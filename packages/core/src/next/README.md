@@ -602,7 +602,11 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     continuations use the same R23.5 task clock as the scan/driver through B1's `task.ts`
     extraction. Already-resolved storage promises do not restart it. Missing pages are claimed
     before a yield so concurrent loads share their completion; started siblings still drain on
-    errors. `testing/scan-windows.test.ts` generates timers/cancel messages in multi-read
+    errors. Each scan owns a cancel signal, passed to its readers and storage. Abort skips
+    closed readers' unstarted page jobs; already-started reads drain, and other live readers
+    keep their jobs. Different cancel signals are never grouped into one shared read. Started
+    rejections are observed immediately while preparation yields, then propagated after drain.
+    `testing/scan-windows.test.ts` generates timers/cancel messages in multi-read
     windows, carried task budget and concurrent followers. `MINNOW_EXPORT_SCAN_IO_COMPARE=1` compares both policies over
     five interleaved cold rounds; `scripts/scan-io-bench.mts` isolates the real scan/cache over
     memory, with fresh caches, untimed warmup GC, and CPU/wall/read/charge measurements. Reported

@@ -341,6 +341,7 @@ export class TableScan implements BatchSource {
   /** Memory segments' staging (re-pointed chunks decode into it) and selection, charged. */
   #memoryOut: { out: ChunkOutput[]; selection: Selection; bytes: number } | null = null;
   #loan: Loan | null = null;
+  readonly #readAbort = new AbortController();
   #aborted = false;
   #released = false;
   /** A step is suspended on a Promise (an access in flight). */
@@ -404,7 +405,9 @@ export class TableScan implements BatchSource {
     this.#target = options.targetBytes ?? BATCH_TARGET_BYTES;
     this.#interval = options.yieldIntervalMs ?? YIELD_INTERVAL_MS;
     this.#clock = clockFor(options.now);
-    this.#readTask = Number.isFinite(this.#interval) ? { clock: this.#clock } : undefined;
+    this.#readTask = Number.isFinite(this.#interval)
+      ? { clock: this.#clock, signal: this.#readAbort.signal }
+      : undefined;
   }
 
   /** Charged allocation components; these are not physical RSS attribution. */
@@ -668,6 +671,7 @@ export class TableScan implements BatchSource {
         const pages = yield* this.#wait(
           this.#options.reads.open(this.#options.pages, chunk, {
             budget: this.#memory,
+            signal: this.#readAbort.signal,
             ...(windowBytes > 0
               ? { once: true, ...(this.#readTask ? { task: this.#readTask } : {}) }
               : {}),
@@ -1237,6 +1241,7 @@ export class TableScan implements BatchSource {
    */
   abort(): void {
     this.#aborted = true;
+    this.#readAbort.abort();
     for (const wake of this.#ownedWaiters) wake();
     this.#ownedWaiters.clear();
     this.#release();

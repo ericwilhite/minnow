@@ -571,12 +571,13 @@ export class ChunkReader {
    * space coalesces neighbouring pages of different columns into large reads (a scan's window
    * over every column becomes a few large, nearly sequential reads). Every page is installed in
    * its own reader as `load` would install it, holding its share of the shared lease. Readers
-   * must share the first reader's space, budget and `once`; one that does not, that needs its
+   * must share the first reader's space, budget, cancellation signals and `once`; one that does not, that needs its
    * dictionary, or that has gzip pages to load, loads on its own (`load`). A reader may appear
    * more than once, with overlapping pages: its requests are merged. Resolves when every
    * page is loaded; a reader closed meanwhile only loses its own pages (its loads give back what
    * they read, as `close` says). Errors reject after all started sibling loads settle, so a
-   * retry or close cannot race later installations or charges. Like `load`, completes
+   * retry or close cannot race later installations or charges. Closed readers lose unstarted
+   * jobs; a read already started drains before completion. Like `load`, completes
    * synchronously when every requested page and dictionary is resident and no task yield is due.
    */
   static loadTogether(
@@ -628,7 +629,14 @@ export class ChunkReader {
   ): Generator<Promise<void>, MaybePromise<void>, unknown> {
     const first = loads[0]?.reader;
     if (first === undefined) return;
-    const waits: Array<PromiseLike<void>> = [];
+    const waits: Array<Promise<void>> = [];
+    const watch = (work: PromiseLike<void>): void => {
+      const observed = Promise.resolve(work);
+      // Preparation can yield before Promise.all is installed. Observe now, but retain
+      // the original rejection for propagation after every started sibling drains.
+      void observed.catch(noop);
+      waits.push(observed);
+    };
     try {
       const jobs: TogetherJob[] = [];
       // One page set per reader before any work (review B2-p2i #3): a reader named twice, or
@@ -651,6 +659,8 @@ export class ChunkReader {
         let alone =
           reader.#space !== first.#space ||
           reader.#options.budget !== first.#options.budget ||
+          reader.#options.signal !== first.#options.signal ||
+          reader.#options.task?.signal !== first.#options.task?.signal ||
           (reader.#options.once === true) !== (first.#options.once === true);
         for (const index of pages) {
           const entry = entries[index];
@@ -659,14 +669,14 @@ export class ChunkReader {
           if (isGzip(entry)) alone = true;
           if (reader.#pages[index] !== undefined) continue;
           const pending = reader.#pending.get(index);
-          if (pending !== undefined) waits.push(pending);
+          if (pending !== undefined) watch(pending);
           else missing.push(index);
         }
         if (alone) {
           const loaded = reader.load(pages);
           // As in the shared reads: a reader closed meanwhile only loses its own pages.
           if (loaded !== undefined)
-            waits.push(
+            watch(
               loaded.then(noop, (error: unknown) => {
                 if (!(error instanceof ReaderClosedError && reader.#closed)) throw error;
               }),
@@ -680,6 +690,7 @@ export class ChunkReader {
         for (const page of missing) reader.#pending.set(page, completion);
       }
       for (const [reader, missing] of missingOf) {
+        if (reader.#isClosed()) continue;
         if (reader.#options.task === undefined) {
           if (reader.#loadCached(missing, false)) continue;
         } else {
@@ -687,13 +698,16 @@ export class ChunkReader {
           for (let start = 0; start < missing.length; start += 128) {
             const pause = reader.#pause();
             if (pause !== undefined) yield pause;
+            if (reader.#isClosed()) break;
             if (!reader.#loadCached(missing.slice(start, start + 128), false)) break;
           }
         }
         for (let k = 0; k < missing.length; k++) {
+          if (reader.#isClosed()) break;
           if (k % 128 === 0) {
             const pause = reader.#pause();
             if (pause !== undefined) yield pause;
+            if (reader.#isClosed()) break;
           }
           const page = at(missing, k);
           if (reader.#pages[page] === undefined)
@@ -707,7 +721,7 @@ export class ChunkReader {
         if (first.#options.task === undefined) jobs.sort(compare);
         else yield sortInSlices(jobs, compare, first.#options.task);
         const run = ChunkReader.#readTogether(first.#space, first.#options, jobs);
-        waits.push(run);
+        watch(run);
       }
       if (waits.length === 0) return;
       return Promise.all(waits).then(noop, async (error: unknown) => {
@@ -720,6 +734,11 @@ export class ChunkReader {
         throw error;
       });
     }
+  }
+
+  /** A suspension may run close callbacks; do not retain a pre-await field narrowing. */
+  #isClosed(): boolean {
+    return this.#closed;
   }
 
   /** Only a real task yield advances this shared clock; resolved reads never restart it. */
@@ -739,10 +758,23 @@ export class ChunkReader {
       if (before !== undefined) await before;
       let end = start;
       let bytes = 0;
-      while (end < jobs.length && bytes + at(jobs, end).entry.length <= MAX_READ_BYTES)
-        bytes += at(jobs, end++).entry.length;
-      if (end === start) end++;
-      const batch = jobs.slice(start, end);
+      const batch: TogetherJob[] = [];
+      while (end < jobs.length) {
+        const job = at(jobs, end);
+        if (job.reader.#closed) {
+          end++;
+          continue;
+        }
+        if (batch.length > 0 && bytes + job.entry.length > MAX_READ_BYTES) break;
+        batch.push(job);
+        bytes += job.entry.length;
+        end++;
+      }
+      // Closed readers own no future requests. Other readers keep their part of the load.
+      if (batch.length === 0) {
+        start = end;
+        continue;
+      }
       const lease = await space.read(
         batch.map(({ reader, entry }) => blobOf(reader.chunk, entry)),
         options.once === true ? { ...options, reuseBuffers: true } : options,
@@ -755,10 +787,13 @@ export class ChunkReader {
           // settle takes this share whether it succeeds or fails. A yield failure only owns
           // the untouched suffix, which the finally returns before rejecting/draining.
           taken = k + 1;
-          try {
-            await reader.#settle(entry, page, lease.bytes[k], shared);
-          } catch (error) {
-            if (!(error instanceof ReaderClosedError)) throw error;
+          if (reader.#closed) shared.drop();
+          else {
+            try {
+              await reader.#settle(entry, page, lease.bytes[k], shared);
+            } catch (error) {
+              if (!(error instanceof ReaderClosedError)) throw error;
+            }
           }
           const after = pause();
           if (after !== undefined) await after;

@@ -1224,7 +1224,12 @@ continuations, check the scan/driver's shared R23.5 clock. Sorting and cached in
 check that clock; only a genuine task yield restarts it. Missing pages are reserved before
 those yields so a concurrent reader waits for the same work. The generated lifecycle campaign
 is `next/testing/scan-windows.test.ts`; its virtual work ticks are scheduling evidence, not a
-throughput measurement.
+throughput measurement. A scan-owned abort signal reaches both readers and storage; cancel
+stops new backend calls while already-started buffers remain charged until drained. Shared
+loads omit closed readers' remaining jobs while finishing live readers. Different cancellation
+signals load independently. Started rejections are observed immediately while preparation is
+yielded, and still propagate after drain. Generated blocked-read histories verify those rules, fresh-signal
+retry and zero final charges.
 
 `MINNOW_EXPORT_SCAN_BATCH_COMPARE=1 npm run benchmark:export` compares 1, 2 and 3 MiB
 decoded-byte targets in five interleaved cold rounds. This is a bench experiment: the core's
