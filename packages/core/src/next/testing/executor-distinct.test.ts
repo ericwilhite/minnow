@@ -83,7 +83,7 @@ it.each(seedsFor("next-executor-distinct-columns", [0xc701, 0xc702]))(
             const execution = prepared.execute({
               snapshot: { catalog: { version: 0 }, observedLsn: 0 } as unknown as Snapshot,
               statement: null,
-              parameters: prepared.bind([]),
+              parameters: [],
               statementTime: 0n,
               reads: {} as ChunkReads,
               governor,
@@ -187,7 +187,7 @@ it("still consumes later input rows after the empty tuple's first representative
   const execution = prepared.execute({
     snapshot: { catalog: { version: 0 }, observedLsn: 0 } as unknown as Snapshot,
     statement: null,
-    parameters: prepared.bind([]),
+    parameters: [],
     statementTime: 0n,
     reads: {} as ChunkReads,
     governor,

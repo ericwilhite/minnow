@@ -76,7 +76,7 @@ async function run(
   const request: ExecuteRequest = {
     snapshot,
     statement: null,
-    parameters: prepared.bind([]),
+    parameters: [],
     statementTime: 0n,
     reads: {} as ChunkReads,
     governor,
@@ -477,7 +477,7 @@ it("keeps kernel buffers and parameter slots local to concurrent executions of o
     prepared.execute({
       snapshot: { catalog: { version: p.catalogVersion }, observedLsn: 0 } as unknown as Snapshot,
       statement: null,
-      parameters: prepared.bind([value]),
+      parameters: [value],
       statementTime: 0n,
       governor,
       reads: {} as ChunkReads,
@@ -608,7 +608,7 @@ it("reserves no unopened window subtrees beneath LIMIT zero", async () => {
               observedLsn: 0,
             } as unknown as Snapshot,
             statement: null,
-            parameters: prepared.bind(parameter ? [0] : []),
+            parameters: parameter ? [0] : [],
             statementTime: 0n,
             reads: {} as ChunkReads,
             governor,

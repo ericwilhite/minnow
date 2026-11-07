@@ -827,7 +827,7 @@ and the owner import it directly.
   outstanding loan (`LoanBackedReleaseError` otherwise).
 - `tryAdmit` admits synchronously when the minimum fits and nothing is queued (the point-read fast
   path); it never jumps a queue and otherwise returns null.
-- The one size error is a single value larger than the reserve.
+- A progress loan larger than the reserve raises `ValueTooLargeError`. Non-spillable parameter inputs must fit normal capacity; an over-cap fixed/input admission raises `MemoryAdmissionError`.
 
 ### Pipeline (`exec/pipeline.ts`)
 
@@ -865,7 +865,13 @@ without admitting execution grants or building breaker pools. A bound zero LIMIT
 input in both reservation and execution, including a zero stored on an ORDER BY sort;
 prepare-time capability checks still cover that input. Small compiler probes determine
 kernel buffer minimums; the generated allocation matrix checks them against real batch-sized
-buffers. Computed join/sort/window arguments are projected
+buffers. Execute accepts caller-owned parameter values (keep them unchanged until execution ends).
+It admits the encoded inputs and active operator minimums atomically, then binds using that
+execution grant. UTF-8 buffers, mutable byte copies and numeric conversion scratch are charged
+before allocation and released on execution completion, cancellation or error. Immutable BigInt
+coefficients can be adopted. An input that cannot fit normal capacity raises the governor's
+`MemoryAdmissionError`; parameter inputs do not spill. Explicit `bind(values, grant)` callers
+must keep that grant alive for the bound vectors' lifetime. Computed join/sort/window arguments are projected
 into hidden columns and removed from visible results. No runtime code generation is used.
 
 The owner composition uses it by default; protocol tests over `StandinWritePath` explicitly keep
@@ -898,11 +904,13 @@ this is not the browser Gate B lane.
 
 The full interface contract includes the following (DML remains unimplemented by the factory):
 
-- `executor.prepare(plan)` compiles a plan once; `bind(values)` fills its placeholders;
+- `executor.prepare(plan)` compiles a plan once; execute accepts raw values and binds after
+  admission. Explicit `bind(values, grant)` also requires an admitted execution budget;
   `execute(request)` runs it over the access contracts: a read snapshot for a query, or an open
   `Statement` for DML, which the executor ends or rolls back. It never commits.
 - The executor admits its own pipelines with plan-bounded minimums. State that outlives a
-  pipeline is in spillable grants. Nothing is refused for size.
+  pipeline is in spillable grants. Non-spillable parameter inputs must fit normal capacity;
+  an over-cap fixed/input admission raises `MemoryAdmissionError`.
 - A plan from another catalog version fails with `PlanStaleError` before anything runs.
 - Three completions: `executed` (the plan ran; for DML the statement ended), committed
   (`acknowledgeCommit()`: autocommit RETURNING waits in a charged, spillable spool until then),

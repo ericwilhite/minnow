@@ -201,16 +201,14 @@ function bound(value: Bound | null, runtime: QueryRuntime, offset: boolean): num
   let number: number;
   if (value.kind === "const") number = value.value;
   else {
-    const vector = runtime.params.slots[value.slot];
-    if (vector === undefined) throw new TypeError("LIMIT/OFFSET slot is missing");
-    if (!isValidSlot(vector, 0)) return offset ? 0 : null;
-    const data = vector.data;
-    if (data.layout === "int64") {
-      const integer = int64At(data.values, 0);
-      number =
-        integer > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(integer);
-    } else if (data.layout === "i32") number = data.values[0] ?? 0;
-    else throw new TypeError("LIMIT/OFFSET is not an integer");
+    const integer = runtime.boundParameter(value.slot);
+    if (integer === null) return offset ? 0 : null;
+    number =
+      typeof integer === "bigint"
+        ? integer > BigInt(Number.MAX_SAFE_INTEGER)
+          ? Number.MAX_SAFE_INTEGER
+          : Number(integer)
+        : integer;
   }
   if (number < 0)
     throw new ExecutionError(

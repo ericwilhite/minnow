@@ -3,9 +3,15 @@ import type { MaybePromise } from "../access/key-index.js";
 import type { Snapshot } from "../access/snapshot.js";
 import type { PhysicalPlan, Rel } from "../ir/ir.js";
 import type { Grant } from "../memory/governor.js";
-import { ExecutionError, PlanStaleError, QueryCancelledError } from "./errors.js";
+import {
+  ExecutionError,
+  ParameterBindError,
+  PlanStaleError,
+  QueryCancelledError,
+} from "./errors.js";
 import { WindowError } from "./window-frames.js";
 import type {
+  BoundParameters,
   ExecuteRequest,
   Execution,
   ExecutionProfile,
@@ -13,7 +19,12 @@ import type {
   ExecutionSummary,
   OperatorProfile,
 } from "./executor.js";
-import { clockParameter } from "./parameters.js";
+import {
+  prepareParameters,
+  needsParameterSizing,
+  PARAMETER_SIZING_BYTES,
+  type ParameterBinding,
+} from "./parameters.js";
 import { RESULT_WINDOW_BYTES, ResultChannel } from "./result.js";
 import { ResultSink } from "./result-sink.js";
 import type { ParameterSlots, CallResolver } from "./kernels/compile.js";
@@ -26,7 +37,7 @@ export type Program = (runtime: QueryRuntime, sink: ResultSink) => MaybePromise<
 /** Per-execution only: never retained by an immutable prepared plan. */
 export class QueryRuntime {
   resolveCall: CallResolver | undefined;
-  readonly params: ParameterSlots;
+  readonly params: ParameterSlots = { slots: [] };
   readonly profiles = new Map<number, MutableOperatorProfile>();
   readonly #grants: Grant[] = [];
   readonly #dispose: Array<() => MaybePromise<void>> = [];
@@ -43,6 +54,47 @@ export class QueryRuntime {
   reserve(
     entries: ReadonlyArray<{ readonly rel: Rel; readonly minimum: number }>,
   ): MaybePromise<void> {
+    if (!needsParameterSizing(this.plan, this.request.parameters))
+      return this.#sizeAndReserve(entries);
+    const scratch = this.admit("parameter-sizing", PARAMETER_SIZING_BYTES, false);
+    return scratch instanceof Promise
+      ? scratch.then((grant) => this.#sizeAndReserve(entries, grant))
+      : this.#sizeAndReserve(entries, scratch);
+  }
+
+  #sizeAndReserve(
+    entries: ReadonlyArray<{ readonly rel: Rel; readonly minimum: number }>,
+    scratch?: Grant,
+  ): MaybePromise<void> {
+    let binding: MaybePromise<ParameterBinding>;
+    try {
+      binding = prepareParameters(
+        this.plan,
+        this.request.parameters,
+        this.signal,
+        this.request.governor.capBytes - this.request.governor.reserveBytes,
+        scratch,
+      );
+    } catch (error) {
+      scratch?.close();
+      throw error;
+    }
+    const next = (value: ParameterBinding) => {
+      scratch?.close();
+      return this.#reserveBound(entries, value);
+    };
+    return binding instanceof Promise
+      ? binding.then(next, (error: unknown) => {
+          scratch?.close();
+          throw error;
+        })
+      : next(binding);
+  }
+
+  #reserveBound(
+    entries: ReadonlyArray<{ readonly rel: Rel; readonly minimum: number }>,
+    binding: ParameterBinding,
+  ): MaybePromise<void> {
     const extras: Grant[] = [];
     const next = (at: number): MaybePromise<void> => {
       for (let k = at; k < entries.length; k++) {
@@ -56,24 +108,32 @@ export class QueryRuntime {
           });
         extras.push(grant);
       }
-      const minimum = entries.reduce((sum, entry) => sum + entry.minimum, 0);
+      const minimum = binding.bytes + entries.reduce((sum, entry) => sum + entry.minimum, 0);
       const fixed = this.admit("fixed-buffers", minimum, true);
       const install = (grant: Grant) => {
-        const shares: ReservedGrant[] = [];
-        for (let k = 0; k < entries.length; k++) {
-          const entry = entries[k],
-            extra = extras[k];
-          if (entry === undefined || extra === undefined)
-            throw new TypeError("missing reservation");
-          const share = new ReservedGrant(grant, extra, entry.minimum);
-          this.#meter(share, entry.rel, false);
-          shares.push(share);
-          this.#reserved.set(`${entry.rel.op}#${String(entry.rel.id)}`, share);
-          this.dispose(() => share.close());
-        }
-        grant.onReclaimRequest((bytes) => {
-          for (const share of shares) share.reclaim(bytes);
-        });
+        const bound = binding.bind(grant, this.request.statementTime);
+        const attach = (parameters: BoundParameters) => {
+          this.params.slots = parameters.slots;
+          this.dispose(() => {
+            this.params.slots = [];
+          });
+          const shares: ReservedGrant[] = [];
+          for (let k = 0; k < entries.length; k++) {
+            const entry = entries[k],
+              extra = extras[k];
+            if (entry === undefined || extra === undefined)
+              throw new TypeError("missing reservation");
+            const share = new ReservedGrant(grant, extra, entry.minimum);
+            this.#meter(share, entry.rel, false);
+            shares.push(share);
+            this.#reserved.set(`${entry.rel.op}#${String(entry.rel.id)}`, share);
+            this.dispose(() => share.close());
+          }
+          grant.onReclaimRequest((bytes) => {
+            for (const share of shares) share.reclaim(bytes);
+          });
+        };
+        return bound instanceof Promise ? bound.then(attach) : attach(bound);
       };
       return fixed instanceof Promise ? fixed.then(install) : install(fixed);
     };
@@ -86,14 +146,26 @@ export class QueryRuntime {
     readonly view: Snapshot,
     readonly signal: AbortSignal,
   ) {
-    this.params = { slots: [...request.parameters.slots] };
-    if (plan.clockSlot !== null) {
-      const type = plan.parameters[plan.clockSlot];
-      if (type?.kind !== "timestamp") throw new TypeError("invalid statement clock slot");
-      const slots = [...this.params.slots];
-      slots[plan.clockSlot] = clockParameter(type, request.statementTime);
-      this.params.slots = slots;
-    }
+    // No owned parameter buffers exist until reserve() admits inputs and operators atomically.
+    if (plan.clockSlot !== null && plan.parameters[plan.clockSlot]?.kind !== "timestamp")
+      throw new TypeError("invalid statement clock slot");
+  }
+
+  /** Reservation pruning needs integer bounds before materializing any vectors. */
+  boundParameter(slot: number): number | bigint | null {
+    const type = this.plan.parameters[slot];
+    const value = this.request.parameters[slot];
+    if (value === null) return null;
+    if (type?.kind !== "int32" && type?.kind !== "int64")
+      throw new TypeError("LIMIT/OFFSET is not an integer");
+    if (typeof value !== "bigint" && (typeof value !== "number" || !Number.isSafeInteger(value)))
+      throw new ParameterBindError(`$${String(slot + 1)}: integer value expected`, slot);
+    const bits = type.kind === "int64" ? 64 : type.bits;
+    const low = bits === 64 ? -(1n << 63n) : bits === 16 ? -32768 : -2147483648;
+    const high = bits === 64 ? (1n << 63n) - 1n : bits === 16 ? 32767 : 2147483647;
+    if (value < low || value > high)
+      throw new ParameterBindError(`$${String(slot + 1)}: integer value out of range`, slot);
+    return value;
   }
 
   profile(rel: Rel): MutableOperatorProfile {
@@ -296,8 +368,6 @@ export class QueryExecution implements Execution {
   ) {
     if (request.snapshot === null || hasStatement(request))
       throw new TypeError("a query requires a read snapshot");
-    if (request.parameters.slots.length !== plan.parameters.length)
-      throw new TypeError("parameters were not bound to this plan");
     const windowBytes = request.resultWindowBytes ?? RESULT_WINDOW_BYTES;
     if (!Number.isSafeInteger(windowBytes) || windowBytes <= 0)
       throw new TypeError("positive result window required");
@@ -402,9 +472,10 @@ export class QueryExecution implements Execution {
     runtime.resultGrant(grant);
     // An empty result window must not prevent admission of its producer. Allocated frame
     // bytes remain held until credit; unused holdings can be reclaimed at any time.
-    grant.onReclaimRequest(() =>
-      grant.release(Math.max(0, grant.held - grant.allocated - grant.loaned)),
-    );
+    grant.onReclaimRequest(() => {
+      const unused = grant.held - grant.allocated - grant.loaned;
+      if (unused > 0) grant.release(unused);
+    });
     this.#sink = new ResultSink(
       this.plan.columns.map((c) => c.type),
       grant,

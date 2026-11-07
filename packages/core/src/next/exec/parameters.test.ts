@@ -1,6 +1,6 @@
 import fc from "fast-check";
 import { PGlite } from "@electric-sql/pglite";
-import { afterAll, beforeAll, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, expect, it, vi } from "vitest";
 import { createReach } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import type { PhysicalType } from "../types.js";
@@ -9,8 +9,24 @@ import { int64At } from "../vector/int64.js";
 import { int128At } from "../vector/int128.js";
 import { decodeUtf8 } from "../vector/varlen.js";
 import { ParameterBindError, UnsupportedPlanError } from "./errors.js";
-import { bindParameter, checkParameterType } from "./parameters.js";
+import { bindParameter as bindChargedParameter, checkParameterType } from "./parameters.js";
 
+import { Governor, type Grant } from "../memory/governor.js";
+import type { ParameterValue } from "./executor.js";
+const cellGrants: Grant[] = [];
+afterEach(() => {
+  for (const grant of cellGrants.splice(0)) grant.close();
+});
+function bindParameter(type: PhysicalType, value: ParameterValue, slot: number) {
+  const grant = new Governor(8 << 20).tryAdmit({
+    label: "test/parameter",
+    minimumBytes: 0,
+    spillable: true,
+  });
+  if (grant === null) throw new Error("parameter admission failed");
+  cellGrants.push(grant);
+  return bindChargedParameter(type, value, slot, grant);
+}
 let pg: PGlite;
 beforeAll(async () => {
   pg = new PGlite();

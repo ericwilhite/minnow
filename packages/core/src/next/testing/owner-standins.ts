@@ -27,6 +27,7 @@ import {
   type CatalogView,
   type TableDef,
 } from "../access/catalog.js";
+import { bindParameters } from "../exec/parameters.js";
 import type { Statement, StatementOptions } from "../access/modify.js";
 import type { Snapshot } from "../access/snapshot.js";
 import type {
@@ -49,7 +50,6 @@ import {
   UnsupportedPlanError,
 } from "../exec/errors.js";
 import type {
-  BoundParameters,
   ExecuteRequest,
   Execution,
   ExecutionState,
@@ -637,7 +637,6 @@ function yieldTask(): Promise<void> {
 }
 
 const programs = new WeakMap<PhysicalPlan, Program>();
-const boundValues = new WeakMap<BoundParameters, readonly ParameterValue[]>();
 
 function columnVector(type: PhysicalType, values: readonly Value[]): WireFlat {
   const length = values.length;
@@ -1020,23 +1019,16 @@ export class StandinExecutor implements Executor {
       columns: program.columns,
       kind: program.kind,
       usesSequences: false,
-      bind: (values) => {
-        if (values.length !== plan.placeholderCount)
+      bind: (values, grant) => bindParameters(plan, values, grant),
+      execute: (request) => {
+        if (request.parameters.length !== plan.placeholderCount)
           throw new ExecutionError(
             `Expected ${String(plan.placeholderCount)} parameters`,
             "MINNOW_PARAMETER_BIND",
             "08P01",
           );
-        const bound: BoundParameters = { slots: [] };
-        boundValues.set(bound, values);
-        return bound;
-      },
-      execute: (request) => {
-        const execution = new StandinExecution(
-          program,
-          request,
-          boundValues.get(request.parameters) ?? [],
-          () => this.onAcknowledge?.(),
+        const execution = new StandinExecution(program, request, request.parameters, () =>
+          this.onAcknowledge?.(),
         );
         this.channels.add(execution.results);
         return execution;

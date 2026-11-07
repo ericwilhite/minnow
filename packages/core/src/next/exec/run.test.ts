@@ -28,7 +28,7 @@ function input(options: { signal?: AbortSignal; windowBytes?: number } = {}) {
   const request: ExecuteRequest = {
     snapshot,
     statement: null,
-    parameters: { slots: [] },
+    parameters: [],
     statementTime: 0n,
     reads: {} as ChunkReads,
     governor,

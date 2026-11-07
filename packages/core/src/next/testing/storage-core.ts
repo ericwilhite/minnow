@@ -92,7 +92,7 @@ export class StorageCore implements NextCore {
       execution = prepared.execute({
         snapshot,
         statement: null,
-        parameters: prepared.bind(params),
+        parameters: params,
         statementTime: 0n,
         governor: this.harness.governor,
         spill: this.spill,
@@ -183,11 +183,22 @@ export class StorageCore implements NextCore {
           );
           try {
             for (const row of rows.slice(start, start + BATCH_ROWS)) {
+              const before = grant.allocated;
               const vectors: FlatVector[] = table.columns.map((column, slot) =>
-                bindParameter(column.type, (row[column.name] ?? null) as ParameterValue, slot),
+                bindParameter(
+                  column.type,
+                  (row[column.name] ?? null) as ParameterValue,
+                  slot,
+                  grant,
+                ),
               );
-              if (store.append(vectors, Uint16Array.of(0), 0, 1) !== 1)
-                throw new RangeError("adapter input allocation refused");
+              const bindingBytes = grant.allocated - before;
+              try {
+                if (store.append(vectors, Uint16Array.of(0), 0, 1) !== 1)
+                  throw new RangeError("adapter input allocation refused");
+              } finally {
+                grant.free(bindingBytes);
+              }
             }
             inserted += await writer.insert(
               { length: store.rows, columns: store.vectors(), selection: null },

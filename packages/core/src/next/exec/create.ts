@@ -1,6 +1,7 @@
 /** The owner uses this factory; protocol fixtures may still inject an explicit executor. */
 import type { PhysicalPlan } from "../ir/ir.js";
 import type { Executor, PreparedPlan, ParameterValue, ExecuteRequest } from "./executor.js";
+import type { Grant } from "../memory/governor.js";
 import { bindParameters, checkParameterType } from "./parameters.js";
 import { compilePlan } from "./plan.js";
 import { QueryExecution } from "./run.js";
@@ -17,7 +18,8 @@ export function createExecutor(): Executor {
         columns: plan.columns,
         kind: "query" as const,
         usesSequences: false,
-        bind: (values: readonly ParameterValue[]) => bindParameters(plan, values),
+        bind: (values: readonly ParameterValue[], grant: Grant) =>
+          bindParameters(plan, values, grant),
         execute: (request: ExecuteRequest) => new QueryExecution(plan, request, program),
       });
     },

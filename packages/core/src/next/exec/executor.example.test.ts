@@ -1,7 +1,7 @@
 /**
  * How the consuming tracks call the executor's entry point (exec/executor.ts) over the access
  * contracts (access/):
- * - the owner (B5): prepare → bind → execute; a cached read completes inside `execute` and its
+ * - the owner (B5): prepare → execute with raw values (binding follows admission); a cached read completes inside `execute` and its
  *   frame is polled with no await (R6); frames are posted as `payload` + `transfer` and released on
  *   credit; `delivered` closes the result grant (R3); a stale plan; cancellation;
  * - DML (B3's `Statement`): insert through a `TableWriter`, `statement.end()` before `executed`,
@@ -101,7 +101,7 @@ class ToyPrepared implements PreparedPlan {
     this.kind = plan.root.op === "modify" ? "modify" : "query";
   }
 
-  bind(values: readonly ParameterValue[]): BoundParameters {
+  bind(values: readonly ParameterValue[], grant: Grant): BoundParameters {
     if (values.length !== this.plan.placeholderCount)
       throw new ParameterBindError(
         `Expected ${String(this.plan.placeholderCount)} parameters`,
@@ -112,6 +112,7 @@ class ToyPrepared implements PreparedPlan {
         const value = values[slot];
         if (typeof value !== "number" || !Number.isInteger(value))
           throw new ParameterBindError(`$${String(slot + 1)}: integer expected`, slot);
+        if (!grant.allocate(4)) throw new RangeError("toy: parameter charge refused");
         const vector = allocateFlat(INT, 1);
         i32(vector)[0] = value;
         vector.length = 1;
@@ -151,7 +152,7 @@ class ToyPrepared implements PreparedPlan {
       if (view === null) throw new TypeError("no view");
       if (view.catalog.version !== this.plan.catalogVersion)
         throw new PlanStaleError(this.plan.catalogVersion, view.catalog.version);
-      const batch = this.#evaluate(request.parameters);
+      const batch = this.#evaluate(this.bind(request.parameters, grant));
       if (request.statement !== null)
         return this.#modify(request, request.statement, batch, execution, done);
       // A query: synchronous from start to the last frame when nothing it reads awaits.
@@ -394,14 +395,13 @@ const reads: ChunkReads = {
 };
 
 function requestFor(
-  prepared: PreparedPlan,
   values: ParameterValue[],
   governor: MemoryGovernor,
   target: { snapshot: Snapshot } | { statement: Statement },
   returning: "atExecuted" | "atCommit" = "atExecuted",
 ): ExecuteRequest {
   const base = {
-    parameters: prepared.bind(values),
+    parameters: values,
     statementTime: 784_111_777_000_000n,
     reads,
     governor,
@@ -433,7 +433,7 @@ describe("executor entry point (examples)", () => {
       valuesPlan([literal(1), { op: "param", slot: 0, type: INT }], 1),
     );
     const view = viewOf(readBound(41));
-    const execution = prepared.execute(requestFor(prepared, [41], governor, { snapshot: view }));
+    const execution = prepared.execute(requestFor([41], governor, { snapshot: view }));
     expect(execution.state).toBe("executed");
     expect(execution.summary?.requiresLsn).toBe(41); // writePath.durable(41) is null: no wait
     view.release(); // the owner may drop the pin at `executed`
@@ -449,15 +449,25 @@ describe("executor entry point (examples)", () => {
     const prepared = new ToyExecutor().prepare(
       valuesPlan([{ op: "param", slot: 0, type: INT }], 1),
     );
-    expect(() => prepared.bind([])).toThrow(ParameterBindError);
-    expect(() => prepared.bind(["x"])).toThrow(expect.objectContaining({ slot: 0 }));
+    const grant = new Governor(8 << 20).tryAdmit({
+      label: "bind-test",
+      minimumBytes: 64,
+      spillable: false,
+    });
+    if (grant === null) throw new Error("missing grant");
+    try {
+      expect(() => prepared.bind([], grant)).toThrow(ParameterBindError);
+      expect(() => prepared.bind(["x"], grant)).toThrow(expect.objectContaining({ slot: 0 }));
+    } finally {
+      grant.close();
+    }
   });
 
   it("fails a stale plan with PlanStaleError and nothing run", async () => {
     const governor = new Governor(16 << 20);
     const prepared = new ToyExecutor().prepare(valuesPlan([literal(1)]));
     const execution = prepared.execute(
-      requestFor(prepared, [], governor, { snapshot: viewOf(readBound(1), 4) }),
+      requestFor([], governor, { snapshot: viewOf(readBound(1), 4) }),
     );
     await expect(execution.executed).rejects.toBeInstanceOf(PlanStaleError);
     await expect(execution.delivered).rejects.toBeInstanceOf(PlanStaleError);
@@ -468,7 +478,7 @@ describe("executor entry point (examples)", () => {
     const governor = new Governor(16 << 20);
     const prepared = new ToyExecutor().prepare(valuesPlan([literal(1)]));
     const execution = prepared.execute(
-      requestFor(prepared, [], governor, { snapshot: viewOf(readBound(1)) }),
+      requestFor([], governor, { snapshot: viewOf(readBound(1)) }),
     );
     execution.results.cancel("client disconnected");
     await expect(execution.delivered).rejects.toBeInstanceOf(QueryCancelledError);
@@ -480,9 +490,7 @@ describe("executor entry point (examples)", () => {
     const governor = new Governor(16 << 20);
     const statement = new RecordingStatement([]);
     const prepared = new ToyExecutor().prepare(insertPlan([1, 2, 3], true));
-    const execution = prepared.execute(
-      requestFor(prepared, [], governor, { statement }, "atCommit"),
-    );
+    const execution = prepared.execute(requestFor([], governor, { statement }, "atCommit"));
     const summary = await execution.executed;
     expect(statement.calls).toEqual(["table:7", "insert", "end"]);
     expect(summary.counts).toEqual({ inserted: 3, updated: 0, deleted: 0 });
@@ -501,7 +509,7 @@ describe("executor entry point (examples)", () => {
     const governor = new Governor(16 << 20);
     const prepared = new ToyExecutor().prepare(insertPlan([5], true));
     const execution = prepared.execute(
-      requestFor(prepared, [], governor, { statement: new RecordingStatement([]) }),
+      requestFor([], governor, { statement: new RecordingStatement([]) }),
     );
     await execution.executed;
     expect(execution.results.poll()?.payload.rowCount).toBe(1);
@@ -511,9 +519,7 @@ describe("executor entry point (examples)", () => {
     const governor = new Governor(16 << 20);
     const statement = new RecordingStatement([2]);
     const prepared = new ToyExecutor().prepare(insertPlan([1, 2], true));
-    const execution = prepared.execute(
-      requestFor(prepared, [], governor, { statement }, "atCommit"),
-    );
+    const execution = prepared.execute(requestFor([], governor, { statement }, "atCommit"));
     await expect(execution.executed).rejects.toThrow("duplicate key 2");
     expect(statement.calls).toEqual(["table:7", "insert", "end", "rollback"]);
     expect(execution.state).toBe("failed");

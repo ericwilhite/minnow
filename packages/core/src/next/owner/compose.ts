@@ -560,10 +560,9 @@ class ComposedSession implements EngineSession {
     returning: "atExecuted" | "atCommit",
   ): Execution {
     const prepared = this.#engine.prepare(plan);
-    const parameters = prepared.bind(params);
     const options = this.#engine.options;
     return prepared.execute({
-      parameters,
+      parameters: params,
       statementTime: this.#statementTime(),
       reads: options.reads,
       governor: options.governor,

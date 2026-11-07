@@ -179,7 +179,7 @@ const LOG10_2 = Math.log10(2);
  * exact decimal conversion only within a digit of the limit. No huge textual conversion is
  * needed merely to refuse an input.
  */
-function numericFits(coefficient: bigint, scale: number): boolean {
+export function numericFits(coefficient: bigint, scale: number): boolean {
   if (coefficient === 0n) return true;
   const limit = NUMERIC_MAX_INTEGER_DIGITS + scale;
   // 10^limit <= 1000^ceil(limit/3) < 2^(10*ceil(limit/3)). Every legal

@@ -65,9 +65,15 @@ export function inputBatch(
         const store = new ColumnStore([type], grant, { chunkRows: BATCH_ROWS });
         closes.push(() => store.close());
         for (const value of values) {
-          const vector = bindParameter(type, value, slot);
-          if (store.append([vector], Uint16Array.of(0), 0, 1) !== 1)
-            throw new RangeError("input decimal allocation refused");
+          const before = grant.allocated;
+          const vector = bindParameter(type, value, slot, grant);
+          const bindingBytes = grant.allocated - before;
+          try {
+            if (store.append([vector], Uint16Array.of(0), 0, 1) !== 1)
+              throw new RangeError("input decimal allocation refused");
+          } finally {
+            grant.free(bindingBytes);
+          }
         }
         const vector = store.vectors()[0];
         if (vector === undefined) throw new TypeError("empty decimal input");
