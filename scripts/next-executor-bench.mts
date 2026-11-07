@@ -1,4 +1,7 @@
-/** Node only: real committed storage -> SQL lowering -> executor -> materialized rows. */
+/** Node only: real committed storage -> SQL lowering -> executor -> materialized rows.
+ * --frozen replays committed SQL verbatim, including captured row-bound literals. Gate B's
+ * 1M join/window cells have no size-dependent SQL literals; select them with --only.
+ */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -9,6 +12,8 @@ import { Session } from "node:inspector/promises";
 import { StorageCore } from "../packages/core/dist/next/testing/storage-core.js";
 import { inputBatch, type InputValue } from "../packages/core/dist/next/testing/executor-input.js";
 import { oracleRows } from "../packages/core/dist/next/testing/differential-adapter.js";
+import { PlanningError } from "../packages/core/dist/next/lower/errors.js";
+import { CATALOGUE_AUTHORITY_REFUSALS } from "../packages/core/dist/next/testing/divergences.js";
 import { UnsupportedPlanError } from "../packages/core/dist/next/errors.js";
 import { BATCH_ROWS, type Batch } from "../packages/core/dist/next/vector/vector.js";
 
@@ -54,12 +59,30 @@ const harness = resolve(
 );
 const only = new Set(option("--only", "").split(",").filter(Boolean));
 const profileId = option("--profile", "");
+const frozenSQL = args.includes("--frozen");
 const dataset = option("--dataset", "wide"),
   scale = Number(option("--scale", "333"));
-if (dataset !== "wide" && dataset !== "star") throw new Error("--dataset must be wide or star");
+if (dataset !== "wide" && dataset !== "star" && dataset !== "retail")
+  throw new Error("--dataset must be wide, star or retail");
+if (dataset === "retail" && !frozenSQL) throw new Error("retail requires --frozen");
 if (!Number.isFinite(scale) || scale <= 0) throw new RangeError("positive star scale required");
 const cache = resolve(option("--output", join(tmpdir(), "b4-executor/baseline")));
 await mkdir(cache, { recursive: true });
+const committed = frozenSQL
+  ? (JSON.parse(
+      await readFile(resolve("packages/core/src/next/testing/executor-catalogue.json"), "utf8"),
+    ) as {
+      queries: Array<CatalogueQuery & { dataset: string }>;
+      datasets: Record<
+        string,
+        Array<{
+          name: string;
+          ddl: string;
+          rows: Array<Record<string, boolean | string | number | null>>;
+        }>
+      >;
+    })
+  : null;
 const generator = (await import(pathToFileURL(join(harness, "gen.js")).href)) as Generator;
 const catalogue = (await import(pathToFileURL(join(harness, "queries.js")).href)) as Catalogue;
 const core = await new StorageCore(8192).open();
@@ -73,6 +96,12 @@ const metadata = {
   columns: dataset === "wide" ? 200 : null,
   scale: dataset === "star" ? scale : null,
   rounds,
+  fixtureRowCounts:
+    dataset === "retail"
+      ? Object.fromEntries(
+          (committed?.datasets.retail ?? []).map((table) => [table.name, table.rows.length]),
+        )
+      : null,
   timing:
     "process user+system CPU; SQL/lower/prepare/bind/pin/execute/rows/credit/cleanup included; ingestion excluded",
   node: process.version,
@@ -84,6 +113,7 @@ const metadata = {
         join(harness, "gen.js"),
         join(harness, "queries.js"),
         resolve("apps/site/bench/benchmark.ts"),
+        resolve("packages/core/src/next/testing/executor-catalogue.json"),
       ].map(async (file) => [
         file,
         createHash("sha256")
@@ -94,6 +124,9 @@ const metadata = {
   ),
   load: loadavg(),
   profileId,
+  sqlSource: frozenSQL
+    ? "committed executor-catalogue.json (unchanged SQL)"
+    : "analytics-harness/queries.js",
   harness,
 };
 console.log(JSON.stringify(metadata));
@@ -141,6 +174,35 @@ try {
           weight: row.weight,
           active: row.active,
         })),
+      );
+    }
+  } else if (dataset === "retail") {
+    // The docs catalogue has a frozen fixture rather than a scale parameter. Keep it exact;
+    // these small-fixture timings are not comparable to the wide/star Gate B targets.
+    for (const fixture of committed?.datasets.retail ?? []) {
+      await core.execute(fixture.ddl);
+      const table = core.harness.path.catalog.tableByName(fixture.name);
+      if (table === undefined) throw new Error("retail table was not created");
+      if (fixture.rows.length > 0)
+        await core.writeBatch(
+          "insertBatch",
+          fixture.name,
+          fixture.rows.map((row) =>
+            Object.fromEntries(
+              table.columns.map((column) => {
+                const value = row[column.name] ?? null;
+                return [
+                  column.name,
+                  value !== null && column.type.kind === "timestamp"
+                    ? new Date(String(value))
+                    : value,
+                ];
+              }),
+            ),
+          ),
+        );
+      console.error(
+        JSON.stringify({ loadedTable: fixture.name, rows: fixture.rows.length, load: loadavg() }),
       );
     }
   } else {
@@ -200,15 +262,34 @@ try {
       load: loadavg(),
     }),
   );
-  const queries = (dataset === "wide" ? catalogue.W_QUERIES : catalogue.S_QUERIES).filter(
-    (query) => only.size === 0 || only.has(query.id),
-  );
+  const sourceQueries =
+    committed === null
+      ? dataset === "wide"
+        ? catalogue.W_QUERIES
+        : catalogue.S_QUERIES
+      : committed.queries.filter((query) => query.dataset === dataset);
+  const queries = sourceQueries.filter((query) => only.size === 0 || only.has(query.id));
   const records: unknown[] = [];
   for (const query of queries) {
-    const sql = catalogue.sqlFor(query, "minnow", total);
+    const sql = frozenSQL ? query.sql : catalogue.sqlFor(query, "minnow", total);
     try {
       core.prepare(sql);
     } catch (error) {
+      if (
+        error instanceof PlanningError &&
+        query.id in CATALOGUE_AUTHORITY_REFUSALS &&
+        error.sqlState === "42883"
+      ) {
+        const record = {
+          id: query.id,
+          status: "authority-refusal",
+          sqlState: error.sqlState,
+          message: error.message,
+        };
+        records.push(record);
+        console.log(JSON.stringify(record));
+        continue;
+      }
       if (!(error instanceof UnsupportedPlanError)) throw error;
       const record = {
         id: query.id,

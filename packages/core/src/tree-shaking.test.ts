@@ -32,19 +32,24 @@ const SQL_ENGINE_MODULES =
 // Each budget is the current measurement plus a little headroom; a change that moves one updates
 // the measurement beside it, and the history lives in git.
 
+// Against main f452eb82, the shared frame parser adds 3,353 raw bytes per engine entry:
+// query.js +3,149, frame-offsets.js +158, query-identity.js +46. No next/ or test input is
+// reachable (library-size-audit.mts). Exact literals, signed/rounded offsets and bound
+// validation share the R19 parser with typed compilation; client output is unchanged.
+// Explicit caps over main: raw +3.25 KiB, gzip +1.25 KiB; isolation assertions stay unchanged.
 // Everything the main entry exports, bundled: the in-thread engine.
-// Recursive declaration admission: 1,168,872 bytes raw / 349,954 bytes gzip.
-const COMPLETE_ENTRY_RAW_BUDGET = 1141.75 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 342 * 1024;
+// Integrated release front end and lowering metadata: 1,172,225 bytes raw / 351,069 bytes gzip.
+const COMPLETE_ENTRY_RAW_BUDGET = 1145 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 343.25 * 1024;
 // The engine with the larger durable adapter, OPFS.
-// Recursive declaration admission: 1,581,282 bytes raw / 457,076 bytes gzip.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1544.5 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 446.5 * 1024;
+// Integrated release front end and lowering metadata: 1,584,635 bytes raw / 458,054 bytes gzip.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1547.75 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 447.75 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does.
-// Recursive declaration admission: 1,577,196 bytes raw / 454,536 bytes gzip.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1540.5 * 1024;
-const INDEXEDDB_WORKER_GZIP_BUDGET = 444 * 1024;
+// Integrated release front end and lowering metadata: 1,580,549 bytes raw / 455,571 bytes gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1543.75 * 1024;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 445.25 * 1024;
 // What a page that hosts the engine in a worker ships on the main thread: the client, the schema
 // DSL and error classes, the Kysely dialect and live queries, and the React hooks, with `kysely`
 // and `react` left to the application. 105.9 KiB raw / 31.6 KiB gzip.

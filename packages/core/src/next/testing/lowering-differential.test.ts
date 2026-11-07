@@ -4,13 +4,18 @@
  * identical results required. This checks lowering's semantics (names, types, constants,
  * grouping, ordering, defaults, generated columns, ON CONFLICT, RETURNING) on the milestone M1
  * surface before the executor exists. Values are compared in the oracle's representation:
- * integers as numbers, floats to 12 significant digits.
+ * integers as numbers, floats to 12 significant digits. The original IN-subquery case also
+ * runs through the real executor against PostgreSQL and the current engine, alongside
+ * B6's complete lowering/reference campaign.
  */
 import { describe, expect, it } from "vitest";
+import { PGlite } from "@electric-sql/pglite";
 import { MinnowDatabase } from "../../engine/database.js";
 import { MemoryBlockStore } from "../../storage/index.js";
 import { ReferenceSqlError } from "./ir-reference.js";
 import { LoweredDatabase } from "./lowering-harness.js";
+import { StorageCore } from "./storage-core.js";
+import { oracleRows as executionRows } from "./differential-adapter.js";
 
 /** A statement and its placeholder values. */
 type Case = readonly [string, (readonly unknown[])?];
@@ -82,6 +87,36 @@ const QUERIES: readonly Case[] = [
   ["SELECT 1 + 2 AS three, 'x' AS t, TRUE AS b"],
   ["SELECT max(qty) AS m FROM orders WHERE customer_id = 99"],
   ["SELECT id FROM orders WHERE customer_id IN (SELECT 1) ORDER BY id"],
+  // Milestone M3: joins, subqueries, windows, set operations, recursion.
+  [
+    "SELECT c.name, o.id, o.qty FROM customers c JOIN orders o ON o.customer_id = c.id ORDER BY o.id",
+  ],
+  [
+    "SELECT c.name, o.id FROM customers c LEFT JOIN orders o ON o.customer_id = c.id ORDER BY c.name, o.id",
+  ],
+  [
+    "SELECT c.name, o.total FROM customers c, orders o WHERE o.customer_id = c.id AND c.region = 'west' ORDER BY o.id",
+  ],
+  [
+    "SELECT c.region, count(*) AS n, sum(o.qty) AS q FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.region ORDER BY c.region",
+  ],
+  [
+    "SELECT name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.qty > 2) ORDER BY id",
+  ],
+  ["SELECT name FROM customers WHERE id NOT IN (SELECT customer_id FROM orders) ORDER BY id"],
+  [
+    "SELECT name, (SELECT max(qty) FROM orders o WHERE o.customer_id = c.id) AS m FROM customers c ORDER BY id",
+  ],
+  ["SELECT name, (SELECT count(*) FROM orders) AS n FROM customers ORDER BY id"],
+  [
+    "SELECT id, row_number() OVER (PARTITION BY customer_id ORDER BY id) AS rn FROM orders ORDER BY id",
+  ],
+  ["SELECT id, sum(qty) OVER (ORDER BY id) AS running FROM orders ORDER BY id"],
+  ["SELECT customer_id AS v FROM orders UNION SELECT id FROM customers ORDER BY 1"],
+  ["SELECT id AS v FROM customers EXCEPT SELECT customer_id FROM orders ORDER BY 1"],
+  [
+    "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 4) SELECT n FROM r ORDER BY n",
+  ],
 ];
 
 const MUTATIONS: readonly Case[] = [
@@ -100,6 +135,13 @@ const MUTATIONS: readonly Case[] = [
   ],
   [
     "INSERT INTO orders (id, customer_id, qty, price) SELECT id + 100, id, tier, score FROM customers WHERE score IS NOT NULL",
+  ],
+  [
+    "UPDATE orders o SET qty = o.qty + c.tier FROM customers c WHERE c.id = o.customer_id AND c.region = 'west'",
+  ],
+  ["DELETE FROM orders o USING customers c WHERE c.id = o.customer_id AND c.active IS NULL"],
+  [
+    "MERGE INTO customers c USING (SELECT 2 AS cid UNION ALL SELECT 9) s ON c.id = s.cid WHEN MATCHED THEN UPDATE SET tier = 7 WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.cid, 'new')",
   ],
 ];
 
@@ -155,10 +197,44 @@ describe("lowering agrees with the current engine (milestone M1 surface)", () =>
       }
       expect(ours, sql).toEqual(await oracleRows(oracle, sql, params));
     }
-    // Subqueries are milestone M3; everything else is covered.
-    expect(unsupported).toEqual([
-      "SELECT id FROM orders WHERE customer_id IN (SELECT 1) ORDER BY id",
-    ]);
+    // Everything the queries use is lowered.
+    expect(unsupported).toEqual([]);
+  });
+
+  it("executes the original IN subquery through the real executor against both SQL engines", async () => {
+    const sql = "SELECT id FROM orders WHERE customer_id IN (SELECT 1) ORDER BY id";
+    const core = await new StorageCore().open();
+    const pg = new PGlite();
+    await pg.waitReady;
+    const current = new MinnowDatabase(new MemoryBlockStore());
+    try {
+      for (const statement of [...SCHEMA, ...SEED]) {
+        await pg.exec(statement);
+        await current.execute(statement);
+      }
+      // Only these two original columns enter this SELECT. The adapter's trusted
+      // fixture omits the unrelated M1 CHECK/generated-column write features.
+      await core.execute("CREATE TABLE orders(id BIGINT PRIMARY KEY,customer_id INTEGER NOT NULL)");
+      const rows = (
+        await pg.query<{ id: number; customer_id: number }>(
+          "SELECT id,customer_id FROM orders ORDER BY id",
+        )
+      ).rows;
+      await core.writeBatch("insertBatch", "orders", rows);
+      expect(core.prepare(sql).columns[0]?.type).toEqual({ kind: "int64" });
+      const expected = (await pg.query<{ id: number | bigint | string }>(sql)).rows.map((row) => ({
+        id: Number(row.id),
+      }));
+      expect(expected).toEqual([{ id: 10 }, { id: 11 }]);
+      const actual = await core.execute(sql);
+      if (!("batches" in actual)) throw new Error("query frames expected");
+      expect(executionRows(actual)).toEqual(expected);
+      expect(await oracleRows(current, sql)).toEqual(expected);
+    } finally {
+      await core.close();
+      await pg.close();
+      await current.close();
+    }
   });
 
   it("writes identically: UPDATE, DELETE, ON CONFLICT, INSERT … SELECT", async () => {

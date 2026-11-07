@@ -48,6 +48,7 @@ import { Slice, runSliced, type SlicedJob } from "./slices.js";
 import { PageWriter, SpillFiles, SpilledRun } from "./spill-pages.js";
 import { Charge, Pool, SpillIo } from "./spill-pool.js";
 import {
+  WindowError,
   DEFAULT_ROW,
   NULL_ROW,
   aggregate,
@@ -260,6 +261,7 @@ export class WindowOperator implements Operator {
   /** The grouped sort's rows while it applies (null: the sort operator has the rows). */
   #grouped: GroupedRows | null = null;
   #pending: Promise<void> | null = null;
+  #started = false;
 
   constructor(spec: WindowSpec, context: SortContext, downstream: Operator) {
     validateWindowSpec(spec);
@@ -332,8 +334,25 @@ export class WindowOperator implements Operator {
     return Promise.all([this.#sort.closed, this.#evaluator.closed]).then(() => undefined);
   }
 
+  /** PostgreSQL calculate_frame_offsets runs even for empty input, when first executed. */
+  #start(): void {
+    if (this.#started) return;
+    for (const call of this.spec.functions) {
+      if (RANKING.has(call.fn) || call.frame === null) continue;
+      for (const bound of [call.frame.start, call.frame.end]) {
+        if (bound.kind !== "preceding" && bound.kind !== "following") continue;
+        if (bound.offset === null) throw new WindowError("frame offset must not be null", "22004");
+        // RANGE's in_range checks the sign only when comparing two non-NULL keys.
+        if (call.frame.unit !== "range" && (bound.offset < 0 || Number.isNaN(bound.offset)))
+          throw new WindowError("frame offset must not be negative or NaN", "22013");
+      }
+    }
+    this.#started = true;
+  }
+
   push(batch: Batch, transfer?: Transfer): PushResult {
     try {
+      this.#start();
       const grouped = this.#grouped;
       if (grouped !== null) {
         this.#evaluator.checkAborted();
@@ -365,6 +384,7 @@ export class WindowOperator implements Operator {
   finish(): MaybePromise<void> {
     let result: MaybePromise<void>;
     try {
+      this.#start();
       const grouped = this.#grouped;
       if (grouped !== null) {
         // Once sorted, the sort operator is not needed: released before the evaluator ends.
@@ -1356,7 +1376,8 @@ class Evaluator implements Operator {
       const starts = scratch.starts.subarray(0, n);
       const ends = scratch.ends.subarray(0, n);
       const framed = call.fn !== "lag" && call.fn !== "lead";
-      if (framed) yield* frameBounds(call.frame, ordered, peers, key, starts, ends, this.slice);
+      if (framed || call.frame !== null)
+        yield* frameBounds(call.frame, ordered, peers, key, starts, ends, this.slice);
       const exclude = call.frame?.exclude ?? "no-others";
       if (VALUE.has(call.fn)) {
         const amount = this.#amountOf(call, args, scratch, f, n);

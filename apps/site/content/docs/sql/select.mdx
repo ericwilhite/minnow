@@ -162,10 +162,15 @@ function call takes the function's name as written (`COUNT(*)` is `count`, `ARRA
 `expression`, numbered like any repeated name (`expression`, `expression_2`), where PostgreSQL
 would say `?column?`.
 
+`ROUND(value, digits)` takes `NUMERIC` in PostgreSQL. Cast a plain-number expression
+explicitly, as in `ROUND(SUM(total)::NUMERIC, 2)`, for SQL that also runs there. Minnow's
+current engine additionally accepts a plain number with a digit count; PostgreSQL refuses
+that overload with `42883`. The numeric form returns exact decimal text.
+
 ## Joins
 
 ```sql
-SELECT s.name AS store, COUNT(*) AS orders, ROUND(SUM(o.total), 2) AS revenue
+SELECT s.name AS store, COUNT(*) AS orders, ROUND(SUM(o.total)::NUMERIC, 2) AS revenue
 FROM stores s
 JOIN orders o ON o.store_id = s.store_id
 LEFT JOIN employees e ON e.employee_id = o.employee_id
@@ -214,8 +219,8 @@ query (`o.amount > c.threshold`) keeps the plain join and cannot group or limit.
 SELECT p.category,
        COUNT(*) AS lines,
        COUNT(DISTINCT i.order_id) AS baskets,
-       ROUND(SUM(i.line_total), 2) AS revenue,
-       ROUND(AVG(i.line_total), 2) AS average_line,
+       ROUND(SUM(i.line_total)::NUMERIC, 2) AS revenue,
+       ROUND(AVG(i.line_total)::NUMERIC, 2) AS average_line,
        MIN(i.unit_price) AS cheapest,
        MAX(i.unit_price) AS dearest
 FROM order_items i
@@ -463,8 +468,12 @@ FROM orders
 `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`,
 `NTH_VALUE`, and the aggregates as window functions, with `PARTITION BY`, `ORDER BY`, and
 explicit `ROWS`, `RANGE`, and `GROUPS` frames, including exclusions. Numeric `RANGE` offsets
-measure ordering-value distance and require exactly one numeric `ORDER BY` expression. Temporal
-interval offsets and `DISTINCT` window aggregates are not supported. Windows work in both the
+measure ordering-value distance and require exactly one numeric `ORDER BY` expression. A
+negative or `NULL` frame offset is an error, as in PostgreSQL (`frame starting offset must not be
+negative`); `-0` is zero. A `ROWS` or `GROUPS` offset written as a decimal is rounded half away
+from zero, so `1.5 PRECEDING` means 2 rows. A positive `RANGE` offset must fit a double: one past its
+range (`1e400`) or nearer zero than it can hold (`1e-400`) is refused with "RANGE frame offsets
+outside double precision are not supported", even over a `NUMERIC` key, where PostgreSQL runs it. Temporal interval offsets and `DISTINCT` window aggregates are not supported. Windows work in both the
 select list and `ORDER BY`; `WHERE`, `GROUP BY`, and `HAVING` cannot contain them.
 
 Compatible windows share sorting and prepare peer information only when a function or frame

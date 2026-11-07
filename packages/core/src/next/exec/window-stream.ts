@@ -735,7 +735,10 @@ export class PartitionStream {
       }
       const offset = b.offset;
       if (offset === null) throw new WindowError("frame offset must not be null", "22004");
-      if (offset < 0 || Number.isNaN(offset))
+      if (
+        (frame.unit !== "range" || this.#keyOk[i - this.#base] === 1) &&
+        (offset < 0 || Number.isNaN(offset))
+      )
         throw new WindowError("frame offset must not be negative or NaN", "22013");
       const sign = b.kind === "preceding" ? -1 : 1;
       if (frame.unit === "rows") {
@@ -899,6 +902,7 @@ export class PartitionStream {
       )
         continue;
       if (fn === "lag" || fn === "lead") {
+        if (s.call.frame !== null && this.#bounds(s, i) === null) return false;
         const k = typeof s.call.amount === "number" ? s.call.amount : 1;
         const target = fn === "lag" ? i - k : i + k;
         if (target >= this.#read && !this.#ended) return false;

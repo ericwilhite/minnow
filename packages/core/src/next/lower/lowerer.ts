@@ -24,7 +24,8 @@
  *    position (or `context.parameterTypes`), operator and function overloads resolved against
  *    the executor's kernel signatures, implicit casts made explicit (`cast` nodes).
  * 5. **IR construction** (INVENTORY.md maps each front-end construct to its operator), join
- *    ordering by the cost model (lower/statistics.ts), parameter slots, init plans, `apply`.
+ *    ordering by the cost model (lower/from.ts over lower/statistics.ts), access paths
+ *    (lower/access-path.ts), parameter slots, init plans, mark joins, `apply`.
  * 6. **Descriptors**: result columns (lower/result.ts), read and write sets, statistics basis.
  *
  * The front end's semantics are kept, not re-derived: where it rewrote SQL (decorrelation, view
@@ -43,9 +44,11 @@
  * - **Memory.** Lowering allocates plain objects proportional to the statement; it holds no
  *   governor grant (plans are small and bounded by the statement text). The cache that holds
  *   plans is the owner's to bound.
- * - **Errors.** Front-end errors pass through (`TypeError`, `SqlCompileError`). Lowering throws
- *   `PlanningError` (SQL errors with SQLSTATE) and `UnsupportedPlanError` (a construct the new
- *   core does not translate yet; errors.ts). Neither leaves state behind.
+ * - **Errors.** `lower` throws only `PlanningError` (a SQL error with PostgreSQL's SQLSTATE:
+ *   42601 syntax, 42P01 relation, 42703 column, 42883 function, 42704 type, …) and
+ *   `UnsupportedPlanError` (0A000, a construct the new core does not translate yet). Front-end
+ *   failures are translated (errors.ts `frontEndError`): the original is the `cause`, and a parse
+ *   error keeps its `position`. Neither leaves state behind.
  * - **Cancellation.** None: lowering is bounded and synchronous.
  */
 import type { CatalogChange, CatalogView, TableDef } from "../access/catalog.js";
@@ -54,6 +57,7 @@ import type { ExecutorCosts } from "../ir/costs.js";
 import type { PhysicalPlan } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
 import type { PhysicalType } from "../types.js";
+import type { NotParameterizable, ParameterizedPlan, ParameterizedText } from "./parameterize.js";
 import type { ResultColumn } from "./result.js";
 import type { StatementKind } from "./statement.js";
 import type { PlanningStatistics, StatisticsBasis } from "./statistics.js";
@@ -70,7 +74,12 @@ export interface LoweringContext {
   readonly parameterTypes?: ReadonlyArray<PhysicalType | null>;
 }
 
+/** Strongest SELECT row-lock intent after view/CTE expansion; no physical lock is acquired. */
+export type LoweredRowLocking = "none" | "keyShare" | "share" | "noKeyUpdate" | "update";
+
 interface LoweredBase {
+  /** B5 refuses a query with any non-none intent in READ ONLY (25006), before executing it. */
+  readonly rowLocking: LoweredRowLocking;
   readonly kind: StatementKind;
   readonly text: string;
   /** `context.catalog.version`: the plan is valid only at this version. */
@@ -88,9 +97,18 @@ interface LoweredPlanned extends LoweredBase {
   readonly plan: PhysicalPlan;
   /** Result columns, aligned with `plan.columns` (RETURNING for DML; empty without it). */
   readonly columns: readonly ResultColumn[];
+  /**
+   * From `lowerParameterized` only: how many trailing placeholder slots hold lifted literals.
+   * They follow the client's `parameters`; the owner binds `ParameterizedText.values` there.
+   */
+  readonly liftedParameters?: number;
   /** Every table id the plan reads (scans, lookups, fetches, through views and subqueries). */
   readonly reads: readonly number[];
-  /** Row counts the plan was costed with (lower/statistics.ts). */
+  /**
+   * Row counts the plan was costed with (lower/statistics.ts). Empty when no decision about the
+   * plan's shape read statistics (a unique-key lookup, a lone scan): the owner can skip
+   * `statisticsDrifted` for it.
+   */
   readonly basis: readonly StatisticsBasis[];
 }
 
@@ -129,15 +147,43 @@ export interface LoweredDdl extends LoweredBase {
 
 export interface LoweredTransactionControl extends LoweredBase {
   readonly kind: "transactionControl";
-  readonly action: "begin" | "commit" | "rollback" | "savepoint" | "rollbackTo" | "release";
+  /**
+   * `setTransaction` is SET TRANSACTION: it changes the current transaction's `modes` (the owner
+   * applies them; PostgreSQL refuses a change of access mode or isolation after the
+   * transaction's first query, 25001, and a SET TRANSACTION outside a transaction only warns).
+   */
+  readonly action:
+    "begin" | "commit" | "rollback" | "savepoint" | "rollbackTo" | "release" | "setTransaction";
   /** The savepoint name (normalized identifier), else null. */
   readonly savepoint: string | null;
   /**
-   * BEGIN READ ONLY / START TRANSACTION READ ONLY: the owner pins a snapshot and takes no writer
-   * slot (ruling R11.2). Needs the front-end change "access mode" in INVENTORY.md; false for
-   * every other statement.
+   * The transaction modes BEGIN / START TRANSACTION or SET TRANSACTION name, after PostgreSQL's
+   * rule that the last of each kind applies after all `modeItems` validate; null where none
+   * is named (the current
+   * or default mode stays). All null for the other actions.
+   */
+  readonly modes: TransactionModes;
+  /** Written order, including duplicates; validate these before using final `modes`. */
+  readonly modeItems: readonly TransactionModeItem[];
+  /**
+   * `modes.readOnly === true` on BEGIN / START TRANSACTION and SET TRANSACTION: the owner pins a
+   * snapshot and takes no writer slot (ruling R11.2). False otherwise, READ WRITE included.
    */
   readonly readOnly: boolean;
+}
+
+/** One transaction instruction, retained in written order for B5's admission checks. */
+export type TransactionModeItem =
+  | { readonly kind: "access"; readonly value: "readOnly" | "readWrite" }
+  | { readonly kind: "isolation"; readonly value: NonNullable<TransactionModes["isolation"]> }
+  | { readonly kind: "deferrable"; readonly value: boolean };
+
+/** Transaction modes as they apply (see `LoweredTransactionControl.modes`). */
+export interface TransactionModes {
+  readonly readOnly: boolean | null;
+  /** Every level the engine accepts is met by its one snapshot level; SERIALIZABLE is refused. */
+  readonly isolation: "read uncommitted" | "read committed" | "repeatable read" | null;
+  readonly deferrable: boolean | null;
 }
 
 export interface LoweredUtility extends LoweredBase {
@@ -186,5 +232,30 @@ export interface Lowerer {
    * as the `createTable` change SQL's CREATE TABLE would give (additive, Phase 2). The DSL names
    * no SQL types: `column.integer()` is INTEGER and `column.number()` DOUBLE PRECISION (R17.3).
    */
+  /**
+   * Literal auto-parameterization for the plan cache (lower/parameterize.ts): the statement with
+   * each integer or plain string literal that is the whole operand of `=` lifted into a trailing
+   * placeholder, and the cache key texts differing only in those values share; null when there
+   * is nothing to lift. Pure text work, no parse: cheap enough to run on every execution.
+   */
+  parameterize(text: string): ParameterizedText | null;
+  /**
+   * The plan every text with `parameterized.key` shares, or a NotParameterizable marker for the
+   * key. The plan cache rule (B5):
+   * - look the key up first; a ParameterizedPlan runs with `bindParameterized(plan,
+   *   parameterized, clientParameters)`, which refuses another key's text;
+   * - a NotParameterizable marker under the key means: lower this text with `lower(text)` and
+   *   cache that plan under the text itself, binding only the client's parameters;
+   * - on a miss, call this and cache its result (plan or marker) under the key.
+   * A plan from `lower(text)` is never cached under a normalized key: its literals are constants,
+   * so another text of the family would run with this text's values.
+   * The plan is accepted only when each lifted slot has exactly the type lowering gives its
+   * literal alone and is used where a slot is the literal (an `=` operand of the same type or an
+   * index key); otherwise, or when the rewrite does not lower, the marker.
+   */
+  lowerParameterized(
+    parameterized: ParameterizedText,
+    context: LoweringContext,
+  ): ParameterizedPlan | NotParameterizable;
   lowerSchemaTable(input: CreateTableInput, catalog: CatalogView): CatalogChange;
 }

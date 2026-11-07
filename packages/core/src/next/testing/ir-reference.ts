@@ -1,17 +1,22 @@
 /**
- * A row-at-a-time reference interpreter for the IR subset lowering emits at milestone M1, used
- * only by tests: it checks that lowered plans compute what the current engine computes
- * (lowering-differential.test.ts) before the real executor exists. It is deliberately simple
- * and slow, and it is not the executor's specification: the IR contract comments are.
+ * A row-at-a-time reference interpreter for the IR lowering emits (milestones M1 and M3), used
+ * only by tests: it checks that lowered plans compute what PostgreSQL and the current engine
+ * compute (the lowering-pglite and lowering-differential suites) before the real executor
+ * exists. It is deliberately simple and slow, and it is not the executor's specification: the
+ * IR contract comments are. Init plans run lazily, on the first read of their slot (R24.1);
+ * window frames follow PostgreSQL's ROWS / RANGE / GROUPS and EXCLUDE rules.
  *
  * Values: null; booleans; every integer as an exact `bigint`, range-checked at its type
- * (PostgreSQL's 22003); floats as numbers; text as strings. Decimal constants are approximated
- * as numbers (the tests only cast them to floats and integers); decimal arithmetic, intervals,
- * dates and JSON are outside the subset and throw `ReferenceUnsupportedError`.
+ * (PostgreSQL's 22003); floats as numbers (NaN sorts above every other value and equals NaN, as
+ * PostgreSQL's float order); text as strings; NUMERIC as an exact `Decimal`
+ * (reference-decimal.ts) with PostgreSQL's NaN and ±Infinity: literals, casts (rounded half
+ * away from zero to the scale), comparison, sorting, SUM and RANGE offsets are exact. Decimal
+ * addition/subtraction/multiplication/negation/absolute value are exact; division retains
+ * the reference's approximate subset. Intervals, dates and JSON are outside the subset.
  * Tables are arrays of rows in catalog order; a locator is the row's index.
  */
 import type { CatalogView, TableDef } from "../access/catalog.js";
-import type { Rel, ScalarExpr, SortKey } from "../ir/ir.js";
+import type { Rel, ScalarExpr, SortKey, WindowCall, WindowFrameBound } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
 import {
   INT16_MAX,
@@ -22,10 +27,12 @@ import {
   INT64_MIN,
   type PhysicalType,
 } from "../types.js";
+import { int128At } from "../vector/int128.js";
 import { isValid } from "../vector/validity.js";
-import type { FlatVector } from "../vector/vector.js";
+import { DecimalSpecial, type FlatVector } from "../vector/vector.js";
+import { Decimal, toDecimal } from "./reference-decimal.js";
 
-export type Value = null | boolean | bigint | number | string;
+export type Value = null | boolean | bigint | number | string | Decimal;
 export type Row = Value[];
 
 export class ReferenceUnsupportedError extends Error {
@@ -66,18 +73,20 @@ export function literalValue(vector: FlatVector): Value {
     case "varlen":
       return decoder.decode(data.bytes.subarray(data.offsets[0] ?? 0, data.offsets[1] ?? 0));
     case "decimal": {
-      // Approximated as a number: the tests only cast decimal constants to floats and integers.
+      const special = data.specials?.[0] ?? DecimalSpecial.finite;
+      if (special === DecimalSpecial.nan) return Decimal.special("nan");
+      if (special === DecimalSpecial.positiveInfinity) return Decimal.special("+inf");
+      if (special === DecimalSpecial.negativeInfinity) return Decimal.special("-inf");
       const coefficients = data.coefficients;
-      if (coefficients.repr === "int128" || data.specials !== null)
-        throw new ReferenceUnsupportedError("wide or special decimal literals");
       const coefficient =
-        coefficients.repr === "wide"
-          ? (coefficients.values[0] ?? 0n)
-          : coefficients.repr === "safe"
-            ? BigInt(coefficients.values[0] ?? 0)
-            : (coefficients.values[0] ?? 0n);
-      const scale = data.scale ?? data.scales?.[0] ?? 0;
-      return Number(coefficient) / 10 ** scale;
+        coefficients.repr === "int128"
+          ? int128At(coefficients.limbs, 0)
+          : coefficients.repr === "wide"
+            ? (coefficients.values[0] ?? 0n)
+            : coefficients.repr === "safe"
+              ? BigInt(coefficients.values[0] ?? 0)
+              : (coefficients.values[0] ?? 0n);
+      return Decimal.finite(coefficient, data.scale ?? data.scales?.[0] ?? 0);
     }
     default:
       throw new ReferenceUnsupportedError(`${data.layout} literals`);
@@ -113,6 +122,11 @@ function castValue(value: Value, from: PhysicalType, to: PhysicalType): Value {
   if (value === null) return null;
   if (isInteger(to)) {
     if (typeof value === "bigint") return checkRange(value, to);
+    if (value instanceof Decimal) {
+      if (!value.isFinite)
+        throw new ReferenceSqlError(`cannot convert ${value.toString()} to integer`, "0A000");
+      return checkRange(value.toInteger(), to);
+    }
     if (typeof value === "number")
       // PostgreSQL: float → int is rint (ties to even); numeric → int rounds half away from zero.
       return checkRange(BigInt(isFloat(from) ? roundHalfEven(value) : roundHalfAway(value)), to);
@@ -125,7 +139,7 @@ function castValue(value: Value, from: PhysicalType, to: PhysicalType): Value {
   }
   if (isFloat(to)) {
     const number =
-      typeof value === "bigint"
+      typeof value === "bigint" || value instanceof Decimal
         ? Number(value)
         : typeof value === "string"
           ? Number(value)
@@ -133,6 +147,30 @@ function castValue(value: Value, from: PhysicalType, to: PhysicalType): Value {
     if (Number.isNaN(number) && typeof value === "string" && value.trim().toLowerCase() !== "nan")
       throw new ReferenceSqlError(`invalid input syntax: "${value}"`, "22P02");
     return to.kind === "float32" ? Math.fround(number) : number;
+  }
+  if (to.kind === "decimal") {
+    // Exact: PostgreSQL rounds half away from zero to the scale and raises 22003 when the
+    // integer digits exceed precision − scale (or a typmod holds an infinity).
+    let decimal: Decimal;
+    if (typeof value === "bigint" || value instanceof Decimal) decimal = toDecimal(value);
+    else if (typeof value === "number")
+      decimal = Decimal.fromFloat(value, from.kind === "float32" ? 6 : 15);
+    else if (typeof value === "string") {
+      const parsed = Decimal.parse(value);
+      if (parsed === null)
+        throw new ReferenceSqlError(`invalid input syntax for type numeric: "${value}"`, "22P02");
+      decimal = parsed;
+    } else throw new ReferenceUnsupportedError(`casts from ${from.kind} to decimal`);
+    if (to.scale === null || decimal.isNaN) return decimal;
+    if (!decimal.isFinite) {
+      if (to.precision !== null) throw new ReferenceSqlError("numeric field overflow", "22003");
+      return decimal;
+    }
+    const rounded = decimal.rescale(to.scale);
+    const magnitude = rounded.coefficient < 0n ? -rounded.coefficient : rounded.coefficient;
+    if (to.precision !== null && magnitude >= 10n ** BigInt(to.precision))
+      throw new ReferenceSqlError("numeric field overflow", "22003");
+    return rounded;
   }
   if (to.kind === "text") {
     const text =
@@ -160,8 +198,18 @@ function castValue(value: Value, from: PhysicalType, to: PhysicalType): Value {
 function compareValues(left: Value, right: Value): number {
   if (typeof left === "bigint" && typeof right === "bigint")
     return left < right ? -1 : left > right ? 1 : 0;
-  if (typeof left === "number" && typeof right === "number")
+  if (typeof left === "number" && typeof right === "number") {
+    // PostgreSQL's float order: NaN above every other value, and equal to NaN.
+    if (Number.isNaN(left) || Number.isNaN(right))
+      return Number(Number.isNaN(left)) - Number(Number.isNaN(right));
     return left < right ? -1 : left > right ? 1 : 0;
+  }
+  if (
+    (left instanceof Decimal || right instanceof Decimal) &&
+    (typeof left === "bigint" || typeof left === "number" || left instanceof Decimal) &&
+    (typeof right === "bigint" || typeof right === "number" || right instanceof Decimal)
+  )
+    return toDecimal(left).compare(toDecimal(right));
   if (typeof left === "string" && typeof right === "string") {
     // Byte (code point) order, C8.
     const a = Array.from(left);
@@ -239,24 +287,27 @@ function arithmetic(fn: string, args: readonly Value[], type: PhysicalType): Val
     }
   }
   if (type.kind === "decimal") {
-    // Approximated as numbers, like decimal constants (see the module comment): enough for the
-    // small constants the tests compute with, not an exact NUMERIC.
-    const x = Number(a);
-    const y = Number(b);
+    const x = toDecimal(a as bigint | number | Decimal);
+    const y = b === undefined ? Decimal.fromInteger(0n) : toDecimal(b as bigint | number | Decimal);
     switch (fn) {
       case "add":
-        return x + y;
+        return x.add(y);
       case "sub":
-        return x - y;
+        return x.add(y.negate());
       case "mul":
-        return x * y;
+        if (x.isNaN || y.isNaN || (!x.isFinite && y.sign === 0) || (!y.isFinite && x.sign === 0))
+          return Decimal.special("nan");
+        if (!x.isFinite || !y.isFinite)
+          return Decimal.special(x.sign * y.sign < 0 ? "-inf" : "+inf");
+        return Decimal.finite(x.coefficient * y.coefficient, x.scale + y.scale);
       case "div":
-        if (y === 0) throw new ReferenceSqlError("division by zero", "22012");
-        return x / y;
+        // Preserve the reference's existing approximate division subset.
+        if (y.sign === 0) throw new ReferenceSqlError("division by zero", "22012");
+        return x.toNumber() / y.toNumber();
       case "neg":
-        return -x;
+        return x.negate();
       case "abs":
-        return Math.abs(x);
+        return x.sign < 0 ? x.negate() : x;
     }
   }
   throw new ReferenceUnsupportedError(`${fn} over ${type.kind}`);
@@ -270,6 +321,34 @@ export interface Environment {
   readonly params: readonly Value[];
   readonly rules: (table: TableDef) => TableRuleExpressions;
   sequences: Map<number, bigint>;
+  /** Recursive work tables in scope, by id. */
+  readonly workTables?: ReadonlyMap<number, readonly Row[]>;
+  /**
+   * Init plans by slot (ir.ts `initPlans`, R24.1): each runs on the first read of its slot and
+   * keeps its value, so a query whose rows never reach the read never runs it.
+   */
+  readonly initPlans?: ReadonlyMap<number, () => Value>;
+}
+
+/** `env` with `plan`'s init plans evaluated lazily, once each, on the first read of their slot. */
+export function withInitPlans(
+  plan: { readonly initPlans: ReadonlyArray<{ readonly slot: number; readonly plan: Rel }> },
+  env: Environment,
+): Environment {
+  const thunks = new Map<number, () => Value>();
+  const lazy: Environment = { ...env, initPlans: thunks };
+  for (const init of plan.initPlans) {
+    let done = false;
+    let value: Value = null;
+    thunks.set(init.slot, () => {
+      if (!done) {
+        value = run(init.plan, lazy)[0]?.[0] ?? null;
+        done = true;
+      }
+      return value;
+    });
+  }
+  return lazy;
 }
 
 export function evaluate(expr: ScalarExpr, row: readonly Value[], env: Environment): Value {
@@ -284,8 +363,10 @@ export function evaluate(expr: ScalarExpr, row: readonly Value[], env: Environme
     }
     case "literal":
       return literalValue(expr.value);
-    case "param":
-      return env.params[expr.slot] ?? null;
+    case "param": {
+      const init = env.initPlans?.get(expr.slot);
+      return init === undefined ? (env.params[expr.slot] ?? null) : init();
+    }
     case "cast": {
       const value = evaluate(expr.input, row, env);
       if (
@@ -483,11 +564,21 @@ function aggregate(fn: string, values: readonly Value[], type: PhysicalType): Va
           type,
         );
       if (type.kind === "decimal")
-        return present.reduce<bigint>((sum, value) => sum + (value as bigint), 0n);
+        return present.reduce<Decimal>(
+          (sum, value) => sum.add(toDecimal(value as bigint | number | Decimal)),
+          Decimal.fromInteger(0n),
+        );
       return present.reduce<number>((sum, value) => sum + (value as number), 0);
     case "avg":
       if (present.length === 0) return null;
       return present.reduce<number>((sum, value) => sum + Number(value), 0) / present.length;
+    case "single_value":
+      if (values.length > 1)
+        throw new ReferenceSqlError(
+          "more than one row returned by a subquery used as an expression",
+          "21000",
+        );
+      return values[0] ?? null;
     case "min":
     case "max":
       if (present.length === 0) return null;
@@ -576,19 +667,36 @@ export function run(rel: Rel, env: Environment): Row[] {
       ]);
     }
     case "sort": {
+      const limit = boundValue(rel.limit, env);
+      // LIMIT 0 pulls no row, so nothing below it is evaluated (PostgreSQL's Limit node).
+      if (limit === 0) return [];
       const sorted = sortRows(run(rel.input, env), rel.keys, env);
       const offset = boundValue(rel.offset, env) ?? 0;
-      const limit = boundValue(rel.limit, env);
       return sorted.slice(offset, limit === null ? undefined : offset + limit);
     }
     case "limit": {
+      const limit = boundValue(rel.limit, env);
+      if (limit === 0) return [];
       const rows = run(rel.input, env);
       const offset = boundValue(rel.offset, env) ?? 0;
-      const limit = boundValue(rel.limit, env);
       return rows.slice(offset, limit === null ? undefined : offset + limit);
     }
     case "modify":
       return modifyRows(rel, env);
+    case "join":
+      return joinRows(rel, env);
+    case "apply":
+      return applyRows(rel, env);
+    case "window":
+      return windowRows(rel, env);
+    case "setOp":
+      return setOpRows(rel, env);
+    case "recursive":
+      return recursiveRows(rel, env);
+    case "workTableScan":
+      return (env.workTables?.get(rel.workTable) ?? []).map((row) => [...row]);
+    case "indexRange":
+      return indexRangeRows(rel, env);
     case "input":
       return (env.input ?? []).map((row) => [...row]);
     default:
@@ -637,10 +745,58 @@ function modifyRows(rel: Extract<Rel, { op: "modify" }>, env: Environment): Row[
     }
     return -1;
   };
-  const returning = (row: Row): void => {
+  const returning = (row: Row, extra: readonly Value[] = []): void => {
     if (rel.returning !== null)
-      returned.push(rel.returning.map((expr) => evaluate(expr, row, env)));
+      returned.push(rel.returning.map((expr) => evaluate(expr, [...row, ...extra], env)));
   };
+  const passthrough = rel.passthrough ?? 0;
+  if (rel.kind === "merge" && rel.merge !== undefined) {
+    const spec = rel.merge;
+    for (const row of input) {
+      const locatorValue = row[spec.sourceColumns] ?? null;
+      const matched = locatorValue !== null;
+      for (const action of spec.actions) {
+        if (action.when !== (matched ? "matched" : "notMatched")) continue;
+        if (action.condition !== null && evaluate(action.condition, row, env) !== true) continue;
+        if (action.action.kind === "nothing") break;
+        if (action.when === "matched") {
+          const locator = Number(locatorValue);
+          if (touched.has(locator))
+            throw new ReferenceSqlError("MERGE affects a row a second time", "21000");
+          touched.add(locator);
+          if (action.action.kind === "delete") {
+            stored[locator] = [];
+            break;
+          }
+          const next = [...(stored[locator] ?? [])];
+          const reads = [...row];
+          for (const [j, id] of action.action.assigned.entries()) {
+            const value = evaluate(at(action.action.values, j), reads, env);
+            reads.push(value);
+            next[table.columns.findIndex((column) => column.id === id)] = value;
+          }
+          validate(next);
+          stored[locator] = [];
+          if (conflict(next, []) !== -1) throw new ReferenceSqlError("duplicate key", "23505");
+          stored[locator] = next;
+          break;
+        }
+        const reads = [...row];
+        const next: Row = [];
+        for (const value of action.action.values) {
+          const computed = evaluate(value, reads, env);
+          reads.push(computed);
+          next.push(computed);
+        }
+        validate(next);
+        if (conflict(next, []) !== -1) throw new ReferenceSqlError("duplicate key", "23505");
+        stored.push(next);
+        touched.add(stored.length - 1);
+        break;
+      }
+    }
+    return [];
+  }
   for (const row of input) {
     if (rel.kind === "insert" || rel.kind === "upsert") {
       validate(row);
@@ -674,9 +830,16 @@ function modifyRows(rel: Extract<Rel, { op: "modify" }>, env: Environment): Row[
     } else {
       const locator = Number(row[0]);
       const existing = stored[locator];
+      const extra = passthrough === 0 ? [] : row.slice(row.length - passthrough);
+      if (touched.has(locator)) {
+        // A row affected twice: the first wins (UPDATE … FROM), else 21000.
+        if (rel.onRepeat === "first") continue;
+        throw new ReferenceSqlError("command affects a row a second time", "21000");
+      }
       if (existing === undefined || existing.length === 0) continue;
+      touched.add(locator);
       if (rel.kind === "delete") {
-        returning(existing);
+        returning(existing, extra);
         stored[locator] = [];
         continue;
       }
@@ -687,8 +850,514 @@ function modifyRows(rel: Extract<Rel, { op: "modify" }>, env: Environment): Row[
       stored[locator] = [];
       if (conflict(next, []) !== -1) throw new ReferenceSqlError("duplicate key", "23505");
       stored[locator] = next;
-      returning(next);
+      returning(next, extra);
     }
   }
   return returned;
+}
+
+/** One key per row of equal values (peers, groups, DISTINCT): NaN = NaN, 1.50 = 1.5. */
+const rowKey = (row: readonly Value[]): string =>
+  JSON.stringify(row, (_key, value: unknown) =>
+    typeof value === "bigint"
+      ? `${value.toString()}n`
+      : value instanceof Decimal
+        ? `${value.key()}d`
+        : typeof value === "number" && !Number.isFinite(value)
+          ? `${String(value)}f`
+          : value,
+  );
+
+function keysMatch(
+  rel: Extract<Rel, { op: "join" }>,
+  left: Row,
+  right: Row,
+  from: number,
+  to: number,
+  env: Environment,
+): boolean | null {
+  let result: boolean | null = true;
+  for (let index = from; index < to; index += 1) {
+    const l = evaluate(at(rel.leftKeys, index), left, env);
+    const r = evaluate(at(rel.rightKeys, index), right, env);
+    let equal: boolean | null;
+    if (rel.nullSafe[index] === true)
+      equal = l === null || r === null ? l === r : compareValues(l, r) === 0;
+    else equal = l === null || r === null ? null : compareValues(l, r) === 0;
+    if (equal === false) return false;
+    if (equal === null) result = null;
+  }
+  return result;
+}
+
+function joinRows(rel: Extract<Rel, { op: "join" }>, env: Environment): Row[] {
+  const left = run(rel.left, env);
+  const right = run(rel.right, env);
+  const keys = rel.leftKeys.length;
+  const nullsLeft = (): Row => rel.left.output.map(() => null);
+  const nullsRight = (): Row => rel.right.output.map(() => null);
+  if (rel.kind === "mark") {
+    // R20.5: participation by correlation keys and `filter`; the mark from the tested keys and
+    // `residual`, three-valued.
+    const correlated = rel.correlated ?? 0;
+    return left.map((l) => {
+      let sawTrue = false;
+      let sawUnknown = false;
+      for (const r of right) {
+        if (keysMatch(rel, l, r, 0, correlated, env) !== true) continue;
+        const both = [...l, ...r];
+        if (
+          rel.filter !== undefined &&
+          rel.filter !== null &&
+          evaluate(rel.filter, both, env) !== true
+        )
+          continue;
+        let compared = keysMatch(rel, l, r, correlated, keys, env);
+        if (compared !== false && rel.residual !== null) {
+          const residual = evaluate(rel.residual, both, env);
+          compared = residual === false ? false : residual === null ? null : compared;
+        }
+        if (compared === true) {
+          sawTrue = true;
+          break;
+        }
+        if (compared === null) sawUnknown = true;
+      }
+      return [...l, sawTrue ? true : sawUnknown ? null : false];
+    });
+  }
+  const matches = (l: Row, r: Row): boolean =>
+    keysMatch(rel, l, r, 0, keys, env) === true &&
+    (rel.residual === null || evaluate(rel.residual, [...l, ...r], env) === true);
+  const out: Row[] = [];
+  const matchedRight = new Set<number>();
+  for (const l of left) {
+    let any = false;
+    for (const [index, r] of right.entries()) {
+      if (!matches(l, r)) continue;
+      any = true;
+      matchedRight.add(index);
+      if (rel.kind === "semi" || rel.kind === "anti") break;
+      out.push([...l, ...r]);
+    }
+    if (rel.kind === "semi" && any) out.push([...l]);
+    if (rel.kind === "anti" && !any) out.push([...l]);
+    if ((rel.kind === "left" || rel.kind === "full") && !any) out.push([...l, ...nullsRight()]);
+  }
+  if (rel.kind === "full" || rel.kind === "right")
+    for (const [index, r] of right.entries())
+      if (!matchedRight.has(index)) out.push([...nullsLeft(), ...r]);
+  return out;
+}
+
+function quantify(
+  test: Value,
+  values: readonly Value[],
+  cmp: "=" | "<>" | "<" | "<=" | ">" | ">=",
+  quantifier: "any" | "all",
+): boolean | null {
+  let unknown = false;
+  for (const value of values) {
+    let result: boolean | null;
+    if (test === null || value === null) result = null;
+    else {
+      const order = compareValues(test, value);
+      result =
+        cmp === "="
+          ? order === 0
+          : cmp === "<>"
+            ? order !== 0
+            : cmp === "<"
+              ? order < 0
+              : cmp === "<="
+                ? order <= 0
+                : cmp === ">"
+                  ? order > 0
+                  : order >= 0;
+    }
+    if (quantifier === "any" && result === true) return true;
+    if (quantifier === "all" && result === false) return false;
+    if (result === null) unknown = true;
+  }
+  if (unknown) return null;
+  return quantifier === "all";
+}
+
+function applyRows(rel: Extract<Rel, { op: "apply" }>, env: Environment): Row[] {
+  return run(rel.outer, env).map((row) => {
+    const params = [...env.params];
+    for (const binding of rel.bindings) params[binding.slot] = evaluate(binding.expr, row, env);
+    const rows = run(rel.inner, { ...env, params });
+    if (rel.mode === "scalar") {
+      if (rows.length > 1)
+        throw new ReferenceSqlError(
+          "more than one row returned by a subquery used as an expression",
+          "21000",
+        );
+      return [...row, rows[0]?.[0] ?? null];
+    }
+    if (rel.mode === "exists") return [...row, rows.length > 0];
+    const quantified = rel.quantified;
+    if (quantified === null)
+      throw new ReferenceUnsupportedError("a quantified apply without its test");
+    const test = evaluate(quantified.test, row, env);
+    return [
+      ...row,
+      quantify(
+        test,
+        rows.map((inner) => inner[0] ?? null),
+        quantified.cmp,
+        quantified.quantifier,
+      ),
+    ];
+  });
+}
+
+/**
+ * PostgreSQL's in_range support functions: whether `value` is <= (`less`) or >= `base` − `offset`
+ * (`sub`) or + `offset`. Integers compare exactly (a sum past the type's range is beyond every
+ * value); float8 computes the bound in floating point, with NaN above every value and the
+ * not-a-number sums of an infinite base and offset taken as containing every value
+ * (in_range_float8_float8); NUMERIC is exact, with its NaN and infinities
+ * (in_range_numeric_numeric). A negative or NaN offset is 22013.
+ */
+function inRange(value: Value, base: Value, offset: Value, sub: boolean, less: boolean): boolean {
+  if (typeof base === "bigint" && typeof value === "bigint") {
+    if (typeof offset !== "bigint")
+      throw new ReferenceUnsupportedError(`an integer RANGE key with a ${typeof offset} offset`);
+    if (offset < 0n) throw new ReferenceSqlError("invalid preceding or following size", "22013");
+    const sum = sub ? base - offset : base + offset;
+    return less ? value <= sum : value >= sum;
+  }
+  if (typeof base === "number" && typeof value === "number") {
+    const size = Number(offset);
+    if (Number.isNaN(size) || size < 0)
+      throw new ReferenceSqlError("invalid preceding or following size", "22013");
+    if (Number.isNaN(value)) return Number.isNaN(base) ? true : !less;
+    if (Number.isNaN(base)) return less;
+    if (size === Infinity && Math.abs(base) === Infinity && (sub ? base > 0 : base < 0))
+      return true;
+    const sum = sub ? base - size : base + size;
+    return less ? value <= sum : value >= sum;
+  }
+  if (base instanceof Decimal && value instanceof Decimal) {
+    if (typeof offset !== "bigint" && typeof offset !== "number" && !(offset instanceof Decimal))
+      throw new ReferenceUnsupportedError(`a numeric RANGE key with a ${typeof offset} offset`);
+    const size = toDecimal(offset);
+    if (size.isNaN || size.sign < 0)
+      throw new ReferenceSqlError("invalid preceding or following size", "22013");
+    if (value.isNaN) return base.isNaN ? true : !less;
+    if (base.isNaN) return less;
+    if (!size.isFinite) {
+      if (sub ? base.special === "+inf" : base.special === "-inf") return true;
+      if (sub) return less ? value.special === "-inf" : true;
+      return less ? true : value.special === "+inf";
+    }
+    if (!value.isFinite) {
+      if (value.special === "+inf") return base.special === "+inf" ? true : !less;
+      return base.special === "-inf" ? true : less;
+    }
+    if (!base.isFinite) return base.special === "-inf" ? !less : less;
+    const order = value.compare(base.add(sub ? size.negate() : size));
+    return less ? order <= 0 : order >= 0;
+  }
+  throw new ReferenceUnsupportedError(`RANGE offsets over ${typeof base} keys`);
+}
+
+function windowRows(rel: Extract<Rel, { op: "window" }>, env: Environment): Row[] {
+  // PostgreSQL calculates constant frame offsets before pulling even the first input row.
+  // RANGE's negative/NaN check belongs to in_range; only NULL is a startup error there.
+  for (const call of rel.functions) {
+    if (call.frame === null) continue;
+    for (const bound of [call.frame.start, call.frame.end]) {
+      if (bound.offset === null) continue;
+      const amount = evaluate(bound.offset, [], env);
+      if (amount === null) throw new ReferenceSqlError("frame offset must not be null", "22004");
+      if (call.frame.unit !== "range" && Number(amount) < 0)
+        throw new ReferenceSqlError("frame offset must not be negative", "22013");
+    }
+  }
+  const rows = run(rel.input, env);
+  const partitions = new Map<string, Row[]>();
+  for (const row of rows) {
+    const key = rowKey(rel.partitionBy.map((index) => row[index] ?? null));
+    partitions.set(key, [...(partitions.get(key) ?? []), row]);
+  }
+  const out: Row[] = [];
+  for (const partition of partitions.values()) {
+    const sorted = sortRows(partition, rel.orderBy, env);
+    const orderKey = (row: Row) => rowKey(rel.orderBy.map((key) => evaluate(key.expr, row, env)));
+    const peersEnd = sorted.map((row, index) => {
+      let end = index;
+      while (end + 1 < sorted.length && orderKey(at(sorted, end + 1)) === orderKey(row)) end += 1;
+      return end;
+    });
+    const peersStart = sorted.map((row, index) => {
+      let start = index;
+      while (start > 0 && orderKey(at(sorted, start - 1)) === orderKey(row)) start -= 1;
+      return start;
+    });
+    const n = sorted.length;
+    // Peer groups in order: each row's group number, and each group's first and last row.
+    const groupOf: number[] = [];
+    const groups: Array<[number, number]> = [];
+    for (let index = 0; index < n; index += 1) {
+      if (index === 0 || peersStart[index] === index)
+        groups.push([index, peersEnd[index] ?? index]);
+      groupOf.push(groups.length - 1);
+    }
+    const sortKey = (row: Row): Value => {
+      const [key] = rel.orderBy;
+      return key === undefined ? null : evaluate(key.expr, row, env);
+    };
+    const descending = rel.orderBy[0]?.direction === "desc";
+    const nullsFirst = (rel.orderBy[0]?.nulls ?? (descending ? "first" : "last")) === "first";
+    /** The rows of `call`'s frame for the row at `index`, in order (PostgreSQL's frame rules). */
+    const frameOf = (call: WindowCall, row: Row, index: number): Row[] => {
+      const frame = call.frame;
+      const peers: [number, number] = [peersStart[index] ?? index, peersEnd[index] ?? index];
+      if (frame === null) return rel.orderBy.length === 0 ? sorted : sorted.slice(0, peers[1] + 1);
+      const offset = (bound: WindowFrameBound): Value =>
+        bound.offset === null ? null : evaluate(bound.offset, row, env);
+      const position = (bound: WindowFrameBound, end: boolean): number => {
+        switch (bound.kind) {
+          case "unbounded-preceding":
+            return 0;
+          case "unbounded-following":
+            return n - 1;
+          case "current-row":
+            return frame.unit === "rows" ? index : end ? peers[1] : peers[0];
+        }
+        const amount = offset(bound);
+        if (amount === null) throw new ReferenceSqlError("frame offset must not be null", "22004");
+        const sign = bound.kind === "preceding" ? -1 : 1;
+        if (frame.unit === "rows" || frame.unit === "groups") {
+          if (Number(amount) < 0)
+            throw new ReferenceSqlError("frame offset must not be negative", "22013");
+          if (frame.unit === "rows") return index + sign * Number(amount);
+          const group = (groupOf[index] ?? 0) + sign * Number(amount);
+          if (group < 0) return end ? -1 : 0;
+          if (group >= groups.length) return end ? n - 1 : n;
+          const [first, last] = at(groups, group);
+          return end ? last : first;
+        }
+        // RANGE with an offset, as PostgreSQL's nodeWindowAgg: a frame start is the first row
+        // for which in_range(key, own, amount, sub, less) holds, a frame end the last. `sub` is
+        // PRECEDING, flipped (with `less`) for a descending key. NULL keys sort where NULLS
+        // FIRST / LAST puts them, so a range can run into them; a NULL key's own frame is its
+        // NULL peers.
+        const own = sortKey(row);
+        if (own === null) return end ? peers[1] : peers[0];
+        const sub = (bound.kind === "preceding") !== descending;
+        const less = end !== descending;
+        const holds = (key: Value): boolean => {
+          // NULLS FIRST: before every key (never past a start, always before an end).
+          if (key === null) return nullsFirst ? end : !end;
+          return inRange(key, own, amount, sub, less);
+        };
+        if (end) {
+          for (let candidate = n - 1; candidate >= 0; candidate -= 1)
+            if (holds(sortKey(at(sorted, candidate)))) return candidate;
+          return -1;
+        }
+        for (let candidate = 0; candidate < n; candidate += 1)
+          if (holds(sortKey(at(sorted, candidate)))) return candidate;
+        return n;
+      };
+      const start = Math.max(0, position(frame.start, false));
+      const end = Math.min(n - 1, position(frame.end, true));
+      const members: number[] = [];
+      for (let candidate = start; candidate <= end; candidate += 1) {
+        const peer = candidate >= peers[0] && candidate <= peers[1];
+        if (frame.exclude === "current-row" && candidate === index) continue;
+        if (frame.exclude === "group" && peer) continue;
+        if (frame.exclude === "ties" && peer && candidate !== index) continue;
+        members.push(candidate);
+      }
+      return members.map((member) => at(sorted, member));
+    };
+    for (const [index, row] of sorted.entries()) {
+      const values = rel.functions.map((call) => {
+        const frame = frameOf(call, row, index);
+        const arg = (target: Row) =>
+          call.args[0] === undefined ? true : evaluate(call.args[0], target, env);
+        switch (call.fn) {
+          case "row_number":
+            return BigInt(index + 1);
+          case "rank":
+            return BigInt((peersStart[index] ?? index) + 1);
+          case "dense_rank":
+            return BigInt((groupOf[index] ?? 0) + 1);
+          case "percent_rank":
+            return n <= 1 ? 0 : (peersStart[index] ?? index) / (n - 1);
+          case "cume_dist":
+            return ((peersEnd[index] ?? index) + 1) / n;
+          case "ntile": {
+            const buckets = call.args[0] === undefined ? null : evaluate(call.args[0], row, env);
+            if (buckets === null) return null;
+            const count = Number(buckets);
+            if (count <= 0)
+              throw new ReferenceSqlError("argument of ntile must be greater than zero", "22014");
+            // PostgreSQL: n / count rows per bucket, the first n % count buckets one row more.
+            const size = Math.floor(n / count);
+            const larger = n % count;
+            const boundary = larger * (size + 1);
+            return BigInt(
+              index < boundary
+                ? Math.floor(index / (size + 1)) + 1
+                : larger + Math.floor((index - boundary) / Math.max(size, 1)) + 1,
+            );
+          }
+          case "nth_value": {
+            const nth = call.args[1] === undefined ? null : evaluate(call.args[1], row, env);
+            if (nth === null) return null;
+            if (Number(nth) <= 0)
+              throw new ReferenceSqlError(
+                "argument of nth_value must be greater than zero",
+                "22016",
+              );
+            const target = frame[Number(nth) - 1];
+            return target === undefined ? null : arg(target);
+          }
+          case "lag":
+          case "lead": {
+            const offset = Number(
+              call.args[1] === undefined ? 1n : evaluate(call.args[1], row, env),
+            );
+            const target = sorted[call.fn === "lag" ? index - offset : index + offset];
+            if (target !== undefined) return arg(target);
+            return call.args[2] === undefined ? null : evaluate(call.args[2], row, env);
+          }
+          case "first_value":
+            return frame[0] === undefined ? null : arg(frame[0]);
+          case "last_value": {
+            const last = frame.at(-1);
+            return last === undefined ? null : arg(last);
+          }
+          default:
+            return aggregate(call.fn, frame.map(arg), call.type);
+        }
+      });
+      out.push([...row, ...values]);
+    }
+  }
+  return out;
+}
+
+function setOpRows(rel: Extract<Rel, { op: "setOp" }>, env: Environment): Row[] {
+  const [first = [], ...others] = rel.inputs.map((input) => run(input, env));
+  const distinct = (rows: readonly Row[]): Row[] => {
+    const seen = new Set<string>();
+    return rows.filter((row) => {
+      const key = rowKey(row);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  };
+  let acc = first;
+  for (const other of others) {
+    if (rel.kind === "union") acc = [...acc, ...other];
+    else {
+      // Multiset counts of the right side: INTERSECT keeps, EXCEPT removes, one per occurrence
+      // with ALL; any occurrence without.
+      const counts = new Map<string, number>();
+      for (const row of other) counts.set(rowKey(row), (counts.get(rowKey(row)) ?? 0) + 1);
+      acc = acc.filter((row) => {
+        const key = rowKey(row);
+        const count = counts.get(key) ?? 0;
+        if (rel.all && count > 0) counts.set(key, count - 1);
+        return rel.kind === "intersect" ? count > 0 : count === 0;
+      });
+    }
+    if (!rel.all) acc = distinct(acc);
+  }
+  return acc;
+}
+
+function recursiveRows(rel: Extract<Rel, { op: "recursive" }>, env: Environment): Row[] {
+  const seen = new Set<string>();
+  const fresh = (rows: readonly Row[]): Row[] =>
+    rel.all
+      ? [...rows]
+      : rows.filter((row) => {
+          const key = rowKey(row);
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+  let work = fresh(run(rel.base, env));
+  const result = [...work];
+  for (let iteration = 0; work.length > 0; iteration += 1) {
+    if (iteration > 10_000) throw new ReferenceUnsupportedError("recursion past 10,000 steps");
+    const workTables = new Map(env.workTables ?? []);
+    workTables.set(rel.workTable, work);
+    work = fresh(run(rel.step, { ...env, workTables }));
+    result.push(...work);
+  }
+  return result;
+}
+
+function indexRangeRows(rel: Extract<Rel, { op: "indexRange" }>, env: Environment): Row[] {
+  const table = env.catalog.table(rel.tableId);
+  const index = table?.indexes.find((candidate) => candidate.id === rel.indexId);
+  if (table === undefined || index === undefined)
+    throw new ReferenceUnsupportedError("a missing index");
+  const keyPositions = index.columnIds.map((id) =>
+    table.columns.findIndex((column) => column.id === id),
+  );
+  const positions = rel.columns.map((id) => table.columns.findIndex((column) => column.id === id));
+  const bound = (side: typeof rel.lower) =>
+    side === null
+      ? null
+      : { keys: side.keys.map((key) => evaluate(key, [], env)), inclusive: side.inclusive };
+  const lower = bound(rel.lower);
+  const upper = bound(rel.upper);
+  if ([...(lower?.keys ?? []), ...(upper?.keys ?? [])].some((value) => value === null)) return [];
+  const compareTo = (row: Row, keys: readonly Value[]): number => {
+    for (const [k, key] of keys.entries()) {
+      const value = row[keyPositions[k] ?? -1] ?? null;
+      if (value === null || key === null) return Number.NaN;
+      const order = compareValues(value, key);
+      if (order !== 0) return order;
+    }
+    return 0;
+  };
+  const stored = env.tables.get(rel.tableId) ?? [];
+  const selected = stored
+    .map((row, locator) => ({ row, locator }))
+    .filter(({ row }) => {
+      if (row.length === 0) return false;
+      if (lower !== null) {
+        const order = compareTo(row, lower.keys);
+        if (Number.isNaN(order) || order < 0 || (order === 0 && !lower.inclusive)) return false;
+      }
+      if (upper !== null) {
+        const order = compareTo(row, upper.keys);
+        if (Number.isNaN(order) || order > 0 || (order === 0 && !upper.inclusive)) return false;
+      }
+      return true;
+    })
+    .sort((a, b) => {
+      for (const position of keyPositions) {
+        const x = a.row[position] ?? null;
+        const y = b.row[position] ?? null;
+        if (x === null || y === null) continue;
+        const order = compareValues(x, y);
+        if (order !== 0) return rel.descending ? -order : order;
+      }
+      return a.locator - b.locator;
+    });
+  return selected.map(({ row, locator }) => {
+    const out = positions.map((position) => row[position] ?? null);
+    if (rel.emitLocator) out.push(BigInt(locator));
+    return out;
+  });
+}
+
+/** `items[index]`, which the plan's shape guarantees exists. */
+function at<T>(items: ArrayLike<T>, index: number): T {
+  const item = items[index];
+  if (item === undefined) throw new Error(`item ${String(index)} is missing`);
+  return item;
 }

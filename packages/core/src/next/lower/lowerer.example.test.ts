@@ -10,6 +10,7 @@ import type { ExecutorCosts } from "../ir/costs.js";
 import type { PhysicalPlan } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
 import type { LoweredStatement, Lowerer, LoweringContext } from "./lowerer.js";
+import type { NotParameterizable, ParameterizedText } from "./parameterize.js";
 import { resultColumn } from "./result.js";
 import { statisticsDrifted, type PlanningStatistics } from "./statistics.js";
 
@@ -85,6 +86,7 @@ class StubLowerer implements Lowerer {
   lower(text: string, context: LoweringContext): LoweredStatement {
     this.calls += 1;
     const base = {
+      rowLocking: "none" as const,
       text,
       catalogVersion: context.catalog.version,
       controlsTransaction: false,
@@ -113,6 +115,12 @@ class StubLowerer implements Lowerer {
   }
   lowerWrite(): never {
     throw new Error("not used here");
+  }
+  parameterize(): null {
+    return null;
+  }
+  lowerParameterized(parameterized: ParameterizedText): NotParameterizable {
+    return { kind: "notParameterizable", key: parameterized.key };
   }
   lowerSchemaTable(): never {
     throw new Error("not used here");

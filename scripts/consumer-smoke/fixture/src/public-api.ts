@@ -73,3 +73,12 @@ export type InstalledPublicJson = readonly [
   typeof corePackage,
   typeof sqlFeatureMatrix,
 ];
+
+/** Parser-only frame metadata must not be reachable through a published plan type. */
+type PublicFrameBound = NonNullable<
+  NonNullable<Plan.TableSource["windowed"]>["windows"][number]["frame"]
+>["start"];
+type AssertFrameType<T extends true> = T;
+export type FrameMetadataIsPrivate = AssertFrameType<
+  Exclude<keyof PublicFrameBound, "kind" | "offset"> extends never ? true : false
+>;

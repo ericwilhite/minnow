@@ -12,8 +12,11 @@
  * - **Plain data.** No functions, classes or cycles: a plan can be cached per (statement text,
  *   catalog version), compared structurally, and structured-cloned to a helper.
  * - **Bound once.** Placeholders and the statement clock are parameter slots (`param`), filled per
- *   execution. Uncorrelated scalar subqueries are `initPlans` that fill slots before the main plan
- *   runs. A plan never changes shape with parameter values.
+ *   execution. Uncorrelated scalar subqueries are `initPlans`, each filling one slot lazily: it
+ *   runs on the first read of its slot during execution, once per query, never before the root
+ *   needs the value (R24.1). A query whose rows never reach the read (WHERE false, LIMIT 0, a
+ *   CASE branch not taken) never runs it and never raises its errors (21000, 22012, …), as in
+ *   PostgreSQL. A plan never changes shape with parameter values.
  * - **Semantics stay in the front end's laws.** SQL NULL, three-valued logic, PostgreSQL overflow
  *   errors and rounding are the kernels' job; the IR only names them. Where the front end
  *   rewrote SQL (decorrelation, view expansion, NATURAL/USING), the IR receives the rewritten
@@ -159,6 +162,7 @@ export interface AggregateCall {
 export interface WindowFrameBound {
   readonly kind:
     "unbounded-preceding" | "preceding" | "current-row" | "following" | "unbounded-following";
+  /** ROWS/GROUPS use int8; RANGE uses its btree in_range offset type, possibly wider than the key. */
   readonly offset: ScalarExpr | null;
 }
 
@@ -502,7 +506,10 @@ export interface PhysicalPlan {
   readonly placeholderCount: number;
   /** Slot of the statement clock (CURRENT_TIMESTAMP and friends), or null. */
   readonly clockSlot: number | null;
-  /** Uncorrelated scalar subqueries: run in order, each fills one slot. */
+  /**
+   * Uncorrelated scalar subqueries, each filling one slot on the first read of that slot, once
+   * per query (see the module comment, R24.1). An init plan may read the slots of others.
+   */
   readonly initPlans: ReadonlyArray<{ readonly slot: number; readonly plan: Rel }>;
   /** Catalog version the plan was lowered against; a mismatch means re-lower. */
   readonly catalogVersion: number;

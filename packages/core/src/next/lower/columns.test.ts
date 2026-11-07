@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { compileStatement, compileWithDeclaredTypes } from "../../engine/query.js";
 import { declaredColumnType, type FrontEndColumn } from "./columns.js";
-import { UnsupportedPlanError } from "../errors.js";
+import { PlanningError } from "./errors.js";
 
 function columns(sql: string, declared = true): Record<string, FrontEndColumn> {
   const statement = declared
@@ -57,9 +57,11 @@ describe("declaredColumnType (DECISIONS.md C5)", () => {
     expect(() => type(t.a)).toThrow("Column t.a has no declared SQL type name");
   });
 
-  it("refuses what the new catalog cannot declare yet", () => {
+  it("refuses a type name the catalog does not have (42704)", () => {
+    // The new catalog has no named types yet (CREATE TYPE is refused, R17.7), so `mood` names
+    // nothing, as in PostgreSQL before CREATE TYPE mood.
     const t = columns("CREATE TABLE t (a mood)");
-    expect(() => type(t.a)).toThrow(UnsupportedPlanError);
-    expect(() => type(t.a)).toThrow("(enumType)");
+    expect(() => type(t.a)).toThrow(PlanningError);
+    expect(() => type(t.a)).toThrow('type "mood" does not exist');
   });
 });

@@ -31,7 +31,7 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `access/`     | write path + key index           | Storage access contracts the write path implements: snapshots and segments, catalog, key-index probes and ranges, `modify` (rows, conflicts, RETURNING), transactions, group commit, sequences, delivery                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `testing/`    | all                              | Real-storage SQL differential adapter (`storage-core.ts`) over the query factory and write path; explicit protocol stand-ins (`owner-standins.ts`) for tests that need synthetic scheduling or persistence, an in-memory Web Locks for election tests (`fake-locks.ts`); the registry of intended divergences from the current engine (R21, `divergences.ts`); the write path's generated differential against PostgreSQL and the current engine                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `write/`      | write path + key index           | Implements `access/`: catalog and DDL, memtables (chunked columns, key deltas, deletions; memory charged before allocation, backpressure across tables), transactions with an undo log, modify and constraint checks, log appender and group commit, commit-body codec, flush to column groups and index runs, background index run merges (`merge.ts`: levels of fan-in 8, streamed, task-yield slices, published under the lock flushes share; writers wait only past 24 level-0 runs), log recycling past 8 MiB (the writer slot, every table flushed through the cut, a root naming a new incarnation, then the reset; frames appended meanwhile go to the new log), re-point, recovery (`openWritePath`), sequences; manifests through `format/`'s codecs (paged group directory) and metadata reader, per-table planning statistics stored with the root at every publish (an open reads one blob per table, never a group root), the resident group directory held as shared immutable typed-array chunks (charged exactly, refcounted by the generations that hold them; an append copies one chunk), each root charged until its last reader closes, on a grant of their own. Tested by a crash sweep over every simulated-disk step (and by the generated differential in `testing/`) |
-| `lower/`      | planner lowering                 | `Lowerer` (`lowerer.ts` contract, `create.ts`): front-end passes over the catalog, typing (`coerce.ts`, `expressions.ts`), queries, DML, DDL, table rules, result descriptors; an in-memory catalog; front-end inventory (`INVENTORY.md`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `lower/`      | planner lowering                 | `Lowerer` (`lowerer.ts` contract, `create.ts`): front-end passes over the catalog, typing (`coerce.ts`, `expressions.ts`), queries (`query.ts`), FROM clauses, join order and subqueries (`from.ts`), access paths (`access-path.ts`), windows (`windows.ts`), plan building (`plan.ts`), DML and MERGE (`modify.ts`), DDL, table rules, result descriptors; an in-memory catalog; front-end inventory (`INVENTORY.md`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `owner/`      | ownership                        | Owner/client protocol (`protocol.ts`), wire payloads (re-exported from exec) and stream dictionaries (`frame.ts`), ledger routing (`outcomes.ts`), wire errors (`errors.ts`), client sequencing (`sequence.ts`), election, liveness and step-down (`election.ts`), public client API (`api.ts`), engine boundary and idle-transaction timer (`engine.ts`), planner port (`planner.ts`), the composed engine (`compose.ts`), the protocol server (`server.ts`) and client (`client.ts`), the owner worker runtime (`host.ts`), the port broker (`broker.ts`), the client-side election and lifecycle (`connector.ts`), Web Locks (`web-locks.ts`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 ## Cross-track interfaces (owned by the implementing track)
@@ -1739,8 +1739,30 @@ with no stored-format change.
   with result descriptors, read and write sets and its statistics basis; a catalog change; or a
   transaction or utility command. `lowerer.ts` lists the front-end passes that are kept and the
   code that lowering replaces.
-- Pure and synchronous; the owner caches by (text, catalog version) and re-lowers when
-  `statisticsDrifted` says the data moved.
+- Pure and synchronous; the owner caches by (text, catalog version, `parameterTypes` when sent)
+  and re-lowers when `statisticsDrifted` says the data moved. A plan whose shape no statistics
+  decided (a unique-key lookup, a lone scan) has an empty `basis`, so its hit skips the check.
+- Literal auto-parameterization (`parameterize.ts`): `parameterize(text)` lifts each integer or
+  plain string literal that is the whole operand of `=` into a trailing placeholder and returns
+  the cache key texts differing only in those values share (a text scan, ~4 µs).
+  `lowerParameterized` gives a lifted slot exactly the type lowering gives its literal alone and
+  accepts the rewrite only where each slot is an `=` operand of the same type or an index key.
+  It returns a `ParameterizedPlan` (run with `bindParameterized`, which refuses another key's
+  text) or a `NotParameterizable` marker. Cache rule: cache the result under the key; on a marker
+  lower each text itself and cache that plan under the text, never under the key. A literal
+  point-read loop over 10,000 keys lowers once.
+- Every failure is a `PlanningError` with PostgreSQL's SQLSTATE (42601 syntax, 42P01 relation,
+  42703 column, 42883 function, 42704 type, …) or an `UnsupportedPlanError` (0A000). Front-end
+  errors are translated by message (`frontEndError`), keeping the parse position and the
+  original as `cause`. The messages it depends on are pinned (`testing/front-end-states.test.ts`:
+  a snapshot of every mapped front-end message, and per pattern a PGlite-checked statement).
+  HAVING names resolve before the grouping check, as in PostgreSQL: an unknown qualifier is
+  42P01, an unknown column 42703, an ambiguous one 42702 (`lower/frontend.ts`). A negative frame
+  offset is 22013 and a NULL one 22004.
+- Transaction modes come from the parser's AST in written order; `modes` holds what applies (the
+  last of each kind). `BEGIN READ ONLY` lowers with `readOnly: true` (R11.2); `SET TRANSACTION …`
+  lowers to `transactionControl` action `setTransaction` with its `modes`, for the owner to apply.
+  SERIALIZABLE and SET SESSION CHARACTERISTICS are refused (0A000).
 - Declared numeric widths and VARCHAR(n) / CHAR(n) widths come from the parser only under
   `compileWithDeclaredTypes` (engine/query.ts), so the current engine compiles exactly what it
   did (C5, R17.4).
@@ -1751,13 +1773,50 @@ with no stored-format change.
   constant that cannot be a key of the column's type keeps the scan.
 - int8 renders `bigint` only when an operand does (R17.1); SUM(int8) is `decimal(null, 0)`
   rendered `bigint` (R17.2).
-- Milestone M1 surface. Joins, subqueries, windows, set operations and recursion are refused
-  with `UnsupportedPlanError` (stage "lower", a construct key) until milestone M3.
-- `testing/lowering-differential.test.ts` runs DDL, seed rows, 41 queries, writes, RETURNING
-  and failing writes through the current engine and through lowering + the IR reference
-  interpreter (`testing/ir-reference.ts`), and requires identical results;
-  `testing/lowering-pglite.test.ts` does the same against PostgreSQL (PGlite), the authority;
-  `testing/ir-check.ts` type-checks every plan they run.
+- Aggregates are typed by `ir/functions.ts` `AGGREGATES` (R19), the table the plan checker
+  reads too: PostgreSQL's overloads, with an argument cast implicitly to the one overload it
+  reaches (`sum(time)` is `sum(interval)`), and no `min` / `max` over bool, json, jsonb or uuid
+  (42883). AVG of integers and floats is double precision (C11).
+- Joins are ordered by cost (`from.ts`): every left-deep connected order up to 8 relations,
+  greedy above, with the smaller estimate as the hash build side. Outer, semi and anti joins keep
+  their place; a WHERE conjunct over one source is pushed into it unless an outer join
+  null-supplies it.
+- A range on an ordered index under byte-order collation becomes `indexRange` when it reads at
+  most 5% of the table by the estimate (`access-path.ts`), else a scan with a filter.
+- Subqueries: the decorrelator rewrites correlated IN / EXISTS / scalar / quantified subqueries
+  into joins first. What reaches lowering as a subquery: `x [NOT] IN (simple subquery)` is a mark
+  join (the subquery's WHERE in `filter`, R20.5); anything else correlated is an `apply` with
+  correlated values in parameter slots (rare from SQL); uncorrelated scalar and EXISTS subqueries
+  where no join can attach are init plans, run lazily on the first read of their slot (R24.1).
+  The front end refuses correlated subqueries in HAVING, in grouped or nested select lists, and
+  with GROUP BY / HAVING inside them, and a FULL JOIN after another join or under a window
+  (INVENTORY.md "Still needed" 4).
+- Set operations resolve each pair's column types as PostgreSQL does: an unknown-typed constant
+  (NULL, a string literal) takes the other arm's type, and two unknowns are text.
+- A FULL JOIN with no hash-joinable condition lowers, though PostgreSQL refuses it (0A000): an
+  intended extension (R24.2), checked against PostgreSQL's LEFT JOIN UNION ALL anti-join rewrite.
+- Windows, set operations, recursive CTEs and GENERATE_SERIES, UPDATE … FROM, DELETE … USING and
+  MERGE lower too. Still refused (`UnsupportedPlanError`, stage "lower"): ordered-set and JSON
+  aggregates, JSON / array / regex functions, batch UPDATE / DELETE (`batchWrite`), LATERAL the
+  decorrelator cannot remove, full-text search. `INVENTORY.md` has every construct's status.
+- `testing/lowering-differential.test.ts` runs DDL, seed rows, queries (joins, subqueries,
+  windows, set operations, recursion included), writes, RETURNING and failing writes through the
+  current engine and through lowering + the IR reference interpreter (`testing/ir-reference.ts`),
+  and requires identical results; `testing/lowering-pglite.test.ts` and
+  `testing/lowering-pglite-m3.test.ts` do the same against PostgreSQL (PGlite), the authority,
+  through `testing/pglite-oracle.ts`, and `testing/lowering-pglite-review.test.ts` holds review
+  B6-p2b's cases (lazy init plans, set-operation types, FULL JOIN extension, window frames,
+  decimal casts, RANGE offsets at NULL boundaries and past 2^53, over exact NUMERIC, float
+  infinities and NaN, aggregate signatures over every column type). The reference interpreter
+  keeps NUMERIC exact (`testing/reference-decimal.ts`) and RANGE frames follow PostgreSQL's
+  in_range functions. `testing/ir-check.ts` checks every
+  plan they run: every declared slot filled by exactly one producer that dominates its readers
+  (placeholders, the clock, init plans without cycles, apply bindings within their apply), LIMIT /
+  OFFSET bounds, positions on both sides, aggregate FILTER / ORDER BY and signatures (every
+  aggregate an overload of `AGGREGATES`, no fallback), window
+  signatures and frames, recursion widths and work tables (`ir-check.test.ts`).
+- Lowering cost (`scripts/lowering-bench.mts`, warm, median on a loaded host): a point read
+  ~160 µs, a 3-way join ~350 µs, a 6- to 9-way chain 530–840 µs.
 - Under `compileWithDeclaredTypes` the front end keeps constants typed (no folding with the
   current engine's numbers), keeps INSERT values as expressions, marks TRUNCATE and leaves bare
   ON CONFLICT names unqualified; lowering folds integer constants after overload resolution.
@@ -1930,3 +1989,46 @@ from a checkpoint the recycler has not published.
 
 Resuming deferred initial maintenance joins the existing flush chain. Close and step-down still
 wait for every accepted flush and merge, including work started before the ready acknowledgement.
+
+### Row-lock admission (B6/B5)
+
+Every lowered statement carries `rowLocking`: `none`, `keyShare`, `share`, `noKeyUpdate`, or
+`update`, strongest last. The owner must refuse a query whose intent is not `none` in READ ONLY
+with 25006, before executing it, including a cached or parameterized statement. Lowering does
+not acquire locks or enforce transaction access mode. DML/DDL write admission stays separate.
+The shared front end resolves targets through FROM subqueries but never pushes an outer clause
+into a CTE. A referenced CTE's own clause and a view's own clause count, including references from
+CTEs not consumed by the final SELECT. Only zero-reference CTEs in that query scope are
+omitted; declarations inside a discarded outer CTE do not leak into the caller.
+View bodies are included after catalog expansion. The shipped engine uses the same target and
+strength helpers. Metadata is retained even for a point read; the owner must check it before
+its synchronous fast path.
+
+### Transaction mode items (B6/B5)
+
+`LoweredTransactionControl.modeItems` keeps the written order and duplicates for BEGIN,
+START TRANSACTION and SET TRANSACTION. Access items have `value: readOnly | readWrite`,
+isolation items have the named level, and deferrable items have a boolean. Other transaction
+controls carry an empty list. `modes` remains the final value of each kind; the owner must
+validate every item in order before using it. In a savepoint that starts READ WRITE,
+`SET TRANSACTION READ ONLY, READ WRITE` fails with 25001, while `READ WRITE, READ ONLY`
+succeeds. If it already starts READ ONLY, either list fails. This is metadata for B5;
+it does not wire owner enforcement.
+
+The parser records CTE reference counts before execution pruning. Referenced bodies remain
+as `CompiledQuery.rowLockingCtes`, so catalog expansion includes locking views in a CTE
+referenced only by an unused referrer. This admission-only data survives ordinary clones and
+worker transport; it is not lowered as an execution input. The strongest intent still wins
+when the final SELECT has a weaker clause. Nested query scopes retain their own references.
+
+The retained admission declaration includes both members of a recursive CTE. A step's
+locking subquery or view contributes even when the only external reference is in an
+unused CTE. Self-reference alone does not count. This is lowering metadata; the owner
+must apply it before execution. The shipped SQL enforcement is inherited from Stream A.
+
+### Real-executor M3 coverage
+
+The B7 generated campaigns run joins and windows through real writes, storage and the executor
+against PostgreSQL and the shipped engine. These complement B6's broader lowering/reference
+campaigns; lowering support does not imply every emitted operation has an executor binding.
+The frozen catalogue records typed executor refusals separately from matching executions.

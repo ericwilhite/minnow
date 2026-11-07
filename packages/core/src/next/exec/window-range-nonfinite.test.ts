@@ -261,7 +261,8 @@ for (const seed of seedsFor("next-window-float-range", [0x572, 0x9a1]))
           }
           expect(governor.usedBytes).toBe(0);
           expect(spill.bytesInUse).toBe(0);
-          if (streamed) expect(op.profile.streamedPartitions).toBeGreaterThan(0);
+          // NULL offsets fail at startup, before a partition can spill.
+          if (streamed && offset !== null) expect(op.profile.streamedPartitions).toBeGreaterThan(0);
           reach.beginHistory();
           reach.reach(
             `${path}: ${offset === null ? "NULL offset 22004" : Number.isNaN(offset) ? "NaN offset 22013" : "negative offset 22013"}`,

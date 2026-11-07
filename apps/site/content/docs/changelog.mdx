@@ -25,6 +25,46 @@ message; the exception remains a `TypeError`. No public type or stored-format ch
 Transaction point reads of views also reach view expansion instead of failing with
 "view, not a table", so a locking view gets the same read-only refusal as other reads.
 
+The internal SQL lowerer now retains effective `rowLocking` metadata after view and
+CTE expansion, including both members of a referenced recursive declaration and
+references from unused CTEs. It emits the strongest intent for owner admission; this
+lowering metadata does not itself enforce READ ONLY or acquire locks. Shipped runtime
+enforcement is provided by the preceding Stream A changes below.
+
+Lowered BEGIN, START TRANSACTION and SET TRANSACTION statements also retain ordered
+`modeItems`, including duplicates, alongside final mode summaries. Owners must validate
+the ordered items before applying those summaries. These internal fields do not add
+public package exports.
+
+- **Window frame offsets follow PostgreSQL's rules.** The offset of a `ROWS`, `RANGE` or `GROUPS`
+  frame bound used to be an unsigned number literal, and anything else failed as a syntax error.
+  - A negative offset (`ROWS -1 PRECEDING`) now fails with
+    `frame starting offset must not be negative`, or `ending` for the frame's end. A `NULL`
+    offset fails with `… must not be null`. A negative `RANGE` offset fails even over no rows,
+    where PostgreSQL returns none; the [compatibility page](/docs/sql/feature-matrix) lists it.
+  - A sign is not a value: `-0`, `-0.0` and `+1` are accepted, as in PostgreSQL. Zero and the
+    sign come from the digits, so `RANGE -1e-400 PRECEDING` is negative, as PostgreSQL's
+    `NUMERIC` keeps it.
+  - A `ROWS` or `GROUPS` offset written as a decimal now runs, rounded half away from zero as
+    PostgreSQL does: `1.5 PRECEDING` is 2 rows and `-0.4 PRECEDING` is 0. It used to be refused.
+    One past the `bigint` range (`1e400`, `9223372036854775808`) fails with
+    `bigint out of range`; the largest used to run.
+  - A positive `RANGE` offset that a double cannot hold, so that it would become 0 or infinity
+    (`1e-400`, `1e400`), is refused with
+    `RANGE frame offsets outside double precision are not supported`. PostgreSQL runs it over a
+    `NUMERIC` key; over a `DOUBLE PRECISION` key it raises "out of range for double precision",
+    where Minnow refuses a positive offset this way and reports a negative one as negative.
+  - The front end retains the exact decimal text of numeric `RANGE` offsets for the internal
+    rebuild lowering, including through CTE copies and expression matching. The shipped window
+    executor still measures distances with JavaScript numbers.
+  - An `INTERVAL` offset on `ROWS` or `GROUPS` now says that they take integers. An interval or
+    quoted (`'1'`) offset on `RANGE` fails with
+    `Window frame offsets other than numeric literals are not supported`. Both were already
+    refused, with a syntax error.
+
+Parser-only frame precision and literal-type metadata stays outside the published plan types;
+frame bounds keep their existing `kind` and numeric `offset` fields.
+
 `SET TRANSACTION` now checks isolation and deferrability as well as access mode,
 through SQL and compiled commands. Changing isolation after a query or inside a
 savepoint fails with 25001; setting the already-requested level again is allowed.
@@ -57,6 +97,33 @@ strongest-lock rules with the internal rebuild lowerer. No stored-format change.
 Some SQL that used to run now fails, and some now answers differently, so this is a minor
 release, as the [versioning policy](/docs/reference/versioning) requires during 0.x. Each change
 says what to rewrite; the **Migration** list below collects them.
+
+- Window frames reject an end bound of an earlier kind than their start, as PostgreSQL does:
+  `ROWS BETWEEN CURRENT ROW AND 1 PRECEDING` is an error, including over an empty input.
+  Same-kind bounds such as `ROWS BETWEEN 1 PRECEDING AND 5 PRECEDING` remain valid empty frames.
+
+- The private rebuild core now lowers joins and window functions to its real executor. Its
+  typed compilation keeps native FULL joins and exact window-frame literals; the published
+  SQL execution path keeps its plan rewrites and literal-offset syntax. Direct boolean hash joins
+  retain TRUE-only keys. In the rebuild executor, frame-offset checks run when the window starts; RANGE sign checks
+  require a non-null key comparison, matching PostgreSQL on empty and null-only inputs.
+  These modules remain unexported.
+  The published shared compiler grows to support signed and rounded frame offsets, bound-kind
+  validation, and exact frame-literal identity through CTE copies. The same parser also supplies
+  the private typed compiler, including native FULL/USING handling; keeping it shared preserves
+  one SQL grammar and expression-identity authority.
+  A module audit against main `f452eb82` attributes all 3,353 added raw bytes to
+  `engine/query.js` (+3,149), `engine/frame-offsets.js` (+158), and
+  `engine/query-identity.js` (+46). No `next/` or test module reaches the published bundles;
+  the client is byte-identical. The generic worker grows by 983 gzip bytes, and worker plus
+  client measures 570,953 bytes against main's 569,970. Its development size cap moves from
+  556.75 to 558 KiB: the old cap is exceeded by 841 bytes, with 439 bytes left under the new cap.
+  Relative to that main revision, the three engine-entry raw caps move by 3.25 KiB and gzip caps
+  by 1.25 KiB. Adapter isolation and tree-shaking checks are unchanged. The audit is reproducible
+  after building with `node scripts/library-size-audit.mts --base=f452eb82`; it freezes the whole
+  published source family and verifies current source emission against the built bundle first.
+- SQL examples cast plain-number aggregates to `NUMERIC` before `ROUND(value, digits)` so
+  they use PostgreSQL's supported overload and return exact decimal text.
 
 - The exported query-plan type `CompiledStatement` gains three optional fields: `truncate` on a
   delete that came from `TRUNCATE`, and `declaredTypeName` and `declaredLength` on column
@@ -169,6 +236,7 @@ these rewrites where an application uses the old forms:
 - Open transactions that write with `BEGIN` or `BEGIN READ WRITE`, not `READ ONLY`, and leave
   savepoints before switching a read-only transaction back to `READ WRITE`.
 - Write transaction modes in PostgreSQL's grammar.
+- Rewrite window frame offsets that the new offset rules above refuse.
 - Close every nested `/*` with its own `*/`.
 - Expect changed answers, with no rewrite, where these fixes apply: `ORDER BY` a qualified
   unselected column, a correlated aggregate with `LIMIT` or `OFFSET`, `EXISTS` over a

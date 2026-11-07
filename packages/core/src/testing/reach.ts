@@ -636,6 +636,342 @@ export const TRANSACTION_ATTRIBUTE_STATES = [
   "deferrable savepoint refusal",
 ] as const;
 
+/**
+ * RANGE offset frames over non-integer keys against PostgreSQL (next/testing/
+ * lowering-pglite-review.test.ts, review B6-p2b-3 finding 1): exact NUMERIC around 2^53 and
+ * with fractions, NUMERIC NaN / ±Infinity peers, float ±Infinity and NaN peers, and temporal
+ * keys with interval offsets (refused, 0A000, until lowering takes them).
+ */
+export const RANGE_KEY_STATES = [
+  "numeric exact",
+  "numeric special",
+  "float infinite",
+  "float NaN",
+  "temporal refused",
+] as const;
+
+/** Frame offset errors against PostgreSQL (review B6-p2b-3 finding 3). */
+export const FRAME_OFFSET_STATES = [
+  "accepted",
+  "null offset",
+  "negative offset",
+  "refused",
+  // Review B6-p2b-4: a minus sign on zero is zero; ROWS / GROUPS round decimals to bigint; a
+  // decimal on an integer RANGE key is PostgreSQL's 0A000.
+  "signed zero accepted",
+  "rounded offset accepted",
+  "numeric offset on an integer key",
+  // Review B6-p2b-5: a ROWS / GROUPS offset past bigint (1e400) is 22003.
+  "bigint out of range",
+  // Review B6-p2b-6: the signed bigint range exactly: 2^63 - 1 runs, -2^63 is negative (22013).
+  "bigint maximum accepted",
+  "bigint minimum negative",
+] as const;
+
+/** HAVING names against PostgreSQL (review B6-p2b-3 finding 3). */
+export const HAVING_NAME_STATES = [
+  "accepted",
+  "unknown column",
+  "ungrouped column",
+  "unknown table",
+] as const;
+
+/**
+ * NULL keys in RANGE offset frames against PostgreSQL (next/testing/lowering-pglite-review.test.ts,
+ * the B7 report): for a non-NULL current row, NULLs sort below every key (NULLS FIRST) or above
+ * (NULLS LAST), so a frame that runs to that end includes them; a NULL row's frame is its NULL
+ * peers.
+ */
+export const RANGE_NULL_STATES = [
+  "nulls first in a frame",
+  "nulls last in a frame",
+  "nulls outside a frame",
+  "null row",
+] as const;
+
+/** Exact NUMERIC window distances, including parser clones and expression identity. */
+export const RANGE_DECIMAL_STATES = [
+  "fractional distance",
+  "2^53 distance",
+  "2^63 distance",
+  "direct frame",
+  "CTE clone",
+  "derived frame",
+  "adjacent frame identity",
+] as const;
+
+/** Private frame metadata must survive the parser's plan-copy boundaries. */
+export const FRAME_METADATA_STATES = [
+  "exact ROWS",
+  "exact GROUPS",
+  "exact RANGE",
+  "numeric RANGE refusal",
+  "direct",
+  "CTE",
+  "derived",
+] as const;
+
+/** Planned locking reads: relation targets, CTE boundaries, expanded views and strongest intent. */
+export const ROW_LOCK_INTENT_STATES = [
+  "unused stronger CTE",
+  "base relation",
+  "FROM propagation",
+  "constant source",
+  "CTE boundary",
+  "CTE body",
+  "unused CTE",
+  "OF target",
+  "view clause",
+  "nested view",
+  "view target",
+  "strongest",
+] as const;
+
+/** Ordered transaction-mode coverage against PostgreSQL or the lossless lowering contract. */
+export const TRANSACTION_MODE_ITEM_STATES = [
+  "empty",
+  "access",
+  "isolation",
+  "deferrable",
+  "duplicates",
+  "mixed kinds",
+  "begin",
+  "start",
+  "set",
+] as const;
+
+/** Exact basic NUMERIC operations in the reference, checked as text against PostgreSQL. */
+export const REFERENCE_DECIMAL_ARITH_STATES = [
+  "add",
+  "sub",
+  "mul",
+  "neg",
+  "abs",
+  "finite",
+  "special",
+  "zero",
+  "large",
+  "fractional",
+] as const;
+
+/**
+ * Literal auto-parameterization over integer boundaries (next/testing/autoparameterize.test.ts):
+ * a literal lifted into an int4 or int8 slot, a family refused (the original text lowers alone),
+ * and a literal the scanner leaves as written (past int8). Reachable before and after integer
+ * literals past 2^53 lower as int8.
+ */
+export const AUTOPARAMETERIZE_LITERAL_STATES = [
+  "lifted int4",
+  "lifted int8",
+  "refused",
+  "not lifted",
+] as const;
+
+/** Every lock intent survives the parameterized point-read cache. */
+export const ROW_LOCK_CACHE_STATES = [
+  "none",
+  "keyShare",
+  "share",
+  "noKeyUpdate",
+  "update",
+] as const;
+
+/** BOOL's Uint8-backed keys exercise the direct table's full logical domain. */
+export const JOIN_BOOLEAN_REACH = [
+  "inner",
+  "left",
+  "right",
+  "full",
+  "semi",
+  "anti",
+  "mark",
+  "TRUE only",
+  "FALSE only",
+  "both",
+  "NULL",
+  "empty",
+  "direct",
+  "hashed",
+  "released",
+] as const;
+
+/** Invalid bound-kind order differs from a legal same-kind frame with no members. */
+export const WINDOW_FRAME_ORDER_REACH = [
+  "shorthand",
+  "ROWS",
+  "RANGE",
+  "GROUPS",
+  "current then preceding",
+  "following then current",
+  "following then preceding",
+  "allowed empty",
+] as const;
+
+/** M3 joins through actual storage/execution and both independent SQL engines. */
+export const LOWER_M3_JOINS_REACH = [
+  "keyless full",
+  "key-only",
+  "zero-column",
+  "USING",
+  "USING chain",
+  "NATURAL",
+  "inner",
+  "left",
+  "right",
+  "full",
+  "cross",
+  "residual",
+  "outer residual",
+  "full residual",
+  "null safe",
+  "outer WHERE",
+  "semi",
+  "anti",
+  "IN",
+  "NOT IN",
+  "correlated NOT IN",
+  "mark",
+  "EXISTS mark",
+  "star",
+  "uncorrelated EXISTS",
+  "uncorrelated anti",
+  "limited NOT IN",
+  "OR EXISTS",
+  "empty probe",
+  "empty build",
+  "NULL",
+  "duplicates",
+  "flushed",
+  "reopened",
+  "complete",
+] as const;
+
+/** SQL windows run through durable storage and the actual executor, not a plan interpreter. */
+export const LOWER_M3_WINDOWS_REACH = [
+  "min max",
+  "integer average",
+  "text order",
+  "row_number",
+  "rank",
+  "running sum",
+  "lag lead",
+  "moving avg",
+  "ranking",
+  "value functions",
+  "default peers",
+  "whole partition",
+  "different sorts",
+  "named",
+  "ROWS",
+  "RANGE",
+  "GROUPS",
+  "empty",
+  "singleton",
+  "NULL peers",
+  "flushed",
+  "reopened",
+  "complete",
+] as const;
+
+/** Exact key families, coefficients, non-finite RANGE and parser-owned offset precision. */
+export const LOWER_M3_TYPES_REACH = [
+  "int64 RANGE",
+  "float4 offset",
+  "outer chain",
+  "INNER",
+  "LEFT",
+  "RIGHT",
+  "FULL",
+  "CROSS",
+  "k",
+  "t",
+  "f",
+  "n",
+  "x",
+  "IN",
+  "NOT IN",
+  "exact offsets",
+  "parameters",
+  "non-finite RANGE",
+  "wide sum and lag",
+  "invalid offsets",
+  "released",
+] as const;
+
+/** Startup checks differ from RANGE's comparison-time sign check and optimized ranking. */
+export const LOWER_M3_OFFSETS_REACH = [
+  "reference startup",
+  "empty",
+  "NULL only",
+  "mixed",
+  "non-null",
+  "ROWS",
+  "RANGE",
+  "GROUPS",
+  "literal",
+  "parameter",
+  "PRECEDING",
+  "FOLLOWING",
+  "NULL offset",
+  "NaN offset",
+  "negative offset",
+  "aggregate",
+  "navigation",
+  "optimized ranking",
+  "LIMIT 0",
+  "released",
+] as const;
+
+/** Empty input and NULL-only keys do not invoke RANGE's sign-checking support function. */
+export const WINDOW_OFFSET_STARTUP_REACH = [
+  "resident",
+  "streamed",
+  "empty",
+  "NULL only",
+  "NULL 22004",
+  "NaN accepted",
+  "negative accepted",
+  "PRECEDING",
+  "FOLLOWING",
+  "aggregate",
+  "navigation",
+  "released",
+] as const;
+
+/** Cross-width btree in_range overloads, with exact small COUNT outputs against PostgreSQL. */
+export const REFERENCE_RANGE_TYPES_REACH = [
+  "SMALLINT",
+  "INTEGER",
+  "REAL",
+  "literal",
+  "parameter",
+  "ASC",
+  "DESC",
+  "FIRST",
+  "LAST",
+  "NULL key",
+  "rows match",
+] as const;
+
+/** Exact NUMERIC literals and float conversion errors across planning and startup boundaries. */
+export const RANGE_LITERAL_WIDTH_REACH = [
+  "adjacent frames",
+  "cloned frames",
+  "NUMERIC",
+  "NUMERIC(12,2)",
+  "DOUBLE PRECISION",
+  "empty",
+  "NULL only",
+  "values",
+  "count(*)",
+  "row_number()",
+  "evaluated",
+  "LIMIT 0",
+  "typmod distance",
+  "tiny or negative",
+  "large",
+] as const;
+
 /** Production Gate A executor bridge over real transfers and delayed cumulative credits. */
 export const EXECUTOR_EXPORT_REACH = [
   "production executor preparation",

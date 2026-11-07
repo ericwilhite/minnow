@@ -14,7 +14,8 @@ import type {
 import { MemoryCatalog } from "../lower/memory-catalog.js";
 import type { PhysicalType } from "../types.js";
 import { checkPlan } from "./ir-check.js";
-import { run, type Environment, type Row, type Value } from "./ir-reference.js";
+import { Decimal } from "./reference-decimal.js";
+import { run, withInitPlans, type Environment, type Row, type Value } from "./ir-reference.js";
 
 export const TEST_COSTS: ExecutorCosts = {
   decodePerValue: 1,
@@ -30,6 +31,7 @@ export const TEST_COSTS: ExecutorCosts = {
 /** A reference value in the form tests compare: integers as numbers, floats to 12 digits. */
 export function comparable(value: Value): unknown {
   if (typeof value === "bigint") return Number(value);
+  if (value instanceof Decimal) return comparable(value.toNumber());
   if (typeof value === "number" && !Number.isInteger(value)) return Number(value.toPrecision(12));
   return value;
 }
@@ -40,6 +42,16 @@ export function bindValue(value: unknown, type: PhysicalType): Value {
   if (type.kind === "int32" || type.kind === "int64") return BigInt(value as number);
   if (type.kind === "float64" || type.kind === "float32") return Number(value);
   if (type.kind === "bool") return Boolean(value);
+  if (type.kind === "decimal") {
+    const decimal =
+      typeof value === "bigint"
+        ? Decimal.fromInteger(value)
+        : typeof value === "number"
+          ? Decimal.fromFloat(value)
+          : Decimal.parse(typeof value === "string" ? value : JSON.stringify(value));
+    if (decimal === null) throw new TypeError(`not a numeric: ${JSON.stringify(value)}`);
+    return decimal;
+  }
   return typeof value === "string" ? value : JSON.stringify(value);
 }
 
@@ -95,22 +107,27 @@ export class LoweredDatabase {
     params: readonly unknown[],
     input: readonly Row[],
   ): ResultRow[] {
-    const env: Environment = {
+    const plan = lowered.plan;
+    // Every slot: placeholders, then the clock (a fixed instant); init plans run lazily, on the
+    // first read of their slot (R24.1).
+    const slots: Value[] = plan.parameters.map((type, index) =>
+      index < plan.placeholderCount ? bindValue(params[index], type) : null,
+    );
+    if (plan.clockSlot !== null) slots[plan.clockSlot] = 820_454_400_000_000n;
+    const env: Environment = withInitPlans(plan, {
       tables: this.tables,
       catalog: this.catalog.view,
-      params: lowered.plan.parameters
-        .slice(0, lowered.plan.placeholderCount)
-        .map((type, index) => bindValue(params[index], type)),
+      params: slots,
       rules: (table) => this.lowerer.lowerTableRules(table, this.catalog.view),
       sequences: this.sequences,
       input,
-    };
+    });
     // Every plan the tests run is also checked for well-formed types (ir-check.ts).
     checkPlan(lowered.plan, this.catalog.view);
     // Statement atomicity: a failing statement leaves the tables as they were.
     const saved = new Map([...this.tables].map(([id, rows]) => [id, rows.map((row) => [...row])]));
     try {
-      const rows = run(lowered.plan.root, env);
+      const rows = run(plan.root, env);
       return rows.map((row) =>
         Object.fromEntries(
           lowered.columns.map((column, index) => [column.name, comparable(row[index] ?? null)]),

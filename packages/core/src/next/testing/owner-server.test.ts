@@ -112,8 +112,12 @@ describe("statements end to end", () => {
       code: "MINNOW_DIVISION_BY_ZERO",
       sqlState: "22012",
     });
-    // The front end's own syntax error, passed through (it carries a position, no SQLSTATE yet).
-    await expect(client.query("SELEKT 1")).rejects.toMatchObject({ name: "SqlCompileError" });
+    // The front end's syntax error, as lowering reports every failure: PostgreSQL's SQLSTATE
+    // (B6 56be7aea), the parser's error and position kept as its cause.
+    await expect(client.query("SELEKT 1")).rejects.toMatchObject({
+      name: "PlanningError",
+      sqlState: "42601",
+    });
     await expect(client.query("SELECT id FROM missing")).rejects.toMatchObject({
       name: "PlanningError",
       sqlState: "42P01",
