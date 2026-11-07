@@ -1,5 +1,5 @@
 /** Shape reuse must preserve the page/vector exactness contract (types.ts and column-target.ts).
- * Compare scalar memos with uncached verified descriptors, and both decoders with source rows.
+ * Compare scalar memos with legacy verified descriptors and independent source byte counts.
  * Histories change residency and selections independently of their endpoint pages.
  */
 import fc from "fast-check";
@@ -13,7 +13,7 @@ import type { PhysicalType } from "../types.js";
 import { isValid } from "../vector/validity.js";
 import type { Vector } from "../vector/vector.js";
 import { ColumnTarget, type DecodeSpec } from "./column-target.js";
-import type { ChunkPages } from "./scan.js";
+import { sourceSizedPages } from "./column-shape-test-support.js";
 
 function countingBudget(): ByteBudget & { used: number } {
   const budget = {
@@ -46,19 +46,6 @@ function equal(actual: readonly TestValue[], expected: readonly TestValue[]): vo
     !actual.every((value, row) => sameValue(value, expected[row] ?? null))
   )
     expect(actual).toEqual(expected);
-}
-
-/** Bind private-field methods to the reader, with the optional memo capability hidden. */
-function uncached(reader: ChunkReader): ChunkPages {
-  return new Proxy(reader, {
-    get(target, key) {
-      if (key === "decodeFacts") return undefined;
-      const value: unknown = Reflect.get(target, key, target);
-      if (typeof value !== "function") return value;
-      const bound: unknown = value.bind(target);
-      return bound;
-    },
-  });
 }
 
 function facts(reader: ChunkReader, from: number, to: number): void {
@@ -210,17 +197,26 @@ it.each(seedsFor("next-column-shape", [0xb2d1, 0xb2d2]))(
                       );
                 for (const codes of [true, false]) {
                   const a = target.outputBytes(reader, spec, codes, true),
-                    b = reference.outputBytes(uncached(reader), spec, codes, true);
+                    b = reference.outputBytes(
+                      sourceSizedPages(reader, source.values),
+                      spec,
+                      codes,
+                      true,
+                    );
                   expect(a).toBe(b);
                   expect(target.growthFor(reader, spec)).toBe(
-                    reference.growthFor(uncached(reader), spec),
+                    reference.growthFor(sourceSizedPages(reader, source.values), spec),
                   );
                   const actual = target.decode(reader, spec),
-                    old = reference.decode(uncached(reader), spec);
+                    old = reference.decode(sourceSizedPages(reader, source.values), spec);
                   equal(rows(actual), expected);
                   equal(rows(actual), rows(old));
                   const owned = target.decodeOwned(reader, spec, codes),
-                    legacy = reference.decodeOwned(uncached(reader), spec, codes);
+                    legacy = reference.decodeOwned(
+                      sourceSizedPages(reader, source.values),
+                      spec,
+                      codes,
+                    );
                   equal(rows(owned.vector), expected);
                   equal(rows(owned.vector), rows(legacy.vector));
                   expect(owned.bytes).toBe(legacy.bytes);

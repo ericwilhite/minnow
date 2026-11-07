@@ -960,6 +960,18 @@ and the owner import it directly.
   keeps the selection, the residual then narrowing it. Below it only the selected positions are
   gathered; with a residual, its columns are gathered first and the others only for the rows it
   keeps.
+- Shape setup reuses only verified scalar header facts while endpoint pages remain resident;
+  install/release/materialization invalidates them. Exact-range byte counts have a separate
+  memo. `exec/column-shape.test.ts` compares against header queries with memoization disabled
+  and byte counts summed directly from immutable source rows, including gathers. It never
+  uses the candidate reader's `varlenBytes` or `gatherBytes` for reference sizing.
+  `testing/column-shape-differential.test.ts` extends that comparison over actual cache
+  eviction/backend reload, three same-layout groups through one target, all-valid/sparse/all-null
+  masks, empty ranges/gathers, genuine >64 KiB out-of-line values, stored gzip, and stored
+  dictionary code widths 0/1/2. Reach assertions require each named state and encoding. The
+  current writer's 65,536-row group limit cannot emit a 4-byte dictionary code; that reader
+  capability is outside this writer-generated comparison. A stale exact-range-size mutant
+  must fail byte accounting even when an oversized output could still decode correct values.
 - Batches are bounded by their decoded bytes: validity, values or codes, scales, limbs,
   specials, offsets, varlen bytes (full value lengths, out-of-line values included) and
   locators, all known from page headers before any value is read. One row larger than the target

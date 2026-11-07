@@ -410,3 +410,17 @@ export const SMALL_PAGE_REPRESENTATION_REACH = [
 
 /** Stratified independently for every type/representation and source form. */
 export const SMALL_PAGE_NULL_STATES = ["all valid", "sparse nulls"] as const;
+
+/** Independent source-sized shape differential over real cache eviction and group switches. */
+export const SHAPE_DIFFERENTIAL_REACH = [
+  "independent source lengths",
+  "actual cache eviction",
+  "backend reload after eviction",
+  "same target switches group",
+  "all-valid group",
+  "sparse-null group",
+  "all-null group",
+  "empty range",
+  "empty gather",
+  "same endpoints different interiors",
+] as const;
