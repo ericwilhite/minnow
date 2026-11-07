@@ -1,3 +1,4 @@
+import { Temporal as polyfillTemporal } from "@js-temporal/polyfill";
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { seedsFor } from "../testing/seeds.js";
@@ -21,14 +22,18 @@ import {
 } from "./temporal.js";
 import { INT64_MAX } from "./types.js";
 
-/** Node 26 ships Temporal: an independent oracle for the proleptic Gregorian calendar. */
+/**
+ * Temporal is an independent oracle for the proleptic Gregorian calendar. Node 26 ships it; the
+ * CI runners' Node 22 and 24 do not, so they use the TC39 reference polyfill.
+ */
 interface TemporalOracle {
   PlainDate: { from(fields: { year: number; month: number; day: number }): { toString(): string } };
   Instant: {
     fromEpochNanoseconds(ns: bigint): { toString(options: { fractionalSecondDigits: 6 }): string };
   };
 }
-const Temporal = (globalThis as unknown as { Temporal: TemporalOracle }).Temporal;
+const Temporal =
+  (globalThis as unknown as { Temporal?: TemporalOracle }).Temporal ?? polyfillTemporal;
 const SEEDS = seedsFor("next-temporal", [0x7e3a]);
 /** Temporal's own range is ±271821 years; within it every value is checked against it. */
 const ORACLE_MIN = -98_000_000_000_000_000n;

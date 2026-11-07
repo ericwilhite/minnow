@@ -6,6 +6,9 @@ const port = 4180;
 export default defineConfig({
   ...runnerDefaults,
   testDir: "./packages/core/browser-tests",
+  // The rebuild owner's specs need a cross-origin-isolated server (fine timers, SharedArrayBuffer)
+  // and run under playwright.next-owner.config.ts; here their isolation check would fail.
+  testIgnore: /next-owner.*\.spec\.ts$/u,
   webServer: {
     command: `node apps/site/scripts/vendor-engines.mjs && npx vite --config vite.library.config.ts --host 127.0.0.1 --port ${String(port)} --strictPort`,
     url: `${localUrl(port)}/packages/core/browser/`,

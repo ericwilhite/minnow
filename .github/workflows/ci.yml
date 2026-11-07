@@ -260,6 +260,22 @@ jobs:
             playwright-report/
             test-results/
           retention-days: 14
+      # The rebuild owner's specs run once per engine, on its first shard, under their own
+      # cross-origin-isolated server. R6 latency targets are reported here and enforced only in the
+      # browser performance lane.
+      - name: Test rebuild owner in ${{ matrix.browser }}
+        id: next-owner
+        if: matrix.site
+        run: npm run test:browser:next-owner -- --project ${{ matrix.browser }}
+      - name: Upload rebuild owner reports and traces
+        if: always() && (steps.next-owner.outcome == 'success' || steps.next-owner.outcome == 'failure')
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-next-owner-${{ matrix.artifact }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14
       - name: Test site in ${{ matrix.browser }}
         id: site
         if: matrix.site
