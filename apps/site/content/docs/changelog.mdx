@@ -10,6 +10,46 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The internal SQL lowerer now retains effective `rowLocking` metadata after view and
+CTE expansion, including both members of a referenced recursive declaration and
+references from unused CTEs. It emits the strongest intent for owner admission; this
+lowering metadata does not itself enforce READ ONLY or acquire locks. Shipped runtime
+enforcement is provided by the preceding Stream A changes below.
+
+Lowered BEGIN, START TRANSACTION and SET TRANSACTION statements also retain ordered
+`modeItems`, including duplicates, alongside final mode summaries. Owners must validate
+the ordered items before applying those summaries. These internal fields do not add
+public package exports.
+
+- **Window frame offsets follow PostgreSQL's rules.** The offset of a `ROWS`, `RANGE` or `GROUPS`
+  frame bound used to be an unsigned number literal, and anything else failed as a syntax error.
+  - A negative offset (`ROWS -1 PRECEDING`) now fails with
+    `frame starting offset must not be negative`, or `ending` for the frame's end. A `NULL`
+    offset fails with `… must not be null`. A negative `RANGE` offset fails even over no rows,
+    where PostgreSQL returns none; the [compatibility page](/docs/sql/feature-matrix) lists it.
+  - A sign is not a value: `-0`, `-0.0` and `+1` are accepted, as in PostgreSQL. Zero and the
+    sign come from the digits, so `RANGE -1e-400 PRECEDING` is negative, as PostgreSQL's
+    `NUMERIC` keeps it.
+  - A `ROWS` or `GROUPS` offset written as a decimal now runs, rounded half away from zero as
+    PostgreSQL does: `1.5 PRECEDING` is 2 rows and `-0.4 PRECEDING` is 0. It used to be refused.
+    One past the `bigint` range (`1e400`, `9223372036854775808`) fails with
+    `bigint out of range`; the largest used to run.
+  - A positive `RANGE` offset that a double cannot hold, so that it would become 0 or infinity
+    (`1e-400`, `1e400`), is refused with
+    `RANGE frame offsets outside double precision are not supported`. PostgreSQL runs it over a
+    `NUMERIC` key; over a `DOUBLE PRECISION` key it raises "out of range for double precision",
+    where Minnow refuses a positive offset this way and reports a negative one as negative.
+  - The front end retains the exact decimal text of numeric `RANGE` offsets for the internal
+    rebuild lowering, including through CTE copies and expression matching. The shipped window
+    executor still measures distances with JavaScript numbers.
+  - An `INTERVAL` offset on `ROWS` or `GROUPS` now says that they take integers. An interval or
+    quoted (`'1'`) offset on `RANGE` fails with
+    `Window frame offsets other than numeric literals are not supported`. Both were already
+    refused, with a syntax error.
+
+Parser-only frame precision and literal-type metadata stays outside the published plan types;
+frame bounds keep their existing `kind` and numeric `offset` fields.
+
 `SET TRANSACTION` now checks isolation and deferrability as well as access mode,
 through SQL and compiled commands. Changing isolation after a query or inside a
 savepoint fails with 25001; setting the already-requested level again is allowed.
@@ -155,6 +195,7 @@ these rewrites where an application uses the old forms:
 - Open transactions that write with `BEGIN` or `BEGIN READ WRITE`, not `READ ONLY`, and leave
   savepoints before switching a read-only transaction back to `READ WRITE`.
 - Write transaction modes in PostgreSQL's grammar.
+- Rewrite window frame offsets that the new offset rules above refuse.
 - Close every nested `/*` with its own `*/`.
 - Expect changed answers, with no rewrite, where these fixes apply: `ORDER BY` a qualified
   unselected column, a correlated aggregate with `LIMIT` or `OFFSET`, `EXISTS` over a

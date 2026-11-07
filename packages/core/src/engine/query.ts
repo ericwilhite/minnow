@@ -4,6 +4,7 @@ import {
   withRowLock,
   withRowLockCtes,
 } from "./row-locking.js";
+import { copyFrameOffset, rememberFrameOffset } from "./frame-offsets.js";
 import { checkedInteger, checkedSum } from "./integer-exactness.js";
 import { castSqlValue, datetimeText } from "./sql-casts.js";
 import { parseJson } from "../block-format/json-parse.js";
@@ -3006,6 +3007,7 @@ function cloneTreeValue(value: unknown): unknown {
   for (const key of Object.keys(value)) {
     copy[key] = cloneTreeValue((value as Record<string, unknown>)[key]);
   }
+  copyFrameOffset(value, copy);
   return copy;
 }
 
@@ -12801,12 +12803,12 @@ class Parser {
       let end: WindowFrameBound;
       if (this.#isKeyword("BETWEEN")) {
         this.#keyword("BETWEEN");
-        start = this.#frameBound(unit);
+        start = this.#frameBound(unit, "starting");
         this.#keyword("AND");
-        end = this.#frameBound(unit);
+        end = this.#frameBound(unit, "ending");
       } else {
         // The single-bound shorthand: the bound is the frame start, the end is the current row.
-        start = this.#frameBound(unit);
+        start = this.#frameBound(unit, "starting");
         end = { kind: "current-row" };
       }
       if (start.kind === "unbounded-following" || end.kind === "unbounded-preceding") {
@@ -12851,7 +12853,7 @@ class Parser {
     return { partitionBy, orderBy, ...(frame === undefined ? {} : { frame }) };
   }
 
-  #frameBound(unit: "rows" | "range" | "groups"): WindowFrameBound {
+  #frameBound(unit: "rows" | "range" | "groups", which: "starting" | "ending"): WindowFrameBound {
     if (this.#isKeyword("UNBOUNDED")) {
       this.#keyword("UNBOUNDED");
       if (this.#isKeyword("PRECEDING")) {
@@ -12866,18 +12868,87 @@ class Parser {
       this.#keyword("ROW");
       return { kind: "current-row" };
     }
-    const offset = Number(this.#take("number").text);
-    if (!Number.isFinite(offset) || offset < 0 || (unit !== "range" && !Number.isInteger(offset))) {
+    // PostgreSQL's frame offset errors (22004, 22013). A negative RANGE offset is raised here,
+    // where PostgreSQL raises it when the first row compares (so not over no rows).
+    if (this.#isKeyword("NULL")) {
+      if (which === "starting") throw new TypeError("frame starting offset must not be null");
+      throw new TypeError("frame ending offset must not be null");
+    }
+    if (this.#isKeyword("INTERVAL") && unit === "rows")
+      throw new TypeError("argument of ROWS must be type bigint, not type interval");
+    if (this.#isKeyword("INTERVAL") && unit === "groups")
+      throw new TypeError("argument of GROUPS must be type bigint, not type interval");
+    if (this.#isKeyword("INTERVAL") || this.#peek().kind === "string")
+      throw new TypeError("Window frame offsets other than numeric literals are not supported");
+    // A sign is not a value: `-0` and `-0.0` are zero, which PostgreSQL accepts.
+    let negated = false;
+    if (
+      this.#peek().kind === "operator" &&
+      (this.#peek().text === "-" || this.#peek().text === "+")
+    ) {
+      negated = this.#peek().text === "-";
+      this.#index += 1;
+    }
+    const literal = this.#take("number").text;
+    // Sign and zero come from the literal's digits, never from Number(): `-1e-400` is negative
+    // (PostgreSQL's NUMERIC keeps it exactly) though Number() makes it -0.
+    const digits = frameOffsetDigits(literal);
+    if (digits === null)
       throw new TypeError(
         "Window frame offsets must be non-negative integers, or numeric RANGE offsets",
       );
+    const decimal = /[.eE]/u.test(literal);
+    let offset: number;
+    // The exact value when a double cannot hold it (past 2^53), so lowering never round-trips
+    // it through Number().
+    let exact: bigint | undefined;
+    // PostgreSQL types a decimal literal, or an integer outside int8, as numeric.
+    let numeric = decimal;
+    if (unit === "range") {
+      if (negated && !digits.zero) {
+        if (which === "starting") throw new TypeError("frame starting offset must not be negative");
+        throw new TypeError("frame ending offset must not be negative");
+      }
+      // RANGE keeps the value. One a double cannot hold (it would become 0 or Infinity) is
+      // refused rather than changed.
+      offset = digits.zero ? 0 : Number(literal);
+      if (!digits.zero && (offset === 0 || !Number.isFinite(offset)))
+        throw new TypeError("RANGE frame offsets outside double precision are not supported");
+      if (!decimal) {
+        const value = BigInt(literal);
+        if (value > 9007199254740991n) exact = value;
+        if (value > 9223372036854775807n) numeric = true;
+      }
+    } else {
+      // ROWS and GROUPS take a bigint: PostgreSQL rounds a numeric literal half away from zero
+      // (`-0.4` is 0, `-0.5` is -1, `-1e-400` is 0) before checking its sign and its range.
+      // The range is signed, [-2^63, 2^63 - 1], and comes first: -9223372036854775808 is a
+      // valid bigint, so it reaches the sign check (22013).
+      const magnitude = roundedFrameOffset(digits);
+      const rounded = negated ? -magnitude : magnitude;
+      if (rounded > 9223372036854775807n || rounded < -9223372036854775808n)
+        throw new TypeError("bigint out of range");
+      if (rounded < 0n) {
+        if (which === "starting") throw new TypeError("frame starting offset must not be negative");
+        throw new TypeError("frame ending offset must not be negative");
+      }
+      offset = Number(rounded);
+      if (rounded > 9007199254740991n) exact = rounded;
     }
+    const metadata =
+      unit === "range" || numeric || exact !== undefined
+        ? {
+            ...(unit === "range" ? { text: literal } : {}),
+            ...(numeric ? { numeric: true as const } : {}),
+            ...(exact === undefined ? {} : { exact }),
+          }
+        : undefined;
     if (this.#isKeyword("PRECEDING")) {
       this.#keyword("PRECEDING");
-      return { kind: "preceding", offset };
+      return rememberFrameOffset<WindowFrame["start"]>({ kind: "preceding", offset }, metadata);
     }
     this.#keyword("FOLLOWING");
-    return { kind: "following", offset };
+    return rememberFrameOffset<WindowFrame["start"]>({ kind: "following", offset }, metadata);
   }
 
   #comparison(): ComparisonOperator {
@@ -14939,6 +15010,42 @@ function timestampLiteral(text: string): Date {
 }
 
 /** The parser's OFFSET range contract, shared with the typed builder. */
+/**
+ * A frame offset literal's significant digits and power of ten (value = digits × 10^exponent),
+ * read from its text: `zero` when every mantissa digit is 0, whatever the exponent. Null when
+ * the text is not a plain decimal literal.
+ */
+function frameOffsetDigits(
+  literal: string,
+): { readonly digits: string; readonly exponent: number; readonly zero: boolean } | null {
+  const match = /^(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/u.exec(literal);
+  if (match === null) return null;
+  const [, whole = "", fraction = "", exponent = "0"] = match;
+  if (whole === "" && fraction === "") return null;
+  const digits = `${whole}${fraction}`.replace(/^0+/u, "");
+  return { digits, exponent: Number(exponent) - fraction.length, zero: digits === "" };
+}
+
+/**
+ * A ROWS / GROUPS frame offset as PostgreSQL's numeric → bigint cast reads it: rounded half away
+ * from zero, exactly from the digits (`2.5` is 3, `0.4999…` is 0). Huge exponents never build
+ * huge numbers: past 20 integer digits the value is out of bigint range, and below 0.1 it is 0.
+ */
+function roundedFrameOffset(literal: {
+  readonly digits: string;
+  readonly exponent: number;
+}): bigint {
+  const { digits, exponent } = literal;
+  if (digits === "") return 0n;
+  if (digits.length + exponent > 20) return 10n ** 20n;
+  if (exponent >= 0) return BigInt(digits) * 10n ** BigInt(exponent);
+  if (digits.length + exponent < 0) return 0n;
+  const coefficient = BigInt(digits);
+  const divisor = 10n ** BigInt(-exponent);
+  let rounded = coefficient / divisor;
+  if ((coefficient % divisor) * 2n >= divisor) rounded += 1n;
+  return rounded;
+}
 
 export function validateOffset(offset: number): number {
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > 100_000_000)

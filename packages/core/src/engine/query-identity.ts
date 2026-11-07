@@ -1,3 +1,4 @@
+import { frameOffsetMetadata } from "./frame-offsets.js";
 import { dateMilliseconds } from "../date-value.js";
 
 /** Type-tagged, length-delimited structural identity. Unlike JSON, it preserves Date vs string,
@@ -34,6 +35,9 @@ export function encodeQueryIdentity(value: unknown, ancestors = new Set<object>(
       )
       .join("")}}`;
   }
+  // Exact frame literals participate even when their public double offsets are identical.
+  const frame = frameOffsetMetadata(value);
+  if (frame !== undefined) encoded = `f${encodeQueryIdentity(frame, ancestors)}${encoded}`;
   ancestors.delete(value);
   return encoded;
 }

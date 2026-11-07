@@ -689,6 +689,34 @@
       "notes": "Numeric RANGE offsets measure ordering-value distance and require one numeric ORDER BY expression. Temporal interval offsets are not supported."
     },
     {
+      "id": "window.frame-range-interval-offset",
+      "status": "unsupported",
+      "example": "SELECT amount, COUNT(*) OVER (ORDER BY joined RANGE BETWEEN INTERVAL '1 day' PRECEDING AND CURRENT ROW) AS recent FROM rows",
+      "error": "Window frame offsets other than numeric literals are not supported",
+      "notes": "PostgreSQL measures a date or timestamp RANGE frame with an interval offset. Minnow takes only numeric literal offsets, so interval offsets are refused."
+    },
+    {
+      "id": "window.frame-range-string-offset",
+      "status": "unsupported",
+      "example": "SELECT amount, SUM(amount) OVER (ORDER BY amount RANGE BETWEEN '1' PRECEDING AND CURRENT ROW) AS windowed FROM rows",
+      "error": "Window frame offsets other than numeric literals are not supported",
+      "notes": "PostgreSQL reads a quoted offset as a value of the ORDER BY type. Write the offset as a number literal: RANGE BETWEEN 1 PRECEDING."
+    },
+    {
+      "id": "window.frame-negative-offset",
+      "status": "unsupported",
+      "example": "SELECT amount, SUM(amount) OVER (ORDER BY amount RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) AS windowed FROM rows WHERE amount < 0",
+      "error": "frame starting offset must not be negative",
+      "notes": "A negative frame offset is an error, as in PostgreSQL (22013), and so is a NULL one (22004). One difference: PostgreSQL raises a negative RANGE offset only when it compares a row, so over no rows, as here, it returns none. Minnow refuses the statement before reading any row. A negative ROWS or GROUPS offset fails before any row in both."
+    },
+    {
+      "id": "window.frame-range-offset-double-precision",
+      "status": "unsupported",
+      "example": "SELECT amount, SUM(amount) OVER (ORDER BY amount RANGE BETWEEN 1e400 PRECEDING AND CURRENT ROW) AS windowed FROM rows",
+      "error": "RANGE frame offsets outside double precision are not supported",
+      "notes": "A positive RANGE offset must fit a double: one past its range (1e400) or nearer zero than it can hold (1e-400) is refused, never rounded to infinity or zero. Over a NUMERIC key PostgreSQL runs both. Over a DOUBLE PRECISION key PostgreSQL 18 raises 22003 (out of range for double precision) for both signs; Minnow raises this refusal for a positive offset and 'frame starting offset must not be negative' (22013) for a negative one."
+    },
+    {
       "id": "window.distinct-aggregate",
       "status": "unsupported",
       "example": "SELECT SUM(DISTINCT amount) OVER (PARTITION BY region) AS total FROM rows",

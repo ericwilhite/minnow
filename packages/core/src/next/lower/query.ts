@@ -1,277 +1,45 @@
 /**
  * Query blocks (plan/model.ts `CompiledQuery`, after the front-end passes) to relational IR:
- * source (scan, key lookup, derived block, or the one-row FROM-less source), WHERE, GROUP BY with
+ * the FROM clause and WHERE (lower/from.ts), GROUP BY with
  * aggregates and HAVING, the select list, ORDER BY, LIMIT / OFFSET.
  *
- * Milestone M1 surface; joins, subqueries, windows, set operations and recursion are refused
- * with `UnsupportedPlanError` (stage "lower") until milestone M3.
+ * The FROM clause (sources, joins and their order, subqueries) is lower/from.ts.
  */
-import type { CatalogView, ColumnDef, IndexDef, TableDef } from "../access/catalog.js";
-import type {
-  AggregateCall,
-  AggregateFn,
-  Bound,
-  OutputColumn,
-  Rel,
-  ScalarExpr,
-  SortKey,
-} from "../ir/ir.js";
+import { strongestRowLock } from "../../engine/row-locking.js";
+import type { AggregateCall, AggregateFn, Bound, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
+import { aggregateArgument, aggregateResult } from "../ir/functions.js";
 import type { PhysicalType } from "../types.js";
-import { DUAL_TABLE, isAggregateCall } from "../../engine/query.js";
+import { isAggregateCall } from "../../engine/query.js";
 import { encodeQueryIdentity } from "../../engine/query-identity.js";
-import type { CompiledQuery, Expression, Predicate, TableSource } from "../../plan/model.js";
-import { baseType, coerce, settle, type ParameterTypes, type Typed } from "./coerce.js";
+import type { CompiledQuery, Expression } from "../../plan/model.js";
+import { coerce, settle, type Typed } from "./coerce.js";
 import { PlanningError, unsupported } from "./errors.js";
 import {
   asBool,
   lowerCondition,
   lowerExpression,
   type Collated,
-  type ExpressionState,
   type Scope,
 } from "./expressions.js";
+import { lowerFrom, type FromClause, type OuterResolver } from "./from.js";
+import {
+  andOf,
+  column,
+  mapColumns,
+  outputColumns,
+  type LoweredRel,
+  type PlanBuilder,
+  type RelColumn,
+} from "./plan.js";
 
-/** An output column of a lowered relation, with what result descriptors need. */
-export interface RelColumn {
-  readonly name: string;
-  readonly type: PhysicalType;
-  readonly nullable: boolean;
-  /** Renders as a JS bigint (R17.1). */
-  readonly big: boolean;
-}
-
-export interface LoweredRel {
-  readonly rel: Rel;
-  readonly columns: readonly RelColumn[];
-}
-
-/** Per-statement plan state: operator ids, read tables, expression state. */
-export class PlanBuilder {
-  #nextId = 1;
-  readonly reads = new Set<number>();
-  readonly rowCounts = new Map<number, number>();
-  constructor(
-    readonly catalog: CatalogView,
-    readonly state: ExpressionState,
-    readonly rowCount: (tableId: number) => number,
-  ) {}
-  get parameters(): ParameterTypes {
-    return this.state.parameters;
-  }
-  id(): number {
-    return this.#nextId++;
-  }
-  read(table: TableDef): void {
-    this.reads.add(table.id);
-    this.rowCounts.set(table.id, this.rowCount(table.id));
-  }
-}
-
-export function outputColumns(columns: readonly RelColumn[]): OutputColumn[] {
-  return columns.map(({ name, type, nullable }) => ({ name, type, nullable }));
-}
-
-const column = (index: number, type: PhysicalType): ScalarExpr => ({ op: "column", index, type });
-
-/** `a` or `t.a` → the column name if the qualifier is one of `qualifiers` (or absent). */
-function unqualified(reference: string, qualifiers: readonly string[]): string | undefined {
-  const dot = reference.indexOf(".");
-  if (dot === -1) return reference;
-  return qualifiers.includes(reference.slice(0, dot)) ? reference.slice(dot + 1) : undefined;
-}
-
-/**
- * A base table read: the columns any expression references, collected on first use, so the scan
- * reads only those (late materialization and key lookups use the same list).
- */
-export class TableRead {
-  readonly columns: number[] = [];
-  readonly #positions = new Map<number, number>();
-  constructor(
-    readonly table: TableDef,
-    readonly alias: string,
-  ) {}
-  /** The output position of a catalog column, added on first use. */
-  use(def: ColumnDef): number {
-    let position = this.#positions.get(def.id);
-    if (position === undefined) {
-      position = this.columns.length;
-      this.columns.push(def.id);
-      this.#positions.set(def.id, position);
-    }
-    return position;
-  }
-  columnByName(name: string): ColumnDef | undefined {
-    return this.table.columns.find((candidate) => candidate.name === name);
-  }
-  /** Output columns of the scan, in `columns` order (plus the locator when asked). */
-  output(locator: boolean): OutputColumn[] {
-    const columns: OutputColumn[] = this.columns.map((id) => {
-      const def = this.table.columns.find((candidate) => candidate.id === id);
-      if (def === undefined) throw new PlanningError(`column ${String(id)} vanished`, "XX000");
-      return { name: def.name, type: def.type, nullable: def.nullable };
-    });
-    if (locator)
-      columns.push({
-        name: "(locator)",
-        type: { kind: "locator", tableId: this.table.id },
-        nullable: false,
-      });
-    return columns;
-  }
-  scope(): Scope {
-    const qualifiers = [this.alias, this.table.name];
-    return {
-      column: (reference) => {
-        const name = unqualified(reference, qualifiers);
-        const def = name === undefined ? undefined : this.columnByName(name);
-        if (def === undefined) return undefined;
-        return {
-          expr: column(this.use(def), def.type),
-          nullable: def.nullable,
-          big: def.type.kind === "int64",
-        };
-      },
-    };
-  }
-}
-
-/** A scope over a lowered relation's named columns (a derived table's output). */
-export function relationScope(columns: readonly RelColumn[], qualifiers: readonly string[]): Scope {
-  return {
-    column: (reference) => {
-      const name =
-        unqualified(reference, qualifiers) ??
-        (columns.some((c) => c.name === reference) ? reference : undefined);
-      if (name === undefined) return undefined;
-      const index = columns.findIndex((candidate) => candidate.name === name);
-      const found = columns[index];
-      if (found === undefined) return undefined;
-      return { expr: column(index, found.type), nullable: found.nullable, big: found.big };
-    },
-  };
-}
-
-/** One key tuple of a unique index, from `col = constant` conjuncts (or one `col IN (…)`). */
-interface KeyAccess {
-  readonly index: IndexDef;
-  readonly keys: ReadonlyArray<readonly ScalarExpr[]>;
-  /** Positions of the predicates the lookup answers. */
-  readonly used: ReadonlySet<number>;
-}
-
-const isConstant = (expression: Expression): boolean =>
-  expression.kind === "literal" ||
-  expression.kind === "parameter" ||
-  (expression.kind === "call" &&
-    expression.name === "CAST" &&
-    expression.arguments[0] !== undefined &&
-    isConstant(expression.arguments[0]));
-
-/**
- * A key exactly of `def.type` for a constant expression, or null when it cannot be one (a
- * constant out of the column's range, or a type that needs more than an exact constant).
- */
-function keyValue(
-  expression: Expression,
-  def: ColumnDef,
-  scope: Scope,
-  builder: PlanBuilder,
-): ScalarExpr | null {
-  const typed = lowerExpression(expression, scope, builder.state);
-  try {
-    // Only lossless coercions select key access (review finding 1): the key is the constant at
-    // the column's base type, so `varchar2_col = 'abc'` probes 'abc' (no match), never 'ab'.
-    const keyed = coerce(typed, baseType(def.type), "implicit", builder.parameters);
-    const expr = keyed.expr;
-    if (expr.op === "literal" || expr.op === "param") return expr;
-    // A constant parsed from text (`DATE '…'`, a uuid string), evaluated once by the executor.
-    if (
-      expr.op === "cast" &&
-      expr.assignment !== true &&
-      expr.input.op === "literal" &&
-      expr.input.type.kind === "text" &&
-      expr.type.kind !== "text"
-    )
-      return expr;
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Finds a unique index whose every column is fixed by an equality with a constant (or one column
- * by an IN list of constants): the plan becomes a `keyLookup` (ruling R6's point read). The
- * primary key wins over other unique indexes. A constant that cannot be a key of the column's type
- * (`int4_col = 5000000000`) gives no lookup: the scan's filter answers it (no row matches).
- */
-export function findKeyAccess(
-  read: TableRead,
-  predicates: readonly Predicate[],
-  builder: PlanBuilder,
-): KeyAccess | null {
-  const scope = read.scope();
-  const equalities = new Map<number, { position: number; value: Expression }>();
-  const lists = new Map<number, { position: number; values: readonly Expression[] }>();
-  for (const [position, predicate] of predicates.entries()) {
-    const sides: Array<[Expression, Expression]> = [
-      [predicate.left, predicate.right],
-      [predicate.right, predicate.left],
-    ];
-    for (const [columnSide, valueSide] of sides) {
-      if (columnSide.kind !== "column") continue;
-      const name = unqualified(columnSide.reference, [read.alias, read.table.name]);
-      const def = name === undefined ? undefined : read.columnByName(name);
-      if (def === undefined) continue;
-      if (predicate.operator === "=" && isConstant(valueSide)) {
-        if (!equalities.has(def.id)) equalities.set(def.id, { position, value: valueSide });
-        break;
-      }
-      if (
-        predicate.operator === "IN" &&
-        columnSide === predicate.left &&
-        valueSide.kind === "list" &&
-        valueSide.items.length > 0 &&
-        valueSide.items.every(isConstant)
-      ) {
-        if (!lists.has(def.id)) lists.set(def.id, { position, values: valueSide.items });
-        break;
-      }
-    }
-  }
-  const unique = read.table.indexes
-    .filter((index) => index.unique)
-    .sort((a, b) => Number(b.role === "primary") - Number(a.role === "primary"));
-  for (const index of unique) {
-    const defs = index.columnIds.map((id) =>
-      read.table.columns.find((candidate) => candidate.id === id),
-    );
-    if (defs.some((def) => def === undefined)) continue;
-    const columns = defs as ColumnDef[];
-    if (columns.every((def) => equalities.has(def.id))) {
-      const tuple: ScalarExpr[] = [];
-      const used = new Set<number>();
-      for (const def of columns) {
-        const entry = equalities.get(def.id);
-        const key = entry === undefined ? null : keyValue(entry.value, def, scope, builder);
-        if (entry === undefined || key === null) break;
-        tuple.push(key);
-        used.add(entry.position);
-      }
-      if (tuple.length === columns.length) return { index, keys: [tuple], used };
-    }
-    const [only] = columns;
-    if (columns.length === 1 && only !== undefined && lists.has(only.id)) {
-      const entry = lists.get(only.id);
-      if (entry === undefined) continue;
-      const keys = entry.values.map((value) => keyValue(value, only, scope, builder));
-      if (keys.every((key): key is ScalarExpr => key !== null))
-        return { index, keys: keys.map((key) => [key]), used: new Set([entry.position]) };
-    }
-  }
-  return null;
-}
+export {
+  PlanBuilder,
+  TableRead,
+  andOf,
+  outputColumns,
+  type LoweredRel,
+  type RelColumn,
+} from "./plan.js";
 
 /** A front-end aggregate call as an IR aggregate over the pre-aggregation projection. */
 interface AggregateDraft {
@@ -289,7 +57,6 @@ interface AggregateDraft {
 }
 
 const INT8: PhysicalType = { kind: "int64" };
-const FLOAT8: PhysicalType = { kind: "float64" };
 
 function aggregateDraft(
   expression: Extract<Expression, { kind: "call" }>,
@@ -325,20 +92,22 @@ function aggregateDraft(
   }
   if (first === undefined)
     throw new PlanningError(`${name.toLowerCase()} needs an argument`, "42601");
-  const arg = settleArg(first);
+  const settled = settleArg(first);
+  // An argument no overload takes as is casts implicitly to the one that does (sum(time) is
+  // sum(interval), as PostgreSQL resolves it).
+  const resolved =
+    name === "SUM" || name === "AVG"
+      ? aggregateArgument(name === "SUM" ? "sum" : "avg", settled.expr.type)
+      : null;
+  const arg =
+    resolved === null || resolved === settled.expr.type
+      ? settled
+      : coerce(settled, resolved, "implicit", builder.parameters);
   const type = arg.expr.type;
   switch (name) {
     case "SUM": {
-      const result: PhysicalType | null =
-        type.kind === "int32"
-          ? INT8
-          : type.kind === "int64"
-            ? { kind: "decimal", precision: null, scale: 0 }
-            : type.kind === "decimal"
-              ? { kind: "decimal", precision: null, scale: null }
-              : type.kind === "float32" || type.kind === "float64" || type.kind === "interval"
-                ? type
-                : null;
+      // ir/functions.ts AGGREGATES (R19) types every aggregate.
+      const result = aggregateResult("sum", [type]);
       if (result === null)
         throw new PlanningError(`function sum(${type.kind}) does not exist`, "42883");
       // D2 / R17.2: SUM(int8) is exact and renders bigint; SUM(int2/int4) renders number.
@@ -353,17 +122,7 @@ function aggregateDraft(
       };
     }
     case "AVG": {
-      const result: PhysicalType | null =
-        type.kind === "int32" ||
-        type.kind === "int64" ||
-        type.kind === "float32" ||
-        type.kind === "float64"
-          ? FLOAT8
-          : type.kind === "decimal"
-            ? { kind: "decimal", precision: null, scale: null }
-            : type.kind === "interval"
-              ? type
-              : null;
+      const result = aggregateResult("avg", [type]);
       if (result === null)
         throw new PlanningError(`function avg(${type.kind}) does not exist`, "42883");
       return {
@@ -377,11 +136,14 @@ function aggregateDraft(
       };
     }
     case "MIN":
-    case "MAX":
-      if (type.kind === "json" && !type.binary)
-        throw new PlanningError(`function ${name.toLowerCase()}(json) does not exist`, "42883");
+    case "MAX": {
+      const fn = name === "MIN" ? "min" : "max";
+      // PostgreSQL has no min / max over bool, json, jsonb or uuid (42883). The result keeps
+      // the argument's modifiers (a VARCHAR(n) column's min renders as the column does).
+      if (aggregateResult(fn, [type]) === null)
+        throw new PlanningError(`function ${fn}(${type.kind}) does not exist`, "42883");
       return {
-        fn: name === "MIN" ? "min" : "max",
+        fn,
         args: [arg],
         distinct,
         orderBy: [],
@@ -389,6 +151,7 @@ function aggregateDraft(
         nullable: true,
         big: arg.big,
       };
+    }
     case "STRING_AGG": {
       const [, separator] = expression.arguments;
       if (separator === undefined) throw new PlanningError("string_agg needs a delimiter", "42601");
@@ -488,6 +251,9 @@ class Grouping {
         }
         return this.#aggregateColumn(position);
       },
+      ...(this.source.knowsQualifier === undefined
+        ? {}
+        : { knowsQualifier: this.source.knowsQualifier.bind(this.source) }),
       column: (reference) => {
         const resolved = this.source.column(reference);
         if (resolved === undefined) return undefined;
@@ -504,8 +270,8 @@ class Grouping {
   }
 
   /** The projection below the aggregate (keys, then every aggregate argument) and the aggregate. */
-  build(input: Rel): LoweredRel {
-    const exprs: ScalarExpr[] = this.keys.map((key) => key.expr);
+  build(input: Rel, remap: (expr: ScalarExpr) => ScalarExpr): LoweredRel {
+    const exprs: ScalarExpr[] = this.keys.map((key) => remap(key.expr));
     const projected: RelColumn[] = this.keys.map((key, index) => ({
       name: `(group ${String(index + 1)})`,
       type: key.expr.type,
@@ -514,7 +280,7 @@ class Grouping {
     }));
     const argumentColumn = (typed: Typed): ScalarExpr => {
       const index = exprs.length;
-      exprs.push(typed.expr);
+      exprs.push(remap(typed.expr));
       projected.push({
         name: `(argument ${String(index + 1)})`,
         type: typed.expr.type,
@@ -565,121 +331,6 @@ class Grouping {
   }
 }
 
-/** A block's source before its relation is built (table reads collect columns first). */
-interface Source {
-  readonly scope: Scope;
-  build(
-    filter: readonly Typed[],
-    predicates: readonly Predicate[],
-  ): LoweredRel & { readonly pointRead: boolean };
-}
-
-export function andOf(conjuncts: readonly Typed[]): ScalarExpr | null {
-  if (conjuncts.length === 0) return null;
-  if (conjuncts.length === 1) return conjuncts[0]?.expr ?? null;
-  return { op: "and", args: conjuncts.map((conjunct) => conjunct.expr), type: { kind: "bool" } };
-}
-
-function filtered(
-  input: LoweredRel,
-  conjuncts: readonly Typed[],
-  builder: PlanBuilder,
-): LoweredRel {
-  const predicate = andOf(conjuncts);
-  if (predicate === null) return input;
-  return {
-    rel: { op: "filter", id: builder.id(), input: input.rel, predicate, output: input.rel.output },
-    columns: input.columns,
-  };
-}
-
-function tableSource(
-  table: TableDef,
-  alias: string,
-  builder: PlanBuilder,
-  keyed: boolean,
-): Source & { readonly read: TableRead } {
-  const read = new TableRead(table, alias);
-  return {
-    read,
-    scope: read.scope(),
-    build(conjuncts, predicates) {
-      builder.read(table);
-      const access = keyed ? findKeyAccess(read, predicates, builder) : null;
-      const columnsOf = (): RelColumn[] =>
-        read.output(false).map((output) => ({ ...output, big: output.type.kind === "int64" }));
-      if (access !== null) {
-        const residual = conjuncts.filter((_, position) => !access.used.has(position));
-        const lookup: Rel = {
-          op: "keyLookup",
-          id: builder.id(),
-          tableId: table.id,
-          indexId: access.index.id,
-          keys: access.keys,
-          columns: [...read.columns],
-          output: read.output(false),
-        };
-        return {
-          ...filtered({ rel: lookup, columns: columnsOf() }, residual, builder),
-          pointRead: true,
-        };
-      }
-      const scan: Rel = {
-        op: "scan",
-        id: builder.id(),
-        tableId: table.id,
-        columns: [...read.columns],
-        filter: andOf(conjuncts),
-        runtimeFilters: [],
-        emitLocator: false,
-        output: read.output(false),
-      };
-      return { rel: scan, columns: columnsOf(), pointRead: false };
-    },
-  };
-}
-
-function lowerSource(source: TableSource, builder: PlanBuilder): Source {
-  if (source.union !== undefined) throw unsupported("setOperation", "UNION / INTERSECT / EXCEPT");
-  if (source.recursive !== undefined) throw unsupported("recursive", "WITH RECURSIVE");
-  if (source.windowed !== undefined) throw unsupported("window", "window functions");
-  if (source.lateral === true) throw unsupported("lateral", "LATERAL");
-  if (source.derived !== undefined) {
-    const inner = lowerBlock(source.derived, builder);
-    const columns =
-      source.columnAliases === undefined
-        ? inner.columns
-        : inner.columns.map((col, index) => ({
-            ...col,
-            name: source.columnAliases?.[index] ?? col.name,
-          }));
-    const scope = relationScope(columns, [source.alias]);
-    return {
-      scope,
-      build: (conjuncts) => ({
-        ...filtered({ rel: inner.rel, columns }, conjuncts, builder),
-        pointRead: false,
-      }),
-    };
-  }
-  if (source.table === DUAL_TABLE)
-    return {
-      scope: { column: () => undefined },
-      build: (conjuncts) => ({
-        ...filtered(
-          { rel: { op: "values", id: builder.id(), rows: [[]], output: [] }, columns: [] },
-          conjuncts,
-          builder,
-        ),
-        pointRead: false,
-      }),
-    };
-  const table = builder.catalog.tableByName(source.table);
-  if (table === undefined)
-    throw new PlanningError(`relation "${source.table}" does not exist`, "42P01");
-  return tableSource(table, source.alias, builder, true);
-}
-
 function boundOf(
   value: number | undefined,
   parameter: number | undefined,
@@ -692,16 +343,63 @@ function boundOf(
   return value === undefined ? null : { kind: "const", value };
 }
 
+/**
+ * Subqueries in scopes that cannot attach an `apply` (HAVING, grouped select lists, DML
+ * values): an uncorrelated scalar subquery or EXISTS becomes an init plan; a correlated one, or
+ * IN / ANY / ALL there, is refused until it can be attached (`correlatedSubquery`).
+ */
+export function installSubqueries(builder: PlanBuilder): void {
+  builder.state.subquery = (request, scope) => {
+    const uncorrelated: OuterResolver = (reference) => {
+      if (scope.column(reference) !== undefined)
+        throw unsupported(
+          "correlatedSubquery",
+          "a correlated subquery outside FROM-level expressions",
+        );
+      return undefined;
+    };
+    if (request.kind === "quantified")
+      throw unsupported("correlatedSubquery", "IN / ANY / ALL over a subquery here");
+    const inner = lowerBlock(request.block, builder, uncorrelated);
+    return request.kind === "scalar" ? builder.initPlan(inner) : builder.existsInitPlan(inner);
+  };
+}
+
+/** `*` and `alias.*` select items expanded over the FROM clause's columns. */
+function expandWildcards(
+  select: CompiledQuery["select"],
+  from: FromClause,
+): CompiledQuery["select"] {
+  if (!select.some((item) => item.expression.kind === "wildcard")) return select;
+  return select.flatMap((item) => {
+    const expression = item.expression;
+    if (expression.kind !== "wildcard") return [item];
+    return from.wildcard(expression.table).map((reference) => ({
+      expression: reference,
+      alias:
+        reference.kind === "column"
+          ? (reference.reference.split(".").at(-1) ?? reference.reference)
+          : item.alias,
+    }));
+  });
+}
+
 /** One query block as a relation with named output columns. */
 export function lowerBlock(
   block: CompiledQuery,
   builder: PlanBuilder,
+  outer?: OuterResolver,
 ): LoweredRel & { readonly pointRead?: boolean } {
-  if (block.joins.length > 0) throw unsupported("join", "joins (milestone M3)");
+  builder.rowLocking = strongestRowLock([builder.rowLocking, block.rowLocking]);
   if (block.pendingSelectShape !== undefined)
     throw new PlanningError("unbound select shape", "XX000");
   const state = builder.state;
-  const source = lowerSource(block.base, builder);
+  const from = lowerFrom(block.base, block.joins, builder, {
+    ...(outer === undefined ? {} : { outer }),
+    lowerBlock,
+  });
+  const source = from.scope;
+  const select = expandWildcards(block.select, from);
   const conjuncts = block.predicates.map((predicate) =>
     asBool(
       lowerCondition(
@@ -709,7 +407,7 @@ export function lowerBlock(
         predicate.left,
         predicate.right,
         predicate.escape,
-        source.scope,
+        source,
         state,
       ),
       state,
@@ -717,10 +415,10 @@ export function lowerBlock(
   );
   const grouped =
     block.groupBy.length > 0 ||
-    block.select.some((item) => hasAggregateCall(item.expression)) ||
+    select.some((item) => hasAggregateCall(item.expression)) ||
     block.having.length > 0;
-  const grouping = grouped ? new Grouping(block.groupBy, source.scope, builder) : null;
-  const outputScope = grouping?.scope() ?? source.scope;
+  const grouping = grouped ? new Grouping(block.groupBy, source, builder) : null;
+  const outputScope = grouping?.scope() ?? source;
   const having = block.having.map((predicate) =>
     asBool(
       lowerCondition(
@@ -734,10 +432,13 @@ export function lowerBlock(
       state,
     ),
   );
-  const items: Collated[] = block.select.map((item) =>
-    settle(lowerExpression(item.expression, outputScope, state), builder.parameters),
+  const raw = select.map((item) => lowerExpression(item.expression, outputScope, state));
+  const items: Collated[] = raw.map((typed) => settle(typed, builder.parameters));
+  // Unknown-typed constants a set operation still resolves (placeholders keep their own rule).
+  const pending = raw.map((typed) =>
+    typed.pending?.kind === "null" || typed.pending?.kind === "text" ? typed : undefined,
   );
-  const names = block.select.map((item) => item.alias);
+  const names = select.map((item) => item.alias);
   // ORDER BY: an output column by name, else an expression over the block's rows (hidden).
   const hidden: Collated[] = [];
   const order = block.orderBy.map((entry) => {
@@ -751,7 +452,7 @@ export function lowerBlock(
       ) as Collated;
       collation = typed.collation ?? null;
       const identity = encodeQueryIdentity(expression);
-      const existing = block.select.findIndex(
+      const existing = select.findIndex(
         (item) => encodeQueryIdentity(item.expression) === identity,
       );
       if (existing !== -1) position = existing;
@@ -768,11 +469,40 @@ export function lowerBlock(
     };
   });
 
-  // Assemble bottom-up: every expression is typed, so the scan's column list is final.
-  const base = source.build(conjuncts, block.predicates);
-  let current: LoweredRel = base;
-  if (grouping !== null) current = filtered(grouping.build(current.rel), having, builder);
+  // Assemble bottom-up: every expression is typed, so the FROM clause can be built and its
+  // virtual columns mapped to positions.
+  const base = from.build(conjuncts);
+  const positions = new Map(base.layout.map((index, position) => [index, position]));
+  const remap = (expr: ScalarExpr): ScalarExpr =>
+    mapColumns(expr, (index) => {
+      const position = positions.get(index);
+      if (position === undefined)
+        throw new PlanningError(`column ${String(index)} vanished`, "XX000");
+      return position;
+    });
+  let current: LoweredRel = { rel: base.rel, columns: base.columns };
   const projected = [...items, ...hidden];
+  const exprs =
+    grouping === null
+      ? projected.map((item) => remap(item.expr))
+      : projected.map((item) => item.expr);
+  if (grouping !== null) {
+    const aggregated = grouping.build(current.rel, remap);
+    const predicate = andOf(having);
+    current =
+      predicate === null
+        ? aggregated
+        : {
+            rel: {
+              op: "filter",
+              id: builder.id(),
+              input: aggregated.rel,
+              predicate,
+              output: aggregated.rel.output,
+            },
+            columns: aggregated.columns,
+          };
+  }
   const columns: RelColumn[] = projected.map((item, index) => ({
     name: names[index] ?? `(order ${String(index - names.length + 1)})`,
     type: item.expr.type,
@@ -784,7 +514,7 @@ export function lowerBlock(
       op: "project",
       id: builder.id(),
       input: current.rel,
-      exprs: projected.map((item) => item.expr),
+      exprs,
       output: outputColumns(columns),
     },
     columns,
@@ -839,7 +569,15 @@ export function lowerBlock(
       columns: visible,
     };
   }
-  return { ...current, pointRead: base.pointRead && grouping === null && order.length === 0 };
+  const rows =
+    grouping === null ? base.rows : Math.max(1, Math.min(base.rows, Math.sqrt(base.rows) * 10));
+  const limited = block.limit === undefined ? rows : Math.min(rows, block.limit);
+  return {
+    ...current,
+    rows: limited,
+    pointRead: base.pointRead && grouping === null && order.length === 0,
+    ...(pending.some((typed) => typed !== undefined) ? { pending } : {}),
+  };
 }
 
 function hasAggregateCall(expression: Expression): boolean {

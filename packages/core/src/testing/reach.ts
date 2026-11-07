@@ -585,3 +585,121 @@ export const TRANSACTION_ATTRIBUTE_STATES = [
   "deferrable query refusal",
   "deferrable savepoint refusal",
 ] as const;
+
+/**
+ * RANGE offset frames over non-integer keys against PostgreSQL (next/testing/
+ * lowering-pglite-review.test.ts, review B6-p2b-3 finding 1): exact NUMERIC around 2^53 and
+ * with fractions, NUMERIC NaN / ±Infinity peers, float ±Infinity and NaN peers, and temporal
+ * keys with interval offsets (refused, 0A000, until lowering takes them).
+ */
+export const RANGE_KEY_STATES = [
+  "numeric exact",
+  "numeric special",
+  "float infinite",
+  "float NaN",
+  "temporal refused",
+] as const;
+
+/** Frame offset errors against PostgreSQL (review B6-p2b-3 finding 3). */
+export const FRAME_OFFSET_STATES = [
+  "accepted",
+  "null offset",
+  "negative offset",
+  "refused",
+  // Review B6-p2b-4: a minus sign on zero is zero; ROWS / GROUPS round decimals to bigint; a
+  // decimal on an integer RANGE key is PostgreSQL's 0A000.
+  "signed zero accepted",
+  "rounded offset accepted",
+  "numeric offset on an integer key",
+  // Review B6-p2b-5: a ROWS / GROUPS offset past bigint (1e400) is 22003.
+  "bigint out of range",
+  // Review B6-p2b-6: the signed bigint range exactly: 2^63 - 1 runs, -2^63 is negative (22013).
+  "bigint maximum accepted",
+  "bigint minimum negative",
+] as const;
+
+/** HAVING names against PostgreSQL (review B6-p2b-3 finding 3). */
+export const HAVING_NAME_STATES = [
+  "accepted",
+  "unknown column",
+  "ungrouped column",
+  "unknown table",
+] as const;
+
+/**
+ * NULL keys in RANGE offset frames against PostgreSQL (next/testing/lowering-pglite-review.test.ts,
+ * the B7 report): for a non-NULL current row, NULLs sort below every key (NULLS FIRST) or above
+ * (NULLS LAST), so a frame that runs to that end includes them; a NULL row's frame is its NULL
+ * peers.
+ */
+export const RANGE_NULL_STATES = [
+  "nulls first in a frame",
+  "nulls last in a frame",
+  "nulls outside a frame",
+  "null row",
+] as const;
+
+/** Exact NUMERIC window distances, including parser clones and expression identity. */
+export const RANGE_DECIMAL_STATES = [
+  "fractional distance",
+  "2^53 distance",
+  "2^63 distance",
+  "direct frame",
+  "CTE clone",
+  "derived frame",
+  "adjacent frame identity",
+] as const;
+
+/** Private frame metadata must survive the parser's plan-copy boundaries. */
+export const FRAME_METADATA_STATES = [
+  "exact ROWS",
+  "exact GROUPS",
+  "exact RANGE",
+  "numeric RANGE refusal",
+  "direct",
+  "CTE",
+  "derived",
+] as const;
+
+/** Planned locking reads: relation targets, CTE boundaries, expanded views and strongest intent. */
+export const ROW_LOCK_INTENT_STATES = [
+  "unused stronger CTE",
+  "base relation",
+  "FROM propagation",
+  "constant source",
+  "CTE boundary",
+  "CTE body",
+  "unused CTE",
+  "OF target",
+  "view clause",
+  "nested view",
+  "view target",
+  "strongest",
+] as const;
+
+/** Ordered transaction-mode coverage against PostgreSQL or the lossless lowering contract. */
+export const TRANSACTION_MODE_ITEM_STATES = [
+  "empty",
+  "access",
+  "isolation",
+  "deferrable",
+  "duplicates",
+  "mixed kinds",
+  "begin",
+  "start",
+  "set",
+] as const;
+
+/** Exact basic NUMERIC operations in the reference, checked as text against PostgreSQL. */
+export const REFERENCE_DECIMAL_ARITH_STATES = [
+  "add",
+  "sub",
+  "mul",
+  "neg",
+  "abs",
+  "finite",
+  "special",
+  "zero",
+  "large",
+  "fractional",
+] as const;

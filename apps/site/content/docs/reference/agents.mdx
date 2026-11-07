@@ -282,7 +282,8 @@ machines: https://minnowdb.com/llms.txt
   ARRAY constructors, and `ANY`/`ALL` over arrays are supported. Pass an IN list as one array
   parameter — `WHERE id = ANY($1)` with `params: [[1, 2, 3]]`, or `$1::int[]` — rather than
   building `IN ($1, $2, …)` per length; it binds to the same plan as the IN list. An array binds
-  only under ANY/ALL. Numeric RANGE offsets need one numeric ordering expression.
+  only under ANY/ALL. Numeric RANGE offsets need one numeric ordering expression. A positive offset must remain
+  finite and nonzero when converted to a double, even over a NUMERIC key.
   FULL JOIN supports grouping, DISTINCT, wildcards, and compound ON in its sole-join form.
 - A datetime cast or concatenated to text is PostgreSQL's text in UTC: `2026-01-02 03:04:05+00`
   for a `TIMESTAMPTZ` column (`column.datetime()`, and every datetime column core 0.16.0 or

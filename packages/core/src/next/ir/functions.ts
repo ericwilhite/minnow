@@ -38,7 +38,8 @@
  * (values written to a column) additionally narrow among numeric types and accept any type into
  * text.
  */
-import type { PhysicalType } from "../types.js";
+import type { AggregateFn } from "./ir.js";
+import { samePhysicalType, type PhysicalType } from "../types.js";
 
 /** The SQL type names the table uses (PostgreSQL's), one per physical type family. */
 export type SqlType =
@@ -345,4 +346,168 @@ export function physicalTypeOfSql(type: SqlType): PhysicalType {
     case "bytea":
       return { kind: "bytes" };
   }
+}
+
+/** An aggregate's argument pattern: a SQL type, `"T"` (any type), or T bound to an enum/array. */
+export type AggregateArg = SqlType | "T" | "anyenum" | "anyarray";
+
+/** One overload of an aggregate (ir.ts `AggregateFn`). */
+export interface AggregateOverload {
+  readonly args: readonly AggregateArg[];
+  /** Ordered-set aggregates: the type of the one WITHIN GROUP (ORDER BY …) key. */
+  readonly within?: AggregateArg;
+  /**
+   * The result: a SQL type, T, an array of T, or an exact physical type where the IR fixes a
+   * modifier (`sum(int8)` is numeric with scale 0, R17.2).
+   */
+  readonly result: SqlType | "T" | "T[]" | PhysicalType;
+}
+
+/** The types `min` and `max` order (PostgreSQL's btree opclasses with a min/max aggregate). */
+const MIN_MAX_TYPES: readonly SqlType[] = [
+  ...numericTypes,
+  "text",
+  "date",
+  "time",
+  "timestamp",
+  "timestamptz",
+  "interval",
+  "bytea",
+];
+
+/**
+ * Every aggregate the IR names, with its overloads (ruling R19: the one authority, read by
+ * lowering's typing and by the plan checker). PostgreSQL's signatures, except where a ruling
+ * fixes Minnow's: `avg` of integers and floats is double precision (C11), and `sum(int8)` is
+ * numeric with scale 0 (R17.2). There are no `min` / `max` over bool, json, jsonb or uuid, as
+ * in PostgreSQL (42883).
+ */
+export const AGGREGATES: Readonly<Record<AggregateFn, readonly AggregateOverload[]>> = {
+  count_star: [{ args: [], result: "int8" }],
+  count: [{ args: ["T"], result: "int8" }],
+  sum: [
+    { args: ["int2"], result: "int8" },
+    { args: ["int4"], result: "int8" },
+    { args: ["int8"], result: { kind: "decimal", precision: null, scale: 0 } },
+    { args: ["numeric"], result: "numeric" },
+    { args: ["float4"], result: "float4" },
+    { args: ["float8"], result: "float8" },
+    { args: ["interval"], result: "interval" },
+  ],
+  avg: [
+    ...(["int2", "int4", "int8", "float4", "float8"] as const).map((type) => ({
+      args: [type],
+      result: "float8" as const,
+    })),
+    { args: ["numeric"], result: "numeric" },
+    { args: ["interval"], result: "interval" },
+  ],
+  min: [
+    ...MIN_MAX_TYPES.map((type) => ({ args: [type], result: type })),
+    { args: ["anyenum"], result: "T" },
+    { args: ["anyarray"], result: "T" },
+  ],
+  max: [
+    ...MIN_MAX_TYPES.map((type) => ({ args: [type], result: type })),
+    { args: ["anyenum"], result: "T" },
+    { args: ["anyarray"], result: "T" },
+  ],
+  bool_and: [{ args: ["bool"], result: "bool" }],
+  bool_or: [{ args: ["bool"], result: "bool" }],
+  string_agg: [
+    { args: ["text", "text"], result: "text" },
+    { args: ["bytea", "bytea"], result: "bytea" },
+  ],
+  array_agg: [{ args: ["T"], result: "T[]" }],
+  json_agg: [{ args: ["T"], result: "json" }],
+  percentile_cont: [
+    { args: ["float8"], within: "float8", result: "float8" },
+    { args: ["float8"], within: "interval", result: "interval" },
+  ],
+  percentile_disc: [{ args: ["float8"], within: "T", result: "T" }],
+  mode: [{ args: [], within: "T", result: "T" }],
+  single_value: [{ args: ["T"], result: "T" }],
+};
+
+/** Base types for overload matching: numeric modifiers and text widths are ignored. */
+function aggregateBase(type: PhysicalType): PhysicalType {
+  if (type.kind === "decimal") return { kind: "decimal", precision: null, scale: null };
+  if (type.kind === "text") return { kind: "text" };
+  return type;
+}
+
+/**
+ * The result type of `fn` over arguments (and a WITHIN GROUP key) of these types, by the
+ * overload they match exactly (lowering casts to an overload's types first), or null when no
+ * overload takes them.
+ */
+export function aggregateResult(
+  fn: AggregateFn,
+  args: readonly PhysicalType[],
+  within?: PhysicalType,
+): PhysicalType | null {
+  const same = (a: PhysicalType, b: PhysicalType) =>
+    samePhysicalType(aggregateBase(a), aggregateBase(b));
+  for (const overload of AGGREGATES[fn]) {
+    if (overload.args.length !== args.length) continue;
+    if ((overload.within === undefined) !== (within === undefined)) continue;
+    let bound: PhysicalType | undefined;
+    const binds = (pattern: AggregateArg, actual: PhysicalType): boolean => {
+      if (pattern === "T" || pattern === "anyenum" || pattern === "anyarray") {
+        if (pattern === "anyenum" && actual.kind !== "enum") return false;
+        if (pattern === "anyarray" && actual.kind !== "array") return false;
+        bound ??= actual;
+        return same(bound, actual);
+      }
+      return sqlTypeOf(actual) === pattern;
+    };
+    if (!overload.args.every((pattern, index) => binds(pattern, args[index] ?? { kind: "bool" })))
+      continue;
+    if (overload.within !== undefined && within !== undefined && !binds(overload.within, within))
+      continue;
+    const result = overload.result;
+    if (result === "T") {
+      if (bound !== undefined) return bound;
+      continue;
+    }
+    if (result === "T[]") {
+      if (bound !== undefined) return { kind: "array", element: bound };
+      continue;
+    }
+    return typeof result === "string" ? physicalTypeOfSql(result) : result;
+  }
+  return null;
+}
+
+/**
+ * The argument type a one-argument aggregate call resolves to, as PostgreSQL's
+ * func_select_candidate does: the argument's own type when an overload takes it, else the one
+ * overload argument it implicitly casts to (`sum(time)` is `sum(interval)`), else null (42883).
+ * Several reachable overloads resolve to the preferred type of the argument's category, if one.
+ */
+export function aggregateArgument(fn: AggregateFn, arg: PhysicalType): PhysicalType | null {
+  if (aggregateResult(fn, [arg]) !== null) return arg;
+  const source = sqlTypeOf(arg);
+  if (source === null) return null;
+  const reachable = new Set(IMPLICIT_CASTS[source] ?? []);
+  const targets = [
+    ...new Set(
+      AGGREGATES[fn].flatMap((overload) => {
+        const [only] = overload.args;
+        return overload.args.length === 1 &&
+          overload.within === undefined &&
+          only !== undefined &&
+          only !== "T" &&
+          only !== "anyenum" &&
+          only !== "anyarray" &&
+          reachable.has(only)
+          ? [only]
+          : [];
+      }),
+    ),
+  ];
+  const preferred = targets.filter((type) => PREFERRED_TYPES.has(type));
+  const target =
+    targets.length === 1 ? targets[0] : preferred.length === 1 ? preferred[0] : undefined;
+  return target === undefined ? null : physicalTypeOfSql(target);
 }

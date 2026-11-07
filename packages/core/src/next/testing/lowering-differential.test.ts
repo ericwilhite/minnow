@@ -82,6 +82,36 @@ const QUERIES: readonly Case[] = [
   ["SELECT 1 + 2 AS three, 'x' AS t, TRUE AS b"],
   ["SELECT max(qty) AS m FROM orders WHERE customer_id = 99"],
   ["SELECT id FROM orders WHERE customer_id IN (SELECT 1) ORDER BY id"],
+  // Milestone M3: joins, subqueries, windows, set operations, recursion.
+  [
+    "SELECT c.name, o.id, o.qty FROM customers c JOIN orders o ON o.customer_id = c.id ORDER BY o.id",
+  ],
+  [
+    "SELECT c.name, o.id FROM customers c LEFT JOIN orders o ON o.customer_id = c.id ORDER BY c.name, o.id",
+  ],
+  [
+    "SELECT c.name, o.total FROM customers c, orders o WHERE o.customer_id = c.id AND c.region = 'west' ORDER BY o.id",
+  ],
+  [
+    "SELECT c.region, count(*) AS n, sum(o.qty) AS q FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.region ORDER BY c.region",
+  ],
+  [
+    "SELECT name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.qty > 2) ORDER BY id",
+  ],
+  ["SELECT name FROM customers WHERE id NOT IN (SELECT customer_id FROM orders) ORDER BY id"],
+  [
+    "SELECT name, (SELECT max(qty) FROM orders o WHERE o.customer_id = c.id) AS m FROM customers c ORDER BY id",
+  ],
+  ["SELECT name, (SELECT count(*) FROM orders) AS n FROM customers ORDER BY id"],
+  [
+    "SELECT id, row_number() OVER (PARTITION BY customer_id ORDER BY id) AS rn FROM orders ORDER BY id",
+  ],
+  ["SELECT id, sum(qty) OVER (ORDER BY id) AS running FROM orders ORDER BY id"],
+  ["SELECT customer_id AS v FROM orders UNION SELECT id FROM customers ORDER BY 1"],
+  ["SELECT id AS v FROM customers EXCEPT SELECT customer_id FROM orders ORDER BY 1"],
+  [
+    "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 4) SELECT n FROM r ORDER BY n",
+  ],
 ];
 
 const MUTATIONS: readonly Case[] = [
@@ -100,6 +130,13 @@ const MUTATIONS: readonly Case[] = [
   ],
   [
     "INSERT INTO orders (id, customer_id, qty, price) SELECT id + 100, id, tier, score FROM customers WHERE score IS NOT NULL",
+  ],
+  [
+    "UPDATE orders o SET qty = o.qty + c.tier FROM customers c WHERE c.id = o.customer_id AND c.region = 'west'",
+  ],
+  ["DELETE FROM orders o USING customers c WHERE c.id = o.customer_id AND c.active IS NULL"],
+  [
+    "MERGE INTO customers c USING (SELECT 2 AS cid UNION ALL SELECT 9) s ON c.id = s.cid WHEN MATCHED THEN UPDATE SET tier = 7 WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.cid, 'new')",
   ],
 ];
 
@@ -155,10 +192,8 @@ describe("lowering agrees with the current engine (milestone M1 surface)", () =>
       }
       expect(ours, sql).toEqual(await oracleRows(oracle, sql, params));
     }
-    // Subqueries are milestone M3; everything else is covered.
-    expect(unsupported).toEqual([
-      "SELECT id FROM orders WHERE customer_id IN (SELECT 1) ORDER BY id",
-    ]);
+    // Everything the queries use is lowered.
+    expect(unsupported).toEqual([]);
   });
 
   it("writes identically: UPDATE, DELETE, ON CONFLICT, INSERT … SELECT", async () => {

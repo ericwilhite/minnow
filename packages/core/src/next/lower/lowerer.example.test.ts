@@ -85,6 +85,7 @@ class StubLowerer implements Lowerer {
   lower(text: string, context: LoweringContext): LoweredStatement {
     this.calls += 1;
     const base = {
+      rowLocking: "none" as const,
       text,
       catalogVersion: context.catalog.version,
       controlsTransaction: false,

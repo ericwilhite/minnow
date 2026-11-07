@@ -3,22 +3,24 @@
  */
 import type { CatalogChange, CatalogView, TableDef } from "../access/catalog.js";
 import type { CreateTableInput } from "../../engine/catalog-mutations.js";
-import type { CompiledStatement } from "../../engine/query.js";
+import type { CompiledStatement, TransactionMode } from "../../engine/query.js";
 import type { OutputColumn, PhysicalPlan, Rel } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
-import type { PhysicalType } from "../types.js";
 import { ParameterTypes } from "./coerce.js";
 import { descriptorOf, lowerDdl, tableInput } from "./ddl.js";
-import { PlanningError, unsupported } from "./errors.js";
+import { frontEndError, PlanningError } from "./errors.js";
 import type { ExpressionState } from "./expressions.js";
-import type { CompiledQuery } from "../../plan/model.js";
+import type { RowLocking, CompiledQuery } from "../../plan/model.js";
 import { parseAny, parseQuery, prepareQuery } from "./frontend.js";
 import type {
   LoweredModify,
+  LoweredRowLocking,
   LoweredQuery,
   LoweredStatement,
   Lowerer,
   LoweringContext,
+  TransactionModes,
+  TransactionModeItem,
   WriteShape,
 } from "./lowerer.js";
 import {
@@ -26,9 +28,16 @@ import {
   lowerBatchWrite,
   lowerDelete,
   lowerInsert,
+  lowerMerge,
   lowerUpdate,
 } from "./modify.js";
-import { lowerBlock, outputColumns, PlanBuilder, type RelColumn } from "./query.js";
+import {
+  installSubqueries,
+  lowerBlock,
+  outputColumns,
+  PlanBuilder,
+  type RelColumn,
+} from "./query.js";
 import { resultColumn } from "./result.js";
 import { lowerTableRules } from "./rules.js";
 import { classifyStatement } from "./statement.js";
@@ -53,8 +62,6 @@ const SETTINGS: Readonly<Record<string, string>> = {
   max_identifier_length: "63",
 };
 
-const TIMESTAMPTZ: PhysicalType = { kind: "timestamp", zoned: true };
-
 /**
  * The query of `CREATE TABLE [IF NOT EXISTS] name AS query`, as written: the compiled statement
  * keeps no text of it, and its follow-up INSERT must lower it again at the new catalog version.
@@ -71,28 +78,25 @@ function ctasQueryText(text: string): string {
 
 interface Planning {
   readonly builder: PlanBuilder;
-  readonly state: ExpressionState & { clockUsed: boolean };
+  readonly state: ExpressionState;
   readonly placeholders: number;
 }
 
 function planning(placeholders: number, context: LoweringContext): Planning {
   const parameters = new ParameterTypes(placeholders, context.parameterTypes ?? []);
-  const state = {
+  let builder: PlanBuilder | null = null;
+  const state: ExpressionState = {
     parameters,
     catalog: context.catalog,
-    clockUsed: false,
-    clock(): number {
-      state.clockUsed = true;
-      return placeholders;
+    clock: () => {
+      if (builder === null) throw new PlanningError("clock before planning", "XX000");
+      return builder.clock();
     },
     volatile: false,
     sequences: false,
   };
-  const builder = new PlanBuilder(
-    context.catalog,
-    state,
-    (tableId) => context.statistics.table(tableId)?.rowCount ?? 0,
-  );
+  builder = new PlanBuilder(context.catalog, state, context.statistics, context.costs);
+  installSubqueries(builder);
   return { builder, state, placeholders };
 }
 
@@ -102,22 +106,31 @@ function physicalPlan(
   plan: Planning,
   catalog: CatalogView,
 ): PhysicalPlan {
-  const parameters = plan.state.parameters.settled();
-  const clockSlot = plan.state.clockUsed ? plan.placeholders : null;
   return {
     root,
     columns,
-    parameters: clockSlot === null ? parameters : [...parameters, TIMESTAMPTZ],
+    parameters: [...plan.state.parameters.settled(), ...plan.builder.slots],
     placeholderCount: plan.placeholders,
-    clockSlot,
-    initPlans: [],
+    clockSlot: plan.builder.clockSlot,
+    initPlans: [...plan.builder.initPlans],
     catalogVersion: catalog.version,
     volatile: plan.state.volatile,
   };
 }
 
+const ROW_LOCK_INTENT: Readonly<Record<RowLocking, LoweredRowLocking>> = {
+  "KEY SHARE": "keyShare",
+  SHARE: "share",
+  "NO KEY UPDATE": "noKeyUpdate",
+  UPDATE: "update",
+};
+function rowLockIntent(lock: RowLocking | undefined): LoweredRowLocking {
+  return lock === undefined ? "none" : ROW_LOCK_INTENT[lock];
+}
+
 function planned(plan: Planning, root: Rel, columns: readonly RelColumn[], catalog: CatalogView) {
   return {
+    rowLocking: rowLockIntent(plan.builder.rowLocking),
     plan: physicalPlan(root, outputColumns(columns), plan, catalog),
     columns: columns.map((column) => resultColumn(column, column.big)),
     reads: [...plan.builder.reads].sort((a, b) => a - b),
@@ -146,7 +159,7 @@ function lowerSelect(text: string, parsed: CompiledQuery, context: LoweringConte
 
 function lowerModify(
   text: string,
-  statement: Extract<CompiledStatement, { kind: "insert" | "update" | "delete" }>,
+  statement: Extract<CompiledStatement, { kind: "insert" | "update" | "delete" | "merge" }>,
   context: LoweringContext,
 ): LoweredModify {
   const plan = planning(placeholderCount(statement), context);
@@ -155,7 +168,9 @@ function lowerModify(
       ? lowerInsert(statement, plan.builder)
       : statement.kind === "update"
         ? lowerUpdate(statement, plan.builder)
-        : lowerDelete(statement, plan.builder);
+        : statement.kind === "merge"
+          ? lowerMerge(statement, plan.builder)
+          : lowerDelete(statement, plan.builder);
   return {
     kind: "modify",
     text,
@@ -167,6 +182,30 @@ function lowerModify(
   };
 }
 
+/** Preserve every instruction; order-sensitive validation precedes the final-mode summary. */
+function transactionModeItems(modes: readonly TransactionMode[]): TransactionModeItem[] {
+  return modes.map((mode) =>
+    mode.kind === "access"
+      ? { kind: "access", value: mode.readOnly ? "readOnly" : "readWrite" }
+      : mode.kind === "isolation"
+        ? { kind: "isolation", value: mode.level }
+        : { kind: "deferrable", value: mode.deferrable },
+  );
+}
+
+/** Final values after ordered validation: the last item of each kind wins. */
+function transactionModes(modes: readonly TransactionMode[]): TransactionModes {
+  let readOnly: boolean | null = null;
+  let isolation: TransactionModes["isolation"] = null;
+  let deferrable: boolean | null = null;
+  for (const mode of modes) {
+    if (mode.kind === "access") readOnly = mode.readOnly;
+    else if (mode.kind === "isolation") isolation = mode.level;
+    else deferrable = mode.deferrable;
+  }
+  return { readOnly, isolation, deferrable };
+}
+
 const TRANSACTION_ACTIONS = {
   begin: "begin",
   commit: "commit",
@@ -176,120 +215,152 @@ const TRANSACTION_ACTIONS = {
   release: "release",
 } as const;
 
+/** `Lowerer.lower` before its errors are translated (lower/errors.ts `frontEndError`). */
+function lowerStatement(text: string, context: LoweringContext): LoweredStatement {
+  // CREATE TABLE … AS … WITH [NO] DATA: the front end does not parse the clause (and keeps
+  // refusing it); lowering strips it and decides whether the follow-up INSERT runs.
+  const ctasData = CTAS_DATA.exec(text);
+  const source = ctasData === null ? text : text.slice(0, ctasData.index);
+  const noData = ctasData?.[1] !== undefined;
+  const parsed = parseAny(source);
+  if ("query" in parsed) return lowerSelect(text, parsed.query, context);
+  const statement = parsed.statement;
+  const statementClass = classifyStatement(statement);
+  const base = {
+    rowLocking: "none" as const,
+    text,
+    catalogVersion: context.catalog.version,
+    command: statementClass.command,
+    controlsTransaction: statementClass.controlsTransaction,
+  };
+  switch (statement.kind) {
+    case "select":
+      return lowerSelect(text, parseQuery(statement.sql), context);
+    case "insert":
+    case "update":
+    case "delete":
+      return lowerModify(text, statement, context);
+    case "merge":
+      return lowerModify(text, statement, context);
+    case "transaction": {
+      const modes = transactionModes(statement.modes ?? []);
+      return {
+        ...base,
+        kind: "transactionControl",
+        parameters: [],
+        action: TRANSACTION_ACTIONS[statement.action],
+        savepoint: statement.name ?? null,
+        modes,
+        modeItems: transactionModeItems(statement.modes ?? []),
+        readOnly: statement.action === "begin" && modes.readOnly === true,
+      };
+    }
+    case "set": {
+      // SET TRANSACTION changes the transaction: a typed instruction, never a no-op utility.
+      if (statement.transactionModes !== undefined) {
+        const modes = transactionModes(statement.transactionModes);
+        return {
+          ...base,
+          controlsTransaction: true,
+          kind: "transactionControl",
+          parameters: [],
+          action: "setTransaction",
+          savepoint: null,
+          modes,
+          modeItems: transactionModeItems(statement.transactionModes),
+          readOnly: modes.readOnly === true,
+        };
+      }
+      return { ...base, kind: "utility", parameters: [], show: null };
+    }
+    case "show": {
+      const name = statement.name.toLowerCase();
+      const value = SETTINGS[name];
+      if (value === undefined)
+        throw new PlanningError(
+          `unrecognized configuration parameter "${statement.name}"`,
+          "42704",
+        );
+      return {
+        ...base,
+        kind: "utility",
+        parameters: [],
+        show: {
+          column: resultColumn({ name, type: { kind: "text" }, nullable: false }, false),
+          value,
+        },
+      };
+    }
+    case "create-table-as": {
+      if (context.catalog.tableByName(statement.table) !== undefined) {
+        if (statement.ifNotExists === true)
+          return { ...base, kind: "ddl", parameters: [], change: null, followUp: null };
+        throw new PlanningError(`relation "${statement.table}" already exists`, "42P07");
+      }
+      const plan = planning(placeholderCount(statement.query), context);
+      const block = lowerBlock(prepareQuery(statement.query, context.catalog), plan.builder);
+      const columns = block.columns.map((column) => ({
+        name: column.name,
+        type: column.type,
+        declared: descriptorOf(column.type),
+        nullable: true,
+        defaultSql: null,
+        generatedSql: null,
+        identitySequence: null,
+        missing: null,
+      }));
+      if (new Set(columns.map((column) => column.name)).size !== columns.length)
+        throw new PlanningError(
+          `column specified more than once in table "${statement.table}"`,
+          "42701",
+        );
+      const change: CatalogChange = {
+        kind: "createTable",
+        table: {
+          name: statement.table,
+          columns,
+          primaryKey: null,
+          unique: [],
+          foreignKeys: [],
+          checks: [],
+        },
+      };
+      return {
+        ...base,
+        kind: "ddl",
+        parameters: [],
+        change,
+        rowLocking: noData ? "none" : rowLockIntent(plan.builder.rowLocking),
+        followUp: noData
+          ? null
+          : insertSelectText(
+              statement.table,
+              columns.map((column) => column.name),
+              ctasQueryText(source),
+            ),
+      };
+    }
+    default: {
+      const result = lowerDdl(statement, context.catalog);
+      return {
+        ...base,
+        kind: "ddl",
+        parameters: [],
+        change: result.change,
+        followUp: result.followUp,
+      };
+    }
+  }
+}
+
 export function createLowerer(): Lowerer {
   return {
     lower(text: string, context: LoweringContext): LoweredStatement {
-      // CREATE TABLE … AS … WITH [NO] DATA: the front end does not parse the clause (and keeps
-      // refusing it); lowering strips it and decides whether the follow-up INSERT runs.
-      const ctasData = CTAS_DATA.exec(text);
-      const source = ctasData === null ? text : text.slice(0, ctasData.index);
-      const noData = ctasData?.[1] !== undefined;
-      const parsed = parseAny(source);
-      if ("query" in parsed) return lowerSelect(text, parsed.query, context);
-      const statement = parsed.statement;
-      const statementClass = classifyStatement(statement);
-      const base = {
-        text,
-        catalogVersion: context.catalog.version,
-        command: statementClass.command,
-        controlsTransaction: statementClass.controlsTransaction,
-      };
-      switch (statement.kind) {
-        case "select":
-          return lowerSelect(text, parseQuery(statement.sql), context);
-        case "insert":
-        case "update":
-        case "delete":
-          return lowerModify(text, statement, context);
-        case "merge":
-          throw unsupported("merge", "MERGE (milestone M3)");
-        case "transaction":
-          return {
-            ...base,
-            kind: "transactionControl",
-            parameters: [],
-            action: TRANSACTION_ACTIONS[statement.action],
-            savepoint: statement.name ?? null,
-            readOnly: false,
-          };
-        case "set":
-          return { ...base, kind: "utility", parameters: [], show: null };
-        case "show": {
-          const name = statement.name.toLowerCase();
-          const value = SETTINGS[name];
-          if (value === undefined)
-            throw new PlanningError(
-              `unrecognized configuration parameter "${statement.name}"`,
-              "42704",
-            );
-          return {
-            ...base,
-            kind: "utility",
-            parameters: [],
-            show: {
-              column: resultColumn({ name, type: { kind: "text" }, nullable: false }, false),
-              value,
-            },
-          };
-        }
-        case "create-table-as": {
-          if (context.catalog.tableByName(statement.table) !== undefined) {
-            if (statement.ifNotExists === true)
-              return { ...base, kind: "ddl", parameters: [], change: null, followUp: null };
-            throw new PlanningError(`relation "${statement.table}" already exists`, "42P07");
-          }
-          const plan = planning(placeholderCount(statement.query), context);
-          const block = lowerBlock(prepareQuery(statement.query, context.catalog), plan.builder);
-          const columns = block.columns.map((column) => ({
-            name: column.name,
-            type: column.type,
-            declared: descriptorOf(column.type),
-            nullable: true,
-            defaultSql: null,
-            generatedSql: null,
-            identitySequence: null,
-            missing: null,
-          }));
-          if (new Set(columns.map((column) => column.name)).size !== columns.length)
-            throw new PlanningError(
-              `column specified more than once in table "${statement.table}"`,
-              "42701",
-            );
-          const change: CatalogChange = {
-            kind: "createTable",
-            table: {
-              name: statement.table,
-              columns,
-              primaryKey: null,
-              unique: [],
-              foreignKeys: [],
-              checks: [],
-            },
-          };
-          return {
-            ...base,
-            kind: "ddl",
-            parameters: [],
-            change,
-            followUp: noData
-              ? null
-              : insertSelectText(
-                  statement.table,
-                  columns.map((column) => column.name),
-                  ctasQueryText(source),
-                ),
-          };
-        }
-        default: {
-          const result = lowerDdl(statement, context.catalog);
-          return {
-            ...base,
-            kind: "ddl",
-            parameters: [],
-            change: result.change,
-            followUp: result.followUp,
-          };
-        }
+      // Every failure leaves as a PlanningError with a SQLSTATE (or UnsupportedPlanError).
+      try {
+        return lowerStatement(text, context);
+      } catch (error) {
+        throw frontEndError(error);
       }
     },
 

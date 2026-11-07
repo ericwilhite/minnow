@@ -1,0 +1,492 @@
+[
+  {
+    "file": "catalog-mutations.ts",
+    "message": "Unsupported column type: X",
+    "state": "0A000"
+  },
+  {
+    "file": "catalog-mutations.ts",
+    "message": "Unsupported data type: X",
+    "state": "0A000"
+  },
+  {
+    "file": "database.ts",
+    "message": "Unsupported column type: X",
+    "state": "0A000"
+  },
+  {
+    "file": "database.ts",
+    "message": "SET X = DEFAULT is not supported for an auto-increment column",
+    "state": "0A000"
+  },
+  {
+    "file": "database.ts",
+    "message": "Unsupported upsert conflict operator: X",
+    "state": "0A000"
+  },
+  {
+    "file": "optimizer.ts",
+    "message": "A correlated scalar subquery cannot use GROUP BY or HAVING",
+    "state": "0A000"
+  },
+  {
+    "file": "optimizer.ts",
+    "message": "A correlated scalar aggregate cannot select an ungrouped inner column",
+    "state": "0A000"
+  },
+  {
+    "file": "optimizer.ts",
+    "message": "A correlated scalar aggregate cannot contain another subquery",
+    "state": "0A000"
+  },
+  {
+    "file": "optimizer.ts",
+    "message": "A range-correlated scalar aggregate cannot use aggregate ORDER BY",
+    "state": "0A000"
+  },
+  {
+    "file": "optimizer.ts",
+    "message": "Correlated X references an unavailable outer source: X",
+    "state": "42P01"
+  },
+  {
+    "file": "optimizer.ts",
+    "message": "Correlated X subqueries support only X conditions between one inner and one outer qualified column (unsupported reference: X)",
+    "state": "0A000"
+  },
+  {
+    "file": "optimizer.ts",
+    "message": "Correlated X subqueries cannot use GROUP BY or HAVING",
+    "state": "0A000"
+  },
+  {
+    "file": "optimizer.ts",
+    "message": "Correlated subqueries are supported only as top-level WHERE conditions (reference: X)",
+    "state": "0A000"
+  },
+  {
+    "file": "query-identity.ts",
+    "message": "Unsupported query identity value: X",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "SET TIME ZONE X is not supported: every datetime is an instant in UTC",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "SET SESSION CHARACTERISTICS AS TRANSACTION is not supported: set each transaction's mode with BEGIN or SET TRANSACTION",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "SET X = X is not supported: every datetime is an instant in UTC",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "TRUNCATE CASCADE is not supported; truncate dependents explicitly",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "X ISOLATION LEVEL SERIALIZABLE is not supported: the engine has one isolation level",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "CREATE VIEW takes a name and AS <query>; column lists are not supported",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "Trigger bodies cannot contain parameters",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "CREATE SEQUENCE options are not supported yet",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "Unknown table alias: X",
+    "state": "42P01"
+  },
+  {
+    "file": "query.ts",
+    "message": "Ambiguous or missing column: X",
+    "state": "42702"
+  },
+  {
+    "file": "query.ts",
+    "message": "X requires a string argument",
+    "state": "42883"
+  },
+  {
+    "file": "query.ts",
+    "message": "Unknown table for X.*: X",
+    "state": "42P01"
+  },
+  {
+    "file": "query.ts",
+    "message": "missing FROM-clause entry for table \"X\"",
+    "state": "42P01"
+  },
+  {
+    "file": "query.ts",
+    "message": "column X does not exist",
+    "state": "42703"
+  },
+  {
+    "file": "query.ts",
+    "message": "column \"X\" does not exist",
+    "state": "42703"
+  },
+  {
+    "file": "query.ts",
+    "message": "Unsupported EXTRACT field: X",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "GENERATE_SERIES takes integer or timestamp arguments",
+    "state": "42883"
+  },
+  {
+    "file": "query.ts",
+    "message": "IN is only supported in WHERE predicates",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "Selected column must appear in GROUP BY: X",
+    "state": "42803"
+  },
+  {
+    "file": "query.ts",
+    "message": "HAVING conditions must use aggregates, literals, or GROUP BY expressions",
+    "state": "42803"
+  },
+  {
+    "file": "query.ts",
+    "message": "ON CONFLICT DO UPDATE expressions cannot contain aggregates",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "CREATE TABLE column names must be unique",
+    "state": "42701"
+  },
+  {
+    "file": "query.ts",
+    "message": "ON UPDATE X is not supported: a rekey always moves its references (use ON UPDATE CASCADE or omit the clause)",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "SET DEFAULT is not supported; use SET NULL or CASCADE",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "DROP TABLE CASCADE is not supported; drop dependents explicitly",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "ALTER TABLE RENAME TO is not supported; create the new table and copy the rows with INSERT … SELECT",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "ALTER TABLE RENAME CONSTRAINT is not supported",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "ALTER TABLE DROP COLUMN CASCADE is not supported; drop dependents explicitly",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "Unsupported CAST target: X",
+    "state": "42704"
+  },
+  {
+    "file": "query.ts",
+    "message": "ON CONFLICT ON CONSTRAINT is not supported; name the constraint's columns: ON CONFLICT (column, …)",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "RETURNING cannot use aggregate functions",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "MERGE ... MATCHED BY SOURCE and BY TARGET are not supported",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "UPDATE SET (columns) = (SELECT …) is not supported; assign each column its own scalar subquery",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "NATURAL RIGHT JOIN is not supported; write it as a LEFT join",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "RIGHT JOIN is only supported as the sole join",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "NOW takes no arguments",
+    "state": "42883"
+  },
+  {
+    "file": "query.ts",
+    "message": "X(precision) is not supported: the engine keeps milliseconds",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "SUBSTRING requires a string argument",
+    "state": "42883"
+  },
+  {
+    "file": "query.ts",
+    "message": "X requires a value argument",
+    "state": "42883"
+  },
+  {
+    "file": "query.ts",
+    "message": "Unsupported function: X",
+    "state": "42883"
+  },
+  {
+    "file": "query.ts",
+    "message": "DISTINCT is only supported inside aggregate functions",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "X requires exactly one argument",
+    "state": "42883"
+  },
+  {
+    "file": "query.ts",
+    "message": "X takes scalar arguments",
+    "state": "42883"
+  },
+  {
+    "file": "query.ts",
+    "message": "ROUND requires one or two arguments",
+    "state": "42883"
+  },
+  {
+    "file": "query.ts",
+    "message": "COALESCE requires at least one argument",
+    "state": "42601"
+  },
+  {
+    "file": "query.ts",
+    "message": "X takes no arguments",
+    "state": "42883"
+  },
+  {
+    "file": "query.ts",
+    "message": "X requires exactly two arguments",
+    "state": "42883"
+  },
+  {
+    "file": "query.ts",
+    "message": "X requires at least one argument",
+    "state": "42883"
+  },
+  {
+    "file": "query.ts",
+    "message": "DATE_TRUNC requires a unit and a datetime argument",
+    "state": "42883"
+  },
+  {
+    "file": "query.ts",
+    "message": "Unsupported DATE_TRUNC unit: X",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "JSON_ARRAYAGG FILTER is not supported; filter rows in WHERE",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "FILTER conditions cannot contain aggregates",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "JSON_ARRAYAGG window use is not supported",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "STRING_AGG window use is not supported",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "DISTINCT window aggregates are not supported",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "Offset RANGE frames require exactly one ORDER BY expression",
+    "state": "42P20"
+  },
+  {
+    "file": "query.ts",
+    "message": "frame starting offset must not be null",
+    "state": "22004"
+  },
+  {
+    "file": "query.ts",
+    "message": "frame ending offset must not be null",
+    "state": "22004"
+  },
+  {
+    "file": "query.ts",
+    "message": "argument of ROWS must be type bigint, not type interval",
+    "state": "42804"
+  },
+  {
+    "file": "query.ts",
+    "message": "argument of GROUPS must be type bigint, not type interval",
+    "state": "42804"
+  },
+  {
+    "file": "query.ts",
+    "message": "Window frame offsets other than numeric literals are not supported",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "frame starting offset must not be negative",
+    "state": "22013"
+  },
+  {
+    "file": "query.ts",
+    "message": "frame ending offset must not be negative",
+    "state": "22013"
+  },
+  {
+    "file": "query.ts",
+    "message": "RANGE frame offsets outside double precision are not supported",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "bigint out of range",
+    "state": "22003"
+  },
+  {
+    "file": "query.ts",
+    "message": "NATURAL FULL JOIN is not supported; name the shared columns: FULL JOIN … USING (columns)",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "FULL JOIN is only supported as the sole join",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "SELECT * requires known columns for: X",
+    "state": "42P01"
+  },
+  {
+    "file": "query.ts",
+    "message": "Full-text MATCH and BM25 are not supported inside OVER(...)",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "Unsupported SQL character: X",
+    "state": "0A000"
+  },
+  {
+    "file": "sql-casts.ts",
+    "message": "Unsupported CAST: X to X",
+    "state": "0A000"
+  },
+  {
+    "file": "sql-domains.ts",
+    "message": "X cannot contain a cycle",
+    "state": "0A000"
+  },
+  {
+    "file": "sql-domains.ts",
+    "message": "Unsupported collation: X",
+    "state": "0A000"
+  },
+  {
+    "file": "sql-domains.ts",
+    "message": "PostgreSQL array concatenation (||) is not supported",
+    "state": "0A000"
+  },
+  {
+    "file": "sql-domains.ts",
+    "message": "PostgreSQL JSONB concatenation (||) is not supported",
+    "state": "0A000"
+  },
+  {
+    "file": "sql-functions.ts",
+    "message": "X requires a numeric argument",
+    "state": "42883"
+  },
+  {
+    "file": "sql-functions.ts",
+    "message": "X requires a datetime argument",
+    "state": "42883"
+  },
+  {
+    "file": "sql-semantics.ts",
+    "message": "X requires a string argument",
+    "state": "42883"
+  },
+  {
+    "file": "vector.ts",
+    "message": "Unsupported vector type: X",
+    "state": "0A000"
+  },
+  {
+    "file": "vector.ts",
+    "message": "Unknown table alias: X",
+    "state": "42P01"
+  },
+  {
+    "file": "vector.ts",
+    "message": "Ambiguous or missing column: X",
+    "state": "42702"
+  },
+  {
+    "file": "vector.ts",
+    "message": "Selected column must appear in GROUP BY",
+    "state": "42803"
+  },
+  {
+    "file": "vector.ts",
+    "message": "Selected full-text expression must appear in GROUP BY",
+    "state": "42803"
+  },
+  {
+    "file": "windows.ts",
+    "message": "Offset RANGE frames require exactly one ORDER BY expression",
+    "state": "42P20"
+  }
+]

@@ -8,6 +8,7 @@
  * integer-division annotations (types decide both), statement-clock substitution and WITH TIES
  * expansion (the IR has `clockSlot` and `sort.withTies`).
  */
+import { expandedRowLock } from "../../engine/row-locking.js";
 import type { CatalogView } from "../access/catalog.js";
 import {
   bindPendingSelectShapes,
@@ -18,6 +19,8 @@ import {
   expandRowReferences,
   expandSourceColumnAliases,
   expandViewSources,
+  expandRowLockCteViews,
+  expressionColumns,
   extendGroupByWithKeyDependents,
   foldIdentifierCase,
   mergeJoinColumns,
@@ -92,19 +95,24 @@ export function prepareQuery(parsed: CompiledQuery, catalog: CatalogView): Compi
   const columnsOf = (name: string): readonly string[] | undefined => front.columns.get(name);
   let plan = foldIdentifierCase(parsed, front.columns);
   plan = expandRowReferences(plan, columnsOf);
-  if (front.views.size > 0) {
-    const bodies = new Map<string, CompiledQuery>();
-    plan = expandViewSources(plan, (name) => {
-      const sql = front.views.get(name);
-      if (sql === undefined) return undefined;
-      let body = bodies.get(name);
-      if (body === undefined) {
-        body = parseQuery(sql);
-        bodies.set(name, body);
-      }
-      return body;
-    });
-  }
+  const bodies = new Map<string, CompiledQuery>();
+  const viewBody = (name: string): CompiledQuery | undefined => {
+    const sql = front.views.get(name);
+    if (sql === undefined) return undefined;
+    let body = bodies.get(name);
+    if (body === undefined) {
+      body = parseQuery(sql);
+      bodies.set(name, body);
+    }
+    return body;
+  };
+  if (front.views.size > 0) plan = expandViewSources(plan, viewBody);
+  const rowLocking = expandedRowLock(
+    parsed,
+    bodies.values(),
+    front.views.size === 0 ? undefined : (body) => expandRowLockCteViews(body, viewBody),
+  );
+  if (rowLocking !== undefined) plan.rowLocking = rowLocking;
   if (front.keys.size > 0)
     plan = extendGroupByWithKeyDependents(plan, (name) => front.keys.get(name), columnsOf);
   plan = bindPendingSelectShapes(plan, columnsOf);
@@ -113,5 +121,48 @@ export function prepareQuery(parsed: CompiledQuery, catalog: CatalogView): Compi
   plan = expandNaturalJoins(plan, columnsOf);
   if (blockHasSubqueries(plan))
     plan = optimizePlan(qualifyCorrelatedReferences(plan, front.columns), { resolvedNames: true });
+  checkHavingNames(plan, columnsOf);
   return prepareColumnarShape(plan, columnsOf);
+}
+
+/**
+ * A HAVING condition's names resolve as PostgreSQL resolves them, before the grouping check
+ * would call them ungrouped (42803): a qualifier no source has is 42P01 (missing FROM-clause
+ * entry), a column no source has 42703, an unqualified name two sources have 42702 (unless a
+ * USING join merged it). Output aliases are not in scope there, as in PostgreSQL. Checked only where every source is a catalog table, so its columns are
+ * known; nested blocks are not checked here (their names may be correlated).
+ */
+function checkHavingNames(
+  plan: CompiledQuery,
+  columnsOf: (name: string) => readonly string[] | undefined,
+): void {
+  if (plan.having.length === 0) return;
+  const sources = [plan.base, ...plan.joins];
+  const known = sources.map((source) =>
+    source.derived === undefined &&
+    source.union === undefined &&
+    source.recursive === undefined &&
+    source.windowed === undefined &&
+    source.columnAliases === undefined
+      ? columnsOf(source.table)
+      : undefined,
+  );
+  if (known.some((columns) => columns === undefined)) return;
+  const merged = new Set(plan.joins.flatMap((join) => join.using ?? []));
+  for (const predicate of plan.having)
+    for (const reference of [predicate.left, predicate.right].flatMap(expressionColumns)) {
+      const dot = reference.indexOf(".");
+      if (dot === -1) {
+        const owners = known.filter((columns) => columns?.includes(reference) === true).length;
+        if (owners === 0) throw new TypeError(`column "${reference}" does not exist`);
+        if (owners > 1 && !merged.has(reference))
+          throw new TypeError(`column reference "${reference}" is ambiguous`);
+        continue;
+      }
+      const qualifier = reference.slice(0, dot);
+      const index = sources.findIndex((source) => (source.alias || source.table) === qualifier);
+      if (index === -1) throw new TypeError(`missing FROM-clause entry for table "${qualifier}"`);
+      if (known[index]?.includes(reference.slice(dot + 1)) !== true)
+        throw new TypeError(`column ${reference} does not exist`);
+    }
 }

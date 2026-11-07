@@ -8,9 +8,17 @@ import { PGlite } from "@electric-sql/pglite";
 import { NAME_RESOLUTION_SETUP, NAME_RESOLUTION_CASES } from "../../testing/conformance-source.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { LoweredDatabase } from "./lowering-harness.js";
+import {
+  check as checkIn,
+  nextOutcome,
+  pgOutcome as pgOutcomeIn,
+  type Case,
+} from "./pglite-oracle.js";
+
+const check = (setup: readonly string[], cases: readonly Case[]) => checkIn(pg, setup, cases);
+const pgOutcome = (sql: string) => pgOutcomeIn(pg, sql);
 
 let pg: PGlite;
-let schema = 0;
 
 beforeAll(async () => {
   pg = new PGlite();
@@ -22,108 +30,6 @@ afterAll(async () => {
 });
 
 /** PostgreSQL type OIDs → the base of our `sqlType` (typmods are not in a result's OID). */
-const OID_NAMES: Readonly<Record<number, string>> = {
-  16: "boolean",
-  20: "bigint",
-  21: "smallint",
-  23: "integer",
-  25: "text",
-  700: "real",
-  701: "double precision",
-  1043: "character varying",
-  1700: "numeric",
-  2950: "uuid",
-};
-
-const baseName = (sqlType: string) => sqlType.replace(/\(.*\)$/u, "");
-
-type Outcome =
-  | { readonly error: string }
-  | { readonly rows: unknown[]; readonly types: string[]; readonly command: string };
-
-interface Case {
-  readonly sql: string;
-  /** Compare only result types (values that are random, or NUMERIC text). */
-  readonly typesOnly?: boolean;
-  /** R17.1 render hints of the result columns (lowering's own rule; PostgreSQL has none). */
-  readonly render?: ReadonlyArray<"bigint" | "number" | null>;
-}
-
-function normalized(value: unknown): unknown {
-  if (typeof value === "number" && !Number.isInteger(value)) return Number(value.toPrecision(12));
-  if (typeof value === "bigint") return Number(value);
-  return value;
-}
-
-async function pgOutcome(sql: string): Promise<Outcome> {
-  try {
-    const result = await pg.query<Record<string, unknown>>(sql);
-    return {
-      rows: result.rows.map((row) => Object.values(row).map(normalized)),
-      types: result.fields.map(
-        (field) => OID_NAMES[field.dataTypeID] ?? `oid ${String(field.dataTypeID)}`,
-      ),
-      command: (result as { command?: string }).command ?? "",
-    };
-  } catch (error) {
-    return { error: (error as { code?: string }).code ?? String(error) };
-  }
-}
-
-function nextOutcome(next: LoweredDatabase, sql: string): Outcome {
-  try {
-    const lowered = next.lower(sql);
-    const rows = next.execute(sql);
-    return {
-      rows: rows.map((row) => Object.values(row)),
-      types:
-        lowered.kind === "query" || lowered.kind === "modify"
-          ? lowered.columns.map((column) => baseName(column.sqlType))
-          : [],
-      command: lowered.command,
-    };
-  } catch (error) {
-    const state = (error as { sqlState?: string }).sqlState;
-    return { error: state ?? String(error) };
-  }
-}
-
-/** Runs the setup in a fresh schema of both, then each case; returns the lowered database. */
-async function check(setup: readonly string[], cases: readonly Case[]): Promise<LoweredDatabase> {
-  schema += 1;
-  await pg.exec(`CREATE SCHEMA s${String(schema)}; SET search_path TO s${String(schema)}`);
-  const next = new LoweredDatabase();
-  for (const sql of setup) {
-    await pg.exec(sql);
-    next.execute(sql);
-  }
-  for (const entry of cases) {
-    const expected = await pgOutcome(entry.sql);
-    const actual = nextOutcome(next, entry.sql);
-    if ("error" in expected) {
-      expect(actual, entry.sql).toEqual(expected);
-      continue;
-    }
-    if ("error" in actual) throw new Error(`${entry.sql}: lowering failed with ${actual.error}`);
-    expect(actual.types, `${entry.sql} types`).toEqual(expected.types);
-    if (entry.typesOnly !== true) expect(actual.rows, `${entry.sql} rows`).toEqual(expected.rows);
-    if (
-      ["INSERT", "UPDATE", "DELETE", "TRUNCATE", "SELECT"].includes(expected.command) &&
-      !entry.sql.startsWith("CREATE")
-    )
-      expect(actual.command, `${entry.sql} command`).toBe(expected.command);
-    if (entry.render !== undefined) {
-      const lowered = next.lower(entry.sql);
-      if (lowered.kind !== "query" && lowered.kind !== "modify") throw new Error("Expected a plan");
-      expect(
-        lowered.columns.map((column) => column.render),
-        `${entry.sql} render`,
-      ).toEqual(entry.render);
-    }
-  }
-  return next;
-}
-
 const BASE = [
   "CREATE TABLE t (id integer PRIMARY KEY, v varchar(2), x bigint, g bigint GENERATED ALWAYS AS (x * 2) STORED)",
   "CREATE TABLE onlyg (g integer GENERATED ALWAYS AS (1) STORED)",
@@ -266,8 +172,7 @@ describe("lowering agrees with PostgreSQL on review B6-p2a's findings", () => {
 
 describe("name errors before grouping errors", () => {
   it("matches PostgreSQL messages for the same cases as the shipped engine", async () => {
-    schema += 1;
-    await pg.exec(`CREATE SCHEMA s${String(schema)}; SET search_path TO s${String(schema)}`);
+    await pg.exec("CREATE SCHEMA name_resolution; SET search_path TO name_resolution");
     const next = new LoweredDatabase();
     for (const sql of NAME_RESOLUTION_SETUP) {
       await pg.exec(sql);
