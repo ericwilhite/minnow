@@ -2214,6 +2214,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         const memtable = need(memtables[k]);
         if (!awaitsFlush(memtable) || memtable.visibleRows(MAX_LSN) < memtable.rowCount) break;
         through = Math.max(through, maxSeq(memtable, memtable.rowCount));
+        if (through > MAX_LSN) break; // an earlier statement's pending index delta
         const next = memtables[k + 1];
         if (next === undefined || minSeq(next) > through) {
           if (this.#flushable(state, Math.max(through, state.flushedThroughLsn))) return true;
@@ -2483,6 +2484,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
         const rows = memtable.rowCount;
         if (memtable.visibleRows(MAX_LSN) < rows) break; // pending rows
         through = Math.max(through, maxSeq(memtable, rows));
+        // Committed rows can share a frozen delta with an earlier statement's pending
+        // tombstone. Its marker is not an LSN; wait for commit/rollback, not log durability.
+        if (through > MAX_LSN) break;
         set.push(memtable);
         const next = memtables[k + 1];
         if (next === undefined || minSeq(next) > through) {

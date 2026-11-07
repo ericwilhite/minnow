@@ -185,6 +185,11 @@ It also checks non-unique index results. The PostgreSQL write differential retai
 and step under the real task clock and forced third/seventh-check yields, so publication races
 are exercised without requiring host contention.
 
+A frozen input can contain committed rows and an earlier statement's pending index tombstone.
+The flush boundary waits for that transaction to commit or roll back; a pending marker is never
+passed to the log's durability barrier as an LSN. `write/pending-flush.test.ts` generates both
+statement boundaries, commit and rollback, publication and reopen on both simulated stores.
+
 ## Dependency rules
 
 `dependency-rules.test.ts` enforces these.

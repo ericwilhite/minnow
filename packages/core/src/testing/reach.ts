@@ -1896,3 +1896,16 @@ export const WRITE_RANGE_PRESSURE_STATES = [
   "publication",
   "durable reopen",
 ] as const;
+
+/** A pending tombstone does not name a durable frame, even when its memtable's rows are committed. */
+export const WRITE_PENDING_FLUSH_STATES = [
+  "earlier statement",
+  "same statement",
+  "memory",
+  "indexeddb",
+  "frozen committed rows with pending tombstone",
+  "rollback",
+  "commit",
+  "publication and reopen",
+  "close settles",
+] as const;
