@@ -98,10 +98,13 @@ const committed = frozenSQL
 const generator = (await import(pathToFileURL(join(harness, "gen.js")).href)) as Generator;
 const catalogue = (await import(pathToFileURL(join(harness, "queries.js")).href)) as Catalogue;
 const core = await new StorageCore(8192).open();
+const lateSort = option("--late-sort", "on") !== "off";
+if (!lateSort) core.executor.prepare = createExecutor({ lateSort: false }).prepare;
 const spec = generator.wideSpec(200);
 const metadata = {
   lane: "Node",
   sqlCorrections: frozenSQL ? ["S_q7", "guide-4", "guide-5"] : dataset === "star" ? ["S_q7"] : [],
+  lateSort,
   revision: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
   workingTreePatchSha256: createHash("sha256")
     .update(execFileSync("git", ["diff", "HEAD"]))
@@ -460,6 +463,65 @@ try {
       }
       const sorted = [...samples].sort((a, b) => a - b),
         median = sorted[sorted.length >>> 1] ?? NaN;
+      let wholeComparison = null;
+      if (option("--whole-compare", "") === "late-sort") {
+        const saved = core.executor.prepare;
+        const strategies = [createExecutor({ lateSort: false }), createExecutor()];
+        const before: number[] = [],
+          after: number[] = [],
+          order: string[] = [];
+        let beforeProfile = last.profile,
+          afterProfile = last.profile;
+        try {
+          for (const strategy of strategies) {
+            core.executor.prepare = strategy.prepare;
+            const result = await consume();
+            if (result.rows !== warm.rows || result.checksum !== warm.checksum)
+              throw new Error("whole-query comparison warmups differ");
+          }
+          for (let round = 0; round < rounds; round++)
+            for (const late of round % 2 === 0 ? [false, true] : [true, false]) {
+              const strategy = strategies[late ? 1 : 0];
+              if (!strategy) throw new Error("missing comparison strategy");
+              core.executor.prepare = strategy.prepare;
+              const started = process.cpuUsage();
+              const result = await consume();
+              const used = process.cpuUsage(started);
+              (late ? after : before).push((used.user + used.system) / 1000);
+              if (result.rows !== warm.rows || result.checksum !== warm.checksum)
+                throw new Error("whole-query comparison lost rows or changed checksum");
+              if (late) afterProfile = result.profile;
+              else beforeProfile = result.profile;
+              order.push(late ? "keys-and-locators" : "full-payload");
+              console.error(
+                JSON.stringify({ id: query.id, comparison: true, round, late, load: loadavg() }),
+              );
+            }
+        } finally {
+          core.executor.prepare = saved;
+        }
+        const distribution = (values: readonly number[]) => {
+          const sorted = [...values].sort((a, b) => a - b);
+          return {
+            samples: values,
+            median: sorted[sorted.length >>> 1] ?? NaN,
+            spread: (sorted.at(-1) ?? 0) - (sorted[0] ?? 0),
+          };
+        };
+        const baseline = distribution(before),
+          candidate = distribution(after);
+        wholeComparison = {
+          lane: "Node",
+          rounds,
+          order,
+          timing: metadata.timing,
+          before: { ...baseline, profile: beforeProfile },
+          after: { ...candidate, profile: afterProfile },
+          medianDeltaMs: baseline.median - candidate.median,
+          regressionWithinLargestSpread:
+            candidate.median - baseline.median <= Math.max(baseline.spread, candidate.spread),
+        };
+      }
       const record = {
         id: query.id,
         status: "executed",
@@ -474,6 +536,7 @@ try {
         rows: last.rows,
         checksum: last.checksum,
         profile: last.profile,
+        wholeComparison,
         load: loadavg(),
       };
       records.push(record);
@@ -503,6 +566,14 @@ try {
         : null,
     );
     await writeFile(join(cache, "component-scan-limit.json"), JSON.stringify(component, null, 2));
+    console.log(JSON.stringify(component));
+  }
+  if (option("--component", "") === "late-sort") {
+    const { lateSortComponent } = await import(
+      pathToFileURL(resolve("scripts/next-executor-components.mts")).href
+    );
+    const component = await lateSortComponent(core, rounds);
+    await writeFile(join(cache, "component-late-sort.json"), JSON.stringify(component, null, 2));
     console.log(JSON.stringify(component));
   }
 } finally {

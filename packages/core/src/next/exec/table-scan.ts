@@ -120,6 +120,16 @@ import {
 } from "./pushdown.js";
 import type { ChunkPages, ChunkReads } from "./scan.js";
 
+/** Fixed staging needed when a scan reaches a resident or re-pointed memory segment.
+ * The executor reserves this before keeping other breaker buffers resident. */
+export function memoryScanBufferBytes(types: readonly PhysicalType[]): number {
+  return (
+    types.reduce((sum, type) => sum + dataBytes(type, BATCH_ROWS), 0) +
+    types.length * BATCH_ROWS * Int32Array.BYTES_PER_ELEMENT +
+    MEMORY_CHUNK_ROWS * Uint16Array.BYTES_PER_ELEMENT
+  );
+}
+
 /** `xs[i]`, which must exist. */
 function at<T>(xs: readonly T[], i: number): T {
   const x = xs[i];
@@ -616,10 +626,7 @@ export class TableScan implements BatchSource {
 
   #memoryBuffers(): { out: ChunkOutput[]; selection: Selection } {
     if (this.#memoryOut !== null) return this.#memoryOut;
-    const bytes =
-      this.#types.reduce((sum, type) => sum + dataBytes(type, BATCH_ROWS), 0) +
-      this.#types.length * BATCH_ROWS * Int32Array.BYTES_PER_ELEMENT +
-      MEMORY_CHUNK_ROWS * Uint16Array.BYTES_PER_ELEMENT;
+    const bytes = memoryScanBufferBytes(this.#types);
     this.#memory.take(bytes);
     try {
       this.#memoryOut = {

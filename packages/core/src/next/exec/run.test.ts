@@ -1,4 +1,7 @@
 import { expect, it } from "vitest";
+import fc from "fast-check";
+import { seedsFor } from "../../testing/seeds.js";
+import { createReach } from "../../testing/reach.js";
 import type { Snapshot } from "../access/snapshot.js";
 import type { PhysicalPlan } from "../ir/ir.js";
 import { Governor } from "../memory/governor.js";
@@ -95,6 +98,61 @@ it("reserves nested loan owners before fixed buffers and keeps them independent 
   }
   expect(h.governor.usedBytes).toBe(0);
 });
+
+it.each(seedsFor("next-executor-helper-profile", [0xd10b, 0xd10c]))(
+  "attributes simultaneous helper holdings to the plan operator (seed %i)",
+  async (seed) => {
+    const reach = createReach("helper profiles", [
+      "simultaneous",
+      "non-overlapping",
+      "logical-id",
+      "released",
+    ]);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 64, max: 4096 }),
+        fc.integer({ min: 64, max: 4096 }),
+        fc.boolean(),
+        async (first, second, overlap) => {
+          reach.beginHistory();
+          const h = input();
+          const execution = new QueryExecution(h.plan, h.request, async (runtime, sink) => {
+            const original = await runtime.admit("logical", first, true, h.plan.root);
+            if (!overlap) original.close();
+            await runtime.admit("helper", second, true, {
+              id: 999,
+              op: "sort",
+              profileAs: h.plan.root,
+            });
+            const profiles = runtime.summary(false).operators;
+            expect(profiles).toHaveLength(1);
+            expect(profiles[0]?.relId).toBe(h.plan.root.id);
+            expect(profiles[0]?.op).toBe(h.plan.root.op);
+            expect(profiles[0]?.peakHeldBytes).toBe(
+              overlap ? first + second : Math.max(first, second),
+            );
+            return sink.finish();
+          });
+          await execution.executed;
+          await execution.delivered;
+          expect(h.governor.usedBytes).toBe(0);
+          reach.reach(overlap ? "simultaneous" : "non-overlapping");
+          reach.reach("logical-id");
+          reach.reach("released");
+        },
+      ),
+      {
+        seed,
+        numRuns: 12,
+        examples: [
+          [64, 128, true],
+          [128, 64, false],
+        ],
+      },
+    );
+    reach.assertReached();
+  },
+);
 
 it("preserves a window operator's PostgreSQL SQLSTATE at the execution boundary", async () => {
   const h = input();

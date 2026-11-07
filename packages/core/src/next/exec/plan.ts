@@ -30,12 +30,15 @@ import { OutputArena, isValidSlot, slotOf } from "./kernels/vectors.js";
 import { LimitOperator } from "./limit.js";
 import { nullParameter } from "./parameters.js";
 import { drive, isPromise, type BatchSource, type Operator } from "./pipeline.js";
-import type { QueryRuntime, Program } from "./run.js";
+import type { QueryRuntime, Program, OperatorIdentity } from "./run.js";
+import { lateSortShape, type LateSortShape } from "./late-sort.js";
+import { LateFetchOperator, ORDINAL_TYPE } from "./late-fetch.js";
+import { OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
 import { SortOperator, sortMinimumBytes } from "./sort.js";
 import { sortMode } from "./sort-keys.js";
 import type { SortColumn } from "./sort-keys.js";
 import { windowInputLayout, remapWindowFunction, literalWindowAmount } from "./window-input.js";
-import { TableScan } from "./table-scan.js";
+import { TableScan, memoryScanBufferBytes } from "./table-scan.js";
 import {
   WindowOperator,
   windowMinimumBytes,
@@ -158,7 +161,7 @@ export function measureCompilerBuffers<T>(
 
 function instantiate<T>(
   runtime: QueryRuntime,
-  rel: Rel,
+  rel: OperatorIdentity,
   input: readonly PhysicalType[],
   minimum: number,
   capacity: number,
@@ -196,7 +199,7 @@ function instantiate<T>(
   );
 }
 
-function counted(runtime: QueryRuntime, rel: Rel, sink: Operator): Operator {
+function counted(runtime: QueryRuntime, rel: OperatorIdentity, sink: Operator): Operator {
   const profile = runtime.profile(rel);
   return {
     push(batch, transfer) {
@@ -370,6 +373,7 @@ function setupWindow(
 
 /** Compile capability checks and recipes, never retaining a mutable kernel instance. */
 export interface CompileOptions {
+  readonly lateSort?: boolean;
   /** False retains the original window inputs for component/query benchmark controls. */
   readonly windowInputDeduplication?: boolean;
   /** Parent control for literal-amount gather benchmarks. */
@@ -391,12 +395,26 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   if (plan.initPlans.length !== 0)
     throw new UnsupportedPlanError("init plans", { construct: "initPlan" });
   const admissions: Array<{
-    rel: Rel;
+    rel: OperatorIdentity;
     minimum: number | ((cap: number) => number);
+    owner: number;
     loanSlots: number;
   }> = [];
-  const fixed = (rel: Rel, minimum: number | ((cap: number) => number), loanSlots = 0) =>
-    admissions.push({ rel, minimum, loanSlots });
+  const fixed = (
+    rel: OperatorIdentity,
+    minimum: number | ((cap: number) => number),
+    owner = rel.id,
+    loanSlots = 0,
+  ) => admissions.push({ rel, minimum, owner, loanSlots });
+  let nextPhysicalId = 0;
+  const findIds = (rel: Rel): void => {
+    nextPhysicalId = Math.max(nextPhysicalId, rel.id + 1);
+    if ("input" in rel) findIds(rel.input);
+    if ("left" in rel) findIds(rel.left);
+    if ("right" in rel) findIds(rel.right);
+  };
+  findIds(plan.root);
+  const lateSortIds = new Set<number>();
   const ids = new Set<number>();
   // A terminal names-only projection forwards export ownership while retaining profile counts.
   const exportOwners = new WeakMap<Operator, ResultSink>();
@@ -660,7 +678,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           );
           const minimum = orderedSetMinimumBytes(aggregate, input) + measured;
           const loanSlots = aggregate.aggregates.length + 2;
-          fixed(rel, minimum, loanSlots);
+          fixed(rel, minimum, rel.id, loanSlots);
           return (runtime, downstream) =>
             instantiate(
               runtime,
@@ -724,6 +742,11 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       }
       case "sort":
       case "window": {
+        const late =
+          rel.op === "sort" && options.lateSort !== false && plan.parameters.length === 0
+            ? lateSortShape(rel)
+            : null;
+        if (late !== null && rel.op === "sort") return prepareLate(rel, late);
         const child = prepare(rel.input),
           input = types(rel.input);
         const keys =
@@ -1002,7 +1025,115 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         throw new UnsupportedPlanError(`the ${rel.op} operator`, { construct: rel.op });
     }
   };
+  function prepareLate(rel: Extract<Rel, { op: "sort" }>, shape: LateSortShape): Recipe {
+    lateSortIds.add(rel.id);
+    const { project, scan, narrow, keys, locator } = shape;
+    if (ids.has(project.id))
+      throw new UnsupportedPlanError("a repeated relational operator id", { construct: "plan" });
+    ids.add(project.id);
+    const child = prepare(narrow),
+      input = types(narrow),
+      payload = types(project);
+    sortMode(input, keys);
+    const restoreTypes = [...payload, ORDINAL_TYPE];
+    sortMode(restoreTypes, [
+      { column: payload.length, direction: "asc", nulls: "last", collation: null },
+    ]);
+    const restoreIdentity: OperatorIdentity = { id: nextPhysicalId++, op: "sort", profileAs: rel };
+    const restoreMinimum = sortMinimumBytes(restoreTypes),
+      sortMinimum = sortMinimumBytes(input);
+    const fetchMinimum = (cap: number) =>
+      batchTargetFor(cap, 4) +
+      memoryScanBufferBytes(payload) +
+      BATCH_ROWS * (80 + 8 * OBJECT_OVERHEAD_BYTES) +
+      OBJECT_OVERHEAD_BYTES * (16 + 2 * payload.length);
+    fixed(project, fetchMinimum);
+    fixed(restoreIdentity, restoreMinimum, rel.id);
+    fixed(rel, sortMinimum);
+    return (runtime, downstream) =>
+      runtime.bounds(rel).limit === 0
+        ? downstream.finish()
+        : instantiate(
+            runtime,
+            restoreIdentity,
+            restoreTypes,
+            restoreMinimum,
+            BATCH_ROWS,
+            (_context, grant) => grant,
+            (restoreGrant) =>
+              instantiate(
+                runtime,
+                project,
+                input,
+                fetchMinimum(runtime.request.governor.capBytes),
+                BATCH_ROWS,
+                (context, grant) =>
+                  new LateFetchOperator(
+                    {
+                      snapshot: runtime.view,
+                      tableId: scan.tableId,
+                      columns: scan.columns,
+                      types: payload,
+                      locator,
+                      compile: context,
+                      grant,
+                      restoreGrant,
+                      reads: runtime.request.reads,
+                      spill: runtime.request.spill,
+                      queryId: runtime.request.queryId,
+                      targetBytes: batchTargetFor(runtime.request.governor.capBytes, 4),
+                      signal: runtime.signal,
+                      onPipeline: () => runtime.pipeline(),
+                    },
+                    counted(runtime, project, downstream),
+                  ),
+                (fetch) => {
+                  runtime.onAbort((reason) => fetch.abort(reason));
+                  runtime.dispose(() => fetch.closed);
+                  return instantiate(
+                    runtime,
+                    rel,
+                    input,
+                    sortMinimum,
+                    BATCH_ROWS,
+                    (_context, grant) =>
+                      new SortOperator(
+                        {
+                          types: input,
+                          keys,
+                          limit: runtime.bounds(rel).limit,
+                          offset: runtime.bounds(rel).offset,
+                          withTies: false,
+                        },
+                        {
+                          grant,
+                          spill: runtime.request.spill,
+                          queryId: runtime.request.queryId,
+                          signal: runtime.signal,
+                        },
+                        counted(runtime, rel, fetch),
+                      ),
+                    (sort) => {
+                      runtime.onAbort((reason) => sort.abort(reason));
+                      runtime.dispose(() => sort.closed);
+                      return then(child(runtime, sort, []), () => {
+                        const profile = runtime.profile(rel);
+                        profile.spilledBytes = sort.profile.spilledBytes + fetch.spilledBytes;
+                        profile.spillPasses = sort.profile.mergePasses + fetch.spillPasses;
+                        runtime.profile(project).pagesRead = fetch.pagesRead;
+                        profile.rowsOut = fetch.rowsOut;
+                        profile.batchesOut = fetch.batchesOut;
+                      });
+                    },
+                  );
+                },
+              ),
+          );
+  }
   const recipe = prepare(plan.root);
+  // Extra helper buffers must not turn a formerly admissible small-cap query into a refusal.
+  // Both strategies are capability-checked at prepare; only their execution resources differ.
+  const fallback = lateSortIds.size === 0 ? null : compilePlan(plan, { lateSort: false });
   return (runtime, sink) => {
     runtime.resolveCall = resolveCall;
     // LIMIT zero never opens its input. Keep capability checks at prepare, but do not reserve
@@ -1019,20 +1150,22 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       } else if ("input" in rel) visit(rel.input);
     };
     visit(plan.root);
-    return then(
-      runtime.reserve(
-        admissions
-          .filter((entry) => active.has(entry.rel.id))
-          .map((entry) => ({
-            rel: entry.rel,
-            loanSlots: entry.loanSlots,
-            minimum:
-              typeof entry.minimum === "number"
-                ? entry.minimum
-                : entry.minimum(runtime.request.governor.capBytes),
-          })),
-      ),
-      () => recipe(runtime, sink, []),
-    );
+    const entries = admissions
+      .filter((entry) => active.has(entry.owner))
+      .map((entry) => ({
+        rel: entry.rel,
+        loanSlots: entry.loanSlots,
+        minimum:
+          typeof entry.minimum === "number"
+            ? entry.minimum
+            : entry.minimum(runtime.request.governor.capBytes),
+      }));
+    if (
+      fallback !== null &&
+      entries.reduce((sum, entry) => sum + entry.minimum, 0) >
+        runtime.request.governor.capBytes - runtime.request.governor.reserveBytes
+    )
+      return fallback(runtime, sink);
+    return then(runtime.reserve(entries), () => recipe(runtime, sink, []));
   };
 }

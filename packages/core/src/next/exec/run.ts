@@ -31,13 +31,18 @@ import type { ParameterSlots, CallResolver } from "./kernels/compile.js";
 import { ReservedGrant } from "./admission.js";
 
 interface Reservation {
-  readonly rel: Rel;
+  readonly rel: OperatorIdentity;
   readonly minimum: number;
   readonly loanSlot?: number;
 }
 
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
 export type MutableOperatorProfile = Mutable<OperatorProfile>;
+/** Identity for physical helper operators as well as lowered relational nodes. */
+export type OperatorIdentity = Pick<Rel, "id" | "op"> & {
+  /** Private helper grants retain unique labels, but statistics belong to an IR operator. */
+  readonly profileAs?: Pick<Rel, "id" | "op">;
+};
 export type Program = (runtime: QueryRuntime, sink: ResultSink) => MaybePromise<void>;
 
 /** Per-execution only: never retained by an immutable prepared plan. */
@@ -45,8 +50,8 @@ export class QueryRuntime {
   resolveCall: CallResolver | undefined;
   readonly params: ParameterSlots = { slots: [] };
   readonly profiles = new Map<number, MutableOperatorProfile>();
+  readonly #operatorGrants = new Map<number, Grant[]>();
   readonly #grants: Grant[] = [];
-  readonly #profileGrants = new Map<number, Grant[]>();
   readonly #dispose: Array<() => MaybePromise<void>> = [];
   readonly #aborters: Array<(reason: unknown) => void> = [];
   #aborted = false;
@@ -61,7 +66,7 @@ export class QueryRuntime {
   /** Loan owners hold zero bytes until the one atomic fixed-buffer admission succeeds. */
   reserve(
     pipelines: ReadonlyArray<{
-      readonly rel: Rel;
+      readonly rel: OperatorIdentity;
       readonly minimum: number;
       readonly loanSlots?: number;
     }>,
@@ -232,12 +237,13 @@ export class QueryRuntime {
     return value;
   }
 
-  profile(rel: Rel): MutableOperatorProfile {
-    let profile = this.profiles.get(rel.id);
+  profile(rel: OperatorIdentity): MutableOperatorProfile {
+    const identity = rel.profileAs ?? rel;
+    let profile = this.profiles.get(identity.id);
     if (profile === undefined) {
       profile = {
-        relId: rel.id,
-        op: rel.op,
+        relId: identity.id,
+        op: identity.op,
         rowsOut: 0,
         batchesOut: 0,
         peakHeldBytes: 0,
@@ -247,19 +253,24 @@ export class QueryRuntime {
         pagesPruned: 0,
         runtimeFilter: null,
       };
-      this.profiles.set(rel.id, profile);
+      this.profiles.set(identity.id, profile);
     }
     return profile;
   }
 
   /** Independent zero-byte loan owner installed by the atomic plan reservation. */
-  loan(rel: Rel, slot: number): Grant {
+  loan(rel: OperatorIdentity, slot: number): Grant {
     const grant = this.#reserved.get(`${rel.op}#${String(rel.id)}/loan/${String(slot)}`);
     if (grant === undefined) throw new TypeError("Missing reserved operator loan slot");
     return grant;
   }
 
-  admit(label: string, minimumBytes: number, spillable: boolean, rel?: Rel): MaybePromise<Grant> {
+  admit(
+    label: string,
+    minimumBytes: number,
+    spillable: boolean,
+    rel?: OperatorIdentity,
+  ): MaybePromise<Grant> {
     this.signal.throwIfAborted();
     const reserved = this.#reserved.get(label);
     if (reserved !== undefined) {
@@ -362,7 +373,7 @@ export class QueryRuntime {
     };
   }
 
-  #adopt(grant: Grant, rel: Rel | undefined): Grant {
+  #adopt(grant: Grant, rel: OperatorIdentity | undefined): Grant {
     if (this.#closed || this.signal.aborted) {
       grant.close();
       this.signal.throwIfAborted();
@@ -373,27 +384,30 @@ export class QueryRuntime {
     return grant;
   }
 
-  #meter(grant: Grant, rel?: Rel, account = true): void {
+  #meter(grant: Grant, rel?: OperatorIdentity, account = true): void {
     // A reserved share is already included in its fixed/extra real grants. Observe its
     // operator peak without double-counting the execution's holdings or loan wait time.
     if (account) this.#grants.push(grant);
-    if (rel !== undefined) {
-      const peers = this.#profileGrants.get(rel.id) ?? [];
-      peers.push(grant);
-      this.#profileGrants.set(rel.id, peers);
+    const profile = rel === undefined ? undefined : this.profile(rel);
+    let operatorGrants: Grant[] | undefined;
+    if (profile !== undefined) {
+      operatorGrants = this.#operatorGrants.get(profile.relId);
+      if (operatorGrants === undefined) {
+        operatorGrants = [];
+        this.#operatorGrants.set(profile.relId, operatorGrants);
+      }
+      operatorGrants.push(grant);
     }
     const observe = () => {
       this.#peak = Math.max(
         this.#peak,
         this.#grants.reduce((sum, g) => sum + g.held, 0),
       );
-      if (rel !== undefined) {
-        const profile = this.profile(rel);
+      if (profile !== undefined && operatorGrants !== undefined)
         profile.peakHeldBytes = Math.max(
           profile.peakHeldBytes,
-          (this.#profileGrants.get(rel.id) ?? []).reduce((sum, owner) => sum + owner.held, 0),
+          operatorGrants.reduce((sum, held) => sum + held.held, 0),
         );
-      }
     };
     const allocate = grant.allocate.bind(grant),
       grow = grant.tryGrow.bind(grant),

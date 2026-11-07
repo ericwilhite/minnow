@@ -1274,6 +1274,19 @@ and output, retains the unconsumed suffix of a borrowed memory chunk, and applie
 predicates and deletions in vectorized ranges before bounding survivors. Separate filters and
 breakers stop demand propagation. `scripts/next-executor-bench.mts --component scan-limit`
 measures this scan/operator pair in interleaved Node CPU rounds over the real stored fixture.
+Wide top-N queries can sort keys and row locators, then read the surviving payload columns
+through TableScan in physical order. A charged, spillable ordinal sort restores SQL order.
+The initial shape is an identity projection over an unfiltered scan with at least 16 columns,
+one to four direct fixed numeric/temporal keys, and a constant LIMIT from 1 through BATCH_ROWS,
+in a parameter-free plan without WITH TIES. Its fetch reserves memory-segment staging as well
+as read/sort buffers. When the additional fixed minimums cannot fit, preparation retains the
+ordinary recipe for execution under that cap. The query's pin protects locators through
+publication and payload reads. Internal helper grants report statistics through the original
+IR operator, including the peak sum of simultaneous holdings.
+`scripts/next-executor-bench.mts --only sort_topn_wide --whole-compare late-sort --component late-sort`
+compares both strategies in interleaved Node CPU rounds over the same committed fixture.
+The whole-query comparison includes SQL/lowering/prepare/materialized rows; the component
+times the prepared scan/sort/fetch/frame pipeline. These are Node measurements.
 Small compiler probes determine
 kernel buffer minimums; the generated allocation matrix checks them against real batch-sized
 buffers. Execute accepts caller-owned parameter values (keep them unchanged until execution ends).
