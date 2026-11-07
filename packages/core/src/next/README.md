@@ -457,7 +457,7 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   more entries than the rows it codes: the writer keeps a page dictionary-encoded only while its
   codes and new entries cost no more than the plain page, so a group of mostly distinct values is
   stored plain, and a map never costs more than the rows it replaces.
-- Full export (`SELECT *` over the whole table, Gate A): a sequential decode stream reads with
+- The page-stream half of a full export (the page benchmark, not the real table scan) reads with
   `ChunkReadOptions.once` (storage `ReadOptions.once`, `PeekOptions.once`): nothing it misses is
   admitted to the page cache, nothing it hits is promoted or reordered (synchronous peeks and
   pins included: an entry only one-pass leases pin keeps its place and last use), a
@@ -527,7 +527,7 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   - The nightly browser-performance workflow runs the export bench (`npm run benchmark:export`,
     1M × 200, five cold and five warm rounds per configuration) and records rows/s, the worker's CPU seconds and rows per CPU-second, RSS, worker
     heap and pool residency per pass in `export-bench.json`; nothing judges it yet. Locally, the
-    export is judged per CPU-second: this host gives the worker about half a core.
+    export is compared per CPU-second too; host scheduling and memory reclaim can dominate wall time.
 - Reproduce increment 10 comparisons with `scripts/gather-bench.mts` (finite float64 gathers,
   all-word / Number-only / production NaN-only copies) and `scripts/export-compare.mts --dir
 ~/.cache/minnow-export` (the whole file-backed page export against p2i on identical stored data).
@@ -535,6 +535,128 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   min/max spread and every sample; the export also records sampled RSS. The file comparison uses
   one untimed priming pass per variant, keeps the OS cache, and does not establish the cold OPFS Gate A target. Number-only is a finite-input
   comparator: NaNs still require raw copies to preserve their bits.
+- Export phase profiling (`MINNOW_EXPORT_PROFILE_ONLY=1` with `MINNOW_NEXT_EXPORT_BENCH=1`
+  on `next-export-bench.spec.ts`) runs a cold and a warm Chromium/OPFS profile, then unprofiled
+  references. `MINNOW_EXPORT_ROWS` selects the rows (default 1,048,576), with 200 columns.
+  Root open, worker imports, dataset construction and the hot-set audit are outside the timed
+  export; this mode skips hot-set prefill entirely. Cold file residency is recorded; warm still
+  requires at least 98% residency at its start, not a promise it stays resident under pressure.
+  - The wall phases are synchronous `readDataInto` (native read/wait and validation), target
+    decode, window/buffer planning and release, and residual directory/page load work (checksum,
+    parsing, allocation, GC and coordination). Raw CDP CPU profiles are attached to the HTML
+    report; thread CPU at CDP profile boundaries excludes setup, with clock-tick/notification
+    latency. The wall counters are cross-checked against platform reads and batch decode calls.
+  - Decompression is zero for these uncompressed flushed pages (the profiler refuses gzip
+    pages rather than silently misattribute them). Gather and row transfer are not exercised:
+    this bench range-decodes reusable column buffers and sends only its summary back. It is the
+    page-streaming half, not a SQL/result-transport Gate A certification.
+  - `MINNOW_EXPORT_COMPARE_STREAM=1` runs five interleaved cold/warm attempts per loop version,
+    without CPU profiling. `MINNOW_EXPORT_BASELINE_COMMIT` (default `18548e34`) freezes only the
+    old export loop; both versions use the current engine and both loop modules are imported
+    before timing. This checks disabled-probe overhead, not an arbitrary engine change.
+  - `MINNOW_EXPORT_VARIANCE=1` alternates nine cold/warm pairs (reversing order each round).
+    Each pass records read sizes, backing-buffer sizes and timings, pending promises versus
+    synchronous read concurrency, cache/pool/governor samples, file residency, host load and
+    Linux CPU/IO/memory pressure and reclaim counters. Chromium timeline traces attach the
+    exporting worker's GC pauses between user-timing marks; GC overlaps the wall phases and
+    must not be added to them. A benchmark-only compiler wrapper times xxHash separately (it
+    lives in the residual load phase). No checksum timer is shipped in the engine.
+  - The native read timer excludes xxHash. One-pass page loads already read into leased pooled
+    buffers and verify their views in place; OS cache residency does not switch on a blob copy.
+    OPFS sync reads block this worker, so outstanding promises do not mean concurrent IO or
+    decode/read overlap. The row window is also capped at one group, even when configured larger.
+  - `MINNOW_EXPORT_READ_COMPARE=1` tests a benchmark-only 8 MiB read-call candidate against
+    the current 4 MiB bound, five interleaved cold/warm rounds. Both use the existing 16 MiB
+    maximum pool class and 64 MiB idle cap, with normal lease charging. The isolated
+    `scripts/read-batch-bench.mts` runs full read/verify/release over contiguous and gapped
+    ranges in memory, with CPU/wall samples and charge checks. The candidate does not change
+    the engine's bound: fewer calls alone are not evidence of a faster export.
+  - `MINNOW_EXPORT_DEPTH_COMPARE=1` compares retaining one versus two whole groups, five
+    interleaved cold/warm attempts each. Two groups are opened and prefetched before decoding
+    the first; their existing shared leases pay for both groups until release. It does not
+    create IO overlap on a sync handle. The default stays one group. The isolated
+    `scripts/readahead-bench.mts` runs the actual page-export loop and PageCache over a wide
+    fixture outside IO, checks row/charge totals, and reports five CPU/wall rounds. Its memory
+    peak is only the cache handle; the OPFS comparison reports the full governor and RSS.
+- Scan/transport mode: `MINNOW_EXPORT_SCAN_COMPARE=1 npm run benchmark:export` runs five
+  interleaved cold/warm attempts of the page stream and B4's real `TableScan`/pipeline driver.
+  `MINNOW_EXPORT_SCAN_COLD_ONLY=1` keeps five cold attempts of each mode; the nightly workflow
+  records these separately as `export-scan-bench.json`, without a threshold. The governor cap
+  is 512 MiB for both modes and is reported; its counter is not an RSS bound.
+  - `scripts/browser-perf/page/owner-frames.ts` is a **bench adapter standing in for the
+    executor's future frame assembly**. It stays out of `exec/` and production imports. It owns
+    each compact scan batch as the current `FramePayload`, prepays exact frame/registry bytes,
+    uses identity dictionaries up to the stream cap, then flattens text dictionaries. It does
+    not implement selected vectors or capped non-text dictionaries (outside this fixture).
+  - The real `ResultChannel`, `frameByteLength` and owner transfer policy are reused. Frames
+    go over a real `MessagePort`; the client checks sequence/dictionary/row/byte totals and
+    returns cumulative credits at half the window or the owner's release delay. The timed
+    export ends after all credits return. The client consumes typed frames, not JS row objects.
+  - Table/group descriptors come from the fixture, replacing SQL lowering and B3 catalog/root
+    loading. The scan requests a 64 MiB row window through `TableScan.readWindowBytes` and
+    the `chunkReads` factory: B2's shared `loadTogether` and one-pass pooled leases. This
+    window stays opt-in: absent/zero `readWindowBytes` keeps cached batch reads. Filtered/deleted groups
+    retain selective reads. Resident shared loads preserve synchronous `next()` steps until a task yield is due. A refused
+    optional window drops partial loads and shrinks before
+    falling back to batch reads. Window planning, cached installation, sorting and read/page
+    continuations use the same R23.5 task clock as the scan/driver through B1's `task.ts`
+    extraction. Already-resolved storage promises do not restart it. Missing pages are claimed
+    before a yield so concurrent loads share their completion; started siblings still drain on
+    errors. Each scan owns a cancel signal, passed to its readers and storage. Abort skips
+    closed readers' unstarted page jobs; already-started reads drain, and other live readers
+    keep their jobs. Different cancel signals are never grouped into one shared read. Started
+    rejections are observed immediately while preparation yields, then propagated after drain.
+    `testing/scan-windows.test.ts` generates timers/cancel messages in multi-read
+    windows, carried task budget and concurrent followers. `MINNOW_EXPORT_SCAN_IO_COMPARE=1` compares both policies over
+    five interleaved cold rounds; `scripts/scan-io-bench.mts` isolates the real scan/cache over
+    memory, with fresh caches, untimed warmup GC, and CPU/wall/read/charge measurements. Reported
+    scan assembly/post/credit and inclusive `next()` timers can overlap; they are not exclusive
+    phase shares. Raw scan statistics reveal dense/gather batches, splits and storage calls.
+  - `MINNOW_EXPORT_SCAN_BATCH_COMPARE=1` measures 1/2/3 MiB decoded targets over five cold
+    interleaved rounds, holding the row limit (2,048), borrowed outputs, read window and owner
+    credits (4 MiB) fixed. This experiment also changes frame size because the labelled adapter
+    owns one compact batch per frame. Actual frame/transfer counts, maximum frame bytes and
+    outstanding credits are recorded. `scripts/scan-batch-bench.mts` isolates the same targets
+    over memory with real query/result grants and in-process transfers (no MessagePort IPC).
+    The core target stays 1 MiB: neither the isolated nor whole CPU medians beat their full
+    spreads in the recorded investigation. A timed-out foreground campaign can resume an
+    exact completed-case prefix; combine both logs and retain every completed pass.
+  - Sparse CDP profiles (one-second sample interval) bracket setup-excluded worker CPU, not
+    hotspots. Profile-count checks refuse missing brackets. CPU tick/notification latency
+    remains. Both modes verify zero governor/cache/pool charge after worker close. A final
+    client GC/RSS probe is after the campaign and never changes a recorded peak.
+  - `MINNOW_EXPORT_SCAN_PROFILE=1` profiles only the scan mode, cold and warm, requesting
+    500 µs samples. `scripts/scan-profile.mts` summarizes its `export-cpu-N` attachments:
+    exclusive buckets and top self-time functions. CDP durations include descheduling and
+    native read waits; active sample-count shares are hotspot estimates, not exact CPU seconds.
+    Native reads, GC and idle/program samples remain separate. The worker's `/proc` CPU bracket
+    still reports the actual thread CPU, excluding setup.
+  - Varlen frame offsets use a typed ownership copy, with a subtraction pass only for biased
+    offsets. `scripts/frame-copy-bench.mts` compares the full assembler against the parent generic
+    mapping formula, five interleaved CPU/wall rounds over real decoded wide-column layouts.
+    It compares complete frame digests and charges, without requiring a historical Git object.
+    `MINNOW_EXPORT_FRAME_COPY_COMPARE=1` compares both formulas over real cold scan/transport,
+    five interleaved rounds. Both own all borrowed buffers and use the same transfer policy.
+  - Compact scan batches whose selected positions are contiguous use range APIs for sizing,
+    value loading and decoding. Every position is checked; selections with gaps keep the gather
+    path. Batch sizes, byte limits, borrowing, pushdown and output values are unchanged.
+    `gatherBatches` still counts the compact-selection branch, including these contiguous spans.
+    `scripts/scan-range-bench.mts` isolates this dispatch in five interleaved CPU/wall rounds over
+    the real scan/cache/targets in memory. `MINNOW_EXPORT_SCAN_RANGE_COMPARE=1` compares the
+    parent gather policy and range dispatch through whole cold scan/transport, keeping the
+    adapter and owner transfer policy fixed. Neither comparison needs a historical Git object.
+- The checksum-load CPU hypothesis from the export profile is reproducible with
+  `npx vite-node scripts/hash-load-bench.mts`: five rotating rounds in fresh processes, CPU and
+  wall medians/min/max, aligned and unaligned inputs, byte offsets, stripe tails, and consumed
+  hash results checked across variants. The aligned unsigned/signed native-word candidates stay
+  in this benchmark only: neither cleared the median-versus-spread rule. The engine keeps its
+  explicit little-endian `DataView` reads. Cold IO/directory coordination and fixed-width decode
+  remain the next profile-led candidates; window assembly is a smaller share of this workload.
+- `scripts/scaled-width-bench.mts` screens separate dense scaled-float loops for u8/u16/u32
+  deltas against the existing shared loop. It calls the full decode function, interleaves five
+  fresh-process rounds, reports CPU and wall spreads, and compares every output byte (including
+  raw NaN patches and signed zero). The prototype keeps division, never reciprocal multiplication.
+  Its gain did not clear the spread consistently on patched pages, so it remains benchmark-only.
 - What an export reads (`scripts/export-size.mts`, 262,144 rows of W1M): 1,055 B/row as flushed.
   High-cardinality text is 34% (`h02`'s free text alone 113 B/row), float64 31%, nullable
   floats 9%, int32 9%, decimals 8%; dictionary text 3%. Compaction gzip stores 869 B/row (−18%)
@@ -1321,3 +1443,32 @@ branch).
 - **Group commit is essential.** `flush()` is one real disk flush on every engine: 3.4–4.7 ms.
 - **Cross-tab round trips are slow on WebKit.** Measured at about 55–65 µs on Chromium, 140 µs on
   Firefox and 280 µs on WebKit (p95 520 µs).
+
+The terminal export experiment can also request `TableScan.transferOutputs`. Unfiltered group
+output without locators, deletions or missing columns then decodes into fresh, tight, dedicated
+buffers. `"dictionary"` retains dictionary codes and keeps the dictionary charge through output
+release; `true` flattens text to UTF-8 bytes as an alternative diagnostic. Only fresh output buffers are marked in
+`Transfer.detachableBuffers`. Cached pages, dictionaries, read slabs and reusable output pools
+are never detachable. Four batch credits and a four-MiB threshold (plus one batch) bound retained
+output, and loan-backed output must be released before the next step. Charges last through
+client release, including after detachment or source abort. Terminal scans can provide
+`outputBudget`, so dedicated buffers are charged to the result grant from creation. The bench
+adopts only buffers marked with that exact result-budget identity; other handoffs copy. Output
+reservation waits for retained credits, then shrinks on refusal. A separate output budget that
+refuses even one row reports an error; the experiment does not borrow a second grant's loan. Other scan paths keep borrowing.
+
+`MINNOW_EXPORT_SCAN_OWNED_COMPARE=1 npm run benchmark:export` compares borrowed dictionary/copy
+output with dictionary-preserving owned decode/adopt output in five interleaved cold attempts. Both use real
+TableScan, ResultChannel, owner transfer policy and MessagePort credits through the labelled
+bench-only frame adapter. `npx vite-node scripts/scan-owned-bench.mts` isolates scan decode and
+frame assembly over memory-backed input, using the real governor and separate query/result grants (setup and warmup cleanup excluded; process/thread CPU
+and wall time). It includes output allocations, frame accounting and real in-process transfers,
+with four frames held; it excludes MessagePort IPC. `--profile` records one diagnostic pass per
+variant, never a performance comparison.
+The component benchmark includes borrowed, dictionary-preserving owned, and all-flat owned
+variants in five interleaved rounds. The all-flat diagnostic changes text policy and can change
+frame counts and wire bytes. Dictionary-preserving ownership still copies dictionary deltas and
+capped text fallback in the bench adapter; fixed-width values and emitted codes can transfer.
+Bench frame-boundary memory snapshots report charges, including idle pool, active read/descriptor
+remainder, decoded output and live frames. Frames overlap the source/result allocation counters;
+independent maxima must never be added, and these counters do not partition physical RSS.

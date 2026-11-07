@@ -15,7 +15,11 @@ import type { BlobCache } from "../../../packages/core/src/next/format/blob-cach
 import type { ChunkDirectory } from "../../../packages/core/src/next/page/directory.js";
 import { ChunkReader } from "../../../packages/core/src/next/page/reader.js";
 import { targetFor } from "../../../packages/core/src/next/page/test-support.js";
-import type { ColumnChunk, PageEntry } from "../../../packages/core/src/next/format/manifest.js";
+import {
+  PageEncoding,
+  type ColumnChunk,
+  type PageEntry,
+} from "../../../packages/core/src/next/format/manifest.js";
 import type {
   BlobRef,
   ByteBudget,
@@ -30,6 +34,52 @@ export const EXPORT_BATCH = 2048;
 export interface ExportGroup {
   readonly rows: number;
   readonly chunks: readonly ColumnChunk[];
+}
+
+/** Exclusive wall phases of the page-stream bench, not SQL execution/result transport. */
+export interface ExportPhases {
+  active: boolean;
+  readMs: number;
+  readCalls: number;
+  decodeMs: number;
+  decodeCalls: number;
+  gatherCalls: number;
+  compressedPages: number;
+  assemblyMs: number;
+  otherLoadMs: number;
+  /** This bench does range decode only; no gathers, decompression or row transfers. */
+  gatherMs: number;
+  decompressMs: number;
+  transferMs: number;
+  checksumMs: number;
+  checksumCalls: number;
+  readEvents: Array<{ offset: number; bytes: number; backingBytes: number; ms: number }>;
+  maxPendingReads: number;
+  maxSyncReads: number;
+  memory: Array<{ rows: number; pool: number; resident: number; pinned: number; governor: number }>;
+}
+
+export function exportPhases(): ExportPhases {
+  return {
+    active: false,
+    readMs: 0,
+    readCalls: 0,
+    decodeMs: 0,
+    decodeCalls: 0,
+    gatherCalls: 0,
+    compressedPages: 0,
+    assemblyMs: 0,
+    otherLoadMs: 0,
+    gatherMs: 0,
+    decompressMs: 0,
+    transferMs: 0,
+    checksumMs: 0,
+    checksumCalls: 0,
+    readEvents: [],
+    maxPendingReads: 0,
+    maxSyncReads: 0,
+    memory: [],
+  };
 }
 
 export interface ExportOptions {
@@ -51,7 +101,10 @@ export interface ExportOptions {
    */
   readonly windowBytes?: number;
   /** Called every 8 batches (memory sampling). */
-  readonly sample?: () => void;
+  readonly sample?: (rows: number) => void;
+  readonly phases?: ExportPhases;
+  /** Bench-only depth experiment: hold the next group too; sync OPFS still cannot overlap. */
+  readonly groupDepth?: 1 | 2;
 }
 
 export interface ExportResult {
@@ -74,6 +127,30 @@ interface Buffer {
 /** One reused batch buffer per column, kept across passes (the executor reuses its own). */
 const buffers = new Map<number, Buffer>();
 
+function profileReader(reader: ChunkReader, phases: ExportPhases): void {
+  const timed =
+    <Args extends unknown[]>(fn: (...args: Args) => void, gather: boolean) =>
+    (...args: Args): void => {
+      const start = performance.now();
+      try {
+        fn(...args);
+      } finally {
+        const elapsed = performance.now() - start;
+        if (gather) {
+          phases.gatherMs += elapsed;
+          phases.gatherCalls++;
+        } else {
+          phases.decodeMs += elapsed;
+          phases.decodeCalls++;
+        }
+      }
+    };
+  reader.decodeRange = timed(reader.decodeRange.bind(reader), false);
+  reader.decodeCodes = timed(reader.decodeCodes.bind(reader), false);
+  reader.gather = timed(reader.gather.bind(reader), true);
+  reader.gatherCodes = timed(reader.gatherCodes.bind(reader), true);
+}
+
 export async function exportStream(
   space: ExtentReader,
   groups: readonly ExportGroup[],
@@ -87,11 +164,52 @@ export async function exportStream(
   let batches = 0;
   const open = { budget: options.budget, directories: options.directories, once: options.once };
   const windowBytes = options.windowBytes ?? 0;
-  for (const group of groups) {
-    let t = performance.now();
+  const prepare = async (group: ExportGroup): Promise<ChunkReader[]> => {
+    const t = performance.now();
     const readers: ChunkReader[] = [];
-    for (const chunk of group.chunks) readers.push(await ChunkReader.open(space, chunk, open));
+    for (const chunk of group.chunks) {
+      const reader = await ChunkReader.open(space, chunk, open);
+      if (options.phases) profileReader(reader, options.phases);
+      readers.push(reader);
+    }
+    if (options.phases) {
+      for (const reader of readers)
+        for (const page of reader.directory.pages)
+          if ((page.encoding & PageEncoding.gzip) !== 0) options.phases.compressedPages++;
+      for (const reader of readers)
+        if (
+          reader.directory.dictionary &&
+          (reader.directory.dictionary.encoding & PageEncoding.gzip) !== 0
+        )
+          options.phases.compressedPages++;
+      if (options.phases.compressedPages > 0)
+        throw new Error("Phase profiling expects uncompressed flushed pages");
+    }
     openMs += performance.now() - t;
+    return readers;
+  };
+  const prepared = new Map<number, ChunkReader[]>();
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+    const group = groups[groupIndex] ?? fail();
+    const readers = prepared.get(groupIndex) ?? (await prepare(group));
+    prepared.delete(groupIndex);
+    let t: number;
+    if (options.groupDepth === 2 && groupIndex % 2 === 0) {
+      const next = groups[groupIndex + 1];
+      if (next) {
+        const future = await prepare(next);
+        prepared.set(groupIndex + 1, future);
+        t = performance.now();
+        await ChunkReader.loadTogether(
+          [...readers, ...future].map((reader) => ({
+            reader,
+            pages: reader.directory.pages.map((_, i) => i),
+          })),
+        );
+        loadMs += performance.now() - t;
+        loads++;
+      }
+    }
     const loadedFrom = readers.map(() => 0);
     /** Pages behind `from` were emitted: let them go. */
     const releaseBehind = (column: number, reader: ChunkReader, from: number, to: number) => {
@@ -170,9 +288,9 @@ export async function exportStream(
           };
           buffers.set(column, buffer);
         }
-        if (reader.isDictionaryRange(from, to))
+        if (reader.isDictionaryRange(from, to)) {
           reader.decodeCodes(from, to, buffer.codes, buffer.validity);
-        else {
+        } else {
           const bytes = reader.varlenBytes(from, to);
           const kept = buffer.target;
           // A buffer of another column's type (a reused slot) or too small for this batch.
@@ -186,11 +304,18 @@ export async function exportStream(
         }
       }
       rows += to - from;
-      if ((++batches & 7) === 0) options.sample?.();
+      if ((++batches & 7) === 0) options.sample?.(rows);
     }
     for (const reader of readers) reader.close();
+    options.sample?.(rows);
   }
-  return { rows, ms: performance.now() - started, loadMs, openMs, loads };
+  const ms = performance.now() - started;
+  if (options.phases) {
+    options.phases.otherLoadMs = openMs + loadMs - options.phases.readMs;
+    options.phases.assemblyMs =
+      ms - openMs - loadMs - options.phases.decodeMs - options.phases.gatherMs;
+  }
+  return { rows, ms, loadMs, openMs, loads };
 }
 
 function fail(): never {

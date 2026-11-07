@@ -1,3 +1,5 @@
+// eslint-disable-next-line no-restricted-imports -- Node-only benchmark compiler; never shipped.
+import { execFileSync } from "node:child_process";
 import { defineConfig, type Plugin } from "vite";
 
 /**
@@ -25,8 +27,119 @@ const isolatedPages: Plugin = {
   },
 };
 
+const exportBaselineRevision = process.env.MINNOW_EXPORT_BASELINE_COMMIT ?? "18548e34";
+const exportBaseline =
+  process.env.MINNOW_EXPORT_COMPARE_STREAM === "1"
+    ? execFileSync(
+        "git",
+        ["show", `${exportBaselineRevision}:scripts/browser-perf/page/export-stream.ts`],
+        { encoding: "utf8" },
+      )
+    : null;
+
 export default defineConfig({
-  plugins: [isolatedPages],
+  plugins: [
+    isolatedPages,
+    ...(process.env.MINNOW_EXPORT_SCAN_RANGE_COMPARE === "1"
+      ? [
+          {
+            name: "export-scan-range-comparison",
+            enforce: "pre" as const,
+            transform(source: string, id: string) {
+              if (!id.endsWith("/next/exec/table-scan.ts")) return;
+              const anchor = "function specForRows(";
+              if (!source.includes(anchor)) throw new Error("Scan range anchor moved");
+              return (
+                source.replace(anchor, "function fastSpecForRows(") +
+                `
+const specForRows = new URL(globalThis.location.href).searchParams.get("scanRange") === "baseline"
+ ? (rows: Uint16Array, count: number): DecodeSpec => ({rows,count}) : fastSpecForRows;
+`
+              );
+            },
+          },
+        ]
+      : []),
+    ...(process.env.MINNOW_EXPORT_FRAME_COPY_COMPARE === "1"
+      ? [
+          {
+            name: "export-frame-copy-comparison",
+            enforce: "pre" as const,
+            transform(source: string, id: string) {
+              if (!id.endsWith("/scripts/browser-perf/page/owner-frames.ts")) return;
+              const anchor = "function ownedOffsets(";
+              if (!source.includes(anchor)) throw new Error("Frame copy anchor moved");
+              return (
+                source.replace(anchor, "function fastOwnedOffsets(") +
+                `
+const ownedOffsets = new URL(globalThis.location.href).searchParams.get("frameCopy") === "baseline"
+ ? (source: Int32Array, n: number, first: number) => Int32Array.from(source.subarray(0,n+1),x=>x-first)
+ : fastOwnedOffsets;
+`
+              );
+            },
+          },
+        ]
+      : []),
+    ...(process.env.MINNOW_EXPORT_READ_COMPARE === "1"
+      ? [
+          {
+            name: "export-read-call-candidate",
+            enforce: "pre" as const,
+            transform(source: string, id: string) {
+              if (!id.endsWith("/next/storage/extents.ts")) return;
+              const anchor = "export const MAX_READ_BYTES = 4 * MAX_SLAB;";
+              if (!source.includes(anchor)) throw new Error("Read bound anchor moved");
+              return source.replace(
+                anchor,
+                'export const MAX_READ_BYTES = Number(new URL(globalThis.location.href).searchParams.get("readMiB") ?? 4) * MAX_SLAB;',
+              );
+            },
+          },
+        ]
+      : []),
+    ...(process.env.MINNOW_EXPORT_VARIANCE === "1"
+      ? [
+          {
+            name: "export-checksum-timer",
+            enforce: "pre" as const,
+            transform(source: string, id: string) {
+              if (!id.endsWith("/next/hash/xxhash32.ts")) return;
+              return (
+                source.replace("export function xxHash32(", "function measuredHash(") +
+                `
+export function xxHash32(bytes: Uint8Array, seed = 0, start = 0, end = bytes.length): number {
+ const state = (globalThis as typeof globalThis & {__minnowExportPhases?: {active: boolean; checksumMs: number; checksumCalls: number}}).__minnowExportPhases;
+ if (!state?.active) return measuredHash(bytes, seed, start, end);
+ const before = performance.now();
+ try { return measuredHash(bytes, seed, start, end); }
+ finally { state.checksumMs += performance.now() - before; state.checksumCalls++; }
+}`
+              );
+            },
+          },
+        ]
+      : []),
+    ...(exportBaseline === null
+      ? []
+      : [
+          {
+            name: "export-baseline",
+            enforce: "pre" as const,
+            load(id: string) {
+              const [file, query] = id.split("?");
+              if (
+                file?.endsWith("/scripts/browser-perf/page/export-stream.ts") &&
+                new URLSearchParams(query).has("exportBaseline")
+              )
+                return (
+                  exportBaseline +
+                  `\nexport const EXPORT_BASELINE_REVISION = ${JSON.stringify(exportBaselineRevision)};\n`
+                );
+            },
+          },
+        ]),
+  ],
   // Test pages only: the next/ engine re-verifies cached bytes at every lease release and
   // eviction, so a writer into them fails in the browser lanes too
   // (packages/core/src/next/storage/verify-cached.ts). Off only for the opt-in OPFS export bench

@@ -30,6 +30,48 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+/** Full-scan shared windows: the default and override must cover cold and resident reads. */
+export const SCAN_WINDOW_RESIDENCY_REACH = [
+  "default cold",
+  "default resident",
+  "default mixed",
+  "explicit cold",
+  "explicit resident",
+  "explicit mixed",
+  "disabled",
+] as const;
+
+/** R23.5 inside one coalesced scan window, not only at batch/operator boundaries. */
+export const SCAN_WINDOW_PACING_REACH = [
+  "multi-read window",
+  "immediately resolved storage",
+  "timer inside window",
+  "cancel message inside window",
+  "carried task budget",
+  "concurrent follower",
+  "follower across later yield",
+] as const;
+
+/** Abort stops new backend work, drains started buffers, then permits a fresh scan. */
+export const SCAN_WINDOW_CANCEL_REACH = [
+  "first native read blocked",
+  "later native read blocked",
+  "started work remains charged",
+  "no backend calls after cancel",
+  "signal forwarded to storage",
+  "fresh signal retry",
+] as const;
+
+/** Closing one participant must not cancel the other readers of a shared read. */
+export const SHARED_WINDOW_CLOSE_REACH = [
+  "closed jobs omitted",
+  "all readers closed",
+  "live readers complete",
+  "closed suffix",
+  "alternating closure",
+  "independent cancel signals",
+] as const;
+
 export function createReach<State extends string>(
   campaign: string,
   states: readonly State[],
@@ -311,4 +353,11 @@ export const OWNER_RELEASE_STATES = [
   "superseded",
   "closing",
   "lockLost",
+] as const;
+
+/** Standalone load errors must already have an observer while planning is yielded. */
+export const WINDOW_CANCEL_REJECTION_REACH = [
+  "dictionary pending",
+  "cancel while yielded",
+  "rejection observed",
 ] as const;

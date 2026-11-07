@@ -1,9 +1,27 @@
 /**
- * Gate A's streaming export on real OPFS in Chromium (opt-in: MINNOW_NEXT_EXPORT_BENCH=1;
- * MINNOW_EXPORT_ROWS, default 1,048,576). The wide table (200 columns) is written into OPFS
- * through the rebuild core's backend in a dedicated worker (browser/next-export-worker.ts), on
+ * Page-stream diagnostics and scan/result-transport export on Chromium OPFS (opt-in:
+ * MINNOW_NEXT_EXPORT_BENCH=1; MINNOW_EXPORT_ROWS, default 1,048,576). The 200-column table is
+ * written through the rebuild core backend in a dedicated worker (browser/next-export-worker.ts), on
  * the persistent profile on disk (fixtures.ts); each pass then streams every row in a fresh
  * worker (scripts/browser-perf/page/export-stream.ts).
+ *
+ * MINNOW_EXPORT_SCAN_COMPARE=1 adds a second mode: B4's real TableScan and pipeline driver,
+ * a labelled bench adapter standing in for the executor's future frame assembly (not yet on
+ * main), real ResultChannel/frameByteLength/owner transfer policy and MessagePort credits.
+ * Fixture descriptors replace SQL/catalog/group-root loading. The scan requests a one-pass
+ * coalesced row window from TableScan (64 MiB by default), with its ordinary byte target.
+ * MINNOW_EXPORT_SCAN_IO_COMPARE=1 compares it with the parent cached per-batch policy.
+ * MINNOW_EXPORT_SCAN_BATCH_COMPARE=1 compares 1/2/3 MiB decoded targets with owner credits fixed.
+ * MINNOW_EXPORT_SCAN_BATCH_COMPLETED resumes only a recorded exact prefix of that campaign.
+ * MINNOW_EXPORT_SCAN_OWNED_COMPARE=1 compares borrowed/copy with dictionary-preserving owned
+ * decode/adopt. The source retains dictionary charges; the owner still copies dictionary deltas
+ * and capped text fallback. The component bench also records the slower all-flat diagnostic.
+ * Frame-boundary charged counters overlap (source output includes adopted in-flight frames);
+ * they are not an exact physical-RSS partition. Absolute renderer baseline/peak is also recorded.
+ * Five interleaved cold/warm attempts per mode; sparse CDP profiles bracket setup-excluded
+ * thread CPU (1-second sampling interval, not a hotspot profile). Both await all frame credits.
+ * MINNOW_EXPORT_SCAN_PROFILE=1 instead profiles only the scan worker, cold and warm, requesting
+ * 500-us samples. scripts/scan-profile.mts separates native waits from active-stack shares.
  *
  * - Cold: the profile's OPFS files are synced and dropped from the OS page cache first
  *   (`dd iflag=nocache count=0`, posix_fadvise DONTNEED on a file this user owns), and `fincore`
@@ -33,6 +51,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 // eslint-disable-next-line no-restricted-imports -- Node-only Playwright bench (cache control, /proc); never shipped.
 import { join } from "node:path";
 import { expect, type CDPSession, type Page } from "@playwright/test";
+import { exportTrace, hostSample } from "./export-diagnostics.js";
 import { requireWorkerOpfs, test } from "./fixtures.js";
 
 type Run = typeof import("../browser/next-export-run.js");
@@ -49,6 +68,26 @@ const WARM_SHARE = 0.98;
  */
 const DISTINCT = Number(process.env.MINNOW_EXPORT_DISTINCT ?? 4);
 /** MINNOW_EXPORT_FOCUS=1: only Gate A's configuration (cold ×5, warm ×5, a profiled pass). */
+const COMPARE_STREAM = process.env.MINNOW_EXPORT_COMPARE_STREAM === "1";
+const SCAN_PROFILE = process.env.MINNOW_EXPORT_SCAN_PROFILE === "1";
+const FRAME_COPY_COMPARE = process.env.MINNOW_EXPORT_FRAME_COPY_COMPARE === "1";
+const SCAN_RANGE_COMPARE = process.env.MINNOW_EXPORT_SCAN_RANGE_COMPARE === "1";
+const SCAN_OWNED_COMPARE = process.env.MINNOW_EXPORT_SCAN_OWNED_COMPARE === "1";
+const SCAN_BATCH_COMPARE = process.env.MINNOW_EXPORT_SCAN_BATCH_COMPARE === "1";
+const SCAN_BATCH_COMPLETED = process.env.MINNOW_EXPORT_SCAN_BATCH_COMPLETED ?? "";
+const SCAN_IO_COMPARE = process.env.MINNOW_EXPORT_SCAN_IO_COMPARE === "1";
+const SCAN_COMPARE =
+  process.env.MINNOW_EXPORT_SCAN_COMPARE === "1" ||
+  SCAN_PROFILE ||
+  FRAME_COPY_COMPARE ||
+  SCAN_RANGE_COMPARE ||
+  SCAN_IO_COMPARE ||
+  SCAN_OWNED_COMPARE ||
+  SCAN_BATCH_COMPARE;
+const DEPTH_COMPARE = process.env.MINNOW_EXPORT_DEPTH_COMPARE === "1";
+const READ_COMPARE = process.env.MINNOW_EXPORT_READ_COMPARE === "1";
+const VARIANCE = process.env.MINNOW_EXPORT_VARIANCE === "1";
+const PROFILE_ONLY = process.env.MINNOW_EXPORT_PROFILE_ONLY === "1" || VARIANCE;
 const FOCUS = process.env.MINNOW_EXPORT_FOCUS === "1";
 /** The row window of the focused passes (MINNOW_EXPORT_WINDOW_MIB, default 64). */
 const WINDOW_MIB = Number(process.env.MINNOW_EXPORT_WINDOW_MIB ?? 64);
@@ -169,11 +208,13 @@ interface CpuProfile {
  * CPU profile of a pass that brackets itself with console.profile / profileEnd (the Profiler
  * domain is enabled on every worker as it attaches).
  */
-async function workers(page: Page) {
+async function workers(page: Page, profileDirectory: string) {
   const cdp: CDPSession = await page.context().newCDPSession(page);
   const sessions = new Set<string>();
   const pending = new Map<number, (value: unknown) => void>();
   const profiles: CpuProfile[] = [];
+  const profileCpuSeconds: number[] = [];
+  const starts = new Map<string, Map<string, number>>();
   let next = 1;
   let external = 0;
   const send = (sessionId: string, method: string, params: object = {}): Promise<unknown> => {
@@ -196,9 +237,17 @@ async function workers(page: Page) {
   cdp.on("Target.attachedToTarget", (event) => {
     if (event.targetInfo.type !== "worker") return;
     sessions.add(event.sessionId);
-    void send(event.sessionId, "Profiler.enable").then(() =>
-      send(event.sessionId, "Profiler.setSamplingInterval", { interval: 500 }),
-    );
+    void send(event.sessionId, "Profiler.enable")
+      .then(() =>
+        send(event.sessionId, "Profiler.setSamplingInterval", {
+          interval: SCAN_COMPARE && !SCAN_PROFILE ? 1_000_000 : 500,
+        }),
+      )
+      .then(() =>
+        PROFILE_ONLY || SCAN_COMPARE
+          ? send(event.sessionId, "Runtime.runIfWaitingForDebugger")
+          : undefined,
+      );
   });
   cdp.on("Target.detachedFromTarget", (event) => {
     sessions.delete(event.sessionId);
@@ -210,8 +259,17 @@ async function workers(page: Page) {
       result?: unknown;
       params?: { profile?: CpuProfile };
     };
-    if (message.method === "Profiler.consoleProfileFinished" && message.params?.profile)
+    if (message.method === "Profiler.consoleProfileStarted")
+      starts.set(event.sessionId, workerThreadCpu(profileDirectory));
+    if (message.method === "Profiler.consoleProfileFinished" && message.params?.profile) {
       profiles.push(message.params.profile);
+      const before = starts.get(event.sessionId);
+      let used = 0;
+      for (const [tid, seconds] of workerThreadCpu(profileDirectory))
+        if (before?.has(tid)) used += seconds - (before.get(tid) ?? seconds);
+      profileCpuSeconds.push(used);
+      starts.delete(event.sessionId);
+    }
     if (message.id === undefined) return;
     pending.get(message.id)?.(message.result ?? null);
     pending.delete(message.id);
@@ -220,7 +278,7 @@ async function workers(page: Page) {
   try {
     await cdp.send("Target.setAutoAttach", {
       autoAttach: true,
-      waitForDebuggerOnStart: false,
+      waitForDebuggerOnStart: PROFILE_ONLY || SCAN_COMPARE,
       flatten: false,
     });
   } catch {
@@ -229,6 +287,13 @@ async function workers(page: Page) {
   return {
     ok,
     profiles,
+    profileCpuSeconds,
+    async collectPage() {
+      const before = await cdp.send("Runtime.getHeapUsage");
+      await cdp.send("HeapProfiler.collectGarbage");
+      const after = await cdp.send("Runtime.getHeapUsage");
+      return { before, after };
+    },
     async heap(): Promise<number> {
       let used = 0;
       for (const sessionId of sessions) {
@@ -283,8 +348,13 @@ interface Row {
   readonly residentBeforeMiB: number;
   readonly rows: number;
   readonly rowsPerSecond: number;
+  readonly readMiB: number;
+  readonly mode: "pages" | "scan";
+  readonly scanStats?: Awaited<ReturnType<Run["exportPass"]>>[number]["scanStats"];
+  readonly afterWorkerClose?: Awaited<ReturnType<Run["exportPass"]>>[number]["afterWorkerClose"];
   readonly seconds: number;
-  readonly loadShare: number;
+  readonly exportMs: number;
+  readonly loadShare: number | null;
   readonly mbPerSecond: number;
   readonly platformReads: number;
   readonly governorPeakMiB: number;
@@ -298,12 +368,20 @@ interface Row {
   /** Hot set and scanned pages left after evicting everything but the hot set's size. */
   readonly hotKept: string;
   readonly scannedKept: string;
+  readonly rendererCampaignGrowthMiB: number;
+  readonly rendererRssBaselineMiB: number;
+  readonly rendererRssAbsolutePeakMiB: number;
   readonly rendererRssPeakMiB: number;
   readonly workerHeapPeakMiB: number;
   /** The export worker's thread CPU (whole worker, setup included; sampled every 200 ms). */
   readonly workerCpuSeconds: number;
+  /** Thread CPU delta at CDP profile boundaries; setup excluded, tick/CDP latency applies. */
+  readonly exportCpuSeconds?: number;
+  readonly phases?: Awaited<ReturnType<Run["exportPass"]>>[number]["phases"];
   /** Rows per second of that CPU: the pass's cost, whatever share of a core the host gave it. */
   readonly rowsPerCpuSecond: number;
+  readonly diagnostics?: unknown;
+  readonly host?: unknown;
 }
 
 test.describe("rebuild core export on OPFS (bench)", () => {
@@ -315,10 +393,12 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     test.skip(browserName !== "chromium", "measured on Chromium (CDP and /proc)");
     test.setTimeout(60 * 60_000);
     const rows = Number(process.env.MINNOW_EXPORT_ROWS ?? 1_048_576);
+    if (!Number.isInteger(rows) || rows < 1 || !Number.isInteger(DISTINCT) || DISTINCT < 1)
+      throw new Error("Export rows/distinct must be positive integers");
     await page.goto("/packages/core/browser/");
     await requireWorkerOpfs(page);
     const profile = info.outputPath("storage-profile");
-    const targets = await workers(page);
+    const targets = await workers(page, profile);
 
     // One group more than the export reads: the measured hot set comes from it, so the export
     // never touches it (export-stream.ts `establishWorkingSet`).
@@ -342,6 +422,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       `dd of the data file: cold ${String(device.coldMBps)} MB/s, warm ${String(device.warmMBps)} MB/s`,
     );
 
+    const campaignRendererBaselineMiB = rendererRss(profile) / MiB;
     const results: Row[] = [];
     const measure = async (
       label: string,
@@ -356,7 +437,11 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       const residentBefore = resident(files);
       const share = residentBefore / onDisk;
       const established = !warm || share >= WARM_SHARE;
+      const hostBefore = VARIANCE || SCAN_COMPARE ? hostSample() : undefined;
+      const stopTrace = VARIANCE ? await exportTrace(page) : undefined;
       const rssBefore = rendererRss(profile);
+      const samples: unknown[] = [];
+      let ticks = 0;
       let rssPeak = rssBefore;
       let heapPeak = 0;
       // The export worker's thread CPU: threads that appear during the pass, at their last sample.
@@ -366,13 +451,17 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       const sampling = { on: true };
       const sampler = (async () => {
         while (sampling.on) {
-          rssPeak = Math.max(rssPeak, rendererRss(profile));
+          const rss = rendererRss(profile);
+          rssPeak = Math.max(rssPeak, rss);
+          if (VARIANCE && ++ticks % 5 === 0)
+            samples.push({ rss, resident: resident(files), host: hostSample() });
           for (const [tid, seconds] of workerThreadCpu(profile))
             if (!threadsBefore.has(tid)) passCpu.set(tid, seconds);
           heapPeak = Math.max(heapPeak, await targets.heap());
           await new Promise((resolve) => setTimeout(resolve, 200));
         }
       })();
+      const profilesBefore = targets.profiles.length;
       const passes = await page
         .evaluate(async ([url, run]) => ((await import(url)) as Run).exportPass(run), [
           RUN,
@@ -382,21 +471,79 @@ test.describe("rebuild core export on OPFS (bench)", () => {
           sampling.on = false;
         });
       await sampler;
+      const trace = await stopTrace?.();
+      if (trace)
+        await info.attach(`gc-trace-${String(results.length)}`, {
+          body: JSON.stringify({ traceEvents: trace.events }),
+          contentType: "application/json",
+        });
       const pass = passes.at(-1);
       if (pass === undefined) throw new Error("no pass");
       // vite.library.config.ts drops the cached-bytes guard when this bench is opted in.
+      if (COMPARE_STREAM)
+        expect(pass.baselineCommit).toBe(process.env.MINNOW_EXPORT_BASELINE_COMMIT ?? "18548e34");
       expect(pass.verifying, "the cached-bytes guard re-hashes every release").toBe(false);
+      if (options.scanOutput === "dictionary" || options.scanOutput === "flat") {
+        expect(pass.scanStats?.copies.adoptedFrames, "candidate ownership must be active").toBe(
+          pass.scanStats?.frames,
+        );
+        expect(pass.scanStats?.copies.adoptedBytes).toBeGreaterThan(0);
+      } else if (options.scanOutput === "borrowed") {
+        expect(pass.scanStats?.copies.adoptedFrames).toBe(0);
+        expect(pass.scanStats?.copies.copiedBytes).toBe(pass.scanStats?.wireBytes);
+      }
+      if (options.scanTargetMiB !== undefined) {
+        expect(pass.scanStats?.batchTargetBytes).toBe(options.scanTargetMiB * MiB);
+        expect(pass.scanStats?.maxBatchRows).toBeLessThanOrEqual(2048);
+        expect(pass.scanStats?.maxFrameBytes).toBeLessThanOrEqual(4 * MiB);
+        expect(pass.scanStats?.maxOutstandingBytes).toBeLessThan(
+          4 * MiB + (pass.scanStats?.maxFrameBytes ?? 0),
+        );
+        if (rows === 1048576) {
+          expect(pass.scanStats?.frames).toBe(
+            options.scanTargetMiB === 1 ? 1536 : options.scanTargetMiB === 2 ? 1024 : 512,
+          );
+        }
+      }
       const bytes = (built.dataBytes * pass.rows) / (rows + 65_536);
       const cpuSeconds = [...passCpu.values()].reduce((sum, seconds) => sum + seconds, 0);
+      const exportCpu = targets.profileCpuSeconds.at(-1);
+      if ((SCAN_COMPARE || VARIANCE) && options.profile) {
+        expect(targets.profiles).toHaveLength(profilesBefore + 1);
+        expect(exportCpu).toBeDefined();
+      }
       const row: Row = {
+        ...(pass.phases ? { phases: pass.phases } : {}),
+        ...(options.profile && exportCpu !== undefined ? { exportCpuSeconds: exportCpu } : {}),
+        ...(hostBefore ? { host: { before: hostBefore, after: hostSample() } } : {}),
+        ...(trace
+          ? {
+              diagnostics: {
+                hostBefore,
+                hostAfter: hostSample(),
+                samples,
+                rssBefore,
+                rssEnd: rendererRss(profile),
+                residentAfter: resident(files),
+                gcMs: trace.gcMs,
+                gcCount: trace.gcCount,
+                traceMs: trace.traceMs,
+              },
+            }
+          : {}),
         label: established
           ? label
           : `${label.replace("warm", "partial residency")} (${(100 * share).toFixed(0)}% resident)`,
         residentBeforeMiB: Math.round(residentBefore / MiB),
         rows: pass.rows,
+        readMiB: pass.readMiB,
+        mode: pass.mode,
+        ...(pass.scanStats ? { scanStats: pass.scanStats } : {}),
+        ...(pass.afterWorkerClose ? { afterWorkerClose: pass.afterWorkerClose } : {}),
         rowsPerSecond: Math.round(pass.rows / (pass.ms / 1000)),
         seconds: Number((pass.ms / 1000).toFixed(1)),
-        loadShare: Number((pass.loadMs / pass.ms).toFixed(2)),
+        exportMs: pass.ms,
+        loadShare: pass.mode === "scan" ? null : Number((pass.loadMs / pass.ms).toFixed(2)),
         mbPerSecond: Math.round(bytes / 1e6 / (pass.ms / 1000)),
         platformReads: pass.platformReads,
         governorPeakMiB: Math.round(pass.governorPeakMiB),
@@ -406,6 +553,9 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         protectedMiB: `${pass.protectedBeforeMiB.toFixed(1)} → ${pass.protectedAfterMiB.toFixed(1)}`,
         hotKept: pass.kept?.hot ?? "",
         scannedKept: pass.kept?.scanned ?? "",
+        rendererCampaignGrowthMiB: rssPeak / MiB - campaignRendererBaselineMiB,
+        rendererRssBaselineMiB: rssBefore / MiB,
+        rendererRssAbsolutePeakMiB: rssPeak / MiB,
         rendererRssPeakMiB: Math.round((rssPeak - rssBefore) / MiB),
         workerHeapPeakMiB: Math.round(heapPeak / MiB),
         workerCpuSeconds: Number(cpuSeconds.toFixed(2)),
@@ -416,7 +566,165 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     };
 
     const base = { once: true, capMiB: 512, passes: 1, groups: exported };
-    if (FOCUS) {
+    if (SCAN_BATCH_COMPARE) {
+      const options = {
+        ...base,
+        mode: "scan" as const,
+        readaheadKiB: 256,
+        windowMiB: WINDOW_MIB,
+        auditWorkingSet: false,
+        profile: true,
+      };
+      const plan = Array.from({ length: 5 }, (_, round) =>
+        (round % 2 === 0 ? ([1, 2, 3] as const) : ([3, 2, 1] as const)).map((scanTargetMiB) => ({
+          round,
+          scanTargetMiB,
+          key: `${String(round)}:${String(scanTargetMiB)}`,
+        })),
+      ).flat();
+      // A foreground command may hit its time limit between passes on a contended host.
+      // Resume only an exact prefix; retain every completed measurement when combining runs.
+      const completed = SCAN_BATCH_COMPLETED === "" ? [] : SCAN_BATCH_COMPLETED.split(",");
+      if (completed.length >= plan.length || completed.some((key, k) => plan[k]?.key !== key))
+        throw new Error("Completed batch cases must be a strict prefix of the five-round plan");
+      for (const { round, scanTargetMiB } of plan.slice(completed.length))
+        await measure(
+          `cold scan target ${String(scanTargetMiB)} MiB round ${String(round)}`,
+          true,
+          false,
+          { ...options, scanTargetMiB },
+        );
+    } else if (FRAME_COPY_COMPARE || SCAN_RANGE_COMPARE || SCAN_IO_COMPARE || SCAN_OWNED_COMPARE) {
+      const options = {
+        ...base,
+        mode: "scan" as const,
+        readaheadKiB: 256,
+        windowMiB: WINDOW_MIB,
+        auditWorkingSet: false,
+        profile: true,
+      };
+      for (let round = 0; round < 5; round++)
+        for (const variant of round % 2 === 0
+          ? (["baseline", "candidate"] as const)
+          : (["candidate", "baseline"] as const))
+          await measure(
+            `cold scan ${FRAME_COPY_COMPARE ? "frame copy" : SCAN_IO_COMPARE ? "IO" : SCAN_OWNED_COMPARE ? "ownership" : "range"} ${variant} round ${String(round)}`,
+            true,
+            false,
+            {
+              ...options,
+              ...(FRAME_COPY_COMPARE
+                ? { frameCopy: variant }
+                : SCAN_OWNED_COMPARE
+                  ? {
+                      scanOutput:
+                        variant === "baseline" ? ("borrowed" as const) : ("dictionary" as const),
+                    }
+                  : SCAN_IO_COMPARE
+                    ? { scanIO: variant === "baseline" ? ("batch" as const) : ("window" as const) }
+                    : { scanRange: variant }),
+            },
+          );
+    } else if (SCAN_COMPARE) {
+      const options = {
+        ...base,
+        readaheadKiB: 256,
+        windowMiB: WINDOW_MIB,
+        auditWorkingSet: false,
+        profile: true,
+      };
+      const rounds = Number(process.env.MINNOW_EXPORT_SCAN_ROUNDS ?? (SCAN_PROFILE ? 1 : 5));
+      if (!Number.isInteger(rounds) || rounds < 1)
+        throw new Error("Scan rounds must be a positive integer");
+      for (let round = 0; round < rounds; round++)
+        for (const mode of SCAN_PROFILE
+          ? (["scan"] as const)
+          : round % 2 === 0
+            ? (["pages", "scan"] as const)
+            : (["scan", "pages"] as const)) {
+          await measure(`cold ${mode} round ${String(round)}`, true, false, { ...options, mode });
+          if (process.env.MINNOW_EXPORT_SCAN_COLD_ONLY !== "1")
+            await measure(`warm ${mode} round ${String(round)}`, false, true, { ...options, mode });
+        }
+    } else if (DEPTH_COMPARE) {
+      const options = { ...base, readaheadKiB: 256, windowMiB: WINDOW_MIB, auditWorkingSet: false };
+      for (let round = 0; round < 5; round++)
+        for (const groupDepth of round % 2 === 0 ? ([1, 2] as const) : ([2, 1] as const)) {
+          await measure(`cold depth ${String(groupDepth)} round ${String(round)}`, true, false, {
+            ...options,
+            groupDepth,
+          });
+          await measure(`warm depth ${String(groupDepth)} round ${String(round)}`, false, true, {
+            ...options,
+            groupDepth,
+          });
+        }
+    } else if (READ_COMPARE) {
+      const options = { ...base, readaheadKiB: 256, windowMiB: WINDOW_MIB, auditWorkingSet: false };
+      for (let round = 0; round < 5; round++)
+        for (const readMiB of round % 2 === 0 ? ([4, 8] as const) : ([8, 4] as const)) {
+          await measure(`cold read ${String(readMiB)} MiB round ${String(round)}`, true, false, {
+            ...options,
+            readMiB,
+          });
+          await measure(`warm read ${String(readMiB)} MiB round ${String(round)}`, false, true, {
+            ...options,
+            readMiB,
+          });
+        }
+    } else if (COMPARE_STREAM) {
+      const options = { ...base, readaheadKiB: 256, windowMiB: WINDOW_MIB, auditWorkingSet: false };
+      for (let round = 0; round < 5; round++) {
+        for (const baselineStream of round % 2 === 0 ? [true, false] : [false, true]) {
+          const variant = baselineStream ? "baseline" : "current";
+          await measure(`cold ${variant} round ${String(round)}`, true, false, {
+            ...options,
+            baselineStream,
+          });
+          await measure(`warm ${variant} round ${String(round)}`, false, true, {
+            ...options,
+            baselineStream,
+          });
+        }
+      }
+    } else if (VARIANCE) {
+      const options = {
+        ...base,
+        readaheadKiB: 256,
+        windowMiB: WINDOW_MIB,
+        profile: true,
+        profilePhases: true,
+      };
+      for (let round = 0; round < 9; round++)
+        for (const cold of round % 2 === 0 ? [true, false] : [false, true])
+          await measure(
+            `${cold ? "cold" : "warm"} diagnostic round ${String(round)}`,
+            cold,
+            !cold,
+            options,
+          );
+      expect(targets.profiles).toHaveLength(18);
+    } else if (PROFILE_ONLY) {
+      const options = {
+        ...base,
+        readaheadKiB: 256,
+        windowMiB: WINDOW_MIB,
+        profile: true,
+        profilePhases: true,
+      };
+      await measure(`cold, window ${String(WINDOW_MIB)} MiB, phase profile`, true, false, options);
+      await measure(`warm, window ${String(WINDOW_MIB)} MiB, phase profile`, false, true, options);
+      expect(targets.profiles).toHaveLength(2);
+      // Unprofiled references omit the same setup and hot-set prefill as the profiles.
+      const reference = {
+        ...base,
+        readaheadKiB: 256,
+        windowMiB: WINDOW_MIB,
+        auditWorkingSet: false,
+      };
+      await measure("cold, unprofiled reference", true, false, reference);
+      await measure("warm, unprofiled reference", false, true, reference);
+    } else if (FOCUS) {
       // Gate A's configuration, repeated and interleaved (per-column readahead, then the row
       // window, export-stream.ts `windowBytes`), so host drift falls on both alike.
       const perColumn = { ...base, readaheadKiB: 256 };
@@ -464,23 +772,108 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       });
     }
     // Where a warm pass spends its time: a CPU profile of the worker (CDP), by self time.
-    await measure(`warm, window ${String(WINDOW_MIB)} MiB, profiled`, false, true, {
-      ...base,
-      readaheadKiB: 256,
-      windowMiB: WINDOW_MIB,
-      profile: true,
-    });
-    const recorded = targets.profiles.at(-1);
+    if (!PROFILE_ONLY && !COMPARE_STREAM && !READ_COMPARE && !DEPTH_COMPARE && !SCAN_COMPARE)
+      await measure(`warm, window ${String(WINDOW_MIB)} MiB, profiled`, false, true, {
+        ...base,
+        readaheadKiB: 256,
+        windowMiB: WINDOW_MIB,
+        profile: true,
+      });
+    for (const [index, profile] of targets.profiles.entries())
+      await info.attach(`export-cpu-${String(index)}`, {
+        body: JSON.stringify(profile),
+        contentType: "application/json",
+      });
+    const recorded = SCAN_COMPARE && !SCAN_PROFILE ? undefined : targets.profiles.at(-1);
     const hotspots = recorded === undefined ? [] : selfTimes(recorded, 15);
     console.log(`warm pass profile (self time):\n  ${hotspots.join("\n  ")}`);
 
+    const gcRssBefore = rendererRss(profile);
+    const campaignGc = SCAN_COMPARE ? await targets.collectPage() : undefined;
+    const gcRssAfter = rendererRss(profile);
     const report = {
       rows,
       built,
       opfsBytes: onDisk,
+      generatedGroups: built.generatedGroups,
+      exportedRows: results[0]?.rows,
+      exportedGroups: exported,
+      governorCapMiB: base.capMiB,
+      rowWindowMiB: WINDOW_MIB,
       heapSampling: targets.ok,
+      campaignRendererBaselineMiB,
+      campaignRendererPeakMiB: Math.max(...results.map((r) => r.rendererRssAbsolutePeakMiB)),
+      ...(SCAN_COMPARE
+        ? {
+            scanAdapter:
+              "bench stand-in for future executor frame assembly; real TableScan/ResultChannel/owner transfer policy/MessagePort credits; fixture descriptors exclude SQL/catalog/root loading",
+            cpuSamplingIntervalUs: SCAN_PROFILE ? 500 : 1_000_000,
+            rounds:
+              FRAME_COPY_COMPARE ||
+              SCAN_RANGE_COMPARE ||
+              SCAN_IO_COMPARE ||
+              SCAN_OWNED_COMPARE ||
+              SCAN_BATCH_COMPARE
+                ? 5
+                : Number(process.env.MINNOW_EXPORT_SCAN_ROUNDS ?? (SCAN_PROFILE ? 1 : 5)),
+            scanProfile: SCAN_PROFILE,
+            ...(SCAN_BATCH_COMPARE
+              ? {
+                  scanBatchCompletedPrefix: SCAN_BATCH_COMPLETED,
+                  scanBatchRecordedCases: results.map((r) => r.label),
+                }
+              : {}),
+            ...(SCAN_OWNED_COMPARE
+              ? {
+                  scanOwnedComparison:
+                    "borrowed/copy vs dedicated fixed-width/adopt; same text policy; BENCH adapter, real owner transfers",
+                }
+              : {}),
+            ...(SCAN_IO_COMPARE
+              ? { scanIOComparison: "cached per-batch vs coalesced one-pass 64 MiB row windows" }
+              : {}),
+            coldOnly:
+              SCAN_BATCH_COMPARE ||
+              FRAME_COPY_COMPARE ||
+              SCAN_RANGE_COMPARE ||
+              SCAN_IO_COMPARE ||
+              SCAN_OWNED_COMPARE ||
+              process.env.MINNOW_EXPORT_SCAN_COLD_ONLY === "1",
+            ...(SCAN_RANGE_COMPARE
+              ? {
+                  scanRangeComparison:
+                    "parent gather specs vs contiguous range specs; same adapter and transfer policy",
+                }
+              : {}),
+            ...(FRAME_COPY_COMPARE
+              ? {
+                  frameCopyComparison:
+                    "parent generic offset mapping vs typed copy with nonzero-bias loop",
+                }
+              : {}),
+          }
+        : {}),
       device,
       hotspots,
+      profileHotspots:
+        SCAN_COMPARE && !SCAN_PROFILE
+          ? []
+          : targets.profiles.map((profile) => selfTimes(profile, 30)),
+      ...(campaignGc
+        ? {
+            afterCampaignGc: {
+              rendererBeforeMiB: gcRssBefore / MiB,
+              rendererAfterMiB: gcRssAfter / MiB,
+              page: campaignGc,
+            },
+          }
+        : {}),
+      ...(COMPARE_STREAM
+        ? {
+            comparisonScope: "stream loop only; both use the current engine",
+            baselineStreamRevision: process.env.MINNOW_EXPORT_BASELINE_COMMIT ?? "18548e34",
+          }
+        : {}),
       results,
     };
     await info.attach("export-bench", {

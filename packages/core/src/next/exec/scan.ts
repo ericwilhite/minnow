@@ -51,11 +51,13 @@
  *   chunk across the declared columns": the vectors of chunk k of several columns stay valid
  *   together until a call for another chunk index.
  */
+import type { TaskWork } from "../task.js";
 import type { MaybePromise } from "../access/key-index.js";
 import type { GroupSegment } from "../access/snapshot.js";
 import type { ByteBudget, SpaceReader } from "../access/space.js";
 import type { ColumnPredicate, CompiledPredicate } from "../page/predicate.js";
 import type { FlatVector, Validity } from "../vector/vector.js";
+import { ChunkReader } from "../page/reader.js";
 
 /** A column chunk as a group segment names it (format/manifest.ts `ColumnChunk`). */
 export type ColumnChunkRef = NonNullable<ReturnType<GroupSegment["chunk"]>>;
@@ -82,6 +84,8 @@ export interface ChunkPages {
   isDictionaryRange(from: number, to: number): boolean;
   /** Whether int64-family values over pages `[first, end)` fit the f64 `safe` representation. */
   isSafe(first?: number, end?: number): boolean;
+  /** Optional proof from verified, loaded page masks; false/absent keeps an output validity mask. */
+  isAllValid?(from: number, to: number): boolean;
   /**
    * Out-of-line values (page/large-value.ts): a decode reaching such a row needs it loaded first,
    * for a range or for the selected rows; values stay leased until `releaseValues` (all, or the
@@ -164,6 +168,28 @@ export interface ChunkReads {
   open(
     pages: SpaceReader,
     chunk: ColumnChunkRef,
-    options: { readonly budget: ByteBudget; readonly signal?: AbortSignal },
+    options: {
+      readonly budget: ByteBudget;
+      readonly signal?: AbortSignal;
+      readonly once?: boolean;
+      readonly task?: TaskWork;
+    },
   ): MaybePromise<ChunkPages>;
+  /** Coalesce a full scan's row window across columns; leases still belong to each reader. */
+  loadTogether?(
+    loads: ReadonlyArray<{ readonly reader: ChunkPages; readonly pages: readonly number[] }>,
+  ): MaybePromise<void>;
 }
+
+/** Ordinary B2 readers, including shared one-pass slabs for full-scan row windows. */
+export const chunkReads: ChunkReads = {
+  open: (pages, chunk, options) => ChunkReader.open(pages, chunk, options),
+  loadTogether(loads) {
+    return ChunkReader.loadTogether(
+      loads.map(({ reader, pages }) => {
+        if (!(reader instanceof ChunkReader)) throw new TypeError("Expected a B2 chunk reader");
+        return { reader, pages };
+      }),
+    );
+  },
+};

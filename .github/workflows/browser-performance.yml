@@ -86,13 +86,13 @@ jobs:
           npm run benchmark:agg-browser 2>&1 | tee agg-microbench.txt
           grep -o 'AGG_MICROBENCH .*' agg-microbench.txt | sed 's/^AGG_MICROBENCH //' \
             > browser-perf-results/agg-microbench.json
-      - name: Export bench (rebuild core, recorded, not judged)
-        # Gate A's streaming export in real Chromium on the runner's disk: the wide table
+      - name: Page-stream export diagnostic (rebuild core, recorded)
+        # The page-stream half in real Chromium on the runner's disk: the wide table
         # (1,048,576 rows x 200 columns, about 1.1 GB of OPFS) written through the rebuild core's
         # OPFS backend, then cold and warm passes, per-column readahead and the row window.
         # Recorded per pass: rows/s, the export worker's CPU seconds and rows per CPU-second,
-        # renderer RSS peak, worker heap and pool residency. Gate A's >= 190k rows/s cold is
-        # judged here once it is, not yet (lead ruling: record only, like the storage microbench).
+        # renderer RSS peak, worker heap and pool residency. This bypasses the real scan and
+        # result transport; the next step measures those. Both are recorded, not judged.
         # A runner whose disk cannot take the table can lower MINNOW_EXPORT_ROWS.
         if: always()
         shell: bash
@@ -103,6 +103,23 @@ jobs:
           npm run benchmark:export 2>&1 | tee export-bench.txt
           grep -o 'EXPORT_BENCH .*' export-bench.txt | sed 's/^EXPORT_BENCH //' \
             > browser-perf-results/export-bench.json
+      - name: Scan and result-transport export (rebuild core, recorded)
+        # Closer to Gate A: real TableScan and ResultChannel, owner transfer policy and real
+        # MessagePort credits. The bench-owned frame assembler stands in for the executor's
+        # future production sink; fixture descriptors replace SQL/catalog/group-root loading.
+        # Five interleaved cold rounds of both page-stream and scan/transport modes; record
+        # rows/s, setup-excluded CPU brackets and sampled RSS. No target threshold is enforced.
+        if: always()
+        shell: bash
+        env:
+          MINNOW_EXPORT_ROWS: "1048576"
+          MINNOW_EXPORT_SCAN_COMPARE: "1"
+          MINNOW_EXPORT_SCAN_COLD_ONLY: "1"
+        run: |
+          mkdir -p browser-perf-results
+          npm run benchmark:export 2>&1 | tee export-scan-bench.txt
+          grep -o 'EXPORT_BENCH .*' export-scan-bench.txt | sed 's/^EXPORT_BENCH //' \
+            > browser-perf-results/export-scan-bench.json
       - name: Storage kill campaign (rebuild core, Gate A)
         # The rebuild core's storage in real Chromium, OPFS and IndexedDB: 1,000 seeded random kills
         # of a worker running builders, publish, reclaim, log flush and truncate, and spill; after
@@ -127,6 +144,7 @@ jobs:
             storage-microbench.txt
             agg-microbench.txt
             export-bench.txt
+            export-scan-bench.txt
             storage-kills.txt
             browser-perf-results/
             packages/core/browser-perf-baseline.json

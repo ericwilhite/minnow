@@ -10,7 +10,7 @@
  */
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import { createReach } from "../../testing/reach.js";
+import { createReach, SCAN_WINDOW_RESIDENCY_REACH } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import type { ColumnDef } from "../access/catalog.js";
 import type {
@@ -51,6 +51,7 @@ import {
 import { OutputArena } from "./kernels/vectors.js";
 import { andThen } from "./pushdown.js";
 import type { ChunkPages, ChunkReads, ColumnChunkRef } from "./scan.js";
+import { chunkReads } from "./scan.js";
 import { TableScan, type ScanStats, type TableScanOptions } from "./table-scan.js";
 
 /** `xs[i]`, which must exist. */
@@ -407,6 +408,272 @@ function scanOf(
 }
 
 describe("table scan: pushdown, gather and late materialization never change the answer", () => {
+  it.each(seedsFor("next-scan-window-residency", [0xb2b1, 0xb2b2]))(
+    "opt-in windows preserve cached synchronous steps; default stays cached (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-scan-window-residency", SCAN_WINDOW_RESIDENCY_REACH);
+      await fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 20, max: 120 }),
+          fc.constantFrom("cold", "resident", "mixed"),
+          async (count, residency) => {
+            reach.beginHistory();
+            const source = rowsOf(mulberry32(count), count, false);
+            const space = new MemoryExtentSpace();
+            const segment = await groupSegment(0, source, new Set(), false, space);
+            const table: TableSnapshot = {
+              tableId: 9,
+              schemaVersion: 1,
+              columns: DEFS,
+              liveRowCount: count,
+              segments: [segment],
+            };
+            for (const policy of ["explicit", "default", "disabled"] as const) {
+              const pages = space.view({ cache: true }),
+                budget = counting();
+              if (residency !== "cold") {
+                for (const def of DEFS) {
+                  if (residency === "mixed" && def.id % 2 === 0) continue;
+                  const chunk = segment.chunk(def.id);
+                  if (chunk === null) throw new Error("Missing fixture chunk");
+                  const reader = await ChunkReader.open(pages, chunk, { budget });
+                  await reader.load(reader.pagesAhead(0, count, 0));
+                  reader.close();
+                }
+              }
+              let windows = 0;
+              const reads: ChunkReads = {
+                ...chunkReads,
+                loadTogether(loads) {
+                  windows++;
+                  return chunkReads.loadTogether?.(loads);
+                },
+              };
+              const scan = scanOf(table, space, null, {
+                pages,
+                reads,
+                budget,
+                yieldIntervalMs: Infinity,
+                ...(policy === "default"
+                  ? {}
+                  : { readWindowBytes: policy === "disabled" ? 0 : 64 * 1024 * 1024 }),
+              });
+              const actual: unknown[][] = [];
+              try {
+                for (;;) {
+                  const next = scan.next();
+                  if (residency === "resident")
+                    expect(next instanceof Promise, "resident scan must stay synchronous").toBe(
+                      false,
+                    );
+                  const item = await next;
+                  if (item === null) break;
+                  for (let r = 0; r < item.batch.length; r++)
+                    actual.push(item.batch.columns.map((v) => normalize(valueAt(v, r))));
+                }
+                expect(actual).toEqual(source.map((r) => expectedRow(r, false)));
+                expect(windows > 0).toBe(policy === "explicit");
+                reach.reach(policy === "disabled" ? "disabled" : `${policy} ${residency}`);
+              } finally {
+                scan.close();
+              }
+              expect(budget.held).toBe(0);
+            }
+          },
+        ),
+        { seed, numRuns: 24 },
+      );
+      reach.assertReached();
+      console.log(
+        "SCAN_WINDOW_REACH",
+        JSON.stringify({ seed, states: Object.fromEntries(reach.counts()) }),
+      );
+    },
+  );
+
+  it.each(seedsFor("next-scan-windows", [0xb2a1, 0xb2a2]))(
+    "one-pass row windows balance retries and cancellation (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-scan-windows", [
+        "shared window",
+        "refused partial window",
+        "shrunk window",
+        "window error",
+        "abort suspended window",
+        "out-of-line text",
+      ] as const);
+      await fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 100, max: 500 }),
+          fc.boolean(),
+          fc.integer(),
+          fc.constantFrom("normal", "refuse", "refuse-large", "error", "abort"),
+          async (count, longText, inner, mode) => {
+            reach.beginHistory();
+            const actualCount = count + (mode === "refuse-large" ? 3000 : 0);
+            const source = rowsOf(mulberry32(inner), actualCount, longText),
+              space = new MemoryExtentSpace();
+            const table: TableSnapshot = {
+              tableId: 9,
+              schemaVersion: 1,
+              columns: DEFS,
+              liveRowCount: actualCount,
+              segments: [await groupSegment(0, source, new Set(), false, space)],
+            };
+            const pages = space.view({ cache: true }),
+              budget = counting();
+            let windows = 0,
+              once = true;
+            let partial: { reader: ChunkPages; page: number } | null = null;
+            let arrived = (): void => undefined,
+              unblock = (): void => undefined;
+            const entered = new Promise<void>((r) => {
+                arrived = r;
+              }),
+              gate = new Promise<void>((r) => {
+                unblock = r;
+              });
+            const reads: ChunkReads = {
+              open: (p, c, o) => {
+                once &&= o.once === true;
+                return chunkReads.open(p, c, o);
+              },
+              loadTogether: async (loads) => {
+                windows++;
+                if (windows === 2 && partial !== null)
+                  expect(partial.reader.isLoaded(partial.page)).toBe(false);
+                if (windows === 1 && mode !== "normal") {
+                  await chunkReads.loadTogether?.(loads.slice(0, 1));
+                  const first = loads[0];
+                  if (first?.pages[0] !== undefined)
+                    partial = { reader: first.reader, page: first.pages[0] };
+                  if (mode === "refuse" || mode === "refuse-large")
+                    throw Object.assign(new Error("injected read refusal"), {
+                      code: "MINNOW_READ_DENIED",
+                    });
+                  if (mode === "error") throw new Error("injected window error");
+                  arrived();
+                  await gate;
+                  return;
+                }
+                await chunkReads.loadTogether?.(loads);
+              },
+            };
+            const scan = scanOf(table, space, null, {
+              pages,
+              reads,
+              budget,
+              readWindowBytes: 64 * 1024 * 1024,
+              targetBytes: 1024,
+            });
+            if (mode === "abort") {
+              const pending = scan.next();
+              const waiting = await Promise.race([
+                entered.then(() => true),
+                Promise.resolve(pending).then(() => false),
+              ]);
+              if (!waiting) {
+                scan.abort();
+                throw new Error("Expected a shared window before the first batch");
+              }
+              scan.abort();
+              unblock();
+              expect(await pending).toBeNull();
+              reach.reach("abort suspended window");
+            } else if (mode === "error") {
+              await expect(collect(scan)).rejects.toThrow("injected window error");
+              reach.reach("window error");
+            } else {
+              expect(await collect(scan)).toEqual(source.map((r) => expectedRow(r, false)));
+              reach.reach(mode === "normal" ? "shared window" : "refused partial window");
+              if (mode === "refuse-large") {
+                expect(windows).toBeGreaterThan(1);
+                reach.reach("shrunk window");
+              }
+              if (source.some((r) => (r.t?.length ?? 0) > 512)) reach.reach("out-of-line text");
+            }
+            expect(windows).toBeGreaterThan(0);
+            expect(once).toBe(true);
+            scan.close();
+            expect(budget.held).toBe(0);
+          },
+        ),
+        { seed, numRuns: 24 },
+      );
+      reach.assertReached();
+    },
+  );
+
+  it.each(seedsFor("next-table-scan-ranges", [0x5ca92, 0x5ca93]))(
+    "contiguous split prefixes use range APIs; gaps preserve positions (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-table-scan-ranges", [
+        "contiguous byte split",
+        "gapped gather",
+        "dictionary codes",
+        "out-of-line text",
+      ] as const);
+      await fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 100, max: 500 }),
+          fc.boolean(),
+          fc.boolean(),
+          fc.integer(),
+          async (count, holes, longText, inner) => {
+            reach.beginHistory();
+            const source = rowsOf(mulberry32(inner), count, longText);
+            const deleted = new Set<number>();
+            if (holes) for (let k = 2; k < count; k += 3) deleted.add(k);
+            const space = new MemoryExtentSpace();
+            const table: TableSnapshot = {
+              tableId: 9,
+              schemaVersion: 1,
+              columns: DEFS,
+              liveRowCount: count - deleted.size,
+              segments: [await groupSegment(0, source, deleted, false, space)],
+            };
+            let gathered = 0,
+              codes = 0;
+            const reads: ChunkReads = {
+              open: async (_pages, chunk, options) => {
+                const reader = await ChunkReader.open(space.view({ cache: true }), chunk, options);
+                return new Proxy(reader, {
+                  get(target, key) {
+                    const member: unknown = Reflect.get(target, key, target);
+                    if (typeof member !== "function") return member;
+                    return (...args: unknown[]) => {
+                      if (key === "gather" || key === "gatherCodes") gathered++;
+                      if (key === "decodeCodes" || key === "gatherCodes") codes++;
+                      const result: unknown = Reflect.apply(member, target, args);
+                      return result;
+                    };
+                  },
+                });
+              },
+            };
+            const budget = counting(),
+              scan = scanOf(table, space, null, { reads, budget, targetBytes: 1024 });
+            const actual = await collect(scan);
+            expect(actual).toEqual(
+              source.filter((_, k) => !deleted.has(k)).map((r) => expectedRow(r, false)),
+            );
+            expect(budget.held).toBe(0);
+            expect(scan.stats.splits).toBeGreaterThan(0);
+            if (!holes) {
+              expect(gathered).toBe(0);
+              reach.reach("contiguous byte split");
+            }
+            if (holes && gathered > 0) reach.reach("gapped gather");
+            if (codes > 0) reach.reach("dictionary codes");
+            if (source.some((r) => (r.t?.length ?? 0) > 512)) reach.reach("out-of-line text");
+          },
+        ),
+        { seed, numRuns: 24 },
+      );
+      reach.assertReached();
+    },
+  );
+
   it.each(SEEDS)(
     "generated tables and filters (seed %i)",
     async (seed) => {
@@ -1056,6 +1323,274 @@ describe("review B4-p2c-2: the scan's lifecycle, budget and pacing", () => {
  * before borrowing again), and the scan's abort contract (table-scan.ts "Pacing and ending").
  */
 describe("review B4-p2c-3: loans under the real governor", () => {
+  it.each(seedsFor("next-owned-result-budget", [0xb2ad, 0xb2ae]))(
+    "result allocations wait for released credit, including abort seed %i",
+    async (seed) => {
+      const reach = createReach("next-owned-result-budget", [
+        "result charge",
+        "wait for result credit",
+        "abort retained result",
+        "progress after result credit",
+        "one-row result refusal",
+      ] as const);
+      await fc.assert(
+        fc.asyncProperty(fc.integer({ min: 10, max: 30 }), fc.boolean(), async (n, cancel) => {
+          reach.beginHistory();
+          const space = new MemoryExtentSpace(),
+            rows = rowsOf(mulberry32(n), n, false).map((r, k) => ({ ...r, i: k }));
+          const table: TableSnapshot = {
+              tableId: 9,
+              schemaVersion: 1,
+              columns: DEFS,
+              segments: [await groupSegment(0, rows, new Set(), false, space)],
+              liveRowCount: n,
+            },
+            budget = counting();
+          const output = {
+            held: 0,
+            allocate(bytes: number) {
+              if (output.held > 0 || output.held + bytes > 16) return false;
+              output.held += bytes;
+              return true;
+            },
+            free(bytes: number) {
+              output.held -= bytes;
+            },
+          };
+          const scan = scanOf(table, space, null, {
+            budget,
+            outputBudget: output,
+            columns: [1],
+            targetBytes: 32,
+            transferOutputs: "dictionary",
+          });
+          const first = await scan.next();
+          if (!first?.transfer) throw new Error("Missing owned output");
+          expect(first.transfer.detachableBudget).toBe(output);
+          expect(output.held).toBeGreaterThan(0);
+          expect(output.held).toBeLessThanOrEqual(16);
+          const firstCharge = output.held;
+          expect(scan.memoryStats.ownedOutputInQueryBytes).toBe(0);
+          reach.reach("result charge");
+          let settled = false;
+          const pending = Promise.resolve(scan.next()).then((x) => {
+            settled = true;
+            return x;
+          });
+          await Promise.resolve();
+          await Promise.resolve();
+          expect(settled).toBe(false);
+          reach.reach("wait for result credit");
+          if (cancel) {
+            scan.abort();
+            expect(await pending).toBeNull();
+            expect(output.held).toBe(firstCharge);
+            first.transfer.release();
+            reach.reach("abort retained result");
+          } else {
+            first.transfer.release();
+            let item = await pending,
+              count = first.batch.length;
+            while (item !== null) {
+              count += item.batch.length;
+              item.transfer?.release();
+              item = await scan.next();
+            }
+            expect(count).toBe(n);
+            reach.reach("progress after result credit");
+          }
+          scan.close();
+          expect([budget.held, output.held]).toEqual([0, 0]);
+          const refused = scanOf(table, space, null, {
+            budget,
+            outputBudget: { allocate: () => false, free: () => undefined },
+            columns: [1],
+            transferOutputs: true,
+          });
+          await expect(Promise.resolve().then(() => refused.next())).rejects.toThrow(
+            "result grant refused a one-row dedicated output",
+          );
+          refused.close();
+          expect(budget.held).toBe(0);
+          reach.reach("one-row result refusal");
+        }),
+        { seed, numRuns: 12 },
+      );
+      reach.assertReached();
+      console.log(
+        "OWNED_SCAN_REACH",
+        JSON.stringify({
+          seed,
+          campaign: "next-owned-result-budget",
+          states: Object.fromEntries(reach.counts()),
+        }),
+      );
+    },
+    120000,
+  );
+
+  it.each(seedsFor("next-owned-scan-fallback", [0xb2ab, 0xb2ac]))(
+    "ownership falls back for missing/deleted/memory rows seed %i",
+    async (seed) => {
+      const reach = createReach("next-owned-scan-fallback", [
+        "missing column",
+        "deleted rows",
+        "memory segment",
+      ] as const);
+      await fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 10, max: 150 }),
+          fc.constantFrom("missing column", "deleted rows", "memory segment"),
+          async (n, kind) => {
+            reach.beginHistory();
+            reach.reach(kind);
+            const space = new MemoryExtentSpace(),
+              rows = rowsOf(mulberry32(n), n, false),
+              deleted = kind === "deleted rows" ? new Set([2, 7]) : new Set<number>();
+            const segment =
+              kind === "memory segment"
+                ? memorySegment(0, rows, deleted)
+                : await groupSegment(0, rows, deleted, kind === "missing column", space);
+            const table: TableSnapshot = {
+                tableId: 9,
+                schemaVersion: 1,
+                columns: DEFS,
+                segments: [segment],
+                liveRowCount: n - deleted.size,
+              },
+              budget = counting();
+            const scan = scanOf(table, space, null, {
+                budget,
+                targetBytes: 512,
+                transferOutputs: "dictionary",
+              }),
+              actual: unknown[][] = [];
+            for (let item = await scan.next(); item !== null; item = await scan.next()) {
+              expect(item.transfer).toBeUndefined();
+              const batch = item.batch;
+              const positions =
+                batch.selection === null
+                  ? Array.from({ length: batch.length }, (_, k) => k)
+                  : [...batch.selection.rows.subarray(0, batch.selection.count)];
+              for (const row of positions)
+                actual.push(batch.columns.map((v) => normalize(valueAt(v, row))));
+            }
+            scan.close();
+            expect(actual).toEqual(
+              rows
+                .filter((_, k) => !deleted.has(k))
+                .map((r) => expectedRow(r, kind === "missing column")),
+            );
+            expect(budget.held).toBe(0);
+          },
+        ),
+        { seed, numRuns: 24 },
+      );
+      reach.assertReached();
+      console.log(
+        "OWNED_SCAN_REACH",
+        JSON.stringify({
+          seed,
+          campaign: "next-owned-scan-fallback",
+          states: Object.fromEntries(reach.counts()),
+        }),
+      );
+    },
+    120000,
+  );
+
+  it.each(seedsFor("next-owned-scan-dictionaries", [0xb2a9, 0xb2aa]))(
+    "dictionary charges and values survive source end until output release (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-owned-scan-dictionaries", [
+        "retained after end",
+        "retained after abort",
+        "dictionary output",
+      ] as const);
+      await fc.assert(
+        fc.asyncProperty(fc.integer({ min: 80, max: 200 }), fc.boolean(), async (n, cancel) => {
+          reach.beginHistory();
+          const space = new MemoryExtentSpace(),
+            rows = rowsOf(mulberry32(n), n, false).map((r, k) => ({
+              ...r,
+              t: `v${String(k % 3)}`,
+            }));
+          const table: TableSnapshot = {
+            tableId: 9,
+            schemaVersion: 1,
+            columns: DEFS,
+            segments: [await groupSegment(0, rows, new Set(), false, space)],
+            liveRowCount: n,
+          };
+          const opened: ChunkReader[] = [];
+          const reads: ChunkReads = {
+            open: (_p, c, o) =>
+              andThen(ChunkReader.open(space.view({ cache: true }), c, o), (r) => {
+                opened.push(r);
+                return r;
+              }),
+          };
+          const budget = counting(),
+            scan = scanOf(table, space, null, {
+              budget,
+              reads,
+              targetBytes: 512,
+              transferOutputs: "dictionary",
+            });
+          const first = await scan.next();
+          if (!first?.transfer?.detachableBuffers) throw new Error("No retained output");
+          expect(first.batch.columns.some((v) => v.form === "dictionary")).toBe(true);
+          reach.reach("dictionary output");
+          const dictionaryReaders = opened.filter((reader) => reader.dictionary !== null);
+          expect(dictionaryReaders.length).toBeGreaterThan(0);
+          const original = Array.from({ length: first.batch.length }, (_, r) =>
+            first.batch.columns.map((v) => normalize(valueAt(v, r))),
+          );
+          const dedicatedBytes = [...first.transfer.detachableBuffers].reduce(
+            (sum, b) => sum + b.byteLength,
+            0,
+          );
+          if (cancel) {
+            scan.abort();
+            reach.reach("retained after abort");
+          } else {
+            for (let item = await scan.next(); item !== null; item = await scan.next())
+              item.transfer?.release();
+            reach.reach("retained after end");
+          }
+          scan.close();
+          expect(dictionaryReaders.every((reader) => reader.dictionary !== null)).toBe(true);
+          expect(
+            opened.every((reader) =>
+              reader.directory.pages.every((_, page) => !reader.isLoaded(page)),
+            ),
+          ).toBe(true);
+          expect(budget.held).toBeGreaterThan(dedicatedBytes);
+          expect(
+            Array.from({ length: first.batch.length }, (_, r) =>
+              first.batch.columns.map((v) => normalize(valueAt(v, r))),
+            ),
+          ).toEqual(original);
+          first.transfer.release();
+          first.transfer.release();
+          expect(budget.held).toBe(0);
+          expect(dictionaryReaders.every((reader) => reader.dictionary === null)).toBe(true);
+        }),
+        { seed, numRuns: 12 },
+      );
+      reach.assertReached();
+      console.log(
+        "OWNED_SCAN_REACH",
+        JSON.stringify({
+          seed,
+          campaign: "next-owned-scan-dictionaries",
+          states: Object.fromEntries(reach.counts()),
+        }),
+      );
+    },
+    120000,
+  );
+
   /** A 150,000-byte grant (no growth beyond it) and its loans, counted. */
   async function grantOf(): Promise<{
     governor: Governor;
@@ -1101,6 +1636,92 @@ describe("review B4-p2c-3: loans under the real governor", () => {
     };
     return { rows, table };
   }
+
+  it.each(seedsFor("next-owned-scan-loans", [0xb2a7, 0xb2a8]))(
+    "detached loan-backed output holds its credit until release (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-owned-scan-loans", [
+        "wait for output release",
+        "normal progress",
+        "abort with retained output",
+        "detached output",
+      ] as const);
+      await fc.assert(
+        fc.asyncProperty(fc.integer({ min: 2, max: 4 }), fc.boolean(), async (count, cancel) => {
+          reach.beginHistory();
+          const space = new MemoryExtentSpace(),
+            { table, rows } = await hugeRows(space, count);
+          const { governor, grant, loans, counts } = await grantOf();
+          const scan = scanOf(table, space, null, {
+            budget: grant,
+            loans,
+            targetBytes: 65536,
+            transferOutputs: true,
+          });
+          const first = await scan.next();
+          if (!first?.transfer?.detachableBuffers) throw new Error("Missing dedicated output");
+          expect(first.batch.length).toBe(1);
+          expect(grant.loaned).toBeGreaterThan(0);
+          const buffers = [...first.transfer.detachableBuffers];
+          const copied = structuredClone(first.batch, { transfer: buffers });
+          expect(copied.columns.map((v) => normalize(valueAt(v, 0)))).toEqual(
+            expectedRow(at(rows, 0), false),
+          );
+          expect(buffers.every((b) => b.byteLength === 0)).toBe(true);
+          reach.reach("detached output");
+          let settled = false;
+          const pending = Promise.resolve(scan.next()).then((x) => {
+            settled = true;
+            return x;
+          });
+          await Promise.resolve();
+          await Promise.resolve();
+          expect(settled).toBe(false);
+          expect(counts.borrowed).toBe(1);
+          expect(counts.repaid).toBe(0);
+          reach.reach("wait for output release");
+          if (cancel) {
+            scan.abort();
+            expect(await pending).toBeNull();
+            expect(grant.allocated).toBeGreaterThan(0);
+            expect(grant.loaned).toBeGreaterThan(0);
+            first.transfer.release();
+            reach.reach("abort with retained output");
+          } else {
+            first.transfer.release();
+            first.transfer.release();
+            let item = await pending,
+              k = 1;
+            while (item !== null) {
+              expect(item.batch.columns.map((v) => normalize(valueAt(v, 0)))).toEqual(
+                expectedRow(at(rows, k++), false),
+              );
+              item.transfer?.release();
+              item = await scan.next();
+            }
+            expect(k).toBe(count);
+            reach.reach("normal progress");
+          }
+          scan.close();
+          expect(counts.repaid).toBe(counts.borrowed);
+          expect([grant.allocated, grant.loaned]).toEqual([0, 0]);
+          grant.close();
+          expect(governor.usedBytes).toBe(0);
+        }),
+        { seed, numRuns: 12 },
+      );
+      reach.assertReached();
+      console.log(
+        "OWNED_SCAN_REACH",
+        JSON.stringify({
+          seed,
+          campaign: "next-owned-scan-loans",
+          states: Object.fromEntries(reach.counts()),
+        }),
+      );
+    },
+    120000,
+  );
 
   it("1. a rejected oversized row gives its working set back and repays before the next", async () => {
     const space = new MemoryExtentSpace();
