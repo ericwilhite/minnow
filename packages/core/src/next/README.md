@@ -1541,7 +1541,12 @@ still detaches locally, and never sends its capabilities to the replacement conn
 Each connection creates its return pool lazily on its first export. It is charged to that owner's
 governor, capped at 4 MiB (twice the default credit window, regardless of larger user prefetch),
 and closed on connection teardown. Capabilities are one-use and bounded; expired, duplicate,
-foreign, detached or wrong-sized returns are dropped. No lost return is awaited. Client-held
+unknown-capability, detached or wrong-sized returns are dropped. This is a cooperative-client
+contract: a valid capability, original sender detachment and an exact size establish protocol
+provenance, not physical backing-store identity. A compromised receiver can return a different
+same-sized buffer with an unused valid capability. Real transfers still detach released views,
+and reused storage is cleared, but the pool cannot authenticate that it received the original
+backing store. No lost return is awaited. Client-held
 frames after credit are client memory: the cap bounds returned idle buffers, not arbitrary caller
 retention. A terminal full-table export can use the larger 2 MiB target and decode directly into
 exclusive returned output. SQL's names-only identity projection forwards that ownership and keeps
