@@ -143,7 +143,7 @@ import {
   type MergePlan,
   type MergePolicy,
 } from "./merge.js";
-import { taskClock, yieldTask } from "../exec/pipeline.js";
+import { taskClock, yieldTask } from "../task.js";
 import { GroupDirectory } from "./groups.js";
 import {
   GroupDeletes,
@@ -2708,6 +2708,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const delta = new DeltaPublication(
       "stage",
       this.#extentDeltas,
+      this.#lists,
       this.#nextAttempt,
       this.#afterDeltaPrepared,
       this.#sinkFailed,
@@ -4160,8 +4161,8 @@ class DeltaPublication {
     let prepared: ExtentDeltaResult;
     try {
       prepared = await this.lists.prepare(attempt, {
-        added: [...writer.extents],
-        released: [...retired],
+        added: writer.extents,
+        released: retired,
         writer,
       });
     } catch (error) {
@@ -4176,8 +4177,8 @@ class DeltaPublication {
       let result: ExtentDeltaResult | null;
       try {
         result = await this.sink.prepare(attempt, {
-          added: [...writer.extents],
-          released: [...retired],
+          added: writer.extents,
+          released: retired,
           writer,
         });
       } catch (error) {

@@ -1418,3 +1418,7 @@ quiescence, physical/list audit, schema and complete-batch-prefix checks, and fi
 probes. It preserves the canonical 50,000-row transactions and generator values. The report
 records the load budget and resumed row count. A failed 256 MiB load is a separate result and
 is not treated as successful completion within that cap when loading continues at 512 MiB.
+
+R25 delta preparation reserves its copy workspace before reading inputs and checks the shared
+clock and cancellation every 128 entries while copying. The write-path adapter passes its
+owned vectors directly; it does not make unsliced integration copies.

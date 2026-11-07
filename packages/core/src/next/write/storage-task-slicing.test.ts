@@ -340,3 +340,47 @@ it("preserves free-map overlap refusal and duplicate handling", async () => {
     ]),
   ).rejects.toBeInstanceOf(RangeError);
 });
+
+for (const field of ["added", "released"] as const)
+  it(`yields and cancels during ${field} input copying`, async () => {
+    let time = 0;
+    let copied = 0;
+    const input = new Proxy(added(), {
+      get(target, key, receiver) {
+        if (typeof key === "string" && /^\d+$/u.test(key)) {
+          copied++;
+          time += 0.01;
+        }
+        return Reflect.get(target, key, receiver) as unknown;
+      },
+    });
+    const space = new MemoryExtentSpace();
+    const charged = countingBudget(8 << 20);
+    const controller = new AbortController();
+    const reason = new Error("cancel during input copy");
+    const keeper = new ExtentListKeeper([], {
+      reader: space,
+      budget: charged,
+      clock: new TaskClock(() => time),
+      signal: controller.signal,
+      yieldTask: async () => {
+        expect(copied).toBeGreaterThan(0);
+        expect(copied).toBeLessThanOrEqual(512);
+        expect(charged.used).toBeGreaterThan(0);
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        controller.abort(reason);
+      },
+    });
+    try {
+      await expect(
+        keeper.prepare(1, {
+          added: field === "added" ? input : [],
+          released: field === "released" ? input : [],
+          writer: space.beginWrite("copy cancel"),
+        }),
+      ).rejects.toBe(reason);
+      expect(charged.used).toBe(0);
+    } finally {
+      keeper.close();
+    }
+  });

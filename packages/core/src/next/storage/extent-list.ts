@@ -412,8 +412,26 @@ export class ExtentListKeeper {
     reserve(this.#budget, charge);
     let retained = 0;
     try {
-      const added = [...delta.added];
-      const released = [...delta.released];
+      // The reservation above includes both copies. Check the shared deadline while reading
+      // caller-owned inputs too: a later sliced sort cannot bound this preceding work.
+      const copy = async (input: readonly ExtentRef[]) => {
+        const result: ExtentRef[] = [];
+        for (let start = 0; start < input.length; start += 128) {
+          const pending = pauseIfDue(this.#work);
+          if (pending !== undefined) await pending;
+          const end = Math.min(start + 128, input.length);
+          for (let at = start; at < end; at++) {
+            const extent = input[at];
+            if (extent === undefined) throw new RangeError("Extent delta requires dense inputs");
+            result.push(extent);
+          }
+        }
+        const pending = pauseIfDue(this.#work);
+        if (pending !== undefined) await pending;
+        return result;
+      };
+      const added = await copy(delta.added);
+      const released = await copy(delta.released);
       await sortInSlices(added, byOffset, this.#work);
       await sortInSlices(released, byOffset, this.#work);
       const out: ExtentListPage[] = [];
