@@ -133,6 +133,10 @@ const metadata = {
   sourceHashes: Object.fromEntries(
     await Promise.all(
       [
+        resolve("scripts/next-executor-bench.mts"),
+        resolve("scripts/next-executor-components.mts"),
+        resolve("scripts/next-late-fetch-component.mts"),
+        resolve("scripts/next-aggregation-components.mts"),
         generatorPath,
         cataloguePath,
         resolve("apps/site/bench/benchmark.ts"),
@@ -583,6 +587,22 @@ try {
   }
   await writeFile(join(cache, "baseline.json"), JSON.stringify({ ...metadata, records }, null, 2));
   // Run components only AFTER whole-query timing/profile, so their extra warmups cannot bias it.
+  if (option("--component", "") === "aggregation") {
+    const { aggregationComponents } = await import(
+      pathToFileURL(resolve("scripts/next-aggregation-components.mts")).href
+    );
+    const components = await aggregationComponents(
+      core,
+      rounds,
+      queries.map((query) => ({
+        id: query.id,
+        sql: catalogue.sqlFor(query, "minnow", total),
+      })),
+    );
+    await writeFile(join(cache, "component-aggregation.json"), JSON.stringify(components, null, 2));
+    console.log(JSON.stringify(components));
+  }
+
   if (option("--component", "") === "scan-limit") {
     const { scanLimitComponent } = await import(
       pathToFileURL(resolve("scripts/next-executor-components.mts")).href

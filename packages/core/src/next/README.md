@@ -1294,6 +1294,13 @@ times the prepared scan/sort/fetch/frame pipeline. `--whole-compare late-fetch -
 compares cached and one-pass winner reads and also isolates LateFetchOperator plus ordinal
 restoration, with selection and result frames outside that component's timed samples.
 These are Node measurements.
+For aggregation, `--only agg_highcard_int,agg_3dims_20aggs,agg_count_distinct --component aggregation`
+rotates five or more CPU rounds over the stored scan/project feed, aggregation over an exact
+cloned input fixture, and the prepared full pipeline with owned result frames. The report
+records the referenced scan columns, forms of input vectors, batch sizes and frame counts.
+Input copying is outside the timed samples. The three costs are diagnostic rather than
+additive: their sinks, downstream sorting and cache/GC interactions differ. This Node adapter
+calls the executor directly; it does not measure owner worker transport.
 Unbounded, value-producing `indexRange` nodes require the same internal `keyOrder:true`
 diagnostic opt-in as SQL until the charged streaming cursor lands. The default executor
 refuses them at prepare with `UnsupportedPlanError`, including under LIMIT zero. Opted-in
