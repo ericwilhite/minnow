@@ -159,3 +159,27 @@ it("sizes once from the run count with bounded headroom", () => {
   expect(runArenaBytes(Number.MAX_SAFE_INTEGER)).toBe(MAX_RUN_ARENA_BYTES);
   expect(() => runArenaBytes(-1)).toThrow(RangeError);
 });
+
+it("copies a temporary borrowed reconstruction without retaining its slab or returning its charge", async () => {
+  const slab = new Uint8Array(1024 * 1024),
+    backing = slab.subarray(384 * 1024, 640 * 1024);
+  const source = BoundedFreeSpaceMap.borrow(64, backing);
+  source.startRebuild(100_000 * 128);
+  for (let at = 0; at < 100_000; at++) source.releaseKnownAllocated(at * 128, 64);
+  const budget = countingBudget(MAX_RUN_ARENA_BYTES),
+    target = BoundedFreeSpaceMap.create(64, MAX_RUN_ARENA_BYTES, budget);
+  try {
+    await target.copyFrom(source);
+    expect(target.runs()).toEqual(source.runs());
+    expect(target.untrackedFreeBytes).toBe(source.untrackedFreeBytes);
+    source.close();
+    slab.fill(0);
+    expect(target.runCount).toBe(target.capacity);
+    expect(target.untrackedFreeBytes).toBeGreaterThan(0);
+    expect(target.allocate(64)).toBe(0);
+  } finally {
+    source.close();
+    target.close();
+  }
+  expect(budget.used).toBe(0);
+});

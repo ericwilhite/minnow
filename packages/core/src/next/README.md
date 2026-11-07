@@ -1990,6 +1990,23 @@ trimming consumes one old record response at a time and writes slices of at most
 These I/O limits make the journal inventory enforceable; they do not authorize
 retirement or replace the live-space integration tests.
 
+### Slab-backed reconstruction components
+
+The capped free-run arena can borrow a temporary typed view of the paid read
+slab, then copy its bounded tracked runs into one admitted lifetime arena.
+Copying checks the shared task clock in 128-run chunks. The existing ordinary
+charge transfers atomically to the cache owner; publication never grows it.
+A borrowed temporary arena returns no slab charge when closed.
+
+`storage/native-extent-list.ts` decodes payload pages through a 192 KiB view of
+that slab. It reads up to two nearby pages together, verifies each checksum,
+header, coordinate and cross-page order, then exposes one scalar offset/length
+pair at a time. It creates no decoded per-extent objects. Between page reads and
+shared-clock yields, iteration is synchronous. The input page descriptors stay
+with their admitted caller. These components still need the live ticket and
+space composition below; they do not make lossy-map complement into ownership
+proof.
+
 ### R25 startup measurement
 
 `MINNOW_NEXT_STORAGE_REOPEN=1` enables the Chromium storage reopen lane in

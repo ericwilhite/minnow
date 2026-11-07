@@ -1213,3 +1213,10 @@ export const OWNER_EXPORT_DATA_REACH = {
   views: ["first view partial", "later alias partial"],
   preconnect: ["close before connect", "cancel before connect", "concurrent next refused"],
 } as const;
+
+/** Native R25 list pages are decoded from paid slab views, without per-extent objects. */
+export const NATIVE_EXTENT_LIST_REACH = [
+  "full safe integer offsets",
+  "coalesced page reads",
+  "synchronous scalar pairs",
+] as const;

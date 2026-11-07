@@ -1674,6 +1674,15 @@ share the paid slab and cannot become native write buffers. These checks cover
 managed/native callback lifetimes, not browser allocator or garbage-collector
 retention after a callback returns.
 
+Slab-backed list-cursor histories verify high coordinates, page coalescing and
+scalar results against an independent sequence. Malformed headers, checksums,
+first offsets, overlaps and past-end coordinates fail. An injected shared clock
+services a real timer and cancels within the first 512 entries even when reads
+resolve immediately. Arena-copy tests count typed-array elements at the yield,
+cancel partway through copying and retry with the same reservation. A full
+ordinary governor must transfer the arena's existing charge without a second
+admission; source and lifetime owners return exactly their own bytes.
+
 ### Rebuild storage step-down regression
 
 The storage campaign stops its workload inside the worker, drains admitted operations, closes

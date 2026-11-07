@@ -3,7 +3,13 @@
  * ownership-transition barrier. Releases require root/writer provenance under that barrier.
  * With releases blocked, concurrent reservations can only shrink the tracked free pool.
  */
-import { ReadDeniedError, type ByteBudget } from "./extents.js";
+import { pauseIfDue, type TaskWork } from "../task.js";
+import {
+  ReadDeniedError,
+  type ByteBudget,
+  type CacheMemory,
+  type OpenSpaceOptions,
+} from "./extents.js";
 
 export const MIN_RUN_ARENA_BYTES = 32 * 1024;
 export const MAX_RUN_ARENA_BYTES = 256 * 1024;
@@ -24,6 +30,8 @@ export class BoundedFreeSpaceMap {
   #untracked = 0;
   #closed = false;
   #smallest = -1;
+  #budget: ByteBudget | null;
+  #memory: CacheMemory | null = null;
   static create(align: number, arenaBytes: number, budget: ByteBudget): BoundedFreeSpaceMap {
     if (!Number.isSafeInteger(align) || align <= 0) throw new RangeError("Bad alignment");
     if (
@@ -43,9 +51,79 @@ export class BoundedFreeSpaceMap {
   private constructor(
     readonly align: number,
     readonly arenaBytes: number,
-    readonly budget: ByteBudget,
+    budget: ByteBudget | null,
+    backing?: Uint8Array,
   ) {
-    this.#pairs = new Float64Array(2 * Math.floor((arenaBytes - HEADERS) / 16));
+    this.#budget = budget;
+    const length = 2 * Math.floor((arenaBytes - HEADERS) / 16);
+    this.#pairs =
+      backing === undefined
+        ? new Float64Array(length)
+        : new Float64Array(backing.buffer, backing.byteOffset, length);
+  }
+  /** Temporary startup builder, borrowing an exclusively held prepaid read slab. */
+  static borrow(align: number, backing: Uint8Array): BoundedFreeSpaceMap {
+    if (
+      !Number.isSafeInteger(align) ||
+      align <= 0 ||
+      backing.byteOffset % 8 !== 0 ||
+      backing.byteLength < MIN_RUN_ARENA_BYTES ||
+      backing.byteLength > MAX_RUN_ARENA_BYTES
+    )
+      throw new RangeError("Invalid borrowed run arena");
+    return new BoundedFreeSpaceMap(align, backing.byteLength, null, backing);
+  }
+  get bytes(): number {
+    return this.#closed || (this.#budget === null && this.#memory === null) ? 0 : this.arenaBytes;
+  }
+  readonly evictableBytes = 0;
+  evict(): number {
+    return 0;
+  }
+  /** No publication admission: this open-time charge changes owner atomically. */
+  transfer(register: OpenSpaceOptions["registerCache"]): void {
+    if (this.#closed || this.#budget === null || this.#memory !== null)
+      throw new TypeError("Arena has no transferable charge");
+    const memory = register(this);
+    const moved =
+      memory.takeFrom === undefined
+        ? memory.charge(this.arenaBytes)
+        : memory.takeFrom(this.#budget, this.arenaBytes);
+    if (!moved) {
+      memory.unregister?.();
+      throw new ReadDeniedError(this.arenaBytes);
+    }
+    if (memory.takeFrom === undefined) this.#budget.free(this.arenaBytes);
+    this.#budget = null;
+    this.#memory = memory;
+  }
+  /** One sequential rebuild; callers have validated every gap from the immutable root union. */
+  startRebuild(end: number): void {
+    this.#usable();
+    this.#check(end);
+    if (this.#end !== 0 || this.#count !== 0) throw new TypeError("Arena is not empty");
+    this.#end = end;
+  }
+  /** Gap copying borrows the old paid slab, so no old/new retained backing overlap is needed. */
+  async copyFrom(source: BoundedFreeSpaceMap, work?: TaskWork): Promise<void> {
+    this.#usable();
+    source.#usable();
+    if (source.#count > this.capacity || this.#end !== 0 || this.#count !== 0)
+      throw new RangeError("Cannot copy run arena");
+    for (let at = 0; at < source.#count; at += 128) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+      this.#pairs.set(
+        source.#pairs.subarray(at * 2, Math.min(source.#count, at + 128) * 2),
+        at * 2,
+      );
+    }
+    const pending = pauseIfDue(work);
+    if (pending !== undefined) await pending;
+    this.#count = source.#count;
+    this.#end = source.#end;
+    this.#untracked = source.#untracked;
+    this.#smallest = -1;
   }
   get capacity(): number {
     return this.#pairs.length / 2;
@@ -238,7 +316,11 @@ export class BoundedFreeSpaceMap {
       this.#closed = true;
       this.#pairs = EMPTY;
       this.#count = 0;
-      this.budget.free(this.arenaBytes);
+      this.#budget?.free(this.arenaBytes);
+      this.#memory?.release(this.arenaBytes);
+      this.#memory?.unregister?.();
+      this.#budget = null;
+      this.#memory = null;
     }
   }
 }
