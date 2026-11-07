@@ -1644,3 +1644,10 @@ The owner idle-timeout regression keeps MessagePort delivery native and advances
 clock. It holds a cursor window open for 100 ms with a 20 ms idle limit, then separately checks
 the 19/20 ms boundary after the terminal reply and final frame release. Sleeping after the last
 frame tests an idle gap between requests, not whether a running request is protected.
+
+The owner hidden-flush test disables automatic lifecycle relays only in its fixture and uses an
+explicit hidden event in the positive case. A same-worker FIFO checkpoint observes existing
+saves without starting one. The control confirms zero saves and zero durable LSN, then both
+cases terminate the worker before closing the tab. Loss is required only for this fixture's
+unsaved JavaScript state; relaxed durability does not require data loss. Ordinary tab teardown
+can process hidden/pagehide or graceful close and flush, with browser-dependent scheduling.

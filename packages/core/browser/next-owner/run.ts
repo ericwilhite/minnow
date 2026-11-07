@@ -19,6 +19,7 @@ interface Opened {
   readonly connector: OwnerConnector;
   readonly state: {
     superseded: boolean;
+    worker: Worker | null;
     stepDowns: Array<{ stepDownMs: number; reloadSuggested: boolean }>;
   };
 }
@@ -35,6 +36,8 @@ export interface OpenOptions {
   readonly protocol?: number;
   readonly settings?: Readonly<Record<string, unknown>>;
   readonly mobile?: boolean;
+  /** Fixture-only: suppress automatic visibility/pagehide relays; explicit lifecycle still works. */
+  readonly relayLifecycle?: boolean;
 }
 
 /** This page's Web Lock calls (the connector's), for the latency lane. */
@@ -75,10 +78,7 @@ export async function lockCalls(): Promise<{
 
 export async function open(name: string, options: OpenOptions = {}): Promise<{ hosting: boolean }> {
   const mobile = options.mobile ?? false;
-  const state = {
-    superseded: false,
-    stepDowns: [] as Array<{ stepDownMs: number; reloadSuggested: boolean }>,
-  };
+  const state: Opened["state"] = { superseded: false, worker: null, stepDowns: [] };
   const client = new ProtocolClient(
     options.protocol === undefined ? {} : { protocol: options.protocol },
   );
@@ -96,6 +96,7 @@ export async function open(name: string, options: OpenOptions = {}): Promise<{ h
         const worker = new Worker(new URL("./owner-worker.ts", import.meta.url), {
           type: "module",
         });
+        state.worker = worker;
         worker.addEventListener("message", (event: MessageEvent) => {
           const status = event.data as {
             t: string;
@@ -124,7 +125,7 @@ export async function open(name: string, options: OpenOptions = {}): Promise<{ h
       state.superseded = true;
     },
   });
-  relayPageLifecycle(connector, window);
+  if (options.relayLifecycle !== false) relayPageLifecycle(connector, window);
   opened = { name, client, connector, state };
   await connector.start();
   return { hosting: connector.hosting };
@@ -251,6 +252,47 @@ export async function settle(key: string) {
   } catch (error) {
     return errorOf(error);
   }
+}
+
+/** Fixture crash: terminate before disabling connector retries; never drain/close a live worker. */
+export function crashOwner(): void {
+  const { connector, state } = current();
+  if (!connector.hosting || state.worker === null) throw new Error("Page is not hosting an owner");
+  state.worker.terminate();
+  state.worker = null;
+  connector.close();
+}
+
+/** Same-worker FIFO checkpoint after an explicit lifecycle command; never initiates a flush. */
+export function durabilityCheckpoint(): Promise<{
+  appliedLsn: number;
+  durableLsn: number;
+  flushes: number;
+}> {
+  const worker = current().state.worker;
+  if (worker === null) throw new Error("Page is not hosting an owner");
+  const nonce = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    const receive = (event: MessageEvent) => {
+      const reply = event.data as {
+        t?: string;
+        nonce?: string;
+        state: { appliedLsn: number; durableLsn: number; flushes: number };
+        error?: string;
+      };
+      if (reply.t !== "minnow-test:durability" || reply.nonce !== nonce) return;
+      clearTimeout(timer);
+      worker.removeEventListener("message", receive);
+      if (reply.error !== undefined) reject(new Error(reply.error));
+      else resolve(reply.state);
+    };
+    const timer = setTimeout(() => {
+      worker.removeEventListener("message", receive);
+      reject(new Error("Durability checkpoint did not answer"));
+    }, 5_000);
+    worker.addEventListener("message", receive);
+    worker.postMessage({ t: "minnow-test:durability", nonce });
+  });
 }
 
 export function lifecycle(event: LifecycleEvent): void {
