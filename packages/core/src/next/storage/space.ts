@@ -537,7 +537,8 @@ class Space implements ExtentSpace {
 
   // ── Reading ──────────────────────────────────────────────────────────────────────────────────
 
-  read(refs: readonly BlobRef[], options: ReadOptions): Promise<ReadLease> {
+  async read(refs: readonly BlobRef[], options: ReadOptions): Promise<ReadLease> {
+    this.cleanupAllowed();
     return this.#cache.read(refs, options);
   }
 
@@ -1029,6 +1030,7 @@ class Space implements ExtentSpace {
     await this.writeLock.run(async () => undefined);
     await this.settled();
     await this.#mutations.run(async () => undefined);
+    await this.#cache.settled();
     this.#closed = true;
     this.#cache.close();
     this.retainedMemory.close();

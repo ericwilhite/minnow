@@ -1948,9 +1948,12 @@ retirement tickets still use the existing implementation until integration.
 ### Prepaid metadata journal
 
 `storage/metadata-journal.ts` adds a private page-chain primitive with a 512 KiB
-workspace reservation. Source phases expose three 60 KiB frames; merge/reclaim
-phases expose four. The inventory includes a native read response, bounded
-control objects and up to 256 release-range objects. Callers serialize workspace
+workspace reservation. Source phases expose three 60 KiB frames; merge phases
+expose four, and native-release phases expose two. The inventory includes one
+256 KiB native record response, one bounded 60 KiB boundary copy and bounded
+release-range vectors. Six read-only metadata views and raw-list cursor windows
+can borrow the separately prepaid 1 MiB read slab. Native metadata writes still
+require standalone whole-buffer frames. Callers serialize workspace
 use before taking the mutation barrier, and never overlap source and reclaim
 phases. Frames and their borrowed slices cannot escape a phase. Journal cursors
 and writers retain scalar slots and phase identities, rather than old buffers.
@@ -1978,6 +1981,14 @@ eligibility, bounded data-range release and live publication still need their
 separate integration; these components alone do not establish the whole-space
 memory bound or repair the rejected compact branch. Sorting a candidate does
 not authorize it against roots, writers or the lossy map's complement.
+
+The fixed read slab is allocated only after its cache charge succeeds. A borrowed
+slab scope serializes with ordinary cache misses and drains before close returns
+its charge. Raw-list reads request IndexedDB records sequentially. Boundary
+trimming consumes one old record response at a time and writes slices of at most
+60 KiB, preserving the existing byte-record encoding and transaction atomicity.
+These I/O limits make the journal inventory enforceable; they do not authorize
+retirement or replace the live-space integration tests.
 
 ### R25 startup measurement
 

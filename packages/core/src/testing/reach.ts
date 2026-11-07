@@ -92,6 +92,16 @@ export const STORAGE_MUTATION_REACH = [
   "audit after interleaving",
 ] as const;
 
+/** Native record clipping and list reads stay inside the prepaid response/copy allowance. */
+export const STORAGE_BOUNDED_IO_REACH = [
+  "one boundary response",
+  "bounded copy",
+  "serial record read",
+  "outside bytes preserved",
+  "lazy",
+  "eager",
+] as const;
+
 /** Full-scan shared windows: the default and override must cover cold and resident reads. */
 export const SCAN_WINDOW_RESIDENCY_REACH = [
   "default cold",

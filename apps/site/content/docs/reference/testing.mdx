@@ -1663,6 +1663,17 @@ acknowledges receiving ready, then resumes it. Native file/range and logical cal
 The first statistics-only count can overlap the resumed maintenance. Standalone write-path opens
 still schedule their maintenance automatically; owner composition supplies the ready lifecycle.
 
+Bounded-storage I/O histories independently count pending IndexedDB record gets,
+callback response bytes and output-copy lengths in eager and lazy index modes.
+Random two-boundary trims must retain all outside bytes, survive reopen and
+roll back an already trimmed first boundary if the second is corrupt. Raw reads
+must have one pending data-record request; boundary copies stay at most 60 KiB.
+A constructor probe requires fixed-slab admission before allocation, and a held
+borrowed view must serialize ordinary cache reads. Borrowed metadata frames
+share the paid slab and cannot become native write buffers. These checks cover
+managed/native callback lifetimes, not browser allocator or garbage-collector
+retention after a callback returns.
+
 ### Rebuild storage step-down regression
 
 The storage campaign stops its workload inside the worker, drains admitted operations, closes

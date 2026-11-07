@@ -30,8 +30,10 @@ const EMPTY: Uint8Array[] = [];
  * W inventory (all bounded before any chain exists):
  * - source phase: three 60 KiB frames, a 64 KiB+16 raw list, one native data response <=256 KiB,
  *   8 KiB of bounded descriptors/views/control state: 520,208 bytes;
- * - merge/reclaim phase: four 60 KiB frames, one 60 KiB native metadata response, <=256 range
- *   objects at 80 bytes, and 8 KiB control state: 335,872 bytes.
+ * - native-list merge: four 60 KiB frames, one 256 KiB native response and 8 KiB control state:
+ *   516,096 bytes. Raw list cursor views borrow the separately charged read slab (S).
+ * - release phase: two 60 KiB frames, one 256 KiB native response, one <=60 KiB boundary copy,
+ *   three bounded vectors of <=256 ranges at 80 bytes, and 8 KiB control: 516,096 bytes.
  * The remaining allowance is headroom, not capacity for an O(extents) collection. The caller
  * must not overlap source reads with the merge/reclaim phase or escape a phase's frame views.
  * Native storage contents and unreachable GC garbage are not resident managed buffers.
@@ -43,6 +45,7 @@ export class MetadataWorkspace {
   #frames = EMPTY;
   #active = false;
   #borrowed = 0;
+  #readOnly = 0;
   #closed = false;
   #epoch = 0;
   get epoch(): number {
@@ -77,18 +80,19 @@ export class MetadataWorkspace {
     this.#memory = memory;
   }
   /** The external workspace lock must already be held; this method never queues or waits. */
-  async run<T>(phase: "source" | "merge", work: () => Promise<T>): Promise<T> {
+  async run<T>(phase: "source" | "merge" | "release", work: () => Promise<T>): Promise<T> {
     if (this.#active || this.#closed) throw new TypeError("Workspace busy or closed");
     this.#active = true;
     this.#epoch++;
     try {
-      const count = phase === "source" ? 3 : 4;
+      const count = phase === "source" ? 3 : phase === "merge" ? 4 : 2;
       this.#frames = Array.from({ length: count }, () => new Uint8Array(METADATA_PAGE_BYTES));
       return await work();
     } finally {
       // Drop all references before a different phase allocates its frames: no old/new overlap.
       this.#frames = EMPTY;
       this.#borrowed = 0;
+      this.#readOnly = 0;
       this.#active = false;
     }
   }
@@ -97,13 +101,65 @@ export class MetadataWorkspace {
     if (!this.#active || frame === undefined) throw new TypeError("No prepaid frame in this phase");
     return frame;
   }
-  claim(index: number): Uint8Array {
+  claim(index: number, wholeBufferWrite = false): Uint8Array {
     const frame = this.frame(index);
+    if (wholeBufferWrite && (this.#readOnly & (1 << index)) !== 0)
+      throw new TypeError("A borrowed read frame cannot be used for a metadata writer");
     if (index === 0 || (this.#borrowed & (1 << index)) !== 0)
       throw new TypeError("Metadata frame is already borrowed");
     this.#borrowed |= 1 << index;
     return frame;
   }
+  /** Up to six read-only metadata views can borrow the already charged read slab (S).
+   * Caller holds PageCache.withReadSlab until this callback and all its cursors finish.
+   * The views allocate no backing stores; native writes still require an owned whole frame.
+   */
+  async withReadFrames<T>(
+    frames: readonly Uint8Array[],
+    work: (first: number) => Promise<T>,
+  ): Promise<T> {
+    if (!this.#active || this.#readOnly !== 0 || frames.length > 6)
+      throw new TypeError("Invalid read-frame scope");
+    const first = this.#frames.length;
+    for (let index = 0; index < frames.length; index++) {
+      const frame = frames[index];
+      if (frame === undefined) throw new TypeError("Missing read frame");
+      if (
+        frame.byteLength !== METADATA_PAGE_BYTES ||
+        frame.buffer.byteLength !== 1024 * 1024 ||
+        frame.byteOffset % 8 !== 0
+      )
+        throw new TypeError("Read frames must be views of the prepaid read slab");
+      if (frame.buffer !== frames[0]?.buffer)
+        throw new TypeError("Read frames must share one prepaid slab");
+      for (let prior = 0; prior < index; prior++) {
+        const before = frames[prior];
+        if (
+          before !== undefined &&
+          before.byteOffset < frame.byteOffset + frame.length &&
+          frame.byteOffset < before.byteOffset + before.length
+        )
+          throw new TypeError("Read frames overlap");
+      }
+    }
+    this.#frames.push(...frames);
+    const mask = ((1 << frames.length) - 1) << first;
+    this.#readOnly = mask;
+    let leaked: boolean;
+    let value: T;
+    try {
+      value = await work(first);
+    } finally {
+      leaked = (this.#borrowed & mask) !== 0;
+      this.#borrowed &= ~mask;
+      this.#frames.length = first;
+      this.#readOnly = 0;
+    }
+    if (leaked)
+      throw new TypeError("Borrowed metadata cursors must close before returning the slab");
+    return value;
+  }
+
   assertFrame(frame: Uint8Array): void {
     if (!this.#active || !this.#frames.includes(frame))
       throw new TypeError("Frame escaped its workspace phase");
@@ -293,7 +349,7 @@ export class MetadataJournal {
   async writer(slot: number, tag = 0): Promise<ChainWriter> {
     if (slot === 0) throw new RangeError("Frame zero belongs to the journal");
     if (!safe(tag)) throw new RangeError("Invalid chain tag");
-    const frame = this.workspace.claim(slot);
+    const frame = this.workspace.claim(slot, true);
     try {
       const handle = await this.allocate();
       initialize(frame, DATA);

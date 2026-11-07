@@ -177,6 +177,12 @@ export interface MetadataStore {
   reset(): Promise<void>;
 }
 
+/** Raw data reads used by the prepaid list cursors. */
+export interface ReadDataOptions {
+  /** Issue record gets in callback order, so at most one native data response is live. */
+  readonly serialRecords?: boolean;
+}
+
 /** `StoreSession.writeData` options. */
 export interface WriteDataOptions {
   /** The caller hands the bytes' buffer over (see `writeData`). */
@@ -302,7 +308,7 @@ export interface StoreSession {
    * cache reads coalesced slabs into one reused buffer this way. Throws `StoreCorruptionError` past
    * the data length.
    */
-  readDataInto(offset: number, target: Uint8Array): Promise<void>;
+  readDataInto(offset: number, target: Uint8Array, options?: ReadDataOptions): Promise<void>;
   /** Guarantee 5. */
   releaseData(ranges: readonly DataRange[]): Promise<void>;
   /** Bytes in the data space (the allocator's high-water mark on open). */

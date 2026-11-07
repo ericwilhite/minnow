@@ -57,6 +57,7 @@ import {
   LOG_HEADER_SLOT_BYTES,
   METADATA_PAGE_BYTES,
   type MetadataStore,
+  type ReadDataOptions,
   OwnershipLostError,
   ReleaseUnsettledError,
   StoreClosedError,
@@ -803,11 +804,11 @@ class IdbSession implements StoreSession {
     return results;
   }
 
-  async readDataInto(offset: number, target: Uint8Array): Promise<void> {
+  async readDataInto(offset: number, target: Uint8Array, options?: ReadDataOptions): Promise<void> {
     this.#live();
     this.#checkData(offset, target.length);
     await this.#read([this.#data.name, this.#data.indexName], (tx) => {
-      this.#data.read(tx, offset, target, () => undefined);
+      this.#data.read(tx, offset, target, () => undefined, options?.serialRecords === true);
     });
   }
 

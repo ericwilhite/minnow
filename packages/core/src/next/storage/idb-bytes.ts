@@ -51,6 +51,8 @@ import type { IdbDatabaseLike, IdbKey, IdbTransactionLike } from "./idb-like.js"
 
 /** Records are at most this long (writes are split). */
 export const IDB_RECORD_BYTES = 256 * 1024;
+/** One transient boundary copy, covered by the extent space's prepaid I/O workspace. */
+export const IDB_BOUNDARY_BYTES = 60 * 1024;
 /** Index entries per block. */
 export const INDEX_BLOCK = 512;
 /**
@@ -596,10 +598,15 @@ export class ByteStore {
       next();
       return;
     }
-    // Each straddling record keeps its parts outside the range. Both gets are issued before
-    // either record is rewritten, and requests run in issue order, so each sees its record whole.
-    let left = straddling.length;
-    for (const record of straddling)
+    // Boundary responses are consumed one at a time; output slices are bounded independently
+    // of the record size. All bytes/keys remain in this transaction, so interruption is atomic.
+    let at = 0;
+    const visit = () => {
+      const record = straddling[at++];
+      if (record === undefined) {
+        next();
+        return;
+      }
       tx.store(this.name).get(record.start, (value) => {
         const bytes = (value as StoredRecord | undefined)?.bytes;
         if (!(bytes instanceof ArrayBuffer) || bytes.byteLength !== record.end - record.start)
@@ -607,11 +614,26 @@ export class ByteStore {
         tx.store(this.name).delete(record.start);
         tx.store(this.indexName).delete(record.start);
         this.#removeStarts(record.start, record.start);
-        if (record.start < start) this.#put(tx, record.start, bytes.slice(0, start - record.start));
-        if (record.end > end) this.#put(tx, end, bytes.slice(end - record.start));
-        left -= 1;
-        if (left === 0) next();
+        if (record.start < start)
+          this.#keepBoundary(tx, record.start, bytes, 0, start - record.start);
+        if (record.end > end)
+          this.#keepBoundary(tx, record.start, bytes, end - record.start, bytes.byteLength);
+        visit();
       });
+    };
+    visit();
+  }
+
+  /** Each put clones synchronously; the previous output slice is no longer retained in JS. */
+  #keepBoundary(
+    tx: IdbTransactionLike,
+    offset: number,
+    bytes: ArrayBuffer,
+    start: number,
+    end: number,
+  ): void {
+    for (let at = start; at < end; at += IDB_BOUNDARY_BYTES)
+      this.#put(tx, offset + at, bytes.slice(at, Math.min(end, at + IDB_BOUNDARY_BYTES)));
   }
 
   /** At most two boundary records are read; interior deletion is a native range operation. */
@@ -655,41 +677,34 @@ export class ByteStore {
       if (before !== undefined && before.offset + before.length > start) straddling.push(before);
       if (after !== undefined && after.offset >= start && after.offset + after.length > end)
         straddling.push(after);
-      const found: ArrayBuffer[] = [];
-      const apply = () => {
-        const range = { lower: start, upper: end, upperOpen: true };
-        records.deleteRange(range);
-        index.deleteRange(range);
-        for (let at = 0; at < straddling.length; at++) {
-          const entry = straddling[at];
-          const bytes = found[at];
-          if (entry === undefined || bytes === undefined)
-            throw corrupt("a boundary record is missing");
-          records.delete(entry.offset);
-          index.delete(entry.offset);
-          if (entry.offset < start)
-            this.#put(tx, entry.offset, bytes.slice(0, start - entry.offset));
-          if (entry.offset + entry.length > end)
-            this.#put(tx, end, bytes.slice(end - entry.offset));
+      let at = 0;
+      const visit = () => {
+        const entry = straddling[at++];
+        if (entry === undefined) {
+          // New boundary parts are strictly before start or at/after end; the range delete
+          // cannot erase them. Read/trim each old boundary BEFORE deleting interior keys.
+          const range = { lower: start, upper: end, upperOpen: true };
+          records.deleteRange(range);
+          index.deleteRange(range);
+          finish();
+          return;
         }
-        finish();
-      };
-      if (straddling.length === 0) {
-        apply();
-        return;
-      }
-      let pending = straddling.length;
-      straddling.forEach((entry, at) =>
         records.get(entry.offset, (value) => {
           const bytes = (value as StoredRecord | undefined)?.bytes;
           if (!(bytes instanceof ArrayBuffer) || bytes.byteLength !== entry.length)
             throw corrupt(
               `record ${String(entry.offset)} of ${this.name} disagrees with its entry`,
             );
-          found[at] = bytes;
-          if (--pending === 0) apply();
-        }),
-      );
+          records.delete(entry.offset);
+          index.delete(entry.offset);
+          if (entry.offset < start)
+            this.#keepBoundary(tx, entry.offset, bytes, 0, start - entry.offset);
+          if (entry.offset + entry.length > end)
+            this.#keepBoundary(tx, entry.offset, bytes, end - entry.offset, entry.length);
+          visit();
+        });
+      };
+      visit();
     };
     index.last({ upper: start, upperOpen: true }, (entry) => {
       head = entry;
@@ -725,7 +740,13 @@ export class ByteStore {
    * Fills `target` with the bytes at `offset`, then calls `then` (see "Who trusts what"). `tx`'s
    * scope must hold both stores. A missing or mismatched record aborts with `StoreCorruptionError`.
    */
-  read(tx: IdbTransactionLike, offset: number, target: Uint8Array, then: () => void): void {
+  read(
+    tx: IdbTransactionLike,
+    offset: number,
+    target: Uint8Array,
+    then: () => void,
+    serial = false,
+  ): void {
     target.fill(0);
     if (target.length === 0) {
       then();
@@ -749,7 +770,8 @@ export class ByteStore {
           return;
         }
         const records = tx.store(this.name);
-        for (const entry of entries)
+        let at = 0;
+        const issue = (entry: IndexEntry) =>
           records.get(entry.offset, (value) => {
             const found = value as StoredRecord | undefined;
             if (!(found?.bytes instanceof ArrayBuffer) || found.bytes.byteLength !== entry.length)
@@ -761,7 +783,15 @@ export class ByteStore {
             target.set(new Uint8Array(found.bytes, from - entry.offset, to - from), from - offset);
             left -= 1;
             if (left === 0) then();
+            else if (serial) {
+              const next = entries[at++];
+              if (next !== undefined) issue(next);
+            }
           });
+        if (serial) {
+          const first = entries[at++];
+          if (first !== undefined) issue(first);
+        } else for (const entry of entries) issue(entry);
       });
     });
   }
