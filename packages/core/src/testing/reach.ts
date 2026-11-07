@@ -413,6 +413,7 @@ export const SMALL_PAGE_NULL_STATES = ["all valid", "sparse nulls"] as const;
 
 /** Independent source-sized shape differential over real cache eviction and group switches. */
 export const SHAPE_DIFFERENTIAL_REACH = [
+  "separate page and metadata caches",
   "independent source lengths",
   "actual cache eviction",
   "backend reload after eviction",

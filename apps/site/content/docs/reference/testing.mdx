@@ -1249,8 +1249,9 @@ The reader charges its bounded scalar memo separately from the shared directory 
 Generated source-value equality and residency histories cover this reuse in
 `next/exec/column-shape.test.ts` and `next/exec/shape-reuse.test.ts`. Reference sizing sums
 immutable source values independently of the reader's range and gather byte memos.
-`next/testing/column-shape-differential.test.ts` checks real cache eviction and backend reload,
-three same-layout groups through one target, all-valid/sparse/all-null masks, empty selections,
+`next/testing/column-shape-differential.test.ts` checks real page-cache eviction and backend
+reload while the extent space also registers retained metadata caches. It also checks three
+same-layout groups through one target, all-valid/sparse/all-null masks, empty selections,
 values larger than 64 KiB stored out of line, gzip, and actual dictionary code widths 0/1/2.
 Declared reach requires these states. Four-byte dictionary codes are outside this generated
 writer campaign: the writer limits groups to 65,536 rows. A restored stale-range-length mutant
