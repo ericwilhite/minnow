@@ -5,10 +5,10 @@
  * ```text
  *  owner (B5)                              executor (B4)                    write path (B3)
  *  prepared = executor.prepare(plan)       (cached with the plan)
- *  params   = prepared.bind(values)
+ *  // execute admits the inputs and binds them using its own grant.
  *  SELECT: view = writePath.pin()   ───────────────────────────────────▶  Snapshot
  *  DML:    statement = tx.statement({ rules })   (rules: compileTableRules, exec/rules.ts)
- *  exec = prepared.execute({ parameters, snapshot | statement, reads, governor, spill, … })
+ *  exec = prepared.execute({ parameters: values, snapshot | statement, reads, governor, spill, … })
  *  await exec.executed        DML: statement ended (deferred checks passed) │ SELECT: last frame offered
  *  autocommit DML: commit (per durability) → exec.acknowledgeCommit()      │ (otherwise nothing)
  *  loop frame = exec.results.next() / poll(): wait durable(frame.requiresLsn) if needed,
@@ -21,7 +21,8 @@
  *   `PreparedPlan` is immutable, shared by concurrent executions, and cached by the owner with the
  *   plan (text, catalog version). Anything the executor lacks is `UnsupportedPlanError` here,
  *   never a wrong answer later.
- * - `bind` converts client values once per execution (`ParameterValue`). A value that does not
+ * - `execute` admits input storage and invokes `bind(values, grant)` once per execution
+ *   (`ParameterValue`). A value that does not
  *   fit its slot is `ParameterBindError`, never a re-plan.
  *
  * ## Inputs
@@ -36,8 +37,9 @@
  *   with the plan-derived minimum (memory/governor.ts rule 3), labelled `query#<queryId>/…`. State
  *   that outlives its pipeline (hash builds, sorted runs, aggregate partitions, the RETURNING
  *   spool) is in spillable grants, so an admission waiting elsewhere can be served by reclaim.
- *   Non-spillable grants hold only bounded batch and I/O buffers. Nothing is refused for size; the
- *   one size error is a single value larger than the reserve (`ValueTooLargeError`). Dictionaries
+ *   Non-spillable inputs are admitted with the fixed buffers; inputs exceeding normal capacity
+ *   raise MemoryAdmissionError. Other non-spillable grants hold bounded batch/I/O buffers. The
+ *   progress-loan size error is a single value larger than the reserve (`ValueTooLargeError`). Dictionaries
  *   a scan decodes are charged to the query, not the cache (ruling R5).
  * - **Result grant.** One per execution, spillable, admitted at start with the credit window as
  *   its minimum. Frames are charged to it until released (exec/result.ts). It outlives `executed`
@@ -118,9 +120,10 @@ import type { Statement } from "../access/modify.js";
 import type { SequenceAccess } from "../access/write-path.js";
 import type { ExecutorCosts } from "../ir/costs.js";
 import type { OutputColumn, PhysicalPlan } from "../ir/ir.js";
-import type { MemoryGovernor } from "../memory/governor.js";
+import type { Grant, MemoryGovernor } from "../memory/governor.js";
 import type { SpillService } from "../spill/contract.js";
 import type { FlatVector } from "../vector/vector.js";
+import type { MaybePromise } from "../access/key-index.js";
 import type { ResultStream } from "./result.js";
 import type { ChunkReads } from "./scan.js";
 
@@ -152,9 +155,9 @@ export type ParameterValue =
   null | boolean | number | bigint | string | Date | Uint8Array | readonly ParameterValue[];
 
 /**
- * Slot values ready to execute: one length-1 flat vector per `plan.parameters` slot, in slot
- * order (placeholders bound; lowering's own slots filled by init plans and the clock). Immutable
- * once bound; one `BoundParameters` serves one execution at a time.
+ * Execution-owned slots: one length-1 flat vector per `plan.parameters` slot, in slot order.
+ * These are internal kernel inputs, produced after admission; execute accepts the raw values.
+ * Immutable once bound, with their binding grant alive for their entire use.
  */
 export interface BoundParameters {
   readonly slots: readonly FlatVector[];
@@ -190,13 +193,15 @@ export interface PreparedPlan {
    * Binds `values[i]` to placeholder `$i+1`. Throws `ParameterBindError` when the count is not
    * `plan.placeholderCount` or a value does not fit (the error names the slot).
    */
-  bind(values: readonly ParameterValue[]): BoundParameters;
+  bind(values: readonly ParameterValue[], grant: Grant): MaybePromise<BoundParameters>;
   /** Starts the execution synchronously (see "Running"). Throws only `TypeError` for owner bugs. */
   execute(request: ExecuteRequest): Execution;
 }
 
 interface ExecuteBase {
-  readonly parameters: BoundParameters;
+  /** Caller-owned values, borrowed until executed/cancellation; do not mutate during execution.
+   * The execution admits its input storage before creating any owned vectors or copies. */
+  readonly parameters: readonly ParameterValue[];
   /** int64 µs since 2000-01-01 (temporal.ts): fills `plan.clockSlot`. */
   readonly statementTime: bigint;
   readonly reads: ChunkReads;
@@ -209,6 +214,8 @@ interface ExecuteBase {
   readonly signal?: AbortSignal;
   /** Credit window of the result stream (default `RESULT_WINDOW_BYTES`). */
   readonly resultWindowBytes?: number;
+  /** Optional maximum rows per result frame (null/absent: byte-bounded framing only). */
+  readonly resultFrameRows?: number | null;
   /**
    * When RETURNING rows may flow: `"atCommit"` for an autocommit DML statement (after
    * `acknowledgeCommit`), `"atExecuted"` otherwise (queries, statements inside a transaction).
@@ -269,7 +276,8 @@ export interface OperatorProfile {
   /** Spill bytes written, and passes over spilled data (0 when it never spilled). */
   readonly spilledBytes: number;
   readonly spillPasses: number;
-  /** Scans and fetches: pages decoded, and pages skipped by bounds or runtime filters. */
+  /** Scans/fetches: encoded data pages opened in their chunk readers (cache hits included),
+   * and pages directly ruled out by group/page bounds or runtime filters. */
   readonly pagesRead: number;
   readonly pagesPruned: number;
   /** Runtime filters this operator applied: probes seen and kept (null when none). */

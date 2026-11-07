@@ -12,7 +12,9 @@
  * 3. **Bounded minimums.** A pipeline's minimum is fixed by its plan, never by data: the batch
  *    buffers of its operators at `batchTargetFor` bytes per batch (fewer rows for wide rows),
  *    hash-table and run headers, and spill I/O buffers. A minimum above `cap − reserve` is a
- *    planner bug (`RangeError`), not a size refusal.
+ *    planner bug (`MemoryAdmissionError`, a `RangeError`), not a query-size refusal.
+ *    Caller-supplied parameters are non-spillable inputs: their conversion/storage bound is
+ *    admitted atomically with those fixed buffers, and must fit normal capacity too.
  * 4. **Held vs allocated.** A grant *holds* bytes from the governor (its minimum, growth, loan)
  *    and its holder *allocates* buffers out of them (`allocate`/`free`): a suballocator, so a
  *    non-spillable operator builds buffers inside its admitted minimum without asking the
@@ -156,6 +158,21 @@ export interface MemoryGovernor {
      */
     unregister?(): void;
   };
+}
+
+/** A non-spillable input or a fixed minimum cannot fit the owner's normal capacity. */
+export class MemoryAdmissionError extends RangeError {
+  readonly code = "MINNOW_MEMORY_ADMISSION";
+  constructor(
+    readonly label: string,
+    readonly bytes: number,
+    readonly capacity: number,
+  ) {
+    super(
+      `${label} needs a minimum above the cap: plan smaller batches (${String(bytes)} bytes, ${String(capacity)} available)`,
+    );
+    this.name = "MemoryAdmissionError";
+  }
 }
 
 export class ValueTooLargeError extends Error {
@@ -480,7 +497,11 @@ export class Governor implements MemoryGovernor {
 
   async admit(options: AdmitOptions): Promise<Grant> {
     if (options.minimumBytes > this.capBytes - this.reserveBytes)
-      throw new RangeError(`${options.label} needs a minimum above the cap: plan smaller batches`);
+      throw new MemoryAdmissionError(
+        options.label,
+        options.minimumBytes,
+        this.capBytes - this.reserveBytes,
+      );
     return this.#enqueue(
       this.#admissions,
       {
@@ -496,7 +517,11 @@ export class Governor implements MemoryGovernor {
 
   tryAdmit(options: Omit<AdmitOptions, "signal">): Grant | null {
     if (options.minimumBytes > this.capBytes - this.reserveBytes)
-      throw new RangeError(`${options.label} needs a minimum above the cap: plan smaller batches`);
+      throw new MemoryAdmissionError(
+        options.label,
+        options.minimumBytes,
+        this.capBytes - this.reserveBytes,
+      );
     if (this.#draining || this.#loans.length > 0 || this.#admissions.length > 0) return null;
     if (!this.#room(options.minimumBytes, false)) return null;
     this.#take(options.minimumBytes);

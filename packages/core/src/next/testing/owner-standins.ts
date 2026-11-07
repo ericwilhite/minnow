@@ -1,5 +1,5 @@
 /**
- * Stand-ins for the tracks whose implementations have not landed, so the owner's composition
+ * Explicit protocol fixtures, so the owner's composition
  * (owner/compose.ts) and protocol server (owner/server.ts) run end to end over **real lowering**
  * (lower/, B6, on main):
  *
@@ -17,7 +17,9 @@
  * - `withTestStatements` adds `SELECT spin($1)`, the latency lane's analytic load.
  *
  * They honour the contracts the composition depends on; they are not models of the real engines
- * (no MVCC beyond copies, no key index, no pages). Replace each with the real track as it lands.
+ * (no MVCC beyond copies, no key index, no pages). `composeEngine` defaults to the real executor;
+ * tests using this synthetic write path must explicitly inject its matching synthetic executor.
+ * `storage-core.ts` exercises the real executor over the real write path and extent storage.
  */
 import {
   CatalogChangeError,
@@ -25,6 +27,7 @@ import {
   type CatalogView,
   type TableDef,
 } from "../access/catalog.js";
+import { bindParameters } from "../exec/parameters.js";
 import type { Statement, StatementOptions } from "../access/modify.js";
 import type { Snapshot } from "../access/snapshot.js";
 import type {
@@ -47,7 +50,6 @@ import {
   UnsupportedPlanError,
 } from "../exec/errors.js";
 import type {
-  BoundParameters,
   ExecuteRequest,
   Execution,
   ExecutionState,
@@ -635,7 +637,6 @@ function yieldTask(): Promise<void> {
 }
 
 const programs = new WeakMap<PhysicalPlan, Program>();
-const boundValues = new WeakMap<BoundParameters, readonly ParameterValue[]>();
 
 function columnVector(type: PhysicalType, values: readonly Value[]): WireFlat {
   const length = values.length;
@@ -1031,23 +1032,16 @@ export class StandinExecutor implements Executor {
       columns: program.columns,
       kind: program.kind,
       usesSequences: false,
-      bind: (values) => {
-        if (values.length !== plan.placeholderCount)
+      bind: (values, grant) => bindParameters(plan, values, grant),
+      execute: (request) => {
+        if (request.parameters.length !== plan.placeholderCount)
           throw new ExecutionError(
             `Expected ${String(plan.placeholderCount)} parameters`,
             "MINNOW_PARAMETER_BIND",
             "08P01",
           );
-        const bound: BoundParameters = { slots: [] };
-        boundValues.set(bound, values);
-        return bound;
-      },
-      execute: (request) => {
-        const execution = new StandinExecution(
-          program,
-          request,
-          boundValues.get(request.parameters) ?? [],
-          () => this.onAcknowledge?.(),
+        const execution = new StandinExecution(program, request, request.parameters, () =>
+          this.onAcknowledge?.(),
         );
         this.channels.add(execution.results);
         return execution;
