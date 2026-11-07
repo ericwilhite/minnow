@@ -37,6 +37,10 @@ const lockSQL = {
     "WITH x AS (SELECT * FROM t FOR $LOCK), unused AS (SELECT * FROM x) SELECT 1 AS n",
   "cte-graph-two":
     "WITH x AS (SELECT * FROM t FOR $LOCK), y AS (SELECT * FROM x), unused AS (SELECT * FROM y) SELECT 1 AS n",
+  "recursive-base":
+    "WITH RECURSIVE r(id) AS (SELECT id FROM (SELECT * FROM t FOR $LOCK) base UNION ALL SELECT id+1 FROM r WHERE id<2), d AS (SELECT * FROM r) SELECT 1 AS id",
+  "recursive-step":
+    "WITH RECURSIVE r(id) AS (SELECT 1 UNION ALL SELECT t.id+1 FROM r JOIN (SELECT * FROM t FOR $LOCK) t ON t.id=r.id WHERE r.id<2), d AS (SELECT * FROM r) SELECT 1 AS id",
   constants: "SELECT * FROM (SELECT 1 AS n) q FOR $LOCK",
 } as const;
 const lockKinds = Object.keys(lockSQL) as Array<keyof typeof lockSQL>;

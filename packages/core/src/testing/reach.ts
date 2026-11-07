@@ -1236,6 +1236,8 @@ export const OWNER_ROW_LOCK_STATES = [
   "unused-cte",
   "cte-graph-one",
   "cte-graph-two",
+  "recursive-base",
+  "recursive-step",
   "constants",
   "cold locking refusal",
   "cached locking refusal",

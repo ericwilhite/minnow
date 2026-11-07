@@ -2037,6 +2037,8 @@ The shared front end resolves targets through FROM subqueries but never pushes a
 into a CTE. A referenced CTE's own clause and a view's own clause count, including references from
 CTEs not consumed by the final SELECT. Only zero-reference CTEs in that query scope are
 omitted; declarations inside a discarded outer CTE do not leak into the caller.
+Recursive CTE base and step locks both count when referenced only through an unused CTE;
+the generated owner campaign covers both with cold and cached plans at all four strengths.
 View bodies are included after catalog expansion. The shipped engine uses the same target and
 strength helpers. Metadata is retained even for a point read; the owner must check it before
 its synchronous fast path.

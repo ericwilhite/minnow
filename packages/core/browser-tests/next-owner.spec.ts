@@ -583,6 +583,8 @@ test("public lock intent and ordered modes survive owner cache hits", async ({ p
     "SELECT * FROM v",
     "WITH x AS (SELECT * FROM t FOR UPDATE), unused AS (SELECT * FROM x) SELECT 1 AS n",
     "WITH x AS (SELECT * FROM t FOR UPDATE), y AS (SELECT * FROM x), unused AS (SELECT * FROM y) SELECT 1 AS n",
+    "WITH RECURSIVE r(id) AS (SELECT id FROM (SELECT * FROM t FOR UPDATE) base UNION ALL SELECT id+1 FROM r WHERE id<2), d AS (SELECT * FROM r) SELECT 1 AS id",
+    "WITH RECURSIVE r(id) AS (SELECT 1 UNION ALL SELECT t.id+1 FROM r JOIN (SELECT * FROM t FOR UPDATE) t ON t.id=r.id WHERE r.id<2), d AS (SELECT * FROM r) SELECT 1 AS id",
   ];
   for (const sql of locking) {
     expect(await call(a, "query", sql.replace("id = 1", "id = 2"))).toHaveProperty("rows");
