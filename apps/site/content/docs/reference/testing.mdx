@@ -1611,6 +1611,14 @@ reservations with queued abort, discard and seal transitions at every checkpoint
 outside the barrier must fail these checks. Audit histories also require another publication
 to finish while the audit's external producer is blocked, and verify a restarted generation.
 
+The free-map pressure regression replays seed 598's generated durable-load shapes over
+memory and the IndexedDB adapter. It holds all but one ordinary byte during each native
+allocator release, including trim and abort, with startup credit retained or returned and
+with or without a caller loan. Releases must add no charge. The histories require real
+merges, exact rows, recovery, audit and complete charge cleanup. Pressure is scoped to
+allocator mutation; the separate write-path metadata and merge admission policy has its
+own tests. The full review workload can expose that separate policy after storage succeeds.
+
 Disk-derived retirement tests keep the before/after list pages protected through complete
 worklist construction, then release at most 256 ranges per batch. They independently check
 fragmentation debt and recovery when the gaps coalesce within the arena capacity. Private

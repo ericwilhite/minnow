@@ -11,7 +11,7 @@ import {
 import { openPairs } from "./metadata-extents.js";
 import { disposeSnapshot } from "./extent-snapshot.js";
 import { countingBudget } from "./space-test-support.js";
-import { ScriptedMetadataPages } from "../testing/metadata-test-support.js";
+import { ScriptedMetadataPages } from "./metadata-test-support.js";
 import type { ExtentRef } from "./extents.js";
 for (const seed of seedsFor("audit-capture", [1641, 1642, 1643, 1644]))
   it(`flushes a prefix before yielding to a contending publication (${String(seed)})`, async () => {

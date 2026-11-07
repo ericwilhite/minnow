@@ -2055,6 +2055,13 @@ and C the root bank, larger owned frames and snapshot descriptors. Caller-owned
 snapshot budgets stay live until release. `stats.retainedBytes` reports the
 space-owned charges; caller-budget pin credit remains with that caller.
 
+`write/free-map-pressure.test.ts` generates the review's seed598 durable-load shapes
+on memory and the IndexedDB adapter, saturating ordinary capacity during the native
+allocator release. Trim and abort consume the prepaid arena without a new charge,
+including beside a caller loan. It checks real merge completion, complete rows,
+reopen, audit and close accounting. This storage test scopes pressure to allocator
+mutation; it does not claim the write path's separate metadata admission policy is fixed.
+
 ### R25 startup measurement
 
 `MINNOW_NEXT_STORAGE_REOPEN=1` enables the Chromium storage reopen lane in

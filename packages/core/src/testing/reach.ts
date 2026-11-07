@@ -1271,3 +1271,17 @@ export const STORAGE_SERIAL_INDEX_REACH = [
   "multiple index pages",
   "exact tiny-record image",
 ] as const;
+
+/** Seed598's real loads keep idle ordinary estimates while free-map mutation completes. */
+export const FREE_MAP_PRESSURE_REACH = [
+  "memory",
+  "indexeddb",
+  "startup returned",
+  "startup retained",
+  "one byte ordinary headroom",
+  "caller loan held",
+  "real merge completed",
+  "abort completed",
+  "durable reopen and audit",
+  "closed without charge",
+] as const;
