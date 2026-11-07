@@ -62,12 +62,29 @@ const profileId = option("--profile", "");
 const frozenSQL = args.includes("--frozen");
 const dataset = option("--dataset", "wide"),
   scale = Number(option("--scale", "333"));
-if (dataset !== "wide" && dataset !== "star") throw new Error("--dataset must be wide or star");
+if (dataset !== "wide" && dataset !== "star" && dataset !== "retail")
+  throw new Error("--dataset must be wide, star or retail");
+if (dataset === "retail" && !frozenSQL) throw new Error("retail requires --frozen");
 if (!Number.isFinite(scale) || scale <= 0) throw new RangeError("positive star scale required");
 const cache = resolve(option("--output", join(homedir(), ".cache/b4-executor/baseline")));
 if (!cache.startsWith(join(homedir(), ".cache/")))
   throw new Error("benchmark output must be under ~/.cache/");
 await mkdir(cache, { recursive: true });
+const committed = frozenSQL
+  ? (JSON.parse(
+      await readFile(resolve("packages/core/src/next/testing/executor-catalogue.json"), "utf8"),
+    ) as {
+      queries: Array<CatalogueQuery & { dataset: string }>;
+      datasets: Record<
+        string,
+        Array<{
+          name: string;
+          ddl: string;
+          rows: Record<string, boolean | string | number | null>[];
+        }>
+      >;
+    })
+  : null;
 const generator = (await import(pathToFileURL(join(harness, "gen.js")).href)) as Generator;
 const catalogue = (await import(pathToFileURL(join(harness, "queries.js")).href)) as Catalogue;
 const core = await new StorageCore(8192).open();
@@ -81,6 +98,12 @@ const metadata = {
   columns: dataset === "wide" ? 200 : null,
   scale: dataset === "star" ? scale : null,
   rounds,
+  fixtureRowCounts:
+    dataset === "retail"
+      ? Object.fromEntries(
+          (committed?.datasets.retail ?? []).map((table) => [table.name, table.rows.length]),
+        )
+      : null,
   timing:
     "process user+system CPU; SQL/lower/prepare/bind/pin/execute/rows/credit/cleanup included; ingestion excluded",
   node: process.version,
@@ -155,6 +178,35 @@ try {
         })),
       );
     }
+  } else if (dataset === "retail") {
+    // The docs catalogue has a frozen fixture rather than a scale parameter. Keep it exact;
+    // these small-fixture timings are not comparable to the wide/star Gate B targets.
+    for (const fixture of committed?.datasets.retail ?? []) {
+      await core.execute(fixture.ddl);
+      const table = core.harness.path.catalog.tableByName(fixture.name);
+      if (table === undefined) throw new Error("retail table was not created");
+      if (fixture.rows.length > 0)
+        await core.writeBatch(
+          "insertBatch",
+          fixture.name,
+          fixture.rows.map((row) =>
+            Object.fromEntries(
+              table.columns.map((column) => {
+                const value = row[column.name] ?? null;
+                return [
+                  column.name,
+                  value !== null && column.type.kind === "timestamp"
+                    ? new Date(String(value))
+                    : value,
+                ];
+              }),
+            ),
+          ),
+        );
+      console.error(
+        JSON.stringify({ loadedTable: fixture.name, rows: fixture.rows.length, load: loadavg() }),
+      );
+    }
   } else {
     const { commerceEntities, generateEntityBatch } =
       await import("../apps/site/bench/benchmark.ts");
@@ -212,11 +264,6 @@ try {
       load: loadavg(),
     }),
   );
-  const committed = frozenSQL
-    ? (JSON.parse(
-        await readFile(resolve("packages/core/src/next/testing/executor-catalogue.json"), "utf8"),
-      ) as { queries: Array<CatalogueQuery & { dataset: string }> })
-    : null;
   const sourceQueries =
     committed === null
       ? dataset === "wide"
@@ -226,7 +273,7 @@ try {
   const queries = sourceQueries.filter((query) => only.size === 0 || only.has(query.id));
   const records: unknown[] = [];
   for (const query of queries) {
-    const sql = catalogue.sqlFor(query, "minnow", total);
+    const sql = frozenSQL ? query.sql : catalogue.sqlFor(query, "minnow", total);
     try {
       core.prepare(sql);
     } catch (error) {
