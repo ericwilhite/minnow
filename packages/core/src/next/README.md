@@ -76,8 +76,14 @@ The write grant keeps an admitted working minimum and charges live memtables and
 Its unused growth after a wide-batch estimate is reclaimable: a waiting merge can take that
 capacity without waiting for another writer call. Metadata has its own grant and uses the
 same retrying budget for root/statistics charges, group-directory chunks and run readers.
-If its allocation cannot grow, that budget returns idle write holdings and retries. Reclaim
-preserves both allocated bytes and outstanding loans; it never frees a reader's live buffers.
+If its allocation cannot grow, that budget returns idle write holdings and retries. If live
+reader memory still prevents growth, publication unwinds its provisional writer and lock,
+then waits on task turns until headroom returns, checking close and abort while waiting.
+Temporary pressure never becomes a fatal writer failure. Only an individual allocation
+larger than the entire cap gets the typed `MetadataAllocationTooLargeError` size refusal.
+Reclaim preserves both allocated bytes and outstanding loans; it never frees a reader's live buffers.
+`write/metadata-pressure.test.ts` generates reader-held memory through flush, staging, merges
+and durable reopen on memory and simulated IndexedDB.
 Oversized insert calls admit at most 2,048 rows at once, so an entire call's conservative
 estimate does not need to fit beside other working grants. Eligible pending chunks stage
 between pieces of the same call; uniqueness, foreign keys and rollback still span the whole

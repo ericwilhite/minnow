@@ -718,7 +718,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const reclaimWriter = () => releaseIdle(grant, MINIMUM_BYTES);
     grant.onReclaimRequest(reclaimWriter);
     metadataGrant.onReclaimRequest(() => releaseIdle(metadataGrant));
-    const metadataBudget = new MetadataBudget(metadataGrant, reclaimWriter);
+    const metadataBudget = new MetadataBudget(
+      metadataGrant,
+      reclaimWriter,
+      input.governor.capBytes,
+    );
     let commitBuffers: CommitBuffers | null = null;
     let engine: WritePathImpl | null = null;
     try {
@@ -772,7 +776,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
           root = { ...root, extentList: await delta.prepare(root.sequence, writer, []) };
           const bytes = encodeManifestRoot(root);
           rootCharge = parseCharge(bytes.length);
-          if (!metadataBudget.allocate(rootCharge)) throw new ParseBudgetError(rootCharge);
+          await metadataBudget.retry(
+            () => {
+              if (!metadataBudget.allocate(rootCharge)) throw new ParseBudgetError(rootCharge);
+            },
+            () => {
+              if (input.options.signal?.aborted) throw input.options.signal.reason;
+            },
+          );
           await delta.publish(space, bytes, writer, []);
         } catch (error) {
           failed = error;
@@ -787,7 +798,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
             : new Error("The first root failed", { cause: failed });
       } else {
         // The decoded root stays resident for the session: its parse charge stays with it.
-        const parsed = decodeManifestRoot(space.root, metadataBudget);
+        const parsed = await metadataBudget.retry(
+          () => decodeManifestRoot(need(space.root), metadataBudget),
+          () => {
+            if (input.options.signal?.aborted) throw input.options.signal.reason;
+          },
+        );
         rootCharge = parsed.charge;
         root = parsed.value;
         // Built from the durable root's list, never from earlier callbacks (ruling R25).
@@ -828,7 +844,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           // (exactly) before its buffer exists (review B3-p2a-3, ruling on findings 1, 2, 6).
           metadataBytes = pageIndexBytes(index.value.length);
           try {
-            this.#chargeMetadata(metadataBytes);
+            await this.#metadataRetry(() => this.#chargeMetadata(metadataBytes));
           } catch (error) {
             index.release();
             throw error;
@@ -840,12 +856,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
             for (const page of pages) {
               const held = await this.#metadata.groupPage(page.ref, this.#grant);
               try {
-                for (const group of held.value) builder.add(group);
+                for (const group of held.value) await this.#metadataRetry(() => builder.add(group));
               } finally {
                 held.release();
               }
             }
-            groups = builder.finish();
+            groups = await this.#metadataRetry(() => builder.finish());
           } catch (error) {
             builder.abandon();
             this.#chargeMetadata(-metadataBytes);
@@ -879,9 +895,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
         // Planning totals come from the table's statistics blob: one read per table, never a
         // group root (Gate A reopen). Its parse charge stays with the table's metadata.
         if (table.statistics !== null) {
-          const parsed = decodeTableStatistics(
-            await readBlob(this.#space, table.statistics, this.#grant),
-            this.#metadataBudget,
+          const statisticsBytes = await readBlob(this.#space, table.statistics, this.#grant);
+          const parsed = await this.#metadataRetry(() =>
+            decodeTableStatistics(statisticsBytes, this.#metadataBudget),
           );
           state.metadataBytes += parsed.charge;
           if (parsed.value.groupCount !== table.groupCount)
@@ -1528,7 +1544,25 @@ export class WritePathImpl implements WritePath, EngineHooks {
     free: (bytes: number) => this.#chargeMetadata(-bytes),
   };
 
-  /** Charges (or, negative, returns) resident metadata bytes; a refusal is `ParseBudgetError`. */
+  /** Retry only after an operation has aborted its provisional writer and released its lock. */
+  #metadataRetry<T>(work: () => MaybePromise<T>): MaybePromise<T> {
+    return this.#metadataBudget.retry(work, () => {
+      this.#signal?.throwIfAborted();
+      // The initial load precedes construction of the appender in recovery. The path is not
+      // exposed to close yet; open's abort signal is still checked at every suspension.
+      if (this.#recovering) {
+        if (this.#failure !== null) throw this.#failure;
+        return;
+      }
+      this.#check();
+    });
+  }
+
+  async #metadataAsync<T>(work: () => Promise<T>): Promise<T> {
+    return await this.#metadataRetry(work);
+  }
+
+  /** Charges (or returns) resident metadata bytes; async owners handle temporary pressure. */
   #chargeMetadata(bytes: number): void {
     if (bytes < 0) this.#metadataBudget.free(-bytes);
     else if (bytes > 0 && !this.#metadataBudget.allocate(bytes)) throw new ParseBudgetError(bytes);
@@ -2382,7 +2416,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
       return cached;
     }
     // Its resident parts are charged to the metadata grant before they are built (runs.ts).
-    const opened = RunReader.open(this.#space, ref, this.#grant, this.#metadataBudget);
+    const opened = this.#metadataRetry(() =>
+      RunReader.open(this.#space, ref, this.#grant, this.#metadataBudget),
+    );
     if (opened instanceof Promise) {
       const pending = opened.then((reader) => {
         // A drop while it opened took the entry away: give the charge back.
@@ -2423,7 +2459,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
         try {
           await work;
         } catch (error) {
-          this.#failure ??= error instanceof Error ? error : new Error(String(error));
+          if (!this.closed)
+            this.#failure ??= error instanceof Error ? error : new Error(String(error));
           return;
         }
         // Invariant: every flush the loop runs makes progress (a publication, an abandoned flush
@@ -2469,7 +2506,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   #flushTable(state: TableState, set: readonly Memtable[], through: number): Promise<void> {
-    const flush = this.#writeFlush(state, set, through);
+    const flush = this.#metadataAsync(() => this.#writeFlush(state, set, through));
     this.#flushing.set(state, flush);
     const done = () => {
       if (this.#flushing.get(state) === flush) this.#flushing.delete(state);
@@ -2729,11 +2766,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const metadataBytes = pageIndexBytes(pages.length) + statisticsCharge;
       const growth = metadataBytes - state.metadataBytes;
       const rootCharge = parseCharge(rootBytes.length);
-      this.#chargeMetadata(growth);
+      const positiveGrowth = Math.max(0, growth);
+      this.#chargeMetadata(positiveGrowth);
       try {
         this.#chargeMetadata(rootCharge);
       } catch (error) {
-        this.#chargeMetadata(-growth);
+        this.#chargeMetadata(-positiveGrowth);
         throw error;
       }
       this.#roots.set(root, { refs: 1, bytes: rootCharge });
@@ -2741,7 +2779,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       try {
         await delta.publish(this.#space, rootBytes, writer, retired);
       } catch (error) {
-        this.#chargeMetadata(-growth);
+        this.#chargeMetadata(-positiveGrowth);
         throw error;
       }
       // A table dropped while the publish was in flight never holds the new page index: its own
@@ -2758,9 +2796,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
         }
       const live = this.#tables.get(state.tableId) === state;
       if (live) {
+        if (growth < 0) this.#chargeMetadata(growth);
         state.metadataBytes = metadataBytes;
         this.#summaries.set(state.tableId, totals);
-      } else this.#chargeMetadata(-growth);
+      } else this.#chargeMetadata(-positiveGrowth);
       // Re-point readers in the same step the publish resolves (ruling R16.3).
       const pin: SpacePin = this.#space.pin(`re-point t${String(state.tableId)}`, this.#pinBudget);
       const flushed = [...set];
@@ -2923,7 +2962,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   #stage(candidates: ReadonlyMap<TableState, readonly Memtable[]>): Promise<void> {
-    return this.#trackStaging(this.#stageNow(candidates));
+    return this.#trackStaging(this.#metadataAsync(() => this.#stageNow(candidates)));
   }
 
   async #stageNow(candidates: ReadonlyMap<TableState, readonly Memtable[]>): Promise<void> {
@@ -2945,7 +2984,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * committed rows.
    */
   #restage(tx: TransactionImpl, id: number): Promise<Map<number, PublishedRows>> {
-    return this.#trackStaging(this.#restageNow(tx, id));
+    return this.#trackStaging(this.#metadataAsync(() => this.#restageNow(tx, id)));
   }
 
   async #restageNow(tx: TransactionImpl, id: number): Promise<Map<number, PublishedRows>> {
@@ -3374,7 +3413,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#idleTimer = setTimeout(() => {
       this.#idleTimer = null;
       // Kept, so close() waits for a publication the timer already started (review B3-p2b-2 B3).
-      const run = this.#idlePublish()
+      const run = this.#metadataAsync(() => this.#idlePublish())
         .catch((error: unknown) => {
           this.#failure ??= error instanceof Error ? error : new Error(String(error));
         })
@@ -3466,7 +3505,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   #maybeRecycle(): void {
     if (this.#recycling !== null || this.#closed || this.#recovering || this.failure !== null)
       return;
-    this.#recycling = this.#recycleLog()
+    this.#recycling = this.#metadataAsync(() => this.#recycleLog())
       .catch((error: unknown) => {
         if (this.#closed) return; // a close refused its wait for the slot
         this.#failure ??= error instanceof Error ? error : new Error(String(error));
@@ -3697,7 +3736,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
         let done = false;
         for (const divisor of [1, 4]) {
           try {
-            await this.#merge(job.state, job.indexId, job.plan, job.inputs, divisor);
+            await this.#metadataRetry(() =>
+              this.#merge(job.state, job.indexId, job.plan, job.inputs, divisor),
+            );
             done = true;
             break;
           } catch (error) {

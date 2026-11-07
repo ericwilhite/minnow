@@ -1839,3 +1839,16 @@ export const WRITE_BATCH_ADMISSION_STATES = [
   "staged within call",
   "durable reopen",
 ] as const;
+
+/** B3 review: transient reader memory must delay metadata publication, never poison it. */
+export const WRITE_METADATA_PRESSURE_STATES = [
+  "memory",
+  "indexeddb",
+  "reader owns real bytes",
+  "metadata waits",
+  "reader released",
+  "flush published",
+  "staging published",
+  "merge completed",
+  "durable reopen",
+] as const;

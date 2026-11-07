@@ -140,9 +140,11 @@
  *   reservations yield to governor reclaim requests, retaining the working minimum and every
  *   allocated or loan-backed byte. This lets a bounded merge admission progress beside a writer.
  * - Metadata allocation first uses its own grant (and the governor's cache eviction), then
- *   returns idle writer reservations and retries. Directory construction and run-reader opens
- *   use that same budget, as do root/statistics charges. Retained high-water estimates must not
- *   cause a size refusal while the writer holds sufficient reclaimable capacity. Row admission
+ *   returns idle writer reservations and retries. If live reader memory still prevents growth,
+ *   the owning operation waits on task turns, checking close/abort, after unwinding provisional
+ *   publication state. Directory construction and run-reader opens use that same budget, as do
+ *   root/statistics charges. Temporary pressure never poisons the writer; a single allocation
+ *   larger than the whole cap reports MetadataAllocationTooLargeError. Row admission
  *   separately freezes committed memtables and waits for their flush at a writer boundary.
  *   Oversized insert calls admit at most one memory chunk (2,048 rows) at a time, allowing
  *   eligible pending chunks to stage within the call while preserving statement atomicity.

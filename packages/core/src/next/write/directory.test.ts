@@ -7,7 +7,7 @@
 import { PIN_HEADER_BYTES } from "../storage/root-pins.js";
 import { GroupDirectory } from "./groups.js";
 import { describe, expect, it } from "vitest";
-import { GROUPS_PER_PAGE, ParseBudgetError, parseCharge } from "../format/manifest-codec.js";
+import { GROUPS_PER_PAGE, parseCharge } from "../format/manifest-codec.js";
 import {
   autocommit,
   batch,
@@ -183,11 +183,19 @@ describe("resident directory memory (review B3-p2a-2 #1)", () => {
       minimumBytes: room - used + opened,
       spillable: false,
     });
-    // Refused with the typed metadata error (the resident charge or the parse that feeds it),
-    // never by growing the heap past the cap.
-    await expect(harness.open()).rejects.toThrow(ParseBudgetError);
-    ballast.close();
-    path = await harness.open();
+    // PROPOSAL "One memory governor": temporary competing holdings wait, never refuse.
+    let released = false;
+    const release = setTimeout(() => {
+      ballast.close();
+      released = true;
+    }, 25);
+    try {
+      path = await harness.open();
+      expect(released).toBe(true);
+    } finally {
+      clearTimeout(release);
+      ballast.close();
+    }
     expect(path.residentMetadataBytes).toBe(opened);
     expect(metadata.grant?.allocated).toBe(opened + snapshotCredit());
     // Dropping the table returns its directory's charge (no older reader holds it).

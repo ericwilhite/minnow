@@ -373,6 +373,40 @@ describe("extent deltas (ruling R25)", () => {
             ).id ?? 0;
         });
         await path.quiesce();
+        // Quiet builds must be exercised independently of random maintenance timing: metadata
+        // retries can let a formerly quiet table receive another row before publication.
+        let quiet = 0;
+        await autocommit(path, async (s) => {
+          quiet =
+            (
+              await s.changeCatalog({
+                kind: "createTable",
+                table: tableInput("quiet", [column("id", INT, false)]),
+              })
+            ).id ?? 0;
+        });
+        await autocommit(path, (s) =>
+          s.changeCatalog({
+            kind: "createIndex",
+            index: {
+              tableId: quiet,
+              name: "quiet_index",
+              columnIds: [path.catalog.table(quiet)?.columns[0]?.id ?? 0],
+              unique: false,
+              role: "secondary",
+            },
+          }),
+        );
+        await autocommit(path, (s) =>
+          s
+            .table(dropped)
+            .insert(batch(ints(Array.from({ length: width }, (_, k) => -k - 1))), null),
+        );
+        await autocommit(path, (s) => s.table(dropped).insert(batch(ints([-1000])), null));
+        await path.quiesce();
+        expect(path.maintenance.buildsSettled).toBeGreaterThan(0);
+        reach.reach("build-settled");
+        expect(set).toEqual(await walk(overlap.space));
         armed = true;
         const ids = Array.from({ length: width }, (_, k) => k);
         await autocommit(path, (s) => s.table(dropped).insert(batch(ints(ids)), null));
