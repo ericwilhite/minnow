@@ -2436,6 +2436,34 @@ describe("requests end in bounded time too (client.ts connect and giveUp)", () =
   });
 });
 
+/** FIFO delivery independent of the host poll phase; transfer/serialization use real-port suites. */
+function discoveryChannel(): { port1: MessagePort; port2: MessagePort } {
+  const endpoint = () => ({
+    onmessage: null as ((event: MessageEvent) => void) | null,
+    closed: false,
+    close() {
+      this.closed = true;
+    },
+    postMessage(message: unknown) {
+      void message; // replaced after pairing
+    },
+  });
+  const a = endpoint();
+  const b = endpoint();
+  const send = (peer: typeof a, message: unknown) => {
+    queueMicrotask(() => {
+      if (!peer.closed) peer.onmessage?.({ data: message } as MessageEvent);
+    });
+  };
+  a.postMessage = (message) => {
+    if (!a.closed) send(b, message);
+  };
+  b.postMessage = (message) => {
+    if (!b.closed) send(a, message);
+  };
+  return { port1: a as unknown as MessagePort, port2: b as unknown as MessagePort };
+}
+
 /** Whole-attempt liveness, independent of whether individual discovery messages are answered. */
 describe("review P1: responsive discovery still has a deadline", () => {
   const seeds = seedsFor("next-owner-discovery-bound", [0xd15c]);
@@ -2464,183 +2492,194 @@ describe("review P1: responsive discovery still has a deadline", () => {
             sent: fc.boolean(),
           }),
           async ({ mode, bound, unresponsive, sent }) => {
-            const registry = new FakeLockRegistry();
-            const held = registry.context();
-            const ports: MessagePort[] = [];
-            let requests = 0;
-            let stalled = false;
-            let terminated = 0;
-            let spawned = 0;
-            if (mode === "lock wait" || mode.startsWith("handshake")) {
-              await new Promise<void>((resolve) => {
-                void held.request(hostLockName("bounded-discovery"), {}, () => {
-                  resolve();
-                  return new Promise<void>(() => undefined);
-                });
-              });
-            }
-            const client = new ProtocolClient();
-            let warm: ReturnType<typeof ownerHarness> | null = null;
-            if (sent) {
-              warm = ownerHarness();
-              const channel = new MessageChannel();
-              ports.push(channel.port1, channel.port2);
-              const post = channel.port1.postMessage.bind(channel.port1);
-              channel.port1.postMessage = ((message: { t: string }, transfer?: Transferable[]) => {
-                if (message.t === "welcome") post(message, transfer ?? []);
-              }) as typeof channel.port1.postMessage;
-              warm.server.accept(channel.port1);
-              await client.connect(channel.port2);
-            }
-            const connector = new OwnerConnector({
-              database: "bounded-discovery",
-              client,
-              locks: registry.context(),
-              announcements: false,
-              brokerBoundMs: bound,
-              brokerTimeoutMs: 5,
-              retryMs: 2,
-              handshakeTimeoutMs: 5,
-              unresponsiveAfterMs: unresponsive,
-              context: () => ({
-                kind: "page",
-                visible: true,
-                superseded: false,
-                platform: { mobile: false },
-              }),
-              openBroker:
-                mode === "never ready" || mode === "lock wait" || mode === "startup throws"
-                  ? null
-                  : () => {
-                      if (mode === "broker throws") throw new Error("broker construction failed");
-                      const channel = new MessageChannel();
-                      ports.push(channel.port1, channel.port2);
-                      channel.port1.onmessage = (event) => {
-                        const request = event.data as { t: string; nonce: number };
-                        if (request.t !== "connect") return;
-                        requests++;
-                        if (requests === 2) {
-                          // Simulate a suspended event loop after responsive discovery has
-                          // demonstrably repeated. Both attempt and observation timers become
-                          // due together; the later give-up grace still needs its own turn.
-                          const until = performance.now() + 200;
-                          while (performance.now() < until) {
-                            /* suspended context */
-                          }
-                          stalled = true;
-                        }
-                        if (!mode.startsWith("handshake")) {
-                          channel.port1.postMessage({ t: mode, nonce: request.nonce });
-                          return;
-                        }
-                        const owner = new MessageChannel();
-                        ports.push(owner.port1);
-                        owner.port1.onmessage = () => {
-                          if (mode === "handshake newer")
-                            owner.port1.postMessage({
-                              t: "refused",
-                              reason: "version",
-                              ownerProtocol: PROTOCOL_VERSION + 1,
-                              ownerBuild: "newer",
-                            });
-                          if (mode === "handshake refusal")
-                            owner.port1.postMessage({
-                              t: "refused",
-                              reason: "steppingDown",
-                              ownerProtocol: PROTOCOL_VERSION,
-                              ownerBuild: "test",
-                            });
-                        };
-                        channel.port1.postMessage(
-                          { t: "port", ownerId: "silent", nonce: request.nonce, port: owner.port2 },
-                          [owner.port2],
-                        );
-                      };
-                      return channel.port2;
-                    },
-              startOwner:
-                mode === "never ready" || mode === "lock wait" || mode === "startup throws"
-                  ? () => {
-                      spawned++;
-                      if (mode === "startup throws") throw new Error("worker construction failed");
-                      return {
-                        ready: new Promise(() => undefined),
-                        stopped: new Promise(() => undefined),
-                        lifecycle() {
-                          return undefined;
-                        },
-                        terminate() {
-                          terminated++;
-                        },
-                      };
-                    }
-                  : null,
-            });
-            let ended = false;
-            let effect: string | undefined;
-            const waiting = client
-              .query("SELECT 1")
-              .catch((error: unknown) => {
-                effect = (error as { effect?: string }).effect;
-              })
-              .finally(() => {
-                ended = true;
-              });
-            let startEnded = false;
-            let atEnd = {
-              status: connector.status,
-              requests,
-              spawned,
-              terminated,
-              stalled,
-              hostHeld: registry.held(hostLockName("bounded-discovery")),
-            };
-            const connecting = connector
-              .start()
-              .catch(() => undefined)
-              .finally(() => {
-                startEnded = true;
-                atEnd = {
-                  status: connector.status,
-                  requests,
-                  spawned,
-                  terminated,
-                  stalled,
-                  hostHeld: registry.held(hostLockName("bounded-discovery")),
-                };
-              });
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
             try {
-              // Observe the attempt first, then give the grace its own timer turn. When the
-              // event loop resumes late, summing both budgets into one sleep can observe before
-              // the newly armed grace is due. Neither deadline relies on close() for settlement.
-              await sleep(bound + 1);
-              expect(startEnded).toBe(true);
-              // giveUp changes activity and can start another attempt. Check this attempt's
-              // result and cleanup at its completion, independently of a later retry.
-              expect(atEnd.status).toBe(mode === "handshake newer" ? "superseded" : "unreachable");
-              if (mode === "startup throws") expect(atEnd.hostHeld).toBe(false);
-              if (
-                mode === "noOwner" ||
-                (mode.startsWith("handshake") && mode !== "handshake newer")
-              )
-                expect(atEnd.requests).toBeGreaterThan(1);
-              if (mode === "never ready") {
-                expect(atEnd.spawned).toBeGreaterThan(0);
-                expect(atEnd.terminated).toBe(atEnd.spawned);
+              const registry = new FakeLockRegistry();
+              const held = registry.context();
+              const ports: MessagePort[] = [];
+              let requests = 0;
+              const timing = { stalled: false };
+              let terminated = 0;
+              let spawned = 0;
+              if (mode === "lock wait" || mode.startsWith("handshake")) {
+                await new Promise<void>((resolve) => {
+                  void held.request(hostLockName("bounded-discovery"), {}, () => {
+                    resolve();
+                    return new Promise<void>(() => undefined);
+                  });
+                });
               }
-              await sleep(unresponsive + 1);
-              expect(ended).toBe(true);
-              expect(effect).toBe(sent ? "unknown" : "none");
-              const entered = new Set([mode, sent ? "sent unanswered" : "never sent"]);
-              if (atEnd.stalled) entered.add("delayed event-loop turn");
-              reach.recordHistory(entered);
+              const client = new ProtocolClient();
+              let warm: ReturnType<typeof ownerHarness> | null = null;
+              if (sent) {
+                warm = ownerHarness();
+                const channel = discoveryChannel();
+                ports.push(channel.port1, channel.port2);
+                const post = channel.port1.postMessage.bind(channel.port1);
+                channel.port1.postMessage = ((
+                  message: { t: string },
+                  transfer?: Transferable[],
+                ) => {
+                  if (message.t === "welcome") post(message, transfer ?? []);
+                }) as typeof channel.port1.postMessage;
+                warm.server.accept(channel.port1);
+                await client.connect(channel.port2);
+              }
+              const connector = new OwnerConnector({
+                database: "bounded-discovery",
+                client,
+                locks: registry.context(),
+                announcements: false,
+                brokerBoundMs: bound,
+                brokerTimeoutMs: 5,
+                retryMs: 2,
+                handshakeTimeoutMs: 5,
+                unresponsiveAfterMs: unresponsive,
+                context: () => ({
+                  kind: "page",
+                  visible: true,
+                  superseded: false,
+                  platform: { mobile: false },
+                }),
+                openBroker:
+                  mode === "never ready" || mode === "lock wait" || mode === "startup throws"
+                    ? null
+                    : () => {
+                        if (mode === "broker throws") throw new Error("broker construction failed");
+                        const channel = discoveryChannel();
+                        ports.push(channel.port1, channel.port2);
+                        channel.port1.onmessage = (event) => {
+                          const request = event.data as { t: string; nonce: number };
+                          if (request.t !== "connect") return;
+                          requests++;
+                          if (requests === 2) {
+                            // Witness a repeated reply before the deliberately delayed timer turn.
+                            timing.stalled = true;
+                          }
+                          if (!mode.startsWith("handshake")) {
+                            channel.port1.postMessage({ t: mode, nonce: request.nonce });
+                            return;
+                          }
+                          const owner = discoveryChannel();
+                          ports.push(owner.port1);
+                          owner.port1.onmessage = () => {
+                            if (mode === "handshake newer")
+                              owner.port1.postMessage({
+                                t: "refused",
+                                reason: "version",
+                                ownerProtocol: PROTOCOL_VERSION + 1,
+                                ownerBuild: "newer",
+                              });
+                            if (mode === "handshake refusal")
+                              owner.port1.postMessage({
+                                t: "refused",
+                                reason: "steppingDown",
+                                ownerProtocol: PROTOCOL_VERSION,
+                                ownerBuild: "test",
+                              });
+                          };
+                          channel.port1.postMessage(
+                            {
+                              t: "port",
+                              ownerId: "silent",
+                              nonce: request.nonce,
+                              port: owner.port2,
+                            },
+                            [owner.port2],
+                          );
+                        };
+                        return channel.port2;
+                      },
+                startOwner:
+                  mode === "never ready" || mode === "lock wait" || mode === "startup throws"
+                    ? () => {
+                        spawned++;
+                        if (mode === "startup throws")
+                          throw new Error("worker construction failed");
+                        return {
+                          ready: new Promise(() => undefined),
+                          stopped: new Promise(() => undefined),
+                          lifecycle() {
+                            return undefined;
+                          },
+                          terminate() {
+                            terminated++;
+                          },
+                        };
+                      }
+                    : null,
+              });
+              let ended = false;
+              let effect: string | undefined;
+              const waiting = client
+                .query("SELECT 1")
+                .catch((error: unknown) => {
+                  effect = (error as { effect?: string }).effect;
+                })
+                .finally(() => {
+                  ended = true;
+                });
+              let startEnded = false;
+              let atEnd = {
+                status: connector.status,
+                requests,
+                spawned,
+                terminated,
+                stalled: timing.stalled,
+                hostHeld: registry.held(hostLockName("bounded-discovery")),
+              };
+              const connecting = connector
+                .start()
+                .catch(() => undefined)
+                .finally(() => {
+                  startEnded = true;
+                  atEnd = {
+                    status: connector.status,
+                    requests,
+                    spawned,
+                    terminated,
+                    stalled: timing.stalled,
+                    hostHeld: registry.held(hostLockName("bounded-discovery")),
+                  };
+                });
+              try {
+                // Let responsive discovery repeat with deterministic FIFO delivery. A late turn
+                // fires due timers synchronously, withholding promise continuations until afterward.
+                await vi.advanceTimersByTimeAsync(bound - 1);
+                vi.advanceTimersByTime(timing.stalled ? 200 : 1);
+                await vi.advanceTimersByTimeAsync(0);
+                expect(startEnded).toBe(true);
+                // giveUp changes activity and can start another attempt. Check this attempt's
+                // result and cleanup at its completion, independently of a later retry.
+                expect(atEnd.status).toBe(
+                  mode === "handshake newer" ? "superseded" : "unreachable",
+                );
+                if (mode === "startup throws") expect(atEnd.hostHeld).toBe(false);
+                if (
+                  mode === "noOwner" ||
+                  (mode.startsWith("handshake") && mode !== "handshake newer")
+                )
+                  expect(atEnd.requests).toBeGreaterThan(1);
+                if (mode === "never ready") {
+                  expect(atEnd.spawned).toBeGreaterThan(0);
+                  expect(atEnd.terminated).toBe(atEnd.spawned);
+                }
+                await vi.advanceTimersByTimeAsync(unresponsive + 1);
+                expect(ended).toBe(true);
+                expect(effect).toBe(sent ? "unknown" : "none");
+                const entered = new Set([mode, sent ? "sent unanswered" : "never sent"]);
+                if (atEnd.stalled) entered.add("delayed event-loop turn");
+                reach.recordHistory(entered);
+              } finally {
+                connector.close();
+                held.kill();
+                for (const port of ports) port.close();
+                warm?.server.stepDown("closing");
+                await warm?.engine.close();
+                await Promise.all([waiting, connecting]);
+              }
             } finally {
-              connector.close();
-              held.kill();
-              for (const port of ports) port.close();
-              warm?.server.stepDown("closing");
-              await warm?.engine.close();
-              await Promise.all([waiting, connecting]);
+              vi.useRealTimers();
             }
           },
         ),
