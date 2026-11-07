@@ -14,7 +14,7 @@ import type { MaybePromise } from "../access/key-index.js";
 import { taskClock, yieldTask } from "../exec/pipeline.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { compareBytes } from "../vector/varlen.js";
-import { charged, copyRange, UNCHARGED, type Charge } from "./bytes.js";
+import { charged, copyRange, MemtableMemoryError, UNCHARGED, type Charge } from "./bytes.js";
 
 type DeltaVisitor = (
   arena: Uint8Array,
@@ -32,42 +32,71 @@ const NO_ENTRIES = new Int32Array(0);
 
 export class KeyDelta {
   readonly #charge: Charge;
-  /** Bytes charged for the delta's arrays. */
-  chargedBytes = INITIAL_BYTES;
+  /** Retained arrays/ranges plus the workspaces of active traversals. */
+  chargedBytes = 0;
+  #activeTraversals = 0;
+  #releaseRequested = false;
 
-  /** `charge` pays for every array before it is allocated (the memtable's counter). */
+  /** Every backing capacity is paid before its constructor runs. */
   constructor(charge: Charge = UNCHARGED) {
     this.#charge = charge;
-    charged(charge, INITIAL_BYTES);
+    this.#reserve(INITIAL_BYTES);
+    try {
+      this.#slots = new Int32Array(64);
+      this.#hashes = new Int32Array(16);
+      this.#keyStart = new Int32Array(16);
+      this.#keyEnd = new Int32Array(16);
+      this.#head = new Int32Array(16);
+      this.#arena = new Uint8Array(256);
+      this.#rowIds = new Float64Array(16);
+      this.#seqs = new Float64Array(16);
+      this.#tombstones = new Uint8Array(16);
+      this.#next = new Int32Array(16);
+      this.#keyOf = new Int32Array(16);
+    } catch (error) {
+      this.#releaseRetained();
+      throw error;
+    }
   }
 
-  #grow(bytes: number, freed: number): void {
-    charged(this.#charge, bytes);
-    this.chargedBytes += bytes - freed;
-    // The old arrays are released after the copy (the caller replaces them right after).
-    this.#charge.free(freed);
+  #reserve(bytes: number, charge: Charge = this.#charge): void {
+    if (bytes === 0) return;
+    charged(charge, bytes);
+    this.chargedBytes += bytes;
   }
 
-  /** Returns every charged byte (the delta is dropped). */
+  #free(bytes: number, charge: Charge = this.#charge): void {
+    if (bytes === 0) return;
+    charge.free(bytes);
+    this.chargedBytes -= bytes;
+  }
+
+  /** Idempotent. A suspended traversal retains the arrays until its last use settles. */
   releaseCharge(): void {
-    this.#charge.free(this.chargedBytes);
-    this.chargedBytes = 0;
+    if (this.#releaseRequested) return;
+    this.#releaseRequested = true;
+    if (this.#activeTraversals === 0) this.#releaseRetained();
   }
 
-  #slots: Int32Array = new Int32Array(64);
+  #releaseRetained(): void {
+    this.#free(this.chargedBytes);
+  }
+
+  #slots: Int32Array;
   #mask = 63;
-  #hashes = new Int32Array(16);
-  #keyStart = new Int32Array(16);
-  #keyEnd = new Int32Array(16);
-  #head = new Int32Array(16);
-  #arena = new Uint8Array(256);
+  #hashes: Int32Array;
+  #keyStart: Int32Array;
+  #keyEnd: Int32Array;
+  #head: Int32Array;
+  #arena: Uint8Array;
   #arenaUsed = 0;
+  #maxKeyBytes = 0;
   keyCount = 0;
-  #rowIds = new Float64Array(16);
-  #seqs = new Float64Array(16);
-  #tombstones = new Uint8Array(16);
-  #next = new Int32Array(16);
-  #keyOf = new Int32Array(16);
+  #rowIds: Float64Array;
+  #seqs: Float64Array;
+  #tombstones: Uint8Array;
+  #next: Int32Array;
+  #keyOf: Int32Array;
   entryCount = 0;
 
   /** Bytes held (charged). */
@@ -192,10 +221,17 @@ export class KeyDelta {
     if (this.#arenaUsed + length > this.#arena.length) {
       let size = this.#arena.length * 2;
       while (size < this.#arenaUsed + length) size *= 2;
-      this.#grow(size, this.#arena.byteLength);
-      const grown = new Uint8Array(size);
-      grown.set(this.#arena.subarray(0, this.#arenaUsed));
-      this.#arena = grown;
+      const freed = this.#arena.byteLength;
+      this.#reserve(size);
+      try {
+        const grown = new Uint8Array(size);
+        grown.set(this.#arena.subarray(0, this.#arenaUsed));
+        this.#arena = grown;
+      } catch (error) {
+        this.#free(size);
+        throw error;
+      }
+      this.#free(freed);
     }
     copyRange(this.#arena, this.#arenaUsed, key, start, end);
     const hash = xxHash32(key, 0, start, end) | 0;
@@ -204,6 +240,7 @@ export class KeyDelta {
     this.#keyEnd[index] = this.#arenaUsed + length;
     this.#head[index] = -1;
     this.#arenaUsed += length;
+    if (length > this.#maxKeyBytes) this.#maxKeyBytes = length;
     this.keyCount = index + 1;
     this.#place(index, hash);
     return index;
@@ -216,45 +253,78 @@ export class KeyDelta {
   }
 
   #rehash(size: number): void {
-    this.#grow(size * 4, this.#slots.byteLength);
-    this.#slots = new Int32Array(size);
-    this.#mask = size - 1;
-    for (let index = 0; index < this.keyCount; index++)
-      this.#place(index, this.#hashes[index] ?? 0);
+    const bytes = size * 4,
+      freed = this.#slots.byteLength;
+    this.#reserve(bytes);
+    try {
+      const grown = new Int32Array(size),
+        mask = size - 1;
+      for (let index = 0; index < this.keyCount; index++) {
+        let slot = (this.#hashes[index] ?? 0) & mask;
+        while ((grown[slot] ?? 0) !== 0) slot = (slot + 1) & mask;
+        grown[slot] = index + 1;
+      }
+      this.#slots = grown;
+      this.#mask = mask;
+    } catch (error) {
+      this.#free(bytes);
+      throw error;
+    }
+    this.#free(freed);
   }
 
   #growKeys(): void {
-    const size = this.#hashes.length * 2;
-    this.#grow(4 * size * 4, 4 * this.#hashes.byteLength);
-    const grow = (array: Int32Array) => {
-      const grown = new Int32Array(size);
-      grown.set(array);
-      return grown;
-    };
-    this.#hashes = grow(this.#hashes);
-    this.#keyStart = grow(this.#keyStart);
-    this.#keyEnd = grow(this.#keyEnd);
-    this.#head = grow(this.#head);
+    const size = this.#hashes.length * 2,
+      bytes = 4 * size * 4,
+      freed = 4 * this.#hashes.byteLength;
+    this.#reserve(bytes);
+    try {
+      const grow = (array: Int32Array) => {
+        const grown = new Int32Array(size);
+        grown.set(array);
+        return grown;
+      };
+      const hashes = grow(this.#hashes),
+        starts = grow(this.#keyStart),
+        ends = grow(this.#keyEnd),
+        heads = grow(this.#head);
+      this.#hashes = hashes;
+      this.#keyStart = starts;
+      this.#keyEnd = ends;
+      this.#head = heads;
+    } catch (error) {
+      this.#free(bytes);
+      throw error;
+    }
+    this.#free(freed);
   }
 
   #growEntries(): void {
-    const size = this.#rowIds.length * 2;
-    this.#grow(size * ENTRY_BYTES, this.#rowIds.length * ENTRY_BYTES);
-    const rowIds = new Float64Array(size);
-    rowIds.set(this.#rowIds);
-    this.#rowIds = rowIds;
-    const seqs = new Float64Array(size);
-    seqs.set(this.#seqs);
-    this.#seqs = seqs;
-    const tombstones = new Uint8Array(size);
-    tombstones.set(this.#tombstones);
-    this.#tombstones = tombstones;
-    const next = new Int32Array(size);
-    next.set(this.#next);
-    this.#next = next;
-    const keyOf = new Int32Array(size);
-    keyOf.set(this.#keyOf);
-    this.#keyOf = keyOf;
+    const size = this.#rowIds.length * 2,
+      bytes = size * ENTRY_BYTES,
+      freed = this.#rowIds.length * ENTRY_BYTES;
+    this.#reserve(bytes);
+    try {
+      const rowIds = new Float64Array(size);
+      rowIds.set(this.#rowIds);
+      const seqs = new Float64Array(size);
+      seqs.set(this.#seqs);
+      const tombstones = new Uint8Array(size);
+      tombstones.set(this.#tombstones);
+      const next = new Int32Array(size);
+      next.set(this.#next);
+      const keyOf = new Int32Array(size);
+      keyOf.set(this.#keyOf);
+      this.#rowIds = rowIds;
+      this.#seqs = seqs;
+      this.#tombstones = tombstones;
+      this.#next = next;
+      this.#keyOf = keyOf;
+    } catch (error) {
+      this.#free(bytes);
+      throw error;
+    }
+    this.#free(freed);
   }
 
   /**
@@ -262,14 +332,17 @@ export class KeyDelta {
    * Ordered chains are visited linearly; arbitrary chains use an in-place O(n log n) heapsort.
    * Large traversals share the worker task clock, and suspend only for a real task yield.
    * Scratch belongs to this traversal: another traversal can run while this one yields.
+   * The caller keeps the input immutable until completion. `visit` borrows the key arena;
+   * retaining it after completion requires retaining the delta's ownership too.
    */
   forEachSorted(
     bound: number,
     visit: DeltaVisitor,
     keep: KeepEntry | null = null,
     check: (() => void) | null = null,
+    workspace: Charge = this.#charge,
   ): MaybePromise<void> {
-    const work = this.#sortedWork(bound, visit, keep, check);
+    const work = this.#sortedWork(bound, visit, keep, check, workspace);
     const resume = (): MaybePromise<void> => {
       const next = work.next();
       return next.done ? undefined : next.value.then(resume);
@@ -282,83 +355,111 @@ export class KeyDelta {
     visit: DeltaVisitor,
     keep: KeepEntry | null,
     check: (() => void) | null,
+    workspace: Charge,
   ): Generator<Promise<void>, void, unknown> {
-    yield* checkpoint(check);
-    const arena = this.#arena;
-    const starts = this.#keyStart;
-    const ends = this.#keyEnd;
-    const compareSlots = (a: number, b: number) =>
-      compareBytes(arena, starts[a] ?? 0, ends[a] ?? 0, arena, starts[b] ?? 0, ends[b] ?? 0);
-    const order = new Int32Array(this.keyCount);
-    let ascending = true;
-    for (let from = 0; from < this.keyCount; from += 128) {
+    if (this.#releaseRequested) throw new RangeError("A released key delta cannot be traversed");
+    this.#activeTraversals++;
+    let workspaceBytes = 0;
+    try {
       yield* checkpoint(check);
-      ascending = fillKeyOrder(
-        order,
-        from,
-        Math.min(from + 128, order.length),
-        ascending,
-        compareSlots,
-      );
-    }
-    if (!ascending) yield* sortIndices(order, order.length, compareSlots, check);
-    const rowIds = this.#rowIds;
-    const seqs = this.#seqs;
-    const tombstones = this.#tombstones;
-    const next = this.#next;
-    const compareEntries = (a: number, b: number) =>
-      (rowIds[a] ?? 0) - (rowIds[b] ?? 0) || (tombstones[a] ?? 0) - (tombstones[b] ?? 0);
-    let scratch: Int32Array = NO_ENTRIES;
-    for (let slot = 0; slot < order.length;) {
-      yield* checkpoint(check);
-      const limit = Math.min(slot + 128, order.length);
-      slot = this.#emitSingles(order, slot, limit, bound, visit, keep);
-      if (slot === limit) continue;
-      const keySlot = order[slot++] ?? 0;
-      const start = starts[keySlot] ?? 0;
-      const end = ends[keySlot] ?? 0;
-      const head = this.#head[keySlot] ?? -1;
-      if (scratch.length === 0) scratch = new Int32Array(16);
-      let count = 0;
-      let walked = 0;
-      let forward = true;
-      let reverse = true;
-      for (let entry = head; entry >= 0; entry = next[entry] ?? -1) {
-        if ((walked++ & 127) === 0) yield* checkpoint(check);
-        if ((seqs[entry] ?? 0) > bound) continue;
-        const rowId = rowIds[entry] ?? 0;
-        const tombstone = tombstones[entry] === 1;
-        if (keep !== null && !keep(rowId, tombstone)) continue;
-        if (count >= scratch.length) {
-          const grown: Int32Array = new Int32Array(scratch.length * 2);
-          grown.set(scratch);
-          scratch = grown;
-        }
-        if (count > 0) {
-          const comparison = compareEntries(scratch[count - 1] ?? 0, entry);
-          forward &&= comparison <= 0;
-          reverse &&= comparison >= 0;
-        }
-        scratch[count++] = entry;
-      }
-      if (!forward && !reverse) yield* sortIndices(scratch, count, compareEntries, check);
-      for (let from = 0; from < count; from += 128) {
+      const arena = this.#arena;
+      const starts = this.#keyStart;
+      const ends = this.#keyEnd;
+      const compareSlots = (a: number, b: number) =>
+        compareBytes(arena, starts[a] ?? 0, ends[a] ?? 0, arena, starts[b] ?? 0, ends[b] ?? 0);
+      const orderBytes = this.keyCount * 4;
+      this.#reserve(orderBytes, workspace);
+      workspaceBytes += orderBytes;
+      const order = new Int32Array(this.keyCount);
+      let ascending = true;
+      for (let from = 0; from < this.keyCount; from += 128) {
         yield* checkpoint(check);
-        emitEntries(
-          scratch,
+        ascending = fillKeyOrder(
+          order,
           from,
-          Math.min(from + 128, count),
-          reverse,
-          count,
-          rowIds,
-          tombstones,
-          arena,
-          start,
-          end,
-          visit,
+          Math.min(from + 128, order.length),
+          ascending,
+          compareSlots,
         );
       }
+      if (!ascending) yield* sortIndices(order, order.length, compareSlots, check);
+      const rowIds = this.#rowIds;
+      const seqs = this.#seqs;
+      const tombstones = this.#tombstones;
+      const next = this.#next;
+      const compareEntries = (a: number, b: number) =>
+        (rowIds[a] ?? 0) - (rowIds[b] ?? 0) || (tombstones[a] ?? 0) - (tombstones[b] ?? 0);
+      let scratch: Int32Array = NO_ENTRIES;
+      for (let slot = 0; slot < order.length;) {
+        yield* checkpoint(check);
+        const limit = Math.min(slot + 128, order.length);
+        slot = this.#emitSingles(order, slot, limit, bound, visit, keep);
+        if (slot === limit) continue;
+        const keySlot = order[slot++] ?? 0;
+        const start = starts[keySlot] ?? 0;
+        const end = ends[keySlot] ?? 0;
+        const head = this.#head[keySlot] ?? -1;
+        if (scratch.length === 0) {
+          this.#reserve(16 * 4, workspace);
+          workspaceBytes += 16 * 4;
+          scratch = new Int32Array(16);
+        }
+        let count = 0;
+        let walked = 0;
+        let forward = true;
+        let reverse = true;
+        for (let entry = head; entry >= 0; entry = next[entry] ?? -1) {
+          if ((walked++ & 127) === 0) yield* checkpoint(check);
+          if ((seqs[entry] ?? 0) > bound) continue;
+          const rowId = rowIds[entry] ?? 0;
+          const tombstone = tombstones[entry] === 1;
+          if (keep !== null && !keep(rowId, tombstone)) continue;
+          if (count >= scratch.length) {
+            const bytes = scratch.byteLength * 2;
+            this.#reserve(bytes, workspace);
+            workspaceBytes += bytes;
+            const prior = scratch;
+            const grown: Int32Array = new Int32Array(scratch.length * 2);
+            grown.set(prior);
+            scratch = grown;
+            this.#free(prior.byteLength, workspace);
+            workspaceBytes -= prior.byteLength;
+          }
+          if (count > 0) {
+            const comparison = compareEntries(scratch[count - 1] ?? 0, entry);
+            forward &&= comparison <= 0;
+            reverse &&= comparison >= 0;
+          }
+          scratch[count++] = entry;
+        }
+        if (!forward && !reverse) yield* sortIndices(scratch, count, compareEntries, check);
+        for (let from = 0; from < count; from += 128) {
+          yield* checkpoint(check);
+          emitEntries(
+            scratch,
+            from,
+            Math.min(from + 128, count),
+            reverse,
+            count,
+            rowIds,
+            tombstones,
+            arena,
+            start,
+            end,
+            visit,
+          );
+        }
+      }
+    } finally {
+      this.#free(workspaceBytes, workspace);
+      this.#finishTraversal();
     }
+  }
+
+  /** Re-read ownership after suspension; release may have been requested by another task. */
+  #finishTraversal(): void {
+    this.#activeTraversals--;
+    if (this.#activeTraversals === 0 && this.#releaseRequested) this.#releaseRetained();
   }
 
   /** Ordinary bounded loop: row emission stays outside the generator's suspension state. */
@@ -395,12 +496,28 @@ export class KeyDelta {
   /**
    * The smallest and largest key this delta has ever held (key slots, cached until a key is
    * added; popped entries keep their keys, so the range may be wider: sound for skipping), or
-   * null when it has no key. For deltas that no longer change (frozen, staged, published
-   * memtables), it is computed once.
+   * null when it has no key or cannot fund the optional copies. A nonempty delta with no
+   * funded range cannot be pruned. Frozen deltas compute their funded range once.
+   * Returned bytes are borrowed until the next cache attempt or `releaseCharge`. Current
+   * callers compare them synchronously; a caller retaining a range must own its copy.
    */
   keyRange(): { readonly min: Uint8Array; readonly max: Uint8Array } | null {
     if (this.keyCount === 0) return null;
     if (this.#range !== null && this.#rangeKeys === this.keyCount) return this.#range;
+    // Decline before walking keys when copies cannot fit. Otherwise repeated pressure would
+    // turn this optional cache into a full key walk on every uniqueness check.
+    const reserved = 2 * this.#maxKeyBytes;
+    try {
+      this.#reserve(reserved);
+    } catch (error) {
+      if (!(error instanceof MemtableMemoryError)) throw error;
+      const prior = this.#rangeBytes;
+      this.#range = null;
+      this.#rangeKeys = 0;
+      this.#rangeBytes = 0;
+      this.#free(prior);
+      return null;
+    }
     const arena = this.#arena;
     const starts = this.#keyStart;
     const ends = this.#keyEnd;
@@ -412,13 +529,29 @@ export class KeyDelta {
       if (compareBytes(arena, start, end, arena, starts[min] ?? 0, ends[min] ?? 0) < 0) min = slot;
       if (compareBytes(arena, start, end, arena, starts[max] ?? 0, ends[max] ?? 0) > 0) max = slot;
     }
-    this.#range = { min: this.keyBytes(min).slice(), max: this.keyBytes(max).slice() };
+    const minKey = this.keyBytes(min),
+      maxKey = this.keyBytes(max);
+    const bytes = minKey.byteLength + maxKey.byteLength;
+    let range: { readonly min: Uint8Array; readonly max: Uint8Array };
+    try {
+      range = { min: new Uint8Array(minKey.byteLength), max: new Uint8Array(maxKey.byteLength) };
+      range.min.set(minKey);
+      range.max.set(maxKey);
+    } catch (error) {
+      this.#free(reserved);
+      throw error;
+    }
+    const prior = this.#rangeBytes;
+    this.#range = range;
     this.#rangeKeys = this.keyCount;
-    return this.#range;
+    this.#rangeBytes = bytes;
+    this.#free(prior + reserved - bytes);
+    return range;
   }
 
   #range: { readonly min: Uint8Array; readonly max: Uint8Array } | null = null;
   #rangeKeys = 0;
+  #rangeBytes = 0;
 
   /**
    * Key slots in key-byte order, each with its entries in (row id, put before tombstone) order,

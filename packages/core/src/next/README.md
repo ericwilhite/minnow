@@ -105,6 +105,18 @@ check lives in `scripts/write-hot-key-cpu.test.ts`, outside the browser core.
 `scripts/write-run-bench.mts --hot-key` measures the built component in interleaved CPU rounds.
 Stored run bytes and the Bloom format are unchanged.
 
+Delta array constructors and growth copies pay before allocation, retaining the old capacity's
+charge until the copy finishes. Cached key-range copies pay for replacement overlap too;
+when funding is unavailable, their cache is shed and uniqueness uses full probes. A nonempty
+layer with no funded bounds is never skipped. `write/range-pressure.test.ts` generates these
+histories through a held flush and durable reopen over memory and simulated IndexedDB.
+Each traversal charges its order and chain buffers and refunds them on success, cancellation
+or failure. Published-run encoding uses the metadata budget for that temporary workspace, so
+pressure unwinds the publication and waits through its retry path. Dropping a delta while a
+traversal is suspended keeps its source arrays charged until the last traversal settles.
+`write/key-hash-accounting.test.ts` intercepts native constructors independently of the
+charge callbacks and checks capacities, overlap, refusal, constructor failures and release.
+
 ### Commit encoding under the cap
 
 Commit encoding has a separate, fixed 6 MiB minimum, admitted before the engine runs. It charges

@@ -106,7 +106,7 @@ import { MetadataBudget, releaseIdle } from "./budget.js";
 import { GroupWriter } from "../page/writer.js";
 import type { StoreSession } from "../storage/contract.js";
 import { ExtentListKeeper, type ExtentList } from "../storage/extent-list.js";
-import type { ExtentWriter } from "../storage/extents.js";
+import type { ByteBudget, ExtentWriter } from "../storage/extents.js";
 import type { StatValue } from "../types.js";
 import { layoutOf } from "../types.js";
 import type { Vector } from "../vector/vector.js";
@@ -2553,7 +2553,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
           for (const index of def.indexes) {
             const delta = memtable.deltas.get(index.id);
             if (delta === undefined || delta.entryCount === 0) continue;
-            const run = await encodeDelta(delta, through, null, () => this.#check());
+            const run = await encodeDelta(
+              delta,
+              through,
+              null,
+              () => this.#check(),
+              this.#metadataBudget,
+            );
             if (run === null) continue;
             runs.set(index.id, runRef(run, (await writer.write(run.parts)).blobs));
           }
@@ -2589,7 +2595,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
           for (const index of def.indexes) {
             const delta = memtable.deltas.get(index.id);
             if (delta === undefined) continue;
-            const run = await encodeDelta(delta, through, null, () => this.#check());
+            const run = await encodeDelta(
+              delta,
+              through,
+              null,
+              () => this.#check(),
+              this.#metadataBudget,
+            );
             if (run === null) continue;
             runs.set(index.id, runRef(run, (await writer.write(run.parts)).blobs));
           }
@@ -2621,7 +2633,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
         for (const index of def.indexes) {
           const delta = memtable.deltas.get(index.id);
           if (delta === undefined) continue;
-          const run = await encodeDelta(delta, through, null, () => this.#check());
+          const run = await encodeDelta(
+            delta,
+            through,
+            null,
+            () => this.#check(),
+            this.#metadataBudget,
+          );
           if (run === null) continue;
           const written = await writer.write(run.parts);
           runs.set(index.id, runRef(run, written.blobs));
@@ -3246,6 +3264,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         Infinity,
         (rowId, tombstone) => !tombstone && rowId >= first && rowId < end,
         () => this.#check(),
+        this.#metadataBudget,
       );
       if (run !== null) {
         const written = await writer.write(run.parts);
@@ -4351,6 +4370,7 @@ function encodeDelta(
   bound: number,
   keep: ((rowId: number, tombstone: boolean) => boolean) | null = null,
   check: (() => void) | null = null,
+  workspace?: ByteBudget,
 ): MaybePromise<EncodedRun | null> {
   const builder = new RunBuilder();
   const pending = delta.forEachSorted(
@@ -4360,6 +4380,7 @@ function encodeDelta(
     },
     keep,
     check,
+    workspace,
   );
   return pending instanceof Promise ? pending.then(() => builder.finish()) : builder.finish();
 }

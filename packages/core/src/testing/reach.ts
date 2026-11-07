@@ -1864,3 +1864,35 @@ export const WRITE_HOT_KEY_STATES = [
   "task yields",
   "short traversals accumulate",
 ] as const;
+
+/** Write rule 4: actual native capacities, overlap, refusal and suspension lifetimes. */
+export const WRITE_DELTA_ACCOUNTING_STATES = [
+  "constructor precharge",
+  "initial constructor failure",
+  "order buffer",
+  "chain growth overlap",
+  "full memtable",
+  "visitor failure",
+  "range cache",
+  "range replacement overlap",
+  "denial before allocation",
+  "retained growth overlap",
+  "constructor failure refund",
+  "last entry array failure",
+  "release while suspended",
+  "publication workspace pressure",
+] as const;
+
+/** An unfunded nonempty range is unknown, never evidence that a layer is empty. */
+export const WRITE_RANGE_PRESSURE_STATES = [
+  "memory",
+  "indexeddb",
+  "single row",
+  "batch rows",
+  "single conflict",
+  "batch conflict",
+  "accepted fresh keys",
+  "nonempty range unavailable",
+  "publication",
+  "durable reopen",
+] as const;

@@ -133,7 +133,10 @@
  * the next commit (zero wakeups when idle).
  *
  * ## Memory (rulings R5, R16.3)
- * - Memtables, index deltas and their scratch use the write-path grant (memory/governor.ts).
+ * - Memtables and retained index deltas/ranges use the write-path grant (memory/governor.ts).
+ *   Run-encoding traversal workspaces use the retrying metadata budget. Their order/chain
+ *   capacities include old/new growth overlap and stay charged through the last use, including
+ *   task suspension. Releasing a delta defers its source-array refund until traversals settle.
  *   Commit codec/log buffers and bounded codec workspaces use a separate admitted grant. Resident
  *   directories, roots, fences and Bloom filters use its separate metadata grant. Every byte is
  *   charged before allocation. Freeing buffers returns allocations to a grant; unused growth

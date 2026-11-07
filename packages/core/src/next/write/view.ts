@@ -759,7 +759,7 @@ export function otherIndexLayersEndBefore(
     const delta = memtable.deltas.get(indexId);
     if (delta === undefined || delta === own) continue;
     const range = delta.keyRange();
-    if (range !== null && !before(range.max)) return false;
+    if (range === null ? delta.keyCount > 0 : !before(range.max)) return false;
   }
   return true;
 }
@@ -873,7 +873,7 @@ export class ViewIndex implements IndexReader {
       const delta = memtable.deltas.get(this.def.id);
       if (delta === undefined || delta === own) continue;
       const range = delta.keyRange();
-      if (range !== null && !outside(range.min, range.max)) return true;
+      if (range === null ? delta.keyCount > 0 : !outside(range.min, range.max)) return true;
     }
     return false;
   }
