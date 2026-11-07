@@ -1910,6 +1910,18 @@ root lists reconsiders every gap; debt can remain if fragmentation still exceeds
 the capped arena. Full recovery follows when coalescing brings the gap count
 within capacity. No current-root-only background rebuild is enabled.
 
+### Atomic memory ownership transfer
+
+`CacheMemory.takeFrom` transfers an existing ordinary buffer allocation from a
+live grant of the same governor to a registered cache owner. It changes neither
+total charged bytes nor peak usage, and never drains the admission queue between
+owners. The source loses both allocated and held bytes; its caller must stop
+using and freeing that allocation. The destination releases the charge at the
+end of its lifetime. Progress-loan capacity remains with the source and cannot
+become permanent metadata. Foreign, closed or insufficient sources fail without
+changing either owner. This additive operation is optional for structural test
+budgets; callers must check support before depending on an atomic handoff.
+
 ### Owner-private metadata backing
 
 The store session exposes fixed 60 KiB metadata pages independently of operator

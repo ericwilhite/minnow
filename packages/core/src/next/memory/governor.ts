@@ -21,6 +21,9 @@
  *    governor. `allocate` takes free held bytes first and grows (spillable grants only) for the
  *    shortfall; it never waits. A resize allocates the new buffer before freeing the old one, so
  *    growth overlap is counted.
+ *    An explicitly transferred buffer may move from a grant to a registered cache atomically
+ *    (`takeFrom`): allocated and ordinary held bytes leave the grant, and the cache owns the
+ *    existing charge. Total usage and queue order do not change. Loan bytes cannot be transferred.
  * 5. **Progress is scheduled apart from admission.** An operator that cannot progress by spilling
  *    (one value larger than a batch, a result frame waiting for credit, a spill buffer it must fill
  *    before it can free anything) `borrow`s a **loan**. Loans are served first-come, before any
@@ -152,6 +155,8 @@ export interface MemoryGovernor {
   registerCache(cache: EvictableCache): {
     charge(bytes: number): boolean;
     release(bytes: number): void;
+    /** Transfers existing ordinary allocated bytes from this governor's live grant; no admission. */
+    takeFrom?(source: unknown, bytes: number): boolean;
     /**
      * Stops asking this cache to evict (a cache that closes; release its bytes first). Optional:
      * a cache that lives as long as its governor need not call it.
@@ -543,7 +548,25 @@ export class Governor implements MemoryGovernor {
   /** Registers one more cache (rule 6); every registered cache is evicted before anything waits. */
   registerCache(cache: EvictableCache) {
     if (!this.#caches.includes(cache)) this.#caches.push(cache);
+    let active = true;
     return {
+      takeFrom: (source: unknown, bytes: number): boolean => {
+        if (!Number.isSafeInteger(bytes) || bytes < 0) throw new RangeError("Bad transfer size");
+        if (
+          !active ||
+          !(source instanceof GrantImpl) ||
+          source.governor !== this ||
+          source.closed ||
+          source.allocated < bytes ||
+          source.held - source.loan < bytes
+        )
+          return false;
+        // No give/take/drain, eviction or callback between the two ownership changes. Existing
+        // ordinary capacity changes owner; it cannot serve a queued admission in between.
+        source.allocated -= bytes;
+        source.held -= bytes;
+        return true;
+      },
       charge: (bytes: number): boolean => {
         if (this.#loans.length > 0 || this.#admissions.length > 0) return false;
         if (this.#missing(bytes, false) > 0) return false;
@@ -554,6 +577,7 @@ export class Governor implements MemoryGovernor {
         this.give(bytes);
       },
       unregister: (): void => {
+        active = false;
         const at = this.#caches.indexOf(cache);
         if (at >= 0) this.#caches.splice(at, 1);
       },

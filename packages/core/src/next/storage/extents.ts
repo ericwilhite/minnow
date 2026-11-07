@@ -227,6 +227,12 @@ export interface ByteBudget {
 export interface CacheMemory {
   charge(bytes: number): boolean;
   release(bytes: number): void;
+  /** Move an existing ordinary allocation into this owner, atomically and without admission.
+   * On true the source loses allocated AND held bytes; do not also call source.free().
+   * False changes nothing (foreign/closed source, insufficient ordinary bytes, or no support).
+   * Never transfers a progress loan into retained state.
+   */
+  takeFrom?(source: ByteBudget, bytes: number): boolean;
   /** Unregister a closed cache or retained metadata owner, after returning its bytes. */
   unregister?(): void;
 }

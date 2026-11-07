@@ -1611,6 +1611,12 @@ brings fragmentation within capacity. Unchanged extreme fragmentation may retain
 reopen. This allocator is tested in isolation before integration with root-list provenance;
 unknown space never authorizes a root reference or retirement.
 
+Memory-transfer histories fill ordinary capacity, queue another admission and
+move an existing allocation into a cache owner without adding or releasing a
+charge. They also move ordinary allocations beside an active loan, refuse loan
+capture, and require both owners to return every byte on close. Foreign and
+closed grants cannot transfer into another owner's accounting.
+
 Private-metadata histories run over memory, both simulated fences, OPFS handles and
 IndexedDB. Random page rewrites must survive the operator-spill sweep; resetting
 metadata must preserve roots, log, data and operator spill. Every read, write and

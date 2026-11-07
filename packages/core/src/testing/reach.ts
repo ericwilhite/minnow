@@ -49,6 +49,15 @@ export const METADATA_STORE_REACH = [
   "replacement reset",
 ] as const;
 
+/** Moving an existing allocation changes ownership, never capacity or the progress reserve. */
+export const CACHE_TRANSFER_REACH = [
+  "at capacity",
+  "queued admission unchanged",
+  "loan capture refused",
+  "ordinary transfer beside loan",
+  "both owners close",
+] as const;
+
 /** Full-scan shared windows: the default and override must cover cold and resident reads. */
 export const SCAN_WINDOW_RESIDENCY_REACH = [
   "default cold",
