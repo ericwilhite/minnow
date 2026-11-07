@@ -17,6 +17,7 @@ function outcome(error: unknown): string {
   if (typeof error === "object" && error !== null && "code" in error) return String(error.code);
   return String(error).includes("in a read-only transaction") ? "25006" : String(error);
 }
+// 5,568 graph shapes through four entry points take about 22 s alone, past the 20 s local default.
 it("refuses the same CTE dependency graphs as PostgreSQL through SQL and copied typed plans", async () => {
   const reach = createReach<string>("shipped locking CTE graph", ROW_LOCK_GRAPH_STATES);
   const failures: string[] = [];
@@ -78,4 +79,4 @@ it("refuses the same CTE dependency graphs as PostgreSQL through SQL and copied 
   } finally {
     for (const db of databases) await db.close();
   }
-});
+}, 120_000);
