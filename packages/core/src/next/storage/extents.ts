@@ -227,6 +227,8 @@ export interface ByteBudget {
 export interface CacheMemory {
   charge(bytes: number): boolean;
   release(bytes: number): void;
+  /** Unregister a closed cache or retained metadata owner, after returning its bytes. */
+  unregister?(): void;
 }
 
 /** What the governor calls on the cache (`EvictableCache`). */
@@ -276,9 +278,10 @@ export interface OpenSpaceOptions extends TaskWork {
   readonly walk?: ReachableExtents;
   /** Cross-check `reachable` against `walk` at open as well as in `audit` (test builds). */
   readonly verifyAtOpen?: boolean;
-  /** Charged for the walk's leases (the owner's startup grant); `audit` uses it too. */
+  /** Charged for startup leases and retained-map construction. Retained state transfers
+   * to a lifetime handle from `registerCache` before open returns; audits use this budget too. */
   readonly budget: ByteBudget;
-  /** Registers the cache with the governor and returns its handle (`governor.registerCache`). */
+  /** Registers the page cache or non-evictable metadata owner with the governor; may be called twice. */
   readonly registerCache: (cache: EvictableCacheLike) => CacheMemory;
   readonly signal?: AbortSignal;
 }

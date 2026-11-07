@@ -19,6 +19,7 @@
  * array splice. Runs stay few because placement is first fit and frees coalesce.
  */
 import { pauseIfDue, sortInSlices, type TaskWork } from "../task.js";
+import type { RetainedCapacity } from "./retained-memory.js";
 
 export class FreeSpaceMap {
   readonly align: number;
@@ -28,7 +29,10 @@ export class FreeSpaceMap {
   readonly #ends: number[] = [];
   #end = 0;
 
-  constructor(align: number) {
+  constructor(
+    align: number,
+    readonly capacity?: RetainedCapacity,
+  ) {
     if (!(Number.isSafeInteger(align) && align > 0)) throw new RangeError("Bad alignment");
     this.align = align;
   }
@@ -72,10 +76,11 @@ export class FreeSpaceMap {
     length: number,
     allocated: Iterable<{ readonly offset: number; readonly length: number }>,
     work?: TaskWork,
+    capacity?: RetainedCapacity,
   ): Promise<FreeSpaceMap> {
     const firstPause = pauseIfDue(work);
     if (firstPause !== undefined) await firstPause;
-    const map = new FreeSpaceMap(align);
+    const map = new FreeSpaceMap(align, capacity);
     const extents: Array<{ offset: number; end: number }> = [];
     for (const extent of allocated) {
       if (extents.length % 128 === 0) {
@@ -117,8 +122,9 @@ export class FreeSpaceMap {
     length: number,
     allocated: AsyncIterable<{ readonly offset: number; readonly length: number }>,
     work?: TaskWork,
+    capacity?: RetainedCapacity,
   ): Promise<FreeSpaceMap> {
-    const map = new FreeSpaceMap(align);
+    const map = new FreeSpaceMap(align, capacity);
     let cursor = 0;
     let previous: { offset: number; end: number } | null = null;
     for await (const extent of allocated) {
@@ -224,6 +230,7 @@ export class FreeSpaceMap {
     } else if (joinsBefore) this.#ends[before] = end;
     else if (joinsNext) this.#starts[next] = offset;
     else {
+      this.capacity?.ensure(this.#starts.length + 1);
       this.#starts.splice(next, 0, offset);
       this.#ends.splice(next, 0, end);
     }
@@ -267,6 +274,7 @@ export class FreeSpaceMap {
   }
 
   #push(start: number, end: number): void {
+    this.capacity?.ensure(this.#starts.length + 1);
     this.#starts.push(start);
     this.#ends.push(end);
   }
@@ -298,6 +306,7 @@ export class FreeSpaceMap {
     } else if (runStart === start) this.#starts[index] = end;
     else if (runEnd === end) this.#ends[index] = start;
     else {
+      this.capacity?.ensure(this.#starts.length + 1);
       this.#ends[index] = start;
       this.#starts.splice(index + 1, 0, end);
       this.#ends.splice(index + 1, 0, runEnd);

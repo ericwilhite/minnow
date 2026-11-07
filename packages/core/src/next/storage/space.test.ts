@@ -4,6 +4,7 @@
  * cache. Crash behaviour is in space-crash.test.ts; the real governor in
  * testing/storage-space.test.ts.
  */
+import { RETAINED_BASE_BYTES } from "./retained-memory.js";
 import { describe, expect, it } from "vitest";
 import { storeConformanceCases } from "./conformance.js";
 import { DATA_ALIGN, StoreCorruptionError, type StoreSession } from "./contract.js";
@@ -574,18 +575,18 @@ describe("extent space: reads, leases and the cache", () => {
   it("charges unpinned blobs to the cache and pinned ones to the reader, and evicts on demand", async () => {
     const memory = countingMemory(Infinity);
     const { space } = await openOver(new MemoryBackend(), { memory });
-    expect(memory.used).toBe(FIXED_CACHE_BYTES);
+    expect(memory.used).toBe(FIXED_CACHE_BYTES + RETAINED_BASE_BYTES);
     const writer = space.beginWrite("t");
     const { blobs } = await writer.write([bytesOf(1000, 1), bytesOf(3000, 2)]);
     const budget = countingBudget(1 << 20);
     const lease = await space.read(blobs, { budget });
-    expect(memory.used).toBe(FIXED_CACHE_BYTES);
+    expect(memory.used).toBe(FIXED_CACHE_BYTES + RETAINED_BASE_BYTES);
     expect(space.stats.cache.pinnedBytes).toBe(4000);
     expect(memory.cache?.evictableBytes).toBe(0);
     lease.release();
-    expect(memory.used).toBe(FIXED_CACHE_BYTES + 4000 + 2 * ENTRY_OVERHEAD);
+    expect(memory.used).toBe(FIXED_CACHE_BYTES + RETAINED_BASE_BYTES + 4000 + 2 * ENTRY_OVERHEAD);
     expect(memory.cache?.evict(1)).toBeGreaterThan(0);
-    expect(memory.used).toBe(FIXED_CACHE_BYTES + 3000 + ENTRY_OVERHEAD);
+    expect(memory.used).toBe(FIXED_CACHE_BYTES + RETAINED_BASE_BYTES + 3000 + ENTRY_OVERHEAD);
     expect(space.peek(at(blobs, 1))).not.toBeNull();
     await space.close();
     expect(memory.used).toBe(0);

@@ -1375,7 +1375,11 @@ No operation entry or resolved read restarts it. Bounded loops check the deadlin
 task when due, and check cancellation on resume. Delta sorting uses an in-place sliced heapsort. Normal listed-root startup stream-merges both
 ordered roots directly into the free map, decoding one page per root at a time. Scattered list-page
 allocations use seven bounded radix passes over page references, so reconstruction is O(extents +
-list pages), with no extent Maps or comparison sort. Unordered reachability callbacks and full
+list pages), with no extent Maps or comparison sort. Retained free-run arrays and retirement
+state reserve conservative capacity (including growth overlap) before allocating. Startup
+transfers that charge to a non-evictable lifetime handle, released at space close. Capacity
+charges remain at their high-water mark after entries are deleted. Audits serialize with
+publication so their roots and allocator belong to one generation. Unordered reachability callbacks and full
 audit/test-open validation retain their separate collection/sort path. All paths cooperate with
 the shared clock and cancellation.
 Timer/cancellation regressions include cached reads, immediate writes and two preparations

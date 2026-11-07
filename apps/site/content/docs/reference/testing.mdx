@@ -1431,6 +1431,12 @@ The default fence deadline is unchanged; the ready timer includes acquisition an
 Ordered-root startup regressions require a streaming union without the unordered free-map sort,
 validate scattered list-page allocations, and refuse overlapping, descending or inconsistent
 extents before reclaim. Full audit and test-build semantic checks remain enabled separately.
+Retained free-run and previous-only retirement capacity is admitted before allocation, including
+old/new backing-store overlap. The charge transfers from the startup grant to the space and
+remains until close; deleting entries does not assume the JavaScript containers release capacity.
+Finite-budget regressions cover refusal, transfer refusal, cancellation, fragmentation,
+previous-root retirement and cleanup. Audits hold the publication lock across root enumeration
+and allocator checks, so concurrent publication cannot make their captured roots stale.
 
 The real owner-ready composition holds initial flush, merge and recycle work until the page
 acknowledges receiving ready, then resumes it. Native file/range and logical call-site tracing

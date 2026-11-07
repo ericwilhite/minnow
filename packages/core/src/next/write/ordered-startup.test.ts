@@ -5,6 +5,9 @@ import { MemoryBackend } from "../storage/memory-store.js";
 import { openExtentSpace } from "../storage/space.js";
 import { FreeSpaceMap } from "../storage/free-space.js";
 import { countingBudget, countingMemory } from "../storage/space-test-support.js";
+import { ReadDeniedError } from "../storage/extents.js";
+import { RETAINED_BASE_BYTES, RETIRED_SLOT_BYTES } from "../storage/retained-memory.js";
+import { FIXED_CACHE_BYTES } from "../storage/page-cache.js";
 import type { ReachableExtents } from "../storage/extents.js";
 
 it("stream-merges ordered roots without the unordered sort constructor", async () => {
@@ -28,11 +31,30 @@ it("stream-merges ordered roots without the unordered sort constructor", async (
   const sorted = vi.spyOn(FreeSpaceMap, "fromAllocatedAsync");
   let space;
   try {
+    // Half of the union belongs only to the previous root. The old 8 MiB
+    // fixture budget hid that retained state; it must now refuse and clean up.
+    const refused = countingBudget(8 << 20);
+    const refusedMemory = countingMemory(Infinity);
+    await expect(
+      openExtentSpace(session, {
+        reachable,
+        budget: refused,
+        registerCache: () => refusedMemory,
+      }),
+    ).rejects.toBeInstanceOf(ReadDeniedError);
+    expect(refused.used).toBe(0);
+    expect(refusedMemory.used).toBe(0);
+    visited = 0;
+    const retainedBytes = RETAINED_BASE_BYTES + 2 * 65536 * RETIRED_SLOT_BYTES;
+    const budget = countingBudget(retainedBytes);
+    const memory = countingMemory(Infinity);
     space = await openExtentSpace(session, {
       reachable,
-      budget: countingBudget(8 << 20),
-      registerCache: () => countingMemory(Infinity),
+      budget,
+      registerCache: () => memory,
     });
+    expect(budget.used).toBe(0);
+    expect(memory.used).toBe(FIXED_CACHE_BYTES + retainedBytes);
     expect(sorted).not.toHaveBeenCalled();
     expect(visited).toBe(100_000);
     expect(space.stats.dataBytes).toBe(length);

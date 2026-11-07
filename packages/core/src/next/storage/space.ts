@@ -56,6 +56,12 @@ import { PageCache } from "./page-cache.js";
 import { ReclaimLedger, type RootPin } from "./reclaim.js";
 import { ExtentReservation, type SealPlan } from "./reservation.js";
 import { MAX_SLAB } from "./slabs.js";
+import {
+  RetainedMemory,
+  RetainedCapacity,
+  FREE_RUN_SLOT_BYTES,
+  RETIRED_SLOT_BYTES,
+} from "./retained-memory.js";
 
 const alignDown = (value: number) => value - (value % DATA_ALIGN);
 
@@ -202,6 +208,8 @@ async function orderedMap(
   options: OpenSpaceOptions,
   reader: ExtentReader,
   dataLength: number,
+  runs: RetainedCapacity,
+  retirements: RetainedCapacity,
 ): Promise<{ map: FreeSpaceMap; retired: DataRange[] }> {
   async function* input(bytes: Uint8Array | null) {
     if (bytes === null) return;
@@ -246,6 +254,7 @@ async function orderedMap(
           a = await current.next();
         } else if (!b.done && (a.done || b.value.offset < a.value.offset)) {
           const ref = b.value;
+          retirements.ensure(retired.length + 1);
           retired.push({
             offset: ref.offset,
             length: Math.ceil(ref.length / DATA_ALIGN) * DATA_ALIGN,
@@ -269,7 +278,13 @@ async function orderedMap(
     }
   }
   return {
-    map: await FreeSpaceMap.fromSortedAllocatedAsync(DATA_ALIGN, dataLength, union(), options),
+    map: await FreeSpaceMap.fromSortedAllocatedAsync(
+      DATA_ALIGN,
+      dataLength,
+      union(),
+      options,
+      runs,
+    ),
     retired,
   };
 }
@@ -291,7 +306,11 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
   const cache = new PageCache(session);
   cache.attach(options.registerCache(cache));
   let opened: Space | null = null;
+  let memory: RetainedMemory | null = null;
   try {
+    memory = RetainedMemory.create(options.budget);
+    const runs = new RetainedCapacity(memory, FREE_RUN_SLOT_BYTES);
+    const retirements = new RetainedCapacity(memory, RETIRED_SLOT_BYTES);
     const reader = {
       read: (refs: readonly BlobRef[], read: ReadOptions) => cache.read(refs, read),
       peek: (ref: BlobRef, peek?: PeekOptions) => cache.peek(ref, peek),
@@ -300,7 +319,15 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
     let retired: DataRange[];
     if (options.reachable.ordered === true && options.verifyAtOpen !== true) {
       try {
-        ({ map, retired } = await orderedMap(root, previousRoot, options, reader, dataLength));
+        ({ map, retired } = await orderedMap(
+          root,
+          previousRoot,
+          options,
+          reader,
+          dataLength,
+          runs,
+          retirements,
+        ));
       } catch (error) {
         if (!(error instanceof RangeError) || error === options.signal?.reason) throw error;
         throw new StoreCorruptionError(
@@ -343,7 +370,7 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
       const { union, previousOnly } = await unite(current, previous, options);
 
       try {
-        map = await FreeSpaceMap.fromAllocatedAsync(DATA_ALIGN, dataLength, union, options);
+        map = await FreeSpaceMap.fromAllocatedAsync(DATA_ALIGN, dataLength, union, options, runs);
       } catch (error) {
         if (!(error instanceof RangeError) || error === options.signal?.reason) throw error;
         throw new StoreCorruptionError(
@@ -357,10 +384,22 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
           const pending = pauseIfDue(options);
           if (pending !== undefined) await pending;
         }
+        retirements.ensure(retired.length + 1);
         retired.push({ offset, length: map.sizeOf(length) });
       }
     }
-    const space = new Space(session, options, cache, map, root, previousRoot, dataLength);
+    memory.transfer(options.registerCache);
+    const space = new Space(
+      session,
+      options,
+      cache,
+      map,
+      root,
+      previousRoot,
+      dataLength,
+      memory,
+      retirements,
+    );
     opened = space;
     await space.initialize(retired, options);
     const ready = pauseIfDue(options);
@@ -368,6 +407,7 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
     return space;
   } catch (error) {
     await opened?.close();
+    memory?.close();
     cache.close();
     throw error;
   }
@@ -410,6 +450,8 @@ class Space implements ExtentSpace {
     root: Uint8Array | null,
     previousRoot: Uint8Array | null,
     dataLength: number,
+    readonly retainedMemory: RetainedMemory,
+    readonly retirements: RetainedCapacity,
   ) {
     this.#session = session;
     this.#reachable = options.reachable;
@@ -730,6 +772,7 @@ class Space implements ExtentSpace {
   async #publishNow(root: Uint8Array, change: PublishChange): Promise<number> {
     this.usable();
     const writers = this.#checkWriters(change.writers);
+    this.retirements.ensure(this.#retired.size + change.retired.length);
     const retired = this.#checkRetired(change.retired);
     for (const writer of writers) writer.state = "publishing";
     try {
@@ -886,6 +929,7 @@ class Space implements ExtentSpace {
     await this.settled();
     this.#closed = true;
     this.#cache.close();
+    this.retainedMemory.close();
   }
 }
 
