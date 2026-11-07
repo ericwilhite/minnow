@@ -966,7 +966,9 @@ and the owner import it directly.
   Store-to-store gathers bulk-copy fully checked contiguous spans of non-null int32/f64
   storage (including safe int64), across chunk boundaries; other permutations and negative
   row ids keep the ordinary gather. `exec/column-gather.bench.ts` isolates contiguous and
-  arbitrary gathers with prebuilt input and untimed result checks.
+  arbitrary and partition-strided gathers with prebuilt input, untimed warmup and result
+  checks. Compare revisions in at least seven interleaved rounds, recording process CPU
+  medians, max-minus-min spreads and host load for each run.
 - Inner, semi and right joins publish runtime filters (exact bitmap, split-block Bloom, bounds)
   when the build stays resident; a filter never drops a row that can match, and stops testing
   when it keeps over 90 % of probes.

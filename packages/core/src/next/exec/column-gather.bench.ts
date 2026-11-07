@@ -1,5 +1,5 @@
 /** Store gather CPU, prebuilt input and IDs; allocation/warmup/validation outside timing.
- * Compare revision bundles in >=5 alternating rounds. ROWS/RUNS set work and repetitions.
+ * Compare revision bundles in >=7 alternating rounds. ROWS/RUNS set work and repetitions.
  */
 import type { PhysicalType } from "../types.js";
 import type { FlatVector } from "../vector/vector.js";
@@ -43,10 +43,18 @@ const out = new ColumnStore([floatType, intType], charge, {
   chunkRows: 2048,
   targetBytes: 64 * 1024,
 });
-const modes = process.argv.slice(2).length ? process.argv.slice(2) : ["contiguous", "random"];
+const modes = process.argv.slice(2).length
+  ? process.argv.slice(2)
+  : ["contiguous", "random", "partitioned"];
 for (const mode of modes) {
+  if (mode === "partitioned" && n % 50 !== 0)
+    throw new Error("Partitioned rows must be divisible by 50");
   const ids = Int32Array.from({ length: n }, (_, i) =>
-    mode === "contiguous" ? i : (Math.imul(i, 2654435761) >>> 0) % n,
+    mode === "contiguous"
+      ? i
+      : mode === "partitioned"
+        ? (i % (n / 50)) * 50 + Math.floor(i / (n / 50))
+        : (Math.imul(i, 2654435761) >>> 0) % n,
   );
   const copy = (validate: boolean) => {
     for (let at = 0; at < n; at += 2048) {
@@ -65,6 +73,7 @@ for (const mode of modes) {
     }
   };
   copy(true);
+  for (let warm = 0; warm < 5; warm++) copy(false);
   for (let r = 0; r <= runs; r++) {
     (globalThis as { gc?: () => void }).gc?.();
     const start = process.cpuUsage();
