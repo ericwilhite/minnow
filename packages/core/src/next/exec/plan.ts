@@ -28,7 +28,7 @@ import { compileExpr, type CompileContext, type CallResolver } from "./kernels/c
 import { bindCall } from "./kernels/bindings.js";
 import { OutputArena, isValidSlot, slotOf } from "./kernels/vectors.js";
 import { LimitOperator } from "./limit.js";
-import { nullParameter } from "./parameters.js";
+import { nullParameter, integerParameterBytes } from "./parameters.js";
 import { drive, isPromise, type BatchSource, type Operator } from "./pipeline.js";
 import type { QueryRuntime, Program, OperatorIdentity } from "./run.js";
 import { lateSortShape, type LateSortShape } from "./late-sort.js";
@@ -1179,7 +1179,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         ordered.keys.every((column, i) => column === index.columnIds[i])
       ) {
         const bounds = runtime.bounds(rel);
-        if (bounds.limit === 0) return sink.finish();
+        if (bounds.limit === 0) return then(runtime.reserve([]), () => sink.finish());
         const shape: IndexShape = {
           tableId: scan.tableId,
           columns: ordered.columns,
@@ -1190,9 +1190,11 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           descending: rel.keys[0]?.direction === "desc",
         };
         const entries = indexMinimums(shape, runtime.request.governor.capBytes);
+        const inputs = integerParameterBytes(plan, runtime.request.parameters);
         if (
-          entries.reduce((n, e) => n + e.minimum, 0) <=
-          runtime.request.governor.capBytes - runtime.request.governor.reserveBytes
+          inputs !== null &&
+          inputs + entries.reduce((n, e) => n + e.minimum, 0) <=
+            runtime.request.governor.capBytes - runtime.request.governor.reserveBytes
         )
           return then(runtime.reserve(entries), () =>
             then(runIndexOrder(runtime, sink, shape, index.id, bounds.limit, bounds.offset), () => {

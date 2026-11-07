@@ -1306,6 +1306,9 @@ path; `--only scan_first_page_ordered --whole-compare key-order --component key-
 the current implementation as a Node diagnostic, not first-page performance acceptance.
 The SQL shortcut is off by default until the streaming cursor meets that acceptance rule;
 ordinary owner composition retains the scan/sort recipe.
+The optional index recipe includes integer parameter bytes when checking its fixed minimum;
+other input kinds retain the generic recipe. Zero still admits and binds all inputs through
+the normal reservation path, with no operator entries or opened input.
 Small compiler probes determine
 kernel buffer minimums; the generated allocation matrix checks them against real batch-sized
 buffers. Execute accepts caller-owned parameter values (keep them unchanged until execution ends).

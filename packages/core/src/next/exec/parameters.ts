@@ -34,6 +34,23 @@ import type { MaybePromise } from "../access/key-index.js";
  * The charge survives binding: cast output can alias the arena, and source BigInts can be
  * adopted by the result. It is released with the execution's atomic fixed reservation. */
 const SLOT_BYTES = 512;
+/** Exact input charge for integer scalar slots, without binding or allocating vectors.
+ * Other types require the general sizing path; a strategy must retain its generic recipe.
+ * Ordinary binding still validates every input after admission. */
+export function integerParameterBytes(
+  plan: PhysicalPlan,
+  values: readonly ParameterValue[],
+): number | null {
+  let bytes = 0;
+  for (let slot = 0; slot < plan.parameters.length; slot++) {
+    const type = plan.parameters[slot];
+    if (type?.kind !== "int32" && type?.kind !== "int64") return null;
+    const value = slot < plan.placeholderCount ? values[slot] : null;
+    if (value !== null && typeof value !== "number" && typeof value !== "bigint") return null;
+    bytes += SLOT_BYTES + (value === null ? dataBytes(type, 1) + 4 : 0);
+  }
+  return bytes;
+}
 /** Bounded NUMERIC probes truncate to at most 491521 bits, then inspect bounded strings.
  * 512 KiB covers that truncated BigInt, a negative magnitude, hex/decimal strings and overlap.
  * It is charged temporarily and returned before waiting for the atomic input reservation. */
