@@ -14,6 +14,7 @@ import { LARGE_VALUE_BYTES } from "../page/large-value.js";
 import { ChunkReader } from "../page/reader.js";
 import { defined, sameValue, valueAt, vectorOf, type TestValue } from "../page/test-support.js";
 import { GroupWriter } from "../page/writer.js";
+import { PageCache } from "../storage/page-cache.js";
 import { MemoryBackend } from "../storage/memory-store.js";
 import { openExtentSpace } from "../storage/space.js";
 import {
@@ -94,16 +95,19 @@ describe.each(PROFILES)("shape differential: %s", (profile) => {
           const memory = countingMemory(Infinity),
             rootBudget = countingBudget(Infinity),
             budget = countingBudget(Infinity);
+          let registeredCaches = 0;
           const space = await openExtentSpace(session, {
             budget: rootBudget,
             reachable: jsonReachable,
             registerCache: (cache) => {
-              // The page cache registers first; R25's retained metadata registers after it and has
-              // nothing evictable, so keep the page cache for the eviction check below.
-              memory.cache ??= cache;
+              registeredCaches++;
+              // Like main's first-registration fix, select pages rather than retained metadata.
+              if (cache instanceof PageCache) memory.cache = cache;
               return memory;
             },
           });
+          expect(registeredCaches).toBeGreaterThan(1);
+          reach.reach("separate page and metadata caches");
           const directories = new BlobCache<ChunkDirectory>(() => memory);
           const type: PhysicalType = profile === "large" ? { kind: "bytes" } : { kind: "text" };
           const count =

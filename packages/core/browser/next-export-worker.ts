@@ -1,12 +1,16 @@
 /**
  * Worker for the OPFS export bench: build the wide table, then run either the one-pass page
- * stream, scan-side-only diagnostic, or real TableScan and owner-format transport. Frame assembly uses the
- * labelled bench stand-in in scripts/browser-perf/page/scan-export.ts, not a production sink.
+ * stream, scan-only diagnostic, or production Executor/ResultSink and owner-format transport.
+ * Historical comparison flags use the explicit scan-adapter diagnostic, excluded from Gate A.
  */
 import {
   scanExport,
   type ScanExportStats,
 } from "../../../scripts/browser-perf/page/scan-export.js";
+import {
+  prepareExecutorExport,
+  type ExecutorExportStats,
+} from "../../../scripts/browser-perf/page/executor-export.js";
 import { scanCore, type ScanCoreStats } from "../../../scripts/browser-perf/page/scan-core.js";
 import { TableScan } from "../src/next/exec/table-scan.js";
 import { ColumnTarget } from "../src/next/exec/column-target.js";
@@ -19,6 +23,7 @@ import { MAX_READ_BYTES, type ExtentRef, type ExtentWriter } from "../src/next/s
 import { createOpfsBackend, webLocks } from "../src/next/storage/opfs.js";
 import { openExtentSpace } from "../src/next/storage/space.js";
 import { countingBudget, jsonReachable } from "../src/next/storage/space-test-support.js";
+import { PageCache } from "../src/next/storage/page-cache.js";
 import { VERIFY_CACHED_BYTES } from "../src/next/storage/verify-cached.js";
 import {
   establishWorkingSet,
@@ -65,7 +70,7 @@ export type ExportRequest =
       readonly baselineStream?: boolean;
       readonly readMiB?: 4 | 8;
       readonly groupDepth?: 1 | 2;
-      readonly mode?: "pages" | "scan" | "scan-core";
+      readonly mode?: "pages" | "scan" | "scan-core" | "scan-adapter";
       readonly frameCopy?: "baseline" | "candidate";
       readonly scanRange?: "baseline" | "candidate";
       readonly scanShape?: "baseline" | "candidate";
@@ -73,6 +78,8 @@ export type ExportRequest =
       readonly scanIO?: "batch" | "window";
       readonly scanOutput?: "borrowed" | "flat" | "dictionary";
       readonly resultPort?: MessagePort;
+      readonly executorVariant?: "baseline" | "candidate";
+      readonly executorReference?: string;
     }
   | { readonly op: "remove"; readonly dir: string };
 
@@ -109,8 +116,13 @@ export interface ExportPass {
     readonly classes: readonly string[];
   };
   readonly readMiB: number;
-  readonly mode: "pages" | "scan" | "scan-core";
+  readonly mode: "pages" | "scan" | "scan-core" | "scan-adapter";
+  readonly executorComparison?: {
+    readonly reference: string;
+    readonly variant: "baseline" | "candidate" | undefined;
+  };
   readonly scanStats?: ScanExportStats;
+  readonly executorStats?: ExecutorExportStats;
   readonly scanCoreStats?: ScanCoreStats;
   readonly afterWorkerClose?: { governorMiB: number; poolMiB: number; residentMiB: number };
 }
@@ -174,7 +186,8 @@ async function open(
     reachable: jsonReachable,
     budget: countingBudget(Number.POSITIVE_INFINITY),
     registerCache: (cache) => {
-      registered?.(cache);
+      // R25 also registers retained metadata; the hot-set audit must evict page data.
+      if (cache instanceof PageCache) registered?.(cache);
       return governor === null
         ? { charge: () => true, release: () => undefined }
         : governor.registerCache(cache);
@@ -284,7 +297,7 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
   );
   const grant = await governor.admit({ label: "export", minimumBytes: 32 * MiB, spillable: true });
   const resultGrant =
-    request.mode === "scan"
+    request.mode === "scan-adapter"
       ? await governor.admit({ label: "bench results", minimumBytes: 4 * MiB, spillable: true })
       : null;
   const first = request.groups[0];
@@ -315,61 +328,110 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
     )
   )
     throw new Error("Shape comparison did not select a consistent module family");
+  if ((request.mode === "scan" || request.mode === "scan-adapter") && request.passes !== 1)
+    throw new Error("Transport export requires one pass per worker");
+  if (
+    request.mode === "scan" &&
+    (!request.resultPort ||
+      request.scanIO !== undefined ||
+      request.scanOutput !== undefined ||
+      request.scanTargetMiB !== undefined ||
+      request.scanShape !== undefined ||
+      request.scanRange !== undefined ||
+      request.frameCopy !== undefined)
+  )
+    throw new Error("Production executor export does not accept historical adapter overrides");
+  // Hot-set setup is outside timing. The real execution owns its own admission/result grants.
+  if (request.mode === "scan") grant.close();
+  const frozenExecutor = request.executorReference
+    ? ((await import(
+        /* @vite-ignore */ new URL("../src/next/exec/create.ts?executorBaseline", import.meta.url)
+          .href
+      )) as typeof import("../src/next/exec/create.js") & {
+        EXECUTOR_BASELINE_REVISION?: string;
+        EXECUTOR_BASELINE_READS: typeof import("../src/next/exec/scan.js").chunkReads;
+      })
+    : null;
+  if (frozenExecutor && frozenExecutor.EXECUTOR_BASELINE_REVISION !== request.executorReference)
+    throw new Error("Wrong frozen executor revision");
+  const executeExport =
+    request.mode === "scan" && request.resultPort
+      ? prepareExecutorExport(space, request.groups, {
+          governor,
+          ...(request.executorVariant === "baseline" && frozenExecutor
+            ? {
+                executor: frozenExecutor.createExecutor(),
+                reads: frozenExecutor.EXECUTOR_BASELINE_READS,
+              }
+            : {}),
+          port: request.resultPort,
+          memory: () => ({
+            governorHeld: governor.usedBytes,
+            idlePool: space.stats.cache.poolBytes,
+            cacheResident: space.stats.cache.residentBytes,
+            cachePinned: space.stats.cache.pinnedBytes,
+          }),
+        })
+      : null;
   if (request.profile === true) console.profile("export");
   if (phases) performance.mark("minnow-export-start");
   for (let pass = 0; pass < request.passes; pass++) {
     const readsBefore = space.stats.cache.platformReads;
     if (phases) phases.active = true;
     const result =
-      request.mode === "scan-core"
-        ? await scanCore(space, request.groups, {
-            budget: grant,
-            readWindowBytes: request.scanIO === "batch" ? 0 : (request.windowMiB ?? 64) * MiB,
-          })
-        : request.mode === "scan" && request.resultPort && resultGrant
-          ? await scanExport(space, request.groups, {
+      executeExport !== null
+        ? await executeExport()
+        : request.mode === "scan-core"
+          ? await scanCore(space, request.groups, {
               budget: grant,
-              resultBudget: resultGrant,
-              ...(request.scanTargetMiB === undefined
-                ? {}
-                : { targetBytes: request.scanTargetMiB * MiB }),
               readWindowBytes: request.scanIO === "batch" ? 0 : (request.windowMiB ?? 64) * MiB,
-              transferOutputs:
-                request.scanOutput === "dictionary" ? "dictionary" : request.scanOutput === "flat",
-              memory: () => ({
-                queryAllocated: grant.allocated,
-                queryHeld: grant.held,
-                resultHeld: resultGrant.held,
-                cacheCharge: governor.usedBytes - grant.held - resultGrant.held,
-                resultAllocated: resultGrant.allocated,
-                governorHeld: governor.usedBytes,
-                idlePool: space.stats.cache.poolBytes,
-                cacheResident: space.stats.cache.residentBytes,
-                cachePinned: space.stats.cache.pinnedBytes,
-              }),
-              port: request.resultPort,
             })
-          : await stream(space, request.groups, {
-              budget: grant,
-              directories,
-              once: request.once,
-              readahead: request.readaheadKiB * 1024,
-              windowBytes: (request.windowMiB ?? 0) * MiB,
-              ...(phases ? { phases } : {}),
-              ...(request.groupDepth === undefined ? {} : { groupDepth: request.groupDepth }),
-              ...(phases
-                ? {
-                    sample: (rows: number) =>
-                      phases.memory.push({
-                        rows,
-                        pool: space.stats.cache.poolBytes,
-                        resident: space.stats.cache.residentBytes,
-                        pinned: space.stats.cache.pinnedBytes,
-                        governor: governor.usedBytes,
-                      }),
-                  }
-                : {}),
-            });
+          : request.mode === "scan-adapter" && request.resultPort && resultGrant
+            ? await scanExport(space, request.groups, {
+                budget: grant,
+                resultBudget: resultGrant,
+                ...(request.scanTargetMiB === undefined
+                  ? {}
+                  : { targetBytes: request.scanTargetMiB * MiB }),
+                readWindowBytes: request.scanIO === "batch" ? 0 : (request.windowMiB ?? 64) * MiB,
+                transferOutputs:
+                  request.scanOutput === "dictionary"
+                    ? "dictionary"
+                    : request.scanOutput === "flat",
+                memory: () => ({
+                  queryAllocated: grant.allocated,
+                  queryHeld: grant.held,
+                  resultHeld: resultGrant.held,
+                  cacheCharge: governor.usedBytes - grant.held - resultGrant.held,
+                  resultAllocated: resultGrant.allocated,
+                  governorHeld: governor.usedBytes,
+                  idlePool: space.stats.cache.poolBytes,
+                  cacheResident: space.stats.cache.residentBytes,
+                  cachePinned: space.stats.cache.pinnedBytes,
+                }),
+                port: request.resultPort,
+              })
+            : await stream(space, request.groups, {
+                budget: grant,
+                directories,
+                once: request.once,
+                readahead: request.readaheadKiB * 1024,
+                windowBytes: (request.windowMiB ?? 0) * MiB,
+                ...(phases ? { phases } : {}),
+                ...(request.groupDepth === undefined ? {} : { groupDepth: request.groupDepth }),
+                ...(phases
+                  ? {
+                      sample: (rows: number) =>
+                        phases.memory.push({
+                          rows,
+                          pool: space.stats.cache.poolBytes,
+                          resident: space.stats.cache.residentBytes,
+                          pinned: space.stats.cache.pinnedBytes,
+                          governor: governor.usedBytes,
+                        }),
+                    }
+                  : {}),
+              });
     if (phases) {
       phases.active = false;
       const expected = request.groups.reduce(
@@ -385,6 +447,14 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
       ...(phases ? { phases: { ...phases } } : {}),
       ...(baselineCommit ? { baselineCommit } : {}),
       ...(shapeComparison ? { shapeComparison } : {}),
+      ...(request.executorReference
+        ? {
+            executorComparison: {
+              reference: request.executorReference,
+              variant: request.executorVariant,
+            },
+          }
+        : {}),
       mode: request.mode ?? "pages",
       readMiB: MAX_READ_BYTES / MiB,
       verifying: VERIFY_CACHED_BYTES,
@@ -406,7 +476,9 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
   }
   const evictable = cache as EvictableCache | null;
   const last = passes.at(-1);
-  if (evictable !== null && last !== undefined && working !== null) {
+  if (last !== undefined && working !== null) {
+    if (!(evictable instanceof PageCache))
+      throw new Error("Hot-set audit requires the actual PageCache");
     const left = survivors(space, evictable, working);
     passes[passes.length - 1] = {
       ...last,

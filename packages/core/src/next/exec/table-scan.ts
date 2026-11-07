@@ -173,9 +173,14 @@ export interface TableScanOptions {
   readonly transferOutputs?: boolean | "dictionary";
   /** Terminal ownership: allocate dedicated buffers in this result budget from creation.
    * Without it, detachable output stays charged to the scan budget. Refusal shrinks a batch;
-   * an output budget refusing even one row is reported (no second grant's progress loan).
+   * an output budget refusing even one row is reported (no second grant's progress loan),
+   * unless the terminal caller permits ordinary borrowed output with borrowOutputOnRefusal.
    */
   readonly outputBudget?: ByteBudget;
+  /** Owning terminal consumer resolves each dictionary's wire form before sizing output. */
+  readonly outputDictionary?: (dictionary: FlatVector) => boolean;
+  /** Terminal transfer optimization may use ordinary borrowed decode on one-row refusal. */
+  readonly borrowOutputOnRefusal?: boolean;
   /** Full unfiltered scans: one-pass coalesced row windows when the reader factory supports it.
    * Opt-in stored-byte target; absent/zero keeps cached per-batch reads.
    * Filtered/deleted groups stay selective. Refusal shrinks the window, then falls back.
@@ -221,6 +226,7 @@ const ABORTED = new ScanAborted("The scan was aborted");
 
 /** One output column of an open group: its reader and target, or the group predates it. */
 interface GroupColumn {
+  ownedDictionary?: boolean;
   readonly pages: ChunkPages | null;
   /** The group predates the column: every row is this value (`ColumnDef.missing` or NULL). */
   readonly missing: FlatVector | null;
@@ -228,7 +234,7 @@ interface GroupColumn {
 
 /** An open group segment and where the scan is in it. */
 interface OpenGroup {
-  readonly owned: boolean;
+  owned: boolean;
   retained: number;
   retired: boolean;
   windowRows: number;
@@ -901,6 +907,15 @@ export class TableScan implements BatchSource {
    * Bytes of the batch decoding `spec` produces: every output column as decoded (validity, codes
    * or values, varlen bytes; ColumnTarget.outputBytes) plus the locators. Pages loaded.
    */
+  #dictionaryCodes(group: OpenGroup, c: number): boolean {
+    if (this.#transferOutputs !== "dictionary") return false;
+    const column = at(group.columns, c),
+      dictionary = column.pages?.dictionary;
+    if (column.ownedDictionary === undefined && dictionary != null)
+      column.ownedDictionary = this.#options.outputDictionary?.(dictionary) ?? true;
+    return column.ownedDictionary ?? true;
+  }
+
   #bytesFor(group: OpenGroup, spec: DecodeSpec): number {
     let bytes = this.#options.emitLocator ? 8 * rowsIn(spec) : 0;
     for (let c = 0; c < this.#types.length; c++) {
@@ -909,7 +924,7 @@ export class TableScan implements BatchSource {
         bytes += at(this.#targets, c).outputBytes(
           pages,
           spec,
-          !group.owned || this.#transferOutputs === "dictionary",
+          !group.owned || this.#dictionaryCodes(group, c),
           group.owned,
         );
     }
@@ -987,12 +1002,7 @@ export class TableScan implements BatchSource {
       const pages = at(group.columns, c).pages;
       if (pages === null) continue;
       const bytes = group.owned
-        ? at(this.#targets, c).outputBytes(
-            pages,
-            spec,
-            this.#transferOutputs === "dictionary",
-            true,
-          )
+        ? at(this.#targets, c).outputBytes(pages, spec, this.#dictionaryCodes(group, c), true)
         : at(this.#targets, c).growthFor(pages, spec);
       if (group.owned && this.#ownedMemory !== this.#memory) output += bytes;
       else input += bytes;
@@ -1021,14 +1031,23 @@ export class TableScan implements BatchSource {
         continue;
       }
       if (rowsIn(spec) > 1) return false;
-      throw new RangeError("The result grant refused a one-row dedicated output");
+      if (!this.#options.borrowOutputOnRefusal)
+        throw new RangeError("The result grant refused a one-row dedicated output");
+      return false;
     }
     return true;
   }
 
   *#prepay(group: OpenGroup, spec: DecodeSpec): Step<boolean> {
-    const { input: need, output } = this.#workingSet(group, spec);
-    if (!(yield* this.#reserveOutput(output, spec))) return false;
+    let { input: need, output } = this.#workingSet(group, spec);
+    if (!(yield* this.#reserveOutput(output, spec))) {
+      if (rowsIn(spec) > 1) return false;
+      // Optional dedicated output must preserve the ordinary one-row progress-loan path.
+      // All previous owned batches drained above; existing transfer tokens remain valid.
+      group.owned = false;
+      this.#ownedMemory.settle();
+      ({ input: need, output } = this.#workingSet(group, spec));
+    }
     if (this.#memory.prepay(need)) return true;
     if (this.#ownedMemory !== this.#memory) this.#ownedMemory.settle();
     if (rowsIn(spec) > 1) return false;
@@ -1064,13 +1083,13 @@ export class TableScan implements BatchSource {
               length,
               value: column.missing ?? nullOf(at(this.#types, c)),
             }
-          : owned === undefined
+          : owned === undefined || !group.owned
             ? at(this.#targets, c).decode(column.pages, spec)
             : (() => {
                 const decoded = at(this.#targets, c).decodeOwned(
                   column.pages,
                   spec,
-                  this.#transferOutputs === "dictionary",
+                  this.#dictionaryCodes(group, c),
                   this.#ownedMemory,
                 );
                 owned.push(decoded);

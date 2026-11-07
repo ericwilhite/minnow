@@ -10,7 +10,11 @@
  */
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import { createReach, SCAN_WINDOW_RESIDENCY_REACH } from "../../testing/reach.js";
+import {
+  createReach,
+  SCAN_WINDOW_RESIDENCY_REACH,
+  RESULT_OWNED_REACH,
+} from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import type { ColumnDef } from "../access/catalog.js";
 import type {
@@ -1337,6 +1341,7 @@ describe("review B4-p2c-3: loans under the real governor", () => {
         "abort retained result",
         "progress after result credit",
         "one-row result refusal",
+        RESULT_OWNED_REACH.refusal,
       ] as const);
       await fc.assert(
         fc.asyncProperty(fc.integer({ min: 10, max: 30 }), fc.boolean(), async (n, cancel) => {
@@ -1418,6 +1423,17 @@ describe("review B4-p2c-3: loans under the real governor", () => {
           refused.close();
           expect(budget.held).toBe(0);
           reach.reach("one-row result refusal");
+          const fallback = scanOf(table, space, null, {
+            budget,
+            outputBudget: { allocate: () => false, free: () => undefined },
+            columns: [1],
+            transferOutputs: "dictionary",
+            borrowOutputOnRefusal: true,
+          });
+          expect(await collect(fallback)).toEqual(rows.map((r) => [r.i]));
+          fallback.close();
+          expect(budget.held).toBe(0);
+          reach.reach(RESULT_OWNED_REACH.refusal);
         }),
         { seed, numRuns: 12 },
       );
@@ -1511,6 +1527,8 @@ describe("review B4-p2c-3: loans under the real governor", () => {
         "retained after end",
         "retained after abort",
         "dictionary output",
+        RESULT_OWNED_REACH.dictCodes,
+        RESULT_OWNED_REACH.dictFlat,
       ] as const);
       await fc.assert(
         fc.asyncProperty(fc.integer({ min: 80, max: 200 }), fc.boolean(), async (n, cancel) => {
@@ -1580,6 +1598,39 @@ describe("review B4-p2c-3: loans under the real governor", () => {
           first.transfer.release();
           expect(budget.held).toBe(0);
           expect(dictionaryReaders.every((reader) => reader.dictionary === null)).toBe(true);
+          for (const allow of [true, false]) {
+            let decisions = 0;
+            const output = counting();
+            const negotiated = scanOf(table, space, null, {
+              budget,
+              outputBudget: output,
+              columns: [4],
+              targetBytes: 64,
+              transferOutputs: "dictionary",
+              outputDictionary: () => {
+                decisions++;
+                return allow;
+              },
+            });
+            const values: unknown[] = [];
+            for (
+              let item = await negotiated.next();
+              item !== null;
+              item = await negotiated.next()
+            ) {
+              const vector = at(item.batch.columns, 0);
+              expect(vector.form).toBe(allow ? "dictionary" : "flat");
+              expect(item.transfer?.detachableBuffers?.size).toBeGreaterThan(0);
+              for (let row = 0; row < item.batch.length; row++)
+                values.push(normalize(valueAt(vector, row)));
+              item.transfer?.release();
+            }
+            negotiated.close();
+            expect(values).toEqual(rows.map((row) => row.t));
+            expect(decisions).toBe(1);
+            expect([budget.held, output.held]).toEqual([0, 0]);
+            reach.reach(allow ? RESULT_OWNED_REACH.dictCodes : RESULT_OWNED_REACH.dictFlat);
+          }
         }),
         { seed, numRuns: 12 },
       );

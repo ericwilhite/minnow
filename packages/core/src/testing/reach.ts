@@ -413,6 +413,7 @@ export const SMALL_PAGE_NULL_STATES = ["all valid", "sparse nulls"] as const;
 
 /** Independent source-sized shape differential over real cache eviction and group switches. */
 export const SHAPE_DIFFERENTIAL_REACH = [
+  "separate page and metadata caches",
   "independent source lengths",
   "actual cache eviction",
   "backend reload after eviction",
@@ -584,4 +585,61 @@ export const TRANSACTION_ATTRIBUTE_STATES = [
   "isolation savepoint refusal",
   "deferrable query refusal",
   "deferrable savepoint refusal",
+] as const;
+
+/** Production Gate A executor bridge over real transfers and delayed cumulative credits. */
+export const EXECUTOR_EXPORT_REACH = [
+  "production executor preparation",
+  "multiple source groups",
+  "sparse nulls",
+  "out of line >64KiB",
+  "exact transferred values",
+  "task-delayed cumulative credit",
+  "source survives transfer",
+  "execution charges returned",
+] as const;
+
+/** Stratified terminal full export and nonterminal/subset/filter policy checks. */
+export const EXECUTOR_POLICY_REACH = {
+  full: "terminal one-pass window",
+  cached: "selective/consumer cache policy",
+} as const;
+
+/** Production dictionary frames remain exact through stream deltas and real detachment. */
+export const RESULT_DICTIONARY_REACH = {
+  equality: "dictionary client equality and returned charges",
+  codes: "stream dictionary codes and owned deltas",
+  fallback: "stream dictionary cap fallback",
+  loan: "dictionary delta progress loan repaid before finish",
+  predecode: "dictionary wire form chosen before first frame",
+  abandoned: "unpublished dictionary reservation returned on cancel",
+} as const;
+
+/** R8: a terminal result adopts authorized dedicated output, never a page or pooled slab. */
+export const RESULT_OWNED_REACH = {
+  equality: "source and transferred values equal with returned charges",
+  cache: "no cache or pooled page buffer transferred",
+  adopt: "dedicated result frame charge held until credit",
+  copy: "unmarked foreign selected or capped input copied",
+  refusal: "terminal dedicated refusal falls back to exact borrowed output",
+  capped: "capped dictionary copied beside adopted fixed buffers",
+  dictCodes: "source decodes an admitted dictionary to owned codes",
+  dictFlat: "source decodes a refused dictionary to owned UTF-8",
+} as const;
+
+/** Every native owned layout, including floating point payload words, survives transfer exactly. */
+export const RESULT_OWNED_LAYOUT_REACH = [
+  "bool",
+  "i32",
+  "f32",
+  "f64",
+  "i64-safe",
+  "i64-wide",
+  "fixed16",
+  "interval",
+  "text",
+  "decimal-safe",
+  "decimal-i64",
+  "decimal-i128",
+  "decimal-mixed",
 ] as const;
