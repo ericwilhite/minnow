@@ -171,7 +171,8 @@ export interface TableScanOptions {
    */
   readonly outputBudget?: ByteBudget;
   /** Full unfiltered scans: one-pass coalesced row windows when the reader factory supports it.
-   * Opt-in byte target; absent/zero keeps cached per-batch reads. Filtered scans stay selective.
+   * Defaults to 64 MiB of stored bytes; zero keeps cached per-batch reads.
+   * Filtered/deleted groups stay selective. Refusal shrinks the window, then falls back.
    */
   readonly readWindowBytes?: number;
   readonly table: TableSnapshot;
@@ -648,7 +649,7 @@ export class TableScan implements BatchSource {
     const opened: ChunkPages[] = [];
     const windowBytes =
       this.#options.filter === null && this.#options.reads.loadTogether
-        ? (this.#options.readWindowBytes ?? 0)
+        ? (this.#options.readWindowBytes ?? 64 * 1024 * 1024)
         : 0;
     let storedBytes = 0;
     try {

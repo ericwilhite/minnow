@@ -10,7 +10,7 @@
  */
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import { createReach } from "../../testing/reach.js";
+import { createReach, SCAN_WINDOW_RESIDENCY_REACH } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import type { ColumnDef } from "../access/catalog.js";
 import type {
@@ -408,6 +408,89 @@ function scanOf(
 }
 
 describe("table scan: pushdown, gather and late materialization never change the answer", () => {
+  it.each(seedsFor("next-scan-window-residency", [0xb2b1, 0xb2b2]))(
+    "default windows preserve cached synchronous steps and explicit opt-out (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-scan-window-residency", SCAN_WINDOW_RESIDENCY_REACH);
+      await fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 20, max: 120 }),
+          fc.constantFrom("cold", "resident", "mixed"),
+          async (count, residency) => {
+            reach.beginHistory();
+            const source = rowsOf(mulberry32(count), count, false);
+            const space = new MemoryExtentSpace();
+            const segment = await groupSegment(0, source, new Set(), false, space);
+            const table: TableSnapshot = {
+              tableId: 9,
+              schemaVersion: 1,
+              columns: DEFS,
+              liveRowCount: count,
+              segments: [segment],
+            };
+            for (const policy of ["explicit", "default", "disabled"] as const) {
+              const pages = space.view({ cache: true }),
+                budget = counting();
+              if (residency !== "cold") {
+                for (const def of DEFS) {
+                  if (residency === "mixed" && def.id % 2 === 0) continue;
+                  const chunk = segment.chunk(def.id);
+                  if (chunk === null) throw new Error("Missing fixture chunk");
+                  const reader = await ChunkReader.open(pages, chunk, { budget });
+                  await reader.load(reader.pagesAhead(0, count, 0));
+                  reader.close();
+                }
+              }
+              let windows = 0;
+              const reads: ChunkReads = {
+                ...chunkReads,
+                loadTogether(loads) {
+                  windows++;
+                  return chunkReads.loadTogether?.(loads);
+                },
+              };
+              const scan = scanOf(table, space, null, {
+                pages,
+                reads,
+                budget,
+                yieldIntervalMs: Infinity,
+                ...(policy === "default"
+                  ? {}
+                  : { readWindowBytes: policy === "disabled" ? 0 : 64 * 1024 * 1024 }),
+              });
+              const actual: unknown[][] = [];
+              try {
+                for (;;) {
+                  const next = scan.next();
+                  if (residency === "resident")
+                    expect(next instanceof Promise, "resident scan must stay synchronous").toBe(
+                      false,
+                    );
+                  const item = await next;
+                  if (item === null) break;
+                  for (let r = 0; r < item.batch.length; r++)
+                    actual.push(item.batch.columns.map((v) => normalize(valueAt(v, r))));
+                }
+                expect(actual).toEqual(source.map((r) => expectedRow(r, false)));
+                expect(windows > 0).toBe(policy !== "disabled");
+                reach.reach(policy === "disabled" ? "disabled" : `${policy} ${residency}`);
+              } finally {
+                scan.close();
+              }
+              expect(budget.held).toBe(0);
+            }
+          },
+        ),
+        { seed, numRuns: 24 },
+      );
+      reach.assertReached();
+      console.log(
+        "SCAN_WINDOW_REACH",
+        JSON.stringify({ seed, states: Object.fromEntries(reach.counts()) }),
+      );
+    },
+  );
+
   it.each(seedsFor("next-scan-windows", [0xb2a1, 0xb2a2]))(
     "one-pass row windows balance retries and cancellation (seed %i)",
     async (seed) => {

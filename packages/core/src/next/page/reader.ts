@@ -573,13 +573,14 @@ export class ChunkReader {
    * more than once, with overlapping pages: its requests are merged. Resolves when every
    * page is loaded; a reader closed meanwhile only loses its own pages (its loads give back what
    * they read, as `close` says). Errors reject after all started sibling loads settle, so a
-   * retry or close cannot race later installations or charges.
+   * retry or close cannot race later installations or charges. Like `load`, completes
+   * synchronously when every requested page and dictionary is resident.
    */
   static loadTogether(
     loads: ReadonlyArray<{ readonly reader: ChunkReader; readonly pages: readonly number[] }>,
-  ): Promise<void> {
+  ): MaybePromise<void> {
     const first = loads[0]?.reader;
-    if (first === undefined) return Promise.resolve();
+    if (first === undefined) return;
     const waits: Array<PromiseLike<void>> = [];
     try {
       const jobs: TogetherJob[] = [];
@@ -627,6 +628,9 @@ export class ChunkReader {
           continue;
         }
         if (missing.length === 0) continue;
+        // Preserve the MaybePromise contract for resident scans before constructing shared
+        // miss jobs. Each successful install is charged exactly as the ordinary cached load.
+        if (reader.#loadCached(missing, false)) continue;
         missingOf.set(reader, missing);
         for (const page of missing) jobs.push({ reader, entry: at(entries, page), page });
       }
@@ -647,6 +651,7 @@ export class ChunkReader {
         }
         waits.push(run);
       }
+      if (waits.length === 0) return;
       return Promise.all(waits).then(noop, async (error: unknown) => {
         // A retry/close must not race sibling reads still installing pages or holding budget.
         await Promise.allSettled(waits);

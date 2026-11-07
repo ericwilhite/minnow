@@ -30,6 +30,17 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+/** Full-scan shared windows: the default and override must cover cold and resident reads. */
+export const SCAN_WINDOW_RESIDENCY_REACH = [
+  "default cold",
+  "default resident",
+  "default mixed",
+  "explicit cold",
+  "explicit resident",
+  "explicit mixed",
+  "disabled",
+] as const;
+
 export function createReach<State extends string>(
   campaign: string,
   states: readonly State[],
