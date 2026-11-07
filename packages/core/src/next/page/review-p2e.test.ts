@@ -14,7 +14,12 @@ import { countingBudget, countingMemory, openOver } from "../storage/space-test-
 import { CachedBytesWrittenError, VERIFY_CACHED_BYTES } from "../storage/verify-cached.js";
 import { UNLIMITED } from "./memory-extents.js";
 import { compilePredicate } from "./predicate.js";
-import { ChunkReader, directoryCharge, PAGE_DESCRIPTOR_BYTES } from "./reader.js";
+import {
+  ChunkReader,
+  DECODE_MEMO_BYTES,
+  directoryCharge,
+  PAGE_DESCRIPTOR_BYTES,
+} from "./reader.js";
 import { defined, vectorOf, writeGroup } from "./test-support.js";
 import { GroupWriter } from "./writer.js";
 
@@ -83,7 +88,7 @@ describe("review B2-p2e #1: descriptors are charged continuously, pinned or not"
     // The reader holds its pages (leases: blob bytes) and its parsed directory; the cache, the
     // descriptors.
     expect(memory.used + budget.used - before).toBe(
-      stored + descriptors + directoryCharge(reader.directory),
+      stored + descriptors + directoryCharge(reader.directory) + DECODE_MEMO_BYTES,
     );
     reader.close();
     // Cached: the blobs and their descriptors.

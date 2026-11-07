@@ -345,6 +345,35 @@ is access's `Snapshot`.
 
 ### Pages (`page/`)
 
+**Historical experimental writer data loss (B2-p2m).** Rebuild writers before the capacity
+clamp could persist wrong values after a page flush when the raw buffer held fewer than 64
+rows. The soft 64-row preference exceeded the buffer: scalar copies silently discarded stores,
+and an undersized validity bitmap could turn non-NULL input into NULL. Safe intervals and
+decimals (safe, int64, or int128 coefficient input) can complete with wrong zero/NULL values;
+wide int64 and other flat typed-array copies can instead throw. Dictionary/constant source
+forms using scalar copies can also be affected. This concerns the unreleased, unexported
+rebuild format, not shipped MinnowDB formats.
+
+For a fixed-width row of `w` bytes, the raw-buffer capacity is
+`min(maxRows, floor(rawPageBytes / w))`; the raw-size danger range is `rawPageBytes < 64*w`.
+Supported fixed widths are 1, 4, 8 and 16 bytes, so the largest affected raw budgets are
+63, 255, 511 and 1023 bytes respectively (for positive capacities). At the reproduced
+512-byte budget, the smallest affected supported width is 16 bytes: capacity 32.
+A 128-byte encoded-page target initially admits 8 such rows, then the old preference admits
+64 into the next 32-row buffer. The encoded-page target alone does not shrink the buffer.
+Defaults use 32 KiB raw pages and at most 16-byte rows, so capacity is at least 2048;
+default settings cannot reach this defect. A `maxRows < 64` group limit alone also cannot
+overrun its buffer, because the entire group stops at that limit.
+
+The clamp prevents new damage. Pages successfully written by those older experimental builds
+can contain checksummed, structurally valid wrong values; the current reader cannot detect
+or reconstruct the original lost values. Treat affected experimental stores as untrusted
+and reconstruct them from an independent source. No automatic upgrade can recover overwritten
+values. This format has never been released, so no supported-version migration is owed or
+introduced; there is no encoding/version bump. Independent generated type/representation,
+flat/dictionary source and all-valid/sparse-null campaigns live in
+`page/small-page-representations.test.ts`; the original throwing regression remains intact.
+
 - A column chunk is `[pages][dictionary page][directory]` in one extent; each is one blob of at
   most 1 MiB, and its `BlobRef` carries the extent (R15.1). `ColumnChunk.data` is the chunk's
   range in that extent (offset 0 for its own extent, its place in a pack otherwise); page and
@@ -1000,6 +1029,18 @@ The full interface contract includes the following (DML remains unimplemented by
   keeps the selection, the residual then narrowing it. Below it only the selected positions are
   gathered; with a residual, its columns are gathered first and the others only for the rows it
   keeps.
+- Shape setup reuses only verified scalar header facts while endpoint pages remain resident;
+  install/release/materialization invalidates them. Exact-range byte counts have a separate
+  memo. `exec/column-shape.test.ts` compares against header queries with memoization disabled
+  and byte counts summed directly from immutable source rows, including gathers. It never
+  uses the candidate reader's `varlenBytes` or `gatherBytes` for reference sizing.
+  `testing/column-shape-differential.test.ts` extends that comparison over actual cache
+  eviction/backend reload, three same-layout groups through one target, all-valid/sparse/all-null
+  masks, empty ranges/gathers, genuine >64 KiB out-of-line values, stored gzip, and stored
+  dictionary code widths 0/1/2. Reach assertions require each named state and encoding. The
+  current writer's 65,536-row group limit cannot emit a 4-byte dictionary code; that reader
+  capability is outside this writer-generated comparison. A stale exact-range-size mutant
+  must fail byte accounting even when an oversized output could still decode correct values.
 - Batches are bounded by their decoded bytes: validity, values or codes, scales, limbs,
   specials, offsets, varlen bytes (full value lengths, out-of-line values included) and
   locators, all known from page headers before any value is read. One row larger than the target

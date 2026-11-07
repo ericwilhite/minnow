@@ -19,6 +19,8 @@ async function withWorker<T>(request: ExportRequest): Promise<T> {
     url.searchParams.set("frameCopy", request.frameCopy);
   if (request.op === "export" && request.scanRange !== undefined)
     url.searchParams.set("scanRange", request.scanRange);
+  if (request.op === "export" && request.scanShape !== undefined)
+    url.searchParams.set("scanShape", request.scanShape);
   const worker = new Worker(url, {
     type: "module",
   });
@@ -144,9 +146,10 @@ export async function exportPass(options: {
   readonly baselineStream?: boolean;
   readonly readMiB?: 4 | 8;
   readonly groupDepth?: 1 | 2;
-  readonly mode?: "pages" | "scan";
+  readonly mode?: "pages" | "scan" | "scan-core";
   readonly frameCopy?: "baseline" | "candidate";
   readonly scanRange?: "baseline" | "candidate";
+  readonly scanShape?: "baseline" | "candidate";
   readonly scanTargetMiB?: 1 | 2 | 3;
   readonly scanIO?: "batch" | "window";
   readonly scanOutput?: "borrowed" | "flat" | "dictionary";
@@ -170,6 +173,7 @@ export async function exportPass(options: {
     ...(options.mode === undefined ? {} : { mode: options.mode }),
     ...(options.frameCopy === undefined ? {} : { frameCopy: options.frameCopy }),
     ...(options.scanRange === undefined ? {} : { scanRange: options.scanRange }),
+    ...(options.scanShape === undefined ? {} : { scanShape: options.scanShape }),
     ...(options.scanTargetMiB === undefined ? {} : { scanTargetMiB: options.scanTargetMiB }),
     ...(options.scanIO === undefined ? {} : { scanIO: options.scanIO }),
     ...(options.scanOutput === undefined ? {} : { scanOutput: options.scanOutput }),

@@ -906,9 +906,8 @@ export class TableScan implements BatchSource {
     for (let c = 0; c < this.#types.length; c++) {
       const pages = at(group.columns, c).pages;
       if (pages !== null)
-        bytes += ColumnTarget.outputBytes(
+        bytes += at(this.#targets, c).outputBytes(
           pages,
-          at(this.#types, c),
           spec,
           !group.owned || this.#transferOutputs === "dictionary",
           group.owned,
@@ -988,9 +987,8 @@ export class TableScan implements BatchSource {
       const pages = at(group.columns, c).pages;
       if (pages === null) continue;
       const bytes = group.owned
-        ? ColumnTarget.outputBytes(
+        ? at(this.#targets, c).outputBytes(
             pages,
-            at(this.#types, c),
             spec,
             this.#transferOutputs === "dictionary",
             true,

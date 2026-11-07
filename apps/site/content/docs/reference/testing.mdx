@@ -1205,6 +1205,47 @@ top self-time functions and exclusive buckets for scan, descriptors, vectors, fr
 result accounting and transport. CDP sample durations include native waits and descheduling;
 active sample shares estimate hotspots, not exact CPU seconds per bucket. The report keeps
 native reads, GC and idle samples separate and records the worker's actual thread CPU bracket.
+`MINNOW_EXPORT_SCAN_CORE_PROFILE=1` profiles the scan side alone over the same OPFS table.
+It drives the real table scan and pipeline into a synchronous borrowed-batch consumer,
+without the frame adapter, result channel, ownership copies, or client transport. The consumer
+records batch/column counts, dictionary/validity/offset shapes, and an endpoint fingerprint;
+it does not decode text or check every value. Its rows/s is a scan diagnostic, not export
+throughput or a Gate A result. Cold/warm residency and setup-excluded CPU rules stay the same.
+`scripts/scan-shape-bench.mts --planning` isolates descriptor sizing and reservation over
+real loaded pages; without `--planning` it runs the whole memory-backed scan. Both compare
+with `74c79c9b` in five interleaved fresh-process rounds, excluding setup and one warmup,
+and record CPU, wall time and host load. The comparison requires that Git object.
+`MINNOW_EXPORT_SCAN_SHAPE_COMPARE=1 npm run benchmark:export` compares the same change
+in five cold, interleaved OPFS scan-only pairs. It uses explicit 64 MiB windows and the
+same borrowed-batch consumer; it measures neither frame assembly nor export transport.
+Add `MINNOW_EXPORT_SCAN_SHAPE_TRANSPORT=1` to compare the whole stand-in adapter and
+real owner transfer path instead. Both modes assert which three module versions reached
+the worker; the transport comparison still does not use the future executor frame builder.
+The scan reuses verified header facts while the endpoint pages stay the same. Loading,
+releasing or materializing a page invalidates those facts. Exact-range varlen byte sizes
+are memoized separately; sparse selections are sized from their selected rows.
+The reader charges its bounded scalar memo separately from the shared directory cache.
+Generated source-value equality and residency histories cover this reuse in
+`next/exec/column-shape.test.ts` and `next/exec/shape-reuse.test.ts`. Reference sizing sums
+immutable source values independently of the reader's range and gather byte memos.
+`next/testing/column-shape-differential.test.ts` checks real cache eviction and backend reload,
+three same-layout groups through one target, all-valid/sparse/all-null masks, empty selections,
+values larger than 64 KiB stored out of line, gzip, and actual dictionary code widths 0/1/2.
+Declared reach requires these states. Four-byte dictionary codes are outside this generated
+writer campaign: the writer limits groups to 65,536 rows. A restored stale-range-length mutant
+must fail the independent size comparison, even if its oversized buffer preserves decoded values.
+The shape histories include 512-byte and 2 KiB raw pages. The generated
+`next/page/small-pages.test.ts` also checks adaptive flushes for intervals, UUIDs
+and 128-bit decimals when the raw buffer holds fewer than 64 rows. The density-based
+row preference is capped by that buffer's capacity. The independent
+`next/page/small-page-representations.test.ts` checks safe and wide int64 inputs,
+safe/wide intervals, and safe/int64/int128 decimal coefficients with all-valid and sparse
+null masks, in both flat and dictionary source form. It checks source equality after a
+successful write/read before page-size assertions, so silent data loss cannot be hidden by
+another column's throwing copy. The old rebuild writer could persist undetectably wrong
+values at these small capacities; the internal rebuild README records the impact and thresholds.
+This unreleased-format defect does not affect the shipped format or default raw page sizes.
+
 `scripts/frame-copy-bench.mts` isolates frame ownership copies in five interleaved CPU/wall
 rounds; `MINNOW_EXPORT_FRAME_COPY_COMPARE=1` compares those policies through the whole cold scan.
 `scripts/scan-range-bench.mts` isolates the scan's contiguous-prefix dispatch over real encoded

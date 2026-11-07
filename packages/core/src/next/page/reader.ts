@@ -201,6 +201,11 @@ function at<T>(values: readonly T[], index: number): T {
  */
 export const PAGE_DESCRIPTOR_BYTES = 768;
 
+/** In-memory facts only; these bits are never persisted in the page format. */
+export const DecodeFact = { dictionary: 1, safeInt64: 2, allValid: 4 } as const;
+/** One bounded scalar memo per reader; charged independently of the shared directory. */
+export const DECODE_MEMO_BYTES = 128;
+
 /** A parsed page riding on its space-cache entry, with the directory fields it was checked against. */
 class PageDescriptor {
   readonly #encoding: number;
@@ -372,6 +377,24 @@ export class ChunkReader {
   readonly #held: Array<Held | undefined>;
   readonly #pending = new Map<number, Promise<void>>();
   readonly #directoryCharge: number;
+  readonly #int128: boolean;
+  readonly #facts = {
+    valid: false,
+    firstFrom: 0,
+    firstTo: 0,
+    lastFrom: 0,
+    lastTo: 0,
+    bits: 0,
+    bytesFrom: -1,
+    bytesTo: -1,
+    bytes: 0,
+  };
+
+  #invalidateFacts(): void {
+    this.#facts.valid = false;
+    this.#facts.bytesFrom = -1;
+  }
+
   /** The directory cache entry this reader pins, or null. */
   readonly #directoryPin: BlobRef | null;
   #dictionaryPending: Promise<void> | null = null;
@@ -415,6 +438,15 @@ export class ChunkReader {
     this.directory = directory;
     this.#directoryCharge = directoryBytes;
     this.#directoryPin = directoryPin;
+    const { min, max } = chunk.statistics;
+    this.#int128 =
+      directory.tag === ValueTag.dec64 &&
+      !(
+        typeof min === "bigint" &&
+        typeof max === "bigint" &&
+        min >= -(2n ** 63n) &&
+        max <= 2n ** 63n - 1n
+      );
     this.#pages = new Array<PageView | undefined>(directory.pages.length);
     this.#held = new Array<Held | undefined>(directory.pages.length);
   }
@@ -443,16 +475,17 @@ export class ChunkReader {
         cache.unpin(ref, pinning);
         throw error;
       }
-      if (!options.budget.allocate(hit.size)) {
+      if (!options.budget.allocate(hit.size + DECODE_MEMO_BYTES)) {
         cache.unpin(ref, pinning);
-        throw new PageBudgetError(hit.size);
+        throw new PageBudgetError(hit.size + DECODE_MEMO_BYTES);
       }
-      return new ChunkReader(space, chunk, hit.value, options, hit.size, ref);
+      return new ChunkReader(space, chunk, hit.value, options, hit.size + DECODE_MEMO_BYTES, ref);
     }
     const build = (bytes: Uint8Array): ChunkReader => {
       // Charged from the header's page count before the parse builds anything (B2-2 #4).
       const charge = directoryChargeOf(sized(bytes, ref.length));
-      if (!options.budget.allocate(charge)) throw new PageBudgetError(charge);
+      if (!options.budget.allocate(charge + DECODE_MEMO_BYTES))
+        throw new PageBudgetError(charge + DECODE_MEMO_BYTES);
       let directory: ChunkDirectory;
       try {
         directory = parseDirectory(bytes, chunk.data.length);
@@ -461,15 +494,15 @@ export class ChunkReader {
           "Page directory tag differs from the column type",
         );
       } catch (error) {
-        options.budget.free(charge);
+        options.budget.free(charge + DECODE_MEMO_BYTES);
         throw error;
       }
       // A one-pass scan uses cached directories but keeps none it parsed (`options.once`).
       if (cache === undefined || options.once === true)
-        return new ChunkReader(space, chunk, directory, options, charge, null);
+        return new ChunkReader(space, chunk, directory, options, charge + DECODE_MEMO_BYTES, null);
       // Pinned for this reader; another reader's earlier entry wins a race (same bytes, same charge).
       const shared = cache.admit(ref, directory, charge);
-      return new ChunkReader(space, chunk, shared, options, charge, ref);
+      return new ChunkReader(space, chunk, shared, options, charge + DECODE_MEMO_BYTES, ref);
     };
     const cached = options.once === true ? space.peek(ref, PEEK_ONCE) : space.peek(ref);
     if (cached !== null) return build(cached);
@@ -1023,6 +1056,7 @@ export class ChunkReader {
   ): void {
     try {
       if (this.#closed) throw new ReaderClosedError();
+      this.#invalidateFacts();
       if (page === null) {
         const dictionary = this.#parseDictionary(entry, bytes, stored);
         this.#dictionary = dictionary;
@@ -1193,6 +1227,7 @@ export class ChunkReader {
 
   /** Drops loaded pages (all, or the named ones) and their bytes. The dictionary stays. */
   release(pageIndices?: readonly number[]): void {
+    this.#invalidateFacts();
     if (pageIndices === undefined) this.releaseValues();
     const indices = pageIndices ?? this.#pages.map((_, index) => index);
     for (const index of indices) {
@@ -1804,6 +1839,7 @@ export class ChunkReader {
     if (!this.#options.budget.allocate(lane)) throw new PageBudgetError(lane);
     const plain = materializeScaledFloat(view);
     this.#held[index] = { ...held, charged: held.charged + lane };
+    this.#invalidateFacts();
     this.#pages[index] = plain;
     return plain;
   }
@@ -1812,6 +1848,44 @@ export class ChunkReader {
     const view = this.#pages[index];
     if (view === undefined) throw new RangeError(`Page ${String(index)} is not loaded`);
     return view;
+  }
+
+  /**
+   * Header facts for the pages covering a nonempty row span. Reused while its first/last
+   * pages stay the same. Loads/releases/materialization invalidate the memo; it holds
+   * scalars only, never page buffers or dictionary references. Missing pages prove nothing.
+   */
+  decodeFacts(from: number, to: number): number {
+    const memo = this.#facts;
+    if (
+      memo.valid &&
+      from >= memo.firstFrom &&
+      from < memo.firstTo &&
+      to > memo.lastFrom &&
+      to <= memo.lastTo
+    )
+      return memo.bits;
+    const [first, end] = this.pagesInRange(from, to);
+    let bits = DecodeFact.dictionary | DecodeFact.safeInt64 | DecodeFact.allValid;
+    for (let page = first; page < end; page++) {
+      const entry = this.directory.pages[page],
+        view = this.#pages[page];
+      if (entry === undefined || !isDictionary(entry)) bits &= ~DecodeFact.dictionary;
+      if (view === undefined || (!view.safe && !view.allNull)) bits &= ~DecodeFact.safeInt64;
+      if (view === undefined || view.allNull || view.validity !== null)
+        bits &= ~DecodeFact.allValid;
+    }
+    const start = this.directory.pages[first],
+      stop = this.directory.pages[end - 1];
+    memo.valid = start !== undefined && stop !== undefined;
+    if (start !== undefined && stop !== undefined) {
+      memo.firstFrom = start.firstRow;
+      memo.firstTo = start.firstRow + start.rowCount;
+      memo.lastFrom = stop.firstRow;
+      memo.lastTo = stop.firstRow + stop.rowCount;
+    }
+    memo.bits = bits;
+    return bits;
   }
 
   /** Whether every page over `[from, to)` is dictionary-encoded (decode as codes). */
@@ -1863,6 +1937,8 @@ export class ChunkReader {
 
   /** Bytes a varlen target needs for rows `[from, to)` (pages must be loaded). */
   varlenBytes(from: number, to: number): number {
+    const memo = this.#facts;
+    if (memo.bytesFrom === from && memo.bytesTo === to) return memo.bytes;
     const [first, end] = this.pagesInRange(from, to);
     let total = 0;
     for (let page = first; page < end; page++) {
@@ -1873,6 +1949,9 @@ export class ChunkReader {
       const stop = Math.min(to, entry.firstRow + entry.rowCount) - entry.firstRow;
       total += varlenBytesOf(view, this.#dictionary, null, start, stop);
     }
+    memo.bytesFrom = from;
+    memo.bytesTo = to;
+    memo.bytes = total;
     return total;
   }
 
@@ -1980,10 +2059,6 @@ export class ChunkReader {
 
   /** Whether any page of the chunk stores 128-bit coefficients (decode into the int128 tier). */
   get needsInt128(): boolean {
-    if (this.directory.tag !== ValueTag.dec64) return false;
-    const { min, max } = this.chunk.statistics;
-    if (typeof min === "bigint" && typeof max === "bigint")
-      return min < -(2n ** 63n) || max > 2n ** 63n - 1n;
-    return true;
+    return this.#int128;
   }
 }

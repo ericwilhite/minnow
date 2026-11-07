@@ -11,7 +11,13 @@ import {
   TIMESTAMP_POS_INFINITY,
 } from "../temporal.js";
 import { INT32_MAX, INT32_MIN, INT64_MAX, INT64_MIN, type PhysicalType } from "../types.js";
-import { ChunkReader, directoryCharge, MAX_BLOB_BYTES, MAX_READ_BYTES } from "./reader.js";
+import {
+  ChunkReader,
+  DECODE_MEMO_BYTES,
+  directoryCharge,
+  MAX_BLOB_BYTES,
+  MAX_READ_BYTES,
+} from "./reader.js";
 import { ReadDeniedError } from "../storage/extents.js";
 import { DistinctSketch, mix32 } from "./sketch.js";
 import {
@@ -983,7 +989,7 @@ describe("chunk reader over the extent space", () => {
     expect(second.load(all)).toBeUndefined();
     expect(second.loadDictionary()).toBe(second.dictionary);
     const stored = second.directory.pages.reduce((sum, page) => sum + page.length, 0);
-    const directory = directoryCharge(second.directory);
+    const directory = directoryCharge(second.directory) + DECODE_MEMO_BYTES;
     expect(warm.held).toBe(directory + stored + (second.directory.dictionary?.length ?? 0));
     const codes = new Int32Array(values.length);
     second.decodeCodes(0, values.length, codes, null, 0);

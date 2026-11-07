@@ -4,7 +4,7 @@
  *
  * ## Shape of what it writes
  * - Each column is cut into pages of about `pageBytes` encoded bytes (default 32 KiB), from a raw
- *   page buffer of at most `rawPageBytes` (default 64 KiB). The next page's row target comes from
+ *   page buffer of at most `rawPageBytes` (default 32 KiB). The next page's row target comes from
  *   the previous page's encoded bytes per row, so compressible columns get longer pages.
  * - Text, bytes, json, enum, array and uuid columns start with a group-scoped dictionary. A page
  *   whose dictionary form (codes plus its new entries) would be larger than plain, or that would
@@ -494,7 +494,8 @@ abstract class ColumnWriter {
     // Next page's row target from this page's density.
     const perRow = page.bytes.length / this.rows;
     const target = Math.floor(this.writer.options.pageBytes / Math.max(perRow, 1 / 64));
-    this.pageRows = Math.max(64, Math.min(this.capacity, target - (target % 64)));
+    // The 64-row preference cannot exceed a small raw buffer's hard capacity.
+    this.pageRows = Math.min(this.capacity, Math.max(64, target - (target % 64)));
     this.rows = 0;
     this.mayHaveNulls = false;
     this.resetPage();

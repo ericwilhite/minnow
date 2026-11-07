@@ -5,11 +5,6 @@
  * Table/group descriptors are supplied by the fixture (no B3 catalog/group-root loading).
  * Keep this adapter under the bench directory; production modules must not import it.
  */
-import type { ColumnDef } from "../../../packages/core/src/next/access/catalog.js";
-import type {
-  GroupSegment,
-  TableSnapshot,
-} from "../../../packages/core/src/next/access/snapshot.js";
 import type { ByteBudget, ExtentReader } from "../../../packages/core/src/next/storage/extents.js";
 import { chunkReads } from "../../../packages/core/src/next/exec/scan.js";
 import { TableScan, type ScanStats } from "../../../packages/core/src/next/exec/table-scan.js";
@@ -26,6 +21,8 @@ import { DEFAULT_RESULT_WINDOW_BYTES } from "../../../packages/core/src/next/own
 import { transferFor } from "../../../packages/core/src/next/owner/frame.js";
 import type { ExportGroup, ExportResult } from "./export-stream.js";
 import { BenchFrameAssembler } from "./owner-frames.js";
+import { benchTableOf } from "./scan-fixture.js";
+export { benchTableOf } from "./scan-fixture.js";
 
 export interface ScanExportStats {
   readonly copies: BenchFrameAssembler["copyStats"];
@@ -50,49 +47,6 @@ export interface ScanExportStats {
   readonly postMs: number;
   readonly creditWaitMs: number;
   readonly scan: ScanStats;
-}
-
-/** BENCH-only snapshot descriptors; stands in for catalog/group-root reads. */
-export function benchTableOf(groups: readonly ExportGroup[]): TableSnapshot {
-  const first = groups[0];
-  if (!first) throw new Error("No scan groups");
-  const columns: ColumnDef[] = first.chunks.map((chunk) => ({
-    id: chunk.columnId,
-    name: `c${String(chunk.columnId)}`,
-    type: chunk.type,
-    get declared(): never {
-      throw new Error("Bench has no SQL catalog descriptors");
-    },
-    nullable: true,
-    defaultSql: null,
-    generatedSql: null,
-    identitySequence: null,
-    missing: null,
-  }));
-  const segments: GroupSegment[] = groups.map((g, index) => ({
-    kind: "group",
-    index,
-    rowCount: g.rows,
-    liveRowCount: g.rows,
-    staged: false,
-    get group(): never {
-      throw new Error("Bench supplies decoded group descriptors, not B3 GroupRefs");
-    },
-    root: () => ({ rowCount: g.rows, rowIds: { kind: "dense" }, columns: g.chunks }),
-    chunk: (id: number) => g.chunks.find((c) => c.columnId === id) ?? null,
-    deletions: () => null,
-    statistics: () => null,
-    pages: () => {
-      throw new Error("Unfiltered bench does not supply B3 page summaries");
-    },
-  }));
-  return {
-    tableId: 1,
-    schemaVersion: 1,
-    columns,
-    segments,
-    liveRowCount: groups.reduce((n, g) => n + g.rows, 0),
-  };
 }
 
 export async function scanExport(

@@ -1,6 +1,7 @@
 // eslint-disable-next-line no-restricted-imports -- Node-only benchmark compiler; never shipped.
 import { execFileSync } from "node:child_process";
 import { defineConfig, type Plugin } from "vite";
+import { shapeComparison } from "./scripts/browser-perf/shape-comparison.js";
 
 /**
  * Cross-origin isolation for the pages that ask for it (`?isolated=1`), and for every request that
@@ -40,6 +41,7 @@ const exportBaseline =
 export default defineConfig({
   plugins: [
     isolatedPages,
+    ...(process.env.MINNOW_EXPORT_SCAN_SHAPE_COMPARE === "1" ? [shapeComparison()] : []),
     ...(process.env.MINNOW_EXPORT_SCAN_RANGE_COMPARE === "1"
       ? [
           {

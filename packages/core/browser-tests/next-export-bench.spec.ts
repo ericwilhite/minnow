@@ -22,6 +22,10 @@
  * thread CPU (1-second sampling interval, not a hotspot profile). Both await all frame credits.
  * MINNOW_EXPORT_SCAN_PROFILE=1 instead profiles only the scan worker, cold and warm, requesting
  * 500-us samples. scripts/scan-profile.mts separates native waits from active-stack shares.
+ * MINNOW_EXPORT_SCAN_SHAPE_COMPARE=1 compares scan-only shape setup with 74c79c9b,
+ * five interleaved cold pairs, setup excluded, no frame adapter (requires that Git object).
+ * MINNOW_EXPORT_SCAN_CORE_PROFILE=1 instead consumes borrowed scan batches without any frame
+ * assembly or transport. This diagnostic is not an export result or Gate A throughput measure.
  *
  * - Cold: the profile's OPFS files are synced and dropped from the OS page cache first
  *   (`dd iflag=nocache count=0`, posix_fadvise DONTNEED on a file this user owns), and `fincore`
@@ -69,7 +73,10 @@ const WARM_SHARE = 0.98;
 const DISTINCT = Number(process.env.MINNOW_EXPORT_DISTINCT ?? 4);
 /** MINNOW_EXPORT_FOCUS=1: only Gate A's configuration (cold ×5, warm ×5, a profiled pass). */
 const COMPARE_STREAM = process.env.MINNOW_EXPORT_COMPARE_STREAM === "1";
-const SCAN_PROFILE = process.env.MINNOW_EXPORT_SCAN_PROFILE === "1";
+const SCAN_SHAPE_TRANSPORT = process.env.MINNOW_EXPORT_SCAN_SHAPE_TRANSPORT === "1";
+const SCAN_SHAPE_COMPARE = process.env.MINNOW_EXPORT_SCAN_SHAPE_COMPARE === "1";
+const SCAN_CORE_PROFILE = process.env.MINNOW_EXPORT_SCAN_CORE_PROFILE === "1";
+const SCAN_PROFILE = process.env.MINNOW_EXPORT_SCAN_PROFILE === "1" || SCAN_CORE_PROFILE;
 const FRAME_COPY_COMPARE = process.env.MINNOW_EXPORT_FRAME_COPY_COMPARE === "1";
 const SCAN_RANGE_COMPARE = process.env.MINNOW_EXPORT_SCAN_RANGE_COMPARE === "1";
 const SCAN_OWNED_COMPARE = process.env.MINNOW_EXPORT_SCAN_OWNED_COMPARE === "1";
@@ -79,6 +86,7 @@ const SCAN_IO_COMPARE = process.env.MINNOW_EXPORT_SCAN_IO_COMPARE === "1";
 const SCAN_COMPARE =
   process.env.MINNOW_EXPORT_SCAN_COMPARE === "1" ||
   SCAN_PROFILE ||
+  SCAN_SHAPE_COMPARE ||
   FRAME_COPY_COMPARE ||
   SCAN_RANGE_COMPARE ||
   SCAN_IO_COMPARE ||
@@ -349,8 +357,9 @@ interface Row {
   readonly rows: number;
   readonly rowsPerSecond: number;
   readonly readMiB: number;
-  readonly mode: "pages" | "scan";
+  readonly mode: "pages" | "scan" | "scan-core";
   readonly scanStats?: Awaited<ReturnType<Run["exportPass"]>>[number]["scanStats"];
+  readonly scanCoreStats?: Awaited<ReturnType<Run["exportPass"]>>[number]["scanCoreStats"];
   readonly afterWorkerClose?: Awaited<ReturnType<Run["exportPass"]>>[number]["afterWorkerClose"];
   readonly seconds: number;
   readonly exportMs: number;
@@ -483,6 +492,20 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       if (COMPARE_STREAM)
         expect(pass.baselineCommit).toBe(process.env.MINNOW_EXPORT_BASELINE_COMMIT ?? "18548e34");
       expect(pass.verifying, "the cached-bytes guard re-hashes every release").toBe(false);
+      if (SCAN_SHAPE_COMPARE) {
+        expect(pass.shapeComparison?.reference).toBe("74c79c9b");
+        expect(pass.shapeComparison?.variant).toBe(options.scanShape);
+        expect(pass.shapeComparison?.classes).toHaveLength(3);
+      }
+      if (options.mode === "scan-core") {
+        expect(pass.scanStats, "scan-only must not assemble frames").toBeUndefined();
+        expect(pass.scanCoreStats?.batches).toBeGreaterThan(0);
+        expect(pass.scanCoreStats?.columns).toBe((pass.scanCoreStats?.batches ?? 0) * 200);
+        expect(pass.scanCoreStats?.maxBatchRows).toBeLessThanOrEqual(2048);
+        const previous = results.find((r) => r.mode === "scan-core");
+        if (previous)
+          expect(pass.scanCoreStats?.fingerprint).toBe(previous.scanCoreStats?.fingerprint);
+      }
       if (options.scanOutput === "dictionary" || options.scanOutput === "flat") {
         expect(pass.scanStats?.copies.adoptedFrames, "candidate ownership must be active").toBe(
           pass.scanStats?.frames,
@@ -539,11 +562,12 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         readMiB: pass.readMiB,
         mode: pass.mode,
         ...(pass.scanStats ? { scanStats: pass.scanStats } : {}),
+        ...(pass.scanCoreStats ? { scanCoreStats: pass.scanCoreStats } : {}),
         ...(pass.afterWorkerClose ? { afterWorkerClose: pass.afterWorkerClose } : {}),
         rowsPerSecond: Math.round(pass.rows / (pass.ms / 1000)),
         seconds: Number((pass.ms / 1000).toFixed(1)),
         exportMs: pass.ms,
-        loadShare: pass.mode === "scan" ? null : Number((pass.loadMs / pass.ms).toFixed(2)),
+        loadShare: pass.mode !== "pages" ? null : Number((pass.loadMs / pass.ms).toFixed(2)),
         mbPerSecond: Math.round(bytes / 1e6 / (pass.ms / 1000)),
         platformReads: pass.platformReads,
         governorPeakMiB: Math.round(pass.governorPeakMiB),
@@ -594,6 +618,24 @@ test.describe("rebuild core export on OPFS (bench)", () => {
           false,
           { ...options, scanTargetMiB },
         );
+    } else if (SCAN_SHAPE_COMPARE) {
+      const options = {
+        ...base,
+        mode: SCAN_SHAPE_TRANSPORT ? ("scan" as const) : ("scan-core" as const),
+        readaheadKiB: 256,
+        windowMiB: WINDOW_MIB,
+        auditWorkingSet: false,
+        profile: true,
+      };
+      for (let round = 0; round < 5; round++)
+        for (const scanShape of round % 2 === 0
+          ? (["baseline", "candidate"] as const)
+          : (["candidate", "baseline"] as const))
+          await measure(`cold scan shape ${scanShape} round ${String(round)}`, true, false, {
+            ...options,
+            scanShape,
+            scanIO: "window",
+          });
     } else if (FRAME_COPY_COMPARE || SCAN_RANGE_COMPARE || SCAN_IO_COMPARE || SCAN_OWNED_COMPARE) {
       const options = {
         ...base,
@@ -638,7 +680,9 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         throw new Error("Scan rounds must be a positive integer");
       for (let round = 0; round < rounds; round++)
         for (const mode of SCAN_PROFILE
-          ? (["scan"] as const)
+          ? SCAN_CORE_PROFILE
+            ? (["scan-core"] as const)
+            : (["scan"] as const)
           : round % 2 === 0
             ? (["pages", "scan"] as const)
             : (["scan", "pages"] as const)) {
@@ -779,11 +823,23 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         windowMiB: WINDOW_MIB,
         profile: true,
       });
-    for (const [index, profile] of targets.profiles.entries())
+    for (const [index, profile] of targets.profiles.entries()) {
+      if (SCAN_CORE_PROFILE || (SCAN_SHAPE_COMPARE && !SCAN_SHAPE_TRANSPORT)) {
+        const sampled = new Set(profile.samples);
+        expect(
+          profile.nodes.filter(
+            (node) =>
+              sampled.has(node.id) &&
+              /\/(owner-frames|exec\/result|owner\/frame)\.ts/u.test(node.callFrame.url),
+          ),
+          "scan-only profiles must exclude frame assembly and result transport",
+        ).toHaveLength(0);
+      }
       await info.attach(`export-cpu-${String(index)}`, {
         body: JSON.stringify(profile),
         contentType: "application/json",
       });
+    }
     const recorded = SCAN_COMPARE && !SCAN_PROFILE ? undefined : targets.profiles.at(-1);
     const hotspots = recorded === undefined ? [] : selfTimes(recorded, 15);
     console.log(`warm pass profile (self time):\n  ${hotspots.join("\n  ")}`);
@@ -806,9 +862,12 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       ...(SCAN_COMPARE
         ? {
             scanAdapter:
-              "bench stand-in for future executor frame assembly; real TableScan/ResultChannel/owner transfer policy/MessagePort credits; fixture descriptors exclude SQL/catalog/root loading",
+              SCAN_CORE_PROFILE || (SCAN_SHAPE_COMPARE && !SCAN_SHAPE_TRANSPORT)
+                ? "scan-only diagnostic; real TableScan/driver; borrowed endpoint consumer; excludes all frame assembly, result channel, transfers and client transport; fixture descriptors exclude SQL/catalog/root loading"
+                : "bench stand-in for future executor frame assembly; real TableScan/ResultChannel/owner transfer policy/MessagePort credits; fixture descriptors exclude SQL/catalog/root loading",
             cpuSamplingIntervalUs: SCAN_PROFILE ? 500 : 1_000_000,
             rounds:
+              SCAN_SHAPE_COMPARE ||
               FRAME_COPY_COMPARE ||
               SCAN_RANGE_COMPARE ||
               SCAN_IO_COMPARE ||
@@ -817,6 +876,14 @@ test.describe("rebuild core export on OPFS (bench)", () => {
                 ? 5
                 : Number(process.env.MINNOW_EXPORT_SCAN_ROUNDS ?? (SCAN_PROFILE ? 1 : 5)),
             scanProfile: SCAN_PROFILE,
+            ...(SCAN_SHAPE_COMPARE
+              ? {
+                  scanShapeReference: "74c79c9b",
+                  scanShapeComparison: SCAN_SHAPE_TRANSPORT
+                    ? "reader facts and column recipes; bench stand-in frame adapter, real transfers, five cold interleaved pairs"
+                    : "reader facts and column recipes; scan-only, no frame adapter, five cold interleaved pairs",
+                }
+              : {}),
             ...(SCAN_BATCH_COMPARE
               ? {
                   scanBatchCompletedPrefix: SCAN_BATCH_COMPLETED,
@@ -834,6 +901,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
               : {}),
             coldOnly:
               SCAN_BATCH_COMPARE ||
+              SCAN_SHAPE_COMPARE ||
               FRAME_COPY_COMPARE ||
               SCAN_RANGE_COMPARE ||
               SCAN_IO_COMPARE ||
