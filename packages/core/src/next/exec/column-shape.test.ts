@@ -260,8 +260,8 @@ it.each(seedsFor("next-column-shape", [0xb2d1, 0xb2d2]))(
                     actualBytes.length !== expectedBytes.length ||
                     !actualBytes.every((bytes, i) => {
                       const referenceBytes = expectedBytes[i];
+                      if (referenceBytes === undefined) return false;
                       return (
-                        referenceBytes !== undefined &&
                         bytes.byteLength === referenceBytes.byteLength &&
                         bytes.every((value, byte) => value === referenceBytes[byte])
                       );
