@@ -397,3 +397,16 @@ export const SMALL_PAGE_CAPACITY_REACH = [
   "fixed16",
   "decimal128",
 ] as const;
+
+/** Each small-page writer representation and source form runs this independent campaign. */
+export const SMALL_PAGE_REPRESENTATION_REACH = [
+  "capacity below 64",
+  "capacity at least 64",
+  "write completed",
+  "ordinary read completed",
+  "source equality",
+  "second flush",
+] as const;
+
+/** Stratified independently for every type/representation and source form. */
+export const SMALL_PAGE_NULL_STATES = ["all valid", "sparse nulls"] as const;

@@ -1230,7 +1230,14 @@ Generated source-value equality and residency histories cover this reuse in
 The shape histories include 512-byte and 2 KiB raw pages. The generated
 `next/page/small-pages.test.ts` also checks adaptive flushes for intervals, UUIDs
 and 128-bit decimals when the raw buffer holds fewer than 64 rows. The density-based
-row preference is capped by that buffer's capacity.
+row preference is capped by that buffer's capacity. The independent
+`next/page/small-page-representations.test.ts` checks safe and wide int64 inputs,
+safe/wide intervals, and safe/int64/int128 decimal coefficients with all-valid and sparse
+null masks, in both flat and dictionary source form. It checks source equality after a
+successful write/read before page-size assertions, so silent data loss cannot be hidden by
+another column's throwing copy. The old rebuild writer could persist undetectably wrong
+values at these small capacities; the internal rebuild README records the impact and thresholds.
+This unreleased-format defect does not affect the shipped format or default raw page sizes.
 
 `scripts/frame-copy-bench.mts` isolates frame ownership copies in five interleaved CPU/wall
 rounds; `MINNOW_EXPORT_FRAME_COPY_COMPARE=1` compares those policies through the whole cold scan.
