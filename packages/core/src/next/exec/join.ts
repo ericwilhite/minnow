@@ -299,6 +299,48 @@ export function hashJoinMinimumBytes(declared: HashJoinSpec): number {
   return KeyScratch.bytes(layout, BATCH_ROWS) + SCRATCH_BYTES + poolBytes(spec);
 }
 
+/** Validates immutable join metadata without allocating a hash table, pool or batch buffer. */
+function checkJoinSpec(spec: HashJoinSpec): { layout: KeyLayout; correlated: number } {
+  if (spec.probeKeys.length !== spec.buildKeys.length)
+    throw new RangeError("Join keys must pair up");
+  const keyTypes = spec.probeKeys.map((c) => {
+    const type = spec.probeTypes[c];
+    if (type === undefined) throw new RangeError("Probe key column out of range");
+    return type;
+  });
+  for (let i = 0; i < spec.buildKeys.length; i++) {
+    const type = spec.buildTypes[spec.buildKeys[i] ?? -1];
+    if (type === undefined) throw new RangeError("Build key column out of range");
+    if (type.kind !== keyTypes[i]?.kind)
+      throw new TypeError("Join keys must have the same type on both sides (lowering casts)");
+  }
+  const correlated = spec.kind === "mark" ? (spec.correlated ?? 0) : spec.probeKeys.length;
+  if (spec.kind === "mark") {
+    if (correlated < 0 || correlated >= keyTypes.length)
+      throw new RangeError("A mark join tests at least one key");
+    for (let i = correlated; i < keyTypes.length; i++)
+      if (spec.nullSafe[i] === true) throw new TypeError("A mark join's tested keys use =");
+  }
+  if (spec.kind !== "mark" && (spec.filter ?? null) !== null)
+    throw new TypeError("Only a mark join has a filter apart from its residual");
+  if (spec.kind === "mark" && spec.residual !== null && spec.residual.unknown === undefined)
+    throw new TypeError("A mark join's residual must report NULL rows (`unknown`)");
+  if (spec.publishes.length > 0 && !kindPublishes(spec.kind))
+    throw new TypeError(
+      `A ${spec.kind} join keeps its probe misses: it cannot publish runtime filters`,
+    );
+  const layout = new KeyLayout(keyTypes, spec.nullSafe);
+  return { layout, correlated };
+}
+
+export function validateHashJoinSpec(declared: HashJoinSpec): void {
+  const spec =
+    declared.probeKeys.length === 0 && declared.buildKeys.length === 0
+      ? new Keyless(declared).spec
+      : declared;
+  checkJoinSpec(spec);
+}
+
 /** State shared by every level of one join: spec, scratch, outputs, spill, downstream. */
 class Shared {
   readonly kind: HashJoinKind;
@@ -367,35 +409,9 @@ class Shared {
     readonly context: HashJoinContext,
   ) {
     this.kind = spec.kind;
-    if (spec.probeKeys.length !== spec.buildKeys.length)
-      throw new RangeError("Join keys must pair up");
-    const keyTypes = spec.probeKeys.map((c) => {
-      const type = spec.probeTypes[c];
-      if (type === undefined) throw new RangeError("Probe key column out of range");
-      return type;
-    });
-    for (let i = 0; i < spec.buildKeys.length; i++) {
-      const type = spec.buildTypes[spec.buildKeys[i] ?? -1];
-      if (type === undefined) throw new RangeError("Build key column out of range");
-      if (type.kind !== keyTypes[i]?.kind)
-        throw new TypeError("Join keys must have the same type on both sides (lowering casts)");
-    }
-    this.correlated = spec.kind === "mark" ? (spec.correlated ?? 0) : spec.probeKeys.length;
-    if (spec.kind === "mark") {
-      if (this.correlated < 0 || this.correlated >= keyTypes.length)
-        throw new RangeError("A mark join tests at least one key");
-      for (let i = this.correlated; i < keyTypes.length; i++)
-        if (spec.nullSafe[i] === true) throw new TypeError("A mark join's tested keys use =");
-    }
-    if (spec.kind !== "mark" && (spec.filter ?? null) !== null)
-      throw new TypeError("Only a mark join has a filter apart from its residual");
-    if (spec.kind === "mark" && spec.residual !== null && spec.residual.unknown === undefined)
-      throw new TypeError("A mark join's residual must report NULL rows (`unknown`)");
-    if (spec.publishes.length > 0 && !kindPublishes(spec.kind))
-      throw new TypeError(
-        `A ${spec.kind} join keeps its probe misses: it cannot publish runtime filters`,
-      );
-    this.layout = new KeyLayout(keyTypes, spec.nullSafe);
+    const checked = checkJoinSpec(spec);
+    this.correlated = checked.correlated;
+    this.layout = checked.layout;
     this.conditioned = spec.residual !== null || (spec.filter ?? null) !== null;
     this.charge = new Charge(context.grant);
     if (!this.charge.allocate(SCRATCH_BYTES))
@@ -408,8 +424,8 @@ class Shared {
     });
     this.scratch = new KeyScratch(this.layout, BATCH_ROWS, this.charge, this.pool);
     if (spec.kind === "mark")
-      for (let i = this.correlated; i < keyTypes.length; i++) {
-        const type = keyTypes[i];
+      for (let i = this.correlated; i < this.layout.types.length; i++) {
+        const type = this.layout.types[i];
         if (type === undefined) continue;
         const layout = new KeyLayout([type], [false]);
         this.compat[i] = {

@@ -114,6 +114,7 @@ import {
   CompiledFallback,
   pushedColumn,
   splitFilter,
+  loadProfiled,
   type PushedColumn,
   type PushedPredicate,
 } from "./pushdown.js";
@@ -142,6 +143,10 @@ export const DENSE_SELECTION = 0.4;
 
 /** What the scan counts (diagnostics, tests, benches). */
 export interface ScanStats {
+  /** Encoded data pages first opened by a chunk reader (including cache hits). */
+  pagesRead: number;
+  /** Pages directly ruled out by whole-group or encoded page bounds, once per predicate. */
+  pagesPruned: number;
   groupsPruned: number;
   groupsRead: number;
   denseBatches: number;
@@ -292,6 +297,8 @@ function scratchBytes(emitLocator: boolean): number {
 
 export class TableScan implements BatchSource {
   readonly stats: ScanStats = {
+    pagesRead: 0,
+    pagesPruned: 0,
     groupsPruned: 0,
     groupsRead: 0,
     denseBatches: 0,
@@ -692,7 +699,10 @@ export class TableScan implements BatchSource {
           // A missing column is one constant: decide the conjunct once.
           const value = column.missing ?? nullOf(at(this.#types, predicate.column));
           if (!this.#missingMatches(p, { form: "constant", type: value.type, length: 1, value })) {
-            for (const pages of opened) pages.close();
+            for (const pages of opened) {
+              this.stats.pagesPruned += pages.pagesInRange(0, pages.rowCount)[1];
+              pages.close();
+            }
             this.stats.groupsPruned += 1;
             return null;
           }
@@ -707,9 +717,13 @@ export class TableScan implements BatchSource {
           predicate,
           at(this.#fallbacks, p),
           this.#options.encodedPushdown ?? true,
+          this.stats,
         );
         if (!compiled.mayMatch(segment.rowCount, chunk.statistics)) {
-          for (const pages of opened) pages.close();
+          for (const pages of opened) {
+            this.stats.pagesPruned += pages.pagesInRange(0, pages.rowCount)[1];
+            pages.close();
+          }
           this.stats.groupsPruned += 1;
           return null;
         }
@@ -912,15 +926,22 @@ export class TableScan implements BatchSource {
       if ("from" in spec) {
         const [first, end] = pages.pagesInRange(spec.from, spec.to);
         yield* this.#wait(
-          pages.load(Array.from({ length: end - first }, (_, k) => first + k)),
+          loadProfiled(
+            pages,
+            Array.from({ length: end - first }, (_, k) => first + k),
+            this.stats,
+          ),
           () => {
             if (group.retired && group.retained > 0) pages.release();
           },
         );
       } else
-        yield* this.#wait(pages.load(pages.pagesForRows(spec.rows, 0, spec.count)), () => {
-          if (group.retired && group.retained > 0) pages.release();
-        });
+        yield* this.#wait(
+          loadProfiled(pages, pages.pagesForRows(spec.rows, 0, spec.count), this.stats),
+          () => {
+            if (group.retired && group.retained > 0) pages.release();
+          },
+        );
     }
   }
 
@@ -933,7 +954,11 @@ export class TableScan implements BatchSource {
         if (!(group.windowRows > 0 && spec.to <= group.windowEnd)) {
           const [first, end] = pages.pagesInRange(spec.from, spec.to);
           yield* this.#wait(
-            pages.load(Array.from({ length: end - first }, (_, k) => first + k)),
+            loadProfiled(
+              pages,
+              Array.from({ length: end - first }, (_, k) => first + k),
+              this.stats,
+            ),
             () => {
               if (group.retired && group.retained > 0) pages.release();
             },
@@ -941,9 +966,12 @@ export class TableScan implements BatchSource {
         }
         yield* this.#wait(pages.loadValues(spec.from, spec.to));
       } else {
-        yield* this.#wait(pages.load(pages.pagesForRows(spec.rows, 0, spec.count)), () => {
-          if (group.retired && group.retained > 0) pages.release();
-        });
+        yield* this.#wait(
+          loadProfiled(pages, pages.pagesForRows(spec.rows, 0, spec.count), this.stats),
+          () => {
+            if (group.retired && group.retained > 0) pages.release();
+          },
+        );
         yield* this.#wait(pages.loadValuesOf(spec.rows, 0, spec.count));
       }
     }

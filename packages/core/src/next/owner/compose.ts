@@ -46,6 +46,7 @@ import {
   type PreparedPlan,
   type SequenceSession,
 } from "../exec/executor.js";
+import { createExecutor } from "../exec/create.js";
 import { compileTableRules } from "../exec/rules.js";
 import { ResultChannel, type ResultFrame, type ResultStream } from "../exec/result.js";
 import type { ChunkReads } from "../exec/scan.js";
@@ -91,7 +92,8 @@ export interface ComposeOptions {
   readonly statistics?: PlanningStatistics;
   /** The executor's per-row costs the cost model reads; default the executor's own. */
   readonly costs?: ExecutorCosts;
-  readonly executor: Executor;
+  /** Real operator executor by default; protocol fixtures may inject a synthetic executor. */
+  readonly executor?: Executor;
   readonly writePath: WritePath;
   readonly governor: MemoryGovernor;
   readonly spill: SpillService;
@@ -237,7 +239,7 @@ export function composeEngine(options: ComposeOptions): OwnerEngine {
 }
 
 class ComposedEngine implements OwnerEngine {
-  readonly #options: ComposeOptions;
+  readonly #options: ComposeOptions & { readonly executor: Executor };
   readonly #now: () => number;
   readonly #plans = new Map<string, PlannedStatement>();
   readonly #statistics: PlanningStatistics;
@@ -249,7 +251,7 @@ class ComposedEngine implements OwnerEngine {
   #sessionId = 0;
 
   constructor(options: ComposeOptions) {
-    this.#options = options;
+    this.#options = { ...options, executor: options.executor ?? createExecutor() };
     this.#now = options.now ?? Date.now;
     this.#statistics = options.statistics ?? { table: () => null };
     this.#rules = new RuleCache(options.governor);
@@ -571,6 +573,7 @@ class ComposedSession implements EngineSession {
       sequenceSession: this.sequences,
       signal: context.signal,
       resultWindowBytes: context.windowBytes,
+      resultFrameRows: context.frameRows,
       returning,
       ...target,
     });

@@ -796,7 +796,12 @@ describe("table scan: pushdown, gather and late materialization never change the
             if (stats.denseBatches > 0) reach.reach("dense batch");
             if (stats.residualBatches > 0) reach.reach("residual");
             if (stats.splits > 0) reach.reach("byte-bounded split");
-            if (stats.groupsPruned > 0) reach.reach("group pruned");
+            if (stats.groupsPruned > 0) {
+              reach.reach("group pruned");
+              expect(stats.pagesPruned).toBeGreaterThan(0);
+            }
+            if (stats.groupsRead > 0 && stats.denseBatches + stats.gatherBatches > 0)
+              expect(stats.pagesRead).toBeGreaterThan(0);
             if (stats.encodedPredicates > 0) reach.reach("encoded-page pushdown");
             if (stats.decodedPredicates > 0) reach.reach("decoded fallback");
           },

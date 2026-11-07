@@ -244,6 +244,21 @@ export interface PushedColumn {
   selectMask(from: number, to: number, mask: Uint8Array): number;
 }
 
+/** Per-scan counters; cache hits still open an encoded page in this chunk reader. */
+export interface PageWork {
+  pagesRead: number;
+  pagesPruned: number;
+}
+
+export function loadProfiled(
+  pages: ChunkPages,
+  indexes: readonly number[],
+  work?: PageWork,
+): MaybePromise<void> {
+  if (work !== undefined) for (const index of indexes) if (!pages.isLoaded(index)) work.pagesRead++;
+  return pages.load(indexes);
+}
+
 /**
  * The pushed predicate over a chunk: B2's encoded-page evaluation (`ChunkPages.compilePredicate`
  * and the calls after it, `chunkMayMatch` for the group), or, when it does not push the predicate
@@ -256,29 +271,41 @@ export function pushedColumn(
   pushed: PushedPredicate,
   fallback: CompiledFallback,
   encoded = true,
+  work?: PageWork,
 ): PushedColumn {
   if (encoded) {
     const compiled = pages.compilePredicate(pushed.predicate);
-    if (compiled !== null) return new EncodedColumn(pages, compiled);
+    if (compiled !== null) return new EncodedColumn(pages, compiled, work);
   }
-  return new DecodedColumn(pages, fallback);
+  return new DecodedColumn(pages, fallback, work);
 }
 
 /** B2's pushdown on encoded pages. */
 class EncodedColumn implements PushedColumn {
   readonly encoded = true;
+  #prunedThrough = 0;
   constructor(
     readonly pages: ChunkPages,
     readonly compiled: CompiledPredicate,
+    readonly work?: PageWork,
   ) {}
   mayMatch(rowCount: number, statistics: ColumnStatistics): boolean {
     return chunkMayMatch(this.compiled, rowCount, statistics);
   }
   prepare(from: number, to: number): MaybePromise<void> {
-    return this.pages.load(this.pages.pagesMatching(this.compiled, from, to));
+    const matching = this.pages.pagesMatching(this.compiled, from, to);
+    const [first, end] = this.pages.pagesInRange(from, to);
+    if (this.work !== undefined) {
+      // Scan ranges advance monotonically. A page straddling two ranges is credited once.
+      let kept = 0;
+      for (const page of matching) if (page >= this.#prunedThrough) kept++;
+      this.work.pagesPruned += Math.max(0, end - Math.max(first, this.#prunedThrough) - kept);
+    }
+    this.#prunedThrough = Math.max(this.#prunedThrough, end);
+    return loadProfiled(this.pages, matching, this.work);
   }
   prepareRows(rows: Uint16Array, count: number): MaybePromise<void> {
-    return this.pages.load(this.pages.pagesForRows(rows, 0, count));
+    return loadProfiled(this.pages, this.pages.pagesForRows(rows, 0, count), this.work);
   }
   select(from: number, to: number, out: Uint16Array): number {
     return this.pages.select(this.compiled, from, to, out, 0);
@@ -321,17 +348,22 @@ class DecodedColumn implements PushedColumn {
   constructor(
     readonly pages: ChunkPages,
     readonly fallback: CompiledFallback,
+    readonly work?: PageWork,
   ) {}
   mayMatch(): boolean {
     return true;
   }
   prepare(from: number, to: number): MaybePromise<void> {
     const [first, end] = this.pages.pagesInRange(from, to);
-    const loaded = this.pages.load(Array.from({ length: end - first }, (_, k) => first + k));
+    const loaded = loadProfiled(
+      this.pages,
+      Array.from({ length: end - first }, (_, k) => first + k),
+      this.work,
+    );
     return andThen(loaded, () => this.pages.loadValues(from, to));
   }
   prepareRows(rows: Uint16Array, count: number): MaybePromise<void> {
-    const loaded = this.pages.load(this.pages.pagesForRows(rows, 0, count));
+    const loaded = loadProfiled(this.pages, this.pages.pagesForRows(rows, 0, count), this.work);
     return andThen(loaded, () => this.pages.loadValuesOf(rows, 0, count));
   }
   select(from: number, to: number, out: Uint16Array): number {

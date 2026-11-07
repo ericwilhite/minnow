@@ -39,7 +39,14 @@ export interface CompileContext {
   readonly params: ParameterSlots;
   /** Types of the input's columns, by position. */
   readonly input: readonly PhysicalType[];
+  /** Prepared-plan overload decisions only; compiled buffers remain instance-local. */
+  readonly resolveCall?: CallResolver;
 }
+
+export type CallResolver = (
+  fn: string,
+  args: readonly PhysicalType[],
+) => ReturnType<typeof bindCall>;
 
 class ColumnNode implements Compiled {
   constructor(
@@ -148,7 +155,7 @@ export function compileExpr(expr: ScalarExpr, context: CompileContext): Compiled
 function compileCall(expr: Extract<ScalarExpr, { op: "call" }>, context: CompileContext): Compiled {
   const { arena } = context;
   const args = expr.args.map((arg) => compileExpr(arg, context));
-  const binding = bindCall(
+  const binding = (context.resolveCall ?? bindCall)(
     expr.fn,
     args.map((arg) => arg.type),
   );

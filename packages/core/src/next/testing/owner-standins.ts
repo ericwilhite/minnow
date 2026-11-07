@@ -1,5 +1,5 @@
 /**
- * Stand-ins for the tracks whose implementations have not landed, so the owner's composition
+ * Explicit protocol fixtures, so the owner's composition
  * (owner/compose.ts) and protocol server (owner/server.ts) run end to end over **real lowering**
  * (lower/, B6, on main):
  *
@@ -17,7 +17,9 @@
  * - `withTestStatements` adds `SELECT spin($1)`, the latency lane's analytic load.
  *
  * They honour the contracts the composition depends on; they are not models of the real engines
- * (no MVCC beyond copies, no key index, no pages). Replace each with the real track as it lands.
+ * (no MVCC beyond copies, no key index, no pages). `composeEngine` defaults to the real executor;
+ * tests using this synthetic write path must explicitly inject its matching synthetic executor.
+ * `storage-core.ts` exercises the real executor over the real write path and extent storage.
  */
 import {
   CatalogChangeError,

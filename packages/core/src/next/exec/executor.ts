@@ -209,6 +209,8 @@ interface ExecuteBase {
   readonly signal?: AbortSignal;
   /** Credit window of the result stream (default `RESULT_WINDOW_BYTES`). */
   readonly resultWindowBytes?: number;
+  /** Optional maximum rows per result frame (null/absent: byte-bounded framing only). */
+  readonly resultFrameRows?: number | null;
   /**
    * When RETURNING rows may flow: `"atCommit"` for an autocommit DML statement (after
    * `acknowledgeCommit`), `"atExecuted"` otherwise (queries, statements inside a transaction).
@@ -269,7 +271,8 @@ export interface OperatorProfile {
   /** Spill bytes written, and passes over spilled data (0 when it never spilled). */
   readonly spilledBytes: number;
   readonly spillPasses: number;
-  /** Scans and fetches: pages decoded, and pages skipped by bounds or runtime filters. */
+  /** Scans/fetches: encoded data pages opened in their chunk readers (cache hits included),
+   * and pages directly ruled out by group/page bounds or runtime filters. */
   readonly pagesRead: number;
   readonly pagesPruned: number;
   /** Runtime filters this operator applied: probes seen and kept (null when none). */

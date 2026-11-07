@@ -15,6 +15,7 @@
  * observe them.
  */
 import { DEFAULT_KEY_FORWARD_RETENTION_MS } from "../../engine/key-forwards.js";
+import type { PhysicalPlan, Rel } from "../ir/ir.js";
 
 /** The constraint class a statement failed with, or "ok". */
 export type OutcomeClass = "ok" | "unique" | "foreignKey";
@@ -329,4 +330,40 @@ export const DIVERGENCES: readonly Divergence[] = [
 /** The registered divergence that explains `observation`, or null (an unexplained difference). */
 export function intendedDivergence(observation: DivergenceObservation): Divergence | null {
   return DIVERGENCES.find((divergence) => divergence.matches(observation)) ?? null;
+}
+
+/** A documented result-representation decision, applied to the independent PG answer only. */
+export const QUERY_DIVERGENCES = [
+  {
+    id: "integer-average-float64",
+    authority:
+      "next/DECISIONS.md C11: AVG of integer/float inputs returns float64; AVG(NUMERIC) stays NUMERIC. PostgreSQL's pg_typeof(avg(integer)) is numeric (PGlite probe in executor-catalogue.test.ts).",
+  },
+] as const;
+
+/** Trace an unchanged output position to the aggregate that produced it. Computed expressions,
+ * joins and other transformations are deliberately outside this representation rule. */
+function integerAverage(rel: Rel, column: number): boolean {
+  if (rel.op === "project") {
+    const expr = rel.exprs[column];
+    return expr?.op === "column" && integerAverage(rel.input, expr.index);
+  }
+  if (rel.op === "sort" || rel.op === "limit" || rel.op === "filter")
+    return integerAverage(rel.input, column);
+  if (rel.op !== "aggregate") return false;
+  const call = rel.aggregates[column - rel.groupBy.length];
+  const kind = call?.args[0]?.type.kind;
+  return (
+    call?.fn === "avg" && call.type.kind === "float64" && (kind === "int32" || kind === "int64")
+  );
+}
+
+/** C11 authorizes converting this NUMERIC wire text to float64, not a tolerance or a changed
+ * value. The harness then compares exact IEEE bytes. A wrong next-core value still fails.
+ * No conversion for AVG(NUMERIC), an arbitrary float projection, or another aggregate. */
+export function queryAuthorityValue(plan: PhysicalPlan, column: number, value: unknown): unknown {
+  if (typeof value !== "string" || !integerAverage(plan.root, column)) return value;
+  if (!/^[+-]?\d+(?:\.\d+)?$/u.test(value)) return value;
+  const result = Number(value);
+  return Number.isFinite(result) ? result : value;
 }

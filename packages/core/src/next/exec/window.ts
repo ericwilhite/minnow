@@ -175,7 +175,7 @@ function integral(type: PhysicalType): boolean {
 }
 
 /** Refuses what the evaluator does not support (lowering produced it; see the module comment). */
-function check(spec: WindowSpec): void {
+export function validateWindowSpec(spec: WindowSpec): void {
   for (const call of spec.functions) {
     const known = RANKING.has(call.fn) || VALUE.has(call.fn) || AGGREGATE.has(call.fn);
     if (!known) throw new TypeError(`Window function ${call.fn} is not supported`);
@@ -262,7 +262,7 @@ export class WindowOperator implements Operator {
   #pending: Promise<void> | null = null;
 
   constructor(spec: WindowSpec, context: SortContext, downstream: Operator) {
-    check(spec);
+    validateWindowSpec(spec);
     this.spec = spec;
     const grant = deferClose(context.grant);
     const shared: SortContext = { ...context, grant };
