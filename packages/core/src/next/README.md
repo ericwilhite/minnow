@@ -1321,3 +1321,13 @@ branch).
 - **Group commit is essential.** `flush()` is one real disk flush on every engine: 3.4–4.7 ms.
 - **Cross-tab round trips are slow on WebKit.** Measured at about 55–65 µs on Chromium, 140 µs on
   Firefox and 280 µs on WebKit (p95 520 µs).
+
+### IndexedDB log queue ownership
+
+Log append snapshots and coalescing tails are charged to the backend's governor registration
+before allocation. Their charges survive queued and in-flight transactions, even after append
+resolves or a tail is replaced, and are returned only after the final reference settles.
+Backend-owned log buffers total at most 4 MiB across all batches. At that bound or when a copy
+charge cannot fit, append borrows the caller's input and waits for its transaction to settle.
+The caller must keep that input immutable and charged until resolution. No size refusal or
+uncharged fallback copy is introduced. OPFS writes synchronously and retains no append copy.

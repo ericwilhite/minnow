@@ -38,7 +38,8 @@
  * record whole (a range delete of the old record and one put, no get). Records therefore number
  * about log bytes / 64 KiB however small the group commits; a commit rewrites at most 64 KiB.
  * A crash during a rewrite leaves the previous complete record (the transaction is atomic). The
- * tail's buffer is charged to the backend's memory registration while the session holds it.
+ * tail and queued log copies are charged before allocation, until their last session/transaction
+ * reference settles. A replaced tail stays charged while a transaction retains it.
  * `truncateLog` and `resetLog` move the logical end when called, in call order with appends, and
  * forget the tail; if their transaction then fails, the session fails (later appends were placed
  * after the new end). The platforms keep one write-ahead log per database and commit in order, so a strict
@@ -496,6 +497,8 @@ interface LogTail {
   length: number;
   /** The batch whose queue holds its rewrite (later appends in that batch just extend it). */
   queued: number;
+  references: number;
+  readonly release: () => void;
 }
 
 /** A batch of relaxed writes is committed once it holds this many bytes or operations. */
@@ -510,8 +513,9 @@ export const IDB_BATCH_OPERATIONS = 256;
  * `flushLog`), so a barrier commits everything queued before it, atomically and in order. A
  * queued write's failure (quota, a moved epoch) fails the session: every later mutation rejects
  * with it, and nothing of the batch applied; reads go on. Releases, truncation and reset are
- * barriers on the same chain. The queue holds copies (at most one batch, ≤ 4 MiB, plus the batch
- * in flight) and the log's tail record (≤ 64 KiB).
+ * barriers on the same chain. Owned log buffers, including tails and batches in flight, total at
+ * most 4 MiB. At that limit or on refused copy admission, append borrows the caller's input and
+ * waits for settlement; the caller retains its charge. Other write queues keep their own rules.
  */
 class IdbSession implements StoreSession {
   readonly epoch: number;
@@ -530,6 +534,7 @@ class IdbSession implements StoreSession {
   readonly #pendingDataEnds = new Set<{ readonly end: number }>();
   #logLength: number;
   #closed = false;
+  #closing: Promise<void> | null = null;
   #queue: QueuedWrite[] = [];
   #queuedSpaces = new Set<ByteStore>();
   #queuedExtra = new Set<string>();
@@ -539,7 +544,8 @@ class IdbSession implements StoreSession {
   #batch = 0;
   #logTail: LogTail | null = null;
   readonly #memory: CacheMemory | null;
-  #tailCharged = false;
+  #logOwnedBytes = 0;
+  #queuedLogReleases: Array<() => void> = [];
   /** Every commit runs after the previous one (call order). */
   #committing: Promise<void> = Promise.resolve();
   #failure: Error | null = null;
@@ -560,18 +566,37 @@ class IdbSession implements StoreSession {
     this.#memory = memory;
   }
 
-  /**
-   * Sets the log tail. Its 64 KiB buffer is charged to the memory registration while the session
-   * holds one (review B1-p2e finding 3); a refused charge is not retried (the buffer is bounded).
-   */
+  /** Reserve before copying; refusal uses the caller's buffer until settlement. */
+  #reserveLog(bytes: number): (() => void) | null {
+    if (
+      this.#logOwnedBytes + bytes > IDB_BATCH_BYTES ||
+      (this.#memory !== null && !this.#memory.charge(bytes))
+    )
+      return null;
+    this.#logOwnedBytes += bytes;
+    let held = true;
+    return () => {
+      if (!held) return;
+      held = false;
+      this.#logOwnedBytes -= bytes;
+      this.#memory?.release(bytes);
+    };
+  }
+
+  #releaseTail(tail: LogTail): void {
+    tail.references -= 1;
+    if (tail.references === 0) tail.release();
+  }
+
   #setTail(tail: LogTail | null): void {
+    const previous = this.#logTail;
     this.#logTail = tail;
-    if (tail !== null && !this.#tailCharged && this.#memory !== null)
-      this.#tailCharged = this.#memory.charge(LOG_COALESCE_BYTES);
-    else if (tail === null && this.#tailCharged) {
-      this.#memory?.release(LOG_COALESCE_BYTES);
-      this.#tailCharged = false;
-    }
+    if (previous !== null) this.#releaseTail(previous);
+  }
+
+  async #queueTail(tail: LogTail, bytes: number): Promise<void> {
+    tail.references += 1; // the transaction owns this reference, even after replacement/reset
+    await this.#enqueue([this.#log], [], bytes, this.#rewrite(tail), () => this.#releaseTail(tail));
   }
 
   #live(): void {
@@ -590,10 +615,17 @@ class IdbSession implements StoreSession {
     extra: readonly string[],
     bytes: number,
     write: QueuedWrite,
+    releaseLog?: () => void,
   ): Promise<void> {
-    this.#mutable();
-    this.#lease.guard();
+    try {
+      this.#mutable();
+      this.#lease.guard();
+    } catch (error) {
+      releaseLog?.();
+      throw error;
+    }
     this.#queue.push(write);
+    if (releaseLog !== undefined) this.#queuedLogReleases.push(releaseLog);
     for (const space of spaces) this.#queuedSpaces.add(space);
     for (const store of extra) this.#queuedExtra.add(store);
     this.#queuedBytes += bytes;
@@ -620,6 +652,8 @@ class IdbSession implements StoreSession {
    */
   #commit(barrier: Barrier | null = null): Promise<void> {
     const writes = this.#queue;
+    const releaseLogs = this.#queuedLogReleases;
+    this.#queuedLogReleases = [];
     const spaces = [...new Set([...this.#queuedSpaces, ...(barrier?.spaces ?? [])])];
     const extra = [...this.#queuedExtra, ...(barrier?.extra ?? [])];
     this.#queue = [];
@@ -655,10 +689,17 @@ class IdbSession implements StoreSession {
         throw this.#failure;
       }
     });
-    const settled = run.catch(() => undefined);
+    const completed = run.finally(() => {
+      // Clear references before returning their charges, on success and every failure path.
+      all.length = 0;
+      writes.length = 0;
+      for (const release of releaseLogs) release();
+      releaseLogs.length = 0;
+    });
+    const settled = completed.catch(() => undefined);
     void settled.then(() => this.#pendingDataEnds.delete(pending));
     this.#committing = settled;
-    return run;
+    return completed;
   }
 
   /**
@@ -845,33 +886,60 @@ class IdbSession implements StoreSession {
         return offset;
       }
       tail.queued = this.#batch;
-      await this.#enqueue([this.#log], [], bytes.length, this.#rewrite(tail));
+      await this.#queueTail(tail, bytes.length);
       return offset;
     }
-    if (bytes.length >= LOG_COALESCE_BYTES) {
-      this.#setTail(null);
-      const copy = copyOf(bytes);
-      await this.#enqueue([this.#log], [], bytes.length, (tx, next) => {
-        this.#log.write(tx, offset, copy, next);
-      });
+    this.#setTail(null);
+    const release = this.#reserveLog(
+      bytes.length < LOG_COALESCE_BYTES ? LOG_COALESCE_BYTES : bytes.length,
+    );
+    if (bytes.length >= LOG_COALESCE_BYTES || release === null) {
+      // At the queue limit or on refused copy admission, borrow instead of allocating.
+      // appendLog then waits for the transaction: the caller keeps its charge and buffer.
+      let copy: Uint8Array;
+      try {
+        copy = release === null ? bytes : copyOf(bytes);
+      } catch (error) {
+        release?.();
+        throw error;
+      }
+      await this.#enqueue(
+        [this.#log],
+        [],
+        bytes.length,
+        (tx, next) => {
+          this.#log.write(tx, offset, copy, next);
+        },
+        release ?? undefined,
+      );
+      if (release === null) await this.#commit();
       return offset;
+    }
+    let buffer: Uint8Array;
+    try {
+      buffer = new Uint8Array(LOG_COALESCE_BYTES);
+    } catch (error) {
+      release();
+      throw error;
     }
     const started: LogTail = {
       offset,
-      buffer: new Uint8Array(LOG_COALESCE_BYTES),
+      buffer,
       length: bytes.length,
       queued: this.#batch,
+      references: 1,
+      release,
     };
     started.buffer.set(bytes);
     this.#setTail(started);
-    await this.#enqueue([this.#log], [], bytes.length, this.#rewrite(started));
+    await this.#queueTail(started, bytes.length);
     return offset;
   }
 
   /** Writes the tail record whole, as long as it is when the transaction runs. */
   #rewrite(tail: LogTail): QueuedWrite {
     return (tx, next) => {
-      this.#log.write(tx, tail.offset, tail.buffer.slice(0, tail.length), next);
+      this.#log.write(tx, tail.offset, tail.buffer.subarray(0, tail.length), next);
     };
   }
 
@@ -936,13 +1004,16 @@ class IdbSession implements StoreSession {
     });
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return;
-    await this.#commit().catch(() => undefined);
-    this.#closed = true;
-    this.#data.close();
-    this.#log.close();
-    this.#setTail(null);
+  close(): Promise<void> {
+    if (this.#closing !== null) return this.#closing;
+    this.#closed = true; // no new reservations while the existing transactions drain
+    this.#closing = (async () => {
+      await this.#commit().catch(() => undefined);
+      this.#data.close();
+      this.#log.close();
+      this.#setTail(null);
+    })();
+    return this.#closing;
   }
 }
 

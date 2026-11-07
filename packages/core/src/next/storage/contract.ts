@@ -299,7 +299,12 @@ export interface StoreSession {
   readLog(offset: number, length: number): Promise<Uint8Array>;
   /** Both header slots as stored (zeros or null for a slot never written since the last reset). */
   readLogHeaders(): Promise<readonly [Uint8Array | null, Uint8Array | null]>;
-  /** Appends at the end of the body and returns the offset. Not durable until `flushLog`. */
+  /**
+   * Appends at the end of the body and returns the offset. Not durable until `flushLog`.
+   * The caller keeps the input immutable and charged until this promise settles. A backend may
+   * borrow it until then; any copy retained after resolution is the backend's charged memory.
+   * A bounded queue applies backpressure by delaying resolution, never by an uncharged copy.
+   */
   appendLog(bytes: Uint8Array): Promise<number>;
   /** Replaces one header slot (≤ LOG_HEADER_SLOT_BYTES). Not durable until `flushLog`. */
   writeLogHeader(slot: 0 | 1, bytes: Uint8Array): Promise<void>;
