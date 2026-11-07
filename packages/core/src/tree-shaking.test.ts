@@ -32,19 +32,22 @@ const SQL_ENGINE_MODULES =
 // Each budget is the current measurement plus a little headroom; a change that moves one updates
 // the measurement beside it, and the history lives in git.
 
+// B7 typed frame metadata/validation adds 1,181 raw bytes over reviewed B6 base 35cc8c89.
+// Explicitly rebaseline the three engine raw caps by 1 KiB and gzip caps by 0.5 KiB;
+// keep adapter isolation and every tree-shaking assertion unchanged.
 // Everything the main entry exports, bundled: the in-thread engine.
-// Integrated release front end and lowering metadata: 1,171,044 bytes raw / 350,731 bytes gzip.
-const COMPLETE_ENTRY_RAW_BUDGET = 1144 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 342.75 * 1024;
+// Integrated release front end and lowering metadata: 1,172,225 bytes raw / 351,069 bytes gzip.
+const COMPLETE_ENTRY_RAW_BUDGET = 1145 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 343.25 * 1024;
 // The engine with the larger durable adapter, OPFS.
-// Integrated release front end and lowering metadata: 1,583,454 bytes raw / 457,771 bytes gzip.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1546.75 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 447.25 * 1024;
+// Integrated release front end and lowering metadata: 1,584,635 bytes raw / 458,054 bytes gzip.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1547.75 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 447.75 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does.
-// Integrated release front end and lowering metadata: 1,579,368 bytes raw / 455,250 bytes gzip.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1542.75 * 1024;
-const INDEXEDDB_WORKER_GZIP_BUDGET = 444.75 * 1024;
+// Integrated release front end and lowering metadata: 1,580,549 bytes raw / 455,571 bytes gzip.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1543.75 * 1024;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 445.25 * 1024;
 // What a page that hosts the engine in a worker ships on the main thread: the client, the schema
 // DSL and error classes, the Kysely dialect and live queries, and the React hooks, with `kysely`
 // and `react` left to the application. 105.9 KiB raw / 31.6 KiB gzip.

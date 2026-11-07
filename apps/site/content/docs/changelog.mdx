@@ -94,9 +94,11 @@ list below collects them.
   retain TRUE-only keys. In the rebuild executor, frame-offset checks run when the window starts; RANGE sign checks
   require a non-null key comparison, matching PostgreSQL on empty and null-only inputs.
   These modules remain unexported.
-  Shared compiler guards add 243 gzip bytes over the reviewed lowering base. Worker plus client
-  measures 570,899 bytes; its development size budget moves explicitly from 557.5 to 558.0 KiB.
-  The old cap is exceeded by 19 bytes.
+  Shared compiler guards and metadata add 297 gzip bytes over the reviewed lowering base. Worker plus client
+  measures 570,953 bytes; its development size budget moves explicitly from 557.5 to 558.0 KiB.
+  The old cap is exceeded by 73 bytes. Main, OPFS and IndexedDB worker bundles each add
+  1,181 raw bytes; their development raw caps move by 1 KiB and gzip caps by 0.5 KiB.
+  Adapter isolation and tree-shaking checks are unchanged.
 - SQL examples cast plain-number aggregates to `NUMERIC` before `ROUND(value, digits)` so
   they use PostgreSQL's supported overload and return exact decimal text.
 

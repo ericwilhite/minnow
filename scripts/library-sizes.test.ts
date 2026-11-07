@@ -30,9 +30,9 @@ describe("compressed download budgets", () => {
     // The client and worker run in separate realms. Count both downloads without sharing code;
     // disabling splitting also counts all dynamically imported adapters in the worker bundle.
     // A tight absolute budget, not a claim that this two-download setup is below SQLite: the
-    // current measurement plus a little headroom (570,899 bytes measured). B7 shared
-    // frame guards add 243 bytes over B6 base 35cc8c89 (570,656). Explicitly rebaseline
-    // 557.5 to 558.0 KiB; the old cap is exceeded by 19 bytes.
+    // current measurement plus a little headroom (570,953 bytes measured). B7 shared
+    // frame guards add 297 bytes over B6 base 35cc8c89 (570,656). Explicitly rebaseline
+    // 557.5 to 558.0 KiB; the old cap is exceeded by 73 bytes.
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
