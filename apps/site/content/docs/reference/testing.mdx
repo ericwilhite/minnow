@@ -1218,8 +1218,11 @@ latency or renderer RSS; the adapter comparison is diagnostic, not an alternativ
 
 `MINNOW_EXPORT_SCAN_PROFILE=1` profiles only the dedicated scan worker, cold and warm, after
 setup. Its `export-cpu-N` attachments can be summarized with `scripts/scan-profile.mts`:
-top self-time functions and exclusive buckets for scan, descriptors, vectors, frame assembly,
-result accounting and transport. CDP sample durations include native waits and descheduling;
+top self-time functions and exclusive buckets for scan, descriptors, vectors, production frame
+assembly, result accounting and transport. ColumnStore helpers inherit their nearest classified
+caller, so ResultSink copies are counted as production framing rather than pipeline overhead;
+stores used by other operators are not automatically called frames. Executor entry/admission,
+memory accounting and benchmark delivery/instrumentation have separate buckets. CDP sample durations include native waits and descheduling;
 active sample shares estimate hotspots, not exact CPU seconds per bucket. The report keeps
 native reads, GC and idle samples separate and records the worker's actual thread CPU bracket.
 `MINNOW_EXPORT_SCAN_CORE_PROFILE=1` profiles the scan side alone over the same OPFS table.

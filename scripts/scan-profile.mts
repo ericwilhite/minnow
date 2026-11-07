@@ -59,6 +59,13 @@ function category(f: Frame, parent?: Frame): string | null {
     return ["flatBytes", "validityBytes", "textFlattenBytes"].includes(n)
       ? "bench frame sizing"
       : "bench frame building / ownership copies";
+  // ColumnStore is shared by several operators. Leave its helpers unclassified here so
+  // the nearest caller identifies ResultSink copies, rather than labelling every store a frame.
+  if (u.includes("/exec/result-sink.ts")) return "production result frame assembly / copies";
+  if (/\/exec\/(create|plan|run|admission|parameters)\.ts/u.test(u))
+    return "executor entry / plan / admission";
+  if (u.includes("/executor-export.ts")) return "bench delivery / instrumentation coordination";
+  if (u.includes("/next/memory/")) return "memory admission / accounting";
   if (u.includes("/exec/result.ts")) return "ResultChannel / frameByteLength";
   if (u.includes("/owner/frame.ts")) return "owner transfer-list policy";
   if (/\/(pushdown|filter|column-target)\.ts/u.test(u)) {
@@ -117,8 +124,7 @@ function category(f: Frame, parent?: Frame): string | null {
   }
   if (u.includes("/page/bits.ts")) return "vector materialization";
   if (u.includes("/page/directory.ts")) return "pushdown / shape and descriptor work";
-  if (/\/next\/(storage|format|hash|memory)\//u.test(u))
-    return "storage / page loading and validation";
+  if (/\/next\/(storage|format|hash)\//u.test(u)) return "storage / page loading and validation";
   if (u.includes("/exec/pipeline.ts") || u.includes("/scan-export.ts"))
     return "pipeline / bench delivery coordination";
   return null;
