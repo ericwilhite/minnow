@@ -18,7 +18,9 @@
  * whose foreign keys differ ON DELETE (RESTRICT, CASCADE, SET NULL; all follow a rekey, which
  * PostgreSQL is told as ON UPDATE CASCADE), explicit transactions that commit or roll back, and
  * reopen / crash of the write path. Small memtables put flushes, publishes and replay in the
- * middle of every run.
+ * middle of every run. Every seed runs under the real task clock and under clocks that force
+ * a genuine task yield at every third or seventh deadline check. This exposes publication
+ * interleavings without depending on CPU contention; no seed or workload step is omitted.
  *
  * The current engine always runs a step inside BEGIN … COMMIT / ROLLBACK (so it can be undone when
  * it differs); its autocommit behaviour for single statements is not compared. The write path and
@@ -28,11 +30,13 @@
  * tests pin them), nor statements the write path does not take yet (ALTER TABLE, staged large
  * transactions).
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { PGlite } from "@electric-sql/pglite";
 import { MinnowDatabase } from "../../engine/database.js";
 import { MemoryBlockStore } from "../../storage/index.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
+import { createReach, WRITE_DIFFERENTIAL_CLOCK_STATES } from "../../testing/reach.js";
+import { taskClock } from "../task.js";
 import {
   ForeignKeyViolationError,
   UniqueViolationError,
@@ -65,6 +69,7 @@ import {
 import { DEFAULT_KEY_FORWARD_RETENTION_MS } from "../../engine/key-forwards.js";
 
 const SEEDS = seedsFor("next-write-differential", [0xd1ff, 7, 4242, 90210, 31337, 2718]);
+const CASES = SEEDS.flatMap((seed) => [0, 3, 7].map((clockEvery) => ({ seed, clockEvery })));
 const STEPS = 160;
 /**
  * A step that takes longer than this is a hang (a correctness bug), reported with its label. It
@@ -658,12 +663,26 @@ function differing(
 }
 
 describe("write path vs PostgreSQL and the current engine (generated)", () => {
+  const clocks = createReach("write differential task schedules", WRITE_DIFFERENTIAL_CLOCK_STATES);
+  afterEach(() => vi.restoreAllMocks());
   const observed: Observed[] = [];
   /** Foreign-key actions the steps asked for: restrict, cascade, setNull, follow (a rekey). */
   const reach = new Map<string, number>();
   let compared = 0;
-  for (const seed of SEEDS)
-    it(`seed ${String(seed)}`, async () => {
+  for (const { seed, clockEvery } of CASES)
+    it(`seed ${String(seed)}, clock ${clockEvery === 0 ? "real" : String(clockEvery)}`, async () => {
+      clocks.beginHistory();
+      clocks.reach(
+        clockEvery === 0
+          ? "real clock"
+          : clockEvery === 3
+            ? "every third check"
+            : "every seventh check",
+      );
+      if (clockEvery > 0) {
+        let checks = 0;
+        vi.spyOn(taskClock, "due").mockImplementation(() => ++checks % clockEvery === 0);
+      }
       const workload = new Workload(seed);
       const harness = new Harness("strict", "sim", 16);
       let path = await harness.open();
@@ -792,6 +811,7 @@ describe("write path vs PostgreSQL and the current engine (generated)", () => {
     }, 180_000);
 
   it("compared every step with the current engine, and met the registered divergence", () => {
+    clocks.assertReached();
     if (process.env.MINNOW_SEED !== undefined) return;
     console.info(
       `intended divergences (R21):\n${observed.map((o) => `  ${o.divergence.id} at ${o.step}: ${String(o.current)}`).join("\n")}\ncompared with the current engine: ${String(compared)} steps`,

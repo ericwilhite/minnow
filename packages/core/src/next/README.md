@@ -50,6 +50,16 @@ the track that implements it, reviewed adversarially before the consuming tracks
 `SnapshotReleasedError` and the snapshot type live in `access/snapshot.ts`; `FetchRequest.snapshot`
 is access's `Snapshot`.
 
+## Rollback and in-flight publication
+
+Rollback can revive a partially full frozen memtable only when no flush of its table is in
+flight. A flush keeps its inputs immutable through publication; later inserts use a new
+memtable. `write/freeze-rollback-race.test.ts` holds publication across rollback and subsequent
+inserts over memory and simulated IndexedDB, then checks their rows through durable reopen.
+It also checks non-unique index results. The PostgreSQL write differential retains every seed
+and step under the real task clock and forced third/seventh-check yields, so publication races
+are exercised without requiring host contention.
+
 ## Dependency rules
 
 `dependency-rules.test.ts` enforces these.

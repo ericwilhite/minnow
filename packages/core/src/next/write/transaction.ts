@@ -80,7 +80,10 @@ export interface EngineHooks {
     readonly created: boolean;
     readonly frozen: Memtable | null;
   };
-  /** Undoes a freeze: drops `created` (now empty) and makes `frozen` live again if it still can be. */
+  /**
+   * Undoes a freeze: drops `created` (now empty). `frozen` may become live again only if no
+   * in-flight flush owns its immutable rows; later inserts otherwise use another memtable.
+   */
   undoFreeze(tableId: number, created: Memtable, frozen: Memtable | null): void;
   /** Creates (or, with null, removes) the in-memory state of a table this transaction creates. */
   createTableState(def: TableDef | null, tableId: number): void;
