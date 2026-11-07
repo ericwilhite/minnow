@@ -514,8 +514,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     mergesDuringFlush: 0,
     /** Merges dropped at publish because their inputs changed (a drop). */
     mergesAbandoned: 0,
-    /** Flushes dropped at publish because their table was dropped meanwhile. */
+    /** Flushes abandoned at publish after a table drop or catalog change. */
     flushesAbandoned: 0,
+    /** Abandoned flushes that retry against a changed catalog definition. */
+    flushesCatalogChanged: 0,
     /** Stage publications (large transactions' rows written before commit), rows staged, folds. */
     stages: 0,
     stagedRows: 0,
@@ -2400,6 +2402,20 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (this.#tables.get(state.tableId) !== state) {
         await writer.abort();
         this.maintenance.flushesAbandoned += 1;
+        return;
+      }
+      // Group/run encoding used the captured definition. DDL may have committed while
+      // it yielded, so retry from the current definition before installing any of it.
+      const currentDef = this.#catalog.table(state.tableId);
+      if (
+        currentDef?.schemaVersion !== def.schemaVersion ||
+        currentDef.indexes.length !== def.indexes.length ||
+        currentDef.indexes.some((index) => !def.indexes.some((old) => old.id === index.id)) ||
+        !this.#flushable(state, through)
+      ) {
+        await writer.abort();
+        this.maintenance.flushesAbandoned += 1;
+        this.maintenance.flushesCatalogChanged += 1;
         return;
       }
       if (this.#merging) this.maintenance.flushesDuringMerge += 1;

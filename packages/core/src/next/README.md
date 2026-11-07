@@ -1430,3 +1430,7 @@ is not treated as successful completion within that cap when loading continues a
 R25 delta preparation reserves its copy workspace before reading inputs and checks the shared
 clock and cancellation every 128 entries while copying. The write-path adapter passes its
 owned vectors directly; it does not make unsliced integration copies.
+
+A flush revalidates its captured schema and index identifiers under the publication lock.
+If concurrent DDL changed them while it encoded groups, it aborts the provisional writer
+and retries against the current catalog; the published root must carry its catalog’s indexes.
