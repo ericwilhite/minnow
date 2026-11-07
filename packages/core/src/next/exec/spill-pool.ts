@@ -185,6 +185,7 @@ export class SpillIo {
       readonly signal?: AbortSignal;
     },
     readonly checkAborted: () => void,
+    readonly pace?: () => Promise<void> | null,
   ) {}
 
   /** Called with each staging chunk before it is encoded as a page (the sort measures pages). */
@@ -278,6 +279,8 @@ export class SpillIo {
     let done = 0;
     while (done < count) {
       this.checkAborted();
+      const paced = this.pace?.();
+      if (paced != null) await paced;
       done += staging.append(vectors, ids, from + done, count - done);
       // An oversized row may fit without a loan. Do not retain its arena in one partition
       // while filling the others: together they can pin a loan past this row-sized step.

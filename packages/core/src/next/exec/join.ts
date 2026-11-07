@@ -403,9 +403,16 @@ class Shared {
     this.pool = new Pool(this.charge, poolBytes(spec));
     this.files = new SpillFiles(context.spill, context.queryId, this.charge);
     this.pages = new PageWriter(this.pool, 16 * 1024);
-    this.io = new SpillIo(this.pool, this.files, this.pages, context, () => {
-      this.checkAborted();
-    });
+    this.io = new SpillIo(
+      this.pool,
+      this.files,
+      this.pages,
+      context,
+      () => {
+        this.checkAborted();
+      },
+      () => this.pace(),
+    );
     this.scratch = new KeyScratch(this.layout, BATCH_ROWS, this.charge, this.pool);
     if (spec.kind === "mark")
       for (let i = this.correlated; i < keyTypes.length; i++) {

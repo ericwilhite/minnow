@@ -964,6 +964,8 @@ and the owner import it directly.
   the spill pool or the grant; `closed` covers that drain, including close failures.
   Oversized staging rows flush immediately, including when their first allocation fits: their
   arenas and page buffers cannot accumulate across partitions and pin a progress loan.
+  Join staging checks the shared task deadline between oversized rows, even when every spill
+  append resolves immediately; resumption checks abort before copying another row.
   `join-large-row.test.ts` checks generated large TEXT rows against PGlite at 8 MiB and the
   admitted minimum, with a probe connected during build.
   Store-to-store gathers bulk-copy fully checked contiguous spans of non-null int32/f64
