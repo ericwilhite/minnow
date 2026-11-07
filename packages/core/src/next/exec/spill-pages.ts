@@ -282,8 +282,10 @@ export class PageWriter {
   }
 
   close(): void {
-    this.#charge.free(this.#bytes.byteLength);
+    const bytes = this.#bytes.byteLength;
     this.#bytes = new Uint8Array(0);
+    this.#view = new DataView(this.#bytes.buffer);
+    this.#charge.free(bytes);
   }
 }
 
@@ -521,7 +523,7 @@ export class SpillClosedError extends Error {
  * Lazily created spill files for a partitioned operator: one file per run, closed together.
  *
  * Every operation that can still close a file (a creation that resolves after the close began,
- * a `release`, `closeAll` itself) is tracked in one set; `closed` settles only when all of them
+ * a `release`, `closeAll` itself) is tracked; appends retain their borrowed pages through settlement; `closed` settles only when all of them
  * have, and rejects with their failures (one error, or an `AggregateError`). So cleanup is never
  * reported complete while a close is in flight, and no close failure is dropped.
  */
@@ -531,6 +533,8 @@ export class SpillFiles {
   readonly #budget: ByteCharge;
   readonly #open = new Set<SpillFile>();
   readonly #inFlight = new Set<Promise<void>>();
+  readonly #appends = new Set<Promise<void>>();
+  readonly #borrows = new WeakMap<SpillFile, Set<Promise<void>>>();
   readonly #failures: unknown[] = [];
   /** Each file's one close operation: a failed file contributes one failure, however many paths close it. */
   readonly #closes = new WeakMap<SpillFile, Promise<void>>();
@@ -547,6 +551,11 @@ export class SpillFiles {
 
   get isClosed(): boolean {
     return this.#closing;
+  }
+
+  /** Live files and operations may still hold buffers charged to the operator. */
+  get needsDrain(): boolean {
+    return this.#open.size > 0 || this.#inFlight.size > 0 || this.#appends.size > 0;
   }
 
   /** Settles when `closeAll` finished every tracked close (rejects with their failures); null before. */
@@ -570,7 +579,10 @@ export class SpillFiles {
   #close(file: SpillFile): Promise<void> {
     let closing = this.#closes.get(file);
     if (closing === undefined) {
-      closing = file.close();
+      closing = Promise.resolve().then(async () => {
+        await Promise.all([...(this.#borrows.get(file) ?? [])]);
+        await file.close();
+      });
       this.#closes.set(file, closing);
       this.#track(closing);
     }
@@ -578,31 +590,47 @@ export class SpillFiles {
   }
 
   async append(run: SpilledRun, page: Uint8Array, rows: number): Promise<void> {
-    if (this.#closing) throw new SpillClosedError();
-    if (run.file === null) {
-      // The creation and, if the close began meanwhile, the late file's close are one tracked
-      // operation, so `closed` waits for that close and sees its failure.
-      const created = this.#service.create(this.#queryId, this.#budget).then(async (file) => {
-        if (!this.#closing) return file;
-        // Its failure is the close's own (tracked by #close), not the creation's too.
-        await this.#close(file).catch(() => undefined);
-        return null;
-      });
-      this.#track(created);
-      const file = await created;
-      if (file === null || this.isClosed) {
-        if (file !== null) this.#close(file).catch(() => undefined);
-        throw new SpillClosedError();
+    // Register before calling the service: append may synchronously abort its owner.
+    let drained!: () => void;
+    const fence = new Promise<void>((resolve) => {
+      drained = resolve;
+    });
+    this.#appends.add(fence);
+    let borrowed: Set<Promise<void>> | undefined;
+    try {
+      if (this.#closing) throw new SpillClosedError();
+      if (run.file === null) {
+        // The creation and, if the close began meanwhile, the late file's close are one tracked
+        // operation, so `closed` waits for that close and sees its failure.
+        const created = this.#service.create(this.#queryId, this.#budget).then(async (file) => {
+          if (!this.#closing) return file;
+          // Its failure is the close's own (tracked by #close), not the creation's too.
+          await this.#close(file).catch(() => undefined);
+          return null;
+        });
+        this.#track(created);
+        const file = await created;
+        if (file === null || this.isClosed) {
+          if (file !== null) this.#close(file).catch(() => undefined);
+          throw new SpillClosedError();
+        }
+        run.file = file;
+        this.#open.add(file);
       }
-      run.file = file;
-      this.#open.add(file);
+      borrowed = this.#borrows.get(run.file) ?? new Set<Promise<void>>();
+      this.#borrows.set(run.file, borrowed);
+      borrowed.add(fence);
+      const ref = await run.file.append(page);
+      if (this.isClosed) throw new SpillClosedError();
+      run.pages.push(ref);
+      run.rows += rows;
+      run.bytes += page.length;
+      this.written += page.length;
+    } finally {
+      borrowed?.delete(fence);
+      this.#appends.delete(fence);
+      drained();
     }
-    const ref = await run.file.append(page);
-    if (this.isClosed) throw new SpillClosedError();
-    run.pages.push(ref);
-    run.rows += rows;
-    run.bytes += page.length;
-    this.written += page.length;
   }
 
   /** Closes a run's file (its pages are gone); the close is tracked until it settles. */
@@ -619,6 +647,7 @@ export class SpillFiles {
   closeAll(): Promise<void> {
     this.#closing = true;
     this.#closed ??= (async () => {
+      await Promise.all([...this.#appends]);
       // Drain until nothing is in flight: a late creation may add its own close meanwhile.
       for (;;) {
         for (const file of [...this.#open]) {

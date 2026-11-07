@@ -214,6 +214,8 @@ describe("runtime join filters", () => {
       await drive(new ArraySource(batchesOf([INT, TEXT], rows)), join.build);
       expect(join.runtimeFilters.length).toBe(tight ? 0 : 1);
       join.abort(new Error("done"));
+      // Spilled buffers stay charged until their asynchronous close fence drains.
+      await join.closed;
       expect(g.usedBytes).toBe(0);
     }
   });

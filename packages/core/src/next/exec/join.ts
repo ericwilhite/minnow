@@ -1968,6 +1968,7 @@ export class HashJoin {
   #built = false;
   #pending: Promise<void> | null = null;
   #closed = false;
+  #cleanup: Promise<void> | null = null;
 
   /** A join without keys (ruling R24.2): its inputs carry one constant key column each. */
   readonly #keyless: Keyless | null;
@@ -2514,33 +2515,61 @@ export class HashJoin {
     if (n > 0) await flush();
   }
 
+  #releaseOwned(): void {
+    const shared = this.#shared;
+    try {
+      this.#prober.release();
+      this.#level.close();
+      for (const filter of this.runtimeFilters) filter.close();
+      shared.probeOut.close();
+      shared.buildOut.close();
+      shared.buildPart.close();
+      shared.pages.close();
+      shared.pool.close();
+    } finally {
+      shared.profile.peakHeldBytes = shared.charge.peak;
+      shared.context.grant.close();
+    }
+  }
+
   #release(): void {
     if (this.#closed) return;
     this.#closed = true;
     const shared = this.#shared;
-    this.#prober.release();
-    this.#level.close();
-    for (const filter of this.runtimeFilters) filter.close();
-    shared.probeOut.close();
-    shared.buildOut.close();
-    shared.buildPart.close();
-    shared.pages.close();
-    shared.pool.close();
-    // Spill files close asynchronously; a failure is kept and surfaces through `closed`.
-    const closing = shared.files.closeAll();
-    closing.catch((error: unknown) => {
+    // Publish the fence before calling external close implementations, which may reenter.
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    this.#cleanup = new Promise<void>((yes, no) => {
+      resolve = yes;
+      reject = no;
+    });
+    void this.#cleanup.catch((error: unknown) => {
       this.cleanupError ??= error;
     });
-    shared.profile.peakHeldBytes = shared.charge.peak;
-    shared.context.grant.close();
+    const drain = shared.files.needsDrain;
+    const finish = (failed: boolean, error?: unknown) => {
+      try {
+        if (drain) this.#releaseOwned();
+      } catch (releaseError) {
+        if (!failed) error = releaseError;
+        failed = true;
+      }
+      if (failed) reject(error);
+      else resolve();
+    };
+    const closing = shared.files.closeAll();
+    // Resident completion remains synchronous. Spill pages, stores, pool and grant stay
+    // owned until every append and file close has stopped borrowing their charged buffers.
+    if (!drain) this.#releaseOwned();
+    void closing.then(
+      () => finish(false),
+      (error: unknown) => finish(true, error),
+    );
   }
 
-  /**
-   * Settles when the join's spill files are all closed (including any whose creation was in
-   * flight when it ended); rejects with the first close failure. Resolved before the join ends.
-   */
+  /** After termination, settles once spill borrows drain and all charges release; resolved before termination. */
   get closed(): Promise<void> {
-    return this.#shared.files.closed ?? Promise.resolve();
+    return this.#cleanup ?? Promise.resolve();
   }
 
   /** Releases everything (grant, spill files, tables); idempotent. */

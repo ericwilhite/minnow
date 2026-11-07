@@ -960,6 +960,8 @@ and the owner import it directly.
   variant round-trips. `column-store.ts` is the chunked, charged row store operators keep rows
   in. Zero-column stores still count rows and obey single-chunk limits, so key-only
   joins can reuse their keys without a payload gather. Both are shared exec/ files (ruling R20.2) for aggregation spill and sort runs as well.
+  Join abort waits for spill appends and file closes before releasing borrowed pages, stores,
+  the spill pool or the grant; `closed` covers that drain, including close failures.
   Oversized staging rows flush immediately, including when their first allocation fits: their
   arenas and page buffers cannot accumulate across partitions and pin a progress loan.
   `join-large-row.test.ts` checks generated large TEXT rows against PGlite at 8 MiB and the
