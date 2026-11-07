@@ -103,6 +103,9 @@ const metadata = {
   lane: "Node",
   sqlCorrections: frozenSQL ? ["S_q7", "guide-4", "guide-5"] : dataset === "star" ? ["S_q7"] : [],
   revision: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+  workingTreePatchSha256: createHash("sha256")
+    .update(execFileSync("git", ["diff", "HEAD"]))
+    .digest("hex"),
   storage: "MemoryBackend + extent space + WritePathImpl, strict commits, flushed",
   dataset,
   rows: dataset === "wide" ? total : null,
@@ -128,6 +131,9 @@ const metadata = {
         resolve("apps/site/bench/benchmark.ts"),
         resolve("packages/core/src/next/testing/executor-catalogue.json"),
         resolve("scripts/next-executor-bench.mts"),
+        ...["plan", "limit", "table-scan", "memory-scan"].map((name) =>
+          resolve(`packages/core/dist/next/exec/${name}.js`),
+        ),
       ].map(async (file) => [
         file,
         createHash("sha256")
@@ -484,6 +490,21 @@ try {
     }
   }
   await writeFile(join(cache, "baseline.json"), JSON.stringify({ ...metadata, records }, null, 2));
+  // Run components only AFTER whole-query timing/profile, so their extra warmups cannot bias it.
+  if (option("--component", "") === "scan-limit") {
+    const { scanLimitComponent } = await import(
+      pathToFileURL(resolve("scripts/next-executor-components.mts")).href
+    );
+    const component = await scanLimitComponent(
+      core,
+      rounds,
+      option("--component-profile", "") === "1"
+        ? join(cache, "scan-limit-full-batch.cpuprofile")
+        : null,
+    );
+    await writeFile(join(cache, "component-scan-limit.json"), JSON.stringify(component, null, 2));
+    console.log(JSON.stringify(component));
+  }
 } finally {
   await core.close();
 }

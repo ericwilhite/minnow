@@ -39,11 +39,12 @@ import type {
 import { MEMORY_CHUNK_ROWS, resumeRow } from "../access/snapshot.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { allocateSelection } from "../vector/validity.js";
-import type { Selection, Vector } from "../vector/vector.js";
+import type { Batch, Selection, Vector } from "../vector/vector.js";
 import { UnsupportedPlanError } from "./errors.js";
 import { isPromise, type BatchSource, type SourceItem } from "./pipeline.js";
 
 export class MemorySegmentScan implements BatchSource {
+  #maxRows = MEMORY_CHUNK_ROWS;
   readonly #segments: readonly MemorySegment[];
   readonly #columnIds: readonly number[];
   readonly #out: readonly ChunkOutput[];
@@ -72,6 +73,8 @@ export class MemorySegmentScan implements BatchSource {
     columnIds: readonly number[],
     out: readonly ChunkOutput[],
     selection?: Selection,
+    /** Select active rows in input order before bounding the returned interval. */
+    readonly selectRows?: (batch: Batch) => Selection,
   ) {
     if (out.length !== columnIds.length) throw new RangeError("One output per column");
     if (selection !== undefined && selection.rows.length < MEMORY_CHUNK_ROWS)
@@ -84,7 +87,11 @@ export class MemorySegmentScan implements BatchSource {
     this.#results = new Array<ChunkResult | undefined>(columnIds.length);
   }
 
-  next(): MaybePromise<SourceItem | null> {
+  /** Cap active rows after selection, keeping the unconsumed suffix of the borrowed chunk. */
+  next(maxRows = MEMORY_CHUNK_ROWS): MaybePromise<SourceItem | null> {
+    if (!Number.isSafeInteger(maxRows) || maxRows <= 0)
+      throw new RangeError("positive memory-scan row bound required");
+    this.#maxRows = maxRows;
     for (;;) {
       if (this.#aborted) return null;
       const segment = this.#segments[this.#segment];
@@ -101,7 +108,7 @@ export class MemorySegmentScan implements BatchSource {
         if (isPromise(deletions))
           return deletions.then((value) => {
             this.#deletions = value;
-            return this.next();
+            return this.next(maxRows);
           });
         this.#deletions = deletions;
       }
@@ -172,7 +179,14 @@ export class MemorySegmentScan implements BatchSource {
         `Memory chunk ${String(this.#chunk)} made no progress at row ${String(start)}`,
       );
     }
-    const selection = this.#select(start - firstRow, end - start, length);
+    let selection = this.#select(start - firstRow, end - start, length);
+    if (this.selectRows !== undefined)
+      selection = this.selectRows({ length: end - firstRow, columns: this.#vectors, selection });
+    if ((selection?.count ?? end - firstRow) > this.#maxRows) {
+      // Keep the unconsumed suffix in this same chunk, including after a sparse predicate.
+      end = firstRow + (selection?.rows[this.#maxRows - 1] ?? this.#maxRows - 1) + 1;
+      if (selection !== null) selection.count = this.#maxRows;
+    }
     this.#lastSegment = this.#segments[this.#segment]?.index ?? -1;
     this.#lastStart = this.#chunk * MEMORY_CHUNK_ROWS + firstRow;
     if (end === length) {

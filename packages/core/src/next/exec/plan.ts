@@ -44,7 +44,12 @@ import {
 } from "./window.js";
 
 type Stop = () => boolean;
-type Recipe = (runtime: QueryRuntime, sink: Operator, stops: readonly Stop[]) => MaybePromise<void>;
+type Recipe = (
+  runtime: QueryRuntime,
+  sink: Operator,
+  stops: readonly Stop[],
+  rowsNeeded?: () => number,
+) => MaybePromise<void>;
 type Setup<T> = (context: CompileContext, grant: Grant) => T;
 const EMPTY: Batch = { length: 1, columns: [], selection: null };
 const DISCARD: Operator = {
@@ -460,7 +465,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 (filter) => filter.abort(undefined),
               );
         fixed(rel, (cap) => kernelBytes + batchTargetFor(cap, 4) + BATCH_ROWS * 16);
-        return (runtime, downstream, stops) => {
+        return (runtime, downstream, stops, rowsNeeded) => {
           if (stops.some((stop) => stop())) return downstream.finish();
           const target = batchTargetFor(runtime.request.governor.capBytes, 4);
           return instantiate(
@@ -509,6 +514,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                           owner?.admitDictionary(dictionary) ?? false,
                         borrowOutputOnRefusal: true,
                       }),
+                  ...(rowsNeeded === undefined ? {} : { rowsNeeded }),
                 });
                 runtime.onAbort(() => scan.abort());
                 const source: BatchSource = {
@@ -562,7 +568,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               samePhysicalType(expr.type, after.type)
             );
           });
-        return (runtime, downstream, stops) => {
+        return (runtime, downstream, stops, rowsNeeded) => {
           const owner =
             runtime.request.outputBuffers && identity
               ? downstream instanceof ResultSink
@@ -572,7 +578,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           if (owner) {
             const output = counted(runtime, rel, downstream);
             exportOwners.set(output, owner);
-            return child(runtime, output, stops);
+            return child(runtime, output, stops, rowsNeeded);
           }
           return instantiate(
             runtime,
@@ -595,7 +601,16 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 operator instanceof LimitOperator ? [...stops, () => operator.done] : stops;
               return childStops.some((stop) => stop())
                 ? operator.finish()
-                : child(runtime, operator, childStops);
+                : child(
+                    runtime,
+                    operator,
+                    childStops,
+                    operator instanceof LimitOperator
+                      ? () => operator.inputNeeded(rowsNeeded?.() ?? Infinity)
+                      : rel.op === "filter"
+                        ? undefined
+                        : rowsNeeded,
+                  );
             },
           );
         };

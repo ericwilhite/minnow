@@ -212,6 +212,10 @@ export interface TableScanOptions {
   /** False: no pushdown, dense decode, the whole filter on decoded values (decode-then-filter). */
   readonly pushdown?: boolean;
   readonly targetBytes?: number;
+  /** A streaming consumer's remaining demand, including OFFSET. Bounds emitted rows and
+   * payload decode; predicates/deletions inspect vectorized ranges first. Zero ends the source.
+   * Update between batches. A breaker or separate filter starts a new domain. Default: full batches. */
+  readonly rowsNeeded?: () => number;
   /** Synchronous work between the scan's task yields (default `YIELD_INTERVAL_MS`). */
   readonly yieldIntervalMs?: number;
   /** The clock in ms (default `performance.now`); injectable for tests. */
@@ -521,6 +525,13 @@ export class TableScan implements BatchSource {
     afterYield(this.#clock);
   }
 
+  #rowsNeeded(): number {
+    const rows = this.#options.rowsNeeded?.() ?? BATCH_ROWS;
+    if (rows !== Infinity && (!Number.isSafeInteger(rows) || rows < 0))
+      throw new RangeError("nonnegative scan row demand required");
+    return Math.min(BATCH_ROWS, rows);
+  }
+
   *#next(): Step<SourceItem | null> {
     this.#endBorrow();
     while (
@@ -538,6 +549,10 @@ export class TableScan implements BatchSource {
     }
     for (;;) {
       if (this.#aborted) return null;
+      if (this.#rowsNeeded() === 0) {
+        this.abort();
+        return null;
+      }
       const segment: Segment | undefined = this.#options.table.segments[this.#segment];
       if (segment === undefined) {
         // The end: the last batch's borrow has ended, so everything goes back now.
@@ -626,21 +641,29 @@ export class TableScan implements BatchSource {
   *#fromMemory(segment: MemorySegment): Step<SourceItem | null> {
     if (this.#memoryScan === null) {
       const { out, selection } = this.#memoryBuffers();
-      this.#memoryScan = new MemorySegmentScan([segment], this.#options.columns, out, selection);
+      this.#memoryScan = new MemorySegmentScan(
+        [segment],
+        this.#options.columns,
+        out,
+        selection,
+        this.#options.filter === null
+          ? undefined
+          : (batch) => this.#memoryPredicate().select(batch),
+      );
     }
     const scan = this.#memoryScan;
     for (;;) {
-      const item = yield* this.#wait(scan.next());
+      const needed = this.#rowsNeeded();
+      if (needed === 0) {
+        this.abort();
+        return null;
+      }
+      const item = yield* this.#wait(scan.next(needed));
       if (item === null) return null;
       let batch = item.batch;
-      if (this.#options.filter !== null) {
-        const predicate = this.#memoryPredicate();
-        const rows = predicate.select(batch);
-        if (rows.count === 0) {
-          yield* this.#pace();
-          continue;
-        }
-        batch = { ...batch, selection: rows };
+      if (this.#options.filter !== null && batch.selection?.count === 0) {
+        yield* this.#pace();
+        continue;
       }
       this.stats.memoryBatches += 1;
       if (this.#options.emitLocator) {
@@ -805,6 +828,10 @@ export class TableScan implements BatchSource {
     const group = this.#group;
     for (;;) {
       if (this.#aborted) return null;
+      if (this.#rowsNeeded() === 0) {
+        this.abort();
+        return null;
+      }
       if (group.pendingCount > 0) {
         const item = yield* this.#emitPositions(group, group.pendingFrom, group.pendingTo);
         if (item !== null) return item;
@@ -815,7 +842,11 @@ export class TableScan implements BatchSource {
       }
       if (group.from >= segment.rowCount) return null;
       const from = group.from;
-      const to = Math.min(from + BATCH_ROWS, segment.rowCount);
+      // Vectorize predicates independently of LIMIT selectivity. Bound survivors below,
+      // rather than repeatedly opening one-row intervals for a sparse predicate.
+      const rangeRows =
+        this.#options.filter === null && group.deletions === null ? this.#rowsNeeded() : BATCH_ROWS;
+      const to = Math.min(from + rangeRows, segment.rowCount);
       group.from = to;
       this.#releaseBefore(group, from);
       yield* this.#prefetch(group, from);
@@ -1189,7 +1220,8 @@ export class TableScan implements BatchSource {
     // Dense when enough of the range is selected and the whole range fits the byte target.
     const fresh = group.fresh;
     group.fresh = false;
-    let dense = fresh && count >= span * DENSE_SELECTION;
+    const wanted = this.#rowsNeeded();
+    let dense = fresh && count >= span * DENSE_SELECTION && count <= wanted;
     if (dense) {
       // Sizing reads page headers: the range's pages first (no values yet).
       yield* this.#loadPages(group, { from, to });
@@ -1218,10 +1250,10 @@ export class TableScan implements BatchSource {
       this.stats.denseBatches += 1;
       return { batch: this.#withLocators(batch, group, (k) => from + k) };
     }
-    yield* this.#loadPages(group, specForRows(positions, count));
+    let take = this.#residual === null ? Math.min(count, wanted) : count;
+    yield* this.#loadPages(group, specForRows(positions, take));
     // Gather: a prefix of the positions that fits the byte target (at least one row), then the
     // grant (halving until it holds the prefix's working set, or one row under a loan).
-    let take = count;
     for (;;) {
       if (take <= 1) break;
       const bytes = this.#bytesFor(group, specForRows(positions, take));
@@ -1235,6 +1267,7 @@ export class TableScan implements BatchSource {
     const survivors = this.#survivors;
     survivors.set(positions.subarray(0, take));
     let kept = take;
+    let consumed = take;
     if (this.#residual !== null) {
       // Residual columns first, for the candidates; the rest only for the survivors.
       const first = all.filter((c) => this.#residualColumns.has(c));
@@ -1242,12 +1275,13 @@ export class TableScan implements BatchSource {
       yield* this.#decode(group, specForRows(survivors, take), first, probe);
       const rows = this.#residual.select({ length: take, columns: probe, selection: null });
       this.stats.residualBatches += 1;
-      kept = rows.count;
+      kept = Math.min(rows.count, wanted);
+      if (rows.count > kept) consumed = (rows.rows[kept - 1] ?? 0) + 1;
       for (let k = 0; k < kept; k++) survivors[k] = survivors[rows.rows[k] ?? 0] ?? 0;
     }
     // Consume the taken positions; keep the rest for the next batch.
-    positions.copyWithin(0, take, count);
-    group.pendingCount = count - take;
+    positions.copyWithin(0, consumed, count);
+    group.pendingCount = count - consumed;
     if (kept === 0) return null;
     yield* this.#decode(group, specForRows(survivors, kept), all, columns, owned);
     this.stats.gatherBatches += 1;

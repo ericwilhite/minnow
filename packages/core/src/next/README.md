@@ -1268,7 +1268,13 @@ without admitting execution grants or building breaker pools. A bound zero LIMIT
 input in both reservation and execution, including a zero stored on an ORDER BY sort.
 The active node first binds both bounds and validates OFFSET before LIMIT, once per execution;
 zero does not suppress its own negative/overflow error. Bounds in an unopened child stay
-unreached, and prepare-time capability checks still cover that input. Small compiler probes determine
+unreached, and prepare-time capability checks still cover that input. Streaming LIMIT/OFFSET passes its remaining
+row demand through projections and nested limits to TableScan. The scan bounds payload decoding
+and output, retains the unconsumed suffix of a borrowed memory chunk, and applies sparse
+predicates and deletions in vectorized ranges before bounding survivors. Separate filters and
+breakers stop demand propagation. `scripts/next-executor-bench.mts --component scan-limit`
+measures this scan/operator pair in interleaved Node CPU rounds over the real stored fixture.
+Small compiler probes determine
 kernel buffer minimums; the generated allocation matrix checks them against real batch-sized
 buffers. Execute accepts caller-owned parameter values (keep them unchanged until execution ends).
 It admits the encoded inputs and active operator minimums atomically, then binds using that

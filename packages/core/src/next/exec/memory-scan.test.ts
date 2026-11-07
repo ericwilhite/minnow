@@ -4,6 +4,9 @@
  * deletions as the selection, and re-pointed segments whose `chunk()` is async.
  */
 import { describe, expect, it } from "vitest";
+import fc from "fast-check";
+import { seedsFor } from "../../testing/seeds.js";
+import { createReach } from "../../testing/reach.js";
 import {
   MEMORY_CHUNK_ROWS,
   type ChunkOutput,
@@ -333,4 +336,100 @@ describe("MemorySegmentScan", () => {
       drive(new MemorySegmentScan([segment], [1, 2], out), new Copying()),
     ).rejects.toThrow(UnsupportedPlanError);
   });
+});
+
+it.each(seedsFor("next-memory-scan-demand", [0xc903, 0xc904]))(
+  "retains every live row across bounded borrowed intervals (seed %i)",
+  async (seed) => {
+    const reach = createReach("memory demand", [
+      "resident",
+      "repointed",
+      "deleted",
+      "all-live",
+      "bounded",
+      "suffix",
+      "chunk-boundary",
+    ]);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 10, max: 97 }),
+        fc.integer({ min: 1, max: 7 }),
+        fc.boolean(),
+        fc.boolean(),
+        fc.integer({ min: 2, max: 8 }),
+        fc.boolean(),
+        async (rows, maximum, repointed, removed, every, crossChunk) => {
+          reach.beginHistory();
+          const total = rows + (crossChunk ? MEMORY_CHUNK_ROWS : 0);
+          const segment = new LendingSegment(0, total, repointed, removed ? deleting(every) : null),
+            scan = new MemorySegmentScan([segment], [1], outputs(1));
+          const actual: number[] = [];
+          let batches = 0;
+          try {
+            for (;;) {
+              const item = await scan.next(maximum);
+              if (item === null) break;
+              const batch = item.batch,
+                count = batch.selection?.count ?? batch.length;
+              expect(count).toBeLessThanOrEqual(maximum);
+              const column = batch.columns[0];
+              if (column?.form !== "flat" || column.data.layout !== "i32")
+                throw new Error("expected int32");
+              for (let k = 0; k < count; k++)
+                actual.push(column.data.values[batch.selection?.rows[k] ?? k] ?? -1);
+              batches++;
+            }
+          } finally {
+            scan.abort();
+          }
+          expect(actual).toEqual(
+            Array.from({ length: total }, (_, k) => k)
+              .filter((k) => !removed || k % every !== 0)
+              .map((k) => 1_000_000 + k),
+          );
+          reach.reach(repointed ? "repointed" : "resident");
+          reach.reach(removed ? "deleted" : "all-live");
+          reach.reach("bounded");
+          if (batches > 1) reach.reach("suffix");
+          if (crossChunk) reach.reach("chunk-boundary");
+        },
+      ),
+      {
+        seed,
+        numRuns: 24,
+        examples: [
+          [33, 2, false, true, 3, true],
+          [64, 3, true, false, 2, false],
+        ],
+      },
+    );
+    reach.assertReached();
+  },
+);
+
+it("selects a sparse predicate in one borrowed interval before applying its row bound", async () => {
+  const segment = new LendingSegment(0, 97, false, deleting(3));
+  const selected: Selection = { rows: new Uint16Array(MEMORY_CHUNK_ROWS), count: 0 };
+  let evaluations = 0;
+  const scan = new MemorySegmentScan([segment], [1], outputs(1), undefined, (batch) => {
+    evaluations++;
+    selected.count = 0;
+    const column = batch.columns[0];
+    if (column?.form !== "flat" || column.data.layout !== "i32") throw new Error("int32 expected");
+    for (let k = 0; k < (batch.selection?.count ?? batch.length); k++) {
+      const row = batch.selection?.rows[k] ?? k;
+      if (column.data.values[row] === 1_000_095) selected.rows[selected.count++] = row;
+    }
+    return selected;
+  });
+  try {
+    const item = await scan.next(1);
+    expect(item).not.toBeNull();
+    expect(item?.batch.selection?.count).toBe(1);
+    expect(evaluations).toBe(1);
+    expect(segment.calls).toBe(1);
+    expect(await scan.next(1)).toBeNull();
+  } finally {
+    scan.abort();
+  }
 });
