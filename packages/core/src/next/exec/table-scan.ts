@@ -62,6 +62,7 @@
  * `MaybePromise`; `next()` returns a value when everything it needed was resident (the generator
  * below runs synchronously until a call actually returns a Promise).
  */
+import type { TaskWork } from "../task.js";
 import type { MaybePromise } from "../access/key-index.js";
 import type { ColumnDef } from "../access/catalog.js";
 import {
@@ -154,7 +155,7 @@ export interface ScanStats {
   /** Pushed conjuncts per chunk evaluated on encoded pages (B2), and on decoded values. */
   encodedPredicates: number;
   decodedPredicates: number;
-  /** Task yields inside a `next()` that had not emitted yet (R23 pacing). */
+  /** Yields requested directly by this scan; reader-window task yields are not counted here. */
   yields: number;
 }
 
@@ -333,6 +334,7 @@ export class TableScan implements BatchSource {
   readonly #interval: number;
   /** The worker's task clock, or a test's (R23.5): no slice start of its own. */
   readonly #clock: TaskClock;
+  readonly #readTask: TaskWork | undefined;
   #segment = 0;
   #group: OpenGroup | null = null;
   #memoryScan: MemorySegmentScan | null = null;
@@ -402,6 +404,7 @@ export class TableScan implements BatchSource {
     this.#target = options.targetBytes ?? BATCH_TARGET_BYTES;
     this.#interval = options.yieldIntervalMs ?? YIELD_INTERVAL_MS;
     this.#clock = clockFor(options.now);
+    this.#readTask = Number.isFinite(this.#interval) ? { clock: this.#clock } : undefined;
   }
 
   /** Charged allocation components; these are not physical RSS attribution. */
@@ -665,7 +668,9 @@ export class TableScan implements BatchSource {
         const pages = yield* this.#wait(
           this.#options.reads.open(this.#options.pages, chunk, {
             budget: this.#memory,
-            ...(windowBytes > 0 ? { once: true } : {}),
+            ...(windowBytes > 0
+              ? { once: true, ...(this.#readTask ? { task: this.#readTask } : {}) }
+              : {}),
           }),
           (late) => {
             late.close();

@@ -41,6 +41,17 @@ export const SCAN_WINDOW_RESIDENCY_REACH = [
   "disabled",
 ] as const;
 
+/** R23.5 inside one coalesced scan window, not only at batch/operator boundaries. */
+export const SCAN_WINDOW_PACING_REACH = [
+  "multi-read window",
+  "immediately resolved storage",
+  "timer inside window",
+  "cancel message inside window",
+  "carried task budget",
+  "concurrent follower",
+  "follower across later yield",
+] as const;
+
 export function createReach<State extends string>(
   campaign: string,
   states: readonly State[],

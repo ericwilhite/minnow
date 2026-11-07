@@ -51,6 +51,7 @@
  *   chunk across the declared columns": the vectors of chunk k of several columns stay valid
  *   together until a call for another chunk index.
  */
+import type { TaskWork } from "../task.js";
 import type { MaybePromise } from "../access/key-index.js";
 import type { GroupSegment } from "../access/snapshot.js";
 import type { ByteBudget, SpaceReader } from "../access/space.js";
@@ -171,6 +172,7 @@ export interface ChunkReads {
       readonly budget: ByteBudget;
       readonly signal?: AbortSignal;
       readonly once?: boolean;
+      readonly task?: TaskWork;
     },
   ): MaybePromise<ChunkPages>;
   /** Coalesce a full scan's row window across columns; leases still belong to each reader. */

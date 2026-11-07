@@ -39,6 +39,7 @@
  *
  * Decoding is synchronous over loaded pages; every target buffer is the caller's.
  */
+import { pauseIfDue, sortInSlices, type TaskWork } from "../task.js";
 import type { ChunkData, ColumnChunk, PageEntry } from "../format/manifest.js";
 import { PageEncoding } from "../format/manifest.js";
 import {
@@ -115,6 +116,8 @@ type Rows = Uint16Array | Uint32Array | Int32Array;
 export type MaybePromise<T> = T | Promise<T>;
 
 export interface ChunkReadOptions {
+  /** Window work uses the owner task clock; no per-reader slice starts. */
+  readonly task?: TaskWork;
   /** Charged for every byte the reader holds (ruling R5). */
   readonly budget: ByteBudget;
   readonly signal?: AbortSignal;
@@ -574,17 +577,60 @@ export class ChunkReader {
    * page is loaded; a reader closed meanwhile only loses its own pages (its loads give back what
    * they read, as `close` says). Errors reject after all started sibling loads settle, so a
    * retry or close cannot race later installations or charges. Like `load`, completes
-   * synchronously when every requested page and dictionary is resident.
+   * synchronously when every requested page and dictionary is resident and no task yield is due.
    */
   static loadTogether(
     loads: ReadonlyArray<{ readonly reader: ChunkReader; readonly pages: readonly number[] }>,
   ): MaybePromise<void> {
+    let resolve = noop;
+    let reject: (error: unknown) => void = noop;
+    const completion = new Promise<void>((yes, no) => {
+      resolve = yes;
+      reject = no;
+    });
+    const claimed = new Map<ChunkReader, number[]>();
+    const finish = (failure?: { error: unknown }): void => {
+      for (const [reader, pages] of claimed)
+        for (const page of pages)
+          if (reader.#pending.get(page) === completion) reader.#pending.delete(page);
+      if (failure === undefined) resolve();
+      else reject(failure.error);
+    };
+    const step = ChunkReader.#together(loads, completion, claimed);
+    const resume = (failure?: { error: unknown }): MaybePromise<void> => {
+      const next = failure === undefined ? step.next() : step.throw(failure.error);
+      if (next.done) return next.value;
+      return next.value.then(
+        () => resume(),
+        (error: unknown) => resume({ error }),
+      );
+    };
+    try {
+      const result = resume();
+      if (result === undefined) {
+        finish();
+        return;
+      }
+      void result.then(
+        () => finish(),
+        (error: unknown) => finish({ error }),
+      );
+    } catch (error) {
+      finish({ error });
+    }
+    return completion;
+  }
+
+  static *#together(
+    loads: ReadonlyArray<{ readonly reader: ChunkReader; readonly pages: readonly number[] }>,
+    completion: Promise<void>,
+    missingOf: Map<ChunkReader, number[]>,
+  ): Generator<Promise<void>, MaybePromise<void>, unknown> {
     const first = loads[0]?.reader;
     if (first === undefined) return;
     const waits: Array<PromiseLike<void>> = [];
     try {
       const jobs: TogetherJob[] = [];
-      const missingOf = new Map<ChunkReader, number[]>();
       // One page set per reader before any work (review B2-p2i #3): a reader named twice, or
       // overlapping page arrays, must not install a page twice (the second install would drop
       // the first's lease share without releasing it).
@@ -628,27 +674,39 @@ export class ChunkReader {
           continue;
         }
         if (missing.length === 0) continue;
-        // Preserve the MaybePromise contract for resident scans before constructing shared
-        // miss jobs. Each successful install is charged exactly as the ordinary cached load.
-        if (reader.#loadCached(missing, false)) continue;
+        // Reserve every shared missing page before the first possible yield. A concurrent
+        // load sees this completion, never a gap between planning and starting the read.
         missingOf.set(reader, missing);
-        for (const page of missing) jobs.push({ reader, entry: at(entries, page), page });
+        for (const page of missing) reader.#pending.set(page, completion);
+      }
+      for (const [reader, missing] of missingOf) {
+        if (reader.#options.task === undefined) {
+          if (reader.#loadCached(missing, false)) continue;
+        } else {
+          // Bounded cached installation keeps R6's sync path until the shared clock is due.
+          for (let start = 0; start < missing.length; start += 128) {
+            const pause = reader.#pause();
+            if (pause !== undefined) yield pause;
+            if (!reader.#loadCached(missing.slice(start, start + 128), false)) break;
+          }
+        }
+        for (let k = 0; k < missing.length; k++) {
+          if (k % 128 === 0) {
+            const pause = reader.#pause();
+            if (pause !== undefined) yield pause;
+          }
+          const page = at(missing, k);
+          if (reader.#pages[page] === undefined)
+            jobs.push({ reader, entry: at(reader.directory.pages, page), page });
+        }
       }
       if (jobs.length > 0) {
-        jobs.sort(
-          (a, b) =>
-            blobAddress(blobOf(a.reader.chunk, a.entry)) -
-            blobAddress(blobOf(b.reader.chunk, b.entry)),
-        );
+        const compare = (a: TogetherJob, b: TogetherJob) =>
+          blobAddress(blobOf(a.reader.chunk, a.entry)) -
+          blobAddress(blobOf(b.reader.chunk, b.entry));
+        if (first.#options.task === undefined) jobs.sort(compare);
+        else yield sortInSlices(jobs, compare, first.#options.task);
         const run = ChunkReader.#readTogether(first.#space, first.#options, jobs);
-        for (const [reader, missing] of missingOf) {
-          for (const index of missing) reader.#pending.set(index, run);
-          const settle = (): void => {
-            for (const index of missing)
-              if (reader.#pending.get(index) === run) reader.#pending.delete(index);
-          };
-          run.then(settle, settle);
-        }
         waits.push(run);
       }
       if (waits.length === 0) return;
@@ -664,13 +722,21 @@ export class ChunkReader {
     }
   }
 
+  /** Only a real task yield advances this shared clock; resolved reads never restart it. */
+  #pause(): Promise<void> | undefined {
+    return this.#options.task === undefined ? undefined : pauseIfDue(this.#options.task);
+  }
+
   static async #readTogether(
     space: ExtentReader,
     options: ChunkReadOptions,
     jobs: readonly TogetherJob[],
   ): Promise<void> {
+    const pause = () => (options.task === undefined ? undefined : pauseIfDue(options.task));
     let start = 0;
     while (start < jobs.length) {
+      const before = pause();
+      if (before !== undefined) await before;
       let end = start;
       let bytes = 0;
       while (end < jobs.length && bytes + at(jobs, end).entry.length <= MAX_READ_BYTES)
@@ -682,18 +748,23 @@ export class ChunkReader {
         options.once === true ? { ...options, reuseBuffers: true } : options,
       );
       const shared = new SharedLease(lease, batch.length);
-      // `#settle` takes over one hold on the lease per job, success or failure; a reader closed
-      // meanwhile gives its share back there (`#install`).
-      for (let k = 0; k < batch.length; k++) {
-        const { reader, entry, page } = at(batch, k);
-        try {
-          await reader.#settle(entry, page, lease.bytes[k], shared);
-        } catch (error) {
-          // A reader closed meanwhile only loses its own pages; the others still load.
-          if (error instanceof ReaderClosedError) continue;
-          for (let rest = k + 1; rest < batch.length; rest++) shared.drop();
-          throw error;
+      let taken = 0;
+      try {
+        for (let k = 0; k < batch.length; k++) {
+          const { reader, entry, page } = at(batch, k);
+          // settle takes this share whether it succeeds or fails. A yield failure only owns
+          // the untouched suffix, which the finally returns before rejecting/draining.
+          taken = k + 1;
+          try {
+            await reader.#settle(entry, page, lease.bytes[k], shared);
+          } catch (error) {
+            if (!(error instanceof ReaderClosedError)) throw error;
+          }
+          const after = pause();
+          if (after !== undefined) await after;
         }
+      } finally {
+        for (let rest = taken; rest < batch.length; rest++) shared.drop();
       }
       start = end;
     }
@@ -808,6 +879,8 @@ export class ChunkReader {
     jobs.sort((a, b) => (a.page === null ? 1 : 0) - (b.page === null ? 1 : 0));
     let start = 0;
     while (start < jobs.length) {
+      const before = this.#pause();
+      if (before !== undefined) await before;
       let end = start;
       let bytes = 0;
       const dictionary = at(jobs, start).page === null;
@@ -825,15 +898,17 @@ export class ChunkReader {
         batch.some(({ page }) => page === null) ? this.#options : this.#pageReads,
       );
       const shared = new SharedLease(lease, batch.length);
-      // `#settle` takes over one hold on the lease per job, success or failure.
-      for (let k = 0; k < batch.length; k++) {
-        const { entry, page } = at(batch, k);
-        try {
+      let taken = 0;
+      try {
+        for (let k = 0; k < batch.length; k++) {
+          const { entry, page } = at(batch, k);
+          taken = k + 1;
           await this.#settle(entry, page, lease.bytes[k], shared);
-        } catch (error) {
-          for (let rest = k + 1; rest < batch.length; rest++) shared.drop();
-          throw error;
+          const after = this.#pause();
+          if (after !== undefined) await after;
         }
+      } finally {
+        for (let rest = taken; rest < batch.length; rest++) shared.drop();
       }
       start = end;
     }

@@ -596,9 +596,14 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     loading. The scan requests a 64 MiB row window through `TableScan.readWindowBytes` and
     the `chunkReads` factory: B2's shared `loadTogether` and one-pass pooled leases. This
     window stays opt-in: absent/zero `readWindowBytes` keeps cached batch reads. Filtered/deleted groups
-    retain selective reads. Resident shared loads preserve synchronous `next()` steps. A refused
+    retain selective reads. Resident shared loads preserve synchronous `next()` steps until a task yield is due. A refused
     optional window drops partial loads and shrinks before
-    falling back to batch reads. `MINNOW_EXPORT_SCAN_IO_COMPARE=1` compares both policies over
+    falling back to batch reads. Window planning, cached installation, sorting and read/page
+    continuations use the same R23.5 task clock as the scan/driver through B1's `task.ts`
+    extraction. Already-resolved storage promises do not restart it. Missing pages are claimed
+    before a yield so concurrent loads share their completion; started siblings still drain on
+    errors. `testing/scan-windows.test.ts` generates timers/cancel messages in multi-read
+    windows, carried task budget and concurrent followers. `MINNOW_EXPORT_SCAN_IO_COMPARE=1` compares both policies over
     five interleaved cold rounds; `scripts/scan-io-bench.mts` isolates the real scan/cache over
     memory, with fresh caches, untimed warmup GC, and CPU/wall/read/charge measurements. Reported
     scan assembly/post/credit and inclusive `next()` timers can overlap; they are not exclusive

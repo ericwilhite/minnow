@@ -1216,9 +1216,15 @@ The scan export requests a charged, coalesced row window from the core scan (64 
 `MINNOW_EXPORT_SCAN_IO_COMPARE=1` compares this one-pass policy with cached per-batch reads;
 `scripts/scan-io-bench.mts` isolates both over a fresh memory-backed page cache. Setup and warmup
 GC are outside its CPU/wall timings. Core row windows stay opt-in; absent/zero
-`readWindowBytes` keeps cached batch reads. The bench requests 64 MiB explicitly. Resident shared loads remain synchronous. Filters and
+`readWindowBytes` keeps cached batch reads. The bench requests 64 MiB explicitly. Resident shared loads remain synchronous until a task yield is due. Filters and
 deletions retain selective reads, and a refused window is released and reduced before falling
 back to ordinary batch loading.
+The window read loops, including dictionary/gzip loads and immediately resolved storage
+continuations, check the scan/driver's shared R23.5 clock. Sorting and cached installation also
+check that clock; only a genuine task yield restarts it. Missing pages are reserved before
+those yields so a concurrent reader waits for the same work. The generated lifecycle campaign
+is `next/testing/scan-windows.test.ts`; its virtual work ticks are scheduling evidence, not a
+throughput measurement.
 
 `MINNOW_EXPORT_SCAN_BATCH_COMPARE=1 npm run benchmark:export` compares 1, 2 and 3 MiB
 decoded-byte targets in five interleaved cold rounds. This is a bench experiment: the core's
