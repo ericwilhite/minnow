@@ -376,3 +376,18 @@ export const ROW_LOCK_TARGET_STATES = [
 
 /** A view remains a relation lock target even when its body has no table. */
 export const ROW_LOCK_VIEW_STATES = ["read only refused", "read write allowed"] as const;
+
+/** Ordered transaction-mode coverage against PostgreSQL or the lossless lowering contract. */
+export const TRANSACTION_MODE_ORDER_STATES = [
+  "top level",
+  "savepoint",
+  "after query",
+  "already read only",
+  "begin read only",
+  "begin read write",
+  "execute",
+  "compiled",
+  "accepted",
+  "refused",
+  "duplicates",
+] as const;

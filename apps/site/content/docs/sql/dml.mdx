@@ -325,8 +325,11 @@ COMMIT;
 Statements inside see each other — a `SELECT` after the `UPDATE` reads the new value — and
 `ROLLBACK` (or `ABORT`) discards the lot (`END` commits, as `COMMIT` does). `BEGIN` and
 `SET TRANSACTION` accept `READ ONLY`, `READ WRITE`, `[NOT] DEFERRABLE`, and `ISOLATION LEVEL`
-below `SERIALIZABLE`, in PostgreSQL's grammar: modes are separated by spaces or commas, and the
-last one of each kind applies. Every transaction reads one snapshot and commits atomically, which
+below `SERIALIZABLE`, in PostgreSQL's grammar: modes are separated by spaces or commas. Each
+access-mode item is checked in written order; when all are valid, the last one of each
+kind applies. In a savepoint that starts READ WRITE, `SET TRANSACTION READ ONLY, READ WRITE`
+fails with 25001, while `READ WRITE, READ ONLY` succeeds. If the transaction is already READ
+ONLY, both lists fail. Every transaction reads one snapshot and commits atomically, which
 satisfies those levels, while `SERIALIZABLE` is refused rather than silently downgraded. A
 `READ ONLY` transaction refuses writes, as in PostgreSQL. `INSERT`, `UPDATE`, `DELETE`, `MERGE`,
 `TRUNCATE`, schema changes, `nextval` and row locks (`SELECT … FOR UPDATE`, `FOR SHARE`, and the

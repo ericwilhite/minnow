@@ -10,6 +10,12 @@ compatibility policy and release process.
 
 ## Unreleased
 
+SET TRANSACTION now checks each access-mode item in written order, including through
+compiled `runStatement`. A READ ONLY item can make a later READ WRITE item invalid (25001)
+inside a savepoint or after a query, even when the final value would have matched the old
+mode. Specify only the final desired access mode before queries and savepoints. Compiled
+mode arrays retain their existing ordered shape. No stored-format change.
+
 A locking clause in an unused CTE no longer causes a read-only query to fail. A referenced
 CTE's own clause still counts. Parsing and view expansion share the same lock-target and
 strongest-lock rules with the internal rebuild lowerer. No stored-format change.
@@ -95,7 +101,8 @@ b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP 
 - **Transaction statements follow PostgreSQL's grammar.** `BEGIN`, `START TRANSACTION` and
   `SET TRANSACTION` accepted their keywords in any order and ignored anything else, so
   `BEGIN ONLY READ` and `BEGIN 'READ ONLY'` ran. They now fail with `syntax error at or near …`.
-  Modes may be separated by spaces or commas; the last mode of each kind applies.
+  Modes may be separated by spaces or commas. Access-mode items are checked in written
+  order; if every item is valid, the last mode of each kind applies.
   `SET SESSION CHARACTERISTICS AS TRANSACTION` is refused with a message that says so.
 - **A FROM clause that names a source twice fails earlier, with PostgreSQL's message.**
   `SELECT a.id FROM a a, b a` already failed when it ran, with "Table aliases must be unique".

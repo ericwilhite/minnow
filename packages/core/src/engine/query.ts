@@ -1919,8 +1919,8 @@ function parseTransactionStatement(keyword: string, tokens: Token[]): CompiledSt
 }
 
 /**
- * One transaction mode as written (PostgreSQL's `transaction_mode`), in order: when a kind
- * repeats, the last one applies, as in PostgreSQL (`BEGIN READ ONLY, READ WRITE` writes).
+ * One transaction mode as written (PostgreSQL's `transaction_mode`), in order, including
+ * duplicates. Validate each item in order before using the last value of each kind.
  */
 export type TransactionMode =
   | { readonly kind: "access"; readonly readOnly: boolean }

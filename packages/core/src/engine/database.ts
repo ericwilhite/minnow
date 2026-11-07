@@ -14017,16 +14017,20 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       // SET TRANSACTION changes the open transaction (outside one it has no effect, as in
       // PostgreSQL, which only warns). READ ONLY may be set at any point; READ WRITE only before
       // the transaction's first statement.
-      const readOnly = accessMode(statement.transactionModes);
-      if (current !== undefined && readOnly !== undefined) {
-        // PostgreSQL's check_transaction_read_only: out of read-only mode, never inside a
-        // savepoint (a subtransaction), and at top level only before the first statement.
-        if (!readOnly && current.readOnly && current.savepoints.length > 0)
-          throw new TypeError(
-            "cannot set transaction read-write mode inside a read-only transaction",
-          );
-        if (!readOnly && current.readOnly && current.queried)
-          throw new TypeError("transaction read-write mode must be set before any query");
+      if (current !== undefined) {
+        // Each item observes the preceding items, not just the final access value. For
+        // example, READ ONLY followed by READ WRITE may become invalid inside a savepoint.
+        let readOnly = current.readOnly;
+        for (const mode of statement.transactionModes) {
+          if (mode.kind !== "access") continue;
+          if (!mode.readOnly && readOnly && current.savepoints.length > 0)
+            throw new TypeError(
+              "cannot set transaction read-write mode inside a read-only transaction",
+            );
+          if (!mode.readOnly && readOnly && current.queried)
+            throw new TypeError("transaction read-write mode must be set before any query");
+          readOnly = mode.readOnly;
+        }
         current.readOnly = readOnly;
       }
       return { kind: "set", action: statement.action, name: statement.name };

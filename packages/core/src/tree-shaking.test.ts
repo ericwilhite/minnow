@@ -33,16 +33,16 @@ const SQL_ENGINE_MODULES =
 // the measurement beside it, and the history lives in git.
 
 // Everything the main entry exports, bundled: the in-thread engine.
-// 0.20.0 SQL fixes: 1,166,586 bytes raw / 349,202 bytes gzip.
+// 0.20.0 SQL fixes: 1,166,629 bytes raw / 349,221 bytes gzip.
 const COMPLETE_ENTRY_RAW_BUDGET = 1140 * 1024;
 const COMPLETE_ENTRY_GZIP_BUDGET = 341.5 * 1024;
 // The engine with the larger durable adapter, OPFS.
-// 0.20.0 SQL fixes: 1,579,023 bytes raw / 456,334 bytes gzip.
+// 0.20.0 SQL fixes: 1,579,066 bytes raw / 456,345 bytes gzip.
 const ENGINE_WITH_OPFS_RAW_BUDGET = 1542.5 * 1024;
 const ENGINE_WITH_OPFS_GZIP_BUDGET = 446 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does.
-// 0.20.0 SQL fixes: 1,574,911 bytes raw / 453,763 bytes gzip.
+// 0.20.0 SQL fixes: 1,574,954 bytes raw / 453,806 bytes gzip.
 const INDEXEDDB_WORKER_RAW_BUDGET = 1538.5 * 1024;
 const INDEXEDDB_WORKER_GZIP_BUDGET = 443.5 * 1024;
 // What a page that hosts the engine in a worker ships on the main thread: the client, the schema
