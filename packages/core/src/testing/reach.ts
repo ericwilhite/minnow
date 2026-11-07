@@ -424,3 +424,15 @@ export const SHAPE_DIFFERENTIAL_REACH = [
   "empty gather",
   "same endpoints different interiors",
 ] as const;
+
+/** Production Gate A executor bridge over real transfers and delayed cumulative credits. */
+export const EXECUTOR_EXPORT_REACH = [
+  "production executor preparation",
+  "multiple source groups",
+  "sparse nulls",
+  "out of line >64KiB",
+  "exact transferred values",
+  "task-delayed cumulative credit",
+  "source survives transfer",
+  "execution charges returned",
+] as const;

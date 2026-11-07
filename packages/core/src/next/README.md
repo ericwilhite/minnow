@@ -615,21 +615,34 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     fixture outside IO, checks row/charge totals, and reports five CPU/wall rounds. Its memory
     peak is only the cache handle; the OPFS comparison reports the full governor and RSS.
 - Scan/transport mode: `MINNOW_EXPORT_SCAN_COMPARE=1 npm run benchmark:export` runs five
-  interleaved cold/warm attempts of the page stream and B4's real `TableScan`/pipeline driver.
+  interleaved cold/warm attempts of the page stream and B4's production Executor/result path.
   `MINNOW_EXPORT_SCAN_COLD_ONLY=1` keeps five cold attempts of each mode; the nightly workflow
   records these separately as `export-scan-bench.json`, without a threshold. The governor cap
   is 512 MiB for both modes and is reported; its counter is not an RSS bound.
-  - `scripts/browser-perf/page/owner-frames.ts` is a **bench adapter standing in for the
-    executor's future frame assembly**. It stays out of `exec/` and production imports. It owns
-    each compact scan batch as the current `FramePayload`, prepays exact frame/registry bytes,
-    uses identity dictionaries up to the stream cap, then flattens text dictionaries. It does
-    not implement selected vectors or capped non-text dictionaries (outside this fixture).
+  - `scripts/browser-perf/page/executor-export.ts` prepares a real scan plan with `createExecutor`
+    before timing. `execute` owns admission, TableScan, ResultSink and ResultChannel; frames use
+    the unchanged owner transfer policy, real MessagePort delivery and cumulative client credits.
+    Ordinary `mode:"scan"` is now Gate A's export number. Execution defaults are used, including
+    the compiler's current per-batch read policy. The bench does not override scan windows,
+    output ownership, batch targets or result framing. Fixture preparation/SQL/catalog/root reads
+    and client row-object construction remain excluded. Generated `executor-export.test.ts`
+    histories check actual factory preparation, all transferred values, multiple groups, sparse
+    NULLs, genuine >64 KiB values, delayed credits, storage survival and returned execution charges.
+  - `scripts/executor-export-bench.mts` compares the real executor/result path with the historical
+    adapter over the same memory-backed PageCache and per-batch reads. Five interleaved fresh
+    processes per variant exclude preparation, setup, warmup and GC and record process/thread
+    CPU and wall time. This isolates worker export cost, not OPFS/renderer memory. Both use real
+    in-process transfers; the adapter is not an alternative Gate A implementation.
+  - `owner-frames.ts` and `scan-export.ts` remain **historical scan-adapter diagnostics**, excluded
+    from Gate A. Ownership/batch/IO/range/shape-transport/frame-copy experiment flags explicitly
+    use `mode:"scan-adapter"`. No production module imports the old assembler.
   - The real `ResultChannel`, `frameByteLength` and owner transfer policy are reused. Frames
     go over a real `MessagePort`; the client checks sequence/dictionary/row/byte totals and
     returns cumulative credits at half the window or the owner's release delay. The timed
     export ends after all credits return. The client consumes typed frames, not JS row objects.
   - Table/group descriptors come from the fixture, replacing SQL lowering and B3 catalog/root
-    loading. The scan requests a 64 MiB row window through `TableScan.readWindowBytes` and
+    loading. The historical scan-adapter/scan-core diagnostics request a 64 MiB row window
+    through `TableScan.readWindowBytes` and
     the `chunkReads` factory: B2's shared `loadTogether` and one-pass pooled leases. This
     window stays opt-in: absent/zero `readWindowBytes` keeps cached batch reads. Filtered/deleted groups
     retain selective reads. Resident shared loads preserve synchronous `next()` steps until a task yield is due. A refused

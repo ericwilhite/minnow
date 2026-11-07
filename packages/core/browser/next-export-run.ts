@@ -24,7 +24,10 @@ async function withWorker<T>(request: ExportRequest): Promise<T> {
   const worker = new Worker(url, {
     type: "module",
   });
-  const results = request.op === "export" && request.mode === "scan" ? new MessageChannel() : null;
+  const results =
+    request.op === "export" && (request.mode === "scan" || request.mode === "scan-adapter")
+      ? new MessageChannel()
+      : null;
   let releaseTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await new Promise<T>((resolve, reject) => {
@@ -95,8 +98,8 @@ async function withWorker<T>(request: ExportRequest): Promise<T> {
             const pass = (data.result as ExportPass[]).at(-1);
             if (
               pass?.rows !== receivedRows ||
-              pass.scanStats?.frames !== receivedFrames ||
-              pass.scanStats.wireBytes !== receivedBytes
+              (pass.executorStats ?? pass.scanStats)?.frames !== receivedFrames ||
+              (pass.executorStats ?? pass.scanStats)?.wireBytes !== receivedBytes
             ) {
               reject(new Error("Scan transport totals disagree"));
               return;
@@ -146,7 +149,7 @@ export async function exportPass(options: {
   readonly baselineStream?: boolean;
   readonly readMiB?: 4 | 8;
   readonly groupDepth?: 1 | 2;
-  readonly mode?: "pages" | "scan" | "scan-core";
+  readonly mode?: "pages" | "scan" | "scan-core" | "scan-adapter";
   readonly frameCopy?: "baseline" | "candidate";
   readonly scanRange?: "baseline" | "candidate";
   readonly scanShape?: "baseline" | "candidate";

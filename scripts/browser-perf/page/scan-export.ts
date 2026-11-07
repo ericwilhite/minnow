@@ -1,7 +1,7 @@
 /**
- * Gate A bench mode: real TableScan and pipeline driver -> BENCH frame assembler -> real
+ * HISTORICAL scan-adapter diagnostic, excluded from Gate A: real TableScan and pipeline driver -> BENCH frame assembler -> real
  * ResultChannel -> owner transfer policy -> MessagePort -> client credit. The assembler stands
- * in for the executor's future result sink; this is not SQL lowering or a production Executor.
+ * in for the former missing sink; the production Executor/ResultSink now runs in executor-export.ts.
  * Table/group descriptors are supplied by the fixture (no B3 catalog/group-root loading).
  * Keep this adapter under the bench directory; production modules must not import it.
  */

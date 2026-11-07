@@ -1182,11 +1182,22 @@ sub-millisecond numbers on Firefox are rounded to the millisecond.
 
 **Export diagnostics (rebuild, not yet shipped).** `npm run benchmark:export` records the
 page-stream half on Linux/Chromium OPFS: a wide 1,048,576-row, 200-column table read into reused
-column buffers. `MINNOW_EXPORT_SCAN_COMPARE=1` adds the real table scan, result channel, owner
-transfer policy, and MessagePort credits. Its frame assembler is a labelled bench adapter that
-stands in for the executor's future production assembly. Fixture descriptors replace SQL,
-catalog, and group-root loading; the receiver consumes typed frames rather than JS row objects.
-The two modes must be reported separately.
+column buffers. `MINNOW_EXPORT_SCAN_COMPARE=1` adds the production executor and result path:
+`createExecutor` → `ResultSink` → `ResultChannel` → the owner transfer policy → real MessagePort
+credits. This `mode:"scan"` number is the Gate A export result. Preparation and fixture snapshot
+and group descriptors replace SQL lowering, catalog and group-root loading; the receiver consumes
+typed frames rather than JS row objects. The executor owns admission, scan options and result
+framing without bench overrides. Its current compiled scan uses the default per-batch read policy;
+the diagnostic 64 MiB scan window is not forced onto it. The timed region includes execution
+admission, scanning, framing, transfers and complete credit drain, and excludes fixture preparation.
+Page-stream and real-executor results must be reported separately.
+
+Historical ownership, batch, IO, range, shape-transport and frame-copy comparison flags use the
+explicit `mode:"scan-adapter"` diagnostic and its old stand-in frame assembler. Those numbers
+are excluded from Gate A. They remain available to reproduce earlier component experiments.
+`next-executor-export` generated histories verify production executor preparation, source-value
+equality through real transfers, task-delayed cumulative credits, storage survival and zero
+remaining execution charges across multiple groups, sparse NULLs and >64 KiB values.
 
 Both export modes record rows/s, worker CPU and sampled renderer RSS. The scan comparison brackets
 CPU after setup, checks frame delivery and release charges, and defaults to five interleaved
@@ -1198,6 +1209,12 @@ file residency at the start, not a promise it stays resident. `MINNOW_EXPORT_VAR
 nine cold/warm pairs with per-pass phases, GC pauses, read shapes, residency, and host pressure.
 The nightly workflow keeps the page diagnostic in `export-bench.json` and the cold comparison in
 `export-scan-bench.json`, under `browser-perf-results/`. Neither enforces a performance threshold.
+
+`scripts/executor-export-bench.mts` isolates the production executor/result path against the
+historical adapter over the same memory-backed page cache, with per-batch reads for both and
+real in-process MessagePort transfers. It records five interleaved fresh-process CPU/wall rounds,
+excluding fixture construction, preparation, warmup and GC. It measures worker work, not OPFS
+latency or renderer RSS; the adapter comparison is diagnostic, not an alternative Gate A result.
 
 `MINNOW_EXPORT_SCAN_PROFILE=1` profiles only the dedicated scan worker, cold and warm, after
 setup. Its `export-cpu-N` attachments can be summarized with `scripts/scan-profile.mts`:
@@ -1220,7 +1237,8 @@ in five cold, interleaved OPFS scan-only pairs. It uses explicit 64 MiB windows 
 same borrowed-batch consumer; it measures neither frame assembly nor export transport.
 Add `MINNOW_EXPORT_SCAN_SHAPE_TRANSPORT=1` to compare the whole stand-in adapter and
 real owner transfer path instead. Both modes assert which three module versions reached
-the worker; the transport comparison still does not use the future executor frame builder.
+the worker. This historical transport comparison uses the old adapter, not the production
+`ResultSink`, and is explicitly excluded from Gate A.
 The scan reuses verified header facts while the endpoint pages stay the same. Loading,
 releasing or materializing a page invalidates those facts. Exact-range varlen byte sizes
 are memoized separately; sparse selections are sized from their selected rows.

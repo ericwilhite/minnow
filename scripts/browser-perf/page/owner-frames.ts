@@ -1,12 +1,12 @@
 /**
- * BENCH ADAPTER, not the executor's production result sink (it does not exist yet).
+ * HISTORICAL BENCH ADAPTER, not the production ResultSink (exec/result-sink.ts).
  * Owns compact scan batches (no selection vector) as the current owner's FramePayload.
  * ResultChannel numbers/credits frames; the caller uses the unchanged owner transfer policy.
  * Identity dictionaries are sent once up to the cap, then text dictionaries flatten per frame.
  * Refuses selections and capped non-text dictionaries (outside the wide SELECT * fixture).
  * A compact flat batch with explicit detachable-buffer permission is adopted as-is, with the
  * same result budget, retained through frame credit. Otherwise this adapter owns copies.
- * This policy is a stand-in for future frame assembly. No production import here.
+ * Retained for explicitly labelled historical diagnostics, excluded from Gate A. No production imports.
  */
 import type { Transfer } from "../../../packages/core/src/next/exec/pipeline.js";
 import type { ByteBudget } from "../../../packages/core/src/next/storage/extents.js";
