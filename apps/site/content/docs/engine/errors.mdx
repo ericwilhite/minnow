@@ -86,6 +86,7 @@ unknown outcome.
 the engine had work outstanding. Nothing in IndexedDB can be cancelled or timed out, so this
 deadline is what stands between a wedged browser and a call that never returns; any storage event
 resets it, so work queued behind a genuinely long transaction is never mistaken for a wedge.
+That includes native request events from bulk work that waits only for transaction completion.
 
 The known cause is a worker terminated with `worker.terminate()` while one of its IndexedDB
 transactions was still queued — behind another of its own, or behind another tab's write that

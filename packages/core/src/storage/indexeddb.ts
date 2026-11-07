@@ -793,6 +793,12 @@ export class IndexedDbBlockStore implements BlockStore {
       this.close();
     });
     stallGuards.set(db, this.#stallGuard);
+    // Requests need not have an adapter-owned promise: bulk writes can wait only for the
+    // transaction's completion. Observe native request/transaction progress on this connection.
+    // Success does not bubble, but its event path includes the transaction and connection.
+    const progress = () => this.#stallGuard.progress();
+    for (const type of ["success", "error", "complete", "abort"])
+      db.addEventListener(type, progress, true);
     db.addEventListener("versionchange", () => {
       this.#supersede();
     });
@@ -10213,7 +10219,7 @@ class ConnectionStallGuard {
       if (released) return;
       released = true;
       this.#waiting.delete(reject);
-      this.#progress();
+      this.progress();
     };
   }
 
@@ -10236,8 +10242,8 @@ class ConnectionStallGuard {
     this.#timer = undefined;
   }
 
-  /** An event arrived, so the connection is alive: start the deadline over. */
-  #progress(): void {
+  /** A native event or awaited settlement proves this connection alive, even within a long TX. */
+  progress(): void {
     if (this.#tripped !== undefined) return;
     this.#deadline = performance.now() + this.#afterMs;
     if (this.#waiting.size === 0) this.#disarm();
