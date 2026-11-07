@@ -342,15 +342,15 @@ class Sorter {
   readonly profile: SortProfile;
   #reserved = 0;
   /** Operator-owned scratch (R23.1): it lives across `#makeRoom`'s awaits. */
-  readonly keptRows = new Uint16Array(BATCH_ROWS);
-  readonly partLengths = new Int32Array(BATCH_ROWS);
+  readonly keptRows: Uint16Array;
+  readonly partLengths: Int32Array;
   /** Rows 0 … BATCH_ROWS − 1 (never written after construction). */
-  readonly #identity = Uint16Array.from({ length: BATCH_ROWS }, (_, i) => i);
+  readonly #identity: Uint16Array;
   /** Group thresholds (partition > 0), or the raw first-key gate (partition = 0).
    * This charged buffer is distinct from keptRows, which full-key filtering overwrites.
    */
-  readonly groupKept = new Uint16Array(BATCH_ROWS);
-  readonly radix = new RadixScratch();
+  readonly groupKept: Uint16Array;
+  readonly radix: RadixScratch;
   #groupKeptCount = 0;
   /**
    * Compare mode: the resident rows' decoded operands by row id, charged as the rows arrive, so
@@ -421,8 +421,16 @@ class Sorter {
     this.#maxVarlen = this.#varlenColumns.map(() => 0);
     this.charge = new Charge(context.grant);
     this.pool = new Pool(this.charge, POOL_BYTES);
-    if (!this.charge.allocate(SORTER_SCRATCH_BYTES))
+    if (!this.charge.allocate(SORTER_SCRATCH_BYTES)) {
+      this.pool.close();
       throw new RangeError("A sort's minimum must be admitted");
+    }
+    // All sorter scratch is constructed only after its owning reservation succeeds.
+    this.keptRows = new Uint16Array(BATCH_ROWS);
+    this.partLengths = new Int32Array(BATCH_ROWS);
+    this.#identity = Uint16Array.from({ length: BATCH_ROWS }, (_, i) => i);
+    this.groupKept = new Uint16Array(BATCH_ROWS);
+    this.radix = new RadixScratch();
     this.files = new SpillFiles(context.spill, context.queryId, this.charge);
     this.pages = new PageWriter(this.pool, 16 * 1024);
     this.io = new SpillIo(this.pool, this.files, this.pages, context, () => {

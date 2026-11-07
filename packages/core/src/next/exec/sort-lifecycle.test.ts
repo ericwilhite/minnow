@@ -5,7 +5,8 @@
  * after backpressure, and compare mode's decoded operands charged to the grant. Also the review's
  * resource probes: an oversized row refused cleanly, and a wide spill that stays bounded.
  */
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
+import { createReach } from "../../testing/reach.js";
 import { Governor } from "../memory/governor.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import type { PhysicalType } from "../types.js";
@@ -1113,4 +1114,77 @@ describe("R23.5: one task clock per worker", () => {
       void run;
     });
   });
+});
+
+const admissionReach = createReach("next-sort-scratch-admission", [
+  "sort",
+  "group",
+  "pool refused",
+  "scratch refused",
+  "admitted",
+]);
+afterAll(() => admissionReach.assertReached());
+describe("R19: sort scratch admission", () => {
+  for (const kind of ["sort", "group"] as const)
+    for (const refuseAt of [1, 2, 0])
+      it(`${kind} constructs radix only after admission, refusal ${String(refuseAt)}`, async () => {
+        const { context: ctx, governor, spill } = await context([INT]);
+        const native = globalThis.Int32Array;
+        const allocate = ctx.grant.allocate.bind(ctx.grant);
+        let calls = 0;
+        const observed: number[] = [];
+        const allocation = vi.spyOn(ctx.grant, "allocate").mockImplementation((bytes) => {
+          calls++;
+          return calls === refuseAt ? false : allocate(bytes);
+        });
+        vi.stubGlobal(
+          "Int32Array",
+          new Proxy(native, {
+            construct(target, args, newTarget) {
+              const value = Reflect.construct(target, args, newTarget) as Int32Array;
+              if (value.length === 65_537) observed.push(calls);
+              return value;
+            },
+          }),
+        );
+        let op: SortOperator | GroupTopKOperator | undefined;
+        try {
+          const make = () =>
+            kind === "sort"
+              ? new SortOperator(
+                  { types: [INT], keys: [asc(0)], limit: null, offset: 0, withTies: false },
+                  ctx,
+                  new CollectSink(),
+                )
+              : new GroupTopKOperator(
+                  { types: [INT], partitionBy: [0], orderBy: [asc(0)], k: 1 },
+                  ctx,
+                  new CollectSink(),
+                );
+          if (refuseAt === 0) {
+            op = make();
+            expect(observed).toEqual([2, 2]);
+            await drive(new ArraySource([]), op);
+            await op.closed;
+          } else {
+            expect(make).toThrow(RangeError);
+            expect(observed).toEqual([]);
+            // Scratch refusal must unwind the pool reservation already made by this constructor.
+            expect(ctx.grant.allocated).toBe(0);
+          }
+          admissionReach.beginHistory();
+          admissionReach.reach(kind);
+          admissionReach.reach(
+            refuseAt === 0 ? "admitted" : refuseAt === 1 ? "pool refused" : "scratch refused",
+          );
+        } finally {
+          vi.unstubAllGlobals();
+          allocation.mockRestore();
+          op?.abort(new Error("admission test cleanup"));
+          await op?.closed.catch(() => undefined);
+          ctx.grant.close();
+        }
+        expect(governor.usedBytes).toBe(0);
+        expect(spill.bytesInUse).toBe(0);
+      });
 });

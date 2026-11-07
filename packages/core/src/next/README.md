@@ -998,6 +998,9 @@ and the owner import it directly.
   after a compaction each partition keeps its k-th key, and rows that cannot beat it are dropped.
 - Grant-or-spill: sorted runs of typed spill pages, merged with a fan-in the spill pool's room
   allows, in passes when needed; OFFSET rows are counted, not materialized.
+- Sorter scratch buffers, including the radix histograms, are constructed only after their
+  owning charge succeeds. Refusing scratch admission constructs no radix arrays and returns
+  the pool allocation made earlier in the constructor.
 - Finish work (compaction, the sort, the merge, emission) runs in slices of `YIELD_INTERVAL_MS`
   with a real task yield between them; each slice and each resumption after backpressure checks
   the abort signal (ruling R23). Scratch that lives across a suspension belongs to the operator.
