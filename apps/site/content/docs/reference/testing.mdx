@@ -1604,6 +1604,13 @@ are unavailable; the report counts returned byte payloads and numeric index/meta
 The factory acquires handles in `openFence` and recovers in `open`, following the host contract.
 The default fence deadline is unchanged; the ready timer includes acquisition and recovery.
 
+Bounded-arena histories independently track live cells and reusable runs under fragmentation,
+overflow, splitting and coalescing. They require forgotten holes to remain unavailable, check
+the single prepaid backing allocation, and recover all free space on rebuild where coalescing
+brings fragmentation within capacity. Unchanged extreme fragmentation may retain debt across
+reopen. This allocator is tested in isolation before integration with root-list provenance;
+unknown space never authorizes a root reference or retirement.
+
 Ordered-root startup regressions require a streaming union without the unordered free-map sort,
 validate scattered list-page allocations, and refuse overlapping, descending or inconsistent
 extents before reclaim. Full audit and test-build semantic checks remain enabled separately.

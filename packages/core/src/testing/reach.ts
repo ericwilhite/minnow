@@ -30,6 +30,16 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+/** Fixed run arenas may forget holes, but cannot reuse unknown or live bytes. */
+export const BOUNDED_FREE_ARENA_REACH = [
+  "overflow",
+  "unknown",
+  "tracked first fit",
+  "coalesce",
+  "reopen",
+  "closed",
+] as const;
+
 /** Full-scan shared windows: the default and override must cover cold and resident reads. */
 export const SCAN_WINDOW_RESIDENCY_REACH = [
   "default cold",

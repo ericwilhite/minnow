@@ -1891,6 +1891,25 @@ and close releases that reservation. List readers keep decoded objects charged a
 suspension and release them when the consumer finishes or stops. Startup carries a single page
 cursor across read batches, so traversing the root’s page references is linear in page count.
 
+### Bounded free-run arena
+
+`storage/bounded-free-space.ts` provides the fixed-arena allocator for the R25
+replacement. It is isolated from the live space until list-based provenance and
+the ownership-transition barrier are integrated. The arena is admitted once,
+sized with headroom from the initial run count, between 32 and 256 KiB. It never
+grows its backing buffer during allocation or release.
+
+At capacity it forgets the smallest free runs and reports `untrackedFreeBytes`.
+Allocation remains synchronous and chooses the lowest fit among tracked runs,
+or extends EOF. Forgotten ranges are never reused. Their complement is unknown,
+not proof that bytes are allocated: releases require an independent ownership
+proof. This distinction must also govern publication validation and audits.
+
+Extreme fragmentation can waste free space until reopen. Rebuilding from kept
+root lists reconsiders every gap; debt can remain if fragmentation still exceeds
+the capped arena. Full recovery follows when coalescing brings the gap count
+within capacity. No current-root-only background rebuild is enabled.
+
 ### R25 startup measurement
 
 `MINNOW_NEXT_STORAGE_REOPEN=1` enables the Chromium storage reopen lane in
