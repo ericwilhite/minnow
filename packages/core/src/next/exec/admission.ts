@@ -13,7 +13,7 @@ export class ReservedGrant implements Grant {
   #credit: number;
   #used = 0;
   #closed = false;
-  #reclaim: ((bytes: number) => void) | null = null;
+  #reclaim: ((bytes: number) => void | Promise<void>) | null = null;
   constructor(
     readonly fixed: Grant,
     readonly extra: Grant,
@@ -59,6 +59,13 @@ export class ReservedGrant implements Grant {
   tryGrow(bytes: number): boolean {
     return !this.#closed && this.extra.tryGrow(bytes);
   }
+  async makeRoom(bytes: number, signal?: AbortSignal): Promise<boolean> {
+    if (this.#closed) return false;
+    if (this.held - this.allocated >= bytes) return true;
+    // Ask for room in the independent account. A concurrent reclaim can surrender unused
+    // fixed credit while this waits; extra room remains owned by this reader either way.
+    return (await this.extra.makeRoom?.(bytes, signal)) ?? false;
+  }
   release(bytes: number): void {
     if (!Number.isSafeInteger(bytes) || bytes < 0)
       throw new RangeError("nonnegative byte count required");
@@ -73,12 +80,12 @@ export class ReservedGrant implements Grant {
   borrow(bytes: number, signal?: AbortSignal): Promise<Loan> {
     return this.extra.borrow(bytes, signal);
   }
-  onReclaimRequest(callback: (bytes: number) => void): void {
+  onReclaimRequest(callback: (bytes: number) => void | Promise<void>): void {
     this.#reclaim = callback;
     this.extra.onReclaimRequest(callback);
   }
-  reclaim(bytes: number): void {
-    if (!this.#closed) this.#reclaim?.(bytes);
+  reclaim(bytes: number): void | Promise<void> {
+    if (!this.#closed) return this.#reclaim?.(bytes);
   }
   close(): void {
     if (this.#closed) return;

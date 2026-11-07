@@ -1288,7 +1288,15 @@ real storage and result delivery.
 
 Fixed operator buffers are reserved atomically before data-dependent state grows, so a join build
 cannot consume the later probe's admission minimum. Individual operators retain separate grants
-for growth and progress loans. Existing join/sort/window spilling remains active. Hash aggregation
+for growth and progress loans. A refused encoded-page lease goes through the executor's read
+wrapper: evict cache first, await eligible holders' cooperative reclaim callbacks, then retry
+inside the original read. Sort registers a callback that spills its resident run and releases
+unused holdings at a batch boundary; concurrent input and finish wait for that spill. Asynchronous
+callbacks are serialized per grant, and a cancelled reader stops waiting without cancelling a
+spill another reader needs. Waiting reads reserve normal capacity before new growth or admissions can retake released bytes;
+progress loans still run first and read growth never consumes their reserve. A read is finally
+refused only after eligible holders are exhausted.
+Existing join/sort/window spilling remains active. Hash aggregation
 still has its documented refused-growth limitation until partitioned aggregation is implemented.
 Hash-join spill staging also has a known large-row defect: 600 kB build payloads at an 8 MiB
 budget can request a second progress loan. This is a bug, not an intended size limit.

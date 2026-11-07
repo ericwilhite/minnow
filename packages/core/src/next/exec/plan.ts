@@ -3,6 +3,7 @@ import type { MaybePromise } from "../access/key-index.js";
 import type { PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { ResultSink } from "./result-sink.js";
 import { batchTargetFor, type Grant } from "../memory/governor.js";
+import { reclaimingReader } from "./reclaim-reader.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import { samePhysicalType, type PhysicalType } from "../types.js";
 import { BATCH_ROWS, type Batch, type Selection, type Vector } from "../vector/vector.js";
@@ -483,7 +484,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 const output = owner?.grant;
                 const scan = new TableScan({
                   table,
-                  pages: runtime.view.pages,
+                  pages: reclaimingReader(runtime.view.pages, grant, runtime.signal),
                   reads: runtime.request.reads,
                   budget: grant,
                   columns: rel.columns,

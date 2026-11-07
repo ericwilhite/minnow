@@ -44,7 +44,8 @@
  *    caches may register (the space's page cache, decoded directories and metadata, inflated
  *    pages): eviction takes the entry unused the longest across all of them, asking the cache
  *    whose `oldestUnusedAt` is smallest for one entry at a time.
- * 7. **Cooperative reclaim.** While a loan or an admission waits, the governor calls each other
+ * 7. **Cooperative reclaim.** Before a read refuses growth, or while a loan/admission waits,
+ *    the governor calls each other
  *    spillable grant's `onReclaimRequest`; the operator spills at its next batch boundary and
  *    `release`s. A callback (or the cache) may release synchronously: the drain is not reentrant.
  * 8. **Lifecycle.** `close` returns everything, rejects the grant's queued loan, and makes every
@@ -118,6 +119,13 @@ export interface Grant {
   /** Adds held bytes (spillable grants only). Never waits. */
   tryGrow(bytes: number): boolean;
   /**
+   * Make `bytes` of unallocated room, evicting cache first, then awaiting other holders' spills.
+   * False only after all eligible holders have been asked and room still cannot be obtained.
+   * Does not allocate the caller's buffers or take the progress reserve. Optional for synthetic
+   * budgets; real governor grants and executor reservations implement it.
+   */
+  makeRoom?(bytes: number, signal?: AbortSignal): Promise<boolean>;
+  /**
    * Returns held bytes to the governor: only holdings beyond what is allocated and beyond the
    * outstanding loan. Loan-backed bytes leave only through `repay` (else `LoanBackedReleaseError`,
    * and nothing changes).
@@ -126,7 +134,7 @@ export interface Grant {
   /** Rule 5. */
   borrow(bytes: number, signal?: AbortSignal): Promise<Loan>;
   /** Rule 7. */
-  onReclaimRequest(callback: (bytes: number) => void): void;
+  onReclaimRequest(callback: (bytes: number) => void | Promise<void>): void;
   /** Rule 8. Idempotent. */
   close(): void;
 }
@@ -232,6 +240,13 @@ function abortReason(signal: AbortSignal | undefined): Error {
   return reason instanceof Error ? reason : new Error("Aborted", { cause: reason });
 }
 
+function checkSignal(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) throw abortReason(signal);
+}
+
+/** Internal completion of a read for which every reclaim callback is exhausted. */
+class NoReadRoom extends Error {}
+
 interface Request {
   readonly bytes: number;
   /** Null for an admission (a new grant is made). */
@@ -243,6 +258,9 @@ interface Request {
   readonly resolve: (grant: GrantImpl) => void;
   readonly reject: (reason: unknown) => void;
   readonly detach: () => void;
+  readonly asked: Set<GrantImpl>;
+  readonly readRoom: number | null;
+  readonly pending: Set<Promise<void>>;
 }
 
 class GrantImpl implements Grant {
@@ -251,7 +269,8 @@ class GrantImpl implements Grant {
   loan = 0;
   loanPending = false;
   closed = false;
-  reclaim: ((bytes: number) => void) | null = null;
+  reclaim: ((bytes: number) => void | Promise<void>) | null = null;
+  reclaiming: Promise<void> | null = null;
   constructor(
     readonly governor: Governor,
     readonly label: string,
@@ -275,6 +294,10 @@ class GrantImpl implements Grant {
   tryGrow(bytes: number): boolean {
     if (this.closed || !this.spillable) return false;
     return this.governor.grow(this, bytes);
+  }
+
+  makeRoom(bytes: number, signal?: AbortSignal): Promise<boolean> {
+    return this.governor.makeRoom(this, bytes, signal);
   }
 
   get loaned(): number {
@@ -319,7 +342,7 @@ class GrantImpl implements Grant {
     );
   }
 
-  onReclaimRequest(callback: (bytes: number) => void): void {
+  onReclaimRequest(callback: (bytes: number) => void | Promise<void>): void {
     this.reclaim = callback;
   }
 
@@ -345,6 +368,7 @@ export class Governor implements MemoryGovernor {
   readonly #caches: EvictableCache[] = [];
   readonly #grants = new Set<GrantImpl>();
   readonly #loans: Request[] = [];
+  readonly #reads: Request[] = [];
   readonly #admissions: Request[] = [];
   #draining = false;
   #again = false;
@@ -421,11 +445,58 @@ export class Governor implements MemoryGovernor {
   }
 
   grow(grant: GrantImpl, bytes: number): boolean {
-    if (this.#loans.length > 0 || this.#admissions.length > 0) return false;
+    if (this.#loans.length > 0 || this.#reads.length > 0 || this.#admissions.length > 0)
+      return false;
     if (!this.#room(bytes, false)) return false;
     this.#take(bytes);
     grant.held += bytes;
     return true;
+  }
+
+  /** Reclaim is serialized per holder; two readers must never spill the same store concurrently. */
+  #ask(grant: GrantImpl, bytes: number): void | Promise<void> {
+    if (grant.reclaiming !== null) return grant.reclaiming;
+    const work = grant.reclaim?.(bytes);
+    if (!(work instanceof Promise)) return;
+    const pending = work.then(
+      () => {
+        grant.reclaiming = null;
+      },
+      (error: unknown) => {
+        grant.reclaiming = null;
+        throw error;
+      },
+    );
+    grant.reclaiming = pending;
+    return pending;
+  }
+
+  /** Normal read room: cache eviction precedes cooperative spill, never reserve consumption. */
+  async makeRoom(grant: GrantImpl, bytes: number, signal?: AbortSignal): Promise<boolean> {
+    if (!Number.isSafeInteger(bytes) || bytes < 0)
+      throw new RangeError("nonnegative byte count required");
+    const check = () => {
+      checkSignal(signal);
+      if (grant.closed) throw new GrantClosedError(grant.label);
+    };
+    check();
+    const missing = grant.allocated + bytes - grant.held;
+    if (missing <= 0) return true;
+    if (!grant.spillable) return false;
+    if (grant.tryGrow(missing)) return true;
+    try {
+      await this.#enqueue(
+        this.#reads,
+        { bytes: missing, loan: false, grant, label: grant.label, spillable: true },
+        signal,
+        bytes,
+      );
+      check();
+      return true;
+    } catch (error) {
+      if (error instanceof NoReadRoom) return false;
+      throw error;
+    }
   }
 
   give(bytes: number): void {
@@ -435,7 +506,7 @@ export class Governor implements MemoryGovernor {
 
   forget(grant: GrantImpl): void {
     this.#grants.delete(grant);
-    for (const queue of [this.#loans, this.#admissions])
+    for (const queue of [this.#loans, this.#reads, this.#admissions])
       for (const request of [...queue])
         if (request.grant === grant) {
           queue.splice(queue.indexOf(request), 1);
@@ -460,7 +531,10 @@ export class Governor implements MemoryGovernor {
       do {
         this.#again = false;
         this.#serve(this.#loans, true);
-        if (this.#loans.length === 0) this.#serve(this.#admissions, false);
+        if (this.#loans.length === 0) {
+          this.#serve(this.#reads, false);
+          if (this.#reads.length === 0) this.#serve(this.#admissions, false);
+        }
       } while (this.#releasedDuringDrain());
     } finally {
       this.#draining = false;
@@ -468,27 +542,65 @@ export class Governor implements MemoryGovernor {
   }
 
   #serve(queue: Request[], loan: boolean): void {
-    for (let request = queue[0]; request !== undefined; request = queue[0]) {
+    for (let head = queue[0]; head !== undefined; head = queue[0]) {
+      const request = head;
       const wholeMinimum = loan || request.includesProgress === true;
-      if (!this.#room(request.bytes, wholeMinimum)) {
-        for (const grant of [...this.#grants])
-          if (grant.spillable && grant !== request.grant) grant.reclaim?.(request.bytes);
-        if (!this.#room(request.bytes, wholeMinimum)) return;
+      // Parallel column reads may share a grant. Re-evaluate its missing room after another
+      // request was served, and after callbacks that can surrender unused holdings.
+      const bytes = () =>
+        request.readRoom === null || request.grant === null
+          ? request.bytes
+          : Math.max(0, request.grant.allocated + request.readRoom - request.grant.held);
+      if (!this.#room(bytes(), wholeMinimum)) {
+        for (const grant of [...this.#grants]) {
+          if (!grant.spillable || grant === request.grant || request.asked.has(grant)) continue;
+          if (request.readRoom !== null) request.asked.add(grant);
+          try {
+            const work = this.#ask(grant, bytes());
+            if (work instanceof Promise) {
+              request.asked.add(grant);
+              request.pending.add(work);
+              void work.then(
+                () => {
+                  request.pending.delete(work);
+                  this.#drain();
+                },
+                (error: unknown) => {
+                  request.pending.delete(work);
+                  this.#reject(queue, request, error);
+                },
+              );
+              // One read asks one holder at a time; a small lease must not spill every query.
+              if (request.readRoom !== null) break;
+            }
+          } catch (error) {
+            this.#reject(queue, request, error);
+          }
+          if (request.readRoom !== null && this.#room(bytes(), wholeMinimum)) break;
+        }
+        if (!this.#room(bytes(), wholeMinimum)) {
+          if (request.readRoom !== null && request.pending.size === 0 && this.#loaned === 0) {
+            this.#reject(queue, request, new NoReadRoom());
+            continue;
+          }
+          return;
+        }
       }
       // A callback may have cancelled or served the head while we asked for room.
       if (queue[0] !== request) continue;
       queue.shift();
       request.detach();
-      this.#take(request.bytes);
-      if (loan) this.#loaned += request.bytes;
+      const taken = bytes();
+      this.#take(taken);
+      if (loan) this.#loaned += taken;
       let grant = request.grant;
       if (grant === null) {
         grant = new GrantImpl(this, request.label, request.spillable);
         this.#grants.add(grant);
       }
-      grant.held += request.bytes;
+      grant.held += taken;
       if (request.loan) {
-        grant.loan = request.bytes;
+        grant.loan = taken;
         grant.loanPending = false;
       }
       request.resolve(grant);
@@ -497,8 +609,9 @@ export class Governor implements MemoryGovernor {
 
   #enqueue(
     queue: Request[],
-    request: Omit<Request, "resolve" | "reject" | "detach">,
+    request: Omit<Request, "resolve" | "reject" | "detach" | "asked" | "readRoom" | "pending">,
     signal?: AbortSignal,
+    readRoom: number | null = null,
   ): Promise<GrantImpl> {
     if (signal?.aborted === true) return Promise.reject(abortReason(signal));
     return new Promise((resolve, reject) => {
@@ -511,6 +624,9 @@ export class Governor implements MemoryGovernor {
       };
       const entry: Request = {
         ...request,
+        asked: new Set(),
+        pending: new Set(),
+        readRoom,
         resolve,
         reject,
         detach: () => {
@@ -521,6 +637,15 @@ export class Governor implements MemoryGovernor {
       queue.push(entry);
       this.#drain();
     });
+  }
+
+  #reject(queue: Request[], request: Request, error: unknown): void {
+    const at = queue.indexOf(request);
+    if (at < 0) return;
+    queue.splice(at, 1);
+    request.detach();
+    request.reject(error);
+    this.#drain();
   }
 
   async admit(options: AdmitOptions): Promise<Grant> {
@@ -638,7 +763,13 @@ export class Governor implements MemoryGovernor {
         options.minimumBytes,
         this.capBytes - this.reserveBytes,
       );
-    if (this.#draining || this.#loans.length > 0 || this.#admissions.length > 0) return null;
+    if (
+      this.#draining ||
+      this.#loans.length > 0 ||
+      this.#reads.length > 0 ||
+      this.#admissions.length > 0
+    )
+      return null;
     if (!this.#room(options.minimumBytes, false)) return null;
     this.#take(options.minimumBytes);
     const grant = new GrantImpl(this, options.label, options.spillable);
@@ -679,7 +810,8 @@ export class Governor implements MemoryGovernor {
         return true;
       },
       charge: (bytes: number): boolean => {
-        if (this.#loans.length > 0 || this.#admissions.length > 0) return false;
+        if (this.#loans.length > 0 || this.#reads.length > 0 || this.#admissions.length > 0)
+          return false;
         if (this.#missing(bytes, false) > 0) return false;
         this.#take(bytes);
         return true;

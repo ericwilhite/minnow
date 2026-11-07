@@ -149,7 +149,10 @@ export class QueryRuntime {
             this.dispose(() => share.close());
           }
           grant.onReclaimRequest((bytes) => {
-            for (const share of shares) share.reclaim(bytes);
+            const work = shares
+              .map((share) => share.reclaim(bytes))
+              .filter((value) => value instanceof Promise);
+            if (work.length > 0) return Promise.all(work).then(() => undefined);
           });
         };
         return bound instanceof Promise ? bound.then(attach) : attach(bound);

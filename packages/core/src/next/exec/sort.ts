@@ -1448,6 +1448,14 @@ class Sorter {
 
   // --- runs ------------------------------------------------------------------------------
 
+  /** Spill at a batch boundary before another admitted pipeline's read can be refused. */
+  async reclaim(): Promise<void> {
+    this.checkAborted();
+    if (this.store.rows > 0) await this.#spillRun();
+    const free = this.context.grant.held - this.context.grant.allocated - this.context.grant.loaned;
+    if (free > 0) this.context.grant.release(free);
+  }
+
   /** Sorts the rows in memory and writes them as one run; the store is emptied. */
   async #spillRun(): Promise<void> {
     const store = this.store;
@@ -2050,6 +2058,9 @@ export class SortOperator implements Operator {
   readonly #emitter: Emitter;
   #pending: Promise<void> | null = null;
   #done = false;
+  #working: Promise<void> | null = null;
+  #reclaiming: Promise<void> | null = null;
+  #finishing = false;
 
   constructor(spec: SortSpec, context: SortContext, downstream: Operator) {
     this.spec = spec;
@@ -2059,6 +2070,29 @@ export class SortOperator implements Operator {
       context,
     );
     this.#emitter = new Emitter(this.#sorter, downstream, false);
+    context.grant.onReclaimRequest(() => this.reclaim());
+  }
+
+  /** Serialize a cooperative spill with push/finish and retain borrowed batches until it ends. */
+  reclaim(): void | Promise<void> {
+    if (this.#done || this.#finishing) return;
+    if (this.#reclaiming !== null) return this.#reclaiming;
+    const run = async () => {
+      if (this.#working !== null) await this.#working;
+      if (!this.#done && !this.#finishing) await this.#sorter.reclaim();
+    };
+    const pending = run().then(
+      () => {
+        this.#reclaiming = null;
+      },
+      (error: unknown) => {
+        this.#reclaiming = null;
+        this.abort(error);
+        throw error;
+      },
+    );
+    this.#reclaiming = pending;
+    return pending;
   }
 
   get profile(): SortProfile {
@@ -2076,7 +2110,10 @@ export class SortOperator implements Operator {
   push(batch: Batch, transfer?: Transfer): PushResult {
     let result: MaybePromise<void>;
     try {
-      result = this.#sorter.add(batch);
+      result =
+        this.#reclaiming === null
+          ? this.#sorter.add(batch)
+          : this.#reclaiming.then(() => this.#sorter.add(batch));
     } catch (error) {
       this.abort(error);
       throw error;
@@ -2093,6 +2130,16 @@ export class SortOperator implements Operator {
         throw error;
       },
     );
+    const working = this.#pending;
+    this.#working = working;
+    void working.then(
+      () => {
+        if (this.#working === working) this.#working = null;
+      },
+      () => {
+        if (this.#working === working) this.#working = null;
+      },
+    );
     return "blocked";
   }
 
@@ -2103,6 +2150,8 @@ export class SortOperator implements Operator {
   }
 
   finish(): MaybePromise<void> {
+    if (this.#reclaiming !== null) return this.#reclaiming.then(() => this.finish());
+    this.#finishing = true;
     const sorter = this.#sorter;
     let resident: MaybePromise<boolean>;
     try {

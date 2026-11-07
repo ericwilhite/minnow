@@ -19,7 +19,7 @@ import type {
 } from "../storage/extents.js";
 
 export type { ByteBudget, ReadLease } from "../storage/extents.js";
-export { MAX_BLOB_BYTES } from "../storage/extents.js";
+export { MAX_BLOB_BYTES, ReadDeniedError } from "../storage/extents.js";
 
 /** Verified, cached reads (B1 `ExtentReader`). */
 export type SpaceReader = ExtentReader;
