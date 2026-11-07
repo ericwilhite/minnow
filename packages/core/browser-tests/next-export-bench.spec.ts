@@ -11,6 +11,8 @@
  * Fixture descriptors replace SQL/catalog/group-root loading. The scan requests a one-pass
  * coalesced row window from TableScan (64 MiB by default), with its ordinary byte target.
  * MINNOW_EXPORT_SCAN_IO_COMPARE=1 compares it with the parent cached per-batch policy.
+ * MINNOW_EXPORT_SCAN_BATCH_COMPARE=1 compares 1/2/3 MiB decoded targets with owner credits fixed.
+ * MINNOW_EXPORT_SCAN_BATCH_COMPLETED resumes only a recorded exact prefix of that campaign.
  * MINNOW_EXPORT_SCAN_OWNED_COMPARE=1 compares borrowed/copy with dictionary-preserving owned
  * decode/adopt. The source retains dictionary charges; the owner still copies dictionary deltas
  * and capped text fallback. The component bench also records the slower all-flat diagnostic.
@@ -71,6 +73,8 @@ const SCAN_PROFILE = process.env.MINNOW_EXPORT_SCAN_PROFILE === "1";
 const FRAME_COPY_COMPARE = process.env.MINNOW_EXPORT_FRAME_COPY_COMPARE === "1";
 const SCAN_RANGE_COMPARE = process.env.MINNOW_EXPORT_SCAN_RANGE_COMPARE === "1";
 const SCAN_OWNED_COMPARE = process.env.MINNOW_EXPORT_SCAN_OWNED_COMPARE === "1";
+const SCAN_BATCH_COMPARE = process.env.MINNOW_EXPORT_SCAN_BATCH_COMPARE === "1";
+const SCAN_BATCH_COMPLETED = process.env.MINNOW_EXPORT_SCAN_BATCH_COMPLETED ?? "";
 const SCAN_IO_COMPARE = process.env.MINNOW_EXPORT_SCAN_IO_COMPARE === "1";
 const SCAN_COMPARE =
   process.env.MINNOW_EXPORT_SCAN_COMPARE === "1" ||
@@ -78,7 +82,8 @@ const SCAN_COMPARE =
   FRAME_COPY_COMPARE ||
   SCAN_RANGE_COMPARE ||
   SCAN_IO_COMPARE ||
-  SCAN_OWNED_COMPARE;
+  SCAN_OWNED_COMPARE ||
+  SCAN_BATCH_COMPARE;
 const DEPTH_COMPARE = process.env.MINNOW_EXPORT_DEPTH_COMPARE === "1";
 const READ_COMPARE = process.env.MINNOW_EXPORT_READ_COMPARE === "1";
 const VARIANCE = process.env.MINNOW_EXPORT_VARIANCE === "1";
@@ -487,6 +492,19 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         expect(pass.scanStats?.copies.adoptedFrames).toBe(0);
         expect(pass.scanStats?.copies.copiedBytes).toBe(pass.scanStats?.wireBytes);
       }
+      if (options.scanTargetMiB !== undefined) {
+        expect(pass.scanStats?.batchTargetBytes).toBe(options.scanTargetMiB * MiB);
+        expect(pass.scanStats?.maxBatchRows).toBeLessThanOrEqual(2048);
+        expect(pass.scanStats?.maxFrameBytes).toBeLessThanOrEqual(4 * MiB);
+        expect(pass.scanStats?.maxOutstandingBytes).toBeLessThan(
+          4 * MiB + (pass.scanStats?.maxFrameBytes ?? 0),
+        );
+        if (rows === 1048576) {
+          expect(pass.scanStats?.frames).toBe(
+            options.scanTargetMiB === 1 ? 1536 : options.scanTargetMiB === 2 ? 1024 : 512,
+          );
+        }
+      }
       const bytes = (built.dataBytes * pass.rows) / (rows + 65_536);
       const cpuSeconds = [...passCpu.values()].reduce((sum, seconds) => sum + seconds, 0);
       const exportCpu = targets.profileCpuSeconds.at(-1);
@@ -548,7 +566,35 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     };
 
     const base = { once: true, capMiB: 512, passes: 1, groups: exported };
-    if (FRAME_COPY_COMPARE || SCAN_RANGE_COMPARE || SCAN_IO_COMPARE || SCAN_OWNED_COMPARE) {
+    if (SCAN_BATCH_COMPARE) {
+      const options = {
+        ...base,
+        mode: "scan" as const,
+        readaheadKiB: 256,
+        windowMiB: WINDOW_MIB,
+        auditWorkingSet: false,
+        profile: true,
+      };
+      const plan = Array.from({ length: 5 }, (_, round) =>
+        (round % 2 === 0 ? ([1, 2, 3] as const) : ([3, 2, 1] as const)).map((scanTargetMiB) => ({
+          round,
+          scanTargetMiB,
+          key: `${String(round)}:${String(scanTargetMiB)}`,
+        })),
+      ).flat();
+      // A foreground command may hit its time limit between passes on a contended host.
+      // Resume only an exact prefix; retain every completed measurement when combining runs.
+      const completed = SCAN_BATCH_COMPLETED === "" ? [] : SCAN_BATCH_COMPLETED.split(",");
+      if (completed.length >= plan.length || completed.some((key, k) => plan[k]?.key !== key))
+        throw new Error("Completed batch cases must be a strict prefix of the five-round plan");
+      for (const { round, scanTargetMiB } of plan.slice(completed.length))
+        await measure(
+          `cold scan target ${String(scanTargetMiB)} MiB round ${String(round)}`,
+          true,
+          false,
+          { ...options, scanTargetMiB },
+        );
+    } else if (FRAME_COPY_COMPARE || SCAN_RANGE_COMPARE || SCAN_IO_COMPARE || SCAN_OWNED_COMPARE) {
       const options = {
         ...base,
         mode: "scan" as const,
@@ -763,10 +809,20 @@ test.describe("rebuild core export on OPFS (bench)", () => {
               "bench stand-in for future executor frame assembly; real TableScan/ResultChannel/owner transfer policy/MessagePort credits; fixture descriptors exclude SQL/catalog/root loading",
             cpuSamplingIntervalUs: SCAN_PROFILE ? 500 : 1_000_000,
             rounds:
-              FRAME_COPY_COMPARE || SCAN_RANGE_COMPARE || SCAN_IO_COMPARE || SCAN_OWNED_COMPARE
+              FRAME_COPY_COMPARE ||
+              SCAN_RANGE_COMPARE ||
+              SCAN_IO_COMPARE ||
+              SCAN_OWNED_COMPARE ||
+              SCAN_BATCH_COMPARE
                 ? 5
                 : Number(process.env.MINNOW_EXPORT_SCAN_ROUNDS ?? (SCAN_PROFILE ? 1 : 5)),
             scanProfile: SCAN_PROFILE,
+            ...(SCAN_BATCH_COMPARE
+              ? {
+                  scanBatchCompletedPrefix: SCAN_BATCH_COMPLETED,
+                  scanBatchRecordedCases: results.map((r) => r.label),
+                }
+              : {}),
             ...(SCAN_OWNED_COMPARE
               ? {
                   scanOwnedComparison:
@@ -777,6 +833,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
               ? { scanIOComparison: "cached per-batch vs coalesced one-pass 64 MiB row windows" }
               : {}),
             coldOnly:
+              SCAN_BATCH_COMPARE ||
               FRAME_COPY_COMPARE ||
               SCAN_RANGE_COMPARE ||
               SCAN_IO_COMPARE ||

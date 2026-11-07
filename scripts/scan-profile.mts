@@ -23,7 +23,10 @@ function category(f: Frame): string | null {
   if (["(idle)", "(program)", "(root)"].includes(n)) return "idle/program/unattributed";
   if (!u && n === "read") return "native read: CPU/wait inseparable";
   if (!u && n === "postMessage") return "structured clone / transfer";
-  if (u.includes("/owner-frames.ts")) return "bench frame adapter";
+  if (u.includes("/owner-frames.ts"))
+    return ["flatBytes", "validityBytes", "textFlattenBytes"].includes(n)
+      ? "bench frame sizing"
+      : "bench frame building / ownership copies";
   if (u.includes("/exec/result.ts")) return "ResultChannel / frameByteLength";
   if (u.includes("/owner/frame.ts")) return "owner transfer-list policy";
   if (/\/(pushdown|filter|column-target)\.ts/u.test(u)) {

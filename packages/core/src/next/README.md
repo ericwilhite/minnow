@@ -604,6 +604,15 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     memory, with fresh caches, untimed warmup GC, and CPU/wall/read/charge measurements. Reported
     scan assembly/post/credit and inclusive `next()` timers can overlap; they are not exclusive
     phase shares. Raw scan statistics reveal dense/gather batches, splits and storage calls.
+  - `MINNOW_EXPORT_SCAN_BATCH_COMPARE=1` measures 1/2/3 MiB decoded targets over five cold
+    interleaved rounds, holding the row limit (2,048), borrowed outputs, read window and owner
+    credits (4 MiB) fixed. This experiment also changes frame size because the labelled adapter
+    owns one compact batch per frame. Actual frame/transfer counts, maximum frame bytes and
+    outstanding credits are recorded. `scripts/scan-batch-bench.mts` isolates the same targets
+    over memory with real query/result grants and in-process transfers (no MessagePort IPC).
+    The core target stays 1 MiB: neither the isolated nor whole CPU medians beat their full
+    spreads in the recorded investigation. A timed-out foreground campaign can resume an
+    exact completed-case prefix; combine both logs and retain every completed pass.
   - Sparse CDP profiles (one-second sample interval) bracket setup-excluded worker CPU, not
     hotspots. Profile-count checks refuse missing brackets. CPU tick/notification latency
     remains. Both modes verify zero governor/cache/pool charge after worker close. A final

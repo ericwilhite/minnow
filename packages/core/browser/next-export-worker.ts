@@ -64,6 +64,7 @@ export type ExportRequest =
       readonly mode?: "pages" | "scan";
       readonly frameCopy?: "baseline" | "candidate";
       readonly scanRange?: "baseline" | "candidate";
+      readonly scanTargetMiB?: 1 | 2 | 3;
       readonly scanIO?: "batch" | "window";
       readonly scanOutput?: "borrowed" | "flat" | "dictionary";
       readonly resultPort?: MessagePort;
@@ -294,6 +295,9 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
         ? await scanExport(space, request.groups, {
             budget: grant,
             resultBudget: resultGrant,
+            ...(request.scanTargetMiB === undefined
+              ? {}
+              : { targetBytes: request.scanTargetMiB * MiB }),
             readWindowBytes: request.scanIO === "batch" ? 0 : (request.windowMiB ?? 64) * MiB,
             transferOutputs:
               request.scanOutput === "dictionary" ? "dictionary" : request.scanOutput === "flat",

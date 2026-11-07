@@ -13,6 +13,7 @@ import type {
 import type { ByteBudget, ExtentReader } from "../../../packages/core/src/next/storage/extents.js";
 import { chunkReads } from "../../../packages/core/src/next/exec/scan.js";
 import { TableScan, type ScanStats } from "../../../packages/core/src/next/exec/table-scan.js";
+import { BATCH_TARGET_BYTES } from "../../../packages/core/src/next/vector/vector.js";
 import { OutputArena } from "../../../packages/core/src/next/exec/kernels/vectors.js";
 import {
   drive,
@@ -35,6 +36,10 @@ export interface ScanExportStats {
     samples: Array<Record<string, number>>;
   };
   readonly frames: number;
+  readonly batchTargetBytes: number;
+  readonly maxBatchRows: number;
+  readonly maxFrameBytes: number;
+  readonly maxOutstandingBytes: number;
   readonly flattenedDictionaryColumns: number;
   readonly dictionaryBytes: number;
   readonly wireBytes: number;
@@ -97,6 +102,7 @@ export async function scanExport(
     budget: ByteBudget;
     resultBudget: ByteBudget;
     port: MessagePort;
+    targetBytes?: number;
     readWindowBytes?: number;
     transferOutputs?: boolean | "dictionary";
     /** Bench-only charged counters supplied by the worker, sampled at frame boundaries. */
@@ -118,6 +124,9 @@ export async function scanExport(
   const posted = new Map<number, ResultFrame>();
   let rows = 0,
     frames = 0,
+    maxBatchRows = 0,
+    maxFrameBytes = 0,
+    maxOutstandingBytes = 0,
     wireBytes = 0,
     transferredBuffers = 0,
     nextMs = 0,
@@ -132,6 +141,7 @@ export async function scanExport(
     table,
     pages: space,
     reads: chunkReads,
+    ...(options.targetBytes === undefined ? {} : { targetBytes: options.targetBytes }),
     readWindowBytes: options.readWindowBytes ?? 64 * 1024 * 1024,
     transferOutputs: options.transferOutputs ?? false,
     outputBudget: options.resultBudget,
@@ -239,7 +249,9 @@ export async function scanExport(
     push(batch, transfer) {
       const before = performance.now();
       try {
+        maxBatchRows = Math.max(maxBatchRows, batch.length);
         const readiness = channel.offer(assembler.offer(batch, transfer));
+        maxOutstandingBytes = Math.max(maxOutstandingBytes, channel.outstandingBytes);
         sample();
         return readiness;
       } finally {
@@ -263,6 +275,7 @@ export async function scanExport(
       highest = frame.payload.sequence;
       rows += frame.payload.rowCount;
       frames++;
+      maxFrameBytes = Math.max(maxFrameBytes, frame.byteLength);
       wireBytes += frame.byteLength;
       const transfer = transferFor(frame.transfer);
       transferredBuffers += transfer.length;
@@ -293,6 +306,10 @@ export async function scanExport(
         flattenedDictionaryColumns: assembler.flattenedColumns,
         dictionaryBytes: assembler.dictionaryBytes,
         frames,
+        batchTargetBytes: options.targetBytes ?? BATCH_TARGET_BYTES,
+        maxBatchRows,
+        maxFrameBytes,
+        maxOutstandingBytes,
         wireBytes,
         transferredBuffers,
         nextMs,

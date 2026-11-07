@@ -1220,6 +1220,20 @@ the reader factory supports shared loads; `readWindowBytes: 0` opts out. Residen
 deletions retain selective reads, and a refused window is released and reduced before falling
 back to ordinary batch loading.
 
+`MINNOW_EXPORT_SCAN_BATCH_COMPARE=1 npm run benchmark:export` compares 1, 2 and 3 MiB
+decoded-byte targets in five interleaved cold rounds. This is a bench experiment: the core's
+default target remains 1 MiB. Every variant keeps the 2,048-row maximum, borrowed vectors,
+64 MiB read windows and real owner 4 MiB credits. Reports include the actual batch target,
+frame count, largest batch/frame and peak outstanding credit bytes, and assert the requested
+target reached the worker. `scripts/scan-batch-bench.mts` isolates the same target choices over
+a memory-backed cache with real query/result grants and in-process structured-clone transfers;
+it excludes MessagePort IPC. Setup and warmup GC are outside CPU/wall timings. Both experiments
+keep the labelled bench frame builder and current owner wire policy. If a foreground command
+hits its time limit, `MINNOW_EXPORT_SCAN_BATCH_COMPLETED` accepts only an exact comma-separated
+prefix of completed `round:targetMiB` cases (for example `0:1,0:2,0:3`). The next command runs
+only the remaining cases and records the prefix. Combine both logs and keep all five rounds;
+a continuation's report alone is a partial campaign, not a five-round comparison.
+
 The rebuild's opt-in `MINNOW_EXPORT_SCAN_OWNED_COMPARE=1 npm run benchmark:export` compares
 borrowed scan output copied into frames with dedicated output decoded into transferable
 buffers while retaining dictionary codes. It uses the same labelled bench adapter, real result credits and owner transfer policy.

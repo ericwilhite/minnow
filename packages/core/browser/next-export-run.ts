@@ -147,6 +147,7 @@ export async function exportPass(options: {
   readonly mode?: "pages" | "scan";
   readonly frameCopy?: "baseline" | "candidate";
   readonly scanRange?: "baseline" | "candidate";
+  readonly scanTargetMiB?: 1 | 2 | 3;
   readonly scanIO?: "batch" | "window";
   readonly scanOutput?: "borrowed" | "flat" | "dictionary";
 }): Promise<ExportPass[]> {
@@ -169,6 +170,7 @@ export async function exportPass(options: {
     ...(options.mode === undefined ? {} : { mode: options.mode }),
     ...(options.frameCopy === undefined ? {} : { frameCopy: options.frameCopy }),
     ...(options.scanRange === undefined ? {} : { scanRange: options.scanRange }),
+    ...(options.scanTargetMiB === undefined ? {} : { scanTargetMiB: options.scanTargetMiB }),
     ...(options.scanIO === undefined ? {} : { scanIO: options.scanIO }),
     ...(options.scanOutput === undefined ? {} : { scanOutput: options.scanOutput }),
     ...(options.groupDepth === undefined ? {} : { groupDepth: options.groupDepth }),
