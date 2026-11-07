@@ -32,9 +32,11 @@ const SQL_ENGINE_MODULES =
 // Each budget is the current measurement plus a little headroom; a change that moves one updates
 // the measurement beside it, and the history lives in git.
 
-// B7 typed frame metadata/validation adds 1,181 raw bytes over reviewed B6 base 35cc8c89.
-// Explicitly rebaseline the three engine raw caps by 1 KiB and gzip caps by 0.5 KiB;
-// keep adapter isolation and every tree-shaking assertion unchanged.
+// Against main f452eb82, the shared frame parser adds 3,353 raw bytes per engine entry:
+// query.js +3,149, frame-offsets.js +158, query-identity.js +46. No next/ or test input is
+// reachable (library-size-audit.mts). Exact literals, signed/rounded offsets and bound
+// validation share the R19 parser with typed compilation; client output is unchanged.
+// Explicit caps over main: raw +3.25 KiB, gzip +1.25 KiB; isolation assertions stay unchanged.
 // Everything the main entry exports, bundled: the in-thread engine.
 // Integrated release front end and lowering metadata: 1,172,225 bytes raw / 351,069 bytes gzip.
 const COMPLETE_ENTRY_RAW_BUDGET = 1145 * 1024;

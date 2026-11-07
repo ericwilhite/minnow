@@ -94,11 +94,20 @@ list below collects them.
   retain TRUE-only keys. In the rebuild executor, frame-offset checks run when the window starts; RANGE sign checks
   require a non-null key comparison, matching PostgreSQL on empty and null-only inputs.
   These modules remain unexported.
-  Shared compiler guards and metadata add 297 gzip bytes over the reviewed lowering base. Worker plus client
-  measures 570,953 bytes; its development size budget moves explicitly from 557.5 to 558.0 KiB.
-  The old cap is exceeded by 73 bytes. Main, OPFS and IndexedDB worker bundles each add
-  1,181 raw bytes; their development raw caps move by 1 KiB and gzip caps by 0.5 KiB.
-  Adapter isolation and tree-shaking checks are unchanged.
+  The published shared compiler grows to support signed and rounded frame offsets, bound-kind
+  validation, and exact frame-literal identity through CTE copies. The same parser also supplies
+  the private typed compiler, including native FULL/USING handling; keeping it shared preserves
+  one SQL grammar and expression-identity authority.
+  A module audit against main `f452eb82` attributes all 3,353 added raw bytes to
+  `engine/query.js` (+3,149), `engine/frame-offsets.js` (+158), and
+  `engine/query-identity.js` (+46). No `next/` or test module reaches the published bundles;
+  the client is byte-identical. The generic worker grows by 983 gzip bytes, and worker plus
+  client measures 570,953 bytes against main's 569,970. Its development size cap moves from
+  556.75 to 558 KiB: the old cap is exceeded by 841 bytes, with 439 bytes left under the new cap.
+  Relative to that main revision, the three engine-entry raw caps move by 3.25 KiB and gzip caps
+  by 1.25 KiB. Adapter isolation and tree-shaking checks are unchanged. The audit is reproducible
+  after building with `node scripts/library-size-audit.mts --base=f452eb82`; it freezes the whole
+  published source family and verifies current source emission against the built bundle first.
 - SQL examples cast plain-number aggregates to `NUMERIC` before `ROUND(value, digits)` so
   they use PostgreSQL's supported overload and return exact decimal text.
 
