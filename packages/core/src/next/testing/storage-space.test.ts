@@ -26,7 +26,10 @@ describe("extent space under the memory governor", () => {
       budget: startup,
       registerCache: (cache) => governor.registerCache(cache),
     });
-    expect(governor.usedBytes).toBe(FIXED_CACHE_BYTES);
+    // The space's retained metadata (R25) is charged for its lifetime beside the fixed cache; the
+    // startup grant still holds what it reserved for that metadata before the transfer.
+    expect(space.stats.retainedBytes).toBeGreaterThan(0);
+    expect(governor.usedBytes).toBe(FIXED_CACHE_BYTES + space.stats.retainedBytes + startup.held);
 
     const writer = space.beginWrite("data");
     const blobs: BlobRef[] = [];
@@ -42,6 +45,7 @@ describe("extent space under the memory governor", () => {
     if (query === null) throw new Error("no query grant");
     const accounted = () =>
       FIXED_CACHE_BYTES +
+      space.stats.retainedBytes +
       (space.stats.cache.residentBytes - space.stats.cache.pinnedBytes) +
       ENTRY_OVERHEAD * cachedEntries() +
       query.held +

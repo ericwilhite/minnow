@@ -472,6 +472,8 @@ export interface SpaceStats {
   readonly releasingBytes: number;
   /** Builders `seal` had to relocate after an `extend` could not grow in place. */
   readonly relocations: number;
+  /** Charged for the space's retained metadata (free runs, retirements; R25 lifetime admission). */
+  readonly retainedBytes: number;
   readonly cache: {
     readonly residentBytes: number;
     /** Idle pooled one-pass buffers (`ReadOptions.reuseBuffers`), charged to the cache. */

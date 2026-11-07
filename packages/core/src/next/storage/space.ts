@@ -515,6 +515,7 @@ class Space implements ExtentSpace {
       waitingBytes: retired,
       releasingBytes: this.#releasingBytes,
       relocations: this.#relocations,
+      retainedBytes: this.retainedMemory.bytes,
       pinCount: this.#ledger.pinCount,
       oldestPin: this.#ledger.oldestPin,
       cache: this.#cache.stats,

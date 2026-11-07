@@ -34,6 +34,11 @@ export class RetainedMemory {
     return 0;
   }
 
+  /** Bytes currently reserved for the space's retained metadata (exact; for accounting checks). */
+  get bytes(): number {
+    return this.#bytes;
+  }
+
   reserve(bytes: number): void {
     if (this.#closed) throw new TypeError("Retained space memory is closed");
     const accepted =
