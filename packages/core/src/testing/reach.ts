@@ -411,3 +411,32 @@ export const ROW_LOCK_GRAPH_STATES = [
   "nested scope counted",
   "nested scope discarded",
 ] as const;
+
+/** PostgreSQL variable.c admission guards are per attribute and preserve idempotent isolation. */
+export const TRANSACTION_ATTRIBUTE_STATES = [
+  "begin modes",
+  "set modes",
+  "before query",
+  "after query",
+  "top level",
+  "savepoint",
+  "release",
+  "rollback to",
+  "same isolation",
+  "changed isolation",
+  "same deferrable",
+  "changed deferrable",
+  "same access",
+  "changed access",
+  "earlier write",
+  "execute",
+  "compiled",
+  "accepted",
+  "refused",
+  "duplicate item",
+  "mixed attributes",
+  "isolation query refusal",
+  "isolation savepoint refusal",
+  "deferrable query refusal",
+  "deferrable savepoint refusal",
+] as const;

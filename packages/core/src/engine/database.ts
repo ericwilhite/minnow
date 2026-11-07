@@ -2601,7 +2601,9 @@ interface OpenStatementTransaction {
   }>;
   /** BEGIN … READ ONLY or SET TRANSACTION READ ONLY: no write may run (PostgreSQL's 25006). */
   readOnly: boolean;
-  /** A statement has run: READ WRITE can no longer be set (PostgreSQL's 25001). */
+  /** Requested level for PG admission; execution still uses the engine's fixed snapshot. */
+  isolation: Extract<TransactionMode, { kind: "isolation" }>["level"];
+  /** A snapshot-taking statement has run: mode changes follow PostgreSQL's 25001 rules. */
   queried: boolean;
 }
 
@@ -14040,24 +14042,46 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     }
     const current = this.#openTransaction;
     if (statement.kind === "set" && statement.transactionModes !== undefined) {
-      // SET TRANSACTION changes the open transaction (outside one it has no effect, as in
-      // PostgreSQL, which only warns). READ ONLY may be set at any point; READ WRITE only before
-      // the transaction's first statement.
+      // Outside an open transaction PostgreSQL only warns; no mode survives into BEGIN.
       if (current !== undefined) {
-        // Each item observes the preceding items, not just the final access value. For
-        // example, READ ONLY followed by READ WRITE may become invalid inside a savepoint.
+        // Validate each item against prior items before applying any final value. The
+        // attributes have different guards (PostgreSQL variable.c), including idempotence.
         let readOnly = current.readOnly;
+        let isolation = current.isolation;
         for (const mode of statement.transactionModes) {
-          if (mode.kind !== "access") continue;
-          if (!mode.readOnly && readOnly && current.savepoints.length > 0)
-            throw new TypeError(
-              "cannot set transaction read-write mode inside a read-only transaction",
-            );
-          if (!mode.readOnly && readOnly && current.queried)
-            throw new TypeError("transaction read-write mode must be set before any query");
-          readOnly = mode.readOnly;
+          if (mode.kind === "access") {
+            if (!mode.readOnly && readOnly && current.savepoints.length > 0)
+              throw new TypeError(
+                "cannot set transaction read-write mode inside a read-only transaction",
+              );
+            if (!mode.readOnly && readOnly && current.queried)
+              throw new TypeError("transaction read-write mode must be set before any query");
+            readOnly = mode.readOnly;
+          } else if (mode.kind === "isolation") {
+            if (mode.level !== isolation) {
+              if (current.queried)
+                throw new TypeError(
+                  "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+                );
+              if (current.savepoints.length > 0)
+                throw new TypeError(
+                  "SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction",
+                );
+            }
+            isolation = mode.level;
+          } else {
+            if (current.savepoints.length > 0)
+              throw new TypeError(
+                "SET TRANSACTION [NOT] DEFERRABLE cannot be called within a subtransaction",
+              );
+            if (current.queried)
+              throw new TypeError(
+                "SET TRANSACTION [NOT] DEFERRABLE must be called before any query",
+              );
+          }
         }
         current.readOnly = readOnly;
+        current.isolation = isolation;
       }
       return { kind: "set", action: statement.action, name: statement.name };
     }
@@ -14499,6 +14523,8 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         failStart(error);
       });
       const session = await opened;
+      let isolation: OpenStatementTransaction["isolation"] = "read committed";
+      for (const mode of modes ?? []) if (mode.kind === "isolation") isolation = mode.level;
       const state = {
         session,
         settle,
@@ -14506,6 +14532,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
         activeAt: dateMilliseconds(this.#now()),
         savepoints: [],
         readOnly: accessMode(modes) === true,
+        isolation,
         queried: false,
         finished: finished.then(
           ({ version }) => ({ version }),

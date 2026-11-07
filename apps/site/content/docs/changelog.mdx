@@ -10,6 +10,16 @@ compatibility policy and release process.
 
 ## Unreleased
 
+`SET TRANSACTION` now checks isolation and deferrability as well as access mode,
+through SQL and compiled commands. Changing isolation after a query or inside a
+savepoint fails with 25001; setting the already-requested level again is allowed.
+Both DEFERRABLE values are refused in either context, including unchanged values.
+Items are checked in written order and valid changes preserve earlier writes.
+The requested level defaults to READ COMMITTED. Execution still uses the engine's
+fixed snapshot for all accepted weaker levels; SERIALIZABLE remains unsupported.
+**Migration:** set changed isolation and DEFERRABLE before queries and savepoints.
+There is no stored-format change and no public type change.
+
 READ ONLY admission now counts a locking CTE referenced only by another CTE that the final
 SELECT does not use, as PostgreSQL does. Chains and locking views contribute their strongest
 intent even when the final query has a weaker clause. `CompiledQuery.rowLockingCtes` is an
@@ -108,7 +118,7 @@ b.id = a.id)` was false when no row of `b` matched. An aggregate without `GROUP 
 - **Transaction statements follow PostgreSQL's grammar.** `BEGIN`, `START TRANSACTION` and
   `SET TRANSACTION` accepted their keywords in any order and ignored anything else, so
   `BEGIN ONLY READ` and `BEGIN 'READ ONLY'` ran. They now fail with `syntax error at or near …`.
-  Modes may be separated by spaces or commas. Access-mode items are checked in written
+  Modes may be separated by spaces or commas. Mode items are checked in written
   order; if every item is valid, the last mode of each kind applies.
   `SET SESSION CHARACTERISTICS AS TRANSACTION` is refused with a message that says so.
 - **A FROM clause that names a source twice fails earlier, with PostgreSQL's message.**

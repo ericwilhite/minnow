@@ -290,6 +290,10 @@ machines: https://minnowdb.com/llms.txt
   `"2026-01-02T03:04:05+00:00"` against `"2026-01-02T03:04:05"` in JSON. Both kinds hold the same
   UTC instant and compare alike. INTERVAL values read and render as `1 day 02:00:00`. Query
   results return datetimes as `Date` objects; use those rather than parsing SQL text.
+- Transaction modes use PostgreSQL's admission rules: a changed isolation level requires
+  no earlier query and no savepoint; the same requested level is always allowed.
+  `[NOT] DEFERRABLE` requires no earlier query and no savepoint even when unchanged.
+  Accepted weaker isolation levels still execute with the engine's fixed snapshot.
 - Unsupported: keyless `UPDATE`/`DELETE`, `GRANT`, `SERIALIZABLE` isolation, `LOCK TABLE`, DDL
   inside `BEGIN … COMMIT`, several statements in one call, range-correlated LATERAL
   grouping/order/limit, correlated JSON_TABLE documents, array slices and multidimensional access,

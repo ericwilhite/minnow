@@ -326,7 +326,7 @@ Statements inside see each other — a `SELECT` after the `UPDATE` reads the new
 `ROLLBACK` (or `ABORT`) discards the lot (`END` commits, as `COMMIT` does). `BEGIN` and
 `SET TRANSACTION` accept `READ ONLY`, `READ WRITE`, `[NOT] DEFERRABLE`, and `ISOLATION LEVEL`
 below `SERIALIZABLE`, in PostgreSQL's grammar: modes are separated by spaces or commas. Each
-access-mode item is checked in written order; when all are valid, the last one of each
+mode item is checked in written order; when all are valid, the last one of each
 kind applies. In a savepoint that starts READ WRITE, `SET TRANSACTION READ ONLY, READ WRITE`
 fails with 25001, while `READ WRITE, READ ONLY` succeeds. If the transaction is already READ
 ONLY, both lists fail. Every transaction reads one snapshot and commits atomically, which
@@ -342,11 +342,19 @@ subscription's runs (which are not statements of the transaction, so they never 
 `SET TRANSACTION READ ONLY` makes the open transaction read-only at any point. Switching a
 read-only transaction back with `SET TRANSACTION READ WRITE` is refused once the transaction
 has run a statement (reads count, whichever method ran them), and always inside a savepoint.
-Setting `READ WRITE` on a transaction that is already read-write is allowed. As in PostgreSQL, a
-mode set after `SAVEPOINT` lasts only until that savepoint ends: `ROLLBACK TO` and `RELEASE`
+Setting `READ WRITE` on a transaction that is already read-write is allowed. As in PostgreSQL,
+`READ ONLY` set after `SAVEPOINT` lasts only until that savepoint ends: `ROLLBACK TO` and `RELEASE`
 both return to the mode the transaction had when the savepoint was set. Inserts and updates
 through the table methods (`insert`, `update`, …) are not SQL statements of the transaction.
 They wait for it to finish and then commit on their own.
+
+Isolation-level changes are allowed only before the first query and outside a savepoint;
+setting the already-requested isolation level again is allowed at any time. The requested
+level starts at READ COMMITTED unless BEGIN supplies one. Both `SET TRANSACTION DEFERRABLE`
+and `NOT DEFERRABLE` are refused after the first query or inside a savepoint, even when the
+value is unchanged. These admission rules follow PostgreSQL; execution still uses the same
+fixed snapshot for every accepted isolation level. Reads and writes both count as queries
+for these rules.
 
 Other session settings — `SET name TO value`, `SET LOCAL …`, `RESET name` — are accepted and
 ignored, since an embedded single-session engine has nothing to configure by them; `SET TIME ZONE`
