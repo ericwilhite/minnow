@@ -223,7 +223,12 @@ function checkWindowCall(call: WindowCall, orderBy: readonly SortKey[], where: s
       fail(where, "RANGE with an offset needs exactly one ORDER BY key");
     const ordered = key.expr.type.kind;
     const temporal = ordered === "timestamp" || ordered === "date" || ordered === "time";
-    if (!(temporal ? offset.type.kind === "interval" : sameBase(offset.type, key.expr.type)))
+    // PG btree support 3: float4 keys take float8 offsets; int2/int4 keys also take int8.
+    const compatible =
+      sameBase(offset.type, key.expr.type) ||
+      (ordered === "float32" && offset.type.kind === "float64") ||
+      (ordered === "int32" && offset.type.kind === "int64");
+    if (!(temporal ? offset.type.kind === "interval" : compatible))
       fail(where, `RANGE offset ${offset.type.kind} over a ${ordered} key`);
   }
 }

@@ -887,3 +887,18 @@ export const WINDOW_OFFSET_STARTUP_REACH = [
   "navigation",
   "released",
 ] as const;
+
+/** Cross-width btree in_range overloads, with exact small COUNT outputs against PostgreSQL. */
+export const REFERENCE_RANGE_TYPES_REACH = [
+  "SMALLINT",
+  "INTEGER",
+  "REAL",
+  "literal",
+  "parameter",
+  "ASC",
+  "DESC",
+  "FIRST",
+  "LAST",
+  "NULL key",
+  "rows match",
+] as const;

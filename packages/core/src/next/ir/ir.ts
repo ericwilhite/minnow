@@ -162,6 +162,7 @@ export interface AggregateCall {
 export interface WindowFrameBound {
   readonly kind:
     "unbounded-preceding" | "preceding" | "current-row" | "following" | "unbounded-following";
+  /** ROWS/GROUPS use int8; RANGE uses its btree in_range offset type, possibly wider than the key. */
   readonly offset: ScalarExpr | null;
 }
 

@@ -157,6 +157,22 @@ describe("checkPlan checks window calls and work tables", () => {
     expect(check(misplaced)).toThrow("frame bound current-row offset");
   });
 
+  it("rejects unrelated RANGE offset families instead of accepting every cross-width type", () => {
+    const { plan, check } = setup();
+    for (const type of [{ kind: "bool" }, { kind: "text" }, { kind: "float64" }] as const) {
+      const malformed = plan("SELECT count(*)OVER(ORDER BY id RANGE 1 PRECEDING)AS n FROM b");
+      const [call] = windowOf(malformed);
+      if (call?.frame == null) throw new Error("Expected a frame");
+      call.frame = {
+        ...call.frame,
+        start: { kind: "preceding", offset: { op: "param", slot: 0, type } },
+      };
+      (malformed as Mutable<PhysicalPlan>).parameters = [type];
+      (malformed as Mutable<PhysicalPlan>).placeholderCount = 1;
+      expect(check(malformed)).toThrow("RANGE offset " + type.kind + " over a int32 key");
+    }
+  });
+
   it("rejects a window call outside its signature", () => {
     const { plan, check } = setup();
     const ranked = plan("SELECT id, row_number() OVER (ORDER BY id) AS r FROM b");
