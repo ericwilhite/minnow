@@ -330,6 +330,7 @@ import {
   mergeJoinColumns,
   expandSourceColumnAliases,
   expandViewSources,
+  expandRowLockCteViews,
   forEachBlockExpression,
   forEachNestedBlock,
   planContainsFts,
@@ -2633,7 +2634,8 @@ function admitToTransaction(
 ): void {
   if (open.readOnly) {
     if ("write" in statement) throw readOnlyTransactionError(writeCommand(statement.write));
-    if (statement.read.rowLocking !== undefined)
+    // CTE graphs need catalog/view analysis before their strongest lock is known.
+    if (statement.read.rowLocking !== undefined && statement.read.rowLockingCtes === undefined)
       throw readOnlyTransactionError(`SELECT FOR ${statement.read.rowLocking}`);
   }
   open.queried = true;
@@ -6303,6 +6305,33 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     this.#cachePut(resultKey, markQueryResultExternal(copyQueryResult(result)), bytes);
   }
 
+  /** One cached resolver for execution expansion and admission-only CTE bodies. */
+  #rowLockViewBody(views: ReadonlyMap<string, string>, bodies: Map<string, CompiledQuery>) {
+    return (name: string): CompiledQuery | undefined => {
+      const sql = views.get(name);
+      if (sql === undefined) return undefined;
+      const cached = bodies.get(name);
+      if (cached !== undefined) return cached;
+      const compiled = this.#queries.compile(sql);
+      bodies.set(name, compiled);
+      return compiled;
+    };
+  }
+
+  /** Check retained bodies before a transaction's point-read or cached-plan shortcut. */
+  async #admitCteRowLocks(plan: CompiledQuery): Promise<void> {
+    if (this.#openTransaction?.readOnly !== true || plan.rowLockingCtes === undefined) return;
+    const { views } = await this.#catalogFacts();
+    const bodies = new Map<string, CompiledQuery>();
+    const viewBody = this.#rowLockViewBody(views, bodies);
+    const lock = expandedRowLock(
+      plan,
+      bodies.values(),
+      views.size === 0 ? undefined : (body) => expandRowLockCteViews(body, viewBody),
+    );
+    if (lock !== undefined) throw readOnlyTransactionError(`SELECT FOR ${lock}`);
+  }
+
   /**
    * Applies the rewrites that need the catalog rather than the statement alone: a view becomes
    * the query it stands for (F031-02), `FROM t AS y(a, b)` renames the table's columns
@@ -6346,21 +6375,16 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     rewritten = expandRowReferences(rewritten, (name) => catalogColumns.get(name));
     const readsViews = views.size > 0 && planReadsViews(rewritten, (name) => views.has(name));
     const bodies = new Map<string, CompiledQuery>();
-    if (readsViews) {
-      rewritten = expandViewSources(rewritten, (name) => {
-        const sql = views.get(name);
-        if (sql === undefined) return undefined;
-        const cached = bodies.get(name);
-        if (cached !== undefined) return cached;
-        const compiled = this.#queries.compile(sql);
-        bodies.set(name, compiled);
-        return compiled;
-      });
-    }
+    const viewBody = this.#rowLockViewBody(views, bodies);
+    if (readsViews) rewritten = expandViewSources(rewritten, viewBody);
     // A read-only transaction refuses a row lock wherever it is written: in the statement, or in
     // a view it reads, at any depth (PostgreSQL checks the planned query, views expanded).
     if (this.#openTransaction?.readOnly === true) {
-      const strongest = expandedRowLock(plan, bodies.values());
+      const strongest = expandedRowLock(
+        plan,
+        bodies.values(),
+        views.size === 0 ? undefined : (body) => expandRowLockCteViews(body, viewBody),
+      );
       if (strongest !== undefined) throw readOnlyTransactionError(`SELECT FOR ${strongest}`);
     }
     if (planReadsTable(rewritten, (name) => domains.has(name) || types.has(name))) {
@@ -11102,6 +11126,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
       ...operations,
       queryPlan: (plan) =>
         this.#withReadReservation(async () => {
+          if (plan.rowLockingCtes !== undefined) await this.#admitCteRowLocks(plan);
           // Before this scope stages anything, its view is exactly the catalog probe captured
           // by beginDeferred. Reuse the ordinary current-version pipeline and its compact
           // catalog/lease caches; once work is staged, switch to the overlay pipeline below.
@@ -11307,6 +11332,7 @@ export class MinnowDatabase<TSchema extends AnySchema = UntypedSchema> {
     options = this.#effectiveQueryOptions(options);
     throwIfAborted(options.signal);
     const compiled = this.#queries.compile(sql);
+    if (compiled.rowLockingCtes !== undefined) await this.#admitCteRowLocks(compiled);
     // A keyed lookup takes the point-read path under the scope's overlay as it would outside
     // one: the staged segments join the visible set, and the row's history is replayed for the
     // one key. Without this, every keyed read inside a long scope scanned everything the scope

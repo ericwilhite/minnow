@@ -10,14 +10,21 @@ compatibility policy and release process.
 
 ## Unreleased
 
+READ ONLY admission now counts a locking CTE referenced only by another CTE that the final
+SELECT does not use, as PostgreSQL does. Chains and locking views contribute their strongest
+intent even when the final query has a weaker clause. `CompiledQuery.rowLockingCtes` is an
+optional additive field retaining these admission-only bodies for catalog/view expansion
+and compiled-plan transport; it does not add execution sources. Only a CTE with zero
+references in a planned query scope is omitted. No stored-format change.
+
 SET TRANSACTION now checks each access-mode item in written order, including through
 compiled `runStatement`. A READ ONLY item can make a later READ WRITE item invalid (25001)
 inside a savepoint or after a query, even when the final value would have matched the old
 mode. Specify only the final desired access mode before queries and savepoints. Compiled
 mode arrays retain their existing ordered shape. No stored-format change.
 
-A locking clause in an unused CTE no longer causes a read-only query to fail. A referenced
-CTE's own clause still counts. Parsing and view expansion share the same lock-target and
+A CTE with zero references contributes no locking intent. A referenced
+CTE's own clause still counts, including a reference from a CTE the final SELECT does not use. Parsing and view expansion share the same lock-target and
 strongest-lock rules with the internal rebuild lowerer. No stored-format change.
 
 Not yet released. Some SQL that used to run now fails, and some now answers differently, so the

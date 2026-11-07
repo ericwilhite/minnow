@@ -391,3 +391,23 @@ export const TRANSACTION_MODE_ORDER_STATES = [
   "refused",
   "duplicates",
 ] as const;
+
+/** PostgreSQL CTE refcounts count unused referrers, but respect the enclosing query scope. */
+export const ROW_LOCK_GRAPH_STATES = [
+  "referenced by unused",
+  "unreferenced",
+  "direct",
+  "view",
+  "nested view",
+  "view graph",
+  "materialized",
+  "not materialized",
+  "chain",
+  "multiple references",
+  "strongest final clause",
+  "point read",
+  "scalar view",
+  "dead expression",
+  "nested scope counted",
+  "nested scope discarded",
+] as const;

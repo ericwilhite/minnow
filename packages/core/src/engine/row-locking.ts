@@ -35,12 +35,38 @@ export function sourceLocksRelation(
   return source.table !== DUAL_TABLE;
 }
 
-/** View expansion may add clauses absent from the caller's SQL, including through other views. */
+/** Include refcounted CTE bodies even when their referrers produce no execution rows.
+ * `bodies` is the live view-body map's values: expanding a retained CTE can discover more views.
+ */
 export function expandedRowLock(
   query: CompiledQuery,
   bodies: Iterable<CompiledQuery>,
+  expandCte?: (body: CompiledQuery) => RowLocking | undefined,
 ): RowLocking | undefined {
-  return strongestRowLock([query.rowLocking, ...Array.from(bodies, (body) => body.rowLocking)]);
+  let lock: RowLocking | undefined;
+  const seen = new Set<CompiledQuery>();
+  const visit = (body: CompiledQuery, expand = true): void => {
+    if (seen.has(body)) return;
+    seen.add(body);
+    if (expand) lock = strongestRowLock([lock, expandCte?.(body)]);
+    lock = strongestRowLock([lock, body.rowLocking]);
+    for (const cte of body.rowLockingCtes ?? []) {
+      if (seen.has(cte)) continue;
+      visit(cte);
+    }
+  };
+  visit(query, false);
+  for (const body of bodies) visit(body);
+  return lock;
+}
+
+/** Admission-only data stays on the serializable plan, outside execution's source tree. */
+export function withRowLockCtes<T extends CompiledQuery>(
+  query: T,
+  ctes: readonly CompiledQuery[],
+): T {
+  if (ctes.length > 0) query.rowLockingCtes = ctes;
+  return withRowLock(query, expandedRowLock(query, []));
 }
 
 export function withRowLock<T extends CompiledQuery>(query: T, lock: RowLocking | undefined): T {

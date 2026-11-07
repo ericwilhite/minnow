@@ -219,7 +219,8 @@ describe("published core tarball", () => {
       // 1,018,250 with PostgreSQL's name, argument and comment errors (1,017,725 measured), then
       // 1,019,500 for the 0.20.0 SQL fixes (1,019,104 measured);
       // ratchets, not targets.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_019_500);
+      // Refcounted CTEs and admission before point reads: 1,020,112 packed bytes.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_020_500);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");

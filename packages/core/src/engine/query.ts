@@ -1,4 +1,9 @@
-import { sourceLocksRelation, strongestRowLock, withRowLock } from "./row-locking.js";
+import {
+  sourceLocksRelation,
+  strongestRowLock,
+  withRowLock,
+  withRowLockCtes,
+} from "./row-locking.js";
 import { checkedInteger, checkedSum } from "./integer-exactness.js";
 import { castSqlValue, datetimeText } from "./sql-casts.js";
 import { parseJson } from "../block-format/json-parse.js";
@@ -1383,7 +1388,8 @@ export function compileQuery(sql: string, options: CompileQueryOptions = {}): Co
     if (parser.usesStatementDatetime) block.usesStatementDatetime = true;
     if (parser.usesSequenceCalls) block.usesSequenceCalls = true;
     if (parser.usesVolatileFunctions) block.usesVolatileFunctions = true;
-    if (parser.rowLocking !== undefined) block.rowLocking = parser.rowLocking;
+    withRowLockCtes(block, parser.rowLockingCtes);
+    withRowLock(block, parser.rowLocking);
   }
   return compiled;
 }
@@ -8319,6 +8325,9 @@ class Parser {
     this.#derivedSequence += 1;
     return this.#derivedSequence;
   };
+  /** CTEs planned in this query scope; nested declarations are isolated with their body. */
+  rowLockingCtes: CompiledQuery[] = [];
+  readonly #cteRefCounts = new WeakMap<CompiledQuery, number>();
   readonly #ctes = new Map<string, CompiledQuery>();
   readonly #cteReferences = new WeakSet<CompiledQuery>();
   /** Named windows of the block being parsed: `WINDOW w AS (...)`, referenced by `OVER w`. */
@@ -8335,8 +8344,9 @@ class Parser {
     this.text = text;
   }
 
-  #withClause(): void {
-    if (!this.#isKeyword("WITH")) return;
+  #withClause(): CompiledQuery[] {
+    if (!this.#isKeyword("WITH")) return [];
+    const declarations: CompiledQuery[] = [];
     this.#keyword("WITH");
     let recursive = false;
     if (this.#isKeyword("RECURSIVE")) {
@@ -8362,7 +8372,9 @@ class Parser {
       }
       this.#expectPunctuation("(");
       const outerLocking = this.rowLocking;
+      const outerCtes = this.rowLockingCtes;
       this.rowLocking = undefined;
+      this.rowLockingCtes = [];
       if (recursive) {
         this.#recursiveCte(name, columns);
       } else {
@@ -8374,11 +8386,22 @@ class Parser {
         this.#ctes.set(name, block);
       }
       const body = this.#ctes.get(name) ?? this.#recursiveCtes.get(name)?.base;
-      const ownLocking = strongestRowLock([this.rowLocking]);
-      if (body !== undefined && ownLocking !== undefined) body.rowLocking = ownLocking;
+      if (body !== undefined) {
+        withRowLockCtes(body, this.rowLockingCtes);
+        withRowLock(body, expandRowLockCteViews(body));
+        declarations.push(body);
+      }
       this.rowLocking = outerLocking;
+      this.rowLockingCtes = outerCtes;
       if (!this.#punctuation(",")) break;
     }
+    return declarations;
+  }
+
+  /** PG skips a SELECT CTE only at refcount zero, even when its referrer is unused. */
+  #recordRowLockCtes(declarations: readonly CompiledQuery[]): void {
+    for (const body of declarations)
+      if ((this.#cteRefCounts.get(body) ?? 0) > 0) this.rowLockingCtes.push(body);
   }
 
   /** The optional `(a, b, c)` between a CTE's name and its AS. */
@@ -8411,9 +8434,10 @@ class Parser {
   }
 
   parse(sql: string): CompiledQuery {
-    this.#withClause();
+    const declarations = this.#withClause();
     const plan = this.#queryExpression(sql);
     this.#take("eof");
+    this.#recordRowLockCtes(declarations);
     return plan;
   }
 
@@ -8428,8 +8452,10 @@ class Parser {
       // restored afterwards and an inner CTE cannot leak out of the subquery that declared it.
       const outer = new Map(this.#ctes);
       try {
-        this.#withClause();
-        return this.#queryExpression(sql);
+        const declarations = this.#withClause();
+        const plan = this.#queryExpression(sql);
+        this.#recordRowLockCtes(declarations);
+        return plan;
       } finally {
         this.#ctes.clear();
         for (const [name, block] of outer) this.#ctes.set(name, block);
@@ -11176,6 +11202,7 @@ class Parser {
     const alias = this.#sourceAlias() ?? table;
     const cte = this.#ctes.get(table);
     if (cte !== undefined) {
+      this.#cteRefCounts.set(cte, (this.#cteRefCounts.get(cte) ?? 0) + 1);
       this.rowLocking = strongestRowLock([this.rowLocking, cte.rowLocking]);
       const source = clonePlanTree(cte);
       this.#cteReferences.add(source);
@@ -11187,6 +11214,7 @@ class Parser {
     }
     const recursive = this.#recursiveCtes.get(table);
     if (recursive !== undefined) {
+      this.#cteRefCounts.set(recursive.base, (this.#cteRefCounts.get(recursive.base) ?? 0) + 1);
       this.rowLocking = strongestRowLock([
         this.rowLocking,
         recursive.base.rowLocking,
@@ -13996,6 +14024,54 @@ export function expandViewSources(
   return resolved;
 }
 
+/** Admission inspects planned expression subqueries too; it never executes these bodies.
+ * A constant CASE/COALESCE arm that planning discards must not contribute a hidden view lock.
+ */
+export function expandRowLockCteViews(
+  plan: CompiledQuery,
+  viewFor?: (name: string) => CompiledQuery | undefined,
+): RowLocking | undefined {
+  let lock: RowLocking | undefined;
+  const expression = (node: Expression): void => {
+    if (node.kind === "subquery" || node.kind === "exists") block(node.block);
+    else if (node.kind === "case") {
+      for (const branch of node.branches) {
+        expression(branch.when);
+        let known: boolean | null | undefined;
+        try {
+          known = evaluateBooleanExpression(branch.when, (value) => {
+            if (
+              value.kind !== "literal" ||
+              (typeof value.value === "number" && !Number.isSafeInteger(value.value))
+            )
+              throw new TypeError("not a known planning constant");
+            return value.value;
+          });
+        } catch {
+          /* Keep every arm when the condition is not a known constant. */
+        }
+        if (known === false || known === null) continue;
+        expression(branch.then);
+        if (known === true) return;
+      }
+      if (node.otherwise !== undefined) expression(node.otherwise);
+    } else if (node.kind === "call" && node.name === "COALESCE") {
+      for (const argument of node.arguments) {
+        expression(argument);
+        if (argument.kind === "literal" && argument.value !== null) return;
+      }
+    } else childExpressions(node).forEach(expression);
+  };
+  const block = (query: CompiledQuery): void => {
+    lock = strongestRowLock([lock, query.rowLocking]);
+    if (viewFor !== undefined) expandViewSources(query, viewFor);
+    forEachNestedBlock(query, block);
+    forEachBlockExpression(query, expression);
+  };
+  block(plan);
+  return lock;
+}
+
 export function planHasSourceColumnAliases(plan: CompiledQuery): boolean {
   if ([plan.base, ...plan.joins].some((source) => source.columnAliases !== undefined)) return true;
   let nested = false;
@@ -14235,6 +14311,7 @@ export function bindPendingSelectShapes(
       "usesSequenceCalls",
       "usesVolatileFunctions",
       "rowLocking",
+      "rowLockingCtes",
     ] as const) {
       const value = from[key];
       if (value !== undefined) Object.assign(to, { [key]: value });
