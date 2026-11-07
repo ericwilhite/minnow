@@ -250,7 +250,7 @@ are exercised without requiring host contention.
   headroom by `estimate()`, so the run records where the refusal came rather than assuming it.
 - Kill campaign (Gate A, `browser/next-storage-chaos.ts`): a worker runs a seeded random workload
   (builders, publish, retire and reclaim, log append, flush, truncate and reset, spill) and is
-  killed at seeded moments (`worker.terminate()`, sometimes a page close); the next worker reopens,
+  killed at seeded request checkpoints (`worker.terminate()`, sometimes a page close); the next worker reopens,
   checks the acknowledged root and every acknowledged log byte, audits exactly, and carries on. The
   worker announces each step and waits for the page's go, and posts when the step's storage work
   begins and returns, on its own channel; the backends post every platform request (an IndexedDB
@@ -261,7 +261,14 @@ are exercised without requiring host contention.
   acknowledgement and failure posted before the counter read. A claim interrupted before posting
   fails the barrier deadline, rather than passing with a missing message; its operation has an
   unknown outcome. What the worker claims after the counter is read is an unobserved tail, its operation left in flight for recovery to find done or not. The
-  page is cross-origin isolated for this (`?isolated=1`). A kill lands before, inside (a platform
+  page is cross-origin isolated for this (`?isolated=1`). Serial terminate kills now use a
+  shared-memory park at a real request in the selected phase: the request marker is fully posted
+  before the parked flag. The page drains that stable prefix before termination, avoiding both
+  the counter/post gap and loss of undelivered port traffic during teardown. Buffered IDB
+  writes in the selected phase wait for their real scheduled native batch; batching stays enabled.
+  No-op occurrences advance under the original deadline and earn no reach. IDB parks in a
+  microtask after the transaction body issues its initial requests, before its end callback;
+  OPFS parks before its synchronous call. A kill lands before, inside (a platform
   request open), in the window (begun, no request open) or after a step's storage work. A page
   close takes its expectation at a boundary just before the close. Any failure the workload
   reports, at any time, fails the campaign. On IndexedDB kills land inside each phase's storage
@@ -274,7 +281,8 @@ are exercised without requiring host contention.
   (`STORAGE_KILL_REACH`, `STORAGE_KILL_EDGE_REACH`).
 - Concurrent kill campaign: the same workload as lanes that run at once (two writers with their
   builders, a pinned reader, the log, spill, settling reclaims), each operation still announced and
-  given a go at once, killed at random wall-clock moments; at the kill the page stops giving gos,
+  given a go at once. A seeded delay arms the next request gate, cycling publish/log/spill/data
+  with at least two operation windows open on IndexedDB; at the kill the page stops giving gos,
   so everything the worker does before the kill takes effect was announced, and recovery accepts
   the acknowledged root or any announced one. On IndexedDB kills land with a transaction open
   (one at a time: the backend serializes them per connection) of each kind, beside two to five
@@ -287,6 +295,13 @@ are exercised without requiring host contention.
   returned at that step (`STORAGE_CONCURRENT_CRASH_REACH`). The
   workload and recovery live in `spill/chaos-workload.ts`. `npm run benchmark:storage` records the
   storage microbench nightly (docs: reference/testing).
+  The worker gate uses 100 ms futex sleeps so the VM can process worker termination between wakes.
+  Every wake keeps the worker parked; it does not advance the storage call or change the kill point.
+  This avoids an indefinite wait retaining WebKit's owner during teardown.
+  Storage kill diagnostics accept `MINNOW_STORAGE_CPU_THROTTLE=4` for Chromium CDP
+  `Emulation.setCPUThrottlingRate` on the controller page (reapplied after page-close kills).
+  Reports record the rate; this is delayed controller scheduling, not a calibrated disk/worker
+  slowdown. The 50-kill default, 1,000-kill nightly counts, reach states and minima are unchanged.
 - `select.ts` (`chooseBackend`) picks OPFS where a dedicated worker can open sync handles, else
   IndexedDB only on the private modes' refusals (`SecurityError`, `UnknownError`,
   `NotSupportedError`; other errors propagate), else memory (Safari Lockdown Mode). Before

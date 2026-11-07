@@ -15,6 +15,11 @@
  * its step in flight. A claim interrupted before posting fails the barrier deadline rather than
  * passing with a missing acknowledgement; its operation has an unknown outcome. The next worker
  * is handed that knowledge (`ChaosExpect`) and checks:
+ * Browser terminate campaigns park at an actual backend request after its marker is fully
+ * posted. A selected buffered write stays pending until its scheduled native batch starts;
+ * the test adapter keeps batching enabled. The shared workload and simulated power-loss
+ * sweeps otherwise run unchanged. Native transaction completion and disk interruption are
+ * separate observations: OPFS parks at a synchronous-call edge, never inside the native call.
  * - **Root.** The recovered root is the last acknowledged one, or the one an in-flight publish was
  *   writing; its round and the identity of every blob (coordinates and checksum) match. Every blob
  *   it names reads back and verifies, and the free map is exact (`audit`).

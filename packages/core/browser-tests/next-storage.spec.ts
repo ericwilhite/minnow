@@ -1,3 +1,4 @@
+import { requestKind as classifyRequest } from "../browser/next-storage-gate.js";
 import { reopenCpuSampler } from "./reopen-cpu.js";
 /**
  * The rebuild core's storage (packages/core/src/next/storage) in real browsers, over real OPFS sync
@@ -7,7 +8,7 @@ import { reopenCpuSampler } from "./reopen-cpu.js";
  * The same scenarios run on the IndexedDB backend, on the persistent profile and where OPFS is
  * absent (Firefox private browsing, a WebKit ephemeral session as in Safari private browsing).
  * The kill campaign (Gate A, next-storage-chaos.ts) kills a worker running a random storage
- * workload at seeded moments and checks every reopen against what was acknowledged
+ * workload at seeded request checkpoints and checks every reopen against what was acknowledged
  * (MINNOW_NEXT_STORAGE_KILLS=1000 for the nightly count).
  */
 import { chromium, expect, firefox, webkit, type Page } from "@playwright/test";
@@ -31,14 +32,21 @@ const RUN = "/packages/core/browser/next-storage-run.ts";
  */
 const CHAOS_PAGE = "/packages/core/browser/?isolated=1";
 
+/** Diagnostic slow-runner reproduction. Reapplied after each page-close kill. */
+async function throttleStorageCpu(page: Page, browserName: string): Promise<number> {
+  const rate = Number(process.env.MINNOW_STORAGE_CPU_THROTTLE ?? "1");
+  if (!Number.isFinite(rate) || rate < 1) throw new Error("Invalid MINNOW_STORAGE_CPU_THROTTLE");
+  if (rate !== 1) {
+    if (browserName !== "chromium") throw new Error("CPU throttling needs Chromium CDP");
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send("Emulation.setCPUThrottlingRate", { rate });
+  }
+  return rate;
+}
+
 /** What a platform request (`target:op`, next-storage-run.ts) belongs to. */
 function requestKind(request: string): "publish" | "log" | "spill" | "data" | "other" {
-  const target = request.slice(0, request.indexOf(":"));
-  if (/roots|root-/u.test(target)) return "publish";
-  if (target.includes("log")) return "log";
-  if (target.includes("spill")) return "spill";
-  if (target.includes("data")) return "data";
-  return "other";
+  return classifyRequest(request.slice(0, request.indexOf(":")));
 }
 
 test.describe("rebuild core storage on OPFS", () => {
@@ -456,6 +464,7 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
         let page: Page = first;
         await page.goto(CHAOS_PAGE);
         if (kind === "opfs") await requireWorkerOpfs(page);
+        const cpuThrottlingRate = await throttleStorageCpu(page, browserName);
         const random = mulberry32(seed);
         const dir = `kills-${kind}-${String(seed)}-${Date.now().toString(36)}`;
         // IndexedDB's work is asynchronous: kills must land inside each phase's storage work.
@@ -512,6 +521,7 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
             occurrence: 1 + Math.floor(random() * 3),
             delayMs: random() < 0.4 ? 0 : Math.floor(random() * 8),
             mode: random() < 0.1 ? "page" : "terminate",
+            atRequest: true,
           };
           let landing;
           try {
@@ -547,6 +557,7 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
             count(`${landing.landed} (page close)`);
             page = await context.newPage();
             await page.goto(CHAOS_PAGE);
+            await throttleStorageCpu(page, browserName);
           } else {
             // IndexedDB: `in-<step>` needs a transaction open (review B1-p2g finding 2); a step
             // begun with none open lands `window-<step>`, which reaches nothing. OPFS: its edges.
@@ -572,6 +583,7 @@ test.describe("rebuild core storage kill campaign (Gate A)", () => {
           browser: browserName,
           version: page.context().browser()?.version() ?? null,
           store: kind,
+          cpuThrottlingRate,
           seed,
           kills,
           pageKills,
@@ -741,8 +753,10 @@ test.describe("rebuild core storage concurrent kill campaign (Gate A)", () => {
         const page: Page = first;
         await page.goto(CHAOS_PAGE);
         if (kind === "opfs") await requireWorkerOpfs(page);
+        const cpuThrottlingRate = await throttleStorageCpu(page, browserName);
         const random = mulberry32(seed);
         const dir = `concurrent-${kind}-${String(seed)}-${Date.now().toString(36)}`;
+        // A seeded delay arms a native request checkpoint (IDB: two operation windows open).
         // Reach counts platform requests open at the kill (review B1-p2g finding 2), not workload
         // windows: on IndexedDB a transaction created and not ended (one at a time: the backend
         // serializes them per connection), beside operations in their windows. OPFS's calls are
@@ -808,8 +822,13 @@ test.describe("rebuild core storage concurrent kill campaign (Gate A)", () => {
           let landing;
           try {
             landing = await page.evaluate(
-              async ([url, delay]) => ((await import(url)) as Run).chaosKillAfter(delay),
-              [RUN, delayMs] as const,
+              async ([url, delay, request]) =>
+                ((await import(url)) as Run).chaosKillAfter(delay, request),
+              [
+                RUN,
+                delayMs,
+                (["publish", "log", "spill", "data"] as const)[iteration % 4],
+              ] as const,
             );
           } catch (error) {
             throw new Error(
@@ -846,6 +865,7 @@ test.describe("rebuild core storage concurrent kill campaign (Gate A)", () => {
           browser: browserName,
           version: page.context().browser()?.version() ?? null,
           store: kind,
+          cpuThrottlingRate,
           seed,
           kills,
           corruptions: 0,
