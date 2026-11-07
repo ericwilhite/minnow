@@ -725,3 +725,22 @@ export const ROW_LOCK_CACHE_STATES = [
   "noKeyUpdate",
   "update",
 ] as const;
+
+/** BOOL's Uint8-backed keys exercise the direct table's full logical domain. */
+export const JOIN_BOOLEAN_REACH = [
+  "inner",
+  "left",
+  "right",
+  "full",
+  "semi",
+  "anti",
+  "mark",
+  "TRUE only",
+  "FALSE only",
+  "both",
+  "NULL",
+  "empty",
+  "direct",
+  "hashed",
+  "released",
+] as const;

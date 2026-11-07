@@ -805,11 +805,11 @@ export class JoinTable {
   }
 }
 
-/** The values of a flat int32/date or safe int64-family vector (direct addressing), else null. */
-function directValues(vector: Vector): Int32Array | Float64Array | null {
+/** The values of a flat boolean, int32/date or safe int64-family vector (direct addressing), else null. */
+function directValues(vector: Vector): Uint8Array | Int32Array | Float64Array | null {
   if (vector.form !== "flat") return null;
   const data = vector.data;
-  if (data.layout === "i32") return data.values;
+  if (data.layout === "bool" || data.layout === "i32") return data.values;
   if (data.layout === "int64" && data.values.repr === "safe") return data.values.values;
   return null;
 }
