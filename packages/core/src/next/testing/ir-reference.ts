@@ -1065,6 +1065,18 @@ function inRange(value: Value, base: Value, offset: Value, sub: boolean, less: b
 }
 
 function windowRows(rel: Extract<Rel, { op: "window" }>, env: Environment): Row[] {
+  // PostgreSQL calculates constant frame offsets before pulling even the first input row.
+  // RANGE's negative/NaN check belongs to in_range; only NULL is a startup error there.
+  for (const call of rel.functions) {
+    if (call.frame === null) continue;
+    for (const bound of [call.frame.start, call.frame.end]) {
+      if (bound.offset === null) continue;
+      const amount = evaluate(bound.offset, [], env);
+      if (amount === null) throw new ReferenceSqlError("frame offset must not be null", "22004");
+      if (call.frame.unit !== "range" && Number(amount) < 0)
+        throw new ReferenceSqlError("frame offset must not be negative", "22013");
+    }
+  }
   const rows = run(rel.input, env);
   const partitions = new Map<string, Row[]>();
   for (const row of rows) {

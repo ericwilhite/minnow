@@ -850,6 +850,7 @@ export const LOWER_M3_TYPES_REACH = [
 
 /** Startup checks differ from RANGE's comparison-time sign check and optimized ranking. */
 export const LOWER_M3_OFFSETS_REACH = [
+  "reference startup",
   "empty",
   "NULL only",
   "mixed",

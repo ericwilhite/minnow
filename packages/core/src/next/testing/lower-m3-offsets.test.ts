@@ -5,11 +5,13 @@ import { createReach, LOWER_M3_OFFSETS_REACH } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
+import { LoweredDatabase } from "./lowering-harness.js";
 
 const reach = createReach("M3 offset timing", LOWER_M3_OFFSETS_REACH, { minimum: 2 });
 for (const seed of seedsFor("next-lower-m3-offsets", [0x7741, 0x7742]))
   it(`evaluates offsets at the PostgreSQL execution stage, seed ${String(seed)}`, async () => {
     const core = await new StorageCore().open();
+    const reference = new LoweredDatabase();
     const pg = new PGlite();
     await pg.waitReady;
     const random = mulberry32(seed);
@@ -37,11 +39,22 @@ for (const seed of seedsFor("next-lower-m3-offsets", [0x7741, 0x7742]))
             JSON.stringify(value, (_, v: unknown) => (typeof v === "bigint" ? Number(v) : v)),
           ) as unknown;
         expect(normalize(actual), `${sql}; params ${String(params)}`).toEqual(normalize(authority));
+        let interpreted;
+        try {
+          interpreted = { rows: reference.execute(sql, params) };
+        } catch (error) {
+          const code = (error as { sqlState?: string }).sqlState;
+          if (code === undefined) throw error;
+          interpreted = { code };
+        }
+        expect(normalize(interpreted), "reference: " + sql).toEqual(normalize(authority));
+        reach.reach("reference startup");
       };
       for (const state of ["empty", "NULL only", "mixed", "non-null"] as const) {
         const table = `t${String(LOWER_M3_OFFSETS_REACH.indexOf(state))}`;
         const ddl = `CREATE TABLE ${table}(id INTEGER PRIMARY KEY,x DOUBLE PRECISION)`;
         await core.execute(ddl);
+        reference.execute(ddl);
         await pg.exec(ddl);
         if (state !== "empty") {
           const rows = Array.from({ length: 2 + Math.floor(random() * 4) }, (_, id) => ({
@@ -49,8 +62,10 @@ for (const seed of seedsFor("next-lower-m3-offsets", [0x7741, 0x7742]))
             x: state === "NULL only" || (state === "mixed" && id === 0) ? null : id + 1,
           }));
           await core.writeBatch("insertBatch", table, rows);
-          for (const row of rows)
+          for (const row of rows) {
+            reference.execute(`INSERT INTO ${table} VALUES($1,$2)`, [row.id, row.x]);
             await pg.query(`INSERT INTO ${table} VALUES($1,$2)`, [row.id, row.x]);
+          }
         }
         for (const unit of ["ROWS", "RANGE", "GROUPS"] as const)
           for (const fn of ["count(*)", "lag(x)", "row_number()", "ntile(2)"])
