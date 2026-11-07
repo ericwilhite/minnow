@@ -341,18 +341,64 @@ describe("transaction state", () => {
   });
 
   it("keeps a transaction with a request running past the timeout", async () => {
-    const { connect } = harness({ rowsPerFrame: 10, idleMs: 20 });
-    const client = await connect();
-    await seed(client, 40);
-    await client.query("BEGIN");
-    const cursor = client.cursor("SELECT * FROM t", [], { windowBytes: 1 });
-    let taken = 0;
-    for await (const frame of cursor.frames) {
-      taken += frame.rowCount;
-      await sleep(15);
+    const { connect, server, writePath } = harness({ rowsPerFrame: 10, idleMs: 20 });
+    try {
+      const client = await connect();
+      await seed(client, 40);
+      // Native MessagePort delivery continues, but CPU scheduling cannot consume idle time.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"], shouldClearNativeTimers: true });
+      const aborted: number[] = [];
+      client.onSessionAborted = (session) => aborted.push(session);
+      await client.query("BEGIN");
+      const cursor = client.cursor("SELECT * FROM t", [], { windowBytes: 1 });
+      const first = await cursor.frames.next();
+      expect(first.done).toBe(false);
+      if (first.done) throw new Error("cursor ended before the held window");
+      let taken = first.value.rowCount;
+      // Hold the cursor window: the request cannot finish with its remaining frames blocked.
+      await vi.advanceTimersByTimeAsync(100);
+      // A reply on the same FIFO port also delivers any earlier timeout notification.
+      await client.query("SELECT 1", [], { session: 1 });
+      expect(aborted).toEqual([]);
+      expect(writePath.writerBusy).toBe(true);
+      for await (const frame of cursor.frames) {
+        taken += frame.rowCount;
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      expect(taken).toBe(40);
+      // No virtual idle gap between the terminal reply and COMMIT.
+      expect((await client.query("COMMIT")).summary.command).toBe("COMMIT");
+    } finally {
+      server.stepDown("closing");
+      vi.useRealTimers();
     }
-    expect(taken).toBe(40);
-    expect((await client.query("COMMIT")).summary.command).toBe("COMMIT");
+  });
+
+  it("starts the twenty-millisecond idle deadline only after a request completes", async () => {
+    const { connect, server, writePath } = harness({ idleMs: 20 });
+    try {
+      const client = await connect();
+      await seed(client, 1);
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"], shouldClearNativeTimers: true });
+      const aborted: number[] = [];
+      client.onSessionAborted = (session) => aborted.push(session);
+      await client.query("BEGIN");
+      await client.query("SELECT * FROM t");
+      // Deliver the final frame release at time zero: touch() legitimately restarts idle time.
+      await vi.advanceTimersByTimeAsync(0);
+      await client.query("SELECT 1", [], { session: 1 });
+      await vi.advanceTimersByTimeAsync(19);
+      expect(writePath.writerBusy).toBe(true);
+      expect(aborted).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1);
+      await client.query("SELECT 1", [], { session: 1 });
+      expect(aborted).toEqual([0]);
+      expect(writePath.writerBusy).toBe(false);
+      await expect(client.query("COMMIT")).rejects.toBeInstanceOf(TransactionIdleTimeoutError);
+    } finally {
+      server.stepDown("closing");
+      vi.useRealTimers();
+    }
   });
 });
 
