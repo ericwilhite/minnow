@@ -2070,24 +2070,43 @@ function trackOwnerTimers() {
 
 describe("a broker request is bounded (connector.ts ConnectorStatus)", () => {
   it("a broker that never answers: OwnerUnreachableError at the bound, never left connecting", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const w = world();
     const unreachable: Error[] = [];
     const { connector, silent } = silentTab(w, unreachable);
-    const started = Date.now();
-    const error = await connector.start().then(
-      () => null,
-      (caught: unknown) => caught as Error,
+    let settled = false;
+    const start = connector.start().then(
+      () => {
+        settled = true;
+        return null;
+      },
+      (caught: unknown) => {
+        settled = true;
+        return caught as Error;
+      },
     );
-    const took = Date.now() - started;
-    expect(error?.name).toBe("OwnerUnreachableError");
-    expect((error as { code?: string } | null)?.code).toBe("MINNOW_OWNER_UNREACHABLE");
-    expect(took).toBeGreaterThanOrEqual(140);
-    expect(took).toBeLessThan(1_000);
-    expect(connector.status).toBe("unreachable");
-    expect(unreachable).toHaveLength(1);
-    // Attempts at 0, 20 and 60 ms on the first port, a fresh one, another fresh one (20+40+80 ms).
-    expect(silent.posts).toBe(4);
-    expect(silent.ports).toBe(3);
+    try {
+      // Timer progress, rather than host scheduling latency, defines the 150 ms policy bound.
+      await vi.advanceTimersByTimeAsync(149);
+      expect(settled).toBe(false);
+      expect(connector.status).toBe("connecting");
+      // Requests at 0, 20, 60 and 140 ms; the last two each open a fresh port. Count sends
+      // synchronously: delivery on real MessageChannels has an independent task queue.
+      expect(silent.sent).toBe(4);
+      expect(silent.ports).toBe(3);
+      await vi.advanceTimersByTimeAsync(1);
+      // Assert settlement before awaiting: a missing bound must fail here, never time out.
+      expect(settled).toBe(true);
+      const error = await start;
+      expect(error?.name).toBe("OwnerUnreachableError");
+      expect((error as { code?: string } | null)?.code).toBe("MINNOW_OWNER_UNREACHABLE");
+      expect(connector.status).toBe("unreachable");
+      expect(unreachable).toHaveLength(1);
+    } finally {
+      connector.close();
+      await start;
+      vi.useRealTimers();
+    }
   });
 
   it("after giving up, the next request makes it connect again once the broker answers", async () => {
