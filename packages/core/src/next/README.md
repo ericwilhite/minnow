@@ -1282,11 +1282,18 @@ in a parameter-free plan without WITH TIES. Its fetch reserves memory-segment st
 as read/sort buffers. When the additional fixed minimums cannot fit, preparation retains the
 ordinary recipe for execution under that cap. The query's pin protects locators through
 publication and payload reads. Internal helper grants report statistics through the original
-IR operator, including the peak sum of simultaneous holdings.
+IR operator, including the peak sum of simultaneous holdings. Winner payload reads are
+one-pass: existing cache hits remain usable, while new encoded pages, parsed directories and
+inflated pages stay private to the reader. Sparse payload leases use exact-sized buffers rather
+than rounding each column's small page up to a pooled buffer. Selection still decodes only
+sort-key columns; fetching visits winners in physical page order before restoring SQL order.
 `scripts/next-executor-bench.mts --only sort_topn_wide --whole-compare late-sort --component late-sort`
 compares both strategies in interleaved Node CPU rounds over the same committed fixture.
 The whole-query comparison includes SQL/lowering/prepare/materialized rows; the component
-times the prepared scan/sort/fetch/frame pipeline. These are Node measurements.
+times the prepared scan/sort/fetch/frame pipeline. `--whole-compare late-fetch --component late-fetch`
+compares cached and one-pass winner reads and also isolates LateFetchOperator plus ordinal
+restoration, with selection and result frames outside that component's timed samples.
+These are Node measurements.
 Unbounded, value-producing `indexRange` nodes require the same internal `keyOrder:true`
 diagnostic opt-in as SQL until the charged streaming cursor lands. The default executor
 refuses them at prepare with `UnsupportedPlanError`, including under LIMIT zero. Opted-in

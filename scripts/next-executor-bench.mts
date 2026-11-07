@@ -451,7 +451,7 @@ try {
         if (last.rows !== warm.rows || last.checksum !== warm.checksum)
           throw new Error("baseline result changed across CPU rounds");
       }
-      if (profileId === "all" || profileId === query.id) {
+      if (profileId === "all" || profileId.split(",").includes(query.id)) {
         const profiler = new Session();
         profiler.connect();
         await profiler.post("Profiler.enable");
@@ -468,13 +468,18 @@ try {
       const sorted = [...samples].sort((a, b) => a - b),
         median = sorted[sorted.length >>> 1] ?? NaN;
       let wholeComparison = null;
-      if (["late-sort", "key-order"].includes(option("--whole-compare", ""))) {
+      if (
+        ["late-sort", "key-order", "late-fetch"].includes(option("--whole-compare", "")) &&
+        (option("--whole-compare", "") !== "late-fetch" || query.id === "sort_topn_wide")
+      ) {
         const saved = core.executor.prepare;
         const strategies = [
           createExecutor(
             option("--whole-compare", "") === "key-order"
               ? { keyOrder: false }
-              : { lateSort: false },
+              : option("--whole-compare", "") === "late-fetch"
+                ? { lateFetchOnce: false }
+                : { lateSort: false },
           ),
           createExecutor(option("--whole-compare", "") === "key-order" ? { keyOrder: true } : {}),
         ];
@@ -508,9 +513,13 @@ try {
                   ? late
                     ? "index-cursor"
                     : "scan-sort-locators"
-                  : late
-                    ? "keys-and-locators"
-                    : "full-payload",
+                  : option("--whole-compare", "") === "late-fetch"
+                    ? late
+                      ? "one-pass-payload"
+                      : "cached-payload"
+                    : late
+                      ? "keys-and-locators"
+                      : "full-payload",
               );
               console.error(
                 JSON.stringify({ id: query.id, comparison: true, round, late, load: loadavg() }),
@@ -588,7 +597,7 @@ try {
     await writeFile(join(cache, "component-scan-limit.json"), JSON.stringify(component, null, 2));
     console.log(JSON.stringify(component));
   }
-  if (["late-sort", "key-order"].includes(option("--component", ""))) {
+  if (["late-sort", "key-order", "late-fetch"].includes(option("--component", ""))) {
     const { lateSortComponent } = await import(
       pathToFileURL(resolve("scripts/next-executor-components.mts")).href
     );

@@ -38,7 +38,14 @@ export async function lateSortComponent(core: StorageCore, rounds: number, kind 
       : "SELECT * FROM events_wide ORDER BY f09 DESC,id LIMIT 100",
   );
   const programs = [
-    compilePlan(prepared.plan, kind === "key-order" ? { keyOrder: false } : { lateSort: false }),
+    compilePlan(
+      prepared.plan,
+      kind === "key-order"
+        ? { keyOrder: false }
+        : kind === "late-fetch"
+          ? { lateFetchOnce: false }
+          : { lateSort: false },
+    ),
     compilePlan(prepared.plan, kind === "key-order" ? { keyOrder: true } : {}),
   ];
   let queryId = 1000000;
@@ -128,15 +135,26 @@ export async function lateSortComponent(core: StorageCore, rounds: number, kind 
           ? late
             ? "index-cursor"
             : "scan-sort-locators"
-          : late
-            ? "keys-and-locators"
-            : "full-payload",
+          : kind === "late-fetch"
+            ? late
+              ? "one-pass-payload"
+              : "cached-payload"
+            : late
+              ? "keys-and-locators"
+              : "full-payload",
       );
     }
   const baseline = distribution(before),
     optimized = distribution(after),
     delta = baseline.median - optimized.median;
   return {
+    ...(kind === "late-fetch"
+      ? {
+          payload: await (
+            await import("./next-late-fetch-component.mts")
+          ).lateFetchComponent(core, rounds),
+        }
+      : {}),
     lane: "Node",
     strategy: kind,
     component: "prepared TableScan/sort/fetch/frames pipeline; no SQL/lowering/compile/JS rows",

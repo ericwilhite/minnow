@@ -376,6 +376,7 @@ function setupWindow(
 export interface CompileOptions {
   readonly lateSort?: boolean;
   readonly keyOrder?: boolean;
+  readonly lateFetchOnce?: boolean;
   /** False retains the original window inputs for component/query benchmark controls. */
   readonly windowInputDeduplication?: boolean;
   /** Parent control for literal-amount gather benchmarks. */
@@ -1104,6 +1105,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 (context, grant) =>
                   new LateFetchOperator(
                     {
+                      onePass: options.lateFetchOnce !== false,
                       snapshot: runtime.view,
                       tableId: scan.tableId,
                       columns: scan.columns,

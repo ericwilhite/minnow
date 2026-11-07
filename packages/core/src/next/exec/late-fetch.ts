@@ -11,6 +11,7 @@ import type {
   TableSnapshot,
 } from "../access/snapshot.js";
 import { SnapshotReleasedError } from "../access/snapshot.js";
+import type { SpaceReader } from "../access/space.js";
 import {
   OBJECT_OVERHEAD_BYTES,
   GrantClosedError,
@@ -209,6 +210,8 @@ export function scopedGrant(grant: Grant, minimum: number): Grant {
 }
 
 export interface LateFetchContext {
+  /** Winner payloads are consumed once in physical order, without cache admission. */
+  readonly onePass?: boolean;
   /** Ordered index input may already be in physical order; preserve its borrowed stream. */
   readonly orderedShortcut?: boolean;
   readonly snapshot: Snapshot;
@@ -402,13 +405,29 @@ export class LateFetchOperator implements Operator {
             output,
           );
       this.#sort = sort;
+      const pages = reclaimingReader(context.snapshot.pages, context.grant, this.#abort.signal);
+      // Sparse winners often need one small page per column. Pooling rounds each lease up to
+      // 64 KiB, so keep these one-pass slabs exact-sized rather than inflating scan admission.
+      const payloadPages: SpaceReader = context.onePass
+        ? {
+            peek: (ref, options) => pages.peek(ref, options),
+            parsed: (ref) => pages.parsed?.(ref) ?? null,
+            attach: (ref, parsed, bytes, of) => pages.attach?.(ref, parsed, bytes, of) ?? false,
+            read: (refs, options) => pages.read(refs, { ...options, reuseBuffers: false }),
+          }
+        : pages;
       const scan = new TableScan({
         table,
         columns: context.columns,
         filter: null,
         emitLocator: false,
-        pages: reclaimingReader(context.snapshot.pages, context.grant, this.#abort.signal),
-        reads: context.reads,
+        pages: payloadPages,
+        reads: context.onePass
+          ? {
+              open: (pages, chunk, options) =>
+                context.reads.open(pages, chunk, { ...options, once: true }),
+            }
+          : context.reads,
         budget: context.grant,
         context: { ...context.compile, input: context.types },
         targetBytes: context.targetBytes,
