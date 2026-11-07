@@ -346,6 +346,16 @@
   },
   {
     "file": "query.ts",
+    "message": "Window frame bounds are reversed",
+    "state": "42P20"
+  },
+  {
+    "file": "query.ts",
+    "message": "GROUPS frames require ORDER BY inside OVER (...)",
+    "state": "42P20"
+  },
+  {
+    "file": "query.ts",
     "message": "Offset RANGE frames require exactly one ORDER BY expression",
     "state": "42P20"
   },

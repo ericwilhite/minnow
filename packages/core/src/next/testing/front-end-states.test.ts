@@ -13,7 +13,13 @@ import { PGlite } from "@electric-sql/pglite";
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { FRONT_END_STATES, frontEndSqlState, PlanningError } from "../lower/errors.js";
+import { compileQuery } from "../../engine/query.js";
+import {
+  FRONT_END_STATES,
+  frontEndError,
+  frontEndSqlState,
+  PlanningError,
+} from "../lower/errors.js";
 import { LoweredDatabase } from "./lowering-harness.js";
 import { pgOutcome } from "./pglite-oracle.js";
 
@@ -65,7 +71,7 @@ const SETUP = ["CREATE TABLE a (id integer, v integer)", "CREATE TABLE b (id int
  * front-end message prefix it must fail with. The code is PGlite's, except "accepted": a
  * refusal of SQL PostgreSQL runs (0A000).
  */
-const CASES: ReadonlyArray<readonly [sql: string, message: string]> = [
+const CASES: ReadonlyArray<readonly [sql: string, message: string, source?: "published"]> = [
   ["SELECT * FROM missing", "SELECT * requires known columns for: "],
   ["SELECT z.* FROM a", "Unknown table for z.*: "],
   [
@@ -94,6 +100,14 @@ const CASES: ReadonlyArray<readonly [sql: string, message: string]> = [
     "SELECT count(*) OVER (ORDER BY id, v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM a",
     "Offset RANGE frames require exactly one ORDER BY expression",
   ],
+  [
+    "SELECT count(*) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM a",
+    "Window frame bounds are reversed",
+  ],
+  [
+    "SELECT count(*) OVER (GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM a",
+    "GROUPS frames require ORDER BY inside",
+  ],
   // Review B6-p2b-3 finding 3: an unknown HAVING name, and invalid frame offsets.
   ["SELECT id FROM a GROUP BY id HAVING nope > 0", 'column "nope" does not exist'],
   ["SELECT id FROM a GROUP BY id HAVING a.nope > 0", "column a.nope does not exist"],
@@ -109,18 +123,22 @@ const CASES: ReadonlyArray<readonly [sql: string, message: string]> = [
   [
     "SELECT count(*) OVER (ORDER BY id ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM a",
     "frame starting offset must not be negative",
+    "published",
   ],
   [
     "SELECT count(*) OVER (ORDER BY id GROUPS BETWEEN CURRENT ROW AND -2 FOLLOWING) FROM a",
     "frame ending offset must not be negative",
+    "published",
   ],
   [
     "SELECT count(*) OVER (ORDER BY id RANGE BETWEEN NULL PRECEDING AND CURRENT ROW) FROM a",
     "frame starting offset must not be null",
+    "published",
   ],
   [
     "SELECT count(*) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND NULL FOLLOWING) FROM a",
     "frame ending offset must not be null",
+    "published",
   ],
   [
     "SELECT count(*) OVER (ORDER BY id ROWS BETWEEN 1e400 PRECEDING AND CURRENT ROW) FROM a",
@@ -135,6 +153,7 @@ const CASES: ReadonlyArray<readonly [sql: string, message: string]> = [
   [
     "SELECT a.id FROM a LEFT JOIN b ON b.id = a.id FULL JOIN b c ON c.id = a.id",
     "FULL JOIN is only supported as the sole join",
+    "published",
   ],
   [
     "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
@@ -155,13 +174,17 @@ describe("every pattern's code against PostgreSQL", () => {
       await pg.exec(sql);
     }
     const reached = new Set<string>();
-    for (const [sql, message] of CASES) {
+    for (const [sql, message, source] of CASES) {
       let failure: PlanningError | null = null;
       try {
-        next.lower(sql);
+        // The published compiler retains these refusals; typed lowering defers offset
+        // validation to execution and supports the formerly refused FULL join shape.
+        if (source === "published") compileQuery(sql);
+        else next.lower(sql);
       } catch (error) {
-        if (!(error instanceof PlanningError)) throw error;
-        failure = error;
+        const mapped = source === "published" ? frontEndError(error) : error;
+        if (!(mapped instanceof PlanningError)) throw mapped;
+        failure = mapped;
       }
       if (failure === null) throw new Error(`${sql} lowered`);
       const cause = failure.cause instanceof Error ? failure.cause.message : failure.message;

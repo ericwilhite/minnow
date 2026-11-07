@@ -12898,7 +12898,8 @@ class Parser {
     // PostgreSQL's frame offset errors (22004, 22013). A negative RANGE offset is raised here,
     // where PostgreSQL raises it when the first row compares (so not over no rows).
     if (this.#isKeyword("NULL")) {
-      frameOffsetError(which, "null");
+      if (which === "starting") throw new TypeError("frame starting offset must not be null");
+      throw new TypeError("frame ending offset must not be null");
     }
     if (this.#isKeyword("INTERVAL") && unit === "rows")
       throw new TypeError("argument of ROWS must be type bigint, not type interval");
@@ -12933,7 +12934,8 @@ class Parser {
     let numeric = decimal;
     if (unit === "range") {
       if (!recordDeclaredTypes && negated && !digits.zero) {
-        frameOffsetError(which);
+        if (which === "starting") throw new TypeError("frame starting offset must not be negative");
+        throw new TypeError("frame ending offset must not be negative");
       }
       // RANGE keeps the value. One a double cannot hold (it would become 0 or Infinity) is
       // refused rather than changed.
@@ -12963,7 +12965,8 @@ class Parser {
       if (rounded > 9223372036854775807n || rounded < -9223372036854775808n)
         throw new TypeError("bigint out of range");
       if (!recordDeclaredTypes && rounded < 0n) {
-        frameOffsetError(which);
+        if (which === "starting") throw new TypeError("frame starting offset must not be negative");
+        throw new TypeError("frame ending offset must not be negative");
       }
       offset = Number(rounded);
       if (rounded > 9007199254740991n || rounded < -9007199254740991n) exact = rounded;
@@ -15043,20 +15046,11 @@ function timestampLiteral(text: string): Date {
   return date;
 }
 
-function frameOffsetError(
-  which: "starting" | "ending",
-  reason: "null" | "negative" = "negative",
-): never {
-  throw new TypeError(`frame ${which} offset must not be ${reason}`);
-}
-
-/** The parser's OFFSET range contract, shared with the typed builder. */
 /**
  * A frame offset literal's significant digits and power of ten (value = digits × 10^exponent),
  * read from its text: `zero` when every mantissa digit is 0, whatever the exponent. Null when
  * the text is not a plain decimal literal.
  */
-
 function frameOffsetDigits(
   literal: string,
 ): { readonly digits: string; readonly exponent: number; readonly zero: boolean } | null {
