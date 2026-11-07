@@ -124,7 +124,13 @@ class MemoryLease implements OwnerLease {
   #lose(): void {
     if (this.#lost.signal.aborted) return;
     this.#lost.abort(new OwnershipLostError(this.epoch));
-    for (const file of [this.files.log, this.files.data, ...this.files.roots, this.files.metadata])
+    for (const file of [
+      this.files.log,
+      this.files.data,
+      ...this.files.roots,
+      this.files.metadata,
+      this.files.metadataIndex,
+    ])
       file?.close();
   }
 
@@ -163,19 +169,21 @@ export class MemoryBackend implements StorageBackend {
   #openFiles(): FileSet {
     const opened: MemoryFile[] = [];
     try {
-      for (const name of [...FILE_NAMES, "space-meta"]) opened.push(this.#open(name));
+      for (const name of [...FILE_NAMES, "space-meta", "space-meta-index"])
+        opened.push(this.#open(name));
     } catch (error) {
       for (const file of opened) file.close();
       throw error;
     }
-    const [log, data, root0, root1, metadata] = opened as [
+    const [log, data, root0, root1, metadata, metadataIndex] = opened as [
       MemoryFile,
       MemoryFile,
       MemoryFile,
       MemoryFile,
       MemoryFile,
+      SyncFile,
     ];
-    return { log, data, roots: [root0, root1], metadata };
+    return { log, data, roots: [root0, root1], metadata, metadataIndex };
   }
 
   async acquire(options: AcquireOptions = {}): Promise<OwnerLease> {
@@ -184,7 +192,14 @@ export class MemoryBackend implements StorageBackend {
       this.name,
       () => this.#openFiles(),
       (files) => {
-        for (const file of [files.log, files.data, ...files.roots, files.metadata]) file?.close();
+        for (const file of [
+          files.log,
+          files.data,
+          ...files.roots,
+          files.metadata,
+          files.metadataIndex,
+        ])
+          file?.close();
       },
       options,
     );

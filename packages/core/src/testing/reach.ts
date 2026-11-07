@@ -1230,3 +1230,17 @@ export const RETIREMENT_TICKETS_REACH = [
   "next generation guard",
   "two bounded batches per ticket",
 ] as const;
+
+export const FLUSH_ROLLBACK_REACH = [
+  "flush held before publication",
+  "rollback removes the new tail",
+  "later committed row survives publication and reopen",
+] as const;
+
+export const ROOT_CREDIT_REACH = [
+  "five overlapping root frames prepaid",
+  "large frame credit and encoded compatibility",
+  "refusal keeps owned roots and charge intact",
+  "independent descriptor accounting",
+  "late snapshot release refunds its owner",
+] as const;

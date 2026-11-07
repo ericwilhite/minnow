@@ -229,6 +229,9 @@ export interface WrittenExtent {
 
 /** A grant's suballocator (`memory/governor.ts` `Grant.allocate`/`free`). Never waits. */
 export interface ByteBudget {
+  /** An allocation-policy wrapper may identify the native grant holding its ordinary credit.
+   * allocate/free must affect that same grant; retained transfers never use its loan bytes. */
+  ordinarySource?(): ByteBudget;
   allocate(bytes: number): boolean;
   free(bytes: number): void;
 }

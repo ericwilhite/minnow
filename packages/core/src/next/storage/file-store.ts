@@ -12,9 +12,11 @@
  * A torn slot fails its checksum and the other slot, the previous root, stays current.
  */
 import { chooseRoot, encodeRootSlot } from "./root-slot.js";
+import { preparedRoot } from "./root-memory.js";
 import {
   DATA_ALIGN,
   METADATA_PAGE_BYTES,
+  METADATA_SMALL_BYTES,
   type MetadataStore,
   LOG_HEADER_SLOT_BYTES,
   StoreClosedError,
@@ -33,6 +35,7 @@ export interface FileSet {
   readonly data: SyncFile;
   readonly roots: readonly [SyncFile, SyncFile];
   readonly metadata?: SyncFile;
+  readonly metadataIndex?: SyncFile;
 }
 
 export const FILE_NAMES = ["log", "data", "root-0", "root-1"] as const;
@@ -64,6 +67,7 @@ function writeAll(file: SyncFile, bytes: Uint8Array, at: number): void {
 
 export class FileStoreSession implements StoreSession {
   readonly epoch: number;
+  readonly rootWriterToken = {};
   readonly #files: FileSet;
   readonly #guard: () => void;
   #logLength: number;
@@ -92,14 +96,22 @@ export class FileStoreSession implements StoreSession {
   metadata(): MetadataStore | null {
     this.#owned();
     const file = this.#files.metadata;
-    if (file === undefined) return null;
-    return (this.#metadata ??= new FileMetadata(file, () => {
+    const index = this.#files.metadataIndex;
+    if (file === undefined || index === undefined) return null;
+    return (this.#metadata ??= new FileMetadata(file, index, () => {
       this.#owned();
     }));
   }
 
   async readRoot(): Promise<Uint8Array | null> {
     return this.#chooseRoot().current?.root ?? null;
+  }
+
+  async readRootSlot(slot: 0 | 1): Promise<Uint8Array | null> {
+    const file = this.#live().roots[slot],
+      length = file.getSize();
+    if (length > (1 << 20) + 20) throw new StoreCorruptionError("Root slot exceeds1MiB payload");
+    return length === 0 ? null : readExact(file, 0, length);
   }
 
   async readPreviousRoot(): Promise<Uint8Array | null> {
@@ -113,9 +125,11 @@ export class FileStoreSession implements StoreSession {
 
   async publish(root: Uint8Array): Promise<void> {
     const files = this.#owned();
-    const { nextSlot, nextSequence } = this.#chooseRoot();
+    const prepared = preparedRoot(this, root);
+    const chosen = prepared === undefined ? this.#chooseRoot() : null;
+    const nextSlot = prepared?.slot ?? chosen?.nextSlot ?? 0;
     files.data.flush();
-    const slot = encodeRootSlot(nextSequence, root);
+    const slot = prepared?.frame.slotBytes ?? encodeRootSlot(chosen?.nextSequence ?? 1, root);
     const file = files.roots[nextSlot];
     writeAll(file, slot, 0);
     file.truncate(slot.length);
@@ -273,34 +287,57 @@ export class FileScratch implements ScratchSpace {
 }
 
 /** Fixed pages over a dedicated file: no record directory or growable managed buffers. */
+/** Fixed data-page addresses and a compact512-byte directory. Small records live entirely
+ * in the directory; neither file needs a resident page/offset index. Both reset per owner. */
 class FileMetadata implements MetadataStore {
+  readonly #header = new Uint8Array(4);
   constructor(
     readonly file: SyncFile,
+    readonly index: SyncFile,
     readonly guard: () => void,
   ) {}
-  #offset(page: number, bytes: Uint8Array): number {
+  #check(page: number, bytes: Uint8Array, reading: boolean): void {
     if (
       !Number.isSafeInteger(page) ||
       page < 0 ||
       !Number.isSafeInteger((page + 1) * METADATA_PAGE_BYTES)
     )
       throw new RangeError("Bad metadata page");
-    if (bytes.byteLength !== METADATA_PAGE_BYTES) throw new RangeError("Bad metadata frame");
-    return page * METADATA_PAGE_BYTES;
+    if (
+      bytes.byteLength !== METADATA_PAGE_BYTES &&
+      (reading || bytes.byteLength !== METADATA_SMALL_BYTES)
+    )
+      throw new RangeError("Bad metadata frame");
   }
   async read(page: number, target: Uint8Array): Promise<void> {
     this.guard();
-    const at = this.#offset(page, target);
-    if (at + target.length > this.file.getSize())
-      throw new StoreCorruptionError("Missing metadata page");
-    readFully(this.file, at, target);
+    this.#check(page, target, true);
+    const at = page * 512;
+    if (at + 4 > this.index.getSize()) throw new StoreCorruptionError("Missing metadata page");
+    readFully(this.index, at, this.#header);
+    const length = new DataView(this.#header.buffer).getUint32(0, true);
+    if (length !== METADATA_PAGE_BYTES && length !== METADATA_SMALL_BYTES)
+      throw new StoreCorruptionError("Malformed metadata directory");
+    const file = length === METADATA_SMALL_BYTES ? this.index : this.file;
+    const offset = length === METADATA_SMALL_BYTES ? at + 4 : page * METADATA_PAGE_BYTES;
+    if (offset + length > file.getSize())
+      throw new StoreCorruptionError("Missing metadata page body");
+    target.fill(0);
+    readFully(file, offset, target.subarray(0, length));
   }
   async write(page: number, bytes: Uint8Array): Promise<void> {
     this.guard();
-    writeAll(this.file, bytes, this.#offset(page, bytes));
+    this.#check(page, bytes, false);
+    const at = page * 512;
+    if (bytes.length === METADATA_SMALL_BYTES) writeAll(this.index, bytes, at + 4);
+    else writeAll(this.file, bytes, page * METADATA_PAGE_BYTES);
+    // The body precedes the directory publication. Interrupted scratch is discarded on open.
+    new DataView(this.#header.buffer).setUint32(0, bytes.length, true);
+    writeAll(this.index, this.#header, at);
   }
   async reset(): Promise<void> {
     this.guard();
     this.file.truncate(0);
+    this.index.truncate(0);
   }
 }

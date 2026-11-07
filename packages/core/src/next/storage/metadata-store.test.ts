@@ -4,6 +4,7 @@ import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { createReach, METADATA_STORE_REACH } from "../../testing/reach.js";
 import {
   METADATA_PAGE_BYTES,
+  METADATA_SMALL_BYTES,
   OwnershipLostError,
   StoreCorruptionError,
   type MetadataStore,
@@ -60,7 +61,8 @@ for (const [name, factory] of factories)
       if (metadata == null) throw new Error("No metadata backing");
       const frame = new Uint8Array(METADATA_PAGE_BYTES),
         target = new Uint8Array(METADATA_PAGE_BYTES);
-      const values = new Uint8Array(9);
+      const values = new Uint8Array(9),
+        lengths = new Uint32Array(9);
       try {
         await metadata.reset();
         await session.writeData(0, new Uint8Array([7, 8, 9]));
@@ -68,11 +70,19 @@ for (const [name, factory] of factories)
         await session.appendLog(new Uint8Array([3, 4]));
         const scratch = backend.scratch(lease);
         for (let step = 0; step < 27; step++) {
-          const page = step < values.length ? step : Math.floor(random() * values.length);
+          const page =
+            step < 2 * values.length ? step % values.length : Math.floor(random() * values.length);
           const value = 1 + Math.floor(random() * 254);
           frame.fill(value);
-          await metadata.write(page, frame);
+          const length =
+            step < values.length || (step >= 2 * values.length && step % 2 === 0)
+              ? METADATA_PAGE_BYTES
+              : METADATA_SMALL_BYTES;
+          const input = length === frame.length ? frame : frame.slice(0, length);
+          await metadata.write(page, input);
           values[page] = value;
+          lengths[page] = length;
+          input.fill(0);
           // Reuse is permitted only after the write settles.
           frame.fill(0);
           if (scratch !== null) {
@@ -80,13 +90,17 @@ for (const [name, factory] of factories)
             await scratch.truncate(0);
           }
           await metadata.read(page, target);
-          expect(target.every((byte) => byte === value)).toBe(true);
+          expect(target.every((byte, index) => byte === (index < length ? value : 0))).toBe(true);
         }
         reach.reach("rewrite");
         reach.reach("spill sweep isolation");
         for (let page = 0; page < values.length; page++) {
           await metadata.read(page, target);
-          expect(target.every((byte) => byte === values[page])).toBe(true);
+          expect(
+            target.every(
+              (byte, index) => byte === (index < (lengths[page] ?? 0) ? values[page] : 0),
+            ),
+          ).toBe(true);
         }
         if (scratch !== null) await scratch.write(0, new Uint8Array([5]));
         await metadata.reset();

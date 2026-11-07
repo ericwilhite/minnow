@@ -95,7 +95,7 @@
  *
  * ## Implementations
  * - `file-store.ts`: the store over four long-lived files (log, data, two root slots; OPFS adds
- *   `spill`, `epoch` and `space-meta`) through a
+ *   `spill`, `epoch`, `space-meta` and `space-meta-index`) through a
  *   `SyncFile` interface with the shape of `FileSystemSyncAccessHandle`. OPFS supplies real
  *   handles (`opfs.ts`); `sim-disk.ts` supplies simulated ones with a physical crash model.
  * - `indexeddb.ts`: the same contract on IndexedDB (Safari and Firefox private browsing), with the
@@ -166,11 +166,14 @@ export interface ScratchSpace {
 
 /** Owner-private reconstructible metadata; separate from the operator-spill sweep.
  * Fixed page addressing requires no resident per-record index. Input remains borrowed and
- * immutable until write settles. IndexedDB requires a standalone whole-buffer write frame.
+ * immutable until write settles. Writes accept a full frame or the compact256-byte frame;
+ * reads return a full zero-padded logical page. IndexedDB requires standalone whole buffers.
  * One native read response of this size can coexist with the target: callers reserve both.
  * reset is only used before opening the extent space.
  */
 export const METADATA_PAGE_BYTES = 60 * 1024;
+/** Standalone compact frame for small private records; read expands it with zero padding. */
+export const METADATA_SMALL_BYTES = 256;
 export interface MetadataStore {
   read(page: number, target: Uint8Array): Promise<void>;
   write(page: number, bytes: Uint8Array): Promise<void>;
@@ -265,6 +268,11 @@ export interface StorageBackend {
 
 export interface StoreSession {
   readonly epoch: number;
+  /** Owner-private identity for prepared root frames; wrappers preserve this value. */
+  readonly rootWriterToken?: object;
+  /** Read one borrowed native root slot. Extent-space startup prepays the native response and
+   * processes it before reading the next. The legacy root APIs remain for raw store callers. */
+  readRootSlot?(slot: 0 | 1): Promise<Uint8Array | null>;
   /** Private metadata backing under this session's fence; never recovered as database state. */
   metadata?(): MetadataStore | null;
   /**

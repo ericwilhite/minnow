@@ -6,6 +6,8 @@ export class ScriptedMetadataPages implements MetadataStore {
   native = 0;
   maxNative = 0;
   writes = 0;
+  reads = 0;
+  failReadAt = -1;
   failAt = -1;
   afterRead: (() => void) | null = null;
   afterWrite: ((page: number, bytes: Uint8Array) => void) | null = null;
@@ -16,6 +18,7 @@ export class ScriptedMetadataPages implements MetadataStore {
     this.afterWrite?.(page, bytes);
   }
   async read(page: number, target: Uint8Array): Promise<void> {
+    if (++this.reads === this.failReadAt) throw new Error("scripted metadata read failure");
     const bytes = this.physical.get(page);
     if (bytes === undefined) throw new StoreCorruptionError("missing page");
     this.native += bytes.byteLength;
@@ -23,6 +26,7 @@ export class ScriptedMetadataPages implements MetadataStore {
     try {
       const response = bytes.slice();
       await Promise.resolve();
+      target.fill(0);
       target.set(response);
       this.afterRead?.();
     } finally {

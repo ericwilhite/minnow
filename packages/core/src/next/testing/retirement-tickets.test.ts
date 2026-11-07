@@ -1,6 +1,7 @@
 import { afterAll, expect, it, vi } from "vitest";
 import { createReach, RETIREMENT_TICKETS_REACH } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
+import { TaskClock } from "../task.js";
 import { Governor } from "../memory/governor.js";
 import {
   MetadataJournal,
@@ -306,9 +307,9 @@ it("keeps capped fragmentation debt and recovers it only when the rebuilt gaps c
   }
 });
 
-it("refuses arena admission before allocating its backing and returns it after every failed native close", async () => {
-  let writes = 0;
-  for (let fault = 0; fault <= writes; fault++) {
+it("refuses arena admission before allocating its backing and returns it after every failed native read", async () => {
+  let reads = 0;
+  for (let fault = 0; fault <= reads; fault++) {
     const f = await construction();
     try {
       const a = await saveExtentInput(f.journal, [{ offset: 4096, length: 4096 }], true, 8192);
@@ -320,18 +321,18 @@ it("refuses arena admission before allocating its backing and returns it after e
         );
         expect(denied.used).toBe(0);
       }
-      const before = f.pages.writes;
-      if (fault !== 0) f.pages.failAt = before + fault;
+      const before = f.pages.reads;
+      if (fault !== 0) f.pages.failReadAt = before + fault;
       if (fault === 0) {
         const map = await reconstructMap(f.journal, f.cache, a, b, 8192, f.budget);
         map.close();
-        writes = f.pages.writes - before;
-        expect(writes).toBeGreaterThan(0);
+        reads = f.pages.reads - before;
+        expect(reads).toBeGreaterThan(0);
         await disposeSnapshot(f.journal, a);
         await disposeSnapshot(f.journal, b);
       } else {
         await expect(reconstructMap(f.journal, f.cache, a, b, 8192, f.budget)).rejects.toThrow(
-          "scripted metadata write failure",
+          "scripted metadata read failure",
         );
         expect(f.budget.used).toBe(METADATA_WORKSPACE_BYTES);
       }
@@ -432,6 +433,31 @@ it("unlinks an aborted provisional ticket and restores both snapshot references"
     });
     await disposeSnapshot(f.journal, a);
     await disposeSnapshot(f.journal, b);
+  } finally {
+    await f.close();
+  }
+});
+
+it("returns an admitted arena when cancellation arrives as copying resumes", async () => {
+  const f = await construction();
+  try {
+    const root = await saveExtentInput(f.journal, [{ offset: 4096, length: 1 }], true, 4097);
+    const controller = new AbortController(),
+      reason = new Error("cancel after arena allocation"),
+      allocate = f.budget.allocate.bind(f.budget);
+    f.budget.allocate = (bytes) => {
+      const accepted = allocate(bytes);
+      if (accepted && bytes === MIN_RUN_ARENA_BYTES) queueMicrotask(() => controller.abort(reason));
+      return accepted;
+    };
+    await expect(
+      reconstructMap(f.journal, f.cache, root, root, 4097, f.budget, {
+        signal: controller.signal,
+        clock: new TaskClock(() => 0),
+      }),
+    ).rejects.toBe(reason);
+    expect(f.budget.used).toBe(METADATA_WORKSPACE_BYTES);
+    await disposeSnapshot(f.journal, root);
   } finally {
     await f.close();
   }

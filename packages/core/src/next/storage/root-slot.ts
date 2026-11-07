@@ -34,7 +34,7 @@ export function encodeRootSlot(sequence: number, root: Uint8Array): Uint8Array {
 }
 
 /** A slot's root, or null when the slot is empty, torn or not a root slot. */
-export function decodeRootSlot(bytes: Uint8Array | null): RootSlot | null {
+export function decodeRootSlot(bytes: Uint8Array | null, borrow = false): RootSlot | null {
   if (bytes === null || bytes.length < HEADER + 4) return null;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   if (view.getUint32(0, true) !== MAGIC) return null;
@@ -43,7 +43,7 @@ export function decodeRootSlot(bytes: Uint8Array | null): RootSlot | null {
   if (view.getUint32(HEADER + length, true) !== xxHash32(bytes, 0, 0, HEADER + length)) return null;
   return {
     sequence: view.getUint32(4, true) + view.getUint32(8, true) * 2 ** 32,
-    root: bytes.slice(HEADER, HEADER + length),
+    root: borrow ? bytes.subarray(HEADER, HEADER + length) : bytes.slice(HEADER, HEADER + length),
   };
 }
 

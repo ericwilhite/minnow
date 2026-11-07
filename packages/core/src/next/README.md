@@ -151,7 +151,7 @@ are exercised without requiring host contention.
   owner changes nothing.
 - The store is four long-lived files: log, data space, and two root slots. OPFS adds the spill
   scratch file, the epoch counter (two checksummed slots, flushed before a lease exists), and an
-  owner-private `space-meta` file, all seven opened under the same fence. Extents are reused in place inside the data space.
+  owner-private `space-meta` and `space-meta-index` files, all eight opened under the same fence. Extents are reused in place inside the data space.
 - `publish` is atomic and durable: it flushes data, then writes the inactive root slot.
 - The log has a flush barrier and two header slots.
 - **The extent space** (`extents.ts`) is the only caller of the data-space calls and of `publish`.
@@ -1932,7 +1932,7 @@ budgets; callers must check support before depending on an atomic handoff.
 ### Owner-private metadata backing
 
 The store session exposes fixed 60 KiB metadata pages independently of operator
-spill. OPFS uses the fenced `space-meta` handle. IndexedDB uses negative numeric
+spill. OPFS uses fenced `space-meta` data and `space-meta-index` compact-directory handles. IndexedDB uses negative numeric
 keys in `meta`, with one direct, epoch-checked request per page; it has no resident
 record directory. Writes borrow a prepaid frame until the transaction settles.
 IndexedDB requires a standalone frame so structured cloning cannot copy a larger
@@ -1953,7 +1953,8 @@ expose four, and native-release phases expose two. The inventory includes one
 256 KiB native record response, one bounded 60 KiB boundary copy and bounded
 release-range vectors. Six read-only metadata views and raw-list cursor windows
 can borrow the separately prepaid 1 MiB read slab. Native metadata writes still
-require standalone whole-buffer frames. Callers serialize workspace
+require standalone whole-buffer frames. Eight compact control pages have a fixed direct-mapped cache, covered by W;
+payload reads always use the native store and verify checksums. Callers serialize workspace
 use before taking the mutation barrier, and never overlap source and reclaim
 phases. Frames and their borrowed slices cannot escape a phase. Journal cursors
 and writers retain scalar slots and phase identities, rather than old buffers.
@@ -2027,9 +2028,28 @@ live-space switch is a separate integration step.
 The live composition can borrow private sort/merge inputs and sort scratch from
 the paid read slab. Only two standalone control/output frames are then owned.
 W also covers one 256 KiB native response, a 60 KiB boundary copy, three bounded
-256-range vectors and headers (516,096 bytes). Startup's private cache may admit
+256-range vectors, compact I/O and the fixed control cache (519,104 bytes).
+The worst source phase is 523,216 bytes; both fit the 512 KiB reservation. Startup's private cache may admit
 its final arena synchronously while holding its temporary slab view; the cache
 is not exposed yet and this never awaits an admission or a caller.
+
+### Root and snapshot credit primitives
+
+`storage/root-memory.ts` prepays a 128 KiB bank for five overlapping roots up to
+18 KiB each, including current/previous, preparation and the two roots captured
+by one serialized audit. Larger frames move ordinary caller credit before
+allocation. Copies use bounded task-clock chunks. Root frames carry the unchanged
+root-slot header/checksum; native publication borrows that frame until settlement
+without rereading slots or making another whole-root copy. Startup processes one
+native slot response at a time before allocating the prepaid read slab.
+
+`storage/root-pins.ts` holds pins in an intrusive generation-ordered list, with
+no per-generation Maps. Each descriptor and its label are charged before
+allocation to the supplied snapshot budget, or a separate non-evictable owner.
+The caller keeps its budget alive until release. Release is idempotent and
+returns its credit even after the space closes. These primitives supply C for
+the live composition; their individual tests do not establish the whole-space
+bound.
 
 ### R25 startup measurement
 

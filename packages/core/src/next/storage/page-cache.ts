@@ -214,7 +214,7 @@ export class PageCache implements EvictableCacheLike {
   }
 
   /** Connects the governor's handle and charges the fixed slabs (`RangeError` if it cannot). */
-  attach(memory: CacheMemory): void {
+  attach(memory: CacheMemory, deferReadSlab = false): void {
     if (this.#memory !== null || this.#closed)
       throw new TypeError("Cache already attached or closed");
     if (!memory.charge(FIXED_CACHE_BYTES)) {
@@ -222,13 +222,20 @@ export class PageCache implements EvictableCacheLike {
       throw new RangeError("The memory cap cannot hold the extent space's 2 MiB of fixed slabs");
     }
     try {
-      this.#slab = new Uint8Array(MAX_SLAB);
+      if (!deferReadSlab) this.#slab = new Uint8Array(MAX_SLAB);
     } catch (error) {
       memory.release(FIXED_CACHE_BYTES);
       memory.unregister?.();
       throw error;
     }
     this.#memory = memory;
+  }
+
+  /** Root loading temporarily uses the paid slab allowance for one native slot response. */
+  activateReadSlab(): void {
+    if (this.#memory === null || this.#closed || this.#slab.length !== 0)
+      throw new TypeError("Read slab cannot activate");
+    this.#slab = new Uint8Array(MAX_SLAB);
   }
 
   /** Borrow the already charged read slab for raw list cursors. Acquire before taking the

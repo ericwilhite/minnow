@@ -102,7 +102,10 @@ export async function openPairs(
   slot: number,
   ordered = false,
 ): Promise<ExtentPairs> {
-  const cursor = await journal.cursor(handle, slot);
+  // All pair helpers retain the input's owning reference for this entire synchronous workspace
+  // phase. Borrowing the cursor avoids four native refcount reads/writes per pass; the generic
+  // journal cursor still retains independently unless explicitly borrowed.
+  const cursor = await journal.cursor(handle, slot, true);
   try {
     return new ExtentPairs(cursor, ordered);
   } catch (error) {

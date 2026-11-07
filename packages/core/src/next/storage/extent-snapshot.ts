@@ -219,7 +219,9 @@ export async function reconstructMap(
               right = await b.next(work);
             } else {
               if (a.length !== b.length)
-                throw new StoreCorruptionError("Kept roots disagree on extent length");
+                throw new StoreCorruptionError(
+                  `The current and previous roots name different extents at ${String(a.offset)}`,
+                );
               offset = a.offset;
               length = a.length;
               left = await a.next(work);
@@ -239,6 +241,7 @@ export async function reconstructMap(
           // cache entries, never this fixed slab; no governor/caller wait is permitted here.
           owned.map = BoundedFreeSpaceMap.create(DATA_ALIGN, runArenaBytes(gaps), budget);
           await owned.map.copyFrom(temporary, work);
+          await check(work);
           return owned.map;
         } catch (error) {
           failed = true;

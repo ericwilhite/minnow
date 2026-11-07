@@ -6,7 +6,12 @@
  */
 import { xxHash32 } from "../hash/xxhash32.js";
 import { pauseIfDue, type TaskWork } from "../task.js";
-import { METADATA_PAGE_BYTES, StoreCorruptionError, type MetadataStore } from "./contract.js";
+import {
+  METADATA_PAGE_BYTES,
+  METADATA_SMALL_BYTES,
+  StoreCorruptionError,
+  type MetadataStore,
+} from "./contract.js";
 import {
   ReadDeniedError,
   type ByteBudget,
@@ -15,6 +20,8 @@ import {
 } from "./extents.js";
 
 export const METADATA_WORKSPACE_BYTES = 512 * 1024;
+/** Eight direct-mapped compact control pages, including buffer/view/header allowance. */
+export const METADATA_CONTROL_CACHE_BYTES = 2752;
 const MAGIC = 0x504d4e4d; // MNMP; private to this owner, not a supported database encoding.
 const HEADER = 24;
 const CHECKSUM = METADATA_PAGE_BYTES - 4;
@@ -34,6 +41,8 @@ const EMPTY: Uint8Array[] = [];
  *   516,096 bytes. Raw list cursor views borrow the separately charged read slab (S).
  * - release phase: two 60 KiB frames, one 256 KiB native response, one <=60 KiB boundary copy,
  *   three bounded vectors of <=256 ranges at 80 bytes, and 8 KiB control: 516,096 bytes.
+ * The compact native frame adds256B; a fixed eight-entry control cache adds at most2752B.
+ * The worst source phase is523216B; merge/release phases are519104B, all below512KiB.
  * The remaining allowance is headroom, not capacity for an O(extents) collection. The caller
  * must not overlap source reads with the merge/reclaim phase or escape a phase's frame views.
  * Native storage contents and unreachable GC garbage are not resident managed buffers.
@@ -43,6 +52,9 @@ export class MetadataWorkspace {
   #budget: ByteBudget | null;
   #memory: CacheMemory | null = null;
   #frames = EMPTY;
+  #io = new Uint8Array(METADATA_SMALL_BYTES);
+  #controls = new Uint8Array(8 * METADATA_SMALL_BYTES);
+  #controlHandles = new Float64Array(8);
   #active = false;
   #borrowed = 0;
   #readOnly = 0;
@@ -170,6 +182,34 @@ export class MetadataWorkspace {
     return value;
   }
 
+  /** Only immutable, successfully written control pages are cached. Payload pages still pass
+   * through native reads/checksums; the cache has fixed capacity and no per-page directory. */
+  readControl(handle: number, target: Uint8Array): boolean {
+    this.assertFrame(target);
+    const index = handle % 8;
+    if (this.#controlHandles[index] !== handle) return false;
+    target.fill(0);
+    target.set(
+      this.#controls.subarray(index * METADATA_SMALL_BYTES, (index + 1) * METADATA_SMALL_BYTES),
+    );
+    return true;
+  }
+  writtenControl(handle: number, frame: Uint8Array, kind: number, span: number): void {
+    this.assertFrame(frame);
+    const index = handle % 8;
+    if (span !== METADATA_SMALL_BYTES || (kind !== DESCRIPTOR && kind !== FREE)) {
+      if (this.#controlHandles[index] === handle) this.#controlHandles[index] = 0;
+      return;
+    }
+    this.#controls.set(frame.subarray(0, METADATA_SMALL_BYTES), index * METADATA_SMALL_BYTES);
+    this.#controlHandles[index] = handle;
+  }
+
+  compact(frame: Uint8Array): Uint8Array {
+    this.assertFrame(frame);
+    this.#io.set(frame.subarray(0, METADATA_SMALL_BYTES));
+    return this.#io;
+  }
   assertFrame(frame: Uint8Array): void {
     if (!this.#active || !this.#frames.includes(frame))
       throw new TypeError("Frame escaped its workspace phase");
@@ -182,6 +222,9 @@ export class MetadataWorkspace {
     if (this.#active) throw new TypeError("Cannot close an active workspace");
     if (this.#closed) return;
     this.#frames = EMPTY;
+    this.#io = new Uint8Array(0);
+    this.#controls = new Uint8Array(0);
+    this.#controlHandles = new Float64Array(0);
     this.#budget?.free(METADATA_WORKSPACE_BYTES);
     this.#memory?.release(METADATA_WORKSPACE_BYTES);
     this.#memory?.unregister?.();
@@ -222,6 +265,9 @@ export class MetadataJournal {
     readonly store: MetadataStore,
     readonly workspace: MetadataWorkspace,
   ) {}
+  get failed(): boolean {
+    return this.#failed;
+  }
   get pages(): number {
     return this.#next - 1;
   }
@@ -236,18 +282,20 @@ export class MetadataJournal {
     if (!safe(handle) || handle === 0 || handle >= this.#next)
       throw new RangeError("Invalid journal handle");
     try {
-      await this.store.read(handle - 1, frame);
+      if (!this.workspace.readControl(handle, frame)) await this.store.read(handle - 1, frame);
       const view = viewOf(frame),
         kind = view.getUint32(4, true),
-        next = view.getFloat64(8, true);
+        next = view.getFloat64(8, true),
+        span = view.getUint32(20, true);
       if (
         view.getUint32(0, true) !== MAGIC ||
-        view.getUint32(CHECKSUM, true) !== xxHash32(frame, 0, 0, CHECKSUM) ||
+        (span !== METADATA_PAGE_BYTES && span !== METADATA_SMALL_BYTES) ||
+        view.getUint32(span - 4, true) !== xxHash32(frame, 0, 0, span - 4) ||
         !safe(next) ||
         next >= this.#next ||
         (kind !== DESCRIPTOR && kind !== DATA && kind !== FREE) ||
         (expected !== undefined && kind !== expected) ||
-        view.getUint32(16, true) > METADATA_PAYLOAD_BYTES
+        view.getUint32(16, true) > Math.min(METADATA_PAYLOAD_BYTES, span - HEADER - 4)
       )
         throw new StoreCorruptionError("Malformed owner-private metadata page");
     } catch (error) {
@@ -263,9 +311,17 @@ export class MetadataJournal {
     if (!safe(handle) || handle === 0 || handle >= this.#next)
       throw new RangeError("Invalid journal handle");
     const view = viewOf(frame);
-    view.setUint32(CHECKSUM, xxHash32(frame, 0, 0, CHECKSUM), true);
+    const used = view.getUint32(16, true);
+    const span =
+      HEADER + used + 4 <= METADATA_SMALL_BYTES ? METADATA_SMALL_BYTES : METADATA_PAGE_BYTES;
+    view.setUint32(20, span, true);
+    view.setUint32(span - 4, xxHash32(frame, 0, 0, span - 4), true);
     try {
-      await this.store.write(handle - 1, frame);
+      await this.store.write(
+        handle - 1,
+        span === METADATA_SMALL_BYTES ? this.workspace.compact(frame) : frame,
+      );
+      this.workspace.writtenControl(handle, frame, view.getUint32(4, true), span);
     } catch (error) {
       this.#failed = true;
       throw error;
@@ -369,13 +425,13 @@ export class MetadataJournal {
       throw error;
     }
   }
-  async cursor(handle: number, slot: number): Promise<ChainCursor> {
+  async cursor(handle: number, slot: number, borrowed = false): Promise<ChainCursor> {
     if (slot === 0) throw new RangeError("Frame zero belongs to the journal");
     const frame = this.workspace.claim(slot);
     try {
       const descriptor = await this.describe(handle);
-      await this.retain(handle);
-      return new ChainCursor(this, slot, this.workspace.epoch, descriptor, handle);
+      if (!borrowed) await this.retain(handle);
+      return new ChainCursor(this, slot, this.workspace.epoch, descriptor, handle, !borrowed);
     } catch (error) {
       this.workspace.returnFrame(frame);
       throw error;
@@ -498,6 +554,7 @@ export class ChainCursor {
     readonly epoch: number,
     readonly descriptor: ChainDescriptor,
     readonly handle: number,
+    readonly retained = true,
   ) {
     this.#next = descriptor.first;
     this.#remaining = descriptor.length;
@@ -542,7 +599,7 @@ export class ChainCursor {
     if (this.#closed) return;
     this.#closed = true;
     try {
-      await this.journal.release(this.handle);
+      if (this.retained) await this.journal.release(this.handle);
     } finally {
       this.journal.workspace.returnFrame(this.frame);
     }

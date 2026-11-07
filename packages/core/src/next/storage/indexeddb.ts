@@ -56,6 +56,7 @@
 import {
   LOG_HEADER_SLOT_BYTES,
   METADATA_PAGE_BYTES,
+  METADATA_SMALL_BYTES,
   type MetadataStore,
   type ReadDataOptions,
   OwnershipLostError,
@@ -77,6 +78,7 @@ import { ByteStore, inOrder } from "./idb-bytes.js";
 import type { CacheMemory } from "./extents.js";
 import type { IdbDatabaseLike, IdbTransactionLike } from "./idb-like.js";
 import { chooseRoot, encodeRootSlot } from "./root-slot.js";
+import { preparedRoot } from "./root-memory.js";
 
 export interface IndexedDbBackendOptions {
   /**
@@ -523,6 +525,7 @@ export const IDB_BATCH_OPERATIONS = 256;
  * waits for settlement; the caller retains its charge. Other write queues keep their own rules.
  */
 class IdbSession implements StoreSession {
+  readonly rootWriterToken = {};
   readonly epoch: number;
   /** Relaxed writes are queued until their batch commits (`transfer` saves the copy). */
   readonly keepsWrites = true;
@@ -734,6 +737,18 @@ class IdbSession implements StoreSession {
     return (await this.#slots()).current?.root ?? null;
   }
 
+  async readRootSlot(slot: 0 | 1): Promise<Uint8Array | null> {
+    let bytes: Uint8Array | null = null;
+    await this.#read(["roots"], (tx) => {
+      tx.store("roots").get(`slot-${String(slot)}`, (value) => {
+        bytes = slotBytes(value);
+        if (bytes !== null && bytes.length > (1 << 20) + 20)
+          throw new StoreCorruptionError("Root slot exceeds1MiB payload");
+      });
+    });
+    return bytes;
+  }
+
   async readPreviousRoot(): Promise<Uint8Array | null> {
     return (await this.#slots()).previous?.root ?? null;
   }
@@ -750,6 +765,19 @@ class IdbSession implements StoreSession {
   async publish(root: Uint8Array): Promise<void> {
     this.#mutable();
     this.#lease.guard();
+    const prepared = preparedRoot(this, root);
+    if (prepared !== undefined) {
+      await this.#commit({
+        durability: "strict",
+        spaces: [],
+        extra: ["roots"],
+        write: (tx, next) => {
+          tx.store("roots").put(`slot-${String(prepared.slot)}`, prepared.frame.slotBytes.buffer);
+          next();
+        },
+      });
+      return;
+    }
     const copy = root.slice();
     await this.#commit({
       durability: "strict",
@@ -1060,16 +1088,22 @@ class IdbMetadata implements MetadataStore {
       !Number.isSafeInteger((page + 1) * METADATA_PAGE_BYTES)
     )
       throw new RangeError("Bad metadata page");
-    if (bytes.byteLength !== METADATA_PAGE_BYTES) throw new RangeError("Bad metadata frame");
+    if (bytes.byteLength !== METADATA_PAGE_BYTES && bytes.byteLength !== METADATA_SMALL_BYTES)
+      throw new RangeError("Bad metadata frame");
     return -page - 1;
   }
   async read(page: number, target: Uint8Array): Promise<void> {
     this.guard();
     const key = this.#key(page, target);
+    if (target.byteLength !== METADATA_PAGE_BYTES) throw new RangeError("Bad metadata read frame");
     await this.lease.read(["meta"], (tx) =>
       tx.store("meta").get(key, (value) => {
-        if (!(value instanceof ArrayBuffer) || value.byteLength !== METADATA_PAGE_BYTES)
+        if (
+          !(value instanceof ArrayBuffer) ||
+          (value.byteLength !== METADATA_PAGE_BYTES && value.byteLength !== METADATA_SMALL_BYTES)
+        )
           throw new StoreCorruptionError("Missing or malformed metadata page");
+        target.fill(0);
         target.set(new Uint8Array(value));
       }),
     );
