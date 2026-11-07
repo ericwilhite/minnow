@@ -10,8 +10,8 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
-import { cpus, homedir, loadavg, tmpdir } from "node:os";
-import { pathToFileURL } from "node:url";
+import { cpus, loadavg, tmpdir } from "node:os";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Session } from "node:inspector/promises";
 import {
   StorageCore,
@@ -62,8 +62,10 @@ const total = Number(option("--rows", "1000000")),
 if (!Number.isSafeInteger(total) || total < 1 || !Number.isSafeInteger(rounds) || rounds < 5)
   throw new RangeError("positive rows and at least five CPU rounds required");
 const harness = resolve(
-  option("--harness", join(homedir(), ".local/share/minnow-plan/analytics-harness")),
+  option("--harness", fileURLToPath(new URL("./next-executor-workload/", import.meta.url))),
 );
+const generatorPath = join(harness, args.includes("--harness") ? "gen.js" : "gen.mjs"),
+  cataloguePath = join(harness, args.includes("--harness") ? "queries.js" : "queries.mjs");
 const only = new Set(option("--only", "").split(",").filter(Boolean));
 const profileId = option("--profile", "");
 const frozenSQL = args.includes("--frozen");
@@ -95,8 +97,8 @@ const committed = frozenSQL
       >;
     })
   : null;
-const generator = (await import(pathToFileURL(join(harness, "gen.js")).href)) as Generator;
-const catalogue = (await import(pathToFileURL(join(harness, "queries.js")).href)) as Catalogue;
+const generator = (await import(pathToFileURL(generatorPath).href)) as Generator;
+const catalogue = (await import(pathToFileURL(cataloguePath).href)) as Catalogue;
 const core = await new StorageCore(8192).open();
 const lateSort = option("--late-sort", "on") !== "off";
 const keyOrder = option("--key-order", "on") !== "off";
@@ -131,8 +133,8 @@ const metadata = {
   sourceHashes: Object.fromEntries(
     await Promise.all(
       [
-        join(harness, "gen.js"),
-        join(harness, "queries.js"),
+        generatorPath,
+        cataloguePath,
         resolve("apps/site/bench/benchmark.ts"),
         resolve("packages/core/src/next/testing/executor-catalogue.json"),
         resolve("scripts/next-executor-bench.mts"),
