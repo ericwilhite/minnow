@@ -1463,3 +1463,13 @@ class or introducing negative zero fails at the intended operation. Reversing an
 unordered result passes. Live subscriptions, concurrent openers, crash schedules,
 native browser storage and order-dependent floating aggregates remain outside this
 serial harness; their existing suites still own those checks.
+
+### Rebuild-core log queue accounting
+
+The generated storage log-queue check holds a transaction open and independently counts retained
+input snapshots from copy creation through transaction settlement. It compares that live-byte
+count and peak with the real governor, checks the 4 MiB backend-owned queue bound, and checks
+that pressured appends wait. Refused copy admission borrows the still-charged caller buffer.
+Separate cases cover replaced tails, failed transactions, truncation order and close-time drain.
+This checks managed buffer accounting; native IndexedDB clones and browser RSS still need the
+Gate D browser measurement.

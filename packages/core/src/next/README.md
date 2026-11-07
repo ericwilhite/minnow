@@ -1472,3 +1472,13 @@ capped text fallback in the bench adapter; fixed-width values and emitted codes 
 Bench frame-boundary memory snapshots report charges, including idle pool, active read/descriptor
 remainder, decoded output and live frames. Frames overlap the source/result allocation counters;
 independent maxima must never be added, and these counters do not partition physical RSS.
+
+### IndexedDB log queue ownership
+
+Log append snapshots and coalescing tails are charged to the backend's governor registration
+before allocation. Their charges survive queued and in-flight transactions, even after append
+resolves or a tail is replaced, and are returned only after the final reference settles.
+Backend-owned log buffers total at most 4 MiB across all batches. At that bound or when a copy
+charge cannot fit, append borrows the caller's input and waits for its transaction to settle.
+The caller must keep that input immutable and charged until resolution. No size refusal or
+uncharged fallback copy is introduced. OPFS writes synchronously and retains no append copy.
