@@ -512,6 +512,23 @@ export const ROW_LOCK_TARGET_STATES = [
 /** A view remains a relation lock target even when its body has no table. */
 export const ROW_LOCK_VIEW_STATES = ["read only refused", "read write allowed"] as const;
 
+/** Real IndexedDB events count even when no per-request adapter promise is waiting for them. */
+export const INDEXEDDB_NATIVE_PROGRESS_STATES = [
+  "get",
+  "getKey",
+  "count",
+  "cursor",
+  "same connection",
+  "other connection",
+  "one waiter",
+  "several waiters",
+  "small budget",
+  "large budget",
+  "continuous native progress",
+  "silence still bounded",
+  "shared failure",
+] as const;
+
 /** Admission follows PG; the strength-free SELECT diagnostic never describes a syntax-only lock. */
 export const ROW_LOCK_DIAGNOSTIC_STATES = [
   "read only refused",

@@ -12,6 +12,11 @@ compatibility policy and release process.
 
 Release packages: `@minnowdb/core@0.20.0`.
 
+IndexedDB's silence guard now counts native request and transaction events, including bulk
+requests whose caller waits only for transaction completion. A long transaction that keeps
+answering no longer produces a false `StorageUnresponsiveError`. The 30-second deadline,
+error type and stored formats are unchanged; no migration is needed.
+
 Locking reads refused in a READ ONLY transaction now consistently say
 `cannot execute SELECT in a read-only transaction`. The message no longer names a lock strength
 that may be weaker than a view's own clause. Plans still retain the strongest effective intent

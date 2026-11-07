@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { classifyError } from "../engine/errors.js";
 import { IndexedDbBlockStore, INDEXEDDB_UNRESPONSIVE_AFTER_MS } from "./indexeddb.js";
 import { StorageCorruptionError, StorageUnresponsiveError, UnknownOutcomeError } from "./types.js";
+import { createReach, INDEXEDDB_NATIVE_PROGRESS_STATES } from "../testing/reach.js";
 
 /**
  * A connection that answers nothing.
@@ -147,6 +148,114 @@ async function openStore(unresponsiveAfterMs: number): Promise<{
 }
 
 describe("an IndexedDB connection that stops answering", () => {
+  it("counts native connection progress independently of awaited request promises", async () => {
+    const reach = createReach<string>(
+      "IndexedDB native progress",
+      INDEXEDDB_NATIVE_PROGRESS_STATES,
+    );
+    let histories = 0;
+    for (const budget of [40, 80])
+      for (const divisor of [3, 5])
+        for (const kind of ["get", "getKey", "count", "cursor"] as const)
+          for (const sameConnection of [true, false])
+            for (const waiters of [1, 2, 3, 4]) {
+              reach.beginHistory();
+              histories += 1;
+              vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+              const current = await openStore(budget);
+              const db = firstConnection(current.connections);
+              const other = sameConnection ? undefined : await openStore(budget);
+              const trafficDb = other === undefined ? db : firstConnection(other.connections);
+              // Save the real connection's transaction constructor before wedging the awaited
+              // request. Native requests then keep answering on this connection, or another
+              // connection with the same name, without settling an adapter-owned promise.
+              const nativeTransaction = trafficDb.transaction.bind(trafficDb);
+              wedge(db);
+              try {
+                const failures = Array.from({ length: waiters }, (_, index) =>
+                  current.store
+                    .getBlock(`silent-${String(index)}`)
+                    .catch((error: unknown) => error),
+                );
+                let settled = false;
+                void failures[0]?.then(() => {
+                  settled = true;
+                });
+                const step = Math.floor(budget / divisor);
+                const rounds = Math.ceil((3 * budget) / step);
+                let observed = 0;
+                trafficDb.addEventListener(
+                  "success",
+                  () => {
+                    observed += 1;
+                  },
+                  true,
+                );
+                await new Promise<void>((resolve, reject) => {
+                  const transaction = nativeTransaction("blocks", "readonly");
+                  const blocks = transaction.objectStore("blocks");
+                  let completed = 0;
+                  const next = (): void => {
+                    const request =
+                      kind === "get"
+                        ? blocks.get("absent")
+                        : kind === "getKey"
+                          ? blocks.getKey("absent")
+                          : kind === "count"
+                            ? blocks.count()
+                            : blocks.openCursor("absent");
+                    request.onerror = () =>
+                      reject(new Error("Native request failed", { cause: request.error }));
+                    request.onsuccess = () => {
+                      completed += 1;
+                      // Advance between real success events (which do not bubble), leaving
+                      // the last event at the current time for the exact silence assertion.
+                      // No adapter request promise is released here.
+                      if (completed < rounds) {
+                        next();
+                        vi.advanceTimersByTime(step);
+                      }
+                    };
+                  };
+                  transaction.oncomplete = () => resolve();
+                  transaction.onabort = () =>
+                    reject(new Error("Native transaction aborted", { cause: transaction.error }));
+                  next();
+                });
+                await vi.advanceTimersByTimeAsync(0);
+                expect(observed, kind).toBe(rounds);
+                expect(settled, `${kind}: only this connection's native events count`).toBe(
+                  !sameConnection,
+                );
+                if (sameConnection) {
+                  reach.reach("continuous native progress");
+                  await vi.advanceTimersByTimeAsync(budget - 1);
+                  expect(settled).toBe(false);
+                  await vi.advanceTimersByTimeAsync(1);
+                }
+                expect(settled, "genuine silence must still be bounded").toBe(true);
+                const errors = await Promise.all(failures);
+                for (const error of errors) {
+                  expect(error).toBeInstanceOf(StorageUnresponsiveError);
+                  expect((error as StorageUnresponsiveError).waitedMs).toBe(budget);
+                  expect(error).toBe(errors[0]);
+                }
+                reach.reach(kind);
+                reach.reach(sameConnection ? "same connection" : "other connection");
+                reach.reach(waiters === 1 ? "one waiter" : "several waiters");
+                reach.reach(budget === 40 ? "small budget" : "large budget");
+                reach.reach("silence still bounded");
+                if (waiters > 1) reach.reach("shared failure");
+              } finally {
+                current.store.close();
+                other?.store.close();
+                vi.useRealTimers();
+              }
+            }
+    expect(histories).toBe(128);
+    reach.assertReached();
+  });
+
   it("fails the waiting call with a typed error instead of hanging", async () => {
     const { store, connections } = await openStore(50);
     wedge(firstConnection(connections));
