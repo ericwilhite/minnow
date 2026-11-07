@@ -754,6 +754,7 @@ export class ColumnStore {
   #chargeWideRows(k: number, at: number, n: number): void {
     let bytes = 0;
     for (const column of this.#columns) {
+      if (column.layout !== "decimal") continue;
       const data = column.chunks[k]?.data as Decimal | undefined;
       if (data?.coefficients.repr !== "wide") continue;
       for (let i = at; i < at + n; i++) bytes += bigintBytes(data.coefficients.values[i] ?? 0n);
