@@ -11,6 +11,11 @@
  * Fixture descriptors replace SQL/catalog/group-root loading. The scan requests a one-pass
  * coalesced row window from TableScan (64 MiB by default), with its ordinary byte target.
  * MINNOW_EXPORT_SCAN_IO_COMPARE=1 compares it with the parent cached per-batch policy.
+ * MINNOW_EXPORT_SCAN_OWNED_COMPARE=1 compares borrowed/copy with dictionary-preserving owned
+ * decode/adopt. The source retains dictionary charges; the owner still copies dictionary deltas
+ * and capped text fallback. The component bench also records the slower all-flat diagnostic.
+ * Frame-boundary charged counters overlap (source output includes adopted in-flight frames);
+ * they are not an exact physical-RSS partition. Absolute renderer baseline/peak is also recorded.
  * Five interleaved cold/warm attempts per mode; sparse CDP profiles bracket setup-excluded
  * thread CPU (1-second sampling interval, not a hotspot profile). Both await all frame credits.
  * MINNOW_EXPORT_SCAN_PROFILE=1 instead profiles only the scan worker, cold and warm, requesting
@@ -65,13 +70,15 @@ const COMPARE_STREAM = process.env.MINNOW_EXPORT_COMPARE_STREAM === "1";
 const SCAN_PROFILE = process.env.MINNOW_EXPORT_SCAN_PROFILE === "1";
 const FRAME_COPY_COMPARE = process.env.MINNOW_EXPORT_FRAME_COPY_COMPARE === "1";
 const SCAN_RANGE_COMPARE = process.env.MINNOW_EXPORT_SCAN_RANGE_COMPARE === "1";
+const SCAN_OWNED_COMPARE = process.env.MINNOW_EXPORT_SCAN_OWNED_COMPARE === "1";
 const SCAN_IO_COMPARE = process.env.MINNOW_EXPORT_SCAN_IO_COMPARE === "1";
 const SCAN_COMPARE =
   process.env.MINNOW_EXPORT_SCAN_COMPARE === "1" ||
   SCAN_PROFILE ||
   FRAME_COPY_COMPARE ||
   SCAN_RANGE_COMPARE ||
-  SCAN_IO_COMPARE;
+  SCAN_IO_COMPARE ||
+  SCAN_OWNED_COMPARE;
 const DEPTH_COMPARE = process.env.MINNOW_EXPORT_DEPTH_COMPARE === "1";
 const READ_COMPARE = process.env.MINNOW_EXPORT_READ_COMPARE === "1";
 const VARIANCE = process.env.MINNOW_EXPORT_VARIANCE === "1";
@@ -356,6 +363,9 @@ interface Row {
   /** Hot set and scanned pages left after evicting everything but the hot set's size. */
   readonly hotKept: string;
   readonly scannedKept: string;
+  readonly rendererCampaignGrowthMiB: number;
+  readonly rendererRssBaselineMiB: number;
+  readonly rendererRssAbsolutePeakMiB: number;
   readonly rendererRssPeakMiB: number;
   readonly workerHeapPeakMiB: number;
   /** The export worker's thread CPU (whole worker, setup included; sampled every 200 ms). */
@@ -407,6 +417,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       `dd of the data file: cold ${String(device.coldMBps)} MB/s, warm ${String(device.warmMBps)} MB/s`,
     );
 
+    const campaignRendererBaselineMiB = rendererRss(profile) / MiB;
     const results: Row[] = [];
     const measure = async (
       label: string,
@@ -467,6 +478,15 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       if (COMPARE_STREAM)
         expect(pass.baselineCommit).toBe(process.env.MINNOW_EXPORT_BASELINE_COMMIT ?? "18548e34");
       expect(pass.verifying, "the cached-bytes guard re-hashes every release").toBe(false);
+      if (options.scanOutput === "dictionary" || options.scanOutput === "flat") {
+        expect(pass.scanStats?.copies.adoptedFrames, "candidate ownership must be active").toBe(
+          pass.scanStats?.frames,
+        );
+        expect(pass.scanStats?.copies.adoptedBytes).toBeGreaterThan(0);
+      } else if (options.scanOutput === "borrowed") {
+        expect(pass.scanStats?.copies.adoptedFrames).toBe(0);
+        expect(pass.scanStats?.copies.copiedBytes).toBe(pass.scanStats?.wireBytes);
+      }
       const bytes = (built.dataBytes * pass.rows) / (rows + 65_536);
       const cpuSeconds = [...passCpu.values()].reduce((sum, seconds) => sum + seconds, 0);
       const exportCpu = targets.profileCpuSeconds.at(-1);
@@ -515,6 +535,9 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         protectedMiB: `${pass.protectedBeforeMiB.toFixed(1)} → ${pass.protectedAfterMiB.toFixed(1)}`,
         hotKept: pass.kept?.hot ?? "",
         scannedKept: pass.kept?.scanned ?? "",
+        rendererCampaignGrowthMiB: rssPeak / MiB - campaignRendererBaselineMiB,
+        rendererRssBaselineMiB: rssBefore / MiB,
+        rendererRssAbsolutePeakMiB: rssPeak / MiB,
         rendererRssPeakMiB: Math.round((rssPeak - rssBefore) / MiB),
         workerHeapPeakMiB: Math.round(heapPeak / MiB),
         workerCpuSeconds: Number(cpuSeconds.toFixed(2)),
@@ -525,7 +548,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     };
 
     const base = { once: true, capMiB: 512, passes: 1, groups: exported };
-    if (FRAME_COPY_COMPARE || SCAN_RANGE_COMPARE || SCAN_IO_COMPARE) {
+    if (FRAME_COPY_COMPARE || SCAN_RANGE_COMPARE || SCAN_IO_COMPARE || SCAN_OWNED_COMPARE) {
       const options = {
         ...base,
         mode: "scan" as const,
@@ -539,16 +562,21 @@ test.describe("rebuild core export on OPFS (bench)", () => {
           ? (["baseline", "candidate"] as const)
           : (["candidate", "baseline"] as const))
           await measure(
-            `cold scan ${FRAME_COPY_COMPARE ? "frame copy" : SCAN_IO_COMPARE ? "IO" : "range"} ${variant} round ${String(round)}`,
+            `cold scan ${FRAME_COPY_COMPARE ? "frame copy" : SCAN_IO_COMPARE ? "IO" : SCAN_OWNED_COMPARE ? "ownership" : "range"} ${variant} round ${String(round)}`,
             true,
             false,
             {
               ...options,
               ...(FRAME_COPY_COMPARE
                 ? { frameCopy: variant }
-                : SCAN_IO_COMPARE
-                  ? { scanIO: variant === "baseline" ? ("batch" as const) : ("window" as const) }
-                  : { scanRange: variant }),
+                : SCAN_OWNED_COMPARE
+                  ? {
+                      scanOutput:
+                        variant === "baseline" ? ("borrowed" as const) : ("dictionary" as const),
+                    }
+                  : SCAN_IO_COMPARE
+                    ? { scanIO: variant === "baseline" ? ("batch" as const) : ("window" as const) }
+                    : { scanRange: variant }),
             },
           );
     } else if (SCAN_COMPARE) {
@@ -727,16 +755,24 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       governorCapMiB: base.capMiB,
       rowWindowMiB: WINDOW_MIB,
       heapSampling: targets.ok,
+      campaignRendererBaselineMiB,
+      campaignRendererPeakMiB: Math.max(...results.map((r) => r.rendererRssAbsolutePeakMiB)),
       ...(SCAN_COMPARE
         ? {
             scanAdapter:
               "bench stand-in for future executor frame assembly; real TableScan/ResultChannel/owner transfer policy/MessagePort credits; fixture descriptors exclude SQL/catalog/root loading",
             cpuSamplingIntervalUs: SCAN_PROFILE ? 500 : 1_000_000,
             rounds:
-              FRAME_COPY_COMPARE || SCAN_RANGE_COMPARE || SCAN_IO_COMPARE
+              FRAME_COPY_COMPARE || SCAN_RANGE_COMPARE || SCAN_IO_COMPARE || SCAN_OWNED_COMPARE
                 ? 5
                 : Number(process.env.MINNOW_EXPORT_SCAN_ROUNDS ?? (SCAN_PROFILE ? 1 : 5)),
             scanProfile: SCAN_PROFILE,
+            ...(SCAN_OWNED_COMPARE
+              ? {
+                  scanOwnedComparison:
+                    "borrowed/copy vs dedicated fixed-width/adopt; same text policy; BENCH adapter, real owner transfers",
+                }
+              : {}),
             ...(SCAN_IO_COMPARE
               ? { scanIOComparison: "cached per-batch vs coalesced one-pass 64 MiB row windows" }
               : {}),
@@ -744,6 +780,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
               FRAME_COPY_COMPARE ||
               SCAN_RANGE_COMPARE ||
               SCAN_IO_COMPARE ||
+              SCAN_OWNED_COMPARE ||
               process.env.MINNOW_EXPORT_SCAN_COLD_ONLY === "1",
             ...(SCAN_RANGE_COMPARE
               ? {

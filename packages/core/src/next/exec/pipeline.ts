@@ -36,7 +36,8 @@
  * ## Ownership handoff
  * - Default (no `transfer`): borrow, as above. Keeping anything past readiness means copying.
  * - `transfer`: the producer hands the buffers over (retain without copy). The operator owns the
- *   batch until it calls `transfer.release()`, which returns the buffers to the producer's pool.
+ *   batch until it calls `transfer.release()`, which returns reusable buffers to the producer's pool
+ *   or releases dedicated output charges. Only `detachableBuffers` authorizes irreversible transfer.
  *   The pool has a fixed number of batches (its credits); a producer with no free batch blocks
  *   in `next()` until one is released. Retained batches are therefore bounded and charged to the
  *   producer's grant, never invisible.
@@ -53,6 +54,7 @@
  * fixed window of result bytes in flight to the client and returns `blocked` beyond it, so a
  * slow consumer pauses the pipeline instead of growing a buffer (exec/result.ts).
  */
+import type { ByteBudget } from "../access/space.js";
 import type { MaybePromise } from "../access/key-index.js";
 import type { Batch } from "../vector/vector.js";
 
@@ -60,6 +62,16 @@ export type PushResult = "ready" | "blocked";
 
 /** Retain-without-copy: the receiver owns the batch until it calls `release`. */
 export interface Transfer {
+  /** Explicit permission for irreversible transfer of dedicated output buffers. Never names
+   * cached pages, leased slabs or reusable producer-pool buffers. An unmarked handoff only
+   * permits retention; release returns its buffers to the producer pool as usual.
+   * For detachable output, release returns the charge/credit, never a detached buffer to a pool.
+   */
+  readonly detachableBuffers?: ReadonlySet<ArrayBuffer>;
+  /** Where those buffers remain charged. A result sink can adopt without another charge only
+   * when this is its result budget; otherwise it must copy/reclassify before publishing.
+   */
+  readonly detachableBudget?: ByteBudget;
   release(): void;
 }
 

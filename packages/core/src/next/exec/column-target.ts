@@ -14,7 +14,10 @@
  * - Sizing reads the same layout description as decoding (`shapeOf`): `outputBytes` is what a
  *   decode produces (fixed and variable parts) and `growthFor` what it newly charges, so a scan
  *   bounds batches and reserves memory before it decodes anything.
- * The vector returned is valid until the next decode into the same target.
+ * `decode` borrows until the next decode. `decodeOwned` instead allocates tight dedicated output
+ * buffers (including flat UTF-8 text), charged independently until the caller returns its recorded byte charge.
+ * It never exposes dictionary/page/cache buffers; all-valid proofs use verified loaded masks.
+ * The vector returned by `decode` is valid until the next decode into the same target.
  */
 import type { PhysicalType } from "../types.js";
 import { layoutOf } from "../types.js";
@@ -103,9 +106,20 @@ interface Use {
 
 /** What a decode of a spec produces: dictionary codes, or flat data (validity in both). */
 type Shape =
-  | { readonly codes: Int32Array; readonly validity: Uint32Array; readonly dictionary: FlatVector }
-  | { readonly data: VectorData; readonly validity: Uint32Array };
+  | {
+      readonly codes: Int32Array;
+      readonly validity: Uint32Array | null;
+      readonly dictionary: FlatVector;
+    }
+  | { readonly data: VectorData; readonly validity: Uint32Array | null };
 
+/** Fresh decode buffers, never pages/cache/pool storage. Caller returns `bytes` to the allocation memory after ownership ends.
+ * A dictionary vector also borrows its immutable dictionary; its caller must retain that reader. */
+export interface OwnedColumn {
+  readonly vector: Vector;
+  readonly buffers: readonly ArrayBuffer[];
+  readonly bytes: number;
+}
 export class ColumnTarget {
   readonly #memory: TargetMemory;
   readonly #layout: ReturnType<typeof layoutOf>;
@@ -121,6 +135,83 @@ export class ColumnTarget {
   ) {
     this.#memory = memory;
     this.#layout = layoutOf(type);
+  }
+
+  /** Decode directly into tight, dedicated output buffers. Text stays UTF-8 bytes.
+   * Only fresh output buffers are marked detachable. With dictionaryCodes, the caller must
+   * also retain the reader/dictionary and its charge through output release. Otherwise text
+   * pages decode to fresh flat UTF-8. The caller prepays outputBytes with the same policy.
+   */
+  decodeOwned(
+    pages: ChunkPages,
+    spec: DecodeSpec,
+    dictionaryCodes = false,
+    memory: TargetMemory = this.#memory,
+  ): OwnedColumn {
+    const count = rowsOf(spec);
+    if (count > this.capacity) throw new RangeError("A decode larger than its target");
+    const buffers: ArrayBuffer[] = [];
+    let bytes = 0;
+    const create = <T extends Typed | BigInt64Array>(
+      Type: { new (n: number): T; readonly BYTES_PER_ELEMENT: number },
+      n: number,
+    ): T => {
+      const size = n * Type.BYTES_PER_ELEMENT;
+      memory.take(size);
+      bytes += size;
+      const array = new Type(n);
+      if (!(array.buffer instanceof ArrayBuffer))
+        throw new TypeError("Expected dedicated ArrayBuffer");
+      buffers.push(array.buffer);
+      return array;
+    };
+    try {
+      const shape = shapeOf(
+        this.#layout,
+        pages,
+        spec,
+        { buffer: (b) => create(b.Type, b.elements(count)), varlen: (n) => create(Uint8Array, n) },
+        dictionaryCodes,
+        true,
+      );
+      const target: Vector =
+        "codes" in shape
+          ? {
+              form: "dictionary",
+              type: this.type,
+              length: count,
+              validity: shape.validity,
+              codes: shape.codes,
+              dictionary: shape.dictionary,
+              dictionaryId: dictionaryIdOf(shape.dictionary),
+            }
+          : {
+              form: "flat",
+              type: this.type,
+              length: count,
+              validity: shape.validity,
+              data: shape.data,
+            };
+      if (target.form === "dictionary") {
+        if ("from" in spec) pages.decodeCodes(spec.from, spec.to, target.codes, target.validity);
+        else pages.gatherCodes(spec.rows, target.codes, target.validity, 0, 0, spec.count);
+      } else if ("from" in spec) pages.decodeRange(spec.from, spec.to, target, 0);
+      else pages.gather(spec.rows, target, 0, 0, spec.count);
+      if (shape.validity !== null && allValid(shape.validity, count)) {
+        target.validity = null;
+        const validity = shape.validity;
+        const at = buffers.findIndex((b) => b === validity.buffer);
+        if (at < 0) throw new Error("Missing owned validity buffer");
+        buffers.splice(at, 1);
+        const unused = shape.validity.byteLength;
+        memory.give(unused);
+        bytes -= unused;
+      }
+      return { vector: target, buffers, bytes };
+    } catch (error) {
+      memory.give(bytes);
+      throw error;
+    }
   }
 
   /** The rows a buffer made for `held` rows grows to for a decode of `rows` (0: no growth). */
@@ -196,19 +287,32 @@ export class ColumnTarget {
    * Bytes of the vector decoding `spec` produces, as decoded: validity, codes or values, scales,
    * limbs, specials, offsets and varlen bytes (full value lengths). Pages loaded.
    */
-  static outputBytes(pages: ChunkPages, type: PhysicalType, spec: DecodeSpec): number {
+  static outputBytes(
+    pages: ChunkPages,
+    type: PhysicalType,
+    spec: DecodeSpec,
+    dictionaryCodes = true,
+    omitAllValid = false,
+  ): number {
     const rows = rowsOf(spec);
     let bytes = 0;
-    shapeOf(layoutOf(type), pages, spec, {
-      buffer: (b) => {
-        bytes += b.elements(rows) * b.Type.BYTES_PER_ELEMENT;
-        return b.empty;
+    shapeOf(
+      layoutOf(type),
+      pages,
+      spec,
+      {
+        buffer: (b) => {
+          bytes += b.elements(rows) * b.Type.BYTES_PER_ELEMENT;
+          return b.empty;
+        },
+        varlen: (n) => {
+          bytes += n;
+          return NO_BYTES;
+        },
       },
-      varlen: (n) => {
-        bytes += n;
-        return NO_BYTES;
-      },
-    });
+      dictionaryCodes,
+      omitAllValid,
+    );
     return bytes;
   }
 
@@ -260,7 +364,7 @@ export class ColumnTarget {
       varlen: (n) => this.#varlen(n),
     });
     const validity = shape.validity;
-    validity.fill(0, 0, (count + 31) >>> 5);
+    validity?.fill(0, 0, (count + 31) >>> 5);
     if ("codes" in shape) {
       const codes = shape.codes;
       if ("from" in spec) pages.decodeCodes(spec.from, spec.to, codes, validity, 0);
@@ -316,16 +420,23 @@ function shapeOf(
   pages: ChunkPages,
   spec: DecodeSpec,
   use: Use,
+  dictionaryCodes = true,
+  omitAllValid = false,
 ): Shape {
   const count = rowsOf(spec);
   const [lo, hi] =
     "from" in spec
       ? [spec.from, spec.to]
       : [spec.rows[0] ?? 0, (spec.rows[Math.max(0, spec.count - 1)] ?? 0) + 1];
+  const needValidity = !(omitAllValid && count > 0 && pages.isAllValid?.(lo, hi) === true);
   const dictionary = pages.dictionary;
-  if (count > 0 && dictionary !== null && pages.isDictionaryRange(lo, hi))
-    return { codes: use.buffer(CODES), validity: use.buffer(VALIDITY), dictionary };
-  const validity = use.buffer(VALIDITY);
+  if (dictionaryCodes && count > 0 && dictionary !== null && pages.isDictionaryRange(lo, hi))
+    return {
+      codes: use.buffer(CODES),
+      validity: needValidity ? use.buffer(VALIDITY) : null,
+      dictionary,
+    };
+  const validity = needValidity ? use.buffer(VALIDITY) : null;
   const [first, end] = pages.pagesInRange(lo, Math.max(hi, lo + 1));
   const int64 = (): Int64Values =>
     pages.isSafe(first, end)

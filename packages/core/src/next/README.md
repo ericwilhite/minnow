@@ -1412,3 +1412,32 @@ branch).
 - **Group commit is essential.** `flush()` is one real disk flush on every engine: 3.4–4.7 ms.
 - **Cross-tab round trips are slow on WebKit.** Measured at about 55–65 µs on Chromium, 140 µs on
   Firefox and 280 µs on WebKit (p95 520 µs).
+
+The terminal export experiment can also request `TableScan.transferOutputs`. Unfiltered group
+output without locators, deletions or missing columns then decodes into fresh, tight, dedicated
+buffers. `"dictionary"` retains dictionary codes and keeps the dictionary charge through output
+release; `true` flattens text to UTF-8 bytes as an alternative diagnostic. Only fresh output buffers are marked in
+`Transfer.detachableBuffers`. Cached pages, dictionaries, read slabs and reusable output pools
+are never detachable. Four batch credits and a four-MiB threshold (plus one batch) bound retained
+output, and loan-backed output must be released before the next step. Charges last through
+client release, including after detachment or source abort. Terminal scans can provide
+`outputBudget`, so dedicated buffers are charged to the result grant from creation. The bench
+adopts only buffers marked with that exact result-budget identity; other handoffs copy. Output
+reservation waits for retained credits, then shrinks on refusal. A separate output budget that
+refuses even one row reports an error; the experiment does not borrow a second grant's loan. Other scan paths keep borrowing.
+
+`MINNOW_EXPORT_SCAN_OWNED_COMPARE=1 npm run benchmark:export` compares borrowed dictionary/copy
+output with dictionary-preserving owned decode/adopt output in five interleaved cold attempts. Both use real
+TableScan, ResultChannel, owner transfer policy and MessagePort credits through the labelled
+bench-only frame adapter. `npx vite-node scripts/scan-owned-bench.mts` isolates scan decode and
+frame assembly over memory-backed input, using the real governor and separate query/result grants (setup and warmup cleanup excluded; process/thread CPU
+and wall time). It includes output allocations, frame accounting and real in-process transfers,
+with four frames held; it excludes MessagePort IPC. `--profile` records one diagnostic pass per
+variant, never a performance comparison.
+The component benchmark includes borrowed, dictionary-preserving owned, and all-flat owned
+variants in five interleaved rounds. The all-flat diagnostic changes text policy and can change
+frame counts and wire bytes. Dictionary-preserving ownership still copies dictionary deltas and
+capped text fallback in the bench adapter; fixed-width values and emitted codes can transfer.
+Bench frame-boundary memory snapshots report charges, including idle pool, active read/descriptor
+remainder, decoded output and live frames. Frames overlap the source/result allocation counters;
+independent maxima must never be added, and these counters do not partition physical RSS.

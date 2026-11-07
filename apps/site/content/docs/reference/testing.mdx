@@ -1218,6 +1218,18 @@ The scan export requests a charged, coalesced row window from the core scan (64 
 GC are outside its CPU/wall timings. The row window is optional; filters retain selective reads,
 and a refused window is released and reduced before falling back to ordinary batch loading.
 
+The rebuild's opt-in `MINNOW_EXPORT_SCAN_OWNED_COMPARE=1 npm run benchmark:export` compares
+borrowed scan output copied into frames with dedicated output decoded into transferable
+buffers while retaining dictionary codes. It uses the same labelled bench adapter, real result credits and owner transfer policy.
+Dedicated buffers are allocated in the result grant and stay charged until client credit.
+The component benchmark is `npx vite-node scripts/scan-owned-bench.mts`: it includes allocations,
+the real governor, frame accounting and real in-process transfers with four frames held, excluding MessagePort IPC.
+`--profile` runs one diagnostic pass per variant, not a performance comparison. Both record CPU and wall
+time; the browser also records absolute renderer RSS and charged-memory snapshots. Charged
+memory is not physical RSS, and independent category peaks must not be added. Dictionary deltas
+and capped text fallback still need ownership copies. The component benchmark also records
+an all-flat diagnostic, which changes text policy and may change wire bytes and frame counts.
+
 **Storage kill campaign.** The nightly run also runs `npm run test:storage-kills`: the rebuild
 core's storage in Chromium, on OPFS and on IndexedDB, killed 1,000 times each at seeded random
 moments while a worker builds and publishes extents, retires and reclaims them, appends, flushes,

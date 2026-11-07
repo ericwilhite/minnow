@@ -1709,6 +1709,16 @@ export class ChunkReader {
     return true;
   }
 
+  /** Proof from loaded, verified masks, never from untrusted summary null counts. */
+  isAllValid(from: number, to: number): boolean {
+    const [first, end] = this.pagesInRange(from, to);
+    for (let page = first; page < end; page++) {
+      const view = this.#pages[page];
+      if (view === undefined || view.allNull || view.validity !== null) return false;
+    }
+    return true;
+  }
+
   /**
    * Whether int64-family values over the loaded pages `[first, end)` (default: the whole chunk,
    * by its statistics) fit the f64 `safe` representation.

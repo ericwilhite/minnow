@@ -148,6 +148,7 @@ export async function exportPass(options: {
   readonly frameCopy?: "baseline" | "candidate";
   readonly scanRange?: "baseline" | "candidate";
   readonly scanIO?: "batch" | "window";
+  readonly scanOutput?: "borrowed" | "flat" | "dictionary";
 }): Promise<ExportPass[]> {
   if (built === null) throw new Error("build the table first");
   const groups = built.groups.slice(0, options.groups ?? built.groups.length);
@@ -169,6 +170,7 @@ export async function exportPass(options: {
     ...(options.frameCopy === undefined ? {} : { frameCopy: options.frameCopy }),
     ...(options.scanRange === undefined ? {} : { scanRange: options.scanRange }),
     ...(options.scanIO === undefined ? {} : { scanIO: options.scanIO }),
+    ...(options.scanOutput === undefined ? {} : { scanOutput: options.scanOutput }),
     ...(options.groupDepth === undefined ? {} : { groupDepth: options.groupDepth }),
     ...(options.readMiB === undefined ? {} : { readMiB: options.readMiB }),
     ...(options.profile === true ? { profile: true } : {}),

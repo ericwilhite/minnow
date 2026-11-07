@@ -83,6 +83,8 @@ export interface ChunkPages {
   isDictionaryRange(from: number, to: number): boolean;
   /** Whether int64-family values over pages `[first, end)` fit the f64 `safe` representation. */
   isSafe(first?: number, end?: number): boolean;
+  /** Optional proof from verified, loaded page masks; false/absent keeps an output validity mask. */
+  isAllValid?(from: number, to: number): boolean;
   /**
    * Out-of-line values (page/large-value.ts): a decode reaching such a row needs it loaded first,
    * for a range or for the selected rows; values stay leased until `releaseValues` (all, or the

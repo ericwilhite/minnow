@@ -1240,6 +1240,274 @@ describe("review B4-p2c-2: the scan's lifecycle, budget and pacing", () => {
  * before borrowing again), and the scan's abort contract (table-scan.ts "Pacing and ending").
  */
 describe("review B4-p2c-3: loans under the real governor", () => {
+  it.each(seedsFor("next-owned-result-budget", [0xb2ad, 0xb2ae]))(
+    "result allocations wait for released credit, including abort seed %i",
+    async (seed) => {
+      const reach = createReach("next-owned-result-budget", [
+        "result charge",
+        "wait for result credit",
+        "abort retained result",
+        "progress after result credit",
+        "one-row result refusal",
+      ] as const);
+      await fc.assert(
+        fc.asyncProperty(fc.integer({ min: 10, max: 30 }), fc.boolean(), async (n, cancel) => {
+          reach.beginHistory();
+          const space = new MemoryExtentSpace(),
+            rows = rowsOf(mulberry32(n), n, false).map((r, k) => ({ ...r, i: k }));
+          const table: TableSnapshot = {
+              tableId: 9,
+              schemaVersion: 1,
+              columns: DEFS,
+              segments: [await groupSegment(0, rows, new Set(), false, space)],
+              liveRowCount: n,
+            },
+            budget = counting();
+          const output = {
+            held: 0,
+            allocate(bytes: number) {
+              if (output.held > 0 || output.held + bytes > 16) return false;
+              output.held += bytes;
+              return true;
+            },
+            free(bytes: number) {
+              output.held -= bytes;
+            },
+          };
+          const scan = scanOf(table, space, null, {
+            budget,
+            outputBudget: output,
+            columns: [1],
+            targetBytes: 32,
+            transferOutputs: "dictionary",
+          });
+          const first = await scan.next();
+          if (!first?.transfer) throw new Error("Missing owned output");
+          expect(first.transfer.detachableBudget).toBe(output);
+          expect(output.held).toBeGreaterThan(0);
+          expect(output.held).toBeLessThanOrEqual(16);
+          const firstCharge = output.held;
+          expect(scan.memoryStats.ownedOutputInQueryBytes).toBe(0);
+          reach.reach("result charge");
+          let settled = false;
+          const pending = Promise.resolve(scan.next()).then((x) => {
+            settled = true;
+            return x;
+          });
+          await Promise.resolve();
+          await Promise.resolve();
+          expect(settled).toBe(false);
+          reach.reach("wait for result credit");
+          if (cancel) {
+            scan.abort();
+            expect(await pending).toBeNull();
+            expect(output.held).toBe(firstCharge);
+            first.transfer.release();
+            reach.reach("abort retained result");
+          } else {
+            first.transfer.release();
+            let item = await pending,
+              count = first.batch.length;
+            while (item !== null) {
+              count += item.batch.length;
+              item.transfer?.release();
+              item = await scan.next();
+            }
+            expect(count).toBe(n);
+            reach.reach("progress after result credit");
+          }
+          scan.close();
+          expect([budget.held, output.held]).toEqual([0, 0]);
+          const refused = scanOf(table, space, null, {
+            budget,
+            outputBudget: { allocate: () => false, free: () => undefined },
+            columns: [1],
+            transferOutputs: true,
+          });
+          await expect(Promise.resolve().then(() => refused.next())).rejects.toThrow(
+            "result grant refused a one-row dedicated output",
+          );
+          refused.close();
+          expect(budget.held).toBe(0);
+          reach.reach("one-row result refusal");
+        }),
+        { seed, numRuns: 12 },
+      );
+      reach.assertReached();
+      console.log(
+        "OWNED_SCAN_REACH",
+        JSON.stringify({
+          seed,
+          campaign: "next-owned-result-budget",
+          states: Object.fromEntries(reach.counts()),
+        }),
+      );
+    },
+    120000,
+  );
+
+  it.each(seedsFor("next-owned-scan-fallback", [0xb2ab, 0xb2ac]))(
+    "ownership falls back for missing/deleted/memory rows seed %i",
+    async (seed) => {
+      const reach = createReach("next-owned-scan-fallback", [
+        "missing column",
+        "deleted rows",
+        "memory segment",
+      ] as const);
+      await fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 10, max: 150 }),
+          fc.constantFrom("missing column", "deleted rows", "memory segment"),
+          async (n, kind) => {
+            reach.beginHistory();
+            reach.reach(kind);
+            const space = new MemoryExtentSpace(),
+              rows = rowsOf(mulberry32(n), n, false),
+              deleted = kind === "deleted rows" ? new Set([2, 7]) : new Set<number>();
+            const segment =
+              kind === "memory segment"
+                ? memorySegment(0, rows, deleted)
+                : await groupSegment(0, rows, deleted, kind === "missing column", space);
+            const table: TableSnapshot = {
+                tableId: 9,
+                schemaVersion: 1,
+                columns: DEFS,
+                segments: [segment],
+                liveRowCount: n - deleted.size,
+              },
+              budget = counting();
+            const scan = scanOf(table, space, null, {
+                budget,
+                targetBytes: 512,
+                transferOutputs: "dictionary",
+              }),
+              actual: unknown[][] = [];
+            for (let item = await scan.next(); item !== null; item = await scan.next()) {
+              expect(item.transfer).toBeUndefined();
+              const batch = item.batch;
+              const positions =
+                batch.selection === null
+                  ? Array.from({ length: batch.length }, (_, k) => k)
+                  : [...batch.selection.rows.subarray(0, batch.selection.count)];
+              for (const row of positions)
+                actual.push(batch.columns.map((v) => normalize(valueAt(v, row))));
+            }
+            scan.close();
+            expect(actual).toEqual(
+              rows
+                .filter((_, k) => !deleted.has(k))
+                .map((r) => expectedRow(r, kind === "missing column")),
+            );
+            expect(budget.held).toBe(0);
+          },
+        ),
+        { seed, numRuns: 24 },
+      );
+      reach.assertReached();
+      console.log(
+        "OWNED_SCAN_REACH",
+        JSON.stringify({
+          seed,
+          campaign: "next-owned-scan-fallback",
+          states: Object.fromEntries(reach.counts()),
+        }),
+      );
+    },
+    120000,
+  );
+
+  it.each(seedsFor("next-owned-scan-dictionaries", [0xb2a9, 0xb2aa]))(
+    "dictionary charges and values survive source end until output release (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-owned-scan-dictionaries", [
+        "retained after end",
+        "retained after abort",
+        "dictionary output",
+      ] as const);
+      await fc.assert(
+        fc.asyncProperty(fc.integer({ min: 80, max: 200 }), fc.boolean(), async (n, cancel) => {
+          reach.beginHistory();
+          const space = new MemoryExtentSpace(),
+            rows = rowsOf(mulberry32(n), n, false).map((r, k) => ({
+              ...r,
+              t: `v${String(k % 3)}`,
+            }));
+          const table: TableSnapshot = {
+            tableId: 9,
+            schemaVersion: 1,
+            columns: DEFS,
+            segments: [await groupSegment(0, rows, new Set(), false, space)],
+            liveRowCount: n,
+          };
+          const opened: ChunkReader[] = [];
+          const reads: ChunkReads = {
+            open: (_p, c, o) =>
+              andThen(ChunkReader.open(space.view({ cache: true }), c, o), (r) => {
+                opened.push(r);
+                return r;
+              }),
+          };
+          const budget = counting(),
+            scan = scanOf(table, space, null, {
+              budget,
+              reads,
+              targetBytes: 512,
+              transferOutputs: "dictionary",
+            });
+          const first = await scan.next();
+          if (!first?.transfer?.detachableBuffers) throw new Error("No retained output");
+          expect(first.batch.columns.some((v) => v.form === "dictionary")).toBe(true);
+          reach.reach("dictionary output");
+          const dictionaryReaders = opened.filter((reader) => reader.dictionary !== null);
+          expect(dictionaryReaders.length).toBeGreaterThan(0);
+          const original = Array.from({ length: first.batch.length }, (_, r) =>
+            first.batch.columns.map((v) => normalize(valueAt(v, r))),
+          );
+          const dedicatedBytes = [...first.transfer.detachableBuffers].reduce(
+            (sum, b) => sum + b.byteLength,
+            0,
+          );
+          if (cancel) {
+            scan.abort();
+            reach.reach("retained after abort");
+          } else {
+            for (let item = await scan.next(); item !== null; item = await scan.next())
+              item.transfer?.release();
+            reach.reach("retained after end");
+          }
+          scan.close();
+          expect(dictionaryReaders.every((reader) => reader.dictionary !== null)).toBe(true);
+          expect(
+            opened.every((reader) =>
+              reader.directory.pages.every((_, page) => !reader.isLoaded(page)),
+            ),
+          ).toBe(true);
+          expect(budget.held).toBeGreaterThan(dedicatedBytes);
+          expect(
+            Array.from({ length: first.batch.length }, (_, r) =>
+              first.batch.columns.map((v) => normalize(valueAt(v, r))),
+            ),
+          ).toEqual(original);
+          first.transfer.release();
+          first.transfer.release();
+          expect(budget.held).toBe(0);
+          expect(dictionaryReaders.every((reader) => reader.dictionary === null)).toBe(true);
+        }),
+        { seed, numRuns: 12 },
+      );
+      reach.assertReached();
+      console.log(
+        "OWNED_SCAN_REACH",
+        JSON.stringify({
+          seed,
+          campaign: "next-owned-scan-dictionaries",
+          states: Object.fromEntries(reach.counts()),
+        }),
+      );
+    },
+    120000,
+  );
+
   /** A 150,000-byte grant (no growth beyond it) and its loans, counted. */
   async function grantOf(): Promise<{
     governor: Governor;
@@ -1285,6 +1553,92 @@ describe("review B4-p2c-3: loans under the real governor", () => {
     };
     return { rows, table };
   }
+
+  it.each(seedsFor("next-owned-scan-loans", [0xb2a7, 0xb2a8]))(
+    "detached loan-backed output holds its credit until release (seed %i)",
+    async (seed) => {
+      const reach = createReach("next-owned-scan-loans", [
+        "wait for output release",
+        "normal progress",
+        "abort with retained output",
+        "detached output",
+      ] as const);
+      await fc.assert(
+        fc.asyncProperty(fc.integer({ min: 2, max: 4 }), fc.boolean(), async (count, cancel) => {
+          reach.beginHistory();
+          const space = new MemoryExtentSpace(),
+            { table, rows } = await hugeRows(space, count);
+          const { governor, grant, loans, counts } = await grantOf();
+          const scan = scanOf(table, space, null, {
+            budget: grant,
+            loans,
+            targetBytes: 65536,
+            transferOutputs: true,
+          });
+          const first = await scan.next();
+          if (!first?.transfer?.detachableBuffers) throw new Error("Missing dedicated output");
+          expect(first.batch.length).toBe(1);
+          expect(grant.loaned).toBeGreaterThan(0);
+          const buffers = [...first.transfer.detachableBuffers];
+          const copied = structuredClone(first.batch, { transfer: buffers });
+          expect(copied.columns.map((v) => normalize(valueAt(v, 0)))).toEqual(
+            expectedRow(at(rows, 0), false),
+          );
+          expect(buffers.every((b) => b.byteLength === 0)).toBe(true);
+          reach.reach("detached output");
+          let settled = false;
+          const pending = Promise.resolve(scan.next()).then((x) => {
+            settled = true;
+            return x;
+          });
+          await Promise.resolve();
+          await Promise.resolve();
+          expect(settled).toBe(false);
+          expect(counts.borrowed).toBe(1);
+          expect(counts.repaid).toBe(0);
+          reach.reach("wait for output release");
+          if (cancel) {
+            scan.abort();
+            expect(await pending).toBeNull();
+            expect(grant.allocated).toBeGreaterThan(0);
+            expect(grant.loaned).toBeGreaterThan(0);
+            first.transfer.release();
+            reach.reach("abort with retained output");
+          } else {
+            first.transfer.release();
+            first.transfer.release();
+            let item = await pending,
+              k = 1;
+            while (item !== null) {
+              expect(item.batch.columns.map((v) => normalize(valueAt(v, 0)))).toEqual(
+                expectedRow(at(rows, k++), false),
+              );
+              item.transfer?.release();
+              item = await scan.next();
+            }
+            expect(k).toBe(count);
+            reach.reach("normal progress");
+          }
+          scan.close();
+          expect(counts.repaid).toBe(counts.borrowed);
+          expect([grant.allocated, grant.loaned]).toEqual([0, 0]);
+          grant.close();
+          expect(governor.usedBytes).toBe(0);
+        }),
+        { seed, numRuns: 12 },
+      );
+      reach.assertReached();
+      console.log(
+        "OWNED_SCAN_REACH",
+        JSON.stringify({
+          seed,
+          campaign: "next-owned-scan-loans",
+          states: Object.fromEntries(reach.counts()),
+        }),
+      );
+    },
+    120000,
+  );
 
   it("1. a rejected oversized row gives its working set back and repays before the next", async () => {
     const space = new MemoryExtentSpace();

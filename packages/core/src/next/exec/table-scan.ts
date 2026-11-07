@@ -47,6 +47,15 @@
  *   that read settles and the step unwinds. `close` is `abort`, and reports a loan that another
  *   operator's bytes still hold.
  *
+ * ## Dedicated terminal output (opt-in)
+ * Complete unfiltered groups without locators, deletions or missing columns may decode directly
+ * into tight, fresh buffers. Text stays UTF-8 bytes or dictionary codes; dictionary lifetimes
+ * and charges extend through retained output, including after source end/abort. SourceItem.transfer
+ * marks only these buffers detachable; pages,
+ * dictionaries and pooled slabs are never marked. Charges survive detachment until release.
+ * Four batch credits and a four-MiB threshold (plus the current batch) bound retained output;
+ * a loan-backed output must be released before the next step. Memory segments keep borrowing.
+ *
  * ## Borrowing, sync-when-cached
  * A batch's vectors are the scan's own buffers (or a memory segment's lent chunk), valid until the
  * next `next()`: the pipeline asks again only after the batch's borrow ended. Every access call is
@@ -80,7 +89,12 @@ import {
   type Selection,
   type Vector,
 } from "../vector/vector.js";
-import { ColumnTarget, type DecodeSpec, type TargetMemory } from "./column-target.js";
+import {
+  ColumnTarget,
+  type DecodeSpec,
+  type TargetMemory,
+  type OwnedColumn,
+} from "./column-target.js";
 import { Predicate } from "./filter.js";
 import type { CompileContext } from "./kernels/compile.js";
 import { MemorySegmentScan } from "./memory-scan.js";
@@ -93,6 +107,7 @@ import {
   yieldTask,
   type BatchSource,
   type SourceItem,
+  type Transfer,
 } from "./pipeline.js";
 import {
   CompiledFallback,
@@ -144,6 +159,17 @@ export interface ScanStats {
 }
 
 export interface TableScanOptions {
+  /** Fresh detachable outputs for terminal unfiltered groups without locators/deletions/missing columns.
+   * true flattens dictionaries to UTF-8; "dictionary" preserves codes and retains dictionary charges.
+   * At most four batches / four target MiB (plus one oversized row) may be retained.
+   * Other sources/plans retain their ordinary borrowed contract.
+   */
+  readonly transferOutputs?: boolean | "dictionary";
+  /** Terminal ownership: allocate dedicated buffers in this result budget from creation.
+   * Without it, detachable output stays charged to the scan budget. Refusal shrinks a batch;
+   * an output budget refusing even one row is reported (no second grant's progress loan).
+   */
+  readonly outputBudget?: ByteBudget;
   /** Full unfiltered scans: one-pass coalesced row windows when the reader factory supports it.
    * Opt-in byte target; absent/zero keeps cached per-batch reads. Filtered scans stay selective.
    */
@@ -195,6 +221,9 @@ interface GroupColumn {
 
 /** An open group segment and where the scan is in it. */
 interface OpenGroup {
+  readonly owned: boolean;
+  retained: number;
+  retired: boolean;
   windowRows: number;
   windowEnd: number;
   readonly releasedThrough: number[];
@@ -274,6 +303,10 @@ export class TableScan implements BatchSource {
     yields: 0,
   };
   readonly #options: TableScanOptions;
+  readonly #transferOutputs: boolean | "dictionary";
+  #ownedBytes = 0;
+  #ownedCount = 0;
+  readonly #ownedWaiters = new Set<() => void>();
   readonly #defs: readonly ColumnDef[];
   readonly #types: readonly PhysicalType[];
   readonly #pushed: readonly PushedPredicate[];
@@ -283,6 +316,7 @@ export class TableScan implements BatchSource {
   readonly #residualColumns: ReadonlySet<number>;
   readonly #all: readonly number[];
   readonly #memory: ScanMemory;
+  readonly #ownedMemory: ScanMemory;
   readonly #targets: ColumnTarget[];
   readonly #scratchBytes: number;
   readonly #positions: Uint16Array;
@@ -311,6 +345,12 @@ export class TableScan implements BatchSource {
 
   constructor(options: TableScanOptions) {
     this.#options = options;
+    this.#transferOutputs =
+      (options.transferOutputs === true || options.transferOutputs === "dictionary") &&
+      options.filter === null &&
+      !options.emitLocator
+        ? options.transferOutputs
+        : false;
     const table = options.table;
     this.#defs = options.columns.map((id) => {
       const def = table.columns.find((column) => column.id === id);
@@ -331,6 +371,10 @@ export class TableScan implements BatchSource {
     this.#residual = split.residual === null ? null : new Predicate(split.residual, context);
     this.#residualColumns = new Set(split.residual === null ? [] : columnsOf(split.residual));
     this.#memory = new ScanMemory(options.budget);
+    this.#ownedMemory =
+      options.outputBudget === undefined || options.outputBudget === options.budget
+        ? this.#memory
+        : new ScanMemory(options.outputBudget);
     this.#targets = this.#types.map((type) => new ColumnTarget(type, BATCH_ROWS, this.#memory));
     // The scratch is charged before it is built (a refusal throws, holding nothing).
     const scratch = scratchBytes(options.emitLocator);
@@ -357,6 +401,25 @@ export class TableScan implements BatchSource {
     this.#target = options.targetBytes ?? BATCH_TARGET_BYTES;
     this.#interval = options.yieldIntervalMs ?? YIELD_INTERVAL_MS;
     this.#clock = clockFor(options.now);
+  }
+
+  /** Charged allocation components; these are not physical RSS attribution. */
+  get memoryStats(): {
+    reusedDecodeBytes: number;
+    ownedOutputBytes: number;
+    ownedOutputInQueryBytes: number;
+    outputReserveBytes: number;
+    scratchBytes: number;
+    reserveBytes: number;
+  } {
+    return {
+      reusedDecodeBytes: this.#targets.reduce((n, t) => n + t.chargedBytes, 0),
+      ownedOutputBytes: this.#ownedBytes,
+      ownedOutputInQueryBytes: this.#ownedMemory === this.#memory ? this.#ownedBytes : 0,
+      outputReserveBytes: this.#ownedMemory === this.#memory ? 0 : this.#ownedMemory.reserve,
+      scratchBytes: this.#released ? 0 : this.#scratchBytes,
+      reserveBytes: this.#memory.reserve,
+    };
   }
 
   next(): MaybePromise<SourceItem | null> {
@@ -426,6 +489,19 @@ export class TableScan implements BatchSource {
 
   *#next(): Step<SourceItem | null> {
     this.#endBorrow();
+    while (
+      !this.#aborted &&
+      (this.#ownedCount >= 4 ||
+        this.#ownedBytes >= 4 * BATCH_TARGET_BYTES ||
+        (this.#loan !== null && this.#ownedCount > 0))
+    ) {
+      yield* this.#wait(
+        new Promise<void>((resolve) => {
+          this.#ownedWaiters.add(resolve);
+        }),
+      );
+      this.#endBorrow();
+    }
     for (;;) {
       if (this.#aborted) return null;
       const segment: Segment | undefined = this.#options.table.segments[this.#segment];
@@ -634,6 +710,12 @@ export class TableScan implements BatchSource {
       const deletions = yield* this.#wait(segment.deletions());
       this.stats.groupsRead += 1;
       return {
+        owned:
+          this.#transferOutputs !== false &&
+          deletions === null &&
+          columns.every((c) => c.pages !== null),
+        retained: 0,
+        retired: false,
         windowRows:
           windowBytes > 0 && deletions === null
             ? Math.min(
@@ -738,7 +820,7 @@ export class TableScan implements BatchSource {
     if (group.windowRows === 0 || from < group.windowEnd) return;
     for (;;) {
       const end = Math.min(group.segment.rowCount, from + group.windowRows);
-      const loads = [];
+      const loads: Array<{ reader: ChunkPages; pages: number[] }> = [];
       for (const column of group.columns) {
         const reader = column.pages;
         if (reader === null) continue;
@@ -748,7 +830,11 @@ export class TableScan implements BatchSource {
         if (pages.length > 0) loads.push({ reader, pages });
       }
       try {
-        if (loads.length > 0) yield* this.#wait(this.#options.reads.loadTogether?.(loads));
+        if (loads.length > 0)
+          yield* this.#wait(this.#options.reads.loadTogether?.(loads), () => {
+            if (group.retired && group.retained > 0)
+              for (const load of loads) load.reader.release();
+          });
         group.windowEnd = end;
         return;
       } catch (error) {
@@ -795,7 +881,14 @@ export class TableScan implements BatchSource {
     let bytes = this.#options.emitLocator ? 8 * rowsIn(spec) : 0;
     for (let c = 0; c < this.#types.length; c++) {
       const pages = at(group.columns, c).pages;
-      if (pages !== null) bytes += ColumnTarget.outputBytes(pages, at(this.#types, c), spec);
+      if (pages !== null)
+        bytes += ColumnTarget.outputBytes(
+          pages,
+          at(this.#types, c),
+          spec,
+          !group.owned || this.#transferOutputs === "dictionary",
+          group.owned,
+        );
     }
     return bytes;
   }
@@ -808,8 +901,16 @@ export class TableScan implements BatchSource {
       if (pages === null) continue;
       if ("from" in spec) {
         const [first, end] = pages.pagesInRange(spec.from, spec.to);
-        yield* this.#wait(pages.load(Array.from({ length: end - first }, (_, k) => first + k)));
-      } else yield* this.#wait(pages.load(pages.pagesForRows(spec.rows, 0, spec.count)));
+        yield* this.#wait(
+          pages.load(Array.from({ length: end - first }, (_, k) => first + k)),
+          () => {
+            if (group.retired && group.retained > 0) pages.release();
+          },
+        );
+      } else
+        yield* this.#wait(pages.load(pages.pagesForRows(spec.rows, 0, spec.count)), () => {
+          if (group.retired && group.retained > 0) pages.release();
+        });
     }
   }
 
@@ -821,11 +922,18 @@ export class TableScan implements BatchSource {
       if ("from" in spec) {
         if (!(group.windowRows > 0 && spec.to <= group.windowEnd)) {
           const [first, end] = pages.pagesInRange(spec.from, spec.to);
-          yield* this.#wait(pages.load(Array.from({ length: end - first }, (_, k) => first + k)));
+          yield* this.#wait(
+            pages.load(Array.from({ length: end - first }, (_, k) => first + k)),
+            () => {
+              if (group.retired && group.retained > 0) pages.release();
+            },
+          );
         }
         yield* this.#wait(pages.loadValues(spec.from, spec.to));
       } else {
-        yield* this.#wait(pages.load(pages.pagesForRows(spec.rows, 0, spec.count)));
+        yield* this.#wait(pages.load(pages.pagesForRows(spec.rows, 0, spec.count)), () => {
+          if (group.retired && group.retained > 0) pages.release();
+        });
         yield* this.#wait(pages.loadValuesOf(spec.rows, 0, spec.count));
       }
     }
@@ -835,18 +943,29 @@ export class TableScan implements BatchSource {
    * The working set decoding `spec` (every output column) newly takes: the out-of-line values
    * leased for it and every target buffer it grows. Pages loaded.
    */
-  #workingSet(group: OpenGroup, spec: DecodeSpec): number {
-    let bytes = 0;
+  #workingSet(group: OpenGroup, spec: DecodeSpec): { input: number; output: number } {
+    let input = 0,
+      output = 0;
     for (let c = 0; c < this.#types.length; c++) {
       const pages = at(group.columns, c).pages;
       if (pages === null) continue;
-      bytes +=
-        at(this.#targets, c).growthFor(pages, spec) +
-        ("from" in spec
+      const bytes = group.owned
+        ? ColumnTarget.outputBytes(
+            pages,
+            at(this.#types, c),
+            spec,
+            this.#transferOutputs === "dictionary",
+            true,
+          )
+        : at(this.#targets, c).growthFor(pages, spec);
+      if (group.owned && this.#ownedMemory !== this.#memory) output += bytes;
+      else input += bytes;
+      input +=
+        "from" in spec
           ? pages.largeValueBytes(spec.from, spec.to)
-          : pages.largeValueBytesOf(spec.rows, 0, spec.count));
+          : pages.largeValueBytesOf(spec.rows, 0, spec.count);
     }
-    return bytes;
+    return { input, output };
   }
 
   /**
@@ -854,22 +973,40 @@ export class TableScan implements BatchSource {
    * halfway. False when the grant refuses a batch of several rows (the caller decodes fewer); for
    * one row, borrows a progress loan for it (R18.3), repaid when the batch's borrow ends.
    */
+  *#reserveOutput(bytes: number, spec: DecodeSpec): Step<boolean> {
+    if (this.#ownedMemory === this.#memory) return true;
+    while (!this.#ownedMemory.prepay(bytes)) {
+      if (this.#ownedCount > 0) {
+        yield* this.#wait(
+          new Promise<void>((resolve) => {
+            this.#ownedWaiters.add(resolve);
+          }),
+        );
+        continue;
+      }
+      if (rowsIn(spec) > 1) return false;
+      throw new RangeError("The result grant refused a one-row dedicated output");
+    }
+    return true;
+  }
+
   *#prepay(group: OpenGroup, spec: DecodeSpec): Step<boolean> {
-    const need = this.#workingSet(group, spec);
+    const { input: need, output } = this.#workingSet(group, spec);
+    if (!(yield* this.#reserveOutput(output, spec))) return false;
     if (this.#memory.prepay(need)) return true;
+    if (this.#ownedMemory !== this.#memory) this.#ownedMemory.settle();
     if (rowsIn(spec) > 1) return false;
     const loans = this.#options.loans;
     if (loans === undefined)
       throw new RangeError(`A ${String(need)}-byte row was refused by the scan's grant`);
-    // A grant has one loan at a time: an earlier one not yet repaid goes first (or this throws).
     this.#repay();
     this.#loan = yield* this.#wait(loans.borrow(need), (late) => {
       late.repay();
     });
-    this.stats.loans += 1;
+    this.stats.loans++;
     if (!this.#memory.prepay(need))
       throw new RangeError(`A ${String(need)}-byte row was refused even after a loan`);
-    return true;
+    return yield* this.#reserveOutput(output, spec);
   }
 
   *#decode(
@@ -877,6 +1014,7 @@ export class TableScan implements BatchSource {
     spec: DecodeSpec,
     columns: readonly number[],
     out: Vector[],
+    owned?: OwnedColumn[],
   ): Step<void> {
     yield* this.#load(group, spec, columns);
     const length = rowsIn(spec);
@@ -890,7 +1028,18 @@ export class TableScan implements BatchSource {
               length,
               value: column.missing ?? nullOf(at(this.#types, c)),
             }
-          : at(this.#targets, c).decode(column.pages, spec);
+          : owned === undefined
+            ? at(this.#targets, c).decode(column.pages, spec)
+            : (() => {
+                const decoded = at(this.#targets, c).decodeOwned(
+                  column.pages,
+                  spec,
+                  this.#transferOutputs === "dictionary",
+                  this.#ownedMemory,
+                );
+                owned.push(decoded);
+                return decoded.vector;
+              })();
     }
   }
 
@@ -900,14 +1049,62 @@ export class TableScan implements BatchSource {
    * What was reserved and not used goes back once the batch is decoded.
    */
   *#emitPositions(group: OpenGroup, from: number, to: number): Step<SourceItem | null> {
+    const owned = group.owned ? ([] as OwnedColumn[]) : undefined;
+    let published = false;
     try {
-      return yield* this.#emitReserved(group, from, to);
+      const item = yield* this.#emitReserved(group, from, to, owned);
+      if (item === null || owned === undefined || owned.length === 0) return item;
+      const buffers = new Set<ArrayBuffer>();
+      let bytes = 0;
+      for (const column of owned) {
+        bytes += column.bytes;
+        for (const buffer of column.buffers) buffers.add(buffer);
+      }
+      const transfer = this.#retainOwned(buffers, bytes, group);
+      published = true;
+      return { ...item, transfer };
     } finally {
+      if (!published && owned !== undefined) {
+        const bytes = owned.reduce((sum, column) => sum + column.bytes, 0);
+        if (bytes > 0) this.#ownedMemory.give(bytes);
+      }
       this.#memory.settle();
+      if (this.#ownedMemory !== this.#memory) this.#ownedMemory.settle();
     }
   }
 
-  *#emitReserved(group: OpenGroup, from: number, to: number): Step<SourceItem | null> {
+  // One charge/credit per batch, independent of the emit locals. Retired groups have dropped
+  // page slabs; only their explicit dictionary/directory lifetime survives in this handle.
+  #retainOwned(buffers: ReadonlySet<ArrayBuffer>, bytes: number, group: OpenGroup): Transfer {
+    group.retained++;
+    this.#ownedBytes += bytes;
+    this.#ownedCount++;
+    let released = false;
+    return {
+      detachableBuffers: buffers,
+      detachableBudget: this.#ownedMemory.budget,
+      release: () => {
+        if (released) return;
+        released = true;
+        this.#ownedMemory.give(bytes);
+        this.#ownedBytes -= bytes;
+        this.#ownedCount--;
+        group.retained--;
+        if (group.retired && group.retained === 0)
+          for (const column of group.columns) column.pages?.close();
+        for (const wake of this.#ownedWaiters) wake();
+        this.#ownedWaiters.clear();
+        if (this.#aborted) this.#settleAborted();
+      },
+    };
+  }
+
+  *#emitReserved(
+    group: OpenGroup,
+    from: number,
+    to: number,
+    owned?: OwnedColumn[],
+  ): Step<SourceItem | null> {
     const span = to - from;
     const all = this.#all;
     const count = group.pendingCount;
@@ -925,7 +1122,7 @@ export class TableScan implements BatchSource {
     }
     const columns: Vector[] = new Array<Vector>(this.#defs.length);
     if (dense) {
-      yield* this.#decode(group, { from, to }, all, columns);
+      yield* this.#decode(group, { from, to }, all, columns, owned);
       let selection: Selection | null = null;
       if (count < span) {
         const s = this.#selection;
@@ -975,7 +1172,7 @@ export class TableScan implements BatchSource {
     positions.copyWithin(0, take, count);
     group.pendingCount = count - take;
     if (kept === 0) return null;
-    yield* this.#decode(group, specForRows(survivors, kept), all, columns);
+    yield* this.#decode(group, specForRows(survivors, kept), all, columns, owned);
     this.stats.gatherBatches += 1;
     return {
       batch: this.#withLocators(
@@ -994,7 +1191,14 @@ export class TableScan implements BatchSource {
   }
 
   #closeSegment(): void {
-    if (this.#group !== null) for (const column of this.#group.columns) column.pages?.close();
+    if (this.#group !== null) {
+      const group = this.#group;
+      group.retired = true;
+      for (const column of group.columns) {
+        if (group.retained === 0) column.pages?.close();
+        else column.pages?.release(); // Dictionary bytes/charge survive retained batches.
+      }
+    }
     this.#group = null;
     this.#memoryScan = null;
   }
@@ -1009,6 +1213,7 @@ export class TableScan implements BatchSource {
       this.#memoryScan?.abort();
       this.#closeSegment();
       this.#memory.settle();
+      if (this.#ownedMemory !== this.#memory) this.#ownedMemory.settle();
       for (const target of this.#targets) target.close();
       if (this.#memoryOut !== null) this.#memory.give(this.#memoryOut.bytes);
       this.#memoryOut = null;
@@ -1026,6 +1231,8 @@ export class TableScan implements BatchSource {
    */
   abort(): void {
     this.#aborted = true;
+    for (const wake of this.#ownedWaiters) wake();
+    this.#ownedWaiters.clear();
     this.#release();
   }
 

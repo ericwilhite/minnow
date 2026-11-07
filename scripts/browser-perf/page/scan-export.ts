@@ -27,6 +27,13 @@ import type { ExportGroup, ExportResult } from "./export-stream.js";
 import { BenchFrameAssembler } from "./owner-frames.js";
 
 export interface ScanExportStats {
+  readonly copies: BenchFrameAssembler["copyStats"];
+  /** Charged-byte snapshots, not physical RSS. Independent maxima must not be added. */
+  readonly memory?: {
+    maxima: Record<string, number>;
+    atPeak: Record<string, number>;
+    samples: Array<Record<string, number>>;
+  };
   readonly frames: number;
   readonly flattenedDictionaryColumns: number;
   readonly dictionaryBytes: number;
@@ -40,7 +47,8 @@ export interface ScanExportStats {
   readonly scan: ScanStats;
 }
 
-function tableOf(groups: readonly ExportGroup[]): TableSnapshot {
+/** BENCH-only snapshot descriptors; stands in for catalog/group-root reads. */
+export function benchTableOf(groups: readonly ExportGroup[]): TableSnapshot {
   const first = groups[0];
   if (!first) throw new Error("No scan groups");
   const columns: ColumnDef[] = first.chunks.map((chunk) => ({
@@ -90,9 +98,22 @@ export async function scanExport(
     resultBudget: ByteBudget;
     port: MessagePort;
     readWindowBytes?: number;
+    transferOutputs?: boolean | "dictionary";
+    /** Bench-only charged counters supplied by the worker, sampled at frame boundaries. */
+    memory?: () => {
+      queryAllocated: number;
+      queryHeld: number;
+      resultHeld: number;
+      cacheCharge: number;
+      resultAllocated: number;
+      governorHeld: number;
+      idlePool: number;
+      cacheResident: number;
+      cachePinned: number;
+    };
   },
 ): Promise<ExportResult & { scanStats: ScanExportStats }> {
-  const table = tableOf(groups),
+  const table = benchTableOf(groups),
     port = options.port;
   const posted = new Map<number, ResultFrame>();
   let rows = 0,
@@ -112,6 +133,8 @@ export async function scanExport(
     pages: space,
     reads: chunkReads,
     readWindowBytes: options.readWindowBytes ?? 64 * 1024 * 1024,
+    transferOutputs: options.transferOutputs ?? false,
+    outputBudget: options.resultBudget,
     budget: options.budget,
     columns: table.columns.map((c) => c.id),
     filter: null,
@@ -123,6 +146,49 @@ export async function scanExport(
     table.columns.map((c) => ({ name: c.name, type: c.type, nullable: c.nullable })),
     { windowBytes: DEFAULT_RESULT_WINDOW_BYTES },
   );
+  const maxima: Record<string, number> = {},
+    samples: Array<Record<string, number>> = [];
+  let atPeak: Record<string, number> = {};
+  const sample = () => {
+    const external = options.memory?.();
+    if (!external) return;
+    const decoded = scan.memoryStats,
+      copies = assembler.copyStats;
+    const activeReadsAndDescriptors = Math.max(
+      0,
+      external.queryAllocated -
+        decoded.reusedDecodeBytes -
+        decoded.ownedOutputInQueryBytes -
+        decoded.scratchBytes -
+        decoded.reserveBytes,
+    );
+    const cacheResidentLessPins = Math.max(0, external.cacheResident - external.cachePinned);
+    const snapshot = {
+      rows,
+      frames,
+      ...external,
+      ...decoded,
+      activeReadsAndDescriptors,
+      cacheResidentLessPins,
+      unusedGrantHeadroom:
+        external.queryHeld +
+        external.resultHeld -
+        external.queryAllocated -
+        external.resultAllocated,
+      cacheOtherCharge: Math.max(0, external.cacheCharge - external.idlePool - 2 * 1024 * 1024),
+      frameBytes: channel.outstandingBytes,
+      liveCopiedBytes: copies.liveCopiedBytes,
+      liveAdoptedBytes: copies.liveAdoptedBytes,
+      // Includes the cache's fixed slabs/idle pool, without adding them twice. Frame bytes
+      // already occur in queryAllocated (adopted) or resultAllocated (copies). Prepaid reserve
+      // is charged before allocation; all of these are accounting, not physical RSS.
+      attributedCharge: external.queryAllocated + external.resultAllocated + external.cacheCharge,
+    };
+    for (const [key, value] of Object.entries(snapshot))
+      maxima[key] = Math.max(maxima[key] ?? 0, value);
+    if (snapshot.attributedCharge > (atPeak.attributedCharge ?? 0)) atPeak = snapshot;
+    if (frames % 32 === 0) samples.push(snapshot);
+  };
   let protocolError: unknown;
   const cancel = (error: unknown) => {
     protocolError = error;
@@ -149,6 +215,7 @@ export async function scanExport(
       if (sequence <= released) {
         frame.release();
         posted.delete(sequence);
+        sample();
       }
   };
   port.onmessageerror = () => cancel(new Error("Bench result port decode failed"));
@@ -159,18 +226,22 @@ export async function scanExport(
         step = scan.next();
       if (isPromise(step))
         return step.finally(() => {
+          sample();
           nextMs += performance.now() - before;
         });
+      sample();
       nextMs += performance.now() - before;
       return step;
     },
     abort: () => scan.abort(),
   };
   const sink: Operator = {
-    push(batch) {
+    push(batch, transfer) {
       const before = performance.now();
       try {
-        return channel.offer(assembler.offer(batch));
+        const readiness = channel.offer(assembler.offer(batch, transfer));
+        sample();
+        return readiness;
       } finally {
         assemblyMs += performance.now() - before;
       }
@@ -217,6 +288,8 @@ export async function scanExport(
       openMs: 0,
       loads: 0,
       scanStats: {
+        copies: assembler.copyStats,
+        ...(options.memory ? { memory: { maxima, atPeak, samples } } : {}),
         flattenedDictionaryColumns: assembler.flattenedColumns,
         dictionaryBytes: assembler.dictionaryBytes,
         frames,

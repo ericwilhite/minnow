@@ -65,6 +65,7 @@ export type ExportRequest =
       readonly frameCopy?: "baseline" | "candidate";
       readonly scanRange?: "baseline" | "candidate";
       readonly scanIO?: "batch" | "window";
+      readonly scanOutput?: "borrowed" | "flat" | "dictionary";
       readonly resultPort?: MessagePort;
     }
   | { readonly op: "remove"; readonly dir: string };
@@ -294,6 +295,19 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
             budget: grant,
             resultBudget: resultGrant,
             readWindowBytes: request.scanIO === "batch" ? 0 : (request.windowMiB ?? 64) * MiB,
+            transferOutputs:
+              request.scanOutput === "dictionary" ? "dictionary" : request.scanOutput === "flat",
+            memory: () => ({
+              queryAllocated: grant.allocated,
+              queryHeld: grant.held,
+              resultHeld: resultGrant.held,
+              cacheCharge: governor.usedBytes - grant.held - resultGrant.held,
+              resultAllocated: resultGrant.allocated,
+              governorHeld: governor.usedBytes,
+              idlePool: space.stats.cache.poolBytes,
+              cacheResident: space.stats.cache.residentBytes,
+              cachePinned: space.stats.cache.pinnedBytes,
+            }),
             port: request.resultPort,
           })
         : await stream(space, request.groups, {
