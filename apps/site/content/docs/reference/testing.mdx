@@ -1623,6 +1623,14 @@ metadata must preserve roots, log, data and operator spill. Every read, write an
 reset from a replaced owner must fail. This backing is preparatory for disk-derived
 retirement tickets, rather than an additional recovery authority.
 
+The metadata-journal generator inventories frames independently at construction,
+requires admission first, and keeps the frame count constant as its disk queue
+grows. It tests multi-page inputs, empty chains, cursor references and page
+reuse; mutants that omit admission or cursor retention fail their respective
+invariants. Native-read response capacity is measured separately in its scripted
+store. Cancellation and failed-write tests require cleanup without a new memory
+request. These primitive tests do not yet establish live publication's bound.
+
 Ordered-root startup regressions require a streaming union without the unordered free-map sort,
 validate scattered list-page allocations, and refuse overlapping, descending or inconsistent
 extents before reclaim. Full audit and test-build semantic checks remain enabled separately.

@@ -58,6 +58,16 @@ export const CACHE_TRANSFER_REACH = [
   "both owners close",
 ] as const;
 
+/** A pin-delayed journal backlog changes disk pages, never resident frame capacity. */
+export const METADATA_JOURNAL_REACH = [
+  "multi page input",
+  "cursor protects released owner",
+  "constant time chain reuse",
+  "disk queue backlog",
+  "admitted before frames",
+  "close returns charge",
+] as const;
+
 /** Full-scan shared windows: the default and override must cover cold and resident reads. */
 export const SCAN_WINDOW_RESIDENCY_REACH = [
   "default cold",

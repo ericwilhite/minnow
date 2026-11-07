@@ -1938,6 +1938,30 @@ the operator-spill sweep leaves them alone. Their page encoding is private to
 one owner and needs no stored-format migration. This backing is preparatory;
 retirement tickets still use the existing implementation until integration.
 
+### Prepaid metadata journal
+
+`storage/metadata-journal.ts` adds a private page-chain primitive with a 512 KiB
+workspace reservation. Source phases expose three 60 KiB frames; merge/reclaim
+phases expose four. The inventory includes a native read response, bounded
+control objects and up to 256 release-range objects. Callers serialize workspace
+use before taking the mutation barrier, and never overlap source and reclaim
+phases. Frames and their borrowed slices cannot escape a phase. Journal cursors
+and writers retain scalar slots and phase identities, rather than old buffers.
+
+Descriptors, reference counts and queue links live on disk. A cursor retains its
+chain until close; releasing the caller's reference cannot make an active
+cursor's pages reusable. Returning a whole chain splices its tail onto a free
+stack, without a resident page directory. Cancellation can return a partial
+writer's chain, including a just-allocated empty page. A native write error
+fails the journal closed; reopening resets it and uses durable roots instead.
+The initial grant's existing charge moves atomically to the space's lifetime
+owner and is returned on close.
+
+This is a tested primitive for the replacement. Root-list sorting, ticket
+eligibility, bounded data-range release and live publication still need their
+separate integration; this component alone does not establish the whole-space
+memory bound or repair the rejected compact branch.
+
 ### R25 startup measurement
 
 `MINNOW_NEXT_STORAGE_REOPEN=1` enables the Chromium storage reopen lane in
