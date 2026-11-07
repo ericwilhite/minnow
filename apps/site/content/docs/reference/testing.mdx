@@ -1631,6 +1631,15 @@ invariants. Native-read response capacity is measured separately in its scripted
 store. Cancellation and failed-write tests require cleanup without a new memory
 request. These primitive tests do not yet establish live publication's bound.
 
+Private pair-stream histories sort shuffled extents above `2^40` through several
+disk passes, including an unmatched final run. Independent expected pairs check
+union, difference and duplicate policy. Cancellation interrupts the 100,000-entry
+producer during copying, selected sort/merge task turns and the final descriptor
+write. Each case retries and checks input references. A scripted two-run trace
+fails every native write boundary in turn, preserving the original error and
+returning the workspace charge. Mutants that truncate offsets, reclaim shared
+extents or copy the whole producer before slicing must fail.
+
 Ordered-root startup regressions require a streaming union without the unordered free-map sort,
 validate scattered list-page allocations, and refuse overlapping, descending or inconsistent
 extents before reclaim. Full audit and test-build semantic checks remain enabled separately.

@@ -165,6 +165,8 @@ export class MetadataJournal {
   async read(handle: number, frame: Uint8Array, expected?: number): Promise<void> {
     this.#live();
     this.workspace.assertFrame(frame);
+    const pending = pauseIfDue();
+    if (pending !== undefined) await pending;
     if (!safe(handle) || handle === 0 || handle >= this.#next)
       throw new RangeError("Invalid journal handle");
     try {
@@ -190,6 +192,8 @@ export class MetadataJournal {
   async write(handle: number, frame: Uint8Array): Promise<void> {
     this.#live();
     this.workspace.assertFrame(frame);
+    const pending = pauseIfDue();
+    if (pending !== undefined) await pending;
     if (!safe(handle) || handle === 0 || handle >= this.#next)
       throw new RangeError("Invalid journal handle");
     const view = viewOf(frame);

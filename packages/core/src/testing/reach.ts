@@ -68,6 +68,20 @@ export const METADATA_JOURNAL_REACH = [
   "close returns charge",
 ] as const;
 
+/** Pair streams keep the same memory reservation across external sort and list set operations. */
+export const METADATA_EXTENTS_REACH = [
+  "external passes",
+  "odd external tail",
+  "exact duplicates coalesce",
+  "difference",
+  "union",
+  "wide offsets",
+  "fixed admission",
+] as const;
+
+/** Every scripted private-journal write failure must preserve its cause and return memory. */
+export const METADATA_WRITE_FAULT_REACH = ["native error preserved", "zero final charge"] as const;
+
 /** Full-scan shared windows: the default and override must cover cold and resident reads. */
 export const SCAN_WINDOW_RESIDENCY_REACH = [
   "default cold",

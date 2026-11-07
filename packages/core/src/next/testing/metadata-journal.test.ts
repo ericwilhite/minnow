@@ -3,11 +3,7 @@ import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { createReach, METADATA_JOURNAL_REACH } from "../../testing/reach.js";
 import { TaskClock } from "../task.js";
 import { Governor } from "../memory/governor.js";
-import {
-  METADATA_PAGE_BYTES,
-  StoreCorruptionError,
-  type MetadataStore,
-} from "../storage/contract.js";
+import { METADATA_PAGE_BYTES, StoreCorruptionError } from "../storage/contract.js";
 import { ReadDeniedError } from "../storage/extents.js";
 import { bytesOf, countingBudget, expectBytes } from "../storage/space-test-support.js";
 import {
@@ -17,39 +13,7 @@ import {
   METADATA_WORKSPACE_BYTES,
 } from "../storage/metadata-journal.js";
 
-/** Physical storage is independent of managed frames. Simulate one native cloned response. */
-class Pages implements MetadataStore {
-  readonly physical = new Map<number, Uint8Array>();
-  native = 0;
-  maxNative = 0;
-  writes = 0;
-  failAt = -1;
-  afterRead: (() => void) | null = null;
-  afterWrite: (() => void) | null = null;
-  async write(page: number, bytes: Uint8Array): Promise<void> {
-    if (++this.writes === this.failAt) throw new Error("scripted metadata write failure");
-    this.physical.set(page, bytes.slice());
-    await Promise.resolve();
-    this.afterWrite?.();
-  }
-  async read(page: number, target: Uint8Array): Promise<void> {
-    const bytes = this.physical.get(page);
-    if (bytes === undefined) throw new StoreCorruptionError("missing page");
-    this.native += bytes.byteLength;
-    this.maxNative = Math.max(this.maxNative, this.native);
-    try {
-      const response = bytes.slice();
-      await Promise.resolve();
-      target.set(response);
-      this.afterRead?.();
-    } finally {
-      this.native -= bytes.byteLength;
-    }
-  }
-  async reset(): Promise<void> {
-    this.physical.clear();
-  }
-}
+import { ScriptedMetadataPages as Pages } from "./metadata-test-support.js";
 
 const reach = createReach("metadata journal", METADATA_JOURNAL_REACH);
 for (const seed of seedsFor("metadata-journal", [1531, 1532, 1533, 1534]))

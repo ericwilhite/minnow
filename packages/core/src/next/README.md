@@ -1957,10 +1957,20 @@ fails the journal closed; reopening resets it and uses durable roots instead.
 The initial grant's existing charge moves atomically to the space's lifetime
 owner and is returned on close.
 
-This is a tested primitive for the replacement. Root-list sorting, ticket
+`storage/metadata-extents.ts` provides incremental pair spooling, a fixed-buffer
+external sort and streaming union/difference. Sorted runs form a disk queue with
+scalar head and tail. Exact duplicates may coalesce for root reachability;
+retirement inputs refuse duplicates. Offsets keep their full safe-integer
+precision. Every copy/sort/merge loop uses the shared task clock. Cancellation
+is checked after the final descriptor write as well, and returns the unused
+output chain. Native failures preserve their original error while cleanup
+returns the resident workspace.
+
+These are tested primitives for the replacement. Root-list provenance, ticket
 eligibility, bounded data-range release and live publication still need their
-separate integration; this component alone does not establish the whole-space
-memory bound or repair the rejected compact branch.
+separate integration; these components alone do not establish the whole-space
+memory bound or repair the rejected compact branch. Sorting a candidate does
+not authorize it against roots, writers or the lossy map's complement.
 
 ### R25 startup measurement
 
