@@ -6,7 +6,7 @@ import { GRAPH_DDL, rowLockGraphs } from "../testing/row-locking-graphs.test.fix
 import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
 import { compileQuery, clonePlanTree } from "./query.js";
-const pg = new PGlite();
+let pg = new PGlite();
 beforeAll(async () => {
   for (const sql of GRAPH_DDL) await pg.exec(sql);
 });
@@ -20,12 +20,19 @@ function outcome(error: unknown): string {
 it("refuses the same CTE dependency graphs as PostgreSQL through SQL and copied typed plans", async () => {
   const reach = createReach<string>("shipped locking CTE graph", ROW_LOCK_GRAPH_STATES);
   const failures: string[] = [];
-  const databases = Array.from({ length: 4 }, () => new MinnowDatabase(new MemoryBlockStore()));
-  for (const db of databases) for (const sql of GRAPH_DDL) await db.execute(sql);
+  const databases = Array.from({ length: 8 }, () => new MinnowDatabase(new MemoryBlockStore()));
+  for (const [index, db] of databases.entries())
+    for (const sql of index < 4 ? GRAPH_DDL : GRAPH_DDL.slice(0, 2)) await db.execute(sql);
   const cases = rowLockGraphs();
-  expect(cases.length).toBe(3408);
+  expect(cases.length).toBe(5568);
   try {
-    for (const test of cases) {
+    for (const [caseNumber, test] of cases.entries()) {
+      // Independent histories need no shared PG lifetime; bound repeated error recovery.
+      if (caseNumber > 0 && caseNumber % 512 === 0) {
+        await pg.close();
+        pg = new PGlite();
+        for (const sql of GRAPH_DDL) await pg.exec(sql);
+      }
       await pg.exec("BEGIN READ ONLY");
       let expected = "rows";
       try {
@@ -36,7 +43,9 @@ it("refuses the same CTE dependency graphs as PostgreSQL through SQL and copied 
         await pg.exec("ROLLBACK");
       }
       expect(expected, test.sql).toBe(test.lock === undefined ? "rows" : "25006");
-      for (const [entry, db] of databases.entries()) {
+      const emptyCatalog = test.states.includes("direct");
+      const offset = emptyCatalog ? 4 : 0;
+      for (const [entry, db] of databases.slice(offset, offset + 4).entries()) {
         reach.beginHistory();
         await db.execute("BEGIN READ ONLY");
         let actual = "rows";
@@ -58,7 +67,10 @@ it("refuses the same CTE dependency graphs as PostgreSQL through SQL and copied 
         }
         if (actual !== expected)
           failures.push(`${String(entry)}: ${test.sql}\nPG ${expected}; Minnow ${actual}`);
-        else for (const state of test.states) reach.reach(state);
+        else {
+          for (const state of test.states) reach.reach(state);
+          reach.reach(emptyCatalog ? "empty view catalog" : "nonempty view catalog");
+        }
       }
     }
     expect(failures.join("\n")).toBe("");

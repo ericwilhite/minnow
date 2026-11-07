@@ -63,7 +63,9 @@ a clause that reaches a table or view is refused, including through FROM subquer
 clause on a CTE reference or constant-only source locks nothing and is allowed. A referenced
 CTE's own locking clause counts whenever its reference count is positive, even if its only
 referrer is a CTE the final SELECT does not use. A zero-reference CTE contributes nothing;
-this rule applies separately inside each planned query scope.
+this rule applies separately inside each planned query scope. Both the base and step of a
+recursive declaration count when it has an external reference; its self-reference alone
+does not count.
 
 Casts take either spelling, `CAST(total AS INTEGER)` or `total::INTEGER`; the postfix form binds
 tighter than every operator, so `-total::INTEGER * 2` is `(-(total::INTEGER)) * 2`. A double

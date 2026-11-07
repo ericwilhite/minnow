@@ -22,7 +22,9 @@ There is no stored-format change and no public type change.
 
 READ ONLY admission now counts a locking CTE referenced only by another CTE that the final
 SELECT does not use, as PostgreSQL does. Chains and locking views contribute their strongest
-intent even when the final query has a weaker clause. `CompiledQuery.rowLockingCtes` is an
+intent even when the final query has a weaker clause. Both the base and step of a
+referenced recursive declaration count, including a step reached only by an unused referrer.
+`CompiledQuery.rowLockingCtes` is an
 optional additive field retaining these admission-only bodies for catalog/view expansion
 and compiled-plan transport; it does not add execution sources. Only a CTE with zero
 references in a planned query scope is omitted. No stored-format change.

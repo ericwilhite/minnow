@@ -8385,8 +8385,15 @@ class Parser {
         if (columns !== undefined) renameBlockOutputs(block, columns, name);
         this.#ctes.set(name, block);
       }
-      const body = this.#ctes.get(name) ?? this.#recursiveCtes.get(name)?.base;
+      const recursiveBody = this.#recursiveCtes.get(name);
+      const body = this.#ctes.get(name) ?? recursiveBody?.base;
       if (body !== undefined) {
+        // Retain both members under the declaration's external reference count. Its
+        // self-reference alone does not plan it; an unused sibling's reference does.
+        if (recursiveBody !== undefined)
+          this.rowLockingCtes.push(
+            withRowLock(recursiveBody.step, expandRowLockCteViews(recursiveBody.step)),
+          );
         withRowLockCtes(body, this.rowLockingCtes);
         withRowLock(body, expandRowLockCteViews(body));
         declarations.push(body);

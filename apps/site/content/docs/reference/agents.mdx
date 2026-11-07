@@ -277,7 +277,7 @@ machines: https://minnowdb.com/llms.txt
   truncates, `GROUP BY` a primary key with the row's other columns ungrouped, case-insensitive
   unquoted identifiers, `SET`/`RESET`/`SHOW` session settings (accepted and ignored, except a
   non-UTC time zone), `FOR UPDATE` (no locks taken; table/view targets are refused in
-  `READ ONLY`, including through FROM subqueries; outer CTE-reference locks are allowed; CTE bodies with positive reference counts count even through unused referrers; zero-reference CTEs do not), and `E'…'`/`$$…$$` strings.
+  `READ ONLY`, including through FROM subqueries; outer CTE-reference locks are allowed; CTE bodies with positive reference counts count even through unused referrers; zero-reference CTEs do not; a recursive declaration retains both base and step, and self-reference alone does not count), and `E'…'`/`$$…$$` strings.
 - Array values use canonical JSON text. Scalar subscripts, ARRAY_AGG, typed UNNEST over
   ARRAY constructors, and `ANY`/`ALL` over arrays are supported. Pass an IN list as one array
   parameter — `WHERE id = ANY($1)` with `params: [[1, 2, 3]]`, or `$1::int[]` — rather than

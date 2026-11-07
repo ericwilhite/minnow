@@ -113,5 +113,68 @@ export function rowLockGraphs(): Array<{
             states: [counted ? "scalar view" : "dead expression"],
           });
       }
+  // Self-recursion is not an external reference. A retained declaration needs both members.
+  for (const lock of GRAPH_LOCKS)
+    for (const source of ["direct", "view", "nested view", "view graph"])
+      for (const hint of ["", "MATERIALIZED ", "NOT MATERIALIZED "])
+        for (const position of ["base", "step", "both"]) {
+          const relation = (strength: (typeof GRAPH_LOCKS)[number]): string =>
+            source === "direct"
+              ? `(SELECT * FROM t FOR ${strength})`
+              : `graph_${source === "view" ? "v" : source === "view graph" ? "g" : "n"}${String(GRAPH_LOCKS.indexOf(strength))}`;
+          const base =
+            position === "step"
+              ? "SELECT 1 AS id"
+              : `SELECT q.id FROM ${relation(position === "both" ? "KEY SHARE" : lock)} q WHERE q.id = 1`;
+          const step = `SELECT q.id + 1 AS id FROM r JOIN ${position === "base" ? "t" : relation(lock)} q ON q.id = r.id WHERE r.id < 2`;
+          const declaration = `r(id) AS ${hint}(${base} UNION ALL ${step})`;
+          for (const referrer of ["none", "unused", "chain", "consumed"])
+            for (const tail of ["constant", "weak", "point"]) {
+              const suffix =
+                referrer === "unused"
+                  ? ", d AS (SELECT * FROM r)"
+                  : referrer === "chain"
+                    ? ", d AS (SELECT * FROM r), e AS (SELECT * FROM d)"
+                    : "";
+              const final =
+                referrer === "consumed"
+                  ? tail === "constant"
+                    ? "SELECT * FROM r"
+                    : `SELECT t.id FROM r JOIN t ON t.id = r.id ${tail === "point" ? "WHERE t.id = 1 " : ""}FOR KEY SHARE OF t`
+                  : tail === "constant"
+                    ? "SELECT 1 AS id"
+                    : `SELECT * FROM t ${tail === "point" ? "WHERE id = 1 " : ""}FOR KEY SHARE`;
+              cases.push({
+                sql: `WITH RECURSIVE ${declaration}${suffix} ${final}`,
+                lock: referrer !== "none" ? lock : tail === "constant" ? undefined : "KEY SHARE",
+                states: [
+                  source,
+                  `recursive ${position}`,
+                  `recursive ${referrer}`,
+                  ...(hint === "MATERIALIZED " ? ["materialized"] : []),
+                  ...(hint === "NOT MATERIALIZED " ? ["not materialized"] : []),
+                  ...(tail !== "constant" ? ["strongest final clause"] : []),
+                ],
+              });
+            }
+          const inner = `WITH RECURSIVE ${declaration}, d AS (SELECT * FROM r) SELECT 1 AS id`;
+          for (const [sql, used] of [
+            [`WITH discarded AS (${inner}) SELECT 1 AS id`, false],
+            [`WITH consumed AS (${inner}) SELECT * FROM consumed`, true],
+            [
+              `WITH discarded AS (${inner}), referrer AS (SELECT * FROM discarded) SELECT 1 AS id`,
+              true,
+            ],
+          ] as const)
+            cases.push({
+              sql,
+              lock: used ? lock : undefined,
+              states: [
+                source,
+                `recursive ${position}`,
+                used ? "recursive nested counted" : "recursive discarded scope",
+              ],
+            });
+        }
   return cases;
 }

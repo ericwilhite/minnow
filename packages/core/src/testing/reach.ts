@@ -394,6 +394,17 @@ export const TRANSACTION_MODE_ORDER_STATES = [
 
 /** PostgreSQL CTE refcounts count unused referrers, but respect the enclosing query scope. */
 export const ROW_LOCK_GRAPH_STATES = [
+  "empty view catalog",
+  "nonempty view catalog",
+  "recursive base",
+  "recursive step",
+  "recursive both",
+  "recursive none",
+  "recursive unused",
+  "recursive chain",
+  "recursive consumed",
+  "recursive nested counted",
+  "recursive discarded scope",
   "referenced by unused",
   "unreferenced",
   "direct",

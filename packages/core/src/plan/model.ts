@@ -513,7 +513,7 @@ export interface CompiledQuery {
    * refuses them, as PostgreSQL does.
    */
   rowLocking?: RowLocking;
-  /** Referenced CTE bodies retained for row-lock admission/view expansion, not execution.
+  /** Referenced CTE bodies, including recursive base and step, retained for admission/view expansion.
    * A reference from an unused CTE still counts (PostgreSQL SS_process_ctes).
    */
   rowLockingCtes?: readonly CompiledQuery[];
