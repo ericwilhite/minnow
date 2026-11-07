@@ -9,12 +9,14 @@ import { DEFAULT_RESULT_WINDOW_BYTES, RELEASE_DELAY_MS } from "../src/next/owner
 import type { FramePayload } from "../src/next/exec/result.js";
 import type { BuildResult, ExportPass, ExportRequest } from "./next-export-worker.js";
 
+import { ProtocolClient } from "../src/next/owner/client.js";
 import { recyclingFrame } from "../src/next/owner/recycling-frame.js";
 import { DiscardReceiver } from "../../../scripts/browser-perf/page/discard-receiver.js";
 
 const DIR = "wide";
 let built: BuildResult | null = null;
 let seriesWorker: Worker | null = null;
+let seriesOwner: ProtocolClient | null = null;
 let nextRequest = 1;
 
 async function withWorker<T>(request: ExportRequest, discard = false): Promise<T> {
@@ -34,9 +36,17 @@ async function withWorker<T>(request: ExportRequest, discard = false): Promise<T
   const worker = reused && seriesWorker ? seriesWorker : new Worker(url, { type: "module" });
   const id = nextRequest++;
   const job =
-    request.op === "export" ? request : request.op === "series-pass" ? request.request : null;
+    request.op === "export"
+      ? request
+      : request.op === "series-pass" || (request.op === "series-open" && request.request.ownerAPI)
+        ? request.request
+        : null;
   const results =
-    job && (job.mode === "scan" || job.mode === "scan-adapter") ? new MessageChannel() : null;
+    job &&
+    (!job.ownerAPI || request.op === "series-open") &&
+    (job.mode === "scan" || job.mode === "scan-adapter")
+      ? new MessageChannel()
+      : null;
   let onMessage: ((event: MessageEvent<unknown>) => void) | undefined;
   let onError: ((event: ErrorEvent) => void) | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -60,7 +70,8 @@ async function withWorker<T>(request: ExportRequest, discard = false): Promise<T
         results.port1.postMessage({ t: "release", target: 1, through });
         unreleased = 0;
       };
-      if (results) {
+      let ownerRun: Promise<number> | null = null;
+      if (results && !job?.ownerAPI) {
         results.port1.onmessage = (
           event: MessageEvent<{ t: string; frames: FramePayload[]; bufferIds?: number[] }>,
         ) => {
@@ -128,7 +139,9 @@ async function withWorker<T>(request: ExportRequest, discard = false): Promise<T
             {
               id,
               request:
-                request.op === "series-pass" ? { op: "series-pass", request: posted } : posted,
+                request.op === "series-pass" || request.op === "series-open"
+                  ? { op: request.op, request: posted }
+                  : posted,
             },
             [results.port2],
           );
@@ -144,11 +157,34 @@ async function withWorker<T>(request: ExportRequest, discard = false): Promise<T
           if (!reused) send();
           return;
         }
-        const data = event.data as { id?: number; result?: unknown; error?: string };
+        const data = event.data as { id?: number; result?: unknown; error?: string; t?: string };
+        if (data.id === id && data.t === "owner-start") {
+          ownerRun = (async () => {
+            if (!seriesOwner || !job?.ownerAPI) throw new Error("Owner client is not connected");
+            const start = performance.now();
+            const stream = seriesOwner.exportStream("SELECT * FROM t");
+            for await (const frame of stream.frames) {
+              if (
+                frame.payload.columns.length !== job.groups[0]?.chunks.length ||
+                frame.payload.columns.some((c) => c.length !== frame.payload.rowCount)
+              )
+                throw new Error("Malformed owner API frame");
+              receivedRows += frame.payload.rowCount;
+              receivedFrames++;
+              receivedBytes += payloadBytes(frame.payload);
+              frame.release();
+            }
+            const summary = await stream.done;
+            if (summary.rowCount !== receivedRows) throw new Error("Owner API summary disagrees");
+            return performance.now() - start;
+          })();
+          ownerRun.catch(reject);
+          return;
+        }
         if (data.id !== id) return;
         if (data.error !== undefined) reject(new Error(data.error));
         else {
-          if (results) {
+          if (results && !job?.ownerAPI) {
             const pass = (data.result as ExportPass[]).at(-1);
             if (
               pass?.rows !== receivedRows ||
@@ -159,23 +195,51 @@ async function withWorker<T>(request: ExportRequest, discard = false): Promise<T
               return;
             }
           }
-          resolve(data.result as T);
+          if (job?.ownerAPI && request.op === "series-pass") {
+            if (!ownerRun) {
+              reject(new Error("Missing owner API iteration"));
+              return;
+            }
+            ownerRun
+              .then((ms) => {
+                const passes = data.result as ExportPass[],
+                  pass = passes.at(-1);
+                if (
+                  pass?.rows !== receivedRows ||
+                  pass.executorStats?.frames !== receivedFrames ||
+                  pass.executorStats.wireBytes !== receivedBytes
+                )
+                  throw new Error("Owner API transport totals disagree");
+                resolve(passes.map((p, k) => (k === passes.length - 1 ? { ...p, ms } : p)) as T);
+              })
+              .catch(reject);
+          } else resolve(data.result as T);
         }
       };
       worker.addEventListener("message", onMessage);
       if (reused) send();
     });
+    if (request.op === "series-open") {
+      seriesWorker = worker;
+      if (job?.ownerAPI && results) {
+        seriesOwner = new ProtocolClient();
+        await seriesOwner.connect(results.port1);
+      }
+    }
     succeeded = true;
-    if (request.op === "series-open") seriesWorker = worker;
     return answer;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
     if (releaseTimer !== undefined) clearTimeout(releaseTimer);
     if (onMessage) worker.removeEventListener("message", onMessage);
     if (onError) worker.removeEventListener("error", onError);
-    results?.port1.close();
+    if (!(request.op === "series-open" && job?.ownerAPI && succeeded)) results?.port1.close();
     receiver?.close();
     if (!persistent || request.op === "series-close" || !succeeded) {
+      if (!succeeded) {
+        seriesOwner?.close();
+        seriesOwner = null;
+      }
       worker.terminate();
       if (seriesWorker === worker) seriesWorker = null;
     }
@@ -206,6 +270,7 @@ export async function exportPass(options: {
   /** Bench consumer relinquishes all column views after consuming each frame. */
   readonly discard?: boolean;
   readonly recycle?: boolean;
+  readonly ownerAPI?: boolean;
   readonly once: boolean;
   readonly readaheadKiB: number;
   readonly windowMiB?: number;
@@ -230,6 +295,8 @@ export async function exportPass(options: {
   readonly scanOutput?: "borrowed" | "flat" | "dictionary";
 }): Promise<ExportPass[]> {
   if (built === null) throw new Error("build the table first");
+  if (options.ownerAPI && !options.persistent)
+    throw new Error("Owner API timing requires a persistent series");
   if (options.recycle && options.discard) throw new Error("Choose recycling or discard disposal");
   if (options.recycle && !options.persistent)
     throw new Error("Return-pool experiment requires a persistent series");
@@ -245,6 +312,7 @@ export async function exportPass(options: {
     outside,
     once: options.once,
     ...(options.recycle ? { recycle: true } : {}),
+    ...(options.ownerAPI ? { ownerAPI: true } : {}),
     readaheadKiB: options.readaheadKiB,
     ...(options.windowMiB === undefined ? {} : { windowMiB: options.windowMiB }),
     capMiB: options.capMiB,
@@ -274,6 +342,7 @@ export async function openSeries(
   groups: number,
   capMiB: number,
   executorReference?: string,
+  ownerAPI = false,
 ): Promise<unknown> {
   if (built === null) throw new Error("Build first");
   const selected = built.groups.slice(0, groups),
@@ -293,10 +362,13 @@ export async function openSeries(
       passes: 1,
       auditWorkingSet: false,
       ...(executorReference ? { executorReference } : {}),
+      ...(ownerAPI ? { ownerAPI: true } : {}),
     },
   });
 }
 export async function closeSeries(): Promise<unknown> {
+  seriesOwner?.close();
+  seriesOwner = null;
   return withWorker({ op: "series-close" });
 }
 

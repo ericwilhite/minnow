@@ -24,7 +24,7 @@ import type { ExportGroup, ExportResult } from "./export-stream.js";
 import { benchTableOf } from "./scan-fixture.js";
 
 export interface ExecutorExportStats {
-  readonly path: "production-executor";
+  readonly path: "production-executor" | "production-owner-api";
   readonly outputRecycling: boolean;
   readonly frames: number;
   readonly wireBytes: number;

@@ -805,3 +805,15 @@ export const OWNER_EXPORT_DATA_REACH = {
   views: ["first view partial", "later alias partial"],
   preconnect: ["close before connect", "cancel before connect", "concurrent next refused"],
 } as const;
+
+/** Production API benchmark fixture stays on real SQL/owner transport, across repeated queries. */
+export const OWNER_API_BENCH_REACH = [
+  "real SQL identity projection",
+  "wire totals",
+  "first export",
+  "same connection export",
+  "sparse NULLs",
+  "all valid",
+] as const;
+
+export const OWNER_API_ENVELOPE_REACH = ["rows envelope", "done envelope"] as const;

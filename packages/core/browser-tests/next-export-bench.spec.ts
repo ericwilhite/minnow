@@ -87,7 +87,11 @@ const SCAN_BATCH_COMPARE = process.env.MINNOW_EXPORT_SCAN_BATCH_COMPARE === "1";
 const SCAN_BATCH_COMPLETED = process.env.MINNOW_EXPORT_SCAN_BATCH_COMPLETED ?? "";
 const SCAN_IO_COMPARE = process.env.MINNOW_EXPORT_SCAN_IO_COMPARE === "1";
 const DISCARD = process.env.MINNOW_EXPORT_DISCARD === "1";
-const RSS_SERIES = process.env.MINNOW_EXPORT_RSS_SERIES === "1";
+const OWNER_COMPARE = process.env.MINNOW_EXPORT_OWNER_COMPARE === "1";
+const OWNER_API = process.env.MINNOW_EXPORT_OWNER_API === "1" || OWNER_COMPARE;
+if (OWNER_API && EXECUTOR_REFERENCE)
+  throw new Error("Owner API comparison uses the current bench control, not a frozen executor");
+const RSS_SERIES = process.env.MINNOW_EXPORT_RSS_SERIES === "1" || OWNER_API;
 const SCAN_COMPARE =
   RSS_SERIES ||
   process.env.MINNOW_EXPORT_SCAN_COMPARE === "1" ||
@@ -484,9 +488,9 @@ test.describe("rebuild core export on OPFS (bench)", () => {
 
     const seriesOpen = RSS_SERIES
       ? await page.evaluate(
-          async ([url, groups, reference]) =>
-            ((await import(url)) as Run).openSeries(groups, 512, reference),
-          [RUN, exported, EXECUTOR_REFERENCE] as const,
+          async ([url, groups, reference, ownerAPI]) =>
+            ((await import(url)) as Run).openSeries(groups, 512, reference, ownerAPI),
+          [RUN, exported, EXECUTOR_REFERENCE, OWNER_API] as const,
         )
       : undefined;
     const seriesMemoryBefore = RSS_SERIES ? await targets.memory() : undefined;
@@ -562,7 +566,9 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       }
       if (options.mode === "scan") {
         expect(pass.scanStats, "Gate A must not run the stand-in adapter").toBeUndefined();
-        expect(pass.executorStats?.path).toBe("production-executor");
+        expect(pass.executorStats?.path).toBe(
+          options.ownerAPI ? "production-owner-api" : "production-executor",
+        );
         expect(pass.executorStats?.frames).toBeGreaterThan(0);
         expect(pass.executorStats?.transferredBuffers).toBeGreaterThan(0);
         expect(pass.executorStats?.readWindowPolicy).toBe("executor-default");
@@ -696,7 +702,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     const base = { once: true, capMiB: 512, passes: 1, groups: exported };
     if (RSS_SERIES) {
       for (let round = 0; round < 5; round++)
-        for (const variant of EXECUTOR_REFERENCE
+        for (const variant of EXECUTOR_REFERENCE || OWNER_COMPARE
           ? round % 2 === 0
             ? (["baseline", "candidate"] as const)
             : (["candidate", "baseline"] as const)
@@ -704,7 +710,8 @@ test.describe("rebuild core export on OPFS (bench)", () => {
           await measure(`cold persistent ${variant} scan round ${String(round)}`, true, false, {
             ...base,
             persistent: true,
-            recycle: process.env.MINNOW_EXPORT_RECYCLE === "1",
+            recycle: OWNER_API || process.env.MINNOW_EXPORT_RECYCLE === "1",
+            ownerAPI: OWNER_API && (!OWNER_COMPARE || variant === "candidate"),
             discard: DISCARD,
             readaheadKiB: 256,
             auditWorkingSet: false,
@@ -1057,8 +1064,9 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       campaignRendererPeakMiB: Math.max(...results.map((r) => r.rendererRssAbsolutePeakMiB)),
       ...(SCAN_COMPARE
         ? {
-            scanAdapter:
-              SCAN_CORE_PROFILE || (SCAN_SHAPE_COMPARE && !SCAN_SHAPE_TRANSPORT)
+            scanAdapter: OWNER_API
+              ? "Production ProtocolClient.exportStream -> OwnerServer -> composeEngine -> real SQL lowering -> Executor/ResultSink/ResultChannel. Fixture catalog and immutable snapshot descriptors exclude B3 root discovery; client row objects excluded. Wall time includes exportStream call through iteration, frame releases and done. CPU is worker only. Prototype control uses the old bench handle."
+              : SCAN_CORE_PROFILE || (SCAN_SHAPE_COMPARE && !SCAN_SHAPE_TRANSPORT)
                 ? "scan-only diagnostic; real TableScan/driver; borrowed endpoint consumer; excludes all frame assembly, result channel, transfers and client transport; fixture descriptors exclude SQL/catalog/root loading"
                 : results.some((r) => r.mode === "scan-adapter")
                   ? "historical scan-adapter diagnostic; stand-in assembler; excluded from Gate A; fixture descriptors exclude SQL/catalog/root loading"

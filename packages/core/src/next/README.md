@@ -1555,6 +1555,33 @@ slab buffer is eligible. Protocol version 6 adds the explicit mode, capability l
 `returnBuffers` signal; old versions are refused during handshake. This is a wire-only change,
 with no stored-format change.
 
+For the production API benchmark, set `MINNOW_EXPORT_OWNER_API=1` with
+`MINNOW_EXPORT_DISTINCT=1 npm run benchmark:export`. It performs five cold OPFS exports through
+`ProtocolClient.exportStream()` in one persistent owner process and reports RSS against one fixed
+post-setup baseline. `MINNOW_EXPORT_OWNER_COMPARE=1` instead interleaves five API/control pairs;
+the control is explicitly the historical bench handle, on current executor code. Both release
+frames promptly. A pass's wall time runs from the API call through iteration, releases and `done`;
+CPU is the dedicated worker's setup-excluded CPU, excluding the page consumer. The owner server,
+composition, SQL lowerer, executor and client are real. Fixture catalog/snapshot descriptors
+replace B3 catalog/group-root discovery, and client row objects are excluded. These measurements
+are not a full database-open benchmark or quiet-host Gate A acceptance. The harness records
+its own observation overhead; pull/drain sub-times are uninstrumented, reported as zero.
+
+The component `scripts/vector-materialize-bench.mts --compare=REV` separately measures resident
+page decode, vector shape setup and fresh dedicated output allocation, excluding storage,
+framing and transfers. It permits source dictionary codes in every column/range; ResultSink's
+per-stream dictionary cap and returned-buffer transport are outside this component.
+`--returned` uses the actual charged 4 MiB ReturnPool: decode and take/clear are timed per
+200-column batch, while two real structured-clone transfers and capability issue/return run
+outside those timers. It models prompt cooperative return, not MessagePort latency or the
+production pool hit rate. The fresh mode's timer covers its complete loop. Separate modes are
+component scopes, not an A/B speed claim. All output and pool charges must be zero at close.
+`--legacy-dictionaries` preserves the historical first-23-columns-only diagnostic.
+`--profile-dir=/home/eric/.cache/NAME` records 500-us Node CPU profiles around only the measured
+fresh loop, after fixture loading, warmup and GC. Returned mode refuses profiling because its
+return handovers are excluded from component timers. Profiled samples remain separate from unprofiled
+CPU comparisons. Each comparison retains five alternating fresh-process rounds per variant.
+
 - One owner per database holds the store's fence: a dedicated owner worker started by a page, or
   a dedicated worker hosting in place. Every other context is a thin client over a MessagePort
   brokered by a SharedWorker; the owner tab's own client uses a direct channel.
