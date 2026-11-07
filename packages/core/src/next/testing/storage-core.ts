@@ -12,6 +12,7 @@ import {
   type ParameterValue,
 } from "../exec/executor.js";
 import { UnsupportedPlanError } from "../exec/errors.js";
+import type { WireDictionary, WireFlat } from "../exec/result.js";
 import { bindParameter } from "../exec/parameters.js";
 import { ColumnStore } from "../exec/column-store.js";
 import { compileTableRules } from "../exec/rules.js";
@@ -121,21 +122,34 @@ export class StorageCore implements NextCore {
     const prepared = this.executor.prepare(lowered.plan);
     const run = this.start(prepared, params);
     const batches: Batch[] = [];
+    // Stream dictionaries, applied in frame order as the owner client does (`StreamDictionaries`).
+    const dictionaries = new Map<number, WireFlat[]>();
     try {
       for (;;) {
         const frame = await run.execution.results.next();
         if (frame === null) break;
         try {
           const payload = structuredClone(frame.payload);
+          for (const delta of payload.dictionaries) {
+            const parts = dictionaries.get(delta.id) ?? [];
+            if (delta.from !== parts.reduce((size, part) => size + part.length, 0))
+              throw new RangeError(`dictionary ${String(delta.id)} delta out of order`);
+            parts.push(delta.values);
+            dictionaries.set(delta.id, parts);
+          }
           batches.push({
             length: payload.rowCount,
             selection: null,
             columns: payload.columns.map((vector, index) => {
-              if (vector.form !== "flat")
-                throw new TypeError("the result sink must materialize flat frames");
+              const flat =
+                vector.form === "dictionary"
+                  ? expandTextDictionary(vector, dictionaries.get(vector.dictionary) ?? [])
+                  : vector;
+              if (flat.form !== "flat")
+                throw new TypeError("the result sink must send flat or dictionary frames");
               const type = prepared.columns[index]?.type;
               if (type === undefined) throw new TypeError("missing result type");
-              return { ...vector, type };
+              return { ...flat, type };
             }),
           });
         } finally {
@@ -230,4 +244,41 @@ export async function storageCore(store: StoreKind): Promise<StorageCore> {
   if (store !== "memory")
     throw new UnsupportedPlanError(`the Node adapter's ${store} store`, { construct: "storage" });
   return new StorageCore().open();
+}
+
+/**
+ * A text dictionary column expanded to flat UTF-8 (result dictionaries carry only `varlen` text
+ * entries). The client reads the same codes through `StreamDictionaries`; the adapter compares
+ * flat batches.
+ */
+function expandTextDictionary(column: WireDictionary, parts: readonly WireFlat[]): WireFlat {
+  const entry = (code: number): Uint8Array => {
+    let index = code;
+    for (const part of parts) {
+      if (index < part.length) {
+        if (part.data.layout !== "varlen") throw new TypeError("result dictionaries are text");
+        const { bytes, offsets } = part.data;
+        return bytes.subarray(offsets[index] ?? 0, offsets[index + 1] ?? 0);
+      }
+      index -= part.length;
+    }
+    throw new RangeError(`code ${String(code)} is outside dictionary ${String(column.dictionary)}`);
+  };
+  const valid = (row: number): boolean =>
+    column.validity === null || ((column.validity[row >>> 5] ?? 0) & (1 << (row & 31))) !== 0;
+  const offsets = new Int32Array(column.length + 1);
+  let size = 0;
+  for (let row = 0; row < column.length; row++) {
+    if (valid(row)) size += entry(column.codes[row] ?? 0).length;
+    offsets[row + 1] = size;
+  }
+  const bytes = new Uint8Array(size);
+  for (let row = 0; row < column.length; row++)
+    if (valid(row)) bytes.set(entry(column.codes[row] ?? 0), offsets[row] ?? 0);
+  return {
+    form: "flat",
+    length: column.length,
+    validity: column.validity,
+    data: { layout: "varlen", bytes, offsets },
+  };
 }

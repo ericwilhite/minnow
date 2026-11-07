@@ -625,23 +625,85 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     fixture outside IO, checks row/charge totals, and reports five CPU/wall rounds. Its memory
     peak is only the cache handle; the OPFS comparison reports the full governor and RSS.
 - Scan/transport mode: `MINNOW_EXPORT_SCAN_COMPARE=1 npm run benchmark:export` runs five
-  interleaved cold/warm attempts of the page stream and B4's real `TableScan`/pipeline driver.
+  interleaved cold/warm attempts of the page stream and B4's production Executor/result path.
   `MINNOW_EXPORT_SCAN_COLD_ONLY=1` keeps five cold attempts of each mode; the nightly workflow
   records these separately as `export-scan-bench.json`, without a threshold. The governor cap
   is 512 MiB for both modes and is reported; its counter is not an RSS bound.
-  - `scripts/browser-perf/page/owner-frames.ts` is a **bench adapter standing in for the
-    executor's future frame assembly**. It stays out of `exec/` and production imports. It owns
-    each compact scan batch as the current `FramePayload`, prepays exact frame/registry bytes,
-    uses identity dictionaries up to the stream cap, then flattens text dictionaries. It does
-    not implement selected vectors or capped non-text dictionaries (outside this fixture).
+  - `scripts/browser-perf/page/executor-export.ts` prepares a real scan plan with `createExecutor`
+    before timing. `execute` owns admission, TableScan, ResultSink and ResultChannel; frames use
+    the unchanged owner transfer policy, real MessagePort delivery and cumulative client credits.
+    Ordinary `mode:"scan"` is now Gate A's export number. Execution defaults are used, including
+    the compiler's terminal full-scan window policy. The bench does not override scan windows,
+    output ownership, batch targets or result framing. Fixture preparation/SQL/catalog/root reads
+    and client row-object construction remain excluded. Generated `executor-export.test.ts`
+    histories check actual factory preparation, all transferred values, multiple groups, sparse
+    NULLs, genuine >64 KiB values, delayed credits, storage survival and returned execution charges.
+    The production sink keeps eligible UTF-8 dictionaries as copied codes and per-stream owned
+    deltas, applied by `StreamDictionaries` before client access. Dictionary bytes and registry
+    entries share the existing 1 MiB stream cap; subsequent dictionaries fall back to flat varlen.
+    Registry entries use ordinary result-grant capacity, so a delta frame can return its progress
+    loan before the stream ends. Dictionary pages and borrowed codes never enter a transfer list.
+    A direct terminal full scan decodes tight dedicated output into the result grant. The sink
+    adopts only buffers explicitly named by that source's detach permission and charged to its
+    own grant. Before returning the source token (and its query dictionary references), it
+    reclassifies the dedicated buffers into a frame charge in the same result grant. That charge
+    survives until frame credit; a refused optional reclassification keeps the copying path. Capped dictionary columns and other
+    ineligible columns are copied into the same frame. The owning sink admits dictionaries
+    before source sizing: accepted columns decode to dedicated codes, refused ones directly to
+    dedicated UTF-8. Each group's decision stays fixed across sizing, reservation and decode,
+    so the batch target reflects its wire form. A reserved dictionary id is published only with
+    its first owned delta; cancel/end returns unused registry charges.
+    If the complete batch exceeds the frame
+    byte or row limit, the ordinary copying splitter remains in use. Identity/computed projects
+    retain that safe copying path. A terminal scan may fall back to ordinary borrowed decode
+    when the result budget refuses even one dedicated row, preserving progress loans.
+    `testing/result-owned.test.ts` checks source/client equality, mixed ownership, foreign grants,
+    selections, row limits and cancellation; `testing/result-owned-bytes.test.ts` checks exact
+    transferred buffer identity and bytes across all native layouts, including NaN payload words; the real executor bridge observes cached and pooled
+    PageCache buffers through actual transfers, with poison verification off.
+    Generated `testing/result-dictionaries.test.ts` checks exact client values, NULLs, selections,
+    identity reuse/change, large deltas, cumulative cap fallback, pressure and cancellation.
+  - The receiver opens `browser/next-export.html`, which loads no unrelated conformance
+    runner or released legacy engine. `MINNOW_EXPORT_GENERIC_PAGE=1` reproduces the historical
+    page bootstrap; reports identify the bootstrap. This changes harness residency, not the
+    production executor, receiver, transfers or credit policy. Compare absolute RSS across
+    those scopes only with the bootstrap stated.
+  - `MINNOW_EXPORT_PAGE_HEAP=/home/eric/.cache/export.heapsnapshot` adds a page-side CDP
+    heap snapshot after all frame delivery. It records pre/post snapshot heap, backing storage
+    and renderer RSS. Snapshotting performs GC: use a separate diagnostic run, not its timings
+    or post-GC snapshot as an export peak measurement. CDP `backingStorageSize` includes
+    external strings as well as ArrayBuffers. Captures label it `backingStoragePeakMiB`; the
+    historical `arrayBufferPeakMiB` key remains an alias, not a pure ArrayBuffer measurement.
+  - `scripts/result-sink-bench.mts --compare=REV --owned` isolates framing with fresh
+    authorized source buffers and mixed numeric/dictionary columns. It charges source buffers
+    before pushing and returns their charges on release. Input construction is excluded; decode
+    and OPFS are measured by the whole export instead.
+  - `scripts/executor-export-bench.mts` compares the real executor/result path with the historical
+    adapter over the same memory-backed PageCache. `--compare=REV` instead freezes the whole
+    executor dependency family at a Git revision and compares it with the current compiler.
+    Physical groups have distinct addresses in both variants. Five interleaved fresh
+    processes per variant exclude preparation, setup, warmup and GC and record process/thread
+    CPU and wall time. This isolates worker export cost, not OPFS/renderer memory. Both use real
+    in-process transfers; the adapter is not an alternative Gate A implementation.
+  - `MINNOW_EXPORT_EXECUTOR_REFERENCE=REV npm run benchmark:export` runs five interleaved
+    cold baseline/current production-executor pairs. The revision must exist locally; every core
+    dependency is frozen, with no fallback to current sources. Both code families load before
+    timing. Use standalone current runs for absolute RSS acceptance: the paired comparison
+    also retains the reference code family.
+  - `owner-frames.ts` and `scan-export.ts` remain **historical scan-adapter diagnostics**, excluded
+    from Gate A. Ownership/batch/IO/range/shape-transport/frame-copy experiment flags explicitly
+    use `mode:"scan-adapter"`. No production module imports the old assembler.
   - The real `ResultChannel`, `frameByteLength` and owner transfer policy are reused. Frames
     go over a real `MessagePort`; the client checks sequence/dictionary/row/byte totals and
     returns cumulative credits at half the window or the owner's release delay. The timed
     export ends after all credits return. The client consumes typed frames, not JS row objects.
   - Table/group descriptors come from the fixture, replacing SQL lowering and B3 catalog/root
-    loading. The scan requests a 64 MiB row window through `TableScan.readWindowBytes` and
+    loading. The historical scan-adapter/scan-core diagnostics request a 64 MiB row window
+    through `TableScan.readWindowBytes` and
     the `chunkReads` factory: B2's shared `loadTogether` and one-pass pooled leases. This
-    window stays opt-in: absent/zero `readWindowBytes` keeps cached batch reads. Filtered/deleted groups
+    window is also the production default for a terminal, unfiltered full-table scan (including
+    identity projections), with no runtime filter or locator consumer. Other plans retain cached
+    reads; direct TableScan callers still opt in with `readWindowBytes`. Filtered/deleted groups
     retain selective reads. Resident shared loads preserve synchronous `next()` steps until a task yield is due. A refused
     optional window drops partial loads and shrinks before
     falling back to batch reads. Window planning, cached installation, sorting and read/page

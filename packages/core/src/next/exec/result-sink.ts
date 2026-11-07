@@ -1,8 +1,14 @@
-/** Owned, compact result frames. Input buffers never survive readiness or enter a wire frame. */
+/** Owned, compact result frames. Borrowed input is copied; authorized dedicated input stays charged through frame credit. */
 import type { MaybePromise } from "../access/key-index.js";
 import { OBJECT_OVERHEAD_BYTES, bigintBytes, type Grant, type Loan } from "../memory/governor.js";
 import type { PhysicalType } from "../types.js";
-import { BATCH_ROWS, type Batch } from "../vector/vector.js";
+import { BATCH_ROWS, type Batch, type FlatVector } from "../vector/vector.js";
+import {
+  ResultDictionaries,
+  type DictionaryPlan,
+  type DictionaryFrame,
+} from "./result-dictionaries.js";
+import { ownedResultColumns } from "./result-owned.js";
 import { ColumnStore } from "./column-store.js";
 import { slotOf, validAt } from "./kernels/vectors.js";
 import {
@@ -16,10 +22,17 @@ import {
   type PushResult,
   type Transfer,
 } from "./pipeline.js";
-import { RESULT_FRAME_TARGET_BYTES, ResultChannel } from "./result.js";
+import {
+  frameByteLength,
+  frameTransferList,
+  RESULT_FRAME_TARGET_BYTES,
+  ResultChannel,
+  type WireVector,
+} from "./result.js";
 
-interface FrameStore {
+interface FrameStore extends DictionaryFrame {
   readonly store: ColumnStore;
+  columns: WireVector[] | null;
   metadata: boolean;
   loan: Loan | null;
   freed: boolean;
@@ -38,6 +51,8 @@ export class ResultSink implements Operator {
   readonly #maxRows: number | null;
   readonly #clock: TaskClock;
   #zeroSent = 0;
+  readonly #dictionaries: ResultDictionaries;
+  #dictionaryPlan: DictionaryPlan | null = null;
   readonly #abort = new AbortController();
   readonly #frames = new Set<FrameStore>();
   readonly #metadataBytes: number;
@@ -58,6 +73,7 @@ export class ResultSink implements Operator {
     readonly requiresLsn: number,
     options: ResultSinkOptions = {},
   ) {
+    this.#dictionaries = new ResultDictionaries(grant);
     this.deferEnd = options.deferEnd ?? false;
     this.#maxRows = options.maxRows ?? null;
     this.#clock = clockFor(options.now);
@@ -76,6 +92,12 @@ export class ResultSink implements Operator {
       rows /= 2;
     }
     this.#rowsPerFrame = rows;
+  }
+
+  /** Stable per-stream admission used by a direct terminal source before output reservation. */
+  admitDictionary(dictionary: FlatVector): boolean {
+    this.#check();
+    return this.#dictionaries.admit(dictionary) !== null;
   }
 
   get rowCount(): number {
@@ -102,6 +124,7 @@ export class ResultSink implements Operator {
     this.#transfer = transfer ?? null;
     this.#at = 0;
     try {
+      this.#dictionaryPlan = this.#dictionaries.plan(this.types, batch.columns);
       return this.#drain();
     } catch (error) {
       this.abort(error);
@@ -177,6 +200,7 @@ export class ResultSink implements Operator {
   }
 
   #finishFrames(): void {
+    this.#dictionaries.close();
     this.#finished = true;
     if (!this.deferEnd) this.complete();
   }
@@ -185,6 +209,7 @@ export class ResultSink implements Operator {
   abort(reason: unknown): void {
     if (!this.#abort.signal.aborted) this.#abort.abort(reason);
     this.#releaseInput();
+    this.#dictionaries.close();
     if (this.#pending !== null) this.#free(this.#pending);
     this.#pending = null;
   }
@@ -195,15 +220,18 @@ export class ResultSink implements Operator {
     for (const frame of this.#frames) this.#free(frame);
   }
 
-  #make(rows: number): FrameStore {
+  #make(rows: number, types = this.#dictionaryPlan?.types ?? this.types): FrameStore {
     const frame: FrameStore = {
-      store: new ColumnStore(this.types, this.grant, {
+      store: new ColumnStore(types, this.grant, {
         chunkRows: rows,
         varlenBytes: 64,
         // ColumnStore permits one oversized row even with a finite target. Keeping that
         // target makes its arena grow to the actual need, rather than doubling past reserve.
         targetBytes: this.#target,
       }),
+      columns: null,
+      dictionaries: [],
+      extraBytes: 0,
       metadata: this.grant.allocate(this.#metadataBytes),
       loan: null,
       freed: false,
@@ -220,6 +248,7 @@ export class ResultSink implements Operator {
     this.#frames.delete(frame);
     // close() uses retainedBytes, so it remains correct after transfer detached the buffers.
     frame.store.close();
+    this.grant.free(frame.extraBytes);
     if (frame.metadata) this.grant.free(this.#metadataBytes);
     if (frame.loan !== null && this.grant.loaned > 0) frame.loan.repay();
     frame.returned?.();
@@ -229,12 +258,18 @@ export class ResultSink implements Operator {
     if (this.#pending === frame) this.#pending = null;
     this.#frames.add(frame);
     try {
-      const columns = this.types.map((_, c) => {
-        const { form, length, validity, data } = frame.store.chunk(c, 0);
-        return { form, length, validity, data };
-      });
+      const columns =
+        frame.columns ??
+        this.types.map((_, c) => {
+          const { form, length, validity, data } = frame.store.chunk(c, 0);
+          const flat = { form, length, validity, data };
+          return this.#dictionaryPlan === null
+            ? flat
+            : this.#dictionaries.wire(this.#dictionaryPlan, flat, c);
+        });
+      if (this.#dictionaryPlan !== null) this.#dictionaries.publish(this.#dictionaryPlan, frame);
       return this.channel.offer({
-        payload: { rowCount: rows, columns, dictionaries: [] },
+        payload: { rowCount: rows, columns, dictionaries: frame.dictionaries },
         requiresLsn: this.requiresLsn,
         free: () => this.#free(frame),
       });
@@ -244,9 +279,76 @@ export class ResultSink implements Operator {
     }
   }
 
+  /** One compact source batch, mixing authorized buffers with owned fallback copies.
+   * The whole frame must fit the normal byte/row limits. Otherwise use the copying splitter.
+   */
+  #offerOwned(batch: Batch): PushResult | null {
+    const plan = this.#dictionaryPlan;
+    if (plan === null || (this.#maxRows !== null && batch.length > this.#maxRows)) return null;
+    const columns = ownedResultColumns(batch, plan.ids, this.#transfer, this.grant);
+    if (columns === null) return null;
+    const copies = plan.columns.filter((_, c) => columns[c] === null);
+    const types = plan.types.filter((_, c) => columns[c] === null);
+    const frame = this.#make(2 ** Math.ceil(Math.log2(batch.length)), types);
+    try {
+      if (
+        !frame.metadata ||
+        !this.#dictionaries.stage(plan, frame) ||
+        (copies.length > 0 && frame.store.append(copies, null, 0, batch.length) !== batch.length)
+      ) {
+        this.#free(frame);
+        return null;
+      }
+      let copied = 0;
+      frame.columns = columns.map((column, c) => {
+        if (column !== null) return column;
+        const { form, length, validity, data } = frame.store.chunk(copied++, 0);
+        return this.#dictionaries.wire(plan, { form, length, validity, data }, c);
+      });
+      const bytes = frameByteLength({
+        rowCount: batch.length,
+        columns: frame.columns,
+        dictionaries: frame.dictionaries,
+      });
+      if (bytes > this.#target && batch.length > 1) {
+        this.#free(frame);
+        return null;
+      }
+      // The source token also retains query dictionaries/readers. A wire frame has copied
+      // those deltas and owns only dedicated arrays: reclassify their charge before returning
+      // the source lifetime, so execution can close its query grant before frame credit.
+      const adoptedBytes = frameTransferList({
+        rowCount: batch.length,
+        columns: columns.filter((column): column is WireVector => column !== null),
+        dictionaries: [],
+      }).reduce((sum, buffer) => sum + buffer.byteLength, 0);
+      if (!this.grant.allocate(adoptedBytes)) {
+        this.#free(frame);
+        return null;
+      }
+      frame.extraBytes += adoptedBytes;
+      this.#at = batch.length;
+      this.#rows += batch.length;
+      const result = this.#offer(frame, batch.length);
+      this.#releaseInput();
+      if (result === "blocked") this.#wait(this.channel.ready());
+      return result;
+    } catch (error) {
+      this.#free(frame);
+      throw error;
+    }
+  }
+
   #drain(): PushResult {
     const batch = this.#batch;
     if (batch === null) return "ready";
+    if (this.#at === 0) {
+      const owned = this.#offerOwned(batch);
+      if (owned !== null) return owned;
+    }
+    const input = this.#dictionaryPlan?.columns ?? batch.columns;
+    const stage = (frame: FrameStore) =>
+      this.#dictionaryPlan === null || this.#dictionaries.stage(this.#dictionaryPlan, frame);
     const count = batch.selection?.count ?? batch.length;
     while (this.#at < count) {
       this.#check();
@@ -256,38 +358,45 @@ export class ResultSink implements Operator {
       }
       let capacity = count - this.#at === 1 ? 1 : this.#rowsPerFrame;
       let frame = this.#make(capacity);
-      let copied = frame.metadata
-        ? frame.store.append(
-            batch.columns,
-            batch.selection?.rows ?? null,
-            this.#at,
-            Math.min(capacity, count - this.#at),
-          )
-        : 0;
-      // The constructor's estimate covers fixed buffers. Several varlen arenas can each fit
-      // the target while their sum exceeds it; seal by the whole retained payload, including
-      // unused capacity. Retry without advancing the borrowed selection. Only one row may
-      // exceed the target.
-      while ((copied === 0 || frame.store.retainedBytes > this.#target) && capacity > 1) {
-        const maximum = copied === 0 ? capacity / 2 : Math.min(capacity / 2, copied);
-        this.#free(frame);
-        do capacity /= 2;
-        while (capacity > maximum);
-        frame = this.#make(capacity);
-        copied = frame.metadata
+      let copied =
+        frame.metadata && stage(frame)
           ? frame.store.append(
-              batch.columns,
+              input,
               batch.selection?.rows ?? null,
               this.#at,
               Math.min(capacity, count - this.#at),
             )
           : 0;
+      // The constructor's estimate covers fixed buffers. Several varlen arenas can each fit
+      // the target while their sum exceeds it; seal by the whole retained payload, including
+      // unused capacity. Retry without advancing the borrowed selection. Only one row may
+      // exceed the target.
+      while (
+        (copied === 0 || frame.store.retainedBytes + frame.extraBytes > this.#target) &&
+        capacity > 1
+      ) {
+        const maximum = copied === 0 ? capacity / 2 : Math.min(capacity / 2, copied);
+        this.#free(frame);
+        do capacity /= 2;
+        while (capacity > maximum);
+        frame = this.#make(capacity);
+        copied =
+          frame.metadata && stage(frame)
+            ? frame.store.append(
+                input,
+                batch.selection?.rows ?? null,
+                this.#at,
+                Math.min(capacity, count - this.#at),
+              )
+            : 0;
       }
       if (copied === 0) {
         this.#pending = frame;
         const row = batch.selection?.rows[this.#at] ?? this.#at;
         let needed =
-          frame.store.appendNeed(batch.columns, row) + (frame.metadata ? 0 : this.#metadataBytes);
+          frame.store.appendNeed(input, row) + (frame.metadata ? 0 : this.#metadataBytes);
+        if (this.#dictionaryPlan !== null && frame.extraBytes === 0)
+          needed += this.#dictionaries.needed(this.#dictionaryPlan);
         // An empty store may not yet have observed numeric input tiers. Allow fixed-width
         // promotions, and charge any wide decimal coefficient copied into its one row.
         needed += 32 * this.types.length;
@@ -313,7 +422,9 @@ export class ResultSink implements Operator {
                 throw new Error("result metadata reservation failed");
               frame.metadata = true;
             }
-            if (frame.store.append(batch.columns, batch.selection?.rows ?? null, this.#at, 1) !== 1)
+            if (frame.extraBytes === 0 && !stage(frame))
+              throw new Error("result dictionary reservation failed");
+            if (frame.store.append(input, batch.selection?.rows ?? null, this.#at, 1) !== 1)
               throw new Error("result reservation did not cover one row");
             this.#pending = null;
             this.#at++;
@@ -343,6 +454,8 @@ export class ResultSink implements Operator {
 
   #releaseInput(): void {
     this.#batch = null;
+    if (this.#dictionaryPlan !== null) this.#dictionaries.abandon(this.#dictionaryPlan);
+    this.#dictionaryPlan = null;
     const transfer = this.#transfer;
     this.#transfer = null;
     transfer?.release();
