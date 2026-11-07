@@ -532,65 +532,118 @@ it("counts driven pipelines independently of reserved grants and skipped inputs"
 });
 
 it("reserves no unopened window subtrees beneath LIMIT zero", async () => {
-  const reach = createReach("zero limit admission", ["constant", "parameter"] as const);
+  const reach = createReach("zero limit admission", [
+    "constant",
+    "parameter",
+    "sort",
+    "plain limit",
+    "projection failure",
+    "order failure",
+    "offset",
+    "unopened windows",
+  ] as const);
   for (const seed of seedsFor("next-zero-limit-admission", [0x1011, 0x1012]))
     await fc.assert(
-      fc.asyncProperty(fc.integer({ min: 3, max: 5 }), fc.boolean(), async (depth, parameter) => {
-        reach.beginHistory();
-        let root = values([[1]]);
-        for (let k = 0; k < depth; k++)
-          root = {
-            id: ++id,
-            op: "window",
-            input: root,
-            output: output([...root.output.map((c) => c.type), I64]),
-            partitionBy: [],
-            orderBy: [{ expr: column(0, I32), direction: "asc", nulls: "last", collation: null }],
-            functions: [{ fn: "row_number", args: [], frame: null, type: I64 }],
+      fc.asyncProperty(
+        fc.integer({ min: 0, max: 5 }),
+        fc.boolean(),
+        fc.boolean(),
+        fc.constantFrom("none", "projection", "order"),
+        fc.integer({ min: 0, max: 12 }),
+        async (depth, parameter, sorted, failure, offset) => {
+          reach.beginHistory();
+          let root = values([[0], [1]]);
+          const bad: ScalarExpr = {
+            op: "call",
+            fn: "div",
+            args: [literal(numbers(I32, [1])), column(0, I32)],
+            type: I32,
           };
-        root = {
-          id: ++id,
-          op: "limit",
-          input: root,
-          output: root.output,
-          limit: parameter ? { kind: "param", slot: 0 } : { kind: "const", value: 0 },
-          offset: null,
-        };
-        const physical = plan(root);
-        const prepared = createExecutor().prepare({
-          ...physical,
-          parameters: parameter ? [I64] : [],
-          placeholderCount: parameter ? 1 : 0,
-        });
-        const governor = new Governor(8 * 1024 * 1024);
-        const execution = prepared.execute({
-          snapshot: {
-            catalog: { version: physical.catalogVersion },
-            observedLsn: 0,
-          } as unknown as Snapshot,
-          statement: null,
-          parameters: prepared.bind(parameter ? [0] : []),
-          statementTime: 0n,
-          reads: {} as ChunkReads,
-          governor,
-          spill: new MemorySpillService(),
-          queryId: 1,
-          sequences: null,
-          sequenceSession: null,
-          returning: "atExecuted",
-        });
-        try {
-          expect(await execution.results.next()).toBeNull();
-          expect((await execution.executed).profile.pipelines).toBe(0);
-          await execution.delivered;
-        } finally {
-          execution.cancel();
-          await Promise.allSettled([execution.executed, execution.delivered]);
-        }
-        expect(governor.usedBytes).toBe(0);
-        reach.reach(parameter ? "parameter" : "constant");
-      }),
-      { seed, numRuns: 12 },
+          if (failure === "projection")
+            root = { id: ++id, op: "project", input: root, output: root.output, exprs: [bad] };
+          for (let k = 0; k < depth; k++)
+            root = {
+              id: ++id,
+              op: "window",
+              input: root,
+              output: output([...root.output.map((c) => c.type), I64]),
+              partitionBy: [],
+              orderBy: [{ expr: column(0, I32), direction: "asc", nulls: "last", collation: null }],
+              functions: [{ fn: "row_number", args: [], frame: null, type: I64 }],
+            };
+          const common = {
+            id: ++id,
+            input: root,
+            output: root.output,
+            limit: parameter
+              ? { kind: "param" as const, slot: 0 }
+              : { kind: "const" as const, value: 0 },
+            offset: { kind: "const" as const, value: offset },
+          };
+          root = sorted
+            ? {
+                ...common,
+                op: "sort",
+                keys: [
+                  {
+                    expr: failure === "order" ? bad : column(0, I32),
+                    direction: "asc",
+                    nulls: "last",
+                    collation: null,
+                  },
+                ],
+                withTies: false,
+              }
+            : { ...common, op: "limit" };
+          const physical = plan(root);
+          const prepared = createExecutor().prepare({
+            ...physical,
+            parameters: parameter ? [I64] : [],
+            placeholderCount: parameter ? 1 : 0,
+          });
+          const governor = new Governor(8 * 1024 * 1024);
+          const execution = prepared.execute({
+            snapshot: {
+              catalog: { version: physical.catalogVersion },
+              observedLsn: 0,
+            } as unknown as Snapshot,
+            statement: null,
+            parameters: prepared.bind(parameter ? [0] : []),
+            statementTime: 0n,
+            reads: {} as ChunkReads,
+            governor,
+            spill: new MemorySpillService(),
+            queryId: 1,
+            sequences: null,
+            sequenceSession: null,
+            returning: "atExecuted",
+          });
+          try {
+            expect(await execution.results.next()).toBeNull();
+            expect((await execution.executed).profile.pipelines).toBe(0);
+            await execution.delivered;
+          } finally {
+            execution.cancel();
+            await Promise.allSettled([execution.executed, execution.delivered]);
+          }
+          expect(governor.usedBytes).toBe(0);
+          reach.reach(parameter ? "parameter" : "constant");
+          reach.reach(sorted ? "sort" : "plain limit");
+          if (failure === "projection") reach.reach("projection failure");
+          if (sorted && failure === "order") reach.reach("order failure");
+          if (offset > 0) reach.reach("offset");
+          if (depth >= 3) reach.reach("unopened windows");
+        },
+      ),
+      {
+        seed,
+        numRuns: 12,
+        examples: [
+          [3, false, true, "projection", 1],
+          [3, true, true, "order", 1],
+          [3, false, false, "none", 0],
+        ],
+      },
     );
   reach.assertReached();
 });

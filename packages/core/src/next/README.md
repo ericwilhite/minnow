@@ -861,7 +861,9 @@ and the owner import it directly.
 recipes for VALUES, table scans with pushdown, filter/project kernels, hash aggregation and
 DISTINCT, hash joins (including keyless joins), sort/top-N, windows, and LIMIT/OFFSET. Each run
 owns its kernels, grants and source borrows. Preparation checks immutable operator metadata,
-without admitting execution grants or building breaker pools. Small compiler probes determine
+without admitting execution grants or building breaker pools. A bound zero LIMIT skips its
+input in both reservation and execution, including a zero stored on an ORDER BY sort;
+prepare-time capability checks still cover that input. Small compiler probes determine
 kernel buffer minimums; the generated allocation matrix checks them against real batch-sized
 buffers. Computed join/sort/window arguments are projected
 into hidden columns and removed from visible results. No runtime code generation is used.

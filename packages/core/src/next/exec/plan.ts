@@ -667,25 +667,28 @@ export function compilePlan(plan: PhysicalPlan): Program {
         const minimum = base + measured;
         fixed(rel, minimum);
         return (runtime, downstream) =>
-          instantiate(
-            runtime,
-            rel,
-            input,
-            minimum,
-            BATCH_ROWS,
-            (context, grant) => make(context, grant, counted(runtime, rel, downstream), runtime),
-            ({ operator, breaker }) => {
-              if (breaker === null) throw new TypeError("missing execution breaker");
-              runtime.onAbort((reason) => operator.abort(reason));
-              runtime.dispose(() => breaker.closed);
-              return then(child(runtime, operator, []), () => {
-                const p = breaker.profile,
-                  out = runtime.profile(rel);
-                out.spilledBytes = p.spilledBytes + ("sort" in p ? p.sort.spilledBytes : 0);
-                out.spillPasses = "mergePasses" in p ? p.mergePasses : p.sort.mergePasses;
-              });
-            },
-          );
+          rel.op === "sort" && bound(rel.limit, runtime, false) === 0
+            ? downstream.finish()
+            : instantiate(
+                runtime,
+                rel,
+                input,
+                minimum,
+                BATCH_ROWS,
+                (context, grant) =>
+                  make(context, grant, counted(runtime, rel, downstream), runtime),
+                ({ operator, breaker }) => {
+                  if (breaker === null) throw new TypeError("missing execution breaker");
+                  runtime.onAbort((reason) => operator.abort(reason));
+                  runtime.dispose(() => breaker.closed);
+                  return then(child(runtime, operator, []), () => {
+                    const p = breaker.profile,
+                      out = runtime.profile(rel);
+                    out.spilledBytes = p.spilledBytes + ("sort" in p ? p.sort.spilledBytes : 0);
+                    out.spillPasses = "mergePasses" in p ? p.mergePasses : p.sort.mergePasses;
+                  });
+                },
+              );
       }
       case "join": {
         if (
@@ -830,6 +833,8 @@ export function compilePlan(plan: PhysicalPlan): Program {
     // buffers for those unreachable pipelines (including when zero is a bound parameter).
     const active = new Set<number>();
     const visit = (rel: Rel): void => {
+      // Lowering stores ORDER BY's LIMIT on its sort. Zero must not open even its pools.
+      if (rel.op === "sort" && bound(rel.limit, runtime, false) === 0) return;
       active.add(rel.id);
       if (rel.op === "limit" && bound(rel.limit, runtime, false) === 0) return;
       if (rel.op === "join") {
