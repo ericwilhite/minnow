@@ -20,7 +20,7 @@ import { coerce, type Typed } from "./coerce.js";
 import { PlanningError, unsupported } from "./errors.js";
 import { lowerExpression } from "./expressions.js";
 import type { BlockLowerer, OuterResolver } from "./from.js";
-import { integerLiteral } from "./literals.js";
+import { floatLiteral, integerLiteral } from "./literals.js";
 import {
   at,
   column,
@@ -129,10 +129,21 @@ function frameOf(
   builder: PlanBuilder,
 ): WindowCall["frame"] {
   if (frame === undefined) return null;
+  // float_ops in_range(float4,float4,float8,bool,bool) keeps the offset in float8.
+  const rangeOffsetType = orderType?.kind === "float32" ? FLOAT8 : orderType;
   const bound = (input: WindowFrame["start"]): WindowFrameBound => {
     if (input.offset === undefined) return { kind: input.kind, offset: null };
     // Parser-owned metadata preserves the exact literal without adding public model fields.
     const metadata = frameOffsetMetadata(input);
+    if (metadata?.parameter !== undefined) {
+      if (frame.unit === "range" && orderType === null)
+        throw new PlanningError("RANGE with offset requires exactly one ORDER BY column", "42P20");
+      const type = builder.parameters.fix(
+        metadata.parameter,
+        frame.unit === "range" ? (rangeOffsetType ?? INT8) : INT8,
+      );
+      return { kind: input.kind, offset: { op: "param", slot: metadata.parameter, type } };
+    }
     const exact = metadata?.exact ?? input.offset;
     if (frame.unit !== "range") return { kind: input.kind, offset: int(exact, INT8) };
     if (orderType === null)
@@ -144,17 +155,17 @@ function frameOf(
         `RANGE with offset PRECEDING/FOLLOWING is not supported for column type ${orderType.kind === "int64" ? "bigint" : orderType.bits === 16 ? "smallint" : "integer"} and offset type numeric`,
         "0A000",
       );
-    // An integer offset over an integer key is that key's type exactly. One outside the key
-    // type's range is refused: the IR's RANGE offset has the key's type, while PostgreSQL's
-    // in_range compares an int4 key with an int8 offset in int8.
+    // PostgreSQL also supplies cross-width in_range(int4,int4,int8).
     if (orderType.kind === "int32" || orderType.kind === "int64") {
-      const literal = integerLiteral(typeof exact === "bigint" ? exact : BigInt(exact), orderType);
+      const value = typeof exact === "bigint" ? exact : BigInt(exact);
+      const literal = integerLiteral(value, orderType) ?? integerLiteral(value, INT8);
       if (literal === null)
-        throw new PlanningError(
-          `RANGE offset ${String(exact)} outside the ORDER BY key's type is not supported`,
-          "0A000",
-        );
+        throw new PlanningError("RANGE offset outside bigint is not supported", "0A000");
       return { kind: input.kind, offset: literal };
+    }
+    if (orderType.kind === "float32" || orderType.kind === "float64") {
+      const text = metadata?.text ?? String(exact);
+      return { kind: input.kind, offset: floatLiteral(Number(text), FLOAT8) };
     }
     const text =
       metadata?.text ?? (metadata?.exact === undefined ? undefined : String(metadata.exact));
@@ -208,7 +219,7 @@ export function lowerWindowed(
         expr: column(index, inner.columns[index]?.type ?? { kind: "text" }),
         direction: order.direction,
         nulls: order.nulls ?? (order.direction === "desc" ? "first" : "last"),
-        collation: null,
+        collation: inner.columns[index]?.collation ?? null,
       };
     });
     const orderType = orderBy.length === 1 ? (orderBy[0]?.expr.type ?? null) : null;

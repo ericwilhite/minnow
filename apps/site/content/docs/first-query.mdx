@@ -82,7 +82,7 @@ columnar and skips the parser entirely.
 
 ```ts
 const { rows, columns, columnDomains } = await db.query(
-  `SELECT c.name, COUNT(*) AS orders, ROUND(SUM(o.total), 2) AS revenue
+  `SELECT c.name, COUNT(*) AS orders, ROUND(SUM(o.total)::NUMERIC, 2) AS revenue
    FROM customers c
    JOIN orders o ON o.customer_id = c.customer_id
    WHERE o.status = $1

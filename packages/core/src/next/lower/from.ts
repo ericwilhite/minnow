@@ -46,6 +46,7 @@ import {
   lowerCondition,
   lowerExpression,
   type Scope,
+  type Collated,
   type SubqueryRequest,
 } from "./expressions.js";
 import {
@@ -64,6 +65,12 @@ import {
 } from "./plan.js";
 import { EXHAUSTIVE_JOIN_LIMIT } from "./statistics.js";
 import { lowerWindowed } from "./windows.js";
+import { boolLiteral } from "./literals.js";
+
+/** Hash keys use C8 byte equality. Locale-aware equalities remain vector comparisons. */
+function byteCollation(collation: string | null | undefined): boolean {
+  return collation == null || ["C", "POSIX", "default", "ucs_basic"].includes(collation);
+}
 
 export const SOURCE_STRIDE = 1 << 16;
 /** The local index of a table source's row locator. */
@@ -102,6 +109,7 @@ interface Resolved {
   readonly type: PhysicalType;
   readonly nullable: boolean;
   readonly big: boolean;
+  readonly collation?: string;
 }
 
 interface Entry {
@@ -167,7 +175,13 @@ function relationEntry(
       const found = columns[local];
       return found === undefined
         ? undefined
-        : { local, type: found.type, nullable: found.nullable, big: found.big };
+        : {
+            local,
+            type: found.type,
+            nullable: found.nullable,
+            big: found.big,
+            ...(found.collation === undefined ? {} : { collation: found.collation }),
+          };
     },
     names: () => columns.map((col) => col.name).filter((name) => !name.startsWith(HIDDEN)),
     build: (pushed) => {
@@ -286,7 +300,7 @@ export function lowerFrom(
   options: FromOptions,
 ): FromClause {
   const lowerInner = options.lowerBlock;
-  const fullAt = joins.findIndex((join) => join.full === true);
+  const fullAt = joins.reduce((last, join, index) => (join.full === true ? index : last), -1);
   const entries: Entry[] = [base, ...joins].map((source, position) => {
     const join = position === 0 ? null : (joins[position - 1] ?? null);
     const kind: EntryKind =
@@ -353,6 +367,7 @@ export function lowerFrom(
     expr: column(virtual(entry.source, found.local), found.type),
     nullable: found.nullable || entry.nullSupplied,
     big: found.big,
+    ...(found.collation === undefined ? {} : { collation: found.collation }),
   });
   const attachments: Attachment[] = [];
 
@@ -455,29 +470,86 @@ export function lowerFrom(
             nullable: request.kind !== "exists",
             big: false,
           };
+    // An uncorrelated EXISTS or IN can materialize its complete inner plan once and
+    // test it with a mark join. No executor-side apply or per-row re-execution is needed.
+    const directExists = bindings.length === 0 && request.kind === "exists";
+    const directIn =
+      bindings.length === 0 &&
+      request.kind === "quantified" &&
+      ((request.cmp === "=" && request.quantifier === "any") ||
+        (request.cmp === "<>" && request.quantifier === "all"));
+    const hashedIn = byteCollation(quantified?.collation);
+    const markedInner: Rel = directExists
+      ? {
+          op: "project",
+          id: builder.id(),
+          input: innerRel,
+          exprs: [boolLiteral(true)],
+          output: [{ name: "(exists row)", type: { kind: "bool" }, nullable: false }],
+        }
+      : innerRel;
     attachments.push({
       source: id,
       column: result,
-      attach: (acc, position) => ({
-        op: "apply",
-        id: builder.id(),
-        mode: request.kind,
-        outer: acc.rel,
-        inner: innerRel,
-        bindings: bindings.map(({ slot, typed }) => ({
-          slot,
-          expr: mapColumns(typed.expr, position),
-        })),
-        quantified:
-          quantified === null
-            ? null
-            : { ...quantified, test: mapColumns(quantified.test, position) },
-        memoize: !innerVolatile,
-        output: [...outputColumns(acc.columns), ...outputColumns([result])],
-      }),
+      attach: (acc, position) =>
+        directExists || directIn
+          ? {
+              op: "join",
+              id: builder.id(),
+              kind: "mark",
+              algorithm: "hash",
+              left: acc.rel,
+              right: markedInner,
+              leftKeys: [
+                directExists || !hashedIn
+                  ? boolLiteral(true)
+                  : mapColumns(required(quantified).test, position),
+              ],
+              rightKeys: [
+                directIn && !hashedIn
+                  ? boolLiteral(true)
+                  : column(0, required(markedInner.output[0]).type),
+              ],
+              nullSafe: [false],
+              correlated: 0,
+              filter: null,
+              residual:
+                directIn && !hashedIn
+                  ? {
+                      op: "compare",
+                      cmp: "=",
+                      left: mapColumns(required(quantified).test, position),
+                      right: column(acc.columns.length, required(markedInner.output[0]).type),
+                      collation: required(quantified).collation,
+                      type: { kind: "bool" },
+                    }
+                  : null,
+              publishes: [],
+              output: [...outputColumns(acc.columns), ...outputColumns([result])],
+            }
+          : {
+              op: "apply",
+              id: builder.id(),
+              mode: request.kind,
+              outer: acc.rel,
+              inner: innerRel,
+              bindings: bindings.map(({ slot, typed }) => ({
+                slot,
+                expr: mapColumns(typed.expr, position),
+              })),
+              quantified:
+                quantified === null
+                  ? null
+                  : { ...quantified, test: mapColumns(quantified.test, position) },
+              memoize: !innerVolatile,
+              output: [...outputColumns(acc.columns), ...outputColumns([result])],
+            },
     });
     return {
-      expr: column(virtual(id, 0), result.type),
+      expr:
+        directIn && request.quantifier === "all"
+          ? { op: "not", arg: column(virtual(id, 0), result.type), type: { kind: "bool" } }
+          : column(virtual(id, 0), result.type),
       nullable: result.nullable,
       big: result.big,
     };
@@ -532,6 +604,8 @@ export function lowerFrom(
     const type = baseType(commonType([request.test, tested], builder.parameters, "IN"));
     const probeKey = coerce(request.test, type, "implicit", builder.parameters);
     const buildKey = coerce(tested, type, "implicit", builder.parameters);
+    const collation = request.test.collation ?? (tested as Collated).collation ?? null;
+    const hashedTest = byteCollation(collation);
     const correlated: Array<{ probe: ScalarExpr; build: ScalarExpr }> = [];
     const filter: ScalarExpr[] = [];
     const pushed: Typed[] = [];
@@ -541,7 +615,7 @@ export function lowerFrom(
         pushed.push(conjunct);
         continue;
       }
-      if (expr.op === "compare" && expr.cmp === "=") {
+      if (expr.op === "compare" && expr.cmp === "=" && byteCollation(expr.collation)) {
         if (outerOnly(expr.left) && innerOnly(expr.right)) {
           correlated.push({ probe: expr.left, build: expr.right });
           continue;
@@ -583,11 +657,11 @@ export function lowerFrom(
           right: build.rel,
           leftKeys: [
             ...correlated.map((key) => mapColumns(key.probe, position)),
-            mapColumns(probeKey.expr, position),
+            hashedTest ? mapColumns(probeKey.expr, position) : boolLiteral(true),
           ],
           rightKeys: [
             ...correlated.map((key) => mapColumns(key.build, buildPosition)),
-            mapColumns(buildKey.expr, buildPosition),
+            hashedTest ? mapColumns(buildKey.expr, buildPosition) : boolLiteral(true),
           ],
           nullSafe: [...correlated.map(() => false), false],
           correlated: correlated.length,
@@ -598,7 +672,19 @@ export function lowerFrom(
                   required(andOf(filter.map((expr) => ({ expr, nullable: true, big: false })))),
                   both,
                 ),
-          residual: null,
+          residual: hashedTest
+            ? null
+            : {
+                op: "compare",
+                cmp: "=",
+                left: mapColumns(probeKey.expr, position),
+                right: mapColumns(
+                  buildKey.expr,
+                  (index) => acc.columns.length + buildPosition(index),
+                ),
+                collation,
+                type: { kind: "bool" },
+              },
           publishes: [],
           output: [...outputColumns(acc.columns), ...outputColumns([result])],
         };
@@ -681,10 +767,18 @@ export function lowerFrom(
         for (const part of conjunctsOf(typed))
           pool.push({ typed: part, sources: sourcesOf(part.expr), used: false });
       };
-      for (const typed of where) add(typed);
-      for (const entry of entries)
-        if (entry.kind === "inner" || entry.kind === "base")
-          for (const typed of joinConditions.get(entry.source) ?? []) add(typed);
+      // WHERE sees the completed outer-join tree. Any conjunct reading a null-supplied
+      // source stays above every barrier, even if an earlier inner group already covers it.
+      const nullableSources = new Set(
+        entries.filter((entry) => entry.nullSupplied).map((entry) => entry.source),
+      );
+      const deferred: Typed[] = [];
+      for (const typed of where)
+        for (const part of conjunctsOf(typed)) {
+          if ([...sourcesOf(part.expr)].some((source) => nullableSources.has(source)))
+            deferred.push(part);
+          else add(part);
+        }
       const unitOf = (entry: Entry, extra: readonly Typed[]): Unit => {
         const pushed: Typed[] = [...extra];
         if (!entry.nullSupplied)
@@ -707,6 +801,9 @@ export function lowerFrom(
       let group: Unit[] = [];
       for (const entry of entries) {
         if (entry.kind === "base" || entry.kind === "inner") {
+          // An INNER ON belongs to this group. A later one-sided condition must not filter
+          // the input of an earlier FULL/LEFT join before that join supplies its NULL rows.
+          for (const typed of joinConditions.get(entry.source) ?? []) add(typed);
           group.push(unitOf(entry, []));
           continue;
         }
@@ -738,7 +835,7 @@ export function lowerFrom(
       for (const conjunct of remaining) conjunct.used = true;
       return filterUnit(
         acc,
-        remaining.map((conjunct) => conjunct.typed),
+        [...remaining.map((conjunct) => conjunct.typed), ...deferred],
         builder,
       );
     },
@@ -823,7 +920,7 @@ function splitConditions(
   const rest: Typed[] = [];
   for (const typed of conditions) {
     const expr = typed.expr;
-    if (expr.op === "compare" && expr.cmp === "=") {
+    if (expr.op === "compare" && expr.cmp === "=" && byteCollation(expr.collation)) {
       const l = sourcesOf(expr.left);
       const r = sourcesOf(expr.right);
       if (l.size > 0 && r.size > 0 && subset(l, left) && subset(r, right)) {

@@ -350,8 +350,13 @@ function integerAverage(rel: Rel, column: number): boolean {
   }
   if (rel.op === "sort" || rel.op === "limit" || rel.op === "filter")
     return integerAverage(rel.input, column);
-  if (rel.op !== "aggregate") return false;
-  const call = rel.aggregates[column - rel.groupBy.length];
+  if (rel.op === "window" && column < rel.input.output.length)
+    return integerAverage(rel.input, column);
+  if (rel.op !== "aggregate" && rel.op !== "window") return false;
+  const call =
+    rel.op === "aggregate"
+      ? rel.aggregates[column - rel.groupBy.length]
+      : rel.functions[column - rel.input.output.length];
   const kind = call?.args[0]?.type.kind;
   return (
     call?.fn === "avg" && call.type.kind === "float64" && (kind === "int32" || kind === "int64")
@@ -367,3 +372,42 @@ export function queryAuthorityValue(plan: PhysicalPlan, column: number, value: u
   const result = Number(value);
   return Number.isFinite(result) ? result : value;
 }
+
+/** Frozen SQL calls a PostgreSQL overload that does not exist. These cells remain refusals,
+ * never passing executions; the lead will refreeze a corrected harness separately. */
+export const CATALOGUE_AUTHORITY_REFUSALS = {
+  S_q7: "42883",
+  "guide-4": "42883",
+  "guide-5": "42883",
+} as const;
+export const ROUND_OVERLOAD_AUTHORITY =
+  "PostgreSQL 18 functions-math: round(double precision) and round(numeric, integer), no round(double precision, integer); R19 keeps the overload signatures exact. https://www.postgresql.org/docs/18/functions-math.html";
+
+/** R21: witnesses for four frozen catalogue cells. The new executor is still compared exactly
+ * with the original PostgreSQL SQL. The legacy engine is compared exactly with these independent
+ * PG answers, with no epsilon, rounding, or changed next-core expectation.
+ * PostgreSQL documents float8 as inexact and aggregate input order as unspecified without an
+ * aggregate ORDER BY (docs/18/datatype-numeric.html and docs/18/functions-aggregate.html).
+ * Legacy windows return source order, so their outer float SUM accumulates in id order.
+ * C2/R17.2 types 1.0 as NUMERIC; the old engine instead uses a plain double in S_q10.
+ */
+export const CATALOGUE_CURRENT_AUTHORITY: Readonly<Record<string, string>> = {
+  join_fact_fact_int:
+    "SELECT COUNT(*) AS n, SUM(b.f01 ORDER BY a.id) AS s FROM events_wide a JOIN events_wide b ON b.id=a.i20 WHERE a.i05<5",
+  win_running_sum:
+    "SELECT COUNT(*) AS n,SUM(rs ORDER BY id) AS total,MAX(rs) AS mx FROM(SELECT id,SUM(f06) OVER(PARTITION BY d00 ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rs FROM events_wide)t",
+  win_moving_avg:
+    "SELECT SUM(ma ORDER BY id) AS s,MAX(ma) AS mx FROM(SELECT id,AVG(f07) OVER(PARTITION BY d03 ORDER BY id ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS ma FROM events_wide)t",
+  S_q10:
+    "SELECT p.category,COUNT(*) AS items,COUNT(r.item_id) AS returns,COUNT(r.item_id)*CAST(1.0 AS DOUBLE PRECISION)/COUNT(*) AS return_rate FROM products p JOIN order_items i ON i.product_id=p.product_id LEFT JOIN(SELECT DISTINCT item_id AS item_id FROM returns)r ON r.item_id=i.item_id GROUP BY p.category ORDER BY p.category",
+};
+
+/** R24.2 explicitly keeps the well-defined non-equi FULL extension. PostgreSQL refuses the
+ * original with 0A000; independent evidence uses LEFT JOIN UNION ALL unmatched right rows. */
+export const KEYLESS_FULL_AUTHORITY = {
+  id: "non-equi-full-join",
+  ruling: "PHASE-B-joint-review-1.md R24.2",
+  sqlState: "0A000",
+  authority:
+    "PostgreSQL FULL JOIN requires a hash/merge-joinable condition; FULL's bag semantics are LEFT JOIN plus each unmatched right row exactly once. https://www.postgresql.org/docs/18/queries-table-expressions.html#QUERIES-JOIN",
+} as const;

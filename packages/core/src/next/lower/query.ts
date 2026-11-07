@@ -508,6 +508,7 @@ export function lowerBlock(
     type: item.expr.type,
     nullable: item.nullable,
     big: item.big,
+    ...(item.collation === undefined ? {} : { collation: item.collation }),
   }));
   current = {
     rel: {

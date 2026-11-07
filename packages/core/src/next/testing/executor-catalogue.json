@@ -26600,71 +26600,61 @@
       "id": "join_star_3dims",
       "dataset": "wide",
       "sql": "SELECT a.tier AS tier_a, b.tier AS tier_b, c.label AS label_c, COUNT(*) AS n, SUM(e.f00) AS s FROM events_wide e JOIN dim_d03 a ON a.k = e.d03 JOIN dim_d04 b ON b.k = e.d04 JOIN dim_d07 c ON c.k = e.d07 WHERE a.active AND b.weight > 1 AND c.tier = 't1' GROUP BY a.tier, b.tier, c.label ORDER BY s DESC, tier_a, tier_b, label_c LIMIT 50",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "join_fact_fact_int",
       "dataset": "wide",
       "sql": "SELECT COUNT(*) AS n, SUM(b.f01) AS s FROM events_wide a JOIN events_wide b ON b.id = a.i20 WHERE a.i05 < 5",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "join_fact_fact_text",
       "dataset": "wide",
       "sql": "SELECT COUNT(*) AS n, SUM(b.f02) AS s FROM events_wide a JOIN events_wide b ON b.h00 = a.h07",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "join_semi_exists",
       "dataset": "wide",
       "sql": "SELECT COUNT(*) AS n FROM events_wide a WHERE EXISTS (SELECT 1 FROM events_wide b WHERE b.id = a.i20 AND b.b00)",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "join_anti_not_exists",
       "dataset": "wide",
       "sql": "SELECT COUNT(*) AS n FROM events_wide a WHERE NOT EXISTS (SELECT 1 FROM events_wide b WHERE b.id = a.i20 AND b.i05 = 0)",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "win_topk_row_number",
       "dataset": "wide",
       "sql": "SELECT d04, id, f05, rn FROM (SELECT d04, id, f05, ROW_NUMBER() OVER (PARTITION BY d04 ORDER BY f05 DESC, id) AS rn FROM events_wide) t WHERE rn <= 3 ORDER BY d04, rn",
-      "lowered": false,
-      "construct": "window"
+      "lowered": true
     },
     {
       "id": "win_rank",
       "dataset": "wide",
       "sql": "SELECT d07, id, i06, rk FROM (SELECT d07, id, i06, RANK() OVER (PARTITION BY d07 ORDER BY i06 DESC) AS rk FROM events_wide) t WHERE rk <= 2 ORDER BY d07, rk, id",
-      "lowered": false,
-      "construct": "window"
+      "lowered": true
     },
     {
       "id": "win_running_sum",
       "dataset": "wide",
       "sql": "SELECT COUNT(*) AS n, SUM(rs) AS total, MAX(rs) AS mx FROM (SELECT SUM(f06) OVER (PARTITION BY d00 ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rs FROM events_wide) t",
-      "lowered": false,
-      "construct": "window"
+      "lowered": true
     },
     {
       "id": "win_lag_lead",
       "dataset": "wide",
       "sql": "SELECT COUNT(*) AS n, SUM(nx - pv) AS d FROM (SELECT LAG(i08) OVER (PARTITION BY d05 ORDER BY id) AS pv, LEAD(i08) OVER (PARTITION BY d05 ORDER BY id) AS nx FROM events_wide) t",
-      "lowered": false,
-      "construct": "window"
+      "lowered": true
     },
     {
       "id": "win_moving_avg",
       "dataset": "wide",
       "sql": "SELECT SUM(ma) AS s, MAX(ma) AS mx FROM (SELECT AVG(f07) OVER (PARTITION BY d03 ORDER BY id ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS ma FROM events_wide) t",
-      "lowered": false,
-      "construct": "window"
+      "lowered": true
     },
     {
       "id": "win_median_pct",
@@ -26725,8 +26715,7 @@
       "id": "spill_hash_join_text",
       "dataset": "wide",
       "sql": "SELECT COUNT(*) AS n, SUM(b.f02) AS s FROM events_wide a JOIN events_wide b ON b.h00 = a.h07",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "S_q2",
@@ -26744,22 +26733,19 @@
       "id": "S_q4",
       "dataset": "star",
       "sql": "SELECT c.customer_id, c.segment, SUM(p.captured_amount) AS revenue FROM customers c JOIN orders o ON o.customer_id = c.customer_id JOIN payments p ON p.order_id = o.order_id WHERE p.status = 'captured' GROUP BY c.customer_id, c.segment ORDER BY revenue DESC, c.customer_id LIMIT 20",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "S_q5",
       "dataset": "star",
       "sql": "SELECT p.category, SUM(i.quantity * i.unit_price * (1 - i.discount_pct)) AS net_revenue FROM order_items i JOIN products p ON p.product_id = i.product_id GROUP BY p.category ORDER BY net_revenue DESC",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "S_q6",
       "dataset": "star",
       "sql": "WITH returned_orders AS (SELECT DISTINCT i.order_id AS order_id FROM order_items i JOIN returns r ON r.item_id = i.item_id) SELECT o.customer_id, COUNT(*) AS orders FROM orders o WHERE o.order_id NOT IN (SELECT order_id FROM returned_orders) GROUP BY o.customer_id HAVING COUNT(*) >= 2",
-      "lowered": false,
-      "construct": "subquery"
+      "lowered": true
     },
     {
       "id": "S_q7",
@@ -26772,29 +26758,25 @@
       "id": "S_q8",
       "dataset": "star",
       "sql": "WITH cohorts AS (SELECT customer_id AS customer_id, DATE_TRUNC('month', joined_at) AS cohort_month FROM customers), returned_orders AS (SELECT DISTINCT i.order_id AS order_id FROM order_items i JOIN returns r ON r.item_id = i.item_id), captured AS (SELECT k.cohort_month AS cohort_month, o.customer_id AS customer_id, SUM(p.captured_amount) AS revenue, COUNT(*) AS orders FROM payments p JOIN orders o ON o.order_id = p.order_id JOIN cohorts k ON k.customer_id = o.customer_id WHERE p.status = 'captured' GROUP BY k.cohort_month, o.customer_id) SELECT cohort_month, COUNT(*) AS customers, SUM(revenue) AS revenue FROM captured GROUP BY cohort_month ORDER BY cohort_month",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "S_q9",
       "dataset": "star",
       "sql": "WITH per_customer AS (SELECT r.name AS region, c.segment AS segment, c.customer_id AS customer_id, SUM(p.captured_amount) AS revenue FROM regions r JOIN customers c ON c.region_id = r.region_id JOIN orders o ON o.customer_id = c.customer_id JOIN payments p ON p.order_id = o.order_id WHERE p.status = 'captured' GROUP BY r.name, c.segment, c.customer_id) SELECT region, segment, COUNT(*) AS customers, SUM(revenue) AS revenue FROM per_customer GROUP BY region, segment ORDER BY region, segment",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "S_q10",
       "dataset": "star",
       "sql": "SELECT p.category, COUNT(*) AS items, COUNT(r.item_id) AS returns, COUNT(r.item_id) * 1.0 / COUNT(*) AS return_rate FROM products p JOIN order_items i ON i.product_id = p.product_id LEFT JOIN (SELECT DISTINCT item_id AS item_id FROM returns) r ON r.item_id = i.item_id GROUP BY p.category ORDER BY p.category",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "S_q11",
       "dataset": "star",
       "sql": "SELECT j.name, SUM(t.tax_amount) AS tax_collected FROM order_taxes t JOIN tax_rates r ON r.tax_rate_id = t.tax_rate_id JOIN tax_jurisdictions j ON j.jurisdiction_id = r.jurisdiction_id GROUP BY j.name ORDER BY tax_collected DESC, j.name",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "S_q14",
@@ -26806,36 +26788,31 @@
       "id": "S_q15",
       "dataset": "star",
       "sql": "WITH discounts AS (SELECT order_id AS order_id, SUM(amount) AS amount FROM order_discounts GROUP BY order_id), taxes AS (SELECT order_id AS order_id, SUM(tax_amount) AS amount FROM order_taxes GROUP BY order_id) SELECT o.status, SUM(COALESCE(d.amount, 0)) AS discounts, SUM(COALESCE(t.amount, 0)) AS taxes FROM orders o LEFT JOIN discounts d ON d.order_id = o.order_id LEFT JOIN taxes t ON t.order_id = o.order_id GROUP BY o.status ORDER BY o.status",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "S_fact_fact",
       "dataset": "star",
       "sql": "SELECT o.status, COUNT(*) AS n, SUM(i.quantity * i.unit_price) AS revenue FROM orders o JOIN order_items i ON i.order_id = o.order_id GROUP BY o.status ORDER BY o.status",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "S_semi",
       "dataset": "star",
       "sql": "SELECT COUNT(*) AS n FROM orders o WHERE EXISTS (SELECT 1 FROM order_items i JOIN returns r ON r.item_id = i.item_id WHERE i.order_id = o.order_id)",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "S_anti",
       "dataset": "star",
       "sql": "SELECT COUNT(*) AS n FROM orders o WHERE NOT EXISTS (SELECT 1 FROM payments p WHERE p.order_id = o.order_id AND p.status = 'captured')",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "S_m2m",
       "dataset": "star",
       "sql": "SELECT ps.supplier_id, COUNT(*) AS n, SUM(i.quantity) AS units FROM order_items i JOIN product_suppliers ps ON ps.product_id = i.product_id GROUP BY ps.supplier_id ORDER BY ps.supplier_id",
-      "lowered": false,
-      "construct": "join"
+      "lowered": true
     },
     {
       "id": "guide-1",
@@ -26874,8 +26851,7 @@
       "id": "guide-6",
       "dataset": "retail",
       "sql": "SELECT DISTINCT ON (customer_id) customer_id, order_id, placed_at\nFROM orders\nORDER BY customer_id, placed_at DESC",
-      "lowered": false,
-      "construct": "window"
+      "lowered": true
     },
     {
       "id": "guide-7",
@@ -26909,8 +26885,7 @@
       "id": "guide-11",
       "dataset": "retail",
       "sql": "SELECT category, name, revenue\nFROM (\n  SELECT p.category, p.name, SUM(i.line_total) AS revenue,\n         ROW_NUMBER() OVER (PARTITION BY p.category ORDER BY SUM(i.line_total) DESC) AS rank\n  FROM order_items i\n  JOIN products p ON p.product_id = i.product_id\n  GROUP BY p.category, p.name\n) AS ranked\nWHERE rank <= 3",
-      "lowered": false,
-      "construct": "window"
+      "lowered": true
     },
     {
       "id": "guide-12",
@@ -26923,8 +26898,7 @@
       "id": "guide-13",
       "dataset": "retail",
       "sql": "WITH monthly AS (\n  SELECT DATE_TRUNC('month', placed_at) AS month, SUM(total) AS revenue\n  FROM orders WHERE status = 'completed'\n  GROUP BY DATE_TRUNC('month', placed_at)\n)\nSELECT month, revenue,\n       revenue - LAG(revenue) OVER (ORDER BY month) AS change\nFROM monthly\nORDER BY month",
-      "lowered": false,
-      "construct": "window"
+      "lowered": true
     },
     {
       "id": "guide-14",
@@ -26944,15 +26918,13 @@
       "id": "guide-16",
       "dataset": "retail",
       "sql": "SELECT customer_id,\n       placed_at,\n       total,\n       SUM(total) OVER (PARTITION BY customer_id ORDER BY placed_at) AS running_total,\n       RANK() OVER (PARTITION BY customer_id ORDER BY total DESC) AS biggest_basket,\n       LAG(placed_at) OVER (PARTITION BY customer_id ORDER BY placed_at) AS previous_order\nFROM orders",
-      "lowered": false,
-      "construct": "window"
+      "lowered": true
     },
     {
       "id": "guide-17",
       "dataset": "retail",
       "sql": "WITH monthly AS (\n  SELECT DATE_TRUNC('month', placed_at) AS month, SUM(total) AS revenue\n  FROM orders WHERE status = 'completed'\n  GROUP BY DATE_TRUNC('month', placed_at)\n)\nSELECT month,\n       revenue,\n       revenue - LAG(revenue) OVER (ORDER BY month) AS change,\n       100.0 * revenue / SUM(revenue) OVER () AS pct_of_total\nFROM monthly\nORDER BY month",
-      "lowered": false,
-      "construct": "window"
+      "lowered": true
     },
     {
       "id": "guide-18",

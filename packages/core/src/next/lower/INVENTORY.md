@@ -256,3 +256,11 @@ false }`, CHAR(n) / CHARACTER(n) as fixed, CHAR alone as CHAR(1).
 3. Schema DSL: `column.integer()` → INTEGER, `column.number()` → DOUBLE PRECISION.
 4. VARCHAR(n) / CHAR(n) widths are kept, printed (`character varying(n)`, `character(n)`) and
    enforced on write (22001). CHAR(n) is not blank-padded: a documented divergence.
+
+## Real executor integration
+
+B6's reviewed lowering is the authority for scalar, set, recursive and locking plans as well as
+joins and windows. B7 adds exact real-executor campaigns, byte-collation join keys, completed
+outer-join WHERE placement, and uncorrelated EXISTS/IN marks that avoid unsupported apply.
+The catalogue executes every cell it can and records each remaining refusal by class; its SQL
+and data stay frozen, including ROUND(float8,int4) cells that PostgreSQL refuses with 42883.

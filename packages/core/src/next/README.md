@@ -1828,3 +1828,10 @@ The retained admission declaration includes both members of a recursive CTE. A s
 locking subquery or view contributes even when the only external reference is in an
 unused CTE. Self-reference alone does not count. This is lowering metadata; the owner
 must apply it before execution. The shipped SQL enforcement is inherited from Stream A.
+
+### Real-executor M3 coverage
+
+The B7 generated campaigns run joins and windows through real writes, storage and the executor
+against PostgreSQL and the shipped engine. These complement B6's broader lowering/reference
+campaigns; lowering support does not imply every emitted operation has an executor binding.
+The frozen catalogue records typed executor refusals separately from matching executions.

@@ -91,6 +91,10 @@ export function parseQuery(text: string): CompiledQuery {
  * shape passes repeat the wildcard binding as `createPreparedColumnarQuery` does (a no-op then).
  */
 export function prepareQuery(parsed: CompiledQuery, catalog: CatalogView): CompiledQuery {
+  return compileWithDeclaredTypes(() => prepareTypedQuery(parsed, catalog));
+}
+
+function prepareTypedQuery(parsed: CompiledQuery, catalog: CatalogView): CompiledQuery {
   const front = frontEndCatalog(catalog);
   const columnsOf = (name: string): readonly string[] | undefined => front.columns.get(name);
   let plan = foldIdentifierCase(parsed, front.columns);

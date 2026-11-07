@@ -19,7 +19,7 @@ extensions.
 
 ```ts
 const { rows, columns } = await db.query(`
-  SELECT category, ROUND(SUM(line_total), 2) AS revenue
+  SELECT category, ROUND(SUM(line_total)::NUMERIC, 2) AS revenue
   FROM order_items i
   JOIN products p ON p.product_id = i.product_id
   GROUP BY category

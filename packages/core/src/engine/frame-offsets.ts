@@ -1,6 +1,8 @@
 /** Parser-owned frame precision and literal types, kept outside the logical plan fields. */
 export interface FrameOffsetMetadata {
   readonly text?: string;
+  /** Typed-only placeholder, not a public logical-plan field. */
+  readonly parameter?: number;
   /** Original PostgreSQL literal type, used to resolve RANGE over integer keys. */
   readonly numeric?: true;
   /** Rounded ROWS/GROUPS integer, or integer RANGE literal, beyond the safe double range. */

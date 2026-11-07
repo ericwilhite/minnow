@@ -12875,6 +12875,30 @@ class Parser {
       this.#keyword("ROW");
       return { kind: "current-row" };
     }
+    if (!recordDeclaredTypes) {
+      const offset = Number(this.#take("number").text);
+      if (
+        !Number.isFinite(offset) ||
+        offset < 0 ||
+        (unit !== "range" && !Number.isInteger(offset))
+      ) {
+        throw new TypeError(
+          "Window frame offsets must be non-negative integers, or numeric RANGE offsets",
+        );
+      }
+      if (this.#isKeyword("PRECEDING")) {
+        this.#keyword("PRECEDING");
+        return { kind: "preceding", offset };
+      }
+      this.#keyword("FOLLOWING");
+      return { kind: "following", offset };
+    }
+    if (this.#peek().kind === "parameter") {
+      const parameter = this.#parameterExpression().index;
+      const kind = this.#isKeyword("PRECEDING") ? "preceding" : "following";
+      this.#keyword(kind.toUpperCase());
+      return rememberFrameOffset<WindowFrame["start"]>({ kind, offset: 0 }, { parameter });
+    }
     // PostgreSQL's frame offset errors (22004, 22013). A negative RANGE offset is raised here,
     // where PostgreSQL raises it when the first row compares (so not over no rows).
     if (this.#isKeyword("NULL")) {
@@ -13877,7 +13901,8 @@ function lowerSelectBlock(
     ),
   };
   parts = unifyBlockGroupedReferences(parts);
-  if (parts.joins.some((join) => join.full === true)) {
+  // Typed lowering has a native FULL join; only the shipped execution path needs its UNION desugar.
+  if (!recordDeclaredTypes && parts.joins.some((join) => join.full === true)) {
     return desugarFullJoin(parts, nextSequence);
   }
   if (parts.groupingSets !== undefined && parts.groupingSets.length > 0) {
@@ -15410,7 +15435,17 @@ function mergedWildcardColumns(
     }
     const merged = names.flatMap((name) => {
       const column = columns.find((candidate) => candidate.name === name);
-      return column === undefined ? [] : [column];
+      return column === undefined
+        ? []
+        : [
+            {
+              ...column,
+              reference:
+                recordDeclaredTypes && block.joins.some((item) => item.full === true)
+                  ? name
+                  : column.reference,
+            },
+          ];
     });
     columns = [
       ...merged,
@@ -15447,6 +15482,7 @@ export function mergeJoinColumns(
     forEachBlockExpression(block, nested);
     const sources = [block.base, ...block.joins];
     const replacements = new Map<string, Expression>();
+    const nativeFull = recordDeclaredTypes && block.joins.some((join) => join.full === true);
     block.joins.forEach((join, index) => {
       if (join.using === undefined && join.natural !== true) return;
       const names = joinMergedNames(sources, index + 1, columnsFor);
@@ -15465,6 +15501,30 @@ export function mergeJoinColumns(
         }
         return owner;
       });
+      if (nativeFull) {
+        const conditions = names.map<Expression>((name, key) => {
+          const left: Expression = replacements.get(name) ?? {
+            kind: "column",
+            reference: `${owners[key]?.alias ?? block.base.alias}.${name}`,
+          };
+          const right: Expression = { kind: "column", reference: `${join.alias}.${name}` };
+          if (join.full === true)
+            replacements.set(name, { kind: "call", name: "COALESCE", arguments: [left, right] });
+          else replacements.set(name, left);
+          return { kind: "condition", operator: "=", left, right };
+        });
+        // These conditions use the merged left value at this join, before later FULL joins
+        // extend it. The final replacement is only for the block's unqualified references.
+        join.left = { kind: "literal", value: null };
+        join.right = { kind: "literal", value: null };
+        join.on = conditions.reduce<Expression>(
+          (left, right) => ({ kind: "logical", operator: "and", left, right }),
+          { kind: "literal", value: true },
+        );
+        delete join.using;
+        delete join.natural;
+        return;
+      }
       if (join.using !== undefined && owners.some((owner) => owner !== block.base)) {
         const condition = usingCondition(
           "",

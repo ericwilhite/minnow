@@ -273,3 +273,22 @@ describe("statistics basis (lowerer.ts LoweredPlanned.basis)", () => {
     ]);
   });
 });
+
+it("preserves non-byte comparisons as residuals instead of silently hashing bytes", () => {
+  const { plan } = setup(
+    ["CREATE TABLE p(id INT PRIMARY KEY,t TEXT)", "CREATE TABLE b(id INT PRIMARY KEY,t TEXT)"],
+    {},
+  );
+  for (const sql of [
+    'SELECT p.id FROM p JOIN b ON p.t COLLATE "en"=b.t',
+    'SELECT p.id,p.t COLLATE "en" IN(SELECT b.t FROM b)AS found FROM p',
+    'SELECT p.id,p.t COLLATE "en" IN(SELECT b.t FROM b ORDER BY b.id LIMIT 3)AS found FROM p',
+  ]) {
+    const joins = all(plan(sql)).filter((rel) => rel.op === "join");
+    expect(joins).toHaveLength(1);
+    const join = joins[0];
+    if (join?.op !== "join") throw new Error("join expected");
+    expect(join.residual).toMatchObject({ op: "compare", collation: "en" });
+    expect(join.leftKeys.every((key) => key.op === "literal")).toBe(true);
+  }
+});

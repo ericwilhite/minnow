@@ -8,7 +8,11 @@ import { encodeValue } from "../../testing/differential-harness.js";
 import { UnsupportedPlanError } from "../errors.js";
 import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
-import { queryAuthorityValue } from "./divergences.js";
+import {
+  CATALOGUE_AUTHORITY_REFUSALS,
+  CATALOGUE_CURRENT_AUTHORITY,
+  queryAuthorityValue,
+} from "./divergences.js";
 
 interface Table {
   name: string;
@@ -91,13 +95,22 @@ for (const dataset of ["wide", "retail", "star"])
           ).rows,
         ).toEqual([{ type: "numeric" }]);
       for (const query of FIXTURE.queries.filter((query) => query.dataset === dataset)) {
+        if (query.id in CATALOGUE_AUTHORITY_REFUSALS) {
+          await expect(pg.query(query.sql), query.id).rejects.toMatchObject({ code: "42883" });
+          expect(() => core.prepare(query.sql), query.id).toThrow(
+            expect.objectContaining({ sqlState: "42883" }),
+          );
+          expect((await current.query(query.sql)).rows).toBeDefined();
+          refused.push(`${query.id}: PG/R19 42883, current accepts`);
+          continue;
+        }
         if (!query.lowered) {
           expect(() => core.prepare(query.sql), query.id).toThrow(UnsupportedPlanError);
           refused.push(query.id);
           continue;
         }
-        if (query.id === "S_q2") {
-          // R19: cast bindings explicitly refuse text -> DATE. This is an unfinished kernel,
+        if (["S_q2", "S_q8", "guide-13", "guide-17"].includes(query.id)) {
+          // R19: text -> DATE and date_trunc timestamp bindings remain unfinished kernels,
           // reported as unsupported, not an R21 intended semantic divergence or a passing query.
           expect(() => core.prepare(query.sql), query.id).toThrow(UnsupportedPlanError);
           refused.push(query.id);
@@ -135,12 +148,25 @@ for (const dataset of ["wide", "retail", "star"])
             `${query.id} row ${String(index)}, column ${String(cell)} (${String(result.columns[cell]?.name)}): next=${String(av[cell])} PG=${String(bv[cell])}; counts ${String(a.length)}/${String(b.length)}`,
           );
         }
-        expect(canonical(actual), `${query.id} against current engine`).toEqual(
+        const witnessSQL = CATALOGUE_CURRENT_AUTHORITY[query.id];
+        const legacyExpected =
+          witnessSQL === undefined
+            ? pgRows
+            : (await pg.query<Record<string, unknown>>(witnessSQL)).rows;
+        expect(
           canonical((await current.query(query.sql)).rows),
-        );
+          `${query.id} against independent PostgreSQL${witnessSQL === undefined ? "" : " R21 witness"}`,
+        ).toEqual(canonical(legacyExpected));
         compiled.push(query.id);
       }
-      expect(compiled.length).toBe(dataset === "wide" ? 20 : 2);
+      expect(compiled.length).toBe(
+        FIXTURE.queries.filter(
+          (query) =>
+            query.dataset === dataset &&
+            query.lowered &&
+            !["S_q2", "S_q8", "guide-13", "guide-17"].includes(query.id),
+        ).length,
+      );
       console.info(
         JSON.stringify({
           lane: "Node correctness",
@@ -155,3 +181,19 @@ for (const dataset of ["wide", "retail", "star"])
       await core.close();
     }
   }, 60_000);
+
+it("keeps the frozen SQL and data unchanged while enabling capability metadata", async () => {
+  const source = fixtureData;
+  const frozen = {
+    source: source.source,
+    datasets: source.datasets,
+    queries: source.queries.map(({ id, dataset, sql }) => ({ id, dataset, sql })),
+  };
+  const hash = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(JSON.stringify(frozen)),
+  );
+  expect(
+    Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join(""),
+  ).toBe("8d3af125ed1af20672fe678e0fdc9a40e5ce180bae68c64a099b601ae7b7e9a1");
+});

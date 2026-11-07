@@ -88,6 +88,13 @@ list below collects them.
   `ROWS BETWEEN CURRENT ROW AND 1 PRECEDING` is an error, including over an empty input.
   Same-kind bounds such as `ROWS BETWEEN 1 PRECEDING AND 5 PRECEDING` remain valid empty frames.
 
+- The private rebuild core now lowers joins and window functions to its real executor. Its
+  typed compilation keeps native FULL joins and exact window-frame literals; the published
+  SQL execution path keeps its plan rewrites and literal-offset syntax. Direct boolean hash joins
+  retain TRUE-only keys. These modules remain unexported.
+- SQL examples cast plain-number aggregates to `NUMERIC` before `ROUND(value, digits)` so
+  they use PostgreSQL's supported overload and return exact decimal text.
+
 - The exported query-plan type `CompiledStatement` gains three optional fields: `truncate` on a
   delete that came from `TRUNCATE`, and `declaredTypeName` and `declaredLength` on column
   definitions, which keep the declared `NUMERIC`/`DECIMAL` spelling and `VARCHAR(n)`/`CHAR(n)`
@@ -207,7 +214,7 @@ these rewrites where an application uses the old forms:
 
 No stored format changes.
 
-No stored format changes or data migration are introduced by this fix.
+No stored format changes or data migration are introduced by these changes.
 
 ## 0.19.3 — November 5, 2026
 

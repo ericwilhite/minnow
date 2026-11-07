@@ -20,6 +20,7 @@ export interface RelColumn {
   readonly nullable: boolean;
   /** Renders as a JS bigint (R17.1). */
   readonly big: boolean;
+  readonly collation?: string;
 }
 
 export interface LoweredRel {
@@ -284,7 +285,12 @@ export function relationScope(columns: readonly RelColumn[], qualifiers: readonl
       const index = columns.findIndex((candidate) => candidate.name === name);
       const found = columns[index];
       if (found === undefined) return undefined;
-      return { expr: column(index, found.type), nullable: found.nullable, big: found.big };
+      return {
+        expr: column(index, found.type),
+        nullable: found.nullable,
+        big: found.big,
+        ...(found.collation === undefined ? {} : { collation: found.collation }),
+      };
     },
   };
 }

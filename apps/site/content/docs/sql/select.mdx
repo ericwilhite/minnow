@@ -160,10 +160,15 @@ function call takes the function's name as written (`COUNT(*)` is `count`, `ARRA
 `expression`, numbered like any repeated name (`expression`, `expression_2`), where PostgreSQL
 would say `?column?`.
 
+`ROUND(value, digits)` takes `NUMERIC` in PostgreSQL. Cast a plain-number expression
+explicitly, as in `ROUND(SUM(total)::NUMERIC, 2)`, for SQL that also runs there. Minnow's
+current engine additionally accepts a plain number with a digit count; PostgreSQL refuses
+that overload with `42883`. The numeric form returns exact decimal text.
+
 ## Joins
 
 ```sql
-SELECT s.name AS store, COUNT(*) AS orders, ROUND(SUM(o.total), 2) AS revenue
+SELECT s.name AS store, COUNT(*) AS orders, ROUND(SUM(o.total)::NUMERIC, 2) AS revenue
 FROM stores s
 JOIN orders o ON o.store_id = s.store_id
 LEFT JOIN employees e ON e.employee_id = o.employee_id
@@ -212,8 +217,8 @@ query (`o.amount > c.threshold`) keeps the plain join and cannot group or limit.
 SELECT p.category,
        COUNT(*) AS lines,
        COUNT(DISTINCT i.order_id) AS baskets,
-       ROUND(SUM(i.line_total), 2) AS revenue,
-       ROUND(AVG(i.line_total), 2) AS average_line,
+       ROUND(SUM(i.line_total)::NUMERIC, 2) AS revenue,
+       ROUND(AVG(i.line_total)::NUMERIC, 2) AS average_line,
        MIN(i.unit_price) AS cheapest,
        MAX(i.unit_price) AS dearest
 FROM order_items i

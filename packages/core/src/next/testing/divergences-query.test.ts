@@ -17,6 +17,9 @@ const cases = [
   "numeric",
   "computed",
   "wrong-column",
+  "window",
+  "window-numeric",
+  "window-sum",
 ] as const;
 it("applies C11 only to a direct integer AVG output, never tolerating a different float", () => {
   const reach = createReach("C11 result lineage", cases);
@@ -28,7 +31,7 @@ it("applies C11 only to a direct integer AVG output, never tolerating a differen
         (variant, coefficient) => {
           reach.beginHistory();
           reach.reach(variant);
-          const inputType = variant === "numeric" ? NUMERIC : INT;
+          const inputType = variant === "numeric" || variant === "window-numeric" ? NUMERIC : INT;
           const column = (index: number, type: PhysicalType): ScalarExpr => ({
             op: "column",
             index,
@@ -62,6 +65,23 @@ it("applies C11 only to a direct integer AVG output, never tolerating a differen
               },
             ],
           };
+          if (variant.startsWith("window"))
+            root = {
+              op: "window",
+              id: 2,
+              input,
+              output,
+              partitionBy: [],
+              orderBy: [],
+              functions: [
+                {
+                  fn: variant === "window-sum" ? "sum" : "avg",
+                  args: [column(0, inputType)],
+                  frame: null,
+                  type: FLOAT,
+                },
+              ],
+            };
           let position = variant === "wrong-column" ? 0 : 1;
           if (variant === "projected" || variant === "computed") {
             root = {
@@ -106,7 +126,7 @@ it("applies C11 only to a direct integer AVG output, never tolerating a differen
             volatile: false,
           };
           const text = (coefficient / 100).toFixed(2),
-            changed = ["direct", "projected", "barriers"].includes(variant);
+            changed = ["direct", "projected", "barriers", "window"].includes(variant);
           expect(queryAuthorityValue(plan, position, text)).toBe(changed ? Number(text) : text);
           expect(queryAuthorityValue(plan, position, "NaN")).toBe("NaN");
           expect(queryAuthorityValue(plan, position, null)).toBeNull();
