@@ -15,7 +15,7 @@ for (const seed of seedsFor("next-lower-m3-offsets", [0x7741, 0x7742]))
     const random = mulberry32(seed);
     reach.beginHistory();
     try {
-      const check = async (sql: string, params: (number | null)[]) => {
+      const check = async (sql: string, params: Array<number | null>) => {
         let authority;
         try {
           authority = { rows: (await pg.query(sql, params)).rows };
@@ -28,8 +28,9 @@ for (const seed of seedsFor("next-lower-m3-offsets", [0x7741, 0x7742]))
           if (!("batches" in result)) throw new Error("rows expected");
           actual = { rows: oracleRows(result) };
         } catch (error) {
-          actual = { code: (error as { sqlState: string }).sqlState };
-          if (actual.code === undefined) throw error;
+          const code = (error as { sqlState?: string }).sqlState;
+          if (code === undefined) throw error;
+          actual = { code };
         }
         const normalize = (value: unknown) =>
           JSON.parse(

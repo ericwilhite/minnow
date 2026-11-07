@@ -80,7 +80,7 @@ const committed = frozenSQL
         Array<{
           name: string;
           ddl: string;
-          rows: Record<string, boolean | string | number | null>[];
+          rows: Array<Record<string, boolean | string | number | null>>;
         }>
       >;
     })
