@@ -65,7 +65,9 @@ CTE's own locking clause counts whenever its reference count is positive, even i
 referrer is a CTE the final SELECT does not use. A zero-reference CTE contributes nothing;
 this rule applies separately inside each planned query scope. Both the base and step of a
 recursive declaration count when it has an external reference; its self-reference alone
-does not count.
+does not count. A locking-read refusal says `cannot execute SELECT in a read-only transaction`;
+the message does not report lock strength. Plans still retain the strongest effective intent
+after view and CTE expansion.
 
 Casts take either spelling, `CAST(total AS INTEGER)` or `total::INTEGER`; the postfix form binds
 tighter than every operator, so `-total::INTEGER * 2` is `(-(total::INTEGER)) * 2`. A double

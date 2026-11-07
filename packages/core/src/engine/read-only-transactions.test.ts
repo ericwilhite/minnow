@@ -300,7 +300,9 @@ const SEQUENCES: ReadonlyArray<readonly string[]> = [
 
 /**
  * PostgreSQL's outcome of `statements` in a fresh schema: ok, or the first SQLSTATE, with the
- * message for 25006 (it names the refused command: `SELECT FOR UPDATE`, `nextval()`).
+ * message for 25006. Minnow's declared diagnostic names locking reads SELECT, independently of
+ * the strength PostgreSQL names; only the PG SELECT tag is mapped to that contract. Minnow's
+ * messages are never normalized, and writes/nextval keep their exact PG comparison.
  */
 async function pgRun(statements: readonly string[]): Promise<string> {
   await pg.exec("DROP SCHEMA IF EXISTS ro CASCADE; CREATE SCHEMA ro; SET search_path TO ro");
@@ -310,7 +312,11 @@ async function pgRun(statements: readonly string[]): Promise<string> {
     return "ok";
   } catch (error) {
     const { code, message } = error as { code?: string; message?: string };
-    return code === "25006" ? `25006 ${String(message)}` : String(code);
+    const diagnostic = String(message).replace(
+      /^cannot execute SELECT FOR (?:KEY SHARE|SHARE|NO KEY UPDATE|UPDATE) in a read-only transaction$/u,
+      "cannot execute SELECT in a read-only transaction",
+    );
+    return code === "25006" ? `25006 ${diagnostic}` : String(code);
   } finally {
     await pg.exec("ROLLBACK");
   }
@@ -384,8 +390,8 @@ describe("READ ONLY across entry points, row locks and savepoints (review B6 str
           const sql = `SELECT * FROM vc FOR ${clause}`;
           const expected = await pgRun([begin, sql]);
           const actual = await minnowRun([begin, sql], entry);
-          // PG uses generic SELECT here (permission check), while Minnow names the strength.
-          // This new control compares SQLSTATE; existing exact-message campaigns stay intact.
+          // PG and Minnow both use generic SELECT for a constant view. The diagnostic campaign
+          // separately requires that wording for every locking read, including expanded views.
           expect(expected === "ok" ? "ok" : expected.split(" ")[0], sql).toBe(
             begin === "BEGIN READ ONLY" ? "25006" : "ok",
           );

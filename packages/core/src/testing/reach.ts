@@ -512,6 +512,33 @@ export const ROW_LOCK_TARGET_STATES = [
 /** A view remains a relation lock target even when its body has no table. */
 export const ROW_LOCK_VIEW_STATES = ["read only refused", "read write allowed"] as const;
 
+/** Admission follows PG; the strength-free SELECT diagnostic never describes a syntax-only lock. */
+export const ROW_LOCK_DIAGNOSTIC_STATES = [
+  "read only refused",
+  "read only allowed",
+  "read write allowed",
+  "early",
+  "expanded view",
+  "unlocked view",
+  "retained cte",
+  "nested",
+  "point read",
+  "weaker outer",
+  "stronger outer",
+  "cte boundary",
+  "unused cte",
+  "strongest KEY SHARE",
+  "strongest SHARE",
+  "strongest NO KEY UPDATE",
+  "strongest UPDATE",
+  "execute",
+  "query",
+  "typed",
+  "cloned",
+  "serialized",
+  "cursor",
+] as const;
+
 /** Ordered transaction-mode coverage against PostgreSQL or the lossless lowering contract. */
 export const TRANSACTION_MODE_ORDER_STATES = [
   "top level",
