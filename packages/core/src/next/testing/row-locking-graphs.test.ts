@@ -26,6 +26,7 @@ const INTENT = {
   "NO KEY UPDATE": "noKeyUpdate",
   UPDATE: "update",
 };
+// The full lowered graph campaign runs past the 20 s local default; CI already allows 300 s.
 it("preserves refcounted CTE graph locks, views and strongest intent before execution pruning", async () => {
   const reach = createReach<string>("locking CTE graph", ROW_LOCK_GRAPH_STATES);
   const failures: string[] = [];
@@ -66,4 +67,4 @@ it("preserves refcounted CTE graph locks, views and strongest intent before exec
   }
   expect(failures.join("\n")).toBe("");
   reach.assertReached();
-});
+}, 120_000);
