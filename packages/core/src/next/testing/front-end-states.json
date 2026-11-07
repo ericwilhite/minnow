@@ -131,6 +131,21 @@
   },
   {
     "file": "query.ts",
+    "message": "missing FROM-clause entry for table \"X\"",
+    "state": "42P01"
+  },
+  {
+    "file": "query.ts",
+    "message": "column X does not exist",
+    "state": "42703"
+  },
+  {
+    "file": "query.ts",
+    "message": "column \"X\" does not exist",
+    "state": "42703"
+  },
+  {
+    "file": "query.ts",
     "message": "Unsupported EXTRACT field: X",
     "state": "0A000"
   },
@@ -227,6 +242,16 @@
   {
     "file": "query.ts",
     "message": "RIGHT JOIN is only supported as the sole join",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
+    "message": "NOW takes no arguments",
+    "state": "42883"
+  },
+  {
+    "file": "query.ts",
+    "message": "X(precision) is not supported: the engine keeps milliseconds",
     "state": "0A000"
   },
   {
@@ -368,6 +393,11 @@
     "file": "query.ts",
     "message": "bigint out of range",
     "state": "22003"
+  },
+  {
+    "file": "query.ts",
+    "message": "NATURAL FULL JOIN is not supported; name the shared columns: FULL JOIN … USING (columns)",
+    "state": "0A000"
   },
   {
     "file": "query.ts",

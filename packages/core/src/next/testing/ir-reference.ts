@@ -11,8 +11,8 @@
  * PostgreSQL's float order); text as strings; NUMERIC as an exact `Decimal`
  * (reference-decimal.ts) with PostgreSQL's NaN and ±Infinity: literals, casts (rounded half
  * away from zero to the scale), comparison, sorting, SUM and RANGE offsets are exact. Decimal
- * arithmetic, intervals, dates and JSON are outside the subset and throw
- * `ReferenceUnsupportedError`.
+ * addition/subtraction/multiplication/negation/absolute value are exact; division retains
+ * the reference's approximate subset. Intervals, dates and JSON are outside the subset.
  * Tables are arrays of rows in catalog order; a locator is the row's index.
  */
 import type { CatalogView, TableDef } from "../access/catalog.js";
@@ -287,24 +287,27 @@ function arithmetic(fn: string, args: readonly Value[], type: PhysicalType): Val
     }
   }
   if (type.kind === "decimal") {
-    // Approximated as numbers, like decimal constants (see the module comment): enough for the
-    // small constants the tests compute with, not an exact NUMERIC.
-    const x = Number(a);
-    const y = Number(b);
+    const x = toDecimal(a as bigint | number | Decimal);
+    const y = b === undefined ? Decimal.fromInteger(0n) : toDecimal(b as bigint | number | Decimal);
     switch (fn) {
       case "add":
-        return x + y;
+        return x.add(y);
       case "sub":
-        return x - y;
+        return x.add(y.negate());
       case "mul":
-        return x * y;
+        if (x.isNaN || y.isNaN || (!x.isFinite && y.sign === 0) || (!y.isFinite && x.sign === 0))
+          return Decimal.special("nan");
+        if (!x.isFinite || !y.isFinite)
+          return Decimal.special(x.sign * y.sign < 0 ? "-inf" : "+inf");
+        return Decimal.finite(x.coefficient * y.coefficient, x.scale + y.scale);
       case "div":
-        if (y === 0) throw new ReferenceSqlError("division by zero", "22012");
-        return x / y;
+        // Preserve the reference's existing approximate division subset.
+        if (y.sign === 0) throw new ReferenceSqlError("division by zero", "22012");
+        return x.toNumber() / y.toNumber();
       case "neg":
-        return -x;
+        return x.negate();
       case "abs":
-        return Math.abs(x);
+        return x.sign < 0 ? x.negate() : x;
     }
   }
   throw new ReferenceUnsupportedError(`${fn} over ${type.kind}`);

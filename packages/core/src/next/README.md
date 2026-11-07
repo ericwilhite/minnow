@@ -1362,7 +1362,7 @@ branch).
 ### Row-lock admission (B6/B5)
 
 Every lowered statement carries `rowLocking`: `none`, `keyShare`, `share`, `noKeyUpdate`, or
-`update`, strongest last. The owner refuses a query whose intent is not `none` in READ ONLY
+`update`, strongest last. The owner must refuse a query whose intent is not `none` in READ ONLY
 with 25006, before executing it, including a cached or parameterized statement. Lowering does
 not acquire locks or enforce transaction access mode. DML/DDL write admission stays separate.
 The shared front end resolves targets through FROM subqueries but never pushes an outer clause
@@ -1389,3 +1389,8 @@ as `CompiledQuery.rowLockingCtes`, so catalog expansion includes locking views i
 referenced only by an unused referrer. This admission-only data survives ordinary clones and
 worker transport; it is not lowered as an execution input. The strongest intent still wins
 when the final SELECT has a weaker clause. Nested query scopes retain their own references.
+
+The retained admission declaration includes both members of a recursive CTE. A step's
+locking subquery or view contributes even when the only external reference is in an
+unused CTE. Self-reference alone does not count. This is lowering metadata; the owner
+must apply it before execution. The shipped SQL enforcement is inherited from Stream A.

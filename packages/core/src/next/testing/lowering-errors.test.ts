@@ -12,6 +12,7 @@ import {
   FRAME_METADATA_STATES,
   HAVING_NAME_STATES,
   RANGE_DECIMAL_STATES,
+  REFERENCE_DECIMAL_ARITH_STATES,
 } from "../../testing/reach.js";
 import { PlanningError } from "../lower/errors.js";
 import { check, nextOutcome, pgOutcome } from "./pglite-oracle.js";
@@ -264,6 +265,55 @@ describe("HAVING names and frame offsets (review B6-p2b-3 finding 3)", () => {
           );
         }
     expect(failures.join("\n")).toBe("");
+    reach.assertReached();
+  });
+
+  it("keeps basic NUMERIC arithmetic exact after typed front-end folding", async () => {
+    const next = await fixture([]);
+    const reach = createReach<string>(
+      "reference decimal arithmetic",
+      REFERENCE_DECIMAL_ARITH_STATES,
+    );
+    const inputs = [
+      "0.100000000000000001",
+      "9007199254740993",
+      "-9223372036854775808.5",
+      "Infinity",
+      "-Infinity",
+      "NaN",
+      "0",
+    ];
+    const cases: Array<{ op: string; a: string; b?: string; expression: string }> = [];
+    const numeric = (text: string) => `CAST('${text}' AS NUMERIC)`;
+    for (const a of inputs) {
+      for (const b of ["0", "1", "-1", "0.000000000000000001"])
+        for (const [op, symbol] of [
+          ["add", "+"],
+          ["sub", "-"],
+          ["mul", "*"],
+        ])
+          cases.push({
+            op: op ?? "",
+            a,
+            b,
+            expression: `${numeric(a)} ${symbol ?? ""} ${numeric(b)}`,
+          });
+      cases.push(
+        { op: "neg", a, expression: `-${numeric(a)}` },
+        { op: "abs", a, expression: `abs(${numeric(a)})` },
+      );
+    }
+    expect(cases.length).toBe(98);
+    for (const test of cases) {
+      reach.beginHistory();
+      const sql = `SELECT CAST((${test.expression}) AS TEXT) AS value`;
+      expect(nextOutcome(next, sql), sql).toEqual(await pgOutcome(pg, sql));
+      reach.reach(test.op);
+      reach.reach(/Infinity|NaN/u.test(test.a) ? "special" : "finite");
+      if (test.a === "0" || test.b === "0") reach.reach("zero");
+      if (/9007|9223/u.test(test.a)) reach.reach("large");
+      if (test.a.includes(".") || test.b?.includes(".") === true) reach.reach("fractional");
+    }
     reach.assertReached();
   });
 

@@ -172,8 +172,7 @@ describe("lowering agrees with PostgreSQL on review B6-p2a's findings", () => {
 
 describe("name errors before grouping errors", () => {
   it("matches PostgreSQL messages for the same cases as the shipped engine", async () => {
-    schema += 1;
-    await pg.exec(`CREATE SCHEMA s${String(schema)}; SET search_path TO s${String(schema)}`);
+    await pg.exec("CREATE SCHEMA name_resolution; SET search_path TO name_resolution");
     const next = new LoweredDatabase();
     for (const sql of NAME_RESOLUTION_SETUP) {
       await pg.exec(sql);

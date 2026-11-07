@@ -555,3 +555,17 @@ export const TRANSACTION_MODE_ITEM_STATES = [
   "start",
   "set",
 ] as const;
+
+/** Exact basic NUMERIC operations in the reference, checked as text against PostgreSQL. */
+export const REFERENCE_DECIMAL_ARITH_STATES = [
+  "add",
+  "sub",
+  "mul",
+  "neg",
+  "abs",
+  "finite",
+  "special",
+  "zero",
+  "large",
+  "fractional",
+] as const;
