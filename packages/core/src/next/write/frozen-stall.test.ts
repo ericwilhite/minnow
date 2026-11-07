@@ -19,13 +19,24 @@ import {
   texts,
 } from "./test-support.js";
 
-/** begin() with a guard: a spin would read `failure` without end; 1,000 reads stop it. */
-async function guardedBegin(path: WritePathImpl): Promise<unknown> {
+/** A stalled begin makes no read/write progress. Real encoding and merges may check
+ * cancellation many times, so only 1,000 failure reads without storage/publication progress
+ * stop it. A task yield alone does not reset the guard. */
+async function guardedBegin(path: WritePathImpl, space: Harness["space"]): Promise<unknown> {
   let checks = 0;
+  let previous = "";
   const stop = new Error("guard: 1,000 failure checks without the slot");
   Object.defineProperty(path, "failure", {
     configurable: true,
-    get: () => (++checks >= 1000 ? stop : null),
+    get: () => {
+      const stats = space.stats;
+      const progress = `${String(stats.dataBytes)}/${String(stats.writerBytes)}/${String(stats.cache.hits)}/${String(path.publications)}`;
+      if (progress !== previous) {
+        previous = progress;
+        checks = 0;
+      }
+      return ++checks >= 1000 ? stop : null;
+    },
   });
   try {
     const tx = await path.begin();
@@ -66,7 +77,7 @@ describe("frozen memtables whose commit continues into the live one", () => {
       expect(path.stats().frozenMemtables).toBe(1499);
       expect(path.stats().backpressure).toBe(true);
       // The writer gets the slot: the tail froze and the whole commit flushed.
-      expect(await guardedBegin(path)).toBeNull();
+      expect(await guardedBegin(path, harness.space)).toBeNull();
       expect(path.stats().frozenMemtables).toBe(0);
       expect(path.stats().backpressure).toBe(false);
       const view = path.pin();
@@ -91,7 +102,7 @@ describe("frozen memtables whose commit continues into the live one", () => {
     );
     await path.quiesce();
     expect(path.stats().backpressure).toBe(true);
-    expect(await guardedBegin(path)).toBeNull();
+    expect(await guardedBegin(path, harness.space)).toBeNull();
     expect(path.failure).toBeNull();
     expect(path.stats().frozenMemtables).toBe(0);
     const reopened = await harness.reopen();

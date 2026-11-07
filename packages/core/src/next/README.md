@@ -96,6 +96,15 @@ merges, metadata growth, exact rows and durable reopen, with declared reach. Its
 are small to bound the in-memory virtual disk; the separate native W5M reproduction covers
 the canonical 200-column workload at 256 MiB. No stored format changes are involved.
 
+A non-unique key can occupy a whole memtable. Delta traversal visits ordered chains linearly,
+uses an in-place O(n log n) sort for arbitrary row-id/tombstone order, and checks the shared
+worker task clock while gathering, sorting and emitting entries. Scratch belongs to each
+traversal, so suspended traversals can overlap safely. `write/hot-key.test.ts` generates full
+chains and checks order and cumulative task progress. The Node-only generated CPU-ratio
+check lives in `scripts/write-hot-key-cpu.test.ts`, outside the browser core.
+`scripts/write-run-bench.mts --hot-key` measures the built component in interleaved CPU rounds.
+Stored run bytes and the Bloom format are unchanged.
+
 ### Commit encoding under the cap
 
 Commit encoding has a separate, fixed 6 MiB minimum, admitted before the engine runs. It charges

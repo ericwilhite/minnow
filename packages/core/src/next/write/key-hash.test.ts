@@ -1,5 +1,5 @@
 /**
- * KeyDelta.forEachSorted (perf step 1): the allocation-free stream a run is encoded from yields
+ * KeyDelta.forEachSorted (perf step 1): the stream a run is encoded from yields
  * exactly what `sorted` lists, filtered by the same bound and predicate, in the same order.
  * Generated (fast-check, `seedsFor`): keys of 1-6 bytes from a small alphabet (so keys repeat),
  * puts and tombstones, row ids, seqs on both sides of the bound, pops of the newest entries.
@@ -11,9 +11,9 @@ import { KeyDelta } from "./key-hash.js";
 
 describe("KeyDelta.forEachSorted", () => {
   for (const seed of seedsFor("next-write-key-delta-stream", [0x4b44]))
-    it(`streams what sorted() lists (seed ${String(seed)})`, () => {
-      fc.assert(
-        fc.property(
+    it(`streams what sorted() lists (seed ${String(seed)})`, async () => {
+      await fc.assert(
+        fc.asyncProperty(
           fc.array(
             fc.record({
               key: fc.uint8Array({ minLength: 1, maxLength: 6, min: 0, max: 3 }),
@@ -26,7 +26,7 @@ describe("KeyDelta.forEachSorted", () => {
           fc.integer({ min: 0, max: 30 }),
           fc.integer({ min: 0, max: 21 }),
           fc.integer({ min: 0, max: 3 }),
-          (entries, pops, bound, filter) => {
+          async (entries, pops, bound, filter) => {
             const delta = new KeyDelta();
             for (const entry of entries)
               delta.add(entry.key, 0, entry.key.length, entry.rowId, entry.seq, entry.tombstone);
@@ -45,7 +45,7 @@ describe("KeyDelta.forEachSorted", () => {
                     `${key.join(".")}:${String(entry.rowId)}:${String(entry.tombstone)}`,
                   );
             const actual: string[] = [];
-            delta.forEachSorted(
+            await delta.forEachSorted(
               bound,
               (arena, start, end, rowId, tombstone) => {
                 actual.push(

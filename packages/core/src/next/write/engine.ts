@@ -2553,7 +2553,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           for (const index of def.indexes) {
             const delta = memtable.deltas.get(index.id);
             if (delta === undefined || delta.entryCount === 0) continue;
-            const run = encodeDelta(delta, through);
+            const run = await encodeDelta(delta, through, null, () => this.#check());
             if (run === null) continue;
             runs.set(index.id, runRef(run, (await writer.write(run.parts)).blobs));
           }
@@ -2589,7 +2589,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           for (const index of def.indexes) {
             const delta = memtable.deltas.get(index.id);
             if (delta === undefined) continue;
-            const run = encodeDelta(delta, through);
+            const run = await encodeDelta(delta, through, null, () => this.#check());
             if (run === null) continue;
             runs.set(index.id, runRef(run, (await writer.write(run.parts)).blobs));
           }
@@ -2621,7 +2621,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         for (const index of def.indexes) {
           const delta = memtable.deltas.get(index.id);
           if (delta === undefined) continue;
-          const run = encodeDelta(delta, through);
+          const run = await encodeDelta(delta, through, null, () => this.#check());
           if (run === null) continue;
           const written = await writer.write(run.parts);
           runs.set(index.id, runRef(run, written.blobs));
@@ -3241,10 +3241,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const remaps = new Map<KeyDelta, { delta: KeyDelta; entries: Int32Array }>();
     this.#stageFault?.("runs", index);
     for (const [indexId, old] of memtable.deltas) {
-      const run = encodeDelta(
+      const run = await encodeDelta(
         old,
         Infinity,
         (rowId, tombstone) => !tombstone && rowId >= first && rowId < end,
+        () => this.#check(),
       );
       if (run !== null) {
         const written = await writer.write(run.parts);
@@ -4349,16 +4350,18 @@ function encodeDelta(
   delta: KeyDelta,
   bound: number,
   keep: ((rowId: number, tombstone: boolean) => boolean) | null = null,
-): EncodedRun | null {
+  check: (() => void) | null = null,
+): MaybePromise<EncodedRun | null> {
   const builder = new RunBuilder();
-  delta.forEachSorted(
+  const pending = delta.forEachSorted(
     bound,
     (arena, start, end, rowId, tombstone) => {
       builder.addRange(arena, start, end, rowId, tombstone);
     },
     keep,
+    check,
   );
-  return builder.finish();
+  return pending instanceof Promise ? pending.then(() => builder.finish()) : builder.finish();
 }
 
 /** Adds `extents` to a publication's retirements, each at most once. */

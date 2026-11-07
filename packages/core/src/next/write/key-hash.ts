@@ -10,13 +10,25 @@
  * - `restamp` changes an entry's seq (commit turns pending seqs into the LSN).
  * - `sorted` lists keys in byte order with their entries in row-id order (a run's input).
  */
+import type { MaybePromise } from "../access/key-index.js";
+import { taskClock, yieldTask } from "../exec/pipeline.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { compareBytes } from "../vector/varlen.js";
 import { charged, copyRange, UNCHARGED, type Charge } from "./bytes.js";
 
+type DeltaVisitor = (
+  arena: Uint8Array,
+  start: number,
+  end: number,
+  rowId: number,
+  tombstone: boolean,
+) => void;
+type KeepEntry = (rowId: number, tombstone: boolean) => boolean;
+
 /** Bytes of a fresh delta's arrays (slots 64×4, 4 key arrays 16×4, arena 256, entries 16×(8+8+1+4+4)). */
 const INITIAL_BYTES = 64 * 4 + 4 * 16 * 4 + 256 + 16 * 25;
 const ENTRY_BYTES = 25;
+const NO_ENTRIES = new Int32Array(0);
 
 export class KeyDelta {
   readonly #charge: Charge;
@@ -246,22 +258,32 @@ export class KeyDelta {
   }
 
   /**
-   * `sorted` without the objects: each entry with `seq ≤ bound` (and `keep`, if given), in key-byte
-   * order and, per key, (row id, put before tombstone) order, handed to `visit` as the key's range
-   * in `arena` plus the entry's fields. Allocates only the key order (one Int32Array) and a reused
-   * scratch for keys with several entries.
+   * Entries in key-byte order and, per key, (row id, put before tombstone) order.
+   * Ordered chains are visited linearly; arbitrary chains use an in-place O(n log n) heapsort.
+   * Large traversals share the worker task clock, and suspend only for a real task yield.
+   * Scratch belongs to this traversal: another traversal can run while this one yields.
    */
   forEachSorted(
     bound: number,
-    visit: (
-      arena: Uint8Array,
-      start: number,
-      end: number,
-      rowId: number,
-      tombstone: boolean,
-    ) => void,
-    keep: ((rowId: number, tombstone: boolean) => boolean) | null = null,
-  ): void {
+    visit: DeltaVisitor,
+    keep: KeepEntry | null = null,
+    check: (() => void) | null = null,
+  ): MaybePromise<void> {
+    const work = this.#sortedWork(bound, visit, keep, check);
+    const resume = (): MaybePromise<void> => {
+      const next = work.next();
+      return next.done ? undefined : next.value.then(resume);
+    };
+    return resume();
+  }
+
+  *#sortedWork(
+    bound: number,
+    visit: DeltaVisitor,
+    keep: KeepEntry | null,
+    check: (() => void) | null,
+  ): Generator<Promise<void>, void, unknown> {
+    yield* checkpoint(check);
     const arena = this.#arena;
     const starts = this.#keyStart;
     const ends = this.#keyEnd;
@@ -269,59 +291,105 @@ export class KeyDelta {
       compareBytes(arena, starts[a] ?? 0, ends[a] ?? 0, arena, starts[b] ?? 0, ends[b] ?? 0);
     const order = new Int32Array(this.keyCount);
     let ascending = true;
-    for (let k = 0; k < this.keyCount; k++) {
-      order[k] = k;
-      if (ascending && k > 0 && compareSlots(k - 1, k) > 0) ascending = false;
+    for (let from = 0; from < this.keyCount; from += 128) {
+      yield* checkpoint(check);
+      ascending = fillKeyOrder(
+        order,
+        from,
+        Math.min(from + 128, order.length),
+        ascending,
+        compareSlots,
+      );
     }
-    if (!ascending) order.sort(compareSlots);
+    if (!ascending) yield* sortIndices(order, order.length, compareSlots, check);
     const rowIds = this.#rowIds;
     const seqs = this.#seqs;
     const tombstones = this.#tombstones;
     const next = this.#next;
-    let scratch = this.#scratch;
-    for (const keySlot of order) {
+    const compareEntries = (a: number, b: number) =>
+      (rowIds[a] ?? 0) - (rowIds[b] ?? 0) || (tombstones[a] ?? 0) - (tombstones[b] ?? 0);
+    let scratch: Int32Array = NO_ENTRIES;
+    for (let slot = 0; slot < order.length;) {
+      yield* checkpoint(check);
+      const limit = Math.min(slot + 128, order.length);
+      slot = this.#emitSingles(order, slot, limit, bound, visit, keep);
+      if (slot === limit) continue;
+      const keySlot = order[slot++] ?? 0;
       const start = starts[keySlot] ?? 0;
       const end = ends[keySlot] ?? 0;
-      // One entry: the common case, no gathering.
       const head = this.#head[keySlot] ?? -1;
-      if (head >= 0 && (next[head] ?? -1) < 0) {
-        const rowId = rowIds[head] ?? 0;
-        const tombstone = tombstones[head] === 1;
-        if ((seqs[head] ?? 0) <= bound && (keep === null || keep(rowId, tombstone)))
-          visit(arena, start, end, rowId, tombstone);
-        continue;
-      }
+      if (scratch.length === 0) scratch = new Int32Array(16);
       let count = 0;
+      let walked = 0;
+      let forward = true;
+      let reverse = true;
       for (let entry = head; entry >= 0; entry = next[entry] ?? -1) {
+        if ((walked++ & 127) === 0) yield* checkpoint(check);
         if ((seqs[entry] ?? 0) > bound) continue;
         const rowId = rowIds[entry] ?? 0;
         const tombstone = tombstones[entry] === 1;
         if (keep !== null && !keep(rowId, tombstone)) continue;
         if (count >= scratch.length) {
-          const grown = new Int32Array(scratch.length * 2);
+          const grown: Int32Array = new Int32Array(scratch.length * 2);
           grown.set(scratch);
-          scratch = this.#scratch = grown;
+          scratch = grown;
         }
-        // Insertion by (row id, put before tombstone): chains are short.
-        let at = count++;
-        while (at > 0) {
-          const prior = scratch[at - 1] ?? 0;
-          const priorRow = rowIds[prior] ?? 0;
-          if (
-            priorRow < rowId ||
-            (priorRow === rowId && (tombstones[prior] ?? 0) <= (tombstone ? 1 : 0))
-          )
-            break;
-          scratch[at] = prior;
-          at -= 1;
+        if (count > 0) {
+          const comparison = compareEntries(scratch[count - 1] ?? 0, entry);
+          forward &&= comparison <= 0;
+          reverse &&= comparison >= 0;
         }
-        scratch[at] = entry;
+        scratch[count++] = entry;
       }
-      for (let k = 0; k < count; k++) {
-        const entry = scratch[k] ?? 0;
-        visit(arena, start, end, rowIds[entry] ?? 0, tombstones[entry] === 1);
+      if (!forward && !reverse) yield* sortIndices(scratch, count, compareEntries, check);
+      for (let from = 0; from < count; from += 128) {
+        yield* checkpoint(check);
+        emitEntries(
+          scratch,
+          from,
+          Math.min(from + 128, count),
+          reverse,
+          count,
+          rowIds,
+          tombstones,
+          arena,
+          start,
+          end,
+          visit,
+        );
       }
     }
+  }
+
+  /** Ordinary bounded loop: row emission stays outside the generator's suspension state. */
+  #emitSingles(
+    order: Int32Array,
+    from: number,
+    to: number,
+    bound: number,
+    visit: DeltaVisitor,
+    keep: KeepEntry | null,
+  ): number {
+    const arena = this.#arena,
+      starts = this.#keyStart,
+      ends = this.#keyEnd,
+      heads = this.#head,
+      next = this.#next,
+      seqs = this.#seqs,
+      rowIds = this.#rowIds,
+      tombstones = this.#tombstones;
+    for (let at = from; at < to; at++) {
+      const slot = order[at] ?? 0,
+        head = heads[slot] ?? -1;
+      if (head < 0) continue;
+      if ((next[head] ?? -1) >= 0) return at;
+      if ((seqs[head] ?? 0) > bound) continue;
+      const rowId = rowIds[head] ?? 0,
+        tombstone = tombstones[head] === 1;
+      if (keep === null || keep(rowId, tombstone))
+        visit(arena, starts[slot] ?? 0, ends[slot] ?? 0, rowId, tombstone);
+    }
+    return to;
   }
 
   /**
@@ -351,9 +419,6 @@ export class KeyDelta {
 
   #range: { readonly min: Uint8Array; readonly max: Uint8Array } | null = null;
   #rangeKeys = 0;
-
-  /** Scratch for one key's entries in `forEachSorted`. */
-  #scratch = new Int32Array(16);
 
   /**
    * Key slots in key-byte order, each with its entries in (row id, put before tombstone) order,
@@ -388,5 +453,81 @@ export class KeyDelta {
       out.push({ key: this.keyBytes(keySlot), entries });
     }
     return out;
+  }
+}
+
+/** Fill one bounded key-order batch without a suspension inside its hot loop. */
+function fillKeyOrder(
+  order: Int32Array,
+  from: number,
+  to: number,
+  ascending: boolean,
+  compare: (a: number, b: number) => number,
+): boolean {
+  for (let k = from; k < to; k++) {
+    order[k] = k;
+    if (ascending && k > 0 && compare(k - 1, k) > 0) ascending = false;
+  }
+  return ascending;
+}
+
+/** Emit one bounded chain batch; direction handles newest-first chains without sorting. */
+function emitEntries(
+  entries: Int32Array,
+  from: number,
+  to: number,
+  reverse: boolean,
+  count: number,
+  rowIds: Float64Array,
+  tombstones: Uint8Array,
+  arena: Uint8Array,
+  start: number,
+  end: number,
+  visit: DeltaVisitor,
+): void {
+  let at = reverse ? count - 1 - from : from;
+  const step = reverse ? -1 : 1;
+  for (let k = from; k < to; k++, at += step) {
+    const entry = entries[at] ?? 0;
+    visit(arena, start, end, rowIds[entry] ?? 0, tombstones[entry] === 1);
+  }
+}
+
+/** A checkpoint never starts a clock; nested traversals spend the same worker task budget. */
+function* checkpoint(check: (() => void) | null): Generator<Promise<void>, void, unknown> {
+  check?.();
+  if (taskClock.due()) {
+    yield yieldTask();
+    check?.();
+  }
+}
+
+/** In-place heapsort, with no opaque native sort interval or auxiliary array. */
+function* sortIndices(
+  order: Int32Array,
+  count: number,
+  compare: (a: number, b: number) => number,
+  check: (() => void) | null,
+): Generator<Promise<void>, void, unknown> {
+  let operations = 0;
+  for (let start = count >>> 1, end = count; end > 1;) {
+    if (start > 0) start--;
+    else {
+      end--;
+      const first = order[0] ?? 0;
+      order[0] = order[end] ?? 0;
+      order[end] = first;
+    }
+    const value = order[start] ?? 0;
+    let root = start;
+    for (let child = root * 2 + 1; child < end; child = root * 2 + 1) {
+      if ((operations++ & 127) === 0) yield* checkpoint(check);
+      if (child + 1 < end && compare(order[child] ?? 0, order[child + 1] ?? 0) < 0) child++;
+      if (compare(value, order[child] ?? 0) >= 0) break;
+      order[root] = order[child] ?? 0;
+      root = child;
+    }
+    order[root] = value;
+    if ((operations++ & 127) === 0) yield* checkpoint(check);
   }
 }

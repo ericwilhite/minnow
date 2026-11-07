@@ -4,6 +4,7 @@
  * node --expose-gc scripts/write-run-bench.mts --baseline ~/.cache/old/dist --mode delta --gc-before
  * Modes: delta (sorted delta -> run), bloom (hash pairs -> stored
  * filter), encoder (ordered entries -> run). --keys 65536 --iterations 32 --rounds 6 defaults.
+ * --hot-key sends every row to one non-unique key; use --iterations 1 for the quadratic parent.
  * Inputs and optional setup GC are outside the clock. One discarded warmup pair precedes >=5
  * measured AB/BA pairs. Exact bytes/metadata are compared before timing; checksums keep results
  * live during timing. No storage, log, SQL, query or durability cost is claimed here. Use the
@@ -31,6 +32,7 @@ const baseline = option("baseline", "");
 if (!baseline) throw new Error("--baseline must name the parent's built core dist");
 const mode = option("mode", "delta");
 if (!["delta", "bloom", "encoder"].includes(mode)) throw new Error("Invalid --mode");
+const hotKey = args.includes("--hot-key");
 const keys = integer("keys", 65_536);
 const iterations = integer("iterations", 32);
 const rounds = integer("rounds", 6, 5);
@@ -51,7 +53,7 @@ const builds = {} as Record<Label, Build>;
 // --key-bytes exercises longer compound/text keys without changing the timed operations.
 const input = Array.from({ length: keys }, (_, k) => {
   const key = new Uint8Array(keyBytes + 6).fill(0x61);
-  new DataView(key.buffer).setUint32(3, k, false);
+  new DataView(key.buffer).setUint32(3, hotKey ? 0 : k, false);
   return key;
 });
 const hashes = new Uint32Array(keys * 2);
@@ -77,11 +79,12 @@ for (const label of ["baseline", "candidate"] as const) {
 function encode(build: Build) {
   if (mode === "bloom") return build.runs.encodeBloom(hashes, hashes.length);
   const builder = new build.runs.RunBuilder();
-  if (mode === "delta")
-    build.delta.forEachSorted(1, (arena, start, end, rowId, tombstone) => {
+  if (mode === "delta") {
+    const pending = build.delta.forEachSorted(1, (arena, start, end, rowId, tombstone) => {
       builder.addRange(arena, start, end, rowId, tombstone);
     });
-  else
+    if (pending instanceof Promise) return pending.then(() => builder.finish());
+  } else
     for (let k = 0; k < input.length; k++) {
       const key = input[k];
       if (!key) throw new Error("Missing input");
@@ -89,7 +92,7 @@ function encode(build: Build) {
     }
   return builder.finish();
 }
-deepStrictEqual(encode(builds.candidate), encode(builds.baseline));
+deepStrictEqual(await encode(builds.candidate), await encode(builds.baseline));
 interface Result {
   cpuMs: number;
   wallMs: number;
@@ -105,7 +108,8 @@ for (let round = -1; round < rounds; round++) {
     const wall = performance.now();
     const cpu = process.cpuUsage();
     for (let k = 0; k < iterations; k++) {
-      const run = encode(builds[label]);
+      const pending = encode(builds[label]);
+      const run = pending instanceof Promise ? await pending : pending;
       if (run instanceof Uint8Array) checksum += run.length + (run[5] ?? 0);
       else if (run) checksum += run.entryCount + run.parts.reduce((n, part) => n + part.length, 0);
     }
@@ -153,6 +157,7 @@ console.log(
     mode,
     keys,
     keyBytes,
+    hotKey,
     iterations,
     rounds,
     gcBefore,

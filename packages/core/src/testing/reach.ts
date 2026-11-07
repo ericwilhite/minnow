@@ -1852,3 +1852,15 @@ export const WRITE_METADATA_PRESSURE_STATES = [
   "merge completed",
   "durable reopen",
 ] as const;
+
+/** R23.5 / key-index chain ordering: a popular non-unique key can fill the whole memtable. */
+export const WRITE_HOT_KEY_STATES = [
+  "ascending",
+  "descending",
+  "mixed",
+  "row-id ties",
+  "full memtable chain",
+  "filtered chain",
+  "task yields",
+  "short traversals accumulate",
+] as const;
