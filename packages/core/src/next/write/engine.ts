@@ -1603,7 +1603,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     for (const table of root.tables) {
       const state = this.#tables.get(table.tableId);
       if (state === undefined) continue;
-      if (state.root !== null) state.root = table;
+      // Construction is provisional; only this post-publication adoption installs it.
+      state.root = table;
       state.flushedThroughLsn = Math.max(state.flushedThroughLsn, table.flushedThroughLsn);
     }
     this.maintenance.buildsSettled += this.#settles.get(root) ?? 0;
@@ -3293,12 +3294,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
         const last = state.view.memtables[state.view.memtables.length - 1];
         if (quietTable(state)) {
           this.maintenance.recycleQuietTables += 1;
-          state.flushedThroughLsn = Math.max(state.flushedThroughLsn, cut);
-          // An index built on it before the cut has no entries: its root gets the empty index.
+          // This checkpoint belongs to the provisional recycle root. Other flushes
+          // must not mistake it for a published checkpoint and settle an index build.
           const atCut = this.#catalogAt(cut).table(state.tableId);
-          if (state.root !== null && state.root.flushedThroughLsn < cut && atCut !== undefined)
+          if (atCut !== undefined)
             quiet.set(state.tableId, {
-              ...withCatalogIndexes(state.root, atCut, true),
+              ...(state.root === null
+                ? emptyTableRoot(atCut, state.nextRowId, cut)
+                : withCatalogIndexes(state.root, atCut, true)),
               flushedThroughLsn: cut,
             });
           continue;
@@ -3328,16 +3331,29 @@ export class WritePathImpl implements WritePath, EngineHooks {
           state.flushedThroughLsn < cut,
       );
       const unbuilt = [...this.#pendingIndexes.values()].some(
-        (pending) => (this.#tables.get(pending.tableId)?.flushedThroughLsn ?? 0) < pending.lsn,
+        (pending) =>
+          (quiet.get(pending.tableId)?.flushedThroughLsn ??
+            this.#tables.get(pending.tableId)?.flushedThroughLsn ??
+            0) < pending.lsn,
       );
       if (unbuilt || uncovered) {
         this.maintenance.recyclesAbandoned += 1;
         return;
       }
-      for (const tableId of [...quiet.keys()]) {
+      for (const [tableId, prepared] of quiet) {
         const state = this.#tables.get(tableId);
-        if (state?.root == null || state.root.flushedThroughLsn >= cut) quiet.delete(tableId);
-        else quiet.set(tableId, { ...state.root, flushedThroughLsn: cut });
+        const atCut = this.#catalogAt(cut).table(tableId);
+        if (
+          state === undefined ||
+          atCut === undefined ||
+          (state.root !== null && state.root.flushedThroughLsn >= cut)
+        )
+          quiet.delete(tableId);
+        else
+          quiet.set(tableId, {
+            ...withCatalogIndexes(state.root ?? prepared, atCut, true),
+            flushedThroughLsn: cut,
+          });
       }
       writer = this.#space.beginWrite("log recycle");
       const salt = (crypto.getRandomValues(new Uint32Array(1))[0] ?? 1) >>> 0 || 1;
@@ -3867,12 +3883,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
         continue;
       }
       // First root to include the table: an empty group directory (nothing written).
+      // It stays provisional here; #adoptTableRoots installs it after publication.
       const root: TableRoot = emptyTableRoot(
         def,
         state.nextRowId,
         Math.max(state.flushedThroughLsn, settles ?? 0),
       );
-      state.root = root;
       tables.push(root);
     }
     // The root agrees with its catalog (format/manifest.ts "Checkpoints and replay"): every table

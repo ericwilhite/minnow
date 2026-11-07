@@ -1434,3 +1434,7 @@ owned vectors directly; it does not make unsliced integration copies.
 A flush revalidates its captured schema and index identifiers under the publication lock.
 If concurrent DDL changed them while it encoded groups, it aborts the provisional writer
 and retries against the current catalog; the published root must carry its catalog’s indexes.
+
+Quiet-table checkpoints and first table roots stay provisional while a publication is prepared.
+Only adoption of the durable root installs them, so another flush cannot settle an index build
+from a checkpoint the recycler has not published.

@@ -50,6 +50,7 @@ const REACH = [
   "released",
   "merge",
   "recycle",
+  "recycle-quiet-table",
   "idle-publish",
   "drop-table",
   "drop-index",
@@ -320,6 +321,7 @@ describe("extent deltas (ruling R25)", () => {
         }
         if (path.maintenance.merges > 0) reach.reach("merge");
         if (path.maintenance.recycles > 0) reach.reach("recycle");
+        if (path.maintenance.recycleQuietTables > 0) reach.reach("recycle-quiet-table");
         if (path.maintenance.idlePublishes > 0) reach.reach("idle-publish");
         if (path.maintenance.flushesAbandoned > path.maintenance.flushesCatalogChanged)
           reach.reach("flush-of-dropped-table");
