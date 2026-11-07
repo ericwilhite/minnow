@@ -2,7 +2,7 @@
  * The owner server end to end in process: protocol client ⇄ MessageChannel ⇄ server ⇄ composed
  * engine ⇄ stand-ins for the write path, executor and planner (testing/owner-standins.ts).
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { SessionLostError } from "../errors.js";
 import {
   CancelledError,
@@ -498,19 +498,37 @@ describe("connections ending", () => {
   it("rolls back and releases a client whose liveness lock was released", async () => {
     const liveness = new Map<string, AbortController>();
     const { connect, writePath, server } = harness({ liveness });
-    const client = await connect();
-    await seed(client, 1);
-    await client.begin(1);
-    expect(writePath.writerBusy).toBe(true);
-    // Not watched until the client declares its lock held.
-    expect(liveness.size).toBe(0);
-    client.liveness(true);
-    await flushTasks();
-    expect(liveness.size).toBe(1);
-    [...liveness.values()][0]?.abort();
-    await flushTasks();
-    expect(writePath.writerBusy).toBe(false);
-    expect(server.stats.connections).toBe(0);
+    try {
+      const client = await connect();
+      await seed(client, 1);
+      await client.begin(1);
+      expect(writePath.writerBusy).toBe(true);
+      // Freeze timeout progress only after transaction setup; native MessagePort tasks still run.
+      vi.useFakeTimers({
+        toFake: ["setTimeout", "clearTimeout"],
+        shouldClearNativeTimers: true,
+      });
+      // Not watched until the client declares its lock held.
+      expect(liveness.size).toBe(0);
+      client.liveness(true);
+      // MessagePort delivery is independent of timers. The next reply on this FIFO channel
+      // proves the earlier declaration was handled, even when the host delays message tasks.
+      await client.query("SELECT 1");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(liveness.size).toBe(1);
+      expect(server.stats.connections).toBe(1);
+      expect(writePath.writerBusy).toBe(true);
+      const watch = [...liveness.values()][0];
+      expect(watch).toBeDefined();
+      watch?.abort();
+      // Abort dispatch and rollback need no elapsed-time budget.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(writePath.writerBusy).toBe(false);
+      expect(server.stats.connections).toBe(0);
+    } finally {
+      server.stepDown("closing");
+      vi.useRealTimers();
+    }
   });
 
   it("ends an older generation when the client reconnects, and steps down cleanly", async () => {
