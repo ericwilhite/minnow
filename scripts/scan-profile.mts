@@ -16,13 +16,18 @@ interface Profile {
   timeDeltas: number[];
 }
 
-function category(f: Frame): string | null {
+function category(f: Frame, parent?: Frame): string | null {
   const n = f.functionName,
     u = f.url;
   if (n === "(garbage collector)") return "GC";
   if (["(idle)", "(program)", "(root)"].includes(n)) return "idle/program/unattributed";
   if (!u && n === "read") return "native read: CPU/wait inseparable";
-  if (!u && n === "postMessage") return "structured clone / transfer";
+  if (!u && n === "postMessage")
+    return /\/(task|exec\/pipeline)\.ts/u.test(parent?.url ?? "")
+      ? "task clock / pacing"
+      : "structured clone / transfer";
+  if (u.includes("/next/task.ts") && !["sortInSlices", "sift", "swap", "item"].includes(n))
+    return "task clock / pacing";
   if (u.includes("/owner-frames.ts"))
     return ["flatBytes", "validityBytes", "textFlattenBytes"].includes(n)
       ? "bench frame sizing"
@@ -39,6 +44,8 @@ function category(f: Frame): string | null {
       ? "pushdown / shape and descriptor work"
       : "table-scan batch / column overhead";
   if (u.includes("/page/reader.ts")) {
+    if (["#together", "compare", "#loadCached"].includes(n))
+      return "pushdown / shape and descriptor work";
     if (
       [
         "pagesForRows",
@@ -85,7 +92,7 @@ for (const path of process.argv.slice(2)) {
       bucket: string | null = null;
     while (at !== undefined && bucket === null) {
       const n = nodes.get(at);
-      if (n) bucket = category(n.callFrame);
+      if (n) bucket = category(n.callFrame, nodes.get(parents.get(at) ?? -1)?.callFrame);
       at = parents.get(at);
     }
     bucket ??= "idle/program/unattributed";
