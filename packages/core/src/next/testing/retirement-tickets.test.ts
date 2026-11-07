@@ -14,6 +14,7 @@ import {
   saveNativeList,
   disposeSnapshot,
   reconstructMap,
+  reconstructState,
 } from "../storage/extent-snapshot.js";
 import { PageCache } from "../storage/page-cache.js";
 import { MemoryBackend } from "../storage/memory-store.js";
@@ -225,14 +226,16 @@ it("reconstructs previous-only ownership with one arena admission, without a ret
       40_000 * 4096,
     );
     const allocation = vi.spyOn(f.budget, "allocate");
-    const map = await reconstructMap(
-      f.journal,
-      f.cache,
-      current,
-      previous,
-      40_000 * 4096,
-      f.budget,
-    );
+    const state = await reconstructState(
+        f.journal,
+        f.cache,
+        current,
+        previous,
+        40_000 * 4096,
+        f.budget,
+      ),
+      map = state.map;
+    expect(state.previousOnlyBytes).toBe(20_000 * 4096);
     try {
       expect(map.freeBytes).toBe(0);
       expect(map.untrackedFreeBytes).toBe(0);

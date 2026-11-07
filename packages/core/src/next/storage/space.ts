@@ -50,7 +50,7 @@ import { MetadataJournal, MetadataWorkspace } from "./metadata-journal.js";
 import {
   saveNativeList,
   saveExtentInput,
-  reconstructMap,
+  reconstructState,
   disposeSnapshot,
 } from "./extent-snapshot.js";
 import { RetirementTickets } from "./retirement-tickets.js";
@@ -210,7 +210,7 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
       cache,
       options,
     );
-    map = await reconstructMap(
+    const reconstruction = await reconstructState(
       journal,
       cache,
       current,
@@ -219,6 +219,7 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
       options.budget,
       options,
     );
+    map = reconstruction.map;
     workspace.transfer(options.registerCache);
     map.transfer(options.registerCache);
     const space = new Space(
@@ -241,7 +242,7 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
     // Semantic verification precedes every release/truncate. A structurally valid but incomplete
     // list must not destroy the very extent whose full walk proves it incomplete.
     if (options.verifyAtOpen === true && options.walk !== undefined) await space.audit();
-    await space.initialize(options);
+    await space.initialize(reconstruction.previousOnlyBytes);
     const pending = pauseIfDue(options);
     if (pending !== undefined) await pending;
     return space;
@@ -333,21 +334,16 @@ class Space implements ExtentSpace {
     this.#previousSnapshot = previousSnapshot;
   }
 
-  async initialize(work: TaskWork): Promise<void> {
-    await this.#metadata.run(() =>
-      this.#cache.withReadSlab(async (slab) => {
-        const bytes = await validateRetirements(
-          this.journal,
-          this.#previousSnapshot,
-          this.#currentSnapshot,
-          null,
-          { slab },
-          work,
-        );
-        await this.#tickets.prepare(0, this.#previousSnapshot, this.#currentSnapshot, bytes);
-        this.#tickets.commit();
-      }),
-    );
+  async initialize(previousOnlyBytes: number): Promise<void> {
+    await this.#metadata.run(async () => {
+      await this.#tickets.prepare(
+        0,
+        this.#previousSnapshot,
+        this.#currentSnapshot,
+        previousOnlyBytes,
+      );
+      this.#tickets.commit();
+    });
     await this.mutate((guard) => this.#releaseTail(guard));
   }
 

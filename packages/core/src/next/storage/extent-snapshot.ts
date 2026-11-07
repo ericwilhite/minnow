@@ -7,13 +7,7 @@ import { DATA_ALIGN, StoreCorruptionError } from "./contract.js";
 import type { ByteBudget, ExtentRef } from "./extents.js";
 import type { ExtentList } from "./extent-list.js";
 import { MetadataJournal } from "./metadata-journal.js";
-import {
-  ExtentPairWriter,
-  openPairs,
-  mergeExtents,
-  sortExtents,
-  spoolExtents,
-} from "./metadata-extents.js";
+import { ExtentPairWriter, openPairs, sortExtents, spoolExtents } from "./metadata-extents.js";
 import { pairPhase, type MetadataWork } from "./metadata-work.js";
 import { NativeExtentList, NATIVE_LIST_WINDOW_BYTES } from "./native-extent-list.js";
 import { PageCache } from "./page-cache.js";
@@ -33,46 +27,12 @@ export async function saveNativeList(
   work?: TaskWork,
   io?: MetadataWork,
 ): Promise<number> {
-  let payload = 0,
-    physical = 0,
+  if (list.length === 0) return saveExtentInput(journal, [], true, dataLength, work, io);
+  let physical = 0,
     orderedPhysical = 0,
     result = 0,
     failed = false;
   try {
-    const payloadPhase = async (slab: Uint8Array) => {
-      const cursor = new NativeExtentList(
-        list,
-        cache,
-        slab.subarray(0, NATIVE_LIST_WINDOW_BYTES),
-        dataLength,
-        work,
-      );
-      const writer = await journal.writer(1),
-        output = new ExtentPairWriter(writer, true);
-      try {
-        for (;;) {
-          const pending = cursor.next();
-          if (!(typeof pending === "boolean" ? pending : await pending)) break;
-          const writing = output.append(cursor.offset, cursor.length, work);
-          if (writing !== undefined) await writing;
-        }
-        payload = await writer.finish();
-        await check(work);
-      } catch (error) {
-        await writer.abort().catch(() => undefined);
-        throw error;
-      } finally {
-        cursor.close();
-      }
-    };
-    await journal.workspace.run("spool", () =>
-      io === undefined ? cache.withReadSlab(payloadPhase) : payloadPhase(io.slab),
-    );
-    if (list.length === 0) {
-      result = payload;
-      payload = 0;
-      return result;
-    }
     await journal.workspace.run("spool", async () => {
       physical = await spoolExtents(
         journal,
@@ -83,26 +43,67 @@ export async function saveNativeList(
         work,
       );
     });
-    await pairPhase(journal, io, "merge", async (slots) => {
-      orderedPhysical = await sortExtents(journal, physical, "exact", work, slots);
-      // A payload must not name its own list-page allocation, even with exactly equal coordinates.
-      result = await mergeExtents(
-        journal,
-        payload,
-        orderedPhysical,
-        "union",
-        work,
-        "refuse",
-        slots,
-      );
-    });
+    const compose = (scope: MetadataWork) =>
+      pairPhase(journal, scope, "merge", async (slots) => {
+        orderedPhysical = await sortExtents(journal, physical, "exact", work, slots);
+        const native = new NativeExtentList(
+          list,
+          cache,
+          scope.slab.subarray(0, NATIVE_LIST_WINDOW_BYTES),
+          dataLength,
+          work,
+        );
+        const pages = await openPairs(journal, orderedPhysical, slots.left, true);
+        let writer: Awaited<ReturnType<MetadataJournal["writer"]>> | null = null,
+          composeFailed = false;
+        try {
+          writer = await journal.writer(slots.output);
+          const output = new ExtentPairWriter(writer, true, "refuse");
+          let left = await native.next(),
+            right = await pages.next(work),
+            steps = 0;
+          while (left || right) {
+            if (steps++ % 128 === 0) await check(work);
+            if (left && right && native.offset === pages.offset)
+              throw new StoreCorruptionError(
+                "Repeated private extent pair: payload names its own list-page allocation",
+              );
+            const takeNative = left && (!right || native.offset < pages.offset);
+            const writing = output.append(
+              takeNative ? native.offset : pages.offset,
+              takeNative ? native.length : pages.length,
+              work,
+            );
+            if (writing !== undefined) await writing;
+            if (takeNative) {
+              const pending = native.next();
+              left = typeof pending === "boolean" ? pending : await pending;
+            } else {
+              const pending = pages.next(work);
+              right = typeof pending === "boolean" ? pending : await pending;
+            }
+          }
+          result = await writer.finish();
+          writer = null;
+          await check(work);
+        } catch (error) {
+          composeFailed = true;
+          await writer?.abort().catch(() => undefined);
+          throw error;
+        } finally {
+          native.close();
+          await closePairs(pages, null, composeFailed);
+        }
+      });
+    if (io === undefined) await cache.withReadSlab((slab) => compose({ slab }));
+    else await compose(io);
     return result;
   } catch (error) {
     failed = true;
     if (result !== 0) await disposeSnapshot(journal, result).catch(() => undefined);
     throw error;
   } finally {
-    await disposeAll(journal, [payload, physical, orderedPhysical], failed);
+    await disposeAll(journal, [physical, orderedPhysical], failed);
   }
 }
 
@@ -187,6 +188,18 @@ export async function reconstructMap(
   budget: ByteBudget,
   work?: TaskWork,
 ): Promise<BoundedFreeSpaceMap> {
+  return (await reconstructState(journal, cache, current, previous, dataLength, budget, work)).map;
+}
+
+export async function reconstructState(
+  journal: MetadataJournal,
+  cache: PageCache,
+  current: number,
+  previous: number,
+  dataLength: number,
+  budget: ByteBudget,
+  work?: TaskWork,
+): Promise<{ map: BoundedFreeSpaceMap; previousOnlyBytes: number }> {
   const owned = { map: null as BoundedFreeSpaceMap | null };
   try {
     return await journal.workspace.run("merge", () =>
@@ -205,18 +218,26 @@ export async function reconstructMap(
             right = await b.next(work),
             cursor = 0,
             gaps = 0,
-            steps = 0;
+            steps = 0,
+            previousOnlyBytes = 0;
           while (left || right) {
             if (steps++ % 128 === 0) await check(work);
             let offset: number, length: number;
             if (left && (!right || a.offset < b.offset)) {
               offset = a.offset;
               length = a.length;
-              left = await a.next(work);
+              {
+                const next = a.next(work);
+                left = typeof next === "boolean" ? next : await next;
+              }
             } else if (right && (!left || b.offset < a.offset)) {
               offset = b.offset;
               length = b.length;
-              right = await b.next(work);
+              previousOnlyBytes += Math.ceil(length / DATA_ALIGN) * DATA_ALIGN;
+              {
+                const next = b.next(work);
+                right = typeof next === "boolean" ? next : await next;
+              }
             } else {
               if (a.length !== b.length)
                 throw new StoreCorruptionError(
@@ -224,8 +245,14 @@ export async function reconstructMap(
                 );
               offset = a.offset;
               length = a.length;
-              left = await a.next(work);
-              right = await b.next(work);
+              {
+                const next = a.next(work);
+                left = typeof next === "boolean" ? next : await next;
+              }
+              {
+                const next = b.next(work);
+                right = typeof next === "boolean" ? next : await next;
+              }
             }
             if (offset < cursor || offset + length > dataLength)
               throw new StoreCorruptionError("Kept roots overlap or extend past data length");
@@ -242,7 +269,7 @@ export async function reconstructMap(
           owned.map = BoundedFreeSpaceMap.create(DATA_ALIGN, runArenaBytes(gaps), budget);
           await owned.map.copyFrom(temporary, work);
           await check(work);
-          return owned.map;
+          return { map: owned.map, previousOnlyBytes };
         } catch (error) {
           failed = true;
           throw error;

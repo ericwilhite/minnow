@@ -2083,6 +2083,10 @@ No operation entry or resolved read restarts it. Bounded loops check the deadlin
 task when due, and check cancellation on resume. Delta sorting uses an in-place sliced heapsort. Normal listed-root startup decodes both payload lists incrementally into private
 immutable pair chains, orders the physical list-page allocations with bounded
 external sorting, and merges the chains directly into the free-map arena.
+Native payload pairs merge directly with the ordered physical page stream into the saved chain;
+they are not first written to another payload chain. The allocator union also counts the
+previous-only bytes for its initial ticket, so initialization does not rescan both chains.
+Pair iteration stays synchronous between native reads and shared-clock slice checks.
 Payload work is O(extents); physical page ordering is O(list pages × log(list pages)).
 There are no extent Maps or resident retirement index. Native list pages remain
 protected until their disk-derived ticket finishes. Every release batch has at
