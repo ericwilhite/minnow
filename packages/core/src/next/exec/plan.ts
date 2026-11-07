@@ -8,7 +8,8 @@ import type { ByteCharge } from "../vector/varlen.js";
 import { samePhysicalType, type PhysicalType } from "../types.js";
 import { BATCH_ROWS, type Batch, type Selection, type Vector } from "../vector/vector.js";
 import { int64At } from "../vector/int64.js";
-import { AggregateOperator } from "./agg/aggregate.js";
+import { AggregateOperator, type AggregateOptions } from "./agg/aggregate.js";
+import { groupTopNShape, type GroupTopNSpec } from "./agg/group-top-n.js";
 import {
   isOrderedSet,
   orderedSetArguments,
@@ -377,6 +378,7 @@ export interface CompileOptions {
   readonly lateSort?: boolean;
   readonly keyOrder?: boolean;
   readonly lateFetchOnce?: boolean;
+  readonly groupTopN?: boolean;
   /** False retains the original window inputs for component/query benchmark controls. */
   readonly windowInputDeduplication?: boolean;
   /** Parent control for literal-amount gather benchmarks. */
@@ -421,6 +423,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   const ids = new Set<number>();
   // A terminal names-only projection forwards export ownership while retaining profile counts.
   const exportOwners = new WeakMap<Operator, ResultSink>();
+  const groupTops = new Map<number, GroupTopNSpec>();
   // SQL SELECT * may retain an identity projection for output names. It neither retains
   // source batches nor re-reads them; computed/reordered projections and other consumers stop here.
   let terminalInput = plan.root;
@@ -750,11 +753,14 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               },
             );
         }
+        const top = groupTops.get(rel.id);
+        const outputOptions: AggregateOptions = top === undefined ? {} : { outputTopN: top };
         const minimum = measureCompilerBuffers(
           compilation,
           input,
           BATCH_ROWS,
-          (context, grant) => new AggregateOperator(aggregate, context, grant, DISCARD),
+          (context, grant) =>
+            new AggregateOperator(aggregate, context, grant, DISCARD, outputOptions),
           (operator) => operator.abort(undefined),
         );
         fixed(rel, Math.max(4096, minimum));
@@ -768,6 +774,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             (context, grant) =>
               new AggregateOperator(aggregate, context, grant, counted(runtime, rel, downstream), {
                 signal: runtime.signal,
+                ...outputOptions,
               }),
             (operator) => {
               runtime.onAbort((reason) => operator.abort(reason));
@@ -777,6 +784,10 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       }
       case "sort":
       case "window": {
+        if (rel.op === "sort" && options.groupTopN !== false) {
+          const shape = groupTopNShape(rel);
+          if (shape) groupTops.set(shape.aggregate.id, shape.spec);
+        }
         const late =
           rel.op === "sort" && options.lateSort !== false && plan.parameters.length === 0
             ? lateSortShape(rel)

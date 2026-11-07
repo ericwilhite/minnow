@@ -1530,7 +1530,8 @@ The full interface contract includes the following (DML remains unimplemented by
 
 - `aggregate.ts`: the `aggregate` operator. Each batch maps its rows to dense group ids, then
   every aggregate (after its FILTER and DISTINCT) updates its state. `finish` emits groups in
-  first-seen order in batches of at most 2,048 groups and about 1 MiB, each charged to the grant
+  first-seen order unless the eligible output top-N below retains only winners. Batches hold
+  at most 2,048 groups and about 1 MiB, each charged to the grant
   before it is built and released when downstream is done with it; it yields to the event loop
   with a task every 4 ms, checking the deadline per group inside AVG(NUMERIC)'s divisions and
   resuming mid-batch (it prepares at most what the next batch holds, charged by `bigintBytes`,
@@ -1539,6 +1540,18 @@ The full interface contract includes the following (DML remains unimplemented by
   after backpressure, R23), it rejects with the reason. Scratch that outlives a slice belongs to
   the operator; module-level scratch is used only within one synchronous call (R23). Without
   GROUP BY there is one row even over no input.
+- `group-top-n.ts`: eligible ORDER BY/LIMIT plans select group ids before materializing all
+  aggregate results. A charged heap holds at most LIMIT + OFFSET ids and their rank keys; the
+  existing sorter orders the winners and applies OFFSET. The first shape has one int32 grouping
+  key, COUNT/key ordering including that unique grouping key, constant positive LIMIT + OFFSET
+  up to 2,048, and only COUNT or float64 SUM results. Direct projections are allowed; HAVING,
+  computed projections, other finalizers, parameter bounds and WITH TIES keep the ordinary path.
+  All input rows still update every aggregate, preserving transition errors. Rank scans use the
+  shared task clock and release temporary vectors before yielding; cancellation closes the heap.
+  `createExecutor({ groupTopN: false })` supplies the benchmark control. This does not make hash
+  aggregation spillable or eliminate its group table. `scripts/next-agg-selection-bench.mts`
+  isolates selection and output; `next-executor-bench.mts --whole-compare group-top-n`
+  compares the real stored whole query. CPU captures belong in the caller's cache directory.
 - `groups.ts`: group ids from open-addressing tables chosen by key type — interleaved
   (key, id) tables for 32-bit and 64-bit integers (int8 by its two words, whatever its
   representation: no BigInt, no Map), an f64 table for floats, xxHash32 over bytes for text (a
