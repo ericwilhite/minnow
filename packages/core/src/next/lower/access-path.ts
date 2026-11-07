@@ -266,6 +266,8 @@ export function accessPath(
     const lower = position === undefined ? undefined : facts.lower.get(position);
     const upper = position === undefined ? undefined : facts.upper.get(position);
     if (prefix.length === 0 && lower === undefined && upper === undefined) continue;
+    // A range is costed against the scan: the choice depends on the statistics.
+    builder.dependsOnStatistics();
     if (next !== undefined && (lower !== undefined || upper !== undefined)) {
       fraction *= rangeFraction(next, lower, upper, builder, table.id);
       if (lower !== undefined) used.add(lower.conjunct);

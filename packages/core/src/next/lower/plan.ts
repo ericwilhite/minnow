@@ -48,6 +48,12 @@ export class PlanBuilder {
   #nextSource = 1;
   readonly reads = new Set<number>();
   readonly rowCounts = new Map<number, number>();
+  /**
+   * Whether a decision about the plan's shape read statistics (an index range costed against a
+   * scan, a join order or build side). False: the shape is the same whatever the counts, and the
+   * statement's statistics basis is empty, so the owner skips `statisticsDrifted` on a hit.
+   */
+  statisticsDependent = false;
   /** Types of the slots after the placeholders, in slot order. */
   readonly slots: PhysicalType[] = [];
   clockSlot: number | null = null;
@@ -176,6 +182,10 @@ export class PlanBuilder {
   /** Estimated live rows of a table (planning statistics; 1,000 when unknown). */
   rowsOf(tableId: number): number {
     return this.statistics.table(tableId)?.rowCount ?? DEFAULT_TABLE_ROWS;
+  }
+  /** A shape decision consulted the statistics (see `statisticsDependent`). */
+  dependsOnStatistics(): void {
+    this.statisticsDependent = true;
   }
   read(table: TableDef): void {
     this.reads.add(table.id);

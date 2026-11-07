@@ -1542,8 +1542,18 @@ include it. Validation checks all normalized words, row multiplicity and stable 
   with result descriptors, read and write sets and its statistics basis; a catalog change; or a
   transaction or utility command. `lowerer.ts` lists the front-end passes that are kept and the
   code that lowering replaces.
-- Pure and synchronous; the owner caches by (text, catalog version) and re-lowers when
-  `statisticsDrifted` says the data moved.
+- Pure and synchronous; the owner caches by (text, catalog version, `parameterTypes` when sent)
+  and re-lowers when `statisticsDrifted` says the data moved. A plan whose shape no statistics
+  decided (a unique-key lookup, a lone scan) has an empty `basis`, so its hit skips the check.
+- Literal auto-parameterization (`parameterize.ts`): `parameterize(text)` lifts each integer or
+  plain string literal that is the whole operand of `=` into a trailing placeholder and returns
+  the cache key texts differing only in those values share (a text scan, ~4 µs).
+  `lowerParameterized` gives a lifted slot exactly the type lowering gives its literal alone and
+  accepts the rewrite only where each slot is an `=` operand of the same type or an index key.
+  It returns a `ParameterizedPlan` (run with `bindParameterized`, which refuses another key's
+  text) or a `NotParameterizable` marker. Cache rule: cache the result under the key; on a marker
+  lower each text itself and cache that plan under the text, never under the key. A literal
+  point-read loop over 10,000 keys lowers once.
 - Every failure is a `PlanningError` with PostgreSQL's SQLSTATE (42601 syntax, 42P01 relation,
   42703 column, 42883 function, 42704 type, …) or an `UnsupportedPlanError` (0A000). Front-end
   errors are translated by message (`frontEndError`), keeping the parse position and the

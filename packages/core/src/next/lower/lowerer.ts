@@ -57,6 +57,7 @@ import type { ExecutorCosts } from "../ir/costs.js";
 import type { PhysicalPlan } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
 import type { PhysicalType } from "../types.js";
+import type { NotParameterizable, ParameterizedPlan, ParameterizedText } from "./parameterize.js";
 import type { ResultColumn } from "./result.js";
 import type { StatementKind } from "./statement.js";
 import type { PlanningStatistics, StatisticsBasis } from "./statistics.js";
@@ -96,9 +97,18 @@ interface LoweredPlanned extends LoweredBase {
   readonly plan: PhysicalPlan;
   /** Result columns, aligned with `plan.columns` (RETURNING for DML; empty without it). */
   readonly columns: readonly ResultColumn[];
+  /**
+   * From `lowerParameterized` only: how many trailing placeholder slots hold lifted literals.
+   * They follow the client's `parameters`; the owner binds `ParameterizedText.values` there.
+   */
+  readonly liftedParameters?: number;
   /** Every table id the plan reads (scans, lookups, fetches, through views and subqueries). */
   readonly reads: readonly number[];
-  /** Row counts the plan was costed with (lower/statistics.ts). */
+  /**
+   * Row counts the plan was costed with (lower/statistics.ts). Empty when no decision about the
+   * plan's shape read statistics (a unique-key lookup, a lone scan): the owner can skip
+   * `statisticsDrifted` for it.
+   */
   readonly basis: readonly StatisticsBasis[];
 }
 
@@ -222,5 +232,30 @@ export interface Lowerer {
    * as the `createTable` change SQL's CREATE TABLE would give (additive, Phase 2). The DSL names
    * no SQL types: `column.integer()` is INTEGER and `column.number()` DOUBLE PRECISION (R17.3).
    */
+  /**
+   * Literal auto-parameterization for the plan cache (lower/parameterize.ts): the statement with
+   * each integer or plain string literal that is the whole operand of `=` lifted into a trailing
+   * placeholder, and the cache key texts differing only in those values share; null when there
+   * is nothing to lift. Pure text work, no parse: cheap enough to run on every execution.
+   */
+  parameterize(text: string): ParameterizedText | null;
+  /**
+   * The plan every text with `parameterized.key` shares, or a NotParameterizable marker for the
+   * key. The plan cache rule (B5):
+   * - look the key up first; a ParameterizedPlan runs with `bindParameterized(plan,
+   *   parameterized, clientParameters)`, which refuses another key's text;
+   * - a NotParameterizable marker under the key means: lower this text with `lower(text)` and
+   *   cache that plan under the text itself, binding only the client's parameters;
+   * - on a miss, call this and cache its result (plan or marker) under the key.
+   * A plan from `lower(text)` is never cached under a normalized key: its literals are constants,
+   * so another text of the family would run with this text's values.
+   * The plan is accepted only when each lifted slot has exactly the type lowering gives its
+   * literal alone and is used where a slot is the literal (an `=` operand of the same type or an
+   * index key); otherwise, or when the rewrite does not lower, the marker.
+   */
+  lowerParameterized(
+    parameterized: ParameterizedText,
+    context: LoweringContext,
+  ): ParameterizedPlan | NotParameterizable;
   lowerSchemaTable(input: CreateTableInput, catalog: CatalogView): CatalogChange;
 }
