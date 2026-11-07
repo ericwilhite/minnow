@@ -1411,9 +1411,13 @@ samples are labelled and never count as Gate A measurements.
 
 The host-ready endpoint is captured in the host’s actual ready callback. Phase counters capture
 before awaiting a CPU checkpoint, so reads arriving during that wait are kept in the next
-interval. Wall-only checkpoints are synchronous. Intervals after write-path open may include
-its background maintenance; they are not causal CPU/I/O attribution to the host or count query.
-The report includes write-path maintenance counters at ready and after the first count.
+interval. Wall-only checkpoints are synchronous. The owner composition opens with initial maintenance
+held, posts ready, and resumes initial flush/merge/recycle work only after the page acknowledges
+receiving that message. The work is deferred, not removed: count setup and the first count may
+overlap it. The report includes completed counters and in-flight state at ready and after count.
+`MINNOW_OWNER_TRACE=1` records native file ranges and logical read call stacks with maintenance
+state for diagnosis only; turn it off for timing. `MINNOW_OWNER_DEFER_MAINTENANCE=0` enables the
+pre-gate diagnostic comparison without changing the standalone write path's default policy.
 
 The harness returns its unused extent-space startup reservation before opening the write path.
 `MINNOW_OWNER_REOPEN_LOAD_MIB` selects the load governor only; reopens remain at 256 MiB.

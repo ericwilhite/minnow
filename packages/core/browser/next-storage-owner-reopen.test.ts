@@ -163,6 +163,15 @@ it("captures ready in the real host callback and counts through the real recover
       },
     );
     expect(readyCalls).toBe(1);
+    expect(owner.storage.path.maintenanceState.initialStarted).toBe(false);
+    expect(owner.rootInfo?.maintenanceStateAtReady).toMatchObject({
+      initialStarted: false,
+      merging: false,
+      flushes: 0,
+      recycling: false,
+    });
+    owner.storage.path.startInitialMaintenance();
+    expect(owner.storage.path.maintenanceState.initialStarted).toBe(true);
     expect(owner.executor.prepared).toBe(0);
     expect(owner.rootInfo?.maintenanceAtReady).toBeDefined();
     expect((await firstStatisticsCount(owner, "tiny")).count).toBe("3");

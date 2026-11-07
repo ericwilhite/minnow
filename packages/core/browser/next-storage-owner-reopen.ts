@@ -3,6 +3,8 @@
  * recovery -> owner host ready. The executor is a stand-in and is UNUSED during startup.
  * Its optional first SELECT count(*) reads write-path row statistics only; it measures planning,
  * protocol and delivery, not a scan or the integrated executor. No startup phase uses fake data.
+ * The owner defers initial maintenance until its ready message is acknowledged by the page.
+ * Read tracing is diagnostic-only and must be disabled for timing.
  * The factory acquires handles in openFence; session/space/write-path recovery runs in open,
  * as host.ts requires, outside the fence-acquisition deadline. The ready timer includes both.
  * Native reads count returned OPFS bytes / IndexedDB cloned byte payloads; IndexedDB's physical
@@ -33,6 +35,38 @@ export interface ReadCounts {
   payloadBytes: number;
   numericBytes: number;
   reads: number;
+}
+interface ReadTrace {
+  phase: OwnerReopenPhase | "cleanup";
+  state?: () => WritePathImpl["maintenanceState"];
+  events: Array<{
+    phase: OwnerReopenPhase | "cleanup";
+    kind: string;
+    file?: string;
+    offset?: number;
+    length?: number;
+    ranges?: Array<{ offset: number; length: number }>;
+    state?: WritePathImpl["maintenanceState"] | undefined;
+    stack: string;
+  }>;
+}
+const readTraces = new WeakMap<ReadCounts, ReadTrace>();
+function traceRead(
+  counts: ReadCounts,
+  event: Omit<ReadTrace["events"][number], "phase" | "state" | "stack">,
+) {
+  const trace = readTraces.get(counts);
+  if (trace !== undefined)
+    trace.events.push({
+      ...event,
+      phase: trace.phase,
+      state: trace.state?.(),
+      stack: new Error().stack ?? "",
+    });
+}
+export interface OwnerOpenOptions {
+  readonly traceReads?: boolean | undefined;
+  readonly deferInitialMaintenance?: boolean | undefined;
 }
 export interface OwnerPhase {
   phase: OwnerReopenPhase;
@@ -134,6 +168,7 @@ async function backendFor(
             const read = handle.read(target, options);
             counts.payloadBytes += read;
             counts.reads++;
+            traceRead(counts, { kind: "native", file, offset: options.at, length: read });
             return read;
           },
           write: (source, options) => handle.write(source, options),
@@ -163,17 +198,37 @@ async function openRealFence(
   phase: (phase: OwnerPhase) => void | Promise<void>,
   started: number,
   capBytes = 256 << 20,
+  traceReads = false,
 ) {
   const counts: ReadCounts = { payloadBytes: 0, numericBytes: 0, reads: 0 };
+  if (traceReads) readTraces.set(counts, { phase: "backend", events: [] });
   const meter = new OwnerPhaseMeter(counts, phase, () => performance.now(), started);
-  const finish = (name: OwnerReopenPhase) => meter.finish(name);
+  const finish = (name: OwnerReopenPhase) => {
+    const pending = meter.finish(name);
+    const trace = readTraces.get(counts);
+    if (trace !== undefined)
+      trace.phase = (
+        {
+          backend: "space",
+          space: "recovery",
+          recovery: "host",
+          host: "countSetup",
+          countSetup: "count",
+          count: "cleanup",
+        } as const
+      )[name];
+    return pending;
+  };
   const governor = new Governor(capBytes);
   const backend = await backendFor(store, `b1-owner-data-${db}`, counts, governor);
   const lease = await backend.acquire({ timeoutMs: 30_000 });
   return { backend, lease, governor, finish, counts };
 }
 
-async function recoverRealStorage(fence: Awaited<ReturnType<typeof openRealFence>>) {
+async function recoverRealStorage(
+  fence: Awaited<ReturnType<typeof openRealFence>>,
+  deferInitialMaintenance = false,
+) {
   const { backend, lease, governor, finish, counts } = fence;
   const session = await backend.open(lease);
   await finish("backend");
@@ -192,12 +247,33 @@ async function recoverRealStorage(fence: Awaited<ReturnType<typeof openRealFence
   // explicit later audit, but return its unused admission before the writer starts.
   startup.release(startup.held - startup.allocated);
   await finish("space");
+  const trace = readTraces.get(counts);
+  if (trace !== undefined) {
+    const read = space.read.bind(space);
+    space.read = (refs, options) => {
+      traceRead(counts, {
+        kind: "logical",
+        ranges: refs.map((ref) => ({ offset: ref.extent.offset + ref.offset, length: ref.length })),
+      });
+      return read(refs, options);
+    };
+    const peek = space.peek.bind(space);
+    space.peek = (ref, options) => {
+      traceRead(counts, {
+        kind: "peek",
+        ranges: [{ offset: ref.extent.offset + ref.offset, length: ref.length }],
+      });
+      return peek(ref, options);
+    };
+  }
   const path = await WritePathImpl.open({
     session,
     space,
     governor,
     options: { durability: "strict" },
+    deferInitialMaintenance,
   });
+  if (trace !== undefined) trace.state = () => path.maintenanceState;
   await finish("recovery");
   const scratch = backend.scratch(lease);
   if (scratch === null) throw new Error("Native benchmark requires scratch storage");
@@ -214,7 +290,9 @@ async function recoverRealStorage(fence: Awaited<ReturnType<typeof openRealFence
     spill,
     finish,
     counts,
+    readTrace: trace?.events,
     async close() {
+      if (trace !== undefined) trace.phase = "cleanup";
       await path.close();
       await spill.close();
       await space.close();
@@ -230,6 +308,7 @@ export async function startMeasuredOwner(
   db: string,
   phase: (phase: OwnerPhase) => void | Promise<void>,
   onReady: () => void = () => undefined,
+  options: OwnerOpenOptions = {},
 ) {
   const started = performance.now();
   // Distinct host/storage lock names: the native backend owns its own lease under the host fence.
@@ -250,7 +329,7 @@ export async function startMeasuredOwner(
   // Acquisition/session open belongs to the backend phase, including the outer host lock wait.
   const factory: OwnerEngineFactory<Awaited<ReturnType<typeof openRealFence>>> = {
     openFence() {
-      return openRealFence(store, db, phase, started);
+      return openRealFence(store, db, phase, started, 256 << 20, options.traceReads);
     },
     epochOf: (fence) => fence.lease.epoch,
     closeFence(fence) {
@@ -259,7 +338,7 @@ export async function startMeasuredOwner(
     async open(fence) {
       // OwnerEngineFactory.openFence acquires handles only. Session loading and recovery are
       // startup step 2 (host.ts), outside acquireFenced's 5s handle-acquisition deadline.
-      opened = await recoverRealStorage(fence);
+      opened = await recoverRealStorage(fence, options.deferInitialMaintenance ?? true);
       const storage = opened;
       const engine = composeEngine({
         planner: {
@@ -292,6 +371,7 @@ export async function startMeasuredOwner(
   const channel = new MessageChannel();
   const announcement = { phase: null as Promise<OwnerPhase> | null };
   const maintenanceAtReady: Partial<WritePathImpl["maintenance"]> = {};
+  const maintenanceStateAtReady: Partial<WritePathImpl["maintenanceState"]> = {};
   let host: OwnerHost | null = null;
   try {
     host = await startOwnerHost(
@@ -310,6 +390,7 @@ export async function startMeasuredOwner(
           if (status.t === "minnow:ready") {
             const storage = getOpened();
             Object.assign(maintenanceAtReady, storage.path.maintenance);
+            Object.assign(maintenanceStateAtReady, storage.path.maintenanceState);
             announcement.phase = storage.finish("host"); // exact host-ready endpoint
             onReady();
           } else if (status.t === "minnow:failed") throw new Error(JSON.stringify(status.error));
@@ -320,6 +401,7 @@ export async function startMeasuredOwner(
     // TypeScript cannot see the asynchronous factory assignment.
     const storage = getOpened();
     const hostPhase = await announcement.phase;
+
     if (executor.prepared !== 0) throw new Error("The executor was used before owner ready");
     const rootGrant = await storage.governor.admit({
       label: "bench root metadata",
@@ -334,6 +416,7 @@ export async function startMeasuredOwner(
         ? null
         : {
             maintenanceAtReady,
+            maintenanceStateAtReady,
             groups: root.tables.reduce((sum, table) => sum + table.groupCount, 0),
             staged: root.tables.reduce((sum, table) => sum + table.staged.length, 0),
             listPages: root.extentList.length,

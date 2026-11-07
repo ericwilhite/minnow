@@ -17,6 +17,12 @@ interface ReopenResult {
   result: {
     phases: OwnerPhase[];
     root: {
+      maintenanceStateAtReady: {
+        initialStarted: boolean;
+        merging: boolean;
+        flushes: number;
+        recycling: boolean;
+      };
       groups: number;
       extents: number;
       listPages: number;
@@ -61,6 +67,8 @@ for (const store of ["opfs", "indexeddb"] as const)
           dataset,
           db,
           cpu: false,
+          traceReads: process.env.MINNOW_OWNER_TRACE === "1",
+          deferInitialMaintenance: process.env.MINNOW_OWNER_DEFER_MAINTENANCE !== "0",
           loadGovernorBytes: Number(process.env.MINNOW_OWNER_REOPEN_LOAD_MIB ?? 256) * 1024 * 1024,
           resume: process.env.MINNOW_OWNER_REOPEN_RESUME === "1",
           ...(testRows === undefined ? {} : { testRows }),
@@ -90,6 +98,17 @@ for (const store of ["opfs", "indexeddb"] as const)
           const sample = await run({ ...base, op: "open" });
           wall.push(sample);
           expect(sample.result.preparedAtReady).toBe(0);
+          if (base.deferInitialMaintenance) {
+            expect(sample.result.root.maintenanceStateAtReady).toMatchObject({
+              initialStarted: false,
+              merging: false,
+              flushes: 0,
+              recycling: false,
+            });
+            expect(
+              sample.result.phases.find((phase) => phase.phase === "host")?.reads.payloadBytes,
+            ).toBe(0);
+          }
           expect(sample.result.root.rows).toHaveLength(dataset === "S5" ? 13 : 4);
           if (testRows === undefined) {
             expect(sample.result.root.groups).toBeGreaterThan(0);

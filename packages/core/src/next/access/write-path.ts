@@ -61,8 +61,10 @@
  * their out-of-line values before decoding (page/large-value.ts). The fold reuses group metadata;
  * index-run merges read keys and row ids, without decoding row chunks.
  *
- * Recovery schedules the staging fold in a later task, after open has delivered ready;
- * no group-root read begins as part of open, including its queued microtasks.
+ * Standalone recovery schedules the staging fold in a later task so open can return first.
+ * The real owner composition additionally defers initial flush/merge/recycle work until its
+ * ready message is acknowledged, then resumes it through the concrete write-path lifecycle.
+ * No group-root read is needed for recovery itself.
  *
  * Retirement of unclaimed staging runs in task slices, checks close and the open signal,
  * and deduplicates extent identities in a set. It runs at the first publication after open.

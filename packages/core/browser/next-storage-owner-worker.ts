@@ -1,3 +1,4 @@
+import { beginTask } from "../src/next/task.js";
 /** Fresh worker per load or reopen; dataset generation is never part of the measured open. */
 import { buildOwnerDataset, type OwnerDataset } from "./next-storage-owner-load.js";
 import {
@@ -15,10 +16,20 @@ export interface OwnerBenchRequest {
   testRows?: number;
   loadGovernorBytes?: number;
   resume?: boolean;
+  traceReads?: boolean;
+  deferInitialMaintenance?: boolean;
 }
 const barriers = new Map<number, () => void>();
 let next = 0;
-self.onmessage = (event: MessageEvent<OwnerBenchRequest | { ack: number }>) => {
+let readyReceived: (() => void) | undefined;
+self.onmessage = (
+  event: MessageEvent<OwnerBenchRequest | { ack: number } | { readyAck: true }>,
+) => {
+  beginTask();
+  if ("readyAck" in event.data) {
+    readyReceived?.();
+    return;
+  }
   if ("ack" in event.data) {
     barriers.get(event.data.ack)?.();
     barriers.delete(event.data.ack);
@@ -51,20 +62,33 @@ self.onmessage = (event: MessageEvent<OwnerBenchRequest | { ack: number }>) => {
         return done;
       }
     };
-    const owner = await startMeasuredOwner(request.store, request.db, phase, () =>
-      self.postMessage({ ready: true }),
+    const readyDelivered = new Promise<void>((resolve) => {
+      readyReceived = resolve;
+    });
+    const owner = await startMeasuredOwner(
+      request.store,
+      request.db,
+      phase,
+      () => self.postMessage({ ready: true }),
+      { traceReads: request.traceReads, deferInitialMaintenance: request.deferInitialMaintenance },
     );
     try {
+      if (request.deferInitialMaintenance !== false) {
+        await readyDelivered;
+        owner.storage.path.startInitialMaintenance();
+      }
       const count = await firstStatisticsCount(
         owner,
         request.dataset === "S5" ? "order_items" : "events_wide",
       );
       return {
         phases,
+        readTrace: owner.storage.readTrace,
         root: owner.rootInfo,
         count,
         preparedAtReady: 0,
         maintenanceAfterCount: { ...owner.storage.path.maintenance },
+        maintenanceStateAfterCount: owner.storage.path.maintenanceState,
       };
     } finally {
       await owner.close();

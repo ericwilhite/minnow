@@ -31,7 +31,10 @@ export async function runOwnerReopen(
             started = performance.now();
             worker.postMessage(request);
           })().catch(reject);
-        if (data.ready) readyWallMs = performance.now() - started;
+        if (data.ready) {
+          readyWallMs = performance.now() - started;
+          worker.postMessage({ readyAck: true });
+        }
         if (data.progress !== undefined) console.log(`owner-load: ${data.progress}`);
         if (data.phase !== undefined)
           void (async () => {

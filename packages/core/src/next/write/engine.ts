@@ -25,6 +25,8 @@ import type { KeyDelta } from "./key-hash.js";
  * make crash sweeps cross many flushes and publishes in a short scenario.
  */
 export type EngineInput = OpenWritePathInput & {
+  /** Owner composition resumes initial background work only after ready is delivered. */
+  readonly deferInitialMaintenance?: boolean;
   readonly tuning?: {
     readonly memtableRows?: number;
     /**
@@ -724,12 +726,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       await engine.#load();
       await engine.#recover();
       engine.#recovering = false;
-      // A resolved promise would start the fold before the open result reaches the owner.
-      // Track the task delay in the flush chain so quiesce/close also wait for it.
-      engine.#flushes = new Promise<void>((resolve) => setTimeout(resolve, 0));
-      engine.#scheduleFlush();
-      engine.#scheduleMerge();
-      if (engine.#appender.end >= engine.#logRecycleBytes) engine.#maybeRecycle();
+      if (input.deferInitialMaintenance !== true) engine.startInitialMaintenance();
       return engine;
     } catch (error) {
       metadataGrant.close();
@@ -1991,6 +1988,30 @@ export class WritePathImpl implements WritePath, EngineHooks {
           averageWidth: fixed ?? (total.values === 0 ? 16 : total.bytes / total.values),
         };
       },
+    };
+  }
+
+  #initialMaintenanceStarted = false;
+
+  /** Idempotent owner-ready lifecycle hook; standalone opens start automatically. */
+  startInitialMaintenance(): void {
+    if (this.#initialMaintenanceStarted || this.#closed) return;
+    this.#initialMaintenanceStarted = true;
+    // Preserve B3's later-task fold scheduling. The owner may additionally hold all initial
+    // flush/merge/recycle work until its ready message has actually reached the page.
+    this.#flushes = new Promise<void>((resolve) => setTimeout(resolve, 0));
+    this.#scheduleFlush();
+    this.#scheduleMerge();
+    if (this.#appender.end >= this.#logRecycleBytes) this.#maybeRecycle();
+  }
+
+  /** In-flight state; completed counters alone do not identify startup work. */
+  get maintenanceState() {
+    return {
+      initialStarted: this.#initialMaintenanceStarted,
+      merging: this.#merging,
+      flushes: this.#flushesWriting,
+      recycling: this.#recycling !== null,
     };
   }
 
