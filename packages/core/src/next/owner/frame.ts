@@ -9,7 +9,8 @@
  *   release handle and `requiresLsn` stay outside the payload, on exec's `ResultFrame`.
  * - The port adds no copy: every buffer in `transfer` moves (exec `frameTransferList` checks a
  *   payload owns exactly what it transfers). Wide decimal coefficients are cloned. This module
- *   imports exec/ for types only, so a client bundle carries no executor code.
+ *   imports exec/ for types only, so ordinary clients need no executor implementation. Recycling
+ *   additionally uses the client-safe frame-buffers validator.
  * - Vectors keep their executor form (`VectorData`), so the client sees exact physical values. JS
  *   values are built on the client, on request (api.ts).
  * - **Accounting.** A frame stays charged to its execution's result grant until the client's
@@ -60,7 +61,7 @@ export type WireInputColumn =
 
 /**
  * The client's per-stream dictionaries: deltas applied in frame order, entries kept as the chunks
- * that arrived (no copy). A delta whose `from` is not the dictionary's current size, or a frame
+ * that arrived (no copy by default; explicit recycling exports request compact owned copies). A delta whose `from` is not the dictionary's current size, or a frame
  * out of sequence, is a protocol error (a lost or reordered frame): `RangeError`.
  */
 export class StreamDictionaries {
@@ -68,13 +69,14 @@ export class StreamDictionaries {
   #nextSequence = 0;
 
   /** Applies `payload.dictionaries`. Call once per frame, in sequence order, before reading it. */
-  apply(payload: FramePayload): void {
+  apply(payload: FramePayload, ownDeltas = false): void {
     if (payload.sequence !== this.#nextSequence)
       throw new RangeError(
         `Frame ${String(payload.sequence)} arrived, expected ${String(this.#nextSequence)}`,
       );
     this.#nextSequence++;
-    for (const delta of payload.dictionaries) this.#append(delta);
+    for (const delta of payload.dictionaries)
+      this.#append(ownDeltas ? { ...delta, values: structuredClone(delta.values) } : delta);
   }
 
   #append(delta: DictionaryDelta): void {

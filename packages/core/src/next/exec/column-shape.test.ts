@@ -12,6 +12,8 @@ import type { ByteBudget } from "../access/space.js";
 import type { PhysicalType } from "../types.js";
 import { isValid } from "../vector/validity.js";
 import type { Vector } from "../vector/vector.js";
+import { ReturnPool } from "./return-pool.js";
+import { Governor } from "../memory/governor.js";
 import { ColumnTarget, type DecodeSpec } from "./column-target.js";
 import { sourceSizedPages } from "./column-shape-test-support.js";
 
@@ -66,9 +68,11 @@ it.each(seedsFor("next-column-shape", [0xb2d1, 0xb2d2]))(
         fc.integer({ min: 300, max: 512 }),
         fc.integer({ min: 1, max: 19 }),
         fc.constantFrom(512, 2048),
-        async (count, salt, rawPageBytes) => {
+        fc.boolean(),
+        async (count, salt, rawPageBytes, sparseEveryLayout) => {
           reach.beginHistory();
           reach.reach(rawPageBytes === 512 ? "512 B raw page" : "2 KiB raw page");
+          if (sparseEveryLayout) reach.reach("sparse NULLs in every layout");
           const encoder = new TextEncoder();
           const types: PhysicalType[] = [
             { kind: "bool" },
@@ -88,7 +92,11 @@ it.each(seedsFor("next-column-shape", [0xb2d1, 0xb2d2]))(
             type,
             vector: { scale: 2, tier: column === 10 ? ("int128" as const) : ("int64" as const) },
             values: Array.from({ length: count }, (_, row): TestValue => {
-              if (column === 11 || (column % 3 === 0 && (row + salt) % 7 === 0)) return null;
+              if (
+                column === 11 ||
+                ((column % 3 === 0 || sparseEveryLayout) && (row + salt) % 7 === 0)
+              )
+                return null;
               const integer =
                 BigInt(row < 256 ? row * salt : 2 ** 53) + (row < 256 ? 0n : BigInt(row));
               switch (type.kind) {
@@ -130,7 +138,8 @@ it.each(seedsFor("next-column-shape", [0xb2d1, 0xb2d2]))(
           });
           for (let column = 0; column < columns.length; column++) {
             const source = defined(columns[column]),
-              budget = countingBudget();
+              budget = countingBudget(),
+              pool = new ReturnPool(new Governor(8 * 1048576), 4 * 1048576);
             const reader = await ChunkReader.open(
               space.view({ cache: false }),
               defined(group.columns[column]),
@@ -138,15 +147,19 @@ it.each(seedsFor("next-column-shape", [0xb2d1, 0xb2d2]))(
             );
             let targetCharge = 0;
             const memory = {
-              take(n: number) {
+              reuse: (bytes: number) => pool.take(bytes),
+              take: (n: number) => {
                 targetCharge += n;
               },
-              give(n: number) {
+              give: (n: number) => {
                 targetCharge -= n;
               },
             };
             const target = new ColumnTarget(source.type, count, memory),
-              reference = new ColumnTarget(source.type, count, memory);
+              reference = new ColumnTarget(source.type, count, {
+                take: memory.take,
+                give: memory.give,
+              });
             try {
               const indices = reader.directory.pages.map((_, page) => page);
               expect(indices.length).toBeGreaterThan(0);
@@ -221,7 +234,41 @@ it.each(seedsFor("next-column-shape", [0xb2d1, 0xb2d2]))(
                   equal(rows(owned.vector), rows(legacy.vector));
                   expect(owned.bytes).toBe(legacy.bytes);
                   expect(owned.bytes).toBeLessThanOrEqual(a);
-                  memory.give(owned.bytes + legacy.bytes);
+                  const expectedBytes = legacy.buffers.map((buffer) =>
+                    new Uint8Array(buffer).slice(),
+                  );
+                  const ids = pool.issue(0, owned.buffers);
+                  const received = structuredClone(owned.buffers, { transfer: [...owned.buffers] });
+                  // A consumer can modify its exclusive storage before relinquishing it.
+                  for (const buffer of received) new Uint8Array(buffer).fill(0xa5);
+                  const returned = structuredClone(received, { transfer: [...received] });
+                  pool.release(
+                    0,
+                    returned.map((buffer, i) => ({ id: ids[i] ?? -1, buffer })),
+                  );
+                  expect(owned.buffers.every((buffer) => buffer.byteLength === 0)).toBe(true);
+                  memory.give(owned.bytes);
+                  const hitsBefore = pool.hits;
+                  const again = target.decodeOwned(reader, spec, codes);
+                  equal(rows(again.vector), expected);
+                  if (expectedBytes.some((bytes) => bytes.byteLength > 0)) {
+                    expect(pool.hits).toBeGreaterThan(hitsBefore);
+                    reach.reach("recycled native bytes");
+                  }
+                  const actualBytes = again.buffers.map((buffer) => new Uint8Array(buffer));
+                  if (
+                    actualBytes.length !== expectedBytes.length ||
+                    !actualBytes.every((bytes, i) => {
+                      const referenceBytes = expectedBytes[i];
+                      if (referenceBytes === undefined) return false;
+                      return (
+                        bytes.byteLength === referenceBytes.byteLength &&
+                        bytes.every((value, byte) => value === referenceBytes[byte])
+                      );
+                    })
+                  )
+                    expect(actualBytes).toEqual(expectedBytes);
+                  memory.give(again.bytes + legacy.bytes);
                   if (actual.form === "dictionary") reach.reach("dictionary");
                 }
               }
@@ -229,14 +276,24 @@ it.each(seedsFor("next-column-shape", [0xb2d1, 0xb2d2]))(
               reach.reach("gather same endpoints");
               if (column === 4) {
                 expect(reader.isSafe(0, 1)).toBe(true);
-                expect(reader.isSafe(indices.length - 1, indices.length)).toBe(false);
-                reach.reach("mixed safe integers");
+                const lastPage = defined(reader.directory.pages.at(-1));
+                const hasWide = source.values
+                  .slice(count - lastPage.rowCount)
+                  .some(
+                    (value) => typeof value === "bigint" && value > BigInt(Number.MAX_SAFE_INTEGER),
+                  );
+                expect(reader.isSafe(indices.length - 1, indices.length)).toBe(!hasWide);
+                if (hasWide) reach.reach("mixed safe integers");
               }
               if (column === 8) reach.reach("plain varlen");
               if (column === 11) reach.reach("all null");
-              if (column === 1) reach.reach("all valid");
+              if (column === 1 && !sparseEveryLayout) {
+                expect(source.values.every((value) => value !== null)).toBe(true);
+                reach.reach("all valid");
+              }
               if (column === 10) reach.reach("int128 mixed scales");
             } finally {
+              pool.close();
               target.close();
               reference.close();
               reader.close();

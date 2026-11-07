@@ -658,7 +658,12 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     entries share the existing 1 MiB stream cap; subsequent dictionaries fall back to flat varlen.
     Registry entries use ordinary result-grant capacity, so a delta frame can return its progress
     loan before the stream ends. Dictionary pages and borrowed codes never enter a transfer list.
-    A direct terminal full scan decodes tight dedicated output into the result grant. The sink
+    A direct terminal full scan decodes tight dedicated output into the result grant.
+    Only explicit recycling exports double its owned batch target, bounded by
+    the existing result credit window (2 MiB at the default cap/window). This amortizes wide-column
+    allocation without changing the 2,048-row limit. Ordinary results, other producers and
+    consumer pipelines keep their existing target;
+    copying fallbacks retain conservative frame row capacities. The sink
     adopts only buffers explicitly named by that source's detach permission and charged to its
     own grant. Before returning the source token (and its query dictionary references), it
     reclassifies the dedicated buffers into a frame charge in the same result grant. That charge
@@ -689,6 +694,51 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     or post-GC snapshot as an export peak measurement. CDP `backingStorageSize` includes
     external strings as well as ArrayBuffers. Captures label it `backingStoragePeakMiB`; the
     historical `arrayBufferPeakMiB` key remains an alias, not a pure ArrayBuffer measurement.
+  - `MINNOW_EXPORT_RSS_SERIES=1 npm run benchmark:export` keeps one worker, OPFS space,
+    governor and page pool across five cold exports. RSS growth uses one fixed campaign baseline;
+    each pass records page/worker heap and backing stores plus end-of-pass pool/cache charges.
+    Without the diagnostic GC flag, collection runs only after the campaign, followed by space close and zero-charge checks. With
+    `MINNOW_EXPORT_EXECUTOR_REFERENCE=REV`, five interleaved reference/current pairs share that
+    actor; both source families load before the baseline. This paired scope includes both families.
+    `MINNOW_EXPORT_DISCARD=1` is an explicit discard-consumer diagnostic: detach consumed column
+    buffers, retaining dictionary deltas until stream close. It changes no public Result lifetime
+    and does not guarantee lower RSS: backing-store disposal can still wait for GC/allocator work.
+  - `MINNOW_EXPORT_RECYCLE=1 MINNOW_EXPORT_RSS_SERIES=1` is the dedicated executor/transport component bench for the adopted explicit return mode.
+    The production owner client exposes it through `exportStream()`, separately from `query()`. It keeps the existing per-buffer frame contract. Its export
+    receiver exposes `recyclingFrame(...).release()`: only explicit relinquishment transfers
+    the dedicated frame buffers back. Receipt and cursor credits keep their existing timing and
+    do not end ordinary result/view lifetimes. After release, typed views are detached (length
+    zero, or `TypeError` on operations that require a live buffer); they must never be used again.
+    JavaScript value arrays contain copied values and are not reusable native storage.
+    The receiver copies dictionary deltas into compact stream storage before releasing a frame,
+    so later dictionary codes never refer to detached buffers. Callers retaining views after credit
+    hold client memory outside the worker result grant, as before; the pool does not bound arbitrary
+    consumer retention. The benchmark discards each frame
+    after counting it and explicitly releases it; normal buffered results and cursors do not.
+    Worker returns use one-use slot capabilities tied to the originally sent dedicated buffer,
+    its size and the detached sender wrapper. Unknown, duplicate, resized, detached and expired
+    returns are refused. A cooperative receiver can only return the buffers captured by its
+    handle; this is an internal protocol, not a physical-identity proof against a compromised
+    receiver sending a same-sized replacement with a stolen capability. Pages, borrowed dictionaries,
+    slabs and cached storage never receive capabilities. Only exact-size buffers are reused,
+    cleared to fresh-allocation semantics, after the output grant reserves their charge.
+    The return cache is capped at twice the 2 MiB credit window, including conservative entry
+    metadata charges; capabilities are also limited to 4,096 slots. It evicts stale size classes
+    and deletes empty ones. Refused/lost/late returns never delay execution or cancellation.
+    Closing the stream's pool returns its charges; frames still held by a caller stay valid until
+    that caller explicitly releases them. `scripts/output-return-bench.mts` records five
+    interleaved CPU/wall component rounds. Five persistent-process Chromium A/B pairs are still
+    required for throughput and fixed-baseline RSS. Five standalone recycling passes met the RSS
+    bound; paired passes can inherit ordinary-result garbage from the previous variant. The return
+    component increases CPU with disjoint ranges, and whole-export throughput does not improve
+    beyond the spread. The lead accepted its memory/CPU tradeoff for explicit export; ordinary
+    queries keep their batch target. Absolute Gate A throughput will be measured on a quiet host.
+    `MINNOW_EXPORT_GC_EACH=1` adds post-pass forced-GC diagnostics, outside timed exports and
+    outside the sampled peak. It is diagnostic evidence, not an RSS acceptance run.
+  - `scripts/vector-materialize-bench.mts --compare=REV` isolates loaded-page vector building,
+    including output allocation, sizing and decode, in five interleaved CPU/wall rounds.
+    `--batch` compares 512/1024-row batches over equal rows; `--offsets --reused` isolates offset
+    decoding without output allocation. Writing/loading, frame assembly and transport are excluded.
   - `scripts/result-sink-bench.mts --compare=REV --owned` isolates framing with fresh
     authorized source buffers and mixed numeric/dictionary columns. It charges source buffers
     before pushing and returns their charges on release. Input construction is excluded; decode
@@ -705,6 +755,23 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     dependency is frozen, with no fallback to current sources. Both code families load before
     timing. Use standalone current runs for absolute RSS acceptance: the paired comparison
     also retains the reference code family.
+  - The packed-frame copy-compaction experiment is **rejected**, with the production frame
+    contract unchanged. `scripts/browser-perf/experiments/packed-frame-copy.patch` and its
+    hashed base archive preserve the candidate without production imports. `MINNOW_EXPORT_PACKED_EXPERIMENT=1`
+    requires the explicit export-bench opt-in; combine it with `MINNOW_EXPORT_RSS_SERIES=1`
+    and `MINNOW_EXPORT_EXECUTOR_REFERENCE=095f5f1c` for five cold A/B rounds in one worker.
+    `scripts/executor-export-bench.mts --compare=095f5f1c --packed` replays its CPU component.
+    Every packed frame has one fresh buffer and aligned, bounded, disjoint views; both endpoints
+    validate them, and retained UTF-8 dictionary deltas are copied into compact client storage.
+    Generated diagnostics compare native bytes across layouts (including wide decimals, NaN words,
+    NULLs, constants, dictionaries and >64 KiB values), reject malformed subviews, and check
+    completion/abort/cancel charges. This is not an accepted frame format or a supported stored format.
+    It adds a compaction copy after per-column decode: measured throughput regresses and RSS
+    ranges overlap beyond the budget. Its doubled temporary-buffer reservation also refuses a
+    previously supported 550 KiB row under a 1 MiB progress reserve. That failure is preserved
+    as rejection evidence; it does not weaken the ordinary large-row properties. These results
+    concern this copy-compaction implementation, not a proof that direct decode into packed output
+    cannot work. The benchmark excludes SQL/catalog/root loading and client row-object assembly.
   - `owner-frames.ts` and `scan-export.ts` remain **historical scan-adapter diagnostics**, excluded
     from Gate A. Ownership/batch/IO/range/shape-transport/frame-copy experiment flags explicitly
     use `mode:"scan-adapter"`. No production module imports the old assembler.
@@ -1430,6 +1497,59 @@ include it. Validation checks all normalized words, row multiplicity and stable 
 
 ### Owner and client protocol (`owner/`)
 
+The internal owner client is `ProtocolClient` (`owner/client.ts`). Its explicit columnar export
+API is `exportStream(sql, params?, { session?, windowBytes? })`. It is not a published package API.
+It accepts queries, including queries in a session, and rejects modifying/control statements.
+`query()` and the existing cursor retain their current lifetimes and 1 MiB source target.
+
+```ts
+const stream = client.exportStream("SELECT * FROM t");
+const columns = await stream.columns; // resolves with the first reply, before iteration completes
+try {
+  for await (const frame of stream.frames) {
+    try {
+      // Consume frame.payload's physical vectors. A dictionary column's codes use
+      // frame.dictionaries.locate(id, code); entries remain bytes, not decoded strings.
+      consume(columns, frame.payload, frame.dictionaries);
+    } finally {
+      frame.release();
+    }
+  }
+  await stream.done; // the owner's StatementSummary; it never waits for buffer returns
+} finally {
+  stream.close();
+}
+```
+
+Credits return when the iterator hands out a frame, at the existing piggyback/half-window/timer
+pacing. Only `frame.release()` relinquishes its buffers. It is idempotent and transfers all
+frame-owned buffers, even for a tiny frame that ordinary results would clone. After release,
+its typed views have length zero or throw `TypeError`; callers must not use them. Plain JS value
+arrays are copied values, not recycled storage. Per-stream dictionary deltas are copied into
+compact client storage before frame handout, so later codes remain readable after earlier frames
+are released. These dictionary chunks are shared stream storage, not frame-owned views.
+
+`close()` (also iterator `return()` on a break) ends normally and relinquishes queued frames;
+`cancel()` aborts iteration. Closing/cancelling before a request is sent rejects it locally with
+`CancelledError`, without replaying it after connect. Only one iterator `next()` may be pending.
+Both preserve frames already handed to the consumer, which remain
+valid until that consumer calls their release. A reconnect/owner change fails an already-started
+stream with `SessionLostError`; it never replays frames already received. Old frame handles
+capture their original connection. Releasing one after reconnect, client close or owner change
+still detaches locally, and never sends its capabilities to the replacement connection.
+
+Each connection creates its return pool lazily on its first export. It is charged to that owner's
+governor, capped at 4 MiB (twice the default credit window, regardless of larger user prefetch),
+and closed on connection teardown. Capabilities are one-use and bounded; expired, duplicate,
+foreign, detached or wrong-sized returns are dropped. No lost return is awaited. Client-held
+frames after credit are client memory: the cap bounds returned idle buffers, not arbitrary caller
+retention. A terminal full-table export can use the larger 2 MiB target and decode directly into
+exclusive returned output. SQL's names-only identity projection forwards that ownership and keeps
+its profile counters; computed/reordered projections retain the copying path. No page-cache or
+slab buffer is eligible. Protocol version 6 adds the explicit mode, capability lists and independent
+`returnBuffers` signal; old versions are refused during handshake. This is a wire-only change,
+with no stored-format change.
+
 - One owner per database holds the store's fence: a dedicated owner worker started by a page, or
   a dedicated worker hosting in place. Every other context is a thin client over a MessagePort
   brokered by a SharedWorker; the owner tab's own client uses a direct channel.
@@ -1469,7 +1589,7 @@ include it. Validation checks all normalized words, row multiplicity and stable 
   `CommittedWithoutResultError`, never an empty result.
 - Result frames are the executor's payloads, pulled and transferred without a copy, and charged
   until the client releases them. Dictionaries are per stream, sent as frame-level deltas.
-- A message whose buffers total less than `TRANSFER_MIN_BYTES` (1 KiB) is cloned, not
+- An ordinary message whose buffers total less than `TRANSFER_MIN_BYTES` (1 KiB) is cloned, not
   transferred: below it a copy is cheaper than detaching the buffers (R22.1; the latency lane
   measures the crossover per engine). Releases ride on the client's next request, or go alone
   after `RELEASE_DELAY_MS` (10 ms) or once half the result window is unreleased (R22.2).

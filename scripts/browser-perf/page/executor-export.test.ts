@@ -7,12 +7,14 @@ import { seedsFor } from "../../../packages/core/src/testing/seeds.js";
 import {
   createReach,
   EXECUTOR_EXPORT_REACH,
+  EXPORT_RETURN_REACH,
   EXECUTOR_POLICY_REACH,
   RESULT_OWNED_REACH,
 } from "../../../packages/core/src/testing/reach.js";
 import * as factory from "../../../packages/core/src/next/exec/create.js";
 import { PageCache } from "../../../packages/core/src/next/storage/page-cache.js";
 import { VERIFY_CACHED_BYTES } from "../../../packages/core/src/next/storage/verify-cached.js";
+import { ResultSink } from "../../../packages/core/src/next/exec/result-sink.js";
 import { ColumnTarget } from "../../../packages/core/src/next/exec/column-target.js";
 import type { StoreSession } from "../../../packages/core/src/next/storage/contract.js";
 import type { ExtentReader } from "../../../packages/core/src/next/storage/extents.js";
@@ -20,6 +22,8 @@ import { chunkReads } from "../../../packages/core/src/next/exec/scan.js";
 import type { PhysicalPlan, ScalarExpr } from "../../../packages/core/src/next/ir/ir.js";
 import { numbers } from "../../../packages/core/src/next/exec/kernels/test-support.js";
 import { Governor } from "../../../packages/core/src/next/memory/governor.js";
+import { ReturnPool } from "../../../packages/core/src/next/exec/return-pool.js";
+import { recyclingFrame } from "../../../packages/core/src/next/owner/recycling-frame.js";
 import { StreamDictionaries } from "../../../packages/core/src/next/owner/frame.js";
 import { MemoryExtentSpace } from "../../../packages/core/src/next/page/memory-extents.js";
 import {
@@ -42,14 +46,19 @@ vi.mock("../../../packages/core/src/next/storage/verify-cached.js", async (origi
   VERIFY_CACHED_BYTES: false,
 }));
 
-describe.each(["full", "identity", "subset", "project", "filter"] as const)(
-  "terminal policy %s",
-  (shape) => {
+describe.each(
+  (["full", "identity", "subset", "project", "filter"] as const).flatMap((shape) =>
+    [false, true].map((recycle) => ({ shape, recycle })),
+  ),
+)(
+  "terminal policy $shape with explicit streaming export buffer recycling=$recycle",
+  ({ shape, recycle }) => {
     it.each(seedsFor("next-executor-export", [0xb2e1, 0xb2e2]))(
       "production executor, exact MessagePort values, credits and cleanup (seed %i)",
       async (seed) => {
         const reach = createReach("next-executor-export", [
           ...EXECUTOR_EXPORT_REACH,
+          ...(recycle ? EXPORT_RETURN_REACH.slice(0, 2) : []),
           RESULT_OWNED_REACH.cache,
           ...(shape === "full" ? [RESULT_OWNED_REACH.adopt] : []),
           shape === "full" || shape === "identity"
@@ -121,6 +130,7 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
             for (const buffer of result.buffers) dedicated.add(buffer);
             return result;
           });
+        const batchTarget = vi.spyOn(ResultSink.prototype, "terminalBatchTarget");
         const opened = vi.spyOn(chunkReads, "open"),
           together = vi.spyOn(chunkReads, "loadTogether");
         try {
@@ -128,10 +138,12 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
             fc.asyncProperty(
               fc.integer({ min: 65, max: 160 }),
               fc.integer({ min: 1, max: 31 }),
-              async (count, salt) => {
+              fc.boolean(),
+              async (count, salt, returnBeforeCredit) => {
                 reach.beginHistory();
                 const space = new MemoryExtentSpace(),
-                  governor = new Governor(64 * 1024 * 1024);
+                  governor = new Governor(64 * 1024 * 1024),
+                  returnPool = recycle ? new ReturnPool(governor, 4 * 1024 * 1024) : undefined;
                 const sources = Array.from({ length: 2 }, (_, group) => [
                   {
                     type: { kind: "int32", bits: 32 } as const,
@@ -238,10 +250,18 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
                   frames = 0,
                   creditTasks = 0,
                   failure: unknown;
-                ports.port2.onmessage = (event: MessageEvent<{ frames: FramePayload[] }>) => {
+                const released: Array<Promise<void>> = [];
+                ports.port2.onmessage = (
+                  event: MessageEvent<{ frames: FramePayload[]; bufferIds?: number[] }>,
+                ) => {
                   for (const frame of event.data.frames) {
                     try {
-                      dictionaries.apply(frame);
+                      // A recycling consumer owns compact stream dictionaries independently of released frames.
+                      dictionaries.apply(
+                        recycle
+                          ? { ...frame, dictionaries: structuredClone(frame.dictionaries) }
+                          : frame,
+                      );
                       for (let row = 0; row < frame.rowCount; row++) {
                         const absolute = received + row,
                           group = Math.floor(absolute / count),
@@ -280,31 +300,76 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
                     }
                     received += frame.rowCount;
                     frames++;
-                    // A task-delayed cumulative owner credit, never release in the sender on offer.
-                    setTimeout(() => {
-                      creditTasks++;
-                      ports.port2.postMessage({ t: "release", target: 1, through: frame.sequence });
-                    }, 0);
+                    const handle = event.data.bufferIds
+                      ? recyclingFrame(frame, event.data.bufferIds, (buffers, transfer) =>
+                          ports.port2.postMessage(
+                            { t: "return", target: 1, through: frame.sequence, buffers },
+                            transfer,
+                          ),
+                        )
+                      : null;
+                    const beforeRelease = frame.columns[0];
+                    const retained =
+                      beforeRelease?.form === "flat" && beforeRelease.data.layout === "i32"
+                        ? beforeRelease.data.values
+                        : null;
+                    const firstValue = retained?.[0];
+                    const relinquish = () => {
+                      if (retained) expect(retained[0]).toBe(firstValue);
+                      handle?.release();
+                      if (handle) reach.reach(EXPORT_RETURN_REACH[0]);
+                      if (handle && retained) expect(retained.length).toBe(0);
+                    };
+                    if (returnBeforeCredit) relinquish();
+                    // Credit is independent: callers can retain views after credit but before release.
+                    released.push(
+                      new Promise<void>((resolve) =>
+                        setTimeout(() => {
+                          creditTasks++;
+                          ports.port2.postMessage({
+                            t: "release",
+                            target: 1,
+                            through: frame.sequence,
+                          });
+                          if (!returnBeforeCredit) {
+                            if (handle) reach.reach(EXPORT_RETURN_REACH[1]);
+                            try {
+                              relinquish();
+                            } catch (error) {
+                              failure = error;
+                            }
+                          }
+                          resolve();
+                        }, 0),
+                      ),
+                    );
                   }
                 };
                 ports.port2.start();
                 try {
                   const before = create.mock.calls.length,
                     openBefore = opened.mock.calls.length,
-                    sharedBefore = together.mock.calls.length;
+                    sharedBefore = together.mock.calls.length,
+                    batchBefore = batchTarget.mock.calls.length;
                   const run = prepareExecutorExport(
                     pages,
                     fixtures.map((f) => ({ rows: count, chunks: f.group.columns })),
                     {
                       governor,
+                      ...(returnPool ? { returnPool } : {}),
                       port: ports.port1,
                     },
                   );
                   expect(create.mock.calls.length).toBe(before + 1);
                   reach.reach("production executor preparation");
                   const result = await run();
+                  await Promise.all(released);
                   if (failure) throw failure;
+                  expect(batchTarget.mock.calls.length - batchBefore).toBe(
+                    (shape === "full" || shape === "identity") && recycle ? 1 : 0,
+                  );
                   expect(result.rows).toBe(2 * count);
+                  expect(result.executorStats.outputRecycling).toBe(recycle);
                   expect(
                     opened.mock.calls
                       .slice(openBefore)
@@ -341,6 +406,7 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
                     reach.reach(RESULT_OWNED_REACH.adopt);
                   }
                   cache.close();
+                  returnPool?.close();
                   expect(governor.usedBytes).toBe(0);
                   expect(space.leased).toBe(0);
                   reach.reach("execution charges returned");
@@ -357,6 +423,7 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
                   }
                   reach.reach("source survives transfer");
                 } finally {
+                  returnPool?.close();
                   cache.close();
                   ports.port2.close();
                 }
@@ -368,6 +435,7 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
         } finally {
           create.mockRestore();
           decodeOwned.mockRestore();
+          batchTarget.mockRestore();
           opened.mockRestore();
           together.mockRestore();
         }
@@ -375,3 +443,65 @@ describe.each(["full", "identity", "subset", "project", "filter"] as const)(
     );
   },
 );
+
+for (const seed of seedsFor("next-executor-return-cancel", [0xb2c4, 0xb2c5]))
+  it(`cancellation never waits for a retained export frame (${String(seed)})`, async () => {
+    const reach = createReach("export return cancellation", EXPORT_RETURN_REACH.slice(2));
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 65, max: 96 }),
+        fc.integer({ min: 1, max: 31 }),
+        async (count, salt) => {
+          reach.beginHistory();
+          const fixture = await writeGroup([
+            {
+              type: { kind: "text" },
+              values: Array.from({ length: count }, (_, i) =>
+                new Uint8Array(65536 + salt + i).fill(65 + (i % 20)),
+              ),
+            },
+          ]);
+          const governor = new Governor(64 * 1048576),
+            pool = new ReturnPool(governor, 4 * 1048576),
+            ports = new MessageChannel();
+          let retained: ReturnType<typeof recyclingFrame> | undefined;
+          ports.port2.onmessage = (
+            event: MessageEvent<{ frames: FramePayload[]; bufferIds: number[] }>,
+          ) => {
+            const payload = event.data.frames[0];
+            if (!payload || retained) return;
+            retained = recyclingFrame(payload, event.data.bufferIds, (buffers, transfer) =>
+              ports.port2.postMessage(
+                { t: "return", target: 1, through: payload.sequence, buffers },
+                transfer,
+              ),
+            );
+            ports.port2.postMessage({ t: "release", target: 1, through: Number.MAX_SAFE_INTEGER });
+          };
+          ports.port2.start();
+          try {
+            const run = prepareExecutorExport(
+              fixture.space,
+              [{ rows: count, chunks: fixture.group.columns }],
+              { governor, returnPool: pool, port: ports.port1 },
+            );
+            await expect(run()).rejects.toThrow();
+            expect(retained).toBeDefined();
+            reach.reach(EXPORT_RETURN_REACH[2]);
+            // Cancellation closes execution charges even though the client still owns its frame.
+            pool.close();
+            expect(governor.usedBytes).toBe(0);
+            retained?.release(); // late/lost return is never awaited by cancellation
+            reach.reach(EXPORT_RETURN_REACH[3]);
+            expect(governor.usedBytes).toBe(0);
+          } finally {
+            pool.close();
+            ports.port1.close();
+            ports.port2.close();
+          }
+        },
+      ),
+      { seed, numRuns: 16 },
+    );
+    reach.assertReached();
+  });

@@ -57,7 +57,7 @@ export class ResultSink implements Operator {
   readonly #frames = new Set<FrameStore>();
   readonly #metadataBytes: number;
   readonly #rowsPerFrame: number;
-  readonly #target: number;
+  #target: number;
   #batch: Batch | null = null;
   #transfer: Transfer | null = null;
   #at = 0;
@@ -92,6 +92,20 @@ export class ResultSink implements Operator {
       rows /= 2;
     }
     this.#rowsPerFrame = rows;
+  }
+
+  /** A direct terminal scan can amortize wide-column allocation with a larger owned batch.
+   * Configure before input; the existing credit window is a hard bound. Copying fallbacks keep
+   * their conservative row capacity. Nothing changes for other producers/consumer pipelines.
+   */
+  terminalBatchTarget(bytes: number): number {
+    this.#check();
+    if (!Number.isSafeInteger(bytes) || bytes <= 0)
+      throw new TypeError("Positive terminal batch target required");
+    if (this.#batch !== null || this.#rows !== 0 || this.#frames.size !== 0)
+      throw new TypeError("Terminal batch target must precede input");
+    this.#target = Math.max(this.#target, Math.min(bytes, this.channel.windowBytes));
+    return this.#target;
   }
 
   /** Stable per-stream admission used by a direct terminal source before output reservation. */

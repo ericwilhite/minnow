@@ -1,0 +1,39 @@
+{
+  "base": "095f5f1cd96577ec3e974fb78135aac81f2137f9",
+  "state": "rejected",
+  "implementation": "copy existing native frame lanes into one fresh packed frame buffer; source decode remains per-column",
+  "patchSha256": "185f9ef094818264249d101759efeaa89d7c6a3864f19f3f26f7c93c599da149",
+  "files": {
+    "packages/core/src/next/exec/frame-memory.ts": "3549a9f1f0d2c5b72cb1c3b62faf22c9ada7358b08d5d08ae3a6dfbfdc3c5fc1",
+    "packages/core/src/next/exec/result-dictionaries.ts": "5d04ff31152a0635fbb6693d4b1c952aa265574e9e5d3b2f28ab810a1b6f43d6",
+    "packages/core/src/next/exec/result-sink.ts": "1e648c8aca7243329ea3fbcace1175fdc015759e44374c50d84450a5e61329ad",
+    "packages/core/src/next/exec/result.ts": "e9cc59310052649b87af7d658c8ac70c1eed923c0f62aba9f9357e538ad7c8a9",
+    "packages/core/src/next/owner/client.ts": "50577f4ec045705a44839fb9a786c046db19d0839c7c278629bb9fd5fe602033",
+    "packages/core/src/next/owner/frame.ts": "1e888279d6ff81e4cf247240cd709aea73e33f847b53d3bbe0160950dfd9d23c",
+    "packages/core/src/next/owner/server.ts": "fde60586566bd70467be704910cf0e433ab8923df2ae35b36f9d50a535e1c5a9",
+    "packages/core/src/next/testing/packed-frame.test.ts": "06254736f58341d164e78be23a4db9c4c031582789140c94d28762f55d8ede8c",
+    "packages/core/src/next/testing/packed-input.ts": "5d3d4347816cb58e05cdcac2887bf9ba8e2c19e4fb960ea82d6f4237f1044fa3",
+    "packages/core/src/next/testing/storage-core.ts": "89df24ff2b628c92fe4f179d5a016225550c74578fadbe88bf07672c38b37452",
+    "packages/core/src/next/vector/frame.ts": "1c634e52adf3420432a1f26323624cf8bfe85953448637c62031a3ca6ad5eca4",
+    "packages/core/src/next/vector/pack-frame.ts": "7b367fe63fec48ac21f4155b80f3fe963ed56a37d8f29c8b50c9a82563322840",
+    "packages/core/src/testing/reach.ts": "61af68258ae2bc1e712c60de620d700fbccd1d75a425b762a8778a61a442141f",
+    "scripts/browser-perf/page/discard-receiver.ts": "cb5888cc5fa6f43534893f5d1e7fa3467e182c68ca5aa6f2d420c1fc984c9f1d",
+    "scripts/browser-perf/page/executor-export.ts": "8940775c34fcedd4ccade5945a82759442c6cd7e7911f7806546c41040641697",
+    "scripts/browser-perf/page/scan-export.ts": "1f32413fceed7335fcb90265f370c01a8a51ef43cbff2e0a9cbf5b2f8ff7b83f"
+  },
+  "limits": [
+    "Failed adoption: RSS ranges overlap and throughput regresses.",
+    "The temporary-copy reservation rejects previously supported 550000-byte rows under a 1MiB reserve.",
+    "The experimental receiver compacts UTF-8 dictionary deltas; other dictionary entry layouts were not a supported production output in this snapshot.",
+    "This is a frozen diagnostic, never a production frame contract or stored-format change."
+  ],
+  "baseArchiveSha256": "48267c38bb51e208e13cdbd730f7eb3920f9fd3b55ec3dc0cc1ad5d23cb3a359",
+  "baseArchivePaths": [
+    "packages/core/src/next",
+    "packages/core/src/testing/reach.ts",
+    "scripts/browser-perf/page/executor-export.ts",
+    "scripts/browser-perf/page/scan-export.ts",
+    "scripts/browser-perf/page/discard-receiver.ts"
+  ],
+  "baseArchiveFilter": ".ts files excluding .test.ts and .bench.ts; the patch adds its own test support"
+}

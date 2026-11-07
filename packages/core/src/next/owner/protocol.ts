@@ -31,7 +31,7 @@
  * - Every request gets **exactly one terminal reply** (`done`, `error`, `prepared`, `value`),
  *   possibly preceded by `rows` messages. After its terminal reply a seq is never mentioned again
  *   by the owner.
- * - Signals (`cancel`, `release`, `liveness`, `liveAck`, `unprepare`, `bye`) have no seq and no
+ * - Signals (`cancel`, `release`, `returnBuffers`, `liveness`, `liveAck`, `unprepare`, `bye`) have no seq and no
  *   reply.
  * - The owner may answer requests out of order. Requests on one session run in arrival order.
  *
@@ -46,8 +46,11 @@
  *   iterator, and a buffered result's frames as they arrive. Unreleased bytes reach the request's
  *   `windowBytes` and the executor pauses: a slow consumer costs one window, never a growing
  *   buffer.
- * - Messages whose buffers add up to less than `TRANSFER_MIN_BYTES` (frame.ts) are cloned, larger
- *   ones transferred (ruling R22.1).
+ * - Ordinary messages whose buffers total less than `TRANSFER_MIN_BYTES` (frame.ts) are cloned,
+ *   larger ones transferred (ruling R22.1). Explicit streaming exports always transfer. Their
+ *   credits return on handout as for cursors; only consumer `release()` sends `returnBuffers`.
+ *   These one-use capabilities belong to their issuing connection, never to a replacement owner.
+ *   Missing returns never block. Released views are detached and must not be accessed.
  * - RETURNING rows (ruling R2) are delivered only once the write is committed: for an autocommit
  *   write, after its commit is acknowledged per durability mode (strict: durable; relaxed:
  *   applied). Until then the executor keeps them in a charged, spillable spool and offers no
@@ -214,7 +217,7 @@ export type TransactionState = "idle" | "open" | "failed" | "timedOut";
 export const DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
 
 /** Bumped by every change to a message in this file or in frame.ts. */
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 
 /** The owner sends `alive` at least this often while a client has requests in flight. */
 export const ALIVE_INTERVAL_MS = 1_000;
@@ -318,6 +321,8 @@ export type SessionId = number;
 
 /** How the rows of a statement come back. */
 export interface ResultRequest {
+  /** Explicit columnar export: return buffers only when its consumer relinquishes a frame. */
+  readonly recycle?: boolean;
   /**
    * Unreleased frame bytes the stream may hold before the executor pauses (the executor's
    * `resultWindowBytes`). `DEFAULT_RESULT_WINDOW_BYTES` unless the caller asked for more prefetch.
@@ -445,6 +450,13 @@ export interface Release {
   readonly through: number;
 }
 
+/** One-use frame capabilities on this connection. Independent of cumulative result credit. */
+export interface ReturnBuffers {
+  readonly t: "returnBuffers";
+  readonly through: number;
+  readonly buffers: ReadonlyArray<{ readonly id: number; readonly buffer: ArrayBuffer }>;
+}
+
 /**
  * `held: true`: the client now holds its liveness lock, so its outstanding requests and its pins
  * (open transactions, cursors) may be watched. `held: false`, sent before it releases the lock
@@ -483,7 +495,7 @@ export interface Bye {
   readonly t: "bye";
 }
 
-export type Signal = Cancel | Release | Liveness | LiveAck | Unprepare | Ping | Bye;
+export type Signal = Cancel | Release | ReturnBuffers | Liveness | LiveAck | Unprepare | Ping | Bye;
 
 export type ClientMessage = Hello | Request | Signal;
 
@@ -574,6 +586,8 @@ export interface Rows {
   /** Present on the first message of a result unless the client already has them. */
   readonly columns: readonly WireColumnMeta[] | null;
   readonly frames: readonly FramePayload[];
+  /** One capability list per frame, only for explicit recycling exports. */
+  readonly bufferIds?: ReadonlyArray<readonly number[]>;
 }
 
 export interface Done {
@@ -582,6 +596,7 @@ export interface Done {
   readonly columns: readonly WireColumnMeta[] | null;
   /** The last frames, inline (often the only one: a small result is this one message). */
   readonly frames: readonly FramePayload[];
+  readonly bufferIds?: ReadonlyArray<readonly number[]>;
   readonly summary: StatementSummary;
 }
 
@@ -714,6 +729,7 @@ const CLIENT_KINDS = new Set<string>([
   "admin",
   "cancel",
   "release",
+  "returnBuffers",
   "liveness",
   "liveAck",
   "unprepare",
@@ -785,5 +801,21 @@ export function parseClientMessage(value: unknown): ClientMessage {
   }
   if (kind === "hello" && (value as Partial<Hello>).protocol === undefined)
     throw new ProtocolError("Hello without a protocol version");
+  if (kind === "returnBuffers") {
+    const message = value as Partial<ReturnBuffers>;
+    if (
+      !Number.isSafeInteger(message.through) ||
+      (message.through ?? -1) < 0 ||
+      !Array.isArray(message.buffers) ||
+      message.buffers.some(
+        (item: unknown) =>
+          typeof item !== "object" ||
+          item === null ||
+          !Number.isSafeInteger((item as { id?: unknown }).id) ||
+          !((item as { buffer?: unknown }).buffer instanceof ArrayBuffer),
+      )
+    )
+      throw new ProtocolError("Invalid frame buffer return");
+  }
   return value as ClientMessage;
 }

@@ -10,6 +10,7 @@ import {
   workerOwner,
 } from "../../dist/next/owner/connector.js";
 import { STEP_DOWN_BOUND_MS, type LifecycleEvent } from "../../dist/next/owner/election.js";
+import { frameTransferList } from "../../dist/next/exec/frame-buffers.js";
 import type { WireValue } from "../../dist/next/owner/protocol.js";
 
 interface Opened {
@@ -455,4 +456,42 @@ export async function waitForOwnerPhase(
   } finally {
     channel.close();
   }
+}
+
+/** Real worker/MessagePort export smoke: credit and cancellation never detach held views. */
+export async function exportReleaseCheck() {
+  const { client } = current();
+  const ordinary = await client.query("SELECT * FROM t");
+  const stream = client.exportStream("SELECT * FROM t", [], { windowBytes: 1 });
+  const first = await stream.frames.next();
+  if (first.done) throw new Error("missing worker export frame");
+  const handle = first.value;
+  const buffers = frameTransferList(handle.payload);
+  const views = buffers.map((buffer) => new Uint8Array(buffer));
+  const expected = views.map((view) => Array.from(view));
+  const columns = (await stream.columns).length;
+  stream.close();
+  await stream.done;
+  const validAfterClose = views.every(
+    (view, i) => JSON.stringify(Array.from(view)) === JSON.stringify(expected[i]),
+  );
+  handle.release();
+  handle.release();
+  const detached = views.every((view) => view.length === 0);
+  // Force subsequent dedicated output to use returned size classes, then check old views again.
+  const again = client.exportStream("SELECT * FROM t");
+  let rows = 0;
+  for await (const frame of again.frames) {
+    rows += frame.payload.rowCount;
+    frame.release();
+  }
+  await again.done;
+  return {
+    columns,
+    validAfterClose,
+    detached,
+    stillDetached: views.every((view) => view.length === 0),
+    rows,
+    ordinaryRows: ordinary.rows(),
+  };
 }

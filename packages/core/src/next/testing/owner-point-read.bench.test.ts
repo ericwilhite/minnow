@@ -187,6 +187,9 @@ function stubEngine(): OwnerEngine {
     close: () => undefined,
   } as unknown as EngineSession;
   return {
+    createReturnPool: () => {
+      throw new Error("Point benchmark stub has no streaming output pool");
+    },
     durability: "strict",
     catalogVersion: 1,
     ledger: new RequestLedger(),

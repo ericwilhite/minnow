@@ -452,3 +452,19 @@ test("an unsettled release reports unknown before client reconnect", async ({ pa
   await call(c, "open", name);
   expect([0, 1]).toContain(await n(c));
 });
+
+test("explicit streaming export relinquishes worker buffers only on release", async ({ page }) => {
+  const name = dbName("export-release");
+  await tab(page);
+  await call(page, "wipe", name);
+  await call(page, "open", name);
+  await seed(page);
+  expect(await call(page, "exportReleaseCheck")).toEqual({
+    columns: 3,
+    validAfterClose: true,
+    detached: true,
+    stillDetached: true,
+    rows: 1,
+    ordinaryRows: [[1, 0, "x"]],
+  });
+});

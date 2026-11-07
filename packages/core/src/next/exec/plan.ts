@@ -4,7 +4,7 @@ import type { PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { ResultSink } from "./result-sink.js";
 import { batchTargetFor, type Grant } from "../memory/governor.js";
 import type { ByteCharge } from "../vector/varlen.js";
-import type { PhysicalType } from "../types.js";
+import { samePhysicalType, type PhysicalType } from "../types.js";
 import { BATCH_ROWS, type Batch, type Selection, type Vector } from "../vector/vector.js";
 import { int64At } from "../vector/int64.js";
 import { AggregateOperator } from "./agg/aggregate.js";
@@ -362,6 +362,8 @@ export function compilePlan(plan: PhysicalPlan): Program {
   const fixed = (rel: Rel, minimum: number | ((cap: number) => number)) =>
     admissions.push({ rel, minimum });
   const ids = new Set<number>();
+  // A terminal names-only projection forwards export ownership while retaining profile counts.
+  const exportOwners = new WeakMap<Operator, ResultSink>();
   // SQL SELECT * may retain an identity projection for output names. It neither retains
   // source batches nor re-reads them; computed/reordered projections and other consumers stop here.
   let terminalInput = plan.root;
@@ -443,8 +445,11 @@ export function compilePlan(plan: PhysicalPlan): Program {
                   terminal &&
                   rel.columns.length === table.columns.length &&
                   rel.columns.every((id, k) => id === table.columns[k]?.id);
-                const owner =
-                  terminalFull && downstream instanceof ResultSink ? downstream : undefined;
+                const owner = terminalFull
+                  ? downstream instanceof ResultSink
+                    ? downstream
+                    : exportOwners.get(downstream)
+                  : undefined;
                 const output = owner?.grant;
                 const scan = new TableScan({
                   table,
@@ -456,13 +461,19 @@ export function compilePlan(plan: PhysicalPlan): Program {
                   emitLocator: rel.emitLocator,
                   context,
                   loans: { borrow: (bytes) => grant.borrow(bytes, runtime.signal) },
-                  targetBytes: target,
+                  // Larger batches remain restricted to explicit relinquishing export consumers.
+                  targetBytes: runtime.request.outputBuffers
+                    ? (owner?.terminalBatchTarget(2 * target) ?? target)
+                    : target,
                   readWindowBytes: terminalFull ? 64 * 1024 * 1024 : 0,
                   ...(output === undefined
                     ? {}
                     : {
                         transferOutputs: "dictionary" as const,
                         outputBudget: output,
+                        ...(runtime.request.outputBuffers
+                          ? { outputBuffers: runtime.request.outputBuffers }
+                          : {}),
                         outputDictionary: (dictionary) =>
                           owner?.admitDictionary(dictionary) ?? false,
                         borrowOutputOnRefusal: true,
@@ -504,8 +515,35 @@ export function compilePlan(plan: PhysicalPlan): Program {
           (operator) => operator.abort(undefined),
         );
         fixed(rel, Math.max(4096, minimum));
-        return (runtime, downstream, stops) =>
-          instantiate(
+        const identity =
+          rel.op === "project" &&
+          rel.exprs.length === rel.input.output.length &&
+          rel.output.length === rel.exprs.length &&
+          rel.exprs.every((expr, k) => {
+            const before = rel.input.output[k],
+              after = rel.output[k];
+            return (
+              expr.op === "column" &&
+              expr.index === k &&
+              before !== undefined &&
+              after !== undefined &&
+              samePhysicalType(before.type, expr.type) &&
+              samePhysicalType(expr.type, after.type)
+            );
+          });
+        return (runtime, downstream, stops) => {
+          const owner =
+            runtime.request.outputBuffers && identity
+              ? downstream instanceof ResultSink
+                ? downstream
+                : exportOwners.get(downstream)
+              : undefined;
+          if (owner) {
+            const output = counted(runtime, rel, downstream);
+            exportOwners.set(output, owner);
+            return child(runtime, output, stops);
+          }
+          return instantiate(
             runtime,
             rel,
             input,
@@ -529,6 +567,7 @@ export function compilePlan(plan: PhysicalPlan): Program {
                 : child(runtime, operator, childStops);
             },
           );
+        };
       }
       case "aggregate":
       case "distinct": {

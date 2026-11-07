@@ -364,6 +364,8 @@ export const WINDOW_CANCEL_REJECTION_REACH = [
 
 /** Descriptor reuse across scan phases, endpoint page spans and residency changes. */
 export const SCAN_SHAPE_REACH = [
+  "sparse NULLs in every layout",
+  "recycled native bytes",
   "512 B raw page",
   "2 KiB raw page",
   "same page span",
@@ -715,3 +717,91 @@ export const STORAGE_PHASE_CONTROLLER_REACH = [
   "no-request-occurrence-advanced",
   "parked-prefix-drained-before-teardown",
 ] as const;
+
+/** Discard-only benchmark receiver: columns end at consume, dictionaries at stream close. */
+export const DISCARD_RECEIVER_REACH = [
+  "disposed columns",
+  "live dictionary",
+  "sparse",
+  "all valid",
+  "empty frame",
+] as const;
+
+/** Larger direct terminal batches keep exact values and the existing owner credit bound. */
+export const TERMINAL_BATCH_REACH = [
+  "ordinary target unchanged",
+  "all valid",
+  "sparse NULLs",
+  "owned frame above 1MiB",
+  "unchanged credit bound",
+  "exact received values",
+  "small credit cap",
+] as const;
+
+/** Frozen rejected packed-frame diagnostic: native bytes, dictionaries, malformed views and cleanup. */
+export const PACKED_FRAME_REACH = [
+  "all valid",
+  "sparse NULLs",
+  "large varlen",
+  "dictionary delta",
+  "dictionary append",
+  "one fresh buffer",
+  "foreign",
+  "overlap",
+  "misaligned",
+  "out of bounds",
+  "wrong type",
+  "short lane",
+  "complete",
+  "abort",
+  "cancel",
+] as const;
+
+/** Explicit output relinquishment and one-use return capabilities. */
+export const OUTPUT_RETURN_REACH = [
+  "held",
+  "released",
+  "reused",
+  "foreign",
+  "not detached",
+  "wrong size",
+  "replay",
+  "detached reuse refused",
+  "late",
+  "cap",
+  "closed",
+] as const;
+
+export const EXPORT_RETURN_REACH = [
+  "explicit frame return",
+  "credit before frame return",
+  "cancel while retained",
+  "late return after cancel",
+] as const;
+
+export const OUTPUT_RETURN_PRESSURE_REACH = [
+  "stale size replaced",
+  "pressure close returns charges",
+] as const;
+
+export const OWNER_EXPORT_REACH = [
+  "credit independent of return",
+  "ordinary lifetime",
+  "held after credit",
+  "release after cancel",
+  "early close",
+  "release after reconnect",
+  "release after owner change",
+  "lost return does not block",
+  "detached across reuse",
+  "double release",
+  "small frames",
+  "large frames",
+] as const;
+
+export const OWNER_EXPORT_DATA_REACH = {
+  real: ["real factory and SQL", "wide int64 and large text", "sparse source", "all-valid source"],
+  dictionary: ["compacted dictionary delta", "later dictionary append"],
+  views: ["first view partial", "later alias partial"],
+  preconnect: ["close before connect", "cancel before connect", "concurrent next refused"],
+} as const;
