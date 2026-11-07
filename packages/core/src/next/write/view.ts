@@ -5,6 +5,7 @@
  * tombstone entries across memtable deltas and durable runs under the view's bound.
  */
 import { MemoryReads } from "./memory-read.js";
+import { StreamingRangeCursor } from "./range-cursor.js";
 import type { Held } from "../format/reachable.js";
 import type { CatalogView, ColumnDef, IndexDef, TableDef } from "../access/catalog.js";
 import {
@@ -698,7 +699,7 @@ export class SnapshotImpl implements Snapshot {
     (this.#holds ??= []).push(held);
   }
 
-  // Allocated only for bounded reads; ordinary snapshots keep their existing fast path.
+  // Allocated only for bounded reads or range cursors; ordinary snapshots keep their existing fast path.
   #cursors: Set<IndexCursor> | null = null;
   watchCursor(cursor: IndexCursor): () => void {
     this.check();
@@ -1084,7 +1085,7 @@ export class ViewIndex implements IndexReader {
 
   range(range: KeyRange, direction: "asc" | "desc"): IndexCursor {
     if (this.def.kind !== "ordered") throw new TypeError("An equality index serves lookups only");
-    return new RangeCursor(this, range, direction);
+    return new StreamingRangeCursor(this, range, direction);
   }
 
   /** Every live (key, rowId) in `range`, resolved, sorted by key then row id. */
@@ -1152,40 +1153,4 @@ function startsWith(key: Uint8Array, prefix: Uint8Array): boolean {
   if (key.length < prefix.length) return false;
   for (let k = 0; k < prefix.length; k++) if (key[k] !== prefix[k]) return false;
   return true;
-}
-
-class RangeCursor implements IndexCursor {
-  #rows: number[] | null = null;
-  #at = 0;
-  #closed = false;
-
-  constructor(
-    readonly index: ViewIndex,
-    readonly range: KeyRange,
-    readonly direction: "asc" | "desc",
-  ) {}
-
-  next(out: Float64Array): MaybePromise<number> {
-    this.index.table.snapshot.check();
-    if (this.#closed) return 0;
-    if (this.#rows === null)
-      return this.index.collect(this.range).then((entries) => {
-        const rows = entries.map((entry) => this.index.table.locator(entry.rowId));
-        this.#rows = this.direction === "asc" ? rows : rows.reverse();
-        return this.#fill(out);
-      });
-    return this.#fill(out);
-  }
-
-  #fill(out: Float64Array): number {
-    const rows = this.#rows ?? [];
-    let filled = 0;
-    while (filled < out.length && this.#at < rows.length) out[filled++] = rows[this.#at++] ?? 0;
-    return filled;
-  }
-
-  close(): void {
-    this.#closed = true;
-    this.#rows = null;
-  }
 }

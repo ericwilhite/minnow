@@ -343,10 +343,10 @@ describe("extent deltas (ruling R25)", () => {
       let armed = false;
       let entered!: () => void;
       let release!: () => void;
-      const atPublish = new Promise<void>((resolve) => {
+      let atPublish = new Promise<void>((resolve) => {
         entered = resolve;
       });
-      const gate = new Promise<void>((resolve) => {
+      let gate = new Promise<void>((resolve) => {
         release = resolve;
       });
       const width = 6 + int(4);
@@ -398,6 +398,18 @@ describe("extent deltas (ruling R25)", () => {
           }),
         );
         await autocommit(path, (s) =>
+          s.changeCatalog({
+            kind: "createIndex",
+            index: {
+              tableId: dropped,
+              name: "overlap_index",
+              columnIds: [path.catalog.table(dropped)?.columns[0]?.id ?? 0],
+              unique: false,
+              role: "secondary",
+            },
+          }),
+        );
+        await autocommit(path, (s) =>
           s
             .table(dropped)
             .insert(batch(ints(Array.from({ length: width }, (_, k) => -k - 1))), null),
@@ -407,6 +419,33 @@ describe("extent deltas (ruling R25)", () => {
         expect(path.maintenance.buildsSettled).toBeGreaterThan(0);
         reach.reach("build-settled");
         expect(set).toEqual(await walk(overlap.space));
+        // A shared task-clock yield changes random DDL/flush overlap. Coordinate a catalog
+        // change explicitly, retaining all random histories and their exact-delta assertions.
+        armed = true;
+        await autocommit(path, (s) =>
+          s
+            .table(dropped)
+            .insert(batch(ints(Array.from({ length: width }, (_, k) => 100 + k))), null),
+        );
+        await autocommit(path, (s) => s.table(dropped).insert(batch(ints([2000])), null));
+        await atPublish;
+        const secondary = need(
+          path.catalog.table(dropped)?.indexes.find((i) => i.name === "overlap_index"),
+        );
+        await autocommit(path, (s) =>
+          s.changeCatalog({ kind: "dropIndex", indexId: secondary.id }),
+        );
+        release();
+        await path.quiesce();
+        expect(path.maintenance.flushesCatalogChanged).toBeGreaterThan(0);
+        reach.reach("flush-catalog-changed");
+        expect(set).toEqual(await walk(overlap.space));
+        atPublish = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
         armed = true;
         const ids = Array.from({ length: width }, (_, k) => k);
         await autocommit(path, (s) => s.table(dropped).insert(batch(ints(ids)), null));

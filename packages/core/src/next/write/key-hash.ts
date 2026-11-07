@@ -2,7 +2,8 @@
  * The memtable's key-index delta (access/key-index.ts "Structure"): equality-key bytes →
  * entries `(rowId, seq, put | tombstone)`, newest first per key. Typed arrays only: an
  * open-addressing table of key slots over xxHash32, keys in one byte arena, entries in parallel
- * arrays linked per key. Nothing is allocated per key or entry once grown.
+ * arrays linked per key. A charged leaf directory maintains entry order on writes for lazy
+ * ranges; its moves are bounded by the leaf size. Nothing is allocated per entry once grown.
  *
  * - `add` puts an entry at the head of its key's chain.
  * - `pop` removes the newest entry of the newest key touched, in exact reverse order of `add`
@@ -15,6 +16,8 @@ import { taskClock, yieldTask } from "../exec/pipeline.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { compareBytes } from "../vector/varlen.js";
 import { charged, copyRange, MemtableMemoryError, UNCHARGED, type Charge } from "./bytes.js";
+
+import { OrderedEntries } from "./ordered-entries.js";
 
 type DeltaVisitor = (
   arena: Uint8Array,
@@ -91,6 +94,9 @@ export class KeyDelta {
   #arena: Uint8Array;
   #arenaUsed = 0;
   #maxKeyBytes = 0;
+  get maxKeyBytes(): number {
+    return this.#maxKeyBytes;
+  }
   keyCount = 0;
   #rowIds: Float64Array;
   #seqs: Float64Array;
@@ -167,6 +173,43 @@ export class KeyDelta {
     return this.#arena.subarray(this.#keyStart[keySlot] ?? 0, this.#keyEnd[keySlot] ?? 0);
   }
 
+  #ordered: OrderedEntries | null = null;
+
+  /** Maintained on writes: no first-page sort or traversal workspace. */
+  ordered(): OrderedEntries | null {
+    return this.#ordered;
+  }
+
+  /** A cursor retains the delta's paid arrays even if its owning view is released during I/O. */
+  retain(): () => void {
+    if (this.#releaseRequested) throw new RangeError("A released delta cannot be retained");
+    this.#activeTraversals++;
+    let live = true;
+    return () => {
+      if (!live) return;
+      live = false;
+      if (--this.#activeTraversals === 0 && this.#releaseRequested) this.#releaseRetained();
+    };
+  }
+
+  #compareEntry(a: number, b: number): number {
+    const ka = this.keyOf(a),
+      kb = this.keyOf(b);
+    return (
+      compareBytes(
+        this.#arena,
+        this.keyStart(ka),
+        this.keyEnd(ka),
+        this.#arena,
+        this.keyStart(kb),
+        this.keyEnd(kb),
+      ) ||
+      this.rowId(a) - this.rowId(b) ||
+      Number(this.isTombstone(a)) - Number(this.isTombstone(b)) ||
+      a - b
+    );
+  }
+
   /** Adds an entry for `key[start … end)` at the head of its chain; returns the entry index. */
   add(
     key: Uint8Array,
@@ -185,6 +228,20 @@ export class KeyDelta {
     this.#tombstones[entry] = tombstone ? 1 : 0;
     this.#next[entry] = this.#head[keySlot] ?? -1;
     this.#keyOf[entry] = keySlot;
+    if (this.#ordered === null) {
+      this.#reserve(64);
+      this.#ordered = new OrderedEntries(
+        {
+          allocate: (bytes) => {
+            this.#reserve(bytes);
+            return true;
+          },
+          free: (bytes) => this.#free(bytes),
+        },
+        (a, b) => this.#compareEntry(a, b),
+      );
+    }
+    this.#ordered.add(entry);
     this.#head[keySlot] = entry;
     this.entryCount = entry + 1;
     return entry;
@@ -194,6 +251,7 @@ export class KeyDelta {
   pop(entry: number): void {
     if (entry !== this.entryCount - 1)
       throw new RangeError("Key delta entries are removed newest first");
+    this.#ordered?.remove(entry);
     const keySlot = this.#keyOf[entry] ?? 0;
     this.#head[keySlot] = this.#next[entry] ?? -1;
     this.entryCount = entry;

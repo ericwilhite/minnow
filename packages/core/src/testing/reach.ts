@@ -1923,6 +1923,63 @@ export const WRITE_PENDING_FLUSH_STATES = [
   "close settles",
 ] as const;
 
+/** Streaming index ranges preserve the pinned view while visiting only demanded output. */
+export const WRITE_STREAM_RANGE_STATES = [
+  "memory",
+  "32 MiB cap",
+  "64 MiB cap",
+  "indexeddb",
+  "ascending",
+  "descending",
+  "unique",
+  "nonunique",
+  "hot nonunique",
+  "memtable input",
+  "stored input",
+  "staged input",
+  "bounded range",
+  "empty range",
+  "output continuation",
+  "earlier statement",
+  "own writes invisible",
+  "older pin",
+  "committed delete",
+] as const;
+
+/** Maintained order survives growth and rollback while a cursor keeps its position. */
+export const WRITE_STREAM_DELTA_STATES = [
+  "ordered inserts",
+  "unordered pending inserts",
+  "leaf-sized tail",
+  "arena growth",
+  "ascending",
+  "descending",
+  "rollback while pinned",
+  "resume after mutation",
+  "invisible tail",
+] as const;
+
+/** Reverse run traversal handles the existing interleaved blocks and Bloom partitions. */
+export const WRITE_RANGE_DIRECTORY_STATES = [
+  "asynchronous metadata",
+  "cached metadata",
+  "one hot key",
+  "distinct keys",
+  "ascending",
+  "descending",
+  "crossed Bloom boundaries",
+  "bounded prefix seek",
+] as const;
+
+/** New ordered-leaf buffers must not bypass the memtable's native-capacity ownership. */
+export const WRITE_STREAM_ORDER_STATES = [
+  "denied before constructor",
+  "funded retry",
+  "native allocation witness",
+  "constructor failure refund",
+  "release once",
+] as const;
+
 /** An allocation failure after a key prefix cannot leave index effects of aborted rows. */
 export const WRITE_PARTIAL_DELTA_STATES = [
   "memory",

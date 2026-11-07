@@ -690,6 +690,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.keys = new KeyBatch(grant);
     const space = input.space;
     this.shared = {
+      governor: input.governor,
       space,
       budget: grant,
       readers: new ReaderRegistry(),

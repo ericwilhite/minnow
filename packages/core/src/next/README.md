@@ -198,6 +198,29 @@ If a key allocation fails after several puts or tombstones, rollback removes tha
 prefix in every index. `write/partial-delta-rollback.test.ts` injects budget and native faults
 in primary, unique and non-unique indexes over both stores, then checks retry and durable reopen.
 
+## Streaming index ranges
+
+Ordered range cursors merge one head per durable run, memtable delta and visible staging run.
+They stop when the caller's output fills. Memtable order is maintained by writes: an ordered
+append prefix is implicit entry ids, and out-of-order entries use charged leaves; the first read does not collect keys or build a permutation. Run cursors read fences and
+block references lazily and decode one reusable block per input in either direction. A run's
+min/max key is a heap sentinel until that run can affect output. Directory positions are scalars:
+unbounded ASC decodes its first reference directly; DESC uses the existing Bloom directory's
+partition boundaries to walk index records backwards. A bounded seek uses one shared metadata
+workspace, rather than retaining fence/ref arrays per input. Bloom filters are not loaded. The run format and stored Bloom bytes are unchanged.
+
+A cursor owns an admitted write-side grant for its heap, heads, key buffers, small reverse partition offsets and
+one shared metadata/read workspace. Admission waits under temporary pressure. Close cancels admission and
+reads; an in-flight call settles before its scratch and the snapshot's last pin are released.
+The shared worker task clock slices both skipped versions and metadata decoding. Range membership
+uses the same prefix-bound rule in `access/key-index.ts`; visibility uses the captured view bound.
+
+`write/range-cursor.test.ts` compares the stream against the retained eager reference across
+memory and simulated IndexedDB, ASC/DESC, ranges, deletes, statements, staging and older pins.
+It checks actual prefix work, cold-read close, admission pressure and native-buffer precharge.
+`scripts/write-range-bench.mts` measures first-page CPU in interleaved eager/streamed rounds;
+its memory-store results exclude payload fetch, SQL, owner transport and real disk latency.
+
 ## Dependency rules
 
 `dependency-rules.test.ts` enforces these.
