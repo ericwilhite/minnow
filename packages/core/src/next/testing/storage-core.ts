@@ -1,6 +1,5 @@
 /** Differential/Node-bench adapter over B3's actual write path and B1's extent storage. */
 import type { CreateTableInput, DatabaseRow } from "../../engine/database.js";
-import type { QueryParameter } from "../../engine/query.js";
 import type { StoreKind } from "../../testing/differential-harness.js";
 import type { CatalogChange, TableDef } from "../access/catalog.js";
 import type { Statement } from "../access/modify.js";
@@ -108,7 +107,7 @@ export class StorageCore implements NextCore {
     }
     return { execution, release: () => snapshot.release() };
   }
-  async execute(sql: string, params: readonly QueryParameter[] = []): Promise<NextStatementResult> {
+  async execute(sql: string, params: readonly ParameterValue[] = []): Promise<NextStatementResult> {
     this.lastProfile = null;
     const lowered = this.lowerer.lower(sql, this.context());
     if (lowered.kind === "ddl") {

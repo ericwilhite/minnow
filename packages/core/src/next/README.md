@@ -862,8 +862,10 @@ recipes for VALUES, table scans with pushdown, filter/project kernels, hash aggr
 DISTINCT (including empty tuples: zero rows over empty input, one otherwise), hash joins (including keyless joins), sort/top-N, windows, and LIMIT/OFFSET. Each run
 owns its kernels, grants and source borrows. Preparation checks immutable operator metadata,
 without admitting execution grants or building breaker pools. A bound zero LIMIT skips its
-input in both reservation and execution, including a zero stored on an ORDER BY sort;
-prepare-time capability checks still cover that input. Small compiler probes determine
+input in both reservation and execution, including a zero stored on an ORDER BY sort.
+The active node first binds both bounds and validates OFFSET before LIMIT, once per execution;
+zero does not suppress its own negative/overflow error. Bounds in an unopened child stay
+unreached, and prepare-time capability checks still cover that input. Small compiler probes determine
 kernel buffer minimums; the generated allocation matrix checks them against real batch-sized
 buffers. Execute accepts caller-owned parameter values (keep them unchanged until execution ends).
 It admits the encoded inputs and active operator minimums atomically, then binds using that

@@ -1,13 +1,13 @@
 /** Immutable pipeline recipes; every execution instantiates its own operators and kernels. */
 import type { MaybePromise } from "../access/key-index.js";
-import type { Bound, PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
+import type { PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { batchTargetFor, type Grant } from "../memory/governor.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import type { PhysicalType } from "../types.js";
 import { BATCH_ROWS, type Batch, type Selection, type Vector } from "../vector/vector.js";
 import { int64At } from "../vector/int64.js";
 import { AggregateOperator } from "./agg/aggregate.js";
-import { ExecutionError, UnsupportedPlanError } from "./errors.js";
+import { UnsupportedPlanError } from "./errors.js";
 import { FilterOperator, ProjectOperator } from "./filter.js";
 import {
   HashJoin,
@@ -194,30 +194,6 @@ function counted(runtime: QueryRuntime, rel: Rel, sink: Operator): Operator {
     finish: () => sink.finish(),
     abort: (reason) => sink.abort(reason),
   };
-}
-
-function bound(value: Bound | null, runtime: QueryRuntime, offset: boolean): number | null {
-  if (value === null) return offset ? 0 : null;
-  let number: number;
-  if (value.kind === "const") number = value.value;
-  else {
-    const integer = runtime.boundParameter(value.slot);
-    if (integer === null) return offset ? 0 : null;
-    number =
-      typeof integer === "bigint"
-        ? integer > BigInt(Number.MAX_SAFE_INTEGER)
-          ? Number.MAX_SAFE_INTEGER
-          : Number(integer)
-        : integer;
-  }
-  if (number < 0)
-    throw new ExecutionError(
-      `${offset ? "OFFSET" : "LIMIT"} must not be negative`,
-      "MINNOW_INVALID_BOUND",
-      offset ? "2201X" : "2201W",
-    );
-  if (!Number.isSafeInteger(number)) throw new TypeError("invalid LIMIT/OFFSET constant");
-  return number;
 }
 
 /** Add non-column keys once, preserving the original columns at their original positions. */
@@ -503,8 +479,8 @@ export function compilePlan(plan: PhysicalPlan): Program {
             (context) =>
               rel.op === "limit"
                 ? new LimitOperator(
-                    bound(rel.limit, runtime, false),
-                    bound(rel.offset, runtime, true) ?? 0,
+                    runtime.bounds(rel).limit,
+                    runtime.bounds(rel).offset,
                     context.arena,
                     counted(runtime, rel, downstream),
                   )
@@ -655,8 +631,8 @@ export function compilePlan(plan: PhysicalPlan): Program {
               {
                 types: keys.types,
                 keys: order(rel.keys, keys.indexes),
-                limit: bound(rel.limit, runtime, false),
-                offset: bound(rel.offset, runtime, true) ?? 0,
+                limit: runtime.bounds(rel).limit,
+                offset: runtime.bounds(rel).offset,
                 withTies: rel.withTies,
               },
               shared,
@@ -685,7 +661,7 @@ export function compilePlan(plan: PhysicalPlan): Program {
         const minimum = base + measured;
         fixed(rel, minimum);
         return (runtime, downstream) =>
-          rel.op === "sort" && bound(rel.limit, runtime, false) === 0
+          rel.op === "sort" && runtime.bounds(rel).limit === 0
             ? downstream.finish()
             : instantiate(
                 runtime,
@@ -852,9 +828,9 @@ export function compilePlan(plan: PhysicalPlan): Program {
     const active = new Set<number>();
     const visit = (rel: Rel): void => {
       // Lowering stores ORDER BY's LIMIT on its sort. Zero must not open even its pools.
-      if (rel.op === "sort" && bound(rel.limit, runtime, false) === 0) return;
+      if (rel.op === "sort" && runtime.bounds(rel).limit === 0) return;
       active.add(rel.id);
-      if (rel.op === "limit" && bound(rel.limit, runtime, false) === 0) return;
+      if (rel.op === "limit" && runtime.bounds(rel).limit === 0) return;
       if (rel.op === "join") {
         visit(rel.left);
         visit(rel.right);

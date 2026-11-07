@@ -17,6 +17,7 @@ import { decodeUtf8 } from "../vector/varlen.js";
 import { ParameterBindError } from "../exec/errors.js";
 import { MemoryAdmissionError } from "../memory/governor.js";
 import { vi } from "vitest";
+import { yieldTask } from "../exec/pipeline.js";
 
 function preparedInput(type: PhysicalType, count = 1, zero = false): PreparedPlan {
   const output = [{ name: "v", type, nullable: true }];
@@ -364,8 +365,22 @@ it("queues concurrent large bindings atomically instead of pinning inputs ahead 
   const left = start(prepared, Array<string>(8).fill(a), governor),
     right = start(prepared, Array<string>(8).fill(b), governor);
   try {
-    expect(await drain(left.execution)).toEqual([a, a]);
-    expect(await drain(right.execution)).toEqual([b, b]);
+    // Sizing can admit either execution first. An unread first result may keep the
+    // other admission queued, so both consumers must return their frame credit.
+    let consumers = 0;
+    const consume = async (execution: Execution) => {
+      consumers++;
+      await yieldTask();
+      // Reject a serial-consumption mutant without waiting for a deadlocked test timeout.
+      expect(consumers, "both concurrent result consumers must start").toBe(2);
+      return drain(execution);
+    };
+    const [leftRows, rightRows] = await Promise.all([
+      consume(left.execution),
+      consume(right.execution),
+    ]);
+    expect(leftRows).toEqual([a, a]);
+    expect(rightRows).toEqual([b, b]);
     expect(governor.peakBytes).toBeLessThanOrEqual(governor.capBytes);
     expect(governor.usedBytes).toBe(0);
   } finally {

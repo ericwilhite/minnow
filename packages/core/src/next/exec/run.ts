@@ -1,7 +1,7 @@
 /** One query's admissions, resources and the executed/delivered lifecycle. */
 import type { MaybePromise } from "../access/key-index.js";
 import type { Snapshot } from "../access/snapshot.js";
-import type { PhysicalPlan, Rel } from "../ir/ir.js";
+import type { Bound, PhysicalPlan, Rel } from "../ir/ir.js";
 import type { Grant } from "../memory/governor.js";
 import {
   ExecutionError,
@@ -49,6 +49,7 @@ export class QueryRuntime {
   #pipelines = 0;
   #wait = 0;
   readonly #reserved = new Map<string, ReservedGrant>();
+  readonly #bounds = new Map<number, { readonly limit: number | null; readonly offset: number }>();
 
   /** Loan owners hold zero bytes until the one atomic fixed-buffer admission succeeds. */
   reserve(
@@ -151,6 +152,44 @@ export class QueryRuntime {
       throw new TypeError("invalid statement clock slot");
   }
 
+  /** Bind an active node's own bounds once, before deciding whether to open its input.
+   * PostgreSQL recompute_limits checks OFFSET before LIMIT. Parameter type/range checks
+   * precede those sign checks; a child's bounds are never requested when its parent is zero. */
+  bounds(rel: Extract<Rel, { op: "limit" | "sort" }>): {
+    readonly limit: number | null;
+    readonly offset: number;
+  } {
+    const prior = this.#bounds.get(rel.id);
+    if (prior !== undefined) return prior;
+    if (this.request.parameters.length !== this.plan.placeholderCount)
+      throw new ParameterBindError(
+        `Expected ${String(this.plan.placeholderCount)} parameters, received ${String(this.request.parameters.length)}`,
+        null,
+      );
+    const read = (value: Bound | null, offset: boolean): number | null => {
+      if (value === null) return offset ? 0 : null;
+      if (value.kind === "const") return value.value;
+      const integer = this.boundParameter(value.slot);
+      if (integer === null) return offset ? 0 : null;
+      // A finite relation cannot distinguish larger positive int8 bounds. Keep negative
+      // values negative until the clause's SQLSTATE-specific sign check below.
+      return typeof integer === "bigint" && integer > BigInt(Number.MAX_SAFE_INTEGER)
+        ? Number.MAX_SAFE_INTEGER
+        : Number(integer);
+    };
+    const limit = read(rel.limit, false),
+      offset = read(rel.offset, true) ?? 0;
+    if (offset < 0)
+      throw new ExecutionError("OFFSET must not be negative", "MINNOW_INVALID_BOUND", "2201X");
+    if (limit !== null && limit < 0)
+      throw new ExecutionError("LIMIT must not be negative", "MINNOW_INVALID_BOUND", "2201W");
+    if (!Number.isSafeInteger(offset) || (limit !== null && !Number.isSafeInteger(limit)))
+      throw new TypeError("invalid LIMIT/OFFSET constant");
+    const values = { limit, offset };
+    this.#bounds.set(rel.id, values);
+    return values;
+  }
+
   /** Reservation pruning needs integer bounds before materializing any vectors. */
   boundParameter(slot: number): number | bigint | null {
     const type = this.plan.parameters[slot];
@@ -164,7 +203,11 @@ export class QueryRuntime {
     const low = bits === 64 ? -(1n << 63n) : bits === 16 ? -32768 : -2147483648;
     const high = bits === 64 ? (1n << 63n) - 1n : bits === 16 ? 32767 : 2147483647;
     if (value < low || value > high)
-      throw new ParameterBindError(`$${String(slot + 1)}: integer value out of range`, slot);
+      throw new ParameterBindError(
+        `$${String(slot + 1)}: integer value out of range`,
+        slot,
+        "22003",
+      );
     return value;
   }
 
@@ -251,6 +294,7 @@ export class QueryRuntime {
   close(): MaybePromise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#bounds.clear();
     const jobs = this.#dispose.splice(0).reverse();
     let first: unknown;
     let failed = false;
