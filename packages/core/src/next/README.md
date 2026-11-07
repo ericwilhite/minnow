@@ -972,14 +972,18 @@ and the owner import it directly.
 - Push returns `blocked` when the downstream blocks or a spill write waits; with no spill the
   whole join runs without an await.
 
-### Sort (`exec/sort.ts`, `sort-keys.ts`)
+### Sort (`exec/sort.ts`, `sort-keys.ts`, `sort-lsd.ts`)
 
 - ORDER BY follows PostgreSQL: NaN above every number, −0 = 0, NUMERIC by value, NULLS FIRST/
   LAST, DESC, text in C (byte) order. Keys are input column indexes.
-- Key mode: rows carry the frozen sort-key bytes and five prefix words; the in-memory sort is an
+- Key mode: rows carry the frozen sort-key bytes and five prefix words; byte-key sorting uses an
   MSD radix sort over (prefix words, row id) tuples, refining by bytes only when a key is longer
   than the prefix. Fixed-width keys (booleans, integers, dates, times, timestamps, floats) that
   fit the prefix skip the key bytes: they are encoded straight into the words (direct mode).
+  For at least 65,536 direct-key rows, stable 16-bit LSD passes scatter row ids against
+  contiguous normalized word columns, skipping digits proven constant. Smaller direct sorts
+  and byte keys retain MSD. Both paths use the same normalized order, including NULLs, DESC,
+  NaN and exact int64 words; the LSD arrays fit inside the existing sorting reservation.
 - An ICU `COLLATE` sorts by query-wide ranks from `Intl.Collator` (ties by bytes) when the
   distinct values fit; otherwise, and for JSON and array keys, a value comparator (compare
   mode), in memory and across runs (DECISIONS.md C8). Compare mode decodes each row's JSONB,
@@ -1008,6 +1012,11 @@ measurements do not establish the whole-query browser performance gates.
 checking every word against frozen sort-key bytes outside CPU timing.
 `exec/topn-filter.bench.ts` compares encode-first and raw-filter-first on prebuilt batches
 with a fixed threshold; use `MODE=encode` and `MODE=filter` in interleaved rounds.
+The `exec/sort-lsd.bench.ts` comparison accepts `MODE=msd`, `lsd` (contiguous columns), or
+`lsd-tuples` (the rejected strided prototype), and `SHAPE=u32`, `u64`, or `gate` (the Gate B
+float64/int64 keys). Compare `ROWS=100000` and `1000000` in at least seven interleaved rounds,
+recording load per run. The component excludes key preparation; whole-operator comparisons
+include it. Validation checks all normalized words, row multiplicity and stable ties untimed.
 
 ### Windows (`exec/window.ts`, `window-sort.ts`, `window-frames.ts`, `window-stream.ts`)
 

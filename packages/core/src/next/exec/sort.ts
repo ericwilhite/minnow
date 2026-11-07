@@ -45,6 +45,7 @@ import {
   type FlatVector,
   type Vector,
 } from "../vector/vector.js";
+import { lsdSortIds } from "./sort-lsd.js";
 import { ColumnStore } from "./column-store.js";
 import {
   YIELD_INTERVAL_MS,
@@ -1245,6 +1246,27 @@ class Sorter {
     if (!this.#reserve(n)) return null;
     const ids = new Int32Array(n);
     if (this.mode === "keys") {
+      if (this.direct && n >= 65_536) {
+        // Normalized fixed-width words already live in columns. Keep this layout and scatter
+        // row ids, rather than constructing/moving six-word tuples on every digit pass.
+        // 5 word columns + ids + temporary = 28 bytes/row, within the existing tuple reserve.
+        const columns = Array.from({ length: PREFIX_WORDS }, () => new Uint32Array(n));
+        for (let w = 0; w < PREFIX_WORDS; w++) {
+          const column = columns[w];
+          if (column === undefined) throw new Error("Missing normalized sort column");
+          for (let k = 0; k < store.chunkCount; k++) {
+            const values = (store.chunk(this.prefixColumn + w, k).data as { values: Int32Array })
+              .values;
+            column.set(
+              values.subarray(0, store.chunk(this.prefixColumn + w, k).length),
+              k * store.chunkRows,
+            );
+            if (slice.due()) yield;
+          }
+        }
+        yield* lsdSortIds(columns, ids, new Int32Array(n), n, slice, this.radix);
+        return ids;
+      }
       // (prefix words, row id) tuples read straight from the store's word columns, then an MSD
       // radix over them; 4 + 2 × 4 × TUPLE_WORDS bytes per row, inside the reserve.
       const S = TUPLE_WORDS;
