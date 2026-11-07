@@ -54,7 +54,7 @@ import { MEMORY_CHUNK_ROWS } from "./columns.js";
 import type { GroupDirectory } from "./groups.js";
 import { groupRootOf, type Memtable } from "./memtable.js";
 import type { KeyDelta } from "./key-hash.js";
-import type { RunEntry } from "./runs.js";
+import type { RunEntry, RunReader } from "./runs.js";
 import { groupDeletions, type Shared, type TableView, type WriteState } from "./state.js";
 import { need } from "./bytes.js";
 
@@ -907,7 +907,7 @@ export class ViewIndex implements IndexReader {
           } else {
             const run = published.runs.get(this.def.id);
             if (run !== undefined && this.#skip?.has(run) !== true) {
-              const pending = this.#runLayer(run, key(), layer, 0, 1, Infinity);
+              const pending = this.#runLayer(run, key(), layer, 1, Infinity);
               if (pending !== null) return pending;
               if (unique && this.#hitCount > 0) return;
             }
@@ -919,7 +919,7 @@ export class ViewIndex implements IndexReader {
         for (let k = Math.max(0, sub - 1); k < staged.length; k++) {
           const run = need(staged[k]);
           if (this.#skip?.has(run) === true) continue;
-          const pending = this.#runLayer(run, key(), layer, k + 1, k + 2, limit);
+          const pending = this.#runLayer(run, key(), layer, k + 2, limit);
           if (pending !== null) return pending;
           if (unique && this.#hitCount > 0) return;
         }
@@ -927,7 +927,7 @@ export class ViewIndex implements IndexReader {
       }
       const run = runs[layer - memtables.length];
       if (run === undefined || this.#skip?.has(run) === true) continue;
-      const pending = this.#runLayer(run, key(), layer, 0, -1, Infinity);
+      const pending = this.#runLayer(run, key(), layer, -1, Infinity);
       if (pending !== null) return pending;
       if (unique && this.#hitCount > 0) return;
     }
@@ -960,24 +960,38 @@ export class ViewIndex implements IndexReader {
   }
 
   /**
-   * One run, at (`layer`, `sub`); a Promise that finishes the resolution when it had to read, else
-   * null. It continues at (`layer`, `next`), or at the next layer when `next` is −1. Puts at or past
+   * One run in `layer`; a Promise that finishes resolution when it had to read, else null.
+   * It continues at (`layer`, `next`), or at the next layer when `next` is −1. Puts at or past
    * `limit` (a row id) are not visible.
    */
   #runLayer(
     run: RunRef,
     key: Uint8Array,
     layer: number,
-    sub: number,
     next: number,
     limit: number,
   ): Promise<void> | null {
     const shared = this.table.snapshot.shared;
     const reader = shared.runReader(run);
     if (reader instanceof Promise)
-      return reader.then(async () => {
-        await this.#resolveFrom(key, 0, key.length, layer, sub);
+      return reader.then(async (loaded) => {
+        const pending = this.#readRunLayer(loaded, key, layer, next, limit);
+        if (pending !== null) return await pending;
+        if (this.def.unique && this.#hitCount > 0) return;
+        await this.#continueRun(key, layer, next);
       });
+    return this.#readRunLayer(reader, key, layer, next, limit);
+  }
+
+  /** Consume the reader returned by an asynchronous open, even if it cannot stay cached. */
+  #readRunLayer(
+    reader: RunReader,
+    key: Uint8Array,
+    layer: number,
+    next: number,
+    limit: number,
+  ): Promise<void> | null {
+    const shared = this.table.snapshot.shared;
     const entries = this.#layer;
     entries.length = 0;
     const read = reader.lookup(shared.space, key, entries, shared.budget);
@@ -985,12 +999,16 @@ export class ViewIndex implements IndexReader {
       return read.then(async () => {
         this.#applyLayer(entries, limit);
         if (this.def.unique && this.#hitCount > 0) return;
-        await (next < 0
-          ? this.#resolveFrom(key, 0, key.length, layer + 1, 0)
-          : this.#resolveFrom(key, 0, key.length, layer, next));
+        await this.#continueRun(key, layer, next);
       });
     this.#applyLayer(entries, limit);
     return null;
+  }
+
+  #continueRun(key: Uint8Array, layer: number, next: number): MaybePromise<void> {
+    return next < 0
+      ? this.#resolveFrom(key, 0, key.length, layer + 1, 0)
+      : this.#resolveFrom(key, 0, key.length, layer, next);
   }
 
   #applyLayer(layer: readonly RunEntry[], limit: number): void {
@@ -1016,27 +1034,34 @@ export class ViewIndex implements IndexReader {
     from: number,
     skip: number,
   ): MaybePromise<ProbeResult> {
-    const capacity = Math.min(out.probes.length, out.locators.length);
     const rows: number[] = [];
     for (let k = from; k < keys.count; k++) {
       const result = this.resolve(keys.key(k), rows);
       if (result instanceof Promise)
         return result.then(() => {
-          // Blocks are cached now: this key resolves synchronously (or reads again).
-          return this.#probeFrom(keys, out, k, k === from ? skip : 0);
+          // The completed call already produced these rows. Cache admission is optional.
+          const resume = this.#copyProbeRows(out, k, k === from ? skip : 0, rows);
+          return resume === null ? this.#probeFrom(keys, out, k + 1, 0) : { done: false, resume };
         });
-      const first = k === from ? skip : 0;
-      for (let m = first; m < rows.length; m++) {
-        if (out.count >= capacity) {
-          const next: Resume = { key: k, skip: m };
-          return { done: false, resume: next };
-        }
-        out.probes[out.count] = k;
-        out.locators[out.count] = this.table.locator(rows[m] ?? 0);
-        out.count += 1;
-      }
+      const resume = this.#copyProbeRows(out, k, k === from ? skip : 0, rows);
+      if (resume !== null) return { done: false, resume };
     }
     return { done: true };
+  }
+
+  #copyProbeRows(
+    out: ProbeOutput,
+    key: number,
+    first: number,
+    rows: readonly number[],
+  ): Resume | null {
+    const capacity = Math.min(out.probes.length, out.locators.length);
+    for (let m = first; m < rows.length; m++) {
+      if (out.count >= capacity) return { key, skip: m };
+      out.probes[out.count] = key;
+      out.locators[out.count++] = this.table.locator(rows[m] ?? 0);
+    }
+    return null;
   }
 
   /**

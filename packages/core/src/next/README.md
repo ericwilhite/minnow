@@ -190,6 +190,10 @@ The flush boundary waits for that transaction to commit or roll back; a pending 
 passed to the log's durability barrier as an LSN. `write/pending-flush.test.ts` generates both
 statement boundaries, commit and rollback, publication and reopen on both simulated stores.
 
+Index probes consume completed asynchronous metadata and block reads directly. They do not
+require a later synchronous cache hit to make progress. `write/async-probe.test.ts` checks
+uncached reads, continuation buffers and older pins through visible deletions.
+
 ## Dependency rules
 
 `dependency-rules.test.ts` enforces these.

@@ -1897,6 +1897,19 @@ export const WRITE_RANGE_PRESSURE_STATES = [
   "durable reopen",
 ] as const;
 
+/** A completed asynchronous read must advance rather than require a synchronous cache replay. */
+export const WRITE_ASYNC_PROBE_STATES = [
+  "memory",
+  "indexeddb",
+  "unique",
+  "nonunique",
+  "asynchronous metadata",
+  "asynchronous blocks",
+  "output continuation",
+  "older pin",
+  "visible delete",
+] as const;
+
 /** A pending tombstone does not name a durable frame, even when its memtable's rows are committed. */
 export const WRITE_PENDING_FLUSH_STATES = [
   "earlier statement",
