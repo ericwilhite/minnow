@@ -1611,6 +1611,12 @@ brings fragmentation within capacity. Unchanged extreme fragmentation may retain
 reopen. This allocator is tested in isolation before integration with root-list provenance;
 unknown space never authorizes a root reference or retirement.
 
+Private-metadata histories run over memory, both simulated fences, OPFS handles and
+IndexedDB. Random page rewrites must survive the operator-spill sweep; resetting
+metadata must preserve roots, log, data and operator spill. Every read, write and
+reset from a replaced owner must fail. This backing is preparatory for disk-derived
+retirement tickets, rather than an additional recovery authority.
+
 Ordered-root startup regressions require a streaming union without the unordered free-map sort,
 validate scattered list-page allocations, and refuse overlapping, descending or inconsistent
 extents before reclaim. Full audit and test-build semantic checks remain enabled separately.

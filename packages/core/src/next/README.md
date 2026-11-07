@@ -150,8 +150,8 @@ are exercised without requiring host contention.
 - Every mutation is async and checks ownership in the same step that applies its effect. A fenced
   owner changes nothing.
 - The store is four long-lived files: log, data space, and two root slots. OPFS adds the spill
-  scratch file and the epoch counter (two checksummed slots, flushed before a lease exists), all six
-  opened under the same fence. Extents are reused in place inside the data space.
+  scratch file, the epoch counter (two checksummed slots, flushed before a lease exists), and an
+  owner-private `space-meta` file, all seven opened under the same fence. Extents are reused in place inside the data space.
 - `publish` is atomic and durable: it flushes data, then writes the inactive root slot.
 - The log has a flush barrier and two header slots.
 - **The extent space** (`extents.ts`) is the only caller of the data-space calls and of `publish`.
@@ -1909,6 +1909,22 @@ Extreme fragmentation can waste free space until reopen. Rebuilding from kept
 root lists reconsiders every gap; debt can remain if fragmentation still exceeds
 the capped arena. Full recovery follows when coalescing brings the gap count
 within capacity. No current-root-only background rebuild is enabled.
+
+### Owner-private metadata backing
+
+The store session exposes fixed 60 KiB metadata pages independently of operator
+spill. OPFS uses the fenced `space-meta` handle. IndexedDB uses negative numeric
+keys in `meta`, with one direct, epoch-checked request per page; it has no resident
+record directory. Writes borrow a prepaid frame until the transaction settles.
+IndexedDB requires a standalone frame so structured cloning cannot copy a larger
+underlying pool. Callers account for the native read response as well as their
+own frame.
+
+These pages are reconstructible scratch, never a durable root or a recovery
+authority. The extent-space opener will reset them under its fence before use;
+the operator-spill sweep leaves them alone. Their page encoding is private to
+one owner and needs no stored-format migration. This backing is preparatory;
+retirement tickets still use the existing implementation until integration.
 
 ### R25 startup measurement
 

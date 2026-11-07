@@ -14,6 +14,8 @@
 import { chooseRoot, encodeRootSlot } from "./root-slot.js";
 import {
   DATA_ALIGN,
+  METADATA_PAGE_BYTES,
+  type MetadataStore,
   LOG_HEADER_SLOT_BYTES,
   StoreClosedError,
   StoreCorruptionError,
@@ -30,6 +32,7 @@ export interface FileSet {
   readonly log: SyncFile;
   readonly data: SyncFile;
   readonly roots: readonly [SyncFile, SyncFile];
+  readonly metadata?: SyncFile;
 }
 
 export const FILE_NAMES = ["log", "data", "root-0", "root-1"] as const;
@@ -83,6 +86,16 @@ export class FileStoreSession implements StoreSession {
     const files = this.#live();
     this.#guard();
     return files;
+  }
+
+  #metadata: MetadataStore | null = null;
+  metadata(): MetadataStore | null {
+    this.#owned();
+    const file = this.#files.metadata;
+    if (file === undefined) return null;
+    return (this.#metadata ??= new FileMetadata(file, () => {
+      this.#owned();
+    }));
   }
 
   async readRoot(): Promise<Uint8Array | null> {
@@ -256,5 +269,38 @@ export class FileScratch implements ScratchSpace {
   async truncate(size: number): Promise<void> {
     this.#guard();
     if (size < this.#file.getSize()) this.#file.truncate(size);
+  }
+}
+
+/** Fixed pages over a dedicated file: no record directory or growable managed buffers. */
+class FileMetadata implements MetadataStore {
+  constructor(
+    readonly file: SyncFile,
+    readonly guard: () => void,
+  ) {}
+  #offset(page: number, bytes: Uint8Array): number {
+    if (
+      !Number.isSafeInteger(page) ||
+      page < 0 ||
+      !Number.isSafeInteger((page + 1) * METADATA_PAGE_BYTES)
+    )
+      throw new RangeError("Bad metadata page");
+    if (bytes.byteLength !== METADATA_PAGE_BYTES) throw new RangeError("Bad metadata frame");
+    return page * METADATA_PAGE_BYTES;
+  }
+  async read(page: number, target: Uint8Array): Promise<void> {
+    this.guard();
+    const at = this.#offset(page, target);
+    if (at + target.length > this.file.getSize())
+      throw new StoreCorruptionError("Missing metadata page");
+    readFully(this.file, at, target);
+  }
+  async write(page: number, bytes: Uint8Array): Promise<void> {
+    this.guard();
+    writeAll(this.file, bytes, this.#offset(page, bytes));
+  }
+  async reset(): Promise<void> {
+    this.guard();
+    this.file.truncate(0);
   }
 }

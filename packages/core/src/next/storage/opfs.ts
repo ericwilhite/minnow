@@ -3,9 +3,10 @@
  * `FileSystemSyncAccessHandle`s, fenced by them.
  *
  * ## Files
- * One directory per database, holding six long-lived files, each with one sync handle opened at
+ * One directory per database, holding seven long-lived files, each with one sync handle opened at
  * acquisition and kept open until the lease is released:
  * - `log`, `data`, `root-0`, `root-1` (file-store.ts);
+ * - `space-meta`: owner-private reconstructible extent-space metadata;
  * - `spill`: the scratch file the spill service uses (`StorageBackend.scratch`);
  * - `epoch`: the epoch counter, two checksummed slots (`nextEpoch`). Each acquisition writes the
  *   next value into the other slot and flushes it before the lease exists, so epochs increase
@@ -74,7 +75,15 @@ export interface OpfsBackendOptions {
 }
 
 /** The files of one database directory, in acquisition order. */
-export const OPFS_FILE_NAMES = ["log", "data", "root-0", "root-1", "spill", "epoch"] as const;
+export const OPFS_FILE_NAMES = [
+  "log",
+  "data",
+  "root-0",
+  "root-1",
+  "spill",
+  "epoch",
+  "space-meta",
+] as const;
 
 const errorName = (error: unknown): string =>
   typeof error === "object" && error !== null && "name" in error ? String(error.name) : "";
@@ -222,6 +231,9 @@ class OpfsLease implements OwnerLease {
       log: wrap(opened.files.log, "log"),
       data: wrap(opened.files.data, "data"),
       roots: [wrap(opened.files.roots[0], "root-0"), wrap(opened.files.roots[1], "root-1")],
+      ...(opened.files.metadata === undefined
+        ? {}
+        : { metadata: wrap(opened.files.metadata, "space-meta") }),
     };
     this.scratchFile = wrap(opened.scratch, "spill");
     // The handle, not the lock, stops a hung owner: close every handle the moment the lock goes.
@@ -345,7 +357,8 @@ async function openFiles(directory: OpfsDirectoryLike): Promise<OpenFiles> {
       const file = await directory.getFileHandle(name, { create: true });
       handles.push(await file.createSyncAccessHandle());
     }
-    const [log, data, root0, root1, scratch, epochFile] = handles as [
+    const [log, data, root0, root1, scratch, epochFile, metadata] = handles as [
+      SyncFile,
       SyncFile,
       SyncFile,
       SyncFile,
@@ -355,7 +368,7 @@ async function openFiles(directory: OpfsDirectoryLike): Promise<OpenFiles> {
     ];
     const unused = [log, data, root0, root1].every((file) => file.getSize() === 0);
     const epoch = nextEpoch(new QuotaMappedFile(epochFile, () => false), unused);
-    return { files: { log, data, roots: [root0, root1] }, scratch, epoch, handles };
+    return { files: { log, data, roots: [root0, root1], metadata }, scratch, epoch, handles };
   } catch (error) {
     closeAll(handles);
     throw error;

@@ -95,7 +95,7 @@
  *
  * ## Implementations
  * - `file-store.ts`: the store over four long-lived files (log, data, two root slots; OPFS adds
- *   `spill` and `epoch`) through a
+ *   `spill`, `epoch` and `space-meta`) through a
  *   `SyncFile` interface with the shape of `FileSystemSyncAccessHandle`. OPFS supplies real
  *   handles (`opfs.ts`); `sim-disk.ts` supplies simulated ones with a physical crash model.
  * - `indexeddb.ts`: the same contract on IndexedDB (Safari and Firefox private browsing), with the
@@ -162,6 +162,19 @@ export interface ScratchSpace {
   chargeTo?(memory: CacheMemory): void;
   /** Optional (additive): drop that bookkeeping and return its charge (sweep, close). */
   dispose?(): Promise<void>;
+}
+
+/** Owner-private reconstructible metadata; separate from the operator-spill sweep.
+ * Fixed page addressing requires no resident per-record index. Input remains borrowed and
+ * immutable until write settles. IndexedDB requires a standalone whole-buffer write frame.
+ * One native read response of this size can coexist with the target: callers reserve both.
+ * reset is only used before opening the extent space.
+ */
+export const METADATA_PAGE_BYTES = 60 * 1024;
+export interface MetadataStore {
+  read(page: number, target: Uint8Array): Promise<void>;
+  write(page: number, bytes: Uint8Array): Promise<void>;
+  reset(): Promise<void>;
 }
 
 /** `StoreSession.writeData` options. */
@@ -246,6 +259,8 @@ export interface StorageBackend {
 
 export interface StoreSession {
   readonly epoch: number;
+  /** Private metadata backing under this session's fence; never recovered as database state. */
+  metadata?(): MetadataStore | null;
   /**
    * True when `writeData` keeps the caller's bytes until a later commit (the IndexedDB session
    * queues them), so handing a buffer over (`transfer`) saves a copy. A session that writes at

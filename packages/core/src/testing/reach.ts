@@ -40,6 +40,15 @@ export const BOUNDED_FREE_ARENA_REACH = [
   "closed",
 ] as const;
 
+/** Private metadata and operator spill have independent lifetimes under the same fence. */
+export const METADATA_STORE_REACH = [
+  "rewrite",
+  "spill sweep isolation",
+  "metadata reset isolation",
+  "fenced",
+  "replacement reset",
+] as const;
+
 /** Full-scan shared windows: the default and override must cover cold and resident reads. */
 export const SCAN_WINDOW_RESIDENCY_REACH = [
   "default cold",
