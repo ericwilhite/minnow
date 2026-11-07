@@ -542,3 +542,16 @@ export const ROW_LOCK_INTENT_STATES = [
   "view target",
   "strongest",
 ] as const;
+
+/** Ordered transaction-mode coverage against PostgreSQL or the lossless lowering contract. */
+export const TRANSACTION_MODE_ITEM_STATES = [
+  "empty",
+  "access",
+  "isolation",
+  "deferrable",
+  "duplicates",
+  "mixed kinds",
+  "begin",
+  "start",
+  "set",
+] as const;

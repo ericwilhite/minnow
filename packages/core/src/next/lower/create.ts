@@ -20,6 +20,7 @@ import type {
   Lowerer,
   LoweringContext,
   TransactionModes,
+  TransactionModeItem,
   WriteShape,
 } from "./lowerer.js";
 import {
@@ -181,7 +182,18 @@ function lowerModify(
   };
 }
 
-/** The modes as they apply: the last of each kind wins, as in PostgreSQL. */
+/** Preserve every instruction; order-sensitive validation precedes the final-mode summary. */
+function transactionModeItems(modes: readonly TransactionMode[]): TransactionModeItem[] {
+  return modes.map((mode) =>
+    mode.kind === "access"
+      ? { kind: "access", value: mode.readOnly ? "readOnly" : "readWrite" }
+      : mode.kind === "isolation"
+        ? { kind: "isolation", value: mode.level }
+        : { kind: "deferrable", value: mode.deferrable },
+  );
+}
+
+/** Final values after ordered validation: the last item of each kind wins. */
 function transactionModes(modes: readonly TransactionMode[]): TransactionModes {
   let readOnly: boolean | null = null;
   let isolation: TransactionModes["isolation"] = null;
@@ -239,6 +251,7 @@ function lowerStatement(text: string, context: LoweringContext): LoweredStatemen
         action: TRANSACTION_ACTIONS[statement.action],
         savepoint: statement.name ?? null,
         modes,
+        modeItems: transactionModeItems(statement.modes ?? []),
         readOnly: statement.action === "begin" && modes.readOnly === true,
       };
     }
@@ -254,6 +267,7 @@ function lowerStatement(text: string, context: LoweringContext): LoweredStatemen
           action: "setTransaction",
           savepoint: null,
           modes,
+          modeItems: transactionModeItems(statement.transactionModes),
           readOnly: modes.readOnly === true,
         };
       }

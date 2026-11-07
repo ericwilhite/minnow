@@ -148,16 +148,25 @@ export interface LoweredTransactionControl extends LoweredBase {
   readonly savepoint: string | null;
   /**
    * The transaction modes BEGIN / START TRANSACTION or SET TRANSACTION name, after PostgreSQL's
-   * rule that the last of each kind applies; null where the statement names none (the current
+   * rule that the last of each kind applies after all `modeItems` validate; null where none
+   * is named (the current
    * or default mode stays). All null for the other actions.
    */
   readonly modes: TransactionModes;
+  /** Written order, including duplicates; validate these before using final `modes`. */
+  readonly modeItems: readonly TransactionModeItem[];
   /**
    * `modes.readOnly === true` on BEGIN / START TRANSACTION and SET TRANSACTION: the owner pins a
    * snapshot and takes no writer slot (ruling R11.2). False otherwise, READ WRITE included.
    */
   readonly readOnly: boolean;
 }
+
+/** One transaction instruction, retained in written order for B5's admission checks. */
+export type TransactionModeItem =
+  | { readonly kind: "access"; readonly value: "readOnly" | "readWrite" }
+  | { readonly kind: "isolation"; readonly value: NonNullable<TransactionModes["isolation"]> }
+  | { readonly kind: "deferrable"; readonly value: boolean };
 
 /** Transaction modes as they apply (see `LoweredTransactionControl.modes`). */
 export interface TransactionModes {
