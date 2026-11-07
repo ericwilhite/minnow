@@ -46,7 +46,7 @@ if (
   throw new RangeError("positive rows and at least five rounds required");
 if (!directory.startsWith(join(homedir(), ".cache/"))) throw new Error("output belongs in cache");
 await mkdir(directory, { recursive: true });
-const generated = aggShapes(lib, rows, ["agg_highcard_int"])[0];
+const generated = aggShapes(lib, only === "distinct" ? 0 : rows, ["agg_highcard_int"])[0];
 if (!generated) throw new Error("missing fixture");
 const shape = generated;
 const discard: Operator = {
@@ -55,6 +55,7 @@ const discard: Operator = {
   finish: () => undefined,
   abort: () => undefined,
 };
+const distinctPeaks: Record<string, number> = {};
 const outputTypes = [lib.I32, lib.I64, lib.F64];
 const rel = {
   id: 1,
@@ -260,20 +261,22 @@ const distinctInput = Array.from(
     };
   },
 );
-async function distinctSetup() {
+async function distinctSetup(bitmap = false, scalar = false) {
   const governor = new Governor(256 << 20),
     grant = await governor.admit({
       label: "component/grouped-distinct",
       minimumBytes: 16 << 20,
       spillable: true,
     }),
-    set = new DistinctSet(lib.TEXT, grant, 2048),
+    set = new DistinctSet(lib.TEXT, grant, 2048, bitmap),
     out = { rows: new Uint16Array(2048), count: 0 };
   return async () => {
     let selected = 0;
     try {
       for (const batch of distinctInput)
-        selected += set.filter(batch.vector, batch.gids, batch.n, null, false, out).count;
+        selected += set.filter(batch.vector, batch.gids, batch.n, null, scalar, out).count;
+      distinctPeaks[(scalar ? "scalar" : "grouped") + (bitmap ? "Bitmap" : "Distinct")] =
+        governor.peakBytes;
       return selected;
     } finally {
       set.close();
@@ -288,12 +291,19 @@ const setups = {
     groupTopN: () => outputSetup(true, true),
     sortOnly: sortSetup,
     selectionTopN: selectionSetup,
-    groupedDistinct: distinctSetup,
+    groupedDistinct: () => distinctSetup(),
+    groupedBitmap: () => distinctSetup(true),
+    scalarDistinct: () => distinctSetup(false, true),
+    scalarBitmap: () => distinctSetup(true, true),
   },
   kinds = (Object.keys(setups) as Array<keyof typeof setups>).filter(
     (k) =>
       only === "all" ||
-      (only === "selection" ? ["sortOnly", "selectionTopN"].includes(k) : k.includes(only)),
+      (only === "selection"
+        ? ["sortOnly", "selectionTopN"].includes(k)
+        : only === "distinct"
+          ? ["groupedDistinct", "groupedBitmap", "scalarDistinct", "scalarBitmap"].includes(k)
+          : k.includes(only)),
   ),
   samples = Object.fromEntries(kinds.map((k) => [k, [] as number[]])) as Record<
     keyof typeof setups,
@@ -301,6 +311,7 @@ const setups = {
   >,
   expected = new Map<string, unknown>(),
   order: string[] = [];
+if (kinds.length === 0) throw new Error("unknown component selection");
 for (const kind of kinds) {
   for (let warm = 0; warm < warmups; warm++) {
     const once = await setups[kind]();
@@ -333,8 +344,22 @@ for (let round = 0; round < rounds; round++)
   }
 if (expected.has("selectionTopN") && expected.get("selectionTopN") !== expected.get("sortOnly"))
   throw new Error("selector result mismatch");
+if (
+  expected.has("groupedBitmap") &&
+  expected.get("groupedBitmap") !== expected.get("groupedDistinct")
+)
+  throw new Error("grouped bitmap result mismatch");
+if (expected.has("scalarBitmap") && expected.get("scalarBitmap") !== expected.get("scalarDistinct"))
+  throw new Error("scalar bitmap result mismatch");
 if (profile)
-  for (const kind of ["outputTopN", "groupTopN", "selectionTopN", "groupedDistinct"] as const) {
+  for (const kind of [
+    "outputTopN",
+    "groupTopN",
+    "selectionTopN",
+    "groupedDistinct",
+    "groupedBitmap",
+    "scalarBitmap",
+  ] as const) {
     if (!kinds.includes(kind)) continue;
     const once = await setups[kind](),
       session = new Session();
@@ -370,9 +395,11 @@ const report = {
   order,
   cpuMs: summary,
   groupedDistinctPairs: expected.get("groupedDistinct"),
+  distinctGroups: 10,
+  distinctPeaks,
   load: loadavg(),
   limits:
-    "Baseline dissection, not optimization acceptance. State/input fixture construction excluded; finish/output/top-N/cleanup included. Regions overlap and are not additive. Grouped DISTINCT is exact catalogue d01/h05 values, excluding scan and grouping.",
+    "Isolated component CPU; acceptance is assessed from paired medians/spreads. State/input fixture construction excluded; finish/output/top-N/cleanup included. Regions overlap and are not additive. Grouped DISTINCT is exact catalogue d01/h05 values, excluding scan and grouping.",
 };
 await writeFile(join(directory, "baseline.json"), JSON.stringify(report, null, 2) + "\n");
 console.log(JSON.stringify(report));

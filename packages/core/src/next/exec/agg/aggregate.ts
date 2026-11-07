@@ -120,6 +120,8 @@ export interface AggregateOptions {
   readonly groupOrder?: boolean;
   /** Internal output reduction; the downstream sort still orders/applies OFFSET. */
   readonly outputTopN?: GroupTopNSpec;
+  /** False keeps grouped COUNT(DISTINCT) on its legacy pair set (benchmark control). */
+  readonly groupedDistinctBitmap?: boolean;
 }
 
 /** Refuses what the operator cannot compile, before anything is allocated. */
@@ -233,7 +235,13 @@ export class AggregateOperator implements Operator {
           });
           return;
         }
-        const compiled = this.#compile(call, context, capacity, sharing);
+        const compiled = this.#compile(
+          call,
+          context,
+          capacity,
+          sharing,
+          rel.groupBy.length > 0 && options.groupedDistinctBitmap !== false,
+        );
         this.#aggregates.push(compiled);
         if (sharing) shared.set(key, compiled);
       });
@@ -275,6 +283,7 @@ export class AggregateOperator implements Operator {
     context: CompileContext,
     capacity: number,
     sharedState: boolean,
+    groupedBitmap: boolean,
   ): CompiledAggregate {
     const [arg] = call.args;
     const argument =
@@ -294,7 +303,12 @@ export class AggregateOperator implements Operator {
       filter = call.filter === null ? null : new Predicate(call.filter, context);
       distinct =
         call.distinct && argument !== null
-          ? new DistinctSet(argument.type, this.#charge, capacity)
+          ? new DistinctSet(
+              argument.type,
+              this.#charge,
+              capacity,
+              groupedBitmap && call.fn === "count",
+            )
           : null;
       this.#takeArena(context, 2 * capacity);
       selection = { rows: new Uint16Array(capacity), count: 0 };

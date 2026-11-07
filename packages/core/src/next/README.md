@@ -1595,7 +1595,17 @@ The full interface contract includes the following (DML remains unimplemented by
   comparisons use it only while both values are safe integers, otherwise comparing exact words.
 - NUMERIC results past PostgreSQL's limits (131,072 digits before the decimal point) are 22003 at
   emission, SUM's and AVG's alike; exact intermediates may pass them and come back.
-- `distinct.ts`: exact DISTINCT through value ids and a (group, value id) set.
+- `distinct.ts`: exact DISTINCT through shared value ids. Grouped COUNT(DISTINCT) uses one
+  membership bitmap per group when its first active batch uses group ids below 64; it does not
+  hash/store each (group, value id) pair again. Values and dictionary-entry hashes stay shared.
+  Inputs starting with more groups keep the pair set. Later group growth retains bitmaps for
+  ids below 64 and uses pairs for the others, without migration or duplicate membership.
+  Scalar COUNT keeps its seen markers; other DISTINCT functions keep the pair set. Bitmap
+  arrays, headers and resize overlap are charged before allocation and returned on close or
+  failure. This does not add aggregation spill or promise lower memory for every later-growing
+  group distribution. `createExecutor({ groupedDistinctBitmap: false })` selects the control;
+  `next-executor-bench.mts --whole-compare aggregation` compares both aggregation levers and
+  can record parent/candidate CPU profiles with `--profile`.
 - Scan statistics hints (future; pre-sizing and AVG Sxx skipping are deferred).
   High-cardinality pre-sizing is deferred. The scan would need to supply a conservative NDV
   estimate for the grouping expressions (not merely a row count), its scope across pages and
