@@ -690,7 +690,7 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     page bootstrap; reports identify the bootstrap. This changes harness residency, not the
     production executor, receiver, transfers or credit policy. Compare absolute RSS across
     those scopes only with the bootstrap stated.
-  - `MINNOW_EXPORT_PAGE_HEAP=/home/eric/.cache/export.heapsnapshot` adds a page-side CDP
+  - `MINNOW_EXPORT_PAGE_HEAP="$TMPDIR/export.heapsnapshot"` adds a page-side CDP
     heap snapshot after all frame delivery. It records pre/post snapshot heap, backing storage
     and renderer RSS. Snapshotting performs GC: use a separate diagnostic run, not its timings
     or post-GC snapshot as an export peak measurement. CDP `backingStorageSize` includes
@@ -1579,10 +1579,12 @@ outside those timers. It models prompt cooperative return, not MessagePort laten
 production pool hit rate. The fresh mode's timer covers its complete loop. Separate modes are
 component scopes, not an A/B speed claim. All output and pool charges must be zero at close.
 `--legacy-dictionaries` preserves the historical first-23-columns-only diagnostic.
-`--profile-dir=/home/eric/.cache/NAME` records 500-us Node CPU profiles around only the measured
+`--profile-dir="$TMPDIR/profiles"` records 500-us Node CPU profiles around only the measured
 fresh loop, after fixture loading, warmup and GC. Returned mode refuses profiling because its
 return handovers are excluded from component timers. Profiled samples remain separate from unprofiled
-CPU comparisons. Each comparison retains five alternating fresh-process rounds per variant.
+CPU comparisons. Each comparison retains five alternating fresh-process rounds per variant. Scratch comes from `os.tmpdir()`, honoring the
+caller's `TMPDIR`; explicit profile and heap-snapshot output paths are caller-selected and do
+not require a home cache directory.
 
 - One owner per database holds the store's fence: a dedicated owner worker started by a page, or
   a dedicated worker hosting in place. Every other context is a thin client over a MessagePort

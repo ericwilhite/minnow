@@ -56,9 +56,7 @@ import { execFileSync } from "node:child_process";
 // eslint-disable-next-line no-restricted-imports -- Node-only Playwright bench (cache control, /proc); never shipped.
 import { appendFileSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 // eslint-disable-next-line no-restricted-imports -- Node-only Playwright bench (cache control, /proc); never shipped.
-import { join, resolve, sep } from "node:path";
-// eslint-disable-next-line no-restricted-imports -- Node-only benchmark scratch paths.
-import { homedir } from "node:os";
+import { join } from "node:path";
 import { expect, type CDPSession, type Page } from "@playwright/test";
 import { exportTrace, hostSample } from "./export-diagnostics.js";
 import { requireWorkerOpfs, test } from "./fixtures.js";
@@ -312,8 +310,6 @@ async function workers(page: Page, profileDirectory: string) {
     profileCpuSeconds,
     /** Diagnostic only, after delivery. Snapshot collection runs GC and is never a peak sample. */
     async snapshotPage(path: string) {
-      if (!resolve(path).startsWith(join(homedir(), ".cache") + sep))
-        throw new Error("Heap snapshot must stay under ~/.cache");
       const before = await cdp.send("Runtime.getHeapUsage");
       const chunk = (event: { chunk: string }) => appendFileSync(path, event.chunk);
       writeFileSync(path, "");

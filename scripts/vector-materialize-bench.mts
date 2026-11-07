@@ -3,12 +3,12 @@
  * remain codes per range. --returned times decode plus charged pool take/clear per batch; real
  * clone returns and issue/release are outside those timers (not a transport benchmark). Excludes writing,
  * page loading/parsing, framing and transport. One warmup + GC, then five interleaved fresh-process
- * rounds per revision. Scratch is under ~/.cache; invoke vite-node with TMPDIR there too.
+ * rounds per revision. Scratch uses os.tmpdir(); set TMPDIR to choose its location.
  * npx vite-node scripts/vector-materialize-bench.mts --compare=<revision>
  */
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, loadavg, tmpdir } from "node:os";
+import { loadavg, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { serialize } from "node:v8";
 import type { PhysicalType } from "../packages/core/src/next/types.js";
@@ -27,8 +27,6 @@ const profileDirArg = process.argv
   ?.slice("--profile-dir=".length);
 const profileDir = profileDirArg ? resolve(profileDirArg) : undefined;
 if (profileDir) {
-  if (!profileDir.startsWith(join(homedir(), ".cache") + "/"))
-    throw new Error("Profiles must stay under ~/.cache");
   mkdirSync(profileDir, { recursive: true });
 }
 const returned = process.argv.includes("--returned");

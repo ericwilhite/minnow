@@ -2,7 +2,7 @@
  * Each child warms its selected path, collects, then times 512 frames of 64 × 8 KiB outputs.
  * Includes charging, fill, real structured-clone detachment, return validation and zeroing.
  * Excludes process startup, warmup, explicit GC, IO, scan, framing and row construction.
- * npx vite-node scripts/output-return-bench.mts (scratch/TMPDIR under ~/.cache).
+ * npx vite-node scripts/output-return-bench.mts (scratch uses os.tmpdir(), honoring TMPDIR).
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
