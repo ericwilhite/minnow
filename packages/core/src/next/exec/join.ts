@@ -1028,6 +1028,7 @@ class Level {
       const page = await shared.readPage(run, i);
       try {
         const { rows, columns } = await shared.decode(page, shared.spec.buildTypes);
+        shared.checkAborted();
         if (store.append(columns, null, 0, rows) < rows) return false;
       } finally {
         shared.releasePage(page);
@@ -2273,6 +2274,7 @@ export class HashJoin {
         const page = await shared.readPage(build, i);
         try {
           const { rows, columns } = await shared.decode(page, this.spec.buildTypes);
+          shared.checkAborted();
           await sub.addPage(page.bytes, rows, columns);
         } finally {
           shared.releasePage(page);
@@ -2296,6 +2298,7 @@ export class HashJoin {
       const page = await shared.readPage(probe, i);
       try {
         const { rows, columns } = await shared.decode(page, this.spec.probeTypes);
+        shared.checkAborted();
         if (rows > BATCH_ROWS) throw new RangeError("A probe spill page holds more than a batch");
         if (chunk === null && (await level.forwardPage("probe", page.bytes, rows, columns))) {
           ordinal += rows;
@@ -2362,6 +2365,7 @@ export class HashJoin {
             let retry = 0;
             try {
               const { rows, columns } = await shared.decode(bytes, this.spec.buildTypes);
+              shared.checkAborted();
               loadingFirst = reserved && sub.store.rows === 0;
               let taken = sub.store.append(columns, null, row, loadingFirst ? 1 : rows - row);
               loadingFirst = false;
@@ -2444,6 +2448,7 @@ export class HashJoin {
       const page = await shared.readPage(probe, i);
       try {
         const { rows, columns } = await shared.decode(page, this.spec.probeTypes);
+        shared.checkAborted();
         const out = shared.out;
         out.count = 0;
         let batch: Batch;

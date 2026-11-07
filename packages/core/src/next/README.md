@@ -964,8 +964,11 @@ and the owner import it directly.
   in. Zero-column stores still count rows and obey single-chunk limits, so key-only
   joins can reuse their keys without a payload gather. Wide decimal copy accounting inspects
   only decimal columns, preserving mixed numeric, boolean and text payloads. Both are shared exec/ files (ruling R20.2) for aggregation spill and sort runs as well.
-  Join abort waits for spill appends and file closes before releasing borrowed pages, stores,
+  Join abort waits for spill reads, appends and file closes before releasing borrowed pages, stores,
   the spill pool or the grant; `closed` covers that drain, including close failures.
+  A read registers its ownership before entering the backend. Cancelled read results are
+  discarded while charged, before decoding or resuming load/replay; read leases also fence
+  per-run closes. `join-read-fence.test.ts` gates load and replay across read/close failures.
   Oversized staging rows flush immediately, including when their first allocation fits: their
   arenas and page buffers cannot accumulate across partitions and pin a progress loan.
   Join staging checks the shared task deadline between oversized rows, even when every spill

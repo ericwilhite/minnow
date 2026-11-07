@@ -19,6 +19,7 @@ import {
   decodePage,
   type DecodedPage,
   PageWriter,
+  SpillClosedError,
   type SpillFiles,
   type SpilledRun,
 } from "./spill-pages.js";
@@ -199,20 +200,41 @@ export class SpillIo {
     this.pool.settle();
   }
 
+  /** A close or cancellation can arrive at any asynchronous read/decode resumption. */
+  #checkOpen(): void {
+    this.checkAborted();
+    if (this.files.isClosed) throw new SpillClosedError();
+  }
+
   /** Reads and verifies a page (a bounded step), charged to the pool while the caller holds it. */
   async readPage(run: SpilledRun, index: number): Promise<{ bytes: Uint8Array; charged: number }> {
+    this.#checkOpen();
     const ref = run.pages[index];
     const file = run.file;
     if (ref === undefined || file === null) throw new RangeError("No such spill page");
     if (!this.pool.allocate(ref.length)) {
       await this.need(ref.length);
+      this.#checkOpen();
       if (!this.pool.allocate(ref.length)) throw new RangeError("A spill page could not be read");
     }
+    let end: (() => void) | undefined;
+    let bytes: Uint8Array | undefined;
     try {
-      return { bytes: await file.read(ref), charged: ref.length };
+      end = this.files.beginRead(file);
+      bytes = await file.read(ref);
+      // The backend may return after cancellation. Never hand that page to a decoder.
+      this.#checkOpen();
+      return { bytes, charged: ref.length };
     } catch (error) {
+      // The cancelled result must not remain owned when its charge is released.
+      // eslint-disable-next-line no-useless-assignment
+      bytes = undefined;
       this.pool.free(ref.length);
+      this.checkAborted();
       throw error;
+    } finally {
+      // Keep the pool/grant alive until failed/cancelled results gave their bytes back.
+      end?.();
     }
   }
 
@@ -225,9 +247,11 @@ export class SpillIo {
     page: { bytes: Uint8Array; charged: number },
     types: readonly PhysicalType[],
   ): Promise<DecodedPage> {
+    this.#checkOpen();
     let decoded = decodePage(page.bytes, types, this.pool);
     if ("needed" in decoded) {
       await this.need(decoded.needed);
+      this.#checkOpen();
       decoded = decodePage(page.bytes, types, this.pool);
       if ("needed" in decoded) throw new RangeError("A spill page could not be decoded");
     }
