@@ -862,7 +862,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       ...(SCAN_COMPARE
         ? {
             scanAdapter:
-              SCAN_CORE_PROFILE || SCAN_SHAPE_COMPARE
+              SCAN_CORE_PROFILE || (SCAN_SHAPE_COMPARE && !SCAN_SHAPE_TRANSPORT)
                 ? "scan-only diagnostic; real TableScan/driver; borrowed endpoint consumer; excludes all frame assembly, result channel, transfers and client transport; fixture descriptors exclude SQL/catalog/root loading"
                 : "bench stand-in for future executor frame assembly; real TableScan/ResultChannel/owner transfer policy/MessagePort credits; fixture descriptors exclude SQL/catalog/root loading",
             cpuSamplingIntervalUs: SCAN_PROFILE ? 500 : 1_000_000,
