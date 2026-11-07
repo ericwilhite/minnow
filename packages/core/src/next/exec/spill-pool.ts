@@ -18,7 +18,7 @@ import type { ColumnStore } from "./column-store.js";
 import {
   decodePage,
   type DecodedPage,
-  type PageWriter,
+  PageWriter,
   type SpillFiles,
   type SpilledRun,
 } from "./spill-pages.js";
@@ -246,6 +246,8 @@ export class SpillIo {
     if (staging.rows === 0) return;
     this.onFlush?.(staging);
     const columns = staging.vectors();
+    const oversized =
+      staging.rows === 1 && PageWriter.encodedBytes(columns, 1) > staging.targetBytes;
     const pageHeader = {
       queryId: this.context.queryId,
       run: header.run,
@@ -259,7 +261,7 @@ export class SpillIo {
       if (page === null) throw new RangeError("A spill page could not be encoded");
     }
     await this.files.append(run, page, staging.rows);
-    this.pages.shrinkIf(this.pool.owes);
+    this.pages.shrinkIf(oversized || this.pool.owes);
     this.reset(staging);
   }
 
@@ -277,6 +279,15 @@ export class SpillIo {
     while (done < count) {
       this.checkAborted();
       done += staging.append(vectors, ids, from + done, count - done);
+      // An oversized row may fit without a loan. Do not retain its arena in one partition
+      // while filling the others: together they can pin a loan past this row-sized step.
+      if (
+        staging.rows === 1 &&
+        PageWriter.encodedBytes(staging.vectors(), 1) > staging.targetBytes
+      ) {
+        await this.flush(staging, run, header);
+        continue;
+      }
       if (done >= count) break;
       if (staging.rows > 0) {
         await this.flush(staging, run, header);

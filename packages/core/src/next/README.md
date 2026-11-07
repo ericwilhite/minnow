@@ -959,6 +959,10 @@ and the owner import it directly.
 - Spill pages (`spill-pages.ts`) are the spill contract's typed layout; every `VectorData`
   variant round-trips. `column-store.ts` is the chunked, charged row store operators keep rows
   in. Both are shared exec/ files (ruling R20.2) for aggregation spill and sort runs as well.
+  Oversized staging rows flush immediately, including when their first allocation fits: their
+  arenas and page buffers cannot accumulate across partitions and pin a progress loan.
+  `join-large-row.test.ts` checks generated large TEXT rows against PGlite at 8 MiB and the
+  admitted minimum, with a probe connected during build.
   Store-to-store gathers bulk-copy fully checked contiguous spans of non-null int32/f64
   storage (including safe int64), across chunk boundaries; other permutations and negative
   row ids keep the ordinary gather. `exec/column-gather.bench.ts` isolates contiguous and
