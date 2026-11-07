@@ -19,6 +19,7 @@ import {
   expandRowReferences,
   expandSourceColumnAliases,
   expandViewSources,
+  expandRowLockCteViews,
   expressionColumns,
   extendGroupByWithKeyDependents,
   foldIdentifierCase,
@@ -95,19 +96,22 @@ export function prepareQuery(parsed: CompiledQuery, catalog: CatalogView): Compi
   let plan = foldIdentifierCase(parsed, front.columns);
   plan = expandRowReferences(plan, columnsOf);
   const bodies = new Map<string, CompiledQuery>();
-  if (front.views.size > 0) {
-    plan = expandViewSources(plan, (name) => {
-      const sql = front.views.get(name);
-      if (sql === undefined) return undefined;
-      let body = bodies.get(name);
-      if (body === undefined) {
-        body = parseQuery(sql);
-        bodies.set(name, body);
-      }
-      return body;
-    });
-  }
-  const rowLocking = expandedRowLock(parsed, bodies.values());
+  const viewBody = (name: string): CompiledQuery | undefined => {
+    const sql = front.views.get(name);
+    if (sql === undefined) return undefined;
+    let body = bodies.get(name);
+    if (body === undefined) {
+      body = parseQuery(sql);
+      bodies.set(name, body);
+    }
+    return body;
+  };
+  if (front.views.size > 0) plan = expandViewSources(plan, viewBody);
+  const rowLocking = expandedRowLock(
+    parsed,
+    bodies.values(),
+    front.views.size === 0 ? undefined : (body) => expandRowLockCteViews(body, viewBody),
+  );
   if (rowLocking !== undefined) plan.rowLocking = rowLocking;
   if (front.keys.size > 0)
     plan = extendGroupByWithKeyDependents(plan, (name) => front.keys.get(name), columnsOf);

@@ -1366,7 +1366,9 @@ Every lowered statement carries `rowLocking`: `none`, `keyShare`, `share`, `noKe
 with 25006, before executing it, including a cached or parameterized statement. Lowering does
 not acquire locks or enforce transaction access mode. DML/DDL write admission stays separate.
 The shared front end resolves targets through FROM subqueries but never pushes an outer clause
-into a CTE. A referenced CTE's own clause and a view's own clause count; unused CTEs do not.
+into a CTE. A referenced CTE's own clause and a view's own clause count, including references from
+CTEs not consumed by the final SELECT. Only zero-reference CTEs in that query scope are
+omitted; declarations inside a discarded outer CTE do not leak into the caller.
 View bodies are included after catalog expansion. The shipped engine uses the same target and
 strength helpers. Metadata is retained even for a point read; the owner must check it before
 its synchronous fast path.
@@ -1381,3 +1383,9 @@ validate every item in order before using it. In a savepoint that starts READ WR
 `SET TRANSACTION READ ONLY, READ WRITE` fails with 25001, while `READ WRITE, READ ONLY`
 succeeds. If it already starts READ ONLY, either list fails. This is metadata for B5;
 it does not wire owner enforcement.
+
+The parser records CTE reference counts before execution pruning. Referenced bodies remain
+as `CompiledQuery.rowLockingCtes`, so catalog expansion includes locking views in a CTE
+referenced only by an unused referrer. This admission-only data survives ordinary clones and
+worker transport; it is not lowered as an execution input. The strongest intent still wins
+when the final SELECT has a weaker clause. Nested query scopes retain their own references.
