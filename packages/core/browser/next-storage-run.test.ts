@@ -12,14 +12,20 @@ import { chaosPoster } from "./next-storage-post.js";
  * - The failure-path regression kills once the counter shows the injected failure posted.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
-import { seedsFor } from "../src/testing/seeds.js";
-import { createReach, STORAGE_PHASE_CONTROLLER_REACH } from "../src/testing/reach.js";
+import { mulberry32, seedsFor } from "../src/testing/seeds.js";
+import {
+  createReach,
+  STORAGE_PAGE_BOUNDARY_REACH,
+  STORAGE_PHASE_CONTROLLER_REACH,
+} from "../src/testing/reach.js";
 import type { ChaosMessage, ChaosState } from "./next-storage-chaos.js";
 import {
   chaosBegin,
   chaosKill,
   chaosKillAfter,
   chaosKillAtFault,
+  chaosPageBoundary,
+  chaosWaitForPageIdle,
   setChaosBarrierTimeout,
 } from "./next-storage-run.js";
 
@@ -493,3 +499,80 @@ for (const seed of seedsFor("storage-parked-prefix-drain", [1701, 1702, 1703, 17
   });
 
 afterAll(() => phaseReach.assertReached());
+
+const pageReach = createReach("page-boundary acknowledgements", STORAGE_PAGE_BOUNDARY_REACH);
+afterAll(() => pageReach.assertReached());
+
+// Acknowledgements may arrive between recovery and arming, as well as after arming.
+for (const beforeArm of [0, 1] as const)
+  for (const seed of seedsFor("storage-page-boundary-acks", [1701, 1702, 1703, 1704]))
+    it(`includes all page-boundary acknowledgements (${String(beforeArm)} before arming, seed ${String(seed)})`, async () => {
+      pageReach.beginHistory();
+      let announce: () => void = () => undefined;
+      let acknowledged = RECOVERED;
+      let gos = 0;
+      let blocked!: () => void;
+      const blockedAck = new Promise<void>((resolve) => {
+        blocked = resolve;
+      });
+      let resume!: () => void;
+      const resumeAck = new Promise<void>((resolve) => {
+        resume = resolve;
+      });
+      scenario = (worker) => {
+        const random = mulberry32(seed);
+        worker.port.delayOf = () => Math.floor(random() * 4);
+        const page = worker.port.peer;
+        if (page === null) throw Error("missing page port");
+        const receive = page.onmessage;
+        page.onmessage = (event) => {
+          receive?.(event);
+          const message = event.data as ChaosMessage;
+          if (message.chaos === "ack") acknowledged = message.state;
+        };
+        worker.port.beforeDelivery = async (data) => {
+          const message = data as ChaosMessage;
+          if (message.chaos === "ack" && message.state.round === beforeArm + 1) {
+            blocked();
+            await resumeAck;
+          }
+        };
+        announce = () => {
+          if (beforeArm > 0) worker.post({ chaos: "ack", state: ACKED });
+          worker.post({ chaos: "intent", intent: { step: "publish", sequence: 1 } });
+        };
+        worker.onGo = () => {
+          gos++;
+          worker.post({ chaos: "began", sequence: 1 });
+          worker.post({ chaos: "ack", state: { ...ACKED, round: beforeArm + 1 } });
+          worker.post({ chaos: "settled", sequence: 1 });
+          worker.post({ chaos: "done", sequence: 1 });
+          worker.post({ chaos: "intent", intent: { step: "write", sequence: 2 } });
+        };
+      };
+      const recovered = await chaosBegin("indexeddb", `page-boundary-${String(seed)}`, seed, null);
+      const arming = chaosKill({ target: "publish", occurrence: 1, delayMs: 0, mode: "page" });
+      announce();
+      await arming;
+      await blockedAck;
+      let idle = false;
+      const waiting = chaosWaitForPageIdle().then((state) => {
+        idle = true;
+        return state;
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(idle, "the active publish has not acknowledged yet").toBe(false);
+      pageReach.reach("waits for the armed acknowledgement");
+      resume();
+      const lastAck = await waiting;
+      const boundary = await chaosPageBoundary();
+      expect(boundary.landed).toBe("between");
+      expect(boundary.expect.inFlight).toEqual([]);
+      expect(boundary.expect.state.round).toBeGreaterThanOrEqual(recovered.state.round + 1);
+      expect(boundary.expect.state).toEqual(acknowledged);
+      expect(lastAck).toEqual(acknowledged);
+      expect(gos, "the held next intent must not run").toBe(1);
+      pageReach.reach("next intent held");
+      pageReach.reach(beforeArm === 0 ? "one root since recovery" : "two roots since recovery");
+    });

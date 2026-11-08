@@ -715,19 +715,19 @@ test.describe("rebuild core storage kill campaign: its own failure paths (review
         const run = (await import(url)) as Run;
         const recovered = await run.chaosBegin("indexeddb", directory, 11, null);
         await run.chaosKill({ target: "publish", occurrence: 1, delayMs: 0, mode: "page" });
-        // The armed publish runs on and is acknowledged before the boundary is taken.
-        await new Promise<void>((resolve) => {
-          setTimeout(resolve, 1_000);
-        });
+        // The held workload finishes its armed publish and starts no further step. An earlier
+        // publish may also have acknowledged since recovery, before this kill was armed.
+        const acknowledged = await run.chaosWaitForPageIdle();
         const boundary = await run.chaosPageBoundary();
         await run.chaosEnd("indexeddb", directory);
-        return { before: recovered.state.round, boundary };
+        return { before: recovered.state.round, acknowledged, boundary };
       },
       [RUN, dir] as const,
     );
     expect(result.boundary.landed).toBe("between");
     expect(result.boundary.expect.inFlight).toEqual([]);
-    expect(result.boundary.expect.state.round).toBe(result.before + 1);
+    expect(result.boundary.expect.state.round).toBeGreaterThanOrEqual(result.before + 1);
+    expect(result.boundary.expect.state).toEqual(result.acknowledged);
   });
 });
 

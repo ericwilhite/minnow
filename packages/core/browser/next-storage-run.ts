@@ -864,6 +864,25 @@ export async function chaosKillAfter(
 }
 
 /**
+ * The page-boundary regression waits on the held workload's completion markers, not elapsed
+ * time. A page kill has stopped new intents; its active step may still acknowledge a root.
+ * Return that last acknowledgement after the step's done marker, before taking the boundary.
+ * This is only for the regression: campaign page kills still interrupt work in flight.
+ */
+export async function chaosWaitForPageIdle(): Promise<ChaosState> {
+  const run = chaos;
+  if (run?.hold !== true) throw new Error("arm a page kill first");
+  await run.worker.until(
+    () => run.failure !== null || run.inFlight.size === 0,
+    "the held page workload to finish its active step",
+  );
+  const failure = failed(run);
+  if (failure !== null) throw failure;
+  if (run.state === null) throw new Error("no acknowledged state");
+  return run.state;
+}
+
+/**
  * The page-close boundary (review B1-p2f finding 2): the page stops answering intents, receives
  * every message claimed when the boundary was taken, stops observing and returns;
  * the caller closes the page next. What the worker claims after (it lives until the page closes) is

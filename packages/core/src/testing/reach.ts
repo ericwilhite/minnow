@@ -1463,3 +1463,11 @@ export const SPACE_CRASH_SWEEP_REACH = [
   "IndexedDB/growing",
   "IndexedDB/relocating",
 ] as const;
+
+/** Page-close expectations include every ack, even when recovery precedes several publishes. */
+export const STORAGE_PAGE_BOUNDARY_REACH = [
+  "waits for the armed acknowledgement",
+  "next intent held",
+  "one root since recovery",
+  "two roots since recovery",
+] as const;
