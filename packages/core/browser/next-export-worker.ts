@@ -60,6 +60,7 @@ export type ExportRequest =
       readonly once: boolean;
       readonly recycle?: boolean;
       readonly ownerAPI?: boolean;
+      readonly poolTrace?: boolean;
       readonly readaheadKiB: number;
       /** Row-window readahead across all columns (export-stream.ts `windowBytes`); 0: per column. */
       readonly windowMiB?: number;
@@ -132,6 +133,7 @@ export interface ExportPass {
   readonly executorStats?: ExecutorExportStats;
   readonly scanCoreStats?: ScanCoreStats;
   readonly series?: {
+    readonly poolTrace?: import("../../../scripts/browser-perf/page/return-pool-trace.js").PoolTraceSummary;
     readonly returnPoolMiB?: number;
     readonly returnHits?: number;
     readonly returnAccepted?: number;
@@ -658,6 +660,7 @@ async function handle(request: ExportRequest): Promise<unknown> {
         owner: request.request.ownerAPI
           ? prepareOwnerExport(opened.space, request.request.groups, {
               governor,
+              ...(request.request.poolTrace ? { poolTrace: true } : {}),
               port:
                 request.request.resultPort ??
                 (() => {

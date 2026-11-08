@@ -1569,6 +1569,25 @@ replace B3 catalog/group-root discovery, and client row objects are excluded. Th
 are not a full database-open benchmark or quiet-host Gate A acceptance. The harness records
 its own observation overhead; pull/drain sub-times are uninstrumented, reported as zero.
 
+`MINNOW_EXPORT_POOL_TRACE=1` selects the production API and adds benchmark-only return-pool
+observers. Five persistent 1M-row passes count exact positive-size requests and byte-weighted
+hits, by exact size. Misses distinguish a pending return of that size, a previously returned
+size, and a new size (in that order). These categories describe availability, not a proof that
+all previously seen sizes were evicted. The first pass also captures a bounded prefix through
+200 frame issuances. This instrumentation adds allocations and is excluded from CPU/RSS
+acceptance measurements. It changes no production pool policy.
+
+`scripts/pool-trace-bench.mts --compare=REV --trace=scripts/browser-perf/experiments/pool-requests-prefix.json.gz
+--cap-mib=16` replays that frozen prefix in five alternating fresh-process rounds. It measures
+actual ReturnPool request, allocation, synthetic byte fill, real two-way transfers, capability
+validation, clearing and eviction. Loading, warmup and GC precede the timer. Baseline replay
+checks every captured hit; candidate replay changes only the bounded cap. Recorded issue IDs
+are mapped to replay capabilities. The benchmark checks detachment and zero charges on close;
+its synthetic values are not a differential proof of executor output. It excludes IO, decode,
+frame assembly and MessagePort latency, so it cannot establish whole-export performance.
+The checked-in `pool-trace-result.json` records the negative 4-to-16 MiB result: a higher hit
+rate did not improve CPU beyond the spread. The production cap remains 4 MiB.
+
 The component `scripts/vector-materialize-bench.mts --compare=REV` separately measures resident
 page decode, vector shape setup and fresh dedicated output allocation, excluding storage,
 framing and transfers. It permits source dictionary codes in every column/range; ResultSink's

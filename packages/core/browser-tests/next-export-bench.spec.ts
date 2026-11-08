@@ -88,8 +88,9 @@ const SCAN_BATCH_COMPARE = process.env.MINNOW_EXPORT_SCAN_BATCH_COMPARE === "1";
 const SCAN_BATCH_COMPLETED = process.env.MINNOW_EXPORT_SCAN_BATCH_COMPLETED ?? "";
 const SCAN_IO_COMPARE = process.env.MINNOW_EXPORT_SCAN_IO_COMPARE === "1";
 const DISCARD = process.env.MINNOW_EXPORT_DISCARD === "1";
+const POOL_TRACE = process.env.MINNOW_EXPORT_POOL_TRACE === "1";
 const OWNER_COMPARE = process.env.MINNOW_EXPORT_OWNER_COMPARE === "1";
-const OWNER_API = process.env.MINNOW_EXPORT_OWNER_API === "1" || OWNER_COMPARE;
+const OWNER_API = process.env.MINNOW_EXPORT_OWNER_API === "1" || OWNER_COMPARE || POOL_TRACE;
 if (OWNER_API && EXECUTOR_REFERENCE)
   throw new Error("Owner API comparison uses the current bench control, not a frozen executor");
 const RSS_SERIES = process.env.MINNOW_EXPORT_RSS_SERIES === "1" || OWNER_API;
@@ -487,9 +488,9 @@ test.describe("rebuild core export on OPFS (bench)", () => {
 
     const seriesOpen = RSS_SERIES
       ? await page.evaluate(
-          async ([url, groups, reference, ownerAPI]) =>
-            ((await import(url)) as Run).openSeries(groups, 512, reference, ownerAPI),
-          [RUN, exported, EXECUTOR_REFERENCE, OWNER_API] as const,
+          async ([url, groups, reference, ownerAPI, poolTrace]) =>
+            ((await import(url)) as Run).openSeries(groups, 512, reference, ownerAPI, poolTrace),
+          [RUN, exported, EXECUTOR_REFERENCE, OWNER_API, POOL_TRACE] as const,
         )
       : undefined;
     const seriesMemoryBefore = RSS_SERIES ? await targets.memory() : undefined;

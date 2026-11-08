@@ -24,6 +24,7 @@ import type { ExtentReader } from "../../../packages/core/src/next/storage/exten
 import type { PhysicalType } from "../../../packages/core/src/next/types.js";
 import type { ExportGroup, ExportResult } from "./export-stream.js";
 import type { ExecutorExportStats } from "./executor-export.js";
+import { traceReturnPool } from "./return-pool-trace.js";
 import { benchTableOf } from "./scan-fixture.js";
 
 /** R3: last frames may be inline in done, including an empty terminal message. */
@@ -62,6 +63,7 @@ export function prepareOwnerExport(
   groups: readonly ExportGroup[],
   options: {
     readonly governor: MemoryGovernor;
+    readonly poolTrace?: boolean;
     readonly port: MessagePort;
     readonly memory: () => Record<string, number>;
   },
@@ -222,7 +224,13 @@ export function prepareOwnerExport(
   });
   let pool: ReturnPool | null = null;
   const createPool = engine.createReturnPool.bind(engine);
-  engine.createReturnPool = (cap) => (pool = createPool(cap));
+  let trace: ReturnType<typeof traceReturnPool> | null = null;
+  let pass = 0;
+  engine.createReturnPool = (cap) => {
+    pool = createPool(cap);
+    if (options.poolTrace) trace = traceReturnPool(pool);
+    return pool;
+  };
   const port = options.port,
     post = port.postMessage.bind(port);
   port.postMessage = (raw: unknown, transfer?: Transferable[] | StructuredSerializeOptions) => {
@@ -278,6 +286,8 @@ export function prepareOwnerExport(
   return {
     arm: () => {
       if (finish) throw new Error("Owner export is already armed");
+      trace?.begin(pass);
+      pass++;
       frames =
         wireBytes =
         frameBufferBytes =
@@ -303,6 +313,7 @@ export function prepareOwnerExport(
       returnPoolMiB: (pool?.evictableBytes ?? 0) / 1048576,
       returnHits: pool?.hits ?? 0,
       returnAccepted: pool?.accepted ?? 0,
+      ...(trace ? { poolTrace: trace.summary() } : {}),
     }),
     close: async () => {
       const stop = server.quiesce("closing");

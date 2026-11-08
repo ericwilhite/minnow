@@ -343,6 +343,7 @@ export async function openSeries(
   capMiB: number,
   executorReference?: string,
   ownerAPI = false,
+  poolTrace = false,
 ): Promise<unknown> {
   if (built === null) throw new Error("Build first");
   const selected = built.groups.slice(0, groups),
@@ -363,6 +364,7 @@ export async function openSeries(
       auditWorkingSet: false,
       ...(executorReference ? { executorReference } : {}),
       ...(ownerAPI ? { ownerAPI: true } : {}),
+      ...(poolTrace ? { poolTrace: true } : {}),
     },
   });
 }

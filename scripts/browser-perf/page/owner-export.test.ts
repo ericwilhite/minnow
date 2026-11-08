@@ -51,6 +51,7 @@ for (const seed of seedsFor("owner-api-bench", [0xb2f2, 0xb2f3]))
             client = new ProtocolClient();
           const actor = prepareOwnerExport(space, [{ rows: count, chunks: group.columns }], {
             governor,
+            poolTrace: true,
             port: channels.port1,
             memory: () => ({ governorHeld: governor.usedBytes }),
           });
@@ -98,6 +99,22 @@ for (const seed of seedsFor("owner-api-bench", [0xb2f2, 0xb2f3]))
               const result = await completion;
               expect(actual).toEqual(source);
               expect(result.rows).toBe(count);
+              const traced = actor.returnStats().poolTrace;
+              expect(traced?.requests).toBeGreaterThan(0);
+              expect(traced).toBeDefined();
+              if (!traced) throw new Error("Missing diagnostic observer");
+              expect(traced.hits).toBeLessThanOrEqual(traced.requests);
+              expect(
+                traced.hits +
+                  traced.missesPendingReturn +
+                  traced.missesSeenSize +
+                  traced.missesNewSize,
+              ).toBe(traced.requests);
+              expect(traced.classes.reduce((sum, row) => sum + row.requests, 0)).toBe(
+                traced.requests,
+              );
+              if (pass === 0) expect(traced.events.length).toBeGreaterThan(0);
+              else expect(traced.events.length).toBe(0);
               expect(result.executorStats).toMatchObject({
                 path: "production-owner-api",
                 frames,
