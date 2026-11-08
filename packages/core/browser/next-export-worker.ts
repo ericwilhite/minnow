@@ -61,6 +61,7 @@ export type ExportRequest =
       readonly recycle?: boolean;
       readonly ownerAPI?: boolean;
       readonly poolTrace?: boolean;
+      readonly outputClasses?: boolean;
       readonly readaheadKiB: number;
       /** Row-window readahead across all columns (export-stream.ts `windowBytes`); 0: per column. */
       readonly windowMiB?: number;
@@ -134,6 +135,8 @@ export interface ExportPass {
   readonly scanCoreStats?: ScanCoreStats;
   readonly series?: {
     readonly poolTrace?: import("../../../scripts/browser-perf/page/return-pool-trace.js").PoolTraceSummary;
+    readonly requestedBuffers?: number;
+    readonly reusedBuffers?: number;
     readonly returnPoolMiB?: number;
     readonly returnHits?: number;
     readonly returnAccepted?: number;
@@ -571,7 +574,7 @@ async function seriesPass(
     const execute = request.ownerAPI
       ? () => {
           if (!active.owner) throw new Error("No production owner export actor");
-          const result = active.owner.arm();
+          const result = active.owner.arm(request.outputClasses);
           scope.postMessage({ id: activeControlId, t: "owner-start" });
           return result;
         }

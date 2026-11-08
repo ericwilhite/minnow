@@ -89,8 +89,10 @@ const SCAN_BATCH_COMPLETED = process.env.MINNOW_EXPORT_SCAN_BATCH_COMPLETED ?? "
 const SCAN_IO_COMPARE = process.env.MINNOW_EXPORT_SCAN_IO_COMPARE === "1";
 const DISCARD = process.env.MINNOW_EXPORT_DISCARD === "1";
 const POOL_TRACE = process.env.MINNOW_EXPORT_POOL_TRACE === "1";
+const POOL_COMPARE = process.env.MINNOW_EXPORT_POOL_COMPARE === "1";
 const OWNER_COMPARE = process.env.MINNOW_EXPORT_OWNER_COMPARE === "1";
-const OWNER_API = process.env.MINNOW_EXPORT_OWNER_API === "1" || OWNER_COMPARE || POOL_TRACE;
+const OWNER_API =
+  process.env.MINNOW_EXPORT_OWNER_API === "1" || OWNER_COMPARE || POOL_TRACE || POOL_COMPARE;
 if (OWNER_API && EXECUTOR_REFERENCE)
   throw new Error("Owner API comparison uses the current bench control, not a frozen executor");
 const RSS_SERIES = process.env.MINNOW_EXPORT_RSS_SERIES === "1" || OWNER_API;
@@ -705,7 +707,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     const base = { once: true, capMiB: 512, passes: 1, groups: exported };
     if (RSS_SERIES) {
       for (let round = 0; round < 5; round++)
-        for (const variant of EXECUTOR_REFERENCE || OWNER_COMPARE
+        for (const variant of EXECUTOR_REFERENCE || OWNER_COMPARE || POOL_COMPARE
           ? round % 2 === 0
             ? (["baseline", "candidate"] as const)
             : (["candidate", "baseline"] as const)
@@ -715,6 +717,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
             persistent: true,
             recycle: OWNER_API || process.env.MINNOW_EXPORT_RECYCLE === "1",
             ownerAPI: OWNER_API && (!OWNER_COMPARE || variant === "candidate"),
+            ...(POOL_COMPARE ? { outputClasses: variant === "candidate" } : {}),
             discard: DISCARD,
             readaheadKiB: 256,
             auditWorkingSet: false,

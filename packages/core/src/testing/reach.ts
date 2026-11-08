@@ -363,6 +363,27 @@ export const WINDOW_CANCEL_REJECTION_REACH = [
 ] as const;
 
 /** Descriptor reuse across scan phases, endpoint page spans and residency changes. */
+export const OUTPUT_CLASS_SCAN_REACH = [
+  "bucket bounded scan",
+  "exact bounded scan",
+  "bounded padding",
+] as const;
+
+export const OUTPUT_BUCKET_POOL_REACH = [
+  "held is never reused",
+  "release after close",
+  "neighbor size reused",
+  "slack charged",
+  "tight views only",
+  "all charges released",
+] as const;
+
+export const OUTPUT_CLASS_REACH = [
+  "exact output",
+  "bucketed output",
+  "charged zero padding",
+] as const;
+
 export const SCAN_SHAPE_REACH = [
   "sparse NULLs in every layout",
   "recycled native bytes",

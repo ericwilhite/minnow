@@ -4,7 +4,7 @@
  */
 import fc from "fast-check";
 import { expect, it } from "vitest";
-import { createReach, SCAN_SHAPE_REACH } from "../../testing/reach.js";
+import { createReach, SCAN_SHAPE_REACH, OUTPUT_CLASS_REACH } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { ChunkReader, DecodeFact } from "../page/reader.js";
 import { defined, sameValue, valueAt, writeGroup, type TestValue } from "../page/test-support.js";
@@ -15,6 +15,7 @@ import type { Vector } from "../vector/vector.js";
 import { ReturnPool } from "./return-pool.js";
 import { Governor } from "../memory/governor.js";
 import { ColumnTarget, type DecodeSpec } from "./column-target.js";
+import { referenceCapacity } from "./output-class-test-support.js";
 import { sourceSizedPages } from "./column-shape-test-support.js";
 
 function countingBudget(): ByteBudget & { used: number } {
@@ -62,15 +63,17 @@ function facts(reader: ChunkReader, from: number, to: number): void {
 it.each(seedsFor("next-column-shape", [0xb2d1, 0xb2d2]))(
   "shape reuse preserves decoded output and charges (seed %i)",
   async (seed) => {
-    const reach = createReach("next-column-shape", SCAN_SHAPE_REACH);
+    const reach = createReach("next-column-shape", [...SCAN_SHAPE_REACH, ...OUTPUT_CLASS_REACH]);
     await fc.assert(
       fc.asyncProperty(
         fc.integer({ min: 300, max: 512 }),
         fc.integer({ min: 1, max: 19 }),
         fc.constantFrom(512, 2048),
         fc.boolean(),
-        async (count, salt, rawPageBytes, sparseEveryLayout) => {
+        fc.boolean(),
+        async (count, salt, rawPageBytes, sparseEveryLayout, bucketed) => {
           reach.beginHistory();
+          reach.reach(bucketed ? "bucketed output" : "exact output");
           reach.reach(rawPageBytes === 512 ? "512 B raw page" : "2 KiB raw page");
           if (sparseEveryLayout) reach.reach("sparse NULLs in every layout");
           const encoder = new TextEncoder();
@@ -147,6 +150,7 @@ it.each(seedsFor("next-column-shape", [0xb2d1, 0xb2d2]))(
             );
             let targetCharge = 0;
             const memory = {
+              ...(bucketed ? { outputSize: referenceCapacity } : {}),
               reuse: (bytes: number) => pool.take(bytes),
               take: (n: number) => {
                 targetCharge += n;
@@ -224,6 +228,7 @@ it.each(seedsFor("next-column-shape", [0xb2d1, 0xb2d2]))(
                     old = reference.decode(sourceSizedPages(reader, source.values), spec);
                   equal(rows(actual), expected);
                   equal(rows(actual), rows(old));
+                  const chargedBefore = targetCharge;
                   const owned = target.decodeOwned(reader, spec, codes),
                     legacy = reference.decodeOwned(
                       sourceSizedPages(reader, source.values),
@@ -232,16 +237,25 @@ it.each(seedsFor("next-column-shape", [0xb2d1, 0xb2d2]))(
                     );
                   equal(rows(owned.vector), expected);
                   equal(rows(owned.vector), rows(legacy.vector));
-                  expect(owned.bytes).toBe(legacy.bytes);
-                  expect(owned.bytes).toBeLessThanOrEqual(a);
-                  const expectedBytes = legacy.buffers.map((buffer) =>
-                    new Uint8Array(buffer).slice(),
+                  expect(targetCharge - chargedBefore).toBe(owned.bytes + legacy.bytes);
+                  expect(owned.bytes).toBe(owned.buffers.reduce((sum, b) => sum + b.byteLength, 0));
+                  expect(owned.bytes).toBeLessThanOrEqual(
+                    target.outputBytes(reader, spec, codes, true, memory.outputSize),
                   );
+                  if (owned.bytes > legacy.bytes) reach.reach("charged zero padding");
+                  const expectedBytes = legacy.buffers.map((buffer) => {
+                    const bytes = new Uint8Array(
+                      bucketed ? referenceCapacity(buffer.byteLength) : buffer.byteLength,
+                    );
+                    bytes.set(new Uint8Array(buffer));
+                    return bytes;
+                  });
                   const ids = pool.issue(0, owned.buffers);
                   const received = structuredClone(owned.buffers, { transfer: [...owned.buffers] });
                   // A consumer can modify its exclusive storage before relinquishing it.
                   for (const buffer of received) new Uint8Array(buffer).fill(0xa5);
                   const returned = structuredClone(received, { transfer: [...received] });
+                  expect(received.every((b) => b.byteLength === 0)).toBe(true);
                   pool.release(
                     0,
                     returned.map((buffer, i) => ({ id: ids[i] ?? -1, buffer })),

@@ -177,7 +177,10 @@ export interface TableScanOptions {
    * unless the terminal caller permits ordinary borrowed output with borrowOutputOnRefusal.
    */
   readonly outputBudget?: ByteBudget;
-  readonly outputBuffers?: { take(bytes: number): ArrayBuffer | null };
+  readonly outputBuffers?: {
+    take(bytes: number): ArrayBuffer | null;
+    outputSize?(bytes: number): number;
+  };
   /** Owning terminal consumer resolves each dictionary's wire form before sizing output. */
   readonly outputDictionary?: (dictionary: FlatVector) => boolean;
   /** Terminal transfer optimization may use ordinary borrowed decode on one-row refusal. */
@@ -265,8 +268,12 @@ class ScanMemory implements TargetMemory, ByteBudget {
   reserve = 0;
   constructor(
     readonly budget: ByteBudget,
-    readonly buffers?: { take(bytes: number): ArrayBuffer | null },
+    readonly buffers?: {
+      take(bytes: number): ArrayBuffer | null;
+      outputSize?(bytes: number): number;
+    },
   ) {}
+  outputSize = (bytes: number): number => this.buffers?.outputSize?.(bytes) ?? bytes;
   reuse(bytes: number): ArrayBuffer | null {
     return this.buffers?.take(bytes) ?? null;
   }
@@ -933,6 +940,7 @@ export class TableScan implements BatchSource {
           spec,
           !group.owned || this.#dictionaryCodes(group, c),
           group.owned,
+          group.owned ? this.#ownedMemory.outputSize : undefined,
         );
     }
     return bytes;
@@ -1009,7 +1017,13 @@ export class TableScan implements BatchSource {
       const pages = at(group.columns, c).pages;
       if (pages === null) continue;
       const bytes = group.owned
-        ? at(this.#targets, c).outputBytes(pages, spec, this.#dictionaryCodes(group, c), true)
+        ? at(this.#targets, c).outputBytes(
+            pages,
+            spec,
+            this.#dictionaryCodes(group, c),
+            true,
+            this.#ownedMemory.outputSize,
+          )
         : at(this.#targets, c).growthFor(pages, spec);
       if (group.owned && this.#ownedMemory !== this.#memory) output += bytes;
       else input += bytes;
@@ -1145,6 +1159,7 @@ export class TableScan implements BatchSource {
     return {
       detachableBuffers: buffers,
       detachableBudget: this.#ownedMemory.budget,
+      detachableCapacity: this.#ownedMemory.outputSize,
       release: () => {
         if (released) return;
         released = true;

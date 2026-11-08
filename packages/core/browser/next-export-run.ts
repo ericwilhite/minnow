@@ -271,6 +271,7 @@ export async function exportPass(options: {
   readonly discard?: boolean;
   readonly recycle?: boolean;
   readonly ownerAPI?: boolean;
+  readonly outputClasses?: boolean;
   readonly once: boolean;
   readonly readaheadKiB: number;
   readonly windowMiB?: number;
@@ -313,6 +314,7 @@ export async function exportPass(options: {
     once: options.once,
     ...(options.recycle ? { recycle: true } : {}),
     ...(options.ownerAPI ? { ownerAPI: true } : {}),
+    ...(options.outputClasses === undefined ? {} : { outputClasses: options.outputClasses }),
     readaheadKiB: options.readaheadKiB,
     ...(options.windowMiB === undefined ? {} : { windowMiB: options.windowMiB }),
     capMiB: options.capMiB,

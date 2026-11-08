@@ -1,11 +1,12 @@
 import fc from "fast-check";
 import { expect, it } from "vitest";
-import { createReach, RESULT_OWNED_LAYOUT_REACH } from "../../testing/reach.js";
+import { createReach, RESULT_OWNED_LAYOUT_REACH, OUTPUT_CLASS_REACH } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { Governor } from "../memory/governor.js";
 import type { PhysicalType } from "../types.js";
 import type { FlatVector, VectorData } from "../vector/vector.js";
 import { frameTransferList, ResultChannel } from "../exec/result.js";
+import { referenceCapacity, paddedCopy } from "../exec/output-class-test-support.js";
 import { ResultSink } from "../exec/result-sink.js";
 
 type Kind = (typeof RESULT_OWNED_LAYOUT_REACH)[number];
@@ -103,19 +104,29 @@ function input(kind: Kind, n: number, salt: number): FlatVector {
 for (const kind of RESULT_OWNED_LAYOUT_REACH)
   for (const seed of seedsFor("next-result-owned-bytes", [0xb2f7, 0xb2f8]))
     it(`dedicated ${kind} bytes survive real transfer seed ${String(seed)}`, async () => {
-      const reach = createReach(`result bytes ${kind}`, [kind]);
+      const reach = createReach(`result bytes ${kind}`, [kind, ...OUTPUT_CLASS_REACH]);
       await fc.assert(
         fc.asyncProperty(
           fc.integer({ min: 33, max: 100 }),
           fc.integer({ min: 1, max: 31 }),
-          async (n, salt) => {
+          fc.boolean(),
+          async (n, salt, bucketed) => {
             reach.beginHistory();
-            const vector = input(kind, n, salt);
+            reach.reach(bucketed ? "bucketed output" : "exact output");
+            const source = input(kind, n, salt);
+            const vector = bucketed ? paddedCopy(source) : source;
             const original = frameTransferList({
               rowCount: n,
               columns: [vector],
               dictionaries: [],
             });
+            const sourceBytes = frameTransferList({
+              rowCount: n,
+              columns: [source],
+              dictionaries: [],
+            }).reduce((sum, b) => sum + b.byteLength, 0);
+            if (original.reduce((sum, b) => sum + b.byteLength, 0) > sourceBytes)
+              reach.reach("charged zero padding");
             const expected = original.map((b) => new Uint8Array(b).slice());
             const bytes = original.reduce((s, b) => s + b.byteLength, 0);
             const governor = new Governor(8 * 1024 * 1024),
@@ -137,6 +148,7 @@ for (const kind of RESULT_OWNED_LAYOUT_REACH)
                   {
                     detachableBuffers: new Set(original),
                     detachableBudget: grant,
+                    ...(bucketed ? { detachableCapacity: referenceCapacity } : {}),
                     release() {
                       if (!returned) {
                         returned = true;

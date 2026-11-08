@@ -24,6 +24,7 @@ import type { ExtentReader } from "../../../packages/core/src/next/storage/exten
 import type { PhysicalType } from "../../../packages/core/src/next/types.js";
 import type { ExportGroup, ExportResult } from "./export-stream.js";
 import type { ExecutorExportStats } from "./executor-export.js";
+import { outputCapacity } from "../../../packages/core/src/next/exec/return-pool.js";
 import { traceReturnPool } from "./return-pool-trace.js";
 import { benchTableOf } from "./scan-fixture.js";
 
@@ -226,8 +227,17 @@ export function prepareOwnerExport(
   const createPool = engine.createReturnPool.bind(engine);
   let trace: ReturnType<typeof traceReturnPool> | null = null;
   let pass = 0;
+  let policy: ((bytes: number) => number) | undefined;
+  let requestedBuffers = 0,
+    hitsAtArm = 0;
   engine.createReturnPool = (cap) => {
     pool = createPool(cap);
+    if (policy) pool.outputSize = policy;
+    const take = pool.take.bind(pool);
+    pool.take = (bytes) => {
+      if (bytes > 0) requestedBuffers++;
+      return take(bytes);
+    };
     if (options.poolTrace) trace = traceReturnPool(pool);
     return pool;
   };
@@ -284,8 +294,17 @@ export function prepareOwnerExport(
     receive?.(event);
   };
   return {
-    arm: () => {
+    arm: (outputClasses?: boolean) => {
       if (finish) throw new Error("Owner export is already armed");
+      // Bench A/B only: each policy starts with an empty bounded pool on the same real
+      // connection. Expire old capabilities; late returns are dropped, never awaited.
+      if (outputClasses !== undefined) {
+        policy = outputClasses ? outputCapacity : (bytes) => bytes;
+        pool?.evict(Infinity);
+        if (pool) pool.outputSize = policy;
+      }
+      requestedBuffers = 0;
+      hitsAtArm = pool?.hits ?? 0;
       trace?.begin(pass);
       pass++;
       frames =
@@ -312,6 +331,8 @@ export function prepareOwnerExport(
     returnStats: () => ({
       returnPoolMiB: (pool?.evictableBytes ?? 0) / 1048576,
       returnHits: pool?.hits ?? 0,
+      requestedBuffers,
+      reusedBuffers: (pool?.hits ?? 0) - hitsAtArm,
       returnAccepted: pool?.accepted ?? 0,
       ...(trace ? { poolTrace: trace.summary() } : {}),
     }),
