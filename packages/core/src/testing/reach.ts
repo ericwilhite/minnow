@@ -1712,3 +1712,17 @@ export const JSON_TABLE_NULL_REACH = [
   "single NULL",
   "NULL-only prefix",
 ] as const;
+
+/** The same FLOAT8 input stream must keep its order across every batch partition. */
+export const FLOAT_SUM_BOUNDARIES_REACH = [
+  "batch 1",
+  "batch 17",
+  "batch 511",
+  "batch 2048",
+  "unequal boundaries",
+  "stable group sorting",
+  "input-order updates",
+  "zero cancellation",
+  "unit cancellation",
+  "5000 groups",
+] as const;
