@@ -101,6 +101,11 @@ export default tseslint.config(
       "packages/core/src/next/testing/front-end-states.test.ts",
       // Exposes the collector through node:v8/node:vm to measure the driver's live heap.
       "packages/core/src/next/exec/pipeline.test.ts",
+      // Unexported Node-only operator benchmarks read node:os for per-run host load.
+      "packages/core/src/next/exec/window.bench.ts",
+      "packages/core/src/next/exec/window-order.bench.ts",
+      "packages/core/src/next/exec/window-gather.bench.ts",
+      "packages/core/src/next/exec/window-eval.bench.ts",
       // Linux process/task CPU counters for the opt-in storage reopen measurement.
       "packages/core/browser-tests/reopen-cpu.ts",
       "packages/core/browser-tests/next-storage-owner-reopen.spec.ts",

@@ -941,6 +941,8 @@ export const LOWER_M3_JOINS_REACH = [
 
 /** SQL windows run through durable storage and the actual executor, not a plan interpreter. */
 export const LOWER_M3_WINDOWS_REACH = [
+  "literal window amounts",
+  "duplicate window inputs",
   "min max",
   "integer average",
   "text order",
@@ -1521,4 +1523,15 @@ export const MEMORY_READ_BOUND_STATES = [
   "release chunk",
   "cancel sizing",
   "release sizing",
+] as const;
+
+/** Catalogue order checks preserve peers but reject reordered distinct key groups. */
+export const CATALOGUE_ORDER_REACH = [
+  "ascending",
+  "descending",
+  "multiple keys",
+  "ordinal",
+  "null keys",
+  "ties",
+  "window order only",
 ] as const;

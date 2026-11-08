@@ -1,6 +1,10 @@
 /** Node only: real committed storage -> SQL lowering -> executor -> materialized rows.
  * --frozen replays committed SQL verbatim, including captured row-bound literals. Gate B's
  * 1M join/window cells have no size-dependent SQL literals; select them with --only.
+ * --profile all records one setup-excluded V8 region per executing cell after CPU rounds.
+ * --compare-window-inputs / --compare-window-scalars alternate parent and candidate,
+ * hash every output cell, and record per-run CPU, wall time and load (use --repeats 7).
+ * Run under node --cpu-prof as well for a separately labelled whole-process diagnostic.
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -9,11 +13,16 @@ import { join, resolve } from "node:path";
 import { cpus, homedir, loadavg, tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { Session } from "node:inspector/promises";
-import { StorageCore } from "../packages/core/dist/next/testing/storage-core.js";
+import {
+  StorageCore,
+  expandTextDictionary,
+} from "../packages/core/dist/next/testing/storage-core.js";
 import { inputBatch, type InputValue } from "../packages/core/dist/next/testing/executor-input.js";
 import { oracleRows } from "../packages/core/dist/next/testing/differential-adapter.js";
+import { createExecutor } from "../packages/core/dist/next/exec/create.js";
 import { PlanningError } from "../packages/core/dist/next/lower/errors.js";
 import { CATALOGUE_AUTHORITY_REFUSALS } from "../packages/core/dist/next/testing/divergences.js";
+import type { WireFlat } from "../packages/core/dist/next/owner/frame.js";
 import { UnsupportedPlanError } from "../packages/core/dist/next/errors.js";
 import { BATCH_ROWS, type Batch } from "../packages/core/dist/next/vector/vector.js";
 
@@ -60,6 +69,11 @@ const harness = resolve(
 const only = new Set(option("--only", "").split(",").filter(Boolean));
 const profileId = option("--profile", "");
 const frozenSQL = args.includes("--frozen");
+const compareScalars = args.includes("--compare-window-scalars");
+const compareInputs = args.includes("--compare-window-inputs") || compareScalars;
+const parentExecutor = createExecutor(
+  compareScalars ? { windowScalarArguments: false } : { windowInputDeduplication: false },
+);
 const dataset = option("--dataset", "wide"),
   scale = Number(option("--scale", "333"));
 if (dataset !== "wide" && dataset !== "star" && dataset !== "retail")
@@ -114,6 +128,7 @@ const metadata = {
         join(harness, "queries.js"),
         resolve("apps/site/bench/benchmark.ts"),
         resolve("packages/core/src/next/testing/executor-catalogue.json"),
+        resolve("scripts/next-executor-bench.mts"),
       ].map(async (file) => [
         file,
         createHash("sha256")
@@ -124,6 +139,7 @@ const metadata = {
   ),
   load: loadavg(),
   profileId,
+  execArgv: process.execArgv,
   sqlSource: frozenSQL
     ? "committed executor-catalogue.json (unchanged SQL)"
     : "analytics-harness/queries.js",
@@ -302,9 +318,13 @@ try {
       console.log(JSON.stringify(record));
       continue;
     }
-    const consume = async () => {
-      const prepared = core.prepare(sql),
+    const consume = async (parent = false) => {
+      const lowered = core.lowerer.lower(sql, core.context());
+      if (lowered.kind !== "query") throw new Error("expected query");
+      const prepared = (parent ? parentExecutor : core.executor).prepare(lowered.plan),
         run = core.start(prepared);
+      const digest = createHash("sha256");
+      const dictionaries = new Map<number, WireFlat[]>();
       let rows = 0,
         checksum = 0;
       try {
@@ -312,19 +332,41 @@ try {
           const frame = await run.execution.results.next();
           if (frame === null) break;
           try {
+            for (const delta of frame.payload.dictionaries) {
+              const parts = dictionaries.get(delta.id) ?? [];
+              if (delta.from !== parts.reduce((size, part) => size + part.length, 0))
+                throw new RangeError("out-of-order result dictionary delta");
+              parts.push(structuredClone(delta.values));
+              dictionaries.set(delta.id, parts);
+            }
+            // Match StorageCore's tested materialization. Prepare descriptors once per frame,
+            // retain owned dictionary deltas across releases, and preserve the flat fast path.
             const batch: Batch = {
               length: frame.payload.rowCount,
               selection: null,
               columns: frame.payload.columns.map((vector, index) => {
-                if (vector.form !== "flat") throw new Error("unexpected encoded result frame");
+                const flat =
+                  vector.form === "dictionary"
+                    ? expandTextDictionary(vector, dictionaries.get(vector.dictionary) ?? [])
+                    : vector;
+                if (flat.form !== "flat") throw new Error("unexpected constant result frame");
                 const type = prepared.columns[index]?.type;
                 if (type === undefined) throw new Error("result type missing");
-                return { ...vector, type };
+                return { ...flat, type };
               }),
             };
             const decoded = oracleRows({ columns: prepared.columns, batches: [batch] });
             rows += decoded.length;
             for (const row of decoded) {
+              digest.update(
+                JSON.stringify(row, (_, value: unknown) =>
+                  typeof value === "bigint"
+                    ? { bigint: String(value) }
+                    : typeof value === "number" && !Number.isFinite(value)
+                      ? { number: String(value) }
+                      : value,
+                ),
+              );
               const firstName = prepared.columns[0]?.name;
               const first = firstName === undefined ? undefined : row[firstName];
               checksum +=
@@ -336,7 +378,7 @@ try {
         }
         const summary = await run.execution.executed;
         await run.execution.delivered;
-        return { rows, checksum, profile: summary.profile };
+        return { rows, checksum, digest: digest.digest("hex"), profile: summary.profile };
       } catch (error) {
         run.execution.cancel(error);
         await Promise.allSettled([run.execution.executed, run.execution.delivered]);
@@ -348,6 +390,42 @@ try {
     try {
       console.error(JSON.stringify({ id: query.id, phase: "warmup", load: loadavg() }));
       const warm = await consume();
+      if (compareInputs) {
+        const parentWarm = await consume(true);
+        if (warm.digest !== parentWarm.digest)
+          throw new Error("different parent/candidate results");
+        const samples: Array<{ variant: string; cpuMs: number; wallMs: number; load: number[] }> =
+          [];
+        for (let round = 0; round < rounds; round++) {
+          for (const parent of round % 2 === 0 ? [true, false] : [false, true]) {
+            const load = loadavg(),
+              cpu = process.cpuUsage(),
+              start = performance.now();
+            const result = await consume(parent);
+            const used = process.cpuUsage(cpu);
+            if (result.digest !== warm.digest || result.rows !== warm.rows)
+              throw new Error("different complete output across paired rounds");
+            const sample = {
+              variant: parent ? "parent" : "candidate",
+              cpuMs: (used.user + used.system) / 1000,
+              wallMs: performance.now() - start,
+              load,
+            };
+            samples.push(sample);
+            console.error(JSON.stringify({ id: query.id, round, ...sample }));
+          }
+        }
+        const record = {
+          id: query.id,
+          status: "paired",
+          rows: warm.rows,
+          digest: warm.digest,
+          samples,
+        };
+        records.push(record);
+        console.log(JSON.stringify(record));
+        continue;
+      }
       const samples: number[] = [],
         wall: number[] = [];
       let last = warm;
@@ -371,7 +449,7 @@ try {
         if (last.rows !== warm.rows || last.checksum !== warm.checksum)
           throw new Error("baseline result changed across CPU rounds");
       }
-      if (profileId === query.id) {
+      if (profileId === "all" || profileId === query.id) {
         const profiler = new Session();
         profiler.connect();
         await profiler.post("Profiler.enable");

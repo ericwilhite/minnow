@@ -27,6 +27,7 @@ import type { QueryRuntime, Program } from "./run.js";
 import { SortOperator, sortMinimumBytes } from "./sort.js";
 import { sortMode } from "./sort-keys.js";
 import type { SortColumn } from "./sort-keys.js";
+import { windowInputLayout, remapWindowFunction, literalWindowAmount } from "./window-input.js";
 import { TableScan } from "./table-scan.js";
 import {
   WindowOperator,
@@ -257,10 +258,18 @@ function condition(
   };
 }
 
-function setupWindow(rel: Extract<Rel, { op: "window" }>, input: readonly PhysicalType[]) {
+function setupWindow(
+  rel: Extract<Rel, { op: "window" }>,
+  input: readonly PhysicalType[],
+  scalarAmounts: boolean,
+) {
+  const amounts = rel.functions.map((call) =>
+    scalarAmounts ? literalWindowAmount(call.args[call.fn === "ntile" ? 0 : 1]) : undefined,
+  );
   const exprs: ScalarExpr[] = rel.orderBy.map((key) => key.expr);
-  const positions = rel.functions.map((call) =>
-    call.args.map((expr) => {
+  const positions = rel.functions.map((call, index) =>
+    call.args.map((expr, argIndex) => {
+      if (amounts[index] !== undefined && argIndex === (call.fn === "ntile" ? 0 : 1)) return -1;
       const at = exprs.length;
       exprs.push(expr);
       return at;
@@ -274,6 +283,7 @@ function setupWindow(rel: Extract<Rel, { op: "window" }>, input: readonly Physic
         call.fn === "ntile" ? null : args[0] === undefined ? null : at(keys.indexes, args[0]);
       const amountAt = call.fn === "ntile" ? args[0] : args[1];
       const fallback = call.args[2];
+      const scalarAmount = amounts[index];
       if (fallback !== undefined && fallback.op !== "literal" && fallback.op !== "param")
         throw new UnsupportedPlanError("a row-dependent lag/lead default", { construct: "window" });
       const scalar = (expr: ScalarExpr | null): number | null => {
@@ -322,7 +332,11 @@ function setupWindow(rel: Extract<Rel, { op: "window" }>, input: readonly Physic
         fn: call.fn,
         arg,
         type: call.type,
-        ...(amountAt === undefined ? {} : { amount: { column: at(keys.indexes, amountAt) } }),
+        ...(amountAt === undefined
+          ? {}
+          : amountAt === -1 && scalarAmount !== undefined
+            ? { amount: scalarAmount }
+            : { amount: { column: at(keys.indexes, amountAt) } }),
         fallback:
           fallback === undefined
             ? null
@@ -343,7 +357,13 @@ function setupWindow(rel: Extract<Rel, { op: "window" }>, input: readonly Physic
 }
 
 /** Compile capability checks and recipes, never retaining a mutable kernel instance. */
-export function compilePlan(plan: PhysicalPlan): Program {
+export interface CompileOptions {
+  /** False retains the original window inputs for component/query benchmark controls. */
+  readonly windowInputDeduplication?: boolean;
+  /** Parent control for literal-amount gather benchmarks. */
+  readonly windowScalarArguments?: boolean;
+}
+export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): Program {
   const bindings = new Map<string, ReturnType<typeof bindCall>>();
   const resolveCall: CallResolver = (fn, args) => {
     const key = fn + JSON.stringify(args);
@@ -638,13 +658,22 @@ export function compilePlan(plan: PhysicalPlan): Program {
                 input,
                 rel.keys.map((key) => key.expr),
               )
-            : setupWindow(rel, input);
-        const outputExprs = columns(keys.types).slice(0, input.length);
+            : setupWindow(rel, input, options.windowScalarArguments !== false);
+        const physical = windowInputLayout(
+          keys.exprs,
+          rel.op === "window" && rel.input.op === "project" ? rel.input.exprs : null,
+          rel.op === "window" && options.windowInputDeduplication !== false,
+        );
+        const outputExprs = input.map((type, c): ScalarExpr => ({
+          op: "column",
+          index: physical.index(c),
+          type,
+        }));
         if (rel.op === "window")
           for (let k = 0; k < rel.functions.length; k++) {
             const type = rel.functions[k]?.type;
             if (type !== undefined)
-              outputExprs.push({ op: "column", index: keys.types.length + k, type });
+              outputExprs.push({ op: "column", index: physical.types.length + k, type });
           }
         const make = (
           context: CompileContext,
@@ -658,7 +687,7 @@ export function compilePlan(plan: PhysicalPlan): Program {
             {
               ...context,
               input: [
-                ...keys.types,
+                ...physical.types,
                 ...(rel.op === "window" ? rel.functions.map((call) => call.type) : []),
               ],
             },
@@ -667,13 +696,15 @@ export function compilePlan(plan: PhysicalPlan): Program {
           const windowSpec =
             rel.op === "window"
               ? {
-                  types: keys.types,
-                  partitionBy: rel.partitionBy,
-                  orderBy: (keys as ReturnType<typeof setupWindow>).orderBy,
-                  functions: (keys as ReturnType<typeof setupWindow>).functions(
-                    extended,
-                    runtime === undefined,
-                  ),
+                  types: physical.types,
+                  partitionBy: rel.partitionBy.map(physical.index),
+                  orderBy: (keys as ReturnType<typeof setupWindow>).orderBy.map((key) => ({
+                    ...key,
+                    column: physical.index(key.column),
+                  })),
+                  functions: (keys as ReturnType<typeof setupWindow>)
+                    .functions(extended, runtime === undefined)
+                    .map((call) => remapWindowFunction(call, physical.index)),
                 }
               : null;
           if (runtime === undefined || grant === null) {
@@ -681,7 +712,7 @@ export function compilePlan(plan: PhysicalPlan): Program {
               sortMode(keys.types, order(rel.op === "sort" ? rel.keys : [], keys.indexes));
             else {
               validateWindowSpec(windowSpec);
-              sortMode(keys.types, [
+              sortMode(physical.types, [
                 ...windowSpec.partitionBy.map((column) => ({
                   column,
                   direction: "asc" as const,
@@ -691,7 +722,10 @@ export function compilePlan(plan: PhysicalPlan): Program {
                 ...windowSpec.orderBy,
               ]);
             }
-            return { operator: new ProjectOperator(keys.exprs, context, DISCARD), breaker: null };
+            return {
+              operator: new ProjectOperator(physical.exprs, context, DISCARD),
+              breaker: null,
+            };
           }
           const shared = {
             grant,
@@ -716,7 +750,7 @@ export function compilePlan(plan: PhysicalPlan): Program {
             if (windowSpec === null) throw new TypeError("missing window specification");
             breaker = new WindowOperator(windowSpec, shared, output);
           }
-          return { operator: new ProjectOperator(keys.exprs, context, breaker), breaker };
+          return { operator: new ProjectOperator(physical.exprs, context, breaker), breaker };
         };
         const measured = measureCompilerBuffers(
           compilation,
@@ -729,7 +763,7 @@ export function compilePlan(plan: PhysicalPlan): Program {
         const base =
           rel.op === "sort"
             ? sortMinimumBytes(keys.types)
-            : windowMinimumBytes(keys.types, rel.functions.length);
+            : windowMinimumBytes(physical.types, rel.functions.length);
         // The operator helper already includes its constructor's fixed buffers. Add only
         // this recipe's kernel arena; adding all measured bytes would count pools twice.
         const minimum = base + measured;

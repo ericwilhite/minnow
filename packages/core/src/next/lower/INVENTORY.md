@@ -200,9 +200,13 @@ false }`, CHAR(n) / CHARACTER(n) as fixed, CHAR alone as CHAR(1).
    `apply` yet: a correlated subquery in HAVING, in a grouped select list or nested in another
    subquery's select list ("Correlated subqueries are supported only as top-level WHERE
    conditions"), with GROUP BY or HAVING inside it, and DISTINCT inside a correlated scalar
-   subquery; a FULL JOIN after another join (`a LEFT JOIN b … FULL JOIN c`, "FULL JOIN is only
-   supported as the sole join") or under a window function; NATURAL FULL JOIN. PostgreSQL
-   accepts all of them.
+   subquery. PostgreSQL accepts these correlated forms.
+
+The typed preparation path supports FULL JOIN after another join, FULL JOIN under windows, and
+NATURAL FULL JOIN. These are covered by `testing/lower-m3-joins.test.ts` through the real executor
+and PostgreSQL. The shipped executor still uses its sole-FULL-join rewrite and refuses NATURAL
+FULL JOIN; its restrictions are not restrictions of typed lowering. NATURAL RIGHT JOIN remains
+refused by typed preparation.
 
 ## Contract requests
 

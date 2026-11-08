@@ -251,7 +251,7 @@ export async function storageCore(store: StoreKind): Promise<StorageCore> {
  * entries). The client reads the same codes through `StreamDictionaries`; the adapter compares
  * flat batches.
  */
-function expandTextDictionary(column: WireDictionary, parts: readonly WireFlat[]): WireFlat {
+export function expandTextDictionary(column: WireDictionary, parts: readonly WireFlat[]): WireFlat {
   const entry = (code: number): Uint8Array => {
     let index = code;
     for (const part of parts) {

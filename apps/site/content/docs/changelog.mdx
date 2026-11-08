@@ -8,9 +8,35 @@ commit; an omitted package did not change. Minnow is still in 0.x, so read an en
 notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
+## Unreleased
+
+Affected packages: `@minnowdb/core` (SQL feature metadata and compatibility documentation) and
+`@minnowdb/devtools` (failure explanations, for its next release after 0.3.9).
+
+The SQL feature matrix now records the existing refusal of parameter frame offsets, including
+`ROWS $1 PRECEDING`. The SELECT guide and compatibility notes also distinguish fractional
+`RANGE` offsets over integer keys (accepted here, rejected by PostgreSQL with `0A000`), validation
+before execution on empty or NULL-only input and under `LIMIT 0`, differing error messages, and
+public double-precision distances. These records describe existing public behavior; exact
+NUMERIC distances in the unexported rebuild executor do not change the public contract.
+
+Devtools' generated failure explanations now include the parameter-offset refusal and the
+clarified frame-compatibility notes from the matrix.
+
+**Size note:** the core package's SQL feature matrix and PostgreSQL profile add 402 packed
+bytes, bringing the tarball to 1,022,698 bytes. Its packed-size cap moves from 1,022,500 to
+1,023,000 bytes. Private rebuild code and test suites remain excluded; worker/client runtime code is unchanged. The unpacked-size and worker/client bundle caps remain unchanged.
+
+**Migration:** no stored-format change. Existing parameter frame offsets remain refused; use
+numeric literals. Consumers of SQL feature metadata should handle the added entries by ID.
+
 ## 0.20.0 — November 7, 2026
 
 Release packages: `@minnowdb/core@0.20.0`.
+
+**Correction:** the frame-offset rules below have public compatibility limits: offsets must be
+literals, `RANGE` distances use double precision, and accepted types, validation timing and error
+text differ from PostgreSQL. See the [compatibility notes](/docs/sql/feature-matrix).
 
 IndexedDB's silence guard now counts native request and transaction events, including bulk
 requests whose caller waits only for transaction completion. A long transaction that keeps

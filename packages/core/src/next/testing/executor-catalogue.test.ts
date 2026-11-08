@@ -9,6 +9,7 @@ import { UnsupportedPlanError } from "../errors.js";
 import { PlanningError } from "../lower/errors.js";
 import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
+import { assertCatalogueOrder, catalogueOrderColumns } from "./catalogue-order.js";
 import {
   CATALOGUE_AUTHORITY_REFUSALS,
   CATALOGUE_REFUSALS,
@@ -154,6 +155,12 @@ for (const dataset of ["wide", "retail", "star"])
           ),
         );
         const actual = oracleRows(result);
+        assertCatalogueOrder(
+          query.sql,
+          result.columns.map((column) => column.name),
+          actual,
+          pgRows,
+        );
         const a = canonical(actual),
           b = canonical(pgRows);
         if (JSON.stringify(a) !== JSON.stringify(b)) {
@@ -170,8 +177,10 @@ for (const dataset of ["wide", "retail", "star"])
           witnessSQL === undefined
             ? pgRows
             : (await pg.query<Record<string, unknown>>(witnessSQL)).rows;
+        const legacy = await current.query(query.sql);
+        assertCatalogueOrder(query.sql, legacy.columns, legacy.rows, legacyExpected);
         expect(
-          canonical((await current.query(query.sql)).rows),
+          canonical(legacy.rows),
           `${query.id} against independent PostgreSQL${witnessSQL === undefined ? "" : " R21 witness"}`,
         ).toEqual(canonical(legacyExpected));
         compiled.push(query.id);
@@ -193,6 +202,16 @@ for (const dataset of ["wide", "retail", "star"])
           lane: "Node correctness",
           dataset,
           executed: compiled,
+          ordered: cells
+            .filter(
+              (cell) =>
+                compiled.includes(cell.id) &&
+                catalogueOrderColumns(
+                  cell.sql,
+                  core.prepare(cell.sql).columns.map((column) => column.name),
+                ).length > 0,
+            )
+            .map((cell) => cell.id),
           unsupported: refused,
         }),
       );

@@ -61,6 +61,10 @@ for (const seed of seedsFor("next-lower-m3-windows", [0x7731, 0x7732]))
           reach.reach("reopened");
         }
         const cases: Array<[(typeof LOWER_M3_WINDOWS_REACH)[number], string]> = [
+          [
+            "literal window amounts",
+            `LAG(i,0,99) OVER(PARTITION BY p ORDER BY id),LEAD(i,1,99) OVER(PARTITION BY p ORDER BY id),LAG(i,2) OVER(PARTITION BY p ORDER BY id) AS lag_two,NTH_VALUE(i,3) OVER(PARTITION BY p ORDER BY id),NTILE(3) OVER(PARTITION BY p ORDER BY id)`,
+          ],
           ["row_number", `ROW_NUMBER() OVER(PARTITION BY p ORDER BY v DESC,id)`],
           ["rank", `RANK() OVER(PARTITION BY p ORDER BY k DESC)`],
           [
@@ -112,11 +116,12 @@ for (const seed of seedsFor("next-lower-m3-windows", [0x7731, 0x7732]))
               `COUNT(*) OVER(PARTITION BY p ORDER BY k DESC NULLS LAST${unit === "ROWS" ? ",id" : ""} ${unit} BETWEEN ${String(width)} PRECEDING AND 1 FOLLOWING EXCLUDE ${exclude}),SUM(i) OVER(PARTITION BY p ORDER BY k DESC NULLS LAST${unit === "ROWS" ? ",id" : ""} ${unit} BETWEEN ${String(width)} PRECEDING AND 1 FOLLOWING EXCLUDE ${exclude}),AVG(v) OVER(PARTITION BY p ORDER BY k DESC NULLS LAST${unit === "ROWS" ? ",id" : ""} ${unit} BETWEEN ${String(width)} PRECEDING AND 1 FOLLOWING EXCLUDE ${exclude})`,
             ]);
           }
+        reach.reach("duplicate window inputs");
         const operations: Operation[] = cases.map(([, expr]) => ({
           kind: "sql",
           sql: expr.includes(" WINDOW ")
-            ? `SELECT id,${expr.replace(" WINDOW ", ` FROM ${name} WINDOW `)} ORDER BY id`
-            : `SELECT id,${expr} FROM ${name} ORDER BY id`,
+            ? `SELECT id,p,k,i,v,p AS p_copy,k AS k_copy,${expr.replace(" WINDOW ", ` FROM ${name} WINDOW `)} ORDER BY id`
+            : `SELECT id,p,k,i,v,p AS p_copy,k AS k_copy,${expr} FROM ${name} ORDER BY id`,
           totalOrder: "primary key id",
         }));
         const candidate: EngineUnderTest = {

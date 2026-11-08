@@ -220,7 +220,11 @@ describe("published core tarball", () => {
       // 1,019,500 for the 0.20.0 SQL fixes (1,019,104 measured);
       // ratchets, not targets.
       // Integrated release/lowering front end: 1,021,845 packed bytes; cap raised to 1,022,500.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_022_500);
+      // Frame compatibility metadata adds 402 packed bytes (SQL matrix + PostgreSQL profile),
+      // taking cd21ba42's 1,022,296 bytes to 1,022,698. Counterfactual packs replacing only
+      // those JSON files recover the baseline; no next/ or test files ship. Keep 302 bytes
+      // of headroom without changing the unpacked budget or worker/client bundle caps.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_023_000);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");

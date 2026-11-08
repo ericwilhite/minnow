@@ -1101,9 +1101,9 @@ into hidden columns and removed from visible results. No runtime code generation
 The owner composition uses it by default; protocol tests over `StandinWritePath` explicitly keep
 their synthetic executor. DML, keyed nested-loop joins, index lookup/range, fetch, init plans, apply, set operations and
 recursion are still typed prepare-time refusals, as are unsupported existing kernel overloads.
-This factory does not turn those missing capabilities into current-engine fallbacks. Main's M2
-lowerer also refuses joins/windows before they reach the factory; direct IR tests exercise the
-operator wiring until M3 lowering lands.
+This factory does not turn those missing capabilities into current-engine fallbacks. The
+lowerer emits joins and windows for the factory; SQL catalogue tests exercise them through
+real storage and result delivery.
 
 Fixed operator buffers are reserved atomically before data-dependent state grows, so a join build
 cannot consume the later probe's admission minimum. Individual operators retain separate grants
@@ -1451,6 +1451,46 @@ The `exec/sort-lsd.bench.ts` comparison accepts `MODE=msd`, `lsd` (contiguous co
 float64/int64 keys). Compare `ROWS=100000` and `1000000` in at least seven interleaved rounds,
 recording load per run. The component excludes key preparation; whole-operator comparisons
 include it. Validation checks all normalized words, row multiplicity and stable ties untimed.
+
+`exec/window-order.bench.ts` isolates the five Gate B windows' actual grouped ordering,
+including sort scratch and peer construction. It shares prebuilt batches with `window.bench.ts`
+through `window-bench-fixtures.ts`. Full permutation, stable ties, partition membership and peer
+flags are checked outside timing. Run with `ROWS=1000000 RUNS=7`; both harnesses record process
+CPU and host load. Whole-window runs use `SORT=0 BENCH_JSON=1`. Bundle with esbuild for Node;
+keep output and `TMPDIR` under a cache directory. `scripts/profile-exec.mjs` brackets the measured
+operator region after construction and warmup; use it under `node --cpu-prof` for a separate
+whole-process diagnostic. `scripts/exec-profile.mts` reports self samples and exclusive phase
+shares from region profiles. Sampled wall duration includes descheduling and is not phase CPU.
+
+The older `window.bench.ts` and `window-order.bench.ts` layout diagnostics accept
+`LAYOUT=sql` (default), reproducing the frozen SQL's six-column top-k and five-column rank
+projections, or `LAYOUT=compact`, selecting the historical three-column operator shape.
+Those layout controls do not select a variant in the paired gather harness.
+
+`window-gather.bench.ts` isolates held-row construction from prebuilt, sorted partitions;
+every copied value is checked before timing. It always starts from the SQL layout and
+alternates parent/candidate order, recording CPU and host load per run. After bundling for
+Node, use `ROWS=1000000 RUNS=7 node --expose-gc <bundle> rank topk` for input compaction, or
+`COMPARE=amounts ROWS=1000000 RUNS=7 node --expose-gc <bundle> lagLead` for materialized versus
+scalar literal offsets. It does not read `LAYOUT`.
+
+`window-eval.bench.ts` separately isolates the running float SUM and moving float AVG kernels,
+with bounds measured separately and exact ordered-addition checks. Its buffers and sorted
+partitions are prebuilt.
+
+For full-query parent/candidate CPU comparisons, run `scripts/next-executor-bench.mts` with
+`--frozen --rows 1000000 --repeats 7` and either `--compare-window-inputs` (input compaction)
+or `--compare-window-scalars` (literal amounts). Select the frozen cells with `--only`, for
+example `--only win_rank,win_topk_row_number` or `--only win_lag_lead`. These controls alternate
+variants and require complete output digests to agree. Ingestion is outside timing;
+preparation, execution, materialization and cleanup remain inside.
+
+`scripts/next-executor-bench.mts --frozen --profile all` records one V8 region for every executing
+catalogue cell, after ingestion and CPU rounds. Dataset size/scale, seven-round samples, per-run
+load and source hashes accompany the results. The consumer shares the correctness adapter's
+dictionary expansion and prepares flat descriptors once per frame. The fixed retail fixture is
+not a scaled Gate B timing. Smaller diagnostic scales screen all cells; target comparisons need
+the target dataset and the separate 1M-row component runs.
 
 ### Windows (`exec/window.ts`, `window-sort.ts`, `window-frames.ts`, `window-stream.ts`)
 
@@ -2008,8 +2048,9 @@ not require a home cache directory.
   correlated values in parameter slots (rare from SQL); uncorrelated scalar and EXISTS subqueries
   where no join can attach are init plans, run lazily on the first read of their slot (R24.1).
   The front end refuses correlated subqueries in HAVING, in grouped or nested select lists, and
-  with GROUP BY / HAVING inside them, and a FULL JOIN after another join or under a window
-  (INVENTORY.md "Still needed" 4).
+  with GROUP BY / HAVING inside them (INVENTORY.md "Still needed" 4). Typed preparation
+  supports multiple FULL joins, FULL joins under windows, and NATURAL FULL JOIN; the shipped
+  executor retains its separate sole-FULL-join rewrite and NATURAL FULL refusal.
 - Set operations resolve each pair's column types as PostgreSQL does: an unknown-typed constant
   (NULL, a string literal) takes the other arm's type, and two unknowns are text.
 - A FULL JOIN with no hash-joinable condition lowers, though PostgreSQL refuses it (0A000): an
