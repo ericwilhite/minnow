@@ -1600,12 +1600,23 @@ The full interface contract includes the following (DML remains unimplemented by
   hash/store each (group, value id) pair again. Values and dictionary-entry hashes stay shared.
   Inputs starting with more groups keep the pair set. Later group growth retains bitmaps for
   ids below 64 and uses pairs for the others, without migration or duplicate membership.
-  Scalar COUNT keeps its seen markers; other DISTINCT functions keep the pair set. Bitmap
+  Scalar COUNT of TEXT, bytes, UUID and enum labels uses `scalar-byte-distinct.ts`: one
+  exact membership table with packed byte records, without dense value ids or a second seen
+  marker. A byte tag rejects most probes before loading record offsets; table growth reads
+  stored hashes in record order. Full hash matches still compare every byte. NULL is ignored; selected/constant vectors
+  preserve the first new row, and dictionary codes cache only entries actually referenced.
+  Other scalar COUNT arguments keep seen markers; other DISTINCT functions keep the pair set. Bitmap
   arrays, headers and resize overlap are charged before allocation and returned on close or
   failure. This does not add aggregation spill or promise lower memory for every later-growing
   group distribution. `createExecutor({ groupedDistinctBitmap: false })` selects the control;
   `next-executor-bench.mts --whole-compare aggregation` compares both aggregation levers and
   can record parent/candidate CPU profiles with `--profile`.
+  Scalar byte membership also charges buffers, temporary views, headers and old/new growth
+  overlap before allocating, and owns copies of borrowed input bytes. It does not add spill or
+  guarantee smaller memory for every key width/cardinality.
+  `createExecutor({ scalarByteDistinct: false })` selects generic interning;
+  `next-scalar-distinct-bench.mts` compares the exact million-row catalogue inputs in isolation,
+  and `next-executor-bench.mts --whole-compare scalar-distinct` compares whole queries.
 - Scan statistics hints (future; pre-sizing and AVG Sxx skipping are deferred).
   High-cardinality pre-sizing is deferred. The scan would need to supply a conservative NDV
   estimate for the grouping expressions (not merely a row count), its scope across pages and

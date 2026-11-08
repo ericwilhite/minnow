@@ -48,6 +48,7 @@ import {
   type TaskClock,
 } from "../pipeline.js";
 import { DistinctSet } from "./distinct.js";
+import { ScalarByteDistinct, supportsScalarByteDistinct } from "./scalar-byte-distinct.js";
 import { GroupTopN, supportsGroupTopN, type GroupTopNSpec } from "./group-top-n.js";
 import { GroupTable } from "./groups.js";
 import { accumulatorFor, fusedSums, type Accumulator } from "./states.js";
@@ -77,7 +78,7 @@ interface CompiledAggregate {
   readonly accumulator: Accumulator;
   readonly argument: Compiled | null;
   readonly filter: Predicate | null;
-  readonly distinct: DistinctSet | null;
+  readonly distinct: DistinctSet | ScalarByteDistinct | null;
   readonly selection: Selection;
   /** The output's type and, for a shared state, which of its results it reads. */
   readonly type: PhysicalType;
@@ -122,6 +123,8 @@ export interface AggregateOptions {
   readonly outputTopN?: GroupTopNSpec;
   /** False keeps grouped COUNT(DISTINCT) on its legacy pair set (benchmark control). */
   readonly groupedDistinctBitmap?: boolean;
+  /** False retains generic value interning for scalar byte COUNT(DISTINCT) (benchmark control). */
+  readonly scalarByteDistinct?: boolean;
 }
 
 /** Refuses what the operator cannot compile, before anything is allocated. */
@@ -241,6 +244,7 @@ export class AggregateOperator implements Operator {
           capacity,
           sharing,
           rel.groupBy.length > 0 && options.groupedDistinctBitmap !== false,
+          rel.groupBy.length === 0 && options.scalarByteDistinct !== false,
         );
         this.#aggregates.push(compiled);
         if (sharing) shared.set(key, compiled);
@@ -284,6 +288,7 @@ export class AggregateOperator implements Operator {
     capacity: number,
     sharedState: boolean,
     groupedBitmap: boolean,
+    scalarBytes: boolean,
   ): CompiledAggregate {
     const [arg] = call.args;
     const argument =
@@ -295,7 +300,7 @@ export class AggregateOperator implements Operator {
       argument?.type ?? null,
       this.#charge,
     );
-    let distinct: DistinctSet | null = null;
+    let distinct: DistinctSet | ScalarByteDistinct | null = null;
     let filter: Predicate | null;
     let selection: Selection;
     // Every fallible step after the accumulator is inside this scope, so a failure closes it.
@@ -303,12 +308,14 @@ export class AggregateOperator implements Operator {
       filter = call.filter === null ? null : new Predicate(call.filter, context);
       distinct =
         call.distinct && argument !== null
-          ? new DistinctSet(
-              argument.type,
-              this.#charge,
-              capacity,
-              groupedBitmap && call.fn === "count",
-            )
+          ? scalarBytes && call.fn === "count" && supportsScalarByteDistinct(argument.type)
+            ? new ScalarByteDistinct(argument.type, this.#charge)
+            : new DistinctSet(
+                argument.type,
+                this.#charge,
+                capacity,
+                groupedBitmap && call.fn === "count",
+              )
           : null;
       this.#takeArena(context, 2 * capacity);
       selection = { rows: new Uint16Array(capacity), count: 0 };

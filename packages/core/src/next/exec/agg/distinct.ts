@@ -8,7 +8,8 @@
  * dropped (every aggregate ignores them). Grouped COUNT can opt into per-group membership
  * bitmaps over those same global value ids: no second pair hash, no copied per-group values.
  * Large-group-first inputs retain pairs; later group growth uses disjoint bitmap/pair routes.
- * Scalar COUNT retains its existing seen-marker path in AggregateOperator.
+ * Scalar byte COUNT uses a count-only membership table in AggregateOperator; other scalar
+ * arguments retain this generic value-id/seen-marker path.
  * Memory is charged to the grant; spilling the set by
  * partition is milestone 3.
  */

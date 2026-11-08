@@ -380,6 +380,7 @@ export interface CompileOptions {
   readonly lateFetchOnce?: boolean;
   readonly groupTopN?: boolean;
   readonly groupedDistinctBitmap?: boolean;
+  readonly scalarByteDistinct?: boolean;
   /** False retains the original window inputs for component/query benchmark controls. */
   readonly windowInputDeduplication?: boolean;
   /** Parent control for literal-amount gather benchmarks. */
@@ -758,6 +759,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         const outputOptions: AggregateOptions = {
           ...(top === undefined ? {} : { outputTopN: top }),
           groupedDistinctBitmap: options.groupedDistinctBitmap !== false,
+          scalarByteDistinct: options.scalarByteDistinct !== false,
         };
         const minimum = measureCompilerBuffers(
           compilation,
