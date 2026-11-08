@@ -17,6 +17,7 @@ import {
 } from "../packages/core/dist/next/testing/storage-core.js";
 import { inputBatch, type InputValue } from "../packages/core/dist/next/testing/executor-input.js";
 import { oracleRows } from "../packages/core/dist/next/testing/differential-adapter.js";
+import { createExecutor } from "../packages/core/dist/next/exec/create.js";
 import { PlanningError } from "../packages/core/dist/next/lower/errors.js";
 import { CATALOGUE_AUTHORITY_REFUSALS } from "../packages/core/dist/next/testing/divergences.js";
 import type { WireFlat } from "../packages/core/dist/next/owner/frame.js";
@@ -66,6 +67,8 @@ const harness = resolve(
 const only = new Set(option("--only", "").split(",").filter(Boolean));
 const profileId = option("--profile", "");
 const frozenSQL = args.includes("--frozen");
+const compareInputs = args.includes("--compare-window-inputs");
+const parentExecutor = createExecutor({ windowInputDeduplication: false });
 const dataset = option("--dataset", "wide"),
   scale = Number(option("--scale", "333"));
 if (dataset !== "wide" && dataset !== "star" && dataset !== "retail")
@@ -310,9 +313,12 @@ try {
       console.log(JSON.stringify(record));
       continue;
     }
-    const consume = async () => {
-      const prepared = core.prepare(sql),
+    const consume = async (parent = false) => {
+      const lowered = core.lowerer.lower(sql, core.context());
+      if (lowered.kind !== "query") throw new Error("expected query");
+      const prepared = (parent ? parentExecutor : core.executor).prepare(lowered.plan),
         run = core.start(prepared);
+      const digest = createHash("sha256");
       const dictionaries = new Map<number, WireFlat[]>();
       let rows = 0,
         checksum = 0;
@@ -347,6 +353,15 @@ try {
             const decoded = oracleRows({ columns: prepared.columns, batches: [batch] });
             rows += decoded.length;
             for (const row of decoded) {
+              digest.update(
+                JSON.stringify(row, (_, value: unknown) =>
+                  typeof value === "bigint"
+                    ? { bigint: String(value) }
+                    : typeof value === "number" && !Number.isFinite(value)
+                      ? { number: String(value) }
+                      : value,
+                ),
+              );
               const firstName = prepared.columns[0]?.name;
               const first = firstName === undefined ? undefined : row[firstName];
               checksum +=
@@ -358,7 +373,7 @@ try {
         }
         const summary = await run.execution.executed;
         await run.execution.delivered;
-        return { rows, checksum, profile: summary.profile };
+        return { rows, checksum, digest: digest.digest("hex"), profile: summary.profile };
       } catch (error) {
         run.execution.cancel(error);
         await Promise.allSettled([run.execution.executed, run.execution.delivered]);
@@ -370,6 +385,42 @@ try {
     try {
       console.error(JSON.stringify({ id: query.id, phase: "warmup", load: loadavg() }));
       const warm = await consume();
+      if (compareInputs) {
+        const parentWarm = await consume(true);
+        if (warm.digest !== parentWarm.digest)
+          throw new Error("different parent/candidate results");
+        const samples: Array<{ variant: string; cpuMs: number; wallMs: number; load: number[] }> =
+          [];
+        for (let round = 0; round < rounds; round++) {
+          for (const parent of round % 2 === 0 ? [true, false] : [false, true]) {
+            const load = loadavg(),
+              cpu = process.cpuUsage(),
+              start = performance.now();
+            const result = await consume(parent);
+            const used = process.cpuUsage(cpu);
+            if (result.digest !== warm.digest || result.rows !== warm.rows)
+              throw new Error("different complete output across paired rounds");
+            const sample = {
+              variant: parent ? "parent" : "candidate",
+              cpuMs: (used.user + used.system) / 1000,
+              wallMs: performance.now() - start,
+              load,
+            };
+            samples.push(sample);
+            console.error(JSON.stringify({ id: query.id, round, ...sample }));
+          }
+        }
+        const record = {
+          id: query.id,
+          status: "paired",
+          rows: warm.rows,
+          digest: warm.digest,
+          samples,
+        };
+        records.push(record);
+        console.log(JSON.stringify(record));
+        continue;
+      }
       const samples: number[] = [],
         wall: number[] = [];
       let last = warm;

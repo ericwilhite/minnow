@@ -112,11 +112,12 @@ for (const seed of seedsFor("next-lower-m3-windows", [0x7731, 0x7732]))
               `COUNT(*) OVER(PARTITION BY p ORDER BY k DESC NULLS LAST${unit === "ROWS" ? ",id" : ""} ${unit} BETWEEN ${String(width)} PRECEDING AND 1 FOLLOWING EXCLUDE ${exclude}),SUM(i) OVER(PARTITION BY p ORDER BY k DESC NULLS LAST${unit === "ROWS" ? ",id" : ""} ${unit} BETWEEN ${String(width)} PRECEDING AND 1 FOLLOWING EXCLUDE ${exclude}),AVG(v) OVER(PARTITION BY p ORDER BY k DESC NULLS LAST${unit === "ROWS" ? ",id" : ""} ${unit} BETWEEN ${String(width)} PRECEDING AND 1 FOLLOWING EXCLUDE ${exclude})`,
             ]);
           }
+        reach.reach("duplicate window inputs");
         const operations: Operation[] = cases.map(([, expr]) => ({
           kind: "sql",
           sql: expr.includes(" WINDOW ")
-            ? `SELECT id,${expr.replace(" WINDOW ", ` FROM ${name} WINDOW `)} ORDER BY id`
-            : `SELECT id,${expr} FROM ${name} ORDER BY id`,
+            ? `SELECT id,p,k,i,v,p AS p_copy,k AS k_copy,${expr.replace(" WINDOW ", ` FROM ${name} WINDOW `)} ORDER BY id`
+            : `SELECT id,p,k,i,v,p AS p_copy,k AS k_copy,${expr} FROM ${name} ORDER BY id`,
           totalOrder: "primary key id",
         }));
         const candidate: EngineUnderTest = {
