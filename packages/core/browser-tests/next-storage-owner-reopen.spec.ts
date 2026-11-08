@@ -6,6 +6,7 @@
 import { chromium, expect, test } from "@playwright/test";
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { loadavg } from "node:os";
 import { requireWorkerOpfs } from "./fixtures.js";
 import { reopenCpuSampler } from "./reopen-cpu.js";
 import { cpuDelta, type ReopenCpuSnapshot } from "../browser/next-storage-listed-reopen.js";
@@ -94,9 +95,26 @@ for (const store of ["opfs", "indexeddb"] as const)
         });
         const wall: ReopenResult[] = [];
         const cpu = [];
-        for (let repeat = 0; repeat < 3; repeat++) {
+        const repeats = Number(process.env.MINNOW_OWNER_REOPEN_SAMPLES ?? 3);
+        if (!Number.isSafeInteger(repeats) || repeats < 1)
+          throw new RangeError("Bad reopen sample count");
+        const snapshot = () => ({
+          at: new Date().toISOString(),
+          load: loadavg(),
+          cpuPressure: existsSync("/proc/pressure/cpu")
+            ? readFileSync("/proc/pressure/cpu", "utf8")
+            : null,
+        });
+        const observations = [];
+        for (let repeat = 0; repeat < repeats; repeat++) {
+          const before = snapshot();
           const sample = await run({ ...base, op: "open" });
+          observations.push({ mode: "wall", repeat, before, after: snapshot() });
           wall.push(sample);
+          await info.attach(`owner-wall-${String(repeat)}`, {
+            body: JSON.stringify({ sample, observation: observations.at(-1) }),
+            contentType: "application/json",
+          });
           expect(sample.result.preparedAtReady).toBe(0);
           if (base.deferInitialMaintenance) {
             expect(sample.result.root.maintenanceStateAtReady).toMatchObject({
@@ -120,8 +138,14 @@ for (const store of ["opfs", "indexeddb"] as const)
           const expected = dataset === "W5M" ? (testRows ?? 5_000_000) : (testRows ?? 5_001_000);
           expect(Number(sample.result.count.count)).toBe(expected);
         }
-        for (let repeat = 0; repeat < 3; repeat++) {
+        for (let repeat = 0; repeat < repeats; repeat++) {
+          const before = snapshot();
           const sample = await run({ ...base, op: "open", cpu: true });
+          observations.push({ mode: "cpu", repeat, before, after: snapshot() });
+          await info.attach(`owner-cpu-${String(repeat)}`, {
+            body: JSON.stringify({ sample, observation: observations.at(-1) }),
+            contentType: "application/json",
+          });
           expect(sample.cpu).toHaveLength(sample.result.phases.length + 1);
           cpu.push({
             root: sample.result.root,
@@ -147,6 +171,7 @@ for (const store of ["opfs", "indexeddb"] as const)
           cpu: "Linux /proc owner-thread and browser-tree ticks, bracketed separately from wall-only samples; includes phase-boundary IPC",
           wall,
           profiled: cpu,
+          observations,
         };
         await info.attach("owner-ready-reopen", {
           body: JSON.stringify(report, null, 2),

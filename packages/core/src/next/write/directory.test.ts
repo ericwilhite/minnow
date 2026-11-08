@@ -4,6 +4,7 @@
  * when a deletion folds into one of its groups, retires exactly the directory extents no longer
  * used (the extent audit), and reopens with every row.
  */
+import { PIN_HEADER_BYTES } from "../storage/root-pins.js";
 import { GroupDirectory } from "./groups.js";
 import { describe, expect, it } from "vitest";
 import { GROUPS_PER_PAGE, ParseBudgetError, parseCharge } from "../format/manifest-codec.js";
@@ -134,6 +135,12 @@ describe("resident directory memory (review B3-p2a-2 #1)", () => {
     const fixed = () =>
       harness.governor.usedBytes - caches.reduce((sum, cache) => sum + cache.evictableBytes, 0);
     let path = await harness.open();
+    const snapshotCredit = () => {
+      const stats = harness.space.stats;
+      expect(stats.pinCount).toBe(1);
+      expect(stats.oldestPin?.label).toBe("current state");
+      return PIN_HEADER_BYTES + 2 * "current state".length;
+    };
     let t = 0;
     await autocommit(path, async (s) => {
       t =
@@ -157,14 +164,14 @@ describe("resident directory memory (review B3-p2a-2 #1)", () => {
     // At least the directory's exact charge (groups.ts) on top of the root's.
     expect(grown).toBeGreaterThanOrEqual(GroupDirectory.buildCharge(groups));
     // Each publish charged its growth on the grant itself.
-    expect(metadata.grant?.allocated).toBe(grown);
+    expect(metadata.grant?.allocated).toBe(grown + snapshotCredit());
     await harness.close();
     const baseline = fixed();
     path = await harness.open();
     const opened = path.residentMetadataBytes;
     // The same directory, charged again at open, before it was materialized.
     expect(opened).toBe(grown);
-    expect(metadata.grant?.allocated).toBe(opened);
+    expect(metadata.grant?.allocated).toBe(opened + snapshotCredit());
     const used = fixed() - baseline;
     await harness.close();
     // Ballast leaves room for everything the open needs except half the directory's charge.
@@ -182,14 +189,14 @@ describe("resident directory memory (review B3-p2a-2 #1)", () => {
     ballast.close();
     path = await harness.open();
     expect(path.residentMetadataBytes).toBe(opened);
-    expect(metadata.grant?.allocated).toBe(opened);
+    expect(metadata.grant?.allocated).toBe(opened + snapshotCredit());
     // Dropping the table returns its directory's charge (no older reader holds it).
     await autocommit(path, (s) => s.changeCatalog({ kind: "dropTable", tableId: t }));
-    expect(metadata.grant?.allocated).toBe(path.residentMetadataBytes);
-    // What stays is the current root's parse bound alone.
+    expect(metadata.grant?.allocated).toBe(path.residentMetadataBytes + snapshotCredit());
+    // Decoded metadata now holds only the current root; its separately owned pin remains charged.
     await path.quiesce();
     expect(path.residentMetadataBytes).toBe(parseCharge(harness.space.root?.length ?? 0));
-    expect(metadata.grant?.allocated).toBe(path.residentMetadataBytes);
+    expect(metadata.grant?.allocated).toBe(path.residentMetadataBytes + snapshotCredit());
     await harness.close();
   }, 300_000);
 });

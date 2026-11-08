@@ -25,7 +25,7 @@ import {
 } from "./chaos-workload.js";
 import { createReach, STORAGE_CONCURRENT_CRASH_REACH } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
-import type { ScratchSpace, StorageBackend } from "../storage/contract.js";
+import type { MetadataStore, ScratchSpace, StorageBackend } from "../storage/contract.js";
 import { createIndexedDbBackend } from "../storage/indexeddb.js";
 import { createOpfsBackend, type OpfsDirectoryLike } from "../storage/opfs.js";
 import { SimDisk, SimLocks } from "../storage/sim-disk.js";
@@ -79,6 +79,11 @@ function issuing<T extends object>(target: T, calls: IssuedCalls, prefix: string
       const method = (value as (...args: unknown[]) => unknown).bind(inner);
       // logLength is synchronous; everything else returns a promise.
       if (key === "logLength") return method;
+      if (key === "metadata")
+        return () => {
+          const metadata = method() as MetadataStore | null;
+          return metadata === null ? null : issuing(metadata, calls, "metadata.");
+        };
       return (...args: unknown[]) =>
         calls.run(`${prefix}${String(key)}`, () => method(...args) as Promise<unknown>);
     },
@@ -153,10 +158,18 @@ describe("the concurrent storage workload under power loss at any physical step"
     const reach = createReach(`concurrent crash ${kind}`, STORAGE_CONCURRENT_CRASH_REACH, {
       minimum: 5,
     });
-    it.each(SEEDS)(
-      `${kind}: recovers exactly what was acknowledged (seed %i)`,
+    it.each(
+      SEEDS.flatMap(
+        (seed) =>
+          [
+            [seed, false],
+            [seed, true],
+          ] as const,
+      ),
+    )(
+      `${kind}: recovers exactly what was acknowledged (seed %i, target overlap %s)`,
       { timeout: 60_000 },
-      async (seed) => {
+      async (seed, overlap) => {
         const random = mulberry32(seed);
         // A physical step is a file write or flush on OPFS, but a whole committed transaction on
         // the simulated IndexedDB (its write-ahead log record), so the ranges differ.
@@ -166,9 +179,35 @@ describe("the concurrent storage workload under power loss at any physical step"
         const first = observer(false);
         const calls = new IssuedCalls(mulberry32(seed ^ 0x1a7e));
         const crash: { at: { issued: string[]; open: ChaosStep[] } | null } = { at: null };
-        const disk = new SimDisk({
+        const disk: SimDisk = new SimDisk({
           seed,
-          crashAtStep,
+          // Keep every original uniform physical cut. The added dimension waits for an
+          // issued-call overlap; private metadata I/O must not make this reach accidental.
+          get crashAtStep(): number {
+            if (!overlap) return crashAtStep;
+            const issued = calls.snapshot();
+            const data = issued.some((method) =>
+              ["writeData", "publish", "releaseData"].includes(method),
+            );
+            const log = issued.some((method) =>
+              ["appendLog", "flushLog", "truncateLog", "resetLog", "writeLogHeader"].includes(
+                method,
+              ),
+            );
+            const writers = [...first.view.inFlight.values()].filter(
+              (intent) =>
+                intent.step === "write" &&
+                first.view.began.has(intent.sequence) &&
+                !first.view.settled.has(intent.sequence),
+            ).length;
+            const reached =
+              seed % 3 === 0
+                ? data && log
+                : seed % 3 === 1
+                  ? issued.includes("writeData") && writers >= 2
+                  : issued.length >= 2 && issued.some((method) => method.startsWith("spill."));
+            return reached ? disk.steps - 1 : -1;
+          },
           onCrash: () => {
             crash.at = {
               issued: calls.snapshot(),

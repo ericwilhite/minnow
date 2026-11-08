@@ -6,7 +6,9 @@ import { openExtentSpace } from "../storage/space.js";
 import { FreeSpaceMap } from "../storage/free-space.js";
 import { countingBudget, countingMemory } from "../storage/space-test-support.js";
 import { ReadDeniedError } from "../storage/extents.js";
-import { RETAINED_BASE_BYTES, RETIRED_SLOT_BYTES } from "../storage/retained-memory.js";
+import { METADATA_WORKSPACE_BYTES } from "../storage/metadata-journal.js";
+import { MIN_RUN_ARENA_BYTES } from "../storage/bounded-free-space.js";
+import { ROOT_BANK_BYTES } from "../storage/root-memory.js";
 import { FIXED_CACHE_BYTES } from "../storage/page-cache.js";
 import type { ReachableExtents } from "../storage/extents.js";
 
@@ -31,9 +33,9 @@ it("stream-merges ordered roots without the unordered sort constructor", async (
   const sorted = vi.spyOn(FreeSpaceMap, "fromAllocatedAsync");
   let space;
   try {
-    // Half of the union belongs only to the previous root. The old 8 MiB
-    // fixture budget hid that retained state; it must now refuse and clean up.
-    const refused = countingBudget(8 << 20);
+    // Refuse before a workspace exists. Previous-only extents are disk-derived tickets,
+    // so the successful case needs only the fixed workspace and capped arena.
+    const refused = countingBudget(METADATA_WORKSPACE_BYTES - 1);
     const refusedMemory = countingMemory(Infinity);
     await expect(
       openExtentSpace(session, {
@@ -45,8 +47,8 @@ it("stream-merges ordered roots without the unordered sort constructor", async (
     expect(refused.used).toBe(0);
     expect(refusedMemory.used).toBe(0);
     visited = 0;
-    const retainedBytes = RETAINED_BASE_BYTES + 2 * 65536 * RETIRED_SLOT_BYTES;
-    const budget = countingBudget(retainedBytes);
+    const retainedBytes = METADATA_WORKSPACE_BYTES + MIN_RUN_ARENA_BYTES + ROOT_BANK_BYTES;
+    const budget = countingBudget(METADATA_WORKSPACE_BYTES + MIN_RUN_ARENA_BYTES);
     const memory = countingMemory(Infinity);
     space = await openExtentSpace(session, {
       reachable,

@@ -1,22 +1,6 @@
-/**
- * The extent space (extents.ts): `openExtentSpace` and its writers, builders and publication,
- * over any `StoreSession`. The contract, the rules and their reasons are in extents.ts; this file
- * notes only how they are met.
- *
- * - **Allocation** is one `FreeSpaceMap` (free-space.ts) over the data space; a builder's space is
- *   an `ExtentReservation` (reservation.ts) on it.
- * - **Writes** go through one 1 MiB write slab, so a chunk appended page by page costs a few
- *   platform writes. The store writes only at `DATA_ALIGN` offsets, so the slab always starts at an
- *   aligned logical position of the builder that owns it: when it fills, its aligned prefix is
- *   written and the partial last sector stays in the slab; when another builder appends, everything
- *   staged is written (the last sector partially) and that partial sector (< 4 KiB) is kept with
- *   its builder, to start its next staging. Write amplification is at most one sector per switch.
- * - **Publication** is a promise chain (one at a time, in call order). Validation runs when a
- *   publish's turn comes, before any effect.
- * - **Reclaim**: `ReclaimLedger` (reclaim.ts) decides when retired extents are reusable; freeing
- *   drops the cache's blobs of each extent, then `releaseData`, and only when that resolves does
- *   the range enter the free map. A free tail is then released (truncated) at once: every byte the
- *   space may still write past `end` is reserved in the map, so this never cuts live data.
+/** Extent allocation and ownership over StoreSession. R8 state is a disk queue of immutable
+ * before/after snapshots; the capped free-run arena never treats its unknown complement as
+ * ownership. Every ownership removal/transition is serialized through one mutation barrier.
  */
 import { pauseIfDue, type TaskWork } from "../task.js";
 import { xxHash32 } from "../hash/xxhash32.js";
@@ -51,27 +35,38 @@ import {
   type WriterState,
   type WrittenExtent,
 } from "./extents.js";
-import { FreeSpaceMap } from "./free-space.js";
+import type { ExtentList } from "./extent-list.js";
+import { BoundedFreeSpaceMap } from "./bounded-free-space.js";
 import { PageCache } from "./page-cache.js";
-import { ReclaimLedger, type RootPin } from "./reclaim.js";
+import type { RootPin } from "./reclaim.js";
+import { RootPins } from "./root-pins.js";
 import { ExtentReservation, type SealPlan } from "./reservation.js";
 import { MAX_SLAB } from "./slabs.js";
+import { RootMemory, type RootFrame } from "./root-memory.js";
+import { decodeRootSlot } from "./root-slot.js";
+import { MetadataMutex } from "./metadata-mutex.js";
+import { captureAudit, clearCapture, flattenCapture, type AuditCapture } from "./audit-capture.js";
+import { MetadataJournal, MetadataWorkspace } from "./metadata-journal.js";
 import {
-  RetainedMemory,
-  RetainedCapacity,
-  FREE_RUN_SLOT_BYTES,
-  RETIRED_SLOT_BYTES,
-} from "./retained-memory.js";
-
+  saveNativeList,
+  saveExtentInput,
+  reconstructState,
+  reconstructNativeState,
+  disposeSnapshot,
+} from "./extent-snapshot.js";
+import { RetirementTickets } from "./retirement-tickets.js";
+import { pairPhase, type MetadataWork } from "./metadata-work.js";
+import { sortExtents, mergeExtents, openPairs } from "./metadata-extents.js";
+import {
+  validateRetirements,
+  validateIncoming,
+  releaseWorklist,
+  discardPrepared,
+} from "./publication-validation.js";
 const alignDown = (value: number) => value - (value % DATA_ALIGN);
-
-/** A builder's own staging buffer, when its writer's budget grants one (measured on OPFS). */
 export const BUILDER_BUFFER_BYTES = 256 * 1024;
-
-/** A one-at-a-time lock over a shared buffer. */
 class Mutex {
   #tail: Promise<void> = Promise.resolve();
-
   async run<T>(work: () => Promise<T>): Promise<T> {
     const previous = this.#tail;
     let done!: () => void;
@@ -86,328 +81,261 @@ class Mutex {
     }
   }
 }
-
-/**
- * Every extent `root` reaches, by offset, with its exact length. Each is checked as stored
- * coordinates before anything uses it: safe integers, an aligned offset, a positive length, and an
- * exact end within `dataLength` (not its aligned end: a short file is corruption, review B1-p2a
- * finding 4). One offset with two lengths is corruption.
- */
-async function collect(
+interface MutationGuard {
+  readonly space: Space;
+}
+type ListLease = ReturnType<NonNullable<ReachableExtents["openList"]>>;
+function listLease(
   root: Uint8Array | null,
-  reachable: ReachableExtents,
-  space: { read: ExtentSpace["read"]; peek: ExtentSpace["peek"] },
+  source: ReachableExtents,
+  budget: ByteBudget,
+  supplied?: ExtentList,
+): ListLease | null {
+  if (supplied !== undefined || root === null)
+    return { list: supplied ?? [], release: () => undefined };
+  return source.openList?.(root, budget) ?? null;
+}
+/** Format descriptors are immutable and admitted before return. Keep their credit in C,
+ * instead of keeping the startup grant alive or decoding again during publication.
+ */
+function retainedListLease(
+  root: Uint8Array | null,
+  source: ReachableExtents,
+  startup: ByteBudget,
+  roots: RootMemory,
+): ListLease | null {
+  const budget = roots.leaseBudget(startup);
+  let lease: ListLease | null = null;
+  try {
+    lease = listLease(root, source, budget);
+    if (lease === null) {
+      budget.close();
+      return null;
+    }
+    budget.transfer();
+    const owned = lease;
+    let held = true;
+    return {
+      list: owned.list,
+      release() {
+        if (!held) return;
+        held = false;
+        try {
+          owned.release();
+        } finally {
+          budget.close();
+        }
+      },
+    };
+  } catch (error) {
+    try {
+      lease?.release();
+    } finally {
+      budget.close();
+    }
+    throw error;
+  }
+}
+
+function rootInput(
+  root: Uint8Array | null,
+  source: ReachableExtents,
+  reader: ExtentReader,
+  budget: ByteBudget,
+  work?: TaskWork,
+): AsyncIterable<ExtentRef> {
+  return (async function* () {
+    if (root === null) return;
+    for await (const ref of source(root, reader, budget, work))
+      yield "extent" in ref ? ref.extent : ref;
+  })();
+}
+async function snapshotRoot(
+  root: Uint8Array | null,
+  source: ReachableExtents,
+  reader: ExtentReader,
   budget: ByteBudget,
   dataLength: number,
+  journal: MetadataJournal,
+  cache: PageCache,
   work?: TaskWork,
-): Promise<Map<number, number>> {
-  const extents = new Map<number, number>();
-  if (root === null) return extents;
-  for await (const item of reachable(root, space, budget, work)) {
-    const pending = pauseIfDue(work);
-    if (pending !== undefined) await pending;
-    const { offset, length } = "extent" in item ? item.extent : item;
-    if (!(
-      Number.isSafeInteger(offset) &&
-      Number.isSafeInteger(length) &&
-      offset >= 0 &&
-      offset % DATA_ALIGN === 0 &&
-      length > 0 &&
-      offset + length <= dataLength
-    ))
-      throw new StoreCorruptionError(
-        `A root names an invalid extent at ${String(offset)} (${String(length)} bytes; data space ${String(dataLength)} bytes)`,
-      );
-    const known = extents.get(offset);
-    if (known !== undefined && known !== length)
-      throw new StoreCorruptionError(`Two extents at ${String(offset)} differ in length`);
-    extents.set(offset, length);
-  }
-  return extents;
-}
-
-/**
- * The extents of both kept roots, validated as one set before anything is freed or truncated
- * (review B1-p2a finding 1): an offset both roots name must be the same extent in both. Returns
- * the union and the extents only the previous root reaches.
- */
-async function unite(
-  current: ReadonlyMap<number, number>,
-  previous: ReadonlyMap<number, number>,
-  work?: TaskWork,
-): Promise<{ union: DataRange[]; previousOnly: DataRange[] }> {
-  const union: DataRange[] = [];
-  const previousOnly: DataRange[] = [];
-  for (const [offset, length] of current) {
-    if (union.length % 128 === 0) {
-      const pending = pauseIfDue(work);
-      if (pending !== undefined) await pending;
-    }
-    union.push({ offset, length });
-  }
-  let examined = 0;
-  for (const [offset, length] of previous) {
-    if (examined++ % 128 === 0) {
-      const pending = pauseIfDue(work);
-      if (pending !== undefined) await pending;
-    }
-    const known = current.get(offset);
-    if (known === undefined) {
-      union.push({ offset, length });
-      previousOnly.push({ offset, length });
-    } else if (known !== length)
-      throw new StoreCorruptionError(
-        `The current and previous roots name different extents at ${String(offset)} (${String(known)} and ${String(length)} bytes)`,
-      );
-  }
-  return { union, previousOnly };
-}
-
-/**
- * Checks that a root's startup source (its extent list) and the full walk name exactly the same
- * extents (ruling R25): anything else is `StoreCorruptionError`.
- */
-async function sameExtents(
-  listed: ReadonlyMap<number, number>,
-  walked: ReadonlyMap<number, number>,
-  which: string,
-  work?: TaskWork,
-): Promise<void> {
-  let examined = 0;
-  for (const [offset, length] of walked) {
-    if (examined++ % 128 === 0) {
-      const pending = pauseIfDue(work);
-      if (pending !== undefined) await pending;
-    }
-    const listedLength = listed.get(offset);
-    if (listedLength === undefined)
-      throw new StoreCorruptionError(
-        `The ${which} root's extent list misses the extent at ${String(offset)} that it reaches`,
-      );
-    if (listedLength !== length)
-      throw new StoreCorruptionError(
-        `The ${which} root's extent list gives the extent at ${String(offset)} ${String(listedLength)} bytes, the walk ${String(length)}`,
-      );
-  }
-  for (const offset of listed.keys()) {
-    if (examined++ % 128 === 0) {
-      const pending = pauseIfDue(work);
-      if (pending !== undefined) await pending;
-    }
-    if (!walked.has(offset))
-      throw new StoreCorruptionError(
-        `The ${which} root's extent list names the extent at ${String(offset)}, which it does not reach`,
-      );
+): Promise<number> {
+  const lease = listLease(root, source, budget);
+  try {
+    return lease === null
+      ? await saveExtentInput(
+          journal,
+          rootInput(root, source, reader, budget, work),
+          source.ordered === true,
+          dataLength,
+          work,
+        )
+      : await saveNativeList(journal, cache, lease.list, dataLength, work);
+  } finally {
+    lease?.release();
   }
 }
-
-/** Merge two already ordered roots while retaining only previous-only retirement entries. */
-async function orderedMap(
-  root: Uint8Array | null,
-  previousRoot: Uint8Array | null,
-  options: OpenSpaceOptions,
-  reader: ExtentReader,
-  dataLength: number,
-  runs: RetainedCapacity,
-  retirements: RetainedCapacity,
-): Promise<{ map: FreeSpaceMap; retired: DataRange[] }> {
-  async function* input(bytes: Uint8Array | null) {
-    if (bytes === null) return;
-    let last = -1;
-    let lastLength = 0;
-    for await (const item of options.reachable(bytes, reader, options.budget, options)) {
-      const pending = pauseIfDue(options);
-      if (pending !== undefined) await pending;
-      const ref = "extent" in item ? item.extent : item;
-      if (
-        !Number.isSafeInteger(ref.offset) ||
-        !Number.isSafeInteger(ref.length) ||
-        ref.offset < 0 ||
-        ref.offset % DATA_ALIGN !== 0 ||
-        ref.length <= 0 ||
-        ref.offset + ref.length > dataLength ||
-        ref.offset < last
-      )
-        throw new StoreCorruptionError("Invalid or unordered durable extent");
-      if (ref.offset === last) {
-        if (ref.length !== lastLength)
-          throw new StoreCorruptionError("One root disagrees on an extent length");
-        continue;
-      }
-      last = ref.offset;
-      lastLength = ref.length;
-      yield ref;
-    }
-  }
-  const current = input(root);
-  const previous = input(previousRoot);
-  const retired: DataRange[] = [];
-  async function* union() {
-    try {
-      let a = await current.next();
-      let b = await previous.next();
-      while (!a.done || !b.done) {
-        const pending = pauseIfDue(options);
-        if (pending !== undefined) await pending;
-        if (!a.done && (b.done || a.value.offset < b.value.offset)) {
-          yield a.value;
-          a = await current.next();
-        } else if (!b.done && (a.done || b.value.offset < a.value.offset)) {
-          const ref = b.value;
-          retirements.ensure(retired.length + 1);
-          retired.push({
-            offset: ref.offset,
-            length: Math.ceil(ref.length / DATA_ALIGN) * DATA_ALIGN,
-          });
-          yield ref;
-          b = await previous.next();
-        } else if (!a.done && !b.done) {
-          if (a.value.length !== b.value.length)
-            throw new StoreCorruptionError("Durable roots disagree on an extent length");
-          yield a.value;
-          a = await current.next();
-          b = await previous.next();
-        }
-      }
-    } finally {
-      try {
-        await current.return(undefined);
-      } finally {
-        await previous.return(undefined);
-      }
-    }
-  }
-  return {
-    map: await FreeSpaceMap.fromSortedAllocatedAsync(
-      DATA_ALIGN,
-      dataLength,
-      union(),
-      options,
-      runs,
-    ),
-    retired,
-  };
-}
-
 export const openExtentSpace: OpenExtentSpace = async (session, options) => {
   options.signal?.throwIfAborted();
-  if (options.verifyAtOpen === true) await session.audit?.(options.signal);
-  const beginning = pauseIfDue(options);
-  if (beginning !== undefined) await beginning;
-  const root = await session.readRoot();
-  const afterRoot = pauseIfDue(options);
-  if (afterRoot !== undefined) await afterRoot;
-  const previousRoot = await session.readPreviousRoot();
-  const afterPrevious = pauseIfDue(options);
-  if (afterPrevious !== undefined) await afterPrevious;
-  const dataLength = await session.dataLength();
-  const afterLength = pauseIfDue(options);
-  if (afterLength !== undefined) await afterLength;
   const cache = new PageCache(session);
-  cache.attach(options.registerCache(cache));
-  let opened: Space | null = null;
-  let memory: RetainedMemory | null = null;
+  cache.attach(options.registerCache(cache), true);
+  let roots: RootMemory | null = null,
+    currentFrame: RootFrame | null = null,
+    previousFrame: RootFrame | null = null,
+    nextSlot: 0 | 1 = 0,
+    nextSequence = 1;
+  let workspace: MetadataWorkspace | null = null,
+    map: BoundedFreeSpaceMap | null = null,
+    opened: Space | null = null;
+  let initialCurrent: ListLease | null = null,
+    initialPrevious: ListLease | null = null;
   try {
-    memory = RetainedMemory.create(options.budget);
-    const runs = new RetainedCapacity(memory, FREE_RUN_SLOT_BYTES);
-    const retirements = new RetainedCapacity(memory, RETIRED_SLOT_BYTES);
+    roots = RootMemory.create(options.registerCache);
+    const rootMemory = roots;
+    if (session.readRootSlot === undefined)
+      throw new TypeError("Extent space needs admitted native root slots");
+    // S is charged but its slab buffers do not exist yet: one native root response at a time
+    // borrows that allowance. Copy into C, drop the response, then request the other slot.
+    const readSlot = async (slot: 0 | 1) => {
+      const raw = await session.readRootSlot?.(slot),
+        value = decodeRootSlot(raw ?? null, true);
+      return value === null
+        ? null
+        : {
+            sequence: value.sequence,
+            frame: await rootMemory.copy(value.root, options.budget, options),
+          };
+    };
+    const first = await readSlot(0);
+    currentFrame = first?.frame ?? null;
+    const second = await readSlot(1);
+    if (first !== null && (second === null || first.sequence > second.sequence)) {
+      previousFrame = second?.frame ?? null;
+      nextSlot = 1;
+      nextSequence = first.sequence + 1;
+    } else if (second !== null) {
+      currentFrame = second.frame;
+      previousFrame = first !== null && first.sequence < second.sequence ? first.frame : null;
+      if (first !== null && previousFrame === null) first.frame.release();
+      nextSequence = second.sequence + 1;
+    }
+    cache.activateReadSlab();
+    const root = currentFrame?.bytes ?? null,
+      previousRoot = previousFrame?.bytes ?? null,
+      dataLength = await session.dataLength();
+    workspace = MetadataWorkspace.create(options.budget);
+    // No cursor frames are live during the paged physical audit; its native index page uses W.
+    if (options.verifyAtOpen === true) await session.audit?.(options.signal);
+    const backing = session.metadata?.();
+    if (backing === undefined || backing === null)
+      throw new TypeError("Extent space needs fenced private metadata backing");
+    await backing.reset();
+    const journal = new MetadataJournal(backing, workspace);
     const reader = {
       read: (refs: readonly BlobRef[], read: ReadOptions) => cache.read(refs, read),
       peek: (ref: BlobRef, peek?: PeekOptions) => cache.peek(ref, peek),
     };
-    let map: FreeSpaceMap;
-    let retired: DataRange[];
-    if (options.reachable.ordered === true && options.verifyAtOpen !== true) {
-      try {
-        ({ map, retired } = await orderedMap(
-          root,
-          previousRoot,
-          options,
-          reader,
-          dataLength,
-          runs,
-          retirements,
-        ));
-      } catch (error) {
-        if (!(error instanceof RangeError) || error === options.signal?.reason) throw error;
-        throw new StoreCorruptionError(
-          `The durable roots name inconsistent extents: ${error.message}`,
-        );
-      }
+    initialCurrent = retainedListLease(root, options.reachable, options.budget, rootMemory);
+    initialPrevious = retainedListLease(
+      previousRoot,
+      options.reachable,
+      options.budget,
+      rootMemory,
+    );
+    let current = 0,
+      previous = 0;
+    let initialLists: readonly [ListLease, ListLease] | null = null;
+    let reconstruction: Awaited<ReturnType<typeof reconstructState>>;
+    if (initialCurrent !== null && initialPrevious !== null) {
+      initialLists = [initialCurrent, initialPrevious];
+      reconstruction = await reconstructNativeState(
+        journal,
+        cache,
+        initialCurrent.list,
+        initialPrevious.list,
+        dataLength,
+        options.budget,
+        options,
+      );
     } else {
-      const current = await collect(
+      initialCurrent?.release();
+      initialCurrent = null;
+      initialPrevious?.release();
+      initialPrevious = null;
+      current = await snapshotRoot(
         root,
         options.reachable,
         reader,
         options.budget,
         dataLength,
+        journal,
+        cache,
         options,
       );
-      options.signal?.throwIfAborted();
-      const previous = await collect(
+      previous = await snapshotRoot(
         previousRoot,
         options.reachable,
         reader,
         options.budget,
         dataLength,
+        journal,
+        cache,
         options,
       );
-      const walk = options.walk;
-      if (walk !== undefined && options.verifyAtOpen === true) {
-        await sameExtents(
-          current,
-          await collect(root, walk, reader, options.budget, dataLength, options),
-          "current",
-          options,
-        );
-        await sameExtents(
-          previous,
-          await collect(previousRoot, walk, reader, options.budget, dataLength, options),
-          "previous",
-          options,
-        );
-      }
-      const { union, previousOnly } = await unite(current, previous, options);
-
-      try {
-        map = await FreeSpaceMap.fromAllocatedAsync(DATA_ALIGN, dataLength, union, options, runs);
-      } catch (error) {
-        if (!(error instanceof RangeError) || error === options.signal?.reason) throw error;
-        throw new StoreCorruptionError(
-          `The durable roots name inconsistent extents: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-      // Only now, with both roots validated together, may anything be retired or truncated.
-      retired = [];
-      for (const { offset, length } of previousOnly) {
-        if (retired.length % 128 === 0) {
-          const pending = pauseIfDue(options);
-          if (pending !== undefined) await pending;
-        }
-        retirements.ensure(retired.length + 1);
-        retired.push({ offset, length: map.sizeOf(length) });
-      }
+      reconstruction = await reconstructState(
+        journal,
+        cache,
+        current,
+        previous,
+        dataLength,
+        options.budget,
+        options,
+      );
     }
-    memory.transfer(options.registerCache);
+    map = reconstruction.map;
+    workspace.transfer(options.registerCache);
+    map.transfer(options.registerCache);
     const space = new Space(
       session,
       options,
       cache,
       map,
-      root,
-      previousRoot,
       dataLength,
-      memory,
-      retirements,
+      workspace,
+      journal,
+      current,
+      previous,
+      roots,
+      currentFrame,
+      previousFrame,
+      nextSlot,
+      nextSequence,
+      initialLists,
     );
     opened = space;
-    await space.initialize(retired, options);
-    const ready = pauseIfDue(options);
-    if (ready !== undefined) await ready;
+    initialCurrent = null;
+    initialPrevious = null;
+    // Semantic verification precedes every release/truncate. A structurally valid but incomplete
+    // list must not destroy the very extent whose full walk proves it incomplete.
+    if (options.verifyAtOpen === true && options.walk !== undefined) await space.audit();
+    await space.initialize(reconstruction.previousOnlyBytes);
+    const pending = pauseIfDue(options);
+    if (pending !== undefined) await pending;
     return space;
   } catch (error) {
-    await opened?.close();
-    memory?.close();
+    if (opened !== null) await opened.close();
+    else {
+      try {
+        initialCurrent?.release();
+      } finally {
+        initialPrevious?.release();
+      }
+      currentFrame?.release();
+      previousFrame?.release();
+      roots?.close();
+    }
+    map?.close();
+    workspace?.close();
     cache.close();
     throw error;
   }
@@ -419,20 +347,34 @@ class Space implements ExtentSpace {
   readonly #walk: ReachableExtents | null;
   readonly #budget: ByteBudget;
   readonly #cache: PageCache;
-  readonly #map: FreeSpaceMap;
-  readonly #ledger: ReclaimLedger<DataRange>;
-  /** Retired extents not yet free (waiting for a publish or a pin, or being released). */
-  readonly #retired = new Map<number, number>();
+  readonly #map: BoundedFreeSpaceMap;
+  readonly #ledger: RootPins;
+  readonly #metadata = new MetadataMutex();
+  readonly #auditing = new Mutex();
+  readonly #audits = new Set<Promise<void>>();
+  readonly #tickets: RetirementTickets;
+  #currentSnapshot: number;
+  #previousSnapshot: number;
+  #initialRetiredBytes = 0;
+  #initialized = false;
+  #reclaimWanted = false;
+  #reclaimPending: Promise<void> | null = null;
   /** Writers not yet published or aborted. */
   readonly writers = new Set<Writer>();
   readonly #publishing = new Mutex();
+  readonly #mutations = new Mutex();
+  #activeMutation: MutationGuard | null = null;
+  #mutationEpoch = 0;
+  #activeWrites = 0;
+  #closing = false;
+  #closePromise: Promise<void> | null = null;
   readonly writeLock = new Mutex();
-  readonly writeSlab = new Uint8Array(MAX_SLAB);
+  writeSlab = new Uint8Array(MAX_SLAB);
   /** The builder whose bytes the write slab holds, from its aligned logical `start`. */
   staged: { builder: Builder; start: number; length: number } | null = null;
   readonly #background = new Set<Promise<void>>();
-  #root: Uint8Array | null;
-  #previousRoot: Uint8Array | null;
+  #rootFrame: RootFrame | null;
+  #previousFrame: RootFrame | null;
   #failed: Error | null = null;
   #closed = false;
   #releasingBytes = 0;
@@ -446,12 +388,18 @@ class Space implements ExtentSpace {
     session: StoreSession,
     options: OpenSpaceOptions,
     cache: PageCache,
-    map: FreeSpaceMap,
-    root: Uint8Array | null,
-    previousRoot: Uint8Array | null,
+    map: BoundedFreeSpaceMap,
     dataLength: number,
-    readonly retainedMemory: RetainedMemory,
-    readonly retirements: RetainedCapacity,
+    readonly workspace: MetadataWorkspace,
+    readonly journal: MetadataJournal,
+    currentSnapshot: number,
+    previousSnapshot: number,
+    readonly roots: RootMemory,
+    currentFrame: RootFrame | null,
+    previousFrame: RootFrame | null,
+    private nextSlot: 0 | 1,
+    private nextSequence: number,
+    private initialLists: readonly [ListLease, ListLease] | null,
   ) {
     this.#session = session;
     this.#reachable = options.reachable;
@@ -459,35 +407,93 @@ class Space implements ExtentSpace {
     this.#budget = options.budget;
     this.#cache = cache;
     this.#map = map;
-    this.#root = root;
-    this.#previousRoot = previousRoot;
+    this.#rootFrame = currentFrame;
+    this.#previousFrame = previousFrame;
     this.#fileLength = dataLength;
-    this.#ledger = new ReclaimLedger<DataRange>((ranges) => {
-      this.#background_(this.free(ranges));
-    });
+    this.#ledger = new RootPins(options.registerCache({ evictableBytes: 0, evict: () => 0 }), () =>
+      this.#scheduleReclaim(),
+    );
+    this.#tickets = new RetirementTickets(journal);
+    this.#currentSnapshot = currentSnapshot;
+    this.#previousSnapshot = previousSnapshot;
   }
 
-  async initialize(previousOnly: readonly DataRange[], work: TaskWork): Promise<void> {
-    let count = 0;
-    for (const range of previousOnly) {
-      if (count++ % 128 === 0) {
-        const pending = pauseIfDue(work);
-        if (pending !== undefined) await pending;
+  async initialize(previousOnlyBytes: number): Promise<void> {
+    this.#initialRetiredBytes = previousOnlyBytes;
+    this.#initialized = true;
+    if (this.initialLists === null) await this.#metadata.run(() => this.#prepareInitialTicket());
+    await this.mutate((guard) => this.#releaseTail(guard));
+  }
+
+  async #prepareInitialTicket(): Promise<void> {
+    await this.#tickets.prepare(
+      0,
+      this.#previousSnapshot,
+      this.#currentSnapshot,
+      this.#initialRetiredBytes,
+    );
+    this.#tickets.commit();
+    this.#initialRetiredBytes = 0;
+  }
+
+  /** The two native lists remain immutable and rooted until this complete handoff. This runs
+   * under the workspace lock, before publication's final barrier. It uses only prepaid S/W,
+   * never a closed startup grant or a new admission. Generation zero cannot reclaim yet.
+   */
+  async #ensureInitialSnapshots(work?: TaskWork): Promise<void> {
+    const lists = this.initialLists;
+    if (lists === null) return;
+    if (this.generation !== 0) throw new TypeError("Native initial lists outlived generation zero");
+    let current = 0,
+      previous = 0,
+      failed = false;
+    try {
+      current = await saveNativeList(
+        this.journal,
+        this.#cache,
+        lists[0].list,
+        this.#fileLength,
+        work,
+      );
+      previous = await saveNativeList(
+        this.journal,
+        this.#cache,
+        lists[1].list,
+        this.#fileLength,
+        work,
+      );
+      if (this.#initialized) {
+        await this.#tickets.prepare(0, previous, current, this.#initialRetiredBytes);
+        work?.signal?.throwIfAborted();
+        this.#tickets.commit();
+        this.#initialRetiredBytes = 0;
       }
-      this.#retired.set(range.offset, range.length);
+      this.#currentSnapshot = current;
+      this.#previousSnapshot = previous;
+      current = 0;
+      previous = 0;
+      this.initialLists = null;
+      try {
+        lists[0].release();
+      } finally {
+        lists[1].release();
+      }
+    } catch (error) {
+      failed = true;
+      if (this.#initialized) await this.#tickets.abort().catch(() => undefined);
+      if (this.journal.failed) this.fail(error);
+      throw error;
+    } finally {
+      await discardPrepared(this.journal, [current, previous], failed);
     }
-    const pending = pauseIfDue(work);
-    if (pending !== undefined) await pending;
-    this.#ledger.retireAtOpen(previousOnly);
-    this.#releaseTail();
   }
 
   get root(): Uint8Array | null {
-    return this.#root;
+    return this.#rootFrame?.bytes ?? null;
   }
 
   get previousRoot(): Uint8Array | null {
-    return this.#previousRoot;
+    return this.#previousFrame?.bytes ?? null;
   }
 
   get generation(): number {
@@ -498,24 +504,23 @@ class Space implements ExtentSpace {
     return this.#failed;
   }
 
-  get map(): FreeSpaceMap {
+  get map(): BoundedFreeSpaceMap {
     return this.#map;
   }
 
   get stats(): SpaceStats {
     let writerBytes = 0;
     for (const writer of this.writers) writerBytes += writer.bytes;
-    let retired = 0;
-    for (const size of this.#retired.values()) retired += size;
-    retired -= this.#releasingRetired;
+    const retired = this.#tickets.waitingBytes + this.#initialRetiredBytes - this.#releasingRetired;
     return {
       dataBytes: this.#map.end,
       freeBytes: this.#map.freeBytes,
+      untrackedFreeBytes: this.#map.untrackedFreeBytes,
       writerBytes,
       waitingBytes: retired,
       releasingBytes: this.#releasingBytes,
       relocations: this.#relocations,
-      retainedBytes: this.retainedMemory.bytes,
+      retainedBytes: this.workspace.bytes + this.#map.bytes + this.roots.bytes + this.#ledger.bytes,
       pinCount: this.#ledger.pinCount,
       oldestPin: this.#ledger.oldestPin,
       cache: this.#cache.stats,
@@ -524,7 +529,8 @@ class Space implements ExtentSpace {
 
   // ── Reading ──────────────────────────────────────────────────────────────────────────────────
 
-  read(refs: readonly BlobRef[], options: ReadOptions): Promise<ReadLease> {
+  async read(refs: readonly BlobRef[], options: ReadOptions): Promise<ReadLease> {
+    this.cleanupAllowed();
     return this.#cache.read(refs, options);
   }
 
@@ -543,9 +549,10 @@ class Space implements ExtentSpace {
   // ── Writing ──────────────────────────────────────────────────────────────────────────────────
 
   beginWrite(label: string, options: WriteOptions = {}): ExtentWriter {
-    this.usable();
+    this.accepting();
     const writer = new Writer(this, label, options.budget ?? null);
     this.writers.add(writer);
+    this.reserved();
     return writer;
   }
 
@@ -555,16 +562,53 @@ class Space implements ExtentSpace {
     if (this.#failed !== null) throw new SpaceFailedError(this.#failed);
   }
 
+  accepting(): void {
+    this.usable();
+    this.cleanupAllowed();
+  }
+  cleanupAllowed(): void {
+    if (this.#closing || this.#closed) throw new StoreClosedError();
+  }
+  /** Monotonic reservation adds ownership and only consumes tracked holes or contiguous EOF.
+   * It may run during final-phase awaits: it cannot take bytes owned by a root or sealed writer.
+   * Every removal/transition instead joins mutate(), including abort/free/discard/relocate/seal.
+   */
+  reserved(): void {
+    this.#mutationEpoch++;
+  }
+  mutate<T>(work: (guard: MutationGuard) => Promise<T>): Promise<T> {
+    return this.#mutations.run(async () => {
+      const guard: MutationGuard = { space: this };
+      this.#activeMutation = guard;
+      this.#mutationEpoch++;
+      try {
+        return await work(guard);
+      } finally {
+        this.#mutationEpoch++;
+        this.#activeMutation = null;
+      }
+    });
+  }
+  #guard(guard: MutationGuard): void {
+    if (guard !== this.#activeMutation || guard.space !== this)
+      throw new TypeError("Ownership transition outside its barrier");
+  }
+
   /** A session call that writes: ownership loss fails the space. */
   /** `transfer`: the space hands `bytes` (a whole buffer it will never touch again) over. */
   async sessionWrite(offset: number, bytes: Uint8Array, transfer = false): Promise<void> {
+    this.#mutationEpoch++;
+    this.#activeWrites++;
     try {
       await this.#session.writeData(offset, bytes, transfer ? { transfer } : undefined);
+      this.#fileLength = Math.max(this.#fileLength, offset + bytes.length);
     } catch (error) {
       if (error instanceof OwnershipLostError) this.fail(error);
       throw error;
+    } finally {
+      this.#activeWrites--;
+      this.#mutationEpoch++;
     }
-    this.#fileLength = Math.max(this.#fileLength, offset + bytes.length);
   }
 
   async sessionRead(offset: number, target: Uint8Array): Promise<void> {
@@ -709,45 +753,64 @@ class Space implements ExtentSpace {
    * Frees ranges no root, pin or writer can reach: drop their cached blobs, release them to the
    * platform, then make them allocatable.
    */
-  async free(ranges: readonly DataRange[]): Promise<void> {
-    if (ranges.length === 0) return;
+  free(ranges: Iterable<DataRange>): Promise<void> {
+    return this.mutate((guard) => this.freeGuarded(ranges, guard));
+  }
+  async freeGuarded(
+    ranges: Iterable<DataRange>,
+    guard: MutationGuard,
+    retired = false,
+  ): Promise<void> {
+    this.#guard(guard);
+    let batch: DataRange[] = [];
+    for (const range of ranges) {
+      batch.push(range);
+      if (batch.length === 256) {
+        if (!(await this.#releaseBatch(batch, guard, retired))) return;
+        batch = [];
+      }
+    }
+    if (batch.length > 0) await this.#releaseBatch(batch, guard, retired);
+  }
+  async #releaseBatch(
+    ranges: readonly DataRange[],
+    guard: MutationGuard,
+    retired: boolean,
+  ): Promise<boolean> {
+    this.#guard(guard);
     let bytes = 0;
-    let retired = 0;
     for (const range of ranges) {
       this.#cache.dropExtent(range.offset);
       bytes += range.length;
-      if (this.#retired.has(range.offset)) retired += range.length;
     }
     this.#releasingBytes += bytes;
-    this.#releasingRetired += retired;
+    if (retired) this.#releasingRetired += bytes;
     try {
       await this.#session.releaseData(ranges);
     } catch (error) {
-      // The space stays allocated (a leak until reopen), never handed out twice.
       this.fail(error);
       this.#releasingBytes -= bytes;
-      this.#releasingRetired -= retired;
-      return;
+      if (retired) this.#releasingRetired -= bytes;
+      return false;
     }
     this.#releasingBytes -= bytes;
-    this.#releasingRetired -= retired;
-    for (const range of ranges) {
-      this.#map.free(range.offset, range.length);
-      this.#retired.delete(range.offset);
-    }
-    this.#releaseTail();
+    if (retired) this.#releasingRetired -= bytes;
+    for (const range of ranges) this.#map.releaseKnownAllocated(range.offset, range.length);
+    await this.#releaseTail(guard);
+    return this.#failed === null;
   }
 
-  #releaseTail(): void {
+  async #releaseTail(guard: MutationGuard): Promise<void> {
+    this.#guard(guard);
     const end = this.#map.end;
     if (end >= this.#fileLength || this.#closed) return;
     const length = this.#fileLength - end;
     this.#fileLength = end;
-    this.#background_(
-      this.#session.releaseData([{ offset: end, length }]).catch((error: unknown) => {
-        this.fail(error);
-      }),
-    );
+    try {
+      await this.#session.releaseData([{ offset: end, length }]);
+    } catch (error) {
+      this.fail(error);
+    }
   }
 
   /** Tracks a release in flight; a failure fails the space (its space stays allocated). */
@@ -766,171 +829,566 @@ class Space implements ExtentSpace {
 
   // ── Publication ──────────────────────────────────────────────────────────────────────────────
 
-  publish(root: Uint8Array, change: PublishChange): Promise<number> {
-    return this.#publishing.run(() => this.#publishNow(root, change));
+  async publish(root: Uint8Array, change: PublishChange): Promise<number> {
+    this.accepting();
+    return this.#publishing.run(() =>
+      this.#metadata.run(async () => {
+        const budget = change.budget ?? this.#budget;
+        // Codec/callback admission is preparation, outside the final barrier and slab scope.
+        const lease = listLease(root, this.#reachable, budget, change.list);
+        let frame: RootFrame | null = null;
+        let raw = 0,
+          claimed = 0,
+          failed = false;
+        try {
+          frame = await this.roots.copy(root, budget, change);
+          const ownedRoot = frame;
+          if (lease === null)
+            raw = await saveExtentInput(
+              this.journal,
+              rootInput(root, this.#reachable, this, budget, change),
+              this.#reachable.ordered === true,
+              this.#fileLength,
+              change,
+              undefined,
+              true,
+            );
+          claimed = await saveExtentInput(
+            this.journal,
+            (function* () {
+              for (const extent of change.retired) {
+                if (!Number.isSafeInteger(extent.length) || extent.length <= 0)
+                  throw new RangeError("publish: retirement is not an extent");
+                yield {
+                  offset: extent.offset,
+                  length: Math.ceil(extent.length / DATA_ALIGN) * DATA_ALIGN,
+                };
+              }
+            })(),
+            false,
+            Infinity,
+            change,
+            undefined,
+            true,
+          );
+          await this.#ensureInitialSnapshots(change);
+          return await this.#cache.withReadSlab((slab) =>
+            this.mutate((guard) =>
+              this.#publishNow(
+                ownedRoot,
+                change,
+                lease?.list ?? null,
+                raw,
+                claimed,
+                { slab },
+                guard,
+              ),
+            ),
+          );
+        } catch (error) {
+          failed = true;
+          if (this.journal.failed) this.fail(error);
+          throw error;
+        } finally {
+          if (frame !== null && frame !== this.#rootFrame) frame.release();
+          lease?.release();
+          await discardPrepared(this.journal, [raw, claimed], failed);
+        }
+      }),
+    );
   }
 
-  async #publishNow(root: Uint8Array, change: PublishChange): Promise<number> {
+  async #publishNow(
+    root: RootFrame,
+    change: PublishChange,
+    list: ExtentList | null,
+    raw: number,
+    claimed: number,
+    io: MetadataWork,
+    guard: MutationGuard,
+  ): Promise<number> {
+    this.#guard(guard);
     this.usable();
-    const writers = this.#checkWriters(change.writers);
-    this.retirements.ensure(this.#retired.size + change.retired.length);
-    const retired = this.#checkRetired(change.retired);
-    for (const writer of writers) writer.state = "publishing";
+    let marked = 0,
+      next = 0,
+      sortedClaims = 0,
+      ownerRaw = 0,
+      owners = 0,
+      unused = 0,
+      attempted = false,
+      installed = false,
+      failed = false;
     try {
-      await this.#session.publish(root);
-    } catch (error) {
-      for (const writer of writers) writer.state = "indeterminate";
-      this.fail(error);
-      throw error;
-    }
-    for (const writer of writers) {
-      writer.state = "published";
-      this.writers.delete(writer);
-    }
-    for (const range of retired) this.#retired.set(range.offset, range.length);
-    this.#previousRoot = this.#root;
-    this.#root = root.slice();
-    return this.#ledger.advance(retired);
-  }
-
-  #checkWriters(writers: readonly ExtentWriter[]): Writer[] {
-    const checked = new Set<Writer>();
-    for (const candidate of writers) {
-      if (!(candidate instanceof Writer) || candidate.space !== this)
-        throw new TypeError("publish: a writer from another space");
-      if (checked.has(candidate)) throw new TypeError(`publish: writer ${candidate.label} twice`);
-      if (candidate.state !== "open")
-        throw new TypeError(`publish: writer ${candidate.label} is ${candidate.state}`);
-      if (candidate.builders.size > 0 || candidate.busy > 0)
-        throw new TypeError(`publish: writer ${candidate.label} has an unsealed builder`);
-      checked.add(candidate);
-    }
-    return [...checked];
-  }
-
-  #checkRetired(extents: readonly ExtentRef[]): DataRange[] {
-    const held = new Set<number>();
-    for (const writer of this.writers) for (const extent of writer.extents) held.add(extent.offset);
-    const ranges: DataRange[] = [];
-    const seen = new Set<number>();
-    for (const extent of extents) {
-      const size = this.#map.sizeOf(extent.length);
-      const where = `the extent at ${String(extent.offset)}`;
-      if (extent.offset % DATA_ALIGN !== 0 || size === 0)
-        throw new RangeError(`publish: ${where} is not an extent`);
-      if (seen.has(extent.offset)) throw new RangeError(`publish: ${where} is retired twice`);
-      if (this.#retired.has(extent.offset))
-        throw new RangeError(`publish: ${where} is already retired`);
-      if (held.has(extent.offset))
-        throw new RangeError(`publish: ${where} belongs to an unpublished writer`);
-      if (!this.#map.isAllocated(extent.offset, size))
-        throw new RangeError(`publish: ${where} is not allocated`);
-      for (const writer of this.writers)
-        for (const builder of writer.builders)
-          for (const segment of builder.reservation.segments)
-            if (
-              segment.offset < extent.offset + size &&
-              extent.offset < segment.offset + segment.capacity
+      // Mark supplied writers before the first yielding validation step. Monotonic reservations
+      // on OTHER writers are safe; these supplied writers must have no new builders or transitions.
+      for (const candidate of change.writers) {
+        if (!(candidate instanceof Writer) || candidate.space !== this)
+          throw new TypeError("publish: a writer from another space");
+        if (candidate.abortRequested || candidate.state !== "open")
+          throw new TypeError(
+            `publish: writer ${candidate.label} is ${candidate.state} or aborting`,
+          );
+        if (candidate.builders.size > 0 || candidate.busy > 0)
+          throw new TypeError(`publish: writer ${candidate.label} has an unsealed builder`);
+        candidate.state = "publishing";
+        marked++;
+      }
+      next =
+        list === null
+          ? await pairPhase(this.journal, io, "merge", (slots) =>
+              sortExtents(this.journal, raw, "exact", change, slots),
             )
-              throw new RangeError(`publish: ${where} overlaps an open builder`);
-      seen.add(extent.offset);
-      ranges.push({ offset: extent.offset, length: size });
+          : await saveNativeList(this.journal, this.#cache, list, this.#fileLength, change, io);
+      try {
+        sortedClaims = await pairPhase(this.journal, io, "merge", (slots) =>
+          sortExtents(this.journal, claimed, "refuse", change, slots),
+        );
+      } catch (error) {
+        if (error instanceof StoreCorruptionError && !this.journal.failed)
+          throw new RangeError(`publish: an extent is retired twice or invalid: ${error.message}`, {
+            cause: error,
+          });
+        throw error;
+      }
+      // Retirement authority is ONLY the two immutable root lists. No free-map complement,
+      // allocator allocation test or mutable unpublished-writer observation authorizes it.
+      const retiredBytes = await validateRetirements(
+        this.journal,
+        this.#currentSnapshot,
+        next,
+        sortedClaims,
+        io,
+        change,
+      );
+      ownerRaw = await saveExtentInput(
+        this.journal,
+        (function* () {
+          for (const candidate of change.writers) {
+            if (!(candidate instanceof Writer))
+              throw new TypeError("publish writer changed during call");
+            yield* candidate.extents;
+          }
+        })(),
+        false,
+        Infinity,
+        change,
+        io,
+        true,
+      );
+      owners = await pairPhase(this.journal, io, "merge", (slots) =>
+        sortExtents(this.journal, ownerRaw, "refuse", change, slots),
+      );
+      unused = await validateIncoming(
+        this.journal,
+        this.#currentSnapshot,
+        next,
+        owners,
+        io,
+        change,
+      );
+      await this.#tickets.prepare(this.generation + 1, this.#currentSnapshot, next, retiredBytes);
+      change.signal?.throwIfAborted();
+      // Frees/transitions remain blocked through native publish. Other reservations can only
+      // consume tracked free bytes or EOF; they cannot take rooted or supplied sealed ownership.
+      attempted = true;
+      root.prepare(this.#session, this.nextSlot, this.nextSequence);
+      await this.#session.publish(root.bytes);
+      this.#tickets.commit();
+      const oldPrevious = this.#previousSnapshot;
+      this.#previousSnapshot = this.#currentSnapshot;
+      this.#currentSnapshot = next;
+      next = 0;
+      this.#previousFrame?.release();
+      this.#previousFrame = this.#rootFrame;
+      this.#rootFrame = root;
+      this.nextSlot = this.nextSlot === 0 ? 1 : 0;
+      this.nextSequence++;
+      const generation = this.#ledger.advance();
+      for (const candidate of change.writers)
+        if (candidate instanceof Writer) {
+          candidate.state = "published";
+          this.writers.delete(candidate);
+        }
+      installed = true;
+      await disposeSnapshot(this.journal, oldPrevious);
+      await releaseWorklist(this.journal, unused, async (ranges) => {
+        await this.freeGuarded(ranges, guard);
+        if (this.#failed !== null) throw new SpaceFailedError(this.#failed);
+      });
+      this.#scheduleReclaim();
+      return generation;
+    } catch (error) {
+      failed = true;
+      if (!attempted) await this.#tickets.abort().catch(() => undefined);
+      if (attempted || this.journal.failed) this.fail(error);
+      let at = 0;
+      for (const candidate of change.writers) {
+        if (at++ >= marked) break;
+        if (candidate instanceof Writer && !installed)
+          candidate.state = attempted ? "indeterminate" : "open";
+      }
+      throw error;
+    } finally {
+      await discardPrepared(this.journal, [next, sortedClaims, ownerRaw, owners, unused], failed);
     }
-    return ranges;
   }
 
-  pin(label?: string): RootPin {
-    return this.#ledger.pin(label);
+  pin(label?: string, budget?: ByteBudget): RootPin {
+    this.cleanupAllowed();
+    return this.#ledger.pin(label, budget);
+  }
+
+  #scheduleReclaim(): void {
+    // R8's generation-zero ticket cannot become eligible before the first publication.
+    // Startup pin churn must not start pointless private I/O during the host-ready interval.
+    if (this.generation === 0 || this.#tickets.waitingBytes === 0) return;
+    if (this.#closing || this.#closed || this.#failed !== null) return;
+    this.#reclaimWanted = true;
+    if (this.#reclaimPending !== null) return;
+    const run = (async () => {
+      while (this.#reclaimWanted && !this.#closing && !this.#closed && this.#failed === null) {
+        this.#reclaimWanted = false;
+        await this.#metadata.run(() =>
+          this.#cache.withReadSlab((slab) =>
+            this.mutate((guard) =>
+              this.#tickets.reclaim(
+                this.generation,
+                this.#ledger.oldestPinned,
+                async (ranges) => {
+                  await this.freeGuarded(ranges, guard, true);
+                  if (this.#failed !== null) throw new SpaceFailedError(this.#failed);
+                },
+                undefined,
+                { slab },
+              ),
+            ),
+          ),
+        );
+      }
+    })();
+    this.#reclaimPending = run;
+    this.#background_(run);
+    void run
+      .catch(() => undefined)
+      .finally(() => {
+        this.#reclaimPending = null;
+        if (this.#reclaimWanted) this.#scheduleReclaim();
+      });
   }
 
   // ── Audit ────────────────────────────────────────────────────────────────────────────────────
 
-  audit(): Promise<void> {
-    return this.#publishing.run(() => this.#auditNow());
-  }
-
-  async #auditNow(): Promise<void> {
-    const generation = this.#ledger.generation;
-    await this.settled();
-    await this.#session.audit?.();
-    const fail = (message: string): never => {
-      throw new Error(
-        `Extent audit: ${message} (generation ${String(generation)}, allocator end ${String(this.#map.end)}, retired ${String(this.#retired.size)})`,
-      );
-    };
-    const sizeOf = (bytes: number) => this.#map.sizeOf(bytes);
-    const exactCurrent = await collect(this.#root, this.#reachable, this, this.#budget, Infinity);
-    const exactPrevious = await collect(
-      this.#previousRoot,
-      this.#reachable,
-      this,
-      this.#budget,
-      Infinity,
+  async audit(): Promise<void> {
+    this.cleanupAllowed();
+    const run = this.#auditing.run(() => this.#auditLoop());
+    this.#audits.add(run);
+    void run.then(
+      () => this.#audits.delete(run),
+      () => this.#audits.delete(run),
     );
-    await unite(exactCurrent, exactPrevious);
-    // Ruling R25: the lists startup read must name exactly what the full walk reaches.
-    if (this.#walk !== null) {
-      await sameExtents(
-        exactCurrent,
-        await collect(this.#root, this.#walk, this, this.#budget, Infinity),
-        "current",
-      );
-      await sameExtents(
-        exactPrevious,
-        await collect(this.#previousRoot, this.#walk, this, this.#budget, Infinity),
-        "previous",
-      );
+    return run;
+  }
+  async #auditLoop(): Promise<void> {
+    for (;;) {
+      const turn = pauseIfDue();
+      if (turn !== undefined) await turn;
+      if (this.#activeWrites > 0) {
+        await this.writeLock.run(async () => undefined);
+        continue;
+      }
+      if (this.#activeMutation !== null) {
+        await this.#mutations.run(async () => undefined);
+        continue;
+      }
+      const epoch = this.#mutationEpoch;
+      try {
+        await this.#auditNow(epoch);
+      } catch (error) {
+        if (!this.#sameEpoch(epoch)) continue;
+        throw error;
+      }
+      if (this.#sameEpoch(epoch)) return;
+      const pause = pauseIfDue();
+      if (pause !== undefined) await pause;
     }
-    const aligned = (extents: ReadonlyMap<number, number>) =>
-      new Map([...extents].map(([offset, length]) => [offset, sizeOf(length)]));
-    const current = aligned(exactCurrent);
-    const previous = aligned(exactPrevious);
-    const accounted: DataRange[] = [];
-    for (const [offset, length] of current) {
-      if (!this.#map.isAllocated(offset, length))
-        fail(`the current root's extent at ${String(offset)} is free`);
-      if (this.#retired.has(offset))
-        fail(`the current root's extent at ${String(offset)} is retired`);
-      accounted.push({ offset, length });
-    }
-    for (const [offset, length] of previous) {
-      if (current.has(offset)) continue;
-      if (!this.#map.isAllocated(offset, length))
-        fail(`the previous root's extent at ${String(offset)} is free`);
-      if (!this.#retired.has(offset))
-        fail(`the previous root's extent at ${String(offset)} is neither reachable nor retired`);
-    }
-    for (const [offset, length] of this.#retired) accounted.push({ offset, length });
-    for (const writer of this.writers) {
-      for (const extent of writer.extents)
-        accounted.push({ offset: extent.offset, length: sizeOf(extent.length) });
-      for (const builder of writer.builders)
-        for (const segment of builder.reservation.segments)
-          accounted.push({ offset: segment.offset, length: segment.capacity });
-    }
-    accounted.sort((a, b) => a.offset - b.offset || a.length - b.length);
-    // The accounted ranges and the free runs must tile [0, end) exactly.
-    const tiles = [...accounted, ...this.#map.runs()].sort((a, b) => a.offset - b.offset);
-    let cursor = 0;
-    let last: DataRange | null = null;
-    for (const tile of tiles) {
-      if (last !== null && tile.offset === last.offset && tile.length === last.length) continue;
-      if (tile.offset > cursor)
-        fail(`space at ${String(cursor)} is allocated but unaccounted (a leak)`);
-      if (tile.offset < cursor) fail(`space at ${String(tile.offset)} is accounted twice`);
-      cursor = tile.offset + tile.length;
-      last = tile;
-    }
-    if (cursor !== this.#map.end)
-      fail(`space at ${String(cursor)} is allocated but unaccounted (a leak)`);
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  #sameEpoch(epoch: number): boolean {
+    return (
+      epoch === this.#mutationEpoch && this.#activeMutation === null && this.#activeWrites === 0
+    );
+  }
+
+  async #auditNow(epoch: number): Promise<void> {
     await this.settled();
+    // Physical audit gets W alone, before any frame phase. It never awaits a caller callback.
+    await this.#metadata.run(async () => {
+      await this.#session.audit?.();
+      await this.#ensureInitialSnapshots();
+    });
+    const captured = await this.#metadata.run(() =>
+      this.journal.workspace.run("spool", async () => {
+        const current = this.#currentSnapshot,
+          previous = this.#previousSnapshot;
+        await this.journal.retain(current);
+        try {
+          await this.journal.retain(previous);
+        } catch (error) {
+          await this.journal.release(current).catch(() => undefined);
+          throw error;
+        }
+        return {
+          current,
+          previous,
+          root: this.#rootFrame?.retain() ?? null,
+          previousRoot: this.#previousFrame?.retain() ?? null,
+        };
+      }),
+    );
+    let currentInput: AuditCapture | null = null,
+      previousInput: AuditCapture | null = null;
+    let currentWalkRaw = 0,
+      previousWalkRaw = 0,
+      currentWalk = 0,
+      previousWalk = 0,
+      writerRaw = 0,
+      writers = 0,
+      union = 0,
+      failed = false;
+    try {
+      const source = this.#walk ?? this.#reachable;
+      currentInput = await captureAudit(
+        this.journal,
+        this.#metadata,
+        rootInput(captured.root?.bytes ?? null, source, this, this.#budget),
+      );
+      previousInput = await captureAudit(
+        this.journal,
+        this.#metadata,
+        rootInput(captured.previousRoot?.bytes ?? null, source, this, this.#budget),
+      );
+      await this.#metadata.run(async () => {
+        if (!this.#sameEpoch(epoch)) return;
+        const liveWriters = this.writers;
+        writerRaw = await saveExtentInput(
+          this.journal,
+          (function* () {
+            for (const writer of liveWriters) {
+              yield* writer.extents;
+              for (const builder of writer.builders) yield* builder.ownedRanges();
+            }
+          })(),
+          false,
+          Infinity,
+          undefined,
+          undefined,
+          true,
+        );
+        await this.#cache.withReadSlab(async (slab) => {
+          const io = { slab };
+          const sorting = (handle: number, duplicates: "exact" | "refuse") =>
+            pairPhase(this.journal, io, "merge", (slots) =>
+              sortExtents(this.journal, handle, duplicates, undefined, slots),
+            );
+          if (currentInput === null || previousInput === null)
+            throw new Error("Audit capture missing");
+          currentWalkRaw = await flattenCapture(this.journal, currentInput, io);
+          previousWalkRaw = await flattenCapture(this.journal, previousInput, io);
+          {
+            currentWalk = await sorting(currentWalkRaw, "exact");
+            previousWalk = await sorting(previousWalkRaw, "exact");
+            await this.#sameSnapshot(captured.current, currentWalk, "current", io);
+            await this.#sameSnapshot(captured.previous, previousWalk, "previous", io);
+          }
+          await this.#rootAllocated(captured.current, "current", io);
+          await this.#rootAllocated(captured.previous, "previous", io);
+          await this.journal.workspace.run("spool", () => this.journal.retain(captured.current));
+          union = captured.current;
+          const addRoot = async (handle: number) => {
+            const next = await pairPhase(this.journal, io, "merge", (slots) =>
+              mergeExtents(this.journal, union, handle, "union", undefined, "exact", slots),
+            );
+            await disposeSnapshot(this.journal, union);
+            union = next;
+          };
+          await addRoot(captured.previous);
+          await this.#tickets.forEachRoot(addRoot);
+          writers = await sorting(writerRaw, "refuse");
+          const accounted = await pairPhase(this.journal, io, "merge", (slots) =>
+            mergeExtents(this.journal, union, writers, "union", undefined, "refuse", slots),
+          );
+          await disposeSnapshot(this.journal, union);
+          union = accounted;
+          await pairPhase(this.journal, io, "merge", async (slots) => {
+            const pairs = await openPairs(this.journal, union, slots.left, true);
+            let cursor = 0,
+              run = 0,
+              gapBytes = 0,
+              tracked = 0,
+              steps = 0;
+            const gap = (first: number, last: number) => {
+              gapBytes += last - first;
+              while (run < this.#map.runCount && this.#map.runOffset(run) < last) {
+                const offset = this.#map.runOffset(run),
+                  length = this.#map.runLength(run++);
+                if (offset < first || offset + length > last)
+                  throw new Error("Extent audit: tracked free run overlaps owned space");
+                tracked += length;
+              }
+            };
+            try {
+              while (await pairs.next()) {
+                if (steps++ % 128 === 0) {
+                  const pending = pauseIfDue();
+                  if (pending !== undefined) await pending;
+                }
+                if (pairs.offset < cursor)
+                  throw new Error("Extent audit: space is accounted twice");
+                if (pairs.offset > cursor) gap(cursor, pairs.offset);
+                cursor = pairs.offset + this.#map.sizeOf(pairs.length);
+              }
+              if (cursor > this.#map.end)
+                throw new Error("Extent audit: owned space is past allocator end");
+              gap(cursor, this.#map.end);
+              if (run !== this.#map.runCount || gapBytes - tracked !== this.#map.untrackedFreeBytes)
+                throw new Error(
+                  "Extent audit: allocated but unaccounted space (a leak or incorrect untracked-free debt)",
+                );
+            } finally {
+              await pairs.close();
+            }
+          });
+        });
+      });
+    } catch (error) {
+      failed = true;
+      throw error;
+    } finally {
+      captured.root?.release();
+      captured.previousRoot?.release();
+      await this.#metadata.run(async () => {
+        if (currentInput !== null) await clearCapture(this.journal, currentInput);
+        if (previousInput !== null) await clearCapture(this.journal, previousInput);
+        await discardPrepared(
+          this.journal,
+          [
+            captured.current,
+            captured.previous,
+            currentWalkRaw,
+            previousWalkRaw,
+            currentWalk,
+            previousWalk,
+            writerRaw,
+            writers,
+            union,
+          ],
+          failed,
+        );
+      });
+    }
+  }
+
+  #sameSnapshot(listed: number, walked: number, label: string, io: MetadataWork): Promise<void> {
+    return pairPhase(this.journal, io, "merge", async (slots) => {
+      const a = await openPairs(this.journal, listed, slots.left, true);
+      let b: Awaited<ReturnType<typeof openPairs>> | null = null;
+      try {
+        b = await openPairs(this.journal, walked, slots.right, true);
+        let hasA = await a.next(),
+          hasB = await b.next(),
+          steps = 0;
+        while (hasA || hasB) {
+          if (steps++ % 128 === 0) {
+            const pending = pauseIfDue();
+            if (pending !== undefined) await pending;
+          }
+          if (!hasA || (hasB && b.offset < a.offset))
+            throw new StoreCorruptionError(
+              `The ${label} root's extent list misses the extent at ${String(b.offset)} that it reaches`,
+            );
+          if (!hasB || a.offset < b.offset)
+            throw new StoreCorruptionError(
+              `The ${label} root's extent list names the extent at ${String(a.offset)}, which it does not reach`,
+            );
+          if (a.length !== b.length)
+            throw new StoreCorruptionError(
+              `The ${label} root's extent list and walk differ in length at ${String(a.offset)}`,
+            );
+          hasA = await a.next();
+          hasB = await b.next();
+        }
+      } finally {
+        try {
+          await b?.close();
+        } finally {
+          await a.close();
+        }
+      }
+    });
+  }
+
+  #rootAllocated(handle: number, label: string, io: MetadataWork): Promise<void> {
+    return pairPhase(this.journal, io, "merge", async (slots) => {
+      const pairs = await openPairs(this.journal, handle, slots.left, true);
+      try {
+        let steps = 0;
+        while (await pairs.next()) {
+          if (steps++ % 128 === 0) {
+            const pending = pauseIfDue();
+            if (pending !== undefined) await pending;
+          }
+          const state = this.#map.allocationState(pairs.offset, pairs.length);
+          if (state === "free" || state === "outside")
+            throw new Error(
+              `Extent audit: the ${label} root's extent at ${String(pairs.offset)} is free`,
+            );
+        }
+      } finally {
+        await pairs.close();
+      }
+    });
+  }
+
+  close(): Promise<void> {
+    if (this.#closePromise !== null) return this.#closePromise;
+    this.#closing = true;
+    return (this.#closePromise = this.#closeNow());
+  }
+  async #closeNow(): Promise<void> {
+    await this.#publishing.run(async () => undefined);
+    // Await busy operations outside the barrier: a queued seal/abort needs it to finish.
+    for (const writer of this.writers) {
+      try {
+        await writer.settled();
+      } catch (error) {
+        this.fail(error);
+      }
+    }
+    await this.writeLock.run(async () => undefined);
+    await this.settled();
+    await this.#mutations.run(async () => undefined);
+    for (const audit of this.#audits) await audit.catch(() => undefined);
+    await this.#metadata.run(async () => undefined);
+    await this.#cache.settled();
     this.#closed = true;
+    this.staged = null;
+    this.writeSlab = new Uint8Array(0);
+    this.#rootFrame?.release();
+    this.#previousFrame?.release();
+    this.#rootFrame = null;
+    this.#previousFrame = null;
+    const initial = this.initialLists;
+    this.initialLists = null;
+    try {
+      initial?.[0].release();
+    } finally {
+      initial?.[1].release();
+    }
+    this.roots.close();
+    this.#ledger.close();
     this.#cache.close();
-    this.retainedMemory.close();
+    this.#map.close();
+    this.workspace.close();
   }
 }
 
@@ -943,6 +1401,14 @@ class Writer implements ExtentWriter {
   /** Calls in flight (appends, whole seals): abort waits for them. */
   busy = 0;
   readonly #idle: Array<() => void> = [];
+  #abortPromise: Promise<void> | null = null;
+  get abortRequested(): boolean {
+    return this.#abortPromise !== null;
+  }
+  async settled(): Promise<void> {
+    while (this.busy > 0) await new Promise<void>((resolve) => this.#idle.push(resolve));
+    await this.#abortPromise;
+  }
 
   /** Charged for each builder's own staging buffer; null: builders share the space's slab. */
   readonly budget: ByteBudget | null;
@@ -966,7 +1432,8 @@ class Writer implements ExtentWriter {
 
   usable(): void {
     if (this.state !== "open") throw new TypeError(`Writer ${this.label} is ${this.state}`);
-    this.space.usable();
+    if (this.abortRequested) throw new TypeError(`Writer ${this.label} is aborting`);
+    this.space.accepting();
   }
 
   async track<T>(work: () => Promise<T>): Promise<T> {
@@ -989,6 +1456,7 @@ class Writer implements ExtentWriter {
     if (this.budget?.allocate(size) === true)
       builder.own = { buffer: new Uint8Array(size), start: 0, length: 0 };
     this.builders.add(builder);
+    this.space.reserved();
     return builder;
   }
 
@@ -1009,39 +1477,50 @@ class Writer implements ExtentWriter {
 
   async discard(extent: ExtentRef): Promise<void> {
     this.usable();
-    const index = this.#extents.findIndex(
-      (candidate) => candidate.offset === extent.offset && candidate.length === extent.length,
-    );
-    if (index < 0) throw new RangeError(`Writer ${this.label} did not seal that extent`);
-    this.#extents.splice(index, 1);
-    await this.space.free([
-      { offset: extent.offset, length: this.space.map.sizeOf(extent.length) },
-    ]);
-  }
-
-  async abort(): Promise<void> {
-    if (this.state === "aborted") return;
-    if (this.state !== "open") throw new TypeError(`Writer ${this.label} is ${this.state}`);
-    this.state = "aborted";
-    // Every call in flight finishes first, so each range has exactly one owner when abort takes
-    // what is left (review B1-p2a finding 3).
-    while (this.busy > 0)
-      await new Promise<void>((resolve) => {
-        this.#idle.push(resolve);
-      });
-    const ranges: DataRange[] = [];
-    await this.space.writeLock.run(async () => {
-      for (const builder of this.builders) {
-        if (this.space.staged?.builder === builder) this.space.staged = null;
-        ranges.push(...builder.abandon());
-      }
+    await this.space.mutate(async (guard) => {
+      // Accepted before close; recheck ownership, without treating close's drain as new work.
+      if (this.state !== "open") throw new TypeError(`Writer ${this.label} cannot discard now`);
+      this.space.usable();
+      const index = this.#extents.findIndex(
+        (candidate) => candidate.offset === extent.offset && candidate.length === extent.length,
+      );
+      if (index < 0) throw new RangeError(`Writer ${this.label} did not seal that extent`);
+      this.#extents.splice(index, 1);
+      await this.space.freeGuarded(
+        [{ offset: extent.offset, length: this.space.map.sizeOf(extent.length) }],
+        guard,
+      );
     });
-    this.builders.clear();
+  }
+  async abort(): Promise<void> {
+    if (this.state === "aborted") return Promise.resolve();
+    if (this.#abortPromise !== null) return this.#abortPromise;
+    if (this.state !== "open")
+      return Promise.reject(new TypeError(`Writer ${this.label} is ${this.state}`));
+    this.space.cleanupAllowed();
+    // Do not remove ownership or mark aborted until the queued transition owns the barrier.
+    return (this.#abortPromise = this.#abortNow());
+  }
+  *#abortRanges(): IterableIterator<DataRange> {
+    for (const builder of this.builders) {
+      if (this.space.staged?.builder === builder) this.space.staged = null;
+      yield* builder.abandon();
+    }
     for (const extent of this.#extents)
-      ranges.push({ offset: extent.offset, length: this.space.map.sizeOf(extent.length) });
-    this.#extents.length = 0;
-    this.space.writers.delete(this);
-    await this.space.free(ranges);
+      yield { offset: extent.offset, length: this.space.map.sizeOf(extent.length) };
+  }
+  async #abortNow(): Promise<void> {
+    while (this.busy > 0) await new Promise<void>((resolve) => this.#idle.push(resolve));
+    await this.space.writeLock.run(() =>
+      this.space.mutate(async (guard) => {
+        if (this.state !== "open") throw new TypeError(`Writer ${this.label} is ${this.state}`);
+        this.state = "aborted";
+        await this.space.freeGuarded(this.#abortRanges(), guard);
+        this.builders.clear();
+        this.#extents.length = 0;
+        this.space.writers.delete(this);
+      }),
+    );
   }
 }
 
@@ -1089,17 +1568,25 @@ class Builder implements ExtentBuilder {
     this.own = null;
   }
 
+  *ownedRanges(): IterableIterator<DataRange> {
+    if (this.#leftover !== null) yield* this.#leftover;
+    else yield* this.reservation.ownedRanges();
+  }
+
   /** Everything this builder holds, for its writer's abort. */
-  abandon(): DataRange[] {
+  abandon(): Iterable<DataRange> {
     this.releaseBuffer();
     if (this.#leftover !== null) return this.#leftover;
-    return this.reservation.abort();
+    this.tail = null;
+    return this.reservation.abortRanges();
   }
 
   extend(bytes: number): boolean {
     this.#usable();
     if (!(Number.isSafeInteger(bytes) && bytes >= 0)) throw new RangeError("Bad extend size");
-    return this.reservation.extend(bytes);
+    const result = this.reservation.extend(bytes);
+    this.writer.space.reserved();
+    return result;
   }
 
   async append(parts: readonly Uint8Array[]): Promise<PendingBlob[]> {
@@ -1144,55 +1631,54 @@ class Builder implements ExtentBuilder {
     if (this.#appending) throw new TypeError("seal during an append");
     this.#state = "sealed";
     const space = this.writer.space;
-    return this.writer.track(async () => {
-      if (this.#length === 0) {
-        const ranges = await space.writeLock.run(async () => {
-          if (space.staged?.builder === this) space.staged = null;
-          this.releaseBuffer();
-          const reserved = this.reservation.abort();
-          this.writer.sealed(this, null);
-          return reserved;
-        });
-        await space.free(ranges);
-        return null;
-      }
-      let plan: SealPlan;
-      try {
-        plan = await space.writeLock.run(async () => {
-          if (space.staged?.builder === this) await space.flushStaged(false);
-          await space.flushOwn(this);
-          if (this.failure !== null) throw this.failure;
-          this.releaseBuffer();
-          const sealed = this.reservation.seal(this.#length);
-          this.#leftover = [
-            { offset: sealed.extent.offset, length: space.map.sizeOf(sealed.extent.length) },
-            ...sealed.release,
-          ];
-          if (sealed.moves.length > 0) {
-            // Relocation: the slab carries every segment's bytes to the contiguous extent.
-            if (space.staged !== null) await space.flushStaged(false);
-            for (const move of sealed.moves)
-              for (let done = 0; done < move.length; done += MAX_SLAB) {
-                const chunk = space.writeSlab.subarray(0, Math.min(MAX_SLAB, move.length - done));
-                await space.sessionRead(move.from + done, chunk);
-                await space.sessionWrite(move.to + done, chunk);
-              }
-            space.relocated();
+    return this.writer.track(() =>
+      space.writeLock.run(() =>
+        space.mutate(async (guard) => {
+          if (this.#length === 0) {
+            if (space.staged?.builder === this) space.staged = null;
+            this.releaseBuffer();
+            const ranges = this.reservation.abort();
+            this.writer.sealed(this, null);
+            await space.freeGuarded(ranges, guard);
+            return null;
           }
-          this.#leftover = null;
-          this.tail = null;
-          this.writer.sealed(this, sealed.extent);
-          return sealed;
-        });
-      } catch (error) {
-        this.failure ??= error instanceof Error ? error : new Error(String(error));
-        throw error;
-      }
-      await space.free(plan.release);
-      if (this.writer.state === "aborted")
-        throw new TypeError(`Writer ${this.writer.label} was aborted during the seal`);
-      const extent: ExtentRef = plan.extent;
-      return { extent, blobs: this.#pending.map((blob) => ({ extent, ...blob })) };
-    });
+          let plan: SealPlan;
+          try {
+            if (space.staged?.builder === this) await space.flushStaged(false);
+            await space.flushOwn(this);
+            if (this.failure !== null) throw this.failure;
+            this.releaseBuffer();
+            const sealed = this.reservation.seal(this.#length);
+            this.#leftover = [
+              { offset: sealed.extent.offset, length: space.map.sizeOf(sealed.extent.length) },
+              ...sealed.release,
+            ];
+            if (sealed.moves.length > 0) {
+              // Relocation: the slab carries every segment's bytes to the contiguous extent.
+              if (space.staged !== null) await space.flushStaged(false);
+              for (const move of sealed.moves)
+                for (let done = 0; done < move.length; done += MAX_SLAB) {
+                  const chunk = space.writeSlab.subarray(0, Math.min(MAX_SLAB, move.length - done));
+                  await space.sessionRead(move.from + done, chunk);
+                  await space.sessionWrite(move.to + done, chunk);
+                }
+              space.relocated();
+            }
+            this.#leftover = null;
+            this.tail = null;
+            this.writer.sealed(this, sealed.extent);
+            plan = sealed;
+          } catch (error) {
+            this.failure ??= error instanceof Error ? error : new Error(String(error));
+            throw error;
+          }
+          await space.freeGuarded(plan.release, guard);
+          if (this.writer.abortRequested)
+            throw new TypeError(`Writer ${this.writer.label} was aborted during the seal`);
+          const extent: ExtentRef = plan.extent;
+          return { extent, blobs: this.#pending.map((blob) => ({ extent, ...blob })) };
+        }),
+      ),
+    );
   }
 }

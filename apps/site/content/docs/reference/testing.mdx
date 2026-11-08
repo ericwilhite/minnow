@@ -1388,7 +1388,8 @@ elsewhere.
 - The browser profile is a persistent one (`launchPersistentContext`); an ephemeral context keeps
   OPFS in memory. The lane refuses a profile on tmpfs or ramfs, and proves OPFS is on disk by
   writing a probe file and watching the profile grow. The profile lives in
-  `~/.cache/minnow-browser-perf`; set `MINNOW_BROWSER_PERF_DIR` to move it.
+  `minnow-browser-perf` under the OS temporary directory (`os.tmpdir()`, which honours
+  `TMPDIR`); set `MINNOW_BROWSER_PERF_DIR` to choose a persistent directory on disk.
 - One fixed origin, `http://127.0.0.1:8791` (`MINNOW_BROWSER_PERF_PORT`), so a database loaded in
   one run is the one later runs read. A port in use is an error.
 - Every write cell names its durability. SQLite's pragmas are read back after they are set and
@@ -1604,21 +1605,138 @@ are unavailable; the report counts returned byte payloads and numeric index/meta
 The factory acquires handles in `openFence` and recovers in `open`, following the host contract.
 The default fence deadline is unchanged; the ready timer includes acquisition and recovery.
 
+The extent-space crash sweep registers each backend, placement and seed as a separate test.
+Every seed still checks every physical crash boundary, using the normal local test deadline.
+
+The bounded-storage histories hold every remaining ordinary byte in the caller, sometimes
+with a live progress loan, while publication and abort finish without admission. Final-phase
+histories enumerate actual native I/O and task suspensions, then interleave tracked-hole/EOF
+reservations with queued abort, discard and seal transitions at every checkpoint. A free
+outside the barrier must fail these checks. Audit histories also require another publication
+to finish while the audit's external producer is blocked, and verify a restarted generation.
+
+The free-map pressure regression replays seed 598's generated durable-load shapes over
+memory and the IndexedDB adapter. It holds all but one ordinary byte during each native
+allocator release, including trim and abort, with startup credit retained or returned and
+with or without a caller loan. Releases must add no charge. The histories require real
+merges, exact rows, recovery, audit and complete charge cleanup. Pressure is scoped to
+allocator mutation; the separate write-path metadata and merge admission policy has its
+own tests. The full review workload can expose that separate policy after storage succeeds.
+
+Native-open histories require ordinary listed-root open to write no payload pair chains.
+They close the startup grant, hold the remaining ordinary capacity (sometimes with a loan),
+and require the first publication or audit to complete with descriptor credit still charged.
+Refusal, transfer failure, cancellation during decoding/handoff, native write failure and
+unused close return every charge. A large-page-directory case allows sorting only physical
+page coordinates; payload coordinates may not appear in private writes. Timer checks cover
+immediately resolved reads. The first publication or audit pays the deferred chain-copy cost;
+recovery that publishes pays it before ready. Generic callbacks keep their existing path.
+
+Disk-derived retirement tests keep the before/after list pages protected through complete
+worklist construction, then release at most 256 ranges per batch. They independently check
+fragmentation debt and recovery when the gaps coalesce within the arena capacity. Private
+metadata faults, cancellation, native root copies and snapshot charges have separate checks.
+These are managed-buffer bounds; opaque native IndexedDB memory still needs Gate D browser
+measurement.
+
+The owner-ready campaign accepts `MINNOW_OWNER_REOPEN_SAMPLES=6` for six wall and six
+separate CPU samples per dataset/backend. It retains each sample and its before/after host
+load and CPU-pressure snapshot, including slow observations. Private metadata read bytes are
+included. A statistics-only first count remains labelled separately from startup.
+
+Bounded-arena histories independently track live cells and reusable runs under fragmentation,
+overflow, splitting and coalescing. They require forgotten holes to remain unavailable, check
+the single prepaid backing allocation, and recover all free space on rebuild where coalescing
+brings fragmentation within capacity. Unchanged extreme fragmentation may retain debt across
+reopen. Integrated histories also check root-list provenance: unknown space never authorizes
+a root reference or retirement.
+
+Memory-transfer histories fill ordinary capacity, queue another admission and
+move an existing allocation into a cache owner without adding or releasing a
+charge. They also move ordinary allocations beside an active loan, refuse loan
+capture, and require both owners to return every byte on close. Foreign and
+closed grants cannot transfer into another owner's accounting.
+
+Private-metadata histories run over memory, both simulated fences, OPFS handles and
+IndexedDB. Random page rewrites must survive the operator-spill sweep; resetting
+metadata must preserve roots, log, data and operator spill. Every read, write and
+reset from a replaced owner must fail. This backing holds reconstructible disk-derived
+retirement tickets and is discarded at open; durable roots remain recovery authority.
+
+The metadata-journal generator inventories frames independently at construction,
+requires admission first, and keeps the frame count constant as its disk queue
+grows. It tests multi-page inputs, empty chains, cursor references and page
+reuse; mutants that omit admission or cursor retention fail their respective
+invariants. Serial list reads also generate thousands of tiny physical records and require
+index selections of at most128 entries per page, independently of the byte target.
+Native-read response capacity is measured separately in its scripted
+store. Cancellation and failed-write tests require cleanup without a new memory
+request. These primitive tests do not yet establish live publication's bound.
+
+Private pair-stream histories sort shuffled extents above `2^40` through several
+disk passes, including an unmatched final run. Independent expected pairs check
+union, difference and duplicate policy. Cancellation interrupts the 100,000-entry
+producer during copying, selected sort/merge task turns and the final descriptor
+write. Each case retries and checks input references. A scripted two-run trace
+fails every native write boundary in turn, preserving the original error and
+returning the workspace charge. Mutants that truncate offsets, reclaim shared
+extents or copy the whole producer before slicing must fail.
+
 Ordered-root startup regressions require a streaming union without the unordered free-map sort,
 validate scattered list-page allocations, and refuse overlapping, descending or inconsistent
 extents before reclaim. Full audit and test-build semantic checks remain enabled separately.
-Retained free-run and previous-only retirement capacity is admitted before allocation, including
-old/new backing-store overlap. The charge transfers from the startup grant to the space and
-remains until close; deleting entries does not assume the JavaScript containers release capacity.
+The lifetime free-run arena is admitted before allocation, including its overlap with the
+prepaid reconstruction view. Its charge transfers from startup to the space and remains until
+close. Previous-only retirement streams through disk tickets; it has no resident per-extent
+index. Immutable native-list descriptors retain their transferred codec charge until handoff
+or close. Deleting entries does not assume JavaScript containers release capacity.
 Finite-budget regressions cover refusal, transfer refusal, cancellation, fragmentation,
-previous-root retirement and cleanup. Audits hold the publication lock across root enumeration
-and allocator checks, so concurrent publication cannot make their captured roots stale.
+previous-root retirement and cleanup. Audits restart when their mutation epoch changes,
+including a raced failure, so publication, reservation and writer transitions cannot make
+their captured accounting view stale. They hold no publication lock during enumeration.
+
+Ownership-boundary histories hold native publication and interleave synchronous reservations
+with abort, discard and seal in generated orders. They drive the memory backend's task turn
+explicitly, require queued owners to retain their records, then release publication and audit
+the result. Close must retain its memory until an accepted publication settles, including a
+native failure. These tests cover the barrier; disk-derived R8 tickets are a separate integration.
 
 The real owner-ready composition holds initial flush, merge and recycle work until the page
 acknowledges receiving ready, then resumes it. Native file/range and logical call-site tracing
 (`MINNOW_OWNER_TRACE=1`) includes in-flight maintenance state; it is diagnostic, not a timing run.
 The first statistics-only count can overlap the resumed maintenance. Standalone write-path opens
 still schedule their maintenance automatically; owner composition supplies the ready lifecycle.
+
+Bounded-storage I/O histories independently count pending IndexedDB record gets,
+callback response bytes and output-copy lengths in eager and lazy index modes.
+Random two-boundary trims must retain all outside bytes, survive reopen and
+roll back an already trimmed first boundary if the second is corrupt. Raw reads
+must have one pending data-record request; boundary copies stay at most 60 KiB.
+A constructor probe requires fixed-slab admission before allocation, and a held
+borrowed view must serialize ordinary cache reads. Borrowed metadata frames
+share the paid slab and cannot become native write buffers. These checks cover
+managed/native callback lifetimes, not browser allocator or garbage-collector
+retention after a callback returns.
+
+Slab-backed list-cursor histories verify high coordinates, page coalescing and
+scalar results against an independent sequence. Malformed headers, checksums,
+first offsets, overlaps and past-end coordinates fail. An injected shared clock
+services a real timer and cancels within the first 512 entries even when reads
+resolve immediately. Arena-copy tests count typed-array elements at the yield,
+cancel partway through copying and retry with the same reservation. A full
+ordinary governor must transfer the arena's existing charge without a second
+admission; source and lifetime owners return exactly their own bytes.
+
+Disk-ticket histories keep eight generations pinned while their source snapshot
+owners close. They fill ordinary governor capacity, sometimes hold a caller
+progress loan, and reject any new publication admission. Reclaim checks the
+next-durable-generation guard and pin guard separately. An independent native
+buffer-constructor probe permits only two owned frames in the slab-backed
+composition; every release batch must contain at most 256 ranges. Separate
+histories keep fragmentation debt across rebuilds, recover it when gaps
+coalesce, and fail each reconstruction native-write boundary, including cursor
+cleanup after the arena was allocated. These component histories precede the
+full extent-space and write-path integration campaign.
 
 ### Rebuild storage step-down regression
 

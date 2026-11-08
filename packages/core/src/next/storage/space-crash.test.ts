@@ -6,7 +6,8 @@
  * room to keep writing. A second case loses the newest root slot outright: the previous root's
  * extents must still read back, which is what two-generation reclaim is for.
  */
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
+import { createReach, SPACE_CRASH_SWEEP_REACH } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import type { BlobRef, ExtentRef, ExtentSpace } from "./extents.js";
 import type { StorageBackend } from "./contract.js";
@@ -17,6 +18,10 @@ import { blobsOf, bytesOf, openOver, rootOf } from "./space-test-support.js";
 import { DATA_ALIGN } from "./contract.js";
 
 const SEEDS = seedsFor("next-extent-space-crash", [0x5ace, 41, 977, 3, 1009, 7717, 31337, 65521]);
+const reach = createReach(
+  "extent-space crash matrix",
+  SPACE_CRASH_SWEEP_REACH.flatMap((mode) => SEEDS.map((seed) => `${mode}/seed=${String(seed)}`)),
+);
 
 interface Ack {
   readonly published: string[];
@@ -68,14 +73,23 @@ async function readAll(space: ExtentSpace, blobs: readonly BlobRef[]): Promise<v
 }
 
 describe("extent space crash sweep", () => {
-  it.each([
-    ["files", "growing in place", false],
-    ["files", "relocating at seal (review B1-p2a)", true],
-    ["IndexedDB", "growing in place", false],
-    ["IndexedDB", "relocating at seal", true],
-  ] as const)(
-    "%s, %s: reopens to an intact current and previous root, an exact free map, and keeps writing",
-    async (store, _name, forceRelocation) => {
+  // Every backend/placement/seed still sweeps every physical step. Give each seed its own
+  // ordinary test deadline rather than putting eight complete sweeps inside one test.
+  it.each(
+    (
+      [
+        ["files", "growing in place", false],
+        ["files", "relocating at seal (review B1-p2a)", true],
+        ["IndexedDB", "growing in place", false],
+        ["IndexedDB", "relocating at seal", true],
+      ] as const
+    ).flatMap(([store, placement, forceRelocation]) =>
+      SEEDS.map((seed) => ({ store, placement, forceRelocation, seed })),
+    ),
+  )(
+    "$store, $placement, seed $seed: reopens to an intact current and previous root, an exact free map, and keeps writing",
+    async ({ store, forceRelocation, seed }) => {
+      reach.beginHistory();
       const backendOf = (disk: SimDisk): StorageBackend =>
         store === "files"
           ? new SimBackend(disk)
@@ -91,57 +105,57 @@ describe("extent space crash sweep", () => {
       else expect(space.stats.relocations).toBe(0);
       const steps = clean.steps;
       let checked = 0;
-      for (let step = 0; step < steps; step++)
-        for (const seed of SEEDS) {
-          const disk = new SimDisk({ crashAtStep: step, seed: seed + step * 7919 });
-          const ack: Ack = { published: [], inFlight: null };
-          try {
-            const { space: first } = await openOver(backendOf(disk));
-            await workload(first, ack, 5, 1, [], forceRelocation);
-            disk.powerLoss();
-          } catch (error) {
-            // Once the disk has crashed the process is dead, whatever its calls then report (a
-            // crash in background work, an IndexedDB release, fails the space; a call in flight
-            // meets a dead handle). Before a crash, any error is a real failure.
-            if (disk.crashes === 0) throw error;
-          }
-          const label = `crash at step ${String(step)}, seed ${String(seed)}`;
-          const { space: reopened } = await openOver(backendOf(disk));
-          const root = text(reopened.root);
-          expect([ack.published.at(-1) ?? null, ack.inFlight], label).toContain(root);
-          const history = [...ack.published, ...(ack.inFlight === null ? [] : [ack.inFlight])];
-          if (root !== null) {
-            const before = history[history.indexOf(root) - 1] ?? null;
-            const previous = text(reopened.previousRoot);
-            // The previous root is the one before, or lost with the slot an interrupted publish tore.
-            if (previous !== null) expect(previous, label).toBe(before);
-            await readAll(reopened, blobsOf(reopened.root ?? new Uint8Array(0)));
-            if (reopened.previousRoot !== null)
-              await readAll(reopened, blobsOf(reopened.previousRoot));
-          }
-          await reopened.audit();
-          // The reopened space keeps going: two more rounds, the first retiring what its root reached.
-          const reached = blobsOf(reopened.root ?? rootOf([]))
-            .map((blob) => blob.extent)
-            .filter(
-              (extent, index, all) => all.findIndex((e) => e.offset === extent.offset) === index,
-            );
-          await workload(
-            reopened,
-            { published: [], inFlight: null },
-            2,
-            50,
-            reached,
-            forceRelocation,
-          );
-          await readAll(reopened, blobsOf(reopened.root ?? new Uint8Array(0)));
-          await reopened.audit();
-          checked += 1;
+      for (let step = 0; step < steps; step++) {
+        const disk = new SimDisk({ crashAtStep: step, seed: seed + step * 7919 });
+        const ack: Ack = { published: [], inFlight: null };
+        try {
+          const { space: first } = await openOver(backendOf(disk));
+          await workload(first, ack, 5, 1, [], forceRelocation);
+          disk.powerLoss();
+        } catch (error) {
+          // Once the disk has crashed the process is dead, whatever its calls then report (a
+          // crash in background work, an IndexedDB release, fails the space; a call in flight
+          // meets a dead handle). Before a crash, any error is a real failure.
+          if (disk.crashes === 0) throw error;
         }
-      expect(checked).toBe(steps * SEEDS.length);
+        const label = `crash at step ${String(step)}, seed ${String(seed)}`;
+        const { space: reopened } = await openOver(backendOf(disk));
+        const root = text(reopened.root);
+        expect([ack.published.at(-1) ?? null, ack.inFlight], label).toContain(root);
+        const history = [...ack.published, ...(ack.inFlight === null ? [] : [ack.inFlight])];
+        if (root !== null) {
+          const before = history[history.indexOf(root) - 1] ?? null;
+          const previous = text(reopened.previousRoot);
+          // The previous root is the one before, or lost with the slot an interrupted publish tore.
+          if (previous !== null) expect(previous, label).toBe(before);
+          await readAll(reopened, blobsOf(reopened.root ?? new Uint8Array(0)));
+          if (reopened.previousRoot !== null)
+            await readAll(reopened, blobsOf(reopened.previousRoot));
+        }
+        await reopened.audit();
+        // The reopened space keeps going: two more rounds, the first retiring what its root reached.
+        const reached = blobsOf(reopened.root ?? rootOf([]))
+          .map((blob) => blob.extent)
+          .filter(
+            (extent, index, all) => all.findIndex((e) => e.offset === extent.offset) === index,
+          );
+        await workload(
+          reopened,
+          { published: [], inFlight: null },
+          2,
+          50,
+          reached,
+          forceRelocation,
+        );
+        await readAll(reopened, blobsOf(reopened.root ?? new Uint8Array(0)));
+        await reopened.audit();
+        checked += 1;
+      }
+      expect(checked).toBe(steps);
       // The workload reaches dozens of physical steps on files; on IndexedDB, batching leaves at
       // least a commit and a flush per publish (five publishes).
       expect(steps).toBeGreaterThan(store === "files" ? 30 : 2 * 5 - 1);
+      reach.reach(`${store}/${forceRelocation ? "relocating" : "growing"}/seed=${String(seed)}`);
     },
   );
 
@@ -167,3 +181,5 @@ describe("extent space crash sweep", () => {
     await reopened.audit();
   });
 });
+
+afterAll(() => reach.assertReached());

@@ -95,7 +95,7 @@
  *
  * ## Implementations
  * - `file-store.ts`: the store over four long-lived files (log, data, two root slots; OPFS adds
- *   `spill` and `epoch`) through a
+ *   `spill`, `epoch`, `space-meta` and `space-meta-index`) through a
  *   `SyncFile` interface with the shape of `FileSystemSyncAccessHandle`. OPFS supplies real
  *   handles (`opfs.ts`); `sim-disk.ts` supplies simulated ones with a physical crash model.
  * - `indexeddb.ts`: the same contract on IndexedDB (Safari and Firefox private browsing), with the
@@ -162,6 +162,29 @@ export interface ScratchSpace {
   chargeTo?(memory: CacheMemory): void;
   /** Optional (additive): drop that bookkeeping and return its charge (sweep, close). */
   dispose?(): Promise<void>;
+}
+
+/** Owner-private reconstructible metadata; separate from the operator-spill sweep.
+ * Fixed page addressing requires no resident per-record index. Input remains borrowed and
+ * immutable until write settles. Writes accept a full frame or the compact256-byte frame;
+ * reads return a full zero-padded logical page. IndexedDB requires standalone whole buffers.
+ * One native read response of this size can coexist with the target: callers reserve both.
+ * reset is only used before opening the extent space.
+ */
+export const METADATA_PAGE_BYTES = 60 * 1024;
+/** Standalone compact frame for small private records; read expands it with zero padding. */
+export const METADATA_SMALL_BYTES = 256;
+export interface MetadataStore {
+  read(page: number, target: Uint8Array): Promise<void>;
+  write(page: number, bytes: Uint8Array): Promise<void>;
+  reset(): Promise<void>;
+}
+
+/** Raw data reads used by the prepaid list cursors. */
+export interface ReadDataOptions {
+  /** Page index selection at128 entries and issue record gets in callback order,
+   * so at most one index page and one native data response are live. */
+  readonly serialRecords?: boolean;
 }
 
 /** `StoreSession.writeData` options. */
@@ -246,6 +269,13 @@ export interface StorageBackend {
 
 export interface StoreSession {
   readonly epoch: number;
+  /** Owner-private identity for prepared root frames; wrappers preserve this value. */
+  readonly rootWriterToken?: object;
+  /** Read one borrowed native root slot. Extent-space startup prepays the native response and
+   * processes it before reading the next. The legacy root APIs remain for raw store callers. */
+  readRootSlot?(slot: 0 | 1): Promise<Uint8Array | null>;
+  /** Private metadata backing under this session's fence; never recovered as database state. */
+  metadata?(): MetadataStore | null;
   /**
    * True when `writeData` keeps the caller's bytes until a later commit (the IndexedDB session
    * queues them), so handing a buffer over (`transfer`) saves a copy. A session that writes at
@@ -287,7 +317,7 @@ export interface StoreSession {
    * cache reads coalesced slabs into one reused buffer this way. Throws `StoreCorruptionError` past
    * the data length.
    */
-  readDataInto(offset: number, target: Uint8Array): Promise<void>;
+  readDataInto(offset: number, target: Uint8Array, options?: ReadDataOptions): Promise<void>;
   /** Guarantee 5. */
   releaseData(ranges: readonly DataRange[]): Promise<void>;
   /** Bytes in the data space (the allocator's high-water mark on open). */

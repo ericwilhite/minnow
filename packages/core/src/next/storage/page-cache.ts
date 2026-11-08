@@ -191,7 +191,7 @@ export class PageCache implements EvictableCacheLike {
   readonly #byExtent = new Map<number, Set<Entry>>();
   readonly #probation = new List();
   readonly #protected = new List();
-  readonly #slab = new Uint8Array(MAX_SLAB);
+  #slab = new Uint8Array(0);
   #memory: CacheMemory | null = null;
   #slabBusy: Promise<void> = Promise.resolve();
   #pinnedBytes = 0;
@@ -214,10 +214,69 @@ export class PageCache implements EvictableCacheLike {
   }
 
   /** Connects the governor's handle and charges the fixed slabs (`RangeError` if it cannot). */
-  attach(memory: CacheMemory): void {
-    if (!memory.charge(FIXED_CACHE_BYTES))
+  attach(memory: CacheMemory, deferReadSlab = false): void {
+    if (this.#memory !== null || this.#closed)
+      throw new TypeError("Cache already attached or closed");
+    if (!memory.charge(FIXED_CACHE_BYTES)) {
+      memory.unregister?.();
       throw new RangeError("The memory cap cannot hold the extent space's 2 MiB of fixed slabs");
+    }
+    try {
+      if (!deferReadSlab) this.#slab = new Uint8Array(MAX_SLAB);
+    } catch (error) {
+      memory.release(FIXED_CACHE_BYTES);
+      memory.unregister?.();
+      throw error;
+    }
     this.#memory = memory;
+  }
+
+  /** Root loading temporarily uses the paid slab allowance for one native slot response. */
+  activateReadSlab(): void {
+    if (this.#memory === null || this.#closed || this.#slab.length !== 0)
+      throw new TypeError("Read slab cannot activate");
+    this.#slab = new Uint8Array(MAX_SLAB);
+  }
+
+  /** Borrow the already charged read slab for raw list cursors. Acquire before taking the
+   * ownership-transition barrier, and release before freeing list pages. The callback performs
+   * only prepaid work/native I/O: no cache.read reentry, governor admission, or caller waits.
+   */
+  async withReadSlab<T>(work: (slab: Uint8Array) => Promise<T>): Promise<T> {
+    const previous = this.#slabBusy;
+    let done!: () => void;
+    this.#slabBusy = new Promise<void>((resolve) => {
+      done = resolve;
+    });
+    await previous;
+    try {
+      this.#live();
+      return await work(this.#slab);
+    } finally {
+      done();
+    }
+  }
+  /** Close drains borrowed/shared-slab operations before returning the fixed slab charge. */
+  async settled(): Promise<void> {
+    for (;;) {
+      const pending = this.#slabBusy;
+      await pending;
+      if (pending === this.#slabBusy) return;
+    }
+  }
+  /** Exact raw read into a borrowed slab view; raw list decoding verifies its blob checksum. */
+  async readRaw(offset: number, target: Uint8Array): Promise<void> {
+    this.#live();
+    if (
+      target.buffer !== this.#slab.buffer ||
+      target.byteOffset < this.#slab.byteOffset ||
+      target.byteOffset + target.length > this.#slab.byteOffset + this.#slab.length
+    )
+      throw new TypeError("Raw list reads require a borrowed read-slab view");
+    await this.#session.readDataInto(offset, target, { serialRecords: true });
+    this.#platformReads++;
+    this.#bytesRead += target.length;
+    this.#live();
   }
 
   get stats(): CacheStats {
@@ -428,17 +487,11 @@ export class PageCache implements EvictableCacheLike {
       length: ref.length,
     }));
     const slabs = planSlabs(ranges);
-    const previous = this.#slabBusy;
-    let done!: () => void;
-    this.#slabBusy = new Promise<void>((resolve) => {
-      done = resolve;
-    });
-    await previous;
-    try {
+    await this.withReadSlab(async (buffer) => {
       for (const slab of slabs) {
         signal?.throwIfAborted();
         this.#live();
-        const target = this.#slab.subarray(0, slab.length);
+        const target = buffer.subarray(0, slab.length);
         await this.#session.readDataInto(slab.offset, target);
         this.#platformReads += 1;
         this.#bytesRead += slab.length;
@@ -459,9 +512,7 @@ export class PageCache implements EvictableCacheLike {
           resolved.set(key, entry.bytes);
         }
       }
-    } finally {
-      done();
-    }
+    });
   }
 
   /**
@@ -764,9 +815,11 @@ export class PageCache implements EvictableCacheLike {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#slab = new Uint8Array(0);
     for (const entry of [...this.#byAddress.values()]) this.#drop(entry);
     this.#trimPool(Number.POSITIVE_INFINITY);
     this.#memory?.release(FIXED_CACHE_BYTES);
+    this.#memory?.unregister?.();
   }
 
   #drop(entry: Entry): void {
@@ -833,5 +886,6 @@ export class PageCache implements EvictableCacheLike {
 
   #live(): void {
     if (this.#closed) throw new StoreClosedError();
+    if (this.#memory === null) throw new TypeError("Cache has not been attached");
   }
 }

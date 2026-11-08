@@ -30,6 +30,78 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+/** Fixed run arenas may forget holes, but cannot reuse unknown or live bytes. */
+export const BOUNDED_FREE_ARENA_REACH = [
+  "overflow",
+  "unknown",
+  "tracked first fit",
+  "coalesce",
+  "reopen",
+  "closed",
+] as const;
+
+/** Private metadata and operator spill have independent lifetimes under the same fence. */
+export const METADATA_STORE_REACH = [
+  "rewrite",
+  "spill sweep isolation",
+  "metadata reset isolation",
+  "fenced",
+  "replacement reset",
+] as const;
+
+/** Moving an existing allocation changes ownership, never capacity or the progress reserve. */
+export const CACHE_TRANSFER_REACH = [
+  "at capacity",
+  "queued admission unchanged",
+  "loan capture refused",
+  "ordinary transfer beside loan",
+  "both owners close",
+] as const;
+
+/** A pin-delayed journal backlog changes disk pages, never resident frame capacity. */
+export const METADATA_JOURNAL_REACH = [
+  "multi page input",
+  "cursor protects released owner",
+  "constant time chain reuse",
+  "disk queue backlog",
+  "admitted before frames",
+  "close returns charge",
+] as const;
+
+/** Pair streams keep the same memory reservation across external sort and list set operations. */
+export const METADATA_EXTENTS_REACH = [
+  "external passes",
+  "odd external tail",
+  "exact duplicates coalesce",
+  "difference",
+  "union",
+  "wide offsets",
+  "fixed admission",
+] as const;
+
+/** Every scripted private-journal write failure must preserve its cause and return memory. */
+export const METADATA_WRITE_FAULT_REACH = ["native error preserved", "zero final charge"] as const;
+
+/** Ownership transitions wait across native publication, while synchronous reservations progress. */
+export const STORAGE_MUTATION_REACH = [
+  "reservations during publish",
+  "abort held",
+  "discard held",
+  "seal held",
+  "transitions drain",
+  "audit after interleaving",
+] as const;
+
+/** Native record clipping and list reads stay inside the prepaid response/copy allowance. */
+export const STORAGE_BOUNDED_IO_REACH = [
+  "one boundary response",
+  "bounded copy",
+  "serial record read",
+  "outside bytes preserved",
+  "lazy",
+  "eager",
+] as const;
+
 /** Full-scan shared windows: the default and override must cover cold and resident reads. */
 export const SCAN_WINDOW_RESIDENCY_REACH = [
   "default cold",
@@ -1297,3 +1369,97 @@ export const OWNER_API_BENCH_REACH = [
 ] as const;
 
 export const OWNER_API_ENVELOPE_REACH = ["rows envelope", "done envelope"] as const;
+
+/** Native R25 list pages are decoded from paid slab views, without per-extent objects. */
+export const NATIVE_EXTENT_LIST_REACH = [
+  "full safe integer offsets",
+  "coalesced page reads",
+  "synchronous scalar pairs",
+] as const;
+
+/** R8's queue grows on disk and frees bounded batches without publication-time admission. */
+export const RETIREMENT_TICKETS_REACH = [
+  "pin delayed disk backlog",
+  "source owners released",
+  "full ordinary capacity",
+  "caller loan remains held",
+  "next generation guard",
+  "two bounded batches per ticket",
+] as const;
+
+/** Publication/free progress with a caller that releases ordinary/loan holdings only afterwards. */
+export const STORAGE_PRESSURE_REACH = [
+  "pinned retirement backlog",
+  "no publication admission",
+  "caller loan held",
+  "abort completes at full cap",
+  "audit after reclamation",
+] as const;
+
+/** Every native I/O/task suspension of final validation/publication admits additions, never frees. */
+export const STORAGE_FINAL_HISTORY_REACH = [
+  "tracked hole consumed",
+  "monotonic open and extend",
+  "publishing writer rejects additions",
+  "queued owners retain records",
+  "task suspension",
+  "metadata suspension",
+  "native publish suspension",
+  "audit after all orderings",
+] as const;
+
+export const FLUSH_ROLLBACK_REACH = [
+  "flush held before publication",
+  "rollback removes the new tail",
+  "later committed row survives publication and reopen",
+] as const;
+
+export const ROOT_CREDIT_REACH = [
+  "five overlapping root frames prepaid",
+  "large frame credit and encoded compatibility",
+  "refusal keeps owned roots and charge intact",
+  "independent descriptor accounting",
+  "late snapshot release refunds its owner",
+] as const;
+
+export const STORAGE_SERIAL_INDEX_REACH = [
+  "bounded native index page",
+  "multiple index pages",
+  "exact tiny-record image",
+] as const;
+
+/** Seed598's real loads keep idle ordinary estimates while free-map mutation completes. */
+export const FREE_MAP_PRESSURE_REACH = [
+  "memory",
+  "indexeddb",
+  "startup returned",
+  "startup retained",
+  "one byte ordinary headroom",
+  "caller loan held",
+  "real merge completed",
+  "abort completed",
+  "durable reopen and audit",
+  "closed without charge",
+] as const;
+
+/** Native open uses immutable list pages directly; their credit survives startup lifetime. */
+export const NATIVE_OPEN_REACH = [
+  "no payload materialization",
+  "startup closed with charged descriptors",
+  "caller loan held",
+  "audit first",
+  "unused close has no payload copy",
+  "first publication and reclaim",
+  "reopen and audit",
+  "full safe-integer coordinates",
+  "unordered physical allocations",
+  "all credit returned",
+] as const;
+
+/** Each original crash-sweep seed must finish every backend/placement combination. */
+export const SPACE_CRASH_SWEEP_REACH = [
+  "files/growing",
+  "files/relocating",
+  "IndexedDB/growing",
+  "IndexedDB/relocating",
+] as const;

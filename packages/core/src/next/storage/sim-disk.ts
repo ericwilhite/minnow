@@ -372,8 +372,15 @@ export class SimLease implements OwnerLease {
   }
 
   #close(): void {
-    for (const file of [this.files.log, this.files.data, ...this.files.roots, this.scratch])
-      file.close();
+    for (const file of [
+      this.files.log,
+      this.files.data,
+      ...this.files.roots,
+      this.scratch,
+      this.files.metadata,
+      this.files.metadataIndex,
+    ])
+      file?.close();
   }
 
   /** The ownership check every mutation runs in the step that applies its effect. */
@@ -425,19 +432,22 @@ export class SimBackend implements StorageBackend {
   #openFiles(exclusive: boolean): { files: FileSet; scratch: SimFile } {
     const opened: SimFile[] = [];
     try {
-      for (const name of [...FILE_NAMES, "spill"]) opened.push(this.disk.open(name, exclusive));
+      for (const name of [...FILE_NAMES, "spill", "space-meta", "space-meta-index"])
+        opened.push(this.disk.open(name, exclusive));
     } catch (error) {
       for (const file of opened) file.close();
       throw error;
     }
-    const [log, data, root0, root1, scratch] = opened as [
+    const [log, data, root0, root1, scratch, metadata, metadataIndex] = opened as [
       SimFile,
       SimFile,
       SimFile,
       SimFile,
       SimFile,
+      SimFile,
+      SyncFile,
     ];
-    return { files: { log, data, roots: [root0, root1] }, scratch };
+    return { files: { log, data, roots: [root0, root1], metadata, metadataIndex }, scratch };
   }
 
   async acquire(options: AcquireOptions = {}): Promise<SimLease> {
@@ -452,7 +462,15 @@ export class SimBackend implements StorageBackend {
         return { files, scratch, epoch: ++this.disk.epoch };
       },
       ({ files, scratch }) => {
-        for (const file of [files.log, files.data, ...files.roots, scratch]) file.close();
+        for (const file of [
+          files.log,
+          files.data,
+          ...files.roots,
+          scratch,
+          files.metadata,
+          files.metadataIndex,
+        ])
+          file?.close();
       },
       options,
     );

@@ -55,6 +55,10 @@
  */
 import {
   LOG_HEADER_SLOT_BYTES,
+  METADATA_PAGE_BYTES,
+  METADATA_SMALL_BYTES,
+  type MetadataStore,
+  type ReadDataOptions,
   OwnershipLostError,
   ReleaseUnsettledError,
   StoreClosedError,
@@ -74,6 +78,7 @@ import { ByteStore, inOrder } from "./idb-bytes.js";
 import type { CacheMemory } from "./extents.js";
 import type { IdbDatabaseLike, IdbTransactionLike } from "./idb-like.js";
 import { chooseRoot, encodeRootSlot } from "./root-slot.js";
+import { preparedRoot } from "./root-memory.js";
 
 export interface IndexedDbBackendOptions {
   /**
@@ -520,6 +525,7 @@ export const IDB_BATCH_OPERATIONS = 256;
  * waits for settlement; the caller retains its charge. Other write queues keep their own rules.
  */
 class IdbSession implements StoreSession {
+  readonly rootWriterToken = {};
   readonly epoch: number;
   /** Relaxed writes are queued until their batch commits (`transfer` saves the copy). */
   readonly keepsWrites = true;
@@ -731,14 +737,47 @@ class IdbSession implements StoreSession {
     return (await this.#slots()).current?.root ?? null;
   }
 
+  async readRootSlot(slot: 0 | 1): Promise<Uint8Array | null> {
+    let bytes: Uint8Array | null = null;
+    await this.#read(["roots"], (tx) => {
+      tx.store("roots").get(`slot-${String(slot)}`, (value) => {
+        bytes = slotBytes(value);
+        if (bytes !== null && bytes.length > (1 << 20) + 20)
+          throw new StoreCorruptionError("Root slot exceeds1MiB payload");
+      });
+    });
+    return bytes;
+  }
+
   async readPreviousRoot(): Promise<Uint8Array | null> {
     return (await this.#slots()).previous?.root ?? null;
+  }
+
+  #metadata: MetadataStore | null = null;
+  metadata(): MetadataStore {
+    this.#live();
+    return (this.#metadata ??= new IdbMetadata(this.#lease, () => {
+      this.#live();
+    }));
   }
 
   /** Guarantee 1: every queued write, then the root, in one strict transaction. */
   async publish(root: Uint8Array): Promise<void> {
     this.#mutable();
     this.#lease.guard();
+    const prepared = preparedRoot(this, root);
+    if (prepared !== undefined) {
+      await this.#commit({
+        durability: "strict",
+        spaces: [],
+        extra: ["roots"],
+        write: (tx, next) => {
+          tx.store("roots").put(`slot-${String(prepared.slot)}`, prepared.frame.slotBytes.buffer);
+          next();
+        },
+      });
+      return;
+    }
     const copy = root.slice();
     await this.#commit({
       durability: "strict",
@@ -793,11 +832,11 @@ class IdbSession implements StoreSession {
     return results;
   }
 
-  async readDataInto(offset: number, target: Uint8Array): Promise<void> {
+  async readDataInto(offset: number, target: Uint8Array, options?: ReadDataOptions): Promise<void> {
     this.#live();
     this.#checkData(offset, target.length);
     await this.#read([this.#data.name, this.#data.indexName], (tx) => {
-      this.#data.read(tx, offset, target, () => undefined);
+      this.#data.read(tx, offset, target, () => undefined, options?.serialRecords === true);
     });
   }
 
@@ -1033,6 +1072,60 @@ class IdbSession implements StoreSession {
 }
 
 const slotBytes = (value: unknown) => (value instanceof ArrayBuffer ? new Uint8Array(value) : null);
+
+/** Negative numeric meta keys are owner-private fixed pages. No ByteStore or resident index.
+ * Ordinary spill has a separate namespace; its sweep cannot erase these pages.
+ */
+class IdbMetadata implements MetadataStore {
+  constructor(
+    readonly lease: IdbLease,
+    readonly guard: () => void,
+  ) {}
+  #key(page: number, bytes: Uint8Array): number {
+    if (
+      !Number.isSafeInteger(page) ||
+      page < 0 ||
+      !Number.isSafeInteger((page + 1) * METADATA_PAGE_BYTES)
+    )
+      throw new RangeError("Bad metadata page");
+    if (bytes.byteLength !== METADATA_PAGE_BYTES && bytes.byteLength !== METADATA_SMALL_BYTES)
+      throw new RangeError("Bad metadata frame");
+    return -page - 1;
+  }
+  async read(page: number, target: Uint8Array): Promise<void> {
+    this.guard();
+    const key = this.#key(page, target);
+    if (target.byteLength !== METADATA_PAGE_BYTES) throw new RangeError("Bad metadata read frame");
+    await this.lease.read(["meta"], (tx) =>
+      tx.store("meta").get(key, (value) => {
+        if (
+          !(value instanceof ArrayBuffer) ||
+          (value.byteLength !== METADATA_PAGE_BYTES && value.byteLength !== METADATA_SMALL_BYTES)
+        )
+          throw new StoreCorruptionError("Missing or malformed metadata page");
+        target.fill(0);
+        target.set(new Uint8Array(value));
+      }),
+    );
+  }
+  async write(page: number, bytes: Uint8Array): Promise<void> {
+    this.guard();
+    const key = this.#key(page, bytes);
+    if (
+      !(bytes.buffer instanceof ArrayBuffer) ||
+      bytes.byteOffset !== 0 ||
+      bytes.byteLength !== bytes.buffer.byteLength
+    )
+      throw new TypeError("Metadata writes require a standalone prepaid frame");
+    await this.lease.write(["meta"], "relaxed", (tx) => tx.store("meta").put(key, bytes.buffer));
+  }
+  async reset(): Promise<void> {
+    this.guard();
+    await this.lease.write(["meta"], "relaxed", (tx) =>
+      tx.store("meta").deleteRange({ upper: -1 }),
+    );
+  }
+}
 
 /** The spill store under the epoch fence: a byte space in `spill`, relaxed, never recovered. */
 class IdbScratch implements ScratchSpace {

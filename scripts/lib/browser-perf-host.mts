@@ -14,7 +14,7 @@ import path from "node:path";
 
 export const LANE_DIR_ENV = "MINNOW_BROWSER_PERF_DIR";
 
-/** `$MINNOW_BROWSER_PERF_DIR`, else `~/.cache/minnow-browser-perf`. Never under /tmp by default. */
+/** `$MINNOW_BROWSER_PERF_DIR`, else `minnow-browser-perf` under os.tmpdir() (honours TMPDIR). */
 export function laneDirectory(env: NodeJS.ProcessEnv = process.env): string {
   const configured = env[LANE_DIR_ENV];
   if (configured !== undefined && configured.length > 0) return path.resolve(configured);

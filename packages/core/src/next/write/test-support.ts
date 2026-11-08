@@ -344,3 +344,37 @@ export async function autocommit(
   await receipt.durable;
   return receipt.lsn;
 }
+
+/** Independent test-only inventory of descriptors charged to the write path's metadata owner.
+ * Observe raw space pin calls/releases, including re-point pins and shared older states.
+ * The returned sum is separate from decoded root/directory/run metadata.
+ */
+export function countMetadataPinBytes(harness: Harness): () => number {
+  let bytes = 0;
+  const previous = harness.onSpace;
+  harness.onSpace = (space) => {
+    previous?.(space);
+    const original = space.pin.bind(space);
+    space.pin = (label, budget) => {
+      const pin = original(label, budget);
+      if (budget === undefined) return pin;
+      const charge = 320 + 2 * (label ?? "pin").length; // RootPin contract, independently inventoried.
+      bytes += charge;
+      let released = false;
+      return {
+        generation: pin.generation,
+        label: pin.label,
+        get released() {
+          return pin.released;
+        },
+        release: () => {
+          if (released) return;
+          released = true;
+          bytes -= charge;
+          pin.release();
+        },
+      };
+    };
+  };
+  return () => bytes;
+}

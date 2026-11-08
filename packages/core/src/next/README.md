@@ -150,16 +150,23 @@ are exercised without requiring host contention.
 - Every mutation is async and checks ownership in the same step that applies its effect. A fenced
   owner changes nothing.
 - The store is four long-lived files: log, data space, and two root slots. OPFS adds the spill
-  scratch file and the epoch counter (two checksummed slots, flushed before a lease exists), all six
-  opened under the same fence. Extents are reused in place inside the data space.
+  scratch file, the epoch counter (two checksummed slots, flushed before a lease exists), and an
+  owner-private `space-meta` and `space-meta-index` files, all eight opened under the same fence. Extents are reused in place inside the data space.
 - `publish` is atomic and durable: it flushes data, then writes the inactive root slot.
 - The log has a flush barrier and two header slots.
 - **The extent space** (`extents.ts`) is the only caller of the data-space calls and of `publish`.
   - A writer reserves extents, appends checksummed blobs, seals, and either publishes once or
-    aborts. Abort frees at once; a crash before publish leaves orphans that open frees.
+    aborts. Abort frees after in-flight writes and its queued ownership transition finish;
+    a crash before publish leaves orphans that open frees.
   - `publish(root, { writers, retired })` is serialized and atomic. Two-generation reclaim: retired
     extents are reused only after the _next_ publish is durable and no pin of an older generation
     remains, so the current and previous roots always read intact.
+  - One ownership-transition barrier covers final validation and native publication. Abort,
+    discard, seal, relocation and free join it and retain ownership while queued. Synchronous
+    `open`/`extend` reservations stay available: they consume tracked holes or contiguous EOF
+    and add ownership. Supplied publishing writers have no open builders or active operations.
+    Close drains accepted work before releasing the cache; late pin releases do no backend work.
+    Audits restart on mutation-epoch changes, including reservations and physical writes.
   - A rejected publish is indeterminate: the space keeps everything allocated and refuses writes
     until the owner reopens.
   - Free space is rebuilt on open from the extents the current and previous roots reach, first
@@ -2009,6 +2016,182 @@ and close releases that reservation. List readers keep decoded objects charged a
 suspension and release them when the consumer finishes or stops. Startup carries a single page
 cursor across read batches, so traversing the root’s page references is linear in page count.
 
+### Bounded free-run arena
+
+`storage/bounded-free-space.ts` is the live extent space's fixed-arena allocator.
+The arena is admitted once,
+sized with headroom from the initial run count, between 32 and 256 KiB. It never
+grows its backing buffer during allocation or release.
+
+At capacity it forgets the smallest free runs and reports `untrackedFreeBytes`.
+Allocation remains synchronous and chooses the lowest fit among tracked runs,
+or extends EOF. Forgotten ranges are never reused. Their complement is unknown,
+not proof that bytes are allocated: releases require an independent ownership
+proof. This distinction must also govern publication validation and audits.
+
+Extreme fragmentation can waste free space until reopen. Rebuilding from kept
+root lists reconsiders every gap; debt can remain if fragmentation still exceeds
+the capped arena. Full recovery follows when coalescing brings the gap count
+within capacity. No current-root-only background rebuild is enabled.
+
+### Atomic memory ownership transfer
+
+`CacheMemory.takeFrom` transfers an existing ordinary buffer allocation from a
+live grant of the same governor to a registered cache owner. It changes neither
+total charged bytes nor peak usage, and never drains the admission queue between
+owners. The source loses both allocated and held bytes; its caller must stop
+using and freeing that allocation. The destination releases the charge at the
+end of its lifetime. Progress-loan capacity remains with the source and cannot
+become permanent metadata. Foreign, closed or insufficient sources fail without
+changing either owner. This additive operation is optional for structural test
+budgets; callers must check support before depending on an atomic handoff.
+
+### Owner-private metadata backing
+
+The store session exposes fixed 60 KiB metadata pages independently of operator
+spill. OPFS uses fenced `space-meta` data and `space-meta-index` compact-directory handles. IndexedDB uses negative numeric
+keys in `meta`, with one direct, epoch-checked request per page; it has no resident
+record directory. Writes borrow a prepaid frame until the transaction settles.
+IndexedDB requires a standalone frame so structured cloning cannot copy a larger
+underlying pool. Callers account for the native read response as well as their
+own frame.
+
+These pages are reconstructible scratch, never a durable root or a recovery
+authority. The extent-space opener will reset them under its fence before use;
+the operator-spill sweep leaves them alone. Their page encoding is private to
+one owner and needs no stored-format migration. The live space stores saved root
+lists, retirement tickets and reclaim worklists here.
+
+### Prepaid metadata journal
+
+`storage/metadata-journal.ts` adds a private page-chain primitive with a 512 KiB
+workspace reservation. Source phases expose three 60 KiB frames; merge phases
+expose four, and native-release phases expose two. The inventory includes one
+256 KiB native record response, one bounded 60 KiB boundary copy and bounded
+release-range vectors. Six read-only metadata views and raw-list cursor windows
+can borrow the separately prepaid 1 MiB read slab. Native metadata writes still
+require standalone whole-buffer frames. Eight compact control pages have a fixed direct-mapped cache, covered by W;
+payload reads always use the native store and verify checksums. Callers serialize workspace
+use before taking the mutation barrier, and never overlap source and reclaim
+phases. Frames and their borrowed slices cannot escape a phase. Journal cursors
+and writers retain scalar slots and phase identities, rather than old buffers.
+
+Descriptors, reference counts and queue links live on disk. A cursor retains its
+chain until close; releasing the caller's reference cannot make an active
+cursor's pages reusable. Returning a whole chain splices its tail onto a free
+stack, without a resident page directory. Cancellation can return a partial
+writer's chain, including a just-allocated empty page. A native write error
+fails the journal closed; reopening resets it and uses durable roots instead.
+The initial grant's existing charge moves atomically to the space's lifetime
+owner and is returned on close.
+
+`storage/metadata-extents.ts` provides incremental pair spooling, a fixed-buffer
+external sort and streaming union/difference. Sorted runs form a disk queue with
+scalar head and tail. Exact duplicates may coalesce for root reachability;
+retirement inputs refuse duplicates. Offsets keep their full safe-integer
+precision. Every copy/sort/merge loop uses the shared task clock. Cancellation
+is checked after the final descriptor write as well, and returns the unused
+output chain. Native failures preserve their original error while cleanup
+returns the resident workspace.
+
+The live space uses these streams for root provenance, ticket eligibility and
+bounded reclaim. Sorting a candidate does not authorize it: retirement must equal
+the immutable current/new root difference, and incoming ranges must belong to
+the current root or supplied sealed writers. The lossy map's complement grants
+no authority.
+
+The fixed read slab is allocated only after its cache charge succeeds. A borrowed
+slab scope serializes with ordinary cache misses and drains before close returns
+its charge. Raw-list reads request IndexedDB records sequentially. Boundary
+trimming consumes one old record response at a time and writes slices of at most
+60 KiB, preserving the existing byte-record encoding and transaction atomicity.
+These I/O limits make the journal inventory enforceable; they do not authorize
+retirement or replace the live-space integration tests.
+
+### Slab-backed reconstruction components
+
+The capped free-run arena can borrow a temporary typed view of the paid read
+slab, then copy its bounded tracked runs into one admitted lifetime arena.
+Copying checks the shared task clock in 128-run chunks. The existing ordinary
+charge transfers atomically to the cache owner; publication never grows it.
+A borrowed temporary arena returns no slab charge when closed.
+
+`storage/native-extent-list.ts` decodes payload pages through a 192 KiB view of
+that slab. It reads up to two nearby pages together, verifies each checksum,
+header, coordinate and cross-page order, then exposes one scalar offset/length
+pair at a time. It creates no decoded per-extent objects. Between page reads and
+shared-clock yields, iteration is synchronous. The input page descriptors stay
+with their admitted caller; the live space does not duplicate that descriptor
+list during publication.
+
+### Disk-derived retirement composition
+
+Ordinary listed-root startup merges native payload pages and their physical
+page allocations straight into the temporary slab arena. Physical-page ordering
+uses bounded typed views in S, or external sorting of page coordinates when they
+exceed those views. Payload extents are not copied into private storage at open.
+A payload naming its own list-page allocation is refused. Generic callbacks
+retain the bounded private-chain/external-sort path.
+
+The two immutable descriptor leases transfer their admitted startup credit into
+C and remain valid after the startup grant closes. `storage/extent-snapshot.ts`
+materializes their private pair chains only when the first publication or audit
+needs them. This happens under the workspace lock, before the final publication
+barrier, without new admission. Generation-zero retirement debt stays visible in
+stats and becomes a disk ticket before any publication can make it reclaimable.
+Unused close releases the leases without writing payload chains. The existing
+fenced scratch reset and full audit/test-open checks remain. The first operation
+that needs the chains pays their copy cost; recovery that publishes pays it
+before ready. No background task is scheduled to hide that cost.
+
+`storage/retirement-tickets.ts` keeps its queue links, generations and snapshot
+handles on disk. Provisional tail links are committed only with their native
+root publication, or unlinked on abort. Reclaim observes both R8 guards,
+materializes the full difference before any data release, then drains at most
+256 ranges per batch. Snapshot references outlive their original owner until
+the last ticket finishes. Publication and audit serialize workspace use. A
+contending publication lets audit flush a bounded prefix and await its external
+producer outside the workspace; the audit restarts on mutation-epoch changes.
+No publication holds the workspace waiting for caller/governor memory.
+
+The live composition can borrow private sort/merge inputs and sort scratch from
+the paid read slab. Only two standalone control/output frames are then owned.
+W also covers one 256 KiB native response, a 60 KiB boundary copy, three bounded
+256-range vectors, compact I/O and the fixed control cache (519,104 bytes).
+Serial native-list reads also bound index selection to128 entries (16KiB allowance),
+so their source phase is412,608 bytes. Private merge/sort is318,400 bytes. Full physical
+audit uses W with no cursor frames (404,416 bytes). All fit512KiB. Startup's private cache may admit
+its final arena synchronously while holding its temporary slab view; the cache
+is not exposed yet and this never awaits an admission or a caller.
+
+### Root and snapshot credit primitives
+
+`storage/root-memory.ts` prepays a 128 KiB bank for five overlapping roots up to
+18 KiB each, including current/previous, preparation and the two roots captured
+by one serialized audit. Larger frames move ordinary caller credit before
+allocation. Copies use bounded task-clock chunks. Root frames carry the unchanged
+root-slot header/checksum; native publication borrows that frame until settlement
+without rereading slots or making another whole-root copy. Startup processes one
+native slot response at a time before allocating the prepaid read slab.
+
+`storage/root-pins.ts` holds pins in an intrusive generation-ordered list, with
+no per-generation Maps. Each descriptor and its label are charged before
+allocation to the supplied snapshot budget, or a separate non-evictable owner.
+The caller keeps its budget alive until release. Release is idempotent and
+returns its credit even after the space closes. The live bound is S + R + W + C:
+S is the two fixed 1 MiB slabs, R the 32–256 KiB arena, W the 512 KiB workspace,
+and C the root bank, larger owned frames, admitted native-list descriptor leases
+and snapshot descriptors. Caller-owned
+snapshot budgets stay live until release. `stats.retainedBytes` reports the
+space-owned charges; caller-budget pin credit remains with that caller.
+
+`write/free-map-pressure.test.ts` generates the review's seed598 durable-load shapes
+on memory and the IndexedDB adapter, saturating ordinary capacity during the native
+allocator release. Trim and abort consume the prepaid arena without a new charge,
+including beside a caller loan. It checks real merge completion, complete rows,
+reopen, audit and close accounting. This storage test scopes pressure to allocator
+mutation; it does not claim the write path's separate metadata admission policy is fixed.
+
 ### R25 startup measurement
 
 `MINNOW_NEXT_STORAGE_REOPEN=1` enables the Chromium storage reopen lane in
@@ -2034,16 +2217,21 @@ group roots, directory pages and table statistics, not a full SQL workload.
 R25 preparation and startup use the worker-wide R23.5 task clock reexported by
 `exec/pipeline.ts` (implemented in `task.ts` so storage does not depend on the executor).
 No operation entry or resolved read restarts it. Bounded loops check the deadline, yield a real
-task when due, and check cancellation on resume. Delta sorting uses an in-place sliced heapsort. Normal listed-root startup stream-merges both
-ordered roots directly into the free map, decoding one page per root at a time. Scattered list-page
-allocations use seven bounded radix passes over page references, so reconstruction is O(extents +
-list pages), with no extent Maps or comparison sort. Retained free-run arrays and retirement
-state reserve conservative capacity (including growth overlap) before allocating. Startup
-transfers that charge to a non-evictable lifetime handle, released at space close. Capacity
-charges remain at their high-water mark after entries are deleted. Audits serialize with
-publication so their roots and allocator belong to one generation. Unordered reachability callbacks and full
-audit/test-open validation retain their separate collection/sort path. All paths cooperate with
-the shared clock and cancellation.
+task when due, and check cancellation on resume. Delta sorting uses an in-place sliced heapsort. Normal listed-root startup decodes
+both native payload lists incrementally and merges them directly into the free-map
+arena. The physical page index borrows bounded typed S views; oversized page
+directories sort only their page coordinates externally. No payload chain is
+materialized until publication or audit needs immutable retirement streams.
+The allocator union counts previous-only bytes in the same pass. Pair iteration
+stays synchronous between native reads and shared-clock slice checks. Payload
+work is O(extents); physical page ordering is O(list pages × log(list pages)).
+There are no extent Maps or resident retirement index. Native list pages remain
+protected until their disk-derived ticket finishes. Every release batch has at
+most 256 ranges; allocation remains synchronous among the tracked free runs.
+Extreme fragmentation may leave untracked-free debt across reopen until the
+gap count fits the arena. Audits use one mutation epoch and restart on any change;
+unordered callbacks and audit inputs use bounded disk sorting rather than a
+whole-input resident collection. All loops use the shared clock and cancellation.
 Timer/cancellation regressions include cached reads, immediate writes and two preparations
 sharing one task's elapsed time.
 
