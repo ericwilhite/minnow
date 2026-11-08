@@ -375,14 +375,14 @@ export function listedRootExtents(
   return Object.assign(listed, {
     ordered: true,
     openList(root: Uint8Array, budget: ByteBudget) {
-      const manifest = codecs.decodeRoot(root, budget);
+      const { value, charge } = codecs.decodeRoot(root, budget);
       let held = true;
       return {
-        list: manifest.value.extentList,
+        list: value.extentList,
         release() {
           if (held) {
             held = false;
-            budget.free(manifest.charge);
+            budget.free(charge);
           }
         },
       };

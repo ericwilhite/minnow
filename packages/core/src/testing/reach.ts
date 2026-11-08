@@ -1285,3 +1285,17 @@ export const FREE_MAP_PRESSURE_REACH = [
   "durable reopen and audit",
   "closed without charge",
 ] as const;
+
+/** Native open uses immutable list pages directly; their credit survives startup lifetime. */
+export const NATIVE_OPEN_REACH = [
+  "no payload materialization",
+  "startup closed with charged descriptors",
+  "caller loan held",
+  "audit first",
+  "unused close has no payload copy",
+  "first publication and reclaim",
+  "reopen and audit",
+  "full safe-integer coordinates",
+  "unordered physical allocations",
+  "all credit returned",
+] as const;

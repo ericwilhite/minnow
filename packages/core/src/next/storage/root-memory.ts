@@ -1,4 +1,4 @@
-/** Charged root copies. The prepaid bank covers five small frames (current, previous,
+/** Charged root copies and startup codec leases. The prepaid bank covers five small frames (current, previous,
  * preparation, and two captured by the one serialized audit) plus owner/control headers.
  * Oversized roots need ordinary caller credit before allocating; no admission is awaited.
  * Native publication borrows the frame itself, never encoding/copying it a second time.
@@ -50,6 +50,49 @@ export class RootMemory {
   get bytes(): number {
     return (this.#closed ? 0 : ROOT_BANK_BYTES) + this.#extra;
   }
+  /** Two startup codec leases can outlive their grant. Their existing ordinary allocations
+   * move atomically into C; release never calls a closed startup owner. Control headers fit
+   * the root bank's fixed allowance. No later allocation is allowed through the lease.
+   */
+  leaseBudget(source: ByteBudget): ByteBudget & { transfer(): void; close(): void } {
+    let bytes = 0,
+      moved = false,
+      closed = false;
+    const budget = {
+      allocate: (n: number): boolean => {
+        if (closed || moved) throw new TypeError("Root descriptor lease cannot grow");
+        if (!source.allocate(n)) return false;
+        bytes += n;
+        return true;
+      },
+      free: (n: number): void => {
+        if (n > bytes) throw new RangeError("Root descriptor lease freed too much");
+        bytes -= n;
+        if (moved) this.refund(n, false);
+        else source.free(n);
+      },
+      transfer: (): void => {
+        if (closed || moved || this.#closed) throw new TypeError("Root descriptor lease is closed");
+        if (bytes !== 0) {
+          const accepted =
+            this.memory.takeFrom === undefined
+              ? this.memory.charge(bytes)
+              : this.memory.takeFrom(source.ordinarySource?.() ?? source, bytes);
+          if (!accepted) throw new ReadDeniedError(bytes);
+          if (this.memory.takeFrom === undefined) source.free(bytes);
+          this.#extra += bytes;
+        }
+        moved = true;
+      },
+      close: (): void => {
+        if (closed) return;
+        budget.free(bytes);
+        closed = true;
+      },
+    };
+    return budget;
+  }
+
   async copy(bytes: Uint8Array, budget: ByteBudget, work?: TaskWork): Promise<RootFrame> {
     if (this.#closed) throw new TypeError("Root memory closed");
     const charge = bytes.length + ROOT_HEADER + FRAME_OVERHEAD;

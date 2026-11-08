@@ -140,7 +140,8 @@
  *
  * ## Memory
  * S is the fixed read/write slabs (1MiB each), R a prepaid32–256KiB run arena,
- * W a prepaid512KiB cursor/journal/reclaim workspace, and C root/snapshot credit. Retirement
+ * W a prepaid512KiB cursor/journal/reclaim workspace, and C root/snapshot credit,
+ * including admitted native-list descriptors until private snapshots are needed. Retirement
  * state is a disk queue; reclaim derives the immutable before/after difference in bounded
  * batches, with list pages protected until completion. Publication and frees never grow R/W
  * or await admission. Encoded cached blobs remain separately evictable by the governor.
@@ -289,7 +290,9 @@ export type ReachableExtents = ((
 ) => AsyncIterable<ExtentRef | BlobRef> | Iterable<ExtentRef | BlobRef>) & {
   /** Emits nondecreasing offsets; startup validates this promise before reclaiming. */
   readonly ordered?: boolean;
-  /** R25's immutable descriptors, admitted by the format reader before they are returned. */
+  /** R25's owned, immutable descriptors, admitted before return and stable until release.
+   * The space may transfer the budget's existing credit and retain this lease beyond startup.
+   */
   readonly openList?: (
     root: Uint8Array,
     budget: ByteBudget,
@@ -325,10 +328,12 @@ export interface OpenSpaceOptions extends TaskWork {
  * Opens the space over a freshly opened store session, before the write path's log scan
  * (storage/contract.ts "Startup order"): reads the current and previous roots, reads what each
  * reaches (its extent list, ruling R25), builds
- * the free map, retires
- * what only the previous root reaches (a generation-zero disk ticket), returns the free tail. The
- * startup reads the kept roots' list pages, coalesced; audit/test open separately performs the
- * full O(groups + index runs) cross-check. Owner-private metadata is reset/written; durable
+ * the free map, records what only the previous root reaches as generation-zero debt,
+ * and returns the free tail. Native lists stream directly into the arena; admitted descriptor
+ * leases remain immutable until the first publication/audit creates the private chains and
+ * initial disk ticket. Generic callbacks use private chains at open. Startup reads list pages,
+ * coalesced; audit/test open separately performs the full O(groups + index runs) cross-check.
+ * Owner-private metadata is reset; durable
  * roots/data are unchanged except for the proven free-tail release.
  * Implemented by `openExtentSpace` (space.ts).
  */

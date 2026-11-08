@@ -51,6 +51,7 @@ import {
   saveNativeList,
   saveExtentInput,
   reconstructState,
+  reconstructNativeState,
   disposeSnapshot,
 } from "./extent-snapshot.js";
 import { RetirementTickets } from "./retirement-tickets.js";
@@ -94,6 +95,48 @@ function listLease(
     return { list: supplied ?? [], release: () => undefined };
   return source.openList?.(root, budget) ?? null;
 }
+/** Format descriptors are immutable and admitted before return. Keep their credit in C,
+ * instead of keeping the startup grant alive or decoding again during publication.
+ */
+function retainedListLease(
+  root: Uint8Array | null,
+  source: ReachableExtents,
+  startup: ByteBudget,
+  roots: RootMemory,
+): ListLease | null {
+  const budget = roots.leaseBudget(startup);
+  let lease: ListLease | null = null;
+  try {
+    lease = listLease(root, source, budget);
+    if (lease === null) {
+      budget.close();
+      return null;
+    }
+    budget.transfer();
+    const owned = lease;
+    let held = true;
+    return {
+      list: owned.list,
+      release() {
+        if (!held) return;
+        held = false;
+        try {
+          owned.release();
+        } finally {
+          budget.close();
+        }
+      },
+    };
+  } catch (error) {
+    try {
+      lease?.release();
+    } finally {
+      budget.close();
+    }
+    throw error;
+  }
+}
+
 function rootInput(
   root: Uint8Array | null,
   source: ReachableExtents,
@@ -144,6 +187,8 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
   let workspace: MetadataWorkspace | null = null,
     map: BoundedFreeSpaceMap | null = null,
     opened: Space | null = null;
+  let initialCurrent: ListLease | null = null,
+    initialPrevious: ListLease | null = null;
   try {
     roots = RootMemory.create(options.registerCache);
     const rootMemory = roots;
@@ -190,35 +235,63 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
       read: (refs: readonly BlobRef[], read: ReadOptions) => cache.read(refs, read),
       peek: (ref: BlobRef, peek?: PeekOptions) => cache.peek(ref, peek),
     };
-    const current = await snapshotRoot(
-      root,
-      options.reachable,
-      reader,
-      options.budget,
-      dataLength,
-      journal,
-      cache,
-      options,
-    );
-    const previous = await snapshotRoot(
+    initialCurrent = retainedListLease(root, options.reachable, options.budget, rootMemory);
+    initialPrevious = retainedListLease(
       previousRoot,
       options.reachable,
-      reader,
       options.budget,
-      dataLength,
-      journal,
-      cache,
-      options,
+      rootMemory,
     );
-    const reconstruction = await reconstructState(
-      journal,
-      cache,
-      current,
-      previous,
-      dataLength,
-      options.budget,
-      options,
-    );
+    let current = 0,
+      previous = 0;
+    let initialLists: readonly [ListLease, ListLease] | null = null;
+    let reconstruction: Awaited<ReturnType<typeof reconstructState>>;
+    if (initialCurrent !== null && initialPrevious !== null) {
+      initialLists = [initialCurrent, initialPrevious];
+      reconstruction = await reconstructNativeState(
+        journal,
+        cache,
+        initialCurrent.list,
+        initialPrevious.list,
+        dataLength,
+        options.budget,
+        options,
+      );
+    } else {
+      initialCurrent?.release();
+      initialCurrent = null;
+      initialPrevious?.release();
+      initialPrevious = null;
+      current = await snapshotRoot(
+        root,
+        options.reachable,
+        reader,
+        options.budget,
+        dataLength,
+        journal,
+        cache,
+        options,
+      );
+      previous = await snapshotRoot(
+        previousRoot,
+        options.reachable,
+        reader,
+        options.budget,
+        dataLength,
+        journal,
+        cache,
+        options,
+      );
+      reconstruction = await reconstructState(
+        journal,
+        cache,
+        current,
+        previous,
+        dataLength,
+        options.budget,
+        options,
+      );
+    }
     map = reconstruction.map;
     workspace.transfer(options.registerCache);
     map.transfer(options.registerCache);
@@ -237,8 +310,11 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
       previousFrame,
       nextSlot,
       nextSequence,
+      initialLists,
     );
     opened = space;
+    initialCurrent = null;
+    initialPrevious = null;
     // Semantic verification precedes every release/truncate. A structurally valid but incomplete
     // list must not destroy the very extent whose full walk proves it incomplete.
     if (options.verifyAtOpen === true && options.walk !== undefined) await space.audit();
@@ -249,6 +325,11 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
   } catch (error) {
     if (opened !== null) await opened.close();
     else {
+      try {
+        initialCurrent?.release();
+      } finally {
+        initialPrevious?.release();
+      }
       currentFrame?.release();
       previousFrame?.release();
       roots?.close();
@@ -274,6 +355,8 @@ class Space implements ExtentSpace {
   readonly #tickets: RetirementTickets;
   #currentSnapshot: number;
   #previousSnapshot: number;
+  #initialRetiredBytes = 0;
+  #initialized = false;
   #reclaimWanted = false;
   #reclaimPending: Promise<void> | null = null;
   /** Writers not yet published or aborted. */
@@ -316,6 +399,7 @@ class Space implements ExtentSpace {
     previousFrame: RootFrame | null,
     private nextSlot: 0 | 1,
     private nextSequence: number,
+    private initialLists: readonly [ListLease, ListLease] | null,
   ) {
     this.#session = session;
     this.#reachable = options.reachable;
@@ -335,16 +419,73 @@ class Space implements ExtentSpace {
   }
 
   async initialize(previousOnlyBytes: number): Promise<void> {
-    await this.#metadata.run(async () => {
-      await this.#tickets.prepare(
-        0,
-        this.#previousSnapshot,
-        this.#currentSnapshot,
-        previousOnlyBytes,
-      );
-      this.#tickets.commit();
-    });
+    this.#initialRetiredBytes = previousOnlyBytes;
+    this.#initialized = true;
+    if (this.initialLists === null) await this.#metadata.run(() => this.#prepareInitialTicket());
     await this.mutate((guard) => this.#releaseTail(guard));
+  }
+
+  async #prepareInitialTicket(): Promise<void> {
+    await this.#tickets.prepare(
+      0,
+      this.#previousSnapshot,
+      this.#currentSnapshot,
+      this.#initialRetiredBytes,
+    );
+    this.#tickets.commit();
+    this.#initialRetiredBytes = 0;
+  }
+
+  /** The two native lists remain immutable and rooted until this complete handoff. This runs
+   * under the workspace lock, before publication's final barrier. It uses only prepaid S/W,
+   * never a closed startup grant or a new admission. Generation zero cannot reclaim yet.
+   */
+  async #ensureInitialSnapshots(work?: TaskWork): Promise<void> {
+    const lists = this.initialLists;
+    if (lists === null) return;
+    if (this.generation !== 0) throw new TypeError("Native initial lists outlived generation zero");
+    let current = 0,
+      previous = 0,
+      failed = false;
+    try {
+      current = await saveNativeList(
+        this.journal,
+        this.#cache,
+        lists[0].list,
+        this.#fileLength,
+        work,
+      );
+      previous = await saveNativeList(
+        this.journal,
+        this.#cache,
+        lists[1].list,
+        this.#fileLength,
+        work,
+      );
+      if (this.#initialized) {
+        await this.#tickets.prepare(0, previous, current, this.#initialRetiredBytes);
+        work?.signal?.throwIfAborted();
+        this.#tickets.commit();
+        this.#initialRetiredBytes = 0;
+      }
+      this.#currentSnapshot = current;
+      this.#previousSnapshot = previous;
+      current = 0;
+      previous = 0;
+      this.initialLists = null;
+      try {
+        lists[0].release();
+      } finally {
+        lists[1].release();
+      }
+    } catch (error) {
+      failed = true;
+      if (this.#initialized) await this.#tickets.abort().catch(() => undefined);
+      if (this.journal.failed) this.fail(error);
+      throw error;
+    } finally {
+      await discardPrepared(this.journal, [current, previous], failed);
+    }
   }
 
   get root(): Uint8Array | null {
@@ -370,7 +511,7 @@ class Space implements ExtentSpace {
   get stats(): SpaceStats {
     let writerBytes = 0;
     for (const writer of this.writers) writerBytes += writer.bytes;
-    const retired = this.#tickets.waitingBytes - this.#releasingRetired;
+    const retired = this.#tickets.waitingBytes + this.#initialRetiredBytes - this.#releasingRetired;
     return {
       dataBytes: this.#map.end,
       freeBytes: this.#map.freeBytes,
@@ -730,6 +871,7 @@ class Space implements ExtentSpace {
             undefined,
             true,
           );
+          await this.#ensureInitialSnapshots(change);
           return await this.#cache.withReadSlab((slab) =>
             this.mutate((guard) =>
               this.#publishNow(
@@ -982,6 +1124,7 @@ class Space implements ExtentSpace {
     // Physical audit gets W alone, before any frame phase. It never awaits a caller callback.
     await this.#metadata.run(async () => {
       await this.#session.audit?.();
+      await this.#ensureInitialSnapshots();
     });
     const captured = await this.#metadata.run(() =>
       this.journal.workspace.run("spool", async () => {
@@ -1234,6 +1377,13 @@ class Space implements ExtentSpace {
     this.#previousFrame?.release();
     this.#rootFrame = null;
     this.#previousFrame = null;
+    const initial = this.initialLists;
+    this.initialLists = null;
+    try {
+      initial?.[0].release();
+    } finally {
+      initial?.[1].release();
+    }
     this.roots.close();
     this.#ledger.close();
     this.#cache.close();

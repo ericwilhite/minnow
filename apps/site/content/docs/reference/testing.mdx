@@ -1619,6 +1619,15 @@ merges, exact rows, recovery, audit and complete charge cleanup. Pressure is sco
 allocator mutation; the separate write-path metadata and merge admission policy has its
 own tests. The full review workload can expose that separate policy after storage succeeds.
 
+Native-open histories require ordinary listed-root open to write no payload pair chains.
+They close the startup grant, hold the remaining ordinary capacity (sometimes with a loan),
+and require the first publication or audit to complete with descriptor credit still charged.
+Refusal, transfer failure, cancellation during decoding/handoff, native write failure and
+unused close return every charge. A large-page-directory case allows sorting only physical
+page coordinates; payload coordinates may not appear in private writes. Timer checks cover
+immediately resolved reads. The first publication or audit pays the deferred chain-copy cost;
+recovery that publishes pays it before ready. Generic callbacks keep their existing path.
+
 Disk-derived retirement tests keep the before/after list pages protected through complete
 worklist construction, then release at most 256 ranges per batch. They independently check
 fragmentation debt and recovery when the gaps coalesce within the arena capacity. Private
@@ -1672,9 +1681,11 @@ extents or copy the whole producer before slicing must fail.
 Ordered-root startup regressions require a streaming union without the unordered free-map sort,
 validate scattered list-page allocations, and refuse overlapping, descending or inconsistent
 extents before reclaim. Full audit and test-build semantic checks remain enabled separately.
-Retained free-run and previous-only retirement capacity is admitted before allocation, including
-old/new backing-store overlap. The charge transfers from the startup grant to the space and
-remains until close; deleting entries does not assume the JavaScript containers release capacity.
+The lifetime free-run arena is admitted before allocation, including its overlap with the
+prepaid reconstruction view. Its charge transfers from startup to the space and remains until
+close. Previous-only retirement streams through disk tickets; it has no resident per-extent
+index. Immutable native-list descriptors retain their transferred codec charge until handoff
+or close. Deleting entries does not assume JavaScript containers release capacity.
 Finite-budget regressions cover refusal, transfer refusal, cancellation, fragmentation,
 previous-root retirement and cleanup. Audits restart when their mutation epoch changes,
 including a raced failure, so publication, reservation and writer transitions cannot make

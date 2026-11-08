@@ -1435,7 +1435,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
    */
   readonly #pendingIndexes = new Map<number, { readonly tableId: number; readonly lsn: number }>();
 
-  /** Pins use the metadata owner's admission policy, including its idle-credit reclamation. */
+  /** Pins use the metadata owner's admission policy. */
   readonly #pinBudget = {
     ordinarySource: () => this.#metadataGrant,
     allocate: (bytes: number) => {

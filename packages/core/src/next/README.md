@@ -2008,12 +2008,23 @@ list during publication.
 
 ### Disk-derived retirement composition
 
-`storage/extent-snapshot.ts` streams native payload pages and externally ordered
-physical page allocations into an immutable private pair chain. It refuses a
-payload that names its own list-page allocation. Generic unordered callbacks
-use the bounded external-sort adapter. Startup merges both saved roots into a
-temporary slab arena and makes one lifetime arena reservation, with no resident
-previous-only set.
+Ordinary listed-root startup merges native payload pages and their physical
+page allocations straight into the temporary slab arena. Physical-page ordering
+uses bounded typed views in S, or external sorting of page coordinates when they
+exceed those views. Payload extents are not copied into private storage at open.
+A payload naming its own list-page allocation is refused. Generic callbacks
+retain the bounded private-chain/external-sort path.
+
+The two immutable descriptor leases transfer their admitted startup credit into
+C and remain valid after the startup grant closes. `storage/extent-snapshot.ts`
+materializes their private pair chains only when the first publication or audit
+needs them. This happens under the workspace lock, before the final publication
+barrier, without new admission. Generation-zero retirement debt stays visible in
+stats and becomes a disk ticket before any publication can make it reclaimable.
+Unused close releases the leases without writing payload chains. The existing
+fenced scratch reset and full audit/test-open checks remain. The first operation
+that needs the chains pays their copy cost; recovery that publishes pays it
+before ready. No background task is scheduled to hide that cost.
 
 `storage/retirement-tickets.ts` keeps its queue links, generations and snapshot
 handles on disk. Provisional tail links are committed only with their native
@@ -2051,7 +2062,8 @@ allocation to the supplied snapshot budget, or a separate non-evictable owner.
 The caller keeps its budget alive until release. Release is idempotent and
 returns its credit even after the space closes. The live bound is S + R + W + C:
 S is the two fixed 1 MiB slabs, R the 32–256 KiB arena, W the 512 KiB workspace,
-and C the root bank, larger owned frames and snapshot descriptors. Caller-owned
+and C the root bank, larger owned frames, admitted native-list descriptor leases
+and snapshot descriptors. Caller-owned
 snapshot budgets stay live until release. `stats.retainedBytes` reports the
 space-owned charges; caller-budget pin credit remains with that caller.
 
@@ -2087,14 +2099,14 @@ group roots, directory pages and table statistics, not a full SQL workload.
 R25 preparation and startup use the worker-wide R23.5 task clock reexported by
 `exec/pipeline.ts` (implemented in `task.ts` so storage does not depend on the executor).
 No operation entry or resolved read restarts it. Bounded loops check the deadline, yield a real
-task when due, and check cancellation on resume. Delta sorting uses an in-place sliced heapsort. Normal listed-root startup decodes both payload lists incrementally into private
-immutable pair chains, orders the physical list-page allocations with bounded
-external sorting, and merges the chains directly into the free-map arena.
-Native payload pairs merge directly with the ordered physical page stream into the saved chain;
-they are not first written to another payload chain. The allocator union also counts the
-previous-only bytes for its initial ticket, so initialization does not rescan both chains.
-Pair iteration stays synchronous between native reads and shared-clock slice checks.
-Payload work is O(extents); physical page ordering is O(list pages × log(list pages)).
+task when due, and check cancellation on resume. Delta sorting uses an in-place sliced heapsort. Normal listed-root startup decodes
+both native payload lists incrementally and merges them directly into the free-map
+arena. The physical page index borrows bounded typed S views; oversized page
+directories sort only their page coordinates externally. No payload chain is
+materialized until publication or audit needs immutable retirement streams.
+The allocator union counts previous-only bytes in the same pass. Pair iteration
+stays synchronous between native reads and shared-clock slice checks. Payload
+work is O(extents); physical page ordering is O(list pages × log(list pages)).
 There are no extent Maps or resident retirement index. Native list pages remain
 protected until their disk-derived ticket finishes. Every release batch has at
 most 256 ranges; allocation remains synchronous among the tracked free runs.
