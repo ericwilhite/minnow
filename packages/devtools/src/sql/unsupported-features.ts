@@ -356,7 +356,7 @@ export const unsupportedFeatures: readonly UnsupportedFeatureRecord[] = [
     id: "window.frame-negative-offset",
     error: "frame starting offset must not be negative",
     notes:
-      'Negative RANGE offsets are rejected at parse time (22013), including empty or NULL-only input and LIMIT 0. PostgreSQL validates during non-NULL key comparison and can return without error if none is needed. Minnow says "frame starting offset must not be negative"; PostgreSQL says "invalid preceding or following size in window function". NULL offsets are 22004. Negative ROWS/GROUPS offsets fail before reading rows in both.',
+      'Negative RANGE offsets are rejected at parse time, including empty or NULL-only input and LIMIT 0. PostgreSQL validates during non-NULL key comparison and can return without error if none is needed. Minnow says "frame starting offset must not be negative"; PostgreSQL says "invalid preceding or following size in window function" (22013). PostgreSQL uses 22004 for NULL offsets. When a window executes, both reject negative ROWS/GROUPS offsets before reading input. PostgreSQL can avoid that initialization under LIMIT 0; Minnow still validates the literals while parsing.',
   },
   {
     id: "window.frame-parameter-offset",

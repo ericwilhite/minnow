@@ -479,11 +479,12 @@ offset outside double precision (`1e400`, `1e-400`) is refused with "RANGE frame
 double precision are not supported", even over a `NUMERIC` key, where PostgreSQL runs it.
 Exact NUMERIC distances in the unexported rebuild core are not part of the public executor.
 
-Negative and `NULL` offsets are errors (`22013` and `22004`). Negative `RANGE` offsets are
-rejected at parse time, including on empty or NULL-only input and under `LIMIT 0`; PostgreSQL
+Negative and `NULL` offsets are errors; PostgreSQL uses `22013` and `22004` for them. Negative
+`RANGE` offsets are rejected at parse time, including on empty or NULL-only input and under `LIMIT 0`; PostgreSQL
 checks them when comparing non-NULL keys and can return without an error if no comparison is
-needed. Minnow says "frame starting offset must not be negative"; PostgreSQL says "invalid
-preceding or following size in window function". For negative float offsets outside double
+needed. PostgreSQL also skips `ROWS`/`GROUPS` offset initialization under `LIMIT 0`; Minnow
+still validates those literals while parsing. Minnow says "frame starting offset must not be
+negative"; PostgreSQL says "invalid preceding or following size in window function". For negative float offsets outside double
 precision, Minnow reports this negative-offset error before PostgreSQL's `22003` overflow error.
 
 `DISTINCT` window aggregates are not supported. Windows work in both the select list and

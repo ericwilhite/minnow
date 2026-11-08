@@ -56,12 +56,15 @@ rejects that key/offset type combination with `0A000`.
 
 A negative `RANGE` offset fails at parse time, even on empty or NULL-only input and under
 `LIMIT 0`. PostgreSQL validates it when comparing non-NULL keys, so those queries can succeed
-without doing such a comparison. Both report `22013` when they reject a negative offset, but
-Minnow's message is "frame starting offset must not be negative"; PostgreSQL's is "invalid
-preceding or following size in window function". A positive offset outside double precision
+without doing such a comparison. Minnow's message is "frame starting offset must not be negative";
+PostgreSQL's is "invalid preceding or following size in window function" (`22013`). A positive
+offset outside double precision
 (`1e400`, `1e-400`) is also refused, though PostgreSQL runs it over a `NUMERIC` key. Public
 `RANGE` distances use double precision; the unexported rebuild core's exact NUMERIC execution
 does not change that public contract.
+
+`LIMIT 0` also avoids PostgreSQL's `ROWS`/`GROUPS` offset initialization. Minnow still validates
+those literals while parsing, so a negative offset is rejected even under `LIMIT 0`.
 
 ## Supported SQL
 
