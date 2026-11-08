@@ -224,6 +224,9 @@ function memorySegment(
   };
   return {
     kind: "memory",
+    readHint: () => {
+      throw new TypeError("This legacy scan fixture does not implement bounded reads");
+    },
     index,
     rowCount: rows.length,
     liveRowCount: rows.length - deleted.size,

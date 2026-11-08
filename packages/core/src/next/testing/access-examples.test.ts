@@ -174,6 +174,9 @@ const deletions: DeletionVector = {
 function memoryTable(): TableSnapshot {
   const segment: MemorySegment = {
     kind: "memory",
+    readHint: () => {
+      throw new TypeError("This legacy scan fixture does not implement bounded reads");
+    },
     index: 0,
     rowCount: ROWS.length,
     liveRowCount: ROWS.length - DELETED.size,
