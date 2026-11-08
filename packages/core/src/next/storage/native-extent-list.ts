@@ -13,6 +13,48 @@ export const NATIVE_LIST_WINDOW_BYTES = 192 * 1024;
 const fail = (why: string): never => {
   throw new StoreCorruptionError(`Extent list: ${why}`);
 };
+/** Two borrowed windows, already charged by PageCache's read slab. Each cursor keeps its
+ * own bytes while decoding; a hit copies from its peer before either window can be reused.
+ * Reconstruction serializes reads. No extent-count-sized index or extra payload allocation.
+ */
+export class NativeListPageCache {
+  #firstOffset = -1;
+  #firstLength = 0;
+  #secondOffset = -1;
+  #secondLength = 0;
+  constructor(
+    readonly first: Uint8Array,
+    readonly second: Uint8Array,
+  ) {}
+  async read(
+    cache: PageCache,
+    offset: number,
+    target: Uint8Array,
+    required: number,
+  ): Promise<number> {
+    const isFirst =
+      target.buffer === this.first.buffer && target.byteOffset === this.first.byteOffset;
+    const peer = isFirst ? this.second : this.first;
+    const peerOffset = isFirst ? this.#secondOffset : this.#firstOffset;
+    const peerLength = isFirst ? this.#secondLength : this.#firstLength;
+    // A failed read must never advertise stale or partially overwritten bytes.
+    if (isFirst) this.#firstLength = 0;
+    else this.#secondLength = 0;
+    let length = target.length;
+    if (offset >= peerOffset && offset + required <= peerOffset + peerLength) {
+      length = Math.min(length, peerOffset + peerLength - offset);
+      target.set(peer.subarray(offset - peerOffset, offset - peerOffset + length));
+    } else await cache.readRaw(offset, target);
+    if (isFirst) {
+      this.#firstOffset = offset;
+      this.#firstLength = length;
+    } else {
+      this.#secondOffset = offset;
+      this.#secondLength = length;
+    }
+    return length;
+  }
+}
 export class NativeExtentList {
   offset = 0;
   length = 0;
@@ -30,6 +72,7 @@ export class NativeExtentList {
     readonly window: Uint8Array,
     readonly dataLength: number,
     readonly work?: TaskWork,
+    readonly shared?: NativeListPageCache,
   ) {
     if (window.length !== NATIVE_LIST_WINDOW_BYTES)
       throw new RangeError("Wrong native list window");
@@ -124,9 +167,14 @@ export class NativeExtentList {
           break;
         readEnd = last;
       }
+      this.#windowLength = 0;
+      const target = this.window.subarray(0, readEnd - offset);
+      if (this.shared === undefined) await this.cache.readRaw(offset, target);
+      this.#windowLength =
+        this.shared === undefined
+          ? target.length
+          : await this.shared.read(this.cache, offset, target, page.blob.length);
       this.#windowOffset = offset;
-      this.#windowLength = readEnd - offset;
-      await this.cache.readRaw(offset, this.window.subarray(0, this.#windowLength));
       const pending = pauseIfDue(this.work);
       if (pending !== undefined) await pending;
       this.work?.signal?.throwIfAborted();
