@@ -3358,6 +3358,13 @@ describe("SQL conformance against SQLite and PGlite", () => {
         const skipped = matrixSkips.get(feature.id)?.oracles ?? [];
         for (const oracle of oracles) {
           if (skipped.includes(oracle.name)) continue;
+          if (oracle.name === "pglite" && feature.id === "window.frame-range-integer-fractional") {
+            // PostgreSQL has no numeric-offset in_range overload for an integer key.
+            // Check the documented admission difference, rather than inventing PG rows.
+            expect(postgresClassification(feature)).toBe("different");
+            await expect(oracle.execute(testCase)).rejects.toMatchObject({ code: "0A000" });
+            continue;
+          }
           let oracleResult: { rows: Array<Record<string, unknown>>; columns: string[] };
           try {
             oracleResult = await oracle.execute(testCase);
