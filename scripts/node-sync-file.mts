@@ -42,11 +42,22 @@ export class NodeSyncFile implements SyncFile {
   }
 }
 
-/** The store's four files in `directory` (created empty when `create`). */
+/**
+ * The store's files in `directory` (created empty when `create`): log, data, both root slots, and
+ * the extent space's owner-private metadata pair, named as OPFS names them.
+ */
 export function openFileSet(directory: string, create: boolean): FileSet {
   mkdirSync(directory, { recursive: true });
   const file = (name: string): NodeSyncFile => new NodeSyncFile(join(directory, name), create);
-  return { log: file("log"), data: file("data"), roots: [file("root-0"), file("root-1")] };
+  return {
+    log: file("log"),
+    data: file("data"),
+    roots: [file("root-0"), file("root-1")],
+    // Reconstructible scratch the extent space resets on every open: always (re)created, so a
+    // fixture built before these files existed still opens.
+    metadata: new NodeSyncFile(join(directory, "space-meta"), true),
+    metadataIndex: new NodeSyncFile(join(directory, "space-meta-index"), true),
+  };
 }
 
 /** JSON that keeps bigints and byte arrays (column statistics). */
