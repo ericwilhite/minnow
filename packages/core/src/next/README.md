@@ -971,6 +971,19 @@ and the owner import it directly.
   then memory), with sound page bounds (exact or null), deletion vectors for live rows, and
   dictionary codes kept. Groups are read through B1's verified cache with the format chunk readers. A
   memory chunk read that stops early (varlen output full or denied) resumes at `resumeRow(result)`.
+- **Bounded memory reads use caller-owned outputs.** `MemorySegment.readHint` describes a common
+  row/byte prefix and its publication-stable output, resident, scratch and I/O bounds. The optional
+  bounded `chunk` step fills only prepared caller storage; a first null, wider integer or full arena
+  returns a typed need before the affected row. Native int128 and stronger precharged `bigint[]`
+  decimal destinations both work, including capacity-limited continuation. A caller choosing the
+  stronger representation reserves its array pointers and BigInt slot capacity in addition to
+  native lanes. B3 never replaces output buffers. Legacy calls without the step remain unbounded;
+  B4 owns execution admission and consumer migration. The uncompressed 2,048-row/200-column
+  metadata/input envelope is about 25.6 MiB including I/O, before outputs and downstream memory;
+  it proves the bound once admitted, not admission at every smaller cap. Sizing retains no borrow,
+  large values stream verified fragments into the prepared output, and snapshot release cancels
+  reads while retaining the final pin until late I/O drains. Tests vary source and destination
+  layouts, publication, row/byte continuation, multi-blob values and cancellation.
 - **Retention is bounded.** A reader borrows at most one chunk per memory segment. A frozen memtable
   stays resident (capped, writers wait past the cap) only until its flush publishes; then its
   readers are re-pointed to the published group under a pin taken during that publication, and

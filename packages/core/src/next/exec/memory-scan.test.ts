@@ -49,6 +49,9 @@ function deleting(every: number): DeletionVector {
  */
 class LendingSegment implements MemorySegment {
   readonly kind = "memory";
+  readHint(): never {
+    throw new TypeError("This legacy scan fixture does not implement bounded reads");
+  }
   readonly liveRowCount: number;
   lentChunk = -1;
   readonly #lent: FlatVector[] = [];
@@ -114,6 +117,9 @@ function whole(vector: Vector, firstRow: number, rowCount: number): ChunkResult 
  */
 class PartialTextSegment implements MemorySegment {
   readonly kind = "memory";
+  readHint(): never {
+    throw new TypeError("This legacy scan fixture does not implement bounded reads");
+  }
   readonly liveRowCount: number;
   readonly calls: Array<[number, number, number]> = [];
   constructor(

@@ -4,6 +4,7 @@
  * from the published group after a re-point), and index probes and ranges that resolve put and
  * tombstone entries across memtable deltas and durable runs under the view's bound.
  */
+import { MemoryReads } from "./memory-read.js";
 import type { Held } from "../format/reachable.js";
 import type { CatalogView, ColumnDef, IndexDef, TableDef } from "../access/catalog.js";
 import {
@@ -25,6 +26,10 @@ import {
   type DeletionVector,
   type GroupSegment,
   type MemorySegment,
+  type MemoryReadRequest,
+  type MemoryReadContext,
+  type MemoryReadHint,
+  type MemoryChunkStep,
   type PageSummary,
   type Segment,
   type Snapshot,
@@ -226,6 +231,33 @@ class MemorySegmentImpl implements MemorySegment {
   readonly rowCount: number;
   /** The chunk index the reader currently borrows (−1: none). */
   borrowed = -1;
+  #reads: MemoryReads | null = null;
+
+  #bounded(): MemoryReads {
+    return (this.#reads ??= new MemoryReads({
+      rowCount: this.rowCount,
+      column: (id) => this.view.column(id),
+      check: () => this.view.snapshot.check(),
+      publishedRoot: () => need(this.memtable.published).group.root,
+      resident: (columnId, chunk) => {
+        if (this.memtable.published !== null) return null;
+        const stored = this.memtable.chunks[this.view.columnIndex(columnId)]?.[chunk];
+        if (stored === undefined) throw new RangeError("A memtable chunk is missing");
+        return stored.view(Math.min(MEMORY_CHUNK_ROWS, this.rowCount - chunk * MEMORY_CHUNK_ROWS));
+      },
+      watch: (close) =>
+        this.view.snapshot.watchCursor({
+          next: () => {
+            throw new TypeError("A memory read is not an index cursor");
+          },
+          close,
+        }),
+    }));
+  }
+
+  readHint(request: MemoryReadRequest, context: MemoryReadContext): MaybePromise<MemoryReadHint> {
+    return this.#bounded().hint(request, context);
+  }
 
   constructor(
     readonly index: number,
@@ -287,8 +319,10 @@ class MemorySegmentImpl implements MemorySegment {
     chunk: number,
     out: ChunkOutput,
     startRow = 0,
+    step?: MemoryChunkStep,
   ): MaybePromise<ChunkResult> {
     this.view.snapshot.check();
+    if (step !== undefined) return this.#bounded().chunk(columnId, chunk, out, startRow, step);
     const first = chunk * MEMORY_CHUNK_ROWS;
     const length = Math.min(MEMORY_CHUNK_ROWS, this.rowCount - first);
     if (!(length > 0)) throw new RangeError(`Chunk ${String(chunk)} is outside the segment`);
@@ -663,14 +697,33 @@ export class SnapshotImpl implements Snapshot {
     (this.#holds ??= []).push(held);
   }
 
+  // Allocated only for bounded reads; ordinary snapshots keep their existing fast path.
+  #cursors: Set<IndexCursor> | null = null;
+  watchCursor(cursor: IndexCursor): () => void {
+    this.check();
+    const cursors = (this.#cursors ??= new Set());
+    cursors.add(cursor);
+    return () => {
+      cursors.delete(cursor);
+      if (this.#released && cursors.size === 0) this.#releasePin();
+    };
+  }
+  #pinReleased = false;
+  #releasePin(): void {
+    if (this.#pinReleased) return;
+    this.#pinReleased = true;
+    this.#pin.release();
+    this.shared.readers.close(this.#reader);
+  }
+
   releaseInternal(): void {
     if (this.#released) return;
     this.#released = true;
     if (this.#holds !== null) for (const held of this.#holds) held.release();
     this.#holds = null;
     if (this.#handed !== null) for (const table of this.#handed) table.endBorrows();
-    this.#pin.release();
-    this.shared.readers.close(this.#reader);
+    if (this.#cursors !== null) for (const cursor of this.#cursors) cursor.close();
+    if ((this.#cursors?.size ?? 0) === 0) this.#releasePin();
   }
 }
 

@@ -55,8 +55,9 @@
  *   track's chunk readers over `GroupSegment.chunk(columnId)`: dictionary pages decode to
  *   dictionary vectors (codes kept), and decoded dictionaries are charged to the query that
  *   decoded them (R5), never to the cache.
- * - **Memory.** `MemorySegment.chunk` returns a borrowed, zero-copy vector of one
- *   `MEMORY_CHUNK_ROWS`-row chunk (a dictionary vector where the memtable keeps codes).
+ * - **Memory.** Legacy `MemorySegment.chunk` borrows one `MEMORY_CHUNK_ROWS`-row chunk.
+ *   Bounded calls first use `readHint` to size a publication-stable logical prefix, then fill
+ *   caller-owned, precharged outputs. They never borrow a whole chunk or replace output buffers.
  * - **Live rows.** `Segment.deletions()` gives the view's deletion vector; `liveRows` turns a
  *   position range into a selection. Deletion bitmaps of groups are blobs read through the cache.
  *
@@ -75,7 +76,7 @@
  *   positions. Then the memtable is freed (except each reader's one borrowed chunk, until its
  *   borrow ends). A re-pointed segment keeps its index, `rowCount`, deletions and summaries;
  *   its `chunk()` decodes into the caller's `out` through the page cache, leases charged to
- *   `TableReadOptions.budget`, and may return a Promise. That pin is released when the last
+ *   `MemoryReadContext.budget` (legacy: `TableReadOptions.budget`), and may return a Promise. That pin is released when the last
  *   re-pointed reader of that publication is released.
  * So a slow reader never blocks a writer and never pins more than one chunk per memory segment.
  *
@@ -97,6 +98,7 @@
  *   them.
  */
 import type { ColumnChunk, GroupRef, GroupRoot } from "../format/manifest.js";
+import type { Layout } from "../types.js";
 import type { ColumnStatistics } from "../types.js";
 import type { VarlenBuilder } from "../vector/varlen.js";
 import type { FlatVector, Selection, Vector } from "../vector/vector.js";
@@ -229,9 +231,70 @@ export interface GroupSegment extends SegmentBase {
   chunk(columnId: number): ColumnChunk | null;
 }
 
+/** The caller's complete bounded read admission; every read uses these pages and signal. */
+export interface MemoryReadContext {
+  readonly budget: ByteBudget;
+  readonly pages: SpaceReader;
+  readonly signal: AbortSignal;
+}
+
+export interface MemoryReadRequest {
+  readonly columns: readonly number[];
+  readonly chunk: number;
+  readonly startRow: number;
+  readonly maxRows: number;
+  /** Whole decoded output target across the selected columns. */
+  readonly targetBytes: number;
+}
+
+/** No payload, lease, chunk borrow or charge escapes sizing in this immutable descriptor. */
+export interface MemoryReadHint {
+  readonly request: MemoryReadRequest;
+  readonly rowCount: number;
+  readonly outputBytes: number;
+  /** Prepared capacities and stable layouts, in request column order; no value payload. */
+  readonly outputs: readonly MemoryOutputNeed[];
+  readonly residentBytes: number;
+  readonly scratchBytes: number;
+  readonly ioBytes: number;
+  readonly oversized: boolean;
+  readonly token: object;
+}
+
+export interface MemoryChunkStep {
+  readonly hint: MemoryReadHint;
+  readonly context: MemoryReadContext;
+}
+
+/** A prepared output layout. Stronger integer tiers/more lanes are also acceptable. */
+export interface MemoryOutputLayout {
+  readonly layout: Layout;
+  readonly validity: boolean;
+  readonly integer: "safe" | "int64" | "int128" | null;
+  readonly scales: boolean;
+  readonly scale: number | null;
+  readonly specials: boolean;
+}
+
+/** A row that was NOT written: re-prepare all buffers, then resume at `row`. No value payload. */
+export interface MemoryOutputNeed {
+  readonly columnId: number;
+  readonly row: number;
+  /** Capacities for the already written prefix plus this row. */
+  readonly rows: number;
+  readonly varlenBytes: number;
+  readonly bytes: number;
+  readonly shape: MemoryOutputLayout;
+}
+
 /** Rows in memory, stored as immutable chunks of `MEMORY_CHUNK_ROWS` rows. */
 export interface MemorySegment extends SegmentBase {
   readonly kind: "memory";
+  /**
+   * Sizes a common logical prefix before allocation. Bounds remain sufficient after publication;
+   * identical requests keep their prefix and may only shrink byte bounds. No sizing borrow.
+   */
+  readHint(request: MemoryReadRequest, context: MemoryReadContext): MaybePromise<MemoryReadHint>;
   /**
    * Rows of chunk `chunk` (rows `chunk × MEMORY_CHUNK_ROWS …`, at most `rowCount`) of `columnId`,
    * in its exact physical type, from chunk-relative row `startRow` (default 0) on.
@@ -252,10 +315,26 @@ export interface MemorySegment extends SegmentBase {
     chunk: number,
     out: ChunkOutput,
     startRow?: number,
+    /**
+     * Bounded path: fills ONLY caller-owned, precharged buffers over the hinted prefix. Never
+     * replaces output buffers. A first null, unsafe int64, wide decimal or full varlen arena
+     * stops before the row with reason "need" and its required layout and exact byte capacity.
+     * The caller re-prepares/resumes; a whole-cap refusal belongs to its admission, not B3.
+     * Calls without step retain the legacy borrowing/decoding behavior described above.
+     */
+    step?: MemoryChunkStep,
   ): MaybePromise<ChunkResult>;
 }
 
-/** Caller-owned buffers for a re-pointed memory chunk (capacity ≥ `MEMORY_CHUNK_ROWS`). */
+/**
+ * Caller-owned and caller-charged output buffers, including validity, all integer tiers,
+ * scales/specials, varlen bytes/offsets and codes. A bounded call fills without replacing them;
+ * its capacity need only cover the hinted prefix. Stronger decimal `bigint[]` destinations
+ * also reserve their array header/pointers and per-slot BigInt capacity before the call
+ * (up to 32 bytes per stored int128 coefficient). Hint outputBytes describes the advertised
+ * native tier; choosing a stronger destination can require more caller-owned capacity.
+ * `varlen` is used only by legacy calls.
+ */
 export interface ChunkOutput {
   readonly flat: FlatVector;
   readonly codes: Int32Array;
@@ -271,7 +350,9 @@ export interface ChunkResult {
   /** True when the vector reaches the chunk's last row. */
   readonly complete: boolean;
   /** Why an incomplete result stopped; null when complete. */
-  readonly reason: "full" | "denied" | null;
+  readonly reason: "full" | "denied" | "need" | null;
+  /** Present exactly when reason is "need"; the next row has not been written. */
+  readonly need?: MemoryOutputNeed;
 }
 
 /** The `startRow` to resume an incomplete chunk read from, or null when it is complete. */
