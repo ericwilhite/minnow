@@ -12,6 +12,7 @@ import {
   type ExecutorExportStats,
 } from "../../../scripts/browser-perf/page/executor-export.js";
 import { scanCore, type ScanCoreStats } from "../../../scripts/browser-perf/page/scan-core.js";
+import { prepareOwnerExport } from "../../../scripts/browser-perf/page/owner-export.js";
 import { ReturnPool } from "../src/next/exec/return-pool.js";
 import { TableScan } from "../src/next/exec/table-scan.js";
 import { ColumnTarget } from "../src/next/exec/column-target.js";
@@ -58,6 +59,9 @@ export type ExportRequest =
       readonly outside: ExportGroup;
       readonly once: boolean;
       readonly recycle?: boolean;
+      readonly ownerAPI?: boolean;
+      readonly poolTrace?: boolean;
+      readonly outputClasses?: boolean;
       readonly readaheadKiB: number;
       /** Row-window readahead across all columns (export-stream.ts `windowBytes`); 0: per column. */
       readonly windowMiB?: number;
@@ -130,6 +134,9 @@ export interface ExportPass {
   readonly executorStats?: ExecutorExportStats;
   readonly scanCoreStats?: ScanCoreStats;
   readonly series?: {
+    readonly poolTrace?: import("../../../scripts/browser-perf/page/return-pool-trace.js").PoolTraceSummary;
+    readonly requestedBuffers?: number;
+    readonly reusedBuffers?: number;
     readonly returnPoolMiB?: number;
     readonly returnHits?: number;
     readonly returnAccepted?: number;
@@ -384,7 +391,11 @@ async function runExport(request: Extract<ExportRequest, { op: "export" }>): Pro
                 reads: frozenExecutor.EXECUTOR_BASELINE_READS,
               }
             : {}),
-          port: request.resultPort,
+          port:
+            request.resultPort ??
+            (() => {
+              throw new Error("Missing prototype port");
+            })(),
           memory: () => ({
             governorHeld: governor.usedBytes,
             idlePool: space.stats.cache.poolBytes,
@@ -534,6 +545,7 @@ let series: {
   readonly opened: Awaited<ReturnType<typeof open>>;
   readonly governor: Governor;
   readonly returns: ReturnPool;
+  readonly owner: ReturnType<typeof prepareOwnerExport> | null;
   pass: number;
   busy: boolean;
 } | null = null;
@@ -552,32 +564,43 @@ async function seriesPass(
 ): Promise<ExportPass[]> {
   const active = series;
   if (!active || active.busy) throw new Error("No idle export series");
-  if (request.mode !== "scan" || request.passes !== 1 || !request.resultPort)
+  if (request.mode !== "scan" || request.passes !== 1 || (!request.ownerAPI && !request.resultPort))
     throw new Error("Series requires one production scan and a fresh result port");
   active.busy = true;
   const { space } = active.opened,
     { governor } = active;
   try {
     const frozenExecutor = await executorReference(request);
-    const execute = prepareExecutorExport(space, request.groups, {
-      governor,
-      ...(request.executorVariant !== "baseline" && request.recycle
-        ? { returnPool: active.returns }
-        : {}),
-      ...(request.executorVariant === "baseline" && frozenExecutor
-        ? {
-            executor: frozenExecutor.createExecutor(),
-            reads: frozenExecutor.EXECUTOR_BASELINE_READS,
-          }
-        : {}),
-      port: request.resultPort,
-      memory: () => ({
-        governorHeld: governor.usedBytes,
-        idlePool: space.stats.cache.poolBytes,
-        cacheResident: space.stats.cache.residentBytes,
-        cachePinned: space.stats.cache.pinnedBytes,
-      }),
-    });
+    const execute = request.ownerAPI
+      ? () => {
+          if (!active.owner) throw new Error("No production owner export actor");
+          const result = active.owner.arm(request.outputClasses);
+          scope.postMessage({ id: activeControlId, t: "owner-start" });
+          return result;
+        }
+      : prepareExecutorExport(space, request.groups, {
+          governor,
+          ...(request.executorVariant !== "baseline" && request.recycle
+            ? { returnPool: active.returns }
+            : {}),
+          ...(request.executorVariant === "baseline" && frozenExecutor
+            ? {
+                executor: frozenExecutor.createExecutor(),
+                reads: frozenExecutor.EXECUTOR_BASELINE_READS,
+              }
+            : {}),
+          port:
+            request.resultPort ??
+            (() => {
+              throw new Error("Missing prototype port");
+            })(),
+          memory: () => ({
+            governorHeld: governor.usedBytes,
+            idlePool: space.stats.cache.poolBytes,
+            cacheResident: space.stats.cache.residentBytes,
+            cachePinned: space.stats.cache.pinnedBytes,
+          }),
+        });
     const reads = space.stats.cache.platformReads;
     if (request.profile) console.profile("export");
     let result;
@@ -603,9 +626,13 @@ async function seriesPass(
         kept: null,
         series: {
           ...seriesStats(),
-          returnPoolMiB: active.returns.evictableBytes / MiB,
-          returnHits: active.returns.hits,
-          returnAccepted: active.returns.accepted,
+          ...(request.ownerAPI && active.owner
+            ? active.owner.returnStats()
+            : {
+                returnPoolMiB: active.returns.evictableBytes / MiB,
+                returnHits: active.returns.hits,
+                returnAccepted: active.returns.accepted,
+              }),
         },
         ...(request.executorReference
           ? {
@@ -633,6 +660,23 @@ async function handle(request: ExportRequest): Promise<unknown> {
         governor,
         opened,
         returns: new ReturnPool(governor, 4 * MiB),
+        owner: request.request.ownerAPI
+          ? prepareOwnerExport(opened.space, request.request.groups, {
+              governor,
+              ...(request.request.poolTrace ? { poolTrace: true } : {}),
+              port:
+                request.request.resultPort ??
+                (() => {
+                  throw new Error("Missing owner port");
+                })(),
+              memory: () => ({
+                governorHeld: governor.usedBytes,
+                idlePool: opened.space.stats.cache.poolBytes,
+                cacheResident: opened.space.stats.cache.residentBytes,
+                cachePinned: opened.space.stats.cache.pinnedBytes,
+              }),
+            })
+          : null,
         pass: 0,
         busy: false,
       };
@@ -645,6 +689,7 @@ async function handle(request: ExportRequest): Promise<unknown> {
       if (!active || active.busy) throw new Error("No idle export series to close");
       series = null;
       active.returns.close();
+      await active.owner?.close();
       try {
         await active.opened.space.close();
       } finally {
@@ -670,8 +715,10 @@ async function handle(request: ExportRequest): Promise<unknown> {
   }
 }
 
+let activeControlId = -1;
 scope.addEventListener("message", (event: MessageEvent<unknown>) => {
   const { id, request } = event.data as { id: number; request: ExportRequest };
+  activeControlId = id;
   handle(request).then(
     (result) => {
       scope.postMessage({ id, result });

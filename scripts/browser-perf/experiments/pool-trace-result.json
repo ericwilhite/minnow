@@ -1,0 +1,1913 @@
+{
+  "scope": "Diagnostics only. No production runtime change, no whole-export speed or RSS claim. Larger-cap candidate rejected before browser adoption because isolated CPU does not beat spread.",
+  "revision": "3cca9da862db68f41a92e2c55ec09dbc608731b9",
+  "fixture": {
+    "exportedRows": 1048576,
+    "columns": 200,
+    "opfsBytes": 1035451213,
+    "groups": 16,
+    "generatedGroups": 1,
+    "description": "One generated group copied to distinct addresses, 17 stored groups including one excluded hot group. 5 cold API passes in one owner/renderer process, prompt explicit release; verification poison off, normal validation on."
+  },
+  "capture": {
+    "file": "pool-requests-prefix.json.gz",
+    "sha256": "2a72d03e39dfcb6e3690908a22d0fe03134612311e18de6356087a02d89bee73",
+    "events": 152493,
+    "scope": "First 200 frame issuances of first pass. Actual requests/issuance/returns/governor-eviction chronology; synthetic bytes in replay."
+  },
+  "browserDiagnostic": {
+    "instrumentation": "Observer counters and trace add memory/time. These are not CPU/RSS acceptance samples. Owner API flag is true; old generic outputRecycling field is false for that harness route and does not identify this API.",
+    "passes": [
+      {
+        "pass": 1,
+        "requests": 288812,
+        "hits": 110543,
+        "requestedBytes": 1526752461,
+        "hitBytes": 365862343,
+        "zeroRequests": 0,
+        "missesPendingReturn": 23902,
+        "missesSeenSize": 142369,
+        "missesNewSize": 11998,
+        "explicitEvictions": 0,
+        "host": {
+          "before": {
+            "at": "2026-11-07T23:51:16.803Z",
+            "load": [13.06, 11.92, 12.06],
+            "pressure": {
+              "cpu": "some avg10=33.89 avg60=30.77 avg300=27.82 total=81233867065\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+              "io": "some avg10=7.38 avg60=2.54 avg300=0.87 total=8871734216\nfull avg10=0.26 avg60=0.08 avg300=0.02 total=4360035501",
+              "memory": "some avg10=1.54 avg60=0.32 avg300=0.33 total=22971957477\nfull avg10=1.08 avg60=0.19 avg300=0.21 total=12724857817"
+            }
+          },
+          "after": {
+            "at": "2026-11-07T23:51:50.823Z",
+            "load": [13.94, 12.28, 12.17],
+            "pressure": {
+              "cpu": "some avg10=45.69 avg60=37.36 avg300=29.83 total=81249875372\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+              "io": "some avg10=3.08 avg60=2.12 avg300=0.93 total=8872417902\nfull avg10=0.00 avg60=0.04 avg300=0.01 total=4360040747",
+              "memory": "some avg10=1.75 avg60=0.76 avg300=0.43 total=22972555832\nfull avg10=1.09 avg60=0.43 avg300=0.26 total=12725149161"
+            }
+          }
+        },
+        "exactSizeClassCount": 3542,
+        "top32ClassesByRequestCount": [
+          {
+            "size": 11264,
+            "requests": 14208,
+            "hits": 6198,
+            "missesPendingReturn": 3496,
+            "missesSeenSize": 4440,
+            "missesNewSize": 74
+          },
+          {
+            "size": 5120,
+            "requests": 14208,
+            "hits": 9620,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 4514,
+            "missesNewSize": 74
+          },
+          {
+            "size": 80,
+            "requests": 13536,
+            "hits": 12361,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 1128,
+            "missesNewSize": 47
+          },
+          {
+            "size": 176,
+            "requests": 13536,
+            "hits": 9306,
+            "missesPendingReturn": 2914,
+            "missesSeenSize": 1269,
+            "missesNewSize": 47
+          },
+          {
+            "size": 5632,
+            "requests": 13464,
+            "hits": 6168,
+            "missesPendingReturn": 3513,
+            "missesSeenSize": 3726,
+            "missesNewSize": 57
+          },
+          {
+            "size": 2560,
+            "requests": 12457,
+            "hits": 9930,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2526,
+            "missesNewSize": 1
+          },
+          {
+            "size": 2564,
+            "requests": 11484,
+            "hits": 7626,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 3816,
+            "missesNewSize": 42
+          },
+          {
+            "size": 5636,
+            "requests": 10116,
+            "hits": 5605,
+            "missesPendingReturn": 2606,
+            "missesSeenSize": 1863,
+            "missesNewSize": 42
+          },
+          {
+            "size": 640,
+            "requests": 5953,
+            "hits": 4030,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 1922,
+            "missesNewSize": 1
+          },
+          {
+            "size": 1408,
+            "requests": 5952,
+            "hits": 3007,
+            "missesPendingReturn": 1395,
+            "missesSeenSize": 1519,
+            "missesNewSize": 31
+          },
+          {
+            "size": 5628,
+            "requests": 4932,
+            "hits": 618,
+            "missesPendingReturn": 1044,
+            "missesSeenSize": 3213,
+            "missesNewSize": 57
+          },
+          {
+            "size": 2568,
+            "requests": 4596,
+            "hits": 1716,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2838,
+            "missesNewSize": 42
+          },
+          {
+            "size": 180,
+            "requests": 4512,
+            "hits": 658,
+            "missesPendingReturn": 799,
+            "missesSeenSize": 3008,
+            "missesNewSize": 47
+          },
+          {
+            "size": 84,
+            "requests": 4512,
+            "hits": 1692,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2820,
+            "missesNewSize": 0
+          },
+          {
+            "size": 11256,
+            "requests": 4440,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 4366,
+            "missesNewSize": 74
+          },
+          {
+            "size": 5128,
+            "requests": 4440,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 4366,
+            "missesNewSize": 74
+          },
+          {
+            "size": 5640,
+            "requests": 3564,
+            "hits": 294,
+            "missesPendingReturn": 834,
+            "missesSeenSize": 2394,
+            "missesNewSize": 42
+          },
+          {
+            "size": 2556,
+            "requests": 3564,
+            "hits": 1008,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2499,
+            "missesNewSize": 57
+          },
+          {
+            "size": 2552,
+            "requests": 3060,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 3018,
+            "missesNewSize": 42
+          },
+          {
+            "size": 5644,
+            "requests": 2880,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2823,
+            "missesNewSize": 57
+          },
+          {
+            "size": 5136,
+            "requests": 2665,
+            "hits": 888,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 1776,
+            "missesNewSize": 1
+          },
+          {
+            "size": 11272,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2590,
+            "missesNewSize": 74
+          },
+          {
+            "size": 5112,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2590,
+            "missesNewSize": 74
+          },
+          {
+            "size": 11280,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2590,
+            "missesNewSize": 74
+          },
+          {
+            "size": 5104,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2590,
+            "missesNewSize": 74
+          },
+          {
+            "size": 11248,
+            "requests": 2664,
+            "hits": 222,
+            "missesPendingReturn": 666,
+            "missesSeenSize": 1702,
+            "missesNewSize": 74
+          },
+          {
+            "size": 196,
+            "requests": 2538,
+            "hits": 2256,
+            "missesPendingReturn": 141,
+            "missesSeenSize": 94,
+            "missesNewSize": 47
+          },
+          {
+            "size": 64,
+            "requests": 2538,
+            "hits": 2397,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 141,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5624,
+            "requests": 2052,
+            "hits": 171,
+            "missesPendingReturn": 513,
+            "missesSeenSize": 1311,
+            "missesNewSize": 57
+          },
+          {
+            "size": 200,
+            "requests": 1974,
+            "hits": 1551,
+            "missesPendingReturn": 141,
+            "missesSeenSize": 188,
+            "missesNewSize": 94
+          },
+          {
+            "size": 60,
+            "requests": 1974,
+            "hits": 1786,
+            "missesPendingReturn": 47,
+            "missesSeenSize": 94,
+            "missesNewSize": 47
+          },
+          {
+            "size": 641,
+            "requests": 1872,
+            "hits": 0,
+            "missesPendingReturn": 12,
+            "missesSeenSize": 1829,
+            "missesNewSize": 31
+          }
+        ]
+      },
+      {
+        "pass": 2,
+        "requests": 288812,
+        "hits": 111077,
+        "requestedBytes": 1526752461,
+        "hitBytes": 371657068,
+        "zeroRequests": 0,
+        "missesPendingReturn": 23456,
+        "missesSeenSize": 153892,
+        "missesNewSize": 387,
+        "explicitEvictions": 0,
+        "host": {
+          "before": {
+            "at": "2026-11-07T23:51:51.824Z",
+            "load": [13.94, 12.28, 12.17],
+            "pressure": {
+              "cpu": "some avg10=47.56 avg60=37.97 avg300=30.01 total=81250442330\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+              "io": "some avg10=3.79 avg60=2.28 avg300=0.97 total=8872510642\nfull avg10=0.00 avg60=0.04 avg300=0.01 total=4360040747",
+              "memory": "some avg10=2.88 avg60=1.00 avg300=0.49 total=22972660213\nfull avg10=1.07 avg60=0.45 avg300=0.27 total=12725162516"
+            }
+          },
+          "after": {
+            "at": "2026-11-07T23:52:19.881Z",
+            "load": [15.68, 12.82, 12.35],
+            "pressure": {
+              "cpu": "some avg10=53.30 avg60=43.53 avg300=32.09 total=81265373090\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+              "io": "some avg10=1.05 avg60=1.81 avg300=0.98 total=8872938190\nfull avg10=0.00 avg60=0.02 avg300=0.00 total=4360041703",
+              "memory": "some avg10=9.52 avg60=3.91 avg300=1.21 total=22975061660\nfull avg10=6.31 avg60=2.37 avg300=0.73 total=12726692096"
+            }
+          }
+        },
+        "exactSizeClassCount": 3542,
+        "top32ClassesByRequestCount": [
+          {
+            "size": 11264,
+            "requests": 14208,
+            "hits": 6236,
+            "missesPendingReturn": 3404,
+            "missesSeenSize": 4568,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5120,
+            "requests": 14208,
+            "hits": 9694,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 4514,
+            "missesNewSize": 0
+          },
+          {
+            "size": 80,
+            "requests": 13536,
+            "hits": 12361,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 1175,
+            "missesNewSize": 0
+          },
+          {
+            "size": 176,
+            "requests": 13536,
+            "hits": 9071,
+            "missesPendingReturn": 3149,
+            "missesSeenSize": 1316,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5632,
+            "requests": 13464,
+            "hits": 6054,
+            "missesPendingReturn": 3870,
+            "missesSeenSize": 3540,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2560,
+            "requests": 12457,
+            "hits": 9987,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2470,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2564,
+            "requests": 11484,
+            "hits": 7419,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 4065,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5636,
+            "requests": 10116,
+            "hits": 5882,
+            "missesPendingReturn": 2400,
+            "missesSeenSize": 1834,
+            "missesNewSize": 0
+          },
+          {
+            "size": 640,
+            "requests": 5953,
+            "hits": 4061,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 1892,
+            "missesNewSize": 0
+          },
+          {
+            "size": 1408,
+            "requests": 5952,
+            "hits": 2883,
+            "missesPendingReturn": 1426,
+            "missesSeenSize": 1643,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5628,
+            "requests": 4932,
+            "hits": 588,
+            "missesPendingReturn": 1074,
+            "missesSeenSize": 3270,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2568,
+            "requests": 4596,
+            "hits": 1716,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2880,
+            "missesNewSize": 0
+          },
+          {
+            "size": 180,
+            "requests": 4512,
+            "hits": 705,
+            "missesPendingReturn": 940,
+            "missesSeenSize": 2867,
+            "missesNewSize": 0
+          },
+          {
+            "size": 84,
+            "requests": 4512,
+            "hits": 1692,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2820,
+            "missesNewSize": 0
+          },
+          {
+            "size": 11256,
+            "requests": 4440,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 4440,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5128,
+            "requests": 4440,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 4440,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5640,
+            "requests": 3564,
+            "hits": 168,
+            "missesPendingReturn": 990,
+            "missesSeenSize": 2406,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2556,
+            "requests": 3564,
+            "hits": 1008,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2556,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2552,
+            "requests": 3060,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 3060,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5644,
+            "requests": 2880,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2880,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5136,
+            "requests": 2665,
+            "hits": 888,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 1777,
+            "missesNewSize": 0
+          },
+          {
+            "size": 11272,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2664,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5112,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2664,
+            "missesNewSize": 0
+          },
+          {
+            "size": 11280,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2664,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5104,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2664,
+            "missesNewSize": 0
+          },
+          {
+            "size": 11248,
+            "requests": 2664,
+            "hits": 148,
+            "missesPendingReturn": 740,
+            "missesSeenSize": 1776,
+            "missesNewSize": 0
+          },
+          {
+            "size": 196,
+            "requests": 2538,
+            "hits": 2256,
+            "missesPendingReturn": 141,
+            "missesSeenSize": 141,
+            "missesNewSize": 0
+          },
+          {
+            "size": 64,
+            "requests": 2538,
+            "hits": 2397,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 141,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5624,
+            "requests": 2052,
+            "hits": 114,
+            "missesPendingReturn": 570,
+            "missesSeenSize": 1368,
+            "missesNewSize": 0
+          },
+          {
+            "size": 200,
+            "requests": 1974,
+            "hits": 1504,
+            "missesPendingReturn": 188,
+            "missesSeenSize": 282,
+            "missesNewSize": 0
+          },
+          {
+            "size": 60,
+            "requests": 1974,
+            "hits": 1833,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 141,
+            "missesNewSize": 0
+          },
+          {
+            "size": 641,
+            "requests": 1872,
+            "hits": 0,
+            "missesPendingReturn": 11,
+            "missesSeenSize": 1861,
+            "missesNewSize": 0
+          }
+        ]
+      },
+      {
+        "pass": 3,
+        "requests": 288812,
+        "hits": 111135,
+        "requestedBytes": 1526752461,
+        "hitBytes": 369657041,
+        "zeroRequests": 0,
+        "missesPendingReturn": 23724,
+        "missesSeenSize": 153566,
+        "missesNewSize": 387,
+        "explicitEvictions": 0,
+        "host": {
+          "before": {
+            "at": "2026-11-07T23:52:20.606Z",
+            "load": [15.63, 12.86, 12.37],
+            "pressure": {
+              "cpu": "some avg10=53.30 avg60=43.53 avg300=32.09 total=81265742478\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+              "io": "some avg10=1.05 avg60=1.81 avg300=0.98 total=8872950710\nfull avg10=0.00 avg60=0.02 avg300=0.00 total=4360041704",
+              "memory": "some avg10=9.52 avg60=3.91 avg300=1.21 total=22975063077\nfull avg10=6.31 avg60=2.37 avg300=0.73 total=12726692120"
+            }
+          },
+          "after": {
+            "at": "2026-11-07T23:52:44.443Z",
+            "load": [15.46, 13.01, 12.43],
+            "pressure": {
+              "cpu": "some avg10=48.78 avg60=45.77 avg300=33.57 total=81278055081\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+              "io": "some avg10=0.24 avg60=1.29 avg300=0.92 total=8873126740\nfull avg10=0.00 avg60=0.01 avg300=0.00 total=4360043826",
+              "memory": "some avg10=1.18 avg60=2.84 avg300=1.17 total=22975283930\nfull avg10=0.72 avg60=1.71 avg300=0.70 total=12726813379"
+            }
+          }
+        },
+        "exactSizeClassCount": 3542,
+        "top32ClassesByRequestCount": [
+          {
+            "size": 11264,
+            "requests": 14208,
+            "hits": 6224,
+            "missesPendingReturn": 3470,
+            "missesSeenSize": 4514,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5120,
+            "requests": 14208,
+            "hits": 9694,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 4514,
+            "missesNewSize": 0
+          },
+          {
+            "size": 80,
+            "requests": 13536,
+            "hits": 12361,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 1175,
+            "missesNewSize": 0
+          },
+          {
+            "size": 176,
+            "requests": 13536,
+            "hits": 9306,
+            "missesPendingReturn": 2961,
+            "missesSeenSize": 1269,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5632,
+            "requests": 13464,
+            "hits": 6339,
+            "missesPendingReturn": 3600,
+            "missesSeenSize": 3525,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2560,
+            "requests": 12457,
+            "hits": 9987,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2470,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2564,
+            "requests": 11484,
+            "hits": 7555,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 3929,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5636,
+            "requests": 10116,
+            "hits": 5728,
+            "missesPendingReturn": 2447,
+            "missesSeenSize": 1941,
+            "missesNewSize": 0
+          },
+          {
+            "size": 640,
+            "requests": 5953,
+            "hits": 4061,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 1892,
+            "missesNewSize": 0
+          },
+          {
+            "size": 1408,
+            "requests": 5952,
+            "hits": 2945,
+            "missesPendingReturn": 1395,
+            "missesSeenSize": 1612,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5628,
+            "requests": 4932,
+            "hits": 618,
+            "missesPendingReturn": 1044,
+            "missesSeenSize": 3270,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2568,
+            "requests": 4596,
+            "hits": 1716,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2880,
+            "missesNewSize": 0
+          },
+          {
+            "size": 180,
+            "requests": 4512,
+            "hits": 752,
+            "missesPendingReturn": 799,
+            "missesSeenSize": 2961,
+            "missesNewSize": 0
+          },
+          {
+            "size": 84,
+            "requests": 4512,
+            "hits": 1692,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2820,
+            "missesNewSize": 0
+          },
+          {
+            "size": 11256,
+            "requests": 4440,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 4440,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5128,
+            "requests": 4440,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 4440,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5640,
+            "requests": 3564,
+            "hits": 294,
+            "missesPendingReturn": 849,
+            "missesSeenSize": 2421,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2556,
+            "requests": 3564,
+            "hits": 1008,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2556,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2552,
+            "requests": 3060,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 3060,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5644,
+            "requests": 2880,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2880,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5136,
+            "requests": 2665,
+            "hits": 888,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 1777,
+            "missesNewSize": 0
+          },
+          {
+            "size": 11272,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2664,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5112,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2664,
+            "missesNewSize": 0
+          },
+          {
+            "size": 11280,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2664,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5104,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2664,
+            "missesNewSize": 0
+          },
+          {
+            "size": 11248,
+            "requests": 2664,
+            "hits": 148,
+            "missesPendingReturn": 740,
+            "missesSeenSize": 1776,
+            "missesNewSize": 0
+          },
+          {
+            "size": 196,
+            "requests": 2538,
+            "hits": 2256,
+            "missesPendingReturn": 141,
+            "missesSeenSize": 141,
+            "missesNewSize": 0
+          },
+          {
+            "size": 64,
+            "requests": 2538,
+            "hits": 2397,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 141,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5624,
+            "requests": 2052,
+            "hits": 114,
+            "missesPendingReturn": 570,
+            "missesSeenSize": 1368,
+            "missesNewSize": 0
+          },
+          {
+            "size": 200,
+            "requests": 1974,
+            "hits": 1551,
+            "missesPendingReturn": 141,
+            "missesSeenSize": 282,
+            "missesNewSize": 0
+          },
+          {
+            "size": 60,
+            "requests": 1974,
+            "hits": 1786,
+            "missesPendingReturn": 47,
+            "missesSeenSize": 141,
+            "missesNewSize": 0
+          },
+          {
+            "size": 641,
+            "requests": 1872,
+            "hits": 0,
+            "missesPendingReturn": 12,
+            "missesSeenSize": 1860,
+            "missesNewSize": 0
+          }
+        ]
+      },
+      {
+        "pass": 4,
+        "requests": 288812,
+        "hits": 111223,
+        "requestedBytes": 1526752461,
+        "hitBytes": 370481906,
+        "zeroRequests": 0,
+        "missesPendingReturn": 24031,
+        "missesSeenSize": 153171,
+        "missesNewSize": 387,
+        "explicitEvictions": 0,
+        "host": {
+          "before": {
+            "at": "2026-11-07T23:52:45.584Z",
+            "load": [15.99, 13.16, 12.48],
+            "pressure": {
+              "cpu": "some avg10=48.78 avg60=45.77 avg300=33.57 total=81278741087\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+              "io": "some avg10=0.24 avg60=1.29 avg300=0.92 total=8873186831\nfull avg10=0.00 avg60=0.01 avg300=0.00 total=4360044108",
+              "memory": "some avg10=1.18 avg60=2.84 avg300=1.17 total=22975287402\nfull avg10=0.72 avg60=1.71 avg300=0.70 total=12726813705"
+            }
+          },
+          "after": {
+            "at": "2026-11-07T23:53:11.557Z",
+            "load": [15.59, 13.3, 12.55],
+            "pressure": {
+              "cpu": "some avg10=54.26 avg60=48.84 avg300=35.35 total=81292852031\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+              "io": "some avg10=1.05 avg60=1.21 avg300=0.93 total=8873517375\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=4360048668",
+              "memory": "some avg10=1.65 avg60=2.13 avg300=1.13 total=22975609375\nfull avg10=0.92 avg60=1.27 avg300=0.67 total=12726982220"
+            }
+          }
+        },
+        "exactSizeClassCount": 3542,
+        "top32ClassesByRequestCount": [
+          {
+            "size": 11264,
+            "requests": 14208,
+            "hits": 6386,
+            "missesPendingReturn": 3292,
+            "missesSeenSize": 4530,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5120,
+            "requests": 14208,
+            "hits": 9694,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 4514,
+            "missesNewSize": 0
+          },
+          {
+            "size": 80,
+            "requests": 13536,
+            "hits": 12361,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 1175,
+            "missesNewSize": 0
+          },
+          {
+            "size": 176,
+            "requests": 13536,
+            "hits": 9306,
+            "missesPendingReturn": 3055,
+            "missesSeenSize": 1175,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5632,
+            "requests": 13464,
+            "hits": 6242,
+            "missesPendingReturn": 3657,
+            "missesSeenSize": 3565,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2560,
+            "requests": 12457,
+            "hits": 9987,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2470,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2564,
+            "requests": 11484,
+            "hits": 7591,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 3893,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5636,
+            "requests": 10116,
+            "hits": 5738,
+            "missesPendingReturn": 2507,
+            "missesSeenSize": 1871,
+            "missesNewSize": 0
+          },
+          {
+            "size": 640,
+            "requests": 5953,
+            "hits": 4061,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 1892,
+            "missesNewSize": 0
+          },
+          {
+            "size": 1408,
+            "requests": 5952,
+            "hits": 3069,
+            "missesPendingReturn": 1333,
+            "missesSeenSize": 1550,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5628,
+            "requests": 4932,
+            "hits": 603,
+            "missesPendingReturn": 1059,
+            "missesSeenSize": 3270,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2568,
+            "requests": 4596,
+            "hits": 1716,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2880,
+            "missesNewSize": 0
+          },
+          {
+            "size": 180,
+            "requests": 4512,
+            "hits": 752,
+            "missesPendingReturn": 893,
+            "missesSeenSize": 2867,
+            "missesNewSize": 0
+          },
+          {
+            "size": 84,
+            "requests": 4512,
+            "hits": 1692,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2820,
+            "missesNewSize": 0
+          },
+          {
+            "size": 11256,
+            "requests": 4440,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 4440,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5128,
+            "requests": 4440,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 4440,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5640,
+            "requests": 3564,
+            "hits": 210,
+            "missesPendingReturn": 918,
+            "missesSeenSize": 2436,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2556,
+            "requests": 3564,
+            "hits": 1008,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2556,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2552,
+            "requests": 3060,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 3060,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5644,
+            "requests": 2880,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2880,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5136,
+            "requests": 2665,
+            "hits": 888,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 1777,
+            "missesNewSize": 0
+          },
+          {
+            "size": 11272,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2664,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5112,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2664,
+            "missesNewSize": 0
+          },
+          {
+            "size": 11280,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2664,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5104,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2664,
+            "missesNewSize": 0
+          },
+          {
+            "size": 11248,
+            "requests": 2664,
+            "hits": 222,
+            "missesPendingReturn": 666,
+            "missesSeenSize": 1776,
+            "missesNewSize": 0
+          },
+          {
+            "size": 196,
+            "requests": 2538,
+            "hits": 2256,
+            "missesPendingReturn": 141,
+            "missesSeenSize": 141,
+            "missesNewSize": 0
+          },
+          {
+            "size": 64,
+            "requests": 2538,
+            "hits": 2397,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 141,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5624,
+            "requests": 2052,
+            "hits": 171,
+            "missesPendingReturn": 513,
+            "missesSeenSize": 1368,
+            "missesNewSize": 0
+          },
+          {
+            "size": 200,
+            "requests": 1974,
+            "hits": 1551,
+            "missesPendingReturn": 141,
+            "missesSeenSize": 282,
+            "missesNewSize": 0
+          },
+          {
+            "size": 60,
+            "requests": 1974,
+            "hits": 1739,
+            "missesPendingReturn": 94,
+            "missesSeenSize": 141,
+            "missesNewSize": 0
+          },
+          {
+            "size": 641,
+            "requests": 1872,
+            "hits": 0,
+            "missesPendingReturn": 12,
+            "missesSeenSize": 1860,
+            "missesNewSize": 0
+          }
+        ]
+      },
+      {
+        "pass": 5,
+        "requests": 288812,
+        "hits": 110256,
+        "requestedBytes": 1526752461,
+        "hitBytes": 362779139,
+        "zeroRequests": 0,
+        "missesPendingReturn": 24149,
+        "missesSeenSize": 154020,
+        "missesNewSize": 387,
+        "explicitEvictions": 0,
+        "host": {
+          "before": {
+            "at": "2026-11-07T23:53:12.439Z",
+            "load": [15.59, 13.3, 12.55],
+            "pressure": {
+              "cpu": "some avg10=53.85 avg60=48.94 avg300=35.47 total=81293319753\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+              "io": "some avg10=0.86 avg60=1.17 avg300=0.93 total=8873519977\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=4360048668",
+              "memory": "some avg10=1.71 avg60=2.13 avg300=1.14 total=22975609983\nfull avg10=0.93 avg60=1.26 avg300=0.67 total=12726982734"
+            }
+          },
+          "after": {
+            "at": "2026-11-07T23:53:35.550Z",
+            "load": [15.25, 13.37, 12.59],
+            "pressure": {
+              "cpu": "some avg10=53.37 avg60=50.03 avg300=36.70 total=81305494299\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+              "io": "some avg10=0.42 avg60=0.94 avg300=0.89 total=8873749840\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=4360049812",
+              "memory": "some avg10=0.37 avg60=1.60 avg300=1.08 total=22975758498\nfull avg10=0.17 avg60=0.92 avg300=0.63 total=12727055271"
+            }
+          }
+        },
+        "exactSizeClassCount": 3542,
+        "top32ClassesByRequestCount": [
+          {
+            "size": 11264,
+            "requests": 14208,
+            "hits": 6198,
+            "missesPendingReturn": 3496,
+            "missesSeenSize": 4514,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5120,
+            "requests": 14208,
+            "hits": 9694,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 4514,
+            "missesNewSize": 0
+          },
+          {
+            "size": 80,
+            "requests": 13536,
+            "hits": 12361,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 1175,
+            "missesNewSize": 0
+          },
+          {
+            "size": 176,
+            "requests": 13536,
+            "hits": 9212,
+            "missesPendingReturn": 3008,
+            "missesSeenSize": 1316,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5632,
+            "requests": 13464,
+            "hits": 6069,
+            "missesPendingReturn": 3681,
+            "missesSeenSize": 3714,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2560,
+            "requests": 12457,
+            "hits": 9987,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2470,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2564,
+            "requests": 11484,
+            "hits": 7592,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 3892,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5636,
+            "requests": 10116,
+            "hits": 5655,
+            "missesPendingReturn": 2398,
+            "missesSeenSize": 2063,
+            "missesNewSize": 0
+          },
+          {
+            "size": 640,
+            "requests": 5953,
+            "hits": 4061,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 1892,
+            "missesNewSize": 0
+          },
+          {
+            "size": 1408,
+            "requests": 5952,
+            "hits": 2976,
+            "missesPendingReturn": 1395,
+            "missesSeenSize": 1581,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5628,
+            "requests": 4932,
+            "hits": 534,
+            "missesPendingReturn": 1158,
+            "missesSeenSize": 3240,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2568,
+            "requests": 4596,
+            "hits": 1716,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2880,
+            "missesNewSize": 0
+          },
+          {
+            "size": 180,
+            "requests": 4512,
+            "hits": 799,
+            "missesPendingReturn": 752,
+            "missesSeenSize": 2961,
+            "missesNewSize": 0
+          },
+          {
+            "size": 84,
+            "requests": 4512,
+            "hits": 1692,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2820,
+            "missesNewSize": 0
+          },
+          {
+            "size": 11256,
+            "requests": 4440,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 4440,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5128,
+            "requests": 4440,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 4440,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5640,
+            "requests": 3564,
+            "hits": 336,
+            "missesPendingReturn": 822,
+            "missesSeenSize": 2406,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2556,
+            "requests": 3564,
+            "hits": 1008,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2556,
+            "missesNewSize": 0
+          },
+          {
+            "size": 2552,
+            "requests": 3060,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 3060,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5644,
+            "requests": 2880,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2880,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5136,
+            "requests": 2665,
+            "hits": 888,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 1777,
+            "missesNewSize": 0
+          },
+          {
+            "size": 11272,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2664,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5112,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2664,
+            "missesNewSize": 0
+          },
+          {
+            "size": 11280,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2664,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5104,
+            "requests": 2664,
+            "hits": 0,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 2664,
+            "missesNewSize": 0
+          },
+          {
+            "size": 11248,
+            "requests": 2664,
+            "hits": 148,
+            "missesPendingReturn": 740,
+            "missesSeenSize": 1776,
+            "missesNewSize": 0
+          },
+          {
+            "size": 196,
+            "requests": 2538,
+            "hits": 2256,
+            "missesPendingReturn": 141,
+            "missesSeenSize": 141,
+            "missesNewSize": 0
+          },
+          {
+            "size": 64,
+            "requests": 2538,
+            "hits": 2397,
+            "missesPendingReturn": 0,
+            "missesSeenSize": 141,
+            "missesNewSize": 0
+          },
+          {
+            "size": 5624,
+            "requests": 2052,
+            "hits": 114,
+            "missesPendingReturn": 570,
+            "missesSeenSize": 1368,
+            "missesNewSize": 0
+          },
+          {
+            "size": 200,
+            "requests": 1974,
+            "hits": 1551,
+            "missesPendingReturn": 141,
+            "missesSeenSize": 282,
+            "missesNewSize": 0
+          },
+          {
+            "size": 60,
+            "requests": 1974,
+            "hits": 1739,
+            "missesPendingReturn": 94,
+            "missesSeenSize": 141,
+            "missesNewSize": 0
+          },
+          {
+            "size": 641,
+            "requests": 1872,
+            "hits": 0,
+            "missesPendingReturn": 12,
+            "missesSeenSize": 1860,
+            "missesNewSize": 0
+          }
+        ]
+      }
+    ],
+    "close": {
+      "governorMiB": 0,
+      "poolMiB": 0,
+      "residentMiB": 0
+    }
+  },
+  "component": {
+    "scope": "Fixture load/warmup/GC excluded. Real ReturnPool and two-way structuredClone transfer, synthetic writes, validation/clear/eviction; no IO/decode/frame assembly/MessagePort latency. 5 fresh-process alternating pairs. CPU is process user+system; thread CPU also supplied. Candidates have identical outputs/checksum and reject no returns. Current source policy unchanged; only cap argument differs.",
+    "sameCodeControl": [
+      {
+        "round": 0,
+        "hostLoad": [10.67, 11.19, 11.81],
+        "variant": "baseline",
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 711.576,
+        "threadCpuMs": 465.472,
+        "wallMs": 598.9988470000001
+      },
+      {
+        "round": 0,
+        "hostLoad": [10.67, 11.19, 11.81],
+        "variant": "candidate",
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 671.25,
+        "threadCpuMs": 452.327,
+        "wallMs": 556.5646739999999
+      },
+      {
+        "round": 1,
+        "hostLoad": [10.67, 11.19, 11.81],
+        "variant": "candidate",
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 600.014,
+        "threadCpuMs": 398.187,
+        "wallMs": 468.65308100000004
+      },
+      {
+        "round": 1,
+        "hostLoad": [10.67, 11.19, 11.81],
+        "variant": "baseline",
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 657.387,
+        "threadCpuMs": 441.674,
+        "wallMs": 518.926041
+      },
+      {
+        "round": 2,
+        "hostLoad": [11.1, 11.27, 11.83],
+        "variant": "baseline",
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 709.139,
+        "threadCpuMs": 476.241,
+        "wallMs": 549.0008260000001
+      },
+      {
+        "round": 2,
+        "hostLoad": [11.1, 11.27, 11.83],
+        "variant": "candidate",
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 631.442,
+        "threadCpuMs": 440.884,
+        "wallMs": 596.9327529999999
+      },
+      {
+        "round": 3,
+        "hostLoad": [11.1, 11.27, 11.83],
+        "variant": "candidate",
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 655.376,
+        "threadCpuMs": 450.478,
+        "wallMs": 553.406181
+      },
+      {
+        "round": 3,
+        "hostLoad": [11.33, 11.32, 11.84],
+        "variant": "baseline",
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 690.75,
+        "threadCpuMs": 444.911,
+        "wallMs": 551.27384
+      },
+      {
+        "round": 4,
+        "hostLoad": [11.33, 11.32, 11.84],
+        "variant": "baseline",
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 778.794,
+        "threadCpuMs": 496.892,
+        "wallMs": 586.867177
+      },
+      {
+        "round": 4,
+        "hostLoad": [11.33, 11.32, 11.84],
+        "variant": "candidate",
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 704.478,
+        "threadCpuMs": 491.822,
+        "wallMs": 765.600962
+      },
+      {
+        "variant": "baseline",
+        "cpuMs": {
+          "median": 709.139,
+          "min": 657.387,
+          "max": 778.794
+        },
+        "threadCpuMs": {
+          "median": 465.472,
+          "min": 441.674,
+          "max": 496.892
+        },
+        "wallMs": {
+          "median": 551.27384,
+          "min": 518.926041,
+          "max": 598.9988470000001
+        }
+      },
+      {
+        "variant": "candidate",
+        "cpuMs": {
+          "median": 655.376,
+          "min": 600.014,
+          "max": 704.478
+        },
+        "threadCpuMs": {
+          "median": 450.478,
+          "min": 398.187,
+          "max": 491.822
+        },
+        "wallMs": {
+          "median": 556.5646739999999,
+          "min": 468.65308100000004,
+          "max": 765.600962
+        }
+      }
+    ],
+    "boundedCapComparison": [
+      {
+        "round": 0,
+        "hostLoad": [7.73, 9.79, 11.18],
+        "variant": "baseline",
+        "capBytes": 4194304,
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 639.119,
+        "threadCpuMs": 437.983,
+        "wallMs": 493.4448810000001
+      },
+      {
+        "round": 0,
+        "hostLoad": [8.39, 9.89, 11.2],
+        "variant": "candidate",
+        "capBytes": 16777216,
+        "requests": 49260,
+        "hits": 29296,
+        "allocations": 23474,
+        "allocatedBytes": 163619308,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 16168370,
+        "governorPeak": 33554432,
+        "cpuMs": 650.066,
+        "threadCpuMs": 472.026,
+        "wallMs": 537.1812279999999
+      },
+      {
+        "round": 1,
+        "hostLoad": [8.39, 9.89, 11.2],
+        "variant": "candidate",
+        "capBytes": 16777216,
+        "requests": 49260,
+        "hits": 29296,
+        "allocations": 23474,
+        "allocatedBytes": 163619308,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 16168370,
+        "governorPeak": 33554432,
+        "cpuMs": 636.387,
+        "threadCpuMs": 431.704,
+        "wallMs": 465.19432700000004
+      },
+      {
+        "round": 1,
+        "hostLoad": [8.39, 9.89, 11.2],
+        "variant": "baseline",
+        "capBytes": 4194304,
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 566.88,
+        "threadCpuMs": 355.374,
+        "wallMs": 367.90313000000003
+      },
+      {
+        "round": 2,
+        "hostLoad": [8.39, 9.89, 11.2],
+        "variant": "baseline",
+        "capBytes": 4194304,
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 630.53,
+        "threadCpuMs": 418.394,
+        "wallMs": 469.8509599999999
+      },
+      {
+        "round": 2,
+        "hostLoad": [8.12, 9.81, 11.17],
+        "variant": "candidate",
+        "capBytes": 16777216,
+        "requests": 49260,
+        "hits": 29296,
+        "allocations": 23474,
+        "allocatedBytes": 163619308,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 16168370,
+        "governorPeak": 33554432,
+        "cpuMs": 604.524,
+        "threadCpuMs": 434.638,
+        "wallMs": 450.69232
+      },
+      {
+        "round": 3,
+        "hostLoad": [8.12, 9.81, 11.17],
+        "variant": "candidate",
+        "capBytes": 16777216,
+        "requests": 49260,
+        "hits": 29296,
+        "allocations": 23474,
+        "allocatedBytes": 163619308,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 16168370,
+        "governorPeak": 33554432,
+        "cpuMs": 611.321,
+        "threadCpuMs": 414.877,
+        "wallMs": 432.38604999999995
+      },
+      {
+        "round": 3,
+        "hostLoad": [8.12, 9.81, 11.17],
+        "variant": "baseline",
+        "capBytes": 4194304,
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 631.085,
+        "threadCpuMs": 401.471,
+        "wallMs": 537.029072
+      },
+      {
+        "round": 4,
+        "hostLoad": [8.12, 9.81, 11.17],
+        "variant": "baseline",
+        "capBytes": 4194304,
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 610.269,
+        "threadCpuMs": 385.506,
+        "wallMs": 396.769217
+      },
+      {
+        "round": 4,
+        "hostLoad": [7.87, 9.73, 11.14],
+        "variant": "candidate",
+        "capBytes": 16777216,
+        "requests": 49260,
+        "hits": 29296,
+        "allocations": 23474,
+        "allocatedBytes": 163619308,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 16168370,
+        "governorPeak": 33554432,
+        "cpuMs": 653.484,
+        "threadCpuMs": 448.685,
+        "wallMs": 521.0290499999999
+      },
+      {
+        "variant": "baseline",
+        "cpuMs": {
+          "median": 630.53,
+          "min": 566.88,
+          "max": 639.119
+        },
+        "threadCpuMs": {
+          "median": 401.471,
+          "min": 355.374,
+          "max": 437.983
+        },
+        "wallMs": {
+          "median": 469.8509599999999,
+          "min": 367.90313000000003,
+          "max": 537.029072
+        }
+      },
+      {
+        "variant": "candidate",
+        "cpuMs": {
+          "median": 636.387,
+          "min": 604.524,
+          "max": 653.484
+        },
+        "threadCpuMs": {
+          "median": 434.638,
+          "min": 414.877,
+          "max": 472.026
+        },
+        "wallMs": {
+          "median": 465.19432700000004,
+          "min": 432.38604999999995,
+          "max": 537.1812279999999
+        }
+      }
+    ]
+  },
+  "decision": "Keep 4MiB production cap: 16MiB raises prefix hits 19205->29296/49260 and cuts allocated bytes 219300470->163619308, but CPU medians 630.530->636.387ms with overlapping ranges [566.880,639.119] and [604.524,653.484]. Thread medians 401.471->434.638ms. Wall medians 469.851->465.194ms overlap. No whole-export candidate accepted."
+}

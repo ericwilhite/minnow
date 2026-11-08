@@ -72,6 +72,8 @@ export interface Transfer {
    * when this is its result budget; otherwise it must copy/reclassify before publishing.
    */
   readonly detachableBudget?: ByteBudget;
+  /** Source-authorized full-buffer capacity for logical bytes; padding is dedicated and charged. */
+  readonly detachableCapacity?: (bytes: number) => number;
   release(): void;
 }
 

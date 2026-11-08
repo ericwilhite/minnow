@@ -1,10 +1,11 @@
-/** Gate A export: production Executor -> ResultSink/ResultChannel -> unchanged owner transfer
+/** Historical executor-only control: production Executor -> ResultSink/ResultChannel -> unchanged owner transfer
  * policy -> real MessagePort credits. Only plan/snapshot/catalog descriptors are bench fixtures;
  * SQL lowering, B3 catalog/root reads and client row-object construction are excluded. Preparation
  * happens before profiling. Execution admission, scanning, framing, posting and credit drain count.
  * Default mode measures current production defaults. The explicit returnPool experiment supplies
  * dedicated output reuse and always transfers buffers, including tiny frames, so release can detach
  * every returned view. It is separate from ordinary owner credits and result lifetimes.
+ * Current production API measurements use owner-export.ts and ProtocolClient.exportStream.
  */
 import type {
   ReturnPool,
@@ -24,7 +25,7 @@ import type { ExportGroup, ExportResult } from "./export-stream.js";
 import { benchTableOf } from "./scan-fixture.js";
 
 export interface ExecutorExportStats {
-  readonly path: "production-executor";
+  readonly path: "production-executor" | "production-owner-api";
   readonly outputRecycling: boolean;
   readonly frames: number;
   readonly wireBytes: number;

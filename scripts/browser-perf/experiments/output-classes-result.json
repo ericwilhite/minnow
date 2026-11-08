@@ -1,0 +1,3333 @@
+{
+  "scope": "Explicit streaming-export terminal scan output only; fixed 4 MiB return pool. Full-buffer views, logical row counts, zero slack; ordinary query/cursor exact-size path unchanged. No stored format or wire-form change. Quiet-host Gate A outstanding.",
+  "parent": "fba3307ffdeba88d21632c6e2af2e79f23d59786",
+  "fixture": "1048576 exported rows x200, 16 exported groups, 987 MiB OPFS in 17 groups including excluded hot group; 1 generated group copied to distinct addresses. Verification poison off, normal integrity checks on.",
+  "componentScope": "5 fresh-process alternating AB/BA rounds each campaign. Real ReturnPool and real two-way structuredClone transfer; caller rounds fresh/reused native storage; synthetic logical byte fills. Excludes setup/loading/warmup/GC, IO/decode/frame assembly/MessagePort latency. All physical slack is charged. RSS absolute loop peak includes allocator state left by variant warmup; loop growth uses post-warmup/GC baseline. Sampling every 256 events can miss shorter peaks. Bench reference policy compared with independent class enumeration in generated tests.",
+  "component": {
+    "initial": [
+      {
+        "round": 0,
+        "hostLoad": [7.58, 10.13, 11.59],
+        "variant": "baseline",
+        "capBytes": 4194304,
+        "bucketed": false,
+        "slackBytes": 0,
+        "measuredRssPeakMiB": 186.08984375,
+        "measuredRssGrowthMiB": 3.75,
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 641.191,
+        "threadCpuMs": 435.012,
+        "wallMs": 451.1034330000001
+      },
+      {
+        "round": 0,
+        "hostLoad": [7.58, 10.13, 11.59],
+        "variant": "candidate",
+        "capBytes": 4194304,
+        "bucketed": true,
+        "slackBytes": 30483423,
+        "measuredRssPeakMiB": 145.7109375,
+        "measuredRssGrowthMiB": 4.25,
+        "requests": 49260,
+        "hits": 47138,
+        "allocations": 5632,
+        "allocatedBytes": 34584379,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 2453344,
+        "governorPeak": 20971520,
+        "cpuMs": 465.923,
+        "threadCpuMs": 350.227,
+        "wallMs": 355.07625700000006
+      },
+      {
+        "round": 1,
+        "hostLoad": [7.58, 10.13, 11.59],
+        "variant": "candidate",
+        "capBytes": 4194304,
+        "bucketed": true,
+        "slackBytes": 30483423,
+        "measuredRssPeakMiB": 145.125,
+        "measuredRssGrowthMiB": 3.25,
+        "requests": 49260,
+        "hits": 47138,
+        "allocations": 5632,
+        "allocatedBytes": 34584379,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 2453344,
+        "governorPeak": 20971520,
+        "cpuMs": 440.765,
+        "threadCpuMs": 349.896,
+        "wallMs": 359.79677100000004
+      },
+      {
+        "round": 1,
+        "hostLoad": [7.58, 10.13, 11.59],
+        "variant": "baseline",
+        "capBytes": 4194304,
+        "bucketed": false,
+        "slackBytes": 0,
+        "measuredRssPeakMiB": 189.6015625,
+        "measuredRssGrowthMiB": 2.125,
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 691.45,
+        "threadCpuMs": 450.929,
+        "wallMs": 469.15059899999994
+      },
+      {
+        "round": 2,
+        "hostLoad": [7.37, 10.05, 11.56],
+        "variant": "baseline",
+        "capBytes": 4194304,
+        "bucketed": false,
+        "slackBytes": 0,
+        "measuredRssPeakMiB": 177.50390625,
+        "measuredRssGrowthMiB": 10.625,
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 566.363,
+        "threadCpuMs": 338.638,
+        "wallMs": 347.72759300000007
+      },
+      {
+        "round": 2,
+        "hostLoad": [7.37, 10.05, 11.56],
+        "variant": "candidate",
+        "capBytes": 4194304,
+        "bucketed": true,
+        "slackBytes": 30483423,
+        "measuredRssPeakMiB": 147.07421875,
+        "measuredRssGrowthMiB": 3.5,
+        "requests": 49260,
+        "hits": 47138,
+        "allocations": 5632,
+        "allocatedBytes": 34584379,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 2453344,
+        "governorPeak": 20971520,
+        "cpuMs": 474.297,
+        "threadCpuMs": 351.978,
+        "wallMs": 358.24858400000005
+      },
+      {
+        "round": 3,
+        "hostLoad": [7.37, 10.05, 11.56],
+        "variant": "candidate",
+        "capBytes": 4194304,
+        "bucketed": true,
+        "slackBytes": 30483423,
+        "measuredRssPeakMiB": 151.40234375,
+        "measuredRssGrowthMiB": 1.875,
+        "requests": 49260,
+        "hits": 47138,
+        "allocations": 5632,
+        "allocatedBytes": 34584379,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 2453344,
+        "governorPeak": 20971520,
+        "cpuMs": 498.368,
+        "threadCpuMs": 386.291,
+        "wallMs": 391.39901900000007
+      },
+      {
+        "round": 3,
+        "hostLoad": [7.37, 10.05, 11.56],
+        "variant": "baseline",
+        "capBytes": 4194304,
+        "bucketed": false,
+        "slackBytes": 0,
+        "measuredRssPeakMiB": 185.73828125,
+        "measuredRssGrowthMiB": 1.375,
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 714.771,
+        "threadCpuMs": 481.219,
+        "wallMs": 506.7673960000001
+      },
+      {
+        "round": 4,
+        "hostLoad": [7.37, 10.05, 11.56],
+        "variant": "baseline",
+        "capBytes": 4194304,
+        "bucketed": false,
+        "slackBytes": 0,
+        "measuredRssPeakMiB": 183.47265625,
+        "measuredRssGrowthMiB": 4.5,
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 589.764,
+        "threadCpuMs": 384.112,
+        "wallMs": 394.1106219999999
+      },
+      {
+        "round": 4,
+        "hostLoad": [7.34, 10, 11.53],
+        "variant": "candidate",
+        "capBytes": 4194304,
+        "bucketed": true,
+        "slackBytes": 30483423,
+        "measuredRssPeakMiB": 150.1953125,
+        "measuredRssGrowthMiB": 3.625,
+        "requests": 49260,
+        "hits": 47138,
+        "allocations": 5632,
+        "allocatedBytes": 34584379,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 2453344,
+        "governorPeak": 20971520,
+        "cpuMs": 397.74,
+        "threadCpuMs": 281.024,
+        "wallMs": 283.35036900000006
+      },
+      {
+        "variant": "baseline",
+        "cpuMs": {
+          "median": 641.191,
+          "min": 566.363,
+          "max": 714.771
+        },
+        "threadCpuMs": {
+          "median": 435.012,
+          "min": 338.638,
+          "max": 481.219
+        },
+        "wallMs": {
+          "median": 451.1034330000001,
+          "min": 347.72759300000007,
+          "max": 506.7673960000001
+        },
+        "measuredRssPeakMiB": {
+          "median": 185.73828125,
+          "min": 177.50390625,
+          "max": 189.6015625
+        },
+        "measuredRssGrowthMiB": {
+          "median": 3.75,
+          "min": 1.375,
+          "max": 10.625
+        }
+      },
+      {
+        "variant": "candidate",
+        "cpuMs": {
+          "median": 465.923,
+          "min": 397.74,
+          "max": 498.368
+        },
+        "threadCpuMs": {
+          "median": 350.227,
+          "min": 281.024,
+          "max": 386.291
+        },
+        "wallMs": {
+          "median": 358.24858400000005,
+          "min": 283.35036900000006,
+          "max": 391.39901900000007
+        },
+        "measuredRssPeakMiB": {
+          "median": 147.07421875,
+          "min": 145.125,
+          "max": 151.40234375
+        },
+        "measuredRssGrowthMiB": {
+          "median": 3.5,
+          "min": 1.875,
+          "max": 4.25
+        }
+      }
+    ],
+    "final": [
+      {
+        "round": 0,
+        "hostLoad": [3.82, 6.2, 8.33],
+        "variant": "baseline",
+        "capBytes": 4194304,
+        "bucketed": false,
+        "slackBytes": 0,
+        "measuredRssPeakMiB": 182.5625,
+        "measuredRssGrowthMiB": 2.875,
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 472.178,
+        "threadCpuMs": 307.397,
+        "wallMs": 314.75089700000007
+      },
+      {
+        "round": 0,
+        "hostLoad": [3.99, 6.2, 8.32],
+        "variant": "candidate",
+        "capBytes": 4194304,
+        "bucketed": true,
+        "slackBytes": 30483423,
+        "measuredRssPeakMiB": 149.35546875,
+        "measuredRssGrowthMiB": 3.75,
+        "requests": 49260,
+        "hits": 47138,
+        "allocations": 5632,
+        "allocatedBytes": 34584379,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 2453344,
+        "governorPeak": 20971520,
+        "cpuMs": 317.843,
+        "threadCpuMs": 233.713,
+        "wallMs": 236.11325299999993
+      },
+      {
+        "round": 1,
+        "hostLoad": [3.99, 6.2, 8.32],
+        "variant": "candidate",
+        "capBytes": 4194304,
+        "bucketed": true,
+        "slackBytes": 30483423,
+        "measuredRssPeakMiB": 149.00390625,
+        "measuredRssGrowthMiB": 3.875,
+        "requests": 49260,
+        "hits": 47138,
+        "allocations": 5632,
+        "allocatedBytes": 34584379,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 2453344,
+        "governorPeak": 20971520,
+        "cpuMs": 324.707,
+        "threadCpuMs": 241.935,
+        "wallMs": 244.05954400000002
+      },
+      {
+        "round": 1,
+        "hostLoad": [3.99, 6.2, 8.32],
+        "variant": "baseline",
+        "capBytes": 4194304,
+        "bucketed": false,
+        "slackBytes": 0,
+        "measuredRssPeakMiB": 178.97265625,
+        "measuredRssGrowthMiB": 6.75,
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 458.257,
+        "threadCpuMs": 284.636,
+        "wallMs": 288.368279
+      },
+      {
+        "round": 2,
+        "hostLoad": [3.99, 6.2, 8.32],
+        "variant": "baseline",
+        "capBytes": 4194304,
+        "bucketed": false,
+        "slackBytes": 0,
+        "measuredRssPeakMiB": 183.68359375,
+        "measuredRssGrowthMiB": 1.875,
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 485.379,
+        "threadCpuMs": 293.748,
+        "wallMs": 299.749391
+      },
+      {
+        "round": 2,
+        "hostLoad": [3.99, 6.2, 8.32],
+        "variant": "candidate",
+        "capBytes": 4194304,
+        "bucketed": true,
+        "slackBytes": 30483423,
+        "measuredRssPeakMiB": 145.66015625,
+        "measuredRssGrowthMiB": 1.5,
+        "requests": 49260,
+        "hits": 47138,
+        "allocations": 5632,
+        "allocatedBytes": 34584379,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 2453344,
+        "governorPeak": 20971520,
+        "cpuMs": 326.714,
+        "threadCpuMs": 243.82,
+        "wallMs": 247.44369799999998
+      },
+      {
+        "round": 3,
+        "hostLoad": [3.99, 6.2, 8.32],
+        "variant": "candidate",
+        "capBytes": 4194304,
+        "bucketed": true,
+        "slackBytes": 30483423,
+        "measuredRssPeakMiB": 151.49609375,
+        "measuredRssGrowthMiB": 3.875,
+        "requests": 49260,
+        "hits": 47138,
+        "allocations": 5632,
+        "allocatedBytes": 34584379,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 2453344,
+        "governorPeak": 20971520,
+        "cpuMs": 299.395,
+        "threadCpuMs": 221.173,
+        "wallMs": 223.07927600000005
+      },
+      {
+        "round": 3,
+        "hostLoad": [3.99, 6.2, 8.32],
+        "variant": "baseline",
+        "capBytes": 4194304,
+        "bucketed": false,
+        "slackBytes": 0,
+        "measuredRssPeakMiB": 183.16796875,
+        "measuredRssGrowthMiB": 9.75,
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 494.592,
+        "threadCpuMs": 319.661,
+        "wallMs": 324.829843
+      },
+      {
+        "round": 4,
+        "hostLoad": [3.83, 6.13, 8.29],
+        "variant": "baseline",
+        "capBytes": 4194304,
+        "bucketed": false,
+        "slackBytes": 0,
+        "measuredRssPeakMiB": 180.41796875,
+        "measuredRssGrowthMiB": 7.625,
+        "requests": 49260,
+        "hits": 19205,
+        "allocations": 33565,
+        "allocatedBytes": 219300470,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 3554863,
+        "governorPeak": 20971520,
+        "cpuMs": 494.57,
+        "threadCpuMs": 299.164,
+        "wallMs": 302.32799
+      },
+      {
+        "round": 4,
+        "hostLoad": [3.83, 6.13, 8.29],
+        "variant": "candidate",
+        "capBytes": 4194304,
+        "bucketed": true,
+        "slackBytes": 30483423,
+        "measuredRssPeakMiB": 147.796875,
+        "measuredRssGrowthMiB": 1.75,
+        "requests": 49260,
+        "hits": 47138,
+        "allocations": 5632,
+        "allocatedBytes": 34584379,
+        "accepted": 51488,
+        "rejected": 0,
+        "checksum": 6272766,
+        "poolBytes": 2453344,
+        "governorPeak": 20971520,
+        "cpuMs": 343.437,
+        "threadCpuMs": 255.528,
+        "wallMs": 258.022602
+      },
+      {
+        "variant": "baseline",
+        "cpuMs": {
+          "median": 485.379,
+          "min": 458.257,
+          "max": 494.592
+        },
+        "threadCpuMs": {
+          "median": 299.164,
+          "min": 284.636,
+          "max": 319.661
+        },
+        "wallMs": {
+          "median": 302.32799,
+          "min": 288.368279,
+          "max": 324.829843
+        },
+        "measuredRssPeakMiB": {
+          "median": 182.5625,
+          "min": 178.97265625,
+          "max": 183.68359375
+        },
+        "measuredRssGrowthMiB": {
+          "median": 6.75,
+          "min": 1.875,
+          "max": 9.75
+        }
+      },
+      {
+        "variant": "candidate",
+        "cpuMs": {
+          "median": 324.707,
+          "min": 299.395,
+          "max": 343.437
+        },
+        "threadCpuMs": {
+          "median": 241.935,
+          "min": 221.173,
+          "max": 255.528
+        },
+        "wallMs": {
+          "median": 244.05954400000002,
+          "min": 223.07927600000005,
+          "max": 258.022602
+        },
+        "measuredRssPeakMiB": {
+          "median": 149.00390625,
+          "min": 145.66015625,
+          "max": 151.49609375
+        },
+        "measuredRssGrowthMiB": {
+          "median": 3.75,
+          "min": 1.5,
+          "max": 3.875
+        }
+      }
+    ]
+  },
+  "browserScope": "Real ProtocolClient.exportStream, SQL/compose/server/executor/ResultSink/ResultChannel and real transfer/release. Fixture catalog/snapshot descriptors replace B3 discovery; excludes client row-object construction. Minimal request/hit counters included on both routes. Paired control uses current runtime with exact sizing, candidate with classes; pool contents and old capabilities cleared before EACH paired pass. Normal standalone retains the pool across five passes. Fixed campaign RSS baseline; no forced GC between passes. Raw outlier retained.",
+  "browser": {
+    "initialPairs": {
+      "rows": 1048576,
+      "series": {
+        "scope": "one renderer and worker, space, governor and pool across five rounds (two queries per paired round); no forced GC between passes; collection only after campaign",
+        "outputRecycling": false,
+        "open": {
+          "timeOrigin": 1794098717561.7,
+          "pass": 0,
+          "governorMiB": 2.0087890625,
+          "poolMiB": 0,
+          "residentMiB": 0
+        },
+        "memoryBefore": {
+          "page": {
+            "usedSize": 3108588,
+            "totalSize": 5410816,
+            "embedderHeapUsedSize": 857712,
+            "backingStorageSize": 794088
+          },
+          "workers": [
+            {
+              "usedSize": 13882448,
+              "totalSize": 18378752,
+              "embedderHeapUsedSize": 1598440,
+              "backingStorageSize": 15316739
+            }
+          ]
+        },
+        "beforeCollection": {
+          "memory": {
+            "page": {
+              "usedSize": 10500548,
+              "totalSize": 45256704,
+              "embedderHeapUsedSize": 2439488,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 17328880,
+                "totalSize": 80244736,
+                "embedderHeapUsedSize": 390072,
+                "backingStorageSize": 195127010
+              }
+            ]
+          },
+          "rendererMiB": 413.7109375
+        },
+        "afterCollection": {
+          "memory": {
+            "page": {
+              "usedSize": 2587084,
+              "totalSize": 3313664,
+              "embedderHeapUsedSize": 379424,
+              "backingStorageSize": 793879
+            },
+            "workers": [
+              {
+                "usedSize": 15072488,
+                "totalSize": 16019456,
+                "embedderHeapUsedSize": 306928,
+                "backingStorageSize": 84226358
+              }
+            ]
+          },
+          "rendererMiB": 276.38671875
+        },
+        "close": {
+          "governorMiB": 0,
+          "poolMiB": 0,
+          "residentMiB": 0
+        },
+        "afterClose": {
+          "memory": {
+            "page": {
+              "usedSize": 2604836,
+              "totalSize": 3575808,
+              "embedderHeapUsedSize": 770344,
+              "backingStorageSize": 793920
+            },
+            "workers": []
+          },
+          "rendererMiB": 205.6328125
+        }
+      },
+      "pageBootstrap": "export-only",
+      "built": {
+        "groups": 17,
+        "generatedGroups": 1,
+        "dataBytes": 1035210752,
+        "ms": 31182.30000001192
+      },
+      "opfsBytes": 1035451209,
+      "generatedGroups": 1,
+      "exportedRows": 1048576,
+      "exportedGroups": 16,
+      "governorCapMiB": 512,
+      "rowWindowMiB": null,
+      "heapSampling": true,
+      "campaignRendererBaselineMiB": 304.5234375,
+      "campaignRendererPeakMiB": 562.87109375,
+      "scanAdapter": "Production ProtocolClient.exportStream -> OwnerServer -> composeEngine -> real SQL lowering -> Executor/ResultSink/ResultChannel. Fixture catalog and immutable snapshot descriptors exclude B3 root discovery; client row objects excluded. Wall time includes exportStream call through iteration, frame releases and done. CPU is worker only. Prototype control uses the old bench handle.",
+      "cpuSamplingIntervalUs": 1000000,
+      "rounds": 5,
+      "scanProfile": false,
+      "coldOnly": false,
+      "device": {
+        "coldMBps": 1461,
+        "warmMBps": 1737
+      },
+      "afterCampaignGc": {
+        "rendererBeforeMiB": 196.27734375,
+        "rendererAfterMiB": 196.2421875,
+        "page": {
+          "before": {
+            "usedSize": 2604836,
+            "totalSize": 3575808,
+            "embedderHeapUsedSize": 770344,
+            "backingStorageSize": 793920
+          },
+          "after": {
+            "usedSize": 2575332,
+            "totalSize": 3313664,
+            "embedderHeapUsedSize": 378040,
+            "backingStorageSize": 793879
+          }
+        }
+      },
+      "results": [
+        {
+          "series": {
+            "timeOrigin": 1794098717561.7,
+            "pass": 1,
+            "governorMiB": 68.4828405380249,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.9740514755249023,
+            "returnHits": 111528,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 111528,
+            "returnAccepted": 292192
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 5947144,
+              "totalSize": 44208128,
+              "embedderHeapUsedSize": 1598464,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 25682688,
+                "totalSize": 78147584,
+                "embedderHeapUsedSize": 4110800,
+                "backingStorageSize": 197583620
+              }
+            ]
+          },
+          "rendererRssEndMiB": 498.5,
+          "exportCpuSeconds": 10.1,
+          "exportRowsPerCpuSecond": 103819.40594059406,
+          "host": {
+            "before": {
+              "at": "2026-11-08T00:45:18.937Z",
+              "load": [8.72, 8.43, 10.32],
+              "pressure": {
+                "cpu": "some avg10=10.09 avg60=13.23 avg300=12.48 total=81985667537\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=28.04 avg60=10.73 avg300=4.04 total=8951092820\nfull avg10=14.27 avg60=5.25 avg300=1.78 total=4387075337",
+                "memory": "some avg10=0.75 avg60=0.62 avg300=0.79 total=23014283859\nfull avg10=0.55 avg60=0.41 avg300=0.55 total=12753493565"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T00:45:32.937Z",
+              "load": [8.53, 8.41, 10.28],
+              "pressure": {
+                "cpu": "some avg10=21.20 avg60=15.47 avg300=13.02 total=81989043098\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=7.68 avg60=8.73 avg300=3.90 total=8951297020\nfull avg10=3.52 avg60=4.16 avg300=1.70 total=4387142584",
+                "memory": "some avg10=0.18 avg60=0.49 avg300=0.75 total=23014328979\nfull avg10=0.13 avg60=0.32 avg300=0.52 total=12753519794"
+              }
+            }
+          },
+          "label": "cold persistent baseline scan round 0",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1035,
+            "wireBytes": 1530218901,
+            "frameBufferBytes": 1530218901,
+            "transferredBuffers": 292192,
+            "maxFrameRows": 1593,
+            "maxFrameBytes": 2097142,
+            "maxPostedBytes": 3683187,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 1053.100000500679,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 79206,
+          "seconds": 13.2,
+          "exportMs": 13238.599999964237,
+          "loadShare": null,
+          "mbPerSecond": 74,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 205,
+          "arrayBufferPeakMiB": 205,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 193.95703125,
+          "rendererRssBaselineMiB": 304.5234375,
+          "rendererRssAbsolutePeakMiB": 498.48046875,
+          "rendererRssPeakMiB": 194,
+          "workerHeapPeakMiB": 44,
+          "workerCpuSeconds": 10.32,
+          "rowsPerCpuSecond": 101606
+        },
+        {
+          "series": {
+            "timeOrigin": 1794098717561.7,
+            "pass": 2,
+            "governorMiB": 68.50582885742188,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.997039794921875,
+            "returnHits": 391305,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 279777,
+            "returnAccepted": 582946
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 17280360,
+              "totalSize": 44732416,
+              "embedderHeapUsedSize": 3894280,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 36831632,
+                "totalSize": 80244736,
+                "embedderHeapUsedSize": 4314464,
+                "backingStorageSize": 139523805
+              }
+            ]
+          },
+          "rendererRssEndMiB": 466.9765625,
+          "exportCpuSeconds": 8.25,
+          "exportRowsPerCpuSecond": 127100.12121212122,
+          "host": {
+            "before": {
+              "at": "2026-11-08T00:45:33.447Z",
+              "load": [8.53, 8.41, 10.28],
+              "pressure": {
+                "cpu": "some avg10=21.20 avg60=15.47 avg300=13.02 total=81989208794\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=7.68 avg60=8.73 avg300=3.90 total=8951317787\nfull avg10=3.52 avg60=4.16 avg300=1.70 total=4387148783",
+                "memory": "some avg10=0.18 avg60=0.49 avg300=0.75 total=23014333953\nfull avg10=0.13 avg60=0.32 avg300=0.52 total=12753520492"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T00:45:44.794Z",
+              "load": [8.59, 8.43, 10.27],
+              "pressure": {
+                "cpu": "some avg10=23.76 avg60=17.54 avg300=13.59 total=81992085541\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=3.49 avg60=7.47 avg300=3.81 total=8951543853\nfull avg10=1.06 avg60=3.40 avg300=1.63 total=4387233082",
+                "memory": "some avg10=0.12 avg60=0.43 avg300=0.73 total=23014359948\nfull avg10=0.04 avg60=0.26 avg300=0.50 total=12753529685"
+              }
+            }
+          },
+          "label": "cold persistent candidate scan round 0",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1030,
+            "wireBytes": 1650277724,
+            "frameBufferBytes": 1650277724,
+            "transferredBuffers": 290754,
+            "maxFrameRows": 1512,
+            "maxFrameBytes": 2092352,
+            "maxPostedBytes": 3292592,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 1045.0999994277954,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 97647,
+          "seconds": 10.7,
+          "exportMs": 10738.399999976158,
+          "loadShare": null,
+          "mbPerSecond": 91,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 189,
+          "arrayBufferPeakMiB": 189,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 213.02734375,
+          "rendererRssBaselineMiB": 498.5,
+          "rendererRssAbsolutePeakMiB": 517.55078125,
+          "rendererRssPeakMiB": 19,
+          "workerHeapPeakMiB": 50,
+          "workerCpuSeconds": 8.35,
+          "rowsPerCpuSecond": 125578
+        },
+        {
+          "series": {
+            "timeOrigin": 1794098717561.7,
+            "pass": 3,
+            "governorMiB": 68.50582885742188,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.997039794921875,
+            "returnHits": 671422,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 280117,
+            "returnAccepted": 873700
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 29421208,
+              "totalSize": 44732416,
+              "embedderHeapUsedSize": 6364720,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 36744820,
+                "totalSize": 79982592,
+                "embedderHeapUsedSize": 4299288,
+                "backingStorageSize": 139523805
+              }
+            ]
+          },
+          "rendererRssEndMiB": 468.1796875,
+          "exportCpuSeconds": 7.350000000000001,
+          "exportRowsPerCpuSecond": 142663.4013605442,
+          "host": {
+            "before": {
+              "at": "2026-11-08T00:45:45.178Z",
+              "load": [8.59, 8.43, 10.27],
+              "pressure": {
+                "cpu": "some avg10=23.76 avg60=17.54 avg300=13.59 total=81992099379\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=3.49 avg60=7.47 avg300=3.81 total=8951544032\nfull avg10=1.06 avg60=3.40 avg300=1.63 total=4387233187",
+                "memory": "some avg10=0.12 avg60=0.43 avg300=0.73 total=23014359950\nfull avg10=0.04 avg60=0.26 avg300=0.50 total=12753529687"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T00:45:54.735Z",
+              "load": [8.44, 8.4, 10.24],
+              "pressure": {
+                "cpu": "some avg10=17.86 avg60=16.96 avg300=13.59 total=81993497538\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=3.52 avg60=6.85 avg300=3.80 total=8951986053\nfull avg10=1.56 avg60=3.16 avg300=1.63 total=4387492259",
+                "memory": "some avg10=0.34 avg60=0.42 avg300=0.71 total=23014454881\nfull avg10=0.01 avg60=0.22 avg300=0.48 total=12753578063"
+              }
+            }
+          },
+          "label": "cold persistent candidate scan round 1",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1030,
+            "wireBytes": 1650277724,
+            "frameBufferBytes": 1650277724,
+            "transferredBuffers": 290754,
+            "maxFrameRows": 1512,
+            "maxFrameBytes": 2092352,
+            "maxPostedBytes": 3292592,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 785.2000002861023,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 117489,
+          "seconds": 8.9,
+          "exportMs": 8924.900000035763,
+          "loadShare": null,
+          "mbPerSecond": 109,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 186,
+          "arrayBufferPeakMiB": 186,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 200.4296875,
+          "rendererRssBaselineMiB": 466.8828125,
+          "rendererRssAbsolutePeakMiB": 504.953125,
+          "rendererRssPeakMiB": 38,
+          "workerHeapPeakMiB": 46,
+          "workerCpuSeconds": 7.5,
+          "rowsPerCpuSecond": 139810
+        },
+        {
+          "series": {
+            "timeOrigin": 1794098717561.7,
+            "pass": 4,
+            "governorMiB": 68.4828405380249,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.9740514755249023,
+            "returnHits": 781944,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 110522,
+            "returnAccepted": 1165892
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 16418024,
+              "totalSize": 44732416,
+              "embedderHeapUsedSize": 3611888,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 31306456,
+                "totalSize": 78934016,
+                "embedderHeapUsedSize": 2199864,
+                "backingStorageSize": 161990139
+              }
+            ]
+          },
+          "rendererRssEndMiB": 471.98046875,
+          "exportCpuSeconds": 9.2,
+          "exportRowsPerCpuSecond": 113975.65217391305,
+          "host": {
+            "before": {
+              "at": "2026-11-08T00:45:55.162Z",
+              "load": [8.44, 8.4, 10.24],
+              "pressure": {
+                "cpu": "some avg10=17.86 avg60=16.96 avg300=13.59 total=81993551627\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=3.52 avg60=6.85 avg300=3.80 total=8952017605\nfull avg10=1.56 avg60=3.16 avg300=1.63 total=4387505983",
+                "memory": "some avg10=0.34 avg60=0.42 avg300=0.71 total=23014466239\nfull avg10=0.01 avg60=0.22 avg300=0.48 total=12753581985"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T00:46:08.150Z",
+              "load": [9.03, 8.53, 10.25],
+              "pressure": {
+                "cpu": "some avg10=20.90 avg60=17.86 avg300=13.95 total=81996563410\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=4.58 avg60=6.47 avg300=3.86 total=8952735993\nfull avg10=1.88 avg60=2.89 avg300=1.64 total=4387799985",
+                "memory": "some avg10=0.55 avg60=0.48 avg300=0.71 total=23014621635\nfull avg10=0.00 avg60=0.17 avg300=0.46 total=12753642678"
+              }
+            }
+          },
+          "label": "cold persistent baseline scan round 1",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1035,
+            "wireBytes": 1530218901,
+            "frameBufferBytes": 1530218901,
+            "transferredBuffers": 292192,
+            "maxFrameRows": 1593,
+            "maxFrameBytes": 2097142,
+            "maxPostedBytes": 3683187,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 1042.6000007390976,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 83897,
+          "seconds": 12.5,
+          "exportMs": 12498.399999976158,
+          "loadShare": null,
+          "mbPerSecond": 78,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 189,
+          "arrayBufferPeakMiB": 189,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 231.171875,
+          "rendererRssBaselineMiB": 468.03125,
+          "rendererRssAbsolutePeakMiB": 535.6953125,
+          "rendererRssPeakMiB": 68,
+          "workerHeapPeakMiB": 45,
+          "workerCpuSeconds": 9.35,
+          "rowsPerCpuSecond": 112147
+        },
+        {
+          "series": {
+            "timeOrigin": 1794098717561.7,
+            "pass": 5,
+            "governorMiB": 68.4828405380249,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.9740514755249023,
+            "returnHits": 891662,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 109718,
+            "returnAccepted": 1458084
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 3850796,
+              "totalSize": 44994560,
+              "embedderHeapUsedSize": 1113552,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 37180764,
+                "totalSize": 78409728,
+                "embedderHeapUsedSize": 2865048,
+                "backingStorageSize": 170929654
+              }
+            ]
+          },
+          "rendererRssEndMiB": 484.1171875,
+          "exportCpuSeconds": 9.030000000000001,
+          "exportRowsPerCpuSecond": 116121.37320044295,
+          "host": {
+            "before": {
+              "at": "2026-11-08T00:46:08.636Z",
+              "load": [9.03, 8.53, 10.25],
+              "pressure": {
+                "cpu": "some avg10=20.90 avg60=17.86 avg300=13.95 total=81996669904\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=4.58 avg60=6.47 avg300=3.86 total=8952737699\nfull avg10=1.88 avg60=2.89 avg300=1.64 total=4387800446",
+                "memory": "some avg10=0.55 avg60=0.48 avg300=0.71 total=23014621635\nfull avg10=0.00 avg60=0.17 avg300=0.46 total=12753642678"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T00:46:21.286Z",
+              "load": [8.55, 8.45, 10.2],
+              "pressure": {
+                "cpu": "some avg10=19.28 avg60=18.03 avg300=14.15 total=81998888077\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=4.48 avg60=6.06 avg300=3.87 total=8953376533\nfull avg10=1.68 avg60=2.62 avg300=1.63 total=4388103888",
+                "memory": "some avg10=0.67 avg60=0.52 avg300=0.71 total=23014788414\nfull avg10=0.00 avg60=0.14 avg300=0.44 total=12753717622"
+              }
+            }
+          },
+          "label": "cold persistent baseline scan round 2",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1035,
+            "wireBytes": 1530218901,
+            "frameBufferBytes": 1530218901,
+            "transferredBuffers": 292192,
+            "maxFrameRows": 1593,
+            "maxFrameBytes": 2097142,
+            "maxPostedBytes": 3683187,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 913.0999996066093,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 86400,
+          "seconds": 12.1,
+          "exportMs": 12136.299999952316,
+          "loadShare": null,
+          "mbPerSecond": 80,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 206,
+          "arrayBufferPeakMiB": 206,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 258.34765625,
+          "rendererRssBaselineMiB": 471.98046875,
+          "rendererRssAbsolutePeakMiB": 562.87109375,
+          "rendererRssPeakMiB": 91,
+          "workerHeapPeakMiB": 45,
+          "workerCpuSeconds": 9.17,
+          "rowsPerCpuSecond": 114349
+        },
+        {
+          "series": {
+            "timeOrigin": 1794098717561.7,
+            "pass": 6,
+            "governorMiB": 68.50582885742188,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.997039794921875,
+            "returnHits": 1171778,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 280116,
+            "returnAccepted": 1748838
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 15018272,
+              "totalSize": 45518848,
+              "embedderHeapUsedSize": 3468776,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 36416824,
+                "totalSize": 77885440,
+                "embedderHeapUsedSize": 4344928,
+                "backingStorageSize": 139523805
+              }
+            ]
+          },
+          "rendererRssEndMiB": 465.28125,
+          "exportCpuSeconds": 7.380000000000003,
+          "exportRowsPerCpuSecond": 142083.4688346883,
+          "host": {
+            "before": {
+              "at": "2026-11-08T00:46:21.622Z",
+              "load": [8.55, 8.45, 10.2],
+              "pressure": {
+                "cpu": "some avg10=17.23 avg60=17.70 avg300=14.10 total=81998895293\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=4.76 avg60=6.05 avg300=3.89 total=8953391009\nfull avg10=2.10 avg60=2.66 avg300=1.65 total=4388114172",
+                "memory": "some avg10=0.73 avg60=0.53 avg300=0.71 total=23014793619\nfull avg10=0.18 avg60=0.17 avg300=0.44 total=12753721682"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T00:46:31.374Z",
+              "load": [8.76, 8.5, 10.19],
+              "pressure": {
+                "cpu": "some avg10=19.77 avg60=18.10 avg300=14.29 total=82000717547\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=3.39 avg60=5.60 avg300=3.85 total=8953675804\nfull avg10=1.42 avg60=2.45 avg300=1.63 total=4388299139",
+                "memory": "some avg10=0.43 avg60=0.49 avg300=0.70 total=23014845078\nfull avg10=0.08 avg60=0.14 avg300=0.43 total=12753754762"
+              }
+            }
+          },
+          "label": "cold persistent candidate scan round 2",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1030,
+            "wireBytes": 1650277724,
+            "frameBufferBytes": 1650277724,
+            "transferredBuffers": 290754,
+            "maxFrameRows": 1512,
+            "maxFrameBytes": 2092352,
+            "maxPostedBytes": 3292592,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 807.9999999403954,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 112737,
+          "seconds": 9.3,
+          "exportMs": 9301.099999964237,
+          "loadShare": null,
+          "mbPerSecond": 105,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 205,
+          "arrayBufferPeakMiB": 205,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 223.47265625,
+          "rendererRssBaselineMiB": 484.1171875,
+          "rendererRssAbsolutePeakMiB": 527.99609375,
+          "rendererRssPeakMiB": 44,
+          "workerHeapPeakMiB": 46,
+          "workerCpuSeconds": 7.5,
+          "rowsPerCpuSecond": 139810
+        },
+        {
+          "series": {
+            "timeOrigin": 1794098717561.7,
+            "pass": 7,
+            "governorMiB": 68.50582885742188,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.997039794921875,
+            "returnHits": 1451788,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 280010,
+            "returnAccepted": 2039592
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 27281524,
+              "totalSize": 44732416,
+              "embedderHeapUsedSize": 5978456,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 36834892,
+                "totalSize": 81817600,
+                "embedderHeapUsedSize": 4213248,
+                "backingStorageSize": 139523805
+              }
+            ]
+          },
+          "rendererRssEndMiB": 462.48828125,
+          "exportCpuSeconds": 7.82,
+          "exportRowsPerCpuSecond": 134089.00255754477,
+          "host": {
+            "before": {
+              "at": "2026-11-08T00:46:31.747Z",
+              "load": [8.76, 8.5, 10.19],
+              "pressure": {
+                "cpu": "some avg10=17.28 avg60=17.70 avg300=14.23 total=82000726201\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=3.32 avg60=5.52 avg300=3.84 total=8953693730\nfull avg10=1.53 avg60=2.43 avg300=1.63 total=4388312618",
+                "memory": "some avg10=0.35 avg60=0.48 avg300=0.70 total=23014849507\nfull avg10=0.06 avg60=0.14 avg300=0.42 total=12753758249"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T00:46:42.084Z",
+              "load": [9.06, 8.57, 10.2],
+              "pressure": {
+                "cpu": "some avg10=19.53 avg60=18.05 avg300=14.42 total=82002969568\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=2.49 avg60=4.98 avg300=3.78 total=8953947202\nfull avg10=1.28 avg60=2.24 avg300=1.62 total=4388447458",
+                "memory": "some avg10=0.12 avg60=0.40 avg300=0.67 total=23014931998\nfull avg10=0.02 avg60=0.12 avg300=0.41 total=12753808310"
+              }
+            }
+          },
+          "label": "cold persistent candidate scan round 3",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1030,
+            "wireBytes": 1650277724,
+            "frameBufferBytes": 1650277724,
+            "transferredBuffers": 290754,
+            "maxFrameRows": 1512,
+            "maxFrameBytes": 2092352,
+            "maxPostedBytes": 3292592,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 934.6999997496605,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 107493,
+          "seconds": 9.8,
+          "exportMs": 9754.800000011921,
+          "loadShare": null,
+          "mbPerSecond": 100,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 189,
+          "arrayBufferPeakMiB": 189,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 204.640625,
+          "rendererRssBaselineMiB": 465.28125,
+          "rendererRssAbsolutePeakMiB": 509.1640625,
+          "rendererRssPeakMiB": 44,
+          "workerHeapPeakMiB": 50,
+          "workerCpuSeconds": 7.95,
+          "rowsPerCpuSecond": 131896
+        },
+        {
+          "series": {
+            "timeOrigin": 1794098717561.7,
+            "pass": 8,
+            "governorMiB": 68.4828405380249,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.9740514755249023,
+            "returnHits": 1562837,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 111049,
+            "returnAccepted": 2331784
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 12316048,
+              "totalSize": 45256704,
+              "embedderHeapUsedSize": 2761568,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 24646060,
+                "totalSize": 77885440,
+                "embedderHeapUsedSize": 3968344,
+                "backingStorageSize": 195427236
+              }
+            ]
+          },
+          "rendererRssEndMiB": 496.9765625,
+          "exportCpuSeconds": 11.050000000000004,
+          "exportRowsPerCpuSecond": 94893.75565610857,
+          "host": {
+            "before": {
+              "at": "2026-11-08T00:46:42.614Z",
+              "load": [9.06, 8.57, 10.2],
+              "pressure": {
+                "cpu": "some avg10=19.53 avg60=18.05 avg300=14.42 total=82003101120\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=2.49 avg60=4.98 avg300=3.78 total=8953963447\nfull avg10=1.28 avg60=2.24 avg300=1.62 total=4388454231",
+                "memory": "some avg10=0.12 avg60=0.40 avg300=0.67 total=23014951175\nfull avg10=0.02 avg60=0.12 avg300=0.41 total=12753821809"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T00:46:59.282Z",
+              "load": [10.03, 8.8, 10.25],
+              "pressure": {
+                "cpu": "some avg10=24.06 avg60=19.94 avg300=15.06 total=82007660863\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=3.08 avg60=4.50 avg300=3.73 total=8954523842\nfull avg10=0.66 avg60=1.81 avg300=1.55 total=4388635146",
+                "memory": "some avg10=4.87 avg60=1.65 avg300=0.94 total=23015891158\nfull avg10=3.45 avg60=1.04 avg300=0.60 total=12754535787"
+              }
+            }
+          },
+          "label": "cold persistent baseline scan round 3",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1035,
+            "wireBytes": 1530218901,
+            "frameBufferBytes": 1530218901,
+            "transferredBuffers": 292192,
+            "maxFrameRows": 1593,
+            "maxFrameBytes": 2097142,
+            "maxPostedBytes": 3996341,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 1268.999998807907,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 65390,
+          "seconds": 16,
+          "exportMs": 16035.800000011921,
+          "loadShare": null,
+          "mbPerSecond": 61,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 195,
+          "arrayBufferPeakMiB": 195,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 218.3984375,
+          "rendererRssBaselineMiB": 462.11328125,
+          "rendererRssAbsolutePeakMiB": 522.921875,
+          "rendererRssPeakMiB": 61,
+          "workerHeapPeakMiB": 47,
+          "workerCpuSeconds": 11.21,
+          "rowsPerCpuSecond": 93539
+        },
+        {
+          "series": {
+            "timeOrigin": 1794098717561.7,
+            "pass": 9,
+            "governorMiB": 68.49850559234619,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.9897165298461914,
+            "returnHits": 1672695,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 109858,
+            "returnAccepted": 2623976
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 26524600,
+              "totalSize": 45518848,
+              "embedderHeapUsedSize": 5736320,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 28480620,
+                "totalSize": 81293312,
+                "embedderHeapUsedSize": 1995616,
+                "backingStorageSize": 153511981
+              }
+            ]
+          },
+          "rendererRssEndMiB": 471.24609375,
+          "exportCpuSeconds": 9.66000000000001,
+          "exportRowsPerCpuSecond": 108548.24016563135,
+          "host": {
+            "before": {
+              "at": "2026-11-08T00:46:59.837Z",
+              "load": [10.03, 8.8, 10.25],
+              "pressure": {
+                "cpu": "some avg10=26.04 avg60=20.43 avg300=15.19 total=82007869108\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=3.25 avg60=4.48 avg300=3.73 total=8954574691\nfull avg10=0.54 avg60=1.75 avg300=1.54 total=4388636158",
+                "memory": "some avg10=3.99 avg60=1.60 avg300=0.93 total=23015895211\nfull avg10=2.83 avg60=1.01 avg300=0.60 total=12754535850"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T00:47:13.949Z",
+              "load": [10.58, 8.99, 10.29],
+              "pressure": {
+                "cpu": "some avg10=26.13 avg60=21.54 avg300=15.69 total=82011529001\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=3.24 avg60=4.28 avg300=3.72 total=8955114474\nfull avg10=0.44 avg60=1.50 avg300=1.49 total=4388798582",
+                "memory": "some avg10=1.71 avg60=1.44 avg300=0.93 total=23016084766\nfull avg10=0.87 avg60=0.83 avg300=0.57 total=12754614874"
+              }
+            }
+          },
+          "label": "cold persistent baseline scan round 4",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1035,
+            "wireBytes": 1530218901,
+            "frameBufferBytes": 1530218901,
+            "transferredBuffers": 292192,
+            "maxFrameRows": 1593,
+            "maxFrameBytes": 2097142,
+            "maxPostedBytes": 3683187,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 1131.60000115633,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 76770,
+          "seconds": 13.7,
+          "exportMs": 13658.699999988079,
+          "loadShare": null,
+          "mbPerSecond": 71,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 209,
+          "arrayBufferPeakMiB": 209,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 204.8515625,
+          "rendererRssBaselineMiB": 496.9765625,
+          "rendererRssAbsolutePeakMiB": 509.375,
+          "rendererRssPeakMiB": 12,
+          "workerHeapPeakMiB": 46,
+          "workerCpuSeconds": 9.77,
+          "rowsPerCpuSecond": 107326
+        },
+        {
+          "series": {
+            "timeOrigin": 1794098717561.7,
+            "pass": 10,
+            "governorMiB": 68.50582885742188,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.997039794921875,
+            "returnHits": 1952509,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 279814,
+            "returnAccepted": 2914730
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 10500548,
+              "totalSize": 45256704,
+              "embedderHeapUsedSize": 2439488,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 17328880,
+                "totalSize": 80244736,
+                "embedderHeapUsedSize": 390072,
+                "backingStorageSize": 195127010
+              }
+            ]
+          },
+          "rendererRssEndMiB": 413.7109375,
+          "exportCpuSeconds": 12.019999999999996,
+          "exportRowsPerCpuSecond": 87235.94009983364,
+          "host": {
+            "before": {
+              "at": "2026-11-08T00:47:14.357Z",
+              "load": [10.58, 8.99, 10.29],
+              "pressure": {
+                "cpu": "some avg10=26.13 avg60=21.54 avg300=15.69 total=82011615837\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=3.24 avg60=4.28 avg300=3.72 total=8955117084\nfull avg10=0.44 avg60=1.50 avg300=1.49 total=4388798856",
+                "memory": "some avg10=1.71 avg60=1.44 avg300=0.93 total=23016087204\nfull avg10=0.87 avg60=0.83 avg300=0.57 total=12754615463"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T00:47:31.113Z",
+              "load": [11.98, 9.38, 10.39],
+              "pressure": {
+                "cpu": "some avg10=28.68 avg60=23.48 avg300=16.45 total=82016999682\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=2.45 avg60=3.73 avg300=3.62 total=8955578867\nfull avg10=0.21 avg60=1.17 avg300=1.42 total=4388875934",
+                "memory": "some avg10=9.89 avg60=4.21 avg300=1.60 total=23018711627\nfull avg10=7.62 avg60=3.07 avg300=1.11 total=12756651139"
+              }
+            }
+          },
+          "label": "cold persistent candidate scan round 4",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1030,
+            "wireBytes": 1650277724,
+            "frameBufferBytes": 1650277724,
+            "transferredBuffers": 290754,
+            "maxFrameRows": 1512,
+            "maxFrameBytes": 2092352,
+            "maxPostedBytes": 3292592,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 1294.9000003933907,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 64432,
+          "seconds": 16.3,
+          "exportMs": 16274.100000023842,
+          "loadShare": null,
+          "mbPerSecond": 60,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 240,
+          "arrayBufferPeakMiB": 240,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 228.19921875,
+          "rendererRssBaselineMiB": 470.98046875,
+          "rendererRssAbsolutePeakMiB": 532.72265625,
+          "rendererRssPeakMiB": 62,
+          "workerHeapPeakMiB": 52,
+          "workerCpuSeconds": 12.1,
+          "rowsPerCpuSecond": 86659
+        }
+      ]
+    },
+    "standalone": {
+      "rows": 1048576,
+      "series": {
+        "scope": "one renderer and worker, space, governor and pool across five rounds (two queries per paired round); no forced GC between passes; collection only after campaign",
+        "outputRecycling": false,
+        "open": {
+          "timeOrigin": 1794099116408.7,
+          "pass": 0,
+          "governorMiB": 2.0087890625,
+          "poolMiB": 0,
+          "residentMiB": 0
+        },
+        "memoryBefore": {
+          "page": {
+            "usedSize": 3719172,
+            "totalSize": 5935104,
+            "embedderHeapUsedSize": 1631352,
+            "backingStorageSize": 794185
+          },
+          "workers": [
+            {
+              "usedSize": 14222692,
+              "totalSize": 18378752,
+              "embedderHeapUsedSize": 1622624,
+              "backingStorageSize": 15316739
+            }
+          ]
+        },
+        "beforeCollection": {
+          "memory": {
+            "page": {
+              "usedSize": 16526656,
+              "totalSize": 58363904,
+              "embedderHeapUsedSize": 3940200,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 47448212,
+                "totalSize": 86274048,
+                "embedderHeapUsedSize": 4662256,
+                "backingStorageSize": 195127010
+              }
+            ]
+          },
+          "rendererMiB": 504.27734375
+        },
+        "afterCollection": {
+          "memory": {
+            "page": {
+              "usedSize": 2545484,
+              "totalSize": 3313664,
+              "embedderHeapUsedSize": 379440,
+              "backingStorageSize": 793879
+            },
+            "workers": [
+              {
+                "usedSize": 14863296,
+                "totalSize": 16543744,
+                "embedderHeapUsedSize": 306936,
+                "backingStorageSize": 84226358
+              }
+            ]
+          },
+          "rendererMiB": 285.4921875
+        },
+        "close": {
+          "governorMiB": 0,
+          "poolMiB": 0,
+          "residentMiB": 0
+        },
+        "afterClose": {
+          "memory": {
+            "page": {
+              "usedSize": 2572196,
+              "totalSize": 3575808,
+              "embedderHeapUsedSize": 752608,
+              "backingStorageSize": 793920
+            },
+            "workers": []
+          },
+          "rendererMiB": 205.65625
+        }
+      },
+      "pageBootstrap": "export-only",
+      "built": {
+        "groups": 17,
+        "generatedGroups": 1,
+        "dataBytes": 1035210752,
+        "ms": 18685.299999952316
+      },
+      "opfsBytes": 1035451233,
+      "generatedGroups": 1,
+      "exportedRows": 1048576,
+      "exportedGroups": 16,
+      "governorCapMiB": 512,
+      "rowWindowMiB": null,
+      "heapSampling": true,
+      "campaignRendererBaselineMiB": 327.00390625,
+      "campaignRendererPeakMiB": 527.89453125,
+      "scanAdapter": "Production ProtocolClient.exportStream -> OwnerServer -> composeEngine -> real SQL lowering -> Executor/ResultSink/ResultChannel. Fixture catalog and immutable snapshot descriptors exclude B3 root discovery; client row objects excluded. Wall time includes exportStream call through iteration, frame releases and done. CPU is worker only. Prototype control uses the old bench handle.",
+      "cpuSamplingIntervalUs": 1000000,
+      "rounds": 5,
+      "scanProfile": false,
+      "coldOnly": false,
+      "device": {
+        "coldMBps": 1111,
+        "warmMBps": 6460
+      },
+      "afterCampaignGc": {
+        "rendererBeforeMiB": 204.91015625,
+        "rendererAfterMiB": 204.56640625,
+        "page": {
+          "before": {
+            "usedSize": 2572196,
+            "totalSize": 3575808,
+            "embedderHeapUsedSize": 752608,
+            "backingStorageSize": 793920
+          },
+          "after": {
+            "usedSize": 2542524,
+            "totalSize": 3313664,
+            "embedderHeapUsedSize": 378056,
+            "backingStorageSize": 793879
+          }
+        }
+      },
+      "results": [
+        {
+          "series": {
+            "timeOrigin": 1794099116408.7,
+            "pass": 1,
+            "governorMiB": 68.50582885742188,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.997039794921875,
+            "returnHits": 279828,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 279828,
+            "returnAccepted": 290754
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 26052640,
+              "totalSize": 42635264,
+              "embedderHeapUsedSize": 5733264,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 36121272,
+                "totalSize": 81293312,
+                "embedderHeapUsedSize": 4327208,
+                "backingStorageSize": 139523805
+              }
+            ]
+          },
+          "rendererRssEndMiB": 446.10546875,
+          "exportCpuSeconds": 9.21,
+          "exportRowsPerCpuSecond": 113851.90010857763,
+          "host": {
+            "before": {
+              "at": "2026-11-08T00:51:57.878Z",
+              "load": [9.76, 9.84, 10.34],
+              "pressure": {
+                "cpu": "some avg10=19.61 avg60=18.13 avg300=18.44 total=82070832542\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=2.10 avg60=1.23 avg300=2.27 total=8960666096\nfull avg10=0.24 avg60=0.15 avg300=0.71 total=4390676399",
+                "memory": "some avg10=1.75 avg60=0.72 avg300=0.97 total=23020881375\nfull avg10=1.39 avg60=0.52 avg300=0.65 total=12758091637"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T00:52:11.045Z",
+              "load": [10.41, 9.98, 10.38],
+              "pressure": {
+                "cpu": "some avg10=23.21 avg60=19.27 avg300=18.68 total=82073912455\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=1.89 avg60=1.29 avg300=2.23 total=8960910188\nfull avg10=0.07 avg60=0.12 avg300=0.68 total=4390713515",
+                "memory": "some avg10=0.94 avg60=0.71 avg300=0.96 total=23021037282\nfull avg10=0.71 avg60=0.51 avg300=0.64 total=12758214031"
+              }
+            }
+          },
+          "label": "cold persistent candidate scan round 0",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1030,
+            "wireBytes": 1650277724,
+            "frameBufferBytes": 1650277724,
+            "transferredBuffers": 290754,
+            "maxFrameRows": 1512,
+            "maxFrameBytes": 2092352,
+            "maxPostedBytes": 3292592,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 1112.5000002980232,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 84490,
+          "seconds": 12.4,
+          "exportMs": 12410.699999988079,
+          "loadShare": null,
+          "mbPerSecond": 79,
+          "platformReads": 4947,
+          "governorPeakMiB": 179,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 187,
+          "arrayBufferPeakMiB": 187,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 155.671875,
+          "rendererRssBaselineMiB": 327.00390625,
+          "rendererRssAbsolutePeakMiB": 482.67578125,
+          "rendererRssPeakMiB": 156,
+          "workerHeapPeakMiB": 44,
+          "workerCpuSeconds": 9.44,
+          "rowsPerCpuSecond": 111078
+        },
+        {
+          "series": {
+            "timeOrigin": 1794099116408.7,
+            "pass": 2,
+            "governorMiB": 68.50582885742188,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.997039794921875,
+            "returnHits": 559814,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 279986,
+            "returnAccepted": 581508
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 10670364,
+              "totalSize": 57839616,
+              "embedderHeapUsedSize": 2490240,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 47457224,
+                "totalSize": 86011904,
+                "embedderHeapUsedSize": 4556608,
+                "backingStorageSize": 195127010
+              }
+            ]
+          },
+          "rendererRssEndMiB": 514.43359375,
+          "exportCpuSeconds": 8.63,
+          "exportRowsPerCpuSecond": 121503.59212050984,
+          "host": {
+            "before": {
+              "at": "2026-11-08T00:52:11.417Z",
+              "load": [10.78, 10.06, 10.41],
+              "pressure": {
+                "cpu": "some avg10=23.21 avg60=19.27 avg300=18.68 total=82073972530\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=1.89 avg60=1.29 avg300=2.23 total=8960913353\nfull avg10=0.07 avg60=0.12 avg300=0.68 total=4390714901",
+                "memory": "some avg10=0.94 avg60=0.71 avg300=0.96 total=23021045346\nfull avg10=0.71 avg60=0.51 avg300=0.64 total=12758222045"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T00:52:23.284Z",
+              "load": [11.04, 10.14, 10.43],
+              "pressure": {
+                "cpu": "some avg10=22.15 avg60=19.58 avg300=18.77 total=82076570686\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.83 avg60=1.11 avg300=2.16 total=8961017567\nfull avg10=0.02 avg60=0.10 avg300=0.65 total=4390751404",
+                "memory": "some avg10=0.35 avg60=0.60 avg300=0.93 total=23021097878\nfull avg10=0.28 avg60=0.45 avg300=0.62 total=12758266938"
+              }
+            }
+          },
+          "label": "cold persistent candidate scan round 1",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1030,
+            "wireBytes": 1650277724,
+            "frameBufferBytes": 1650277724,
+            "transferredBuffers": 290754,
+            "maxFrameRows": 1512,
+            "maxFrameBytes": 2092352,
+            "maxPostedBytes": 3292592,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 1022.9000014662743,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 93425,
+          "seconds": 11.2,
+          "exportMs": 11223.699999988079,
+          "loadShare": null,
+          "mbPerSecond": 87,
+          "platformReads": 4947,
+          "governorPeakMiB": 179,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 186,
+          "arrayBufferPeakMiB": 186,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 189.54296875,
+          "rendererRssBaselineMiB": 446.10546875,
+          "rendererRssAbsolutePeakMiB": 516.546875,
+          "rendererRssPeakMiB": 70,
+          "workerHeapPeakMiB": 50,
+          "workerCpuSeconds": 8.76,
+          "rowsPerCpuSecond": 119700
+        },
+        {
+          "series": {
+            "timeOrigin": 1794099116408.7,
+            "pass": 3,
+            "governorMiB": 68.50582885742188,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.997039794921875,
+            "returnHits": 839574,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 279760,
+            "returnAccepted": 872262
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 21483960,
+              "totalSize": 57839616,
+              "embedderHeapUsedSize": 4790688,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 36870876,
+                "totalSize": 81555456,
+                "embedderHeapUsedSize": 4399240,
+                "backingStorageSize": 139523805
+              }
+            ]
+          },
+          "rendererRssEndMiB": 471.7734375,
+          "exportCpuSeconds": 8.379999999999999,
+          "exportRowsPerCpuSecond": 125128.40095465396,
+          "host": {
+            "before": {
+              "at": "2026-11-08T00:52:23.808Z",
+              "load": [11.04, 10.14, 10.43],
+              "pressure": {
+                "cpu": "some avg10=21.04 avg60=19.46 avg300=18.75 total=82076649970\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.68 avg60=1.08 avg300=2.14 total=8961019998\nfull avg10=0.01 avg60=0.10 avg300=0.65 total=4390753145",
+                "memory": "some avg10=0.83 avg60=0.68 avg300=0.94 total=23021134765\nfull avg10=0.77 avg60=0.53 avg300=0.64 total=12758301250"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T00:52:35.311Z",
+              "load": [10.49, 10.05, 10.4],
+              "pressure": {
+                "cpu": "some avg10=20.62 avg60=19.56 avg300=18.79 total=82079062542\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.25 avg60=0.91 avg300=2.07 total=8961109431\nfull avg10=0.00 avg60=0.08 avg300=0.63 total=4390784886",
+                "memory": "some avg10=0.30 avg60=0.58 avg300=0.91 total=23021203970\nfull avg10=0.28 avg60=0.45 avg300=0.62 total=12758359825"
+              }
+            }
+          },
+          "label": "cold persistent candidate scan round 2",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1030,
+            "wireBytes": 1650277724,
+            "frameBufferBytes": 1650277724,
+            "transferredBuffers": 290754,
+            "maxFrameRows": 1512,
+            "maxFrameBytes": 2092352,
+            "maxPostedBytes": 3292592,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 1044.9000006914139,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 96987,
+          "seconds": 10.8,
+          "exportMs": 10811.5,
+          "loadShare": null,
+          "mbPerSecond": 90,
+          "platformReads": 4947,
+          "governorPeakMiB": 179,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 187,
+          "arrayBufferPeakMiB": 187,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 191.62890625,
+          "rendererRssBaselineMiB": 514.43359375,
+          "rendererRssAbsolutePeakMiB": 518.6328125,
+          "rendererRssPeakMiB": 4,
+          "workerHeapPeakMiB": 47,
+          "workerCpuSeconds": 8.57,
+          "rowsPerCpuSecond": 122354
+        },
+        {
+          "series": {
+            "timeOrigin": 1794099116408.7,
+            "pass": 4,
+            "governorMiB": 68.50582885742188,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.997039794921875,
+            "returnHits": 1119628,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 280054,
+            "returnAccepted": 1163016
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 6576924,
+              "totalSize": 58363904,
+              "embedderHeapUsedSize": 1794560,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 35548020,
+                "totalSize": 81817600,
+                "embedderHeapUsedSize": 4300120,
+                "backingStorageSize": 139523805
+              }
+            ]
+          },
+          "rendererRssEndMiB": 475.60546875,
+          "exportCpuSeconds": 8.350000000000005,
+          "exportRowsPerCpuSecond": 125577.96407185622,
+          "host": {
+            "before": {
+              "at": "2026-11-08T00:52:35.864Z",
+              "load": [10.49, 10.05, 10.4],
+              "pressure": {
+                "cpu": "some avg10=21.23 avg60=19.70 avg300=18.83 total=82079174666\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.20 avg60=0.88 avg300=2.05 total=8961111641\nfull avg10=0.00 avg60=0.08 avg300=0.62 total=4390786074",
+                "memory": "some avg10=0.97 avg60=0.69 avg300=0.93 total=23021253766\nfull avg10=0.77 avg60=0.53 avg300=0.63 total=12758407331"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T00:52:47.431Z",
+              "load": [10.63, 10.11, 10.41],
+              "pressure": {
+                "cpu": "some avg10=20.90 avg60=19.79 avg300=18.88 total=82081486552\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.31 avg60=0.83 avg300=2.00 total=8961227892\nfull avg10=0.00 avg60=0.06 avg300=0.60 total=4390819093",
+                "memory": "some avg10=0.43 avg60=0.61 avg300=0.91 total=23021268530\nfull avg10=0.36 avg60=0.48 avg300=0.62 total=12758419195"
+              }
+            }
+          },
+          "label": "cold persistent candidate scan round 3",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1030,
+            "wireBytes": 1650277724,
+            "frameBufferBytes": 1650277724,
+            "transferredBuffers": 290754,
+            "maxFrameRows": 1512,
+            "maxFrameBytes": 2092352,
+            "maxPostedBytes": 3292592,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 1072.3000003695488,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 95648,
+          "seconds": 11,
+          "exportMs": 10962.900000035763,
+          "loadShare": null,
+          "mbPerSecond": 89,
+          "platformReads": 4947,
+          "governorPeakMiB": 179,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 211,
+          "arrayBufferPeakMiB": 211,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 200.890625,
+          "rendererRssBaselineMiB": 471.7734375,
+          "rendererRssAbsolutePeakMiB": 527.89453125,
+          "rendererRssPeakMiB": 56,
+          "workerHeapPeakMiB": 47,
+          "workerCpuSeconds": 8.51,
+          "rowsPerCpuSecond": 123217
+        },
+        {
+          "series": {
+            "timeOrigin": 1794099116408.7,
+            "pass": 5,
+            "governorMiB": 68.50582885742188,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.997039794921875,
+            "returnHits": 1399601,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 279973,
+            "returnAccepted": 1453770
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 16526656,
+              "totalSize": 58363904,
+              "embedderHeapUsedSize": 3940200,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 47448212,
+                "totalSize": 86274048,
+                "embedderHeapUsedSize": 4662256,
+                "backingStorageSize": 195127010
+              }
+            ]
+          },
+          "rendererRssEndMiB": 504.27734375,
+          "exportCpuSeconds": 8.299999999999997,
+          "exportRowsPerCpuSecond": 126334.45783132534,
+          "host": {
+            "before": {
+              "at": "2026-11-08T00:52:47.949Z",
+              "load": [10.63, 10.11, 10.41],
+              "pressure": {
+                "cpu": "some avg10=19.65 avg60=19.60 avg300=18.84 total=82081564477\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.26 avg60=0.80 avg300=1.99 total=8961227892\nfull avg10=0.00 avg60=0.06 avg300=0.60 total=4390819093",
+                "memory": "some avg10=0.35 avg60=0.59 avg300=0.90 total=23021268530\nfull avg10=0.29 avg60=0.46 avg300=0.61 total=12758419195"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T00:52:59.248Z",
+              "load": [10.7, 10.14, 10.42],
+              "pressure": {
+                "cpu": "some avg10=20.20 avg60=19.65 avg300=18.88 total=82083790513\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.09 avg60=0.68 avg300=1.92 total=8961293162\nfull avg10=0.00 avg60=0.05 avg300=0.57 total=4390840281",
+                "memory": "some avg10=0.13 avg60=0.50 avg300=0.87 total=23021298737\nfull avg10=0.10 avg60=0.39 avg300=0.59 total=12758443595"
+              }
+            }
+          },
+          "label": "cold persistent candidate scan round 4",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1030,
+            "wireBytes": 1650277724,
+            "frameBufferBytes": 1650277724,
+            "transferredBuffers": 290754,
+            "maxFrameRows": 1512,
+            "maxFrameBytes": 2092352,
+            "maxPostedBytes": 3292592,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 1108.9000011086464,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 97492,
+          "seconds": 10.8,
+          "exportMs": 10755.5,
+          "loadShare": null,
+          "mbPerSecond": 91,
+          "platformReads": 4947,
+          "governorPeakMiB": 179,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 186,
+          "arrayBufferPeakMiB": 186,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 188.90234375,
+          "rendererRssBaselineMiB": 475.60546875,
+          "rendererRssAbsolutePeakMiB": 515.90625,
+          "rendererRssPeakMiB": 40,
+          "workerHeapPeakMiB": 50,
+          "workerCpuSeconds": 8.46,
+          "rowsPerCpuSecond": 123945
+        }
+      ]
+    },
+    "finalPairs": {
+      "rows": 1048576,
+      "series": {
+        "scope": "one renderer and worker, space, governor and pool across five rounds (two queries per paired round); no forced GC between passes; collection only after campaign",
+        "outputRecycling": false,
+        "open": {
+          "timeOrigin": 1794099777738.1,
+          "pass": 0,
+          "governorMiB": 2.0087890625,
+          "poolMiB": 0,
+          "residentMiB": 0
+        },
+        "memoryBefore": {
+          "page": {
+            "usedSize": 3719172,
+            "totalSize": 6197248,
+            "embedderHeapUsedSize": 1631056,
+            "backingStorageSize": 794185
+          },
+          "workers": [
+            {
+              "usedSize": 14216516,
+              "totalSize": 18378752,
+              "embedderHeapUsedSize": 1605160,
+              "backingStorageSize": 15317224
+            }
+          ]
+        },
+        "beforeCollection": {
+          "memory": {
+            "page": {
+              "usedSize": 12050824,
+              "totalSize": 45518848,
+              "embedderHeapUsedSize": 2742056,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 37083304,
+                "totalSize": 78409728,
+                "embedderHeapUsedSize": 4307752,
+                "backingStorageSize": 139524290
+              }
+            ]
+          },
+          "rendererMiB": 463.03515625
+        },
+        "afterCollection": {
+          "memory": {
+            "page": {
+              "usedSize": 2586296,
+              "totalSize": 3313664,
+              "embedderHeapUsedSize": 378520,
+              "backingStorageSize": 793879
+            },
+            "workers": [
+              {
+                "usedSize": 15051292,
+                "totalSize": 17068032,
+                "embedderHeapUsedSize": 306944,
+                "backingStorageSize": 84226843
+              }
+            ]
+          },
+          "rendererMiB": 286.828125
+        },
+        "close": {
+          "governorMiB": 0,
+          "poolMiB": 0,
+          "residentMiB": 0
+        },
+        "afterClose": {
+          "memory": {
+            "page": {
+              "usedSize": 2604048,
+              "totalSize": 3575808,
+              "embedderHeapUsedSize": 763064,
+              "backingStorageSize": 793920
+            },
+            "workers": []
+          },
+          "rendererMiB": 198.1640625
+        }
+      },
+      "pageBootstrap": "export-only",
+      "built": {
+        "groups": 17,
+        "generatedGroups": 1,
+        "dataBytes": 1035210752,
+        "ms": 10036.799999952316
+      },
+      "opfsBytes": 1035451213,
+      "generatedGroups": 1,
+      "exportedRows": 1048576,
+      "exportedGroups": 16,
+      "governorCapMiB": 512,
+      "rowWindowMiB": null,
+      "heapSampling": true,
+      "campaignRendererBaselineMiB": 343.41015625,
+      "campaignRendererPeakMiB": 576.66796875,
+      "scanAdapter": "Production ProtocolClient.exportStream -> OwnerServer -> composeEngine -> real SQL lowering -> Executor/ResultSink/ResultChannel. Fixture catalog and immutable snapshot descriptors exclude B3 root discovery; client row objects excluded. Wall time includes exportStream call through iteration, frame releases and done. CPU is worker only. Prototype control uses the old bench handle.",
+      "cpuSamplingIntervalUs": 1000000,
+      "rounds": 5,
+      "scanProfile": false,
+      "coldOnly": false,
+      "device": {
+        "coldMBps": 1895,
+        "warmMBps": 9809
+      },
+      "afterCampaignGc": {
+        "rendererBeforeMiB": 198.1640625,
+        "rendererAfterMiB": 197.25390625,
+        "page": {
+          "before": {
+            "usedSize": 2604048,
+            "totalSize": 3575808,
+            "embedderHeapUsedSize": 763064,
+            "backingStorageSize": 793920
+          },
+          "after": {
+            "usedSize": 2574776,
+            "totalSize": 3313664,
+            "embedderHeapUsedSize": 377136,
+            "backingStorageSize": 793879
+          }
+        }
+      },
+      "results": [
+        {
+          "series": {
+            "timeOrigin": 1794099777738.1,
+            "pass": 1,
+            "governorMiB": 68.4828405380249,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.9740514755249023,
+            "returnHits": 108231,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 108231,
+            "returnAccepted": 292192
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 16286452,
+              "totalSize": 44732416,
+              "embedderHeapUsedSize": 3531448,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 21329340,
+                "totalSize": 79196160,
+                "embedderHeapUsedSize": 1275344,
+                "backingStorageSize": 146234804
+              }
+            ]
+          },
+          "rendererRssEndMiB": 462.46484375,
+          "exportCpuSeconds": 6.529999999999999,
+          "exportRowsPerCpuSecond": 160578.25421133233,
+          "host": {
+            "before": {
+              "at": "2026-11-08T01:02:58.388Z",
+              "load": [3.57, 5.96, 8.19],
+              "pressure": {
+                "cpu": "some avg10=1.22 avg60=1.19 avg300=5.08 total=82112588777\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=2.26 avg60=0.63 avg300=0.69 total=8966200136\nfull avg10=1.81 avg60=0.45 avg300=0.28 total=4393528452",
+                "memory": "some avg10=0.05 avg60=0.02 avg300=0.17 total=23022914681\nfull avg10=0.00 avg60=0.00 avg300=0.11 total=12759852744"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T01:03:06.229Z",
+              "load": [3.61, 5.92, 8.17],
+              "pressure": {
+                "cpu": "some avg10=1.20 avg60=1.19 avg300=4.97 total=82112733283\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=1.16 avg60=0.58 avg300=0.67 total=8966261200\nfull avg10=0.81 avg60=0.39 avg300=0.27 total=4393583767",
+                "memory": "some avg10=0.02 avg60=0.02 avg300=0.17 total=23022915899\nfull avg10=0.00 avg60=0.00 avg300=0.11 total=12759853668"
+              }
+            }
+          },
+          "label": "cold persistent baseline scan round 0",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1035,
+            "wireBytes": 1530218901,
+            "frameBufferBytes": 1530218901,
+            "transferredBuffers": 292192,
+            "maxFrameRows": 1593,
+            "maxFrameBytes": 2097142,
+            "maxPostedBytes": 3683187,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 509.3000002503395,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 140834,
+          "seconds": 7.4,
+          "exportMs": 7445.5,
+          "loadShare": null,
+          "mbPerSecond": 131,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 199,
+          "arrayBufferPeakMiB": 199,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 180.5078125,
+          "rendererRssBaselineMiB": 343.41015625,
+          "rendererRssAbsolutePeakMiB": 523.91796875,
+          "rendererRssPeakMiB": 181,
+          "workerHeapPeakMiB": 45,
+          "workerCpuSeconds": 6.64,
+          "rowsPerCpuSecond": 157918
+        },
+        {
+          "series": {
+            "timeOrigin": 1794099777738.1,
+            "pass": 2,
+            "governorMiB": 68.50582885742188,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.997039794921875,
+            "returnHits": 388350,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 280119,
+            "returnAccepted": 582946
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 28816800,
+              "totalSize": 44732416,
+              "embedderHeapUsedSize": 6204960,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 36800172,
+                "totalSize": 81293312,
+                "embedderHeapUsedSize": 4299776,
+                "backingStorageSize": 139524290
+              }
+            ]
+          },
+          "rendererRssEndMiB": 482.2109375,
+          "exportCpuSeconds": 5.25,
+          "exportRowsPerCpuSecond": 199728.7619047619,
+          "host": {
+            "before": {
+              "at": "2026-11-08T01:03:06.495Z",
+              "load": [3.48, 5.86, 8.14],
+              "pressure": {
+                "cpu": "some avg10=1.20 avg60=1.19 avg300=4.97 total=82112734245\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=1.16 avg60=0.58 avg300=0.67 total=8966261212\nfull avg10=0.81 avg60=0.39 avg300=0.27 total=4393583778",
+                "memory": "some avg10=0.02 avg60=0.02 avg300=0.17 total=23022915899\nfull avg10=0.00 avg60=0.00 avg300=0.11 total=12759853668"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T01:03:12.663Z",
+              "load": [3.36, 5.79, 8.1],
+              "pressure": {
+                "cpu": "some avg10=0.98 avg60=1.14 avg300=4.88 total=82112814530\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=1.20 avg60=0.65 avg300=0.69 total=8966373960\nfull avg10=0.86 avg60=0.44 avg300=0.29 total=4393686540",
+                "memory": "some avg10=0.01 avg60=0.01 avg300=0.16 total=23022916210\nfull avg10=0.00 avg60=0.00 avg300=0.11 total=12759853980"
+              }
+            }
+          },
+          "label": "cold persistent candidate scan round 0",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1030,
+            "wireBytes": 1650277724,
+            "frameBufferBytes": 1650277724,
+            "transferredBuffers": 290754,
+            "maxFrameRows": 1512,
+            "maxFrameBytes": 2092352,
+            "maxPostedBytes": 3292592,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 490.4000008702278,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 178950,
+          "seconds": 5.9,
+          "exportMs": 5859.600000023842,
+          "loadShare": null,
+          "mbPerSecond": 166,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 231,
+          "arrayBufferPeakMiB": 231,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 206.0078125,
+          "rendererRssBaselineMiB": 462.46484375,
+          "rendererRssAbsolutePeakMiB": 549.41796875,
+          "rendererRssPeakMiB": 87,
+          "workerHeapPeakMiB": 50,
+          "workerCpuSeconds": 5.27,
+          "rowsPerCpuSecond": 198971
+        },
+        {
+          "series": {
+            "timeOrigin": 1794099777738.1,
+            "pass": 3,
+            "governorMiB": 68.50582885742188,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.997039794921875,
+            "returnHits": 668469,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 280119,
+            "returnAccepted": 873700
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 12228484,
+              "totalSize": 45518848,
+              "embedderHeapUsedSize": 2750944,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 36494132,
+                "totalSize": 79720448,
+                "embedderHeapUsedSize": 4293616,
+                "backingStorageSize": 139524290
+              }
+            ]
+          },
+          "rendererRssEndMiB": 462.09375,
+          "exportCpuSeconds": 5.579999999999998,
+          "exportRowsPerCpuSecond": 187916.84587813626,
+          "host": {
+            "before": {
+              "at": "2026-11-08T01:03:12.926Z",
+              "load": [3.36, 5.79, 8.1],
+              "pressure": {
+                "cpu": "some avg10=0.98 avg60=1.14 avg300=4.88 total=82112815049\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=1.20 avg60=0.65 avg300=0.69 total=8966373960\nfull avg10=0.86 avg60=0.44 avg300=0.29 total=4393686540",
+                "memory": "some avg10=0.01 avg60=0.01 avg300=0.16 total=23022916210\nfull avg10=0.00 avg60=0.00 avg300=0.11 total=12759853980"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T01:03:19.560Z",
+              "load": [3.49, 5.78, 8.09],
+              "pressure": {
+                "cpu": "some avg10=1.23 avg60=1.16 avg300=4.81 total=82112968342\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=1.11 avg60=0.68 avg300=0.69 total=8966439379\nfull avg10=0.59 avg60=0.43 avg300=0.29 total=4393746412",
+                "memory": "some avg10=0.00 avg60=0.01 avg300=0.16 total=23022935167\nfull avg10=0.00 avg60=0.00 avg300=0.10 total=12759872193"
+              }
+            }
+          },
+          "label": "cold persistent candidate scan round 1",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1030,
+            "wireBytes": 1650277724,
+            "frameBufferBytes": 1650277724,
+            "transferredBuffers": 290754,
+            "maxFrameRows": 1512,
+            "maxFrameBytes": 2092352,
+            "maxPostedBytes": 3292592,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 545.8999993801117,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 168826,
+          "seconds": 6.2,
+          "exportMs": 6211,
+          "loadShare": null,
+          "mbPerSecond": 157,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 183,
+          "arrayBufferPeakMiB": 183,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 157.38671875,
+          "rendererRssBaselineMiB": 482.2109375,
+          "rendererRssAbsolutePeakMiB": 500.796875,
+          "rendererRssPeakMiB": 19,
+          "workerHeapPeakMiB": 47,
+          "workerCpuSeconds": 5.69,
+          "rowsPerCpuSecond": 184284
+        },
+        {
+          "series": {
+            "timeOrigin": 1794099777738.1,
+            "pass": 4,
+            "governorMiB": 68.49850559234619,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.9897165298461914,
+            "returnHits": 777888,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 109419,
+            "returnAccepted": 1165892
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 26547388,
+              "totalSize": 45518848,
+              "embedderHeapUsedSize": 5694248,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 20518064,
+                "totalSize": 79982592,
+                "embedderHeapUsedSize": 1173264,
+                "backingStorageSize": 142733540
+              }
+            ]
+          },
+          "rendererRssEndMiB": 477.4765625,
+          "exportCpuSeconds": 6.050000000000001,
+          "exportRowsPerCpuSecond": 173318.347107438,
+          "host": {
+            "before": {
+              "at": "2026-11-08T01:03:19.859Z",
+              "load": [3.49, 5.78, 8.09],
+              "pressure": {
+                "cpu": "some avg10=1.23 avg60=1.16 avg300=4.81 total=82112971024\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=1.11 avg60=0.68 avg300=0.69 total=8966439379\nfull avg10=0.59 avg60=0.43 avg300=0.29 total=4393746412",
+                "memory": "some avg10=0.00 avg60=0.01 avg300=0.16 total=23022935976\nfull avg10=0.00 avg60=0.00 avg300=0.10 total=12759873001"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T01:03:27.193Z",
+              "load": [3.5, 5.71, 8.04],
+              "pressure": {
+                "cpu": "some avg10=1.44 avg60=1.23 avg300=4.72 total=82113119921\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.64 avg60=0.63 avg300=0.68 total=8966509172\nfull avg10=0.41 avg60=0.41 avg300=0.28 total=4393812094",
+                "memory": "some avg10=0.00 avg60=0.01 avg300=0.15 total=23022939484\nfull avg10=0.00 avg60=0.00 avg300=0.10 total=12759876293"
+              }
+            }
+          },
+          "label": "cold persistent baseline scan round 1",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1035,
+            "wireBytes": 1530218901,
+            "frameBufferBytes": 1530218901,
+            "transferredBuffers": 292192,
+            "maxFrameRows": 1593,
+            "maxFrameBytes": 2097142,
+            "maxPostedBytes": 3683187,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 516.5,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 151664,
+          "seconds": 6.9,
+          "exportMs": 6913.799999952316,
+          "loadShare": null,
+          "mbPerSecond": 141,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 201,
+          "arrayBufferPeakMiB": 201,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 195.0703125,
+          "rendererRssBaselineMiB": 462.09375,
+          "rendererRssAbsolutePeakMiB": 538.48046875,
+          "rendererRssPeakMiB": 76,
+          "workerHeapPeakMiB": 45,
+          "workerCpuSeconds": 6.14,
+          "rowsPerCpuSecond": 170778
+        },
+        {
+          "series": {
+            "timeOrigin": 1794099777738.1,
+            "pass": 5,
+            "governorMiB": 68.4828405380249,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.9740514755249023,
+            "returnHits": 886457,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 108569,
+            "returnAccepted": 1458084
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 13126444,
+              "totalSize": 45518848,
+              "embedderHeapUsedSize": 2860504,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 22249736,
+                "totalSize": 80506880,
+                "embedderHeapUsedSize": 1362056,
+                "backingStorageSize": 146234804
+              }
+            ]
+          },
+          "rendererRssEndMiB": 472.9765625,
+          "exportCpuSeconds": 5.810000000000002,
+          "exportRowsPerCpuSecond": 180477.79690189322,
+          "host": {
+            "before": {
+              "at": "2026-11-08T01:03:27.444Z",
+              "load": [3.5, 5.71, 8.04],
+              "pressure": {
+                "cpu": "some avg10=1.44 avg60=1.23 avg300=4.72 total=82113121241\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.64 avg60=0.63 avg300=0.68 total=8966510041\nfull avg10=0.41 avg60=0.41 avg300=0.28 total=4393812834",
+                "memory": "some avg10=0.00 avg60=0.01 avg300=0.15 total=23022939484\nfull avg10=0.00 avg60=0.00 avg300=0.10 total=12759876293"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T01:03:34.491Z",
+              "load": [3.54, 5.68, 8.02],
+              "pressure": {
+                "cpu": "some avg10=1.20 avg60=1.20 avg300=4.62 total=82113219381\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.39 avg60=0.58 avg300=0.67 total=8966573915\nfull avg10=0.18 avg60=0.36 avg300=0.27 total=4393873899",
+                "memory": "some avg10=0.00 avg60=0.01 avg300=0.15 total=23022939484\nfull avg10=0.00 avg60=0.00 avg300=0.10 total=12759876293"
+              }
+            }
+          },
+          "label": "cold persistent baseline scan round 2",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1035,
+            "wireBytes": 1530218901,
+            "frameBufferBytes": 1530218901,
+            "transferredBuffers": 292192,
+            "maxFrameRows": 1593,
+            "maxFrameBytes": 2097142,
+            "maxPostedBytes": 3248337,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 496.79999989271164,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 157361,
+          "seconds": 6.7,
+          "exportMs": 6663.5,
+          "loadShare": null,
+          "mbPerSecond": 146,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 238,
+          "arrayBufferPeakMiB": 238,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 233.2578125,
+          "rendererRssBaselineMiB": 477.4765625,
+          "rendererRssAbsolutePeakMiB": 576.66796875,
+          "rendererRssPeakMiB": 99,
+          "workerHeapPeakMiB": 46,
+          "workerCpuSeconds": 5.86,
+          "rowsPerCpuSecond": 178938
+        },
+        {
+          "series": {
+            "timeOrigin": 1794099777738.1,
+            "pass": 6,
+            "governorMiB": 68.50582885742188,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.997039794921875,
+            "returnHits": 1166576,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 280119,
+            "returnAccepted": 1748838
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 24258012,
+              "totalSize": 45518848,
+              "embedderHeapUsedSize": 5432280,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 28558764,
+                "totalSize": 85487616,
+                "embedderHeapUsedSize": 4955056,
+                "backingStorageSize": 195127495
+              }
+            ]
+          },
+          "rendererRssEndMiB": 492.8671875,
+          "exportCpuSeconds": 5.049999999999997,
+          "exportRowsPerCpuSecond": 207638.81188118825,
+          "host": {
+            "before": {
+              "at": "2026-11-08T01:03:34.753Z",
+              "load": [3.54, 5.68, 8.02],
+              "pressure": {
+                "cpu": "some avg10=1.20 avg60=1.20 avg300=4.62 total=82113220980\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.39 avg60=0.58 avg300=0.67 total=8966573915\nfull avg10=0.18 avg60=0.36 avg300=0.27 total=4393873899",
+                "memory": "some avg10=0.00 avg60=0.01 avg300=0.15 total=23022939484\nfull avg10=0.00 avg60=0.00 avg300=0.10 total=12759876293"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T01:03:40.870Z",
+              "load": [3.5, 5.63, 7.99],
+              "pressure": {
+                "cpu": "some avg10=0.96 avg60=1.15 avg300=4.54 total=82113288222\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.21 avg60=0.52 avg300=0.66 total=8966632506\nfull avg10=0.10 avg60=0.32 avg300=0.27 total=4393930052",
+                "memory": "some avg10=0.00 avg60=0.00 avg300=0.14 total=23022939484\nfull avg10=0.00 avg60=0.00 avg300=0.09 total=12759876293"
+              }
+            }
+          },
+          "label": "cold persistent candidate scan round 2",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1030,
+            "wireBytes": 1650277724,
+            "frameBufferBytes": 1650277724,
+            "transferredBuffers": 290754,
+            "maxFrameRows": 1512,
+            "maxFrameBytes": 2092352,
+            "maxPostedBytes": 3292592,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 505.7999992966652,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 185176,
+          "seconds": 5.7,
+          "exportMs": 5662.600000023842,
+          "loadShare": null,
+          "mbPerSecond": 172,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 232,
+          "arrayBufferPeakMiB": 232,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 203.17578125,
+          "rendererRssBaselineMiB": 472.9765625,
+          "rendererRssAbsolutePeakMiB": 546.5859375,
+          "rendererRssPeakMiB": 74,
+          "workerHeapPeakMiB": 45,
+          "workerCpuSeconds": 5.1,
+          "rowsPerCpuSecond": 205603
+        },
+        {
+          "series": {
+            "timeOrigin": 1794099777738.1,
+            "pass": 7,
+            "governorMiB": 68.50582885742188,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.997039794921875,
+            "returnHits": 1446695,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 280119,
+            "returnAccepted": 2039592
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 5985128,
+              "totalSize": 45518848,
+              "embedderHeapUsedSize": 1591648,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 17176872,
+                "totalSize": 81817600,
+                "embedderHeapUsedSize": 404144,
+                "backingStorageSize": 195127495
+              }
+            ]
+          },
+          "rendererRssEndMiB": 423.55859375,
+          "exportCpuSeconds": 5.100000000000001,
+          "exportRowsPerCpuSecond": 205603.1372549019,
+          "host": {
+            "before": {
+              "at": "2026-11-08T01:03:41.145Z",
+              "load": [3.5, 5.63, 7.99],
+              "pressure": {
+                "cpu": "some avg10=0.96 avg60=1.15 avg300=4.54 total=82113290165\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.21 avg60=0.52 avg300=0.66 total=8966632932\nfull avg10=0.10 avg60=0.32 avg300=0.27 total=4393930422",
+                "memory": "some avg10=0.00 avg60=0.00 avg300=0.14 total=23022939484\nfull avg10=0.00 avg60=0.00 avg300=0.09 total=12759876293"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T01:03:47.263Z",
+              "load": [3.89, 5.64, 7.97],
+              "pressure": {
+                "cpu": "some avg10=0.97 avg60=1.13 avg300=4.47 total=82113376034\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.50 avg60=0.57 avg300=0.66 total=8966735728\nfull avg10=0.29 avg60=0.35 avg300=0.28 total=4394023566",
+                "memory": "some avg10=0.00 avg60=0.00 avg300=0.14 total=23022941809\nfull avg10=0.00 avg60=0.00 avg300=0.09 total=12759878524"
+              }
+            }
+          },
+          "label": "cold persistent candidate scan round 3",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1030,
+            "wireBytes": 1650277724,
+            "frameBufferBytes": 1650277724,
+            "transferredBuffers": 290754,
+            "maxFrameRows": 1512,
+            "maxFrameBytes": 2092352,
+            "maxPostedBytes": 3292592,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 498.30000019073486,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 184407,
+          "seconds": 5.7,
+          "exportMs": 5686.199999988079,
+          "loadShare": null,
+          "mbPerSecond": 171,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 187,
+          "arrayBufferPeakMiB": 187,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 149.45703125,
+          "rendererRssBaselineMiB": 492.8671875,
+          "rendererRssAbsolutePeakMiB": 492.8671875,
+          "rendererRssPeakMiB": 0,
+          "workerHeapPeakMiB": 48,
+          "workerCpuSeconds": 5.2,
+          "rowsPerCpuSecond": 201649
+        },
+        {
+          "series": {
+            "timeOrigin": 1794099777738.1,
+            "pass": 8,
+            "governorMiB": 68.4828405380249,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.9740514755249023,
+            "returnHits": 1555250,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 108555,
+            "returnAccepted": 2331784
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 17159672,
+              "totalSize": 45518848,
+              "embedderHeapUsedSize": 3729528,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 37302724,
+                "totalSize": 80506880,
+                "embedderHeapUsedSize": 2733840,
+                "backingStorageSize": 171316286
+              }
+            ]
+          },
+          "rendererRssEndMiB": 497.8359375,
+          "exportCpuSeconds": 6.6100000000000065,
+          "exportRowsPerCpuSecond": 158634.79576399378,
+          "host": {
+            "before": {
+              "at": "2026-11-08T01:03:47.533Z",
+              "load": [3.89, 5.64, 7.97],
+              "pressure": {
+                "cpu": "some avg10=0.97 avg60=1.13 avg300=4.47 total=82113379586\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.50 avg60=0.57 avg300=0.66 total=8966735728\nfull avg10=0.29 avg60=0.35 avg300=0.28 total=4394023566",
+                "memory": "some avg10=0.00 avg60=0.00 avg300=0.14 total=23022941809\nfull avg10=0.00 avg60=0.00 avg300=0.09 total=12759878524"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T01:03:55.635Z",
+              "load": [3.9, 5.62, 7.95],
+              "pressure": {
+                "cpu": "some avg10=2.57 avg60=1.46 avg300=4.45 total=82113744802\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.22 avg60=0.49 avg300=0.64 total=8966810102\nfull avg10=0.13 avg60=0.31 avg300=0.27 total=4394085084",
+                "memory": "some avg10=0.00 avg60=0.00 avg300=0.13 total=23022959121\nfull avg10=0.00 avg60=0.00 avg300=0.09 total=12759894782"
+              }
+            }
+          },
+          "label": "cold persistent baseline scan round 3",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1035,
+            "wireBytes": 1530218901,
+            "frameBufferBytes": 1530218901,
+            "transferredBuffers": 292192,
+            "maxFrameRows": 1593,
+            "maxFrameBytes": 2097142,
+            "maxPostedBytes": 3683187,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 554.8999997377396,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 137054,
+          "seconds": 7.7,
+          "exportMs": 7650.800000011921,
+          "loadShare": null,
+          "mbPerSecond": 127,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 196,
+          "arrayBufferPeakMiB": 196,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 222.53125,
+          "rendererRssBaselineMiB": 423.55859375,
+          "rendererRssAbsolutePeakMiB": 565.94140625,
+          "rendererRssPeakMiB": 142,
+          "workerHeapPeakMiB": 46,
+          "workerCpuSeconds": 6.67,
+          "rowsPerCpuSecond": 157208
+        },
+        {
+          "series": {
+            "timeOrigin": 1794099777738.1,
+            "pass": 9,
+            "governorMiB": 68.49850559234619,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.9897165298461914,
+            "returnHits": 1665102,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 109852,
+            "returnAccepted": 2623976
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 15470320,
+              "totalSize": 45518848,
+              "embedderHeapUsedSize": 6478832,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 20361952,
+                "totalSize": 81031168,
+                "embedderHeapUsedSize": 1165504,
+                "backingStorageSize": 140846531
+              }
+            ]
+          },
+          "rendererRssEndMiB": 469.58984375,
+          "exportCpuSeconds": 7.259999999999998,
+          "exportRowsPerCpuSecond": 144431.95592286505,
+          "host": {
+            "before": {
+              "at": "2026-11-08T01:03:55.971Z",
+              "load": [3.9, 5.62, 7.95],
+              "pressure": {
+                "cpu": "some avg10=2.57 avg60=1.46 avg300=4.45 total=82113754848\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.22 avg60=0.49 avg300=0.64 total=8966813042\nfull avg10=0.13 avg60=0.31 avg300=0.27 total=4394087637",
+                "memory": "some avg10=0.00 avg60=0.00 avg300=0.13 total=23022960787\nfull avg10=0.00 avg60=0.00 avg300=0.09 total=12759896365"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T01:04:04.882Z",
+              "load": [4.66, 5.73, 7.96],
+              "pressure": {
+                "cpu": "some avg10=3.44 avg60=1.83 avg300=4.43 total=82114157866\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.63 avg60=0.57 avg300=0.65 total=8966928480\nfull avg10=0.41 avg60=0.35 avg300=0.28 total=4394178132",
+                "memory": "some avg10=0.00 avg60=0.00 avg300=0.13 total=23022978075\nfull avg10=0.00 avg60=0.00 avg300=0.08 total=12759911127"
+              }
+            }
+          },
+          "label": "cold persistent baseline scan round 4",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1035,
+            "wireBytes": 1530218901,
+            "frameBufferBytes": 1530218901,
+            "transferredBuffers": 292192,
+            "maxFrameRows": 1593,
+            "maxFrameBytes": 2097142,
+            "maxPostedBytes": 3248337,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 658.6000003218651,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 124813,
+          "seconds": 8.4,
+          "exportMs": 8401.199999988079,
+          "loadShare": null,
+          "mbPerSecond": 116,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 220,
+          "arrayBufferPeakMiB": 220,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 207.46875,
+          "rendererRssBaselineMiB": 497.8359375,
+          "rendererRssAbsolutePeakMiB": 550.87890625,
+          "rendererRssPeakMiB": 53,
+          "workerHeapPeakMiB": 47,
+          "workerCpuSeconds": 7.37,
+          "rowsPerCpuSecond": 142276
+        },
+        {
+          "series": {
+            "timeOrigin": 1794099777738.1,
+            "pass": 10,
+            "governorMiB": 68.50582885742188,
+            "poolMiB": 62.5,
+            "residentMiB": 0,
+            "returnPoolMiB": 3.997039794921875,
+            "returnHits": 1945221,
+            "requestedBuffers": 288812,
+            "reusedBuffers": 280119,
+            "returnAccepted": 2914730
+          },
+          "memoryAfter": {
+            "page": {
+              "usedSize": 12050824,
+              "totalSize": 45518848,
+              "embedderHeapUsedSize": 2742056,
+              "backingStorageSize": 1813519
+            },
+            "workers": [
+              {
+                "usedSize": 37083304,
+                "totalSize": 78409728,
+                "embedderHeapUsedSize": 4307752,
+                "backingStorageSize": 139524290
+              }
+            ]
+          },
+          "rendererRssEndMiB": 463.03515625,
+          "exportCpuSeconds": 5.859999999999999,
+          "exportRowsPerCpuSecond": 178937.88395904438,
+          "host": {
+            "before": {
+              "at": "2026-11-08T01:04:05.205Z",
+              "load": [4.66, 5.73, 7.96],
+              "pressure": {
+                "cpu": "some avg10=3.44 avg60=1.83 avg300=4.43 total=82114160020\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.63 avg60=0.57 avg300=0.65 total=8966928612\nfull avg10=0.41 avg60=0.35 avg300=0.28 total=4394178261",
+                "memory": "some avg10=0.00 avg60=0.00 avg300=0.13 total=23022978075\nfull avg10=0.00 avg60=0.00 avg300=0.08 total=12759911127"
+              }
+            },
+            "after": {
+              "at": "2026-11-08T01:04:12.134Z",
+              "load": [5.34, 5.84, 7.97],
+              "pressure": {
+                "cpu": "some avg10=2.41 avg60=1.81 avg300=4.35 total=82114320828\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+                "io": "some avg10=0.28 avg60=0.50 avg300=0.63 total=8966981308\nfull avg10=0.18 avg60=0.31 avg300=0.27 total=4394226156",
+                "memory": "some avg10=0.00 avg60=0.00 avg300=0.13 total=23022978236\nfull avg10=0.00 avg60=0.00 avg300=0.08 total=12759911285"
+              }
+            }
+          },
+          "label": "cold persistent candidate scan round 4",
+          "residentBeforeMiB": 0,
+          "rows": 1048576,
+          "readMiB": 4,
+          "mode": "scan",
+          "executorStats": {
+            "path": "production-owner-api",
+            "outputRecycling": true,
+            "frames": 1030,
+            "wireBytes": 1650277724,
+            "frameBufferBytes": 1650277724,
+            "transferredBuffers": 290754,
+            "maxFrameRows": 1512,
+            "maxFrameBytes": 2092352,
+            "maxPostedBytes": 3292592,
+            "resultWindowBytes": 2097152,
+            "readWindowPolicy": "executor-default",
+            "nextMs": 0,
+            "postMs": 580.4999986886978,
+            "drainMs": 0
+          },
+          "rowsPerSecond": 160392,
+          "seconds": 6.5,
+          "exportMs": 6537.599999964237,
+          "loadShare": null,
+          "mbPerSecond": 149,
+          "platformReads": 4947,
+          "governorPeakMiB": 180,
+          "cacheResidentMiB": 0,
+          "poolMiB": 62.5,
+          "backingStoragePeakMiB": 230,
+          "arrayBufferPeakMiB": 230,
+          "protectedMiB": "0.0 \u2192 0.0",
+          "hotKept": "",
+          "scannedKept": "",
+          "rendererCampaignGrowthMiB": 200.70703125,
+          "rendererRssBaselineMiB": 469.36328125,
+          "rendererRssAbsolutePeakMiB": 544.1171875,
+          "rendererRssPeakMiB": 75,
+          "workerHeapPeakMiB": 51,
+          "workerCpuSeconds": 5.93,
+          "rowsPerCpuSecond": 176826
+        }
+      ]
+    }
+  },
+  "safety": "Fresh/reused capacities validated for safe size, >=logical bytes, and element alignment. Source ownership set, same result grant, declared exact capacity and full-buffer view checks required to adopt. Cached/page/dictionary/slab buffers never authorized. Physical byteLength participates in reservation, source ownership, frame credit and return pool cap. Returned buffers retain existing capability/provenance, detachment and size checks, are zeroed on reuse, and are never awaited. Trusted-client provenance limit unchanged."
+}

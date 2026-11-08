@@ -641,13 +641,15 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     peak is only the cache handle; the OPFS comparison reports the full governor and RSS.
 - Scan/transport mode: `MINNOW_EXPORT_SCAN_COMPARE=1 npm run benchmark:export` runs five
   interleaved cold/warm attempts of the page stream and B4's production Executor/result path.
-  `MINNOW_EXPORT_SCAN_COLD_ONLY=1` keeps five cold attempts of each mode; the nightly workflow
-  records these separately as `export-scan-bench.json`, without a threshold. The governor cap
+  `MINNOW_EXPORT_SCAN_COLD_ONLY=1` keeps five cold attempts of each historical control mode.
+  The nightly `export-scan-bench.json` now uses `MINNOW_EXPORT_OWNER_API=1` instead: five cold
+  real-API exports on one owner, recorded without a threshold. The governor cap
   is 512 MiB for both modes and is reported; its counter is not an RSS bound.
   - `scripts/browser-perf/page/executor-export.ts` prepares a real scan plan with `createExecutor`
     before timing. `execute` owns admission, TableScan, ResultSink and ResultChannel; frames use
     the unchanged owner transfer policy, real MessagePort delivery and cumulative client credits.
-    Ordinary `mode:"scan"` is now Gate A's export number. Execution defaults are used, including
+    This executor-only helper is the historical control. Production API measurements use
+    `MINNOW_EXPORT_OWNER_API=1`, described beside `exportStream()` below. Execution defaults are used, including
     the compiler's terminal full-scan window policy. The bench does not override scan windows,
     output ownership, batch targets or result framing. Fixture preparation/SQL/catalog/root reads
     and client row-object construction remain excluded. Generated `executor-export.test.ts`
@@ -688,7 +690,7 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
     page bootstrap; reports identify the bootstrap. This changes harness residency, not the
     production executor, receiver, transfers or credit policy. Compare absolute RSS across
     those scopes only with the bootstrap stated.
-  - `MINNOW_EXPORT_PAGE_HEAP=/home/eric/.cache/export.heapsnapshot` adds a page-side CDP
+  - `MINNOW_EXPORT_PAGE_HEAP="$TMPDIR/export.heapsnapshot"` adds a page-side CDP
     heap snapshot after all frame delivery. It records pre/post snapshot heap, backing storage
     and renderer RSS. Snapshotting performs GC: use a separate diagnostic run, not its timings
     or post-GC snapshot as an export peak measurement. CDP `backingStorageSize` includes
@@ -1540,8 +1542,25 @@ still detaches locally, and never sends its capabilities to the replacement conn
 
 Each connection creates its return pool lazily on its first export. It is charged to that owner's
 governor, capped at 4 MiB (twice the default credit window, regardless of larger user prefetch),
-and closed on connection teardown. Capabilities are one-use and bounded; expired, duplicate,
-foreign, detached or wrong-sized returns are dropped. No lost return is awaited. Client-held
+and closed on connection teardown. Only this explicit export path rounds the terminal scan’s dedicated native output
+into 8-byte-aligned classes: four steps per doubling above 32 bytes (at most 25% slack above
+the small classes). Logical row counts and varlen end offsets do not change. Every typed view
+still starts at zero and covers its entire exclusive buffer; padding is zeroed and included in
+scan reservation, frame credit and pool charges before allocation. No short subviews, page,
+cache, dictionary or slab buffers are made transferable. The sink accepts a padded source
+buffer only when its full size matches the source's declared capacity policy and ownership set.
+Dictionary deltas and fallback frame copies retain exact sizes. Returned buffers are indexed
+and evicted by physical size class under the same cap; take still checks
+the exact physical size and detachment. Only explicitly relinquished buffers enter that cache.
+Ordinary query/cursor lifetimes and exact output sizes remain unchanged.
+
+Capabilities are one-use and bounded; expired, duplicate,
+unknown-capability, detached or wrong-sized returns are dropped. This is a cooperative-client
+contract: a valid capability, original sender detachment and an exact size establish protocol
+provenance, not physical backing-store identity. A compromised receiver can return a different
+same-sized buffer with an unused valid capability. Real transfers still detach released views,
+and reused storage is cleared, but the pool cannot authenticate that it received the original
+backing store. No lost return is awaited. Client-held
 frames after credit are client memory: the cap bounds returned idle buffers, not arbitrary caller
 retention. A terminal full-table export can use the larger 2 MiB target and decode directly into
 exclusive returned output. SQL's names-only identity projection forwards that ownership and keeps
@@ -1549,6 +1568,68 @@ its profile counters; computed/reordered projections retain the copying path. No
 slab buffer is eligible. Protocol version 6 adds the explicit mode, capability lists and independent
 `returnBuffers` signal; old versions are refused during handshake. This is a wire-only change,
 with no stored-format change.
+
+For the production API benchmark, set `MINNOW_EXPORT_OWNER_API=1` with
+`MINNOW_EXPORT_DISTINCT=1 npm run benchmark:export`. It performs five cold OPFS exports through
+`ProtocolClient.exportStream()` in one persistent owner process and reports RSS against one fixed
+post-setup baseline. `MINNOW_EXPORT_OWNER_COMPARE=1` instead interleaves five API/control pairs;
+the control is explicitly the historical bench handle, on current executor code. Both release
+frames promptly. A pass's wall time runs from the API call through iteration, releases and `done`;
+CPU is the dedicated worker's setup-excluded CPU, excluding the page consumer. The owner server,
+composition, SQL lowerer, executor and client are real. Fixture catalog/snapshot descriptors
+replace B3 catalog/group-root discovery, and client row objects are excluded. These measurements
+are not a full database-open benchmark or quiet-host Gate A acceptance. The harness records
+its own observation overhead; pull/drain sub-times are uninstrumented, reported as zero.
+
+`MINNOW_EXPORT_POOL_TRACE=1` selects the production API and adds benchmark-only return-pool
+observers. Five persistent 1M-row passes count exact positive-size requests and byte-weighted
+hits, by exact size. Misses distinguish a pending return of that size, a previously returned
+size, and a new size (in that order). These categories describe availability, not a proof that
+all previously seen sizes were evicted. The first pass also captures a bounded prefix through
+200 frame issuances. This instrumentation adds allocations and is excluded from CPU/RSS
+acceptance measurements. It changes no production pool policy.
+
+`scripts/pool-trace-bench.mts --compare=REV --trace=scripts/browser-perf/experiments/pool-requests-prefix.json.gz
+--cap-mib=16` replays that frozen prefix in five alternating fresh-process rounds. It measures
+actual ReturnPool request, allocation, synthetic byte fill, real two-way transfers, capability
+validation, clearing and eviction. Loading, warmup and GC precede the timer. Baseline replay
+checks every captured hit; candidate replay changes only the bounded cap. Recorded issue IDs
+are mapped to replay capabilities. The benchmark checks detachment and zero charges on close;
+its synthetic values are not a differential proof of executor output. It excludes IO, decode,
+frame assembly and MessagePort latency, so it cannot establish whole-export performance.
+The checked-in `pool-trace-result.json` records the negative 4-to-16 MiB result: a higher hit
+rate did not improve CPU beyond the spread. The production cap remains 4 MiB.
+
+`scripts/pool-trace-bench.mts --compare=REV --trace=scripts/browser-perf/experiments/pool-requests-prefix.json.gz --bucketed`
+compares exact and quarter-power-of-two sizing under the same 4 MiB cap. It records charged
+slack, hit rate, process/thread CPU, wall time, and sampled Node RSS (absolute loop peak and
+growth from the post-warmup/GC baseline). The rounded policy in this component is a small
+bench reference; generated tests compare the production policy against independently enumerated
+classes. It is not a full vector/decode benchmark.
+`MINNOW_EXPORT_POOL_COMPARE=1` instead drives five real `exportStream()` AB/BA pairs. Both
+routes use current code, differing only in capacity policy; each starts with an empty bounded
+pool on the same connection. Unstarted/late returns are expired, never awaited. Minimal
+request/hit counters are included in both routes' timings. It does not use the historical bench
+handle. Normal `MINNOW_EXPORT_OWNER_API=1` retains pool contents across all five passes.
+The committed `output-classes-result.json` includes the first paired campaign's slow final
+candidate; overlapping whole-export ranges do not establish a quiet-host Gate A result.
+
+The component `scripts/vector-materialize-bench.mts --compare=REV` separately measures resident
+page decode, vector shape setup and fresh dedicated output allocation, excluding storage,
+framing and transfers. It permits source dictionary codes in every column/range; ResultSink's
+per-stream dictionary cap and returned-buffer transport are outside this component.
+`--returned` is an exact-sized component control using the actual charged 4 MiB ReturnPool: decode and take/clear are timed per
+200-column batch, while two real structured-clone transfers and capability issue/return run
+outside those timers. It models prompt cooperative return, not MessagePort latency or the
+production pool hit rate. The fresh mode's timer covers its complete loop. Separate modes are
+component scopes, not an A/B speed claim. All output and pool charges must be zero at close.
+`--legacy-dictionaries` preserves the historical first-23-columns-only diagnostic.
+`--profile-dir="$TMPDIR/profiles"` records 500-us Node CPU profiles around only the measured
+fresh loop, after fixture loading, warmup and GC. Returned mode refuses profiling because its
+return handovers are excluded from component timers. Profiled samples remain separate from unprofiled
+CPU comparisons. Each comparison retains five alternating fresh-process rounds per variant. Scratch comes from `os.tmpdir()`, honoring the
+caller's `TMPDIR`; explicit profile and heap-snapshot output paths are caller-selected and do
+not require a home cache directory.
 
 - One owner per database holds the store's fence: a dedicated owner worker started by a page, or
   a dedicated worker hosting in place. Every other context is a thin client over a MessagePort

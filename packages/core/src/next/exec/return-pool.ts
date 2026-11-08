@@ -11,6 +11,16 @@ const CAPABILITY_BYTES = OBJECT_OVERHEAD_BYTES;
 // Native buffer wrapper plus its retained size-class entry/list storage.
 const RETURNED_OVERHEAD_BYTES = 2 * OBJECT_OVERHEAD_BYTES;
 
+/** Full-buffer classes: 8-byte alignment, quarter-power-of-two steps. Slack is output memory. */
+export function outputCapacity(bytes: number): number {
+  if (!Number.isSafeInteger(bytes) || bytes < 0) throw new RangeError("Invalid output size");
+  if (bytes === 0) return 0;
+  const step = Math.max(8, 2 ** (Math.floor(Math.log2(bytes)) - 2));
+  const capacity = Math.ceil(bytes / step) * step;
+  if (!Number.isSafeInteger(capacity)) throw new RangeError("Output size overflow");
+  return capacity;
+}
+
 export interface ReturnedBuffer {
   readonly id: number;
   readonly buffer: ArrayBuffer;
@@ -33,6 +43,10 @@ export class ReturnPool implements EvictableCache {
     if (!Number.isSafeInteger(capBytes) || capBytes < 0)
       throw new TypeError("Invalid return pool cap");
     this.#memory = governor.registerCache(this);
+  }
+  /** Called before output charging/allocation. take() still requires the exact physical size. */
+  outputSize(bytes: number): number {
+    return outputCapacity(bytes);
   }
   get evictableBytes(): number {
     return this.#bytes;

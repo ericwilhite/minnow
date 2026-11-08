@@ -14,6 +14,7 @@ import {
   createReach,
   SCAN_WINDOW_RESIDENCY_REACH,
   RESULT_OWNED_REACH,
+  OUTPUT_CLASS_SCAN_REACH,
 } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import type { ColumnDef } from "../access/catalog.js";
@@ -28,6 +29,7 @@ import type {
 } from "../access/snapshot.js";
 import type { ScalarExpr } from "../ir/ir.js";
 import { Governor, type Loan } from "../memory/governor.js";
+import { referenceCapacity } from "./output-class-test-support.js";
 import { MemoryExtentSpace } from "../page/memory-extents.js";
 import { ChunkReader } from "../page/reader.js";
 import { writeGroup, type TestValue } from "../page/test-support.js";
@@ -1336,6 +1338,7 @@ describe("review B4-p2c-3: loans under the real governor", () => {
     "result allocations wait for released credit, including abort seed %i",
     async (seed) => {
       const reach = createReach("next-owned-result-budget", [
+        ...OUTPUT_CLASS_SCAN_REACH,
         "result charge",
         "wait for result credit",
         "abort retained result",
@@ -1344,97 +1347,112 @@ describe("review B4-p2c-3: loans under the real governor", () => {
         RESULT_OWNED_REACH.refusal,
       ] as const);
       await fc.assert(
-        fc.asyncProperty(fc.integer({ min: 10, max: 30 }), fc.boolean(), async (n, cancel) => {
-          reach.beginHistory();
-          const space = new MemoryExtentSpace(),
-            rows = rowsOf(mulberry32(n), n, false).map((r, k) => ({ ...r, i: k }));
-          const table: TableSnapshot = {
-              tableId: 9,
-              schemaVersion: 1,
-              columns: DEFS,
-              segments: [await groupSegment(0, rows, new Set(), false, space)],
-              liveRowCount: n,
-            },
-            budget = counting();
-          const output = {
-            held: 0,
-            allocate(bytes: number) {
-              if (output.held > 0 || output.held + bytes > 16) return false;
-              output.held += bytes;
-              return true;
-            },
-            free(bytes: number) {
-              output.held -= bytes;
-            },
-          };
-          const scan = scanOf(table, space, null, {
-            budget,
-            outputBudget: output,
-            columns: [1],
-            targetBytes: 32,
-            transferOutputs: "dictionary",
-          });
-          const first = await scan.next();
-          if (!first?.transfer) throw new Error("Missing owned output");
-          expect(first.transfer.detachableBudget).toBe(output);
-          expect(output.held).toBeGreaterThan(0);
-          expect(output.held).toBeLessThanOrEqual(16);
-          const firstCharge = output.held;
-          expect(scan.memoryStats.ownedOutputInQueryBytes).toBe(0);
-          reach.reach("result charge");
-          let settled = false;
-          const pending = Promise.resolve(scan.next()).then((x) => {
-            settled = true;
-            return x;
-          });
-          await Promise.resolve();
-          await Promise.resolve();
-          expect(settled).toBe(false);
-          reach.reach("wait for result credit");
-          if (cancel) {
-            scan.abort();
-            expect(await pending).toBeNull();
-            expect(output.held).toBe(firstCharge);
-            first.transfer.release();
-            reach.reach("abort retained result");
-          } else {
-            first.transfer.release();
-            let item = await pending,
-              count = first.batch.length;
-            while (item !== null) {
-              count += item.batch.length;
-              item.transfer?.release();
-              item = await scan.next();
+        fc.asyncProperty(
+          fc.integer({ min: 10, max: 30 }),
+          fc.boolean(),
+          fc.boolean(),
+          async (n, cancel, bucketed) => {
+            reach.beginHistory();
+            reach.reach(bucketed ? "bucket bounded scan" : "exact bounded scan");
+            const outputBuffers = bucketed
+              ? { outputSize: referenceCapacity, take: () => null }
+              : undefined;
+            const space = new MemoryExtentSpace(),
+              rows = rowsOf(mulberry32(n), n, false).map((r, k) => ({ ...r, i: k }));
+            const table: TableSnapshot = {
+                tableId: 9,
+                schemaVersion: 1,
+                columns: DEFS,
+                segments: [await groupSegment(0, rows, new Set(), false, space)],
+                liveRowCount: n,
+              },
+              budget = counting();
+            const output = {
+              held: 0,
+              allocate(bytes: number) {
+                if (output.held > 0 || output.held + bytes > 16) return false;
+                output.held += bytes;
+                return true;
+              },
+              free(bytes: number) {
+                output.held -= bytes;
+              },
+            };
+            const scan = scanOf(table, space, null, {
+              budget,
+              outputBudget: output,
+              columns: [1],
+              targetBytes: 32,
+              ...(outputBuffers ? { outputBuffers } : {}),
+              transferOutputs: "dictionary",
+            });
+            const first = await scan.next();
+            if (!first?.transfer) throw new Error("Missing owned output");
+            expect(first.transfer.detachableBudget).toBe(output);
+            expect(output.held).toBeGreaterThan(0);
+            expect(output.held).toBeLessThanOrEqual(16);
+            const firstCharge = output.held;
+            const logical = 4 * first.batch.length;
+            expect(firstCharge).toBe(bucketed ? referenceCapacity(logical) : logical);
+            if (firstCharge > logical) reach.reach("bounded padding");
+            expect(scan.memoryStats.ownedOutputInQueryBytes).toBe(0);
+            reach.reach("result charge");
+            let settled = false;
+            const pending = Promise.resolve(scan.next()).then((x) => {
+              settled = true;
+              return x;
+            });
+            await Promise.resolve();
+            await Promise.resolve();
+            expect(settled).toBe(false);
+            reach.reach("wait for result credit");
+            if (cancel) {
+              scan.abort();
+              expect(await pending).toBeNull();
+              expect(output.held).toBe(firstCharge);
+              first.transfer.release();
+              reach.reach("abort retained result");
+            } else {
+              first.transfer.release();
+              let item = await pending,
+                count = first.batch.length;
+              while (item !== null) {
+                count += item.batch.length;
+                item.transfer?.release();
+                item = await scan.next();
+              }
+              expect(count).toBe(n);
+              reach.reach("progress after result credit");
             }
-            expect(count).toBe(n);
-            reach.reach("progress after result credit");
-          }
-          scan.close();
-          expect([budget.held, output.held]).toEqual([0, 0]);
-          const refused = scanOf(table, space, null, {
-            budget,
-            outputBudget: { allocate: () => false, free: () => undefined },
-            columns: [1],
-            transferOutputs: true,
-          });
-          await expect(Promise.resolve().then(() => refused.next())).rejects.toThrow(
-            "result grant refused a one-row dedicated output",
-          );
-          refused.close();
-          expect(budget.held).toBe(0);
-          reach.reach("one-row result refusal");
-          const fallback = scanOf(table, space, null, {
-            budget,
-            outputBudget: { allocate: () => false, free: () => undefined },
-            columns: [1],
-            transferOutputs: "dictionary",
-            borrowOutputOnRefusal: true,
-          });
-          expect(await collect(fallback)).toEqual(rows.map((r) => [r.i]));
-          fallback.close();
-          expect(budget.held).toBe(0);
-          reach.reach(RESULT_OWNED_REACH.refusal);
-        }),
+            scan.close();
+            expect([budget.held, output.held]).toEqual([0, 0]);
+            const refused = scanOf(table, space, null, {
+              budget,
+              outputBudget: { allocate: () => false, free: () => undefined },
+              columns: [1],
+              ...(outputBuffers ? { outputBuffers } : {}),
+              transferOutputs: true,
+            });
+            await expect(Promise.resolve().then(() => refused.next())).rejects.toThrow(
+              "result grant refused a one-row dedicated output",
+            );
+            refused.close();
+            expect(budget.held).toBe(0);
+            reach.reach("one-row result refusal");
+            const fallback = scanOf(table, space, null, {
+              budget,
+              outputBudget: { allocate: () => false, free: () => undefined },
+              columns: [1],
+              ...(outputBuffers ? { outputBuffers } : {}),
+              transferOutputs: "dictionary",
+              borrowOutputOnRefusal: true,
+            });
+            expect(await collect(fallback)).toEqual(rows.map((r) => [r.i]));
+            fallback.close();
+            expect(budget.held).toBe(0);
+            reach.reach(RESULT_OWNED_REACH.refusal);
+          },
+        ),
         { seed, numRuns: 12 },
       );
       reach.assertReached();

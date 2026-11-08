@@ -200,7 +200,10 @@ export interface PreparedPlan {
 
 interface ExecuteBase {
   /** Explicit relinquishing consumer only; ordinary result credits do not end view lifetimes. */
-  readonly outputBuffers?: { take(bytes: number): ArrayBuffer | null };
+  readonly outputBuffers?: {
+    take(bytes: number): ArrayBuffer | null;
+    outputSize?(bytes: number): number;
+  };
   /** Caller-owned values, borrowed until executed/cancellation; do not mutate during execution.
    * The execution admits its input storage before creating any owned vectors or copies. */
   readonly parameters: readonly ParameterValue[];

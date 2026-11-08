@@ -5,7 +5,10 @@
  * the persistent profile on disk (fixtures.ts); each pass then streams every row in a fresh
  * worker (scripts/browser-perf/page/export-stream.ts).
  *
- * MINNOW_EXPORT_SCAN_COMPARE=1 adds Gate A's production createExecutor -> ResultSink ->
+ * MINNOW_EXPORT_OWNER_API=1 measures ProtocolClient.exportStream -> OwnerServer -> SQL lowering
+ * -> composition -> production executor/result path, five cold exports in one persistent owner.
+ * MINNOW_EXPORT_OWNER_COMPARE=1 adds five interleaved historical bench-handle controls.
+ * MINNOW_EXPORT_SCAN_COMPARE=1 instead adds the historical createExecutor -> ResultSink ->
  * ResultChannel -> owner transfer policy -> MessagePort credits. Preparation and fixture
  * descriptors replace SQL/catalog/group-root loading; client JS row objects are excluded.
  * The executor's real defaults are used (no bench scan-window or ownership override).
@@ -53,9 +56,7 @@ import { execFileSync } from "node:child_process";
 // eslint-disable-next-line no-restricted-imports -- Node-only Playwright bench (cache control, /proc); never shipped.
 import { appendFileSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 // eslint-disable-next-line no-restricted-imports -- Node-only Playwright bench (cache control, /proc); never shipped.
-import { join, resolve, sep } from "node:path";
-// eslint-disable-next-line no-restricted-imports -- Node-only benchmark scratch paths.
-import { homedir } from "node:os";
+import { join } from "node:path";
 import { expect, type CDPSession, type Page } from "@playwright/test";
 import { exportTrace, hostSample } from "./export-diagnostics.js";
 import { requireWorkerOpfs, test } from "./fixtures.js";
@@ -87,7 +88,14 @@ const SCAN_BATCH_COMPARE = process.env.MINNOW_EXPORT_SCAN_BATCH_COMPARE === "1";
 const SCAN_BATCH_COMPLETED = process.env.MINNOW_EXPORT_SCAN_BATCH_COMPLETED ?? "";
 const SCAN_IO_COMPARE = process.env.MINNOW_EXPORT_SCAN_IO_COMPARE === "1";
 const DISCARD = process.env.MINNOW_EXPORT_DISCARD === "1";
-const RSS_SERIES = process.env.MINNOW_EXPORT_RSS_SERIES === "1";
+const POOL_TRACE = process.env.MINNOW_EXPORT_POOL_TRACE === "1";
+const POOL_COMPARE = process.env.MINNOW_EXPORT_POOL_COMPARE === "1";
+const OWNER_COMPARE = process.env.MINNOW_EXPORT_OWNER_COMPARE === "1";
+const OWNER_API =
+  process.env.MINNOW_EXPORT_OWNER_API === "1" || OWNER_COMPARE || POOL_TRACE || POOL_COMPARE;
+if (OWNER_API && EXECUTOR_REFERENCE)
+  throw new Error("Owner API comparison uses the current bench control, not a frozen executor");
+const RSS_SERIES = process.env.MINNOW_EXPORT_RSS_SERIES === "1" || OWNER_API;
 const SCAN_COMPARE =
   RSS_SERIES ||
   process.env.MINNOW_EXPORT_SCAN_COMPARE === "1" ||
@@ -305,8 +313,6 @@ async function workers(page: Page, profileDirectory: string) {
     profileCpuSeconds,
     /** Diagnostic only, after delivery. Snapshot collection runs GC and is never a peak sample. */
     async snapshotPage(path: string) {
-      if (!resolve(path).startsWith(join(homedir(), ".cache") + sep))
-        throw new Error("Heap snapshot must stay under ~/.cache");
       const before = await cdp.send("Runtime.getHeapUsage");
       const chunk = (event: { chunk: string }) => appendFileSync(path, event.chunk);
       writeFileSync(path, "");
@@ -484,9 +490,9 @@ test.describe("rebuild core export on OPFS (bench)", () => {
 
     const seriesOpen = RSS_SERIES
       ? await page.evaluate(
-          async ([url, groups, reference]) =>
-            ((await import(url)) as Run).openSeries(groups, 512, reference),
-          [RUN, exported, EXECUTOR_REFERENCE] as const,
+          async ([url, groups, reference, ownerAPI, poolTrace]) =>
+            ((await import(url)) as Run).openSeries(groups, 512, reference, ownerAPI, poolTrace),
+          [RUN, exported, EXECUTOR_REFERENCE, OWNER_API, POOL_TRACE] as const,
         )
       : undefined;
     const seriesMemoryBefore = RSS_SERIES ? await targets.memory() : undefined;
@@ -561,8 +567,13 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         expect(pass.executorComparison?.variant).toBe(options.executorVariant);
       }
       if (options.mode === "scan") {
-        expect(pass.scanStats, "Gate A must not run the stand-in adapter").toBeUndefined();
-        expect(pass.executorStats?.path).toBe("production-executor");
+        expect(
+          pass.scanStats,
+          "Executor/control routes must not run the stand-in adapter",
+        ).toBeUndefined();
+        expect(pass.executorStats?.path).toBe(
+          options.ownerAPI ? "production-owner-api" : "production-executor",
+        );
         expect(pass.executorStats?.frames).toBeGreaterThan(0);
         expect(pass.executorStats?.transferredBuffers).toBeGreaterThan(0);
         expect(pass.executorStats?.readWindowPolicy).toBe("executor-default");
@@ -696,7 +707,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     const base = { once: true, capMiB: 512, passes: 1, groups: exported };
     if (RSS_SERIES) {
       for (let round = 0; round < 5; round++)
-        for (const variant of EXECUTOR_REFERENCE
+        for (const variant of EXECUTOR_REFERENCE || OWNER_COMPARE || POOL_COMPARE
           ? round % 2 === 0
             ? (["baseline", "candidate"] as const)
             : (["candidate", "baseline"] as const)
@@ -704,7 +715,9 @@ test.describe("rebuild core export on OPFS (bench)", () => {
           await measure(`cold persistent ${variant} scan round ${String(round)}`, true, false, {
             ...base,
             persistent: true,
-            recycle: process.env.MINNOW_EXPORT_RECYCLE === "1",
+            recycle: OWNER_API || process.env.MINNOW_EXPORT_RECYCLE === "1",
+            ownerAPI: OWNER_API && (!OWNER_COMPARE || variant === "candidate"),
+            ...(POOL_COMPARE ? { outputClasses: variant === "candidate" } : {}),
             discard: DISCARD,
             readaheadKiB: 256,
             auditWorkingSet: false,
@@ -1057,12 +1070,13 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       campaignRendererPeakMiB: Math.max(...results.map((r) => r.rendererRssAbsolutePeakMiB)),
       ...(SCAN_COMPARE
         ? {
-            scanAdapter:
-              SCAN_CORE_PROFILE || (SCAN_SHAPE_COMPARE && !SCAN_SHAPE_TRANSPORT)
+            scanAdapter: OWNER_API
+              ? "Production ProtocolClient.exportStream -> OwnerServer -> composeEngine -> real SQL lowering -> Executor/ResultSink/ResultChannel. Fixture catalog and immutable snapshot descriptors exclude B3 root discovery; client row objects excluded. Wall time includes exportStream call through iteration, frame releases and done. CPU is worker only. Prototype control uses the old bench handle."
+              : SCAN_CORE_PROFILE || (SCAN_SHAPE_COMPARE && !SCAN_SHAPE_TRANSPORT)
                 ? "scan-only diagnostic; real TableScan/driver; borrowed endpoint consumer; excludes all frame assembly, result channel, transfers and client transport; fixture descriptors exclude SQL/catalog/root loading"
                 : results.some((r) => r.mode === "scan-adapter")
                   ? "historical scan-adapter diagnostic; stand-in assembler; excluded from Gate A; fixture descriptors exclude SQL/catalog/root loading"
-                  : "Gate A: production Executor/ResultSink/ResultChannel, real owner transfer policy and MessagePort credits; prepared fixture plan/snapshot exclude SQL/catalog/root loading and client row objects",
+                  : "Historical executor-only control: production Executor/ResultSink/ResultChannel, owner transfer policy and MessagePort credits; fixture plan/snapshot excludes SQL/catalog/root discovery and client row objects; use OWNER_API for the production API metric",
             cpuSamplingIntervalUs: SCAN_PROFILE ? 500 : 1_000_000,
             rounds:
               SCAN_SHAPE_COMPARE ||

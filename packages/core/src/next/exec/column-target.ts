@@ -14,8 +14,8 @@
  * - Sizing reads the same layout description as decoding (`shapeOf`): `outputBytes` is what a
  *   decode produces (fixed and variable parts) and `growthFor` what it newly charges, so a scan
  *   bounds batches and reserves memory before it decodes anything.
- * `decode` borrows until the next decode. `decodeOwned` instead allocates tight dedicated output
- * buffers (including flat UTF-8 text), charged independently until the caller returns its recorded byte charge.
+ * `decode` borrows until the next decode. `decodeOwned` instead allocates dedicated output
+ * buffers with full views (optionally rounded capacity) (including flat UTF-8 text), charged independently until the caller returns its recorded byte charge.
  * It never exposes dictionary/page/cache buffers; all-valid proofs use verified loaded masks.
  * The vector returned by `decode` is valid until the next decode into the same target.
  */
@@ -38,6 +38,8 @@ export interface TargetMemory {
   give(bytes: number): void;
   /** Exact-sized exclusive output storage, already charged to its return cache until take. */
   reuse?(bytes: number): ArrayBuffer | null;
+  /** Dedicated full-buffer capacity, including charged zero padding. Defaults to exact size. */
+  outputSize?(bytes: number): number;
 }
 
 /** A row range `[from, to)`, or selected group positions `rows[0 … count)` (ascending). */
@@ -97,6 +99,7 @@ const LIMBS = spec("limbs", Uint32Array, 4);
 const SPECIALS = spec("specials", Uint8Array);
 const OFFSETS = spec("offsets", Int32Array, 1, 1);
 const NO_BYTES = new Uint8Array(0);
+const EXACT_CAPACITY = (bytes: number): number => bytes;
 
 /** Fixed buffers grow to at least this many rows (fewer reallocations for small batches). */
 const MIN_ROWS = 64;
@@ -140,7 +143,8 @@ export class ColumnTarget {
     this.#build = SHAPE_BUILDERS[layoutOf(type)];
   }
 
-  /** Decode directly into tight, dedicated output buffers. Text stays UTF-8 bytes.
+  /** Decode directly into dedicated output with full views. Logical length is independent of
+   * capacity. Text stays UTF-8 bytes.
    * Only fresh output buffers are marked detachable. With dictionaryCodes, the caller must
    * also retain the reader/dictionary and its charge through output release. Otherwise text
    * pages decode to fresh flat UTF-8. The caller prepays outputBytes with the same policy.
@@ -159,11 +163,16 @@ export class ColumnTarget {
       Type: { new (n: number): T; readonly BYTES_PER_ELEMENT: number },
       n: number,
     ): T => {
-      const size = n * Type.BYTES_PER_ELEMENT;
+      const logical = n * Type.BYTES_PER_ELEMENT;
+      const size = memory.outputSize?.(logical) ?? logical;
+      if (!Number.isSafeInteger(size) || size < logical || size % Type.BYTES_PER_ELEMENT !== 0)
+        throw new RangeError("Invalid dedicated output capacity");
       memory.take(size);
       bytes += size;
       const reused = memory.reuse?.(size);
-      const array = reused ? (Reflect.construct(Type, [reused]) as T) : new Type(n);
+      const array = reused
+        ? (Reflect.construct(Type, [reused]) as T)
+        : new Type(size / Type.BYTES_PER_ELEMENT);
       if (!(array.buffer instanceof ArrayBuffer))
         throw new TypeError("Expected dedicated ArrayBuffer");
       buffers.push(array.buffer);
@@ -313,8 +322,9 @@ export class ColumnTarget {
     spec: DecodeSpec,
     dictionaryCodes = true,
     omitAllValid = false,
+    capacity?: (bytes: number) => number,
   ): number {
-    return bytesForShape(this.#build, pages, spec, dictionaryCodes, omitAllValid);
+    return bytesForShape(this.#build, pages, spec, dictionaryCodes, omitAllValid, capacity);
   }
 
   /** Gives back every buffer (after an oversized row, before its loan is repaid). */
@@ -520,6 +530,7 @@ function bytesForShape(
   spec: DecodeSpec,
   dictionaryCodes: boolean,
   omitAllValid: boolean,
+  capacity: (bytes: number) => number = EXACT_CAPACITY,
 ): number {
   const rows = rowsOf(spec);
   let bytes = 0;
@@ -529,11 +540,11 @@ function bytesForShape(
     spec,
     {
       buffer: (b) => {
-        bytes += b.elements(rows) * b.Type.BYTES_PER_ELEMENT;
+        bytes += capacity(b.elements(rows) * b.Type.BYTES_PER_ELEMENT);
         return b.empty;
       },
       varlen: (n) => {
-        bytes += n;
+        bytes += capacity(n);
         return NO_BYTES;
       },
     },
