@@ -1320,7 +1320,15 @@ bound in the source. Allocation and final ordering are timed; input flattening i
 These are optimistic fixed-workload observations, not mathematical lower bounds or proof of a
 JavaScript limit. They borrow immutable inputs and omit governor, spill, cancellation and task
 pacing. Presizing assumes the catalogue's domain bounds, and the original operator retains its
-dictionary representation. Non-wide `split`/`native` samples alias the same plain kernel.
+dictionary representation. Highcard `native` certifies the actual min/max domain inside timing,
+then uses direct-address packed COUNT/SUM state; a domain wider than 2^22 values keeps the exact
+hash fallback. `split` aliases its hash baseline, and DISTINCT aliases both plain variants.
+`scripts/next-highcard-domain-bench.mts --rows 1000000 --repeats 9` isolates these highcard
+algorithms against the existing matched operator without writing or scanning a table. The probe,
+state allocation and top-100 selection are timed. This is a benchmark kernel, not an executor
+plan; it borrows immutable non-NULL int32/finite float8 inputs under the source
+cardinality/magnitude bound. Generated PGlite checks cover negative and endpoint domains, holes,
+wide-domain fallback, signed zero and exact count-desc/key-asc ordering.
 The report includes CPU samples, full spreads, checkpointed partial rounds, profiles and the
 actual transformed JS needed to interpret line-level ticks. No baseline is an executor path.
 Unbounded, value-producing `indexRange` nodes require the same internal `keyOrder:true`

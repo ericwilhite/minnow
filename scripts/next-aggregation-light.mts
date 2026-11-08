@@ -20,6 +20,7 @@ import { OutputArena } from "../packages/core/dist/next/exec/kernels/vectors.js"
 import { drive, type Operator } from "../packages/core/dist/next/exec/pipeline.js";
 import {
   highcard,
+  highcardDomain,
   wide,
   wideSplit,
   wideNative,
@@ -61,6 +62,7 @@ export async function lightComparison(
     readonly collect?: () => void;
     readonly warmups?: number;
     readonly nativeOnly?: boolean;
+    readonly omitAliases?: boolean;
   } = {},
 ) {
   const warmups = measurement.warmups ?? 3;
@@ -306,7 +308,12 @@ export async function lightComparison(
     split();
     measurement.collect?.();
   }
-  const native = id === "agg_3dims_20aggs" ? wideNative.bind(undefined, input) : plain;
+  const native =
+    id === "agg_3dims_20aggs"
+      ? wideNative.bind(undefined, input)
+      : id === "agg_highcard_int"
+        ? highcardDomain.bind(undefined, input)
+        : plain;
   const nativeExpected = native();
   assert.deepEqual(nativeExpected.rows, expected.rows);
   if (expected.sxx) {
@@ -338,7 +345,8 @@ export async function lightComparison(
   ).filter(
     (kind) =>
       operations[kind] !== undefined &&
-      !(measurement.nativeOnly && (kind === "bound" || kind === "split")),
+      !(measurement.nativeOnly && (kind === "bound" || kind === "split")) &&
+      !(measurement.omitAliases && kind === "split"),
   );
   for (let round = 0; round < rounds; round++) {
     loads.push(loadavg());
@@ -436,6 +444,6 @@ export async function lightComparison(
     ),
     componentOnly: pipeline === undefined && feed === undefined,
     limits:
-      "Optimistic fixed-workload TS observation, not a mathematical lower bound or universal JS impossibility result. Raw bound/split read flat decoded bytes/numbers and hash every text row. Native wide consumes the original decoded dictionary segments, hashes/maps all entries and translates every row within timing, then uses packed five-AVG state. No precomputed canonical IDs/ranks. All use exact collision equality. Split/native alias bound for the other shapes (not independent algorithms). Operator keeps original scan dictionary forms and includes matching sort/top-N, copying and governor/driver/task clock. Whole is prepared pipeline/owned frames; outer harness separately measures SQL through cleanup. Feed is scan/project/discard only, not additive with the other sinks. Setup/flattening (including numeric widening to Float64) excluded; kernel allocation/state/final ordering included. Borrowed immutable inputs need no key copy; no memory governor/spill/cancellation in plain TS. AVG Sxx retained. No production changes.",
+      "Optimistic fixed-workload TS observation, not a mathematical lower bound or universal JS impossibility result. Raw bound/split read flat decoded bytes/numbers and hash every text row. Native wide consumes the original decoded dictionary segments, hashes/maps all entries and translates every row within timing, then uses packed five-AVG state. No precomputed canonical IDs/ranks. All use exact collision equality. Highcard native includes an exact full-input min/max probe and direct-address COUNT/SUM state with an exact general-hash fallback for a wide domain; highcard split and both other DISTINCT kernels alias bound (not independent algorithms). Operator keeps original scan dictionary forms and includes matching sort/top-N, copying and governor/driver/task clock. Whole is prepared pipeline/owned frames; outer harness separately measures SQL through cleanup. Feed is scan/project/discard only, not additive with the other sinks. Setup/flattening (including numeric widening to Float64) excluded; kernel allocation/state/final ordering included. Borrowed immutable inputs need no key copy; no memory governor/spill/cancellation in plain TS. AVG Sxx retained. No production changes.",
   };
 }

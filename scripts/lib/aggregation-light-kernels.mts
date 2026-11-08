@@ -819,3 +819,83 @@ export function wideNative(input: LightInput): LightResult {
   );
   return { rows, sxx: avg.sxx };
 }
+
+/** Plain-loop experiment on immutable, non-NULL int32 keys and finite float8 values.
+ * An exact min/max probe certifies the dense address range before allocating.
+ * The catalogue's finite SUM bound (N<=1M, |v|<=1e6) is checked by the caller;
+ * all float additions remain in group input order. No NDV/domain is assumed.
+ * Wider integer ranges retain the general open-addressing kernel above.
+ */
+export function highcardDomain(
+  input: LightInput,
+): LightResult & { domainStrategy: "empty" | "direct" | "hash" } {
+  const keys = need(input.n, 0),
+    values = need(input.n, 1),
+    N = input.rows;
+  if (N === 0) return { rows: [], domainStrategy: "empty" };
+  let low = Infinity,
+    high = -Infinity;
+  for (let i = 0; i < N; i++) {
+    const key = keys[i] as number;
+    if (key < low) low = key;
+    if (key > high) high = key;
+  }
+  const span = high - low + 1;
+  if (!Number.isSafeInteger(span) || span < 1) throw new RangeError("invalid int32 domain");
+  if (span > 1 << 22) return { ...highcard(input), domainStrategy: "hash" };
+  // Count and SUM share a 16-byte record. -0 is SUM's additive identity;
+  // it is also equal to 0 for an unseen count.
+  const state = new Float64Array(2 * span);
+  state.fill(-0);
+  for (let i = 0; i < N; i++) {
+    const at = ((keys[i] as number) - low) * 2;
+    state[at] = (state[at] as number) + 1;
+    state[at + 1] = (state[at + 1] as number) + (values[i] as number);
+  }
+  const heap = new Int32Array(100);
+  let used = 0;
+  for (let g = 0; g < span; g++) {
+    const count = state[g * 2] as number;
+    if (count === 0) continue;
+    if (used < 100) {
+      let p = used++;
+      while (p > 0) {
+        const up = (p - 1) >>> 1,
+          u = heap[up] as number,
+          prior = state[u * 2] as number;
+        if (prior < count || (prior === count && u >= g)) break;
+        heap[p] = u;
+        p = up;
+      }
+      heap[p] = g;
+      continue;
+    }
+    const root = heap[0] as number,
+      rootCount = state[root * 2] as number;
+    if (count < rootCount || (count === rootCount && g >= root)) continue;
+    let p = 0;
+    while (2 * p + 1 < used) {
+      let child = 2 * p + 1;
+      const a = heap[child] as number,
+        b = heap[child + 1] as number;
+      if (
+        child + 1 < used &&
+        ((state[b * 2] as number) < (state[a * 2] as number) ||
+          (state[b * 2] === state[a * 2] && b > a))
+      )
+        child++;
+      const c = heap[child] as number,
+        childCount = state[c * 2] as number;
+      if (count < childCount || (count === childCount && g >= c)) break;
+      heap[p] = c;
+      p = child;
+    }
+    heap[p] = g;
+  }
+  return {
+    domainStrategy: "direct",
+    rows: Array.from(heap.subarray(0, used), (g) => [low + g, state[g * 2], state[g * 2 + 1]]).sort(
+      (a, b) => Number(b[1]) - Number(a[1]) || Number(a[0]) - Number(b[0]),
+    ),
+  };
+}
