@@ -1388,7 +1388,8 @@ elsewhere.
 - The browser profile is a persistent one (`launchPersistentContext`); an ephemeral context keeps
   OPFS in memory. The lane refuses a profile on tmpfs or ramfs, and proves OPFS is on disk by
   writing a probe file and watching the profile grow. The profile lives in
-  `~/.cache/minnow-browser-perf`; set `MINNOW_BROWSER_PERF_DIR` to move it.
+  `minnow-browser-perf` under the OS temporary directory (`os.tmpdir()`, which honours
+  `TMPDIR`); set `MINNOW_BROWSER_PERF_DIR` to choose a persistent directory on disk.
 - One fixed origin, `http://127.0.0.1:8791` (`MINNOW_BROWSER_PERF_PORT`), so a database loaded in
   one run is the one later runs read. A port in use is an error.
 - Every write cell names its durability. SQLite's pragmas are read back after they are set and

@@ -2,7 +2,7 @@
  * PageCache and real in-process MessagePort transfers. This isolates worker export CPU without
  * OPFS/renderer cost; it does not justify replacing the production path with the adapter.
  * Five interleaved fresh-process rounds, one excluded warmup and GC per child.
- * npx vite-node scripts/executor-export-bench.mts (scratch/TMPDIR must be under ~/.cache).
+ * npx vite-node scripts/executor-export-bench.mts (scratch follows os.tmpdir(); set TMPDIR to choose its location).
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";

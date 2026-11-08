@@ -1,7 +1,7 @@
 /**
  * Builds the wide table on disk for scripts/export-bench.mts: `--rows` rows × 200 columns of the
  * W1M generator (scripts/browser-perf/page/wide-data.ts), written through the real file store and
- * extent space into `--dir` (under ~/.cache), then `--copies − 1` byte copies of every group's
+ * extent space into `--dir` (defaults under os.tmpdir()), then `--copies − 1` byte copies of every group's
  * extents at new addresses (W5M = W1M × 5: encoding throughput is not what the export measures,
  * and generating 1 billion values would take most of an hour). The groups' column chunks are
  * saved as `groups.json`.
