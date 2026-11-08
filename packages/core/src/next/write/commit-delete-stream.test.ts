@@ -1,5 +1,6 @@
 /** Large unordered deletion bodies keep canonical row order with a charged, bounded index. */
 import fc from "fast-check";
+import { watchGrants } from "./test-support.js";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, WRITE_DELETE_STREAM_STATES } from "../../testing/reach.js";
@@ -36,18 +37,15 @@ for (const seed of seedsFor("next-write-delete-stream", [0xde1]))
           const governor = new Governor(32 * 1024 * 1024);
           Object.assign(h, { governor });
           let loans = 0;
-          const admit = governor.admit.bind(governor);
-          governor.admit = async (options) => {
-            const grant = await admit(options);
-            if (options.label === "write commit buffers") {
+          watchGrants(governor, (grant) => {
+            if (grant.label === "write commit buffers") {
               const borrow = grant.borrow.bind(grant);
               grant.borrow = (bytes, signal) => {
                 loans++;
                 return borrow(bytes, signal);
               };
             }
-            return grant;
-          };
+          });
           let capture: Uint8Array | null = null;
           let at = 0;
           const open = h.backend.open.bind(h.backend);

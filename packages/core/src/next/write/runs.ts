@@ -500,6 +500,22 @@ export class RunReader {
    * what the constructor keeps (the partitions less their 5-byte headers, the keys less their
    * length prefixes).
    */
+  /**
+   * Pre-admission bound from an existing run reference, without reading its directories.
+   * Every block-index entry uses at least two varints and a u32 checksum (six bytes).
+   * Bloom construction uses at most ten bits per input entry, plus thirteen bytes per
+   * partition for rounding, the minimum bitset and its header. Stored bytes are unchanged.
+   */
+  static residentBound(ref: RunRef): number {
+    const blocks = Math.min(ref.entryCount, Math.max(0, Math.floor((ref.entries.length - 1) / 6)));
+    return (
+      ref.fences.length +
+      blocks * (48 + 64) +
+      Math.ceil((ref.entryCount * BLOOM_BITS_PER_KEY) / 8) +
+      13 * Math.ceil(blocks / PARTITION_BLOCKS)
+    );
+  }
+
   static residentCharge(fences: Uint8Array, blooms: readonly Uint8Array[]): number {
     const count = new ByteReader(fences).varuint();
     let total = fences.length + count * (48 + 64);

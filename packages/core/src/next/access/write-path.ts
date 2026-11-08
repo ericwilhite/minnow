@@ -145,13 +145,18 @@
  *   charged before allocation. Freeing buffers returns allocations to a grant; unused growth
  *   reservations yield to governor reclaim requests, retaining the working minimum and every
  *   allocated or loan-backed byte. This lets a bounded merge admission progress beside a writer.
- * - Metadata allocation first uses its own grant (and the governor's cache eviction), then
- *   returns idle writer reservations and retries. If live reader memory still prevents growth,
- *   the owning operation waits on task turns, checking close/abort, after unwinding provisional
- *   publication state. Directory construction and run-reader opens use that same budget, as do
- *   root/statistics charges. Temporary pressure never poisons the writer; a single allocation
- *   larger than the whole cap reports MetadataAllocationTooLargeError. Row admission
- *   separately freezes committed memtables and waits for their flush at a writer boundary.
+ * - The write owner atomically admits native row/I/O, commit, metadata and merge accounts before
+ *   starting. Metadata headroom follows the current schema/root, not the format-wide maximum;
+ *   it grows before larger work. One merge's credit stays admitted between steps. Idle row
+ *   estimates can transfer directly into metadata or an active merge without rejoining global
+ *   admission; native storage takeovers keep each account's allocated count exact.
+ * - Directory construction, run-reader opens, root/statistics charges and synchronous state
+ *   pins use the prepaid metadata account. An asynchronous owner unwinds provisional work
+ *   before waiting for additional headroom, with close/abort cancellation. A protected reader's
+ *   admitted minimum cannot be the source of a write step's progress. Temporary pressure never
+ *   poisons the writer; only an individual allocation larger than the whole cap reports
+ *   MetadataAllocationTooLargeError. Row admission separately freezes committed memtables
+ *   and waits for their flush at a writer boundary.
  *   Oversized insert calls admit at most one memory chunk (2,048 rows) at a time, allowing
  *   eligible pending chunks to stage within the call while preserving statement atomicity.
  * - The write path charges log frame/join buffers until `StoreSession.appendLog()` resolves.

@@ -29,6 +29,11 @@ async function guardedBegin(path: WritePathImpl, space: Harness["space"]): Promi
   Object.defineProperty(path, "failure", {
     configurable: true,
     get: () => {
+      // The admitted-minimum walk checks cancellation once per finite metadata item without
+      // storage I/O. Those checks are work, not rounds of the writer's backpressure loop;
+      // minimum-clock.test.ts separately proves that walk yields and cancels. Keep the
+      // original 1,000-check guard for the writer/flush wait this probe owns.
+      if ((new Error().stack ?? "").includes("/write/minimum.")) return null;
       const stats = space.stats;
       const progress = `${String(stats.dataBytes)}/${String(stats.writerBytes)}/${String(stats.cache.hits)}/${String(path.publications)}`;
       if (progress !== previous) {

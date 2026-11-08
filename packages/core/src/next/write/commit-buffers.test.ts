@@ -1,5 +1,6 @@
 /** Gate D / governor rules 1, 2, 4: actual commit-buffer capacities stay charged and bounded. */
 import fc from "fast-check";
+import { watchGrants } from "./test-support.js";
 import { describe, expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, WRITE_COMMIT_BUFFER_STATES } from "../../testing/reach.js";
@@ -64,12 +65,7 @@ for (const backend of ["memory", "indexeddb"] as const)
             reach.reach(backend);
             const governor = new Governor(s.capMiB * MiB);
             const grants: Grant[] = [];
-            const admit = governor.admit.bind(governor);
-            governor.admit = async (options) => {
-              const grant = await admit(options);
-              grants.push(grant);
-              return grant;
-            };
+            watchGrants(governor, (grant) => grants.push(grant));
             const live = new Set<Uint8Array>();
             let independentPeak = 0;
             let capacityPeak = 0;

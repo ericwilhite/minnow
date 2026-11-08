@@ -102,7 +102,9 @@ import { Replayer, type Effect } from "../format/replay.js";
 import { walkReachable } from "../format/reachable.js";
 import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
 import type { Grant, Loan } from "../memory/governor.js";
-import { MetadataBudget, releaseIdle } from "./budget.js";
+import { WriteCredits } from "./credits.js";
+import { writeStepMinimum, type WriteStepMinimum } from "./minimum.js";
+import { MetadataBudget } from "./budget.js";
 import { GroupWriter } from "../page/writer.js";
 import type { StoreSession } from "../storage/contract.js";
 import { ExtentListKeeper, type ExtentList } from "../storage/extent-list.js";
@@ -434,6 +436,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #abortCommit = () => this.#commitAbort.abort(this.#signal?.reason);
   readonly #session: StoreSession;
   readonly #space: Space;
+  readonly #credits: WriteCredits;
   readonly #grant: Grant;
   readonly #now: () => number;
   readonly #signal: AbortSignal | undefined;
@@ -487,7 +490,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #memtableRows: number;
   /** True while open replays the log (no flush runs before the appender exists). */
   #recovering = true;
-  readonly #governor: EngineInput["governor"];
   readonly #mergePolicy: MergePolicy;
   readonly #mergeMode: "auto" | "manual" | "off";
   readonly #stallRuns: number;
@@ -600,6 +602,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   private constructor(
     input: EngineInput,
+    credits: WriteCredits,
     grant: Grant,
     commitBuffers: CommitBuffers,
     root: ManifestRoot,
@@ -611,6 +614,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       readonly lists: ExtentListKeeper;
     },
   ) {
+    this.#credits = credits;
     this.#commitBuffers = commitBuffers;
     this.#columns = new ByteWriter(64 * 1024, commitBuffers, SMALL_COMMIT_BYTES);
     this.#body = new ByteWriter(64 * 1024, commitBuffers, SMALL_COMMIT_BYTES);
@@ -636,7 +640,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#metadataCaches = [caches.groupRoots, caches.groupPages, caches.groupIndexes];
     this.#metadata = new MetadataReader(input.space, caches);
     this.#governorCap = input.governor.capBytes;
-    this.#governor = input.governor;
     const merges = input.tuning?.merges;
     this.#mergePolicy = { ...DEFAULT_MERGE_POLICY, ...merges };
     this.#mergeMode = merges?.mode ?? "auto";
@@ -704,36 +707,36 @@ export class WritePathImpl implements WritePath, EngineHooks {
   // ── Open and recovery ────────────────────────────────────────────────────────────────────
 
   static async open(input: EngineInput): Promise<WritePathImpl> {
-    const grant = await input.governor.admit({
-      label: "write path",
-      minimumBytes: MINIMUM_BYTES,
-      spillable: true,
-      ...(input.options.signal === undefined ? {} : { signal: input.options.signal }),
-    });
-    const metadataGrant = await input.governor.admit({
-      label: "write path metadata",
-      minimumBytes: 0,
-      spillable: true,
-    });
-    // Growth after a wide batch is a reservation, not a live buffer. Return it on pressure.
-    const reclaimWriter = () => releaseIdle(grant, MINIMUM_BYTES);
+    const raw = input.space.root?.byteLength ?? 512;
+    const credits = await WriteCredits.open(
+      input.governor,
+      {
+        rows: MINIMUM_BYTES,
+        metadata: 4096 + 2 * parseCharge(raw) + 5 * (raw + 512),
+        commits: COMMIT_MINIMUM_BYTES,
+        merge:
+          input.tuning?.merges?.mode === "off"
+            ? 0
+            : MERGE_FIXED_BYTES +
+              (input.tuning?.merges?.fanIn ?? DEFAULT_MERGE_POLICY.fanIn) * MERGE_INPUT_BYTES,
+      },
+      input.options.signal,
+    );
+    const grant = credits.rows;
+    const metadataGrant = credits.metadata;
+    const reclaimWriter = () => credits.reclaimRows();
     grant.onReclaimRequest(reclaimWriter);
-    metadataGrant.onReclaimRequest(() => releaseIdle(metadataGrant));
+    metadataGrant.onReclaimRequest(() => credits.reclaimMetadata());
     const metadataBudget = new MetadataBudget(
       metadataGrant,
       reclaimWriter,
       input.governor.capBytes,
+      (wanted) => credits.growTo(metadataGrant, wanted),
     );
     let commitBuffers: CommitBuffers | null = null;
     let engine: WritePathImpl | null = null;
     try {
-      const bufferGrant = await input.governor.admit({
-        label: "write commit buffers",
-        minimumBytes: COMMIT_MINIMUM_BYTES,
-        spillable: false,
-        ...(input.options.signal === undefined ? {} : { signal: input.options.signal }),
-      });
-      commitBuffers = new CommitBuffers(bufferGrant, input.tuning?.onCommitBuffer);
+      commitBuffers = new CommitBuffers(credits.commits, input.tuning?.onCommitBuffer);
       const { space, session } = input;
       let rootCharge = 0;
       let root: ManifestRoot;
@@ -811,13 +814,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
         lists = new ExtentListKeeper(root.extentList, { reader: space, budget: grant });
         catalog = Catalog.decode(await readBlob(space, root.catalog, grant));
       }
-      engine = new WritePathImpl(input, grant, commitBuffers, root, catalog, {
+      engine = new WritePathImpl(input, credits, grant, commitBuffers, root, catalog, {
         grant: metadataGrant,
         budget: metadataBudget,
         rootCharge,
         lists,
       });
       await engine.#load();
+      await engine.#prepareMinimum();
       await engine.#recover();
       engine.#recovering = false;
       if (input.deferInitialMaintenance !== true) engine.startInitialMaintenance();
@@ -825,8 +829,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     } catch (error) {
       if (engine !== null) engine.#signal?.removeEventListener("abort", engine.#abortCommit);
       commitBuffers?.close();
-      metadataGrant.close();
-      grant.close();
+      credits.close();
       throw error;
     }
   }
@@ -857,7 +860,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
             for (const page of pages) {
               const held = await this.#metadata.groupPage(page.ref, this.#grant);
               try {
-                for (const group of held.value) await this.#metadataRetry(() => builder.add(group));
+                for (const group of held.value) {
+                  await this.#metadataRetry(() => builder.add(group));
+                }
               } finally {
                 held.release();
               }
@@ -1563,6 +1568,88 @@ export class WritePathImpl implements WritePath, EngineHooks {
     return await this.#metadataRetry(work);
   }
 
+  readonly #minimumRuns = new Set<Promise<void>>();
+  #minimumState: WriteState | null = null;
+  #minimumCatalog: Catalog | null = null;
+  #minimumMetadata = 0;
+  #minimumMerge = 0;
+
+  // This cached check is deliberately closure-free: single-row writes take it repeatedly.
+  #prepareMinimum(
+    catalog = this.#holder?.catalog ?? this.#catalog,
+    signal?: AbortSignal,
+  ): MaybePromise<void> {
+    if (this.#minimumState !== this.#state || this.#minimumCatalog !== catalog)
+      return this.#recalculateMinimum(catalog, signal);
+    const metadata = this.#credits.prepareMetadata(this.#minimumMetadata, signal);
+    if (metadata instanceof Promise) return this.#finishMinimumGrowth(metadata, signal);
+    const merge = this.#credits.prepareMerge(this.#minimumMerge, signal);
+    return merge instanceof Promise ? this.#trackMinimum(merge) : undefined;
+  }
+
+  #finishMinimumGrowth(metadata: Promise<void>, signal?: AbortSignal): Promise<void> {
+    return this.#trackMinimum(
+      metadata.then(() => this.#credits.prepareMerge(this.#minimumMerge, signal)),
+    );
+  }
+
+  #recalculateMinimum(catalog: Catalog, signal?: AbortSignal): MaybePromise<void> {
+    const state = this.#state;
+    // Calculation may yield; reuse the state's existing pin so publication cannot release
+    // its directory buffers until navigation has finished. This takes no new space pin.
+    const pin = this.#pinState(state, "write minimum");
+    const install = (minimum: WriteStepMinimum): MaybePromise<void> => {
+      pin.release();
+      if (state !== this.#state) return this.#prepareMinimum(catalog, signal);
+      this.#minimumMetadata = minimum.metadata;
+      this.#minimumMerge = minimum.merge;
+      this.#minimumState = state;
+      this.#minimumCatalog = catalog;
+      return this.#prepareMinimum(catalog, signal);
+    };
+    let minimum: MaybePromise<WriteStepMinimum>;
+    try {
+      minimum = writeStepMinimum(
+        state,
+        catalog,
+        this.#space.root?.byteLength ?? 512,
+        this.#mergePolicy.fanIn,
+        this.#mergeMode !== "off",
+        this.#runsByRef,
+        () => {
+          signal?.throwIfAborted();
+          this.#signal?.throwIfAborted();
+          if (this.#closed) throw new WritePathClosedError();
+          if (this.#recovering) {
+            if (this.#failure !== null) throw this.#failure;
+          } else this.#check();
+        },
+      );
+    } catch (error) {
+      pin.release();
+      throw error;
+    }
+    if (minimum instanceof Promise)
+      return this.#trackMinimum(
+        minimum.then(install, (error: unknown) => {
+          pin.release();
+          throw error;
+        }),
+      );
+    return install(minimum);
+  }
+
+  #trackMinimum(run: Promise<void>): Promise<void> {
+    this.#minimumRuns.add(run);
+    void run.finally(() => this.#minimumRuns.delete(run)).catch(() => undefined);
+    return run;
+  }
+
+  /** Admit the proposed schema before DDL mutates synchronous state/pins. */
+  prepareCatalog(catalog: Catalog): MaybePromise<void> {
+    return this.#prepareMinimum(catalog);
+  }
+
   /** Charges (or returns) resident metadata bytes; async owners handle temporary pressure. */
   #chargeMetadata(bytes: number): void {
     if (bytes < 0) this.#metadataBudget.free(-bytes);
@@ -1657,6 +1744,18 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * `MemtableMemoryError` when nothing more can be freed.
    */
   admit(bytes: number): MaybePromise<void> {
+    const prepared = this.#prepareMinimum();
+    return prepared instanceof Promise
+      ? this.#admitAfterMinimum(prepared, bytes)
+      : this.#admitRows(bytes);
+  }
+
+  #admitAfterMinimum(prepared: Promise<void>, bytes: number): Promise<void> {
+    return prepared.then(() => this.#admitRows(bytes));
+  }
+
+  #admitRows(bytes: number): MaybePromise<void> {
+    this.#check();
     // A large transaction's full memtables are staged first: its rows never stay resident whole.
     const stage = this.#stageCandidates();
     if (stage !== null)
@@ -1805,6 +1904,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#check();
     await this.#takeSlot("writer", options.signal);
     try {
+      this.#check();
+      await this.#prepareMinimum(this.#catalog, options.signal);
+      options.signal?.throwIfAborted();
       this.#check();
       // Backpressure: frozen memtables awaiting publication past their cap, or memtables across
       // every table past theirs, make writers wait (ruling 6). None of it needs the slot.
@@ -1964,6 +2066,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
   ): Promise<CommitReceipt> {
     try {
       this.#check();
+      const minimum = this.#prepareMinimum(tx.catalog);
+      if (minimum instanceof Promise)
+        return this.#commitAfterMinimum(minimum, tx, request, staged, preflighted);
       const workspace = tx.commitWorkspaceBytes();
       if (workspace > SMALL_COMMIT_BYTES)
         return this.#trackCommit(this.#streamCommit(tx, request, staged), tx);
@@ -2008,6 +2113,19 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.release(tx);
       return Promise.reject(error instanceof Error ? error : new Error(String(error)));
     }
+  }
+
+  #commitAfterMinimum(
+    minimum: Promise<void>,
+    tx: TransactionImpl,
+    request: CommitRequest | null,
+    staged: (tableId: number) => PublishedRows | null,
+    preflighted: boolean,
+  ): Promise<CommitReceipt> {
+    return this.#trackCommit(
+      minimum.then(() => this.#commitNow(tx, request, staged, preflighted)),
+      tx,
+    );
   }
 
   async #preflightCommit(
@@ -2073,7 +2191,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (
         deletes > 0 &&
         unordered &&
-        deletes * 4 <= this.#governor.reserveBytes &&
+        deletes * 4 <= this.#credits.governor.reserveBytes &&
         tx.undo.length <= 0x7fffffff
       ) {
         loan = await this.#commitBuffers.grant.borrow(deletes * 4, this.#commitAbort.signal);
@@ -2353,10 +2471,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
   async #closeNow(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#credits.cancel(new WritePathClosedError());
     this.#commitAbort.abort(new WritePathClosedError());
     this.#signal?.removeEventListener("abort", this.#abortCommit);
     if (this.#idleTimer !== null) clearTimeout(this.#idleTimer);
     this.#idleTimer = null;
+    // A sliced admission calculation retains its input state until cancellation settles.
+    await Promise.allSettled(this.#minimumRuns);
     // Staging owns memtables until its writer has settled. Rollback may release them.
     await Promise.allSettled(this.#stagingRuns);
     await Promise.allSettled(this.#commitRuns);
@@ -2388,6 +2509,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#sequenceBody.close();
       this.#commitBuffers.close();
       this.#grant.close();
+      this.#credits.close();
     }
   }
 
@@ -2896,6 +3018,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       unlock?.();
       if (writing) this.#flushesWriting -= 1;
     }
+    await this.#prepareMinimum();
     this.#scheduleMerge();
   }
 
@@ -3836,20 +3959,26 @@ export class WritePathImpl implements WritePath, EngineHooks {
     divisor = 1,
   ): Promise<void> {
     const started = performance.now();
-    const grant = await this.#governor.admit({
-      label: `merge t${String(state.tableId)} i${String(indexId)}`,
-      minimumBytes: MERGE_FIXED_BYTES + inputs.length * MERGE_INPUT_BYTES,
-      spillable: false,
-    });
+    const grant = await this.#credits.acquireMerge(
+      `merge t${String(state.tableId)} i${String(indexId)}`,
+      MERGE_FIXED_BYTES + inputs.length * MERGE_INPUT_BYTES,
+    );
     // The encoder's buffers and the staging queue (the space charges leases and its own staging).
     const working = MERGE_FIXED_BYTES - 512 * 1024;
     if (!grant.allocate(working)) {
-      grant.close();
+      this.#credits.releaseMerge(grant);
       throw new RangeError("A merge's admitted grant cannot hold its working memory");
     }
-    const writer = this.#space.beginWrite(`merge t${String(state.tableId)} i${String(indexId)}`, {
-      budget: grant,
-    });
+    let writer: ExtentWriter;
+    try {
+      writer = this.#space.beginWrite(`merge t${String(state.tableId)} i${String(indexId)}`, {
+        budget: grant,
+      });
+    } catch (error) {
+      grant.free(working);
+      this.#credits.releaseMerge(grant);
+      throw error;
+    }
     let unlock: (() => void) | null = null;
     let madeRoot: ManifestRoot | null = null;
     const delta = new DeltaPublication(
@@ -3933,6 +4062,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.shared.readers.holdUntilOlderClose(() => {
         this.#dropRunReaders(inputs);
       });
+      await this.#prepareMinimum();
       const counters = this.maintenance;
       counters.merges += 1;
       if (this.#flushesWriting > 0) counters.mergesDuringFlush += 1;
@@ -3953,7 +4083,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
       delta.settle();
       if (madeRoot !== null) this.#releaseRoot(madeRoot);
       unlock?.();
-      grant.close();
+      grant.free(working);
+      this.#credits.releaseMerge(grant);
     }
   }
 

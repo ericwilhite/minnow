@@ -84,8 +84,14 @@ for (const backend of ["memory", "indexeddb"] as const)
             governor.admit = async (options) => {
               if (reader && options.label.startsWith("merge")) schedule();
               const g = await admit(options);
+              watchGrant(g);
+              return g;
+            };
+            // Admission bookkeeping moved from individual admit calls to native group parts;
+            // the same holder, growth denial, timer release and progress assertions remain.
+            const watchGrant = (g: Grant) => {
               grants.push(g);
-              if (options.label === "write path metadata") {
+              if (g.label === "write path metadata") {
                 const grow = g.tryGrow.bind(g);
                 g.tryGrow = (bytes) => {
                   const ok = grow(bytes);
@@ -93,8 +99,15 @@ for (const backend of ["memory", "indexeddb"] as const)
                   return ok;
                 };
               }
-              return g;
             };
+            if (typeof governor.admitGroup === "function") {
+              const admitGroup = governor.admitGroup.bind(governor);
+              governor.admitGroup = async (options) => {
+                const group = await admitGroup(options);
+                for (const g of group) watchGrant(g);
+                return group;
+              };
+            }
             path = await h.open();
             let table = 0,
               next = 0;

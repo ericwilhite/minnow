@@ -8,6 +8,7 @@
  * the path keeps staging and committing, and retired space is reclaimed (R8): no pin holds it.
  */
 import fc from "fast-check";
+import { watchGrants } from "./test-support.js";
 import { describe, expect, it } from "vitest";
 import type { Grant } from "../memory/governor.js";
 import { createReach } from "../../testing/reach.js";
@@ -75,11 +76,9 @@ async function run(fault: Fault): Promise<void> {
   // A hard failure at the root charge exercises cleanup; temporary refusal now waits/retries
   // (PROPOSAL "One memory governor", covered by metadata-pressure.test.ts).
   let grant: Grant | null = null;
-  const admit = harness.governor.admit.bind(harness.governor);
-  harness.governor.admit = async (options) => {
-    const admitted = await admit(options);
-    if (options.label === "write path") grant = admitted;
-    if (options.label === "write path metadata") {
+  watchGrants(harness.governor, (admitted) => {
+    if (admitted.label === "write path") grant = admitted;
+    if (admitted.label === "write path metadata") {
       const allocate = admitted.allocate.bind(admitted);
       admitted.allocate = (bytes) => {
         if (
@@ -95,8 +94,7 @@ async function run(fault: Fault): Promise<void> {
         return allocate(bytes);
       };
     }
-    return admitted;
-  };
+  });
   // Released bytes per committed publication (the sink sees exactly what each root retires).
   const released: number[] = [];
   let pending = 0;

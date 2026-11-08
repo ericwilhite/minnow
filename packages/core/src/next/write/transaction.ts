@@ -74,6 +74,8 @@ export interface EngineHooks {
   state(): WriteState;
   committedCatalog(): Catalog;
   nextCatalogVersion(): number;
+  /** Prepay schema-dependent metadata before synchronous DDL state changes. */
+  prepareCatalog(catalog: Catalog): MaybePromise<void>;
   /**
    * The table's live memtable with room, freezing a full one first: `created` is set when this
    * call created the memtable (and `frozen` is the one it froze, if any).
@@ -769,14 +771,19 @@ export class StatementImpl implements Statement {
     return this.guard(() => {
       const before = this.tx.catalog;
       const { catalog, logged, id } = before.change(change, this.tx.hooks.nextCatalogVersion());
-      this.tx.undo.push({ kind: "catalog", statement: this.ordinal, before, logged });
-      this.tx.catalog = catalog;
-      const work: Array<MaybePromise<void>> = [];
-      for (const entry of logged) {
-        if (entry.op === "createTable") this.tx.hooks.createTableState(entry.table, entry.table.id);
-        if (entry.op === "createIndex") work.push(this.#backfill(entry.index));
-      }
-      return settle(all(work), () => ({ id }));
+      return settle(this.tx.hooks.prepareCatalog(catalog), () =>
+        this.guard(() => {
+          this.tx.undo.push({ kind: "catalog", statement: this.ordinal, before, logged });
+          this.tx.catalog = catalog;
+          const work: Array<MaybePromise<void>> = [];
+          for (const entry of logged) {
+            if (entry.op === "createTable")
+              this.tx.hooks.createTableState(entry.table, entry.table.id);
+            if (entry.op === "createIndex") work.push(this.#backfill(entry.index));
+          }
+          return settle(all(work), () => ({ id }));
+        }),
+      );
     });
   }
 

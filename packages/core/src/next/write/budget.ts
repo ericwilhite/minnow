@@ -49,6 +49,7 @@ export class MetadataBudget implements ByteBudget {
     readonly grant: Grant,
     readonly reclaimWriter: () => number,
     readonly capBytes: number,
+    readonly grow?: (wanted: number) => Promise<void>,
   ) {}
 
   allocate(bytes: number): boolean {
@@ -81,6 +82,12 @@ export class MetadataBudget implements ByteBudget {
   }
 
   async #wait(wanted: number, check: () => void): Promise<void> {
+    if (this.grow !== undefined) {
+      check();
+      await this.grow(wanted);
+      check();
+      return;
+    }
     for (;;) {
       check();
       if (this.grant.held >= wanted || this.grant.tryGrow(wanted - this.grant.held)) return;

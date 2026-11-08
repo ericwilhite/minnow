@@ -1738,12 +1738,30 @@ export const NATIVE_CREDIT_CACHE_STATES = [
   "takeover owns real buffer",
   "transfer after takeover",
   "close leaves retained owner paid",
+] as const;
+
 /** Run Bloom arithmetic preserves the stored probes across bitmap sizes and unsigned hashes. */
 export const RUN_BLOOM_STEP_STATES = [
   "minimum bitmap",
   "rounded bitmap",
   "unsigned high hash",
   "wrapped step",
+] as const;
+
+/** Feasible durable writes under small caps must share idle holdings with maintenance. */
+export const WRITE_LOW_CAP_STATES = [
+  "memory",
+  "indexeddb",
+  "startup returned",
+  "startup retained",
+  "active progress loan",
+  "idle estimate headroom",
+  "merge needs returned headroom",
+  "merge completed",
+  "metadata grew under pressure",
+  "durable reopen",
+  "allocated write above minimum",
+  "commit buffers independently charged",
 ] as const;
 
 /** B3: low-cap commit encoding owns a bounded, independently counted set of actual buffers. */
@@ -2050,4 +2068,41 @@ export const WRITE_RANGE_NAVIGATION_LIFETIME_STATES = [
   "1024 keys",
   "16384 keys",
   "131072 keys",
+] as const;
+
+export const WRITE_PRIVATE_MINIMUM_STATES = [
+  "memory",
+  "indexeddb",
+  "32 MiB",
+  "48 MiB",
+  "64 MiB",
+  "two input policy",
+  "three input policy",
+  "merge debt prepared",
+  "protected holder owns real bytes",
+  "merge progressed while holder retained",
+  "complete current snapshot",
+  "durable reopen",
+  "all credit returned",
+] as const;
+
+/** An admitted writer funds one bounded step without taking another execution's minimum. */
+export const WRITE_CREDIT_STATES = [
+  "atomic owner admitted",
+  "merge while protected holder retained",
+  "idle row credit transferred",
+  "merge credit reused",
+  "metadata step retained and returned",
+  "all accounts returned once",
+  "growth waits on real retained bytes",
+  "operation cancellation",
+  "owner cancellation",
+] as const;
+
+/** Publication-minimum navigation shares the task clock and closes its retained state once. */
+export const WRITE_MINIMUM_CLOCK_STATES = [
+  "task turn during cumulative small tables",
+  "close drains sliced state pin",
+  "shared clock due repeatedly",
+  "all state credit returned",
 ] as const;

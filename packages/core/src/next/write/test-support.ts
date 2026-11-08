@@ -13,7 +13,7 @@ import type {
   WritePath,
   WriteTransaction,
 } from "../access/write-path.js";
-import { Governor } from "../memory/governor.js";
+import { Governor, type MemoryGovernor, type Grant } from "../memory/governor.js";
 import { SimBackend, SimDisk } from "../storage/sim-disk.js";
 import type { PhysicalType } from "../types.js";
 import { int64At } from "../vector/int64.js";
@@ -128,7 +128,7 @@ export class Harness {
       await lease.release();
     };
     try {
-      this.path = await WritePathImpl.open({
+      const opening = WritePathImpl.open({
         session,
         space: this.space,
         governor: this.governor,
@@ -139,6 +139,10 @@ export class Harness {
           ...(this.memtableRows === undefined ? {} : { memtableRows: this.memtableRows }),
         },
       });
+      // Native storage retains its own admitted roots after open. Startup's unused estimate
+      // yields at write admission; allocated buffers and loans keep their original ownership.
+      startup.release(startup.held - startup.allocated - startup.loaned);
+      this.path = await opening;
     } catch (error) {
       // A refused open leaves nothing held: the next open can take the lock.
       await release();
@@ -380,4 +384,20 @@ export function countMetadataPinBytes(harness: Harness): () => number {
     };
   };
   return () => bytes;
+}
+
+/** Observe native accounts as well as standalone admissions; no budgets or faults are replaced. */
+export function watchGrants(governor: MemoryGovernor, observe: (grant: Grant) => void): void {
+  const admit = governor.admit.bind(governor);
+  governor.admit = async (options) => {
+    const grant = await admit(options);
+    observe(grant);
+    return grant;
+  };
+  const admitGroup = governor.admitGroup.bind(governor);
+  governor.admitGroup = async (options) => {
+    const grants = await admitGroup(options);
+    for (const grant of grants) observe(grant);
+    return grants;
+  };
 }

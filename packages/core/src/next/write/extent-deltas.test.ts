@@ -5,6 +5,7 @@
  * index and table DDL, log recycles, idle publishes and reopens. Each delta adds only extents the
  * set lacks and releases only extents it holds.
  */
+import { watchGrants } from "./test-support.js";
 import { describe, expect, it } from "vitest";
 import type { PublishDelta } from "../access/write-path.js";
 import { reachableExtents } from "../format/reachable.js";
@@ -107,10 +108,8 @@ describe("extent deltas (ruling R25)", () => {
           if (roll < 0.4) refuseNextAllocation = true;
         },
       });
-      const admit = harness.governor.admit.bind(harness.governor);
-      harness.governor.admit = async (options) => {
-        const grant = await admit(options);
-        if (options.label === "write path metadata") {
+      watchGrants(harness.governor, (grant) => {
+        if (grant.label === "write path metadata") {
           const allocate = grant.allocate.bind(grant);
           grant.allocate = (bytes) => {
             // The merge's own root charge: a flush can allocate between the hook and that charge.
@@ -122,8 +121,7 @@ describe("extent deltas (ruling R25)", () => {
             return allocate(bytes);
           };
         }
-        return grant;
-      };
+      });
       reach.beginHistory();
       const set = new Map<number, number>();
       let sequence = 0;
@@ -457,6 +455,50 @@ describe("extent deltas (ruling R25)", () => {
         expect(path.maintenance.flushesAbandoned).toBeGreaterThan(0);
         reach.reach("flush-of-dropped-table");
         expect(set).toEqual(await walk(overlap.space));
+        // A nonquiet older table's unflushed build holds a newer table's catalog back.
+        // This topology forces the held-flush state independently of random task timing.
+        let building = 0,
+          newer = 0;
+        await autocommit(path, async (s) => {
+          building =
+            (
+              await s.changeCatalog({
+                kind: "createTable",
+                table: tableInput("building", [column("id", INT, false)]),
+              })
+            ).id ?? 0;
+        });
+        await autocommit(path, (s) => s.table(building).insert(batch(ints([1])), null));
+        await autocommit(path, (s) =>
+          s.changeCatalog({
+            kind: "createIndex",
+            index: {
+              tableId: building,
+              name: "building_index",
+              columnIds: [need(path.catalog.table(building)?.columns[0]?.id)],
+              unique: false,
+              role: "secondary",
+            },
+          }),
+        );
+        await autocommit(path, async (s) => {
+          newer =
+            (
+              await s.changeCatalog({
+                kind: "createTable",
+                table: tableInput("newer", [column("id", INT, false)]),
+              })
+            ).id ?? 0;
+        });
+        const heldBefore = path.maintenance.flushesHeld;
+        await autocommit(path, (s) =>
+          s.table(newer).insert(batch(ints(Array.from({ length: width }, (_, k) => k))), null),
+        );
+        await autocommit(path, (s) => s.table(newer).insert(batch(ints([width])), null));
+        await path.quiesce();
+        expect(path.maintenance.flushesHeld).toBeGreaterThan(heldBefore);
+        reach.reach("flush-held-by-build");
+        expect(set).toEqual(await walk(overlap.space));
         await overlap.space.audit();
       } finally {
         release();
@@ -673,7 +715,13 @@ describe("a sink whose commit or abort throws (review B3-p2b-4 D1)", () => {
         await insert([6, 7, 8]);
         target = true;
         if (kind === "flush") {
-          await insert([9]);
+          // ExtentDeltaSink makes callback failures fatal. Minimum admission may yield while
+          // the triggering insert is still settling, so observe that same fatal error there
+          // or at quiesce; the callback, once-only settlement and cleanup assertions stay below.
+          await insert([9]).catch((error: unknown) => {
+            expect(error).toBeInstanceOf(ExtentSinkError);
+            expect(error).toBe(path.failure);
+          });
           await path.quiesce().catch(() => undefined);
         } else if (kind === "merge") {
           await insert([9]);

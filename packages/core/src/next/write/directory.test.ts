@@ -4,6 +4,7 @@
  * when a deletion folds into one of its groups, retires exactly the directory extents no longer
  * used (the extent audit), and reopens with every row.
  */
+import { watchGrants } from "./test-support.js";
 import { PIN_HEADER_BYTES } from "../storage/root-pins.js";
 import { GroupDirectory } from "./groups.js";
 import { describe, expect, it } from "vitest";
@@ -126,12 +127,9 @@ describe("resident directory memory (review B3-p2a-2 #1)", () => {
     };
     // The engine's resident-metadata grant, to check its charge is real (not only reported).
     const metadata: { grant: { readonly allocated: number } | null } = { grant: null };
-    const admit = harness.governor.admit.bind(harness.governor);
-    harness.governor.admit = async (options) => {
-      const grant = await admit(options);
-      if (options.label === "write path metadata") metadata.grant = grant;
-      return grant;
-    };
+    watchGrants(harness.governor, (grant) => {
+      if (grant.label === "write path metadata") metadata.grant = grant;
+    });
     const fixed = () =>
       harness.governor.usedBytes - caches.reduce((sum, cache) => sum + cache.evictableBytes, 0);
     let path = await harness.open();

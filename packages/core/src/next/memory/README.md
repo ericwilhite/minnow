@@ -47,3 +47,21 @@ directions, cache takeovers, loans, close order, queued admission and cancellati
 Native cache takeovers check every post-transfer allocation and close balance.
 `MINNOW_NATIVE_CREDIT_CACHE=1` additionally requires that capability: a governor
 without native takeovers cannot pass this integration mode.
+
+## Write-owner minimum
+
+The write path admits its row/I/O, metadata, commit and merge accounts together.
+The metadata allowance follows the current schema and root, and is revised before larger work; it is not a reservation for the largest allowed format blob.
+A merge takes its already admitted credit into a temporary native grant and returns it
+when the step settles. Credit is not released into global admission between merge steps.
+Idle write estimates may fund that step directly, while live allocations and loan-backed
+bytes stay with their owner. Storage can take retained buffers from these native accounts;
+there is no second allocation counter that can become stale after a takeover.
+
+Additional growth first transfers idle row estimates, then requests ordinary admission
+with cancellation. Closing the writer cancels pending growth before releasing its inputs.
+Metadata allocation distinguishes an individual object larger than the whole cap from
+transient pressure: only the former is a typed size refusal. A metadata parse still has
+to fit as one step; this does not add a new stored format or a streaming manifest parser.
+The owner of an extent-space startup grant returns its unused estimate when handing off
+to write admission, retaining any live allocation or outstanding loan.
