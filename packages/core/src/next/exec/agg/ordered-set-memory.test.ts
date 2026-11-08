@@ -182,12 +182,20 @@ it.each(seedsFor("next-ordered-set-memory", [0xb603, 0xb604]))(
     const examples: Array<[number, number, number, boolean, boolean, boolean, boolean]> = [];
     for (let fn = 0; fn < 3; fn++)
       for (const cancel of [false, true])
-        examples.push([fn, 20000, 3, fn % 2 === 0, cancel, fn % 2 !== 0, fn === 2]);
+        examples.push([
+          fn,
+          20000,
+          fn === 0 ? 1 : 1000,
+          fn % 2 === 0,
+          cancel,
+          fn % 2 !== 0,
+          fn === 2,
+        ]);
     await fc.assert(
       fc.asyncProperty(
         fc.integer({ min: 0, max: 2 }),
         fc.integer({ min: 16000, max: 24000 }),
-        fc.integer({ min: 1, max: 4 }),
+        fc.integer({ min: 1000, max: 2000 }),
         fc.boolean(),
         fc.boolean(),
         fc.boolean(),
@@ -195,6 +203,8 @@ it.each(seedsFor("next-ordered-set-memory", [0xb603, 0xb604]))(
         async (fn, n, groups, descending, cancel, clock, multiple) => {
           reach.beginHistory();
           await run(present(fns[fn]), n, groups, descending, cancel, clock, multiple);
+          if (!cancel && groups === 1) reach.reach("single group");
+          if (!cancel && groups >= 1000) reach.reach("many groups");
           if (multiple) reach.reach("multiple ordered calls");
           reach.reach(present(fns[fn]));
           reach.reach(cancel ? "cancelled append" : "backpressure");

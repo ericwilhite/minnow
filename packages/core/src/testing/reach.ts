@@ -1546,6 +1546,8 @@ export const ORDERED_SET_REACH = [
 ] as const;
 
 export const ORDERED_SET_MEMORY_REACH = [
+  "single group",
+  "many groups",
   "multiple ordered calls",
   "percentile_cont",
   "percentile_disc",
