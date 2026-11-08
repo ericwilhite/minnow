@@ -1712,3 +1712,14 @@ export const JSON_TABLE_NULL_REACH = [
   "single NULL",
   "NULL-only prefix",
 ] as const;
+
+/** Append reuse changes allocation cost, never the simulated disk's physical fault law. */
+export const SIM_DISK_APPEND_REACH = [
+  "amortized append growth",
+  "planned physical crash",
+  "overwrite truncate and gap",
+  "recovery forks before an old suffix",
+  "retained immutable views",
+  "honest flush",
+  "lying flush",
+] as const;
