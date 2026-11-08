@@ -1,4 +1,5 @@
-import { it, expect } from "vitest";
+import { it, expect, vi } from "vitest";
+import { taskClock } from "../task.js";
 import {
   Harness,
   autocommit,
@@ -28,6 +29,10 @@ it("review: unclaimed staging walk gives timers a turn", async () => {
     await s.table(t).insert(batch(ints(Array.from({ length: 8 }, (_, k) => i + k))), null);
   await s.end();
   const q = await h.crash();
+  // The walk must yield whenever the shared task clock is due. Make it due on every fourth
+  // check, so the law does not depend on how fast the host finishes a 4 ms slice.
+  let checks = 0;
+  const due = vi.spyOn(taskClock, "due").mockImplementation(() => ++checks % 4 === 0);
   let timer = false;
   let handle: ReturnType<typeof setTimeout> | undefined;
   let start = 0;
@@ -71,6 +76,7 @@ it("review: unclaimed staging walk gives timers a turn", async () => {
   );
   await autocommit(q, (s) => s.table(t).insert(batch(ints([40])), null));
   await q.quiesce();
+  due.mockRestore();
   if (handle) clearTimeout(handle);
   console.log({ reads, yielded, elapsed });
   await h.close();
