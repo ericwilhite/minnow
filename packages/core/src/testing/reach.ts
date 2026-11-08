@@ -1471,3 +1471,14 @@ export const STORAGE_PAGE_BOUNDARY_REACH = [
   "one root since recovery",
   "two roots since recovery",
 ] as const;
+
+/** Catalogue order checks preserve peers but reject reordered distinct key groups. */
+export const CATALOGUE_ORDER_REACH = [
+  "ascending",
+  "descending",
+  "multiple keys",
+  "ordinal",
+  "null keys",
+  "ties",
+  "window order only",
+] as const;
