@@ -1086,6 +1086,39 @@ To iterate on the harness, run the unit tests (`npm test`) for the generator, an
 suite rules, then `npm run test:browser:site` to run a suite in real browsers. To try a change by
 hand, `npm run site:dev` and open `/benchmarks`.
 
+## Rebuild owner latency
+
+The unexported rebuild core's owner protocol has a separate, cross-origin isolated runner.
+Run one engine at a time, with no other benchmark or build in flight:
+
+```bash
+MINNOW_PERF_LANE=1 npm run test:browser:next-owner -- next-owner-latency.spec.ts --project=chromium --repeat-each=5 --workers=1
+```
+
+Repeat for `firefox` and `webkit`, recording host load alongside the results. This lane enforces
+warm cross-tab point-read p50 targets of 250, 400 and 600 microseconds respectively, and a loaded
+p95 target of 5 milliseconds. The fixture uses real lowering and the owner protocol, with a
+synthetic executor and write path; it does not establish the real executor's lookup cost.
+Warm prepared reads bypass plan-cache lookup. The report also includes bare broker round trips,
+lock-call counts and a clone/transfer probe. The probe sends buffers to the broker, which replies
+without echoing those buffers, so it measures one payload direction.
+
+An isolated scheduling experiment helps distinguish browser task queues from SQL and wire costs:
+
+```bash
+MINNOW_OWNER_SCHEDULING_BENCH=1 npm run test:browser:next-owner -- next-owner-scheduling.spec.ts --project=chromium --workers=1
+```
+
+It compares the fixture's fresh-channel yields with the production task scheduler, then compares
+4, 1 and 0.5 millisecond slices using that scheduler. Five rounds rotate variant order. Each
+variant completes the same integer kernel and checksum; the attachment reports echo latency,
+work completion time and yield count, with host CPU count and load at the start and end.
+Slice elapsed time includes host preemption and is not OS
+CPU time. The echo client and worker belong to one page: this isolates task scheduling rather
+than measuring the cross-tab protocol. These experiments do not change the production quantum
+or replace the latency gate. Retain every round and inspect throughput cost as well as latency
+before choosing a scheduling change.
+
 ## Performance after repeated writes
 
 Most gate shapes read a table as it was loaded. The `settled-*` shapes read it as it is after a

@@ -1911,13 +1911,19 @@ not require a home cache directory.
 - Tests: in process (`testing/owner-*.test.ts`, the election ones on in-memory Web Locks) and
   across real tabs in Chromium, Firefox and WebKit (`npm run test:browser:next-owner`), over real
   lowering and the stand-in executor and write path persisted in OPFS (IndexedDB where workers
-  have no OPFS). The browser run includes the cross-tab point-read latency lane: it asserts at most
-  4× a bare round trip to the broker in the same run, and R6's absolute targets with
+  have no OPFS). The browser run includes the cross-tab point-read latency lane: it reports its ratio to
+  a bare round trip to the broker in the same run, and enforces R6's absolute targets with
   `MINNOW_PERF_LANE=1`, judged on the nightly browser-performance workflow (job `owner`) and on a
   quiet local run (R22.3).
+- `MINNOW_OWNER_SCHEDULING_BENCH=1` enables `next-owner-scheduling.spec.ts`: five rotating
+  rounds of fixed CPU work compare the latency fixture's fresh-channel yield with the production
+  scheduler, then 4/1/0.5 ms quanta. Each completes the same kernel and checksum, reporting both
+  echo latency and work completion time. This single-page experiment isolates task-source
+  scheduling; it neither changes the production quantum nor establishes cross-tab R6 acceptance.
+  Prepared point reads reuse the server's prepared handle and bypass plan-cache lookup, so the
+  cache-hit cost is not on the timed path of the warm browser sample.
 - Owner-side cost of a warm prepared point read (p50, Node, `testing/owner-point-read.bench.test.ts`):
-  the server alone ~3 µs; the owner's share in the full composition (server, plan-cache hit,
-  admission, frames) ~15 µs, gated at 50 µs. The stand-in executor's key lookup scans the table
+  the server alone ~3 µs; the owner's share in the full composition (server, admission, frames) ~15 µs, gated at 50 µs. The stand-in executor's key lookup scans the table
   (~100 µs at 1,000 rows); this protocol benchmark still explicitly injects stand-ins. It does
   not measure the real executor, whose index lookup plans remain unsupported, so real warm-PK
   latency is not established by those numbers.

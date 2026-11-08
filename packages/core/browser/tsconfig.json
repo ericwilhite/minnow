@@ -62,6 +62,7 @@
     "supersede-run.ts",
     "next-owner/run.ts",
     "next-owner/owner-worker.ts",
-    "next-owner/broker-worker.ts"
+    "next-owner/broker-worker.ts",
+    "next-owner/scheduling-worker.ts"
   ]
 }
