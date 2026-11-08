@@ -1636,6 +1636,11 @@ page coordinates; payload coordinates may not appear in private writes. Timer ch
 immediately resolved reads. The first publication or audit pays the deferred chain-copy cost;
 recovery that publishes pays it before ready. Generic callbacks keep their existing path.
 
+The rebuild's native extent-list cursor tests also interleave two roots over two prepaid
+192 KiB windows. A cursor reuses bytes still held by its peer, while checking its own root's
+checksum and descriptor. The shared cache has two slots regardless of the extent count;
+evicted ranges are read again. It adds no payload buffer to the charged read slab.
+
 Disk-derived retirement tests keep the before/after list pages protected through complete
 worklist construction, then release at most 256 ranges per batch. They independently check
 fragmentation debt and recovery when the gaps coalesce within the arena capacity. Private

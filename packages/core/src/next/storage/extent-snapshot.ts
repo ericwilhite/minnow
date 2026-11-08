@@ -9,7 +9,11 @@ import type { ExtentList } from "./extent-list.js";
 import { MetadataJournal } from "./metadata-journal.js";
 import { ExtentPairWriter, openPairs, sortExtents, spoolExtents } from "./metadata-extents.js";
 import { pairPhase, type MetadataWork } from "./metadata-work.js";
-import { NativeExtentList, NATIVE_LIST_WINDOW_BYTES } from "./native-extent-list.js";
+import {
+  NativeExtentList,
+  NativeListPageCache,
+  NATIVE_LIST_WINDOW_BYTES,
+} from "./native-extent-list.js";
 import { PageCache } from "./page-cache.js";
 import {
   NativePhysicalExtents,
@@ -273,6 +277,10 @@ export async function reconstructNativeState(
                 work,
               )
             : openPairs(journal, handle, slot, true);
+        const shared = new NativeListPageCache(
+          slab.subarray(0, NATIVE_LIST_WINDOW_BYTES),
+          slab.subarray(NATIVE_LIST_WINDOW_BYTES, 2 * NATIVE_LIST_WINDOW_BYTES),
+        );
         const a = await physicalCursor(current, aPages, 1, 640 * 1024);
         let b: ScalarExtents | null = null;
         try {
@@ -285,6 +293,7 @@ export async function reconstructNativeState(
                 slab.subarray(0, NATIVE_LIST_WINDOW_BYTES),
                 dataLength,
                 work,
+                shared,
               ),
               a,
             ),
@@ -295,6 +304,7 @@ export async function reconstructNativeState(
                 slab.subarray(NATIVE_LIST_WINDOW_BYTES, 2 * NATIVE_LIST_WINDOW_BYTES),
                 dataLength,
                 work,
+                shared,
               ),
               b,
             ),

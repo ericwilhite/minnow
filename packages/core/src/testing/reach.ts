@@ -1372,6 +1372,8 @@ export const OWNER_API_ENVELOPE_REACH = ["rows envelope", "done envelope"] as co
 
 /** Native R25 list pages are decoded from paid slab views, without per-extent objects. */
 export const NATIVE_EXTENT_LIST_REACH = [
+  "shared prepaid page windows",
+  "shared page descriptor validation",
   "full safe integer offsets",
   "coalesced page reads",
   "synchronous scalar pairs",

@@ -3,7 +3,11 @@ import { createReach, NATIVE_EXTENT_LIST_REACH } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { TaskClock } from "../task.js";
 import { xxHash32 } from "../hash/xxhash32.js";
-import { NativeExtentList, NATIVE_LIST_WINDOW_BYTES } from "../storage/native-extent-list.js";
+import {
+  NativeExtentList,
+  NativeListPageCache,
+  NATIVE_LIST_WINDOW_BYTES,
+} from "../storage/native-extent-list.js";
 import { encodeListPage, LIST_PAGE_EXTENTS, type ExtentListPage } from "../storage/extent-list.js";
 import { MemoryBackend } from "../storage/memory-store.js";
 import { PageCache } from "../storage/page-cache.js";
@@ -117,6 +121,98 @@ for (const seed of seedsFor("native-extent-list", [1571, 1572, 1573, 1574]))
       await source.close();
     }
   });
+
+// Law: immutable rooted pages may be shared, but each root's descriptors are still authority.
+for (const seed of seedsFor("native-shared-pages", [1581, 1582, 1583, 1584]))
+  it(`shares prepaid windows across interleaved cursors (${String(seed)})`, async () => {
+    reach.beginHistory();
+    const random = mulberry32(seed);
+    const count = 8193 + Math.floor(random() * 12000);
+    const source = await fixture(count);
+    try {
+      await source.cache.withReadSlab(async (slab) => {
+        const first = slab.subarray(0, NATIVE_LIST_WINDOW_BYTES);
+        const second = slab.subarray(NATIVE_LIST_WINDOW_BYTES, 2 * NATIVE_LIST_WINDOW_BYTES);
+        const shared = new NativeListPageCache(first, second);
+        const a = new NativeExtentList(
+          source.pages,
+          source.cache,
+          first,
+          BASE + count * 8192,
+          undefined,
+          shared,
+        );
+        const b = new NativeExtentList(
+          source.pages,
+          source.cache,
+          second,
+          BASE + count * 8192,
+          undefined,
+          shared,
+        );
+        try {
+          for (let at = 0; at < count; at++) {
+            // Alternate who reaches a new page first; both directions must reuse the peer.
+            const [lead, follow] =
+              Math.floor(at / (2 * LIST_PAGE_EXTENTS)) % 2 === 0 ? [a, b] : [b, a];
+            expect(await lead.next()).toBe(true);
+            expect(await follow.next()).toBe(true);
+            expect(a.offset).toBe(BASE + at * 8192);
+            expect(b.offset).toBe(a.offset);
+            expect(b.length).toBe(a.length);
+          }
+          expect(await a.next()).toBe(false);
+          expect(await b.next()).toBe(false);
+          expect(source.calls).toBe(Math.ceil(source.pages.length / 2));
+          reach.reach("shared prepaid page windows");
+          // A cache hit cannot bypass the receiving root's checksum validation.
+          const page = source.pages.at(-1);
+          if (page === undefined) throw new Error("missing last page");
+          const bad = new NativeExtentList(
+            [{ ...page, blob: { ...page.blob, checksum: (page.blob.checksum ^ 1) >>> 0 } }],
+            source.cache,
+            first,
+            BASE + count * 8192,
+            undefined,
+            shared,
+          );
+          await expect(bad.next()).rejects.toThrow(/checksum/);
+          bad.close();
+          reach.reach("shared page descriptor validation");
+        } finally {
+          a.close();
+          b.close();
+        }
+      });
+    } finally {
+      await source.close();
+    }
+  });
+
+it("reuses contained ranges, evicts overwritten windows and retries failed reads", async () => {
+  const source = await fixture(12000);
+  try {
+    await source.cache.withReadSlab(async (slab) => {
+      const first = slab.subarray(0, NATIVE_LIST_WINDOW_BYTES);
+      const second = slab.subarray(NATIVE_LIST_WINDOW_BYTES, 2 * NATIVE_LIST_WINDOW_BYTES);
+      const shared = new NativeListPageCache(first, second);
+      await shared.read(source.cache, 0, first.subarray(0, 100), 100);
+      // The caller's prefetch extends past the peer's range; only the required page must fit.
+      expect(await shared.read(source.cache, 50, second.subarray(0, 100), 40)).toBe(50);
+      expect(second.subarray(0, 50)).toEqual(first.subarray(50, 100));
+      expect(source.calls).toBe(1);
+      // Overwriting a slot removes its old range, including on failure.
+      await shared.read(source.cache, 69632, first.subarray(0, 100), 100);
+      await expect(
+        shared.read(source.cache, 999999, second.subarray(0, 100), 100),
+      ).rejects.toThrow();
+      await shared.read(source.cache, 50, first.subarray(0, 40), 40);
+      expect(source.calls).toBe(4);
+    });
+  } finally {
+    await source.close();
+  }
+});
 
 it("services a real timer and cancels during an immediately resolved list read", async () => {
   const source = await fixture(100_000),
