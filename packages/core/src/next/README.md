@@ -1439,6 +1439,31 @@ float64/int64 keys). Compare `ROWS=100000` and `1000000` in at least seven inter
 recording load per run. The component excludes key preparation; whole-operator comparisons
 include it. Validation checks all normalized words, row multiplicity and stable ties untimed.
 
+`exec/window-order.bench.ts` isolates the five Gate B windows' actual grouped ordering,
+including sort scratch and peer construction. It shares prebuilt batches with `window.bench.ts`
+through `window-bench-fixtures.ts`. Full permutation, stable ties, partition membership and peer
+flags are checked outside timing. Run with `ROWS=1000000 RUNS=7`; both harnesses record process
+CPU and host load. Whole-window runs use `SORT=0 BENCH_JSON=1`. Bundle with esbuild for Node;
+keep output and `TMPDIR` under a cache directory. `scripts/profile-exec.mjs` brackets the measured
+operator region after construction and warmup; use it under `node --cpu-prof` for a separate
+whole-process diagnostic. `scripts/exec-profile.mts` reports self samples and exclusive phase
+shares from region profiles. Sampled wall duration includes descheduling and is not phase CPU.
+
+`window-gather.bench.ts` isolates held-row construction from the same permutation; every copied
+value is checked before timing. `window-eval.bench.ts` isolates the running float SUM and moving
+float AVG kernels, with bounds measured separately and exact ordered-addition checks. Their
+buffers and sorted partitions are prebuilt. `LAYOUT=sql` (default) reproduces the frozen SQL's
+six-column top-k and five-column rank projections, including repeated hidden keys;
+`LAYOUT=compact` selects the historical three-column operator diagnostic. Comparing these
+layouts identifies redundant copying but does not constitute an implemented SQL optimization.
+
+`scripts/next-executor-bench.mts --frozen --profile all` records one V8 region for every executing
+catalogue cell, after ingestion and CPU rounds. Dataset size/scale, seven-round samples, per-run
+load and source hashes accompany the results. The consumer shares the correctness adapter's
+dictionary expansion and prepares flat descriptors once per frame. The fixed retail fixture is
+not a scaled Gate B timing. Smaller diagnostic scales screen all cells; target comparisons need
+the target dataset and the separate 1M-row component runs.
+
 ### Windows (`exec/window.ts`, `window-sort.ts`, `window-frames.ts`, `window-stream.ts`)
 
 - Prefix counts, ordinary and bigint sums, promotion, and long moving-frame aggregate scans
