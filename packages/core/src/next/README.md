@@ -1449,13 +1449,28 @@ operator region after construction and warmup; use it under `node --cpu-prof` fo
 whole-process diagnostic. `scripts/exec-profile.mts` reports self samples and exclusive phase
 shares from region profiles. Sampled wall duration includes descheduling and is not phase CPU.
 
-`window-gather.bench.ts` isolates held-row construction from the same permutation; every copied
-value is checked before timing. `window-eval.bench.ts` isolates the running float SUM and moving
-float AVG kernels, with bounds measured separately and exact ordered-addition checks. Their
-buffers and sorted partitions are prebuilt. `LAYOUT=sql` (default) reproduces the frozen SQL's
-six-column top-k and five-column rank projections, including repeated hidden keys;
-`LAYOUT=compact` selects the historical three-column operator diagnostic. Comparing these
-layouts identifies redundant copying but does not constitute an implemented SQL optimization.
+The older `window.bench.ts` and `window-order.bench.ts` layout diagnostics accept
+`LAYOUT=sql` (default), reproducing the frozen SQL's six-column top-k and five-column rank
+projections, or `LAYOUT=compact`, selecting the historical three-column operator shape.
+Those layout controls do not select a variant in the paired gather harness.
+
+`window-gather.bench.ts` isolates held-row construction from prebuilt, sorted partitions;
+every copied value is checked before timing. It always starts from the SQL layout and
+alternates parent/candidate order, recording CPU and host load per run. After bundling for
+Node, use `ROWS=1000000 RUNS=7 node --expose-gc <bundle> rank topk` for input compaction, or
+`COMPARE=amounts ROWS=1000000 RUNS=7 node --expose-gc <bundle> lagLead` for materialized versus
+scalar literal offsets. It does not read `LAYOUT`.
+
+`window-eval.bench.ts` separately isolates the running float SUM and moving float AVG kernels,
+with bounds measured separately and exact ordered-addition checks. Its buffers and sorted
+partitions are prebuilt.
+
+For full-query parent/candidate CPU comparisons, run `scripts/next-executor-bench.mts` with
+`--frozen --rows 1000000 --repeats 7` and either `--compare-window-inputs` (input compaction)
+or `--compare-window-scalars` (literal amounts). Select the frozen cells with `--only`, for
+example `--only win_rank,win_topk_row_number` or `--only win_lag_lead`. These controls alternate
+variants and require complete output digests to agree. Ingestion is outside timing;
+preparation, execution, materialization and cleanup remain inside.
 
 `scripts/next-executor-bench.mts --frozen --profile all` records one V8 region for every executing
 catalogue cell, after ingestion and CPU rounds. Dataset size/scale, seven-round samples, per-run
