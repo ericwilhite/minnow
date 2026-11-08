@@ -2,12 +2,12 @@
  * Audit the shipped module graph against a Git revision with unchanged dependencies/compiler.
  * Run after the package build: node scripts/library-size-audit.mts --base=f452eb82
  * Native dist must match re-emitted HEAD byte for byte before comparing frozen source families.
- * Metafiles, module deltas and bundles go under ~/.cache by default, never into public assets.
+ * Metafiles, module deltas and bundles use os.tmpdir() by default, never public assets.
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { constants, gzipSync } from "node:zlib";
 import { build, type BuildOptions, type Plugin } from "esbuild";
@@ -20,7 +20,7 @@ if (baseArg === undefined || args.some((arg) => !/^--(?:base|output)=/u.test(arg
   throw new TypeError("Usage: library-size-audit.mts --base=REV [--output=DIR]");
 const output = resolve(
   args.find((arg) => arg.startsWith("--output="))?.slice(9) ??
-    join(homedir(), ".cache", "minnow-bundle-audit"),
+    join(tmpdir(), "minnow-bundle-audit"),
 );
 const git = (...argv: string[]): string =>
   execFileSync("git", argv, {

@@ -1,7 +1,7 @@
 /** Scalar catalogue COUNT(DISTINCT h01), COUNT(DISTINCT h05), with untimed input/setup. */
 import { strict as assert } from "node:assert";
 import { cpuUsage } from "node:process";
-import { loadavg, homedir } from "node:os";
+import { loadavg, tmpdir } from "node:os";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
@@ -24,10 +24,9 @@ const rows = Number(option("--rows", "1000000")),
   warmups = Number(option("--warmups", "12")),
   iterations = Number(option("--iterations", "1")),
   profile = option("--profile", "0") === "1",
-  directory = resolve(option("--output", join(homedir(), ".cache/b4-scalar-distinct/baseline")));
+  directory = resolve(option("--output", join(tmpdir(), "b4-scalar-distinct/baseline")));
 for (const [name, n] of Object.entries({ rows, rounds, warmups, iterations }))
   if (!Number.isSafeInteger(n) || n < (name === "rounds" ? 5 : 1)) throw new RangeError(name);
-if (!directory.startsWith(join(homedir(), ".cache/"))) throw new Error("scratch belongs in cache");
 await mkdir(directory, { recursive: true });
 const input: Array<readonly Vector[]> = [],
   model = [new Set<string>(), new Set<string>()];

@@ -4,13 +4,14 @@ The Node executor benchmark uses these committed modules by default. It needs no
 `~/.local/share`. Build the repository, then run:
 
 ```sh
-TMPDIR="$HOME/.cache/minnow-bench" node scripts/next-executor-bench.mts \
-  --rows 1000000 --repeats 5 --only sort_topn_wide \
-  --output "$HOME/.cache/minnow-bench/results"
+node scripts/next-executor-bench.mts \
+  --rows 1000000 --repeats 5 --only sort_topn_wide
 ```
 
-Create the TMPDIR directory before running. `--harness` remains an explicit override for a
-compatible directory containing `gen.js` and `queries.js`.
+Scratch and default output use `os.tmpdir()`, which respects `TMPDIR`. To choose a temporary
+root, create it and set `TMPDIR` in the shell. `--output` accepts any caller-selected directory.
+`--harness` remains an explicit override for a compatible directory containing `gen.js` and
+`queries.js`.
 
 These are the reviewed Gate B analytics workload, copied on 2026-11-07. Original SHA-256:
 
@@ -20,4 +21,5 @@ These are the reviewed Gate B analytics workload, copied on 2026-11-07. Original
 Formatting was normalized and one unused string-padding helper was removed. Data and SQL
 fingerprints in `workload.test.ts` match the originals. The star data generator already lives in
 `apps/site/bench/benchmark.ts`; its query catalogue is included here too. Timing artifacts belong
-under the caller's cache directory and are not published benchmark results.
+under the temporary root unless `--output` selects another directory; they are not published
+benchmark results.

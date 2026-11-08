@@ -9,7 +9,7 @@ import { cpuUsage } from "node:process";
 import { Session } from "node:inspector/promises";
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve, join } from "node:path";
-import { homedir, loadavg } from "node:os";
+import { tmpdir, loadavg } from "node:os";
 import { aggShapes, mix } from "../packages/core/browser/next-agg-shapes.ts";
 import * as lib from "../packages/core/dist/next/exec/kernels/test-support.js";
 import { AggregateOperator } from "../packages/core/dist/next/exec/agg/aggregate.js";
@@ -30,7 +30,7 @@ const rows = Number(option("--rows", "1000000")),
   rounds = Number(option("--rounds", "7")),
   warmups = Number(option("--warmups", "3")),
   iterations = Number(option("--iterations", "1")),
-  directory = resolve(option("--output", join(homedir(), ".cache/b4-agg-selection"))),
+  directory = resolve(option("--output", join(tmpdir(), "b4-agg-selection"))),
   profile = option("--profile", "0") === "1",
   only = option("--only", "all");
 if (
@@ -44,7 +44,6 @@ if (
   iterations < 1
 )
   throw new RangeError("positive rows and at least five rounds required");
-if (!directory.startsWith(join(homedir(), ".cache/"))) throw new Error("output belongs in cache");
 await mkdir(directory, { recursive: true });
 const generated = aggShapes(lib, only === "distinct" ? 0 : rows, ["agg_highcard_int"])[0];
 if (!generated) throw new Error("missing fixture");
