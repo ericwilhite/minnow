@@ -264,6 +264,27 @@ export async function build(
   };
 }
 
+/** Acceptance image import, outside export timings; Node validated its SHA256 inventory. */
+export async function installFixture(): Promise<{
+  groups: number;
+  generatedGroups: number;
+  dataBytes: number;
+  ms: number;
+}> {
+  await withWorker({ op: "remove", dir: DIR });
+  built = await withWorker<BuildResult>({
+    op: "install-fixture",
+    dir: DIR,
+    base: new URL("/__gate_a_fixture/", location.href).href,
+  });
+  return {
+    groups: built.groups.length,
+    generatedGroups: built.generatedGroups,
+    dataBytes: built.dataBytes,
+    ms: built.ms,
+  };
+}
+
 /** One export of the first `groups` groups (all by default) in a fresh worker. */
 export async function exportPass(options: {
   readonly persistent?: boolean;
@@ -272,6 +293,7 @@ export async function exportPass(options: {
   readonly recycle?: boolean;
   readonly ownerAPI?: boolean;
   readonly outputClasses?: boolean;
+  readonly dictionarySizing?: "baseline" | "candidate";
   readonly once: boolean;
   readonly readaheadKiB: number;
   readonly windowMiB?: number;
@@ -315,6 +337,7 @@ export async function exportPass(options: {
     ...(options.recycle ? { recycle: true } : {}),
     ...(options.ownerAPI ? { ownerAPI: true } : {}),
     ...(options.outputClasses === undefined ? {} : { outputClasses: options.outputClasses }),
+    ...(options.dictionarySizing ? { dictionarySizing: options.dictionarySizing } : {}),
     readaheadKiB: options.readaheadKiB,
     ...(options.windowMiB === undefined ? {} : { windowMiB: options.windowMiB }),
     capMiB: options.capMiB,

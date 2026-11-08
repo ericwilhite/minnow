@@ -1,0 +1,18 @@
+diff --git i/packages/core/src/next/page/decode.ts w/packages/core/src/next/page/decode.ts
+index cbd31171..17143ef6 100644
+--- i/packages/core/src/next/page/decode.ts
++++ w/packages/core/src/next/page/decode.ts
+@@ -1038,6 +1038,13 @@ function codeBytes8(
+   to: number,
+ ): number {
+   let total = 0;
++  if (validity === null) {
++    for (let row = from; row < to; row++) {
++      const code = codes[row] ?? 0;
++      total += (entries[code + 1] ?? 0) - (entries[code] ?? 0);
++    }
++    return total;
++  }
+   for (let row = from; row < to; row++) {
+     if (validity !== null && (((validity[row >>> 5] ?? 0) >>> (row & 31)) & 1) === 0) continue;
+     const code = codes[row] ?? 0;
