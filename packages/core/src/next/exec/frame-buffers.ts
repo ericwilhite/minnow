@@ -14,33 +14,36 @@ export class FrameBufferError extends Error {
 type TypedArray =
   Uint8Array | Uint16Array | Uint32Array | Int32Array | Float32Array | Float64Array | BigInt64Array;
 
-function dataArrays(data: VectorData, into: TypedArray[]): void {
+function dataArrays(data: VectorData, buffers: Set<ArrayBuffer>): void {
   switch (data.layout) {
     case "bool":
     case "i32":
     case "f64":
     case "f32":
-      into.push(data.values);
+      add(data.values, buffers);
       return;
     case "int64":
-      into.push(data.values.values);
+      add(data.values.values, buffers);
       return;
     case "decimal": {
-      if (data.scales !== null) into.push(data.scales);
-      if (data.specials !== null) into.push(data.specials);
+      if (data.scales !== null) add(data.scales, buffers);
+      if (data.specials !== null) add(data.specials, buffers);
       const coefficients = data.coefficients;
-      if (coefficients.repr === "int128") into.push(coefficients.limbs);
-      else if (coefficients.repr !== "wide") into.push(coefficients.values);
+      if (coefficients.repr === "int128") add(coefficients.limbs, buffers);
+      else if (coefficients.repr !== "wide") add(coefficients.values, buffers);
       return;
     }
     case "varlen":
-      into.push(data.bytes, data.offsets);
+      add(data.bytes, buffers);
+      add(data.offsets, buffers);
       return;
     case "fixed16":
-      into.push(data.bytes);
+      add(data.bytes, buffers);
       return;
     case "interval":
-      into.push(data.months, data.days, data.micros.values);
+      add(data.months, buffers);
+      add(data.days, buffers);
+      add(data.micros.values, buffers);
       return;
   }
 }
@@ -53,18 +56,19 @@ export function flats(payload: UnnumberedPayload): WireFlat[] {
   return out;
 }
 
-function payloadArrays(payload: UnnumberedPayload): TypedArray[] {
-  const arrays: TypedArray[] = [];
-  for (const flat of flats(payload)) {
-    dataArrays(flat.data, arrays);
-    if (flat.validity !== null) arrays.push(flat.validity);
-  }
-  for (const column of payload.columns)
-    if (column.form === "dictionary") {
-      arrays.push(column.codes);
-      if (column.validity !== null) arrays.push(column.validity);
-    }
-  return arrays;
+function add(view: TypedArray, buffers: Set<ArrayBuffer>): void {
+  const buffer = view.buffer;
+  if (!(buffer instanceof ArrayBuffer))
+    throw new FrameBufferError("Frame buffers must be ArrayBuffers, never SharedArrayBuffer");
+  if (view.byteOffset !== 0 || view.byteLength !== buffer.byteLength)
+    throw new FrameBufferError(
+      `A frame view covers ${String(view.byteLength)} of its buffer's ${String(buffer.byteLength)} bytes`,
+    );
+  buffers.add(buffer);
+}
+function flat(column: WireFlat, buffers: Set<ArrayBuffer>): void {
+  dataArrays(column.data, buffers);
+  if (column.validity !== null) add(column.validity, buffers);
 }
 
 /**
@@ -74,15 +78,15 @@ function payloadArrays(payload: UnnumberedPayload): TypedArray[] {
  */
 export function frameTransferList(payload: UnnumberedPayload): ArrayBuffer[] {
   const buffers = new Set<ArrayBuffer>();
-  for (const view of payloadArrays(payload)) {
-    const buffer = view.buffer;
-    if (!(buffer instanceof ArrayBuffer))
-      throw new FrameBufferError("Frame buffers must be ArrayBuffers, never SharedArrayBuffer");
-    if (view.byteOffset !== 0 || view.byteLength !== buffer.byteLength)
-      throw new FrameBufferError(
-        `A frame view covers ${String(view.byteLength)} of its buffer's ${String(buffer.byteLength)} bytes`,
-      );
-    buffers.add(buffer);
+  for (const delta of payload.dictionaries) flat(delta.values, buffers);
+  for (const column of payload.columns) {
+    if (column.form === "flat") flat(column, buffers);
+    else if (column.form === "constant") flat(column.value, buffers);
+  }
+  for (const column of payload.columns) {
+    if (column.form !== "dictionary") continue;
+    add(column.codes, buffers);
+    if (column.validity !== null) add(column.validity, buffers);
   }
   return [...buffers];
 }

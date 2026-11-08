@@ -1119,6 +1119,47 @@ than measuring the cross-tab protocol. These experiments do not change the produ
 or replace the latency gate. Retain every round and inspect throughput cost as well as latency
 before choosing a scheduling change.
 
+### Quiet-host R6 gate and CPU components
+
+Run all engines with one command when the host is idle:
+
+```bash
+npm run benchmark:owner:r6 -- --out /path/to/fresh-output
+```
+
+The command checks `load1 <= 1` before starting, builds the core, waits up to ten minutes for
+build load to decay, then runs Chromium, Firefox and WebKit sequentially. Each engine runs the
+latency lane five times with `MINNOW_PERF_LANE=1`, then the five-round fixed-work sweep over
+4, 1 and 0.5 ms quanta (including the original fixture's 4 ms control). It samples host load every
+second and at command boundaries. Any measured load above 1, invalid load evidence or incomplete
+run produces `refused.json` and raw logs, **never `report.json`**. It waits for its own children;
+it does not kill processes. A complete quiet run writes `report.json`; unmet targets return exit
+1, refusal returns exit 2. The gate requires OS load averages (Linux/macOS).
+
+Temporary output uses `os.tmpdir()`; set `TMPDIR` to your scratch directory on a constrained host.
+For a private Linux WebKit installation, `MINNOW_R6_WEBKIT_BROWSERS_PATH` overrides the browser
+path for WebKit only. The ordinary Playwright browser path still serves Chromium and Firefox.
+The quantum tradeoff remains a candidate: decide it from quiet loaded p95 and fixed-work
+completion times, not from a shorter workload or these shared-host observations.
+
+For CPU work without cross-process waits:
+
+```bash
+npm run benchmark:owner:cpu
+npm run benchmark:owner:cpu -- --baseline /path/to/frozen-frame-buffers.ts
+```
+
+This requires Node with `process.threadCpuUsage()` (22.19+). Five fresh-process rounds rotate
+baseline/candidate order. It reports the p50 of amortized **thread CPU** per operation over 30
+batches: 1,000 prepared reads or 10,000 isolated frame validations. A 200-column case checks wide
+frames as well. Setup and warmup are excluded; V8 sampled-stack attribution is a separate pass.
+The profile identifies composition binding, compiled-plan-cache hits, write probes, frame work,
+owner dispatch and fixture execution. Zero samples mean below sampling resolution, not zero CPU.
+Stable-catalog prepared reads bypass the SQL-text plan cache. Native port serialization, client
+work, real executor binding and real indexed lookups are outside this component bench.
+Reports and the CPU profile are retained under `os.tmpdir()`. Neither CPU p50 nor sampled stacks
+are a substitute for cross-tab R6 acceptance.
+
 ## Performance after repeated writes
 
 Most gate shapes read a table as it was loaded. The `settled-*` shapes read it as it is after a
