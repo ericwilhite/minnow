@@ -263,6 +263,11 @@
       "id": "aggregate.array-agg",
       "classification": "different",
       "reason": "Minnow returns arrays as canonical JSON text at the JavaScript boundary; PostgreSQL clients return native arrays. ARRAY_AGG supports DISTINCT and ordering, but not FILTER or window use."
+    },
+    {
+      "id": "window.frame-range-integer-fractional",
+      "classification": "different",
+      "reason": "PostgreSQL refuses a numeric RANGE offset over an integer key (0A000); the public Minnow executor accepts the fractional distance in double precision."
     }
   ]
 }

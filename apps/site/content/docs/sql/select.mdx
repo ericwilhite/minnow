@@ -468,13 +468,26 @@ FROM orders
 `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`,
 `NTH_VALUE`, and the aggregates as window functions, with `PARTITION BY`, `ORDER BY`, and
 explicit `ROWS`, `RANGE`, and `GROUPS` frames, including exclusions. Numeric `RANGE` offsets
-measure ordering-value distance and require exactly one numeric `ORDER BY` expression. A
-negative or `NULL` frame offset is an error, as in PostgreSQL (`frame starting offset must not be
-negative`); `-0` is zero. A `ROWS` or `GROUPS` offset written as a decimal is rounded half away
-from zero, so `1.5 PRECEDING` means 2 rows. A positive `RANGE` offset must fit a double: one past its
-range (`1e400`) or nearer zero than it can hold (`1e-400`) is refused with "RANGE frame offsets
-outside double precision are not supported", even over a `NUMERIC` key, where PostgreSQL runs it. Temporal interval offsets and `DISTINCT` window aggregates are not supported. Windows work in both the
-select list and `ORDER BY`; `WHERE`, `GROUP BY`, and `HAVING` cannot contain them.
+measure ordering-value distance and require exactly one numeric `ORDER BY` expression. Offsets
+must be numeric literals: parameters (including `ROWS $1 PRECEDING`), quoted offsets, and temporal
+interval offsets are refused. `-0` is zero. A `ROWS` or `GROUPS` decimal offset is rounded half
+away from zero, so `1.5 PRECEDING` means 2 rows.
+
+Public `RANGE` distances use double precision. A fractional offset such as `RANGE 1.5 PRECEDING`
+is accepted over an integer key; PostgreSQL rejects this combination with `0A000`. A positive
+offset outside double precision (`1e400`, `1e-400`) is refused with "RANGE frame offsets outside
+double precision are not supported", even over a `NUMERIC` key, where PostgreSQL runs it.
+Exact NUMERIC distances in the unexported rebuild core are not part of the public executor.
+
+Negative and `NULL` offsets are errors (`22013` and `22004`). Negative `RANGE` offsets are
+rejected at parse time, including on empty or NULL-only input and under `LIMIT 0`; PostgreSQL
+checks them when comparing non-NULL keys and can return without an error if no comparison is
+needed. Minnow says "frame starting offset must not be negative"; PostgreSQL says "invalid
+preceding or following size in window function". For negative float offsets outside double
+precision, Minnow reports this negative-offset error before PostgreSQL's `22003` overflow error.
+
+`DISTINCT` window aggregates are not supported. Windows work in both the select list and
+`ORDER BY`; `WHERE`, `GROUP BY`, and `HAVING` cannot contain them.
 
 Compatible windows share sorting and prepare peer information only when a function or frame
 needs it. Positional functions and `ROWS` frames without peer exclusions skip those buffers.

@@ -689,6 +689,20 @@
       "notes": "Numeric RANGE offsets measure ordering-value distance and require one numeric ORDER BY expression. Temporal interval offsets are not supported."
     },
     {
+      "id": "window.frame-range-integer-fractional",
+      "status": "supported",
+      "example": "SELECT COUNT(*) OVER (ORDER BY CAST(amount AS INTEGER) RANGE 1.5 PRECEDING) AS recent FROM rows",
+      "notes": "Public RANGE distances use double precision and accept a fractional numeric literal over an integer ordering key. PostgreSQL rejects this numeric-offset/integer-key combination with 0A000. Exact NUMERIC RANGE execution belongs only to the unexported rebuild core."
+    },
+    {
+      "id": "window.frame-parameter-offset",
+      "status": "unsupported",
+      "example": "SELECT COUNT(*) OVER (ORDER BY amount ROWS $1 PRECEDING) AS recent FROM rows",
+      "params": [1],
+      "error": "Expected number, found 1",
+      "notes": "Public frame offsets must be numeric literals. PostgreSQL accepts a bound parameter here; Minnow refuses it at parse time, before parameter binding. This also applies to RANGE and GROUPS offsets."
+    },
+    {
       "id": "window.frame-range-interval-offset",
       "status": "unsupported",
       "example": "SELECT amount, COUNT(*) OVER (ORDER BY joined RANGE BETWEEN INTERVAL '1 day' PRECEDING AND CURRENT ROW) AS recent FROM rows",
@@ -707,7 +721,7 @@
       "status": "unsupported",
       "example": "SELECT amount, SUM(amount) OVER (ORDER BY amount RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) AS windowed FROM rows WHERE amount < 0",
       "error": "frame starting offset must not be negative",
-      "notes": "A negative frame offset is an error, as in PostgreSQL (22013), and so is a NULL one (22004). One difference: PostgreSQL raises a negative RANGE offset only when it compares a row, so over no rows, as here, it returns none. Minnow refuses the statement before reading any row. A negative ROWS or GROUPS offset fails before any row in both."
+      "notes": "Negative RANGE offsets are rejected at parse time (22013), including empty or NULL-only input and LIMIT 0. PostgreSQL validates during non-NULL key comparison and can return without error if none is needed. Minnow says \"frame starting offset must not be negative\"; PostgreSQL says \"invalid preceding or following size in window function\". NULL offsets are 22004. Negative ROWS/GROUPS offsets fail before reading rows in both."
     },
     {
       "id": "window.frame-range-offset-double-precision",

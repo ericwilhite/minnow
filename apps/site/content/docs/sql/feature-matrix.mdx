@@ -49,10 +49,19 @@ and `FULL JOIN` beyond their supported sole-join forms, interval and quoted `RAN
 window aggregates, windows in `WHERE`/`GROUP BY`/`HAVING`, and `ON DELETE SET DEFAULT` — each with the
 exact error it raises.
 
-Two refusals are stricter than PostgreSQL. A negative `RANGE` frame offset fails before any row is
-read; PostgreSQL raises the same error only when it compares a row, so over no rows it returns
-none. And a positive `RANGE` offset a double cannot hold (`1e400`, `1e-400`) is refused, though PostgreSQL
-runs it over a `NUMERIC` key.
+Frame offsets have several public compatibility gaps. Only numeric literals are accepted;
+parameters such as `ROWS $1 PRECEDING`, quoted values, and intervals are refused. A fractional
+numeric literal such as `RANGE 1.5 PRECEDING` is accepted over an integer key, whereas PostgreSQL
+rejects that key/offset type combination with `0A000`.
+
+A negative `RANGE` offset fails at parse time, even on empty or NULL-only input and under
+`LIMIT 0`. PostgreSQL validates it when comparing non-NULL keys, so those queries can succeed
+without doing such a comparison. Both report `22013` when they reject a negative offset, but
+Minnow's message is "frame starting offset must not be negative"; PostgreSQL's is "invalid
+preceding or following size in window function". A positive offset outside double precision
+(`1e400`, `1e-400`) is also refused, though PostgreSQL runs it over a `NUMERIC` key. Public
+`RANGE` distances use double precision; the unexported rebuild core's exact NUMERIC execution
+does not change that public contract.
 
 ## Supported SQL
 

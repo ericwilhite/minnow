@@ -36,12 +36,15 @@ Lowered BEGIN, START TRANSACTION and SET TRANSACTION statements also retain orde
 the ordered items before applying those summaries. These internal fields do not add
 public package exports.
 
-- **Window frame offsets follow PostgreSQL's rules.** The offset of a `ROWS`, `RANGE` or `GROUPS`
+- **Window frame offsets accept signed and decimal numeric literals.** The offset of a `ROWS`, `RANGE` or `GROUPS`
   frame bound used to be an unsigned number literal, and anything else failed as a syntax error.
   - A negative offset (`ROWS -1 PRECEDING`) now fails with
     `frame starting offset must not be negative`, or `ending` for the frame's end. A `NULL`
     offset fails with `… must not be null`. A negative `RANGE` offset fails even over no rows,
-    where PostgreSQL returns none; the [compatibility page](/docs/sql/feature-matrix) lists it.
+    where PostgreSQL returns none. The [compatibility page](/docs/sql/feature-matrix) also
+    records NULL-only and `LIMIT 0` validation, different error text, fractional offsets over
+    integer keys, and the refusal of parameter offsets. These are inherited public compatibility
+    gaps, not new exact-NUMERIC support in the public executor.
   - A sign is not a value: `-0`, `-0.0` and `+1` are accepted, as in PostgreSQL. Zero and the
     sign come from the digits, so `RANGE -1e-400 PRECEDING` is negative, as PostgreSQL's
     `NUMERIC` keeps it.
