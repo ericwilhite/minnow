@@ -1360,7 +1360,11 @@ workflow saves as `browser-perf-results/storage-kills.jsonl`. A failure names it
 the selected step, rather than racing a short request against a page timer. A buffered IDB write
 in that selected step stays pending until its scheduled native batch issues; batching remains
 enabled. No-op occurrences get no credit and the gate advances to the next matching step under
-the original deadline. Page-close kills retain their separately observed boundary.
+the original deadline. Page-close kills retain their separately observed boundary. That boundary
+includes every acknowledgement received through its observation barrier, including those received
+after the kill was armed. The controller regression holds new intents and waits for the active
+publish's completion markers before taking its boundary. It compares the whole acknowledged
+state, allowing more than one root since recovery; elapsed time does not determine the count.
 
 The IDB gate runs in a microtask after the transaction body has issued its initial requests,
 before the transaction-end callback. OPFS parks before the synchronous call and reaches an edge;
