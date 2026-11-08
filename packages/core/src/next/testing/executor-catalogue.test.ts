@@ -12,6 +12,8 @@ import { StorageCore } from "./storage-core.js";
 import { assertCatalogueOrder, catalogueOrderColumns } from "./catalogue-order.js";
 import {
   CATALOGUE_REFUSALS,
+  CATALOGUE_QUERY_AUTHORITY,
+  CATALOGUE_REFUSAL_REASONS,
   ROUND_OVERLOAD_AUTHORITY,
   type CatalogueRefusal,
   CATALOGUE_CURRENT_AUTHORITY,
@@ -109,6 +111,27 @@ for (const dataset of ["wide", "retail", "star"])
       }
       await core.harness.path.recycleLog();
       await core.harness.path.quiesce();
+      if (dataset === "retail") {
+        // Establish the physical input order used by the ordered PG authority, rather than
+        // assuming a heap scan happens to match an unspecified SQL result order.
+        const scan = await core.execute("SELECT order_id FROM orders WHERE status = 'completed'");
+        if (!("batches" in scan)) throw new Error("Expected stored scan rows");
+        expect(oracleRows(scan)).toEqual(
+          (
+            await pg.query(
+              "SELECT order_id FROM orders WHERE status = 'completed' ORDER BY order_id",
+            )
+          ).rows,
+        );
+        const grouped = await core.execute(
+          "SELECT DATE_TRUNC('month', placed_at) AS month, SUM(total) AS revenue FROM orders WHERE status = 'completed' GROUP BY DATE_TRUNC('month', placed_at)",
+        );
+        if (!("batches" in grouped)) throw new Error("Expected monthly rows");
+        const ordered = await pg.query<Record<string, unknown>>(
+          "SELECT DATE_TRUNC('month', placed_at) AS month, SUM(total ORDER BY order_id) AS revenue FROM orders WHERE status = 'completed' GROUP BY DATE_TRUNC('month', placed_at)",
+        );
+        expect(canonical(oracleRows(grouped))).toEqual(canonical(ordered.rows));
+      }
       if (dataset === "wide")
         expect(
           (
@@ -155,6 +178,11 @@ for (const dataset of ["wide", "retail", "star"])
           expect(query.lowered, query.id).toBe(
             actual.class === "UnsupportedPlanError" && actual.stage === "execute",
           );
+          const explanation = CATALOGUE_REFUSAL_REASONS[query.id];
+          expect(explanation?.reason.length, query.id).toBeGreaterThan(0);
+          if (explanation?.pgState === "42725")
+            await expect(pg.query(query.sql), query.id).rejects.toMatchObject({ code: "42725" });
+          else expect((await pg.query(query.sql)).rows, query.id).toBeDefined();
           refused.push({ id: query.id, ...actual });
           continue;
         }
@@ -164,7 +192,9 @@ for (const dataset of ["wide", "retail", "star"])
         ).toBeUndefined();
         expect(query.lowered, query.id).toBe(true);
         if (!("batches" in result)) throw new Error("catalogue SELECT did not return frames");
-        const expected = await pg.query<Record<string, unknown>>(query.sql);
+        const expected = await pg.query<Record<string, unknown>>(
+          CATALOGUE_QUERY_AUTHORITY[query.id] ?? query.sql,
+        );
         const pgRows = expected.rows.map((row) =>
           Object.fromEntries(
             Object.entries(row).map(([name, value], column) => [
@@ -275,4 +305,10 @@ it("keeps frozen data and every SQL cell except the three authorized ROUND corre
       })),
     }),
   ).toBe("8d3af125ed1af20672fe678e0fdc9a40e5ce180bae68c64a099b601ae7b7e9a1");
+});
+
+it("documents exactly every retained catalogue refusal", () => {
+  expect(Object.keys(CATALOGUE_REFUSAL_REASONS).sort()).toEqual(
+    Object.keys(CATALOGUE_REFUSALS).sort(),
+  );
 });

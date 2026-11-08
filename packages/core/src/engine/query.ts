@@ -11105,6 +11105,7 @@ class Parser {
           sqlDomain?: SqlDomain;
           declaredTypeName?: DeclaredNumericTypeName;
           declaredLength?: DeclaredTextLength;
+          withoutTimeZone?: true;
           path: string;
         }> = [];
         for (;;) {
@@ -11141,24 +11142,51 @@ class Parser {
           joins: [],
           select: columns.map((column) => {
             const selected = jsonAtPath(boundedJsonText(member, false), column.path, "JSON_TABLE");
-            const value = empty
-              ? column.sqlDomain?.kind === "numeric"
-                ? jsonTableColumnValue(column, 0)
-                : column.type === "number"
-                  ? 0
-                  : column.type === "boolean"
-                    ? false
-                    : column.type === "datetime"
-                      ? new Date(0)
-                      : ""
-              : jsonTableColumnValue(column, selected.found ? selected.value : null);
+            const value =
+              empty && recordDeclaredTypes
+                ? null
+                : empty
+                  ? column.sqlDomain?.kind === "numeric"
+                    ? jsonTableColumnValue(column, 0)
+                    : column.type === "number"
+                      ? 0
+                      : column.type === "boolean"
+                        ? false
+                        : column.type === "datetime"
+                          ? new Date(0)
+                          : ""
+                  : jsonTableColumnValue(column, selected.found ? selected.value : null);
+            const literal: Expression = {
+              kind: "literal",
+              value,
+              ...(column.sqlDomain === undefined
+                ? {}
+                : { internalSqlValue: true as const, sqlDomain: column.sqlDomain }),
+            };
+            if (!recordDeclaredTypes) return { expression: literal, alias: column.name };
+            // JSON_TABLE declarations type every member, including NULL-only prefixes.
+            // Keep that provenance for lowering rather than resolving the UNION ALL's
+            // synthesized NULL literals as independent, unknown-typed SELECT expressions.
+            const domain = column.sqlDomain;
+            const target: Expression = {
+              kind: "literal",
+              value:
+                domain?.kind === "numeric"
+                  ? `numeric:${String(domain.precision ?? "")}:${String(domain.scale ?? "")}`
+                  : (domain?.kind ?? (column.integer === true ? "number-integer" : column.type)),
+              ...(column.declaredTypeName === undefined
+                ? {}
+                : { declaredTypeName: column.declaredTypeName }),
+              ...(column.declaredLength === undefined
+                ? {}
+                : { declaredLength: column.declaredLength }),
+              ...(column.withoutTimeZone === true ? { timestamp: true as const } : {}),
+            };
             return {
               expression: {
-                kind: "literal" as const,
-                value,
-                ...(column.sqlDomain === undefined
-                  ? {}
-                  : { internalSqlValue: true as const, sqlDomain: column.sqlDomain }),
+                kind: "call" as const,
+                name: "CAST" as const,
+                arguments: [literal, target],
               },
               alias: column.name,
             };

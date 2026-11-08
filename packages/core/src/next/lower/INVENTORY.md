@@ -316,3 +316,41 @@ PostgreSQL types; integer arithmetic folding still preserves the resolved call t
 The literal plan-cache scanner uses these signed integer ranges too, including both
 minima. Lifted slots and the client's own parameter types agree with the original
 PG-typed expression; decimal spellings and nonliteral arithmetic stay unlifted.
+
+## Remaining frozen-catalogue refusals
+
+The registry in `testing/divergences.ts` names every remaining refusal and its reason. The
+catalogue suite checks its exact class, stage, construct and SQLSTATE, and executes each refused
+SQL statement against PGlite to verify the authority outcome. These are capability limits of
+this unexported core; they do not describe the shipped engine's SQL support.
+
+| Cell     | Stage / construct   | Reason                                                                                                                                                                                            |
+| -------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| guide-7  | lower / function    | JSON_OBJECT and JSON_ARRAYAGG need heterogeneous typed construction and charged, spillable JSON accumulation.                                                                                     |
+| guide-8  | lower / function    | Whole-row json_agg needs record typing and bounded JSON accumulation; its expanded JSON_OBJECT is refused.                                                                                        |
+| guide-9  | lower / function    | The original frozen unknown -> unknown expression is ambiguous in PostgreSQL (42725). The legacy JSON extraction desugar is not an R19 function. No SQL refreeze or result waiver is applied.     |
+| guide-14 | lower / function    | Legacy DATE_ADD desugaring loses interval field provenance; calendar interval lowering and recursive execution are required. A user DATE_ADD call must not be mistaken for a PostgreSQL operator. |
+| guide-3  | execute / cast      | Timestamp-to-text output, timestamp subtraction to INTERVAL and DATE subtraction kernels are missing.                                                                                             |
+| guide-15 | execute / recursive | GENERATE_SERIES still needs bounded, cancellable work-table/fixpoint execution, plus interval arithmetic and EXTRACT.                                                                             |
+| guide-18 | execute / setOp     | EXCEPT needs spillable distinct/bag multiplicities with SQL NULL equality.                                                                                                                        |
+
+Canonical DATE literals now lower directly to epoch-day vectors using the binder's shared
+canonical parser. The shipped SQL front end still limits DATE literal spelling to AD years
+0001..9999; moving the parser does not expand that syntax. The physical parser/binder continues
+to accept its full date range, BC and infinities.
+
+Constant JSON_TABLE rows retain their declared types, including NULL-only prefixes and empty
+sources. A literal-only UNION ALL (including this front-end desugar) folds to one `values` bag,
+keeping order and duplicates. This rewrite neither evaluates scalar calls nor implements
+UNION DISTINCT, INTERSECT, EXCEPT or arbitrary set execution.
+
+Timestamp and timestamptz DATE_TRUNC execute in the fixed UTC session (C4), with PostgreSQL's
+units/aliases, integer microseconds, calendar boundaries, BC dates, infinity propagation and
+unit/range errors. The interval overload stays a typed execution refusal. This does not add
+non-UTC sessions or the three-argument timestamptz overload to R19.
+
+The monthly guide-13/17 authority queries pin PostgreSQL's floating SUM input to order_id ASC,
+matching the verified stored scan and stable per-group updates. Guide-17's LAG stage emits
+month ASC before its global SUM, so the PG global SUM uses that full-frame order too. The
+frozen SQL remains unchanged. Unordered PostgreSQL float sums may choose a different input
+order; these comparisons use explicit orders rather than a numerical tolerance.
