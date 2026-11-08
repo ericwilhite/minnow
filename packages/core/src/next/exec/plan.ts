@@ -384,6 +384,9 @@ export interface CompileOptions {
   readonly groupedDistinctBitmap?: boolean;
   readonly scalarByteDistinct?: boolean;
   readonly groupedUpdateFusion?: boolean;
+  readonly packedAverages?: boolean;
+  readonly packedIntegers?: boolean;
+  readonly batchDictionaryMinMax?: boolean;
   /** False retains the original window inputs for component/query benchmark controls. */
   readonly windowInputDeduplication?: boolean;
   /** Parent control for literal-amount gather benchmarks. */
@@ -776,6 +779,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           groupedDistinctBitmap: options.groupedDistinctBitmap !== false,
           scalarByteDistinct: options.scalarByteDistinct !== false,
           groupedUpdateFusion: options.groupedUpdateFusion !== false,
+          packedAverages: options.packedAverages === true,
+          packedIntegers: options.packedIntegers === true,
+          batchDictionaryMinMax: options.batchDictionaryMinMax === true,
         };
         const minimum = measureCompilerBuffers(
           compilation,

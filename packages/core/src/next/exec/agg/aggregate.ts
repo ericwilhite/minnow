@@ -51,6 +51,8 @@ import { DistinctSet } from "./distinct.js";
 import { ScalarByteDistinct, supportsScalarByteDistinct } from "./scalar-byte-distinct.js";
 import { GroupTopN, supportsGroupTopN, type GroupTopNSpec } from "./group-top-n.js";
 import { GroupTable } from "./groups.js";
+import { PackedAverages } from "./packed-averages.js";
+import { PackedIntegers, packedIntegerCalls } from "./packed-integers.js";
 import { accumulatorFor, fusedSums, updateGroupedPair, type Accumulator } from "./states.js";
 
 type AggregateRel = Extract<Rel, { op: "aggregate" }>;
@@ -129,6 +131,11 @@ export interface AggregateOptions {
   readonly scalarByteDistinct?: boolean;
   /** False retains separate grouped update loops (benchmark control). */
   readonly groupedUpdateFusion?: boolean;
+  /** Experimental control: five adjacent direct-column AVG(float8)s in packed state. */
+  readonly packedAverages?: boolean;
+  /** Experimental control: reduce dictionary MIN/MAX to one candidate per group/batch. */
+  readonly batchDictionaryMinMax?: boolean;
+  readonly packedIntegers?: boolean;
 }
 
 /** Refuses what the operator cannot compile, before anything is allocated. */
@@ -151,6 +158,9 @@ function preflight(rel: AggregateRel): void {
 }
 
 export class AggregateOperator implements Operator {
+  #packedIntegers: PackedIntegers | null = null;
+  readonly #packedIntegerMembers = new Set<number>();
+  readonly #packed = new Map<number, { bank: PackedAverages; columns: readonly number[] }>();
   readonly #keys: readonly number[];
   readonly #groups: GroupTable | null = null;
   readonly #aggregates: CompiledAggregate[] = [];
@@ -230,6 +240,47 @@ export class AggregateOperator implements Operator {
         ),
       );
       const shared = new Map<string, CompiledAggregate>();
+      const packedMembers = new Map<number, Accumulator>();
+      if (options.packedIntegers === true && rel.groupBy.length > 0) {
+        const calls = packedIntegerCalls(rel.aggregates, context.input);
+        if (calls !== null) {
+          this.#packedIntegers = new PackedIntegers(calls, context.input, charge);
+          for (const member of this.#packedIntegers.members) {
+            packedMembers.set(member.index, member.accumulator);
+            this.#packedIntegerMembers.add(member.index);
+          }
+        }
+      }
+      if (options.packedAverages === true && rel.groupBy.length > 0) {
+        for (let k = 0; k + 4 < rel.aggregates.length; k++) {
+          const calls = rel.aggregates.slice(k, k + 5);
+          if (
+            !calls.every(
+              (call) =>
+                call.fn === "avg" &&
+                call.type.kind === "float64" &&
+                !call.distinct &&
+                call.orderBy.length === 0 &&
+                call.filter === null &&
+                call.args.length === 1 &&
+                call.args[0]?.op === "column" &&
+                context.input[call.args[0].index]?.kind === "float64",
+            )
+          )
+            continue;
+          const first = calls[0];
+          if (first === undefined) throw new Error("Packed AVG group is empty");
+          const bank = new PackedAverages(first.type, charge);
+          const columns = calls.map((call) => {
+            const arg = call.args[0];
+            if (arg?.op !== "column") throw new Error("Packed AVG requires columns");
+            return arg.index;
+          });
+          this.#packed.set(k, { bank, columns });
+          bank.members.forEach((member, offset) => packedMembers.set(k + offset, member));
+          k += 4;
+        }
+      }
       rel.aggregates.forEach((call, k) => {
         const key = keys[k] ?? null;
         const sharing = key !== null && both.has(key);
@@ -251,6 +302,8 @@ export class AggregateOperator implements Operator {
           sharing,
           rel.groupBy.length > 0 && options.groupedDistinctBitmap !== false,
           rel.groupBy.length === 0 && options.scalarByteDistinct !== false,
+          packedMembers.get(k),
+          options.batchDictionaryMinMax === true,
         );
         this.#aggregates.push(compiled);
         if (sharing) shared.set(key, compiled);
@@ -295,17 +348,22 @@ export class AggregateOperator implements Operator {
     sharedState: boolean,
     groupedBitmap: boolean,
     scalarBytes: boolean,
+    packed?: Accumulator,
+    batchDictionaryMinMax = false,
   ): CompiledAggregate {
     const [arg] = call.args;
     const argument =
       call.fn === "count_star" || arg === undefined ? null : compileExpr(arg, context);
     // A shared state is built as AVG's (it also counts) and read as either.
-    const accumulator = accumulatorFor(
-      sharedState ? "avg" : call.fn,
-      call.type,
-      argument?.type ?? null,
-      this.#charge,
-    );
+    const accumulator =
+      packed ??
+      accumulatorFor(
+        sharedState ? "avg" : call.fn,
+        call.type,
+        argument?.type ?? null,
+        this.#charge,
+        { batchDictionaryMinMax },
+      );
     let distinct: DistinctSet | ScalarByteDistinct | null = null;
     let filter: Predicate | null;
     let selection: Selection;
@@ -383,10 +441,32 @@ export class AggregateOperator implements Operator {
       groups.groupCount > SORT_MIN_GROUPS
         ? this.#sortByGroup(gids, batch.selection, length, groups.groupCount)
         : null;
+    const integerRows = sorted ?? batch.selection;
+    const integerFused =
+      this.#packedIntegers?.tryUpdate(
+        batch,
+        gids,
+        rowsIn(integerRows),
+        countIn(integerRows, length),
+      ) ?? false;
     for (let index = 0; index < this.#aggregates.length; index++) {
       const aggregate = this.#aggregates[index];
       if (aggregate === undefined || !aggregate.updates || (scalar && aggregate.fusable)) continue;
+      if (integerFused && this.#packedIntegerMembers.has(index)) continue;
       const next = this.#aggregates[index + 1];
+      const packed = this.#packed.get(index);
+      if (packed !== undefined) {
+        const selection = sorted ?? batch.selection;
+        packed.bank.updateBatch(
+          batch,
+          packed.columns,
+          gids,
+          rowsIn(selection),
+          countIn(selection, length),
+        );
+        index += 4;
+        continue;
+      }
       if (
         !scalar &&
         this.#groupedUpdateFusion &&
@@ -431,6 +511,17 @@ export class AggregateOperator implements Operator {
       aggregate.accumulator.update(value, gids, rowsIn(rows), countIn(rows, length), scalar);
     }
     return "ready";
+  }
+
+  /** Internal diagnostic proving that a component/differential actually took the packed kernel. */
+  get packedAverageRows(): number {
+    let rows = 0;
+    for (const { bank } of this.#packed.values()) rows += bank.fusedRows;
+    return rows;
+  }
+
+  get packedIntegerRows(): number {
+    return this.#packedIntegers?.fusedRows ?? 0;
   }
 
   /**

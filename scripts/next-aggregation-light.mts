@@ -57,7 +57,13 @@ export async function lightComparison(
   pipeline?: () => Promise<{ rows: number }>,
   feed?: () => Promise<{ rows: number }>,
   candidate?: AggregateOptions,
+  measurement: {
+    readonly collect?: () => void;
+    readonly warmups?: number;
+    readonly nativeOnly?: boolean;
+  } = {},
 ) {
+  const warmups = measurement.warmups ?? 3;
   const N = captured.reduce((n, b) => n + (b.selection?.count ?? b.length), 0);
   assert.ok(N <= 1000000 && N > 0);
   // Flatten decoded vectors only: no hashing, canonical IDs, key interning, grouping or statistics
@@ -242,7 +248,13 @@ export async function lightComparison(
       { arena, params: { slots: [] }, input: types },
       grant,
       sort ?? sink,
-      { ...options, ...(id === "agg_highcard_int" ? { outputTopN: { count: 100, keys } } : {}) },
+      {
+        packedAverages: false,
+        packedIntegers: false,
+        batchDictionaryMinMax: false,
+        ...options,
+        ...(id === "agg_highcard_int" ? { outputTopN: { count: 100, keys } } : {}),
+      },
     );
     try {
       let at = 0;
@@ -270,10 +282,12 @@ export async function lightComparison(
   if (pipeline) assert.equal((await pipeline()).rows, expected.rows.length);
   // Preserve every Sxx array in the consumed result so its updates cannot be dead work.
   if (expected.sxx) for (const q of expected.sxx) assert.ok(q.every(Number.isFinite));
-  for (let k = 0; k < 3; k++) {
+  measurement.collect?.();
+  for (let k = 0; k < warmups; k++) {
     plain();
     await operator();
     if (pipeline) await pipeline();
+    measurement.collect?.();
   }
   const samples = {
       bound: [] as number[],
@@ -288,7 +302,10 @@ export async function lightComparison(
     loads: number[][] = [];
   const split = id === "agg_3dims_20aggs" ? wideSplit.bind(undefined, input) : plain;
   assert.deepEqual(split().rows, expected.rows);
-  for (let w = 0; w < 3; w++) split();
+  for (let w = 0; w < warmups; w++) {
+    split();
+    measurement.collect?.();
+  }
   const native = id === "agg_3dims_20aggs" ? wideNative.bind(undefined, input) : plain;
   const nativeExpected = native();
   assert.deepEqual(nativeExpected.rows, expected.rows);
@@ -297,10 +314,16 @@ export async function lightComparison(
     assert.deepEqual(nativeExpected.sxx, expected.sxx);
     if (N >= 8192) for (const q of expected.sxx) assert.ok(q.some((v) => v > 0));
   }
-  for (let w = 0; w < 3; w++) native();
-  if (feed) for (let w = 0; w < 3; w++) assert.equal((await feed()).rows, N);
+  for (let w = 0; w < warmups; w++) {
+    native();
+    measurement.collect?.();
+  }
+  if (feed) for (let w = 0; w < warmups; w++) assert.equal((await feed()).rows, N);
   if (candidate)
-    for (let w = 0; w < 3; w++) assert.deepEqual((await operator(candidate)).rows, expected.rows);
+    for (let w = 0; w < warmups; w++) {
+      assert.deepEqual((await operator(candidate)).rows, expected.rows);
+      measurement.collect?.();
+    }
   const operations = {
     bound: plain,
     split,
@@ -312,7 +335,11 @@ export async function lightComparison(
   };
   const kinds = (
     ["bound", "split", "native", "operator", "candidate", "whole", "feed"] as const
-  ).filter((kind) => operations[kind] !== undefined);
+  ).filter(
+    (kind) =>
+      operations[kind] !== undefined &&
+      !(measurement.nativeOnly && (kind === "bound" || kind === "split")),
+  );
   for (let round = 0; round < rounds; round++) {
     loads.push(loadavg());
     for (let j = 0; j < kinds.length; j++) {
@@ -320,8 +347,11 @@ export async function lightComparison(
         operation = operations[kind];
       if (!operation) throw new Error("missing benchmark operation");
       const start = cpuUsage(),
-        result = await operation(),
-        spent = cpuUsage(start);
+        result = await operation();
+      // Include collection CPU, so deferred work from a prior kernel cannot be
+      // assigned to the next sample. This is an explicit diagnostic lane.
+      measurement.collect?.();
+      const spent = cpuUsage(start);
       samples[kind].push((spent.user + spent.system) / 1000);
       order.push(kind);
       if (kind === "feed") assert.equal(result.rows, N);
@@ -361,6 +391,7 @@ export async function lightComparison(
     const operation = operations[kind];
     if (!operation) throw new Error("missing profile operation");
     await operation();
+    measurement.collect?.();
     const { profile } = await profiler.post("Profiler.stop");
     profiler.disconnect();
     for (const node of profile.nodes)

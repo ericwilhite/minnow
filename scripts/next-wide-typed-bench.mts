@@ -37,6 +37,16 @@ if (
   rounds < 5
 )
   throw new RangeError("1..1M rows and >=5 rounds required");
+const strategy = option("--strategy", "both");
+if (!["packed", "dictionary", "both"].includes(strategy)) throw new RangeError("unknown strategy");
+const controlledGC = args.includes("--controlled-gc");
+const collect = controlledGC ? globalThis.gc : undefined;
+if (controlledGC && collect === undefined)
+  throw new Error("--controlled-gc needs node --expose-gc");
+const warmups = Number(option("--warmups", "3"));
+if (!Number.isSafeInteger(warmups) || warmups < 3)
+  throw new RangeError("at least three warmups required");
+const nativeOnly = args.includes("--native-only");
 const output = resolve(option("--output", join(tmpdir(), "minnow-wide-typed")));
 await mkdir(output, { recursive: true });
 const fixture = wideDecodedFixture(
@@ -51,6 +61,8 @@ const sourcePaths = [
   "packages/core/browser/next-agg-shapes.ts",
   "packages/core/dist/next/exec/agg/aggregate.js",
   "packages/core/dist/next/exec/agg/states.js",
+  "packages/core/dist/next/exec/agg/packed-averages.js",
+  "packages/core/dist/next/exec/agg/packed-integers.js",
   "packages/core/dist/next/exec/agg/groups.js",
 ];
 const hashes = Object.fromEntries(
@@ -65,6 +77,10 @@ const hashes = Object.fromEntries(
 );
 const metadata = {
   lane: "Node isolated component",
+  strategy,
+  controlledGC,
+  warmups,
+  nativeOnly,
   rows,
   rounds,
   node: process.version,
@@ -88,6 +104,14 @@ try {
     fixture.batches,
     rounds,
     output,
+    undefined,
+    undefined,
+    {
+      packedAverages: strategy !== "dictionary",
+      packedIntegers: strategy !== "dictionary",
+      batchDictionaryMinMax: strategy !== "packed",
+    },
+    { ...(collect === undefined ? {} : { collect }), warmups, nativeOnly },
   );
   await writeFile(join(output, "component.json"), JSON.stringify({ ...metadata, result }, null, 2));
   console.log(JSON.stringify(result.cpuMs));

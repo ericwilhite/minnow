@@ -98,6 +98,17 @@ export interface Accumulator {
   fusedValues?(vector: Vector, rows: Uint16Array, count: number): Float64Array | null;
   /** Adds `count` values whose exact total is `total` (after `fusedValues`). */
   addFused?(total: number, count: number): void;
+  /** Restore a certified exact-int32 prefix into a fresh ordinary accumulator.
+   * Its sums are exact integers within ±2^52; counts are exact and masks matched.
+   * Internal packed-state promotion only; never combines float transition states.
+   */
+  restoreIntegerPrefix?(
+    state: Float64Array,
+    stride: number,
+    valueOffset: number,
+    countOffset: number,
+    groups: number,
+  ): void;
 }
 
 /** The f64 part of an exact sum stays within ±LIMIT so every addition of a value ≤ LIMIT is exact. */
@@ -227,6 +238,18 @@ class CountAccumulator implements Accumulator {
       counts[g] = (counts[g] ?? 0) + bit;
     }
   }
+  /** Restore the exact counts from a packed integer prefix. */
+  restoreIntegerPrefix(
+    state: Float64Array,
+    stride: number,
+    valueOffset: number,
+    _countOffset: number,
+    groups: number,
+  ): void {
+    this.grow(groups);
+    for (let g = 0; g < groups; g++) this.#counts[g] = state[g * stride + valueOffset] ?? 0;
+  }
+
   /** Borrow COUNT(*) state only for a synchronous, independent float SUM update. */
   updateWithSum(
     sum: FloatSumAccumulator,
@@ -636,6 +659,24 @@ class IntegerSumAccumulator implements Accumulator {
   grow(groups: number): void {
     this.#sums.grow(groups);
     this.#counts?.grow(groups);
+  }
+  restoreIntegerPrefix(
+    state: Float64Array,
+    stride: number,
+    valueOffset: number,
+    countOffset: number,
+    groups: number,
+  ): void {
+    this.grow(groups);
+    let bound = 0;
+    for (let g = 0; g < groups; g++) {
+      const sum = state[g * stride + valueOffset] ?? 0;
+      this.#sums.sums[g] = sum;
+      this.#sums.has[g] = (state[g * stride + countOffset] ?? 0) > 0 ? 1 : 0;
+      bound = Math.max(bound, Math.abs(sum));
+    }
+    this.#sums.bound = bound;
+    this.#counts?.restoreIntegerPrefix(state, stride, countOffset, countOffset, groups);
   }
   update(
     vector: Vector | null,
@@ -1896,10 +1937,13 @@ class MinMaxAccumulator implements Accumulator {
   #positionEpoch: Int32Array = new Int32Array(0);
   /** Bumped when positions go stale: a new ranking, or a best stored outside the ranked path. */
   #epoch = 1;
+  #batchEpoch = 0;
+  #touched: Int32Array = new Int32Array(0);
   constructor(
     readonly type: PhysicalType,
     readonly max: boolean,
     charge: ByteCharge,
+    readonly batchDictionary = false,
   ) {
     if (
       type.kind === "enum" ||
@@ -1947,7 +1991,9 @@ class MinMaxAccumulator implements Accumulator {
       vector.dictionary.validity === null &&
       4 * vector.dictionary.length <= count
     ) {
-      this.#updateRanked(vector, this.#rankingOf(vector), gids, rows, count, scalar);
+      const ranking = this.#rankingOf(vector);
+      if (this.batchDictionary) this.#updateBatchRanked(vector, ranking, gids, rows, count, scalar);
+      else this.#updateRanked(vector, ranking, gids, rows, count, scalar);
       return;
     }
     const reader = readerOf(vector);
@@ -2124,6 +2170,60 @@ class MinMaxAccumulator implements Accumulator {
       }
       position[g] = r;
       positionEpoch[g] = epoch;
+    }
+  }
+
+  /** Reduce page-local dictionary ranks before touching retained values. A group's
+   * batch winner needs one exact byte comparison with its prior winner, rather than
+   * a binary search locating that prior winner in every new page's dictionary.
+   * The scratch is bounded by groups plus one batch; no global value cache is built.
+   */
+  #updateBatchRanked(
+    vector: Vector & { form: "dictionary" },
+    ranking: Ranking,
+    gids: Int32Array,
+    rows: Uint16Array,
+    count: number,
+    scalar: boolean,
+  ): void {
+    if (this.#touched.length === 0) this.#touched = this.#memory.make(Int32Array, BATCH_ROWS);
+    this.#batchEpoch = (this.#batchEpoch + 1) | 0;
+    const epoch = this.#batchEpoch;
+    if (epoch === 0) this.#positionEpoch.fill(-1);
+    const position = this.#position,
+      epochs = this.#positionEpoch,
+      touched = this.#touched,
+      codes = vector.codes,
+      rank = ranking.rank,
+      validity = vector.validity;
+    let groups = 0;
+    for (let k = 0; k < count; k++) {
+      const row = rows[k] ?? 0;
+      if (!validAt(validity, row)) continue;
+      const g = scalar ? 0 : (gids[row] ?? 0);
+      if (epochs[g] !== epoch) {
+        touched[groups++] = g;
+        epochs[g] = epoch;
+        position[g] = row;
+      } else {
+        const best = position[g] ?? 0,
+          incoming = rank[codes[row] ?? 0] ?? 0,
+          previous = rank[codes[best] ?? 0] ?? 0;
+        if (this.max ? incoming > previous : incoming < previous) position[g] = row;
+      }
+    }
+    const values = this.#values,
+      has = this.#has,
+      better = this.max ? 1 : -1;
+    for (let k = 0; k < groups; k++) {
+      const g = touched[k] ?? 0,
+        row = position[g] ?? 0,
+        slot = codes[row] ?? 0;
+      // Byte-equal ties have identical SQL value and display. They need no copy.
+      if (has[g] === 0 || compareToStored(values, g, vector.dictionary, slot) === -better) {
+        values.set(g, vector, row);
+        has[g] = 1;
+      }
     }
   }
 
@@ -2433,6 +2533,7 @@ export function accumulatorFor(
   type: PhysicalType,
   input: PhysicalType | null,
   charge: ByteCharge,
+  options: { readonly batchDictionaryMinMax?: boolean } = {},
 ): Accumulator {
   switch (fn) {
     case "count_star":
@@ -2454,7 +2555,7 @@ export function accumulatorFor(
     case "max":
       return layoutOf(type) === "i32" || layoutOf(type) === "f32" || layoutOf(type) === "f64"
         ? new NumberMinMaxAccumulator(type, fn === "max", charge)
-        : new MinMaxAccumulator(type, fn === "max", charge);
+        : new MinMaxAccumulator(type, fn === "max", charge, options.batchDictionaryMinMax);
     case "bool_and":
     case "bool_or":
       return new BoolAccumulator(type, fn === "bool_and", charge);

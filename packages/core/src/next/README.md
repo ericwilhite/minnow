@@ -1635,7 +1635,7 @@ The full interface contract includes the following (DML remains unimplemented by
   state and input order. The loop stops before a non-finite result; ordinary transitions finish
   the first aggregate before the second, preserving overflow precedence. NULL, dictionary,
   constant, FILTER, DISTINCT and expression arguments keep separate updates. AVG is excluded:
-  no count, mask, Sx or Sxx state is coalesced. These pairs cover 2/2 highcard outputs and only
+  no AVG state is coalesced by these pairs. These pairs cover 2/2 highcard outputs and only
   2/21 outputs in the wide catalogue shape, whose aggregates all read different columns.
   `createExecutor({ groupedUpdateFusion: false })` selects separate loops;
   `next-agg-fused-update-bench.mts` measures real accumulator updates, and
@@ -1675,6 +1675,29 @@ The full interface contract includes the following (DML remains unimplemented by
   harness checks every result against the plain kernels and preserves AVG's Sxx transitions.
   `scripts/wide-decoded-fixture.test.ts` also judges all 21 outputs against PostgreSQL.
   These are Node diagnostic measurements, not browser Gate B results.
+- Wide typed-state experiments are opt-in while performance acceptance is pending:
+  `createExecutor({ packedAverages: true, packedIntegers: true, batchDictionaryMinMax: true })`.
+  The existing dictionary-native group table remains responsible for exact key identities.
+  One kernel packs five adjacent plain float8 AVG outputs into N/Sx[5]/Sxx[5] records.
+  It certifies the entire accumulated finite prefix (at most 2^26 rows, |x| at most 2^400),
+  keeps every PostgreSQL Youngs-Cramer transition, and restores independent counts lazily
+  when masks change or a batch fails that certificate. Sx and Sxx are never reconstructed.
+  A second kernel packs eight outputs (COUNT(*), five SUM(int32), a different AVG(int32),
+  and COUNT(nullable int32)) into one 64-byte record per group. With at most 2^21 rows,
+  every integer addition stays exact within 2^52. NULL/encoded arguments, more than
+  4,096 groups or a longer input restore the ordinary exact accumulators at their original
+  update positions. FILTER, DISTINCT, ordered and expression arguments retain general paths.
+  The dictionary MIN/MAX experiment first chooses each group's batch candidate by dictionary
+  rank, then compares its bytes once with the retained winner. Scratch is bounded by the
+  group count plus one batch; it retains no input buffers or global dictionary cache.
+  The new fused kernels cover 13/21 catalogue outputs (8 integer/count and 5 float AVG);
+  text MIN uses the batch reduction, and the other outputs retain their typed kernels.
+  State buffers, restoration, resizing overlap and scratch are charged before allocation.
+  `next-wide-typed-bench.mts --strategy both --native-only --warmups 10` compares this
+  experiment with the ordinary operator and its dictionary-native plain-TS kernel.
+  `--controlled-gc` (Node `--expose-gc`) includes synchronous collection inside each CPU
+  sample as a separate diagnostic mode; ordinary samples do not force collection.
+  `next-executor-bench.mts --whole-compare wide-typed` compares the real stored queries.
 - Scan statistics hints (future; pre-sizing and AVG Sxx skipping are deferred).
   High-cardinality pre-sizing is deferred. The scan would need to supply a conservative NDV
   estimate for the grouping expressions (not merely a row count), its scope across pages and

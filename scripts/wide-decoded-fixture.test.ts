@@ -75,6 +75,8 @@ it.each(seedsFor("wide-decoded-fixture", [0xb451, 0xb452]))(
       "integer-average",
       "physical-layout",
       "pg-rows",
+      "packed-kernel",
+      "packed-integers",
     ]);
     await fc.assert(
       fc.asyncProperty(
@@ -132,6 +134,7 @@ it.each(seedsFor("wide-decoded-fixture", [0xb451, 0xb452]))(
               { arena, params: { slots: [] }, input: fixture.input },
               lib.UNCHARGED,
               sink,
+              { packedAverages: true, packedIntegers: true, batchDictionaryMinMax: true },
             );
             let index = 0;
             try {
@@ -149,6 +152,10 @@ it.each(seedsFor("wide-decoded-fixture", [0xb451, 0xb452]))(
               aggregate.abort(undefined);
               arena.close();
             }
+            expect(aggregate.packedAverageRows).toBeGreaterThan(0);
+            reach.reach("packed-kernel");
+            expect(aggregate.packedIntegerRows).toBeGreaterThan(0);
+            reach.reach("packed-integers");
             const values: string[] = [];
             let observedNull = false;
             for (const batch of batches)
