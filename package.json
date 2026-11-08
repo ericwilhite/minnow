@@ -70,6 +70,8 @@
     "fixture:differential": "vite-node scripts/differential-corpus.mts",
     "benchmark:browser": "tsc -b packages/core && vite-node scripts/browser-perf.mts",
     "benchmark:agg-browser": "tsc -b packages/core && MINNOW_AGG_MICROBENCH=1 playwright test --config playwright.library.config.ts packages/core/browser-tests/next-agg-bench.spec.ts --project=chromium",
+    "benchmark:owner:cpu": "vite-node scripts/owner-point-read-cpu.mts",
+    "benchmark:owner:r6": "vite-node scripts/owner-r6-quiet.mts",
     "benchmark:storage": "tsc -b packages/core && MINNOW_STORAGE_MICROBENCH=1 playwright test --config playwright.library.config.ts packages/core/browser-tests/next-storage.spec.ts --project=chromium -g \"storage microbench\"",
     "benchmark:export": "tsc -b packages/core && MINNOW_NEXT_EXPORT_BENCH=1 MINNOW_EXPORT_FOCUS=1 playwright test --config playwright.library.config.ts packages/core/browser-tests/next-export-bench.spec.ts --project=chromium --workers=1",
     "test:storage-kills": "tsc -b packages/core && MINNOW_NEXT_STORAGE_KILLS=1000 playwright test --config playwright.library.config.ts packages/core/browser-tests/next-storage.spec.ts --project=chromium -g \"kill campaign\""
