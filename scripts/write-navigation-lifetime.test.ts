@@ -29,7 +29,6 @@ for (const seed of seedsFor("next-write-navigation-lifetime", [0xb3d2]))
                 encoding: "utf8",
                 timeout: 60000,
                 maxBuffer: 1024 * 1024,
-                env: { ...process.env, TMPDIR: "/home/eric/.cache/b3-tmp" },
               },
             ),
           ) as Array<NavigationLifetimeCase & { witnesses: number; retainedBytes: number }>;

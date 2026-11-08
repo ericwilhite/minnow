@@ -41,7 +41,6 @@ for (const seed of seedsFor("next-write-column-borrow", [0xb3d1]))
                 encoding: "utf8",
                 timeout: 60000,
                 maxBuffer: 4 * 1024 * 1024,
-                env: { ...process.env, TMPDIR: "/home/eric/.cache/b3-tmp" },
               },
             ),
           ) as { cases: number; retainedInputBytes: number };
