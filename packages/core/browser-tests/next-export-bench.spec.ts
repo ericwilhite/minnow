@@ -54,7 +54,14 @@
 // eslint-disable-next-line no-restricted-imports -- Node-only Playwright bench (cache control, /proc); never shipped.
 import { execFileSync } from "node:child_process";
 // eslint-disable-next-line no-restricted-imports -- Node-only Playwright bench (cache control, /proc); never shipped.
-import { appendFileSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 // eslint-disable-next-line no-restricted-imports -- Node-only Playwright bench (cache control, /proc); never shipped.
 import { join } from "node:path";
 import { expect, type CDPSession, type Page } from "@playwright/test";
@@ -73,6 +80,7 @@ const WARM_SHARE = 0.98;
  * at new addresses (distinct file bytes, the same encoded content), so a 1M-row table builds in
  * minutes on a loaded host.
  */
+const GATE_A = process.env.MINNOW_EXPORT_GATE_A === "1";
 const DISTINCT = Number(process.env.MINNOW_EXPORT_DISTINCT ?? 4);
 /** MINNOW_EXPORT_FOCUS=1: only Gate A's configuration (cold ×5, warm ×5, a profiled pass). */
 const COMPARE_STREAM = process.env.MINNOW_EXPORT_COMPARE_STREAM === "1";
@@ -89,10 +97,15 @@ const SCAN_BATCH_COMPLETED = process.env.MINNOW_EXPORT_SCAN_BATCH_COMPLETED ?? "
 const SCAN_IO_COMPARE = process.env.MINNOW_EXPORT_SCAN_IO_COMPARE === "1";
 const DISCARD = process.env.MINNOW_EXPORT_DISCARD === "1";
 const POOL_TRACE = process.env.MINNOW_EXPORT_POOL_TRACE === "1";
+const DICTIONARY_COMPARE = process.env.MINNOW_EXPORT_DICTIONARY_COMPARE === "1";
 const POOL_COMPARE = process.env.MINNOW_EXPORT_POOL_COMPARE === "1";
 const OWNER_COMPARE = process.env.MINNOW_EXPORT_OWNER_COMPARE === "1";
 const OWNER_API =
-  process.env.MINNOW_EXPORT_OWNER_API === "1" || OWNER_COMPARE || POOL_TRACE || POOL_COMPARE;
+  process.env.MINNOW_EXPORT_OWNER_API === "1" ||
+  OWNER_COMPARE ||
+  POOL_TRACE ||
+  POOL_COMPARE ||
+  DICTIONARY_COMPARE;
 if (OWNER_API && EXECUTOR_REFERENCE)
   throw new Error("Owner API comparison uses the current bench control, not a frozen executor");
 const RSS_SERIES = process.env.MINNOW_EXPORT_RSS_SERIES === "1" || OWNER_API;
@@ -469,10 +482,23 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     // One group more than the export reads: the measured hot set comes from it, so the export
     // never touches it (export-stream.ts `establishWorkingSet`).
     const exported = Math.ceil(rows / 65_536);
-    const built = await page.evaluate(
-      async ([url, count, distinct]) => ((await import(url)) as Run).build(count, distinct),
-      [RUN, rows + 65_536, DISTINCT] as const,
-    );
+    const built = GATE_A
+      ? await page.evaluate(async (url) => ((await import(url)) as Run).installFixture(), RUN)
+      : await page.evaluate(
+          async ([url, count, distinct]) => ((await import(url)) as Run).build(count, distinct),
+          [RUN, rows + 65_536, DISTINCT] as const,
+        );
+    const fixture = GATE_A
+      ? {
+          seed: Number(process.env.MINNOW_EXPORT_FIXTURE_SEED),
+          hash: process.env.MINNOW_EXPORT_FIXTURE_HASH,
+          independent: true,
+        }
+      : {
+          independent: built.generatedGroups === built.groups,
+          generatedGroups: built.generatedGroups,
+          label: "profile/comparison fixture; may copy generated groups",
+        };
     const files = opfsFiles(profile);
     const onDisk = totalBytes(files);
     console.log(
@@ -625,6 +651,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       }
       const backingStoragePeakMiB = Math.round(targets.takeExternal() / MiB);
       const row: Row = {
+        ...(GATE_A ? { fixture } : {}),
         ...(pass.series
           ? {
               series: pass.series,
@@ -707,7 +734,10 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     const base = { once: true, capMiB: 512, passes: 1, groups: exported };
     if (RSS_SERIES) {
       for (let round = 0; round < 5; round++)
-        for (const variant of EXECUTOR_REFERENCE || OWNER_COMPARE || POOL_COMPARE
+        for (const variant of EXECUTOR_REFERENCE ||
+        OWNER_COMPARE ||
+        POOL_COMPARE ||
+        DICTIONARY_COMPARE
           ? round % 2 === 0
             ? (["baseline", "candidate"] as const)
             : (["candidate", "baseline"] as const)
@@ -718,6 +748,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
             recycle: OWNER_API || process.env.MINNOW_EXPORT_RECYCLE === "1",
             ownerAPI: OWNER_API && (!OWNER_COMPARE || variant === "candidate"),
             ...(POOL_COMPARE ? { outputClasses: variant === "candidate" } : {}),
+            ...(DICTIONARY_COMPARE ? { dictionarySizing: variant } : {}),
             discard: DISCARD,
             readaheadKiB: 256,
             auditWorkingSet: false,
@@ -986,6 +1017,13 @@ test.describe("rebuild core export on OPFS (bench)", () => {
           "scan-only profiles must exclude frame assembly and result transport",
         ).toHaveLength(0);
       }
+      if (process.env.MINNOW_EXPORT_CPU_DIR) {
+        mkdirSync(process.env.MINNOW_EXPORT_CPU_DIR, { recursive: true });
+        writeFileSync(
+          join(process.env.MINNOW_EXPORT_CPU_DIR, `worker-${String(index)}.cpuprofile`),
+          JSON.stringify(profile),
+        );
+      }
       await info.attach(`export-cpu-${String(index)}`, {
         body: JSON.stringify(profile),
         contentType: "application/json",
@@ -1020,6 +1058,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     const campaignGc = SCAN_COMPARE ? await targets.collectPage() : undefined;
     const gcRssAfter = rendererRss(profile);
     const report = {
+      fixture,
       rows,
       ...(process.env.MINNOW_EXPORT_PACKED_EXPERIMENT === "1"
         ? {

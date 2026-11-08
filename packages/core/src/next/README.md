@@ -1569,6 +1569,81 @@ slab buffer is eligible. Protocol version 6 adds the explicit mode, capability l
 `returnBuffers` signal; old versions are refused during handshake. This is a wire-only change,
 with no stored-format change.
 
+The quiet-host acceptance command is:
+
+```sh
+TMPDIR=/home/eric/.cache npm run benchmark:export:gate-a -- --seed=0xb2a00001
+```
+
+It uses the production `exportStream()` route for five cold exports of 1,048,576 rows × 200
+columns. All 17 stored groups (16 exported plus the outside hot group) are independently
+written. The seeded generator cyclically permutes the historical wide generator's global row
+indices; it never copies a generated group's encoded extents. Existing copied-group profile
+comparisons retain their old data and are labelled separately.
+
+Completed file-store images are cached beneath `os.tmpdir()/minnow-gate-a/seed-…/`, keyed by
+seed, dimensions and generator/storage source fingerprint. Every use verifies a streamed
+SHA-256 inventory of data, log, roots and descriptors. The image is imported into OPFS outside
+timing; cached files are never opened for writing by a rerun. Seed and aggregate fixture hash
+appear in every pass and the final report. Preparation publishes a completed image atomically;
+an incomplete or changed cache cannot supply an acceptance result. No supported stored format
+changes here.
+
+The command requires Linux cache-control tools, installed dependencies and Chromium. It records
+load1 at startup, after fixture preparation, each second while the runner is active, and before/
+after each measured pass. Any unavailable, negative or greater-than-1 sample refuses the result,
+even if load later falls. This includes the benchmark's own load; no core-count normalization,
+waiting for a better sample or selective pass removal occurs. First-time generation can itself
+make the run refuse. `--prepare-only` can populate the same cache beforehand, without producing
+performance numbers. Reruns verify and reuse it.
+
+The runner captures diagnostic output under `os.tmpdir()` and publishes metrics only for a
+quiet, complete five-pass run with matching fixture identity, the real owner API, and at most
+1 MiB OS residency before each cold pass. Exit 0 means every pass meets 190k rows/s and baseline
++256 MiB RSS; exit 1 records a quiet run that misses a target; exit 2 refuses publication because
+of load, fixture/runner failure or missing evidence. Frame release is prompt. The fixed campaign
+RSS baseline, 200-ms peak sampling and worker-only CPU scope remain explicit in the report.
+Fixture catalogue/snapshot descriptors still replace B3 root discovery; client row objects and
+5M completion are outside this command. This is an export acceptance checkpoint, not cut-over
+or full-database-open acceptance.
+
+The p2v dictionary-sizing diagnostic profiles the existing size-class export path and keeps
+both rejected experiments in `scripts/browser-perf/experiments/dictionary-sizing-result.json`.
+The profile/comparison fixture independently generates one group, then copies it to distinct
+addresses: it is explicitly separate from the acceptance fixture above. Across five setup-excluded
+worker profiles, native read/wait was 17.4% median [15.4, 21.3]; the top named JavaScript kernel,
+`codeBytes8`, was 7.7% [7.1, 8.2]. Sampling can attribute native wait to `read`; this is not a CPU
+partition or proof that native read is the next CPU lever.
+
+The isolated Node component calls real `varlenBytesOf` for uint8 dictionary pages (33,554,432
+logical rows per case, all-valid and sparse NULLs), checks independent source-length totals,
+and interleaves five fresh-process rounds. CPU and wall clocks exclude setup and warmup.
+The unrolled all-valid loop improved component process CPU from 227.188 [216.024, 238.516] to
+132.048 [127.010, 137.467] ms, but whole Chromium `exportStream()` worker CPU regressed from
+8.47 [8.45, 9.56] to 8.89 [8.45, 10.28] s. Whole-export rows/s fell from 82,440
+[64,478, 86,723] to 59,623 [42,734, 79,311]. Those loaded-host results reject adoption;
+they do not replace the earlier campaign or establish absolute throughput. A smaller all-valid
+split improved component medians, but the gain did not beat the larger full CPU range, so it
+was rejected before another whole-export run. Production decode remains unchanged.
+
+To reproduce an experimental kernel, apply exactly one archived patch to a clean checkout,
+then run the component or real-API comparison below; revert that patch afterwards. The browser
+comparison selects only the baseline/candidate kernel in one persistent worker. That selector
+may itself affect optimization; the component and whole-export scopes are deliberately distinct.
+
+```sh
+git apply scripts/browser-perf/experiments/dictionary-unroll.patch
+npx vite-node scripts/dictionary-size-bench.mts --compare=53ec3457 --assert-gain
+MINNOW_EXPORT_DICTIONARY_COMPARE=1 MINNOW_EXPORT_DISTINCT=1 npm run benchmark:export
+git apply -R scripts/browser-perf/experiments/dictionary-unroll.patch
+```
+
+Use `dictionary-split.patch` for the second component experiment. `--assert-gain` rejects a
+median process-CPU gain no larger than either full range, independently for both NULL shapes.
+These are diagnostic benchmarks, not timing tests in the unit gate. `MINNOW_EXPORT_CPU_DIR`
+can name a directory for raw CDP profiles; otherwise ordinary Playwright attachment retention
+applies. All automatic scratch uses `os.tmpdir()`.
+
 For the production API benchmark, set `MINNOW_EXPORT_OWNER_API=1` with
 `MINNOW_EXPORT_DISTINCT=1 npm run benchmark:export`. It performs five cold OPFS exports through
 `ProtocolClient.exportStream()` in one persistent owner process and reports RSS against one fixed

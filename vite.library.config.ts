@@ -1,3 +1,5 @@
+import { dictionaryComparison } from "./scripts/browser-perf/dictionary-comparison.js";
+import { gateAFixtureServer } from "./scripts/browser-perf/gate-a-server.js";
 import { packedExperiment } from "./scripts/browser-perf/packed-experiment.js";
 import { executorSnapshot } from "./scripts/browser-perf/executor-comparison.js";
 // eslint-disable-next-line no-restricted-imports -- Node-only benchmark compiler; never shipped.
@@ -49,6 +51,10 @@ const exportBaseline =
 export default defineConfig({
   plugins: [
     isolatedPages,
+    ...(process.env.MINNOW_EXPORT_DICTIONARY_COMPARE === "1" ? [dictionaryComparison()] : []),
+    ...(process.env.MINNOW_EXPORT_FIXTURE_DIR
+      ? [gateAFixtureServer(process.env.MINNOW_EXPORT_FIXTURE_DIR)]
+      : []),
     ...(process.env.MINNOW_EXPORT_PACKED_EXPERIMENT === "1" ? [packedExperiment().vite] : []),
     ...(process.env.MINNOW_EXPORT_EXECUTOR_REFERENCE
       ? [executorSnapshot(process.env.MINNOW_EXPORT_EXECUTOR_REFERENCE).vite]

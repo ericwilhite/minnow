@@ -49,10 +49,16 @@ export function vectorOf(
   first: number,
   count: number,
   rows: number,
+  /** Acceptance fixture only: seeded cyclic row permutation; zero preserves historical values. */
+  rowOffset = 0,
 ): FlatVector {
   let validity: Uint32Array | null = null;
   const valueAt = (k: number): ReturnType<typeof wideValue> => {
-    const value = wideValue(column, first + k, rows);
+    const value = wideValue(
+      column,
+      rowOffset === 0 ? first + k : (first + k + rowOffset) % rows,
+      rows,
+    );
     if (value === null) {
       validity ??= (() => {
         const all = allocateValidity(count);

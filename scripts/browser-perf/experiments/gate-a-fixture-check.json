@@ -1,0 +1,36 @@
+{
+  "seed": 2996830209,
+  "fixtureHash": "d53e7816265b3a61ceda17a7d58bddc60a261735bbef89495fc27f35af133708",
+  "sourceHash": "db17703b58e70e2dd6eb0aba56fa5fcafea671fe97bd117ee00e75ed09c80f26",
+  "generatedGroups": 17,
+  "checkedIds": 1114112,
+  "files": [
+    {
+      "name": "data",
+      "bytes": 1112610272,
+      "sha256": "21d73f4551729b7146185aa8cca71c03d6cca5697630b72cacc5795f3965f3d6"
+    },
+    {
+      "name": "log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "root-0",
+      "bytes": 124022,
+      "sha256": "3a138ef34637f234320141837c6e3919ca00361367a7d1b916a6c0f7a6b51e12"
+    },
+    {
+      "name": "root-1",
+      "bytes": 116567,
+      "sha256": "5dd6a3823f245342036b3b3bd354b17191276e91a845f18ea6a2197d35960b03"
+    },
+    {
+      "name": "groups.json",
+      "bytes": 1523563,
+      "sha256": "326b098752f287169e05766236e34a3c91be72d58dc9515c86cae5c5a71f2f40"
+    }
+  ],
+  "reused": true,
+  "scope": "Fixture identity and independent seeded IDs only; no performance acceptance."
+}
