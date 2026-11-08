@@ -1605,6 +1605,9 @@ are unavailable; the report counts returned byte payloads and numeric index/meta
 The factory acquires handles in `openFence` and recovers in `open`, following the host contract.
 The default fence deadline is unchanged; the ready timer includes acquisition and recovery.
 
+The extent-space crash sweep registers each backend, placement and seed as a separate test.
+Every seed still checks every physical crash boundary, using the normal local test deadline.
+
 The bounded-storage histories hold every remaining ordinary byte in the caller, sometimes
 with a live progress loan, while publication and abort finish without admission. Final-phase
 histories enumerate actual native I/O and task suspensions, then interleave tracked-hole/EOF

@@ -1299,3 +1299,11 @@ export const NATIVE_OPEN_REACH = [
   "unordered physical allocations",
   "all credit returned",
 ] as const;
+
+/** Each original crash-sweep seed must finish every backend/placement combination. */
+export const SPACE_CRASH_SWEEP_REACH = [
+  "files/growing",
+  "files/relocating",
+  "IndexedDB/growing",
+  "IndexedDB/relocating",
+] as const;
