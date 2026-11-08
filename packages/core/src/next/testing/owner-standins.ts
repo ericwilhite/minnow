@@ -1305,8 +1305,8 @@ function* evaluate(expr: ScalarExpr, row: Tuple, context: Context): Evaluation<V
       return unknown ? null : expr.op === "and";
     }
     case "distinctFrom": {
-      const left = evaluate(expr.left, row, context);
-      const right = evaluate(expr.right, row, context);
+      const left = yield* evaluate(expr.left, row, context);
+      const right = yield* evaluate(expr.right, row, context);
       const distinct =
         left === null ? right !== null : right === null || compareValues(left, right) !== 0;
       return expr.negated ? !distinct : distinct;
@@ -1321,9 +1321,9 @@ function* evaluate(expr: ScalarExpr, row: Tuple, context: Context): Evaluation<V
     }
     case "case":
       for (const branch of expr.branches)
-        if (evaluate(branch.when, row, context) === true)
-          return evaluate(branch.then, row, context);
-      return expr.otherwise === null ? null : evaluate(expr.otherwise, row, context);
+        if ((yield* evaluate(branch.when, row, context)) === true)
+          return yield* evaluate(branch.then, row, context);
+      return expr.otherwise === null ? null : yield* evaluate(expr.otherwise, row, context);
     case "call":
       return yield* call(expr.fn, expr.type, yield* evaluateAll(expr.args, row, context), context);
     default:

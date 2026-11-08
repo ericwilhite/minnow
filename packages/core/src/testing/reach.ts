@@ -1807,6 +1807,9 @@ export const WRITE_REQUEST_BUFFER_STATES = [
 
 /** B3/B5: async sequence callers stop at cancellation before continuing batched inputs. */
 export const OWNER_SEQUENCE_PRESSURE_STATES = [
+  "plain sequence expression",
+  "case then sequence expression",
+  "case else sequence expression",
   "last value",
   "remaining values",
   "no later sequence call",

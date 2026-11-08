@@ -106,7 +106,7 @@ import { MetadataBudget, releaseIdle } from "./budget.js";
 import { GroupWriter } from "../page/writer.js";
 import type { StoreSession } from "../storage/contract.js";
 import { ExtentListKeeper, type ExtentList } from "../storage/extent-list.js";
-import type { ByteBudget, ExtentWriter } from "../storage/extents.js";
+import type { ExtentWriter } from "../storage/extents.js";
 import type { StatValue } from "../types.js";
 import { layoutOf } from "../types.js";
 import type { Vector } from "../vector/vector.js";
