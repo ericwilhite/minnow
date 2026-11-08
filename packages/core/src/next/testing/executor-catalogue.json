@@ -26660,8 +26660,7 @@
       "id": "win_median_pct",
       "dataset": "wide",
       "sql": "SELECT d02, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY f08) AS med, PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY i08) AS p90 FROM events_wide GROUP BY d02 ORDER BY d02",
-      "lowered": false,
-      "construct": "aggregate"
+      "lowered": true
     },
     {
       "id": "sort_full_numeric",
@@ -26874,8 +26873,7 @@
       "id": "guide-10",
       "dataset": "retail",
       "sql": "SELECT p.category,\n       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY i.line_total) AS median_line,\n       PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY i.line_total) AS p90_line,\n       MODE() WITHIN GROUP (ORDER BY i.quantity) AS usual_quantity\nFROM order_items i\nJOIN products p ON p.product_id = i.product_id\nGROUP BY p.category\nORDER BY median_line DESC",
-      "lowered": false,
-      "construct": "aggregate"
+      "lowered": true
     },
     {
       "id": "guide-11",

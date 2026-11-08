@@ -1520,3 +1520,41 @@ export const MEMORY_READ_BOUND_STATES = [
   "cancel sizing",
   "release sizing",
 ] as const;
+
+/** Ordered-set SQL is checked against independent PostgreSQL and shipped-engine outcomes. */
+export const ORDERED_SET_REACH = [
+  "percentile_cont",
+  "percentile_disc",
+  "mode",
+  "mode tie",
+  "interpolation",
+  "integer",
+  "double precision",
+  "numeric(12,2)",
+  "bigint",
+  "grouped",
+  "scalar",
+  "ascending",
+  "descending",
+  "empty input",
+  "null values",
+  "null group",
+  "null fraction",
+  "zero fraction",
+  "one fraction",
+  "range error",
+] as const;
+
+export const ORDERED_SET_MEMORY_REACH = [
+  "multiple ordered calls",
+  "percentile_cont",
+  "percentile_disc",
+  "mode",
+  "cancelled append",
+  "pending bytes retained",
+  "backpressure",
+  "task clock",
+  "real clock",
+  "spill",
+  "zero leak",
+] as const;

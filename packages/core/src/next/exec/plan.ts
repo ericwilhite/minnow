@@ -8,6 +8,12 @@ import { samePhysicalType, type PhysicalType } from "../types.js";
 import { BATCH_ROWS, type Batch, type Selection, type Vector } from "../vector/vector.js";
 import { int64At } from "../vector/int64.js";
 import { AggregateOperator } from "./agg/aggregate.js";
+import {
+  isOrderedSet,
+  orderedSetArguments,
+  orderedSetMinimumBytes,
+  OrderedSetOperator,
+} from "./agg/ordered-set.js";
 import { UnsupportedPlanError } from "./errors.js";
 import { FilterOperator, ProjectOperator } from "./filter.js";
 import {
@@ -358,9 +364,13 @@ export function compilePlan(plan: PhysicalPlan): Program {
 
   if (plan.initPlans.length !== 0)
     throw new UnsupportedPlanError("init plans", { construct: "initPlan" });
-  const admissions: Array<{ rel: Rel; minimum: number | ((cap: number) => number) }> = [];
-  const fixed = (rel: Rel, minimum: number | ((cap: number) => number)) =>
-    admissions.push({ rel, minimum });
+  const admissions: Array<{
+    rel: Rel;
+    minimum: number | ((cap: number) => number);
+    loanSlots: number;
+  }> = [];
+  const fixed = (rel: Rel, minimum: number | ((cap: number) => number), loanSlots = 0) =>
+    admissions.push({ rel, minimum, loanSlots });
   const ids = new Set<number>();
   // A terminal names-only projection forwards export ownership while retaining profile counts.
   const exportOwners = new WeakMap<Operator, ResultSink>();
@@ -603,6 +613,54 @@ export function compilePlan(plan: PhysicalPlan): Program {
                 groupingSets: null,
                 aggregates: [],
               };
+        if (aggregate.aggregates.some(isOrderedSet)) {
+          const measured = measureCompilerBuffers(
+            compilation,
+            input,
+            BATCH_ROWS,
+            (context) => orderedSetArguments(aggregate, context),
+            () => undefined,
+            "aggregate",
+          );
+          const minimum = orderedSetMinimumBytes(aggregate, input) + measured;
+          const loanSlots = aggregate.aggregates.length + 2;
+          fixed(rel, minimum, loanSlots);
+          return (runtime, downstream) =>
+            instantiate(
+              runtime,
+              rel,
+              input,
+              minimum,
+              BATCH_ROWS,
+              (context, grant) =>
+                new OrderedSetOperator(
+                  aggregate,
+                  context,
+                  {
+                    grant,
+                    loans: Array.from({ length: loanSlots }, (_, slot) => runtime.loan(rel, slot)),
+                    spill: runtime.request.spill,
+                    queryId: runtime.request.queryId,
+                    signal: runtime.signal,
+                  },
+                  counted(runtime, rel, downstream),
+                ),
+              (operator) => {
+                runtime.onAbort((reason) => operator.abort(reason));
+                runtime.dispose(() => operator.closed);
+                return (async () => {
+                  try {
+                    await child(runtime, operator, []);
+                  } catch (error) {
+                    operator.abort(error);
+                    // Disposal also observes cleanup failures; retain this statement's first error.
+                    await operator.closed.catch(() => undefined);
+                    throw error;
+                  }
+                })();
+              },
+            );
+        }
         const minimum = measureCompilerBuffers(
           compilation,
           input,
@@ -917,6 +975,7 @@ export function compilePlan(plan: PhysicalPlan): Program {
           .filter((entry) => active.has(entry.rel.id))
           .map((entry) => ({
             rel: entry.rel,
+            loanSlots: entry.loanSlots,
             minimum:
               typeof entry.minimum === "number"
                 ? entry.minimum

@@ -6,7 +6,7 @@ import { MemorySpillService } from "../spill/memory-spill.js";
 import { NumericOutOfRangeError, PlanStaleError, QueryCancelledError } from "./errors.js";
 import type { ExecuteRequest } from "./executor.js";
 import { I32, numbers } from "./kernels/test-support.js";
-import { QueryExecution, type Program } from "./run.js";
+import { QueryExecution, QueryRuntime, type Program } from "./run.js";
 import { WindowError } from "./window-frames.js";
 import type { ChunkReads } from "./scan.js";
 
@@ -42,6 +42,59 @@ function input(options: { signal?: AbortSignal; windowBytes?: number } = {}) {
   };
   return { plan, request, governor };
 }
+
+it("reserves nested loan owners before fixed buffers and keeps them independent behind a queued admission", async () => {
+  const h = input();
+  const runtime = new QueryRuntime(
+    h.plan,
+    h.request,
+    h.request.snapshot,
+    new AbortController().signal,
+  );
+  const normal = h.governor.capBytes - h.governor.reserveBytes;
+  const controller = new AbortController();
+  const stop = new Error("end blocked admission");
+  let admitted = false;
+  await runtime.reserve([{ rel: h.plan.root, minimum: normal, loanSlots: 2 }]);
+  const base = runtime.admit("values#1", normal, true, h.plan.root);
+  expect(base).not.toBeInstanceOf(Promise);
+  const blocked = h.governor
+    .admit({ label: "other pipeline", minimumBytes: 1, spillable: true, signal: controller.signal })
+    .then(
+      (grant) => {
+        admitted = true;
+        grant.close();
+      },
+      () => undefined,
+    );
+  try {
+    const first = runtime.loan(h.plan.root, 0),
+      second = runtime.loan(h.plan.root, 1);
+    // A late zero-byte admission would wait behind the blocked pipeline. Reject that design
+    // synchronously, not through a timeout, and consume any mutant's eventual rejection.
+    if (first instanceof Promise) void first.catch(() => undefined);
+    if (second instanceof Promise) void second.catch(() => undefined);
+    expect(first).not.toBeInstanceOf(Promise);
+    expect(second).not.toBeInstanceOf(Promise);
+    expect(first).not.toBe(second);
+    const a = await first.borrow(128),
+      b = await second.borrow(256);
+    expect(first.allocate(128)).toBe(true);
+    expect(second.allocate(256)).toBe(true);
+    expect([first.loaned, second.loaned]).toEqual([128, 256]);
+    expect(runtime.profile(h.plan.root).peakHeldBytes).toBe(normal + 384);
+    expect(admitted).toBe(false);
+    first.free(128);
+    second.free(256);
+    a.repay();
+    b.repay();
+  } finally {
+    controller.abort(stop);
+    await blocked;
+    await runtime.close();
+  }
+  expect(h.governor.usedBytes).toBe(0);
+});
 
 it("preserves a window operator's PostgreSQL SQLSTATE at the execution boundary", async () => {
   const h = input();

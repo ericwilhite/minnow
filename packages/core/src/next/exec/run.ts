@@ -30,6 +30,12 @@ import { ResultSink } from "./result-sink.js";
 import type { ParameterSlots, CallResolver } from "./kernels/compile.js";
 import { ReservedGrant } from "./admission.js";
 
+interface Reservation {
+  readonly rel: Rel;
+  readonly minimum: number;
+  readonly loanSlot?: number;
+}
+
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
 export type MutableOperatorProfile = Mutable<OperatorProfile>;
 export type Program = (runtime: QueryRuntime, sink: ResultSink) => MaybePromise<void>;
@@ -40,6 +46,7 @@ export class QueryRuntime {
   readonly params: ParameterSlots = { slots: [] };
   readonly profiles = new Map<number, MutableOperatorProfile>();
   readonly #grants: Grant[] = [];
+  readonly #profileGrants = new Map<number, Grant[]>();
   readonly #dispose: Array<() => MaybePromise<void>> = [];
   readonly #aborters: Array<(reason: unknown) => void> = [];
   #aborted = false;
@@ -53,8 +60,22 @@ export class QueryRuntime {
 
   /** Loan owners hold zero bytes until the one atomic fixed-buffer admission succeeds. */
   reserve(
-    entries: ReadonlyArray<{ readonly rel: Rel; readonly minimum: number }>,
+    pipelines: ReadonlyArray<{
+      readonly rel: Rel;
+      readonly minimum: number;
+      readonly loanSlots?: number;
+    }>,
   ): MaybePromise<void> {
+    // Zero-byte loan owners must be admitted before holding fixed buffers: a late admission
+    // could queue behind another pipeline waiting for those same fixed bytes.
+    const entries: Reservation[] = pipelines.flatMap((entry) => [
+      { rel: entry.rel, minimum: entry.minimum },
+      ...Array.from({ length: entry.loanSlots ?? 0 }, (_, loanSlot) => ({
+        rel: entry.rel,
+        minimum: 0,
+        loanSlot,
+      })),
+    ]);
     if (!needsParameterSizing(this.plan, this.request.parameters))
       return this.#sizeAndReserve(entries);
     const scratch = this.admit("parameter-sizing", PARAMETER_SIZING_BYTES, false);
@@ -63,10 +84,7 @@ export class QueryRuntime {
       : this.#sizeAndReserve(entries, scratch);
   }
 
-  #sizeAndReserve(
-    entries: ReadonlyArray<{ readonly rel: Rel; readonly minimum: number }>,
-    scratch?: Grant,
-  ): MaybePromise<void> {
+  #sizeAndReserve(entries: readonly Reservation[], scratch?: Grant): MaybePromise<void> {
     let binding: MaybePromise<ParameterBinding>;
     try {
       binding = prepareParameters(
@@ -92,10 +110,7 @@ export class QueryRuntime {
       : next(binding);
   }
 
-  #reserveBound(
-    entries: ReadonlyArray<{ readonly rel: Rel; readonly minimum: number }>,
-    binding: ParameterBinding,
-  ): MaybePromise<void> {
+  #reserveBound(entries: readonly Reservation[], binding: ParameterBinding): MaybePromise<void> {
     const extras: Grant[] = [];
     const next = (at: number): MaybePromise<void> => {
       for (let k = at; k < entries.length; k++) {
@@ -127,7 +142,10 @@ export class QueryRuntime {
             const share = new ReservedGrant(grant, extra, entry.minimum);
             this.#meter(share, entry.rel, false);
             shares.push(share);
-            this.#reserved.set(`${entry.rel.op}#${String(entry.rel.id)}`, share);
+            this.#reserved.set(
+              `${entry.rel.op}#${String(entry.rel.id)}${entry.loanSlot === undefined ? "" : `/loan/${String(entry.loanSlot)}`}`,
+              share,
+            );
             this.dispose(() => share.close());
           }
           grant.onReclaimRequest((bytes) => {
@@ -229,6 +247,13 @@ export class QueryRuntime {
       this.profiles.set(rel.id, profile);
     }
     return profile;
+  }
+
+  /** Independent zero-byte loan owner installed by the atomic plan reservation. */
+  loan(rel: Rel, slot: number): Grant {
+    const grant = this.#reserved.get(`${rel.op}#${String(rel.id)}/loan/${String(slot)}`);
+    if (grant === undefined) throw new TypeError("Missing reserved operator loan slot");
+    return grant;
   }
 
   admit(label: string, minimumBytes: number, spillable: boolean, rel?: Rel): MaybePromise<Grant> {
@@ -349,6 +374,11 @@ export class QueryRuntime {
     // A reserved share is already included in its fixed/extra real grants. Observe its
     // operator peak without double-counting the execution's holdings or loan wait time.
     if (account) this.#grants.push(grant);
+    if (rel !== undefined) {
+      const peers = this.#profileGrants.get(rel.id) ?? [];
+      peers.push(grant);
+      this.#profileGrants.set(rel.id, peers);
+    }
     const observe = () => {
       this.#peak = Math.max(
         this.#peak,
@@ -356,7 +386,10 @@ export class QueryRuntime {
       );
       if (rel !== undefined) {
         const profile = this.profile(rel);
-        profile.peakHeldBytes = Math.max(profile.peakHeldBytes, grant.held);
+        profile.peakHeldBytes = Math.max(
+          profile.peakHeldBytes,
+          (this.#profileGrants.get(rel.id) ?? []).reduce((sum, owner) => sum + owner.held, 0),
+        );
       }
     };
     const allocate = grant.allocate.bind(grant),

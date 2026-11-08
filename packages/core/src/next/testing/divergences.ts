@@ -395,18 +395,6 @@ export type CatalogueRefusal =
       readonly construct: string | null;
     };
 export const CATALOGUE_REFUSALS: Readonly<Record<string, CatalogueRefusal>> = {
-  win_median_pct: {
-    class: "UnsupportedPlanError",
-    sqlState: "0A000",
-    stage: "lower",
-    construct: "aggregate",
-  },
-  "guide-10": {
-    class: "UnsupportedPlanError",
-    sqlState: "0A000",
-    stage: "lower",
-    construct: "aggregate",
-  },
   "guide-7": {
     class: "UnsupportedPlanError",
     sqlState: "0A000",
@@ -506,4 +494,37 @@ export const KEYLESS_FULL_AUTHORITY = {
   sqlState: "0A000",
   authority:
     "PostgreSQL FULL JOIN requires a hash/merge-joinable condition; FULL's bag semantics are LEFT JOIN plus each unmatched right row exactly once. https://www.postgresql.org/docs/18/queries-table-expressions.html#QUERIES-JOIN",
+} as const;
+
+/** R17.1/R21: a narrow setup-refusal witness, never a waiver of next-core query results.
+ * PostgreSQL BIGINT spans signed 64 bits; the shipped INTEGER/BIGINT storage model is number
+ * (docs/sql/ddl) and refuses values outside the JS safe range. The next core uses int64.
+ * The ordered-set precision test first proves the INSERT and result against PGlite.
+ * https://www.postgresql.org/docs/18/datatype-numeric.html#DATATYPE-INT
+ */
+export const ORDERED_SET_LEGACY_BIGINT = {
+  authority: "PostgreSQL signed int64; R17.1 bigint rendering versus shipped safe-integer storage",
+  matches(ddl: string, values: readonly bigint[], error: unknown): boolean {
+    return (
+      ddl === "CREATE TABLE precise_ordered(id integer PRIMARY KEY,x bigint)" &&
+      values.length > 0 &&
+      values.every((v) => v >= -(1n << 63n) && v < 1n << 63n) &&
+      values.some(
+        (v) => v < BigInt(Number.MIN_SAFE_INTEGER) || v > BigInt(Number.MAX_SAFE_INTEGER),
+      ) &&
+      error instanceof TypeError &&
+      error.message === "x must be a safe integer"
+    );
+  },
+} as const;
+
+/** C6/R21 REAL boundary witness: original input retained as FLOAT8 for the legacy comparison.
+ * Always compare next with the original REAL table first. No rounding/epsilon is applied to
+ * next outputs. The independent FLOAT8 table represents the shipped number storage model.
+ * https://www.postgresql.org/docs/18/datatype-numeric.html#DATATYPE-FLOAT
+ */
+export const ORDERED_SET_CURRENT_REAL_AUTHORITY = {
+  table: "ordered_real_source",
+  type: "double precision",
+  authority: "C6/R21: REAL rounds on storage to float32; shipped REAL columns store JS doubles",
 } as const;
