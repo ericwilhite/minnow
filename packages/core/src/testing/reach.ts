@@ -1746,22 +1746,6 @@ export const RUN_BLOOM_STEP_STATES = [
   "wrapped step",
 ] as const;
 
-/** Feasible durable writes under small caps must share idle holdings with maintenance. */
-export const WRITE_LOW_CAP_STATES = [
-  "memory",
-  "indexeddb",
-  "startup returned",
-  "startup retained",
-  "active progress loan",
-  "idle estimate headroom",
-  "merge needs returned headroom",
-  "merge completed",
-  "metadata grew under pressure",
-  "durable reopen",
-  "allocated write above minimum",
-  "commit buffers independently charged",
-] as const;
-
 /** B3: low-cap commit encoding owns a bounded, independently counted set of actual buffers. */
 export const WRITE_COMMIT_BUFFER_STATES = [
   "request metadata",
