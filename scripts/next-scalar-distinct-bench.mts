@@ -14,6 +14,10 @@ import { xxHash32, xxHash32View } from "../packages/core/dist/next/hash/xxhash32
 import type { Vector } from "../packages/core/dist/next/vector/vector.js";
 import * as lib from "../packages/core/dist/next/exec/kernels/test-support.js";
 import { value } from "./next-executor-workload/gen.mjs";
+import { ScalarByteWord32 } from "./lib/scalar-byte-word32.mts";
+import { ScalarByteWord8 } from "./lib/scalar-byte-word8.mts";
+import { ScalarByteBulk } from "./lib/scalar-byte-bulk.mts";
+import { ScalarSortDistinct } from "./lib/scalar-distinct-sort.mts";
 
 function option(name: string, fallback: string): string {
   const at = process.argv.indexOf(name);
@@ -47,7 +51,18 @@ for (let first = 0; first < rows; first += 2048) {
 const counts = model.map((set) => set.size);
 for (const set of model) set.clear();
 const peaks: Record<string, number> = {};
-const ALL_POLICIES = ["legacy", "intern", "hash", "compact", "hashView"] as const;
+const ALL_POLICIES = [
+  "legacy",
+  "intern",
+  "hash",
+  "compact",
+  "hashView",
+  "bulk",
+  "word8",
+  "word32",
+  "hashSort",
+  "byteSort",
+] as const;
 type Policy = (typeof ALL_POLICIES)[number];
 async function setup(policy: Policy) {
   const governor = new Governor(256 << 20),
@@ -57,12 +72,26 @@ async function setup(policy: Policy) {
       spillable: true,
     });
   const sets =
-      policy === "legacy" || policy === "compact"
+      policy === "legacy" ||
+      policy === "compact" ||
+      policy === "bulk" ||
+      policy === "word8" ||
+      policy === "word32"
         ? [0, 1].map(() =>
-            policy === "compact"
-              ? new ScalarByteDistinct(lib.TEXT, grant)
-              : new DistinctSet(lib.TEXT, grant, 2048),
+            policy === "word8" || policy === "word32"
+              ? policy === "word32"
+                ? new ScalarByteWord32(lib.TEXT, grant)
+                : new ScalarByteWord8(lib.TEXT, grant)
+              : policy === "bulk"
+                ? new ScalarByteBulk(lib.TEXT, grant)
+                : policy === "compact"
+                  ? new ScalarByteDistinct(lib.TEXT, grant)
+                  : new DistinctSet(lib.TEXT, grant, 2048),
           )
+        : [],
+    sorters =
+      policy === "hashSort" || policy === "byteSort"
+        ? [0, 1].map(() => new ScalarSortDistinct(grant, policy === "hashSort"))
         : [],
     tables = policy === "intern" ? [0, 1].map(() => new GroupTable([lib.TEXT], grant)) : [],
     one: Vector[][] = [[], []],
@@ -76,11 +105,21 @@ async function setup(policy: Policy) {
           const vector = columns[c];
           if (vector === undefined || vector.form !== "flat" || vector.data.layout !== "varlen")
             throw new Error("flat UTF-8 fixture");
-          if (policy === "legacy" || policy === "compact") {
+          if (
+            policy === "legacy" ||
+            policy === "compact" ||
+            policy === "bulk" ||
+            policy === "word8" ||
+            policy === "word32"
+          ) {
             const set = sets[c];
             if (set === undefined) throw new Error("set");
             result[c] =
               (result[c] ?? 0) + set.filter(vector, ids, vector.length, null, true, out).count;
+          } else if (policy === "hashSort" || policy === "byteSort") {
+            const sorter = sorters[c];
+            if (sorter === undefined) throw new Error("sorter");
+            sorter.add(vector);
           } else if (policy === "intern") {
             const table = tables[c],
               keys = one[c];
@@ -101,6 +140,7 @@ async function setup(policy: Policy) {
             result[c] = hash;
           }
         }
+      if (sorters.length > 0) for (let c = 0; c < 2; c++) result[c] = sorters[c]?.finish() ?? 0;
       if (policy === "intern") for (let c = 0; c < 2; c++) result[c] = tables[c]?.groupCount ?? 0;
       if (policy !== "hash" && policy !== "hashView") assert.deepEqual(result, counts);
       peaks[policy] = governor.peakBytes;
@@ -108,6 +148,7 @@ async function setup(policy: Policy) {
     } finally {
       for (const set of sets) set.close();
       for (const table of tables) table.close();
+      for (const sorter of sorters) sorter.close();
       grant.close();
       assert.equal(governor.usedBytes, 0, "component leaked");
     }
@@ -166,6 +207,10 @@ const hashes: Record<string, string> = {};
 for (const name of [
   "scripts/next-scalar-distinct-bench.mts",
   "scripts/next-executor-workload/gen.mjs",
+  "scripts/lib/scalar-byte-bulk.mts",
+  "scripts/lib/scalar-byte-word8.mts",
+  "scripts/lib/scalar-byte-word32.mts",
+  "scripts/lib/scalar-distinct-sort.mts",
   "packages/core/dist/next/exec/agg/groups.js",
   "packages/core/dist/next/exec/agg/distinct.js",
   "packages/core/dist/next/exec/agg/scalar-byte-distinct.js",
@@ -202,7 +247,7 @@ const report = {
     }),
   ),
   limits:
-    "Diagnostic regions overlap: intern-only drops the scalar seen-marker/output selection; hash-only drops equality/storage. They are not additive or production alternatives. Input construction and state setup excluded; filtering, validation, teardown included. No browser or whole-query acceptance.",
+    "Bulk and sorting variants are benchmark-only experiments, not executor paths. Sorts preserve exact byte equality including interleaved full-hash collisions. Diagnostic regions overlap: intern-only drops the scalar seen-marker/output selection; hash-only drops equality/storage. They are not additive or production alternatives. Input construction and state setup excluded; filtering, validation, teardown included. No browser or whole-query acceptance.",
 };
 await writeFile(join(directory, "baseline.json"), JSON.stringify(report, null, 2) + "\n");
 console.log(JSON.stringify(report));

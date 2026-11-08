@@ -1617,6 +1617,12 @@ The full interface contract includes the following (DML remains unimplemented by
   `createExecutor({ scalarByteDistinct: false })` selects generic interning;
   `next-scalar-distinct-bench.mts` compares the exact million-row catalogue inputs in isolation,
   and `next-executor-bench.mts --whole-compare scalar-distinct` compares whole queries.
+  Further scalar DISTINCT experiments in the component benchmark are diagnostics only:
+  `bulk` copies whole input batches, `hashSort` radix-sorts hashes and checks byte equality,
+  `byteSort` merge-sorts exact byte keys, and `word8`/`word32` change record transport/layout.
+  None met the component median-versus-spread rule, so none is selected by the executor.
+  Sorting prototypes cover only flat, all-valid varlen input; the aligned-word prototype also
+  requires native little-endian words. These are not new supported execution paths.
 - Scan statistics hints (future; pre-sizing and AVG Sxx skipping are deferred).
   High-cardinality pre-sizing is deferred. The scan would need to supply a conservative NDV
   estimate for the grouping expressions (not merely a row count), its scope across pages and
