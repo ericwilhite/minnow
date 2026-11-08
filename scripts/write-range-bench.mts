@@ -4,13 +4,13 @@
  * No payload fetch, SQL, disk fsync or owner transport. Setup/GC/profile serialization excluded.
  * Warmup then >=5 AB/BA rounds; output equality, CPU/wall/spread and load average reported.
  * --full --out 2048 drains the range (ordered count/checksum), for whole-scan regression.
- * --profile under ~/.cache records one extra eager/streamed pair, outside measured rounds.
+ * --profile under os.tmpdir() records one extra eager/streamed pair, outside measured rounds.
  */
 import { deepStrictEqual } from "node:assert";
-import { loadavg, homedir } from "node:os";
+import { loadavg, tmpdir } from "node:os";
 import { Session, type Profiler } from "node:inspector";
 import { writeFile } from "node:fs/promises";
-import { resolve, relative, join } from "node:path";
+import { resolve, relative } from "node:path";
 import {
   Harness,
   autocommit,
@@ -132,8 +132,8 @@ try {
       }
     if (profileFile) {
       const file = resolve(profileFile);
-      if (relative(join(homedir(), ".cache"), file).startsWith(".."))
-        throw new Error("Profile belongs under ~/.cache");
+      if (relative(tmpdir(), file).startsWith(".."))
+        throw new Error("Profile belongs under os.tmpdir()");
       for (const label of ["eager", "streamed"]) {
         global.gc?.();
         const session = new Session();

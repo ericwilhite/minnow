@@ -1,12 +1,12 @@
 /**
- * Built write-path A/B bench. Capture the parent's core dist under ~/.cache before rebuilding;
+ * Built write-path A/B bench. Capture the parent's core dist under os.tmpdir() before rebuilding;
  * pass both dist directories. No vite-node transforms occur in the timed code.
  *
- * node scripts/write-insert-bench.mts --baseline ~/.cache/b3-old/dist --mode unique
- * node scripts/write-insert-bench.mts --baseline ~/.cache/b3-old/dist --mode single --durability relaxed
- * node scripts/write-insert-bench.mts --baseline ~/.cache/b3-old/dist --mode single --durability strict
- * node scripts/write-insert-bench.mts --baseline ~/.cache/b3-old/dist --mode load --load-mode tx
- * node scripts/write-insert-bench.mts --baseline ~/.cache/b3-old/dist --mode load --load-mode commits
+ * node scripts/write-insert-bench.mts --baseline "$TMPDIR/b3-old/dist" --mode unique
+ * node scripts/write-insert-bench.mts --baseline "$TMPDIR/b3-old/dist" --mode single --durability relaxed
+ * node scripts/write-insert-bench.mts --baseline "$TMPDIR/b3-old/dist" --mode single --durability strict
+ * node scripts/write-insert-bench.mts --baseline "$TMPDIR/b3-old/dist" --mode load --load-mode tx
+ * node scripts/write-insert-bench.mts --baseline "$TMPDIR/b3-old/dist" --mode load --load-mode commits
  *
  * Component: unique-key range/chain proof, including the old snapshot/reader setup. Whole paths: single inserts
  * after 100k keyed rows, or a durable 1M-row load including maintenance. Each pass builds its own inputs and database setup

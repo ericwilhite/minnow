@@ -3,8 +3,8 @@
  * measures commit encoding, log append and durability, then closes outside the clock. Each
  * iteration has its own database, reusing one columnar fixture. No SQL/transport/fsync timing.
  *
- * node scripts/write-commit-bench.mts --baseline ~/.cache/b3-parent/dist --durability relaxed
- * node scripts/write-commit-bench.mts --baseline ~/.cache/b3-parent/dist --durability strict
+ * node scripts/write-commit-bench.mts --baseline "$TMPDIR/b3-parent/dist" --durability relaxed
+ * node scripts/write-commit-bench.mts --baseline "$TMPDIR/b3-parent/dist" --durability strict
  *
  * One warmup pair, >=5 interleaved rounds (alternating AB/BA). CPU is process.cpuUsage across
  * all Node threads, including JIT/GC during the measured span. Wall and host load are separate.

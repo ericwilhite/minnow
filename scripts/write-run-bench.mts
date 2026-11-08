@@ -1,7 +1,7 @@
 /**
  * Built run-encoding component A/B benchmark (CPU across all Node threads, plus wall).
- * Capture the parent core dist under ~/.cache, then build the candidate. Examples:
- * node --expose-gc scripts/write-run-bench.mts --baseline ~/.cache/old/dist --mode delta --gc-before
+ * Capture the parent core dist under os.tmpdir(), then build the candidate. Examples:
+ * node --expose-gc scripts/write-run-bench.mts --baseline "$TMPDIR/old/dist" --mode delta --gc-before
  * Modes: delta (sorted delta -> run), bloom (hash pairs -> stored
  * filter), encoder (ordered entries -> run). --keys 65536 --iterations 32 --rounds 6 defaults.
  * --hot-key sends every row to one non-unique key; use --iterations 1 for the quadratic parent.

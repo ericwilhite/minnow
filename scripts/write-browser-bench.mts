@@ -1,10 +1,10 @@
 /**
  * Production-built write core on real disk, in a persistent Chromium OPFS worker.
  * Build core first. No Vite transforms or test cached-byte guard. All generated bundles,
- * profiles and logs go under --output (must be in ~/.cache). One process/worker at a time.
+ * profiles and logs go under --output (must be under os.tmpdir()). One process/worker at a time.
  *
- * node scripts/write-browser-bench.mts --baseline ~/.cache/b3-old/dist \
- *   --output ~/.cache/b3-browser --mode single --durability relaxed
+ * node scripts/write-browser-bench.mts --baseline "$TMPDIR/b3-old/dist" \
+ *   --output "$TMPDIR/b3-browser" --mode single --durability relaxed
  * Modes/durability/load-mode/rows/singles match write-insert-bench.mts. Defaults: 6 measured
  * interleaved AB/BA pairs after a discarded warmup pair, 20k relaxed / 2k strict singles,
  * 1M load rows. The input
@@ -25,7 +25,7 @@ import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { readdirSync, readFileSync, statfsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join, resolve, relative } from "node:path";
-import { homedir, loadavg } from "node:os";
+import { tmpdir, loadavg } from "node:os";
 import { build } from "esbuild";
 import { chromium, type CDPSession } from "@playwright/test";
 import type { WriteBenchInput } from "../packages/core/browser/next-write-bench-worker.js";
@@ -42,9 +42,10 @@ const integer = (name: string, fallback: number, minimum = 1) => {
 };
 const baseline = option("baseline", "");
 if (!baseline) throw new Error("--baseline must name the parent's built core dist");
-const output = resolve(option("output", join(homedir(), ".cache/minnow-write-browser")));
-const cache = join(homedir(), ".cache");
-if (relative(cache, output).startsWith("..")) throw new Error("--output must be under ~/.cache");
+const scratchRoot = tmpdir();
+const output = resolve(option("output", join(scratchRoot, "minnow-write-browser")));
+if (relative(scratchRoot, output).startsWith(".."))
+  throw new Error("--output must be under os.tmpdir(); set TMPDIR to choose its disk");
 await mkdir(output, { recursive: true });
 process.env.TMPDIR = join(output, "tmp");
 await mkdir(process.env.TMPDIR, { recursive: true });

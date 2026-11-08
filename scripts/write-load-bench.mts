@@ -11,7 +11,7 @@
  * - `single`: `singles` one-row transactions after a 100k-row table, each acknowledged as its
  *   durability says (strict: after its flush; relaxed: at commit): µs per insert (wall and process
  *   CPU), the relaxed lane's owner cost.
- * Build core first (npx tsc -b packages/core). Optional --profile ~/.cache/load.cpuprofile
+ * Build core first (npx tsc -b packages/core). Optional --profile "$TMPDIR/load.cpuprofile"
  * records only the measured phase; Inspector stop/serialization are outside its CPU/wall clock.
  * Rows are built before the clock starts (the engine's cost alone is measured). Reported: wall
  * and CPU per phase, rows/s, staged and flushed counts. The memory store has no
@@ -20,8 +20,8 @@
  */
 import { Session, type Profiler } from "node:inspector";
 import { writeFile, mkdir } from "node:fs/promises";
-import { resolve, dirname, relative, join } from "node:path";
-import { homedir, loadavg } from "node:os";
+import { resolve, dirname, relative } from "node:path";
+import { tmpdir, loadavg } from "node:os";
 import { performance, PerformanceObserver } from "node:perf_hooks";
 import {
   autocommit,
@@ -47,8 +47,8 @@ const inspector = profileFile ? new Session() : null;
 const startProfile = async () => {
   if (!inspector) return;
   const file = resolve(profileFile);
-  if (relative(join(homedir(), ".cache"), file).startsWith(".."))
-    throw new Error("--profile must be under ~/.cache");
+  if (relative(tmpdir(), file).startsWith(".."))
+    throw new Error("--profile must be under os.tmpdir()");
   await mkdir(dirname(file), { recursive: true });
   inspector.connect();
   await new Promise<void>((ok, fail) =>
