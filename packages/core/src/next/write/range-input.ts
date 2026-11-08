@@ -21,7 +21,7 @@ export interface RangeInput {
 }
 export { rangeSide } from "./range-bound.js";
 import { rangeSide } from "./range-bound.js";
-import { RangeDirectory, directoryBytes } from "./range-directory.js";
+import { RangeDirectory } from "./range-directory.js";
 
 /** Version-aware position: writes may split leaves or grow arenas while a snapshot is pinned. */
 export class DeltaRangeInput implements RangeInput {
@@ -127,9 +127,11 @@ export class DeltaRangeInput implements RangeInput {
   }
 }
 
-/** One decoded block and reverse partition boundaries, independent of the number of blocks. */
-export function rangeRunBytes(ref: RunRef, direction: number): number {
-  return 4096 + 512 + directoryBytes(ref, direction);
+/** One decoded block and scalar navigation, independent of the number of blocks. */
+export function rangeRunBytes(_ref: RunRef, _direction: number): number {
+  void _ref;
+  void _direction;
+  return 4096 + 512;
 }
 export class RunRangeInput implements RangeInput {
   readonly #directory: RangeDirectory;
@@ -159,10 +161,9 @@ export class RunRangeInput implements RangeInput {
     readonly direction: number,
     readonly limit: number,
     readonly signal: AbortSignal,
-    scratch: Uint8Array,
   ) {
     this.rowId = direction > 0 ? -Infinity : Infinity;
-    this.#directory = new RangeDirectory(ref, space, budget, range, direction, signal, scratch);
+    this.#directory = new RangeDirectory(ref, space, budget, range, direction, signal);
   }
   open(): MaybePromise<void> {
     return this.#directory.open();

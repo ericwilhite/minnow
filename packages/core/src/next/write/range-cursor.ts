@@ -8,6 +8,7 @@ import {
 import { taskClock, yieldTask } from "../exec/pipeline.js";
 import type { RunRef } from "../format/manifest.js";
 import type { Grant } from "../memory/governor.js";
+import { MAX_BLOB_BYTES } from "../access/space.js";
 import { compareBytes } from "../vector/varlen.js";
 import { rangeSide } from "./range-bound.js";
 import { need } from "./bytes.js";
@@ -32,7 +33,6 @@ export class StreamingRangeCursor implements IndexCursor {
   #size = 0;
   #pair = EMPTY;
   #previous = EMPTY;
-  #metadata = EMPTY;
   #previousLength = -1;
   #previousRow = -1;
   constructor(
@@ -66,37 +66,25 @@ export class StreamingRangeCursor implements IndexCursor {
     }
     for (const run of table.tableView.runs.get(id) ?? []) stored(run, Infinity);
   }
-  #sizes(): { resident: number; minimum: number; keyBytes: number; metadataBytes: number } {
+  #sizes(): { resident: number; minimum: number; keyBytes: number } {
     let resident = 1024,
       io = 0,
-      metadataBytes = 0,
       keyBytes = 2048;
     this.#layers((delta, run) => {
       resident += 512; // source, two reference-array slots and heap head
       if (delta !== null) keyBytes = Math.max(keyBytes, delta.maxKeyBytes);
       if (run !== null) {
         resident += rangeRunBytes(run, this.#direction);
-        const bounded = (this.#direction > 0 ? this.range.lower : this.range.upper) !== null;
-        metadataBytes = Math.max(
-          metadataBytes,
-          bounded ? Math.max(run.fences.length, run.entries.length) : 0,
-          this.#direction < 0 ? run.bloom.length : 0,
-        );
-        io = Math.max(
-          io,
-          run.entries.length,
-          bounded ? run.fences.length : 0,
-          this.#direction < 0 ? run.bloom.length : 0,
-          4096,
-        );
+        // Fixed credit for one verified directory blob and one one-pass block. Parsed
+        // navigation belongs to the governed cache, not this non-spillable admission.
+        io = MAX_BLOB_BYTES;
       }
     });
-    resident += keyBytes * 2 + metadataBytes;
+    resident += keyBytes * 2;
     return {
       resident,
       minimum: resident + (io === 0 ? 0 : io * 2 + 128 * 1024),
       keyBytes,
-      metadataBytes,
     };
   }
   *#open(): Generator<Promise<unknown>, void, unknown> {
@@ -119,7 +107,6 @@ export class StreamingRangeCursor implements IndexCursor {
         throw new TypeError("Admitted cursor scratch did not fit");
       this.#pair = new Uint8Array(current.keyBytes);
       this.#previous = new Uint8Array(current.keyBytes);
-      this.#metadata = new Uint8Array(current.metadataBytes);
       this.#layers((delta, run, limit) => {
         this.#inputs.push(
           delta !== null
@@ -138,7 +125,6 @@ export class StreamingRangeCursor implements IndexCursor {
                 this.#direction,
                 limit,
                 this.#abort.signal,
-                this.#metadata,
               ),
         );
       });
@@ -301,7 +287,6 @@ export class StreamingRangeCursor implements IndexCursor {
     this.#size = 0;
     this.#pair = EMPTY;
     this.#previous = EMPTY;
-    this.#metadata = EMPTY;
     this.#grant?.close();
     this.#grant = null;
     this.#unwatch();

@@ -4,6 +4,7 @@ import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, WRITE_RANGE_DIRECTORY_STATES } from "../../testing/reach.js";
 import { inKeyRange, type KeyRange } from "../access/key-index.js";
+import { MAX_BLOB_BYTES } from "../access/space.js";
 import { need } from "./bytes.js";
 import { Harness } from "./test-support.js";
 import { RunBuilder, runRef, PARTITION_BLOCKS } from "./runs.js";
@@ -55,16 +56,10 @@ for (const seed of seedsFor("next-write-stream-directory", [0xb3ce]))
             reach.reach(hot ? "one hot key" : "distinct keys");
             for (const range of ranges)
               for (const direction of [1, -1]) {
-                const scratchBytes = Math.max(
-                  ref.fences.length,
-                  ref.entries.length,
-                  ref.bloom.length,
-                  4096,
-                );
-                const resident = rangeRunBytes(ref, direction) + scratchBytes;
+                const resident = rangeRunBytes(ref, direction);
                 const grant = await h.governor.admit({
                   label: "directory fixture reader",
-                  minimumBytes: resident + 2 * scratchBytes + 128 * 1024,
+                  minimumBytes: resident + 2 * MAX_BLOB_BYTES + 128 * 1024,
                   spillable: false,
                 });
                 expect(grant.allocate(resident)).toBe(true);
@@ -76,7 +71,6 @@ for (const seed of seedsFor("next-write-stream-directory", [0xb3ce]))
                   direction,
                   Infinity,
                   new AbortController().signal,
-                  new Uint8Array(scratchBytes),
                 );
                 try {
                   await input.open();

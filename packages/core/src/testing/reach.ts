@@ -2023,3 +2023,44 @@ export const WRITE_COLUMN_BORROW_STATES = [
   "full chunk",
   "failed after copied prefix",
 ] as const;
+
+/** R23/R5 cursor state is bounded by run count; shared cold indexes are separately governed. */
+export const WRITE_RANGE_CARDINALITY_STATES = [
+  "1024 keys",
+  "16384 keys",
+  "131072 keys",
+  "governor eviction",
+  "shared precharged index",
+  "cold all asc",
+  "warm all asc",
+  "cold all desc",
+  "warm all desc",
+  "cold bounded asc",
+  "warm bounded asc",
+  "cold bounded desc",
+  "warm bounded desc",
+] as const;
+
+/** Cold fills share one governed descriptor; cancellation and refusal preserve other users. */
+export const WRITE_RANGE_NAVIGATION_STATES = [
+  "concurrent followers",
+  "follower cancellation",
+  "owner cancellation retry",
+  "resumed partial fill",
+  "timer during cold fill",
+  "released I/O holds",
+  "shared ready descriptor",
+  "optional cache refusal",
+  "pressure descending",
+  "pressure ascending",
+] as const;
+
+/** An open cursor must not root cache-owned arrays or encoded bytes after eviction. */
+export const WRITE_RANGE_NAVIGATION_LIFETIME_STATES = [
+  "desc",
+  "bounded asc",
+  "bounded desc",
+  "1024 keys",
+  "16384 keys",
+  "131072 keys",
+] as const;
