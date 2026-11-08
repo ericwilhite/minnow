@@ -188,8 +188,14 @@ describe("review B2-p2a #2: the governor evicts every registered cache, the entr
     const governor = new Governor(64 * 1024 * 1024);
     const register = governor.registerCache.bind(governor);
     const backend = new MemoryBackend();
-    const session = await backend.open(await backend.acquire({ steal: false, timeoutMs: 2000 }));
-    const budget = countingBudget(Infinity);
+    const ownership = await backend.acquire({ steal: false, timeoutMs: 2000 });
+    const session = await backend.open(ownership);
+    // Startup transfers its prepaid metadata credit to the space; both owners use this governor.
+    const budget = await governor.admit({
+      label: "cache-order startup and reads",
+      minimumBytes: 0,
+      spillable: true,
+    });
     const space = await openExtentSpace(session, {
       reachable: jsonReachable,
       budget,
@@ -197,53 +203,69 @@ describe("review B2-p2a #2: the governor evicts every registered cache, the entr
     });
     const roots = new BlobCache<string>(register);
     const pages = new BlobCache<string>(register);
-    const writer = space.beginWrite("t");
-    const [first, second] = (await writer.write([bytesOf(100_000, 1), bytesOf(100_000, 2)])).blobs;
-    if (first === undefined || second === undefined) throw new Error("not written");
-    const use = async (blob: BlobRef): Promise<void> => {
-      (await space.read([blob], { budget })).release();
-      await pause(3);
-    };
-    const keep = async (cache: BlobCache<string>, size: number): Promise<BlobRef> => {
-      const key = { ...ref, checksum: size };
-      cache.admit(key, "decoded", size);
-      cache.unpin(key);
-      await pause(3);
-      return key;
-    };
-    // Last used, oldest first: page `first`, a group root, page `second`, a directory page.
-    await use(first);
-    const rootKey = await keep(roots, 30_000);
-    await use(second);
-    await keep(pages, 20_000);
-    const resident = (): number => space.stats.cache.residentBytes;
-    expect(resident()).toBe(200_000);
-    const admitOneMore = (): void => {
-      const free = governor.capBytes - governor.reserveBytes - governor.usedBytes;
-      const grant = governor.tryAdmit({ label: "probe", minimumBytes: free + 1, spillable: true });
-      expect(grant).not.toBeNull();
-      grant?.close();
-    };
-    admitOneMore();
-    expect([resident(), roots.evictableBytes, pages.evictableBytes]).toEqual([
-      100_000, 30_000, 20_000,
-    ]);
-    admitOneMore();
-    expect([resident(), roots.evictableBytes, pages.evictableBytes]).toEqual([100_000, 0, 20_000]);
-    admitOneMore();
-    expect([resident(), roots.evictableBytes, pages.evictableBytes]).toEqual([0, 0, 20_000]);
-    // A use moves an entry to the back: a group root kept before a second directory page but used
-    // after it outlives that page.
-    const again = await keep(roots, 30_000);
-    await keep(pages, 10_000);
-    expect(roots.pin(again)?.value).toBe("decoded");
-    roots.unpin(again);
-    admitOneMore(); // the first directory page (oldest)
-    expect([roots.evictableBytes, pages.evictableBytes]).toEqual([30_000, 10_000]);
-    admitOneMore(); // the second, released before the group root's last use
-    expect([roots.evictableBytes, pages.evictableBytes]).toEqual([30_000, 0]);
-    expect(again).toEqual(rootKey);
-    await space.close();
+    try {
+      const writer = space.beginWrite("t");
+      const [first, second] = (await writer.write([bytesOf(100_000, 1), bytesOf(100_000, 2)]))
+        .blobs;
+      if (first === undefined || second === undefined) throw new Error("not written");
+      const use = async (blob: BlobRef): Promise<void> => {
+        (await space.read([blob], { budget })).release();
+        await pause(3);
+      };
+      const keep = async (cache: BlobCache<string>, size: number): Promise<BlobRef> => {
+        const key = { ...ref, checksum: size };
+        cache.admit(key, "decoded", size);
+        cache.unpin(key);
+        await pause(3);
+        return key;
+      };
+      // Last used, oldest first: page `first`, a group root, page `second`, a directory page.
+      await use(first);
+      const rootKey = await keep(roots, 30_000);
+      await use(second);
+      await keep(pages, 20_000);
+      const resident = (): number => space.stats.cache.residentBytes;
+      expect(resident()).toBe(200_000);
+      const admitOneMore = (): void => {
+        const free = governor.capBytes - governor.reserveBytes - governor.usedBytes;
+        const grant = governor.tryAdmit({
+          label: "probe",
+          minimumBytes: free + 1,
+          spillable: true,
+        });
+        expect(grant).not.toBeNull();
+        grant?.close();
+      };
+      admitOneMore();
+      expect([resident(), roots.evictableBytes, pages.evictableBytes]).toEqual([
+        100_000, 30_000, 20_000,
+      ]);
+      admitOneMore();
+      expect([resident(), roots.evictableBytes, pages.evictableBytes]).toEqual([
+        100_000, 0, 20_000,
+      ]);
+      admitOneMore();
+      expect([resident(), roots.evictableBytes, pages.evictableBytes]).toEqual([0, 0, 20_000]);
+      // A use moves an entry to the back: a group root kept before a second directory page but used
+      // after it outlives that page.
+      const again = await keep(roots, 30_000);
+      await keep(pages, 10_000);
+      expect(roots.pin(again)?.value).toBe("decoded");
+      roots.unpin(again);
+      admitOneMore(); // the first directory page (oldest)
+      expect([roots.evictableBytes, pages.evictableBytes]).toEqual([30_000, 10_000]);
+      admitOneMore(); // the second, released before the group root's last use
+      expect([roots.evictableBytes, pages.evictableBytes]).toEqual([30_000, 0]);
+      expect(again).toEqual(rootKey);
+    } finally {
+      roots.clear();
+      pages.clear();
+      await space.close();
+      budget.close();
+      await session.close();
+      await ownership.release();
+    }
+    expect(governor.usedBytes).toBe(0);
   });
 });
 
