@@ -1088,9 +1088,9 @@ into hidden columns and removed from visible results. No runtime code generation
 The owner composition uses it by default; protocol tests over `StandinWritePath` explicitly keep
 their synthetic executor. DML, keyed nested-loop joins, index lookup/range, fetch, init plans, apply, set operations and
 recursion are still typed prepare-time refusals, as are unsupported existing kernel overloads.
-This factory does not turn those missing capabilities into current-engine fallbacks. Main's M2
-lowerer also refuses joins/windows before they reach the factory; direct IR tests exercise the
-operator wiring until M3 lowering lands.
+This factory does not turn those missing capabilities into current-engine fallbacks. The
+lowerer emits joins and windows for the factory; SQL catalogue tests exercise them through
+real storage and result delivery.
 
 Fixed operator buffers are reserved atomically before data-dependent state grows, so a join build
 cannot consume the later probe's admission minimum. Individual operators retain separate grants
@@ -1914,8 +1914,9 @@ not require a home cache directory.
   correlated values in parameter slots (rare from SQL); uncorrelated scalar and EXISTS subqueries
   where no join can attach are init plans, run lazily on the first read of their slot (R24.1).
   The front end refuses correlated subqueries in HAVING, in grouped or nested select lists, and
-  with GROUP BY / HAVING inside them, and a FULL JOIN after another join or under a window
-  (INVENTORY.md "Still needed" 4).
+  with GROUP BY / HAVING inside them (INVENTORY.md "Still needed" 4). Typed preparation
+  supports multiple FULL joins, FULL joins under windows, and NATURAL FULL JOIN; the shipped
+  executor retains its separate sole-FULL-join rewrite and NATURAL FULL refusal.
 - Set operations resolve each pair's column types as PostgreSQL does: an unknown-typed constant
   (NULL, a string literal) takes the other arm's type, and two unknowns are text.
 - A FULL JOIN with no hash-joinable condition lowers, though PostgreSQL refuses it (0A000): an
