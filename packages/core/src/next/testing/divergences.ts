@@ -373,19 +373,12 @@ export function queryAuthorityValue(plan: PhysicalPlan, column: number, value: u
   return Number.isFinite(result) ? result : value;
 }
 
-/** Frozen SQL calls a PostgreSQL overload that does not exist. These cells remain refusals,
- * never passing executions; the lead will refreeze a corrected harness separately. */
-export const CATALOGUE_AUTHORITY_REFUSALS = {
-  S_q7: "42883",
-  "guide-4": "42883",
-  "guide-5": "42883",
-} as const;
 export const ROUND_OVERLOAD_AUTHORITY =
   "PostgreSQL 18 functions-math: round(double precision) and round(numeric, integer), no round(double precision, integer); R19 keeps the overload signatures exact. https://www.postgresql.org/docs/18/functions-math.html";
 
 /** Capability refusals are not successful executions or intended result divergences.
- * R17.6 (next/errors.ts) owns UnsupportedPlanError's stage/construct; R19 and PG's
- * overload table own the three 42883 PlanningErrors. The frozen SQL stays unchanged. */
+ * R17.6 (next/errors.ts) owns UnsupportedPlanError's stage/construct. The three ROUND
+ * overload refusals were corrected and refrozen with explicit NUMERIC inputs. */
 export type CatalogueRefusal =
   | { readonly class: "PlanningError"; readonly sqlState: "42883" }
   | {
@@ -462,9 +455,6 @@ export const CATALOGUE_REFUSALS: Readonly<Record<string, CatalogueRefusal>> = {
     stage: "execute",
     construct: "recursive",
   },
-  "guide-4": { class: "PlanningError", sqlState: "42883" },
-  "guide-5": { class: "PlanningError", sqlState: "42883" },
-  S_q7: { class: "PlanningError", sqlState: "42883" },
 };
 
 /** R21: witnesses for four frozen catalogue cells. The new executor is still compared exactly

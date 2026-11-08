@@ -262,8 +262,10 @@ false }`, CHAR(n) / CHARACTER(n) as fixed, CHAR alone as CHAR(1).
 B6's reviewed lowering is the authority for scalar, set, recursive and locking plans as well as
 joins and windows. B7 adds exact real-executor campaigns, byte-collation join keys, completed
 outer-join WHERE placement, and uncorrelated EXISTS/IN marks that avoid unsupported apply.
-The catalogue executes every cell it can and records each remaining refusal by class; its SQL
-and data stay frozen, including ROUND(float8,int4) cells that PostgreSQL refuses with 42883.
+The catalogue executes every cell it can and records each remaining refusal by class; its data
+stays frozen. The authorized S_q7/guide-4/guide-5 refreeze only casts ROUND inputs to NUMERIC;
+the harness reverses those corrections to verify the original whole-catalogue fingerprint.
+The old FLOAT8/int4 overload remains a legacy extension planned for removal at cutover under R19.
 
 Frame offsets follow PostgreSQL execution timing: ROWS/GROUPS and NULL offsets validate when
 WindowAgg starts; negative/NaN RANGE values validate at non-NULL comparisons. Ranking frames
@@ -291,3 +293,22 @@ ordered-set-only aggregate lists. Array fractions, group-key direct fractions, i
 interpolation and mixed ordinary/ordered-set lists are refused with typed UnsupportedPlanError.
 PG comparisons use real storage/executor tests; REAL's and wide BIGINT's differences from the
 shipped number model have narrow independent R21 witnesses in `testing/divergences.ts`.
+
+## Numeric ROUND execution
+
+The R19 `round(numeric,int4)` overload executes through `exec/kernels/round.ts`.
+It matches PostgreSQL's half-away-from-zero rounding, negative scales, strict NULLs,
+NaN/infinity propagation, display-scale clamp and numeric-overflow error. The scalar
+kernel has fixed charged scratch and charges wide results before construction; reused
+batches release previous wide results. One-argument numeric and float8 ROUND remain
+explicit execution refusals. Corrected S_q7 and guide-4/5 execute against original PG
+and shipped-engine rows; no new-core tolerance or changed data is used.
+
+Unary numeric spellings are classified by signed magnitude before overload resolution.
+The parser's unary-prefix form is kept distinct from explicit arithmetic: `-2147483648`
+is int4, but `(-1) * 2147483648` is int8. Decimal spellings and explicit casts keep their
+PostgreSQL types; integer arithmetic folding still preserves the resolved call type.
+
+The literal plan-cache scanner uses these signed integer ranges too, including both
+minima. Lifted slots and the client's own parameter types agree with the original
+PG-typed expression; decimal spellings and nonliteral arithmetic stay unlifted.

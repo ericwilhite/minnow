@@ -5,8 +5,8 @@
  * 1. `parameterize(text)` scans the text (no parse) and lifts each integer or plain string
  *    literal that is the whole right operand of `=` into a trailing placeholder, `$k` after the
  *    statement's own. The cache key is the rewritten text plus each lifted literal's class:
- *    integers by the magnitude of their digits (to int4, to 2^53 − 1, to int8; the front end
- *    negates in the unsigned literal's type, so `-2147483648` is in the second), or text. Texts
+ *    integers by their signed value (int4, safe int8, wide int8), or text. Both signed minima
+ *    belong to their PostgreSQL integer types. Texts
  *    that differ only in those values share a key; `42` never shares one with `5000000000` or
  *    `'42'`.
  * 2. `lowerParameterized` first types each lifted literal as lowering types it alone (the same
@@ -90,8 +90,10 @@ export function bindParameterized(
 const INT4: PhysicalType = { kind: "int32", bits: 32 };
 const INT8: PhysicalType = { kind: "int64" };
 const TEXT: PhysicalType = { kind: "text" };
+const INT4_MIN = -2147483648n;
 const INT4_MAX = 2147483647n;
 const SAFE_MAX = 9007199254740991n;
+const INT8_MIN = -9223372036854775808n;
 const INT8_MAX = 9223372036854775807n;
 
 /** Statements whose `=` operands are expressions (not DDL options or SET values). */
@@ -330,13 +332,13 @@ export function parameterize(text: string): ParameterizedText | null {
     if (!ends) continue;
     const start = negative ? (tokens[index - 1]?.start ?? token.start) : token.start;
     if (token.kind === "integer") {
-      // Classes by the digits' magnitude, sign aside: the front end types the unsigned literal,
-      // then negates it in that type (`-2147483648` is int8), so every literal of one class gets
-      // one type from lowering. Past int8 the literal is numeric, never lifted.
+      // PostgreSQL classifies the signed value, including -2^31 and -2^63. Keep safe
+      // and wide int8 families separate; lowering still checks every candidate's exact type.
+      // Past int8 the literal is numeric, never lifted.
       const digits = BigInt(text.slice(token.start, token.end));
       const value = negative ? -digits : digits;
       const spelling = text.slice(start, token.end);
-      if (digits <= INT4_MAX)
+      if (value >= INT4_MIN && value <= INT4_MAX)
         lifted.push({
           start,
           end: token.end,
@@ -347,7 +349,7 @@ export function parameterize(text: string): ParameterizedText | null {
         });
       else if (digits <= SAFE_MAX)
         lifted.push({ start, end: token.end, value, type: INT8, spelling, family: "l" });
-      else if (digits <= INT8_MAX)
+      else if (value >= INT8_MIN && value <= INT8_MAX)
         lifted.push({ start, end: token.end, value, type: INT8, spelling, family: "L" });
       continue;
     }

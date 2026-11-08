@@ -18,8 +18,8 @@ export const sampleQueries: readonly SampleQuery[] = [
     note: "A grouped scan over every completed order, bucketed with DATE_TRUNC.",
     sql: `SELECT DATE_TRUNC('month', placed_at) AS month,
        COUNT(*) AS orders,
-       ROUND(SUM(total), 2) AS revenue,
-       ROUND(AVG(total), 2) AS average_basket
+       ROUND(SUM(total)::NUMERIC, 2) AS revenue,
+       ROUND(AVG(total)::NUMERIC, 2) AS average_basket
 FROM orders
 WHERE status = 'completed'
 GROUP BY DATE_TRUNC('month', placed_at)
@@ -34,7 +34,7 @@ FROM (
   SELECT p.category,
          p.name,
          SUM(i.quantity) AS units,
-         ROUND(SUM(i.line_total), 2) AS revenue,
+         ROUND(SUM(i.line_total)::NUMERIC, 2) AS revenue,
          ROW_NUMBER() OVER (PARTITION BY p.category ORDER BY SUM(i.line_total) DESC) AS rank
   FROM order_items i
   JOIN products p ON p.product_id = i.product_id
@@ -65,8 +65,8 @@ LIMIT 10`,
        s.city,
        s.country,
        COUNT(DISTINCT o.order_id) AS orders,
-       ROUND(SUM(o.total), 2) AS revenue,
-       ROUND(SUM(o.total) / s.floor_sqm, 2) AS revenue_per_sqm
+       ROUND(SUM(o.total)::NUMERIC, 2) AS revenue,
+       ROUND((SUM(o.total) / s.floor_sqm)::NUMERIC, 2) AS revenue_per_sqm
 FROM stores s
 JOIN orders o ON o.store_id = s.store_id
 WHERE o.status = 'completed'
@@ -80,9 +80,9 @@ LIMIT 20`,
     note: "Lifetime value per customer, and how concentrated revenue really is.",
     sql: `SELECT c.loyalty_tier,
        COUNT(DISTINCT c.customer_id) AS customers,
-       ROUND(SUM(o.total), 2) AS revenue,
-       ROUND(SUM(o.total) / COUNT(DISTINCT c.customer_id), 2) AS revenue_per_customer,
-       ROUND(100.0 * SUM(o.total) / (SELECT SUM(total) FROM orders), 1) AS pct_of_revenue
+       ROUND(SUM(o.total)::NUMERIC, 2) AS revenue,
+       ROUND((SUM(o.total) / COUNT(DISTINCT c.customer_id))::NUMERIC, 2) AS revenue_per_customer,
+       ROUND((100.0 * SUM(o.total) / (SELECT SUM(total) FROM orders))::NUMERIC, 1) AS pct_of_revenue
 FROM customers c
 JOIN orders o ON o.customer_id = c.customer_id
 GROUP BY c.loyalty_tier
@@ -111,7 +111,7 @@ ORDER BY pct DESC`,
        COUNT(DISTINCT r.return_id) AS returns,
        COUNT(DISTINCT i.order_item_id) AS lines_sold,
        ROUND(100.0 * COUNT(DISTINCT r.return_id) / COUNT(DISTINCT i.order_item_id), 2) AS return_rate,
-       ROUND(SUM(COALESCE(r.refund_amount, 0)), 2) AS refunded
+       ROUND(SUM(COALESCE(r.refund_amount, 0))::NUMERIC, 2) AS refunded
 FROM order_items i
 JOIN products p ON p.product_id = i.product_id
 LEFT JOIN returns r ON r.order_item_id = i.order_item_id

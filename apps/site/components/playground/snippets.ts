@@ -153,8 +153,8 @@ console.log(hits);`,
 // \`threshold\` is bound, not interpolated — the statement the engine parses is the
 // same one every time, whatever the value is.
 const threshold = 400;
-const result = await sql<{ status: string; orders: number; revenue: number }>\`
-  SELECT status, COUNT(*) AS orders, ROUND(SUM(total), 2) AS revenue
+const result = await sql<{ status: string; orders: number; revenue: string }>\`
+  SELECT status, COUNT(*) AS orders, ROUND(SUM(total)::NUMERIC, 2) AS revenue
   FROM orders
   WHERE total > \${threshold}
   GROUP BY status

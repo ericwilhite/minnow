@@ -19,7 +19,7 @@ import type { PhysicalKind, PhysicalType } from "../../types.js";
 import { UnsupportedPlanError } from "../errors.js";
 
 /** The call kernels compile.ts dispatches to. */
-export type CallKernel = "arith" | "neg" | "coalesce" | "nullif";
+export type CallKernel = "arith" | "neg" | "coalesce" | "nullif" | "numericRound";
 
 export type Binding =
   | {
@@ -117,7 +117,11 @@ export const FUNCTION_BINDINGS: Readonly<Record<string, Binding | PerOverload>> 
   textcat: refuse("text concatenation (text kernels come next)"),
 
   abs: refuse("mathematical functions (come next)"),
-  round: refuse("mathematical functions (come next)"),
+  round: per({
+    float8: refuse("float8 ROUND (comes next)"),
+    numeric: refuse("one-argument numeric ROUND (comes next)"),
+    "numeric,int4": { kernel: "numericRound" },
+  }),
   trunc: refuse("mathematical functions (come next)"),
   ceil: refuse("mathematical functions (come next)"),
   floor: refuse("mathematical functions (come next)"),

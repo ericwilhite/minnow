@@ -227,6 +227,56 @@ function numberLiteral(value: number, exactText: string | undefined, decimal: bo
   return { expr: decimalLiteral(parsed.coefficient, parsed.scale), nullable: false, big: false };
 }
 
+/** The parser represents unary minus as -1 * operand. Recover a numeric spelling before
+ * choosing its type: -2147483648 is int4, whereas (-1) * 2147483648 is int8.
+ * An explicit arithmetic -1 has its own prefix node, so is not this parser-owned left leaf.
+ */
+function signedNumberLiteral(expression: Expression): Typed | null {
+  let operand = expression,
+    negative = false,
+    prefix = false;
+  while (
+    operand.kind === "binary" &&
+    operand.operator === "*" &&
+    operand.left.kind === "literal" &&
+    operand.left.value === -1 &&
+    operand.left.decimal !== true &&
+    operand.left.exactText === undefined &&
+    operand.left.internalSqlValue !== true
+  ) {
+    prefix = true;
+    negative = !negative;
+    operand = operand.right;
+  }
+  if (!prefix || operand.kind !== "literal") return null;
+  const sign = (text: string): string =>
+    !negative
+      ? text
+      : text.startsWith("-")
+        ? text.slice(1)
+        : `-${text.startsWith("+") ? text.slice(1) : text}`;
+  if (typeof operand.value === "number")
+    return numberLiteral(
+      negative ? -operand.value : operand.value,
+      operand.exactText === undefined ? undefined : sign(operand.exactText),
+      operand.decimal === true,
+    );
+  if (operand.internalSqlValue === true && operand.sqlDomain?.kind === "numeric") {
+    if (operand.exactText !== undefined) {
+      const text = sign(operand.exactText);
+      return numberLiteral(Number(text), text, false);
+    }
+    const parsed = parseDecimalText(String(externalSqlDomainValue(operand.value)));
+    if (parsed !== null)
+      return {
+        expr: decimalLiteral(negative ? -parsed.coefficient : parsed.coefficient, parsed.scale),
+        nullable: false,
+        big: false,
+      };
+  }
+  return null;
+}
+
 function lowerLiteral(expression: Extract<Expression, { kind: "literal" }>): Typed {
   const value = expression.value;
   if (value === null)
@@ -716,6 +766,8 @@ export function lowerExpression(
     case "wildcard":
       throw new PlanningError("* is not allowed here", "42601");
     case "binary": {
+      const signed = signedNumberLiteral(expression);
+      if (signed !== null) return signed;
       const left = lowerExpression(expression.left, scope, state);
       const right = lowerExpression(expression.right, scope, state);
       if (expression.operator === "||") {

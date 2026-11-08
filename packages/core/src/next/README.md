@@ -1161,7 +1161,7 @@ The full interface contract includes the following (DML remains unimplemented by
 - Exact types: int32 with PostgreSQL's range errors; int64 as `safe` f64 while every value stays
   within ±(2^53 − 1), recomputed exactly in BigInt64Array otherwise; floats with PostgreSQL's
   overflow, underflow and division-by-zero errors, REAL rounded with `Math.fround`; decimals with
-  per-slot scales, never rescaled to a shared maximum: f64 while exact, then the int64 and int128
+  per-slot scales, never rescaled to a shared maximum. Decimal add/subtract/multiply use f64 while exact, then the int64 and int128
   tiers in 32-bit limbs (no BigInt per value; rows grouped by scale pair, any number of pairs).
   A batch is recomputed with one BigInt per value only when a value of it passes 128 bits, an
   input is already wide, or a product passes the display-scale cap.
@@ -1178,14 +1178,21 @@ The full interface contract includes the following (DML remains unimplemented by
 - Memory: output buffers are allocated once per compiled expression; number paths allocate
   nothing per row, and a batch costs tens to a few hundred bytes of small objects (measured by
   `scripts/next-kernels-bench.mts`). Only BigInt paths (values past 128 bits, int64 past 2^53 in
-  casts and comparisons) allocate per value.
+  casts and comparisons, and ROUND outside its safe-coefficient path) allocate per value.
 - `pglite.test.ts` judges generated cases by PostgreSQL itself: every numeric type, casts, NULLs
   with garbage under them, flat/dictionary/constant operands, wide values.
 - `ir/functions.ts` (lowering's) is the one table of functions, overloads and casts (R19).
   `exec/kernels/bindings.ts` binds each entry to a kernel or refuses it with a construct key
   (`UnsupportedPlanError`, stage "execute"); `bindings.test.ts` fails on an unbound entry, a
   stale binding, or a kernel binding that does not evaluate. Not implemented yet: date, time and
-  interval arithmetic, text and math functions, casts to and from text, bounded text casts.
+  interval arithmetic, text functions, math functions other than numeric ROUND(numeric,int4),
+  casts to and from text, bounded text casts.
+- Two-argument NUMERIC ROUND (`round.ts`) follows PostgreSQL's half-away-from-zero rule,
+  including negative scales. Requested scales clamp to -131073…16383; output scale is at least
+  zero, NaN/infinities propagate, either NULL argument produces NULL, and a carry beyond
+  131072 integer digits gives 22003. Safe coefficients use number arithmetic; larger values
+  and rescaling use exact BigInt with a fixed scratch bound and charged wide results, released
+  on reuse. One-argument ROUND and float8 ROUND remain typed execution refusals.
 - NUMERIC division and modulo (`decimal-div.ts`, `DecimalDivNode`): PostgreSQL's result scale
   (`select_div_scale`: at least 16 significant digits, capped at 1000), rounded half away from
   zero; 128-bit limbs while the scaled operands fit, BigInt past that.
@@ -1330,8 +1337,11 @@ The full interface contract includes the following (DML remains unimplemented by
 
 - Memory: every typed array is charged before it is constructed, and a constructor that fails
   releases what it took. A refused growth fails the query until partitioned spill (milestone 3).
-  Not yet: GROUPING SETS, ordered-set and string/array/JSON aggregates (`UnsupportedPlanError`,
-  construct `aggregate`, refused before anything is allocated).
+  Ordinary hash aggregation still refuses GROUPING SETS and string/array/JSON aggregates
+  (`UnsupportedPlanError`, construct `aggregate`, before allocation). Numeric ordered-set-only
+  lists use `agg/ordered-set.ts`: a group sort and spillable per-group value sorts, with
+  independently reserved minimums and loan owners. Mixed ordinary/ordered-set lists, interval
+  interpolation and array/group-key fractions remain explicit refusals.
 - `aggregate-pglite.test.ts` judges generated rows and batchings by PostgreSQL, including sums
   across ±2^127, with declared reach; `groups.test.ts` checks the group tables against a model
   past several growths; `review-1.test.ts` holds the review's probes.
@@ -2015,8 +2025,8 @@ not require a home cache directory.
 - A FULL JOIN with no hash-joinable condition lowers, though PostgreSQL refuses it (0A000): an
   intended extension (R24.2), checked against PostgreSQL's LEFT JOIN UNION ALL anti-join rewrite.
 - Windows, set operations, recursive CTEs and GENERATE_SERIES, UPDATE … FROM, DELETE … USING and
-  MERGE lower too. Still refused (`UnsupportedPlanError`, stage "lower"): ordered-set and JSON
-  aggregates, JSON / array / regex functions, batch UPDATE / DELETE (`batchWrite`), LATERAL the
+  MERGE lower too. Numeric ordered sets lower with constant/parameter scalar fractions.
+  Still refused (`UnsupportedPlanError`, stage "lower"): JSON aggregates, JSON / array / regex functions, batch UPDATE / DELETE (`batchWrite`), LATERAL the
   decorrelator cannot remove, full-text search. `INVENTORY.md` has every construct's status.
 - `testing/lowering-differential.test.ts` runs DDL, seed rows, queries (joins, subqueries,
   windows, set operations, recursion included), writes, RETURNING and failing writes through the

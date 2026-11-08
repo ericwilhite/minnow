@@ -26749,8 +26749,8 @@
     {
       "id": "S_q7",
       "dataset": "star",
-      "sql": "WITH product_revenue AS (SELECT p.category AS category, i.product_id AS product_id, SUM(i.quantity * i.unit_price) AS revenue FROM order_items i JOIN products p ON p.product_id = i.product_id GROUP BY p.category, i.product_id), ranked AS (SELECT category, product_id, revenue, DENSE_RANK() OVER (PARTITION BY category ORDER BY ROUND(revenue, 4) DESC, product_id) AS rank FROM product_revenue) SELECT category, product_id, revenue, rank FROM ranked WHERE rank <= 3 ORDER BY category, rank",
-      "lowered": false
+      "sql": "WITH product_revenue AS (SELECT p.category AS category, i.product_id AS product_id, SUM(i.quantity * i.unit_price) AS revenue FROM order_items i JOIN products p ON p.product_id = i.product_id GROUP BY p.category, i.product_id), ranked AS (SELECT category, product_id, revenue, DENSE_RANK() OVER (PARTITION BY category ORDER BY ROUND(revenue::numeric, 4) DESC, product_id) AS rank FROM product_revenue) SELECT category, product_id, revenue, rank FROM ranked WHERE rank <= 3 ORDER BY category, rank",
+      "lowered": true
     },
     {
       "id": "S_q8",
@@ -26833,14 +26833,14 @@
     {
       "id": "guide-4",
       "dataset": "retail",
-      "sql": "SELECT s.name AS store, COUNT(*) AS orders, ROUND(SUM(o.total), 2) AS revenue\nFROM stores s\nJOIN orders o ON o.store_id = s.store_id\nLEFT JOIN employees e ON e.employee_id = o.employee_id\nWHERE o.status = 'completed'\nGROUP BY s.store_id, s.name\nORDER BY revenue DESC",
-      "lowered": false
+      "sql": "SELECT s.name AS store, COUNT(*) AS orders, ROUND(SUM(o.total)::NUMERIC, 2) AS revenue\nFROM stores s\nJOIN orders o ON o.store_id = s.store_id\nLEFT JOIN employees e ON e.employee_id = o.employee_id\nWHERE o.status = 'completed'\nGROUP BY s.store_id, s.name\nORDER BY revenue DESC",
+      "lowered": true
     },
     {
       "id": "guide-5",
       "dataset": "retail",
-      "sql": "SELECT p.category,\n       COUNT(*) AS lines,\n       COUNT(DISTINCT i.order_id) AS baskets,\n       ROUND(SUM(i.line_total), 2) AS revenue,\n       ROUND(AVG(i.line_total), 2) AS average_line,\n       MIN(i.unit_price) AS cheapest,\n       MAX(i.unit_price) AS dearest\nFROM order_items i\nJOIN products p ON p.product_id = i.product_id\nGROUP BY p.category\nHAVING SUM(i.line_total) > 10000\nORDER BY revenue DESC",
-      "lowered": false
+      "sql": "SELECT p.category,\n       COUNT(*) AS lines,\n       COUNT(DISTINCT i.order_id) AS baskets,\n       ROUND(SUM(i.line_total)::NUMERIC, 2) AS revenue,\n       ROUND(AVG(i.line_total)::NUMERIC, 2) AS average_line,\n       MIN(i.unit_price) AS cheapest,\n       MAX(i.unit_price) AS dearest\nFROM order_items i\nJOIN products p ON p.product_id = i.product_id\nGROUP BY p.category\nHAVING SUM(i.line_total) > 10000\nORDER BY revenue DESC",
+      "lowered": true
     },
     {
       "id": "guide-6",

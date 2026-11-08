@@ -17,6 +17,20 @@ sort and spill pool. This does not change the shipped SQL engine or public API. 
 are unchanged; no migration is needed. Interval interpolation and mixing ordered-set calls with
 ordinary aggregates remain explicitly unsupported in the rebuild core.
 
+The unexported rebuild core also executes two-argument `ROUND(numeric, int4)` with
+PostgreSQL's exact decimal rounding, result scales, special values and overflow errors.
+Signed integer literals keep PostgreSQL's boundary types during lowering, so the minimum
+int4 literal is accepted as a ROUND scale; arithmetic expressions keep their resolved types.
+The rebuild's literal plan-cache scanner keeps those signed types too.
+One-argument ROUND and float ROUND remain unsupported there. Public API and stored formats
+are unchanged; no migration is needed.
+
+Retail console queries and the analytics catalogue now cast plain-number inputs to `NUMERIC`
+before two-argument `ROUND`, matching PostgreSQL's overload. The SELECT guide already used
+this form. The legacy float overload is planned for removal when the rebuilt engine becomes
+the default. This changes example SQL, not the shipped runtime, public API or stored format;
+no migration is needed.
+
 ## 0.20.0 — November 7, 2026
 
 Release packages: `@minnowdb/core@0.20.0`.
