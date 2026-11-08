@@ -7,12 +7,14 @@
  *    Default: a fraction of `navigator.deviceMemory` when reported, otherwise a fixed conservative
  *    value; the single public option overrides it. `usedBytes` never exceeds the cap.
  * 2. **Admission, not refusal.** Every pipeline is admitted with its minimum before it runs
- *    (`admit`). If the minimum does not fit, admission **waits** (FIFO) while the cache is evicted
+ *    (`admit`, or one `admitGroup` split into native budgets). If the minimum does not fit,
+ *    admission **waits** (FIFO) while the cache is evicted
  *    and spillable grants are asked to give memory back; it never fails for size.
  * 3. **Bounded minimums.** A pipeline's minimum is fixed by its plan, never by data: the batch
  *    buffers of its operators at `batchTargetFor` bytes per batch (fewer rows for wide rows),
  *    hash-table and run headers, and spill I/O buffers. A minimum above `cap − reserve` is a
- *    planner bug (`MemoryAdmissionError`, a `RangeError`), not a query-size refusal.
+ *    planner bug (`MemoryAdmissionError`, a `RangeError`), not a query-size refusal. An explicit
+ *    `admitGroup` including all its private progress may instead use the whole cap.
  *    Caller-supplied parameters are non-spillable inputs: their conversion/storage bound is
  *    admitted atomically with those fixed buffers, and must fit normal capacity too.
  * 4. **Held vs allocated.** A grant *holds* bytes from the governor (its minimum, growth, loan)
@@ -27,8 +29,10 @@
  * 5. **Progress is scheduled apart from admission.** An operator that cannot progress by spilling
  *    (one value larger than a batch, a result frame waiting for credit, a spill buffer it must fill
  *    before it can free anything) `borrow`s a **loan**. Loans are served first-come, before any
- *    admission, and may use the progress reserve (`reserveBytes`), which admissions and growth
- *    never take. What this proves, and no more: a queued admission, growth or the cache can never
+ *    admission, and may use the progress reserve (`reserveBytes`), which ordinary admissions and
+ *    growth never take. Complete private-progress groups instead fund progress internally; their
+ *    credit is not available for legacy shared loans. For ordinary admissions, what this proves,
+ *    and no more: a queued admission, growth or the cache can never
  *    delay a loan; a loan waits only for earlier loans to be repaid. So progress is guaranteed if
  *    every loan holder repays without waiting on anything that itself needs memory (the operator
  *    rule: a loan covers one bounded step). A grant has at most one loan and repays it before
@@ -146,6 +150,10 @@ export interface MemoryGovernor {
   readonly usedBytes: number;
   readonly peakBytes: number;
   admit(options: AdmitOptions): Promise<Grant>;
+  /** One FIFO admission, then an atomic split. A zero-total group needs no shared capacity. */
+  admitGroup(options: NativeGrantGroupOptions): Promise<readonly Grant[]>;
+  /** Moves idle ordinary credit within this owner. No allocation or global admission occurs. */
+  transferCredit(source: Grant, target: Grant, bytes: number): boolean;
   /**
    * Synchronous admission for the point-read fast path: the grant when nothing is queued and the
    * minimum fits now (after evicting cache), else null; the caller then uses `admit`. It never
@@ -163,6 +171,19 @@ export interface MemoryGovernor {
      */
     unregister?(): void;
   };
+}
+
+/** Named parts of one complete minimum. Each part remains a normal native grant. */
+export interface NativeGrantGroupOptions {
+  readonly label: string;
+  readonly grants: ReadonlyArray<{
+    readonly label: string;
+    readonly minimumBytes: number;
+    readonly spillable: boolean;
+  }>;
+  readonly signal?: AbortSignal;
+  /** The total includes private progress credit; its consumers never need the shared reserve. */
+  readonly includesProgress?: boolean;
 }
 
 /** A non-spillable input or a fixed minimum cannot fit the owner's normal capacity. */
@@ -218,6 +239,7 @@ interface Request {
   readonly label: string;
   readonly spillable: boolean;
   readonly loan: boolean;
+  readonly includesProgress?: boolean;
   readonly resolve: (grant: GrantImpl) => void;
   readonly reject: (reason: unknown) => void;
   readonly detach: () => void;
@@ -340,8 +362,8 @@ export class Governor implements MemoryGovernor {
   }
 
   /**
-   * Bytes missing for a request: loans may use the whole cap; admissions and growth must also fit
-   * `cap − reserve` counting everything except loans.
+   * Bytes missing for a request: loans and complete private-progress groups may use the whole
+   * cap; ordinary admissions and growth must also fit `cap − reserve` excluding shared loans.
    */
   #missing(bytes: number, loan: boolean): number {
     const total = this.usedBytes + bytes - this.capBytes;
@@ -447,10 +469,11 @@ export class Governor implements MemoryGovernor {
 
   #serve(queue: Request[], loan: boolean): void {
     for (let request = queue[0]; request !== undefined; request = queue[0]) {
-      if (!this.#room(request.bytes, loan)) {
+      const wholeMinimum = loan || request.includesProgress === true;
+      if (!this.#room(request.bytes, wholeMinimum)) {
         for (const grant of [...this.#grants])
           if (grant.spillable && grant !== request.grant) grant.reclaim?.(request.bytes);
-        if (!this.#room(request.bytes, loan)) return;
+        if (!this.#room(request.bytes, wholeMinimum)) return;
       }
       // A callback may have cancelled or served the head while we asked for room.
       if (queue[0] !== request) continue;
@@ -518,6 +541,94 @@ export class Governor implements MemoryGovernor {
       },
       options.signal,
     );
+  }
+
+  async admitGroup(options: NativeGrantGroupOptions): Promise<readonly Grant[]> {
+    const { label, signal, includesProgress } = options;
+    // Copy before waiting: the caller cannot change the named minima after admission queues.
+    const parts = options.grants.map(({ label, minimumBytes, spillable }) => ({
+      label,
+      minimumBytes,
+      spillable,
+    }));
+    let total = 0;
+    const labels = new Set<string>();
+    for (const part of parts) {
+      if (!Number.isSafeInteger(part.minimumBytes) || part.minimumBytes < 0)
+        throw new RangeError("A native grant minimum must be a nonnegative safe integer");
+      if (labels.has(part.label)) throw new RangeError("Native grant labels must be unique");
+      labels.add(part.label);
+      total += part.minimumBytes;
+      if (!Number.isSafeInteger(total)) throw new RangeError("Native grant total overflow");
+    }
+    signal?.throwIfAborted();
+    if (total === 0) {
+      const grants = parts.map((part) => new GrantImpl(this, part.label, part.spillable));
+      for (const grant of grants) this.#grants.add(grant);
+      return grants;
+    }
+    if (includesProgress === true && total > this.capBytes)
+      throw new MemoryAdmissionError(label, total, this.capBytes);
+    const admitted =
+      includesProgress === true
+        ? await this.#enqueue(
+            this.#admissions,
+            {
+              bytes: total,
+              loan: false,
+              grant: null,
+              label,
+              spillable: false,
+              includesProgress: true,
+            },
+            signal,
+          )
+        : await this.admit({
+            label,
+            minimumBytes: total,
+            spillable: false,
+            ...(signal === undefined ? {} : { signal }),
+          });
+    try {
+      signal?.throwIfAborted();
+      if (!(admitted instanceof GrantImpl) || admitted.governor !== this || admitted.closed)
+        throw new TypeError("A grant group requires this owner's native admission");
+      if (admitted.held !== total || admitted.allocated !== 0 || admitted.loaned !== 0)
+        throw new TypeError("The group admission was changed before it could split");
+      // No call out or suspension while ownership moves. Peak/used stay charged once.
+      const grants = parts.map((part) => new GrantImpl(this, part.label, part.spillable));
+      for (let index = 0; index < grants.length; index++) {
+        const grant = grants[index];
+        const part = parts[index];
+        if (grant === undefined || part === undefined) throw new Error("Grant group length");
+        admitted.held -= part.minimumBytes;
+        grant.held = part.minimumBytes;
+        this.#grants.add(grant);
+      }
+      return grants;
+    } finally {
+      admitted.close();
+    }
+  }
+
+  transferCredit(source: Grant, target: Grant, bytes: number): boolean {
+    if (!Number.isSafeInteger(bytes) || bytes < 0)
+      throw new RangeError("Credit transfer bytes must be a nonnegative safe integer");
+    if (
+      !(source instanceof GrantImpl) ||
+      !(target instanceof GrantImpl) ||
+      source.governor !== this ||
+      target.governor !== this ||
+      source.closed ||
+      target.closed ||
+      (bytes > 0 && bytes > source.held - source.allocated - source.loaned)
+    )
+      return false;
+    if (source !== target) {
+      source.held -= bytes;
+      target.held += bytes;
+    }
+    return true;
   }
 
   tryAdmit(options: Omit<AdmitOptions, "signal">): Grant | null {

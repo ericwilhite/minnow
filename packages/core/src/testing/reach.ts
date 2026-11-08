@@ -1712,3 +1712,30 @@ export const JSON_TABLE_NULL_REACH = [
   "single NULL",
   "NULL-only prefix",
 ] as const;
+
+/** Native groups acquire one complete minimum; moving its ordinary credit never re-admits. */
+export const NATIVE_CREDIT_STATES = [
+  "private progress group",
+  "transfer keeps queued admission waiting",
+  "named native split",
+  "same owner transfer",
+  "live allocation protected",
+  "loan credit protected",
+  "foreign owner refused",
+  "closed side refused",
+  "close returns exact holdings",
+  "queued group holds nothing",
+  "zero group takes no credit",
+  "queued cancellation",
+  "queued request snapshot",
+  "invalid credit rejected",
+  "invalid group rejected",
+  "served cancellation",
+] as const;
+
+/** Required in the B1 integration, whose cache can take allocated native credit. */
+export const NATIVE_CREDIT_CACHE_STATES = [
+  "takeover owns real buffer",
+  "transfer after takeover",
+  "close leaves retained owner paid",
+] as const;
