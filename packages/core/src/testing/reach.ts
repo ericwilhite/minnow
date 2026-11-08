@@ -1141,3 +1141,36 @@ export const OWNER_EXPORT_DATA_REACH = {
   views: ["first view partial", "later alias partial"],
   preconnect: ["close before connect", "cancel before connect", "concurrent next refused"],
 } as const;
+
+/** The owner cache exercises successful families, refusal fallbacks, binding and bounded retention. */
+export const OWNER_PLAN_CACHE_STATES = [
+  "integer template",
+  "text template",
+  "marker fallback",
+  "transaction query",
+  "bound write",
+  "client parameters",
+  "cache eviction",
+] as const;
+
+/** Owner plan retention is bounded by bytes, reclaimable, and LRU across all entry kinds. */
+export const OWNER_PLAN_CACHE_POLICY_STATES = [
+  "raw charged",
+  "template charged",
+  "marker charged",
+  "oversized refused",
+  "byte eviction",
+  "governor reclaim",
+  "close releases",
+  "raw LRU",
+  "template LRU",
+  "mixed LRU",
+] as const;
+
+/** Private uncommitted-schema plans carry the same accounting and end with their transaction. */
+export const OWNER_PRIVATE_PLAN_CACHE_STATES = [
+  "private charged",
+  "private rollback",
+  "private commit",
+  "private close",
+] as const;

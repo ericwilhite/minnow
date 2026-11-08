@@ -185,9 +185,10 @@ describe("replies and resends (findings 1, 3, 5, 11)", () => {
   });
 });
 
+// Frame-only accounting tests disable plan retention; the cache has its own charge/reclaim campaign.
 describe("frames and their charge (findings 9, 10, 12)", () => {
   it("frees a finished cursor's frames when the client closes it", async () => {
-    const { connect, server, executor, governor } = harness();
+    const { connect, server, executor, governor } = harness({ planCacheSize: 0 });
     const client = await connect();
     await seed(client, 3);
     const cursor = client.cursor("SELECT * FROM t");
@@ -212,7 +213,7 @@ describe("frames and their charge (findings 9, 10, 12)", () => {
   });
 
   it("frees a live point read's frame when its cursor is closed", async () => {
-    const { connect, executor, governor } = harness();
+    const { connect, executor, governor } = harness({ planCacheSize: 0 });
     const client = await connect();
     await seed(client, 1);
     client.liveness(true);
@@ -268,7 +269,7 @@ describe("frames and their charge (findings 9, 10, 12)", () => {
   });
 
   it("charges an autocommit write's RETURNING spool until it is delivered", async () => {
-    const { connect, writePath, governor } = harness({ autoFlush: false });
+    const { connect, writePath, governor } = harness({ autoFlush: false, planCacheSize: 0 });
     const client = await connect();
     const created = client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
     await flushUntil(writePath, created);
@@ -308,7 +309,7 @@ describe("cancellation and failed commits (findings 2, 4)", () => {
   });
 
   it("ends an autocommit RETURNING request whose durability fails", async () => {
-    const { connect, writePath, governor } = harness();
+    const { connect, writePath, governor } = harness({ planCacheSize: 0 });
     const client = await connect();
     await seed(client, 1);
     const commit = writePath.commit.bind(writePath);

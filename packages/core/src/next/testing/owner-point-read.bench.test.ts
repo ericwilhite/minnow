@@ -11,8 +11,8 @@
  *   stand-in has no key index (B3's is not on main), so its key lookup scans the table and its
  *   cost is not the real executor's. R6's absolute target for the whole read is judged once B3's
  *   write path and B4's executor replace the stand-ins.
- * - **Literal statements** (`WHERE id = 7`, a new text per key) are reported: past the plan cache
- *   every one is lowered again, which is what the split shows.
+ * - **Literal statements** (`WHERE id = 7`, a new text per key) share an auto-parameterized
+ *   template: warm reads must neither lower nor prepare again, even past 512 distinct texts.
  *
  * Every read must take the synchronous path; the timing bounds are loose (shared machines), the
  * printed numbers are the measurement. The timing wrappers add well under a µs per call.
@@ -41,6 +41,7 @@ function quantile(sorted: readonly number[], q: number): number {
 interface Meter {
   ms: number;
   calls: number;
+  plans?: number;
 }
 const depth = { value: 0 };
 
@@ -91,6 +92,8 @@ function metered<T extends object>(target: T, meter: Meter, deep: boolean): T {
           if (outer) {
             meter.ms += performance.now() - start;
             meter.calls++;
+            if (meter.plans !== undefined && (prop === "lower" || prop === "lowerParameterized"))
+              meter.plans++;
           }
         }
       };
@@ -100,7 +103,7 @@ function metered<T extends object>(target: T, meter: Meter, deep: boolean): T {
 
 async function setup() {
   const meters = {
-    lowering: { ms: 0, calls: 0 },
+    lowering: { ms: 0, calls: 0, plans: 0 },
     execution: { ms: 0, calls: 0 },
     writePath: { ms: 0, calls: 0 },
   };
@@ -330,7 +333,7 @@ describe("point read (R6)", () => {
         const key = 1 + (i % ROWS);
         const before = {
           lowering: meters.lowering.ms,
-          calls: meters.lowering.calls,
+          calls: meters.lowering.plans,
           execution: meters.execution.ms,
           writePath: meters.writePath.ms,
           prepares: executor.prepared,
@@ -364,7 +367,7 @@ describe("point read (R6)", () => {
         const lowering = (meters.lowering.ms - before.lowering) * 1000;
         const execution = (meters.execution.ms - before.execution) * 1000;
         const writePath = (meters.writePath.ms - before.writePath) * 1000;
-        lowerCalls += meters.lowering.calls - before.calls;
+        lowerCalls += meters.lowering.plans - before.calls;
         executorPrepares += executor.prepared - before.prepares;
         parts.total.push(total);
         parts.lowering.push(lowering);
@@ -409,8 +412,10 @@ describe("point read (R6)", () => {
     // …and none is prepared again by the executor (the composition caches it per plan).
     expect(preparedReads.executorPrepares).toBe(0);
     expect(textReads.executorPrepares).toBe(0);
-    // A literal per key outgrows the plan cache: every warm read is lowered.
-    expect(literalReads.lowerCalls).toBe(literalReads.warm);
+    // More literal texts than cache entries still share one template and executor preparation.
+    expect(literalReads.lowerCalls).toBe(0);
+    expect(literalReads.executorPrepares).toBe(0);
+    expect(literalReads.synchronous).toBe(READS / 4);
     expect(server.stats.outstandingFrames).toBe(0);
 
     // Reference: a whole request/response over an in-process MessageChannel.

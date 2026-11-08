@@ -126,7 +126,7 @@ keep the same instance, isolated or not, and 2359 keeps it on a page that is not
 multi-tab owner case that hangs only on 2359 is likely this, not OPFS. The rebuild core's owner
 protocol survives it: every broker request is bounded and retried, and each broker instance
 announces an id so clients resend and owners register again;
-`packages/core/src/next/owner/webkit-sharedworker.md` has the measurements and the repro.
+[the SharedWorker restart note](https://github.com/ericwilhite/minnow/blob/main/packages/core/src/next/owner/webkit-sharedworker.md) has the measurements and the repro.
 
 The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push and pull
 request, spread across parallel jobs. One job runs the format, type, lint, build, API contract, and

@@ -1454,6 +1454,9 @@ const SPIN = /^\s*SELECT\s+spin\(\$1\)\s*;?\s*$/iu;
  */
 export function withTestStatements(lowerer: StatementPlanner): StatementPlanner {
   return {
+    parameterize: (text) => lowerer.parameterize(text),
+    lowerParameterized: (parameterized, context) =>
+      lowerer.lowerParameterized(parameterized, context),
     lower(text: string, context: PlannerContext): LoweredStatement {
       if (!SPIN.test(text)) return lowerer.lower(text, context);
       const INT: PhysicalType = { kind: "int32", bits: 32 };

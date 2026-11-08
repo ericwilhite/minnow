@@ -52,6 +52,11 @@ import { ResultChannel, type ResultFrame, type ResultStream } from "../exec/resu
 import type { ChunkReads } from "../exec/scan.js";
 import type { ExecutorCosts } from "../ir/costs.js";
 import type { OutputColumn, PhysicalPlan } from "../ir/ir.js";
+import {
+  bindParameterized,
+  type ParameterizedPlan,
+  type NotParameterizable,
+} from "../lower/parameterize.js";
 import { statisticsDrifted, type PlanningStatistics } from "../lower/statistics.js";
 import type { MemoryGovernor } from "../memory/governor.js";
 import { ReturnPool } from "../exec/return-pool.js";
@@ -59,6 +64,7 @@ import type { SpillService } from "../spill/contract.js";
 import { PG_EPOCH_UNIX_MICROS } from "../temporal.js";
 import { UnsupportedPlanError } from "../errors.js";
 import { RuleCache } from "./rule-cache.js";
+import { PlanCache } from "./plan-cache.js";
 import { requestsReadOnly } from "./sequence.js";
 import type {
   EngineSession,
@@ -79,7 +85,12 @@ import {
 } from "./errors.js";
 import type { WireInputColumn } from "./frame.js";
 import type { OwnerLedger } from "./outcomes.js";
-import type { LoweredModify, LoweredStatement, StatementPlanner } from "./planner.js";
+import type {
+  LoweredModify,
+  LoweredStatement,
+  StatementPlanner,
+  PlannerContext,
+} from "./planner.js";
 import type { TransactionState, WireColumnMeta, WireValue } from "./protocol.js";
 
 export interface ComposeOptions {
@@ -107,13 +118,32 @@ export interface ComposeOptions {
   readonly rules?: (catalog: CatalogView, tableId: number) => TableRules;
   /** Device clock in ms (the statement clock and the ledger's). */
   readonly now?: () => number;
-  /** Plans kept per catalog version; default 512. */
+  /** Shared templates, refusal markers and full-text plans retained across catalogs; default 512. */
   readonly planCacheSize?: number;
+  /** Maximum retained plan/key/marker bytes; default 4 MiB. Zero disables retention. */
+  readonly planCacheBytes?: number;
   /** The idle-transaction timeout the server applies (reported in errors). */
   readonly transactionIdleTimeoutMs?: number;
 }
 
-const DEFAULT_PLAN_CACHE = 512;
+type CachedPlan =
+  | PlannedStatement
+  | NotParameterizable
+  | {
+      readonly kind: "parameterized";
+      readonly template: ParameterizedPlan;
+      readonly planned: PlannedStatement;
+    };
+function boundParameters(
+  statement: PlannedStatement,
+  params: readonly WireValue[],
+): readonly WireValue[] {
+  const binding = statement.parameterization;
+  // The public binder appends only number/bigint/string literals to these wire values.
+  return binding === undefined
+    ? params
+    : (bindParameterized(binding.template, binding.text, params) as WireValue[]);
+}
 
 const toOutputColumns = (columns: readonly WireColumnMeta[]): OutputColumn[] =>
   columns.map((column) => ({ name: column.name, type: column.type, nullable: column.nullable }));
@@ -245,7 +275,8 @@ class ComposedEngine implements OwnerEngine {
   }
   readonly #options: ComposeOptions & { readonly executor: Executor };
   readonly #now: () => number;
-  readonly #plans = new Map<string, PlannedStatement>();
+  readonly #plans: PlanCache<CachedPlan>;
+  readonly #sessionPlans = new Set<PlanCache<PlannedStatement>>();
   readonly #statistics: PlanningStatistics;
   /** Compiled table rules for the committed catalog (rule-cache.ts). */
   readonly #rules: RuleCache;
@@ -259,6 +290,7 @@ class ComposedEngine implements OwnerEngine {
     this.#now = options.now ?? Date.now;
     this.#statistics = options.statistics ?? { table: () => null };
     this.#rules = new RuleCache(options.governor);
+    this.#plans = new PlanCache(options.governor, options.planCacheSize, options.planCacheBytes);
   }
 
   /**
@@ -319,7 +351,7 @@ class ComposedEngine implements OwnerEngine {
     return ++this.#sessionId;
   }
 
-  #context(catalog: CatalogView) {
+  #context(catalog: CatalogView): PlannerContext {
     return { catalog, statistics: this.#statistics, costs: this.#options.costs ?? EXECUTOR_COSTS };
   }
 
@@ -328,24 +360,59 @@ class ComposedEngine implements OwnerEngine {
     return toPlanned(this.#options.planner.lower(text, this.#context(catalog)));
   }
 
-  /**
-   * The cached plan of `text` at `catalog`'s version, re-lowered when the row counts it was
-   * costed on drifted (lower/statistics.ts `statisticsDrifted`).
-   */
+  #drifted(statement: LoweredStatement): boolean {
+    return (
+      "basis" in statement &&
+      statement.basis.length > 0 &&
+      statisticsDrifted(statement.basis, this.#statistics)
+    );
+  }
+
+  /** Public lowering results/markers use normalized keys; raw constants use full text only. */
   plan(text: string, catalog: CatalogView = this.#options.writePath.catalog): PlannedStatement {
-    const key = `${String(catalog.version)}\u0000${text}`;
+    const context = this.#context(catalog);
+    const prefix = `${String(catalog.version)}\u0000${JSON.stringify(context.parameterTypes ?? [])}\u0000`;
+    const parameterized = this.#options.planner.parameterize(text);
+    if (parameterized !== null) {
+      const key = `${prefix}normalized\u0000${parameterized.key}`;
+      let cached = this.#plans.get(key);
+      if (cached?.kind === "parameterized" && this.#drifted(cached.template.statement)) {
+        this.#plans.delete(key);
+        cached = undefined;
+      }
+      if (
+        cached === undefined ||
+        (cached.kind !== "parameterized" && cached.kind !== "notParameterizable")
+      ) {
+        const result = this.#options.planner.lowerParameterized(parameterized, context);
+        cached =
+          result.kind === "notParameterizable"
+            ? result
+            : {
+                kind: "parameterized",
+                template: result,
+                planned: toPlanned(result.statement),
+              };
+        this.#plans.set(key, cached);
+      }
+      if (cached.kind === "parameterized")
+        return {
+          ...cached.planned,
+          text,
+          parameterization: { template: cached.template, text: parameterized },
+        };
+    }
+    const key = `${prefix}text\u0000${text}`;
     const cached = this.#plans.get(key);
     if (
       cached !== undefined &&
-      !("basis" in cached.lowered && statisticsDrifted(cached.lowered.basis, this.#statistics))
+      cached.kind !== "parameterized" &&
+      cached.kind !== "notParameterizable" &&
+      !this.#drifted(cached.lowered)
     )
       return cached;
-    const lowered = this.#options.planner.lower(text, this.#context(catalog));
-    const planned = toPlanned(lowered);
-    if (this.#plans.size >= (this.#options.planCacheSize ?? DEFAULT_PLAN_CACHE)) {
-      const oldest = this.#plans.keys().next();
-      if (oldest.done !== true) this.#plans.delete(oldest.value);
-    }
+    if (cached !== undefined) this.#plans.delete(key);
+    const planned = toPlanned(this.#options.planner.lower(text, context));
     this.#plans.set(key, planned);
     return planned;
   }
@@ -370,6 +437,21 @@ class ComposedEngine implements OwnerEngine {
       generation,
       sessionId ?? `${clientId}:${String(this.nextSessionId())}`,
     );
+  }
+
+  privatePlans(): PlanCache<PlannedStatement> {
+    const cache = new PlanCache<PlannedStatement>(
+      this.#options.governor,
+      this.#options.planCacheSize,
+      this.#options.planCacheBytes,
+    );
+    this.#sessionPlans.add(cache);
+    return cache;
+  }
+
+  closePrivatePlans(cache: PlanCache<PlannedStatement>): void {
+    cache.close();
+    this.#sessionPlans.delete(cache);
   }
 
   readSet(statement: PlannedStatement): readonly number[] {
@@ -403,6 +485,9 @@ class ComposedEngine implements OwnerEngine {
     } finally {
       // The committed catalog's rules go with the engine, whether or not the write path closed.
       this.#rules.close();
+      this.#plans.close();
+      for (const cache of this.#sessionPlans) cache.close();
+      this.#sessionPlans.clear();
     }
   }
 }
@@ -479,7 +564,7 @@ class ComposedSession implements EngineSession {
    * Plans against this transaction's own schema changes (uncommitted DDL): private to the
    * session, dropped when the transaction ends or rolls back to a savepoint.
    */
-  readonly #privatePlans = new Map<string, PlannedStatement>();
+  #privatePlans: PlanCache<PlannedStatement> | null = null;
   /** Rules against this transaction's own schema changes, on the same lifetime as its plans. */
   #txRules: RuleCache | null = null;
   /** Affected rows per table of the open transaction, for its COMMIT's frame and outcome. */
@@ -517,10 +602,12 @@ class ComposedSession implements EngineSession {
     // transaction could reach the same version number with different contents.
     if (this.#tx === null || catalog.version === this.#writePath().catalog.version)
       return this.#engine.plan(text, catalog);
-    const cached = this.#privatePlans.get(text);
+    const cache = (this.#privatePlans ??= this.#engine.privatePlans());
+    const cached = cache.get(text);
     if (cached?.catalogVersion === catalog.version) return cached;
+    if (cached !== undefined) cache.delete(text);
     const planned = this.#engine.lower(text, catalog);
-    this.#privatePlans.set(text, planned);
+    cache.set(text, planned);
     return planned;
   }
 
@@ -591,7 +678,7 @@ class ComposedSession implements EngineSession {
     this.#readOnly = false;
     this.#startedAtMs = null;
     this.#savepoints = [];
-    this.#privatePlans.clear();
+    this.#privatePlans?.clear();
     this.#txRules?.clear();
     this.#txCounts = {};
   }
@@ -638,7 +725,7 @@ class ComposedSession implements EngineSession {
     try {
       execution = this.#execute(
         lowered.plan,
-        params,
+        boundParameters(statement, params),
         context,
         { snapshot: pin, statement: null },
         "atExecuted",
@@ -699,9 +786,9 @@ class ComposedSession implements EngineSession {
     const lowered = statement.lowered;
     switch (lowered.kind) {
       case "query":
-        return this.#query(lowered, params, context);
+        return this.#query(lowered, boundParameters(statement, params), context);
       case "modify":
-        return this.#modify(lowered, params, context);
+        return this.#modify(lowered, boundParameters(statement, params), context);
       case "ddl":
         return this.#ddl(lowered, context);
       case "transactionControl":
@@ -957,7 +1044,8 @@ class ComposedSession implements EngineSession {
         throw error;
       }
       if (lowered.followUp !== null) {
-        const followUp = this.plan(lowered.followUp).lowered;
+        const plannedFollowUp = this.plan(lowered.followUp);
+        const followUp = plannedFollowUp.lowered;
         if (followUp.kind !== "modify") throw new TypeError("A DDL follow-up must be a write");
         const next = tx.statement({
           rules: this.#rules(() => next.catalog),
@@ -965,7 +1053,7 @@ class ComposedSession implements EngineSession {
         });
         const execution = this.#execute(
           followUp.plan,
-          [],
+          boundParameters(plannedFollowUp, []),
           context,
           { snapshot: null, statement: next },
           "atExecuted",
@@ -1051,7 +1139,7 @@ class ComposedSession implements EngineSession {
           if (entry.savepoint !== null) this.#tx?.rollbackTo(entry.savepoint);
           this.#savepoints.length = index + 1;
           this.#txCounts = { ...entry.counts };
-          this.#privatePlans.clear();
+          this.#privatePlans?.clear();
           this.#txRules?.clear();
           if (this.#state === "failed") this.#state = "open";
         }
@@ -1183,8 +1271,12 @@ class ComposedSession implements EngineSession {
   }
 
   close(): void {
-    this.rollback();
-    this.#txRules?.close();
-    this.#txRules = null;
+    try {
+      this.rollback();
+    } finally {
+      if (this.#privatePlans !== null) this.#engine.closePrivatePlans(this.#privatePlans);
+      this.#txRules?.close();
+      this.#txRules = null;
+    }
   }
 }
