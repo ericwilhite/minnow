@@ -1668,6 +1668,13 @@ The full interface contract includes the following (DML remains unimplemented by
   None met the component median-versus-spread rule, so none is selected by the executor.
   Sorting prototypes cover only flat, all-valid varlen input; the aligned-word prototype also
   requires native little-endian words. These are not new supported execution paths.
+- `scripts/next-wide-typed-bench.mts --rows 1000000 --repeats 7` compares the wide
+  catalogue aggregation with its plain typed-array kernels, over already decoded inputs.
+  Every page has its own first-seen dictionary ordering. Dictionary translation, grouping,
+  transitions and final group ordering are timed; scan, storage and SQL are excluded. The
+  harness checks every result against the plain kernels and preserves AVG's Sxx transitions.
+  `scripts/wide-decoded-fixture.test.ts` also judges all 21 outputs against PostgreSQL.
+  These are Node diagnostic measurements, not browser Gate B results.
 - Scan statistics hints (future; pre-sizing and AVG Sxx skipping are deferred).
   High-cardinality pre-sizing is deferred. The scan would need to supply a conservative NDV
   estimate for the grouping expressions (not merely a row count), its scope across pages and

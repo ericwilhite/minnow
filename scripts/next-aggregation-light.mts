@@ -11,7 +11,10 @@ import type { AggregateCall, Rel } from "../packages/core/dist/next/ir/ir.js";
 import type { PhysicalType } from "../packages/core/dist/next/types.js";
 import type { StorageCore } from "../packages/core/dist/next/testing/storage-core.js";
 import { valueAt } from "../packages/core/dist/next/exec/kernels/test-support.js";
-import { AggregateOperator } from "../packages/core/dist/next/exec/agg/aggregate.js";
+import {
+  AggregateOperator,
+  type AggregateOptions,
+} from "../packages/core/dist/next/exec/agg/aggregate.js";
 import { SortOperator } from "../packages/core/dist/next/exec/sort.js";
 import { OutputArena } from "../packages/core/dist/next/exec/kernels/vectors.js";
 import { drive, type Operator } from "../packages/core/dist/next/exec/pipeline.js";
@@ -51,8 +54,9 @@ export async function lightComparison(
   captured: readonly Batch[],
   rounds: number,
   directory: string,
-  pipeline: () => Promise<{ rows: number }>,
-  feed: () => Promise<{ rows: number }>,
+  pipeline?: () => Promise<{ rows: number }>,
+  feed?: () => Promise<{ rows: number }>,
+  candidate?: AggregateOptions,
 ) {
   const N = captured.reduce((n, b) => n + (b.selection?.count ?? b.length), 0);
   assert.ok(N <= 1000000 && N > 0);
@@ -196,7 +200,7 @@ export async function lightComparison(
           nulls: "last" as const,
           collation: null,
         }));
-  const operator = async () => {
+  const operator = async (options: AggregateOptions = {}) => {
     const grant = await core.harness.governor.admit({
         label: "light/operator",
         minimumBytes: 16 << 20,
@@ -238,7 +242,7 @@ export async function lightComparison(
       { arena, params: { slots: [] }, input: types },
       grant,
       sort ?? sink,
-      id === "agg_highcard_int" ? { outputTopN: { count: 100, keys } } : {},
+      { ...options, ...(id === "agg_highcard_int" ? { outputTopN: { count: 100, keys } } : {}) },
     );
     try {
       let at = 0;
@@ -263,13 +267,13 @@ export async function lightComparison(
   };
   const expected = plain();
   assert.deepEqual((await operator()).rows, expected.rows);
-  assert.equal((await pipeline()).rows, expected.rows.length);
+  if (pipeline) assert.equal((await pipeline()).rows, expected.rows.length);
   // Preserve every Sxx array in the consumed result so its updates cannot be dead work.
   if (expected.sxx) for (const q of expected.sxx) assert.ok(q.every(Number.isFinite));
   for (let k = 0; k < 3; k++) {
     plain();
     await operator();
-    await pipeline();
+    if (pipeline) await pipeline();
   }
   const samples = {
       bound: [] as number[],
@@ -277,6 +281,7 @@ export async function lightComparison(
       native: [] as number[],
       feed: [] as number[],
       operator: [] as number[],
+      candidate: [] as number[],
       whole: [] as number[],
     },
     order: string[] = [],
@@ -293,15 +298,29 @@ export async function lightComparison(
     if (N >= 8192) for (const q of expected.sxx) assert.ok(q.some((v) => v > 0));
   }
   for (let w = 0; w < 3; w++) native();
-  for (let w = 0; w < 3; w++) assert.equal((await feed()).rows, N);
-  const operations = { bound: plain, split, native, operator, whole: pipeline, feed };
+  if (feed) for (let w = 0; w < 3; w++) assert.equal((await feed()).rows, N);
+  if (candidate)
+    for (let w = 0; w < 3; w++) assert.deepEqual((await operator(candidate)).rows, expected.rows);
+  const operations = {
+    bound: plain,
+    split,
+    native,
+    operator: () => operator(),
+    candidate: candidate ? () => operator(candidate) : undefined,
+    whole: pipeline,
+    feed,
+  };
+  const kinds = (
+    ["bound", "split", "native", "operator", "candidate", "whole", "feed"] as const
+  ).filter((kind) => operations[kind] !== undefined);
   for (let round = 0; round < rounds; round++) {
     loads.push(loadavg());
-    const kinds = ["bound", "split", "native", "operator", "whole", "feed"] as const;
-    for (let j = 0; j < 6; j++) {
-      const kind = need(kinds, (j + round) % 6),
-        start = cpuUsage(),
-        result = await operations[kind](),
+    for (let j = 0; j < kinds.length; j++) {
+      const kind = need(kinds, (j + round) % kinds.length),
+        operation = operations[kind];
+      if (!operation) throw new Error("missing benchmark operation");
+      const start = cpuUsage(),
+        result = await operation(),
         spent = cpuUsage(start);
       samples[kind].push((spent.user + spent.system) / 1000);
       order.push(kind);
@@ -333,13 +352,15 @@ export async function lightComparison(
   }
   const profiles: Record<string, string> = {};
   const ownScripts = new Map<string, string>();
-  for (const kind of ["bound", "split", "native", "operator", "whole", "feed"] as const) {
+  for (const kind of kinds) {
     const profiler = new Session();
     profiler.connect();
     await profiler.post("Profiler.enable");
     await profiler.post("Profiler.setSamplingInterval", { interval: 100 });
     await profiler.post("Profiler.start");
-    await operations[kind]();
+    const operation = operations[kind];
+    if (!operation) throw new Error("missing profile operation");
+    await operation();
     const { profile } = await profiler.post("Profiler.stop");
     profiler.disconnect();
     for (const node of profile.nodes)
@@ -377,14 +398,12 @@ export async function lightComparison(
     order,
     loads,
     profiles,
-    cpuMs: {
-      bound: distribution(samples.bound),
-      split: distribution(samples.split),
-      native: distribution(samples.native),
-      feed: distribution(samples.feed),
-      operator: distribution(samples.operator),
-      whole: distribution(samples.whole),
-    },
+    cpuMs: Object.fromEntries(
+      Object.entries(samples)
+        .filter(([, values]) => values.length > 0)
+        .map(([kind, values]) => [kind, distribution(values)]),
+    ),
+    componentOnly: pipeline === undefined && feed === undefined,
     limits:
       "Optimistic fixed-workload TS observation, not a mathematical lower bound or universal JS impossibility result. Raw bound/split read flat decoded bytes/numbers and hash every text row. Native wide consumes the original decoded dictionary segments, hashes/maps all entries and translates every row within timing, then uses packed five-AVG state. No precomputed canonical IDs/ranks. All use exact collision equality. Split/native alias bound for the other shapes (not independent algorithms). Operator keeps original scan dictionary forms and includes matching sort/top-N, copying and governor/driver/task clock. Whole is prepared pipeline/owned frames; outer harness separately measures SQL through cleanup. Feed is scan/project/discard only, not additive with the other sinks. Setup/flattening (including numeric widening to Float64) excluded; kernel allocation/state/final ordering included. Borrowed immutable inputs need no key copy; no memory governor/spill/cancellation in plain TS. AVG Sxx retained. No production changes.",
   };
