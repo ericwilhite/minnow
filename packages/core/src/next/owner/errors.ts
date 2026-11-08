@@ -209,6 +209,16 @@ export class InFailedTransactionError extends Error {
   }
 }
 
+/** A transaction attribute change forbidden by PostgreSQL snapshot/subtransaction rules (25001). */
+export class TransactionModeError extends Error {
+  readonly code = "MINNOW_TRANSACTION_MODE";
+  override readonly name = "TransactionModeError";
+  readonly sqlState = "25001";
+  constructor(message = "The transaction mode cannot be changed here") {
+    super(message);
+  }
+}
+
 /** A write inside a READ ONLY transaction (PostgreSQL 25006). */
 export class ReadOnlyTransactionError extends Error {
   readonly code = "MINNOW_READ_ONLY_TRANSACTION";
@@ -262,6 +272,7 @@ export const ownerErrorRegistry: ErrorRegistry = new Map<string, new (...args: n
   ["NoActiveTransactionError", NoActiveTransactionError],
   ["SavepointNotFoundError", SavepointNotFoundError],
   ["ReadOnlyTransactionError", ReadOnlyTransactionError],
+  ["TransactionModeError", TransactionModeError],
   ["SequenceStateError", SequenceStateError],
   ["RecordedFailureError", RecordedFailureError],
   ["ConnectionRefusedError", ConnectionRefusedError],

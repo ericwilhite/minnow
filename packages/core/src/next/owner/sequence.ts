@@ -241,22 +241,6 @@ export function classifyStatementText(text: string): StatementKind {
 }
 
 /**
- * Whether SQL `text` is a BEGIN or START TRANSACTION whose modes include READ ONLY, read as the
- * front end reads them: it validates a transaction statement's identifier words only, ignoring
- * punctuation (engine/query.ts `parseTransactionStatement`), so `BEGIN READ, ONLY` and
- * `BEGIN READ (ONLY)` are READ ONLY too. This follows the front end's token semantics; it is not
- * a grammar, and it is temporary: the owner's refusal it serves goes once lowering reports a
- * BEGIN's access mode (B6).
- */
-export function requestsReadOnly(text: string): boolean {
-  if (classifyStatementText(text) !== "begin") return false;
-  const words = (lex(text.trim().replace(/;$/u, "").trim()) ?? []).filter(
-    (token): token is Extract<Token, { kind: "word" }> => token.kind === "word",
-  );
-  return words.some((word, i) => word.upper === "READ" && words[i + 1]?.upper === "ONLY");
-}
-
-/**
  * Whether SQL `text` may open, end or change a transaction (`classifyStatementText` is not
  * `other`): such a request is not resendable on session 0 while it is unresolved.
  */

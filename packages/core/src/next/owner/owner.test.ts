@@ -12,6 +12,7 @@ import {
 import {
   CommittedWithoutResultError,
   TransactionIdleTimeoutError,
+  TransactionModeError,
   OutcomeUnknownError,
   OwnerUnresponsiveError,
   SessionLostError,
@@ -232,6 +233,7 @@ describe("errors on the wire", () => {
       new OwnerUnresponsiveError(10_000),
       new OutcomeUnknownError("unresponsive"),
       new TransactionIdleTimeoutError(30_000),
+      new TransactionModeError(),
       new SessionLostError("transaction"),
       new CommittedWithoutResultError({ orders: 2 }),
     ]) {

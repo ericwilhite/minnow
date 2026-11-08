@@ -1715,10 +1715,36 @@ with no stored-format change.
   own schema in a session cache dropped on ROLLBACK and ROLLBACK TO. Both are the governor's
   evictable caches (`registerCache`): charged at a size walked from the expressions, and evicted,
   oldest unused across caches, before growth is refused or an operator spills.
-- SQL `BEGIN READ ONLY` (and `START TRANSACTION READ ONLY`) is refused with 0A000 until lowering
-  reports a BEGIN's access mode; the protocol's read-only begin works. The guard reads the modes
-  as the front end does (identifier words, punctuation ignored); it is not a grammar. The refusal goes when
-  lowering's fix lands, and the owner's test then requires 25006 for a write in it.
+- SQL `BEGIN` / `START TRANSACTION` and `SET TRANSACTION` apply lowering's typed modes.
+  READ ONLY starts with a pinned snapshot and no writer slot. Switching to it after writes
+  keeps the transaction and commits those earlier writes; subsequent writes fail with 25006.
+  Sequence mutation is checked at `SequenceAccess.next` / `set`, when execution reaches it:
+  currval and unexecuted conditional calls remain allowed. SQL lastval() is still refused
+  by the pinned lowerer (42883); it is outside this effect campaign.
+- SET follows PostgreSQL's per-attribute restrictions (verified against PGlite). READ ONLY
+  remains allowed after data work; READ WRITE is a no-op when already read-write, but switching
+  from read-only is forbidden after a snapshot or within a savepoint. An unchanged isolation
+  level remains allowed; changing it, or setting either deferrability value, is forbidden after
+  a snapshot or within a savepoint (25001). Query/data attempts, including refused writes and
+  synchronous point reads, take that boundary; SHOW does not. ROLLBACK TO restores modes and
+  prior writes without resetting the snapshot boundary; RELEASE keeps subsequent modes.
+  Modes reset at transaction end. SHOW transaction_isolation reports the selected level per
+  session; the default is repeatable read. Every accepted isolation level uses the engine's
+  snapshot level (lowering refuses SERIALIZABLE); DEFERRABLE has no execution effect.
+  SET outside a transaction changes nothing; the wire has no PostgreSQL warning notices.
+- READ ONLY refuses effective row locks (25006) before normal, cached or synchronous
+  execution. The required public `rowLocking` metadata supplies effective intent after view
+  and CTE expansion, including a locking CTE referenced only by an unused CTE. An outer lock
+  on a CTE reference does not propagate into its body; a truly unused locking CTE contributes
+  no intent. The generated PG campaign covers these controls and cache hits.
+- BEGIN, START TRANSACTION and SET consume the public `modeItems` list in written order,
+  retaining duplicates and validating every instruction before applying resources. Inside a
+  savepoint starting READ WRITE, READ WRITE then READ ONLY succeeds but READ ONLY then READ
+  WRITE fails (25001). When already READ ONLY, both orders fail. Both SQL metadata campaigns
+  in `testing/owner-lowering-metadata.test.ts` are active; the former R21 pending entries are
+  resolved. They retain their committed seed keys for replay.
+- The hidden-flush browser control terminates the worker before closing its tab. An ordinary
+  page close can flush through visibility or graceful step-down, so it cannot require data loss.
 - Tests: in process (`testing/owner-*.test.ts`, the election ones on in-memory Web Locks) and
   across real tabs in Chromium, Firefox and WebKit (`npm run test:browser:next-owner`), over real
   lowering and the stand-in executor and write path persisted in OPFS (IndexedDB where workers
@@ -2011,6 +2037,8 @@ The shared front end resolves targets through FROM subqueries but never pushes a
 into a CTE. A referenced CTE's own clause and a view's own clause count, including references from
 CTEs not consumed by the final SELECT. Only zero-reference CTEs in that query scope are
 omitted; declarations inside a discarded outer CTE do not leak into the caller.
+Recursive CTE base and step locks both count when referenced only through an unused CTE;
+the generated owner campaign covers both with cold and cached plans at all four strengths.
 View bodies are included after catalog expansion. The shipped engine uses the same target and
 strength helpers. Metadata is retained even for a point read; the owner must check it before
 its synchronous fast path.
@@ -2023,8 +2051,7 @@ isolation items have the named level, and deferrable items have a boolean. Other
 controls carry an empty list. `modes` remains the final value of each kind; the owner must
 validate every item in order before using it. In a savepoint that starts READ WRITE,
 `SET TRANSACTION READ ONLY, READ WRITE` fails with 25001, while `READ WRITE, READ ONLY`
-succeeds. If it already starts READ ONLY, either list fails. This is metadata for B5;
-it does not wire owner enforcement.
+succeeds. If it already starts READ ONLY, either list fails. Lowering supplies the ordered metadata; the owner validates it before applying accepted modes.
 
 The parser records CTE reference counts before execution pruning. Referenced bodies remain
 as `CompiledQuery.rowLockingCtes`, so catalog expansion includes locking views in a CTE

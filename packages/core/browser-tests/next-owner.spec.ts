@@ -485,3 +485,138 @@ test("explicit streaming export relinquishes worker buffers only on release", as
     ordinaryRows: [[1, 0, "x"]],
   });
 });
+
+test("literal families and typed transaction modes cross real owner ports", async ({
+  page,
+  context,
+}) => {
+  const name = dbName("plan-modes");
+  const a = await tab(page);
+  await call(a, "wipe", name);
+  await call(a, "open", name);
+  const b = await tab(await context.newPage());
+  await call(b, "open", name);
+  await call(a, "query", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+  await call(a, "query", "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+  for (let pass = 0; pass < 2; pass++)
+    for (const [id, value] of [
+      [1, "a"],
+      [2, "b"],
+      [3, "c"],
+    ] as const) {
+      expect(await call(b, "query", `SELECT v FROM t WHERE id = ${String(id)}`)).toMatchObject({
+        rows: [[value]],
+      });
+      // Text-to-integer coercion is a refusal marker: raw constants stay text-specific.
+      expect(await call(a, "query", `SELECT v FROM t WHERE id = '${String(id)}'`)).toMatchObject({
+        rows: [[value]],
+      });
+    }
+  await call(b, "query", "BEGIN READ ONLY", [], 1);
+  expect(await call(b, "query", "SELECT id FROM t WHERE id = 1", [], 1)).toMatchObject({
+    rows: [[1]],
+  });
+  expect(await call(b, "query", "SET TRANSACTION READ WRITE", [], 1)).toMatchObject({
+    error: "TransactionModeError",
+  });
+  await call(b, "query", "ROLLBACK", [], 1);
+  await call(b, "query", "BEGIN READ WRITE", [], 1);
+  expect(
+    await call(b, "query", "SET TRANSACTION READ ONLY, ISOLATION LEVEL READ COMMITTED", [], 1),
+  ).toMatchObject({ summary: { transaction: "open" } });
+  expect(await call(b, "query", "SHOW transaction_isolation", [], 1)).toMatchObject({
+    rows: [["read committed"]],
+  });
+  expect(await call(b, "query", "INSERT INTO t VALUES (4, 'd')", [], 1)).toMatchObject({
+    error: "ReadOnlyTransactionError",
+  });
+  await call(b, "query", "ROLLBACK", [], 1);
+  expect(
+    await call(a, "query", "UPDATE t SET v = $1 WHERE id = 2 RETURNING id, v", ["updated"]),
+  ).toMatchObject({ rows: [[2, "updated"]] });
+});
+
+test("read-only transitions retain earlier writes and obey savepoint restrictions", async ({
+  page,
+}) => {
+  const name = dbName("mode-transitions");
+  const a = await tab(page);
+  await call(a, "wipe", name);
+  await call(a, "open", name);
+  await call(a, "query", "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+  await call(a, "query", "BEGIN", [], 1);
+  await call(a, "query", "INSERT INTO t VALUES (1)", [], 1);
+  expect(await call(a, "query", "SET TRANSACTION READ ONLY", [], 1)).toMatchObject({
+    summary: { transaction: "open" },
+  });
+  expect(await call(a, "query", "SELECT id FROM t WHERE id = 1", [], 1)).toMatchObject({
+    rows: [[1]],
+  });
+  await call(a, "query", "COMMIT", [], 1);
+  expect(await call(a, "query", "SELECT id FROM t")).toMatchObject({ rows: [[1]] });
+  await call(a, "query", "BEGIN READ ONLY", [], 1);
+  await call(a, "query", "SAVEPOINT s", [], 1);
+  expect(await call(a, "query", "SET TRANSACTION READ WRITE", [], 1)).toMatchObject({
+    error: "TransactionModeError",
+  });
+  await call(a, "query", "ROLLBACK", [], 1);
+  await call(a, "query", "BEGIN", [], 1);
+  await call(a, "query", "SELECT 1", [], 1);
+  expect(await call(a, "query", "SET TRANSACTION READ ONLY", [], 1)).toMatchObject({
+    summary: { transaction: "open" },
+  });
+  await call(a, "query", "ROLLBACK", [], 1);
+});
+
+test("public lock intent and ordered modes survive owner cache hits", async ({ page }) => {
+  const name = dbName("locking-order");
+  const a = await tab(page);
+  await call(a, "wipe", name);
+  await call(a, "open", name);
+  await call(a, "query", "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+  await call(a, "query", "INSERT INTO t VALUES (1), (2)");
+  await call(a, "query", "CREATE VIEW v AS SELECT * FROM t FOR SHARE");
+  const locking = [
+    ...["UPDATE", "NO KEY UPDATE", "SHARE", "KEY SHARE"].map(
+      (strength) => `SELECT * FROM t WHERE id = 1 FOR ${strength}`,
+    ),
+    "SELECT * FROM v",
+    "WITH x AS (SELECT * FROM t FOR UPDATE), unused AS (SELECT * FROM x) SELECT 1 AS n",
+    "WITH x AS (SELECT * FROM t FOR UPDATE), y AS (SELECT * FROM x), unused AS (SELECT * FROM y) SELECT 1 AS n",
+    "WITH RECURSIVE r(id) AS (SELECT id FROM (SELECT * FROM t FOR UPDATE) base UNION ALL SELECT id+1 FROM r WHERE id<2), d AS (SELECT * FROM r) SELECT 1 AS id",
+    "WITH RECURSIVE r(id) AS (SELECT 1 UNION ALL SELECT t.id+1 FROM r JOIN (SELECT * FROM t FOR UPDATE) t ON t.id=r.id WHERE r.id<2), d AS (SELECT * FROM r) SELECT 1 AS id",
+  ];
+  for (const sql of locking) {
+    expect(await call(a, "query", sql.replace("id = 1", "id = 2"))).toHaveProperty("rows");
+    await call(a, "query", "BEGIN READ ONLY", [], 1);
+    expect(await call(a, "query", sql, [], 1), sql).toMatchObject({
+      error: "ReadOnlyTransactionError",
+      sqlState: "25006",
+    });
+    await call(a, "query", "ROLLBACK", [], 1);
+  }
+  await call(a, "query", "BEGIN READ ONLY", [], 1);
+  expect(
+    await call(a, "query", "WITH x AS (SELECT * FROM t FOR UPDATE) SELECT 1 AS n", [], 1),
+  ).toMatchObject({ rows: [[1]] });
+  expect(
+    await call(a, "query", "WITH x AS (SELECT * FROM t) SELECT * FROM x FOR UPDATE", [], 1),
+  ).toMatchObject({ rows: [[1], [2]] });
+  await call(a, "query", "ROLLBACK", [], 1);
+  for (const initial of ["WRITE", "ONLY"])
+    for (const reversed of [false, true]) {
+      await call(a, "query", `BEGIN READ ${initial}`, [], 1);
+      await call(a, "query", "SAVEPOINT s", [], 1);
+      const sql =
+        "SET TRANSACTION " + (reversed ? "READ WRITE, READ ONLY" : "READ ONLY, READ WRITE");
+      const result = await call(a, "query", sql, [], 1);
+      if (initial === "WRITE" && reversed) {
+        expect(result).toMatchObject({ summary: { transaction: "open" } });
+        expect(await call(a, "query", "INSERT INTO t VALUES (3)", [], 1)).toMatchObject({
+          error: "ReadOnlyTransactionError",
+          sqlState: "25006",
+        });
+      } else expect(result).toMatchObject({ error: "TransactionModeError", sqlState: "25001" });
+      await call(a, "query", "ROLLBACK", [], 1);
+    }
+});

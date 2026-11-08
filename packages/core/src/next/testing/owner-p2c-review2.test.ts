@@ -16,7 +16,6 @@ import { createLowerer } from "../lower/create.js";
 import { MemoryCatalog } from "../lower/memory-catalog.js";
 import { Governor, OBJECT_OVERHEAD_BYTES, bigintBytes } from "../memory/governor.js";
 import { RuleCache, retainedBytes, ruleBytes } from "../owner/rule-cache.js";
-import { requestsReadOnly } from "../owner/sequence.js";
 import { harness } from "./owner-harness.js";
 
 const MiB = 1024 * 1024;
@@ -161,25 +160,24 @@ describe("finding 3 (review): engine.close() returns the committed rule cache's 
   });
 });
 
-describe("finding 4 (review): the READ ONLY guard reads modes as the front end does", () => {
-  it("matches READ then ONLY among identifier words, punctuation ignored", () => {
+describe("finding 4 (review): typed READ ONLY modes cannot open a writable transaction", () => {
+  it("uses typed access modes for valid SQL instead of the retired token guard", () => {
+    const lower = (text: string) =>
+      createLowerer().lower(text, {
+        catalog: new MemoryCatalog().view,
+        statistics: { table: () => null },
+        costs: EXECUTOR_COSTS,
+      });
     for (const text of [
       "BEGIN READ ONLY",
-      "BEGIN READ, ONLY",
-      "BEGIN READ (ONLY)",
-      'BEGIN "read" "only"',
       "START TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY",
       "BEGIN WORK READ /* x */ ONLY",
     ])
-      expect(requestsReadOnly(text), text).toBe(true);
-    for (const text of [
-      "BEGIN",
-      "BEGIN READ WRITE",
-      "BEGIN /* READ ONLY */ READ WRITE",
-      "BEGIN ISOLATION LEVEL READ COMMITTED",
-      "SELECT 'READ ONLY'",
-    ])
-      expect(requestsReadOnly(text), text).toBe(false);
+      expect(lower(text)).toMatchObject({ kind: "transactionControl", modes: { readOnly: true } });
+    for (const text of ["BEGIN READ WRITE", "BEGIN /* READ ONLY */ READ WRITE"])
+      expect(lower(text)).toMatchObject({ kind: "transactionControl", modes: { readOnly: false } });
+    for (const text of ["BEGIN READ, ONLY", "BEGIN READ (ONLY)"])
+      expect(() => lower(text)).toThrow(expect.objectContaining({ sqlState: "42601" }));
   });
 
   it("rejects malformed access modes before opening a transaction, as PostgreSQL", async () => {
