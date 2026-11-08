@@ -138,6 +138,8 @@ const metadata = {
         resolve("scripts/next-late-fetch-component.mts"),
         resolve("scripts/next-aggregation-components.mts"),
         resolve("scripts/next-scalar-distinct-bench.mts"),
+        resolve("scripts/next-aggregation-light.mts"),
+        resolve("scripts/lib/aggregation-light-kernels.mts"),
         resolve("packages/core/dist/next/hash/xxhash32.js"),
         generatorPath,
         cataloguePath,
@@ -660,7 +662,7 @@ try {
   }
   await writeFile(join(cache, "baseline.json"), JSON.stringify({ ...metadata, records }, null, 2));
   // Run components only AFTER whole-query timing/profile, so their extra warmups cannot bias it.
-  if (option("--component", "") === "aggregation") {
+  if (["aggregation", "aggregation-light"].includes(option("--component", ""))) {
     const { aggregationComponents } = await import(
       pathToFileURL(resolve("scripts/next-aggregation-components.mts")).href
     );
@@ -671,6 +673,7 @@ try {
         id: query.id,
         sql: catalogue.sqlFor(query, "minnow", total),
       })),
+      option("--component", "") === "aggregation-light" ? cache : undefined,
     );
     await writeFile(join(cache, "component-aggregation.json"), JSON.stringify(components, null, 2));
     console.log(JSON.stringify(components));

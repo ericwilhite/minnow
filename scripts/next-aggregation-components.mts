@@ -31,6 +31,7 @@ export async function aggregationComponents(
   core: StorageCore,
   rounds: number,
   queries: ReadonlyArray<{ id: string; sql: string }>,
+  lightDirectory?: string,
 ) {
   if (!Number.isSafeInteger(rounds) || rounds < 5) throw new RangeError("five rounds required");
   const records = [];
@@ -176,8 +177,26 @@ export async function aggregationComponents(
         started.release();
       }
     };
-    const recorded = await scan(true),
-      expectedOperator = await operator(),
+    const recorded = await scan(true);
+    if (lightDirectory !== undefined) {
+      const { lightComparison } = await import("./next-aggregation-light.mts");
+      records.push(
+        await lightComparison(
+          core,
+          query.id,
+          aggregate,
+          inputTypes,
+          captured,
+          rounds,
+          lightDirectory,
+          pipeline,
+          scan,
+        ),
+      );
+      captured.length = 0;
+      continue;
+    }
+    const expectedOperator = await operator(),
       expectedPipeline = await pipeline();
     const samples = { scan: [] as number[], operator: [] as number[], pipeline: [] as number[] },
       operations = { scan, operator, pipeline },
@@ -227,5 +246,5 @@ export async function aggregationComponents(
     });
     captured.length = 0;
   }
-  return { lane: "Node", rounds, warmupsPerVariant: 1, records };
+  return { lane: "Node", rounds, warmupsPerVariant: lightDirectory === undefined ? 1 : 3, records };
 }

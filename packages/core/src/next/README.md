@@ -1306,6 +1306,23 @@ records the referenced scan columns, forms of input vectors, batch sizes and fra
 Input copying is outside the timed samples. The three costs are diagnostic rather than
 additive: their sinks, downstream sorting and cache/GC interactions differ. This Node adapter
 calls the executor directly; it does not measure owner worker transport.
+`--component aggregation-light` adds workload-specialized plain-TS/open-addressing baselines
+on the same decoded million-row inputs. It matches downstream sort/top-100 work in the operator
+comparison, checks every result, and rotates at least five CPU rounds with the prepared whole
+pipeline. The ordinary whole-query samples still include SQL/lowering/preparation separately.
+The wide shape compares a raw-byte fused loop, raw-byte grouping plus full-column loops, and a
+dictionary-native variant whose entry hashing, global mapping, row translation and ranking are
+timed. Numeric widening to Float64 is fixture setup; the operator keeps native input forms.
+A scan/project/discard feed measurement helps interpret the whole-query gap (the sinks are not
+additive). Its packed five-AVG state retains every independent Sx/Sxx transition; only counts for
+certified identical non-NULL row sets coincide. Integer sums use the written row-count/range
+bound in the source. Allocation and final ordering are timed; input flattening is not.
+These are optimistic fixed-workload observations, not mathematical lower bounds or proof of a
+JavaScript limit. They borrow immutable inputs and omit governor, spill, cancellation and task
+pacing. Presizing assumes the catalogue's domain bounds, and the original operator retains its
+dictionary representation. Non-wide `split`/`native` samples alias the same plain kernel.
+The report includes CPU samples, full spreads, checkpointed partial rounds, profiles and the
+actual transformed JS needed to interpret line-level ticks. No baseline is an executor path.
 Unbounded, value-producing `indexRange` nodes require the same internal `keyOrder:true`
 diagnostic opt-in as SQL until the charged streaming cursor lands. The default executor
 refuses them at prepare with `UnsupportedPlanError`, including under LIMIT zero. Opted-in
