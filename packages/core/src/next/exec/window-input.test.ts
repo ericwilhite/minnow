@@ -1,6 +1,6 @@
 import { vectorOf } from "./join-fixtures.js";
 import { expect, it } from "vitest";
-import { windowInputLayout, remapWindowFunction } from "./window-input.js";
+import { windowInputLayout, remapWindowFunction, literalWindowAmount } from "./window-input.js";
 import type { ScalarExpr } from "../ir/ir.js";
 import { seedsFor, mulberry32 } from "../../testing/seeds.js";
 const int = { kind: "int32", bits: 32 } as const;
@@ -50,3 +50,20 @@ for (const seed of seedsFor("window-input-layout", [0xb710, 0xb711]))
       expect(layout.exprs.length).toBeLessThanOrEqual(3);
     }
   });
+
+it("keeps exact int4 amounts scalar but retains NULL, computed and wider arguments", () => {
+  const literal = (amount: number | null): ScalarExpr => {
+    const value = vectorOf(int, [amount]);
+    if (value.form !== "flat") throw new Error("flat literal expected");
+    return { op: "literal", type: int, value };
+  };
+  for (const amount of [-2147483648, -1, 0, 1, 3, 2147483647])
+    expect(literalWindowAmount(literal(amount))).toBe(amount);
+  expect(literalWindowAmount(literal(null))).toBeUndefined();
+  expect(literalWindowAmount(col(0))).toBeUndefined();
+  expect(literalWindowAmount(undefined)).toBeUndefined();
+  const big = { kind: "int64" } as const;
+  const value = vectorOf(big, [2n ** 62n]);
+  if (value.form !== "flat") throw new Error("flat literal expected");
+  expect(literalWindowAmount({ op: "literal", type: big, value })).toBeUndefined();
+});

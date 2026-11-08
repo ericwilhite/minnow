@@ -1,7 +1,8 @@
 /** Window held-row gather only, using each frozen shape's exact row permutation/layout.
  * Input, normalization, sorting and warmup are untimed. Includes target allocation and freeing
  * per partition, as WindowEvaluator.#held does. Excludes arguments, output and evaluation.
- * Seven interleaved rounds, restoring the same logical values; records per-run CPU and load.
+ * Interleaved rounds, per-run CPU and load. SQL tests check logical output restoration.
+ * COMPARE=amounts isolates materialized vs scalar offsets for the frozen lagLead shape.
  * ROWS=1000000 RUNS=7 node --expose-gc bundled.mjs [shapes]
  */
 import type { ScalarExpr } from "../ir/ir.js";
@@ -11,7 +12,7 @@ import { BATCH_ROWS } from "../vector/vector.js";
 import { ColumnStore } from "./column-store.js";
 import { valueAt } from "./join-fixtures.js";
 import { Slice, runToEnd } from "./slices.js";
-import { windowShape } from "./window-bench-fixtures.js";
+import { windowShape, materializeWindowAmounts } from "./window-bench-fixtures.js";
 import { GroupedRows } from "./window-sort.js";
 const n = Number(process.env.ROWS ?? 1_000_000),
   runs = Number(process.env.RUNS ?? 7);
@@ -19,14 +20,16 @@ for (const name of process.argv.slice(2).length
   ? process.argv.slice(2)
   : ["topk", "rank", "runningSum", "lagLead", "movingAvg"]) {
   const setup = (deduplicate: boolean) => {
-    const shape = windowShape(name, n, true, "sql");
+    const original = windowShape(name, n, true, "sql");
+    const scalar = process.env.COMPARE === "amounts";
+    const shape = scalar && !deduplicate ? materializeWindowAmounts(original) : original;
     const first = shape.input[0];
     const projection: ScalarExpr[] = shape.types.map((type, column) => ({
       op: "column",
       type,
       index: first?.columns.findIndex((value) => value === first.columns[column]) ?? column,
     }));
-    const physical = windowInputLayout(projection, null, deduplicate);
+    const physical = windowInputLayout(projection, null, scalar || deduplicate);
     const { types } = physical;
     const input = shape.input.map((batch) => ({
       ...batch,

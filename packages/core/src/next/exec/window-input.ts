@@ -63,3 +63,15 @@ export function remapWindowFunction(
       : {}),
   };
 }
+
+/** A non-null int4 literal is already an exact scalar; never materialize it once per row. */
+export function literalWindowAmount(expr: ScalarExpr | undefined): number | undefined {
+  if (expr?.op !== "literal" || expr.type.kind !== "int32") return undefined;
+  const vector = expr.value;
+  if (
+    vector.data.layout !== "i32" ||
+    (vector.validity !== null && ((vector.validity[0] ?? 0) & 1) === 0)
+  )
+    return undefined;
+  return vector.data.values[0];
+}

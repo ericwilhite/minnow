@@ -941,6 +941,7 @@ export const LOWER_M3_JOINS_REACH = [
 
 /** SQL windows run through durable storage and the actual executor, not a plan interpreter. */
 export const LOWER_M3_WINDOWS_REACH = [
+  "literal window amounts",
   "duplicate window inputs",
   "min max",
   "integer average",

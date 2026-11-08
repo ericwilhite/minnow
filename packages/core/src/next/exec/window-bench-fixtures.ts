@@ -293,3 +293,22 @@ export function windowShape(name: string, rows: number, dict: boolean, layout = 
     },
   };
 }
+
+/** Reproduce the executor parent's hidden int4 offset columns for the frozen lag/lead SQL. */
+export function materializeWindowAmounts(shape: ReturnType<typeof windowShape>) {
+  const amounts = shape.spec.functions.filter((call) => call.fn === "lag" || call.fn === "lead");
+  if (amounts.length === 0) return shape;
+  const types = [...shape.types, ...amounts.map(() => INT)];
+  let index = shape.types.length;
+  const functions = shape.spec.functions.map((call) =>
+    call.fn === "lag" || call.fn === "lead" ? { ...call, amount: { column: index++ } } : call,
+  );
+  return {
+    types,
+    spec: { ...shape.spec, types, functions },
+    input: shape.input.map((batch) => ({
+      ...batch,
+      columns: [...batch.columns, ...amounts.map(() => numbers(INT, () => 1, 0, batch.length))],
+    })),
+  };
+}

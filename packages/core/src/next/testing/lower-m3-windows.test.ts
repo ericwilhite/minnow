@@ -61,6 +61,10 @@ for (const seed of seedsFor("next-lower-m3-windows", [0x7731, 0x7732]))
           reach.reach("reopened");
         }
         const cases: Array<[(typeof LOWER_M3_WINDOWS_REACH)[number], string]> = [
+          [
+            "literal window amounts",
+            `LAG(i,0,99) OVER(PARTITION BY p ORDER BY id),LEAD(i,1,99) OVER(PARTITION BY p ORDER BY id),LAG(i,2) OVER(PARTITION BY p ORDER BY id) AS lag_two,NTH_VALUE(i,3) OVER(PARTITION BY p ORDER BY id),NTILE(3) OVER(PARTITION BY p ORDER BY id)`,
+          ],
           ["row_number", `ROW_NUMBER() OVER(PARTITION BY p ORDER BY v DESC,id)`],
           ["rank", `RANK() OVER(PARTITION BY p ORDER BY k DESC)`],
           [

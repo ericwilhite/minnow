@@ -4,7 +4,8 @@ import fixture from "./executor-catalogue.json" with { type: "json" };
 import { StorageCore } from "./storage-core.js";
 import type { Rel } from "../ir/ir.js";
 import { valueAt } from "../exec/join-fixtures.js";
-import { windowShape } from "../exec/window-bench-fixtures.js";
+import { literalWindowAmount } from "../exec/window-input.js";
+import { windowShape, materializeWindowAmounts } from "../exec/window-bench-fixtures.js";
 
 function windowOf(rel: Rel): Extract<Rel, { op: "window" }> {
   if (rel.op === "window") return rel;
@@ -56,6 +57,22 @@ it("reproduces the frozen SQL window input layout, types, calls and values", asy
           return { fn: call.fn, arg: arg?.index ?? null, type: call.type };
         }),
       );
+      if (name === "lagLead") {
+        const materialized = materializeWindowAmounts(shape);
+        expect(rel.functions.map((call) => literalWindowAmount(call.args[1]))).toEqual([1, 1]);
+        expect(materialized.types.slice(shape.types.length)).toEqual(
+          rel.functions.map((call) => call.args[1]?.type),
+        );
+        expect(materialized.spec.functions.map((call) => call.amount)).toEqual([
+          { column: 3 },
+          { column: 4 },
+        ]);
+        expect(
+          materialized.input[0]?.columns
+            .slice(shape.types.length)
+            .map((vector) => valueAt(vector, 0)),
+        ).toEqual([1, 1]);
+      }
       const batch = shape.input[0];
       if (batch === undefined || shape.input.length !== 1)
         throw new Error("Expected one frozen batch");

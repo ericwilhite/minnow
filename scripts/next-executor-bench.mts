@@ -2,6 +2,8 @@
  * --frozen replays committed SQL verbatim, including captured row-bound literals. Gate B's
  * 1M join/window cells have no size-dependent SQL literals; select them with --only.
  * --profile all records one setup-excluded V8 region per executing cell after CPU rounds.
+ * --compare-window-inputs / --compare-window-scalars alternate parent and candidate,
+ * hash every output cell, and record per-run CPU, wall time and load (use --repeats 7).
  * Run under node --cpu-prof as well for a separately labelled whole-process diagnostic.
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -67,8 +69,11 @@ const harness = resolve(
 const only = new Set(option("--only", "").split(",").filter(Boolean));
 const profileId = option("--profile", "");
 const frozenSQL = args.includes("--frozen");
-const compareInputs = args.includes("--compare-window-inputs");
-const parentExecutor = createExecutor({ windowInputDeduplication: false });
+const compareScalars = args.includes("--compare-window-scalars");
+const compareInputs = args.includes("--compare-window-inputs") || compareScalars;
+const parentExecutor = createExecutor(
+  compareScalars ? { windowScalarArguments: false } : { windowInputDeduplication: false },
+);
 const dataset = option("--dataset", "wide"),
   scale = Number(option("--scale", "333"));
 if (dataset !== "wide" && dataset !== "star" && dataset !== "retail")

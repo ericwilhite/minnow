@@ -27,7 +27,7 @@ import type { QueryRuntime, Program } from "./run.js";
 import { SortOperator, sortMinimumBytes } from "./sort.js";
 import { sortMode } from "./sort-keys.js";
 import type { SortColumn } from "./sort-keys.js";
-import { windowInputLayout, remapWindowFunction } from "./window-input.js";
+import { windowInputLayout, remapWindowFunction, literalWindowAmount } from "./window-input.js";
 import { TableScan } from "./table-scan.js";
 import {
   WindowOperator,
@@ -258,10 +258,18 @@ function condition(
   };
 }
 
-function setupWindow(rel: Extract<Rel, { op: "window" }>, input: readonly PhysicalType[]) {
+function setupWindow(
+  rel: Extract<Rel, { op: "window" }>,
+  input: readonly PhysicalType[],
+  scalarAmounts: boolean,
+) {
+  const amounts = rel.functions.map((call) =>
+    scalarAmounts ? literalWindowAmount(call.args[call.fn === "ntile" ? 0 : 1]) : undefined,
+  );
   const exprs: ScalarExpr[] = rel.orderBy.map((key) => key.expr);
-  const positions = rel.functions.map((call) =>
-    call.args.map((expr) => {
+  const positions = rel.functions.map((call, index) =>
+    call.args.map((expr, argIndex) => {
+      if (amounts[index] !== undefined && argIndex === (call.fn === "ntile" ? 0 : 1)) return -1;
       const at = exprs.length;
       exprs.push(expr);
       return at;
@@ -275,6 +283,7 @@ function setupWindow(rel: Extract<Rel, { op: "window" }>, input: readonly Physic
         call.fn === "ntile" ? null : args[0] === undefined ? null : at(keys.indexes, args[0]);
       const amountAt = call.fn === "ntile" ? args[0] : args[1];
       const fallback = call.args[2];
+      const scalarAmount = amounts[index];
       if (fallback !== undefined && fallback.op !== "literal" && fallback.op !== "param")
         throw new UnsupportedPlanError("a row-dependent lag/lead default", { construct: "window" });
       const scalar = (expr: ScalarExpr | null): number | null => {
@@ -323,7 +332,11 @@ function setupWindow(rel: Extract<Rel, { op: "window" }>, input: readonly Physic
         fn: call.fn,
         arg,
         type: call.type,
-        ...(amountAt === undefined ? {} : { amount: { column: at(keys.indexes, amountAt) } }),
+        ...(amountAt === undefined
+          ? {}
+          : amountAt === -1 && scalarAmount !== undefined
+            ? { amount: scalarAmount }
+            : { amount: { column: at(keys.indexes, amountAt) } }),
         fallback:
           fallback === undefined
             ? null
@@ -347,6 +360,8 @@ function setupWindow(rel: Extract<Rel, { op: "window" }>, input: readonly Physic
 export interface CompileOptions {
   /** False retains the original window inputs for component/query benchmark controls. */
   readonly windowInputDeduplication?: boolean;
+  /** Parent control for literal-amount gather benchmarks. */
+  readonly windowScalarArguments?: boolean;
 }
 export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): Program {
   const bindings = new Map<string, ReturnType<typeof bindCall>>();
@@ -643,7 +658,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 input,
                 rel.keys.map((key) => key.expr),
               )
-            : setupWindow(rel, input);
+            : setupWindow(rel, input, options.windowScalarArguments !== false);
         const physical = windowInputLayout(
           keys.exprs,
           rel.op === "window" && rel.input.op === "project" ? rel.input.exprs : null,
