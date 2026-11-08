@@ -9,7 +9,7 @@ import type { PhysicalType } from "../types.js";
 import type { CompiledQuery, Expression, PredicateOperator } from "../../plan/model.js";
 import { isAggregateCall } from "../../engine/query.js";
 import { externalSqlDomainValue } from "../../engine/sql-domains.js";
-import { timestampFromDate } from "../temporal.js";
+import { parseDate, timestampFromDate } from "../temporal.js";
 import {
   baseType,
   coerce,
@@ -22,6 +22,7 @@ import {
 import { PlanningError, unsupported } from "./errors.js";
 import {
   boolLiteral,
+  dateLiteral,
   decimalLiteral,
   integerLiteral,
   integerLiteralValue,
@@ -305,6 +306,7 @@ function lowerLiteral(expression: Extract<Expression, { kind: "literal" }>): Typ
         break;
       }
       case "date":
+        return { expr: dateLiteral(parseDate(text)), nullable: false, big: false };
       case "time":
       case "interval":
       case "uuid":

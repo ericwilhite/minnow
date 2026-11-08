@@ -146,7 +146,14 @@ describe("kernel bindings onto ir/functions.ts (R19)", () => {
       const types = argumentTypes(overload, variable);
       const run = () => {
         const compiled = compileFor(callOf(fn, overload, types), types);
-        compiled.evaluate(batchOf(types.map(sample)), null);
+        compiled.evaluate(
+          batchOf(
+            types.map((type, index) =>
+              fn === "date_trunc" && index === 0 ? texts(["month", "day"]) : sample(type),
+            ),
+          ),
+          null,
+        );
       };
       if ("refused" in binding) refusedWith(run, binding.construct);
       else if (binding.kinds !== undefined && !binding.kinds.has(variable.kind))

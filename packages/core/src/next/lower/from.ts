@@ -31,6 +31,7 @@
  *   parameter slots; `memoize` unless the subquery is volatile.
  * - An uncorrelated scalar subquery is an init plan (query.ts `installSubqueries`).
  */
+import { constantRows } from "./constant-rows.js";
 import type { TableDef } from "../access/catalog.js";
 import type { ExecutorCosts } from "../ir/costs.js";
 import type { Rel, ScalarExpr } from "../ir/ir.js";
@@ -1377,7 +1378,10 @@ export function lowerSetOperation(
         (kind === "union" ? (right.rows ?? DEFAULT_TABLE_ROWS) : 0),
     };
   }
-  return acc;
+  const rows = constantRows(acc.rel);
+  return rows === null
+    ? acc
+    : { ...acc, rel: { op: "values", id: builder.id(), rows, output: outputColumns(acc.columns) } };
 }
 
 /** WITH RECURSIVE (and GENERATE_SERIES): base, then the step over the work table, to a fixpoint. */

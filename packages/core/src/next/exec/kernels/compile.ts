@@ -24,6 +24,7 @@ import { UnsupportedPlanError } from "../errors.js";
 import { compileArithmetic, compileNegate, type ArithOp } from "./arith.js";
 import { bindCall } from "./bindings.js";
 import { compileCase, compileCoalesce } from "./case.js";
+import { compileDateTrunc } from "./date-trunc.js";
 import { compileNumericRound } from "./round.js";
 import { compileCast } from "./cast.js";
 import { compileCompare, compileDistinctFrom } from "./compare.js";
@@ -171,6 +172,12 @@ function compileCall(expr: Extract<ScalarExpr, { op: "call" }>, context: Compile
       const [arg] = args;
       if (arg === undefined) throw new TypeError("neg takes one argument");
       return compileNegate(expr.type, arg, arena);
+    }
+    case "dateTrunc": {
+      const [field, input] = args;
+      if (field === undefined || input === undefined)
+        throw new TypeError("DATE_TRUNC takes two arguments");
+      return compileDateTrunc(expr.type, field, input, arena);
     }
     case "numericRound": {
       const [input, digits] = args;

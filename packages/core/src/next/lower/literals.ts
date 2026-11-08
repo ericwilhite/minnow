@@ -1,8 +1,8 @@
 /**
  * IR literals: a `literal` expression holds a flat vector of length 1 (ir.ts). Lowering builds
  * them only for values it knows exactly at plan time: booleans, integers, floats, exact decimals,
- * text, timestamps from the front end's `Date` constants, sequence ids, and NULL of any type.
- * Every other constant (a DATE, INTERVAL, UUID or JSON spelled as text) stays text and is cast by
+ * text, canonical dates, timestamps from the front end's `Date` constants, sequence ids, and NULL of any type.
+ * Every other constant (an INTERVAL, UUID or JSON spelled as text) stays text and is cast by
  * the executor, which owns those parsers.
  */
 import type { ScalarExpr } from "../ir/ir.js";
@@ -119,6 +119,12 @@ export function textLiteral(value: string, type: PhysicalType = { kind: "text" }
     type,
     value: flat(type, { layout: "varlen", bytes, offsets: Int32Array.of(0, bytes.length) }),
   };
+}
+
+/** A date in days since 2000-01-01, including PostgreSQL's infinity sentinels. */
+export function dateLiteral(days: number): ScalarExpr {
+  const type: PhysicalType = { kind: "date" };
+  return { op: "literal", type, value: flat(type, { layout: "i32", values: Int32Array.of(days) }) };
 }
 
 /** A timestamp in µs since 2000-01-01 (temporal.ts). */

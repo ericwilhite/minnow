@@ -23,9 +23,10 @@ NUMERIC distances in the unexported rebuild executor do not change the public co
 Devtools' generated failure explanations now include the parameter-offset refusal and the
 clarified frame-compatibility notes from the matrix.
 
-**Size note:** the core package's SQL feature matrix and PostgreSQL profile add 402 packed
-bytes, bringing the tarball to 1,022,698 bytes. Its packed-size cap moves from 1,022,500 to
-1,023,000 bytes. Private rebuild code and test suites remain excluded; worker/client runtime code is unchanged. The unpacked-size and worker/client bundle caps remain unchanged.
+**Size note:** the SQL feature metadata adds 402 packed bytes and raises the core tarball cap
+from 1,022,500 to 1,023,000 bytes. With JSON_TABLE declaration metadata, the measured tarball
+is now 1,022,832 packed bytes and 4,433,733 unpacked bytes. Private rebuild code and test suites
+remain excluded. The unpacked-size cap remains unchanged.
 
 **Migration:** no stored-format change. Existing parameter frame offsets remain refused; use
 numeric literals. Consumers of SQL feature metadata should handle the added entries by ID.
@@ -49,6 +50,20 @@ before two-argument `ROUND`, matching PostgreSQL's overload. The SELECT guide al
 this form. The legacy float overload is planned for removal when the rebuilt engine becomes
 the default. This changes example SQL, not the shipped runtime, public API or stored format;
 no migration is needed.
+
+The unexported rebuild core now executes timestamp `DATE_TRUNC` in its fixed UTC session,
+keeps DATE literals in native date vectors, and executes constant `JSON_TABLE` TEXT/INTEGER rows
+through literal `UNION ALL` folding. JSON_TABLE declarations keep their types even for NULL-only rows.
+JSON constructors, general set operations and recursive execution still have explicit typed
+refusals; the internal catalogue records each remaining reason and its PostgreSQL outcome.
+These changes do not alter the shipped SQL engine, public API or stored formats; no migration
+is needed.
+
+**Bundle sizes:** JSON_TABLE declaration metadata adds 451 minified raw bytes to each engine
+entry. Measured raw/gzip sizes are 1,172,659/351,184 bytes for the complete main entry,
+1,585,069/458,168 bytes with OPFS, and 1,581,102/455,735 bytes for the IndexedDB worker.
+Their raw caps each move up once by 512 bytes. Gzip caps, the worker application's main-thread
+budget, and package tarball caps stay unchanged.
 
 ## 0.20.0 — November 7, 2026
 

@@ -1631,3 +1631,84 @@ export const SIGNED_LITERAL_REACH = [
   "ROUND rows",
   "overload refusal",
 ] as const;
+
+/** DATE constants preserve the complete finite range and sentinel values before execution. */
+export const DATE_LITERAL_REACH = [
+  "finite",
+  "BC parser",
+  "maximum parser",
+  "before epoch",
+  "at or after epoch",
+  "minimum",
+  "maximum",
+  "leap day",
+  "infinity",
+  "-infinity",
+] as const;
+
+/** Calendar units and active-vector paths for timestamp DATE_TRUNC in fixed UTC. */
+export const DATE_TRUNC_REACH = [
+  "microseconds",
+  "milliseconds",
+  "second",
+  "minute",
+  "hour",
+  "day",
+  "week",
+  "month",
+  "quarter",
+  "year",
+  "decade",
+  "century",
+  "millennium",
+  "timestamp",
+  "timestamptz",
+  "flat",
+  "dictionary",
+  "constant",
+  "selected",
+  "all rows",
+  "null garbage",
+  "NULL unit",
+  "unselected garbage",
+  "safe tier",
+  "int64 tier",
+  "infinity",
+  "before epoch",
+  "int64 precision",
+  "aliases or invalid units",
+  "rows",
+  "22008",
+  "22023",
+  "0A000",
+] as const;
+
+/** Literal JSON_TABLE desugaring keeps row order, multiplicity, NULLs and text exact. */
+export const JSON_TABLE_VALUES_REACH = [
+  "empty",
+  "one row",
+  "multiple rows",
+  "NULL text",
+  "NULL integer",
+  "duplicates",
+  "escaped text",
+  "negative integer",
+] as const;
+
+/** JSON_TABLE NULL values carry declarations before UNION ALL resolves unknown constants. */
+export const JSON_TABLE_NULL_REACH = [
+  "smallint",
+  "integer",
+  "bigint",
+  "real",
+  "double precision",
+  "boolean",
+  "text",
+  "numeric",
+  "date",
+  "timestamp without time zone",
+  "timestamp with time zone",
+  "empty",
+  "single NULL",
+  "NULL-only prefix",
+] as const;

@@ -19,7 +19,7 @@ import type { PhysicalKind, PhysicalType } from "../../types.js";
 import { UnsupportedPlanError } from "../errors.js";
 
 /** The call kernels compile.ts dispatches to. */
-export type CallKernel = "arith" | "neg" | "coalesce" | "nullif" | "numericRound";
+export type CallKernel = "arith" | "neg" | "coalesce" | "nullif" | "numericRound" | "dateTrunc";
 
 export type Binding =
   | {
@@ -150,7 +150,11 @@ export const FUNCTION_BINDINGS: Readonly<Record<string, Binding | PerOverload>> 
   greatest: refuse("greatest (comes with the text kernels)"),
   least: refuse("least (comes with the text kernels)"),
 
-  date_trunc: refuse("date and time functions (temporal kernels come later)"),
+  date_trunc: per({
+    "text,timestamp": { kernel: "dateTrunc" },
+    "text,timestamptz": { kernel: "dateTrunc" },
+    "text,interval": refuse("interval DATE_TRUNC (calendar interval kernels come later)"),
+  }),
   extract: refuse("date and time functions (temporal kernels come later)"),
 
   nextval: refuse("sequences (come with DML)"),

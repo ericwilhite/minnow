@@ -84,6 +84,34 @@ export function formatDate(days: number): string {
   return `${pad(bc ? 1 - year : year, 4)}-${pad(month, 2)}-${pad(day, 2)}${bc ? " BC" : ""}`;
 }
 
+/** Parse canonical PostgreSQL DATE text, including BC and infinities; reject invalid dates. */
+export function parseDate(value: string): number {
+  if (/^\s*\+?infinity\s*$/iu.test(value)) return DATE_POS_INFINITY;
+  if (/^\s*-infinity\s*$/iu.test(value)) return DATE_NEG_INFINITY;
+  const m = /^(\d+)-(\d{2})-(\d{2})(?:\s+(BC))?$/iu.exec(value.trim());
+  if (m === null) throw new RangeError("date text expected");
+  const y = Number(m[1]);
+  const year = m[4] === undefined ? y : 1 - y;
+  const month = Number(m[2]),
+    day = Number(m[3]);
+  const days = daysFromCivil(year, month, day);
+  const civil = civilFromDays(days);
+  if (
+    y === 0 ||
+    !Number.isSafeInteger(y) ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    civil[0] !== year ||
+    civil[1] !== month ||
+    civil[2] !== day ||
+    days < DATE_MIN ||
+    days > DATE_MAX
+  )
+    throw new RangeError("date is out of range");
+  return days;
+}
+
 function isoYear(year: number): string {
   if (year >= 0 && year <= 9999) return pad(year, 4);
   return `${year < 0 ? "-" : "+"}${pad(Math.abs(year), 6)}`;

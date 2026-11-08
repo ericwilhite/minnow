@@ -418,31 +418,6 @@ export const CATALOGUE_REFUSALS: Readonly<Record<string, CatalogueRefusal>> = {
     stage: "execute",
     construct: "cast",
   },
-  S_q2: { class: "UnsupportedPlanError", sqlState: "0A000", stage: "execute", construct: "cast" },
-  "guide-13": {
-    class: "UnsupportedPlanError",
-    sqlState: "0A000",
-    stage: "execute",
-    construct: "function",
-  },
-  "guide-17": {
-    class: "UnsupportedPlanError",
-    sqlState: "0A000",
-    stage: "execute",
-    construct: "function",
-  },
-  S_q8: {
-    class: "UnsupportedPlanError",
-    sqlState: "0A000",
-    stage: "execute",
-    construct: "function",
-  },
-  "guide-12": {
-    class: "UnsupportedPlanError",
-    sqlState: "0A000",
-    stage: "execute",
-    construct: "setOp",
-  },
   "guide-18": {
     class: "UnsupportedPlanError",
     sqlState: "0A000",
@@ -455,6 +430,69 @@ export const CATALOGUE_REFUSALS: Readonly<Record<string, CatalogueRefusal>> = {
     stage: "execute",
     construct: "recursive",
   },
+};
+
+/** Each remaining cell has an explicit missing semantic capability and an authority outcome.
+ * These explain capability refusals, never waive a successful result comparison. */
+export const CATALOGUE_REFUSAL_REASONS: Readonly<
+  Record<string, { readonly reason: string; readonly pgState: "00000" | "42725" }>
+> = {
+  "guide-7": {
+    reason:
+      "JSON_OBJECT / JSON_ARRAYAGG need typed heterogeneous constructors and a charged, spillable JSON accumulator; the R19 scalar table has no JSON constructor overload yet.",
+    pgState: "00000",
+  },
+  "guide-8": {
+    reason:
+      "Whole-row json_agg requires record typing and bounded JSON accumulation; lowering currently expands the record to an unsupported JSON_OBJECT.",
+    pgState: "00000",
+  },
+  "guide-9": {
+    reason:
+      "The frozen query uses unknown -> unknown, which PostgreSQL rejects as ambiguous (42725). Its legacy MINNOW_JSON_GET_TEXT desugar has no R19 kernel. Keep the original SQL and explicit refusal until an authorized PG-valid catalogue correction.",
+    pgState: "42725",
+  },
+  "guide-14": {
+    reason:
+      "The front end desugars month addition to legacy DATE_ADD(months,milliseconds), losing interval field provenance. Calendar-preserving interval lowering and recursive work-table execution are required; do not reinterpret a user DATE_ADD as a PG function.",
+    pgState: "00000",
+  },
+  "guide-3": {
+    reason:
+      "Timestamp output casts, timestamp subtraction to INTERVAL and DATE subtraction kernels are unavailable. PostgreSQL text/interval rendering must precede admission of this cell.",
+    pgState: "00000",
+  },
+  "guide-15": {
+    reason:
+      "GENERATE_SERIES lowers to recursive/workTableScan. A bounded, cancellable fixpoint executor is unavailable; EXTRACT and interval arithmetic are also required.",
+    pgState: "00000",
+  },
+  "guide-18": {
+    reason:
+      "EXCEPT needs spillable set multiplicity and SQL NULL equality. The literal UNION ALL rewrite cannot implement distinct subtraction.",
+    pgState: "00000",
+  },
+};
+
+/** PostgreSQL's unordered FLOAT8 SUM permits different accumulation orders. These two
+ * unchanged catalogue cells promise next-core input order (agg/states.ts, stable group radix
+ * order in agg/aggregate.ts). The catalogue verifies the stored orders scan is order_id ASC.
+ * Their LAG window emits month ASC before the global SUM window, so that sum is month ASC.
+ * Pin only the independent PG authority to those same orders; no epsilon or SQL refreeze.
+ * https://www.postgresql.org/docs/18/functions-aggregate.html (input order unspecified).
+ */
+export const CATALOGUE_QUERY_AUTHORITY: Readonly<Record<string, string>> = {
+  "guide-13": `WITH monthly AS (
+    SELECT DATE_TRUNC('month', placed_at) AS month, SUM(total ORDER BY order_id) AS revenue
+    FROM orders WHERE status = 'completed' GROUP BY DATE_TRUNC('month', placed_at)
+  ) SELECT month, revenue, revenue - LAG(revenue) OVER (ORDER BY month) AS change
+  FROM monthly ORDER BY month`,
+  "guide-17": `WITH monthly AS (
+    SELECT DATE_TRUNC('month', placed_at) AS month, SUM(total ORDER BY order_id) AS revenue
+    FROM orders WHERE status = 'completed' GROUP BY DATE_TRUNC('month', placed_at)
+  ) SELECT month, revenue, revenue - LAG(revenue) OVER (ORDER BY month) AS change,
+  100.0 * revenue / SUM(revenue) OVER (ORDER BY month ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS pct_of_total
+  FROM monthly ORDER BY month`,
 };
 
 /** R21: witnesses for four frozen catalogue cells. The new executor is still compared exactly
