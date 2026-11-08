@@ -14,6 +14,7 @@
  * `UnsupportedOracleValueError` (a harness defect, so `replay` reports it as an error outcome
  * that cannot match the oracle).
  */
+import { formatSqlInterval, isInfiniteInterval } from "../temporal-text.js";
 import type { CreateTableInput, DatabaseRow } from "../../engine/database.js";
 import type { QueryParameter } from "../../engine/query.js";
 import type { SqlDomain } from "../../storage/types.js";
@@ -163,8 +164,14 @@ function flatValue(vector: FlatVector, row: number): unknown {
         hex += (data.bytes[k] ?? 0).toString(16).padStart(2, "0");
       return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
     }
-    case "interval":
-      throw new UnsupportedOracleValueError(vector.type);
+    case "interval": {
+      const months = data.months[row] ?? 0,
+        days = data.days[row] ?? 0,
+        micros = int64At(data.micros, row);
+      if (isInfiniteInterval(months, days, micros))
+        throw new UnsupportedOracleValueError(vector.type);
+      return formatSqlInterval(months, days, micros);
+    }
   }
 }
 

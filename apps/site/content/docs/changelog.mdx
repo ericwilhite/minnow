@@ -65,6 +65,14 @@ entry. Measured raw/gzip sizes are 1,172,659/351,184 bytes for the complete main
 Their raw caps each move up once by 512 bytes. Gzip caps, the worker application's main-thread
 budget, and package tarball caps stay unchanged.
 
+The unexported rebuild core now subtracts DATE values as whole days and finite timestamps as
+INTERVAL values with PostgreSQL's day and microsecond fields. DATE, TIMESTAMP, TIMESTAMPTZ and
+finite INTERVAL values cast to unbounded TEXT in PostgreSQL's default output styles and UTC.
+Timestamp row values keep their separate ISO representation. Bounded temporal text casts and
+infinite INTERVAL results remain explicitly unsupported. This changes the private rebuild
+executor; the shipped SQL engine, public API and stored formats are unchanged. No migration is
+needed.
+
 ## 0.20.0 — November 7, 2026
 
 Release packages: `@minnowdb/core@0.20.0`.

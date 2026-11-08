@@ -1683,6 +1683,50 @@ export const DATE_TRUNC_REACH = [
   "0A000",
 ] as const;
 
+/** SQL output functions preserve temporal fields and only evaluate active non-NULL rows. */
+export const TEMPORAL_TEXT_REACH = [
+  "date",
+  "timestamp",
+  "timestamptz",
+  "interval",
+  "flat",
+  "dictionary",
+  "constant",
+  "selected",
+  "all rows",
+  "sparse nonascending selection",
+  "NULL garbage",
+  "constant NULL",
+  "unselected garbage",
+  "safe timestamp",
+  "wide timestamp",
+  "infinities",
+  "BC",
+  "mixed signs",
+] as const;
+
+/** Native date/timestamp differences preserve PG interval fields, strictness and errors. */
+export const TEMPORAL_SUB_REACH = [
+  "date",
+  "timestamp",
+  "timestamptz",
+  "flat",
+  "dictionary",
+  "constant",
+  "selected",
+  "all rows",
+  "strict NULL",
+  "constant NULL",
+  "unselected garbage",
+  "safe timestamp",
+  "wide timestamp",
+  "rows",
+  "22008",
+  "infinite interval refused",
+  "positive infinity refused",
+  "negative infinity refused",
+] as const;
+
 /** Literal JSON_TABLE desugaring keeps row order, multiplicity, NULLs and text exact. */
 export const JSON_TABLE_VALUES_REACH = [
   "empty",

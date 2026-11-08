@@ -19,7 +19,8 @@ import type { PhysicalKind, PhysicalType } from "../../types.js";
 import { UnsupportedPlanError } from "../errors.js";
 
 /** The call kernels compile.ts dispatches to. */
-export type CallKernel = "arith" | "neg" | "coalesce" | "nullif" | "numericRound" | "dateTrunc";
+export type CallKernel =
+  "arith" | "neg" | "coalesce" | "nullif" | "numericRound" | "dateTrunc" | "temporalSub";
 
 export type Binding =
   | {
@@ -91,11 +92,11 @@ export const FUNCTION_BINDINGS: Readonly<Record<string, Binding | PerOverload>> 
   }),
   sub: per({
     ...each(NUMERIC, 2, ARITH),
-    "date,date": DATETIME,
+    "date,date": { kernel: "temporalSub" },
     "date,int4": DATETIME,
     "date,interval": DATETIME,
-    "timestamp,timestamp": DATETIME,
-    "timestamptz,timestamptz": DATETIME,
+    "timestamp,timestamp": { kernel: "temporalSub" },
+    "timestamptz,timestamptz": { kernel: "temporalSub" },
     "timestamp,interval": DATETIME,
     "timestamptz,interval": DATETIME,
     "time,time": DATETIME,
@@ -165,7 +166,8 @@ export const FUNCTION_BINDINGS: Readonly<Record<string, Binding | PerOverload>> 
 
 /**
  * Explicit casts (`explicitCastAllowed`) with no kernel yet, as "from→to" over SQL types; every
- * other allowed pair has one in cast.ts. `*` stands for any type of the table.
+ * other allowed pair has one in cast.ts. `*` stands for any type of the table; implemented
+ * temporal output casts are exceptions selected by castRefusal before its wildcard.
  */
 export const CAST_REFUSALS: ReadonlyMap<string, string> = new Map([
   ["*→text", "casts to text (output functions come with the text kernels)"],
@@ -183,7 +185,10 @@ export const CAST_REFUSALS: ReadonlyMap<string, string> = new Map([
 /** Why the cast `from → to` is refused, or null when cast.ts implements it. */
 export function castRefusal(from: SqlType, to: SqlType): string | null {
   if (from === to) return null;
-  if (to === "text") return CAST_REFUSALS.get("*→text") ?? null;
+  if (to === "text")
+    return from === "date" || from === "timestamp" || from === "timestamptz" || from === "interval"
+      ? null
+      : (CAST_REFUSALS.get("*→text") ?? null);
   if (from === "text") return CAST_REFUSALS.get("text→*") ?? null;
   return CAST_REFUSALS.get(`${from}→${to}`) ?? null;
 }

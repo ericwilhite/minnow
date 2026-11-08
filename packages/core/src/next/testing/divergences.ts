@@ -412,12 +412,6 @@ export const CATALOGUE_REFUSALS: Readonly<Record<string, CatalogueRefusal>> = {
     stage: "lower",
     construct: "function",
   },
-  "guide-3": {
-    class: "UnsupportedPlanError",
-    sqlState: "0A000",
-    stage: "execute",
-    construct: "cast",
-  },
   "guide-18": {
     class: "UnsupportedPlanError",
     sqlState: "0A000",
@@ -455,11 +449,6 @@ export const CATALOGUE_REFUSAL_REASONS: Readonly<
   "guide-14": {
     reason:
       "The front end desugars month addition to legacy DATE_ADD(months,milliseconds), losing interval field provenance. Calendar-preserving interval lowering and recursive work-table execution are required; do not reinterpret a user DATE_ADD as a PG function.",
-    pgState: "00000",
-  },
-  "guide-3": {
-    reason:
-      "Timestamp output casts, timestamp subtraction to INTERVAL and DATE subtraction kernels are unavailable. PostgreSQL text/interval rendering must precede admission of this cell.",
     pgState: "00000",
   },
   "guide-15": {

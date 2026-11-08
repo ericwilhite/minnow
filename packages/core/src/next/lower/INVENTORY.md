@@ -330,7 +330,6 @@ this unexported core; they do not describe the shipped engine's SQL support.
 | guide-8  | lower / function    | Whole-row json_agg needs record typing and bounded JSON accumulation; its expanded JSON_OBJECT is refused.                                                                                        |
 | guide-9  | lower / function    | The original frozen unknown -> unknown expression is ambiguous in PostgreSQL (42725). The legacy JSON extraction desugar is not an R19 function. No SQL refreeze or result waiver is applied.     |
 | guide-14 | lower / function    | Legacy DATE_ADD desugaring loses interval field provenance; calendar interval lowering and recursive execution are required. A user DATE_ADD call must not be mistaken for a PostgreSQL operator. |
-| guide-3  | execute / cast      | Timestamp-to-text output, timestamp subtraction to INTERVAL and DATE subtraction kernels are missing.                                                                                             |
 | guide-15 | execute / recursive | GENERATE_SERIES still needs bounded, cancellable work-table/fixpoint execution, plus interval arithmetic and EXTRACT.                                                                             |
 | guide-18 | execute / setOp     | EXCEPT needs spillable distinct/bag multiplicities with SQL NULL equality.                                                                                                                        |
 
@@ -354,3 +353,25 @@ matching the verified stored scan and stable per-group updates. Guide-17's LAG s
 month ASC before its global SUM, so the PG global SUM uses that full-frame order too. The
 frozen SQL remains unchanged. Unordered PostgreSQL float sums may choose a different input
 order; these comparisons use explicit orders rather than a numerical tolerance.
+
+## Temporal scalar execution
+
+DATE subtraction returns int4 days. Timestamp/timestamptz subtraction returns a finite INTERVAL
+with zero months and PostgreSQL's `interval_justify_hours` day/remainder fields; negative
+remainders truncate toward zero. Wide inputs subtract as exact BigInts and int64 difference
+overflow gives 22008. Infinite DATE subtraction and equal infinite timestamps give PG's 22008.
+Other timestamp differences that would produce an infinite INTERVAL stay typed execution
+refusals; no interval-infinity writer encoding or stored-format meaning is introduced.
+
+DATE, TIMESTAMP, TIMESTAMPTZ and finite INTERVAL cast to unbounded TEXT in PostgreSQL's default
+ISO date / postgres interval styles, with the fixed UTC zone. SQL timestamp text trims fraction
+zeros and uses historical BC years; D1's ISO timestamp row-value format remains unchanged.
+Mixed-sign intervals keep their months, days and microseconds as separate fields. Bounded TEXT
+casts and infinite INTERVAL output remain explicit typed refusals.
+
+The text kernels reserve bounded ASCII buffers before allocation (48 bytes per date/timestamp
+slot, 128 per interval slot), reuse them and skip NULL/unselected garbage. Sparse and
+nonascending selections keep monotone output offsets. Differential tests construct PG input
+from independent ordinal date and interval fields and compare interval subtraction fields
+directly, rather than judging arithmetic through its text renderer. Guide-3 now executes
+unchanged against both PGlite and the shipped engine; the frozen catalogue is 60/66 executions.
