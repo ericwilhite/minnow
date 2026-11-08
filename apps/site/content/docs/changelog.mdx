@@ -23,6 +23,10 @@ NUMERIC distances in the unexported rebuild executor do not change the public co
 Devtools' generated failure explanations now include the parameter-offset refusal and the
 clarified frame-compatibility notes from the matrix.
 
+**Size note:** the core package's SQL feature matrix and PostgreSQL profile add 402 packed
+bytes, bringing the tarball to 1,022,698 bytes. Its packed-size cap moves from 1,022,500 to
+1,023,000 bytes. Private rebuild code and test suites remain excluded; worker/client runtime code is unchanged. The unpacked-size and worker/client bundle caps remain unchanged.
+
 **Migration:** no stored-format change. Existing parameter frame offsets remain refused; use
 numeric literals. Consumers of SQL feature metadata should handle the added entries by ID.
 
