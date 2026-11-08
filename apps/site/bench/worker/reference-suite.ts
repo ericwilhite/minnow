@@ -572,17 +572,12 @@ export function referenceQueryDefinitions(orderRows: number): ReferenceQueryDefi
       complexity: "complex",
       tables: ["order_items", "products"],
       expectedRows: 15,
-      // Ranking on ROUND(revenue, 4) makes mathematically-tied revenues true ties in every
+      // Ranking on ROUND(CAST(revenue AS NUMERIC), 4) makes mathematically-tied revenues true ties in every
       // engine — summation-order float noise would otherwise pick different winners — and
       // product_id then breaks those ties so DENSE_RANK stays unique and rank <= 3 keeps
       // exactly three rows per category. QUALIFY is not in the surface; the window feeds a
       // CTE instead.
-      sql: "WITH product_revenue AS (SELECT p.category AS category, i.product_id AS product_id, SUM(i.quantity * i.unit_price) AS revenue FROM order_items i JOIN products p ON p.product_id = i.product_id GROUP BY p.category, i.product_id), ranked AS (SELECT category, product_id, revenue, DENSE_RANK() OVER (PARTITION BY category ORDER BY ROUND(revenue, 4) DESC, product_id) AS rank FROM product_revenue) SELECT category, product_id, revenue, rank FROM ranked WHERE rank <= 3 ORDER BY category, rank",
-      // Postgres has no ROUND(double precision, int); the window key casts through numeric.
-      engineSql: {
-        pglite:
-          "WITH product_revenue AS (SELECT p.category AS category, i.product_id AS product_id, SUM(i.quantity * i.unit_price) AS revenue FROM order_items i JOIN products p ON p.product_id = i.product_id GROUP BY p.category, i.product_id), ranked AS (SELECT category, product_id, revenue, DENSE_RANK() OVER (PARTITION BY category ORDER BY ROUND(revenue::numeric, 4) DESC, product_id) AS rank FROM product_revenue) SELECT category, product_id, revenue, rank FROM ranked WHERE rank <= 3 ORDER BY category, rank",
-      },
+      sql: "WITH product_revenue AS (SELECT p.category AS category, i.product_id AS product_id, SUM(i.quantity * i.unit_price) AS revenue FROM order_items i JOIN products p ON p.product_id = i.product_id GROUP BY p.category, i.product_id), ranked AS (SELECT category, product_id, revenue, DENSE_RANK() OVER (PARTITION BY category ORDER BY ROUND(CAST(revenue AS NUMERIC), 4) DESC, product_id) AS rank FROM product_revenue) SELECT category, product_id, revenue, rank FROM ranked WHERE rank <= 3 ORDER BY category, rank",
       columns: ["category", "product_id", "revenue", "rank"],
       project: (row) => [row.category, row.productId, row.revenue, row.rank],
       baseline: rankedProductsIndexed,
@@ -916,7 +911,7 @@ function repeatCustomersWithoutReturns(tables: ReadonlyMap<string, DatabaseRow[]
     .map(([customerId, count]) => ({ customerId, count }));
 }
 
-/** Mirrors q7's ROUND(revenue, 4) window key so float-noise near-ties rank identically. */
+/** Mirrors q7's ROUND(CAST(revenue AS NUMERIC), 4) window key so float-noise near-ties rank identically. */
 function roundedRevenue(revenue: number): number {
   return Math.round(revenue * 10_000) / 10_000;
 }

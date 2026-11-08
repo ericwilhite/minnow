@@ -20,8 +20,6 @@ import {
 import { inputBatch, type InputValue } from "../packages/core/dist/next/testing/executor-input.js";
 import { oracleRows } from "../packages/core/dist/next/testing/differential-adapter.js";
 import { createExecutor } from "../packages/core/dist/next/exec/create.js";
-import { PlanningError } from "../packages/core/dist/next/lower/errors.js";
-import { CATALOGUE_AUTHORITY_REFUSALS } from "../packages/core/dist/next/testing/divergences.js";
 import type { WireFlat } from "../packages/core/dist/next/owner/frame.js";
 import { UnsupportedPlanError } from "../packages/core/dist/next/errors.js";
 import { BATCH_ROWS, type Batch } from "../packages/core/dist/next/vector/vector.js";
@@ -103,6 +101,7 @@ const core = await new StorageCore(8192).open();
 const spec = generator.wideSpec(200);
 const metadata = {
   lane: "Node",
+  sqlCorrections: frozenSQL ? ["S_q7", "guide-4", "guide-5"] : dataset === "star" ? ["S_q7"] : [],
   revision: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
   storage: "MemoryBackend + extent space + WritePathImpl, strict commits, flushed",
   dataset,
@@ -141,7 +140,7 @@ const metadata = {
   profileId,
   execArgv: process.execArgv,
   sqlSource: frozenSQL
-    ? "committed executor-catalogue.json (unchanged SQL)"
+    ? "committed executor-catalogue.json (three PG-valid ROUND corrections; frozen data)"
     : "analytics-harness/queries.js",
   harness,
 };
@@ -287,25 +286,15 @@ try {
   const queries = sourceQueries.filter((query) => only.size === 0 || only.has(query.id));
   const records: unknown[] = [];
   for (const query of queries) {
-    const sql = frozenSQL ? query.sql : catalogue.sqlFor(query, "minnow", total);
+    const sourceSQL = frozenSQL ? query.sql : catalogue.sqlFor(query, "minnow", total);
+    // The frozen harness predates the authorized PG-valid S_q7 correction.
+    const sql =
+      !frozenSQL && query.id === "S_q7"
+        ? sourceSQL.replace("ROUND(revenue, 4)", "ROUND(revenue::numeric, 4)")
+        : sourceSQL;
     try {
       core.prepare(sql);
     } catch (error) {
-      if (
-        error instanceof PlanningError &&
-        query.id in CATALOGUE_AUTHORITY_REFUSALS &&
-        error.sqlState === "42883"
-      ) {
-        const record = {
-          id: query.id,
-          status: "authority-refusal",
-          sqlState: error.sqlState,
-          message: error.message,
-        };
-        records.push(record);
-        console.log(JSON.stringify(record));
-        continue;
-      }
       if (!(error instanceof UnsupportedPlanError)) throw error;
       const record = {
         id: query.id,

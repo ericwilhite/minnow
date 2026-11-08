@@ -11,8 +11,8 @@ import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
 import { assertCatalogueOrder, catalogueOrderColumns } from "./catalogue-order.js";
 import {
-  CATALOGUE_AUTHORITY_REFUSALS,
   CATALOGUE_REFUSALS,
+  ROUND_OVERLOAD_AUTHORITY,
   type CatalogueRefusal,
   CATALOGUE_CURRENT_AUTHORITY,
   queryAuthorityValue,
@@ -35,6 +35,25 @@ interface Fixture {
   queries: Query[];
 }
 const FIXTURE = fixtureData as unknown as Fixture;
+// Authorized refreeze: PostgreSQL has ROUND(numeric, int4), not ROUND(float8, int4).
+// No dataset or other SQL changed. Reversing these three corrections must recover the old hash.
+const ROUND_CORRECTIONS: Readonly<Record<string, ReadonlyArray<readonly [string, string]>>> = {
+  S_q7: [["ROUND(revenue, 4)", "ROUND(revenue::numeric, 4)"]],
+  "guide-4": [["ROUND(SUM(o.total), 2)", "ROUND(SUM(o.total)::NUMERIC, 2)"]],
+  "guide-5": [
+    ["ROUND(SUM(i.line_total), 2)", "ROUND(SUM(i.line_total)::NUMERIC, 2)"],
+    ["ROUND(AVG(i.line_total), 2)", "ROUND(AVG(i.line_total)::NUMERIC, 2)"],
+  ],
+};
+function originalRoundSQL(id: string, sql: string): string | null {
+  const corrections = ROUND_CORRECTIONS[id];
+  if (corrections === undefined) return null;
+  for (const [original, corrected] of corrections) {
+    sql = sql.replace(corrected, original);
+  }
+  return sql;
+}
+
 const canonical = (rows: ReadonlyArray<Record<string, unknown>>) =>
   rows.map((row) => encodeValue(Object.values(row))).sort();
 
@@ -99,6 +118,18 @@ for (const dataset of ["wide", "retail", "star"])
           ).rows,
         ).toEqual([{ type: "numeric" }]);
       for (const query of FIXTURE.queries.filter((query) => query.dataset === dataset)) {
+        const original = originalRoundSQL(query.id, query.sql);
+        if (original !== null) {
+          // Record the retained legacy extension without crediting it as a PG-valid cell.
+          await expect(
+            pg.query(original),
+            `${query.id}: ${ROUND_OVERLOAD_AUTHORITY}`,
+          ).rejects.toMatchObject({ code: "42883" });
+          expect(() => core.prepare(original), query.id).toThrow(
+            expect.objectContaining({ sqlState: "42883" }),
+          );
+          expect((await current.query(original)).rows, query.id).toBeDefined();
+        }
         const expectedRefusal = CATALOGUE_REFUSALS[query.id];
         let prepared: ReturnType<StorageCore["prepare"]>;
         let result: Awaited<ReturnType<StorageCore["execute"]>>;
@@ -124,10 +155,6 @@ for (const dataset of ["wide", "retail", "star"])
           expect(query.lowered, query.id).toBe(
             actual.class === "UnsupportedPlanError" && actual.stage === "execute",
           );
-          if (query.id in CATALOGUE_AUTHORITY_REFUSALS) {
-            await expect(pg.query(query.sql), query.id).rejects.toMatchObject({ code: "42883" });
-            expect((await current.query(query.sql)).rows).toBeDefined();
-          }
           refused.push({ id: query.id, ...actual });
           continue;
         }
@@ -222,18 +249,30 @@ for (const dataset of ["wide", "retail", "star"])
     }
   }, 60_000);
 
-it("keeps the frozen SQL and data unchanged while enabling capability metadata", async () => {
+it("keeps frozen data and every SQL cell except the three authorized ROUND corrections", async () => {
   const source = fixtureData;
   const frozen = {
     source: source.source,
     datasets: source.datasets,
     queries: source.queries.map(({ id, dataset, sql }) => ({ id, dataset, sql })),
   };
-  const hash = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(JSON.stringify(frozen)),
+  const fingerprint = async (value: unknown): Promise<string> => {
+    const hash = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(JSON.stringify(value)),
+    );
+    return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  };
+  expect(await fingerprint(frozen)).toBe(
+    "45b7af80987dcee9ee8786f9bf56d5417a4f519cea4beeece06235a310ad6c31",
   );
   expect(
-    Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join(""),
+    await fingerprint({
+      ...frozen,
+      queries: frozen.queries.map((query) => ({
+        ...query,
+        sql: originalRoundSQL(query.id, query.sql) ?? query.sql,
+      })),
+    }),
   ).toBe("8d3af125ed1af20672fe678e0fdc9a40e5ce180bae68c64a099b601ae7b7e9a1");
 });

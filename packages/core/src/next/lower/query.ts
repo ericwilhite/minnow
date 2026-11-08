@@ -12,7 +12,7 @@ import type { PhysicalType } from "../types.js";
 import { isAggregateCall } from "../../engine/query.js";
 import { encodeQueryIdentity } from "../../engine/query-identity.js";
 import type { CompiledQuery, Expression } from "../../plan/model.js";
-import { coerce, settle, type Typed } from "./coerce.js";
+import { canImplicitlyCast, coerce, settle, type Typed } from "./coerce.js";
 import { PlanningError, unsupported } from "./errors.js";
 import {
   asBool,
@@ -88,6 +88,68 @@ function aggregateDraft(
       type: INT8,
       nullable: false,
       big: false,
+    };
+  }
+  if (name === "PERCENTILE_CONT" || name === "PERCENTILE_DISC" || name === "MODE") {
+    const fn =
+      name === "MODE" ? "mode" : name === "PERCENTILE_CONT" ? "percentile_cont" : "percentile_disc";
+    const [order] = expression.aggregateOrderBy ?? [];
+    if (first === undefined || order === undefined || expression.aggregateOrderBy?.length !== 1)
+      throw new PlanningError("WITHIN GROUP requires one ordering expression", "42601");
+    if (distinct) throw unsupported("aggregate", "ordered-set DISTINCT");
+    const input = lowerExpression(first, scope, state);
+    let value = input;
+    if (fn === "percentile_cont") {
+      if (value.expr.type.kind === "interval")
+        throw unsupported("aggregate", "interval percentile_cont");
+      if (input.pending === undefined && !canImplicitlyCast(input.expr.type, { kind: "float64" }))
+        throw new PlanningError("function percentile_cont does not exist for these types", "42883");
+      value = coerce(input, { kind: "float64" }, "implicit", builder.parameters);
+    } else value = settle(input, builder.parameters);
+    const args: Typed[] = [];
+    if (fn !== "mode") {
+      const fraction = expression.arguments[1];
+      if (fraction === undefined)
+        throw new PlanningError("percentile requires a fraction", "42601");
+      const rawFraction = lowerExpression(fraction, scope, state);
+      if (rawFraction.expr.type.kind === "array")
+        throw unsupported("aggregate", "array percentile fractions");
+      if (
+        rawFraction.pending === undefined &&
+        !canImplicitlyCast(rawFraction.expr.type, { kind: "float64" })
+      )
+        throw new PlanningError(`function ${fn} does not exist for these types`, "42883");
+      const direct = coerce(rawFraction, { kind: "float64" }, "implicit", builder.parameters);
+      // Direct arguments are evaluated once per group, not over the input projection.
+      // Correlated/group-key direct arguments require a group scope, which is not wired yet.
+      args.push({
+        ...direct,
+        expr: mapColumns(direct.expr, () => {
+          throw unsupported("aggregate", "column-valued ordered-set direct argument");
+        }),
+      });
+    }
+    const result = aggregateResult(
+      fn,
+      args.map((arg) => arg.expr.type),
+      value.expr.type,
+    );
+    if (result === null)
+      throw new PlanningError(`function ${fn} does not exist for these types`, "42883");
+    return {
+      fn,
+      args,
+      distinct: false,
+      orderBy: [
+        {
+          typed: value,
+          direction: order.direction,
+          nulls: order.nulls ?? (order.direction === "desc" ? "first" : "last"),
+        },
+      ],
+      type: result,
+      nullable: true,
+      big: fn !== "percentile_cont" && value.big,
     };
   }
   if (first === undefined)
@@ -291,7 +353,11 @@ class Grouping {
     };
     const calls: AggregateCall[] = this.aggregates.map((draft) => ({
       fn: draft.fn,
-      args: draft.args.map(argumentColumn),
+      args: draft.args.map((arg) =>
+        draft.fn === "percentile_cont" || draft.fn === "percentile_disc" || draft.fn === "mode"
+          ? arg.expr
+          : argumentColumn(arg),
+      ),
       distinct: draft.distinct,
       filter: null,
       orderBy: draft.orderBy.map((order): SortKey => ({

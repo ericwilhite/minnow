@@ -209,3 +209,14 @@ These rulings follow the storage probe of 2026-11-05.
    - The log never reorders or invents a group, and a rolled-back root is detected.
    - `format/recovery-sweep.test.ts` ("lying flush") demonstrates this.
 8. **ICU collations use ranks, not sort-key bytes.** JavaScript has no sort-key API (C8).
+
+## ROUND overload at cutover
+
+R19 follows PostgreSQL's overload table: `round(float8)`, `round(numeric)`, or `round(numeric, int4)`.
+The shipped engine additionally accepts `round(float8, int4)`; this is a legacy extension to
+remove when the rebuilt core becomes the default, rather than a new intentional extension.
+Public retail examples and the analytics S_q7/guide-4/guide-5 cells cast the input to NUMERIC.
+The catalogue checks original SQL gives PG 42883, records legacy acceptance, then compares the
+corrected SQL through PostgreSQL, the shipped engine and the real rebuild executor. Its original
+frozen fingerprint is still checked after reversing only those three SQL corrections.
+Authority: https://www.postgresql.org/docs/18/functions-math.html.

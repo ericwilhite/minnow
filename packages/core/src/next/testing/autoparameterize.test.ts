@@ -114,9 +114,13 @@ describe("parameterize: what is lifted", () => {
     expect(key("SELECT label FROM big WHERE id = 9007199254740992")).toBe(
       key("SELECT label FROM big WHERE id = -9223372036854775807"),
     );
-    // Classed by the digits: the front end negates in the unsigned literal's type.
-    expect(key("SELECT label FROM big WHERE id = -2147483648")).toBe(
+    // PostgreSQL's signed int4 minimum belongs to the small family, unlike +2^31.
+    expect(key("SELECT label FROM big WHERE id = -2147483648")).toBe(small);
+    expect(key("SELECT label FROM big WHERE id = -2147483648")).not.toBe(
       key("SELECT label FROM big WHERE id = 2147483648"),
+    );
+    expect(key("SELECT label FROM big WHERE id = -9223372036854775808")).toBe(
+      key("SELECT label FROM big WHERE id = 9223372036854775807"),
     );
     expect(parameterize("SELECT label FROM big WHERE id = 5000000000")?.values).toEqual([
       5000000000n,
@@ -370,8 +374,8 @@ describe("plan-cache gate: one lowering per normalized text", () => {
 });
 
 describe("a lifted slot has exactly the type the original literal gets", () => {
-  // Review B6-p2c finding 2: past 2^53 the scanner said int8 where the original lowers NUMERIC,
-  // and `-2147483648` int4 where the original's unary minus gives int8.
+  // Review B6-p2c finding 2: a candidate slot must match original lowering. PostgreSQL's
+  // signed minima are int4/int8; round-sql.test.ts judges both lowering and this scanner by PG.
   const BOUNDARIES = [
     "0",
     "1",
@@ -388,6 +392,8 @@ describe("a lifted slot has exactly the type the original literal gets", () => {
     "-9007199254740993",
     "9223372036854775807",
     "-9223372036854775807",
+    "-9223372036854775808",
+    "-9223372036854775809",
     "9223372036854775808",
   ];
   const SHAPES: ReadonlyArray<(value: string) => string> = [
@@ -417,7 +423,7 @@ describe("a lifted slot has exactly the type the original literal gets", () => {
     next.execute("CREATE TABLE narrow (id integer PRIMARY KEY)");
     // Bound, not literal: the rows are exact whatever the front end makes of a literal.
     for (const key of keys) next.execute("INSERT INTO wide VALUES ($1, $2)", [BigInt(key), key]);
-    for (const key of keys.filter((v) => Math.abs(Number(v)) <= 2147483647))
+    for (const key of keys.filter((v) => BigInt(v) >= -2147483648n && BigInt(v) <= 2147483647n))
       next.execute("INSERT INTO narrow VALUES ($1) ON CONFLICT DO NOTHING", [BigInt(key)]);
     const reach = createReach("auto-parameterized literals", AUTOPARAMETERIZE_LITERAL_STATES);
     const decisions = new Map<string, string>();
@@ -447,7 +453,7 @@ describe("a lifted slot has exactly the type the original literal gets", () => {
             : [clientType.kind === "int32" || clientType.kind === "int64" ? BigInt(value) : value];
         if (parameterized === null) {
           reach.reach("not lifted");
-          if (BigInt(value) <= 9223372036854775807n && BigInt(value) >= -9223372036854775807n)
+          if (BigInt(value) <= 9223372036854775807n && BigInt(value) >= -9223372036854775808n)
             failures.push(`${sql}: an int8 literal not lifted`);
           continue;
         }
@@ -494,17 +500,17 @@ describe("a lifted slot has exactly the type the original literal gets", () => {
     reach.assertReached();
   });
 
-  it("lifts -2147483648 as int8 and leaves the client's $1 as the original types it", () => {
+  it("lifts -2147483648 as int4 and leaves the client's $1 as PostgreSQL types it", () => {
     const next = new LoweredDatabase();
     next.execute("CREATE TABLE wide (id bigint PRIMARY KEY, label text)");
     const sql = "SELECT count(*) AS n FROM wide WHERE $1 = -2147483648";
     const parameterized = parameterize(sql);
-    expect(parameterized?.types).toEqual([{ kind: "int64" }]);
+    expect(parameterized?.types).toEqual([{ kind: "int32", bits: 32 }]);
     if (parameterized === null) throw new Error("nothing lifted");
     const family = next.lowerer.lowerParameterized(parameterized, next.context());
     if (family.kind !== "parameterized") throw new Error(family.kind);
     expect(family.statement.parameters).toEqual(next.lower(sql).parameters);
-    expect(family.statement.parameters).toEqual([{ kind: "int64" }]);
+    expect(family.statement.parameters).toEqual([{ kind: "int32", bits: 32 }]);
   });
 
   it("past 2^53, lifts only where the original literal is int8 too", () => {

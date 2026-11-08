@@ -282,7 +282,7 @@ describe("SELECT", () => {
     expect(chain(lowered.plan.root)).toEqual(["project", "values"]);
   });
 
-  it("lowers the milestone M3 surface and refuses what is left with a construct key", () => {
+  it("lowers the milestone M3 surface and preserves direct ordered-set arguments", () => {
     const { run } = database(...RETAIL);
     const construct = (sql: string): string | null => {
       try {
@@ -302,9 +302,18 @@ describe("SELECT", () => {
       "UPDATE orders o SET qty = 1 FROM customers c WHERE c.id = o.customer_id",
     ])
       expect(construct(sql), sql).toBeNull();
-    expect(construct("SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY qty) FROM orders")).toBe(
-      "aggregate",
+    const ordered = query(
+      run("SELECT percentile_cont($1) WITHIN GROUP (ORDER BY qty DESC) FROM orders"),
     );
+    expect(ordered.parameters).toEqual([{ kind: "float64" }]);
+    expect(find(ordered.plan.root, "aggregate").aggregates).toMatchObject([
+      {
+        fn: "percentile_cont",
+        args: [{ op: "param", slot: 0, type: { kind: "float64" } }],
+        orderBy: [{ expr: { op: "column", type: { kind: "float64" } }, direction: "desc" }],
+        type: { kind: "float64" },
+      },
+    ]);
     // An uncorrelated LATERAL is a plain derived table after the front end's rewrite.
     expect(construct("SELECT * FROM customers c, LATERAL (SELECT 1 AS one) l")).toBeNull();
   });

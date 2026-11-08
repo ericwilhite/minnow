@@ -11,7 +11,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { MountedDevtools } from "@minnowdb/devtools";
 import { useSiteTheme } from "./use-site-theme";
 
-const DEMO_QUERY = `SELECT c.city, COUNT(*) AS orders, ROUND(SUM(o.total), 2) AS revenue
+const DEMO_QUERY = `SELECT c.city, COUNT(*) AS orders, ROUND(SUM(o.total)::NUMERIC, 2) AS revenue
 FROM orders o
 JOIN customers c ON c.customer_id = o.customer_id
 WHERE o.status = 'completed'

@@ -165,7 +165,8 @@ would say `?column?`.
 `ROUND(value, digits)` takes `NUMERIC` in PostgreSQL. Cast a plain-number expression
 explicitly, as in `ROUND(SUM(total)::NUMERIC, 2)`, for SQL that also runs there. Minnow's
 current engine additionally accepts a plain number with a digit count; PostgreSQL refuses
-that overload with `42883`. The numeric form returns exact decimal text.
+that overload with `42883`. This legacy overload is planned for removal when the rebuilt
+engine becomes the default; use the explicit cast now. The numeric form returns exact decimal text.
 
 ## Joins
 

@@ -256,6 +256,9 @@ machines: https://minnowdb.com/llms.txt
   Logical domains such as exact NUMERIC and enum use indexes for equality, but scan/sort for ranges.
 - SQL transactions support `SAVEPOINT name`, `ROLLBACK TO SAVEPOINT name`, and
   `RELEASE SAVEPOINT name`. A second `BEGIN` is rejected; use a savepoint for nested work.
+- For two-argument `ROUND`, cast a plain-number input to `NUMERIC`: `ROUND(value::NUMERIC, digits)`.
+  PostgreSQL refuses `ROUND(float8, int4)` with `42883`; Minnow's legacy overload is planned for
+  removal when the rebuilt engine becomes the default.
 - `db.explain(sql)` returns the optimized plan as text.
 - Check https://minnowdb.com/sql-feature-matrix.json before using an unfamiliar SQL form, and
   https://minnowdb.com/postgres-feature-profile.json before assuming PostgreSQL behavior. They

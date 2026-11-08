@@ -24,6 +24,7 @@ import { UnsupportedPlanError } from "../errors.js";
 import { compileArithmetic, compileNegate, type ArithOp } from "./arith.js";
 import { bindCall } from "./bindings.js";
 import { compileCase, compileCoalesce } from "./case.js";
+import { compileNumericRound } from "./round.js";
 import { compileCast } from "./cast.js";
 import { compileCompare, compileDistinctFrom } from "./compare.js";
 import { compileInList, compileJunction, compileNot, compileTest } from "./logic.js";
@@ -170,6 +171,12 @@ function compileCall(expr: Extract<ScalarExpr, { op: "call" }>, context: Compile
       const [arg] = args;
       if (arg === undefined) throw new TypeError("neg takes one argument");
       return compileNegate(expr.type, arg, arena);
+    }
+    case "numericRound": {
+      const [input, digits] = args;
+      if (input === undefined || digits === undefined)
+        throw new TypeError("numeric ROUND takes two arguments");
+      return compileNumericRound(expr.type, input, digits, arena);
     }
     case "coalesce":
       return compileCoalesce(expr.type, args, arena);
