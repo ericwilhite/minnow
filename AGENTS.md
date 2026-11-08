@@ -61,6 +61,14 @@ Facts about this repository that are easy to get wrong:
   `tsc --noEmit -p scripts` before `tsc -b` fails on missing dists. ESLint still runs `scripts/`
   without type-aware rules, and `scripts/consumer-smoke/fixture` is deliberately excluded: the
   smoke test compiles it against the packed tarballs.
+- **The SQL feature matrix has exact browser populations.** When changing
+  `packages/core/sql-feature-matrix.json`, update the counts in
+  `packages/core/browser-tests/sql-differential.spec.ts`. Supported entries that differ from
+  PostgreSQL also need an independently authored `packages/core/browser/sql-feature-probes.ts`
+  probe. Before reporting, run
+  `npm run test:browser:library -- packages/core/browser-tests/sql-differential.spec.ts --project chromium`.
+  Put the spec before `--project`: Playwright accepts several project names and otherwise treats
+  the trailing spec as another project. The fast population test does not replace the browser run.
 - **Root `tsconfig.json` validates zero files.** It is `"files": []` plus project references.
   `tsc --noEmit -p tsconfig.json` proves nothing; use `npm run typecheck`.
 - **`apps/site/public/versions.json` is a hand-maintained input**, not a generated file, even

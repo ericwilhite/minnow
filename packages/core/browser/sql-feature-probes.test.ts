@@ -1,3 +1,4 @@
+import { PGlite } from "@electric-sql/pglite";
 import { describe, expect, it } from "vitest";
 import rawProfile from "../postgres-feature-profile.json";
 import rawMatrix from "../sql-feature-matrix.json";
@@ -84,13 +85,14 @@ const expectedFeatureIds = [
   "ddl.drop-view",
   "ddl.foreign-key-on-update",
   "ddl.foreign-key-not-enforced",
+  "window.frame-range-integer-fractional",
 ] as const;
 
 describe("browser SQL feature behavior probes", () => {
   it("keeps the independently authored feature and step populations fixed", () => {
     expect(featureBehaviorProbes.map(({ featureId }) => featureId)).toEqual(expectedFeatureIds);
     expect(new Set(expectedFeatureIds).size).toBe(expectedFeatureIds.length);
-    expect(featureBehaviorProbes.reduce((total, probe) => total + probe.steps.length, 0)).toBe(161);
+    expect(featureBehaviorProbes.reduce((total, probe) => total + probe.steps.length, 0)).toBe(162);
     expect(
       featureBehaviorProbes
         .flatMap(({ steps }) => steps)
@@ -318,4 +320,27 @@ describe("browser SQL feature behavior probes", () => {
       ["ddl.alter-table-rename-column", "TypeError", "Ambiguous or missing column: old_name"],
     ]);
   });
+});
+
+it("anchors the fractional integer RANGE probe to PostgreSQL's type refusal and distance rule", async () => {
+  const step = featureBehaviorProbes.find(
+    (probe) => probe.featureId === "window.frame-range-integer-fractional",
+  )?.steps[0];
+  if (step?.kind !== "query") throw new Error("Missing fractional RANGE query probe");
+  const pg = await PGlite.create();
+  try {
+    await expect(pg.query(step.sql)).rejects.toMatchObject({ code: "0A000" });
+    // These tiny integers are exact float8 values. PG's valid float8 RANGE overload gives an
+    // independent semantic witness for the documented public integer-key admission difference.
+    const valid = step.sql.replace(
+      "ORDER BY k RANGE",
+      "ORDER BY CAST(k AS DOUBLE PRECISION) RANGE",
+    );
+    expect(valid).not.toBe(step.sql);
+    const result = await pg.query<{ k: number; n: number | string | bigint }>(valid);
+    expect(result.fields.map((column) => column.name)).toEqual(step.expected.columns);
+    expect(result.rows.map(({ k, n }) => [k, Number(n)])).toEqual(step.expected.rows);
+  } finally {
+    await pg.close();
+  }
 });

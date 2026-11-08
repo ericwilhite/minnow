@@ -1414,4 +1414,22 @@ export const featureBehaviorProbes: readonly FeatureBehaviorProbe[] = [
       },
     ],
   },
+  {
+    featureId: "window.frame-range-integer-fractional",
+    steps: [
+      {
+        kind: "query",
+        sql: "SELECT k, COUNT(*) OVER (ORDER BY k RANGE 1.5 PRECEDING) AS n FROM (SELECT 0 AS k UNION ALL SELECT 1 AS k UNION ALL SELECT 2 AS k) AS frame_keys ORDER BY k",
+        expected: {
+          columns: ["k", "n"],
+          rows: [
+            [0, 1],
+            [1, 2],
+            [2, 2],
+          ],
+          ordered: true,
+        },
+      },
+    ],
+  },
 ];
