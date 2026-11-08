@@ -15,13 +15,17 @@ const option = (n: string, f: string) => {
   return i < 0 ? f : (args[i + 1] ?? f);
 };
 const rows = Number(option("--rows", "1000000")),
-  rounds = Number(option("--repeats", "9"));
+  rounds = Number(option("--repeats", "9")),
+  warmups = Number(option("--warmups", "3"));
 if (
   !Number.isSafeInteger(rows) ||
   rows < 1 ||
   rows > 1000000 ||
   !Number.isSafeInteger(rounds) ||
-  rounds < 5
+  rounds < 5 ||
+  !Number.isSafeInteger(warmups) ||
+  warmups < 1 ||
+  warmups > 100
 )
   throw new RangeError("1..1M rows, >=5 rounds");
 const output = resolve(option("--output", join(tmpdir(), "minnow-highcard-domain")));
@@ -62,11 +66,21 @@ const files = [
   "packages/core/dist/next/exec/agg/groups.js",
   "packages/core/dist/next/exec/agg/states.js",
   "packages/core/dist/next/exec/agg/group-top-n.js",
+  ...(args.includes("--candidate")
+    ? [
+        "packages/core/dist/next/exec/agg/domain-count-sum.js",
+        "packages/core/src/next/exec/agg/domain-count-sum.ts",
+        "packages/core/src/next/exec/agg/domain-count-sum.test.ts",
+      ]
+    : []),
 ];
 const metadata = {
   lane: "Node isolated decoded component",
   rows,
   rounds,
+  warmups,
+  operatorOnly: args.includes("--operator-only"),
+  candidate: args.includes("--candidate"),
   node: process.version,
   cpu: cpus()[0]?.model,
   revision: execFileSync("git", ["rev-parse", "HEAD"], {
@@ -102,8 +116,13 @@ try {
     output,
     undefined,
     undefined,
-    undefined,
-    { warmups: 3, omitAliases: true },
+    args.includes("--candidate") ? {} : undefined,
+    {
+      warmups,
+      omitAliases: true,
+      domainCountSum: args.includes("--candidate"),
+      operatorOnly: args.includes("--operator-only"),
+    },
   );
   await writeFile(join(output, "component.json"), JSON.stringify({ ...metadata, result }, null, 2));
   console.log(JSON.stringify(result.cpuMs));

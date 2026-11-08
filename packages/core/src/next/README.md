@@ -1329,6 +1329,15 @@ state allocation and top-100 selection are timed. This is a benchmark kernel, no
 plan; it borrows immutable non-NULL int32/finite float8 inputs under the source
 cardinality/magnitude bound. Generated PGlite checks cover negative and endpoint domains, holes,
 wide-domain fallback, signed zero and exact count-desc/key-asc ordering.
+The same component script's `--candidate` flag also measures `DomainCountSumOperator`, an
+unwired executor experiment. It probes the complete decoded key stream inside timing, charges
+its optional packed table, keeps an exact disjoint hash fallback, and selects group ids before
+copying only the top-N payload. Fixed winner buffers are reserved up front; the large table is
+released before downstream output. Refused direct-state allocation keeps the ordinary plan.
+The component includes both probe and update drivers plus shared task pacing. It does not read
+a table or establish the cost of obtaining a sound snapshot bound in a real SQL plan. No
+default factory path selects this operator, and no new aggregation spill implementation is
+claimed.
 The report includes CPU samples, full spreads, checkpointed partial rounds, profiles and the
 actual transformed JS needed to interpret line-level ticks. No baseline is an executor path.
 Unbounded, value-producing `indexRange` nodes require the same internal `keyOrder:true`

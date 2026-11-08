@@ -15,6 +15,7 @@ import {
   AggregateOperator,
   type AggregateOptions,
 } from "../packages/core/dist/next/exec/agg/aggregate.js";
+import { DomainCountSumOperator } from "../packages/core/dist/next/exec/agg/domain-count-sum.js";
 import { SortOperator } from "../packages/core/dist/next/exec/sort.js";
 import { OutputArena } from "../packages/core/dist/next/exec/kernels/vectors.js";
 import { drive, type Operator } from "../packages/core/dist/next/exec/pipeline.js";
@@ -63,6 +64,8 @@ export async function lightComparison(
     readonly warmups?: number;
     readonly nativeOnly?: boolean;
     readonly omitAliases?: boolean;
+    readonly domainCountSum?: boolean;
+    readonly operatorOnly?: boolean;
   } = {},
 ) {
   const warmups = measurement.warmups ?? 3;
@@ -208,7 +211,7 @@ export async function lightComparison(
           nulls: "last" as const,
           collation: null,
         }));
-  const operator = async (options: AggregateOptions = {}) => {
+  const operator = async (options: AggregateOptions = {}, domainCountSum = false) => {
     const grant = await core.harness.governor.admit({
         label: "light/operator",
         minimumBytes: 16 << 20,
@@ -245,20 +248,39 @@ export async function lightComparison(
             { grant, spill: core.spill, queryId: 991 },
             sink,
           );
-    const aggregate = new AggregateOperator(
-      rel,
-      { arena, params: { slots: [] }, input: types },
-      grant,
-      sort ?? sink,
-      {
-        packedAverages: false,
-        packedIntegers: false,
-        batchDictionaryMinMax: false,
-        ...options,
-        ...(id === "agg_highcard_int" ? { outputTopN: { count: 100, keys } } : {}),
-      },
-    );
+    const context = { arena, params: { slots: [] }, input: types };
+    const configuration: AggregateOptions = {
+      packedAverages: false,
+      packedIntegers: false,
+      batchDictionaryMinMax: false,
+      ...options,
+      ...(id === "agg_highcard_int" ? { outputTopN: { count: 100, keys } } : {}),
+    };
+    const aggregate = domainCountSum
+      ? new DomainCountSumOperator(rel, context, grant, sort ?? sink, configuration)
+      : new AggregateOperator(rel, context, grant, sort ?? sink, configuration);
     try {
+      if (aggregate instanceof DomainCountSumOperator) {
+        let probeAt = 0;
+        await drive(
+          {
+            next: () => {
+              const batch = captured[probeAt++];
+              return batch ? { batch } : null;
+            },
+            abort: () => undefined,
+          },
+          {
+            push: (batch) => {
+              aggregate.probe(batch);
+              return "ready";
+            },
+            ready: () => Promise.resolve(),
+            finish: () => aggregate.seal(),
+            abort: (reason) => aggregate.abort(reason),
+          },
+        );
+      }
       let at = 0;
       await drive(
         {
@@ -270,7 +292,10 @@ export async function lightComparison(
         },
         aggregate,
       );
-      return { rows };
+      return {
+        rows,
+        directRows: aggregate instanceof DomainCountSumOperator ? aggregate.directRows : 0,
+      };
     } finally {
       aggregate.abort(undefined);
       sort?.abort(undefined);
@@ -328,7 +353,9 @@ export async function lightComparison(
   if (feed) for (let w = 0; w < warmups; w++) assert.equal((await feed()).rows, N);
   if (candidate)
     for (let w = 0; w < warmups; w++) {
-      assert.deepEqual((await operator(candidate)).rows, expected.rows);
+      const result = await operator(candidate, measurement.domainCountSum);
+      assert.deepEqual(result.rows, expected.rows);
+      if (measurement.domainCountSum) assert.ok(result.directRows > 0);
       measurement.collect?.();
     }
   const operations = {
@@ -336,7 +363,7 @@ export async function lightComparison(
     split,
     native,
     operator: () => operator(),
-    candidate: candidate ? () => operator(candidate) : undefined,
+    candidate: candidate ? () => operator(candidate, measurement.domainCountSum) : undefined,
     whole: pipeline,
     feed,
   };
@@ -346,7 +373,8 @@ export async function lightComparison(
     (kind) =>
       operations[kind] !== undefined &&
       !(measurement.nativeOnly && (kind === "bound" || kind === "split")) &&
-      !(measurement.omitAliases && kind === "split"),
+      !(measurement.omitAliases && kind === "split") &&
+      !(measurement.operatorOnly && kind !== "operator" && kind !== "candidate"),
   );
   for (let round = 0; round < rounds; round++) {
     loads.push(loadavg());
