@@ -51,7 +51,7 @@ import { DistinctSet } from "./distinct.js";
 import { ScalarByteDistinct, supportsScalarByteDistinct } from "./scalar-byte-distinct.js";
 import { GroupTopN, supportsGroupTopN, type GroupTopNSpec } from "./group-top-n.js";
 import { GroupTable } from "./groups.js";
-import { accumulatorFor, fusedSums, type Accumulator } from "./states.js";
+import { accumulatorFor, fusedSums, updateGroupedPair, type Accumulator } from "./states.js";
 
 type AggregateRel = Extract<Rel, { op: "aggregate" }>;
 
@@ -87,6 +87,8 @@ interface CompiledAggregate {
   readonly updates: boolean;
   /** In the fused scalar pass (no GROUP BY, no FILTER or DISTINCT, an exact sum). */
   readonly fusable: boolean;
+  /** undefined: not eligible; null: COUNT(*); number: plain SUM input column. */
+  readonly groupedColumn: number | null | undefined;
 }
 
 /**
@@ -125,6 +127,8 @@ export interface AggregateOptions {
   readonly groupedDistinctBitmap?: boolean;
   /** False retains generic value interning for scalar byte COUNT(DISTINCT) (benchmark control). */
   readonly scalarByteDistinct?: boolean;
+  /** False retains separate grouped update loops (benchmark control). */
+  readonly groupedUpdateFusion?: boolean;
 }
 
 /** Refuses what the operator cannot compile, before anything is allocated. */
@@ -161,6 +165,7 @@ export class AggregateOperator implements Operator {
   readonly #sorted: { rows: Uint16Array; count: number } = { rows: new Uint16Array(0), count: 0 };
   /** Accumulators updated over the batch's own rows (no FILTER): what a sort serves. */
   #sortPasses = 0;
+  readonly #groupedUpdateFusion: boolean;
   #fusedTotals = new Float64Array(0);
   readonly #gids: Int32Array = new Int32Array(0);
   readonly #keyVectors: Vector[];
@@ -196,6 +201,7 @@ export class AggregateOperator implements Operator {
   ) {
     preflight(rel);
     this.#charge = charge;
+    this.#groupedUpdateFusion = options.groupedUpdateFusion !== false;
     this.#interval = options.yieldIntervalMs ?? YIELD_INTERVAL_MS;
     this.#clock = clockFor(options.now);
     this.#target = options.targetBytes ?? BATCH_TARGET_BYTES;
@@ -338,6 +344,14 @@ export class AggregateOperator implements Operator {
             : "sum"
           : "own",
       updates: true,
+      groupedColumn:
+        call.filter === null && !call.distinct
+          ? call.fn === "count_star" && call.args.length === 0
+            ? null
+            : call.fn === "sum" && call.args.length === 1 && arg?.op === "column"
+              ? arg.index
+              : undefined
+          : undefined,
       fusable:
         call.filter === null &&
         !call.distinct &&
@@ -369,8 +383,40 @@ export class AggregateOperator implements Operator {
       groups.groupCount > SORT_MIN_GROUPS
         ? this.#sortByGroup(gids, batch.selection, length, groups.groupCount)
         : null;
-    for (const aggregate of this.#aggregates) {
-      if (!aggregate.updates || (scalar && aggregate.fusable)) continue;
+    for (let index = 0; index < this.#aggregates.length; index++) {
+      const aggregate = this.#aggregates[index];
+      if (aggregate === undefined || !aggregate.updates || (scalar && aggregate.fusable)) continue;
+      const next = this.#aggregates[index + 1];
+      if (
+        !scalar &&
+        this.#groupedUpdateFusion &&
+        next?.updates === true &&
+        aggregate.groupedColumn !== undefined &&
+        typeof next.groupedColumn === "number"
+      ) {
+        const left =
+          aggregate.groupedColumn === null ? null : batch.columns[aggregate.groupedColumn];
+        const right = batch.columns[next.groupedColumn];
+        const rows = sorted ?? batch.selection;
+        // Only direct columns: evaluating a later fallible expression before an earlier
+        // aggregate finishes would change which error wins. NULL/encoded inputs fall back.
+        if (
+          left !== undefined &&
+          right !== undefined &&
+          updateGroupedPair(
+            aggregate.accumulator,
+            next.accumulator,
+            left,
+            right,
+            gids,
+            rowsIn(rows),
+            countIn(rows, length),
+          )
+        ) {
+          index++;
+          continue;
+        }
+      }
       let rows: Selection | null = batch.selection;
       if (aggregate.filter !== null) {
         rows = aggregate.filter.select(batch);

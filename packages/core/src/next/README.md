@@ -1595,6 +1595,16 @@ The full interface contract includes the following (DML remains unimplemented by
   comparisons use it only while both values are safe integers, otherwise comparing exact words.
 - NUMERIC results past PostgreSQL's limits (131,072 digits before the decimal point) are 22003 at
   emission, SUM's and AVG's alike; exact intermediates may pass them and come back.
+- Adjacent grouped COUNT(*)/SUM(float8) and SUM(float8)/SUM(float8) over direct
+  columns use one update loop when both inputs are flat and all-valid. Each SUM keeps its own
+  state and input order. The loop stops before a non-finite result; ordinary transitions finish
+  the first aggregate before the second, preserving overflow precedence. NULL, dictionary,
+  constant, FILTER, DISTINCT and expression arguments keep separate updates. AVG is excluded:
+  no count, mask, Sx or Sxx state is coalesced. These pairs cover 2/2 highcard outputs and only
+  2/21 outputs in the wide catalogue shape, whose aggregates all read different columns.
+  `createExecutor({ groupedUpdateFusion: false })` selects separate loops;
+  `next-agg-fused-update-bench.mts` measures real accumulator updates, and
+  `next-executor-bench.mts --whole-compare grouped-pairs` compares whole queries.
 - `distinct.ts`: exact DISTINCT through shared value ids. Grouped COUNT(DISTINCT) uses one
   membership bitmap per group when its first active batch uses group ids below 64; it does not
   hash/store each (group, value id) pair again. Values and dictionary-entry hashes stay shared.

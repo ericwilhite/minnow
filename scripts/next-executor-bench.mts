@@ -493,6 +493,7 @@ try {
           "group-top-n",
           "grouped-distinct",
           "scalar-distinct",
+          "grouped-pairs",
           "aggregation",
         ].includes(option("--whole-compare", "")) &&
         (option("--whole-compare", "") !== "late-fetch" || query.id === "sort_topn_wide")
@@ -500,19 +501,21 @@ try {
         const saved = core.executor.prepare;
         const strategies = [
           createExecutor(
-            option("--whole-compare", "") === "scalar-distinct"
-              ? { scalarByteDistinct: false }
-              : option("--whole-compare", "") === "aggregation"
-                ? { groupTopN: false, groupedDistinctBitmap: false }
-                : option("--whole-compare", "") === "grouped-distinct"
-                  ? { groupedDistinctBitmap: false }
-                  : option("--whole-compare", "") === "group-top-n"
-                    ? { groupTopN: false }
-                    : option("--whole-compare", "") === "key-order"
-                      ? { keyOrder: false }
-                      : option("--whole-compare", "") === "late-fetch"
-                        ? { lateFetchOnce: false }
-                        : { lateSort: false },
+            option("--whole-compare", "") === "grouped-pairs"
+              ? { groupedUpdateFusion: false }
+              : option("--whole-compare", "") === "scalar-distinct"
+                ? { scalarByteDistinct: false }
+                : option("--whole-compare", "") === "aggregation"
+                  ? { groupTopN: false, groupedDistinctBitmap: false }
+                  : option("--whole-compare", "") === "grouped-distinct"
+                    ? { groupedDistinctBitmap: false }
+                    : option("--whole-compare", "") === "group-top-n"
+                      ? { groupTopN: false }
+                      : option("--whole-compare", "") === "key-order"
+                        ? { keyOrder: false }
+                        : option("--whole-compare", "") === "late-fetch"
+                          ? { lateFetchOnce: false }
+                          : { lateSort: false },
           ),
           createExecutor(option("--whole-compare", "") === "key-order" ? { keyOrder: true } : {}),
         ];
@@ -563,33 +566,37 @@ try {
               if (late) afterProfile = result.profile;
               else beforeProfile = result.profile;
               order.push(
-                option("--whole-compare", "") === "scalar-distinct"
+                option("--whole-compare", "") === "grouped-pairs"
                   ? late
-                    ? "scalar-byte-membership"
-                    : "scalar-value-interning"
-                  : option("--whole-compare", "") === "aggregation"
+                    ? "fused-grouped-pairs"
+                    : "separate-grouped-updates"
+                  : option("--whole-compare", "") === "scalar-distinct"
                     ? late
-                      ? "aggregation-default"
-                      : "aggregation-control"
-                    : option("--whole-compare", "") === "grouped-distinct"
+                      ? "scalar-byte-membership"
+                      : "scalar-value-interning"
+                    : option("--whole-compare", "") === "aggregation"
                       ? late
-                        ? "bitmaps-enabled"
-                        : "pair-set-control"
-                      : option("--whole-compare", "") === "group-top-n"
+                        ? "aggregation-default"
+                        : "aggregation-control"
+                      : option("--whole-compare", "") === "grouped-distinct"
                         ? late
-                          ? "selected-groups"
-                          : "all-groups"
-                        : option("--whole-compare", "") === "key-order"
+                          ? "bitmaps-enabled"
+                          : "pair-set-control"
+                        : option("--whole-compare", "") === "group-top-n"
                           ? late
-                            ? "index-cursor"
-                            : "scan-sort-locators"
-                          : option("--whole-compare", "") === "late-fetch"
+                            ? "selected-groups"
+                            : "all-groups"
+                          : option("--whole-compare", "") === "key-order"
                             ? late
-                              ? "one-pass-payload"
-                              : "cached-payload"
-                            : late
-                              ? "keys-and-locators"
-                              : "full-payload",
+                              ? "index-cursor"
+                              : "scan-sort-locators"
+                            : option("--whole-compare", "") === "late-fetch"
+                              ? late
+                                ? "one-pass-payload"
+                                : "cached-payload"
+                              : late
+                                ? "keys-and-locators"
+                                : "full-payload",
               );
               console.error(
                 JSON.stringify({ id: query.id, comparison: true, round, late, load: loadavg() }),
@@ -617,8 +624,8 @@ try {
           before: { ...baseline, profile: beforeProfile },
           after: { ...candidate, profile: afterProfile },
           medianDeltaMs: baseline.median - candidate.median,
-          regressionWithinLargestSpread:
-            candidate.median - baseline.median <= Math.max(baseline.spread, candidate.spread),
+          // The acceptance rule uses the parent's spread, even when the candidate is noisier.
+          regressionWithinParentSpread: candidate.median <= baseline.median + baseline.spread,
         };
       }
       const record = {

@@ -227,6 +227,16 @@ class CountAccumulator implements Accumulator {
       counts[g] = (counts[g] ?? 0) + bit;
     }
   }
+  /** Borrow COUNT(*) state only for a synchronous, independent float SUM update. */
+  updateWithSum(
+    sum: FloatSumAccumulator,
+    vector: Vector,
+    gids: Int32Array,
+    rows: Uint16Array,
+    count: number,
+  ): boolean {
+    return this.star && sum.updateCounted(this.#counts, vector, gids, rows, count);
+  }
   /** Counts as plain numbers (AVG reads them). */
   count(g: number): number {
     return this.#counts[g] ?? 0;
@@ -983,6 +993,80 @@ function averageDense(
   return k;
 }
 
+/** Dense pair loops stop before committing either state at the first non-finite result. */
+function countedSumDense(
+  counts: Float64Array,
+  sums: Float64Array,
+  has: Uint8Array,
+  values: Float64Array,
+  gids: Int32Array,
+  rows: Uint16Array,
+  count: number,
+): number {
+  let k = 0;
+  for (; k < count; k++) {
+    const i = rows[k] ?? 0,
+      g = gids[i] ?? 0,
+      next = (sums[g] ?? 0) + (values[i] ?? 0);
+    if (next - next !== 0) break;
+    counts[g] = (counts[g] ?? 0) + 1;
+    sums[g] = next;
+    has[g] = 1;
+  }
+  return k;
+}
+function twoSumsDense(
+  sums: Float64Array,
+  has: Uint8Array,
+  other: Float64Array,
+  otherHas: Uint8Array,
+  values: Float64Array,
+  otherValues: Float64Array,
+  gids: Int32Array,
+  rows: Uint16Array,
+  count: number,
+): number {
+  let k = 0;
+  for (; k < count; k++) {
+    const i = rows[k] ?? 0,
+      g = gids[i] ?? 0,
+      a = (sums[g] ?? 0) + (values[i] ?? 0),
+      b = (other[g] ?? 0) + (otherValues[i] ?? 0);
+    if (a - a !== 0 || b - b !== 0) break;
+    sums[g] = a;
+    has[g] = 1;
+    other[g] = b;
+    otherHas[g] = 1;
+  }
+  return k;
+}
+
+/**
+ * Adjacent grouped COUNT(*)/SUM(float8) or SUM(float8)/SUM(float8) updates. Callers must
+ * supply plain direct-column arguments with no FILTER/DISTINCT; eligibility is checked before
+ * changing any state. NULL, encoded and float4 inputs keep the ordinary accumulator path.
+ * Every SUM retains its own state: differing past NULL masks do not prevent a later dense batch
+ * from qualifying. No AVG count/mask/Sxx state is shared; no input reference survives this call.
+ */
+export function updateGroupedPair(
+  first: Accumulator,
+  second: Accumulator,
+  left: Vector | null,
+  right: Vector | null,
+  gids: Int32Array,
+  rows: Uint16Array,
+  count: number,
+): boolean {
+  if (!(second instanceof FloatSumAccumulator) || right === null) return false;
+  if (first instanceof CountAccumulator && left === null)
+    return first.updateWithSum(second, right, gids, rows, count);
+  return (
+    first instanceof FloatSumAccumulator &&
+    left !== null &&
+    first.updateTogether(second, left, right, gids, rows, count)
+  );
+}
+
 class FloatSumAccumulator implements Accumulator {
   readonly #memory: Charged;
   #sums: Float64Array = new Float64Array(0);
@@ -1055,6 +1139,68 @@ class FloatSumAccumulator implements Accumulator {
     }
     if (k < count) this.#exact(values, validity, gids, rows, k, count, scalar, float32);
   }
+  /** COUNT(*) plus SUM(float8), with independent state and the original row order. */
+  updateCounted(
+    counts: Float64Array,
+    vector: Vector,
+    gids: Int32Array,
+    rows: Uint16Array,
+    count: number,
+  ): boolean {
+    if (
+      this.average ||
+      this.type.kind !== "float64" ||
+      vector.form !== "flat" ||
+      vector.data.layout !== "f64" ||
+      vector.validity !== null
+    )
+      return false;
+    const values = vector.data.values,
+      sums = this.#sums,
+      has = this.#has;
+    const k = countedSumDense(counts, sums, has, values, gids, rows, count);
+    // The ordinary COUNT runs before the whole SUM. Finish its suffix before SUM can throw.
+    for (let j = k; j < count; j++) {
+      const g = gids[rows[j] ?? 0] ?? 0;
+      counts[g] = (counts[g] ?? 0) + 1;
+    }
+    if (k < count) this.#exact(values, null, gids, rows, k, count, false, false);
+    return true;
+  }
+
+  /** Two plain SUM(float8)s. The first aggregate's errors still precede the second's. */
+  updateTogether(
+    other: FloatSumAccumulator,
+    left: Vector,
+    right: Vector,
+    gids: Int32Array,
+    rows: Uint16Array,
+    count: number,
+  ): boolean {
+    if (
+      this === other ||
+      this.average ||
+      other.average ||
+      this.type.kind !== "float64" ||
+      other.type.kind !== "float64" ||
+      left.form !== "flat" ||
+      right.form !== "flat" ||
+      left.data.layout !== "f64" ||
+      right.data.layout !== "f64" ||
+      left.validity !== null ||
+      right.validity !== null
+    )
+      return false;
+    const a = left.data.values,
+      b = right.data.values;
+    const k = twoSumsDense(this.#sums, this.#has, other.#sums, other.#has, a, b, gids, rows, count);
+    if (k < count) {
+      this.#exact(a, null, gids, rows, k, count, false, false);
+      other.#exact(b, null, gids, rows, k, count, false, false);
+    }
+    return true;
+  }
+
   /**
    * AVG(float4 / float8): PostgreSQL's float8_accum, in float8. N += 1, Sx += v, and from the
    * second value Sxx += (v·N − Sx)² / (N·(N − 1)); an infinite Sx or Sxx is 22003 when the old Sx
