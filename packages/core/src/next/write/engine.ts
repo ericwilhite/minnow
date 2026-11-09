@@ -13,6 +13,7 @@
  * - **Recovery** (`openWritePath`): the single log scan, truncation and replay of startup step 4.
  */
 import {
+  ArenaPool,
   groupRootOf,
   LazyGroupRoot,
   Memtable,
@@ -446,6 +447,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #space: Space;
   readonly #credits: WriteCredits;
   readonly #grant: Grant;
+  readonly #arenaPool: ArenaPool;
   readonly #now: () => number;
   readonly #signal: AbortSignal | undefined;
   #appender!: LogAppender;
@@ -636,6 +638,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#session = input.session;
     this.#space = input.space;
     this.#grant = grant;
+    this.#arenaPool = new ArenaPool(
+      grant,
+      Math.min(8 * 1024 * 1024, Math.floor(input.governor.capBytes / 32)),
+    );
     const caches = {
       groupRoots: new BlobCache<GroupRoot>((cache) => input.governor.registerCache(cache)),
       groupPages: new BlobCache<readonly GroupRef[]>((cache) =>
@@ -732,7 +738,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
     );
     const grant = credits.rows;
     const metadataGrant = credits.metadata;
-    const reclaimWriter = () => credits.reclaimRows();
+    let engine: WritePathImpl | null = null;
+    const reclaimWriter = () => {
+      if (engine !== null) engine.#arenaPool.clear();
+      return credits.reclaimRows();
+    };
     grant.onReclaimRequest(reclaimWriter);
     metadataGrant.onReclaimRequest(() => credits.reclaimMetadata());
     const metadataBudget = new MetadataBudget(
@@ -742,7 +752,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
       (wanted) => credits.growTo(metadataGrant, wanted),
     );
     let commitBuffers: CommitBuffers | null = null;
-    let engine: WritePathImpl | null = null;
     try {
       commitBuffers = new CommitBuffers(credits.commits, input.tuning?.onCommitBuffer);
       const { space, session } = input;
@@ -1274,6 +1283,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         def.indexes.map((index) => index.id),
         this.#grant,
         this.#memtableRows,
+        this.#arenaPool,
       );
       memtable.rowCount = ref.rowCount;
       memtable.storedRows = ref.rowCount;
@@ -1452,6 +1462,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       def.indexes.map((index) => index.id),
       this.#grant,
       this.#memtableRows,
+      this.#arenaPool,
     );
     this.#setView(state, { ...state.view, memtables: [...memtables, memtable] });
     if (frozen !== null && !this.#recovering) this.#scheduleFlush();
@@ -1489,6 +1500,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       def.indexes.map((index) => index.id),
       this.#grant,
       this.#memtableRows,
+      this.#arenaPool,
     );
     this.#setView(state, { ...state.view, memtables: [...memtables, memtable] });
     return memtable;
@@ -1812,7 +1824,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   #headroom(bytes: number): boolean {
     const free = this.#grant.held - this.#grant.allocated;
-    return free >= bytes || this.#grant.tryGrow(bytes - free);
+    if (free >= bytes || this.#grant.tryGrow(bytes - free)) return true;
+    this.#arenaPool.clear();
+    const reclaimed = this.#grant.held - this.#grant.allocated;
+    return reclaimed >= bytes || this.#grant.tryGrow(bytes - reclaimed);
   }
 
   async #relieve(bytes: number): Promise<void> {
@@ -2563,6 +2578,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#body.close();
       this.#sequenceBody.close();
       this.#commitBuffers.close();
+      this.#arenaPool.close();
       this.#grant.close();
       this.#credits.close();
     }

@@ -380,8 +380,11 @@ export class ColumnChunk {
     if (total > arena.length) {
       let size = arena.length * 2;
       while (size < total) size *= 2;
-      this.#take(size);
-      const grown = new Uint8Array(size);
+      let grown = this.#charge.reuseBytes?.(size);
+      if (grown === undefined) {
+        this.#take(size);
+        grown = new Uint8Array(size);
+      } else this.chargedBytes += grown.byteLength;
       grown.set(arena.subarray(0, used));
       this.#give(arena.byteLength);
       arena = grown;

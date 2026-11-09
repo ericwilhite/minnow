@@ -87,6 +87,12 @@ It checks copied bytes after the producer recycles its buffers; forced GC is a l
 not a certification of peak RSS or native storage memory.
 
 The write grant keeps an admitted working minimum and charges live memtables and scratch.
+Released variable-length byte arenas are reused by exact capacity, within a fixed writer pool
+(at most 8 MiB or 1/32 of the governor cap, plus 132 KiB of bounded bookkeeping). Active column
+objects, source slots and numeric arrays keep their ordinary lifetime. Cached arenas remain
+allocated to the write grant; pressure discards them before spilling live rows, and reclaim
+returns their credit. A chunk borrow delays reuse until its last reader releases it. Mixed
+resident/disk row assembly keeps its resident sources borrowed until copying finishes or fails.
 Its unused growth after a wide-batch estimate is reclaimable: a waiting merge can take that
 capacity without waiting for another writer call. Metadata has its own grant and uses the
 same retrying budget for root/statistics charges, group-directory chunks and run readers.

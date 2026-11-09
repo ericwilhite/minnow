@@ -26,6 +26,12 @@ changes makes the scope roll back even if the callback catches its error. Kysely
 transaction callback to Minnow's SQL transaction statements; see the
 [Kysely adapter](/docs/adapters/kysely).
 
+For wide bulk imports, start with input batches of roughly 5,000 rows. In a 1M-row Chromium check
+of the 200-column `events_wide` input generator, reducing batches from 50,000 to 5,000 rows
+saved about 188 MiB of peak worker-renderer RSS during input construction. Smaller batches
+reduce the application's own temporary arrays, which the engine cannot release for it.
+Keep several batch calls inside one `db.write()` scope when they must commit together.
+
 A database has one writer at a time. A scope takes its turn before its callback runs — in order
 with every other write on this engine, on other engines in this context, and in other tabs and
 workers over the same database — and keeps it until its commit or rollback has a known outcome.

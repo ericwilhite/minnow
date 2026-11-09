@@ -18,6 +18,8 @@ export function need<T>(value: T | null | undefined): T {
 export interface Charge {
   allocate(bytes: number): boolean;
   free(bytes: number): void;
+  /** Optional exact-capacity reuse: the returned array is owned and already charged here. */
+  reuseBytes?(bytes: number): Uint8Array | undefined;
 }
 
 /** For scratch structures nobody accounts (tests, a statement's transient row copies). */

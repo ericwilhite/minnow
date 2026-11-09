@@ -2320,3 +2320,24 @@ export const WRITE_CATALOG_DROP_STATES = [
   "durable reopen",
   "all credit returned",
 ] as const;
+
+/** A released write column is reusable only after its last reader gives it back. */
+export const WRITE_COLUMN_POOL_STATES = [
+  "memory",
+  "indexeddb",
+  "rollback after reuse",
+  "backing buffer reused",
+  "null to valid",
+  "reopen",
+  "zero final charge",
+] as const;
+
+/** Row assembly can suspend with resident sources beside stored rows. */
+export const WRITE_ROW_BORROW_STATES = [
+  "resident first",
+  "stored first",
+  "success",
+  "async error",
+  "sync error",
+  "released after suspension",
+] as const;
