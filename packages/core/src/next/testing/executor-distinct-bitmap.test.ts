@@ -1,10 +1,12 @@
-/** End-to-end SQL COUNT(DISTINCT) with independent oracles and a pair-set control. */
+/** End-to-end SQL COUNT(DISTINCT) with independent oracles and bounded external storage.
+ * Raw distinct-bitmap.test.ts retains the bitmap/pair memory-saving checks. */
 import fc from "fast-check";
 import { PGlite } from "@electric-sql/pglite";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach } from "../../testing/reach.js";
 import { currentEngine } from "../../testing/differential-current.js";
+import { ExternalAggregateOperator } from "../exec/agg/external.js";
 import { createExecutor } from "../exec/create.js";
 import { StorageCore } from "./storage-core.js";
 import { oracleRows } from "./differential-adapter.js";
@@ -23,8 +25,9 @@ it.each(seedsFor("next-executor-distinct-bitmap", [0xe245, 0xe246]))(
       "filter",
       "numeric",
       "pair-control",
-      "lower-memory",
+      "bounded external",
     ]);
+    const external = vi.spyOn(ExternalAggregateOperator.prototype, "finish");
     await pg.waitReady;
     try {
       for (const name of ["s", "m", "x", "e"]) {
@@ -67,8 +70,10 @@ it.each(seedsFor("next-executor-distinct-bitmap", [0xe245, 0xe246]))(
             const old = await current.run({ kind: "sql", sql });
             expect(old.kind).toBe("rows");
             expect(old.rows).toEqual(expected);
+            const externalBefore = external.mock.calls.length;
             const result = await core.execute(sql);
             if (!("batches" in result)) throw new Error("SELECT");
+            expect(external.mock.calls.length).toBeGreaterThan(externalBefore);
             expect(oracleRows(result)).toEqual(expected);
             const candidate = core.lastProfile?.operators.find(
               (o) => o.op === "aggregate",
@@ -88,9 +93,9 @@ it.each(seedsFor("next-executor-distinct-bitmap", [0xe245, 0xe246]))(
                 expect(before).toBeDefined();
                 expect(
                   candidate ?? Infinity,
-                  "grouped bitmaps must avoid materializing the pair set",
-                ).toBeLessThan(before ?? 0);
-                reach.reach("lower-memory");
+                  "uncertified DISTINCT uses the same bounded external minimum under either hash-kernel control",
+                ).toBe(before);
+                reach.reach("bounded external");
               }
             } finally {
               core.executor.prepare = saved;
@@ -114,6 +119,7 @@ it.each(seedsFor("next-executor-distinct-bitmap", [0xe245, 0xe246]))(
       );
       reach.assertReached();
     } finally {
+      external.mockRestore();
       await current.close();
       await pg.close();
       await core.close();

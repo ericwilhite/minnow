@@ -1389,7 +1389,8 @@ range-checked; a wide domain or unavailable optional credit keeps the exact gene
 The read-sizing pass folds existing group-root statistics without another source scan.
 Winner buffers are admitted up front, optional table memory is released before downstream
 output, and `createExecutor({ domainCountSum: false })` retains the ordinary hash plan.
-This adds no aggregation spill implementation. The paired million-row Node component passed
+The direct-address kernel itself does not spill; the executor now chooses the bounded external
+aggregation recipe when no complete direct/hash workspace is certified. The paired million-row Node component passed
 with a −55.578 ms median delta against a 32.005 ms IQR (9/9 favourable;
 full delta range width 51.571 ms);
 the stored whole query passed reverse-test non-regression (−27.729 ms median,
@@ -1474,8 +1475,9 @@ multi-blob values and old/new output overlap are included. The provider's conser
 before outputs/downstream buffers, so small caps can still
 be below the admitted minimum even for small resident input. Legacy direct fixtures keep
 the borrowed API; they are not the production memory proof.
-Existing join/sort/window spilling remains active. Hash aggregation
-still has its documented refused-growth limitation until partitioned aggregation is implemented.
+Existing join/sort/window spilling remains active. Ordinary aggregation now reserves a complete
+certified hash workspace or uses bounded external aggregation from the start; it does not wait
+while retaining a partial hash table.
 Hash-join spill staging also has a known large-row defect: 600 kB build payloads at an 8 MiB
 budget can request a second progress loan. This is a bug, not an intended size limit.
 The result sink copies selected/dictionary/constant input into owned flat frames, with credit and
@@ -1682,8 +1684,8 @@ shipped-engine or stored-format change.
   computed projections, other finalizers, parameter bounds and WITH TIES keep the ordinary path.
   All input rows still update every aggregate, preserving transition errors. Rank scans use the
   shared task clock and release temporary vectors before yielding; cancellation closes the heap.
-  `createExecutor({ groupTopN: false })` supplies the benchmark control. This does not make hash
-  aggregation spillable or eliminate its group table. `scripts/next-agg-selection-bench.mts`
+  `createExecutor({ groupTopN: false })` supplies the benchmark control. Group selection itself does not spill or eliminate its hash table; the factory can
+  instead select the external recipe described below. `scripts/next-agg-selection-bench.mts`
   isolates selection and output; `next-executor-bench.mts --whole-compare group-top-n`
   compares the real stored whole query. CPU captures belong in the caller's cache directory.
 - `groups.ts`: group ids from open-addressing tables chosen by key type — interleaved
@@ -1744,15 +1746,19 @@ shipped-engine or stored-format change.
   hash/store each (group, value id) pair again. Values and dictionary-entry hashes stay shared.
   Inputs starting with more groups keep the pair set. Later group growth retains bitmaps for
   ids below 64 and uses pairs for the others, without migration or duplicate membership.
-  Scalar COUNT of TEXT, bytes, UUID and enum labels uses `scalar-byte-distinct.ts`: one
+  In the synchronous hash engine, scalar COUNT of TEXT, bytes, UUID and enum labels uses
+  `scalar-byte-distinct.ts`: one
   exact membership table with packed byte records, without dense value ids or a second seen
   marker. A byte tag rejects most probes before loading record offsets; table growth reads
   stored hashes in record order. Full hash matches still compare every byte. NULL is ignored; selected/constant vectors
   preserve the first new row, and dictionary codes cache only entries actually referenced.
   Other scalar COUNT arguments keep seen markers; other DISTINCT functions keep the pair set. Bitmap
   arrays, headers and resize overlap are charged before allocation and returned on close or
-  failure. This does not add aggregation spill or promise lower memory for every later-growing
-  group distribution. `createExecutor({ groupedDistinctBitmap: false })` selects the control;
+  failure. These hash kernels do not spill or promise lower memory for every later-growing
+  group distribution. The factory currently selects external DISTINCT without an exact complete
+  hash-domain proof; hash storage flags do not alter that recipe's minimum. Raw-kernel suites
+  retain bitmap/pair and scalar-membership memory comparisons. `groupedDistinctBitmap: false`
+  and `scalarByteDistinct: false` select raw hash controls;
   `next-executor-bench.mts --whole-compare aggregation` compares both aggregation levers and
   can record parent/candidate CPU profiles with `--profile`.
   Scalar byte membership also charges buffers, temporary views, headers and old/new growth
@@ -1817,7 +1823,8 @@ shipped-engine or stored-format change.
   grouping keys translate only selected entries and probe their canonical tuple in one loop;
   changing dictionaries, duplicate entries, NULLs, flat inputs and larger domains keep exact
   equality through direct-table growth or the general hash fallback. State, promotion scratch
-  and resize overlap remain charged. This adds no aggregation spill or runtime code generation.
+  and resize overlap remain charged. The bank remains a synchronous transition engine; its
+  executor recipe owns admission and the external fallback. There is no runtime code generation.
   `createExecutor({ typedLayout: false })` retains the merged separate-bank control, including
   its older dictionary tuple loops. The component command
   `next-wide-typed-bench.mts --typed-layout --paired --repeats 9 --warmups 10` and the whole-query command
@@ -1827,11 +1834,12 @@ shipped-engine or stored-format change.
   `--record-prototype` measures the independent fixed-fixture numeric layout diagnostic;
   its preconditions are not a production certificate.
 - Scan statistics hints (future; pre-sizing and AVG Sxx skipping are deferred).
-  High-cardinality pre-sizing is deferred. The scan would need to supply a conservative NDV
+  General high-cardinality hash pre-sizing from estimates is deferred. The exact codebook
+  certificate below is a separate bound, not an NDV estimate. The scan would need to supply a conservative NDV
   estimate for the grouping expressions (not merely a row count), its scope across pages and
   dictionaries, and whether a selection/filter invalidates it. A shared dictionary's entry count
   can bound one dictionary key; per-page counts must not be added as if dictionaries were disjoint.
-  Composite keys need a joint estimate. The aggregate must charge any reservation before growth,
+  Composite keys need a joint estimate or a proven conservative product of exact domains. The aggregate must charge any reservation before growth,
   cap it to the grant, and retain ordinary incremental growth when the estimate is absent or low.
   AVG also needs a query-wide finite max|x| and upper row count N, excluding NaN and infinities.
   A written bound must prove PostgreSQL's rounded Youngs-Cramer tmp, tmp²/(n(n−1)), and
@@ -1839,8 +1847,39 @@ shipped-engine or stored-format change.
   once skipped, the omitted Sxx cannot be reconstructed in PostgreSQL's operation order
   when a later batch approaches overflow. Keep the exact path until that proof exists.
 
-- Memory: every typed array is charged before it is constructed, and a constructor that fails
-  releases what it took. A refused growth fails the query until partitioned spill (milestone 3).
+- Memory progress: every typed array is charged before construction. `plan.ts` selects a
+  complete workspace before opening aggregate input. Fixed-width scalar states have a fixed
+  bound. The exact int32 direct-address shape reserves its full table. `dictionary-probe.ts`
+  reads complete codebooks for simple stored scan/projection children, interns entries across
+  pages by SQL equality, and uses the product of exact domains as a group-count upper bound.
+  A memory tail uses the public byte/row-bounded scan of keys and byte-extremum payloads on the
+  same pinned snapshot. The probe includes unused/deleted dictionary entries conservatively,
+  finishes before aggregation, and releases every native grant before execution admission waits.
+  The hash certificate is limited to 1024 possible groups and 2^21 active rows. Its minimum
+  includes old/new arrays, tuple and translation tables, ordinary promotion, byte-arena
+  compaction and output overlap (`agg/hash-bound.ts`). No float Sxx update is omitted.
+  Unknown/unproven shapes use `agg/external.ts` from the start: the shared spill sort orders
+  group keys plus an explicit input ordinal, and one group's transitions finish at a time.
+  SQL sort alone is not stable. Each call and nested sort has independent admitted progress
+  credit. DISTINCT uses a bounded value sort and adjacent SQL-equality deduplication; floating
+  SUM/AVG DISTINCT follow PostgreSQL's value-ordered transitions. The previous raw hash path
+  used first-occurrence order for floating DISTINCT; the executor now selects the ordered
+  external path for those calls. Redundant DISTINCT on byte extrema and boolean aggregates needs no set; other
+  extrema retain sorted DISTINCT representatives (including signed zero).
+  Group top-N remains bounded before winner rows reach the downstream sorter.
+  Admission waits FIFO while retaining no aggregate state or partial native reservation, and
+  cancellation drains readers, spill operations, output borrows and grants. Once admitted,
+  hash growth never needs shared headroom; external growth spills inside private progress lanes.
+  A complete minimum above the whole cap is the typed admission refusal. Low-level synchronous
+  `AggregateOperator`/`GroupTable`/`TypedLayout` callers must supply their complete workspace;
+  retrying a partly applied push after a refused synthetic charge is invalid.
+  Limits: this does not serialize/merge partial float states or replay aggregate rows. Unproven
+  and high-cardinality hash shapes can pay additional external-sort I/O, including scalar
+  COUNT(DISTINCT). Codebook certification adds a metadata/dictionary pass; a memory tail
+  additionally scans only the required key/payload columns. `aggregationProgress: false` is
+  the unexported parent benchmark control. `next-executor-bench.mts --whole-compare
+aggregation-progress --paired --repeats 9 --component aggregation-light` measures its Node
+  operator and whole-query CPU effects; the component excludes source certification.
   Ordinary hash aggregation still refuses GROUPING SETS and string/array/JSON aggregates
   (`UnsupportedPlanError`, construct `aggregate`, before allocation). Numeric ordered-set-only
   lists use `agg/ordered-set.ts`: a group sort and spillable per-group value sorts, with

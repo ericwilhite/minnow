@@ -1,10 +1,14 @@
-/** COUNT(DISTINCT) ignores NULL and uses SQL equality, independent of membership storage. */
+/** COUNT(DISTINCT) ignores NULL and uses SQL equality. The memory-progress contract selects
+ * external aggregation without a complete hash-domain proof. Hash-storage controls must not
+ * change that fallback's working minimum; raw kernel suites retain their memory-saving checks.
+ */
 import fc from "fast-check";
 import { PGlite } from "@electric-sql/pglite";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach } from "../../testing/reach.js";
 import { currentEngine } from "../../testing/differential-current.js";
+import { ExternalAggregateOperator } from "../exec/agg/external.js";
 import { createExecutor } from "../exec/create.js";
 import { StorageCore } from "./storage-core.js";
 import { oracleRows } from "./differential-adapter.js";
@@ -12,7 +16,7 @@ import { inputBatch } from "./executor-input.js";
 import { BATCH_ROWS, type FlatVector } from "../vector/vector.js";
 
 it.each(seedsFor("next-executor-scalar-distinct", [0xe355, 0xe356]))(
-  "matches PostgreSQL/current with byte membership and generic controls (seed %i)",
+  "matches PostgreSQL/current with bounded DISTINCT and hash-control invariance (seed %i)",
   async (seed) => {
     const core = await new StorageCore(8192).open(),
       pg = new PGlite(),
@@ -28,8 +32,9 @@ it.each(seedsFor("next-executor-scalar-distinct", [0xe355, 0xe356]))(
       "uuid",
       "generic",
       "control",
-      "lower-memory",
+      "bounded external",
     ]);
+    const external = vi.spyOn(ExternalAggregateOperator.prototype, "finish");
     await pg.waitReady;
     try {
       const rows = Array.from({ length: 5121 }, (_, i) => ({
@@ -172,8 +177,10 @@ it.each(seedsFor("next-executor-scalar-distinct", [0xe355, 0xe356]))(
               old = await current.run({ kind: "sql", sql });
             expect(old.kind).toBe("rows");
             expect(old.rows).toEqual(expected);
+            const externalBefore = external.mock.calls.length;
             const result = await core.execute(nextSql);
             if (!("batches" in result)) throw new Error("SELECT");
+            expect(external.mock.calls.length).toBeGreaterThan(externalBefore);
             expect(oracleRows(result)).toEqual(expected);
             const candidate = core.lastProfile?.operators.find(
               (o) => o.op === "aggregate",
@@ -193,9 +200,9 @@ it.each(seedsFor("next-executor-scalar-distinct", [0xe355, 0xe356]))(
                 expect(before).toBeDefined();
                 expect(
                   candidate ?? Infinity,
-                  "scalar byte membership must avoid value-id/output interning",
-                ).toBeLessThan(before ?? 0);
-                reach.reach("lower-memory");
+                  "uncertified DISTINCT uses the same bounded external minimum under either hash-kernel control",
+                ).toBe(before);
+                reach.reach("bounded external");
                 reach.reach("null");
                 reach.reach("collision");
               }
@@ -222,6 +229,7 @@ it.each(seedsFor("next-executor-scalar-distinct", [0xe355, 0xe356]))(
       );
       reach.assertReached();
     } finally {
+      external.mockRestore();
       await current.close();
       await pg.close();
       await core.close();

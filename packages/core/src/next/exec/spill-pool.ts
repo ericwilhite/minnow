@@ -55,6 +55,7 @@ export class Pool implements ByteCharge {
   #extra = 0;
   /** The step allocated since it made room (until then, its room is held, not given back). */
   #consumed = false;
+  #steps = 0;
   loans = 0;
   largestLoan = 0;
   constructor(
@@ -111,14 +112,19 @@ export class Pool implements ByteCharge {
    * Room for `bytes` more in the pool for the next step: from the grant if it has them, else a
    * progress loan of exactly the shortfall (rule 5's one bounded step).
    */
-  async need(bytes: number, grant: Grant, signal?: AbortSignal): Promise<void> {
+  async need(
+    bytes: number,
+    grant: Grant,
+    signal?: AbortSignal,
+    privateStep = false,
+  ): Promise<void> {
     if (this.#used + bytes <= this.#size) return;
     this.settle();
     const shortfall = this.#used + bytes - this.#size;
     if (shortfall <= 0) return;
     // Within one step the room may grow again (a row, then its page): from the grant, or one
     // loan; everything goes back together when the step's usage has left.
-    if (this.charge.allocate(shortfall)) {
+    if (!privateStep && this.charge.allocate(shortfall)) {
       this.#size += shortfall;
       this.#beginStep(shortfall);
       return;
@@ -141,13 +147,31 @@ export class Pool implements ByteCharge {
     this.#extra += extra;
     this.#consumed = false;
   }
+  /** A synchronous compound transition may free an old buffer before allocating its
+   * replacement. Keep its prepaid step until the entire transition has finished.
+   */
+  withStep<T>(work: () => T): T {
+    this.#steps++;
+    try {
+      return work();
+    } finally {
+      this.#steps--;
+      this.settle();
+    }
+  }
 
   /**
    * Returns extra bytes once the step has allocated and all live pool usage fits without
    * them. Fixed buffers first created during the step may remain inside the admitted pool.
    */
   settle(): void {
-    if (this.#extra === 0 || !this.#consumed || this.#used > this.#size - this.#extra) return;
+    if (
+      this.#steps !== 0 ||
+      this.#extra === 0 ||
+      !this.#consumed ||
+      this.#used > this.#size - this.#extra
+    )
+      return;
     this.charge.free(this.#extra);
     this.#size -= this.#extra;
     this.#extra = 0;

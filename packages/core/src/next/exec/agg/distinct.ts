@@ -10,8 +10,9 @@
  * Large-group-first inputs retain pairs; later group growth uses disjoint bitmap/pair routes.
  * Scalar byte COUNT uses a count-only membership table in AggregateOperator; other scalar
  * arguments retain this generic value-id/seen-marker path.
- * Memory is charged to the grant; spilling the set by
- * partition is milestone 3.
+ * This synchronous set requires a complete admitted workspace. The query factory
+ * uses the bounded external DISTINCT recipe when no whole-set bound is certified;
+ * it never retries filter() after a partially applied allocation failure.
  */
 import { OBJECT_OVERHEAD_BYTES } from "../../memory/governor.js";
 import type { PhysicalType } from "../../types.js";

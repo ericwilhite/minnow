@@ -19,6 +19,7 @@ import {
 } from "../kernels/test-support.js";
 import { IDENTITY } from "../kernels/vectors.js";
 import { accumulatorFor } from "./states.js";
+import { Governor } from "../../memory/governor.js";
 import { TypedLayout, typedLayoutCalls } from "./typed-layout.js";
 
 const input = [
@@ -388,13 +389,11 @@ it.each(seedsFor("typed-layout-exceptions", [0xb483, 0xb484]))(
 );
 
 it.each(seedsFor("typed-layout-prefix-limit", [0xb485, 0xb486]))(
-  "promotes at the exact prefix row bound and releases failed growth (seed %i)",
+  "promotes at the exact prefix row bound and releases its state (seed %i)",
   (seed) => {
     const reach = createReach("numeric record bounds", [
       "row bound",
       "restore",
-      "growth refusal",
-      "promotion refusal",
       "release",
       "integer carry",
     ]);
@@ -403,11 +402,9 @@ it.each(seedsFor("typed-layout-prefix-limit", [0xb485, 0xb486]))(
         reach.beginHistory();
         const selected = typedLayoutCalls(baseCalls, input);
         if (!selected) throw new Error("Missing numeric layout");
-        let bytes = 0,
-          cap = Infinity;
+        let bytes = 0;
         const bank = new TypedLayout(selected, input, {
           allocate(n) {
-            if (bytes + n > cap) return false;
             bytes += n;
             return true;
           },
@@ -464,48 +461,118 @@ it.each(seedsFor("typed-layout-prefix-limit", [0xb485, 0xb486]))(
         }
         expect(bytes).toBe(0);
         reach.reach("release");
-        for (const phase of ["growth", "promotion"] as const) {
-          const other = new TypedLayout(selected, input, {
-            allocate(n) {
-              if (bytes + n > cap) return false;
-              bytes += n;
-              return true;
-            },
-            free(n) {
-              bytes -= n;
-            },
-          });
-          try {
-            if (phase === "growth") {
-              cap = 0;
-              expect(() => need(other.members, 0).accumulator.grow(1)).toThrow(
-                "aggregation growth was refused",
-              );
-              reach.reach("growth refusal");
-            } else {
-              cap = Infinity;
-              for (const m of other.members) m.accumulator.grow(1);
-              expect(other.tryUpdate(batch, gids, IDENTITY, 1)).toBe(true);
-              cap = bytes;
-              const member = need(
-                other.members,
-                selected.findIndex((m) => m.offset === 6),
-              );
-              expect(() =>
-                member.accumulator.update(columns[5] ?? null, gids, IDENTITY, 1, false),
-              ).toThrow("aggregation growth was refused");
-              reach.reach("promotion refusal");
-            }
-          } finally {
-            for (const m of other.members) m.accumulator.close();
-          }
-          expect(bytes).toBe(0);
-          cap = Infinity;
-        }
       }),
       { seed, numRuns: 3 },
     );
     reach.assertReached();
   },
   60000,
+);
+
+it.each(seedsFor("typed-layout-native-workspace", [0xb49d, 0xb49e]))(
+  "waits for a complete workspace before growing or promoting (seed %i)",
+  async (seed) => {
+    const reach = createReach("numeric bank admitted progress", [
+      "wait",
+      "cancel",
+      "grow",
+      "promote",
+      "no headroom",
+      "release",
+    ]);
+    await fc.assert(
+      fc.asyncProperty(fc.integer({ min: 2, max: 32 }), async (groups) => {
+        reach.beginHistory();
+        const selected = typedLayoutCalls(baseCalls, input);
+        if (!selected) throw new Error("Missing bank shape");
+        // <=32 groups: 256B packed records plus ordinary fixed-width states, old/new
+        // overlap, 64-slot GroupValues minima and every promotion coexist below this bound.
+        const minimum = 65536 + groups * 4096;
+        for (const cancel of [true, false]) {
+          const governor = new Governor(16 << 20),
+            controller = new AbortController();
+          const holders = await governor.admitGroup({
+            label: "temporary pinned execution",
+            includesProgress: true,
+            grants: [
+              {
+                label: "minimum and private progress",
+                minimumBytes: governor.capBytes - minimum + 1,
+                spillable: false,
+              },
+            ],
+          });
+          const waiting = governor.admitGroup({
+            label: "bank complete workspace",
+            includesProgress: true,
+            signal: controller.signal,
+            grants: [{ label: "bank", minimumBytes: minimum, spillable: false }],
+          });
+          let admitted = false;
+          void waiting.then(
+            () => {
+              admitted = true;
+            },
+            () => undefined,
+          );
+          await Promise.resolve();
+          expect(admitted).toBe(false);
+          expect(governor.usedBytes).toBe(governor.capBytes - minimum + 1);
+          reach.reach("wait");
+          if (cancel) {
+            const reason = new Error("cancel bank minimum wait");
+            controller.abort(reason);
+            await expect(waiting).rejects.toBe(reason);
+            reach.reach("cancel");
+            for (const holder of holders) holder.close();
+          } else {
+            for (const holder of holders) holder.close();
+            const parts = await waiting,
+              grant = need(parts, 0);
+            const competing = await governor.admitGroup({
+              label: "pinned competing minimum",
+              includesProgress: true,
+              grants: [
+                { label: "pinned", minimumBytes: governor.capBytes - minimum, spillable: false },
+              ],
+            });
+            const bank = new TypedLayout(selected, input, grant);
+            try {
+              const columns = input.map((type) => numbers(type, [2])),
+                gids = new Int32Array(2048);
+              const batch: Batch = { columns, length: 1, selection: null };
+              for (const m of bank.members) m.accumulator.grow(1);
+              expect(bank.tryUpdate(batch, gids, IDENTITY, 1)).toBe(true);
+              for (const m of bank.members) m.accumulator.grow(groups);
+              reach.reach("grow");
+              columns[5] = numbers(F64, [null]);
+              expect(bank.tryUpdate(batch, gids, IDENTITY, 1)).toBe(false);
+              for (const m of bank.members) {
+                const arg = baseCalls[m.index]?.args[0];
+                m.accumulator.update(
+                  arg?.op === "column" ? (columns[arg.index] ?? null) : null,
+                  gids,
+                  IDENTITY,
+                  1,
+                  false,
+                );
+              }
+              expect(bank.transition(0, 0)).toEqual([1, 2, 0]);
+              reach.reach("promote");
+              expect(governor.usedBytes).toBe(governor.capBytes);
+              reach.reach("no headroom");
+            } finally {
+              for (const m of bank.members) m.accumulator.close();
+              for (const part of parts) part.close();
+              for (const holder of competing) holder.close();
+            }
+          }
+          expect(governor.usedBytes).toBe(0);
+          reach.reach("release");
+        }
+      }),
+      { seed, numRuns: 10 },
+    );
+    reach.assertReached();
+  },
 );

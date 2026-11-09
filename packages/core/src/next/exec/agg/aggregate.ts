@@ -19,8 +19,9 @@
  *   one set, ordered aggregates (`orderBy`), and string_agg / array_agg / json_agg / percentiles /
  *   mode. These are refused before anything is allocated; any later failure while constructing
  *   releases everything already taken.
- * - Memory: group table and states grow from the grant; a refused growth fails the query until
- *   partitioned aggregation spill (milestone 3).
+ * - Memory: this synchronous transition engine requires a complete certified workspace.
+ *   The recipe admits it atomically before opening input, or uses external.ts from the start.
+ *   Never retry push after a failed allocation: earlier calls may already have transitioned.
  */
 import type { MaybePromise } from "../../access/key-index.js";
 import type { AggregateCall, Rel } from "../../ir/ir.js";

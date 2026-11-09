@@ -29,8 +29,11 @@
  *
  * ## Memory
  * Every typed array is charged to the grant before it is constructed (`Charged.make`; the charge
- * is returned if construction throws). A refused growth throws `RangeError`: partitioned
- * aggregation spill is milestone 3. `keyBytes` bounds what `emitKey` will allocate, so the
+ * is returned if construction throws). The executor admits a complete certified hash workspace
+ * before constructing this synchronous table, or selects bounded external aggregation instead.
+ * This low-level ByteCharge seam cannot wait or recover from a partially applied assignment;
+ * a refusal indicates a bad workspace certificate or an isolated caller's undersized budget.
+ * `keyBytes` bounds what `emitKey` will allocate, so the
  * operator charges an output batch before building it.
  */
 import { xxHash32 } from "../../hash/xxhash32.js";

@@ -70,6 +70,8 @@ export async function lightComparison(
     readonly operatorOnly?: boolean;
     readonly paired?: boolean;
     readonly control?: AggregateOptions;
+    /** Component control: same transitions inside a prepaid fixed workspace. */
+    readonly boundedWorkspace?: boolean;
     readonly nativeKernel?: (input: LightInput) => LightResult;
   } = {},
 ) {
@@ -218,13 +220,36 @@ export async function lightComparison(
           nulls: "last" as const,
           collation: null,
         }));
-  const operator = async (options: AggregateOptions = {}, domainCountSum = false) => {
+  let workspacePeak = 0;
+  const operator = async (
+    options: AggregateOptions = {},
+    domainCountSum = false,
+    bounded = false,
+  ) => {
     const grant = await core.harness.governor.admit({
-        label: "light/operator",
-        minimumBytes: 16 << 20,
-        spillable: true,
-      }),
-      arena = new OutputArena(grant, 2048),
+      label: "light/operator",
+      minimumBytes: 16 << 20,
+      spillable: true,
+    });
+    let peak = 0;
+    const owned = bounded
+      ? new Proxy(grant, {
+          get(target, key) {
+            if (key === "allocate")
+              return (bytes: number) => {
+                const needed = target.allocated + bytes;
+                if (needed > 16 << 20) return false;
+                peak = Math.max(peak, needed);
+                return target.allocate(bytes);
+              };
+            const value: unknown = Reflect.get(target, key, target);
+            return typeof value === "function"
+              ? (value as (...args: unknown[]) => unknown).bind(target)
+              : value;
+          },
+        })
+      : grant;
+    const arena = new OutputArena(owned, 2048),
       rows: unknown[][] = [];
     const sink: Operator = {
       push(batch) {
@@ -252,7 +277,7 @@ export async function lightComparison(
               offset: 0,
               withTies: false,
             },
-            { grant, spill: core.spill, queryId: 991 },
+            { grant: owned, spill: core.spill, queryId: 991 },
             sink,
           );
     const context = { arena, params: { slots: [] }, input: types };
@@ -265,8 +290,8 @@ export async function lightComparison(
       ...(id === "agg_highcard_int" ? { outputTopN: { count: 100, keys } } : {}),
     };
     const aggregate = domainCountSum
-      ? new DomainCountSumOperator(rel, context, grant, sort ?? sink, configuration)
-      : new AggregateOperator(rel, context, grant, sort ?? sink, configuration);
+      ? new DomainCountSumOperator(rel, context, owned, sort ?? sink, configuration)
+      : new AggregateOperator(rel, context, owned, sort ?? sink, configuration);
     try {
       if (aggregate instanceof DomainCountSumOperator) {
         let probeAt = 0;
@@ -300,8 +325,10 @@ export async function lightComparison(
         },
         aggregate,
       );
+      workspacePeak = Math.max(workspacePeak, peak);
       return {
         rows,
+        peakBytes: peak,
         layoutRows: aggregate instanceof AggregateOperator ? aggregate.typedLayoutRows : 0,
         directRows: aggregate instanceof DomainCountSumOperator ? aggregate.directRows : 0,
       };
@@ -363,7 +390,11 @@ export async function lightComparison(
   if (feed) for (let w = 0; w < warmups; w++) assert.equal((await feed()).rows, N);
   if (candidate)
     for (let w = 0; w < warmups; w++) {
-      const result = await operator(candidate, measurement.domainCountSum);
+      const result = await operator(
+        candidate,
+        measurement.domainCountSum,
+        measurement.boundedWorkspace,
+      );
       assert.deepEqual(result.rows, expected.rows);
       if (measurement.domainCountSum) assert.ok(result.directRows > 0);
       if (candidate.typedLayout === true) assert.equal(result.layoutRows, N);
@@ -374,7 +405,9 @@ export async function lightComparison(
     split,
     native,
     operator: () => operator(measurement.control),
-    candidate: candidate ? () => operator(candidate, measurement.domainCountSum) : undefined,
+    candidate: candidate
+      ? () => operator(candidate, measurement.domainCountSum, measurement.boundedWorkspace)
+      : undefined,
     whole: pipeline,
     feed,
   };
@@ -471,6 +504,14 @@ export async function lightComparison(
     sources,
     id,
     inputRows: N,
+    workspace: measurement.boundedWorkspace
+      ? {
+          minimumBytes: 16 << 20,
+          peakBytes: workspacePeak,
+          scope:
+            "decoded operator and group-result sort; source certification measured in whole query",
+        }
+      : null,
     inputLayout: {
       numeric: "Float64, widening excluded as fixture setup",
       flatTextBytes: input.b.reduce((n, c) => n + c.bytes.length, 0),

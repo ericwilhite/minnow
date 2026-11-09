@@ -30,6 +30,23 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+/** Aggregation waits before retaining state, then grows solely inside its admitted workspace. */
+export const AGGREGATE_PROGRESS_REACH = [
+  "stored dictionary certificate",
+  "bounded memory certificate",
+  "temporary pinned holder waits",
+  "cancelled credit wait",
+  "competing holder releases",
+  "no shared growth headroom",
+  "numeric promotion",
+  "private resize",
+  "codebook translation growth",
+  "tuple growth",
+  "PG exact bits",
+  "concurrent prepared executions",
+  "all credit returned",
+] as const;
+
 /** Fixed run arenas may forget holes, but cannot reuse unknown or live bytes. */
 export const BOUNDED_FREE_ARENA_REACH = [
   "overflow",

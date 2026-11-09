@@ -195,3 +195,42 @@ the bounded option and retain the old borrow API. The latter is off in ordinary 
 is outside this production proof until its query-owned read admission is integrated. The structural page-sizing helper keeps its conservative legacy fallback for
 such callers without `readHint`; production access segments always provide hints.
 That fallback is not a production proof, and no semantic oracle or R21 waiver is used.
+
+## Aggregation workspaces
+
+A regular aggregation chooses its memory strategy before applying any transition. A complete
+fixed-width scalar bound, exact direct-address bounds, or a complete codebook-domain certificate
+can authorize the hash path. The hash minimum covers table/translation growth, every old/new
+buffer overlap, ordinary-state promotion and output. An allocation is synchronous inside that
+admitted workspace; it does not borrow shared headroom. A short synthetic budget at the raw
+transition-engine seam is an accounting error, not a resumable `push`.
+
+The optional domain probe owns one complete temporary native admission. It reads the pinned
+snapshot's codebooks, or a publication-stable bounded key/payload scan for a memory tail. It
+drops every reader and grant before requesting the execution minimum. Only bounded numeric
+certificate metadata survives. Thus planning cannot retain one part of the execution minimum
+while waiting for its other parts, and competing planning executions cannot form a credit cycle.
+
+Without a hash proof, ordinary aggregation uses external sorting from the start. It orders group
+keys plus an explicit input ordinal, then finishes one group at a time; the shared SQL sort does
+not guarantee stable ties. Each transition call, each nested DISTINCT value sort, the outer group
+sort and optional winner sort have independent progress owners in the same atomic admission.
+No partial floating states are combined or replayed. DISTINCT float transitions use PostgreSQL's
+[ordered distinct values](https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/executor/nodeAgg.c). Per-call pools precharge their bounded numeric scratch and resize/emit
+overlap; large byte values use the private source-sized progress lane. Growth spills instead of
+waiting on another execution's protected memory. All waits use cancellation and the shared task
+clock; cancellation drains in-flight work before returning its charges. Compound synchronous
+transitions keep their private progress loan until the whole transition finishes, including
+compaction that frees an old buffer before allocating its replacement. NUMERIC calls precharge
+384 KiB of scratch before coefficient arithmetic, within a 640 KiB fixed call workspace; the
+[PostgreSQL digit limits](https://www.postgresql.org/docs/17/datatype-numeric.html) bound that scratch.
+
+A temporarily pinned competitor can delay admission, but cannot prevent an already admitted
+aggregation from taking its next step. A waiter holds no partial native reservation or aggregate
+state. An admitted execution never requests another execution's pinned/minimum credit. This
+removes hold-and-wait between aggregations; progress still assumes the external holder eventually
+releases and storage operations settle, as for the other executor operators.
+
+Limits: unproven domains pay external-sort I/O, and a whole minimum above the cap remains a typed
+admission refusal. The raw synchronous hash helpers cannot safely resume a partially applied
+batch; callers outside the executor must admit their entire certified workspace first.

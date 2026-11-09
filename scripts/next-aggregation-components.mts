@@ -32,6 +32,7 @@ export async function aggregationComponents(
   rounds: number,
   queries: ReadonlyArray<{ id: string; sql: string }>,
   lightDirectory?: string,
+  memoryProgress = false,
 ) {
   if (!Number.isSafeInteger(rounds) || rounds < 5) throw new RangeError("five rounds required");
   const records = [];
@@ -189,8 +190,30 @@ export async function aggregationComponents(
           captured,
           rounds,
           lightDirectory,
-          pipeline,
-          scan,
+          memoryProgress ? undefined : pipeline,
+          memoryProgress ? undefined : scan,
+          memoryProgress
+            ? {
+                typedLayout: true,
+                packedIntegers: true,
+                packedAverages: true,
+                batchDictionaryMinMax: true,
+              }
+            : undefined,
+          memoryProgress
+            ? {
+                boundedWorkspace: true,
+                paired: true,
+                operatorOnly: true,
+                omitAliases: true,
+                control: {
+                  typedLayout: true,
+                  packedIntegers: true,
+                  packedAverages: true,
+                  batchDictionaryMinMax: true,
+                },
+              }
+            : {},
         ),
       );
       captured.length = 0;
