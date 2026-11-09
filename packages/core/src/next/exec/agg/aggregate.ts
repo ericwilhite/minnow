@@ -131,9 +131,9 @@ export interface AggregateOptions {
   readonly scalarByteDistinct?: boolean;
   /** False retains separate grouped update loops (benchmark control). */
   readonly groupedUpdateFusion?: boolean;
-  /** Experimental control: five adjacent direct-column AVG(float8)s in packed state. */
+  /** Enable five adjacent direct-column AVG(float8)s in packed state. */
   readonly packedAverages?: boolean;
-  /** Experimental control: reduce dictionary MIN/MAX to one candidate per group/batch. */
+  /** Reduce dictionary MIN/MAX to one candidate per group/batch. */
   readonly batchDictionaryMinMax?: boolean;
   readonly packedIntegers?: boolean;
 }

@@ -1,5 +1,5 @@
 {
-  "protocol": "Nine adjacent AB/BA pairs on one fixture; candidate minus control process user+system CPU in milliseconds. Component accepted only when -median(delta) > max(delta)-min(delta) and at least 7/9 favour candidate. Whole-query non-regression requires median(delta) <= full delta spread. No outliers discarded.",
+  "protocol": "Nine adjacent AB/BA pairs on one fixture; candidate minus control process user+system CPU in milliseconds. Quartiles use linear interpolation at (n-1)*p. Accept a gain when -median(delta)>IQR(delta) and at least ceil(7*n/9) pairs favour the candidate. An accepted regression uses the same test reversed; noRegression means that reverse test is not met. Retain every pair, quartiles, median, IQR, minimum, maximum and full range. No outliers discarded.",
   "lane": "Node, not browser",
   "node": "v26.12.0",
   "cpu": "Intel(R) Core(TM) i5-8279U CPU @ 2.40GHz",
@@ -50,7 +50,7 @@
     {
       "id": "agg_3dims_20aggs",
       "targetMs": 134,
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "component": {
         "warmups": 10,
         "order": [
@@ -133,11 +133,17 @@
             }
           ],
           "medianDeltaMs": -76.73100000000005,
+          "q1DeltaMs": -113.04000000000008,
+          "q3DeltaMs": -65.887,
+          "iqrDeltaMs": 47.15300000000008,
+          "minDeltaMs": -151.522,
+          "maxDeltaMs": -10.609000000000037,
+          "rangeDeltaMs": 140.91299999999995,
           "spreadDeltaMs": 140.91299999999995,
           "favoursCandidate": 9,
           "favoursControl": 0,
           "requiredFavourable": 7,
-          "acceptedGain": false,
+          "acceptedGain": true,
           "significantRegression": false,
           "noRegression": true
         },
@@ -282,6 +288,12 @@
             }
           ],
           "medianDeltaMs": -31.574999999999932,
+          "q1DeltaMs": -315.13100000000003,
+          "q3DeltaMs": 83.35399999999993,
+          "iqrDeltaMs": 398.48499999999996,
+          "minDeltaMs": -393.799,
+          "maxDeltaMs": 195.558,
+          "rangeDeltaMs": 589.357,
           "spreadDeltaMs": 589.357,
           "favoursCandidate": 5,
           "favoursControl": 4,
@@ -433,6 +445,12 @@
             }
           ],
           "medianDeltaMs": -55.57799999999999,
+          "q1DeltaMs": -69.329,
+          "q3DeltaMs": -37.324,
+          "iqrDeltaMs": 32.004999999999995,
+          "minDeltaMs": -76.966,
+          "maxDeltaMs": -25.39500000000001,
+          "rangeDeltaMs": 51.570999999999984,
           "spreadDeltaMs": 51.570999999999984,
           "favoursCandidate": 9,
           "favoursControl": 0,
@@ -581,6 +599,12 @@
             }
           ],
           "medianDeltaMs": -27.729000000000042,
+          "q1DeltaMs": -181.163,
+          "q3DeltaMs": -22.153999999999996,
+          "iqrDeltaMs": 159.00900000000001,
+          "minDeltaMs": -219.96099999999998,
+          "maxDeltaMs": 168.63300000000004,
+          "rangeDeltaMs": 388.59400000000005,
           "spreadDeltaMs": 388.59400000000005,
           "favoursCandidate": 8,
           "favoursControl": 1,
@@ -649,9 +673,19 @@
   ],
   "limits": [
     "Loaded shared host; no quiet-host or browser acceptance claim.",
-    "Whole-query non-regression is accepted, but neither whole-query gain exceeds its paired spread.",
-    "Wide fails the component rule and remains opt-in. DISTINCT remains diagnostic.",
+    "Neither whole-query gain meets the corrected median/IQR/vote test; both pass the reverse non-regression test.",
+    "Both historical component comparisons pass the corrected IQR rule; wide activation is recorded separately. DISTINCT remains diagnostic.",
     "No new spill path. Unknown/live-memory/computed/filtered domains retain ordinary aggregation.",
     "Input setup/decoding excluded from component; real write/flush fixture setup excluded from whole query. Allocation, task pacing, transitions, top-N and output included."
-  ]
+  ],
+  "reanalysis": {
+    "rule": "Lead correction: IQR replaces full range as acceptance dispersion",
+    "quartiles": "linear interpolation, index (n-1)*p (type 7)",
+    "pairedHelperSha256": "6c578f94613567937737d5be128634d293665fa1c87db3376324aa260873da69",
+    "cpuRerun": false,
+    "captureProvenance": "All original raw pairs/source hashes/timings retained; this is post-hoc rule correction, not current-tip or browser measurement."
+  },
+  "defaultActivation": {
+    "wide": "Guarded packed AVG/integer states and dictionary MIN/MAX default on; false options retain controls. Accepted by historical component IQR and whole reverse non-regression. No new CPU capture."
+  }
 }

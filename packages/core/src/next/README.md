@@ -1361,17 +1361,21 @@ The read-sizing pass folds existing group-root statistics without another source
 Winner buffers are admitted up front, optional table memory is released before downstream
 output, and `createExecutor({ domainCountSum: false })` retains the ordinary hash plan.
 This adds no aggregation spill implementation. The paired million-row Node component passed
-with a −55.578 ms median delta against a 51.571 ms full delta spread (9/9 favourable);
-the stored whole query passed non-regression (−27.729 ms median, 388.594 ms spread, 8/9).
+with a −55.578 ms median delta against a 32.005 ms IQR (9/9 favourable;
+full delta range width 51.571 ms);
+the stored whole query passed reverse-test non-regression (−27.729 ms median,
+159.009 ms IQR, 388.594 ms full range width, 8/9 favourable).
 No statistically accepted whole-query gain is claimed. The committed raw pairs are in
 `scripts/bench-evidence/aggregation-paired-2026-11-08.json`.
 For the wide and highcard component drivers, `--paired --repeats 9 --warmups 10`
 times only adjacent control/candidate runs, alternating AB/BA on the same decoded fixture.
 `next-executor-bench.mts --paired --repeats 9 --whole-compare wide-typed` uses the same
 pairing for stored queries. Reports retain every CPU sample and candidate-minus-control
-delta. A component gain requires its negative median delta to exceed the complete delta
-spread (max minus min) and at least seven of nine pairs to favour the candidate. A whole
-query must have no positive median delta beyond its paired spread. Output comparison and
+delta. A component gain requires its negative median delta to exceed the paired delta
+IQR and at least seven of nine pairs to favour the candidate. Quartiles use linear
+interpolation at `(n−1)×p`; reports retain Q1, Q3, IQR and the full minimum/maximum
+range. No-regression is the same test in reverse: a positive median greater than IQR
+with at least seven of nine pairs favouring control is an accepted regression. Output comparison and
 profiles are outside the component timing; query materialization remains in whole timing.
 The report includes CPU samples, full spreads, checkpointed partial rounds, profiles and the
 actual transformed JS needed to interpret line-level ticks. No baseline is an executor path.
@@ -1727,9 +1731,14 @@ The full interface contract includes the following (DML remains unimplemented by
   harness checks every result against the plain kernels and preserves AVG's Sxx transitions.
   `scripts/wide-decoded-fixture.test.ts` also judges all 21 outputs against PostgreSQL.
   These are Node diagnostic measurements, not browser Gate B results.
-- Wide typed-state experiments remain opt-in: the paired component median gain
-  (76.731 ms) did not exceed its 140.913 ms paired spread, despite 9/9 favourable pairs:
-  `createExecutor({ packedAverages: true, packedIntegers: true, batchDictionaryMinMax: true })`.
+- Wide typed-state kernels are enabled by default after the corrected IQR rule
+  qualifies the retained pre-rebase component captures: 76.731 ms median gain,
+  47.153 ms IQR, full delta range [−151.522, −10.609] ms (width 140.913 ms),
+  9/9 favourable pairs. The whole query has no accepted reverse regression
+  (median −31.575 ms, IQR 398.485 ms, range [−393.799, 195.558] ms, 5/9 favourable);
+  this is not an accepted whole-query gain or a new post-integration measurement.
+  `createExecutor({ packedAverages: false, packedIntegers: false, batchDictionaryMinMax: false })`
+  retains the ordinary control paths.
   The existing dictionary-native group table remains responsible for exact key identities.
   One kernel packs five adjacent plain float8 AVG outputs into N/Sx[5]/Sxx[5] records.
   It certifies the entire accumulated finite prefix (at most 2^26 rows, |x| at most 2^400),
