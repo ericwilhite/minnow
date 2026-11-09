@@ -2292,3 +2292,56 @@ export const PAIR_PROGRESS_REACH = [
   "page boundary",
   "exact cleanup",
 ] as const;
+
+/** Partial directory pages amortize singleton appends without losing rows or ownership. */
+export const DIRECTORY_APPEND_REACH = [
+  "variable batches",
+  "multi-group flush",
+  "mixed mutations",
+  "bounded tail after mutation",
+  "singleton append",
+  "geometric tail",
+  "changed page",
+  "exact extent ownership",
+  "reopen preserves rows",
+  "exact cleanup",
+] as const;
+
+/** Every legal twelve-bit canonical directory tail is opened by both supported builds. */
+export const DIRECTORY_COMPAT_TAILS = Array.from({ length: 4096 }, (_, n) => `tail ${String(n)}`);
+export const DIRECTORY_COMPAT_REACH = [
+  "current to baseline continuation",
+  "baseline to current continuation",
+  "every value preserved",
+  "exact cleanup",
+  "range end reopened",
+  "full-page carry",
+  "full-page plus tail",
+  "frozen packed tail",
+  "partial extent retained after edit",
+  "shared extent carry retired",
+] as const;
+
+/** Physical publication edges, recovery/continuation and competing cross-build openers. */
+export const DIRECTORY_TRANSITION_REACH = [
+  "packed normalization",
+  "full carry",
+  "partial edit",
+  "shared carry",
+  "page written",
+  "index written",
+  "data flushed",
+  "root written",
+  "root truncated",
+  "root flushed",
+  "acknowledged values recovered",
+  "retry both writers",
+  "interrupted current writer",
+  "interrupted baseline writer",
+  "concurrent current owner",
+  "concurrent baseline owner",
+  "damaged page refused",
+  "damaged index refused",
+  "damage refused by current",
+  "damage refused by baseline",
+] as const;

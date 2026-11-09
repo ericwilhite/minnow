@@ -1815,6 +1815,33 @@ scalar operations stay synchronous and reuse admitted frame views; actual native
 The continuation check freezes its clocks to isolate scheduling overhead. Separate clock,
 cancellation, corruption and physical-failure suites exercise those boundaries.
 
+The rebuild's directory-append campaign counts encoded references rather than asserting wall
+clock timings. It generates singleton appends, variable transaction batches and mixed edits.
+The writer retains a canonical prefix: full pages followed by descending power-of-two partial
+pages. This bounds both encoding work and the page index. Each history audits extent ownership,
+reopens, verifies every expected value and returns every governor charge. The original full-page
+boundary workload retains its groups, operations, assertions and deadline.
+
+The directory's byte grammar and versions are unchanged, but physical packing changes the
+page and index bytes. Both packing policies support successful continuation in both directions.
+Committed native-file fixtures and a self-contained baseline reader/writer bundle are frozen at
+`4133d25a`; tests never regenerate them. The ordinary-open campaign covers every tail total from
+0 through 4,095 in 32 independent ranges of 128 states. Every state reads all values in both builds, makes
+durable writes, and reopens. It also covers the full-page carry, packed-tail normalization,
+and an edited page whose extent still holds unchanged partial pages.
+
+The exhaustive ranges use the ordinary startup policy, without repeating test-only physical
+audits at every open. Each range reopens its final baseline write and audits its boundary carry.
+Transition histories explicitly audit current and previous ownership.
+They interrupt both writers after directory page/index writes and each native publication step: data flush,
+root write, root truncate and root flush. Strictly acknowledged values must survive recovery;
+both writers continue writing and reopen. Each transition also refuses damaged page/index
+bytes and queues two competing openers in both build orders. Declared reach covers all tail
+states, transition types and publication edges. The physical crash model uses honest flushes
+with seeded lost/torn pending writes; this is Node fixture evidence, not a real-browser crash
+campaign. To explicitly regenerate fixtures from the pinned writer, run
+`npx vite-node scripts/write-next-directory-fixtures.mts`; scratch uses `os.tmpdir()`.
+
 Ordered-root startup regressions require a streaming union without the unordered free-map sort,
 validate scattered list-page allocations, and refuse overlapping, descending or inconsistent
 extents before reclaim. Full audit and test-build semantic checks remain enabled separately.

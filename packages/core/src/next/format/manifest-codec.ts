@@ -20,12 +20,15 @@
  * ## The paged group directory (`TableRoot.groups`)
  * `groups` names an **index** blob: one entry per directory **page** (its `BlobRef`, row-id range,
  * group, row and live-row counts). Each page holds up to `GROUPS_PER_PAGE` `GroupRef`s in row-id
- * order. A flush rewrites only the last page and the index (`writeGroupDirectory` with `keep`), so
- * a table's metadata write is O(page), and no group count is limited by the 1 MiB blob cap (about
- * 15,000 pages of 4,096 groups). A table with no groups has a zero-length `groups` reference.
- * The index itself is rewritten on every flush and grows by one entry (~30 bytes) per page, so
- * the per-flush rewrite is one page (≤ ~115 KB) plus O(pages); a two-level index can bound it if
- * tables ever reach thousands of pages.
+ * order. Page sizes may be any value from 1 to GROUPS_PER_PAGE; partial pages are not a new
+ * encoding. A flush keeps an unchanged prefix (`writeGroupDirectory` with `keep`). The write
+ * path carries a geometric suffix of partial pages on append, so each appended group is encoded
+ * O(log GROUPS_PER_PAGE) times amortized, rather than once per remaining slot in a tail page.
+ * Full pages remain shared on append. The write path uses full pages followed by a descending
+ * power-of-two tail, preserving this layout across variable append batches and mutations. No group count is
+ * limited by the 1 MiB blob cap (about 15,000 full pages plus a bounded partial tail). A table
+ * with no groups has a zero-length `groups` reference. The index is still rewritten on every
+ * flush, O(pages); a two-level index can bound it if tables reach thousands of pages.
  *
  * ## Canonical decoding (review B2-p2a #7)
  * One value has one encoding, and decoders refuse every other: extent and type tables hold no
@@ -708,25 +711,38 @@ export interface WrittenGroupDirectory {
   readonly pages: readonly GroupPageEntry[];
 }
 
+/** Canonical append layout: full pages, then power-of-two partial pages in descending order.
+ * Zero has no page. The envelope permits other sizes too; legacy packed tails stay readable.
+ */
+export function directoryPageGroups(remaining: number): number {
+  if (!Number.isSafeInteger(remaining) || remaining < 0)
+    throw new RangeError("Invalid directory group count");
+  return remaining === 0 ? 0 : 2 ** Math.floor(Math.log2(Math.min(remaining, GROUPS_PER_PAGE)));
+}
+
 /**
  * Writes a table's group directory through `writer`: the pages in `keep` as they are (their
  * blobs are reused), then `groups` (which follow them in row-id order) in new pages of up to
- * `GROUPS_PER_PAGE`, then the index. A flush keeps every full page and rewrites the last one plus
- * its new groups: O(page) bytes written, whatever the table's size. The new pages share one
- * extent; the index is a blob of its own extent.
+ * `GROUPS_PER_PAGE`, then the index. The caller keeps an unchanged prefix and selects the
+ * suffix to rewrite. Binary tail sizing keeps the regular write path canonical while the
+ * default packed mode preserves the legacy/staging writer behavior. The new pages share one extent; the index is a blob of its own extent.
  */
 export async function writeGroupDirectory(
   writer: ExtentWriter,
   groups: readonly GroupRef[],
   keep: readonly GroupPageEntry[] = [],
+  tail: "packed" | "binary" = "packed",
 ): Promise<WrittenGroupDirectory> {
   const last = keep[keep.length - 1];
   const first = groups[0];
   if (last !== undefined && first !== undefined && first.firstRowId <= last.lastRowId)
     throw new RangeError("New groups must follow the kept directory pages");
   const chunks: GroupRef[][] = [];
-  for (let start = 0; start < groups.length; start += GROUPS_PER_PAGE)
-    chunks.push(groups.slice(start, start + GROUPS_PER_PAGE));
+  for (let start = 0; start < groups.length;) {
+    const count = tail === "binary" ? directoryPageGroups(groups.length - start) : GROUPS_PER_PAGE;
+    chunks.push(groups.slice(start, start + count));
+    start += count;
+  }
   const pages = [...keep];
   if (chunks.length > 0) {
     const written = await writer.write(chunks.map((chunk) => encodeGroupPage(chunk)));
