@@ -8,10 +8,13 @@
  * node scripts/write-insert-bench.mts --baseline "$TMPDIR/b3-old/dist" --mode load --load-mode tx
  * node scripts/write-insert-bench.mts --baseline "$TMPDIR/b3-old/dist" --mode load --load-mode commits
  *
+ * --mode hash --hash-bytes 4096 --iterations 1000000 isolates checksumming.
+ * --require-gain enforces paired CPU acceptance; --profile FILE with --worker candidate
+ * records only the timed second pass (profiling runs are excluded from acceptance).
  * Component: unique-key range/chain proof, including the old snapshot/reader setup. Whole paths: single inserts
  * after 100k keyed rows, or a durable 1M-row load including maintenance. Each pass builds its own inputs and database setup
  * outside the clock. Singles include the final flush; strict waits for every durable receipt.
- * One warmup pair is discarded, then >=5 interleaved pairs, alternating AB/BA order. CPU includes
+ * One warmup pair is discarded, then >=9 interleaved pairs, alternating AB/BA order. CPU includes
  * all Node threads (including JIT/GC); wall is reported separately. The store is memory, no fsync,
  * parser, executor or owner/client transport. Optional --gc-before (node --expose-gc) collects
  * setup garbage before each clock; GC during the measured phase still counts. Each timed database is closed before the next run.
@@ -23,6 +26,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
 import { loadavg } from "node:os";
+import { Session } from "node:inspector";
+import { writeFileSync } from "node:fs";
+import { summarizePairDeltas } from "./write-bench-pairs.mts";
 
 type Support = typeof import("../packages/core/dist/next/write/test-support.js");
 type Views = typeof import("../packages/core/dist/next/write/view.js");
@@ -39,7 +45,7 @@ const integer = (name: string, fallback: number, minimum = 1): number => {
 const baseline = option("baseline", "");
 if (!baseline) throw new Error("--baseline must name the parent's built core dist directory");
 const mode = option("mode", "unique");
-if (!["unique", "single", "load"].includes(mode)) throw new Error("Invalid --mode");
+if (!["unique", "single", "load", "hash"].includes(mode)) throw new Error("Invalid --mode");
 const durability = option("durability", "relaxed");
 if (durability !== "strict" && durability !== "relaxed") throw new Error("Invalid --durability");
 const lane: "strict" | "relaxed" = durability;
@@ -51,7 +57,10 @@ if (gcBefore && typeof global.gc !== "function")
 const collectSetup = () => {
   if (gcBefore) global.gc?.();
 };
-const rounds = integer("rounds", 6, 5);
+const rounds = integer("rounds", 9, 9);
+const samplesPerWorker = integer("samples", 1);
+const hashBytes = integer("hash-bytes", 4096);
+const hashOffset = integer("hash-offset", 0, 0);
 const iterations = integer("iterations", 1_000_000);
 const singles = integer("singles", 20_000);
 const rows = integer("rows", 1_000_000);
@@ -64,6 +73,7 @@ type Label = keyof typeof directories;
 interface Build {
   support: Support;
   views: Views;
+  hash: typeof import("../packages/core/dist/next/hash/xxhash32.js").xxHash32;
 }
 const builds = {} as Record<Label, Build>;
 const batches = (s: Support, count: number, size: number, start = 0) =>
@@ -84,6 +94,11 @@ for (const label of ["baseline", "candidate"] as const) {
   )) as Support;
   builds[label] = {
     support,
+    hash: (
+      (await import(
+        pathToFileURL(join(directories[label], "next/hash/xxhash32.js")).href
+      )) as typeof import("../packages/core/dist/next/hash/xxhash32.js")
+    ).xxHash32,
     views: (await import(
       pathToFileURL(join(directories[label], "next/write/view.js")).href
     )) as Views,
@@ -95,13 +110,67 @@ interface Result {
   checksum?: number;
   flushes?: number;
   merges?: number;
+  samples?: Result[];
 }
 const clock = () => ({ wall: performance.now(), cpu: process.cpuUsage() });
 const elapsed = (start: ReturnType<typeof clock>): Result => {
   const used = process.cpuUsage(start.cpu);
   return { cpuMs: (used.user + used.system) / 1000, wallMs: performance.now() - start.wall };
 };
+const profile = option("profile", "");
+if (profile && (!args.includes("--worker") || mode === "unique" || samplesPerWorker !== 1))
+  throw new Error(
+    "--profile needs --worker baseline/candidate and --mode load/single/hash and --samples 1",
+  );
+let measuredPass = false;
+async function timed(run: () => Promise<Omit<Result, "cpuMs" | "wallMs">>): Promise<Result> {
+  const session = profile && measuredPass ? new Session() : undefined;
+  const post = (method: "Profiler.enable" | "Profiler.start" | "Profiler.stop"): Promise<unknown> =>
+    new Promise((resolve, reject) =>
+      session?.post(method, (error, result) => (error ? reject(error) : resolve(result))),
+    );
+  if (session) {
+    session.connect();
+    await post("Profiler.enable");
+    await post("Profiler.start");
+  }
+  try {
+    const start = clock();
+    const extra = await run();
+    const result = { ...elapsed(start), ...extra };
+    if (session) {
+      const stopped = (await post("Profiler.stop")) as { profile: unknown };
+      writeFileSync(profile, JSON.stringify(stopped.profile));
+    }
+    return result;
+  } finally {
+    session?.disconnect();
+  }
+}
 async function measure(build: Build, label: Label): Promise<Result> {
+  if (mode === "hash") {
+    const bytes = new Uint8Array(4 * 1024 * 1024 + hashBytes + hashOffset);
+    for (let k = 0; k < bytes.length; k++) bytes[k] = (k * 131 + (k >>> 9)) & 255;
+    // Independent build equality outside the clock, including byte offsets and seeds.
+    for (let k = 0; k < 100; k++) {
+      const at = hashOffset + k * 16;
+      if (
+        builds.baseline.hash(bytes, k, at, at + hashBytes) !==
+        build.hash(bytes, k, at, at + hashBytes)
+      )
+        throw new Error("Checksum changed");
+    }
+    collectSetup();
+    return timed(async () => {
+      let checksum = 0;
+      for (let k = 0, at = hashOffset; k < iterations; k++) {
+        checksum ^= build.hash(bytes, k, at, at + hashBytes);
+        at += Math.ceil(hashBytes / 4) * 4 + 8;
+        if (at + hashBytes > bytes.length) at = hashOffset;
+      }
+      return { checksum };
+    });
+  }
   const s = build.support;
   // Only this pass retains its fixture; constructing it is outside the measured phase.
   const prepared =
@@ -194,32 +263,36 @@ async function measure(build: Build, label: Label): Promise<Result> {
       return result;
     }
     collectSetup();
-    const start = clock();
-    if (mode === "single") {
-      for (const batch of prepared) {
-        const tx = await p.begin();
-        const statement = tx.statement({ rules: s.rules });
-        await statement.table(t).insert(batch, null);
-        await statement.end();
-        const receipt = await tx.commit(null);
-        if (durability === "strict") await receipt.durable;
-      }
-      await p.flush();
-    } else {
-      const commitBatches = loadMode === "tx" ? prepared.length : 5;
-      for (let from = 0; from < prepared.length; from += commitBatches) {
-        const tx = await p.begin();
-        const statement = tx.statement({ rules: s.rules });
-        for (const batch of prepared.slice(from, from + commitBatches))
+    const result = await timed(async () => {
+      if (mode === "single") {
+        for (const batch of prepared) {
+          const tx = await p.begin();
+          const statement = tx.statement({ rules: s.rules });
           await statement.table(t).insert(batch, null);
-        await statement.end();
-        await (
-          await tx.commit(null)
-        ).durable;
+          await statement.end();
+          const receipt = await tx.commit(null);
+          if (durability === "strict") await receipt.durable;
+        }
+        await p.flush();
+      } else {
+        const commitBatches = loadMode === "tx" ? prepared.length : 5;
+        for (let from = 0; from < prepared.length; from += commitBatches) {
+          const tx = await p.begin();
+          const statement = tx.statement({ rules: s.rules });
+          for (const batch of prepared.slice(from, from + commitBatches))
+            await statement.table(t).insert(batch, null);
+          await statement.end();
+          await (
+            await tx.commit(null)
+          ).durable;
+        }
+        await p.quiesce();
       }
-      await p.quiesce();
-    }
-    return { ...elapsed(start), flushes: p.maintenance.flushes, merges: p.maintenance.merges };
+      return { flushes: p.maintenance.flushes, merges: p.maintenance.merges };
+    });
+    const expectedRows = mode === "single" ? 100_000 + singles : rows;
+    if (p.statistics(t)?.rowCount !== expectedRows) throw new Error("Loaded row count changed");
+    return result;
   } finally {
     await h.close();
   }
@@ -231,7 +304,18 @@ if (workerLabel !== "") {
     throw new Error("Invalid --worker");
   const label: Label = workerLabel;
   await measure(builds[label], label);
-  console.log(JSON.stringify({ isolatedWorker: true, ...(await measure(builds[label], label)) }));
+  measuredPass = true;
+  const samples: Result[] = [];
+  for (let k = 0; k < samplesPerWorker; k++) samples.push(await measure(builds[label], label));
+  console.log(
+    JSON.stringify({
+      isolatedWorker: true,
+      ...samples[0],
+      cpuMs: samples.reduce((n, s) => n + s.cpuMs, 0) / samplesPerWorker,
+      wallMs: samples.reduce((n, s) => n + s.wallMs, 0) / samplesPerWorker,
+      samples,
+    }),
+  );
   process.exit(0);
 }
 async function measurePass(label: Label): Promise<Result> {
@@ -284,11 +368,23 @@ const summary = (values: Result[]) => ({
 });
 const before = summary(results.baseline),
   after = summary(results.candidate);
-const operations = mode === "unique" ? iterations : mode === "single" ? singles : rows;
+const operations =
+  mode === "unique" || mode === "hash" ? iterations : mode === "single" ? singles : rows;
+const paired = (["cpuMs", "wallMs"] as const).map((metric) => {
+  const deltas = results.baseline.map(
+    (result, i) => result[metric] - (results.candidate[i]?.[metric] ?? NaN),
+  );
+  return { metric, ...summarizePairDeltas(deltas) };
+});
 console.log(
   JSON.stringify({
     summary: true,
+    paired,
+    pairedCriterion: "median(A-B) > IQR(A-B); wins >= ceil(pairs*7/9); regression uses the reverse",
+    hashBytes: mode === "hash" ? hashBytes : undefined,
+    hashOffset: mode === "hash" ? hashOffset : undefined,
     processIsolation: !args.includes("--in-process"),
+    samplesPerWorker,
     workerWarmups: args.includes("--in-process") ? 0 : 1,
     gcBefore,
     fixtureLifetime: "per-pass",
@@ -306,3 +402,7 @@ console.log(
     beatsSpread: after.cpuMedianMs < before.cpuMinMs && before.cpuMedianMs > after.cpuMaxMs,
   }),
 );
+
+if (args.includes("--require-gain") && !paired[0]?.accepted) process.exitCode = 1;
+
+if (args.includes("--require-no-regression") && paired[0]?.regression) process.exitCode = 1;

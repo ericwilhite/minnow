@@ -38,12 +38,55 @@ function round(accumulator: number, lane: number): number {
   return Math.imul((sum << 13) | (sum >>> 19), PRIME1);
 }
 
+/** Short ordered keys dominate the 1M write-load profile. Keep dispatch and short kernels
+ * separately inlinable; the large stripe routine below retains the reference algorithm.
+ * Five bytes is the common ordered INT key: one word and one byte, with no tail loops. */
 export function xxHash32(bytes: Uint8Array, seed = 0, start = 0, end = bytes.length): number {
   if (start < 0 || end > bytes.length || start > end)
     throw new RangeError("xxHash32 range is outside the input");
-  // The seed is a uint32: any number is taken as `seed >>> 0` (ToUint32) before arithmetic, so
-  // a fractional, non-finite or large seed means exactly what `>>> 0` makes of it.
   seed >>>= 0;
+  const length = end - start;
+  if (length === 5) return hashFive(bytes, seed, start);
+  return length < 16 ? hashShort(bytes, seed, start, end) : hashGeneral(bytes, seed, start, end);
+}
+
+function hashFive(bytes: Uint8Array, seed: number, start: number): number {
+  let hash = (seed + PRIME5 + 5) | 0;
+  hash = (hash + Math.imul(read32(bytes, start), PRIME3)) | 0;
+  hash = Math.imul((hash << 17) | (hash >>> 15), PRIME4);
+  hash = (hash + Math.imul(bytes[start + 4] ?? 0, PRIME5)) | 0;
+  hash = Math.imul((hash << 11) | (hash >>> 21), PRIME1);
+  hash ^= hash >>> 15;
+  hash = Math.imul(hash, PRIME2);
+  hash ^= hash >>> 13;
+  hash = Math.imul(hash, PRIME3);
+  hash ^= hash >>> 16;
+  return hash >>> 0;
+}
+
+function hashShort(bytes: Uint8Array, seed: number, start: number, end: number): number {
+  let hash = (seed + PRIME5) | 0;
+  hash = (hash + (end - start)) | 0;
+  let index = start;
+  while (index + 4 <= end) {
+    hash = (hash + Math.imul(read32(bytes, index), PRIME3)) | 0;
+    hash = Math.imul((hash << 17) | (hash >>> 15), PRIME4);
+    index += 4;
+  }
+  while (index < end) {
+    hash = (hash + Math.imul(bytes[index] ?? 0, PRIME5)) | 0;
+    hash = Math.imul((hash << 11) | (hash >>> 21), PRIME1);
+    index += 1;
+  }
+  hash ^= hash >>> 15;
+  hash = Math.imul(hash, PRIME2);
+  hash ^= hash >>> 13;
+  hash = Math.imul(hash, PRIME3);
+  hash ^= hash >>> 16;
+  return hash >>> 0;
+}
+
+function hashGeneral(bytes: Uint8Array, seed: number, start: number, end: number): number {
   const length = end - start;
   let index = start;
   let hash: number;

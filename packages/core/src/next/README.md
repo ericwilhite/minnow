@@ -43,6 +43,12 @@ the constraint-check component in Node CPU time. `--mode single --durability rel
 measures prepared one-row commits after a 100k-row table; `--mode load --load-mode tx|commits`
 includes the durable million-row load and maintenance. Each reported Node pass runs in its own
 worker process after one excluded warmup of the same build, keeping feedback and GC state separate.
+Nine or more pairs alternate AB/BA; `--samples N` retains N timed passes per worker and
+compares their mean. The paired CPU rule accepts a median gain above the deltas' IQR with
+at least 7/9 wins; the reverse rule identifies regressions. Raw deltas, IQR, full range and
+MAD are reported. `--require-gain` and `--require-no-regression` enforce these rules.
+`--mode hash --hash-bytes 5|12` isolates the hot short-key checksum paths. `--worker candidate
+--profile /path/to/load.cpuprofile` profiles only the second, timed pass (use `--samples 1`).
 `--in-process` retains the shared-process diagnostic lane. `node scripts/write-load-bench.mts --mode tx|commits
 --profile ~/.cache/load.cpuprofile` records a CPU profile around the load and maintenance only;
 profile stop and serialization are outside the reported CPU/wall clock. Run with plain `node`, using the built
@@ -313,6 +319,11 @@ its memory-store results exclude payload fetch, SQL, owner transport and real di
   reference CLI on both sides of the read threshold.
 - The seed is taken as `seed >>> 0` (ToUint32) before any arithmetic, so a fractional,
   non-finite or large number means exactly what `>>> 0` makes of it.
+- Inputs shorter than 16 bytes use a separate small kernel; five-byte ordered INT keys use
+  one word and one byte without tail loops. These kernels keep dispatch inlinable without
+  bringing the stripe loop into each key hash. They preserve the same canonical bytes and
+  allocate no buffers. Generated reference comparisons cover short keys, shifted backing
+  buffers and nonzero ranges (`testing/reach.ts`'s `XXHASH32_REACH`).
 - Inputs of at least `WORD_READ_BYTES` (256) read 32-bit little-endian words through one
   `DataView` per call (R15.8); shorter ones read bytes, which is faster there. Words are about
   2.5–3.5× faster from 4 KiB (about 2 GB/s against 0.6 GB/s); cold page loads, which verify

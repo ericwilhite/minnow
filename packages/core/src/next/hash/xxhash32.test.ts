@@ -1,6 +1,6 @@
 import fc from "fast-check";
 import { afterAll, describe, expect, it } from "vitest";
-import { createReach } from "../../testing/reach.js";
+import { createReach, XXHASH32_REACH } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { WORD_READ_BYTES, XxHash32Stream, xxHash32, xxHash32View } from "./xxhash32.js";
 
@@ -73,7 +73,7 @@ describe("xxHash32", () => {
   });
 
   it("takes any number as the seed `seed >>> 0` (review B2-p2c)", () => {
-    for (const length of [0, 5, 20, 300])
+    for (const length of [0, 5, 12, 20, 300])
       for (const seed of [
         1.5,
         -0.5,
@@ -201,16 +201,7 @@ describe("xxHash32 word reads (ruling R15.8)", () => {
     expect(xxHash32(shared, 7)).toBe(referenceXxHash32(sanityBuffer(length), 7));
   });
 
-  const reach = createReach("next-xxhash32", [
-    "byte reads",
-    "word reads",
-    "word reads at an odd byte offset",
-    "a range ending at its buffer's end",
-    "reused view short words",
-    "reused view long words",
-    "reused view odd offset",
-    "reused view byte tail",
-  ]);
+  const reach = createReach("next-xxhash32", XXHASH32_REACH);
   afterAll(() => {
     reach.assertReached();
   });
@@ -222,6 +213,7 @@ describe("xxHash32 word reads (ruling R15.8)", () => {
         .record({
           bytes: fc.oneof(
             fc.uint8Array({ maxLength: 64 }),
+            fc.uint8Array({ minLength: 13, maxLength: 13 }),
             fc.uint8Array({ minLength: WORD_READ_BYTES, maxLength: 6000 }),
           ),
           lead: fc.nat({ max: 15 }),
@@ -233,12 +225,14 @@ describe("xxHash32 word reads (ruling R15.8)", () => {
             .tuple(
               fc.nat({ max: each.bytes.length }),
               fc.nat({ max: each.bytes.length }),
-              fc.boolean(),
+              fc.constantFrom("whole", "range", "five"),
             )
-            .map(([a, b, whole]) =>
-              whole
+            .map(([a, b, shape]) =>
+              shape === "whole"
                 ? { ...each, start: 0, end: each.bytes.length }
-                : { ...each, start: Math.min(a, b), end: Math.max(a, b) },
+                : shape === "five" && each.bytes.length >= 6
+                  ? { ...each, start: 1, end: 6 }
+                  : { ...each, start: Math.min(a, b), end: Math.max(a, b) },
             ),
         );
       fc.assert(
@@ -252,6 +246,11 @@ describe("xxHash32 word reads (ruling R15.8)", () => {
           view.set(bytes);
           const length = end - start;
           reach.beginHistory();
+          if (length < 16 && length !== 5) reach.reach("short key other than five");
+          if (length === 5) {
+            reach.reach("five byte key");
+            if (lead > 0 && start > 0) reach.reach("five byte key with shifted backing and range");
+          }
           reach.reach(length >= WORD_READ_BYTES ? "word reads" : "byte reads");
           if (length >= WORD_READ_BYTES && (lead + start) % 4 !== 0)
             reach.reach("word reads at an odd byte offset");
