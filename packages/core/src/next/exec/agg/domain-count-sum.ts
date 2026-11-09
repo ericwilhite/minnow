@@ -1,4 +1,4 @@
-/** Exact, opt-in COUNT(*)/SUM(float8) over a certified int32 address range.
+/** Exact COUNT(*)/SUM(float8) over a certified int32 address range.
  *
  * A complete probe (or sound snapshot statistics) must precede seal(). Every
  * actual key is still range checked. NULL/out-of-range keys always use a
@@ -29,7 +29,7 @@ type AggregateRel = Extract<Rel, { op: "aggregate" }>;
 /** Deliberately narrow: both finalizers are copy-only and ranking has a total tie break. */
 export function supportsDomainCountSum(
   rel: AggregateRel,
-  context: CompileContext,
+  context: Pick<CompileContext, "input">,
   options: AggregateOptions,
 ): boolean {
   const [count, sum] = rel.aggregates,

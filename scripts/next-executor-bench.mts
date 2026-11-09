@@ -109,7 +109,7 @@ const catalogue = (await import(pathToFileURL(cataloguePath).href)) as Catalogue
 const core = await new StorageCore(8192).open();
 const lateSort = option("--late-sort", "on") !== "off";
 const keyOrder = option("--key-order", "on") !== "off";
-core.executor.prepare = createExecutor({ lateSort, keyOrder }).prepare;
+core.executor.prepare = createExecutor({ lateSort, keyOrder, domainCountSum: false }).prepare;
 const spec = generator.wideSpec(200);
 const metadata = {
   lane: "Node",
@@ -149,6 +149,8 @@ const metadata = {
         resolve("scripts/next-aggregation-light.mts"),
         resolve("scripts/lib/aggregation-light-kernels.mts"),
         resolve("packages/core/dist/next/hash/xxhash32.js"),
+        resolve("packages/core/dist/next/page/read-bounds.js"),
+        resolve("packages/core/dist/next/page/domain-certificate.js"),
         generatorPath,
         cataloguePath,
         resolve("apps/site/bench/benchmark.ts"),
@@ -162,6 +164,7 @@ const metadata = {
           "key-order",
           "late-fetch",
           "agg/aggregate",
+          "agg/domain-count-sum",
           "agg/group-top-n",
           "agg/groups",
           "agg/states",
@@ -507,37 +510,59 @@ try {
           "scalar-distinct",
           "grouped-pairs",
           "wide-typed",
+          "highcard-domain",
+          "structural",
           "aggregation",
         ].includes(option("--whole-compare", "")) &&
         (option("--whole-compare", "") !== "late-fetch" || query.id === "sort_topn_wide")
       ) {
         const saved = core.executor.prepare;
+        const comparison =
+          option("--whole-compare", "") === "structural"
+            ? query.id === "agg_highcard_int"
+              ? "highcard-domain"
+              : "wide-typed"
+            : option("--whole-compare", "");
         const strategies = [
           createExecutor(
-            option("--whole-compare", "") === "wide-typed"
-              ? { packedAverages: false, packedIntegers: false, batchDictionaryMinMax: false }
-              : option("--whole-compare", "") === "grouped-pairs"
-                ? { groupedUpdateFusion: false }
-                : option("--whole-compare", "") === "scalar-distinct"
-                  ? { scalarByteDistinct: false }
-                  : option("--whole-compare", "") === "aggregation"
-                    ? { groupTopN: false, groupedDistinctBitmap: false }
-                    : option("--whole-compare", "") === "grouped-distinct"
-                      ? { groupedDistinctBitmap: false }
-                      : option("--whole-compare", "") === "group-top-n"
-                        ? { groupTopN: false }
-                        : option("--whole-compare", "") === "key-order"
-                          ? { keyOrder: false }
-                          : option("--whole-compare", "") === "late-fetch"
-                            ? { lateFetchOnce: false }
-                            : { lateSort: false },
+            comparison === "wide-typed"
+              ? {
+                  packedAverages: false,
+                  packedIntegers: false,
+                  batchDictionaryMinMax: false,
+                  domainCountSum: false,
+                }
+              : comparison === "highcard-domain"
+                ? { domainCountSum: false }
+                : comparison === "grouped-pairs"
+                  ? { groupedUpdateFusion: false }
+                  : comparison === "scalar-distinct"
+                    ? { scalarByteDistinct: false }
+                    : comparison === "aggregation"
+                      ? { groupTopN: false, groupedDistinctBitmap: false }
+                      : comparison === "grouped-distinct"
+                        ? { groupedDistinctBitmap: false }
+                        : comparison === "group-top-n"
+                          ? { groupTopN: false }
+                          : comparison === "key-order"
+                            ? { keyOrder: false }
+                            : comparison === "late-fetch"
+                              ? { lateFetchOnce: false }
+                              : { lateSort: false },
           ),
           createExecutor(
-            option("--whole-compare", "") === "wide-typed"
-              ? { packedAverages: true, packedIntegers: true, batchDictionaryMinMax: true }
-              : option("--whole-compare", "") === "key-order"
-                ? { keyOrder: true }
-                : {},
+            comparison === "wide-typed"
+              ? {
+                  packedAverages: true,
+                  packedIntegers: true,
+                  batchDictionaryMinMax: true,
+                  domainCountSum: false,
+                }
+              : comparison === "highcard-domain"
+                ? { domainCountSum: true }
+                : comparison === "key-order"
+                  ? { keyOrder: true }
+                  : {},
           ),
         ];
         const before: number[] = [],
@@ -599,41 +624,45 @@ try {
               if (late) afterProfile = result.profile;
               else beforeProfile = result.profile;
               order.push(
-                option("--whole-compare", "") === "wide-typed"
+                comparison === "wide-typed"
                   ? late
                     ? "packed-averages-batch-dictionary"
                     : "separate-states"
-                  : option("--whole-compare", "") === "grouped-pairs"
+                  : comparison === "highcard-domain"
                     ? late
-                      ? "fused-grouped-pairs"
-                      : "separate-grouped-updates"
-                    : option("--whole-compare", "") === "scalar-distinct"
+                      ? "certified-direct-domain"
+                      : "general-hash"
+                    : comparison === "grouped-pairs"
                       ? late
-                        ? "scalar-byte-membership"
-                        : "scalar-value-interning"
-                      : option("--whole-compare", "") === "aggregation"
+                        ? "fused-grouped-pairs"
+                        : "separate-grouped-updates"
+                      : comparison === "scalar-distinct"
                         ? late
-                          ? "aggregation-default"
-                          : "aggregation-control"
-                        : option("--whole-compare", "") === "grouped-distinct"
+                          ? "scalar-byte-membership"
+                          : "scalar-value-interning"
+                        : comparison === "aggregation"
                           ? late
-                            ? "bitmaps-enabled"
-                            : "pair-set-control"
-                          : option("--whole-compare", "") === "group-top-n"
+                            ? "aggregation-default"
+                            : "aggregation-control"
+                          : comparison === "grouped-distinct"
                             ? late
-                              ? "selected-groups"
-                              : "all-groups"
-                            : option("--whole-compare", "") === "key-order"
+                              ? "bitmaps-enabled"
+                              : "pair-set-control"
+                            : comparison === "group-top-n"
                               ? late
-                                ? "index-cursor"
-                                : "scan-sort-locators"
-                              : option("--whole-compare", "") === "late-fetch"
+                                ? "selected-groups"
+                                : "all-groups"
+                              : comparison === "key-order"
                                 ? late
-                                  ? "one-pass-payload"
-                                  : "cached-payload"
-                                : late
-                                  ? "keys-and-locators"
-                                  : "full-payload",
+                                  ? "index-cursor"
+                                  : "scan-sort-locators"
+                                : comparison === "late-fetch"
+                                  ? late
+                                    ? "one-pass-payload"
+                                    : "cached-payload"
+                                  : late
+                                    ? "keys-and-locators"
+                                    : "full-payload",
               );
               console.error(
                 JSON.stringify({ id: query.id, comparison: true, round, late, load: loadavg() }),
@@ -654,7 +683,7 @@ try {
           candidate = distribution(after);
         wholeComparison = {
           lane: "Node",
-          strategy: option("--whole-compare", ""),
+          strategy: comparison,
           paired: paired ? pairedCPU(before, after) : null,
           rounds,
           order,

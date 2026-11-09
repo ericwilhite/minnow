@@ -1329,15 +1329,23 @@ state allocation and top-100 selection are timed. This is a benchmark kernel, no
 plan; it borrows immutable non-NULL int32/finite float8 inputs under the source
 cardinality/magnitude bound. Generated PGlite checks cover negative and endpoint domains, holes,
 wide-domain fallback, signed zero and exact count-desc/key-asc ordering.
-The same component script's `--candidate` flag also measures `DomainCountSumOperator`, an
-unwired executor experiment. It probes the complete decoded key stream inside timing, charges
-its optional packed table, keeps an exact disjoint hash fallback, and selects group ids before
-copying only the top-N payload. Fixed winner buffers are reserved up front; the large table is
-released before downstream output. Refused direct-state allocation keeps the ordinary plan.
-The component includes both probe and update drivers plus shared task pacing. It does not read
-a table or establish the cost of obtaining a sound snapshot bound in a real SQL plan. No
-default factory path selects this operator, and no new aggregation spill implementation is
-claimed.
+The same component script's `--candidate` flag measures the charged
+`DomainCountSumOperator`: complete decoded min/max probing, optional packed state, an exact
+disjoint hash fallback, top-N group-id selection and copying only the winners. The default
+executor selects this operator for one int32 grouping key, COUNT(*) and SUM(float8), with
+count-desc/key-asc bounded top-N, only when the pinned snapshot's complete stored-column
+statistics certify exact finite integer bounds and a safe row count. Nonempty memory segments,
+unknown bounds, computed keys and filtered sources retain ordinary aggregation. Deleted
+physical keys may widen the certificate, never exclude a visible key. Every key remains
+range-checked; a wide domain or unavailable optional credit keeps the exact general fallback.
+The read-sizing pass folds existing group-root statistics without another source scan.
+Winner buffers are admitted up front, optional table memory is released before downstream
+output, and `createExecutor({ domainCountSum: false })` retains the ordinary hash plan.
+This adds no aggregation spill implementation. The paired million-row Node component passed
+with a −55.578 ms median delta against a 51.571 ms full delta spread (9/9 favourable);
+the stored whole query passed non-regression (−27.729 ms median, 388.594 ms spread, 8/9).
+No statistically accepted whole-query gain is claimed. The committed raw pairs are in
+`scripts/bench-evidence/aggregation-paired-2026-11-08.json`.
 For the wide and highcard component drivers, `--paired --repeats 9 --warmups 10`
 times only adjacent control/candidate runs, alternating AB/BA on the same decoded fixture.
 `next-executor-bench.mts --paired --repeats 9 --whole-compare wide-typed` uses the same
@@ -1700,7 +1708,8 @@ The full interface contract includes the following (DML remains unimplemented by
   harness checks every result against the plain kernels and preserves AVG's Sxx transitions.
   `scripts/wide-decoded-fixture.test.ts` also judges all 21 outputs against PostgreSQL.
   These are Node diagnostic measurements, not browser Gate B results.
-- Wide typed-state experiments are opt-in while performance acceptance is pending:
+- Wide typed-state experiments remain opt-in: the paired component median gain
+  (76.731 ms) did not exceed its 140.913 ms paired spread, despite 9/9 favourable pairs:
   `createExecutor({ packedAverages: true, packedIntegers: true, batchDictionaryMinMax: true })`.
   The existing dictionary-native group table remains responsible for exact key identities.
   One kernel packs five adjacent plain float8 AVG outputs into N/Sx[5]/Sxx[5] records.

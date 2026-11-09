@@ -1,0 +1,657 @@
+{
+  "protocol": "Nine adjacent AB/BA pairs on one fixture; candidate minus control process user+system CPU in milliseconds. Component accepted only when -median(delta) > max(delta)-min(delta) and at least 7/9 favour candidate. Whole-query non-regression requires median(delta) <= full delta spread. No outliers discarded.",
+  "lane": "Node, not browser",
+  "node": "v26.12.0",
+  "cpu": "Intel(R) Core(TM) i5-8279U CPU @ 2.40GHz",
+  "rows": 1000000,
+  "measuredOptInSnapshot": "2569806e3966649626fcd03fc606ad8794b62d73",
+  "snapshotNote": "Component runs precede SQL wiring; compiled domain kernel unchanged. Whole-query working-tree patch is recorded below and committed in the measured opt-in snapshot. Default activation changes dispatch only, with controls explicit.",
+  "wholeMetadata": {
+    "revision": "27fbe8c2e50e3b08e2cdbec550560350203be9c6",
+    "workingTreePatchSha256": "3645a0bea917fde1dbad24abad1b3cf5a85131f9c1b5f9a8cfdb69fae4c09a73",
+    "storage": "MemoryBackend + extent space + WritePathImpl, strict commits, flushed",
+    "timing": "process user+system CPU; SQL/lower/prepare/bind/pin/execute/rows/credit/cleanup included; ingestion excluded",
+    "sourceHashes": {
+      "/home/eric/.cache/b4-agg-paired/scripts/next-executor-bench.mts": "cfbf9e086ad5d225eda2a7f05836c8737d076764538e466683c599ac7bc882e3",
+      "/home/eric/.cache/b4-agg-paired/scripts/lib/paired-cpu.mts": "55d226022f841d902c060452b9725a77e1b4e217c8bfe3021fdeb4e77af20bca",
+      "/home/eric/.cache/b4-agg-paired/scripts/next-executor-components.mts": "2d480e35e3415561a4d6bf60f383f114abf827c8f059d1ebc388d4b2b9154bc5",
+      "/home/eric/.cache/b4-agg-paired/scripts/next-late-fetch-component.mts": "41006934f3c14b8cf4c6cec95797c68ad87bb28db349bc34cffcf35621c0714d",
+      "/home/eric/.cache/b4-agg-paired/scripts/next-aggregation-components.mts": "607fb95045b3773c9e0ad25d8940a717b0ffbd23719f507608d82b8ea0761cae",
+      "/home/eric/.cache/b4-agg-paired/scripts/next-scalar-distinct-bench.mts": "46c7b4429f0576ce5b4bf2c762a1fc93b0b7fc55caa6a87e759e105675c3cc95",
+      "/home/eric/.cache/b4-agg-paired/scripts/next-aggregation-light.mts": "9a52e9da6208c4c102ac0881a068cbaa5a89f9cfd67391ee9fdc3822bfe2e3fa",
+      "/home/eric/.cache/b4-agg-paired/scripts/lib/aggregation-light-kernels.mts": "a14c388387f1bbed9dc2da1d4b962387fa414b8db179a9e2210b4cf89532872b",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/hash/xxhash32.js": "24c6b6e9d2684cc9c138c69ef6d648af5059f6a93e76b8c538ad071ebd364c9f",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/page/read-bounds.js": "356a1b2ddb78ac6dcda8b0eccca1dde57e12e9c53f708d706ad7ced0400bebe2",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/page/domain-certificate.js": "4b6f94c7abd4231dfd5d35eb79e668270575065eb8106dc4d8cff809a1e77107",
+      "/home/eric/.cache/b4-agg-paired/scripts/next-executor-workload/gen.mjs": "8b3d70312ac54a87e69f2a0672ed49b024baab7cf9097d92cf6e11da0189fd95",
+      "/home/eric/.cache/b4-agg-paired/scripts/next-executor-workload/queries.mjs": "abcc9f2809d04270569fe6b9e37867978d0c4c82e8a5ea331461d6f3a37347f2",
+      "/home/eric/.cache/b4-agg-paired/apps/site/bench/benchmark.ts": "3af271201d76a77c1d8d4296f11eb1e6abbac3ecd93223daf7a40e594ed6a60e",
+      "/home/eric/.cache/b4-agg-paired/packages/core/src/next/testing/executor-catalogue.json": "2af31fa77be1033ddf527956134ffe0dc2dbf05042bd15d495cf26c1f017ba3a",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/plan.js": "e3d145917146b0f0b3e5835fcf3cbb263d701d1ea44f69c03cf466cfe99dda88",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/limit.js": "b1791d3de37fef6e6a54cfa236e1124967da49cc4b255b752803e31f2b19c205",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/table-scan.js": "ca949db38416ba9d6ce30c7eda288d38fcb70f3f5c76c3d693219829eee26eb1",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/memory-scan.js": "946b07cc043f5e89415ea89aec55751cb66b2d276e30a285c3321ab59a8f2e7d",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/key-order.js": "f42600c9435038b251339b2dda6bbfc50665d389a52da0ac4dd31ea77b37036c",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/late-fetch.js": "c917b37f809a85d16e215ff9c84762e15f7237bf6e5e839080cdc1b90fbfba53",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/aggregate.js": "858dd225c9ea8d9535e2b121ba475cc8e3a52f6b6cac90a8f37d07b0c972c6f7",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/domain-count-sum.js": "83dec70a3a94e19d5ed5342095719dbca66a4a733c1c6eab9f295517df99c06e",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/group-top-n.js": "5ef1c1577fc14b76dd6e95386364d0bf7d1e8cd244ed3c2c9825faa6dd940096",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/groups.js": "3a89c5cf2e8a23f924e6f8fc26c70123a1210c725bf71de072e1405a3eee3c21",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/states.js": "bd449838589a97b73a81e80644189a94d681e4ad3c686a11a06fa269879ee660",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/packed-averages.js": "3f1db7e2bde8ccbdc567cd2d4c78ce831516b863db1c6cd676008da253330606",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/packed-integers.js": "479493490f0afa9f05b8595614a5a61832a95aa44bae4694b695536ce8911298",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/distinct.js": "08972c46c4050f2d48f147ad9a7db71ed4a1d73e9ad16a96c164799fe08345ca",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/scalar-byte-distinct.js": "01e6bd8904027327596f2d9d7deb291a5a255810f7184ba72f165ef12d4341a4"
+    },
+    "load": [5.05, 3.76, 3.22]
+  },
+  "profileMethod": "Separate inspector profiles outside CPU sample timing (components after pairs; whole queries before pairs). Unweighted non-idle/program self sample counts; sampling shares are not CPU attribution or an additive gap decomposition.",
+  "shapes": [
+    {
+      "id": "agg_3dims_20aggs",
+      "targetMs": 134,
+      "defaultEnabled": false,
+      "component": {
+        "warmups": 10,
+        "order": [
+          "operator",
+          "candidate",
+          "candidate",
+          "operator",
+          "operator",
+          "candidate",
+          "candidate",
+          "operator",
+          "operator",
+          "candidate",
+          "candidate",
+          "operator",
+          "operator",
+          "candidate",
+          "candidate",
+          "operator",
+          "operator",
+          "candidate"
+        ],
+        "loads": [
+          [6.71, 5.37, 5.51],
+          [6.71, 5.37, 5.51],
+          [6.74, 5.39, 5.52],
+          [6.74, 5.39, 5.52],
+          [6.74, 5.39, 5.52],
+          [6.74, 5.39, 5.52],
+          [6.74, 5.39, 5.52],
+          [6.74, 5.39, 5.52],
+          [6.74, 5.39, 5.52]
+        ],
+        "paired": {
+          "pairs": [
+            {
+              "control": 530.854,
+              "candidate": 454.123,
+              "delta": -76.73100000000005
+            },
+            {
+              "control": 445.861,
+              "candidate": 402.432,
+              "delta": -43.428999999999974
+            },
+            {
+              "control": 395.139,
+              "candidate": 327.292,
+              "delta": -67.84700000000004
+            },
+            {
+              "control": 400.872,
+              "candidate": 390.263,
+              "delta": -10.609000000000037
+            },
+            {
+              "control": 417.008,
+              "candidate": 266.695,
+              "delta": -150.313
+            },
+            {
+              "control": 495.76,
+              "candidate": 429.873,
+              "delta": -65.887
+            },
+            {
+              "control": 457.841,
+              "candidate": 358.828,
+              "delta": -99.01300000000003
+            },
+            {
+              "control": 485.913,
+              "candidate": 334.391,
+              "delta": -151.522
+            },
+            {
+              "control": 567.488,
+              "candidate": 454.448,
+              "delta": -113.04000000000008
+            }
+          ],
+          "medianDeltaMs": -76.73100000000005,
+          "spreadDeltaMs": 140.91299999999995,
+          "favoursCandidate": 9,
+          "favoursControl": 0,
+          "requiredFavourable": 7,
+          "acceptedGain": false,
+          "significantRegression": false,
+          "noRegression": true
+        },
+        "rawCPU": {
+          "operator": {
+            "samples": [
+              530.854, 445.861, 395.139, 400.872, 417.008, 495.76, 457.841, 485.913, 567.488
+            ],
+            "median": 457.841,
+            "spread": 172.34900000000005
+          },
+          "candidate": {
+            "samples": [
+              454.123, 402.432, 327.292, 390.263, 266.695, 429.873, 358.828, 334.391, 454.448
+            ],
+            "median": 390.263,
+            "spread": 187.753
+          }
+        },
+        "sourceHashes": {
+          "scripts/next-wide-typed-bench.mts": "c359f2e089b6d7d544737321514f9af768c8a16143451e7d9dec3f69728a2fd4",
+          "scripts/lib/wide-decoded-fixture.mts": "19bd9a4a8356b8b713ab40cb1e500e95044b5de09a1183da0676d33576400394",
+          "scripts/next-aggregation-light.mts": "9a52e9da6208c4c102ac0881a068cbaa5a89f9cfd67391ee9fdc3822bfe2e3fa",
+          "scripts/lib/paired-cpu.mts": "55d226022f841d902c060452b9725a77e1b4e217c8bfe3021fdeb4e77af20bca",
+          "scripts/lib/aggregation-light-kernels.mts": "a14c388387f1bbed9dc2da1d4b962387fa414b8db179a9e2210b4cf89532872b",
+          "packages/core/browser/next-agg-shapes.ts": "57228f8d3849eff1febec0c8fa130f2db03166c087393e66e3e425967a305354",
+          "packages/core/dist/next/exec/agg/aggregate.js": "858dd225c9ea8d9535e2b121ba475cc8e3a52f6b6cac90a8f37d07b0c972c6f7",
+          "packages/core/dist/next/exec/agg/states.js": "bd449838589a97b73a81e80644189a94d681e4ad3c686a11a06fa269879ee660",
+          "packages/core/dist/next/exec/agg/packed-averages.js": "3f1db7e2bde8ccbdc567cd2d4c78ce831516b863db1c6cd676008da253330606",
+          "packages/core/dist/next/exec/agg/packed-integers.js": "479493490f0afa9f05b8595614a5a61832a95aa44bae4694b695536ce8911298",
+          "packages/core/dist/next/exec/agg/groups.js": "3a89c5cf2e8a23f924e6f8fc26c70123a1210c725bf71de072e1405a3eee3c21"
+        },
+        "revision": "27fbe8c2e50e3b08e2cdbec550560350203be9c6",
+        "patchSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "profiles": {
+          "operator": {
+            "sha256": "87361edd2827a8fb49f9776b9665f05ccbfa1d194b46fb755ba2cd7e002ffcf6",
+            "nonIdleSamples": 2740,
+            "topSelfSamplePercent": {
+              "exec/agg/states.js:averageDense": 16.5,
+              "exec/agg/states.js:update": 11.93,
+              "exec/agg/states.js:addFlat32": 10.95,
+              "vector/varlen.js:compareBytes": 8.91,
+              "exec/agg/groups.js:#assign": 7.26,
+              "exec/agg/states.js:#updateRanked": 6.28,
+              "exec/agg/states.js:maxDense": 5.15,
+              "exec/agg/states.js:minDense": 4.96,
+              "exec/agg/groups.js:assign": 3.83,
+              "exec/agg/states.js:#positionOf": 3.65,
+              "exec/agg/states.js:twoSumsDense": 2.37,
+              "exec/agg/values.js:set": 2.08
+            }
+          },
+          "candidate": {
+            "sha256": "420e2ff340d2a9c5f3ea675e386a7170b4b6d958aea796686435edacce11b4fb",
+            "nonIdleSamples": 2215,
+            "topSelfSamplePercent": {
+              "exec/agg/packed-integers.js:exactEight": 14.9,
+              "exec/agg/packed-averages.js:denseFive": 10.79,
+              "exec/agg/states.js:update": 9.39,
+              "exec/agg/groups.js:#assign": 8.62,
+              "exec/agg/states.js:#updateBatchRanked": 8.35,
+              "exec/agg/states.js:minDense": 7.36,
+              "exec/agg/states.js:maxDense": 6.68,
+              "exec/agg/groups.js:assign": 5.55,
+              "exec/agg/packed-averages.js:bounded": 2.84,
+              "exec/agg/states.js:twoSumsDense": 2.71,
+              "exec/agg/values.js:#setValue": 2.66,
+              "exec/agg/values.js:set": 2.62
+            }
+          }
+        }
+      },
+      "whole": {
+        "strategy": "wide-typed",
+        "order": [
+          "separate-states",
+          "packed-averages-batch-dictionary",
+          "packed-averages-batch-dictionary",
+          "separate-states",
+          "separate-states",
+          "packed-averages-batch-dictionary",
+          "packed-averages-batch-dictionary",
+          "separate-states",
+          "separate-states",
+          "packed-averages-batch-dictionary",
+          "packed-averages-batch-dictionary",
+          "separate-states",
+          "separate-states",
+          "packed-averages-batch-dictionary",
+          "packed-averages-batch-dictionary",
+          "separate-states",
+          "separate-states",
+          "packed-averages-batch-dictionary"
+        ],
+        "paired": {
+          "pairs": [
+            {
+              "control": 566.149,
+              "candidate": 723.603,
+              "delta": 157.45399999999995
+            },
+            {
+              "control": 960.89,
+              "candidate": 627.405,
+              "delta": -333.485
+            },
+            {
+              "control": 667.619,
+              "candidate": 750.973,
+              "delta": 83.35399999999993
+            },
+            {
+              "control": 806.849,
+              "candidate": 491.718,
+              "delta": -315.13100000000003
+            },
+            {
+              "control": 651.606,
+              "candidate": 667.647,
+              "delta": 16.041000000000054
+            },
+            {
+              "control": 817.728,
+              "candidate": 507.673,
+              "delta": -310.05499999999995
+            },
+            {
+              "control": 612.707,
+              "candidate": 808.265,
+              "delta": 195.558
+            },
+            {
+              "control": 880.958,
+              "candidate": 487.159,
+              "delta": -393.799
+            },
+            {
+              "control": 897.218,
+              "candidate": 865.643,
+              "delta": -31.574999999999932
+            }
+          ],
+          "medianDeltaMs": -31.574999999999932,
+          "spreadDeltaMs": 589.357,
+          "favoursCandidate": 5,
+          "favoursControl": 4,
+          "requiredFavourable": 7,
+          "acceptedGain": false,
+          "significantRegression": false,
+          "noRegression": true
+        },
+        "rawCPU": {
+          "before": {
+            "samples": [
+              566.149, 960.89, 667.619, 806.849, 651.606, 817.728, 612.707, 880.958, 897.218
+            ],
+            "median": 806.849,
+            "spread": 394.741
+          },
+          "after": {
+            "samples": [
+              723.603, 627.405, 750.973, 491.718, 667.647, 507.673, 808.265, 487.159, 865.643
+            ],
+            "median": 667.647,
+            "spread": 378.48400000000004
+          }
+        },
+        "outputEquality": "Every timed result compared by complete output digest, both strategies on the same fixture. PG/current-engine generated tests independently judge results.",
+        "profiles": {
+          "before": {
+            "sha256": "6531d7be27c3d8ef6abfb81087ae1df858b58294ef342d96165284b7790c40be",
+            "nonIdleSamples": 3202,
+            "topSelfSamplePercent": {
+              "exec/agg/states.js:averageDense": 10.43,
+              "exec/agg/states.js:update": 8.06,
+              "exec/agg/states.js:addFlat32": 6.62,
+              "exec/agg/groups.js:#assign": 4.15,
+              "exec/agg/states.js:minDense": 3.65,
+              "format/manifest-codec.js:RefReader": 3.62,
+              "exec/agg/states.js:#updateRanked": 3.47,
+              "exec/agg/states.js:maxDense": 3.28,
+              "exec/agg/groups.js:assign": 2.81,
+              "page/decode.js:scaledInto": 2.19,
+              "vector/varlen.js:compareBytes": 2.06,
+              "page/read-bounds.js:size": 1.81
+            }
+          },
+          "after": {
+            "sha256": "3f613edac409cb22ae39ecec9d8999d01b57fad0a95abaa953904619cb01246f",
+            "nonIdleSamples": 3962,
+            "topSelfSamplePercent": {
+              "exec/agg/packed-integers.js:exactEight": 7.27,
+              "exec/agg/packed-averages.js:denseFive": 5.33,
+              "exec/agg/states.js:#updateBatchRanked": 4.77,
+              "exec/agg/states.js:update": 4.64,
+              "format/manifest-codec.js:RefReader": 4.44,
+              "exec/agg/groups.js:#assign": 4.19,
+              "exec/agg/states.js:maxDense": 3.61,
+              "exec/agg/states.js:minDense": 3.51,
+              "exec/agg/groups.js:assign": 2.95,
+              "page/decode.js:scaledInto": 2.65,
+              "page/read-bounds.js:size": 2.35,
+              ":(garbage collector)": 2.15
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "agg_highcard_int",
+      "targetMs": 74,
+      "defaultEnabled": true,
+      "component": {
+        "warmups": 10,
+        "order": [
+          "operator",
+          "candidate",
+          "candidate",
+          "operator",
+          "operator",
+          "candidate",
+          "candidate",
+          "operator",
+          "operator",
+          "candidate",
+          "candidate",
+          "operator",
+          "operator",
+          "candidate",
+          "candidate",
+          "operator",
+          "operator",
+          "candidate"
+        ],
+        "loads": [
+          [3.31, 4.66, 5.25],
+          [3.31, 4.66, 5.25],
+          [3.31, 4.66, 5.25],
+          [3.31, 4.66, 5.25],
+          [3.31, 4.66, 5.25],
+          [3.31, 4.66, 5.25],
+          [3.31, 4.66, 5.25],
+          [3.31, 4.66, 5.25],
+          [3.31, 4.66, 5.25]
+        ],
+        "paired": {
+          "pairs": [
+            {
+              "control": 147.986,
+              "candidate": 71.02,
+              "delta": -76.966
+            },
+            {
+              "control": 130.188,
+              "candidate": 74.61,
+              "delta": -55.57799999999999
+            },
+            {
+              "control": 114.173,
+              "candidate": 76.849,
+              "delta": -37.324
+            },
+            {
+              "control": 137.488,
+              "candidate": 67.931,
+              "delta": -69.557
+            },
+            {
+              "control": 147.504,
+              "candidate": 78.175,
+              "delta": -69.329
+            },
+            {
+              "control": 103.983,
+              "candidate": 78.588,
+              "delta": -25.39500000000001
+            },
+            {
+              "control": 110.853,
+              "candidate": 75.461,
+              "delta": -35.391999999999996
+            },
+            {
+              "control": 106.85,
+              "candidate": 48.858,
+              "delta": -57.992
+            },
+            {
+              "control": 133.012,
+              "candidate": 84.812,
+              "delta": -48.2
+            }
+          ],
+          "medianDeltaMs": -55.57799999999999,
+          "spreadDeltaMs": 51.570999999999984,
+          "favoursCandidate": 9,
+          "favoursControl": 0,
+          "requiredFavourable": 7,
+          "acceptedGain": true,
+          "significantRegression": false,
+          "noRegression": true
+        },
+        "rawCPU": {
+          "operator": {
+            "samples": [
+              147.986, 130.188, 114.173, 137.488, 147.504, 103.983, 110.853, 106.85, 133.012
+            ],
+            "median": 130.188,
+            "spread": 44.002999999999986
+          },
+          "candidate": {
+            "samples": [71.02, 74.61, 76.849, 67.931, 78.175, 78.588, 75.461, 48.858, 84.812],
+            "median": 75.461,
+            "spread": 35.954
+          }
+        },
+        "sourceHashes": {
+          "scripts/next-highcard-domain-bench.mts": "e6c578ddd5aa9eb42ab75cd23e61b3cf0bfcd926874546a3ae062955d580aa6c",
+          "scripts/next-aggregation-light.mts": "9a52e9da6208c4c102ac0881a068cbaa5a89f9cfd67391ee9fdc3822bfe2e3fa",
+          "scripts/lib/paired-cpu.mts": "55d226022f841d902c060452b9725a77e1b4e217c8bfe3021fdeb4e77af20bca",
+          "scripts/lib/aggregation-light-kernels.mts": "a14c388387f1bbed9dc2da1d4b962387fa414b8db179a9e2210b4cf89532872b",
+          "packages/core/browser/next-agg-shapes.ts": "57228f8d3849eff1febec0c8fa130f2db03166c087393e66e3e425967a305354",
+          "packages/core/dist/next/exec/agg/aggregate.js": "858dd225c9ea8d9535e2b121ba475cc8e3a52f6b6cac90a8f37d07b0c972c6f7",
+          "packages/core/dist/next/exec/agg/groups.js": "3a89c5cf2e8a23f924e6f8fc26c70123a1210c725bf71de072e1405a3eee3c21",
+          "packages/core/dist/next/exec/agg/states.js": "bd449838589a97b73a81e80644189a94d681e4ad3c686a11a06fa269879ee660",
+          "packages/core/dist/next/exec/agg/group-top-n.js": "5ef1c1577fc14b76dd6e95386364d0bf7d1e8cd244ed3c2c9825faa6dd940096",
+          "packages/core/dist/next/exec/agg/domain-count-sum.js": "83dec70a3a94e19d5ed5342095719dbca66a4a733c1c6eab9f295517df99c06e",
+          "packages/core/src/next/exec/agg/domain-count-sum.ts": "9d2893fe1e86fd259fcff2e634a32004d31cffe14b0c768c3f40198ce45eca42",
+          "packages/core/src/next/exec/agg/domain-count-sum.test.ts": "c739325b135568ef0bc2acd7bb2f2aacd3d3a0f4437bcc961be967101f2bb35b"
+        },
+        "revision": "27fbe8c2e50e3b08e2cdbec550560350203be9c6",
+        "patchSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "profiles": {
+          "operator": {
+            "sha256": "33480d187af3cc2913e9a79ba2b54df247e46c6c3914ed28c8241b733a866100",
+            "nonIdleSamples": 570,
+            "topSelfSamplePercent": {
+              "exec/agg/groups.js:#assignDirect": 31.75,
+              "exec/agg/states.js:countedSumDense": 25.44,
+              "exec/agg/groups.js:#hashed": 9.47,
+              "exec/agg/group-top-n.js:#dense": 5.26,
+              "exec/agg/groups.js:emit": 4.21,
+              "exec/agg/groups.js:assign": 3.68,
+              "exec/agg/groups.js:#grow": 2.81,
+              "exec/agg/groups.js:#newId": 2.28,
+              "exec/agg/groups.js:make": 2.11,
+              "exec/agg/groups.js:#assignHashed": 2.11,
+              "exec/agg/states.js:grow": 1.58,
+              ":(garbage collector)": 1.58
+            }
+          },
+          "candidate": {
+            "sha256": "dd2d43bf1c6fdc6d4d8bde3dc02741f65c190a6bfc05f936bb6a7eeeb9ab3754",
+            "nonIdleSamples": 532,
+            "topSelfSamplePercent": {
+              "exec/agg/domain-count-sum.js:finish": 44.92,
+              "exec/agg/domain-count-sum.js:push": 39.66,
+              "exec/agg/domain-count-sum.js:": 4.51,
+              "exec/agg/domain-count-sum.js:probe": 2.63,
+              ":(garbage collector)": 2.63,
+              "exec/agg/domain-count-sum.js:seal": 2.44,
+              "exec/pipeline.js:#advance": 0.75,
+              "exec/sort.js:Sorter": 0.56,
+              "exec/sort-keys.js:msdSort": 0.38,
+              "node:inspector:post": 0.19,
+              "exec/agg/groups.js:make": 0.19,
+              "timers:Immediate": 0.19
+            }
+          }
+        }
+      },
+      "whole": {
+        "strategy": "highcard-domain",
+        "order": [
+          "general-hash",
+          "certified-direct-domain",
+          "certified-direct-domain",
+          "general-hash",
+          "general-hash",
+          "certified-direct-domain",
+          "certified-direct-domain",
+          "general-hash",
+          "general-hash",
+          "certified-direct-domain",
+          "certified-direct-domain",
+          "general-hash",
+          "general-hash",
+          "certified-direct-domain",
+          "certified-direct-domain",
+          "general-hash",
+          "general-hash",
+          "certified-direct-domain"
+        ],
+        "paired": {
+          "pairs": [
+            {
+              "control": 295.386,
+              "candidate": 267.657,
+              "delta": -27.729000000000042
+            },
+            {
+              "control": 394.444,
+              "candidate": 178.516,
+              "delta": -215.92800000000003
+            },
+            {
+              "control": 296.628,
+              "candidate": 274.474,
+              "delta": -22.153999999999996
+            },
+            {
+              "control": 184.501,
+              "candidate": 158.736,
+              "delta": -25.765000000000015
+            },
+            {
+              "control": 289.202,
+              "candidate": 238.846,
+              "delta": -50.355999999999995
+            },
+            {
+              "control": 352.974,
+              "candidate": 133.013,
+              "delta": -219.96099999999998
+            },
+            {
+              "control": 196.813,
+              "candidate": 365.446,
+              "delta": 168.63300000000004
+            },
+            {
+              "control": 181.306,
+              "candidate": 160.161,
+              "delta": -21.14500000000001
+            },
+            {
+              "control": 392.665,
+              "candidate": 211.502,
+              "delta": -181.163
+            }
+          ],
+          "medianDeltaMs": -27.729000000000042,
+          "spreadDeltaMs": 388.59400000000005,
+          "favoursCandidate": 8,
+          "favoursControl": 1,
+          "requiredFavourable": 7,
+          "acceptedGain": false,
+          "significantRegression": false,
+          "noRegression": true
+        },
+        "rawCPU": {
+          "before": {
+            "samples": [
+              295.386, 394.444, 296.628, 184.501, 289.202, 352.974, 196.813, 181.306, 392.665
+            ],
+            "median": 295.386,
+            "spread": 213.138
+          },
+          "after": {
+            "samples": [
+              267.657, 178.516, 274.474, 158.736, 238.846, 133.013, 365.446, 160.161, 211.502
+            ],
+            "median": 211.502,
+            "spread": 232.43300000000002
+          }
+        },
+        "outputEquality": "Every timed result compared by complete output digest, both strategies on the same fixture. PG/current-engine generated tests independently judge results.",
+        "profiles": {
+          "before": {
+            "sha256": "5e91a4971aaa2e7609b9146c06a133e934c6516467b81c7db7eba5a22c7f788a",
+            "nonIdleSamples": 1208,
+            "topSelfSamplePercent": {
+              "exec/agg/groups.js:#assignDirect": 21.94,
+              "exec/agg/states.js:countedSumDense": 13.82,
+              "format/manifest-codec.js:RefReader": 10.02,
+              "exec/agg/groups.js:#hashed": 4.72,
+              ":(garbage collector)": 3.97,
+              "exec/agg/groups.js:make": 3.48,
+              "format/bytes.js:uint": 3.15,
+              "exec/agg/states.js:grow": 2.81,
+              "format/manifest-codec.js:": 2.15,
+              "exec/agg/groups.js:#newId": 1.74,
+              "exec/agg/group-top-n.js:#dense": 1.66,
+              "page/read-bounds.js:size": 1.57
+            }
+          },
+          "after": {
+            "sha256": "20be3d69da499e0db8fa85faaf0b58630e6b8dabab85dd94337277fb45ab675f",
+            "nonIdleSamples": 1151,
+            "topSelfSamplePercent": {
+              "exec/agg/domain-count-sum.js:push": 21.81,
+              "exec/agg/domain-count-sum.js:finish": 18.77,
+              "format/manifest-codec.js:RefReader": 11.56,
+              "format/manifest-codec.js:": 5.39,
+              "format/manifest-codec.js:charged": 5.04,
+              ":(garbage collector)": 4.17,
+              "format/bytes.js:uint": 3.82,
+              "exec/agg/domain-count-sum.js:seal": 3.48,
+              "format/bytes.js:bigint": 1.56,
+              "page/read-bounds.js:size": 1.39,
+              "page/decode.js:decodeValues": 1.39,
+              "page/read-bounds.js:run": 0.96
+            }
+          }
+        }
+      }
+    }
+  ],
+  "limits": [
+    "Loaded shared host; no quiet-host or browser acceptance claim.",
+    "Whole-query non-regression is accepted, but neither whole-query gain exceeds its paired spread.",
+    "Wide fails the component rule and remains opt-in. DISTINCT remains diagnostic.",
+    "No new spill path. Unknown/live-memory/computed/filtered domains retain ordinary aggregation.",
+    "Input setup/decoding excluded from component; real write/flush fixture setup excluded from whole query. Allocation, task pacing, transitions, top-N and output included."
+  ]
+}

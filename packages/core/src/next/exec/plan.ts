@@ -10,6 +10,7 @@ import { samePhysicalType, type PhysicalType } from "../types.js";
 import { BATCH_ROWS, type Batch, type Selection, type Vector } from "../vector/vector.js";
 import { int64At } from "../vector/int64.js";
 import { AggregateOperator, type AggregateOptions } from "./agg/aggregate.js";
+import { DomainCountSumOperator, supportsDomainCountSum } from "./agg/domain-count-sum.js";
 import { groupTopNShape, type GroupTopNSpec } from "./agg/group-top-n.js";
 import {
   isOrderedSet,
@@ -376,6 +377,29 @@ function setupWindow(
 }
 
 /** Compile capability checks and recipes, never retaining a mutable kernel instance. */
+/** Follow only row-preserving direct key projections; filters/joins/computed keys keep hashing. */
+function domainSource(rel: Extract<Rel, { op: "aggregate" }>) {
+  const group = rel.groupBy[0];
+  if (group === undefined) return null;
+  let index: number = group;
+  let source = rel.input;
+  while (source.op === "project") {
+    const key: ScalarExpr | undefined = source.exprs[index];
+    if (key?.op !== "column") return null;
+    index = key.index;
+    source = source.input;
+  }
+  if (
+    source.op !== "scan" ||
+    source.filter !== null ||
+    source.runtimeFilters.length > 0 ||
+    source.emitLocator
+  )
+    return null;
+  const column = source.columns[index];
+  return column === undefined ? null : { scan: source, column };
+}
+
 export interface CompileOptions {
   readonly lateSort?: boolean;
   readonly keyOrder?: boolean;
@@ -387,6 +411,8 @@ export interface CompileOptions {
   readonly packedAverages?: boolean;
   readonly packedIntegers?: boolean;
   readonly batchDictionaryMinMax?: boolean;
+  /** False retains the general hash recipe as a benchmark control. */
+  readonly domainCountSum?: boolean;
   /** False retains the original window inputs for component/query benchmark controls. */
   readonly windowInputDeduplication?: boolean;
   /** Parent control for literal-amount gather benchmarks. */
@@ -433,6 +459,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   // A terminal names-only projection forwards export ownership while retaining profile counts.
   const exportOwners = new WeakMap<Operator, ResultSink>();
   const groupTops = new Map<number, GroupTopNSpec>();
+  let domainPlans = 0;
   // SQL SELECT * may retain an identity projection for output names. It neither retains
   // source batches nor re-reads them; computed/reordered projections and other consumers stop here.
   let terminalInput = plan.root;
@@ -783,12 +810,27 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           packedIntegers: options.packedIntegers === true,
           batchDictionaryMinMax: options.batchDictionaryMinMax === true,
         };
+        const domain =
+          options.domainCountSum !== false &&
+          rel.op === "aggregate" &&
+          aggregate.groupingSets === null &&
+          supportsDomainCountSum(aggregate, { input }, outputOptions)
+            ? domainSource(rel)
+            : null;
+        if (domain !== null) {
+          const source = readSources.get(domain.scan.id);
+          if (source === undefined) throw new TypeError("Missing domain scan recipe");
+          readSources.set(domain.scan.id, { ...source, domainColumn: domain.column });
+          domainPlans++;
+        }
         const minimum = measureCompilerBuffers(
           compilation,
           input,
           BATCH_ROWS,
           (context, grant) =>
-            new AggregateOperator(aggregate, context, grant, DISCARD, outputOptions),
+            domain === null
+              ? new AggregateOperator(aggregate, context, grant, DISCARD, outputOptions)
+              : new DomainCountSumOperator(aggregate, context, grant, DISCARD, outputOptions),
           (operator) => operator.abort(undefined),
         );
         fixed(rel, Math.max(4096, minimum));
@@ -799,11 +841,32 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             input,
             minimum,
             BATCH_ROWS,
-            (context, grant) =>
-              new AggregateOperator(aggregate, context, grant, counted(runtime, rel, downstream), {
+            (context, grant) => {
+              const config = {
                 signal: runtime.signal,
                 ...outputOptions,
-              }),
+              };
+              const certificate =
+                domain === null ? undefined : runtime.sourceDomain(domain.scan.id);
+              if (certificate === undefined || certificate.column !== domain?.column)
+                return new AggregateOperator(
+                  aggregate,
+                  context,
+                  grant,
+                  counted(runtime, rel, downstream),
+                  config,
+                );
+              const operator = new DomainCountSumOperator(
+                aggregate,
+                context,
+                grant,
+                counted(runtime, rel, downstream),
+                config,
+              );
+              operator.bounds(certificate.low, certificate.high, certificate.rows);
+              operator.seal();
+              return operator;
+            },
             (operator) => {
               runtime.onAbort((reason) => operator.abort(reason));
               return child(runtime, operator, []);
@@ -1218,14 +1281,16 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           );
   }
   const recipe = prepare(plan.root);
-  // The provider cursor is streaming. Keep this SQL strategy diagnostic until its
+  // Keep this SQL strategy diagnostic until its
   // cursor/fetch steps participate in the execution minimum and pass first-page acceptance.
   // Explicit indexRange and SQL both require the diagnostic opt-in above.
   const ordered = options.keyOrder === true ? orderedSort(plan) : null;
   // Extra helper buffers must not turn a formerly admissible small-cap query into a refusal.
   // Both strategies are capability-checked at prepare; only their execution resources differ.
   const fallback =
-    lateSortIds.size === 0 ? null : compilePlan(plan, { ...options, lateSort: false });
+    lateSortIds.size === 0 && domainPlans === 0
+      ? null
+      : compilePlan(plan, { ...options, lateSort: false, domainCountSum: false });
   const program: Program = (runtime, sink) => {
     runtime.resolveCall = resolveCall;
     if (ordered !== null) {

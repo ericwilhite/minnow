@@ -15,6 +15,7 @@ import { MAX_BLOB_BYTES, MAX_READ_BYTES } from "../storage/extents.js";
 import { BATCH_ROWS, dataBytes } from "../vector/vector.js";
 import { INT32_MAX, type PhysicalType } from "../types.js";
 import { clockFor, pauseIfDue } from "../task.js";
+import { Int32DomainCertificate, type Int32Domain } from "./domain-certificate.js";
 
 interface Snapshot {
   readonly pages: SpaceReader;
@@ -22,6 +23,7 @@ interface Snapshot {
     id: number,
     options: { budget: ByteBudget },
   ): MaybePromise<{
+    readonly liveRowCount?: number;
     readonly columns: ReadonlyArray<{ readonly id: number }>;
     readonly segments: ReadonlyArray<
       | {
@@ -73,12 +75,15 @@ export interface ReadSource {
   readonly stagingBytes: number;
   /** A proven unfiltered input prefix; null means the complete input can be reached. */
   readonly rows: number | null;
+  /** Optional exact int32 address certificate for a complete, unfiltered source. */
+  readonly domainColumn?: number;
 }
 export interface ReadBound {
   readonly bytes: number;
   readonly io: number;
   readonly progress: number;
   readonly windowBytes: number;
+  readonly domain?: Int32Domain;
 }
 
 /** A sizing pass cannot grow or hold a partial reservation while awaiting a bigger one. */
@@ -140,6 +145,11 @@ export function boundSource(
   return run(size());
   function* size(): ReadJob<ReadBound> {
     const table = yield* readValue(view.table(source.tableId, { budget: NO_ALLOCATION }));
+    const certificate = new Int32DomainCertificate(
+      source.domainColumn,
+      table.liveRowCount,
+      source.rows === null,
+    );
     const windowBytes =
       source.columns.length === table.columns.length &&
       source.columns.every((id, k) => id === table.columns[k]?.id)
@@ -167,6 +177,7 @@ export function boundSource(
           : segment.rowCount;
       if (remaining !== null) remaining = live === undefined ? null : Math.max(0, remaining - live);
       if (segment.kind === "memory") {
+        if (segment.liveRowCount !== 0) certificate.unknown();
         if (segment.readHint !== undefined && source.columns.length > 0) {
           let capacity = Math.min(governor.capBytes, 65536);
           for (;;) {
@@ -297,6 +308,11 @@ export function boundSource(
         try {
           io = Math.max(io, Math.min(MAX_READ_BYTES, segment.group.root.length));
           root = yield* readValue(metadata.groupRoot(segment.group.root, budget));
+          if (source.domainColumn !== undefined && segment.liveRowCount !== 0)
+            certificate.stored(
+              segment.rowCount,
+              root.value.columns.find((column) => column.columnId === source.domainColumn),
+            );
           const stored = root.value.columns
             .filter((column) => source.columns.includes(column.columnId))
             .reduce((sum, column) => sum + column.data.length, 0);
@@ -451,7 +467,14 @@ export function boundSource(
         capacity = Math.min(required, governor.capBytes);
       }
     }
-    return { bytes: maximum, io, progress: Math.max(65536, 4 * largestValue), windowBytes };
+    const domain = certificate.result();
+    return {
+      bytes: maximum,
+      io,
+      progress: Math.max(65536, 4 * largestValue),
+      windowBytes,
+      ...(domain === undefined ? {} : { domain }),
+    };
   }
 }
 

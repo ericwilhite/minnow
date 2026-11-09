@@ -110,6 +110,9 @@ export class QueryRuntime {
   sourceWindow(id: number): number {
     return this.#readBounds.get(id)?.windowBytes ?? 0;
   }
+  sourceDomain(id: number) {
+    return this.#readBounds.get(id)?.domain;
+  }
   minimumBytes(
     entries: ReadonlyArray<{ rel: OperatorIdentity; minimum: number; loanSlots?: number }>,
     inputs = 0,
