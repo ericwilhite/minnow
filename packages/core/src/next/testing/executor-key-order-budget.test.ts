@@ -7,7 +7,8 @@ import { createReach } from "../../testing/reach.js";
 import { createExecutor } from "../exec/create.js";
 import { prepareParameters } from "../exec/parameters.js";
 import { indexMinimums, orderedSort } from "../exec/key-order.js";
-import { Governor, reserveFor, MemoryAdmissionError } from "../memory/governor.js";
+import { Governor, MemoryAdmissionError } from "../memory/governor.js";
+import { MAX_BLOB_BYTES } from "../access/space.js";
 import { ChunkReader } from "../page/reader.js";
 import type { PreparedPlan, ParameterValue } from "../exec/executor.js";
 import type { Snapshot } from "../access/snapshot.js";
@@ -43,6 +44,10 @@ it.each(seedsFor("next-key-order-parameter-admission", [0xe109, 0xe10a]))(
       await core.execute(ddl);
       await pg.exec(ddl);
       await core.writeBatch("insertBatch", "t", input);
+      // This law requires the generic recipe to fit. Memory segments have a separate
+      // publication-safe decoder envelope; use stored rows to isolate strategy admission.
+      await core.harness.path.recycleLog();
+      await core.harness.path.quiesce();
       for (const row of input)
         await pg.query(
           `INSERT INTO t VALUES(${names.map((_, i) => `$${String(i + 1)}`).join(",")})`,
@@ -140,18 +145,20 @@ it.each(seedsFor("next-key-order-parameter-admission", [0xe109, 0xe10a]))(
               types: ordered.project.output.map((f) => f.type),
               descending,
             };
+            // The diagnostic strategy has one restore breaker and one result phase.
+            // Each owns one private blob-sized progress step inside the whole cap.
             const total = (cap: number) =>
-              indexMinimums(shape, cap).reduce((n, e) => n + e.minimum, 0);
+              indexMinimums(shape, cap).reduce((n, e) => n + e.minimum, 0) + 2 * MAX_BLOB_BYTES;
             const binding = await prepareParameters(plan, args);
             let lo = 2 << 20,
               hi = 64 << 20;
             while (lo < hi) {
               const mid = Math.floor((lo + hi) / 2);
-              if (total(mid) + binding.bytes <= mid - reserveFor(mid)) hi = mid;
+              if (total(mid) + binding.bytes <= mid) hi = mid;
               else lo = mid + 1;
             }
             const cap = lo - 1 - slack,
-              room = cap - reserveFor(cap) - total(cap);
+              room = cap - total(cap);
             expect(room).toBeGreaterThanOrEqual(0);
             expect(room).toBeLessThan(binding.bytes);
             if (unused) {

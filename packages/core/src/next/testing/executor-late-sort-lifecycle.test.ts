@@ -79,7 +79,11 @@ it.each(seedsFor("next-executor-late-sort-small-cap", [0xd105, 0xd106]))(
         async (width, count, memory) => {
           reach.beginHistory();
           const core = await new StorageCore(8192).open(),
-            governor = new Governor((memory ? 21 : 16) * MiB);
+            // MemoryReadHint's publication-safe metadata envelope is about 25.6 MiB
+            // before output and downstream buffers. Fund the generic memory recipe;
+            // the extra late-fetch source/restore minima must still force fallback.
+            // The assertions below retain both admission and single-pipeline witnesses.
+            governor = new Governor((memory ? 64 : 16) * MiB);
           const names = Array.from({ length: width }, (_, i) => `c${String(i)}`);
           const input: Array<Record<string, number>> = Array.from({ length: count }, (_, i) =>
             Object.fromEntries(

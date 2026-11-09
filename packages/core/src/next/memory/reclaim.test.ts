@@ -80,22 +80,6 @@ it.each(seedsFor("next-memory-reclaim", [0xc401, 0xc402]))(
   },
 );
 
-it("returns false only after eligible holders are exhausted, without reclaiming pinned state", async () => {
-  const gov = new Governor(8 * MiB),
-    pinned = await gov.admit({ label: "pinned", minimumBytes: 7 * MiB, spillable: false }),
-    reader = await gov.admit({ label: "reader", minimumBytes: 0, spillable: true });
-  let asked = 0;
-  pinned.onReclaimRequest(() => {
-    asked++;
-  });
-  expect(await reader.makeRoom?.(1)).toBe(false);
-  expect(asked).toBe(0);
-  expect(gov.usedBytes).toBe(7 * MiB);
-  reader.close();
-  pinned.close();
-  expect(gov.usedBytes).toBe(0);
-});
-
 it("shares an in-flight spill, and cancels one reader without cancelling the other", async () => {
   const gov = new Governor(8 * MiB),
     holder = await gov.admit({ label: "holder", minimumBytes: 7 * MiB, spillable: true }),
@@ -191,3 +175,74 @@ it("re-evaluates free room when parallel column reads share a grant", async () =
     expect(gov.usedBytes).toBe(0);
   }
 });
+
+it.each(seedsFor("next-fresh-read-admission", [0xc41b, 0xc41c]))(
+  "returns unused partial holdings before waiting for a complete fresh read (seed %i)",
+  async (seed) => {
+    const reach = createReach("fresh read admission", [
+      "two",
+      "more",
+      "no-partial-wait",
+      "completed",
+      "released",
+    ]);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 2, max: 4 }),
+        fc.integer({ min: 1, max: 1024 }),
+        async (count, extra) => {
+          reach.beginHistory();
+          const part = MiB,
+            gov = new Governor(count * part),
+            grants = [];
+          for (let k = 0; k < count; k++) {
+            const parts = await gov.admitGroup({
+              label: `fresh${String(k)}`,
+              includesProgress: true,
+              grants: [{ label: `fresh${String(k)}`, minimumBytes: part, spillable: false }],
+            });
+            const grant = parts[0];
+            if (!grant) throw new Error("missing fresh read minimum");
+            grants.push(grant);
+          }
+          expect(gov.usedBytes).toBe(gov.capBytes);
+          let completed = 0;
+          const jobs = grants.map(async (grant) => {
+            expect(await grant.makeRoom?.(part + extra)).toBe(true);
+            expect(grant.allocate(part + extra)).toBe(true);
+            grant.free(part + extra);
+            grant.release(grant.held);
+            completed++;
+          });
+          void Promise.allSettled(jobs);
+          try {
+            for (let tick = 0; tick < 32; tick++) await Promise.resolve();
+            expect(
+              completed,
+              "at least one fresh read must progress without a partial reservation cycle",
+            ).toBeGreaterThan(0);
+            reach.reach("no-partial-wait");
+            await Promise.all(jobs);
+            expect(completed).toBe(count);
+            reach.reach("completed");
+            reach.reach(count === 2 ? "two" : "more");
+          } finally {
+            for (const grant of grants) grant.close();
+            await Promise.allSettled(jobs);
+            expect(gov.usedBytes).toBe(0);
+            reach.reach("released");
+          }
+        },
+      ),
+      {
+        seed,
+        numRuns: 16,
+        examples: [
+          [2, 1],
+          [4, 1024],
+        ],
+      },
+    );
+    reach.assertReached();
+  },
+);

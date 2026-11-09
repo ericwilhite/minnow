@@ -1,63 +1,28 @@
 /**
- * The memory governor: one cap for the whole engine owner, handed out as grants.
+ * One owner-wide memory cap. See memory/README.md for the bounded read-step contract/proof.
  *
- * ## Rules
- * 1. **One cap.** `capBytes` covers the page cache, operator state, batch and I/O buffers,
- *    dictionaries, sketches, Bloom filters, result frames in flight, and buffers lent to helpers.
- *    Default: a fraction of `navigator.deviceMemory` when reported, otherwise a fixed conservative
- *    value; the single public option overrides it. `usedBytes` never exceeds the cap.
- * 2. **Admission, not refusal.** Every pipeline is admitted with its minimum before it runs
- *    (`admit`, or one `admitGroup` split into native budgets). If the minimum does not fit,
- *    admission **waits** (FIFO) while the cache is evicted
- *    and spillable grants are asked to give memory back; it never fails for size.
- * 3. **Bounded minimums.** A pipeline's minimum is fixed by its plan, never by data: the batch
- *    buffers of its operators at `batchTargetFor` bytes per batch (fewer rows for wide rows),
- *    hash-table and run headers, and spill I/O buffers. A minimum above `cap − reserve` is a
- *    planner bug (`MemoryAdmissionError`, a `RangeError`), not a query-size refusal. An explicit
- *    `admitGroup` including all its private progress may instead use the whole cap.
- *    Caller-supplied parameters are non-spillable inputs: their conversion/storage bound is
- *    admitted atomically with those fixed buffers, and must fit normal capacity too.
- * 4. **Held vs allocated.** A grant *holds* bytes from the governor (its minimum, growth, loan)
- *    and its holder *allocates* buffers out of them (`allocate`/`free`): a suballocator, so a
- *    non-spillable operator builds buffers inside its admitted minimum without asking the
- *    governor. `allocate` takes free held bytes first and grows (spillable grants only) for the
- *    shortfall; it never waits. A resize allocates the new buffer before freeing the old one, so
- *    growth overlap is counted.
- *    An explicitly transferred buffer may move from a grant to a registered cache atomically
- *    (`takeFrom`): allocated and ordinary held bytes leave the grant, and the cache owns the
- *    existing charge. Total usage and queue order do not change. Loan bytes cannot be transferred.
- * 5. **Progress is scheduled apart from admission.** An operator that cannot progress by spilling
- *    (one value larger than a batch, a result frame waiting for credit, a spill buffer it must fill
- *    before it can free anything) `borrow`s a **loan**. Loans are served first-come, before any
- *    admission, and may use the progress reserve (`reserveBytes`), which ordinary admissions and
- *    growth never take. Complete private-progress groups instead fund progress internally; their
- *    credit is not available for legacy shared loans. For ordinary admissions, what this proves,
- *    and no more: a queued admission, growth or the cache can never
- *    delay a loan; a loan waits only for earlier loans to be repaid. So progress is guaranteed if
- *    every loan holder repays without waiting on anything that itself needs memory (the operator
- *    rule: a loan covers one bounded step). A grant has at most one loan and repays it before
- *    borrowing again. Ownership of a loan is installed when it is served, atomically with its
- *    charge: closing the grant at any point returns it. A loan larger than the reserve is the one
- *    size error, `ValueTooLargeError`: about a value, never a query or table.
- * 6. **The cache yields first.** Before refusing growth or keeping anything waiting, the governor
- *    evicts unpinned encoded pages. Operators spill only after the cache is at its floor. Several
- *    caches may register (the space's page cache, decoded directories and metadata, inflated
- *    pages): eviction takes the entry unused the longest across all of them, asking the cache
- *    whose `oldestUnusedAt` is smallest for one entry at a time.
- * 7. **Cooperative reclaim.** Before a read refuses growth, or while a loan/admission waits,
- *    the governor calls each other
- *    spillable grant's `onReclaimRequest`; the operator spills at its next batch boundary and
- *    `release`s. A callback (or the cache) may release synchronously: the drain is not reentrant.
- * 8. **Lifecycle.** `close` returns everything, rejects the grant's queued loan, and makes every
- *    later call inert (`allocate`/`tryGrow` false, `borrow` rejects `GrantClosedError`). Abort
- *    listeners are removed when a request settles.
+ * Rules:
+ * 1. Held bytes include cache, leases, operator/input/result buffers and resize overlap.
+ * 2. Complete executions atomically admit their whole minimum FIFO, holding nothing while
+ *    waiting. `includesProgress` includes their private I/O and per-operator progress credit.
+ * 3. Only a complete minimum above the whole cap is a typed admission-size refusal. An
+ *    incomplete legacy operator minimum leaves the shared reserve for its isolated step loans.
+ * 4. Held and allocated differ: allocate/free suballocate an existing grant. Allocation and
+ *    growth never wait; spillable operators spill or continue at their admitted minimum.
+ * 5. Compiled executions use private StepLoans and never wait for another execution's pinned
+ *    or minimum memory. Legacy isolated loans use the reserve and must repay without asking
+ *    for another memory resource. A grant has at most one outstanding legacy loan.
+ * 6. Evict unused caches before requesting spill; choose the oldest unused entry across caches.
+ * 7. Cooperative spill callbacks are serialized per holder. A fresh compatibility read can
+ *    wait/reclaim, with cancellation. Retained inputs must use the bounded read-step contract,
+ *    rather than enter a hold-and-wait cycle through makeRoom.
+ * 8. Close returns every holding, rejects queued requests, and leaves later calls inert. Abort
+ *    listeners are removed when requests settle. The drain is not reentrant.
+ *    Cache takeFrom transfers ordinary allocated/held credit atomically; loan credit cannot transfer.
  *
- * ## Accounting unit
- * Bytes of ArrayBuffer capacity (`byteLength` allocated, not used), plus `OBJECT_OVERHEAD_BYTES`
- * per JS object kept per group, partition or run, plus `bigintBytes` per BigInt held in operator
- * state (wide decimals). JS strings are not kept in operator state (text stays UTF-8) except on the
- * collation fallback (DECISIONS.md C8), which charges `stringBytes`. Managed memory only; Gate D
- * measures browser RSS.
+ * Accounting: ArrayBuffer capacity plus OBJECT_OVERHEAD_BYTES per retained object and
+ * bigintBytes per retained BigInt; collation-fallback strings use stringBytes. Managed memory
+ * only; browser RSS is measured separately at Gate D.
  */
 import { BATCH_TARGET_BYTES } from "../vector/vector.js";
 
@@ -119,10 +84,10 @@ export interface Grant {
   /** Adds held bytes (spillable grants only). Never waits. */
   tryGrow(bytes: number): boolean;
   /**
-   * Make `bytes` of unallocated room, evicting cache first, then awaiting other holders' spills.
-   * False only after all eligible holders have been asked and room still cannot be obtained.
-   * Does not allocate the caller's buffers or take the progress reserve. Optional for synthetic
-   * budgets; real governor grants and executor reservations implement it.
+   * Compatibility admission for a read: evict cache, request reclaim, then wait for temporary
+   * holders with cancellation. A fresh account may admit a complete step from the whole cap.
+   * Retained input must use ReadStep, rather than wait here for another pinned minimum.
+   * Does not allocate buffers; false only for a closed/synthetic account.
    */
   makeRoom?(bytes: number, signal?: AbortSignal): Promise<boolean>;
   /**
@@ -134,7 +99,7 @@ export interface Grant {
   /** Rule 5. */
   borrow(bytes: number, signal?: AbortSignal): Promise<Loan>;
   /** Rule 7. */
-  onReclaimRequest(callback: (bytes: number) => void | Promise<void>): void;
+  onReclaimRequest(callback: (bytes: number) => unknown): void;
   /** Rule 8. Idempotent. */
   close(): void;
 }
@@ -244,9 +209,6 @@ function checkSignal(signal: AbortSignal | undefined): void {
   if (signal?.aborted === true) throw abortReason(signal);
 }
 
-/** Internal completion of a read for which every reclaim callback is exhausted. */
-class NoReadRoom extends Error {}
-
 interface Request {
   readonly bytes: number;
   /** Null for an admission (a new grant is made). */
@@ -254,13 +216,13 @@ interface Request {
   readonly label: string;
   readonly spillable: boolean;
   readonly loan: boolean;
-  readonly includesProgress?: boolean;
   readonly resolve: (grant: GrantImpl) => void;
   readonly reject: (reason: unknown) => void;
   readonly detach: () => void;
   readonly asked: Set<GrantImpl>;
   readonly readRoom: number | null;
   readonly pending: Set<Promise<void>>;
+  readonly includesProgress: boolean;
 }
 
 class GrantImpl implements Grant {
@@ -269,7 +231,7 @@ class GrantImpl implements Grant {
   loan = 0;
   loanPending = false;
   closed = false;
-  reclaim: ((bytes: number) => void | Promise<void>) | null = null;
+  reclaim: ((bytes: number) => unknown) | null = null;
   reclaiming: Promise<void> | null = null;
   constructor(
     readonly governor: Governor,
@@ -342,7 +304,7 @@ class GrantImpl implements Grant {
     );
   }
 
-  onReclaimRequest(callback: (bytes: number) => void | Promise<void>): void {
+  onReclaimRequest(callback: (bytes: number) => unknown): void {
     this.reclaim = callback;
   }
 
@@ -471,7 +433,7 @@ export class Governor implements MemoryGovernor {
     return pending;
   }
 
-  /** Normal read room: cache eviction precedes cooperative spill, never reserve consumption. */
+  /** Fresh-read admission: cache eviction precedes cooperative spill or a whole-cap step. */
   async makeRoom(grant: GrantImpl, bytes: number, signal?: AbortSignal): Promise<boolean> {
     if (!Number.isSafeInteger(bytes) || bytes < 0)
       throw new RangeError("nonnegative byte count required");
@@ -480,23 +442,31 @@ export class Governor implements MemoryGovernor {
       if (grant.closed) throw new GrantClosedError(grant.label);
     };
     check();
+    if (bytes > this.capBytes) throw new MemoryAdmissionError(grant.label, bytes, this.capBytes);
     const missing = grant.allocated + bytes - grant.held;
     if (missing <= 0) return true;
-    if (!grant.spillable) return false;
     if (grant.tryGrow(missing)) return true;
-    try {
-      await this.#enqueue(
-        this.#reads,
-        { bytes: missing, loan: false, grant, label: grant.label, spillable: true },
-        signal,
-        bytes,
-      );
-      check();
-      return true;
-    } catch (error) {
-      if (error instanceof NoReadRoom) return false;
-      throw error;
+    if (grant.allocated === 0) {
+      if (grant.loan > 0 || grant.loanPending) throw new ReadStepBoundaryError();
+      // A fresh compatibility read must not hold an unused partial minimum while
+      // waiting for the complete step. Two half-cap accounts would otherwise cycle.
+      if (grant.held > 0) grant.release(grant.held);
     }
+    await this.#enqueue(
+      this.#reads,
+      {
+        bytes: missing,
+        loan: false,
+        grant,
+        label: grant.label,
+        spillable: grant.spillable,
+        includesProgress: false,
+      },
+      signal,
+      bytes,
+    );
+    check();
+    return true;
   }
 
   give(bytes: number): void {
@@ -544,7 +514,7 @@ export class Governor implements MemoryGovernor {
   #serve(queue: Request[], loan: boolean): void {
     for (let head = queue[0]; head !== undefined; head = queue[0]) {
       const request = head;
-      const wholeMinimum = loan || request.includesProgress === true;
+      let wholeMinimum = loan || request.includesProgress;
       // Parallel column reads may share a grant. Re-evaluate its missing room after another
       // request was served, and after callbacks that can surrender unused holdings.
       const bytes = () =>
@@ -553,7 +523,12 @@ export class Governor implements MemoryGovernor {
           : Math.max(0, request.grant.allocated + request.readRoom - request.grant.held);
       if (!this.#room(bytes(), wholeMinimum)) {
         for (const grant of [...this.#grants]) {
-          if (!grant.spillable || grant === request.grant || request.asked.has(grant)) continue;
+          if (
+            !grant.spillable ||
+            (grant === request.grant && request.readRoom === null) ||
+            request.asked.has(grant)
+          )
+            continue;
           if (request.readRoom !== null) request.asked.add(grant);
           try {
             const work = this.#ask(grant, bytes());
@@ -578,9 +553,23 @@ export class Governor implements MemoryGovernor {
           }
           if (request.readRoom !== null && this.#room(bytes(), wholeMinimum)) break;
         }
+        if (
+          request.readRoom !== null &&
+          request.pending.size === 0 &&
+          request.grant?.allocated === 0 &&
+          this.#room(bytes(), true)
+        )
+          wholeMinimum = true;
         if (!this.#room(bytes(), wholeMinimum)) {
-          if (request.readRoom !== null && request.pending.size === 0 && this.#loaned === 0) {
-            this.#reject(queue, request, new NoReadRoom());
+          // A new minimum may wait while holding nothing. A caller retaining allocated
+          // input must use its admitted read step or surrender/spill that input first;
+          // waiting here would create hold-and-wait on another execution's minimum.
+          if (
+            request.readRoom !== null &&
+            request.pending.size === 0 &&
+            (request.grant?.allocated ?? 0) > 0
+          ) {
+            this.#reject(queue, request, new ReadStepBoundaryError());
             continue;
           }
           return;
@@ -609,7 +598,10 @@ export class Governor implements MemoryGovernor {
 
   #enqueue(
     queue: Request[],
-    request: Omit<Request, "resolve" | "reject" | "detach" | "asked" | "readRoom" | "pending">,
+    request: Omit<
+      Request,
+      "resolve" | "reject" | "detach" | "asked" | "readRoom" | "pending" | "includesProgress"
+    > & { includesProgress?: boolean },
     signal?: AbortSignal,
     readRoom: number | null = null,
   ): Promise<GrantImpl> {
@@ -624,6 +616,7 @@ export class Governor implements MemoryGovernor {
       };
       const entry: Request = {
         ...request,
+        includesProgress: request.includesProgress ?? false,
         asked: new Set(),
         pending: new Set(),
         readRoom,
@@ -825,5 +818,14 @@ export class Governor implements MemoryGovernor {
         if (at >= 0) this.#caches.splice(at, 1);
       },
     };
+  }
+}
+
+/** Internal protocol violation: progress-backed input crossed a downstream memory request. */
+export class ReadStepBoundaryError extends Error {
+  readonly code = "MINNOW_READ_STEP_BOUNDARY";
+  constructor() {
+    super("A read-step lease crossed a downstream memory request");
+    this.name = "ReadStepBoundaryError";
   }
 }

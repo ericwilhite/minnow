@@ -55,6 +55,7 @@ export class ResultSink implements Operator {
   #dictionaryPlan: DictionaryPlan | null = null;
   readonly #abort = new AbortController();
   readonly #frames = new Set<FrameStore>();
+  readonly #creditWaiters = new Set<() => void>();
   readonly #metadataBytes: number;
   readonly #rowsPerFrame: number;
   #target: number;
@@ -183,6 +184,12 @@ export class ResultSink implements Operator {
         this.#zeroSent += rows;
         continue;
       }
+      if (this.#frames.size > 0) {
+        this.#free(frame);
+        return new Promise<void>((resolve) => this.#creditWaiters.add(resolve)).then(() =>
+          this.#emptyFrames(),
+        );
+      }
       this.#pending = frame;
       return this.grant.borrow(this.#metadataBytes, this.#abort.signal).then((loan) => {
         if (this.#abort.signal.aborted) {
@@ -224,6 +231,8 @@ export class ResultSink implements Operator {
     if (!this.#abort.signal.aborted) this.#abort.abort(reason);
     this.#releaseInput();
     this.#dictionaries.close();
+    for (const wake of this.#creditWaiters) wake();
+    this.#creditWaiters.clear();
     if (this.#pending !== null) this.#free(this.#pending);
     this.#pending = null;
   }
@@ -259,13 +268,17 @@ export class ResultSink implements Operator {
     if (frame.freed) return;
     frame.freed = true;
     if (this.#pending === frame) this.#pending = null;
-    this.#frames.delete(frame);
+    const offered = this.#frames.delete(frame);
     // close() uses retainedBytes, so it remains correct after transfer detached the buffers.
     frame.store.close();
     this.grant.free(frame.extraBytes);
     if (frame.metadata) this.grant.free(this.#metadataBytes);
     if (frame.loan !== null && this.grant.loaned > 0) frame.loan.repay();
     frame.returned?.();
+    if (offered) {
+      for (const wake of this.#creditWaiters) wake();
+      this.#creditWaiters.clear();
+    }
   }
 
   #offer(frame: FrameStore, rows: number): PushResult {
@@ -405,6 +418,14 @@ export class ResultSink implements Operator {
             : 0;
       }
       if (copied === 0) {
+        if (this.#frames.size > 0) {
+          // At its admitted minimum, a result sink can own one frame. Return unused
+          // construction scratch and wait for consumer credit before asking for another
+          // bounded step; never retain one frame while seeking another execution's memory.
+          this.#free(frame);
+          this.#wait(new Promise<void>((resolve) => this.#creditWaiters.add(resolve)));
+          return "blocked";
+        }
         this.#pending = frame;
         const row = batch.selection?.rows[this.#at] ?? this.#at;
         let needed =

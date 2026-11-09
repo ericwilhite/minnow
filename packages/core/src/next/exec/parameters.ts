@@ -161,6 +161,7 @@ function prepaid(charge: ByteCharge, bytes: number): ByteCharge {
 
 export interface ParameterBinding {
   readonly bytes: number;
+  readonly largestSlot: number;
   bind(charge: ByteCharge, statementTime?: bigint): MaybePromise<BoundParameters>;
 }
 
@@ -206,6 +207,7 @@ export function prepareParameters(
     }
     return {
       bytes,
+      largestSlot: Math.max(0, ...sizes),
       bind(charge, statementTime = 0n) {
         const pool = prepaid(charge, bytes);
         function* convert(): SlicedJob<BoundParameters> {

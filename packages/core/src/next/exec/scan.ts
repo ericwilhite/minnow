@@ -15,7 +15,10 @@
  *   any page is read, and exact int64-family bounds prove the f64 `safe` representation.
  * - **Live rows.** `segment.deletions()` and `liveRows` turn each batch range into the live
  *   selection before any column is decoded.
- * - **Memory segments** (exec/memory-scan.ts, ruling R16.3). A scan borrows at most one chunk
+ * - **Memory segments** (exec/memory-scan.ts, ruling R16.3). Production scans first size a
+ *   publication-stable common prefix with readHint, then fill caller-owned native buffers via
+ *   the bounded chunk step, charging all output and decoder memory inside admission.
+ *   Direct legacy operator fixtures may instead borrow at most one chunk
  *   of a memory segment at a time: `chunk(columnId, k, out)` lends chunk k (one row range, all its
  *   columns) until the scan's next `chunk()` call on that segment or the snapshot's release, and
  *   the scan asks for chunk k + 1 only after the batch built from chunk k was released downstream.

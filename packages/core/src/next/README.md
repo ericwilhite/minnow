@@ -1213,7 +1213,10 @@ and the owner import it directly.
 ### Memory (`memory/governor.ts`)
 
 - One cap, which `usedBytes` never exceeds.
-- Pipelines are admitted with plan-bounded minimums. Admission waits; it is never refused.
+- Executions atomically admit their whole minimum: input parameters, bounded read-step and
+  resident-page space, downstream buffers, private progress credit, and one result frame.
+  FIFO admission waits while holding no partial reservation. A minimum above the whole cap
+  raises `MemoryAdmissionError`. See [the bounded read-step contract](memory/README.md).
 - A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable
   operator works inside its admitted minimum.
 - Growth is charged before it happens, including the overlap while a buffer is copied.
@@ -1230,7 +1233,9 @@ and the owner import it directly.
   outstanding loan (`LoanBackedReleaseError` otherwise).
 - `tryAdmit` admits synchronously when the minimum fits and nothing is queued (the point-read fast
   path); it never jumps a queue and otherwise returns null.
-- A progress loan larger than the reserve raises `ValueTooLargeError`. Non-spillable parameter inputs must fit normal capacity; an over-cap fixed/input admission raises `MemoryAdmissionError`.
+- Isolated legacy operator grants still use the shared reserve and its `ValueTooLargeError`.
+  Compiled executions use their own admitted progress credit instead of waiting on another
+  execution's pinned or minimum memory.
 
 ### Pipeline (`exec/pipeline.ts`)
 
@@ -1323,6 +1328,7 @@ path; `--only scan_first_page_ordered --whole-compare key-order --component key-
 the current implementation as a Node diagnostic, not first-page performance acceptance.
 The SQL shortcut is off by default until the streaming cursor meets that acceptance rule;
 ordinary owner composition retains the scan/sort recipe.
+The diagnostic cursor/fetch recipe also remains outside the complete query-owned read-minimum proof used by ordinary scans.
 The optional index recipe includes integer parameter bytes when checking its fixed minimum;
 other input kinds retain the generic recipe. Zero still admits and binds all inputs through
 the normal reservation path, with no operator entries or opened input.
@@ -1332,7 +1338,7 @@ buffers. Execute accepts caller-owned parameter values (keep them unchanged unti
 It admits the encoded inputs and active operator minimums atomically, then binds using that
 execution grant. UTF-8 buffers, mutable byte copies and numeric conversion scratch are charged
 before allocation and released on execution completion, cancellation or error. Immutable BigInt
-coefficients can be adopted. An input that cannot fit normal capacity raises the governor's
+coefficients can be adopted. An input whose complete execution minimum exceeds the whole cap raises the governor's
 `MemoryAdmissionError`; parameter inputs do not spill. Explicit `bind(values, grant)` callers
 must keep that grant alive for the bound vectors' lifetime. Computed join/sort/window arguments are projected
 into hidden columns and removed from visible results. No runtime code generation is used.
@@ -1345,16 +1351,27 @@ This factory does not turn those missing capabilities into current-engine fallba
 lowerer emits joins and windows for the factory; SQL catalogue tests exercise them through
 real storage and result delivery.
 
-Fixed operator buffers are reserved atomically before data-dependent state grows, so a join build
-cannot consume the later probe's admission minimum. Individual operators retain separate grants
-for growth and progress loans. A refused encoded-page lease goes through the executor's read
-wrapper: evict cache first, await eligible holders' cooperative reclaim callbacks, then retry
-inside the original read. Sort registers a callback that spills its resident run and releases
-unused holdings at a batch boundary; concurrent input and finish wait for that spill. Asynchronous
-callbacks are serialized per grant, and a cancelled reader stops waiting without cancelling a
-spill another reader needs. Waiting reads reserve normal capacity before new growth or admissions can retake released bytes;
-progress loans still run first and read growth never consumes their reserve. A read is finally
-refused only after eligible holders are exhausted.
+The whole execution minimum includes scan resident pages, a serialized read step, downstream
+fixed buffers, private per-breaker progress, input parameters and one result frame. Nothing is
+partially admitted while waiting for the remainder. Read leases are charged within that minimum;
+they move to the source's admitted resident-page budget before downstream memory requests.
+Sources cannot grow pinned pages into shared headroom. Optional coalesced reads fall back to
+verified ordinary reads when gaps would exceed the bounded I/O step. Retired group roots are
+released with their chunk readers rather than accumulating until snapshot release.
+
+Operators keep independent spillable growth grants. A failed growth allocation spills or runs
+at the minimum; it never waits for another execution's protected or pinned bytes. Private
+progress loans include unused fixed credit and must be repaid before another local loan.
+Cancellation wakes read/admission callers; pending reads drain before their private I/O lane
+and execution grant close. The [governor README](memory/README.md) states the liveness argument,
+external progress assumptions and the legacy isolated-grant boundary.
+Production memory reads size publication-stable byte/row prefixes through `readHint`,
+prepare charged native output buffers, and pass the complete step into `chunk`. Whole
+multi-blob values and old/new output overlap are included. The provider's conservative
+2,048-row/200-column uncompressed reference envelope is about 25.6 MiB including I/O,
+before outputs/downstream buffers, so small caps can still
+be below the admitted minimum even for small resident input. Legacy direct fixtures keep
+the borrowed API; they are not the production memory proof.
 Existing join/sort/window spilling remains active. Hash aggregation
 still has its documented refused-growth limitation until partitioned aggregation is implemented.
 Hash-join spill staging also has a known large-row defect: 600 kB build payloads at an 8 MiB
@@ -1380,10 +1397,9 @@ The full interface contract includes the following (DML remains unimplemented by
   admission. Explicit `bind(values, grant)` also requires an admitted execution budget;
   `execute(request)` runs it over the access contracts: a read snapshot for a query, or an open
   `Statement` for DML, which the executor ends or rolls back. It never commits.
-- The executor admits its own pipelines with plan-bounded minimums. State that outlives a
-  pipeline is in spillable grants. A bounded step whose required loan exceeds the reserve
-  fails with `ValueTooLargeError`. Non-spillable parameter inputs must fit normal capacity;
-  an over-cap fixed/input admission raises `MemoryAdmissionError`.
+- The executor admits its whole minimum atomically, including reads and downstream progress.
+  Extra operator state is spillable. A complete minimum above the whole cap raises
+  `MemoryAdmissionError`; temporary pressure waits or spills.
 - A plan from another catalog version fails with `PlanStaleError` before anything runs.
 - Three completions: `executed` (the plan ran; for DML the statement ended), committed
   (`acknowledgeCommit()`: autocommit RETURNING waits in a charged, spillable spool until then),
@@ -1515,8 +1531,10 @@ The full interface contract includes the following (DML remains unimplemented by
   the same comparison runs on decoded values with the executor's kernels, without statistics
   pruning. Semantics are PostgreSQL's either way, so where a conjunct runs never changes the
   answer. `selectMask` (the fused dense filter and aggregate) is not called by any operator yet.
-- Memory segments are read through `memory-scan.ts` (one lent chunk at a time, zero copy), the
-  whole filter as the residual.
+- Production memory segments use `memory-scan.ts` with a publication-stable common prefix
+  and caller-owned native buffers. The whole filter remains the residual; sparse selections
+  are vectorized before LIMIT caps active output. Direct legacy fixtures can still borrow
+  one chunk at a time.
 - `table-scan.test.ts` checks generated tables (groups through the page writer, memory segments,
   deletions, columns some groups predate, values stored out of line) and filters, with pushed
   conjuncts on encoded pages or forced onto decoded values, against the same scan with pushdown

@@ -222,6 +222,8 @@ export interface TableScanOptions {
   /** False: no pushdown, dense decode, the whole filter on decoded values (decode-then-filter). */
   readonly pushdown?: boolean;
   readonly targetBytes?: number;
+  /** Executor admission includes B3's complete publication-stable memory step. */
+  readonly boundedMemory?: boolean;
   /** A streaming consumer's remaining demand, including OFFSET. Bounds emitted rows and
    * payload decode; predicates/deletions inspect vectorized ranges first. Zero ends the source.
    * Update between batches. A breaker or separate filter starts a new domain. Default: full batches. */
@@ -569,6 +571,13 @@ export class TableScan implements BatchSource {
         this.#release();
         return null;
       }
+      // An empty memory tail cannot decode anything. Do not allocate full chunk staging
+      // just to discover its end, especially after a stored scan or for a wide empty table.
+      if (segment.kind === "memory" && segment.rowCount === 0) {
+        this.#segment += 1;
+        yield* this.#pace();
+        continue;
+      }
       const item =
         segment.kind === "group"
           ? yield* this.#fromGroup(segment)
@@ -656,6 +665,16 @@ export class TableScan implements BatchSource {
         this.#options.filter === null
           ? undefined
           : (batch) => this.#memoryPredicate().select(batch),
+        this.#options.boundedMemory === true
+          ? {
+              context: {
+                pages: this.#options.pages,
+                budget: this.#memory,
+                signal: this.#readAbort.signal,
+              },
+              targetBytes: this.#target,
+            }
+          : undefined,
       );
     }
     const scan = this.#memoryScan;
@@ -707,7 +726,7 @@ export class TableScan implements BatchSource {
   // ── Group segments ──
 
   *#open(segment: GroupSegment): Step<OpenGroup | null> {
-    yield* this.#wait(segment.root());
+    yield* this.#wait(segment.root(), () => segment.releaseRoot?.());
     const columns: GroupColumn[] = [];
     const opened: ChunkPages[] = [];
     const windowBytes =
@@ -754,6 +773,7 @@ export class TableScan implements BatchSource {
               pages.close();
             }
             this.stats.groupsPruned += 1;
+            segment.releaseRoot?.();
             return null;
           }
           pushed.push(ALWAYS);
@@ -775,6 +795,7 @@ export class TableScan implements BatchSource {
             pages.close();
           }
           this.stats.groupsPruned += 1;
+          segment.releaseRoot?.();
           return null;
         }
         if (compiled.encoded) this.stats.encodedPredicates += 1;
@@ -816,6 +837,7 @@ export class TableScan implements BatchSource {
       };
     } catch (error) {
       for (const pages of opened) pages.close();
+      segment.releaseRoot?.();
       throw error;
     }
   }
@@ -1205,8 +1227,10 @@ export class TableScan implements BatchSource {
         this.#ownedBytes -= bytes;
         this.#ownedCount--;
         group.retained--;
-        if (group.retired && group.retained === 0)
+        if (group.retired && group.retained === 0) {
           for (const column of group.columns) column.pages?.close();
+          group.segment.releaseRoot?.();
+        }
         for (const wake of this.#ownedWaiters) wake();
         this.#ownedWaiters.clear();
         if (this.#aborted) this.#settleAborted();
@@ -1316,8 +1340,10 @@ export class TableScan implements BatchSource {
         if (group.retained === 0) column.pages?.close();
         else column.pages?.release(); // Dictionary bytes/charge survive retained batches.
       }
+      if (group.retained === 0) group.segment.releaseRoot?.();
     }
     this.#group = null;
+    this.#memoryScan?.close();
     this.#memoryScan = null;
   }
 

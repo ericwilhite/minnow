@@ -1,5 +1,6 @@
 /** Fixed plan buffers are reserved atomically before any breaker can grow data-dependent state. */
-import type { Grant, Loan } from "../memory/governor.js";
+import { GrantClosedError, type Grant, type Loan } from "../memory/governor.js";
+import type { StepLoans } from "../memory/step-loans.js";
 
 /**
  * A share of the plan's fixed reservation plus an ordinary, independent spillable grant for
@@ -13,11 +14,18 @@ export class ReservedGrant implements Grant {
   #credit: number;
   #used = 0;
   #closed = false;
-  #reclaim: ((bytes: number) => void | Promise<void>) | null = null;
+  #closing = false;
+  #loan: Loan | null = null;
+  #loanExtra = 0;
+  #reclaim: ((bytes: number) => unknown) | null = null;
   constructor(
     readonly fixed: Grant,
     readonly extra: Grant,
     minimum: number,
+    readonly progress: StepLoans | null = null,
+    readonly bounded = false,
+    readonly onClosed?: () => void,
+    readonly closeFixed = false,
   ) {
     this.#credit = minimum;
   }
@@ -25,42 +33,52 @@ export class ReservedGrant implements Grant {
     return this.extra.label;
   }
   get held(): number {
-    return this.#credit + this.extra.held;
+    return this.#credit + this.extra.held + (this.progress?.capacity ?? 0);
   }
   get allocated(): number {
-    return this.#used + this.extra.allocated;
+    return this.#used + this.extra.allocated + (this.progress?.budget.allocated ?? 0);
   }
   get loaned(): number {
-    return this.extra.loaned;
+    return this.extra.loaned + (this.#loan?.bytes ?? 0);
   }
   allocate(bytes: number): boolean {
     if (!Number.isSafeInteger(bytes) || bytes < 0)
       throw new RangeError("nonnegative byte count required");
-    if (this.#closed) return false;
+    if (this.#closed || this.#closing) return false;
     const base = Math.min(bytes, this.#credit - this.#used);
-    if (bytes > base && !this.extra.allocate(bytes - base)) return false;
+    const loan = Math.min(
+      bytes - base,
+      this.#loan === null ? 0 : this.#loanExtra - (this.progress?.budget.allocated ?? 0),
+    );
+    if (bytes > base + loan && (this.bounded || !this.extra.allocate(bytes - base - loan)))
+      return false;
     if (base > 0 && !this.fixed.allocate(base))
       throw new Error("reserved fixed buffers were not held");
     this.#used += base;
+    if (loan > 0 && !this.progress?.budget.allocate(loan))
+      throw new Error("admitted step loan exhausted");
     return true;
   }
   free(bytes: number): void {
     if (this.#closed) return;
     if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > this.allocated)
       throw new RangeError("free exceeds reserved grant allocation");
-    const extra = Math.min(bytes, this.extra.allocated);
+    const loan = Math.min(bytes, this.progress?.budget.allocated ?? 0);
+    if (loan > 0) this.progress?.budget.free(loan);
+    const extra = Math.min(bytes - loan, this.extra.allocated);
     if (extra > 0) this.extra.free(extra);
-    const base = bytes - extra;
+    const base = bytes - loan - extra;
     if (base > 0) {
       this.fixed.free(base);
       this.#used -= base;
     }
+    if (this.#closing && this.allocated === 0) this.close();
   }
   tryGrow(bytes: number): boolean {
-    return !this.#closed && this.extra.tryGrow(bytes);
+    return !this.#closed && !this.#closing && !this.bounded && this.extra.tryGrow(bytes);
   }
   async makeRoom(bytes: number, signal?: AbortSignal): Promise<boolean> {
-    if (this.#closed) return false;
+    if (this.#closed || this.#closing) return false;
     if (this.held - this.allocated >= bytes) return true;
     // Ask for room in the independent account. A concurrent reclaim can surrender unused
     // fixed credit while this waits; extra room remains owned by this reader either way.
@@ -70,6 +88,13 @@ export class ReservedGrant implements Grant {
     if (!Number.isSafeInteger(bytes) || bytes < 0)
       throw new RangeError("nonnegative byte count required");
     if (this.#closed) return;
+    if (this.progress !== null) {
+      // The execution's whole minimum is immutable until this operator closes. Growth can
+      // spill/release, but another execution cannot take its next step's fixed buffers.
+      const returned = Math.min(bytes, this.extra.held - this.extra.allocated - this.extra.loaned);
+      if (returned > 0) this.extra.release(returned);
+      return;
+    }
     const base = Math.min(bytes, this.#credit - this.#used);
     if (bytes > base) this.extra.release(bytes - base);
     if (base > 0) {
@@ -78,22 +103,62 @@ export class ReservedGrant implements Grant {
     }
   }
   borrow(bytes: number, signal?: AbortSignal): Promise<Loan> {
+    if (this.progress !== null) {
+      if (this.#closed) return Promise.reject(new GrantClosedError(this.label));
+      // The existing unused minimum already covers part of this bounded step. Only its
+      // shortfall needs the separately admitted progress lane.
+      const additional = Math.max(0, bytes - (this.#credit - this.#used));
+      return this.progress.borrow(additional, signal).then((loan) => {
+        if (this.#closed || signal?.aborted) {
+          loan.repay();
+          signal?.throwIfAborted();
+          throw new GrantClosedError(this.label);
+        }
+        // A local loan can be backed entirely by unused fixed credit. It still owns
+        // the one-loan slot and must be visible to callers' repay guards.
+        const tracked: Loan = {
+          bytes,
+          repay: () => {
+            loan.repay();
+            if (this.#loan === tracked) {
+              this.#loan = null;
+              this.#loanExtra = 0;
+            }
+          },
+        };
+        this.#loanExtra = additional;
+        this.#loan = tracked;
+        return tracked;
+      });
+    }
     return this.extra.borrow(bytes, signal);
   }
-  onReclaimRequest(callback: (bytes: number) => void | Promise<void>): void {
+  onReclaimRequest(callback: (bytes: number) => unknown): void {
     this.#reclaim = callback;
     this.extra.onReclaimRequest(callback);
   }
-  reclaim(bytes: number): void | Promise<void> {
+  reclaim(bytes: number): unknown {
     if (!this.#closed) return this.#reclaim?.(bytes);
   }
   close(): void {
     if (this.#closed) return;
+    if (this.bounded && this.allocated > 0) {
+      // Dedicated terminal frames can retain dictionary readers after the producer ends.
+      // Their source minimum remains charged until the last transfer releases its leases.
+      this.#closing = true;
+      return;
+    }
     this.#closed = true;
+    this.progress?.close();
+    this.#loan = null;
+    this.#loanExtra = 0;
     this.extra.close();
     if (this.#used > 0) this.fixed.free(this.#used);
-    if (this.#credit > 0) this.fixed.release(this.#credit);
+    const returned = this.#credit + (this.closeFixed ? 0 : (this.progress?.capacity ?? 0));
+    if (returned > 0) this.fixed.release(returned);
+    if (this.closeFixed) this.fixed.close();
     this.#used = 0;
     this.#credit = 0;
+    this.onClosed?.();
   }
 }

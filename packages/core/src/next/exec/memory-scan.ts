@@ -5,6 +5,11 @@
  * scan's buffers after a re-point. Group segments are read through chunk readers (exec/scan.ts),
  * not here.
  *
+ * Production callers supply `bounded`: readHint sizes one common byte/row prefix,
+ * MemoryOutputs prepares charged native buffers, and every chunk call supplies that step.
+ * Sufficient buffers are reused; the enclosing source closes them only after a pending read
+ * drains. The legacy borrow behavior below remains for direct operator fixtures.
+ *
  * ## One borrowed chunk at a time (ruling R16.3)
  * - A memory segment lends one chunk index at a time: the vectors `chunk()` returned for that
  *   index (every column) stay valid until `chunk()` is called on that segment with another index,
@@ -35,6 +40,8 @@ import type {
   ChunkResult,
   DeletionVector,
   MemorySegment,
+  MemoryReadContext,
+  MemoryReadHint,
 } from "../access/snapshot.js";
 import { MEMORY_CHUNK_ROWS, resumeRow } from "../access/snapshot.js";
 import type { MaybePromise } from "../access/key-index.js";
@@ -42,12 +49,15 @@ import { allocateSelection } from "../vector/validity.js";
 import type { Batch, Selection, Vector } from "../vector/vector.js";
 import { UnsupportedPlanError } from "./errors.js";
 import { isPromise, type BatchSource, type SourceItem } from "./pipeline.js";
+import { MemoryOutputs } from "./memory-output.js";
 
 export class MemorySegmentScan implements BatchSource {
   #maxRows = MEMORY_CHUNK_ROWS;
   readonly #segments: readonly MemorySegment[];
   readonly #columnIds: readonly number[];
-  readonly #out: readonly ChunkOutput[];
+  #out: readonly ChunkOutput[];
+  readonly #owned: MemoryOutputs | null;
+  #hint: MemoryReadHint | null = null;
   readonly #vectors: Vector[];
   readonly #results: Array<ChunkResult | undefined>;
   readonly #selection: Selection;
@@ -75,6 +85,7 @@ export class MemorySegmentScan implements BatchSource {
     selection?: Selection,
     /** Select active rows in input order before bounding the returned interval. */
     readonly selectRows?: (batch: Batch) => Selection,
+    readonly bounded?: { readonly context: MemoryReadContext; readonly targetBytes: number },
   ) {
     if (out.length !== columnIds.length) throw new RangeError("One output per column");
     if (selection !== undefined && selection.rows.length < MEMORY_CHUNK_ROWS)
@@ -83,6 +94,13 @@ export class MemorySegmentScan implements BatchSource {
     this.#segments = segments;
     this.#columnIds = columnIds;
     this.#out = out;
+    this.#owned =
+      bounded === undefined
+        ? null
+        : new MemoryOutputs(
+            out.map((o) => o.flat.type),
+            bounded.context.budget,
+          );
     this.#vectors = new Array<Vector>(columnIds.length);
     this.#results = new Array<ChunkResult | undefined>(columnIds.length);
   }
@@ -126,6 +144,35 @@ export class MemorySegmentScan implements BatchSource {
       }
       // The previous batch's borrow has ended: its varlen bytes may be reused.
       for (const out of this.#out) out.varlen?.reset();
+      if (this.bounded !== undefined && this.#columnIds.length > 0) {
+        this.#vectors.length = 0;
+        this.#vectors.length = this.#columnIds.length;
+        const hint = segment.readHint(
+          {
+            columns: this.#columnIds,
+            chunk: this.#chunk,
+            startRow: this.#start,
+            // LIMIT bounds active rows, not positions before a sparse predicate/deletion
+            // selection. Keep those reads vectorized inside the admitted byte prefix.
+            maxRows: Math.min(
+              MEMORY_CHUNK_ROWS,
+              length - this.#start,
+              this.selectRows !== undefined || this.#deletions !== null
+                ? MEMORY_CHUNK_ROWS
+                : maxRows,
+            ),
+            targetBytes: this.bounded.targetBytes,
+          },
+          this.bounded.context,
+        );
+        const read = (value: MemoryReadHint): MaybePromise<SourceItem | null> => {
+          if (this.#aborted) return null;
+          this.#hint = value;
+          this.#out = this.#owned?.prepare(value.outputs) ?? this.#out;
+          return this.#read(segment, length, 0);
+        };
+        return isPromise(hint) ? hint.then(read) : read(hint);
+      }
       return this.#read(segment, length, 0);
     }
   }
@@ -134,7 +181,15 @@ export class MemorySegmentScan implements BatchSource {
     for (let c = from; c < this.#columnIds.length; c++) {
       const out = this.#out[c];
       if (out === undefined) throw new RangeError("Missing output");
-      const result = segment.chunk(this.#columnIds[c] ?? -1, this.#chunk, out, this.#start);
+      const result = segment.chunk(
+        this.#columnIds[c] ?? -1,
+        this.#chunk,
+        out,
+        this.#start,
+        this.#hint === null || this.bounded === undefined
+          ? undefined
+          : { hint: this.#hint, context: this.bounded.context },
+      );
       if (isPromise(result))
         return result.then((value) => {
           // Aborted while the read was in flight: no later column is read, no batch built.
@@ -231,5 +286,15 @@ export class MemorySegmentScan implements BatchSource {
 
   abort(): void {
     this.#aborted = true;
+  }
+
+  /** The enclosing source calls after its pending read drained and the borrow ended. */
+  close(): void {
+    this.#aborted = true;
+    this.#out = [];
+    this.#vectors.length = 0;
+    this.#results.fill(undefined);
+    this.#hint = null;
+    this.#owned?.close();
   }
 }

@@ -11,7 +11,6 @@ import type {
   TableSnapshot,
 } from "../access/snapshot.js";
 import { SnapshotReleasedError } from "../access/snapshot.js";
-import type { SpaceReader } from "../access/space.js";
 import {
   OBJECT_OVERHEAD_BYTES,
   GrantClosedError,
@@ -28,6 +27,7 @@ import { isValidSlot, slotOf } from "./kernels/vectors.js";
 import { drive, type Operator, type PushResult, type Transfer } from "./pipeline.js";
 import { reclaimingReader } from "./reclaim-reader.js";
 import type { ChunkReads } from "./scan.js";
+import type { SpaceReader } from "../access/space.js";
 import { SortOperator, sortMinimumBytes } from "./sort.js";
 import { TableScan } from "./table-scan.js";
 
@@ -98,6 +98,9 @@ class SelectedGroup implements GroupSegment {
   root() {
     return this.source.root();
   }
+  releaseRoot(): void {
+    this.source.releaseRoot?.();
+  }
   chunk(column: number) {
     return this.source.chunk(column);
   }
@@ -129,6 +132,9 @@ class SelectedMemory implements MemorySegment {
   }
   chunk(...args: Parameters<MemorySegment["chunk"]>) {
     return this.source.chunk(...args);
+  }
+  readHint(...args: Parameters<MemorySegment["readHint"]>) {
+    return this.source.readHint(...args);
   }
   deletions() {
     return this.mask;
@@ -212,6 +218,7 @@ export function scopedGrant(grant: Grant, minimum: number): Grant {
 export interface LateFetchContext {
   /** Winner payloads are consumed once in physical order, without cache admission. */
   readonly onePass?: boolean;
+  readonly pages?: SpaceReader;
   /** Ordered index input may already be in physical order; preserve its borrowed stream. */
   readonly orderedShortcut?: boolean;
   readonly snapshot: Snapshot;
@@ -228,6 +235,8 @@ export interface LateFetchContext {
   readonly targetBytes: number;
   readonly signal: AbortSignal;
   readonly onPipeline: () => void;
+  readonly readTable?: () => TableSnapshot | Promise<TableSnapshot>;
+  readonly boundedMemory?: boolean;
 }
 
 export class LateFetchOperator implements Operator {
@@ -324,7 +333,8 @@ export class LateFetchOperator implements Operator {
         signal: this.#abort.signal,
       });
       this.#check();
-      this.#table ??= await context.snapshot.table(context.tableId, { budget: context.grant });
+      this.#table ??= await (context.readTable?.() ??
+        context.snapshot.table(context.tableId, { budget: context.grant }));
       const segments: Segment[] = [];
       for (let from = 0; from < count;) {
         const first = locators[order[from] ?? 0] ?? -1,
@@ -405,7 +415,9 @@ export class LateFetchOperator implements Operator {
             output,
           );
       this.#sort = sort;
-      const pages = reclaimingReader(context.snapshot.pages, context.grant, this.#abort.signal);
+      const pages =
+        context.pages ??
+        reclaimingReader(context.snapshot.pages, context.grant, this.#abort.signal);
       // Sparse winners often need one small page per column. Pooling rounds each lease up to
       // 64 KiB, so keep these one-pass slabs exact-sized rather than inflating scan admission.
       const payloadPages: SpaceReader = context.onePass
@@ -431,6 +443,7 @@ export class LateFetchOperator implements Operator {
         budget: context.grant,
         context: { ...context.compile, input: context.types },
         targetBytes: context.targetBytes,
+        boundedMemory: context.boundedMemory === true,
         loans: { borrow: (n) => context.grant.borrow(n, this.#abort.signal) },
       });
       this.#scan = scan;

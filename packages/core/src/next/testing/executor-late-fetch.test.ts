@@ -29,7 +29,9 @@ it.each(seedsFor("next-executor-one-pass-fetch", [0xd131, 0xd132]))(
         async (width, count, limit, mixed) => {
           reach.beginHistory();
           const core = await new StorageCore(8192).open(),
-            governor = new Governor(64 << 20),
+            // Both the selection and payload phase need publication-safe source minima.
+            // This checks the admitted one-pass strategy; tight-cap fallback has its own suite.
+            governor = new Governor(128 << 20),
             fields = ["id", "k", ...Array.from({ length: width - 2 }, (_, k) => `p${String(k)}`)],
             keyRows = mixed ? count >>> 1 : count,
             input = Array.from({ length: count }, (_, id) =>
@@ -65,22 +67,9 @@ it.each(seedsFor("next-executor-one-pass-fetch", [0xd131, 0xd132]))(
               definition = core.harness.path.catalog.tableByName("t");
             if (!definition) throw new Error("fixture table");
             snapshot = core.harness.path.pin();
-            const fixture = await governor.admit({
-              label: "fetch/fixture",
-              minimumBytes: 4096,
-              spillable: true,
-            });
-            const table = snapshot.table(definition.id, { budget: fixture });
-            const chunks = new Map<object, number>();
-            for (const segment of table.segments)
-              if (segment.kind === "group") {
-                await segment.root();
-                for (const column of definition.columns) {
-                  const chunk = segment.chunk(column.id);
-                  if (chunk) chunks.set(chunk, column.id);
-                }
-              }
-            fixture.close();
+            // Scan-owned metadata may decode a different ColumnChunk object for the same
+            // physical column. The format contract identifies that column by columnId.
+            const known = new Set(definition.columns.map((column) => column.id));
             const keys = new Set(definition.columns.slice(0, 2).map((c) => c.id)),
               selection = new Set<number>(),
               payload = new Set<number>();
@@ -98,8 +87,8 @@ it.each(seedsFor("next-executor-one-pass-fetch", [0xd131, 0xd132]))(
               returning: "atExecuted",
               reads: {
                 open(pages, chunk, options) {
-                  const id = chunks.get(chunk);
-                  if (id === undefined) throw new Error("unknown chunk");
+                  const id = chunk.columnId;
+                  if (!known.has(id)) throw new Error("unknown chunk");
                   (options.once ? payload : selection).add(id);
                   let charged = 0;
                   const budget = {

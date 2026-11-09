@@ -1,9 +1,10 @@
+import { Slice, runSliced, type SlicedJob } from "./slices.js";
 /** Immutable pipeline recipes; every execution instantiates its own operators and kernels. */
 import type { MaybePromise } from "../access/key-index.js";
 import type { PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { ResultSink } from "./result-sink.js";
+import { readValue, boundSource, type ReadSource, type ReadBound } from "../page/read-bounds.js";
 import { batchTargetFor, type Grant } from "../memory/governor.js";
-import { reclaimingReader } from "./reclaim-reader.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import { samePhysicalType, type PhysicalType } from "../types.js";
 import { BATCH_ROWS, type Batch, type Selection, type Vector } from "../vector/vector.js";
@@ -205,6 +206,7 @@ function counted(runtime: QueryRuntime, rel: OperatorIdentity, sink: Operator): 
   const profile = runtime.profile(rel);
   return {
     push(batch, transfer) {
+      runtime.readBoundary();
       profile.rowsOut += batch.selection?.count ?? batch.length;
       profile.batchesOut++;
       return sink.push(batch, transfer);
@@ -422,6 +424,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     if ("right" in rel) findIds(rel.right);
   };
   findIds(plan.root);
+  const readSources = new Map<number, ReadSource>();
   const lateSortIds = new Set<number>();
   const ids = new Set<number>();
   // A terminal names-only projection forwards export ownership while retaining profile counts.
@@ -444,7 +447,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       case "indexRange": {
         if (options.keyOrder !== true)
           throw new UnsupportedPlanError(
-            "index range requires the diagnostic keyOrder opt-in until the charged streaming cursor lands",
+            "index range requires the diagnostic keyOrder opt-in; the eager cursor and fetch lack query-minimum integration",
             {
               construct: "indexRange",
             },
@@ -513,6 +516,15 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           filter === null &&
           rel.runtimeFilters.length === 0 &&
           !rel.emitLocator;
+        readSources.set(rel.id, {
+          id: rel.id,
+          tableId: rel.tableId,
+          columns: rel.columns,
+          types: input,
+          stagingBytes: memoryScanBufferBytes(input),
+          windowBytes: terminal ? 64 * 1024 * 1024 : 0,
+          rows: null,
+        });
         const kernelBytes =
           filter === null
             ? 0
@@ -535,7 +547,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             BATCH_ROWS,
             (context, grant) => ({ context, grant }),
             ({ context, grant }) =>
-              then(runtime.view.table(rel.tableId, { budget: grant }), (table) => {
+              then(runtime.table(rel.tableId, grant), (table) => {
                 const terminalFull =
                   terminal &&
                   rel.columns.length === table.columns.length &&
@@ -548,7 +560,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 const output = owner?.grant;
                 const scan = new TableScan({
                   table,
-                  pages: reclaimingReader(runtime.view.pages, grant, runtime.signal),
+                  pages: runtime.readPages(runtime.view.pages),
                   reads: runtime.request.reads,
                   budget: grant,
                   columns: rel.columns,
@@ -560,7 +572,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                   targetBytes: runtime.request.outputBuffers
                     ? (owner?.terminalBatchTarget(2 * target) ?? target)
                     : target,
-                  readWindowBytes: terminalFull ? 64 * 1024 * 1024 : 0,
+                  boundedMemory: true,
+                  readWindowBytes: terminalFull ? runtime.sourceWindow(rel.id) : 0,
                   ...(output === undefined
                     ? {}
                     : {
@@ -628,6 +641,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             );
           });
         return (runtime, downstream, stops, rowsNeeded) => {
+          if (rel.op === "limit" && runtime.bounds(rel).limit === 0) return downstream.finish();
           const owner =
             runtime.request.outputBuffers && identity
               ? downstream instanceof ResultSink
@@ -1101,6 +1115,15 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       memoryScanBufferBytes(payload) +
       BATCH_ROWS * (80 + 8 * OBJECT_OVERHEAD_BYTES) +
       OBJECT_OVERHEAD_BYTES * (16 + 2 * payload.length);
+    readSources.set(project.id, {
+      id: project.id,
+      tableId: scan.tableId,
+      columns: scan.columns,
+      types: payload,
+      windowBytes: 0,
+      stagingBytes: memoryScanBufferBytes(payload),
+      rows: null,
+    });
     fixed(project, fetchMinimum);
     fixed(restoreIdentity, restoreMinimum, rel.id);
     fixed(rel, sortMinimum);
@@ -1126,6 +1149,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                     {
                       onePass: options.lateFetchOnce !== false,
                       snapshot: runtime.view,
+                      readTable: () => runtime.table(scan.tableId, grant),
+                      boundedMemory: true,
+                      pages: runtime.readPages(runtime.view.pages),
                       tableId: scan.tableId,
                       columns: scan.columns,
                       types: payload,
@@ -1186,15 +1212,15 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           );
   }
   const recipe = prepare(plan.root);
-  // Main's cursor still collects the whole range before its first result. Keep this SQL
-  // strategy opt-in until B3's streaming cursor passes the first-page CPU acceptance rule.
+  // The provider cursor is streaming. Keep this SQL strategy diagnostic until its
+  // cursor/fetch steps participate in the execution minimum and pass first-page acceptance.
   // Explicit indexRange and SQL both require the diagnostic opt-in above.
   const ordered = options.keyOrder === true ? orderedSort(plan) : null;
   // Extra helper buffers must not turn a formerly admissible small-cap query into a refusal.
   // Both strategies are capability-checked at prepare; only their execution resources differ.
   const fallback =
     lateSortIds.size === 0 ? null : compilePlan(plan, { ...options, lateSort: false });
-  return (runtime, sink) => {
+  const program: Program = (runtime, sink) => {
     runtime.resolveCall = resolveCall;
     if (ordered !== null) {
       const { rel, scan, project } = ordered;
@@ -1221,8 +1247,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         const inputs = integerParameterBytes(plan, runtime.request.parameters);
         if (
           inputs !== null &&
-          inputs + entries.reduce((n, e) => n + e.minimum, 0) <=
-            runtime.request.governor.capBytes - runtime.request.governor.reserveBytes
+          runtime.minimumBytes(entries, inputs) <= runtime.request.governor.capBytes
         )
           return then(runtime.reserve(entries), () =>
             then(runIndexOrder(runtime, sink, shape, index.id, bounds.limit, bounds.offset), () => {
@@ -1242,7 +1267,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     const active = new Set<number>();
     const visit = (rel: Rel): void => {
       // Lowering stores ORDER BY's LIMIT on its sort. Zero must not open even its pools.
-      if (rel.op === "sort" && runtime.bounds(rel).limit === 0) return;
+      if ((rel.op === "sort" || rel.op === "limit") && runtime.bounds(rel).limit === 0) return;
       active.add(rel.id);
       if (rel.op === "limit" && runtime.bounds(rel).limit === 0) return;
       if (rel.op === "join") {
@@ -1261,12 +1286,83 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             ? entry.minimum
             : entry.minimum(runtime.request.governor.capBytes),
       }));
-    if (
-      fallback !== null &&
-      entries.reduce((sum, entry) => sum + entry.minimum, 0) >
-        runtime.request.governor.capBytes - runtime.request.governor.reserveBytes
-    )
-      return fallback(runtime, sink);
-    return then(runtime.reserve(entries), () => recipe(runtime, sink, []));
+    const demand = new Map<number, number>();
+    const findDemand = (node: Rel, need: number | null): void => {
+      if (!active.has(node.id)) return;
+      if (node.op === "scan") {
+        if (need !== null && node.filter === null) demand.set(node.id, need);
+        return;
+      }
+      if (node.op === "limit") {
+        const bound = runtime.bounds(node);
+        const count =
+          bound.limit === null ? need : need === null ? bound.limit : Math.min(need, bound.limit);
+        findDemand(node.input, count === null ? null : count + bound.offset);
+        return;
+      }
+      if (node.op === "project") {
+        findDemand(node.input, need);
+        return;
+      }
+      if (node.op === "join") {
+        findDemand(node.left, null);
+        findDemand(node.right, null);
+      } else if ("input" in node) findDemand(node.input, null);
+    };
+    findDemand(plan.root, null);
+    const sources = [...readSources.values()].filter((source) => active.has(source.id));
+    const execute = () => then(runtime.reserve(entries), () => recipe(runtime, sink, []));
+    if (sources.length === 0) return execute();
+    const bounds = new Map<number, ReadBound>();
+    const sizeSources = function* (): SlicedJob<void> {
+      const fixedMinimums = entries.map((entry) => entry.minimum);
+      let windows = true;
+      for (;;) {
+        let io = 0,
+          progress = 0;
+        bounds.clear();
+        for (const source of sources) {
+          const bound = yield* readValue(
+            boundSource(
+              runtime.view,
+              {
+                ...source,
+                windowBytes: windows ? source.windowBytes : 0,
+                rows: demand.get(source.id) ?? null,
+              },
+              runtime.request.governor,
+              runtime.signal,
+              batchTargetFor(runtime.request.governor.capBytes, 4),
+            ),
+          );
+          bounds.set(source.id, bound);
+          io = Math.max(io, bound.io);
+          progress = Math.max(progress, bound.progress);
+        }
+        for (const [index, entry] of entries.entries())
+          entry.minimum = (fixedMinimums[index] ?? 0) + (bounds.get(entry.rel.id)?.bytes ?? 0);
+        runtime.sourceBounds(bounds);
+        runtime.readMinimum(io, progress);
+        if (
+          windows &&
+          runtime.minimumBytes(entries) > runtime.request.governor.capBytes &&
+          [...bounds.values()].some((bound) => bound.windowBytes > 0)
+        ) {
+          // Coalesced export windows are optional. All sizing holds have ended: retry the
+          // ordinary bounded batch before treating the execution minimum as over-cap.
+          windows = false;
+          continue;
+        }
+        break;
+      }
+      if (fallback !== null && runtime.minimumBytes(entries) > runtime.request.governor.capBytes) {
+        runtime.sourceBounds(new Map());
+        runtime.readMinimum(0, 0);
+        return yield* readValue(fallback(runtime, sink));
+      }
+      return yield* readValue(execute());
+    };
+    return runSliced(sizeSources(), new Slice(Infinity), () => undefined);
   };
+  return Object.assign(program, { atomic: true });
 }
