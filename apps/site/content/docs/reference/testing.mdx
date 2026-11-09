@@ -1640,6 +1640,39 @@ unordered result passes. Live subscriptions, concurrent openers, crash schedules
 native browser storage and order-dependent floating aggregates remain outside this
 serial harness; their existing suites still own those checks.
 
+### Rebuild-core write CPU comparisons
+
+`scripts/write-insert-bench.mts` compares two built core `dist` directories in fresh Node
+workers. Save the parent build before rebuilding the candidate, then run:
+
+```bash
+node scripts/write-insert-bench.mts --baseline /path/to/parent/dist --mode load --durability strict --rounds 9 --require-gain
+node scripts/write-insert-bench.mts --baseline /path/to/parent/dist --mode hash --hash-bytes 5 --iterations 20000000 --rounds 9 --require-gain
+```
+
+The load prepares its input outside the clock, writes one million rows in a transaction,
+waits for its durable receipt and maintenance, and verifies the row count. Its memory backend
+checks the strict write protocol; it does not measure disk flushes or worker transport.
+The hash component walks a buffer and checks equality with the parent outside the clock.
+Change `--hash-bytes` and `--hash-offset` to measure other sizes and alignments.
+
+Each worker runs one excluded warmup before its measured pass. Nine or more pairs alternate
+AB/BA order. CPU includes all Node threads; wall time is separate. The acceptance rule uses
+paired CPU deltas: their median gain must exceed their interquartile range (IQR), and at least
+seven of nine pairs must favour the candidate. The output retains every delta, the IQR, full range, and MAD. The same rule in the reverse direction
+identifies a regression; `--require-no-regression` fails on that result.
+`--samples 3` averages three complete timed passes per worker and retains each timing;
+the default is one. Report the sample count and CPU affinity with every comparison.
+`--gc-before` requires `node --expose-gc` and collects setup garbage outside both clocks;
+report this choice with the result. Use `--worker candidate --profile /path/to/load.cpuprofile`
+for a separate profile of only the measured phase; profiling runs are not acceptance runs.
+
+A governor cap bounds managed allocations, not renderer RSS. For native memory work, align
+input backing-buffer bytes and governor usage with V8 heap and OS resident-memory readings
+at explicit batch barriers. Compare before and after garbage collection, and use allocator
+dumps to distinguish live bytes from retained pages. A heap snapshot taken after a peak
+cannot by itself explain that peak.
+
 ### Rebuild-core low-cap write ownership
 
 The low-cap campaign observes idle row credit transferred into an active merge while global

@@ -144,6 +144,17 @@ export const SHARED_WINDOW_CLOSE_REACH = [
   "independent cancel signals",
 ] as const;
 
+/** XXH32 specialization must retain reference bytes across length, backing, and range offsets. */
+export const XXHASH32_REACH = [
+  "byte reads",
+  "word reads",
+  "word reads at an odd byte offset",
+  "a range ending at its buffer's end",
+  "short key other than five",
+  "five byte key",
+  "five byte key with shifted backing and range",
+] as const;
+
 export function createReach<State extends string>(
   campaign: string,
   states: readonly State[],
