@@ -22,7 +22,7 @@ import { payloadBytes, transferFor } from "../../../packages/core/src/next/owner
 import { DEFAULT_RESULT_WINDOW_BYTES } from "../../../packages/core/src/next/owner/protocol.js";
 import type { ExtentReader } from "../../../packages/core/src/next/storage/extents.js";
 import type { ExportGroup, ExportResult } from "./export-stream.js";
-import { benchTableOf } from "./scan-fixture.js";
+import { benchSnapshotOf } from "./scan-fixture.js";
 
 export interface ExecutorExportStats {
   readonly path: "production-executor" | "production-owner-api";
@@ -62,7 +62,7 @@ export function prepareExecutorExport(
     readonly memory?: () => Record<string, number>;
   },
 ): () => Promise<ExportResult & { executorStats: ExecutorExportStats }> {
-  const table = benchTableOf(groups);
+  const { table, pages } = benchSnapshotOf(space, groups);
   const unsupported = (): never => {
     throw new Error("Export fixture does not provide SQL/catalog/index/spill access");
   };
@@ -87,7 +87,7 @@ export function prepareExecutorExport(
       type: unsupported,
       typeByName: unsupported,
     },
-    pages: space,
+    pages,
     table: (id) => {
       if (released || id !== table.tableId) throw new Error("Invalid export snapshot table");
       return table;
