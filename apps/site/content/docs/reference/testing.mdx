@@ -1656,6 +1656,14 @@ checks the strict write protocol; it does not measure disk flushes or worker tra
 The hash component walks a buffer and checks equality with the parent outside the clock.
 Change `--hash-bytes` and `--hash-offset` to measure other sizes and alignments.
 
+Write-key hash reuse is checked against the canonical xxHash32 implementation for both stored
+Bloom seeds. Generated cases cover collisions, shifted ranges, growth, rollback and release;
+the resulting run bytes must match the uncached path. Cached hashes never replace byte equality
+checks. Hash metadata is charged with the key delta and is not added to the stored format.
+Disk merges compute the pair for keys read from storage, then reuse it across block boundaries.
+Structural write optimizations require a paired whole-load gain; component gains alone do not
+qualify.
+
 Each worker runs one excluded warmup before its measured pass. Nine or more pairs alternate
 AB/BA order. CPU includes all Node threads; wall time is separate. The acceptance rule uses
 paired CPU deltas: their median gain must exceed their interquartile range (IQR), and at least

@@ -1318,7 +1318,13 @@ export class TableWriterImpl implements TableWriter {
       for (let entry = first; entry < to; entry++) {
         const slot = delta.keyOf(entry);
         if (alone && delta.head(slot) === entry && delta.nextEntry(entry) < 0) continue;
-        const found = reader.countRange(delta.keyArena(), delta.keyStart(slot), delta.keyEnd(slot));
+        const found = reader.countRange(
+          delta.keyArena(),
+          delta.keyStart(slot),
+          delta.keyEnd(slot),
+          delta.keyHash(slot),
+          delta.keyBloomHash(slot),
+        );
         if (found instanceof Promise)
           return found.then((count) => {
             if (count > 1)

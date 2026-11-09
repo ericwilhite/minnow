@@ -4,6 +4,7 @@
  * from the published group after a re-point), and index probes and ranges that resolve put and
  * tombstone entries across memtable deltas and durable runs under the view's bound.
  */
+import { hashKey } from "./key-hashes.js";
 import { MemoryReads } from "./memory-read.js";
 import { StreamingRangeCursor } from "./range-cursor.js";
 import type { Held } from "../format/reachable.js";
@@ -796,8 +797,14 @@ export class ViewIndex implements IndexReader {
   }
 
   /** How many live rows hold the key `bytes[start … end)` (`resolve` without the row ids). */
-  countRange(bytes: Uint8Array, start: number, end: number): MaybePromise<number> {
-    const done = this.#begin(bytes, start, end);
+  countRange(
+    bytes: Uint8Array,
+    start: number,
+    end: number,
+    hash?: number,
+    bloomHash?: number,
+  ): MaybePromise<number> {
+    const done = this.#begin(bytes, start, end, hash, bloomHash);
     return done === undefined ? this.#hitCount : done.then(() => this.#hitCount);
   }
 
@@ -814,7 +821,20 @@ export class ViewIndex implements IndexReader {
     this.#hitCount += 1;
   }
 
-  #begin(bytes: Uint8Array, start: number, end: number): Promise<void> | undefined {
+  readonly #hashes = { first: 0, second: 0 };
+
+  #begin(
+    bytes: Uint8Array,
+    start: number,
+    end: number,
+    hash?: number,
+    bloomHash?: number,
+  ): Promise<void> | undefined {
+    if (hash === undefined || bloomHash === undefined) hashKey(bytes, start, end, this.#hashes);
+    else {
+      this.#hashes.first = hash;
+      this.#hashes.second = bloomHash;
+    }
     this.#hitCount = 0;
     this.#deadRows?.clear();
     const done = this.#resolveFrom(bytes, start, end, 0, 0);
@@ -944,7 +964,7 @@ export class ViewIndex implements IndexReader {
   ): boolean {
     const delta = memtable.deltas.get(this.def.id);
     if (delta === undefined) return false;
-    const keySlot = delta.find(bytes, start, end);
+    const keySlot = delta.find(bytes, start, end, this.#hashes.first);
     if (keySlot < 0) return false;
     for (let entry = delta.head(keySlot); entry >= 0; entry = delta.nextEntry(entry))
       if (delta.isTombstone(entry) && delta.seq(entry) <= bound) this.#dead.add(delta.rowId(entry));
@@ -995,7 +1015,14 @@ export class ViewIndex implements IndexReader {
     const shared = this.table.snapshot.shared;
     const entries = this.#layer;
     entries.length = 0;
-    const read = reader.lookup(shared.space, key, entries, shared.budget);
+    const read = reader.lookup(
+      shared.space,
+      key,
+      entries,
+      shared.budget,
+      this.#hashes.first,
+      this.#hashes.second,
+    );
     if (read instanceof Promise)
       return read.then(async () => {
         this.#applyLayer(entries, limit);

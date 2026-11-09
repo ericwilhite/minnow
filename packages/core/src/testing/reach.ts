@@ -2043,6 +2043,7 @@ export const WRITE_DELTA_ACCOUNTING_STATES = [
   "retained growth overlap",
   "constructor failure refund",
   "last entry array failure",
+  "last key array failure",
   "release while suspended",
   "publication workspace pressure",
 ] as const;
@@ -2458,4 +2459,27 @@ export const WRITE_ROW_BORROW_STATES = [
   "async error",
   "sync error",
   "released after suspension",
+] as const;
+
+/** Cached write hashes retain both canonical seeds through ownership and run publication. */
+export const WRITE_KEY_HASH_REACH = [
+  "first hash collision",
+  "empty",
+  "five bytes",
+  "stripes",
+  "long key",
+  "high bytes",
+  "shifted range",
+  "growth",
+  "rollback and reinsert",
+  "identical run bytes",
+  "released charge",
+] as const;
+
+/** Ingress hashing must not be repeated by table insertion after a probe. */
+export const WRITE_KEY_HASH_ONCE_REACH = [
+  "one key",
+  "many keys",
+  "shifted range",
+  "duplicate keys",
 ] as const;

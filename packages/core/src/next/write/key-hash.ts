@@ -13,6 +13,7 @@
  */
 import type { MaybePromise } from "../access/key-index.js";
 import { taskClock, yieldTask } from "../exec/pipeline.js";
+import { hashKey } from "./key-hashes.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { compareBytes } from "../vector/varlen.js";
 import { charged, copyRange, MemtableMemoryError, UNCHARGED, type Charge } from "./bytes.js";
@@ -25,11 +26,13 @@ type DeltaVisitor = (
   end: number,
   rowId: number,
   tombstone: boolean,
+  hash: number,
+  bloomHash: number,
 ) => void;
 type KeepEntry = (rowId: number, tombstone: boolean) => boolean;
 
-/** Bytes of a fresh delta's arrays (slots 64×4, 4 key arrays 16×4, arena 256, entries 16×(8+8+1+4+4)). */
-const INITIAL_BYTES = 64 * 4 + 4 * 16 * 4 + 256 + 16 * 25;
+/** Bytes of a fresh delta's arrays (slots 64×4, 5 key arrays 16×4, arena 256, entries 16×(8+8+1+4+4)). */
+const INITIAL_BYTES = 64 * 4 + 5 * 16 * 4 + 256 + 16 * 25;
 const ENTRY_BYTES = 25;
 const NO_ENTRIES = new Int32Array(0);
 
@@ -47,6 +50,7 @@ export class KeyDelta {
     try {
       this.#slots = new Int32Array(64);
       this.#hashes = new Int32Array(16);
+      this.#bloomHashes = new Int32Array(16);
       this.#keyStart = new Int32Array(16);
       this.#keyEnd = new Int32Array(16);
       this.#head = new Int32Array(16);
@@ -88,6 +92,8 @@ export class KeyDelta {
   #slots: Int32Array;
   #mask = 63;
   #hashes: Int32Array;
+  #bloomHashes: Int32Array;
+  readonly #computed = { first: 0, second: 0 };
   #keyStart: Int32Array;
   #keyEnd: Int32Array;
   #head: Int32Array;
@@ -110,9 +116,9 @@ export class KeyDelta {
     return this.chargedBytes;
   }
 
-  /** Key slot of `key[start … end)`, or −1. */
-  find(key: Uint8Array, start = 0, end = key.length): number {
-    const hash = xxHash32(key, 0, start, end) | 0;
+  /** Key slot of `key[start … end)`, or −1. A supplied hash must be seed-0 XXH32 of this exact range. */
+  find(key: Uint8Array, start = 0, end = key.length, hash = xxHash32(key, 0, start, end)): number {
+    hash |= 0;
     let slot = hash & this.#mask;
     for (;;) {
       const entry = this.#slots[slot] ?? 0;
@@ -219,8 +225,11 @@ export class KeyDelta {
     seq: number,
     tombstone: boolean,
   ): number {
-    let keySlot = this.find(key, start, end);
-    if (keySlot < 0) keySlot = this.#insertKey(key, start, end);
+    hashKey(key, start, end, this.#computed);
+    const hash = this.#computed.first | 0,
+      bloomHash = this.#computed.second | 0;
+    let keySlot = this.find(key, start, end, hash);
+    if (keySlot < 0) keySlot = this.#insertKey(key, start, end, hash, bloomHash);
     const entry = this.entryCount;
     if (entry >= this.#rowIds.length) this.#growEntries();
     this.#rowIds[entry] = rowId;
@@ -271,7 +280,15 @@ export class KeyDelta {
     return this.#keyOf[entry] ?? 0;
   }
 
-  #insertKey(key: Uint8Array, start: number, end: number): number {
+  /** Canonical hashes retained with immutable key bytes; popped entries retain their key slot. */
+  keyHash(slot: number): number {
+    return (this.#hashes[slot] ?? 0) >>> 0;
+  }
+  keyBloomHash(slot: number): number {
+    return (this.#bloomHashes[slot] ?? 0) >>> 0;
+  }
+
+  #insertKey(key: Uint8Array, start: number, end: number, hash: number, bloomHash: number): number {
     const index = this.keyCount;
     if (index >= this.#hashes.length) this.#growKeys();
     if ((index + 1) * 2 > this.#slots.length) this.#rehash(this.#slots.length * 2);
@@ -292,8 +309,8 @@ export class KeyDelta {
       this.#free(freed);
     }
     copyRange(this.#arena, this.#arenaUsed, key, start, end);
-    const hash = xxHash32(key, 0, start, end) | 0;
     this.#hashes[index] = hash;
+    this.#bloomHashes[index] = bloomHash;
     this.#keyStart[index] = this.#arenaUsed;
     this.#keyEnd[index] = this.#arenaUsed + length;
     this.#head[index] = -1;
@@ -333,8 +350,8 @@ export class KeyDelta {
 
   #growKeys(): void {
     const size = this.#hashes.length * 2,
-      bytes = 4 * size * 4,
-      freed = 4 * this.#hashes.byteLength;
+      bytes = 5 * size * 4,
+      freed = 5 * this.#hashes.byteLength;
     this.#reserve(bytes);
     try {
       const grow = (array: Int32Array) => {
@@ -343,10 +360,12 @@ export class KeyDelta {
         return grown;
       };
       const hashes = grow(this.#hashes),
+        bloomHashes = grow(this.#bloomHashes),
         starts = grow(this.#keyStart),
         ends = grow(this.#keyEnd),
         heads = grow(this.#head);
       this.#hashes = hashes;
+      this.#bloomHashes = bloomHashes;
       this.#keyStart = starts;
       this.#keyEnd = ends;
       this.#head = heads;
@@ -504,6 +523,8 @@ export class KeyDelta {
             arena,
             start,
             end,
+            this.keyHash(keySlot),
+            this.keyBloomHash(keySlot),
             visit,
           );
         }
@@ -546,7 +567,15 @@ export class KeyDelta {
       const rowId = rowIds[head] ?? 0,
         tombstone = tombstones[head] === 1;
       if (keep === null || keep(rowId, tombstone))
-        visit(arena, starts[slot] ?? 0, ends[slot] ?? 0, rowId, tombstone);
+        visit(
+          arena,
+          starts[slot] ?? 0,
+          ends[slot] ?? 0,
+          rowId,
+          tombstone,
+          this.keyHash(slot),
+          this.keyBloomHash(slot),
+        );
     }
     return to;
   }
@@ -674,13 +703,15 @@ function emitEntries(
   arena: Uint8Array,
   start: number,
   end: number,
+  hash: number,
+  bloomHash: number,
   visit: DeltaVisitor,
 ): void {
   let at = reverse ? count - 1 - from : from;
   const step = reverse ? -1 : 1;
   for (let k = from; k < to; k++, at += step) {
     const entry = entries[at] ?? 0;
-    visit(arena, start, end, rowIds[entry] ?? 0, tombstones[entry] === 1);
+    visit(arena, start, end, rowIds[entry] ?? 0, tombstones[entry] === 1, hash, bloomHash);
   }
 }
 

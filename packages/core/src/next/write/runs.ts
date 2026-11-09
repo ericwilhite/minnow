@@ -36,6 +36,7 @@
  * drops the tombstones left (no older put can exist below it).
  */
 import type { BlobRef, RunRef } from "../format/manifest.js";
+import { hashKey } from "./key-hashes.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { ParseBudgetError } from "../format/manifest-codec.js";
 import { StoreCorruptionError } from "../storage/contract.js";
@@ -49,7 +50,6 @@ export const BLOCK_BYTES = 4096;
 export const PARTITION_BLOCKS = 256;
 const BLOOM_BITS_PER_KEY = 10;
 const BLOOM_HASHES = 7;
-const BLOOM_SEED = 0x9747b28c;
 const MAX_INDEX_BYTES = 1024 * 1024;
 
 export interface RunEntry {
@@ -120,6 +120,10 @@ export class RunEncoder {
   #pendingRowId = 0;
   #pendingTombstone = false;
   #hasPending = false;
+  #pendingHash: number | undefined;
+  #pendingBloomHash: number | undefined;
+  readonly #computed = { first: 0, second: 0 };
+  #hasComputed = false;
   /** The last emitted key, and whether it is in the block being filled. */
   #lastKey = new Uint8Array(64);
   #lastLength = 0;
@@ -158,7 +162,15 @@ export class RunEncoder {
   }
 
   /** Adds one entry, the key `bytes[start … end)` (copied). Entries must come in (key, rowId) order. */
-  add(bytes: Uint8Array, start: number, end: number, rowId: number, tombstone: boolean): void {
+  add(
+    bytes: Uint8Array,
+    start: number,
+    end: number,
+    rowId: number,
+    tombstone: boolean,
+    hash?: number,
+    bloomHash?: number,
+  ): void {
     const length = end - start;
     if (this.#hasPending) {
       if (
@@ -179,6 +191,8 @@ export class RunEncoder {
     this.#pendingLength = length;
     this.#pendingRowId = rowId;
     this.#pendingTombstone = tombstone;
+    this.#pendingHash = hash;
+    this.#pendingBloomHash = bloomHash;
     this.#hasPending = true;
   }
 
@@ -206,9 +220,17 @@ export class RunEncoder {
         grown.set(this.#hashes);
         this.#hashes = grown;
       }
-      // The key's range, hashed in place (no view per key).
-      this.#hashes[this.#hashCount++] = xxHash32(key, 0, 0, length) >>> 0;
-      this.#hashes[this.#hashCount++] = (xxHash32(key, BLOOM_SEED, 0, length) | 1) >>> 0;
+      // The delta supplies canonical hashes. Disk merges compute the pair once per distinct
+      // emitted key, then reuse it when the same key crosses a block or Bloom partition.
+      if (!same || !this.#hasComputed) {
+        if (this.#pendingHash !== undefined && this.#pendingBloomHash !== undefined) {
+          this.#computed.first = this.#pendingHash;
+          this.#computed.second = this.#pendingBloomHash;
+        } else hashKey(key, 0, length, this.#computed);
+        this.#hasComputed = true;
+      }
+      this.#hashes[this.#hashCount++] = this.#computed.first >>> 0;
+      this.#hashes[this.#hashCount++] = (this.#computed.second | 1) >>> 0;
     }
     this.#lastInBlock = true;
     if (!same) {
@@ -332,9 +354,17 @@ export class RunBuilder {
     this.#encoder.add(key, 0, key.length, rowId, tombstone);
   }
 
-  /** `add` of the key `bytes[start … end)`. */
-  addRange(bytes: Uint8Array, start: number, end: number, rowId: number, tombstone: boolean): void {
-    this.#encoder.add(bytes, start, end, rowId, tombstone);
+  /** `add` of the key `bytes[start … end)`. Optional hashes are raw XXH32 with seeds 0 and KEY_BLOOM_SEED. */
+  addRange(
+    bytes: Uint8Array,
+    start: number,
+    end: number,
+    rowId: number,
+    tombstone: boolean,
+    hash?: number,
+    bloomHash?: number,
+  ): void {
+    this.#encoder.add(bytes, start, end, rowId, tombstone, hash, bloomHash);
   }
 
   get entryCount(): number {
@@ -369,10 +399,6 @@ export function runRef(run: EncodedRun, blobs: readonly BlobRef[], level = 0): R
     minKey: run.minKey,
     maxKey: run.maxKey,
   };
-}
-
-function bloomProbes(key: Uint8Array): [number, number] {
-  return [xxHash32(key, 0) >>> 0, (xxHash32(key, BLOOM_SEED) | 1) >>> 0];
 }
 
 /** One partition's Bloom filter over `count / 2` keys' probe pairs (exported for its test). */
@@ -594,8 +620,22 @@ export class RunReader {
     return this.#blocks.length;
   }
 
-  #bloomHas(key: Uint8Array, first: number, end: number): boolean {
-    const [h1, h2] = bloomProbes(key);
+  readonly #computed = { first: 0, second: 0 };
+
+  #bloomHas(
+    key: Uint8Array,
+    first: number,
+    end: number,
+    hash?: number,
+    bloomHash?: number,
+  ): boolean {
+    if (hash === undefined || bloomHash === undefined) {
+      hashKey(key, 0, key.length, this.#computed);
+      hash = this.#computed.first;
+      bloomHash = this.#computed.second;
+    }
+    const h1 = hash >>> 0,
+      h2 = (bloomHash | 1) >>> 0;
     const size = this.#partitionBlocks;
     for (let partition = Math.floor(first / size); partition * size < end; partition++) {
       const bloom = this.#blooms[partition];
@@ -642,10 +682,12 @@ export class RunReader {
     key: Uint8Array,
     out: RunEntry[],
     budget: ByteBudget,
+    hash?: number,
+    bloomHash?: number,
   ): MaybePromise<void> {
     if (compare(key, this.ref.minKey) < 0 || compare(key, this.ref.maxKey) > 0) return;
     const [first, end] = this.#blocksFor(key);
-    if (!this.#bloomHas(key, first, end)) return;
+    if (!this.#bloomHas(key, first, end, hash, bloomHash)) return;
     let missing = false;
     const blocks: Array<Uint8Array | null> = [];
     for (let block = first; block < end; block++) {

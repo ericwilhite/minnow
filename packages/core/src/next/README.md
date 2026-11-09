@@ -76,6 +76,14 @@ index counts. This is an owner-side component benchmark; it does not time SQL, t
 client transport, compare SQLite, or certify power-loss safety. Neither script publishes its
 local numbers to the benchmark site.
 
+Write-key hashes are computed together for the canonical seed-0 table hash and the second
+stored Bloom seed, then retained in the charged key delta. Probes and flushes reuse them;
+collisions still compare bytes. Disk-run merges compute their pair once per distinct emitted
+key and reuse it across block/partition boundaries. No hash metadata or seed change is stored.
+`write/key-hashes.test.ts` checks canonical results, byte-identical runs and reuse through growth,
+rollback and release. Structural changes must pass the whole-load paired rule, not just a
+component benchmark.
+
 ## Write-memory pressure
 
 Column appends copy into the chunk's charged arrays and clear their borrowed source slot on
