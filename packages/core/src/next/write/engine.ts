@@ -277,6 +277,12 @@ function sameExtent(a: ExtentRef, b: ExtentRef): boolean {
   return a.offset === b.offset && a.length === b.length;
 }
 
+/** No temporary array: catalog-sized delta maps already own their traversal storage. */
+function hasDeltaEntries(memtable: Memtable): boolean {
+  for (const delta of memtable.deltas.values()) if (delta.entryCount > 0) return true;
+  return false;
+}
+
 /** The highest seq of anything in a memtable (rows, delta entries). */
 function maxSeq(memtable: Memtable, rows: number): number {
   // The smallest bound that shows every row, from the marks (at most MAX_LSN: committed rows).
@@ -3295,10 +3301,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
             }
           }
           this.maintenance.stagedMemtablesDropped += dropped.length;
-          for (const memtable of dropped) {
-            const gone = memtable;
-            this.shared.readers.holdUntilOlderClose(() => gone.releaseAll());
-          }
           if (entry === null) state.stagings.delete(stagingId);
           else
             state.stagings.set(stagingId, {
@@ -3308,13 +3310,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
               directory,
               rootSequence: 0, // set below
             });
-          // Dropped staged memtables (emptied by a rollback) leave the view: their extents are
-          // retired by this root.
-          const gone = new Set(dropped);
-          this.#setView(state, {
-            ...state.view,
-            memtables: state.view.memtables.filter((memtable) => !gone.has(memtable)),
-          });
+          this.#discardStagedRows(state, dropped);
         });
       }
       if (changed.size === 0) {
@@ -3499,14 +3495,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (staging === undefined) continue;
       state.stagings.delete(id);
       drops.push({ state, staging });
-      const gone = new Set(staging.memtables);
-      this.#setView(state, {
-        ...state.view,
-        memtables: state.view.memtables.filter((memtable) => !gone.has(memtable)),
-      });
-      this.shared.readers.holdUntilOlderClose(() => {
-        for (const memtable of gone) memtable.releaseAll();
-      });
+      this.#discardStagedRows(state, staging.memtables);
     }
     if (drops.length === 0) return;
     this.maintenance.stagingRollbacks += 1;
@@ -3529,6 +3518,32 @@ export class WritePathImpl implements WritePath, EngineHooks {
       } finally {
         unlock();
       }
+    });
+  }
+
+  /**
+   * Rolled-back staged rows leave; unrelated delta entries do not. A rowless live memtable may
+   * have held committed tombstones or earlier statements' entries before these rows arrived.
+   * Keep such a residual frozen until the ordinary rowless flush publishes it. Its staged puts
+   * remain hidden by the empty visible prefix, and its pin stays held until older readers close.
+   */
+  #discardStagedRows(state: TableState, memtables: readonly Memtable[]): void {
+    const gone = new Set(memtables);
+    for (const memtable of memtables)
+      if (
+        memtable.rowCount === 0 &&
+        state.view.memtables.includes(memtable) &&
+        hasDeltaEntries(memtable)
+      ) {
+        gone.delete(memtable);
+        memtable.state = "frozen";
+      }
+    this.#setView(state, {
+      ...state.view,
+      memtables: state.view.memtables.filter((memtable) => !gone.has(memtable)),
+    });
+    this.shared.readers.holdUntilOlderClose(() => {
+      for (const memtable of gone) memtable.releaseAll();
     });
   }
 
@@ -4484,9 +4499,7 @@ function quietTable(state: TableState): boolean {
     state.view.memtables.some(
       (memtable) =>
         memtable.state !== "published" &&
-        (memtable.rowCount > 0 ||
-          [...memtable.deltas.values()].some((delta) => delta.entryCount > 0) ||
-          memtable.deletions.size > 0),
+        (memtable.rowCount > 0 || hasDeltaEntries(memtable) || memtable.deletions.size > 0),
     ) ||
     [...state.view.groupDeletes.byGroup.values()].some((positions) =>
       [...positions.values()].some((seq) => seq > state.view.foldedThrough),

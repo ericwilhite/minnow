@@ -112,13 +112,14 @@ for (const backend of ["memory", "indexeddb"] as const)
             // minimum: the working minimum now comes from admitGroup's row/I/O part, rather than
             // the old standalone admit. Commit-buffer ownership still uses onCommitBuffer,
             // finding the native commit part recorded at that same atomic group split.
-            // merge needs returned headroom: old late global merge admit + idle write reclaim
-            // becomes an actual transferCredit(write, merge, bytes) while global headroom is
-            // insufficient. Record it only after the idle holdings moved to the active merge.
+            // merge transfers idle row credit under global pressure: observe an actual
+            // transferCredit(write, merge, bytes) while global headroom is
+            // insufficient. Prepaid merge credit already permits progress; this witnesses the
+            // ownership exchange, not a dependency on returned capacity.
             // merge completed, metadata grew under pressure and durable reopen retain the
             // existing completed-merge/publication/reopen observations below. No reach minimum
             // or existing assertion is relaxed; an added per-history transfer witness makes a
-            // disabled required transfer fail the property as well as the reach assertion.
+            // disabled transfer fail the property as well as the reach assertion.
             const admit = governor.admit.bind(governor);
             const admitGroup = governor.admitGroup.bind(governor);
             const transferCredit = governor.transferCredit.bind(governor);
@@ -195,7 +196,7 @@ for (const backend of ["memory", "indexeddb"] as const)
               if (witness) {
                 if (moved) {
                   transferredMergeCredit += bytes;
-                  reach.reach("merge needs returned headroom");
+                  reach.reach("merge transfers idle row credit under global pressure");
                 }
                 if (source.held >= before)
                   failures.push("merge queued despite sufficient idle write holdings");
@@ -281,7 +282,7 @@ for (const backend of ["memory", "indexeddb"] as const)
               if (s.atMerge)
                 expect(
                   transferredMergeCredit,
-                  "merge must use returned write headroom",
+                  "merge must transfer idle row credit",
                 ).toBeGreaterThan(0);
               reach.reach("merge completed");
               reach.reach("metadata grew under pressure");
