@@ -45,7 +45,18 @@ export const MEMTABLE_BYTES = 8 * 1024 * 1024;
 /** A memtable's memory: charged to the write path's grant before allocation, counted here. */
 class Counter implements Charge {
   bytes = 0;
-  constructor(readonly grant: Charge) {}
+  constructor(
+    readonly grant: Charge,
+    readonly pool?: ArenaPool,
+  ) {
+    if (pool !== undefined && pool.charge !== grant)
+      throw new TypeError("Arena pool belongs to another allocator");
+  }
+  reuseBytes(bytes: number): Uint8Array | undefined {
+    const buffer = this.pool?.take(bytes);
+    if (buffer !== undefined) this.bytes += buffer.byteLength;
+    return buffer;
+  }
   allocate(bytes: number): boolean {
     if (!this.grant.allocate(bytes)) return false;
     this.bytes += bytes;
@@ -54,6 +65,77 @@ class Counter implements Charge {
   free(bytes: number): void {
     this.grant.free(bytes);
     this.bytes -= bytes;
+  }
+}
+
+/** Exact-capacity byte arenas. Active chunks and their source slots keep their normal lifetime. */
+export class ArenaPool {
+  readonly #entries: Map<number, Uint8Array[]>;
+  readonly #oldest: Set<Uint8Array>;
+  #bytes = 0;
+  // Buffer/view headers and ownership entries, plus the bounded power-of-two buckets.
+  static readonly overhead = 512 * 256 + 4096;
+  constructor(
+    readonly charge: Charge,
+    readonly limit: number,
+  ) {
+    if (!charge.allocate(ArenaPool.overhead)) throw new Error("Missing arena-pool minimum");
+    this.#entries = new Map();
+    this.#oldest = new Set();
+  }
+  get bytes(): number {
+    return this.#bytes;
+  }
+  take(bytes: number): Uint8Array | undefined {
+    const entries = this.#entries.get(bytes);
+    const buffer = entries?.pop();
+    if (buffer === undefined) return;
+    if (entries?.length === 0) this.#entries.delete(bytes);
+    this.#oldest.delete(buffer);
+    this.#bytes -= bytes;
+    return buffer;
+  }
+  put(buffer: Uint8Array): boolean {
+    const bytes = buffer.byteLength;
+    if (
+      bytes < 4096 ||
+      bytes > this.limit ||
+      (bytes & (bytes - 1)) !== 0 ||
+      buffer.byteOffset !== 0 ||
+      bytes !== buffer.buffer.byteLength
+    )
+      return false;
+    if (this.#oldest.has(buffer)) throw new Error("Arena returned twice");
+    while (this.#bytes + bytes > this.limit || this.#oldest.size >= 512) {
+      const oldest = this.#oldest.values().next().value;
+      if (oldest === undefined) break;
+      this.#remove(oldest);
+      this.charge.free(oldest.byteLength);
+    }
+    let entries = this.#entries.get(bytes);
+    if (entries === undefined) this.#entries.set(bytes, (entries = []));
+    entries.push(buffer);
+    this.#oldest.add(buffer);
+    this.#bytes += bytes;
+    return true;
+  }
+  #remove(buffer: Uint8Array): void {
+    const entries = this.#entries.get(buffer.byteLength);
+    const at = entries?.indexOf(buffer) ?? -1;
+    if (at >= 0) entries?.splice(at, 1);
+    if (entries?.length === 0) this.#entries.delete(buffer.byteLength);
+    this.#oldest.delete(buffer);
+    this.#bytes -= buffer.byteLength;
+  }
+  clear(): void {
+    for (const buffer of this.#oldest) this.charge.free(buffer.byteLength);
+    this.#entries.clear();
+    this.#oldest.clear();
+    this.#bytes = 0;
+  }
+  close(): void {
+    this.clear();
+    this.charge.free(ArenaPool.overhead);
   }
 }
 
@@ -143,11 +225,22 @@ export class Memtable {
     charge: Charge = UNCHARGED,
     /** Rows before the memtable is full (tests shrink it: `EngineInput.tuning`). */
     readonly limit = MEMTABLE_ROWS,
+    readonly pool?: ArenaPool,
   ) {
     this.columns = columns;
     this.chunks = columns.map(() => []);
-    this.#counter = new Counter(charge);
+    this.#counter = new Counter(charge, pool);
     this.deltas = new Map(indexIds.map((id) => [id, new KeyDelta(this.#counter)]));
+  }
+
+  #releaseChunk(chunk: ColumnChunk): void {
+    const arena = chunk.arena;
+    if (arena !== null && this.pool?.put(arena)) {
+      this.#counter.bytes -= arena.byteLength;
+      chunk.chargedBytes -= arena.byteLength;
+      chunk.arena = null;
+    }
+    chunk.releaseCharge();
   }
 
   /** A new key delta for an index created while this memtable is live. */
@@ -179,7 +272,7 @@ export class Memtable {
     this.#borrows.delete(chunk);
     const lent = this.#lent.get(chunk);
     if (lent !== undefined) {
-      for (const stored of lent) stored.releaseCharge();
+      for (const stored of lent) this.#releaseChunk(stored);
       this.#lent.delete(chunk);
     }
   }
@@ -345,7 +438,7 @@ export class Memtable {
     for (let chunk = keepChunks; chunk < chunkCount; chunk++) {
       const stored = this.chunks.map((list) => need(list[chunk]));
       if (this.#borrows.has(chunk)) this.#holdBorrowed(chunk, stored);
-      else for (const column of stored) column.releaseCharge();
+      else for (const column of stored) this.#releaseChunk(column);
     }
     for (const list of this.chunks) {
       list.length = Math.min(list.length, keepChunks);
@@ -373,7 +466,7 @@ export class Memtable {
     for (let chunk = 0; chunk < chunkCount; chunk++) {
       const stored = this.chunks.map((list) => need(list[chunk]));
       if (this.#borrows.has(chunk)) this.#holdBorrowed(chunk, stored);
-      else for (const column of stored) column.releaseCharge();
+      else for (const column of stored) this.#releaseChunk(column);
     }
     this.chunks = this.columns.map(() => []);
   }

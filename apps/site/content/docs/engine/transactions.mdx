@@ -26,6 +26,12 @@ changes makes the scope roll back even if the callback catches its error. Kysely
 transaction callback to Minnow's SQL transaction statements; see the
 [Kysely adapter](/docs/adapters/kysely).
 
+For wide bulk imports, build your input in pieces of roughly 5,000 rows and pass each piece to
+its own batch call inside one `db.write()` scope. The scope still commits once. In a 1M-row
+Chromium check of the 200-column `events_wide` input generator, building 5,000-row pieces
+instead of 50,000-row ones saved about 188 MiB of peak worker-renderer RSS. The saving is the
+application's own temporary arrays, which the engine cannot release for it.
+
 A database has one writer at a time. A scope takes its turn before its callback runs — in order
 with every other write on this engine, on other engines in this context, and in other tabs and
 workers over the same database — and keeps it until its commit or rollback has a known outcome.
@@ -64,10 +70,10 @@ run together against the same staged state. Commit joins admitted calls before p
 each call to handle its error. One engine admits at most 256 write/snapshot scopes; within a
 write scope, at most 64 mutations and 256 reads may be pending.
 
-Never split a write to suit the engine. Hand it the whole batch: a statement stages about one
+Never split a write across commits to suit the engine. Commit the whole batch in one scope: a statement stages about one
 block per column per 65,536 rows, so a million-row insert of a 100-column table is a few
 thousand blocks, and the engine encodes and persists them with backpressure instead of holding
-every encoded block in memory. Chunking only multiplies commits, and each commit is a durable
+every encoded block in memory. Splitting it into separate scopes only multiplies commits, and each commit is a durable
 flush, a manifest version, a live-query invalidation, and one more small segment for every
 later read to consult until compaction folds it; on the OPFS store, fifty thousand guarded
 upserts land four to seven times slower as 141-row scopes than as one batch. Inside a scope,

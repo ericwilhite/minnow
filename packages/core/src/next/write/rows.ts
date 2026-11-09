@@ -10,7 +10,7 @@ import { ChunkReader } from "../page/reader.js";
 import type { FlatVector } from "../vector/vector.js";
 import { allocateData } from "../vector/vector.js";
 import { ColumnChunk, MEMORY_CHUNK_ROWS } from "./columns.js";
-import { groupRootOf } from "./memtable.js";
+import { groupRootOf, type Memtable } from "./memtable.js";
 import type { TableSnapshotImpl } from "./view.js";
 
 const ONE = new Uint16Array(1);
@@ -38,51 +38,72 @@ export function readRows(
   // Each output column is filled slot by slot in request order: stage per-slot sources first.
   const sources = new Array<{ vectors: FlatVector[]; index: number } | undefined>(rowIds.length);
   const pending: Array<Promise<void>> = [];
-  for (const [segmentIndex, rows] of bySegment) {
-    const segment = table.segments[segmentIndex];
-    if (segment === undefined) throw new RangeError("A row id names no segment");
-    if (segment.kind === "memory") {
-      const memtable = (segment as unknown as { memtable: import("./memtable.js").Memtable })
-        .memtable;
-      if (memtable.published === null) {
-        for (const { slot, position } of rows) {
-          const chunk = Math.floor(position / MEMORY_CHUNK_ROWS);
-          const vectors = columns.map((_, c) => {
-            const stored = memtable.chunks[c]?.[chunk];
-            if (stored === undefined) throw new RangeError("A memtable row is missing");
-            return stored.view();
-          });
-          sources[slot] = { vectors, index: position % MEMORY_CHUNK_ROWS };
+  const borrowed = new Map<Memtable, Set<number>>();
+  const release = (): void => {
+    for (const [memtable, chunks] of borrowed) for (const chunk of chunks) memtable.unborrow(chunk);
+    borrowed.clear();
+  };
+  try {
+    for (const [segmentIndex, rows] of bySegment) {
+      const segment = table.segments[segmentIndex];
+      if (segment === undefined) throw new RangeError("A row id names no segment");
+      if (segment.kind === "memory") {
+        const memtable = (segment as unknown as { memtable: import("./memtable.js").Memtable })
+          .memtable;
+        if (memtable.published === null) {
+          for (const { slot, position } of rows) {
+            const chunk = Math.floor(position / MEMORY_CHUNK_ROWS);
+            let chunks = borrowed.get(memtable);
+            if (chunks === undefined) borrowed.set(memtable, (chunks = new Set()));
+            if (!chunks.has(chunk)) {
+              memtable.borrow(chunk, -1);
+              chunks.add(chunk);
+            }
+            const vectors = columns.map((_, c) => {
+              const stored = memtable.chunks[c]?.[chunk];
+              if (stored === undefined) throw new RangeError("A memtable row is missing");
+              return stored.view();
+            });
+            sources[slot] = { vectors, index: position % MEMORY_CHUNK_ROWS };
+          }
+          continue;
         }
+        const root = groupRootOf(memtable.published.groupRoot);
+        pending.push(
+          root instanceof Promise
+            ? root.then((resolved) => readGroupRows(table, resolved, rows, sources))
+            : readGroupRows(table, root, rows, sources),
+        );
         continue;
       }
-      const root = groupRootOf(memtable.published.groupRoot);
-      pending.push(
-        root instanceof Promise
-          ? root.then((resolved) => readGroupRows(table, resolved, rows, sources))
-          : readGroupRows(table, root, rows, sources),
-      );
-      continue;
+      const root = segment.root();
+      if (root instanceof Promise)
+        pending.push(root.then((resolved) => readGroupRows(table, resolved, rows, sources)));
+      else pending.push(readGroupRows(table, root, rows, sources));
     }
-    const root = segment.root();
-    if (root instanceof Promise)
-      pending.push(root.then((resolved) => readGroupRows(table, resolved, rows, sources)));
-    else pending.push(readGroupRows(table, root, rows, sources));
+    const assemble = (): FlatVector[] => {
+      for (let slot = 0; slot < rowIds.length; slot++) {
+        const source = sources[slot];
+        if (source === undefined) throw new RangeError("A row was not read");
+        ONE[0] = source.index;
+        out.forEach((chunk, c) => {
+          const vector = source.vectors[c];
+          if (vector === undefined) throw new RangeError("A row lacks a column");
+          chunk.append(vector, ONE, 0, 1);
+        });
+      }
+      return out.map((chunk) => chunk.view());
+    };
+    if (pending.length === 0) {
+      const result = assemble();
+      release();
+      return result;
+    }
+    return Promise.all(pending).then(assemble).finally(release);
+  } catch (error) {
+    release();
+    throw error;
   }
-  const assemble = (): FlatVector[] => {
-    for (let slot = 0; slot < rowIds.length; slot++) {
-      const source = sources[slot];
-      if (source === undefined) throw new RangeError("A row was not read");
-      ONE[0] = source.index;
-      out.forEach((chunk, c) => {
-        const vector = source.vectors[c];
-        if (vector === undefined) throw new RangeError("A row lacks a column");
-        chunk.append(vector, ONE, 0, 1);
-      });
-    }
-    return out.map((chunk) => chunk.view());
-  };
-  return pending.length === 0 ? assemble() : Promise.all(pending).then(assemble);
 }
 
 async function readGroupRows(
