@@ -9,7 +9,9 @@ import type { PhysicalType } from "../types.js";
 import type { CompiledQuery, Expression, PredicateOperator } from "../../plan/model.js";
 import { isAggregateCall } from "../../engine/query.js";
 import { externalSqlDomainValue } from "../../engine/sql-domains.js";
+import { timestampLiteralSources } from "../../date-value.js";
 import { parseDate, timestampFromDate } from "../temporal.js";
+import { parseTimestampLiteral } from "./timestamp-literals.js";
 import {
   baseType,
   coerce,
@@ -287,7 +289,9 @@ function lowerLiteral(expression: Extract<Expression, { kind: "literal" }>): Typ
     return numberLiteral(value, expression.exactText, expression.decimal === true);
   if (value instanceof Date) {
     const zoned = expression.timestamp !== true || expression.zoned === true;
-    return { expr: timestampLiteral(timestampFromDate(value), zoned), nullable: false, big: false };
+    const source = timestampLiteralSources.get(value);
+    const micros = source === undefined ? timestampFromDate(value) : parseTimestampLiteral(source);
+    return { expr: timestampLiteral(micros, zoned), nullable: false, big: false };
   }
   if (expression.internalSqlValue === true && expression.sqlDomain !== undefined) {
     const text = String(externalSqlDomainValue(value));

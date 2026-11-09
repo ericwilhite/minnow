@@ -15,6 +15,7 @@ export { copyQueryResultExternalization, markQueryResultExternal } from "./resul
 import {
   civilFromDays,
   copyDate,
+  timestampLiteralSources,
   dateIsoString,
   dateMilliseconds,
   daysFromCivil,
@@ -1140,6 +1141,8 @@ function declaredType(
   varying?: boolean,
 ): { declaredTypeName?: DeclaredNumericTypeName; declaredLength?: DeclaredTextLength } {
   if (!recordDeclaredTypes) return {};
+  if (width !== undefined && width !== 6 && createTableTypeNames.get(word) === "datetime")
+    throw new TypeError("TIMESTAMP precision other than 6 is not supported");
   // VARCHAR(n) and CHARACTER VARYING(n); CHAR and CHARACTER are CHAR(1) without a width.
   if (word === "VARCHAR" || (word === "CHARACTER" && varying === true))
     return width === undefined ? {} : { declaredLength: { length: width, fixed: false } };
@@ -1419,7 +1422,10 @@ function columnDefaultFor(expression: Expression, sql: string): ColumnDefault {
     if (typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
       return { kind: "literal", value };
     }
-    if (value instanceof Date) return { kind: "literal", value: copyDate(value) };
+    if (value instanceof Date) {
+      if (recordDeclaredTypes) return { kind: "expression", sql };
+      return { kind: "literal", value: copyDate(value) };
+    }
   }
   return { kind: "expression", sql };
 }
@@ -2994,7 +3000,14 @@ export const planCloneStats = { clones: 0 };
 
 function cloneTreeValue(value: unknown): unknown {
   if (typeof value !== "object" || value === null) return value;
-  if (value instanceof Date) return copyDate(value);
+  if (value instanceof Date) {
+    const copy = copyDate(value);
+    if (recordDeclaredTypes) {
+      const source = timestampLiteralSources.get(value);
+      if (source !== undefined) timestampLiteralSources.set(copy, source);
+    }
+    return copy;
+  }
   if (Array.isArray(value)) {
     const copy = new Array<unknown>(value.length);
     for (let index = 0; index < value.length; index += 1)
@@ -9418,6 +9431,7 @@ class Parser {
         multiWord = zone !== undefined;
       }
     }
+    if (mapped === "datetime") declaredType(word, width, multiWord);
     if (!multiWord && this.#punctuation("[")) {
       this.#expectPunctuation("]");
       return { type: "string", sqlDomain: { kind: "array", element: word } };
@@ -12171,11 +12185,10 @@ class Parser {
       };
     }
     if ((upper === "TIMESTAMP" || upper === "DATETIME") && this.#peek().kind === "string") {
-      return {
-        kind: "literal",
-        value: timestampLiteral(this.#take("string").text),
-        timestamp: true,
-      };
+      const text = this.#take("string").text;
+      const value = timestampLiteral(text);
+      if (recordDeclaredTypes) timestampLiteralSources.set(value, text.trim());
+      return { kind: "literal", value, timestamp: true };
     }
     if (upper === "TIME" && this.#peek().kind === "string") {
       return {

@@ -375,3 +375,21 @@ nonascending selections keep monotone output offsets. Differential tests constru
 from independent ordinal date and interval fields and compare interval subtraction fields
 directly, rather than judging arithmetic through its text renderer. Guide-3 now executes
 unchanged against both PGlite and the shipped engine; the frozen catalogue is 60/66 executions.
+
+SQL TIMESTAMP literals now retain their original spelling in a parser-only weak side table,
+carried through plan cloning and structural identity. Lowering builds native microseconds from
+calendar and fractional fields, rather than reconstructing them from the shipped parser's Date.
+SQL TIMESTAMP ignores a written zone as PostgreSQL does; casts to the fixed-UTC zoned type keep
+these microseconds. No published model field is added. Normal shipped parsing keeps its existing
+Date values and precision. Short date/time spellings and BC fractions retain the shared front
+end's validation; the native timestamp boundary is checked with 22008. Existing front-end syntax
+and JS Date range limits remain; native vector coverage does not imply every native value is
+expressible as a SQL literal. Generated SQL/API tests cover 0–6 fraction digits, microsecond
+comparisons, differences, text, direct/derived/CTE/view/grouped/aggregate scopes, serialized timestamp defaults and wide years.
+
+The native timestamp contract has fixed microsecond precision. Explicit TIMESTAMP/TIMESTAMPTZ
+precision 6 is admitted; other precision modifiers on CAST targets or columns give a typed
+lowering refusal (`columnType`, 0A000) until rounding and column precision constraints exist.
+They must not inherit the shipped front end's silently ignored modifiers. Normal shipped
+compilation retains its existing millisecond/ignored-precision behavior. The generated modifier
+matrix checks every target spelling and both contexts against PG admission and the typed limit.

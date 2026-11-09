@@ -24,8 +24,9 @@ Devtools' generated failure explanations now include the parameter-offset refusa
 clarified frame-compatibility notes from the matrix.
 
 **Size note:** the SQL feature metadata adds 402 packed bytes and raises the core tarball cap
-from 1,022,500 to 1,023,000 bytes. With JSON_TABLE declaration metadata, the measured tarball
-is now 1,022,832 packed bytes and 4,433,733 unpacked bytes. Private rebuild code and test suites
+from 1,022,500 to 1,023,000 bytes. Timestamp source and precision-admission metadata adds
+200 packed bytes over the JSON_TABLE baseline: the current tarball is 1,023,032 packed bytes
+and 4,434,467 unpacked bytes. Its packed cap moves up once by 250 bytes to 1,023,250. Private rebuild code and test suites
 remain excluded. The unpacked-size cap remains unchanged.
 
 **Migration:** no stored-format change. Existing parameter frame offsets remain refused; use
@@ -68,10 +69,18 @@ budget, and package tarball caps stay unchanged.
 The unexported rebuild core now subtracts DATE values as whole days and finite timestamps as
 INTERVAL values with PostgreSQL's day and microsecond fields. DATE, TIMESTAMP, TIMESTAMPTZ and
 finite INTERVAL values cast to unbounded TEXT in PostgreSQL's default output styles and UTC.
-Timestamp row values keep their separate ISO representation. Bounded temporal text casts and
+SQL TIMESTAMP literals retain all six fractional digits through lowering and optimization,
+including comparisons at microsecond boundaries; JavaScript Date inputs keep millisecond
+precision. The rebuild admits explicit TIMESTAMP/TIMESTAMPTZ precision 6 and refuses other
+precision modifiers instead of silently skipping their rounding. Timestamp row values keep their separate ISO representation. Bounded temporal text casts and
 infinite INTERVAL results remain explicitly unsupported. This changes the private rebuild
-executor; the shipped SQL engine, public API and stored formats are unchanged. No migration is
+executor; the shipped SQL behavior, public API and stored formats are unchanged. No migration is
 needed.
+
+Timestamp source and precision-admission metadata adds 326 minified raw bytes per engine entry.
+Current raw/gzip sizes are 1,172,985/351,332 bytes for the main entry, 1,585,395/458,305 with OPFS,
+and 1,581,428/455,871 for the IndexedDB worker. Only the IndexedDB raw cap moves up once by
+512 bytes; the other bundle caps stay unchanged. The packed-size adjustment is recorded above.
 
 ## 0.20.0 — November 7, 2026
 

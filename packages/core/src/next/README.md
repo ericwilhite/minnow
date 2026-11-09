@@ -1190,6 +1190,12 @@ The full interface contract includes the following (DML remains unimplemented by
   difference execute through `temporal-subtract.ts`; temporal output casts use `temporal-text.ts`.
   Not implemented yet: other date/time/interval arithmetic, text functions, math functions other
   than numeric ROUND(numeric,int4), other casts to and from text, and bounded text casts.
+- SQL TIMESTAMP literals preserve source microseconds through parsing, plan clones and expression
+  identity; lowering uses integer calendar/fraction fields, not the legacy millisecond Date.
+  Parser provenance lives in an internal weak side table, never in published model fields.
+  JS Date inputs keep millisecond precision; the shipped engine's precision is unchanged.
+  Explicit timestamp precision 6 is supported; other precision modifiers on casts/columns are
+  typed lowering refusals until precision rounding and write constraints are implemented.
 - SQL temporal text uses PostgreSQL's default styles in fixed UTC, preserving BC years and exact
   microseconds. Timestamp differences use PG's day/remainder INTERVAL fields. Infinite INTERVAL
   results and text stay typed refusals; no stored interval-infinity encoding is added. D1's ISO

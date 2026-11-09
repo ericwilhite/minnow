@@ -132,6 +132,8 @@ export function frontEndSqlState(message: string, positioned: boolean): string {
 export function frontEndError(error: unknown): unknown {
   if (!(error instanceof TypeError)) return error;
   const message = error.message;
+  if (message === "TIMESTAMP precision other than 6 is not supported")
+    return unsupported("columnType", message);
   const located =
     "offset" in error && typeof error.offset === "number" && "length" in error
       ? { offset: error.offset, length: Number(error.length) }
