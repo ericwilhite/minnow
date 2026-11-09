@@ -71,6 +71,11 @@
   },
   {
     "file": "query.ts",
+    "message": "TIMESTAMP precision other than 6 is not supported",
+    "state": "0A000"
+  },
+  {
+    "file": "query.ts",
     "message": "SET TIME ZONE X is not supported: every datetime is an instant in UTC",
     "state": "0A000"
   },
