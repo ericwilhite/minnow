@@ -443,8 +443,8 @@ export const CATALOGUE_REFUSAL_REASONS: Readonly<
   },
   "guide-9": {
     reason:
-      "The frozen query uses unknown -> unknown, which PostgreSQL rejects as ambiguous (42725). Its legacy MINNOW_JSON_GET_TEXT desugar has no R19 kernel. Keep the original SQL and explicit refusal until an authorized PG-valid catalogue correction.",
-    pgState: "42725",
+      "The authorized explicit JSON cast resolves PostgreSQL operator ambiguity. JSON extraction still has no typed R19 kernel; the legacy MINNOW_JSON_GET_TEXT desugar remains an explicit lowering refusal.",
+    pgState: "00000",
   },
   "guide-14": {
     reason:

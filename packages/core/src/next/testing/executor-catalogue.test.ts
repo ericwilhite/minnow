@@ -56,6 +56,12 @@ function originalRoundSQL(id: string, sql: string): string | null {
   return sql;
 }
 
+// Authorized guide-9 correction: unknown -> unknown is ambiguous in PG (42725).
+// Select JSON explicitly; keep the document, path, result name and every dataset unchanged.
+function originalJsonSQL(id: string, sql: string): string | null {
+  return id === "guide-9" ? sql.replace("'::json -> 'dims'", "' -> 'dims'") : null;
+}
+
 const canonical = (rows: ReadonlyArray<Record<string, unknown>>) =>
   rows.map((row) => encodeValue(Object.values(row))).sort();
 
@@ -156,6 +162,13 @@ for (const dataset of ["wide", "retail", "star"])
             expect.objectContaining({ sqlState: "42883" }),
           );
           expect((await current.query(original)).rows, query.id).toBeDefined();
+        }
+        const originalJson = originalJsonSQL(query.id, query.sql);
+        if (originalJson !== null) {
+          await expect(pg.query(originalJson), query.id).rejects.toMatchObject({ code: "42725" });
+          const authority = await pg.query(query.sql);
+          expect(authority.rows, query.id).toEqual([{ width: "30" }]);
+          expect((await current.query(query.sql)).rows, query.id).toEqual(authority.rows);
         }
         const expectedRefusal = CATALOGUE_REFUSALS[query.id];
         let prepared: ReturnType<StorageCore["prepare"]>;
@@ -283,7 +296,7 @@ for (const dataset of ["wide", "retail", "star"])
     }
   }, 60_000);
 
-it("keeps frozen data and every SQL cell except the three authorized ROUND corrections", async () => {
+it("keeps frozen data and every SQL cell except the authorized ROUND and JSON corrections", async () => {
   const source = fixtureData;
   const frozen = {
     source: source.source,
@@ -298,14 +311,17 @@ it("keeps frozen data and every SQL cell except the three authorized ROUND corre
     return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("");
   };
   expect(await fingerprint(frozen)).toBe(
-    "45b7af80987dcee9ee8786f9bf56d5417a4f519cea4beeece06235a310ad6c31",
+    "c5b7d4af2c34ab8b6408624d6fe160659ed5dc02f0950c93db12bdaf0c9ce1e6",
   );
   expect(
     await fingerprint({
       ...frozen,
       queries: frozen.queries.map((query) => ({
         ...query,
-        sql: originalRoundSQL(query.id, query.sql) ?? query.sql,
+        sql:
+          originalRoundSQL(query.id, query.sql) ??
+          originalJsonSQL(query.id, query.sql) ??
+          query.sql,
       })),
     }),
   ).toBe("8d3af125ed1af20672fe678e0fdc9a40e5ce180bae68c64a099b601ae7b7e9a1");

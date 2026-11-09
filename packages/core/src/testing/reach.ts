@@ -2263,3 +2263,20 @@ export const WRITE_STAGED_RESIDUAL_STATES = [
   "deleted key reused",
   "reopened",
 ] as const;
+
+/** PG-valid guide-9 SQL must retain text extraction and distinguish absent/JSON-null paths. */
+export const GUIDE9_JSON_CAST_REACH = [
+  "integer",
+  "negative",
+  "string",
+  "escaped string",
+  "boolean",
+  "JSON null",
+  "missing member",
+  "missing parent",
+  "null parent",
+  "explicit JSON",
+  "text result",
+  "original ambiguity",
+  "native typed refusal",
+] as const;

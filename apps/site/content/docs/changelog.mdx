@@ -10,6 +10,12 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The SELECT guide and internal analytics catalogue's guide-9 JSON example now cast the document to `JSON`,
+resolving PostgreSQL's ambiguous untyped extraction operator (`42725`). Its data and path are
+unchanged. PostgreSQL and the current engine return the same text result; the rebuild still
+explicitly refuses JSON extraction pending typed kernels. Runtime behavior, public API and
+stored formats are unchanged; no migration is needed.
+
 Affected packages: `@minnowdb/core` (SQL feature metadata and compatibility documentation) and
 `@minnowdb/devtools` (failure explanations, for its next release after 0.3.9).
 
