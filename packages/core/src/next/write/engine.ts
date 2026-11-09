@@ -199,6 +199,8 @@ export const IDLE_GARBAGE_BYTES = 16 * 1024 * 1024;
 
 /** The write path's working memory admitted at open (scan buffer, key batches, metadata). */
 const MINIMUM_BYTES = RECOVERY_SCAN_BYTES + 4 * 1024 * 1024;
+/** Pending-build record, boxed LSNs and map capacity, including its retained DROP boundary. */
+const PENDING_INDEX_BYTES = 256;
 
 /** One merge to run: every run of `plan.level` of one index. */
 interface MergeJob {
@@ -1103,10 +1105,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
       // A root whose table checkpoint covers the build has its entries in the runs already.
       if (state !== undefined && state.flushedThroughLsn < lsn) {
         await this.#backfill(change.index.tableId, change.index.id, lsn);
-        this.#pendingIndexes.set(change.index.id, { tableId: change.index.tableId, lsn });
+        await this.#metadataRetry(() =>
+          this.#rememberIndex(change.index.tableId, change.index.id, lsn),
+        );
       }
     }
-    if (change.op === "dropIndex") this.#pendingIndexes.delete(change.indexId);
+    if (change.op === "dropIndex") this.#dropIndexBuild(change.indexId, lsn);
   }
 
   /** Replay of createIndex: entries for every live row, with the creating commit's seq. */
@@ -1542,9 +1546,30 @@ export class WritePathImpl implements WritePath, EngineHooks {
   /**
    * CREATE INDEX builds whose entries are still only in a memtable delta (ruling 1): a root's
    * global checkpoint stays below their LSN until their table's checkpoint covers them, so a
-   * reopen replays the build.
+   * reopen replays the build. DROP cancels the current index, not an older catalog's obligation:
+   * retain the marker until publication either carries its build or checkpoints its DROP.
    */
-  readonly #pendingIndexes = new Map<number, { readonly tableId: number; readonly lsn: number }>();
+  readonly #pendingIndexes = new Map<
+    number,
+    { readonly tableId: number; readonly lsn: number; droppedAt: number | null }
+  >();
+
+  #rememberIndex(tableId: number, indexId: number, lsn: number): void {
+    this.#chargeMetadata(PENDING_INDEX_BYTES); // before allocating the record/map entry
+    this.#pendingIndexes.set(indexId, { tableId, lsn, droppedAt: null });
+  }
+
+  #forgetIndex(indexId: number): void {
+    if (this.#pendingIndexes.delete(indexId)) this.#chargeMetadata(-PENDING_INDEX_BYTES);
+  }
+
+  #dropIndexBuild(indexId: number, lsn: number): void {
+    const pending = this.#pendingIndexes.get(indexId);
+    if (pending === undefined) return;
+    // No checkpoint can split the effects of one logged transaction.
+    if (pending.lsn === lsn) this.#forgetIndex(indexId);
+    else pending.droppedAt = lsn;
+  }
 
   /** Pins use the metadata owner's admission policy. */
   readonly #pinBudget = {
@@ -1587,7 +1612,19 @@ export class WritePathImpl implements WritePath, EngineHooks {
   ): MaybePromise<void> {
     if (this.#minimumState !== this.#state || this.#minimumCatalog !== catalog)
       return this.#recalculateMinimum(catalog, signal);
-    const metadata = this.#credits.prepareMetadata(this.#minimumMetadata, signal);
+    // Commit installs these records synchronously after logging. Keep their credit private
+    // alongside the next publication step, so DROP/CREATE churn cannot consume that minimum.
+    let newBuilds = 0;
+    if (catalog !== this.#catalog)
+      for (const table of catalog.tables) {
+        const committed = this.#catalog.table(table.id);
+        for (const index of table.indexes)
+          if (!committed?.indexes.some((existing) => existing.id === index.id)) newBuilds++;
+      }
+    const metadata = this.#credits.prepareMetadata(
+      this.#minimumMetadata + newBuilds * PENDING_INDEX_BYTES,
+      signal,
+    );
     if (metadata instanceof Promise) return this.#finishMinimumGrowth(metadata, signal);
     const merge = this.#credits.prepareMerge(this.#minimumMerge, signal);
     return merge instanceof Promise ? this.#trackMinimum(merge) : undefined;
@@ -1664,7 +1701,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   #dropTableState(tableId: number): void {
     for (const [indexId, pending] of this.#pendingIndexes)
-      if (pending.tableId === tableId) this.#pendingIndexes.delete(indexId);
+      if (pending.tableId === tableId) this.#forgetIndex(indexId);
     const state = this.#tables.get(tableId);
     this.#tables.delete(tableId);
     this.#summaries.delete(tableId);
@@ -1699,7 +1736,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * directory state, and the opened runs' resident parts.
    */
   get residentMetadataBytes(): number {
-    let total = this.#roots.get(this.#root)?.bytes ?? 0;
+    let total =
+      (this.#roots.get(this.#root)?.bytes ?? 0) + this.#pendingIndexes.size * PENDING_INDEX_BYTES;
     for (const state of this.#tables.values())
       total += state.metadataBytes + state.view.groups.chargedBytes;
     // The resident parts of the index runs opened (fences, block refs, Bloom filters).
@@ -1853,8 +1891,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
     // An index build a durable table checkpoint covers has its entries in that table's runs.
     for (const [indexId, pending] of this.#pendingIndexes) {
       const table = root.tables.find((candidate) => candidate.tableId === pending.tableId);
-      if (table !== undefined && table.flushedThroughLsn >= pending.lsn)
-        this.#pendingIndexes.delete(indexId);
+      if (
+        (pending.droppedAt !== null && root.globalLsn >= pending.droppedAt) ||
+        (table !== undefined &&
+          table.flushedThroughLsn >= pending.lsn &&
+          (table.keyIndex?.indexId === indexId ||
+            table.secondaryIndexes.some((index) => index.indexId === indexId)))
+      )
+        this.#forgetIndex(indexId);
     }
   }
 
@@ -2279,9 +2323,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
         }
         {
           if (change.op === "dropSequence") this.sequences.drop(change.sequenceId);
-          if (change.op === "createIndex")
-            this.#pendingIndexes.set(change.index.id, { tableId: change.index.tableId, lsn });
-          if (change.op === "dropIndex") this.#pendingIndexes.delete(change.indexId);
+          if (
+            change.op === "createIndex" &&
+            this.#catalog
+              .table(change.index.tableId)
+              ?.indexes.some((index) => index.id === change.index.id)
+          )
+            this.#rememberIndex(change.index.tableId, change.index.id, lsn);
+          if (change.op === "dropIndex") this.#dropIndexBuild(change.indexId, lsn);
         }
       }
     }
@@ -2649,8 +2698,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   async #writeFlush(state: TableState, set: readonly Memtable[], through: number): Promise<void> {
-    const def = this.#catalog.table(state.tableId);
-    if (def === undefined || !this.#flushable(state, through)) return;
+    const current = this.#catalog.table(state.tableId);
+    const historical = this.#catalogAt(
+      this.#rootLsn(new Map([[state.tableId, { flushedThroughLsn: through }]])),
+    ).table(state.tableId);
+    if (current === undefined || historical === undefined || !this.#flushable(state, through))
+      return;
+    let def: TableDef = current;
+    let definitionCharge = 0;
     const writer = this.#space.beginWrite(`flush t${String(state.tableId)}`);
     const retired: ExtentRef[] = [];
     // Directory chunks and the root this publication made: it owns them until a state holds them.
@@ -2669,6 +2724,19 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#flushesWriting += 1;
     let writing = true;
     try {
+      // DROP changes the current schema, not the older catalog selected for this root. The
+      // still-owned backfill deltas must be encoded when that catalog requires their index.
+      if (
+        historical.indexes.some((index) => !def.indexes.some((current) => current.id === index.id))
+      ) {
+        const charge = 512 + 32 * (historical.indexes.length + def.indexes.length);
+        this.#chargeMetadata(charge);
+        definitionCharge = charge;
+        const indexes = [...def.indexes];
+        for (const index of historical.indexes)
+          if (!indexes.some((current) => current.id === index.id)) indexes.push(index);
+        def = { ...def, indexes };
+      }
       const view = state.view;
       const newGroups: GroupRef[] = [];
       const published = new Map<
@@ -2844,13 +2912,26 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.maintenance.flushesAbandoned += 1;
         return;
       }
-      // Group/run encoding used the captured definition. DDL may have committed while
-      // it yielded, so retry from the current definition before installing any of it.
+      // Revalidate both definitions under the publication lock. Another build may advance the
+      // selected catalog past DROP, or DDL may change the current indexes, while encoding yields.
       const currentDef = this.#catalog.table(state.tableId);
+      const selectedDef = this.#catalogAt(
+        this.#rootLsn(new Map([[state.tableId, { flushedThroughLsn: through }]])),
+      ).table(state.tableId);
       if (
         currentDef?.schemaVersion !== def.schemaVersion ||
-        currentDef.indexes.length !== def.indexes.length ||
-        currentDef.indexes.some((index) => !def.indexes.some((old) => old.id === index.id)) ||
+        selectedDef === undefined ||
+        currentDef.indexes.some(
+          (index) => !def.indexes.some((encoded) => encoded.id === index.id),
+        ) ||
+        selectedDef.indexes.some(
+          (index) => !def.indexes.some((encoded) => encoded.id === index.id),
+        ) ||
+        def.indexes.some(
+          (index) =>
+            !currentDef.indexes.some((current) => current.id === index.id) &&
+            !selectedDef.indexes.some((selected) => selected.id === index.id),
+        ) ||
         !this.#flushable(state, through)
       ) {
         await writer.abort();
@@ -2979,9 +3060,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
       state.root = tableRoot;
       state.pages = pages;
       state.flushedThroughLsn = through;
-      for (const [indexId, pending] of this.#pendingIndexes)
-        if (pending.tableId === state.tableId && pending.lsn <= through)
-          this.#pendingIndexes.delete(indexId);
       state.nextGroupId = nextGroupId;
       state.nextRowId = nextRowId;
       for (const id of foldedStagings) state.stagings.delete(id);
@@ -3018,6 +3096,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (writer.state === "open") await writer.abort().catch(() => undefined);
       throw error;
     } finally {
+      if (definitionCharge > 0) this.#chargeMetadata(-definitionCharge);
       delta.settle();
       created?.releaseCreation();
       if (madeRoot !== null) this.#releaseRoot(madeRoot);
@@ -4204,14 +4283,21 @@ export class WritePathImpl implements WritePath, EngineHooks {
    */
   #rootLsn(changed: ReadonlyMap<number, { readonly flushedThroughLsn: number }>): number {
     let globalLsn = Math.max(this.#root.globalLsn, this.durableLsn);
-    for (const pending of this.#pendingIndexes.values()) {
-      const state = this.#tables.get(pending.tableId);
-      const covered =
-        changed.get(pending.tableId)?.flushedThroughLsn ?? state?.flushedThroughLsn ?? 0;
-      if (covered >= pending.lsn) continue;
-      if (!changed.has(pending.tableId) && state !== undefined && quietTable(state)) continue;
-      globalLsn = Math.min(globalLsn, pending.lsn - 1);
-    }
+    // A later build may lower the checkpoint into an earlier cancelled build's CREATE/DROP
+    // interval. Revisit skipped drops until no newly exposed build holds it further back.
+    let before: number;
+    do {
+      before = globalLsn;
+      for (const pending of this.#pendingIndexes.values()) {
+        if (pending.droppedAt !== null && globalLsn >= pending.droppedAt) continue;
+        const state = this.#tables.get(pending.tableId);
+        const covered =
+          changed.get(pending.tableId)?.flushedThroughLsn ?? state?.flushedThroughLsn ?? 0;
+        if (covered >= pending.lsn) continue;
+        if (!changed.has(pending.tableId) && state !== undefined && quietTable(state)) continue;
+        globalLsn = Math.min(globalLsn, pending.lsn - 1);
+      }
+    } while (globalLsn < before);
     return Math.max(globalLsn, this.#root.globalLsn);
   }
 
@@ -4225,19 +4311,31 @@ export class WritePathImpl implements WritePath, EngineHooks {
   #flushable(state: TableState, through: number): boolean {
     const now = this.#catalog.table(state.tableId);
     if (now === undefined) return true; // dropped: the flush abandons itself
-    const then = this.#catalogAt(
-      this.#rootLsn(new Map([[state.tableId, { flushedThroughLsn: through }]])),
-    ).table(state.tableId);
+    const globalLsn = this.#rootLsn(new Map([[state.tableId, { flushedThroughLsn: through }]]));
+    const then = this.#catalogAt(globalLsn).table(state.tableId);
     if (then?.schemaVersion !== now.schemaVersion) return false;
-    // Every index the root's catalog has must still be there; an index newer than it only when it
-    // is this table's own build this flush does not reach (the flushed memtables predate it, so it
-    // has no entries in them).
     const unbuilt = (indexId: number) => {
       const pending = this.#pendingIndexes.get(indexId);
       return pending?.tableId === state.tableId && pending.lsn > through;
     };
+    // Do not consume a cancelled build's deltas in a prefix that cannot yet name that index.
+    for (const [indexId, pending] of this.#pendingIndexes)
+      if (
+        pending.tableId === state.tableId &&
+        pending.droppedAt !== null &&
+        globalLsn < pending.droppedAt &&
+        pending.lsn <= through &&
+        !then.indexes.some((index) => index.id === indexId)
+      )
+        return false;
     return (
-      then.indexes.every((index) => now.indexes.some((other) => other.id === index.id)) &&
+      then.indexes.every((index) => {
+        const pending = this.#pendingIndexes.get(index.id);
+        return (
+          now.indexes.some((other) => other.id === index.id) ||
+          (pending?.tableId === state.tableId && pending.droppedAt !== null)
+        );
+      }) &&
       now.indexes.every(
         (index) => then.indexes.some((other) => other.id === index.id) || unbuilt(index.id),
       )
@@ -4298,6 +4396,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const state = this.#tables.get(pending.tableId);
       if (
         state !== undefined &&
+        (pending.droppedAt === null || pending.droppedAt > globalLsn) &&
         !changed.has(pending.tableId) &&
         state.flushedThroughLsn < pending.lsn &&
         pending.lsn <= globalLsn &&

@@ -2263,3 +2263,32 @@ export const WRITE_STAGED_RESIDUAL_STATES = [
   "deleted key reused",
   "reopened",
 ] as const;
+
+/** A cancelled build still belongs to catalog prefixes before its DROP checkpoint. */
+export const WRITE_CATALOG_DROP_STATES = [
+  "32 MiB owner cap",
+  "memory",
+  "sim",
+  "indexeddb",
+  "empty cancelled build",
+  "nonempty cancelled build",
+  "single cancellation",
+  "multiple cancellations",
+  "later table creation",
+  "existing blocker table",
+  "reverse drop order",
+  "creation drop order",
+  "interrupted publication",
+  "ordinary publication",
+  "catalog prefix checked",
+  "checkpoint retreats before cancelled CREATE",
+  "build records charged and returned",
+  "atomic create drop replay",
+  "historical backfill stored",
+  "historical empty index stored",
+  "replay uncheckpointed drop",
+  "continued durable writes",
+  "replacement after reopen",
+  "durable reopen",
+  "all credit returned",
+] as const;
