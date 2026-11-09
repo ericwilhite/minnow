@@ -166,9 +166,11 @@ machines: https://minnowdb.com/llms.txt
   `await client.close({ terminateWorker: true })` when the worker is dedicated to the database.
   This rolls back open SQL transactions, stops live-query timers and maintenance scheduling,
   releases reader leases, and drops resident caches.
-  Never chunk a write to suit the engine: hand `insertBatch`/`upsertBatch` the whole batch, and
-  inside `write()` single-row inserts, updates, deletes, upserts, and keyed constant `UPDATE`/
-  `DELETE` statements coalesce into a few segments per table. Chunking only multiplies commits. Worker calls have a 60-second default `requestTimeoutMs` that counts
+  Never split a write across commits to suit the engine: commit the whole batch in one `write()`
+  scope. Inside it, several `insertBatch`/`upsertBatch` calls (for wide imports, build input in
+  pieces of about 5,000 rows to keep your own arrays small), single-row inserts, updates, deletes,
+  upserts, and keyed constant `UPDATE`/`DELETE` statements coalesce into a few segments per
+  table. Separate scopes only multiply commits. Worker calls have a 60-second default `requestTimeoutMs` that counts
   silence, not wall time; close has a five-second default silence `timeoutMs` and the same
   ten-timeout absolute cap. An unknown mutation outcome requires reconciliation by durable
   application ID, never blind replay. Deploy matching client/worker builds: the wire protocol
