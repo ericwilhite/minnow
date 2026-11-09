@@ -12,6 +12,7 @@ import { StorageCore } from "./storage-core.js";
 import { assertCatalogueOrder, catalogueOrderColumns } from "./catalogue-order.js";
 import { createExecutor } from "../exec/create.js";
 import { AggregateOperator } from "../exec/agg/aggregate.js";
+import * as aggregateStates from "../exec/agg/states.js";
 import type { Batch } from "../vector/vector.js";
 import { createReach } from "../../testing/reach.js";
 import {
@@ -72,33 +73,43 @@ const canonical = (rows: ReadonlyArray<Record<string, unknown>>) =>
 for (const [dataset, packed] of [
   ["wide", false],
   ["wide", true],
+  ["wide", undefined],
   ["retail", false],
   ["star", false],
 ] as const)
-  it(`executes the ${dataset} catalogue through actual storage and records unsupported planning${packed ? " (packed wide state)" : ""}`, async () => {
+  it(`executes the ${dataset} catalogue through actual storage and records unsupported planning${packed === undefined ? " (default packed wide state)" : packed ? " (packed wide state)" : ""}`, async () => {
     const core = await new StorageCore(32).open();
-    const executor = createExecutor({
-      packedAverages: packed,
-      packedIntegers: packed,
-      batchDictionaryMinMax: packed,
-    });
+    const enabled = packed !== false;
+    const executor = createExecutor(
+      packed === undefined
+        ? {}
+        : {
+            packedAverages: packed,
+            packedIntegers: packed,
+            batchDictionaryMinMax: packed,
+          },
+    );
     core.executor.prepare = executor.prepare.bind(executor);
-    const reach = packed
+    const reach = enabled
       ? createReach("packed SQL catalogue", [
           "write path",
           "lowered",
           "packed float AVG",
           "packed integers",
+          "dictionary MIN/MAX configured",
           "all PG columns",
           "current engine",
+          ...(packed === undefined ? ["default"] : []),
         ])
       : null;
     reach?.beginHistory();
+    if (packed === undefined) reach?.reach("default");
     let activeQuery = "";
+    const accumulatorSpy = enabled ? vi.spyOn(aggregateStates, "accumulatorFor") : null;
     const packedRows = new Map<string, { average: number; integer: number }>();
     // Explicit receiver below; do not bind this method to the prototype.
     const originalPush = AggregateOperator.prototype.push; // eslint-disable-line @typescript-eslint/unbound-method
-    const spy = packed
+    const spy = enabled
       ? vi.spyOn(AggregateOperator.prototype, "push").mockImplementation(function (
           this: AggregateOperator,
           batch: Batch,
@@ -215,6 +226,7 @@ for (const [dataset, packed] of [
           expect((await current.query(query.sql)).rows, query.id).toEqual(authority.rows);
         }
         activeQuery = query.id;
+        accumulatorSpy?.mockClear();
         const expectedRefusal = CATALOGUE_REFUSALS[query.id];
         let prepared: ReturnType<StorageCore["prepare"]>;
         let result: Awaited<ReturnType<StorageCore["execute"]>>;
@@ -302,11 +314,22 @@ for (const [dataset, packed] of [
           canonical(legacy.rows),
           `${query.id} against independent PostgreSQL${witnessSQL === undefined ? "" : " R21 witness"}`,
         ).toEqual(canonical(legacyExpected));
-        if (packed && query.id === "agg_3dims_20aggs") {
+        if (enabled && query.id === "agg_3dims_20aggs") {
           reach?.reach("lowered");
           const rows = packedRows.get(query.id);
-          expect(rows?.average ?? 0).toBeGreaterThan(0);
-          expect(rows?.integer ?? 0).toBeGreaterThan(0);
+          expect(rows?.average ?? 0, "eligible SQL must execute packed AVG").toBeGreaterThan(0);
+          expect(
+            rows?.integer ?? 0,
+            "eligible SQL must execute packed integer state",
+          ).toBeGreaterThan(0);
+          expect(
+            accumulatorSpy?.mock.calls.some(
+              ([fn, , input, , options]) =>
+                fn === "min" && input?.kind === "text" && options?.batchDictionaryMinMax === true,
+            ),
+            "eligible SQL must configure batch dictionary MIN/MAX",
+          ).toBe(true);
+          reach?.reach("dictionary MIN/MAX configured");
           reach?.reach("packed float AVG");
           reach?.reach("packed integers");
           reach?.reach("all PG columns");
@@ -347,6 +370,7 @@ for (const [dataset, packed] of [
       );
     } finally {
       spy?.mockRestore();
+      accumulatorSpy?.mockRestore();
       await current.close();
       await pg.close();
       await core.close();

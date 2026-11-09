@@ -1731,10 +1731,14 @@ The full interface contract includes the following (DML remains unimplemented by
   harness checks every result against the plain kernels and preserves AVG's Sxx transitions.
   `scripts/wide-decoded-fixture.test.ts` also judges all 21 outputs against PostgreSQL.
   These are Node diagnostic measurements, not browser Gate B results.
-- Wide typed-state kernels meet the corrected IQR rule on the retained pre-rebase
-  captures: 76.731 ms median gain, 47.153 ms IQR, full range width 140.913 ms,
-  9/9 favourable pairs. They remain opt-in pending the separate default activation:
-  `createExecutor({ packedAverages: true, packedIntegers: true, batchDictionaryMinMax: true })`.
+- Wide typed-state kernels are enabled by default after the corrected IQR rule
+  qualifies the retained pre-rebase component captures: 76.731 ms median gain,
+  47.153 ms IQR, full delta range [−151.522, −10.609] ms (width 140.913 ms),
+  9/9 favourable pairs. The whole query has no accepted reverse regression
+  (median −31.575 ms, IQR 398.485 ms, range [−393.799, 195.558] ms, 5/9 favourable);
+  this is not an accepted whole-query gain or a new post-integration measurement.
+  `createExecutor({ packedAverages: false, packedIntegers: false, batchDictionaryMinMax: false })`
+  retains the ordinary control paths.
   The existing dictionary-native group table remains responsible for exact key identities.
   One kernel packs five adjacent plain float8 AVG outputs into N/Sx[5]/Sxx[5] records.
   It certifies the entire accumulated finite prefix (at most 2^26 rows, |x| at most 2^400),

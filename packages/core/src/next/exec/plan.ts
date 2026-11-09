@@ -408,8 +408,11 @@ export interface CompileOptions {
   readonly groupedDistinctBitmap?: boolean;
   readonly scalarByteDistinct?: boolean;
   readonly groupedUpdateFusion?: boolean;
+  /** False retains independent AVG states as a benchmark control. */
   readonly packedAverages?: boolean;
+  /** False retains independent integer states as a benchmark control. */
   readonly packedIntegers?: boolean;
+  /** False retains per-row dictionary MIN/MAX updates as a benchmark control. */
   readonly batchDictionaryMinMax?: boolean;
   /** False retains the general hash recipe as a benchmark control. */
   readonly domainCountSum?: boolean;
@@ -806,9 +809,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           groupedDistinctBitmap: options.groupedDistinctBitmap !== false,
           scalarByteDistinct: options.scalarByteDistinct !== false,
           groupedUpdateFusion: options.groupedUpdateFusion !== false,
-          packedAverages: options.packedAverages === true,
-          packedIntegers: options.packedIntegers === true,
-          batchDictionaryMinMax: options.batchDictionaryMinMax === true,
+          packedAverages: options.packedAverages !== false,
+          packedIntegers: options.packedIntegers !== false,
+          batchDictionaryMinMax: options.batchDictionaryMinMax !== false,
         };
         const domain =
           options.domainCountSum !== false &&

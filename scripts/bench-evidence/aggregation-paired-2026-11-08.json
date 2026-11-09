@@ -50,7 +50,7 @@
     {
       "id": "agg_3dims_20aggs",
       "targetMs": 134,
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "component": {
         "warmups": 10,
         "order": [
@@ -674,7 +674,7 @@
   "limits": [
     "Loaded shared host; no quiet-host or browser acceptance claim.",
     "Neither whole-query gain meets the corrected median/IQR/vote test; both pass the reverse non-regression test.",
-    "Both historical component comparisons pass the corrected IQR rule; wide activation is tracked separately. DISTINCT remains diagnostic.",
+    "Both historical component comparisons pass the corrected IQR rule; wide activation is recorded separately. DISTINCT remains diagnostic.",
     "No new spill path. Unknown/live-memory/computed/filtered domains retain ordinary aggregation.",
     "Input setup/decoding excluded from component; real write/flush fixture setup excluded from whole query. Allocation, task pacing, transitions, top-N and output included."
   ],
@@ -684,5 +684,8 @@
     "pairedHelperSha256": "6c578f94613567937737d5be128634d293665fa1c87db3376324aa260873da69",
     "cpuRerun": false,
     "captureProvenance": "All original raw pairs/source hashes/timings retained; this is post-hoc rule correction, not current-tip or browser measurement."
+  },
+  "defaultActivation": {
+    "wide": "Guarded packed AVG/integer states and dictionary MIN/MAX default on; false options retain controls. Accepted by historical component IQR and whole reverse non-regression. No new CPU capture."
   }
 }
