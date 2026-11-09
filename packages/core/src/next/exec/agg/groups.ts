@@ -896,6 +896,7 @@ class ByteKeys implements KeyColumn {
   count = 0;
   #nullId = -1;
   #dictionaryId = -1;
+  #dictionaryLength = 0;
   #translation: Int32Array;
   constructor(readonly memory: Charged) {
     this.#translation = memory.make(Int32Array, 0);
@@ -952,6 +953,23 @@ class ByteKeys implements KeyColumn {
     if (data.layout === "fixed16") return this.#id(data.bytes, slot * 16, slot * 16 + 16);
     throw new TypeError(`byte group keys over ${data.layout}`);
   }
+  #dictionary(key: Extract<Vector, { form: "dictionary" }>): Int32Array {
+    if (this.#dictionaryId !== key.dictionaryId) {
+      this.#dictionaryId = key.dictionaryId;
+      this.#dictionaryLength = 0;
+    }
+    const length = key.dictionary.length;
+    if (this.#translation.length < length)
+      this.#translation = this.memory.int32(
+        this.#translation,
+        Math.max(length, 2 * this.#translation.length),
+      );
+    // Entry prefixes may grow under one identity. Capacity alone is insufficient:
+    // spare cells can still contain translations from a previous dictionary.
+    if (length > this.#dictionaryLength) this.#translation.fill(-1, this.#dictionaryLength, length);
+    this.#dictionaryLength = length;
+    return this.#translation;
+  }
   assign(key: Vector, length: number, selection: Selection | null, ids: Int32Array): void {
     try {
       this.#assign(key, length, selection, ids);
@@ -966,16 +984,7 @@ class ByteKeys implements KeyColumn {
     const count = selection === null ? length : selection.count;
     if (key.form === "dictionary") {
       // Each dictionary entry is looked up once per dictionary; rows map codes.
-      if (this.#dictionaryId !== key.dictionaryId) {
-        this.#dictionaryId = key.dictionaryId;
-        if (this.#translation.length < key.dictionary.length)
-          this.#translation = this.memory.int32(
-            this.#translation,
-            Math.max(key.dictionary.length, 2 * this.#translation.length),
-          );
-        this.#translation.fill(-1, 0, key.dictionary.length);
-      }
-      const translation = this.#translation;
+      const translation = this.#dictionary(key);
       const codes = key.codes;
       const validity = key.validity;
       const data = key.dictionary.data;
