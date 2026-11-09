@@ -13,8 +13,8 @@ import {
   METADATA_WORKSPACE_BYTES,
   METADATA_PAYLOAD_BYTES,
 } from "./metadata-journal.js";
-import { mergeExtents, openPairs, spoolExtents } from "./metadata-extents.js";
-import { validateRetirements, validateIncoming } from "./publication-validation.js";
+import { ExtentPairs, mergeExtents, openPairs, spoolExtents } from "./metadata-extents.js";
+import { validateRetirements, validatePublication } from "./publication-validation.js";
 import { countingBudget } from "./space-test-support.js";
 import { ScriptedMetadataPages } from "./metadata-test-support.js";
 import type { ExtentRef } from "./extents.js";
@@ -73,7 +73,11 @@ for (const seed of seedsFor("next-pair-progress", [27941, 27942, 27943, 27944]))
           expect(budget.allocate(SLAB)).toBe(true);
           const io = { slab: new Uint8Array(SLAB) },
             journal = new MetadataJournal(new ScriptedMetadataPages(), workspace);
-          const clock = new TaskClock(() => 0);
+          let clockProbes = 0;
+          const clock = new TaskClock(() => {
+            clockProbes++;
+            return 0;
+          });
           clock.begin();
           const work = { clock };
           const all = Array.from({ length: count }, (_, k) => ({
@@ -112,11 +116,22 @@ for (const seed of seedsFor("next-pair-progress", [27941, 27942, 27943, 27944]))
               b = await save(owners),
               whole = await save(all),
               supplied = await save([...owners, unused]);
+            const retiring = current.filter((_, k) => k % 3 === 0);
+            const retiredOffsets = new Set(retiring.map((e) => e.offset));
+            const after = await save(all.filter((e) => !retiredOffsets.has(e.offset)));
+            const claims = await save(retiring);
             for (const mode of ["union", "difference"] as const) {
+              const beforeProbes = clockProbes;
               const result = await turns(() =>
                 workspace.run("merge", () => mergeExtents(journal, whole, b, mode, work)),
               );
+              const probes = clockProbes - beforeProbes;
               handles.push(result.value);
+              expect(
+                probes,
+                "clock probes must be bounded by slices, not scalar output",
+              ).toBeLessThan(bound);
+              reach.reach("slice-bounded clock checks");
               expect(await read(result.value)).toEqual(mode === "union" ? all : current);
               expect(result.count, `${mode}: scalar fast paths must stay synchronous`).toBeLessThan(
                 bound,
@@ -133,10 +148,11 @@ for (const seed of seedsFor("next-pair-progress", [27941, 27942, 27943, 27944]))
             expect(retired.views, "retirement frame views must be reused").toBeLessThan(bound);
             reach.reach("retirements");
             const incoming = await turns(() =>
-              validateIncoming(journal, a, whole, supplied, io, work),
+              validatePublication(journal, a, after, claims, supplied, io, work),
             );
-            handles.push(incoming.value);
-            expect(await read(incoming.value)).toEqual([unused]);
+            handles.push(incoming.value.unused);
+            expect(incoming.value.retiredBytes).toBe(retiring.length * 4096);
+            expect(await read(incoming.value.unused)).toEqual([unused]);
             expect(incoming.count, "incoming scalar fast paths must stay synchronous").toBeLessThan(
               bound,
             );
@@ -144,6 +160,47 @@ for (const seed of seedsFor("next-pair-progress", [27941, 27942, 27943, 27944]))
             reach.reach("frame view reuse");
             reach.reach("incoming");
             reach.reach("unused supplied output");
+            const controller = new AbortController();
+            const reason = new Error("cancel inside pair merge");
+            let consumed = 0,
+              tick = 0;
+            // The wrapper below restores this method's receiver with advance.call(this, ...).
+            // eslint-disable-next-line @typescript-eslint/unbound-method
+            const advance = ExtentPairs.prototype.next;
+            const advances = vi.spyOn(ExtentPairs.prototype, "next").mockImplementation(function (
+              this: ExtentPairs,
+              itemWork,
+            ) {
+              consumed++;
+              return advance.call(this, itemWork);
+            });
+            try {
+              await expect(
+                workspace.run("merge", () =>
+                  mergeExtents(journal, whole, b, "union", {
+                    signal: controller.signal,
+                    clock: new TaskClock(() => (tick += 5)),
+                    yieldTask: () =>
+                      new Promise<void>((resolve) =>
+                        setImmediate(() => {
+                          if (consumed >= 128) controller.abort(reason);
+                          resolve();
+                        }),
+                      ),
+                  }),
+                ),
+              ).rejects.toBe(reason);
+              expect(consumed).toBeGreaterThanOrEqual(128);
+              expect(consumed).toBeLessThanOrEqual(512);
+            } finally {
+              advances.mockRestore();
+            }
+            const retry = await workspace.run("merge", () =>
+              mergeExtents(journal, whole, b, "union", work),
+            );
+            handles.push(retry);
+            expect(await read(retry)).toEqual(all);
+            reach.reach("merge cancellation");
             if (count * 16 > METADATA_PAYLOAD_BYTES) reach.reach("page boundary");
           } finally {
             for (const h of handles) await workspace.run("spool", () => journal.release(h));

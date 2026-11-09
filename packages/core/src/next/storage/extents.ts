@@ -142,8 +142,9 @@
  * S is the fixed read/write slabs (1MiB each), R a prepaid32–256KiB run arena,
  * W a prepaid512KiB cursor/journal/reclaim workspace, and C root/snapshot credit,
  * including admitted native-list descriptors until private snapshots are needed. Retirement
- * state is a disk queue; reclaim derives the immutable before/after difference in bounded
- * batches, with list pages protected until completion. Publication and frees never grow R/W
+ * state is a disk queue. Publication validates the immutable before/after difference once and
+ * retains that disk worklist; startup tickets derive it at reclaim. Both drain bounded batches,
+ * with list pages protected until completion. Publication and frees never grow R/W
  * or await admission. Encoded cached blobs remain separately evictable by the governor.
  * The fixed startup minimum must fit the cap. Writers stage nothing else: `append`
  * copies parts into the write slab, which one builder holds at a time, so a builder's consecutive

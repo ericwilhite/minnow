@@ -1,5 +1,9 @@
 import { afterAll, expect, it, vi } from "vitest";
-import { createReach, RETIREMENT_TICKETS_REACH } from "../../testing/reach.js";
+import {
+  createReach,
+  RETIREMENT_TICKETS_REACH,
+  RETIREMENT_PROOF_REUSE_REACH,
+} from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { TaskClock } from "../task.js";
 import { Governor } from "../memory/governor.js";
@@ -24,14 +28,17 @@ import { ScriptedMetadataPages } from "./metadata-test-support.js";
 import { METADATA_PAGE_BYTES } from "../storage/contract.js";
 import { encodeListPage, type ExtentListPage } from "../storage/extent-list.js";
 import { openPairs } from "../storage/metadata-extents.js";
+import { validateRetirements } from "../storage/publication-validation.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { ReadDeniedError, type ExtentRef } from "../storage/extents.js";
 
 const reach = createReach("disk-derived retirement tickets", RETIREMENT_TICKETS_REACH);
+const proofReach = createReach("validated retirement proof reuse", RETIREMENT_PROOF_REUSE_REACH);
 const BASE = 2 ** 40;
 for (const seed of seedsFor("retirement-tickets", [1581, 1582, 1583, 1584]))
   it(`keeps a pin-delayed disk queue and reclaims in bounded batches at full pressure (${String(seed)})`, async () => {
     reach.beginHistory();
+    proofReach.beginHistory();
     const random = mulberry32(seed),
       governor = new Governor(4 << 20);
     const backend = new MemoryBackend(),
@@ -96,6 +103,9 @@ for (const seed of seedsFor("retirement-tickets", [1581, 1582, 1583, 1584]))
     );
     const expected = new Map<number, number>(),
       retiredByGeneration = new Map<number, readonly ExtentRef[]>();
+    const rootHandles = new Set<number>([current]);
+    const expectedRootScans = new Map<number, number>();
+    const observedProofRefs: number[] = [];
     const freed = new Set<number>();
     let batches = 0;
     const release = async (
@@ -128,13 +138,49 @@ for (const seed of seedsFor("retirement-tickets", [1581, 1582, 1583, 1584]))
         );
         for (const extent of retired) expected.set(extent.offset, 4096);
         retiredByGeneration.set(generation, retired);
-        await tickets.prepare(generation, current, after, retired.length * 4096);
+        const difference = await inSlab((io) =>
+          saveExtentInput(journal, retired, true, Infinity, undefined, io),
+        );
+        expect(
+          await inSlab((io) => validateRetirements(journal, current, after, difference, io)),
+        ).toBe(retired.length * 4096);
+        const reuse = (seed + generation) % 2 === 0;
+        rootHandles.add(after);
+        if (!reuse)
+          for (const root of [current, after])
+            expectedRootScans.set(root, (expectedRootScans.get(root) ?? 0) + 1);
+        await tickets.prepare(
+          generation,
+          current,
+          after,
+          retired.length * 4096,
+          reuse ? difference : 0,
+        );
         tickets.commit();
+        if (reuse) {
+          observedProofRefs.push(
+            await workspace.run("spool", async () => (await journal.describe(difference)).refs),
+          );
+          proofReach.reach("validated difference retained");
+        } else proofReach.reach("fallback difference reconstructed");
+        await disposeSnapshot(journal, difference);
+        proofReach.reach("caller drops proof owner");
         await disposeSnapshot(journal, current);
         current = after;
         await inSlab((io) => tickets.reclaim(generation, 0, release, undefined, io));
         expect(freed.size).toBe(0);
       }
+      proofReach.reach("proof waits behind pin");
+      const rootScans = new Map<number, number>();
+      const openCursor = journal.cursor.bind(journal);
+      const cursorSpy = vi.spyOn(journal, "cursor").mockImplementation(async (...args) => {
+        const cursor = await openCursor(...args);
+        // Root payloads stay at 1,200 pairs. Released handle numbers can be reused for
+        // 300-pair worklists, so count the immutable root payloads, not numeric IDs alone.
+        if (rootHandles.has(args[0]) && cursor.descriptor.length === 1200 * 16)
+          rootScans.set(args[0], (rootScans.get(args[0]) ?? 0) + 1);
+        return cursor;
+      });
       reach.reach("pin delayed disk backlog");
       reach.reach("source owners released");
       reach.reach("full ordinary capacity");
@@ -148,10 +194,19 @@ for (const seed of seedsFor("retirement-tickets", [1581, 1582, 1583, 1584]))
       for (const extent of retiredByGeneration.get(8) ?? [])
         expect(freed.has(extent.offset)).toBe(false);
       reach.reach("next generation guard");
+      proofReach.reach("proof waits for next generation");
       await inSlab((io) => tickets.reclaim(9, null, release, undefined, io));
       expect(freed.size).toBe(expected.size);
       expect(tickets.waitingBytes).toBe(0);
       expect(batches).toBe(16);
+      cursorSpy.mockRestore();
+      for (const root of rootHandles)
+        expect(rootScans.get(root) ?? 0, "validated tickets must not rescan either root").toBe(
+          expectedRootScans.get(root) ?? 0,
+        );
+      expect(observedProofRefs).toEqual([2, 2, 2, 2]);
+      proofReach.reach("no second root scan");
+      proofReach.reach("exact proof reclamation");
       reach.reach("two bounded batches per ticket");
       expect(sourceRequests).not.toHaveBeenCalled();
       expect(newAdmissions).not.toHaveBeenCalled();
@@ -345,7 +400,10 @@ it("refuses arena admission before allocating its backing and returns it after e
   }
 });
 
-afterAll(() => reach.assertReached());
+afterAll(() => {
+  reach.assertReached();
+  proofReach.assertReached();
+});
 
 it("saves payloads and scattered physical list extents without sorting every payload pair", async () => {
   const f = await construction();
@@ -419,7 +477,11 @@ it("unlinks an aborted provisional ticket and restores both snapshot references"
       b = await saveExtentInput(f.journal, [], true, 1);
     await tickets.prepare(0, a, b, 4096);
     tickets.commit();
-    await tickets.prepare(1, b, a, 4096);
+    const difference = await saveExtentInput(f.journal, [{ offset: 0, length: 4096 }], true, 4096);
+    await f.cache.withReadSlab((slab) =>
+      validateRetirements(f.journal, a, b, difference, { slab }),
+    );
+    await tickets.prepare(1, a, b, 4096, difference);
     await tickets.abort();
     expect(tickets.waitingBytes).toBe(4096);
     let visits = 0;
@@ -430,7 +492,10 @@ it("unlinks an aborted provisional ticket and restores both snapshot references"
     await f.workspace.run("spool", async () => {
       expect((await f.journal.describe(a)).refs).toBe(2);
       expect((await f.journal.describe(b)).refs).toBe(2);
+      expect((await f.journal.describe(difference)).refs).toBe(1);
     });
+    proofReach.reach("proof abort releases reference");
+    await disposeSnapshot(f.journal, difference);
     await tickets.reclaim(1, null, async (ranges) => {
       expect(ranges).toEqual([{ offset: 0, length: 4096 }]);
     });

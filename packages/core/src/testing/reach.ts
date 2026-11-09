@@ -70,6 +70,7 @@ export const METADATA_JOURNAL_REACH = [
 
 /** Pair streams keep the same memory reservation across external sort and list set operations. */
 export const METADATA_EXTENTS_REACH = [
+  "extended cancellation history",
   "external passes",
   "odd external tail",
   "exact duplicates coalesce",
@@ -2327,6 +2328,8 @@ export const WRITE_CATALOG_DROP_STATES = [
 
 /** Scalar pair loops yield at native page I/O or shared-clock slices, not per scalar. */
 export const PAIR_PROGRESS_REACH = [
+  "slice-bounded clock checks",
+  "merge cancellation",
   "frame view reuse",
   "union",
   "difference",
@@ -2388,4 +2391,38 @@ export const DIRECTORY_TRANSITION_REACH = [
   "damaged index refused",
   "damage refused by current",
   "damage refused by baseline",
+] as const;
+
+/** The fused publication proof, including exact rejection and a non-timing scan-count guard. */
+export const PUBLICATION_MERGE_REACH = [
+  "mixed ownership",
+  "one root scan",
+  "exact rounded retirements",
+  "unused sealed output",
+  "empty current",
+  "empty next",
+  "all shared",
+  "missing claim",
+  "extra claim",
+  "wrong claim length",
+  "duplicate claim",
+  "changed shared length",
+  "missing sealed owner",
+  "wrong sealed length",
+  "writer overlaps shared",
+  "incoming overlaps left",
+  "incoming overlaps right",
+  "exact cleanup",
+] as const;
+
+/** Prevalidated worklists stay under R8 with roots held, avoiding a second root scan. */
+export const RETIREMENT_PROOF_REUSE_REACH = [
+  "validated difference retained",
+  "fallback difference reconstructed",
+  "caller drops proof owner",
+  "no second root scan",
+  "proof waits behind pin",
+  "proof waits for next generation",
+  "exact proof reclamation",
+  "proof abort releases reference",
 ] as const;

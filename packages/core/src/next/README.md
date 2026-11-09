@@ -2663,16 +2663,18 @@ owner and is returned on close.
 external sort and streaming union/difference. Sorted runs form a disk queue with
 scalar head and tail. Exact duplicates may coalesce for root reachability;
 retirement inputs refuse duplicates. Offsets keep their full safe-integer
-precision. Every copy/sort/merge loop uses the shared task clock. Cancellation
-is checked after the final descriptor write as well, and returns the unused
+precision. Every copy/sort/merge loop uses the shared task clock. The scalar pair writer
+probes it once per 128 appends; surrounding bounded loop checks and the checks before/after
+native I/O remain. Cancellation is checked after the final descriptor write as well, and returns the unused
 output chain. Native failures preserve their original error while cleanup
 returns the resident workspace.
 
 The live space uses these streams for root provenance, ticket eligibility and
 bounded reclaim. Sorting a candidate does not authorize it: retirement must equal
 the immutable current/new root difference, and incoming ranges must belong to
-the current root or supplied sealed writers. The lossy map's complement grants
-no authority.
+the current root or supplied sealed writers. One merge proves both conditions with four
+read cursors in the prepaid S slab; it does not scan the two roots separately for each proof.
+The lossy map's complement grants no authority.
 
 The fixed read slab is allocated only after its cache charge succeeds. A borrowed
 slab scope serializes with ordinary cache misses and drains before close returns
@@ -2720,9 +2722,14 @@ before ready. No background task is scheduled to hide that cost.
 
 `storage/retirement-tickets.ts` keeps its queue links, generations and snapshot
 handles on disk. Provisional tail links are committed only with their native
-root publication, or unlinked on abort. Reclaim observes both R8 guards,
-materializes the full difference before any data release, then drains at most
-256 ranges per batch. Snapshot references outlive their original owner until
+root publication, or unlinked on abort. After publication validates the supplied retirement
+claims against the exact immutable before/after roots, the ticket retains that disk worklist
+alongside both snapshots. Reclaim observes both R8 guards and drains the validated difference
+without scanning the roots again. Startup tickets have no supplied proof and materialize their
+full difference before any data release. Both paths drain at most 256 ranges per batch.
+Abort returns the proof reference. The private ticket encoding is reconstructible owner scratch,
+reset on open; durable database formats and recovery authority are unchanged.
+Snapshot references outlive their original owner until
 the last ticket finishes. Publication and audit serialize workspace use. A
 contending publication lets audit flush a bounded prefix and await its external
 producer outside the workspace; the audit restarts on mutation-epoch changes.
