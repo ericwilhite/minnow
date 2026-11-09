@@ -5,7 +5,7 @@
  *   each aggregate evaluates its argument on its rows — after its FILTER, and through its DISTINCT
  *   set — and updates its accumulator (states.ts). Synchronous; nothing is retained from the
  *   batch (keys and values are copied into the state), so every push is `ready`.
- * - finish: emits the groups in first-seen order (key columns, then one column per aggregate),
+ * - finish: normally emits groups in first-seen order (key columns, then one per aggregate),
  *   then finishes downstream. Without GROUP BY there is exactly one output row, even over no
  *   input (COUNT 0, other aggregates NULL); with GROUP BY, no input means no rows.
  *   - Each output batch is at most `BATCH_ROWS` groups and about `BATCH_TARGET_BYTES` (the
@@ -48,8 +48,12 @@ import {
   type TaskClock,
 } from "../pipeline.js";
 import { DistinctSet } from "./distinct.js";
+import { ScalarByteDistinct, supportsScalarByteDistinct } from "./scalar-byte-distinct.js";
+import { GroupTopN, supportsGroupTopN, type GroupTopNSpec } from "./group-top-n.js";
 import { GroupTable } from "./groups.js";
-import { accumulatorFor, fusedSums, type Accumulator } from "./states.js";
+import { PackedAverages } from "./packed-averages.js";
+import { PackedIntegers, packedIntegerCalls } from "./packed-integers.js";
+import { accumulatorFor, fusedSums, updateGroupedPair, type Accumulator } from "./states.js";
 
 type AggregateRel = Extract<Rel, { op: "aggregate" }>;
 
@@ -76,7 +80,7 @@ interface CompiledAggregate {
   readonly accumulator: Accumulator;
   readonly argument: Compiled | null;
   readonly filter: Predicate | null;
-  readonly distinct: DistinctSet | null;
+  readonly distinct: DistinctSet | ScalarByteDistinct | null;
   readonly selection: Selection;
   /** The output's type and, for a shared state, which of its results it reads. */
   readonly type: PhysicalType;
@@ -85,6 +89,8 @@ interface CompiledAggregate {
   readonly updates: boolean;
   /** In the fused scalar pass (no GROUP BY, no FILTER or DISTINCT, an exact sum). */
   readonly fusable: boolean;
+  /** undefined: not eligible; null: COUNT(*); number: plain SUM input column. */
+  readonly groupedColumn: number | null | undefined;
 }
 
 /**
@@ -117,6 +123,19 @@ export interface AggregateOptions {
   readonly signal?: AbortSignal;
   /** False: never order a batch's rows by group (tests compare against it). Default: by size. */
   readonly groupOrder?: boolean;
+  /** Internal output reduction; the downstream sort still orders/applies OFFSET. */
+  readonly outputTopN?: GroupTopNSpec;
+  /** False keeps grouped COUNT(DISTINCT) on its legacy pair set (benchmark control). */
+  readonly groupedDistinctBitmap?: boolean;
+  /** False retains generic value interning for scalar byte COUNT(DISTINCT) (benchmark control). */
+  readonly scalarByteDistinct?: boolean;
+  /** False retains separate grouped update loops (benchmark control). */
+  readonly groupedUpdateFusion?: boolean;
+  /** Experimental control: five adjacent direct-column AVG(float8)s in packed state. */
+  readonly packedAverages?: boolean;
+  /** Experimental control: reduce dictionary MIN/MAX to one candidate per group/batch. */
+  readonly batchDictionaryMinMax?: boolean;
+  readonly packedIntegers?: boolean;
 }
 
 /** Refuses what the operator cannot compile, before anything is allocated. */
@@ -139,6 +158,9 @@ function preflight(rel: AggregateRel): void {
 }
 
 export class AggregateOperator implements Operator {
+  #packedIntegers: PackedIntegers | null = null;
+  readonly #packedIntegerMembers = new Set<number>();
+  readonly #packed = new Map<number, { bank: PackedAverages; columns: readonly number[] }>();
   readonly #keys: readonly number[];
   readonly #groups: GroupTable | null = null;
   readonly #aggregates: CompiledAggregate[] = [];
@@ -153,6 +175,7 @@ export class AggregateOperator implements Operator {
   readonly #sorted: { rows: Uint16Array; count: number } = { rows: new Uint16Array(0), count: 0 };
   /** Accumulators updated over the batch's own rows (no FILTER): what a sort serves. */
   #sortPasses = 0;
+  readonly #groupedUpdateFusion: boolean;
   #fusedTotals = new Float64Array(0);
   readonly #gids: Int32Array = new Int32Array(0);
   readonly #keyVectors: Vector[];
@@ -164,6 +187,9 @@ export class AggregateOperator implements Operator {
   /** Bytes the operator took from the arena (gids, selections), returned on a failed build. */
   #arenaBytes = 0;
   #emitted = 0;
+  #top: GroupTopN | null = null;
+  #ranked = 0;
+  #selected = false;
   /** The charged bytes of the output batch downstream still holds. */
   #outputHeld = 0;
   #closed = false;
@@ -185,6 +211,7 @@ export class AggregateOperator implements Operator {
   ) {
     preflight(rel);
     this.#charge = charge;
+    this.#groupedUpdateFusion = options.groupedUpdateFusion !== false;
     this.#interval = options.yieldIntervalMs ?? YIELD_INTERVAL_MS;
     this.#clock = clockFor(options.now);
     this.#target = options.targetBytes ?? BATCH_TARGET_BYTES;
@@ -213,6 +240,47 @@ export class AggregateOperator implements Operator {
         ),
       );
       const shared = new Map<string, CompiledAggregate>();
+      const packedMembers = new Map<number, Accumulator>();
+      if (options.packedIntegers === true && rel.groupBy.length > 0) {
+        const calls = packedIntegerCalls(rel.aggregates, context.input);
+        if (calls !== null) {
+          this.#packedIntegers = new PackedIntegers(calls, context.input, charge);
+          for (const member of this.#packedIntegers.members) {
+            packedMembers.set(member.index, member.accumulator);
+            this.#packedIntegerMembers.add(member.index);
+          }
+        }
+      }
+      if (options.packedAverages === true && rel.groupBy.length > 0) {
+        for (let k = 0; k + 4 < rel.aggregates.length; k++) {
+          const calls = rel.aggregates.slice(k, k + 5);
+          if (
+            !calls.every(
+              (call) =>
+                call.fn === "avg" &&
+                call.type.kind === "float64" &&
+                !call.distinct &&
+                call.orderBy.length === 0 &&
+                call.filter === null &&
+                call.args.length === 1 &&
+                call.args[0]?.op === "column" &&
+                context.input[call.args[0].index]?.kind === "float64",
+            )
+          )
+            continue;
+          const first = calls[0];
+          if (first === undefined) throw new Error("Packed AVG group is empty");
+          const bank = new PackedAverages(first.type, charge);
+          const columns = calls.map((call) => {
+            const arg = call.args[0];
+            if (arg?.op !== "column") throw new Error("Packed AVG requires columns");
+            return arg.index;
+          });
+          this.#packed.set(k, { bank, columns });
+          bank.members.forEach((member, offset) => packedMembers.set(k + offset, member));
+          k += 4;
+        }
+      }
       rel.aggregates.forEach((call, k) => {
         const key = keys[k] ?? null;
         const sharing = key !== null && both.has(key);
@@ -227,11 +295,22 @@ export class AggregateOperator implements Operator {
           });
           return;
         }
-        const compiled = this.#compile(call, context, capacity, sharing);
+        const compiled = this.#compile(
+          call,
+          context,
+          capacity,
+          sharing,
+          rel.groupBy.length > 0 && options.groupedDistinctBitmap !== false,
+          rel.groupBy.length === 0 && options.scalarByteDistinct !== false,
+          packedMembers.get(k),
+          options.batchDictionaryMinMax === true,
+        );
         this.#aggregates.push(compiled);
         if (sharing) shared.set(key, compiled);
       });
       this.#groups = keyTypes.length === 0 ? null : new GroupTable(keyTypes, charge);
+      const top = options.outputTopN;
+      if (top && supportsGroupTopN(rel, context.input, top)) this.#top = new GroupTopN(top, charge);
       this.#sortPasses =
         options.groupOrder === false
           ? 0
@@ -267,18 +346,25 @@ export class AggregateOperator implements Operator {
     context: CompileContext,
     capacity: number,
     sharedState: boolean,
+    groupedBitmap: boolean,
+    scalarBytes: boolean,
+    packed?: Accumulator,
+    batchDictionaryMinMax = false,
   ): CompiledAggregate {
     const [arg] = call.args;
     const argument =
       call.fn === "count_star" || arg === undefined ? null : compileExpr(arg, context);
     // A shared state is built as AVG's (it also counts) and read as either.
-    const accumulator = accumulatorFor(
-      sharedState ? "avg" : call.fn,
-      call.type,
-      argument?.type ?? null,
-      this.#charge,
-    );
-    let distinct: DistinctSet | null = null;
+    const accumulator =
+      packed ??
+      accumulatorFor(
+        sharedState ? "avg" : call.fn,
+        call.type,
+        argument?.type ?? null,
+        this.#charge,
+        { batchDictionaryMinMax },
+      );
+    let distinct: DistinctSet | ScalarByteDistinct | null = null;
     let filter: Predicate | null;
     let selection: Selection;
     // Every fallible step after the accumulator is inside this scope, so a failure closes it.
@@ -286,7 +372,14 @@ export class AggregateOperator implements Operator {
       filter = call.filter === null ? null : new Predicate(call.filter, context);
       distinct =
         call.distinct && argument !== null
-          ? new DistinctSet(argument.type, this.#charge, capacity)
+          ? scalarBytes && call.fn === "count" && supportsScalarByteDistinct(argument.type)
+            ? new ScalarByteDistinct(argument.type, this.#charge)
+            : new DistinctSet(
+                argument.type,
+                this.#charge,
+                capacity,
+                groupedBitmap && call.fn === "count",
+              )
           : null;
       this.#takeArena(context, 2 * capacity);
       selection = { rows: new Uint16Array(capacity), count: 0 };
@@ -309,6 +402,14 @@ export class AggregateOperator implements Operator {
             : "sum"
           : "own",
       updates: true,
+      groupedColumn:
+        call.filter === null && !call.distinct
+          ? call.fn === "count_star" && call.args.length === 0
+            ? null
+            : call.fn === "sum" && call.args.length === 1 && arg?.op === "column"
+              ? arg.index
+              : undefined
+          : undefined,
       fusable:
         call.filter === null &&
         !call.distinct &&
@@ -340,8 +441,62 @@ export class AggregateOperator implements Operator {
       groups.groupCount > SORT_MIN_GROUPS
         ? this.#sortByGroup(gids, batch.selection, length, groups.groupCount)
         : null;
-    for (const aggregate of this.#aggregates) {
-      if (!aggregate.updates || (scalar && aggregate.fusable)) continue;
+    const integerRows = sorted ?? batch.selection;
+    const integerFused =
+      this.#packedIntegers?.tryUpdate(
+        batch,
+        gids,
+        rowsIn(integerRows),
+        countIn(integerRows, length),
+      ) ?? false;
+    for (let index = 0; index < this.#aggregates.length; index++) {
+      const aggregate = this.#aggregates[index];
+      if (aggregate === undefined || !aggregate.updates || (scalar && aggregate.fusable)) continue;
+      if (integerFused && this.#packedIntegerMembers.has(index)) continue;
+      const next = this.#aggregates[index + 1];
+      const packed = this.#packed.get(index);
+      if (packed !== undefined) {
+        const selection = sorted ?? batch.selection;
+        packed.bank.updateBatch(
+          batch,
+          packed.columns,
+          gids,
+          rowsIn(selection),
+          countIn(selection, length),
+        );
+        index += 4;
+        continue;
+      }
+      if (
+        !scalar &&
+        this.#groupedUpdateFusion &&
+        next?.updates === true &&
+        aggregate.groupedColumn !== undefined &&
+        typeof next.groupedColumn === "number"
+      ) {
+        const left =
+          aggregate.groupedColumn === null ? null : batch.columns[aggregate.groupedColumn];
+        const right = batch.columns[next.groupedColumn];
+        const rows = sorted ?? batch.selection;
+        // Only direct columns: evaluating a later fallible expression before an earlier
+        // aggregate finishes would change which error wins. NULL/encoded inputs fall back.
+        if (
+          left !== undefined &&
+          right !== undefined &&
+          updateGroupedPair(
+            aggregate.accumulator,
+            next.accumulator,
+            left,
+            right,
+            gids,
+            rowsIn(rows),
+            countIn(rows, length),
+          )
+        ) {
+          index++;
+          continue;
+        }
+      }
       let rows: Selection | null = batch.selection;
       if (aggregate.filter !== null) {
         rows = aggregate.filter.select(batch);
@@ -356,6 +511,17 @@ export class AggregateOperator implements Operator {
       aggregate.accumulator.update(value, gids, rowsIn(rows), countIn(rows, length), scalar);
     }
     return "ready";
+  }
+
+  /** Internal diagnostic proving that a component/differential actually took the packed kernel. */
+  get packedAverageRows(): number {
+    let rows = 0;
+    for (const { bank } of this.#packed.values()) rows += bank.fusedRows;
+    return rows;
+  }
+
+  get packedIntegerRows(): number {
+    return this.#packedIntegers?.fusedRows ?? 0;
   }
 
   /**
@@ -446,14 +612,58 @@ export class AggregateOperator implements Operator {
     return bytes;
   }
 
-  /** Emits every group in charged, byte-bounded batches and paced slices (see the header). */
+  /** Emits every group or the selected winners, charged and paced (see the header). */
   finish(): MaybePromise<void> {
     return this.#emit();
   }
 
   #emit(): MaybePromise<void> {
     if (this.#isAborted()) throw this.#abortReason;
-    const total = this.#groups === null ? 1 : this.#groups.groupCount;
+    const groupsTotal = this.#groups === null ? 1 : this.#groups.groupCount;
+    const top = this.#top;
+    if (top !== null && !this.#selected) {
+      while (this.#ranked < groupsTotal) {
+        if (this.#clock.due(this.#interval))
+          return yieldTask().then(() => {
+            afterYield(this.#clock);
+            return this.#emit();
+          });
+        const first = this.#ranked;
+        let n = Math.min(BATCH_ROWS, groupsTotal - first);
+        const needed = () =>
+          top.spec.keys.reduce(
+            (bytes, key) =>
+              bytes +
+              (key.column === 0
+                ? (this.#groups?.keyBytes(0, first, n) ?? 0)
+                : (this.#aggregates[key.column - 1]?.accumulator.outputBytes(first, n) ?? 0)),
+            0,
+          );
+        let bytes = needed();
+        while (!this.#charge.allocate(bytes)) {
+          if (n === 1) throw new RangeError("Aggregate rank output exceeded its grant");
+          n = Math.max(1, n >>> 1);
+          bytes = needed();
+        }
+        try {
+          const columns = top.spec.keys.map((key) => {
+            const vector =
+              key.column === 0
+                ? this.#groups?.emitKey(0, first, n)
+                : this.#aggregates[key.column - 1]?.accumulator.emit(first, n);
+            if (!vector) throw new Error("Aggregate rank column");
+            return vector;
+          });
+          top.offer(columns, first, n);
+        } finally {
+          this.#charge.free(bytes);
+        }
+        this.#ranked += n;
+        if (this.#isAborted()) throw this.#abortReason;
+      }
+      this.#selected = true;
+    }
+    const total = top === null ? groupsTotal : top.size;
     // The task's deadline (R23.5): neither `finish` nor a resolved `ready()` starts a slice.
     const expired = (): boolean => this.#closed || this.#clock.due(this.#interval);
     while (this.#emitted < total) {
@@ -464,11 +674,12 @@ export class AggregateOperator implements Operator {
           afterYield(this.#clock);
           return this.#emit();
         });
-      let count = Math.min(BATCH_ROWS, total - this.#emitted);
-      let bytes = this.#outputBytes(this.#emitted, count);
+      const from = top === null ? this.#emitted : top.group(this.#emitted);
+      let count = top === null ? Math.min(BATCH_ROWS, total - this.#emitted) : 1;
+      let bytes = this.#outputBytes(from, count);
       while (count > 1 && bytes > this.#target) {
         count = Math.max(1, Math.floor(count / 2));
-        bytes = this.#outputBytes(this.#emitted, count);
+        bytes = this.#outputBytes(from, count);
       }
       // Charge before building; a refusal halves the batch, down to one group.
       while (!this.#charge.allocate(bytes)) {
@@ -477,7 +688,7 @@ export class AggregateOperator implements Operator {
             `A ${String(bytes)}-byte aggregate output batch was refused by its grant`,
           );
         count = Math.max(1, Math.floor(count / 2));
-        bytes = this.#outputBytes(this.#emitted, count);
+        bytes = this.#outputBytes(from, count);
       }
       this.#outputHeld = bytes;
       // Expensive per-group results (AVG over NUMERIC) are prepared under the slice's deadline,
@@ -486,7 +697,7 @@ export class AggregateOperator implements Operator {
       try {
         for (const { accumulator } of this.#aggregates)
           if (accumulator.prepare !== undefined)
-            count = Math.min(count, accumulator.prepare(this.#emitted, count, expired));
+            count = Math.min(count, accumulator.prepare(from, count, expired));
       } catch (error) {
         this.#releaseOutput();
         throw error;
@@ -495,16 +706,15 @@ export class AggregateOperator implements Operator {
       try {
         const groups = this.#groups;
         if (groups !== null)
-          for (let c = 0; c < this.#keys.length; c++)
-            columns.push(groups.emitKey(c, this.#emitted, count));
+          for (let c = 0; c < this.#keys.length; c++) columns.push(groups.emitKey(c, from, count));
         for (const aggregate of this.#aggregates)
           columns.push(
             aggregate.reads === "own" || aggregate.accumulator.emitAs === undefined
-              ? aggregate.accumulator.emit(this.#emitted, count)
+              ? aggregate.accumulator.emit(from, count)
               : aggregate.accumulator.emitAs(
                   aggregate.reads === "average",
                   aggregate.type,
-                  this.#emitted,
+                  from,
                   count,
                 ),
           );
@@ -546,6 +756,7 @@ export class AggregateOperator implements Operator {
     if (this.#closed) return;
     this.#closed = true;
     this.#releaseOutput();
+    this.#top?.close();
     this.#groups?.close();
     for (const aggregate of this.#aggregates) {
       if (!aggregate.updates) continue;

@@ -31,6 +31,11 @@ export class LimitOperator implements Operator {
     return this.#remaining === 0;
   }
 
+  /** Remaining source rows, composing an outer LIMIT's demand with this OFFSET. */
+  inputNeeded(outputRows = Infinity): number {
+    return Math.min(Number.MAX_SAFE_INTEGER, this.#skip + Math.min(this.#remaining, outputRows));
+  }
+
   push(batch: Batch, transfer?: Transfer): PushResult {
     const count = batch.selection?.count ?? batch.length;
     const skip = Math.min(this.#skip, count);

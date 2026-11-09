@@ -5,9 +5,15 @@
  * Values are first mapped to dense value ids by a `GroupTable` over the argument (so SQL equality
  * holds: NUMERIC by value, −0 = 0, one NaN; dictionary columns translated once per entry), then
  * (group id, value id) pairs live in an open-addressing set of two Int32Arrays. NULL values are
- * dropped (every aggregate ignores them). Memory is charged to the grant; spilling the set by
+ * dropped (every aggregate ignores them). Grouped COUNT can opt into per-group membership
+ * bitmaps over those same global value ids: no second pair hash, no copied per-group values.
+ * Large-group-first inputs retain pairs; later group growth uses disjoint bitmap/pair routes.
+ * Scalar byte COUNT uses a count-only membership table in AggregateOperator; other scalar
+ * arguments retain this generic value-id/seen-marker path.
+ * Memory is charged to the grant; spilling the set by
  * partition is milestone 3.
  */
+import { OBJECT_OVERHEAD_BYTES } from "../../memory/governor.js";
 import type { PhysicalType } from "../../types.js";
 import type { ByteCharge } from "../../vector/varlen.js";
 import type { Selection, Vector } from "../../vector/vector.js";
@@ -21,6 +27,8 @@ function mix(a: number, b: number): number {
   return h ^ (h >>> 16);
 }
 
+const BITMAP_GROUPS = 64;
+
 export class DistinctSet {
   readonly #values: GroupTable;
   readonly #memory: Charged;
@@ -33,12 +41,19 @@ export class DistinctSet {
   /** Scalar DISTINCT: value ids already counted. */
   #seen: Uint8Array;
   readonly #one: Vector[] = [];
+  #bitmaps: Array<Uint32Array | undefined> | null = null;
+  #bitmapMode: boolean | null = false;
 
   /** Throws (having released everything it took) when the grant refuses its first buffers. */
-  constructor(type: PhysicalType, charge: ByteCharge, capacity: number) {
+  constructor(type: PhysicalType, charge: ByteCharge, capacity: number, bitmap = false) {
     this.#values = new GroupTable([type], charge);
     const memory = (this.#memory = new Charged(charge));
     try {
+      if (bitmap) {
+        memory.take(BITMAP_GROUPS * 8 + OBJECT_OVERHEAD_BYTES);
+        this.#bitmaps = new Array<Uint32Array | undefined>(BITMAP_GROUPS);
+        this.#bitmapMode = null;
+      }
       this.#vids = memory.make(Int32Array, capacity);
       this.#slots = memory.make(Int32Array, 1024);
       this.#groups = memory.make(Int32Array, 1024);
@@ -68,6 +83,27 @@ export class DistinctSet {
     this.#one[0] = vector;
     const vids = this.#vids;
     this.#values.assign(this.#one, length, rows, vids);
+    if (this.#bitmapMode === null && count > 0) {
+      let maxGroup = 0;
+      if (!scalar)
+        for (let k = 0; k < count; k++) maxGroup = Math.max(maxGroup, gids[active[k] ?? 0] ?? 0);
+      // Do not add bitmap state to queries that already start with many groups.
+      this.#bitmapMode = scalar || maxGroup < BITMAP_GROUPS;
+    }
+    if (this.#bitmapMode === true) {
+      for (let k = 0; k < count; k++) {
+        const i = active[k] ?? 0;
+        if (!constant && validity !== null && ((validity[i >>> 5] ?? 0) & (1 << (i & 31))) === 0)
+          continue;
+        const group = scalar ? 0 : (gids[i] ?? 0),
+          id = vids[i] ?? 0;
+        // A later increase in group cardinality needs no migration or duplicate membership:
+        // groups below the cutoff always use bits, the others always use the original set.
+        if (group < BITMAP_GROUPS ? this.#mark(group, id) : this.#insert(group, id))
+          out.rows[out.count++] = i;
+      }
+      return out;
+    }
     if (scalar) {
       // One group: a value is new iff its id was never seen (no pair set needed).
       if (this.#seen.length < this.#values.groupCount)
@@ -94,6 +130,42 @@ export class DistinctSet {
       if (this.#insert(gids[i] ?? 0, vids[i] ?? 0)) out.rows[out.count++] = i;
     }
     return out;
+  }
+
+  /** One bit per observed (group,value-id), with no second tuple hash or pair arrays. */
+  #mark(group: number, id: number): boolean {
+    const maps = this.#bitmaps;
+    if (maps === null) throw new Error("Missing distinct bitmaps");
+    const word = id >>> 5;
+    let bits = maps[group];
+    if (bits === undefined) {
+      let size = 1;
+      while (size <= word) size *= 2;
+      this.#memory.take(2 * OBJECT_OVERHEAD_BYTES);
+      try {
+        bits = this.#memory.make(Uint32Array, size);
+      } catch (error) {
+        this.#memory.give(2 * OBJECT_OVERHEAD_BYTES);
+        throw error;
+      }
+      maps[group] = bits;
+    } else if (word >= bits.length) {
+      let size = bits.length * 2;
+      while (size <= word) size *= 2;
+      // Count old/new view and buffer headers during resize, as well as their payloads.
+      this.#memory.take(2 * OBJECT_OVERHEAD_BYTES);
+      try {
+        bits = this.#memory.uint32(bits, size);
+        maps[group] = bits;
+      } finally {
+        this.#memory.give(2 * OBJECT_OVERHEAD_BYTES);
+      }
+    }
+    const mask = 1 << (id & 31),
+      before = bits[word] ?? 0;
+    if (before & mask) return false;
+    bits[word] = before | mask;
+    return true;
   }
 
   #insert(group: number, id: number): boolean {
@@ -131,6 +203,8 @@ export class DistinctSet {
   }
 
   close(): void {
+    this.#bitmaps?.fill(undefined);
+    this.#bitmaps = null;
     this.#values.close();
     this.#memory.close();
   }

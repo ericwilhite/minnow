@@ -102,6 +102,58 @@ export function xxHash32(bytes: Uint8Array, seed = 0, start = 0, end = bytes.len
 }
 
 /**
+ * XXH32 using a caller's existing byte view. Equal to xxHash32 over the view's bytes
+ * at integer [start,end) offsets. No view is allocated or retained. Group-key batches
+ * already have this view for comparisons, so short keys can use word reads too.
+ * The ordinary checksum entry point and its allocation threshold remain unchanged.
+ */
+export function xxHash32View(view: DataView, seed = 0, start = 0, end = view.byteLength): number {
+  if (start < 0 || end > view.byteLength || start > end)
+    throw new RangeError("xxHash32 range is outside the input");
+  seed >>>= 0;
+  const length = end - start;
+  let index = start;
+  let hash: number;
+  if (length >= 16) {
+    let v1 = (seed + PRIME1 + PRIME2) | 0;
+    let v2 = (seed + PRIME2) | 0;
+    let v3 = seed | 0;
+    let v4 = (seed - PRIME1) | 0;
+    const limit = end - 16;
+    while (index <= limit) {
+      v1 = round(v1, view.getInt32(index, true));
+      v2 = round(v2, view.getInt32(index + 4, true));
+      v3 = round(v3, view.getInt32(index + 8, true));
+      v4 = round(v4, view.getInt32(index + 12, true));
+      index += 16;
+    }
+    hash =
+      (((v1 << 1) | (v1 >>> 31)) +
+        ((v2 << 7) | (v2 >>> 25)) +
+        ((v3 << 12) | (v3 >>> 20)) +
+        ((v4 << 18) | (v4 >>> 14))) |
+      0;
+  } else hash = (seed + PRIME5) | 0;
+  hash = (hash + length) | 0;
+  while (index + 4 <= end) {
+    hash = (hash + Math.imul(view.getInt32(index, true), PRIME3)) | 0;
+    hash = Math.imul((hash << 17) | (hash >>> 15), PRIME4);
+    index += 4;
+  }
+  while (index < end) {
+    hash = (hash + Math.imul(view.getUint8(index), PRIME5)) | 0;
+    hash = Math.imul((hash << 11) | (hash >>> 21), PRIME1);
+    index++;
+  }
+  hash ^= hash >>> 15;
+  hash = Math.imul(hash, PRIME2);
+  hash ^= hash >>> 13;
+  hash = Math.imul(hash, PRIME3);
+  hash ^= hash >>> 16;
+  return hash >>> 0;
+}
+
+/**
  * XXH32 over input given in pieces (the spec's streaming form): `update` any number of ranges,
  * then `digest`, equal to `xxHash32` of their concatenation with the same seed. Hashing a large
  * value in bounded steps (the join's key work, R23.2) keeps four lanes and up to 15 buffered

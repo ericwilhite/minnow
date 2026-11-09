@@ -1,6 +1,9 @@
 /** One query's admissions, resources and the executed/delivered lifecycle. */
 import type { MaybePromise } from "../access/key-index.js";
-import type { Snapshot } from "../access/snapshot.js";
+import { SnapshotReleasedError } from "../access/snapshot.js";
+import { readTable } from "./read-table.js";
+import type { ByteBudget } from "../access/space.js";
+import type { Snapshot, TableSnapshot } from "../access/snapshot.js";
 import type { Bound, PhysicalPlan, Rel } from "../ir/ir.js";
 import type { Grant } from "../memory/governor.js";
 import {
@@ -11,7 +14,6 @@ import {
 } from "./errors.js";
 import { WindowError } from "./window-frames.js";
 import type {
-  BoundParameters,
   ExecuteRequest,
   Execution,
   ExecutionProfile,
@@ -25,28 +27,41 @@ import {
   PARAMETER_SIZING_BYTES,
   type ParameterBinding,
 } from "./parameters.js";
-import { RESULT_WINDOW_BYTES, ResultChannel } from "./result.js";
+import { RESULT_FRAME_TARGET_BYTES, RESULT_WINDOW_BYTES, ResultChannel } from "./result.js";
 import { ResultSink } from "./result-sink.js";
 import type { ParameterSlots, CallResolver } from "./kernels/compile.js";
 import { ReservedGrant } from "./admission.js";
+import { DeferredGrant } from "./deferred-grant.js";
+import { ReadStep } from "./read-step.js";
+import { admitWorkingSet } from "../memory/working-set.js";
+import { MAX_BLOB_BYTES } from "../access/space.js";
+import { StepLoans } from "../memory/step-loans.js";
+import type { ReadBound } from "../page/read-bounds.js";
 
 interface Reservation {
-  readonly rel: Rel;
+  readonly rel: OperatorIdentity;
   readonly minimum: number;
   readonly loanSlot?: number;
 }
 
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
 export type MutableOperatorProfile = Mutable<OperatorProfile>;
-export type Program = (runtime: QueryRuntime, sink: ResultSink) => MaybePromise<void>;
+/** Identity for physical helper operators as well as lowered relational nodes. */
+export type OperatorIdentity = Pick<Rel, "id" | "op"> & {
+  /** Private helper grants retain unique labels, but statistics belong to an IR operator. */
+  readonly profileAs?: Pick<Rel, "id" | "op">;
+};
+export type Program = ((runtime: QueryRuntime, sink: ResultSink) => MaybePromise<void>) & {
+  readonly atomic?: boolean;
+};
 
 /** Per-execution only: never retained by an immutable prepared plan. */
 export class QueryRuntime {
   resolveCall: CallResolver | undefined;
   readonly params: ParameterSlots = { slots: [] };
   readonly profiles = new Map<number, MutableOperatorProfile>();
+  readonly #operatorGrants = new Map<number, Grant[]>();
   readonly #grants: Grant[] = [];
-  readonly #profileGrants = new Map<number, Grant[]>();
   readonly #dispose: Array<() => MaybePromise<void>> = [];
   readonly #aborters: Array<(reason: unknown) => void> = [];
   #aborted = false;
@@ -57,11 +72,74 @@ export class QueryRuntime {
   #wait = 0;
   readonly #reserved = new Map<string, ReservedGrant>();
   readonly #bounds = new Map<number, { readonly limit: number | null; readonly offset: number }>();
+  #atomicResult: DeferredGrant | null = null;
+  #window = 0;
+  #readBytes = 0;
+  #progressBytes = 0;
+  #readStep: ReadStep | null = null;
+  #operatorProgress = new Map<number, number>();
+  #readBounds = new Map<number, ReadBound>();
 
-  /** Loan owners hold zero bytes until the one atomic fixed-buffer admission succeeds. */
+  atomicResult(grant: DeferredGrant, window: number): void {
+    this.#atomicResult = grant;
+    this.#window = Math.min(window, RESULT_FRAME_TARGET_BYTES);
+  }
+  readMinimum(bytes: number, progress: number): void {
+    this.#readBytes = bytes;
+    this.#progressBytes = progress;
+  }
+  readPages(pages: Snapshot["pages"]): Snapshot["pages"] {
+    return this.#readBytes === 0 ? pages : (this.#readStep?.reader(pages) ?? pages);
+  }
+  readBoundary(): void {
+    this.#readStep?.beforeDownstream();
+  }
+  table(id: number, budget: ByteBudget): MaybePromise<TableSnapshot> {
+    const wrap = (table: TableSnapshot) =>
+      readTable(table, this.readPages(this.view.pages), budget, () => {
+        this.signal.throwIfAborted();
+        if (this.view.released) throw new SnapshotReleasedError();
+      });
+    const table = this.view.table(id, { budget });
+    return table instanceof Promise ? table.then(wrap) : wrap(table);
+  }
+
+  sourceBounds(bounds: ReadonlyMap<number, ReadBound>): void {
+    this.#readBounds = new Map(bounds);
+  }
+  sourceWindow(id: number): number {
+    return this.#readBounds.get(id)?.windowBytes ?? 0;
+  }
+  sourceDomain(id: number) {
+    return this.#readBounds.get(id)?.domain;
+  }
+  minimumBytes(
+    entries: ReadonlyArray<{ rel: OperatorIdentity; minimum: number; loanSlots?: number }>,
+    inputs = 0,
+    largestInput = 0,
+  ): number {
+    if (this.#atomicResult === null)
+      return inputs + entries.reduce((sum, entry) => sum + entry.minimum, 0);
+    const progress = Math.max(MAX_BLOB_BYTES, this.#progressBytes, largestInput);
+    const borrowers = entries
+      .filter(
+        ({ rel }) =>
+          rel.op === "sort" || rel.op === "aggregate" || rel.op === "join" || rel.op === "window",
+      )
+      .reduce((sum, entry) => sum + 1 + (entry.loanSlots ?? 0), 0);
+    return (
+      inputs +
+      entries.reduce((sum, entry) => sum + entry.minimum, 0) +
+      borrowers * progress +
+      this.#readBytes +
+      (entries.length === 0 ? 0 : this.#window + Math.max(0, progress - this.#window))
+    );
+  }
+
+  /** Reserve all operator and nested loan slots in the same atomic minimum. */
   reserve(
     pipelines: ReadonlyArray<{
-      readonly rel: Rel;
+      readonly rel: OperatorIdentity;
       readonly minimum: number;
       readonly loanSlots?: number;
     }>,
@@ -78,7 +156,19 @@ export class QueryRuntime {
     ]);
     if (!needsParameterSizing(this.plan, this.request.parameters))
       return this.#sizeAndReserve(entries);
-    const scratch = this.admit("parameter-sizing", PARAMETER_SIZING_BYTES, false);
+    const label = `query#${String(this.request.queryId)}/parameter-sizing`;
+    const admitted = admitWorkingSet(this.request.governor, {
+      label,
+      includesProgress: true,
+      signal: this.signal,
+      grants: [{ label, minimumBytes: PARAMETER_SIZING_BYTES, spillable: false }],
+    });
+    const adopt = (parts: readonly Grant[]) => {
+      const grant = parts[0];
+      if (!grant) throw new Error("parameter sizing did not receive its native minimum");
+      return this.#adopt(grant, undefined);
+    };
+    const scratch = admitted instanceof Promise ? admitted.then(adopt) : adopt(admitted);
     return scratch instanceof Promise
       ? scratch.then((grant) => this.#sizeAndReserve(entries, grant))
       : this.#sizeAndReserve(entries, scratch);
@@ -91,7 +181,7 @@ export class QueryRuntime {
         this.plan,
         this.request.parameters,
         this.signal,
-        this.request.governor.capBytes - this.request.governor.reserveBytes,
+        this.request.governor.capBytes,
         scratch,
       );
     } catch (error) {
@@ -111,52 +201,119 @@ export class QueryRuntime {
   }
 
   #reserveBound(entries: readonly Reservation[], binding: ParameterBinding): MaybePromise<void> {
-    const extras: Grant[] = [];
-    const next = (at: number): MaybePromise<void> => {
-      for (let k = at; k < entries.length; k++) {
-        const entry = entries[k];
-        if (entry === undefined) throw new TypeError("missing admission entry");
-        const grant = this.admit(`loan#${String(entry.rel.id)}`, 0, true);
-        if (grant instanceof Promise)
-          return grant.then((value) => {
-            extras.push(value);
-            return next(k + 1);
-          });
-        extras.push(grant);
-      }
-      const minimum = binding.bytes + entries.reduce((sum, entry) => sum + entry.minimum, 0);
-      const fixed = this.admit("fixed-buffers", minimum, true);
-      const install = (grant: Grant) => {
-        const bound = binding.bind(grant, this.request.statementTime);
-        const attach = (parameters: BoundParameters) => {
-          this.params.slots = parameters.slots;
-          this.dispose(() => {
-            this.params.slots = [];
-          });
-          const shares: ReservedGrant[] = [];
-          for (let k = 0; k < entries.length; k++) {
-            const entry = entries[k],
-              extra = extras[k];
-            if (entry === undefined || extra === undefined)
-              throw new TypeError("missing reservation");
-            const share = new ReservedGrant(grant, extra, entry.minimum);
-            this.#meter(share, entry.rel, false);
-            shares.push(share);
-            this.#reserved.set(
-              `${entry.rel.op}#${String(entry.rel.id)}${entry.loanSlot === undefined ? "" : `/loan/${String(entry.loanSlot)}`}`,
-              share,
-            );
-            this.dispose(() => share.close());
-          }
-          grant.onReclaimRequest((bytes) => {
-            for (const share of shares) share.reclaim(bytes);
-          });
-        };
-        return bound instanceof Promise ? bound.then(attach) : attach(bound);
-      };
-      return fixed instanceof Promise ? fixed.then(install) : install(fixed);
+    const atomic = this.#atomicResult !== null;
+    const progress = atomic
+      ? Math.max(MAX_BLOB_BYTES, this.#progressBytes, binding.largestSlot)
+      : 0;
+    const canBorrow = (rel: OperatorIdentity) =>
+      rel.op === "sort" || rel.op === "aggregate" || rel.op === "join" || rel.op === "window";
+    this.#operatorProgress = new Map(
+      entries.filter(({ rel }) => canBorrow(rel)).map(({ rel }) => [rel.id, progress]),
+    );
+    const window = atomic && entries.length > 0 ? this.#window : 0;
+    const resultProgress = atomic && entries.length > 0 ? Math.max(0, progress - this.#window) : 0;
+    const prefix = `query#${String(this.request.queryId)}`;
+    const parts: Array<{ label: string; minimumBytes: number; spillable: boolean }> = [];
+    const add = (label: string, minimumBytes: number, spillable = false) => {
+      const index = parts.length;
+      parts.push({ label: `${prefix}/${label}`, minimumBytes, spillable });
+      return index;
     };
-    return next(0);
+    const parameterPart = add("parameters", binding.bytes);
+    const ioPart = add("read-step", atomic ? this.#readBytes : 0);
+    const resultParts = atomic
+      ? {
+          base: add("result/minimum", window),
+          progress: add("result/progress", resultProgress),
+          extra: add("result/growth", 0, true),
+        }
+      : null;
+    const key = (entry: Reservation) =>
+      `${entry.rel.op}#${String(entry.rel.id)}${entry.loanSlot === undefined ? "" : `/loan/${String(entry.loanSlot)}`}`;
+    const operators = entries.map((entry) => ({
+      entry,
+      base: add(`${key(entry)}/minimum`, entry.minimum),
+      progress: add(`${key(entry)}/progress`, this.#operatorProgress.get(entry.rel.id) ?? 0),
+      extra: add(`${key(entry)}/growth`, 0, true),
+    }));
+    const started = performance.now();
+    const admitted = admitWorkingSet(this.request.governor, {
+      label: `${prefix}/fixed-buffers`,
+      grants: parts,
+      includesProgress: atomic,
+      signal: this.signal,
+    });
+    const install = (grants: readonly Grant[]): MaybePromise<void> => {
+      if (this.#closed || this.signal.aborted) {
+        for (const grant of grants) grant.close();
+        this.signal.throwIfAborted();
+        throw new TypeError("admission completed after query disposal");
+      }
+      const retained = new Set<Grant>();
+      // Producer cleanup returns only unclaimed parts. Frames and their source leases can
+      // outlive execution; each phase returns its own native parts when those buffers close.
+      this.dispose(() => {
+        for (const grant of grants) if (!retained.has(grant)) grant.close();
+      });
+      for (const grant of grants) this.#meter(grant);
+      const at = (index: number) => {
+        const grant = grants[index];
+        if (!grant) throw new TypeError("missing native minimum part");
+        return grant;
+      };
+      const phase = (base: number, extra: number, extraProgress: number, bounded: boolean) => {
+        const fixed = at(base),
+          growth = at(extra),
+          lane = at(extraProgress);
+        const capacity = parts[extraProgress]?.minimumBytes ?? 0;
+        const share = new ReservedGrant(
+          fixed,
+          growth,
+          parts[base]?.minimumBytes ?? 0,
+          atomic ? new StepLoans(lane, capacity, lane.label) : null,
+          bounded,
+          () => lane.close(),
+          true,
+        );
+        retained.add(fixed);
+        retained.add(growth);
+        retained.add(lane);
+        return share;
+      };
+      if (resultParts && this.#atomicResult) {
+        this.#atomicResult.install(
+          phase(resultParts.base, resultParts.extra, resultParts.progress, false),
+          () => undefined,
+        );
+      }
+      if (atomic) {
+        const io = at(ioPart);
+        this.#readStep = new ReadStep(io, this.signal);
+        this.dispose(() => {
+          if (io.allocated !== 0) throw new Error("read-step credit still pinned at close");
+          io.close();
+        });
+      }
+      const parameterGrant = at(parameterPart);
+      const bound = binding.bind(parameterGrant, this.request.statementTime);
+      this.dispose(() => parameterGrant.close());
+      const attach = (slots: ParameterSlots) => {
+        this.params.slots = slots.slots;
+        for (const { entry, base, progress: lane, extra } of operators) {
+          const share = phase(base, extra, lane, this.#readBounds.has(entry.rel.id));
+          this.#meter(share, entry.rel, false);
+          this.#reserved.set(key(entry), share);
+          this.dispose(() => share.close());
+        }
+      };
+      return bound instanceof Promise ? bound.then(attach) : attach(bound);
+    };
+    return admitted instanceof Promise
+      ? admitted.then((grants) => {
+          this.#wait += performance.now() - started;
+          return install(grants);
+        })
+      : install(admitted);
   }
 
   constructor(
@@ -229,12 +386,13 @@ export class QueryRuntime {
     return value;
   }
 
-  profile(rel: Rel): MutableOperatorProfile {
-    let profile = this.profiles.get(rel.id);
+  profile(rel: OperatorIdentity): MutableOperatorProfile {
+    const identity = rel.profileAs ?? rel;
+    let profile = this.profiles.get(identity.id);
     if (profile === undefined) {
       profile = {
-        relId: rel.id,
-        op: rel.op,
+        relId: identity.id,
+        op: identity.op,
         rowsOut: 0,
         batchesOut: 0,
         peakHeldBytes: 0,
@@ -244,19 +402,24 @@ export class QueryRuntime {
         pagesPruned: 0,
         runtimeFilter: null,
       };
-      this.profiles.set(rel.id, profile);
+      this.profiles.set(identity.id, profile);
     }
     return profile;
   }
 
-  /** Independent zero-byte loan owner installed by the atomic plan reservation. */
-  loan(rel: Rel, slot: number): Grant {
+  /** Independent loan owner installed by the atomic plan reservation. */
+  loan(rel: OperatorIdentity, slot: number): Grant {
     const grant = this.#reserved.get(`${rel.op}#${String(rel.id)}/loan/${String(slot)}`);
     if (grant === undefined) throw new TypeError("Missing reserved operator loan slot");
     return grant;
   }
 
-  admit(label: string, minimumBytes: number, spillable: boolean, rel?: Rel): MaybePromise<Grant> {
+  admit(
+    label: string,
+    minimumBytes: number,
+    spillable: boolean,
+    rel?: OperatorIdentity,
+  ): MaybePromise<Grant> {
     this.signal.throwIfAborted();
     const reserved = this.#reserved.get(label);
     if (reserved !== undefined) {
@@ -284,7 +447,7 @@ export class QueryRuntime {
 
   /** The result grant is tracked but survives pipeline disposal until result delivery. */
   resultGrant(grant: Grant): void {
-    this.#meter(grant);
+    this.#meter(grant, undefined, this.#atomicResult === null);
   }
 
   /** One source-to-sink driver, independent of how many fixed or loan grants it owns. */
@@ -346,7 +509,7 @@ export class QueryRuntime {
       if (failed) throw first;
       this.#aborters.length = 0;
     };
-    return run(0);
+    return this.#readStep?.busy ? this.#readStep.closed.then(() => run(0)) : run(0);
   }
 
   summary(synchronous: boolean): ExecutionProfile {
@@ -359,38 +522,41 @@ export class QueryRuntime {
     };
   }
 
-  #adopt(grant: Grant, rel: Rel | undefined): Grant {
+  #adopt(grant: Grant, rel: OperatorIdentity | undefined, close = true): Grant {
     if (this.#closed || this.signal.aborted) {
       grant.close();
       this.signal.throwIfAborted();
       throw new TypeError("admission completed after query disposal");
     }
     this.#meter(grant, rel);
-    this.dispose(() => grant.close());
+    if (close) this.dispose(() => grant.close());
     return grant;
   }
 
-  #meter(grant: Grant, rel?: Rel, account = true): void {
+  #meter(grant: Grant, rel?: OperatorIdentity, account = true): void {
     // A reserved share is already included in its fixed/extra real grants. Observe its
     // operator peak without double-counting the execution's holdings or loan wait time.
     if (account) this.#grants.push(grant);
-    if (rel !== undefined) {
-      const peers = this.#profileGrants.get(rel.id) ?? [];
-      peers.push(grant);
-      this.#profileGrants.set(rel.id, peers);
+    const profile = rel === undefined ? undefined : this.profile(rel);
+    let operatorGrants: Grant[] | undefined;
+    if (profile !== undefined) {
+      operatorGrants = this.#operatorGrants.get(profile.relId);
+      if (operatorGrants === undefined) {
+        operatorGrants = [];
+        this.#operatorGrants.set(profile.relId, operatorGrants);
+      }
+      operatorGrants.push(grant);
     }
     const observe = () => {
       this.#peak = Math.max(
         this.#peak,
         this.#grants.reduce((sum, g) => sum + g.held, 0),
       );
-      if (rel !== undefined) {
-        const profile = this.profile(rel);
+      if (profile !== undefined && operatorGrants !== undefined)
         profile.peakHeldBytes = Math.max(
           profile.peakHeldBytes,
-          (this.#profileGrants.get(rel.id) ?? []).reduce((sum, owner) => sum + owner.held, 0),
+          operatorGrants.reduce((sum, held) => sum + held.held, 0),
         );
-      }
     };
     const allocate = grant.allocate.bind(grant),
       grow = grant.tryGrow.bind(grant),
@@ -490,6 +656,12 @@ export class QueryExecution implements Execution {
       if (request.snapshot.catalog.version !== plan.catalogVersion)
         throw new PlanStaleError(plan.catalogVersion, request.snapshot.catalog.version);
       this.#runtime = new QueryRuntime(plan, request, request.snapshot, this.#controller.signal);
+      if (program.atomic === true) {
+        const deferred = new DeferredGrant(`query#${String(request.queryId)}/result`);
+        this.#runtime.atomicResult(deferred, windowBytes);
+        this.#start(deferred, program);
+        return;
+      }
       const options = {
         label: `query#${String(request.queryId)}/result`,
         minimumBytes: windowBytes,

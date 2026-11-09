@@ -1,13 +1,17 @@
+import { Slice, runSliced, type SlicedJob } from "./slices.js";
 /** Immutable pipeline recipes; every execution instantiates its own operators and kernels. */
 import type { MaybePromise } from "../access/key-index.js";
 import type { PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { ResultSink } from "./result-sink.js";
+import { readValue, boundSource, type ReadSource, type ReadBound } from "../page/read-bounds.js";
 import { batchTargetFor, type Grant } from "../memory/governor.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import { samePhysicalType, type PhysicalType } from "../types.js";
 import { BATCH_ROWS, type Batch, type Selection, type Vector } from "../vector/vector.js";
 import { int64At } from "../vector/int64.js";
-import { AggregateOperator } from "./agg/aggregate.js";
+import { AggregateOperator, type AggregateOptions } from "./agg/aggregate.js";
+import { DomainCountSumOperator, supportsDomainCountSum } from "./agg/domain-count-sum.js";
+import { groupTopNShape, type GroupTopNSpec } from "./agg/group-top-n.js";
 import {
   isOrderedSet,
   orderedSetArguments,
@@ -27,14 +31,18 @@ import { compileExpr, type CompileContext, type CallResolver } from "./kernels/c
 import { bindCall } from "./kernels/bindings.js";
 import { OutputArena, isValidSlot, slotOf } from "./kernels/vectors.js";
 import { LimitOperator } from "./limit.js";
-import { nullParameter } from "./parameters.js";
+import { nullParameter, integerParameterBytes } from "./parameters.js";
 import { drive, isPromise, type BatchSource, type Operator } from "./pipeline.js";
-import type { QueryRuntime, Program } from "./run.js";
+import type { QueryRuntime, Program, OperatorIdentity } from "./run.js";
+import { lateSortShape, type LateSortShape } from "./late-sort.js";
+import { LateFetchOperator, ORDINAL_TYPE } from "./late-fetch.js";
+import { OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
 import { SortOperator, sortMinimumBytes } from "./sort.js";
 import { sortMode } from "./sort-keys.js";
 import type { SortColumn } from "./sort-keys.js";
 import { windowInputLayout, remapWindowFunction, literalWindowAmount } from "./window-input.js";
-import { TableScan } from "./table-scan.js";
+import { TableScan, memoryScanBufferBytes } from "./table-scan.js";
+import { orderedSort, indexMinimums, runIndexOrder, type IndexShape } from "./key-order.js";
 import {
   WindowOperator,
   windowMinimumBytes,
@@ -43,7 +51,12 @@ import {
 } from "./window.js";
 
 type Stop = () => boolean;
-type Recipe = (runtime: QueryRuntime, sink: Operator, stops: readonly Stop[]) => MaybePromise<void>;
+type Recipe = (
+  runtime: QueryRuntime,
+  sink: Operator,
+  stops: readonly Stop[],
+  rowsNeeded?: () => number,
+) => MaybePromise<void>;
 type Setup<T> = (context: CompileContext, grant: Grant) => T;
 const EMPTY: Batch = { length: 1, columns: [], selection: null };
 const DISCARD: Operator = {
@@ -152,7 +165,7 @@ export function measureCompilerBuffers<T>(
 
 function instantiate<T>(
   runtime: QueryRuntime,
-  rel: Rel,
+  rel: OperatorIdentity,
   input: readonly PhysicalType[],
   minimum: number,
   capacity: number,
@@ -190,10 +203,11 @@ function instantiate<T>(
   );
 }
 
-function counted(runtime: QueryRuntime, rel: Rel, sink: Operator): Operator {
+function counted(runtime: QueryRuntime, rel: OperatorIdentity, sink: Operator): Operator {
   const profile = runtime.profile(rel);
   return {
     push(batch, transfer) {
+      runtime.readBoundary();
       profile.rowsOut += batch.selection?.count ?? batch.length;
       profile.batchesOut++;
       return sink.push(batch, transfer);
@@ -363,7 +377,42 @@ function setupWindow(
 }
 
 /** Compile capability checks and recipes, never retaining a mutable kernel instance. */
+/** Follow only row-preserving direct key projections; filters/joins/computed keys keep hashing. */
+function domainSource(rel: Extract<Rel, { op: "aggregate" }>) {
+  const group = rel.groupBy[0];
+  if (group === undefined) return null;
+  let index: number = group;
+  let source = rel.input;
+  while (source.op === "project") {
+    const key: ScalarExpr | undefined = source.exprs[index];
+    if (key?.op !== "column") return null;
+    index = key.index;
+    source = source.input;
+  }
+  if (
+    source.op !== "scan" ||
+    source.filter !== null ||
+    source.runtimeFilters.length > 0 ||
+    source.emitLocator
+  )
+    return null;
+  const column = source.columns[index];
+  return column === undefined ? null : { scan: source, column };
+}
+
 export interface CompileOptions {
+  readonly lateSort?: boolean;
+  readonly keyOrder?: boolean;
+  readonly lateFetchOnce?: boolean;
+  readonly groupTopN?: boolean;
+  readonly groupedDistinctBitmap?: boolean;
+  readonly scalarByteDistinct?: boolean;
+  readonly groupedUpdateFusion?: boolean;
+  readonly packedAverages?: boolean;
+  readonly packedIntegers?: boolean;
+  readonly batchDictionaryMinMax?: boolean;
+  /** False retains the general hash recipe as a benchmark control. */
+  readonly domainCountSum?: boolean;
   /** False retains the original window inputs for component/query benchmark controls. */
   readonly windowInputDeduplication?: boolean;
   /** Parent control for literal-amount gather benchmarks. */
@@ -385,15 +434,32 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   if (plan.initPlans.length !== 0)
     throw new UnsupportedPlanError("init plans", { construct: "initPlan" });
   const admissions: Array<{
-    rel: Rel;
+    rel: OperatorIdentity;
     minimum: number | ((cap: number) => number);
+    owner: number;
     loanSlots: number;
   }> = [];
-  const fixed = (rel: Rel, minimum: number | ((cap: number) => number), loanSlots = 0) =>
-    admissions.push({ rel, minimum, loanSlots });
+  const fixed = (
+    rel: OperatorIdentity,
+    minimum: number | ((cap: number) => number),
+    owner = rel.id,
+    loanSlots = 0,
+  ) => admissions.push({ rel, minimum, owner, loanSlots });
+  let nextPhysicalId = 0;
+  const findIds = (rel: Rel): void => {
+    nextPhysicalId = Math.max(nextPhysicalId, rel.id + 1);
+    if ("input" in rel) findIds(rel.input);
+    if ("left" in rel) findIds(rel.left);
+    if ("right" in rel) findIds(rel.right);
+  };
+  findIds(plan.root);
+  const readSources = new Map<number, ReadSource>();
+  const lateSortIds = new Set<number>();
   const ids = new Set<number>();
   // A terminal names-only projection forwards export ownership while retaining profile counts.
   const exportOwners = new WeakMap<Operator, ResultSink>();
+  const groupTops = new Map<number, GroupTopNSpec>();
+  let domainPlans = 0;
   // SQL SELECT * may retain an identity projection for output names. It neither retains
   // source batches nor re-reads them; computed/reordered projections and other consumers stop here.
   let terminalInput = plan.root;
@@ -408,6 +474,38 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       throw new UnsupportedPlanError("a repeated relational operator id", { construct: "plan" });
     ids.add(rel.id);
     switch (rel.op) {
+      case "indexRange": {
+        if (options.keyOrder !== true)
+          throw new UnsupportedPlanError(
+            "index range requires the diagnostic keyOrder opt-in; the cursor and fetch lack query-minimum integration",
+            {
+              construct: "indexRange",
+            },
+          );
+        if (rel.lower !== null || rel.upper !== null || rel.emitLocator)
+          throw new UnsupportedPlanError("bounded or locator-producing index range", {
+            construct: "indexRange",
+          });
+        const shape: IndexShape = {
+          tableId: rel.tableId,
+          columns: rel.columns,
+          types: types(rel),
+          source: { id: nextPhysicalId++, op: "indexRange", profileAs: rel },
+          fetch: rel,
+          restore: { id: nextPhysicalId++, op: "sort", profileAs: rel },
+          descending: rel.descending,
+        };
+        const placeholders = indexMinimums(shape, 1);
+        for (let i = 0; i < placeholders.length; i++) {
+          const entry = placeholders[i];
+          if (!entry) throw new Error("index minimum");
+          fixed(entry.rel, (cap) => indexMinimums(shape, cap)[i]?.minimum ?? 0, rel.id);
+        }
+        return (runtime, sink, stops, demand) =>
+          runIndexOrder(runtime, sink, shape, rel.indexId, null, 0, demand, () =>
+            stops.some((stop) => stop()),
+          );
+      }
       case "values": {
         const setup = (context: CompileContext) =>
           rel.rows.map((row) => row.map((expr) => compileExpr(expr, context)));
@@ -448,6 +546,15 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           filter === null &&
           rel.runtimeFilters.length === 0 &&
           !rel.emitLocator;
+        readSources.set(rel.id, {
+          id: rel.id,
+          tableId: rel.tableId,
+          columns: rel.columns,
+          types: input,
+          stagingBytes: memoryScanBufferBytes(input),
+          windowBytes: terminal ? 64 * 1024 * 1024 : 0,
+          rows: null,
+        });
         const kernelBytes =
           filter === null
             ? 0
@@ -459,7 +566,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 (filter) => filter.abort(undefined),
               );
         fixed(rel, (cap) => kernelBytes + batchTargetFor(cap, 4) + BATCH_ROWS * 16);
-        return (runtime, downstream, stops) => {
+        return (runtime, downstream, stops, rowsNeeded) => {
           if (stops.some((stop) => stop())) return downstream.finish();
           const target = batchTargetFor(runtime.request.governor.capBytes, 4);
           return instantiate(
@@ -470,7 +577,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             BATCH_ROWS,
             (context, grant) => ({ context, grant }),
             ({ context, grant }) =>
-              then(runtime.view.table(rel.tableId, { budget: grant }), (table) => {
+              then(runtime.table(rel.tableId, grant), (table) => {
                 const terminalFull =
                   terminal &&
                   rel.columns.length === table.columns.length &&
@@ -483,7 +590,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 const output = owner?.grant;
                 const scan = new TableScan({
                   table,
-                  pages: runtime.view.pages,
+                  pages: runtime.readPages(runtime.view.pages),
                   reads: runtime.request.reads,
                   budget: grant,
                   columns: rel.columns,
@@ -495,7 +602,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                   targetBytes: runtime.request.outputBuffers
                     ? (owner?.terminalBatchTarget(2 * target) ?? target)
                     : target,
-                  readWindowBytes: terminalFull ? 64 * 1024 * 1024 : 0,
+                  boundedMemory: true,
+                  readWindowBytes: terminalFull ? runtime.sourceWindow(rel.id) : 0,
                   ...(output === undefined
                     ? {}
                     : {
@@ -508,6 +616,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                           owner?.admitDictionary(dictionary) ?? false,
                         borrowOutputOnRefusal: true,
                       }),
+                  ...(rowsNeeded === undefined ? {} : { rowsNeeded }),
                 });
                 runtime.onAbort(() => scan.abort());
                 const source: BatchSource = {
@@ -561,7 +670,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               samePhysicalType(expr.type, after.type)
             );
           });
-        return (runtime, downstream, stops) => {
+        return (runtime, downstream, stops, rowsNeeded) => {
+          if (rel.op === "limit" && runtime.bounds(rel).limit === 0) return downstream.finish();
           const owner =
             runtime.request.outputBuffers && identity
               ? downstream instanceof ResultSink
@@ -571,7 +681,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           if (owner) {
             const output = counted(runtime, rel, downstream);
             exportOwners.set(output, owner);
-            return child(runtime, output, stops);
+            return child(runtime, output, stops, rowsNeeded);
           }
           return instantiate(
             runtime,
@@ -594,7 +704,16 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 operator instanceof LimitOperator ? [...stops, () => operator.done] : stops;
               return childStops.some((stop) => stop())
                 ? operator.finish()
-                : child(runtime, operator, childStops);
+                : child(
+                    runtime,
+                    operator,
+                    childStops,
+                    operator instanceof LimitOperator
+                      ? () => operator.inputNeeded(rowsNeeded?.() ?? Infinity)
+                      : rel.op === "filter"
+                        ? undefined
+                        : rowsNeeded,
+                  );
             },
           );
         };
@@ -644,7 +763,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           );
           const minimum = orderedSetMinimumBytes(aggregate, input) + measured;
           const loanSlots = aggregate.aggregates.length + 2;
-          fixed(rel, minimum, loanSlots);
+          fixed(rel, minimum, rel.id, loanSlots);
           return (runtime, downstream) =>
             instantiate(
               runtime,
@@ -681,11 +800,37 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               },
             );
         }
+        const top = groupTops.get(rel.id);
+        const outputOptions: AggregateOptions = {
+          ...(top === undefined ? {} : { outputTopN: top }),
+          groupedDistinctBitmap: options.groupedDistinctBitmap !== false,
+          scalarByteDistinct: options.scalarByteDistinct !== false,
+          groupedUpdateFusion: options.groupedUpdateFusion !== false,
+          packedAverages: options.packedAverages === true,
+          packedIntegers: options.packedIntegers === true,
+          batchDictionaryMinMax: options.batchDictionaryMinMax === true,
+        };
+        const domain =
+          options.domainCountSum !== false &&
+          rel.op === "aggregate" &&
+          aggregate.groupingSets === null &&
+          supportsDomainCountSum(aggregate, { input }, outputOptions)
+            ? domainSource(rel)
+            : null;
+        if (domain !== null) {
+          const source = readSources.get(domain.scan.id);
+          if (source === undefined) throw new TypeError("Missing domain scan recipe");
+          readSources.set(domain.scan.id, { ...source, domainColumn: domain.column });
+          domainPlans++;
+        }
         const minimum = measureCompilerBuffers(
           compilation,
           input,
           BATCH_ROWS,
-          (context, grant) => new AggregateOperator(aggregate, context, grant, DISCARD),
+          (context, grant) =>
+            domain === null
+              ? new AggregateOperator(aggregate, context, grant, DISCARD, outputOptions)
+              : new DomainCountSumOperator(aggregate, context, grant, DISCARD, outputOptions),
           (operator) => operator.abort(undefined),
         );
         fixed(rel, Math.max(4096, minimum));
@@ -696,10 +841,32 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             input,
             minimum,
             BATCH_ROWS,
-            (context, grant) =>
-              new AggregateOperator(aggregate, context, grant, counted(runtime, rel, downstream), {
+            (context, grant) => {
+              const config = {
                 signal: runtime.signal,
-              }),
+                ...outputOptions,
+              };
+              const certificate =
+                domain === null ? undefined : runtime.sourceDomain(domain.scan.id);
+              if (certificate === undefined || certificate.column !== domain?.column)
+                return new AggregateOperator(
+                  aggregate,
+                  context,
+                  grant,
+                  counted(runtime, rel, downstream),
+                  config,
+                );
+              const operator = new DomainCountSumOperator(
+                aggregate,
+                context,
+                grant,
+                counted(runtime, rel, downstream),
+                config,
+              );
+              operator.bounds(certificate.low, certificate.high, certificate.rows);
+              operator.seal();
+              return operator;
+            },
             (operator) => {
               runtime.onAbort((reason) => operator.abort(reason));
               return child(runtime, operator, []);
@@ -708,6 +875,15 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       }
       case "sort":
       case "window": {
+        if (rel.op === "sort" && options.groupTopN !== false) {
+          const shape = groupTopNShape(rel);
+          if (shape) groupTops.set(shape.aggregate.id, shape.spec);
+        }
+        const late =
+          rel.op === "sort" && options.lateSort !== false && plan.parameters.length === 0
+            ? lateSortShape(rel)
+            : null;
+        if (late !== null && rel.op === "sort") return prepareLate(rel, late);
         const child = prepare(rel.input),
           input = types(rel.input);
         const keys =
@@ -986,15 +1162,183 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         throw new UnsupportedPlanError(`the ${rel.op} operator`, { construct: rel.op });
     }
   };
+  function prepareLate(rel: Extract<Rel, { op: "sort" }>, shape: LateSortShape): Recipe {
+    lateSortIds.add(rel.id);
+    const { project, scan, narrow, keys, locator } = shape;
+    if (ids.has(project.id))
+      throw new UnsupportedPlanError("a repeated relational operator id", { construct: "plan" });
+    ids.add(project.id);
+    const child = prepare(narrow),
+      input = types(narrow),
+      payload = types(project);
+    sortMode(input, keys);
+    const restoreTypes = [...payload, ORDINAL_TYPE];
+    sortMode(restoreTypes, [
+      { column: payload.length, direction: "asc", nulls: "last", collation: null },
+    ]);
+    const restoreIdentity: OperatorIdentity = { id: nextPhysicalId++, op: "sort", profileAs: rel };
+    const restoreMinimum = sortMinimumBytes(restoreTypes),
+      sortMinimum = sortMinimumBytes(input);
+    const fetchMinimum = (cap: number) =>
+      batchTargetFor(cap, 4) +
+      memoryScanBufferBytes(payload) +
+      BATCH_ROWS * (80 + 8 * OBJECT_OVERHEAD_BYTES) +
+      OBJECT_OVERHEAD_BYTES * (16 + 2 * payload.length);
+    readSources.set(project.id, {
+      id: project.id,
+      tableId: scan.tableId,
+      columns: scan.columns,
+      types: payload,
+      windowBytes: 0,
+      stagingBytes: memoryScanBufferBytes(payload),
+      rows: null,
+    });
+    fixed(project, fetchMinimum);
+    fixed(restoreIdentity, restoreMinimum, rel.id);
+    fixed(rel, sortMinimum);
+    return (runtime, downstream) =>
+      runtime.bounds(rel).limit === 0
+        ? downstream.finish()
+        : instantiate(
+            runtime,
+            restoreIdentity,
+            restoreTypes,
+            restoreMinimum,
+            BATCH_ROWS,
+            (_context, grant) => grant,
+            (restoreGrant) =>
+              instantiate(
+                runtime,
+                project,
+                input,
+                fetchMinimum(runtime.request.governor.capBytes),
+                BATCH_ROWS,
+                (context, grant) =>
+                  new LateFetchOperator(
+                    {
+                      onePass: options.lateFetchOnce !== false,
+                      snapshot: runtime.view,
+                      readTable: () => runtime.table(scan.tableId, grant),
+                      boundedMemory: true,
+                      pages: runtime.readPages(runtime.view.pages),
+                      tableId: scan.tableId,
+                      columns: scan.columns,
+                      types: payload,
+                      locator,
+                      compile: context,
+                      grant,
+                      restoreGrant,
+                      reads: runtime.request.reads,
+                      spill: runtime.request.spill,
+                      queryId: runtime.request.queryId,
+                      targetBytes: batchTargetFor(runtime.request.governor.capBytes, 4),
+                      signal: runtime.signal,
+                      onPipeline: () => runtime.pipeline(),
+                    },
+                    counted(runtime, project, downstream),
+                  ),
+                (fetch) => {
+                  runtime.onAbort((reason) => fetch.abort(reason));
+                  runtime.dispose(() => fetch.closed);
+                  return instantiate(
+                    runtime,
+                    rel,
+                    input,
+                    sortMinimum,
+                    BATCH_ROWS,
+                    (_context, grant) =>
+                      new SortOperator(
+                        {
+                          types: input,
+                          keys,
+                          limit: runtime.bounds(rel).limit,
+                          offset: runtime.bounds(rel).offset,
+                          withTies: false,
+                        },
+                        {
+                          grant,
+                          spill: runtime.request.spill,
+                          queryId: runtime.request.queryId,
+                          signal: runtime.signal,
+                        },
+                        counted(runtime, rel, fetch),
+                      ),
+                    (sort) => {
+                      runtime.onAbort((reason) => sort.abort(reason));
+                      runtime.dispose(() => sort.closed);
+                      return then(child(runtime, sort, []), () => {
+                        const profile = runtime.profile(rel);
+                        profile.spilledBytes = sort.profile.spilledBytes + fetch.spilledBytes;
+                        profile.spillPasses = sort.profile.mergePasses + fetch.spillPasses;
+                        runtime.profile(project).pagesRead = fetch.pagesRead;
+                        profile.rowsOut = fetch.rowsOut;
+                        profile.batchesOut = fetch.batchesOut;
+                      });
+                    },
+                  );
+                },
+              ),
+          );
+  }
   const recipe = prepare(plan.root);
-  return (runtime, sink) => {
+  // Keep this SQL strategy diagnostic until its
+  // cursor/fetch steps participate in the execution minimum and pass first-page acceptance.
+  // Explicit indexRange and SQL both require the diagnostic opt-in above.
+  const ordered = options.keyOrder === true ? orderedSort(plan) : null;
+  // Extra helper buffers must not turn a formerly admissible small-cap query into a refusal.
+  // Both strategies are capability-checked at prepare; only their execution resources differ.
+  const fallback =
+    lateSortIds.size === 0 && domainPlans === 0
+      ? null
+      : compilePlan(plan, { ...options, lateSort: false, domainCountSum: false });
+  const program: Program = (runtime, sink) => {
     runtime.resolveCall = resolveCall;
+    if (ordered !== null) {
+      const { rel, scan, project } = ordered;
+      const table = runtime.view.catalog.table(scan.tableId);
+      const index = table?.indexes.find((i) => i.id === table.primaryKey);
+      if (
+        index?.kind === "ordered" &&
+        index.unique &&
+        index.columnIds.length === rel.keys.length &&
+        ordered.keys.every((column, i) => column === index.columnIds[i])
+      ) {
+        const bounds = runtime.bounds(rel);
+        if (bounds.limit === 0) return then(runtime.reserve([]), () => sink.finish());
+        const shape: IndexShape = {
+          tableId: scan.tableId,
+          columns: ordered.columns,
+          types: types(project),
+          source: scan,
+          fetch: project,
+          restore: rel,
+          descending: rel.keys[0]?.direction === "desc",
+        };
+        const entries = indexMinimums(shape, runtime.request.governor.capBytes);
+        const inputs = integerParameterBytes(plan, runtime.request.parameters);
+        if (
+          inputs !== null &&
+          runtime.minimumBytes(entries, inputs) <= runtime.request.governor.capBytes
+        )
+          return then(runtime.reserve(entries), () =>
+            then(runIndexOrder(runtime, sink, shape, index.id, bounds.limit, bounds.offset), () => {
+              for (const projection of ordered.projects) {
+                if (projection.id === project.id) continue;
+                const profile = runtime.profile(projection),
+                  output = runtime.profile(project);
+                profile.rowsOut = output.rowsOut;
+                profile.batchesOut = output.batchesOut;
+              }
+            }),
+          );
+      }
+    }
     // LIMIT zero never opens its input. Keep capability checks at prepare, but do not reserve
     // buffers for those unreachable pipelines (including when zero is a bound parameter).
     const active = new Set<number>();
     const visit = (rel: Rel): void => {
       // Lowering stores ORDER BY's LIMIT on its sort. Zero must not open even its pools.
-      if (rel.op === "sort" && runtime.bounds(rel).limit === 0) return;
+      if ((rel.op === "sort" || rel.op === "limit") && runtime.bounds(rel).limit === 0) return;
       active.add(rel.id);
       if (rel.op === "limit" && runtime.bounds(rel).limit === 0) return;
       if (rel.op === "join") {
@@ -1003,20 +1347,93 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       } else if ("input" in rel) visit(rel.input);
     };
     visit(plan.root);
-    return then(
-      runtime.reserve(
-        admissions
-          .filter((entry) => active.has(entry.rel.id))
-          .map((entry) => ({
-            rel: entry.rel,
-            loanSlots: entry.loanSlots,
-            minimum:
-              typeof entry.minimum === "number"
-                ? entry.minimum
-                : entry.minimum(runtime.request.governor.capBytes),
-          })),
-      ),
-      () => recipe(runtime, sink, []),
-    );
+    const entries = admissions
+      .filter((entry) => active.has(entry.owner))
+      .map((entry) => ({
+        rel: entry.rel,
+        loanSlots: entry.loanSlots,
+        minimum:
+          typeof entry.minimum === "number"
+            ? entry.minimum
+            : entry.minimum(runtime.request.governor.capBytes),
+      }));
+    const demand = new Map<number, number>();
+    const findDemand = (node: Rel, need: number | null): void => {
+      if (!active.has(node.id)) return;
+      if (node.op === "scan") {
+        if (need !== null && node.filter === null) demand.set(node.id, need);
+        return;
+      }
+      if (node.op === "limit") {
+        const bound = runtime.bounds(node);
+        const count =
+          bound.limit === null ? need : need === null ? bound.limit : Math.min(need, bound.limit);
+        findDemand(node.input, count === null ? null : count + bound.offset);
+        return;
+      }
+      if (node.op === "project") {
+        findDemand(node.input, need);
+        return;
+      }
+      if (node.op === "join") {
+        findDemand(node.left, null);
+        findDemand(node.right, null);
+      } else if ("input" in node) findDemand(node.input, null);
+    };
+    findDemand(plan.root, null);
+    const sources = [...readSources.values()].filter((source) => active.has(source.id));
+    const execute = () => then(runtime.reserve(entries), () => recipe(runtime, sink, []));
+    if (sources.length === 0) return execute();
+    const bounds = new Map<number, ReadBound>();
+    const sizeSources = function* (): SlicedJob<void> {
+      const fixedMinimums = entries.map((entry) => entry.minimum);
+      let windows = true;
+      for (;;) {
+        let io = 0,
+          progress = 0;
+        bounds.clear();
+        for (const source of sources) {
+          const bound = yield* readValue(
+            boundSource(
+              runtime.view,
+              {
+                ...source,
+                windowBytes: windows ? source.windowBytes : 0,
+                rows: demand.get(source.id) ?? null,
+              },
+              runtime.request.governor,
+              runtime.signal,
+              batchTargetFor(runtime.request.governor.capBytes, 4),
+            ),
+          );
+          bounds.set(source.id, bound);
+          io = Math.max(io, bound.io);
+          progress = Math.max(progress, bound.progress);
+        }
+        for (const [index, entry] of entries.entries())
+          entry.minimum = (fixedMinimums[index] ?? 0) + (bounds.get(entry.rel.id)?.bytes ?? 0);
+        runtime.sourceBounds(bounds);
+        runtime.readMinimum(io, progress);
+        if (
+          windows &&
+          runtime.minimumBytes(entries) > runtime.request.governor.capBytes &&
+          [...bounds.values()].some((bound) => bound.windowBytes > 0)
+        ) {
+          // Coalesced export windows are optional. All sizing holds have ended: retry the
+          // ordinary bounded batch before treating the execution minimum as over-cap.
+          windows = false;
+          continue;
+        }
+        break;
+      }
+      if (fallback !== null && runtime.minimumBytes(entries) > runtime.request.governor.capBytes) {
+        runtime.sourceBounds(new Map());
+        runtime.readMinimum(0, 0);
+        return yield* readValue(fallback(runtime, sink));
+      }
+      return yield* readValue(execute());
+    };
+    return runSliced(sizeSources(), new Slice(Infinity), () => undefined);
   };
+  return Object.assign(program, { atomic: true });
 }

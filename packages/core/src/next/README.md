@@ -1213,7 +1213,10 @@ and the owner import it directly.
 ### Memory (`memory/governor.ts`)
 
 - One cap, which `usedBytes` never exceeds.
-- Pipelines are admitted with plan-bounded minimums. Admission waits; it is never refused.
+- Executions atomically admit their whole minimum: input parameters, bounded read-step and
+  resident-page space, downstream buffers, private progress credit, and one result frame.
+  FIFO admission waits while holding no partial reservation. A minimum above the whole cap
+  raises `MemoryAdmissionError`. See [the bounded read-step contract](memory/README.md).
 - A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable
   operator works inside its admitted minimum.
 - Growth is charged before it happens, including the overlap while a buffer is copied.
@@ -1230,7 +1233,9 @@ and the owner import it directly.
   outstanding loan (`LoanBackedReleaseError` otherwise).
 - `tryAdmit` admits synchronously when the minimum fits and nothing is queued (the point-read fast
   path); it never jumps a queue and otherwise returns null.
-- A progress loan larger than the reserve raises `ValueTooLargeError`. Non-spillable parameter inputs must fit normal capacity; an over-cap fixed/input admission raises `MemoryAdmissionError`.
+- Isolated legacy operator grants still use the shared reserve and its `ValueTooLargeError`.
+  Compiled executions use their own admitted progress credit instead of waiting on another
+  execution's pinned or minimum memory.
 
 ### Pipeline (`exec/pipeline.ts`)
 
@@ -1268,27 +1273,156 @@ without admitting execution grants or building breaker pools. A bound zero LIMIT
 input in both reservation and execution, including a zero stored on an ORDER BY sort.
 The active node first binds both bounds and validates OFFSET before LIMIT, once per execution;
 zero does not suppress its own negative/overflow error. Bounds in an unopened child stay
-unreached, and prepare-time capability checks still cover that input. Small compiler probes determine
+unreached, and prepare-time capability checks still cover that input. Streaming LIMIT/OFFSET passes its remaining
+row demand through projections and nested limits to TableScan. The scan bounds payload decoding
+and output, retains the unconsumed suffix of a borrowed memory chunk, and applies sparse
+predicates and deletions in vectorized ranges before bounding survivors. Separate filters and
+breakers stop demand propagation. `scripts/next-executor-bench.mts --component scan-limit`
+measures this scan/operator pair in interleaved Node CPU rounds over the real stored fixture.
+Wide top-N queries can sort keys and row locators, then read the surviving payload columns
+through TableScan in physical order. A charged, spillable ordinal sort restores SQL order.
+The initial shape is an identity projection over an unfiltered scan with at least 16 columns,
+one to four direct fixed numeric/temporal keys, and a constant LIMIT from 1 through BATCH_ROWS,
+in a parameter-free plan without WITH TIES. Its fetch reserves memory-segment staging as well
+as read/sort buffers. When the additional fixed minimums cannot fit, preparation retains the
+ordinary recipe for execution under that cap. The query's pin protects locators through
+publication and payload reads. Internal helper grants report statistics through the original
+IR operator, including the peak sum of simultaneous holdings. Winner payload reads are
+one-pass: existing cache hits remain usable, while new encoded pages, parsed directories and
+inflated pages stay private to the reader. Sparse payload leases use exact-sized buffers rather
+than rounding each column's small page up to a pooled buffer. Selection still decodes only
+sort-key columns; fetching visits winners in physical page order before restoring SQL order.
+`scripts/next-executor-bench.mts --only sort_topn_wide --whole-compare late-sort --component late-sort`
+compares both strategies in interleaved Node CPU rounds over the same committed fixture.
+The whole-query comparison includes SQL/lowering/prepare/materialized rows; the component
+times the prepared scan/sort/fetch/frame pipeline. `--whole-compare late-fetch --component late-fetch`
+compares cached and one-pass winner reads and also isolates LateFetchOperator plus ordinal
+restoration, with selection and result frames outside that component's timed samples.
+These are Node measurements.
+For aggregation, `--only agg_highcard_int,agg_3dims_20aggs,agg_count_distinct --component aggregation`
+rotates five or more CPU rounds over the stored scan/project feed, aggregation over an exact
+cloned input fixture, and the prepared full pipeline with owned result frames. The report
+records the referenced scan columns, forms of input vectors, batch sizes and frame counts.
+Input copying is outside the timed samples. The three costs are diagnostic rather than
+additive: their sinks, downstream sorting and cache/GC interactions differ. This Node adapter
+calls the executor directly; it does not measure owner worker transport.
+`--component aggregation-light` adds workload-specialized plain-TS/open-addressing baselines
+on the same decoded million-row inputs. It matches downstream sort/top-100 work in the operator
+comparison, checks every result, and rotates at least five CPU rounds with the prepared whole
+pipeline. The ordinary whole-query samples still include SQL/lowering/preparation separately.
+The wide shape compares a raw-byte fused loop, raw-byte grouping plus full-column loops, and a
+dictionary-native variant whose entry hashing, global mapping, row translation and ranking are
+timed. Numeric widening to Float64 is fixture setup; the operator keeps native input forms.
+A scan/project/discard feed measurement helps interpret the whole-query gap (the sinks are not
+additive). Its packed five-AVG state retains every independent Sx/Sxx transition; only counts for
+certified identical non-NULL row sets coincide. Integer sums use the written row-count/range
+bound in the source. Allocation and final ordering are timed; input flattening is not.
+These are optimistic fixed-workload observations, not mathematical lower bounds or proof of a
+JavaScript limit. They borrow immutable inputs and omit governor, spill, cancellation and task
+pacing. Presizing assumes the catalogue's domain bounds, and the original operator retains its
+dictionary representation. Highcard `native` certifies the actual min/max domain inside timing,
+then uses direct-address packed COUNT/SUM state; a domain wider than 2^22 values keeps the exact
+hash fallback. `split` aliases its hash baseline, and DISTINCT aliases both plain variants.
+`scripts/next-highcard-domain-bench.mts --rows 1000000 --repeats 9` isolates these highcard
+algorithms against the existing matched operator without writing or scanning a table. The probe,
+state allocation and top-100 selection are timed. This is a benchmark kernel, not an executor
+plan; it borrows immutable non-NULL int32/finite float8 inputs under the source
+cardinality/magnitude bound. Generated PGlite checks cover negative and endpoint domains, holes,
+wide-domain fallback, signed zero and exact count-desc/key-asc ordering.
+The same component script's `--candidate` flag measures the charged
+`DomainCountSumOperator`: complete decoded min/max probing, optional packed state, an exact
+disjoint hash fallback, top-N group-id selection and copying only the winners. The default
+executor selects this operator for one int32 grouping key, COUNT(*) and SUM(float8), with
+count-desc/key-asc bounded top-N, only when the pinned snapshot's complete stored-column
+statistics certify exact finite integer bounds and a safe row count. Nonempty memory segments,
+unknown bounds, computed keys and filtered sources retain ordinary aggregation. Deleted
+physical keys may widen the certificate, never exclude a visible key. Every key remains
+range-checked; a wide domain or unavailable optional credit keeps the exact general fallback.
+The read-sizing pass folds existing group-root statistics without another source scan.
+Winner buffers are admitted up front, optional table memory is released before downstream
+output, and `createExecutor({ domainCountSum: false })` retains the ordinary hash plan.
+This adds no aggregation spill implementation. The paired million-row Node component passed
+with a −55.578 ms median delta against a 51.571 ms full delta spread (9/9 favourable);
+the stored whole query passed non-regression (−27.729 ms median, 388.594 ms spread, 8/9).
+No statistically accepted whole-query gain is claimed. The committed raw pairs are in
+`scripts/bench-evidence/aggregation-paired-2026-11-08.json`.
+For the wide and highcard component drivers, `--paired --repeats 9 --warmups 10`
+times only adjacent control/candidate runs, alternating AB/BA on the same decoded fixture.
+`next-executor-bench.mts --paired --repeats 9 --whole-compare wide-typed` uses the same
+pairing for stored queries. Reports retain every CPU sample and candidate-minus-control
+delta. A component gain requires its negative median delta to exceed the complete delta
+spread (max minus min) and at least seven of nine pairs to favour the candidate. A whole
+query must have no positive median delta beyond its paired spread. Output comparison and
+profiles are outside the component timing; query materialization remains in whole timing.
+The report includes CPU samples, full spreads, checkpointed partial rounds, profiles and the
+actual transformed JS needed to interpret line-level ticks. No baseline is an executor path.
+Unbounded, value-producing `indexRange` nodes require the same internal `keyOrder:true`
+diagnostic opt-in as SQL while the cursor's separate admission remains outside the complete
+execution minimum. The default executor
+refuses them at prepare with `UnsupportedPlanError`, including under LIMIT zero. Opted-in
+nodes use the pinned index cursor and the same
+physical-order payload fetch. The internal `keyOrder:true` option lets a direct primary-key
+ORDER BY with LIMIT select this recipe
+without changing lowering's existing sort IR: the pinned catalog must have the complete,
+ordered, unique primary key in the requested byte collation and direction. Direct projections,
+including removal of a hidden order key, are supported; computed expressions and filters keep
+the generic recipe. LIMIT/OFFSET validation precedes cursor opening, and cursor requests are
+bounded by remaining demand. The SQL recipe skips OFFSET payload. Cursor cancellation closes
+once and drains an outstanding write before its output arena closes. Restore buffers retain
+their normal admitted minimum between batches, independently of repayable loans;
+physically monotonic cursor batches can stream payload
+without an ordinal sort. Otherwise the charged, spillable sort restores cursor order.
+The write-path cursor now merges stored runs and visible memory deltas lazily in key order,
+with charged bounded scratch. Its admission and read buffers remain separate from the
+executor's query-owned read minimum. The SQL shortcut stays off by default pending that
+integration and first-page performance acceptance; ordinary owner composition retains the
+scan/sort recipe. `--only scan_first_page_ordered --whole-compare key-order --component key-order`
+measures the opt-in implementation as a Node diagnostic.
+The diagnostic cursor/fetch recipe also remains outside the complete query-owned read-minimum proof used by ordinary scans.
+The optional index recipe includes integer parameter bytes when checking its fixed minimum;
+other input kinds retain the generic recipe. Zero still admits and binds all inputs through
+the normal reservation path, with no operator entries or opened input.
+Small compiler probes determine
 kernel buffer minimums; the generated allocation matrix checks them against real batch-sized
 buffers. Execute accepts caller-owned parameter values (keep them unchanged until execution ends).
 It admits the encoded inputs and active operator minimums atomically, then binds using that
 execution grant. UTF-8 buffers, mutable byte copies and numeric conversion scratch are charged
 before allocation and released on execution completion, cancellation or error. Immutable BigInt
-coefficients can be adopted. An input that cannot fit normal capacity raises the governor's
+coefficients can be adopted. An input whose complete execution minimum exceeds the whole cap raises the governor's
 `MemoryAdmissionError`; parameter inputs do not spill. Explicit `bind(values, grant)` callers
 must keep that grant alive for the bound vectors' lifetime. Computed join/sort/window arguments are projected
 into hidden columns and removed from visible results. No runtime code generation is used.
 
 The owner composition uses it by default; protocol tests over `StandinWritePath` explicitly keep
-their synthetic executor. DML, keyed nested-loop joins, index lookup/range, fetch, init plans, apply, set operations and
+their synthetic executor. DML, keyed nested-loop joins, index lookup, bounded or locator-producing
+index ranges, fetch, init plans, apply, set operations and
 recursion are still typed prepare-time refusals, as are unsupported existing kernel overloads.
 This factory does not turn those missing capabilities into current-engine fallbacks. The
 lowerer emits joins and windows for the factory; SQL catalogue tests exercise them through
 real storage and result delivery.
 
-Fixed operator buffers are reserved atomically before data-dependent state grows, so a join build
-cannot consume the later probe's admission minimum. Individual operators retain separate grants
-for growth and progress loans. Existing join/sort/window spilling remains active. Hash aggregation
+The whole execution minimum includes scan resident pages, a serialized read step, downstream
+fixed buffers, private per-breaker progress, input parameters and one result frame. Nothing is
+partially admitted while waiting for the remainder. Read leases are charged within that minimum;
+they move to the source's admitted resident-page budget before downstream memory requests.
+Sources cannot grow pinned pages into shared headroom. Optional coalesced reads fall back to
+verified ordinary reads when gaps would exceed the bounded I/O step. Retired group roots are
+released with their chunk readers rather than accumulating until snapshot release.
+
+Operators keep independent spillable growth grants. A failed growth allocation spills or runs
+at the minimum; it never waits for another execution's protected or pinned bytes. Private
+progress loans include unused fixed credit and must be repaid before another local loan.
+Cancellation wakes read/admission callers; pending reads drain before their private I/O lane
+and execution grant close. The [governor README](memory/README.md) states the liveness argument,
+external progress assumptions and the legacy isolated-grant boundary.
+Production memory reads size publication-stable byte/row prefixes through `readHint`,
+prepare charged native output buffers, and pass the complete step into `chunk`. Whole
+multi-blob values and old/new output overlap are included. The provider's conservative
+2,048-row/200-column uncompressed reference envelope is about 25.6 MiB including I/O,
+before outputs/downstream buffers, so small caps can still
+be below the admitted minimum even for small resident input. Legacy direct fixtures keep
+the borrowed API; they are not the production memory proof.
+Existing join/sort/window spilling remains active. Hash aggregation
 still has its documented refused-growth limitation until partitioned aggregation is implemented.
 Hash-join spill staging also has a known large-row defect: 600 kB build payloads at an 8 MiB
 budget can request a second progress loan. This is a bug, not an intended size limit.
@@ -1313,10 +1447,9 @@ The full interface contract includes the following (DML remains unimplemented by
   admission. Explicit `bind(values, grant)` also requires an admitted execution budget;
   `execute(request)` runs it over the access contracts: a read snapshot for a query, or an open
   `Statement` for DML, which the executor ends or rolls back. It never commits.
-- The executor admits its own pipelines with plan-bounded minimums. State that outlives a
-  pipeline is in spillable grants. A bounded step whose required loan exceeds the reserve
-  fails with `ValueTooLargeError`. Non-spillable parameter inputs must fit normal capacity;
-  an over-cap fixed/input admission raises `MemoryAdmissionError`.
+- The executor admits its whole minimum atomically, including reads and downstream progress.
+  Extra operator state is spillable. A complete minimum above the whole cap raises
+  `MemoryAdmissionError`; temporary pressure waits or spills.
 - A plan from another catalog version fails with `PlanStaleError` before anything runs.
 - Three completions: `executed` (the plan ran; for DML the statement ended), committed
   (`acknowledgeCommit()`: autocommit RETURNING waits in a charged, spillable spool until then),
@@ -1448,8 +1581,10 @@ The full interface contract includes the following (DML remains unimplemented by
   the same comparison runs on decoded values with the executor's kernels, without statistics
   pruning. Semantics are PostgreSQL's either way, so where a conjunct runs never changes the
   answer. `selectMask` (the fused dense filter and aggregate) is not called by any operator yet.
-- Memory segments are read through `memory-scan.ts` (one lent chunk at a time, zero copy), the
-  whole filter as the residual.
+- Production memory segments use `memory-scan.ts` with a publication-stable common prefix
+  and caller-owned native buffers. The whole filter remains the residual; sparse selections
+  are vectorized before LIMIT caps active output. Direct legacy fixtures can still borrow
+  one chunk at a time.
 - `table-scan.test.ts` checks generated tables (groups through the page writer, memory segments,
   deletions, columns some groups predate, values stored out of line) and filters, with pushed
   conjuncts on encoded pages or forced onto decoded values, against the same scan with pushdown
@@ -1463,7 +1598,8 @@ The full interface contract includes the following (DML remains unimplemented by
 
 - `aggregate.ts`: the `aggregate` operator. Each batch maps its rows to dense group ids, then
   every aggregate (after its FILTER and DISTINCT) updates its state. `finish` emits groups in
-  first-seen order in batches of at most 2,048 groups and about 1 MiB, each charged to the grant
+  first-seen order unless the eligible output top-N below retains only winners. Batches hold
+  at most 2,048 groups and about 1 MiB, each charged to the grant
   before it is built and released when downstream is done with it; it yields to the event loop
   with a task every 4 ms, checking the deadline per group inside AVG(NUMERIC)'s divisions and
   resuming mid-batch (it prepares at most what the next batch holds, charged by `bigintBytes`,
@@ -1472,6 +1608,18 @@ The full interface contract includes the following (DML remains unimplemented by
   after backpressure, R23), it rejects with the reason. Scratch that outlives a slice belongs to
   the operator; module-level scratch is used only within one synchronous call (R23). Without
   GROUP BY there is one row even over no input.
+- `group-top-n.ts`: eligible ORDER BY/LIMIT plans select group ids before materializing all
+  aggregate results. A charged heap holds at most LIMIT + OFFSET ids and their rank keys; the
+  existing sorter orders the winners and applies OFFSET. The first shape has one int32 grouping
+  key, COUNT/key ordering including that unique grouping key, constant positive LIMIT + OFFSET
+  up to 2,048, and only COUNT or float64 SUM results. Direct projections are allowed; HAVING,
+  computed projections, other finalizers, parameter bounds and WITH TIES keep the ordinary path.
+  All input rows still update every aggregate, preserving transition errors. Rank scans use the
+  shared task clock and release temporary vectors before yielding; cancellation closes the heap.
+  `createExecutor({ groupTopN: false })` supplies the benchmark control. This does not make hash
+  aggregation spillable or eliminate its group table. `scripts/next-agg-selection-bench.mts`
+  isolates selection and output; `next-executor-bench.mts --whole-compare group-top-n`
+  compares the real stored whole query. CPU captures belong in the caller's cache directory.
 - `groups.ts`: group ids from open-addressing tables chosen by key type — interleaved
   (key, id) tables for 32-bit and 64-bit integers (int8 by its two words, whatever its
   representation: no BigInt, no Map), an f64 table for floats, xxHash32 over bytes for text (a
@@ -1515,7 +1663,75 @@ The full interface contract includes the following (DML remains unimplemented by
   comparisons use it only while both values are safe integers, otherwise comparing exact words.
 - NUMERIC results past PostgreSQL's limits (131,072 digits before the decimal point) are 22003 at
   emission, SUM's and AVG's alike; exact intermediates may pass them and come back.
-- `distinct.ts`: exact DISTINCT through value ids and a (group, value id) set.
+- Adjacent grouped COUNT(*)/SUM(float8) and SUM(float8)/SUM(float8) over direct
+  columns use one update loop when both inputs are flat and all-valid. Each SUM keeps its own
+  state and input order. The loop stops before a non-finite result; ordinary transitions finish
+  the first aggregate before the second, preserving overflow precedence. NULL, dictionary,
+  constant, FILTER, DISTINCT and expression arguments keep separate updates. AVG is excluded:
+  no AVG state is coalesced by these pairs. These pairs cover 2/2 highcard outputs and only
+  2/21 outputs in the wide catalogue shape, whose aggregates all read different columns.
+  `createExecutor({ groupedUpdateFusion: false })` selects separate loops;
+  `next-agg-fused-update-bench.mts` measures real accumulator updates, and
+  `next-executor-bench.mts --whole-compare grouped-pairs` compares whole queries.
+- `distinct.ts`: exact DISTINCT through shared value ids. Grouped COUNT(DISTINCT) uses one
+  membership bitmap per group when its first active batch uses group ids below 64; it does not
+  hash/store each (group, value id) pair again. Values and dictionary-entry hashes stay shared.
+  Inputs starting with more groups keep the pair set. Later group growth retains bitmaps for
+  ids below 64 and uses pairs for the others, without migration or duplicate membership.
+  Scalar COUNT of TEXT, bytes, UUID and enum labels uses `scalar-byte-distinct.ts`: one
+  exact membership table with packed byte records, without dense value ids or a second seen
+  marker. A byte tag rejects most probes before loading record offsets; table growth reads
+  stored hashes in record order. Full hash matches still compare every byte. NULL is ignored; selected/constant vectors
+  preserve the first new row, and dictionary codes cache only entries actually referenced.
+  Other scalar COUNT arguments keep seen markers; other DISTINCT functions keep the pair set. Bitmap
+  arrays, headers and resize overlap are charged before allocation and returned on close or
+  failure. This does not add aggregation spill or promise lower memory for every later-growing
+  group distribution. `createExecutor({ groupedDistinctBitmap: false })` selects the control;
+  `next-executor-bench.mts --whole-compare aggregation` compares both aggregation levers and
+  can record parent/candidate CPU profiles with `--profile`.
+  Scalar byte membership also charges buffers, temporary views, headers and old/new growth
+  overlap before allocating, and owns copies of borrowed input bytes. It does not add spill or
+  guarantee smaller memory for every key width/cardinality.
+  `createExecutor({ scalarByteDistinct: false })` selects generic interning;
+  `next-scalar-distinct-bench.mts` compares the exact million-row catalogue inputs in isolation,
+  and `next-executor-bench.mts --whole-compare scalar-distinct` compares whole queries.
+  Further scalar DISTINCT experiments in the component benchmark are diagnostics only:
+  `bulk` copies whole input batches, `hashSort` radix-sorts hashes and checks byte equality,
+  `byteSort` merge-sorts exact byte keys, and `word8`/`word32` change record transport/layout.
+  None met the component median-versus-spread rule, so none is selected by the executor.
+  Sorting prototypes cover only flat, all-valid varlen input; the aligned-word prototype also
+  requires native little-endian words. These are not new supported execution paths.
+- `scripts/next-wide-typed-bench.mts --rows 1000000 --repeats 7` compares the wide
+  catalogue aggregation with its plain typed-array kernels, over already decoded inputs.
+  Every page has its own first-seen dictionary ordering. Dictionary translation, grouping,
+  transitions and final group ordering are timed; scan, storage and SQL are excluded. The
+  harness checks every result against the plain kernels and preserves AVG's Sxx transitions.
+  `scripts/wide-decoded-fixture.test.ts` also judges all 21 outputs against PostgreSQL.
+  These are Node diagnostic measurements, not browser Gate B results.
+- Wide typed-state experiments remain opt-in: the paired component median gain
+  (76.731 ms) did not exceed its 140.913 ms paired spread, despite 9/9 favourable pairs:
+  `createExecutor({ packedAverages: true, packedIntegers: true, batchDictionaryMinMax: true })`.
+  The existing dictionary-native group table remains responsible for exact key identities.
+  One kernel packs five adjacent plain float8 AVG outputs into N/Sx[5]/Sxx[5] records.
+  It certifies the entire accumulated finite prefix (at most 2^26 rows, |x| at most 2^400),
+  keeps every PostgreSQL Youngs-Cramer transition, and restores independent counts lazily
+  when masks change or a batch fails that certificate. Sx and Sxx are never reconstructed.
+  A second kernel packs eight outputs (COUNT(*), five SUM(int32), a different AVG(int32),
+  and COUNT(nullable int32)) into one 64-byte record per group. With at most 2^21 rows,
+  every integer addition stays exact within 2^52. NULL/encoded arguments, more than
+  4,096 groups or a longer input restore the ordinary exact accumulators at their original
+  update positions. FILTER, DISTINCT, ordered and expression arguments retain general paths.
+  The dictionary MIN/MAX experiment first chooses each group's batch candidate by dictionary
+  rank, then compares its bytes once with the retained winner. Scratch is bounded by the
+  group count plus one batch; it retains no input buffers or global dictionary cache.
+  The new fused kernels cover 13/21 catalogue outputs (8 integer/count and 5 float AVG);
+  text MIN uses the batch reduction, and the other outputs retain their typed kernels.
+  State buffers, restoration, resizing overlap and scratch are charged before allocation.
+  `next-wide-typed-bench.mts --strategy both --native-only --warmups 10` compares this
+  experiment with the ordinary operator and its dictionary-native plain-TS kernel.
+  `--controlled-gc` (Node `--expose-gc`) includes synchronous collection inside each CPU
+  sample as a separate diagnostic mode; ordinary samples do not force collection.
+  `next-executor-bench.mts --whole-compare wide-typed` compares the real stored queries.
 - Scan statistics hints (future; pre-sizing and AVG Sxx skipping are deferred).
   High-cardinality pre-sizing is deferred. The scan would need to supply a conservative NDV
   estimate for the grouping expressions (not merely a row count), its scope across pages and

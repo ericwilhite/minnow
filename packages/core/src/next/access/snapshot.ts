@@ -223,6 +223,8 @@ export interface GroupSegment extends SegmentBase {
   readonly staged: boolean;
   /** The group root (decoded once, cached, checksum verified when read). */
   root(): MaybePromise<GroupRoot>;
+  /** End this scan step's metadata borrow after its chunk readers close. */
+  releaseRoot?(): void;
   /**
    * The chunk of `columnId` for the format track's chunk reader, or null when the group predates
    * the column (ALTER TABLE ADD COLUMN): every row then has `ColumnDef.missing`. Requires `root()`

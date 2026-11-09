@@ -241,7 +241,7 @@ export function aggShapes(lib: ShapeLib, rows: number, only: readonly string[] =
         call("max", I32, 16, I32),
         call("sum", F64, 18, F64),
         call("sum", F64, 19, F64),
-        call("avg", D, 17, I32),
+        call("avg", F64, 17, I32),
         call("count", I64, 20, I32),
         call("min", TEXT, 21, TEXT),
         call("max", TS, 22, TS),

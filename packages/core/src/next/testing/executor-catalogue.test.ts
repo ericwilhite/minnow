@@ -1,7 +1,7 @@
 /** Frozen catalogue SQL: execute every presently lowerable shape; expose every typed refusal. */
 import fixtureData from "./executor-catalogue.json" with { type: "json" };
 import { PGlite } from "@electric-sql/pglite";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { MinnowDatabase } from "../../engine/database.js";
 import { MemoryBlockStore } from "../../storage/index.js";
 import { encodeValue } from "../../testing/differential-harness.js";
@@ -10,6 +10,10 @@ import { PlanningError } from "../lower/errors.js";
 import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
 import { assertCatalogueOrder, catalogueOrderColumns } from "./catalogue-order.js";
+import { createExecutor } from "../exec/create.js";
+import { AggregateOperator } from "../exec/agg/aggregate.js";
+import type { Batch } from "../vector/vector.js";
+import { createReach } from "../../testing/reach.js";
 import {
   CATALOGUE_REFUSALS,
   CATALOGUE_QUERY_AUTHORITY,
@@ -65,9 +69,48 @@ function originalJsonSQL(id: string, sql: string): string | null {
 const canonical = (rows: ReadonlyArray<Record<string, unknown>>) =>
   rows.map((row) => encodeValue(Object.values(row))).sort();
 
-for (const dataset of ["wide", "retail", "star"])
-  it(`executes the ${dataset} catalogue through actual storage and records unsupported planning`, async () => {
+for (const [dataset, packed] of [
+  ["wide", false],
+  ["wide", true],
+  ["retail", false],
+  ["star", false],
+] as const)
+  it(`executes the ${dataset} catalogue through actual storage and records unsupported planning${packed ? " (packed wide state)" : ""}`, async () => {
     const core = await new StorageCore(32).open();
+    const executor = createExecutor({
+      packedAverages: packed,
+      packedIntegers: packed,
+      batchDictionaryMinMax: packed,
+    });
+    core.executor.prepare = executor.prepare.bind(executor);
+    const reach = packed
+      ? createReach("packed SQL catalogue", [
+          "write path",
+          "lowered",
+          "packed float AVG",
+          "packed integers",
+          "all PG columns",
+          "current engine",
+        ])
+      : null;
+    reach?.beginHistory();
+    let activeQuery = "";
+    const packedRows = new Map<string, { average: number; integer: number }>();
+    // Explicit receiver below; do not bind this method to the prototype.
+    const originalPush = AggregateOperator.prototype.push; // eslint-disable-line @typescript-eslint/unbound-method
+    const spy = packed
+      ? vi.spyOn(AggregateOperator.prototype, "push").mockImplementation(function (
+          this: AggregateOperator,
+          batch: Batch,
+        ) {
+          const result = originalPush.call(this, batch);
+          packedRows.set(activeQuery, {
+            average: this.packedAverageRows,
+            integer: this.packedIntegerRows,
+          });
+          return result;
+        })
+      : null;
     // PGlite's default timestamp-without-zone parser constructs a host-local Date. The new
     // core's fixed session timezone is UTC; adapt the wire representation without shifting SQL
     // wall-clock fields, and keep DATE as PostgreSQL's text instead of a host-local midnight.
@@ -142,6 +185,7 @@ for (const dataset of ["wide", "retail", "star"])
         );
         expect(canonical(oracleRows(grouped))).toEqual(canonical(ordered.rows));
       }
+      reach?.reach("write path");
       if (dataset === "wide")
         expect(
           (
@@ -170,6 +214,7 @@ for (const dataset of ["wide", "retail", "star"])
           expect(authority.rows, query.id).toEqual([{ width: "30" }]);
           expect((await current.query(query.sql)).rows, query.id).toEqual(authority.rows);
         }
+        activeQuery = query.id;
         const expectedRefusal = CATALOGUE_REFUSALS[query.id];
         let prepared: ReturnType<StorageCore["prepare"]>;
         let result: Awaited<ReturnType<StorageCore["execute"]>>;
@@ -257,6 +302,16 @@ for (const dataset of ["wide", "retail", "star"])
           canonical(legacy.rows),
           `${query.id} against independent PostgreSQL${witnessSQL === undefined ? "" : " R21 witness"}`,
         ).toEqual(canonical(legacyExpected));
+        if (packed && query.id === "agg_3dims_20aggs") {
+          reach?.reach("lowered");
+          const rows = packedRows.get(query.id);
+          expect(rows?.average ?? 0).toBeGreaterThan(0);
+          expect(rows?.integer ?? 0).toBeGreaterThan(0);
+          reach?.reach("packed float AVG");
+          reach?.reach("packed integers");
+          reach?.reach("all PG columns");
+          reach?.reach("current engine");
+        }
         compiled.push(query.id);
       }
       const cells = FIXTURE.queries.filter((query) => query.dataset === dataset);
@@ -271,6 +326,7 @@ for (const dataset of ["wide", "retail", "star"])
           .map((query) => query.id),
       );
       expect(compiled.length + refused.length).toBe(cells.length);
+      reach?.assertReached();
       console.info(
         JSON.stringify({
           lane: "Node correctness",
@@ -290,6 +346,7 @@ for (const dataset of ["wide", "retail", "star"])
         }),
       );
     } finally {
+      spy?.mockRestore();
       await current.close();
       await pg.close();
       await core.close();

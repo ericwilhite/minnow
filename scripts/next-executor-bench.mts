@@ -7,11 +7,12 @@
  * Run under node --cpu-prof as well for a separately labelled whole-process diagnostic.
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { pairedCPU } from "./lib/paired-cpu.mts";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
-import { cpus, homedir, loadavg, tmpdir } from "node:os";
-import { pathToFileURL } from "node:url";
+import { cpus, loadavg, tmpdir } from "node:os";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Session } from "node:inspector/promises";
 import {
   StorageCore,
@@ -53,17 +54,25 @@ interface Catalogue {
   sqlFor(query: CatalogueQuery, engine: string, rows: number): string;
 }
 const args = process.argv.slice(2);
+const paired = args.includes("--paired");
 const option = (name: string, fallback: string) => {
   const k = args.indexOf(name);
   return k < 0 ? fallback : (args[k + 1] ?? fallback);
 };
 const total = Number(option("--rows", "1000000")),
   rounds = Number(option("--repeats", "5"));
-if (!Number.isSafeInteger(total) || total < 1 || !Number.isSafeInteger(rounds) || rounds < 5)
+if (
+  !Number.isSafeInteger(total) ||
+  total < 1 ||
+  !Number.isSafeInteger(rounds) ||
+  rounds < (paired ? 9 : 5)
+)
   throw new RangeError("positive rows and at least five CPU rounds required");
 const harness = resolve(
-  option("--harness", join(homedir(), ".local/share/minnow-plan/analytics-harness")),
+  option("--harness", fileURLToPath(new URL("./next-executor-workload/", import.meta.url))),
 );
+const generatorPath = join(harness, args.includes("--harness") ? "gen.js" : "gen.mjs"),
+  cataloguePath = join(harness, args.includes("--harness") ? "queries.js" : "queries.mjs");
 const only = new Set(option("--only", "").split(",").filter(Boolean));
 const profileId = option("--profile", "");
 const frozenSQL = args.includes("--frozen");
@@ -95,14 +104,22 @@ const committed = frozenSQL
       >;
     })
   : null;
-const generator = (await import(pathToFileURL(join(harness, "gen.js")).href)) as Generator;
-const catalogue = (await import(pathToFileURL(join(harness, "queries.js")).href)) as Catalogue;
+const generator = (await import(pathToFileURL(generatorPath).href)) as Generator;
+const catalogue = (await import(pathToFileURL(cataloguePath).href)) as Catalogue;
 const core = await new StorageCore(8192).open();
+const lateSort = option("--late-sort", "on") !== "off";
+const keyOrder = option("--key-order", "on") !== "off";
+core.executor.prepare = createExecutor({ lateSort, keyOrder, domainCountSum: false }).prepare;
 const spec = generator.wideSpec(200);
 const metadata = {
   lane: "Node",
   sqlCorrections: frozenSQL ? ["S_q7", "guide-4", "guide-5"] : dataset === "star" ? ["S_q7"] : [],
+  lateSort,
+  keyOrder,
   revision: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+  workingTreePatchSha256: createHash("sha256")
+    .update(execFileSync("git", ["diff", "HEAD"]))
+    .digest("hex"),
   storage: "MemoryBackend + extent space + WritePathImpl, strict commits, flushed",
   dataset,
   rows: dataset === "wide" ? total : null,
@@ -123,11 +140,39 @@ const metadata = {
   sourceHashes: Object.fromEntries(
     await Promise.all(
       [
-        join(harness, "gen.js"),
-        join(harness, "queries.js"),
+        resolve("scripts/next-executor-bench.mts"),
+        resolve("scripts/lib/paired-cpu.mts"),
+        resolve("scripts/next-executor-components.mts"),
+        resolve("scripts/next-late-fetch-component.mts"),
+        resolve("scripts/next-aggregation-components.mts"),
+        resolve("scripts/next-scalar-distinct-bench.mts"),
+        resolve("scripts/next-aggregation-light.mts"),
+        resolve("scripts/lib/aggregation-light-kernels.mts"),
+        resolve("packages/core/dist/next/hash/xxhash32.js"),
+        resolve("packages/core/dist/next/page/read-bounds.js"),
+        resolve("packages/core/dist/next/page/domain-certificate.js"),
+        generatorPath,
+        cataloguePath,
         resolve("apps/site/bench/benchmark.ts"),
         resolve("packages/core/src/next/testing/executor-catalogue.json"),
-        resolve("scripts/next-executor-bench.mts"),
+
+        ...[
+          "plan",
+          "limit",
+          "table-scan",
+          "memory-scan",
+          "key-order",
+          "late-fetch",
+          "agg/aggregate",
+          "agg/domain-count-sum",
+          "agg/group-top-n",
+          "agg/groups",
+          "agg/states",
+          "agg/packed-averages",
+          "agg/packed-integers",
+          "agg/distinct",
+          "agg/scalar-byte-distinct",
+        ].map((name) => resolve(`packages/core/dist/next/exec/${name}.js`)),
       ].map(async (file) => [
         file,
         createHash("sha256")
@@ -438,7 +483,7 @@ try {
         if (last.rows !== warm.rows || last.checksum !== warm.checksum)
           throw new Error("baseline result changed across CPU rounds");
       }
-      if (profileId === "all" || profileId === query.id) {
+      if (profileId === "all" || profileId.split(",").includes(query.id)) {
         const profiler = new Session();
         profiler.connect();
         await profiler.post("Profiler.enable");
@@ -454,6 +499,202 @@ try {
       }
       const sorted = [...samples].sort((a, b) => a - b),
         median = sorted[sorted.length >>> 1] ?? NaN;
+      let wholeComparison = null;
+      if (
+        [
+          "late-sort",
+          "key-order",
+          "late-fetch",
+          "group-top-n",
+          "grouped-distinct",
+          "scalar-distinct",
+          "grouped-pairs",
+          "wide-typed",
+          "highcard-domain",
+          "structural",
+          "aggregation",
+        ].includes(option("--whole-compare", "")) &&
+        (option("--whole-compare", "") !== "late-fetch" || query.id === "sort_topn_wide")
+      ) {
+        const saved = core.executor.prepare;
+        const comparison =
+          option("--whole-compare", "") === "structural"
+            ? query.id === "agg_highcard_int"
+              ? "highcard-domain"
+              : "wide-typed"
+            : option("--whole-compare", "");
+        const strategies = [
+          createExecutor(
+            comparison === "wide-typed"
+              ? {
+                  packedAverages: false,
+                  packedIntegers: false,
+                  batchDictionaryMinMax: false,
+                  domainCountSum: false,
+                }
+              : comparison === "highcard-domain"
+                ? { domainCountSum: false }
+                : comparison === "grouped-pairs"
+                  ? { groupedUpdateFusion: false }
+                  : comparison === "scalar-distinct"
+                    ? { scalarByteDistinct: false }
+                    : comparison === "aggregation"
+                      ? { groupTopN: false, groupedDistinctBitmap: false }
+                      : comparison === "grouped-distinct"
+                        ? { groupedDistinctBitmap: false }
+                        : comparison === "group-top-n"
+                          ? { groupTopN: false }
+                          : comparison === "key-order"
+                            ? { keyOrder: false }
+                            : comparison === "late-fetch"
+                              ? { lateFetchOnce: false }
+                              : { lateSort: false },
+          ),
+          createExecutor(
+            comparison === "wide-typed"
+              ? {
+                  packedAverages: true,
+                  packedIntegers: true,
+                  batchDictionaryMinMax: true,
+                  domainCountSum: false,
+                }
+              : comparison === "highcard-domain"
+                ? { domainCountSum: true }
+                : comparison === "key-order"
+                  ? { keyOrder: true }
+                  : {},
+          ),
+        ];
+        const before: number[] = [],
+          after: number[] = [],
+          order: string[] = [];
+        let beforeProfile = last.profile,
+          afterProfile = last.profile;
+        try {
+          for (const strategy of strategies) {
+            core.executor.prepare = strategy.prepare;
+            const result = await consume();
+            if (
+              result.rows !== warm.rows ||
+              result.checksum !== warm.checksum ||
+              (paired && result.digest !== warm.digest)
+            )
+              throw new Error("whole-query comparison warmups differ");
+          }
+          if (profileId.split(",").includes(query.id)) {
+            for (let index = 0; index < strategies.length; index++) {
+              const strategy = strategies[index];
+              if (!strategy) throw new Error("profile policy");
+              core.executor.prepare = strategy.prepare;
+              const profiler = new Session();
+              profiler.connect();
+              await profiler.post("Profiler.enable");
+              await profiler.post("Profiler.setSamplingInterval", { interval: 100 });
+              await profiler.post("Profiler.start");
+              const result = await consume();
+              const { profile } = await profiler.post("Profiler.stop");
+              profiler.disconnect();
+              if (
+                result.rows !== warm.rows ||
+                result.checksum !== warm.checksum ||
+                (paired && result.digest !== warm.digest)
+              )
+                throw new Error("profile policy changed output");
+              await writeFile(
+                join(cache, `${query.id}.${index === 0 ? "before" : "after"}.cpuprofile`),
+                JSON.stringify(profile),
+              );
+            }
+          }
+          for (let round = 0; round < rounds; round++)
+            for (const late of round % 2 === 0 ? [false, true] : [true, false]) {
+              const strategy = strategies[late ? 1 : 0];
+              if (!strategy) throw new Error("missing comparison strategy");
+              core.executor.prepare = strategy.prepare;
+              const started = process.cpuUsage();
+              const result = await consume();
+              const used = process.cpuUsage(started);
+              (late ? after : before).push((used.user + used.system) / 1000);
+              if (
+                result.rows !== warm.rows ||
+                result.checksum !== warm.checksum ||
+                (paired && result.digest !== warm.digest)
+              )
+                throw new Error("whole-query comparison lost rows or changed checksum");
+              if (late) afterProfile = result.profile;
+              else beforeProfile = result.profile;
+              order.push(
+                comparison === "wide-typed"
+                  ? late
+                    ? "packed-averages-batch-dictionary"
+                    : "separate-states"
+                  : comparison === "highcard-domain"
+                    ? late
+                      ? "certified-direct-domain"
+                      : "general-hash"
+                    : comparison === "grouped-pairs"
+                      ? late
+                        ? "fused-grouped-pairs"
+                        : "separate-grouped-updates"
+                      : comparison === "scalar-distinct"
+                        ? late
+                          ? "scalar-byte-membership"
+                          : "scalar-value-interning"
+                        : comparison === "aggregation"
+                          ? late
+                            ? "aggregation-default"
+                            : "aggregation-control"
+                          : comparison === "grouped-distinct"
+                            ? late
+                              ? "bitmaps-enabled"
+                              : "pair-set-control"
+                            : comparison === "group-top-n"
+                              ? late
+                                ? "selected-groups"
+                                : "all-groups"
+                              : comparison === "key-order"
+                                ? late
+                                  ? "index-cursor"
+                                  : "scan-sort-locators"
+                                : comparison === "late-fetch"
+                                  ? late
+                                    ? "one-pass-payload"
+                                    : "cached-payload"
+                                  : late
+                                    ? "keys-and-locators"
+                                    : "full-payload",
+              );
+              console.error(
+                JSON.stringify({ id: query.id, comparison: true, round, late, load: loadavg() }),
+              );
+            }
+        } finally {
+          core.executor.prepare = saved;
+        }
+        const distribution = (values: readonly number[]) => {
+          const sorted = [...values].sort((a, b) => a - b);
+          return {
+            samples: values,
+            median: sorted[sorted.length >>> 1] ?? NaN,
+            spread: (sorted.at(-1) ?? 0) - (sorted[0] ?? 0),
+          };
+        };
+        const baseline = distribution(before),
+          candidate = distribution(after);
+        wholeComparison = {
+          lane: "Node",
+          strategy: comparison,
+          paired: paired ? pairedCPU(before, after) : null,
+          rounds,
+          order,
+          timing: metadata.timing,
+          before: { ...baseline, profile: beforeProfile },
+          after: { ...candidate, profile: afterProfile },
+          medianDeltaMs: baseline.median - candidate.median,
+          // Historical unpaired diagnostic only; requested paired acceptance uses paired above.
+          regressionWithinParentSpread: candidate.median <= baseline.median + baseline.spread,
+        };
+      }
       const record = {
         id: query.id,
         status: "executed",
@@ -468,6 +709,7 @@ try {
         rows: last.rows,
         checksum: last.checksum,
         profile: last.profile,
+        wholeComparison,
         load: loadavg(),
       };
       records.push(record);
@@ -484,6 +726,47 @@ try {
     }
   }
   await writeFile(join(cache, "baseline.json"), JSON.stringify({ ...metadata, records }, null, 2));
+  // Run components only AFTER whole-query timing/profile, so their extra warmups cannot bias it.
+  if (["aggregation", "aggregation-light"].includes(option("--component", ""))) {
+    const { aggregationComponents } = await import(
+      pathToFileURL(resolve("scripts/next-aggregation-components.mts")).href
+    );
+    const components = await aggregationComponents(
+      core,
+      rounds,
+      queries.map((query) => ({
+        id: query.id,
+        sql: catalogue.sqlFor(query, "minnow", total),
+      })),
+      option("--component", "") === "aggregation-light" ? cache : undefined,
+    );
+    await writeFile(join(cache, "component-aggregation.json"), JSON.stringify(components, null, 2));
+    console.log(JSON.stringify(components));
+  }
+
+  if (option("--component", "") === "scan-limit") {
+    const { scanLimitComponent } = await import(
+      pathToFileURL(resolve("scripts/next-executor-components.mts")).href
+    );
+    const component = await scanLimitComponent(
+      core,
+      rounds,
+      option("--component-profile", "") === "1"
+        ? join(cache, "scan-limit-full-batch.cpuprofile")
+        : null,
+    );
+    await writeFile(join(cache, "component-scan-limit.json"), JSON.stringify(component, null, 2));
+    console.log(JSON.stringify(component));
+  }
+  if (["late-sort", "key-order", "late-fetch", "group-top-n"].includes(option("--component", ""))) {
+    const { lateSortComponent } = await import(
+      pathToFileURL(resolve("scripts/next-executor-components.mts")).href
+    );
+    const kind = option("--component", "late-sort");
+    const component = await lateSortComponent(core, rounds, kind);
+    await writeFile(join(cache, `component-${kind}.json`), JSON.stringify(component, null, 2));
+    console.log(JSON.stringify(component));
+  }
 } finally {
   await core.close();
 }

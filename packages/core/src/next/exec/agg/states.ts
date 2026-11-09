@@ -98,6 +98,17 @@ export interface Accumulator {
   fusedValues?(vector: Vector, rows: Uint16Array, count: number): Float64Array | null;
   /** Adds `count` values whose exact total is `total` (after `fusedValues`). */
   addFused?(total: number, count: number): void;
+  /** Restore a certified exact-int32 prefix into a fresh ordinary accumulator.
+   * Its sums are exact integers within ±2^52; counts are exact and masks matched.
+   * Internal packed-state promotion only; never combines float transition states.
+   */
+  restoreIntegerPrefix?(
+    state: Float64Array,
+    stride: number,
+    valueOffset: number,
+    countOffset: number,
+    groups: number,
+  ): void;
 }
 
 /** The f64 part of an exact sum stays within ±LIMIT so every addition of a value ≤ LIMIT is exact. */
@@ -226,6 +237,28 @@ class CountAccumulator implements Accumulator {
       const g = scalar ? 0 : (gids[i] ?? 0);
       counts[g] = (counts[g] ?? 0) + bit;
     }
+  }
+  /** Restore the exact counts from a packed integer prefix. */
+  restoreIntegerPrefix(
+    state: Float64Array,
+    stride: number,
+    valueOffset: number,
+    _countOffset: number,
+    groups: number,
+  ): void {
+    this.grow(groups);
+    for (let g = 0; g < groups; g++) this.#counts[g] = state[g * stride + valueOffset] ?? 0;
+  }
+
+  /** Borrow COUNT(*) state only for a synchronous, independent float SUM update. */
+  updateWithSum(
+    sum: FloatSumAccumulator,
+    vector: Vector,
+    gids: Int32Array,
+    rows: Uint16Array,
+    count: number,
+  ): boolean {
+    return this.star && sum.updateCounted(this.#counts, vector, gids, rows, count);
   }
   /** Counts as plain numbers (AVG reads them). */
   count(g: number): number {
@@ -627,6 +660,24 @@ class IntegerSumAccumulator implements Accumulator {
     this.#sums.grow(groups);
     this.#counts?.grow(groups);
   }
+  restoreIntegerPrefix(
+    state: Float64Array,
+    stride: number,
+    valueOffset: number,
+    countOffset: number,
+    groups: number,
+  ): void {
+    this.grow(groups);
+    let bound = 0;
+    for (let g = 0; g < groups; g++) {
+      const sum = state[g * stride + valueOffset] ?? 0;
+      this.#sums.sums[g] = sum;
+      this.#sums.has[g] = (state[g * stride + countOffset] ?? 0) > 0 ? 1 : 0;
+      bound = Math.max(bound, Math.abs(sum));
+    }
+    this.#sums.bound = bound;
+    this.#counts?.restoreIntegerPrefix(state, stride, countOffset, countOffset, groups);
+  }
   update(
     vector: Vector | null,
     gids: Int32Array,
@@ -983,6 +1034,80 @@ function averageDense(
   return k;
 }
 
+/** Dense pair loops stop before committing either state at the first non-finite result. */
+function countedSumDense(
+  counts: Float64Array,
+  sums: Float64Array,
+  has: Uint8Array,
+  values: Float64Array,
+  gids: Int32Array,
+  rows: Uint16Array,
+  count: number,
+): number {
+  let k = 0;
+  for (; k < count; k++) {
+    const i = rows[k] ?? 0,
+      g = gids[i] ?? 0,
+      next = (sums[g] ?? 0) + (values[i] ?? 0);
+    if (next - next !== 0) break;
+    counts[g] = (counts[g] ?? 0) + 1;
+    sums[g] = next;
+    has[g] = 1;
+  }
+  return k;
+}
+function twoSumsDense(
+  sums: Float64Array,
+  has: Uint8Array,
+  other: Float64Array,
+  otherHas: Uint8Array,
+  values: Float64Array,
+  otherValues: Float64Array,
+  gids: Int32Array,
+  rows: Uint16Array,
+  count: number,
+): number {
+  let k = 0;
+  for (; k < count; k++) {
+    const i = rows[k] ?? 0,
+      g = gids[i] ?? 0,
+      a = (sums[g] ?? 0) + (values[i] ?? 0),
+      b = (other[g] ?? 0) + (otherValues[i] ?? 0);
+    if (a - a !== 0 || b - b !== 0) break;
+    sums[g] = a;
+    has[g] = 1;
+    other[g] = b;
+    otherHas[g] = 1;
+  }
+  return k;
+}
+
+/**
+ * Adjacent grouped COUNT(*)/SUM(float8) or SUM(float8)/SUM(float8) updates. Callers must
+ * supply plain direct-column arguments with no FILTER/DISTINCT; eligibility is checked before
+ * changing any state. NULL, encoded and float4 inputs keep the ordinary accumulator path.
+ * Every SUM retains its own state: differing past NULL masks do not prevent a later dense batch
+ * from qualifying. No AVG count/mask/Sxx state is shared; no input reference survives this call.
+ */
+export function updateGroupedPair(
+  first: Accumulator,
+  second: Accumulator,
+  left: Vector | null,
+  right: Vector | null,
+  gids: Int32Array,
+  rows: Uint16Array,
+  count: number,
+): boolean {
+  if (!(second instanceof FloatSumAccumulator) || right === null) return false;
+  if (first instanceof CountAccumulator && left === null)
+    return first.updateWithSum(second, right, gids, rows, count);
+  return (
+    first instanceof FloatSumAccumulator &&
+    left !== null &&
+    first.updateTogether(second, left, right, gids, rows, count)
+  );
+}
+
 class FloatSumAccumulator implements Accumulator {
   readonly #memory: Charged;
   #sums: Float64Array = new Float64Array(0);
@@ -1055,6 +1180,68 @@ class FloatSumAccumulator implements Accumulator {
     }
     if (k < count) this.#exact(values, validity, gids, rows, k, count, scalar, float32);
   }
+  /** COUNT(*) plus SUM(float8), with independent state and the original row order. */
+  updateCounted(
+    counts: Float64Array,
+    vector: Vector,
+    gids: Int32Array,
+    rows: Uint16Array,
+    count: number,
+  ): boolean {
+    if (
+      this.average ||
+      this.type.kind !== "float64" ||
+      vector.form !== "flat" ||
+      vector.data.layout !== "f64" ||
+      vector.validity !== null
+    )
+      return false;
+    const values = vector.data.values,
+      sums = this.#sums,
+      has = this.#has;
+    const k = countedSumDense(counts, sums, has, values, gids, rows, count);
+    // The ordinary COUNT runs before the whole SUM. Finish its suffix before SUM can throw.
+    for (let j = k; j < count; j++) {
+      const g = gids[rows[j] ?? 0] ?? 0;
+      counts[g] = (counts[g] ?? 0) + 1;
+    }
+    if (k < count) this.#exact(values, null, gids, rows, k, count, false, false);
+    return true;
+  }
+
+  /** Two plain SUM(float8)s. The first aggregate's errors still precede the second's. */
+  updateTogether(
+    other: FloatSumAccumulator,
+    left: Vector,
+    right: Vector,
+    gids: Int32Array,
+    rows: Uint16Array,
+    count: number,
+  ): boolean {
+    if (
+      this === other ||
+      this.average ||
+      other.average ||
+      this.type.kind !== "float64" ||
+      other.type.kind !== "float64" ||
+      left.form !== "flat" ||
+      right.form !== "flat" ||
+      left.data.layout !== "f64" ||
+      right.data.layout !== "f64" ||
+      left.validity !== null ||
+      right.validity !== null
+    )
+      return false;
+    const a = left.data.values,
+      b = right.data.values;
+    const k = twoSumsDense(this.#sums, this.#has, other.#sums, other.#has, a, b, gids, rows, count);
+    if (k < count) {
+      this.#exact(a, null, gids, rows, k, count, false, false);
+      other.#exact(b, null, gids, rows, k, count, false, false);
+    }
+    return true;
+  }
+
   /**
    * AVG(float4 / float8): PostgreSQL's float8_accum, in float8. N += 1, Sx += v, and from the
    * second value Sxx += (v·N − Sx)² / (N·(N − 1)); an infinite Sx or Sxx is 22003 when the old Sx
@@ -1750,10 +1937,13 @@ class MinMaxAccumulator implements Accumulator {
   #positionEpoch: Int32Array = new Int32Array(0);
   /** Bumped when positions go stale: a new ranking, or a best stored outside the ranked path. */
   #epoch = 1;
+  #batchEpoch = 0;
+  #touched: Int32Array = new Int32Array(0);
   constructor(
     readonly type: PhysicalType,
     readonly max: boolean,
     charge: ByteCharge,
+    readonly batchDictionary = false,
   ) {
     if (
       type.kind === "enum" ||
@@ -1801,7 +1991,9 @@ class MinMaxAccumulator implements Accumulator {
       vector.dictionary.validity === null &&
       4 * vector.dictionary.length <= count
     ) {
-      this.#updateRanked(vector, this.#rankingOf(vector), gids, rows, count, scalar);
+      const ranking = this.#rankingOf(vector);
+      if (this.batchDictionary) this.#updateBatchRanked(vector, ranking, gids, rows, count, scalar);
+      else this.#updateRanked(vector, ranking, gids, rows, count, scalar);
       return;
     }
     const reader = readerOf(vector);
@@ -1978,6 +2170,60 @@ class MinMaxAccumulator implements Accumulator {
       }
       position[g] = r;
       positionEpoch[g] = epoch;
+    }
+  }
+
+  /** Reduce page-local dictionary ranks before touching retained values. A group's
+   * batch winner needs one exact byte comparison with its prior winner, rather than
+   * a binary search locating that prior winner in every new page's dictionary.
+   * The scratch is bounded by groups plus one batch; no global value cache is built.
+   */
+  #updateBatchRanked(
+    vector: Vector & { form: "dictionary" },
+    ranking: Ranking,
+    gids: Int32Array,
+    rows: Uint16Array,
+    count: number,
+    scalar: boolean,
+  ): void {
+    if (this.#touched.length === 0) this.#touched = this.#memory.make(Int32Array, BATCH_ROWS);
+    this.#batchEpoch = (this.#batchEpoch + 1) | 0;
+    const epoch = this.#batchEpoch;
+    if (epoch === 0) this.#positionEpoch.fill(-1);
+    const position = this.#position,
+      epochs = this.#positionEpoch,
+      touched = this.#touched,
+      codes = vector.codes,
+      rank = ranking.rank,
+      validity = vector.validity;
+    let groups = 0;
+    for (let k = 0; k < count; k++) {
+      const row = rows[k] ?? 0;
+      if (!validAt(validity, row)) continue;
+      const g = scalar ? 0 : (gids[row] ?? 0);
+      if (epochs[g] !== epoch) {
+        touched[groups++] = g;
+        epochs[g] = epoch;
+        position[g] = row;
+      } else {
+        const best = position[g] ?? 0,
+          incoming = rank[codes[row] ?? 0] ?? 0,
+          previous = rank[codes[best] ?? 0] ?? 0;
+        if (this.max ? incoming > previous : incoming < previous) position[g] = row;
+      }
+    }
+    const values = this.#values,
+      has = this.#has,
+      better = this.max ? 1 : -1;
+    for (let k = 0; k < groups; k++) {
+      const g = touched[k] ?? 0,
+        row = position[g] ?? 0,
+        slot = codes[row] ?? 0;
+      // Byte-equal ties have identical SQL value and display. They need no copy.
+      if (has[g] === 0 || compareToStored(values, g, vector.dictionary, slot) === -better) {
+        values.set(g, vector, row);
+        has[g] = 1;
+      }
     }
   }
 
@@ -2287,6 +2533,7 @@ export function accumulatorFor(
   type: PhysicalType,
   input: PhysicalType | null,
   charge: ByteCharge,
+  options: { readonly batchDictionaryMinMax?: boolean } = {},
 ): Accumulator {
   switch (fn) {
     case "count_star":
@@ -2308,7 +2555,7 @@ export function accumulatorFor(
     case "max":
       return layoutOf(type) === "i32" || layoutOf(type) === "f32" || layoutOf(type) === "f64"
         ? new NumberMinMaxAccumulator(type, fn === "max", charge)
-        : new MinMaxAccumulator(type, fn === "max", charge);
+        : new MinMaxAccumulator(type, fn === "max", charge, options.batchDictionaryMinMax);
     case "bool_and":
     case "bool_or":
       return new BoolAccumulator(type, fn === "bool_and", charge);

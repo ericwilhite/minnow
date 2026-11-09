@@ -63,8 +63,12 @@ describe("MIN/MAX by dictionary rank equals MIN/MAX by value (generated)", () =>
             const random = mulberry32(inner);
             const ranked = accumulatorFor(fn, TEXT, TEXT, UNCHARGED);
             const plain = accumulatorFor(fn, TEXT, TEXT, UNCHARGED);
+            const batched = accumulatorFor(fn, TEXT, TEXT, UNCHARGED, {
+              batchDictionaryMinMax: true,
+            });
             ranked.grow(groups);
             plain.grow(groups);
+            batched.grow(groups);
             const gids = new Int32Array(2048);
             let dictionaryEntries: string[] | null = null;
             // One entries vector and id per dictionary, kept across batches (as a chunk's pages).
@@ -130,11 +134,18 @@ describe("MIN/MAX by dictionary rank equals MIN/MAX by value (generated)", () =>
               } else if (asPlain && lastRanked) plainSince = true;
               ranked.update(vector, gids, IDENTITY, count, groups === 1);
               plain.update(flat, gids, IDENTITY, count, groups === 1);
+              batched.update(vector, gids, IDENTITY, count, groups === 1);
             }
             const ours = ranked.emit(0, groups);
             const theirs = plain.emit(0, groups);
+            const batchResult = batched.emit(0, groups);
             for (let g = 0; g < groups; g++)
               expect(valueAt(ours, g), `group ${String(g)}`).toEqual(valueAt(theirs, g));
+            for (let g = 0; g < groups; g++)
+              expect(valueAt(batchResult, g), `batch candidate group ${String(g)}`).toEqual(
+                valueAt(theirs, g),
+              );
+            batched.close();
             ranked.close();
             plain.close();
           },

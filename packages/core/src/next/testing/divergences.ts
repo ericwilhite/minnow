@@ -332,14 +332,46 @@ export function intendedDivergence(observation: DivergenceObservation): Divergen
   return DIVERGENCES.find((divergence) => divergence.matches(observation)) ?? null;
 }
 
-/** A documented result-representation decision, applied to the independent PG answer only. */
+/** Documented query compatibility/representation decisions; matchers stay specific. */
 export const QUERY_DIVERGENCES = [
   {
     id: "integer-average-float64",
     authority:
       "next/DECISIONS.md C11: AVG of integer/float inputs returns float64; AVG(NUMERIC) stays NUMERIC. PostgreSQL's pg_typeof(avg(integer)) is numeric (PGlite probe in executor-catalogue.test.ts).",
   },
+  {
+    id: "current-null-bound-refusal",
+    authority:
+      "PostgreSQL 7.6 https://www.postgresql.org/docs/18/queries-limit.html: NULL LIMIT means unlimited; NULL OFFSET means zero. Verified against PGlite by executor-key-order.test.ts. The new core follows PG; the current engine's bindBlockLimits rejects NULL as nonnumeric.",
+  },
 ] as const;
+
+/** A NULL must belong to an active bound, the refusal must come from its numeric binder,
+ * and an independent retry with equivalent finite bounds must match PG's original rows. */
+export function currentNullBoundRefusal(
+  plan: PhysicalPlan,
+  parameters: readonly unknown[],
+  error: unknown,
+  retryMatchesAuthority: boolean,
+): string | null {
+  if (
+    !retryMatchesAuthority ||
+    !(error instanceof TypeError) ||
+    error.message !== "Arithmetic and numeric aggregates require numbers" ||
+    !error.stack?.includes("bindBlockLimits")
+  )
+    return null;
+  let rel = plan.root;
+  while (rel.op === "project" && rel.exprs.every((expr) => expr.op === "column")) rel = rel.input;
+  if (rel.op !== "sort" && rel.op !== "limit") return null;
+  const slots = new Set(
+    [rel.limit, rel.offset].flatMap((bound) => (bound?.kind === "param" ? [bound.slot] : [])),
+  );
+  const nulls = parameters.flatMap((value, i) => (value === null ? [i] : []));
+  return nulls.length > 0 && nulls.every((slot) => slots.has(slot))
+    ? "current-null-bound-refusal"
+    : null;
+}
 
 /** Trace an unchanged output position to the aggregate that produced it. Computed expressions,
  * joins and other transformations are deliberately outside this representation rule. */

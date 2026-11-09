@@ -3,7 +3,7 @@ import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach } from "../../testing/reach.js";
-import { bindParameter } from "../exec/parameters.js";
+import { bindParameter, prepareParameters } from "../exec/parameters.js";
 import { Governor, type Grant } from "../memory/governor.js";
 import type { PhysicalType } from "../types.js";
 
@@ -240,8 +240,11 @@ it("does not retain execution parameter bytes after executed while frames still 
     expect(frame).not.toBeNull();
     await execution.executed;
     expect(inputs).toHaveLength(1);
-    expect(inputs[0]?.allocated).toBe(0);
-    expect(inputs[0]?.held).toBe(0);
+    // Whole-minimum admission now includes the result account. Its shared parent can
+    // retain frame bytes, but none of the parameter allocation may survive executed.
+    const binding = await prepareParameters(prepared.plan, ["p".repeat(128)]);
+    expect(inputs[0]?.allocated).toBeLessThan(binding.bytes);
+    expect(inputs[0]?.held).toBeLessThanOrEqual(1 << 20);
     expect(governor.usedBytes).toBeGreaterThan(0);
   } finally {
     frame?.release();

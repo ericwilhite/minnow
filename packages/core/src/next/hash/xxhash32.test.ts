@@ -2,7 +2,7 @@ import fc from "fast-check";
 import { afterAll, describe, expect, it } from "vitest";
 import { createReach } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
-import { WORD_READ_BYTES, XxHash32Stream, xxHash32 } from "./xxhash32.js";
+import { WORD_READ_BYTES, XxHash32Stream, xxHash32, xxHash32View } from "./xxhash32.js";
 
 const PRIME32 = 2_654_435_761;
 const ascii = (text: string): Uint8Array => new TextEncoder().encode(text);
@@ -37,7 +37,9 @@ describe("xxHash32", () => {
     [2367, 0, 0x4c8a9773],
     [2367, PRIME32, 0x6d5366f6],
   ])("matches the reference sanity vector: length %i, seed %i", (length, seed, expected) => {
-    expect(xxHash32(sanityBuffer(length), seed)).toBe(expected);
+    const bytes = sanityBuffer(length);
+    expect(xxHash32(bytes, seed)).toBe(expected);
+    expect(xxHash32View(new DataView(bytes.buffer), seed)).toBe(expected);
   });
 
   it.each([
@@ -48,7 +50,9 @@ describe("xxHash32", () => {
     ["Nobody inspects the spammish repetition", 0, 0xe2293b2f],
     ["The quick brown fox jumps over the lazy dog", 0, 0xe85ea4de],
   ])("matches the reference string vector %j seed %i", (text, seed, expected) => {
-    expect(xxHash32(ascii(text), seed)).toBe(expected);
+    const bytes = ascii(text);
+    expect(xxHash32(bytes, seed)).toBe(expected);
+    expect(xxHash32View(new DataView(bytes.buffer), seed)).toBe(expected);
   });
 
   it("hashes a subrange exactly like a copy of it, at every alignment", () => {
@@ -88,12 +92,17 @@ describe("xxHash32", () => {
           xxHash32(bytes, seed >>> 0),
         );
         expect(xxHash32(bytes, seed)).toBe(referenceXxHash32(bytes, seed >>> 0));
+        expect(xxHash32View(new DataView(bytes.buffer), seed)).toBe(
+          referenceXxHash32(bytes, seed >>> 0),
+        );
       }
   });
 
   it("refuses a range outside the input", () => {
     expect(() => xxHash32(new Uint8Array(4), 0, 2, 5)).toThrow(RangeError);
     expect(() => xxHash32(new Uint8Array(4), 0, 3, 2)).toThrow(RangeError);
+    expect(() => xxHash32View(new DataView(new ArrayBuffer(4)), 0, 2, 5)).toThrow(RangeError);
+    expect(() => xxHash32View(new DataView(new ArrayBuffer(4)), 0, 3, 2)).toThrow(RangeError);
   });
 });
 
@@ -149,7 +158,9 @@ describe("xxHash32 word reads (ruling R15.8)", () => {
     [1_048_581, 0x5db1695a],
   ])("matches the reference CLI: length %i", (length, expected) => {
     expect(WORD_READ_BYTES).toBe(256);
-    expect(xxHash32(sanityBuffer(length), 0)).toBe(expected);
+    const bytes = sanityBuffer(length);
+    expect(xxHash32(bytes, 0)).toBe(expected);
+    expect(xxHash32View(new DataView(bytes.buffer), 0)).toBe(expected);
     // The same bytes at an odd offset in a larger buffer, and at the end of it.
     const shifted = new Uint8Array(length + 7);
     shifted.set(sanityBuffer(length), 3);
@@ -195,6 +206,10 @@ describe("xxHash32 word reads (ruling R15.8)", () => {
     "word reads",
     "word reads at an odd byte offset",
     "a range ending at its buffer's end",
+    "reused view short words",
+    "reused view long words",
+    "reused view odd offset",
+    "reused view byte tail",
   ]);
   afterAll(() => {
     reach.assertReached();
@@ -245,6 +260,20 @@ describe("xxHash32 word reads (ruling R15.8)", () => {
           expect(xxHash32(view, hashSeed, start, end)).toBe(
             referenceXxHash32(bytes.slice(start, end), hashSeed),
           );
+          expect(
+            xxHash32View(
+              new DataView(view.buffer, view.byteOffset, view.byteLength),
+              hashSeed,
+              start,
+              end,
+            ),
+          ).toBe(referenceXxHash32(bytes.slice(start, end), hashSeed));
+          if (length >= 4)
+            reach.reach(
+              length < WORD_READ_BYTES ? "reused view short words" : "reused view long words",
+            );
+          if (length >= 4 && (lead + start) % 4 !== 0) reach.reach("reused view odd offset");
+          if (length % 4 !== 0) reach.reach("reused view byte tail");
         }),
         { seed, numRuns: 300 },
       );

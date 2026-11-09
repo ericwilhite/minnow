@@ -1,0 +1,25 @@
+# Executor catalogue workload
+
+The Node executor benchmark uses these committed modules by default. It needs no files in
+`~/.local/share`. Build the repository, then run:
+
+```sh
+node scripts/next-executor-bench.mts \
+  --rows 1000000 --repeats 5 --only sort_topn_wide
+```
+
+Scratch and default output use `os.tmpdir()`, which respects `TMPDIR`. To choose a temporary
+root, create it and set `TMPDIR` in the shell. `--output` accepts any caller-selected directory.
+`--harness` remains an explicit override for a compatible directory containing `gen.js` and
+`queries.js`.
+
+These are the reviewed Gate B analytics workload, copied on 2026-11-07. Original SHA-256:
+
+- `gen.js`: `6f965e234cdaf133991210cadb10e183045a9869aac61c07776b24dfc1675485`
+- `queries.js`: `89986f7190f1b661c7dbe70479a79f433cf423945ed1c86f85476288e7bbec18`
+
+Formatting was normalized and one unused string-padding helper was removed. Data and SQL
+fingerprints in `workload.test.ts` match the originals. The star data generator already lives in
+`apps/site/bench/benchmark.ts`; its query catalogue is included here too. Timing artifacts belong
+under the temporary root unless `--output` selects another directory; they are not published
+benchmark results.
