@@ -170,6 +170,7 @@ const metadata = {
           "agg/states",
           "agg/packed-averages",
           "agg/packed-integers",
+          "agg/typed-layout",
           "agg/distinct",
           "agg/scalar-byte-distinct",
         ].map((name) => resolve(`packages/core/dist/next/exec/${name}.js`)),
@@ -186,7 +187,7 @@ const metadata = {
   execArgv: process.execArgv,
   sqlSource: frozenSQL
     ? "committed executor-catalogue.json (three PG-valid ROUND corrections; frozen data)"
-    : "analytics-harness/queries.js",
+    : cataloguePath,
   harness,
 };
 console.log(JSON.stringify(metadata));
@@ -510,6 +511,7 @@ try {
           "scalar-distinct",
           "grouped-pairs",
           "wide-typed",
+          "wide-layout",
           "highcard-domain",
           "structural",
           "aggregation",
@@ -525,44 +527,50 @@ try {
             : option("--whole-compare", "");
         const strategies = [
           createExecutor(
-            comparison === "wide-typed"
-              ? {
-                  packedAverages: false,
-                  packedIntegers: false,
-                  batchDictionaryMinMax: false,
-                  domainCountSum: false,
-                }
-              : comparison === "highcard-domain"
-                ? { domainCountSum: false }
-                : comparison === "grouped-pairs"
-                  ? { groupedUpdateFusion: false }
-                  : comparison === "scalar-distinct"
-                    ? { scalarByteDistinct: false }
-                    : comparison === "aggregation"
-                      ? { groupTopN: false, groupedDistinctBitmap: false }
-                      : comparison === "grouped-distinct"
-                        ? { groupedDistinctBitmap: false }
-                        : comparison === "group-top-n"
-                          ? { groupTopN: false }
-                          : comparison === "key-order"
-                            ? { keyOrder: false }
-                            : comparison === "late-fetch"
-                              ? { lateFetchOnce: false }
-                              : { lateSort: false },
+            comparison === "wide-layout"
+              ? { typedLayout: false }
+              : comparison === "wide-typed"
+                ? {
+                    typedLayout: false,
+                    packedAverages: false,
+                    packedIntegers: false,
+                    batchDictionaryMinMax: false,
+                    domainCountSum: false,
+                  }
+                : comparison === "highcard-domain"
+                  ? { domainCountSum: false }
+                  : comparison === "grouped-pairs"
+                    ? { groupedUpdateFusion: false }
+                    : comparison === "scalar-distinct"
+                      ? { scalarByteDistinct: false }
+                      : comparison === "aggregation"
+                        ? { groupTopN: false, groupedDistinctBitmap: false }
+                        : comparison === "grouped-distinct"
+                          ? { groupedDistinctBitmap: false }
+                          : comparison === "group-top-n"
+                            ? { groupTopN: false }
+                            : comparison === "key-order"
+                              ? { keyOrder: false }
+                              : comparison === "late-fetch"
+                                ? { lateFetchOnce: false }
+                                : { lateSort: false },
           ),
           createExecutor(
-            comparison === "wide-typed"
-              ? {
-                  packedAverages: true,
-                  packedIntegers: true,
-                  batchDictionaryMinMax: true,
-                  domainCountSum: false,
-                }
-              : comparison === "highcard-domain"
-                ? { domainCountSum: true }
-                : comparison === "key-order"
-                  ? { keyOrder: true }
-                  : {},
+            comparison === "wide-layout"
+              ? { typedLayout: true }
+              : comparison === "wide-typed"
+                ? {
+                    typedLayout: false,
+                    packedAverages: true,
+                    packedIntegers: true,
+                    batchDictionaryMinMax: true,
+                    domainCountSum: false,
+                  }
+                : comparison === "highcard-domain"
+                  ? { domainCountSum: true }
+                  : comparison === "key-order"
+                    ? { keyOrder: true }
+                    : {},
           ),
         ];
         const before: number[] = [],
@@ -624,45 +632,49 @@ try {
               if (late) afterProfile = result.profile;
               else beforeProfile = result.profile;
               order.push(
-                comparison === "wide-typed"
+                comparison === "wide-layout"
                   ? late
-                    ? "packed-averages-batch-dictionary"
-                    : "separate-states"
-                  : comparison === "highcard-domain"
+                    ? "typed-record-dictionary"
+                    : "merged-separate-banks"
+                  : comparison === "wide-typed"
                     ? late
-                      ? "certified-direct-domain"
-                      : "general-hash"
-                    : comparison === "grouped-pairs"
+                      ? "packed-averages-batch-dictionary"
+                      : "separate-states"
+                    : comparison === "highcard-domain"
                       ? late
-                        ? "fused-grouped-pairs"
-                        : "separate-grouped-updates"
-                      : comparison === "scalar-distinct"
+                        ? "certified-direct-domain"
+                        : "general-hash"
+                      : comparison === "grouped-pairs"
                         ? late
-                          ? "scalar-byte-membership"
-                          : "scalar-value-interning"
-                        : comparison === "aggregation"
+                          ? "fused-grouped-pairs"
+                          : "separate-grouped-updates"
+                        : comparison === "scalar-distinct"
                           ? late
-                            ? "aggregation-default"
-                            : "aggregation-control"
-                          : comparison === "grouped-distinct"
+                            ? "scalar-byte-membership"
+                            : "scalar-value-interning"
+                          : comparison === "aggregation"
                             ? late
-                              ? "bitmaps-enabled"
-                              : "pair-set-control"
-                            : comparison === "group-top-n"
+                              ? "aggregation-default"
+                              : "aggregation-control"
+                            : comparison === "grouped-distinct"
                               ? late
-                                ? "selected-groups"
-                                : "all-groups"
-                              : comparison === "key-order"
+                                ? "bitmaps-enabled"
+                                : "pair-set-control"
+                              : comparison === "group-top-n"
                                 ? late
-                                  ? "index-cursor"
-                                  : "scan-sort-locators"
-                                : comparison === "late-fetch"
+                                  ? "selected-groups"
+                                  : "all-groups"
+                                : comparison === "key-order"
                                   ? late
-                                    ? "one-pass-payload"
-                                    : "cached-payload"
-                                  : late
-                                    ? "keys-and-locators"
-                                    : "full-payload",
+                                    ? "index-cursor"
+                                    : "scan-sort-locators"
+                                  : comparison === "late-fetch"
+                                    ? late
+                                      ? "one-pass-payload"
+                                      : "cached-payload"
+                                    : late
+                                      ? "keys-and-locators"
+                                      : "full-payload",
               );
               console.error(
                 JSON.stringify({ id: query.id, comparison: true, round, late, load: loadavg() }),

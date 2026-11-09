@@ -1,0 +1,2534 @@
+{
+  "parent": "007cb1be08db87dda0715c8e829a14b7f3d40b0b",
+  "date": "2026-11-09",
+  "lane": "Node CPU user+system; not browser Gate B",
+  "commands": {
+    "component": "TMPDIR=<scratch> node scripts/next-wide-typed-bench.mts --rows 1000000 --repeats 9 --strategy both --warmups 10 --typed-layout --paired --output <component>",
+    "whole": "TMPDIR=<scratch> node scripts/next-executor-bench.mts --dataset wide --rows 1000000 --repeats 9 --only agg_3dims_20aggs --profile agg_3dims_20aggs --whole-compare wide-layout --paired --output <whole>"
+  },
+  "control": "Merged separate-bank strategy with the dictionary-prefix cache safety correction shared by both strategies; typedLayout:false retains prior tuple loops.",
+  "candidate": "Automatic typed numeric family layout and dictionary-native tuple assignment",
+  "rule": "9 interleaved AB/BA pairs. Quartiles R type 7: interpolation at (n-1)*p. Component gain > paired IQR and >=7/9 favourable; whole query must have no accepted reverse-direction regression. No post-hoc pair removal.",
+  "decision": {
+    "operatorAcceptedGain": true,
+    "operatorMarginMs": 4.894999999999982,
+    "wholeNoAcceptedRegression": true,
+    "wholeAcceptedGain": false
+  },
+  "coverage": {
+    "numericOutputs": 20,
+    "totalOutputs": 21,
+    "componentFusedRows": 1000000,
+    "remaining": "MIN(text) ordinary dictionary candidate reduction"
+  },
+  "component": {
+    "lane": "Node isolated component",
+    "strategy": "both",
+    "controlledGC": false,
+    "warmups": 10,
+    "nativeOnly": false,
+    "record": false,
+    "layout": true,
+    "rows": 1000000,
+    "rounds": 9,
+    "paired": true,
+    "node": "v26.12.0",
+    "cpu": "Intel(R) Core(TM) i5-8279U CPU @ 2.40GHz",
+    "revision": "007cb1be08db87dda0715c8e829a14b7f3d40b0b",
+    "patchSha256": "3a6d335ba59af8b0a645bc41c6aa0d3c45b39c36d621edc9a0238fabdecc1444",
+    "sourceHashes": {
+      "scripts/next-wide-typed-bench.mts": "f1dbb5948b959c7b541b3c655544862889704e3366ca91949d97e04e1629f4b4",
+      "scripts/lib/wide-decoded-fixture.mts": "19bd9a4a8356b8b713ab40cb1e500e95044b5de09a1183da0676d33576400394",
+      "scripts/next-aggregation-light.mts": "2147032057818ece24add9593ebd60b9344bd6360b8a47ec7fb87d1b97980573",
+      "scripts/lib/paired-cpu.mts": "6c578f94613567937737d5be128634d293665fa1c87db3376324aa260873da69",
+      "scripts/lib/aggregation-light-kernels.mts": "db6b98e32b347539dbce7d94d5e7cb3f5a706934abfb57c9e92c14fa3223fa7e",
+      "packages/core/browser/next-agg-shapes.ts": "57228f8d3849eff1febec0c8fa130f2db03166c087393e66e3e425967a305354",
+      "packages/core/dist/next/exec/agg/typed-layout.js": "c8d5445ce1b008d84da56016846af8681d0b28519b768764a71907f2f946fe36",
+      "scripts/lib/wide-layout-kernel.mts": "68114b63d91aa7697a575acb1b373501761e03f40df6cd59992987f6e8cd365d",
+      "packages/core/dist/next/exec/agg/aggregate.js": "5828a8d60680fc6611bd4223febc92373d6f39bbf88b35ddcad1d976b4f0f3a2",
+      "packages/core/dist/next/exec/agg/states.js": "09780d0a424f16c852648b262302c7f39811578567ee212160827b34fd0b3a16",
+      "packages/core/dist/next/exec/agg/packed-averages.js": "3f1db7e2bde8ccbdc567cd2d4c78ce831516b863db1c6cd676008da253330606",
+      "packages/core/dist/next/exec/agg/packed-integers.js": "479493490f0afa9f05b8595614a5a61832a95aa44bae4694b695536ce8911298",
+      "packages/core/dist/next/exec/agg/groups.js": "51926ce8340184930571899d5a9201be7b436310af5f869d1d34cfa2170de5f7"
+    },
+    "fixture": "gen.js-equivalent values; 2048-row batches; first-seen page-local dictionaries; numeric widening is untimed setup",
+    "result": {
+      "id": "agg_3dims_20aggs",
+      "inputRows": 1000000,
+      "inputLayout": {
+        "numeric": "Float64, widening excluded as fixture setup",
+        "flatTextBytes": 17999463,
+        "dictionarySegments": [489, 489, 489, 489]
+      },
+      "resultRows": 1000,
+      "order": [
+        "operator",
+        "candidate",
+        "candidate",
+        "operator",
+        "operator",
+        "candidate",
+        "candidate",
+        "operator",
+        "operator",
+        "candidate",
+        "candidate",
+        "operator",
+        "operator",
+        "candidate",
+        "candidate",
+        "operator",
+        "operator",
+        "candidate"
+      ],
+      "loads": [
+        [4.31, 4.64, 6.06],
+        [4.31, 4.64, 6.06],
+        [4.31, 4.64, 6.06],
+        [4.31, 4.64, 6.06],
+        [4.31, 4.64, 6.06],
+        [4.31, 4.64, 6.06],
+        [4.31, 4.64, 6.06],
+        [4.31, 4.64, 6.06],
+        [4.31, 4.64, 6.06]
+      ],
+      "paired": {
+        "pairs": [
+          {
+            "control": 234.624,
+            "candidate": 196.418,
+            "delta": -38.20599999999999
+          },
+          {
+            "control": 261.637,
+            "candidate": 179.074,
+            "delta": -82.56299999999999
+          },
+          {
+            "control": 225.866,
+            "candidate": 162.632,
+            "delta": -63.23400000000001
+          },
+          {
+            "control": 192.634,
+            "candidate": 159.573,
+            "delta": -33.06099999999998
+          },
+          {
+            "control": 190.379,
+            "candidate": 221.914,
+            "delta": 31.534999999999997
+          },
+          {
+            "control": 191.481,
+            "candidate": 161.558,
+            "delta": -29.923000000000002
+          },
+          {
+            "control": 214.734,
+            "candidate": 162.588,
+            "delta": -52.146000000000015
+          },
+          {
+            "control": 184.696,
+            "candidate": 165.102,
+            "delta": -19.593999999999994
+          },
+          {
+            "control": 255.611,
+            "candidate": 176.991,
+            "delta": -78.61999999999998
+          }
+        ],
+        "medianDeltaMs": -38.20599999999999,
+        "q1DeltaMs": -63.23400000000001,
+        "q3DeltaMs": -29.923000000000002,
+        "iqrDeltaMs": 33.31100000000001,
+        "minDeltaMs": -82.56299999999999,
+        "maxDeltaMs": 31.534999999999997,
+        "rangeDeltaMs": 114.09799999999998,
+        "spreadDeltaMs": 114.09799999999998,
+        "favoursCandidate": 8,
+        "favoursControl": 1,
+        "requiredFavourable": 7,
+        "acceptedGain": true,
+        "significantRegression": false,
+        "noRegression": true
+      },
+      "cpuMs": {
+        "operator": {
+          "samples": [
+            234.624, 261.637, 225.866, 192.634, 190.379, 191.481, 214.734, 184.696, 255.611
+          ],
+          "median": 214.734,
+          "spread": 76.941
+        },
+        "candidate": {
+          "samples": [
+            196.418, 179.074, 162.632, 159.573, 221.914, 161.558, 162.588, 165.102, 176.991
+          ],
+          "median": 165.102,
+          "spread": 62.34099999999998
+        }
+      },
+      "componentOnly": true,
+      "limits": "Optimistic fixed-workload TS observation, not a mathematical lower bound or universal JS impossibility result. Raw bound/split read flat decoded bytes/numbers and hash every text row. Native wide consumes the original decoded dictionary segments, hashes/maps all entries and translates every row within timing, then uses packed five-AVG state. No precomputed canonical IDs/ranks. All use exact collision equality. Highcard native includes an exact full-input min/max probe and direct-address COUNT/SUM state with an exact general-hash fallback for a wide domain; highcard split and both other DISTINCT kernels alias bound (not independent algorithms). Operator keeps original scan dictionary forms and includes matching sort/top-N, copying and governor/driver/task clock. Whole is prepared pipeline/owned frames; outer harness separately measures SQL through cleanup. Feed is scan/project/discard only, not additive with the other sinks. Setup/flattening (including numeric widening to Float64) excluded; kernel allocation/state/final ordering included. Borrowed immutable inputs need no key copy; no memory governor/spill/cancellation in plain TS. AVG Sxx retained. Plain kernels are diagnostics; operator/candidate configurations are reported separately."
+    }
+  },
+  "whole": {
+    "lane": "Node",
+    "sqlCorrections": [],
+    "lateSort": true,
+    "keyOrder": true,
+    "revision": "007cb1be08db87dda0715c8e829a14b7f3d40b0b",
+    "workingTreePatchSha256": "3a6d335ba59af8b0a645bc41c6aa0d3c45b39c36d621edc9a0238fabdecc1444",
+    "storage": "MemoryBackend + extent space + WritePathImpl, strict commits, flushed",
+    "dataset": "wide",
+    "rows": 1000000,
+    "columns": 200,
+    "scale": null,
+    "rounds": 9,
+    "fixtureRowCounts": null,
+    "timing": "process user+system CPU; SQL/lower/prepare/bind/pin/execute/rows/credit/cleanup included; ingestion excluded",
+    "node": "v26.12.0",
+    "cpuModel": "Intel(R) Core(TM) i5-8279U CPU @ 2.40GHz",
+    "governorCapBytes": 268435456,
+    "sourceHashes": {
+      "/home/eric/.cache/b4-agg-paired/scripts/next-executor-bench.mts": "b35af96e2be89631b2c873ef0c2971b4cff103e2b3b626244deba880e0800d15",
+      "/home/eric/.cache/b4-agg-paired/scripts/lib/paired-cpu.mts": "6c578f94613567937737d5be128634d293665fa1c87db3376324aa260873da69",
+      "/home/eric/.cache/b4-agg-paired/scripts/next-executor-components.mts": "2d480e35e3415561a4d6bf60f383f114abf827c8f059d1ebc388d4b2b9154bc5",
+      "/home/eric/.cache/b4-agg-paired/scripts/next-late-fetch-component.mts": "41006934f3c14b8cf4c6cec95797c68ad87bb28db349bc34cffcf35621c0714d",
+      "/home/eric/.cache/b4-agg-paired/scripts/next-aggregation-components.mts": "607fb95045b3773c9e0ad25d8940a717b0ffbd23719f507608d82b8ea0761cae",
+      "/home/eric/.cache/b4-agg-paired/scripts/next-scalar-distinct-bench.mts": "46c7b4429f0576ce5b4bf2c762a1fc93b0b7fc55caa6a87e759e105675c3cc95",
+      "/home/eric/.cache/b4-agg-paired/scripts/next-aggregation-light.mts": "2147032057818ece24add9593ebd60b9344bd6360b8a47ec7fb87d1b97980573",
+      "/home/eric/.cache/b4-agg-paired/scripts/lib/aggregation-light-kernels.mts": "db6b98e32b347539dbce7d94d5e7cb3f5a706934abfb57c9e92c14fa3223fa7e",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/hash/xxhash32.js": "e1364b0c9830cfa59ce7c9c2f9480eab16a10fa2415504f021e1c725144160b4",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/page/read-bounds.js": "356a1b2ddb78ac6dcda8b0eccca1dde57e12e9c53f708d706ad7ced0400bebe2",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/page/domain-certificate.js": "4b6f94c7abd4231dfd5d35eb79e668270575065eb8106dc4d8cff809a1e77107",
+      "/home/eric/.cache/b4-agg-paired/scripts/next-executor-workload/gen.mjs": "8b3d70312ac54a87e69f2a0672ed49b024baab7cf9097d92cf6e11da0189fd95",
+      "/home/eric/.cache/b4-agg-paired/scripts/next-executor-workload/queries.mjs": "abcc9f2809d04270569fe6b9e37867978d0c4c82e8a5ea331461d6f3a37347f2",
+      "/home/eric/.cache/b4-agg-paired/apps/site/bench/benchmark.ts": "3af271201d76a77c1d8d4296f11eb1e6abbac3ecd93223daf7a40e594ed6a60e",
+      "/home/eric/.cache/b4-agg-paired/packages/core/src/next/testing/executor-catalogue.json": "3626fcbcca6d4aa0d493f7fa7ba45ea12e0ba2b9f2e0afaed62514c27d5ab52b",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/plan.js": "6412a0bb2a935064f035b7207963990c46ef0cf9ad735057c22ab2b4f66c7564",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/limit.js": "b1791d3de37fef6e6a54cfa236e1124967da49cc4b255b752803e31f2b19c205",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/table-scan.js": "ca949db38416ba9d6ce30c7eda288d38fcb70f3f5c76c3d693219829eee26eb1",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/memory-scan.js": "946b07cc043f5e89415ea89aec55751cb66b2d276e30a285c3321ab59a8f2e7d",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/key-order.js": "f42600c9435038b251339b2dda6bbfc50665d389a52da0ac4dd31ea77b37036c",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/late-fetch.js": "c917b37f809a85d16e215ff9c84762e15f7237bf6e5e839080cdc1b90fbfba53",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/aggregate.js": "5828a8d60680fc6611bd4223febc92373d6f39bbf88b35ddcad1d976b4f0f3a2",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/domain-count-sum.js": "83dec70a3a94e19d5ed5342095719dbca66a4a733c1c6eab9f295517df99c06e",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/group-top-n.js": "5ef1c1577fc14b76dd6e95386364d0bf7d1e8cd244ed3c2c9825faa6dd940096",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/groups.js": "51926ce8340184930571899d5a9201be7b436310af5f869d1d34cfa2170de5f7",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/states.js": "09780d0a424f16c852648b262302c7f39811578567ee212160827b34fd0b3a16",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/packed-averages.js": "3f1db7e2bde8ccbdc567cd2d4c78ce831516b863db1c6cd676008da253330606",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/packed-integers.js": "479493490f0afa9f05b8595614a5a61832a95aa44bae4694b695536ce8911298",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/typed-layout.js": "c8d5445ce1b008d84da56016846af8681d0b28519b768764a71907f2f946fe36",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/distinct.js": "08972c46c4050f2d48f147ad9a7db71ed4a1d73e9ad16a96c164799fe08345ca",
+      "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/scalar-byte-distinct.js": "01e6bd8904027327596f2d9d7deb291a5a255810f7184ba72f165ef12d4341a4"
+    },
+    "load": [3.24, 4.26, 5.83],
+    "profileId": "agg_3dims_20aggs",
+    "execArgv": [],
+    "sqlSource": "/home/eric/.cache/b4-agg-paired/scripts/next-executor-workload/queries.mjs",
+    "harness": "/home/eric/.cache/b4-agg-paired/scripts/next-executor-workload",
+    "records": [
+      {
+        "id": "agg_3dims_20aggs",
+        "status": "executed",
+        "cpuMs": {
+          "median": 601.994,
+          "spread": 295.18600000000004,
+          "min": 491.851,
+          "max": 787.037,
+          "samples": [
+            787.037, 771.661, 740.892, 609.38, 544.107, 601.994, 583.853, 493.231, 491.851
+          ]
+        },
+        "wallMs": [
+          559.1936140000034, 522.8358420000004, 638.9560210000054, 567.5239450000081,
+          498.3429000000033, 564.9907690000109, 552.7005869999994, 459.277774999995,
+          451.3125990000117
+        ],
+        "rows": 1000,
+        "checksum": 4000,
+        "profile": {
+          "operators": [
+            {
+              "relId": 1,
+              "op": "scan",
+              "rowsOut": 1000000,
+              "batchesOut": 489,
+              "peakHeldBytes": 3704205,
+              "spilledBytes": 0,
+              "spillPasses": 0,
+              "pagesRead": 6031,
+              "pagesPruned": 0,
+              "runtimeFilter": null
+            },
+            {
+              "relId": 2,
+              "op": "project",
+              "rowsOut": 1000000,
+              "batchesOut": 489,
+              "peakHeldBytes": 4096,
+              "spilledBytes": 0,
+              "spillPasses": 0,
+              "pagesRead": 0,
+              "pagesPruned": 0,
+              "runtimeFilter": null
+            },
+            {
+              "relId": 3,
+              "op": "aggregate",
+              "rowsOut": 1000,
+              "batchesOut": 1,
+              "peakHeldBytes": 1952932,
+              "spilledBytes": 0,
+              "spillPasses": 0,
+              "pagesRead": 0,
+              "pagesPruned": 0,
+              "runtimeFilter": null
+            },
+            {
+              "relId": 4,
+              "op": "project",
+              "rowsOut": 1000,
+              "batchesOut": 1,
+              "peakHeldBytes": 4096,
+              "spilledBytes": 0,
+              "spillPasses": 0,
+              "pagesRead": 0,
+              "pagesPruned": 0,
+              "runtimeFilter": null
+            },
+            {
+              "relId": 5,
+              "op": "sort",
+              "rowsOut": 1000,
+              "batchesOut": 1,
+              "peakHeldBytes": 4408228,
+              "spilledBytes": 0,
+              "spillPasses": 0,
+              "pagesRead": 0,
+              "pagesPruned": 0,
+              "runtimeFilter": null
+            }
+          ],
+          "pipelines": 1,
+          "memoryWaitMs": 0,
+          "peakHeldBytes": 11520273,
+          "synchronous": false
+        },
+        "wholeComparison": {
+          "lane": "Node",
+          "strategy": "wide-layout",
+          "paired": {
+            "pairs": [
+              {
+                "control": 393.898,
+                "candidate": 344.776,
+                "delta": -49.122000000000014
+              },
+              {
+                "control": 384.644,
+                "candidate": 460.48,
+                "delta": 75.83600000000001
+              },
+              {
+                "control": 386.508,
+                "candidate": 503.526,
+                "delta": 117.01800000000003
+              },
+              {
+                "control": 538.031,
+                "candidate": 358.154,
+                "delta": -179.87699999999995
+              },
+              {
+                "control": 448.17,
+                "candidate": 584.427,
+                "delta": 136.257
+              },
+              {
+                "control": 590.753,
+                "candidate": 545.011,
+                "delta": -45.742000000000075
+              },
+              {
+                "control": 618.343,
+                "candidate": 654.106,
+                "delta": 35.763000000000034
+              },
+              {
+                "control": 620.065,
+                "candidate": 532.747,
+                "delta": -87.3180000000001
+              },
+              {
+                "control": 483.131,
+                "candidate": 568.839,
+                "delta": 85.70800000000008
+              }
+            ],
+            "medianDeltaMs": 35.763000000000034,
+            "q1DeltaMs": -49.122000000000014,
+            "q3DeltaMs": 85.70800000000008,
+            "iqrDeltaMs": 134.8300000000001,
+            "minDeltaMs": -179.87699999999995,
+            "maxDeltaMs": 136.257,
+            "rangeDeltaMs": 316.13399999999996,
+            "spreadDeltaMs": 316.13399999999996,
+            "favoursCandidate": 4,
+            "favoursControl": 5,
+            "requiredFavourable": 7,
+            "acceptedGain": false,
+            "significantRegression": false,
+            "noRegression": true
+          },
+          "rounds": 9,
+          "order": [
+            "merged-separate-banks",
+            "typed-record-dictionary",
+            "typed-record-dictionary",
+            "merged-separate-banks",
+            "merged-separate-banks",
+            "typed-record-dictionary",
+            "typed-record-dictionary",
+            "merged-separate-banks",
+            "merged-separate-banks",
+            "typed-record-dictionary",
+            "typed-record-dictionary",
+            "merged-separate-banks",
+            "merged-separate-banks",
+            "typed-record-dictionary",
+            "typed-record-dictionary",
+            "merged-separate-banks",
+            "merged-separate-banks",
+            "typed-record-dictionary"
+          ],
+          "timing": "process user+system CPU; SQL/lower/prepare/bind/pin/execute/rows/credit/cleanup included; ingestion excluded",
+          "before": {
+            "samples": [
+              393.898, 384.644, 386.508, 538.031, 448.17, 590.753, 618.343, 620.065, 483.131
+            ],
+            "median": 483.131,
+            "spread": 235.42100000000005,
+            "profile": {
+              "operators": [
+                {
+                  "relId": 1,
+                  "op": "scan",
+                  "rowsOut": 1000000,
+                  "batchesOut": 489,
+                  "peakHeldBytes": 3704205,
+                  "spilledBytes": 0,
+                  "spillPasses": 0,
+                  "pagesRead": 6031,
+                  "pagesPruned": 0,
+                  "runtimeFilter": null
+                },
+                {
+                  "relId": 2,
+                  "op": "project",
+                  "rowsOut": 1000000,
+                  "batchesOut": 489,
+                  "peakHeldBytes": 4096,
+                  "spilledBytes": 0,
+                  "spillPasses": 0,
+                  "pagesRead": 0,
+                  "pagesPruned": 0,
+                  "runtimeFilter": null
+                },
+                {
+                  "relId": 3,
+                  "op": "aggregate",
+                  "rowsOut": 1000,
+                  "batchesOut": 1,
+                  "peakHeldBytes": 1889368,
+                  "spilledBytes": 0,
+                  "spillPasses": 0,
+                  "pagesRead": 0,
+                  "pagesPruned": 0,
+                  "runtimeFilter": null
+                },
+                {
+                  "relId": 4,
+                  "op": "project",
+                  "rowsOut": 1000,
+                  "batchesOut": 1,
+                  "peakHeldBytes": 4096,
+                  "spilledBytes": 0,
+                  "spillPasses": 0,
+                  "pagesRead": 0,
+                  "pagesPruned": 0,
+                  "runtimeFilter": null
+                },
+                {
+                  "relId": 5,
+                  "op": "sort",
+                  "rowsOut": 1000,
+                  "batchesOut": 1,
+                  "peakHeldBytes": 4408228,
+                  "spilledBytes": 0,
+                  "spillPasses": 0,
+                  "pagesRead": 0,
+                  "pagesPruned": 0,
+                  "runtimeFilter": null
+                }
+              ],
+              "pipelines": 1,
+              "memoryWaitMs": 0,
+              "peakHeldBytes": 11456709,
+              "synchronous": false
+            }
+          },
+          "after": {
+            "samples": [
+              344.776, 460.48, 503.526, 358.154, 584.427, 545.011, 654.106, 532.747, 568.839
+            ],
+            "median": 532.747,
+            "spread": 309.33,
+            "profile": {
+              "operators": [
+                {
+                  "relId": 1,
+                  "op": "scan",
+                  "rowsOut": 1000000,
+                  "batchesOut": 489,
+                  "peakHeldBytes": 3704205,
+                  "spilledBytes": 0,
+                  "spillPasses": 0,
+                  "pagesRead": 6031,
+                  "pagesPruned": 0,
+                  "runtimeFilter": null
+                },
+                {
+                  "relId": 2,
+                  "op": "project",
+                  "rowsOut": 1000000,
+                  "batchesOut": 489,
+                  "peakHeldBytes": 4096,
+                  "spilledBytes": 0,
+                  "spillPasses": 0,
+                  "pagesRead": 0,
+                  "pagesPruned": 0,
+                  "runtimeFilter": null
+                },
+                {
+                  "relId": 3,
+                  "op": "aggregate",
+                  "rowsOut": 1000,
+                  "batchesOut": 1,
+                  "peakHeldBytes": 1952932,
+                  "spilledBytes": 0,
+                  "spillPasses": 0,
+                  "pagesRead": 0,
+                  "pagesPruned": 0,
+                  "runtimeFilter": null
+                },
+                {
+                  "relId": 4,
+                  "op": "project",
+                  "rowsOut": 1000,
+                  "batchesOut": 1,
+                  "peakHeldBytes": 4096,
+                  "spilledBytes": 0,
+                  "spillPasses": 0,
+                  "pagesRead": 0,
+                  "pagesPruned": 0,
+                  "runtimeFilter": null
+                },
+                {
+                  "relId": 5,
+                  "op": "sort",
+                  "rowsOut": 1000,
+                  "batchesOut": 1,
+                  "peakHeldBytes": 4408228,
+                  "spilledBytes": 0,
+                  "spillPasses": 0,
+                  "pagesRead": 0,
+                  "pagesPruned": 0,
+                  "runtimeFilter": null
+                }
+              ],
+              "pipelines": 1,
+              "memoryWaitMs": 0,
+              "peakHeldBytes": 11520273,
+              "synchronous": false
+            }
+          },
+          "medianDeltaMs": -49.615999999999985,
+          "regressionWithinParentSpread": true
+        },
+        "load": [4.28, 4.27, 5.61]
+      }
+    ]
+  },
+  "sampledSelfProfile": {
+    "operator": {
+      "samples": 1506,
+      "top": [
+        {
+          "samples": 214,
+          "function": "exactEight",
+          "module": "exec/agg/packed-integers.js",
+          "sharePct": 14.209827357237716
+        },
+        {
+          "samples": 164,
+          "function": "update",
+          "module": "exec/agg/states.js",
+          "sharePct": 10.889774236387781
+        },
+        {
+          "samples": 156,
+          "function": "denseFive",
+          "module": "exec/agg/packed-averages.js",
+          "sharePct": 10.358565737051793
+        },
+        {
+          "samples": 128,
+          "function": "#updateBatchRanked",
+          "module": "exec/agg/states.js",
+          "sharePct": 8.49933598937583
+        },
+        {
+          "samples": 105,
+          "function": "maxDense",
+          "module": "exec/agg/states.js",
+          "sharePct": 6.972111553784861
+        },
+        {
+          "samples": 104,
+          "function": "#assign",
+          "module": "exec/agg/groups.js",
+          "sharePct": 6.905710491367862
+        },
+        {
+          "samples": 98,
+          "function": "minDense",
+          "module": "exec/agg/states.js",
+          "sharePct": 6.50730411686587
+        },
+        {
+          "samples": 82,
+          "function": "assign",
+          "module": "exec/agg/groups.js",
+          "sharePct": 5.444887118193891
+        },
+        {
+          "samples": 60,
+          "function": "wordsOfNumber",
+          "module": "exec/agg/values.js",
+          "sharePct": 3.9840637450199203
+        },
+        {
+          "samples": 50,
+          "function": "twoSumsDense",
+          "module": "exec/agg/states.js",
+          "sharePct": 3.3200531208499338
+        },
+        {
+          "samples": 42,
+          "function": "bounded",
+          "module": "exec/agg/packed-averages.js",
+          "sharePct": 2.7888446215139444
+        },
+        {
+          "samples": 35,
+          "function": "set",
+          "module": "exec/agg/values.js",
+          "sharePct": 2.3240371845949537
+        },
+        {
+          "samples": 31,
+          "function": "#setValue",
+          "module": "exec/agg/values.js",
+          "sharePct": 2.058432934926959
+        },
+        {
+          "samples": 29,
+          "function": "compareBytes",
+          "module": "vector/varlen.js",
+          "sharePct": 1.9256308100929616
+        },
+        {
+          "samples": 29,
+          "function": "#setWords",
+          "module": "exec/agg/values.js",
+          "sharePct": 1.9256308100929616
+        },
+        {
+          "samples": 18,
+          "function": "compareToStored",
+          "module": "exec/agg/states.js",
+          "sharePct": 1.1952191235059761
+        },
+        {
+          "samples": 17,
+          "function": "#rankingOf",
+          "module": "exec/agg/states.js",
+          "sharePct": 1.1288180610889775
+        },
+        {
+          "samples": 12,
+          "function": "make",
+          "module": "exec/agg/groups.js",
+          "sharePct": 0.796812749003984
+        },
+        {
+          "samples": 8,
+          "function": "valueAt",
+          "module": "exec/kernels/test-support.js",
+          "sharePct": 0.5312084993359893
+        },
+        {
+          "samples": 7,
+          "function": "start",
+          "module": "exec/agg/values.js",
+          "sharePct": 0.4648074369189907
+        }
+      ]
+    },
+    "candidate": {
+      "samples": 1053,
+      "top": [
+        {
+          "samples": 475,
+          "function": "record",
+          "module": "exec/agg/typed-layout.js",
+          "sharePct": 45.10921177587844
+        },
+        {
+          "samples": 177,
+          "function": "tryUpdate",
+          "module": "exec/agg/typed-layout.js",
+          "sharePct": 16.80911680911681
+        },
+        {
+          "samples": 130,
+          "function": "#updateBatchRanked",
+          "module": "exec/agg/states.js",
+          "sharePct": 12.345679012345679
+        },
+        {
+          "samples": 91,
+          "function": "dictionaryIds",
+          "module": "exec/agg/groups.js",
+          "sharePct": 8.641975308641975
+        },
+        {
+          "samples": 64,
+          "function": "dictionaries",
+          "module": "exec/agg/groups.js",
+          "sharePct": 6.077872744539412
+        },
+        {
+          "samples": 28,
+          "function": "compareBytes",
+          "module": "vector/varlen.js",
+          "sharePct": 2.6590693257359925
+        },
+        {
+          "samples": 19,
+          "function": "compareToStored",
+          "module": "exec/agg/states.js",
+          "sharePct": 1.8043684710351378
+        },
+        {
+          "samples": 13,
+          "function": "#rankingOf",
+          "module": "exec/agg/states.js",
+          "sharePct": 1.2345679012345678
+        },
+        {
+          "samples": 5,
+          "function": "start",
+          "module": "exec/agg/values.js",
+          "sharePct": 0.4748338081671415
+        },
+        {
+          "samples": 5,
+          "function": "valueAt",
+          "module": "exec/kernels/test-support.js",
+          "sharePct": 0.4748338081671415
+        },
+        {
+          "samples": 4,
+          "function": "push",
+          "module": "file:///home/eric/.cache/b4-agg-paired/scripts/next-aggregation-light.mts",
+          "sharePct": 0.3798670465337132
+        },
+        {
+          "samples": 3,
+          "function": "make",
+          "module": "exec/agg/groups.js",
+          "sharePct": 0.2849002849002849
+        },
+        {
+          "samples": 3,
+          "function": "compare",
+          "module": "exec/agg/states.js",
+          "sharePct": 0.2849002849002849
+        },
+        {
+          "samples": 3,
+          "function": "msdSort",
+          "module": "exec/sort-keys.js",
+          "sharePct": 0.2849002849002849
+        },
+        {
+          "samples": 2,
+          "function": "(program)",
+          "module": "",
+          "sharePct": 0.1899335232668566
+        },
+        {
+          "samples": 2,
+          "function": "read32",
+          "module": "hash/xxhash32.js",
+          "sharePct": 0.1899335232668566
+        },
+        {
+          "samples": 2,
+          "function": "compareBytes",
+          "module": "vector/varlen.js",
+          "sharePct": 0.1899335232668566
+        },
+        {
+          "samples": 2,
+          "function": "emit",
+          "module": "exec/agg/groups.js",
+          "sharePct": 0.1899335232668566
+        },
+        {
+          "samples": 2,
+          "function": "dispatch",
+          "module": "",
+          "sharePct": 0.1899335232668566
+        },
+        {
+          "samples": 1,
+          "function": "Sorter",
+          "module": "exec/sort.js",
+          "sharePct": 0.0949667616334283
+        }
+      ]
+    }
+  },
+  "earlierDiagnostics": {
+    "initialFiveRoundCPU": {
+      "native": {
+        "samples": [108.153, 97.468, 131.183, 113.902, 112.159],
+        "median": 112.159,
+        "spread": 33.71499999999999
+      },
+      "operator": {
+        "samples": [314.208, 308.914, 364.342, 306.676, 301.422],
+        "median": 308.914,
+        "spread": 62.91999999999996
+      },
+      "candidate": {
+        "samples": [237.313, 259.496, 351.084, 230.182, 265.032],
+        "median": 259.496,
+        "spread": 120.90200000000002
+      }
+    },
+    "fixedFixtureRecordCPU": {
+      "native": {
+        "samples": [112.301, 109.141, 113.124, 119.11, 110.818],
+        "median": 112.301,
+        "spread": 9.968999999999994
+      },
+      "operator": {
+        "samples": [246.726, 210.599, 281.312, 264.58, 210.569],
+        "median": 246.726,
+        "spread": 70.74300000000002
+      },
+      "candidate": {
+        "samples": [198.12, 228.223, 260.153, 221.596, 227.621],
+        "median": 227.621,
+        "spread": 62.033000000000015
+      }
+    },
+    "firstPairedAttempt": {
+      "lane": "Node isolated component",
+      "strategy": "both",
+      "controlledGC": false,
+      "warmups": 10,
+      "nativeOnly": false,
+      "record": false,
+      "layout": true,
+      "rows": 1000000,
+      "rounds": 9,
+      "paired": true,
+      "node": "v26.12.0",
+      "cpu": "Intel(R) Core(TM) i5-8279U CPU @ 2.40GHz",
+      "revision": "007cb1be08db87dda0715c8e829a14b7f3d40b0b",
+      "patchSha256": "18c7124bf1ee1c8e55972920ffd9f4b69813a85311f50f8aa1a1a8344250f94d",
+      "sourceHashes": {
+        "scripts/next-wide-typed-bench.mts": "f1dbb5948b959c7b541b3c655544862889704e3366ca91949d97e04e1629f4b4",
+        "scripts/lib/wide-decoded-fixture.mts": "19bd9a4a8356b8b713ab40cb1e500e95044b5de09a1183da0676d33576400394",
+        "scripts/next-aggregation-light.mts": "4d212c8d66721ef93821d12a95d77510153db80ace38559e6c6b6be396f04fb0",
+        "scripts/lib/paired-cpu.mts": "6c578f94613567937737d5be128634d293665fa1c87db3376324aa260873da69",
+        "scripts/lib/aggregation-light-kernels.mts": "db6b98e32b347539dbce7d94d5e7cb3f5a706934abfb57c9e92c14fa3223fa7e",
+        "packages/core/browser/next-agg-shapes.ts": "57228f8d3849eff1febec0c8fa130f2db03166c087393e66e3e425967a305354",
+        "packages/core/dist/next/exec/agg/typed-layout.js": "daa24a3d0f838f6d3df63b046cd8afac7e6c825993cffa90057b64d823167aa8",
+        "scripts/lib/wide-layout-kernel.mts": "68114b63d91aa7697a575acb1b373501761e03f40df6cd59992987f6e8cd365d",
+        "packages/core/dist/next/exec/agg/aggregate.js": "5828a8d60680fc6611bd4223febc92373d6f39bbf88b35ddcad1d976b4f0f3a2",
+        "packages/core/dist/next/exec/agg/states.js": "70c8440b190af24d675565987ca097dc4056572bb688bb3395119bac00d30d91",
+        "packages/core/dist/next/exec/agg/packed-averages.js": "3f1db7e2bde8ccbdc567cd2d4c78ce831516b863db1c6cd676008da253330606",
+        "packages/core/dist/next/exec/agg/packed-integers.js": "479493490f0afa9f05b8595614a5a61832a95aa44bae4694b695536ce8911298",
+        "packages/core/dist/next/exec/agg/groups.js": "b2e30d471cbaf67a5db8a4120e640bffb3d5379b5cabb746970fbc2504451cc6"
+      },
+      "fixture": "gen.js-equivalent values; 2048-row batches; first-seen page-local dictionaries; numeric widening is untimed setup",
+      "result": {
+        "id": "agg_3dims_20aggs",
+        "inputRows": 1000000,
+        "inputLayout": {
+          "numeric": "Float64, widening excluded as fixture setup",
+          "flatTextBytes": 17999463,
+          "dictionarySegments": [489, 489, 489, 489]
+        },
+        "resultRows": 1000,
+        "order": [
+          "operator",
+          "candidate",
+          "candidate",
+          "operator",
+          "operator",
+          "candidate",
+          "candidate",
+          "operator",
+          "operator",
+          "candidate",
+          "candidate",
+          "operator",
+          "operator",
+          "candidate",
+          "candidate",
+          "operator",
+          "operator",
+          "candidate"
+        ],
+        "loads": [
+          [4.23, 3.71, 4.28],
+          [4.23, 3.71, 4.28],
+          [4.23, 3.71, 4.28],
+          [4.37, 3.75, 4.29],
+          [4.37, 3.75, 4.29],
+          [4.37, 3.75, 4.29],
+          [4.37, 3.75, 4.29],
+          [4.37, 3.75, 4.29],
+          [4.37, 3.75, 4.29]
+        ],
+        "paired": {
+          "pairs": [
+            {
+              "control": 310.286,
+              "candidate": 219.849,
+              "delta": -90.43700000000001
+            },
+            {
+              "control": 303.885,
+              "candidate": 230.86,
+              "delta": -73.02499999999998
+            },
+            {
+              "control": 318.65,
+              "candidate": 329.415,
+              "delta": 10.765000000000043
+            },
+            {
+              "control": 287.884,
+              "candidate": 267.712,
+              "delta": -20.172000000000025
+            },
+            {
+              "control": 260.531,
+              "candidate": 205.953,
+              "delta": -54.578
+            },
+            {
+              "control": 239.275,
+              "candidate": 263.963,
+              "delta": 24.688000000000017
+            },
+            {
+              "control": 238.354,
+              "candidate": 194.087,
+              "delta": -44.267000000000024
+            },
+            {
+              "control": 241.781,
+              "candidate": 197.698,
+              "delta": -44.083
+            },
+            {
+              "control": 252.718,
+              "candidate": 199.507,
+              "delta": -53.210999999999984
+            }
+          ],
+          "medianDeltaMs": -44.267000000000024,
+          "q1DeltaMs": -54.578,
+          "q3DeltaMs": -20.172000000000025,
+          "iqrDeltaMs": 34.40599999999998,
+          "minDeltaMs": -90.43700000000001,
+          "maxDeltaMs": 24.688000000000017,
+          "rangeDeltaMs": 115.12500000000003,
+          "spreadDeltaMs": 115.12500000000003,
+          "favoursCandidate": 7,
+          "favoursControl": 2,
+          "requiredFavourable": 7,
+          "acceptedGain": true,
+          "significantRegression": false,
+          "noRegression": true
+        },
+        "cpuMs": {
+          "operator": {
+            "samples": [
+              310.286, 303.885, 318.65, 287.884, 260.531, 239.275, 238.354, 241.781, 252.718
+            ],
+            "median": 260.531,
+            "spread": 80.29599999999996
+          },
+          "candidate": {
+            "samples": [
+              219.849, 230.86, 329.415, 267.712, 205.953, 263.963, 194.087, 197.698, 199.507
+            ],
+            "median": 219.849,
+            "spread": 135.32800000000003
+          }
+        },
+        "componentOnly": true,
+        "limits": "Optimistic fixed-workload TS observation, not a mathematical lower bound or universal JS impossibility result. Raw bound/split read flat decoded bytes/numbers and hash every text row. Native wide consumes the original decoded dictionary segments, hashes/maps all entries and translates every row within timing, then uses packed five-AVG state. No precomputed canonical IDs/ranks. All use exact collision equality. Highcard native includes an exact full-input min/max probe and direct-address COUNT/SUM state with an exact general-hash fallback for a wide domain; highcard split and both other DISTINCT kernels alias bound (not independent algorithms). Operator keeps original scan dictionary forms and includes matching sort/top-N, copying and governor/driver/task clock. Whole is prepared pipeline/owned frames; outer harness separately measures SQL through cleanup. Feed is scan/project/discard only, not additive with the other sinks. Setup/flattening (including numeric widening to Float64) excluded; kernel allocation/state/final ordering included. Borrowed immutable inputs need no key copy; no memory governor/spill/cancellation in plain TS. AVG Sxx retained. No production changes."
+      }
+    },
+    "firstAttemptLimit": "Launched while the tail of a build was still running; warmups preceded recorded rounds. Retained but not used for the final decision; repeated after the build completed.",
+    "preAppendCorrectionCapture": {
+      "component": {
+        "lane": "Node isolated component",
+        "strategy": "both",
+        "controlledGC": false,
+        "warmups": 10,
+        "nativeOnly": false,
+        "record": false,
+        "layout": true,
+        "rows": 1000000,
+        "rounds": 9,
+        "paired": true,
+        "node": "v26.12.0",
+        "cpu": "Intel(R) Core(TM) i5-8279U CPU @ 2.40GHz",
+        "revision": "007cb1be08db87dda0715c8e829a14b7f3d40b0b",
+        "patchSha256": "eb1507c6f6589f0855444136dfcae4f48bf2b46c53805becbb806f5803d8dfc0",
+        "sourceHashes": {
+          "scripts/next-wide-typed-bench.mts": "f1dbb5948b959c7b541b3c655544862889704e3366ca91949d97e04e1629f4b4",
+          "scripts/lib/wide-decoded-fixture.mts": "19bd9a4a8356b8b713ab40cb1e500e95044b5de09a1183da0676d33576400394",
+          "scripts/next-aggregation-light.mts": "c73e310d904838173a691c040286a33a95ad2e41fc6678a594f1088eab168339",
+          "scripts/lib/paired-cpu.mts": "6c578f94613567937737d5be128634d293665fa1c87db3376324aa260873da69",
+          "scripts/lib/aggregation-light-kernels.mts": "db6b98e32b347539dbce7d94d5e7cb3f5a706934abfb57c9e92c14fa3223fa7e",
+          "packages/core/browser/next-agg-shapes.ts": "57228f8d3849eff1febec0c8fa130f2db03166c087393e66e3e425967a305354",
+          "packages/core/dist/next/exec/agg/typed-layout.js": "c8d5445ce1b008d84da56016846af8681d0b28519b768764a71907f2f946fe36",
+          "scripts/lib/wide-layout-kernel.mts": "68114b63d91aa7697a575acb1b373501761e03f40df6cd59992987f6e8cd365d",
+          "packages/core/dist/next/exec/agg/aggregate.js": "5828a8d60680fc6611bd4223febc92373d6f39bbf88b35ddcad1d976b4f0f3a2",
+          "packages/core/dist/next/exec/agg/states.js": "09780d0a424f16c852648b262302c7f39811578567ee212160827b34fd0b3a16",
+          "packages/core/dist/next/exec/agg/packed-averages.js": "3f1db7e2bde8ccbdc567cd2d4c78ce831516b863db1c6cd676008da253330606",
+          "packages/core/dist/next/exec/agg/packed-integers.js": "479493490f0afa9f05b8595614a5a61832a95aa44bae4694b695536ce8911298",
+          "packages/core/dist/next/exec/agg/groups.js": "b2e30d471cbaf67a5db8a4120e640bffb3d5379b5cabb746970fbc2504451cc6"
+        },
+        "fixture": "gen.js-equivalent values; 2048-row batches; first-seen page-local dictionaries; numeric widening is untimed setup",
+        "result": {
+          "id": "agg_3dims_20aggs",
+          "inputRows": 1000000,
+          "inputLayout": {
+            "numeric": "Float64, widening excluded as fixture setup",
+            "flatTextBytes": 17999463,
+            "dictionarySegments": [489, 489, 489, 489]
+          },
+          "resultRows": 1000,
+          "order": [
+            "operator",
+            "candidate",
+            "candidate",
+            "operator",
+            "operator",
+            "candidate",
+            "candidate",
+            "operator",
+            "operator",
+            "candidate",
+            "candidate",
+            "operator",
+            "operator",
+            "candidate",
+            "candidate",
+            "operator",
+            "operator",
+            "candidate"
+          ],
+          "loads": [
+            [4.23, 3.82, 4.09],
+            [4.23, 3.82, 4.09],
+            [4.23, 3.82, 4.09],
+            [4.23, 3.82, 4.09],
+            [4.23, 3.82, 4.09],
+            [4.13, 3.8, 4.08],
+            [4.13, 3.8, 4.08],
+            [4.13, 3.8, 4.08],
+            [4.13, 3.8, 4.08]
+          ],
+          "paired": {
+            "pairs": [
+              {
+                "control": 258.556,
+                "candidate": 185.051,
+                "delta": -73.505
+              },
+              {
+                "control": 210.67,
+                "candidate": 162.806,
+                "delta": -47.863999999999976
+              },
+              {
+                "control": 205.515,
+                "candidate": 227.47,
+                "delta": 21.955000000000013
+              },
+              {
+                "control": 194.056,
+                "candidate": 171.255,
+                "delta": -22.801000000000016
+              },
+              {
+                "control": 196.772,
+                "candidate": 169.932,
+                "delta": -26.840000000000003
+              },
+              {
+                "control": 191.596,
+                "candidate": 191.615,
+                "delta": 0.019000000000005457
+              },
+              {
+                "control": 198.928,
+                "candidate": 168.365,
+                "delta": -30.562999999999988
+              },
+              {
+                "control": 203.086,
+                "candidate": 164.907,
+                "delta": -38.179
+              },
+              {
+                "control": 259.836,
+                "candidate": 189.896,
+                "delta": -69.94000000000003
+              }
+            ],
+            "medianDeltaMs": -30.562999999999988,
+            "q1DeltaMs": -47.863999999999976,
+            "q3DeltaMs": -22.801000000000016,
+            "iqrDeltaMs": 25.06299999999996,
+            "minDeltaMs": -73.505,
+            "maxDeltaMs": 21.955000000000013,
+            "rangeDeltaMs": 95.46000000000001,
+            "spreadDeltaMs": 95.46000000000001,
+            "favoursCandidate": 7,
+            "favoursControl": 2,
+            "requiredFavourable": 7,
+            "acceptedGain": true,
+            "significantRegression": false,
+            "noRegression": true
+          },
+          "cpuMs": {
+            "operator": {
+              "samples": [
+                258.556, 210.67, 205.515, 194.056, 196.772, 191.596, 198.928, 203.086, 259.836
+              ],
+              "median": 203.086,
+              "spread": 68.24000000000001
+            },
+            "candidate": {
+              "samples": [
+                185.051, 162.806, 227.47, 171.255, 169.932, 191.615, 168.365, 164.907, 189.896
+              ],
+              "median": 171.255,
+              "spread": 64.66399999999999
+            }
+          },
+          "componentOnly": true,
+          "limits": "Optimistic fixed-workload TS observation, not a mathematical lower bound or universal JS impossibility result. Raw bound/split read flat decoded bytes/numbers and hash every text row. Native wide consumes the original decoded dictionary segments, hashes/maps all entries and translates every row within timing, then uses packed five-AVG state. No precomputed canonical IDs/ranks. All use exact collision equality. Highcard native includes an exact full-input min/max probe and direct-address COUNT/SUM state with an exact general-hash fallback for a wide domain; highcard split and both other DISTINCT kernels alias bound (not independent algorithms). Operator keeps original scan dictionary forms and includes matching sort/top-N, copying and governor/driver/task clock. Whole is prepared pipeline/owned frames; outer harness separately measures SQL through cleanup. Feed is scan/project/discard only, not additive with the other sinks. Setup/flattening (including numeric widening to Float64) excluded; kernel allocation/state/final ordering included. Borrowed immutable inputs need no key copy; no memory governor/spill/cancellation in plain TS. AVG Sxx retained. No production changes."
+        }
+      },
+      "whole": {
+        "lane": "Node",
+        "sqlCorrections": [],
+        "lateSort": true,
+        "keyOrder": true,
+        "revision": "007cb1be08db87dda0715c8e829a14b7f3d40b0b",
+        "workingTreePatchSha256": "eb1507c6f6589f0855444136dfcae4f48bf2b46c53805becbb806f5803d8dfc0",
+        "storage": "MemoryBackend + extent space + WritePathImpl, strict commits, flushed",
+        "dataset": "wide",
+        "rows": 1000000,
+        "columns": 200,
+        "scale": null,
+        "rounds": 9,
+        "fixtureRowCounts": null,
+        "timing": "process user+system CPU; SQL/lower/prepare/bind/pin/execute/rows/credit/cleanup included; ingestion excluded",
+        "node": "v26.12.0",
+        "cpuModel": "Intel(R) Core(TM) i5-8279U CPU @ 2.40GHz",
+        "governorCapBytes": 268435456,
+        "sourceHashes": {
+          "/home/eric/.cache/b4-agg-paired/scripts/next-executor-bench.mts": "b35af96e2be89631b2c873ef0c2971b4cff103e2b3b626244deba880e0800d15",
+          "/home/eric/.cache/b4-agg-paired/scripts/lib/paired-cpu.mts": "6c578f94613567937737d5be128634d293665fa1c87db3376324aa260873da69",
+          "/home/eric/.cache/b4-agg-paired/scripts/next-executor-components.mts": "2d480e35e3415561a4d6bf60f383f114abf827c8f059d1ebc388d4b2b9154bc5",
+          "/home/eric/.cache/b4-agg-paired/scripts/next-late-fetch-component.mts": "41006934f3c14b8cf4c6cec95797c68ad87bb28db349bc34cffcf35621c0714d",
+          "/home/eric/.cache/b4-agg-paired/scripts/next-aggregation-components.mts": "607fb95045b3773c9e0ad25d8940a717b0ffbd23719f507608d82b8ea0761cae",
+          "/home/eric/.cache/b4-agg-paired/scripts/next-scalar-distinct-bench.mts": "46c7b4429f0576ce5b4bf2c762a1fc93b0b7fc55caa6a87e759e105675c3cc95",
+          "/home/eric/.cache/b4-agg-paired/scripts/next-aggregation-light.mts": "c73e310d904838173a691c040286a33a95ad2e41fc6678a594f1088eab168339",
+          "/home/eric/.cache/b4-agg-paired/scripts/lib/aggregation-light-kernels.mts": "db6b98e32b347539dbce7d94d5e7cb3f5a706934abfb57c9e92c14fa3223fa7e",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/hash/xxhash32.js": "e1364b0c9830cfa59ce7c9c2f9480eab16a10fa2415504f021e1c725144160b4",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/page/read-bounds.js": "356a1b2ddb78ac6dcda8b0eccca1dde57e12e9c53f708d706ad7ced0400bebe2",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/page/domain-certificate.js": "4b6f94c7abd4231dfd5d35eb79e668270575065eb8106dc4d8cff809a1e77107",
+          "/home/eric/.cache/b4-agg-paired/scripts/next-executor-workload/gen.mjs": "8b3d70312ac54a87e69f2a0672ed49b024baab7cf9097d92cf6e11da0189fd95",
+          "/home/eric/.cache/b4-agg-paired/scripts/next-executor-workload/queries.mjs": "abcc9f2809d04270569fe6b9e37867978d0c4c82e8a5ea331461d6f3a37347f2",
+          "/home/eric/.cache/b4-agg-paired/apps/site/bench/benchmark.ts": "3af271201d76a77c1d8d4296f11eb1e6abbac3ecd93223daf7a40e594ed6a60e",
+          "/home/eric/.cache/b4-agg-paired/packages/core/src/next/testing/executor-catalogue.json": "3626fcbcca6d4aa0d493f7fa7ba45ea12e0ba2b9f2e0afaed62514c27d5ab52b",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/plan.js": "6412a0bb2a935064f035b7207963990c46ef0cf9ad735057c22ab2b4f66c7564",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/limit.js": "b1791d3de37fef6e6a54cfa236e1124967da49cc4b255b752803e31f2b19c205",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/table-scan.js": "ca949db38416ba9d6ce30c7eda288d38fcb70f3f5c76c3d693219829eee26eb1",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/memory-scan.js": "946b07cc043f5e89415ea89aec55751cb66b2d276e30a285c3321ab59a8f2e7d",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/key-order.js": "f42600c9435038b251339b2dda6bbfc50665d389a52da0ac4dd31ea77b37036c",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/late-fetch.js": "c917b37f809a85d16e215ff9c84762e15f7237bf6e5e839080cdc1b90fbfba53",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/aggregate.js": "5828a8d60680fc6611bd4223febc92373d6f39bbf88b35ddcad1d976b4f0f3a2",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/domain-count-sum.js": "83dec70a3a94e19d5ed5342095719dbca66a4a733c1c6eab9f295517df99c06e",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/group-top-n.js": "5ef1c1577fc14b76dd6e95386364d0bf7d1e8cd244ed3c2c9825faa6dd940096",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/groups.js": "b2e30d471cbaf67a5db8a4120e640bffb3d5379b5cabb746970fbc2504451cc6",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/states.js": "09780d0a424f16c852648b262302c7f39811578567ee212160827b34fd0b3a16",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/packed-averages.js": "3f1db7e2bde8ccbdc567cd2d4c78ce831516b863db1c6cd676008da253330606",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/packed-integers.js": "479493490f0afa9f05b8595614a5a61832a95aa44bae4694b695536ce8911298",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/typed-layout.js": "c8d5445ce1b008d84da56016846af8681d0b28519b768764a71907f2f946fe36",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/distinct.js": "08972c46c4050f2d48f147ad9a7db71ed4a1d73e9ad16a96c164799fe08345ca",
+          "/home/eric/.cache/b4-agg-paired/packages/core/dist/next/exec/agg/scalar-byte-distinct.js": "01e6bd8904027327596f2d9d7deb291a5a255810f7184ba72f165ef12d4341a4"
+        },
+        "load": [4.2, 3.84, 4.08],
+        "profileId": "agg_3dims_20aggs",
+        "execArgv": [],
+        "sqlSource": "/home/eric/.cache/b4-agg-paired/scripts/next-executor-workload/queries.mjs",
+        "harness": "/home/eric/.cache/b4-agg-paired/scripts/next-executor-workload",
+        "records": [
+          {
+            "id": "agg_3dims_20aggs",
+            "status": "executed",
+            "cpuMs": {
+              "median": 573.729,
+              "spread": 439.435,
+              "min": 354.407,
+              "max": 793.842,
+              "samples": [
+                793.842, 757.463, 640.417, 584.208, 508.369, 573.729, 567.364, 395.369, 354.407
+              ]
+            },
+            "wallMs": [
+              529.5428290000127, 500.64370800000324, 541.787531000009, 532.0769680000085,
+              452.8644110000023, 543.8129570000019, 531.827775999991, 366.0966279999993,
+              342.5587289999967
+            ],
+            "rows": 1000,
+            "checksum": 4000,
+            "profile": {
+              "operators": [
+                {
+                  "relId": 1,
+                  "op": "scan",
+                  "rowsOut": 1000000,
+                  "batchesOut": 489,
+                  "peakHeldBytes": 3704205,
+                  "spilledBytes": 0,
+                  "spillPasses": 0,
+                  "pagesRead": 6031,
+                  "pagesPruned": 0,
+                  "runtimeFilter": null
+                },
+                {
+                  "relId": 2,
+                  "op": "project",
+                  "rowsOut": 1000000,
+                  "batchesOut": 489,
+                  "peakHeldBytes": 4096,
+                  "spilledBytes": 0,
+                  "spillPasses": 0,
+                  "pagesRead": 0,
+                  "pagesPruned": 0,
+                  "runtimeFilter": null
+                },
+                {
+                  "relId": 3,
+                  "op": "aggregate",
+                  "rowsOut": 1000,
+                  "batchesOut": 1,
+                  "peakHeldBytes": 1952932,
+                  "spilledBytes": 0,
+                  "spillPasses": 0,
+                  "pagesRead": 0,
+                  "pagesPruned": 0,
+                  "runtimeFilter": null
+                },
+                {
+                  "relId": 4,
+                  "op": "project",
+                  "rowsOut": 1000,
+                  "batchesOut": 1,
+                  "peakHeldBytes": 4096,
+                  "spilledBytes": 0,
+                  "spillPasses": 0,
+                  "pagesRead": 0,
+                  "pagesPruned": 0,
+                  "runtimeFilter": null
+                },
+                {
+                  "relId": 5,
+                  "op": "sort",
+                  "rowsOut": 1000,
+                  "batchesOut": 1,
+                  "peakHeldBytes": 4408228,
+                  "spilledBytes": 0,
+                  "spillPasses": 0,
+                  "pagesRead": 0,
+                  "pagesPruned": 0,
+                  "runtimeFilter": null
+                }
+              ],
+              "pipelines": 1,
+              "memoryWaitMs": 0,
+              "peakHeldBytes": 11520273,
+              "synchronous": false
+            },
+            "wholeComparison": {
+              "lane": "Node",
+              "strategy": "wide-layout",
+              "paired": {
+                "pairs": [
+                  {
+                    "control": 410.401,
+                    "candidate": 394.704,
+                    "delta": -15.697000000000003
+                  },
+                  {
+                    "control": 437.194,
+                    "candidate": 636.48,
+                    "delta": 199.286
+                  },
+                  {
+                    "control": 628.917,
+                    "candidate": 510.247,
+                    "delta": -118.67000000000002
+                  },
+                  {
+                    "control": 623.221,
+                    "candidate": 385.811,
+                    "delta": -237.41000000000003
+                  },
+                  {
+                    "control": 464.679,
+                    "candidate": 505.46,
+                    "delta": 40.781000000000006
+                  },
+                  {
+                    "control": 527.753,
+                    "candidate": 359.4,
+                    "delta": -168.35300000000007
+                  },
+                  {
+                    "control": 429.457,
+                    "candidate": 596.435,
+                    "delta": 166.97799999999995
+                  },
+                  {
+                    "control": 515.756,
+                    "candidate": 340.34,
+                    "delta": -175.416
+                  },
+                  {
+                    "control": 456.097,
+                    "candidate": 611.631,
+                    "delta": 155.534
+                  }
+                ],
+                "medianDeltaMs": -15.697000000000003,
+                "q1DeltaMs": -168.35300000000007,
+                "q3DeltaMs": 155.534,
+                "iqrDeltaMs": 323.88700000000006,
+                "minDeltaMs": -237.41000000000003,
+                "maxDeltaMs": 199.286,
+                "rangeDeltaMs": 436.696,
+                "spreadDeltaMs": 436.696,
+                "favoursCandidate": 5,
+                "favoursControl": 4,
+                "requiredFavourable": 7,
+                "acceptedGain": false,
+                "significantRegression": false,
+                "noRegression": true
+              },
+              "rounds": 9,
+              "order": [
+                "merged-separate-banks",
+                "typed-record-dictionary",
+                "typed-record-dictionary",
+                "merged-separate-banks",
+                "merged-separate-banks",
+                "typed-record-dictionary",
+                "typed-record-dictionary",
+                "merged-separate-banks",
+                "merged-separate-banks",
+                "typed-record-dictionary",
+                "typed-record-dictionary",
+                "merged-separate-banks",
+                "merged-separate-banks",
+                "typed-record-dictionary",
+                "typed-record-dictionary",
+                "merged-separate-banks",
+                "merged-separate-banks",
+                "typed-record-dictionary"
+              ],
+              "timing": "process user+system CPU; SQL/lower/prepare/bind/pin/execute/rows/credit/cleanup included; ingestion excluded",
+              "before": {
+                "samples": [
+                  410.401, 437.194, 628.917, 623.221, 464.679, 527.753, 429.457, 515.756, 456.097
+                ],
+                "median": 464.679,
+                "spread": 218.51600000000002,
+                "profile": {
+                  "operators": [
+                    {
+                      "relId": 1,
+                      "op": "scan",
+                      "rowsOut": 1000000,
+                      "batchesOut": 489,
+                      "peakHeldBytes": 3704205,
+                      "spilledBytes": 0,
+                      "spillPasses": 0,
+                      "pagesRead": 6031,
+                      "pagesPruned": 0,
+                      "runtimeFilter": null
+                    },
+                    {
+                      "relId": 2,
+                      "op": "project",
+                      "rowsOut": 1000000,
+                      "batchesOut": 489,
+                      "peakHeldBytes": 4096,
+                      "spilledBytes": 0,
+                      "spillPasses": 0,
+                      "pagesRead": 0,
+                      "pagesPruned": 0,
+                      "runtimeFilter": null
+                    },
+                    {
+                      "relId": 3,
+                      "op": "aggregate",
+                      "rowsOut": 1000,
+                      "batchesOut": 1,
+                      "peakHeldBytes": 1889368,
+                      "spilledBytes": 0,
+                      "spillPasses": 0,
+                      "pagesRead": 0,
+                      "pagesPruned": 0,
+                      "runtimeFilter": null
+                    },
+                    {
+                      "relId": 4,
+                      "op": "project",
+                      "rowsOut": 1000,
+                      "batchesOut": 1,
+                      "peakHeldBytes": 4096,
+                      "spilledBytes": 0,
+                      "spillPasses": 0,
+                      "pagesRead": 0,
+                      "pagesPruned": 0,
+                      "runtimeFilter": null
+                    },
+                    {
+                      "relId": 5,
+                      "op": "sort",
+                      "rowsOut": 1000,
+                      "batchesOut": 1,
+                      "peakHeldBytes": 4408228,
+                      "spilledBytes": 0,
+                      "spillPasses": 0,
+                      "pagesRead": 0,
+                      "pagesPruned": 0,
+                      "runtimeFilter": null
+                    }
+                  ],
+                  "pipelines": 1,
+                  "memoryWaitMs": 0,
+                  "peakHeldBytes": 11456709,
+                  "synchronous": false
+                }
+              },
+              "after": {
+                "samples": [
+                  394.704, 636.48, 510.247, 385.811, 505.46, 359.4, 596.435, 340.34, 611.631
+                ],
+                "median": 505.46,
+                "spread": 296.14000000000004,
+                "profile": {
+                  "operators": [
+                    {
+                      "relId": 1,
+                      "op": "scan",
+                      "rowsOut": 1000000,
+                      "batchesOut": 489,
+                      "peakHeldBytes": 3704205,
+                      "spilledBytes": 0,
+                      "spillPasses": 0,
+                      "pagesRead": 6031,
+                      "pagesPruned": 0,
+                      "runtimeFilter": null
+                    },
+                    {
+                      "relId": 2,
+                      "op": "project",
+                      "rowsOut": 1000000,
+                      "batchesOut": 489,
+                      "peakHeldBytes": 4096,
+                      "spilledBytes": 0,
+                      "spillPasses": 0,
+                      "pagesRead": 0,
+                      "pagesPruned": 0,
+                      "runtimeFilter": null
+                    },
+                    {
+                      "relId": 3,
+                      "op": "aggregate",
+                      "rowsOut": 1000,
+                      "batchesOut": 1,
+                      "peakHeldBytes": 1952932,
+                      "spilledBytes": 0,
+                      "spillPasses": 0,
+                      "pagesRead": 0,
+                      "pagesPruned": 0,
+                      "runtimeFilter": null
+                    },
+                    {
+                      "relId": 4,
+                      "op": "project",
+                      "rowsOut": 1000,
+                      "batchesOut": 1,
+                      "peakHeldBytes": 4096,
+                      "spilledBytes": 0,
+                      "spillPasses": 0,
+                      "pagesRead": 0,
+                      "pagesPruned": 0,
+                      "runtimeFilter": null
+                    },
+                    {
+                      "relId": 5,
+                      "op": "sort",
+                      "rowsOut": 1000,
+                      "batchesOut": 1,
+                      "peakHeldBytes": 4408228,
+                      "spilledBytes": 0,
+                      "spillPasses": 0,
+                      "pagesRead": 0,
+                      "pagesPruned": 0,
+                      "runtimeFilter": null
+                    }
+                  ],
+                  "pipelines": 1,
+                  "memoryWaitMs": 0,
+                  "peakHeldBytes": 11520273,
+                  "synchronous": false
+                }
+              },
+              "medianDeltaMs": -40.781000000000006,
+              "regressionWithinParentSpread": true
+            },
+            "load": [3.56, 3.78, 4.03]
+          }
+        ]
+      },
+      "decision": {
+        "operatorAcceptedGain": true,
+        "operatorMarginMs": 5.500000000000028,
+        "wholeNoAcceptedRegression": true,
+        "wholeAcceptedGain": false
+      },
+      "sampledSelfProfile": {
+        "operator": {
+          "samples": 1567,
+          "top": [
+            {
+              "samples": 214,
+              "function": "exactEight",
+              "module": "exec/agg/packed-integers.js",
+              "sharePct": 13.656668793873644
+            },
+            {
+              "samples": 172,
+              "function": "denseFive",
+              "module": "exec/agg/packed-averages.js",
+              "sharePct": 10.976388002552648
+            },
+            {
+              "samples": 155,
+              "function": "#assign",
+              "module": "exec/agg/groups.js",
+              "sharePct": 9.891512444160817
+            },
+            {
+              "samples": 152,
+              "function": "update",
+              "module": "exec/agg/states.js",
+              "sharePct": 9.700063816209317
+            },
+            {
+              "samples": 151,
+              "function": "#updateBatchRanked",
+              "module": "exec/agg/states.js",
+              "sharePct": 9.63624760689215
+            },
+            {
+              "samples": 111,
+              "function": "minDense",
+              "module": "exec/agg/states.js",
+              "sharePct": 7.083599234205488
+            },
+            {
+              "samples": 88,
+              "function": "maxDense",
+              "module": "exec/agg/states.js",
+              "sharePct": 5.615826419910658
+            },
+            {
+              "samples": 87,
+              "function": "assign",
+              "module": "exec/agg/groups.js",
+              "sharePct": 5.55201021059349
+            },
+            {
+              "samples": 51,
+              "function": "set",
+              "module": "exec/agg/values.js",
+              "sharePct": 3.2546266751754946
+            },
+            {
+              "samples": 40,
+              "function": "wordsOfNumber",
+              "module": "exec/agg/values.js",
+              "sharePct": 2.5526483726866624
+            },
+            {
+              "samples": 39,
+              "function": "twoSumsDense",
+              "module": "exec/agg/states.js",
+              "sharePct": 2.4888321633694956
+            },
+            {
+              "samples": 38,
+              "function": "#setValue",
+              "module": "exec/agg/values.js",
+              "sharePct": 2.4250159540523293
+            },
+            {
+              "samples": 33,
+              "function": "bounded",
+              "module": "exec/agg/packed-averages.js",
+              "sharePct": 2.1059349074664966
+            },
+            {
+              "samples": 26,
+              "function": "#setWords",
+              "module": "exec/agg/values.js",
+              "sharePct": 1.6592214422463305
+            },
+            {
+              "samples": 24,
+              "function": "compareBytes",
+              "module": "vector/varlen.js",
+              "sharePct": 1.5315890236119976
+            },
+            {
+              "samples": 17,
+              "function": "#rankingOf",
+              "module": "exec/agg/states.js",
+              "sharePct": 1.0848755583918315
+            },
+            {
+              "samples": 16,
+              "function": "compareToStored",
+              "module": "exec/agg/states.js",
+              "sharePct": 1.021059349074665
+            },
+            {
+              "samples": 11,
+              "function": "rowValues",
+              "module": "exec/agg/states.js",
+              "sharePct": 0.7019783024888322
+            },
+            {
+              "samples": 10,
+              "function": "valueAt",
+              "module": "exec/kernels/test-support.js",
+              "sharePct": 0.6381620931716656
+            },
+            {
+              "samples": 9,
+              "function": "make",
+              "module": "exec/agg/groups.js",
+              "sharePct": 0.574345883854499
+            }
+          ]
+        },
+        "candidate": {
+          "samples": 1316,
+          "top": [
+            {
+              "samples": 615,
+              "function": "record",
+              "module": "exec/agg/typed-layout.js",
+              "sharePct": 46.73252279635258
+            },
+            {
+              "samples": 207,
+              "function": "tryUpdate",
+              "module": "exec/agg/typed-layout.js",
+              "sharePct": 15.729483282674773
+            },
+            {
+              "samples": 142,
+              "function": "#updateBatchRanked",
+              "module": "exec/agg/states.js",
+              "sharePct": 10.790273556231003
+            },
+            {
+              "samples": 118,
+              "function": "dictionaryIds",
+              "module": "exec/agg/groups.js",
+              "sharePct": 8.966565349544073
+            },
+            {
+              "samples": 97,
+              "function": "dictionaries",
+              "module": "exec/agg/groups.js",
+              "sharePct": 7.37082066869301
+            },
+            {
+              "samples": 21,
+              "function": "compareToStored",
+              "module": "exec/agg/states.js",
+              "sharePct": 1.5957446808510638
+            },
+            {
+              "samples": 18,
+              "function": "compareBytes",
+              "module": "vector/varlen.js",
+              "sharePct": 1.3677811550151975
+            },
+            {
+              "samples": 10,
+              "function": "#rankingOf",
+              "module": "exec/agg/states.js",
+              "sharePct": 0.7598784194528876
+            },
+            {
+              "samples": 9,
+              "function": "make",
+              "module": "exec/agg/groups.js",
+              "sharePct": 0.6838905775075987
+            },
+            {
+              "samples": 9,
+              "function": "start",
+              "module": "exec/agg/values.js",
+              "sharePct": 0.6838905775075987
+            },
+            {
+              "samples": 5,
+              "function": "compare",
+              "module": "exec/agg/states.js",
+              "sharePct": 0.3799392097264438
+            },
+            {
+              "samples": 5,
+              "function": "",
+              "module": "file:///home/eric/.cache/b4-agg-paired/scripts/next-aggregation-light.mts",
+              "sharePct": 0.3799392097264438
+            },
+            {
+              "samples": 4,
+              "function": "(program)",
+              "module": "",
+              "sharePct": 0.303951367781155
+            },
+            {
+              "samples": 4,
+              "function": "push",
+              "module": "exec/agg/aggregate.js",
+              "sharePct": 0.303951367781155
+            },
+            {
+              "samples": 4,
+              "function": "xxHash32",
+              "module": "hash/xxhash32.js",
+              "sharePct": 0.303951367781155
+            },
+            {
+              "samples": 4,
+              "function": "decodeUTF8",
+              "module": "",
+              "sharePct": 0.303951367781155
+            },
+            {
+              "samples": 3,
+              "function": "end",
+              "module": "exec/agg/values.js",
+              "sharePct": 0.22796352583586627
+            },
+            {
+              "samples": 2,
+              "function": "#viewOf",
+              "module": "exec/agg/groups.js",
+              "sharePct": 0.1519756838905775
+            },
+            {
+              "samples": 2,
+              "function": "entryStart",
+              "module": "exec/agg/states.js",
+              "sharePct": 0.1519756838905775
+            },
+            {
+              "samples": 2,
+              "function": "assign",
+              "module": "exec/agg/groups.js",
+              "sharePct": 0.1519756838905775
+            }
+          ]
+        }
+      },
+      "wholeSampledSelfProfile": {
+        "before": {
+          "samples": 2503,
+          "sharesPct": {
+            "other": 19.77626847782661,
+            "aggregation": 50.059928086296445,
+            "GC": 1.6779864163004394,
+            "scan/page/storage": 28.48581701957651
+          },
+          "top": [
+            {
+              "samples": 199,
+              "function": "exactEight",
+              "module": "exec/agg/packed-integers.js",
+              "sharePct": 7.950459448661606
+            },
+            {
+              "samples": 124,
+              "function": "denseFive",
+              "module": "exec/agg/packed-averages.js",
+              "sharePct": 4.954055133839392
+            },
+            {
+              "samples": 119,
+              "function": "update",
+              "module": "exec/agg/states.js",
+              "sharePct": 4.754294846184578
+            },
+            {
+              "samples": 108,
+              "function": "maxDense",
+              "module": "exec/agg/states.js",
+              "sharePct": 4.314822213343987
+            },
+            {
+              "samples": 101,
+              "function": "#assign",
+              "module": "exec/agg/groups.js",
+              "sharePct": 4.035157810627247
+            },
+            {
+              "samples": 99,
+              "function": "#updateBatchRanked",
+              "module": "exec/agg/states.js",
+              "sharePct": 3.9552536955653217
+            },
+            {
+              "samples": 99,
+              "function": "minDense",
+              "module": "exec/agg/states.js",
+              "sharePct": 3.9552536955653217
+            },
+            {
+              "samples": 71,
+              "function": "assign",
+              "module": "exec/agg/groups.js",
+              "sharePct": 2.8365960846983618
+            },
+            {
+              "samples": 56,
+              "function": "wordsOfNumber",
+              "module": "exec/agg/values.js",
+              "sharePct": 2.2373152217339194
+            },
+            {
+              "samples": 54,
+              "function": "set",
+              "module": "exec/agg/values.js",
+              "sharePct": 2.1574111066719937
+            },
+            {
+              "samples": 52,
+              "function": "size",
+              "module": "page/read-bounds.js",
+              "sharePct": 2.077506991610068
+            },
+            {
+              "samples": 51,
+              "function": "scaledInto",
+              "module": "page/decode.js",
+              "sharePct": 2.0375549340791053
+            },
+            {
+              "samples": 42,
+              "function": "(garbage collector)",
+              "module": "",
+              "sharePct": 1.6779864163004394
+            },
+            {
+              "samples": 42,
+              "function": "RefReader",
+              "module": "format/manifest-codec.js",
+              "sharePct": 1.6779864163004394
+            },
+            {
+              "samples": 42,
+              "function": "twoSumsDense",
+              "module": "exec/agg/states.js",
+              "sharePct": 1.6779864163004394
+            },
+            {
+              "samples": 42,
+              "function": "consume",
+              "module": "file:///home/eric/.cache/b4-agg-paired/scripts/next-executor-bench.mts",
+              "sharePct": 1.6779864163004394
+            },
+            {
+              "samples": 41,
+              "function": "RefReader",
+              "module": "format/manifest-codec.js",
+              "sharePct": 1.6380343587694766
+            },
+            {
+              "samples": 37,
+              "function": "#load",
+              "module": "exec/table-scan.js",
+              "sharePct": 1.4782261286456253
+            },
+            {
+              "samples": 36,
+              "function": "(program)",
+              "module": "",
+              "sharePct": 1.4382740711146624
+            },
+            {
+              "samples": 33,
+              "function": "#setValue",
+              "module": "exec/agg/values.js",
+              "sharePct": 1.3184178985217738
+            }
+          ]
+        },
+        "after": {
+          "samples": 2610,
+          "sharesPct": {
+            "other": 20.45977011494253,
+            "aggregation": 47.16475095785441,
+            "scan/page/storage": 31.11111111111111,
+            "GC": 1.264367816091954
+          },
+          "top": [
+            {
+              "samples": 601,
+              "function": "record",
+              "module": "exec/agg/typed-layout.js",
+              "sharePct": 23.026819923371647
+            },
+            {
+              "samples": 215,
+              "function": "tryUpdate",
+              "module": "exec/agg/typed-layout.js",
+              "sharePct": 8.237547892720306
+            },
+            {
+              "samples": 135,
+              "function": "#updateBatchRanked",
+              "module": "exec/agg/states.js",
+              "sharePct": 5.172413793103448
+            },
+            {
+              "samples": 109,
+              "function": "dictionaryIds",
+              "module": "exec/agg/groups.js",
+              "sharePct": 4.176245210727969
+            },
+            {
+              "samples": 84,
+              "function": "scaledInto",
+              "module": "page/decode.js",
+              "sharePct": 3.218390804597701
+            },
+            {
+              "samples": 81,
+              "function": "dictionaries",
+              "module": "exec/agg/groups.js",
+              "sharePct": 3.103448275862069
+            },
+            {
+              "samples": 61,
+              "function": "RefReader",
+              "module": "format/manifest-codec.js",
+              "sharePct": 2.3371647509578546
+            },
+            {
+              "samples": 59,
+              "function": "RefReader",
+              "module": "format/manifest-codec.js",
+              "sharePct": 2.260536398467433
+            },
+            {
+              "samples": 48,
+              "function": "consume",
+              "module": "file:///home/eric/.cache/b4-agg-paired/scripts/next-executor-bench.mts",
+              "sharePct": 1.839080459770115
+            },
+            {
+              "samples": 47,
+              "function": "size",
+              "module": "page/read-bounds.js",
+              "sharePct": 1.8007662835249043
+            },
+            {
+              "samples": 45,
+              "function": "#loadPages",
+              "module": "exec/table-scan.js",
+              "sharePct": 1.7241379310344827
+            },
+            {
+              "samples": 39,
+              "function": "addBase32",
+              "module": "page/decode.js",
+              "sharePct": 1.4942528735632183
+            },
+            {
+              "samples": 34,
+              "function": "(program)",
+              "module": "",
+              "sharePct": 1.3026819923371646
+            },
+            {
+              "samples": 33,
+              "function": "(garbage collector)",
+              "module": "",
+              "sharePct": 1.264367816091954
+            },
+            {
+              "samples": 32,
+              "function": "compareBytes",
+              "module": "vector/varlen.js",
+              "sharePct": 1.2260536398467432
+            },
+            {
+              "samples": 30,
+              "function": "",
+              "module": "format/manifest-codec.js",
+              "sharePct": 1.1494252873563218
+            },
+            {
+              "samples": 28,
+              "function": "raw",
+              "module": "page/directory.js",
+              "sharePct": 1.0727969348659003
+            },
+            {
+              "samples": 28,
+              "function": "compareToStored",
+              "module": "exec/agg/states.js",
+              "sharePct": 1.0727969348659003
+            },
+            {
+              "samples": 25,
+              "function": "decodeInt64Delta",
+              "module": "page/decode.js",
+              "sharePct": 0.9578544061302682
+            },
+            {
+              "samples": 24,
+              "function": "raw",
+              "module": "page/directory.js",
+              "sharePct": 0.9195402298850575
+            }
+          ]
+        }
+      },
+      "limit": "A dictionary-prefix bug was discovered after these measurements; retained for audit, not the final acceptance capture."
+    }
+  },
+  "correctness": {
+    "mutants": [
+      {
+        "name": "append-tail-zero",
+        "command": [
+          "npx",
+          "vitest",
+          "run",
+          "packages/core/src/next/exec/agg/dictionary-tuples.test.ts",
+          "--maxWorkers=2",
+          "-t",
+          "keeps exact tuples"
+        ],
+        "exit": 1,
+        "intendedAssertion": true
+      },
+      {
+        "name": "restore-sxx-zero",
+        "command": [
+          "npx",
+          "vitest",
+          "run",
+          "packages/core/src/next/exec/agg/typed-layout.test.ts",
+          "--maxWorkers=2",
+          "-t",
+          "keeps PG Sxx"
+        ],
+        "exit": 1,
+        "intendedAssertion": true
+      },
+      {
+        "name": "tuple-codes-as-ids",
+        "command": [
+          "npx",
+          "vitest",
+          "run",
+          "packages/core/src/next/exec/agg/dictionary-tuples.test.ts",
+          "--maxWorkers=2",
+          "-t",
+          "keeps exact tuples"
+        ],
+        "exit": 1,
+        "intendedAssertion": true
+      }
+    ],
+    "authority": "PostgreSQL float8_accum (all N/Sx/Sxx fields, independently reached accumulators), integer transition arithmetic and GROUP BY equality; C11 integer AVG contract",
+    "generatedSeeds": {
+      "typed-layout-transitions": [46209, 46210],
+      "typed-layout-exceptions": [46211, 46212],
+      "typed-layout-prefix-limit": [46213, 46214],
+      "dictionary-native-tuples": [46225, 46226],
+      "group-dictionary-append": [46227, 46228]
+    },
+    "postCaptureChanges": "Only documentation/report/evidence changed after the corrected captures. No transition, grouping or generated-test runtime code changed.",
+    "parentRED": {
+      "parent": "007cb1be",
+      "scope": "Exact parent aggregate/group/state/plan sources with the new parent-compatible dictionary-append generator. Other runner/support files retain the working tree version.",
+      "command": [
+        "npx",
+        "vitest",
+        "run",
+        "packages/core/src/next/exec/agg/dictionary-append.test.ts",
+        "--maxWorkers=2"
+      ],
+      "exit": 1,
+      "intended": "Appended fresh byte values map to stale cached classes after capacity reuse; not an import/setup failure.",
+      "greenExit": 0
+    },
+    "standaloneCacheFixGREEN": {
+      "command": [
+        "npx",
+        "vitest",
+        "run",
+        "packages/core/src/next/exec/agg/groups.test.ts",
+        "packages/core/src/next/exec/agg/dictionary-hash.test.ts",
+        "packages/core/src/next/exec/agg/dictionary-append.test.ts",
+        "--maxWorkers=2"
+      ],
+      "exit": 0,
+      "scope": "Parent aggregation sources plus only the dictionary translation fix; native tuple/layout absent; restored byte for byte."
+    },
+    "authoritySources": [
+      "https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/utils/adt/float.c#L2807",
+      "packages/core/src/next/vector/vector.ts: DictionaryVector prefix-identity contract",
+      "packages/core/src/next/exec/agg/states.ts: Accumulator contract and C11 integer AVG"
+    ]
+  },
+  "limits": [
+    "Shared loaded host. Whole paired delta +35.763ms, IQR134.830ms, 4/9 favourable, 5/9 control: no accepted reverse regression, not evidence of equivalence or a whole-query gain. Raw candidate median532.747ms exceeds control483.131ms.",
+    "Whole candidate median532.747ms is3.976x the134ms Gate B target, but this is Node, not the browser acceptance lane.",
+    "Specialized reusable numeric/type family and bounded all-valid finite prefix; different shapes/promoted states use general accumulators. Uncertified distributions may lose former packed-bank performance; only the reported catalogue workload is qualified.",
+    "No runtime code generation, approximate arithmetic, Sxx skip, new spill support, stored-format or public API changes. All state, translation growth and restoration scratch remain charged.",
+    "Sampled profiles are one operation each and cannot allocate a causal CPU delta. Three-way diagnostics and paired acceptance are separate CPU experiments.",
+    "The plain typed kernel lacks executor memory/spill/cancellation duties. It is not a mathematical lower bound or a browser measurement."
+  ],
+  "artifactNotes": [
+    "The captured shared component limits string predates this candidate: its No production changes phrase describes the plain diagnostic kernels, not the new operator. The runner description was corrected after capture. Top-level controls, decision and limits describe this comparison."
+  ],
+  "wholeSampledSelfProfile": {
+    "before": {
+      "samples": 2645,
+      "top": [
+        {
+          "samples": 190,
+          "function": "exactEight",
+          "module": "exec/agg/packed-integers.js",
+          "sharePct": 7.183364839319471
+        },
+        {
+          "samples": 127,
+          "function": "maxDense",
+          "module": "exec/agg/states.js",
+          "sharePct": 4.801512287334593
+        },
+        {
+          "samples": 121,
+          "function": "denseFive",
+          "module": "exec/agg/packed-averages.js",
+          "sharePct": 4.574669187145558
+        },
+        {
+          "samples": 112,
+          "function": "#updateBatchRanked",
+          "module": "exec/agg/states.js",
+          "sharePct": 4.234404536862003
+        },
+        {
+          "samples": 105,
+          "function": "update",
+          "module": "exec/agg/states.js",
+          "sharePct": 3.9697542533081287
+        },
+        {
+          "samples": 102,
+          "function": "#assign",
+          "module": "exec/agg/groups.js",
+          "sharePct": 3.8563327032136105
+        },
+        {
+          "samples": 92,
+          "function": "assign",
+          "module": "exec/agg/groups.js",
+          "sharePct": 3.4782608695652173
+        },
+        {
+          "samples": 86,
+          "function": "minDense",
+          "module": "exec/agg/states.js",
+          "sharePct": 3.2514177693761814
+        },
+        {
+          "samples": 77,
+          "function": "consume",
+          "module": "file:///home/eric/.cache/b4-agg-paired/scripts/next-executor-bench.mts",
+          "sharePct": 2.9111531190926274
+        },
+        {
+          "samples": 63,
+          "function": "set",
+          "module": "exec/agg/values.js",
+          "sharePct": 2.381852551984877
+        },
+        {
+          "samples": 62,
+          "function": "scaledInto",
+          "module": "page/decode.js",
+          "sharePct": 2.344045368620038
+        },
+        {
+          "samples": 58,
+          "function": "RefReader",
+          "module": "format/manifest-codec.js",
+          "sharePct": 2.1928166351606806
+        },
+        {
+          "samples": 57,
+          "function": "(program)",
+          "module": "",
+          "sharePct": 2.1550094517958414
+        },
+        {
+          "samples": 56,
+          "function": "RefReader",
+          "module": "format/manifest-codec.js",
+          "sharePct": 2.1172022684310017
+        },
+        {
+          "samples": 56,
+          "function": "size",
+          "module": "page/read-bounds.js",
+          "sharePct": 2.1172022684310017
+        },
+        {
+          "samples": 54,
+          "function": "wordsOfNumber",
+          "module": "exec/agg/values.js",
+          "sharePct": 2.041587901701323
+        },
+        {
+          "samples": 43,
+          "function": "#setValue",
+          "module": "exec/agg/values.js",
+          "sharePct": 1.6257088846880907
+        },
+        {
+          "samples": 34,
+          "function": "twoSumsDense",
+          "module": "exec/agg/states.js",
+          "sharePct": 1.285444234404537
+        },
+        {
+          "samples": 33,
+          "function": "(garbage collector)",
+          "module": "",
+          "sharePct": 1.2476370510396975
+        },
+        {
+          "samples": 31,
+          "function": "addBase32",
+          "module": "page/decode.js",
+          "sharePct": 1.172022684310019
+        }
+      ],
+      "sharesPct": {
+        "other": 22.344045368620037,
+        "aggregation": 48.99810964083176,
+        "scan/page/storage": 27.410207939508506,
+        "GC": 1.2476370510396975
+      }
+    },
+    "after": {
+      "samples": 2252,
+      "top": [
+        {
+          "samples": 501,
+          "function": "record",
+          "module": "exec/agg/typed-layout.js",
+          "sharePct": 22.24689165186501
+        },
+        {
+          "samples": 178,
+          "function": "tryUpdate",
+          "module": "exec/agg/typed-layout.js",
+          "sharePct": 7.904085257548846
+        },
+        {
+          "samples": 128,
+          "function": "#updateBatchRanked",
+          "module": "exec/agg/states.js",
+          "sharePct": 5.683836589698046
+        },
+        {
+          "samples": 93,
+          "function": "dictionaryIds",
+          "module": "exec/agg/groups.js",
+          "sharePct": 4.129662522202486
+        },
+        {
+          "samples": 76,
+          "function": "dictionaries",
+          "module": "exec/agg/groups.js",
+          "sharePct": 3.374777975133215
+        },
+        {
+          "samples": 74,
+          "function": "scaledInto",
+          "module": "page/decode.js",
+          "sharePct": 3.285968028419183
+        },
+        {
+          "samples": 56,
+          "function": "size",
+          "module": "page/read-bounds.js",
+          "sharePct": 2.4866785079928952
+        },
+        {
+          "samples": 53,
+          "function": "RefReader",
+          "module": "format/manifest-codec.js",
+          "sharePct": 2.3534635879218473
+        },
+        {
+          "samples": 47,
+          "function": "RefReader",
+          "module": "format/manifest-codec.js",
+          "sharePct": 2.0870337477797514
+        },
+        {
+          "samples": 40,
+          "function": "consume",
+          "module": "file:///home/eric/.cache/b4-agg-paired/scripts/next-executor-bench.mts",
+          "sharePct": 1.7761989342806395
+        },
+        {
+          "samples": 39,
+          "function": "addBase32",
+          "module": "page/decode.js",
+          "sharePct": 1.7317939609236235
+        },
+        {
+          "samples": 36,
+          "function": "decodeValues",
+          "module": "page/decode.js",
+          "sharePct": 1.5985790408525755
+        },
+        {
+          "samples": 33,
+          "function": "(program)",
+          "module": "",
+          "sharePct": 1.4653641207815276
+        },
+        {
+          "samples": 31,
+          "function": "decodeInt32",
+          "module": "page/decode.js",
+          "sharePct": 1.3765541740674956
+        },
+        {
+          "samples": 25,
+          "function": "charged",
+          "module": "format/manifest-codec.js",
+          "sharePct": 1.1101243339253997
+        },
+        {
+          "samples": 25,
+          "function": "(garbage collector)",
+          "module": "",
+          "sharePct": 1.1101243339253997
+        },
+        {
+          "samples": 24,
+          "function": "compareBytes",
+          "module": "vector/varlen.js",
+          "sharePct": 1.0657193605683837
+        },
+        {
+          "samples": 22,
+          "function": "#load",
+          "module": "exec/table-scan.js",
+          "sharePct": 0.9769094138543517
+        },
+        {
+          "samples": 21,
+          "function": "compareToStored",
+          "module": "exec/agg/states.js",
+          "sharePct": 0.9325044404973357
+        },
+        {
+          "samples": 21,
+          "function": "decodeInt64Delta",
+          "module": "page/decode.js",
+          "sharePct": 0.9325044404973357
+        }
+      ],
+      "sharesPct": {
+        "other": 21.314387211367674,
+        "aggregation": 46.80284191829485,
+        "scan/page/storage": 30.77264653641208,
+        "GC": 1.1101243339253997
+      }
+    }
+  },
+  "threeWayDiagnostic": {
+    "lane": "Node isolated component",
+    "strategy": "both",
+    "controlledGC": false,
+    "warmups": 10,
+    "nativeOnly": true,
+    "record": false,
+    "layout": true,
+    "rows": 1000000,
+    "rounds": 5,
+    "paired": false,
+    "node": "v26.12.0",
+    "cpu": "Intel(R) Core(TM) i5-8279U CPU @ 2.40GHz",
+    "revision": "007cb1be08db87dda0715c8e829a14b7f3d40b0b",
+    "patchSha256": "3a6d335ba59af8b0a645bc41c6aa0d3c45b39c36d621edc9a0238fabdecc1444",
+    "sourceHashes": {
+      "scripts/next-wide-typed-bench.mts": "f1dbb5948b959c7b541b3c655544862889704e3366ca91949d97e04e1629f4b4",
+      "scripts/lib/wide-decoded-fixture.mts": "19bd9a4a8356b8b713ab40cb1e500e95044b5de09a1183da0676d33576400394",
+      "scripts/next-aggregation-light.mts": "2147032057818ece24add9593ebd60b9344bd6360b8a47ec7fb87d1b97980573",
+      "scripts/lib/paired-cpu.mts": "6c578f94613567937737d5be128634d293665fa1c87db3376324aa260873da69",
+      "scripts/lib/aggregation-light-kernels.mts": "db6b98e32b347539dbce7d94d5e7cb3f5a706934abfb57c9e92c14fa3223fa7e",
+      "packages/core/browser/next-agg-shapes.ts": "57228f8d3849eff1febec0c8fa130f2db03166c087393e66e3e425967a305354",
+      "packages/core/dist/next/exec/agg/typed-layout.js": "c8d5445ce1b008d84da56016846af8681d0b28519b768764a71907f2f946fe36",
+      "scripts/lib/wide-layout-kernel.mts": "68114b63d91aa7697a575acb1b373501761e03f40df6cd59992987f6e8cd365d",
+      "packages/core/dist/next/exec/agg/aggregate.js": "5828a8d60680fc6611bd4223febc92373d6f39bbf88b35ddcad1d976b4f0f3a2",
+      "packages/core/dist/next/exec/agg/states.js": "09780d0a424f16c852648b262302c7f39811578567ee212160827b34fd0b3a16",
+      "packages/core/dist/next/exec/agg/packed-averages.js": "3f1db7e2bde8ccbdc567cd2d4c78ce831516b863db1c6cd676008da253330606",
+      "packages/core/dist/next/exec/agg/packed-integers.js": "479493490f0afa9f05b8595614a5a61832a95aa44bae4694b695536ce8911298",
+      "packages/core/dist/next/exec/agg/groups.js": "51926ce8340184930571899d5a9201be7b436310af5f869d1d34cfa2170de5f7"
+    },
+    "fixture": "gen.js-equivalent values; 2048-row batches; first-seen page-local dictionaries; numeric widening is untimed setup",
+    "result": {
+      "id": "agg_3dims_20aggs",
+      "inputRows": 1000000,
+      "inputLayout": {
+        "numeric": "Float64, widening excluded as fixture setup",
+        "flatTextBytes": 17999463,
+        "dictionarySegments": [489, 489, 489, 489]
+      },
+      "resultRows": 1000,
+      "order": [
+        "native",
+        "operator",
+        "candidate",
+        "operator",
+        "candidate",
+        "native",
+        "candidate",
+        "native",
+        "operator",
+        "native",
+        "operator",
+        "candidate",
+        "operator",
+        "candidate",
+        "native"
+      ],
+      "loads": [
+        [2.85, 3.72, 5.17],
+        [2.94, 3.72, 5.16],
+        [2.94, 3.72, 5.16],
+        [2.94, 3.72, 5.16],
+        [2.94, 3.72, 5.16]
+      ],
+      "paired": null,
+      "cpuMs": {
+        "native": {
+          "samples": [98.468, 98.673, 97.585, 97.898, 97.971],
+          "median": 97.971,
+          "spread": 1.088000000000008
+        },
+        "operator": {
+          "samples": [319.115, 233.195, 305.004, 283.333, 224.79],
+          "median": 283.333,
+          "spread": 94.32500000000002
+        },
+        "candidate": {
+          "samples": [211.202, 213.766, 264.357, 193.92, 207.925],
+          "median": 211.202,
+          "spread": 70.43700000000004
+        }
+      },
+      "componentOnly": true,
+      "limits": "Optimistic fixed-workload TS observation, not a mathematical lower bound or universal JS impossibility result. Raw bound/split read flat decoded bytes/numbers and hash every text row. Native wide consumes the original decoded dictionary segments, hashes/maps all entries and translates every row within timing, then uses packed five-AVG state. No precomputed canonical IDs/ranks. All use exact collision equality. Highcard native includes an exact full-input min/max probe and direct-address COUNT/SUM state with an exact general-hash fallback for a wide domain; highcard split and both other DISTINCT kernels alias bound (not independent algorithms). Operator keeps original scan dictionary forms and includes matching sort/top-N, copying and governor/driver/task clock. Whole is prepared pipeline/owned frames; outer harness separately measures SQL through cleanup. Feed is scan/project/discard only, not additive with the other sinks. Setup/flattening (including numeric widening to Float64) excluded; kernel allocation/state/final ordering included. Borrowed immutable inputs need no key copy; no memory governor/spill/cancellation in plain TS. AVG Sxx retained. Plain kernels are diagnostics; operator/candidate configurations are reported separately."
+    }
+  },
+  "threeWayLimit": "Five rotating native/control/candidate rounds on the same decoded fixture. Diagnostic medians are not interchangeable with the nine-pair acceptance samples; all samples retained.",
+  "wholeTarget": {
+    "targetMs": 134,
+    "candidateMedianMs": 532.747,
+    "ratio": 3.9757238805970148,
+    "gapMs": 398.74699999999996,
+    "lane": "Node only, not browser Gate B"
+  }
+}

@@ -1,3 +1,4 @@
+import { wideRecord } from "./lib/wide-layout-kernel.mts";
 /** Isolated Gate B wide aggregate component: decoded inputs, exact same rows as gen.js.
  * No scan/storage/SQL CPU is attributed to this measurement. */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -23,6 +24,8 @@ import { StorageCore } from "../packages/core/dist/next/testing/storage-core.js"
 import { lightComparison } from "./next-aggregation-light.mts";
 
 const args = process.argv.slice(2);
+const layout = args.includes("--typed-layout");
+const record = args.includes("--record-prototype");
 const paired = args.includes("--paired");
 const option = (name: string, fallback: string) => {
   const index = args.indexOf(name);
@@ -61,6 +64,8 @@ const sourcePaths = [
   "scripts/lib/paired-cpu.mts",
   "scripts/lib/aggregation-light-kernels.mts",
   "packages/core/browser/next-agg-shapes.ts",
+  "packages/core/dist/next/exec/agg/typed-layout.js",
+  "scripts/lib/wide-layout-kernel.mts",
   "packages/core/dist/next/exec/agg/aggregate.js",
   "packages/core/dist/next/exec/agg/states.js",
   "packages/core/dist/next/exec/agg/packed-averages.js",
@@ -83,6 +88,8 @@ const metadata = {
   controlledGC,
   warmups,
   nativeOnly,
+  record,
+  layout,
   rows,
   rounds,
   paired,
@@ -110,11 +117,28 @@ try {
     undefined,
     undefined,
     {
+      typedLayout: layout,
       packedAverages: strategy !== "dictionary",
       packedIntegers: strategy !== "dictionary",
       batchDictionaryMinMax: strategy !== "packed",
     },
-    { ...(collect === undefined ? {} : { collect }), warmups, nativeOnly, paired },
+    {
+      ...(collect === undefined ? {} : { collect }),
+      warmups,
+      nativeOnly,
+      paired,
+      ...(record || layout
+        ? {
+            control: {
+              typedLayout: false,
+              packedAverages: true,
+              packedIntegers: true,
+              batchDictionaryMinMax: true,
+            },
+            ...(record ? { nativeKernel: wideRecord } : {}),
+          }
+        : {}),
+    },
   );
   await writeFile(join(output, "component.json"), JSON.stringify({ ...metadata, result }, null, 2));
   console.log(JSON.stringify(result.cpuMs));

@@ -412,6 +412,7 @@ export interface CompileOptions {
   readonly packedAverages?: boolean;
   /** False retains independent integer states as a benchmark control. */
   readonly packedIntegers?: boolean;
+  readonly typedLayout?: boolean;
   /** False retains per-row dictionary MIN/MAX updates as a benchmark control. */
   readonly batchDictionaryMinMax?: boolean;
   /** False retains the general hash recipe as a benchmark control. */
@@ -811,6 +812,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           groupedUpdateFusion: options.groupedUpdateFusion !== false,
           packedAverages: options.packedAverages !== false,
           packedIntegers: options.packedIntegers !== false,
+          typedLayout: options.typedLayout !== false,
           batchDictionaryMinMax: options.batchDictionaryMinMax !== false,
         };
         const domain =

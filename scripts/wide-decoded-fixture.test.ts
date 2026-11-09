@@ -77,6 +77,7 @@ it.each(seedsFor("wide-decoded-fixture", [0xb451, 0xb452]))(
       "pg-rows",
       "packed-kernel",
       "packed-integers",
+      "typed-layout",
     ]);
     await fc.assert(
       fc.asyncProperty(
@@ -112,6 +113,8 @@ it.each(seedsFor("wide-decoded-fixture", [0xb451, 0xb452]))(
               reach.reach("local-dictionaries");
             }
             const actual: unknown[][] = [];
+            const structural: unknown[][] = [];
+            let target = actual;
             const sink: Operator = {
               push(batch) {
                 for (const vector of batch.columns) {
@@ -120,7 +123,7 @@ it.each(seedsFor("wide-decoded-fixture", [0xb451, 0xb452]))(
                   expect(vector.data.layout).toBe(layoutOf(vector.type));
                 }
                 for (let i = 0; i < batch.length; i++)
-                  actual.push(batch.columns.map((v) => lib.valueAt(v, i)));
+                  target.push(batch.columns.map((v) => lib.valueAt(v, i)));
                 reach.reach("physical-layout");
                 return "ready";
               },
@@ -134,7 +137,12 @@ it.each(seedsFor("wide-decoded-fixture", [0xb451, 0xb452]))(
               { arena, params: { slots: [] }, input: fixture.input },
               lib.UNCHARGED,
               sink,
-              { packedAverages: true, packedIntegers: true, batchDictionaryMinMax: true },
+              {
+                typedLayout: false,
+                packedAverages: true,
+                packedIntegers: true,
+                batchDictionaryMinMax: true,
+              },
             );
             let index = 0;
             try {
@@ -156,6 +164,36 @@ it.each(seedsFor("wide-decoded-fixture", [0xb451, 0xb452]))(
             reach.reach("packed-kernel");
             expect(aggregate.packedIntegerRows).toBeGreaterThan(0);
             reach.reach("packed-integers");
+            // Compare both plans against the same independent PG execution; retain reach
+            // for the former kernels as well as the automatically selected structural bank.
+            target = structural;
+            const structuralArena = new OutputArena(lib.UNCHARGED, 2048);
+            const next = new AggregateOperator(
+              fixture.rel,
+              { arena: structuralArena, params: { slots: [] }, input: fixture.input },
+              lib.UNCHARGED,
+              sink,
+            );
+            let nextIndex = 0;
+            try {
+              await drive(
+                {
+                  next: () => {
+                    const batch = batches[nextIndex++];
+                    return batch ? { batch } : null;
+                  },
+                  abort: () => undefined,
+                },
+                next,
+              );
+              expect(Reflect.get(next, "typedLayoutRows") ?? 0).toBe(
+                batches.reduce((n, b) => n + (b.selection?.count ?? b.length), 0),
+              );
+              reach.reach("typed-layout");
+            } finally {
+              next.abort(undefined);
+              structuralArena.close();
+            }
             const values: string[] = [];
             let observedNull = false;
             for (const batch of batches)
@@ -209,6 +247,7 @@ it.each(seedsFor("wide-decoded-fixture", [0xb451, 0xb452]))(
               ],
             );
             expect(keys(actual)).toEqual(expected);
+            expect(keys(structural)).toEqual(expected);
             reach.reach("pg-rows");
             if (observedNull) reach.reach("nullable-count");
           }

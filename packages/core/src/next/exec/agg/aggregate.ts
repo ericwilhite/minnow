@@ -52,6 +52,7 @@ import { ScalarByteDistinct, supportsScalarByteDistinct } from "./scalar-byte-di
 import { GroupTopN, supportsGroupTopN, type GroupTopNSpec } from "./group-top-n.js";
 import { GroupTable } from "./groups.js";
 import { PackedAverages } from "./packed-averages.js";
+import { TypedLayout, typedLayoutCalls } from "./typed-layout.js";
 import { PackedIntegers, packedIntegerCalls } from "./packed-integers.js";
 import { accumulatorFor, fusedSums, updateGroupedPair, type Accumulator } from "./states.js";
 
@@ -136,6 +137,8 @@ export interface AggregateOptions {
   /** Reduce dictionary MIN/MAX to one candidate per group/batch. */
   readonly batchDictionaryMinMax?: boolean;
   readonly packedIntegers?: boolean;
+  /** False retains the former separate numeric banks (benchmark control). */
+  readonly typedLayout?: boolean;
 }
 
 /** Refuses what the operator cannot compile, before anything is allocated. */
@@ -158,6 +161,8 @@ function preflight(rel: AggregateRel): void {
 }
 
 export class AggregateOperator implements Operator {
+  #layout: TypedLayout | null = null;
+  readonly #layoutMembers = new Set<number>();
   #packedIntegers: PackedIntegers | null = null;
   readonly #packedIntegerMembers = new Set<number>();
   readonly #packed = new Map<number, { bank: PackedAverages; columns: readonly number[] }>();
@@ -241,7 +246,17 @@ export class AggregateOperator implements Operator {
       );
       const shared = new Map<string, CompiledAggregate>();
       const packedMembers = new Map<number, Accumulator>();
-      if (options.packedIntegers === true && rel.groupBy.length > 0) {
+      if (options.typedLayout !== false && rel.groupBy.length > 0) {
+        const calls = typedLayoutCalls(rel.aggregates, context.input);
+        if (calls !== null) {
+          this.#layout = new TypedLayout(calls, context.input, charge);
+          for (const member of this.#layout.members) {
+            packedMembers.set(member.index, member.accumulator);
+            this.#layoutMembers.add(member.index);
+          }
+        }
+      }
+      if (this.#layout === null && options.packedIntegers === true && rel.groupBy.length > 0) {
         const calls = packedIntegerCalls(rel.aggregates, context.input);
         if (calls !== null) {
           this.#packedIntegers = new PackedIntegers(calls, context.input, charge);
@@ -251,7 +266,7 @@ export class AggregateOperator implements Operator {
           }
         }
       }
-      if (options.packedAverages === true && rel.groupBy.length > 0) {
+      if (this.#layout === null && options.packedAverages === true && rel.groupBy.length > 0) {
         for (let k = 0; k + 4 < rel.aggregates.length; k++) {
           const calls = rel.aggregates.slice(k, k + 5);
           if (
@@ -308,7 +323,10 @@ export class AggregateOperator implements Operator {
         this.#aggregates.push(compiled);
         if (sharing) shared.set(key, compiled);
       });
-      this.#groups = keyTypes.length === 0 ? null : new GroupTable(keyTypes, charge);
+      this.#groups =
+        keyTypes.length === 0
+          ? null
+          : new GroupTable(keyTypes, charge, capacity, options.typedLayout !== false);
       const top = options.outputTopN;
       if (top && supportsGroupTopN(rel, context.input, top)) this.#top = new GroupTopN(top, charge);
       this.#sortPasses =
@@ -442,6 +460,9 @@ export class AggregateOperator implements Operator {
         ? this.#sortByGroup(gids, batch.selection, length, groups.groupCount)
         : null;
     const integerRows = sorted ?? batch.selection;
+    const layoutFused =
+      this.#layout?.tryUpdate(batch, gids, rowsIn(integerRows), countIn(integerRows, length)) ??
+      false;
     const integerFused =
       this.#packedIntegers?.tryUpdate(
         batch,
@@ -452,6 +473,7 @@ export class AggregateOperator implements Operator {
     for (let index = 0; index < this.#aggregates.length; index++) {
       const aggregate = this.#aggregates[index];
       if (aggregate === undefined || !aggregate.updates || (scalar && aggregate.fusable)) continue;
+      if (layoutFused && this.#layoutMembers.has(index)) continue;
       if (integerFused && this.#packedIntegerMembers.has(index)) continue;
       const next = this.#aggregates[index + 1];
       const packed = this.#packed.get(index);
@@ -518,6 +540,10 @@ export class AggregateOperator implements Operator {
     let rows = 0;
     for (const { bank } of this.#packed.values()) rows += bank.fusedRows;
     return rows;
+  }
+
+  get typedLayoutRows(): number {
+    return this.#layout?.fusedRows ?? 0;
   }
 
   get packedIntegerRows(): number {
