@@ -1647,6 +1647,27 @@ capacity is insufficient. The merge already has prepaid credit: this reach state
 ownership exchange, not a claim that the transfer is required for progress. The separate
 protected-reader minimum campaign checks merge progress while real reader bytes remain held.
 
+### Rebuild-core catalog checkpoints
+
+Dropping an index does not erase a build still needed by an older catalog checkpoint. The
+write path retains that obligation until a published root carries the build or covers its
+DROP. A flush whose selected catalog still requires the old index writes its backfill runs;
+quiet builds get an empty root. The catalog/index invariant remains enforced.
+
+The generated checkpoint campaign uses seeds 702 and 704, with 24 histories per seed on
+memory, simulated disk and fake IndexedDB at a 32 MiB owner cap. It varies empty and nonempty builds, multiple
+cancellations, drop order and table creation after a cancelled build. A held flush and two
+later builds force the catalog prefix between CREATE and DROP. Every published catalog is
+checked against the committed DDL history, and historical index runs are read independently
+to check their keys and row IDs.
+
+The campaign also interrupts publication after preparation, reopens the old root and log,
+and verifies continued durable writes, later index replacement, log recycling and another
+reopen. It checks the surviving indexes through point and range reads. Pending records are charged
+before allocation and returned when no checkpoint prefix needs them, or when the owner closes.
+The campaign observes those native allocations independently and checks that all credit returns.
+This is finite Node regression evidence, not a native-browser or exhaustive power-loss proof.
+
 ### Rebuild-core staged rollback
 
 The generated staged-residual campaign commits a deletion, then stages and rolls back new rows
