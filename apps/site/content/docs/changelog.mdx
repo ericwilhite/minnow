@@ -13,6 +13,10 @@ compatibility policy and release process.
 Affected packages: `@minnowdb/core` (SQL feature metadata and compatibility documentation) and
 `@minnowdb/devtools` (failure explanations, for its next release after 0.3.9).
 
+The compatibility page, SELECT/DDL guides, and agent rules now explicitly document that timestamp
+literals and values in the current engine keep millisecond precision and discard extra fractional
+digits. Runtime behavior, public API, and stored formats are unchanged; no migration is needed.
+
 The SQL feature matrix now records the existing refusal of parameter frame offsets, including
 `ROWS $1 PRECEDING`. The SELECT guide and compatibility notes also distinguish fractional
 `RANGE` offsets over integer keys (accepted here, rejected by PostgreSQL with `0A000`), validation

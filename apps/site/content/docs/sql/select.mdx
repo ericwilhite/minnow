@@ -117,6 +117,11 @@ PostgreSQL does: `'2026-10-15 08:00:00'::date` and `day = '2026-10-15T08:00:00Z'
 beside a `DATE` column is read as that column's type, a day. Explicit TEXT casts retain text comparison semantics: comparing
 `'1'::TEXT` to the number `1` throws rather than interpreting the text as a number.
 
+Timestamp literals and values in the current engine keep millisecond precision. Fractional
+digits beyond the first three are discarded before comparisons, arithmetic, or text output.
+For example, `TIMESTAMP '2000-02-29 12:34:56.123400'::text` returns
+`2000-02-29 12:34:56.123`, while PostgreSQL returns `2000-02-29 12:34:56.1234`.
+
 Going the other way, a datetime turned into text reads as PostgreSQL writes it in a UTC session:
 `CAST(placed_at AS TEXT)` is `2025-03-14 09:30:00+00`, an interval is `5 days 02:30:00`, and
 `date - date` is a whole number of days, so dividing it counts whole weeks.

@@ -246,6 +246,12 @@ add validation and semantics without widening hot scan vectors:
 | array              | `INTEGER[]`, `TEXT[]`, and other core arrays            | JSON `string`                              |
 | enum               | a name declared by `CREATE TYPE … AS ENUM`              | member `string`                            |
 
+`TIMESTAMP` and `TIMESTAMPTZ` values, including timestamp literals, keep millisecond precision
+in the current engine. Fractional digits beyond the first three are discarded before
+comparisons, arithmetic, or text output. For example,
+`TIMESTAMP '2000-02-29 12:34:56.123400'::text` returns `2000-02-29 12:34:56.123`;
+PostgreSQL returns `2000-02-29 12:34:56.1234`.
+
 Both datetime kinds store the same UTC instant, compare and sort alike, do the same arithmetic,
 and come back to JavaScript as a `Date`. They differ only in text, which follows PostgreSQL in a
 UTC session — through `CAST(x AS TEXT)` or `x::text`, `||`, `CONCAT`, `FORMAT`, `TO_CHAR`, and the
@@ -257,7 +263,7 @@ JSON constructors. A `TIMESTAMPTZ` column is an instant, so `CAST(placed_at AS T
 carries no zone: `2025-03-14 09:30:00`, and `"2025-03-14T09:30:00"` in JSON. Views, CTEs, derived
 tables, and `CREATE TABLE … AS` keep each column's kind; mixing the two in `CASE`, `COALESCE`, or a
 `UNION` gives `TIMESTAMPTZ`, as PostgreSQL does. A precision such as `TIMESTAMP(3)` is accepted and
-ignored: values keep their milliseconds. Every text form reads back as the same instant. Text
+ignored; it does not change millisecond precision. Every text form reads back as the same instant. Text
 written into either kind is read as an instant, so a `TIMESTAMP` column stores
 `'2025-03-14 09:30:00+02'` as `07:30` UTC, where PostgreSQL would drop the offset and keep
 `09:30`. A datetime column written by core 0.16.0 or earlier is `TIMESTAMPTZ`, whatever its DDL

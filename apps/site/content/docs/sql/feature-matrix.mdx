@@ -36,6 +36,12 @@ PostgreSQL grammar. These supported features have narrower limits:
 - exact `NUMERIC`, JSON/JSONB, UUID, arrays, `DATE`, `TIME`, intervals, and enums keep their full
   values internally and return strings at the JavaScript boundary.
 
+Timestamp literals and `TIMESTAMP`/`TIMESTAMPTZ` values in the current engine keep millisecond
+precision, rather than PostgreSQL's microseconds. Fractional digits beyond the first three are
+discarded before comparisons, arithmetic, or text output. For example,
+`TIMESTAMP '2000-02-29 12:34:56.123400'::text` returns `2000-02-29 12:34:56.123`;
+PostgreSQL returns `2000-02-29 12:34:56.1234`.
+
 Minnow deliberately excludes three PostgreSQL server or storage-model features:
 
 - `UPDATE` and `DELETE` on tables without row identity;
