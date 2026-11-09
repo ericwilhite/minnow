@@ -1357,7 +1357,8 @@ profiles are outside the component timing; query materialization remains in whol
 The report includes CPU samples, full spreads, checkpointed partial rounds, profiles and the
 actual transformed JS needed to interpret line-level ticks. No baseline is an executor path.
 Unbounded, value-producing `indexRange` nodes require the same internal `keyOrder:true`
-diagnostic opt-in as SQL until the charged streaming cursor lands. The default executor
+diagnostic opt-in as SQL while the cursor's separate admission remains outside the complete
+execution minimum. The default executor
 refuses them at prepare with `UnsupportedPlanError`, including under LIMIT zero. Opted-in
 nodes use the pinned index cursor and the same
 physical-order payload fetch. The internal `keyOrder:true` option lets a direct primary-key
@@ -1371,13 +1372,12 @@ once and drains an outstanding write before its output arena closes. Restore buf
 their normal admitted minimum between batches, independently of repayable loans;
 physically monotonic cursor batches can stream payload
 without an ordinal sort. Otherwise the charged, spillable sort restores cursor order.
-The current write-path range cursor still collects the whole range internally before its first
-output. Early executor termination therefore bounds requested locators and payload reads, but
-does not yet bound index work or scratch by LIMIT. Streaming cursor work belongs to the write
-path; `--only scan_first_page_ordered --whole-compare key-order --component key-order` measures
-the current implementation as a Node diagnostic, not first-page performance acceptance.
-The SQL shortcut is off by default until the streaming cursor meets that acceptance rule;
-ordinary owner composition retains the scan/sort recipe.
+The write-path cursor now merges stored runs and visible memory deltas lazily in key order,
+with charged bounded scratch. Its admission and read buffers remain separate from the
+executor's query-owned read minimum. The SQL shortcut stays off by default pending that
+integration and first-page performance acceptance; ordinary owner composition retains the
+scan/sort recipe. `--only scan_first_page_ordered --whole-compare key-order --component key-order`
+measures the opt-in implementation as a Node diagnostic.
 The diagnostic cursor/fetch recipe also remains outside the complete query-owned read-minimum proof used by ordinary scans.
 The optional index recipe includes integer parameter bytes when checking its fixed minimum;
 other input kinds retain the generic recipe. Zero still admits and binds all inputs through

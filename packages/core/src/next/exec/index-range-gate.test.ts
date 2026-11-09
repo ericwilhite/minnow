@@ -1,4 +1,4 @@
-/** The uncharged eager cursor is diagnostic-only until the streaming dependency lands. */
+/** Cursor/fetch admission remains diagnostic-only until it shares the complete query minimum. */
 import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
@@ -59,7 +59,7 @@ it.each(seedsFor("next-index-range-gate", [0xe133, 0xe134]))(
         ] as const) {
           try {
             createExecutor(options).prepare(plan);
-            throw new Error("eager cursor was admitted");
+            throw new Error("diagnostic cursor was admitted");
           } catch (error) {
             expect(error).toBeInstanceOf(UnsupportedPlanError);
             expect((error as UnsupportedPlanError).construct).toBe("indexRange");

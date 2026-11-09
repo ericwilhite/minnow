@@ -477,7 +477,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       case "indexRange": {
         if (options.keyOrder !== true)
           throw new UnsupportedPlanError(
-            "index range requires the diagnostic keyOrder opt-in; the eager cursor and fetch lack query-minimum integration",
+            "index range requires the diagnostic keyOrder opt-in; the cursor and fetch lack query-minimum integration",
             {
               construct: "indexRange",
             },
