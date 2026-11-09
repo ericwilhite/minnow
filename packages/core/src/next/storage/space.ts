@@ -57,12 +57,7 @@ import {
 import { RetirementTickets } from "./retirement-tickets.js";
 import { pairPhase, type MetadataWork } from "./metadata-work.js";
 import { sortExtents, mergeExtents, openPairs } from "./metadata-extents.js";
-import {
-  validateRetirements,
-  validateIncoming,
-  releaseWorklist,
-  discardPrepared,
-} from "./publication-validation.js";
+import { validatePublication, releaseWorklist, discardPrepared } from "./publication-validation.js";
 const alignDown = (value: number) => value - (value % DATA_ALIGN);
 export const BUILDER_BUFFER_BYTES = 256 * 1024;
 class Mutex {
@@ -950,16 +945,6 @@ class Space implements ExtentSpace {
           });
         throw error;
       }
-      // Retirement authority is ONLY the two immutable root lists. No free-map complement,
-      // allocator allocation test or mutable unpublished-writer observation authorizes it.
-      const retiredBytes = await validateRetirements(
-        this.journal,
-        this.#currentSnapshot,
-        next,
-        sortedClaims,
-        io,
-        change,
-      );
       ownerRaw = await saveExtentInput(
         this.journal,
         (function* () {
@@ -978,15 +963,25 @@ class Space implements ExtentSpace {
       owners = await pairPhase(this.journal, io, "merge", (slots) =>
         sortExtents(this.journal, ownerRaw, "refuse", change, slots),
       );
-      unused = await validateIncoming(
+      // Retirement authority is ONLY the two immutable root lists. No free-map complement,
+      // allocator allocation test or mutable unpublished-writer observation authorizes it.
+      const validated = await validatePublication(
         this.journal,
         this.#currentSnapshot,
         next,
+        sortedClaims,
         owners,
         io,
         change,
       );
-      await this.#tickets.prepare(this.generation + 1, this.#currentSnapshot, next, retiredBytes);
+      unused = validated.unused;
+      await this.#tickets.prepare(
+        this.generation + 1,
+        this.#currentSnapshot,
+        next,
+        validated.retiredBytes,
+        sortedClaims,
+      );
       change.signal?.throwIfAborted();
       // Frees/transitions remain blocked through native publish. Other reservations can only
       // consume tracked free bytes or EOF; they cannot take rooted or supplied sealed ownership.

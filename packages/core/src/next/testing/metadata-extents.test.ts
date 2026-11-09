@@ -339,7 +339,9 @@ for (const stop of [1, 200, 8_000, 16_000, 22_000])
     const budget = countingBudget(METADATA_WORKSPACE_BYTES),
       workspace = MetadataWorkspace.create(budget),
       journal = new MetadataJournal(new ScriptedMetadataPages(), workspace);
-    const count = 8_000;
+    // Keep every existing cancellation point reachable after scalar clock probes are batched.
+    // More input extends the history; no yielded-task stop, retry or assertion is removed.
+    const count = stop <= 200 ? 8_000 : stop <= 16_000 ? 160_000 : 320_000;
     let input = 0;
     try {
       await workspace.run("source", async () => {
@@ -371,6 +373,7 @@ for (const stop of [1, 200, 8_000, 16_000, 22_000])
           }),
         ).rejects.toBe(reason);
         expect(yields).toBe(stop);
+        if (count > 8_000) reach.reach("extended cancellation history");
         expect((await journal.describe(input)).refs).toBe(1);
         const sorted = await sortExtents(journal, input, "refuse");
         const cursor = new ExtentPairs(await journal.cursor(sorted, 1));

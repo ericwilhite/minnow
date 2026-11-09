@@ -1,5 +1,5 @@
-/** R8 tickets live on disk. The queue retains handles for immutable A/B snapshots, never a
- * resident retired-offset index. Caller holds the workspace lock before the mutation barrier;
+/** R8 tickets live on disk. The queue retains immutable A/B snapshots and, when publication
+ * already proved it, their disk difference; never a resident retired-offset index. Caller holds the workspace lock before the mutation barrier;
  * all methods use prepaid frames and perform no governor admission or caller wait.
  */
 import { pauseIfDue, type TaskWork } from "../task.js";
@@ -9,7 +9,7 @@ import { MetadataJournal } from "./metadata-journal.js";
 import { pairPhase, type MetadataWork } from "./metadata-work.js";
 import { disposeSnapshot } from "./extent-snapshot.js";
 
-const TICKET_BYTES = 24;
+const TICKET_BYTES = 32;
 export const RECLAIM_BATCH_RANGES = 256;
 interface Ticket {
   readonly handle: number;
@@ -17,6 +17,8 @@ interface Ticket {
   readonly before: number;
   readonly after: number;
   readonly bytes: number;
+  /** Exact A-B worklist already proved during publication, or zero for startup/legacy callers. */
+  readonly difference: number;
   readonly next: number;
 }
 export class RetirementTickets {
@@ -29,28 +31,42 @@ export class RetirementTickets {
     return this.#waiting;
   }
   /** All fallible ticket I/O is prepared before native root publication. Workspace serialization
-   * keeps the provisional tail link invisible to a reclaimer until commit or abort.
+   * keeps the provisional tail link invisible to a reclaimer until commit or abort. `difference`,
+   * when nonzero, must be the immutable sorted claims validated against before/after by the
+   * publication proof, with exactly `bytes` rounded bytes. It is retained, never copied into RAM.
    */
-  async prepare(generation: number, before: number, after: number, bytes: number): Promise<void> {
+  async prepare(
+    generation: number,
+    before: number,
+    after: number,
+    bytes: number,
+    difference = 0,
+  ): Promise<void> {
     if (this.#prepared !== null) throw new TypeError("A ticket is already prepared");
     if (
       !Number.isSafeInteger(generation) ||
       generation < 0 ||
       !Number.isSafeInteger(bytes) ||
-      bytes < 0
+      bytes < 0 ||
+      !Number.isSafeInteger(difference) ||
+      difference < 0
     )
       throw new RangeError("Invalid retirement ticket");
     if (bytes === 0) {
-      this.#prepared = { handle: 0, generation, before, after, bytes, next: 0 };
+      this.#prepared = { handle: 0, generation, before, after, bytes, difference: 0, next: 0 };
       return;
     }
-    const state = { handle: 0, keptBefore: false, keptAfter: false };
+    const state = { handle: 0, keptBefore: false, keptAfter: false, keptDifference: false };
     try {
       await this.journal.workspace.run("spool", async () => {
         await this.journal.retain(before);
         state.keptBefore = true;
         await this.journal.retain(after);
         state.keptAfter = true;
+        if (difference !== 0) {
+          await this.journal.retain(difference);
+          state.keptDifference = true;
+        }
         const writer = await this.journal.writer(1, generation);
         try {
           const value = new Uint8Array(TICKET_BYTES),
@@ -58,6 +74,7 @@ export class RetirementTickets {
           view.setFloat64(0, before, true);
           view.setFloat64(8, after, true);
           view.setFloat64(16, bytes, true);
+          view.setFloat64(24, difference, true);
           await writer.append(value);
           state.handle = await writer.finish();
           if (this.#tail !== 0) await this.journal.link(this.#tail, state.handle);
@@ -66,12 +83,21 @@ export class RetirementTickets {
           throw error;
         }
       });
-      this.#prepared = { handle: state.handle, generation, before, after, bytes, next: 0 };
+      this.#prepared = {
+        handle: state.handle,
+        generation,
+        before,
+        after,
+        bytes,
+        difference,
+        next: 0,
+      };
     } catch (error) {
       for (const owned of [
         state.handle,
         state.keptBefore ? before : 0,
         state.keptAfter ? after : 0,
+        state.keptDifference ? difference : 0,
       ])
         if (owned !== 0) await disposeSnapshot(this.journal, owned).catch(() => undefined);
       throw error;
@@ -97,6 +123,7 @@ export class RetirementTickets {
       await this.journal.release(ticket.handle);
       await this.journal.release(ticket.before);
       await this.journal.release(ticket.after);
+      if (ticket.difference !== 0) await this.journal.release(ticket.difference);
     });
   }
   async #read(handle: number): Promise<Ticket> {
@@ -112,8 +139,13 @@ export class RetirementTickets {
         const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
         const before = view.getFloat64(0, true),
           after = view.getFloat64(8, true),
-          size = view.getFloat64(16, true);
-        if (![before, after, size].every((n) => Number.isSafeInteger(n) && n > 0))
+          size = view.getFloat64(16, true),
+          difference = view.getFloat64(24, true);
+        if (
+          ![before, after, size].every((n) => Number.isSafeInteger(n) && n > 0) ||
+          !Number.isSafeInteger(difference) ||
+          difference < 0
+        )
           throw new StoreCorruptionError("Bad retirement ticket coordinates");
         return {
           handle,
@@ -122,6 +154,7 @@ export class RetirementTickets {
           before,
           after,
           bytes: size,
+          difference,
         };
       } finally {
         await cursor.close();
@@ -145,17 +178,22 @@ export class RetirementTickets {
       let worklist = 0,
         failed = false;
       try {
-        await pairPhase(this.journal, io, "merge", async (slots) => {
-          worklist = await mergeExtents(
-            this.journal,
-            ticket.before,
-            ticket.after,
-            "difference",
-            work,
-            "exact",
-            slots,
-          );
-        });
+        // A supplied difference has already been checked against these exact immutable roots
+        // under the publication barrier. Keep their references for R8/audit, but do not rescan
+        // them at reclaim. Startup tickets still derive the difference here.
+        if (ticket.difference !== 0) worklist = ticket.difference;
+        else
+          await pairPhase(this.journal, io, "merge", async (slots) => {
+            worklist = await mergeExtents(
+              this.journal,
+              ticket.before,
+              ticket.after,
+              "difference",
+              work,
+              "exact",
+              slots,
+            );
+          });
         await this.journal.workspace.run("release", async () => {
           const pairs = await openPairs(this.journal, worklist, 1, true);
           try {
@@ -189,6 +227,7 @@ export class RetirementTickets {
         await this.journal.workspace.run("spool", async () => {
           await this.journal.release(ticket.before);
           await this.journal.release(ticket.after);
+          if (ticket.difference !== 0) await this.journal.release(ticket.difference);
           await this.journal.release(ticket.handle);
         });
         this.#head = ticket.next;
@@ -197,7 +236,7 @@ export class RetirementTickets {
         failed = true;
         throw error;
       } finally {
-        if (worklist !== 0) {
+        if (worklist !== 0 && worklist !== ticket.difference) {
           await discardWork(this.journal, worklist, failed);
         }
       }

@@ -142,14 +142,20 @@ export class ExtentPairWriter {
   readonly #view = new DataView(this.#pair.buffer);
   #offset = -1;
   #length = 0;
+  #steps = 0;
   constructor(
     readonly writer: ChainWriter,
     readonly ordered: boolean,
     readonly duplicates: Duplicates = "refuse",
   ) {}
   append(offset: number, length: number, work?: TaskWork): void | Promise<void> {
-    const pending = pauseIfDue(work);
-    if (pending !== undefined) return pending.then(() => this.#append(offset, length, work));
+    // The producer and native-I/O paths also check the same task clock. Bound this scalar
+    // fast path to 128 appends per probe, as the pair merge/copy loops do, rather than
+    // probing performance.now() and cancellation again for every 16-byte pair.
+    if (this.#steps++ % 128 === 0) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) return pending.then(() => this.#append(offset, length, work));
+    }
     return this.#append(offset, length, work);
   }
   #append(offset: number, length: number, work?: TaskWork): void | Promise<void> {

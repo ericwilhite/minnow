@@ -1946,8 +1946,21 @@ owners close. They fill ordinary governor capacity, sometimes hold a caller
 progress loan, and reject any new publication admission. Reclaim checks the
 next-durable-generation guard and pin guard separately. An independent native
 buffer-constructor probe permits only two owned frames in the slab-backed
-composition; every release batch must contain at most 256 ranges. Separate
-histories keep fragmentation debt across rebuilds, recover it when gaps
+composition; every release batch must contain at most 256 ranges. Each seeded backlog mixes
+validated worklists retained from publication with startup-style differences derived at reclaim.
+Cursor counts require validated tickets to avoid rescanning either root, even after the caller
+releases its proof reference. Abort must return that reference. A generated publication-merge
+suite checks exact rounded retirements and sealed-writer ownership against an independent
+coordinate partition, including missing/extra/duplicate claims, changed shared lengths and
+incoming overlaps on either side. Each immutable root opens once for both proofs; this cost
+guard counts cursors rather than elapsed time. Both campaigns declare their reach.
+The pair-progress seeds also bound clock probes by slices instead of scalar output, and cancel
+inside a merge within 512 consumed pairs before retrying it. All original cancellation stops
+(1, 200, 8,000, 16,000 and 22,000 yielded tasks) remain. Their three larger input histories
+extend to 160,000 or 320,000 extents so the late stops stay reachable after redundant scalar
+clock probes are removed; none of their retries or assertions is removed.
+The directory coverage workload keeps its rows, assertions, coverage settings and 300-second
+deadline. Separate histories keep fragmentation debt across rebuilds, recover it when gaps
 coalesce, and fail each reconstruction native-write boundary, including cursor
 cleanup after the arena was allocated. These component histories precede the
 full extent-space and write-path integration campaign.
