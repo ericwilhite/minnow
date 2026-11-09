@@ -2280,3 +2280,15 @@ export const GUIDE9_JSON_CAST_REACH = [
   "original ambiguity",
   "native typed refusal",
 ] as const;
+
+/** Scalar pair loops yield at native page I/O or shared-clock slices, not per scalar. */
+export const PAIR_PROGRESS_REACH = [
+  "frame view reuse",
+  "union",
+  "difference",
+  "retirements",
+  "incoming",
+  "unused supplied output",
+  "page boundary",
+  "exact cleanup",
+] as const;

@@ -1,6 +1,8 @@
 /** Ownership checks use immutable current/new snapshots and sealed supplied-writer records.
  * The lossy map's complement is never consulted. Caller marks those writers publishing before
  * yielding, holds the mutation barrier through native publish, and owns S and the workspace.
+ * Preserve the pair APIs' synchronous fast paths; await only actual I/O/clock promises, not
+ * each scalar of the immutable roots. Checks and bounded shared-clock checkpoints stay exact.
  */
 import { pauseIfDue, type TaskWork } from "../task.js";
 import { DATA_ALIGN, StoreCorruptionError } from "./contract.js";
@@ -65,14 +67,17 @@ export function validateRetirements(
       while (hasA) {
         if (steps++ % 128 === 0) await check(work);
         if (hasB && b.offset < a.offset) {
-          hasB = await b.next(work);
+          const nextB = b.next(work);
+          hasB = typeof nextB === "boolean" ? nextB : await nextB;
           continue;
         }
         if (hasB && a.offset === b.offset) {
           if (a.length !== b.length)
             throw new StoreCorruptionError("Current/new roots disagree on extent length");
-          hasA = await a.next(work);
-          hasB = await b.next(work);
+          const nextA = a.next(work);
+          hasA = typeof nextA === "boolean" ? nextA : await nextA;
+          const nextB = b.next(work);
+          hasB = typeof nextB === "boolean" ? nextB : await nextB;
           continue;
         }
         const size = sizeOf(a.length);
@@ -81,10 +86,12 @@ export function validateRetirements(
             throw new RangeError(
               `publish: retirement does not match the current/new root difference at ${String(a.offset)}`,
             );
-          hasC = await c.next(work);
+          const nextC = c.next(work);
+          hasC = typeof nextC === "boolean" ? nextC : await nextC;
         }
         total += size;
-        hasA = await a.next(work);
+        const nextA = a.next(work);
+        hasA = typeof nextA === "boolean" ? nextA : await nextA;
       }
       if (hasC)
         throw new RangeError("publish: retirement is not in the current/new root difference");
@@ -132,12 +139,17 @@ export function validateIncoming(
       while (hasB) {
         if (steps++ % 128 === 0) await check(work);
         while (hasC && c.offset < b.offset) {
-          await unused.append(c.offset, c.length, work);
-          hasC = await c.next(work);
+          {
+            const pending = unused.append(c.offset, c.length, work);
+            if (pending !== undefined) await pending;
+          }
+          const nextC = c.next(work);
+          hasC = typeof nextC === "boolean" ? nextC : await nextC;
         }
         while (hasA && a.offset < b.offset) {
           lastCurrentEnd = a.offset + sizeOf(a.length);
-          hasA = await a.next(work);
+          const nextA = a.next(work);
+          hasA = typeof nextA === "boolean" ? nextA : await nextA;
         }
         if (hasA && a.offset === b.offset) {
           if (a.length !== b.length)
@@ -151,13 +163,19 @@ export function validateIncoming(
             throw new RangeError(
               `publish: incoming extent at ${String(b.offset)} is neither current-root nor supplied sealed-writer output`,
             );
-          hasC = await c.next(work);
+          const nextC = c.next(work);
+          hasC = typeof nextC === "boolean" ? nextC : await nextC;
         }
-        hasB = await b.next(work);
+        const nextB = b.next(work);
+        hasB = typeof nextB === "boolean" ? nextB : await nextB;
       }
       while (hasC) {
-        await unused.append(c.offset, c.length, work);
-        hasC = await c.next(work);
+        {
+          const pending = unused.append(c.offset, c.length, work);
+          if (pending !== undefined) await pending;
+        }
+        const nextC = c.next(work);
+        hasC = typeof nextC === "boolean" ? nextC : await nextC;
       }
       produced = await writer.finish();
       writer = null;

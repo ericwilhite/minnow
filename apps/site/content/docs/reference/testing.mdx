@@ -1808,6 +1808,13 @@ fails every native write boundary in turn, preserving the original error and
 returning the workspace charge. Mutants that truncate offsets, reclaim shared
 extents or copy the whole producer before slicing must fail.
 
+Pair-progress histories count microtask continuations while merging and validating immutable
+extent streams, and count output-frame view allocations. They vary input size and ownership overlap, compare every output with independent
+expected pairs, cross native page boundaries, and require exact workspace cleanup. In-frame
+scalar operations stay synchronous and reuse admitted frame views; actual native I/O and shared-clock pauses still suspend.
+The continuation check freezes its clocks to isolate scheduling overhead. Separate clock,
+cancellation, corruption and physical-failure suites exercise those boundaries.
+
 Ordered-root startup regressions require a streaming union without the unordered free-map sort,
 validate scattered list-page allocations, and refuse overlapping, descending or inconsistent
 extents before reclaim. Full audit and test-build semantic checks remain enabled separately.
