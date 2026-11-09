@@ -9,13 +9,14 @@
  * must change representation (an int64 value outside the f64-safe range, a decimal coefficient past
  * int64, the first null, a varlen arena that is full), it allocates new arrays and copies; views
  * already handed out keep the old arrays, whose slots are still exactly right for their length.
+ * `append` borrows its source only until it returns or throws. Its reusable source slot is cleared
+ * on both exits: owned chunk views keep copied arrays, never a previous producer's entire batch.
  *
  * ## Frame column codec (`encodeColumn` / `decodeColumn`)
  * The write path's log body stores inserted rows column by column (format/log-frame.ts
  * `TableChange.inserts.columns`): a layout tag, a validity bitmap (or none), then the layout's raw
  * little-endian arrays. Decoding yields a fresh `FlatVector` that replay appends like any batch.
  */
-import { copyBits } from "../page/bits.js";
 import { StoreCorruptionError } from "../storage/contract.js";
 import { layoutOf, type PhysicalType } from "../types.js";
 import { int128At, setInt128 } from "../vector/int128.js";
@@ -25,6 +26,7 @@ import { DecimalSpecial } from "../vector/vector.js";
 import {
   ByteReader,
   ByteWriter,
+  type ByteSink,
   charged,
   copyRange,
   need,
@@ -34,9 +36,9 @@ import {
 
 export const MEMORY_CHUNK_ROWS = 2048;
 
-/** A source slot: the flat vector holding it and its index there (−1: null). */
+/** A borrowed source slot: flat exists only during append; index −1 denotes a null value. */
 interface SourceSlot {
-  flat: FlatVector;
+  flat: FlatVector | null;
   index: number;
 }
 
@@ -44,7 +46,11 @@ const bitValid = (validity: Validity | null, row: number): boolean =>
   validity === null || ((validity[row >>> 5] ?? 0) & (1 << (row & 31))) !== 0;
 
 /** Resolves row `row` of any vector form to a flat slot (index −1 for null). */
-export function sourceSlot(vector: Vector, row: number, out: SourceSlot): void {
+export function sourceSlot(
+  vector: Vector,
+  row: number,
+  out: SourceSlot,
+): asserts out is SourceSlot & { flat: FlatVector } {
   if (vector.form === "flat") {
     out.flat = vector;
     out.index = bitValid(vector.validity, row) ? row : -1;
@@ -139,7 +145,7 @@ export class ColumnChunk {
         this.safe = new Float64Array(n);
         break;
     }
-    this.#slot = { flat: null as unknown as FlatVector, index: -1 };
+    this.#slot = { flat: null, index: -1 };
   }
 
   get full(): boolean {
@@ -212,10 +218,17 @@ export class ColumnChunk {
    */
   append(vector: Vector, rows: Uint16Array | null, from: number, to: number): void {
     const slot = this.#slot;
-    for (let k = from; k < to; k++) {
-      const row = rows === null ? k : (rows[k] ?? 0);
-      sourceSlot(vector, row, slot);
-      this.#appendSlot(slot.flat, slot.index);
+    try {
+      for (let k = from; k < to; k++) {
+        const row = rows === null ? k : (rows[k] ?? 0);
+        sourceSlot(vector, row, slot);
+        this.#appendSlot(slot.flat, slot.index);
+      }
+    } finally {
+      // Values have been copied, including any prefix before a failed append. Retaining this
+      // borrowed vector would keep a whole previous input batch outside the chunk's charge.
+      this.#slot.flat = null;
+      this.#slot.index = -1;
     }
   }
 
@@ -484,7 +497,7 @@ const LAYOUT_TAG = {
   interval: 9,
 } as const;
 
-function writeInt64(writer: ByteWriter, values: Int64Values, from: number, count: number): void {
+function writeInt64(writer: ByteSink, values: Int64Values, from: number, count: number): void {
   writer.u8(values.repr === "safe" ? 0 : 1);
   writer.typed(values.values.subarray(from, from + count));
 }
@@ -505,7 +518,7 @@ export function encodeColumn(
   vector: FlatVector,
   from: number,
   count: number,
-  into?: ByteWriter,
+  into?: ByteSink,
 ): Uint8Array {
   const writer = into ?? new ByteWriter(64 + count * 9);
   const data = vector.data;
@@ -558,42 +571,29 @@ export function encodeColumn(
       writeInt64(writer, data.micros, from, count);
       break;
   }
-  return into === undefined ? writer.finish() : EMPTY;
+  return into === undefined ? (writer as ByteWriter).finish() : EMPTY;
 }
 
 const EMPTY = new Uint8Array(0);
 
 /** Validity bits `from … from + count − 1` as `ceil(count / 32)` little-endian words. */
-function writeBits(writer: ByteWriter, validity: Uint32Array, from: number, count: number): void {
+function writeBits(writer: ByteSink, validity: Uint32Array, from: number, count: number): void {
   const words = Math.ceil(count / 32);
-  if ((from & 31) === 0) {
-    writer.range(validity, from >>> 5, words);
-    // Bits past `count` in the last word are not part of the column.
+  const shift = from & 31;
+  const base = from >>> 5;
+  if (shift === 0) {
+    const full = Math.floor(count / 32);
+    writer.range(validity, base, full);
     const tail = count & 31;
-    if (tail !== 0) {
-      const at = writer.length - 4;
-      writer.view.setUint32(at, writer.view.getUint32(at, true) & ((1 << tail) - 1), true);
-    }
+    if (tail !== 0) writer.u32((validity[base + full] ?? 0) & ((1 << tail) - 1));
     return;
   }
-  if (count <= 64) {
-    // A few rows (single-row commits): gather the bits without a scratch array.
-    writer.ensure(words * 4);
-    for (let word = 0; word < words; word++) {
-      let value = 0;
-      const first = word * 32;
-      const last = Math.min(count, first + 32);
-      for (let k = first; k < last; k++) {
-        const bit = from + k;
-        if ((((validity[bit >>> 5] ?? 0) >>> (bit & 31)) & 1) !== 0) value |= 1 << (k - first);
-      }
-      writer.u32(value);
-    }
-    return;
+  for (let word = 0; word < words; word++) {
+    let value =
+      ((validity[base + word] ?? 0) >>> shift) | ((validity[base + word + 1] ?? 0) << (32 - shift));
+    if (word === words - 1 && (count & 31) !== 0) value &= (1 << (count & 31)) - 1;
+    writer.u32(value);
   }
-  const bits = new Uint32Array(words);
-  copyBits(validity, from, bits, 0, count);
-  writer.typed(bits);
 }
 
 /** Decodes an encoded column into a fresh flat vector of `type`. */

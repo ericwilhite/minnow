@@ -24,6 +24,9 @@
  * rollback truncates the marks only (`rowCount` drops; `storedRows` keeps the group's count). At
  * commit the marks are restamped like any memtable's; a later flush folds the staged group and
  * runs into the table's directory instead of writing them again.
+ * An emptied staging can still hold delta entries from before the rolled-back rows (including
+ * committed tombstones). It stays frozen with an empty visible prefix until a rowless flush
+ * publishes those entries; rollback must not remove that unrelated state.
  */
 import type { ColumnDef } from "../access/catalog.js";
 import type { SpacePin } from "../access/space.js";

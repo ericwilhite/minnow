@@ -7,7 +7,7 @@
  * An index maps an equality key (keys/key-encoding.ts; scalar types only) to the stable row ids of
  * the rows holding it. Its entries are `(key, rowId, kind)` with kind put or tombstone, in layers:
  * - in memory, per table: the memtable delta, a typed hash keyed by the key bytes, whose entries
- *   carry a visibility `seq` (snapshot.ts);
+ *   carry a visibility `seq` (snapshot.ts), with write-maintained ordered leaves for range reads;
  * - on disk: immutable sorted runs (format/manifest.ts `RunRef`), each with fences (every Nth key
  *   and its offset) and a partitioned Bloom filter. A run is visible to every view that pins its
  *   root, so run entries need no seq.
@@ -43,10 +43,11 @@
  * ## Output, lifetime, memory
  * - Results are row locators of the reader's view (vector/locator.ts), written into
  *   caller-owned buffers. The reader allocates nothing per key; its scratch (a sort permutation
- *   of one batch, a decoded fence block) is fixed-size, reused, and charged to the write path's
+ *   of one batch, a decoded run block) is fixed-size, reused, and charged to the write path's
  *   grant. Run blocks come through the page cache (governor-charged, evictable).
  * - Calls are synchronous when every block they need is cached (and always for memtable-only
- *   tables) and return a Promise only when they must read: callers `await` only a Promise.
+ *   tables) unless the shared worker task clock is due. A Promise represents I/O, admission
+ *   pressure or a real task yield: callers `await` only a Promise.
  * - A reader and its cursors are valid while its snapshot is pinned; afterwards they throw
  *   `SnapshotReleasedError`. They are not thread-safe across awaits: one call at a time per
  *   reader (a pipeline owns its reader).
@@ -97,7 +98,11 @@ export type ProbeResult =
 export interface IndexCursor {
   /** Fills `out` from index 0; returns how many locators it wrote, 0 at the end. */
   next(out: Float64Array): MaybePromise<number>;
-  /** Releases the cursor's scratch. Idempotent. */
+  /**
+   * Abandons the remaining range without enumerating it. Idempotent; cancels pending admission
+   * and I/O. An outstanding next settles before its scratch is released. The caller retains
+   * out until then; the cursor retains no output buffer once that call settles.
+   */
   close(): void;
 }
 

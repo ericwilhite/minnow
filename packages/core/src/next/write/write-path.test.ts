@@ -466,11 +466,11 @@ describe("sequences and catalog", () => {
       columnId: def?.columns[0]?.id,
     });
     const out = { repr: "safe" as const, values: new Float64Array(4) };
-    const lsn = path.sequences.next(sequenceId, 3, out, 0);
+    const lsn = await path.sequences.next(sequenceId, 3, out, 0);
     expect(Array.from(out.values.subarray(0, 3))).toEqual([1, 2, 3]);
     await path.durable(lsn);
     path = await harness.reopen();
-    path.sequences.next(sequenceId, 1, out, 0);
+    await path.sequences.next(sequenceId, 1, out, 0);
     expect(out.values[0]).toBeGreaterThan(3);
     await harness.close();
   });
@@ -498,7 +498,7 @@ describe("sequences and catalog", () => {
     });
     const out = { repr: "safe" as const, values: new Float64Array(3) };
     expect(() => path.sequences.next(id, 3, out, 0)).toThrow(SequenceExhaustedError);
-    path.sequences.next(id, 2, out, 0);
+    await path.sequences.next(id, 2, out, 0);
     expect(Array.from(out.values.subarray(0, 2))).toEqual([1, 2]);
     await harness.close();
   });

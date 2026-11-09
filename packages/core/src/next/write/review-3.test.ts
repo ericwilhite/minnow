@@ -4,6 +4,7 @@
  * publication owning its charges; 5 by `LogAppender.append`'s boundary check. Finding 4 is in
  * testing/divergences.test.ts (write/ may not import testing/).
  */
+import { watchGrants } from "./test-support.js";
 import { describe, expect, it } from "vitest";
 import { MAX_LSN } from "../access/snapshot.js";
 import { MAX_FRAME_BODY_BYTES } from "../format/log-frame.js";
@@ -29,12 +30,9 @@ function metered(): { harness: Harness; grant: () => Grant; pinCredit: () => num
   const harness = new Harness("strict", "memory", 2);
   const pinCredit = countMetadataPinBytes(harness);
   let grant: Grant | null = null;
-  const admit = harness.governor.admit.bind(harness.governor);
-  harness.governor.admit = async (options) => {
-    const admitted = await admit(options);
-    if (options.label === "write path metadata") grant = admitted;
-    return admitted;
-  };
+  watchGrants(harness.governor, (admitted) => {
+    if (admitted.label === "write path metadata") grant = admitted;
+  });
   return {
     harness,
     pinCredit,

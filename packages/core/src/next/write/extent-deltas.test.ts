@@ -5,6 +5,7 @@
  * index and table DDL, log recycles, idle publishes and reopens. Each delta adds only extents the
  * set lacks and releases only extents it holds.
  */
+import { watchGrants } from "./test-support.js";
 import { describe, expect, it } from "vitest";
 import type { PublishDelta } from "../access/write-path.js";
 import { reachableExtents } from "../format/reachable.js";
@@ -107,10 +108,8 @@ describe("extent deltas (ruling R25)", () => {
           if (roll < 0.4) refuseNextAllocation = true;
         },
       });
-      const admit = harness.governor.admit.bind(harness.governor);
-      harness.governor.admit = async (options) => {
-        const grant = await admit(options);
-        if (options.label === "write path metadata") {
+      watchGrants(harness.governor, (grant) => {
+        if (grant.label === "write path metadata") {
           const allocate = grant.allocate.bind(grant);
           grant.allocate = (bytes) => {
             // The merge's own root charge: a flush can allocate between the hook and that charge.
@@ -122,8 +121,7 @@ describe("extent deltas (ruling R25)", () => {
             return allocate(bytes);
           };
         }
-        return grant;
-      };
+      });
       reach.beginHistory();
       const set = new Map<number, number>();
       let sequence = 0;
@@ -343,10 +341,10 @@ describe("extent deltas (ruling R25)", () => {
       let armed = false;
       let entered!: () => void;
       let release!: () => void;
-      const atPublish = new Promise<void>((resolve) => {
+      let atPublish = new Promise<void>((resolve) => {
         entered = resolve;
       });
-      const gate = new Promise<void>((resolve) => {
+      let gate = new Promise<void>((resolve) => {
         release = resolve;
       });
       const width = 6 + int(4);
@@ -373,6 +371,79 @@ describe("extent deltas (ruling R25)", () => {
             ).id ?? 0;
         });
         await path.quiesce();
+        // Quiet builds must be exercised independently of random maintenance timing: metadata
+        // retries can let a formerly quiet table receive another row before publication.
+        let quiet = 0;
+        await autocommit(path, async (s) => {
+          quiet =
+            (
+              await s.changeCatalog({
+                kind: "createTable",
+                table: tableInput("quiet", [column("id", INT, false)]),
+              })
+            ).id ?? 0;
+        });
+        await autocommit(path, (s) =>
+          s.changeCatalog({
+            kind: "createIndex",
+            index: {
+              tableId: quiet,
+              name: "quiet_index",
+              columnIds: [path.catalog.table(quiet)?.columns[0]?.id ?? 0],
+              unique: false,
+              role: "secondary",
+            },
+          }),
+        );
+        await autocommit(path, (s) =>
+          s.changeCatalog({
+            kind: "createIndex",
+            index: {
+              tableId: dropped,
+              name: "overlap_index",
+              columnIds: [path.catalog.table(dropped)?.columns[0]?.id ?? 0],
+              unique: false,
+              role: "secondary",
+            },
+          }),
+        );
+        await autocommit(path, (s) =>
+          s
+            .table(dropped)
+            .insert(batch(ints(Array.from({ length: width }, (_, k) => -k - 1))), null),
+        );
+        await autocommit(path, (s) => s.table(dropped).insert(batch(ints([-1000])), null));
+        await path.quiesce();
+        expect(path.maintenance.buildsSettled).toBeGreaterThan(0);
+        reach.reach("build-settled");
+        expect(set).toEqual(await walk(overlap.space));
+        // A shared task-clock yield changes random DDL/flush overlap. Coordinate a catalog
+        // change explicitly, retaining all random histories and their exact-delta assertions.
+        armed = true;
+        await autocommit(path, (s) =>
+          s
+            .table(dropped)
+            .insert(batch(ints(Array.from({ length: width }, (_, k) => 100 + k))), null),
+        );
+        await autocommit(path, (s) => s.table(dropped).insert(batch(ints([2000])), null));
+        await atPublish;
+        const secondary = need(
+          path.catalog.table(dropped)?.indexes.find((i) => i.name === "overlap_index"),
+        );
+        await autocommit(path, (s) =>
+          s.changeCatalog({ kind: "dropIndex", indexId: secondary.id }),
+        );
+        release();
+        await path.quiesce();
+        expect(path.maintenance.flushesCatalogChanged).toBeGreaterThan(0);
+        reach.reach("flush-catalog-changed");
+        expect(set).toEqual(await walk(overlap.space));
+        atPublish = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
         armed = true;
         const ids = Array.from({ length: width }, (_, k) => k);
         await autocommit(path, (s) => s.table(dropped).insert(batch(ints(ids)), null));
@@ -383,6 +454,50 @@ describe("extent deltas (ruling R25)", () => {
         await path.quiesce();
         expect(path.maintenance.flushesAbandoned).toBeGreaterThan(0);
         reach.reach("flush-of-dropped-table");
+        expect(set).toEqual(await walk(overlap.space));
+        // A nonquiet older table's unflushed build holds a newer table's catalog back.
+        // This topology forces the held-flush state independently of random task timing.
+        let building = 0,
+          newer = 0;
+        await autocommit(path, async (s) => {
+          building =
+            (
+              await s.changeCatalog({
+                kind: "createTable",
+                table: tableInput("building", [column("id", INT, false)]),
+              })
+            ).id ?? 0;
+        });
+        await autocommit(path, (s) => s.table(building).insert(batch(ints([1])), null));
+        await autocommit(path, (s) =>
+          s.changeCatalog({
+            kind: "createIndex",
+            index: {
+              tableId: building,
+              name: "building_index",
+              columnIds: [need(path.catalog.table(building)?.columns[0]?.id)],
+              unique: false,
+              role: "secondary",
+            },
+          }),
+        );
+        await autocommit(path, async (s) => {
+          newer =
+            (
+              await s.changeCatalog({
+                kind: "createTable",
+                table: tableInput("newer", [column("id", INT, false)]),
+              })
+            ).id ?? 0;
+        });
+        const heldBefore = path.maintenance.flushesHeld;
+        await autocommit(path, (s) =>
+          s.table(newer).insert(batch(ints(Array.from({ length: width }, (_, k) => k))), null),
+        );
+        await autocommit(path, (s) => s.table(newer).insert(batch(ints([width])), null));
+        await path.quiesce();
+        expect(path.maintenance.flushesHeld).toBeGreaterThan(heldBefore);
+        reach.reach("flush-held-by-build");
         expect(set).toEqual(await walk(overlap.space));
         await overlap.space.audit();
       } finally {
@@ -600,7 +715,13 @@ describe("a sink whose commit or abort throws (review B3-p2b-4 D1)", () => {
         await insert([6, 7, 8]);
         target = true;
         if (kind === "flush") {
-          await insert([9]);
+          // ExtentDeltaSink makes callback failures fatal. Minimum admission may yield while
+          // the triggering insert is still settling, so observe that same fatal error there
+          // or at quiesce; the callback, once-only settlement and cleanup assertions stay below.
+          await insert([9]).catch((error: unknown) => {
+            expect(error).toBeInstanceOf(ExtentSinkError);
+            expect(error).toBe(path.failure);
+          });
           await path.quiesce().catch(() => undefined);
         } else if (kind === "merge") {
           await insert([9]);

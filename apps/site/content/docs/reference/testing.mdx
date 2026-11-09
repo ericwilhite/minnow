@@ -1640,6 +1640,30 @@ unordered result passes. Live subscriptions, concurrent openers, crash schedules
 native browser storage and order-dependent floating aggregates remain outside this
 serial harness; their existing suites still own those checks.
 
+### Rebuild-core low-cap write ownership
+
+The low-cap campaign observes idle row credit transferred into an active merge while global
+capacity is insufficient. The merge already has prepaid credit: this reach state checks the
+ownership exchange, not a claim that the transfer is required for progress. The separate
+protected-reader minimum campaign checks merge progress while real reader bytes remain held.
+
+### Rebuild-core staged rollback
+
+The generated staged-residual campaign commits a deletion, then stages and rolls back new rows
+that shared its memtable. The committed tombstone must survive until its rowless flush publishes
+it. The campaign also keeps an earlier pending deletion across statement and savepoint rollback;
+a flush cannot wait for a pending sequence as though it were a committed LSN.
+
+Seeds 702 and 704 run 80 histories per backend over memory, the simulated disk and fake IndexedDB.
+Histories vary memtable capacity, primary and secondary indexes, rollback kind, retained snapshots,
+held publication, merges and deterministic task-clock yields. Row scans, index probes and ranges agree
+before and after publication and reopen. Deleted keys can be inserted again, real duplicates still
+fail, and rolled-back staged keys remain absent. This is a write-path visibility and recovery
+check; it does not measure native browser memory or cover every DDL interleaving.
+A dedicated memory/simulated-disk regression deletes a stored key, reopens, stages and rolls back
+another transaction, then inserts that key again. A point lookup and prefix range must identify
+the same single live row before and after another reopen.
+
 ### Rebuild-core log queue accounting
 
 The generated storage log-queue check holds a transaction open and independently counts retained

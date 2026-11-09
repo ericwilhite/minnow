@@ -206,9 +206,9 @@ export class RunEncoder {
         grown.set(this.#hashes);
         this.#hashes = grown;
       }
-      const probe = key.subarray(0, length);
-      this.#hashes[this.#hashCount++] = xxHash32(probe, 0) >>> 0;
-      this.#hashes[this.#hashCount++] = (xxHash32(probe, BLOOM_SEED) | 1) >>> 0;
+      // The key's range, hashed in place (no view per key).
+      this.#hashes[this.#hashCount++] = xxHash32(key, 0, 0, length) >>> 0;
+      this.#hashes[this.#hashCount++] = (xxHash32(key, BLOOM_SEED, 0, length) | 1) >>> 0;
     }
     this.#lastInBlock = true;
     if (!same) {
@@ -219,12 +219,29 @@ export class RunEncoder {
     }
     const block = this.#block;
     this.#offsets[this.#count++] = block.length;
-    block.varuint(length);
-    block.rawRange(key, 0, length);
     const rowId = this.#pendingRowId;
-    block.u32(rowId % 2 ** 32);
-    block.u16(Math.floor(rowId / 2 ** 32));
-    block.u8(this.#pendingTombstone ? 1 : 0);
+    // One reserve, then the entry's bytes in place: varuint length (a key is ≤ 2 KiB, so one
+    // or two bytes), key, u32 row id low, u16 row id high, flags.
+    block.ensure(length + 9);
+    const bytes = block.bytes;
+    let at = block.length;
+    if (length < 0x80) bytes[at++] = length;
+    else {
+      bytes[at++] = (length & 0x7f) | 0x80;
+      bytes[at++] = length >>> 7;
+    }
+    copyRange(bytes, at, key, 0, length);
+    at += length;
+    const low = rowId % 2 ** 32;
+    const high = Math.floor(rowId / 2 ** 32);
+    bytes[at] = low & 0xff;
+    bytes[at + 1] = (low >>> 8) & 0xff;
+    bytes[at + 2] = (low >>> 16) & 0xff;
+    bytes[at + 3] = (low >>> 24) & 0xff;
+    bytes[at + 4] = high & 0xff;
+    bytes[at + 5] = (high >>> 8) & 0xff;
+    bytes[at + 6] = this.#pendingTombstone ? 1 : 0;
+    block.length = at + 7;
     this.#entryCount += 1;
     this.#minKey ??= key.slice(0, length);
   }
@@ -358,19 +375,39 @@ function bloomProbes(key: Uint8Array): [number, number] {
   return [xxHash32(key, 0) >>> 0, (xxHash32(key, BLOOM_SEED) | 1) >>> 0];
 }
 
-function encodeBloom(hashes: Uint32Array, count: number): Uint8Array {
+/** One partition's Bloom filter over `count / 2` keys' probe pairs (exported for its test). */
+export function encodeBloom(hashes: Uint32Array, count: number): Uint8Array {
   const keys = count / 2;
   const bits = Math.max(64, Math.ceil((keys * BLOOM_BITS_PER_KEY) / 8) * 8);
   const out = new Uint8Array(5 + bits / 8);
   new DataView(out.buffer).setUint32(0, bits, true);
   out[4] = BLOOM_HASHES;
+  // (h1 + p·h2) mod bits, stepped: (h1 mod bits) + p·(h2 mod bits), wrapping at bits. Exactly
+  // the same bits (every term is an integer below 2^35), without a double modulo per probe.
   for (let k = 0; k < count; k += 2) {
-    const h1 = hashes[k] ?? 0;
-    const h2 = hashes[k + 1] ?? 0;
-    for (let p = 0; p < BLOOM_HASHES; p++) {
-      const bit = (h1 + p * h2) % bits;
-      out[5 + (bit >>> 3)] = (out[5 + (bit >>> 3)] ?? 0) | (1 << (bit & 7));
-    }
+    let bit = (hashes[k] ?? 0) % bits;
+    const step = (hashes[k + 1] ?? 0) % bits;
+    // Seven fixed stored probes, unrolled to remove the inner loop's counter and branch.
+    // The size, seeds, arithmetic and probe order are unchanged (a stored-format contract).
+    out[5 + (bit >>> 3)] = (out[5 + (bit >>> 3)] ?? 0) | (1 << (bit & 7));
+    bit += step;
+    if (bit >= bits) bit -= bits;
+    out[5 + (bit >>> 3)] = (out[5 + (bit >>> 3)] ?? 0) | (1 << (bit & 7));
+    bit += step;
+    if (bit >= bits) bit -= bits;
+    out[5 + (bit >>> 3)] = (out[5 + (bit >>> 3)] ?? 0) | (1 << (bit & 7));
+    bit += step;
+    if (bit >= bits) bit -= bits;
+    out[5 + (bit >>> 3)] = (out[5 + (bit >>> 3)] ?? 0) | (1 << (bit & 7));
+    bit += step;
+    if (bit >= bits) bit -= bits;
+    out[5 + (bit >>> 3)] = (out[5 + (bit >>> 3)] ?? 0) | (1 << (bit & 7));
+    bit += step;
+    if (bit >= bits) bit -= bits;
+    out[5 + (bit >>> 3)] = (out[5 + (bit >>> 3)] ?? 0) | (1 << (bit & 7));
+    bit += step;
+    if (bit >= bits) bit -= bits;
+    out[5 + (bit >>> 3)] = (out[5 + (bit >>> 3)] ?? 0) | (1 << (bit & 7));
   }
   return out;
 }
@@ -463,6 +500,22 @@ export class RunReader {
    * what the constructor keeps (the partitions less their 5-byte headers, the keys less their
    * length prefixes).
    */
+  /**
+   * Pre-admission bound from an existing run reference, without reading its directories.
+   * Every block-index entry uses at least two varints and a u32 checksum (six bytes).
+   * Bloom construction uses at most ten bits per input entry, plus thirteen bytes per
+   * partition for rounding, the minimum bitset and its header. Stored bytes are unchanged.
+   */
+  static residentBound(ref: RunRef): number {
+    const blocks = Math.min(ref.entryCount, Math.max(0, Math.floor((ref.entries.length - 1) / 6)));
+    return (
+      ref.fences.length +
+      blocks * (48 + 64) +
+      Math.ceil((ref.entryCount * BLOOM_BITS_PER_KEY) / 8) +
+      13 * Math.ceil(blocks / PARTITION_BLOCKS)
+    );
+  }
+
   static residentCharge(fences: Uint8Array, blooms: readonly Uint8Array[]): number {
     const count = new ByteReader(fences).varuint();
     let total = fences.length + count * (48 + 64);

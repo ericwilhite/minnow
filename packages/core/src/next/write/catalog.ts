@@ -11,6 +11,7 @@
  *   reuses nothing a durable structure names, because nothing durable named it).
  * - `version` is assigned by the caller from a write-path-wide counter that never goes back.
  */
+import type { BufferAllocator } from "./commit-buffers.js";
 import {
   CatalogChangeError,
   type CatalogChange,
@@ -610,8 +611,8 @@ function validateSequence(sequence: SequenceDef): void {
     throw new CatalogChangeError("A sequence's start lies outside its bounds");
 }
 
-export function encodeLogged(change: LoggedChange): Uint8Array {
-  return encodeJson(change);
+export function encodeLogged(change: LoggedChange, allocator?: BufferAllocator): Uint8Array {
+  return encodeJson(change, allocator);
 }
 
 export function decodeLogged(bytes: Uint8Array): LoggedChange {

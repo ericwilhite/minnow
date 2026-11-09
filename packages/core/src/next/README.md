@@ -34,6 +34,139 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `lower/`      | planner lowering                 | `Lowerer` (`lowerer.ts` contract, `create.ts`): front-end passes over the catalog, typing (`coerce.ts`, `expressions.ts`), queries (`query.ts`), FROM clauses, join order and subqueries (`from.ts`), access paths (`access-path.ts`), windows (`windows.ts`), plan building (`plan.ts`), DML and MERGE (`modify.ts`), DDL, table rules, result descriptors; an in-memory catalog; front-end inventory (`INVENTORY.md`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `owner/`      | ownership                        | Owner/client protocol (`protocol.ts`), wire payloads (re-exported from exec) and stream dictionaries (`frame.ts`), ledger routing (`outcomes.ts`), wire errors (`errors.ts`), client sequencing (`sequence.ts`), election, liveness and step-down (`election.ts`), public client API (`api.ts`), engine boundary and idle-transaction timer (`engine.ts`), planner port (`planner.ts`), the composed engine (`compose.ts`), the protocol server (`server.ts`) and client (`client.ts`), the owner worker runtime (`host.ts`), the port broker (`broker.ts`), the client-side election and lifecycle (`connector.ts`), Web Locks (`web-locks.ts`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
+## Write-path measurements
+
+Build core with `npx tsc -b packages/core`. Before rebuilding a candidate, copy the parent's
+`packages/core/dist` under `~/.cache` (with a `package.json` declaring `"type": "module"` in its
+parent directory). `scripts/write-insert-bench.mts --baseline <old-dist> --mode unique` measures
+the constraint-check component in Node CPU time. `--mode single --durability relaxed|strict`
+measures prepared one-row commits after a 100k-row table; `--mode load --load-mode tx|commits`
+includes the durable million-row load and maintenance. Each reported Node pass runs in its own
+worker process after one excluded warmup of the same build, keeping feedback and GC state separate.
+`--in-process` retains the shared-process diagnostic lane. `node scripts/write-load-bench.mts --mode tx|commits
+--profile ~/.cache/load.cpuprofile` records a CPU profile around the load and maintenance only;
+profile stop and serialization are outside the reported CPU/wall clock. Run with plain `node`, using the built
+modules, and set `TMPDIR` under `~/.cache`.
+
+`scripts/write-run-bench.mts --baseline <old-dist> --mode delta|bloom|encoder` isolates
+sorted-delta run encoding, Bloom bit construction, or pending-entry/block encoding. It compares
+exact output bytes before timing, then reports process CPU and wall for interleaved old/new
+rounds. Input construction is outside the clock; `node --expose-gc ... --gc-before` also collects
+setup garbage before each pass. Use `write-insert-bench.mts --mode load --load-mode tx|commits`
+for the whole-load check.
+
+Bloom partitions are stored run bytes (`write/runs.ts`, "Stored form"), including their bit
+count, seven-probe count, bit array, directory and checksums. Changing the bit sizing, seeds or
+probe formula changes that stored contract. Arithmetic-only Bloom optimizations must preserve
+every encoded part byte for byte.
+
+`scripts/write-browser-bench.mts --baseline <old-dist> --output ~/.cache/<run>` bundles those
+built modules into real OPFS workers in a persistent Chromium profile on disk. The same mode
+and durability options apply. The default is six interleaved old/new pairs after a discarded
+warmup pair, with 20,000 relaxed singles or 2,000 strict singles. It reports renderer CPU
+(including JIT/GC), dedicated-worker CPU, whole-browser CPU and wall time separately, with host load averages before and after each pass. `--profile`
+adds two untimed passes. A fresh worker reopens each completed database and checks its row and
+index counts. This is an owner-side component benchmark; it does not time SQL, the executor or
+client transport, compare SQLite, or certify power-loss safety. Neither script publishes its
+local numbers to the benchmark site.
+
+## Write-memory pressure
+
+Column appends copy into the chunk's charged arrays and clear their borrowed source slot on
+success or failure. A live chunk or retained view must not keep an earlier input batch alive.
+The generated `scripts/write-column-lifetime.test.ts` campaign checks input-buffer collection
+in an isolated Node process while copied chunks and their views stay live, across every layout,
+flat/constant/dictionary forms, selections, nulls and successful/full/denied append exits.
+It checks copied bytes after the producer recycles its buffers; forced GC is a lifetime witness,
+not a certification of peak RSS or native storage memory.
+
+The write grant keeps an admitted working minimum and charges live memtables and scratch.
+Its unused growth after a wide-batch estimate is reclaimable: a waiting merge can take that
+capacity without waiting for another writer call. Metadata has its own grant and uses the
+same retrying budget for root/statistics charges, group-directory chunks and run readers.
+If its allocation cannot grow, that budget returns idle write holdings and retries. If live
+reader memory still prevents growth, publication unwinds its provisional writer and lock,
+then waits on task turns until headroom returns, checking close and abort while waiting.
+Temporary pressure never becomes a fatal writer failure. Only an individual allocation
+larger than the entire cap gets the typed `MetadataAllocationTooLargeError` size refusal.
+Reclaim preserves both allocated bytes and outstanding loans; it never frees a reader's live buffers.
+`write/metadata-pressure.test.ts` generates reader-held memory through flush, staging, merges
+and durable reopen on memory and simulated IndexedDB.
+Oversized insert calls admit at most 2,048 rows at once, so an entire call's conservative
+estimate does not need to fit beside other working grants. Eligible pending chunks stage
+between pieces of the same call; uniqueness, foreign keys and rollback still span the whole
+statement. `write/batch-admission.test.ts` generates these calls with another real working
+buffer occupying ordinary capacity, over memory and the IndexedDB fake, through durable reopen.
+
+`write/low-cap.test.ts` generates loads under 32/48/64 MiB caps over memory and the IndexedDB
+adapter on its fake. It exercises idle estimates, allocated working buffers, active loans,
+merges, metadata growth, exact rows and durable reopen, with declared reach. Its stored rows
+are small to bound the in-memory virtual disk; the separate native W5M reproduction covers
+the canonical 200-column workload at 256 MiB. No stored format changes are involved.
+
+A non-unique key can occupy a whole memtable. Delta traversal visits ordered chains linearly,
+uses an in-place O(n log n) sort for arbitrary row-id/tombstone order, and checks the shared
+worker task clock while gathering, sorting and emitting entries. Scratch belongs to each
+traversal, so suspended traversals can overlap safely. `write/hot-key.test.ts` generates full
+chains and checks order and cumulative task progress. The Node-only generated CPU-ratio
+check lives in `scripts/write-hot-key-cpu.test.ts`, outside the browser core.
+`scripts/write-run-bench.mts --hot-key` measures the built component in interleaved CPU rounds.
+Stored run bytes and the Bloom format are unchanged.
+
+Delta array constructors and growth copies pay before allocation, retaining the old capacity's
+charge until the copy finishes. Cached key-range copies pay for replacement overlap too;
+when funding is unavailable, their cache is shed and uniqueness uses full probes. A nonempty
+layer with no funded bounds is never skipped. `write/range-pressure.test.ts` generates these
+histories through a held flush and durable reopen over memory and simulated IndexedDB.
+Each traversal charges its order and chain buffers and refunds them on success, cancellation
+or failure. Published-run encoding uses the metadata budget for that temporary workspace, so
+pressure unwinds the publication and waits through its retry path. Dropping a delta while a
+traversal is suspended keeps its source arrays charged until the last traversal settles.
+`write/key-hash-accounting.test.ts` intercepts native constructors independently of the
+charge callbacks and checks capacities, overlap, refusal, constructor failures and release.
+
+### Commit encoding under the cap
+
+Commit encoding has a separate, fixed 6 MiB minimum, admitted before the engine runs. It charges
+buffer capacities before allocation, counts old and new buffers during growth, and returns each
+ownership charge once. The bound includes reusable column/body writers, sequence scratch, frame
+and queue metadata, a joined append buffer, headers and bounded temporary codec objects. A small
+catalog's temporary JSON spelling is reserved before stringification. The queue's 1 MiB bound
+counts frame metadata as well as payload; its caller waits for the storage drain when full.
+
+Small commits retain the single-buffer codec while their body and estimated temporary workspace
+fit about 512 KiB. Staging remains the preferred path where eligible. Other large commits encode
+the same version-1 body through bounded byte windows into one existing multipart frame at a time.
+Neither body bytes, frame sizes/checksums, effect order nor the stored format change. A partial
+multipart prefix never advances the appender's acknowledged transaction boundary; recovery drops
+it under the ordinary scanner's rules. This path streams directly and creates no spill files.
+Any future spill must use the owner's temporary spill service and remain outside recovery.
+The write-side input charge ends when `StoreSession.appendLog()` resolves. IndexedDB's queued
+copies (up to its 4 MiB batch) are storage's to charge and backpressure; B1 owns that separate
+accounting fix. Write-side ownership tests do not certify those adapter copies.
+
+Unordered deletions can use an in-place row-order index whose capacity is charged before allocation
+through one progress loan bounded by the governor's reserve. It is freed and repaid before the
+commit finishes. Beyond that index bound, the encoder uses a bounded rank walk; its performance
+on very large unordered deletions has not been measured. Stream counting, ordering and encoding
+use the worker's shared task clock and check cancellation after task yields. Close settles their
+writer before releasing its inputs and grants, including a commit still counting before append.
+
+`SequenceAccess.next/set` returns a number synchronously while the queue fits, or a Promise under
+pressure or behind a streamed commit. Callers await it before reading sequence output. The testing
+interpreter does this inside every row of a batched INSERT as well as standalone calls. It checks
+cancellation before resuming the input walk after a pressure wait. Strict
+value delivery still waits for the returned LSN's durability. Changing the sequence reservation
+policy is separate work; the existing adaptive blocks remain unchanged.
+
+The generated low-cap commit suite compares actual buffer ownership with grant allocations and
+the governor peak over memory and the IndexedDB fake, compares codec bytes (including large
+catalog defaults and owned-sequence BigInt tags), and checks durable reopen. Multipart power-loss cuts cover incomplete and complete-but-unacknowledged bodies and a
+later write. Separate probes cover queue backpressure, batched sequence evaluation and close while
+counting. `scripts/write-commit-bench.mts` isolates prepared 10k-row commit CPU; the single-insert
+lane remains in `scripts/write-insert-bench.mts`. These tests and local component measurements do
+not certify physical-disk performance or the Gate D RSS limit; those require the native lane.
+
 ## Cross-track interfaces (owned by the implementing track)
 
 These integration interfaces are deliberately not frozen here. Each is the first deliverable of
@@ -59,6 +192,54 @@ inserts over memory and simulated IndexedDB, then checks their rows through dura
 It also checks non-unique index results. The PostgreSQL write differential retains every seed
 and step under the real task clock and forced third/seventh-check yields, so publication races
 are exercised without requiring host contention.
+
+A frozen input can contain committed rows and an earlier statement's pending index tombstone.
+The flush boundary waits for that transaction to commit or roll back; a pending marker is never
+passed to the log's durability barrier as an LSN. `write/pending-flush.test.ts` generates both
+statement boundaries, commit and rollback, publication and reopen on both simulated stores.
+
+Index probes consume completed asynchronous metadata and block reads directly. They do not
+require a later synchronous cache hit to make progress. `write/async-probe.test.ts` checks
+uncached reads, continuation buffers and older pins through visible deletions.
+
+If a key allocation fails after several puts or tombstones, rollback removes that completed
+prefix in every index. `write/partial-delta-rollback.test.ts` injects budget and native faults
+in primary, unique and non-unique indexes over both stores, then checks retry and durable reopen.
+
+## Streaming index ranges
+
+Ordered range cursors merge one head per durable run, memtable delta and visible staging run.
+They stop when the caller's output fills. Memtable order is maintained by writes: an ordered
+append prefix is implicit entry ids, and out-of-order entries use charged leaves; the first read does not collect keys or build a permutation. Run cursors read fences and
+block references lazily and decode one reusable block per input in either direction. A run's
+min/max key is a heap sentinel until that run can affect output. Directory positions are scalars:
+unbounded ASC decodes references directly; DESC and bounded seeks use record offsets in the
+shared cache. Neither Bloom directories nor Bloom filters are loaded for a range. The run
+format and stored Bloom bytes are unchanged.
+
+A cursor owns an admitted write-side grant for its heap, heads, key buffers and
+a fixed read credit for one format-bounded directory blob. Verified directory bytes and parsed
+record offsets stay in the extent space's shared governed cache; attaching the descriptor
+charges its full capacity before allocation. No cursor copies a directory or keeps a reverse
+partition array. Warm bounded seeks use a binary search; forward unbounded scans keep a byte
+offset. A cold parsed-index fill reads each needed blob once and walks its records in slices on
+the shared task clock. That cold work is linear in directory bytes/records. Cache admission may
+be refused under pressure: a leased, sliced scalar scan then preserves progress without making
+a private index. Repeated cache misses can repeat this cold work. Admission remains independent
+of key count and waits under temporary pressure. Close cancels admission and
+reads; an in-flight call settles before its scratch and the snapshot's last pin are released.
+The shared worker task clock slices both skipped versions and metadata decoding. Range membership
+uses the same prefix-bound rule in `access/key-index.ts`; visibility uses the captured view bound.
+
+`write/range-cursor.test.ts` compares the stream against the retained eager reference across
+memory and simulated IndexedDB, ASC/DESC, ranges, deletes, statements, staging and older pins.
+It checks actual prefix work, cold-read close, admission pressure and native-buffer precharge.
+`write/range-cardinality.test.ts` keeps run count fixed while varying keys and records cold
+indexing separately from warm first-output work. `write/range-navigation.test.ts` checks
+shared fills, cancellation and cache refusal; `scripts/write-navigation-lifetime.test.ts`
+uses native WeakRefs while a cursor remains open to prove eviction releases index payload.
+`scripts/write-range-bench.mts` measures first-page CPU in interleaved eager/streamed rounds;
+its memory-store results exclude payload fetch, SQL, owner transport and real disk latency.
 
 ## Dependency rules
 

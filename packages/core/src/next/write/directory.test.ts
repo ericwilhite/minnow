@@ -4,10 +4,11 @@
  * when a deletion folds into one of its groups, retires exactly the directory extents no longer
  * used (the extent audit), and reopens with every row.
  */
+import { watchGrants } from "./test-support.js";
 import { PIN_HEADER_BYTES } from "../storage/root-pins.js";
 import { GroupDirectory } from "./groups.js";
 import { describe, expect, it } from "vitest";
-import { GROUPS_PER_PAGE, ParseBudgetError, parseCharge } from "../format/manifest-codec.js";
+import { GROUPS_PER_PAGE, parseCharge } from "../format/manifest-codec.js";
 import {
   autocommit,
   batch,
@@ -126,12 +127,9 @@ describe("resident directory memory (review B3-p2a-2 #1)", () => {
     };
     // The engine's resident-metadata grant, to check its charge is real (not only reported).
     const metadata: { grant: { readonly allocated: number } | null } = { grant: null };
-    const admit = harness.governor.admit.bind(harness.governor);
-    harness.governor.admit = async (options) => {
-      const grant = await admit(options);
-      if (options.label === "write path metadata") metadata.grant = grant;
-      return grant;
-    };
+    watchGrants(harness.governor, (grant) => {
+      if (grant.label === "write path metadata") metadata.grant = grant;
+    });
     const fixed = () =>
       harness.governor.usedBytes - caches.reduce((sum, cache) => sum + cache.evictableBytes, 0);
     let path = await harness.open();
@@ -183,11 +181,19 @@ describe("resident directory memory (review B3-p2a-2 #1)", () => {
       minimumBytes: room - used + opened,
       spillable: false,
     });
-    // Refused with the typed metadata error (the resident charge or the parse that feeds it),
-    // never by growing the heap past the cap.
-    await expect(harness.open()).rejects.toThrow(ParseBudgetError);
-    ballast.close();
-    path = await harness.open();
+    // PROPOSAL "One memory governor": temporary competing holdings wait, never refuse.
+    let released = false;
+    const release = setTimeout(() => {
+      ballast.close();
+      released = true;
+    }, 25);
+    try {
+      path = await harness.open();
+      expect(released).toBe(true);
+    } finally {
+      clearTimeout(release);
+      ballast.close();
+    }
     expect(path.residentMetadataBytes).toBe(opened);
     expect(metadata.grant?.allocated).toBe(opened + snapshotCredit());
     // Dropping the table returns its directory's charge (no older reader holds it).

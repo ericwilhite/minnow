@@ -595,6 +595,7 @@ export class StandinWritePath implements WritePath {
 // ---- executor ----
 
 interface ProgramContext {
+  readonly execution: Pick<Execution, "state">;
   readonly params: readonly ParameterValue[];
   /** The view's state (read) and, for DML, the transaction's working state (write). */
   readonly state: State;
@@ -612,7 +613,7 @@ interface ProgramResult {
 interface Program {
   readonly kind: "query" | "modify";
   readonly columns: readonly OutputColumn[];
-  readonly run: (context: ProgramContext) => ProgramResult;
+  readonly run: (context: ProgramContext) => ProgramResult | Promise<ProgramResult>;
   /** Stream frames of this many rows asynchronously (window and cancellation tests). */
   readonly streamBy: number | null;
   /**
@@ -824,10 +825,11 @@ class StandinExecution implements Execution {
     const request = this.request;
     const statement = request.statement as unknown as StandinStatement | null;
     const view = (request.snapshot ?? statement?.view) as unknown as StandinSnapshot;
-    let result: ProgramResult;
+    let result: ProgramResult | Promise<ProgramResult>;
     try {
       if (view.released) throw new TypeError("Read through a released snapshot");
       result = this.program.run({
+        execution: this,
         params,
         state: statement === null ? view.state : statement.state,
         statement,
@@ -838,6 +840,23 @@ class StandinExecution implements Execution {
       this.#fail(error);
       return;
     }
+    if (result instanceof Promise) {
+      void result.then(
+        (value) => this.#started(value, view, statement, params),
+        (error: unknown) => {
+          if (!this.#cancelled) this.#fail(error);
+        },
+      );
+    } else this.#started(result, view, statement, params);
+  }
+
+  #started(
+    result: ProgramResult,
+    view: StandinSnapshot,
+    statement: StandinStatement | null,
+    params: readonly ParameterValue[],
+  ): void {
+    if (this.#cancelled) return;
     this.#requiresLsn = Math.max(result.requiresLsn, view.observedLsn);
     const by = this.program.streamBy;
     // Results larger than a frame stream asynchronously under the window, as B4's do.
@@ -1031,13 +1050,16 @@ export class StandinExecutor implements Executor {
             columns: plan.columns,
             streamBy: this.#rowsPerFrame,
             run: (context) =>
-              interpret(plan, {
-                params: context.params,
-                state: context.state,
-                sequences: context.sequences,
-                sequenceSession: context.sequenceSession,
-                sequenceLsn: 0,
-              }),
+              runEvaluation(
+                interpret(plan, {
+                  params: context.params,
+                  state: context.state,
+                  sequences: context.sequences,
+                  sequenceSession: context.sequenceSession,
+                  sequenceLsn: 0,
+                }),
+                context.execution,
+              ),
           })
         : {
             kind: "query",
@@ -1188,7 +1210,43 @@ function compareValues(left: Value, right: Value): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-function evaluate(expr: ScalarExpr, row: Tuple, context: Context): Value {
+/** Suspend only on actual backpressure, preserving the warm synchronous read contract. */
+type Evaluation<T> = Generator<Promise<unknown>, T, unknown>;
+function* resolveEvaluation<T>(value: T | Promise<T>): Evaluation<T> {
+  if (value instanceof Promise) return (yield value) as T;
+  return value;
+}
+function runEvaluation<T>(
+  steps: Evaluation<T>,
+  execution: Pick<Execution, "state">,
+): T | Promise<T> {
+  const advance = (step: IteratorResult<Promise<unknown>, T>): T | Promise<T> => {
+    if (step.done) return step.value;
+    return step.value.then(
+      (value) =>
+        advance(
+          execution.state === "cancelled"
+            ? steps.throw(new QueryCancelledError())
+            : steps.next(value),
+        ),
+      (error: unknown) =>
+        advance(steps.throw(execution.state === "cancelled" ? new QueryCancelledError() : error)),
+    );
+  };
+  return advance(steps.next());
+}
+
+function* evaluateAll(
+  exprs: readonly ScalarExpr[],
+  row: Tuple,
+  context: Context,
+): Evaluation<Value[]> {
+  const values: Value[] = [];
+  for (const expr of exprs) values.push(yield* evaluate(expr, row, context));
+  return values;
+}
+
+function* evaluate(expr: ScalarExpr, row: Tuple, context: Context): Evaluation<Value> {
   switch (expr.op) {
     case "column":
       return row[expr.index] ?? null;
@@ -1197,7 +1255,7 @@ function evaluate(expr: ScalarExpr, row: Tuple, context: Context): Value {
     case "param":
       return bindValue(expr.type, context.params[expr.slot] ?? null, expr.slot);
     case "cast": {
-      const value = evaluate(expr.input, row, context);
+      const value = yield* evaluate(expr.input, row, context);
       if (value === null) return null;
       switch (expr.type.kind) {
         case "int32":
@@ -1216,8 +1274,8 @@ function evaluate(expr: ScalarExpr, row: Tuple, context: Context): Value {
       }
     }
     case "compare": {
-      const left = evaluate(expr.left, row, context);
-      const right = evaluate(expr.right, row, context);
+      const left = yield* evaluate(expr.left, row, context);
+      const right = yield* evaluate(expr.right, row, context);
       if (left === null || right === null) return null;
       const order = compareValues(left, right);
       switch (expr.cmp) {
@@ -1240,45 +1298,45 @@ function evaluate(expr: ScalarExpr, row: Tuple, context: Context): Value {
     case "or": {
       let unknown = false;
       for (const arg of expr.args) {
-        const value = evaluate(arg, row, context);
+        const value = yield* evaluate(arg, row, context);
         if (value === null) unknown = true;
         else if (value === (expr.op === "or")) return value;
       }
       return unknown ? null : expr.op === "and";
     }
     case "distinctFrom": {
-      const left = evaluate(expr.left, row, context);
-      const right = evaluate(expr.right, row, context);
+      const left = yield* evaluate(expr.left, row, context);
+      const right = yield* evaluate(expr.right, row, context);
       const distinct =
         left === null ? right !== null : right === null || compareValues(left, right) !== 0;
       return expr.negated ? !distinct : distinct;
     }
     case "not": {
-      const value = evaluate(expr.arg, row, context);
+      const value = yield* evaluate(expr.arg, row, context);
       return value === null ? null : !value;
     }
     case "isNull": {
-      const isNull = evaluate(expr.arg, row, context) === null;
+      const isNull = (yield* evaluate(expr.arg, row, context)) === null;
       return expr.negated ? !isNull : isNull;
     }
     case "case":
       for (const branch of expr.branches)
-        if (evaluate(branch.when, row, context) === true)
-          return evaluate(branch.then, row, context);
-      return expr.otherwise === null ? null : evaluate(expr.otherwise, row, context);
+        if ((yield* evaluate(branch.when, row, context)) === true)
+          return yield* evaluate(branch.then, row, context);
+      return expr.otherwise === null ? null : yield* evaluate(expr.otherwise, row, context);
     case "call":
-      return call(
-        expr.fn,
-        expr.type,
-        expr.args.map((arg) => evaluate(arg, row, context)),
-        context,
-      );
+      return yield* call(expr.fn, expr.type, yield* evaluateAll(expr.args, row, context), context);
     default:
       throw new UnsupportedPlanError(`${expr.op} in the stand-in executor`);
   }
 }
 
-function call(fn: string, type: PhysicalType, args: readonly Value[], context: Context): Value {
+function* call(
+  fn: string,
+  type: PhysicalType,
+  args: readonly Value[],
+  context: Context,
+): Evaluation<Value> {
   switch (fn) {
     case "add":
     case "sub":
@@ -1298,7 +1356,7 @@ function call(fn: string, type: PhysicalType, args: readonly Value[], context: C
     case "nextval": {
       const id = Number(args[0]);
       const out: Int64Values = { repr: "int64", values: new BigInt64Array(1) };
-      const lsn = context.sequences?.next(id, 1, out, 0) ?? 0;
+      const lsn = (yield* resolveEvaluation(context.sequences?.next(id, 1, out, 0))) ?? 0;
       context.sequenceLsn = Math.max(context.sequenceLsn, lsn);
       const value = out.values[0] ?? 0n;
       context.sequenceSession?.record(id, value);
@@ -1332,25 +1390,32 @@ function tableOf(context: Context, tableId: number): { def: TableDef; rows: Map<
 }
 
 /** The rows of a relation (no pipelines: the stand-in materializes). */
-function rowsOf(rel: Rel, context: Context): Tuple[] {
+function* rowsOf(rel: Rel, context: Context): Evaluation<Tuple[]> {
   switch (rel.op) {
-    case "values":
-      return rel.rows.map((exprs) => exprs.map((expr) => evaluate(expr, [], context)));
-    case "project":
-      return rowsOf(rel.input, context).map((row) =>
-        rel.exprs.map((expr) => evaluate(expr, row, context)),
-      );
-    case "filter":
-      return rowsOf(rel.input, context).filter(
-        (row) => evaluate(rel.predicate, row, context) === true,
-      );
+    case "values": {
+      const rows: Tuple[] = [];
+      for (const exprs of rel.rows) rows.push(yield* evaluateAll(exprs, [], context));
+      return rows;
+    }
+    case "project": {
+      const rows: Tuple[] = [];
+      for (const row of yield* rowsOf(rel.input, context))
+        rows.push(yield* evaluateAll(rel.exprs, row, context));
+      return rows;
+    }
+    case "filter": {
+      const rows: Tuple[] = [];
+      for (const row of yield* rowsOf(rel.input, context))
+        if ((yield* evaluate(rel.predicate, row, context)) === true) rows.push(row);
+      return rows;
+    }
     case "scan": {
       const { def, rows } = tableOf(context, rel.tableId);
       const positions = rel.columns.map((id) => columnIndex(def, id));
       const out: Tuple[] = [];
       for (const [rowId, row] of [...rows].sort(([a], [b]) => a - b)) {
         const tuple: Tuple = positions.map((position) => row[position] ?? null);
-        if (rel.filter !== null && evaluate(rel.filter, tuple, context) !== true) continue;
+        if (rel.filter !== null && (yield* evaluate(rel.filter, tuple, context)) !== true) continue;
         if (rel.emitLocator) tuple.push(rowId);
         out.push(tuple);
       }
@@ -1366,7 +1431,7 @@ function rowsOf(rel: Rel, context: Context): Tuple[] {
       const out: Tuple[] = [];
       const seen = new Set<number>();
       for (const keys of rel.keys) {
-        const values = keys.map((key) => evaluate(key, [], context));
+        const values = yield* evaluateAll(keys, [], context);
         if (values.some((value) => value === null)) continue;
         for (const [rowId, row] of rows) {
           if (seen.has(rowId)) continue;
@@ -1418,18 +1483,18 @@ function checkUnique(def: TableDef, rows: Map<number, Row>, row: Row, self: numb
 }
 
 /** Runs a plan: query rows, or a modify's effect and its RETURNING rows. */
-function interpret(plan: PhysicalPlan, context: Context): ProgramResult {
+function* interpret(plan: PhysicalPlan, context: Context): Evaluation<ProgramResult> {
   const root = plan.root;
   if (root.op !== "modify")
-    return { rows: rowsOf(root, context), affected: 0, requiresLsn: context.sequenceLsn };
+    return { rows: yield* rowsOf(root, context), affected: 0, requiresLsn: context.sequenceLsn };
   const { def, rows } = tableOf(context, root.tableId);
-  const input = rowsOf(root.input, context);
+  const input = yield* rowsOf(root.input, context);
   const returned: Row[] = [];
   const passthrough = root.passthrough ?? 0;
-  const returning = (row: Row, extra: readonly Value[]) => {
+  const returning = function* (row: Row, extra: readonly Value[]): Evaluation<void> {
     if (root.returning === null) return;
     const full: Tuple = [...row, ...extra];
-    returned.push(root.returning.map((expr) => evaluate(expr, full, context)));
+    returned.push(yield* evaluateAll(root.returning, full, context));
   };
   let affected = 0;
   for (const tuple of input) {
@@ -1439,7 +1504,7 @@ function interpret(plan: PhysicalPlan, context: Context): ProgramResult {
         const row = tuple.slice(0, def.columns.length);
         checkUnique(def, rows, row, null);
         rows.set(context.state.nextRowId++, row);
-        returning(row, extra);
+        yield* returning(row, extra);
         affected++;
         break;
       }
@@ -1453,7 +1518,7 @@ function interpret(plan: PhysicalPlan, context: Context): ProgramResult {
         });
         checkUnique(def, rows, row, rowId);
         rows.set(rowId, row);
-        returning(row, extra);
+        yield* returning(row, extra);
         affected++;
         break;
       }
@@ -1462,7 +1527,7 @@ function interpret(plan: PhysicalPlan, context: Context): ProgramResult {
         const old = rows.get(rowId);
         if (old === undefined) break;
         rows.delete(rowId);
-        returning(old, extra);
+        yield* returning(old, extra);
         affected++;
         break;
       }

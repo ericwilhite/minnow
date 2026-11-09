@@ -6,6 +6,7 @@
  * policy is intentionally not substituted into the production write path here.
  */
 import fc from "fast-check";
+import { watchGrants } from "./test-support.js";
 import { expect, it } from "vitest";
 import { createReach, FREE_MAP_PRESSURE_REACH } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
@@ -71,12 +72,7 @@ for (const backend of ["memory", "indexeddb"] as const)
               }),
             });
           const grants: Grant[] = [];
-          const admit = governor.admit.bind(governor);
-          governor.admit = async (options) => {
-            const grant = await admit(options);
-            grants.push(grant);
-            return grant;
-          };
+          watchGrants(governor, (grant) => grants.push(grant));
           let write: Grant | undefined;
           let pressured = 0;
           harness.onSpace = (space) => {

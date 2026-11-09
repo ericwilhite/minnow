@@ -115,7 +115,11 @@ describe("streaming merge", () => {
         refs.push(runRef(encoded, (await writer.write(encoded.parts)).blobs));
       }
       const readers: RunReader[] = [];
-      for (const ref of refs) readers.push(await RunReader.open(space, ref, FREE, FREE));
+      for (const ref of refs) {
+        const reader = await RunReader.open(space, ref, FREE, FREE);
+        expect(reader.bytes).toBeLessThanOrEqual(RunReader.residentBound(ref));
+        readers.push(reader);
+      }
       const grant = await harness.governor.admit({
         label: "merge test",
         minimumBytes: 8 * 1024 * 1024,

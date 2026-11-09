@@ -13,6 +13,7 @@
  * and foreign keys are checked at `Statement.end()`: during the statement a key that collides with
  * a live row is only a suspect, re-verified at the end against everything the statement wrote.
  */
+import { SMALL_COMMIT_BYTES, type BufferAllocator } from "./commit-buffers.js";
 import {
   CatalogChangeError,
   type CatalogChange,
@@ -54,7 +55,12 @@ import type { KeyDelta } from "./key-hash.js";
 import type { Memtable } from "./memtable.js";
 import { readRows } from "./rows.js";
 import type { GroupDeletes, Shared, WriteState } from "./state.js";
-import { SnapshotImpl, ViewIndex, type TableSnapshotImpl } from "./view.js";
+import {
+  SnapshotImpl,
+  ViewIndex,
+  otherIndexLayersEndBefore,
+  type TableSnapshotImpl,
+} from "./view.js";
 import { need } from "./bytes.js";
 
 /** Everything committed and pending (constraint checks see the whole transaction). */
@@ -68,6 +74,8 @@ export interface EngineHooks {
   state(): WriteState;
   committedCatalog(): Catalog;
   nextCatalogVersion(): number;
+  /** Prepay schema-dependent metadata before synchronous DDL state changes. */
+  prepareCatalog(catalog: Catalog): MaybePromise<void>;
   /**
    * The table's live memtable with room, freezing a full one first: `created` is set when this
    * call created the memtable (and `frozen` is the one it froze, if any).
@@ -307,6 +315,7 @@ export class TransactionImpl implements WriteTransaction {
   effects(
     scratch: ByteWriter,
     staged: (tableId: number) => PublishedRows | null = () => null,
+    allocator?: BufferAllocator,
   ): BodyEffect[] {
     scratch.reset();
     const effects: BodyEffect[] = [];
@@ -369,15 +378,21 @@ export class TransactionImpl implements WriteTransaction {
           let schemaVersion: number | undefined;
           for (const range of inserts)
             if (range.memtable.tableId === tableId) schemaVersion = range.memtable.schemaVersion;
-          schemaVersion ??= need(this.#tableVersion(tableId));
+          schemaVersion ??= need(this.tableVersion(tableId));
           list.sort((x, y) => x.rowId - y.rowId);
+          const rowIds =
+            allocator === undefined
+              ? Float64Array.from(list, (item) => item.rowId)
+              : new Float64Array(allocator.create(list.length * 8).buffer);
+          if (allocator !== undefined)
+            for (let k = 0; k < list.length; k++) rowIds[k] = need(list[k]).rowId;
           effects.push({
             kind: "rows",
             tableId,
             schemaVersion,
             inserts: null,
             deletes: {
-              rowIds: Float64Array.from(list, (item) => item.rowId),
+              rowIds,
               keys: list.map((item) => item.keys),
             },
           });
@@ -411,7 +426,7 @@ export class TransactionImpl implements WriteTransaction {
         }
         case "catalog":
           emitRows();
-          for (const change of entry.logged) effects.push(catalogEffect(change));
+          for (const change of entry.logged) effects.push(catalogEffect(change, allocator));
           break;
         default:
           break;
@@ -424,8 +439,44 @@ export class TransactionImpl implements WriteTransaction {
     return effects;
   }
 
+  /** Conservative temporary object/array bound; large workspaces use the streaming codec. */
+  commitWorkspaceBytes(): number {
+    let bytes = 512;
+    for (const entry of this.undo) {
+      bytes += 64;
+      if (entry.kind === "rows") {
+        const chunks = Math.ceil(
+          ((entry.before % MEMORY_CHUNK_ROWS) + entry.count) / MEMORY_CHUNK_ROWS,
+        );
+        bytes += chunks * (192 + entry.memtable.chunks.length * 192);
+      } else if (entry.kind === "memDelete" || entry.kind === "groupDelete") bytes += 96;
+      else if (entry.kind === "catalog") bytes += 192 * entry.logged.length;
+      if (bytes > SMALL_COMMIT_BYTES) break;
+    }
+    return bytes;
+  }
+
+  /** Large metadata must be counted before the fast codec allocates definitions or row IDs. */
+  needsCommitPreflight(): boolean {
+    let bytes = 0;
+    for (const entry of this.undo) {
+      if (entry.kind === "memDelete" || entry.kind === "groupDelete") {
+        bytes += 8;
+        for (const key of entry.keys) bytes += key.length + 8;
+      } else if (entry.kind === "catalog") {
+        for (const change of entry.logged) bytes += jsonBound(change, SMALL_COMMIT_BYTES - bytes);
+      }
+      if (bytes > SMALL_COMMIT_BYTES) return true;
+    }
+    return false;
+  }
+
+  *loggedChanges(): Generator<LoggedChange> {
+    for (const entry of this.undo) if (entry.kind === "catalog") yield* entry.logged;
+  }
+
   /** A table's schema version in the transaction's catalog, or the committed one (dropped later). */
-  #tableVersion(tableId: number): number | undefined {
+  tableVersion(tableId: number): number | undefined {
     return (this.catalog.table(tableId) ?? this.hooks.committedCatalog().table(tableId))
       ?.schemaVersion;
   }
@@ -456,11 +507,30 @@ export class TransactionImpl implements WriteTransaction {
   }
 }
 
-function catalogEffect(change: LoggedChange): BodyEffect {
+/** Conservative JSON bound without an encoded allocation; exact counting is only on this lane. */
+export function jsonBound(value: unknown, limit: number): number {
+  if (typeof value === "string") return 2 + value.length * 6;
+  if (typeof value === "bigint") return 20 + value.toString().length;
+  if (value instanceof Uint8Array) return 16 + value.length * 4;
+  if (typeof value !== "object" || value === null) return 32;
+  let bytes = 2;
+  for (const key in value) {
+    if (!Object.hasOwn(value, key)) continue;
+    bytes += key.length * 6 + 4 + jsonBound((value as Record<string, unknown>)[key], limit - bytes);
+    if (bytes > limit) break;
+  }
+  return bytes;
+}
+
+function catalogEffect(change: LoggedChange, allocator?: BufferAllocator): BodyEffect {
   if (change.op === "createTable")
-    return { kind: "createTable", tableId: change.table.id, definition: encodeLogged(change) };
+    return {
+      kind: "createTable",
+      tableId: change.table.id,
+      definition: encodeLogged(change, allocator),
+    };
   if (change.op === "dropTable") return { kind: "dropTable", tableId: change.tableId };
-  return { kind: "catalog", definition: encodeLogged(change) };
+  return { kind: "catalog", definition: encodeLogged(change, allocator) };
 }
 
 function undoEntry(tx: TransactionImpl, entry: Undo): void {
@@ -701,14 +771,19 @@ export class StatementImpl implements Statement {
     return this.guard(() => {
       const before = this.tx.catalog;
       const { catalog, logged, id } = before.change(change, this.tx.hooks.nextCatalogVersion());
-      this.tx.undo.push({ kind: "catalog", statement: this.ordinal, before, logged });
-      this.tx.catalog = catalog;
-      const work: Array<MaybePromise<void>> = [];
-      for (const entry of logged) {
-        if (entry.op === "createTable") this.tx.hooks.createTableState(entry.table, entry.table.id);
-        if (entry.op === "createIndex") work.push(this.#backfill(entry.index));
-      }
-      return settle(all(work), () => ({ id }));
+      return settle(this.tx.hooks.prepareCatalog(catalog), () =>
+        this.guard(() => {
+          this.tx.undo.push({ kind: "catalog", statement: this.ordinal, before, logged });
+          this.tx.catalog = catalog;
+          const work: Array<MaybePromise<void>> = [];
+          for (const entry of logged) {
+            if (entry.op === "createTable")
+              this.tx.hooks.createTableState(entry.table, entry.table.id);
+            if (entry.op === "createIndex") work.push(this.#backfill(entry.index));
+          }
+          return settle(all(work), () => ({ id }));
+        }),
+      );
     });
   }
 
@@ -1030,9 +1105,27 @@ export class TableWriterImpl implements TableWriter {
   /** Appends `rows` of `columns` (complete, validated) and their index entries. */
   insertRows(columns: readonly Vector[], rows: Uint16Array): MaybePromise<void> {
     // Memtable memory is admitted before anything is appended (ruling 6).
-    return settle(this.statement.tx.hooks.admit(this.#estimate(columns, rows)), () =>
-      this.#insertRows(columns, rows),
-    );
+    if (rows.length <= MEMORY_CHUNK_ROWS)
+      return settle(this.statement.tx.hooks.admit(this.#estimate(columns, rows)), () =>
+        this.#insertRows(columns, rows),
+      );
+    // An input call can exceed the ordinary cap even though its individual chunks fit.
+    // Admit only the next chunk, letting completed pending chunks stage at each boundary.
+    // These are still one statement: checks and rollback include every appended piece.
+    let offset = 0;
+    const next = (): MaybePromise<void> =>
+      this.statement.guard(() => {
+        while (offset < rows.length) {
+          const piece = rows.subarray(offset, offset + MEMORY_CHUNK_ROWS);
+          offset += piece.length;
+          const pending = settle(
+            this.statement.tx.hooks.admit(this.#estimate(columns, piece)),
+            () => this.statement.guard(() => this.#insertRows(columns, piece)),
+          );
+          if (pending instanceof Promise) return pending.then(next);
+        }
+      });
+    return next();
   }
 
   /** An upper estimate of the memtable bytes `rows` of `columns` take (rows and index entries). */
@@ -1141,30 +1234,39 @@ export class TableWriterImpl implements TableWriter {
       if (delta === undefined) continue;
       const keys = this.#encode(index, columns, rows, columns[0]?.length ?? count);
       const first = delta.entryCount;
-      for (let k = 0; k < count; k++) {
-        const row = rows === null ? k : (rows[k] ?? 0);
-        if (this.#hasNullKey(index, columns, row)) continue;
-        const rowId = typeof rowIds === "number" ? rowIds + k : (rowIds[k] ?? 0);
-        delta.add(
-          keys.writer.bytes,
-          keys.offsets[k] ?? 0,
-          keys.offsets[k + 1] ?? 0,
-          rowId,
-          seq,
-          false,
-        );
+      try {
+        for (let k = 0; k < count; k++) {
+          const row = rows === null ? k : (rows[k] ?? 0);
+          if (this.#hasNullKey(index, columns, row)) continue;
+          const rowId = typeof rowIds === "number" ? rowIds + k : (rowIds[k] ?? 0);
+          delta.add(
+            keys.writer.bytes,
+            keys.offsets[k] ?? 0,
+            keys.offsets[k + 1] ?? 0,
+            rowId,
+            seq,
+            false,
+          );
+        }
+      } finally {
+        // Record completed entries even if a later allocation throws.
+        const added = delta.entryCount - first;
+        if (added > 0)
+          tx.undo.push({
+            kind: "delta",
+            statement: this.statement.ordinal,
+            delta,
+            entry: first,
+            count: added,
+          });
       }
       const added = delta.entryCount - first;
       if (added === 0) continue;
-      tx.undo.push({
-        kind: "delta",
-        statement: this.statement.ordinal,
-        delta,
-        entry: first,
-        count: added,
-      });
       if (!index.unique) continue;
-      const check = this.#suspect(index, delta, first, delta.entryCount);
+      const check =
+        added === 1
+          ? this.#suspectOne(index, delta, first)
+          : this.#suspect(index, delta, first, delta.entryCount);
       if (check !== undefined) (checks ??= []).push(check);
     }
     return checks === null ? undefined : Promise.all(checks).then(() => undefined);
@@ -1175,6 +1277,21 @@ export class TableWriterImpl implements TableWriter {
    * (re-verified at the end of the statement). The keys are read from the delta's arena, which
    * keeps them (no copies).
    */
+  #suspectOne(index: IndexDef, delta: KeyDelta, from: number): Promise<void> | undefined {
+    // Retained writers across DDL keep the existing catalog/view checks.
+    if (this.statement.catalog.table(this.tableId) !== this.def)
+      return this.#suspect(index, delta, from, from + 1);
+    const slot = delta.keyOf(from);
+    if (delta.head(slot) === from && delta.nextEntry(from) < 0) {
+      const key = delta.keyBytes(slot);
+      const table = need(this.statement.tx.hooks.state().tables.get(this.tableId));
+      // A synchronous range/chain proof needs no snapshot, pin, reader or skipped-run Set.
+      if (otherIndexLayersEndBefore(table, index.id, key, delta)) return undefined;
+    }
+    return this.#suspect(index, delta, from, from + 1);
+  }
+
+  /** The existing batch checker, with the single-key proof outside its hot body. */
   #suspect(index: IndexDef, delta: KeyDelta, from: number, to: number): Promise<void> | undefined {
     const current = this.statement.current();
     const reader = new ViewIndex(nonUnique(index), current.internalTable(this.tableId));
@@ -1191,10 +1308,16 @@ export class TableWriterImpl implements TableWriter {
       if (compareBytes(bytes, start, end, bytes, delta.keyStart(high), delta.keyEnd(high)) > 0)
         high = slot;
     }
-    reader.skipRunsOutside(delta.keyBytes(low), delta.keyBytes(high));
+    const lowKey = delta.keyBytes(low);
+    const highKey = delta.keyBytes(high);
+    // No other layer can hold the batch's keys (perf step 3): a key is a suspect only if its own
+    // chain in this delta holds another entry, so most keys need no lookup at all.
+    const alone = !reader.othersOverlap(lowKey, highKey, delta);
+    reader.skipRunsOutside(lowKey, highKey);
     const run = (first: number): Promise<void> | undefined => {
       for (let entry = first; entry < to; entry++) {
         const slot = delta.keyOf(entry);
+        if (alone && delta.head(slot) === entry && delta.nextEntry(entry) < 0) continue;
         const found = reader.countRange(delta.keyArena(), delta.keyStart(slot), delta.keyEnd(slot));
         if (found instanceof Promise)
           return found.then((count) => {
@@ -1447,24 +1570,27 @@ export class TableWriterImpl implements TableWriter {
       const delta = live.deltas.get(index.id);
       const keys = this.#encode(index, old, null, rowIds.length);
       const first = delta?.entryCount ?? 0;
-      for (let k = 0; k < rowIds.length; k++) {
-        if (this.#hasNullKey(index, old, k)) {
-          keysPerRow[k]?.push(NULL_KEY);
-          continue;
+      try {
+        for (let k = 0; k < rowIds.length; k++) {
+          if (this.#hasNullKey(index, old, k)) {
+            keysPerRow[k]?.push(NULL_KEY);
+            continue;
+          }
+          const start = keys.offsets[k] ?? 0;
+          const end = keys.offsets[k + 1] ?? 0;
+          keysPerRow[k]?.push(keys.writer.bytes.slice(start, end));
+          delta?.add(keys.writer.bytes, start, end, rowIds[k] ?? 0, seq, true);
         }
-        const start = keys.offsets[k] ?? 0;
-        const end = keys.offsets[k + 1] ?? 0;
-        keysPerRow[k]?.push(keys.writer.bytes.slice(start, end));
-        delta?.add(keys.writer.bytes, start, end, rowIds[k] ?? 0, seq, true);
+      } finally {
+        if (delta !== undefined && delta.entryCount > first)
+          tx.undo.push({
+            kind: "delta",
+            statement: this.statement.ordinal,
+            delta,
+            entry: first,
+            count: delta.entryCount - first,
+          });
       }
-      if (delta !== undefined && delta.entryCount > first)
-        tx.undo.push({
-          kind: "delta",
-          statement: this.statement.ordinal,
-          delta,
-          entry: first,
-          count: delta.entryCount - first,
-        });
     }
     rowIds.forEach((rowId, k) => {
       const locator = table.locator(rowId);

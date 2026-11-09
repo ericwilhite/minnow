@@ -4,6 +4,7 @@
  * installed generation (the reviewer's probe). Findings 1 and 2 are in
  * testing/divergences.test.ts (write/ may not import testing/).
  */
+import { watchGrants } from "./test-support.js";
 import { expect, it } from "vitest";
 import type { Grant } from "../memory/governor.js";
 import { need } from "./bytes.js";
@@ -23,12 +24,9 @@ it("a pending publication retains its shared chunks while a drop lands during th
   const harness = new Harness("strict", "memory", 1);
   const pinCredit = countMetadataPinBytes(harness);
   let metadata: Grant | null = null;
-  const admit = harness.governor.admit.bind(harness.governor);
-  harness.governor.admit = async (options) => {
-    const grant = await admit(options);
-    if (options.label === "write path metadata") metadata = grant;
-    return grant;
-  };
+  watchGrants(harness.governor, (grant) => {
+    if (grant.label === "write path metadata") metadata = grant;
+  });
   const path = await harness.open();
   let t = 0;
   await autocommit(path, async (s) => {

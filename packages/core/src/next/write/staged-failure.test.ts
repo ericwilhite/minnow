@@ -8,6 +8,7 @@
  * the path keeps staging and committing, and retired space is reclaimed (R8): no pin holds it.
  */
 import fc from "fast-check";
+import { watchGrants } from "./test-support.js";
 import { describe, expect, it } from "vitest";
 import type { Grant } from "../memory/governor.js";
 import { createReach } from "../../testing/reach.js";
@@ -72,13 +73,12 @@ async function run(fault: Fault): Promise<void> {
       if (kind === "stage") fire("encode", -1);
     },
   });
-  // The metadata grant refuses the stage root's charge; the write path's grant is measured.
+  // A hard failure at the root charge exercises cleanup; temporary refusal now waits/retries
+  // (PROPOSAL "One memory governor", covered by metadata-pressure.test.ts).
   let grant: Grant | null = null;
-  const admit = harness.governor.admit.bind(harness.governor);
-  harness.governor.admit = async (options) => {
-    const admitted = await admit(options);
-    if (options.label === "write path") grant = admitted;
-    if (options.label === "write path metadata") {
+  watchGrants(harness.governor, (admitted) => {
+    if (admitted.label === "write path") grant = admitted;
+    if (admitted.label === "write path metadata") {
       const allocate = admitted.allocate.bind(admitted);
       admitted.allocate = (bytes) => {
         if (
@@ -89,13 +89,12 @@ async function run(fault: Fault): Promise<void> {
         ) {
           armed = false;
           reach.reach("failure at charge");
-          return false;
+          throw new Error("injected failure at charge");
         }
         return allocate(bytes);
       };
     }
-    return admitted;
-  };
+  });
   // Released bytes per committed publication (the sink sees exactly what each root retires).
   const released: number[] = [];
   let pending = 0;
@@ -183,10 +182,7 @@ async function run(fault: Fault): Promise<void> {
       (error: unknown) => error,
     );
     expect(armed, `the ${fault.step} fault fired`).toBe(false);
-    // A refused charge is the budget's own error; every other fault is the injected one.
-    expect(String(failed)).toContain(
-      fault.step === "charge" ? "the budget does not have" : "injected failure",
-    );
+    expect(String(failed)).toContain("injected failure");
     await path.quiesce();
     expect(path.failure).toBeNull();
     expect(harness.space.stats.pinCount, `pins after failure ${String(trial)}`).toBe(pins);

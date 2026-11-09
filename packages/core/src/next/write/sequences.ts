@@ -1,7 +1,8 @@
 /**
  * Sequences (access/write-path.ts `SequenceAccess`, ruling R4): values handed out from in-memory
  * blocks, each block reserved by a standalone sequence frame (a one-effect transaction) appended
- * to the log at once, outside any open transaction.
+ * to the log outside any open transaction. Calls stay synchronous when the bounded log queue
+ * fits and otherwise wait for its drain before making values visible.
  *
  * - **State.** Per sequence: `next` (the next value to hand out) and `reservedThrough` (values
  *   strictly before it, in the sequence's direction, are covered by logged reservations). Replay
@@ -12,6 +13,7 @@
  *   consuming anything; a cycling one wraps to its start of range (PostgreSQL: min for ascending,
  *   max for descending).
  */
+import type { MaybePromise } from "../access/key-index.js";
 import { SequenceExhaustedError, type SequenceAccess } from "../access/write-path.js";
 import type { SequenceDef } from "../access/catalog.js";
 import { MAX_SAFE } from "../vector/int64.js";
@@ -34,13 +36,41 @@ interface SequenceState {
 export interface SequenceHost {
   /** The definition visible to callers now (committed catalog, else the open transaction's). */
   definition(sequenceId: number): SequenceDef | undefined;
-  /** Appends a standalone reservation frame; returns its LSN. */
-  logReservation(sequenceId: number, reservedThrough: bigint): number;
+  /** Appends a standalone reservation frame; waits under queue pressure before returning its LSN. */
+  logReservation(sequenceId: number, reservedThrough: bigint): MaybePromise<number>;
+  check(): void;
   now(): number;
 }
 
 export class Sequences implements SequenceAccess {
   readonly #states = new Map<number, SequenceState>();
+  #pending: Promise<number> | null = null;
+
+  /** Serializes only the pressure lane; fitting calls keep their synchronous result. */
+  #run(action: () => MaybePromise<number>): MaybePromise<number> {
+    const result =
+      this.#pending === null
+        ? (this.host.check(), action())
+        : this.#pending
+            .catch(() => undefined)
+            .then(() => {
+              this.host.check();
+              return action();
+            });
+    if (!(result instanceof Promise)) return result;
+    this.#pending = result;
+    void result
+      .finally(() => {
+        if (this.#pending === result) this.#pending = null;
+      })
+      .catch(() => undefined);
+    return result;
+  }
+
+  async settled(): Promise<void> {
+    await this.#pending?.catch(() => undefined);
+  }
+
   /** Logged reservations per sequence (lsn, value), for root checkpoints at a global LSN. */
   readonly #history = new Map<number, Array<{ lsn: number; through: bigint }>>();
 
@@ -131,7 +161,11 @@ export class Sequences implements SequenceAccess {
     return values;
   }
 
-  next(sequenceId: number, count: number, out: Int64Values, offset: number): number {
+  next(sequenceId: number, count: number, out: Int64Values, offset: number): MaybePromise<number> {
+    return this.#run(() => this.#next(sequenceId, count, out, offset));
+  }
+
+  #next(sequenceId: number, count: number, out: Int64Values, offset: number): MaybePromise<number> {
     const state = this.#state(sequenceId);
     const values = this.#plan(state, count);
     if (values === null) throw new SequenceExhaustedError(sequenceId);
@@ -141,21 +175,33 @@ export class Sequences implements SequenceAccess {
           throw new RangeError("A sequence value is outside the f64-safe range; widen to int64");
     const increment = state.def.increment;
     const ascending = increment > 0n;
-    let lsn = state.blockLsn;
-    for (let k = 0; k < values.length; k++) {
-      const value = need(values[k]);
-      // A wrap starts a new reservation range.
-      if (value !== state.next) state.reservedThrough = value;
-      const covered = ascending ? value < state.reservedThrough : value > state.reservedThrough;
-      if (!covered) lsn = this.#reserve(state, value);
-      if (out.repr === "safe") out.values[offset + k] = Number(value);
-      else out.values[offset + k] = value;
-      state.next = value + increment;
-    }
-    return lsn;
+    const consume = (from: number, initialLsn: number): MaybePromise<number> => {
+      let lsn = initialLsn;
+      for (let k = from; k < values.length; k++) {
+        const value = need(values[k]);
+        if (value !== state.next) state.reservedThrough = value;
+        const covered = ascending ? value < state.reservedThrough : value > state.reservedThrough;
+        if (!covered) {
+          const reserved = this.#reserve(state, value);
+          if (reserved instanceof Promise)
+            return reserved.then((logged) => {
+              if (out.repr === "safe") out.values[offset + k] = Number(value);
+              else out.values[offset + k] = value;
+              state.next = value + increment;
+              return consume(k + 1, logged);
+            });
+          lsn = reserved;
+        }
+        if (out.repr === "safe") out.values[offset + k] = Number(value);
+        else out.values[offset + k] = value;
+        state.next = value + increment;
+      }
+      return lsn;
+    };
+    return consume(0, state.blockLsn);
   }
 
-  #reserve(state: SequenceState, from: bigint): number {
+  #reserve(state: SequenceState, from: bigint): MaybePromise<number> {
     const now = this.host.now();
     if (state.reservedAtMs > 0 && now - state.reservedAtMs < ADAPT_MS)
       state.blockSize = Math.min(MAX_BLOCK, state.blockSize * 2);
@@ -165,27 +211,37 @@ export class Sequences implements SequenceAccess {
     // Never reserve past the bound (the next value after it is exhaustion or a wrap).
     if (increment > 0n && through > max + increment) through = max + increment;
     if (increment < 0n && through < min + increment) through = min + increment;
+    const record = (lsn: number): number => {
+      state.reservedThrough = through;
+      state.blockLsn = lsn;
+      state.reservedAtMs = now;
+      this.#remember(state.def.id, lsn, through);
+      return lsn;
+    };
     const lsn = this.host.logReservation(state.def.id, through);
-    state.reservedThrough = through;
-    state.blockLsn = lsn;
-    state.reservedAtMs = now;
-    this.#remember(state.def.id, lsn, through);
-    return lsn;
+    return lsn instanceof Promise ? lsn.then(record) : record(lsn);
   }
 
-  set(sequenceId: number, value: bigint, isCalled: boolean): number {
+  set(sequenceId: number, value: bigint, isCalled: boolean): MaybePromise<number> {
+    return this.#run(() => this.#set(sequenceId, value, isCalled));
+  }
+
+  #set(sequenceId: number, value: bigint, isCalled: boolean): MaybePromise<number> {
     const state = this.#state(sequenceId);
     const { increment, min, max } = state.def;
     if (value < min || value > max)
       throw new RangeError(`setval: ${value.toString()} is outside the sequence's bounds`);
     const next = isCalled ? value + increment : value;
-    state.next = next;
+    const record = (lsn: number): number => {
+      state.next = next;
+      state.reservedThrough = next;
+      state.blockLsn = lsn;
+      state.blockSize = 1;
+      state.reservedAtMs = this.host.now();
+      this.#remember(sequenceId, lsn, next);
+      return lsn;
+    };
     const lsn = this.host.logReservation(state.def.id, next);
-    state.reservedThrough = next;
-    state.blockLsn = lsn;
-    state.blockSize = 1;
-    state.reservedAtMs = this.host.now();
-    this.#remember(sequenceId, lsn, next);
-    return lsn;
+    return lsn instanceof Promise ? lsn.then(record) : record(lsn);
   }
 }

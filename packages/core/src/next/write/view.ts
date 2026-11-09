@@ -5,6 +5,7 @@
  * tombstone entries across memtable deltas and durable runs under the view's bound.
  */
 import { MemoryReads } from "./memory-read.js";
+import { StreamingRangeCursor } from "./range-cursor.js";
 import type { Held } from "../format/reachable.js";
 import type { CatalogView, ColumnDef, IndexDef, TableDef } from "../access/catalog.js";
 import {
@@ -53,7 +54,8 @@ import { compareBytes } from "../vector/varlen.js";
 import { MEMORY_CHUNK_ROWS } from "./columns.js";
 import type { GroupDirectory } from "./groups.js";
 import { groupRootOf, type Memtable } from "./memtable.js";
-import type { RunEntry } from "./runs.js";
+import type { KeyDelta } from "./key-hash.js";
+import type { RunEntry, RunReader } from "./runs.js";
 import { groupDeletions, type Shared, type TableView, type WriteState } from "./state.js";
 import { need } from "./bytes.js";
 
@@ -697,7 +699,7 @@ export class SnapshotImpl implements Snapshot {
     (this.#holds ??= []).push(held);
   }
 
-  // Allocated only for bounded reads; ordinary snapshots keep their existing fast path.
+  // Allocated only for bounded reads or range cursors; ordinary snapshots keep their existing fast path.
   #cursors: Set<IndexCursor> | null = null;
   watchCursor(cursor: IndexCursor): () => void {
     this.check();
@@ -736,6 +738,32 @@ interface Resume extends ProbeResume {
 
 /** Resolution of one key across the view's layers. */
 const NO_RUNS: readonly RunRef[] = [];
+
+/** A fresh single key beyond every other layer needs no constraint-check snapshot. */
+export function otherIndexLayersEndBefore(
+  table: TableView,
+  indexId: number,
+  key: Uint8Array,
+  own: KeyDelta,
+): boolean {
+  const before = (max: Uint8Array) => compareBytes(max, 0, max.length, key, 0, key.length) < 0;
+  for (const run of table.runs.get(indexId) ?? NO_RUNS) if (!before(run.maxKey)) return false;
+  for (const memtable of table.memtables) {
+    for (const run of memtable.staged?.runs.get(indexId) ?? NO_RUNS)
+      if (!before(run.maxKey)) return false;
+    const published = memtable.published;
+    if (published !== null && memtable.deltasDropped) {
+      const run = published.runs.get(indexId);
+      if (run !== undefined && !before(run.maxKey)) return false;
+      continue;
+    }
+    const delta = memtable.deltas.get(indexId);
+    if (delta === undefined || delta === own) continue;
+    const range = delta.keyRange();
+    if (range === null ? delta.keyCount > 0 : !before(range.max)) return false;
+  }
+  return true;
+}
 
 export class ViewIndex implements IndexReader {
   /** Row ids a newer layer tombstoned (made on the first tombstone). */
@@ -824,6 +852,34 @@ export class ViewIndex implements IndexReader {
   #skip: Set<RunRef> | null = null;
 
   /**
+   * Whether any layer but the delta `own` (the live memtable's, which a statement writes into)
+   * could hold a key in `[low, high]` (byte order): durable runs, staged and published runs and
+   * other memtables' deltas are compared by their key ranges (perf step 3).
+   */
+  othersOverlap(low: Uint8Array, high: Uint8Array, own: KeyDelta): boolean {
+    const outside = (min: Uint8Array, max: Uint8Array) =>
+      compareBytes(max, 0, max.length, low, 0, low.length) < 0 ||
+      compareBytes(min, 0, min.length, high, 0, high.length) > 0;
+    for (const run of this.table.tableView.runs.get(this.def.id) ?? NO_RUNS)
+      if (!outside(run.minKey, run.maxKey)) return true;
+    for (const memtable of this.table.tableView.memtables) {
+      for (const run of memtable.staged?.runs.get(this.def.id) ?? NO_RUNS)
+        if (!outside(run.minKey, run.maxKey)) return true;
+      const published = memtable.published;
+      if (published !== null && memtable.deltasDropped) {
+        const run = published.runs.get(this.def.id);
+        if (run !== undefined && !outside(run.minKey, run.maxKey)) return true;
+        continue;
+      }
+      const delta = memtable.deltas.get(this.def.id);
+      if (delta === undefined || delta === own) continue;
+      const range = delta.keyRange();
+      if (range === null ? delta.keyCount > 0 : !outside(range.min, range.max)) return true;
+    }
+    return false;
+  }
+
+  /**
    * Resolution from layer `from`, sub-layer `sub`. A memtable is one layer: sub-layer 0 is its
    * delta (or, once published and its deltas dropped, its published run), sub-layer j ≥ 1 its
    * staged run j − 1, whose entries count only for rows the view sees (runs carry no seq).
@@ -852,7 +908,7 @@ export class ViewIndex implements IndexReader {
           } else {
             const run = published.runs.get(this.def.id);
             if (run !== undefined && this.#skip?.has(run) !== true) {
-              const pending = this.#runLayer(run, key(), layer, 0, 1, Infinity);
+              const pending = this.#runLayer(run, key(), layer, 1, Infinity);
               if (pending !== null) return pending;
               if (unique && this.#hitCount > 0) return;
             }
@@ -864,7 +920,7 @@ export class ViewIndex implements IndexReader {
         for (let k = Math.max(0, sub - 1); k < staged.length; k++) {
           const run = need(staged[k]);
           if (this.#skip?.has(run) === true) continue;
-          const pending = this.#runLayer(run, key(), layer, k + 1, k + 2, limit);
+          const pending = this.#runLayer(run, key(), layer, k + 2, limit);
           if (pending !== null) return pending;
           if (unique && this.#hitCount > 0) return;
         }
@@ -872,7 +928,7 @@ export class ViewIndex implements IndexReader {
       }
       const run = runs[layer - memtables.length];
       if (run === undefined || this.#skip?.has(run) === true) continue;
-      const pending = this.#runLayer(run, key(), layer, 0, -1, Infinity);
+      const pending = this.#runLayer(run, key(), layer, -1, Infinity);
       if (pending !== null) return pending;
       if (unique && this.#hitCount > 0) return;
     }
@@ -905,24 +961,38 @@ export class ViewIndex implements IndexReader {
   }
 
   /**
-   * One run, at (`layer`, `sub`); a Promise that finishes the resolution when it had to read, else
-   * null. It continues at (`layer`, `next`), or at the next layer when `next` is −1. Puts at or past
+   * One run in `layer`; a Promise that finishes resolution when it had to read, else null.
+   * It continues at (`layer`, `next`), or at the next layer when `next` is −1. Puts at or past
    * `limit` (a row id) are not visible.
    */
   #runLayer(
     run: RunRef,
     key: Uint8Array,
     layer: number,
-    sub: number,
     next: number,
     limit: number,
   ): Promise<void> | null {
     const shared = this.table.snapshot.shared;
     const reader = shared.runReader(run);
     if (reader instanceof Promise)
-      return reader.then(async () => {
-        await this.#resolveFrom(key, 0, key.length, layer, sub);
+      return reader.then(async (loaded) => {
+        const pending = this.#readRunLayer(loaded, key, layer, next, limit);
+        if (pending !== null) return await pending;
+        if (this.def.unique && this.#hitCount > 0) return;
+        await this.#continueRun(key, layer, next);
       });
+    return this.#readRunLayer(reader, key, layer, next, limit);
+  }
+
+  /** Consume the reader returned by an asynchronous open, even if it cannot stay cached. */
+  #readRunLayer(
+    reader: RunReader,
+    key: Uint8Array,
+    layer: number,
+    next: number,
+    limit: number,
+  ): Promise<void> | null {
+    const shared = this.table.snapshot.shared;
     const entries = this.#layer;
     entries.length = 0;
     const read = reader.lookup(shared.space, key, entries, shared.budget);
@@ -930,12 +1000,16 @@ export class ViewIndex implements IndexReader {
       return read.then(async () => {
         this.#applyLayer(entries, limit);
         if (this.def.unique && this.#hitCount > 0) return;
-        await (next < 0
-          ? this.#resolveFrom(key, 0, key.length, layer + 1, 0)
-          : this.#resolveFrom(key, 0, key.length, layer, next));
+        await this.#continueRun(key, layer, next);
       });
     this.#applyLayer(entries, limit);
     return null;
+  }
+
+  #continueRun(key: Uint8Array, layer: number, next: number): MaybePromise<void> {
+    return next < 0
+      ? this.#resolveFrom(key, 0, key.length, layer + 1, 0)
+      : this.#resolveFrom(key, 0, key.length, layer, next);
   }
 
   #applyLayer(layer: readonly RunEntry[], limit: number): void {
@@ -961,27 +1035,34 @@ export class ViewIndex implements IndexReader {
     from: number,
     skip: number,
   ): MaybePromise<ProbeResult> {
-    const capacity = Math.min(out.probes.length, out.locators.length);
     const rows: number[] = [];
     for (let k = from; k < keys.count; k++) {
       const result = this.resolve(keys.key(k), rows);
       if (result instanceof Promise)
         return result.then(() => {
-          // Blocks are cached now: this key resolves synchronously (or reads again).
-          return this.#probeFrom(keys, out, k, k === from ? skip : 0);
+          // The completed call already produced these rows. Cache admission is optional.
+          const resume = this.#copyProbeRows(out, k, k === from ? skip : 0, rows);
+          return resume === null ? this.#probeFrom(keys, out, k + 1, 0) : { done: false, resume };
         });
-      const first = k === from ? skip : 0;
-      for (let m = first; m < rows.length; m++) {
-        if (out.count >= capacity) {
-          const next: Resume = { key: k, skip: m };
-          return { done: false, resume: next };
-        }
-        out.probes[out.count] = k;
-        out.locators[out.count] = this.table.locator(rows[m] ?? 0);
-        out.count += 1;
-      }
+      const resume = this.#copyProbeRows(out, k, k === from ? skip : 0, rows);
+      if (resume !== null) return { done: false, resume };
     }
     return { done: true };
+  }
+
+  #copyProbeRows(
+    out: ProbeOutput,
+    key: number,
+    first: number,
+    rows: readonly number[],
+  ): Resume | null {
+    const capacity = Math.min(out.probes.length, out.locators.length);
+    for (let m = first; m < rows.length; m++) {
+      if (out.count >= capacity) return { key, skip: m };
+      out.probes[out.count] = key;
+      out.locators[out.count++] = this.table.locator(rows[m] ?? 0);
+    }
+    return null;
   }
 
   /**
@@ -1004,7 +1085,7 @@ export class ViewIndex implements IndexReader {
 
   range(range: KeyRange, direction: "asc" | "desc"): IndexCursor {
     if (this.def.kind !== "ordered") throw new TypeError("An equality index serves lookups only");
-    return new RangeCursor(this, range, direction);
+    return new StreamingRangeCursor(this, range, direction);
   }
 
   /** Every live (key, rowId) in `range`, resolved, sorted by key then row id. */
@@ -1072,40 +1153,4 @@ function startsWith(key: Uint8Array, prefix: Uint8Array): boolean {
   if (key.length < prefix.length) return false;
   for (let k = 0; k < prefix.length; k++) if (key[k] !== prefix[k]) return false;
   return true;
-}
-
-class RangeCursor implements IndexCursor {
-  #rows: number[] | null = null;
-  #at = 0;
-  #closed = false;
-
-  constructor(
-    readonly index: ViewIndex,
-    readonly range: KeyRange,
-    readonly direction: "asc" | "desc",
-  ) {}
-
-  next(out: Float64Array): MaybePromise<number> {
-    this.index.table.snapshot.check();
-    if (this.#closed) return 0;
-    if (this.#rows === null)
-      return this.index.collect(this.range).then((entries) => {
-        const rows = entries.map((entry) => this.index.table.locator(entry.rowId));
-        this.#rows = this.direction === "asc" ? rows : rows.reverse();
-        return this.#fill(out);
-      });
-    return this.#fill(out);
-  }
-
-  #fill(out: Float64Array): number {
-    const rows = this.#rows ?? [];
-    let filled = 0;
-    while (filled < out.length && this.#at < rows.length) out[filled++] = rows[this.#at++] ?? 0;
-    return filled;
-  }
-
-  close(): void {
-    this.#closed = true;
-    this.#rows = null;
-  }
 }

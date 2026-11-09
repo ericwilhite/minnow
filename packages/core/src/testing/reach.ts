@@ -1870,3 +1870,396 @@ export const FLOAT_SUM_BOUNDARIES_REACH = [
   "unit cancellation",
   "5000 groups",
 ] as const;
+
+/** Run Bloom arithmetic preserves the stored probes across bitmap sizes and unsigned hashes. */
+export const RUN_BLOOM_STEP_STATES = [
+  "minimum bitmap",
+  "rounded bitmap",
+  "unsigned high hash",
+  "wrapped step",
+] as const;
+
+/** Feasible durable writes under small caps must share idle holdings with maintenance. */
+export const WRITE_LOW_CAP_STATES = [
+  "memory",
+  "indexeddb",
+  "startup returned",
+  "startup retained",
+  "active progress loan",
+  "idle estimate headroom",
+  "merge transfers idle row credit under global pressure",
+  "merge completed",
+  "metadata grew under pressure",
+  "durable reopen",
+  "allocated write above minimum",
+  "commit buffers independently charged",
+] as const;
+
+/** B3: low-cap commit encoding owns a bounded, independently counted set of actual buffers. */
+export const WRITE_COMMIT_BUFFER_STATES = [
+  "request metadata",
+  "value over 64 KiB",
+  "memory",
+  "indexeddb",
+  "catalog and rows together",
+  "streamed body",
+  "single-buffer body",
+  "strict",
+  "relaxed",
+  "durable reopen",
+  "ownership released once",
+  "streamed catalog and bigint tags",
+  "observed constructor precharge",
+  "production constructor precharge",
+] as const;
+
+/** B3: physical power loss at multipart prefixes and the complete but unacknowledged body. */
+export const WRITE_STREAM_CRASH_STATES = [
+  "strict",
+  "relaxed",
+  "prefix",
+  "complete",
+  "retry and reopen",
+] as const;
+
+/** B3: bounded canonical row-id ordering of a large deletion body. */
+export const WRITE_DELETE_STREAM_STATES = [
+  "reverse",
+  "zigzag",
+  "charged order loan",
+  "bounded rank walk",
+  "empty after reopen",
+] as const;
+
+/** B3: the bounded byte sink preserves all supported frame-column representations. */
+export const WRITE_COLUMN_WINDOW_STATES = [
+  "bool",
+  "f32",
+  "f64",
+  "int64",
+  "decimal64",
+  "decimal128",
+  "fixed16",
+  "interval",
+  "short range",
+  "long range",
+  "signaling f32",
+] as const;
+
+/** B3: string metadata uses owned UTF-8 storage or bounded streaming before stringification. */
+export const WRITE_REQUEST_BUFFER_STATES = [
+  "streamed metadata",
+  "single-buffer metadata",
+  "sequence UTF-8",
+  "no unowned string buffer",
+] as const;
+
+/** B3/B5: async sequence callers stop at cancellation before continuing batched inputs. */
+export const OWNER_SEQUENCE_PRESSURE_STATES = [
+  "plain sequence expression",
+  "case then sequence expression",
+  "case else sequence expression",
+  "last value",
+  "remaining values",
+  "no later sequence call",
+  "statement rolled back",
+] as const;
+
+/** B3: one oversized input call admits bounded pieces without changing statement atomicity. */
+export const WRITE_BATCH_ADMISSION_STATES = [
+  "memory",
+  "indexeddb",
+  "startup retained",
+  "other live working memory",
+  "oversized input",
+  "staged within call",
+  "durable reopen",
+] as const;
+
+/** B3 review: transient reader memory must delay metadata publication, never poison it. */
+export const WRITE_METADATA_PRESSURE_STATES = [
+  "memory",
+  "indexeddb",
+  "reader owns real bytes",
+  "metadata waits",
+  "reader released",
+  "flush published",
+  "staging published",
+  "merge completed",
+  "durable reopen",
+] as const;
+
+/** R23.5 / key-index chain ordering: a popular non-unique key can fill the whole memtable. */
+export const WRITE_HOT_KEY_STATES = [
+  "ascending",
+  "descending",
+  "mixed",
+  "row-id ties",
+  "full memtable chain",
+  "filtered chain",
+  "task yields",
+  "short traversals accumulate",
+] as const;
+
+/** Write rule 4: actual native capacities, overlap, refusal and suspension lifetimes. */
+export const WRITE_DELTA_ACCOUNTING_STATES = [
+  "constructor precharge",
+  "initial constructor failure",
+  "order buffer",
+  "chain growth overlap",
+  "full memtable",
+  "visitor failure",
+  "range cache",
+  "range replacement overlap",
+  "denial before allocation",
+  "retained growth overlap",
+  "constructor failure refund",
+  "last entry array failure",
+  "release while suspended",
+  "publication workspace pressure",
+] as const;
+
+/** An unfunded nonempty range is unknown, never evidence that a layer is empty. */
+export const WRITE_RANGE_PRESSURE_STATES = [
+  "memory",
+  "indexeddb",
+  "single row",
+  "batch rows",
+  "single conflict",
+  "batch conflict",
+  "accepted fresh keys",
+  "nonempty range unavailable",
+  "publication",
+  "durable reopen",
+] as const;
+
+/** A completed asynchronous read must advance rather than require a synchronous cache replay. */
+export const WRITE_ASYNC_PROBE_STATES = [
+  "memory",
+  "indexeddb",
+  "unique",
+  "nonunique",
+  "asynchronous metadata",
+  "asynchronous blocks",
+  "output continuation",
+  "older pin",
+  "visible delete",
+] as const;
+
+/** A pending tombstone does not name a durable frame, even when its memtable's rows are committed. */
+export const WRITE_PENDING_FLUSH_STATES = [
+  "earlier statement",
+  "same statement",
+  "memory",
+  "indexeddb",
+  "frozen committed rows with pending tombstone",
+  "rollback",
+  "commit",
+  "publication and reopen",
+  "close settles",
+] as const;
+
+/** Streaming index ranges preserve the pinned view while visiting only demanded output. */
+export const WRITE_STREAM_RANGE_STATES = [
+  "memory",
+  "32 MiB cap",
+  "64 MiB cap",
+  "indexeddb",
+  "ascending",
+  "descending",
+  "unique",
+  "nonunique",
+  "hot nonunique",
+  "memtable input",
+  "stored input",
+  "staged input",
+  "bounded range",
+  "empty range",
+  "output continuation",
+  "earlier statement",
+  "own writes invisible",
+  "older pin",
+  "committed delete",
+] as const;
+
+/** Maintained order survives growth and rollback while a cursor keeps its position. */
+export const WRITE_STREAM_DELTA_STATES = [
+  "ordered inserts",
+  "unordered pending inserts",
+  "leaf-sized tail",
+  "arena growth",
+  "ascending",
+  "descending",
+  "rollback while pinned",
+  "resume after mutation",
+  "invisible tail",
+] as const;
+
+/** Reverse run traversal handles the existing interleaved blocks and Bloom partitions. */
+export const WRITE_RANGE_DIRECTORY_STATES = [
+  "asynchronous metadata",
+  "cached metadata",
+  "one hot key",
+  "distinct keys",
+  "ascending",
+  "descending",
+  "crossed Bloom boundaries",
+  "bounded prefix seek",
+] as const;
+
+/** New ordered-leaf buffers must not bypass the memtable's native-capacity ownership. */
+export const WRITE_STREAM_ORDER_STATES = [
+  "denied before constructor",
+  "funded retry",
+  "native allocation witness",
+  "constructor failure refund",
+  "release once",
+] as const;
+
+/** An allocation failure after a key prefix cannot leave index effects of aborted rows. */
+export const WRITE_PARTIAL_DELTA_STATES = [
+  "memory",
+  "insert prefix",
+  "delete prefix",
+  "indexeddb",
+  "primary",
+  "unique",
+  "nonunique",
+  "native failure",
+  "budget denial",
+  "partial key prefix",
+  "all deltas rolled back",
+  "retry accepted",
+  "durable reopen",
+] as const;
+
+/** Copied source buffers are collectible while chunks and owned views remain live. */
+export const WRITE_COLUMN_BORROW_STATES = [
+  "bool",
+  "i32",
+  "f32",
+  "f64",
+  "int64",
+  "decimal",
+  "varlen",
+  "fixed16",
+  "interval",
+  "flat",
+  "constant",
+  "dictionary",
+  "copied",
+  "full",
+  "denied",
+  "selected rows",
+  "dense rows",
+  "nullable source",
+  "all valid source",
+  "single row",
+  "partial chunk",
+  "full chunk",
+  "failed after copied prefix",
+] as const;
+
+/** R23/R5 cursor state is bounded by run count; shared cold indexes are separately governed. */
+export const WRITE_RANGE_CARDINALITY_STATES = [
+  "1024 keys",
+  "16384 keys",
+  "131072 keys",
+  "governor eviction",
+  "shared precharged index",
+  "cold all asc",
+  "warm all asc",
+  "cold all desc",
+  "warm all desc",
+  "cold bounded asc",
+  "warm bounded asc",
+  "cold bounded desc",
+  "warm bounded desc",
+] as const;
+
+/** Cold fills share one governed descriptor; cancellation and refusal preserve other users. */
+export const WRITE_RANGE_NAVIGATION_STATES = [
+  "concurrent followers",
+  "follower cancellation",
+  "owner cancellation retry",
+  "resumed partial fill",
+  "timer during cold fill",
+  "released I/O holds",
+  "shared ready descriptor",
+  "optional cache refusal",
+  "pressure descending",
+  "pressure ascending",
+] as const;
+
+/** An open cursor must not root cache-owned arrays or encoded bytes after eviction. */
+export const WRITE_RANGE_NAVIGATION_LIFETIME_STATES = [
+  "desc",
+  "bounded asc",
+  "bounded desc",
+  "1024 keys",
+  "16384 keys",
+  "131072 keys",
+] as const;
+
+export const WRITE_PRIVATE_MINIMUM_STATES = [
+  "memory",
+  "indexeddb",
+  "32 MiB",
+  "48 MiB",
+  "64 MiB",
+  "two input policy",
+  "three input policy",
+  "merge debt prepared",
+  "protected holder owns real bytes",
+  "merge progressed while holder retained",
+  "complete current snapshot",
+  "durable reopen",
+  "all credit returned",
+] as const;
+
+/** An admitted writer funds one bounded step without taking another execution's minimum. */
+export const WRITE_CREDIT_STATES = [
+  "atomic owner admitted",
+  "merge while protected holder retained",
+  "idle row credit transferred",
+  "merge credit reused",
+  "metadata step retained and returned",
+  "all accounts returned once",
+  "growth waits on real retained bytes",
+  "operation cancellation",
+  "owner cancellation",
+] as const;
+
+/** Publication-minimum navigation shares the task clock and closes its retained state once. */
+export const WRITE_MINIMUM_CLOCK_STATES = [
+  "task turn during cumulative small tables",
+  "close drains sliced state pin",
+  "shared clock due repeatedly",
+  "all state credit returned",
+] as const;
+
+/** Rollback discards staged rows while preserving unrelated, sequence-qualified index entries. */
+export const WRITE_STAGED_RESIDUAL_STATES = [
+  "memory",
+  "sim",
+  "indexeddb",
+  "transaction",
+  "statement",
+  "savepoint",
+  "none",
+  "unique",
+  "nonunique",
+  "earlier pending delete",
+  "committed delete only",
+  "snapshot before delete",
+  "snapshot after delete",
+  "held residual flush",
+  "unheld residual flush",
+  "merges",
+  "no merges",
+  "residual staged",
+  "pending residual waits for commit",
+  "residual flush blocked",
+  "deleted key reused",
+  "reopened",
+] as const;

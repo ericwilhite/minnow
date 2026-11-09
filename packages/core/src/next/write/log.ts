@@ -2,7 +2,8 @@
  * The log appender: group commit over a `StoreSession` log (access/write-path.ts "Commit",
  * format/log-frame.ts envelope and header slots).
  *
- * - `append(body)` is synchronous: it splits the body into parts of at most
+ * - `append(body)` is synchronous while its bounded queue fits, otherwise it waits for the
+ *   storage drain (or a running streamed commit). It splits the body into parts of at most
  *   `MAX_FRAME_BODY_BYTES`, assigns contiguous LSNs, chains checksums, and queues the frames. The
  *   queued bytes reach `appendLog` in order on one promise chain.
  * - A flush takes every frame queued before it (a **group**), waits for their appends, writes the
@@ -30,12 +31,17 @@ import { MAX_LSN } from "../access/snapshot.js";
 import { WritePathFailedError } from "../access/write-path.js";
 import {
   encodeFrame,
+  frameLength,
+  FRAME_HEADER_BYTES,
+  LOG_HEADER_BYTES,
   encodeLogHeader,
   MAX_FRAME_BODY_BYTES,
   MAX_FRAME_PARTS,
 } from "../format/log-frame.js";
 import type { StoreSession } from "../storage/contract.js";
 import { need } from "./bytes.js";
+import type { MaybePromise } from "../access/key-index.js";
+import { LOG_QUEUE_BYTES, COMMIT_BUFFER_OVERHEAD, type BufferAllocator } from "./commit-buffers.js";
 
 /** Idle acknowledgement target from the last append, subject to scheduling and I/O latency. */
 export const IDLE_FLUSH_MS = 100;
@@ -104,6 +110,11 @@ export class LogAppender {
   /** Frames appended and not yet written to the log file (written by the next flush). */
   #queued: Uint8Array[] = [];
   #queuedBytes = 0;
+  #queuedCost = 0;
+  #inFlightBytes = 0;
+  #deferredBytes = 0;
+  #streaming: Promise<number> | null = null;
+  #header: Uint8Array | null;
   #flushing: Promise<void> | null = null;
   #scheduled = false;
   #idle: ReturnType<typeof setTimeout> | null = null;
@@ -121,7 +132,10 @@ export class LogAppender {
     position: LogPosition,
     strict: boolean,
     onFailure: (error: Error) => void,
+    readonly buffers?: BufferAllocator,
+    readonly checkAppend?: () => void,
   ) {
+    this.#header = buffers?.create(LOG_HEADER_BYTES) ?? null;
     this.#session = session;
     this.#strict = strict;
     this.#salt = position.salt;
@@ -158,13 +172,29 @@ export class LogAppender {
   }
 
   /**
-   * Queues one transaction (one or more frames); returns its last LSN. Synchronous. A transaction
+   * Queues one transaction (one or more frames); returns its last LSN, waiting only under
+   * bounded-queue pressure. A transaction
    * whose last frame would pass `MAX_LSN` (committed LSNs end there; pending statement seqs lie
    * above it) is refused with `LogExhaustedError` before anything changes (review B3-p2a-3 #5);
    * so is one too large for the log.
    */
-  append(body: Uint8Array): number {
+  append(body: Uint8Array): MaybePromise<number> {
     this.#check();
+    this.checkAppend?.();
+    if (this.#streaming !== null) return this.#streaming.then(() => this.append(body));
+    const frameParts = Math.max(1, Math.ceil(body.length / MAX_FRAME_BODY_BYTES));
+    const framed = body.length + frameParts * (40 + COMMIT_BUFFER_OVERHEAD);
+    if (this.buffers !== undefined && framed > LOG_QUEUE_BYTES)
+      return this.appendStream(body.length, (out, offset) => {
+        out.set(body.subarray(offset, offset + out.length));
+      });
+    if (
+      this.buffers !== undefined &&
+      this.#queuedCost + this.#inFlightBytes + this.#deferredBytes + framed > LOG_QUEUE_BYTES
+    ) {
+      const drain = this.#deferred !== null ? this.#recycled : this.flushEncoded();
+      return need(drain).then(() => this.append(body));
+    }
     const parts = Math.max(1, Math.ceil(body.length / MAX_FRAME_BODY_BYTES));
     if (parts > MAX_FRAME_PARTS) throw new RangeError("A transaction is too large for the log");
     this.#lastAppendAt = performance.now();
@@ -172,7 +202,10 @@ export class LogAppender {
     if (first + parts - 1 > MAX_LSN) throw new LogExhaustedError(this.#lastLsn, parts);
     if (this.#deferred !== null) {
       // A recycle is switching incarnations: keep the body (the caller may reuse its buffer).
-      this.#deferred.push({ body: body.slice(), first });
+      const copy = this.buffers?.create(body.length) ?? new Uint8Array(body.length);
+      copy.set(body);
+      this.#deferred.push({ body: copy, first });
+      this.#deferredBytes += framed;
       this.#lastLsn = first + parts - 1;
       return this.#lastLsn;
     }
@@ -186,18 +219,24 @@ export class LogAppender {
     // Frames are encoded first and committed together: a failure leaves the log unchanged.
     const frames: Uint8Array[] = [];
     let chain = this.#chain;
-    for (let part = 0; part < parts; part++) {
-      const slice =
-        parts === 1
-          ? body
-          : body.subarray(part * MAX_FRAME_BODY_BYTES, (part + 1) * MAX_FRAME_BODY_BYTES);
-      const frame = encodeFrame(
-        { salt: this.#salt, lsn: first + part, partIndex: part, partCount: parts },
-        slice,
-        chain,
-      );
-      chain = frame.chain;
-      frames.push(frame.bytes);
+    try {
+      for (let part = 0; part < parts; part++) {
+        const slice =
+          parts === 1
+            ? body
+            : body.subarray(part * MAX_FRAME_BODY_BYTES, (part + 1) * MAX_FRAME_BODY_BYTES);
+        const frame = encodeFrame(
+          { salt: this.#salt, lsn: first + part, partIndex: part, partCount: parts },
+          slice,
+          chain,
+          this.buffers?.create(frameLength(slice.length)),
+        );
+        chain = frame.chain;
+        frames.push(frame.bytes);
+      }
+    } catch (error) {
+      for (const frame of frames) this.buffers?.release(frame);
+      throw error;
     }
     this.#chain = chain;
     for (const bytes of frames) {
@@ -205,9 +244,79 @@ export class LogAppender {
       this.bytes += bytes.length;
       this.#queued.push(bytes);
       this.#queuedBytes += bytes.length;
+      this.#queuedCost += bytes.length + COMMIT_BUFFER_OVERHEAD;
     }
     this.#encodedLsn = first + parts - 1;
     if (this.#deferred === null) this.#lastLsn = this.#encodedLsn;
+  }
+
+  /**
+   * Bounded multipart append. Only complete transactions advance the header boundary. A crash
+   * after any prefix is discarded by the existing incremental scanner. Other appends wait so
+   * every part keeps its existing contiguous LSN and byte position.
+   */
+  appendStream(
+    length: number,
+    fill: (body: Uint8Array, offset: number) => MaybePromise<void>,
+  ): Promise<number> {
+    this.#check();
+    if (this.#streaming !== null)
+      return this.#streaming.then(() => this.appendStream(length, fill));
+    const parts = Math.max(1, Math.ceil(length / MAX_FRAME_BODY_BYTES));
+    if (parts > MAX_FRAME_PARTS) throw new RangeError("A transaction is too large for the log");
+    const run = (async () => {
+      if (this.#recycled !== null) await this.#recycled;
+      await this.flushEncoded();
+      this.#check();
+      const first = this.#lastLsn + 1;
+      if (first + parts - 1 > MAX_LSN) throw new LogExhaustedError(this.#lastLsn, parts);
+      let chain = this.#chain;
+      let end = this.#end;
+      try {
+        for (let part = 0; part < parts; part++) {
+          const offset = part * MAX_FRAME_BODY_BYTES;
+          const bodyLength = Math.min(MAX_FRAME_BODY_BYTES, length - offset);
+          const bytes =
+            this.buffers?.create(frameLength(bodyLength)) ??
+            new Uint8Array(frameLength(bodyLength));
+          try {
+            const body = bytes.subarray(FRAME_HEADER_BYTES, FRAME_HEADER_BYTES + bodyLength);
+            await fill(body, offset);
+            const frame = encodeFrame(
+              { salt: this.#salt, lsn: first + part, partIndex: part, partCount: parts },
+              body,
+              chain,
+              bytes,
+            );
+            // Resolution transfers responsibility for retained copies to storage; see #writeQueued.
+            await this.#session.appendLog(bytes);
+            chain = frame.chain;
+            end += bytes.length;
+          } finally {
+            this.buffers?.release(bytes);
+          }
+          this.#check();
+        }
+        this.bytes += end - this.#end;
+        this.#end = end;
+        this.#chain = chain;
+        this.#encodedLsn = first + parts - 1;
+        this.#lastLsn = this.#encodedLsn;
+        this.#lastAppendAt = performance.now();
+        this.#schedule();
+        return this.#lastLsn;
+      } catch (error) {
+        this.#fail(error);
+        throw need(this.#failure);
+      }
+    })();
+    this.#streaming = run;
+    void run
+      .finally(() => {
+        this.#streaming = null;
+      })
+      .catch(() => undefined);
+    return run;
   }
 
   /** Transactions deferred by the running recycle. */
@@ -223,7 +332,8 @@ export class LogAppender {
   /** Starts a recycle: returns the cut (every LSN ≤ it is in the old log). See "Recycling". */
   beginRecycle(): number {
     this.#check();
-    if (this.#deferred !== null) throw new RangeError("A log recycle is already running");
+    if (this.#deferred !== null || this.#streaming !== null)
+      throw new RangeError("A log recycle or streamed append is already running");
     this.#deferred = [];
     this.#recycled = new Promise<void>((resolve) => {
       this.#recycledResolve = resolve;
@@ -283,7 +393,9 @@ export class LogAppender {
   /** A recycle failed after its switch: the appender fails, and waiters on the deferred reject. */
   failRecycle(cause: unknown): void {
     if (this.#deferred === null) return;
+    for (const item of this.#deferred) this.buffers?.release(item.body);
     this.#deferred = null;
+    this.#deferredBytes = 0;
     this.#fail(cause);
     this.#recycledResolve?.();
     this.#recycled = null;
@@ -293,14 +405,24 @@ export class LogAppender {
   #release(deferred: ReadonlyArray<{ readonly body: Uint8Array; readonly first: number }>): void {
     const last = this.#lastLsn;
     this.#deferred = null;
+    let released = 0;
     try {
       for (const { body, first } of deferred) {
         const parts = Math.max(1, Math.ceil(body.length / MAX_FRAME_BODY_BYTES));
-        this.#encode(body, first, parts);
+        try {
+          this.#encode(body, first, parts);
+        } finally {
+          this.buffers?.release(body);
+          released++;
+        }
       }
     } catch (error) {
       this.#fail(error);
+    } finally {
+      for (let k = released; k < deferred.length; k++)
+        this.buffers?.release(need(deferred[k]).body);
     }
+    this.#deferredBytes = 0;
     this.#lastLsn = last;
     this.#recycledResolve?.();
     this.#recycled = null;
@@ -335,6 +457,8 @@ export class LogAppender {
 
   /** Flushes everything queued now; resolves when it is durable (after a running recycle). */
   async flush(): Promise<void> {
+    this.#check();
+    if (this.#streaming !== null) await this.#streaming;
     this.#check();
     if (this.#recycled !== null) await this.#recycled;
     this.#check();
@@ -371,33 +495,53 @@ export class LogAppender {
     return run;
   }
 
-  /** Writes the queued frames, in order, as one log append. */
+  /**
+   * Writes the queued frames as one bounded append. The input charge ends when appendLog resolves;
+   * any retained adapter copies belong to storage (IDB currently batches up to 4 MiB). Storage
+   * must charge/backpressure those copies itself; they are not encoded-frame ownership here.
+   */
   async #writeQueued(): Promise<void> {
     if (this.#queued.length === 0) return;
     const frames = this.#queued;
-    let bytes = need(frames[0]);
-    if (frames.length > 1) {
-      bytes = new Uint8Array(this.#queuedBytes);
-      let at = 0;
-      for (const frame of frames) {
-        bytes.set(frame, at);
-        at += frame.length;
-      }
-    }
+    const size = this.#queuedBytes;
     this.#queued = [];
     this.#queuedBytes = 0;
-    await this.#session.appendLog(bytes);
+    let joined: Uint8Array | null = null;
+    this.#inFlightBytes = this.#queuedCost;
+    this.#queuedCost = 0;
+    try {
+      let bytes = need(frames[0]);
+      if (frames.length > 1) {
+        joined = this.buffers?.create(size) ?? new Uint8Array(size);
+        this.#inFlightBytes += size + COMMIT_BUFFER_OVERHEAD;
+        let at = 0;
+        for (const frame of frames) {
+          joined.set(frame, at);
+          at += frame.length;
+        }
+        bytes = joined;
+      }
+      await this.#session.appendLog(bytes);
+    } finally {
+      if (joined !== null) this.buffers?.release(joined);
+      for (const frame of frames) this.buffers?.release(frame);
+      this.#inFlightBytes = 0;
+    }
   }
 
   async #writeHeader(ack: Boundary): Promise<void> {
-    const header = encodeLogHeader({
-      salt: this.#salt,
-      generation: this.#generation,
-      ackEnd: ack.end,
-      ackChain: ack.chain,
-      ackLsn: ack.lsn,
-      rootSequence: this.#rootSequence,
-    });
+    const output = this.#header ?? undefined;
+    const header = encodeLogHeader(
+      {
+        salt: this.#salt,
+        generation: this.#generation,
+        ackEnd: ack.end,
+        ackChain: ack.chain,
+        ackLsn: ack.lsn,
+        rootSequence: this.#rootSequence,
+      },
+      output,
+    );
     await this.#session.writeLogHeader(this.#nextSlot, header);
     this.#generation += 1;
     this.#nextSlot = this.#nextSlot === 0 ? 1 : 0;
@@ -454,16 +598,31 @@ export class LogAppender {
 
   /** Flushes, acknowledges the newest group in a header, and stops the idle timer. */
   async close(): Promise<void> {
-    if (this.#idle !== null) {
-      clearTimeout(this.#idle);
-      this.#idle = null;
-    }
-    if (this.#failure !== null) return;
-    await this.flush();
-    if (this.#flushing !== null) await this.#flushing;
-    if (this.#acked.lsn < this.#durable.lsn) {
-      await this.#writeHeader(this.#durable);
-      await this.#session.flushLog();
+    try {
+      if (this.#idle !== null) {
+        clearTimeout(this.#idle);
+        this.#idle = null;
+      }
+      if (this.#streaming !== null) await this.#streaming.catch(() => undefined);
+      if (this.#flushing !== null) await this.#flushing;
+      if (this.#failure !== null) {
+        for (const frame of this.#queued.splice(0)) this.buffers?.release(frame);
+        this.#queuedBytes = 0;
+        this.#queuedCost = 0;
+        for (const item of this.#deferred ?? []) this.buffers?.release(item.body);
+        this.#deferred = null;
+        this.#deferredBytes = 0;
+        return;
+      }
+      await this.flush();
+      if (this.#flushing !== null) await this.#flushing;
+      if (this.#acked.lsn < this.#durable.lsn) {
+        await this.#writeHeader(this.#durable);
+        await this.#session.flushLog();
+      }
+    } finally {
+      if (this.#header !== null) this.buffers?.release(this.#header);
+      this.#header = null;
     }
   }
 

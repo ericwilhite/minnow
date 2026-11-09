@@ -102,14 +102,20 @@ export function encodeFrame(
   position: FramePosition,
   body: Uint8Array,
   previousChain: number,
+  into?: Uint8Array,
 ): { readonly bytes: Uint8Array; readonly chain: number } {
   const { salt, lsn, partIndex, partCount } = position;
   if (body.length > MAX_FRAME_BODY_BYTES) throw new RangeError("Log frame body is too large");
   if (!Number.isSafeInteger(lsn) || lsn < 1) throw new RangeError("Bad LSN");
   if (!(partCount >= 1 && partCount <= MAX_FRAME_PARTS && partIndex >= 0 && partIndex < partCount))
     throw new RangeError("Bad transaction part");
-  const bytes = new Uint8Array(frameLength(body.length));
-  const view = new DataView(bytes.buffer);
+  const bytes = into ?? new Uint8Array(frameLength(body.length));
+  if (bytes.length !== frameLength(body.length)) throw new RangeError("Bad frame output length");
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  bytes[21] = 0;
+  bytes[26] = 0;
+  bytes[27] = 0;
+  bytes.fill(0, FRAME_HEADER_BYTES + body.length, bytes.length - 4);
   view.setUint32(0, FRAME_MAGIC, true);
   view.setUint32(4, salt >>> 0, true);
   setU53(view, 8, lsn);
@@ -136,9 +142,10 @@ export interface LogHeader {
   readonly rootSequence: number;
 }
 
-export function encodeLogHeader(header: LogHeader): Uint8Array {
-  const bytes = new Uint8Array(LOG_HEADER_BYTES);
-  const view = new DataView(bytes.buffer);
+export function encodeLogHeader(header: LogHeader, into?: Uint8Array): Uint8Array {
+  const bytes = into ?? new Uint8Array(LOG_HEADER_BYTES);
+  if (bytes.length !== LOG_HEADER_BYTES) throw new RangeError("Bad log header output length");
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   view.setUint32(0, HEADER_MAGIC, true);
   view.setUint32(4, LOG_FORMAT_VERSION, true);
   view.setUint32(8, header.salt >>> 0, true);
