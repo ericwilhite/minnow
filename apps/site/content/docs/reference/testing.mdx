@@ -1683,6 +1683,17 @@ are unavailable; the report counts returned byte payloads and numeric index/meta
 The factory acquires handles in `openFence` and recovers in `open`, following the host contract.
 The default fence deadline is unchanged; the ready timer includes acquisition and recovery.
 
+The simulated disk reuses spare capacity for appends. It keeps the logical file length exact
+and retains copy-on-write for overwrites and truncation, so old views and flushed prefixes
+stay unchanged.
+Recovery starts a new append lineage; it cannot overwrite an old view's unflushed suffix.
+Seeded tests compare reused buffers with fresh-image writes under honest and lying flushes,
+planned crashes, recovery, overwrite, truncate and gaps. They check every physical step and
+retained image, plus a buffer-growth bound that rejects a full-prefix copy on every append.
+This removes quadratic WAL copying from the IndexedDB histories without changing their
+cases, seeds, publication rounds, reads, reopen checks or deadlines. Simulator spare buffers
+are test-fixture memory, outside the engine's managed-memory accounting.
+
 The extent-space crash sweep registers each backend, placement and seed as a separate test.
 Every seed still checks every physical crash boundary, using the normal local test deadline.
 
@@ -1852,3 +1863,10 @@ saves without starting one. The control confirms zero saves and zero durable LSN
 cases terminate the worker before closing the tab. Loss is required only for this fixture's
 unsaved JavaScript state; relaxed durability does not require data loss. Ordinary tab teardown
 can process hidden/pagehide or graceful close and flush, with browser-dependent scheduling.
+
+The rebuild's staging-retirement campaign holds an index flush at its publication barrier,
+rolls back staged rows, and drops their table while the catalog checkpoint still retains it.
+Generated memtable sizes, staging lengths, and memory/simulated backends check that the
+retained root's reachable extents match its deltas. Releasing the barrier must finish the
+drop and allow reopening. This covers the held-build rollback schedule; it is not an
+exhaustive check of every publication schedule.

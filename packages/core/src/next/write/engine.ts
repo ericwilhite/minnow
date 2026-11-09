@@ -3912,6 +3912,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
       );
       tables.push(root);
     }
+    // Rollback/recovery retirement also applies to a dropped table retained by an older
+    // catalog checkpoint. Its durable stub may still name staging already removed from the
+    // live state. Never carry that staging into a root that retires its directory (R25).
+    for (let at = 0; at < tables.length; at++) {
+      const table = need(tables[at]);
+      const removed = (staged: TableRoot["staged"][number]) =>
+        drained.some((extent) => sameExtent(extent, staged.groups.extent));
+      if (table.staged.some(removed))
+        tables[at] = { ...table, staged: table.staged.filter((staged) => !removed(staged)) };
+    }
     // The root agrees with its catalog (format/manifest.ts "Checkpoints and replay"): every table
     // root has every index its catalog entry has (review B3-p2b-4 D2).
     for (const table of tables) {

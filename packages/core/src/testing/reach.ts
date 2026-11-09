@@ -1739,3 +1739,25 @@ export const NATIVE_CREDIT_CACHE_STATES = [
   "transfer after takeover",
   "close leaves retained owner paid",
 ] as const;
+
+/** Append reuse changes allocation cost, never the simulated disk's physical fault law. */
+export const SIM_DISK_APPEND_REACH = [
+  "amortized append growth",
+  "planned physical crash",
+  "overwrite truncate and gap",
+  "recovery forks before an old suffix",
+  "retained immutable views",
+  "honest flush",
+  "lying flush",
+] as const;
+
+/** Rolled-back staging cannot survive in a table retained by a held catalog checkpoint. */
+export const STAGING_DROP_RETIREMENT_REACH = [
+  "sim",
+  "memory",
+  "rollback",
+  "held build",
+  "dropped table retained",
+  "exact retained root",
+  "reopen",
+] as const;

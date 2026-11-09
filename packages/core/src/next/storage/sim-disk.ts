@@ -67,6 +67,9 @@ interface FileState {
   current: Uint8Array;
   durable: Uint8Array;
   pending: Operation[];
+  /** Spare capacity belongs only to the current append lineage, never a recovered branch. */
+  append: Uint8Array | null;
+  appendEnd: number;
   /** Lying mode: flushed but not yet durable. */
   queued: Operation[];
   readonly handles: Set<SimFile>;
@@ -120,6 +123,8 @@ export class SimDisk {
         current: new Uint8Array(0),
         durable: new Uint8Array(0),
         pending: [],
+        append: null,
+        appendEnd: 0,
         queued: [],
         handles: new Set(),
       };
@@ -144,7 +149,30 @@ export class SimDisk {
   step(state: FileState, operation: Operation | null): void {
     const step = this.steps++;
     if (operation !== null) {
-      state.current = apply(state.current, operation);
+      if (operation.kind === "write" && operation.at >= state.current.length) {
+        const end = operation.at + operation.bytes.length;
+        let capacity = state.append;
+        if (
+          capacity?.buffer !== state.current.buffer ||
+          state.current.byteOffset !== 0 ||
+          state.appendEnd !== state.current.length ||
+          end > capacity.length
+        ) {
+          capacity = new Uint8Array(Math.max(end, 4096, state.current.length * 2));
+          capacity.set(state.current);
+        }
+        // Only bytes beyond every earlier view's end may change. Flushed prefixes and
+        // previously returned file images remain immutable, as with copy-on-write.
+        capacity.fill(0, state.current.length, operation.at);
+        capacity.set(operation.bytes, operation.at);
+        state.current = capacity.subarray(0, end);
+        state.append = capacity;
+        state.appendEnd = end;
+      } else {
+        state.current = apply(state.current, operation);
+        state.append = null;
+        state.appendEnd = 0;
+      }
       state.pending.push(operation);
     }
     if (this.#armed && step === this.#options.crashAtStep) {
@@ -171,6 +199,10 @@ export class SimDisk {
     this.crashes += 1;
     const random = this.#random;
     for (const state of this.files.values()) {
+      // Recovery forks from an older prefix. Its spare suffix can still belong to a
+      // longer pre-crash image: never reuse it, even if every pending write is lost.
+      state.append = null;
+      state.appendEnd = 0;
       let image = state.durable;
       let survived = true;
       if (state.queued.length > 0) {
