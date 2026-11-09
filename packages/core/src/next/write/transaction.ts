@@ -1124,7 +1124,9 @@ export class TableWriterImpl implements TableWriter {
     });
   }
 
-  /** Appends complete validated rows; null denotes their contiguous physical range. */
+  /** Appends complete validated rows; null denotes their contiguous physical range.
+   * One plan is active at a time under the single-writer contract (EngineHooks.keys). The
+   * owner prepays its fixed OBJECT_OVERHEAD_BYTES allowance through admission and settlement. */
   insertRows(
     columns: readonly Vector[],
     rows: Uint16Array | null,
