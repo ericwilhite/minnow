@@ -1,4 +1,4 @@
-/** CPU comparisons pair adjacent AB/BA runs over one immutable fixture. */
+/** Adjacent AB/BA CPU deltas. Quartiles use linear interpolation at (n - 1) * p. */
 export function pairedCPU(control: readonly number[], candidate: readonly number[]) {
   if (control.length < 9 || control.length !== candidate.length)
     throw new RangeError("At least nine complete CPU pairs are required");
@@ -9,28 +9,43 @@ export function pairedCPU(control: readonly number[], candidate: readonly number
     return { control: before, candidate: after, delta: after - before };
   });
   const sorted = pairs.map((pair) => pair.delta).sort((a, b) => a - b);
-  const lower = sorted[(sorted.length - 1) >>> 1];
-  const upper = sorted[sorted.length >>> 1];
-  const first = sorted[0],
-    last = sorted.at(-1);
-  if (lower === undefined || upper === undefined || first === undefined || last === undefined)
-    throw new RangeError("Missing paired CPU samples");
-  const median = (lower + upper) / 2;
-  const spread = last - first;
+  const quantile = (p: number) => {
+    const at = (sorted.length - 1) * p,
+      lo = Math.floor(at),
+      lower = sorted[lo],
+      upper = sorted[Math.ceil(at)];
+    if (lower === undefined || upper === undefined)
+      throw new RangeError("Missing paired CPU samples");
+    return lower + (upper - lower) * (at - lo);
+  };
+  const median = quantile(0.5),
+    q1 = quantile(0.25),
+    q3 = quantile(0.75),
+    iqr = q3 - q1,
+    first = quantile(0),
+    last = quantile(1),
+    range = last - first;
   const favoursCandidate = pairs.filter((pair) => pair.delta < 0).length;
   const favoursControl = pairs.filter((pair) => pair.delta > 0).length;
   const requiredFavourable = Math.ceil((7 * pairs.length) / 9);
+  const significantRegression = median > iqr && favoursControl >= requiredFavourable;
   return {
     pairs,
     medianDeltaMs: median,
-    spreadDeltaMs: spread,
+    q1DeltaMs: q1,
+    q3DeltaMs: q3,
+    iqrDeltaMs: iqr,
+    minDeltaMs: first,
+    maxDeltaMs: last,
+    rangeDeltaMs: range,
+    /** Compatibility field: full range width, not the acceptance statistic. */
+    spreadDeltaMs: range,
     favoursCandidate,
     favoursControl,
     requiredFavourable,
-    acceptedGain: -median > spread && favoursCandidate >= requiredFavourable,
-    significantRegression: median > spread && favoursControl >= requiredFavourable,
-    // A whole query may be indistinguishable. Reject even an uncertain positive
-    // delta beyond its spread; never rescue a failed component with this check.
-    noRegression: median <= spread,
+    acceptedGain: -median > iqr && favoursCandidate >= requiredFavourable,
+    significantRegression,
+    // Absence of an accepted reverse-direction regression, not proof of equivalence.
+    noRegression: !significantRegression,
   };
 }
