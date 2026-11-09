@@ -305,10 +305,11 @@ JSON string; cast it to `JSON`/`JSONB` or pass it through a JSON constructor whe
 as a document.
 
 PostgreSQL's `->` and `->>` operators read back into a document. A text key selects an object
-member; an integer key selects an array element, counting from the end when negative:
+member; an integer key selects an array element, counting from the end when negative. Cast an
+untyped document literal to `JSON` so PostgreSQL can resolve the operator overload:
 
 ```sql
-SELECT '{"sku": "A-1", "dims": {"w": 30, "h": 40}}' -> 'dims' ->> 'w' AS width
+SELECT '{"sku": "A-1", "dims": {"w": 30, "h": 40}}'::json -> 'dims' ->> 'w' AS width
 ```
 
 `->` returns a JSON value, so steps chain and a selected string keeps its quotes; `->>` returns

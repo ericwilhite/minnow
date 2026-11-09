@@ -1870,3 +1870,20 @@ export const FLOAT_SUM_BOUNDARIES_REACH = [
   "unit cancellation",
   "5000 groups",
 ] as const;
+
+/** PG-valid guide-9 SQL must retain text extraction and distinguish absent/JSON-null paths. */
+export const GUIDE9_JSON_CAST_REACH = [
+  "integer",
+  "negative",
+  "string",
+  "escaped string",
+  "boolean",
+  "JSON null",
+  "missing member",
+  "missing parent",
+  "null parent",
+  "explicit JSON",
+  "text result",
+  "original ambiguity",
+  "native typed refusal",
+] as const;
