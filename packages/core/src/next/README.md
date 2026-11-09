@@ -84,6 +84,12 @@ key and reuse it across block/partition boundaries. No hash metadata or seed cha
 rollback and release. Structural changes must pass the whole-load paired rule, not just a
 component benchmark.
 
+Contiguous flat non-null inserts share a bounded physical row range through validation, memory
+admission, column copying and index-key preparation. Nullable, dictionary, constant and selected
+inputs retain their selected-row semantics. Admission still splits at 2,048 rows; source buffers
+are copied before the insertion borrow ends. `write/row-plan.test.ts` checks selection, validity,
+ownership, index keys and reopen, including offsets across partial memtables and admission chunks.
+
 ## Write-memory pressure
 
 Column appends copy into the chunk's charged arrays and clear their borrowed source slot on

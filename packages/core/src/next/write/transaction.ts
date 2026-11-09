@@ -182,6 +182,13 @@ function all(values: ReadonlyArray<MaybePromise<void>>): MaybePromise<void> {
   return pending.length === 0 ? undefined : Promise.all(pending).then(() => undefined);
 }
 
+/** A bounded slice of physical rows or of a selected-row list. No per-row iterator/result. */
+interface RowPlan {
+  readonly rows: Uint16Array | null;
+  readonly from: number;
+  readonly count: number;
+}
+
 function activeRows(batch: Batch): Uint16Array {
   if (batch.selection !== null) return batch.selection.rows.subarray(0, batch.selection.count);
   const rows = new Uint16Array(batch.length);
@@ -1065,19 +1072,25 @@ export class TableWriterImpl implements TableWriter {
   /** NOT NULL and CHECK over complete new rows. */
   #validate(
     columns: readonly Vector[],
-    rows: Uint16Array,
+    rows: Uint16Array | null,
     length: number,
     changed: readonly number[] | null,
   ): void {
     this.def.columns.forEach((column, c) => {
       if (column.nullable) return;
       const vector = need(columns[c]);
-      for (const row of rows)
+      if (vector.form === "flat" && vector.validity === null) return;
+      const count = rows?.length ?? length;
+      for (let k = 0; k < count; k++) {
+        const row = rows === null ? k : (rows[k] ?? 0);
         if (isNullAt(vector, row)) throw new NotNullViolationError(this.tableId, column.id, row);
+      }
     });
     if (this.def.checks.length === 0) return;
     const selection: Selection | null =
-      rows.length === length ? null : { rows: Uint16Array.from(rows), count: rows.length };
+      rows === null || rows.length === length
+        ? null
+        : { rows: Uint16Array.from(rows), count: rows.length };
     const failure = this.statement
       .rules(this.tableId)
       .check({ length, columns, selection }, changed);
@@ -1091,36 +1104,52 @@ export class TableWriterImpl implements TableWriter {
         0,
         this.def.columns.map((column) => column.id),
       );
-      const rows = activeRows(batch);
+      // Only this already-contiguous, non-null physical input takes the range plan. Foreign-key
+      // input retains the selected-row path used by deferred child checks.
+      const contiguous =
+        batch.selection === null &&
+        batch.length <= 0x10000 &&
+        this.def.foreignKeys.length === 0 &&
+        batch.columns.every((vector) => vector.form === "flat" && vector.validity === null);
+      const rows = contiguous ? null : activeRows(batch);
+      const count = rows?.length ?? batch.length;
       this.#validate(batch.columns, rows, batch.length, null);
-      const pending = this.insertRows(batch.columns, rows);
+      const pending = this.insertRows(batch.columns, rows, count);
       if (written !== null) {
-        written.rows.set(rows);
-        written.count = rows.length;
+        if (rows === null) for (let k = 0; k < count; k++) written.rows[k] = k;
+        else written.rows.set(rows);
+        written.count = count;
       }
-      return settle(pending, () => rows.length);
+      return settle(pending, () => count);
     });
   }
 
-  /** Appends `rows` of `columns` (complete, validated) and their index entries. */
-  insertRows(columns: readonly Vector[], rows: Uint16Array): MaybePromise<void> {
-    // Memtable memory is admitted before anything is appended (ruling 6).
-    if (rows.length <= MEMORY_CHUNK_ROWS)
-      return settle(this.statement.tx.hooks.admit(this.#estimate(columns, rows)), () =>
-        this.#insertRows(columns, rows),
+  /** Appends complete validated rows; null denotes their contiguous physical range. */
+  insertRows(
+    columns: readonly Vector[],
+    rows: Uint16Array | null,
+    count = rows?.length ?? 0,
+  ): MaybePromise<void> {
+    if (count <= MEMORY_CHUNK_ROWS) {
+      const plan: RowPlan = { rows, from: 0, count };
+      return settle(this.statement.tx.hooks.admit(this.#estimate(columns, plan)), () =>
+        this.#insertRows(columns, plan),
       );
-    // An input call can exceed the ordinary cap even though its individual chunks fit.
-    // Admit only the next chunk, letting completed pending chunks stage at each boundary.
-    // These are still one statement: checks and rollback include every appended piece.
+    }
+    // Preserve the original admission/staging boundaries, but share the same row plan instead
+    // of manufacturing a selection and new subarray views at each boundary.
     let offset = 0;
     const next = (): MaybePromise<void> =>
       this.statement.guard(() => {
-        while (offset < rows.length) {
-          const piece = rows.subarray(offset, offset + MEMORY_CHUNK_ROWS);
-          offset += piece.length;
-          const pending = settle(
-            this.statement.tx.hooks.admit(this.#estimate(columns, piece)),
-            () => this.statement.guard(() => this.#insertRows(columns, piece)),
+        while (offset < count) {
+          const plan: RowPlan = {
+            rows,
+            from: offset,
+            count: Math.min(MEMORY_CHUNK_ROWS, count - offset),
+          };
+          offset += plan.count;
+          const pending = settle(this.statement.tx.hooks.admit(this.#estimate(columns, plan)), () =>
+            this.statement.guard(() => this.#insertRows(columns, plan)),
           );
           if (pending instanceof Promise) return pending.then(next);
         }
@@ -1128,27 +1157,32 @@ export class TableWriterImpl implements TableWriter {
     return next();
   }
 
-  /** An upper estimate of the memtable bytes `rows` of `columns` take (rows and index entries). */
-  #estimate(columns: readonly Vector[], rows: Uint16Array): number {
+  /** Same capacity estimate; a contiguous varlen range uses its two end offsets. */
+  #estimate(columns: readonly Vector[], plan: RowPlan): number {
     let bytes =
-      4096 * columns.length + rows.length * (16 * columns.length + 96 * this.def.indexes.length);
+      4096 * columns.length + plan.count * (16 * columns.length + 96 * this.def.indexes.length);
     for (const vector of columns)
       if (vector.form === "flat" && vector.data.layout === "varlen") {
         const offsets = vector.data.offsets;
-        for (const row of rows) bytes += 2 * ((offsets[row + 1] ?? 0) - (offsets[row] ?? 0));
+        if (plan.rows === null)
+          bytes += 2 * ((offsets[plan.from + plan.count] ?? 0) - (offsets[plan.from] ?? 0));
+        else
+          for (let k = plan.from; k < plan.from + plan.count; k++) {
+            const row = plan.rows[k] ?? 0;
+            bytes += 2 * ((offsets[row + 1] ?? 0) - (offsets[row] ?? 0));
+          }
       }
     return bytes;
   }
 
-  #insertRows(columns: readonly Vector[], rows: Uint16Array): MaybePromise<void> {
-    const tx = this.statement.tx;
-    const seq = this.statement.seq;
+  #insertRows(columns: readonly Vector[], plan: RowPlan): MaybePromise<void> {
+    const tx = this.statement.tx,
+      seq = this.statement.seq;
     let puts: Array<Promise<void>> | null = null;
-    // Row ids of the new rows, for their foreign-key checks (only tables with foreign keys).
     const rowIds: number[] | null = this.def.foreignKeys.length > 0 ? [] : null;
     let done = 0;
-    while (done < rows.length) {
-      const { memtable, created, frozen } = tx.hooks.liveMemtable(this.tableId, rows.length - done);
+    while (done < plan.count) {
+      const { memtable, created, frozen } = tx.hooks.liveMemtable(this.tableId, plan.count - done);
       if (created)
         tx.undo.push({
           kind: "freeze",
@@ -1157,9 +1191,9 @@ export class TableWriterImpl implements TableWriter {
           created: memtable,
           frozen,
         });
-      const take = Math.min(memtable.capacity, rows.length - done);
-      const before = memtable.rowCount;
-      memtable.append(columns, rows, done, take);
+      const take = Math.min(memtable.capacity, plan.count - done),
+        before = memtable.rowCount;
+      memtable.append(columns, plan.rows, plan.from + done, take);
       memtable.mark(seq);
       tx.undo.push({
         kind: "rows",
@@ -1171,13 +1205,25 @@ export class TableWriterImpl implements TableWriter {
       });
       const firstRowId = memtable.firstRowId + before;
       if (rowIds !== null) for (let k = 0; k < take; k++) rowIds.push(firstRowId + k);
-      // Index entries go to the memtable that took the rows (its layer covers them).
-      const piece = take === rows.length ? rows : rows.subarray(done, done + take);
-      const put = this.putKeys(this.def.indexes, columns, piece, firstRowId, memtable);
+      const put = this.putKeys(
+        this.def.indexes,
+        columns,
+        plan.rows,
+        firstRowId,
+        memtable,
+        plan.from + done,
+        take,
+      );
       if (put instanceof Promise) (puts ??= []).push(put);
       done += take;
     }
-    if (rowIds !== null) this.#childChecks(columns, rows, rowIds);
+    // Foreign-key insertions keep the materialized selection contract above.
+    if (rowIds !== null)
+      this.#childChecks(
+        columns,
+        need(plan.rows).subarray(plan.from, plan.from + plan.count),
+        rowIds,
+      );
     return puts === null ? undefined : Promise.all(puts).then(() => undefined);
   }
 
@@ -1195,14 +1241,17 @@ export class TableWriterImpl implements TableWriter {
     columns: readonly Vector[],
     rows: Uint16Array | null,
     count: number,
+    from = 0,
+    take = (rows?.length ?? count) - from,
   ): KeyBatch {
     const keys = this.#keys;
-    const selection = rows === null ? null : { rows, count: rows.length };
+    const selection = rows === null ? null : { rows, count: from + take };
     const result = encodeKeyBatch(
       "equality",
       this.#keyColumns(index, columns),
-      { length: count, selection },
+      { length: rows === null ? from + take : count, selection },
       keys,
+      from,
     );
     if (!result.done) throw new RangeError("An index key batch did not fit its byte target");
     return keys;
@@ -1224,20 +1273,25 @@ export class TableWriterImpl implements TableWriter {
     rows: Uint16Array | null,
     rowIds: readonly number[] | number,
     memtable: Memtable,
+    from = 0,
+    count = rows?.length ?? (typeof rowIds === "number" ? 0 : rowIds.length),
   ): MaybePromise<void> {
     const tx = this.statement.tx;
     const seq = this.statement.seq;
-    const count = rows === null ? (typeof rowIds === "number" ? 0 : rowIds.length) : rows.length;
     let checks: Array<Promise<void>> | null = null;
     for (const index of indexes) {
       const delta = memtable.deltas.get(index.id);
       if (delta === undefined) continue;
-      const keys = this.#encode(index, columns, rows, columns[0]?.length ?? count);
+      const keys = this.#encode(index, columns, rows, columns[0]?.length ?? count, from, count);
+      const noNulls = index.columnIds.every((id) => {
+        const vector = columns[this.#columnIndex(id)];
+        return vector?.form === "flat" && vector.validity === null;
+      });
       const first = delta.entryCount;
       try {
         for (let k = 0; k < count; k++) {
-          const row = rows === null ? k : (rows[k] ?? 0);
-          if (this.#hasNullKey(index, columns, row)) continue;
+          const row = rows === null ? from + k : (rows[from + k] ?? 0);
+          if (!noNulls && this.#hasNullKey(index, columns, row)) continue;
           const rowId = typeof rowIds === "number" ? rowIds + k : (rowIds[k] ?? 0);
           delta.add(
             keys.writer.bytes,

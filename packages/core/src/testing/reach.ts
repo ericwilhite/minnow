@@ -2483,3 +2483,21 @@ export const WRITE_KEY_HASH_ONCE_REACH = [
   "shifted range",
   "duplicate keys",
 ] as const;
+
+/** Physical row ranges must preserve the existing selected-row write contract. */
+export const WRITE_ROW_PLAN_REACH = [
+  "range",
+  "selected",
+  "nullable",
+  "dictionary",
+  "constant",
+  "empty",
+  "admission boundary",
+  "written selection",
+  "producer reused",
+  "primary keys",
+  "reopen",
+  "inactive null",
+  "NOT NULL refusal",
+  "secondary null omission",
+] as const;

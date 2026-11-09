@@ -2011,3 +2011,8 @@ Generated memtable sizes, staging lengths, and memory/simulated backends check t
 retained root's reachable extents match its deltas. Releasing the barrier must finish the
 drop and allow reopening. This covers the held-build rollback schedule; it is not an
 exhaustive check of every publication schedule.
+
+The write row-plan generator compares inserted values and index visibility across physical ranges,
+sparse selections, nullable and encoded vectors, partial memtables, and admission boundaries.
+It checks returned row selections, producer-buffer reuse, NOT NULL refusal and reopen. Its work
+check ensures contiguous input reaches the existing copier without a materialized row selection.
