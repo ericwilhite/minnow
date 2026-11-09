@@ -1,5 +1,5 @@
 import { frameOffsetMetadata } from "./frame-offsets.js";
-import { dateMilliseconds } from "../date-value.js";
+import { dateMilliseconds, timestampLiteralSources } from "../date-value.js";
 
 /** Type-tagged, length-delimited structural identity. Unlike JSON, it preserves Date vs string,
  * -0, non-finite numbers, and undefined fields, so deduplication cannot merge distinct plans. */
@@ -14,7 +14,12 @@ export function encodeQueryIdentity(value: unknown, ancestors = new Set<object>(
   }
   if (typeof value === "bigint") return `i${String(value)};`;
   if (typeof value === "string") return `s${String(value.length)}:${value}`;
-  if (value instanceof Date) return `d${String(dateMilliseconds(value))};`;
+  if (value instanceof Date) {
+    const source = timestampLiteralSources.get(value);
+    return source === undefined
+      ? `d${String(dateMilliseconds(value))};`
+      : `t${encodeQueryIdentity(source, ancestors)}`;
+  }
   if (typeof value !== "object") {
     throw new TypeError(`Unsupported query identity value: ${typeof value}`);
   }

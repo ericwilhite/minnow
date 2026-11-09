@@ -41,18 +41,23 @@ const SQL_ENGINE_MODULES =
 // JSON_TABLE declared-column metadata: 1,172,659 raw / 351,184 gzip bytes. An exact
 // query.js-only counterfactual against 9692edb3 is 1,172,208 / 351,066 (+451 / +118).
 // Raise this raw cap once by 512 bytes; keep the gzip cap and isolation checks.
+// Timestamp source/precision admission adds 326 raw / 148 gzip bytes: 1,172,985 / 351,332.
+// Only typed compilation records source; normal shipped SQL precision is unchanged. Caps stay.
 const COMPLETE_ENTRY_RAW_BUDGET = 1145.5 * 1024;
 const COMPLETE_ENTRY_GZIP_BUDGET = 343.25 * 1024;
 // The engine with the larger durable adapter, OPFS.
 // JSON_TABLE metadata: 1,585,069 raw / 458,168 gzip bytes; counterfactual
 // 1,584,618 / 458,049 (+451 / +119). Raw cap +512 once, gzip cap unchanged.
+// Timestamp source/precision admission: 1,585,395 / 458,305 (+326 raw / +137 gzip); caps stay.
 const ENGINE_WITH_OPFS_RAW_BUDGET = 1548.25 * 1024;
 const ENGINE_WITH_OPFS_GZIP_BUDGET = 447.75 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does.
 // JSON_TABLE metadata: 1,581,102 raw / 455,735 gzip bytes; counterfactual
 // 1,580,651 / 455,607 (+451 / +128). Raw cap +512 once, gzip cap unchanged.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1544.25 * 1024;
+// Timestamp source/precision admission: 1,581,428 / 455,871 (+326 raw / +136 gzip).
+// This exceeds the old raw cap by 116 bytes: raise it once by 512; keep the gzip cap.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1544.75 * 1024;
 const INDEXEDDB_WORKER_GZIP_BUDGET = 445.25 * 1024;
 // What a page that hosts the engine in a worker ships on the main thread: the client, the schema
 // DSL and error classes, the Kysely dialect and live queries, and the React hooks, with `kysely`

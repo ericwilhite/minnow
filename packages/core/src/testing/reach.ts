@@ -1683,6 +1683,101 @@ export const DATE_TRUNC_REACH = [
   "0A000",
 ] as const;
 
+/** SQL literals retain source fractions before the legacy Date boundary, in every scope. */
+export const TIMESTAMP_LITERAL_REACH = [
+  "fraction 0",
+  "fraction 1",
+  "fraction 2",
+  "fraction 3",
+  "fraction 4",
+  "fraction 5",
+  "fraction 6",
+  "direct",
+  "derived",
+  "CTE",
+  "view",
+  "grouped literals",
+  "aggregated literals",
+  "default SQL",
+  "before PG epoch",
+  "at or after PG epoch",
+  "sub-millisecond",
+  "trailing fraction zeros",
+  "positive day difference",
+  "negative day difference",
+  "microsecond comparison",
+  "leap day",
+  "day carry",
+  "wide timestamp",
+  "ignored nonzero literal zone",
+  "UTC or absent literal zone",
+] as const;
+
+/** Typemod admission must not silently turn native microseconds into an unrounded timestamp(p). */
+export const TIMESTAMP_PRECISION_REACH = [
+  "precision 0",
+  "precision 1",
+  "precision 2",
+  "precision 3",
+  "precision 4",
+  "precision 5",
+  "precision 6",
+  "precision 7",
+  "target 0",
+  "target 1",
+  "target 2",
+  "target 3",
+  "cast",
+  "column",
+  "rounding refused",
+  "full precision executes",
+  "full precision column",
+] as const;
+
+/** SQL output functions preserve temporal fields and only evaluate active non-NULL rows. */
+export const TEMPORAL_TEXT_REACH = [
+  "date",
+  "timestamp",
+  "timestamptz",
+  "interval",
+  "flat",
+  "dictionary",
+  "constant",
+  "selected",
+  "all rows",
+  "sparse nonascending selection",
+  "NULL garbage",
+  "constant NULL",
+  "unselected garbage",
+  "safe timestamp",
+  "wide timestamp",
+  "infinities",
+  "BC",
+  "mixed signs",
+] as const;
+
+/** Native date/timestamp differences preserve PG interval fields, strictness and errors. */
+export const TEMPORAL_SUB_REACH = [
+  "date",
+  "timestamp",
+  "timestamptz",
+  "flat",
+  "dictionary",
+  "constant",
+  "selected",
+  "all rows",
+  "strict NULL",
+  "constant NULL",
+  "unselected garbage",
+  "safe timestamp",
+  "wide timestamp",
+  "rows",
+  "22008",
+  "infinite interval refused",
+  "positive infinity refused",
+  "negative infinity refused",
+] as const;
+
 /** Literal JSON_TABLE desugaring keeps row order, multiplicity, NULLs and text exact. */
 export const JSON_TABLE_VALUES_REACH = [
   "empty",
@@ -1760,4 +1855,18 @@ export const STAGING_DROP_RETIREMENT_REACH = [
   "dropped table retained",
   "exact retained root",
   "reopen",
+] as const;
+
+/** The same FLOAT8 input stream must keep its order across every batch partition. */
+export const FLOAT_SUM_BOUNDARIES_REACH = [
+  "batch 1",
+  "batch 17",
+  "batch 511",
+  "batch 2048",
+  "unequal boundaries",
+  "stable group sorting",
+  "input-order updates",
+  "zero cancellation",
+  "unit cancellation",
+  "5000 groups",
 ] as const;

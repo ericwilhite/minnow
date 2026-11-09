@@ -66,7 +66,11 @@ for (const dataset of ["wide", "retail", "star"])
     // core's fixed session timezone is UTC; adapt the wire representation without shifting SQL
     // wall-clock fields, and keep DATE as PostgreSQL's text instead of a host-local midnight.
     const pg = new PGlite({
-      parsers: { 1114: (value) => new Date(value.replace(" ", "T") + "Z"), 1082: (value) => value },
+      parsers: {
+        1114: (value) => new Date(value.replace(" ", "T") + "Z"),
+        1082: (value) => value,
+        1186: (value) => value,
+      },
     });
     await pg.waitReady;
     await pg.exec("SET TIME ZONE 'UTC'");

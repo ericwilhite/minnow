@@ -1172,21 +1172,34 @@ The full interface contract includes the following (DML remains unimplemented by
   entry.
 - AND, OR, CASE and COALESCE evaluate a later argument only on the rows still undecided, so a
   guarded division never divides by zero. Filters narrow a selection vector conjunct by conjunct.
-- Hot loops are branch-free (a data-dependent branch mispredicts on half of random rows): range
+- Numeric arithmetic hot loops are branch-free (a data-dependent branch mispredicts on half of
+  random rows): range
   checks look at the batch's largest result after the loop, and a suspicious batch is rechecked
   row by row.
 - Memory: output buffers are allocated once per compiled expression; number paths allocate
   nothing per row, and a batch costs tens to a few hundred bytes of small objects (measured by
-  `scripts/next-kernels-bench.mts`). Only BigInt paths (values past 128 bits, int64 past 2^53 in
+  `scripts/next-kernels-bench.mts`). BigInt paths (values past 128 bits, int64 past 2^53 in
   casts and comparisons, and ROUND outside its safe-coefficient path) allocate per value.
+  Temporal text output also uses bounded transient strings and precharged reusable ASCII buffers.
 - `pglite.test.ts` judges generated cases by PostgreSQL itself: every numeric type, casts, NULLs
   with garbage under them, flat/dictionary/constant operands, wide values.
 - `ir/functions.ts` (lowering's) is the one table of functions, overloads and casts (R19).
   `exec/kernels/bindings.ts` binds each entry to a kernel or refuses it with a construct key
   (`UnsupportedPlanError`, stage "execute"); `bindings.test.ts` fails on an unbound entry, a
-  stale binding, or a kernel binding that does not evaluate. Not implemented yet: date, time and
-  interval arithmetic, text functions, math functions other than numeric ROUND(numeric,int4),
-  casts to and from text, bounded text casts.
+  stale binding, or a kernel binding that does not evaluate. DATE difference and finite timestamp
+  difference execute through `temporal-subtract.ts`; temporal output casts use `temporal-text.ts`.
+  Not implemented yet: other date/time/interval arithmetic, text functions, math functions other
+  than numeric ROUND(numeric,int4), other casts to and from text, and bounded text casts.
+- SQL TIMESTAMP literals preserve source microseconds through parsing, plan clones and expression
+  identity; lowering uses integer calendar/fraction fields, not the legacy millisecond Date.
+  Parser provenance lives in an internal weak side table, never in published model fields.
+  JS Date inputs keep millisecond precision; the shipped engine's precision is unchanged.
+  Explicit timestamp precision 6 is supported; other precision modifiers on casts/columns are
+  typed lowering refusals until precision rounding and write constraints are implemented.
+- SQL temporal text uses PostgreSQL's default styles in fixed UTC, preserving BC years and exact
+  microseconds. Timestamp differences use PG's day/remainder INTERVAL fields. Infinite INTERVAL
+  results and text stay typed refusals; no stored interval-infinity encoding is added. D1's ISO
+  timestamp row-value format is unchanged.
 - Two-argument NUMERIC ROUND (`round.ts`) follows PostgreSQL's half-away-from-zero rule,
   including negative scales. Requested scales clamp to -131073…16383; output scale is at least
   zero, NaN/infinities propagate, either NULL argument produces NULL, and a carry beyond

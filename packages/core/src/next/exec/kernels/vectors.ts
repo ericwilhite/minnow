@@ -16,7 +16,8 @@
  *   decimal cast's result wrapper is reused, a cache key array): scripts/next-kernels-bench.mts
  *   measures the bytes per batch. The exact paths that read values as BigInt (the `wide`
  *   decimal tier, int64 values past 2^53 in casts and comparisons) allocate per value; the
- *   int64/int128 decimal tiers do not (limbs.ts).
+ *   int64/int128 decimal tiers do not (limbs.ts). SQL temporal text also uses bounded transient
+ *   strings with precharged scratch and reusable ASCII output buffers.
  */
 import type { PhysicalType } from "../../types.js";
 import { BATCH_ROWS, dataBytes, allocateData } from "../../vector/vector.js";

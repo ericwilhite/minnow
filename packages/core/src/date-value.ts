@@ -24,6 +24,9 @@ const intrinsicDateSetUtcDate = Date.prototype.setUTCDate;
 // eslint-disable-next-line @typescript-eslint/unbound-method -- Captured for the same reason.
 const intrinsicDateSetUtcMonth = Date.prototype.setUTCMonth;
 
+/** Rebuild parser provenance only. Weak keys follow literal lifetime; no Date or published type changes. */
+export const timestampLiteralSources = new WeakMap<Date, string>();
+
 /** Returns a Date's internal millisecond value without invoking an instance override. */
 export function dateMilliseconds(value: Date): number {
   return intrinsicDateGetTime.call(value);

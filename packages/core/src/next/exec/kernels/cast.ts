@@ -1,5 +1,5 @@
 /**
- * Cast kernels between numeric and temporal types (text casts come with the text kernels).
+ * Cast kernels between numeric and temporal types, plus temporal output functions.
  *
  * PostgreSQL's rules:
  * - Integer narrowing checks the range (22003 `smallint/integer out of range`).
@@ -39,6 +39,7 @@ import {
   NumericOutOfRangeError,
   UnsupportedPlanError,
 } from "../errors.js";
+import { compileTemporalText } from "./temporal-text.js";
 import { castRefusal } from "./bindings.js";
 import { coefficientAt, scaleAt, specialAt, type DecimalData } from "./numeric.js";
 import {
@@ -599,6 +600,11 @@ export function compileCast(type: PhysicalType, input: Compiled, arena: OutputAr
     const refusal = castRefusal(source, target);
     if (refusal !== null) throw refuse(refusal);
   }
+  if (
+    type.kind === "text" &&
+    (from.kind === "date" || from.kind === "timestamp" || from.kind === "interval")
+  )
+    return compileTemporalText(type, input, arena);
   if (NUMERIC.has(from.kind) && NUMERIC.has(type.kind)) {
     switch (type.kind) {
       case "int32":

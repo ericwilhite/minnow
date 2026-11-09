@@ -1,7 +1,7 @@
 /**
  * IR literals: a `literal` expression holds a flat vector of length 1 (ir.ts). Lowering builds
  * them only for values it knows exactly at plan time: booleans, integers, floats, exact decimals,
- * text, canonical dates, timestamps from the front end's `Date` constants, sequence ids, and NULL of any type.
+ * text, canonical dates, timestamps from exact SQL spellings or JS `Date` inputs, sequence ids, and NULL of any type.
  * Every other constant (an INTERVAL, UUID or JSON spelled as text) stays text and is cast by
  * the executor, which owns those parsers.
  */

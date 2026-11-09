@@ -24,6 +24,7 @@ import { UnsupportedPlanError } from "../errors.js";
 import { compileArithmetic, compileNegate, type ArithOp } from "./arith.js";
 import { bindCall } from "./bindings.js";
 import { compileCase, compileCoalesce } from "./case.js";
+import { compileTemporalSubtract } from "./temporal-subtract.js";
 import { compileDateTrunc } from "./date-trunc.js";
 import { compileNumericRound } from "./round.js";
 import { compileCast } from "./cast.js";
@@ -172,6 +173,12 @@ function compileCall(expr: Extract<ScalarExpr, { op: "call" }>, context: Compile
       const [arg] = args;
       if (arg === undefined) throw new TypeError("neg takes one argument");
       return compileNegate(expr.type, arg, arena);
+    }
+    case "temporalSub": {
+      const [left, right] = args;
+      if (left === undefined || right === undefined)
+        throw new TypeError("Temporal subtraction takes two arguments");
+      return compileTemporalSubtract(expr.type, left, right, arena);
     }
     case "dateTrunc": {
       const [field, input] = args;
