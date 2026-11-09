@@ -7,6 +7,7 @@
  * Run under node --cpu-prof as well for a separately labelled whole-process diagnostic.
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { pairedCPU } from "./lib/paired-cpu.mts";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
@@ -53,13 +54,19 @@ interface Catalogue {
   sqlFor(query: CatalogueQuery, engine: string, rows: number): string;
 }
 const args = process.argv.slice(2);
+const paired = args.includes("--paired");
 const option = (name: string, fallback: string) => {
   const k = args.indexOf(name);
   return k < 0 ? fallback : (args[k + 1] ?? fallback);
 };
 const total = Number(option("--rows", "1000000")),
   rounds = Number(option("--repeats", "5"));
-if (!Number.isSafeInteger(total) || total < 1 || !Number.isSafeInteger(rounds) || rounds < 5)
+if (
+  !Number.isSafeInteger(total) ||
+  total < 1 ||
+  !Number.isSafeInteger(rounds) ||
+  rounds < (paired ? 9 : 5)
+)
   throw new RangeError("positive rows and at least five CPU rounds required");
 const harness = resolve(
   option("--harness", fileURLToPath(new URL("./next-executor-workload/", import.meta.url))),
@@ -134,6 +141,7 @@ const metadata = {
     await Promise.all(
       [
         resolve("scripts/next-executor-bench.mts"),
+        resolve("scripts/lib/paired-cpu.mts"),
         resolve("scripts/next-executor-components.mts"),
         resolve("scripts/next-late-fetch-component.mts"),
         resolve("scripts/next-aggregation-components.mts"),
@@ -145,7 +153,7 @@ const metadata = {
         cataloguePath,
         resolve("apps/site/bench/benchmark.ts"),
         resolve("packages/core/src/next/testing/executor-catalogue.json"),
-        resolve("scripts/next-executor-bench.mts"),
+
         ...[
           "plan",
           "limit",
@@ -541,7 +549,11 @@ try {
           for (const strategy of strategies) {
             core.executor.prepare = strategy.prepare;
             const result = await consume();
-            if (result.rows !== warm.rows || result.checksum !== warm.checksum)
+            if (
+              result.rows !== warm.rows ||
+              result.checksum !== warm.checksum ||
+              (paired && result.digest !== warm.digest)
+            )
               throw new Error("whole-query comparison warmups differ");
           }
           if (profileId.split(",").includes(query.id)) {
@@ -557,7 +569,11 @@ try {
               const result = await consume();
               const { profile } = await profiler.post("Profiler.stop");
               profiler.disconnect();
-              if (result.rows !== warm.rows || result.checksum !== warm.checksum)
+              if (
+                result.rows !== warm.rows ||
+                result.checksum !== warm.checksum ||
+                (paired && result.digest !== warm.digest)
+              )
                 throw new Error("profile policy changed output");
               await writeFile(
                 join(cache, `${query.id}.${index === 0 ? "before" : "after"}.cpuprofile`),
@@ -574,7 +590,11 @@ try {
               const result = await consume();
               const used = process.cpuUsage(started);
               (late ? after : before).push((used.user + used.system) / 1000);
-              if (result.rows !== warm.rows || result.checksum !== warm.checksum)
+              if (
+                result.rows !== warm.rows ||
+                result.checksum !== warm.checksum ||
+                (paired && result.digest !== warm.digest)
+              )
                 throw new Error("whole-query comparison lost rows or changed checksum");
               if (late) afterProfile = result.profile;
               else beforeProfile = result.profile;
@@ -635,13 +655,14 @@ try {
         wholeComparison = {
           lane: "Node",
           strategy: option("--whole-compare", ""),
+          paired: paired ? pairedCPU(before, after) : null,
           rounds,
           order,
           timing: metadata.timing,
           before: { ...baseline, profile: beforeProfile },
           after: { ...candidate, profile: afterProfile },
           medianDeltaMs: baseline.median - candidate.median,
-          // The acceptance rule uses the parent's spread, even when the candidate is noisier.
+          // Historical unpaired diagnostic only; requested paired acceptance uses paired above.
           regressionWithinParentSpread: candidate.median <= baseline.median + baseline.spread,
         };
       }

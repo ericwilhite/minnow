@@ -1,6 +1,7 @@
 /** Matched-output three-way diagnostics; plain TS is an optimistic observation, not a proof of
  * a JavaScript lower bound. No engine implementation changes are enabled by this benchmark. */
 import { strict as assert } from "node:assert";
+import { pairedCPU } from "./lib/paired-cpu.mts";
 import { cpuUsage } from "node:process";
 import { loadavg } from "node:os";
 import { Session } from "node:inspector/promises";
@@ -66,9 +67,12 @@ export async function lightComparison(
     readonly omitAliases?: boolean;
     readonly domainCountSum?: boolean;
     readonly operatorOnly?: boolean;
+    readonly paired?: boolean;
   } = {},
 ) {
   const warmups = measurement.warmups ?? 3;
+  if (measurement.paired && (rounds < 9 || candidate === undefined))
+    throw new RangeError("Paired CPU requires a candidate and at least nine rounds");
   const N = captured.reduce((n, b) => n + (b.selection?.count ?? b.length), 0);
   assert.ok(N <= 1000000 && N > 0);
   // Flatten decoded vectors only: no hashing, canonical IDs, key interning, grouping or statistics
@@ -374,7 +378,11 @@ export async function lightComparison(
       operations[kind] !== undefined &&
       !(measurement.nativeOnly && (kind === "bound" || kind === "split")) &&
       !(measurement.omitAliases && kind === "split") &&
-      !(measurement.operatorOnly && kind !== "operator" && kind !== "candidate"),
+      !(
+        (measurement.operatorOnly || measurement.paired) &&
+        kind !== "operator" &&
+        kind !== "candidate"
+      ),
   );
   for (let round = 0; round < rounds; round++) {
     loads.push(loadavg());
@@ -465,6 +473,7 @@ export async function lightComparison(
     order,
     loads,
     profiles,
+    paired: measurement.paired ? pairedCPU(samples.operator, samples.candidate) : null,
     cpuMs: Object.fromEntries(
       Object.entries(samples)
         .filter(([, values]) => values.length > 0)

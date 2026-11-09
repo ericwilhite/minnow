@@ -1338,6 +1338,14 @@ The component includes both probe and update drivers plus shared task pacing. It
 a table or establish the cost of obtaining a sound snapshot bound in a real SQL plan. No
 default factory path selects this operator, and no new aggregation spill implementation is
 claimed.
+For the wide and highcard component drivers, `--paired --repeats 9 --warmups 10`
+times only adjacent control/candidate runs, alternating AB/BA on the same decoded fixture.
+`next-executor-bench.mts --paired --repeats 9 --whole-compare wide-typed` uses the same
+pairing for stored queries. Reports retain every CPU sample and candidate-minus-control
+delta. A component gain requires its negative median delta to exceed the complete delta
+spread (max minus min) and at least seven of nine pairs to favour the candidate. A whole
+query must have no positive median delta beyond its paired spread. Output comparison and
+profiles are outside the component timing; query materialization remains in whole timing.
 The report includes CPU samples, full spreads, checkpointed partial rounds, profiles and the
 actual transformed JS needed to interpret line-level ticks. No baseline is an executor path.
 Unbounded, value-producing `indexRange` nodes require the same internal `keyOrder:true`

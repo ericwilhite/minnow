@@ -23,18 +23,19 @@ import { StorageCore } from "../packages/core/dist/next/testing/storage-core.js"
 import { lightComparison } from "./next-aggregation-light.mts";
 
 const args = process.argv.slice(2);
+const paired = args.includes("--paired");
 const option = (name: string, fallback: string) => {
   const index = args.indexOf(name);
   return index < 0 ? fallback : (args[index + 1] ?? fallback);
 };
 const rows = Number(option("--rows", "1000000"));
-const rounds = Number(option("--repeats", "7"));
+const rounds = Number(option("--repeats", "9"));
 if (
   !Number.isSafeInteger(rows) ||
   rows < 1 ||
   rows > 1000000 ||
   !Number.isSafeInteger(rounds) ||
-  rounds < 5
+  rounds < (paired ? 9 : 5)
 )
   throw new RangeError("1..1M rows and >=5 rounds required");
 const strategy = option("--strategy", "both");
@@ -57,6 +58,7 @@ const sourcePaths = [
   "scripts/next-wide-typed-bench.mts",
   "scripts/lib/wide-decoded-fixture.mts",
   "scripts/next-aggregation-light.mts",
+  "scripts/lib/paired-cpu.mts",
   "scripts/lib/aggregation-light-kernels.mts",
   "packages/core/browser/next-agg-shapes.ts",
   "packages/core/dist/next/exec/agg/aggregate.js",
@@ -83,6 +85,7 @@ const metadata = {
   nativeOnly,
   rows,
   rounds,
+  paired,
   node: process.version,
   cpu: cpus()[0]?.model,
   revision: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
@@ -111,7 +114,7 @@ try {
       packedIntegers: strategy !== "dictionary",
       batchDictionaryMinMax: strategy !== "packed",
     },
-    { ...(collect === undefined ? {} : { collect }), warmups, nativeOnly },
+    { ...(collect === undefined ? {} : { collect }), warmups, nativeOnly, paired },
   );
   await writeFile(join(output, "component.json"), JSON.stringify({ ...metadata, result }, null, 2));
   console.log(JSON.stringify(result.cpuMs));

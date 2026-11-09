@@ -10,6 +10,7 @@ import type { Rel } from "../packages/core/dist/next/ir/ir.js";
 import { StorageCore } from "../packages/core/dist/next/testing/storage-core.js";
 import { lightComparison } from "./next-aggregation-light.mts";
 const args = process.argv.slice(2);
+const paired = args.includes("--paired");
 const option = (n: string, f: string) => {
   const i = args.indexOf(n);
   return i < 0 ? f : (args[i + 1] ?? f);
@@ -22,7 +23,7 @@ if (
   rows < 1 ||
   rows > 1000000 ||
   !Number.isSafeInteger(rounds) ||
-  rounds < 5 ||
+  rounds < (paired ? 9 : 5) ||
   !Number.isSafeInteger(warmups) ||
   warmups < 1 ||
   warmups > 100
@@ -60,6 +61,7 @@ const rel: Extract<Rel, { op: "aggregate" }> = {
 const files = [
   "scripts/next-highcard-domain-bench.mts",
   "scripts/next-aggregation-light.mts",
+  "scripts/lib/paired-cpu.mts",
   "scripts/lib/aggregation-light-kernels.mts",
   "packages/core/browser/next-agg-shapes.ts",
   "packages/core/dist/next/exec/agg/aggregate.js",
@@ -78,6 +80,7 @@ const metadata = {
   lane: "Node isolated decoded component",
   rows,
   rounds,
+  paired,
   warmups,
   operatorOnly: args.includes("--operator-only"),
   candidate: args.includes("--candidate"),
@@ -119,6 +122,7 @@ try {
     args.includes("--candidate") ? {} : undefined,
     {
       warmups,
+      paired,
       omitAliases: true,
       domainCountSum: args.includes("--candidate"),
       operatorOnly: args.includes("--operator-only"),
