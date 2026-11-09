@@ -1103,6 +1103,14 @@ Warm prepared reads bypass plan-cache lookup. The report also includes bare brok
 lock-call counts and a clone/transfer probe. The probe sends buffers to the broker, which replies
 without echoing those buffers, so it measures one payload direction.
 
+The Node component split in `owner-point-read.bench.test.ts` always checks finite measurements,
+sample counts, synchronous execution, frame release and warm plan-cache reuse. Its 50-microsecond
+owner-share bound for prepared and parameterized text reads is enforced only with
+`MINNOW_PERF_LANE=1`; ordinary unit CI reports the values as an R6 test annotation. The nightly
+owner performance job runs this component benchmark with enforcement before the browser lane,
+and uploads its log alongside the browser results. The separate stub-server 10-microsecond check
+is unchanged.
+
 An isolated scheduling experiment helps distinguish browser task queues from SQL and wire costs:
 
 ```bash
