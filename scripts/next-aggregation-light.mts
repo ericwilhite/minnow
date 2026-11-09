@@ -1,5 +1,5 @@
 /** Matched-output three-way diagnostics; plain TS is an optimistic observation, not a proof of
- * a JavaScript lower bound. No engine implementation changes are enabled by this benchmark. */
+ * a JavaScript lower bound. Operator controls and candidate configurations are reported by the calling benchmark. */
 import { strict as assert } from "node:assert";
 import { pairedCPU } from "./lib/paired-cpu.mts";
 import { cpuUsage } from "node:process";
@@ -28,6 +28,7 @@ import {
   wideNative,
   distinct,
   type LightInput,
+  type LightResult,
   type Bytes,
 } from "./lib/aggregation-light-kernels.mts";
 
@@ -68,6 +69,8 @@ export async function lightComparison(
     readonly domainCountSum?: boolean;
     readonly operatorOnly?: boolean;
     readonly paired?: boolean;
+    readonly control?: AggregateOptions;
+    readonly nativeKernel?: (input: LightInput) => LightResult;
   } = {},
 ) {
   const warmups = measurement.warmups ?? 3;
@@ -254,6 +257,7 @@ export async function lightComparison(
           );
     const context = { arena, params: { slots: [] }, input: types };
     const configuration: AggregateOptions = {
+      typedLayout: false,
       packedAverages: false,
       packedIntegers: false,
       batchDictionaryMinMax: false,
@@ -298,6 +302,7 @@ export async function lightComparison(
       );
       return {
         rows,
+        layoutRows: aggregate instanceof AggregateOperator ? aggregate.typedLayoutRows : 0,
         directRows: aggregate instanceof DomainCountSumOperator ? aggregate.directRows : 0,
       };
     } finally {
@@ -309,14 +314,14 @@ export async function lightComparison(
     }
   };
   const expected = plain();
-  assert.deepEqual((await operator()).rows, expected.rows);
+  assert.deepEqual((await operator(measurement.control)).rows, expected.rows);
   if (pipeline) assert.equal((await pipeline()).rows, expected.rows.length);
   // Preserve every Sxx array in the consumed result so its updates cannot be dead work.
   if (expected.sxx) for (const q of expected.sxx) assert.ok(q.every(Number.isFinite));
   measurement.collect?.();
   for (let k = 0; k < warmups; k++) {
     plain();
-    await operator();
+    await operator(measurement.control);
     if (pipeline) await pipeline();
     measurement.collect?.();
   }
@@ -338,11 +343,12 @@ export async function lightComparison(
     measurement.collect?.();
   }
   const native =
-    id === "agg_3dims_20aggs"
+    measurement.nativeKernel?.bind(undefined, input) ??
+    (id === "agg_3dims_20aggs"
       ? wideNative.bind(undefined, input)
       : id === "agg_highcard_int"
         ? highcardDomain.bind(undefined, input)
-        : plain;
+        : plain);
   const nativeExpected = native();
   assert.deepEqual(nativeExpected.rows, expected.rows);
   if (expected.sxx) {
@@ -360,13 +366,14 @@ export async function lightComparison(
       const result = await operator(candidate, measurement.domainCountSum);
       assert.deepEqual(result.rows, expected.rows);
       if (measurement.domainCountSum) assert.ok(result.directRows > 0);
+      if (candidate.typedLayout === true) assert.equal(result.layoutRows, N);
       measurement.collect?.();
     }
   const operations = {
     bound: plain,
     split,
     native,
-    operator: () => operator(),
+    operator: () => operator(measurement.control),
     candidate: candidate ? () => operator(candidate, measurement.domainCountSum) : undefined,
     whole: pipeline,
     feed,
@@ -481,6 +488,6 @@ export async function lightComparison(
     ),
     componentOnly: pipeline === undefined && feed === undefined,
     limits:
-      "Optimistic fixed-workload TS observation, not a mathematical lower bound or universal JS impossibility result. Raw bound/split read flat decoded bytes/numbers and hash every text row. Native wide consumes the original decoded dictionary segments, hashes/maps all entries and translates every row within timing, then uses packed five-AVG state. No precomputed canonical IDs/ranks. All use exact collision equality. Highcard native includes an exact full-input min/max probe and direct-address COUNT/SUM state with an exact general-hash fallback for a wide domain; highcard split and both other DISTINCT kernels alias bound (not independent algorithms). Operator keeps original scan dictionary forms and includes matching sort/top-N, copying and governor/driver/task clock. Whole is prepared pipeline/owned frames; outer harness separately measures SQL through cleanup. Feed is scan/project/discard only, not additive with the other sinks. Setup/flattening (including numeric widening to Float64) excluded; kernel allocation/state/final ordering included. Borrowed immutable inputs need no key copy; no memory governor/spill/cancellation in plain TS. AVG Sxx retained. No production changes.",
+      "Optimistic fixed-workload TS observation, not a mathematical lower bound or universal JS impossibility result. Raw bound/split read flat decoded bytes/numbers and hash every text row. Native wide consumes the original decoded dictionary segments, hashes/maps all entries and translates every row within timing, then uses packed five-AVG state. No precomputed canonical IDs/ranks. All use exact collision equality. Highcard native includes an exact full-input min/max probe and direct-address COUNT/SUM state with an exact general-hash fallback for a wide domain; highcard split and both other DISTINCT kernels alias bound (not independent algorithms). Operator keeps original scan dictionary forms and includes matching sort/top-N, copying and governor/driver/task clock. Whole is prepared pipeline/owned frames; outer harness separately measures SQL through cleanup. Feed is scan/project/discard only, not additive with the other sinks. Setup/flattening (including numeric widening to Float64) excluded; kernel allocation/state/final ordering included. Borrowed immutable inputs need no key copy; no memory governor/spill/cancellation in plain TS. AVG Sxx retained. Plain kernels are diagnostics; operator/candidate configurations are reported separately.",
   };
 }

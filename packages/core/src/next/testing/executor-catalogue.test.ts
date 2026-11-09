@@ -77,13 +77,14 @@ for (const [dataset, packed] of [
   ["retail", false],
   ["star", false],
 ] as const)
-  it(`executes the ${dataset} catalogue through actual storage and records unsupported planning${packed === undefined ? " (default packed wide state)" : packed ? " (packed wide state)" : ""}`, async () => {
+  it(`executes the ${dataset} catalogue through actual storage and records unsupported planning${packed === undefined ? " (default numeric record)" : packed ? " (packed wide state)" : ""}`, async () => {
     const core = await new StorageCore(32).open();
     const enabled = packed !== false;
     const executor = createExecutor(
       packed === undefined
         ? {}
         : {
+            typedLayout: false,
             packedAverages: packed,
             packedIntegers: packed,
             batchDictionaryMinMax: packed,
@@ -94,8 +95,9 @@ for (const [dataset, packed] of [
       ? createReach("packed SQL catalogue", [
           "write path",
           "lowered",
-          "packed float AVG",
-          "packed integers",
+          ...(packed === undefined
+            ? ["typed numeric record"]
+            : ["packed float AVG", "packed integers"]),
           "dictionary MIN/MAX configured",
           "all PG columns",
           "current engine",
@@ -106,7 +108,7 @@ for (const [dataset, packed] of [
     if (packed === undefined) reach?.reach("default");
     let activeQuery = "";
     const accumulatorSpy = enabled ? vi.spyOn(aggregateStates, "accumulatorFor") : null;
-    const packedRows = new Map<string, { average: number; integer: number }>();
+    const packedRows = new Map<string, { average: number; integer: number; layout: number }>();
     // Explicit receiver below; do not bind this method to the prototype.
     const originalPush = AggregateOperator.prototype.push; // eslint-disable-line @typescript-eslint/unbound-method
     const spy = enabled
@@ -118,6 +120,7 @@ for (const [dataset, packed] of [
           packedRows.set(activeQuery, {
             average: this.packedAverageRows,
             integer: this.packedIntegerRows,
+            layout: this.typedLayoutRows,
           });
           return result;
         })
@@ -317,11 +320,23 @@ for (const [dataset, packed] of [
         if (enabled && query.id === "agg_3dims_20aggs") {
           reach?.reach("lowered");
           const rows = packedRows.get(query.id);
-          expect(rows?.average ?? 0, "eligible SQL must execute packed AVG").toBeGreaterThan(0);
-          expect(
-            rows?.integer ?? 0,
-            "eligible SQL must execute packed integer state",
-          ).toBeGreaterThan(0);
+          if (packed === undefined) {
+            expect(
+              rows?.layout ?? 0,
+              "eligible SQL must execute the default numeric record",
+            ).toBeGreaterThan(0);
+            expect(rows?.average ?? 0).toBe(0);
+            expect(rows?.integer ?? 0).toBe(0);
+            reach?.reach("typed numeric record");
+          } else {
+            expect(rows?.average ?? 0, "eligible SQL must execute packed AVG").toBeGreaterThan(0);
+            expect(
+              rows?.integer ?? 0,
+              "eligible SQL must execute packed integer state",
+            ).toBeGreaterThan(0);
+            reach?.reach("packed float AVG");
+            reach?.reach("packed integers");
+          }
           expect(
             accumulatorSpy?.mock.calls.some(
               ([fn, , input, , options]) =>
@@ -330,8 +345,6 @@ for (const [dataset, packed] of [
             "eligible SQL must configure batch dictionary MIN/MAX",
           ).toBe(true);
           reach?.reach("dictionary MIN/MAX configured");
-          reach?.reach("packed float AVG");
-          reach?.reach("packed integers");
           reach?.reach("all PG columns");
           reach?.reach("current engine");
         }

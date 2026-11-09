@@ -597,7 +597,7 @@ export function wideSplit(input: LightInput): LightResult {
 
 /** Dictionary-native input baseline. Mapping every page's entries into global IDs is TIMED.
  * No precomputed equality/rank IDs are supplied by fixture setup. */
-function dictionaryCodes(
+export function dictionaryCodes(
   segments: ReadonlyArray<{ start: number; codes: Int32Array; entries: Bytes }>,
   N: number,
 ): { codes: Int32Array; ranks: Int32Array; count: number } {

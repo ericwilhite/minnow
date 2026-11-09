@@ -1,3 +1,4 @@
+import { wideRecord } from "./lib/wide-layout-kernel.mts";
 /** Fixed-workload baseline validation: byte equality, local dictionary codes and PostgreSQL's
  * ordered float8 transitions. Independent Map/Set models, not timing assertions. */
 import fc from "fast-check";
@@ -233,6 +234,7 @@ it.each(seedsFor("aggregation-light-baselines", [0xb401, 0xb402]))(
           expect(wide(input)).toEqual(expected);
           expect(wideSplit(input)).toEqual(expected);
           expect(wideNative(input)).toEqual(expected);
+          expect(wideRecord(input)).toEqual(expected);
           expect(at(expected.sxx ?? [], 0).some((v) => v > 0)).toBe(true);
           reach.reach("positive Sxx");
           reach.reach("dictionary changes");

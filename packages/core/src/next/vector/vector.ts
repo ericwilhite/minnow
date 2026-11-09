@@ -163,7 +163,10 @@ export interface DictionaryVector {
   readonly codes: Int32Array;
   validity: Validity | null;
   readonly dictionary: FlatVector;
-  /** Process-unique identity of `dictionary`, for translation caches. */
+  /** Process-unique identity of an immutable entry prefix, for translation caches.
+   * Entries may be appended under the same ID; changing an existing entry needs a new ID.
+   * A cache must initialize newly exposed entries even when its capacity is already sufficient.
+   */
   readonly dictionaryId: number;
 }
 

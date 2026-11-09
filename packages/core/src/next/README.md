@@ -1737,7 +1737,7 @@ The full interface contract includes the following (DML remains unimplemented by
   9/9 favourable pairs. The whole query has no accepted reverse regression
   (median −31.575 ms, IQR 398.485 ms, range [−393.799, 195.558] ms, 5/9 favourable);
   this is not an accepted whole-query gain or a new post-integration measurement.
-  `createExecutor({ packedAverages: false, packedIntegers: false, batchDictionaryMinMax: false })`
+  `createExecutor({ typedLayout: false, packedAverages: false, packedIntegers: false, batchDictionaryMinMax: false })`
   retains the ordinary control paths.
   The existing dictionary-native group table remains responsible for exact key identities.
   One kernel packs five adjacent plain float8 AVG outputs into N/Sx[5]/Sxx[5] records.
@@ -1752,7 +1752,7 @@ The full interface contract includes the following (DML remains unimplemented by
   The dictionary MIN/MAX experiment first chooses each group's batch candidate by dictionary
   rank, then compares its bytes once with the retained winner. Scratch is bounded by the
   group count plus one batch; it retains no input buffers or global dictionary cache.
-  The new fused kernels cover 13/21 catalogue outputs (8 integer/count and 5 float AVG);
+  These earlier fused kernels cover 13/21 catalogue outputs (8 integer/count and 5 float AVG);
   text MIN uses the batch reduction, and the other outputs retain their typed kernels.
   State buffers, restoration, resizing overlap and scratch are charged before allocation.
   `next-wide-typed-bench.mts --strategy both --native-only --warmups 10` compares this
@@ -1760,6 +1760,29 @@ The full interface contract includes the following (DML remains unimplemented by
   `--controlled-gc` (Node `--expose-gc`) includes synchronous collection inside each CPU
   sample as a separate diagnostic mode; ordinary samples do not force collection.
   `next-executor-bench.mts --whole-compare wide-typed` compares the real stored queries.
+- `typed-layout.ts` selects a row-major bank by the functions, direct-column arguments and
+  physical types of a numeric aggregate family. Its 32-double records cover 20/21 wide
+  catalogue outputs; text MIN keeps the ordinary dictionary candidate reduction. It shares
+  N only while all relevant input masks are all-valid, the whole prefix has at most 2^21 rows
+  and 1,024 groups, and every float input is finite with magnitude at most 2^400. Integer
+  sums then stay exact within 2^52; the stricter version of `packed-averages.ts`'s written
+  bound guarantees no float transition can overflow. Every Sx and Sxx update still happens
+  in PostgreSQL's original per-group input order. Safe int64-family MAX retains an exact
+  numeric winner. Before an uncertified batch, members restore the saved fields at their
+  original update positions; no float recomputation, reassociation or merging is used.
+  Other aggregate families keep the general implementation. Three all-valid byte dictionary
+  grouping keys translate only selected entries and probe their canonical tuple in one loop;
+  changing dictionaries, duplicate entries, NULLs, flat inputs and larger domains keep exact
+  equality through direct-table growth or the general hash fallback. State, promotion scratch
+  and resize overlap remain charged. This adds no aggregation spill or runtime code generation.
+  `createExecutor({ typedLayout: false })` retains the merged separate-bank control, including
+  its older dictionary tuple loops. The component command
+  `next-wide-typed-bench.mts --typed-layout --paired --repeats 9 --warmups 10` and the whole-query command
+  `next-executor-bench.mts --whole-compare wide-layout --paired --repeats 9` measure adjacent
+  AB/BA CPU pairs. Committed `scripts/next-executor-workload/aggregation-layout-paired-2026-11-09.json`
+  records the component gain and the inconclusive whole-query comparison, with every pair and source hash.
+  `--record-prototype` measures the independent fixed-fixture numeric layout diagnostic;
+  its preconditions are not a production certificate.
 - Scan statistics hints (future; pre-sizing and AVG Sxx skipping are deferred).
   High-cardinality pre-sizing is deferred. The scan would need to supply a conservative NDV
   estimate for the grouping expressions (not merely a row count), its scope across pages and

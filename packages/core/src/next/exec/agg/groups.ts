@@ -896,6 +896,7 @@ class ByteKeys implements KeyColumn {
   count = 0;
   #nullId = -1;
   #dictionaryId = -1;
+  #dictionaryLength = 0;
   #translation: Int32Array;
   constructor(readonly memory: Charged) {
     this.#translation = memory.make(Int32Array, 0);
@@ -952,6 +953,45 @@ class ByteKeys implements KeyColumn {
     if (data.layout === "fixed16") return this.#id(data.bytes, slot * 16, slot * 16 + 16);
     throw new TypeError(`byte group keys over ${data.layout}`);
   }
+  #dictionary(key: Extract<Vector, { form: "dictionary" }>): Int32Array {
+    if (this.#dictionaryId !== key.dictionaryId) {
+      this.#dictionaryId = key.dictionaryId;
+      this.#dictionaryLength = 0;
+    }
+    const length = key.dictionary.length;
+    if (this.#translation.length < length)
+      this.#translation = this.memory.int32(
+        this.#translation,
+        Math.max(length, 2 * this.#translation.length),
+      );
+    // Entry prefixes may grow under one identity. Capacity alone is insufficient:
+    // spare cells can still contain translations from a previous dictionary.
+    if (length > this.#dictionaryLength) this.#translation.fill(-1, this.#dictionaryLength, length);
+    this.#dictionaryLength = length;
+    return this.#translation;
+  }
+  /** Intern selected dictionary entries, without materializing a row-ID vector.
+   * Never inspect unused entries: their bytes need not belong to this query. */
+  dictionaryIds(
+    key: Extract<Vector, { form: "dictionary" }>,
+    length: number,
+    selection: Selection | null,
+  ): Int32Array {
+    try {
+      const translation = this.#dictionary(key);
+      const rows = selection === null ? IDENTITY : selection.rows,
+        count = selection === null ? length : selection.count;
+      for (let k = 0; k < count; k++) {
+        const code = key.codes[rows[k] ?? 0] ?? 0;
+        if ((translation[code] ?? -1) < 0)
+          translation[code] = this.#slotId(key.dictionary.data, code);
+      }
+      return translation;
+    } finally {
+      this.#source = EMPTY;
+      this.#sourceView = EMPTY_VIEW;
+    }
+  }
   assign(key: Vector, length: number, selection: Selection | null, ids: Int32Array): void {
     try {
       this.#assign(key, length, selection, ids);
@@ -966,16 +1006,7 @@ class ByteKeys implements KeyColumn {
     const count = selection === null ? length : selection.count;
     if (key.form === "dictionary") {
       // Each dictionary entry is looked up once per dictionary; rows map codes.
-      if (this.#dictionaryId !== key.dictionaryId) {
-        this.#dictionaryId = key.dictionaryId;
-        if (this.#translation.length < key.dictionary.length)
-          this.#translation = this.memory.int32(
-            this.#translation,
-            Math.max(key.dictionary.length, 2 * this.#translation.length),
-          );
-        this.#translation.fill(-1, 0, key.dictionary.length);
-      }
-      const translation = this.#translation;
+      const translation = this.#dictionary(key);
       const codes = key.codes;
       const validity = key.validity;
       const data = key.dictionary.data;
@@ -1175,7 +1206,7 @@ class TupleKeys {
   }
 
   /** Widens the direct table's radices for `counts`, rebuilding it, or switches to hashing. */
-  #fit(counts: readonly number[]): void {
+  #fit(counts: readonly number[]): boolean {
     let changed = false;
     for (let c = 0; c < this.width; c++) {
       let bits = this.#bits[c] ?? 0;
@@ -1185,7 +1216,7 @@ class TupleKeys {
         changed = true;
       }
     }
-    if (!changed) return;
+    if (!changed) return this.#direct !== null;
     const total = this.#bits.reduce((a, b) => a + b, 0);
     const old = this.#direct;
     if (total > DIRECT_BITS) {
@@ -1204,12 +1235,13 @@ class TupleKeys {
         if (this.#slots.full(g + 1))
           throw new Error("TupleKeys: the slot table is more than half full while migrating");
       }
-      return;
+      return false;
     }
     const table = this.memory.make(Int32Array, 1 << total);
     if (old !== null) this.memory.give(old.byteLength);
     for (let g = 0; g < this.count; g++) table[this.#slotOfGroup(g)] = g + 1;
     this.#direct = table;
+    return true;
   }
 
   #slotOfGroup(g: number): number {
@@ -1229,7 +1261,7 @@ class TupleKeys {
     return finalize(h);
   }
 
-  #newGroup(ids: readonly Int32Array[], i: number, h: number): number {
+  #reserveGroup(h: number): number {
     const g = this.count++;
     if (g >= this.#hashes.length) {
       const size = 2 * this.#hashes.length;
@@ -1239,11 +1271,58 @@ class TupleKeys {
       });
     }
     this.#hashes[g] = h;
+    return g;
+  }
+
+  #newGroup(ids: readonly Int32Array[], i: number, h: number): number {
+    const g = this.#reserveGroup(h);
     for (let c = 0; c < this.width; c++) {
       const column = this.columnIds[c];
       if (column !== undefined) column[g] = ids[c]?.[i] ?? 0;
     }
     return g;
+  }
+
+  /** Dictionary-native 3-key direct lookup; translations are owned canonical IDs.
+   * Fit may switch to hashing, in which case no group transition has occurred. */
+  dictionaries(
+    a: Int32Array,
+    b: Int32Array,
+    c: Int32Array,
+    ac: Int32Array,
+    bc: Int32Array,
+    cc: Int32Array,
+    counts: readonly number[],
+    rows: Uint16Array,
+    count: number,
+    gids: Int32Array,
+  ): boolean {
+    if (this.#direct === null) return false;
+    if (!this.#fit(counts)) return false;
+    const direct = this.#direct;
+    const shift1 = this.#bits[0] ?? 0,
+      shift2 = shift1 + (this.#bits[1] ?? 0);
+    for (let k = 0; k < count; k++) {
+      const row = rows[k] ?? 0,
+        x = a[ac[row] ?? 0] ?? 0,
+        y = b[bc[row] ?? 0] ?? 0,
+        z = c[cc[row] ?? 0] ?? 0;
+      const slot = x | (y << shift1) | (z << shift2);
+      let g = (direct[slot] ?? 0) - 1;
+      if (g < 0) {
+        g = this.#reserveGroup(0);
+        const ca = this.columnIds[0],
+          cb = this.columnIds[1],
+          cd = this.columnIds[2];
+        if (!ca || !cb || !cd) throw new Error("Missing dictionary tuple columns");
+        ca[g] = x;
+        cb[g] = y;
+        cd[g] = z;
+        direct[slot] = g + 1;
+      }
+      gids[row] = g;
+    }
+    return true;
   }
 
   /** `counts[c]`: column c's value count after this batch's ids were assigned. */
@@ -1338,12 +1417,15 @@ export class GroupTable {
   readonly #tuple: TupleKeys | null = null;
   /** Per key column: this batch's value ids (several keys only). */
   readonly #ids: Int32Array[] = [];
+  /** Selected rows using the dictionary-native tuple kernel (diagnostics). */
+  dictionaryRows = 0;
 
   /** Throws (having released everything it took) when a key column cannot be built. */
   constructor(
     readonly keyTypes: readonly PhysicalType[],
     charge: ByteCharge,
     capacity = 2048,
+    readonly dictionaryNative = true,
   ) {
     this.#memory = new Charged(charge);
     try {
@@ -1365,6 +1447,50 @@ export class GroupTable {
 
   /** Writes the group id of each active row into `gids[row]`, creating groups for new keys. */
   assign(keys: readonly Vector[], length: number, rows: Selection | null, gids: Int32Array): void {
+    const a = this.#columns[0],
+      b = this.#columns[1],
+      c = this.#columns[2],
+      ka = keys[0],
+      kb = keys[1],
+      kc = keys[2];
+    if (
+      this.dictionaryNative &&
+      this.#columns.length === 3 &&
+      this.#tuple?.direct &&
+      a instanceof ByteKeys &&
+      b instanceof ByteKeys &&
+      c instanceof ByteKeys &&
+      ka?.form === "dictionary" &&
+      kb?.form === "dictionary" &&
+      kc?.form === "dictionary" &&
+      ka.validity === null &&
+      kb.validity === null &&
+      kc.validity === null &&
+      ka.dictionary.validity === null &&
+      kb.dictionary.validity === null &&
+      kc.dictionary.validity === null
+    ) {
+      const ac = a.dictionaryIds(ka, length, rows),
+        bc = b.dictionaryIds(kb, length, rows),
+        cc = c.dictionaryIds(kc, length, rows);
+      if (
+        this.#tuple.dictionaries(
+          ac,
+          bc,
+          cc,
+          ka.codes,
+          kb.codes,
+          kc.codes,
+          [a.count, b.count, c.count],
+          rows === null ? IDENTITY : rows.rows,
+          rows === null ? length : rows.count,
+          gids,
+        )
+      ) {
+        this.dictionaryRows += rows === null ? length : rows.count;
+        return;
+      }
+    }
     const target = (c: number): Int32Array => (this.#tuple === null ? gids : this.#ids[c]) ?? gids;
     this.#columns.forEach((column, c) => {
       const key = keys[c];

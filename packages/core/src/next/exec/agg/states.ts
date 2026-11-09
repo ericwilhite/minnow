@@ -98,6 +98,17 @@ export interface Accumulator {
   fusedValues?(vector: Vector, rows: Uint16Array, count: number): Float64Array | null;
   /** Adds `count` values whose exact total is `total` (after `fusedValues`). */
   addFused?(total: number, count: number): void;
+  /** Internal PG transition diagnostics; AVG only. */
+  floatTransition?(group: number): readonly [number, number, number];
+  /** Restore exact finite numeric transition fields; no merging or recomputation. */
+  restoreNumberPrefix?(
+    state: Float64Array,
+    stride: number,
+    valueOffset: number,
+    countOffset: number,
+    groups: number,
+    squareOffset?: number,
+  ): void;
   /** Restore a certified exact-int32 prefix into a fresh ordinary accumulator.
    * Its sums are exact integers within ±2^52; counts are exact and masks matched.
    * Internal packed-state promotion only; never combines float transition states.
@@ -1139,6 +1150,28 @@ class FloatSumAccumulator implements Accumulator {
       this.#squares = this.#memory.float64(this.#squares, capacity);
     } else this.#has = this.#memory.uint8(this.#has, capacity);
   }
+  floatTransition(group: number): readonly [number, number, number] {
+    return [this.#counts[group] ?? 0, this.#sums[group] ?? 0, this.#squares[group] ?? 0];
+  }
+  restoreNumberPrefix(
+    state: Float64Array,
+    stride: number,
+    value: number,
+    count: number,
+    groups: number,
+    square?: number,
+  ): void {
+    this.grow(groups);
+    for (let g = 0; g < groups; g++) {
+      const at = g * stride,
+        n = state[at + count] ?? 0;
+      this.#sums[g] = n === 0 && !this.average ? -0 : (state[at + value] ?? 0);
+      if (this.average) {
+        this.#counts[g] = n;
+        this.#squares[g] = square === undefined ? 0 : (state[at + square] ?? 0);
+      } else this.#has[g] = n > 0 ? 1 : 0;
+    }
+  }
   update(
     vector: Vector | null,
     gids: Int32Array,
@@ -1977,6 +2010,35 @@ class MinMaxAccumulator implements Accumulator {
     };
     while (this.#values.length < groups) this.#values.append(nothing, 0);
   }
+  restoreNumberPrefix(
+    state: Float64Array,
+    stride: number,
+    value: number,
+    count: number,
+    groups: number,
+  ): void {
+    this.grow(groups);
+    // One charged native scratch cell, bounded by the packed plan's 1024-group prefix.
+    const values = this.#memory.make(Float64Array, 1);
+    try {
+      const vector: FlatVector = {
+        form: "flat",
+        type: this.type,
+        length: 1,
+        validity: null,
+        data: { layout: "int64", values: { repr: "safe", values } },
+      };
+      for (let g = 0; g < groups; g++)
+        if ((state[g * stride + count] ?? 0) > 0) {
+          values[0] = state[g * stride + value] ?? 0;
+          this.#values.set(g, vector, 0);
+          this.#numeric[g] = values[0];
+          this.#has[g] = 1;
+        }
+    } finally {
+      this.#memory.give(values.byteLength);
+    }
+  }
   update(
     vector: Vector | null,
     gids: Int32Array,
@@ -2306,6 +2368,19 @@ class NumberMinMaxAccumulator implements Accumulator {
     const capacity = grownCapacity(this.#best.length, groups);
     this.#best = this.#memory.float64(this.#best, capacity);
     this.#has = this.#memory.uint8(this.#has, capacity);
+  }
+  restoreNumberPrefix(
+    state: Float64Array,
+    stride: number,
+    value: number,
+    count: number,
+    groups: number,
+  ): void {
+    this.grow(groups);
+    for (let g = 0; g < groups; g++) {
+      this.#best[g] = state[g * stride + value] ?? 0;
+      this.#has[g] = (state[g * stride + count] ?? 0) > 0 ? 1 : 0;
+    }
   }
   update(
     vector: Vector | null,
