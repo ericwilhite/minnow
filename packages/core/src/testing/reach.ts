@@ -1376,6 +1376,18 @@ export const OWNER_MODE_ORDER_STATES = [
   "readWrite then readOnly under read-only savepoint",
 ] as const;
 
+/** Executor benchmark inputs retain charged encoded roots and storage lease cleanup. */
+export const BENCH_ROOT_ADMISSION_REACH = [
+  "single group",
+  "multiple groups",
+  "warm charged parse",
+  "cold charged parse",
+  "parse refusal cleanup",
+  "mixed lease",
+  "payload refusal cleanup",
+  "cancelled read",
+] as const;
+
 /** Production API benchmark fixture stays on real SQL/owner transport, across repeated queries. */
 export const OWNER_API_BENCH_REACH = [
   "real SQL identity projection",

@@ -2151,7 +2151,10 @@ the control is explicitly the historical bench handle, on current executor code.
 frames promptly. A pass's wall time runs from the API call through iteration, releases and `done`;
 CPU is the dedicated worker's setup-excluded CPU, excluding the page consumer. The owner server,
 composition, SQL lowerer, executor and client are real. Fixture catalog/snapshot descriptors
-replace B3 catalog/group-root discovery, and client row objects are excluded. These measurements
+replace B3 catalog/group-root discovery, and client row objects are excluded. Encoded group roots
+are prepared as warm fixture metadata before timing; execution still uses the normal charged
+metadata parser and read admission. Payload reads retain their original OPFS/cache/pool path.
+These measurements
 are not a full database-open benchmark or quiet-host Gate A acceptance. The harness records
 its own observation overhead; pull/drain sub-times are uninstrumented, reported as zero.
 

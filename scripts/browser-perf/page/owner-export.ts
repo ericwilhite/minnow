@@ -26,7 +26,7 @@ import type { ExportGroup, ExportResult } from "./export-stream.js";
 import type { ExecutorExportStats } from "./executor-export.js";
 import { outputCapacity } from "../../../packages/core/src/next/exec/return-pool.js";
 import { traceReturnPool } from "./return-pool-trace.js";
-import { benchTableOf } from "./scan-fixture.js";
+import { benchSnapshotOf } from "./scan-fixture.js";
 
 /** R3: last frames may be inline in done, including an empty terminal message. */
 export function carriedFrames(message: OwnerMessage): readonly FramePayload[] {
@@ -72,8 +72,8 @@ export function prepareOwnerExport(
   const unsupported = (): never => {
     throw new Error("Read-only BENCH fixture operation unavailable");
   };
-  const table = benchTableOf(groups),
-    catalog = new MemoryCatalog(),
+  const { table, pages } = benchSnapshotOf(space, groups);
+  const catalog = new MemoryCatalog(),
     planner = createLowerer();
   const ddl = planner.lower(
     `CREATE TABLE t (${table.columns.map((c) => `${c.name} ${sqlType(c.type)}`).join(",")})`,
@@ -110,7 +110,7 @@ export function prepareOwnerExport(
         bound: 0,
         observedLsn: 0,
         catalog: catalog.view,
-        pages: space,
+        pages,
         get released() {
           return released;
         },
