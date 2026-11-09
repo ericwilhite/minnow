@@ -3,6 +3,8 @@
  * Preparation does not authorize ownership. The caller revalidates immutable current/new
  * lists and supplied sealed writers under the transition barrier after preparation waits.
  * The complement of a lossy free map is never a source of ownership proof.
+ * Consumers preserve scalar boolean/void fast paths: an in-frame pair must not create a
+ * scheduler continuation. Native page I/O and the shared task clock still suspend normally.
  */
 import { pauseIfDue, type TaskWork } from "../task.js";
 import { DATA_ALIGN, StoreCorruptionError } from "./contract.js";
@@ -269,21 +271,34 @@ export async function mergeExtents(
     while (hasA || hasB) {
       if (steps++ % 128 === 0) await check(work);
       if (hasA && (!hasB || a.offset < b.offset)) {
-        await output.append(a.offset, a.length, work);
-        hasA = await a.next(work);
+        {
+          const pending = output.append(a.offset, a.length, work);
+          if (pending !== undefined) await pending;
+        }
+        const nextA = a.next(work);
+        hasA = typeof nextA === "boolean" ? nextA : await nextA;
       } else if (hasB && (!hasA || b.offset < a.offset)) {
-        if (mode === "union") await output.append(b.offset, b.length, work);
-        hasB = await b.next(work);
+        if (mode === "union") {
+          const pending = output.append(b.offset, b.length, work);
+          if (pending !== undefined) await pending;
+        }
+        const nextB = b.next(work);
+        hasB = typeof nextB === "boolean" ? nextB : await nextB;
       } else {
         if (a.length !== b.length)
           throw new StoreCorruptionError("Roots disagree on private extent length");
         if (mode === "union") {
           if (duplicates === "refuse")
             throw new StoreCorruptionError("Repeated private extent pair");
-          await output.append(a.offset, a.length, work);
+          {
+            const pending = output.append(a.offset, a.length, work);
+            if (pending !== undefined) await pending;
+          }
         }
-        hasA = await a.next(work);
-        hasB = await b.next(work);
+        const nextA = a.next(work);
+        hasA = typeof nextA === "boolean" ? nextA : await nextA;
+        const nextB = b.next(work);
+        hasB = typeof nextB === "boolean" ? nextB : await nextB;
       }
     }
     await check(work);

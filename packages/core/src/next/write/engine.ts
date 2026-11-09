@@ -133,7 +133,7 @@ import {
   decodeManifestRoot,
   encodeGroupRoot,
   encodeManifestRoot,
-  GROUPS_PER_PAGE,
+  directoryPageGroups,
   isEmptyDirectory,
   ParseBudgetError,
   parseCharge,
@@ -254,11 +254,11 @@ interface Staging {
 }
 
 /**
- * Resident bytes of a table's directory page index (one `GroupPageEntry` per `GROUPS_PER_PAGE`
- * groups: a page `BlobRef`, its extent, row-id range and counts), charged before it is
+ * Resident bytes of a table's directory page index (full pages plus a geometric partial tail:
+ * a page `BlobRef`, its extent, row-id range and counts), charged before it is
  * materialized. V8 measures about 193 B per decoded entry with its array slot; 512 B covers any
- * field shape (four objects of at most 8 fields, every number a heap double). It is O(groups / 4,096):
- * 25 entries at 100k groups.
+ * field shape (four objects of at most 8 fields, every number a heap double). Appending to an
+ * existing full-page/tail directory adds at most log2(GROUPS_PER_PAGE) + 1 partial entries.
  */
 const PAGE_ENTRY_BYTES = 512;
 const pageIndexBytes = (pages: number): number => pages * PAGE_ENTRY_BYTES;
@@ -4229,8 +4229,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   /**
    * Writes a table's group directory for `groups`, of which those before `firstChanged` are the
-   * durable ones unchanged: leading full pages wholly before it are kept (format/manifest-codec.ts
-   * "paged group directory"), the rest are rewritten. Extents of the old directory that the new one does not use
+   * durable ones unchanged (format/manifest-codec.ts "paged group directory"). Appends retain
+   * the unchanged canonical prefix and rewrite only the remaining suffix. A growing tail is
+   * not rewritten for every new group. Canonical power-of-two tail pages keep the index
+   * bounded across variable batches and mixed mutations.
+   * Extents of the old directory that the new one does not use
    * are added to `retired` (the pages one flush writes share an extent, which goes with its last
    * page).
    */
@@ -4241,19 +4244,26 @@ export class WritePathImpl implements WritePath, EngineHooks {
     firstChanged: number,
     retired: ExtentRef[],
   ): Promise<{ directory: BlobRef; pages: readonly GroupPageEntry[] }> {
-    // Full pages wholly before the first changed group are kept: O(pages), no group is compared.
+    // Retain the longest unchanged prefix that matches the canonical partition of the new
+    // group count: full pages followed by power-of-two partial pages. Writing the remainder
+    // in that same layout bounds the tail for arbitrary batches and mixed mutations too.
+    // Legacy packed tails normalize on their next write; their byte format does not change.
     const keep: GroupPageEntry[] = [];
     let kept = 0;
     for (const page of state.pages) {
-      if (page.groupCount !== GROUPS_PER_PAGE || kept + page.groupCount > firstChanged) break;
+      if (
+        kept + page.groupCount > firstChanged ||
+        page.groupCount !== directoryPageGroups(groups.count - kept)
+      )
+        break;
       keep.push(page);
       kept += page.groupCount;
     }
     let directory = EMPTY_DIRECTORY;
     let pages: readonly GroupPageEntry[] = [];
     if (groups.count > 0) {
-      // Only the rewritten pages' groups are decoded (at most a page plus changed pages).
-      const written = await writeGroupDirectory(writer, groups.slice(kept), keep);
+      // Decode only the rewritten suffix; retained pages do not decode their groups.
+      const written = await writeGroupDirectory(writer, groups.slice(kept), keep, "binary");
       directory = written.ref;
       pages = written.pages;
     }

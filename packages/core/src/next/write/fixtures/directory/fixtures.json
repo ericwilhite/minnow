@@ -1,0 +1,23 @@
+[
+  {
+    "name": "packed-0",
+    "groups": 0,
+    "pageCounts": [],
+    "shared": false,
+    "sha256": "e73d0c94cbd93f5230dd67589e60977cd50491710e74d1fb1b7b76d3c94d265b"
+  },
+  {
+    "name": "packed-4095",
+    "groups": 4095,
+    "pageCounts": [4095],
+    "shared": false,
+    "sha256": "bebec31e49412b5902cb97d8ba552d3eb4ef550c920fa34b2818dc07ffe9c8e6"
+  },
+  {
+    "name": "packed-4099",
+    "groups": 4099,
+    "pageCounts": [4096, 3],
+    "shared": true,
+    "sha256": "b164a083bed10a9ec2b8b0270212b73dd287fe828b8149136c3d1634c9197e6f"
+  }
+]

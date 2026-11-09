@@ -96,6 +96,12 @@ export default tseslint.config(
       "packages/core/src/storage/contract-boundaries.test.ts",
       // The same, for the rebuild core's module layers (next/README.md).
       "packages/core/src/next/dependency-rules.test.ts",
+      // Frozen native-file compatibility fixtures use Node I/O and bulk array checks.
+      // These unexported test helpers never enter a browser package entry point.
+      "packages/core/src/next/write/directory-compatibility.test.ts",
+      "packages/core/src/next/write/directory-publication-compat.test.ts",
+      "packages/core/src/next/write/directory-frozen.ts",
+      "packages/core/src/next/write/directory-tails-test-support.ts",
       // Reads the front end's sources off disk to pin the messages lowering's SQLSTATE map
       // depends on (lower/errors.ts).
       "packages/core/src/next/testing/front-end-states.test.ts",

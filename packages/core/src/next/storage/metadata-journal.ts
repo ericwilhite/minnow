@@ -54,6 +54,7 @@ export class MetadataWorkspace {
   #budget: ByteBudget | null;
   #memory: CacheMemory | null = null;
   #frames = EMPTY;
+  #frameViews: DataView[] = [];
   #io = new Uint8Array(METADATA_SMALL_BYTES);
   #controls = new Uint8Array(8 * METADATA_SMALL_BYTES);
   #controlHandles = new Float64Array(8);
@@ -110,9 +111,13 @@ export class MetadataWorkspace {
     try {
       const count = phase === "source" ? 3 : phase === "merge" ? 4 : 2;
       this.#frames = Array.from({ length: count }, () => new Uint8Array(METADATA_PAGE_BYTES));
+      // Fixed header/view allowance, admitted with W before the frames exist. These views
+      // belong to the phase, not a potentially escaped writer.
+      this.#frameViews = this.#frames.map(viewOf);
       return await work();
     } finally {
       // Drop all references before a different phase allocates its frames: no old/new overlap.
+      this.#frameViews.length = 0;
       this.#frames = EMPTY;
       this.#borrowed = 0;
       this.#readOnly = 0;
@@ -123,6 +128,12 @@ export class MetadataWorkspace {
     const frame = this.#frames[index];
     if (!this.#active || frame === undefined) throw new TypeError("No prepaid frame in this phase");
     return frame;
+  }
+  /** Owned output-frame view, valid only during the current phase. */
+  frameView(index: number): DataView {
+    const view = this.#frameViews[index];
+    if (!this.#active || view === undefined) throw new TypeError("No prepaid view in this phase");
+    return view;
   }
   claim(index: number, wholeBufferWrite = false): Uint8Array {
     const frame = this.frame(index);
@@ -497,7 +508,7 @@ export class ChainWriter {
     const frame = this.frame;
     this.journal.workspace.assertFrame(frame);
     if (this.#last === 0 || this.#used + 16 > METADATA_PAYLOAD_BYTES) return false;
-    const view = viewOf(frame);
+    const view = this.journal.workspace.frameView(this.slot);
     view.setFloat64(HEADER + this.#used, offset, true);
     view.setFloat64(HEADER + this.#used + 8, length, true);
     this.#used += 16;

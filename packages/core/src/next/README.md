@@ -1106,10 +1106,18 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   the same `ExtentRef`. Encoding is canonical (re-encoding a decoded value gives the same bytes).
 - `TableRoot.groups` names a directory **index**; each index entry names a **page** of up to
   `GROUPS_PER_PAGE` (4,096) `GroupRef`s with its row-id range and counts. `writeGroupDirectory`
-  keeps unchanged pages, so a flush rewrites only the last page and the index. A table with no
+  keeps an unchanged prefix of full pages and descending power-of-two tail pages. Rewriting
+  only the remaining canonical suffix encodes each appended group O(log GROUPS_PER_PAGE)
+  times amortized, including variable batches; full pages stay shared on append. Mutations
+  retain the unchanged canonical prefix. The index stays bounded across mixed histories.
+  A table with no
   groups has a zero-length `groups` reference. The index has one 30-byte entry per page, so the
-  per-flush rewrite grows with the page count: up to about 113 KiB for the last page plus ~30 bytes per
-  4,096 groups (a two-level index can replace it if that ever matters).
+  per-flush index rewrite grows with the page count: full pages plus a logarithmic partial tail
+  (a two-level index can replace it if that ever matters). The byte grammar and version remain
+  unchanged: pages have always allowed any size from 1 through 4,096 groups. Physical packing
+  does change the page/index bytes. Frozen baseline native files and a self-contained baseline
+  build check successful continuation in both directions through every tail, boundary carry,
+  shared-page edit, publication interruption/retry, corruption refusal and competing opens.
 - Decoding is canonical: an extent table or type table with a duplicate, unused or out-of-order
   entry, a non-minimal integer, or ledger counts out of key order is refused, and a blob over its
   cap is refused before anything is charged. Strings keep a leading byte-order mark, and ledger
