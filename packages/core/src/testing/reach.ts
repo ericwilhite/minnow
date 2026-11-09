@@ -1723,3 +1723,14 @@ export const SIM_DISK_APPEND_REACH = [
   "honest flush",
   "lying flush",
 ] as const;
+
+/** Rolled-back staging cannot survive in a table retained by a held catalog checkpoint. */
+export const STAGING_DROP_RETIREMENT_REACH = [
+  "sim",
+  "memory",
+  "rollback",
+  "held build",
+  "dropped table retained",
+  "exact retained root",
+  "reopen",
+] as const;
