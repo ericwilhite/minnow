@@ -4659,8 +4659,8 @@ function encodeDelta(
   const builder = new RunBuilder();
   const pending = delta.forEachSorted(
     bound,
-    (arena, start, end, rowId, tombstone) => {
-      builder.addRange(arena, start, end, rowId, tombstone);
+    (arena, start, end, rowId, tombstone, hash, bloomHash) => {
+      builder.addRange(arena, start, end, rowId, tombstone, hash, bloomHash);
     },
     keep,
     check,

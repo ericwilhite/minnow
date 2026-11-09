@@ -108,7 +108,7 @@ it("pays the initial arrays before field constructors run", async () => {
   delta?.releaseCharge();
   expect(paid.bytes).toBe(0);
 });
-it.each([1, 6, 11])("refunds a constructor failure at initial array %i", async (at) => {
+it.each([1, 6, 11, 12])("refunds a constructor failure at initial array %i", async (at) => {
   reach.beginHistory();
   const paid = ledger(),
     stopped = new Error("initial native constructor failed");
@@ -309,7 +309,7 @@ for (const seed of seedsFor("next-write-delta-growth-accounting", [0xb3c3]))
                   paid.bytes,
                   "old and new retained arrays overlap at native constructor",
                 ).toBeGreaterThanOrEqual(base + actual);
-                if (++seen === Math.min(s.at, s.keys ? 4 : 5)) throw stopped;
+                if (++seen === s.at) throw stopped;
               },
             );
             expect(paid.bytes).toBe(base);
@@ -321,6 +321,7 @@ for (const seed of seedsFor("next-write-delta-growth-accounting", [0xb3c3]))
             reach.reach("retained growth overlap");
             reach.reach("constructor failure refund");
             if (!s.keys && s.at === 5) reach.reach("last entry array failure");
+            if (s.keys && s.at === 5) reach.reach("last key array failure");
           } finally {
             delta.releaseCharge();
           }
@@ -349,9 +350,9 @@ it.each([false, true])(
       await nativeAllocations(
         () => delta.add(key, 0, 1, 17, 1, false),
         (_kind, bytes) => {
-          // The first replacement group is four key arrays or five entry arrays. A later group
+          // The first replacement group is five key arrays or five entry arrays. A later group
           // may already have retired this group's old capacity, so it has its own witness above.
-          if (seen++ >= (keys ? 4 : 5)) return;
+          if (seen++ >= 5) return;
           made += bytes;
           expect(
             paid.bytes,
