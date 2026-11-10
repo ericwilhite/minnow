@@ -311,15 +311,16 @@ function lowerLiteral(expression: Extract<Expression, { kind: "literal" }>): Typ
       }
       case "date":
         return { expr: dateLiteral(parseDate(text)), nullable: false, big: false };
+      case "json":
+        // JSON_TABLE literals have already crossed the shipped front end's
+        // normalizer. It cannot supply their original number spelling to the raw JSON core.
+        throw unsupported("function", "front-end materialized JSON without source spelling");
       case "time":
       case "interval":
       case "uuid":
-      case "json":
       case "jsonb": {
         const type: PhysicalType =
-          domain.kind === "json" || domain.kind === "jsonb"
-            ? { kind: "json", binary: domain.kind === "jsonb" }
-            : { kind: domain.kind };
+          domain.kind === "jsonb" ? { kind: "json", binary: true } : { kind: domain.kind };
         return {
           expr: { op: "cast", input: textLiteral(text), type },
           nullable: false,
@@ -635,6 +636,15 @@ function lowerCall(
         "explicit",
         state.parameters,
       );
+    }
+    case "MINNOW_JSON_GET":
+    case "MINNOW_JSON_GET_TEXT": {
+      const typed = callFunction(
+        name === "MINNOW_JSON_GET" ? "json_get" : "json_get_text",
+        args.map((arg) => lowerExpression(arg, scope, state)),
+        state,
+      );
+      return { ...typed, nullable: true };
     }
     case "MINNOW_COLLATE": {
       const [operand, collation] = args;

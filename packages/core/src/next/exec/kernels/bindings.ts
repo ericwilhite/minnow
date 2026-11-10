@@ -20,7 +20,7 @@ import { UnsupportedPlanError } from "../errors.js";
 
 /** The call kernels compile.ts dispatches to. */
 export type CallKernel =
-  "arith" | "neg" | "coalesce" | "nullif" | "numericRound" | "dateTrunc" | "temporalSub";
+  "arith" | "neg" | "coalesce" | "nullif" | "numericRound" | "dateTrunc" | "temporalSub" | "json";
 
 export type Binding =
   | {
@@ -80,6 +80,18 @@ export const CASE_RESULT_KINDS: ReadonlySet<PhysicalKind> = new Set<PhysicalKind
 ]);
 
 export const FUNCTION_BINDINGS: Readonly<Record<string, Binding | PerOverload>> = {
+  json_get: per({
+    "json,text": { kernel: "json" },
+    "json,int4": { kernel: "json" },
+    "jsonb,text": refuse("JSONB canonical extraction"),
+    "jsonb,int4": refuse("JSONB canonical extraction"),
+  }),
+  json_get_text: per({
+    "json,text": { kernel: "json" },
+    "json,int4": { kernel: "json" },
+    "jsonb,text": refuse("JSONB canonical extraction"),
+    "jsonb,int4": refuse("JSONB canonical extraction"),
+  }),
   add: per({
     ...each(NUMERIC, 2, ARITH),
     "date,int4": DATETIME,
@@ -185,6 +197,7 @@ export const CAST_REFUSALS: ReadonlyMap<string, string> = new Map([
 /** Why the cast `from → to` is refused, or null when cast.ts implements it. */
 export function castRefusal(from: SqlType, to: SqlType): string | null {
   if (from === to) return null;
+  if ((from === "text" && to === "json") || (from === "json" && to === "text")) return null;
   if (to === "text")
     return from === "date" || from === "timestamp" || from === "timestamptz" || from === "interval"
       ? null

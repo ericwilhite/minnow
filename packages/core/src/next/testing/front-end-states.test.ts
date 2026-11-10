@@ -72,6 +72,8 @@ const SETUP = ["CREATE TABLE a (id integer, v integer)", "CREATE TABLE b (id int
  * refusal of SQL PostgreSQL runs (0A000).
  */
 const CASES: ReadonlyArray<readonly [sql: string, message: string, source?: "published"]> = [
+  ["SELECT '[]'::json -> 1.5", "-> array positions are integers"],
+  ["SELECT '{}'::json ->> true", "->> keys are member names or array positions"],
   ["SELECT * FROM missing", "SELECT * requires known columns for: "],
   ["SELECT z.* FROM a", "Unknown table for z.*: "],
   [

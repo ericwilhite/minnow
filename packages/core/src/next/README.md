@@ -34,6 +34,13 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `lower/`      | planner lowering                 | `Lowerer` (`lowerer.ts` contract, `create.ts`): front-end passes over the catalog, typing (`coerce.ts`, `expressions.ts`), queries (`query.ts`), FROM clauses, join order and subqueries (`from.ts`), access paths (`access-path.ts`), windows (`windows.ts`), plan building (`plan.ts`), DML and MERGE (`modify.ts`), DDL, table rules, result descriptors; an in-memory catalog; front-end inventory (`INVENTORY.md`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `owner/`      | ownership                        | Owner/client protocol (`protocol.ts`), wire payloads (re-exported from exec) and stream dictionaries (`frame.ts`), ledger routing (`outcomes.ts`), wire errors (`errors.ts`), client sequencing (`sequence.ts`), election, liveness and step-down (`election.ts`), public client API (`api.ts`), engine boundary and idle-transaction timer (`engine.ts`), planner port (`planner.ts`), the composed engine (`compose.ts`), the protocol server (`server.ts`) and client (`client.ts`), the owner worker runtime (`host.ts`), the port broker (`broker.ts`), the client-side election and lifecycle (`connector.ts`), Web Locks (`web-locks.ts`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
+JSON extraction (`->`, `->>`) uses typed scalar kernels in a resumable project/filter frame.
+A fixed workspace is prepaid from read bounds and literals before opening a producer. It keeps
+raw JSON bytes exact and decodes text without parsing numbers into JS numbers. Document
+parameters and expanding producers without an admitted bound, front-end materialized JSON
+without source spelling (JSON_TABLE JSON columns), JSONB extraction, construction
+and aggregation remain typed refusals; the latter need the new growth-admission API.
+
 ## Write-path measurements
 
 Build core with `npx tsc -b packages/core`. Before rebuilding a candidate, copy the parent's
@@ -1530,7 +1537,7 @@ one-class pass. Stored representative ordinals preserve the first left value's f
 sign, NUMERIC scale and INTERVAL fields across reverse spill-page traversal. Types with
 unsupported equality remain typed refusals: JSONB/arrays, locators, blank-padded CHAR and
 zero or more than 31 columns. Plain JSON is a PG 42883 type error. The frozen catalogue now
-executes 61/66 cells. The operator/tape budget proof excludes the shared scratch service's
+executes 62/66 cells. The operator/tape budget proof excludes the shared scratch service's
 currently uncharged extent-list metadata (B1 owns that follow-up). No public API,
 shipped-engine or stored-format change.
 
@@ -2574,7 +2581,7 @@ not require a home cache directory.
   intended extension (R24.2), checked against PostgreSQL's LEFT JOIN UNION ALL anti-join rewrite.
 - Windows, set operations, recursive CTEs and GENERATE_SERIES, UPDATE … FROM, DELETE … USING and
   MERGE lower too. Numeric ordered sets lower with constant/parameter scalar fractions.
-  Still refused (`UnsupportedPlanError`, stage "lower"): JSON aggregates, JSON / array / regex functions, batch UPDATE / DELETE (`batchWrite`), LATERAL the
+  Still refused (`UnsupportedPlanError`, stage "lower"): JSON aggregates, JSON constructors and paths, array / regex functions, batch UPDATE / DELETE (`batchWrite`), LATERAL the
   decorrelator cannot remove, full-text search. `INVENTORY.md` has every construct's status.
 - `testing/lowering-differential.test.ts` runs DDL, seed rows, queries (joins, subqueries,
   windows, set operations, recursion included), writes, RETURNING and failing writes through the

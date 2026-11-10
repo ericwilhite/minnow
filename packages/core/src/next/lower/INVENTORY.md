@@ -71,7 +71,8 @@ Status:
 | `CAST`                                                                                                          | `cast` to the target type (`declaredTypeName` for numeric targets, C5)                                                                                                                                                                                                 | M1                                                                                                              |
 | `MINNOW_COLLATE`                                                                                                | the collation of the enclosing `compare` / `inList` / `SortKey`                                                                                                                                                                                                        | M1                                                                                                              |
 | `MINNOW_TIMESTAMP_TEXT`, `MINNOW_TO_CHAR_LOCAL`                                                                 | dropped: `timestamp(zoned: false)` already renders without a zone                                                                                                                                                                                                      | M1                                                                                                              |
-| `MINNOW_JSON_GET(_TEXT)`, `MINNOW_ARRAY_*`, `MINNOW_REGEX_MATCH`, `ARRAY`                                       | `call` (`json_get`, `json_get_text`, `array_at`…, `regex_match`)                                                                                                                                                                                                       | L                                                                                                               |
+| `MINNOW_JSON_GET(_TEXT)`                                                                                        | `call` (`json_get`, `json_get_text`), typed JSON/text extraction; source-bounded project/filter execution                                                                                                                                                              | M1                                                                                                              |
+| `MINNOW_ARRAY_*`, `MINNOW_REGEX_MATCH`, `ARRAY`                                                                 | `call` (`array_at`…, `regex_match`)                                                                                                                                                                                                                                    | L                                                                                                               |
 | `MINNOW_TUPLE_KEY` (decorrelation)                                                                              | several `join` keys (one per tuple member, `nullSafe` per the decorrelator)                                                                                                                                                                                            | L                                                                                                               |
 | `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `LOCALTIME`                                                                | casts of the clock `param`                                                                                                                                                                                                                                             | M1                                                                                                              |
 | `NEXTVAL`, `CURRVAL` (sequence name resolved from the catalog)                                                  | `call` `nextval` / `currval` with the sequence id                                                                                                                                                                                                                      | M1                                                                                                              |
@@ -328,7 +329,6 @@ this unexported core; they do not describe the shipped engine's SQL support.
 | -------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | guide-7  | lower / function    | JSON_OBJECT and JSON_ARRAYAGG need heterogeneous typed construction and charged, spillable JSON accumulation.                                                                                     |
 | guide-8  | lower / function    | Whole-row json_agg needs record typing and bounded JSON accumulation; its expanded JSON_OBJECT is refused.                                                                                        |
-| guide-9  | lower / function    | The authorized explicit JSON cast resolves PG operator ambiguity; PG and shipped SQL return width text 30. JSON extraction still needs a typed R19 kernel; no native execution is credited.       |
 | guide-14 | lower / function    | Legacy DATE_ADD desugaring loses interval field provenance; calendar interval lowering and recursive execution are required. A user DATE_ADD call must not be mistaken for a PostgreSQL operator. |
 | guide-15 | execute / recursive | GENERATE_SERIES still needs bounded, cancellable work-table/fixpoint execution, plus interval arithmetic and EXTRACT.                                                                             |
 
@@ -373,7 +373,7 @@ slot, 128 per interval slot), reuse them and skip NULL/unselected garbage. Spars
 nonascending selections keep monotone output offsets. Differential tests construct PG input
 from independent ordinal date and interval fields and compare interval subtraction fields
 directly, rather than judging arithmetic through its text renderer. Guide-3 now executes
-unchanged against both PGlite and the shipped engine; the frozen catalogue is 61/66 executions.
+unchanged against both PGlite and the shipped engine. JSON extraction below brings the frozen catalogue to 62/66 executions.
 
 SQL TIMESTAMP literals now retain their original spelling in a parser-only weak side table,
 carried through plan cloning and structural identity. Lowering builds native microseconds from
@@ -405,3 +405,31 @@ behavior are unchanged. Generated SQL and resident/spilled real-scratch campaign
 multiplicities, NULLs and representative float/NUMERIC/INTERVAL output exactly with PGlite.
 The operator/tape resident-state proof excludes the shared scratch service's uncharged extent
 metadata; its storage-owner fix is tracked separately.
+
+## JSON extraction
+
+The private rebuild executes JSON `->` and `->>` with text keys and int4 array indexes,
+including negative indexes. int2 selectors widen to int4; boolean, NUMERIC and int8 selectors
+give PostgreSQL's 42883. Raw JSON keeps its original number spelling, duplicate keys and
+whitespace; text extraction decodes strings and maps JSON null to SQL NULL. Object lookups use
+the last matching key. Missing paths and mismatched container types return SQL NULL, as in PG.
+The guide-9 SQL and datasets are unchanged: it now executes against PGlite and the shipped
+engine, bringing this branch's frozen catalogue to 62/66 executions.
+
+Projection/filter extraction runs one borrowed row at a time with a prepaid input-sized
+workspace, checks the shared task clock, and retains its source until downstream readiness.
+Text-to-JSON validation preserves source bytes. Source provenance is followed through VALUES,
+views, CTEs and projections; document parameters, lazy init values and expanding scalar sources
+without a stable input envelope stay typed execution refusals. Non-NULL JSON materialized by
+the shipped front end (JSON_TABLE JSON columns) stays a
+typed lowering refusal because that normalizer discards decimal scale and original spelling.
+Use an explicit `'…'::JSON` literal for exact extraction. JSON expressions mixed with volatile
+evaluation also stay refused. JSONB extraction, JSON paths,
+JSON constructors and JSON aggregation remain refused. Construction and aggregation need the
+new admission API to charge growth and wait cancellably under transient pressure; they are
+separate work. No published engine behavior or stored format changes here.
+
+The R21 registry records the shipped engine's canonicalized number-text difference for literal
+JSON decimals with a zero fractional part. Generated checks require the native result to match
+PG's original JSON extraction and the shipped result to match an independent PG int4::text
+witness. Its matcher rejects unrelated wrong values; no tolerance or native-result waiver is used.

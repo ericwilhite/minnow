@@ -39,6 +39,7 @@ import {
   NumericOutOfRangeError,
   UnsupportedPlanError,
 } from "../errors.js";
+import { compileJson } from "./json.js";
 import { compileTemporalText } from "./temporal-text.js";
 import { castRefusal } from "./bindings.js";
 import { coefficientAt, scaleAt, specialAt, type DecimalData } from "./numeric.js";
@@ -600,6 +601,10 @@ export function compileCast(type: PhysicalType, input: Compiled, arena: OutputAr
     const refusal = castRefusal(source, target);
     if (refusal !== null) throw refuse(refusal);
   }
+  if (type.kind === "json" && !type.binary && from.kind === "text")
+    return compileJson(type, "validate_json", [input], arena);
+  if (type.kind === "text" && type.maxLength === undefined && from.kind === "json" && !from.binary)
+    return new Retype(type, input);
   if (
     type.kind === "text" &&
     (from.kind === "date" || from.kind === "timestamp" || from.kind === "interval")

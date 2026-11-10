@@ -21,6 +21,7 @@
  */
 import type { ColumnDef, IndexDef } from "../access/catalog.js";
 import type { Rel, ScalarExpr } from "../ir/ir.js";
+import { jsonExpression } from "../ir/json-expression.js";
 import type { StatValue } from "../types.js";
 import type { Typed } from "./coerce.js";
 import { integerLiteralValue } from "./literals.js";
@@ -303,18 +304,22 @@ export function accessPath(
       rows: Math.max(1, tableRows * best.fraction),
     };
 
-  // 3. A scan, the conjuncts its filter.
+  // 3. Synchronous scan predicates cannot own resumable JSON workspaces. Keep the full
+  // conjunction in one filter frame, preserving its short-circuit order and IR profiles.
+  const predicate = andOf(conjuncts);
+  const deferred = predicate !== null && jsonExpression(predicate);
+  const scan: Rel = {
+    op: "scan",
+    id: builder.id(),
+    tableId: table.id,
+    columns: [...read.columns],
+    filter: deferred ? null : predicate,
+    runtimeFilters: [],
+    emitLocator: locator,
+    output,
+  };
   return {
-    rel: {
-      op: "scan",
-      id: builder.id(),
-      tableId: table.id,
-      columns: [...read.columns],
-      filter: andOf(conjuncts),
-      runtimeFilters: [],
-      emitLocator: locator,
-      output,
-    },
+    rel: deferred ? { op: "filter", id: builder.id(), input: scan, predicate, output } : scan,
     pointRead: false,
     rows: Math.max(1, tableRows * selectivityOf(conjuncts)),
   };

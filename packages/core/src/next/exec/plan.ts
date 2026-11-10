@@ -6,6 +6,9 @@ import { ResultSink } from "./result-sink.js";
 import { ExceptOperator, exceptKeyLayout, exceptMinimumBytes } from "./except.js";
 import { readValue, boundSource, type ReadSource, type ReadBound } from "../page/read-bounds.js";
 import { batchTargetFor, type Grant } from "../memory/governor.js";
+import { jsonLiteralBytes, jsonInputsBounded } from "./json-plan.js";
+import { JsonExpressions } from "./json-expressions.js";
+import { jsonExpression } from "../ir/json-expression.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import { samePhysicalType, type PhysicalType } from "../types.js";
 import { BATCH_ROWS, type Batch, type Selection, type Vector } from "../vector/vector.js";
@@ -460,6 +463,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   };
   findIds(plan.root);
   const readSources = new Map<number, ReadSource>();
+  const jsonWorkspaces = new Map<number, number>();
+  const jsonWidths = new WeakMap<QueryRuntime, number>();
+
   const lateSortIds = new Set<number>();
   const ids = new Set<number>();
   // A terminal names-only projection forwards export ownership while retaining profile counts.
@@ -646,6 +652,75 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       case "limit": {
         const child = prepare(rel.input),
           input = types(rel.input);
+        if (
+          rel.op !== "limit" &&
+          (rel.op === "project" ? rel.exprs.some(jsonExpression) : jsonExpression(rel.predicate))
+        ) {
+          if (plan.volatile)
+            throw new UnsupportedPlanError("JSON expressions mixed with volatile evaluation", {
+              construct: "function",
+            });
+          const exprs = rel.op === "project" ? rel.exprs : rel.predicate;
+          if (
+            rel.op === "project"
+              ? rel.exprs.some((expr) => !jsonInputsBounded(expr, rel.input))
+              : !jsonInputsBounded(exprs as ScalarExpr, rel.input)
+          )
+            throw new UnsupportedPlanError("JSON document without a bounded source envelope", {
+              construct: "function",
+            });
+          let slots = 0;
+          const minimum = measureCompilerBuffers(
+            compilation,
+            input,
+            BATCH_ROWS,
+            (context) => {
+              const operator = new JsonExpressions(exprs, context, { bytes: 0 }, DISCARD);
+              slots = operator.workspaceCount;
+              return operator;
+            },
+            (operator) => operator.abort(undefined),
+          );
+          fixed(rel, Math.max(4096, minimum));
+          jsonWorkspaces.set(rel.id, slots);
+          return (runtime, downstream, stops, rowsNeeded) =>
+            instantiate(
+              runtime,
+              rel,
+              input,
+              minimum + slots * (jsonWidths.get(runtime) ?? 1),
+              BATCH_ROWS,
+              (context) =>
+                new JsonExpressions(
+                  exprs,
+                  context,
+                  {
+                    bytes: jsonWidths.get(runtime) ?? 1,
+                    signal: runtime.signal,
+                    stopped: () => stops.some((stop) => stop()),
+                  },
+                  counted(runtime, rel, downstream),
+                ),
+              (operator) => {
+                runtime.onAbort((reason) => operator.abort(reason));
+                runtime.dispose(() => operator.closed);
+                return (async () => {
+                  try {
+                    await child(
+                      runtime,
+                      operator,
+                      stops,
+                      rel.op === "filter" ? undefined : rowsNeeded,
+                    );
+                  } catch (error) {
+                    operator.abort(error);
+                    await operator.closed.catch(() => undefined);
+                    throw error;
+                  }
+                })();
+              },
+            );
+        }
         const setup = (context: CompileContext, sink: Operator) =>
           rel.op === "filter"
             ? new FilterOperator(rel.predicate, context, sink)
@@ -1340,6 +1415,10 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           );
   }
   const recipe = prepare(plan.root);
+  const hasJson = jsonWorkspaces.size !== 0;
+  const jsonConstants = hasJson ? jsonLiteralBytes(plan) : 0;
+  // One document may feed several output columns in the same copied result row.
+  const jsonProgressColumns = Math.max(1, plan.columns.length);
   // Keep this SQL strategy diagnostic until its
   // cursor/fetch steps participate in the execution minimum and pass first-page acceptance.
   // Explicit indexRange and SQL both require the diagnostic opt-in above.
@@ -1446,7 +1525,15 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     findDemand(plan.root, null);
     const sources = [...readSources.values()].filter((source) => active.has(source.id));
     const execute = () => then(runtime.reserve(entries), () => recipe(runtime, sink, []));
-    if (sources.length === 0) return execute();
+    if (sources.length === 0) {
+      if (!hasJson) return execute();
+      const width = jsonConstants + 1;
+      // Literal documents also bound result copies; no storage read contributes that size.
+      runtime.readMinimum(0, 4 * jsonConstants * jsonProgressColumns);
+      jsonWidths.set(runtime, width);
+      for (const entry of entries) entry.minimum += (jsonWorkspaces.get(entry.rel.id) ?? 0) * width;
+      return execute();
+    }
     const bounds = new Map<number, ReadBound>();
     const sizeSources = function* (): SlicedJob<void> {
       const fixedMinimums = entries.map((entry) => entry.minimum);
@@ -1473,10 +1560,18 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           io = Math.max(io, bound.io);
           progress = Math.max(progress, bound.progress);
         }
+        const jsonWidth = Math.max(jsonConstants, progress) + 1;
+        if (hasJson) jsonWidths.set(runtime, jsonWidth);
         for (const [index, entry] of entries.entries())
-          entry.minimum = (fixedMinimums[index] ?? 0) + (bounds.get(entry.rel.id)?.bytes ?? 0);
+          entry.minimum =
+            (fixedMinimums[index] ?? 0) +
+            (bounds.get(entry.rel.id)?.bytes ?? 0) +
+            (hasJson ? (jsonWorkspaces.get(entry.rel.id) ?? 0) * jsonWidth : 0);
         runtime.sourceBounds(bounds);
-        runtime.readMinimum(io, progress);
+        runtime.readMinimum(
+          io,
+          hasJson ? Math.max(progress, 4 * jsonConstants) * jsonProgressColumns : progress,
+        );
         if (
           windows &&
           runtime.minimumBytes(entries) > runtime.request.governor.capBytes &&

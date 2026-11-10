@@ -68,7 +68,7 @@ function sample(type: PhysicalType): FlatVector {
     case "text":
     case "bytes":
     case "json":
-      return texts(["a", "b"], type);
+      return texts(type.kind === "json" ? ["{}", "null"] : ["a", "b"], type);
     case "enum":
       return texts(["x", "y"], type);
     default: {
@@ -169,7 +169,8 @@ describe("kernel bindings onto ir/functions.ts (R19)", () => {
       ).map((to) => [`${from} → ${to}`, from, to] as const),
     ),
   )("cast %s: a kernel that evaluates, or a refusal", (_name, from, to) => {
-    const input = sample(physicalTypeOfSql(from));
+    const input =
+      from === "text" && to === "json" ? texts(["{}", "null"]) : sample(physicalTypeOfSql(from));
     const run = () => {
       const compiled = compileFor(
         { op: "cast", input: col(0, input.type), type: physicalTypeOfSql(to) },

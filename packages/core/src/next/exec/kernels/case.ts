@@ -93,6 +93,7 @@ class Assembler {
   readonly #validity: Uint32Array;
   readonly #owner: Uint16Array;
   #bytes: Uint8Array = new Uint8Array(0);
+  readonly #borrowVarlen: boolean;
   readonly #offsets: Int32Array | null = null;
   readonly #scales: Uint16Array | null = null;
   readonly #safe: Float64Array | null = null;
@@ -105,6 +106,7 @@ class Assembler {
   ) {
     this.#arena = arena;
     this.#layout = layoutOf(type);
+    this.#borrowVarlen = arena.borrowVarlen;
     const capacity = arena.capacity;
     this.#validity = arena.validity();
     arena.take(2 * capacity);
@@ -122,7 +124,18 @@ class Assembler {
   }
 
   /** The output over `parts`; `missing` rows (a CASE without ELSE, an all-null COALESCE) are null. */
-  assemble(length: number, parts: readonly Part[], missing: Selection | null): FlatVector {
+  assemble(length: number, parts: readonly Part[], missing: Selection | null): Vector {
+    // In a borrowed expression frame, a sole branch already has every computed value.
+    // Other slots are unspecified by Compiled; no bytes need copying or growing.
+    const part = parts[0];
+    if (
+      this.#borrowVarlen &&
+      this.#layout === "varlen" &&
+      parts.length === 1 &&
+      part !== undefined &&
+      (missing === null || missing.count === 0)
+    )
+      return { ...part.vector, type: this.type, length };
     const validity = this.#validityOf(parts, missing);
     switch (this.#layout) {
       case "varlen":

@@ -18,8 +18,10 @@ stored formats are unchanged; no migration is needed.
 
 The SELECT guide and internal analytics catalogue's guide-9 JSON example now cast the document to `JSON`,
 resolving PostgreSQL's ambiguous untyped extraction operator (`42725`). Its data and path are
-unchanged. PostgreSQL and the current engine return the same text result; the rebuild still
-explicitly refuses JSON extraction pending typed kernels. Runtime behavior, public API and
+unchanged. PostgreSQL, the current engine and the private rebuild return the same text result.
+The rebuild now has charged, cancellable JSON extraction kernels that preserve raw number text,
+duplicate keys and whitespace. JSON construction and aggregation remain refused pending growth
+admission. Published runtime behavior, public API and
 stored formats are unchanged; no migration is needed.
 
 Affected packages: `@minnowdb/core` (SQL feature metadata and compatibility documentation) and

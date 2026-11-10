@@ -82,6 +82,11 @@ export class PlanningError extends Error {
  * with two faults may report the other one PostgreSQL would report first.
  */
 export const FRONT_END_STATES: ReadonlyArray<readonly [RegExp, string]> = [
+  // X is the message snapshot's interpolation marker; runtime diagnostics name the operator.
+  [
+    /^(?:->>?|X) (array positions are integers|keys are member names or array positions)$/u,
+    "42883",
+  ],
   [/^SELECT \* requires known columns for: /u, "42P01"],
   [/^Unknown table alias: /u, "42P01"],
   [/^Unknown table for \S+: /u, "42P01"],

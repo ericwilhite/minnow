@@ -26866,8 +26866,7 @@
       "id": "guide-9",
       "dataset": "retail",
       "sql": "SELECT '{\"sku\": \"A-1\", \"dims\": {\"w\": 30, \"h\": 40}}'::json -> 'dims' ->> 'w' AS width",
-      "lowered": false,
-      "construct": "function"
+      "lowered": true
     },
     {
       "id": "guide-10",

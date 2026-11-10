@@ -59,6 +59,8 @@ export class OutputArena {
   constructor(
     readonly charge: ByteCharge,
     readonly capacity: number,
+    /** The caller retains borrowed branch values until downstream readiness. */
+    readonly borrowVarlen = false,
   ) {}
 
   /** Charges `bytes` or throws a `RangeError` (compile-time minimums are admitted first). */

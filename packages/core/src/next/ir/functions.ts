@@ -75,6 +75,18 @@ const same = (types: readonly SqlType[], arity: number): Overload[] =>
 /** `fn` → overloads. Names are PostgreSQL's function names, or the operator's name below. */
 export const FUNCTIONS: Readonly<Record<string, readonly Overload[]>> = {
   // Operators: `+ - * / %`, unary `-`, and `||`.
+  json_get: [
+    { args: ["json", "text"], result: "json" },
+    { args: ["json", "int4"], result: "json" },
+    { args: ["jsonb", "text"], result: "jsonb" },
+    { args: ["jsonb", "int4"], result: "jsonb" },
+  ],
+  json_get_text: [
+    { args: ["json", "text"], result: "text" },
+    { args: ["json", "int4"], result: "text" },
+    { args: ["jsonb", "text"], result: "text" },
+    { args: ["jsonb", "int4"], result: "text" },
+  ],
   add: [
     ...same(numericTypes, 2),
     { args: ["date", "int4"], result: "date" },
