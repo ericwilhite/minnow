@@ -2501,3 +2501,17 @@ export const WRITE_ROW_PLAN_REACH = [
   "NOT NULL refusal",
   "secondary null omission",
 ] as const;
+
+/** The owner prepays one bounded row-plan record through admission, settlement and close. */
+export const WRITE_ROW_PLAN_ACCOUNTING_REACH = [
+  "range",
+  "selected",
+  "single chunk",
+  "multiple chunks",
+  "success",
+  "error",
+  "cancel",
+  "sync error",
+  "paid after settlement",
+  "released on close",
+] as const;

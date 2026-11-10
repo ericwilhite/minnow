@@ -102,7 +102,7 @@ import {
 import { Replayer, type Effect } from "../format/replay.js";
 import { walkReachable } from "../format/reachable.js";
 import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
-import type { Grant, Loan } from "../memory/governor.js";
+import { OBJECT_OVERHEAD_BYTES, type Grant, type Loan } from "../memory/governor.js";
 import { WriteCredits } from "./credits.js";
 import { writeStepMinimum, type WriteStepMinimum } from "./minimum.js";
 import { MetadataBudget } from "./budget.js";
@@ -178,7 +178,7 @@ import {
   type PublishedRows,
 } from "./transaction.js";
 import { SnapshotImpl } from "./view.js";
-import { need } from "./bytes.js";
+import { charged, need } from "./bytes.js";
 
 /**
  * Log bytes past which the write path recycles the log (access/write-path.ts "Log recycling"):
@@ -638,6 +638,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#session = input.session;
     this.#space = input.space;
     this.#grant = grant;
+    // One insertion plan can survive admission at a time (EngineHooks.keys' single-writer
+    // contract). Prepay its record in the owner account, rather than add Promise cleanup to
+    // every chunk. This is allocated scratch, not just held admission headroom.
+    charged(grant, OBJECT_OVERHEAD_BYTES);
     this.#arenaPool = new ArenaPool(
       grant,
       Math.min(8 * 1024 * 1024, Math.floor(input.governor.capBytes / 32)),
@@ -2579,6 +2583,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#sequenceBody.close();
       this.#commitBuffers.close();
       this.#arenaPool.close();
+      this.#grant.free(OBJECT_OVERHEAD_BYTES);
       this.#grant.close();
       this.#credits.close();
     }

@@ -2016,3 +2016,9 @@ The write row-plan generator compares inserted values and index visibility acros
 sparse selections, nullable and encoded vectors, partial memtables, and admission boundaries.
 It checks returned row selections, producer-buffer reuse, NOT NULL refusal and reopen. Its work
 check ensures contiguous input reaches the existing copier without a materialized row selection.
+
+The row-plan accounting generator holds admission open and observes the live owner account.
+The owner allocates one fixed 64-byte allowance for the single active plan, retained through
+success, failure and cancellation and released on close. The plan borrows its row selection
+without another copy. The check covers one and several admission chunks and proves the allowance
+is allocated during the wait, rather than inferring it from a zero balance after close.
