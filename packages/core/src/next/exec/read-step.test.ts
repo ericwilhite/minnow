@@ -2,7 +2,7 @@
 import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
-import { createReach } from "../../testing/reach.js";
+import { createReach, EXACT_STEP_REACH, EXACT_FAST_REACH } from "../../testing/reach.js";
 import { ReadDeniedError, type SpaceReader } from "../access/space.js";
 import { Governor } from "../memory/governor.js";
 import { reclaimingReader } from "./reclaim-reader.js";
@@ -119,78 +119,86 @@ it.each(seedsFor("next-bounded-read-steps", [0xc411, 0xc412]))(
 it.each(seedsFor("next-read-step-cancellation", [0xc413, 0xc414]))(
   "cancels queued reads immediately and drains the private lane before reuse (seed %i)",
   async (seed) => {
-    const reach = createReach("read step cancellation", [
-      "active",
-      "queued",
-      "cancelled",
-      "drained",
-    ]);
+    const reach = createReach("read step cancellation", EXACT_STEP_REACH);
     await fc.assert(
-      fc.asyncProperty(fc.integer({ min: 2, max: 5 }), async (count) => {
-        reach.beginHistory();
-        const gov = new Governor(1 << 20),
-          execution = await WorkingSet.admit(gov, [65536, 65536]),
-          [io, state] = execution.parts;
-        if (!io || !state) throw new Error("missing minimum");
-        const controller = new AbortController(),
-          step = new ReadStep(io, controller.signal);
-        let release!: () => void,
-          entered!: () => void,
-          calls = 0;
-        const gate = new Promise<void>((resolve) => {
-          release = resolve;
-        });
-        const started = new Promise<void>((resolve) => {
-          entered = resolve;
-        });
-        const pages: SpaceReader = {
-          peek: () => null,
-          async read(_refs, options) {
-            calls++;
-            expect(options.budget.allocate(65536)).toBe(true);
-            entered();
-            await gate;
-            let closed = false;
-            return {
-              bytes: [new Uint8Array(65536)],
-              release() {
-                if (!closed) {
-                  closed = true;
-                  options.budget.free(65536);
-                }
-              },
-            };
-          },
-        };
-        const pending = Array.from({ length: count }, () =>
-          step.reader(pages).read([], { budget: state }),
-        );
-        void Promise.allSettled(pending);
-        try {
-          await started;
-          expect(calls).toBe(1);
-          reach.reach("active");
-          reach.reach("queued");
-          const reason = new Error("cancel bounded read");
-          controller.abort(reason);
-          for (const read of pending) await expect(read).rejects.toBe(reason);
-          expect(io.allocated).toBe(65536);
-          expect(step.busy).toBe(true);
-          reach.reach("cancelled");
-          release();
-          await step.closed;
-          expect(calls).toBe(1);
-          expect(io.allocated).toBe(0);
-          expect(state.allocated).toBe(0);
-          reach.reach("drained");
-        } finally {
-          release();
-          await step.closed;
-          execution.close();
-        }
-        expect(gov.usedBytes).toBe(0);
-      }),
-      { seed, numRuns: 12 },
+      fc.asyncProperty(
+        fc.integer({ min: 2, max: 5 }),
+        fc.boolean(),
+        async (count, nonRetaining) => {
+          reach.beginHistory();
+          reach.reach(nonRetaining ? "private" : "default");
+          const gov = new Governor(1 << 20),
+            execution = await WorkingSet.admit(gov, [65536, 65536]),
+            [io, state] = execution.parts;
+          if (!io || !state) throw new Error("missing minimum");
+          const controller = new AbortController(),
+            step = new ReadStep(io, controller.signal);
+          let release!: () => void,
+            entered!: () => void,
+            calls = 0;
+          const gate = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          const started = new Promise<void>((resolve) => {
+            entered = resolve;
+          });
+          const pages: SpaceReader = {
+            peek: () => null,
+            async read(_refs, options) {
+              calls++;
+              expect(options.retain).toBe(nonRetaining ? false : undefined);
+              expect(options.budget.allocate(65536)).toBe(true);
+              entered();
+              await gate;
+              let closed = false;
+              return {
+                bytes: [new Uint8Array(65536)],
+                release() {
+                  if (!closed) {
+                    closed = true;
+                    options.budget.free(65536);
+                  }
+                },
+              };
+            },
+          };
+          const pending = Array.from({ length: count }, () =>
+            step.reader(pages, nonRetaining).read([], { budget: state }),
+          );
+          void Promise.allSettled(pending);
+          try {
+            await started;
+            expect(calls).toBe(1);
+            reach.reach("active");
+            reach.reach("queued");
+            const reason = new Error("cancel bounded read");
+            controller.abort(reason);
+            for (const read of pending) await expect(read).rejects.toBe(reason);
+            expect(io.allocated).toBe(65536);
+            expect(step.busy).toBe(true);
+            reach.reach("cancelled");
+            release();
+            await step.closed;
+            expect(calls).toBe(1);
+            expect(io.allocated).toBe(0);
+            expect(state.allocated).toBe(0);
+            reach.reach("drained");
+          } finally {
+            release();
+            await step.closed;
+            execution.close();
+          }
+          expect(gov.usedBytes).toBe(0);
+        },
+      ),
+      {
+        seed,
+        numRuns: 12,
+        examples: [
+          [2, false],
+          [2, true],
+        ],
+      },
     );
     reach.assertReached();
   },
@@ -465,6 +473,81 @@ it.each(seedsFor("next-read-step-partial-room", [0xc437, 0xc438]))(
         },
       ),
       { seed, numRuns: 12 },
+    );
+    reach.assertReached();
+  },
+);
+
+it.each(seedsFor("next-export-private-window-fallback", [0xb305, 0xb306]))(
+  "keeps the existing one-pass geometry and makes only export fallback private (seed %i)",
+  async (seed) => {
+    const reach = createReach("private window fallback", EXACT_FAST_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.boolean(),
+        fc.boolean(),
+        fc.boolean(),
+        async (privateRead, once, fallback) => {
+          reach.beginHistory();
+          const gov = new Governor(1 << 20),
+            execution = await WorkingSet.admit(gov, [65536, 65536]),
+            [io, state] = execution.parts;
+          if (!io || !state) throw Error("missing read accounts");
+          const step = new ReadStep(io, new AbortController().signal);
+          let calls = 0;
+          const pages: SpaceReader = {
+            peek: () => null,
+            async read(_refs, options) {
+              calls++;
+              expect(options.retain).toBe(privateRead && (!once || calls > 1) ? false : undefined);
+              if (once && fallback && calls === 1) throw new ReadDeniedError(65536);
+              expect(options.once).toBe(once && calls === 1);
+              expect(options.budget.allocate(32)).toBe(true);
+              let live = true;
+              return {
+                bytes: [new Uint8Array(32)],
+                release() {
+                  if (live) {
+                    live = false;
+                    options.budget.free(32);
+                  }
+                },
+              };
+            },
+          };
+          try {
+            const lease = await step.reader(pages, privateRead).read([], { budget: state, once });
+            try {
+              expect(calls).toBe(once && fallback ? 2 : 1);
+              expect(state.allocated).toBe(32);
+              expect(io.allocated).toBe(0);
+              reach.reach(
+                `${privateRead ? "private" : "ordinary"} ${once ? (fallback ? "fallback" : "window") : "exact"}`,
+              );
+            } finally {
+              lease.release();
+            }
+            expect(state.allocated).toBe(0);
+            reach.reach("released");
+          } finally {
+            await step.closed;
+            execution.close();
+          }
+          expect(gov.usedBytes).toBe(0);
+        },
+      ),
+      {
+        seed,
+        numRuns: 16,
+        examples: [
+          [true, true, false],
+          [true, true, true],
+          [true, false, false],
+          [false, true, false],
+          [false, true, true],
+          [false, false, false],
+        ],
+      },
     );
     reach.assertReached();
   },

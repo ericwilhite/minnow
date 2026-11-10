@@ -41,7 +41,7 @@ export async function exportTrace(page: Page) {
     events.push(...(value as unknown as TraceEvent[])),
   );
   await session.send("Tracing.start", {
-    categories: "devtools.timeline,disabled-by-default-v8.gc,blink.user_timing",
+    categories: "toplevel,v8,devtools.timeline,disabled-by-default-v8.gc,blink.user_timing",
     options: "record-until-full",
   });
   return async () => {
@@ -81,4 +81,45 @@ export async function exportTrace(page: Page) {
     }
     return { gcMs: gcUs / 1000, gcCount, traceMs: (end.ts - start.ts) / 1000, events };
   };
+}
+
+/** /proc process counters include all threads, including threads that have already exited. */
+export interface CpuSnapshot {
+  readonly at: number;
+  readonly processes: Array<{ pid: number; kind: string; seconds: number; rss: number }>;
+  readonly threads: Array<{ pid: number; tid: string; name: string; seconds: number }>;
+}
+/** Diagnostics only. Process table is restricted to this runner's Chrome descendants. */
+export function allThreadCpu(
+  processes: ReadonlyMap<number, { kind: string; rss: number }>,
+  tasks: (pid: number) => readonly string[],
+  ticks: number,
+): CpuSnapshot {
+  const result: CpuSnapshot = { at: Date.now(), processes: [], threads: [] };
+  const cpu = (path: string) => {
+    const stat = readFileSync(path, "utf8");
+    const f = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return (Number(f[11]) + Number(f[12])) / ticks;
+  };
+  for (const [pid, process] of processes) {
+    try {
+      result.processes.push({ pid, ...process, seconds: cpu(`/proc/${String(pid)}/stat`) });
+      if (process.kind !== "renderer") continue;
+      for (const tid of tasks(pid)) {
+        try {
+          result.threads.push({
+            pid,
+            tid,
+            name: readFileSync(`/proc/${String(pid)}/task/${tid}/comm`, "utf8").trim(),
+            seconds: cpu(`/proc/${String(pid)}/task/${tid}/stat`),
+          });
+        } catch {
+          /* A helper thread ended. Its CPU remains in the process counter. */
+        }
+      }
+    } catch {
+      /* This owned process ended between samples. */
+    }
+  }
+  return result;
 }

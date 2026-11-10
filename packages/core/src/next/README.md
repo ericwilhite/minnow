@@ -2998,3 +2998,53 @@ The B7 generated campaigns run joins and windows through real writes, storage an
 against PostgreSQL and the shipped engine. These complement B6's broader lowering/reference
 campaigns; lowering support does not imply every emitted operation has an executor binding.
 The frozen catalogue records typed executor refusals separately from matching executions.
+
+The OPFS export bench opens its read-only extent space with a real 8 MiB startup grant
+from the same governor as its caches. Root/workspace ownership transfers before startup
+closes; this is setup outside measured export time and does not raise the query cap.
+
+Terminal full-table `exportStream()` execution uses exact non-retaining reads during
+admission sizing and exact read-step fallbacks (`ReadOptions.retain: false`). Successful
+one-pass window reads keep their existing private coalesced slabs. Cache hits are still
+served and kept in place; misses are verified private copies from the fixed read slab,
+charged exactly to the lease, without slab-gap or pool-rounding growth. They are released
+through the usual lease lifecycle, including cancellation/error cleanup. Shared-clock pacing
+continues between synchronous storage continuations. Ordinary queries, filtered scans and
+other consumers keep their existing cache admission. The policy survives a disabled optional
+coalesced window; it does not skip the gzip/large-value sizing proof or raise the cap.
+
+`npx vite-node scripts/read-retention-bench.mts --compare=REV` runs five interleaved frozen-parent/
+candidate component rounds, checks physical frame bytes (including masks, padding and dictionary
+deltas), and guards warm repeated reads plus real persisted SQL scans and point selections.
+The current executor refuses the `keyLookup` operator; SQL point selection uses `id + 0` to
+exercise the supported scan path. The separate storage point-read guard is a direct single-blob
+cache hit. This benchmark does not claim indexed SQL point-lookup performance.
+
+`MINNOW_EXPORT_RETENTION_REFERENCE=REV` freezes the entire core at that Git revision on its
+ordinary module IDs for a control whole-owner campaign. It is bench-only; ordinary invocations
+use current code. Interleave five control/candidate campaigns, each with five exports in its own
+persistent renderer/owner, to avoid one policy's shared cache contaminating the other's starting
+state. Keep each campaign's post-setup RSS baseline fixed. `MINNOW_EXPORT_ALL_THREAD_CPU=1`
+adds process/thread counters and GC tracing; `MINNOW_EXPORT_DIAGNOSTIC_DIR` retains raw traces
+and nominal 100-ms RSS timelines. Process CPU includes GC/helper/receiver threads; worker-only
+CDP self samples are not an all-thread CPU partition. Actual sample gaps can exceed the nominal
+interval under load. `MINNOW_EXPORT_CPU_DIR` keeps raw worker profiles.
+
+`MINNOW_EXPORT_WIRE_HASH=1` is a separate **correctness-only** full-export check: the receiver
+chains SHA-256 over frame metadata and all native bytes before relinquishing each frame. Its
+extra scratch copies/crypto work invalidate performance timing, so never use those runs as
+throughput or RSS acceptance. All automatic benchmark scratch uses `os.tmpdir()`.
+
+The retention follow-up uses the real `exportStream()` path in five interleaved campaign pairs,
+with five exports per persistent process and a fixed post-setup baseline in each campaign.
+The copied-group profile fixture is not Gate A acceptance. Non-retaining admission/fallback
+reads remove the roughly 305 MiB retained page cache: median campaign peak RSS growth falls
+from 705 to 231 MiB, beyond the measured spread. Whole-export throughput and all-thread CPU
+show no regression beyond spread; two of the first 25 candidate passes still exceed +256 MiB.
+A second five-pair comparison of 32 MiB export windows has no RSS improvement beyond spread
+and still exceeds the bound in two passes, so the production source window stays at 64 MiB.
+The rejected patch and complete records are in `scripts/browser-perf/experiments/`
+(`window32-rejected.patch`, `export-retention-result.json`). The final retained implementation's
+five full-width physical frame hashes equal the frozen parent. Post-campaign forced GC remains
+a diagnostic outside timing and sampled peaks; it is never used between the five passes.
+The memory gate and quiet-host throughput target remain outstanding.

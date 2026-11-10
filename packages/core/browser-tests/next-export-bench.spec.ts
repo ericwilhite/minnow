@@ -65,7 +65,7 @@ import {
 // eslint-disable-next-line no-restricted-imports -- Node-only Playwright bench (cache control, /proc); never shipped.
 import { join } from "node:path";
 import { expect, type CDPSession, type Page } from "@playwright/test";
-import { exportTrace, hostSample } from "./export-diagnostics.js";
+import { allThreadCpu, type CpuSnapshot, exportTrace, hostSample } from "./export-diagnostics.js";
 import { requireWorkerOpfs, test } from "./fixtures.js";
 
 type Run = typeof import("../browser/next-export-run.js");
@@ -80,6 +80,9 @@ const WARM_SHARE = 0.98;
  * at new addresses (distinct file bytes, the same encoded content), so a 1M-row table builds in
  * minutes on a loaded host.
  */
+const WIRE_HASH = process.env.MINNOW_EXPORT_WIRE_HASH === "1";
+const ALL_THREAD = process.env.MINNOW_EXPORT_ALL_THREAD_CPU === "1";
+const DIAGNOSTIC_DIR = process.env.MINNOW_EXPORT_DIAGNOSTIC_DIR;
 const GATE_A = process.env.MINNOW_EXPORT_GATE_A === "1";
 const DISTINCT = Number(process.env.MINNOW_EXPORT_DISTINCT ?? 4);
 /** MINNOW_EXPORT_FOCUS=1: only Gate A's configuration (cold ×5, warm ×5, a profiled pass). */
@@ -230,6 +233,14 @@ const rendererRss = (profile: string): number =>
     .filter((process) => process.kind === "renderer")
     .reduce((sum, process) => sum + process.rss, 0);
 
+function cpuSnapshot(profile: string): CpuSnapshot {
+  return allThreadCpu(
+    chromeProcesses(profile),
+    (pid) => readdirSync(`/proc/${String(pid)}/task`),
+    CLOCK_TICKS,
+  );
+}
+
 interface CpuProfile {
   readonly nodes: ReadonlyArray<{
     readonly id: number;
@@ -251,6 +262,8 @@ async function workers(page: Page, profileDirectory: string) {
   const profiles: CpuProfile[] = [];
   const profileCpuSeconds: number[] = [];
   const starts = new Map<string, Map<string, number>>();
+  const allStarts = new Map<string, CpuSnapshot>();
+  const allPasses: Array<{ before: CpuSnapshot; after: CpuSnapshot }> = [];
   let next = 1;
   let external = 0;
   const send = (sessionId: string, method: string, params: object = {}): Promise<unknown> => {
@@ -295,9 +308,14 @@ async function workers(page: Page, profileDirectory: string) {
       result?: unknown;
       params?: { profile?: CpuProfile };
     };
-    if (message.method === "Profiler.consoleProfileStarted")
+    if (message.method === "Profiler.consoleProfileStarted") {
       starts.set(event.sessionId, workerThreadCpu(profileDirectory));
+      if (ALL_THREAD) allStarts.set(event.sessionId, cpuSnapshot(profileDirectory));
+    }
     if (message.method === "Profiler.consoleProfileFinished" && message.params?.profile) {
+      const allBefore = allStarts.get(event.sessionId);
+      if (allBefore) allPasses.push({ before: allBefore, after: cpuSnapshot(profileDirectory) });
+      allStarts.delete(event.sessionId);
       profiles.push(message.params.profile);
       const before = starts.get(event.sessionId);
       let used = 0;
@@ -324,6 +342,7 @@ async function workers(page: Page, profileDirectory: string) {
     ok,
     profiles,
     profileCpuSeconds,
+    allPasses,
     /** Diagnostic only, after delivery. Snapshot collection runs GC and is never a peak sample. */
     async snapshotPage(path: string) {
       const before = await cdp.send("Runtime.getHeapUsage");
@@ -538,7 +557,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       const share = residentBefore / onDisk;
       const established = !warm || share >= WARM_SHARE;
       const hostBefore = VARIANCE || SCAN_COMPARE ? hostSample() : undefined;
-      const stopTrace = VARIANCE ? await exportTrace(page) : undefined;
+      const stopTrace = VARIANCE || ALL_THREAD ? await exportTrace(page) : undefined;
       const rssBefore = rendererRss(profile);
       const samples: unknown[] = [];
       let ticks = 0;
@@ -552,13 +571,14 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       const sampler = (async () => {
         while (sampling.on) {
           const rss = rendererRss(profile);
+          if (ALL_THREAD) samples.push({ at: Date.now(), rss, cpu: cpuSnapshot(profile) });
           rssPeak = Math.max(rssPeak, rss);
           if (VARIANCE && ++ticks % 5 === 0)
             samples.push({ rss, resident: resident(files), host: hostSample() });
           for (const [tid, seconds] of workerThreadCpu(profile))
             passCpu.set(tid, Math.max(0, seconds - (threadsBefore.get(tid) ?? 0)));
           heapPeak = Math.max(heapPeak, await targets.heap());
-          await new Promise((resolve) => setTimeout(resolve, 200));
+          await new Promise((resolve) => setTimeout(resolve, ALL_THREAD ? 100 : 200));
         }
       })();
       const profilesBefore = targets.profiles.length;
@@ -572,6 +592,18 @@ test.describe("rebuild core export on OPFS (bench)", () => {
         });
       await sampler;
       const trace = await stopTrace?.();
+      if (ALL_THREAD && DIAGNOSTIC_DIR) {
+        mkdirSync(DIAGNOSTIC_DIR, { recursive: true });
+        writeFileSync(
+          join(DIAGNOSTIC_DIR, `timeline-${String(results.length)}.json`),
+          JSON.stringify({ samples, allPasses: targets.allPasses }),
+        );
+        if (trace)
+          writeFileSync(
+            join(DIAGNOSTIC_DIR, `trace-${String(results.length)}.json`),
+            JSON.stringify({ traceEvents: trace.events }),
+          );
+      }
       if (trace)
         await info.attach(`gc-trace-${String(results.length)}`, {
           body: JSON.stringify({ traceEvents: trace.events }),
@@ -651,6 +683,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
       }
       const backingStoragePeakMiB = Math.round(targets.takeExternal() / MiB);
       const row: Row = {
+        ...(pass.wireHash ? { wireHash: pass.wireHash } : {}),
         ...(GATE_A ? { fixture } : {}),
         ...(pass.series
           ? {
@@ -745,6 +778,7 @@ test.describe("rebuild core export on OPFS (bench)", () => {
           await measure(`cold persistent ${variant} scan round ${String(round)}`, true, false, {
             ...base,
             persistent: true,
+            ...(WIRE_HASH ? { verifyBytes: true } : {}),
             recycle: OWNER_API || process.env.MINNOW_EXPORT_RECYCLE === "1",
             ownerAPI: OWNER_API && (!OWNER_COMPARE || variant === "candidate"),
             ...(POOL_COMPARE ? { outputClasses: variant === "candidate" } : {}),
@@ -1059,6 +1093,12 @@ test.describe("rebuild core export on OPFS (bench)", () => {
     const gcRssAfter = rendererRss(profile);
     const report = {
       fixture,
+      ...(WIRE_HASH
+        ? {
+            measurementScope:
+              "correctness-only: receiver SHA-256 and scratch copies included; not performance",
+          }
+        : {}),
       rows,
       ...(process.env.MINNOW_EXPORT_PACKED_EXPERIMENT === "1"
         ? {

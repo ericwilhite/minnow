@@ -1390,6 +1390,8 @@ export const BENCH_ROOT_ADMISSION_REACH = [
 
 /** Production API benchmark fixture stays on real SQL/owner transport, across repeated queries. */
 export const OWNER_API_BENCH_REACH = [
+  "export private miss",
+  "ordinary retained metadata",
   "real SQL identity projection",
   "wire totals",
   "first export",
@@ -2601,3 +2603,41 @@ export const WRITE_RANGE_SKIP_REACH = [
   "reverse insertion",
   "descending multiple pages",
 ] as const;
+
+/** Exact non-retaining export leases, distinct from optional gap/pool reservations. */
+export const EXACT_READ_REACH = [
+  "hit",
+  "miss",
+  "gap",
+  "overlap",
+  "duplicate",
+  "refused",
+  "cancelled",
+  "error-cleanup",
+  "close-held",
+  "ordinary-warm",
+] as const;
+
+export const EXACT_STEP_REACH = [
+  "active",
+  "queued",
+  "cancelled",
+  "drained",
+  "default",
+  "private",
+] as const;
+
+export const EXACT_PACE_REACH = ["timer", "cancelled", "completed", "released"] as const;
+
+export const EXACT_FAST_REACH = [
+  "private window",
+  "private fallback",
+  "private exact",
+  "ordinary window",
+  "ordinary fallback",
+  "ordinary exact",
+  "released",
+] as const;
+
+/** Both exact-read implementations run every existing seed/history count. */
+export const EXACT_READER_REACH = { storage: "storage reader", memory: "memory reader" } as const;

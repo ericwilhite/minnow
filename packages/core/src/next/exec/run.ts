@@ -79,6 +79,7 @@ export class QueryRuntime {
   #readStep: ReadStep | null = null;
   #operatorProgress = new Map<number, number>();
   #readBounds = new Map<number, ReadBound>();
+  #nonRetainingReads = false;
 
   atomicResult(grant: DeferredGrant, window: number): void {
     this.#atomicResult = grant;
@@ -89,7 +90,9 @@ export class QueryRuntime {
     this.#progressBytes = progress;
   }
   readPages(pages: Snapshot["pages"]): Snapshot["pages"] {
-    return this.#readBytes === 0 ? pages : (this.#readStep?.reader(pages) ?? pages);
+    return this.#readBytes === 0
+      ? pages
+      : (this.#readStep?.reader(pages, this.#nonRetainingReads) ?? pages);
   }
   readBoundary(): void {
     this.#readStep?.beforeDownstream();
@@ -106,6 +109,7 @@ export class QueryRuntime {
 
   sourceBounds(bounds: ReadonlyMap<number, ReadBound>): void {
     this.#readBounds = new Map(bounds);
+    this.#nonRetainingReads = bounds.size === 1 && bounds.values().next().value?.retain === false;
   }
   sourceWindow(id: number): number {
     return this.#readBounds.get(id)?.windowBytes ?? 0;

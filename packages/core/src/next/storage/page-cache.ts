@@ -23,6 +23,7 @@
  *   makes (`memory/governor.ts` rule 7). Every list or map change is complete before a call out,
  *   and pinned entries are never in a list, so a nested eviction sees a consistent cache.
  */
+import { pauseIfDue, type TaskWork } from "../task.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { VERIFY_CACHED_BYTES, verifyCached } from "./verify-cached.js";
 import { StoreClosedError, StoreCorruptionError, type StoreSession } from "./contract.js";
@@ -387,6 +388,7 @@ export class PageCache implements EvictableCacheLike {
   async read(refs: readonly BlobRef[], options: ReadOptions): Promise<ReadLease> {
     this.#live();
     const { budget, signal } = options;
+    const once = options.once === true || options.retain === false;
     signal?.throwIfAborted();
     const distinct = new Map<string, BlobRef>();
     let total = 0;
@@ -418,7 +420,6 @@ export class PageCache implements EvictableCacheLike {
           continue;
         }
         this.#hits += 1;
-        const once = options.once === true;
         if (!once) entry.hot = true; // a one-pass scan is not a reuse
         if (entry.pins === 0) {
           uncharge += base(entry); // its descriptor stays charged here
@@ -434,7 +435,9 @@ export class PageCache implements EvictableCacheLike {
       // Hits are pinned before the cache's charge goes back: a nested eviction cannot take them.
       if (uncharge > 0) this.#memory?.release(uncharge);
       if (misses.length > 0) {
-        if (options.once === true)
+        if (options.retain === false)
+          await this.#readMisses(misses, held, resolved, signal, owned, options.task);
+        else if (options.once === true)
           await this.#readPrivate(
             misses,
             resolved,
@@ -446,7 +449,7 @@ export class PageCache implements EvictableCacheLike {
         else await this.#readMisses(misses, held, resolved, signal);
       }
     } catch (error) {
-      this.#unpinAll(held, options.once === true);
+      this.#unpinAll(held, once);
       this.#pinnedBytes -= owned.bytes;
       budget.free(total + owned.chargeDelta);
       this.#givePooled(owned);
@@ -468,7 +471,7 @@ export class PageCache implements EvictableCacheLike {
           for (const { bytes, checksum } of owned.views)
             verifyCached(bytes, checksum, "lease release");
         }
-        this.#unpinAll(held, options.once === true);
+        this.#unpinAll(held, once);
         this.#pinnedBytes -= owned.bytes;
         budget.free(total + owned.chargeDelta);
         this.#givePooled(owned);
@@ -481,6 +484,8 @@ export class PageCache implements EvictableCacheLike {
     held: Entry[],
     resolved: Map<string, Uint8Array>,
     signal: AbortSignal | undefined,
+    owned?: OwnedSlabs,
+    task?: TaskWork,
   ): Promise<void> {
     const ranges = misses.map(({ ref }) => ({
       offset: ref.extent.offset + ref.offset,
@@ -489,6 +494,11 @@ export class PageCache implements EvictableCacheLike {
     const slabs = planSlabs(ranges);
     await this.withReadSlab(async (buffer) => {
       for (const slab of slabs) {
+        // Keep exact export continuations cooperative even on synchronous OPFS handles.
+        if (owned) {
+          const pause = pauseIfDue({ ...task, ...(signal ? { signal } : {}) });
+          if (pause) await pause;
+        }
         signal?.throwIfAborted();
         this.#live();
         const target = buffer.subarray(0, slab.length);
@@ -507,9 +517,16 @@ export class PageCache implements EvictableCacheLike {
               `The blob at ${String(address)} (extent ${String(ref.extent.offset)}, ${String(ref.length)} bytes) failed its checksum`,
             );
           this.#misses += 1;
-          const entry = this.#insertPinned(ref, address, bytes);
-          held.push(entry);
-          resolved.set(key, entry.bytes);
+          if (owned !== undefined) {
+            owned.bytes += bytes.length;
+            this.#pinnedBytes += bytes.length;
+            if (VERIFY_CACHED_BYTES) owned.views.push({ bytes, checksum: ref.checksum });
+            resolved.set(key, bytes);
+          } else {
+            const entry = this.#insertPinned(ref, address, bytes);
+            held.push(entry);
+            resolved.set(key, entry.bytes);
+          }
         }
       }
     });

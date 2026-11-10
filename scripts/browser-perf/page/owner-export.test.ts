@@ -98,6 +98,8 @@ for (const seed of seedsFor("owner-api-bench", [0xb2f2, 0xb2f3]))
               await stream.done;
               const result = await completion;
               expect(actual).toEqual(source);
+              for (const column of group.columns) expect(space.peek(column.directory)).toBeNull();
+              reach.reach("export private miss");
               expect(result.rows).toBe(count);
               const traced = actor.returnStats().poolTrace;
               expect(traced?.requests).toBeGreaterThan(0);
@@ -129,6 +131,15 @@ for (const seed of seedsFor("owner-api-bench", [0xb2f2, 0xb2f3]))
               reach.reach(pass === 0 ? "first export" : "same connection export");
             }
             reach.reach(sparse ? "sparse NULLs" : "all valid");
+            const completion = actor.arm();
+            completion.catch(() => undefined);
+            const ordinary = await client.query("SELECT * FROM t");
+            await completion;
+            expect(ordinary.rows()).toEqual(source);
+            expect(group.columns.some((column) => space.peek(column.directory) !== null)).toBe(
+              true,
+            );
+            reach.reach("ordinary retained metadata");
           } finally {
             client.close();
             await actor.close();

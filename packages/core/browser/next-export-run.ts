@@ -1,3 +1,4 @@
+import { FrameDigest } from "../../../scripts/browser-perf/page/frame-digest.js";
 /**
  * Page side of the OPFS export bench (browser-tests/next-export-bench.spec.ts): builds the wide
  * table once in a dedicated worker (next-export-worker.ts), keeps its group descriptions here, and
@@ -51,6 +52,7 @@ async function withWorker<T>(request: ExportRequest, discard = false): Promise<T
   let onError: ((event: ErrorEvent) => void) | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let succeeded = false;
+  const digest = job?.verifyBytes ? new FrameDigest() : null;
   const receiver = discard ? new DiscardReceiver() : null;
   let releaseTimer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -172,6 +174,7 @@ async function withWorker<T>(request: ExportRequest, discard = false): Promise<T
               receivedRows += frame.payload.rowCount;
               receivedFrames++;
               receivedBytes += payloadBytes(frame.payload);
+              if (digest) await digest.add(frame.payload);
               frame.release();
             }
             const summary = await stream.done;
@@ -210,7 +213,13 @@ async function withWorker<T>(request: ExportRequest, discard = false): Promise<T
                   pass.executorStats.wireBytes !== receivedBytes
                 )
                   throw new Error("Owner API transport totals disagree");
-                resolve(passes.map((p, k) => (k === passes.length - 1 ? { ...p, ms } : p)) as T);
+                resolve(
+                  passes.map((p, k) =>
+                    k === passes.length - 1
+                      ? { ...p, ms, ...(digest ? { wireHash: digest.hex } : {}) }
+                      : p,
+                  ) as T,
+                );
               })
               .catch(reject);
           } else resolve(data.result as T);
@@ -294,6 +303,7 @@ export async function exportPass(options: {
   readonly ownerAPI?: boolean;
   readonly outputClasses?: boolean;
   readonly dictionarySizing?: "baseline" | "candidate";
+  readonly verifyBytes?: boolean;
   readonly once: boolean;
   readonly readaheadKiB: number;
   readonly windowMiB?: number;
@@ -330,6 +340,7 @@ export async function exportPass(options: {
   if (outside === undefined) throw new Error("no groups");
   const request: Extract<ExportRequest, { op: "export" }> = {
     op: "export",
+    ...(options.verifyBytes ? { verifyBytes: true } : {}),
     dir: DIR,
     groups,
     outside,

@@ -12,7 +12,8 @@
  *   offsets relative to the extent; `seal` trims and returns `BlobRef`s carrying the extent.
  * - `read` checks each ref against its extent, verifies the checksum when bytes come from the
  *   array (`StoreCorruptionError`), refuses more than `MAX_READ_BYTES` (`RangeError`) and charges
- *   the lease to the budget (`ReadDeniedError`); verified copies are cached (unless
+ *   each distinct blob identity once to the lease budget (`ReadDeniedError`), sharing duplicate
+ *   request views; verified copies are cached (unless
  *   `cache: false`) and `peek` serves them.
  */
 import { xxHash32 } from "../hash/xxhash32.js";
@@ -184,7 +185,9 @@ export class MemoryExtentSpace implements ExtentReader {
   }
 
   async read(refs: readonly BlobRef[], options: ReadOptions): Promise<ReadLease> {
-    const total = refs.reduce((sum, ref) => sum + ref.length, 0);
+    options.signal?.throwIfAborted();
+    const distinct = new Map(refs.map((ref) => [MemoryExtentSpace.#key(ref), ref]));
+    const total = [...distinct.values()].reduce((sum, ref) => sum + ref.length, 0);
     if (total > MAX_READ_BYTES) throw new RangeError("A read asks for more than MAX_READ_BYTES");
     for (const ref of refs)
       if (ref.offset < 0 || ref.offset + ref.length > ref.extent.length)
@@ -193,15 +196,24 @@ export class MemoryExtentSpace implements ExtentReader {
     this.reads++;
     let bytes: Uint8Array[];
     try {
-      bytes = refs.map((ref) => {
-        const key = MemoryExtentSpace.#key(ref);
+      const resolved = new Map<string, Uint8Array>();
+      for (const [key, ref] of distinct) {
         const cached = this.#cache.get(key);
-        if (cached !== undefined) return cached;
+        if (cached !== undefined) {
+          resolved.set(key, cached);
+          continue;
+        }
         const address = blobAddress(ref);
         const copy = this.bytes.slice(address, address + ref.length);
         if (copy.length !== ref.length || xxHash32(copy) !== ref.checksum)
           throw new StoreCorruptionError(`Checksum mismatch at ${String(address)}`);
-        if (this.#caching && options.once !== true) this.#cache.set(key, copy);
+        if (this.#caching && options.once !== true && options.retain !== false)
+          this.#cache.set(key, copy);
+        resolved.set(key, copy);
+      }
+      bytes = refs.map((ref) => {
+        const copy = resolved.get(MemoryExtentSpace.#key(ref));
+        if (!copy) throw new Error("Unresolved blob reference");
         return copy;
       });
     } catch (error) {

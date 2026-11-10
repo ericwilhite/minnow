@@ -67,6 +67,8 @@ function run<T>(job: ReadJob<T>): MaybePromise<T> {
 }
 
 export interface ReadSource {
+  /** Explicit terminal export: sizing misses must not pollute the shared cache. */
+  readonly retain?: boolean;
   readonly id: number;
   readonly tableId: number;
   readonly columns: readonly number[];
@@ -79,6 +81,7 @@ export interface ReadSource {
   readonly domainColumn?: number;
 }
 export interface ReadBound {
+  readonly retain?: boolean;
   readonly bytes: number;
   readonly io: number;
   readonly progress: number;
@@ -150,14 +153,22 @@ export function boundSource(
       table.liveRowCount,
       source.rows === null,
     );
-    const windowBytes =
+    const fullColumns =
       source.columns.length === table.columns.length &&
-      source.columns.every((id, k) => id === table.columns[k]?.id)
-        ? source.windowBytes
-        : 0;
+      source.columns.every((id, k) => id === table.columns[k]?.id);
+    const windowBytes = fullColumns ? source.windowBytes : 0;
+    const retention = source.retain === false && fullColumns ? { retain: false } : {};
+    const sizingPages: SpaceReader =
+      retention.retain === false
+        ? {
+            peek: (ref, options) => view.pages.peek(ref, { ...options, once: true }),
+            read: (refs, options) => view.pages.read(refs, { ...options, ...retention }),
+          }
+        : view.pages;
     const metadata = new MetadataReader({
-      peek: (ref, options) => view.pages.peek(ref, options),
-      read: (refs, options) => view.pages.read(refs, { ...options, signal, reuseBuffers: false }),
+      peek: (ref, options) => sizingPages.peek(ref, options),
+      read: (refs, options) =>
+        sizingPages.read(refs, { ...options, ...retention, signal, reuseBuffers: false }),
     });
     const task = { clock: clockFor(), signal };
     let maximum = 0,
@@ -200,7 +211,7 @@ export function boundSource(
                         maxRows: end - start,
                         targetBytes: target,
                       },
-                      { budget, pages: view.pages, signal },
+                      { budget, pages: sizingPages, signal },
                     ),
                   );
                   if (
@@ -347,7 +358,13 @@ export function boundSource(
               const pages: SpaceReader = {
                 peek: () => null,
                 read: (refs, options) =>
-                  view.pages.read(refs, { ...options, once: false, reuseBuffers: false, signal }),
+                  view.pages.read(refs, {
+                    ...options,
+                    ...retention,
+                    once: false,
+                    reuseBuffers: false,
+                    signal,
+                  }),
               };
               const reader = yield* readValue(
                 ChunkReader.open(pages, chunk, {
@@ -473,6 +490,7 @@ export function boundSource(
       io,
       progress: Math.max(65536, 4 * largestValue),
       windowBytes,
+      ...retention,
       ...(domain === undefined ? {} : { domain }),
     };
   }
