@@ -1906,6 +1906,19 @@ The full interface contract includes the following (DML remains unimplemented by
   contiguous normalized word columns, skipping digits proven constant. Smaller direct sorts
   and byte keys retain MSD. Both paths use the same normalized order, including NULLs, DESC,
   NaN and exact int64 words; the LSD arrays fit inside the existing sorting reservation.
+- The compiled executor's resident full numeric sorts use `sort-columnar.ts`: payload columns
+  are stored once, numeric key words are encoded once into typed column arrays, and a stable
+  row-id permutation drives one gather per output column. At least 65,536 rows use LSD;
+  smaller inputs use a stable merge sort over the same words. Payloads retain NaN and signed
+  zeros; normalization changes only keys. Nullable keys use a distinct validity word.
+  The guarded path accepts up to four numeric keys and sixteen primitive numeric/text/byte
+  payload columns. LIMIT/OFFSET, WITH TIES, other types and internal window/ordered-set sorts
+  retain the general sorter. Refusal or reclamation replays the resident rows into its spill
+  path before any output. All scratch is charged before allocation, and cancellation keeps
+  borrowed output/replay buffers charged until readiness and spill cleanup settle.
+  `CompileOptions.columnarSort: false` selects the parent path for paired measurements.
+  Results still pass through the normal contiguous result-frame copy after the permutation
+  gather; this path does not transfer source storage or result-buffer ownership.
 - An ICU `COLLATE` sorts by query-wide ranks from `Intl.Collator` (ties by bytes) when the
   distinct values fit; otherwise, and for JSON and array keys, a value comparator (compare
   mode), in memory and across runs (DECISIONS.md C8). Compare mode decodes each row's JSONB,
@@ -1942,6 +1955,20 @@ The `exec/sort-lsd.bench.ts` comparison accepts `MODE=msd`, `lsd` (contiguous co
 float64/int64 keys). Compare `ROWS=100000` and `1000000` in at least seven interleaved rounds,
 recording load per run. The component excludes key preparation; whole-operator comparisons
 include it. Validation checks all normalized words, row multiplicity and stable ties untimed.
+
+`scripts/next-sort-columnar-bench.mts` runs against compiled `dist` in Node. Its default W1M
+workload measures the sort and window catalogue shapes, with `--only` selecting cells.
+`--component` captures the actual numeric sort input once before timing, then measures the
+isolated operator; `--fixture <v8-capture>` reuses an existing predecoded capture;
+`--catalogue` checks all executing frozen small catalogue cells for regressions and records
+registered refusals. Use `--pairs 9 --output <file>` (at least nine adjacent AB/BA pairs).
+Every sample records all-thread process CPU including GC, wall time and host load. Complete
+parent/candidate output hashes are checked before and after timing. Acceptance uses delivery
+and release of columnar frames; a second paired measurement includes JS row materialization.
+Input construction and output hashing are outside both clocks. The median paired gain must
+exceed the type-7 paired IQR, with at least seven of nine pairs favorable; other shapes must
+not show a reverse-direction regression by the same rule. Scratch defaults to `os.tmpdir()`;
+set `TMPDIR` to a cache directory on quota-constrained hosts.
 
 `exec/window-order.bench.ts` isolates the five Gate B windows' actual grouped ordering,
 including sort scratch and peer construction. It shares prebuilt batches with `window.bench.ts`
