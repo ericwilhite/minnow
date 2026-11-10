@@ -13,6 +13,8 @@ import { expectBytes } from "../storage/space-test-support.js";
 import { SpillCorruptionError, SpillQuotaError, type SpillPageRef } from "./contract.js";
 import { SPILL_BATCH_BYTES, ScratchSpillService } from "./scratch-spill.js";
 
+const fresh = () => new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null });
+
 const page = (length: number, seed: number) =>
   Uint8Array.from({ length }, (_, index) => (seed * 31 + index * 7) & 0xff);
 
@@ -43,8 +45,8 @@ describe("scratch spill service", () => {
   it("batches pages, serves reads from the batch and from the scratch space, and frees on close", async () => {
     // An in-memory file: the simulated disk copies its whole image on every write.
     const file_ = new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null });
-    const scratch = new FileScratch(file_, () => undefined);
-    const service = new ScratchSpillService(scratch);
+    const scratch = new FileScratch(file_, () => undefined, fresh());
+    const service = new ScratchSpillService(scratch, { budget: budget(Infinity) });
     const charge = budget(1 << 20);
     const file = await service.create(1, charge);
     expect(charge.used).toBe(SPILL_BATCH_BYTES);
@@ -75,8 +77,9 @@ describe("scratch spill service", () => {
     const scratch = new FileScratch(
       new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null }),
       () => undefined,
+      fresh(),
     );
-    const service = new ScratchSpillService(scratch);
+    const service = new ScratchSpillService(scratch, { budget: budget(Infinity) });
     const refused = budget(0);
     const file = await service.create(1, refused);
     const small = await file.append(page(100, 1));
@@ -92,7 +95,7 @@ describe("scratch spill service", () => {
 
   it("refuses a corrupted page, maps quota to SpillQuotaError, and fences a lost owner", async () => {
     const { backend, scratch, disk } = await scratchOver();
-    const service = new ScratchSpillService(scratch);
+    const service = new ScratchSpillService(scratch, { budget: budget(Infinity) });
     const file = await service.create(1, budget(0));
     const ref = await file.append(page(5000, 1));
     const state = disk.files.get("spill");
@@ -101,12 +104,20 @@ describe("scratch spill service", () => {
     await expect(file.read(ref)).rejects.toThrow(SpillCorruptionError);
 
     const full: ScratchSpace = {
+      metadata: () => {
+        const meta = scratch.metadata?.();
+        if (meta === undefined) throw new Error("metadata missing");
+        return meta;
+      },
       write: () => Promise.reject(new StoreQuotaError("full")),
       readInto: (offset, target) => scratch.readInto(offset, target),
       release: (ranges: readonly DataRange[]) => scratch.release(ranges),
       truncate: (size) => scratch.truncate(size),
     };
-    const quota = await new ScratchSpillService(full).create(1, budget(0));
+    const quota = await new ScratchSpillService(full, { budget: budget(Infinity) }).create(
+      1,
+      budget(0),
+    );
     await expect(quota.append(page(10, 1))).rejects.toThrow(SpillQuotaError);
 
     await backend.acquire({ steal: true, timeoutMs: 2_000 });
@@ -115,7 +126,7 @@ describe("scratch spill service", () => {
 
   it("sweeps everything at startup: the space is empty and old files are dead", async () => {
     const { scratch, disk } = await scratchOver();
-    const service = new ScratchSpillService(scratch);
+    const service = new ScratchSpillService(scratch, { budget: budget(Infinity) });
     const file = await service.create(1, budget(0));
     await file.append(page(9000, 1));
     await service.sweep();
@@ -135,8 +146,9 @@ describe("scratch spill service", () => {
       const scratch = new FileScratch(
         new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null }),
         () => undefined,
+        fresh(),
       );
-      const service = new ScratchSpillService(scratch);
+      const service = new ScratchSpillService(scratch, { budget: budget(Infinity) });
       const files = new Map<
         number,
         {
@@ -183,8 +195,9 @@ describe("scratch spill service", () => {
     const scratch = new FileScratch(
       new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null }),
       () => undefined,
+      fresh(),
     );
-    const service = new ScratchSpillService(scratch);
+    const service = new ScratchSpillService(scratch, { budget: budget(Infinity) });
     const charge = budget(1 << 20);
     const file = await service.create(1, charge);
     for (let index = 0; index < 1000; index++)
@@ -201,8 +214,10 @@ describe("scratch spill service", () => {
     const backing = new FileScratch(
       new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null }),
       () => undefined,
+      fresh(),
     );
     const slow: ScratchSpace = {
+      metadata: () => backing.metadata(),
       write: async (offset, bytes) => {
         await gate;
         await backing.write(offset, bytes);
@@ -211,7 +226,7 @@ describe("scratch spill service", () => {
       release: (ranges) => backing.release(ranges),
       truncate: (size) => backing.truncate(size),
     };
-    const service = new ScratchSpillService(slow);
+    const service = new ScratchSpillService(slow, { budget: budget(Infinity) });
     const charge = budget(1 << 20);
     const file = await service.create(2, charge);
     const appending = file.append(page(SPILL_BATCH_BYTES + 1, 1));

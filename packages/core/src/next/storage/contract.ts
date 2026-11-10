@@ -146,6 +146,9 @@ export interface SyncFile {
  *   transaction per call with the epoch check inside it.
  */
 export interface ScratchSpace {
+  /** Owner-private spill allocator pages. Independent of payload and extent-space metadata;
+   * reset on spill sweep, never recovered. Backends reserve this namespace per store, not query. */
+  metadata?(): ScratchMetadata;
   /** Writes `bytes` at `offset` (a multiple of `DATA_ALIGN`). */
   write(offset: number, bytes: Uint8Array): Promise<void>;
   /** Reads exactly `target.length` bytes written at `offset`; `StoreCorruptionError` past the end. */
@@ -156,12 +159,20 @@ export interface ScratchSpace {
   truncate(size: number): Promise<void>;
   /**
    * Optional (additive): charge the space's resident bookkeeping to `memory` from now on; the spill
-   * service calls it before first use with the registration it owns. IndexedDB charges its spill
-   * record index; a file (OPFS) keeps nothing per extent and has no such method.
+   * service calls it before first use with the registration it owns. IndexedDB keeps its spill
+   * index on disk (native predecessor lookups), without resident per-record state; a file
+   * (OPFS) keeps nothing per extent and has no such method.
    */
   chargeTo?(memory: CacheMemory): void;
   /** Optional (additive): drop that bookkeeping and return its charge (sweep, close). */
   dispose?(): Promise<void>;
+}
+
+/** Fixed pages for the spill allocator; writes borrow the prepaid standalone buffer. */
+export interface ScratchMetadata {
+  read(page: number, target: Uint8Array): Promise<void>;
+  write(page: number, bytes: Uint8Array): Promise<void>;
+  reset(): Promise<void>;
 }
 
 /** Owner-private reconstructible metadata; separate from the operator-spill sweep.

@@ -3,11 +3,11 @@
  * `FileSystemSyncAccessHandle`s, fenced by them.
  *
  * ## Files
- * One directory per database, holding eight long-lived files, each with one sync handle opened at
+ * One directory per database, holding nine long-lived files, each with one sync handle opened at
  * acquisition and kept open until the lease is released:
  * - `log`, `data`, `root-0`, `root-1` (file-store.ts);
  * - `space-meta` and `space-meta-index`: owner-private reconstructible extent-space metadata;
- * - `spill`: the scratch file the spill service uses (`StorageBackend.scratch`);
+ * - `spill` and `spill-meta`: scratch payload and allocator pages; `spill` is the scratch file the spill service uses (`StorageBackend.scratch`);
  * - `epoch`: the epoch counter, two checksummed slots (`nextEpoch`). Each acquisition writes the
  *   next value into the other slot and flushes it before the lease exists, so epochs increase
  *   across acquisitions and crashes (`OwnerLease.epoch`); the flush costs one platform flush per
@@ -84,6 +84,7 @@ export const OPFS_FILE_NAMES = [
   "epoch",
   "space-meta",
   "space-meta-index",
+  "spill-meta",
 ] as const;
 
 const errorName = (error: unknown): string =>
@@ -238,6 +239,9 @@ class OpfsLease implements OwnerLease {
       ...(opened.files.metadataIndex === undefined
         ? {}
         : { metadataIndex: wrap(opened.files.metadataIndex, "space-meta-index") }),
+      ...(opened.files.spillMetadata === undefined
+        ? {}
+        : { spillMetadata: wrap(opened.files.spillMetadata, "spill-meta") }),
     };
     this.scratchFile = wrap(opened.scratch, "spill");
     // The handle, not the lock, stops a hung owner: close every handle the moment the lock goes.
@@ -361,20 +365,22 @@ async function openFiles(directory: OpfsDirectoryLike): Promise<OpenFiles> {
       const file = await directory.getFileHandle(name, { create: true });
       handles.push(await file.createSyncAccessHandle());
     }
-    const [log, data, root0, root1, scratch, epochFile, metadata, metadataIndex] = handles as [
-      SyncFile,
-      SyncFile,
-      SyncFile,
-      SyncFile,
-      SyncFile,
-      SyncFile,
-      SyncFile,
-      SyncFile,
-    ];
+    const [log, data, root0, root1, scratch, epochFile, metadata, metadataIndex, spillMetadata] =
+      handles as [
+        SyncFile,
+        SyncFile,
+        SyncFile,
+        SyncFile,
+        SyncFile,
+        SyncFile,
+        SyncFile,
+        SyncFile,
+        SyncFile,
+      ];
     const unused = [log, data, root0, root1].every((file) => file.getSize() === 0);
     const epoch = nextEpoch(new QuotaMappedFile(epochFile, () => false), unused);
     return {
-      files: { log, data, roots: [root0, root1], metadata, metadataIndex },
+      files: { log, data, roots: [root0, root1], metadata, metadataIndex, spillMetadata },
       scratch,
       epoch,
       handles,
@@ -418,9 +424,13 @@ export function createOpfsBackend(options: OpfsBackendOptions): StorageBackend {
     },
     scratch(lease: OwnerLease): ScratchSpace {
       const owned = own(lease);
-      return new FileScratch(owned.scratchFile, () => {
-        owned.guard();
-      });
+      return new FileScratch(
+        owned.scratchFile,
+        () => {
+          owned.guard();
+        },
+        owned.files.spillMetadata,
+      );
     },
   };
 }

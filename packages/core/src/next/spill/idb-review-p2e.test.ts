@@ -51,7 +51,7 @@ async function spillOver(db: IdbDatabaseLike) {
   const scratch = backend.scratch(await backend.acquire());
   if (scratch === null) throw new Error("IndexedDB has a spill store");
   const memory = holding();
-  const service = new ScratchSpillService(scratch, { memory });
+  const service = new ScratchSpillService(scratch, { memory, budget: countingBudget(Infinity) });
   await service.sweep();
   const records = async () => (await ByteStore.load(db, "spill")).records;
   return { scratch, memory, service, records };
@@ -99,7 +99,7 @@ describe("finding 1: the spill service's close drains before it disposes", () =>
     const { memory, service, records } = await spillOver(db);
     const file = await service.create(1, unbuffered);
     for (let page = 0; page < 20; page++) await file.append(bytesOf(5_000, page));
-    expect(memory.held).toBeGreaterThan(0);
+    expect(memory.held).toBe(0);
     const releasing = file.close();
     const closing = service.close();
     await Promise.all([releasing, closing]);
@@ -318,7 +318,7 @@ describe("the reviewer's other probes", () => {
     expect(seen.length).toBe(2_001);
   });
 
-  it("dispose is idempotent and a later write charges again", async () => {
+  it("dispose is idempotent and later writes remain index-free", async () => {
     const memory = holding();
     const db = simIndexedDb(new SimDisk());
     const backend = createIndexedDbBackend({
@@ -330,11 +330,11 @@ describe("the reviewer's other probes", () => {
     if (scratch === null) throw new Error("IndexedDB has a spill store");
     scratch.chargeTo?.(memory);
     await scratch.write(0, new Uint8Array(1));
-    expect(memory.held).toBeGreaterThan(0);
+    expect(memory.held).toBe(0);
     await Promise.all([scratch.dispose?.(), scratch.dispose?.()]);
     expect(memory.held).toBe(0);
     await scratch.write(4096, new Uint8Array(1));
-    expect(memory.held).toBeGreaterThan(0);
+    expect(memory.held).toBe(0);
     expect((await ByteStore.load(db, "spill")).records).toBe(2);
     await scratch.dispose?.();
     expect(memory.held).toBe(0);

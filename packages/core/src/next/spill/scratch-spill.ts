@@ -1,29 +1,13 @@
 /**
- * The spill service over a backend's scratch space (contract.ts "Implementations"): OPFS's `spill`
- * file or IndexedDB's `spill` object store, through the same `ScratchSpace`.
- *
- * - **Space.** One `FreeSpaceMap` over the scratch space. A file is a list of extents; each batch
- *   write first tries to extend the file's last extent in place (`allocateAt`), so a run is written
- *   and read back sequentially.
- * - **Batching.** A file asks its `budget` for a 256 KiB batch buffer when created. The batch's
- *   extent is reserved when its first page arrives, so every ref names its final offset at once;
- *   appends copy pages into the buffer, which is written as one extent (its unused tail returned to
- *   the map) when the next page would not fit. Reads of batched pages are served from the buffer;
- *   close drops it unwritten. Without the buffer (the budget refused), each page is written
- *   directly as its own extent: spilling never needs memory beyond the page the operator holds.
- * - **Pages never straddle extents**, so a page is one contiguous read. A page larger than the
- *   buffer flushes the buffer and is written alone.
- * - **Reads** verify xxHash32 and return a fresh array (`read`) or fill the caller's (`readInto`).
- *   A page still in the batch buffer is served from it.
- * - **Release.** `close` hands the file's extents to `ScratchSpace.release` and, once that
- *   resolves, back to the map. `sweep` (startup) truncates the space to zero and starts a new map.
- * - **Memory.** The service owns an optional memory registration (`memory`), charged over its
- *   lifetime with what the scratch space keeps per extent (`chargeTo`: IndexedDB's record index;
- *   OPFS keeps nothing). The charge follows the index as files come and go, and `dispose` returns
- *   it at `sweep` and at the service's `close`, which first drains every file (see `close`).
- * - **Errors.** `StoreQuotaError` from the scratch space becomes `SpillQuotaError`; the query fails,
- *   the database is unaffected. A fenced owner's scratch calls fail with `OwnershipLostError`.
- * - **Never in recovery.** Nothing is flushed and nothing durable names spill space.
+ * Shared scratch allocator. Ownership and coalesced free ranges live in checksummed scratch
+ * pages, with one cached page, two I/O frames and sixteen pooled release descriptors. The owner
+ * admits SCRATCH_CONTROL_BYTES before construction; this fixed workspace remains charged until
+ * all file I/O and releases settle. Metadata growth never asks an operator for more memory.
+ * Optional 256 KiB batching uses the operator's budget; refusal selects direct writes. File
+ * handles retain scalar chain coordinates, never a resident extent list or per-page batch map.
+ * Allocator operations are serialized, with no admission wait while holding that serialization.
+ * Released ranges become reusable only after the native release succeeds. Nothing is recovered:
+ * startup sweep discards payload and private allocator pages under the owner's fence.
  */
 import { xxHash32 } from "../hash/xxhash32.js";
 import {
@@ -33,7 +17,7 @@ import {
   type ScratchSpace,
 } from "../storage/contract.js";
 import type { ByteBudget, CacheMemory } from "../storage/extents.js";
-import { FreeSpaceMap } from "../storage/free-space.js";
+import { RangeChain, ScratchRanges, SCRATCH_RELEASE_BATCH } from "./scratch-ranges.js";
 import {
   SpillCorruptionError,
   SpillQuotaError,
@@ -45,79 +29,146 @@ import {
 /** The batch buffer a file asks its budget for. */
 export const SPILL_BATCH_BYTES = 256 * 1024;
 
-function spillError(error: unknown): unknown {
-  return error instanceof StoreQuotaError ? new SpillQuotaError(error.message) : error;
+function spillError(error: unknown): Error {
+  return error instanceof StoreQuotaError
+    ? new SpillQuotaError(error.message)
+    : error instanceof Error
+      ? error
+      : new Error(String(error));
 }
 
 export class ScratchSpillService implements SpillService {
   readonly #scratch: ScratchSpace;
-  #map = new FreeSpaceMap(DATA_ALIGN);
-  readonly #files = new Set<ScratchSpillFile>();
-  /** Bumped by `sweep`: files from before it are dead. */
+  readonly #ranges: ScratchRanges;
+  readonly #pool: Array<{ offset: number; length: number }>;
+  readonly #release: DataRange[];
+  #first: ScratchSpillFile | null = null;
   #generation = 0;
-  /** Releases in flight (a terminal close waits for them). */
-  readonly #releasing = new Set<Promise<void>>();
+  #identity = 0;
+  #end = 0;
+  #queue: Promise<unknown> = Promise.resolve();
+  #failure: Error | null = null;
   #closing: Promise<void> | null = null;
+  #sweeping = false;
 
-  constructor(scratch: ScratchSpace, options: { readonly memory?: CacheMemory } = {}) {
+  constructor(
+    scratch: ScratchSpace,
+    options: { readonly budget: ByteBudget; readonly memory?: CacheMemory },
+  ) {
     this.#scratch = scratch;
-    if (options.memory !== undefined) scratch.chargeTo?.(options.memory);
+    this.#ranges = new ScratchRanges(() => {
+      const metadata = scratch.metadata?.();
+      if (metadata === undefined) throw new TypeError("Scratch allocator needs a metadata backing");
+      return metadata;
+    }, options.budget);
+    this.#pool = Array.from({ length: SCRATCH_RELEASE_BATCH }, () => ({ offset: 0, length: 0 }));
+    this.#release = [];
+    try {
+      if (options.memory !== undefined) scratch.chargeTo?.(options.memory);
+    } catch (error) {
+      this.#ranges.close();
+      throw error;
+    }
   }
 
+  get residentExtentEntries(): number {
+    return this.#ranges.residentEntries + this.#pool.length + this.#release.length;
+  }
   get bytesInUse(): number {
     let bytes = 0;
-    for (const file of this.#files) bytes += file.extentBytes;
+    for (let file = this.#first; file !== null; file = file.next) bytes += file.extentBytes;
     return bytes;
   }
 
   async create(queryId: number, budget: ByteBudget): Promise<SpillFile> {
-    if (this.#closing !== null) throw new TypeError("The spill service is closed");
-    const file = new ScratchSpillFile(this, queryId, budget, this.#generation);
-    this.#files.add(file);
+    if (this.#closing !== null || this.#sweeping)
+      throw new TypeError("The spill service is closed or sweeping");
+    if (this.#failure !== null) throw this.#failure;
+    const file = new ScratchSpillFile(this, queryId, budget, this.#generation, ++this.#identity);
+    file.next = this.#first;
+    if (this.#first !== null) this.#first.previous = file;
+    this.#first = file;
     return file;
   }
 
-  async sweep(): Promise<void> {
-    for (const file of this.#files) file.kill();
-    this.#files.clear();
-    this.#generation += 1;
-    this.#map = new FreeSpaceMap(DATA_ALIGN);
-    await this.#scratch.truncate(0);
-    await this.#scratch.dispose?.();
+  #unlink(file: ScratchSpillFile): void {
+    if (file.previous !== null) file.previous.next = file.next;
+    else this.#first = file.next;
+    if (file.next !== null) file.next.previous = file.previous;
+    file.previous = null;
+    file.next = null;
   }
 
-  /**
-   * Terminal (the owner is closing; unlike `sweep`, nothing is reused afterwards): no new file is
-   * created, every file closes (finishing the operations that already passed its live check, then
-   * releasing its space), releases in flight finish, and only then is the scratch space's memory
-   * charge returned (review B1-p2e finding 1: disposing first let a suspended append write after
-   * it, reloading a charged index and leaving extents nobody released). Idempotent.
-   */
+  #serial<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.#queue.then(async () => {
+      if (this.#failure !== null) throw this.#failure;
+      try {
+        return await work();
+      } catch (error) {
+        this.#failure = spillError(error);
+        throw this.#failure;
+      }
+    });
+    this.#queue = run.catch(() => undefined);
+    return run;
+  }
+
+  async #drain(): Promise<void> {
+    while (this.#first !== null) await this.#first.close().catch(() => undefined);
+    await this.#queue;
+  }
+
+  async sweep(): Promise<void> {
+    if (this.#closing !== null || this.#sweeping)
+      throw new TypeError("The spill service is closed or sweeping");
+    this.#sweeping = true;
+    try {
+      // Keep the workspace and batches charged until all previously started I/O has settled.
+      await this.#drain();
+      this.#generation++;
+      await this.#scratch.truncate(0);
+      await this.#ranges.reset();
+      await this.#scratch.dispose?.();
+      this.#end = 0;
+      this.#failure = null;
+    } finally {
+      this.#sweeping = false;
+    }
+  }
+
   close(): Promise<void> {
     this.#closing ??= this.#close();
     return this.#closing;
   }
-
   async #close(): Promise<void> {
-    await Promise.all([...this.#files].map((file) => file.close().catch(() => undefined)));
-    await Promise.all([...this.#releasing]);
-    this.#generation += 1;
-    this.#map = new FreeSpaceMap(DATA_ALIGN);
-    await this.#scratch.dispose?.();
+    try {
+      await this.#drain();
+      await this.#scratch.dispose?.();
+    } finally {
+      this.#generation++;
+      this.#pool.length = 0;
+      this.#release.length = 0;
+      this.#ranges.close();
+    }
   }
-
   get generation(): number {
     return this.#generation;
   }
 
-  /** Space for `bytes`, after `last` if that space is free (a sequential run). */
-  allocate(bytes: number, last: DataRange | null): DataRange {
-    const size = this.#map.sizeOf(bytes);
-    if (last !== null) {
-      const after = last.offset + this.#map.sizeOf(last.length);
-      if (this.#map.allocateAt(after, size)) return { offset: after, length: size };
-    }
-    return { offset: this.#map.allocate(size), length: size };
+  allocate(bytes: number, chain: RangeChain): Promise<DataRange> {
+    return this.#serial(async () => {
+      const size = Math.ceil(bytes / DATA_ALIGN) * DATA_ALIGN;
+      if (!Number.isSafeInteger(size) || size <= 0)
+        throw new RangeError("Invalid spill allocation");
+      const after = chain.lastOffset + chain.lastLength;
+      let offset = chain.tail === 0 ? null : await this.#ranges.take(size, after);
+      if (offset === null && chain.tail !== 0 && after === this.#end) offset = this.#end;
+      offset ??= await this.#ranges.take(size, null);
+      offset ??= this.#end;
+      this.#end = Math.max(this.#end, offset + size);
+      await this.#ranges.append(chain, offset, size);
+      return { offset, length: size };
+    });
   }
 
   async write(offset: number, bytes: Uint8Array): Promise<void> {
@@ -127,32 +178,53 @@ export class ScratchSpillService implements SpillService {
       throw spillError(error);
     }
   }
-
   async readInto(offset: number, target: Uint8Array): Promise<void> {
     await this.#scratch.readInto(offset, target);
   }
 
-  /** Frees the never-written tail of a reserved `extent` beyond `used` bytes; returns its size. */
-  trim(extent: DataRange, used: number): number {
-    const kept = this.#map.sizeOf(used);
-    if (kept < extent.length) this.#map.free(extent.offset + kept, extent.length - kept);
-    return extent.length - kept;
+  trim(extent: DataRange, used: number, chain: RangeChain): Promise<number> {
+    return this.#serial(async () => {
+      const freed = extent.length - Math.ceil(used / DATA_ALIGN) * DATA_ALIGN;
+      if (freed > 0) {
+        await this.#ranges.trim(chain, freed);
+        await this.#ranges.add(extent.offset + extent.length - freed, freed);
+      }
+      return freed;
+    });
   }
 
-  /** Returns a closed file's extents: released to the platform, then reusable. */
-  async release(file: ScratchSpillFile, ranges: readonly DataRange[]): Promise<void> {
-    this.#files.delete(file);
-    if (ranges.length === 0 || file.generation !== this.#generation) return;
-    const run = (async () => {
-      await this.#scratch.release(ranges);
-      if (file.generation !== this.#generation) return;
-      for (const range of ranges) this.#map.free(range.offset, range.length);
-    })();
-    this.#releasing.add(run);
+  async release(file: ScratchSpillFile): Promise<void> {
     try {
-      await run;
+      await this.#serial(async () => {
+        const ranges = this.#ranges,
+          frame = ranges.releaseFrame,
+          view = new DataView(frame.buffer);
+        let id = file.chain.head;
+        while (id !== 0) {
+          await ranges.read(id, file.chain.owner, frame);
+          const next = view.getFloat64(16, true),
+            count = view.getUint32(24, true);
+          for (let start = 0; start < count; start += SCRATCH_RELEASE_BATCH) {
+            this.#release.length = 0;
+            for (let i = 0; i < Math.min(SCRATCH_RELEASE_BATCH, count - start); i++) {
+              const range = this.#pool[i];
+              if (range === undefined) throw new Error("Missing release descriptor");
+              range.offset = view.getFloat64(32 + (start + i) * 16, true);
+              range.length = view.getFloat64(40 + (start + i) * 16, true);
+              this.#release.push(range);
+            }
+            await this.#scratch.release(this.#release);
+            for (const range of this.#release) await ranges.add(range.offset, range.length);
+          }
+          await ranges.recycle(id);
+          id = next;
+        }
+        this.#end = await ranges.dropTail(this.#end);
+        // Truncate only after release and free-directory updates have both settled.
+        await this.#scratch.truncate(this.#end);
+      });
     } finally {
-      this.#releasing.delete(run);
+      this.#unlink(file);
     }
   }
 }
@@ -162,20 +234,15 @@ class ScratchSpillFile implements SpillFile {
   readonly generation: number;
   readonly #service: ScratchSpillService;
   readonly #budget: ByteBudget;
-  /**
-   * The file's space, adjacent ranges coalesced (a sequential run is one entry), so bookkeeping is
-   * O(1) per flush (review B1-p2b finding 3). The pending batch's reservation is always the tail of
-   * the last entry.
-   */
-  readonly #extents: Array<{ offset: number; length: number }> = [];
+  readonly chain: RangeChain;
+  next: ScratchSpillFile | null = null;
+  previous: ScratchSpillFile | null = null;
   #extentBytes = 0;
   #closing: Promise<void> | null = null;
   /** The batch buffer, or null when the budget refused it or the file is closed. */
   #batch: Uint8Array | null;
   /** Where the batch's bytes will go: the scratch offset of its first byte, once allocated. */
   #batchLength = 0;
-  /** Refs of pages still in the batch: page offset → its place in the batch. */
-  readonly #batched = new Map<number, number>();
   #length = 0;
   #state: "open" | "closed" | "dead" = "open";
   /** Appends and reads run one at a time (the batch buffer is shared state). */
@@ -186,7 +253,9 @@ class ScratchSpillFile implements SpillFile {
     queryId: number,
     budget: ByteBudget,
     generation: number,
+    identity: number,
   ) {
+    this.chain = new RangeChain(identity);
     this.#service = service;
     this.queryId = queryId;
     this.#budget = budget;
@@ -204,22 +273,7 @@ class ScratchSpillFile implements SpillFile {
 
   /** Runs of contiguous space the file holds (diagnostics: a sequential file holds one). */
   get extentRuns(): number {
-    return this.#extents.length;
-  }
-
-  /** Records newly allocated space, extending the last entry when it is adjacent. */
-  #claim(range: DataRange): void {
-    const last = this.#extents.at(-1);
-    if (last !== undefined && last.offset + last.length === range.offset)
-      last.length += range.length;
-    else this.#extents.push({ offset: range.offset, length: range.length });
-    this.#extentBytes += range.length;
-  }
-
-  /** The service swept: nothing of this file exists any more. */
-  kill(): void {
-    this.#state = "dead";
-    this.#dropBatch();
+    return this.chain.count;
   }
 
   #serial<T>(work: () => Promise<T>): Promise<T> {
@@ -238,13 +292,13 @@ class ScratchSpillFile implements SpillFile {
       const batch = this.#batch;
       if (batch !== null && page.length <= batch.length) {
         if (this.#batchLength + page.length > batch.length) await this.#flush();
-        const ref = this.#placeInBatch(page, checksum);
+        const ref = await this.#placeInBatch(page, checksum);
         return ref;
       }
       // No batch buffer, or a page larger than it: flush what is batched, then write it alone.
       await this.#flush();
-      const extent = this.#service.allocate(page.length, this.#extents.at(-1) ?? null);
-      this.#claim(extent);
+      const extent = await this.#service.allocate(page.length, this.chain);
+      this.#extentBytes += extent.length;
       await this.#service.write(extent.offset, page);
       this.#length += page.length;
       return { offset: extent.offset, length: page.length, checksum };
@@ -252,18 +306,17 @@ class ScratchSpillFile implements SpillFile {
   }
 
   /** Copies a page into the batch, reserving the batch's extent with its first page. */
-  #placeInBatch(page: Uint8Array, checksum: number): SpillPageRef {
+  async #placeInBatch(page: Uint8Array, checksum: number): Promise<SpillPageRef> {
     const batch = this.#batch;
     if (batch === null) throw new Error("No batch buffer");
     if (this.#batchLength === 0) {
-      this.#batchExtent = this.#service.allocate(batch.length, this.#extents.at(-1) ?? null);
-      this.#claim(this.#batchExtent);
+      this.#batchExtent = await this.#service.allocate(batch.length, this.chain);
+      this.#extentBytes += this.#batchExtent.length;
     }
     const extent = this.#batchExtent;
     if (extent === null) throw new Error("No batch extent");
     const offset = extent.offset + this.#batchLength;
     batch.set(page, this.#batchLength);
-    this.#batched.set(offset, this.#batchLength);
     this.#batchLength += page.length;
     this.#length += page.length;
     return { offset, length: page.length, checksum };
@@ -278,11 +331,8 @@ class ScratchSpillFile implements SpillFile {
     if (batch === null || extent === null || this.#batchLength === 0) return;
     await this.#service.write(extent.offset, batch.subarray(0, this.#batchLength));
     // The batch's reservation is the tail of the last entry: give back its unused part there.
-    const freed = this.#service.trim(extent, this.#batchLength);
-    const last = this.#extents.at(-1);
-    if (last !== undefined) last.length -= freed;
+    const freed = await this.#service.trim(extent, this.#batchLength, this.chain);
     this.#extentBytes -= freed;
-    this.#batched.clear();
     this.#batchLength = 0;
     this.#batchExtent = null;
   }
@@ -302,8 +352,8 @@ class ScratchSpillFile implements SpillFile {
   }
 
   async #fill(ref: SpillPageRef, target: Uint8Array): Promise<void> {
-    const inBatch = this.#batched.get(ref.offset);
-    if (inBatch !== undefined && this.#batch !== null)
+    const inBatch = this.#batchExtent === null ? -1 : ref.offset - this.#batchExtent.offset;
+    if (inBatch >= 0 && inBatch + ref.length <= this.#batchLength && this.#batch !== null)
       target.set(this.#batch.subarray(inBatch, inBatch + ref.length));
     else await this.#service.readInto(ref.offset, target);
     if (xxHash32(target) !== ref.checksum)
@@ -323,14 +373,19 @@ class ScratchSpillFile implements SpillFile {
   }
 
   async #close(): Promise<void> {
-    const live = this.#state === "open";
     this.#state = "closed";
     await this.#queue;
     this.#dropBatch();
-    this.#batched.clear();
-    const extents = live ? this.#extents.splice(0) : [];
     this.#extentBytes = 0;
     this.#length = 0;
-    await this.#service.release(this, extents);
+    try {
+      await this.#service.release(this);
+    } finally {
+      this.chain.head = 0;
+      this.chain.tail = 0;
+      this.chain.count = 0;
+      this.chain.lastOffset = 0;
+      this.chain.lastLength = 0;
+    }
   }
 }

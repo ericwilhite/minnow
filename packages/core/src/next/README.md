@@ -460,7 +460,7 @@ its memory-store results exclude payload fetch, SQL, owner transport and real di
   records scale with log bytes / 64 KiB rather than with commits (the tail's buffer is charged to
   the memory registration); truncate and reset move the
   logical end when called, in order with appends. A malformed or exhausted epoch refuses
-  ownership; the spill store's record index is charged to the spill service's registration.
+  ownership; scratch uses native persisted-index lookups without a resident record directory.
   Every acquisition opens its own connection, and every transaction of it runs through one
   serialized chain. Releasing the lease lets in-flight transactions finish (up to 500 ms), aborts
   any left and waits for their abort events (up to 1 s more: past it, the release still closes and
@@ -1255,15 +1255,18 @@ and the owner import it directly.
   storage free map. Only the in-memory backend uses the in-memory service.
 - Logically emptied on open, never named by the root, catalog or log.
 - No per-query caps.
-- Write batching is charged to the operator's budget, and is skipped when the budget refuses, so
-  spilling never needs memory beyond the page in hand.
-- `scratch-spill.ts` is the service over a backend's `ScratchSpace` (the OPFS `spill` file or
-  IndexedDB's `spill` store): one free map, 256 KiB batches written as extents that extend
-  the file's last one, checksummed reads, `sweep` at startup. It owns an optional memory
-  registration, charged over its lifetime with what the scratch space keeps per extent
-  (IndexedDB's record index; `chargeTo`), returned at `sweep` and `close` (`dispose`). Its `close`
-  is terminal: it refuses new files, lets every file finish what already started and release its
-  space, and returns the charge last.
+- Write batching is charged to the operator's budget and is skipped when it refuses. The owner
+  first admits the shared allocator's fixed 20 KiB workspace through the constructor's `budget`.
+  Metadata growth then pages to scratch without another operator allocation or a refusal.
+- `scratch-spill.ts` keeps ownership and exact, coalesced free ranges in checksummed 4 KiB pages.
+  Files hold scalar chain coordinates; no resident range vector or per-page batch map grows with
+  append count. One cached page, two I/O frames, native-response credit and sixteen pooled release
+  descriptors stay charged until accepted I/O settles. Closed metadata pages are recycled.
+- OPFS opens one additional long-lived `spill-meta` handle. IndexedDB uses positive numeric keys
+  in `meta`, separate from private extent-space pages and durable string keys. Startup sweep
+  drains old files and discards both scratch namespaces. Neither is recovered or changes the
+  supported database format. Terminal `close` refuses new files, drains accepted I/O and native
+  releases, drops its frames and returns the workspace charge last.
 
 ### Memory (`memory/governor.ts`)
 

@@ -411,6 +411,7 @@ export class SimLease implements OwnerLease {
       this.scratch,
       this.files.metadata,
       this.files.metadataIndex,
+      this.files.spillMetadata,
     ])
       file?.close();
   }
@@ -464,13 +465,14 @@ export class SimBackend implements StorageBackend {
   #openFiles(exclusive: boolean): { files: FileSet; scratch: SimFile } {
     const opened: SimFile[] = [];
     try {
-      for (const name of [...FILE_NAMES, "spill", "space-meta", "space-meta-index"])
+      for (const name of [...FILE_NAMES, "spill", "space-meta", "space-meta-index", "spill-meta"])
         opened.push(this.disk.open(name, exclusive));
     } catch (error) {
       for (const file of opened) file.close();
       throw error;
     }
-    const [log, data, root0, root1, scratch, metadata, metadataIndex] = opened as [
+    const [log, data, root0, root1, scratch, metadata, metadataIndex, spillMetadata] = opened as [
+      SimFile,
       SimFile,
       SimFile,
       SimFile,
@@ -479,7 +481,10 @@ export class SimBackend implements StorageBackend {
       SimFile,
       SyncFile,
     ];
-    return { files: { log, data, roots: [root0, root1], metadata, metadataIndex }, scratch };
+    return {
+      files: { log, data, roots: [root0, root1], metadata, metadataIndex, spillMetadata },
+      scratch,
+    };
   }
 
   async acquire(options: AcquireOptions = {}): Promise<SimLease> {
@@ -531,9 +536,13 @@ export class SimBackend implements StorageBackend {
   scratch(lease: OwnerLease): ScratchSpace | null {
     if (!(lease instanceof SimLease) || !this.#leases.has(lease))
       throw new TypeError("The lease was not acquired from this backend");
-    return new FileScratch(lease.scratch, () => {
-      lease.guard();
-    });
+    return new FileScratch(
+      lease.scratch,
+      () => {
+        lease.guard();
+      },
+      lease.files.spillMetadata,
+    );
   }
 
   /** Process restart after `disk.powerLoss()`: every lock holder is gone. */

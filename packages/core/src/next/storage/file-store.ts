@@ -23,6 +23,7 @@ import {
   StoreCorruptionError,
   type DataRange,
   type ScratchSpace,
+  type ScratchMetadata,
   type StoreSession,
   type SyncFile,
 } from "./contract.js";
@@ -36,6 +37,7 @@ export interface FileSet {
   readonly roots: readonly [SyncFile, SyncFile];
   readonly metadata?: SyncFile;
   readonly metadataIndex?: SyncFile;
+  readonly spillMetadata?: SyncFile;
 }
 
 export const FILE_NAMES = ["log", "data", "root-0", "root-1"] as const;
@@ -253,9 +255,38 @@ export class FileScratch implements ScratchSpace {
   readonly #file: SyncFile;
   readonly #guard: () => void;
 
-  constructor(file: SyncFile, guard: () => void) {
+  constructor(
+    file: SyncFile,
+    guard: () => void,
+    readonly metadataFile?: SyncFile,
+  ) {
     this.#file = file;
     this.#guard = guard;
+  }
+
+  metadata(): ScratchMetadata {
+    const file = this.metadataFile;
+    if (file === undefined) throw new TypeError("Scratch allocator metadata backing is missing");
+    const check = (page: number, bytes: Uint8Array) => {
+      if (!Number.isSafeInteger(page) || page < 0 || bytes.byteLength !== DATA_ALIGN)
+        throw new RangeError("Invalid scratch metadata page");
+    };
+    return {
+      read: async (page, target) => {
+        check(page, target);
+        this.#guard();
+        readFully(file, page * DATA_ALIGN, target);
+      },
+      write: async (page, bytes) => {
+        check(page, bytes);
+        this.#guard();
+        writeAll(file, bytes, page * DATA_ALIGN);
+      },
+      reset: async () => {
+        this.#guard();
+        file.truncate(0);
+      },
+    };
   }
 
   async write(offset: number, bytes: Uint8Array): Promise<void> {

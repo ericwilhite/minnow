@@ -33,17 +33,22 @@
  *   executor track and must round-trip every `VectorData` variant exactly, locators included.
  * - Implementations batch small appends into large sequential writes (≥256 KiB). The batching
  *   buffer is charged to the `budget` given to `create` (the writing operator's grant); when the
- *   budget refuses it, appends write each page directly, so spilling never needs memory beyond the
- *   page the operator already holds. `readInto` reads into the caller's own (charged, reused)
+ *   budget refuses it, appends write each page directly, so operators need no additional workspace beyond the
+ *   page they already hold. The owner prepays the shared allocator's fixed 20 KiB workspace;
+ *   ownership and free-range growth page to scratch instead of growing resident arrays. `readInto` reads into the caller's own (charged, reused)
  *   buffer; `read` returns a new array the caller must account for.
  *
  * ## Implementations
  * - The scratch service (storage track, phase 2: `spill/scratch-spill.ts`), for OPFS and
- *   IndexedDB alike: one `FreeSpaceMap` (storage/free-space.ts) over the backend's
- *   `ScratchSpace`. Each `SpillFile` is a list of extents; it extends its last extent in place when
- *   the space after it is free (`allocateAt`), so a run is written and read back sequentially
+ *   IndexedDB alike: paged ownership and sorted/coalesced free ranges over the backend's
+ *   `ScratchSpace`. Each `SpillFile` holds scalar chain coordinates; it extends its last extent when
+ *   the space after it is free, so a run is written and read back sequentially
  *   (on IndexedDB, one record per batched write). Writes are never flushed. Closed files' extents
- *   go to `ScratchSpace.release` before reuse. `sweep` empties the map and calls `truncate(0)`.
+ *   go to `ScratchSpace.release` before reuse. `sweep` drains old files and discards payload and private metadata. A close streams at most
+ *   sixteen ranges per native release. Metadata pages are recycled as files close; there are no
+ *   per-query native files. OPFS opens one extra `spill-meta` handle; IndexedDB uses positive
+ *   numeric keys in `meta`, separate from negative extent-space metadata keys and durable string
+ *   keys. Neither namespace is recovered, so this does not change the supported database format.
  * - `MemorySpillService` (memory-spill.ts): the test double, and the service for the in-memory
  *   backend only (`scratch` is null there: the whole database is already in memory).
  *
