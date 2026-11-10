@@ -1,0 +1,135 @@
+diff --git i/packages/core/src/next/README.md w/packages/core/src/next/README.md
+index b5f8880d..3e991b98 100644
+--- i/packages/core/src/next/README.md
++++ w/packages/core/src/next/README.md
+@@ -1004,9 +1004,10 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
+     loading. The historical scan-adapter/scan-core diagnostics request a 64 MiB row window
+     through `TableScan.readWindowBytes` and
+     the `chunkReads` factory: B2's shared `loadTogether` and one-pass pooled leases. This
+-    window is also the production default for a terminal, unfiltered full-table scan (including
+-    identity projections), with no runtime filter or locator consumer. Other plans retain cached
+-    reads; direct TableScan callers still opt in with `readWindowBytes`. Filtered/deleted groups
++    64 MiB window remains the production default for an ordinary terminal, unfiltered full-table
++    scan (including identity projections), with no runtime filter or locator consumer. Explicit
++    recycling exports cap that coalesced source window at 32 MiB; their separate owned-output
++    target remains 2 MiB at the default cap/window. Other plans retain cached reads; direct TableScan callers still opt in with `readWindowBytes`. Filtered/deleted groups
+     retain selective reads. Resident shared loads preserve synchronous `next()` steps until a task yield is due. A refused
+     optional window drops partial loads and shrinks before
+     falling back to batch reads. Window planning, cached installation, sorting and read/page
+@@ -2982,7 +2983,8 @@ closes; this is setup outside measured export time and does not raise the query
+ 
+ Terminal full-table `exportStream()` execution uses exact non-retaining reads during
+ admission sizing and exact read-step fallbacks (`ReadOptions.retain: false`). Successful
+-one-pass window reads keep their existing private coalesced slabs. Cache hits are still
++one-pass window reads keep their existing private coalesced slabs, with a 32 MiB source-window
++cap only for explicit recycling exports. Cache hits are still
+ served and kept in place; misses are verified private copies from the fixed read slab,
+ charged exactly to the lease, without slab-gap or pool-rounding growth. They are released
+ through the usual lease lifecycle, including cancellation/error cleanup. Shared-clock pacing
+diff --git i/packages/core/src/next/exec/plan.ts w/packages/core/src/next/exec/plan.ts
+index 6085a126..03dc2906 100644
+--- i/packages/core/src/next/exec/plan.ts
++++ w/packages/core/src/next/exec/plan.ts
+@@ -1398,15 +1398,19 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
+           progress = 0;
+         bounds.clear();
+         for (const source of sources) {
++          const streamingExport = !!runtime.request.outputBuffers && source.windowBytes > 0;
++          // Keep ordinary scan residency unchanged. Explicit streaming exports bound their
++          // coalesced source window separately from the owned-output batch target.
++          const windowBytes = streamingExport
++            ? Math.min(source.windowBytes, 32 * 1024 * 1024)
++            : source.windowBytes;
+           const bound = yield* readValue(
+             boundSource(
+               runtime.view,
+               {
+                 ...source,
+-                windowBytes: windows ? source.windowBytes : 0,
+-                ...(runtime.request.outputBuffers && source.windowBytes > 0
+-                  ? { retain: false }
+-                  : {}),
++                windowBytes: windows ? windowBytes : 0,
++                ...(streamingExport ? { retain: false } : {}),
+                 rows: demand.get(source.id) ?? null,
+               },
+               runtime.request.governor,
+diff --git i/packages/core/src/testing/reach.ts w/packages/core/src/testing/reach.ts
+index a6ac358a..baf478a7 100644
+--- i/packages/core/src/testing/reach.ts
++++ w/packages/core/src/testing/reach.ts
+@@ -1392,6 +1392,8 @@ export const BENCH_ROOT_ADMISSION_REACH = [
+ export const OWNER_API_BENCH_REACH = [
+   "export private miss",
+   "ordinary retained metadata",
++  "export 32 MiB window",
++  "ordinary 64 MiB window",
+   "real SQL identity projection",
+   "wire totals",
+   "first export",
+diff --git i/scripts/browser-perf/page/owner-export.test.ts w/scripts/browser-perf/page/owner-export.test.ts
+index 8a1ee073..fa9c6cec 100644
+--- i/scripts/browser-perf/page/owner-export.test.ts
++++ w/scripts/browser-perf/page/owner-export.test.ts
+@@ -1,6 +1,6 @@
+ /** The measured API path must decode real stored pages via SQL and preserve independent values. */
+ import fc from "fast-check";
+-import { expect, it } from "vitest";
++import { expect, it, vi } from "vitest";
+ import { seedsFor } from "../../../packages/core/src/testing/seeds.js";
+ import {
+   createReach,
+@@ -9,6 +9,7 @@ import {
+ } from "../../../packages/core/src/testing/reach.js";
+ import { MemoryExtentSpace } from "../../../packages/core/src/next/page/memory-extents.js";
+ import { defined, valueAt, writeGroup } from "../../../packages/core/src/next/page/test-support.js";
++import { QueryRuntime } from "../../../packages/core/src/next/exec/run.js";
+ import { Governor } from "../../../packages/core/src/next/memory/governor.js";
+ import { ProtocolClient } from "../../../packages/core/src/next/owner/client.js";
+ import { payloadBytes } from "../../../packages/core/src/next/owner/frame.js";
+@@ -56,8 +57,17 @@ for (const seed of seedsFor("owner-api-bench", [0xb2f2, 0xb2f3]))
+             memory: () => ({ governorHeld: governor.usedBytes }),
+           });
+           await client.connect(channels.port2);
++          const windows: number[] = [],
++            originalBounds = QueryRuntime.prototype.sourceBounds;
++          const observeBounds = vi
++            .spyOn(QueryRuntime.prototype, "sourceBounds")
++            .mockImplementation(function (this: QueryRuntime, bounds) {
++              for (const bound of bounds.values()) windows.push(bound.windowBytes);
++              originalBounds.call(this, bounds);
++            });
+           try {
+             for (let pass = 0; pass < 2; pass++) {
++              windows.length = 0;
+               const completion = actor.arm(),
+                 stream = client.exportStream("SELECT * FROM t");
+               completion.catch(() => undefined);
+@@ -98,6 +108,8 @@ for (const seed of seedsFor("owner-api-bench", [0xb2f2, 0xb2f3]))
+               await stream.done;
+               const result = await completion;
+               expect(actual).toEqual(source);
++              expect(windows.at(-1)).toBe(32 * 1048576);
++              reach.reach("export 32 MiB window");
+               for (const column of group.columns) expect(space.peek(column.directory)).toBeNull();
+               reach.reach("export private miss");
+               expect(result.rows).toBe(count);
+@@ -133,14 +145,18 @@ for (const seed of seedsFor("owner-api-bench", [0xb2f2, 0xb2f3]))
+             reach.reach(sparse ? "sparse NULLs" : "all valid");
+             const completion = actor.arm();
+             completion.catch(() => undefined);
++            windows.length = 0;
+             const ordinary = await client.query("SELECT * FROM t");
+             await completion;
+             expect(ordinary.rows()).toEqual(source);
++            expect(windows.at(-1)).toBe(64 * 1048576);
++            reach.reach("ordinary 64 MiB window");
+             expect(group.columns.some((column) => space.peek(column.directory) !== null)).toBe(
+               true,
+             );
+             reach.reach("ordinary retained metadata");
+           } finally {
++            observeBounds.mockRestore();
+             client.close();
+             await actor.close();
+             channels.port2.close();

@@ -3011,3 +3011,17 @@ interval under load. `MINNOW_EXPORT_CPU_DIR` keeps raw worker profiles.
 chains SHA-256 over frame metadata and all native bytes before relinquishing each frame. Its
 extra scratch copies/crypto work invalidate performance timing, so never use those runs as
 throughput or RSS acceptance. All automatic benchmark scratch uses `os.tmpdir()`.
+
+The retention follow-up uses the real `exportStream()` path in five interleaved campaign pairs,
+with five exports per persistent process and a fixed post-setup baseline in each campaign.
+The copied-group profile fixture is not Gate A acceptance. Non-retaining admission/fallback
+reads remove the roughly 305 MiB retained page cache: median campaign peak RSS growth falls
+from 705 to 231 MiB, beyond the measured spread. Whole-export throughput and all-thread CPU
+show no regression beyond spread; two of the first 25 candidate passes still exceed +256 MiB.
+A second five-pair comparison of 32 MiB export windows has no RSS improvement beyond spread
+and still exceeds the bound in two passes, so the production source window stays at 64 MiB.
+The rejected patch and complete records are in `scripts/browser-perf/experiments/`
+(`window32-rejected.patch`, `export-retention-result.json`). The final retained implementation's
+five full-width physical frame hashes equal the frozen parent. Post-campaign forced GC remains
+a diagnostic outside timing and sampled peaks; it is never used between the five passes.
+The memory gate and quiet-host throughput target remain outstanding.
