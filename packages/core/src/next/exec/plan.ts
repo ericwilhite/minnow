@@ -1404,6 +1404,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               {
                 ...source,
                 windowBytes: windows ? source.windowBytes : 0,
+                ...(runtime.request.outputBuffers && source.windowBytes > 0
+                  ? { retain: false }
+                  : {}),
                 rows: demand.get(source.id) ?? null,
               },
               runtime.request.governor,

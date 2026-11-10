@@ -64,9 +64,9 @@ export class ReadStep {
       throw new ReadStepBoundaryError();
   }
 
-  reader(pages: SpaceReader): SpaceReader {
+  reader(pages: SpaceReader, nonRetaining = false): SpaceReader {
     return {
-      peek: (ref, options) => pages.peek(ref, options),
+      peek: (ref, options) => pages.peek(ref, nonRetaining ? { ...options, once: true } : options),
       parsed: (ref) => pages.parsed?.(ref) ?? null,
       attach: (ref, parsed, bytes, of) => pages.attach?.(ref, parsed, bytes, of) ?? false,
       read: (refs, options): Promise<ReadLease> => {
@@ -78,8 +78,8 @@ export class ReadStep {
         const previous = this.#tail;
         const work =
           previous === null
-            ? this.#read(pages, refs, options)
-            : previous.then(() => this.#read(pages, refs, options));
+            ? this.#read(pages, refs, options, nonRetaining)
+            : previous.then(() => this.#read(pages, refs, options, nonRetaining));
         const tail = work.then(
           () => undefined,
           () => undefined,
@@ -123,6 +123,7 @@ export class ReadStep {
     pages: SpaceReader,
     refs: Parameters<SpaceReader["read"]>[0],
     options: Parameters<SpaceReader["read"]>[1],
+    nonRetaining: boolean,
   ): Promise<ReadLease> {
     this.signal.throwIfAborted();
     options.signal?.throwIfAborted();
@@ -143,7 +144,13 @@ export class ReadStep {
       const signal =
         options.signal === undefined ? this.signal : AbortSignal.any([this.signal, options.signal]);
       try {
-        lease = await pages.read(refs, { ...options, budget, signal, reuseBuffers: false });
+        lease = await pages.read(refs, {
+          ...options,
+          ...(nonRetaining && options.once !== true ? { retain: false } : {}),
+          budget,
+          signal,
+          reuseBuffers: false,
+        });
       } catch (error) {
         // Optional one-pass gaps/pool rounding must not expand the admitted step. The
         // ordinary verified path charges exactly the references and uses its fixed slabs.
@@ -153,6 +160,7 @@ export class ReadStep {
           budget,
           signal,
           once: false,
+          ...(nonRetaining ? { retain: false } : {}),
           reuseBuffers: false,
         });
       }

@@ -51,6 +51,10 @@ const exportBaseline =
 export default defineConfig({
   plugins: [
     isolatedPages,
+    // Paired whole-owner campaigns use the exact parent core on its ordinary module IDs.
+    ...(process.env.MINNOW_EXPORT_RETENTION_REFERENCE
+      ? [executorSnapshot(process.env.MINNOW_EXPORT_RETENTION_REFERENCE, true).vite]
+      : []),
     ...(process.env.MINNOW_EXPORT_DICTIONARY_COMPARE === "1" ? [dictionaryComparison()] : []),
     ...(process.env.MINNOW_EXPORT_FIXTURE_DIR
       ? [gateAFixtureServer(process.env.MINNOW_EXPORT_FIXTURE_DIR)]

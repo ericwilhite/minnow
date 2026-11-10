@@ -346,6 +346,14 @@ export type OpenExtentSpace = (
 // ── Reading ────────────────────────────────────────────────────────────────────────────────────
 
 export interface ReadOptions {
+  /** Optional shared task clock for paced exact private reads. */
+  readonly task?: TaskWork;
+  /** false: exact-sized, verified private misses, never admitted or pooled. Existing hits
+   * remain usable without promotion. Only distinct reference bytes are leased/charged;
+   * coalescing uses the store's already charged fixed scratch, with no gap/rounding debt.
+   * Default true preserves ordinary cache admission. Overrides once/reuseBuffers geometry. */
+  readonly retain?: boolean;
+
   /** Charged for every byte the lease holds, cached or not, until `release` (ruling R5). */
   readonly budget: ByteBudget;
   readonly signal?: AbortSignal;

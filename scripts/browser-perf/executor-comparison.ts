@@ -6,7 +6,7 @@ import { resolve, relative } from "node:path";
 import type { Plugin as VitePlugin } from "vite";
 import type { Plugin as EsbuildPlugin } from "esbuild";
 
-export function executorSnapshot(revision: string) {
+export function executorSnapshot(revision: string, normalIds = false) {
   const root = resolve("packages/core/src/next");
   const sources = new Map<string, string>();
   const source = (file: string) => {
@@ -35,7 +35,12 @@ export function executorSnapshot(revision: string) {
     enforce: "pre",
     load(id) {
       const [file, query] = id.split("?");
-      if (!file || !new URLSearchParams(query).has("executorBaseline")) return;
+      if (!file) return;
+      if (normalIds) {
+        if (!file.startsWith(root + "/") || !file.endsWith(".ts")) return;
+        return source(file);
+      }
+      if (!new URLSearchParams(query).has("executorBaseline")) return;
       let text = source(file);
       // Relative imports remain in the frozen family. No source fallback is allowed.
       text = text.replace(

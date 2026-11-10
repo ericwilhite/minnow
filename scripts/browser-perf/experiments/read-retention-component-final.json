@@ -1,0 +1,1056 @@
+{
+  "reference": "97192fcd",
+  "scope": "Final policy: preserve private window geometry; private admission/fallback only. Five fresh-process AB BA AB BA AB rounds; warm second phases; no indexed SQL keyLookup claim.",
+  "rounds": [
+    {
+      "round": 0,
+      "variant": "baseline",
+      "load": [14.26, 10.29, 6.7],
+      "result": {
+        "component": {
+          "export": {
+            "cpuMs": 505.288,
+            "wallMs": 464.65648700000065,
+            "peakResident": 4194304,
+            "checksum": 1500537120,
+            "calls": 128
+          },
+          "warmScan": {
+            "cpuMs": 285.187,
+            "wallMs": 278.24588700000004,
+            "backendReads": 0
+          },
+          "warmPoint": {
+            "cpuMs": 88.78,
+            "wallMs": 72.87767200000008,
+            "backendReads": 0,
+            "checksum": 1500537120
+          }
+        },
+        "api": [
+          {
+            "hashes": [
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047",
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047"
+            ],
+            "afterExportResident": 264924,
+            "ordinary": [
+              {
+                "cpuMs": 192.246,
+                "wallMs": 141.8128260000003,
+                "backendReads": 116,
+                "rows": 4096,
+                "resident": 264924
+              },
+              {
+                "cpuMs": 171.816,
+                "wallMs": 111.473297,
+                "backendReads": 116,
+                "rows": 4096,
+                "resident": 264924
+              }
+            ]
+          },
+          {
+            "hashes": [
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2",
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2"
+            ],
+            "afterExportResident": 1066,
+            "ordinary": [
+              {
+                "cpuMs": 6.608,
+                "wallMs": 17.414483999999902,
+                "backendReads": 2,
+                "rows": 129,
+                "resident": 1066
+              },
+              {
+                "cpuMs": 7.686,
+                "wallMs": 16.09801800000014,
+                "backendReads": 2,
+                "rows": 129,
+                "resident": 1066
+              }
+            ]
+          }
+        ],
+        "stored": {
+          "scan": [
+            {
+              "cpuMs": 370.409,
+              "wallMs": 238.27657,
+              "backendReads": 0,
+              "rows": 16384
+            },
+            {
+              "cpuMs": 187.561,
+              "wallMs": 154.65536100000008,
+              "backendReads": 0,
+              "rows": 16384
+            }
+          ],
+          "point": [
+            {
+              "cpuMs": 1139.977,
+              "wallMs": 828.2311930000005,
+              "backendReads": 0,
+              "rows": 64
+            },
+            {
+              "cpuMs": 833.249,
+              "wallMs": 728.3268319999997,
+              "backendReads": 0,
+              "rows": 64
+            }
+          ]
+        }
+      }
+    },
+    {
+      "round": 0,
+      "variant": "candidate",
+      "load": [14.24, 10.36, 6.74],
+      "result": {
+        "component": {
+          "export": {
+            "cpuMs": 317.034,
+            "wallMs": 304.13042199999995,
+            "peakResident": 0,
+            "checksum": 1500537120,
+            "calls": 128
+          },
+          "warmScan": {
+            "cpuMs": 215.921,
+            "wallMs": 188.121085,
+            "backendReads": 0
+          },
+          "warmPoint": {
+            "cpuMs": 116.849,
+            "wallMs": 93.29870700000015,
+            "backendReads": 0,
+            "checksum": 1500537120
+          }
+        },
+        "api": [
+          {
+            "hashes": [
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047",
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047"
+            ],
+            "afterExportResident": 0,
+            "ordinary": [
+              {
+                "cpuMs": 203.553,
+                "wallMs": 168.69688300000007,
+                "backendReads": 350,
+                "rows": 4096,
+                "resident": 264924
+              },
+              {
+                "cpuMs": 182.625,
+                "wallMs": 142.80737099999988,
+                "backendReads": 116,
+                "rows": 4096,
+                "resident": 264924
+              }
+            ]
+          },
+          {
+            "hashes": [
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2",
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2"
+            ],
+            "afterExportResident": 0,
+            "ordinary": [
+              {
+                "cpuMs": 6.885,
+                "wallMs": 16.01004699999976,
+                "backendReads": 5,
+                "rows": 129,
+                "resident": 1066
+              },
+              {
+                "cpuMs": 6.896,
+                "wallMs": 19.600867000000108,
+                "backendReads": 2,
+                "rows": 129,
+                "resident": 1066
+              }
+            ]
+          }
+        ],
+        "stored": {
+          "scan": [
+            {
+              "cpuMs": 352.393,
+              "wallMs": 253.3386959999998,
+              "backendReads": 0,
+              "rows": 16384
+            },
+            {
+              "cpuMs": 187.787,
+              "wallMs": 131.78718500000014,
+              "backendReads": 0,
+              "rows": 16384
+            }
+          ],
+          "point": [
+            {
+              "cpuMs": 1162.348,
+              "wallMs": 961.9964959999998,
+              "backendReads": 0,
+              "rows": 64
+            },
+            {
+              "cpuMs": 848.064,
+              "wallMs": 852.145829,
+              "backendReads": 0,
+              "rows": 64
+            }
+          ]
+        }
+      }
+    },
+    {
+      "round": 1,
+      "variant": "candidate",
+      "load": [13.53, 10.33, 6.77],
+      "result": {
+        "component": {
+          "export": {
+            "cpuMs": 329.80600000000004,
+            "wallMs": 312.7522499999998,
+            "peakResident": 0,
+            "checksum": 1500537120,
+            "calls": 128
+          },
+          "warmScan": {
+            "cpuMs": 255.997,
+            "wallMs": 255.62259500000005,
+            "backendReads": 0
+          },
+          "warmPoint": {
+            "cpuMs": 120.674,
+            "wallMs": 103.73189900000011,
+            "backendReads": 0,
+            "checksum": 1500537120
+          }
+        },
+        "api": [
+          {
+            "hashes": [
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047",
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047"
+            ],
+            "afterExportResident": 0,
+            "ordinary": [
+              {
+                "cpuMs": 203.615,
+                "wallMs": 139.56887700000016,
+                "backendReads": 350,
+                "rows": 4096,
+                "resident": 264924
+              },
+              {
+                "cpuMs": 149.264,
+                "wallMs": 132.52326399999993,
+                "backendReads": 116,
+                "rows": 4096,
+                "resident": 264924
+              }
+            ]
+          },
+          {
+            "hashes": [
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2",
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2"
+            ],
+            "afterExportResident": 0,
+            "ordinary": [
+              {
+                "cpuMs": 7.674,
+                "wallMs": 19.470907999999326,
+                "backendReads": 5,
+                "rows": 129,
+                "resident": 1066
+              },
+              {
+                "cpuMs": 7.636,
+                "wallMs": 15.538816000000224,
+                "backendReads": 2,
+                "rows": 129,
+                "resident": 1066
+              }
+            ]
+          }
+        ],
+        "stored": {
+          "scan": [
+            {
+              "cpuMs": 364.535,
+              "wallMs": 260.08366600000045,
+              "backendReads": 0,
+              "rows": 16384
+            },
+            {
+              "cpuMs": 198.221,
+              "wallMs": 165.06606999999985,
+              "backendReads": 0,
+              "rows": 16384
+            }
+          ],
+          "point": [
+            {
+              "cpuMs": 1108.024,
+              "wallMs": 875.9575140000006,
+              "backendReads": 0,
+              "rows": 64
+            },
+            {
+              "cpuMs": 852.178,
+              "wallMs": 810.8156169999993,
+              "backendReads": 0,
+              "rows": 64
+            }
+          ]
+        }
+      }
+    },
+    {
+      "round": 1,
+      "variant": "baseline",
+      "load": [13.33, 10.34, 6.79],
+      "result": {
+        "component": {
+          "export": {
+            "cpuMs": 489.69999999999993,
+            "wallMs": 415.97103699999957,
+            "peakResident": 4194304,
+            "checksum": 1500537120,
+            "calls": 128
+          },
+          "warmScan": {
+            "cpuMs": 227.734,
+            "wallMs": 183.69256499999983,
+            "backendReads": 0
+          },
+          "warmPoint": {
+            "cpuMs": 99.22,
+            "wallMs": 67.68585100000018,
+            "backendReads": 0,
+            "checksum": 1500537120
+          }
+        },
+        "api": [
+          {
+            "hashes": [
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047",
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047"
+            ],
+            "afterExportResident": 264924,
+            "ordinary": [
+              {
+                "cpuMs": 200.002,
+                "wallMs": 132.06738199999972,
+                "backendReads": 116,
+                "rows": 4096,
+                "resident": 264924
+              },
+              {
+                "cpuMs": 115.289,
+                "wallMs": 104.04728399999976,
+                "backendReads": 116,
+                "rows": 4096,
+                "resident": 264924
+              }
+            ]
+          },
+          {
+            "hashes": [
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2",
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2"
+            ],
+            "afterExportResident": 1066,
+            "ordinary": [
+              {
+                "cpuMs": 5.661,
+                "wallMs": 14.906977999999981,
+                "backendReads": 2,
+                "rows": 129,
+                "resident": 1066
+              },
+              {
+                "cpuMs": 7.045,
+                "wallMs": 14.171692999999777,
+                "backendReads": 2,
+                "rows": 129,
+                "resident": 1066
+              }
+            ]
+          }
+        ],
+        "stored": {
+          "scan": [
+            {
+              "cpuMs": 291.778,
+              "wallMs": 193.1061810000001,
+              "backendReads": 0,
+              "rows": 16384
+            },
+            {
+              "cpuMs": 170.906,
+              "wallMs": 118.15335700000014,
+              "backendReads": 0,
+              "rows": 16384
+            }
+          ],
+          "point": [
+            {
+              "cpuMs": 1101.079,
+              "wallMs": 844.3544360000005,
+              "backendReads": 0,
+              "rows": 64
+            },
+            {
+              "cpuMs": 956.955,
+              "wallMs": 798.5964159999994,
+              "backendReads": 0,
+              "rows": 64
+            }
+          ]
+        }
+      }
+    },
+    {
+      "round": 2,
+      "variant": "baseline",
+      "load": [13.06, 10.33, 6.81],
+      "result": {
+        "component": {
+          "export": {
+            "cpuMs": 453.53099999999995,
+            "wallMs": 385.5094020000006,
+            "peakResident": 4194304,
+            "checksum": 1500537120,
+            "calls": 128
+          },
+          "warmScan": {
+            "cpuMs": 243.979,
+            "wallMs": 190.5882120000001,
+            "backendReads": 0
+          },
+          "warmPoint": {
+            "cpuMs": 102.948,
+            "wallMs": 77.25638000000004,
+            "backendReads": 0,
+            "checksum": 1500537120
+          }
+        },
+        "api": [
+          {
+            "hashes": [
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047",
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047"
+            ],
+            "afterExportResident": 264924,
+            "ordinary": [
+              {
+                "cpuMs": 219.525,
+                "wallMs": 163.27027899999985,
+                "backendReads": 116,
+                "rows": 4096,
+                "resident": 264924
+              },
+              {
+                "cpuMs": 132.182,
+                "wallMs": 119.7912110000002,
+                "backendReads": 116,
+                "rows": 4096,
+                "resident": 264924
+              }
+            ]
+          },
+          {
+            "hashes": [
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2",
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2"
+            ],
+            "afterExportResident": 1066,
+            "ordinary": [
+              {
+                "cpuMs": 6.268,
+                "wallMs": 15.417821999999887,
+                "backendReads": 2,
+                "rows": 129,
+                "resident": 1066
+              },
+              {
+                "cpuMs": 7.298,
+                "wallMs": 16.611781000000065,
+                "backendReads": 2,
+                "rows": 129,
+                "resident": 1066
+              }
+            ]
+          }
+        ],
+        "stored": {
+          "scan": [
+            {
+              "cpuMs": 290.127,
+              "wallMs": 184.19034800000009,
+              "backendReads": 0,
+              "rows": 16384
+            },
+            {
+              "cpuMs": 215.225,
+              "wallMs": 144.01933000000008,
+              "backendReads": 0,
+              "rows": 16384
+            }
+          ],
+          "point": [
+            {
+              "cpuMs": 1081.532,
+              "wallMs": 778.9629139999997,
+              "backendReads": 0,
+              "rows": 64
+            },
+            {
+              "cpuMs": 1009.733,
+              "wallMs": 835.0757840000006,
+              "backendReads": 0,
+              "rows": 64
+            }
+          ]
+        }
+      }
+    },
+    {
+      "round": 2,
+      "variant": "candidate",
+      "load": [12.68, 10.34, 6.85],
+      "result": {
+        "component": {
+          "export": {
+            "cpuMs": 335.5919999999999,
+            "wallMs": 328.5893390000001,
+            "peakResident": 0,
+            "checksum": 1500537120,
+            "calls": 128
+          },
+          "warmScan": {
+            "cpuMs": 256.712,
+            "wallMs": 224.14433099999997,
+            "backendReads": 0
+          },
+          "warmPoint": {
+            "cpuMs": 120.538,
+            "wallMs": 74.92073299999993,
+            "backendReads": 0,
+            "checksum": 1500537120
+          }
+        },
+        "api": [
+          {
+            "hashes": [
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047",
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047"
+            ],
+            "afterExportResident": 0,
+            "ordinary": [
+              {
+                "cpuMs": 213.408,
+                "wallMs": 176.1647899999998,
+                "backendReads": 350,
+                "rows": 4096,
+                "resident": 264924
+              },
+              {
+                "cpuMs": 130.033,
+                "wallMs": 124.53311099999974,
+                "backendReads": 116,
+                "rows": 4096,
+                "resident": 264924
+              }
+            ]
+          },
+          {
+            "hashes": [
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2",
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2"
+            ],
+            "afterExportResident": 0,
+            "ordinary": [
+              {
+                "cpuMs": 7.69,
+                "wallMs": 20.196219999999812,
+                "backendReads": 5,
+                "rows": 129,
+                "resident": 1066
+              },
+              {
+                "cpuMs": 8.41,
+                "wallMs": 25.08045899999979,
+                "backendReads": 2,
+                "rows": 129,
+                "resident": 1066
+              }
+            ]
+          }
+        ],
+        "stored": {
+          "scan": [
+            {
+              "cpuMs": 393.235,
+              "wallMs": 417.481863,
+              "backendReads": 0,
+              "rows": 16384
+            },
+            {
+              "cpuMs": 210.893,
+              "wallMs": 183.80249999999978,
+              "backendReads": 0,
+              "rows": 16384
+            }
+          ],
+          "point": [
+            {
+              "cpuMs": 1162.371,
+              "wallMs": 967.3403400000007,
+              "backendReads": 0,
+              "rows": 64
+            },
+            {
+              "cpuMs": 926.824,
+              "wallMs": 856.3648370000001,
+              "backendReads": 0,
+              "rows": 64
+            }
+          ]
+        }
+      }
+    },
+    {
+      "round": 3,
+      "variant": "candidate",
+      "load": [12.94, 10.43, 6.9],
+      "result": {
+        "component": {
+          "export": {
+            "cpuMs": 329.031,
+            "wallMs": 375.2423469999994,
+            "peakResident": 0,
+            "checksum": 1500537120,
+            "calls": 128
+          },
+          "warmScan": {
+            "cpuMs": 286.654,
+            "wallMs": 299.54393900000014,
+            "backendReads": 0
+          },
+          "warmPoint": {
+            "cpuMs": 72.53,
+            "wallMs": 73.21281799999997,
+            "backendReads": 0,
+            "checksum": 1500537120
+          }
+        },
+        "api": [
+          {
+            "hashes": [
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047",
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047"
+            ],
+            "afterExportResident": 0,
+            "ordinary": [
+              {
+                "cpuMs": 218.156,
+                "wallMs": 160.69409300000007,
+                "backendReads": 350,
+                "rows": 4096,
+                "resident": 264924
+              },
+              {
+                "cpuMs": 140.501,
+                "wallMs": 153.71845099999973,
+                "backendReads": 116,
+                "rows": 4096,
+                "resident": 264924
+              }
+            ]
+          },
+          {
+            "hashes": [
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2",
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2"
+            ],
+            "afterExportResident": 0,
+            "ordinary": [
+              {
+                "cpuMs": 35.16,
+                "wallMs": 20.373278999999457,
+                "backendReads": 5,
+                "rows": 129,
+                "resident": 1066
+              },
+              {
+                "cpuMs": 16.433,
+                "wallMs": 20.787414999999783,
+                "backendReads": 2,
+                "rows": 129,
+                "resident": 1066
+              }
+            ]
+          }
+        ],
+        "stored": {
+          "scan": [
+            {
+              "cpuMs": 354.319,
+              "wallMs": 407.2849639999995,
+              "backendReads": 0,
+              "rows": 16384
+            },
+            {
+              "cpuMs": 208.715,
+              "wallMs": 198.64216400000078,
+              "backendReads": 0,
+              "rows": 16384
+            }
+          ],
+          "point": [
+            {
+              "cpuMs": 1233.827,
+              "wallMs": 1248.978193,
+              "backendReads": 0,
+              "rows": 64
+            },
+            {
+              "cpuMs": 913.279,
+              "wallMs": 1293.1869549999992,
+              "backendReads": 0,
+              "rows": 64
+            }
+          ]
+        }
+      }
+    },
+    {
+      "round": 3,
+      "variant": "baseline",
+      "load": [13.23, 10.58, 6.98],
+      "result": {
+        "component": {
+          "export": {
+            "cpuMs": 495.2759999999999,
+            "wallMs": 592.5497300000002,
+            "peakResident": 4194304,
+            "checksum": 1500537120,
+            "calls": 128
+          },
+          "warmScan": {
+            "cpuMs": 290.255,
+            "wallMs": 259.00248399999987,
+            "backendReads": 0
+          },
+          "warmPoint": {
+            "cpuMs": 55.911,
+            "wallMs": 53.46419100000003,
+            "backendReads": 0,
+            "checksum": 1500537120
+          }
+        },
+        "api": [
+          {
+            "hashes": [
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047",
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047"
+            ],
+            "afterExportResident": 264924,
+            "ordinary": [
+              {
+                "cpuMs": 220.851,
+                "wallMs": 142.52374800000052,
+                "backendReads": 116,
+                "rows": 4096,
+                "resident": 264924
+              },
+              {
+                "cpuMs": 184.4,
+                "wallMs": 117.55830399999923,
+                "backendReads": 116,
+                "rows": 4096,
+                "resident": 264924
+              }
+            ]
+          },
+          {
+            "hashes": [
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2",
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2"
+            ],
+            "afterExportResident": 1066,
+            "ordinary": [
+              {
+                "cpuMs": 6.115,
+                "wallMs": 20.752246999999443,
+                "backendReads": 2,
+                "rows": 129,
+                "resident": 1066
+              },
+              {
+                "cpuMs": 8.361,
+                "wallMs": 19.529867000000195,
+                "backendReads": 2,
+                "rows": 129,
+                "resident": 1066
+              }
+            ]
+          }
+        ],
+        "stored": {
+          "scan": [
+            {
+              "cpuMs": 318.659,
+              "wallMs": 220.3858879999998,
+              "backendReads": 0,
+              "rows": 16384
+            },
+            {
+              "cpuMs": 192.247,
+              "wallMs": 137.64561400000002,
+              "backendReads": 0,
+              "rows": 16384
+            }
+          ],
+          "point": [
+            {
+              "cpuMs": 1166.19,
+              "wallMs": 870.5562730000001,
+              "backendReads": 0,
+              "rows": 64
+            },
+            {
+              "cpuMs": 901.388,
+              "wallMs": 906.2382859999998,
+              "backendReads": 0,
+              "rows": 64
+            }
+          ]
+        }
+      }
+    },
+    {
+      "round": 4,
+      "variant": "baseline",
+      "load": [12.73, 10.52, 6.98],
+      "result": {
+        "component": {
+          "export": {
+            "cpuMs": 527.294,
+            "wallMs": 511.0539660000002,
+            "peakResident": 4194304,
+            "checksum": 1500537120,
+            "calls": 128
+          },
+          "warmScan": {
+            "cpuMs": 276.839,
+            "wallMs": 234.13383900000008,
+            "backendReads": 0
+          },
+          "warmPoint": {
+            "cpuMs": 83.486,
+            "wallMs": 89.94669900000008,
+            "backendReads": 0,
+            "checksum": 1500537120
+          }
+        },
+        "api": [
+          {
+            "hashes": [
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047",
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047"
+            ],
+            "afterExportResident": 264924,
+            "ordinary": [
+              {
+                "cpuMs": 214.402,
+                "wallMs": 141.24079700000038,
+                "backendReads": 116,
+                "rows": 4096,
+                "resident": 264924
+              },
+              {
+                "cpuMs": 175.902,
+                "wallMs": 112.64758200000006,
+                "backendReads": 116,
+                "rows": 4096,
+                "resident": 264924
+              }
+            ]
+          },
+          {
+            "hashes": [
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2",
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2"
+            ],
+            "afterExportResident": 1066,
+            "ordinary": [
+              {
+                "cpuMs": 7.827,
+                "wallMs": 16.188156000000163,
+                "backendReads": 2,
+                "rows": 129,
+                "resident": 1066
+              },
+              {
+                "cpuMs": 8.591,
+                "wallMs": 15.144493000000239,
+                "backendReads": 2,
+                "rows": 129,
+                "resident": 1066
+              }
+            ]
+          }
+        ],
+        "stored": {
+          "scan": [
+            {
+              "cpuMs": 324.431,
+              "wallMs": 215.50340199999937,
+              "backendReads": 0,
+              "rows": 16384
+            },
+            {
+              "cpuMs": 208.121,
+              "wallMs": 141.94731799999954,
+              "backendReads": 0,
+              "rows": 16384
+            }
+          ],
+          "point": [
+            {
+              "cpuMs": 1210.511,
+              "wallMs": 946.0187999999998,
+              "backendReads": 0,
+              "rows": 64
+            },
+            {
+              "cpuMs": 908.566,
+              "wallMs": 789.1628389999996,
+              "backendReads": 0,
+              "rows": 64
+            }
+          ]
+        }
+      }
+    },
+    {
+      "round": 4,
+      "variant": "candidate",
+      "load": [13.07, 10.63, 7.04],
+      "result": {
+        "component": {
+          "export": {
+            "cpuMs": 336.956,
+            "wallMs": 360.49231899999995,
+            "peakResident": 0,
+            "checksum": 1500537120,
+            "calls": 128
+          },
+          "warmScan": {
+            "cpuMs": 214.895,
+            "wallMs": 220.7483850000001,
+            "backendReads": 0
+          },
+          "warmPoint": {
+            "cpuMs": 120.275,
+            "wallMs": 91.20131199999992,
+            "backendReads": 0,
+            "checksum": 1500537120
+          }
+        },
+        "api": [
+          {
+            "hashes": [
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047",
+              "8b47eaa1cd840e992540dbb7ac0f61192520d779db30c07d819ea68e5b1ac047"
+            ],
+            "afterExportResident": 0,
+            "ordinary": [
+              {
+                "cpuMs": 231.236,
+                "wallMs": 189.89536199999975,
+                "backendReads": 350,
+                "rows": 4096,
+                "resident": 264924
+              },
+              {
+                "cpuMs": 147.464,
+                "wallMs": 146.517961,
+                "backendReads": 116,
+                "rows": 4096,
+                "resident": 264924
+              }
+            ]
+          },
+          {
+            "hashes": [
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2",
+              "e0d7adbd85ca6a43ae669c2eadf2bf3645776d1aa644095e61aa958be5b549f2"
+            ],
+            "afterExportResident": 0,
+            "ordinary": [
+              {
+                "cpuMs": 8.365,
+                "wallMs": 16.562109999999848,
+                "backendReads": 5,
+                "rows": 129,
+                "resident": 1066
+              },
+              {
+                "cpuMs": 14.531,
+                "wallMs": 16.60190700000021,
+                "backendReads": 2,
+                "rows": 129,
+                "resident": 1066
+              }
+            ]
+          }
+        ],
+        "stored": {
+          "scan": [
+            {
+              "cpuMs": 321.96,
+              "wallMs": 224.1482019999994,
+              "backendReads": 0,
+              "rows": 16384
+            },
+            {
+              "cpuMs": 196.363,
+              "wallMs": 152.9114180000006,
+              "backendReads": 0,
+              "rows": 16384
+            }
+          ],
+          "point": [
+            {
+              "cpuMs": 1210.67,
+              "wallMs": 1005.9504500000003,
+              "backendReads": 0,
+              "rows": 64
+            },
+            {
+              "cpuMs": 815.567,
+              "wallMs": 671.5936940000001,
+              "backendReads": 0,
+              "rows": 64
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

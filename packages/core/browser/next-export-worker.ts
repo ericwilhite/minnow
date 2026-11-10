@@ -65,6 +65,7 @@ export type ExportRequest =
       readonly poolTrace?: boolean;
       readonly outputClasses?: boolean;
       readonly dictionarySizing?: "baseline" | "candidate";
+      readonly verifyBytes?: boolean;
       readonly readaheadKiB: number;
       /** Row-window readahead across all columns (export-stream.ts `windowBytes`); 0: per column. */
       readonly windowMiB?: number;
@@ -103,6 +104,7 @@ export interface BuildResult {
 }
 
 export interface ExportPass {
+  readonly wireHash?: string;
   /** Whether the cached-bytes guard ran (it re-hashes every release: never time with it on). */
   readonly verifying: boolean;
   readonly rows: number;
@@ -677,12 +679,18 @@ async function seriesPass(
           }),
         });
     const reads = space.stats.cache.platformReads;
-    if (request.profile) console.profile("export");
+    if (request.profile) {
+      performance.mark("minnow-export-start");
+      console.profile("export");
+    }
     let result;
     try {
       result = await execute();
     } finally {
-      if (request.profile) console.profileEnd("export");
+      if (request.profile) {
+        console.profileEnd("export");
+        performance.mark("minnow-export-end");
+      }
     }
     active.pass++;
     if (request.profile) await new Promise((resolve) => setTimeout(resolve, 150));
