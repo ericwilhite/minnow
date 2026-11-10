@@ -34,6 +34,7 @@ import {
   type GatherColumn,
 } from "./sort-columnar-data.js";
 import type { SortContext, SortProfile, SortSpec } from "./sort.js";
+import { SortKeyCompression, type CompressionStats } from "./sort-compress.js";
 import { SortDictionary } from "./sort-dictionary.js";
 import type { Loan } from "../memory/governor.js";
 
@@ -89,6 +90,9 @@ export class ColumnarSortOperator implements Operator {
   #reason: unknown;
   #reserved: number;
   #scratchBytes = 0;
+  #compression: SortKeyCompression | null = null;
+  #compressionStats: CompressionStats | null = null;
+  readonly #radixProfile = { passes: 0 };
   #words: Uint32Array[] = [];
   #ids: Int32Array | null = null;
   #temporary: Int32Array | null = null;
@@ -146,6 +150,16 @@ export class ColumnarSortOperator implements Operator {
       operandBytes: 0,
       thresholdBytes: 0,
       columnarRows: this.#columnarRows,
+      ...(this.#compressionStats === null
+        ? {}
+        : {
+            keyBits: this.#compressionStats.bits,
+            packedWords: this.#compressionStats.words,
+            rankedKeys: this.#compressionStats.rankedKeys,
+            orderedSuffixKeys: this.#compressionStats.orderedSuffixKeys,
+            rankRefusals: this.#compressionStats.rankRefusals,
+          }),
+      radixPasses: this.#radixProfile.passes,
     };
   }
 
@@ -338,6 +352,8 @@ export class ColumnarSortOperator implements Operator {
 
   #dropScratch(): void {
     this.#words.length = 0;
+    this.#compression?.close();
+    this.#compression = null;
     this.#ids = null;
     this.#temporary = null;
     this.#columns.length = 0;
@@ -441,10 +457,13 @@ export class ColumnarSortOperator implements Operator {
   *#order(): SlicedJob<boolean> {
     const n = this.#store.rows;
     let words = 0;
+    const groups: number[] = [];
     for (const key of this.spec.keys) {
       const type = this.spec.types[key.column];
       if (type === undefined) throw new TypeError("Missing key type");
-      words += numericWordCount(type) + Number(this.#store.hasNulls(key.column));
+      const count = numericWordCount(type) + Number(this.#store.hasNulls(key.column));
+      words += count;
+      groups.push(count);
     }
     const bytes =
       META_BYTES +
@@ -467,9 +486,32 @@ export class ColumnarSortOperator implements Operator {
       this.#slice,
     );
     if (n >= SMALL_SORT) {
+      if (this.context.columnarCompression !== false) {
+        this.#compression = new SortKeyCompression(this.#charge);
+        const packed = yield* this.#compression.pack(this.#words, groups, n, this.#slice);
+        if (packed === null) {
+          this.#compression.close();
+          this.#compression = null;
+        } else {
+          this.#words = packed;
+          this.#compressionStats = { ...this.#compression.stats };
+        }
+      }
       // Both histograms remain inside the prepaid minimum, allocated only after its charge.
       this.#radix = new RadixScratch();
-      yield* lsdSortIds(this.#words, this.#ids, this.#temporary, n, this.#slice, this.#radix);
+      yield* lsdSortIds(
+        this.#words,
+        this.#ids,
+        this.#temporary,
+        n,
+        this.#slice,
+        this.#radix,
+        this.#radixProfile,
+        (sorted, temporary) => {
+          this.#ids = sorted;
+          this.#temporary = temporary;
+        },
+      );
     } else {
       for (let i = 0; i < n; i++) this.#ids[i] = i;
       yield* mergeSortJob(

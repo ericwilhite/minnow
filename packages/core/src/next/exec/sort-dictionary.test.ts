@@ -221,7 +221,17 @@ it("replays preserved codes as logical text before a mixed-form fallback", async
       spillable: true,
     });
   const sink = new CollectSink();
-  const receiver:Operator={reclassifiesTransfers:true,push(batch,transfer){const result=sink.push(batch);transfer?.release();return result;},ready:()=>sink.ready(),finish:()=>sink.finish(),abort:e=>sink.abort(e)};
+  const receiver: Operator = {
+    reclassifiesTransfers: true,
+    push(batch, transfer) {
+      const result = sink.push(batch);
+      transfer?.release();
+      return result;
+    },
+    ready: () => sink.ready(),
+    finish: () => sink.finish(),
+    abort: (e) => sink.abort(e),
+  };
   const op = new SortOperator(
     {
       types,

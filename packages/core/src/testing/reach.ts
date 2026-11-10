@@ -3340,3 +3340,23 @@ export const SORT_DICTIONARY_REACH = [
   "mixed encoding fallback",
   "borrow-only receiver",
 ] as const;
+
+/** Exact compact ordering words preserve all keys and require proof before omitting suffixes. */
+export const SORT_COMPRESSION_REACH = [
+  "ordered suffix proof",
+  "shuffled suffix retained",
+  "composite packing",
+  "tuple ranks",
+  "probe bound",
+  "explicit tied IDs",
+  "LSD threshold",
+  "above threshold",
+  "float peers",
+  "wide int64",
+  "NULL keys",
+  "hash collision",
+  "one word",
+  "word boundary",
+  "asc",
+  "desc",
+] as const;

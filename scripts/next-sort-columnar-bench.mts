@@ -51,15 +51,17 @@ interface Result {
   rows: number;
   digest: string;
   columnarRows?: number;
+  sort?: SortOperator["profile"];
 }
 const records: unknown[] = [];
 const compareStage = option("--compare-stage", "numeric");
-if (!["numeric", "ownership", "dictionary"].includes(compareStage))
+if (!["numeric", "ownership", "dictionary", "compression"].includes(compareStage))
   throw new RangeError("Unknown comparison stage");
 const compileFlags = (candidate: boolean) => ({
   columnarSort: compareStage !== "numeric" || candidate,
   sortOwnership: compareStage !== "ownership" || candidate,
   sortDictionaries: compareStage !== "dictionary" || candidate,
+  sortCompression: compareStage !== "compression" || candidate,
 });
 const metadata = {
   revision: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
@@ -83,6 +85,8 @@ const metadata = {
         "packages/core/dist/next/exec/sort-columnar.js",
         "packages/core/dist/next/exec/sort-columnar-data.js",
         "packages/core/dist/next/exec/sort-dictionary.js",
+        "packages/core/dist/next/exec/sort-compress.js",
+        "packages/core/dist/next/exec/sort-lsd.js",
         "packages/core/dist/next/exec/plan.js",
         "scripts/next-sort-columnar-bench.mts",
       ].map(async (path) => [
@@ -135,7 +139,14 @@ async function compare(
   if (first.digest !== second.digest || first.rows !== second.rows)
     throw new Error(`${id}: full output mismatch before timing`);
   if (args.includes("--verify-only")) {
-    records.push({ id, digest: first.digest, rows: first.rows, verificationOnly: true });
+    records.push({
+      id,
+      digest: first.digest,
+      rows: first.rows,
+      verificationOnly: true,
+      controlSort: first.sort,
+      enabledSort: second.sort,
+    });
     await save();
     return;
   }
@@ -184,7 +195,15 @@ async function compare(
     if (result.digest !== first.digest || result.rows !== first.rows)
       throw new Error(`${id}: full output mismatch after timing`);
   }
-  records.push({ id, digest: first.digest, rows: first.rows, samples, acceptance });
+  records.push({
+    id,
+    digest: first.digest,
+    rows: first.rows,
+    samples,
+    acceptance,
+    controlSort: first.sort,
+    enabledSort: second.sort,
+  });
   await save();
 }
 
@@ -316,6 +335,7 @@ async function measureComponent(fixture: NumericInput) {
         columnar: compareStage !== "numeric" || candidate,
         columnarOwnership: compareStage !== "ownership" || candidate,
         columnarDictionaries: compareStage !== "dictionary" || candidate,
+        columnarCompression: compareStage !== "compression" || candidate,
       },
       receiver,
     );
@@ -343,7 +363,7 @@ async function measureComponent(fixture: NumericInput) {
         throw new Error("operator leaked memory/spill");
       if (candidate && op.profile.columnarRows !== fixture.metadata.n)
         throw new Error("numeric component fell back");
-      return { ...sink.result(), columnarRows: op.profile.columnarRows ?? 0 };
+      return { ...sink.result(), columnarRows: op.profile.columnarRows ?? 0, sort: op.profile };
     } finally {
       op.abort(new Error("benchmark finished"));
       await op.closed;

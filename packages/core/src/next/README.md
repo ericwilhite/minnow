@@ -2031,6 +2031,18 @@ shipped-engine or stored-format change.
   codes and hashes are never treated as global equality. Translation caches handle appended
   entry prefixes, and dictionary/scratch growth overlap is charged before allocation.
   `sortDictionaries: false` selects the same-build copying control.
+  Large resident sorts additionally compress complete normalized key tuples into exact ranks
+  when at most 32,768 distinct keys fit. Hash collisions compare every word; 128 collision
+  probes or admission refusal decline ranking. Unsuitable keys retain their exact words.
+  Stable sorting can omit a suffix only after proving that suffix key is globally ordered in
+  arrival order. Remaining fields trim constant low bits and their minimum/range, then pack in
+  key priority across word boundaries, retaining NULL, NaN, signed-zero peers and both int64
+  words. Packing is declined when it removes no rank, suffix, word or radix digit. Original
+  key storage stays conservatively charged until cleanup, including new scratch overlap.
+  The typed sorter adopts LSD's finished permutation instead of copying it after an odd pass;
+  other callers retain the existing in-place contract. `sortCompression: false` disables this
+  stage in the same build. Sort profiles expose packed bits/words, ranked keys, proven suffixes,
+  rank refusals and actual radix passes. These are structural diagnostics, not timing claims.
 - An ICU `COLLATE` sorts by query-wide ranks from `Intl.Collator` (ties by bytes) when the
   distinct values fit; otherwise, and for JSON and array keys, a value comparator (compare
   mode), in memory and across runs (DECISIONS.md C8). Compare mode decodes each row's JSONB,
@@ -2113,7 +2125,8 @@ isolated operator; `--fixture <v8-capture>` reuses an existing predecoded captur
 `--catalogue` checks all executing frozen small catalogue cells for regressions and records
 registered refusals. `--compare-stage ownership` compares dedicated output transfer disabled
 versus enabled in the same build; `--compare-stage dictionary` disables/enables code
-preservation with ownership enabled in both arms. The default `numeric` disables/enables the entire typed path.
+preservation with ownership enabled in both arms. `--compare-stage compression` selects exact
+key compression while preserving dictionaries and ownership in both arms. The default `numeric` disables/enables the entire typed path.
 Neither comparison claims a separately built parent runtime. `--with-results` includes the
 ordinary result sink in the isolated component; use it for ownership and dictionary comparisons.
 `--verify-only` checks complete output equality without running timing pairs. Use `--pairs 9 --output <file>` (at least nine adjacent AB/BA pairs).

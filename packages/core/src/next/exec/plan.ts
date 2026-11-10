@@ -466,6 +466,7 @@ export interface CompileOptions {
   readonly columnarSort?: boolean;
   readonly sortOwnership?: boolean;
   readonly sortDictionaries?: boolean;
+  readonly sortCompression?: boolean;
   readonly lateSort?: boolean;
   /** False retains generic SQL sorting; true also permits legacy diagnostic cursors/IR. */
   readonly keyOrder?: boolean;
@@ -1625,6 +1626,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 columnar: options.columnarSort !== false,
                 columnarOwnership: options.sortOwnership !== false,
                 columnarDictionaries: options.sortDictionaries !== false,
+                columnarCompression: options.sortCompression !== false,
               },
               output,
             );

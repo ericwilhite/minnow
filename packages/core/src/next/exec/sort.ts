@@ -144,11 +144,18 @@ export interface SortContext {
   /** Paired control for dedicated gather/result ownership. */
   readonly columnarOwnership?: boolean;
   readonly columnarDictionaries?: boolean;
+  readonly columnarCompression?: boolean;
   /** Deterministic private clock for lifecycle tests; production uses the shared task clock. */
   readonly clock?: TaskClock;
 }
 
 export interface SortProfile {
+  readonly keyBits?: number;
+  readonly packedWords?: number;
+  readonly rankedKeys?: number;
+  readonly orderedSuffixKeys?: number;
+  readonly rankRefusals?: number;
+  readonly radixPasses?: number;
   mode: "keys" | "ranks" | "compare";
   rowsIn: number;
   rowsOut: number;
