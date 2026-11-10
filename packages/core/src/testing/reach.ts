@@ -2501,3 +2501,63 @@ export const WRITE_ROW_PLAN_REACH = [
   "NOT NULL refusal",
   "secondary null omission",
 ] as const;
+
+/** EXCEPT counts equality classes (including NULL), unlike strict join equality. */
+export const EXCEPT_SQL_REACH = [
+  "nested",
+  "binary",
+  "ALL",
+  "DISTINCT",
+  "empty left",
+  "empty right",
+  "empty result",
+  "NULL keys",
+  "escaped Unicode",
+  "left duplicates",
+  "right duplicates",
+  "bag output",
+] as const;
+
+/** Grant-or-spill may change grouping layout, never SQL equality-class multiplicity. */
+export const EXCEPT_SPILL_REACH = [
+  "oversized page",
+  "scratch backend",
+  "memory backend",
+  "collision fallback",
+  "spill",
+  "resident",
+  "ALL",
+  "DISTINCT",
+  "dictionary",
+  "flat",
+  "NULL keys",
+  "unequal batches",
+  "exact PG",
+  "cleanup",
+  "left duplicates",
+  "right exceeds left",
+] as const;
+
+/** Canonical equality cannot discard the chosen left tuple's presentation. */
+export const EXCEPT_REPRESENTATIVE_REACH = [
+  "wide integer",
+  "interval fields",
+  "decimal scale",
+  "negative zero",
+  "ALL",
+  "DISTINCT",
+  "spill",
+  "collision",
+  "cleanup",
+] as const;
+
+/** Cancellation must retain I/O credit until settlement, without a late publish or borrow leak. */
+export const EXCEPT_LIFECYCLE_REACH = [
+  "append",
+  "read",
+  "output",
+  "borrow returned",
+  "cleanup",
+  "no work after abort",
+  "I/O fence",
+] as const;

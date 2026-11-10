@@ -1438,7 +1438,7 @@ into hidden columns and removed from visible results. No runtime code generation
 
 The owner composition uses it by default; protocol tests over `StandinWritePath` explicitly keep
 their synthetic executor. DML, keyed nested-loop joins, index lookup, bounded or locator-producing
-index ranges, fetch, init plans, apply, set operations and
+index ranges, fetch, init plans, apply, UNION/INTERSECT and
 recursion are still typed prepare-time refusals, as are unsupported existing kernel overloads.
 This factory does not turn those missing capabilities into current-engine fallbacks. The
 lowerer emits joins and windows for the factory; SQL catalogue tests exercise them through
@@ -1510,6 +1510,20 @@ The full interface contract includes the following (DML remains unimplemented by
   scan (`memory-scan.ts`) borrows one chunk at a time, passes on async re-pointed chunks, and
   resumes a partial one (a full or denied varlen builder) at `resumeRow`. CHECK and
   generated columns are compiled by `compileTableRules` into the write path's `TableRules`.
+
+### EXCEPT execution (`exec/except.ts`, `exec/except-tape.ts`)
+
+EXCEPT DISTINCT emits one row when its equality class occurs on the left and not the right.
+EXCEPT ALL emits max(left count − right count, 0) copies. NULL keys form one class. The hash
+counts spill into radix partitions under pressure using the shared spill pool; a bounded
+on-disk directory keeps one tail reference per partition. Fully colliding partitions use a
+one-class pass. Stored representative ordinals preserve the first left value's float zero
+sign, NUMERIC scale and INTERVAL fields across reverse spill-page traversal. Types with
+unsupported equality remain typed refusals: JSONB/arrays, locators, blank-padded CHAR and
+zero or more than 31 columns. Plain JSON is a PG 42883 type error. The frozen catalogue now
+executes 61/66 cells. The operator/tape budget proof excludes the shared scratch service's
+currently uncharged extent-list metadata (B1 owns that follow-up). No public API,
+shipped-engine or stored-format change.
 
 ### Expression kernels (`exec/kernels/`, `exec/filter.ts`)
 

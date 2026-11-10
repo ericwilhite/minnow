@@ -331,7 +331,6 @@ this unexported core; they do not describe the shipped engine's SQL support.
 | guide-9  | lower / function    | The authorized explicit JSON cast resolves PG operator ambiguity; PG and shipped SQL return width text 30. JSON extraction still needs a typed R19 kernel; no native execution is credited.       |
 | guide-14 | lower / function    | Legacy DATE_ADD desugaring loses interval field provenance; calendar interval lowering and recursive execution are required. A user DATE_ADD call must not be mistaken for a PostgreSQL operator. |
 | guide-15 | execute / recursive | GENERATE_SERIES still needs bounded, cancellable work-table/fixpoint execution, plus interval arithmetic and EXTRACT.                                                                             |
-| guide-18 | execute / setOp     | EXCEPT needs spillable distinct/bag multiplicities with SQL NULL equality.                                                                                                                        |
 
 Canonical DATE literals now lower directly to epoch-day vectors using the binder's shared
 canonical parser. The shipped SQL front end still limits DATE literal spelling to AD years
@@ -341,7 +340,7 @@ to accept its full date range, BC and infinities.
 Constant JSON_TABLE rows retain their declared types, including NULL-only prefixes and empty
 sources. A literal-only UNION ALL (including this front-end desugar) folds to one `values` bag,
 keeping order and duplicates. This rewrite neither evaluates scalar calls nor implements
-UNION DISTINCT, INTERSECT, EXCEPT or arbitrary set execution.
+UNION DISTINCT, INTERSECT or arbitrary set execution. EXCEPT uses its own hash-count executor.
 
 Timestamp and timestamptz DATE_TRUNC execute in the fixed UTC session (C4), with PostgreSQL's
 units/aliases, integer microseconds, calendar boundaries, BC dates, infinity propagation and
@@ -374,7 +373,7 @@ slot, 128 per interval slot), reuse them and skip NULL/unselected garbage. Spars
 nonascending selections keep monotone output offsets. Differential tests construct PG input
 from independent ordinal date and interval fields and compare interval subtraction fields
 directly, rather than judging arithmetic through its text renderer. Guide-3 now executes
-unchanged against both PGlite and the shipped engine; the frozen catalogue is 60/66 executions.
+unchanged against both PGlite and the shipped engine; the frozen catalogue is 61/66 executions.
 
 SQL TIMESTAMP literals now retain their original spelling in a parser-only weak side table,
 carried through plan cloning and structural identity. Lowering builds native microseconds from
@@ -393,3 +392,16 @@ lowering refusal (`columnType`, 0A000) until rounding and column precision const
 They must not inherit the shipped front end's silently ignored modifiers. Normal shipped
 compilation retains its existing millisecond/ignored-precision behavior. The generated modifier
 matrix checks every target spelling and both contexts against PG admission and the typed limit.
+
+EXCEPT and EXCEPT ALL now execute using canonical SQL equality keys (NULLs compare as one
+class), exact int64 left/right counts and the first left representative. Radix partition spill
+uses the shared Pool/SpillIo and a reverse-linked on-disk page directory, so the page index does
+not grow in RAM. A one-key collision pass guarantees progress when partition hashes collide.
+Optional file write caches have one bounded shared allowance; exhaustion falls back to direct
+page writes. Typed execution limits: 1–31 hash-key columns, no CHAR blank-padding equality,
+JSONB/array semantic keys or locators. Plain JSON lacks equality and is rejected with PG 42883.
+UNION DISTINCT and INTERSECT remain explicit execution refusals. Stored formats and shipped SQL
+behavior are unchanged. Generated SQL and resident/spilled real-scratch campaigns compare
+multiplicities, NULLs and representative float/NUMERIC/INTERVAL output exactly with PGlite.
+The operator/tape resident-state proof excludes the shared scratch service's uncharged extent
+metadata; its storage-owner fix is tracked separately.

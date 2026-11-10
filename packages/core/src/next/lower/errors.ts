@@ -34,6 +34,8 @@ export type UnsupportedConstruct =
   | "subquery"
   /** A window function lowering does not translate (explicit frames are carried as written). */
   | "window"
+  /** A set operation whose equality types the executor cannot implement yet. */
+  | "setOp"
   /** Ordered-set aggregates (percentile_cont/disc, mode) and JSON aggregates. */
   | "aggregate"
   /** SERIAL / IDENTITY columns (needs the write path's owned sequences, R17.7). */

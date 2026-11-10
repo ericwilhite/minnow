@@ -3,6 +3,7 @@ import { Slice, runSliced, type SlicedJob } from "./slices.js";
 import type { MaybePromise } from "../access/key-index.js";
 import type { PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { ResultSink } from "./result-sink.js";
+import { ExceptOperator, exceptKeyLayout, exceptMinimumBytes } from "./except.js";
 import { readValue, boundSource, type ReadSource, type ReadBound } from "../page/read-bounds.js";
 import { batchTargetFor, type Grant } from "../memory/governor.js";
 import type { ByteCharge } from "../vector/varlen.js";
@@ -455,6 +456,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     if ("input" in rel) findIds(rel.input);
     if ("left" in rel) findIds(rel.left);
     if ("right" in rel) findIds(rel.right);
+    if ("inputs" in rel) for (const input of rel.inputs) findIds(input);
   };
   findIds(plan.root);
   const readSources = new Map<number, ReadSource>();
@@ -1163,6 +1165,58 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             },
           );
       }
+      case "setOp": {
+        if (rel.kind !== "except" || rel.inputs.length !== 2)
+          throw new UnsupportedPlanError("set operation other than binary EXCEPT", {
+            construct: "setOp",
+          });
+        const [leftInput, rightInput] = rel.inputs;
+        if (leftInput === undefined || rightInput === undefined)
+          throw new TypeError("Missing EXCEPT arm");
+        const input = types(rel);
+        exceptKeyLayout(input);
+        const left = prepare(leftInput),
+          right = prepare(rightInput);
+        const minimum = exceptMinimumBytes(input);
+        fixed(rel, minimum);
+        return (runtime, downstream) =>
+          instantiate(
+            runtime,
+            rel,
+            input,
+            minimum,
+            1,
+            (_context, grant) =>
+              new ExceptOperator(
+                input,
+                rel.all,
+                {
+                  grant,
+                  spill: runtime.request.spill,
+                  queryId: runtime.request.queryId,
+                  signal: runtime.signal,
+                },
+                counted(runtime, rel, downstream),
+              ),
+            (operator) => {
+              runtime.onAbort((reason) => operator.abort(reason));
+              runtime.dispose(() => operator.closed);
+              return (async () => {
+                try {
+                  await left(runtime, operator.left, []);
+                  await right(runtime, operator.right, []);
+                  const profile = runtime.profile(rel);
+                  profile.spilledBytes = operator.profile.spilledBytes;
+                  profile.spillPasses = operator.profile.spillPasses;
+                } catch (error) {
+                  operator.abort(error);
+                  await operator.closed.catch(() => undefined);
+                  throw error;
+                }
+              })();
+            },
+          );
+      }
       default:
         throw new UnsupportedPlanError(`the ${rel.op} operator`, { construct: rel.op });
     }
@@ -1349,6 +1403,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       if (rel.op === "join") {
         visit(rel.left);
         visit(rel.right);
+      } else if ("inputs" in rel) {
+        for (const input of rel.inputs) visit(input);
       } else if ("input" in rel) visit(rel.input);
     };
     visit(plan.root);
@@ -1383,6 +1439,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       if (node.op === "join") {
         findDemand(node.left, null);
         findDemand(node.right, null);
+      } else if ("inputs" in node) {
+        for (const input of node.inputs) findDemand(input, null);
       } else if ("input" in node) findDemand(node.input, null);
     };
     findDemand(plan.root, null);
