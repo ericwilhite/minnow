@@ -86,6 +86,20 @@ async function check(
         if (!count) break;
       }
       expect(actual).toEqual(expected);
+      const skipping = reader.range(range, direction);
+      try {
+        const offset = Math.floor(expected.length / 2);
+        expect(await skipping.skip(offset)).toBe(offset);
+        const rest: number[] = [];
+        for (;;) {
+          const n = await skipping.next(out);
+          if (!n) break;
+          rest.push(...out.subarray(0, n));
+        }
+        expect(rest).toEqual(expected.slice(offset));
+      } finally {
+        skipping.close();
+      }
     } finally {
       cursor.close();
       cursor.close();
@@ -367,14 +381,16 @@ it("reads a stored prefix without walking unrelated blocks", async () => {
   expect(h.governor.usedBytes).toBe(0);
 });
 
-it.each([
-  { mode: "cursor", phase: "metadata" },
-  { mode: "snapshot", phase: "metadata" },
-  { mode: "cursor", phase: "block" },
-  { mode: "snapshot", phase: "block" },
-])(
+it.each(
+  [
+    { mode: "cursor", phase: "metadata" },
+    { mode: "snapshot", phase: "metadata" },
+    { mode: "cursor", phase: "block" },
+    { mode: "snapshot", phase: "block" },
+  ].flatMap((s) => ["next", "skip"].map((call) => ({ ...s, call }))),
+)(
   "settles close during cold I/O ($mode/$phase) without resurrecting scratch",
-  async ({ mode, phase }) => {
+  async ({ mode, phase, call }) => {
     const h = new Harness("strict", "memory"),
       p = await h.open();
     let t = 0;
@@ -425,10 +441,14 @@ it.each([
       const cursor = reader.range(ALL, "asc"),
         out = new Float64Array(1);
       let settled = false;
-      const pending = Promise.resolve(cursor.next(out)).finally(() => {
-        settled = true;
-      });
+      const pending = Promise.resolve(call === "skip" ? cursor.skip(1) : cursor.next(out)).finally(
+        () => {
+          settled = true;
+        },
+      );
       await waiting;
+      expect(() => cursor.next(out)).toThrow("Only one outstanding");
+      expect(() => cursor.skip(1)).toThrow("Only one outstanding");
       if (mode === "cursor") cursor.close();
       else view.release();
       expect(settled).toBe(false);

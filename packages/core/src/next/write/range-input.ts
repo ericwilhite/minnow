@@ -143,7 +143,9 @@ export class RunRangeInput implements RangeInput {
   #block = 0;
   #ordinal = -1;
   #count = 0;
-  #loadedBlock = -2;
+  #loadedBlock: number | null = null;
+  #leadingSkip = 0;
+  #fixedEntryBytes = 0;
   #closed = false;
   #stopped(): boolean {
     return this.#closed || this.signal.aborted;
@@ -161,6 +163,8 @@ export class RunRangeInput implements RangeInput {
     readonly direction: number,
     readonly limit: number,
     readonly signal: AbortSignal,
+    /** A primary-key coverage witness (or a staged own-put run) proves distinct puts only. */
+    readonly pure = false,
   ) {
     this.rowId = direction > 0 ? -Infinity : Infinity;
     this.#directory = new RangeDirectory(ref, space, budget, range, direction, signal);
@@ -249,13 +253,107 @@ export class RunRangeInput implements RangeInput {
     }
     return;
   }
+  /** Consume the current block without keys or locators. Caller proves the run is wholly in
+   * range and strictly before every other input. RunEncoder cancels equal (key,row) pairs;
+   * the fixed suffix still decides tombstones and staged snapshot visibility per entry.
+   * Leave the generator at the last consumed ordinal; advance resumes at its successor.
+   */
+  skipBlock(max: number): number {
+    const bytes = this.#bytes,
+      view = this.#view;
+    let count = 0,
+      last = this.#ordinal,
+      visible = -1;
+    if (this.pure && this.limit === Infinity) {
+      count = Math.min(max, this.direction > 0 ? this.#count - this.#ordinal : this.#ordinal + 1);
+      last = this.#ordinal + (count - 1) * this.direction;
+      visible = last;
+    } else
+      for (
+        let ordinal = this.#ordinal;
+        ordinal >= 0 && ordinal < this.#count && count < max;
+        ordinal += this.direction
+      ) {
+        const start = view.getUint16(2 + ordinal * 2, true);
+        const end =
+          ordinal + 1 < this.#count ? view.getUint16(2 + (ordinal + 1) * 2, true) : bytes.length;
+        if (start < 2 + this.#count * 2 || end > bytes.length || end - start < 8)
+          throw new StoreCorruptionError("Invalid index entry bounds");
+        last = ordinal;
+        if (((bytes[end - 1] ?? 0) & 1) !== 0) continue;
+        const row = view.getUint32(end - 7, true) + view.getUint16(end - 3, true) * 2 ** 32;
+        if (row >= this.limit) continue;
+        count++;
+        visible = ordinal;
+        this.rowId = row;
+      }
+    this.#ordinal = last;
+    if (visible >= 0) {
+      let at = view.getUint16(2 + visible * 2, true),
+        length = 0,
+        scale = 1;
+      for (;;) {
+        const b = bytes[at++] ?? 0;
+        length += (b & 127) * scale;
+        if (b < 128) break;
+        scale *= 128;
+        if (scale > 2 ** 28) throw new StoreCorruptionError("Invalid key length");
+      }
+      const end =
+        visible + 1 < this.#count ? view.getUint16(2 + (visible + 1) * 2, true) : bytes.length;
+      if (length > 2048 || at + length + 7 !== end)
+        throw new StoreCorruptionError("Truncated index entry");
+      this.#keyStart = at;
+      this.#keyEnd = at + length;
+      this.rowId = view.getUint32(end - 7, true) + view.getUint16(end - 3, true) * 2 ** 32;
+      this.tombstone = false;
+    }
+    return count;
+  }
+  /** Initial seek over certified fixed-width put pages, before creating the entry generator.
+   * Directory lengths are checksummed metadata; no skipped block or key is materialized.
+   */
+  skipPages(max: number, entryBytes: number): MaybePromise<number> {
+    const work = this.#skipPages(max, entryBytes);
+    const step = (value?: unknown): MaybePromise<number> => {
+      const next = work.next(value);
+      return next.done ? next.value : next.value.then(step);
+    };
+    return step();
+  }
+  *#skipPages(max: number, entryBytes: number): Generator<Promise<unknown>, number, unknown> {
+    this.#fixedEntryBytes = entryBytes;
+    let skipped = 0;
+    while (!this.#stopped() && skipped < max) {
+      const ref = this.#directory.current;
+      if (ref === null) break;
+      const count = (ref.length - 2) / entryBytes;
+      if (!Number.isSafeInteger(count) || count < 1)
+        throw new StoreCorruptionError("Invalid fixed-width index block length");
+      const n = Math.min(count, max - skipped);
+      skipped += n;
+      if (n < count) {
+        this.#leadingSkip = n;
+        break;
+      }
+      let ready = this.#directory.step();
+      if (ready instanceof Promise) ready = (yield ready) as boolean;
+      if (!ready) break;
+      this.#block += this.direction;
+      if (taskClock.due()) yield yieldTask();
+    }
+    return skipped;
+  }
   #loaded(bytes: Uint8Array): void {
     this.#buffer.set(bytes);
     this.#bytes = this.#buffer.subarray(0, bytes.length);
     this.#count = this.#view.getUint16(0, true);
     if (bytes.length < 2 || this.#count * 2 + 2 > bytes.length)
       throw new StoreCorruptionError("Invalid index block entry count");
-    this.#ordinal = this.direction > 0 ? 0 : this.#count - 1;
+    if (this.#fixedEntryBytes > 0 && this.#count !== (bytes.length - 2) / this.#fixedEntryBytes)
+      throw new StoreCorruptionError("Invalid fixed-width index block count");
+    this.#ordinal = (this.direction > 0 ? 0 : this.#count - 1) + this.#leadingSkip * this.direction;
+    this.#leadingSkip = 0;
   }
   close(): void {
     this.#closed = true;

@@ -2575,3 +2575,29 @@ export const EXCEPT_LIFECYCLE_REACH = [
   "no work after abort",
   "I/O fence",
 ] as const;
+
+/** Visibility-safe cursor OFFSET without a planner route. */
+export const WRITE_RANGE_SKIP_REACH = [
+  "asc",
+  "desc",
+  "zero",
+  "repeated skip",
+  "end",
+  "past end",
+  "stored",
+  "memtable",
+  "insert",
+  "delete",
+  "update",
+  "other staged rows",
+  "old pin",
+  "own earlier statement",
+  "rollback",
+  "disjoint blocks",
+  "whole run count",
+  "fixed page counts",
+  "pending commit while pinned",
+  "fixed page counts generated",
+  "reverse insertion",
+  "descending multiple pages",
+] as const;

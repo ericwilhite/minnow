@@ -62,6 +62,7 @@ it.each(["index", "fetch", "frame", "publish"] as const)(
                   const cursor = reader.range(range, dir);
                   cursors.push(cursor);
                   return {
+                    skip: cursor.skip.bind(cursor),
                     next: async (out) => {
                       const n = await cursor.next(out);
                       if (phase === "index") await gate();

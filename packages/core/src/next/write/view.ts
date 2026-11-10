@@ -248,13 +248,7 @@ class MemorySegmentImpl implements MemorySegment {
         if (stored === undefined) throw new RangeError("A memtable chunk is missing");
         return stored.view(Math.min(MEMORY_CHUNK_ROWS, this.rowCount - chunk * MEMORY_CHUNK_ROWS));
       },
-      watch: (close) =>
-        this.view.snapshot.watchCursor({
-          next: () => {
-            throw new TypeError("A memory read is not an index cursor");
-          },
-          close,
-        }),
+      watch: (close) => this.view.snapshot.watchCursor({ close }),
     }));
   }
 
@@ -701,8 +695,8 @@ export class SnapshotImpl implements Snapshot {
   }
 
   // Allocated only for bounded reads or range cursors; ordinary snapshots keep their existing fast path.
-  #cursors: Set<IndexCursor> | null = null;
-  watchCursor(cursor: IndexCursor): () => void {
+  #cursors: Set<Pick<IndexCursor, "close">> | null = null;
+  watchCursor(cursor: Pick<IndexCursor, "close">): () => void {
     this.check();
     const cursors = (this.#cursors ??= new Set());
     cursors.add(cursor);
