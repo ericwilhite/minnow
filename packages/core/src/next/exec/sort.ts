@@ -143,6 +143,7 @@ export interface SortContext {
   readonly columnar?: boolean;
   /** Paired control for dedicated gather/result ownership. */
   readonly columnarOwnership?: boolean;
+  readonly columnarDictionaries?: boolean;
   /** Deterministic private clock for lifecycle tests; production uses the shared task clock. */
   readonly clock?: TaskClock;
 }

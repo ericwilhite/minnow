@@ -3,7 +3,13 @@
  */
 import type { PhysicalType } from "../types.js";
 import { layoutOf } from "../types.js";
-import { BATCH_ROWS, BATCH_TARGET_BYTES, type Batch, type FlatVector } from "../vector/vector.js";
+import {
+  BATCH_ROWS,
+  BATCH_TARGET_BYTES,
+  type Batch,
+  type FlatVector,
+  type DictionaryVector,
+} from "../vector/vector.js";
 import { ColumnStore } from "./column-store.js";
 import {
   isPromise,
@@ -28,6 +34,7 @@ import {
   type GatherColumn,
 } from "./sort-columnar-data.js";
 import type { SortContext, SortProfile, SortSpec } from "./sort.js";
+import { SortDictionary } from "./sort-dictionary.js";
 import type { Loan } from "../memory/governor.js";
 
 interface GeneralSort extends Operator {
@@ -61,7 +68,9 @@ export function columnarNumericSort(spec: SortSpec): boolean {
 
 export class ColumnarSortOperator implements Operator {
   readonly #charge: Charge;
-  readonly #store: ColumnStore;
+  #store: ColumnStore;
+  #dictionaries: Array<SortDictionary | null> = [];
+  #dictionaryInitialized = false;
   readonly #slice: Slice;
   readonly #abort = new AbortController();
   readonly #onAbort: () => void;
@@ -185,8 +194,84 @@ export class ColumnarSortOperator implements Operator {
   *#arrival(batch: Batch): SlicedJob<void> {
     this.#check();
     if (this.#slice.due()) yield;
-    const work = this.#add(batch);
-    if (isPromise(work)) yield work;
+    let bytes = 0;
+    try {
+      const prepared =
+        this.#fallback === null && this.#bounded(batch)
+          ? yield* this.#dictionaryBatch(batch)
+          : { batch, bytes: 0 };
+      bytes = prepared?.bytes ?? 0;
+      const work =
+        prepared === null
+          ? this.#external().then(() => this.#forward(batch))
+          : this.#add(prepared.batch, batch);
+      if (isPromise(work)) yield work;
+    } finally {
+      if (bytes) this.#charge.free(bytes);
+    }
+  }
+
+  *#dictionaryBatch(batch: Batch): SlicedJob<{ batch: Batch; bytes: number } | null> {
+    if (
+      this.context.columnarDictionaries === false ||
+      this.downstream.reclassifiesTransfers !== true
+    )
+      return { batch, bytes: 0 };
+    if (!this.#dictionaryInitialized) {
+      this.#dictionaryInitialized = true;
+      const types = this.spec.types.slice();
+      for (let c = 0; c < types.length; c++) {
+        const type = types[c],
+          vector = batch.columns[c];
+        if (type?.kind !== "text" || vector?.form !== "dictionary") {
+          this.#dictionaries.push(null);
+          continue;
+        }
+        const dictionary = new SortDictionary(type, this.#charge);
+        this.#dictionaries.push(dictionary);
+        if (!dictionary.init()) return null;
+        types[c] = { kind: "int32", bits: 32 };
+      }
+      if (this.#dictionaries.some((d) => d !== null)) {
+        this.#store.close();
+        this.#store = new ColumnStore(types, this.#charge);
+      }
+    }
+    const count = this.#dictionaries.filter((d) => d !== null).length;
+    if (!count) return { batch, bytes: 0 };
+    const bytes = count * (128 + batch.length * 4);
+    if (!this.#charge.allocate(bytes)) return null;
+    let published = false;
+    try {
+      const columns = batch.columns.slice();
+      for (let c = 0; c < this.#dictionaries.length; c++) {
+        const dictionary = this.#dictionaries[c];
+        if (!dictionary) continue;
+        const source = batch.columns[c];
+        if (source?.form !== "dictionary") return null;
+        const translation = yield* dictionary.translate(source.dictionary, this.#slice);
+        if (translation === null) return null;
+        const codes = new Int32Array(batch.length);
+        for (let row = 0; row < batch.length; row++)
+          codes[row] = translation[source.codes[row] ?? 0] ?? 0;
+        columns[c] = {
+          form: "flat",
+          type: { kind: "int32", bits: 32 },
+          length: source.length,
+          validity: source.validity,
+          data: { layout: "i32", values: codes },
+        };
+        if (this.#slice.due()) yield;
+      }
+      published = true;
+      return { batch: { ...batch, columns }, bytes };
+    } finally {
+      if (!published) this.#charge.free(bytes);
+    }
+  }
+  #dropDictionaries(): void {
+    for (const dictionary of this.#dictionaries) dictionary?.close();
+    this.#dictionaries.length = 0;
   }
 
   #bounded(batch: Batch): boolean {
@@ -212,7 +297,7 @@ export class ColumnarSortOperator implements Operator {
     return fallback.push(batch) === "blocked" ? fallback.ready() : undefined;
   }
 
-  #add(batch: Batch): void | Promise<void> {
+  #add(batch: Batch, original: Batch = batch): void | Promise<void> {
     this.#check();
     if (this.#fallback !== null) return this.#forward(batch);
     if (!this.#bounded(batch)) return this.#external().then(() => this.#forward(batch));
@@ -223,7 +308,7 @@ export class ColumnarSortOperator implements Operator {
     // Roll back this arrival, so the original borrowed batch can be forwarded without a new
     // uncharged selection buffer or an overlapping/omitted row.
     this.#store.truncate(before);
-    return this.#external().then(() => this.#forward(batch));
+    return this.#external().then(() => this.#forward(original));
   }
 
   push(batch: Batch, transfer?: Transfer): PushResult {
@@ -311,7 +396,10 @@ export class ColumnarSortOperator implements Operator {
     }));
     for (let k = 0; k < this.#store.chunkCount; k++) {
       this.#check();
-      const columns = this.spec.types.map((_, c) => this.#store.chunk(c, k));
+      const columns = this.spec.types.map((_, c) => {
+        const vector = this.#store.chunk(c, k);
+        return this.#dictionaries[c]?.wrap(vector) ?? vector;
+      });
       const length = columns[0]?.length ?? 0;
       if (fallback.push({ length, columns, selection: null }) === "blocked") await fallback.ready();
       // Even immediately-ready replay is part of the shared worker task.
@@ -319,6 +407,7 @@ export class ColumnarSortOperator implements Operator {
       if (isPromise(pause)) await pause;
     }
     this.#store.close();
+    this.#dropDictionaries();
   }
   *#pause(): SlicedJob<void> {
     if (this.#slice.due()) yield;
@@ -436,7 +525,7 @@ export class ColumnarSortOperator implements Operator {
         n = Math.max(1, n >>> 1);
       }
       // This frame and radix are covered by the admitted reserve, never a progress loan.
-      const columns: FlatVector[] = [];
+      const columns: Array<FlatVector | DictionaryVector> = [];
       try {
         for (let c = 0; c < this.#columns.length; c++) {
           const column = this.#columns[c];
@@ -445,7 +534,8 @@ export class ColumnarSortOperator implements Operator {
             this.context.columnarOwnership === false
               ? null
               : moveGatherColumn(column, ids, at, n, shift, mask);
-          columns.push(moved ?? gatherColumn(column, ids, at, n, shift, mask, sizes[c] ?? 0));
+          const gathered = moved ?? gatherColumn(column, ids, at, n, shift, mask, sizes[c] ?? 0);
+          columns.push(this.#dictionaries[c]?.wrap(gathered) ?? gathered);
           if (this.#slice.due()) yield;
         }
         const transfer: Transfer | undefined =
@@ -453,7 +543,21 @@ export class ColumnarSortOperator implements Operator {
             ? undefined
             : {
                 detachableBuffers: new Set(
-                  frameTransferList({ rowCount: n, columns, dictionaries: [] }),
+                  frameTransferList({
+                    rowCount: n,
+                    columns: columns.map((v) =>
+                      v.form === "flat"
+                        ? v
+                        : {
+                            form: "dictionary",
+                            length: n,
+                            codes: v.codes,
+                            validity: v.validity,
+                            dictionary: 0,
+                          },
+                    ),
+                    dictionaries: [],
+                  }),
                 ),
                 detachableBudget: this.context.grant,
                 detachableReclassify: true,
@@ -502,6 +606,7 @@ export class ColumnarSortOperator implements Operator {
     this.context.signal?.removeEventListener("abort", this.#onAbort);
     this.#dropScratch();
     this.#store.close();
+    this.#dropDictionaries();
     this.#releaseReserve();
     if (this.#deferredFree > 0) this.context.grant.free(this.#deferredFree);
     this.#deferredFree = 0;

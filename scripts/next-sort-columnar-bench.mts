@@ -54,11 +54,12 @@ interface Result {
 }
 const records: unknown[] = [];
 const compareStage = option("--compare-stage", "numeric");
-if (!["numeric", "ownership"].includes(compareStage))
+if (!["numeric", "ownership", "dictionary"].includes(compareStage))
   throw new RangeError("Unknown comparison stage");
 const compileFlags = (candidate: boolean) => ({
   columnarSort: compareStage !== "numeric" || candidate,
   sortOwnership: compareStage !== "ownership" || candidate,
+  sortDictionaries: compareStage !== "dictionary" || candidate,
 });
 const metadata = {
   revision: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
@@ -81,6 +82,7 @@ const metadata = {
         "packages/core/dist/next/exec/sort.js",
         "packages/core/dist/next/exec/sort-columnar.js",
         "packages/core/dist/next/exec/sort-columnar-data.js",
+        "packages/core/dist/next/exec/sort-dictionary.js",
         "packages/core/dist/next/exec/plan.js",
         "scripts/next-sort-columnar-bench.mts",
       ].map(async (path) => [
@@ -313,6 +315,7 @@ async function measureComponent(fixture: NumericInput) {
         queryId: 1,
         columnar: compareStage !== "numeric" || candidate,
         columnarOwnership: compareStage !== "ownership" || candidate,
+        columnarDictionaries: compareStage !== "dictionary" || candidate,
       },
       receiver,
     );

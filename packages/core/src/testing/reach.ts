@@ -3322,3 +3322,21 @@ export const SORT_TRANSFER_REACH = [
   "asc",
   "desc",
 ] as const;
+
+/** Encoded text remains a code gather, with exact cross-page payload identities. */
+export const SORT_DICTIONARY_REACH = [
+  "genuine dictionaries",
+  "local code rebasing",
+  "stable dictionary identity",
+  "NULL payload",
+  "UTF8 payload",
+  "wide int64 payload",
+  "asc",
+  "desc",
+  "byte hash collision",
+  "appended dictionary prefix",
+  "raw octets",
+  "codebook bound",
+  "mixed encoding fallback",
+  "borrow-only receiver",
+] as const;

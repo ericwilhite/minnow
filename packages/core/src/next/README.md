@@ -2022,7 +2022,15 @@ shipped-engine or stored-format change.
   chunks, unmarked buffers, computed projections and refused result adoption keep the copying
   fallback. `sortOwnership: false` disables this ownership optimization for paired controls.
   Incoming borrowed payloads still copy into the resident store; source-page ownership is not
-  transferred by this step.
+  transferred by this step. When input is genuinely dictionary-encoded text and the receiver can copy/reclassify it, the
+  resident store now keeps codes and an owned byte-exact union of page dictionaries, gathering
+  codes once and exposing one immutable dictionary identity through output. Borrow-only
+  receivers keep flat outputs so dictionary memory never outlives its source grant. Flat text does not
+  acquire a dictionary. Mixed forms, nullable dictionary entries, a 32,768-entry union limit or
+  admission refusal replay logical text into the general sorter before any output. Source local
+  codes and hashes are never treated as global equality. Translation caches handle appended
+  entry prefixes, and dictionary/scratch growth overlap is charged before allocation.
+  `sortDictionaries: false` selects the same-build copying control.
 - An ICU `COLLATE` sorts by query-wide ranks from `Intl.Collator` (ties by bytes) when the
   distinct values fit; otherwise, and for JSON and array keys, a value comparator (compare
   mode), in memory and across runs (DECISIONS.md C8). Compare mode decodes each row's JSONB,
@@ -2104,9 +2112,10 @@ workload measures the sort and window catalogue shapes, with `--only` selecting 
 isolated operator; `--fixture <v8-capture>` reuses an existing predecoded capture;
 `--catalogue` checks all executing frozen small catalogue cells for regressions and records
 registered refusals. `--compare-stage ownership` compares dedicated output transfer disabled
-versus enabled in the same build; the default `numeric` disables/enables the entire typed path.
+versus enabled in the same build; `--compare-stage dictionary` disables/enables code
+preservation with ownership enabled in both arms. The default `numeric` disables/enables the entire typed path.
 Neither comparison claims a separately built parent runtime. `--with-results` includes the
-ordinary result sink in the isolated component; use it for ownership comparisons.
+ordinary result sink in the isolated component; use it for ownership and dictionary comparisons.
 `--verify-only` checks complete output equality without running timing pairs. Use `--pairs 9 --output <file>` (at least nine adjacent AB/BA pairs).
 Every sample records all-thread process CPU including GC, wall time and host load. Complete
 disabled/enabled output hashes are checked before and after timing. Acceptance uses delivery
