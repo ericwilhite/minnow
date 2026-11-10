@@ -264,6 +264,9 @@ function instantiate<T>(
 function counted(runtime: QueryRuntime, rel: OperatorIdentity, sink: Operator): Operator {
   const profile = runtime.profile(rel);
   return {
+    get reclassifiesTransfers() {
+      return sink.reclassifiesTransfers === true;
+    },
     push(batch, transfer) {
       runtime.readBoundary();
       profile.rowsOut += batch.selection?.count ?? batch.length;
@@ -461,6 +464,7 @@ function domainSource(rel: Extract<Rel, { op: "aggregate" }>) {
 export interface CompileOptions {
   /** Parent control for the resident full numeric columnar sort. */
   readonly columnarSort?: boolean;
+  readonly sortOwnership?: boolean;
   readonly lateSort?: boolean;
   /** False retains generic SQL sorting; true also permits legacy diagnostic cursors/IR. */
   readonly keyOrder?: boolean;
@@ -1615,7 +1619,11 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 offset: runtime.bounds(rel).offset,
                 withTies: rel.withTies,
               },
-              { ...shared, columnar: options.columnarSort !== false },
+              {
+                ...shared,
+                columnar: options.columnarSort !== false,
+                columnarOwnership: options.sortOwnership !== false,
+              },
               output,
             );
           else {

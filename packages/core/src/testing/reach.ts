@@ -3312,3 +3312,13 @@ export const JSONB_WIDE_DEADLINE_REACH = [
   "stalled work cancelled",
   "returned timer owners",
 ] as const;
+
+/** Dedicated sorting outputs move to result ownership without weakening SQL ordering. */
+export const SORT_TRANSFER_REACH = [
+  "dedicated output",
+  "foreign reclassification",
+  "pure projection",
+  "nulls and NaNs",
+  "asc",
+  "desc",
+] as const;

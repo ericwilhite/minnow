@@ -141,6 +141,8 @@ export interface SortContext {
   readonly signal?: AbortSignal;
   /** Compiler opt-in; ordered-set and window-internal sorts retain their existing recipes. */
   readonly columnar?: boolean;
+  /** Paired control for dedicated gather/result ownership. */
+  readonly columnarOwnership?: boolean;
   /** Deterministic private clock for lifecycle tests; production uses the shared task clock. */
   readonly clock?: TaskClock;
 }

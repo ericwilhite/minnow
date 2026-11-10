@@ -28,7 +28,12 @@ import {
   type FlatVector,
 } from "../packages/core/dist/next/vector/vector.js";
 import type { PhysicalType } from "../packages/core/dist/next/types.js";
-import type { WireFlat } from "../packages/core/dist/next/exec/result.js";
+import {
+  ResultChannel,
+  type ResultStream,
+  type WireFlat,
+} from "../packages/core/dist/next/exec/result.js";
+import { ResultSink } from "../packages/core/dist/next/exec/result-sink.js";
 
 const args = process.argv.slice(2);
 const option = (key: string, fallback: string) => {
@@ -48,12 +53,23 @@ interface Result {
   columnarRows?: number;
 }
 const records: unknown[] = [];
+const compareStage = option("--compare-stage", "numeric");
+if (!["numeric", "ownership"].includes(compareStage))
+  throw new RangeError("Unknown comparison stage");
+const compileFlags = (candidate: boolean) => ({
+  columnarSort: compareStage !== "numeric" || candidate,
+  sortOwnership: compareStage !== "ownership" || candidate,
+});
 const metadata = {
   revision: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
   patchSha256: createHash("sha256")
     .update(execFileSync("git", ["diff", "HEAD"]))
     .digest("hex"),
   node: process.version,
+  compareStage,
+  componentWithResults: args.includes("--with-results"),
+  control: "candidate build, selected path disabled (not a separately built parent binary)",
+  candidate: "same candidate build, selected path enabled",
   pairs,
   rows,
   capBytes: 256 << 20,
@@ -116,6 +132,11 @@ async function compare(
     second = await run(true, "verify");
   if (first.digest !== second.digest || first.rows !== second.rows)
     throw new Error(`${id}: full output mismatch before timing`);
+  if (args.includes("--verify-only")) {
+    records.push({ id, digest: first.digest, rows: first.rows, verificationOnly: true });
+    await save();
+    return;
+  }
   const samples: Array<{
     candidate: boolean;
     boundary: string;
@@ -165,50 +186,59 @@ async function compare(
   await save();
 }
 
+async function consumeFrames(
+  stream: Pick<ResultStream, "next">,
+  columns: ReadonlyArray<{ type: PhysicalType }>,
+  boundary: Boundary,
+  sink: ReturnType<typeof consumer>,
+) {
+  const dictionaries = new Map<number, WireFlat[]>();
+  for (;;) {
+    const frame = await stream.next();
+    if (frame === null) break;
+    try {
+      if (boundary === "frames")
+        sink.batch({ length: frame.payload.rowCount, selection: null, columns: [] });
+      else {
+        for (const delta of frame.payload.dictionaries) {
+          const parts = dictionaries.get(delta.id) ?? [];
+          if (delta.from !== parts.reduce((sum, p) => sum + p.length, 0))
+            throw new Error("dictionary order");
+          parts.push(structuredClone(delta.values));
+          dictionaries.set(delta.id, parts);
+        }
+        sink.batch({
+          length: frame.payload.rowCount,
+          selection: null,
+          columns: frame.payload.columns.map((v, c): FlatVector => {
+            const flat =
+              v.form === "dictionary"
+                ? expandTextDictionary(v, dictionaries.get(v.dictionary) ?? [])
+                : v;
+            if (flat.form !== "flat") throw new Error("unexpected constant wire frame");
+            const type = columns[c]?.type;
+            if (!type) throw new Error("missing output type");
+            return { ...flat, type };
+          }),
+        });
+      }
+    } finally {
+      frame.release();
+    }
+  }
+}
+
 function queryRun(core: StorageCore, sql: string) {
-  const factories = [createExecutor({ columnarSort: false }), createExecutor()];
+  const factories = [createExecutor(compileFlags(false)), createExecutor(compileFlags(true))];
   return async (candidate: boolean, boundary: Boundary): Promise<Result> => {
     const lowered = core.lowerer.lower(sql, core.context());
     if (lowered.kind !== "query") throw new Error("not query");
     const prepared = factories[candidate ? 1 : 0]?.prepare(lowered.plan);
     if (!prepared) throw new Error("missing factory");
     const handle = core.start(prepared),
-      sink = consumer(prepared.columns, boundary),
-      dictionaries = new Map<number, WireFlat[]>();
+      sink = consumer(prepared.columns, boundary);
     try {
-      for (;;) {
-        const frame = await handle.execution.results.next();
-        if (frame === null) break;
-        try {
-          if (boundary === "frames")
-            sink.batch({ length: frame.payload.rowCount, selection: null, columns: [] });
-          else {
-            for (const delta of frame.payload.dictionaries) {
-              const parts = dictionaries.get(delta.id) ?? [];
-              if (delta.from !== parts.reduce((sum, p) => sum + p.length, 0))
-                throw new Error("dictionary order");
-              parts.push(structuredClone(delta.values));
-              dictionaries.set(delta.id, parts);
-            }
-            sink.batch({
-              length: frame.payload.rowCount,
-              selection: null,
-              columns: frame.payload.columns.map((v, c): FlatVector => {
-                const flat =
-                  v.form === "dictionary"
-                    ? expandTextDictionary(v, dictionaries.get(v.dictionary) ?? [])
-                    : v;
-                if (flat.form !== "flat") throw new Error("unexpected constant wire frame");
-                const type = prepared.columns[c]?.type;
-                if (!type) throw new Error("missing output type");
-                return { ...flat, type };
-              }),
-            });
-          }
-        } finally {
-          frame.release();
-        }
-      }
+      await consumeFrames(handle.execution.results, prepared.columns, boundary, sink);
       await handle.execution.executed;
       await handle.execution.delivered;
       return sink.result();
@@ -241,6 +271,31 @@ async function measureComponent(fixture: NumericInput) {
       types.map((type, c) => ({ type, name: fixture.metadata.names[c] ?? String(c) })),
       boundary,
     );
+    const resultGrant = args.includes("--with-results")
+      ? await governor.admit({ label: "result-pair", minimumBytes: 4 << 20, spillable: true })
+      : undefined;
+    const channel = resultGrant
+      ? new ResultChannel(
+          types.map((type, c) => ({
+            name: fixture.metadata.names[c] ?? String(c),
+            type,
+            nullable: true,
+          })),
+          { windowBytes: 2 << 20 },
+        )
+      : undefined;
+    const receiver: import("../packages/core/dist/next/exec/pipeline.js").Operator =
+      resultGrant && channel
+        ? new ResultSink(types, resultGrant, channel, 0)
+        : {
+            push: (batch) => {
+              sink.batch(batch);
+              return "ready";
+            },
+            ready: () => Promise.resolve(),
+            finish: () => undefined,
+            abort: () => undefined,
+          };
     const op = new SortOperator(
       {
         types,
@@ -252,20 +307,35 @@ async function measureComponent(fixture: NumericInput) {
         offset: 0,
         withTies: false,
       },
-      { grant, spill, queryId: 1, columnar: candidate },
       {
-        push: (batch) => {
-          sink.batch(batch);
-          return "ready";
-        },
-        ready: () => Promise.resolve(),
-        finish: () => undefined,
-        abort: () => undefined,
+        grant,
+        spill,
+        queryId: 1,
+        columnar: compareStage !== "numeric" || candidate,
+        columnarOwnership: compareStage !== "ownership" || candidate,
       },
+      receiver,
     );
     try {
-      await drive(new ArraySource(fixture.batches), op);
+      const feeding = Promise.resolve(drive(new ArraySource(fixture.batches), op)).catch(
+        (error: unknown) => {
+          channel?.cancel(error);
+          throw error;
+        },
+      );
+      if (channel)
+        await Promise.all([
+          feeding,
+          consumeFrames(
+            channel,
+            types.map((type) => ({ type })),
+            boundary,
+            sink,
+          ),
+        ]);
+      else await feeding;
       await op.closed;
+      resultGrant?.close();
       if (governor.usedBytes !== 0 || spill.bytesInUse !== 0)
         throw new Error("operator leaked memory/spill");
       if (candidate && op.profile.columnarRows !== fixture.metadata.n)
@@ -274,6 +344,7 @@ async function measureComponent(fixture: NumericInput) {
     } finally {
       op.abort(new Error("benchmark finished"));
       await op.closed;
+      resultGrant?.close();
     }
   });
 }

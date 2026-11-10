@@ -2015,9 +2015,14 @@ shipped-engine or stored-format change.
   retain the general sorter. Refusal or reclamation replays the resident rows into its spill
   path before any output. All scratch is charged before allocation, and cancellation keeps
   borrowed output/replay buffers charged until readiness and spill cleanup settle.
-  `CompileOptions.columnarSort: false` selects the parent path for paired measurements.
-  Results still pass through the normal contiguous result-frame copy after the permutation
-  gather; this path does not transfer source storage or result-buffer ownership.
+  `CompileOptions.columnarSort: false` selects the general path in the same candidate build;
+  it is not a separately built parent binary. Dedicated gather arrays now move through
+  column-only projections into result frames after the result account charges their full size.
+  A whole unchanged tight source chunk can move without gathering. Partial/padded source
+  chunks, unmarked buffers, computed projections and refused result adoption keep the copying
+  fallback. `sortOwnership: false` disables this ownership optimization for paired controls.
+  Incoming borrowed payloads still copy into the resident store; source-page ownership is not
+  transferred by this step.
 - An ICU `COLLATE` sorts by query-wide ranks from `Intl.Collator` (ties by bytes) when the
   distinct values fit; otherwise, and for JSON and array keys, a value comparator (compare
   mode), in memory and across runs (DECISIONS.md C8). Compare mode decodes each row's JSONB,
@@ -2098,9 +2103,13 @@ workload measures the sort and window catalogue shapes, with `--only` selecting 
 `--component` captures the actual numeric sort input once before timing, then measures the
 isolated operator; `--fixture <v8-capture>` reuses an existing predecoded capture;
 `--catalogue` checks all executing frozen small catalogue cells for regressions and records
-registered refusals. Use `--pairs 9 --output <file>` (at least nine adjacent AB/BA pairs).
+registered refusals. `--compare-stage ownership` compares dedicated output transfer disabled
+versus enabled in the same build; the default `numeric` disables/enables the entire typed path.
+Neither comparison claims a separately built parent runtime. `--with-results` includes the
+ordinary result sink in the isolated component; use it for ownership comparisons.
+`--verify-only` checks complete output equality without running timing pairs. Use `--pairs 9 --output <file>` (at least nine adjacent AB/BA pairs).
 Every sample records all-thread process CPU including GC, wall time and host load. Complete
-parent/candidate output hashes are checked before and after timing. Acceptance uses delivery
+disabled/enabled output hashes are checked before and after timing. Acceptance uses delivery
 and release of columnar frames; a second paired measurement includes JS row materialization.
 Input construction and output hashing are outside both clocks. The median paired gain must
 exceed the type-7 paired IQR, with at least seven of nine pairs favorable; other shapes must

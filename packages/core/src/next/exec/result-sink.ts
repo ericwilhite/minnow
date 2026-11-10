@@ -47,6 +47,7 @@ export interface ResultSinkOptions {
 }
 
 export class ResultSink implements Operator {
+  readonly reclassifiesTransfers = true;
   readonly deferEnd: boolean;
   readonly #maxRows: number | null;
   readonly #clock: TaskClock;

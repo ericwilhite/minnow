@@ -3,6 +3,7 @@ import { layoutOf, type PhysicalType } from "../types.js";
 import { allocateData, dataBytes, type FlatVector, type VectorData } from "../vector/vector.js";
 import { ColumnStore, wordsOf } from "./column-store.js";
 import type { SortColumn } from "./sort-keys.js";
+import { frameTransferList } from "./frame-buffers.js";
 import type { Slice, SlicedJob } from "./slices.js";
 
 type Varlen = Extract<VectorData, { layout: "varlen" }>;
@@ -304,4 +305,41 @@ export function gatherColumn(
       throw new TypeError(`Unsupported columnar payload ${layoutOf(source.type)}`);
   }
   return { form: "flat", type: source.type, length: n, validity, data };
+}
+
+/** A whole unchanged chunk can move; subranges/padded arenas remain a gather. The caller has
+ * already proved a permutation, so no emitted source row is used by another output frame. */
+export function moveGatherColumn(
+  source: GatherColumn,
+  ids: Int32Array,
+  from: number,
+  n: number,
+  shift: number,
+  mask: number,
+): FlatVector | null {
+  const first = ids[from] ?? -1;
+  if (first < 0 || (first & mask) !== 0) return null;
+  const chunk = source.chunks[first >>> shift];
+  if (chunk?.length !== n) return null;
+  for (let i = 1; i < n; i++) if (ids[from + i] !== first + i) return null;
+  const data = chunk.data;
+  if (data.layout === "varlen") {
+    if (data.offsets.length !== n + 1 || data.bytes.length !== data.offsets[n]) return null;
+  } else if (data.layout === "int64") {
+    if (data.values.values.length !== n) return null;
+  } else if (
+    data.layout === "bool" ||
+    data.layout === "i32" ||
+    data.layout === "f32" ||
+    data.layout === "f64"
+  ) {
+    if (data.values.length !== n) return null;
+  } else return null;
+  if (chunk.validity !== null && chunk.validity.length !== Math.ceil(n / 32)) return null;
+  try {
+    frameTransferList({ rowCount: n, columns: [chunk], dictionaries: [] });
+  } catch {
+    return null;
+  }
+  return chunk;
 }

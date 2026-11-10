@@ -15,12 +15,14 @@ import {
 import { RadixScratch, isByteCollation, mergeSortJob } from "./sort-keys.js";
 import { lsdSortIds } from "./sort-lsd.js";
 import { Slice, runSliced, type SlicedJob } from "./slices.js";
+import { frameTransferList } from "./frame-buffers.js";
 import { Charge } from "./spill-pool.js";
 import {
   encodeNumericColumns,
   gatherBytes,
   gatherColumn,
   gatherSource,
+  moveGatherColumn,
   numericWordCount,
   varlenGatherBytes,
   type GatherColumn,
@@ -439,10 +441,27 @@ export class ColumnarSortOperator implements Operator {
         for (let c = 0; c < this.#columns.length; c++) {
           const column = this.#columns[c];
           if (column === undefined) throw new TypeError("Missing payload column");
-          columns.push(gatherColumn(column, ids, at, n, shift, mask, sizes[c] ?? 0));
+          const moved =
+            this.context.columnarOwnership === false
+              ? null
+              : moveGatherColumn(column, ids, at, n, shift, mask);
+          columns.push(moved ?? gatherColumn(column, ids, at, n, shift, mask, sizes[c] ?? 0));
           if (this.#slice.due()) yield;
         }
-        if (this.downstream.push({ length: n, columns, selection: null }) === "blocked")
+        const transfer: Transfer | undefined =
+          this.context.columnarOwnership === false || this.downstream.reclassifiesTransfers !== true
+            ? undefined
+            : {
+                detachableBuffers: new Set(
+                  frameTransferList({ rowCount: n, columns, dictionaries: [] }),
+                ),
+                detachableBudget: this.context.grant,
+                detachableReclassify: true,
+                // The source reserve remains paid through readiness. A result sink prepays the adopted
+                // arrays on its own grant; retaining/copying receivers finish their borrow before ready.
+                release: () => undefined,
+              };
+        if (this.downstream.push({ length: n, columns, selection: null }, transfer) === "blocked")
           yield this.downstream.ready();
         this.#rowsOut += n;
       } finally {

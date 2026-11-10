@@ -72,12 +72,18 @@ export interface Transfer {
    * when this is its result budget; otherwise it must copy/reclassify before publishing.
    */
   readonly detachableBudget?: ByteBudget;
+  /** Dedicated arrays may be adopted by another account only after that receiver charges their
+   * complete size, before publishing or releasing this token. No credit or pooled slab moves. */
+  readonly detachableReclassify?: boolean;
   /** Source-authorized full-buffer capacity for logical bytes; padding is dedicated and charged. */
   readonly detachableCapacity?: (bytes: number) => number;
   release(): void;
 }
 
 export interface Operator {
+  /** Dedicated output may move into this chain. It copies or prepays/reclassifies before
+   * readiness and returns the source token by then; it never retains source-account credit. */
+  readonly reclassifiesTransfers?: boolean;
   push(batch: Batch, transfer?: Transfer): PushResult;
   /** Resolves when the operator can take the next batch; rejects if aborted. */
   ready(): Promise<void>;
