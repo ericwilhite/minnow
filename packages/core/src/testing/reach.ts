@@ -2538,3 +2538,6 @@ export const EXACT_FAST_REACH = [
   "ordinary exact",
   "released",
 ] as const;
+
+/** Both exact-read implementations run every existing seed/history count. */
+export const EXACT_READER_REACH = { storage: "storage reader", memory: "memory reader" } as const;

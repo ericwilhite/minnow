@@ -1364,10 +1364,16 @@ counts the compact-selection branch; selections with gaps continue to gather.
 The scan export requests a charged, coalesced row window from the core scan (64 MiB by default).
 `MINNOW_EXPORT_SCAN_IO_COMPARE=1` compares this one-pass policy with cached per-batch reads;
 `scripts/scan-io-bench.mts` isolates both over a fresh memory-backed page cache. Setup and warmup
-GC are outside its CPU/wall timings. Core row windows stay opt-in; absent/zero
-`readWindowBytes` keeps cached batch reads. The bench requests 64 MiB explicitly. Resident shared loads remain synchronous until a task yield is due. Filters and
+GC are outside its CPU/wall timings. Direct `TableScan` callers opt in with
+`readWindowBytes`; absent/zero keeps ordinary cached batch reads. The historical adapter bench
+requests 64 MiB explicitly; the real executor uses its terminal full-scan default. Resident shared loads remain synchronous until a task yield is due. Filters and
 deletions retain selective reads, and a refused window is released and reduced before falling
-back to ordinary batch loading.
+back to bounded batch loading. For an explicit terminal full-column `exportStream()`,
+admission sizing and this fallback keep non-retaining reads even when the optional window is
+disabled. Existing cached hits remain usable; misses are verified exact private copies charged
+until lease release, without cache admission or pooling. Successful one-pass window reads keep
+their coalesced slab geometry. Other plans retain their existing cache policy. This exception
+belongs to the unreleased executor export, not the shipped `exportSnapshotStream()` format.
 The window read loops, including dictionary/gzip loads and immediately resolved storage
 continuations, check the scan/driver's shared R23.5 clock. Sorting and cached installation also
 check that clock; only a genuine task yield restarts it. Missing pages are reserved before

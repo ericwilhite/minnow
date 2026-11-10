@@ -18,6 +18,8 @@ import { typeOf, vectorOf } from "./wide-vectors.js";
 import { wideSpec } from "./wide-data.js";
 import { GroupWriter } from "../../../packages/core/src/next/page/writer.js";
 
+import { pointProfile } from "./point-profile.js";
+
 const clock = () => ({ cpu: process.cpuUsage(), wall: performance.now() });
 const elapsed = (before: ReturnType<typeof clock>) => {
   const c = process.cpuUsage(before.cpu);
@@ -69,6 +71,8 @@ export async function readRetentionComponent() {
     hit.release();
   }
   const scan = { ...elapsed(before), backendReads: calls - beforeCalls };
+  const profileDirectory = process.env.MINNOW_POINT_PROFILE_DIR;
+  const finishProfile = profileDirectory ? await pointProfile(profileDirectory) : undefined;
   const pointStart = clock(),
     pointCalls = calls;
   for (let r = 0; r < 16384; r++) {
@@ -79,6 +83,7 @@ export async function readRetentionComponent() {
     hit.release();
   }
   const point = { ...elapsed(pointStart), backendReads: calls - pointCalls, checksum };
+  await finishProfile?.();
   cache.close();
   if (memory.used !== 0 || budget.used !== 0) throw Error("component charge leak");
   return { export: exportResult, warmScan: scan, warmPoint: point };
