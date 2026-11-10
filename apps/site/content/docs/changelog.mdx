@@ -86,8 +86,10 @@ no migration is needed.
 The unexported rebuild core now executes timestamp `DATE_TRUNC` in its fixed UTC session,
 keeps DATE literals in native date vectors, and executes constant `JSON_TABLE` TEXT/INTEGER rows
 through literal `UNION ALL` folding. JSON_TABLE declarations keep their types even for NULL-only rows.
-JSON constructors, general set operations and recursive execution still have explicit typed
-refusals; the internal catalogue records each remaining reason and its PostgreSQL outcome.
+JSON constructors and unsupported set-operation shapes retain explicit typed refusals.
+Recursion supports fixed-width `UNION ALL` work tables, simple seeds and linear filter/project
+steps; other recursive shapes remain refused. The internal catalogue records each remaining
+reason and its PostgreSQL outcome.
 These changes do not alter the shipped SQL engine, public API or stored formats; no migration
 is needed.
 
