@@ -2975,3 +2975,7 @@ The B7 generated campaigns run joins and windows through real writes, storage an
 against PostgreSQL and the shipped engine. These complement B6's broader lowering/reference
 campaigns; lowering support does not imply every emitted operation has an executor binding.
 The frozen catalogue records typed executor refusals separately from matching executions.
+
+The OPFS export bench opens its read-only extent space with a real 8 MiB startup grant
+from the same governor as its caches. Root/workspace ownership transfers before startup
+closes; this is setup outside measured export time and does not raise the query cap.
