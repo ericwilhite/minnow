@@ -30,6 +30,30 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+/** Full numeric sorts preserve SQL order and budget/borrow lifetimes on both physical paths. */
+export const COLUMNAR_SORT_REACH = [
+  "small stable merge",
+  "large LSD",
+  "stable ties",
+  "selected input",
+  "float peers",
+  "wide int64",
+  "safe int64",
+  "null keys",
+  "nullable dictionary payload",
+  "asc",
+  "desc",
+  "first",
+  "last",
+  "fallback replay",
+  "fallback reclaim fence",
+  "external spill",
+  "arrival refusal",
+  "sort scratch refusal",
+  "abort fence",
+  "resolved readiness preserves deadline",
+] as const;
+
 /** Fixed run arenas may forget holes, but cannot reuse unknown or live bytes. */
 export const BOUNDED_FREE_ARENA_REACH = [
   "overflow",

@@ -402,6 +402,8 @@ function domainSource(rel: Extract<Rel, { op: "aggregate" }>) {
 }
 
 export interface CompileOptions {
+  /** Parent control for the resident full numeric columnar sort. */
+  readonly columnarSort?: boolean;
   readonly lateSort?: boolean;
   readonly keyOrder?: boolean;
   readonly lateFetchOnce?: boolean;
@@ -984,7 +986,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 offset: runtime.bounds(rel).offset,
                 withTies: rel.withTies,
               },
-              shared,
+              { ...shared, columnar: options.columnarSort !== false },
               output,
             );
           else {

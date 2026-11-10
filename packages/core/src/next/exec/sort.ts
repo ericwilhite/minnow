@@ -46,6 +46,8 @@ import {
   type Vector,
 } from "../vector/vector.js";
 import { lsdSortIds } from "./sort-lsd.js";
+import { ColumnarSortOperator, columnarNumericSort } from "./sort-columnar.js";
+import type { TaskClock } from "./pipeline.js";
 import { ColumnStore } from "./column-store.js";
 import {
   YIELD_INTERVAL_MS,
@@ -135,6 +137,10 @@ export interface SortContext {
   readonly spill: SpillService;
   readonly queryId: number;
   readonly signal?: AbortSignal;
+  /** Compiler opt-in; ordered-set and window-internal sorts retain their existing recipes. */
+  readonly columnar?: boolean;
+  /** Deterministic private clock for lifecycle tests; production uses the shared task clock. */
+  readonly clock?: TaskClock;
 }
 
 export interface SortProfile {
@@ -361,7 +367,7 @@ class Sorter {
   readonly decodes: boolean;
   readonly #partKeys: readonly SortColumn[];
   /** The slice of the current finish or compaction work (R23.2); merges and runs pace by it. */
-  readonly slice = new Slice(YIELD_INTERVAL_MS);
+  readonly slice: Slice;
   /** Compare mode: most operand bytes of one written page (a merge input holds one). */
   #pageOperands = 0;
   /** A loan for operands of rows stored before compare mode (repaid after their run). */
@@ -406,6 +412,7 @@ class Sorter {
     readonly context: SortContext,
   ) {
     this.spec = spec;
+    this.slice = new Slice(YIELD_INTERVAL_MS, context.clock);
     this.width = spec.types.length;
     this.mode = sortMode(spec.types, spec.keys);
     this.operands = emptyOperands(spec.types, spec.keys);
@@ -2052,7 +2059,7 @@ class HeldRow {
 // --- operators ------------------------------------------------------------------------------
 
 /** ORDER BY [LIMIT / OFFSET / WITH TIES] (see the module comment). */
-export class SortOperator implements Operator {
+class GeneralSortOperator implements Operator {
   readonly spec: SortSpec;
   readonly #sorter: Sorter;
   readonly #emitter: Emitter;
@@ -2280,6 +2287,51 @@ export class SortOperator implements Operator {
       this.#done = true;
       this.#emitter.close();
     }
+  }
+}
+
+/** The full numeric path is optional; the original sorter owns every other shape/fallback. */
+export class SortOperator implements Operator {
+  readonly #operator: GeneralSortOperator | ColumnarSortOperator;
+  constructor(
+    readonly spec: SortSpec,
+    context: SortContext,
+    downstream: Operator,
+  ) {
+    this.#operator =
+      context.columnar === true && columnarNumericSort(spec)
+        ? new ColumnarSortOperator(
+            spec,
+            context,
+            downstream,
+            sortMinimumBytes(spec.types),
+            (fallback) => new GeneralSortOperator(spec, fallback, downstream),
+          )
+        : new GeneralSortOperator(spec, context, downstream);
+  }
+  get profile(): SortProfile & { readonly columnarRows?: number } {
+    return this.#operator.profile;
+  }
+  get closed(): Promise<void> {
+    return this.#operator.closed;
+  }
+  push(batch: Batch, transfer?: Transfer): PushResult {
+    return this.#operator.push(batch, transfer);
+  }
+  ready(): Promise<void> {
+    return this.#operator.ready();
+  }
+  finish(): MaybePromise<void> {
+    return this.#operator.finish();
+  }
+  reclaim(): void | Promise<void> {
+    return this.#operator.reclaim();
+  }
+  discard(): void {
+    this.#operator.discard();
+  }
+  abort(reason: unknown): void {
+    this.#operator.abort(reason);
   }
 }
 
