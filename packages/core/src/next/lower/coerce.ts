@@ -112,6 +112,17 @@ function typeName(type: PhysicalType): string {
 function constantOf(text: string, type: PhysicalType, context: CoercionContext): ScalarExpr {
   const assignment = context === "assignment";
   switch (type.kind) {
+    case "json":
+      if (!type.binary) {
+        // Syntax validation only; retain duplicates, number spellings and whitespace.
+        try {
+          JSON.parse(text);
+        } catch {
+          throw new PlanningError("invalid input syntax for type json", "22P02");
+        }
+        return textLiteral(text, type);
+      }
+      return castTo(textLiteral(text), type, assignment);
     case "text":
       return type.maxLength === undefined
         ? textLiteral(text, type)
@@ -169,6 +180,21 @@ export function coerce(
 ): Typed {
   const pending = typed.pending;
   const int64 = type.kind === "int64";
+  if (
+    pending === undefined &&
+    type.kind === "json" &&
+    !type.binary &&
+    typed.expr.op === "literal" &&
+    typed.expr.type.kind === "text" &&
+    typed.expr.value.validity === null &&
+    typed.expr.value.data.layout === "varlen"
+  ) {
+    const data = typed.expr.value.data;
+    const text = new TextDecoder().decode(
+      data.bytes.subarray(data.offsets[0] ?? 0, data.offsets[1] ?? 0),
+    );
+    return { expr: constantOf(text, type, context), nullable: typed.nullable, big: false };
+  }
   // R17.1: a bigint parameter or an explicit CAST AS BIGINT renders bigint; an implicit
   // widening keeps the operand's rendering; nothing else does.
   if (pending?.kind === "null") return { expr: nullLiteral(type), nullable: true, big: false };

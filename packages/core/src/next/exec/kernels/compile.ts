@@ -26,6 +26,7 @@ import { bindCall } from "./bindings.js";
 import { compileCase, compileCoalesce } from "./case.js";
 import { compileTemporalSubtract } from "./temporal-subtract.js";
 import { compileDateTrunc } from "./date-trunc.js";
+import { compileJson } from "./json.js";
 import { compileNumericRound } from "./round.js";
 import { compileCast } from "./cast.js";
 import { compileCompare, compileDistinctFrom } from "./compare.js";
@@ -163,6 +164,8 @@ function compileCall(expr: Extract<ScalarExpr, { op: "call" }>, context: Compile
     args.map((arg) => arg.type),
   );
   switch (binding.kernel) {
+    case "json":
+      return compileJson(expr.type, expr.fn, args, arena);
     case "arith": {
       const [left, right] = args;
       if (args.length !== 2 || left === undefined || right === undefined)

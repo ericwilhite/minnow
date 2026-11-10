@@ -2333,7 +2333,7 @@ export const GUIDE9_JSON_CAST_REACH = [
   "explicit JSON",
   "text result",
   "original ambiguity",
-  "native typed refusal",
+  "native execution",
 ] as const;
 
 /** A cancelled build still belongs to catalog prefixes before its DROP checkpoint. */
@@ -2665,3 +2665,114 @@ export const EXACT_FAST_REACH = [
 
 /** Both exact-read implementations run every existing seed/history count. */
 export const EXACT_READER_REACH = { storage: "storage reader", memory: "memory reader" } as const;
+
+/** JSON extraction keeps lexical values and the last matching field, including escaped names. */
+export const JSON_EXTRACTION_REACH = [
+  "array Unicode",
+  "nested raw output",
+  "decoded text",
+  "raw JSON",
+  "direct",
+  "derived",
+  "CTE",
+  "NULL selector",
+  "negative index",
+  "exact number text",
+  "duplicate escaped key",
+  "JSON null",
+  "missing field",
+  "Unicode error",
+] as const;
+
+/** JSON extraction frames retain scan order and prepaid workspace across physical encodings. */
+export const JSON_FRAME_REACH = [
+  "flat",
+  "dictionary",
+  "constant",
+  "forward selection",
+  "reverse selection",
+  "NULL and inactive garbage",
+  "prepaid workspace",
+  "released borrow",
+] as const;
+
+/** Runtime text casts must validate syntax, including unselected spelling features. */
+export const JSON_VALIDATION_REACH = [
+  "array comma",
+  "object comma",
+  "leading zero",
+  "exponent",
+  "escape",
+  "valid decimal",
+] as const;
+
+/** The front end normalizes these values before lowering; do not credit an inexact execution. */
+export const JSON_MATERIALIZED_REACH = [
+  "direct",
+  "CTE",
+  "typed refusal",
+  "negative",
+  "scale preserved by PG",
+] as const;
+
+/** Every JSON navigation phase consumes the same worker task budget, even zero-length tokens. */
+export const JSON_SCAN_BUDGET_REACH = [
+  "closing stack",
+  "empty-string negative index",
+  "empty-string positive index",
+  "shared clock",
+] as const;
+
+/** Narrow lexical normalization witness against the shipped engine and two PG queries. */
+export const JSON_CURRENT_LEXICAL_REACH = [
+  "zero",
+  "negative",
+  "positive",
+  "exact PG result",
+  "canonical PG witness",
+  "wrong value rejected",
+] as const;
+
+/** Wide JSON projections resume the suspended column instead of replaying completed columns. */
+export const JSON_PROJECTION_REACH = [
+  "one column",
+  "many columns",
+  "64 columns",
+  "linear evaluation",
+  "returned charges",
+] as const;
+
+/** PG admits text/int4 selectors (including int2 widening), not boolean/numeric/int8. */
+export const JSON_KEY_TYPES_REACH = [
+  "boolean",
+  "fractional",
+  "numeric integral",
+  "int8",
+  "int2 widening",
+  "text",
+  "42883",
+  "text extraction",
+  "raw extraction",
+] as const;
+
+/** Text projections cannot hide a parameter document from source-envelope admission. */
+export const JSON_PARAMETER_ENVELOPE_REACH = [
+  "direct",
+  "derived text",
+  "CTE text",
+  "VALUES text",
+  "SQL NULL",
+  "decimal spelling",
+  "typed bound refusal",
+] as const;
+
+/** Literal JSON can be larger than the default result-progress allowance in UTF-8. */
+export const JSON_LITERAL_PROGRESS_REACH = [
+  "one output",
+  "many outputs",
+  "literal only",
+  "stored source plus literal",
+  "UTF8 over private default",
+  "competing pressure",
+  "returned all grants",
+] as const;

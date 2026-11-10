@@ -1,8 +1,9 @@
-/** Authorized SQL correction only: JSON extraction remains a typed native refusal. */
+/** Authorized SQL correction only: JSON extraction executes through typed, charged native kernels. */
 import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
 import { beforeAll, afterAll, expect, it } from "vitest";
 import fixture from "./executor-catalogue.json" with { type: "json" };
+import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
 import { MinnowDatabase } from "../../engine/database.js";
 import { MemoryBlockStore } from "../../storage/index.js";
@@ -79,18 +80,13 @@ it.each(seedsFor("next-guide9-json-cast", [0xb62b, 0xb62c]))(
             },
           ]);
           expect((await current.query(sql)).rows, sql).toEqual(expected.rows);
-          expect(() => core.prepare(sql)).toThrow(
-            expect.objectContaining({
-              name: "UnsupportedPlanError",
-              sqlState: "0A000",
-              stage: "lower",
-              construct: "function",
-            }),
-          );
+          const actual = await core.execute(sql);
+          if (!("batches" in actual)) throw new Error("Expected JSON rows");
+          expect(oracleRows(actual), sql).toEqual(expected.rows);
           reach.reach("explicit JSON");
           reach.reach("text result");
           reach.reach("original ambiguity");
-          reach.reach("native typed refusal");
+          reach.reach("native execution");
           if (shape.form !== 0)
             reach.reach(["", "missing member", "missing parent", "null parent"][shape.form] ?? "");
           else if (shape.value === null) reach.reach("JSON null");

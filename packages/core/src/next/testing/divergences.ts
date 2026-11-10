@@ -335,6 +335,11 @@ export function intendedDivergence(observation: DivergenceObservation): Divergen
 /** Documented query compatibility/representation decisions; matchers stay specific. */
 export const QUERY_DIVERGENCES = [
   {
+    id: "current-json-number-lexical-normalization",
+    authority:
+      'PostgreSQL JSON retains numeric spelling; ->> on {"n":2.00} returns 2.00, verified in json-pglite.test.ts. The shipped engine normalizes this number text to 2. Native extraction follows PG. https://www.postgresql.org/docs/18/functions-json.html',
+  },
+  {
     id: "integer-average-float64",
     authority:
       "next/DECISIONS.md C11: AVG of integer/float inputs returns float64; AVG(NUMERIC) stays NUMERIC. PostgreSQL's pg_typeof(avg(integer)) is numeric (PGlite probe in executor-catalogue.test.ts).",
@@ -370,6 +375,45 @@ export function currentNullBoundRefusal(
   const nulls = parameters.flatMap((value, i) => (value === null ? [i] : []));
   return nulls.length > 0 && nulls.every((slot) => slots.has(slot))
     ? "current-null-bound-refusal"
+    : null;
+}
+
+/** Narrow R21 witness: an exact literal decimal with zero fraction, extracted as text.
+ * The caller also runs PG's independent int4::text witness; unrelated mismatches never match. */
+export function currentJsonNumberText(
+  plan: PhysicalPlan,
+  oracle: ReadonlyArray<Record<string, unknown>>,
+  native: ReadonlyArray<Record<string, unknown>>,
+  canonicalPG: ReadonlyArray<Record<string, unknown>>,
+): string | null {
+  if (plan.root.op !== "project" || plan.root.exprs.length !== 1 || plan.columns[0]?.name !== "j")
+    return null;
+  const expr = plan.root.exprs[0];
+  if (expr?.op !== "call" || expr.fn !== "json_get_text" || expr.args.length !== 2) return null;
+  const [document, key] = expr.args;
+  if (
+    document?.op !== "literal" ||
+    document.type.kind !== "json" ||
+    document.type.binary ||
+    document.value.validity !== null ||
+    document.value.data.layout !== "varlen" ||
+    key?.op !== "literal" ||
+    key.type.kind !== "text" ||
+    key.value.validity !== null ||
+    key.value.data.layout !== "varlen"
+  )
+    return null;
+  const text = (data: { bytes: Uint8Array; offsets: Int32Array }): string =>
+    new TextDecoder().decode(data.bytes.subarray(data.offsets[0] ?? 0, data.offsets[1] ?? 0));
+  if (text(key.value.data) !== "n") return null;
+  const match = /^\{"n":(-?(?:0|[1-9]\d{0,5})\.0{1,6})\}$/u.exec(text(document.value.data));
+  const raw = match?.[1];
+  if (raw === undefined) return null;
+  const canonical = raw.replace(/\.0+$/u, "");
+  const one = (rows: ReadonlyArray<Record<string, unknown>>, value: string): boolean =>
+    rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.j === value;
+  return one(native, raw) && one(oracle, canonical) && one(canonicalPG, canonical)
+    ? "current-json-number-lexical-normalization"
     : null;
 }
 
@@ -432,12 +476,6 @@ export const CATALOGUE_REFUSALS: Readonly<Record<string, CatalogueRefusal>> = {
     stage: "lower",
     construct: "function",
   },
-  "guide-9": {
-    class: "UnsupportedPlanError",
-    sqlState: "0A000",
-    stage: "lower",
-    construct: "function",
-  },
   "guide-14": {
     class: "UnsupportedPlanError",
     sqlState: "0A000",
@@ -465,11 +503,6 @@ export const CATALOGUE_REFUSAL_REASONS: Readonly<
   "guide-8": {
     reason:
       "Whole-row json_agg requires record typing and bounded JSON accumulation; lowering currently expands the record to an unsupported JSON_OBJECT.",
-    pgState: "00000",
-  },
-  "guide-9": {
-    reason:
-      "The authorized explicit JSON cast resolves PostgreSQL operator ambiguity. JSON extraction still has no typed R19 kernel; the legacy MINNOW_JSON_GET_TEXT desugar remains an explicit lowering refusal.",
     pgState: "00000",
   },
   "guide-14": {

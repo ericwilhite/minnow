@@ -7,6 +7,8 @@ import { int128At, setInt128 } from "../../vector/int128.js";
 import type { PhysicalType } from "../../types.js";
 import type { Batch, FlatVector, Selection, Vector } from "../../vector/vector.js";
 import { compileExpr, type ParameterSlots } from "./compile.js";
+import { installJsonHost, type JsonNode, type JsonMemory } from "./json.js";
+import { Slice, runToEnd } from "../slices.js";
 import { OutputArena, type Compiled } from "./vectors.js";
 
 export const BOOL: PhysicalType = { kind: "bool" };
@@ -199,7 +201,9 @@ export function compileFor(
   params: ParameterSlots = { slots: [] },
   capacity = 2048,
 ): Compiled {
-  return compileExpr(expr, { arena: new OutputArena(UNCHARGED, capacity), params, input: types });
+  const arena = new OutputArena(UNCHARGED, capacity);
+  installSynchronousJson(arena);
+  return compileExpr(expr, { arena, params, input: types });
 }
 
 /** Evaluates `expr` over `batch` and reads every active row as a JS value. */
@@ -307,4 +311,28 @@ export function sqlLiteral(type: string, value: SqlValue): string {
   if (typeof value === "number" && Object.is(value, -0)) return `'-0'::${type}`;
   if (typeof value === "string") return `'${value.replaceAll("'", "''")}'::${type}`;
   return `'${String(value)}'::${type}`;
+}
+
+/** Explicit synchronous test host. Production uses the charged, yielding expression operator. */
+function installSynchronousJson(arena: OutputArena): void {
+  const budgets = new WeakMap<JsonNode, JsonMemory>();
+  const slice = new Slice(Infinity);
+  installJsonHost(arena, {
+    slice,
+    memory: (node) => {
+      let budget = budgets.get(node);
+      if (budget === undefined) {
+        budget = {
+          // eslint-disable-next-line require-yield -- synchronous kernel-test host
+          *take(bytes) {
+            arena.take(bytes);
+          },
+          free: (bytes) => arena.give(bytes),
+        };
+        budgets.set(node, budget);
+      }
+      return budget;
+    },
+    evaluate: (node, batch, rows) => runToEnd(node.run(batch, rows), slice),
+  });
 }

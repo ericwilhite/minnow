@@ -251,6 +251,16 @@
   },
   {
     "file": "query.ts",
+    "message": "X array positions are integers",
+    "state": "42883"
+  },
+  {
+    "file": "query.ts",
+    "message": "X keys are member names or array positions",
+    "state": "42883"
+  },
+  {
+    "file": "query.ts",
     "message": "NOW takes no arguments",
     "state": "42883"
   },
@@ -467,6 +477,16 @@
   {
     "file": "sql-functions.ts",
     "message": "X requires a datetime argument",
+    "state": "42883"
+  },
+  {
+    "file": "sql-json.ts",
+    "message": "X array positions are integers",
+    "state": "42883"
+  },
+  {
+    "file": "sql-json.ts",
+    "message": "X keys are member names or array positions",
     "state": "42883"
   },
   {
