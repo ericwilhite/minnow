@@ -10,6 +10,14 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported rebuild core now executes finite calendar interval addition/subtraction, exact
+interval EXTRACT and interval comparisons. Integer/timestamp GENERATE_SERIES in FROM streams without a
+hidden row cap. Fixed-width UNION ALL recursive CTEs use bounded FIFO work tables that spill under
+the memory governor, with cancellation, task yields and demand. This enables unchanged catalogue
+guide-14/15. Other recursive shapes and numeric series remain explicit typed refusals. Native-only
+parser provenance preserves interval microseconds and series arity; shipped SQL behavior, public
+API and stored formats are unchanged. No migration is needed.
+
 The unexported rebuild executor now runs `EXCEPT` and `EXCEPT ALL` with PostgreSQL's duplicate
 and NULL semantics. Hash counts spill under the memory governor through the shared spill pool,
 with a bounded page directory and collision fallback. This enables unchanged catalogue guide-18.
@@ -43,9 +51,14 @@ clarified frame-compatibility notes from the matrix.
 
 **Size note:** the SQL feature metadata adds 402 packed bytes and raises the core tarball cap
 from 1,022,500 to 1,023,000 bytes. Timestamp source and precision-admission metadata adds
-200 packed bytes over the JSON_TABLE baseline: the current tarball is 1,023,032 packed bytes
+200 packed bytes over the JSON_TABLE baseline: that tarball measured 1,023,032 packed bytes
 and 4,434,467 unpacked bytes. Its packed cap moves up once by 250 bytes to 1,023,250. Private rebuild code and test suites
-remain excluded. The unpacked-size cap remains unchanged.
+remain excluded. Native interval/series provenance adds another 499 packed bytes: 1,023,531
+packed and 4,436,274 unpacked bytes. Its packed cap moves up once by 500 to 1,023,750.
+Main, OPFS and IndexedDB bundles add 514 raw bytes and 151–180 gzip bytes. Their raw caps move up once
+by 512; the main-entry and IndexedDB-worker gzip caps move up by 256. The OPFS gzip,
+unpacked-size and standalone client/isolation caps remain unchanged. The generic worker plus
+its separate client measures 571,449 gzip bytes; that combined cap moves up once by 256 bytes.
 
 **Migration:** no stored-format change. Existing parameter frame offsets remain refused; use
 numeric literals. Consumers of SQL feature metadata should handle the added entries by ID.

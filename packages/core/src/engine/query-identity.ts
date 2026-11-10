@@ -1,3 +1,5 @@
+import { seriesArgumentCount } from "./series-sources.js";
+import { intervalArithmeticSource } from "./interval-arithmetic-sources.js";
 import { frameOffsetMetadata } from "./frame-offsets.js";
 import { dateMilliseconds, timestampLiteralSources } from "../date-value.js";
 
@@ -41,6 +43,10 @@ export function encodeQueryIdentity(value: unknown, ancestors = new Set<object>(
       .join("")}}`;
   }
   // Exact frame literals participate even when their public double offsets are identical.
+  const interval = intervalArithmeticSource(value);
+  if (interval !== undefined) encoded = `v${encodeQueryIdentity(interval, ancestors)}${encoded}`;
+  const count = seriesArgumentCount(value);
+  if (count !== undefined) encoded = `g${String(count)};${encoded}`;
   const frame = frameOffsetMetadata(value);
   if (frame !== undefined) encoded = `f${encodeQueryIdentity(frame, ancestors)}${encoded}`;
   ancestors.delete(value);

@@ -149,7 +149,11 @@ describe("kernel bindings onto ir/functions.ts (R19)", () => {
         compiled.evaluate(
           batchOf(
             types.map((type, index) =>
-              fn === "date_trunc" && index === 0 ? texts(["month", "day"]) : sample(type),
+              fn === "date_trunc" && index === 0
+                ? texts(["month", "day"])
+                : fn === "extract" && index === 0
+                  ? texts(["epoch", "day"])
+                  : sample(type),
             ),
           ),
           null,

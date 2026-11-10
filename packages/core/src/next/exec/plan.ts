@@ -1,3 +1,10 @@
+import {
+  RecursiveOperator,
+  recursiveLayout,
+  validateRecursive,
+  compileRecursiveStep,
+} from "./recursive.js";
+import { SeriesOperator } from "./series.js";
 import { Slice, runSliced, type SlicedJob } from "./slices.js";
 /** Immutable pipeline recipes; every execution instantiates its own operators and kernels. */
 import type { MaybePromise } from "../access/key-index.js";
@@ -458,6 +465,10 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   let nextPhysicalId = 0;
   const findIds = (rel: Rel): void => {
     nextPhysicalId = Math.max(nextPhysicalId, rel.id + 1);
+    if (rel.op === "recursive") {
+      findIds(rel.base);
+      findIds(rel.step);
+    }
     if ("input" in rel) findIds(rel.input);
     if ("left" in rel) findIds(rel.left);
     if ("right" in rel) findIds(rel.right);
@@ -518,6 +529,96 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         return (runtime, sink, stops, demand) =>
           runIndexOrder(runtime, sink, shape, rel.indexId, null, 0, demand, () =>
             stops.some((stop) => stop()),
+          );
+      }
+      case "recursive": {
+        validateRecursive(rel);
+        const input = types(rel),
+          layout = recursiveLayout(input),
+          base = prepare(rel.base);
+        const stepMinimum = measureCompilerBuffers(
+          compilation,
+          input,
+          BATCH_ROWS,
+          (context) => compileRecursiveStep(rel.step, context, DISCARD),
+          (operator) => operator.abort(undefined),
+        );
+        const minimum = stepMinimum + layout.metadata + layout.pool;
+        fixed(rel, minimum);
+        return (runtime, downstream, stops, rowsNeeded) =>
+          instantiate(
+            runtime,
+            rel,
+            input,
+            minimum,
+            BATCH_ROWS,
+            (context, grant) =>
+              new RecursiveOperator(
+                rel,
+                context,
+                {
+                  grant,
+                  spill: runtime.request.spill,
+                  queryId: runtime.request.queryId,
+                  signal: runtime.signal,
+                  stopped: () => stops.some((stop) => stop()),
+                  ...(rowsNeeded === undefined ? {} : { rowsNeeded }),
+                },
+                counted(runtime, rel, downstream),
+                (node, sink) => counted(runtime, node, sink),
+              ),
+            (operator) => {
+              runtime.onAbort((reason) => operator.abort(reason));
+              runtime.dispose(() => operator.closed);
+              return (async () => {
+                try {
+                  await base(runtime, operator.base, stops, rowsNeeded);
+                  const profile = runtime.profile(rel);
+                  profile.spilledBytes = operator.profile.spilledBytes;
+                  profile.spillPasses = operator.profile.spillPasses;
+                } catch (error) {
+                  operator.abort(error);
+                  await operator.closed.catch(() => undefined);
+                  throw error;
+                }
+              })();
+            },
+          );
+      }
+      case "series": {
+        const input = types(rel.input),
+          child = prepare(rel.input);
+        const setup = (
+          context: CompileContext,
+          sink: Operator,
+          options: ConstructorParameters<typeof SeriesOperator>[4] = {},
+        ) => new SeriesOperator(rel.kind, input, context.arena, sink, options);
+        const minimum = measureCompilerBuffers(
+          compilation,
+          [],
+          BATCH_ROWS,
+          (context) => setup(context, DISCARD),
+          (operator) => operator.abort(undefined),
+        );
+        fixed(rel, Math.max(4096, minimum));
+        return (runtime, downstream, stops, rowsNeeded) =>
+          instantiate(
+            runtime,
+            rel,
+            [],
+            minimum,
+            BATCH_ROWS,
+            (context) =>
+              setup(context, counted(runtime, rel, downstream), {
+                signal: runtime.signal,
+                stopped: () => stops.some((stop) => stop()),
+                ...(rowsNeeded === undefined ? {} : { rowsNeeded }),
+              }),
+            (operator) => {
+              runtime.onAbort((reason) => operator.abort(reason));
+              runtime.dispose(() => operator.closed);
+              return then(child(runtime, operator, stops), () => undefined);
+            },
           );
       }
       case "values": {
@@ -1480,6 +1581,10 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       // Lowering stores ORDER BY's LIMIT on its sort. Zero must not open even its pools.
       if ((rel.op === "sort" || rel.op === "limit") && runtime.bounds(rel).limit === 0) return;
       active.add(rel.id);
+      if (rel.op === "recursive") {
+        visit(rel.base);
+        visit(rel.step);
+      }
       if (rel.op === "limit" && runtime.bounds(rel).limit === 0) return;
       if (rel.op === "join") {
         visit(rel.left);
@@ -1502,6 +1607,10 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     const demand = new Map<number, number>();
     const findDemand = (node: Rel, need: number | null): void => {
       if (!active.has(node.id)) return;
+      if (node.op === "recursive") {
+        findDemand(node.base, need);
+        return;
+      }
       if (node.op === "scan") {
         if (need !== null && node.filter === null) demand.set(node.id, need);
         return;

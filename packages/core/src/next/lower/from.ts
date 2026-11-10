@@ -31,6 +31,7 @@
  *   parameter slots; `memoize` unless the subquery is volatile.
  * - An uncorrelated scalar subquery is an init plan (query.ts `installSubqueries`).
  */
+import { seriesArgumentCount } from "../../engine/series-sources.js";
 import { constantRows } from "./constant-rows.js";
 import type { TableDef } from "../access/catalog.js";
 import type { ExecutorCosts } from "../ir/costs.js";
@@ -44,6 +45,7 @@ import { baseType, coerce, commonType, settle, type Typed } from "./coerce.js";
 import { PlanningError, unsupported } from "./errors.js";
 import {
   asBool,
+  callFunction,
   lowerCondition,
   lowerExpression,
   type Scope,
@@ -1399,6 +1401,46 @@ export function lowerRecursive(
   builder: PlanBuilder,
   lowerInner: BlockLowerer,
 ): LoweredRel {
+  if (recursive.series !== undefined) {
+    // Bind the original SRF arguments before unknowns/parameters settle in a SELECT list.
+    const arity = seriesArgumentCount(recursive);
+    if (arity !== 2 && arity !== 3)
+      throw unsupported("function", "GENERATE_SERIES without original-arity provenance");
+    const args = recursive.base.select.map((item) =>
+      lowerExpression(item.expression, { column: () => undefined }, builder.state),
+    );
+    const call = callFunction("generate_series", args.slice(0, arity), builder.state);
+    if (call.expr.op !== "call") throw new TypeError("Expected series overload");
+    if (call.expr.type.kind === "decimal") throw unsupported("function", "numeric GENERATE_SERIES");
+    const expressions = [...call.expr.args];
+    if (arity === 2) {
+      const step = args[2];
+      if (step === undefined) throw new TypeError("Missing default series step");
+      expressions.push(coerce(step, call.expr.type, "implicit", builder.parameters).expr);
+    }
+    const columns = expressions.map((expr, index) => ({
+      name: recursive.base.select[index]?.alias ?? "argument",
+      type: expr.type,
+      nullable: args[index]?.nullable ?? true,
+      big: expr.type.kind === "int64" && call.big,
+    }));
+    const input: Rel = {
+      op: "values",
+      id: builder.id(),
+      rows: [expressions],
+      output: outputColumns(columns),
+    };
+    return {
+      columns,
+      rel: {
+        op: "series",
+        id: builder.id(),
+        kind: recursive.series,
+        input,
+        output: outputColumns(columns),
+      },
+    };
+  }
   const base = lowerInner(recursive.base, builder);
   const workTable = builder.workTable();
   // The work table's columns are the base's, nullable (a step may produce NULLs).

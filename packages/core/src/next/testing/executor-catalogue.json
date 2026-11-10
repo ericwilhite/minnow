@@ -26896,8 +26896,7 @@
       "id": "guide-14",
       "dataset": "retail",
       "sql": "WITH RECURSIVE months(month) AS (\n  SELECT TIMESTAMP '2025-01-01'\n  UNION ALL\n  SELECT month + INTERVAL '1 month' FROM months WHERE month < TIMESTAMP '2025-12-01'\n)\nSELECT month FROM months",
-      "lowered": false,
-      "construct": "function"
+      "lowered": true
     },
     {
       "id": "guide-15",

@@ -8,7 +8,12 @@ import type { Collation, ScalarExpr } from "../ir/ir.js";
 import type { PhysicalType } from "../types.js";
 import type { CompiledQuery, Expression, PredicateOperator } from "../../plan/model.js";
 import { isAggregateCall } from "../../engine/query.js";
-import { externalSqlDomainValue } from "../../engine/sql-domains.js";
+import { intervalArithmeticSource } from "../../engine/interval-arithmetic-sources.js";
+import {
+  intervalDomainParts,
+  intervalDomainValue,
+  externalSqlDomainValue,
+} from "../../engine/sql-domains.js";
 import { timestampLiteralSources } from "../../date-value.js";
 import { parseDate, timestampFromDate } from "../temporal.js";
 import { parseTimestampLiteral } from "./timestamp-literals.js";
@@ -28,6 +33,7 @@ import {
   decimalLiteral,
   integerLiteral,
   integerLiteralValue,
+  intervalLiteral,
   parseDecimalText,
   textLiteral,
   timestampLiteral,
@@ -280,6 +286,13 @@ function signedNumberLiteral(expression: Expression): Typed | null {
   return null;
 }
 
+function nativeInterval(fields: readonly [number, number, number]): ScalarExpr {
+  const [months, days, micros] = fields;
+  if (months < -2147483648 || months > 2147483647 || days < -2147483648 || days > 2147483647)
+    throw new PlanningError("interval out of range", "22015");
+  return intervalLiteral(months, days, BigInt(micros));
+}
+
 function lowerLiteral(expression: Extract<Expression, { kind: "literal" }>): Typed {
   const value = expression.value;
   if (value === null)
@@ -315,8 +328,12 @@ function lowerLiteral(expression: Extract<Expression, { kind: "literal" }>): Typ
         // JSON_TABLE literals have already crossed the shipped front end's
         // normalizer. It cannot supply their original number spelling to the raw JSON core.
         throw unsupported("function", "front-end materialized JSON without source spelling");
+      case "interval": {
+        const fields = intervalDomainParts(value);
+        if (fields === undefined) throw unsupported("function", "interval without exact fields");
+        return { expr: nativeInterval(fields), nullable: false, big: false };
+      }
       case "time":
-      case "interval":
       case "uuid":
       case "jsonb": {
         const type: PhysicalType =
@@ -626,6 +643,22 @@ function lowerCall(
   const name = expression.name;
   const args = expression.arguments;
   switch (name) {
+    case "DATE_ADD": {
+      const [value, , elapsed] = args;
+      const source = elapsed === undefined ? undefined : intervalArithmeticSource(elapsed);
+      if (source === undefined || value === undefined)
+        throw unsupported("function", "date_add without operator provenance");
+      const fields = intervalDomainParts(intervalDomainValue(source.text));
+      if (fields === undefined) throw unsupported("function", "interval without exact fields");
+      return callFunction(
+        source.subtract ? "sub" : "add",
+        [
+          lowerExpression(value, scope, state),
+          { expr: nativeInterval(fields), nullable: false, big: false },
+        ],
+        state,
+      );
+    }
     case "CAST": {
       const [operand, target] = args;
       if (operand === undefined || target === undefined)

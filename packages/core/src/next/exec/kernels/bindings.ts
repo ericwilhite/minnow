@@ -20,7 +20,16 @@ import { UnsupportedPlanError } from "../errors.js";
 
 /** The call kernels compile.ts dispatches to. */
 export type CallKernel =
-  "arith" | "neg" | "coalesce" | "nullif" | "numericRound" | "dateTrunc" | "temporalSub" | "json";
+  | "arith"
+  | "neg"
+  | "coalesce"
+  | "nullif"
+  | "numericRound"
+  | "dateTrunc"
+  | "temporalSub"
+  | "calendarAdd"
+  | "intervalExtract"
+  | "json";
 
 export type Binding =
   | {
@@ -92,13 +101,14 @@ export const FUNCTION_BINDINGS: Readonly<Record<string, Binding | PerOverload>> 
     "jsonb,text": refuse("JSONB canonical extraction"),
     "jsonb,int4": refuse("JSONB canonical extraction"),
   }),
+  generate_series: refuse("set-returning GENERATE_SERIES requires its relational operator"),
   add: per({
     ...each(NUMERIC, 2, ARITH),
     "date,int4": DATETIME,
     "int4,date": DATETIME,
-    "date,interval": DATETIME,
-    "timestamp,interval": DATETIME,
-    "timestamptz,interval": DATETIME,
+    "date,interval": { kernel: "calendarAdd" },
+    "timestamp,interval": { kernel: "calendarAdd" },
+    "timestamptz,interval": { kernel: "calendarAdd" },
     "time,interval": DATETIME,
     "interval,interval": INTERVAL,
   }),
@@ -106,11 +116,11 @@ export const FUNCTION_BINDINGS: Readonly<Record<string, Binding | PerOverload>> 
     ...each(NUMERIC, 2, ARITH),
     "date,date": { kernel: "temporalSub" },
     "date,int4": DATETIME,
-    "date,interval": DATETIME,
+    "date,interval": { kernel: "calendarAdd" },
     "timestamp,timestamp": { kernel: "temporalSub" },
     "timestamptz,timestamptz": { kernel: "temporalSub" },
-    "timestamp,interval": DATETIME,
-    "timestamptz,interval": DATETIME,
+    "timestamp,interval": { kernel: "calendarAdd" },
+    "timestamptz,interval": { kernel: "calendarAdd" },
     "time,time": DATETIME,
     "interval,interval": INTERVAL,
   }),
@@ -168,7 +178,15 @@ export const FUNCTION_BINDINGS: Readonly<Record<string, Binding | PerOverload>> 
     "text,timestamptz": { kernel: "dateTrunc" },
     "text,interval": refuse("interval DATE_TRUNC (calendar interval kernels come later)"),
   }),
-  extract: refuse("date and time functions (temporal kernels come later)"),
+  extract: per({
+    "text,interval": { kernel: "intervalExtract" },
+    ...Object.fromEntries(
+      ["date", "time", "timestamp", "timestamptz"].map((type) => [
+        `text,${type}`,
+        refuse("date/time EXTRACT (calendar kernels come later)"),
+      ]),
+    ),
+  }),
 
   nextval: refuse("sequences (come with DML)"),
   currval: refuse("sequences (come with DML)"),

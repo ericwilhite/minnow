@@ -4,7 +4,12 @@ import {
   withRowLock,
   withRowLockCtes,
 } from "./row-locking.js";
+import { rememberSeriesArgumentCount, copySeriesArgumentCount } from "./series-sources.js";
 import { copyFrameOffset, rememberFrameOffset } from "./frame-offsets.js";
+import {
+  rememberIntervalArithmeticSource,
+  copyIntervalArithmeticSource,
+} from "./interval-arithmetic-sources.js";
 import { checkedInteger, checkedSum } from "./integer-exactness.js";
 import { castSqlValue, datetimeText } from "./sql-casts.js";
 import { parseJson } from "../block-format/json-parse.js";
@@ -3021,6 +3026,8 @@ function cloneTreeValue(value: unknown): unknown {
     copy[key] = cloneTreeValue((value as Record<string, unknown>)[key]);
   }
   copyFrameOffset(value, copy);
+  copySeriesArgumentCount(value, copy);
+  copyIntervalArithmeticSource(value, copy);
   return copy;
 }
 
@@ -7438,7 +7445,8 @@ function generateSeriesSource(
     }
   }
   const step: Expression = given ?? { kind: "literal", value: 1 };
-  if (seriesStepIsZero(step)) throw new TypeError("GENERATE_SERIES step size cannot equal zero");
+  if (seriesStepIsZero(step) && !recordDeclaredTypes)
+    throw new TypeError("GENERATE_SERIES step size cannot equal zero");
   // PostgreSQL's timestamp series returns `timestamp` when both bounds are timestamps without
   // time zone, and `timestamp with time zone` otherwise; only the text of a value shows which.
   const local =
@@ -7535,6 +7543,8 @@ function generateSeriesSource(
       series: timestamps ? "timestamp" : "integer",
     },
   };
+  if (recordDeclaredTypes && recursive.recursive !== undefined)
+    rememberSeriesArgumentCount(recursive.recursive, args.length);
   return derivedTableSource(
     {
       sql: "(generate_series)",
@@ -11829,16 +11839,16 @@ class Parser {
       // already in hand, and folds into the date arithmetic DATE_ADD performs.
       if ((operator === "+" || operator === "-") && this.#isKeyword("INTERVAL")) {
         this.#keyword("INTERVAL");
-        const { months, milliseconds } = intervalLiteral(this.#take("string").text);
+        const text = this.#take("string").text;
+        const { months, milliseconds } = intervalLiteral(text);
         const sign = operator === "-" ? -1 : 1;
+        const elapsed: Expression = { kind: "literal", value: sign * milliseconds };
+        if (recordDeclaredTypes)
+          rememberIntervalArithmeticSource(elapsed, { text, subtract: operator === "-" });
         left = {
           kind: "call",
           name: "DATE_ADD",
-          arguments: [
-            left,
-            { kind: "literal", value: sign * months },
-            { kind: "literal", value: sign * milliseconds },
-          ],
+          arguments: [left, { kind: "literal", value: sign * months }, elapsed],
         };
         continue;
       }
