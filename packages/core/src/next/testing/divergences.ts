@@ -444,12 +444,6 @@ export const CATALOGUE_REFUSALS: Readonly<Record<string, CatalogueRefusal>> = {
     stage: "lower",
     construct: "function",
   },
-  "guide-18": {
-    class: "UnsupportedPlanError",
-    sqlState: "0A000",
-    stage: "execute",
-    construct: "setOp",
-  },
   "guide-15": {
     class: "UnsupportedPlanError",
     sqlState: "0A000",
@@ -486,11 +480,6 @@ export const CATALOGUE_REFUSAL_REASONS: Readonly<
   "guide-15": {
     reason:
       "GENERATE_SERIES lowers to recursive/workTableScan. A bounded, cancellable fixpoint executor is unavailable; EXTRACT and interval arithmetic are also required.",
-    pgState: "00000",
-  },
-  "guide-18": {
-    reason:
-      "EXCEPT needs spillable set multiplicity and SQL NULL equality. The literal UNION ALL rewrite cannot implement distinct subtraction.",
     pgState: "00000",
   },
 };

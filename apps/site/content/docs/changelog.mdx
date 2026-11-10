@@ -10,6 +10,12 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported rebuild executor now runs `EXCEPT` and `EXCEPT ALL` with PostgreSQL's duplicate
+and NULL semantics. Hash counts spill under the memory governor through the shared spill pool,
+with a bounded page directory and collision fallback. This enables unchanged catalogue guide-18.
+Unsupported equality types remain explicit typed refusals. The shipped engine, public API and
+stored formats are unchanged; no migration is needed.
+
 The SELECT guide and internal analytics catalogue's guide-9 JSON example now cast the document to `JSON`,
 resolving PostgreSQL's ambiguous untyped extraction operator (`42725`). Its data and path are
 unchanged. PostgreSQL and the current engine return the same text result; the rebuild still

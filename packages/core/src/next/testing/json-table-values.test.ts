@@ -71,12 +71,15 @@ it.each(seedsFor("next-json-table-values", [0xb615, 0xb616]))(
     // This rewrite never evaluates arbitrary scalar calls or changes set multiplicities.
     for (const sql of [
       "SELECT 1 AS n UNION SELECT 1",
-      "SELECT 1 AS n EXCEPT SELECT 2",
       "SELECT random() AS n UNION ALL SELECT random()",
     ])
       expect(() => core.prepare(sql)).toThrow(
         expect.objectContaining({ sqlState: "0A000", stage: "execute" }),
       );
+    const exceptSQL = "SELECT 1 AS n EXCEPT SELECT 2";
+    const exceptResult = await core.execute(exceptSQL);
+    if (!("batches" in exceptResult)) throw new Error("Expected EXCEPT rows");
+    expect(oracleRows(exceptResult)).toEqual((await pg.query(exceptSQL)).rows);
     reach.assertReached();
   },
   120_000,

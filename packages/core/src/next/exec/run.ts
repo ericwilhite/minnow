@@ -124,7 +124,11 @@ export class QueryRuntime {
     const borrowers = entries
       .filter(
         ({ rel }) =>
-          rel.op === "sort" || rel.op === "aggregate" || rel.op === "join" || rel.op === "window",
+          rel.op === "sort" ||
+          rel.op === "aggregate" ||
+          rel.op === "join" ||
+          rel.op === "window" ||
+          rel.op === "setOp",
       )
       .reduce((sum, entry) => sum + 1 + (entry.loanSlots ?? 0), 0);
     return (
@@ -206,7 +210,11 @@ export class QueryRuntime {
       ? Math.max(MAX_BLOB_BYTES, this.#progressBytes, binding.largestSlot)
       : 0;
     const canBorrow = (rel: OperatorIdentity) =>
-      rel.op === "sort" || rel.op === "aggregate" || rel.op === "join" || rel.op === "window";
+      rel.op === "sort" ||
+      rel.op === "aggregate" ||
+      rel.op === "join" ||
+      rel.op === "window" ||
+      rel.op === "setOp";
     this.#operatorProgress = new Map(
       entries.filter(({ rel }) => canBorrow(rel)).map(({ rel }) => [rel.id, progress]),
     );

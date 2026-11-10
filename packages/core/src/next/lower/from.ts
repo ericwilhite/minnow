@@ -1331,6 +1331,13 @@ export function lowerSetOperation(
         }
       );
     };
+    if (
+      op.startsWith("except") &&
+      [...acc.columns, ...next.columns].some(
+        (col) => col.type.kind === "text" && col.type.fixed === true,
+      )
+    )
+      throw unsupported("setOp", "EXCEPT blank-padded CHAR equality");
     const types = acc.columns.map((_, position) =>
       commonType([side(acc, position), side(next, position)], builder.parameters, op.toUpperCase()),
     );
@@ -1363,6 +1370,8 @@ export function lowerSetOperation(
       big: col.big || (right.columns[position]?.big ?? false),
     }));
     const [kind, all] = op.split(" ") as ["union" | "intersect" | "except", string | undefined];
+    if (kind === "except" && types.some((type) => type.kind === "json" && !type.binary))
+      throw new PlanningError("could not identify an equality operator for type json", "42883");
     acc = {
       rel: {
         op: "setOp",
