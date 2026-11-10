@@ -99,8 +99,14 @@ export interface IndexCursor {
   /** Fills `out` from index 0; returns how many locators it wrote, 0 at the end. */
   next(out: Float64Array): MaybePromise<number>;
   /**
+   * Advances by at most `count` visible rows in this cursor's order, without materializing
+   * locators. Returns the number skipped (possibly fewer at end). Count must be a nonnegative
+   * safe integer. Shares next's snapshot, cancellation and single outstanding call contract.
+   */
+  skip(count: number): MaybePromise<number>;
+  /**
    * Abandons the remaining range without enumerating it. Idempotent; cancels pending admission
-   * and I/O. An outstanding next settles before its scratch is released. The caller retains
+   * and I/O. An outstanding next or skip settles before its scratch is released. The caller retains
    * out until then; the cursor retains no output buffer once that call settles.
    */
   close(): void;

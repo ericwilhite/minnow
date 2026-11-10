@@ -235,7 +235,16 @@ in primary, unique and non-unique indexes over both stores, then checks retry an
 ## Streaming index ranges
 
 Ordered range cursors merge one head per durable run, memtable delta and visible staging run.
-They stop when the caller's output fills. Memtable order is maintained by writes: an ordered
+They stop when the caller's output fills. `IndexCursor.skip(n)` advances the same visibility
+merge without producing locators and returns the number skipped. A primary-index coverage
+witness (stored entry count equals stored live-row count) proves that its runs contain distinct
+puts only; staged own-put runs have the same property. Full snapshot visibility, both range
+bounds, and strict separation from competing heads are also required before counts can replace
+the visibility merge. Such whole runs are skipped without reads. For a non-null single int32
+primary key, verified directory lengths give exact page counts (the current block format is
+2 + 15*n bytes), so partial-run skips read only their landing block. Other certified runs drain
+one block at a time; other inputs use ordinary version resolution. No stored-format change is
+needed. B4's executor OFFSET route is separate and does not call this method yet. Memtable order is maintained by writes: an ordered
 append prefix is implicit entry ids, and out-of-order entries use charged leaves; the first read does not collect keys or build a permutation. Run cursors read fences and
 block references lazily and decode one reusable block per input in either direction. A run's
 min/max key is a heap sentinel until that run can affect output. Directory positions are scalars:

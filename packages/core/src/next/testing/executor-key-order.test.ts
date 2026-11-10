@@ -136,6 +136,7 @@ it.each(seedsFor("next-executor-key-order", [0xe101, 0xe102]))(
                       const cursor = reader.range(range, direction);
                       stats.opens++;
                       return {
+                        skip: cursor.skip.bind(cursor),
                         next(out) {
                           stats.capacity = Math.max(stats.capacity, out.length);
                           const done = (n: number) => {

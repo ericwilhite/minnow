@@ -29,6 +29,9 @@ it.each(seedsFor("next-key-order-prefix", [0xe103, 0xe104]))(
             batches = 0;
           const source = new IndexOrderSource(
             {
+              skip() {
+                throw new Error("Planner does not route skip yet");
+              },
               next(out) {
                 const count = Math.min(out.length, 5000 - at);
                 for (let i = 0; i < count; i++) out[i] = at++;
@@ -99,6 +102,9 @@ it("closes an aborted cursor but drains its in-flight write before closing outpu
   });
   const source = new IndexOrderSource(
     {
+      skip() {
+        throw new Error("Planner does not route skip yet");
+      },
       next(out) {
         entered?.();
         return new Promise<number>((resolve) => {
