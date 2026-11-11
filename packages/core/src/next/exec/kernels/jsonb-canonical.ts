@@ -16,14 +16,16 @@ export function* canonicalJsonb(
   const scan = new JsonScan(bytes, slice, true, (start, end) =>
     jsonbNumber(bytes, start, end, DISCARD, slice),
   );
-  // Sizing must not report a later Unicode error ahead of an earlier grammar error.
-  const depth = yield* new JsonScan(bytes, slice).depth();
-  // Validation has its own short-lived one-byte-per-level stack.
-  yield* memory.take(depth);
+  // Fund an input-sized validation stack before allocation. A validating sizing
+  // prepass would let a later lexical defect hide an earlier Unicode/range error.
+  // This transient bound is smaller than the canonical scratch held below.
+  const validationBytes = bytes.length + 1;
+  let depth: number;
+  yield* memory.take(validationBytes);
   try {
-    yield* scan.validate(new Uint8Array(depth));
+    depth = yield* scan.validate(new Uint8Array(validationBytes));
   } finally {
-    memory.free(depth);
+    memory.free(validationBytes);
   }
   const held = 2 * bytes.length + 24 * depth + 512;
   yield* memory.take(held);

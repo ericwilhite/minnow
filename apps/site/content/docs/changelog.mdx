@@ -11,7 +11,8 @@ compatibility policy and release process.
 ## Unreleased
 
 The unexported rebuild now executes text-to-JSONB casts, JSONB extraction and exact canonical
-JSONB text, including decimal scale, duplicate keys and Unicode validation. Expanding values use
+JSONB text, including decimal scale, duplicate keys and Unicode validation. Invalid documents
+keep PostgreSQL’s error order, including competing Unicode, token and numeric range errors. Expanding values use
 charged spill checkpoints and cancellable re-admission for unary and EXCEPT parents; retaining
 join/window parents remain explicit typed refusals pending their checkpoint seam. JSON paths,
 construction and aggregation remain refused. The shipped engine, public API and stored formats

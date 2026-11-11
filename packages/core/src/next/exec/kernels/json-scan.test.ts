@@ -42,7 +42,7 @@ it("checks the shared budget while closing a deep validation stack", () => {
   expect(job.next().done).toBe(false);
   expect(scan.at).toBeGreaterThan(depth);
   expect(scan.at).toBeLessThan(depth + 2048);
-  job.return();
+  job.return(0);
 });
 it.each([-1, 0])("checks the shared budget across empty string elements (index %i)", (index) => {
   const bytes = new TextEncoder().encode(
@@ -87,7 +87,7 @@ it.each(seedsFor("next-json-scan-budget", [0xb648, 0xb649]))(
             expect(job.next().done).toBe(false);
             expect(scan.at).toBeGreaterThan(width);
             expect(scan.at).toBeLessThan(width + 2048);
-            job.return();
+            job.return(0);
             reach.reach("closing stack");
           } else {
             now = 8;

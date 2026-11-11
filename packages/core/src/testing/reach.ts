@@ -3115,3 +3115,22 @@ export const JSONB_DEFERRED_REACH = [
   "growth",
   "no growth",
 ] as const;
+
+/** PostgreSQL JSONB error precedence across independently defective input fragments. */
+export const JSONB_ERROR_ORDER_REACH = [
+  "array",
+  "object",
+  "nested",
+  "defective keys",
+  "two defects",
+  "three or more defects",
+  "token lookahead",
+  "malformed numeric token",
+  "same string defects",
+  "Unicode before lexical",
+  "numeric before lexical",
+  "lexical before Unicode",
+  "SQLSTATE 22P02",
+  "SQLSTATE 22P05",
+  "SQLSTATE 22003",
+] as const;
