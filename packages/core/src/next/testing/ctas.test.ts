@@ -18,6 +18,8 @@ it.each(seedsFor("next-ctas-data-clause", [0xb4e9, 0xb4ea]))(
       "quoted AS",
       "default AS",
       "column AS",
+      "comment AS",
+      "candidate false positive",
       "not CTAS",
       "case",
       "semicolon",
@@ -28,7 +30,7 @@ it.each(seedsFor("next-ctas-data-clause", [0xb4e9, 0xb4ea]))(
         fc.asyncProperty(
           fc.boolean(),
           fc.boolean(),
-          fc.integer({ min: 0, max: 3 }),
+          fc.integer({ min: 0, max: 4 }),
           fc.boolean(),
           fc.boolean(),
           async (ctas, noData, kind, lower, semicolon) => {
@@ -42,7 +44,9 @@ it.each(seedsFor("next-ctas-data-clause", [0xb4e9, 0xb4ea]))(
                   ? "CREATE TABLE copy(v text DEFAULT 'AS') WITH NO DATA"
                   : kind === 2
                     ? 'CREATE TABLE copy("AS" integer) WITH NO DATA'
-                    : "CREATE TABLE copy(v integer) WITH DATA";
+                    : kind === 3
+                      ? "CREATE TABLE copy(v integer) WITH DATA"
+                      : "CREATE TABLE copy(v integer /* AS */) WITH NO DATA";
             if (lower) {
               sql = sql.replace(/CREATE TABLE|SELECT|WITH|NO|DATA|AS|DEFAULT/gu, (word) =>
                 word.toLowerCase(),
@@ -72,7 +76,12 @@ it.each(seedsFor("next-ctas-data-clause", [0xb4e9, 0xb4ea]))(
               reach.reach(noData ? "WITH NO DATA" : "WITH DATA");
             } else {
               expect(state).toBe("42601");
-              expect(ctasDataClause(sql)).toBeNull();
+              // Candidate matching may find AS inside names/literals/comments; the
+              // parsed statement kind must still reject the CTAS-only suffix.
+              if (kind !== 3) {
+                expect(ctasDataClause(sql)).not.toBeNull();
+                reach.reach("candidate false positive");
+              }
               let actual: unknown;
               try {
                 core.lowerer.lower(sql, core.context());
@@ -84,6 +93,7 @@ it.each(seedsFor("next-ctas-data-clause", [0xb4e9, 0xb4ea]))(
               if (kind === 0) reach.reach("quoted AS");
               if (kind === 1) reach.reach("default AS");
               if (kind === 2) reach.reach("column AS");
+              if (kind === 4) reach.reach("comment AS");
             }
             reach.reach("PG exact");
           },
@@ -95,6 +105,7 @@ it.each(seedsFor("next-ctas-data-clause", [0xb4e9, 0xb4ea]))(
             [false, true, 0, false, false],
             [false, true, 1, false, true],
             [false, true, 2, false, false],
+            [false, true, 4, false, false],
             [true, false, 3, true, true],
             [true, true, 0, false, false],
           ],
@@ -119,6 +130,9 @@ it.each(seedsFor("next-ctas-scanner-budget", [0xb4eb, 0xb4ec]))(
       "NO DATA",
       "DATA",
       "budget",
+      "qualified header",
+      "column header",
+      "nested comment header",
     ]);
     fc.assert(
       fc.property(
@@ -126,10 +140,19 @@ it.each(seedsFor("next-ctas-scanner-budget", [0xb4eb, 0xb4ec]))(
         fc.boolean(),
         fc.boolean(),
         fc.boolean(),
-        (length, noData, clause, tabs) => {
+        fc.integer({ min: 0, max: 3 }),
+        (length, noData, clause, tabs, headerShape) => {
           reach.beginHistory();
           const pad = (tabs ? "\t" : " ").repeat(length);
-          const sql = `CREATE TABLE copy AS SELECT '${pad}AS WITH NO DATA' AS v${clause ? `${pad}WITH${pad}${noData ? `NO${pad}` : ""}DATA` : ""}${pad};${pad}`;
+          const header =
+            headerShape === 1
+              ? `"s${pad}.AS"."t""AS"`
+              : headerShape === 2
+                ? `copy ("a${pad}(,)", "b""AS")`
+                : headerShape === 3
+                  ? `/*${"/*".repeat(length)} AS ${"*/".repeat(length)}*/ copy`
+                  : "copy";
+          const sql = `CREATE TABLE ${header} AS SELECT '${pad}AS WITH NO DATA' AS v${clause ? `${pad}WITH${pad}${noData ? `NO${pad}` : ""}DATA` : ""}${pad};${pad}`;
           // eslint-disable-next-line @typescript-eslint/unbound-method -- Preserved receiver below.
           const original = String.prototype.charCodeAt;
           let reads = 0;
@@ -149,15 +172,21 @@ it.each(seedsFor("next-ctas-scanner-budget", [0xb4eb, 0xb4ec]))(
           reach.reach(tabs ? "tabs" : "spaces");
           reach.reach(clause ? (noData ? "NO DATA" : "DATA") : "no clause");
           reach.reach("budget");
+          if (headerShape === 1) reach.reach("qualified header");
+          if (headerShape === 2) reach.reach("column header");
+          if (headerShape === 3) reach.reach("nested comment header");
         },
       ),
       {
         seed,
         numRuns: 16,
         examples: [
-          [1024, true, true, false],
-          [1024, false, true, true],
-          [1024, false, false, false],
+          [1024, true, true, false, 0],
+          [1024, false, true, true, 0],
+          [1024, false, false, false, 0],
+          [1024, true, true, false, 1],
+          [1024, true, true, false, 2],
+          [1024, true, true, false, 3],
         ],
       },
     );

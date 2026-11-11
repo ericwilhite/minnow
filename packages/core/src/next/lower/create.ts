@@ -233,6 +233,10 @@ function lowerStatement(text: string, context: LoweringContext): LoweredStatemen
   const source = ctasData === null ? text : text.slice(0, ctasData.index);
   const noData = ctasData?.noData ?? false;
   const parsed = parseAny(source);
+  // Candidate matching deliberately preserves the legacy header grammar. Only the
+  // parsed statement kind distinguishes CTAS from AS inside ordinary DDL names/defaults.
+  if (ctasData !== null && ("query" in parsed || parsed.statement.kind !== "create-table-as"))
+    throw new PlanningError("WITH [NO] DATA requires CREATE TABLE AS", "42601");
   if ("query" in parsed) return lowerSelect(text, parsed.query, context);
   const statement = parsed.statement;
   const statementClass = classifyStatement(statement);
