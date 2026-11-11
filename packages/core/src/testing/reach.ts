@@ -2991,3 +2991,28 @@ export const AGGREGATE_PROGRESS_REACH = [
   "concurrent prepared executions",
   "all credit returned",
 ] as const;
+
+/** Admitted index ranges: publication, traversal, cancellation and atomic query admission. */
+export const WRITE_RANGE_ADMISSION_STATES = [
+  "asc",
+  "desc",
+  "publication",
+  "next",
+  "skip",
+  "cancel",
+  "close",
+  "concurrent",
+] as const;
+
+/** Large-key cursor admission across publication before and during traversal. */
+export const WRITE_RANGE_ADMISSION_HISTORY_STATES = [
+  "asc",
+  "desc",
+  "large text keys",
+  "multiple memtables",
+  "publication before open",
+  "publication during iteration",
+  "large text publication during iteration",
+  "next",
+  "skip after next",
+] as const;

@@ -21,6 +21,7 @@ import {
   tableInput,
 } from "./test-support.js";
 import { need } from "./bytes.js";
+import { Governor } from "../memory/governor.js";
 import { RunRangeInput } from "./range-input.js";
 
 const ALL = { lower: null, upper: null };
@@ -70,9 +71,16 @@ async function check(view: Snapshot, table: number, source: string, offset: numb
       table,
       result.rows.map((r) => r.id),
     );
-    const cursor = view
-      .index(table, view.catalog.table(table)?.primaryKey ?? 0)
-      .range(ALL, direction);
+    const index = view.index(table, view.catalog.table(table)?.primaryKey ?? 0);
+    if (index.planRange === undefined) throw new Error("admitted range capability missing");
+    const plan = index.planRange(ALL, direction);
+    const governor = new Governor(plan.minimumBytes + 1024 * 1024);
+    const grant = await governor.admit({
+      label: "admitted OFFSET",
+      minimumBytes: plan.minimumBytes,
+      spillable: false,
+    });
+    const cursor = plan.open({ budget: grant, signal: new AbortController().signal });
     try {
       expect(await cursor.skip(0)).toBe(0);
       const first = Math.floor(offset / 2);
@@ -95,6 +103,10 @@ async function check(view: Snapshot, table: number, source: string, offset: numb
       if (offset > total) reach.reach("past end");
     } finally {
       cursor.close();
+      expect(grant.allocated).toBe(0);
+      expect(grant.held).toBe(plan.minimumBytes);
+      grant.close();
+      expect(governor.usedBytes).toBe(0);
     }
   }
 }

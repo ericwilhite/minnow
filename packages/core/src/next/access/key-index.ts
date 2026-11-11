@@ -54,6 +54,7 @@
  * - Cancellation: calls are bounded (one batch, one block read per run); callers check their
  *   signal between calls. A cursor is abandoned with `close()`.
  */
+import type { Grant } from "../memory/governor.js";
 import { compareBytes } from "../vector/varlen.js";
 import type { KeyBatch } from "../keys/key-encoding.js";
 import type { IndexDef } from "./catalog.js";
@@ -76,6 +77,19 @@ export interface IndexReader {
    * `desc`). `ordered` indexes only; an `equality` index throws `TypeError` (use `probe`).
    */
   range(range: KeyRange, direction: "asc" | "desc"): IndexCursor;
+  /** Plan without native allocations or admission; range bounds must remain immutable. */
+  planRange?(range: KeyRange, direction: "asc" | "desc"): IndexRangePlan;
+}
+
+/** A single-use plan for one pinned view. The complete minimum includes resident heads,
+ * key copies, navigation and overlapping encoded/decoded I/O. Publication cannot widen it.
+ * Open never admits or grows. The caller owns the dedicated grant and closes it only after
+ * pending cursor calls settle; cursor close releases allocations, never the caller's grant.
+ * The signal cancels reads, waits and traversal. No leases are held before open.
+ */
+export interface IndexRangePlan {
+  readonly minimumBytes: number;
+  open(options: { readonly budget: Grant; readonly signal: AbortSignal }): IndexCursor;
 }
 
 /** Caller-owned probe output. Capacity is `min(probes.length, locators.length)`. */

@@ -6,6 +6,7 @@
  */
 import { hashKey } from "./key-hashes.js";
 import { MemoryReads } from "./memory-read.js";
+import { planIndexRange } from "./range-plan.js";
 import { StreamingRangeCursor } from "./range-cursor.js";
 import type { Held } from "../format/reachable.js";
 import type { CatalogView, ColumnDef, IndexDef, TableDef } from "../access/catalog.js";
@@ -14,6 +15,7 @@ import {
   prefixRange,
   type IndexCursor,
   type IndexReader,
+  type IndexRangePlan,
   type KeyRange,
   type MaybePromise,
   type ProbeOutput,
@@ -1102,6 +1104,12 @@ export class ViewIndex implements IndexReader {
     const result = this.resolve(key, rows);
     if (result instanceof Promise) await result;
     return rows;
+  }
+
+  planRange(range: KeyRange, direction: "asc" | "desc"): IndexRangePlan {
+    this.table.snapshot.check();
+    if (this.def.kind !== "ordered") throw new TypeError("An equality index serves lookups only");
+    return planIndexRange(this, range, direction);
   }
 
   range(range: KeyRange, direction: "asc" | "desc"): IndexCursor {

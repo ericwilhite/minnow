@@ -3,7 +3,7 @@ import { taskClock, yieldTask } from "../exec/pipeline.js";
 import { type KeyRange, type MaybePromise } from "../access/key-index.js";
 import type { SpaceReader } from "../access/space.js";
 import type { RunRef } from "../format/manifest.js";
-import type { Grant } from "../memory/governor.js";
+import type { ByteBudget } from "../access/space.js";
 import { StoreCorruptionError } from "../storage/contract.js";
 import { compareBytes } from "../vector/varlen.js";
 import { need } from "./bytes.js";
@@ -157,7 +157,7 @@ export class RunRangeInput implements RangeInput {
   tombstone = false;
   constructor(
     readonly space: SpaceReader,
-    readonly budget: Grant,
+    readonly budget: ByteBudget,
     readonly ref: RunRef,
     readonly range: KeyRange,
     readonly direction: number,
