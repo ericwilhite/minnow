@@ -30,6 +30,28 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+/** A 64-bit key table's half-full resize is funded before assignment. */
+export const INT64_GROWTH_REACH = [
+  "funded transition",
+  "half-full boundary above 8192",
+  "second half-full boundary",
+  "wide int64",
+  "safe int64",
+  "selected input",
+  "NULL group",
+  "zero charges",
+] as const;
+
+export const SEMI_ANTI_KEY_GROWTH_REACH = [
+  "catalogue semi",
+  "catalogue anti",
+  "more than 8192 right keys",
+  "wide correlation",
+  "NULL correlation",
+  "PG exact",
+  "zero resources",
+] as const;
+
 /** Capacity errors do not mutate a private progress lane or mask ownership errors. */
 export const STEP_LOANS_REFUSAL_REACH = [
   "oversized refused without allocation",
@@ -3006,6 +3028,34 @@ export const DATE_PART_SQL_REACH = [
   "day",
   "quarter",
   "week",
+] as const;
+
+/** Coverage-sized SQL histories retain every original phase/pressure state. */
+export const AGG_HANDOFF_SQL_REACH = [
+  "several executions",
+  "scalar",
+  "grouped",
+  "skewed dominant group",
+  "many small groups",
+  "filtered transitions",
+  "pressure checkpoint",
+  "restore admission",
+  "temporary pinned holder",
+  "holder releases",
+  "cancel pending phase",
+  "cancel restore pass",
+  "snapshot retained",
+  "owned parameter",
+  "empty owned parameter",
+  "resident follower",
+  "empty filtered resident state",
+  "PG exact",
+  "scratch service",
+  "zero",
+  "bounded 8192-row source",
+  "owned parameter at most 8KiB",
+  "1024 small groups retained",
+  "stable restore entered",
 ] as const;
 
 /** Aggregation waits before retaining state, then grows solely inside its admitted workspace. */

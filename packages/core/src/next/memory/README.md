@@ -88,6 +88,8 @@ repeating a wide source column across sort output aliases can still exceed its
 admitted progress lane; the planner must account for the expanded output or keep
 one copy until final projection.
 
+The int8 key-growth bound follows its own half-full rehash threshold, including
+old/new table overlap, rather than the int4 table's three-quarter threshold.
 A hash transition charges its complete prepared peak before yielding. Its unused
 credit stays owned while emission or updates are suspended, so reclaim cannot
 shrink the funded step. Buffer allocation consumes that charge once; the next
