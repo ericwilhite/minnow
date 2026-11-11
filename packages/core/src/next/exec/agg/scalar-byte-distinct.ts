@@ -3,9 +3,10 @@ import { xxHash32View } from "../../hash/xxhash32.js";
 import { OBJECT_OVERHEAD_BYTES } from "../../memory/governor.js";
 import type { PhysicalType } from "../../types.js";
 import type { ByteCharge } from "../../vector/varlen.js";
-import type { Selection, Vector } from "../../vector/vector.js";
+import type { Selection, Vector, FlatVector } from "../../vector/vector.js";
 import { IDENTITY } from "../kernels/vectors.js";
 import { Charged, grownCapacity } from "./groups.js";
+import { arrayGrowth, payloadBytes } from "./growth.js";
 
 const EMPTY_BYTES = new Uint8Array(0);
 const EMPTY_SLOTS = new Uint32Array(0);
@@ -18,6 +19,17 @@ export function supportsScalarByteDistinct(type: PhysicalType): boolean {
 }
 
 export class ScalarByteDistinct {
+  growthBytes(vector: Vector, rows: number): number {
+    return (
+      4096 +
+      arrayGrowth(this.#slots.length, (this.#count + rows) / 0.7 + 1, 5, true) +
+      arrayGrowth(this.#arena.length, this.#used + payloadBytes(vector) + 8 * rows, 1) +
+      (vector.form === "dictionary"
+        ? arrayGrowth(this.#translation.length, vector.dictionary.length, 1, true)
+        : 0)
+    );
+  }
+
   readonly #memory: Charged;
   /** Record offset + 1; a compact byte tag rejects most probes without reading this array. */
   #slots: Uint32Array;
@@ -171,6 +183,39 @@ export class ScalarByteDistinct {
     tags[at] = tag;
     this.#count++;
     return true;
+  }
+
+  *members(): Generator<{ group: number; id: number } | undefined, void, void> {
+    let count = 0;
+    for (let at = 0; at < this.#used; at += 8 + this.#view.getUint32(at + 4, true)) {
+      yield { group: 0, id: at };
+      if ((++count & 511) === 0) yield;
+    }
+  }
+  memberBytes(id: number): number {
+    return 8 + this.#view.getUint32(id + 4, true);
+  }
+  memberValue(id: number, type: PhysicalType): FlatVector {
+    const length = this.#view.getUint32(id + 4, true);
+    if (type.kind === "uuid")
+      return {
+        form: "flat",
+        type,
+        length: 1,
+        validity: null,
+        data: { layout: "fixed16", bytes: this.#arena.subarray(id + 8, id + 8 + length) },
+      };
+    return {
+      form: "flat",
+      type,
+      length: 1,
+      validity: null,
+      data: {
+        layout: "varlen",
+        offsets: Int32Array.of(0, length),
+        bytes: this.#arena.subarray(id + 8, id + 8 + length),
+      },
+    };
   }
 
   /** Same first-new-row selection contract as DistinctSet, restricted to scalar byte COUNT. */

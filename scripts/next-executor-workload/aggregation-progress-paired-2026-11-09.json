@@ -1,0 +1,748 @@
+{
+  "parent": "2c952cbf79ac6ea03a2219a823c887ea0f98e9ae",
+  "lane": "Node CPU (user + system), 1M real-write-path rows; not browser Gate B",
+  "rule": "9 adjacent AB/BA pairs, all retained. R type 7 quartiles, interpolation at (n-1)*p. An accepted regression needs median(candidate-control)>IQR and >=7/9 control-favourable pairs.",
+  "control": "Parent unbounded-growth recipe via aggregationProgress:false; same typed/packed numeric kernels. Shared default Pool branch is common to both.",
+  "candidate": "Complete certified hash workspace, or bounded external aggregation selected before transitions. Whole query includes certification and admission.",
+  "component": {
+    "id": "agg_3dims_20aggs",
+    "inputRows": 1000000,
+    "workspace": {
+      "minimumBytes": 16777216,
+      "peakBytes": 3122004,
+      "scope": "decoded operator and group-result sort; source certification measured in whole query"
+    },
+    "inputLayout": {
+      "numeric": "Float64, widening excluded as fixture setup",
+      "flatTextBytes": 17999463,
+      "dictionarySegments": [489, 489, 489, 489]
+    },
+    "resultRows": 1000,
+    "order": [
+      "operator",
+      "candidate",
+      "candidate",
+      "operator",
+      "operator",
+      "candidate",
+      "candidate",
+      "operator",
+      "operator",
+      "candidate",
+      "candidate",
+      "operator",
+      "operator",
+      "candidate",
+      "candidate",
+      "operator",
+      "operator",
+      "candidate"
+    ],
+    "loads": [
+      [2.32, 5.73, 5.75],
+      [2.32, 5.73, 5.75],
+      [2.32, 5.73, 5.75],
+      [2.32, 5.73, 5.75],
+      [2.32, 5.73, 5.75],
+      [2.32, 5.73, 5.75],
+      [2.32, 5.73, 5.75],
+      [2.32, 5.73, 5.75],
+      [2.32, 5.73, 5.75]
+    ],
+    "paired": {
+      "pairs": [
+        {
+          "control": 163.902,
+          "candidate": 283.665,
+          "delta": 119.76300000000003
+        },
+        {
+          "control": 163.505,
+          "candidate": 167.013,
+          "delta": 3.5080000000000098
+        },
+        {
+          "control": 279.677,
+          "candidate": 170.059,
+          "delta": -109.61800000000002
+        },
+        {
+          "control": 284.932,
+          "candidate": 167.795,
+          "delta": -117.13700000000003
+        },
+        {
+          "control": 165.906,
+          "candidate": 163.658,
+          "delta": -2.248000000000019
+        },
+        {
+          "control": 283.805,
+          "candidate": 163.094,
+          "delta": -120.71100000000001
+        },
+        {
+          "control": 171.4,
+          "candidate": 180.383,
+          "delta": 8.983000000000004
+        },
+        {
+          "control": 287.762,
+          "candidate": 169.847,
+          "delta": -117.91499999999999
+        },
+        {
+          "control": 160.469,
+          "candidate": 164.677,
+          "delta": 4.207999999999998
+        }
+      ],
+      "medianDeltaMs": -2.248000000000019,
+      "q1DeltaMs": -117.13700000000003,
+      "q3DeltaMs": 4.207999999999998,
+      "iqrDeltaMs": 121.34500000000003,
+      "minDeltaMs": -120.71100000000001,
+      "maxDeltaMs": 119.76300000000003,
+      "rangeDeltaMs": 240.47400000000005,
+      "spreadDeltaMs": 240.47400000000005,
+      "favoursCandidate": 5,
+      "favoursControl": 4,
+      "requiredFavourable": 7,
+      "acceptedGain": false,
+      "significantRegression": false,
+      "noRegression": true
+    },
+    "cpuMs": {
+      "operator": {
+        "samples": [163.902, 163.505, 279.677, 284.932, 165.906, 283.805, 171.4, 287.762, 160.469],
+        "median": 171.4,
+        "spread": 127.293
+      },
+      "candidate": {
+        "samples": [
+          283.665, 167.013, 170.059, 167.795, 163.658, 163.094, 180.383, 169.847, 164.677
+        ],
+        "median": 167.795,
+        "spread": 120.57100000000003
+      }
+    },
+    "componentOnly": true,
+    "limits": "Optimistic fixed-workload TS observation, not a mathematical lower bound or universal JS impossibility result. Raw bound/split read flat decoded bytes/numbers and hash every text row. Native wide consumes the original decoded dictionary segments, hashes/maps all entries and translates every row within timing, then uses packed five-AVG state. No precomputed canonical IDs/ranks. All use exact collision equality. Highcard native includes an exact full-input min/max probe and direct-address COUNT/SUM state with an exact general-hash fallback for a wide domain; highcard split and both other DISTINCT kernels alias bound (not independent algorithms). Operator keeps original scan dictionary forms and includes matching sort/top-N, copying and governor/driver/task clock. Whole is prepared pipeline/owned frames; outer harness separately measures SQL through cleanup. Feed is scan/project/discard only, not additive with the other sinks. Setup/flattening (including numeric widening to Float64) excluded; kernel allocation/state/final ordering included. Borrowed immutable inputs need no key copy; no memory governor/spill/cancellation in plain TS. AVG Sxx retained. Plain kernels are diagnostics; operator/candidate configurations are reported separately."
+  },
+  "whole": {
+    "lane": "Node",
+    "strategy": "aggregation-progress",
+    "paired": {
+      "pairs": [
+        {
+          "control": 335.426,
+          "candidate": 345.635,
+          "delta": 10.209000000000003
+        },
+        {
+          "control": 327.437,
+          "candidate": 374.462,
+          "delta": 47.02499999999998
+        },
+        {
+          "control": 322.275,
+          "candidate": 454.463,
+          "delta": 132.18800000000005
+        },
+        {
+          "control": 461.058,
+          "candidate": 407.718,
+          "delta": -53.339999999999975
+        },
+        {
+          "control": 360.258,
+          "candidate": 458.178,
+          "delta": 97.92000000000002
+        },
+        {
+          "control": 466.056,
+          "candidate": 397.589,
+          "delta": -68.46699999999998
+        },
+        {
+          "control": 360.406,
+          "candidate": 473.562,
+          "delta": 113.156
+        },
+        {
+          "control": 440.038,
+          "candidate": 406.86,
+          "delta": -33.178
+        },
+        {
+          "control": 376.73,
+          "candidate": 513.686,
+          "delta": 136.95600000000002
+        }
+      ],
+      "medianDeltaMs": 47.02499999999998,
+      "q1DeltaMs": -33.178,
+      "q3DeltaMs": 113.156,
+      "iqrDeltaMs": 146.334,
+      "minDeltaMs": -68.46699999999998,
+      "maxDeltaMs": 136.95600000000002,
+      "rangeDeltaMs": 205.423,
+      "spreadDeltaMs": 205.423,
+      "favoursCandidate": 3,
+      "favoursControl": 6,
+      "requiredFavourable": 7,
+      "acceptedGain": false,
+      "significantRegression": false,
+      "noRegression": true
+    },
+    "rounds": 9,
+    "order": [
+      "unbounded-growth-parent",
+      "admitted-hash-or-external",
+      "admitted-hash-or-external",
+      "unbounded-growth-parent",
+      "unbounded-growth-parent",
+      "admitted-hash-or-external",
+      "admitted-hash-or-external",
+      "unbounded-growth-parent",
+      "unbounded-growth-parent",
+      "admitted-hash-or-external",
+      "admitted-hash-or-external",
+      "unbounded-growth-parent",
+      "unbounded-growth-parent",
+      "admitted-hash-or-external",
+      "admitted-hash-or-external",
+      "unbounded-growth-parent",
+      "unbounded-growth-parent",
+      "admitted-hash-or-external"
+    ],
+    "timing": "process user+system CPU; SQL/lower/prepare/bind/pin/execute/rows/credit/cleanup included; ingestion excluded",
+    "before": {
+      "samples": [335.426, 327.437, 322.275, 461.058, 360.258, 466.056, 360.406, 440.038, 376.73],
+      "median": 360.406,
+      "spread": 143.781,
+      "profile": {
+        "operators": [
+          {
+            "relId": 1,
+            "op": "scan",
+            "rowsOut": 1000000,
+            "batchesOut": 489,
+            "peakHeldBytes": 3704205,
+            "spilledBytes": 0,
+            "spillPasses": 0,
+            "pagesRead": 6031,
+            "pagesPruned": 0,
+            "runtimeFilter": null
+          },
+          {
+            "relId": 2,
+            "op": "project",
+            "rowsOut": 1000000,
+            "batchesOut": 489,
+            "peakHeldBytes": 4096,
+            "spilledBytes": 0,
+            "spillPasses": 0,
+            "pagesRead": 0,
+            "pagesPruned": 0,
+            "runtimeFilter": null
+          },
+          {
+            "relId": 3,
+            "op": "aggregate",
+            "rowsOut": 1000,
+            "batchesOut": 1,
+            "peakHeldBytes": 1952932,
+            "spilledBytes": 0,
+            "spillPasses": 0,
+            "pagesRead": 0,
+            "pagesPruned": 0,
+            "runtimeFilter": null
+          },
+          {
+            "relId": 4,
+            "op": "project",
+            "rowsOut": 1000,
+            "batchesOut": 1,
+            "peakHeldBytes": 4096,
+            "spilledBytes": 0,
+            "spillPasses": 0,
+            "pagesRead": 0,
+            "pagesPruned": 0,
+            "runtimeFilter": null
+          },
+          {
+            "relId": 5,
+            "op": "sort",
+            "rowsOut": 1000,
+            "batchesOut": 1,
+            "peakHeldBytes": 4408228,
+            "spilledBytes": 0,
+            "spillPasses": 0,
+            "pagesRead": 0,
+            "pagesPruned": 0,
+            "runtimeFilter": null
+          }
+        ],
+        "pipelines": 1,
+        "memoryWaitMs": 0,
+        "peakHeldBytes": 11520273,
+        "synchronous": false
+      }
+    },
+    "after": {
+      "samples": [345.635, 374.462, 454.463, 407.718, 458.178, 397.589, 473.562, 406.86, 513.686],
+      "median": 407.718,
+      "spread": 168.05100000000004,
+      "profile": {
+        "operators": [
+          {
+            "relId": 1,
+            "op": "scan",
+            "rowsOut": 1000000,
+            "batchesOut": 489,
+            "peakHeldBytes": 3704205,
+            "spilledBytes": 0,
+            "spillPasses": 0,
+            "pagesRead": 6031,
+            "pagesPruned": 0,
+            "runtimeFilter": null
+          },
+          {
+            "relId": 2,
+            "op": "project",
+            "rowsOut": 1000000,
+            "batchesOut": 489,
+            "peakHeldBytes": 4096,
+            "spilledBytes": 0,
+            "spillPasses": 0,
+            "pagesRead": 0,
+            "pagesPruned": 0,
+            "runtimeFilter": null
+          },
+          {
+            "relId": 3,
+            "op": "aggregate",
+            "rowsOut": 1000,
+            "batchesOut": 1,
+            "peakHeldBytes": 8300694,
+            "spilledBytes": 0,
+            "spillPasses": 0,
+            "pagesRead": 0,
+            "pagesPruned": 0,
+            "runtimeFilter": null
+          },
+          {
+            "relId": 4,
+            "op": "project",
+            "rowsOut": 1000,
+            "batchesOut": 1,
+            "peakHeldBytes": 4096,
+            "spilledBytes": 0,
+            "spillPasses": 0,
+            "pagesRead": 0,
+            "pagesPruned": 0,
+            "runtimeFilter": null
+          },
+          {
+            "relId": 5,
+            "op": "sort",
+            "rowsOut": 1000,
+            "batchesOut": 1,
+            "peakHeldBytes": 4408228,
+            "spilledBytes": 0,
+            "spillPasses": 0,
+            "pagesRead": 0,
+            "pagesPruned": 0,
+            "runtimeFilter": null
+          }
+        ],
+        "pipelines": 1,
+        "memoryWaitMs": 0,
+        "peakHeldBytes": 17868035,
+        "synchronous": false
+      }
+    },
+    "medianDeltaMs": -47.31200000000001,
+    "regressionWithinParentSpread": true
+  },
+  "wholeTarget": {
+    "ms": 134,
+    "candidateMultiple": 3.042671641791045
+  },
+  "metadata": {
+    "lane": "Node",
+    "sqlCorrections": [],
+    "lateSort": true,
+    "keyOrder": true,
+    "revision": "2c952cbf79ac6ea03a2219a823c887ea0f98e9ae",
+    "workingTreePatchSha256": "344c4f074850897acccb6f722db284240257c7dfcc6df2db35bc0e955bde57c6",
+    "storage": "MemoryBackend + extent space + WritePathImpl, strict commits, flushed",
+    "dataset": "wide",
+    "rows": 1000000,
+    "columns": 200,
+    "scale": null,
+    "rounds": 9,
+    "fixtureRowCounts": null,
+    "timing": "process user+system CPU; SQL/lower/prepare/bind/pin/execute/rows/credit/cleanup included; ingestion excluded",
+    "node": "v26.12.0",
+    "cpuModel": "Intel(R) Core(TM) i5-8279U CPU @ 2.40GHz",
+    "governorCapBytes": 268435456,
+    "sourceHashes": {
+      "scripts/next-executor-bench.mts": "0cab9316c32440694e2bccf781e52e7e079add0339c1188846741ed690c867c1",
+      "scripts/lib/paired-cpu.mts": "6c578f94613567937737d5be128634d293665fa1c87db3376324aa260873da69",
+      "scripts/next-executor-components.mts": "2d480e35e3415561a4d6bf60f383f114abf827c8f059d1ebc388d4b2b9154bc5",
+      "scripts/next-late-fetch-component.mts": "41006934f3c14b8cf4c6cec95797c68ad87bb28db349bc34cffcf35621c0714d",
+      "scripts/next-aggregation-components.mts": "3be6b0dfd1855b0d173e8eac60ba8c7cb6e7a893a4e774e8d32637bb6ac6903a",
+      "scripts/next-scalar-distinct-bench.mts": "46c7b4429f0576ce5b4bf2c762a1fc93b0b7fc55caa6a87e759e105675c3cc95",
+      "scripts/next-aggregation-light.mts": "55030979f8134045bddb265306191ee1ea0602462fac60621b7b8e580c7ff277",
+      "scripts/lib/aggregation-light-kernels.mts": "db6b98e32b347539dbce7d94d5e7cb3f5a706934abfb57c9e92c14fa3223fa7e",
+      "packages/core/dist/next/hash/xxhash32.js": "e1364b0c9830cfa59ce7c9c2f9480eab16a10fa2415504f021e1c725144160b4",
+      "packages/core/dist/next/page/read-bounds.js": "356a1b2ddb78ac6dcda8b0eccca1dde57e12e9c53f708d706ad7ced0400bebe2",
+      "packages/core/dist/next/page/domain-certificate.js": "4b6f94c7abd4231dfd5d35eb79e668270575065eb8106dc4d8cff809a1e77107",
+      "scripts/next-executor-workload/gen.mjs": "8b3d70312ac54a87e69f2a0672ed49b024baab7cf9097d92cf6e11da0189fd95",
+      "scripts/next-executor-workload/queries.mjs": "abcc9f2809d04270569fe6b9e37867978d0c4c82e8a5ea331461d6f3a37347f2",
+      "apps/site/bench/benchmark.ts": "3af271201d76a77c1d8d4296f11eb1e6abbac3ecd93223daf7a40e594ed6a60e",
+      "packages/core/src/next/testing/executor-catalogue.json": "3626fcbcca6d4aa0d493f7fa7ba45ea12e0ba2b9f2e0afaed62514c27d5ab52b",
+      "packages/core/dist/next/exec/plan.js": "5089eea8565d4dc1eafbebba3f3544e51567920ed36bc111e8f4908300894702",
+      "packages/core/dist/next/exec/spill-pool.js": "7c87400962ff0743f7d7019d30541c4230598e28b3763d2cc8d3b2d847b32ec6",
+      "packages/core/dist/next/exec/limit.js": "b1791d3de37fef6e6a54cfa236e1124967da49cc4b255b752803e31f2b19c205",
+      "packages/core/dist/next/exec/table-scan.js": "ca949db38416ba9d6ce30c7eda288d38fcb70f3f5c76c3d693219829eee26eb1",
+      "packages/core/dist/next/exec/memory-scan.js": "946b07cc043f5e89415ea89aec55751cb66b2d276e30a285c3321ab59a8f2e7d",
+      "packages/core/dist/next/exec/key-order.js": "f42600c9435038b251339b2dda6bbfc50665d389a52da0ac4dd31ea77b37036c",
+      "packages/core/dist/next/exec/late-fetch.js": "c917b37f809a85d16e215ff9c84762e15f7237bf6e5e839080cdc1b90fbfba53",
+      "packages/core/dist/next/exec/agg/aggregate.js": "5828a8d60680fc6611bd4223febc92373d6f39bbf88b35ddcad1d976b4f0f3a2",
+      "packages/core/dist/next/exec/agg/domain-count-sum.js": "83dec70a3a94e19d5ed5342095719dbca66a4a733c1c6eab9f295517df99c06e",
+      "packages/core/dist/next/exec/agg/group-top-n.js": "5ef1c1577fc14b76dd6e95386364d0bf7d1e8cd244ed3c2c9825faa6dd940096",
+      "packages/core/dist/next/exec/agg/groups.js": "cf59777a3079de4a8c701fc9f3f195c2d7dc3fcdd29261e15ecee91b7af9e938",
+      "packages/core/dist/next/exec/agg/states.js": "09780d0a424f16c852648b262302c7f39811578567ee212160827b34fd0b3a16",
+      "packages/core/dist/next/exec/agg/packed-averages.js": "3f1db7e2bde8ccbdc567cd2d4c78ce831516b863db1c6cd676008da253330606",
+      "packages/core/dist/next/exec/agg/packed-integers.js": "479493490f0afa9f05b8595614a5a61832a95aa44bae4694b695536ce8911298",
+      "packages/core/dist/next/exec/agg/typed-layout.js": "c8d5445ce1b008d84da56016846af8681d0b28519b768764a71907f2f946fe36",
+      "packages/core/dist/next/exec/agg/hash-bound.js": "2c273c83d6d82e15be5f030efe462b9e68d5529211ef7fd50e697eca3e801693",
+      "packages/core/dist/next/exec/agg/dictionary-probe.js": "16f4c6a847213a4a47ed72f088d71318d84adf1b2623b21db2deb09792148bf4",
+      "packages/core/dist/next/exec/agg/partition-probe.js": "7e80b3ebe05077d32f3a6b801cf63f1fdc7cb5990cb1097a995b3cec33eaf587",
+      "packages/core/dist/next/exec/agg/external.js": "8e49bb79ecfd1fb0956bde0f346803a48222a36e5a50ca1b1a41ce9dbb8986ee",
+      "packages/core/dist/next/exec/agg/external-call.js": "05d4428839cbc8dbddf9380a1b2bacddc2ea73f9f68265aafe8115d1a0c939fe",
+      "packages/core/dist/next/exec/agg/sort-grants.js": "fb36f44d817ed5df22ce45bd157402921fb1749428431b108188707c84703c64",
+      "packages/core/dist/next/exec/agg/distinct.js": "932d757d917dd1d3d9fecee66da90ed0d682d7930d6be003684d43a744a1a171",
+      "packages/core/dist/next/exec/agg/scalar-byte-distinct.js": "01e6bd8904027327596f2d9d7deb291a5a255810f7184ba72f165ef12d4341a4"
+    },
+    "load": [6.54, 7.76, 6.32],
+    "profileId": "agg_3dims_20aggs",
+    "execArgv": [],
+    "sqlSource": "scripts/next-executor-workload/queries.mjs",
+    "harness": "scripts/next-executor-workload"
+  },
+  "profile": {
+    "operator": {
+      "scope": "single sampled operation, self samples; inspector/idle/program excluded; diagnostic, not CPU phase timers",
+      "includedSampleMs": 198.628,
+      "excludedSampleMs": 132.989,
+      "sharePct": {
+        "other": 7.733552167871599,
+        "aggregation": 90.48472521497473,
+        "GC": 1.7817226171536742
+      },
+      "topSelf": [
+        {
+          "file": "typed-layout.js",
+          "function": "record",
+          "sharePct": 40.114183297420304
+        },
+        {
+          "file": "typed-layout.js",
+          "function": "tryUpdate",
+          "sharePct": 15.490766659282679
+        },
+        {
+          "file": "states.js",
+          "function": "#updateBatchRanked",
+          "sharePct": 12.4871619308456
+        },
+        {
+          "file": "groups.js",
+          "function": "dictionaryIds",
+          "sharePct": 9.26707211470689
+        },
+        {
+          "file": "groups.js",
+          "function": "dictionaries",
+          "sharePct": 5.959381356102866
+        },
+        {
+          "file": "states.js",
+          "function": "compareToStored",
+          "sharePct": 2.8913345550476266
+        },
+        {
+          "file": "varlen.js",
+          "function": "compareBytes",
+          "sharePct": 2.5902692470346578
+        },
+        {
+          "file": "",
+          "function": "(garbage collector)",
+          "sharePct": 1.7817226171536742
+        },
+        {
+          "file": "sort-keys.js",
+          "function": "msdSort",
+          "sharePct": 1.1015566788166824
+        },
+        {
+          "file": "values.js",
+          "function": "start",
+          "sharePct": 0.959079283887468
+        },
+        {
+          "file": "sort-keys.js",
+          "function": "leaf",
+          "sharePct": 0.9480033026562217
+        },
+        {
+          "file": "states.js",
+          "function": "#rankingOf",
+          "sharePct": 0.7325251223392473
+        },
+        {
+          "file": "test-support.js",
+          "function": "valueAt",
+          "sharePct": 0.6439172724892764
+        },
+        {
+          "file": "groups.js",
+          "function": "make",
+          "sharePct": 0.5729303018708339
+        },
+        {
+          "file": "values.js",
+          "function": "#writeBytes",
+          "sharePct": 0.4083009444791268
+        }
+      ]
+    },
+    "whole": {
+      "scope": "single sampled operation, self samples; inspector/idle/program excluded; diagnostic, not CPU phase timers",
+      "includedSampleMs": 364.848,
+      "excludedSampleMs": 128.566,
+      "sharePct": {
+        "other": 8.18423014515634,
+        "aggregation": 45.175251063456564,
+        "scan/page/storage": 45.30927948077007,
+        "GC": 1.3312393106170242
+      },
+      "topSelf": [
+        {
+          "file": "typed-layout.js",
+          "function": "record",
+          "sharePct": 22.0538415997895
+        },
+        {
+          "file": "typed-layout.js",
+          "function": "tryUpdate",
+          "sharePct": 8.008540542911021
+        },
+        {
+          "file": "manifest-codec.js",
+          "function": "RefReader",
+          "sharePct": 6.473380695522519
+        },
+        {
+          "file": "states.js",
+          "function": "#updateBatchRanked",
+          "sharePct": 4.778154190238126
+        },
+        {
+          "file": "groups.js",
+          "function": "dictionaries",
+          "sharePct": 4.2044906371968604
+        },
+        {
+          "file": "groups.js",
+          "function": "dictionaryIds",
+          "sharePct": 3.8470815243608296
+        },
+        {
+          "file": "bytes.js",
+          "function": "uint",
+          "sharePct": 2.8480353462263737
+        },
+        {
+          "file": "decode.js",
+          "function": "scaledInto",
+          "sharePct": 2.303973161426128
+        },
+        {
+          "file": "manifest-codec.js",
+          "function": "",
+          "sharePct": 2.2549116344340656
+        },
+        {
+          "file": "directory.js",
+          "function": "raw",
+          "sharePct": 1.8624194184975662
+        },
+        {
+          "file": "next-executor-bench.mts",
+          "function": "consume",
+          "sharePct": 1.8470705608911109
+        },
+        {
+          "file": "table-scan.js",
+          "function": "#loadPages",
+          "sharePct": 1.6502762794369161
+        },
+        {
+          "file": "decode.js",
+          "function": "addBase32",
+          "sharePct": 1.5225518572117704
+        },
+        {
+          "file": "read-bounds.js",
+          "function": "size",
+          "sharePct": 1.4943209226856116
+        },
+        {
+          "file": "decode.js",
+          "function": "decodeValues",
+          "sharePct": 1.3567293777134588
+        }
+      ]
+    }
+  },
+  "limits": [
+    "No aggregate replay or state merging; unproven domains pay external-sort I/O.",
+    "Source metadata/codebook planning pass, or bounded key/payload scan for memory tails.",
+    "Raw synchronous hash helpers require a complete workspace; no resumption after failed push.",
+    "SQL DISTINCT suites assert the actual external route; raw bitmap and byte-kernel suites retain memory-gain comparisons.",
+    "Control shares the small default Pool guard; comparison isolates recipe/admission and capped allocation, not an independent parent build.",
+    "No accepted reverse regression is absence of evidence under the requested rule, not proof of equivalence.",
+    "Earlier paired-1m capture is retained but superseded by this final-source capture."
+  ],
+  "commands": {
+    "gate": "Lead gate.sh adapted only for cache scratch, serial commands, two workers, full logs/actual exits; CI unset.",
+    "benchmark": "TMPDIR=<scratch> NODE_OPTIONS=--max-old-space-size=3072 node scripts/next-executor-bench.mts --dataset wide --rows 1000000 --only agg_3dims_20aggs --repeats 9 --paired --whole-compare aggregation-progress --component aggregation-light --profile agg_3dims_20aggs --output <capture>",
+    "redGreen": "npx vitest run packages/core/src/next/testing/executor-agg-progress.test.ts --maxWorkers=2"
+  },
+  "decision": {
+    "purpose": "correctness/liveness fix, not a performance gain",
+    "operatorAcceptedReverseRegression": false,
+    "wholeAcceptedReverseRegression": false,
+    "wholePointEstimate": "Candidate median is higher; do not describe absence of an accepted reverse regression as equivalence."
+  },
+  "correctness": {
+    "law": [
+      "MemoryGovernor grant-or-spill contract; only complete minimum over whole cap is a typed admission refusal.",
+      "PostgreSQL float8_accum input-order transitions and ordered DISTINCT transitions (REL_17_STABLE nodeAgg.c)."
+    ],
+    "red": "Both new production pressure seeds fail on the parent plan routing with intended 4096B aggregation growth refusal. New test/Reach scaffolding and unused helper modules retained; parent implementation selected. Reviewer raw repro also fails at its intended 512B growth.",
+    "green": {
+      "files": 448,
+      "tests": 3945,
+      "CI": null,
+      "maxWorkers": 2,
+      "sourceHashesUnchangedDuringGate": true,
+      "checks": [
+        {
+          "name": "install",
+          "exit": 0,
+          "seconds": 12.290364203974605
+        },
+        {
+          "name": "format",
+          "exit": 0,
+          "seconds": 49.30727370304521
+        },
+        {
+          "name": "build",
+          "exit": 0,
+          "seconds": 110.58943619800266
+        },
+        {
+          "name": "typecheck",
+          "exit": 0,
+          "seconds": 83.98442011000589
+        },
+        {
+          "name": "lint",
+          "exit": 0,
+          "seconds": 154.27658112405334
+        },
+        {
+          "name": "api",
+          "exit": 0,
+          "seconds": 44.079784090979956
+        },
+        {
+          "name": "version",
+          "exit": 0,
+          "seconds": 0.3828085429267958
+        },
+        {
+          "name": "resolve",
+          "exit": 0,
+          "seconds": 0.04208485200069845
+        },
+        {
+          "name": "page-format-memory-hash",
+          "exit": 0,
+          "seconds": 42.62228500389028
+        },
+        {
+          "name": "storage-spill-access-keys-vector",
+          "exit": 0,
+          "seconds": 167.86727547098417
+        },
+        {
+          "name": "exec",
+          "exit": 0,
+          "seconds": 193.34996806492563
+        },
+        {
+          "name": "ir-lower-owner-testing-write",
+          "exit": 0,
+          "seconds": 754.6979503280018
+        },
+        {
+          "name": "browser-and-package-boundaries",
+          "exit": 0,
+          "seconds": 6.4673005159711465
+        },
+        {
+          "name": "full-scripts",
+          "exit": 0,
+          "seconds": 34.31194594700355
+        }
+      ]
+    },
+    "mutants": [
+      {
+        "name": "premature-step-repayment",
+        "exit": 1,
+        "seconds": 3.0404964319895953,
+        "log": "mutant-premature-step-repayment.log"
+      },
+      {
+        "name": "undersized-hash",
+        "exit": 1,
+        "seconds": 10.72539939195849,
+        "log": "mutant-undersized-hash.log"
+      },
+      {
+        "name": "reversed-replay-rows",
+        "exit": 1,
+        "seconds": 3.332727322005667,
+        "log": "mutant-reversed-replay-rows.log"
+      },
+      {
+        "name": "unstable-group-sort",
+        "exit": 1,
+        "seconds": 4.920082052005455,
+        "log": "mutant-unstable-group-sort.log"
+      }
+    ],
+    "reach": "AGGREGATE_PROGRESS_REACH and each local createReach: atomic wait/cancel, pinned holder release, no remaining headroom, typed growth/promotion, tuple/translation growth, exact PG output; external spill/selection/order, large varlen private loans, max NUMERIC, close failure/drain, R6 sync.",
+    "coverageCorrection": "Existing SQL bitmap/byte DISTINCT generators keep all seeds, counts and row oracles; assert actual bounded external route and equal external minimum under either hash flag. Raw bitmap and byte-kernel suites retain their original memory-saving assertions."
+  }
+}

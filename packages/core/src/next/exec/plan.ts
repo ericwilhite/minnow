@@ -10,7 +10,12 @@ import { Slice, runSliced, type SlicedJob } from "./slices.js";
 import type { MaybePromise } from "../access/key-index.js";
 import type { PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { ResultSink } from "./result-sink.js";
-import { ExceptOperator, exceptKeyLayout, exceptMinimumBytes } from "./except.js";
+import {
+  ExceptOperator,
+  exceptKeyLayout,
+  exceptMinimumBytes,
+  type ExceptCheckpoint,
+} from "./except.js";
 import { readValue, boundSource, type ReadSource, type ReadBound } from "../page/read-bounds.js";
 import { batchTargetFor, type Grant } from "../memory/governor.js";
 import { jsonLiteralBytes, jsonInputsBounded } from "./json-plan.js";
@@ -20,9 +25,21 @@ import type { ByteCharge } from "../vector/varlen.js";
 import { samePhysicalType, type PhysicalType } from "../types.js";
 import { BATCH_ROWS, type Batch, type Selection, type Vector } from "../vector/vector.js";
 import { int64At } from "../vector/int64.js";
+import { HybridAggregateOperator, closeHybridPhase, type HybridPhase } from "./agg/hybrid.js";
+import { RestoredAggregateOperator, restoredMinimum, restoredLoans } from "./agg/restored.js";
+import { LARGE_VALUE_BYTES } from "../page/large-value.js";
+import { acquirePhasePool } from "./phase-pool.js";
 import { AggregateOperator, type AggregateOptions } from "./agg/aggregate.js";
 import { DomainCountSumOperator, supportsDomainCountSum } from "./agg/domain-count-sum.js";
 import { groupTopNShape, type GroupTopNSpec } from "./agg/group-top-n.js";
+import {
+  ExternalAggregateOperator,
+  externalAggregateMinimum,
+  externalAggregateLoans,
+} from "./agg/external.js";
+import { scalarHashMinimum, dictionaryHashShape, dictionaryHashMinimum } from "./agg/hash-bound.js";
+import { externalCallArguments } from "./agg/external-call.js";
+import { probeDictionaryGroups } from "./agg/dictionary-probe.js";
 import {
   isOrderedSet,
   orderedSetArguments,
@@ -182,10 +199,27 @@ function instantiate<T>(
   capacity: number,
   setup: Setup<T>,
   use: (value: T) => MaybePromise<void>,
+  bounded = false,
 ): MaybePromise<void> {
   return then(
     runtime.admit(`${rel.op}#${String(rel.id)}`, Math.max(4096, minimum), true, rel),
     (grant) => {
+      if (bounded) {
+        const underlying = grant;
+        // This complete workspace was admitted atomically. No hash resize may silently
+        // depend on shared headroom; a bad certificate is an accounting defect.
+        grant = new Proxy(underlying, {
+          get(target, key) {
+            if (key === "allocate")
+              return (bytes: number) =>
+                target.allocated + bytes <= minimum && target.allocate(bytes);
+            const value: unknown = Reflect.get(target, key, target);
+            return typeof value === "function"
+              ? (value as (...args: unknown[]) => unknown).bind(target)
+              : value;
+          },
+        });
+      }
       const resources = new Resources(grant, capacity);
       runtime.dispose(() => resources.close());
       // Fixed buffers remain charged. Only unused holdings can be surrendered to another admission.
@@ -193,23 +227,21 @@ function instantiate<T>(
         const free = grant.held - grant.allocated - grant.loaned;
         if (free > 0) grant.release(free);
       });
-      try {
-        const value = setup(
-          {
-            arena: resources.arena,
-            params: runtime.params,
-            input,
-            ...(runtime.resolveCall === undefined ? {} : { resolveCall: runtime.resolveCall }),
-          },
-          grant,
-        );
-        const result = use(value);
-        if (isPromise(result)) return result.finally(() => resources.close());
-        resources.close();
-      } catch (error) {
-        resources.close();
-        throw error;
-      }
+      return runtime.resource(
+        () => {
+          const value = setup(
+            {
+              arena: resources.arena,
+              params: runtime.params,
+              input,
+              ...(runtime.resolveCall === undefined ? {} : { resolveCall: runtime.resolveCall }),
+            },
+            grant,
+          );
+          return use(value);
+        },
+        () => resources.close(),
+      );
     },
   );
 }
@@ -430,6 +462,8 @@ export interface CompileOptions {
   readonly batchDictionaryMinMax?: boolean;
   /** False retains the general hash recipe as a benchmark control. */
   readonly domainCountSum?: boolean;
+  /** Parent control for the aggregation memory-progress benchmark only. */
+  readonly aggregationProgress?: boolean;
   /** False retains the original window inputs for component/query benchmark controls. */
   readonly windowInputDeduplication?: boolean;
   /** Parent control for literal-amount gather benchmarks. */
@@ -485,6 +519,53 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   const exportOwners = new WeakMap<Operator, ResultSink>();
   const groupTops = new Map<number, GroupTopNSpec>();
   let domainPlans = 0;
+  interface AggregateStrategy {
+    readonly kind: "hash" | "domain" | "external" | "hybrid" | "restore";
+    readonly minimum: number;
+    readonly loans: number;
+  }
+  const aggregateChoices = new WeakMap<QueryRuntime, Map<number, AggregateStrategy>>();
+  const hybridIo = 2 << 20;
+  interface Cut {
+    readonly rel: number;
+    readonly phase: HybridPhase;
+  }
+  interface Phases {
+    resume: Cut | null;
+    pending: Cut | null;
+    readonly excepts: Map<number, ExceptOperator>;
+    readonly retained: Map<number, ExceptCheckpoint>;
+  }
+  const phases = new WeakMap<QueryRuntime, Phases>();
+  // Unary ancestors are empty until their aggregate child emits. EXCEPT checkpoints
+  // exact counted left/right records before retirement; joins still need their own seam.
+  const phaseCapable = new Set<number>();
+  const markPhases = (rel: Rel, unary: boolean): void => {
+    if (unary && (rel.op === "aggregate" || rel.op === "distinct")) phaseCapable.add(rel.id);
+    if ("input" in rel) markPhases(rel.input, unary);
+    if ("left" in rel) markPhases(rel.left, false);
+    if ("right" in rel) markPhases(rel.right, false);
+    if ("inputs" in rel)
+      for (const input of rel.inputs) markPhases(input, unary && rel.kind === "except");
+  };
+  markPhases(plan.root, true);
+  const aggregatePlanners = new Map<
+    number,
+    {
+      readonly rel: Extract<Rel, { op: "aggregate" }>;
+      readonly input: readonly PhysicalType[];
+      readonly compiler: number;
+      readonly output: AggregateOptions;
+      readonly external: AggregateStrategy;
+      readonly hybrid: AggregateStrategy | null;
+      readonly fixed: boolean;
+      readonly hashMinimum: number;
+      readonly restore: AggregateStrategy;
+      readonly scalar: number | null;
+      readonly dictionary: ReturnType<typeof dictionaryHashShape>;
+      readonly domain: ReturnType<typeof domainSource>;
+    }
+  >();
   // SQL SELECT * may retain an identity projection for output names. It neither retains
   // source batches nor re-reads them; computed/reordered projections and other consumers stop here.
   let terminalInput = plan.root;
@@ -1018,6 +1099,228 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               : new DomainCountSumOperator(aggregate, context, grant, DISCARD, outputOptions),
           (operator) => operator.abort(undefined),
         );
+        if (options.aggregationProgress !== false) {
+          const externalCompiler = measureCompilerBuffers(
+            compilation,
+            input,
+            BATCH_ROWS,
+            (context) => aggregate.aggregates.map((call) => externalCallArguments(call, context)),
+            () => undefined,
+          );
+          const external: AggregateStrategy = {
+            kind: "external",
+            minimum:
+              externalCompiler +
+              externalAggregateMinimum(aggregate, input, outputOptions.outputTopN),
+            loans: externalAggregateLoans(aggregate, input, outputOptions.outputTopN),
+          };
+          const fixedHash =
+            aggregate.groupBy.length <= 8 &&
+            aggregate.groupBy.every((c) =>
+              [
+                "bool",
+                "int32",
+                "int64",
+                "float32",
+                "float64",
+                "date",
+                "time",
+                "timestamp",
+                "uuid",
+              ].includes(input[c]?.kind ?? ""),
+            ) &&
+            aggregate.aggregates.every(
+              (call) =>
+                !call.distinct &&
+                call.filter === null &&
+                call.orderBy.length === 0 &&
+                (call.fn === "count" ||
+                  call.fn === "count_star" ||
+                  (["sum", "avg"].includes(call.fn) &&
+                    ["float32", "float64"].includes(call.args[0]?.type.kind ?? ""))),
+            );
+          const restore: AggregateStrategy = {
+            kind: "restore",
+            minimum: minimum + restoredMinimum(aggregate, input),
+            loans: restoredLoans(aggregate),
+          };
+          aggregatePlanners.set(rel.id, {
+            rel: aggregate,
+            input,
+            compiler: minimum,
+            output: outputOptions,
+            external,
+            fixed: fixedHash,
+            hashMinimum: minimum + (512 << 10),
+            restore,
+            hybrid:
+              !plan.volatile &&
+              (phaseCapable.has(rel.id) || fixedHash) &&
+              aggregate.groupingSets === null &&
+              aggregate.aggregates.every(
+                (call) =>
+                  call.orderBy.length === 0 &&
+                  (!call.distinct || call.fn === "count") &&
+                  call.args.every((arg) => arg.op === "column"),
+              )
+                ? {
+                    kind: "hybrid",
+                    // Only this producer phase exists now. The sorted restore graph
+                    // is atomically admitted after eviction retires these grants; reserving
+                    // its dormant sort lanes here would inflate a memory-fitting hash minimum.
+                    minimum: minimum + (512 << 10) + hybridIo,
+                    loans: 2,
+                  }
+                : null,
+            scalar: plan.volatile ? null : scalarHashMinimum(aggregate, input, minimum),
+            dictionary: plan.volatile ? null : dictionaryHashShape(aggregate, input),
+            domain,
+          });
+          fixed(rel, external.minimum, rel.id, external.loans);
+          return (runtime, downstream) => {
+            const strategy = aggregateChoices.get(runtime)?.get(rel.id);
+            if (strategy === undefined) throw new Error("Aggregation strategy was not admitted");
+            return instantiate(
+              runtime,
+              rel,
+              input,
+              strategy.minimum,
+              BATCH_ROWS,
+              (context, grant) => {
+                const target = counted(runtime, rel, downstream),
+                  config = { signal: runtime.signal, ...outputOptions };
+                if (strategy.kind === "restore") {
+                  const resume = phases.get(runtime)?.resume;
+                  if (resume?.rel !== rel.id) throw new Error("Missing saved restoration phase");
+                  return new RestoredAggregateOperator(
+                    aggregate,
+                    context,
+                    {
+                      grant,
+                      loans: Array.from({ length: strategy.loans }, (_, slot) =>
+                        runtime.loan(rel, slot),
+                      ),
+                      spill: runtime.request.spill,
+                      queryId: runtime.request.queryId,
+                      signal: runtime.signal,
+                    },
+                    resume.phase,
+                    target,
+                  );
+                }
+                if (strategy.kind === "hybrid") {
+                  const state = phases.get(runtime);
+                  if (!state) throw new Error("Missing aggregate phase execution");
+                  const resume = state.resume?.rel === rel.id ? state.resume.phase : undefined;
+                  return new HybridAggregateOperator(
+                    aggregate,
+                    context,
+                    {
+                      grant,
+                      extras: Array.from({ length: strategy.loans }, (_, slot) =>
+                        runtime.loan(rel, slot),
+                      ),
+                      hashMinimum: aggregatePlanners.get(rel.id)?.hashMinimum ?? 0,
+                      progressBytes: runtime.operatorStep(rel),
+                      ioMinimum: hybridIo,
+                      spill: runtime.request.spill,
+                      queryId: runtime.request.queryId,
+                      signal: runtime.signal,
+                      fixed: aggregatePlanners.get(rel.id)?.fixed ?? false,
+                      ...(resume === undefined ? {} : { resume }),
+                      ...(phaseCapable.has(rel.id)
+                        ? {
+                            handoff: async (phase: HybridPhase) => {
+                              if (state.pending) throw new Error("Concurrent aggregate handoffs");
+                              state.pending = { rel: rel.id, phase };
+                              // An EXCEPT right arm can retire only after preserving its
+                              // accumulated/spilled left counts and first representatives.
+                              for (const [id, parent] of state.excepts) {
+                                const saved = await parent.checkpoint();
+                                const previous = state.retained.get(id);
+                                state.retained.set(id, saved);
+                                await previous?.records.close();
+                              }
+                              runtime.beginHandoff();
+                            },
+                          }
+                        : {}),
+                    },
+                    target,
+                    outputOptions,
+                  );
+                }
+                if (strategy.kind === "external")
+                  return new ExternalAggregateOperator(
+                    aggregate,
+                    context,
+                    {
+                      grant,
+                      loans: Array.from({ length: strategy.loans }, (_, slot) =>
+                        runtime.loan(rel, slot),
+                      ),
+                      spill: runtime.request.spill,
+                      queryId: runtime.request.queryId,
+                      signal: runtime.signal,
+                    },
+                    target,
+                    outputOptions.outputTopN,
+                  );
+                if (strategy.kind === "domain" && domain !== null) {
+                  const certificate = runtime.sourceDomain(domain.scan.id);
+                  if (certificate === undefined) throw new Error("Missing admitted exact domain");
+                  const operator = new DomainCountSumOperator(
+                    aggregate,
+                    context,
+                    grant,
+                    target,
+                    config,
+                  );
+                  operator.bounds(certificate.low, certificate.high, certificate.rows);
+                  operator.seal();
+                  return operator;
+                }
+                return new AggregateOperator(aggregate, context, grant, target, config);
+              },
+              (operator) => {
+                runtime.onAbort((reason) => operator.abort(reason));
+                if (
+                  !(operator instanceof ExternalAggregateOperator) &&
+                  !(operator instanceof HybridAggregateOperator) &&
+                  !(operator instanceof RestoredAggregateOperator)
+                )
+                  return child(runtime, operator, []);
+                runtime.dispose(() => operator.closed);
+                return (async () => {
+                  try {
+                    const state = phases.get(runtime);
+                    if (
+                      (operator instanceof HybridAggregateOperator ||
+                        operator instanceof RestoredAggregateOperator) &&
+                      state?.resume?.rel === rel.id
+                    )
+                      await operator.finish();
+                    else await child(runtime, operator, []);
+                    if (operator instanceof RestoredAggregateOperator) {
+                      runtime.profile(rel).spilledBytes = operator.profile.spilledBytes;
+                      runtime.profile(rel).spillPasses = operator.profile.spillPasses;
+                    }
+                    if (operator instanceof HybridAggregateOperator) {
+                      runtime.profile(rel).spilledBytes = operator.profile.spilledBytes;
+                      runtime.profile(rel).spillPasses =
+                        operator.profile.passes + operator.profile.evictions;
+                    }
+                  } catch (error) {
+                    operator.abort(error);
+                    await operator.closed.catch(() => undefined);
+                    throw error;
+                  }
+                })();
+              },
+              strategy.kind === "hash" || strategy.kind === "domain",
+            );
+          };
+        }
         fixed(rel, Math.max(4096, minimum));
         return (runtime, downstream) =>
           instantiate(
@@ -1380,8 +1683,16 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               runtime.onAbort((reason) => operator.abort(reason));
               runtime.dispose(() => operator.closed);
               return (async () => {
+                const state = phases.get(runtime);
+                state?.excepts.set(rel.id, operator);
                 try {
-                  await left(runtime, operator.left, []);
+                  const saved = state?.retained.get(rel.id);
+                  if (saved) {
+                    await operator.restore(saved);
+                    state?.retained.delete(rel.id);
+                  }
+                  if (!operator.leftComplete) await left(runtime, operator.left, []);
+                  if (runtime.handingOff) return;
                   await right(runtime, operator.right, []);
                   const profile = runtime.profile(rel);
                   profile.spilledBytes = operator.profile.spilledBytes;
@@ -1390,6 +1701,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                   operator.abort(error);
                   await operator.closed.catch(() => undefined);
                   throw error;
+                } finally {
+                  state?.excepts.delete(rel.id);
                 }
               })();
             },
@@ -1594,10 +1907,61 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       } else if ("input" in rel) visit(rel.input);
     };
     visit(plan.root);
+    if ([...aggregatePlanners.keys()].some((id) => active.has(id))) {
+      // Inline values are <=64KiB by the stored format. This compound envelope is
+      // aggregation-only: B2's plain export minimum is unchanged. Larger source steps
+      // and owned parameter copies are added by the runtime's admitted progress rule.
+      // Plan-owned literals can exceed the stored inline threshold. Their already-built
+      // vectors give an exact byte bound without re-encoding or copying their payloads.
+      let literalBytes = LARGE_VALUE_BYTES;
+      const inspected = new Set<object>();
+      const inspect = (value: unknown): void => {
+        if (
+          value === null ||
+          typeof value !== "object" ||
+          ArrayBuffer.isView(value) ||
+          inspected.has(value)
+        )
+          return;
+        // An unopened zero-limit subtree contributes no buffers to its live sibling.
+        if ("op" in value && "id" in value && typeof value.id === "number" && !active.has(value.id))
+          return;
+        inspected.add(value);
+        if ("form" in value && value.form === "flat" && "data" in value) {
+          const data = (value as { data: { layout: string; bytes?: Uint8Array } }).data;
+          if (data.layout === "varlen")
+            literalBytes = Math.max(literalBytes, data.bytes?.byteLength ?? 0);
+          return;
+        }
+        for (const child of Object.values(value)) inspect(child);
+      };
+      inspect(plan.root);
+      let inline = 0,
+        sourceMultiplicity = 1;
+      for (const planner of aggregatePlanners.values()) {
+        if (!active.has(planner.rel.id)) continue;
+        const variable = planner.input.reduce((n, type) => {
+          if (["text", "bytes", "json", "array", "enum", "decimal"].includes(type.kind)) {
+            return n + literalBytes;
+          }
+          return n + 16;
+        }, 0);
+        const copies = new Map<number, number>();
+        for (const column of planner.rel.groupBy) copies.set(column, (copies.get(column) ?? 0) + 1);
+        const multiplicity = Math.max(1, ...copies.values());
+        inline = Math.max(inline, 4 * multiplicity * variable);
+        // The source hint already bounds all selected columns together. Only a
+        // repeated key position duplicates that whole prefix; extra inline/literal
+        // and parameter output is added separately by the runtime.
+        sourceMultiplicity = Math.max(sourceMultiplicity, multiplicity);
+      }
+      runtime.progressEnvelope(inline, sourceMultiplicity);
+    }
     const entries = admissions
       .filter((entry) => active.has(entry.owner))
       .map((entry) => ({
         rel: entry.rel,
+        owner: entry.owner,
         loanSlots: entry.loanSlots,
         minimum:
           typeof entry.minimum === "number"
@@ -1635,7 +1999,194 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     };
     findDemand(plan.root, null);
     const sources = [...readSources.values()].filter((source) => active.has(source.id));
-    const execute = () => then(runtime.reserve(entries), () => recipe(runtime, sink, []));
+    const bounds = new Map<number, ReadBound>();
+    const chooseAggregates = () => runSliced(choose(), new Slice(Infinity), () => undefined);
+    const choose = function* (): SlicedJob<void> {
+      const choices = new Map<number, AggregateStrategy>();
+      aggregateChoices.set(runtime, choices);
+      for (const entry of entries) {
+        const planner = aggregatePlanners.get(entry.rel.id);
+        if (!planner) continue;
+        // Ordered DISTINCT/ordered-set transitions retain the SQL-ordered path.
+        let strategy: AggregateStrategy = planner.hybrid ?? planner.external;
+        if (planner.scalar !== null) strategy = { kind: "hash", minimum: planner.scalar, loans: 0 };
+        else if (planner.domain !== null) {
+          const certificate = runtime.sourceDomain(planner.domain.scan.id);
+          if (certificate !== undefined) {
+            const span = certificate.high - certificate.low + 1;
+            if (Number.isInteger(span) && span >= 1 && span <= 1 << 22)
+              strategy = {
+                kind: "domain",
+                minimum: planner.compiler + 256 * 1024 + 16 * span,
+                loans: 0,
+              };
+          }
+        } else if (planner.dictionary !== null) {
+          const read = bounds.get(planner.dictionary.scanId);
+          if (read !== undefined) {
+            const proof = yield* readValue(
+              probeDictionaryGroups(
+                runtime.view,
+                planner.dictionary.source,
+                runtime.request.reads,
+                runtime.request.governor,
+                read,
+                runtime.signal,
+                `query#${String(runtime.request.queryId)}/aggregate-domain-planning`,
+              ),
+            );
+            if (proof !== null) {
+              const minimum = dictionaryHashMinimum(
+                planner.rel,
+                planner.input,
+                planner.dictionary,
+                proof,
+                planner.compiler,
+                planner.output,
+              );
+              if (minimum !== null) strategy = { kind: "hash", minimum, loans: 0 };
+            }
+          }
+        }
+        choices.set(entry.rel.id, strategy);
+        entry.minimum = strategy.minimum;
+        entry.loanSlots = strategy.loans;
+      }
+      // A certified hash workspace is optional. Prefer external spilling when it has a smaller
+      // complete minimum and is what makes this execution admissible. No credit is held yet.
+      while (runtime.minimumBytes(entries) > runtime.request.governor.capBytes) {
+        let best: (typeof entries)[number] | undefined,
+          total = runtime.minimumBytes(entries);
+        for (const entry of entries) {
+          const planner = aggregatePlanners.get(entry.rel.id),
+            prior = choices.get(entry.rel.id);
+          const fallback = planner?.hybrid ?? planner?.external;
+          if (!planner || !fallback || prior?.kind === fallback.kind) continue;
+          const saved = { minimum: entry.minimum, loanSlots: entry.loanSlots };
+          entry.minimum = fallback.minimum;
+          entry.loanSlots = fallback.loans;
+          const candidate = runtime.minimumBytes(entries);
+          Object.assign(entry, saved);
+          if (candidate < total) {
+            best = entry;
+            total = candidate;
+          }
+        }
+        if (!best) break;
+        const planner = aggregatePlanners.get(best.rel.id);
+        const external = planner?.hybrid ?? planner?.external;
+        if (!external) throw new Error("Missing external fallback");
+        choices.set(best.rel.id, external);
+        best.minimum = external.minimum;
+        best.loanSlots = external.loans;
+      }
+    };
+    const execute = () =>
+      then(aggregatePlanners.size === 0 ? undefined : chooseAggregates(), () => {
+        if (
+          ![...(aggregateChoices.get(runtime)?.values() ?? [])].some(
+            (choice) => choice.kind === "hybrid",
+          )
+        )
+          return then(runtime.reserve(entries), () => recipe(runtime, sink, []));
+        runtime.enablePhases();
+        const state: Phases = {
+          resume: null,
+          pending: null,
+          excepts: new Map(),
+          retained: new Map(),
+        };
+        phases.set(runtime, state);
+        const guarded: Operator = {
+          push: (batch, transfer) => sink.push(batch, transfer),
+          ready: () => sink.ready(),
+          finish: () => sink.finish(),
+          abort: (reason) => {
+            if (!runtime.isHandoff(reason)) sink.abort(reason);
+          },
+        };
+        return (async () => {
+          const idle = await acquirePhasePool(runtime.request.governor, runtime.signal);
+          let failed = false,
+            failure: unknown;
+          try {
+            await runtime.reserve(entries);
+            await recipe(runtime, guarded, []);
+            while (state.pending) {
+              const cut: Cut = state.pending;
+              // Keep a cleanup owner before clearing pending: producer suspension
+              // itself awaits consumer credit and can reject on cancellation.
+              state.resume = cut;
+              state.pending = null;
+              await runtime.suspendProducer(sink, idle.pool);
+              const remaining = new Set<number>();
+              const visitRemaining = (node: Rel): void => {
+                remaining.add(node.id);
+                if (node.id === cut.rel) return;
+                if ("inputs" in node) {
+                  for (let i = 0; i < node.inputs.length; i++) {
+                    if (i === 0 && state.retained.get(node.id)?.leftDone) continue;
+                    const input = node.inputs[i];
+                    if (input) visitRemaining(input);
+                  }
+                } else if ("left" in node && "right" in node) {
+                  visitRemaining(node.left);
+                  visitRemaining(node.right);
+                } else if ("input" in node) visitRemaining(node.input);
+              };
+              visitRemaining(plan.root);
+              const next = entries.filter((entry) => remaining.has(entry.owner));
+              const aggregate = next.find((entry) => entry.rel.id === cut.rel);
+              if (!aggregate) throw new Error("Missing restore aggregate admission");
+              const restore = aggregatePlanners.get(cut.rel)?.restore;
+              if (!restore) throw new Error("Missing admitted restoration recipe");
+              aggregate.minimum = restore.minimum;
+              aggregate.loanSlots = restore.loans;
+              aggregateChoices.get(runtime)?.set(cut.rel, restore);
+              // A cut in EXCEPT's left arm leaves its right input unopened. Carry the
+              // original publication-stable bounds for those future sources into admission.
+              let io = 0,
+                progress = 0;
+              for (const [id, bound] of bounds)
+                if (remaining.has(id)) {
+                  io = Math.max(io, bound.io);
+                  progress = Math.max(progress, bound.progress);
+                }
+              runtime.readMinimum(io, progress, cut.phase.progressBytes);
+              await runtime.restorePhase(
+                next,
+                cut.phase.parameters.phaseBinding(runtime.signal),
+                idle.pool,
+              );
+              sink.resumeBudget();
+              await recipe(runtime, guarded, []);
+              state.resume = null;
+            }
+          } catch (error) {
+            failed = true;
+            failure = error;
+          }
+          {
+            // A resumed recipe may already have installed its next cut. Both
+            // slots remain owned until the corresponding files have drained.
+            const retained = new Set(
+              [state.pending, state.resume].flatMap((cut) => (cut ? [cut.phase] : [])),
+            );
+            const cleanup = await Promise.allSettled([
+              ...[...retained].map((phase) => closeHybridPhase(phase)),
+              ...[...state.retained.values()].map((saved) => saved.records.close()),
+            ]);
+            state.retained.clear();
+            phases.delete(runtime);
+            idle.release();
+            const errors = cleanup
+              .filter((r): r is PromiseRejectedResult => r.status === "rejected")
+              .map((r) => r.reason as unknown);
+            if (failed) throw failure;
+            if (errors.length) throw new AggregateError(errors, "Phase files failed to close");
+          }
+        })();
+      });
     if (sources.length === 0) {
       if (!hasJson) return execute();
       const width = jsonConstants + 1;
@@ -1645,7 +2196,6 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       for (const entry of entries) entry.minimum += (jsonWorkspaces.get(entry.rel.id) ?? 0) * width;
       return execute();
     }
-    const bounds = new Map<number, ReadBound>();
     const sizeSources = function* (): SlicedJob<void> {
       const fixedMinimums = entries.map((entry) => entry.minimum);
       let windows = true;
@@ -1698,7 +2248,11 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         }
         break;
       }
-      if (fallback !== null && runtime.minimumBytes(entries) > runtime.request.governor.capBytes) {
+      if (
+        fallback !== null &&
+        aggregatePlanners.size === 0 &&
+        runtime.minimumBytes(entries) > runtime.request.governor.capBytes
+      ) {
         runtime.sourceBounds(new Map());
         runtime.readMinimum(0, 0);
         return yield* readValue(fallback(runtime, sink));

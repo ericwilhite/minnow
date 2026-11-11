@@ -90,6 +90,10 @@ export interface Grant {
    * Does not allocate buffers; false only for a closed/synthetic account.
    */
   makeRoom?(bytes: number, signal?: AbortSignal): Promise<boolean>;
+  /** Breaker growth at a boundary: await reclaimable holders only; false means spill.
+   * Never waits for another execution's pinned/minimum memory, and never allocates.
+   */
+  reclaimRoom?(bytes: number, signal?: AbortSignal): Promise<boolean>;
   /**
    * Returns held bytes to the governor: only holdings beyond what is allocated and beyond the
    * outstanding loan. Loan-backed bytes leave only through `repay` (else `LoanBackedReleaseError`,
@@ -148,6 +152,8 @@ export interface MemoryGovernor {
 
 /** Named parts of one complete minimum. Each part remains a normal native grant. */
 export interface NativeGrantGroupOptions {
+  /** Shared idle native credit, usable by every earlier FIFO admission head. */
+  readonly idleCredit?: Grant;
   readonly label: string;
   readonly grants: ReadonlyArray<{
     readonly label: string;
@@ -223,9 +229,11 @@ interface Request {
   readonly readRoom: number | null;
   readonly pending: Set<Promise<void>>;
   readonly includesProgress: boolean;
+  readonly parts: NativeGrantGroupOptions["grants"] | null;
 }
 
 class GrantImpl implements Grant {
+  group: readonly GrantImpl[] | null = null;
   held = 0;
   allocated = 0;
   loan = 0;
@@ -240,7 +248,7 @@ class GrantImpl implements Grant {
   ) {}
 
   allocate(bytes: number): boolean {
-    if (this.closed) return false;
+    if (this.closed || this.governor.isIdleCredit(this)) return false;
     const shortfall = this.allocated + bytes - this.held;
     if (shortfall > 0 && !this.tryGrow(shortfall)) return false;
     this.allocated += bytes;
@@ -254,12 +262,16 @@ class GrantImpl implements Grant {
   }
 
   tryGrow(bytes: number): boolean {
-    if (this.closed || !this.spillable) return false;
+    if (this.closed || !this.spillable || this.governor.isIdleCredit(this)) return false;
     return this.governor.grow(this, bytes);
   }
 
   makeRoom(bytes: number, signal?: AbortSignal): Promise<boolean> {
     return this.governor.makeRoom(this, bytes, signal);
+  }
+
+  reclaimRoom(bytes: number, signal?: AbortSignal): Promise<boolean> {
+    return this.governor.reclaimRoom(this, bytes, signal);
   }
 
   get loaned(): number {
@@ -275,7 +287,8 @@ class GrantImpl implements Grant {
   }
 
   borrow(bytes: number, signal?: AbortSignal): Promise<Loan> {
-    if (this.closed) return Promise.reject(new GrantClosedError(this.label));
+    if (this.closed || this.governor.isIdleCredit(this))
+      return Promise.reject(new GrantClosedError(this.label));
     if (this.loan > 0 || this.loanPending)
       return Promise.reject(new RangeError(`${this.label} must repay its loan before borrowing`));
     this.loanPending = true;
@@ -311,6 +324,9 @@ class GrantImpl implements Grant {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    // Profiles may retain closed grant handles across passes; they must not keep
+    // the retired operator graph alive through its cooperative spill callback.
+    this.reclaim = null;
     this.governor.forget(this);
     const held = this.held;
     this.held = 0;
@@ -329,6 +345,10 @@ export class Governor implements MemoryGovernor {
   peakBytes = 0;
   readonly #caches: EvictableCache[] = [];
   readonly #grants = new Set<GrantImpl>();
+  readonly #idleCredit = new Set<GrantImpl>();
+  isIdleCredit(grant: GrantImpl): boolean {
+    return this.#idleCredit.has(grant);
+  }
   readonly #loans: Request[] = [];
   readonly #reads: Request[] = [];
   readonly #admissions: Request[] = [];
@@ -351,21 +371,21 @@ export class Governor implements MemoryGovernor {
    * Bytes missing for a request: loans and complete private-progress groups may use the whole
    * cap; ordinary admissions and growth must also fit `cap − reserve` excluding shared loans.
    */
-  #missing(bytes: number, loan: boolean): number {
+  #missing(bytes: number, loan: boolean, idle = 0): number {
     const total = this.usedBytes + bytes - this.capBytes;
     if (loan) return total;
     return Math.max(
       total,
-      this.usedBytes - this.#loaned + bytes - (this.capBytes - this.reserveBytes),
+      this.usedBytes - this.#loaned - idle + bytes - (this.capBytes - this.reserveBytes),
     );
   }
 
   /** Room for a request, evicting the caches first (rule 6). */
-  #room(bytes: number, loan: boolean): boolean {
-    const missing = this.#missing(bytes, loan);
+  #room(bytes: number, loan: boolean, idle = 0): boolean {
+    const missing = this.#missing(bytes, loan, idle);
     if (missing <= 0) return true;
     this.#evict(missing);
-    return this.#missing(bytes, loan) <= 0;
+    return this.#missing(bytes, loan, idle) <= 0;
   }
 
   /** Evicts up to `bytes` across the registered caches, the entry unused longest first. */
@@ -433,6 +453,43 @@ export class Governor implements MemoryGovernor {
     return pending;
   }
 
+  /** Optional breaker growth never joins admission while retaining its state. A failed
+   * reclamation returns to the breaker, which must spill before making another request.
+   * Native minima/progress accounts are not spillable and are never waited upon here.
+   */
+  async reclaimRoom(grant: GrantImpl, bytes: number, signal?: AbortSignal): Promise<boolean> {
+    if (!Number.isSafeInteger(bytes) || bytes < 0)
+      throw new RangeError("nonnegative byte count required");
+    const check = () => {
+      checkSignal(signal);
+      if (grant.closed) throw new GrantClosedError(grant.label);
+    };
+    const grow = () => {
+      check();
+      const missing = grant.allocated + bytes - grant.held;
+      return missing <= 0 || grant.tryGrow(missing);
+    };
+    if (grow()) return true;
+    for (const holder of [...this.#grants]) {
+      if (holder === grant || holder.closed || !holder.spillable) continue;
+      const work = this.#ask(holder, grant.allocated + bytes - grant.held);
+      if (work !== undefined) {
+        // Reclaim owns its buffers until it drains; cancellation stops this caller's
+        // wait without pretending the other holder's outstanding operation finished.
+        await new Promise<void>((resolve, reject) => {
+          const abort = () => reject(abortReason(signal));
+          signal?.addEventListener("abort", abort, { once: true });
+          void work
+            .then(resolve, reject)
+            .finally(() => signal?.removeEventListener("abort", abort));
+          if (signal?.aborted) abort();
+        });
+      }
+      if (grow()) return true;
+    }
+    return false;
+  }
+
   /** Fresh-read admission: cache eviction precedes cooperative spill or a whole-cap step. */
   async makeRoom(grant: GrantImpl, bytes: number, signal?: AbortSignal): Promise<boolean> {
     if (!Number.isSafeInteger(bytes) || bytes < 0)
@@ -475,6 +532,7 @@ export class Governor implements MemoryGovernor {
   }
 
   forget(grant: GrantImpl): void {
+    this.#idleCredit.delete(grant);
     this.#grants.delete(grant);
     for (const queue of [this.#loans, this.#reads, this.#admissions])
       for (const request of [...queue])
@@ -517,11 +575,23 @@ export class Governor implements MemoryGovernor {
       let wholeMinimum = loan || request.includesProgress;
       // Parallel column reads may share a grant. Re-evaluate its missing room after another
       // request was served, and after callbacks that can surrender unused holdings.
-      const bytes = () =>
+      const pooled = () => [...this.#idleCredit].reduce((sum, pool) => sum + pool.held, 0);
+      const demand = () =>
         request.readRoom === null || request.grant === null
           ? request.bytes
           : Math.max(0, request.grant.allocated + request.readRoom - request.grant.held);
-      if (!this.#room(bytes(), wholeMinimum)) {
+      const bytes = () => Math.max(0, demand() - pooled());
+      // Unused private idle credit is not an ordinary allocation. It still counts
+      // against the physical cap, but cannot make an earlier ordinary head wait.
+      const room = (whole: boolean) => {
+        const credit = pooled(),
+          needed = demand();
+        const fits = this.#room(Math.max(0, needed - credit), whole, Math.max(0, credit - needed));
+        // Eviction is a callout: it may close/donate a pool or change a read's
+        // allocation. Never serve using the deficit from before that callback.
+        return fits && pooled() === credit && demand() === needed;
+      };
+      if (!room(wholeMinimum)) {
         for (const grant of [...this.#grants]) {
           if (
             !grant.spillable ||
@@ -551,16 +621,16 @@ export class Governor implements MemoryGovernor {
           } catch (error) {
             this.#reject(queue, request, error);
           }
-          if (request.readRoom !== null && this.#room(bytes(), wholeMinimum)) break;
+          if (request.readRoom !== null && room(wholeMinimum)) break;
         }
         if (
           request.readRoom !== null &&
           request.pending.size === 0 &&
           request.grant?.allocated === 0 &&
-          this.#room(bytes(), true)
+          room(true)
         )
           wholeMinimum = true;
-        if (!this.#room(bytes(), wholeMinimum)) {
+        if (!room(wholeMinimum)) {
           // A new minimum may wait while holding nothing. A caller retaining allocated
           // input must use its admitted read step or surrender/spill that input first;
           // waiting here would create hold-and-wait on another execution's minimum.
@@ -579,17 +649,39 @@ export class Governor implements MemoryGovernor {
       if (queue[0] !== request) continue;
       queue.shift();
       request.detach();
+      const wanted = demand();
       const taken = bytes();
       this.#take(taken);
-      if (loan) this.#loaned += taken;
+      if (loan) this.#loaned += wanted;
       let grant = request.grant;
       if (grant === null) {
         grant = new GrantImpl(this, request.label, request.spillable);
         this.#grants.add(grant);
       }
       grant.held += taken;
+      {
+        let remaining = wanted - taken;
+        for (const pool of this.#idleCredit) {
+          const adopted = Math.min(remaining, pool.held);
+          pool.held -= adopted;
+          grant.held += adopted;
+          remaining -= adopted;
+          if (remaining === 0) break;
+        }
+        if (remaining !== 0) throw new Error("Idle credit changed during admission");
+      }
+      if (request.parts !== null) {
+        // Native adoption and named ownership install are one synchronous drain step.
+        grant.group = request.parts.map((part) => {
+          const named = new GrantImpl(this, part.label, part.spillable);
+          grant.held -= part.minimumBytes;
+          named.held = part.minimumBytes;
+          this.#grants.add(named);
+          return named;
+        });
+      }
       if (request.loan) {
-        grant.loan = taken;
+        grant.loan = wanted;
         grant.loanPending = false;
       }
       request.resolve(grant);
@@ -600,10 +692,18 @@ export class Governor implements MemoryGovernor {
     queue: Request[],
     request: Omit<
       Request,
-      "resolve" | "reject" | "detach" | "asked" | "readRoom" | "pending" | "includesProgress"
+      | "resolve"
+      | "reject"
+      | "detach"
+      | "asked"
+      | "readRoom"
+      | "pending"
+      | "includesProgress"
+      | "parts"
     > & { includesProgress?: boolean },
     signal?: AbortSignal,
     readRoom: number | null = null,
+    parts: NativeGrantGroupOptions["grants"] | null = null,
   ): Promise<GrantImpl> {
     if (signal?.aborted === true) return Promise.reject(abortReason(signal));
     return new Promise((resolve, reject) => {
@@ -620,6 +720,7 @@ export class Governor implements MemoryGovernor {
         asked: new Set(),
         pending: new Set(),
         readRoom,
+        parts,
         resolve,
         reject,
         detach: () => {
@@ -680,50 +781,51 @@ export class Governor implements MemoryGovernor {
       if (!Number.isSafeInteger(total)) throw new RangeError("Native grant total overflow");
     }
     signal?.throwIfAborted();
+    const capacity = includesProgress === true ? this.capBytes : this.capBytes - this.reserveBytes;
+    if (total > capacity) throw new MemoryAdmissionError(label, total, capacity);
+    const pool = options.idleCredit;
+    if (pool !== undefined) {
+      if (
+        !(pool instanceof GrantImpl) ||
+        pool.governor !== this ||
+        pool.closed ||
+        pool.allocated !== 0 ||
+        pool.loaned !== 0 ||
+        pool.loanPending
+      )
+        throw new TypeError("Idle credit requires this owner's live, unallocated native grant");
+      this.#idleCredit.add(pool);
+      this.#drain();
+    }
+    signal?.throwIfAborted();
     if (total === 0) {
       const grants = parts.map((part) => new GrantImpl(this, part.label, part.spillable));
       for (const grant of grants) this.#grants.add(grant);
       return grants;
     }
-    if (includesProgress === true && total > this.capBytes)
-      throw new MemoryAdmissionError(label, total, this.capBytes);
-    const admitted =
-      includesProgress === true
-        ? await this.#enqueue(
-            this.#admissions,
-            {
-              bytes: total,
-              loan: false,
-              grant: null,
-              label,
-              spillable: false,
-              includesProgress: true,
-            },
-            signal,
-          )
-        : await this.admit({
-            label,
-            minimumBytes: total,
-            spillable: false,
-            ...(signal === undefined ? {} : { signal }),
-          });
+    const admitted = await this.#enqueue(
+      this.#admissions,
+      {
+        bytes: total,
+        loan: false,
+        grant: null,
+        label,
+        spillable: false,
+        includesProgress: includesProgress === true,
+      },
+      signal,
+      null,
+      parts,
+    );
     try {
       signal?.throwIfAborted();
-      if (!(admitted instanceof GrantImpl) || admitted.governor !== this || admitted.closed)
-        throw new TypeError("A grant group requires this owner's native admission");
-      if (admitted.held !== total || admitted.allocated !== 0 || admitted.loaned !== 0)
-        throw new TypeError("The group admission was changed before it could split");
-      // No call out or suspension while ownership moves. Peak/used stay charged once.
-      const grants = parts.map((part) => new GrantImpl(this, part.label, part.spillable));
-      for (let index = 0; index < grants.length; index++) {
-        const grant = grants[index];
-        const part = parts[index];
-        if (grant === undefined || part === undefined) throw new Error("Grant group length");
-        admitted.held -= part.minimumBytes;
-        grant.held = part.minimumBytes;
-        this.#grants.add(grant);
-      }
+      const grants = admitted.group;
+      if (grants === null || admitted.held !== 0)
+        throw new Error("Native group was not split atomically in the drain");
       return grants;
+    } catch (error) {
+      for (const grant of admitted.group ?? []) grant.close();
+      throw error;
     } finally {
       admitted.close();
     }
@@ -746,6 +848,12 @@ export class Governor implements MemoryGovernor {
       source.held -= bytes;
       target.held += bytes;
     }
+    if (
+      bytes > 0 &&
+      source !== target &&
+      (this.#idleCredit.has(source) || this.#idleCredit.has(target))
+    )
+      this.#drain();
     return true;
   }
 

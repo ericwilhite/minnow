@@ -504,6 +504,11 @@ function decodeViews(
 
 /** One side (build or probe) of one partition: its pages on spill. */
 export class SpilledRun {
+  /** Optional bounded-directory sink. Ordinary sort/join runs retain their existing page list. */
+  write?: (page: Uint8Array, rows: number) => Promise<void>;
+  get pageCount(): number {
+    return this.pages.length;
+  }
   readonly pages: SpillPageRef[] = [];
   rows = 0;
   bytes = 0;
@@ -618,6 +623,18 @@ export class SpillFiles {
   }
 
   async append(run: SpilledRun, page: Uint8Array, rows: number): Promise<void> {
+    await this.#append(run, page, rows, true);
+  }
+  /** A tape owns its on-disk directory; do not retain a second page-ref array in memory. */
+  appendRef(run: SpilledRun, page: Uint8Array, rows: number): Promise<SpillPageRef> {
+    return this.#append(run, page, rows, false);
+  }
+  async #append(
+    run: SpilledRun,
+    page: Uint8Array,
+    rows: number,
+    retain: boolean,
+  ): Promise<SpillPageRef> {
     // Register before calling the service: append may synchronously abort its owner.
     let drained!: () => void;
     const fence = new Promise<void>((resolve) => {
@@ -650,10 +667,11 @@ export class SpillFiles {
       borrowed.add(fence);
       const ref = await run.file.append(page);
       if (this.isClosed) throw new SpillClosedError();
-      run.pages.push(ref);
+      if (retain) run.pages.push(ref);
       run.rows += rows;
       run.bytes += page.length;
       this.written += page.length;
+      return ref;
     } finally {
       borrowed?.delete(fence);
       this.#appends.delete(fence);

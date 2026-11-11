@@ -390,20 +390,17 @@ for (const seed of seedsFor("next-native-credit-validation", [0xc2ef]))
             expect(governor.usedBytes).toBe(2 * bytes);
             reach.reach("invalid group rejected");
             const stop = new AbortController(),
-              reason = new Error("cancel served group"),
-              admit = governor.admit.bind(governor);
-            governor.admit = async (options) => {
-              const grant = await admit(options);
-              if (options.label === "cancel after serving") stop.abort(reason);
-              return grant;
-            };
-            await expect(
-              governor.admitGroup({
-                label: "cancel after serving",
-                grants: [{ label: "cancelled native part", minimumBytes: bytes, spillable: false }],
-                signal: stop.signal,
-              }),
-            ).rejects.toBe(reason);
+              reason = new Error("cancel served group");
+            const pending = governor.admitGroup({
+              label: "cancel after serving",
+              grants: [{ label: "cancelled native part", minimumBytes: bytes, spillable: false }],
+              signal: stop.signal,
+            });
+            // The uncontended FIFO drain has served and split synchronously, but its
+            // async caller has not yet adopted the handles. Cancel at that real boundary.
+            expect(governor.usedBytes).toBe(3 * bytes);
+            stop.abort(reason);
+            await expect(pending).rejects.toBe(reason);
             expect(governor.usedBytes).toBe(2 * bytes);
             reach.reach("served cancellation");
           } finally {

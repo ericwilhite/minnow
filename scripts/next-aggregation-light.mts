@@ -70,6 +70,10 @@ export async function lightComparison(
     readonly operatorOnly?: boolean;
     readonly paired?: boolean;
     readonly control?: AggregateOptions;
+    /** Optional raw operator from the pinned main control bundle. */
+    readonly controlConstructor?: typeof AggregateOperator;
+    /** Component control: same transitions inside a prepaid fixed workspace. */
+    readonly boundedWorkspace?: boolean;
     readonly nativeKernel?: (input: LightInput) => LightResult;
   } = {},
 ) {
@@ -218,13 +222,37 @@ export async function lightComparison(
           nulls: "last" as const,
           collation: null,
         }));
-  const operator = async (options: AggregateOptions = {}, domainCountSum = false) => {
+  let workspacePeak = 0;
+  const operator = async (
+    options: AggregateOptions = {},
+    domainCountSum = false,
+    bounded = false,
+    Constructor: typeof AggregateOperator = AggregateOperator,
+  ) => {
     const grant = await core.harness.governor.admit({
-        label: "light/operator",
-        minimumBytes: 16 << 20,
-        spillable: true,
-      }),
-      arena = new OutputArena(grant, 2048),
+      label: "light/operator",
+      minimumBytes: 16 << 20,
+      spillable: true,
+    });
+    let peak = 0;
+    const owned = bounded
+      ? new Proxy(grant, {
+          get(target, key) {
+            if (key === "allocate")
+              return (bytes: number) => {
+                const needed = target.allocated + bytes;
+                if (needed > 16 << 20) return false;
+                peak = Math.max(peak, needed);
+                return target.allocate(bytes);
+              };
+            const value: unknown = Reflect.get(target, key, target);
+            return typeof value === "function"
+              ? (value as (...args: unknown[]) => unknown).bind(target)
+              : value;
+          },
+        })
+      : grant;
+    const arena = new OutputArena(owned, 2048),
       rows: unknown[][] = [];
     const sink: Operator = {
       push(batch) {
@@ -252,7 +280,7 @@ export async function lightComparison(
               offset: 0,
               withTies: false,
             },
-            { grant, spill: core.spill, queryId: 991 },
+            { grant: owned, spill: core.spill, queryId: 991 },
             sink,
           );
     const context = { arena, params: { slots: [] }, input: types };
@@ -265,8 +293,8 @@ export async function lightComparison(
       ...(id === "agg_highcard_int" ? { outputTopN: { count: 100, keys } } : {}),
     };
     const aggregate = domainCountSum
-      ? new DomainCountSumOperator(rel, context, grant, sort ?? sink, configuration)
-      : new AggregateOperator(rel, context, grant, sort ?? sink, configuration);
+      ? new DomainCountSumOperator(rel, context, owned, sort ?? sink, configuration)
+      : new Constructor(rel, context, owned, sort ?? sink, configuration);
     try {
       if (aggregate instanceof DomainCountSumOperator) {
         let probeAt = 0;
@@ -300,9 +328,11 @@ export async function lightComparison(
         },
         aggregate,
       );
+      workspacePeak = Math.max(workspacePeak, peak);
       return {
         rows,
-        layoutRows: aggregate instanceof AggregateOperator ? aggregate.typedLayoutRows : 0,
+        peakBytes: peak,
+        layoutRows: aggregate instanceof Constructor ? aggregate.typedLayoutRows : 0,
         directRows: aggregate instanceof DomainCountSumOperator ? aggregate.directRows : 0,
       };
     } finally {
@@ -314,14 +344,17 @@ export async function lightComparison(
     }
   };
   const expected = plain();
-  assert.deepEqual((await operator(measurement.control)).rows, expected.rows);
+  assert.deepEqual(
+    (await operator(measurement.control, false, false, measurement.controlConstructor)).rows,
+    expected.rows,
+  );
   if (pipeline) assert.equal((await pipeline()).rows, expected.rows.length);
   // Preserve every Sxx array in the consumed result so its updates cannot be dead work.
   if (expected.sxx) for (const q of expected.sxx) assert.ok(q.every(Number.isFinite));
   measurement.collect?.();
   for (let k = 0; k < warmups; k++) {
     plain();
-    await operator(measurement.control);
+    await operator(measurement.control, false, false, measurement.controlConstructor);
     if (pipeline) await pipeline();
     measurement.collect?.();
   }
@@ -363,7 +396,11 @@ export async function lightComparison(
   if (feed) for (let w = 0; w < warmups; w++) assert.equal((await feed()).rows, N);
   if (candidate)
     for (let w = 0; w < warmups; w++) {
-      const result = await operator(candidate, measurement.domainCountSum);
+      const result = await operator(
+        candidate,
+        measurement.domainCountSum,
+        measurement.boundedWorkspace,
+      );
       assert.deepEqual(result.rows, expected.rows);
       if (measurement.domainCountSum) assert.ok(result.directRows > 0);
       if (candidate.typedLayout === true) assert.equal(result.layoutRows, N);
@@ -373,8 +410,10 @@ export async function lightComparison(
     bound: plain,
     split,
     native,
-    operator: () => operator(measurement.control),
-    candidate: candidate ? () => operator(candidate, measurement.domainCountSum) : undefined,
+    operator: () => operator(measurement.control, false, false, measurement.controlConstructor),
+    candidate: candidate
+      ? () => operator(candidate, measurement.domainCountSum, measurement.boundedWorkspace)
+      : undefined,
     whole: pipeline,
     feed,
   };
@@ -471,6 +510,14 @@ export async function lightComparison(
     sources,
     id,
     inputRows: N,
+    workspace: measurement.boundedWorkspace
+      ? {
+          minimumBytes: 16 << 20,
+          peakBytes: workspacePeak,
+          scope:
+            "decoded operator and group-result sort; source certification measured in whole query",
+        }
+      : null,
     inputLayout: {
       numeric: "Float64, widening excluded as fixture setup",
       flatTextBytes: input.b.reduce((n, c) => n + c.bytes.length, 0),
@@ -488,6 +535,6 @@ export async function lightComparison(
     ),
     componentOnly: pipeline === undefined && feed === undefined,
     limits:
-      "Optimistic fixed-workload TS observation, not a mathematical lower bound or universal JS impossibility result. Raw bound/split read flat decoded bytes/numbers and hash every text row. Native wide consumes the original decoded dictionary segments, hashes/maps all entries and translates every row within timing, then uses packed five-AVG state. No precomputed canonical IDs/ranks. All use exact collision equality. Highcard native includes an exact full-input min/max probe and direct-address COUNT/SUM state with an exact general-hash fallback for a wide domain; highcard split and both other DISTINCT kernels alias bound (not independent algorithms). Operator keeps original scan dictionary forms and includes matching sort/top-N, copying and governor/driver/task clock. Whole is prepared pipeline/owned frames; outer harness separately measures SQL through cleanup. Feed is scan/project/discard only, not additive with the other sinks. Setup/flattening (including numeric widening to Float64) excluded; kernel allocation/state/final ordering included. Borrowed immutable inputs need no key copy; no memory governor/spill/cancellation in plain TS. AVG Sxx retained. Plain kernels are diagnostics; operator/candidate configurations are reported separately.",
+      "Optimistic fixed-workload TS observation, not a mathematical lower bound or universal JS impossibility result. Raw bound/split read flat decoded bytes/numbers and hash every text row. Native wide consumes the original decoded dictionary segments, hashes/maps all entries and translates every row within timing, then uses packed five-AVG state. No precomputed canonical IDs/ranks. All use exact collision equality. Highcard native includes an exact full-input min/max probe and direct-address COUNT/SUM state with an exact general-hash fallback for a wide domain; highcard split and both other DISTINCT kernels alias bound (not independent algorithms). Operator keeps original scan dictionary forms and includes matching sort/top-N, copying and governor/driver/task clock. Whole is prepared pipeline/owned frames; outer harness separately measures SQL through cleanup. Feed is scan/project/discard only, not additive with the other sinks. Setup/flattening (including numeric widening to Float64) excluded; kernel allocation/state/final ordering included. Borrowed immutable inputs need no key copy; no memory governor/spill/cancellation in plain TS. AVG Sxx retained. Plain kernels are diagnostics; operator/candidate configurations are reported separately. An optional pinned main constructor controls the raw operator; its keys/states are bundled from that revision, with shared owner contracts only.",
   };
 }

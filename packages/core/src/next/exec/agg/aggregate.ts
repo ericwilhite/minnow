@@ -19,8 +19,9 @@
  *   one set, ordered aggregates (`orderBy`), and string_agg / array_agg / json_agg / percentiles /
  *   mode. These are refused before anything is allocated; any later failure while constructing
  *   releases everything already taken.
- * - Memory: group table and states grow from the grant; a refused growth fails the query until
- *   partitioned aggregation spill (milestone 3).
+ * - Memory: this synchronous transition engine requires a complete certified workspace.
+ *   The recipe admits it atomically before opening input, or uses external.ts from the start.
+ *   Never retry push after a failed allocation: earlier calls may already have transitioned.
  */
 import type { MaybePromise } from "../../access/key-index.js";
 import type { AggregateCall, Rel } from "../../ir/ir.js";
@@ -37,7 +38,7 @@ import {
 import { UnsupportedPlanError } from "../errors.js";
 import { Predicate } from "../filter.js";
 import { compileExpr, type CompileContext } from "../kernels/compile.js";
-import { countIn, rowsIn, type Compiled } from "../kernels/vectors.js";
+import { countIn, rowsIn, IDENTITY, type Compiled } from "../kernels/vectors.js";
 import {
   YIELD_INTERVAL_MS,
   afterYield,
@@ -51,6 +52,7 @@ import { DistinctSet } from "./distinct.js";
 import { ScalarByteDistinct, supportsScalarByteDistinct } from "./scalar-byte-distinct.js";
 import { GroupTopN, supportsGroupTopN, type GroupTopNSpec } from "./group-top-n.js";
 import { GroupTable } from "./groups.js";
+import type { StateRow, StateReader } from "./state-row.js";
 import { PackedAverages } from "./packed-averages.js";
 import { TypedLayout, typedLayoutCalls } from "./typed-layout.js";
 import { PackedIntegers, packedIntegerCalls } from "./packed-integers.js";
@@ -80,6 +82,7 @@ const UNSUPPORTED = new Set([
 interface CompiledAggregate {
   readonly accumulator: Accumulator;
   readonly argument: Compiled | null;
+  readonly sourceColumn: number | null;
   readonly filter: Predicate | null;
   readonly distinct: DistinctSet | ScalarByteDistinct | null;
   readonly selection: Selection;
@@ -92,6 +95,14 @@ interface CompiledAggregate {
   readonly fusable: boolean;
   /** undefined: not eligible; null: COUNT(*); number: plain SUM input column. */
   readonly groupedColumn: number | null | undefined;
+}
+
+export interface CheckpointCall {
+  readonly owner: number;
+  readonly stateFn: string;
+  readonly stateType: PhysicalType;
+  readonly reads: "own" | "sum" | "average";
+  readonly mode: boolean;
 }
 
 /**
@@ -111,6 +122,8 @@ function shareKey(call: AggregateCall, input: readonly PhysicalType[]): string |
 
 /** Output pacing (tests inject a clock). */
 export interface AggregateOptions {
+  /** An independently admitted emission step (hybrid hash keeps state credit separate). */
+  readonly outputCharge?: ByteCharge;
   /** Synchronous emitting between task yields (default `YIELD_INTERVAL_MS`). */
   readonly yieldIntervalMs?: number;
   /** The clock in ms (default `performance.now`). */
@@ -185,6 +198,7 @@ export class AggregateOperator implements Operator {
   readonly #gids: Int32Array = new Int32Array(0);
   readonly #keyVectors: Vector[];
   readonly #charge: ByteCharge;
+  readonly #outputCharge: ByteCharge;
   readonly #interval: number;
   /** The worker's task clock, or a test's (R23.5): no slice start of its own. */
   readonly #clock: TaskClock;
@@ -192,6 +206,7 @@ export class AggregateOperator implements Operator {
   /** Bytes the operator took from the arena (gids, selections), returned on a failed build. */
   #arenaBytes = 0;
   #emitted = 0;
+  #finishedGroups: number | null = null;
   #top: GroupTopN | null = null;
   #ranked = 0;
   #selected = false;
@@ -208,7 +223,7 @@ export class AggregateOperator implements Operator {
    * failure while building releases what was already taken, then rethrows.
    */
   constructor(
-    rel: AggregateRel,
+    readonly rel: AggregateRel,
     context: CompileContext,
     charge: ByteCharge,
     readonly downstream: Operator,
@@ -216,6 +231,7 @@ export class AggregateOperator implements Operator {
   ) {
     preflight(rel);
     this.#charge = charge;
+    this.#outputCharge = options.outputCharge ?? charge;
     this.#groupedUpdateFusion = options.groupedUpdateFusion !== false;
     this.#interval = options.yieldIntervalMs ?? YIELD_INTERVAL_MS;
     this.#clock = clockFor(options.now);
@@ -409,6 +425,7 @@ export class AggregateOperator implements Operator {
     return {
       accumulator,
       argument,
+      sourceColumn: arg?.op === "column" ? arg.index : null,
       filter,
       distinct,
       selection,
@@ -436,20 +453,64 @@ export class AggregateOperator implements Operator {
     };
   }
 
-  push(batch: Batch): PushResult {
-    const length = batch.length;
-    const groups = this.#groups;
-    const gids = this.#gids;
-    const scalar = groups === null;
-    if (groups !== null) {
-      for (let c = 0; c < this.#keys.length; c++) {
-        const column = batch.columns[this.#keys[c] ?? 0];
-        if (column === undefined) throw new RangeError("Group key column missing from the batch");
-        this.#keyVectors[c] = column;
-      }
-      groups.assign(this.#keyVectors, length, batch.selection, gids);
-      for (const aggregate of this.#aggregates) aggregate.accumulator.grow(groups.groupCount);
+  /** Hybrid routing may leave unadmitted key IDs at the end of the table. */
+  sealGroups(count: number): void {
+    this.#finishedGroups = count;
+  }
+  get groupTable(): GroupTable | null {
+    return this.#groups;
+  }
+  get groupCount(): number {
+    return this.#groups?.groupCount ?? 1;
+  }
+  keyGrowthBytes(batch: Batch): number {
+    if (this.#groups === null) return 0;
+    for (let c = 0; c < this.#keys.length; c++) {
+      const vector = batch.columns[this.#keys[c] ?? 0];
+      if (!vector) throw new RangeError("Missing group key");
+      this.#keyVectors[c] = vector;
     }
+    return this.#groups.growthBytes(this.#keyVectors, countIn(batch.selection, batch.length));
+  }
+  stateGrowthBytes(batch: Batch, groups: number, scratch = 4096): number {
+    let bytes = scratch;
+    for (const a of this.#aggregates) {
+      if (!a.updates) continue;
+      const value = a.sourceColumn === null ? null : (batch.columns[a.sourceColumn] ?? null);
+      if (a.accumulator.growthBytes === undefined)
+        throw new Error("Hybrid state needs ordinary accumulators");
+      bytes += a.accumulator.growthBytes(groups, value, countIn(batch.selection, batch.length));
+      if (a.distinct !== null) {
+        if (value === null)
+          throw new Error("Hybrid DISTINCT argument must be materialized before routing");
+        bytes += a.distinct.growthBytes(value, countIn(batch.selection, batch.length));
+      }
+    }
+    return bytes;
+  }
+  /** Key assignment precedes transitions; its whole allocation demand must be funded. */
+  assignGroups(batch: Batch): Int32Array {
+    if (this.#groups !== null) {
+      for (let c = 0; c < this.#keys.length; c++) {
+        const vector = batch.columns[this.#keys[c] ?? 0];
+        if (!vector) throw new RangeError("Missing group key");
+        this.#keyVectors[c] = vector;
+      }
+      this.#groups.assign(this.#keyVectors, batch.length, batch.selection, this.#gids);
+    }
+    return this.#gids;
+  }
+  push(batch: Batch): PushResult {
+    this.assignGroups(batch);
+    return this.pushPrepared(batch, this.#gids, this.groupCount);
+  }
+  /** All active rows have resident IDs and funded state growth. No key insertion. */
+  pushPrepared(batch: Batch, gids: Int32Array, admitted: number): PushResult {
+    const length = batch.length,
+      groups = this.#groups,
+      scalar = groups === null;
+    if (groups !== null)
+      for (const aggregate of this.#aggregates) aggregate.accumulator.grow(admitted);
     if (scalar && this.#fused.length > 0) this.#pushFused(batch, length);
     // Many groups and several aggregates: the accumulators walk the batch's rows in group order
     // (`#sortByGroup`), so each one's state arrays are read nearly sequentially.
@@ -533,6 +594,114 @@ export class AggregateOperator implements Operator {
       aggregate.accumulator.update(value, gids, rowsIn(rows), countIn(rows, length), scalar);
     }
     return "ready";
+  }
+
+  checkpointCalls(): readonly CheckpointCall[] {
+    return this.#aggregates.map((a, index) => ({
+      owner: this.#aggregates.findIndex((b) => b.accumulator === a.accumulator),
+      stateFn: a.reads === "own" ? (this.rel.aggregates[index]?.fn ?? "") : "avg",
+      stateType: a.accumulator.type,
+      reads: a.reads,
+      mode: a.distinct instanceof DistinctSet,
+    }));
+  }
+
+  saveGroup(group: number, row: StateRow): void {
+    for (const call of this.stateCalls) this.saveCall(call, group, row);
+  }
+  /** Checkpoint lanes have one schema per transition owner. Shared SUM/AVG saves once. */
+  get stateCalls(): readonly number[] {
+    return this.#aggregates.flatMap((a, call) => (a.updates ? [call] : []));
+  }
+  get distinctCalls(): readonly number[] {
+    return this.#aggregates.flatMap((a, call) => (a.distinct === null ? [] : [call]));
+  }
+  saveCall(call: number, group: number, row: StateRow): void {
+    const a = this.#aggregates[call];
+    if (!a?.updates || !a.accumulator.save) throw new Error("Missing transition owner");
+    a.accumulator.save(group, row);
+    if (a.distinct instanceof DistinctSet) row.number(a.distinct.checkpointMode);
+  }
+  /** Restoring one group at a time must not manufacture a larger geometric capacity
+   * than the original batch grew. Fund the complete resident domain before reading lanes. */
+  restoreStateGroups(groups: number): void {
+    for (const a of this.#aggregates) if (a.updates) a.accumulator.grow(groups);
+  }
+  restoreCall(call: number, group: number, row: StateReader): void {
+    const a = this.#aggregates[call];
+    if (!a?.updates || !a.accumulator.restore) throw new Error("Missing restore owner");
+    a.accumulator.restore(group, row);
+    if (a.distinct instanceof DistinctSet) a.distinct.restoreMode(row.number());
+  }
+  restoreKey(columns: readonly FlatVector[], row: number): number {
+    if (this.#groups === null) {
+      if (columns.length !== 0) throw new Error("Scalar checkpoint has group keys");
+      return 0;
+    }
+    if (columns.length !== this.#keys.length) throw new Error("Checkpoint key count changed");
+    this.#groups.assign(
+      columns,
+      columns[0]?.length ?? 0,
+      { rows: IDENTITY.subarray(row, row + 1), count: 1 },
+      this.#gids,
+    );
+    return this.#gids[row] ?? 0;
+  }
+  restoreGroup(group: number, row: StateReader): void {
+    for (const call of this.stateCalls) this.restoreCall(call, group, row);
+  }
+  /** Registry values include NULL IDs that have no membership. Save original first-seen
+   * order separately: bitmap widths and byte-arena capacities depend on those IDs. */
+  *distinctValues(): Generator<{ call: number; id: number }, void, void> {
+    for (let call = 0; call < this.#aggregates.length; call++) {
+      const d = this.#aggregates[call]?.distinct;
+      if (d instanceof DistinctSet) for (let id = 0; id < d.valueCount; id++) yield { call, id };
+    }
+  }
+  restoreDistinctValue(call: number, vector: Vector, row: number): void {
+    const d = this.#aggregates[call]?.distinct;
+    if (!(d instanceof DistinctSet)) throw new Error("Missing DISTINCT value registry");
+    d.restoreValue(vector, row);
+  }
+  /** Layout metadata is part of the exact checkpoint, not a fresh strategy decision. */
+  distinctMode(call: number): number | null {
+    const d = this.#aggregates[call]?.distinct;
+    return d instanceof DistinctSet ? d.checkpointMode : null;
+  }
+  *distinctMembers(): Generator<
+    { call: number; group: number; id: number } | undefined,
+    void,
+    void
+  > {
+    for (let call = 0; call < this.#aggregates.length; call++) {
+      const d = this.#aggregates[call]?.distinct;
+      if (!d) continue;
+      const members = d instanceof DistinctSet ? d.members(this.#groups === null) : d.members();
+      for (const member of members) yield member === undefined ? undefined : { call, ...member };
+    }
+  }
+  saveMember(call: number, id: number, row: StateRow): void {
+    const a = this.#aggregates[call],
+      d = a?.distinct;
+    if (!a || !d || !a.argument) throw new Error("Missing distinct state");
+    const type = a.argument.type;
+    row.value(d.memberBytes(id), () =>
+      d instanceof DistinctSet ? d.memberValue(id) : d.memberValue(id, type),
+    );
+  }
+  restoreMember(call: number, group: number, vector: Vector, row: number): void {
+    const a = this.#aggregates[call];
+    if (!a?.distinct) throw new Error("Missing distinct restore target");
+    this.#gids[row] = group;
+    const selected = { rows: IDENTITY.subarray(row, row + 1), count: 1 };
+    a.distinct.filter(
+      vector,
+      this.#gids,
+      vector.length,
+      selected,
+      this.#groups === null,
+      a.selection,
+    );
   }
 
   /** Internal diagnostic proving that a component/differential actually took the packed kernel. */
@@ -638,6 +807,16 @@ export class AggregateOperator implements Operator {
     return bytes;
   }
 
+  /** Upper bound for the largest emitted batch and NUMERIC result preparation. The
+   * boundary funds this before finish; transitions are complete and remain untouched. */
+  outputGrowthBytes(): number {
+    const groups = this.#finishedGroups ?? this.groupCount;
+    let peak = 0;
+    for (let from = 0; from < groups; from += BATCH_ROWS)
+      peak = Math.max(peak, 2 * this.#outputBytes(from, Math.min(BATCH_ROWS, groups - from)));
+    return peak;
+  }
+
   /** Emits every group or the selected winners, charged and paced (see the header). */
   finish(): MaybePromise<void> {
     return this.#emit();
@@ -645,7 +824,8 @@ export class AggregateOperator implements Operator {
 
   #emit(): MaybePromise<void> {
     if (this.#isAborted()) throw this.#abortReason;
-    const groupsTotal = this.#groups === null ? 1 : this.#groups.groupCount;
+    const groupsTotal =
+      this.#finishedGroups ?? (this.#groups === null ? 1 : this.#groups.groupCount);
     const top = this.#top;
     if (top !== null && !this.#selected) {
       while (this.#ranked < groupsTotal) {
@@ -666,7 +846,7 @@ export class AggregateOperator implements Operator {
             0,
           );
         let bytes = needed();
-        while (!this.#charge.allocate(bytes)) {
+        while (!this.#outputCharge.allocate(bytes)) {
           if (n === 1) throw new RangeError("Aggregate rank output exceeded its grant");
           n = Math.max(1, n >>> 1);
           bytes = needed();
@@ -682,7 +862,7 @@ export class AggregateOperator implements Operator {
           });
           top.offer(columns, first, n);
         } finally {
-          this.#charge.free(bytes);
+          this.#outputCharge.free(bytes);
         }
         this.#ranked += n;
         if (this.#isAborted()) throw this.#abortReason;
@@ -708,7 +888,7 @@ export class AggregateOperator implements Operator {
         bytes = this.#outputBytes(from, count);
       }
       // Charge before building; a refusal halves the batch, down to one group.
-      while (!this.#charge.allocate(bytes)) {
+      while (!this.#outputCharge.allocate(bytes)) {
         if (count === 1)
           throw new RangeError(
             `A ${String(bytes)}-byte aggregate output batch was refused by its grant`,
@@ -774,13 +954,14 @@ export class AggregateOperator implements Operator {
   }
 
   #releaseOutput(): void {
-    if (this.#outputHeld > 0) this.#charge.free(this.#outputHeld);
+    if (this.#outputHeld > 0) this.#outputCharge.free(this.#outputHeld);
     this.#outputHeld = 0;
   }
 
   #close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#keyVectors.length = 0;
     this.#releaseOutput();
     this.#top?.close();
     this.#groups?.close();

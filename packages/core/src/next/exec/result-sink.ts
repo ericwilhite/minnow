@@ -66,6 +66,7 @@ export class ResultSink implements Operator {
   #pending: FrameStore | null = null;
   #rows = 0;
   #finished = false;
+  #budgetSuspended = false;
 
   constructor(
     readonly types: readonly PhysicalType[],
@@ -119,9 +120,42 @@ export class ResultSink implements Operator {
     return this.#rows;
   }
 
+  /** A producer phase has stopped. Return every offered frame before moving its minimum;
+   * consumer credit is external progress, never another execution's memory admission.
+   * Published dictionary IDs are not reused after the registry releases its source objects.
+   */
+  async suspendBudget(): Promise<void> {
+    this.#check();
+    if (this.#budgetSuspended || this.#finished) throw new TypeError("Result sink cannot suspend");
+    if (this.#batch !== null || this.#waiting !== null)
+      throw new TypeError("Result handoff requires a ready producer");
+    this.#budgetSuspended = true;
+    await this.ready();
+    while (this.#frames.size > 0) {
+      this.#check();
+      await abortable(
+        new Promise<void>((resolve) => this.#creditWaiters.add(resolve)),
+        this.#abort.signal,
+      );
+    }
+    this.#check();
+    this.#dictionaries.close();
+    if (this.grant.allocated !== 0 || this.grant.loaned !== 0)
+      throw new TypeError("Result budget retained buffers at handoff");
+  }
+
+  /** The runtime has atomically installed the next phase's native budget. */
+  resumeBudget(): void {
+    this.#check();
+    if (!this.#budgetSuspended || this.grant.held === 0)
+      throw new TypeError("Result budget is not admitted");
+    this.#budgetSuspended = false;
+  }
+
   push(batch: Batch, transfer?: Transfer): PushResult {
     try {
       this.#check();
+      if (this.#budgetSuspended) throw new TypeError("Result input arrived between phases");
       if (this.#batch !== null) throw new TypeError("push before result readiness");
       if (batch.columns.length !== this.types.length)
         throw new TypeError("result columns differ from the plan");
@@ -165,6 +199,7 @@ export class ResultSink implements Operator {
 
   finish(): MaybePromise<void> {
     this.#check();
+    if (this.#budgetSuspended) throw new TypeError("Result finish arrived between phases");
     if (this.#batch !== null) throw new TypeError("finish before result readiness");
     // Zero-column rows have no payload bytes, hence no byte-window pressure. Coalesce their
     // count instead of queuing an unbounded number of zero-byte frames.

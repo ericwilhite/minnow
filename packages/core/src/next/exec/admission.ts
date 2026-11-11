@@ -1,5 +1,10 @@
 /** Fixed plan buffers are reserved atomically before any breaker can grow data-dependent state. */
-import { GrantClosedError, type Grant, type Loan } from "../memory/governor.js";
+import {
+  GrantClosedError,
+  type Grant,
+  type Loan,
+  type MemoryGovernor,
+} from "../memory/governor.js";
 import type { StepLoans } from "../memory/step-loans.js";
 
 /**
@@ -33,7 +38,7 @@ export class ReservedGrant implements Grant {
     return this.extra.label;
   }
   get held(): number {
-    return this.#credit + this.extra.held + (this.progress?.capacity ?? 0);
+    return this.#closed ? 0 : this.#credit + this.extra.held + (this.progress?.capacity ?? 0);
   }
   get allocated(): number {
     return this.#used + this.extra.allocated + (this.progress?.budget.allocated ?? 0);
@@ -83,6 +88,11 @@ export class ReservedGrant implements Grant {
     // Ask for room in the independent account. A concurrent reclaim can surrender unused
     // fixed credit while this waits; extra room remains owned by this reader either way.
     return (await this.extra.makeRoom?.(bytes, signal)) ?? false;
+  }
+  reclaimRoom(bytes: number, signal?: AbortSignal): Promise<boolean> {
+    if (this.#closed || this.#closing || this.bounded) return Promise.resolve(false);
+    const needed = Math.max(0, bytes - (this.#credit - this.#used));
+    return this.extra.reclaimRoom?.(needed, signal) ?? Promise.resolve(false);
   }
   release(bytes: number): void {
     if (!Number.isSafeInteger(bytes) || bytes < 0)
@@ -140,6 +150,37 @@ export class ReservedGrant implements Grant {
   reclaim(bytes: number): unknown {
     if (!this.#closed) return this.#reclaim?.(bytes);
   }
+  /** Retire a dedicated, quiescent phase account into the owner's idle pool.
+   * Native transfers never take a live buffer or loan; the wrapper's ledger is
+   * reduced before callbacks can run from a donation waking FIFO admission.
+   */
+  parkIdle(governor: MemoryGovernor, pool: Grant, progressGrant: Grant | null): void {
+    if (
+      this.#closed ||
+      this.#closing ||
+      !this.closeFixed ||
+      this.allocated !== 0 ||
+      this.loaned !== 0
+    )
+      throw new TypeError("Phase credit requires an open, dedicated, idle reservation");
+    if (pool === this.fixed || pool === this.extra || pool === progressGrant)
+      throw new TypeError("A phase must park into a separate shared idle account");
+    if ((this.progress?.budget.owner ?? null) !== progressGrant)
+      throw new TypeError("Wrong native progress account");
+    this.#closing = true;
+    const credit = this.#credit;
+    this.#credit = 0;
+    if (!governor.transferCredit(this.fixed, pool, credit)) {
+      this.#credit = credit;
+      this.#closing = false;
+      throw new TypeError("Phase fixed credit is not native idle credit");
+    }
+    for (const native of [this.extra, progressGrant]) {
+      if (native && !governor.transferCredit(native, pool, native.held))
+        throw new TypeError("Phase progress/growth credit is not idle");
+    }
+    this.close();
+  }
   close(): void {
     if (this.#closed) return;
     if (this.bounded && this.allocated > 0) {
@@ -149,6 +190,7 @@ export class ReservedGrant implements Grant {
       return;
     }
     this.#closed = true;
+    this.#reclaim = null;
     this.progress?.close();
     this.#loan = null;
     this.#loanExtra = 0;

@@ -12,6 +12,7 @@ import {
 import { int64At } from "../vector/int64.js";
 import { ColumnStore } from "./column-store.js";
 import { ExecutionError, UnsupportedPlanError } from "./errors.js";
+import { RecordCheckpoint } from "./record-checkpoint.js";
 import { ExceptTape } from "./except-tape.js";
 import { KeyLayout, KeyScratch, KeyWork, equalJob, extractKeysJob } from "./join-keys.js";
 import { isValidSlot, slotOf } from "./kernels/vectors.js";
@@ -93,6 +94,15 @@ function countAt(vector: Vector | undefined, row: number): bigint {
   return int64At(flat.data.values, slot);
 }
 
+/** Only immutable row/count records survive an execution phase boundary. */
+export interface ExceptCheckpoint {
+  readonly records: RecordCheckpoint;
+  readonly leftDone: boolean;
+  readonly leftOrdinal: bigint;
+  readonly recordBytes: number;
+  readonly profile: ExceptOperator["profile"];
+}
+
 export class ExceptOperator {
   readonly left: Operator;
   readonly right: Operator;
@@ -121,6 +131,8 @@ export class ExceptOperator {
   readonly #nulls: Uint32Array;
   readonly #counts: readonly [BigInt64Array, BigInt64Array, BigInt64Array];
   #leftOrdinal = 0n;
+  #leftDone = false;
+  #priorSpilled = 0;
   readonly #countVectors: readonly Vector[];
   readonly closed: Promise<void>;
   #resolveClosed!: () => void;
@@ -252,9 +264,91 @@ export class ExceptOperator {
         return "blocked";
       },
       ready: () => this.#pending,
-      finish: () => (right ? (this.#pending = this.#finish()) : undefined),
+      finish: () => {
+        if (right) return (this.#pending = this.#finish());
+        this.#leftDone = true;
+      },
       abort: (reason) => this.abort(reason),
     };
+  }
+  get spilledBytes(): number {
+    return this.#priorSpilled + this.#files.written;
+  }
+  get leftComplete(): boolean {
+    return this.#leftDone;
+  }
+  /** Pressure only: collapse resident entries to their exact counted records, copy
+   * existing spill records, then detach every native writer before admission waits.
+   * Counts and first-left ordinals restore directly; input rows are never replayed. */
+  checkpoint(): Promise<ExceptCheckpoint> {
+    const prior = this.#pending;
+    const work = (async () => {
+      await prior;
+      this.#check();
+      const records = new RecordCheckpoint(this.#io, this.context.spill, this.#recordTypes);
+      try {
+        await this.#flush(0);
+        const children = this.#children;
+        if (children) {
+          for (let i = 0; i < children.tapes.length; i++) {
+            const tape = children.tapes[i],
+              store = children.stores[i];
+            if (!tape || !store) throw new Error("Missing EXCEPT checkpoint partition");
+            await tape.flush(store);
+            await tape.each(this.#recordTypes, async (columns, rows) =>
+              records.write(columns, 0, rows),
+            );
+          }
+        }
+        await records.seal();
+        this.#check();
+        return {
+          records,
+          leftDone: this.#leftDone,
+          leftOrdinal: this.#leftOrdinal,
+          recordBytes: records.files.written,
+          profile: {
+            ...this.profile,
+            spilledBytes: this.#priorSpilled + this.#files.written + records.files.written,
+          },
+        };
+      } catch (error) {
+        await records.close().catch(() => undefined);
+        throw error;
+      }
+    })();
+    this.#pending = work.then(() => undefined);
+    void this.#pending.catch(() => undefined);
+    return work;
+  }
+  restore(checkpoint: ExceptCheckpoint): Promise<void> {
+    const prior = this.#pending;
+    const work = (async () => {
+      await prior;
+      this.#check();
+      await checkpoint.records.read(this.#io, async (columns, rows) => {
+        for (let row = 0; row < rows; row++) {
+          await this.#pace();
+          await this.#add(
+            columns,
+            row,
+            countAt(columns[this.types.length], row),
+            countAt(columns[this.types.length + 1], row),
+            0,
+            countAt(columns[this.types.length + 2], row),
+          );
+        }
+      });
+      this.#leftDone = checkpoint.leftDone;
+      this.#leftOrdinal = checkpoint.leftOrdinal;
+      Object.assign(this.profile, checkpoint.profile);
+      this.#priorSpilled =
+        checkpoint.profile.spilledBytes + checkpoint.records.files.written - checkpoint.recordBytes;
+      await checkpoint.records.close();
+    })();
+    this.#pending = work;
+    void work.catch(() => undefined);
+    return work;
   }
   async #ingest(batch: Batch, right: boolean): Promise<void> {
     const count = batch.selection?.count ?? batch.length;
@@ -655,7 +749,7 @@ export class ExceptOperator {
     try {
       this.#check();
       await this.#drain(0);
-      this.profile.spilledBytes = this.#files.written;
+      this.profile.spilledBytes = this.#priorSpilled + this.#files.written;
       await this.downstream.finish();
     } finally {
       await this.#dispose();

@@ -2974,3 +2974,20 @@ export const DATE_PART_SQL_REACH = [
   "quarter",
   "week",
 ] as const;
+
+/** Aggregation waits before retaining state, then grows solely inside its admitted workspace. */
+export const AGGREGATE_PROGRESS_REACH = [
+  "stored dictionary certificate",
+  "bounded memory certificate",
+  "temporary pinned holder waits",
+  "cancelled credit wait",
+  "competing holder releases",
+  "no shared growth headroom",
+  "numeric promotion",
+  "private resize",
+  "codebook translation growth",
+  "tuple growth",
+  "PG exact bits",
+  "concurrent prepared executions",
+  "all credit returned",
+] as const;

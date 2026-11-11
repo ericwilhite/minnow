@@ -21,6 +21,7 @@ import {
 import { inputBatch, type InputValue } from "../packages/core/dist/next/testing/executor-input.js";
 import { oracleRows } from "../packages/core/dist/next/testing/differential-adapter.js";
 import { createExecutor } from "../packages/core/dist/next/exec/create.js";
+import type { AggregateOperator } from "../packages/core/dist/next/exec/agg/aggregate.js";
 import type { WireFlat } from "../packages/core/dist/next/owner/frame.js";
 import { UnsupportedPlanError } from "../packages/core/dist/next/errors.js";
 import { BATCH_ROWS, type Batch } from "../packages/core/dist/next/vector/vector.js";
@@ -59,6 +60,17 @@ const option = (name: string, fallback: string) => {
   const k = args.indexOf(name);
   return k < 0 ? fallback : (args[k + 1] ?? fallback);
 };
+/** A pinned, separately built executor permits a true main/candidate comparison
+ * over the SAME stored fixture. No alternate storage implementation enters timing. */
+const controlExecutor = option("--control-executor", "");
+const controlModule =
+  controlExecutor === ""
+    ? null
+    : ((await import(pathToFileURL(resolve(controlExecutor)).href)) as {
+        createExecutor: typeof createExecutor;
+        AggregateOperator?: typeof AggregateOperator;
+      });
+const controlFactory = controlModule?.createExecutor ?? createExecutor;
 const total = Number(option("--rows", "1000000")),
   rounds = Number(option("--repeats", "5"));
 if (
@@ -109,10 +121,21 @@ const catalogue = (await import(pathToFileURL(cataloguePath).href)) as Catalogue
 const core = await new StorageCore(8192).open();
 const lateSort = option("--late-sort", "on") !== "off";
 const keyOrder = option("--key-order", "on") !== "off";
-core.executor.prepare = createExecutor({ lateSort, keyOrder, domainCountSum: false }).prepare;
+core.executor.prepare = (args.includes("--initial-control") ? controlFactory : createExecutor)({
+  lateSort,
+  keyOrder,
+  domainCountSum: false,
+}).prepare;
 const spec = generator.wideSpec(200);
 const metadata = {
   lane: "Node",
+  controlExecutor: controlExecutor === "" ? null : resolve(controlExecutor),
+  controlExecutorSha256:
+    controlExecutor === ""
+      ? null
+      : createHash("sha256")
+          .update(await readFile(resolve(controlExecutor)))
+          .digest("hex"),
   sqlCorrections: frozenSQL ? ["S_q7", "guide-4", "guide-5"] : dataset === "star" ? ["S_q7"] : [],
   lateSort,
   keyOrder,
@@ -142,6 +165,7 @@ const metadata = {
       [
         resolve("scripts/next-executor-bench.mts"),
         resolve("scripts/lib/paired-cpu.mts"),
+        resolve("scripts/build-next-executor-control.mts"),
         resolve("scripts/next-executor-components.mts"),
         resolve("scripts/next-late-fetch-component.mts"),
         resolve("scripts/next-aggregation-components.mts"),
@@ -149,6 +173,8 @@ const metadata = {
         resolve("scripts/next-aggregation-light.mts"),
         resolve("scripts/lib/aggregation-light-kernels.mts"),
         resolve("packages/core/dist/next/hash/xxhash32.js"),
+        resolve("packages/core/dist/next/memory/governor.js"),
+        resolve("packages/core/dist/next/task.js"),
         resolve("packages/core/dist/next/page/read-bounds.js"),
         resolve("packages/core/dist/next/page/domain-certificate.js"),
         generatorPath,
@@ -158,6 +184,7 @@ const metadata = {
 
         ...[
           "plan",
+          "spill-pool",
           "limit",
           "table-scan",
           "memory-scan",
@@ -171,6 +198,30 @@ const metadata = {
           "agg/packed-averages",
           "agg/packed-integers",
           "agg/typed-layout",
+          "agg/hash-bound",
+          "agg/dictionary-probe",
+          "agg/partition-probe",
+          "agg/external",
+          "agg/external-call",
+          "agg/sort-grants",
+          "agg/hybrid",
+          "agg/checkpoint",
+          "agg/restored",
+          "agg/state-row",
+          "agg/growth",
+          "agg/frozen-groups",
+          "agg/values",
+          "except",
+          "record-checkpoint",
+          "parameters",
+          "result-sink",
+          "agg/hash-workspace",
+          "agg/hash-tape",
+          "agg/hash-partitions",
+          "phase-pool",
+          "run",
+          "admission",
+          "parameter-checkpoint",
           "agg/distinct",
           "agg/scalar-byte-distinct",
         ].map((name) => resolve(`packages/core/dist/next/exec/${name}.js`)),
@@ -515,6 +566,7 @@ try {
           "highcard-domain",
           "structural",
           "aggregation",
+          "aggregation-progress",
         ].includes(option("--whole-compare", "")) &&
         (option("--whole-compare", "") !== "late-fetch" || query.id === "sort_topn_wide")
       ) {
@@ -526,51 +578,55 @@ try {
               : "wide-typed"
             : option("--whole-compare", "");
         const strategies = [
-          createExecutor(
-            comparison === "wide-layout"
-              ? { typedLayout: false }
-              : comparison === "wide-typed"
-                ? {
-                    typedLayout: false,
-                    packedAverages: false,
-                    packedIntegers: false,
-                    batchDictionaryMinMax: false,
-                    domainCountSum: false,
-                  }
-                : comparison === "highcard-domain"
-                  ? { domainCountSum: false }
-                  : comparison === "grouped-pairs"
-                    ? { groupedUpdateFusion: false }
-                    : comparison === "scalar-distinct"
-                      ? { scalarByteDistinct: false }
-                      : comparison === "aggregation"
-                        ? { groupTopN: false, groupedDistinctBitmap: false }
-                        : comparison === "grouped-distinct"
-                          ? { groupedDistinctBitmap: false }
-                          : comparison === "group-top-n"
-                            ? { groupTopN: false }
-                            : comparison === "key-order"
-                              ? { keyOrder: false }
-                              : comparison === "late-fetch"
-                                ? { lateFetchOnce: false }
-                                : { lateSort: false },
+          controlFactory(
+            comparison === "aggregation-progress"
+              ? { aggregationProgress: false }
+              : comparison === "wide-layout"
+                ? { typedLayout: false }
+                : comparison === "wide-typed"
+                  ? {
+                      typedLayout: false,
+                      packedAverages: false,
+                      packedIntegers: false,
+                      batchDictionaryMinMax: false,
+                      domainCountSum: false,
+                    }
+                  : comparison === "highcard-domain"
+                    ? { domainCountSum: false }
+                    : comparison === "grouped-pairs"
+                      ? { groupedUpdateFusion: false }
+                      : comparison === "scalar-distinct"
+                        ? { scalarByteDistinct: false }
+                        : comparison === "aggregation"
+                          ? { groupTopN: false, groupedDistinctBitmap: false }
+                          : comparison === "grouped-distinct"
+                            ? { groupedDistinctBitmap: false }
+                            : comparison === "group-top-n"
+                              ? { groupTopN: false }
+                              : comparison === "key-order"
+                                ? { keyOrder: false }
+                                : comparison === "late-fetch"
+                                  ? { lateFetchOnce: false }
+                                  : { lateSort: false },
           ),
           createExecutor(
-            comparison === "wide-layout"
-              ? { typedLayout: true }
-              : comparison === "wide-typed"
-                ? {
-                    typedLayout: false,
-                    packedAverages: true,
-                    packedIntegers: true,
-                    batchDictionaryMinMax: true,
-                    domainCountSum: false,
-                  }
-                : comparison === "highcard-domain"
-                  ? { domainCountSum: true }
-                  : comparison === "key-order"
-                    ? { keyOrder: true }
-                    : {},
+            comparison === "aggregation-progress"
+              ? { aggregationProgress: true }
+              : comparison === "wide-layout"
+                ? { typedLayout: true }
+                : comparison === "wide-typed"
+                  ? {
+                      typedLayout: false,
+                      packedAverages: true,
+                      packedIntegers: true,
+                      batchDictionaryMinMax: true,
+                      domainCountSum: false,
+                    }
+                  : comparison === "highcard-domain"
+                    ? { domainCountSum: true }
+                    : comparison === "key-order"
+                      ? { keyOrder: true }
+                      : {},
           ),
         ];
         const before: number[] = [],
@@ -632,49 +688,53 @@ try {
               if (late) afterProfile = result.profile;
               else beforeProfile = result.profile;
               order.push(
-                comparison === "wide-layout"
+                comparison === "aggregation-progress"
                   ? late
-                    ? "typed-record-dictionary"
-                    : "merged-separate-banks"
-                  : comparison === "wide-typed"
+                    ? "admitted-hash-or-external"
+                    : "unbounded-growth-parent"
+                  : comparison === "wide-layout"
                     ? late
-                      ? "packed-averages-batch-dictionary"
-                      : "separate-states"
-                    : comparison === "highcard-domain"
+                      ? "typed-record-dictionary"
+                      : "merged-separate-banks"
+                    : comparison === "wide-typed"
                       ? late
-                        ? "certified-direct-domain"
-                        : "general-hash"
-                      : comparison === "grouped-pairs"
+                        ? "packed-averages-batch-dictionary"
+                        : "separate-states"
+                      : comparison === "highcard-domain"
                         ? late
-                          ? "fused-grouped-pairs"
-                          : "separate-grouped-updates"
-                        : comparison === "scalar-distinct"
+                          ? "certified-direct-domain"
+                          : "general-hash"
+                        : comparison === "grouped-pairs"
                           ? late
-                            ? "scalar-byte-membership"
-                            : "scalar-value-interning"
-                          : comparison === "aggregation"
+                            ? "fused-grouped-pairs"
+                            : "separate-grouped-updates"
+                          : comparison === "scalar-distinct"
                             ? late
-                              ? "aggregation-default"
-                              : "aggregation-control"
-                            : comparison === "grouped-distinct"
+                              ? "scalar-byte-membership"
+                              : "scalar-value-interning"
+                            : comparison === "aggregation"
                               ? late
-                                ? "bitmaps-enabled"
-                                : "pair-set-control"
-                              : comparison === "group-top-n"
+                                ? "aggregation-default"
+                                : "aggregation-control"
+                              : comparison === "grouped-distinct"
                                 ? late
-                                  ? "selected-groups"
-                                  : "all-groups"
-                                : comparison === "key-order"
+                                  ? "bitmaps-enabled"
+                                  : "pair-set-control"
+                                : comparison === "group-top-n"
                                   ? late
-                                    ? "index-cursor"
-                                    : "scan-sort-locators"
-                                  : comparison === "late-fetch"
+                                    ? "selected-groups"
+                                    : "all-groups"
+                                  : comparison === "key-order"
                                     ? late
-                                      ? "one-pass-payload"
-                                      : "cached-payload"
-                                    : late
-                                      ? "keys-and-locators"
-                                      : "full-payload",
+                                      ? "index-cursor"
+                                      : "scan-sort-locators"
+                                    : comparison === "late-fetch"
+                                      ? late
+                                        ? "one-pass-payload"
+                                        : "cached-payload"
+                                      : late
+                                        ? "keys-and-locators"
+                                        : "full-payload",
               );
               console.error(
                 JSON.stringify({ id: query.id, comparison: true, round, late, load: loadavg() }),
@@ -732,6 +792,7 @@ try {
         status: "failed",
         error: error instanceof Error ? error.name : String(error),
         message: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : null,
       };
       records.push(record);
       console.log(JSON.stringify(record));
@@ -751,6 +812,8 @@ try {
         sql: catalogue.sqlFor(query, "minnow", total),
       })),
       option("--component", "") === "aggregation-light" ? cache : undefined,
+      option("--whole-compare", "") === "aggregation-progress",
+      controlModule?.AggregateOperator,
     );
     await writeFile(join(cache, "component-aggregation.json"), JSON.stringify(components, null, 2));
     console.log(JSON.stringify(components));

@@ -10,8 +10,9 @@
  * Large-group-first inputs retain pairs; later group growth uses disjoint bitmap/pair routes.
  * Scalar byte COUNT uses a count-only membership table in AggregateOperator; other scalar
  * arguments retain this generic value-id/seen-marker path.
- * Memory is charged to the grant; spilling the set by
- * partition is milestone 3.
+ * This synchronous set requires a complete admitted workspace. The query factory
+ * uses the bounded external DISTINCT recipe when no whole-set bound is certified;
+ * it never retries filter() after a partially applied allocation failure.
  */
 import { OBJECT_OVERHEAD_BYTES } from "../../memory/governor.js";
 import type { PhysicalType } from "../../types.js";
@@ -19,6 +20,7 @@ import type { ByteCharge } from "../../vector/varlen.js";
 import type { Selection, Vector } from "../../vector/vector.js";
 import { IDENTITY } from "../kernels/vectors.js";
 import { Charged, GroupTable, grownCapacity } from "./groups.js";
+import { arrayGrowth } from "./growth.js";
 
 function mix(a: number, b: number): number {
   let h = Math.imul(a ^ Math.imul(b, 0x9e3779b1), 0x85ebca6b);
@@ -30,6 +32,25 @@ function mix(a: number, b: number): number {
 const BITMAP_GROUPS = 64;
 
 export class DistinctSet {
+  growthBytes(vector: Vector, rows: number): number {
+    const values = this.#values.groupCount + rows,
+      pairs = this.#size + rows;
+    let bytes =
+      4096 +
+      this.#values.growthBytes([vector], rows) +
+      arrayGrowth(this.#slots.length, 2 * pairs, 4, true) +
+      arrayGrowth(this.#groups.length, pairs, 8, true) +
+      arrayGrowth(this.#seen.length, values, 1);
+    if (this.#bitmaps !== null) {
+      const words = Math.ceil(values / 32);
+      for (let group = 0; group < BITMAP_GROUPS; group++)
+        bytes +=
+          arrayGrowth(this.#bitmaps[group]?.length ?? 0, words, 4, true) +
+          2 * OBJECT_OVERHEAD_BYTES;
+    }
+    return bytes;
+  }
+
   readonly #values: GroupTable;
   readonly #memory: Charged;
   readonly #vids: Int32Array;
@@ -132,6 +153,64 @@ export class DistinctSet {
     return out;
   }
 
+  /** Snapshot logical membership, not hash-slot identities. Undefined is a bounded
+   * scan checkpoint for sparse bitmap words / long pair arrays. */
+  *members(scalar: boolean): Generator<{ group: number; id: number } | undefined, void, void> {
+    if (scalar) {
+      for (let id = 0; id < this.#values.groupCount; id++) {
+        if (this.#seen[id] === 1) yield { group: 0, id };
+        if ((id & 511) === 511) yield;
+      }
+      return;
+    }
+    if (this.#bitmapMode === true && this.#bitmaps !== null) {
+      for (let group = 0; group < BITMAP_GROUPS; group++) {
+        const bits = this.#bitmaps[group];
+        if (!bits) continue;
+        for (let word = 0; word < bits.length; word++) {
+          const mask = bits[word] ?? 0;
+          if (mask !== 0)
+            for (let b = 0; b < 32; b++)
+              if ((mask & (1 << b)) !== 0) yield { group, id: 32 * word + b };
+          if ((word & 511) === 511) yield;
+        }
+      }
+    }
+    for (let i = 0; i < this.#size; i++) {
+      yield { group: this.#groups[i] ?? 0, id: this.#ids[i] ?? 0 };
+      if ((i & 511) === 511) yield;
+    }
+  }
+  /** Restore the original strategy and global value-ID order before memberships. Replaying
+   * memberships group-by-group must not select a different bitmap layout or reorder arenas. */
+  get checkpointMode(): number {
+    return this.#bitmapMode === null ? -1 : this.#bitmapMode ? 1 : 0;
+  }
+  restoreMode(mode: number): void {
+    if (mode !== -1 && mode !== 0 && mode !== 1) throw new Error("Invalid DISTINCT mode");
+    if (this.#bitmaps === null && mode !== 0) throw new Error("Missing DISTINCT bitmap slots");
+    this.#bitmapMode = mode < 0 ? null : mode === 1;
+  }
+  get valueCount(): number {
+    return this.#values.groupCount;
+  }
+  restoreValue(vector: Vector, row: number): void {
+    this.#one[0] = vector;
+    this.#values.assign(
+      this.#one,
+      vector.length,
+      { rows: IDENTITY.subarray(row, row + 1), count: 1 },
+      this.#vids,
+    );
+  }
+
+  memberBytes(id: number): number {
+    return this.#values.keyBytes(0, id, 1);
+  }
+  memberValue(id: number): ReturnType<GroupTable["emitKey"]> {
+    return this.#values.emitKey(0, id, 1);
+  }
+
   /** One bit per observed (group,value-id), with no second tuple hash or pair arrays. */
   #mark(group: number, id: number): boolean {
     const maps = this.#bitmaps;
@@ -203,6 +282,7 @@ export class DistinctSet {
   }
 
   close(): void {
+    this.#one.length = 0;
     this.#bitmaps?.fill(undefined);
     this.#bitmaps = null;
     this.#values.close();

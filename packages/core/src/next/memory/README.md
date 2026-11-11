@@ -5,8 +5,8 @@ admission and splits it into named native grants. `options.grants` lists each
 part's `label`, `minimumBytes` and `spillable` flag. The result has the same order.
 Labels must be unique and minima must be nonnegative safe integers. The request
 is copied before waiting. No part holds credit while the total waits; cancellation
-returns the whole admission, including a cancellation after service but before
-splitting. A zero-total group creates empty budgets without queueing: it acquires
+returns the whole admission, including a cancellation after atomic service but before
+the async caller adopts the named grants. A zero-total group creates empty budgets without queueing: it acquires
 no capacity and cannot displace a waiting request.
 
 By default, the total uses ordinary capacity, like `admit`. A group whose total
@@ -76,7 +76,8 @@ therefore have a minimum above that cap even when its present resident data is t
 
 The cap covers held capacity, including buffers in flight. Temporary pressure is not a
 query-size error. A complete execution minimum greater than the whole cap is the typed
-`MemoryAdmissionError` at admission. Parameters are inputs and cannot spill.
+`MemoryAdmissionError` at admission. Oversized parameter inputs fail initial admission. Only already-admitted owned copies may
+checkpoint during a pressure handoff (see below).
 
 An executor first sizes the widest reachable scan step, including encoded leases,
 decoded pages, dictionaries, directories and decode overlap. It adds every active
@@ -195,3 +196,94 @@ the bounded option and retain the old borrow API. The latter is off in ordinary 
 is outside this production proof until its query-owned read admission is integrated. The structural page-sizing helper keeps its conservative legacy fallback for
 such callers without `readHint`; production access segments always provide hints.
 That fallback is not a production proof, and no semantic oracle or R21 waiver is used.
+
+## Aggregation workspaces
+
+A regular aggregation chooses its memory strategy before applying any transition. A complete
+fixed-width scalar bound, exact direct-address bounds, or a complete codebook-domain certificate
+can authorize the hash path. The hash minimum covers table/translation growth, every old/new
+buffer overlap, ordinary-state promotion and output. An allocation is synchronous inside that
+admitted workspace; it does not borrow shared headroom. A short synthetic budget at the raw
+transition-engine seam is an accounting error, not a resumable `push`.
+
+The optional domain probe owns one complete temporary native admission. It reads the pinned
+snapshot's codebooks, or a publication-stable bounded key/payload scan for a memory tail. It
+drops every reader and grant before requesting the execution minimum. Only bounded numeric
+certificate metadata survives. Thus planning cannot retain one part of the execution minimum
+while waiting for its other parts, and competing planning executions cannot form a credit cycle.
+
+Without a complete certificate, eligible ordinary column aggregates start with a bounded
+hash workspace. They request optional headroom asynchronously at transition boundaries.
+A pinned competitor causes the hash pass to stop admitting new groups: resident groups
+continue in place and other rows enter stable hash-partitioned tapes. Each group finishes
+in one pass. Recursive partitions preserve that group's source order; no partial floating
+states are combined. A bounded resident job directory collapses children onto one tape
+when it would otherwise grow, preserving each group's order.
+
+When a resident variable state cannot grow, its exact transition fields and DISTINCT
+membership are checkpointed before any unapplied input is spooled. The producer then
+spools its remaining child once and closes its readers, leases, buffers and grants. The
+execution retains its original snapshot pin. The runtime moves quiescent result credit
+into the shared idle pool and atomically admits a restore phase: state, bounded I/O,
+remaining operators, owned parameters and result credit. A pressure-only stable merge
+sorts state, membership and suffix records by group key, record kind and input ordinal.
+It restores one group's fields and membership before its suffix rows, so a combined
+resident set above the restore cap cannot force refusal or endless hash repartitioning
+under skew. Native scalar copies retain -0/Sxx, exact NUMERIC coefficients/scales and
+byte extrema. Compound checkpoint rows are measured without copies, then fully funded
+before native materialization. The input scan is not re-executed. The saved progress
+bound is carried intact, without applying its compound multiplier a second time.
+Cancellation of an in-flight nested spill belongs to its holder: the aggregate wrapper
+drains it without rejecting another execution's FIFO admission. Active-owner spill
+failures still propagate.
+
+Plentiful-memory executions neither checkpoint nor spool. Fixed COUNT/float states with
+bounded fixed-width keys use the admitted I/O budget for emission, so an unchanged
+resident group does not need fresh hash headroom merely to produce its result. Waits
+remain cancellable and use the shared task clock; cleanup drains all started I/O.
+
+The phase handoff reconstructs unary parents and checkpoints retained EXCEPT counts,
+first-left ordinals and representatives. A completed EXCEPT left arm is not reopened.
+Each sealed cut stays in an execution-owned cleanup slot across producer suspension,
+restore admission, parameter binding and the resumed recipe. Installing the next owner
+precedes clearing the previous slot. Cancellation drains both pending and resumed cuts
+before the execution settles; tests check spill bytes before the shared service closes.
+Current limits: retaining join parents and computed arguments without a proven
+materialization boundary use the external fallback; direct-column FILTER transitions
+have a conservative full-batch growth bound. Varlen CASE output in an ordinary projection
+has a separate transient-pressure allocation gap, reproduced on main; this hash-state
+protocol does not make that expression buffer resumable. Genuinely ordered DISTINCT and
+ordered-set transitions retain external sorting with independent private progress lanes.
+The raw synchronous hash helpers still require a complete workspace; retrying a partly
+applied raw push after refusal is invalid.
+
+The operator tape's bounded disk-linked directory does not bound the shared scratch
+service's per-file extent list. That metadata is presently uncharged; B1 owns the routed
+fix. Pressure tests cover operator/native-buffer accounting, not a universal whole-service
+hard RAM bound. This limitation also applies to scratch-backed generated SQL cases.
+
+## Idle credit at a pressure handoff
+
+`admitGroup` accepts `idleCredit`, a live native account containing no allocated or
+loaned bytes. It registers an owner-wide idle pool. All earlier FIFO heads can use
+that credit, including ordinary admission, read and loan requests; the requesting
+phase gets no private reservation while waiting. `transferCredit` donations wake
+the existing drain, and closing the pool unregisters it. Registered pools cannot
+allocate or borrow: their credit is idle until the drain installs it in a consumer.
+
+Service adopts pooled credit and splits named grants synchronously, without a
+callback or await between them. Only the deficit increases used/peak capacity.
+Unused pooled credit still counts against the physical cap; it does not consume
+an ordinary head's active allowance. Adopted loan credit follows the existing loan
+repayment accounting. Cancellation after service closes every installed named part.
+Invalid options and already-cancelled requests register nothing.
+
+The generated `idle-credit.test.ts` campaign covers two to four paused executions,
+random complete minima that fit alone, the 8 MiB two-execution case, fresh FIFO
+heads, donation wakeup, full-cap pools, cancellation and zero final charges.
+
+The parameter input rule has one exception: after pressure forces an execution
+phase handoff, already-admitted owned parameter copies may be checkpointed. Initial
+oversized-parameter refusal remains unchanged. Byte payloads are written in bounded
+fragments and restored only inside the new admitted input account. Caller buffers
+are never reread; their contents may already have changed.

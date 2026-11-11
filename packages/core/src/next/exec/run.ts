@@ -55,8 +55,108 @@ export type Program = ((runtime: QueryRuntime, sink: ResultSink) => MaybePromise
   readonly atomic?: boolean;
 };
 
+interface ResourcePhase {
+  readonly parent: ResourcePhase | null;
+  readonly jobs: Array<() => MaybePromise<void>>;
+  readonly aborters: Array<(reason: unknown) => void>;
+}
+const HANDOFF = new Error("Producer retired at aggregation phase handoff");
+
 /** Per-execution only: never retained by an immutable prepared plan. */
 export class QueryRuntime {
+  #phaseCapable = false;
+  #handoff = false;
+  #scope: ResourcePhase | null = null;
+  enablePhases(): void {
+    if (this.#scope !== null) throw new Error("Phase capability must precede graph construction");
+    this.#phaseCapable = true;
+  }
+  isHandoff(reason: unknown): boolean {
+    return reason === HANDOFF;
+  }
+  get handingOff(): boolean {
+    return this.#handoff;
+  }
+  beginHandoff(): void {
+    this.#handoff = true;
+  }
+  resumePhase(): void {
+    this.#handoff = false;
+  }
+  /** Nested recipes retire their own readers/operators before returning native credit.
+   * The snapshot pin belongs to Execution and is deliberately outside these scopes. */
+  resource<T>(body: () => MaybePromise<T>, release: () => void): MaybePromise<T> {
+    const scope: ResourcePhase | null = this.#phaseCapable
+      ? { parent: this.#scope, jobs: [], aborters: [] }
+      : null;
+    if (scope) this.#scope = scope;
+    let failed = false,
+      reason: unknown;
+    const finish = (): MaybePromise<void> => {
+      if (!scope) {
+        release();
+        return;
+      }
+      if (this.#scope !== scope) throw new Error("Producer scopes overlapped");
+      this.#scope = scope.parent;
+      const errors: unknown[] = [];
+      const aborters = scope.aborters.splice(0);
+      for (const abort of aborters) {
+        const index = this.#aborters.indexOf(abort);
+        if (index >= 0) this.#aborters.splice(index, 1);
+        if (failed || this.#handoff || this.#aborted)
+          try {
+            abort(this.#aborted ? this.#reason : failed ? reason : HANDOFF);
+          } catch (error) {
+            errors.push(error);
+          }
+      }
+      const jobs = scope.jobs.splice(0).reverse();
+      const drain = (at: number): MaybePromise<void> => {
+        for (let i = at; i < jobs.length; i++) {
+          try {
+            const work = jobs[i]?.();
+            if (work instanceof Promise)
+              return work
+                .catch((error: unknown) => {
+                  errors.push(error);
+                })
+                .then(() => drain(i + 1));
+          } catch (error) {
+            errors.push(error);
+          }
+        }
+        scope.aborters.length = 0;
+        release();
+        if (errors.length) throw new AggregateError(errors, "Producer phase cleanup failed");
+      };
+      return drain(0);
+    };
+    let result: MaybePromise<T>;
+    try {
+      result = body();
+    } catch (error) {
+      failed = true;
+      reason = error;
+      const done = finish();
+      if (done instanceof Promise)
+        return done.then(() => {
+          throw error;
+        });
+      throw error;
+    }
+    if (result instanceof Promise)
+      return result
+        .catch((error: unknown) => {
+          failed = true;
+          reason = error;
+          throw error;
+        })
+        .finally(finish);
+    const done = finish();
+    return done instanceof Promise ? done.then(() => result) : result;
+  }
+
   resolveCall: CallResolver | undefined;
   readonly params: ParameterSlots = { slots: [] };
   readonly profiles = new Map<number, MutableOperatorProfile>();
@@ -71,11 +171,13 @@ export class QueryRuntime {
   #pipelines = 0;
   #wait = 0;
   readonly #reserved = new Map<string, ReservedGrant>();
+  readonly #phaseParts = new Map<ReservedGrant, Grant>();
   readonly #bounds = new Map<number, { readonly limit: number | null; readonly offset: number }>();
   #atomicResult: DeferredGrant | null = null;
   #window = 0;
   #readBytes = 0;
   #progressBytes = 0;
+  #savedProgressBytes = 0;
   #readStep: ReadStep | null = null;
   #operatorProgress = new Map<number, number>();
   #readBounds = new Map<number, ReadBound>();
@@ -85,9 +187,10 @@ export class QueryRuntime {
     this.#atomicResult = grant;
     this.#window = Math.min(window, RESULT_FRAME_TARGET_BYTES);
   }
-  readMinimum(bytes: number, progress: number): void {
+  readMinimum(bytes: number, progress: number, savedProgress = 0): void {
     this.#readBytes = bytes;
     this.#progressBytes = progress;
+    this.#savedProgressBytes = savedProgress;
   }
   readPages(pages: Snapshot["pages"]): Snapshot["pages"] {
     return this.#readBytes === 0
@@ -117,6 +220,30 @@ export class QueryRuntime {
   sourceDomain(id: number) {
     return this.#readBounds.get(id)?.domain;
   }
+  #expressionProgress = 0;
+  #expressionMultiplicity = 1;
+  #parameterProgress = false;
+  /** Complete variable-output envelope; ordinary project/filter leave it at zero. */
+  progressEnvelope(bytes: number, multiplicity = 1): void {
+    this.#expressionProgress = bytes;
+    this.#expressionMultiplicity = multiplicity;
+    this.#parameterProgress = true;
+  }
+  #stepBytes(inputs: number, largestInput: number): number {
+    // ReadBound.progress already covers a complete source prefix, not one cell.
+    // Add newly materialized inline/literal/owned-parameter columns; multiply only
+    // for repeated group-key positions, never again for the number of source columns.
+    const current = this.#parameterProgress
+      ? this.#progressBytes * this.#expressionMultiplicity +
+        this.#expressionProgress +
+        4 * inputs * this.#expressionMultiplicity
+      : Math.max(this.#progressBytes, largestInput);
+    return Math.max(MAX_BLOB_BYTES, this.#savedProgressBytes, current);
+  }
+  operatorStep(rel: OperatorIdentity): number {
+    return this.#operatorProgress.get(rel.id) ?? 0;
+  }
+
   minimumBytes(
     entries: ReadonlyArray<{ rel: OperatorIdentity; minimum: number; loanSlots?: number }>,
     inputs = 0,
@@ -124,10 +251,11 @@ export class QueryRuntime {
   ): number {
     if (this.#atomicResult === null)
       return inputs + entries.reduce((sum, entry) => sum + entry.minimum, 0);
-    const progress = Math.max(MAX_BLOB_BYTES, this.#progressBytes, largestInput);
+    const progress = this.#stepBytes(inputs, largestInput);
     const borrowers = entries
       .filter(
-        ({ rel }) =>
+        ({ rel, loanSlots }) =>
+          (loanSlots ?? 0) > 0 ||
           rel.op === "sort" ||
           rel.op === "aggregate" ||
           rel.op === "join" ||
@@ -208,12 +336,22 @@ export class QueryRuntime {
       : next(binding);
   }
 
-  #reserveBound(entries: readonly Reservation[], binding: ParameterBinding): MaybePromise<void> {
+  #reserveBound(
+    entries: readonly Reservation[],
+    binding: ParameterBinding,
+    idleCredit?: Grant,
+  ): MaybePromise<void> {
     const atomic = this.#atomicResult !== null;
     const progress = atomic
-      ? Math.max(MAX_BLOB_BYTES, this.#progressBytes, binding.largestSlot)
+      ? this.#stepBytes(binding.logicalBytes ?? binding.bytes, binding.largestSlot)
       : 0;
+    // A helper slot explicitly declares bounded variable output, including project/filter
+    // wrappers. Fund the base owner and every helper together, also after a phase restore.
+    const explicitLoans = new Set(
+      entries.filter((entry) => entry.loanSlot !== undefined).map((entry) => entry.rel.id),
+    );
     const canBorrow = (rel: OperatorIdentity) =>
+      explicitLoans.has(rel.id) ||
       rel.op === "sort" ||
       rel.op === "aggregate" ||
       rel.op === "join" ||
@@ -251,6 +389,7 @@ export class QueryRuntime {
     const started = performance.now();
     const admitted = admitWorkingSet(this.request.governor, {
       label: `${prefix}/fixed-buffers`,
+      ...(idleCredit === undefined ? {} : { idleCredit }),
       grants: parts,
       includesProgress: atomic,
       signal: this.signal,
@@ -287,6 +426,7 @@ export class QueryRuntime {
           () => lane.close(),
           true,
         );
+        this.#phaseParts.set(share, lane);
         retained.add(fixed);
         retained.add(growth);
         retained.add(lane);
@@ -469,12 +609,37 @@ export class QueryRuntime {
 
   dispose(cleanup: () => MaybePromise<void>): void {
     if (this.#closed) throw new TypeError("resource installed after query disposal");
-    this.#dispose.push(cleanup);
+    if (!this.#scope) {
+      this.#dispose.push(cleanup);
+      return;
+    }
+    let live = true;
+    const once = () => {
+      if (!live) return;
+      live = false;
+      const index = this.#dispose.indexOf(once);
+      if (index >= 0) this.#dispose.splice(index, 1);
+      return cleanup();
+    };
+    this.#dispose.push(once);
+    this.#scope.jobs.push(once);
   }
 
   onAbort(abort: (reason: unknown) => void): void {
     if (this.#aborted) abort(this.#reason);
-    else this.#aborters.push(abort);
+    else if (!this.#scope) this.#aborters.push(abort);
+    else {
+      let live = true;
+      const once = (reason: unknown) => {
+        if (!live) return;
+        live = false;
+        const index = this.#aborters.indexOf(once);
+        if (index >= 0) this.#aborters.splice(index, 1);
+        abort(reason);
+      };
+      this.#aborters.push(once);
+      this.#scope.aborters.push(once);
+    }
   }
 
   abort(reason: unknown): void {
@@ -491,10 +656,69 @@ export class QueryRuntime {
     }
   }
 
+  /** Called only after the old graph unwound and parameter copies were checkpointed.
+   * Neither this operation nor resource scopes release the owner-held snapshot pin. */
+  async suspendProducer(sink: ResultSink, idleCredit: Grant): Promise<void> {
+    if (!this.#handoff || this.#scope !== null || this.#atomicResult === null)
+      throw new Error("Producer graph must retire before phase admission");
+    await sink.suspendBudget();
+    const target = this.#atomicResult.detach();
+    try {
+      if (!(target instanceof ReservedGrant))
+        throw new Error("Phase result has no native reservation");
+      const lane = this.#phaseParts.get(target);
+      if (!lane) throw new Error("Missing native phase result parts");
+      target.parkIdle(this.request.governor, idleCredit, lane);
+      this.params.slots = [];
+      await this.#releaseResources();
+      this.#readStep = null;
+      this.#readBytes = 0;
+      this.#progressBytes = 0;
+      this.#savedProgressBytes = 0;
+      this.#reserved.clear();
+      this.#phaseParts.clear();
+      // Peak statistics are scalar now. Do not retain closed grant wrappers, their
+      // metering closures and per-phase arrays for every later restore admission.
+      this.#grants.length = 0;
+      this.#operatorGrants.clear();
+    } catch (error) {
+      target.close();
+      throw error;
+    }
+  }
+
+  /** A checkpoint-backed binding restores owned inputs, never request.parameters. */
+  restorePhase(
+    pipelines: ReadonlyArray<{
+      readonly rel: OperatorIdentity;
+      readonly minimum: number;
+      readonly loanSlots?: number;
+    }>,
+    binding: ParameterBinding,
+    idleCredit: Grant,
+  ): MaybePromise<void> {
+    if (!this.#handoff || this.#scope !== null) throw new Error("No retired producer phase");
+    const entries: Reservation[] = pipelines.flatMap((entry) => [
+      { rel: entry.rel, minimum: entry.minimum },
+      ...Array.from({ length: entry.loanSlots ?? 0 }, (_, loanSlot) => ({
+        rel: entry.rel,
+        minimum: 0,
+        loanSlot,
+      })),
+    ]);
+    const admitted = this.#reserveBound(entries, binding, idleCredit);
+    return admitted instanceof Promise
+      ? admitted.then(() => this.resumePhase())
+      : this.resumePhase();
+  }
   close(): MaybePromise<void> {
     if (this.#closed) return;
     this.#closed = true;
     this.#bounds.clear();
+    this.params.slots = [];
+    return this.#releaseResources();
+  }
+  #releaseResources(): MaybePromise<void> {
     const jobs = this.#dispose.splice(0).reverse();
     let first: unknown;
     let failed = false;
