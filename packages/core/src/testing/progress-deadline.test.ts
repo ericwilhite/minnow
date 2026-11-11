@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { withProgressDeadline } from "./progress-deadline.js";
+import { withProgressDeadline } from "./progress-deadline.test-support.js";
 
 afterEach(() => vi.useRealTimers());
 

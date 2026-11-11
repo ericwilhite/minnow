@@ -50,7 +50,11 @@ await assert.rejects(
 await database.close();
 // Snapshot committed native bytes after releasing the historical store's sync handles.
 store._crashForTests();
-const files: Record<string, string> = {};
+// Binary payloads avoid base64 expansion; equal native files share one lossless payload.
+const files: Record<string, { offset: number; length: number }> = {};
+const payloads: Buffer[] = [];
+const seen = new Map<string, { offset: number; length: number }>();
+let offset = 0;
 async function snapshot(directory: FileSystemDirectoryHandle, prefix: string): Promise<void> {
   const entries = [];
   for await (const [name, entry] of directory.entries()) entries.push([name, entry] as const);
@@ -58,10 +62,20 @@ async function snapshot(directory: FileSystemDirectoryHandle, prefix: string): P
   for (const [name, entry] of entries) {
     const path = prefix + name;
     if (entry.kind === "directory") await snapshot(entry as FileSystemDirectoryHandle, path + "/");
-    else
-      files[path] = Buffer.from(
+    else {
+      const bytes = Buffer.from(
         await (await (entry as FileSystemFileHandle).getFile()).arrayBuffer(),
-      ).toString("base64");
+      );
+      const key = bytes.toString("base64");
+      let range = seen.get(key);
+      if (range === undefined) {
+        range = { offset, length: bytes.length };
+        seen.set(key, range);
+        payloads.push(bytes);
+        offset += bytes.length;
+      }
+      files[path] = range;
+    }
   }
 }
 await snapshot(shim.root, "");
@@ -72,7 +86,10 @@ const fixture = {
   nextId,
   files,
 };
-const bytes = gzipSync(JSON.stringify(fixture));
+// One JSON header line followed by exact native bytes, addressed relative to the payload.
+const bytes = gzipSync(Buffer.concat([Buffer.from(JSON.stringify(fixture) + "\n"), ...payloads]), {
+  level: 9,
+});
 await writeFile(out, bytes);
 console.log(
   JSON.stringify({ nextId, files: Object.keys(files).length, compressedBytes: bytes.length }),

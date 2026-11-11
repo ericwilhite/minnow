@@ -17,7 +17,7 @@
  */
 import { readFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
-import { withProgressDeadline } from "../testing/progress-deadline.js";
+import { withProgressDeadline } from "../testing/progress-deadline.test-support.js";
 import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it, vi } from "vitest";
 import { MinnowDatabase as ReleasedDatabase } from "@minnowdb/core-layout10";
@@ -175,25 +175,30 @@ describe("OPFS: a table 0.15.0 left at the level-zero ceiling", () => {
   it("folds on the first write after the upgrade, and the released reader is refused", async () => {
     // Exact frozen output of scripts/write-fold-ceiling-fixture.mts, written by 0.15.0.
     // No size reduction: the real 4,096-segment ceiling and every original row are retained.
-    const fixture = JSON.parse(
-      gunzipSync(
-        readFileSync(
-          new URL("../../format-fixtures/opfs-layout10-fold-ceiling.json.gz", import.meta.url),
-        ),
-      ).toString("utf8"),
-    ) as {
+    const bytes = gunzipSync(
+      readFileSync(
+        new URL("../../format-fixtures/opfs-layout10-fold-ceiling.json.gz", import.meta.url),
+      ),
+    );
+    const headerEnd = bytes.indexOf(10);
+    expect(headerEnd).toBeGreaterThan(0);
+    const payload = bytes.subarray(headerEnd + 1);
+    const fixture = JSON.parse(bytes.subarray(0, headerEnd).toString("utf8")) as {
       writerPackageVersion: string;
       layoutFormatVersion: number;
       levelZeroSegments: number;
       nextId: number;
-      files: Record<string, string>;
+      files: Record<string, { offset: number; length: number }>;
     };
     expect(fixture.writerPackageVersion).toBe("0.15.0");
     expect(fixture.layoutFormatVersion).toBe(10);
     expect(fixture.levelZeroSegments).toBe(MAX_LEVEL_ZERO_SEGMENTS);
     const shim = new MemoryOpfs();
-    for (const [path, bytes] of Object.entries(fixture.files))
-      shim.writeFileBytes(path, Uint8Array.from(Buffer.from(bytes, "base64")));
+    for (const [path, { offset, length }] of Object.entries(fixture.files)) {
+      expect(offset).toBeGreaterThanOrEqual(0);
+      expect(offset + length).toBeLessThanOrEqual(payload.length);
+      shim.writeFileBytes(path, payload.subarray(offset, offset + length));
+    }
     const nextId = fixture.nextId;
     expect(nextId).toBe(MAX_LEVEL_ZERO_SEGMENTS + 1);
     const releasedStore = await ReleasedOpfsStore.open({ name: NAME, root: shim.root });
