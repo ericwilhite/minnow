@@ -1,7 +1,7 @@
 /** Numeric sort words and a single gather of each payload column. No key byte strings. */
 import { layoutOf, type PhysicalType } from "../types.js";
 import { allocateData, dataBytes, type FlatVector, type VectorData } from "../vector/vector.js";
-import { ColumnStore, wordsOf } from "./column-store.js";
+import { ColumnStore, TIER_INT64, wordsOf } from "./column-store.js";
 import type { SortColumn } from "./sort-keys.js";
 import { frameTransferList } from "./frame-buffers.js";
 import type { Slice, SlicedJob } from "./slices.js";
@@ -11,6 +11,8 @@ export interface GatherColumn {
   readonly type: PhysicalType;
   readonly chunks: Array<FlatVector | undefined>;
   readonly nullable: boolean;
+  /** The homogeneous representation survives retirement of every earlier chunk. */
+  readonly wideInt64: boolean;
   readonly floats: Array<Float64Array | undefined>;
   readonly integers: Array<Int32Array | undefined>;
   readonly singles: Array<Float32Array | undefined>;
@@ -44,6 +46,7 @@ export function* gatherSource(
   const source: GatherColumn = {
     type,
     nullable: store.hasNulls(c),
+    wideInt64: layoutOf(type) === "int64" && store.tier(c) === TIER_INT64,
     chunks: [],
     floats: [],
     integers: [],
@@ -246,10 +249,8 @@ export function gatherColumn(
   varlen: number,
 ): FlatVector {
   const chunks = source.chunks;
-  const first = chunks[0];
-  if (first === undefined) throw new TypeError("Missing gather source");
   let data: VectorData;
-  if (first.data.layout === "int64" && first.data.values.repr === "int64")
+  if (source.wideInt64)
     data = { layout: "int64", values: { repr: "int64", values: new BigInt64Array(n) } };
   else data = allocateData(source.type, n, varlen);
   const validity = source.nullable ? new Uint32Array(Math.ceil(n / 32)).fill(0xffff_ffff) : null;

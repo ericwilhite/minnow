@@ -536,8 +536,7 @@ export class ColumnarSortOperator implements Operator {
     for (const column of this.#columns)
       if (layoutOf(column.type) === "varlen")
         for (const chunk of column.chunks) {
-          if (chunk?.data.layout !== "varlen")
-            throw new TypeError("Invalid varlen payload");
+          if (chunk?.data.layout !== "varlen") throw new TypeError("Invalid varlen payload");
           for (let i = 0; i < chunk.length; i++)
             if ((chunk.data.offsets[i + 1] ?? 0) - (chunk.data.offsets[i] ?? 0) > MAX_INPUT_BYTES)
               return false;

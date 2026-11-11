@@ -3375,3 +3375,38 @@ export const SORT_TRANSFER_ACCOUNTING_REACH = [
   "operator close with live frames",
   "multiple source chunks",
 ] as const;
+
+/** Actual result frames retain exact dictionary values across source close and spill replay. */
+export const SORT_DICTIONARY_LIFETIME_REACH = [
+  "resident union frames",
+  "actual spill and merge",
+  "union replay under reclaim",
+  "stable wire id and delta",
+  "local dictionary codes",
+  "NULL text",
+  "UTF8 text",
+  "exact wide int64",
+  "after source close",
+  "earlier frames detached",
+  "asc",
+  "desc",
+  "PG full output",
+] as const;
+
+/** Every prefix of a multi-column transfer is safe to cancel or fail, before or after prior credit. */
+export const SORT_TRANSFER_FAILURE_REACH = [
+  "error",
+  "cancel",
+  "zero columns",
+  "interior prefix",
+  "all columns",
+  "first frame",
+  "later frame",
+  "wide int64",
+  "nullable validity",
+  "single owner every step",
+  "source close before credit",
+  "idempotent credit",
+  "non-finite payload",
+  "dictionary header before failure",
+] as const;

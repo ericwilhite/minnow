@@ -2020,7 +2020,9 @@ shipped-engine or stored-format change.
   column-only projections into result frames after the result account charges their full size.
   A whole unchanged tight source chunk can move without gathering. Result adoption retires
   its resident native-buffer charge before publishing the frame; source caches drop their views,
-  and capacities are recorded before irreversible detachment. Copied/refused chunks retire at
+  and capacities are recorded before irreversible detachment. Homogeneous representation
+  metadata survives retired chunks, so later partial tails still gather exact int64 values.
+  Copied/refused chunks retire at
   borrow release instead. Both retirement and final credit return are idempotent. Ordinary idle
   source holding is returned immediately; the next-gather reserve and progress-loan credit stay
   with the source. Bounded handoff metadata uses a prepaid 16 KiB allowance.
@@ -2037,6 +2039,11 @@ shipped-engine or stored-format change.
   codes and hashes are never treated as global equality. Translation caches handle appended
   entry prefixes, and dictionary/scratch growth overlap is charged before allocation.
   `sortDictionaries: false` selects the same-build copying control.
+  Seeded result-frame histories cover local dictionaries through explicit reclaim, real spill
+  and merge, stable wire IDs/deltas consumed after source close, and every column-detachment
+  prefix on first/later frames under cancellation or receiver failure. These histories use
+  PGlite values (including wide int64, NULLs and UTF-8) and assert account totals at handoff,
+  partial detachment, sink abort and idempotent frame-credit return.
   Large resident sorts additionally compress complete normalized key tuples into exact ranks
   when at most 32,768 distinct keys fit. Hash collisions compare every word; 128 collision
   probes or admission refusal decline ranking. Unsuitable keys retain their exact words.
