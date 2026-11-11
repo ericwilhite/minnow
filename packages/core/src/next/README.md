@@ -255,7 +255,8 @@ the visibility merge. Such whole runs are skipped without reads. For a non-null 
 primary key, verified directory lengths give exact page counts (the current block format is
 2 + 15*n bytes), so partial-run skips read only their landing block. Other certified runs drain
 one block at a time; other inputs use ordinary version resolution. No stored-format change is
-needed. B4's executor OFFSET route is separate and does not call this method yet. Memtable order is maintained by writes: an ordered
+needed. The admitted executor PK-order OFFSET route calls `skip` and fetches payloads only
+for surviving locators. Memtable order is maintained by writes: an ordered
 append prefix is implicit entry ids, and out-of-order entries use charged leaves; the first read does not collect keys or build a permutation. Run cursors read fences and
 block references lazily and decode one reusable block per input in either direction. A run's
 min/max key is a heap sentinel until that run can affect output. Directory positions are scalars:
@@ -1423,29 +1424,30 @@ with at least seven of nine pairs favouring control is an accepted regression. O
 profiles are outside the component timing; query materialization remains in whole timing.
 The report includes CPU samples, full spreads, checkpointed partial rounds, profiles and the
 actual transformed JS needed to interpret line-level ticks. No baseline is an executor path.
-Unbounded, value-producing `indexRange` nodes require the same internal `keyOrder:true`
-diagnostic opt-in as SQL while the cursor's separate admission remains outside the complete
-execution minimum. The default executor
-refuses them at prepare with `UnsupportedPlanError`, including under LIMIT zero. Opted-in
-nodes use the pinned index cursor and the same
-physical-order payload fetch. The internal `keyOrder:true` option lets a direct primary-key
-ORDER BY with LIMIT select this recipe
-without changing lowering's existing sort IR: the pinned catalog must have the complete,
-ordered, unique primary key in the requested byte collation and direction. Direct projections,
-including removal of a hidden order key, are supported; computed expressions and filters keep
-the generic recipe. LIMIT/OFFSET validation precedes cursor opening, and cursor requests are
-bounded by remaining demand. The SQL recipe skips OFFSET payload. Cursor cancellation closes
-once and drains an outstanding write before its output arena closes. Restore buffers retain
-their normal admitted minimum between batches, independently of repayable loans;
-physically monotonic cursor batches can stream payload
-without an ordinal sort. Otherwise the charged, spillable sort restores cursor order.
-The write-path cursor now merges stored runs and visible memory deltas lazily in key order,
-with charged bounded scratch. Its admission and read buffers remain separate from the
-executor's query-owned read minimum. The SQL shortcut stays off by default pending that
-integration and first-page performance acceptance; ordinary owner composition retains the
-scan/sort recipe. `--only scan_first_page_ordered --whole-compare key-order --component key-order`
-measures the opt-in implementation as a Node diagnostic.
-The diagnostic cursor/fetch recipe also remains outside the complete query-owned read-minimum proof used by ordinary scans.
+Unbounded, value-producing `indexRange` IR remains behind the internal `keyOrder:true`
+diagnostic opt-in. Ordinary SQL selects the admitted index recipe for a direct, complete
+primary-key ORDER BY with LIMIT or OFFSET, including OFFSET without LIMIT. The pinned
+catalog must certify the same unique key columns, byte collation and direction. Direct
+projections are supported; row-locking intent, filters, computed ordering, partial keys, mixed
+directions and readers without `planRange` retain the generic scan/sort recipe. This exclusion
+does not add row locks; the SQL guide documents the current locking semantics.
+
+The executor plans the cursor once and atomically reserves its minimum with payload reads,
+locator buffers, ordinal restoration, parameters and result delivery. It opens once with its
+dedicated grant; the cursor never self-admits. LIMIT and OFFSET are both validated before
+opening, including LIMIT zero. OFFSET uses the visibility-safe cursor `skip` operation;
+only surviving locators reach payload fetch. Close drains pending skip/next before releasing
+the cursor grant. Payload sizing uses conservative metadata for every reachable source,
+including publication-safe memory read hints. If the optional recipe's complete minimum
+cannot fit, execution retains the generic plan before opening any producer.
+
+Payload fetches run in physical page order. Monotonic batches stream directly; otherwise a
+charged, spillable ordinal sort restores the surviving rows' key order. This does not sort
+the complete input. Explicit diagnostic IR and legacy readers remain outside this admitted
+SQL recipe. `scripts/next-executor-quiet.mts` compares complete frozen parent/candidate cores,
+with nine adjacent AB/BA pairs, full untimed output checks and R type 7 paired IQR judgement.
+Its `--check` mode uses seven rows and requests no CPU samples. Actual timing requires the
+quiet-host runner; no first-page target is claimed from loaded-host correctness runs.
 The optional index recipe includes integer parameter bytes when checking its fixed minimum;
 other input kinds retain the generic recipe. Zero still admits and binds all inputs through
 the normal reservation path, with no operator entries or opened input.

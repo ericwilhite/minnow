@@ -8,7 +8,7 @@ import { currentEngine } from "../../testing/differential-current.js";
 import { StorageCore } from "./storage-core.js";
 import { oracleRows } from "./differential-adapter.js";
 import type { Snapshot } from "../access/snapshot.js";
-import type { IndexReader } from "../access/key-index.js";
+import type { IndexReader, IndexCursor } from "../access/key-index.js";
 import { OutputArena } from "../exec/kernels/vectors.js";
 import { packLocator } from "../vector/locator.js";
 import { currentNullBoundRefusal } from "./divergences.js";
@@ -69,16 +69,17 @@ it.each(seedsFor("next-executor-key-order", [0xe101, 0xe102]))(
       "negative",
       "overflow",
       "cursor",
+      "admitted SQL cursor",
       "early-stop",
       "closed",
       "explicit-IR",
       "lowered-sort",
       "null-refusal-registered",
     ]);
-    const stats = { opens: 0, closes: 0, rows: 0, capacity: 0 };
+    const stats = { opens: 0, closes: 0, rows: 0, capacity: 0, admitted: 0 };
     let explicit = false;
-    const executor = createExecutor({ keyOrder: true });
-    const prepare = executor.prepare.bind(executor);
+    const executor = createExecutor();
+    const diagnostic = createExecutor({ keyOrder: true });
     core.executor.prepare = (plan) => {
       let physical = plan;
       if (
@@ -118,7 +119,7 @@ it.each(seedsFor("next-executor-key-order", [0xe101, 0xe102]))(
           },
         };
       }
-      const prepared = prepare(physical);
+      const prepared = (explicit ? diagnostic : executor).prepare(physical);
       return {
         ...prepared,
         execute: (request) => {
@@ -129,26 +130,40 @@ it.each(seedsFor("next-executor-key-order", [0xe101, 0xe102]))(
               if (name === "index")
                 return (...args: Parameters<Snapshot["index"]>): IndexReader => {
                   const reader = target.index(...args);
+                  const observe = (cursor: IndexCursor): IndexCursor => {
+                    stats.opens++;
+                    return {
+                      skip: cursor.skip.bind(cursor),
+                      next(out) {
+                        stats.capacity = Math.max(stats.capacity, out.length);
+                        const done = (n: number) => {
+                          stats.rows += n;
+                          return n;
+                        };
+                        const result = cursor.next(out);
+                        return result instanceof Promise ? result.then(done) : done(result);
+                      },
+                      close() {
+                        stats.closes++;
+                        cursor.close();
+                      },
+                    };
+                  };
                   return {
                     def: reader.def,
                     probe: reader.probe.bind(reader),
-                    range: (range, direction) => {
-                      const cursor = reader.range(range, direction);
-                      stats.opens++;
+                    range: (range, direction) => observe(reader.range(range, direction)),
+                    planRange: (range, direction) => {
+                      const plan = reader.planRange?.(range, direction);
+                      if (!plan) throw new Error("Native admitted index plan required");
                       return {
-                        skip: cursor.skip.bind(cursor),
-                        next(out) {
-                          stats.capacity = Math.max(stats.capacity, out.length);
-                          const done = (n: number) => {
-                            stats.rows += n;
-                            return n;
-                          };
-                          const result = cursor.next(out);
-                          return result instanceof Promise ? result.then(done) : done(result);
-                        },
-                        close() {
-                          stats.closes++;
-                          cursor.close();
+                        minimumBytes: plan.minimumBytes,
+                        open(options) {
+                          expect(
+                            options.budget.held - options.budget.allocated,
+                          ).toBeGreaterThanOrEqual(plan.minimumBytes);
+                          stats.admitted++;
+                          return observe(plan.open(options));
                         },
                       };
                     },
@@ -250,7 +265,7 @@ it.each(seedsFor("next-executor-key-order", [0xe101, 0xe102]))(
             const small = projection && !useIR;
             explicit = useIR;
             reach.beginHistory();
-            Object.assign(stats, { opens: 0, closes: 0, rows: 0, capacity: 0 });
+            Object.assign(stats, { opens: 0, closes: 0, rows: 0, capacity: 0, admitted: 0 });
             const table = ["m", "s", "x", "e", "d"][state],
               limit = bounds[li],
               offset = bounds[oi];
@@ -273,6 +288,7 @@ it.each(seedsFor("next-executor-key-order", [0xe101, 0xe102]))(
               const result = await core.execute(sql, args);
               if (!("batches" in result)) throw new Error("query result");
               const actual = oracleRows(result);
+              if (!useIR && stats.admitted > 0) reach.reach("admitted SQL cursor");
               expect(actual).toEqual(expected);
               if (actual.length > 0) {
                 reach.reach(small ? "projected-payload" : "wide-payload");

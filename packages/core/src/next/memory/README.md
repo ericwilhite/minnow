@@ -206,9 +206,10 @@ step fails its API-boundary assertion; a mutant omitting output charge fails bef
 caller observes uncharged buffers. Provider-level layout, I/O cancellation and publication
 invariance tests live in `write/memory-read.test.ts`.
 
-Direct legacy operator fixtures and the opt-in diagnostic key-order fetch can omit
-the bounded option and retain the old borrow API. The latter is off in ordinary SQL and
-is outside this production proof until its query-owned read admission is integrated. The structural page-sizing helper keeps its conservative legacy fallback for
+Direct legacy operator fixtures and explicitly opted-in legacy index readers can omit
+the bounded option and retain the old borrow API. Ordinary SQL requires a planned cursor
+with a dedicated grant admitted atomically with its bounded payload read and downstream
+minimums; pending cursor calls drain before that grant closes. The structural page-sizing helper keeps its conservative legacy fallback for
 such callers without `readHint`; production access segments always provide hints.
 That fallback is not a production proof, and no semantic oracle or R21 waiver is used.
 
