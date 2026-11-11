@@ -326,6 +326,7 @@ function lowerLiteral(expression: Extract<Expression, { kind: "literal" }>): Typ
       case "date":
         return { expr: dateLiteral(parseDate(text)), nullable: false, big: false };
       case "json":
+      case "jsonb":
         // JSON_TABLE literals have already crossed the shipped front end's
         // normalizer. It cannot supply their original number spelling to the raw JSON core.
         throw unsupported("function", "front-end materialized JSON without source spelling");
@@ -335,10 +336,8 @@ function lowerLiteral(expression: Extract<Expression, { kind: "literal" }>): Typ
         return { expr: nativeInterval(fields), nullable: false, big: false };
       }
       case "time":
-      case "uuid":
-      case "jsonb": {
-        const type: PhysicalType =
-          domain.kind === "jsonb" ? { kind: "json", binary: true } : { kind: domain.kind };
+      case "uuid": {
+        const type: PhysicalType = { kind: domain.kind };
         return {
           expr: { op: "cast", input: textLiteral(text), type },
           nullable: false,

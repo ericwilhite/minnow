@@ -21,8 +21,8 @@ export function jsonLiteralBytes(value: unknown): number {
 }
 
 /** Follow documents through relational projections before promising an input-sized workspace.
- * Parameters, init plans and expanding scalar producers need the future growth admission API.
- * Key expressions do not grow the result and are deliberately outside this check. */
+ * Document parameters, init plans and foreign expanding producers remain outside the
+ * accepted source forms. Selector keys are deliberately outside this provenance check. */
 export function jsonInputsBounded(expr: ScalarExpr, input: Rel): boolean {
   const column = (rel: Rel, index: number): boolean => {
     switch (rel.op) {
@@ -84,6 +84,13 @@ export function jsonInputsBounded(expr: ScalarExpr, input: Rel): boolean {
       origin(expr.args[0], input) &&
       expr.args.every((arg) => jsonInputsBounded(arg, input))
     );
+  if (
+    expr.op === "cast" &&
+    expr.type.kind === "text" &&
+    expr.input.type.kind === "json" &&
+    expr.input.type.binary
+  )
+    return origin(expr.input, input) && jsonInputsBounded(expr.input, input);
   if (expr.op === "cast" && expr.type.kind === "json" && expr.input.type.kind === "text")
     return origin(expr.input, input) && jsonInputsBounded(expr.input, input);
   for (const value of Object.values(expr)) {
@@ -100,4 +107,31 @@ export function jsonInputsBounded(expr: ScalarExpr, input: Rel): boolean {
     }
   }
   return true;
+}
+
+/** Only retaining ancestors participate in a JSON cut. A live descendant can be
+ * awaiting the cut's finish(), and must never be checkpointed from that same cut. */
+export function jsonRetainingParents(root: Rel): {
+  readonly supported: ReadonlySet<number>;
+  readonly excepts: ReadonlyMap<number, ReadonlySet<number>>;
+} {
+  const supported = new Set<number>(),
+    excepts = new Map<number, ReadonlySet<number>>();
+  const visit = (rel: Rel, allowed: boolean, ancestors: readonly number[]): void => {
+    if (allowed) {
+      supported.add(rel.id);
+      excepts.set(rel.id, new Set(ancestors));
+    }
+    const next = allowed && rel.op !== "join" && rel.op !== "window";
+    if ("input" in rel) visit(rel.input, next, ancestors);
+    if ("left" in rel && "right" in rel) {
+      visit(rel.left, false, ancestors);
+      visit(rel.right, false, ancestors);
+    }
+    if ("inputs" in rel)
+      for (const input of rel.inputs)
+        visit(input, next && rel.kind === "except", [...ancestors, rel.id]);
+  };
+  visit(root, true, []);
+  return { supported, excepts };
 }
