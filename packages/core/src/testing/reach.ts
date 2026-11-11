@@ -3221,6 +3221,11 @@ export const JSONB_CANONICAL_REACH = [
 
 /** Fragmented JSON checkpoints restore a single admitted row under independent pressure. */
 export const JSONB_WIDE_REACH = [
+  "multi-byte UTF8",
+  "observed byte progress",
+  "observed fragment progress",
+  "UTF8 fan-out megabyte",
+  "multiple payload fragments",
   "large parameter at cap",
   "stored source",
   "zero source",
@@ -3298,4 +3303,12 @@ export const JSONB_ERROR_ORDER_REACH = [
   "SQLSTATE 22P02",
   "SQLSTATE 22P05",
   "SQLSTATE 22003",
+] as const;
+
+/** Only native byte/fragment/result advancement keeps the JSONB pressure deadline alive. */
+export const JSONB_WIDE_DEADLINE_REACH = [
+  "productive work",
+  "past old total deadline",
+  "stalled work cancelled",
+  "returned timer owners",
 ] as const;
