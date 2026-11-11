@@ -2612,6 +2612,18 @@ not require a home cache directory.
   with result descriptors, read and write sets and its statistics basis; a catalog change; or a
   transaction or utility command. `lowerer.ts` lists the front-end passes that are kept and the
   code that lowering replaces.
+- CTAS data-clause candidate matching uses an anchored prefix, a backward whitespace scan
+  and one bounded AS search. It preserves qualified/quoted names, optional column lists and
+  comment spellings without duplicating identifier grammar. Small generated valid headers
+  match the former regex's clause decision. The parsed statement must then be CTAS:
+  PostgreSQL's 42601 is the oracle for ordinary CREATE TABLE false positives with AS inside
+  names, literals or comments. The former unbounded lookbehind was quadratic on Node 22 even
+  for unrelated SELECT statements. The generated inactive-envelope campaign keeps its original
+  seeds, six histories per seed and million-byte literals; a parent process gives the whole
+  campaign a 90-second deadline that also catches synchronous stalls, including child startup.
+  The child retains the original 60-second per-test limits and Reach checks; the parent allows
+  120 seconds to report and clean up. It runs the invoking Node executable with owned temporary
+  files under `os.tmpdir()`.
 - Pure and synchronous; the owner caches by (text, catalog version, `parameterTypes` when sent)
   and re-lowers when `statisticsDrifted` says the data moved. A plan whose shape no statistics
   decided (a unique-key lookup, a lone scan) has an empty `basis`, so its hit skips the check.

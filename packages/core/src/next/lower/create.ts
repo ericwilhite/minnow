@@ -49,6 +49,7 @@ import {
 import { resultColumn } from "./result.js";
 import { lowerTableRules } from "./rules.js";
 import { classifyStatement } from "./statement.js";
+import { ctasDataClause } from "./ctas.js";
 
 /** PostgreSQL settings SHOW answers with the current engine's fixed values. */
 const SETTINGS: Readonly<Record<string, string>> = {
@@ -74,8 +75,6 @@ const SETTINGS: Readonly<Record<string, string>> = {
  * The query of `CREATE TABLE [IF NOT EXISTS] name AS query`, as written: the compiled statement
  * keeps no text of it, and its follow-up INSERT must lower it again at the new catalog version.
  */
-/** A trailing `WITH DATA` / `WITH NO DATA` of CREATE TABLE AS (group 1 is `NO`). */
-const CTAS_DATA = /(?<=^\s*CREATE\s+TABLE\b[\s\S]*\bAS\b[\s\S]*)\s+WITH\s+(NO\s+)?DATA\s*;?\s*$/iu;
 
 function ctasQueryText(text: string): string {
   const match =
@@ -230,10 +229,14 @@ const TRANSACTION_ACTIONS = {
 function lowerStatement(text: string, context: LoweringContext): LoweredStatement {
   // CREATE TABLE … AS … WITH [NO] DATA: the front end does not parse the clause (and keeps
   // refusing it); lowering strips it and decides whether the follow-up INSERT runs.
-  const ctasData = CTAS_DATA.exec(text);
+  const ctasData = ctasDataClause(text);
   const source = ctasData === null ? text : text.slice(0, ctasData.index);
-  const noData = ctasData?.[1] !== undefined;
+  const noData = ctasData?.noData ?? false;
   const parsed = parseAny(source);
+  // Candidate matching deliberately preserves the legacy header grammar. Only the
+  // parsed statement kind distinguishes CTAS from AS inside ordinary DDL names/defaults.
+  if (ctasData !== null && ("query" in parsed || parsed.statement.kind !== "create-table-as"))
+    throw new PlanningError("WITH [NO] DATA requires CREATE TABLE AS", "42601");
   if ("query" in parsed) return lowerSelect(text, parsed.query, context);
   const statement = parsed.statement;
   const statementClass = classifyStatement(statement);

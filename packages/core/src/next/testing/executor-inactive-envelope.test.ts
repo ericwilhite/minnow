@@ -7,11 +7,22 @@ import { seedsFor } from "../../testing/seeds.js";
 import { StreamDictionaries } from "../owner/frame.js";
 import { Governor } from "../memory/governor.js";
 import { ChunkReader } from "../page/reader.js";
-import { StorageCore } from "./storage-core.js";
+import { inactiveEnvelopeChild } from "./inactive-envelope-deadline.test.fixture.js";
 
-it.each(seedsFor("next-inactive-aggregate-envelope", [0xb4df, 0xb4e0]))(
+// The child runs the entire unchanged campaign once, including normal Reach assertions.
+const child = process.env.MINNOW_INACTIVE_ENVELOPE_CHILD === "1";
+const seeds = seedsFor("next-inactive-aggregate-envelope", [0xb4df, 0xb4e0]);
+let boundedCampaign: Promise<void> | undefined;
+it.each(seeds)(
   "sizes only active aggregate envelopes beside a live EXCEPT input (seed %i)",
   async (seed) => {
+    if (!child) {
+      boundedCampaign ??= inactiveEnvelopeChild(seeds);
+      await boundedCampaign;
+      return;
+    }
+    // Keep the parent watchdog independent of the SQL front-end module graph.
+    const { StorageCore } = await import("./storage-core.js");
     const reach = createReach("inactive aggregate envelope", [
       "sorted zero",
       "unordered zero",
@@ -117,5 +128,5 @@ it.each(seedsFor("next-inactive-aggregate-envelope", [0xb4df, 0xb4e0]))(
       await core.close();
     }
   },
-  60000,
+  child ? 60000 : 120000,
 );
