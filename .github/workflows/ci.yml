@@ -313,14 +313,14 @@ jobs:
   engines-floor-part:
     name: Unit tests on the oldest supported Node (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # The whole unit suite without coverage, in two shards. Node 22 runs the fake-indexeddb
-    # simulator seeds about twice as slowly as 24 (40-76 s each); 0.16.0's whole suite passed in
-    # 20 minutes there on one runner.
+    # The whole unit suite without coverage, in three shards. Node 22 runs the fake-indexeddb
+    # simulator seeds about twice as slowly as 24 (40-76 s each); with the rebuild's suites two
+    # shards took ~25 of their 30 minutes and one overran on 2026-11-11.
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        shard: [1/2, 2/2]
+        shard: [1/3, 2/3, 3/3]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -335,7 +335,7 @@ jobs:
       # after that shard's other files, as in a whole run.
       - run: npm run test:unit -- --shard=${{ matrix.shard }}
 
-  # Preserve the stable check name for the oldest-Node gate: it passes only when both shards did.
+  # Preserve the stable check name for the oldest-Node gate: it passes only when every shard did.
   engines-floor:
     name: Unit tests on the oldest supported Node
     if: always()
