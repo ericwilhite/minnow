@@ -251,7 +251,8 @@ the visibility merge. Such whole runs are skipped without reads. For a non-null 
 primary key, verified directory lengths give exact page counts (the current block format is
 2 + 15*n bytes), so partial-run skips read only their landing block. Other certified runs drain
 one block at a time; other inputs use ordinary version resolution. No stored-format change is
-needed. B4's executor OFFSET route is separate and does not call this method yet. Memtable order is maintained by writes: an ordered
+needed. The admitted executor PK-order OFFSET route calls `skip` and fetches payloads only
+for surviving locators. Memtable order is maintained by writes: an ordered
 append prefix is implicit entry ids, and out-of-order entries use charged leaves; the first read does not collect keys or build a permutation. Run cursors read fences and
 block references lazily and decode one reusable block per input in either direction. A run's
 min/max key is a heap sentinel until that run can affect output. Directory positions are scalars:
@@ -1423,8 +1424,9 @@ Unbounded, value-producing `indexRange` IR remains behind the internal `keyOrder
 diagnostic opt-in. Ordinary SQL selects the admitted index recipe for a direct, complete
 primary-key ORDER BY with LIMIT or OFFSET, including OFFSET without LIMIT. The pinned
 catalog must certify the same unique key columns, byte collation and direction. Direct
-projections are supported; filters, computed ordering, partial keys, mixed directions and
-readers without `planRange` retain the generic scan/sort recipe.
+projections are supported; row-locking intent, filters, computed ordering, partial keys, mixed
+directions and readers without `planRange` retain the generic scan/sort recipe. This exclusion
+does not add row locks; the SQL guide documents the current locking semantics.
 
 The executor plans the cursor once and atomically reserves its minimum with payload reads,
 locator buffers, ordinal restoration, parameters and result delivery. It opens once with its

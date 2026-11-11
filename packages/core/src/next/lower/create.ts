@@ -123,6 +123,7 @@ function physicalPlan(
     initPlans: [...plan.builder.initPlans],
     catalogVersion: catalog.version,
     volatile: plan.state.volatile,
+    hasRowLocking: plan.builder.rowLocking !== undefined,
   };
 }
 

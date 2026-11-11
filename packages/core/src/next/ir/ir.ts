@@ -506,6 +506,8 @@ export type MergeAction =
 
 export interface PhysicalPlan {
   readonly root: Rel;
+  /** SQL locking intent excludes access-route shortcuts; it does not implement row locks. */
+  readonly hasRowLocking?: boolean;
   /** Visible output: names and types, in order. */
   readonly columns: readonly OutputColumn[];
   /** Type of every parameter slot: user placeholders first, then lowering's own slots. */

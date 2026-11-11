@@ -245,6 +245,7 @@ export function orderedSort(plan: PhysicalPlan): {
   columns: readonly number[];
   keys: readonly number[];
 } | null {
+  if (plan.hasRowLocking) return null;
   let root = plan.root;
   const trims: Array<Extract<Rel, { op: "project" }>> = [];
   while (root.op === "project") {
