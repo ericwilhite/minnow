@@ -17,12 +17,44 @@ it.each([0, 1, 129, 8193, 32769])(
       "readwrite",
       "strict",
       (tx) => {
-        for (const name of ["data", "log"])
-          for (let i = 0; i < records; i++) {
-            const offset = i * 4096;
+        // fake-indexeddb shifts its pending-request array. Enqueuing 131,076 requests at
+        // once makes fixture creation quadratic; keep the same single transaction and data,
+        // but issue the next batch from a request callback while the transaction is active.
+        const names = ["data", "log"] as const;
+        let space = 0,
+          at = 0;
+        const seedBatch = () => {
+          const name = names[space];
+          if (name === undefined || records === 0) return;
+          const end = Math.min(records, at + 512);
+          for (; at < end; at++) {
+            const offset = at * 4096;
             tx.store(name).put(offset, { offset, bytes: new ArrayBuffer(8) });
             tx.store(`${name}-index`).put(offset, { offset, length: 8 });
           }
+          tx.store(`${name}-index`).get((at - 1) * 4096, () => {
+            if (at === records) {
+              space++;
+              at = 0;
+            }
+            seedBatch();
+          });
+        };
+        seedBatch();
+      },
+    );
+    // Fixture checks are outside the reopen counters. Prove batching kept every key in all
+    // four stores, including the 32,769-record case that exceeded the setup deadline.
+    await raw.transaction(
+      ["data", "data-index", "log", "log-index"],
+      "readonly",
+      "relaxed",
+      (tx) => {
+        for (const name of ["data", "data-index", "log", "log-index"])
+          tx.store(name).getAllKeys({}, (keys) => {
+            expect(keys).toHaveLength(records);
+            expect(keys.every((key, index) => key === index * 4096)).toBe(true);
+          });
       },
     );
     raw.close();

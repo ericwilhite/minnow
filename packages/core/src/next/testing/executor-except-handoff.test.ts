@@ -11,6 +11,7 @@ import type { Execution, PreparedPlan } from "../exec/executor.js";
 import { Governor } from "../memory/governor.js";
 import { ChunkReader } from "../page/reader.js";
 import { ScratchSpillService } from "../spill/scratch-spill.js";
+import { SCRATCH_CONTROL_BYTES } from "../spill/scratch-ranges.js";
 import { FileScratch } from "../storage/file-store.js";
 import { MemoryFile } from "../storage/memory-store.js";
 import type { Batch } from "../vector/vector.js";
@@ -146,11 +147,18 @@ it.each(seedsFor("next-except-aggregate-handoff", [0xb4d3, 0xb4d4]))(
               prepared = core.prepare(sql),
               governor = new Governor(32 << 20),
               snapshot = core.harness.path.pin();
+            const spillControl = await governor.admit({
+              label: "shared scratch metadata",
+              minimumBytes: SCRATCH_CONTROL_BYTES,
+              spillable: false,
+            });
             const spill = new ScratchSpillService(
               new FileScratch(
                 new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null }),
                 () => undefined,
+                new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null }),
               ),
+              { budget: spillControl },
             );
             const pinned = await governor.admit({
               label: "pinned EXCEPT competitor",
@@ -264,6 +272,7 @@ it.each(seedsFor("next-except-aggregate-handoff", [0xb4d3, 0xb4d4]))(
               if (execution) await Promise.allSettled([execution.executed, execution.delivered]);
               snapshot.release();
               await spill.close();
+              spillControl.close();
             }
             expect(governor.usedBytes).toBe(0);
             expect(spill.bytesInUse).toBe(0);

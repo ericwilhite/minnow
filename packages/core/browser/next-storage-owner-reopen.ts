@@ -278,7 +278,13 @@ async function recoverRealStorage(
   await finish("recovery");
   const scratch = backend.scratch(lease);
   if (scratch === null) throw new Error("Native benchmark requires scratch storage");
+  const spillControl = await governor.admit({
+    label: "scratch allocator",
+    minimumBytes: 20 * 1024,
+    spillable: true,
+  });
   const spill = new ScratchSpillService(scratch, {
+    budget: spillControl,
     memory: governor.registerCache({ evictableBytes: 0, evict: () => 0 }),
   });
   await spill.sweep();
@@ -296,6 +302,7 @@ async function recoverRealStorage(
       if (trace !== undefined) trace.phase = "cleanup";
       await path.close();
       await spill.close();
+      spillControl.close();
       await space.close();
       startup.close();
       await session.close();

@@ -9,6 +9,7 @@ import { QueryRuntime } from "../exec/run.js";
 import { createReach } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { ScratchSpillService } from "../spill/scratch-spill.js";
+import { SCRATCH_CONTROL_BYTES } from "../spill/scratch-ranges.js";
 import { FileScratch } from "../storage/file-store.js";
 import { MemoryFile } from "../storage/memory-store.js";
 import { Governor } from "../memory/governor.js";
@@ -19,19 +20,74 @@ import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
 import { byteSliceEquals } from "./byte-equality.test.fixture.js";
 
-async function deadline<T>(work: Promise<T>): Promise<T> {
+/** Liveness guard: productive FIFO phases may take more than 30 seconds in total. */
+async function deadline<T>(work: Promise<T>, activity: Set<() => void>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const reset = () => {
+    clearTimeout(timer);
+    timer = setTimeout(
+      () => rejectStall(new Error("Concurrent SQL phase progress stalled")),
+      30000,
+    );
+  };
+  let rejectStall: (error: Error) => void = () => undefined;
   try {
-    return await Promise.race([
-      work,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error("Concurrent SQL phase progress stalled")), 30000);
-      }),
-    ]);
+    const stalled = new Promise<never>((_, reject) => {
+      rejectStall = reject;
+    });
+    activity.add(reset);
+    reset();
+    return await Promise.race([work, stalled]);
   } finally {
+    activity.delete(reset);
     clearTimeout(timer);
   }
 }
+
+it("keeps productive phase waits alive and still rejects 30 seconds without progress", async () => {
+  vi.useFakeTimers();
+  const activity = new Set<() => void>();
+  let complete: () => void = () => undefined;
+  try {
+    const work = new Promise<void>((resolve) => {
+      complete = resolve;
+    });
+    let outcome = "pending";
+    const waiting = deadline(work, activity).then(
+      () => {
+        outcome = "complete";
+      },
+      () => {
+        outcome = "stalled";
+      },
+    );
+    await vi.advanceTimersByTimeAsync(29000);
+    for (const advance of activity) advance();
+    await vi.advanceTimersByTimeAsync(29000);
+    expect(outcome).toBe("pending");
+    complete();
+    await waiting;
+    expect(outcome).toBe("complete");
+    expect(activity.size).toBe(0);
+
+    let failure: unknown;
+    const stalled = deadline(new Promise<never>(() => undefined), activity).catch(
+      (error: unknown) => {
+        failure = error;
+      },
+    );
+    await vi.advanceTimersByTimeAsync(29999);
+    expect(failure).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(failure).toEqual(new Error("Concurrent SQL phase progress stalled"));
+    await stalled;
+    expect(activity.size).toBe(0);
+  } finally {
+    complete();
+    vi.useRealTimers();
+  }
+});
+
 const canonical = (rows: ReadonlyArray<Record<string, unknown>>) =>
   rows
     .map((r) => ({
@@ -41,28 +97,40 @@ const canonical = (rows: ReadonlyArray<Record<string, unknown>>) =>
       a: r.a === null ? null : Number(r.a),
     }))
     .sort((a, b) => a.g - b.g);
-async function consume(prepared: PreparedPlan, execution: Execution, bytes: Uint8Array) {
+async function consume(
+  prepared: PreparedPlan,
+  execution: Execution,
+  bytes: Uint8Array,
+  advance: () => void = () => undefined,
+) {
   const batches: Batch[] = [];
   for (;;) {
     const frame = await execution.results.next();
     if (!frame) break;
     try {
-      const payload = structuredClone(frame.payload),
+      const payload = frame.payload,
         marker = payload.columns.at(-1);
       if (marker?.form !== "flat" || marker.data.layout !== "varlen")
         throw new Error("Expected owned byte parameter above aggregate");
       for (let row = 0; row < payload.rowCount; row++) {
         const from = marker.data.offsets[row] ?? 0,
           to = marker.data.offsets[row + 1] ?? from;
-        expect(to - from).toBe(bytes.length);
+        if (to - from !== bytes.length)
+          throw new Error(
+            `Owned parameter length differs at row ${String(row)}: ${String(to - from)} != ${String(bytes.length)}`,
+          );
         // Compare every byte without a JS callback per byte. Large parameters repeated
         // across many output groups otherwise dominate this liveness test's CPU budget.
-        expect(byteSliceEquals(marker.data.bytes, from, bytes)).toBe(true);
+        if (!byteSliceEquals(marker.data.bytes, from, bytes))
+          throw new Error(`Owned parameter bytes differ at row ${String(row)}`);
       }
+      // Verify the parameter under the frame lease, then copy only result columns retained
+      // by the PG oracle. Cloning a large repeated marker copies bytes we immediately discard.
+      const columns = structuredClone(payload.columns.slice(0, -1));
       batches.push({
         length: payload.rowCount,
         selection: null,
-        columns: payload.columns.slice(0, -1).map((column, i) => {
+        columns: columns.map((column, i) => {
           const type = prepared.columns[i]?.type;
           if (column.form !== "flat" || !type) throw new Error("Expected owned aggregate result");
           return { ...column, type };
@@ -70,6 +138,7 @@ async function consume(prepared: PreparedPlan, execution: Execution, bytes: Uint
       });
     } finally {
       frame.release();
+      advance();
     }
   }
   await execution.executed;
@@ -199,7 +268,10 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
             reach.beginHistory();
             const prepared = core.prepare(sql(shape, true, filtered)),
               resident = core.prepare(sql(shape, true, filtered, true)),
-              governor = new Governor(24 << 20),
+              // Preserve the original operator headroom after the shared owner's prepay
+              // and the governor's one-eighth progress reserve (at most one byte rounding).
+              sharedMinimum = grouped ? SCRATCH_CONTROL_BYTES : 0,
+              governor = new Governor(Math.ceil(((((24 << 20) * 7) / 8 + sharedMinimum) * 8) / 7)),
               pinned = await governor.admit({
                 label: "temporarily pinned competitor",
                 minimumBytes: 0,
@@ -208,12 +280,26 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
               snapshot = core.harness.path.pin(),
               executions: Execution[] = [],
               jobs: Array<Promise<unknown>> = [];
-            const scratch = grouped
+            const activity = new Set<() => void>(),
+              advance = () => {
+                for (const notify of activity) notify();
+              };
+            const spillControl = grouped
+              ? await governor.admit({
+                  label: "shared scratch metadata",
+                  minimumBytes: SCRATCH_CONTROL_BYTES,
+                  spillable: false,
+                })
+              : null;
+            const scratch = spillControl
               ? new ScratchSpillService(
                   new FileScratch(
                     new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null }),
-                    () => undefined,
+                    // Synchronous scratch I/O during cancellation is real cleanup progress.
+                    advance,
+                    new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null }),
                   ),
+                  { budget: spillControl },
                 )
               : null;
             const spill = scratch ?? core.spill;
@@ -314,6 +400,7 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
                 } else releaseHolder();
                 return result.then((parts) => {
                   expect(snapshot.released).toBe(false);
+                  advance();
                   reach.reach("restore admission");
                   return parts;
                 });
@@ -355,7 +442,7 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
                 },
               });
               executions[i] = execution;
-              jobs[i] = consume(chosen, execution, marker).catch((error: unknown) => {
+              jobs[i] = consume(chosen, execution, marker, advance).catch((error: unknown) => {
                 // An oracle/consumer failure must not leave the producer waiting on
                 // frame credit, or a pinned test holder masking the original error.
                 execution.cancel(error);
@@ -383,9 +470,10 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
                         : new Error("Query finished without reaching its queued phase");
                     }),
                   ]),
+                  activity,
                 );
               } else for (let i = 0; i < count; i++) start(i);
-              const results = await deadline(Promise.all(jobs));
+              const results = await deadline(Promise.all(jobs), activity);
               for (let i = 0; i < results.length; i++) {
                 if (i === cancelled)
                   expect(results[i]).toMatchObject({
@@ -435,11 +523,13 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
               snapshot.release();
               try {
                 expect(spill.bytesInUse).toBe(0);
-                expect(governor.usedBytes).toBe(0);
+                expect(governor.usedBytes).toBe(spillControl?.held ?? 0);
               } finally {
                 await scratch?.close();
+                spillControl?.close();
               }
             }
+            expect(governor.usedBytes).toBe(0);
             if (scratch) reach.reach("scratch service");
             reach.reach("zero");
           },

@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { ScratchSpillService } from "./scratch-spill.js";
 import { OwnershipLostError, type DataRange } from "../storage/contract.js";
-import { CHARGE_STEP, ByteStore, IntervalIndex, type Interval } from "../storage/idb-bytes.js";
+import { ByteStore, IntervalIndex, type Interval } from "../storage/idb-bytes.js";
 import { openIndexedDb, type IdbDatabaseLike } from "../storage/idb-like.js";
 import { LOG_COALESCE_BYTES, createIndexedDbBackend } from "../storage/indexeddb.js";
 import { SimDisk, SimLocks } from "../storage/sim-disk.js";
@@ -159,7 +159,7 @@ describe("finding 1: release lists of any length", () => {
     const lease = await backend.acquire();
     const scratch = backend.scratch(lease);
     if (scratch === null) throw new Error("IndexedDB has a spill store");
-    const service = new ScratchSpillService(scratch);
+    const service = new ScratchSpillService(scratch, { budget: countingBudget(Infinity) });
     await service.sweep();
     const unbuffered = { allocate: () => false, free: (size: number) => void size };
     const first = await service.create(1, unbuffered);
@@ -285,8 +285,8 @@ describe("finding 2: the logical log end moves in call order", () => {
   });
 });
 
-describe("finding 3: the spill index is charged over the spill service's lifetime", () => {
-  it("charges while pages are held, follows releases, and returns everything at sweep and close", async () => {
+describe("finding 3: scratch never keeps a resident record directory", () => {
+  it("keeps the same 3,000-record workloads index-free through release, sweep and close", async () => {
     let used = 0;
     const memory = {
       charge(bytes: number) {
@@ -305,7 +305,7 @@ describe("finding 3: the spill index is charged over the spill service's lifetim
     });
     const scratch = backend.scratch(await backend.acquire());
     if (scratch === null) throw new Error("IndexedDB has a spill store");
-    const service = new ScratchSpillService(scratch, { memory });
+    const service = new ScratchSpillService(scratch, { memory, budget: countingBudget(Infinity) });
     expect(() => scratch.chargeTo?.(memory)).not.toThrow(); // before first use: allowed
     await service.sweep();
     expect(used).toBe(0);
@@ -320,25 +320,23 @@ describe("finding 3: the spill index is charged over the spill service's lifetim
       return [first, second] as const;
     };
     const [first, second] = await spill(1);
-    // 3,000 records: about 3,000 × 24 bytes plus blocks, in 64 KiB granules.
-    expect(used).toBeGreaterThanOrEqual(2 * CHARGE_STEP);
-    const full = used;
+    // Native predecessor lookups replace the resident index, including when registration refuses.
+    expect(used).toBe(0);
     await first.close();
-    expect(used).toBeLessThan(full);
-    expect(used).toBeGreaterThan(0);
+    expect(used).toBe(0);
     await second.close();
     expect(used).toBe(0);
     await spill(10);
-    expect(used).toBeGreaterThan(0);
+    expect(used).toBe(0);
     await service.sweep();
     expect(used).toBe(0);
     await spill(20);
-    expect(used).toBeGreaterThan(0);
+    expect(used).toBe(0);
     await service.close();
     expect(used).toBe(0);
   }, 300_000);
 
-  it("keeps working when the registration refuses: the refusal is counted as overdraft", async () => {
+  it("keeps working without an index when the registration refuses", async () => {
     const memory = { charge: () => false, release: () => undefined };
     const backend = createIndexedDbBackend({
       database: () => simIndexedDb(new SimDisk()),
@@ -347,7 +345,7 @@ describe("finding 3: the spill index is charged over the spill service's lifetim
     });
     const scratch = backend.scratch(await backend.acquire());
     if (scratch === null) throw new Error("IndexedDB has a spill store");
-    const service = new ScratchSpillService(scratch, { memory });
+    const service = new ScratchSpillService(scratch, { memory, budget: countingBudget(Infinity) });
     await service.sweep();
     const file = await service.create(1, {
       allocate: () => false,

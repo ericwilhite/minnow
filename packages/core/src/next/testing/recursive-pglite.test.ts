@@ -8,6 +8,7 @@ import { SpillFiles } from "../exec/spill-pages.js";
 import { Governor } from "../memory/governor.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { ScratchSpillService } from "../spill/scratch-spill.js";
+import { SCRATCH_CONTROL_BYTES } from "../spill/scratch-ranges.js";
 import { SimBackend, SimDisk } from "../storage/sim-disk.js";
 import { StorageCore } from "./storage-core.js";
 import { oracleRows } from "./differential-adapter.js";
@@ -115,10 +116,20 @@ it.each(seedsFor("next-recursive-spill", [0xb66e, 0xb66f]))(
               minimumBytes: 0,
               spillable: true,
             });
+          const spillControl = scratch
+            ? await governor.admit({
+                label: "shared scratch metadata",
+                minimumBytes: SCRATCH_CONTROL_BYTES,
+                spillable: false,
+              })
+            : null;
           const backend = scratch ? new SimBackend(new SimDisk()) : null,
             lease = await backend?.acquire(),
             space = lease === undefined ? null : backend?.scratch(lease),
-            spill = space ? new ScratchSpillService(space) : new MemorySpillService();
+            spill =
+              space && spillControl
+                ? new ScratchSpillService(space, { budget: spillControl })
+                : new MemorySpillService();
           const original = core.executor.prepare.bind(core.executor);
           const prepare = vi.spyOn(core.executor, "prepare").mockImplementation((plan) => {
             const prepared = original(plan);
@@ -178,6 +189,7 @@ it.each(seedsFor("next-recursive-spill", [0xb66e, 0xb66f]))(
             prepare.mockRestore();
             resident.close();
             if (spill instanceof ScratchSpillService) await spill.close();
+            spillControl?.close();
             await lease?.release();
           }
           expect(spill.bytesInUse).toBe(0);

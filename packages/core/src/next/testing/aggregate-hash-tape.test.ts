@@ -6,6 +6,7 @@ import { expect, it } from "vitest";
 import { createReach } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { ScratchSpillService } from "../spill/scratch-spill.js";
+import { SCRATCH_CONTROL_BYTES } from "../spill/scratch-ranges.js";
 import { FileScratch } from "../storage/file-store.js";
 import { MemoryFile } from "../storage/memory-store.js";
 import { Governor } from "../memory/governor.js";
@@ -209,11 +210,18 @@ it.each(seedsFor("aggregate-hash-tape-reused-extents", [0xb4cf, 0xb4d0]))(
           }),
           pool = new Pool(new Charge(grant), 2 << 20),
           pages = new PageWriter(pool),
+          spillControl = await governor.admit({
+            label: "shared scratch metadata",
+            minimumBytes: SCRATCH_CONTROL_BYTES,
+            spillable: false,
+          }),
           backend = new ScratchSpillService(
             new FileScratch(
               new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null }),
               () => undefined,
+              new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null }),
             ),
+            { budget: spillControl },
           ),
           unbuffered = {
             allocate: () => false,
@@ -292,6 +300,7 @@ it.each(seedsFor("aggregate-hash-tape-reused-extents", [0xb4cf, 0xb4d0]))(
           await hole.close();
           await fence?.close();
           await backend.close();
+          spillControl.close();
           directory.detach();
           pages.close();
           pool.close();

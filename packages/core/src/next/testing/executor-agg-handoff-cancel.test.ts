@@ -11,6 +11,7 @@ import type { Execution } from "../exec/executor.js";
 import { Governor } from "../memory/governor.js";
 import { ChunkReader } from "../page/reader.js";
 import { ScratchSpillService } from "../spill/scratch-spill.js";
+import { SCRATCH_CONTROL_BYTES } from "../spill/scratch-ranges.js";
 import type { SpillService } from "../spill/contract.js";
 import { FileScratch } from "../storage/file-store.js";
 import { MemoryFile } from "../storage/memory-store.js";
@@ -57,11 +58,19 @@ it.each(seedsFor("next-aggregation-handoff-await-cancel", [0xb4e3, 0xb4e4]))(
       "zero before shared close",
     ]);
     const core = await new StorageCore(8192).open();
+    const governor = new Governor(24 << 20);
+    const spillControl = await governor.admit({
+      label: "shared scratch metadata",
+      minimumBytes: SCRATCH_CONTROL_BYTES,
+      spillable: false,
+    });
     const scratch = new ScratchSpillService(
       new FileScratch(
         new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null }),
         () => undefined,
+        new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null }),
       ),
+      { budget: spillControl },
     );
     try {
       await core.execute("CREATE TABLE t(v TEXT)");
@@ -82,7 +91,6 @@ it.each(seedsFor("next-aggregation-handoff-await-cancel", [0xb4e3, 0xb4e4]))(
           async (stage, microtask, parameterBytes, onScratch) => {
             reach.beginHistory();
             const spill: SpillService = onScratch ? scratch : core.spill;
-            const governor = new Governor(24 << 20);
             const competitor = await governor.admit({
               label: "temporary competing holder",
               minimumBytes: 0,
@@ -243,7 +251,7 @@ it.each(seedsFor("next-aggregation-handoff-await-cancel", [0xb4e3, 0xb4e4]))(
             }
             // Successful histories never close or sweep either shared service.
             try {
-              expect(governor.usedBytes).toBe(0);
+              expect(governor.usedBytes).toBe(spillControl.held);
               expect(spill.bytesInUse).toBe(0);
               reach.reach(onScratch ? "scratch spill" : "memory spill");
               reach.reach("zero before shared close");
@@ -266,6 +274,8 @@ it.each(seedsFor("next-aggregation-handoff-await-cancel", [0xb4e3, 0xb4e4]))(
       reach.assertReached();
     } finally {
       await scratch.close();
+      spillControl.close();
+      expect(governor.usedBytes).toBe(0);
       await core.close();
     }
   },

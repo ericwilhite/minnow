@@ -575,7 +575,7 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
       const lease = await backend.acquire();
       const scratch = backend.scratch(lease);
       if (scratch === null) throw new Error("this backend has no scratch space");
-      const service = new ScratchSpillService(scratch);
+      const service = new ScratchSpillService(scratch, { budget: countingBudget(Infinity) });
       await service.sweep();
       const file = await service.create(1, countingBudget(1 << 20));
       const refs = [];
@@ -591,6 +591,7 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
       const inUse = service.bytesInUse;
       await file.close();
       await service.sweep();
+      await service.close();
       await lease.release();
       return { pages: refs.length, inUse, after: service.bytesInUse };
     }

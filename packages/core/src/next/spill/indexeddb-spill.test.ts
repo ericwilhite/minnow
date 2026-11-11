@@ -1,6 +1,6 @@
 /** The spill service over the IndexedDB backend's `spill` store (storage/indexeddb.ts). */
 import { describe, expect, it } from "vitest";
-import { expectBytes } from "../storage/space-test-support.js";
+import { countingBudget, expectBytes } from "../storage/space-test-support.js";
 import { OwnershipLostError, type StorageBackend } from "../storage/contract.js";
 import { createIndexedDbBackend } from "../storage/indexeddb.js";
 import { SimDisk, SimLocks } from "../storage/sim-disk.js";
@@ -20,7 +20,7 @@ describe("spill on the IndexedDB spill store", () => {
     const lease = await backend.acquire();
     const scratch = backend.scratch(lease);
     if (scratch === null) throw new Error("IndexedDB has a spill store");
-    const service = new ScratchSpillService(scratch);
+    const service = new ScratchSpillService(scratch, { budget: countingBudget(Infinity) });
     await service.sweep();
     const file = await service.create(1, {
       allocate: () => false,

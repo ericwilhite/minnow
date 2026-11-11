@@ -3048,3 +3048,36 @@ export const IDB_METADATA_FAILURE_REACH = [
   "both publication oracles after every action",
   "close and reopen agreement",
 ] as const;
+
+/** Scratch ownership/free metadata is paged, including direct appends and close descriptors. */
+export const SCRATCH_METADATA_REACH = [
+  "interleaved direct appends",
+  "metadata pressure fallback",
+  "round trip",
+  "fragmented reuse",
+  "close returns charge",
+  "bounded release descriptors",
+  "metadata pages reused",
+  "release failure and sweep retry",
+  "metadata corruption refusal",
+  "nonadjacent frees beyond a metadata page",
+  "metadata namespace isolation",
+  "allocator fence",
+  "unsettled native metadata retains charge",
+] as const;
+
+/** Independent checksum and retained-object guards for scratch allocator metadata. */
+export const SCRATCH_METADATA_GUARD_REACH = [
+  "inspected private ownership across growing extent counts",
+  "constant resident inventory matches prepaid workspace",
+  "inspected bounded release bookkeeping",
+  "inspected buffers released with charge",
+  "valid aligned offset redirected into live peer",
+  "valid aligned length changed",
+  "checksum byte flipped",
+  "unused padding byte flipped",
+  "corruption refused before release and reuse",
+  "corrupted first entry position",
+  "corrupted middle entry position",
+  "corrupted last entry position",
+] as const;

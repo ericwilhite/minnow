@@ -6,6 +6,7 @@ import { createReach } from "../../testing/reach.js";
 import { Governor } from "../memory/governor.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { ScratchSpillService } from "../spill/scratch-spill.js";
+import { SCRATCH_CONTROL_BYTES } from "../spill/scratch-ranges.js";
 import { FileScratch } from "../storage/file-store.js";
 import { MemoryFile } from "../storage/memory-store.js";
 import type { FlatVector } from "../vector/vector.js";
@@ -34,16 +35,25 @@ it.each(seedsFor("next-binary-record-checkpoint", [0xb4d1, 0xb4d2]))(
         async (rows, payload) => {
           reach.beginHistory();
           for (const scratch of [false, true]) {
-            const service = scratch
+            const governor = new Governor(8 << 20);
+            const spillControl = scratch
+              ? await governor.admit({
+                  label: "shared scratch metadata",
+                  minimumBytes: SCRATCH_CONTROL_BYTES,
+                  spillable: false,
+                })
+              : null;
+            const service = spillControl
               ? new ScratchSpillService(
                   new FileScratch(
                     new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null }),
                     () => undefined,
+                    new MemoryFile({ bytes: new Uint8Array(0), size: 0, holder: null }),
                   ),
+                  { budget: spillControl },
                 )
               : new MemorySpillService();
-            const governor = new Governor(8 << 20),
-              types = [DBL, BIG, TEXT];
+            const types = [DBL, BIG, TEXT];
             const grant = await governor.admit({
               label: "old parent",
               minimumBytes: 2 << 20,
@@ -110,7 +120,8 @@ it.each(seedsFor("next-binary-record-checkpoint", [0xb4d1, 0xb4d2]))(
               old.pool.close();
               expect(grant.allocated).toBe(0);
               grant.close();
-              expect(governor.usedBytes).toBe(0);
+              // Retiring the parent frees its grant; the shared scratch owner stays live.
+              expect(governor.usedBytes).toBe(spillControl?.held ?? 0);
               reach.reach("retired");
               nextGrant = await governor.admit({
                 label: "restored parent",
@@ -163,6 +174,7 @@ it.each(seedsFor("next-binary-record-checkpoint", [0xb4d1, 0xb4d2]))(
               }
               nextGrant?.close();
               if (service instanceof ScratchSpillService) await service.close();
+              spillControl?.close();
             }
             expect(governor.usedBytes).toBe(0);
             expect(service.bytesInUse).toBe(0);

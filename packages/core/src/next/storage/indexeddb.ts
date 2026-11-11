@@ -68,6 +68,7 @@ import {
   type OwnerLease,
   type ReleaseReport,
   type ScratchSpace,
+  type ScratchMetadata,
   type StorageBackend,
   type StorageObserver,
   type StoreSession,
@@ -163,10 +164,11 @@ async function transact(
   durability: "strict" | "relaxed",
   body: (tx: IdbTransactionLike) => void,
   extra: readonly string[] = [],
+  nativeSettled?: () => void,
 ): Promise<void> {
   const stores = [...spaces.flatMap((space) => [space.name, space.indexName]), ...extra];
   try {
-    await lease.write(stores, durability, body);
+    await lease.write(stores, durability, body, nativeSettled);
   } catch (error) {
     for (const space of spaces) space.rollback();
     throw error;
@@ -1253,32 +1255,98 @@ class IdbMetadata implements MetadataCacheBacking {
 class IdbScratch implements ScratchSpace {
   readonly #lease: IdbLease;
   #space: Promise<ByteStore> | null = null;
-  /** Mutations run one after another, so the in-memory index changes in call order. */
+  /** Mutations run one after another, preserving native index and boundary state in call order. */
   #chain: Promise<void> = Promise.resolve();
-  /** The spill service's registration, charged with the record index (`chargeTo`). */
+  /** Optional backend registration. Lazy scratch keeps no resident record directory. */
   #memory: CacheMemory | null = null;
+
+  #nativePending = 0;
+  #nativeWait: Promise<void> | null = null;
+  #nativeDone: (() => void) | null = null;
+  #retainNative(): () => void {
+    this.#nativePending++;
+    let held = true;
+    return () => {
+      if (!held) return;
+      held = false;
+      if (--this.#nativePending === 0) {
+        const done = this.#nativeDone;
+        this.#nativeWait = null;
+        this.#nativeDone = null;
+        done?.();
+      }
+    };
+  }
+  #settledNative(): Promise<void> {
+    if (this.#nativePending === 0) return Promise.resolve();
+    return (this.#nativeWait ??= new Promise((resolve) => {
+      this.#nativeDone = resolve;
+    }));
+  }
 
   constructor(lease: IdbLease) {
     this.#lease = lease;
   }
 
+  metadata(): ScratchMetadata {
+    const check = (page: number, bytes: Uint8Array) => {
+      if (!Number.isSafeInteger(page) || page < 0 || bytes.byteLength !== 4096)
+        throw new RangeError("Invalid scratch metadata page");
+    };
+    return {
+      read: async (page, target) => {
+        check(page, target);
+        await this.#lease.read(
+          ["meta"],
+          (tx) =>
+            tx.store("meta").get(page, (value) => {
+              if (!(value instanceof ArrayBuffer) || value.byteLength !== target.length)
+                throw new StoreCorruptionError("Missing scratch metadata page");
+              target.set(new Uint8Array(value));
+            }),
+          this.#retainNative(),
+        );
+      },
+      write: async (page, bytes) => {
+        check(page, bytes);
+        if (bytes.byteOffset !== 0 || bytes.byteLength !== bytes.buffer.byteLength)
+          throw new TypeError("Scratch metadata requires a standalone prepaid page");
+        await this.#lease.write(
+          ["meta"],
+          "relaxed",
+          (tx) => tx.store("meta").put(page, bytes.buffer),
+          this.#retainNative(),
+        );
+      },
+      reset: async () => {
+        await this.#lease.write(
+          ["meta"],
+          "relaxed",
+          (tx) => tx.store("meta").deleteRange({ lower: 0, upper: Number.MAX_SAFE_INTEGER }),
+          this.#retainNative(),
+        );
+      },
+    };
+  }
+
   #spill(): Promise<ByteStore> {
-    this.#space ??= ByteStore.load(this.#lease.database, "spill", this.#memory);
+    this.#space ??= ByteStore.openLazy(this.#lease.database, "spill", this.#memory);
     return this.#space;
   }
 
-  /** Charges the spill record index to `memory` from now on (before first use). */
+  /** Installs backend accounting before first use; the native scratch index stays on disk. */
   chargeTo(memory: CacheMemory): void {
     if (this.#space !== null) throw new TypeError("chargeTo after the spill space was opened");
     this.#memory = memory;
   }
 
   /**
-   * Drops the resident index and returns its charge once every mutation has settled; the next
-   * use loads it again (charged again). The spill service calls this at sweep and close.
+   * Drops lazy boundary state once every mutation has settled; the next
+   * use discovers the boundaries again without materializing the record directory. The spill service calls this at sweep and close.
    */
   async dispose(): Promise<void> {
     const disposing = this.#chain.then(async () => {
+      await this.#settledNative();
       const space = this.#space;
       this.#space = null;
       if (space !== null) (await space.catch(() => null))?.close();
@@ -1290,9 +1358,16 @@ class IdbScratch implements ScratchSpace {
   #mutate(body: (spill: ByteStore, tx: IdbTransactionLike) => void): Promise<void> {
     const run = this.#chain.then(async () => {
       const spill = await this.#spill();
-      await transact(this.#lease, [spill], "relaxed", (tx) => {
-        body(spill, tx);
-      });
+      await transact(
+        this.#lease,
+        [spill],
+        "relaxed",
+        (tx) => {
+          body(spill, tx);
+        },
+        [],
+        this.#retainNative(),
+      );
     });
     this.#chain = run.catch(() => undefined);
     return run;
@@ -1311,9 +1386,13 @@ class IdbScratch implements ScratchSpace {
     const spill = await this.#spill();
     if (offset < 0 || offset + target.length > spill.end)
       throw new StoreCorruptionError("Read outside the scratch space");
-    await this.#lease.read([spill.name, spill.indexName], (tx) => {
-      spill.read(tx, offset, target, () => undefined);
-    });
+    await this.#lease.read(
+      [spill.name, spill.indexName],
+      (tx) => {
+        spill.read(tx, offset, target, () => undefined);
+      },
+      this.#retainNative(),
+    );
   }
 
   /** Chunked like `releaseData` (`RELEASE_CHUNK`, a task between transactions). */

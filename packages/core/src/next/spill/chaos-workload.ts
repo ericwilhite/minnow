@@ -379,7 +379,10 @@ export async function runChaos(
 
   // ── Spill ──────────────────────────────────────────────────────────────────────────────────
   const scratch = backend.scratch(lease);
-  const spill = scratch === null ? null : new ScratchSpillService(scratch);
+  const spill =
+    scratch === null
+      ? null
+      : new ScratchSpillService(scratch, { budget: countingBudget(Infinity) });
   await spill?.sweep();
   if (spill !== null && spill.bytesInUse !== 0) fail("the spill sweep left space in use");
 
@@ -402,6 +405,7 @@ export async function runChaos(
       clearTimeout(timer);
     }
     const started = performance.now();
+    await spill?.close();
     await session.close();
     const closed = performance.now();
     if (inject === "step-down-wake-after-close")
