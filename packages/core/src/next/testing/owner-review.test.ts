@@ -2,10 +2,18 @@
  * The adversarial probes of review B5-p2a (Astra 6, 2026-11-05), adopted into the suite. Each
  * probe states the defect it found; all must pass for the reason it names.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ProtocolClient } from "../owner/client.js";
-import { RELEASE_DELAY_MS } from "../owner/protocol.js";
+import type { Execution } from "../exec/executor.js";
 import { flushUntil, harness, raw, seed, sleep } from "./owner-harness.js";
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 
 /** A fake port for client-only probes: answers hello (and prepare) and records what is sent. */
 function fakePort(onSend: (message: Record<string, unknown>) => void = () => undefined) {
@@ -299,18 +307,83 @@ describe("frames and their charge (findings 9, 10, 12)", () => {
     ]);
   });
 
-  it("charges an autocommit write's RETURNING spool until it is delivered", async () => {
-    const { connect, writePath, governor } = harness({ autoFlush: false, planCacheSize: 0 });
-    const client = await connect();
-    const created = client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)");
-    await flushUntil(writePath, created);
-    const insert = client.query("INSERT INTO t VALUES ($1, $2, $3) RETURNING *", [1, 0, "a"]);
-    await sleep(10);
-    expect(governor.usedBytes).toBeGreaterThan(0); // the spool, before the commit is durable
-    expect((await flushUntil(writePath, insert)).rows()).toEqual([[1, 0, "a"]]);
-    await sleep(RELEASE_DELAY_MS + 10);
-    expect(governor.usedBytes).toBe(0); // released (standalone, nothing to ride on), grant closed
-  });
+  it.each([
+    { ackTurns: 0, releaseTurns: 0 },
+    { ackTurns: 1, releaseTurns: 3 },
+    { ackTurns: 3, releaseTurns: 1 },
+  ])(
+    "charges an autocommit write's RETURNING spool until it is delivered ($ackTurns/$releaseTurns)",
+    async ({ ackTurns, releaseTurns }) => {
+      const { connect, server, executor, writePath, governor } = harness({
+        autoFlush: false,
+        planCacheSize: 0,
+      });
+      const releaseReceived = deferred<() => void>();
+      const accept = server.accept.bind(server);
+      vi.spyOn(server, "accept").mockImplementation((port) => {
+        accept(port);
+        const receive = port.onmessage;
+        port.onmessage = (event) => {
+          if ((event.data as { t: string }).t === "release")
+            releaseReceived.resolve(() => receive?.(event));
+          else receive?.(event);
+        };
+      });
+      const client = await connect();
+      await flushUntil(
+        writePath,
+        client.query("CREATE TABLE t (id INT PRIMARY KEY, n INT, name TEXT)"),
+      );
+
+      const started = deferred<Execution>();
+      const acknowledge = deferred<() => void>();
+      const prepare = executor.prepare.bind(executor);
+      vi.spyOn(executor, "prepare").mockImplementation((plan) => {
+        const prepared = prepare(plan);
+        return {
+          ...prepared,
+          execute(request) {
+            const execution = prepared.execute(request);
+            const commit = execution.acknowledgeCommit.bind(execution);
+            execution.acknowledgeCommit = () => acknowledge.resolve(commit);
+            started.resolve(execution);
+            return execution;
+          },
+        };
+      });
+      const insert = client.query("INSERT INTO t VALUES ($1, $2, $3) RETURNING *", [1, 0, "a"]);
+      const execution = await started.promise;
+      await execution.executed;
+      expect(governor.usedBytes).toBe(17); // charged spool, before durable commit
+      expect(server.stats.outstandingFrames).toBe(0);
+      let delivered = false;
+      void execution.delivered.then(
+        () => {
+          delivered = true;
+        },
+        () => undefined,
+      );
+      const committed = flushUntil(writePath, insert);
+      const commit = await acknowledge.promise;
+      for (let turn = 0; turn < ackTurns; turn++) await Promise.resolve();
+      expect(delivered).toBe(false);
+      expect(governor.usedBytes).toBe(17);
+      expect(server.stats.outstandingFrames).toBe(0);
+      commit();
+      expect((await committed).rows()).toEqual([[1, 0, "a"]]);
+      const release = await releaseReceived.promise;
+      // Receipt/query completion is not delivery settlement: the release has not reached the owner.
+      for (let turn = 0; turn < releaseTurns; turn++) await Promise.resolve();
+      expect(delivered).toBe(false);
+      expect(governor.usedBytes).toBe(17);
+      expect(server.stats.outstandingFrames).toBe(1);
+      release();
+      await execution.delivered; // R2/R11: stream ended, every frame released, result grant closed
+      expect(delivered).toBe(true);
+      expect(server.stats.outstandingFrames).toBe(0);
+      expect(governor.usedBytes).toBe(0);
+    },
+  );
 });
 
 describe("cancellation and failed commits (findings 2, 4)", () => {

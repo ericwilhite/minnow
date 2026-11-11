@@ -1086,6 +1086,17 @@ To iterate on the harness, run the unit tests (`npm test`) for the generator, an
 suite rules, then `npm run test:browser:site` to run a suite in real browsers. To try a change by
 hand, `npm run site:dev` and open `/benchmarks`.
 
+## Rebuild owner RETURNING settlement
+
+Owner accounting tests distinguish receiving results from delivery settlement. Under R2/R11,
+autocommit `RETURNING` waits for commit acknowledgement under its durability mode before rows
+can flow; inside an explicit transaction rows can flow when the statement executes. The result grant stays charged
+until every frame is released. A client query may resolve while its release message is still
+batched or in transit. `Execution.delivered` is the settlement point: the stream has ended,
+every frame is released, and the result grant is closed. Accounting assertions await this
+completion, rather than an elapsed release-timer delay. The owner regression holds commit
+acknowledgement and release at explicit barriers and varies microtask ordering around both.
+
 ## Rebuild owner latency
 
 The unexported rebuild core's owner protocol has a separate, cross-origin isolated runner.
