@@ -792,7 +792,9 @@ class Int64Keys implements KeyColumn {
     const groups = this.count + rows;
     return (
       arrayGrowth(this.#keys.length / 2, groups, 8) +
-      arrayGrowth(this.#mask + 1, groups / MAX_LOAD + 1, 12, true)
+      // Int64 triples rehash at half full, unlike Int32Keys' three-quarter table.
+      // Fund the new table (including overlap) before #id can cross that boundary.
+      arrayGrowth(this.#mask + 1, 2 * groups, 12, true)
     );
   }
 
