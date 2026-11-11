@@ -3295,3 +3295,43 @@ complete parent/candidate builds and nine AB/BA pairs, median gain greater than 
 seven favorable pairs, and no reverse-rule regression on the other catalogue shapes.
 Delivered columnar frames are the acceptance clock. JS row materialization is outside that
 clock and is reported separately. No timing campaign or absolute target pass is claimed here.
+
+### Native retaining-parent checkpoints
+
+The join and window expose pressure-only native checkpoint primitives. These are
+internal operator APIs; SQL phase wiring remains a separate integration step.
+The planner must checkpoint retaining ancestors only, after the active input push
+has become ready and before a window's evaluation starts. Checkpointing a live
+descendant returning from `finish()` is invalid.
+
+`HashJoin.checkpoint()` saves build values, RIGHT/FULL match bits and deferred
+probe values. `new HashJoin(spec, context, saved)` selects its restored internal
+schema; `restore(saved)` copies the prefix into the new admitted join. A saved
+`buildComplete` means the planner must skip the already-consumed build sibling.
+Previously emitted probes and residuals are not replayed. Match bits travel with
+build values through subsequent repartitioning and chunk processing.
+
+A window opts in with `WindowSpec.checkpointable`. Its complete initial native
+minimum is `windowRetainingMinimumBytes(types, functions)`, which includes ordinal
+scratch and the sort's extra int64 column. It uses the general sort, with a hidden
+input ordinal as a final tie breaker. That ordinal is never a peer key or output
+column. `checkpoint()` saves native input values and the next ordinal before any
+frame transition has run. `restore(saved)` preserves peer and floating ROWS order.
+The ordinary grouped window path remains available to other windows.
+
+Descriptor `minimumBytes` and `restoreLoanSlots` are **additional** to the normal
+recipe. Window restore needs admitted ordinary reader/copy workspace; it cannot
+borrow while another private step is retained. Join restore uses its ordinary
+native I/O lane and reports its bounded progress requirement. Descriptors contain
+files, types and scalar continuation data, with no old grant, vector, parameter
+binding or operator. Saved files close only after successful copying; a controller
+must retain cleanup ownership on failure. Late directory writes are included in
+spill accounting. Cancellation drains checkpoint reads/writes before old credit
+is released, and descriptor close drains every owner before reporting failures.
+
+The native generated suites compare two successive restores with PGlite, including
+observed spills, all join kinds, match bits, window peers, non-associative float
+sums, NULLs, dictionaries and selections. Separate gated I/O histories cover
+cancellation, injected failures and concurrent saved-file closure. These operator
+checks do not replace end-to-end JSON/aggregate phase admission, snapshot, demand
+or consumed-source checks in the phase planner.

@@ -3511,4 +3511,46 @@ export const WINDOW_TOPK_LIFECYCLE_REACH = [
   "queued loan cancellation",
   "complete legacy step refused",
   "zero resources",
+
+/** Native retaining-parent continuation and ownership histories. */
+export const RETAINED_JOIN_REACH = [
+  "build cut",
+  "probe cut",
+  "resident",
+  "spilled",
+  "multiple cuts",
+  "NULL keys",
+  "duplicates",
+  "keyless residual",
+  "ON residual",
+  "right/full match bits",
+  "zero resources",
+] as const;
+
+/** Native retaining-parent continuation and ownership histories. */
+export const RETAINED_WINDOW_REACH = [
+  "two cuts",
+  "peer groups",
+  "nonassociative floats",
+  "spilled prefix",
+  "zero resources",
+  "selected dictionary input",
+  "NULL partition/order keys",
+  "RANGE peers and lag",
+  "non-finite floats",
+] as const;
+
+/** Native retaining-parent continuation and ownership histories. */
+export const RETAINED_PARENT_IO_REACH = [
+  "join",
+  "window",
+  "append",
+  "read",
+  "cancel fence",
+  "fault cleanup",
+  "close drains both owners",
+  "close once after failure",
+  "task deadline",
+  "abort task resumption",
+  "reclaim waits for checkpoint",
 ] as const;
