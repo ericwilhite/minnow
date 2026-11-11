@@ -2018,7 +2018,13 @@ shipped-engine or stored-format change.
   `CompileOptions.columnarSort: false` selects the general path in the same candidate build;
   it is not a separately built parent binary. Dedicated gather arrays now move through
   column-only projections into result frames after the result account charges their full size.
-  A whole unchanged tight source chunk can move without gathering. Partial/padded source
+  A whole unchanged tight source chunk can move without gathering. Result adoption retires
+  its resident native-buffer charge before publishing the frame; source caches drop their views,
+  and capacities are recorded before irreversible detachment. Copied/refused chunks retire at
+  borrow release instead. Both retirement and final credit return are idempotent. Ordinary idle
+  source holding is returned immediately; the next-gather reserve and progress-loan credit stay
+  with the source. Bounded handoff metadata uses a prepaid 16 KiB allowance.
+  Partial/padded source
   chunks, unmarked buffers, computed projections and refused result adoption keep the copying
   fallback. `sortOwnership: false` disables this ownership optimization for paired controls.
   Incoming borrowed payloads still copy into the resident store; source-page ownership is not

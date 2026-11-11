@@ -77,6 +77,11 @@ export interface Transfer {
   readonly detachableReclassify?: boolean;
   /** Source-authorized full-buffer capacity for logical bytes; padding is dedicated and charged. */
   readonly detachableCapacity?: (bytes: number) => number;
+  /** The receiver has prepaid these adopted buffers. Retire their source charge synchronously,
+   * before publishing/detaching them. May be called for several disjoint subsets; idempotent.
+   * release still ends the whole borrow and disposes any buffers that were copied instead.
+   */
+  reclassify?(buffers: ReadonlySet<ArrayBuffer>): void;
   release(): void;
 }
 

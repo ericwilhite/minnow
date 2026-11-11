@@ -10,7 +10,7 @@ import {
   type FlatVector,
   type DictionaryVector,
 } from "../vector/vector.js";
-import { ColumnStore } from "./column-store.js";
+import { ColumnStore, type ChunkTransfer } from "./column-store.js";
 import {
   isPromise,
   YIELD_INTERVAL_MS,
@@ -29,6 +29,7 @@ import {
   gatherColumn,
   gatherSource,
   moveGatherColumn,
+  retireGatherChunk,
   numericWordCount,
   varlenGatherBytes,
   type GatherColumn,
@@ -44,7 +45,8 @@ interface GeneralSort extends Operator {
   reclaim(): void | Promise<void>;
   discard(): void;
 }
-const META_BYTES = 4096;
+// At most sixteen active chunk handoffs: closure/Map entries, output descriptors and views.
+const META_BYTES = 16 * 1024;
 const MAX_INPUT_BYTES = 256 * 1024;
 const SMALL_SORT = 65_536;
 
@@ -534,7 +536,8 @@ export class ColumnarSortOperator implements Operator {
     for (const column of this.#columns)
       if (layoutOf(column.type) === "varlen")
         for (const chunk of column.chunks) {
-          if (chunk.data.layout !== "varlen") throw new TypeError("Invalid varlen payload");
+          if (chunk?.data.layout !== "varlen")
+            throw new TypeError("Invalid varlen payload");
           for (let i = 0; i < chunk.length; i++)
             if ((chunk.data.offsets[i + 1] ?? 0) - (chunk.data.offsets[i] ?? 0) > MAX_INPUT_BYTES)
               return false;
@@ -568,6 +571,9 @@ export class ColumnarSortOperator implements Operator {
       }
       // This frame and radix are covered by the admitted reserve, never a progress loan.
       const columns: Array<FlatVector | DictionaryVector> = [];
+      const movedChunks: ChunkTransfer[] = [];
+      const canTransfer =
+        this.context.columnarOwnership !== false && this.downstream.reclassifiesTransfers === true;
       try {
         for (let c = 0; c < this.#columns.length; c++) {
           const column = this.#columns[c];
@@ -577,36 +583,40 @@ export class ColumnarSortOperator implements Operator {
               ? null
               : moveGatherColumn(column, ids, at, n, shift, mask);
           const gathered = moved ?? gatherColumn(column, ids, at, n, shift, mask, sizes[c] ?? 0);
+          if (moved !== null && canTransfer) {
+            const k = (ids[at] ?? 0) >>> shift;
+            movedChunks.push(this.#store.transferChunk(c, k, () => retireGatherChunk(column, k)));
+          }
           columns.push(this.#dictionaries[c]?.wrap(gathered) ?? gathered);
           if (this.#slice.due()) yield;
         }
-        const transfer: Transfer | undefined =
-          this.context.columnarOwnership === false || this.downstream.reclassifiesTransfers !== true
-            ? undefined
-            : {
-                detachableBuffers: new Set(
-                  frameTransferList({
-                    rowCount: n,
-                    columns: columns.map((v) =>
-                      v.form === "flat"
-                        ? v
-                        : {
-                            form: "dictionary",
-                            length: n,
-                            codes: v.codes,
-                            validity: v.validity,
-                            dictionary: 0,
-                          },
-                    ),
-                    dictionaries: [],
-                  }),
-                ),
-                detachableBudget: this.context.grant,
-                detachableReclassify: true,
-                // The source reserve remains paid through readiness. A result sink prepays the adopted
-                // arrays on its own grant; retaining/copying receivers finish their borrow before ready.
-                release: () => undefined,
-              };
+        const transfer: Transfer | undefined = !canTransfer
+          ? undefined
+          : {
+              detachableBuffers: new Set(
+                frameTransferList({
+                  rowCount: n,
+                  columns: columns.map((v) =>
+                    v.form === "flat"
+                      ? v
+                      : {
+                          form: "dictionary",
+                          length: n,
+                          codes: v.codes,
+                          validity: v.validity,
+                          dictionary: 0,
+                        },
+                  ),
+                  dictionaries: [],
+                }),
+              ),
+              detachableBudget: this.context.grant,
+              detachableReclassify: true,
+              reclassify: (buffers) => this.#retireChunks(movedChunks, buffers),
+              // Preserve the next gather's reserve; retire only resident chunk capacities.
+              // Copied/refused buffers leave the store when this complete borrow ends.
+              release: () => this.#retireChunks(movedChunks),
+            };
         if (this.downstream.push({ length: n, columns, selection: null }, transfer) === "blocked")
           yield this.downstream.ready();
         this.#rowsOut += n;
@@ -616,6 +626,17 @@ export class ColumnarSortOperator implements Operator {
       at += n;
       if (this.#slice.due()) yield;
     }
+  }
+
+  #retireChunks(chunks: readonly ChunkTransfer[], buffers?: ReadonlySet<ArrayBuffer>): void {
+    let bytes = 0;
+    for (const chunk of chunks)
+      bytes += buffers === undefined ? chunk.release() : chunk.reclassify(buffers);
+    // Return ordinary idle holding too; the still-allocated next-gather reserve and any
+    // loan-backed credit stay put. No ownership event transfers progress-loan credit.
+    const grant = this.context.grant;
+    const idle = Math.max(0, grant.held - grant.allocated - grant.loaned);
+    if (bytes > 0 && idle > 0) grant.release(Math.min(bytes, idle));
   }
 
   finish(): Promise<void> {

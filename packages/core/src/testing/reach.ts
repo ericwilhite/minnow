@@ -3360,3 +3360,18 @@ export const SORT_COMPRESSION_REACH = [
   "asc",
   "desc",
 ] as const;
+
+/** Native buffers change accounts exactly once, including failed adoption and frame credit. */
+export const SORT_TRANSFER_ACCOUNTING_REACH = [
+  "adopt",
+  "refuse",
+  "cancel",
+  "error",
+  "loan",
+  "loan credit stays at source",
+  "single owner after readiness",
+  "single owner before publication",
+  "irreversible detach",
+  "operator close with live frames",
+  "multiple source chunks",
+] as const;

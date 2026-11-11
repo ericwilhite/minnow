@@ -9,14 +9,28 @@ import type { Slice, SlicedJob } from "./slices.js";
 type Varlen = Extract<VectorData, { layout: "varlen" }>;
 export interface GatherColumn {
   readonly type: PhysicalType;
-  readonly chunks: FlatVector[];
+  readonly chunks: Array<FlatVector | undefined>;
   readonly nullable: boolean;
-  readonly floats: Float64Array[];
-  readonly integers: Int32Array[];
-  readonly singles: Float32Array[];
-  readonly booleans: Uint8Array[];
-  readonly wide: Int32Array[];
-  readonly variable: Varlen[];
+  readonly floats: Array<Float64Array | undefined>;
+  readonly integers: Array<Int32Array | undefined>;
+  readonly singles: Array<Float32Array | undefined>;
+  readonly booleans: Array<Uint8Array | undefined>;
+  readonly wide: Array<Int32Array | undefined>;
+  readonly variable: Array<Varlen | undefined>;
+}
+
+/** Drop every cached view when the store's whole chunk leaves its ownership. */
+export function retireGatherChunk(source: GatherColumn, k: number): void {
+  for (const cache of [
+    source.chunks,
+    source.floats,
+    source.integers,
+    source.singles,
+    source.booleans,
+    source.wide,
+    source.variable,
+  ])
+    cache[k] = undefined;
 }
 
 /** Cache homogeneous primitive arrays once, outside the row gather loops. */
@@ -71,7 +85,7 @@ export function* gatherSource(
 }
 
 function copyFloats(
-  arrays: Float64Array[],
+  arrays: Array<Float64Array | undefined>,
   ids: Int32Array,
   from: number,
   n: number,
