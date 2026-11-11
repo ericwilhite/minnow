@@ -140,8 +140,9 @@ admission. Planning holds no new native buffers or leases. Its `minimumBytes` co
 heads, key copies, run navigation and bounded I/O, including a memtable publishing before
 opening. Range bounds must remain immutable for the plan and cursor's lifetime.
 
-The executor includes that minimum in its atomic query admission, then calls
+A caller must include that minimum in its atomic query admission, then call
 `plan.open({ budget, signal })` with a dedicated grant. A plan opens once. The cursor does
 not admit more memory, grow the grant or borrow shared progress credit. Closing it cancels
 pending work and releases its scratch after that work settles; the caller then closes the
-grant. This internal API does not enable a new SQL planner route or change stored bytes.
+grant. This access-layer API is available now; executor integration and the SQL planner
+route will follow separately. Stored bytes are unchanged.
