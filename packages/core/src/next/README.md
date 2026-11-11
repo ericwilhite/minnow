@@ -2609,6 +2609,15 @@ not require a home cache directory.
   with result descriptors, read and write sets and its statistics basis; a catalog change; or a
   transaction or utility command. `lowerer.ts` lists the front-end passes that are kept and the
   code that lowering replaces.
+- CTAS data-clause classification recognizes the statement header first, then scans the trailing
+  `WITH [NO] DATA` once backwards. It does not search a query body with an unbounded lookbehind:
+  that was quadratic on Node 22 even for unrelated SELECT statements. AS inside a quoted name
+  or default value cannot make ordinary CREATE TABLE accept a CTAS-only suffix. The generated
+  inactive-envelope campaign keeps its original seeds, six histories per seed and million-byte
+  literals; a parent process gives the whole campaign a 90-second deadline that also catches synchronous
+  stalls, including child startup. The child retains the original 60-second per-test limits and
+  Reach checks; the parent allows 120 seconds to report and clean up. It runs the invoking Node
+  executable with owned temporary files under `os.tmpdir()`.
 - Pure and synchronous; the owner caches by (text, catalog version, `parameterTypes` when sent)
   and re-lowers when `statisticsDrifted` says the data moved. A plan whose shape no statistics
   decided (a unique-key lookup, a lone scan) has an empty `basis`, so its hit skips the check.
