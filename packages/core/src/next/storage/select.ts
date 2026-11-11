@@ -23,7 +23,7 @@
 import type { StorageBackend } from "./contract.js";
 import type { LockManagerLike } from "./fence.js";
 import { openIndexedDb } from "./idb-like.js";
-import { createIndexedDbBackend } from "./indexeddb.js";
+import { createIndexedDbBackend, type IndexedDbBackendOptions } from "./indexeddb.js";
 import { MemoryBackend } from "./memory-store.js";
 import { createOpfsBackend, webLocks, type OpfsDirectoryLike } from "./opfs.js";
 
@@ -151,6 +151,7 @@ export async function chooseBackend(
   name: string,
   platform: StoragePlatform = globalThis,
   locks: LockManagerLike = webLocks(platform.navigator?.locks as Parameters<typeof webLocks>[0]),
+  accounting: Pick<IndexedDbBackendOptions, "memory" | "registerCache"> = {},
 ): Promise<ChosenBackend> {
   // 1. The OPFS probe: only a recognized refusal (or no API) means "no OPFS".
   let root: DirectoryHandleLike | null = null;
@@ -204,6 +205,7 @@ export async function chooseBackend(
     return {
       kind: "indexeddb",
       backend: createIndexedDbBackend({
+        ...accounting,
         database: () => openIndexedDb(factory, `${INDEXEDDB_PREFIX}${name}`),
         name,
         locks,

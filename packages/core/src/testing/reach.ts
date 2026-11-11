@@ -2601,3 +2601,21 @@ export const WRITE_RANGE_SKIP_REACH = [
   "reverse insertion",
   "descending multiple pages",
 ] as const;
+
+/** Bounded private IndexedDB metadata cache, including asynchronous dirty eviction. */
+export const IDB_METADATA_CACHE_REACH = [
+  "coalesced private writes",
+  "exact compact charge",
+  "entry and byte cap pressure",
+  "credit refused native fallback",
+  "close and reopen",
+  "cached owner fenced",
+  "concurrent sessions and reset",
+  "dirty eviction wakes admission",
+  "malformed native page refused",
+  "failed refused replacement keeps old bytes",
+  "failed dirty eviction and reset retry",
+  "governor routed through chooser",
+  "unsettled native frame retains credit",
+  "queued operations fenced before execution",
+] as const;
