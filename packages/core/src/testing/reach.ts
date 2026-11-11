@@ -3081,3 +3081,44 @@ export const SCRATCH_METADATA_GUARD_REACH = [
   "corrupted middle entry position",
   "corrupted last entry position",
 ] as const;
+
+/** Concurrent wide sorts never retain one step loan while requesting another. */
+export const SORT_PROGRESS_PRESSURE_REACH = [
+  "five wide columns",
+  "normal room exhausted",
+  "single owner loan",
+  "exact PG output",
+  "two sorts fit alone",
+  "queued sort has no loan",
+  "with ties boundary row",
+  "peer rows across runs",
+  "both complete",
+  "cancel waiting sort",
+  "later admitted sort",
+  "zero resources",
+] as const;
+
+/** A legacy sort waits only before owning its progress step; another holder can finish. */
+export const SORT_PROGRESS_LOANS_REACH = [
+  "legacy shared reserve",
+  "no overlapping loan",
+  "first sort holds complete merge",
+  "second sort waits unloaned",
+  "both sorts complete",
+  "waiting sort cancelled",
+  "PG exact mixed payload",
+  "released all resources",
+  "numeric first key",
+  "text first key",
+  "multi-run wide merge",
+  "null payload",
+  "misaligned spill reads",
+  "grouped boundary row",
+  "global top-k boundary row",
+  "moving wide fields",
+  "many short output columns",
+  "short rows after a wide row",
+  "small row step before input",
+  "repaid before source readiness",
+  "backend buffering refused loan credit",
+] as const;

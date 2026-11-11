@@ -314,6 +314,8 @@ export interface DecodedPage {
   readonly columns: FlatVector[];
   /** Bytes charged for copies (a misaligned page, wide decimals); the caller frees them. */
   readonly charged: number;
+  /** When alignment required a copy, its bytes replace the original read ownership. */
+  readonly alignedBytes?: Uint8Array;
 }
 
 /**
@@ -347,7 +349,11 @@ export function decodePage(
     throw error;
   }
   try {
-    return { ...decodeViews(page, types), charged: copied + wide };
+    return {
+      ...decodeViews(page, types),
+      charged: copied + wide,
+      ...(copied > 0 ? { alignedBytes: page } : {}),
+    };
   } catch (error) {
     charge.free(copied + wide);
     throw error;

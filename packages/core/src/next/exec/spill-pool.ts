@@ -57,6 +57,7 @@ export class Pool implements ByteCharge {
   /** The step allocated since it made room (until then, its room is held, not given back). */
   #consumed = false;
   #steps = 0;
+  #pins = 0;
   loans = 0;
   largestLoan = 0;
   constructor(
@@ -166,6 +167,18 @@ export class Pool implements ByteCharge {
     }
   }
 
+  /** Pin a pre-sized multi-buffer step until every simultaneous borrower has left. */
+  pinStep(): () => void {
+    this.#pins++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (this.#pins > 0) this.#pins--;
+      this.settle();
+    };
+  }
+
   /**
    * Returns extra bytes once the step has allocated and all live pool usage fits without
    * them. Fixed buffers first created during the step may remain inside the admitted pool.
@@ -173,6 +186,7 @@ export class Pool implements ByteCharge {
   settle(): void {
     if (
       this.#steps !== 0 ||
+      this.#pins > 0 ||
       this.#extra === 0 ||
       !this.#consumed ||
       this.#used > this.#size - this.#extra
@@ -191,6 +205,7 @@ export class Pool implements ByteCharge {
     this.#overflow = 0;
     this.charge.free(this.#size);
     this.#size = this.#base;
+    this.#pins = 0;
     this.#extra = 0;
     this.#consumed = false;
     this.#loan = null;
@@ -293,6 +308,14 @@ export class SpillIo {
       this.#checkOpen();
       decoded = decodePage(page.bytes, types, this.pool);
       if ("needed" in decoded) throw new RangeError("A spill page could not be decoded");
+    }
+    if (decoded.alignedBytes !== undefined) {
+      // Decoder views now own the aligned copy. Drop the original before giving its charge
+      // back, so a merge never pins both representations throughout the following output.
+      const previous = page.bytes.byteLength;
+      page.bytes = decoded.alignedBytes;
+      page.charged -= previous;
+      this.pool.free(previous);
     }
     page.charged += decoded.charged;
     return decoded;

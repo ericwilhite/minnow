@@ -2026,6 +2026,44 @@ shipped-engine or stored-format change.
   after a compaction each partition keeps its k-th key, and rows that cannot beat it are dropped.
 - Grant-or-spill: sorted runs of typed spill pages, merged with a fan-in the spill pool's room
   allows, in passes when needed; OFFSET rows are counted, not materialized.
+- A single key refused by the byte encoder drops its abandoned normalization buffers and
+  uses the exact value comparator for existing and later runs. Their physical page schema
+  stays unchanged; unused key-tail fields have canonical empty values.
+- An oversized row that cannot fit an empty resident store is written as a one-row page from borrowed
+  input views. It does not retain a row-store loan while asking the spill pool for credit.
+  The input borrow ends only after the append settles. NULLs are canonicalized without
+  reading their unspecified payloads; int64 and decimal views keep their exact representation.
+  Small rows with bounded native coefficients instead prepay a whole resident/spill step:
+  the row chunk, sort scratch, staging and page resize overlap use one loan. Its pool share
+  is pinned through the spill and the loan is repaid before source readiness returns. This
+  keeps small rows batched rather than creating one page per row. Decoded keys and unbounded
+  NUMERIC coefficients retain the direct-row fallback. Backend write batching uses ordinary
+  credit only; when only loan credit is left, the spill service writes the supplied page directly.
+- Oversized pages use a two-way merge with one complete working step reserved before opening
+  either cursor: two input pages, the larger of one spill page or one output row, decoded
+  operands, bounded metadata, and a boundary/partition row for WITH TIES or group top-k.
+  A scoped pool pin keeps that reservation through intermediate passes and downstream
+  readiness. Boundary rows drop their old arenas before replacement. Wide output flushes
+  before advancing a cursor, so aligning the next page cannot overlap retained output.
+  Intermediate wide runs write one row at a time, checking
+  the shared task clock between rows. Observed value widths guard this path: many short
+  columns keep their normal batched pages even when a staging chunk exceeds the page target.
+  Normal bounded-page sorts keep their existing fan-in.
+  When a read needs alignment, its aligned copy replaces the original read ownership instead
+  of retaining both pages through output.
+- `exec/sort-progress.test.ts` generates concurrent legacy sorts under a full ordinary budget,
+  including a second sort waiting without a loan and cancellation at that wait. It checks real
+  spill/merge, misaligned reads, five wide TEXT payloads, NULLs, exact int8 and non-finite float
+  outputs against PGlite. It covers global and partitioned group top-k and changing which fields
+  hold wide values; short-schema histories force an empty resident store, require repayment
+  before source readiness, and model a backend that retains its write buffer until close.
+  The wide complete boundary-row step fits alone at 176 MiB (128 MiB for plain
+  sort). `testing/sort-progress-pressure.test.ts` runs the five-TEXT SQL shape, including WITH
+  TIES peers across runs, through real lowering/execution at 128 MiB under resident pressure
+  and queued cancellation.
+  Concurrent executions share one immutable snapshot so their physical input and read minimum
+  stay the same. A later snapshot may require a different complete minimum. These are liveness
+  and correctness checks, not performance acceptance or exhaustive I/O failure injection.
 - Sorter scratch buffers, including the radix histograms, are constructed only after their
   owning charge succeeds. Refusing scratch admission constructs no radix arrays and returns
   the pool allocation made earlier in the constructor.
