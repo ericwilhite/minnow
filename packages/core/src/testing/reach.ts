@@ -3047,6 +3047,8 @@ export const IDB_METADATA_FAILURE_REACH = [
   "compact to full replacement",
   "both publication oracles after every action",
   "close and reopen agreement",
+] as const;
+
 /** Scratch ownership/free metadata is paged, including direct appends and close descriptors. */
 export const SCRATCH_METADATA_REACH = [
   "interleaved direct appends",

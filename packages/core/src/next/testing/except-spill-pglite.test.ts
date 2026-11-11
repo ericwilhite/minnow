@@ -7,6 +7,7 @@ import { createReach, EXCEPT_SPILL_REACH } from "../../testing/reach.js";
 import { Governor } from "../memory/governor.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { ScratchSpillService } from "../spill/scratch-spill.js";
+import { SCRATCH_CONTROL_BYTES } from "../spill/scratch-ranges.js";
 import { SimBackend, SimDisk } from "../storage/sim-disk.js";
 import { ExceptOperator, exceptMinimumBytes } from "../exec/except.js";
 import { INT, TEXT, ArraySource, CollectSink, batchesOf, type Row } from "../exec/join-fixtures.js";
@@ -110,15 +111,30 @@ it.each(seedsFor("next-except-spill", [0xb62f, 0xb630]))(
             )
           ).rows.map((row) => [row.n, row.t] as Row);
           const types = [INT, TEXT],
-            minimum = exceptMinimumBytes(types);
+            minimum = exceptMinimumBytes(types),
+            sharedMinimum = shape.scratch ? SCRATCH_CONTROL_BYTES : 0;
           const cap = shape.tight
-            ? Math.max(minimum + (1 << 20), Math.ceil((minimum * 8) / 7))
+            ? // Preserve the tight operator allowance after admitting the shared owner.
+              Math.max(
+                minimum + sharedMinimum + (1 << 20),
+                Math.ceil(((minimum + sharedMinimum) * 8) / 7),
+              )
             : 64 << 20;
           const governor = new Governor(cap);
+          const spillControl = shape.scratch
+            ? await governor.admit({
+                label: "shared scratch metadata",
+                minimumBytes: SCRATCH_CONTROL_BYTES,
+                spillable: false,
+              })
+            : null;
           const backend = shape.scratch ? new SimBackend(new SimDisk()) : null;
           const lease = await backend?.acquire();
           const scratch = lease === undefined ? null : backend?.scratch(lease);
-          const spill = scratch ? new ScratchSpillService(scratch) : new MemorySpillService();
+          const spill =
+            scratch && spillControl
+              ? new ScratchSpillService(scratch, { budget: spillControl })
+              : new MemorySpillService();
           const grant = await governor.admit({
             label: "except PG",
             minimumBytes: minimum,
@@ -156,6 +172,7 @@ it.each(seedsFor("next-except-spill", [0xb62f, 0xb630]))(
             await op.closed;
             grant.close();
             if (spill instanceof ScratchSpillService) await spill.close();
+            spillControl?.close();
             await lease?.release();
           }
           expect(governor.peakBytes).toBeLessThanOrEqual(cap);
