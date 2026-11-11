@@ -1,5 +1,5 @@
 /** Progress belongs to one admitted operator; it never queues behind another execution. */
-import { GrantClosedError, type Loan, type Grant } from "./governor.js";
+import { GrantClosedError, MemoryAdmissionError, type Loan, type Grant } from "./governor.js";
 import { MinimumBudget } from "./working-set.js";
 
 type ByteBudget = Pick<Grant, "allocate" | "free">;
@@ -20,8 +20,7 @@ export class StepLoans {
     if (this.#closed) throw new GrantClosedError(this.label);
     if (this.#active)
       throw new RangeError(`${this.label} must repay its step loan before borrowing`);
-    if (bytes > this.capacity)
-      throw new RangeError(`${this.label} exceeded its admitted progress working set`);
+    if (bytes > this.capacity) throw new MemoryAdmissionError(this.label, bytes, this.capacity);
     this.#active = true;
     let repaid = false;
     return {

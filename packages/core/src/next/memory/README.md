@@ -79,6 +79,15 @@ query-size error. A complete execution minimum greater than the whole cap is the
 `MemoryAdmissionError` at admission. Oversized parameter inputs fail initial admission. Only already-admitted owned copies may
 checkpoint during a pressure handoff (see below).
 
+Memory refusals carry `code: "MINNOW_MEMORY_ADMISSION"`, SQLSTATE `53200`, and a
+`cause` with `requestedBytes` and `admittedBytes`. A private progress step larger
+than its admitted lane raises the same error before allocating or waiting; it
+does not consume the lane or hide a still-active-loan ownership violation.
+This structured refusal does not repair an underestimated minimum. In particular,
+repeating a wide source column across sort output aliases can still exceed its
+admitted progress lane; the planner must account for the expanded output or keep
+one copy until final projection.
+
 An executor first sizes the widest reachable scan step, including encoded leases,
 decoded pages, dictionaries, directories and decode overlap. It adds every active
 operator's fixed buffers, each breaker's private progress space, parameter storage, and

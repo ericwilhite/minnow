@@ -30,6 +30,23 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+/** Capacity errors do not mutate a private progress lane or mask ownership errors. */
+export const STEP_LOANS_REFUSAL_REACH = [
+  "oversized refused without allocation",
+  "ownership violation stays distinct",
+  "capacity boundary and retry succeed",
+  "abort has precedence",
+  "closed has precedence",
+] as const;
+
+export const SORT_ADMISSION_ERROR_REACH = [
+  "ordinary room exhausted",
+  "repeated SQL projection",
+  "completed earlier step",
+  "initial step refusal",
+  "cleanup returns all resources",
+] as const;
+
 /** Full numeric sorts preserve SQL order and budget/borrow lifetimes on both physical paths. */
 export const COLUMNAR_SORT_REACH = [
   "small stable merge",
