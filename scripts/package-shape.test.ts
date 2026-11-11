@@ -189,6 +189,7 @@ describe("published core tarball", () => {
       );
       expect(report?.files.map(({ path }) => path)).toContain("dist/engine/query.d.ts");
       expect(report?.files.filter(({ path }) => path.startsWith("dist/next/"))).toEqual([]);
+      expect(report?.files.filter(({ path }) => path.includes(".test-support."))).toEqual([]);
       // prepare-package.mjs strips only the JavaScript it expects to ship; every shipped file
       // must come out stripped, so a too-wide skip rule fails here.
       for (const { path } of report?.files ?? []) {

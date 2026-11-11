@@ -1,3 +1,4 @@
+/* eslint-disable no-restricted-imports -- Node-only test loads frozen released-writer bytes. */
 /**
  * Databases a released build left unable to fold. Through 0.15.0 a fold refused any table that
  * had gained a column after rows were written (its older segments have no blocks for it) or
@@ -14,6 +15,9 @@
  * IndexedDB upgrade mid-way and retry, race current and released openers, and refuse plans whose
  * fills do not match their sources.
  */
+import { readFileSync } from "node:fs";
+import { gunzipSync } from "node:zlib";
+import { withProgressDeadline } from "../testing/progress-deadline.test-support.js";
 import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it, vi } from "vitest";
 import { MinnowDatabase as ReleasedDatabase } from "@minnowdb/core-layout10";
@@ -107,30 +111,105 @@ async function levelZeroCount(
   return count;
 }
 
-/** Waits for background maintenance to bring the table under the automatic fold threshold. */
-async function settle(database: MinnowDatabase, store: BlockStore): Promise<number> {
-  let levelZero = Number.POSITIVE_INFINITY;
-  for (let attempt = 0; attempt < 600; attempt += 1) {
-    const active = (await database.listCompactionJobs()).some(
-      (job) => job.state !== "published" && job.state !== "cancelled" && job.state !== "aborted",
-    );
-    levelZero = await levelZeroCount(database, store);
-    if (!active && levelZero < 48) return levelZero;
-    // A read of the fragmented table is what schedules a fold when nothing writes.
-    await database.query("SELECT COUNT(*) AS n FROM t", { memoize: false });
-    await new Promise((resolve) => setTimeout(resolve, 25));
+/** Only advancing native work counts; timestamps and lease-renewal revisions do not. */
+function jobProgress(jobs: readonly CompactionJobRecord[]): string {
+  return JSON.stringify(
+    jobs.map((job) => [
+      job.id,
+      job.state,
+      job.cursor.sourceSegmentIndex,
+      job.cursor.sourceBlockIndex,
+      job.processedRows,
+      job.outputStoredBytes,
+      job.outputCursor,
+    ]),
+  );
+}
+
+/** Await foreground fold assistance with native progress diagnostics if it stops advancing. */
+async function firstWrite(
+  database: MinnowDatabase,
+  store: BlockStore,
+  nextId: number,
+): Promise<void> {
+  const update = store.updateCompactionJob.bind(store);
+  let advance: (marker: string) => void = () => undefined;
+  const watched = vi.spyOn(store, "updateCompactionJob").mockImplementation(async (...args) => {
+    const job = await update(...args);
+    advance(jobProgress([job]));
+    return job;
+  });
+  try {
+    await withProgressDeadline("first upgraded write", async (report) => {
+      advance = report;
+      await database.execute("INSERT INTO t VALUES (?, ?, ?, ?)", [nextId, nextId, false, "next"]);
+    });
+  } finally {
+    watched.mockRestore();
   }
-  throw new Error(`Background folds did not settle: ${String(levelZero)} level-zero segments`);
+}
+
+/** Observe native cursors; do not compete with active folds by repeatedly scanning their sources. */
+async function settle(database: MinnowDatabase, store: BlockStore): Promise<number> {
+  return withProgressDeadline("background folds", async (advance) => {
+    let levelZero: number | null = null;
+    for (;;) {
+      const jobs = await database.listCompactionJobs();
+      const active = jobs.some(
+        (job) => job.state !== "published" && job.state !== "cancelled" && job.state !== "aborted",
+      );
+      advance(JSON.stringify([levelZero, jobProgress(jobs)]));
+      if (!active) {
+        levelZero = await levelZeroCount(database, store);
+        if (levelZero < 48) return levelZero;
+        // Only an idle fragmented table needs a read to schedule its next fold.
+        await database.query("SELECT COUNT(*) AS n FROM t", { memoize: false });
+      }
+      // Job records include their source plans: observe at most four times a second.
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  });
 }
 
 describe("OPFS: a table 0.15.0 left at the level-zero ceiling", () => {
   it("folds on the first write after the upgrade, and the released reader is refused", async () => {
+    // Exact frozen output of scripts/write-fold-ceiling-fixture.mts, written by 0.15.0.
+    // No size reduction: the real 4,096-segment ceiling and every original row are retained.
+    const bytes = gunzipSync(
+      readFileSync(
+        new URL("../../format-fixtures/opfs-layout10-fold-ceiling.json.gz", import.meta.url),
+      ),
+    );
+    const headerEnd = bytes.indexOf(10);
+    expect(headerEnd).toBeGreaterThan(0);
+    const payload = bytes.subarray(headerEnd + 1);
+    const fixture = JSON.parse(bytes.subarray(0, headerEnd).toString("utf8")) as {
+      writerPackageVersion: string;
+      layoutFormatVersion: number;
+      levelZeroSegments: number;
+      nextId: number;
+      files: Record<string, { offset: number; length: number }>;
+    };
+    expect(fixture.writerPackageVersion).toBe("0.15.0");
+    expect(fixture.layoutFormatVersion).toBe(10);
+    expect(fixture.levelZeroSegments).toBe(MAX_LEVEL_ZERO_SEGMENTS);
     const shim = new MemoryOpfs();
+    for (const [path, { offset, length }] of Object.entries(fixture.files)) {
+      expect(offset).toBeGreaterThanOrEqual(0);
+      expect(offset + length).toBeLessThanOrEqual(payload.length);
+      shim.writeFileBytes(path, payload.subarray(offset, offset + length));
+    }
+    const nextId = fixture.nextId;
+    expect(nextId).toBe(MAX_LEVEL_ZERO_SEGMENTS + 1);
     const releasedStore = await ReleasedOpfsStore.open({ name: NAME, root: shim.root });
     const released = new ReleasedDatabase(releasedStore, { autoCompact: false });
-    const nextId = await damagedHistory(released, MAX_LEVEL_ZERO_SEGMENTS + 16);
-    // The released build is stuck: the table is at the ceiling, and its fold refuses the sources.
-    expect(nextId).toBeLessThan(3 + MAX_LEVEL_ZERO_SEGMENTS + 16);
+    // Prove it remains an ordinary, readable old database that refuses writes at the ceiling.
+    expect((await released.query("SELECT * FROM t ORDER BY id")).rows).toEqual(
+      expectedRows(nextId),
+    );
+    await expect(
+      released.execute("INSERT INTO t VALUES (?, ?, ?, ?)", [nextId, nextId, false, "next"]),
+    ).rejects.toMatchObject({ name: "CompactionBacklogError" });
     await expect(released.compactTable("t", { minimumLevel0Segments: 1 })).rejects.toThrow(
       "Full-row compaction source is missing columns",
     );
@@ -146,7 +225,7 @@ describe("OPFS: a table 0.15.0 left at the level-zero ceiling", () => {
     let database = new MinnowDatabase(store, { onBackgroundError: (error) => errors.push(error) });
     expect(await levelZeroCount(database, store)).toBeGreaterThanOrEqual(MAX_LEVEL_ZERO_SEGMENTS);
     // The write at the ceiling lends its turn to a fold, which now publishes.
-    await database.execute("INSERT INTO t VALUES (?, ?, ?, ?)", [nextId, nextId, false, "next"]);
+    await firstWrite(database, store, nextId);
     const rows = [...expectedRows(nextId), { id: nextId, c: nextId, a: false, s: "next" }];
     expect(await readAll(database)).toEqual(rows);
     expect(await settle(database, store)).toBeLessThan(48);

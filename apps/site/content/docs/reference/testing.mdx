@@ -509,11 +509,27 @@ reader then refuses the database; `indexeddb-schema5.test.ts` does the same for 
 every released IndexedDB writer, and `snapshot-format2.test.ts` checks that only a snapshot
 holding the key-forwards table is written as format 2. A fifth alias, of core 0.15.0, is the last
 IndexedDB schema-5 and OPFS layout-10 writer, the last build that could not fold a table across
-`ALTER TABLE`, and the last without delta merges: `schema-change-fold-upgrade.test.ts` lets it
-add and drop columns of a populated table until the level-zero ceiling refuses its writes, then
+`ALTER TABLE`, and the last without delta merges: `schema-change-fold-upgrade.test.ts` uses a
+frozen native OPFS database written by 0.15.0 at the real 4,096-segment ceiling. It retains every
+row and segment from the original live-writer history; no case size is reduced. The fixture is
+a gzip-compressed binary container: one JSON header line maps paths to byte ranges in the
+following payload; identical native files share a range. This reduces repository bytes without
+changing any restored file, row or segment. The released writer hardcodes the 4,096-segment
+admission ceiling; its compaction batch options cannot lower that limit. Its manual generator is
+`scripts/write-fold-ceiling-fixture.mts`. The test first checks that the released reader reads
+all rows but refuses another write and cannot fold them, then upgrades through the ordinary API.
+IndexedDB cases still build their released history live. The suite
 upgrades the database to the current schema or layout through the ordinary open API, checks that
 the first write folds the table and succeeds, interrupts and retries the IndexedDB upgrade, races
 current and released openers, and checks that 0.15.0 then refuses the database.
+The first upgraded OPFS write and background-fold settlement have a progress-aware watchdog:
+30 seconds without an advancing native cursor/state/row or output-byte count fails with the
+last observation; even continuing progress cannot exceed a 120-second phase cap. Repeated
+polls and lease-renewal timestamps do not extend it. Active folds are observed without
+launching competing full-table scans; an idle fragmented table still gets a read to schedule
+its next fold. All existing data, reopen, integrity, interruption/retry and corruption checks remain.
+The watchdog is a `.test-support.ts` helper; the package file list excludes that test-only output
+from the published tarball, while the normal build still type-checks it.
 `delta-merge-upgrade.test.ts` leaves single-row updates and deletes over its folded partitions,
 upgrades the database to the current schema or layout, merges those deltas, writes, reopens,
 interrupts and retries the IndexedDB upgrade, races current and released openers, refuses a

@@ -147,6 +147,7 @@
   "files": [
     "dist",
     "!dist/**/*.test.*",
+    "!dist/**/*.test-support.*",
     "!dist/**/*.spec.*",
     "!dist/**/*.map",
     "!dist/storage/fixture-shape.*",
