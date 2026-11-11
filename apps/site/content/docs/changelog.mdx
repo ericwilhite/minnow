@@ -10,6 +10,14 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported rebuild now keeps `DATE_PART(text, INTERVAL)` as PostgreSQL's double precision
+result, while `EXTRACT` remains exact `NUMERIC`. This also restores overload rejection such as
+`round(date_part(...), 6)` (`42883`). Date/time `DATE_PART` execution remains explicitly unsupported;
+its declared result type is double precision. The shipped engine's alias, public API and stored
+formats are unchanged; no migration is needed. Private parser provenance adds 248 raw bytes
+to each engine entry (95/86/111 gzip bytes for main/OPFS/IndexedDB). Main and OPFS raw size
+caps rise by 256 bytes once, and OPFS gzip by 128 bytes; other caps remain unchanged.
+
 The unexported rebuild core now executes finite calendar interval addition/subtraction, exact
 interval EXTRACT and interval comparisons. Integer/timestamp GENERATE_SERIES in FROM streams without a
 hidden row cap. Fixed-width UNION ALL recursive CTEs use bounded FIFO work tables that spill under

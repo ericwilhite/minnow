@@ -1576,7 +1576,8 @@ shipped-engine or stored-format change.
   stale binding, or a kernel binding that does not evaluate. DATE difference and finite timestamp
   difference execute through `temporal-subtract.ts`; temporal output casts use `temporal-text.ts`.
   Finite date/timestamp +/- interval, exact interval EXTRACT and interval duration comparisons
-  execute through dedicated kernels. Not implemented yet: other temporal arithmetic and EXTRACT
+  execute through dedicated kernels. DATE_PART over finite intervals returns float8 separately
+  from EXTRACT's NUMERIC result; date/time DATE_PART execution remains a typed refusal. Not implemented yet: other temporal arithmetic and EXTRACT
   overloads, text functions, math functions other
   than numeric ROUND(numeric,int4), other casts to and from text, and bounded text casts.
 - SQL TIMESTAMP literals preserve source microseconds through parsing, plan clones and expression

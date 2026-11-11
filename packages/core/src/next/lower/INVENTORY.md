@@ -474,3 +474,13 @@ refusal masks this separate shared aggregate issue.
 The unchanged guide-15 native result is compared to PostgreSQL's NUMERIC output. Only the
 independent shipped-engine witness casts busy_hours to float8, matching the current engine's
 EXTRACT type (R21). No tolerance or frozen-SQL correction is used.
+
+### DATE_PART and EXTRACT
+
+`DATE_PART` has its own R19 overloads returning `float8`; PostgreSQL 14+ `EXTRACT` returns
+`NUMERIC`. Native-only private call provenance survives child rewrites, clones and expression
+identity without a public model field. Finite interval DATE_PART uses PostgreSQL's float8
+operation order, including second/millisecond fractions and epoch cancellation; it does not
+convert the exact EXTRACT result after evaluation. Date/time DATE_PART kernels remain typed
+execution refusals. Its float8 type still rejects two-argument ROUND at lowering, as PostgreSQL
+does, including over date/timestamp arguments whose execution is not implemented yet.

@@ -100,10 +100,28 @@ function extract(
       throw new Error("Unsupported field already checked");
   }
 }
+/** interval_part_common(retnumeric=false): preserve PG's float8 operation order. */
+function datePart(field: Field, months: number, days: number, micros: bigint): number {
+  if (field === "epoch") {
+    let value = Number(micros) / 1000000;
+    value += 31557600 * Math.trunc(months / 12);
+    value += 2592000 * (months % 12);
+    value += 86400 * days;
+    return value;
+  }
+  if (field === "second" || field === "milliseconds") {
+    const seconds = Number((micros / 1000000n) % 60n),
+      fraction = Number(micros % 1000000n);
+    return field === "second" ? seconds + fraction / 1000000 : seconds * 1000 + fraction / 1000;
+  }
+  const [coefficient] = extract(field, months, days, micros);
+  return Number(coefficient);
+}
 class IntervalExtract implements Compiled {
   readonly #output: FlatVector;
-  readonly #limbs: Uint32Array;
-  readonly #scales: Uint16Array;
+  readonly #limbs: Uint32Array | null;
+  readonly #scales: Uint16Array | null;
+  readonly #floats: Float64Array | null;
   readonly #validity: Uint32Array;
   constructor(
     readonly type: PhysicalType,
@@ -111,23 +129,26 @@ class IntervalExtract implements Compiled {
     readonly input: Compiled,
     arena: OutputArena,
   ) {
-    arena.take(arena.capacity * 18 + 4096);
-    this.#limbs = new Uint32Array(arena.capacity * 4);
-    this.#scales = new Uint16Array(arena.capacity);
+    const floating = type.kind === "float64";
+    arena.take(arena.capacity * (floating ? 8 : 18) + 4096);
+    this.#limbs = floating ? null : new Uint32Array(arena.capacity * 4);
+    this.#scales = floating ? null : new Uint16Array(arena.capacity);
+    this.#floats = floating ? new Float64Array(arena.capacity) : null;
     this.#validity = arena.validity();
-    this.#output = {
-      form: "flat",
-      type,
-      length: 0,
-      validity: this.#validity,
-      data: {
+    let data: FlatVector["data"];
+    if (this.#floats !== null) data = { layout: "f64", values: this.#floats };
+    else {
+      if (this.#limbs === null || this.#scales === null)
+        throw new TypeError("Missing interval extraction output buffers");
+      data = {
         layout: "decimal",
         scale: null,
         scales: this.#scales,
         coefficients: { repr: "int128", limbs: this.#limbs },
         specials: null,
-      },
-    };
+      };
+    }
+    this.#output = { form: "flat", type, length: 0, validity: this.#validity, data };
   }
   evaluate(batch: Batch, rows: Selection | null): Vector {
     const field = this.field.evaluate(batch, rows),
@@ -164,9 +185,12 @@ class IntervalExtract implements Compiled {
         micros = int64At(ad.micros, ii);
       if (isInfiniteInterval(months, days, micros))
         throw new UnsupportedPlanError("infinite INTERVAL extraction", { construct: "function" });
-      const [coefficient, scale] = extract(unit, months, days, micros);
-      setInt128(this.#limbs, row, coefficient);
-      this.#scales[row] = scale;
+      if (this.#floats !== null) this.#floats[row] = datePart(unit, months, days, micros);
+      else if (this.#limbs !== null && this.#scales !== null) {
+        const [coefficient, scale] = extract(unit, months, days, micros);
+        setInt128(this.#limbs, row, coefficient);
+        this.#scales[row] = scale;
+      }
       this.#validity[row >>> 5] = (this.#validity[row >>> 5] ?? 0) | (1 << (row & 31));
     }
     this.#output.length = batch.length;
@@ -179,7 +203,11 @@ export function compileIntervalExtract(
   input: Compiled,
   arena: OutputArena,
 ): Compiled {
-  if (type.kind !== "decimal" || field.type.kind !== "text" || input.type.kind !== "interval")
+  if (
+    (type.kind !== "decimal" && type.kind !== "float64") ||
+    field.type.kind !== "text" ||
+    input.type.kind !== "interval"
+  )
     throw new TypeError("INTERVAL EXTRACT needs text and interval");
   return new IntervalExtract(type, field, input, arena);
 }

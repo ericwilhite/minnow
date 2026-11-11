@@ -1,3 +1,4 @@
+import { rememberDatePart, copyDatePart, isDatePart } from "./date-part-sources.js";
 import {
   sourceLocksRelation,
   strongestRowLock,
@@ -304,7 +305,7 @@ export const statementDatetimeNames: ReadonlySet<string> = new Set([
 /** Standard function spellings that share one canonical plan name. */
 const functionSpellings: ReadonlyMap<string, string> = new Map([
   ["SUBSTRING", "SUBSTR"],
-  // DATE_PART('field', value) is EXTRACT(field FROM value) with the field as a string.
+  // Shipped alias; native compilation keeps DATE_PART provenance for its float8 result.
   ["DATE_PART", "EXTRACT"],
   ["CEILING", "CEIL"],
   ["CHAR_LENGTH", "LENGTH"],
@@ -3025,6 +3026,7 @@ function cloneTreeValue(value: unknown): unknown {
   for (const key of Object.keys(value)) {
     copy[key] = cloneTreeValue((value as Record<string, unknown>)[key]);
   }
+  copyDatePart(value, copy);
   copyFrameOffset(value, copy);
   copySeriesArgumentCount(value, copy);
   copyIntervalArithmeticSource(value, copy);
@@ -4481,7 +4483,7 @@ export function mapChildExpressions(
   }
   if (expression.kind === "not") return { ...expression, operand: map(expression.operand) };
   if (expression.kind === "call") {
-    return {
+    const mapped: Expression = {
       ...expression,
       arguments: expression.arguments.map(map),
       ...(expression.aggregateOrderBy === undefined
@@ -4493,6 +4495,8 @@ export function mapChildExpressions(
             })),
           }),
     };
+    copyDatePart(expression, mapped);
+    return mapped;
   }
   if (expression.kind === "list") return { ...expression, items: expression.items.map(map) };
   if (expression.kind === "case") {
@@ -12628,6 +12632,7 @@ class Parser {
         ...(distinct ? { distinct: true } : {}),
         ...(aggregateOrderBy === undefined ? {} : { aggregateOrderBy }),
       };
+      if (recordDeclaredTypes && upper === "DATE_PART") rememberDatePart(call);
       return upper === "ARRAY_AGG"
         ? { kind: "call", name: "MINNOW_ARRAY_FROM_JSON", arguments: [call] }
         : call;
@@ -15652,7 +15657,8 @@ function defaultAlias(expression: Expression): string {
     const operand = expression.arguments[0];
     if (operand?.kind === "column" || operand?.kind === "call") return defaultAlias(operand);
   }
-  if (expression.kind === "call") return expression.name.toLowerCase();
+  if (expression.kind === "call")
+    return isDatePart(expression) ? "date_part" : expression.name.toLowerCase();
   if (expression.kind === "wildcard")
     return expression.table === undefined ? "*" : `${expression.table}.*`;
   return "expression";

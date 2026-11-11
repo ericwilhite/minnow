@@ -45,7 +45,9 @@ const SQL_ENGINE_MODULES =
 // Only typed compilation records source; normal shipped SQL precision is unchanged. Caps stay.
 // Native-only interval/series provenance over eef0ee76: 1,173,499 raw / 351,512 gzip
 // (+514 / +180). Raise raw once by 512 and gzip by 256; isolation assertions stay.
-const COMPLETE_ENTRY_RAW_BUDGET = 1146 * 1024;
+// Native DATE_PART provenance over cb0d82a6: 1,173,747 raw / 351,607 gzip (+248 / +95).
+// Raise raw once by 256 bytes; gzip and every isolation assertion still fit.
+const COMPLETE_ENTRY_RAW_BUDGET = 1146.25 * 1024;
 const COMPLETE_ENTRY_GZIP_BUDGET = 343.5 * 1024;
 // The engine with the larger durable adapter, OPFS.
 // JSON_TABLE metadata: 1,585,069 raw / 458,168 gzip bytes; counterfactual
@@ -53,8 +55,10 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 343.5 * 1024;
 // Timestamp source/precision admission: 1,585,395 / 458,305 (+326 raw / +137 gzip); caps stay.
 // Interval/series provenance: 1,585,909 raw / 458,456 gzip (+514 / +151).
 // Raise raw once by 512; the gzip cap still fits.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1548.75 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 447.75 * 1024;
+// DATE_PART provenance: 1,586,157 raw / 458,542 gzip (+248 / +86).
+// Raise raw once by 256 and gzip by 128; no private rebuild/test input is reachable.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1549 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 447.875 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does.
 // JSON_TABLE metadata: 1,581,102 raw / 455,735 gzip bytes; counterfactual

@@ -188,6 +188,16 @@ export const FUNCTION_BINDINGS: Readonly<Record<string, Binding | PerOverload>> 
     ),
   }),
 
+  date_part: per({
+    "text,interval": { kernel: "intervalExtract" },
+    ...Object.fromEntries(
+      ["date", "time", "timestamp", "timestamptz"].map((type) => [
+        `text,${type}`,
+        refuse("date/time DATE_PART (calendar kernels come later)"),
+      ]),
+    ),
+  }),
+
   nextval: refuse("sequences (come with DML)"),
   currval: refuse("sequences (come with DML)"),
   random: refuse("volatile generators (come with DML)"),

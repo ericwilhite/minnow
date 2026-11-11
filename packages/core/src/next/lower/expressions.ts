@@ -1,3 +1,4 @@
+import { isDatePart } from "../../engine/date-part-sources.js";
 /**
  * Front-end expressions (plan/model.ts `Expression`, `Predicate`) to typed IR scalar
  * expressions. Names resolve through a `Scope`; types follow PostgreSQL (lower/coerce.ts).
@@ -761,7 +762,7 @@ function lowerCall(
       `aggregate function ${name.toLowerCase()} is not allowed here`,
       "42803",
     );
-  const fn = FUNCTION_NAMES[name];
+  const fn = isDatePart(expression) ? "date_part" : FUNCTION_NAMES[name];
   if (fn === undefined) throw unsupported("function", name.toLowerCase());
   const lowered = args.map((arg) => lowerExpression(arg, scope, state));
   if (fn === "date_trunc" || fn === "extract") {

@@ -201,6 +201,15 @@ export const FUNCTIONS: Readonly<Record<string, readonly Overload[]>> = {
     { args: ["text", "interval"], result: "numeric" },
   ],
 
+  /** DATE_PART keeps PostgreSQL's float8 result, separately from EXTRACT's NUMERIC. */
+  date_part: [
+    { args: ["text", "date"], result: "float8" },
+    { args: ["text", "time"], result: "float8" },
+    { args: ["text", "timestamp"], result: "float8" },
+    { args: ["text", "timestamptz"], result: "float8" },
+    { args: ["text", "interval"], result: "float8" },
+  ],
+
   // Sequences: the sequence id is an int8 constant (access/catalog.ts `SequenceDef.id`).
   nextval: [{ args: ["int8"], result: "int8" }],
   currval: [{ args: ["int8"], result: "int8" }],
