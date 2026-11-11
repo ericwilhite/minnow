@@ -11,7 +11,7 @@
  * - Both are synchronous and pass readiness through: `blocked` from downstream keeps the input
  *   batch borrowed (exec/pipeline.ts), and their output buffers are not touched until the next
  *   push.
- * - Neither forwards a `transfer`: the batch they push carries their own reusable selection or
+ * - Computed projections and filters do not forward a `transfer`: the batch they push carries their own reusable selection or
  *   output vectors, which a retaining consumer must copy. They hold an incoming transfer until
  *   downstream is ready, then release it.
  */
@@ -119,6 +119,7 @@ export class FilterOperator implements Operator {
 
 export class ProjectOperator implements Operator {
   readonly #exprs: readonly Compiled[];
+  readonly #columnsOnly: readonly number[] | null;
   readonly #columns: Vector[];
   readonly types: readonly PhysicalType[];
   readonly #hold = new TransferHold();
@@ -127,11 +128,26 @@ export class ProjectOperator implements Operator {
     context: CompileContext,
     readonly downstream: Operator,
   ) {
+    this.#columnsOnly = exprs.every((expr) => expr.op === "column")
+      ? exprs.map((expr) => expr.index)
+      : null;
     this.#exprs = exprs.map((expr) => compileExpr(expr, context));
     this.#columns = new Array<Vector>(exprs.length);
     this.types = this.#exprs.map((expr) => expr.type);
   }
+  get reclassifiesTransfers(): boolean {
+    return this.#columnsOnly !== null && this.downstream.reclassifiesTransfers === true;
+  }
   push(batch: Batch, transfer?: Transfer): PushResult {
+    if (transfer?.detachableBuffers && this.#columnsOnly !== null) {
+      // New column-list ownership: a retaining receiver must never observe #columns reused.
+      const columns = this.#columnsOnly.map((index) => {
+        const vector = batch.columns[index];
+        if (vector === undefined) throw new TypeError("Missing projected column");
+        return vector;
+      });
+      return this.downstream.push({ ...batch, columns }, transfer);
+    }
     for (let c = 0; c < this.#exprs.length; c++) {
       const expr = this.#exprs[c];
       if (expr === undefined) continue;

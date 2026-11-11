@@ -35,6 +35,13 @@ import { layoutOf, type Layout, type PhysicalType } from "../types.js";
 import { int128At, setInt128 } from "../vector/int128.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import type { FlatVector, Validity, Vector, VectorData } from "../vector/vector.js";
+import { frameTransferList } from "./frame-buffers.js";
+
+/** A destructive, terminal drain. Capacities survive irreversible detachment. */
+export interface ChunkTransfer {
+  reclassify(buffers: ReadonlySet<ArrayBuffer>): number;
+  release(): number;
+}
 
 const TWO_32 = 4_294_967_296;
 /**
@@ -142,15 +149,15 @@ interface Rows {
 }
 
 class Column {
-  readonly chunks: FlatVector[] = [];
+  readonly chunks: Array<FlatVector | undefined> = [];
   /** One all-ones-initialised bitmap per chunk; `chunk.validity` points at it once it has a null. */
-  readonly bitmaps: Validity[] = [];
+  readonly bitmaps: Array<Validity | undefined> = [];
   /** Bytes used in each varlen chunk's arena. */
   readonly used: number[] = [];
   tier: number;
   hasNulls = false;
   /** Fixed-width layouts: each chunk's value array (int64: only at the safe tier), for gathers. */
-  arrays: Array<Int32Array | Float64Array | Float32Array | Uint8Array> = [];
+  arrays: Array<Int32Array | Float64Array | Float32Array | Uint8Array | undefined> = [];
   constructor(
     readonly type: PhysicalType,
     readonly layout: Layout,
@@ -200,6 +207,9 @@ export class ColumnStore {
   /** Wide decimal values held (charged per value). */
   #wideBytes = 0;
   #closed = false;
+  #draining = false;
+  #transfers: Set<() => void> | null = null;
+  #prepared: WeakSet<FlatVector> | null = null;
 
   constructor(
     types: readonly PhysicalType[],
@@ -238,6 +248,55 @@ export class ColumnStore {
     if (chunk === undefined) throw new RangeError("No such chunk");
     chunk.length = Math.max(0, Math.min(this.chunkRows, this.rows - k * this.chunkRows));
     return chunk;
+  }
+
+  /** Prepare a tight whole chunk for a terminal transfer. The caller pays bounded handoff
+   * metadata and drops its cached views in forget. No append/reset/truncate follows this call.
+   * Adoption retires only the prepaid subset; release disposes anything copied/refused instead.
+   * The private all-valid bitmap is retained when it is not part of the transferred vector.
+   */
+  transferChunk(c: number, k: number, forget: () => void): ChunkTransfer {
+    if (this.#closed) throw new TypeError("Closed store cannot transfer a chunk");
+    const column = this.#col(c);
+    let chunk: FlatVector | null = this.chunk(c, k);
+    if (chunk.data.layout === "decimal" && chunk.data.coefficients.repr === "wide")
+      throw new TypeError("Wide JS coefficients cannot transfer");
+    this.#prepared ??= new WeakSet();
+    if (this.#prepared.has(chunk)) throw new TypeError("Chunk transfer already prepared");
+    const pending = new Map(
+      frameTransferList({ rowCount: chunk.length, columns: [chunk], dictionaries: [] }).map(
+        (buffer) => [buffer, buffer.byteLength] as const,
+      ),
+    );
+    this.#prepared.add(chunk);
+    const bitmapMoves = chunk.validity !== null;
+    this.#draining = true;
+    const abandon = () => {
+      pending.clear();
+      chunk = null;
+    };
+    (this.#transfers ??= new Set()).add(abandon);
+    const retire = (buffers?: ReadonlySet<ArrayBuffer>) => {
+      if (pending.size === 0) return 0;
+      let bytes = 0;
+      for (const [buffer, capacity] of pending) {
+        if (buffers !== undefined && !buffers.has(buffer)) continue;
+        pending.delete(buffer);
+        bytes += capacity;
+      }
+      if (chunk !== null && (bytes > 0 || pending.size === 0)) {
+        column.chunks[k] = undefined;
+        column.arrays[k] = undefined;
+        column.used[k] = 0;
+        if (bitmapMoves) column.bitmaps[k] = undefined;
+        chunk = null;
+        forget();
+      }
+      if (bytes > 0) this.#free(bytes);
+      if (pending.size === 0) this.#transfers?.delete(abandon);
+      return bytes;
+    };
+    return { reclassify: retire, release: () => retire() };
   }
 
   /** Single-chunk mode: the chunk's vectors, `length` = rows. Valid until the next append/reset. */
@@ -540,6 +599,7 @@ export class ColumnStore {
     varlenNeed: (c: number, n: number, done: number) => number,
   ): number {
     if (this.#closed) return 0;
+    if (this.#draining) throw new TypeError("Cannot append after a terminal chunk transfer");
     // A zero-column tuple still contributes a row, but allocates no column chunks.
     if (this.#columns.length === 0) {
       const taken = Math.max(
@@ -807,6 +867,7 @@ export class ColumnStore {
 
   /** Drops rows past `rows`, freeing whole chunks beyond it. */
   truncate(rows: number): void {
+    if (this.#draining) throw new TypeError("Cannot truncate after a terminal chunk transfer");
     if (rows < 0 || rows > this.rows) throw new RangeError("Truncate outside the store");
     const keep = Math.ceil(rows / this.chunkRows);
     for (const column of this.#columns) {
@@ -842,6 +903,7 @@ export class ColumnStore {
    * (with `shrink`, every arena past its initial size: give a progress loan back).
    */
   reset(shrink = false): void {
+    if (this.#draining) throw new TypeError("Cannot reset after a terminal chunk transfer");
     this.rows = 0;
     for (const column of this.#columns) {
       const bitmap = column.bitmaps[0];
@@ -883,6 +945,9 @@ export class ColumnStore {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    for (const abandon of this.#transfers ?? []) abandon();
+    this.#transfers = null;
+    this.#prepared = null;
     for (const column of this.#columns) {
       column.chunks.length = 0;
       column.bitmaps.length = 0;

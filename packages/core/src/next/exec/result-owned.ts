@@ -1,5 +1,5 @@
 /** Authorize only tight dedicated buffers named by the source transfer, charged to this sink.
- * Cached pages, pooled slabs, reusable output, foreign grants and wide JS arrays copy instead.
+ * Cached pages, pooled slabs, reusable output, unapproved foreign accounts and wide JS arrays copy instead.
  */
 import type { ByteBudget } from "../access/space.js";
 import type { Batch, DictionaryVector, FlatVector } from "../vector/vector.js";
@@ -80,7 +80,8 @@ export function ownedResultColumns(
   if (
     batch.selection !== null ||
     !transfer?.detachableBuffers ||
-    transfer.detachableBudget !== budget
+    (transfer.detachableBudget !== budget &&
+      !(transfer.detachableBudget !== undefined && transfer.detachableReclassify === true))
   )
     return null;
   const allowed = transfer.detachableBuffers,

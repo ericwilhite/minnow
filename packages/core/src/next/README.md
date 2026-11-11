@@ -2015,9 +2015,47 @@ shipped-engine or stored-format change.
   retain the general sorter. Refusal or reclamation replays the resident rows into its spill
   path before any output. All scratch is charged before allocation, and cancellation keeps
   borrowed output/replay buffers charged until readiness and spill cleanup settle.
-  `CompileOptions.columnarSort: false` selects the parent path for paired measurements.
-  Results still pass through the normal contiguous result-frame copy after the permutation
-  gather; this path does not transfer source storage or result-buffer ownership.
+  `CompileOptions.columnarSort: false` selects the general path in the same candidate build;
+  it is not a separately built parent binary. Dedicated gather arrays now move through
+  column-only projections into result frames after the result account charges their full size.
+  A whole unchanged tight source chunk can move without gathering. Result adoption retires
+  its resident native-buffer charge before publishing the frame; source caches drop their views,
+  and capacities are recorded before irreversible detachment. Homogeneous representation
+  metadata survives retired chunks, so later partial tails still gather exact int64 values.
+  Copied/refused chunks retire at
+  borrow release instead. Both retirement and final credit return are idempotent. Ordinary idle
+  source holding is returned immediately; the next-gather reserve and progress-loan credit stay
+  with the source. Bounded handoff metadata uses a prepaid 16 KiB allowance.
+  Partial/padded source
+  chunks, unmarked buffers, computed projections and refused result adoption keep the copying
+  fallback. `sortOwnership: false` disables this ownership optimization for paired controls.
+  Incoming borrowed payloads still copy into the resident store; source-page ownership is not
+  transferred by this step. When input is genuinely dictionary-encoded text and the receiver can copy/reclassify it, the
+  resident store now keeps codes and an owned byte-exact union of page dictionaries, gathering
+  codes once and exposing one immutable dictionary identity through output. Borrow-only
+  receivers keep flat outputs so dictionary memory never outlives its source grant. Flat text does not
+  acquire a dictionary. Mixed forms, nullable dictionary entries, a 32,768-entry union limit or
+  admission refusal replay logical text into the general sorter before any output. Source local
+  codes and hashes are never treated as global equality. Translation caches handle appended
+  entry prefixes, and dictionary/scratch growth overlap is charged before allocation.
+  `sortDictionaries: false` selects the same-build copying control.
+  Seeded result-frame histories cover local dictionaries through explicit reclaim, real spill
+  and merge, stable wire IDs/deltas consumed after source close, and every column-detachment
+  prefix on first/later frames under cancellation or receiver failure. These histories use
+  PGlite values (including wide int64, NULLs and UTF-8) and assert account totals at handoff,
+  partial detachment, sink abort and idempotent frame-credit return.
+  Large resident sorts additionally compress complete normalized key tuples into exact ranks
+  when at most 32,768 distinct keys fit. Hash collisions compare every word; 128 collision
+  probes or admission refusal decline ranking. Unsuitable keys retain their exact words.
+  Stable sorting can omit a suffix only after proving that suffix key is globally ordered in
+  arrival order. Remaining fields trim constant low bits and their minimum/range, then pack in
+  key priority across word boundaries, retaining NULL, NaN, signed-zero peers and both int64
+  words. Packing is declined when it removes no rank, suffix, word or radix digit. Original
+  key storage stays conservatively charged until cleanup, including new scratch overlap.
+  The typed sorter adopts LSD's finished permutation instead of copying it after an odd pass;
+  other callers retain the existing in-place contract. `sortCompression: false` disables this
+  stage in the same build. Sort profiles expose packed bits/words, ranked keys, proven suffixes,
+  rank refusals and actual radix passes. These are structural diagnostics, not timing claims.
 - An ICU `COLLATE` sorts by query-wide ranks from `Intl.Collator` (ties by bytes) when the
   distinct values fit; otherwise, and for JSON and array keys, a value comparator (compare
   mode), in memory and across runs (DECISIONS.md C8). Compare mode decodes each row's JSONB,
@@ -2028,8 +2066,11 @@ shipped-engine or stored-format change.
   are rejected before key encoding. First-key ties and unsupported first-key types retain the
   full comparison. The fixed scalar snapshot is charged and retains no input buffers.
   Up to 65,536 kept rows, it holds its next compaction's store in reserve, so a full
-  grant compacts instead of spilling whenever it can hold the kept rows twice. `GroupTopKOperator` is ROW_NUMBER() ≤ k per partition (the row number appended);
-  after a compaction each partition keeps its k-th key, and rows that cannot beat it are dropped.
+  grant compacts instead of spilling whenever it can hold the kept rows twice. `GroupTopKOperator`
+  supports sole ROW_NUMBER() ≤ k and RANK() ≤ k bounds. RANK counts preceding rows and keeps
+  every peer at the K-th-row boundary, including across runs. After compaction, each partition
+  keeps its K-th key; a raw first numeric key rejects only strictly worse arrivals before full
+  encoding. Ties still take the exact full-key comparison.
 - Grant-or-spill: sorted runs of typed spill pages, merged with a fan-in the spill pool's room
   allows, in passes when needed; OFFSET rows are counted, not materialized.
 - A single key refused by the byte encoder drops its abandoned normalization buffers and
@@ -2098,9 +2139,15 @@ workload measures the sort and window catalogue shapes, with `--only` selecting 
 `--component` captures the actual numeric sort input once before timing, then measures the
 isolated operator; `--fixture <v8-capture>` reuses an existing predecoded capture;
 `--catalogue` checks all executing frozen small catalogue cells for regressions and records
-registered refusals. Use `--pairs 9 --output <file>` (at least nine adjacent AB/BA pairs).
+registered refusals. `--compare-stage ownership` compares dedicated output transfer disabled
+versus enabled in the same build; `--compare-stage dictionary` disables/enables code
+preservation with ownership enabled in both arms. `--compare-stage compression` selects exact
+key compression while preserving dictionaries and ownership in both arms. The default `numeric` disables/enables the entire typed path.
+Neither comparison claims a separately built parent runtime. `--with-results` includes the
+ordinary result sink in the isolated component; use it for ownership and dictionary comparisons.
+`--verify-only` checks complete output equality without running timing pairs. Use `--pairs 9 --output <file>` (at least nine adjacent AB/BA pairs).
 Every sample records all-thread process CPU including GC, wall time and host load. Complete
-parent/candidate output hashes are checked before and after timing. Acceptance uses delivery
+disabled/enabled output hashes are checked before and after timing. Acceptance uses delivery
 and release of columnar frames; a second paired measurement includes JS row materialization.
 Input construction and output hashing are outside both clocks. The median paired gain must
 exceed the type-7 paired IQR, with at least seven of nine pairs favorable; other shapes must
@@ -3221,3 +3268,30 @@ The rejected patch and complete records are in `scripts/browser-perf/experiments
 five full-width physical frame hashes equal the frozen parent. Post-campaign forced GC remains
 a diagnostic outside timing and sampled peaks; it is never used between the five passes.
 The memory gate and quiet-host throughput target remain outstanding.
+
+### Bounded ranking windows (performance candidate)
+
+`window-topk-plan.ts` recognizes a positive constant upper bound on a sole ROW_NUMBER or
+RANK result through direct column aliases. The compiler keeps the original SQL predicate.
+It excludes volatile plans, computed intermediate projections, shared window consumers,
+parameters and other functions. Native explicit-frame specs keep the ordinary evaluator;
+reviewed lowering already canonicalizes ranking frames away, following PostgreSQL's
+`windowfuncs.c` support hook. Rank gaps and every boundary peer survive compaction,
+first-key rejection and external merge. Large peer groups spill rather than truncate.
+
+The seeded native and real-SQL PGlite suites cover exact int64 low words, non-finite and
+NULL keys, both directions and NULL placements, dictionary selections, empty/global
+partitions, observed compaction/spill and conservative recognition. Native finish releases
+its unused evaluator's credit before resolving. Abort cancels a queued native loan and
+fences active spill appends, reads and downstream borrowers before releasing buffers or the
+window grant; `closed` includes that fence. The isolated legacy-governor cancellation
+histories retain five 600k TEXT values: a 64 MiB cap refuses the complete step above its
+8 MiB reserve, while 128 MiB provides a 16 MiB reserve in which the same request queues
+and cancels. This is test setup for the complete-step rule, not a production cap increase.
+The separate worker benchmark accepts
+`--compare-stage windowTopK --window-shape topk` (or `rank`) with prebuilt decoded `--fixture`
+batches. Its same-build toggle is a secondary diagnostic; quiet-host acceptance uses actual
+complete parent/candidate builds and nine AB/BA pairs, median gain greater than type-7 IQR,
+seven favorable pairs, and no reverse-rule regression on the other catalogue shapes.
+Delivered columnar frames are the acceptance clock. JS row materialization is outside that
+clock and is reported separately. No timing campaign or absolute target pass is claimed here.

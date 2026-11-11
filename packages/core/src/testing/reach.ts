@@ -3362,3 +3362,153 @@ export const JSONB_WIDE_DEADLINE_REACH = [
   "stalled work cancelled",
   "returned timer owners",
 ] as const;
+
+/** Dedicated sorting outputs move to result ownership without weakening SQL ordering. */
+export const SORT_TRANSFER_REACH = [
+  "dedicated output",
+  "foreign reclassification",
+  "pure projection",
+  "nulls and NaNs",
+  "asc",
+  "desc",
+] as const;
+
+/** Encoded text remains a code gather, with exact cross-page payload identities. */
+export const SORT_DICTIONARY_REACH = [
+  "genuine dictionaries",
+  "local code rebasing",
+  "stable dictionary identity",
+  "NULL payload",
+  "UTF8 payload",
+  "wide int64 payload",
+  "asc",
+  "desc",
+  "byte hash collision",
+  "appended dictionary prefix",
+  "raw octets",
+  "codebook bound",
+  "mixed encoding fallback",
+  "borrow-only receiver",
+] as const;
+
+/** Exact compact ordering words preserve all keys and require proof before omitting suffixes. */
+export const SORT_COMPRESSION_REACH = [
+  "ordered suffix proof",
+  "shuffled suffix retained",
+  "composite packing",
+  "tuple ranks",
+  "probe bound",
+  "explicit tied IDs",
+  "LSD threshold",
+  "above threshold",
+  "float peers",
+  "wide int64",
+  "NULL keys",
+  "hash collision",
+  "one word",
+  "word boundary",
+  "asc",
+  "desc",
+] as const;
+
+/** Native buffers change accounts exactly once, including failed adoption and frame credit. */
+export const SORT_TRANSFER_ACCOUNTING_REACH = [
+  "adopt",
+  "refuse",
+  "cancel",
+  "error",
+  "loan",
+  "loan credit stays at source",
+  "single owner after readiness",
+  "single owner before publication",
+  "irreversible detach",
+  "operator close with live frames",
+  "multiple source chunks",
+] as const;
+
+/** Actual result frames retain exact dictionary values across source close and spill replay. */
+export const SORT_DICTIONARY_LIFETIME_REACH = [
+  "resident union frames",
+  "actual spill and merge",
+  "union replay under reclaim",
+  "stable wire id and delta",
+  "local dictionary codes",
+  "NULL text",
+  "UTF8 text",
+  "exact wide int64",
+  "after source close",
+  "earlier frames detached",
+  "asc",
+  "desc",
+  "PG full output",
+] as const;
+
+/** Every prefix of a multi-column transfer is safe to cancel or fail, before or after prior credit. */
+export const SORT_TRANSFER_FAILURE_REACH = [
+  "error",
+  "cancel",
+  "zero columns",
+  "interior prefix",
+  "all columns",
+  "first frame",
+  "later frame",
+  "wide int64",
+  "nullable validity",
+  "single owner every step",
+  "source close before credit",
+  "idempotent credit",
+  "non-finite payload",
+  "dictionary header before failure",
+] as const;
+
+/** Bounded ranking preserves PostgreSQL row-count ranks and complete boundary peers. */
+export const WINDOW_TOPK_REACH = [
+  "row_number",
+  "rank",
+  "rank gaps",
+  "boundary peers",
+  "all peers without ORDER BY",
+  "NULL keys",
+  "non-finite keys",
+  "wide int64",
+  "C text partitions",
+  "unpartitioned",
+  "empty input",
+  "selected dictionary",
+  "ascending",
+  "descending",
+  "NULLS FIRST",
+  "NULLS LAST",
+  "compaction",
+  "spill",
+  "frame fallback",
+  "raw rejection",
+  "zero resources",
+] as const;
+
+export const WINDOW_TOPK_SQL_REACH = [
+  "rank",
+  "row_number",
+  "aliases",
+  "unbounded control",
+  "ordered PG rows",
+  "empty",
+  "rank frame canonicalization",
+  "computed guard",
+  "multiple functions",
+  "shared consumer",
+  "reverse comparison",
+  "strict bound",
+] as const;
+
+export const WINDOW_TOPK_LIFECYCLE_REACH = [
+  "append",
+  "read",
+  "consumer",
+  "charged until settlement",
+  "closed waits",
+  "all peers spill",
+  "queued loan cancellation",
+  "complete legacy step refused",
+  "zero resources",
+] as const;

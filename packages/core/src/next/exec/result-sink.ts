@@ -47,6 +47,7 @@ export interface ResultSinkOptions {
 }
 
 export class ResultSink implements Operator {
+  readonly reclassifiesTransfers = true;
   readonly deferEnd: boolean;
   readonly #maxRows: number | null;
   readonly #clock: TaskClock;
@@ -379,16 +380,18 @@ export class ResultSink implements Operator {
       // The source token also retains query dictionaries/readers. A wire frame has copied
       // those deltas and owns only dedicated arrays: reclassify their charge before returning
       // the source lifetime, so execution can close its query grant before frame credit.
-      const adoptedBytes = frameTransferList({
+      const adoptedBuffers = frameTransferList({
         rowCount: batch.length,
         columns: columns.filter((column): column is WireVector => column !== null),
         dictionaries: [],
-      }).reduce((sum, buffer) => sum + buffer.byteLength, 0);
+      });
+      const adoptedBytes = adoptedBuffers.reduce((sum, buffer) => sum + buffer.byteLength, 0);
       if (!this.grant.allocate(adoptedBytes)) {
         this.#free(frame);
         return null;
       }
       frame.extraBytes += adoptedBytes;
+      this.#transfer?.reclassify?.(new Set(adoptedBuffers));
       this.#at = batch.length;
       this.#rows += batch.length;
       const result = this.#offer(frame, batch.length);

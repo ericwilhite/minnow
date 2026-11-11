@@ -4,10 +4,10 @@
  * ## Operators (the executor composes them; exec/executor.ts)
  * - `SortOperator`: ORDER BY with optional LIMIT / OFFSET / WITH TIES (IR `sort`). A breaker:
  *   `push` takes rows, `finish` emits them in order to its downstream, then finishes it.
- * - `GroupTopKOperator`: `ROW_NUMBER() OVER (PARTITION BY p ORDER BY o) <= k` as a per-group
- *   top-k: the first k rows of every partition, in (partition, order) order, with the row number
- *   appended (int64). Lowering rewrites the window + filter to it only when nothing else needs
- *   the other rows (design-wide-window-sort-parallel.md §4); RANK is not this (ties).
+ * - `GroupTopKOperator`: sole ROW_NUMBER/RANK upper bounds as a per-group top-k, with the
+ *   ranking value appended (int64). RANK keeps every K-th-row boundary peer and counts rows
+ *   before a peer group. Compiler recognition keeps the outer filter and only traverses
+ *   immutable direct aliases (window-topk-plan.ts).
  * Key columns are input column indexes; outputs are the input columns (plus the row number).
  *
  * ## How (sort-keys.ts for the key law)
@@ -18,7 +18,7 @@
  *   threshold); periodically the buffer is compacted to its best k (ties kept for WITH TIES),
  *   so memory is O(k) and most rows are rejected before encoding when their first numeric key is worse. Ties and unsupported first keys use the full encoded comparison. A k too large for
  *   memory falls back to the external sort, still filtering by the threshold.
- * - **Per-group top-k** compacts the same way per partition (≤ k survivors per group); if the
+ * - **Per-group top-k** compacts the same way per partition (k rows plus boundary peers for RANK); if the
  *   survivors do not fit, it falls back to the external sort with the per-group cut at output.
  * - **External sort**: when the grant refuses, the rows in memory are sorted and written as a
  *   run of typed, checksummed spill pages (keys included); at the end the runs are merged with
@@ -129,8 +129,10 @@ export interface GroupTopKSpec {
   /** PARTITION BY columns. */
   readonly partitionBy: readonly number[];
   readonly orderBy: readonly SortColumn[];
-  /** Rows kept per partition (ROW_NUMBER() <= k). */
+  /** Row-count bound per partition; RANK includes all peers at the boundary. */
   readonly k: number;
+  readonly ranking?: "row_number" | "rank";
+  readonly partitionNulls?: "first" | "last";
 }
 
 export interface SortContext {
@@ -141,11 +143,21 @@ export interface SortContext {
   readonly signal?: AbortSignal;
   /** Compiler opt-in; ordered-set and window-internal sorts retain their existing recipes. */
   readonly columnar?: boolean;
+  /** Paired control for dedicated gather/result ownership. */
+  readonly columnarOwnership?: boolean;
+  readonly columnarDictionaries?: boolean;
+  readonly columnarCompression?: boolean;
   /** Deterministic private clock for lifecycle tests; production uses the shared task clock. */
   readonly clock?: TaskClock;
 }
 
 export interface SortProfile {
+  readonly keyBits?: number;
+  readonly packedWords?: number;
+  readonly rankedKeys?: number;
+  readonly orderedSuffixKeys?: number;
+  readonly rankRefusals?: number;
+  readonly radixPasses?: number;
   mode: "keys" | "ranks" | "compare";
   rowsIn: number;
   rowsOut: number;
@@ -395,6 +407,7 @@ class Sorter {
   /** Per-group top-k: partition key → its k-th order key so far (rows must beat it). */
   readonly #groups: ByteSet | null;
   #groupThresholds: Array<Uint8Array | undefined> = [];
+  #groupFirstThresholds: Array<FirstKeyThreshold | undefined> = [];
   /** Bytes of the threshold copies (charged before each copy, freed on replace and close). */
   #thresholdBytes = 0;
   /** The grant refused a threshold: the optimization is off (rows are kept, just not filtered). */
@@ -584,6 +597,27 @@ class Sorter {
           if (n !== count) return this.#addKeyed(columns, this.groupKept.subarray(0, n), n);
         }
       }
+      const groups = this.#groups,
+        part = this.partEncoder;
+      if (groups !== null && part !== null && this.#groupFirstThresholds.length > 0) {
+        const encoded = part.encode(columns, ids, 0, count);
+        const first = this.spec.keys[this.spec.partition];
+        const vector = first === undefined ? undefined : columns[first.column];
+        if (encoded.done === count && vector !== undefined) {
+          const bytes = part.keys.writer.bytes,
+            offsets = part.keys.offsets;
+          let kept = 0;
+          for (let i = 0; i < count; i++) {
+            const id = groups.find(bytes, offsets[i] ?? 0, offsets[i + 1] ?? 0);
+            const row = ids === null ? i : (ids[i] ?? 0);
+            if (id < 0 || this.#groupFirstThresholds[id]?.accepts(vector, row) !== false)
+              this.groupKept[kept++] = row;
+          }
+          this.profile.rejected += count - kept;
+          if (kept === 0) return;
+          if (kept < count) return this.#addKeyed(columns, this.groupKept.subarray(0, kept), kept);
+        }
+      }
       return this.#addKeyed(columns, ids, count);
     }
     if (this.mode === "ranks" && !this.#collect(columns, ids, count)) this.#toCompare();
@@ -709,7 +743,8 @@ class Sorter {
       const threshold = id < 0 ? undefined : this.#groupThresholds[id];
       if (
         threshold === undefined ||
-        compareRanges(bytes, start, end, threshold, 0, threshold.length) < 0
+        compareRanges(bytes, start, end, threshold, 0, threshold.length) <
+          (this.spec.withTies ? 1 : 0)
       )
         this.groupKept[m++] = rows === null ? k : (rows[k] ?? 0);
     }
@@ -1023,6 +1058,16 @@ class Sorter {
         return;
       }
       const old = this.#groupThresholds[group];
+      const first = this.spec.keys[this.spec.partition];
+      if (first !== undefined && directWidth(this.spec.types, [first]) !== null) {
+        let gate = this.#groupFirstThresholds[group];
+        if (gate === undefined && this.charge.allocate(FirstKeyThreshold.BYTES)) {
+          gate = new FirstKeyThreshold(first);
+          this.#groupFirstThresholds[group] = gate;
+          this.#thresholdBytes += FirstKeyThreshold.BYTES;
+        }
+        gate?.capture(store.chunk(first.column, id >>> store.chunkShift), id & store.chunkMask);
+      }
       this.#groupThresholds[group] = bytes.slice(start, end);
       this.#thresholdBytes += end - start;
       if (this.#thresholdBytes > this.profile.thresholdBytes)
@@ -1039,6 +1084,7 @@ class Sorter {
     if (this.#thresholdBytes > 0) this.charge.free(this.#thresholdBytes);
     this.#thresholdBytes = 0;
     this.#groupThresholds = [];
+    this.#groupFirstThresholds = [];
     this.#groupThresholdsOff = true;
   }
 
@@ -1055,12 +1101,17 @@ class Sorter {
         }
       return ids.subarray(0, n);
     }
-    let m = 0;
-    let inGroup = 0;
-    for (let i = 0; i < ids.length; i++) {
-      const id = ids[i] ?? 0;
-      if (i > 0 && !this.samePartitionIds(ids[i - 1] ?? 0, id)) inGroup = 0;
-      if (inGroup < keep) ids[m++] = id;
+    let m = 0,
+      inGroup = 0,
+      rank = 1,
+      previous = -1;
+    for (const id of ids) {
+      if (previous < 0 || !this.samePartitionIds(previous, id)) {
+        inGroup = 0;
+        rank = 1;
+      } else if (this.spec.withTies && this.compareIds(previous, id) !== 0) rank = inGroup + 1;
+      if (inGroup < keep || (this.spec.withTies && rank <= keep)) ids[m++] = id;
+      previous = id;
       inGroup++;
       if (slice.tick()) yield;
     }
@@ -1175,6 +1226,7 @@ class Sorter {
   }
 
   samePartitionIds(a: number, b: number): boolean {
+    if (this.spec.partition === 0) return true;
     const store = this.store;
     const shift = store.chunkShift;
     const mask = store.chunkMask;
@@ -1219,6 +1271,7 @@ class Sorter {
     ao: Operands | null = null,
     bo: Operands | null = null,
   ): boolean {
+    if (this.spec.partition === 0) return true;
     if (this.mode !== "keys")
       return compareRows(this.spec.types, this.#partKeys, a, i, b, j, ao, bo) === 0;
     const plen = this.prefixColumn + PREFIX_WORDS;
@@ -1924,8 +1977,13 @@ class Sorter {
     );
   }
 
-  abort(reason: unknown): void {
+  /** Mark cancellation before draining asynchronous borrowers; do not free their buffers. */
+  cancel(reason: unknown): void {
     if (this.#aborted === undefined) this.#aborted = reason ?? new Error("Aborted");
+  }
+
+  abort(reason: unknown): void {
+    this.cancel(reason);
     this.close();
   }
 
@@ -1939,6 +1997,7 @@ class Sorter {
     if (this.#thresholdBytes > 0) this.charge.free(this.#thresholdBytes);
     this.#thresholdBytes = 0;
     this.#groupThresholds = [];
+    this.#groupFirstThresholds = [];
     this.partEncoder?.close(this.pool);
     for (const set of this.#sets) set?.close();
     if (this.#reserved > 0) this.charge.free(this.#reserved);
@@ -2557,20 +2616,23 @@ export class SortOperator implements Operator {
   }
 }
 
-/** `ROW_NUMBER() OVER (PARTITION BY … ORDER BY …) <= k` as a per-group top-k. */
+/** Sole ROW_NUMBER/RANK <= k, with complete boundary peers for RANK. */
 export class GroupTopKOperator implements Operator {
   readonly spec: GroupTopKSpec;
   readonly #sorter: Sorter;
   readonly #emitter: Emitter;
   #pending: Promise<void> | null = null;
   #done = false;
+  #working: Promise<void> | null = null;
+  #closing: Promise<void> | null = null;
+  readonly #cancel = new AbortController();
 
   constructor(spec: GroupTopKSpec, context: SortContext, downstream: Operator) {
     this.spec = spec;
     const partition: SortColumn[] = spec.partitionBy.map((column) => ({
       column,
       direction: "asc",
-      nulls: "first",
+      nulls: spec.partitionNulls ?? "first",
       collation: null,
     }));
     this.#sorter = new Sorter(
@@ -2579,10 +2641,15 @@ export class GroupTopKOperator implements Operator {
         keys: [...partition, ...spec.orderBy],
         partition: partition.length,
         keep: spec.k,
-        withTies: false,
+        withTies: spec.ranking === "rank",
         heldRow: true,
       },
-      context,
+      {
+        ...context,
+        signal: context.signal
+          ? AbortSignal.any([context.signal, this.#cancel.signal])
+          : this.#cancel.signal,
+      },
     );
     this.#emitter = new Emitter(this.#sorter, downstream, true);
   }
@@ -2595,7 +2662,18 @@ export class GroupTopKOperator implements Operator {
   }
 
   get closed(): Promise<void> {
-    return this.#sorter.closed;
+    return this.#closing ?? this.#sorter.closed;
+  }
+
+  #track(work: Promise<unknown>): void {
+    const settled = work.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#working = settled;
+    void settled.then(() => {
+      if (this.#working === settled) this.#working = null;
+    });
   }
 
   push(batch: Batch, transfer?: Transfer): PushResult {
@@ -2618,6 +2696,7 @@ export class GroupTopKOperator implements Operator {
         throw error;
       },
     );
+    this.#track(this.#pending);
     return "blocked";
   }
 
@@ -2637,16 +2716,20 @@ export class GroupTopKOperator implements Operator {
       this.abort(error);
       throw error;
     }
+    if (isPromise(resident)) this.#track(resident);
     const fail = (error: unknown): never => {
       this.abort(error);
       throw error;
     };
     const after = (inMemory: boolean): MaybePromise<void> => {
+      sorter.checkAborted();
       if (inMemory) {
         this.#end();
         return this.#emitter.downstream.finish();
       }
-      return this.#emitMerged().then(async () => {
+      const merged = this.#emitMerged();
+      this.#track(merged);
+      return merged.then(async () => {
         this.#end();
         await sorter.closed;
         await this.#emitter.downstream.finish();
@@ -2667,15 +2750,22 @@ export class GroupTopKOperator implements Operator {
     const ids = yield* sorter.sortJob(slice);
     if (ids === null) return false;
     const kept = sorter.mode === "keys" ? yield* sorter.cutJob(ids, slice) : ids;
-    let rowNumber = 0;
+    let rowNumber = 0,
+      rank = 1,
+      previous = -1;
     for (let i = 0; i < kept.length; i++) {
       const id = kept[i] ?? 0;
-      if (i === 0 || !sorter.samePartitionIds(kept[i - 1] ?? 0, id)) rowNumber = 0;
+      if (previous < 0 || !sorter.samePartitionIds(previous, id)) {
+        rowNumber = 0;
+        rank = 1;
+      } else if (sorter.compareIds(previous, id) !== 0) rank = rowNumber + 1;
       rowNumber++;
-      if (rowNumber <= k) {
+      const value = this.spec.ranking === "rank" ? rank : rowNumber;
+      if (value <= k) {
         const range: Range = { kind: "store", ids: kept, from: i, count: 1 };
-        yield* emitJob(this.#emitter, range, i, 1, rowNumber, slice);
+        yield* emitJob(this.#emitter, range, i, 1, value, slice);
       }
+      previous = id;
       if (slice.tick()) yield;
     }
     const flushed = this.#emitter.flush();
@@ -2690,7 +2780,8 @@ export class GroupTopKOperator implements Operator {
     await sorter.prepareMerge();
     // The partition's first row: rows of one partition have equal partition keys.
     const first = new HeldRow(sorter);
-    let rowNumber = 0;
+    let rowNumber = 0,
+      rank = 1;
     try {
       for await (const range of sorter.merge()) {
         const end = range.from + range.count;
@@ -2707,10 +2798,19 @@ export class GroupTopKOperator implements Operator {
             )
           ) {
             rowNumber = 0;
+            rank = 1;
+            await first.hold(range.columns, r);
+          } else if (
+            this.spec.ranking === "rank" &&
+            rank <= k &&
+            !sorter.sameKey(first.vectors, 0, range.columns, r, first.operands, range.operands)
+          ) {
+            rank = rowNumber + 1;
             await first.hold(range.columns, r);
           }
           rowNumber++;
-          if (rowNumber <= k) await emitRange(this.#emitter, range, r, 1, rowNumber);
+          const value = this.spec.ranking === "rank" ? rank : rowNumber;
+          if (value <= k) await emitRange(this.#emitter, range, r, 1, value);
           else if ((r & (SLICE_ROWS - 1)) === 0) {
             const paced = sorter.pace();
             if (paced !== null) await paced;
@@ -2731,10 +2831,17 @@ export class GroupTopKOperator implements Operator {
   }
 
   abort(reason: unknown): void {
-    this.#sorter.abort(reason);
-    if (!this.#done) {
-      this.#done = true;
+    if (this.#closing !== null) return;
+    this.#cancel.abort(reason);
+    this.#sorter.cancel(reason);
+    this.#done = true;
+    const working = this.#working;
+    this.#closing = (async () => {
+      await working;
       this.#emitter.close();
-    }
+      this.#sorter.abort(reason);
+      await this.#sorter.closed;
+    })();
+    void this.#closing.catch(() => undefined);
   }
 }

@@ -1,21 +1,38 @@
 /** Numeric sort words and a single gather of each payload column. No key byte strings. */
 import { layoutOf, type PhysicalType } from "../types.js";
 import { allocateData, dataBytes, type FlatVector, type VectorData } from "../vector/vector.js";
-import { ColumnStore, wordsOf } from "./column-store.js";
+import { ColumnStore, TIER_INT64, wordsOf } from "./column-store.js";
 import type { SortColumn } from "./sort-keys.js";
+import { frameTransferList } from "./frame-buffers.js";
 import type { Slice, SlicedJob } from "./slices.js";
 
 type Varlen = Extract<VectorData, { layout: "varlen" }>;
 export interface GatherColumn {
   readonly type: PhysicalType;
-  readonly chunks: FlatVector[];
+  readonly chunks: Array<FlatVector | undefined>;
   readonly nullable: boolean;
-  readonly floats: Float64Array[];
-  readonly integers: Int32Array[];
-  readonly singles: Float32Array[];
-  readonly booleans: Uint8Array[];
-  readonly wide: Int32Array[];
-  readonly variable: Varlen[];
+  /** The homogeneous representation survives retirement of every earlier chunk. */
+  readonly wideInt64: boolean;
+  readonly floats: Array<Float64Array | undefined>;
+  readonly integers: Array<Int32Array | undefined>;
+  readonly singles: Array<Float32Array | undefined>;
+  readonly booleans: Array<Uint8Array | undefined>;
+  readonly wide: Array<Int32Array | undefined>;
+  readonly variable: Array<Varlen | undefined>;
+}
+
+/** Drop every cached view when the store's whole chunk leaves its ownership. */
+export function retireGatherChunk(source: GatherColumn, k: number): void {
+  for (const cache of [
+    source.chunks,
+    source.floats,
+    source.integers,
+    source.singles,
+    source.booleans,
+    source.wide,
+    source.variable,
+  ])
+    cache[k] = undefined;
 }
 
 /** Cache homogeneous primitive arrays once, outside the row gather loops. */
@@ -29,6 +46,7 @@ export function* gatherSource(
   const source: GatherColumn = {
     type,
     nullable: store.hasNulls(c),
+    wideInt64: layoutOf(type) === "int64" && store.tier(c) === TIER_INT64,
     chunks: [],
     floats: [],
     integers: [],
@@ -70,7 +88,7 @@ export function* gatherSource(
 }
 
 function copyFloats(
-  arrays: Float64Array[],
+  arrays: Array<Float64Array | undefined>,
   ids: Int32Array,
   from: number,
   n: number,
@@ -231,10 +249,8 @@ export function gatherColumn(
   varlen: number,
 ): FlatVector {
   const chunks = source.chunks;
-  const first = chunks[0];
-  if (first === undefined) throw new TypeError("Missing gather source");
   let data: VectorData;
-  if (first.data.layout === "int64" && first.data.values.repr === "int64")
+  if (source.wideInt64)
     data = { layout: "int64", values: { repr: "int64", values: new BigInt64Array(n) } };
   else data = allocateData(source.type, n, varlen);
   const validity = source.nullable ? new Uint32Array(Math.ceil(n / 32)).fill(0xffff_ffff) : null;
@@ -304,4 +320,41 @@ export function gatherColumn(
       throw new TypeError(`Unsupported columnar payload ${layoutOf(source.type)}`);
   }
   return { form: "flat", type: source.type, length: n, validity, data };
+}
+
+/** A whole unchanged chunk can move; subranges/padded arenas remain a gather. The caller has
+ * already proved a permutation, so no emitted source row is used by another output frame. */
+export function moveGatherColumn(
+  source: GatherColumn,
+  ids: Int32Array,
+  from: number,
+  n: number,
+  shift: number,
+  mask: number,
+): FlatVector | null {
+  const first = ids[from] ?? -1;
+  if (first < 0 || (first & mask) !== 0) return null;
+  const chunk = source.chunks[first >>> shift];
+  if (chunk?.length !== n) return null;
+  for (let i = 1; i < n; i++) if (ids[from + i] !== first + i) return null;
+  const data = chunk.data;
+  if (data.layout === "varlen") {
+    if (data.offsets.length !== n + 1 || data.bytes.length !== data.offsets[n]) return null;
+  } else if (data.layout === "int64") {
+    if (data.values.values.length !== n) return null;
+  } else if (
+    data.layout === "bool" ||
+    data.layout === "i32" ||
+    data.layout === "f32" ||
+    data.layout === "f64"
+  ) {
+    if (data.values.length !== n) return null;
+  } else return null;
+  if (chunk.validity !== null && chunk.validity.length !== Math.ceil(n / 32)) return null;
+  try {
+    frameTransferList({ rowCount: n, columns: [chunk], dictionaries: [] });
+  } catch {
+    return null;
+  }
+  return chunk;
 }

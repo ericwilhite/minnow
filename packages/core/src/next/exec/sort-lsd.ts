@@ -11,6 +11,8 @@ export function* lsdSortIds(
   n: number,
   slice: Slice,
   radix: RadixScratch,
+  profile?: { passes: number },
+  adopt?: (sorted: Int32Array, temporary: Int32Array) => void,
 ): Generator<void, void, void> {
   for (let i = 0; i < n; i++) {
     ids[i] = i;
@@ -30,6 +32,7 @@ export function* lsdSortIds(
     }
     for (const shift of [0, 16]) {
       if (((diff >>> shift) & 65535) === 0) continue;
+      if (profile !== undefined) profile.passes++;
       counts.fill(0);
       for (let at = 0; at < n; at += LSD_STEP_ROWS) {
         histogram(values, source, counts, shift, at, Math.min(n, at + LSD_STEP_ROWS));
@@ -46,7 +49,8 @@ export function* lsdSortIds(
       [source, target] = [target, source];
     }
   }
-  if (source !== ids)
+  if (adopt !== undefined) adopt(source, target);
+  else if (source !== ids)
     for (let at = 0; at < n; at += LSD_STEP_ROWS) {
       ids.set(source.subarray(at, Math.min(n, at + LSD_STEP_ROWS)), at);
       if (slice.due()) yield;

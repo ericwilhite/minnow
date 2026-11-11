@@ -3,8 +3,14 @@
  */
 import type { PhysicalType } from "../types.js";
 import { layoutOf } from "../types.js";
-import { BATCH_ROWS, BATCH_TARGET_BYTES, type Batch, type FlatVector } from "../vector/vector.js";
-import { ColumnStore } from "./column-store.js";
+import {
+  BATCH_ROWS,
+  BATCH_TARGET_BYTES,
+  type Batch,
+  type FlatVector,
+  type DictionaryVector,
+} from "../vector/vector.js";
+import { ColumnStore, type ChunkTransfer } from "./column-store.js";
 import {
   isPromise,
   YIELD_INTERVAL_MS,
@@ -15,17 +21,22 @@ import {
 import { RadixScratch, isByteCollation, mergeSortJob } from "./sort-keys.js";
 import { lsdSortIds } from "./sort-lsd.js";
 import { Slice, runSliced, type SlicedJob } from "./slices.js";
+import { frameTransferList } from "./frame-buffers.js";
 import { Charge } from "./spill-pool.js";
 import {
   encodeNumericColumns,
   gatherBytes,
   gatherColumn,
   gatherSource,
+  moveGatherColumn,
+  retireGatherChunk,
   numericWordCount,
   varlenGatherBytes,
   type GatherColumn,
 } from "./sort-columnar-data.js";
 import type { SortContext, SortProfile, SortSpec } from "./sort.js";
+import { SortKeyCompression, type CompressionStats } from "./sort-compress.js";
+import { SortDictionary } from "./sort-dictionary.js";
 import type { Loan } from "../memory/governor.js";
 
 interface GeneralSort extends Operator {
@@ -34,7 +45,8 @@ interface GeneralSort extends Operator {
   reclaim(): void | Promise<void>;
   discard(): void;
 }
-const META_BYTES = 4096;
+// At most sixteen active chunk handoffs: closure/Map entries, output descriptors and views.
+const META_BYTES = 16 * 1024;
 const MAX_INPUT_BYTES = 256 * 1024;
 const SMALL_SORT = 65_536;
 
@@ -59,7 +71,9 @@ export function columnarNumericSort(spec: SortSpec): boolean {
 
 export class ColumnarSortOperator implements Operator {
   readonly #charge: Charge;
-  readonly #store: ColumnStore;
+  #store: ColumnStore;
+  #dictionaries: Array<SortDictionary | null> = [];
+  #dictionaryInitialized = false;
   readonly #slice: Slice;
   readonly #abort = new AbortController();
   readonly #onAbort: () => void;
@@ -78,6 +92,9 @@ export class ColumnarSortOperator implements Operator {
   #reason: unknown;
   #reserved: number;
   #scratchBytes = 0;
+  #compression: SortKeyCompression | null = null;
+  #compressionStats: CompressionStats | null = null;
+  readonly #radixProfile = { passes: 0 };
   #words: Uint32Array[] = [];
   #ids: Int32Array | null = null;
   #temporary: Int32Array | null = null;
@@ -135,6 +152,16 @@ export class ColumnarSortOperator implements Operator {
       operandBytes: 0,
       thresholdBytes: 0,
       columnarRows: this.#columnarRows,
+      ...(this.#compressionStats === null
+        ? {}
+        : {
+            keyBits: this.#compressionStats.bits,
+            packedWords: this.#compressionStats.words,
+            rankedKeys: this.#compressionStats.rankedKeys,
+            orderedSuffixKeys: this.#compressionStats.orderedSuffixKeys,
+            rankRefusals: this.#compressionStats.rankRefusals,
+          }),
+      radixPasses: this.#radixProfile.passes,
     };
   }
 
@@ -183,8 +210,84 @@ export class ColumnarSortOperator implements Operator {
   *#arrival(batch: Batch): SlicedJob<void> {
     this.#check();
     if (this.#slice.due()) yield;
-    const work = this.#add(batch);
-    if (isPromise(work)) yield work;
+    let bytes = 0;
+    try {
+      const prepared =
+        this.#fallback === null && this.#bounded(batch)
+          ? yield* this.#dictionaryBatch(batch)
+          : { batch, bytes: 0 };
+      bytes = prepared?.bytes ?? 0;
+      const work =
+        prepared === null
+          ? this.#external().then(() => this.#forward(batch))
+          : this.#add(prepared.batch, batch);
+      if (isPromise(work)) yield work;
+    } finally {
+      if (bytes) this.#charge.free(bytes);
+    }
+  }
+
+  *#dictionaryBatch(batch: Batch): SlicedJob<{ batch: Batch; bytes: number } | null> {
+    if (
+      this.context.columnarDictionaries === false ||
+      this.downstream.reclassifiesTransfers !== true
+    )
+      return { batch, bytes: 0 };
+    if (!this.#dictionaryInitialized) {
+      this.#dictionaryInitialized = true;
+      const types = this.spec.types.slice();
+      for (let c = 0; c < types.length; c++) {
+        const type = types[c],
+          vector = batch.columns[c];
+        if (type?.kind !== "text" || vector?.form !== "dictionary") {
+          this.#dictionaries.push(null);
+          continue;
+        }
+        const dictionary = new SortDictionary(type, this.#charge);
+        this.#dictionaries.push(dictionary);
+        if (!dictionary.init()) return null;
+        types[c] = { kind: "int32", bits: 32 };
+      }
+      if (this.#dictionaries.some((d) => d !== null)) {
+        this.#store.close();
+        this.#store = new ColumnStore(types, this.#charge);
+      }
+    }
+    const count = this.#dictionaries.filter((d) => d !== null).length;
+    if (!count) return { batch, bytes: 0 };
+    const bytes = count * (128 + batch.length * 4);
+    if (!this.#charge.allocate(bytes)) return null;
+    let published = false;
+    try {
+      const columns = batch.columns.slice();
+      for (let c = 0; c < this.#dictionaries.length; c++) {
+        const dictionary = this.#dictionaries[c];
+        if (!dictionary) continue;
+        const source = batch.columns[c];
+        if (source?.form !== "dictionary") return null;
+        const translation = yield* dictionary.translate(source.dictionary, this.#slice);
+        if (translation === null) return null;
+        const codes = new Int32Array(batch.length);
+        for (let row = 0; row < batch.length; row++)
+          codes[row] = translation[source.codes[row] ?? 0] ?? 0;
+        columns[c] = {
+          form: "flat",
+          type: { kind: "int32", bits: 32 },
+          length: source.length,
+          validity: source.validity,
+          data: { layout: "i32", values: codes },
+        };
+        if (this.#slice.due()) yield;
+      }
+      published = true;
+      return { batch: { ...batch, columns }, bytes };
+    } finally {
+      if (!published) this.#charge.free(bytes);
+    }
+  }
+  #dropDictionaries(): void {
+    for (const dictionary of this.#dictionaries) dictionary?.close();
+    this.#dictionaries.length = 0;
   }
 
   #bounded(batch: Batch): boolean {
@@ -210,7 +313,7 @@ export class ColumnarSortOperator implements Operator {
     return fallback.push(batch) === "blocked" ? fallback.ready() : undefined;
   }
 
-  #add(batch: Batch): void | Promise<void> {
+  #add(batch: Batch, original: Batch = batch): void | Promise<void> {
     this.#check();
     if (this.#fallback !== null) return this.#forward(batch);
     if (!this.#bounded(batch)) return this.#external().then(() => this.#forward(batch));
@@ -221,7 +324,7 @@ export class ColumnarSortOperator implements Operator {
     // Roll back this arrival, so the original borrowed batch can be forwarded without a new
     // uncharged selection buffer or an overlapping/omitted row.
     this.#store.truncate(before);
-    return this.#external().then(() => this.#forward(batch));
+    return this.#external().then(() => this.#forward(original));
   }
 
   push(batch: Batch, transfer?: Transfer): PushResult {
@@ -251,6 +354,8 @@ export class ColumnarSortOperator implements Operator {
 
   #dropScratch(): void {
     this.#words.length = 0;
+    this.#compression?.close();
+    this.#compression = null;
     this.#ids = null;
     this.#temporary = null;
     this.#columns.length = 0;
@@ -309,7 +414,10 @@ export class ColumnarSortOperator implements Operator {
     }));
     for (let k = 0; k < this.#store.chunkCount; k++) {
       this.#check();
-      const columns = this.spec.types.map((_, c) => this.#store.chunk(c, k));
+      const columns = this.spec.types.map((_, c) => {
+        const vector = this.#store.chunk(c, k);
+        return this.#dictionaries[c]?.wrap(vector) ?? vector;
+      });
       const length = columns[0]?.length ?? 0;
       if (fallback.push({ length, columns, selection: null }) === "blocked") await fallback.ready();
       // Even immediately-ready replay is part of the shared worker task.
@@ -317,6 +425,7 @@ export class ColumnarSortOperator implements Operator {
       if (isPromise(pause)) await pause;
     }
     this.#store.close();
+    this.#dropDictionaries();
   }
   *#pause(): SlicedJob<void> {
     if (this.#slice.due()) yield;
@@ -350,10 +459,13 @@ export class ColumnarSortOperator implements Operator {
   *#order(): SlicedJob<boolean> {
     const n = this.#store.rows;
     let words = 0;
+    const groups: number[] = [];
     for (const key of this.spec.keys) {
       const type = this.spec.types[key.column];
       if (type === undefined) throw new TypeError("Missing key type");
-      words += numericWordCount(type) + Number(this.#store.hasNulls(key.column));
+      const count = numericWordCount(type) + Number(this.#store.hasNulls(key.column));
+      words += count;
+      groups.push(count);
     }
     const bytes =
       META_BYTES +
@@ -376,9 +488,32 @@ export class ColumnarSortOperator implements Operator {
       this.#slice,
     );
     if (n >= SMALL_SORT) {
+      if (this.context.columnarCompression !== false) {
+        this.#compression = new SortKeyCompression(this.#charge);
+        const packed = yield* this.#compression.pack(this.#words, groups, n, this.#slice);
+        if (packed === null) {
+          this.#compression.close();
+          this.#compression = null;
+        } else {
+          this.#words = packed;
+          this.#compressionStats = { ...this.#compression.stats };
+        }
+      }
       // Both histograms remain inside the prepaid minimum, allocated only after its charge.
       this.#radix = new RadixScratch();
-      yield* lsdSortIds(this.#words, this.#ids, this.#temporary, n, this.#slice, this.#radix);
+      yield* lsdSortIds(
+        this.#words,
+        this.#ids,
+        this.#temporary,
+        n,
+        this.#slice,
+        this.#radix,
+        this.#radixProfile,
+        (sorted, temporary) => {
+          this.#ids = sorted;
+          this.#temporary = temporary;
+        },
+      );
     } else {
       for (let i = 0; i < n; i++) this.#ids[i] = i;
       yield* mergeSortJob(
@@ -401,7 +536,7 @@ export class ColumnarSortOperator implements Operator {
     for (const column of this.#columns)
       if (layoutOf(column.type) === "varlen")
         for (const chunk of column.chunks) {
-          if (chunk.data.layout !== "varlen") throw new TypeError("Invalid varlen payload");
+          if (chunk?.data.layout !== "varlen") throw new TypeError("Invalid varlen payload");
           for (let i = 0; i < chunk.length; i++)
             if ((chunk.data.offsets[i + 1] ?? 0) - (chunk.data.offsets[i] ?? 0) > MAX_INPUT_BYTES)
               return false;
@@ -434,15 +569,54 @@ export class ColumnarSortOperator implements Operator {
         n = Math.max(1, n >>> 1);
       }
       // This frame and radix are covered by the admitted reserve, never a progress loan.
-      const columns: FlatVector[] = [];
+      const columns: Array<FlatVector | DictionaryVector> = [];
+      const movedChunks: ChunkTransfer[] = [];
+      const canTransfer =
+        this.context.columnarOwnership !== false && this.downstream.reclassifiesTransfers === true;
       try {
         for (let c = 0; c < this.#columns.length; c++) {
           const column = this.#columns[c];
           if (column === undefined) throw new TypeError("Missing payload column");
-          columns.push(gatherColumn(column, ids, at, n, shift, mask, sizes[c] ?? 0));
+          const moved =
+            this.context.columnarOwnership === false
+              ? null
+              : moveGatherColumn(column, ids, at, n, shift, mask);
+          const gathered = moved ?? gatherColumn(column, ids, at, n, shift, mask, sizes[c] ?? 0);
+          if (moved !== null && canTransfer) {
+            const k = (ids[at] ?? 0) >>> shift;
+            movedChunks.push(this.#store.transferChunk(c, k, () => retireGatherChunk(column, k)));
+          }
+          columns.push(this.#dictionaries[c]?.wrap(gathered) ?? gathered);
           if (this.#slice.due()) yield;
         }
-        if (this.downstream.push({ length: n, columns, selection: null }) === "blocked")
+        const transfer: Transfer | undefined = !canTransfer
+          ? undefined
+          : {
+              detachableBuffers: new Set(
+                frameTransferList({
+                  rowCount: n,
+                  columns: columns.map((v) =>
+                    v.form === "flat"
+                      ? v
+                      : {
+                          form: "dictionary",
+                          length: n,
+                          codes: v.codes,
+                          validity: v.validity,
+                          dictionary: 0,
+                        },
+                  ),
+                  dictionaries: [],
+                }),
+              ),
+              detachableBudget: this.context.grant,
+              detachableReclassify: true,
+              reclassify: (buffers) => this.#retireChunks(movedChunks, buffers),
+              // Preserve the next gather's reserve; retire only resident chunk capacities.
+              // Copied/refused buffers leave the store when this complete borrow ends.
+              release: () => this.#retireChunks(movedChunks),
+            };
+        if (this.downstream.push({ length: n, columns, selection: null }, transfer) === "blocked")
           yield this.downstream.ready();
         this.#rowsOut += n;
       } finally {
@@ -451,6 +625,17 @@ export class ColumnarSortOperator implements Operator {
       at += n;
       if (this.#slice.due()) yield;
     }
+  }
+
+  #retireChunks(chunks: readonly ChunkTransfer[], buffers?: ReadonlySet<ArrayBuffer>): void {
+    let bytes = 0;
+    for (const chunk of chunks)
+      bytes += buffers === undefined ? chunk.release() : chunk.reclassify(buffers);
+    // Return ordinary idle holding too; the still-allocated next-gather reserve and any
+    // loan-backed credit stay put. No ownership event transfers progress-loan credit.
+    const grant = this.context.grant;
+    const idle = Math.max(0, grant.held - grant.allocated - grant.loaned);
+    if (bytes > 0 && idle > 0) grant.release(Math.min(bytes, idle));
   }
 
   finish(): Promise<void> {
@@ -483,6 +668,7 @@ export class ColumnarSortOperator implements Operator {
     this.context.signal?.removeEventListener("abort", this.#onAbort);
     this.#dropScratch();
     this.#store.close();
+    this.#dropDictionaries();
     this.#releaseReserve();
     if (this.#deferredFree > 0) this.context.grant.free(this.#deferredFree);
     this.#deferredFree = 0;

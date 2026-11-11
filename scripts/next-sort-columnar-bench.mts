@@ -1,4 +1,4 @@
-/** Node compiled-dist paired sort bench. Input/validation are untimed; both result boundaries
+/** Node compiled-dist paired sort/window bench. Input/validation are untimed; both boundaries
  * are reported. --fixture <v8 capture> selects the isolated operator; absent it loads W1M.
  * TMPDIR controls scratch. No benchmark assertion is a substitute for generated PG suites.
  */
@@ -13,6 +13,9 @@ import { pairedCPU } from "./lib/paired-cpu.mts";
 import { Governor } from "../packages/core/dist/next/memory/governor.js";
 import { MemorySpillService } from "../packages/core/dist/next/spill/memory-spill.js";
 import { SortOperator, sortMinimumBytes } from "../packages/core/dist/next/exec/sort.js";
+import { WindowOperator, windowMinimumBytes } from "../packages/core/dist/next/exec/window.js";
+import { windowShape } from "../packages/core/dist/next/exec/window-bench-fixtures.js";
+import type { Operator } from "../packages/core/dist/next/exec/pipeline.js";
 import { drive } from "../packages/core/dist/next/exec/pipeline.js";
 import { ArraySource } from "../packages/core/dist/next/exec/join-fixtures.js";
 import { createExecutor } from "../packages/core/dist/next/exec/create.js";
@@ -28,7 +31,12 @@ import {
   type FlatVector,
 } from "../packages/core/dist/next/vector/vector.js";
 import type { PhysicalType } from "../packages/core/dist/next/types.js";
-import type { WireFlat } from "../packages/core/dist/next/exec/result.js";
+import {
+  ResultChannel,
+  type ResultStream,
+  type WireFlat,
+} from "../packages/core/dist/next/exec/result.js";
+import { ResultSink } from "../packages/core/dist/next/exec/result-sink.js";
 
 const args = process.argv.slice(2);
 const option = (key: string, fallback: string) => {
@@ -46,14 +54,30 @@ interface Result {
   rows: number;
   digest: string;
   columnarRows?: number;
+  sort?: SortOperator["profile"];
+  window?: WindowOperator["profile"];
 }
 const records: unknown[] = [];
+const compareStage = option("--compare-stage", "numeric");
+if (!["numeric", "ownership", "dictionary", "compression", "windowTopK"].includes(compareStage))
+  throw new RangeError("Unknown comparison stage");
+const compileFlags = (candidate: boolean) => ({
+  windowTopK: compareStage !== "windowTopK" || candidate,
+  columnarSort: compareStage !== "numeric" || candidate,
+  sortOwnership: compareStage !== "ownership" || candidate,
+  sortDictionaries: compareStage !== "dictionary" || candidate,
+  sortCompression: compareStage !== "compression" || candidate,
+});
 const metadata = {
   revision: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
   patchSha256: createHash("sha256")
     .update(execFileSync("git", ["diff", "HEAD"]))
     .digest("hex"),
   node: process.version,
+  compareStage,
+  componentWithResults: args.includes("--with-results"),
+  control: "candidate build, selected path disabled (not a separately built parent binary)",
+  candidate: "same candidate build, selected path enabled",
   pairs,
   rows,
   capBytes: 256 << 20,
@@ -65,7 +89,13 @@ const metadata = {
         "packages/core/dist/next/exec/sort.js",
         "packages/core/dist/next/exec/sort-columnar.js",
         "packages/core/dist/next/exec/sort-columnar-data.js",
+        "packages/core/dist/next/exec/sort-dictionary.js",
+        "packages/core/dist/next/exec/sort-compress.js",
+        "packages/core/dist/next/exec/sort-lsd.js",
         "packages/core/dist/next/exec/plan.js",
+        "packages/core/dist/next/exec/window.js",
+        "packages/core/dist/next/exec/window-sort.js",
+        "packages/core/dist/next/exec/window-frames.js",
         "scripts/next-sort-columnar-bench.mts",
       ].map(async (path) => [
         path,
@@ -116,6 +146,20 @@ async function compare(
     second = await run(true, "verify");
   if (first.digest !== second.digest || first.rows !== second.rows)
     throw new Error(`${id}: full output mismatch before timing`);
+  if (args.includes("--verify-only")) {
+    records.push({
+      id,
+      digest: first.digest,
+      rows: first.rows,
+      verificationOnly: true,
+      controlSort: first.sort,
+      enabledSort: second.sort,
+      controlWindow: first.window,
+      enabledWindow: second.window,
+    });
+    await save();
+    return;
+  }
   const samples: Array<{
     candidate: boolean;
     boundary: string;
@@ -161,54 +205,71 @@ async function compare(
     if (result.digest !== first.digest || result.rows !== first.rows)
       throw new Error(`${id}: full output mismatch after timing`);
   }
-  records.push({ id, digest: first.digest, rows: first.rows, samples, acceptance });
+  records.push({
+    id,
+    digest: first.digest,
+    rows: first.rows,
+    samples,
+    acceptance,
+    controlSort: first.sort,
+    enabledSort: second.sort,
+  });
   await save();
 }
 
+async function consumeFrames(
+  stream: Pick<ResultStream, "next">,
+  columns: ReadonlyArray<{ type: PhysicalType }>,
+  boundary: Boundary,
+  sink: ReturnType<typeof consumer>,
+) {
+  const dictionaries = new Map<number, WireFlat[]>();
+  for (;;) {
+    const frame = await stream.next();
+    if (frame === null) break;
+    try {
+      if (boundary === "frames")
+        sink.batch({ length: frame.payload.rowCount, selection: null, columns: [] });
+      else {
+        for (const delta of frame.payload.dictionaries) {
+          const parts = dictionaries.get(delta.id) ?? [];
+          if (delta.from !== parts.reduce((sum, p) => sum + p.length, 0))
+            throw new Error("dictionary order");
+          parts.push(structuredClone(delta.values));
+          dictionaries.set(delta.id, parts);
+        }
+        sink.batch({
+          length: frame.payload.rowCount,
+          selection: null,
+          columns: frame.payload.columns.map((v, c): FlatVector => {
+            const flat =
+              v.form === "dictionary"
+                ? expandTextDictionary(v, dictionaries.get(v.dictionary) ?? [])
+                : v;
+            if (flat.form !== "flat") throw new Error("unexpected constant wire frame");
+            const type = columns[c]?.type;
+            if (!type) throw new Error("missing output type");
+            return { ...flat, type };
+          }),
+        });
+      }
+    } finally {
+      frame.release();
+    }
+  }
+}
+
 function queryRun(core: StorageCore, sql: string) {
-  const factories = [createExecutor({ columnarSort: false }), createExecutor()];
+  const factories = [createExecutor(compileFlags(false)), createExecutor(compileFlags(true))];
   return async (candidate: boolean, boundary: Boundary): Promise<Result> => {
     const lowered = core.lowerer.lower(sql, core.context());
     if (lowered.kind !== "query") throw new Error("not query");
     const prepared = factories[candidate ? 1 : 0]?.prepare(lowered.plan);
     if (!prepared) throw new Error("missing factory");
     const handle = core.start(prepared),
-      sink = consumer(prepared.columns, boundary),
-      dictionaries = new Map<number, WireFlat[]>();
+      sink = consumer(prepared.columns, boundary);
     try {
-      for (;;) {
-        const frame = await handle.execution.results.next();
-        if (frame === null) break;
-        try {
-          if (boundary === "frames")
-            sink.batch({ length: frame.payload.rowCount, selection: null, columns: [] });
-          else {
-            for (const delta of frame.payload.dictionaries) {
-              const parts = dictionaries.get(delta.id) ?? [];
-              if (delta.from !== parts.reduce((sum, p) => sum + p.length, 0))
-                throw new Error("dictionary order");
-              parts.push(structuredClone(delta.values));
-              dictionaries.set(delta.id, parts);
-            }
-            sink.batch({
-              length: frame.payload.rowCount,
-              selection: null,
-              columns: frame.payload.columns.map((v, c): FlatVector => {
-                const flat =
-                  v.form === "dictionary"
-                    ? expandTextDictionary(v, dictionaries.get(v.dictionary) ?? [])
-                    : v;
-                if (flat.form !== "flat") throw new Error("unexpected constant wire frame");
-                const type = prepared.columns[c]?.type;
-                if (!type) throw new Error("missing output type");
-                return { ...flat, type };
-              }),
-            });
-          }
-        } finally {
-          frame.release();
-        }
-      }
+      await consumeFrames(handle.execution.results, prepared.columns, boundary, sink);
       await handle.execution.executed;
       await handle.execution.delivered;
       return sink.result();
@@ -241,6 +302,31 @@ async function measureComponent(fixture: NumericInput) {
       types.map((type, c) => ({ type, name: fixture.metadata.names[c] ?? String(c) })),
       boundary,
     );
+    const resultGrant = args.includes("--with-results")
+      ? await governor.admit({ label: "result-pair", minimumBytes: 4 << 20, spillable: true })
+      : undefined;
+    const channel = resultGrant
+      ? new ResultChannel(
+          types.map((type, c) => ({
+            name: fixture.metadata.names[c] ?? String(c),
+            type,
+            nullable: true,
+          })),
+          { windowBytes: 2 << 20 },
+        )
+      : undefined;
+    const receiver: import("../packages/core/dist/next/exec/pipeline.js").Operator =
+      resultGrant && channel
+        ? new ResultSink(types, resultGrant, channel, 0)
+        : {
+            push: (batch) => {
+              sink.batch(batch);
+              return "ready";
+            },
+            ready: () => Promise.resolve(),
+            finish: () => undefined,
+            abort: () => undefined,
+          };
     const op = new SortOperator(
       {
         types,
@@ -252,35 +338,169 @@ async function measureComponent(fixture: NumericInput) {
         offset: 0,
         withTies: false,
       },
-      { grant, spill, queryId: 1, columnar: candidate },
       {
-        push: (batch) => {
-          sink.batch(batch);
-          return "ready";
-        },
-        ready: () => Promise.resolve(),
-        finish: () => undefined,
-        abort: () => undefined,
+        grant,
+        spill,
+        queryId: 1,
+        columnar: compareStage !== "numeric" || candidate,
+        columnarOwnership: compareStage !== "ownership" || candidate,
+        columnarDictionaries: compareStage !== "dictionary" || candidate,
+        columnarCompression: compareStage !== "compression" || candidate,
       },
+      receiver,
     );
     try {
-      await drive(new ArraySource(fixture.batches), op);
+      const feeding = Promise.resolve(drive(new ArraySource(fixture.batches), op)).catch(
+        (error: unknown) => {
+          channel?.cancel(error);
+          throw error;
+        },
+      );
+      if (channel)
+        await Promise.all([
+          feeding,
+          consumeFrames(
+            channel,
+            types.map((type) => ({ type })),
+            boundary,
+            sink,
+          ),
+        ]);
+      else await feeding;
       await op.closed;
+      resultGrant?.close();
       if (governor.usedBytes !== 0 || spill.bytesInUse !== 0)
         throw new Error("operator leaked memory/spill");
       if (candidate && op.profile.columnarRows !== fixture.metadata.n)
         throw new Error("numeric component fell back");
-      return { ...sink.result(), columnarRows: op.profile.columnarRows ?? 0 };
+      return { ...sink.result(), columnarRows: op.profile.columnarRows ?? 0, sort: op.profile };
     } finally {
       op.abort(new Error("benchmark finished"));
       await op.closed;
+      resultGrant?.close();
+    }
+  });
+}
+
+/** Native window plus its unchanged rank predicate/outer order, from decoded columns. */
+async function measureWindow(fixture: NumericInput, name: string) {
+  const ranking = name === "topk" || name === "rank";
+  const shape = windowShape(name, 0, false);
+  const orderBy = shape.spec.orderBy.map((key) => ({
+    ...key,
+    nulls: key.direction === "desc" ? ("first" as const) : ("last" as const),
+  }));
+  const types = fixture.types;
+  if (JSON.stringify(types) !== JSON.stringify(shape.types))
+    throw new Error("window fixture types differ");
+  const outputTypes = [...types, ...shape.spec.functions.map((call) => call.type)];
+  const columns = outputTypes.map((type, c) => ({ type, name: String(c) }));
+  const k = name === "topk" ? 3 : 2;
+  await compare(name + "-operator", async (candidate, boundary) => {
+    const governor = new Governor(256 << 20),
+      spill = new MemorySpillService();
+    const grant = await governor.admit({
+      label: "window component",
+      minimumBytes: windowMinimumBytes(types, shape.spec.functions.length),
+      spillable: true,
+    });
+    const resultGrant = await governor.admit({
+      label: "window result",
+      minimumBytes: 4 << 20,
+      spillable: true,
+    });
+    const sink = consumer(columns, boundary),
+      channel = new ResultChannel(
+        columns.map((column) => ({ ...column, nullable: true })),
+        { windowBytes: 2 << 20 },
+      );
+    const receiver = new ResultSink(outputTypes, resultGrant, channel, 0);
+    let outer: SortOperator | undefined,
+      outerGrant: Awaited<ReturnType<Governor["admit"]>> | undefined;
+    let downstream: Operator = receiver;
+    const selected = new Uint16Array(BATCH_ROWS);
+    if (!resultGrant.allocate(selected.byteLength)) throw new Error("filter scratch refused");
+    if (ranking) {
+      outerGrant = await governor.admit({
+        label: "ranking order",
+        minimumBytes: sortMinimumBytes(outputTypes),
+        spillable: true,
+      });
+      outer = new SortOperator(
+        {
+          types: outputTypes,
+          keys: [
+            { column: 0, direction: "asc", nulls: "last", collation: null },
+            { column: types.length, direction: "asc", nulls: "last", collation: null },
+            ...(name === "rank"
+              ? [{ column: 1, direction: "asc" as const, nulls: "last" as const, collation: null }]
+              : []),
+          ],
+          limit: null,
+          offset: 0,
+          withTies: false,
+        },
+        { grant: outerGrant, spill, queryId: 2 },
+        receiver,
+      );
+      const ordered = outer;
+      downstream = {
+        push(batch, transfer) {
+          const vector = batch.columns[types.length];
+          if (vector?.form !== "flat" || vector.data.layout !== "int64")
+            throw new Error("ranking output layout");
+          const values = vector.data.values.values;
+          let count = 0;
+          for (let row = 0; row < batch.length; row++)
+            if (Number(values[row]) <= k) selected[count++] = row;
+          return ordered.push({ ...batch, selection: { rows: selected, count } }, transfer);
+        },
+        ready: () => ordered.ready(),
+        finish: () => ordered.finish(),
+        abort: (reason) => ordered.abort(reason),
+      };
+    }
+    const op = new WindowOperator(
+      {
+        ...shape.spec,
+        orderBy,
+        ...(ranking && (compareStage !== "windowTopK" || candidate) ? { topK: k } : {}),
+      },
+      { grant, spill, queryId: 1 },
+      downstream,
+    );
+    try {
+      const feeding = Promise.resolve(drive(new ArraySource(fixture.batches), op)).catch(
+        (error: unknown) => {
+          channel.cancel(error);
+          throw error;
+        },
+      );
+      await Promise.all([feeding, consumeFrames(channel, columns, boundary, sink)]);
+      await op.closed;
+      await outer?.closed;
+      resultGrant.free(selected.byteLength);
+      resultGrant.close();
+      if (governor.usedBytes !== 0 || spill.bytesInUse !== 0)
+        throw new Error("window component leaked");
+      return { ...sink.result(), sort: op.profile.sort, window: op.profile };
+    } finally {
+      op.abort(new Error("benchmark finished"));
+      outer?.abort(new Error("benchmark finished"));
+      await op.closed;
+      await outer?.closed;
+      resultGrant.close();
+      outerGrant?.close();
     }
   });
 }
 
 const fixturePath = option("--fixture", "");
 if (fixturePath) {
-  await measureComponent(deserialize(await readFile(resolve(fixturePath))) as NumericInput);
+  const fixture = deserialize(await readFile(resolve(fixturePath))) as NumericInput;
+  const shape = option("--window-shape", "");
+  if (shape) await measureWindow(fixture, shape);
+  else await measureComponent(fixture);
 } else if (args.includes("--catalogue")) {
   const { CATALOGUE_REFUSALS } = await import("../packages/core/dist/next/testing/divergences.js");
   const fixture = JSON.parse(
