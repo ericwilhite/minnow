@@ -3008,6 +3008,34 @@ export const DATE_PART_SQL_REACH = [
   "week",
 ] as const;
 
+/** Coverage-sized SQL histories retain every original phase/pressure state. */
+export const AGG_HANDOFF_SQL_REACH = [
+  "several executions",
+  "scalar",
+  "grouped",
+  "skewed dominant group",
+  "many small groups",
+  "filtered transitions",
+  "pressure checkpoint",
+  "restore admission",
+  "temporary pinned holder",
+  "holder releases",
+  "cancel pending phase",
+  "cancel restore pass",
+  "snapshot retained",
+  "owned parameter",
+  "empty owned parameter",
+  "resident follower",
+  "empty filtered resident state",
+  "PG exact",
+  "scratch service",
+  "zero",
+  "bounded 8192-row source",
+  "owned parameter at most 8KiB",
+  "1024 small groups retained",
+  "stable restore entered",
+] as const;
+
 /** Aggregation waits before retaining state, then grows solely inside its admitted workspace. */
 export const AGGREGATE_PROGRESS_REACH = [
   "stored dictionary certificate",

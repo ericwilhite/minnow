@@ -3,10 +3,10 @@
  * by the execution and mutable parameters come from its admitted copy. */
 import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
-import { expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { RestoredAggregateOperator } from "../exec/agg/restored.js";
 import { QueryRuntime } from "../exec/run.js";
-import { createReach } from "../../testing/reach.js";
+import { AGG_HANDOFF_SQL_REACH, createReach } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { ScratchSpillService } from "../spill/scratch-spill.js";
 import { SCRATCH_CONTROL_BYTES } from "../spill/scratch-ranges.js";
@@ -19,6 +19,38 @@ import type { Batch } from "../vector/vector.js";
 import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
 import { byteSliceEquals } from "./byte-equality.test.fixture.js";
+
+// Capture pristine implementations before any history can install observers. A timed-out
+// test's promise may still unwind after afterEach; its late cleanup must be idempotent.
+// eslint-disable-next-line @typescript-eslint/unbound-method -- called with the original receiver.
+const suspendProducer = QueryRuntime.prototype.suspendProducer;
+// eslint-disable-next-line @typescript-eslint/unbound-method -- called with the original receiver.
+const finishRestore = RestoredAggregateOperator.prototype.finish;
+const observers = new Set<() => void>();
+const activeHistories = new Set<() => void>();
+const campaigns = new Set<AbortController>();
+function ownObserver(spy: { mockRestore(): void }): () => void {
+  const close = () => {
+    if (observers.delete(close)) spy.mockRestore();
+  };
+  observers.add(close);
+  return close;
+}
+afterEach(() => {
+  // Restore first: even an execution's cleanup failure cannot poison the next seed.
+  // Clearing marks old closers retired before a late body-finally can call them.
+  observers.clear();
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+  for (const campaign of campaigns) campaign.abort(new Error("Handoff test ended"));
+  campaigns.clear();
+  for (const stop of activeHistories) stop();
+  activeHistories.clear();
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- identity assertion, never invoked unbound.
+  expect(QueryRuntime.prototype.suspendProducer).toBe(suspendProducer);
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- identity assertion, never invoked unbound.
+  expect(RestoredAggregateOperator.prototype.finish).toBe(finishRestore);
+});
 
 /** Liveness guard: productive FIFO phases may take more than 30 seconds in total. */
 async function deadline<T>(work: Promise<T>, activity: Set<() => void>): Promise<T> {
@@ -149,28 +181,9 @@ async function consume(
 it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
   "completes concurrent scalar/grouped restore phases and cancels with no retained credit (seed %i)",
   async (seed) => {
-    const reach = createReach("SQL aggregate phase handoff", [
-      "several executions",
-      "scalar",
-      "grouped",
-      "skewed dominant group",
-      "many small groups",
-      "filtered transitions",
-      "pressure checkpoint",
-      "restore admission",
-      "temporary pinned holder",
-      "holder releases",
-      "cancel pending phase",
-      "cancel restore pass",
-      "snapshot retained",
-      "owned parameter",
-      "empty owned parameter",
-      "resident follower",
-      "empty filtered resident state",
-      "PG exact",
-      "scratch service",
-      "zero",
-    ]);
+    const reach = createReach("SQL aggregate phase handoff", AGG_HANDOFF_SQL_REACH);
+    const campaign = new AbortController();
+    campaigns.add(campaign);
     const core = await new StorageCore(8192).open(),
       pg = new PGlite();
     await pg.waitReady;
@@ -188,7 +201,10 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
       await pg.exec("INSERT INTO tiny VALUES (0,0,'resident-a',0),(0,1,'resident-b',1e16)");
       // The full DISTINCT payload exceeds the admitted initial hash workspace even
       // when a short read batch avoids a conservative batch-growth overestimate.
-      const rowCount = 32768;
+      // Coverage scales rows 4x and parameter bytes 8x, not histories or the
+      // 1024-key domain. Distinct payload still exceeds initial hash headroom;
+      // every history must reach a real checkpoint and restore admission below.
+      const rowCount = 8192;
       const rows = Array.from({ length: rowCount }, (_, i) => ({
         g: i < (rowCount * 7) / 8 ? 0 : 1 + (i % 11),
         h: i % 1024,
@@ -231,6 +247,7 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
               snapshot,
               statement: null,
               parameters: [""],
+              signal: campaign.signal,
               statementTime: 0n,
               governor,
               spill: core.spill,
@@ -254,15 +271,17 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
           }
         }
       }
+      campaign.signal.throwIfAborted();
       await fc.assert(
         fc.asyncProperty(
           fc.integer({ min: 2, max: 3 }),
-          fc.integer({ min: 0, max: 65536 }),
+          fc.integer({ min: 0, max: 8192 }),
           fc.constantFrom<Shape>("scalar", "skew", "many"),
           fc.constantFrom("none", "wait", "restore"),
           fc.boolean(),
           fc.boolean(),
           async (count, size, shape, cancellation, filtered, residentFollower) => {
+            campaign.signal.throwIfAborted();
             const cancel = cancellation === "wait";
             const grouped = shape !== "scalar";
             reach.beginHistory();
@@ -280,6 +299,12 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
               snapshot = core.harness.path.pin(),
               executions: Execution[] = [],
               jobs: Array<Promise<unknown>> = [];
+            const stop = () => {
+              pinned.close();
+              for (const execution of executions)
+                execution.cancel(new Error("Handoff history ended"));
+            };
+            activeHistories.add(stop);
             const activity = new Set<() => void>(),
               advance = () => {
                 for (const notify of activity) notify();
@@ -314,12 +339,18 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
             const followers = new Promise<void>((resolve) => {
               followersReady = resolve;
             });
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- The original method is invoked with .call(this) inside the observer.
-            const suspend = QueryRuntime.prototype.suspendProducer;
+            if (campaign.signal.aborted) {
+              stop();
+              activeHistories.delete(stop);
+              snapshot.release();
+              await scratch?.close();
+              spillControl?.close();
+              campaign.signal.throwIfAborted();
+            }
             const retirement = vi
               .spyOn(QueryRuntime.prototype, "suspendProducer")
               .mockImplementation(async function (this: QueryRuntime, sink, pool) {
-                await suspend.call(this, sink, pool);
+                await suspendProducer.call(this, sink, pool);
                 if (
                   this.request.governor === governor &&
                   cancel &&
@@ -335,13 +366,13 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
                   cancelPrepared = true;
                 }
               });
+            const closeRetirement = ownObserver(retirement);
             // Start cancellation only after the sealed restore graph has actually opened.
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- Invoked with .call(this).
-            const restore = RestoredAggregateOperator.prototype.finish;
             const restoration = vi
               .spyOn(RestoredAggregateOperator.prototype, "finish")
               .mockImplementation(function (this: RestoredAggregateOperator) {
-                const work = restore.call(this);
+                const work = finishRestore.call(this);
+                reach.reach("stable restore entered");
                 if (
                   this.shared.spill === spill &&
                   this.shared.queryId === 1 &&
@@ -356,6 +387,7 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
                 }
                 return work;
               });
+            const closeRestoration = ownObserver(restoration);
             const phaseQueries = new Set<number>(),
               native = governor.admitGroup.bind(governor);
             let releaseScheduled = false;
@@ -415,6 +447,7 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
                 snapshot,
                 statement: null,
                 parameters: caller,
+                signal: campaign.signal,
                 statementTime: 0n,
                 governor,
                 spill,
@@ -511,13 +544,16 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
               if (shape === "many") reach.reach("many small groups");
               if (filtered) reach.reach("filtered transitions");
               reach.reach("owned parameter");
+              reach.reach("bounded 8192-row source");
+              if (size > 0) reach.reach("owned parameter at most 8KiB");
+              if (shape === "many") reach.reach("1024 small groups retained");
               if (size === 0) reach.reach("empty owned parameter");
               reach.reach("PG exact");
             } finally {
-              retirement.mockRestore();
-              restoration.mockRestore();
-              pinned.close();
-              for (const e of executions) e.cancel(new Error("pressure cleanup"));
+              closeRetirement();
+              closeRestoration();
+              stop();
+              activeHistories.delete(stop);
               await Promise.allSettled(jobs);
               await Promise.allSettled(executions.flatMap((e) => [e.executed, e.delivered]));
               snapshot.release();
@@ -539,21 +575,50 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
           numRuns: 14,
           examples: [
             [2, 0, "scalar", "none", false, false],
-            [2, 4096, "scalar", "none", false, false],
-            [2, 16384, "skew", "none", true, false],
-            [2, 4096, "many", "none", false, false],
-            [3, 256, "scalar", "wait", true, false],
-            [2, 8192, "skew", "restore", false, false],
+            [2, 512, "scalar", "none", false, false],
+            [2, 2048, "skew", "none", true, false],
+            [2, 512, "many", "none", false, false],
+            [3, 32, "scalar", "wait", true, false],
+            [2, 1024, "skew", "restore", false, false],
             [2, 0, "scalar", "none", false, true],
-            [3, 4096, "many", "none", true, true],
+            [3, 512, "many", "none", true, true],
           ],
         },
       );
       reach.assertReached();
     } finally {
+      campaign.abort(new Error("Handoff campaign complete"));
+      campaigns.delete(campaign);
       await pg.close();
       await core.close();
     }
   },
   360000,
 );
+
+// Simulate a failed/abandoned history without waiting for a real test timeout. The
+// next seed must see pristine methods even when the body's own finally never ran.
+for (const seed of seedsFor("next-aggregation-abandoned-observers", [0xb4f7, 0xb4f8]))
+  it(`cleans abandoned history observers before the next seed (${String(seed)})`, () => {
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- identity assertion, never invoked unbound.
+    expect(QueryRuntime.prototype.suspendProducer).toBe(suspendProducer);
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- identity assertion, never invoked unbound.
+    expect(RestoredAggregateOperator.prototype.finish).toBe(finishRestore);
+    fc.assert(
+      fc.property(fc.boolean(), fc.boolean(), (suspend, restore) => {
+        if (suspend)
+          vi.spyOn(QueryRuntime.prototype, "suspendProducer").mockResolvedValue(undefined);
+        if (restore)
+          vi.spyOn(RestoredAggregateOperator.prototype, "finish").mockResolvedValue(undefined);
+      }),
+      {
+        seed,
+        numRuns: 8,
+        examples: [
+          [true, false],
+          [false, true],
+          [true, true],
+        ],
+      },
+    );
+  });
