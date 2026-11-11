@@ -107,6 +107,9 @@ export default tseslint.config(
       // Reads the front end's sources off disk to pin the messages lowering's SQLSTATE map
       // depends on (lower/errors.ts).
       "packages/core/src/next/testing/front-end-states.test.ts",
+      // Node-only lifecycle fault observers associate native callbacks with their producer.
+      // No production module imports this test or node:async_hooks.
+      "packages/core/src/next/testing/retaining-parent-lifecycle.test.ts",
       // Node-only generated-test watchdog; owns/reaps its child and temporary config.
       // No browser entry point imports this fixture.
       "packages/core/src/next/testing/inactive-envelope-deadline.test.fixture.ts",

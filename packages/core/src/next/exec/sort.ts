@@ -34,6 +34,7 @@
  * loans cover one bounded step. `push` returns `blocked` while a run is written; `finish` awaits
  * downstream readiness. Without a spill the whole sort runs without an await.
  */
+import { RecordCheckpoint } from "./record-checkpoint.js";
 import type { Grant } from "../memory/governor.js";
 import { stringBytes } from "../memory/governor.js";
 import type { SpillService } from "../spill/contract.js";
@@ -349,6 +350,8 @@ type Range =
  * grant and closes it at the end.
  */
 class Sorter {
+  #checkpointWork: Promise<void> | null = null;
+  #checkpointClose: Promise<void> | null = null;
   readonly #keyStorage: boolean;
   readonly #emptyTail: readonly Vector[];
   #wideOutputBytes = 0;
@@ -1679,6 +1682,13 @@ class Sorter {
 
   /** Spill at a batch boundary before another admitted pipeline's read can be refused. */
   async reclaim(): Promise<void> {
+    // A checkpoint borrows resident chunks across writes. The phase controller
+    // retires this graph after sealing, so a new reclaim must only drain that
+    // borrow, never spill/truncate the same rows while it is being copied.
+    if (this.#checkpointWork !== null) {
+      await this.#checkpointWork;
+      return;
+    }
     this.checkAborted();
     if (this.store.rows > 0) await this.#spillRun();
     const free = this.context.grant.held - this.context.grant.allocated - this.context.grant.loaned;
@@ -1977,6 +1987,61 @@ class Sorter {
     );
   }
 
+  /** Pre-finish runs are chronological and stable within equal keys; resident input follows. */
+  checkpoint(): Promise<RecordCheckpoint> {
+    if (this.#closed || this.#checkpointWork)
+      return Promise.reject(new Error("Sort checkpoint is not at an input boundary"));
+    const work = (async () => {
+      const checkpointIO = new SpillIo(
+        this.pool,
+        this.files,
+        this.pages,
+        this.context,
+        () => this.checkAborted(),
+        () => this.pace(),
+      );
+      const records = new RecordCheckpoint(checkpointIO, this.context.spill, this.spec.types);
+      try {
+        for (const run of this.runs)
+          for (let at = 0; at < run.pages.length; at++) {
+            this.checkAborted();
+            const ref = run.pages[at];
+            if (!ref) throw new Error("Missing sort checkpoint page");
+            await this.io.need(6 * ref.length + 64 * 1024);
+            const page = await this.io.readPage(run, at);
+            try {
+              const decoded = await this.io.decode(page, this.storeTypes);
+              await records.write(decoded.columns, 0, decoded.rows);
+            } finally {
+              this.io.releasePage(page);
+            }
+          }
+        for (let at = 0; at < this.store.chunkCount; at++) {
+          this.checkAborted();
+          const columns = this.spec.types.map((_, c) => this.store.chunk(c, at));
+          // A key-only window may have no payload columns. Its rows still exist.
+          const rows = Math.min(this.store.chunkRows, this.store.rows - at * this.store.chunkRows);
+          await records.write(columns, 0, rows);
+        }
+        await records.seal();
+        this.checkAborted();
+        return records;
+      } catch (error) {
+        await records.close().catch(() => undefined);
+        throw error;
+      }
+    })();
+    const settled = work.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#checkpointWork = settled;
+    void settled.then(() => {
+      if (this.#checkpointWork === settled) this.#checkpointWork = null;
+    });
+    return work;
+  }
+
   /** Mark cancellation before draining asynchronous borrowers; do not free their buffers. */
   cancel(reason: unknown): void {
     if (this.#aborted === undefined) this.#aborted = reason ?? new Error("Aborted");
@@ -1988,6 +2053,11 @@ class Sorter {
   }
 
   close(): void {
+    if (this.#checkpointWork) {
+      this.#checkpointClose ??= this.#checkpointWork.then(() => this.close());
+      void this.#checkpointClose.catch(() => undefined);
+      return;
+    }
     if (this.#closed) return;
     this.#closed = true;
     this.store.close();
@@ -2025,7 +2095,13 @@ class Sorter {
 
   /** Settles when the sort's spill files are closed (rejects with the first close failure). */
   get closed(): Promise<void> {
-    return this.files.closed ?? Promise.resolve();
+    return (
+      this.#checkpointClose?.then(async () => {
+        await this.files.closed;
+      }) ??
+      this.files.closed ??
+      Promise.resolve()
+    );
   }
 }
 
@@ -2334,6 +2410,13 @@ class HeldRow {
 
 /** ORDER BY [LIMIT / OFFSET / WITH TIES] (see the module comment). */
 class GeneralSortOperator implements Operator {
+  async checkpoint(): Promise<RecordCheckpoint> {
+    if (this.#done || this.#finishing) throw new Error("Sort evaluation has begun");
+    await this.#working;
+    await this.#reclaiming;
+    return this.#sorter.checkpoint();
+  }
+
   readonly spec: SortSpec;
   readonly #sorter: Sorter;
   readonly #emitter: Emitter;
@@ -2573,6 +2656,10 @@ class GeneralSortOperator implements Operator {
 
 /** The full numeric path is optional; the original sorter owns every other shape/fallback. */
 export class SortOperator implements Operator {
+  checkpoint(): Promise<RecordCheckpoint> {
+    return this.#operator.checkpoint();
+  }
+
   readonly #operator: GeneralSortOperator | ColumnarSortOperator;
   constructor(
     readonly spec: SortSpec,
@@ -2704,6 +2791,19 @@ export class GroupTopKOperator implements Operator {
     const pending = this.#pending ?? Promise.resolve();
     this.#pending = null;
     return pending;
+  }
+
+  /** Before evaluation, only candidates that can still satisfy the proven bound matter.
+   * Runs/compactions retain the per-partition bound and all RANK boundary peers. Their
+   * union with a future suffix has the same bounded result. ROW_NUMBER identity is fixed
+   * by its SQL keys; the window retains the original arrival count separately.
+   */
+  async checkpoint(): Promise<RecordCheckpoint> {
+    await this.ready();
+    this.#sorter.checkAborted();
+    const work = this.#sorter.checkpoint();
+    this.#track(work);
+    return work;
   }
 
   finish(): MaybePromise<void> {

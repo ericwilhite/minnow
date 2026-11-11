@@ -125,8 +125,29 @@ import { PageWriter, SpillFiles, SpilledRun, type DecodedPage } from "./spill-pa
 import { ColumnStore, nullConstant } from "./column-store.js";
 import { Charge, Pool, SpillIo } from "./spill-pool.js";
 import { JoinTable, chunkKeys } from "./join-table.js";
+import { JoinCheckpoint } from "./join-checkpoint.js";
+import { RecordCheckpoint } from "./record-checkpoint.js";
 
 type MaybePromise<T> = T | Promise<T>;
+
+/** The internal flag is a view when checkpointing resident matches, a constant otherwise. */
+function matchVector(length: number, values?: Uint8Array): Vector {
+  const type: PhysicalType = { kind: "bool" };
+  return values
+    ? { form: "flat", type, length, validity: null, data: { layout: "bool", values } }
+    : {
+        form: "constant",
+        type,
+        length,
+        value: {
+          form: "flat",
+          type,
+          length: 1,
+          validity: null,
+          data: { layout: "bool", values: new Uint8Array(1) },
+        },
+      };
+}
 
 /** A compiled boolean condition over a batch (the executor's expression kernels satisfy it). */
 export interface VectorPredicate {
@@ -345,6 +366,9 @@ export function validateHashJoinSpec(declared: HashJoinSpec): void {
 
 /** State shared by every level of one join: spec, scratch, outputs, spill, downstream. */
 class Shared {
+  /** Restored RIGHT/FULL records carry their match bit through repartitioning. */
+  readonly buildTypes: readonly PhysicalType[];
+  readonly initialMatchColumn: number;
   readonly kind: HashJoinKind;
   readonly layout: KeyLayout;
   readonly correlated: number;
@@ -409,7 +433,10 @@ class Shared {
   constructor(
     readonly spec: HashJoinSpec,
     readonly context: HashJoinContext,
+    restoreMatches = false,
   ) {
+    this.initialMatchColumn = restoreMatches ? spec.buildTypes.length : -1;
+    this.buildTypes = restoreMatches ? [...spec.buildTypes, { kind: "bool" }] : spec.buildTypes;
     this.kind = spec.kind;
     const checked = checkJoinSpec(spec);
     this.correlated = checked.correlated;
@@ -625,7 +652,7 @@ class Level {
     /** What its store and table are charged to (the pool for a chunk of chunk mode). */
     readonly charge: ByteCharge = shared.charge,
   ) {
-    this.store = new ColumnStore(shared.spec.buildTypes, charge);
+    this.store = new ColumnStore(shared.buildTypes, charge);
     this.#tableCharge = charge;
   }
 
@@ -711,6 +738,10 @@ class Level {
   }
 
   /** Converts to partitioned mode, spilling every resident row. */
+  async spill(): Promise<void> {
+    if (this.parts === null) await this.#overflow();
+  }
+
   async #overflow(): Promise<void> {
     const shared = this.shared;
     const fanout = this.partitionable && shared.kind !== "mark" ? FANOUT : 1;
@@ -739,7 +770,7 @@ class Level {
     const list = side === "build" ? parts.buildStaging : parts.probeStaging;
     const existing = list[p];
     if (existing !== null && existing !== undefined) return existing;
-    const types = side === "build" ? this.shared.spec.buildTypes : this.shared.spec.probeTypes;
+    const types = side === "build" ? this.shared.buildTypes : this.shared.spec.probeTypes;
     const store = new ColumnStore(types, this.shared.pool, {
       chunkRows: stagingRows(types),
       targetBytes: STAGING_TARGET_BYTES,
@@ -924,6 +955,13 @@ class Level {
       if (!this.#tableCharge.allocate(this.store.rows)) return this.#dropTable();
       this.#extraBytes += this.store.rows;
       this.matched = new Uint8Array(this.store.rows);
+      if (shared.initialMatchColumn >= 0)
+        for (let k = 0; k < this.store.chunkCount; k++) {
+          const column = this.store.chunk(shared.initialMatchColumn, k);
+          const values = (column.data as { values: Uint8Array }).values;
+          this.matched.set(values.subarray(0, column.length), k * this.store.chunkRows);
+          if (slice.due()) yield;
+        }
     }
     if (shared.kind === "mark" && !(yield* this.#buildGroups(slice))) return this.#dropTable();
     return true;
@@ -1043,7 +1081,7 @@ class Level {
       if (paced !== null) await paced;
       const page = await shared.readPage(run, i);
       try {
-        const { rows, columns } = await shared.decode(page, shared.spec.buildTypes);
+        const { rows, columns } = await shared.decode(page, shared.buildTypes);
         shared.checkAborted();
         if (store.append(columns, null, 0, rows) < rows) return false;
       } finally {
@@ -1440,7 +1478,9 @@ class Prober {
       length: batch.length,
       columns: [
         ...batch.columns,
-        ...(outer ? store.vectors() : shared.matchedBuildColumns(batch.columns)),
+        ...(outer
+          ? store.vectors().slice(0, shared.spec.buildTypes.length)
+          : shared.matchedBuildColumns(batch.columns)),
       ],
       selection: out,
     });
@@ -1998,16 +2038,21 @@ export class HashJoin {
   #pending: Promise<void> | null = null;
   #closed = false;
   #cleanup: Promise<void> | null = null;
+  #phaseWork: Promise<void> | null = null;
+  #checkpointed = false;
+  #restoreStarted = false;
+  #finishing = false;
+  #priorSpilled = 0;
 
   /** A join without keys (ruling R24.2): its inputs carry one constant key column each. */
   readonly #keyless: Keyless | null;
 
-  constructor(spec: HashJoinSpec, context: HashJoinContext) {
+  constructor(spec: HashJoinSpec, context: HashJoinContext, saved?: JoinCheckpoint) {
     const keyless = spec.probeKeys.length === 0 && spec.buildKeys.length === 0;
     this.#keyless = keyless ? new Keyless(spec) : null;
     // A keyless join runs as the keyed join over its constant key (`spec` is that form).
     this.spec = this.#keyless?.spec ?? spec;
-    this.#shared = new Shared(this.spec, context);
+    this.#shared = new Shared(this.spec, context, saved?.hasMatches === true);
     this.#prober = new Prober(this.#shared);
     this.#level = new Level(this.#shared, 0, true);
     const build = new BuildSink(this);
@@ -2017,7 +2062,7 @@ export class HashJoin {
   get profile(): HashJoinProfile {
     const shared = this.#shared;
     shared.profile.peakHeldBytes = shared.charge.peak;
-    shared.profile.spilledBytes = shared.files.written;
+    shared.profile.spilledBytes = this.#priorSpilled + shared.files.written;
     shared.profile.loans = shared.pool.loans;
     shared.profile.largestLoan = shared.pool.largestLoan;
     return shared.profile;
@@ -2031,6 +2076,168 @@ export class HashJoin {
     return keyless?.input(probe) ?? probe;
   }
 
+  get buildComplete(): boolean {
+    return this.#built;
+  }
+
+  /** At a child-ready boundary, save values and exact match bits, never rerun a
+   * consumed source or residual. No active probe/finish continuation may cross this seam. */
+  checkpoint(): Promise<JoinCheckpoint> {
+    if (this.#checkpointed || this.#phaseWork || this.#finishing || this.#closed)
+      return Promise.reject(new TypeError("Join checkpoint requires an unfinished input boundary"));
+    const prior = this.#pending;
+    const work = (async () => {
+      await prior;
+      const shared = this.#shared,
+        level = this.#level;
+      shared.checkAborted();
+      shared.reset(shared.probeOut);
+      shared.reset(shared.buildOut);
+      shared.reset(shared.buildPart);
+      const matches = shared.kind === "right" || shared.kind === "full";
+      const types = matches
+        ? [...this.spec.buildTypes, { kind: "bool" } as PhysicalType]
+        : this.spec.buildTypes;
+      const build = new RecordCheckpoint(shared.io, shared.context.spill, types);
+      let probe: RecordCheckpoint | null = null;
+      try {
+        await level.flushStaging("build");
+        await level.flushStaging("probe");
+        for (let k = 0; k < level.store.chunkCount; k++) {
+          shared.checkAborted();
+          const columns: Vector[] = this.spec.buildTypes.map((_, c) => level.store.chunk(c, k));
+          const rows = columns[0]?.length ?? 0;
+          if (matches)
+            columns.push(
+              matchVector(
+                rows,
+                level.matched?.subarray(
+                  k * level.store.chunkRows,
+                  k * level.store.chunkRows + rows,
+                ),
+              ),
+            );
+          await build.write(columns, 0, rows);
+        }
+        const copy = async (
+          run: SpilledRun,
+          records: RecordCheckpoint,
+          side: "build" | "probe",
+        ) => {
+          const sourceTypes = side === "build" ? shared.buildTypes : this.spec.probeTypes;
+          for (let p = 0; p < run.pages.length; p++) {
+            shared.checkAborted();
+            const ref = run.pages[p];
+            if (!ref) throw new Error("Missing checkpoint source page");
+            await shared.need(6 * ref.length + 64 * 1024);
+            const page = await shared.readPage(run, p);
+            try {
+              const decoded = await shared.decode(page, sourceTypes);
+              const columns: readonly Vector[] =
+                side === "build" && matches && shared.initialMatchColumn < 0
+                  ? [...decoded.columns, matchVector(decoded.rows)]
+                  : decoded.columns;
+              await records.write(columns, 0, decoded.rows);
+            } finally {
+              shared.releasePage(page);
+            }
+          }
+        };
+        const parts = level.parts;
+        if (parts)
+          for (let p = 0; p < parts.fanout; p++) {
+            const run = parts.build[p];
+            if (run && !parts.resident[p]) await copy(run, build, "build");
+          }
+        await build.seal();
+        probe = new RecordCheckpoint(shared.io, shared.context.spill, this.spec.probeTypes);
+        if (parts)
+          for (let p = 0; p < parts.fanout; p++) {
+            const run = parts.probe[p];
+            if (run && !parts.resident[p]) await copy(run, probe, "probe");
+          }
+        await probe.seal();
+        shared.checkAborted();
+        this.#checkpointed = true;
+        return new JoinCheckpoint(build, probe, this.#built, matches, { ...this.profile });
+      } catch (error) {
+        await Promise.allSettled([build.close(), probe?.close()]);
+        throw error;
+      }
+    })();
+    this.#trackPhase(work);
+    return work;
+  }
+
+  /** Copies into new admitted state; the saved owner closes only after success.
+   * Prior resident probes are absent. Deferred probes stay deferred until finish. */
+  restore(saved: JoinCheckpoint): Promise<void> {
+    if (
+      this.#phaseWork ||
+      this.#built ||
+      this.#level.totalBuildRows ||
+      this.#closed ||
+      this.#restoreStarted
+    )
+      return Promise.reject(new TypeError("Join restore requires a new admitted operator"));
+    this.#restoreStarted = true;
+    const work = (async () => {
+      const shared = this.#shared,
+        level = this.#level;
+      shared.checkAborted();
+      if (saved.hasMatches !== shared.initialMatchColumn >= 0)
+        throw new TypeError("Join restore schema was not selected at construction");
+      await level.spill();
+      await saved.build.read(
+        shared.io,
+        async (columns, rows) => {
+          await level.addBuild(columns, null, 0, rows);
+          await level.flushStaging("build");
+        },
+        saved.progressBytes,
+      );
+      if (saved.buildComplete) {
+        if (!(await shared.sliced(level.buildTableJob(shared.pool))))
+          throw new RangeError("The restored empty join table could not be allocated");
+        this.#built = true;
+      }
+      await saved.probe.read(
+        shared.io,
+        async (columns, rows) => {
+          const parts = level.parts;
+          if (!parts) throw new Error("Missing restored join partitions");
+          const keys = this.spec.probeKeys.map((c) => columnOf(columns, c));
+          await extractAll(shared, keys, null, 0, rows, shared.scratch);
+          const counts = level.groupByPartition(null, 0, rows, false);
+          for (let p = 0; p < parts.fanout; p++) {
+            const start = counts[p] ?? 0,
+              count = (counts[p + 1] ?? 0) - start;
+            if (count) await level.stageProbe(p, columns, shared.order, start, count);
+          }
+          await level.flushStaging("probe");
+        },
+        saved.progressBytes,
+      );
+      shared.checkAborted();
+      Object.assign(shared.profile, saved.profile);
+      await saved.close();
+      this.#priorSpilled = saved.spilledBytes;
+    })();
+    this.#trackPhase(work);
+    return work;
+  }
+
+  #trackPhase(work: Promise<unknown>): void {
+    const settled = work.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#phaseWork = settled;
+    void settled.then(() => {
+      if (this.#phaseWork === settled) this.#phaseWork = null;
+    });
+  }
+
   #fail(error: unknown): never {
     this.abort(error);
     throw error;
@@ -2039,7 +2246,14 @@ export class HashJoin {
   /** @internal */
   pushBuild(batch: Batch, transfer?: Transfer): PushResult {
     if (this.#built) throw new TypeError("The join's build has finished");
+    if (this.#checkpointed || this.#phaseWork)
+      throw new TypeError("The join's input is checkpointed");
     const shared = this.#shared;
+    if (shared.initialMatchColumn >= 0)
+      batch = {
+        ...batch,
+        columns: [...batch.columns, matchVector(batch.length)],
+      };
     shared.checkAborted();
     const count = batch.selection === null ? batch.length : batch.selection.count;
     shared.profile.buildRows += count;
@@ -2155,6 +2369,8 @@ export class HashJoin {
   /** @internal */
   pushProbe(batch: Batch): PushResult {
     if (!this.#built) throw new TypeError("The join's build has not finished");
+    if (this.#checkpointed || this.#phaseWork)
+      throw new TypeError("The join's input is checkpointed");
     this.#shared.checkAborted();
     // No fresh slice per push (R23.5: the task clock's start is the task's, so short pushes
     // whose output blocks with a resolved ready still come due and yield).
@@ -2217,6 +2433,7 @@ export class HashJoin {
 
   /** @internal */
   finishProbe(): MaybePromise<void> {
+    this.#finishing = true;
     const shared = this.#shared;
     const level = this.#level;
     const downstream = shared.downstream;
@@ -2289,7 +2506,7 @@ export class HashJoin {
         if (paced !== null) await paced;
         const page = await shared.readPage(build, i);
         try {
-          const { rows, columns } = await shared.decode(page, this.spec.buildTypes);
+          const { rows, columns } = await shared.decode(page, shared.buildTypes);
           shared.checkAborted();
           await sub.addPage(page.bytes, rows, columns);
         } finally {
@@ -2380,7 +2597,7 @@ export class HashJoin {
             let full = false;
             let retry = 0;
             try {
-              const { rows, columns } = await shared.decode(bytes, this.spec.buildTypes);
+              const { rows, columns } = await shared.decode(bytes, shared.buildTypes);
               shared.checkAborted();
               loadingFirst = reserved && sub.store.rows === 0;
               let taken = sub.store.append(columns, null, row, loadingFirst ? 1 : rows - row);
@@ -2589,7 +2806,8 @@ export class HashJoin {
     void this.#cleanup.catch((error: unknown) => {
       this.cleanupError ??= error;
     });
-    const drain = shared.files.needsDrain;
+    const phaseWork = this.#phaseWork;
+    const drain = shared.files.needsDrain || phaseWork !== null;
     const finish = (failed: boolean, error?: unknown) => {
       try {
         if (drain) this.#releaseOwned();
@@ -2600,7 +2818,9 @@ export class HashJoin {
       if (failed) reject(error);
       else resolve();
     };
-    const closing = shared.files.closeAll();
+    const closing = phaseWork
+      ? phaseWork.catch(() => undefined).then(() => shared.files.closeAll())
+      : shared.files.closeAll();
     // Resident completion remains synchronous. Spill pages, stores, pool and grant stay
     // owned until every append and file close has stopped borrowing their charged buffers.
     if (!drain) this.#releaseOwned();

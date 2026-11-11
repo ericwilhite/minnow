@@ -616,6 +616,7 @@ it("governor-requested fallback reclaim keeps its buffer charged through cancell
       };
       ctx.grant.onReclaimRequest(reclaim);
       return {
+        checkpoint: () => Promise.reject(new Error("unused checkpoint fake")),
         profile: {
           mode: "keys",
           rowsIn: 0,

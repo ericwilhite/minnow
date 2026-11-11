@@ -39,8 +39,10 @@ Raw JSON prepays an input-sized workspace and retains its spelling. JSONB text c
 extraction preserve exact decimal scale, PostgreSQL key ordering and last-duplicate semantics.
 Expanding JSON uses bounded native spill fragments, retires its producer, then waits cancellably
 for complete re-admission through the shared idle pool. Completed rows are delivered once from
-files using a separately funded row buffer. Unary/EXCEPT parents are supported; retaining
-join/window parents await B7's checkpoint seam and return typed 0A000 refusals.
+files using a separately funded row buffer. JSON and eligible hybrid-aggregate producers use
+one ancestor registry, admission/restore controller and shared idle account through unary, EXCEPT,
+join and window parents. Consumed build siblings are not reopened. Window initial and additional
+restore workspace are fully admitted before construction or reads.
 Document parameters, unbounded foreign document producers, front-end materialized JSON/JSONB
 without source spelling, JSON paths, construction and aggregation remain typed refusals.
 Canonical traversal is iterative and charged, with quadratic CPU for wide objects.
@@ -1918,8 +1920,10 @@ shipped-engine or stored-format change.
   EXCEPT parent counts, representatives and first-left ordinals are checkpointed before
   retiring its right aggregate; completed left producers are not reopened. Generated pressure
   covers an already-spilled left arm, ALL/DISTINCT, cancellation and exact wide integers.
-  Current limits: variable-state handoffs below a retaining join parent, and computed aggregate
-  arguments without a proven materialization boundary, still use the external fallback.
+  Retaining join/window parents now share the same checkpoint registry and restore admission
+  with JSON producers. Saved joins preserve match bits and skip consumed build arms; windows
+  retain input ordinals before evaluation begins. Computed aggregate arguments without a
+  proven materialization boundary still use the external fallback.
   Direct-column FILTER transitions use conservative full-batch growth bounds. Pressure-only
   restoration pays sorting/I/O and a planned bounded minimum; plentiful-memory hash does not
   spool or select that route. The scratch service separately admits its fixed control/metadata
@@ -3319,3 +3323,66 @@ complete parent/candidate builds and nine AB/BA pairs, median gain greater than 
 seven favorable pairs, and no reverse-rule regression on the other catalogue shapes.
 Delivered columnar frames are the acceptance clock. JS row materialization is outside that
 clock and is reported separately. No timing campaign or absolute target pass is claimed here.
+
+### Native retaining-parent checkpoints
+
+The join and window expose pressure-only native checkpoint primitives. These are
+internal operator APIs used by the shared JSON/HybridPhase SQL controller.
+The planner must checkpoint retaining ancestors only, after the active input push
+has become ready and before a window's evaluation starts. Checkpointing a live
+descendant returning from `finish()` is invalid.
+
+`HashJoin.checkpoint()` saves build values, RIGHT/FULL match bits and deferred
+probe values. `new HashJoin(spec, context, saved)` selects its restored internal
+schema; `restore(saved)` copies the prefix into the new admitted join. A saved
+`buildComplete` means the planner must skip the already-consumed build sibling.
+Previously emitted probes and residuals are not replayed. Match bits travel with
+build values through subsequent repartitioning and chunk processing.
+
+A window opts in with `WindowSpec.checkpointable`. Its complete initial native
+minimum is `windowRetainingMinimumBytes(types, functions)`, which includes ordinal
+scratch and the sort's extra int64 column. Until an actual cut or grouped-store
+fallback, it uses the same grouped/columnar/general route as an ordinary window,
+without constructing or populating ordinals. Empty-prefix handoffs also keep that route;
+buffered JSON producers can hand off without retaining any ancestor rows. At a nonempty
+cut, grouped input moves to the
+general sort with its original arrival ordinals (including reverse chunk transfer).
+An untouched sort saves chronological pre-finish runs and the resident tail, stable
+within equal full keys. Restore assigns ordinals to that peer-stable prefix before
+copying it to the new general sort. The ordinal is never a peer key or output column.
+`checkpoint()` runs before any frame transition; `restore(saved)` preserves peer
+and floating ROWS order. The initial recipe conservatively reserves continuation
+workspace even when no cut occurs; it does not force a slower execution route.
+
+A proven sole `rank` / `row_number` top-k stays on the bounded route, including under
+phase-capable parents. A checkpoint records its current candidates and all boundary peers
+for RANK; candidates discarded by an earlier local bound cannot enter any later global
+bound. Restoring that union into the bounded sorter is exact, without evaluating a window
+or reopening its source. ROW_NUMBER row identity uses the SQL ordering's tie-breaker.
+The original arrival count is retained separately from the smaller candidate count. Empty
+cuts keep the same fast route, and explicit-ordinal snapshots still use general restoration.
+Resident snapshots, grouped fallback, output emission and streamed staging count rows
+independently of payload columns,
+including a zero-column ranking input. Profiles count original arrivals after a restored
+candidate prefix and ordinary sorter input when no checkpoint counter is enabled. Candidate snapshot reads/writes use the same ownership and cancellation
+fences as ordinary sort checkpoints.
+
+Descriptor `minimumBytes` and `restoreLoanSlots` are **additional** to the normal
+recipe. Window restore needs admitted ordinary reader/copy workspace; it cannot
+borrow while another private step is retained. Join restore uses its ordinary
+native I/O lane and reports its bounded progress requirement. Descriptors contain
+files, types and scalar continuation data, with no old grant, vector, parameter
+binding or operator. Saved files close only after successful copying; a controller
+must retain cleanup ownership on failure. Late directory writes are included in
+spill accounting. Cancellation drains checkpoint reads/writes before old credit
+is released, and descriptor close drains every owner before reporting failures.
+
+The native generated suites compare two successive restores with PGlite, including
+observed spills, all join kinds, match bits, window peers, non-associative float
+sums, NULLs, dictionaries and selections. Separate gated I/O histories cover
+cancellation, injected failures and concurrent saved-file closure. These operator
+checks complement the generated SQL consumer suites: mixed JSON/aggregate cuts, exact
+PGlite rows, pressure, snapshots, demand, owned parameters, concurrent survivors and injected
+checkpoint/retirement/admission/restore/close failures. The controller tests also verify exact
+additional window restore bytes, consumed-build admission pruning and zero open file owners.
+The witnesses are finite; they do not claim exhaustive schedules or browser memory measurements.

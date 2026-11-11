@@ -26,6 +26,7 @@
  * timestamps). RANGE offsets need one numeric ORDER BY key. Decimal and interval arguments are
  * refused (TypeError), as is a lag/lead default that is a column.
  */
+import { WindowCheckpoint, WINDOW_ORDINAL_BYTES } from "./window-checkpoint.js";
 import type { Grant, Loan } from "../memory/governor.js";
 import type { PhysicalType } from "../types.js";
 import { setInt128 } from "../vector/int128.js";
@@ -91,6 +92,8 @@ export interface WindowFunctionSpec {
 export interface WindowSpec {
   /** Proven sole ranking-function upper bound; the outer predicate remains in place. */
   readonly topK?: number;
+  /** Phase planner opt-in: preserve peer-stable input on an actual nonempty cut. */
+  readonly checkpointable?: boolean;
   readonly types: readonly PhysicalType[];
   readonly partitionBy: readonly number[];
   readonly orderBy: readonly SortColumn[];
@@ -169,6 +172,16 @@ export function windowMinimumBytes(types: readonly PhysicalType[], functions = 1
     4096 * 16 +
     1024 * 1024 +
     64 * 1024
+  );
+}
+
+/** Complete native minimum for the phase-capable variant, including its hidden key column. */
+export function windowRetainingMinimumBytes(types: readonly PhysicalType[], functions = 1): number {
+  return (
+    windowMinimumBytes(types, functions) +
+    WINDOW_ORDINAL_BYTES +
+    sortMinimumBytes([...types, { kind: "int64" }]) -
+    sortMinimumBytes(types)
   );
 }
 
@@ -266,20 +279,43 @@ function deferClose(grant: Grant): Grant {
 /** `ROW_NUMBER() / RANK() / … OVER (PARTITION BY … ORDER BY … frame)` (see the module comment). */
 export class WindowOperator implements Operator {
   readonly spec: WindowSpec;
-  readonly #sort: SortOperator | GroupTopKOperator;
-  readonly #boundedRanking: boolean;
+  #sort: SortOperator | GroupTopKOperator;
+  #boundedRanking: boolean;
+  readonly #context: SortContext;
   readonly #evaluator: Evaluator;
   /** The grouped sort's rows while it applies (null: the sort operator has the rows). */
   #grouped: GroupedRows | null = null;
   #pending: Promise<void> | null = null;
+  #inputWork: Promise<void> | null = null;
   #started = false;
+  #finishing = false;
+  #checkpointed = false;
+  #restoreStarted = false;
+  #priorSpilledBytes = 0;
+  #nextOrdinal = 0n;
+  #ordinals: BigInt64Array | null = null;
+  #phaseWork: Promise<unknown> | null = null;
   #aborting: Promise<void> | null = null;
+  readonly #cancel = new AbortController();
+  readonly #grant: Grant;
 
   constructor(spec: WindowSpec, context: SortContext, downstream: Operator) {
     validateWindowSpec(spec);
     this.spec = spec;
     const grant = deferClose(context.grant);
-    const shared: SortContext = { ...context, grant };
+    this.#grant = context.grant;
+    const shared: SortContext = {
+      ...context,
+      grant,
+      ...(spec.checkpointable
+        ? {
+            signal: context.signal
+              ? AbortSignal.any([context.signal, this.#cancel.signal])
+              : this.#cancel.signal,
+          }
+        : {}),
+    };
+    this.#context = shared;
     this.#evaluator = new Evaluator(spec, shared, context.grant, downstream);
     const call = spec.functions.length === 1 ? spec.functions[0] : undefined;
     this.#boundedRanking =
@@ -305,15 +341,6 @@ export class WindowOperator implements Operator {
         // Its first buffers were refused: the sort operator takes the rows.
         this.#grouped = null;
       }
-    const keys: SortColumn[] = [
-      ...spec.partitionBy.map((column): SortColumn => ({
-        column,
-        direction: "asc",
-        nulls: "last",
-        collation: null,
-      })),
-      ...spec.orderBy,
-    ];
     this.#sort = this.#boundedRanking
       ? new GroupTopKOperator(
           {
@@ -327,11 +354,90 @@ export class WindowOperator implements Operator {
           shared,
           downstream,
         )
-      : new SortOperator(
-          { types: spec.types, keys, limit: null, offset: 0, withTies: false },
-          shared,
-          this.#evaluator,
-        );
+      : this.#makeSort(false);
+  }
+
+  #makeSort(ordinals: boolean): SortOperator {
+    const spec = this.spec;
+    const keys: SortColumn[] = [
+      ...spec.partitionBy.map((column): SortColumn => ({
+        column,
+        direction: "asc",
+        nulls: "last",
+        collation: null,
+      })),
+      ...spec.orderBy,
+      ...(ordinals
+        ? [
+            {
+              column: spec.types.length,
+              direction: "asc" as const,
+              nulls: "last" as const,
+              collation: null,
+            },
+          ]
+        : []),
+    ];
+    return new SortOperator(
+      {
+        types: ordinals ? [...spec.types, { kind: "int64" }] : spec.types,
+        keys,
+        limit: null,
+        offset: 0,
+        withTies: false,
+      },
+      ordinals ? { ...this.#context, columnar: false } : this.#context,
+      ordinals
+        ? {
+            push: (batch, transfer) =>
+              this.#evaluator.push(
+                { ...batch, columns: batch.columns.slice(0, spec.types.length) },
+                transfer,
+              ),
+            ready: () => this.#evaluator.ready(),
+            finish: () => this.#evaluator.finish(),
+            abort: (reason) => this.#evaluator.abort(reason),
+          }
+        : this.#evaluator,
+    );
+  }
+
+  /** Only an actual cut/fallback pays for stable continuation ordinals. */
+  async #enableOrdinals(): Promise<void> {
+    if (this.#ordinals) return;
+    if (this.#sort instanceof GroupTopKOperator)
+      this.#sort.abort(new Error("Window ranking route retired"));
+    else this.#sort.discard();
+    await this.#sort.closed;
+    this.#boundedRanking = false;
+    this.#evaluator.checkAborted();
+    if (!this.#grant.allocate(WINDOW_ORDINAL_BYTES))
+      throw new RangeError("Window ordinals must be admitted");
+    this.#ordinals = new BigInt64Array(BATCH_ROWS);
+    this.#sort = this.#makeSort(true);
+  }
+
+  #withOrdinals(batch: Batch, start: bigint): Batch {
+    const values = this.#ordinals;
+    if (!values) return batch;
+    const selection = batch.selection;
+    for (let i = 0; i < (selection?.count ?? batch.length); i++) {
+      const row = selection ? (selection.rows[i] ?? 0) : i;
+      values[row] = start + BigInt(i);
+    }
+    return {
+      ...batch,
+      columns: [
+        ...batch.columns,
+        {
+          form: "flat",
+          type: { kind: "int64" },
+          length: batch.length,
+          validity: null,
+          data: { layout: "int64", values: { repr: "int64", values } },
+        },
+      ],
+    };
   }
 
   get profile(): WindowProfile {
@@ -339,9 +445,11 @@ export class WindowOperator implements Operator {
     profile.sort = this.#sort.profile;
     profile.boundedRanking = this.#boundedRanking;
     if (this.#boundedRanking) {
-      profile.rowsIn = profile.sort.rowsIn;
+      // A checkpoint may replay fewer candidates than original arrivals.
+      profile.rowsIn = this.spec.checkpointable ? Number(this.#nextOrdinal) : profile.sort.rowsIn;
       profile.rowsOut = profile.sort.rowsOut;
     }
+    profile.spilledBytes = this.#priorSpilledBytes + this.#evaluator.files.written;
     return profile;
   }
 
@@ -356,11 +464,17 @@ export class WindowOperator implements Operator {
     this.#grouped = null;
     this.#evaluator.profile.groupedFallbacks++;
     try {
+      if (this.spec.checkpointable) await this.#enableOrdinals();
       const store = grouped.store;
       for (let k = store.chunkCount - 1; k >= 0; k--) {
         const columns = grouped.batchColumns(k);
-        const length = columns[0]?.length ?? 0;
-        if (length > 0 && this.#sort.push({ length, columns, selection: null }) === "blocked")
+        const length = Math.min(store.chunkRows, store.rows - k * store.chunkRows);
+        if (
+          length > 0 &&
+          this.#sort.push(
+            this.#withOrdinals({ length, columns, selection: null }, BigInt(k * store.chunkRows)),
+          ) === "blocked"
+        )
           await this.#sort.ready();
         store.truncate(k * store.chunkRows);
         await yieldTask();
@@ -395,6 +509,11 @@ export class WindowOperator implements Operator {
   }
 
   push(batch: Batch, transfer?: Transfer): PushResult {
+    if (this.#checkpointed || this.#phaseWork || this.#finishing)
+      throw new TypeError("Window input boundary is sealed");
+    const start = this.#nextOrdinal;
+    if (this.spec.checkpointable)
+      this.#nextOrdinal += BigInt(batch.selection?.count ?? batch.length);
     try {
       this.#start();
       const grouped = this.#grouped;
@@ -405,11 +524,22 @@ export class WindowOperator implements Operator {
           return "ready";
         }
         this.#pending = this.#fallback().then(() => {
-          if (this.#sort.push(batch, transfer) === "blocked") return this.#sort.ready();
+          if (this.#sort.push(this.#withOrdinals(batch, start), transfer) === "blocked")
+            return this.#sort.ready();
         });
+        const work = this.#pending;
+        this.#inputWork = work;
+        void work.then(
+          () => {
+            if (this.#inputWork === work) this.#inputWork = null;
+          },
+          () => {
+            if (this.#inputWork === work) this.#inputWork = null;
+          },
+        );
         return "blocked";
       }
-      return this.#sort.push(batch, transfer);
+      return this.#sort.push(this.#withOrdinals(batch, start), transfer);
     } catch (error) {
       this.abort(error);
       throw error;
@@ -426,6 +556,9 @@ export class WindowOperator implements Operator {
   }
 
   finish(): MaybePromise<void> {
+    if (this.#checkpointed || this.#phaseWork) throw new TypeError("Window input is checkpointed");
+    this.#finishing = true;
+    this.#dropOrdinals();
     let result: MaybePromise<void>;
     try {
       this.#start();
@@ -441,7 +574,10 @@ export class WindowOperator implements Operator {
             return;
           }
           // The grant refused the sort's arrays: the sort operator sorts instead.
-          return this.#fallback().then(() => this.#sort.finish());
+          return this.#fallback().then(() => {
+            this.#dropOrdinals();
+            return this.#sort.finish();
+          });
         };
         result = isPromise(sorted) ? sorted.then(after) : after(sorted);
       } else {
@@ -465,7 +601,137 @@ export class WindowOperator implements Operator {
     });
   }
 
+  checkpoint(): Promise<WindowCheckpoint> {
+    if (!this.spec.checkpointable || this.#finishing || this.#checkpointed || this.#phaseWork)
+      return Promise.reject(
+        new TypeError("Window checkpoint requires an unfinished input boundary"),
+      );
+    const work = (async () => {
+      await this.ready();
+      // The grouped store is in arrival order. Its reverse-chunk fallback needs
+      // explicit ordinals; an untouched sort instead snapshots stable peer order.
+      if (this.#grouped && this.#grouped.rows > 0) await this.#fallback();
+      const records = await this.#sort.checkpoint();
+      try {
+        this.#evaluator.checkAborted();
+        this.#checkpointed = true;
+        return new WindowCheckpoint(
+          records,
+          this.#nextOrdinal,
+          this.profile.spilledBytes + this.profile.sort.spilledBytes,
+          this.#ordinals !== null,
+        );
+      } catch (error) {
+        await records.close();
+        throw error;
+      }
+    })();
+    this.#phaseWork = work;
+    void work.then(
+      () => {
+        if (this.#phaseWork === work) this.#phaseWork = null;
+      },
+      () => {
+        if (this.#phaseWork === work) this.#phaseWork = null;
+      },
+    );
+    return work;
+  }
+  restore(saved: WindowCheckpoint): Promise<void> {
+    if (
+      !this.spec.checkpointable ||
+      this.#started ||
+      this.#phaseWork ||
+      this.#finishing ||
+      this.#restoreStarted
+    )
+      return Promise.reject(new TypeError("Window restore requires a new admitted operator"));
+    this.#restoreStarted = true;
+    const work = (async () => {
+      // Buffered producers can hand off with no retained ancestor prefix, even
+      // at plentiful memory. No rows need conversion: keep the ordinary route.
+      if (saved.nextOrdinal === 0n && saved.records.tape.rows === 0) {
+        await saved.close();
+        this.#priorSpilledBytes = saved.spilledBytes;
+        return;
+      }
+      this.#grouped?.close();
+      this.#grouped = null;
+      // A proven bounded ranking needs only its best prefix candidates. A pre-finish
+      // snapshot retains every relevant key/value, so replay into the bounded route is exact.
+      // A row_number whose row identity matters has its explicit SQL tie-breaker in the key.
+      // Explicit-ordinal snapshots from a general route still use its general continuation.
+      const bounded = this.#boundedRanking && !saved.hasOrdinals;
+      if (!bounded) await this.#enableOrdinals();
+      let ordinal = 0n;
+      await saved.records.read(this.#evaluator.io, async (columns, rows) => {
+        // Before finish, sort runs are chronological, each stable for equal keys;
+        // the resident tail follows them. Only peer order matters to a window.
+        const batch = { columns, length: rows, selection: null };
+        const input = bounded || saved.hasOrdinals ? batch : this.#withOrdinals(batch, ordinal);
+        ordinal += BigInt(rows);
+        if (this.#sort.push(input) === "blocked") await this.#sort.ready();
+      });
+      this.#evaluator.checkAborted();
+      await saved.close();
+      this.#nextOrdinal = saved.nextOrdinal;
+      this.#priorSpilledBytes = saved.spilledBytes;
+    })();
+    this.#phaseWork = work;
+    void work.then(
+      () => {
+        if (this.#phaseWork === work) this.#phaseWork = null;
+      },
+      () => {
+        if (this.#phaseWork === work) this.#phaseWork = null;
+      },
+    );
+    return work;
+  }
+  #dropOrdinals(): void {
+    if (this.#ordinals) {
+      this.#ordinals = null;
+      this.#grant.free(WINDOW_ORDINAL_BYTES);
+    }
+  }
   abort(reason: unknown): void {
+    this.#cancel.abort(reason);
+    if (this.spec.checkpointable) {
+      if (this.#aborting) return;
+      const work = this.#phaseWork;
+      this.#aborting = (async () => {
+        await Promise.allSettled([work, this.#inputWork]);
+        this.#dropOrdinals();
+        this.#grouped?.close();
+        this.#grouped = null;
+        this.#sort.abort(reason);
+        const errors: unknown[] = [];
+        try {
+          await this.#sort.closed;
+        } catch (error) {
+          errors.push(error);
+        }
+        this.#evaluator.abort(reason);
+        try {
+          await this.#evaluator.closed;
+        } catch (error) {
+          errors.push(error);
+        }
+        if (errors.length) throw new AggregateError(errors, "Window retirement failed");
+      })();
+      void this.#aborting.catch(() => undefined);
+      return;
+    }
+    if (this.#phaseWork) {
+      this.#aborting ??= this.#phaseWork
+        .catch(() => undefined)
+        .then(() => {
+          this.abort(reason);
+          return Promise.all([this.#sort.closed, this.#evaluator.closed]).then(() => undefined);
+        });
+      return;
+    }
+    this.#dropOrdinals();
     this.#sort.abort(reason);
     if (this.#boundedRanking) {
       this.#aborting ??= (async () => {
@@ -902,7 +1168,7 @@ class Evaluator implements Operator {
       const taken = this.#blockRows;
       for (let k = 0; k < block.chunkCount; k++) {
         const columns = this.spec.types.map((_, c) => block.chunk(c, k));
-        yield* this.#stage(columns, 0, columns[0]?.length ?? 0);
+        yield* this.#stage(columns, 0, Math.min(block.chunkRows, block.rows - k * block.chunkRows));
       }
       done += taken;
     }
@@ -1119,7 +1385,7 @@ class Evaluator implements Operator {
     try {
       for (let k = 0; k < held.chunkCount; k++) {
         const vectors = this.spec.types.map((_, c) => held.chunk(c, k));
-        const rows = vectors[0]?.length ?? 0;
+        const rows = Math.min(held.chunkRows, held.rows - k * held.chunkRows);
         await this.io.stage(staging, run, header, vectors, null, 0, rows);
       }
       await this.io.flush(staging, run, header);
@@ -1520,7 +1786,7 @@ class Evaluator implements Operator {
     const store = this.#held;
     for (let k = 0; k < store.chunkCount; k++) {
       const columns = this.spec.types.map((_, c) => store.chunk(c, k));
-      const rows = columns[0]?.length ?? 0;
+      const rows = Math.min(store.chunkRows, store.rows - k * store.chunkRows);
       yield* this.#push(columns, scratch, at, rows, n);
       at += rows;
     }

@@ -21,6 +21,7 @@ export class RecordCheckpoint {
   #writer: Writer | null = null;
   #sealed = false;
   #closing: Promise<void> | null = null;
+  #maxPageBytes = 0;
   constructor(
     parent: SpillIo,
     service: SpillService,
@@ -53,6 +54,12 @@ export class RecordCheckpoint {
       });
       this.directory = directory;
       this.tape = new HashTape(directory);
+      const append = this.tape.write;
+      this.tape.write = async (page, rows) => {
+        this.#maxPageBytes = Math.max(this.#maxPageBytes, page.byteLength);
+        if (!append) throw new Error("Missing checkpoint tape writer");
+        await append(page, rows);
+      };
       this.#writer = { io, pages, staging };
     } catch (error) {
       staging?.close();
@@ -60,6 +67,9 @@ export class RecordCheckpoint {
       pages?.close();
       throw error;
     }
+  }
+  get maxPageBytes(): number {
+    return this.#maxPageBytes;
   }
   async write(columns: readonly Vector[], row: number, count = 1): Promise<void> {
     const writer = this.#writer;
@@ -94,6 +104,7 @@ export class RecordCheckpoint {
   async read(
     parent: SpillIo,
     visit: (columns: readonly FlatVector[], rows: number) => Promise<void>,
+    progressBytes = 0,
   ): Promise<void> {
     if (!this.#sealed || this.#writer) throw new Error("Checkpoint is not sealed");
     const pages = new PageWriter(parent.pool, 16 * 1024);
@@ -110,9 +121,17 @@ export class RecordCheckpoint {
       );
       this.directory.attach(io, parent.pool);
       attached = true;
-      for await (const batch of this.tape.read(this.types)) {
-        parent.checkAborted();
-        await visit(batch.columns, batch.length);
+      const batches = this.tape.read(this.types);
+      try {
+        for (;;) {
+          if (progressBytes && this.tape.rows) await parent.need(progressBytes);
+          const next = await batches.next();
+          if (next.done) break;
+          parent.checkAborted();
+          await visit(next.value.columns, next.value.length);
+        }
+      } finally {
+        await batches.return();
       }
     } finally {
       if (attached) this.directory.detach();

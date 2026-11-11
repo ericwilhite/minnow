@@ -37,6 +37,7 @@ import {
 import type { SortContext, SortProfile, SortSpec } from "./sort.js";
 import { SortKeyCompression, type CompressionStats } from "./sort-compress.js";
 import { SortDictionary } from "./sort-dictionary.js";
+import type { RecordCheckpoint } from "./record-checkpoint.js";
 import type { Loan } from "../memory/governor.js";
 
 interface GeneralSort extends Operator {
@@ -44,6 +45,7 @@ interface GeneralSort extends Operator {
   readonly closed: Promise<void>;
   reclaim(): void | Promise<void>;
   discard(): void;
+  checkpoint(): Promise<RecordCheckpoint>;
 }
 // At most sixteen active chunk handoffs: closure/Map entries, output descriptors and views.
 const META_BYTES = 16 * 1024;
@@ -87,6 +89,7 @@ export class ColumnarSortOperator implements Operator {
   #working: Promise<void> | null = null;
   #pending: Promise<void> | null = null;
   #reclaiming: Promise<void> | null = null;
+  #checkpointWork: Promise<void> | null = null;
   #finishing = false;
   #done = false;
   #reason: unknown;
@@ -431,7 +434,36 @@ export class ColumnarSortOperator implements Operator {
     if (this.#slice.due()) yield;
   }
 
+  /** Convert only at a real cut. Replay is forward and stable within peer keys. */
+  checkpoint(): Promise<RecordCheckpoint> {
+    if (this.#done || this.#finishing || this.#checkpointWork)
+      return Promise.reject(new TypeError("Columnar checkpoint requires an input boundary"));
+    const working = this.#working,
+      reclaiming = this.#reclaiming;
+    const work = (async () => {
+      await working;
+      await reclaiming;
+      this.#check();
+      await this.#external();
+      this.#check();
+      if (!this.#fallback) throw new Error("Missing checkpoint sorter");
+      return this.#fallback.checkpoint();
+    })();
+    const settled = work.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#checkpointWork = settled;
+    this.#inflight.add(settled);
+    void settled.then(() => {
+      this.#inflight.delete(settled);
+      if (this.#checkpointWork === settled) this.#checkpointWork = null;
+    });
+    return work;
+  }
+
   reclaim(): void | Promise<void> {
+    if (this.#checkpointWork) return this.#checkpointWork;
     if (this.#done || this.#finishing || this.#abort.signal.aborted) return;
     if (this.#fallback !== null) {
       const work = this.#fallback.reclaim();
