@@ -2619,3 +2619,17 @@ export const IDB_METADATA_CACHE_REACH = [
   "unsettled native frame retains credit",
   "queued operations fenced before execution",
 ] as const;
+
+/** Failed private transactions preserve acknowledged bytes and cannot publish clean state. */
+export const IDB_METADATA_FAILURE_REACH = [
+  "dirty acknowledged page ahead of storage",
+  "failed first transaction",
+  "old flush committed before failed replacement",
+  "consecutive aborts",
+  "consecutive callback failures",
+  "successful transactions between failed bursts",
+  "full to compact replacement",
+  "compact to full replacement",
+  "both publication oracles after every action",
+  "close and reopen agreement",
+] as const;
