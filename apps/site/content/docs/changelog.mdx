@@ -10,6 +10,13 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported rebuild now executes text-to-JSONB casts, JSONB extraction and exact canonical
+JSONB text, including decimal scale, duplicate keys and Unicode validation. Expanding values use
+charged spill checkpoints and cancellable re-admission for unary and EXCEPT parents; retaining
+join/window parents remain explicit typed refusals pending their checkpoint seam. JSON paths,
+construction and aggregation remain refused. The shipped engine, public API and stored formats
+are unchanged; no migration is needed.
+
 The unexported rebuild now keeps `DATE_PART(text, INTERVAL)` as PostgreSQL's double precision
 result, while `EXTRACT` remains exact `NUMERIC`. This also restores overload rejection such as
 `round(date_part(...), 6)` (`42883`). Date/time `DATE_PART` execution remains explicitly unsupported;
@@ -36,8 +43,7 @@ The SELECT guide and internal analytics catalogue's guide-9 JSON example now cas
 resolving PostgreSQL's ambiguous untyped extraction operator (`42725`). Its data and path are
 unchanged. PostgreSQL, the current engine and the private rebuild return the same text result.
 The rebuild now has charged, cancellable JSON extraction kernels that preserve raw number text,
-duplicate keys and whitespace. JSON construction and aggregation remain refused pending growth
-admission. Published runtime behavior, public API and
+duplicate keys and whitespace. JSON construction and aggregation remain separate follow-up work. Published runtime behavior, public API and
 stored formats are unchanged; no migration is needed.
 
 Affected packages: `@minnowdb/core` (SQL feature metadata and compatibility documentation) and

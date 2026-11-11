@@ -14,6 +14,7 @@ import {
   type Transfer,
 } from "./pipeline.js";
 import { Slice, runSliced, type SlicedJob } from "./slices.js";
+import { JsonWorkspace } from "./json-workspace.js";
 
 /** Each extractor has a source-sized sub-budget inside a completely prepaid workspace. */
 class JsonMemorySlice implements JsonMemory {
@@ -40,8 +41,11 @@ class JsonRequest extends Error {
   }
 }
 export interface JsonExpressionContext {
-  /** Admitted source envelope + 1; every output is no larger than its input. */
+  /** Prepaid row workspace. Raw JSON uses its source envelope + 1; expanding frames
+   * checkpoint and re-admit when this shared budget is exhausted. */
   readonly bytes: number;
+  /** Expanding expressions checkpoint instead of exceeding this shared row credit. */
+  readonly expanding?: boolean;
   readonly signal?: AbortSignal;
   readonly stopped?: () => boolean;
 }
@@ -91,6 +95,9 @@ class JsonProject implements Operator {
 export class JsonExpressions implements Operator, JsonHost {
   readonly slice = new Slice(YIELD_INTERVAL_MS);
   readonly #arena: OutputArena;
+  readonly #workspace: JsonWorkspace | null;
+  #running = false;
+  #variableArenaBytes = 0;
   readonly #inner: Operator;
   readonly #project: JsonProject | null;
   readonly #nodes: JsonNode[] = [];
@@ -110,15 +117,24 @@ export class JsonExpressions implements Operator, JsonHost {
     readonly downstream: Operator,
   ) {
     context.arena.take(1024 + 2);
+    this.#workspace = shared.expanding ? new JsonWorkspace(shared.bytes) : null;
     this.#one = { rows: new Uint16Array(1), count: 1 };
     this.#batch = { length: 0, columns: [], selection: this.#one };
     this.#arena = new OutputArena(
       {
         allocate: (bytes) => {
-          context.arena.take(bytes);
+          if (this.#running && this.#workspace !== null) {
+            this.#workspace.takeNow(bytes);
+            this.#variableArenaBytes += bytes;
+          } else context.arena.take(bytes);
           return true;
         },
-        free: (bytes) => context.arena.give(bytes),
+        free: (bytes) => {
+          const variable = Math.min(bytes, this.#variableArenaBytes);
+          this.#workspace?.free(variable);
+          this.#variableArenaBytes -= variable;
+          if (bytes > variable) context.arena.give(bytes - variable);
+        },
       },
       context.arena.capacity,
       true,
@@ -127,14 +143,15 @@ export class JsonExpressions implements Operator, JsonHost {
     const compile = { ...context, arena: this.#arena };
     this.#project = Array.isArray(exprs) ? new JsonProject(exprs, compile, downstream) : null;
     this.#inner = this.#project ?? new FilterOperator(exprs as ScalarExpr, compile, downstream);
-    this.#arena.take(this.#nodes.length * shared.bytes);
+    this.#arena.take((this.#workspace === null ? this.#nodes.length : 1) * shared.bytes);
+    this.#running = true;
   }
   get workspaceCount(): number {
     return this.#nodes.length;
   }
   memory(node: JsonNode): JsonMemory {
     this.#arena.take(512);
-    const memory = new JsonMemorySlice(this.shared.bytes);
+    const memory = this.#workspace ?? new JsonMemorySlice(this.shared.bytes);
     this.#nodes.push(node);
     this.#requests.set(node, new JsonRequest(node));
     return memory;

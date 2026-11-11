@@ -92,14 +92,14 @@ export const FUNCTION_BINDINGS: Readonly<Record<string, Binding | PerOverload>> 
   json_get: per({
     "json,text": { kernel: "json" },
     "json,int4": { kernel: "json" },
-    "jsonb,text": refuse("JSONB canonical extraction"),
-    "jsonb,int4": refuse("JSONB canonical extraction"),
+    "jsonb,text": { kernel: "json" },
+    "jsonb,int4": { kernel: "json" },
   }),
   json_get_text: per({
     "json,text": { kernel: "json" },
     "json,int4": { kernel: "json" },
-    "jsonb,text": refuse("JSONB canonical extraction"),
-    "jsonb,int4": refuse("JSONB canonical extraction"),
+    "jsonb,text": { kernel: "json" },
+    "jsonb,int4": { kernel: "json" },
   }),
   generate_series: refuse("set-returning GENERATE_SERIES requires its relational operator"),
   add: per({
@@ -225,7 +225,11 @@ export const CAST_REFUSALS: ReadonlyMap<string, string> = new Map([
 /** Why the cast `from → to` is refused, or null when cast.ts implements it. */
 export function castRefusal(from: SqlType, to: SqlType): string | null {
   if (from === to) return null;
-  if ((from === "text" && to === "json") || (from === "json" && to === "text")) return null;
+  if (
+    (from === "text" && (to === "json" || to === "jsonb")) ||
+    ((from === "json" || from === "jsonb") && to === "text")
+  )
+    return null;
   if (to === "text")
     return from === "date" || from === "timestamp" || from === "timestamptz" || from === "interval"
       ? null

@@ -195,9 +195,10 @@ it("retains document bytes through stored, VALUES, view and CASE sources", async
     expect(() => core.prepare(sql), sql).toThrow(
       expect.objectContaining({ sqlState: "0A000", stage: "execute", construct: "function" }),
     );
-  expect(() => core.prepare("SELECT '{\"n\":1}'::jsonb ->> 'n'")).toThrow(
-    expect.objectContaining({ sqlState: "0A000", stage: "execute", construct: "cast" }),
-  );
+  const binarySql = "SELECT '{\"n\":1}'::jsonb ->> 'n' AS j";
+  const binaryResult = await core.execute(binarySql);
+  if (!("batches" in binaryResult)) throw new Error("Expected JSONB rows");
+  expect(oracleRows(binaryResult)).toEqual((await pg.query(binarySql)).rows);
 }, 120000);
 
 it.each(seedsFor("next-json-runtime-validation", [0xb644, 0xb645]))(

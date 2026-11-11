@@ -18,9 +18,16 @@ import {
 } from "./except.js";
 import { readValue, boundSource, type ReadSource, type ReadBound } from "../page/read-bounds.js";
 import { batchTargetFor, type Grant } from "../memory/governor.js";
-import { jsonLiteralBytes, jsonInputsBounded } from "./json-plan.js";
+import { jsonLiteralBytes, jsonInputsBounded, jsonRetainingParents } from "./json-plan.js";
 import { JsonExpressions } from "./json-expressions.js";
-import { jsonExpression } from "../ir/json-expression.js";
+import {
+  JsonPhaseOperator,
+  closeJsonPhase,
+  JSON_PHASE_IO,
+  JSON_PHASE_FIXED,
+  type JsonPhase,
+} from "./json-phase.js";
+import { jsonExpression, expandingJsonExpression } from "../ir/json-expression.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import { samePhysicalType, type PhysicalType } from "../types.js";
 import { BATCH_ROWS, type Batch, type Selection, type Vector } from "../vector/vector.js";
@@ -526,10 +533,35 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   }
   const aggregateChoices = new WeakMap<QueryRuntime, Map<number, AggregateStrategy>>();
   const hybridIo = 2 << 20;
-  interface Cut {
-    readonly rel: number;
-    readonly phase: HybridPhase;
-  }
+  type Cut =
+    | { readonly kind: "aggregate"; readonly rel: number; readonly phase: HybridPhase }
+    | { readonly kind: "json"; readonly rel: number; readonly phase: JsonPhase };
+  const closePhase = (phase: HybridPhase | JsonPhase): Promise<void> =>
+    "checkpoint" in phase ? closeHybridPhase(phase) : closeJsonPhase(phase);
+  const jsonPlanners = new Map<number, number>();
+  const jsonCapacities = new WeakMap<QueryRuntime, Map<number, number>>();
+  const jsonFrontier = new WeakMap<QueryRuntime, number | null>();
+  const jsonDescendants = new Set<number>();
+  const findJson = (rel: Rel): boolean => {
+    let found =
+      (rel.op === "project" && rel.exprs.some(expandingJsonExpression)) ||
+      (rel.op === "filter" && expandingJsonExpression(rel.predicate));
+    if ("input" in rel) found = findJson(rel.input) || found;
+    if ("left" in rel && "right" in rel) {
+      const left = findJson(rel.left),
+        right = findJson(rel.right);
+      found = left || right || found;
+    }
+    if ("inputs" in rel) for (const input of rel.inputs) found = findJson(input) || found;
+    if (found) jsonDescendants.add(rel.id);
+    return found;
+  };
+  findJson(plan.root);
+  // Ordinary plans need no per-relation JSON retention metadata.
+  const { supported: jsonParents, excepts: jsonExceptParents } =
+    jsonDescendants.size > 0
+      ? jsonRetainingParents(plan.root)
+      : { supported: new Set<number>(), excepts: new Map<number, ReadonlySet<number>>() };
   interface Phases {
     resume: Cut | null;
     pending: Cut | null;
@@ -838,7 +870,10 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           input = types(rel.input);
         if (
           rel.op !== "limit" &&
-          (rel.op === "project" ? rel.exprs.some(jsonExpression) : jsonExpression(rel.predicate))
+          ((rel.op === "project"
+            ? rel.exprs.some(jsonExpression)
+            : jsonExpression(rel.predicate)) ||
+            jsonDescendants.has(rel.input.id))
         ) {
           if (plan.volatile)
             throw new UnsupportedPlanError("JSON expressions mixed with volatile evaluation", {
@@ -865,6 +900,108 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             },
             (operator) => operator.abort(undefined),
           );
+          if (jsonDescendants.has(rel.id)) {
+            if (!jsonParents.has(rel.id))
+              throw new UnsupportedPlanError(
+                "expanding JSON under a join/window retaining parent (checkpoint seam pending)",
+                { construct: "function" },
+              );
+            const base = Math.max(4096, minimum) + JSON_PHASE_FIXED + 2 * JSON_PHASE_IO;
+            jsonPlanners.set(rel.id, base);
+            fixed(rel, base);
+            jsonWorkspaces.set(rel.id, 0);
+            return (runtime, downstream, stops, rowsNeeded) => {
+              const resume = phases.get(runtime)?.resume;
+              const saved =
+                resume?.kind === "json" && resume.rel === rel.id ? resume.phase : undefined;
+              if (!saved && jsonFrontier.get(runtime) !== rel.id) {
+                // An ancestor remains empty while the frontier spools. It needs no evaluator,
+                // row buffers or I/O lane until a completed child is delivered in a new phase.
+                const waiting: Operator = {
+                  push: () => {
+                    throw new Error("JSON frontier emitted before checkpoint");
+                  },
+                  ready: () => Promise.resolve(),
+                  finish: () => undefined,
+                  abort: () => undefined,
+                };
+                return child(runtime, waiting, stops, rel.op === "filter" ? undefined : rowsNeeded);
+              }
+              const capacity = saved?.emit ? 0 : (jsonCapacities.get(runtime)?.get(rel.id) ?? 4096);
+              const retainedBytes = saved?.retainedBytes ?? 0;
+              return instantiate(
+                runtime,
+                rel,
+                input,
+                base + capacity + retainedBytes,
+                BATCH_ROWS,
+                (context, grant) =>
+                  new JsonPhaseOperator(
+                    exprs,
+                    context,
+                    {
+                      grant,
+                      spill: runtime.request.spill,
+                      queryId: runtime.request.queryId,
+                      capacity,
+                      retainedBytes,
+                      ...(rowsNeeded === undefined ? {} : { rowsNeeded }),
+                      stopped: () => stops.some((stop) => stop()),
+                      progressBytes: runtime.retainedProgressEnvelope(),
+                      signal: runtime.signal,
+                      ...(saved ? { resume: saved } : {}),
+                      dispose: (release) => runtime.dispose(release),
+                      handoff: async (phase) => {
+                        const state = phases.get(runtime);
+                        if (!state || state.pending)
+                          throw new Error("Missing/overlapping JSON phase owner");
+                        state.pending = { kind: "json", rel: rel.id, phase };
+                        for (const [id, parent] of state.excepts) {
+                          // A descendant may still be returning from finish(), awaiting this
+                          // cut. Only retaining ANCESTORS belong to this continuation.
+                          if (!jsonExceptParents.get(rel.id)?.has(id)) continue;
+                          const saved = await parent.checkpoint(),
+                            prior = state.retained.get(id);
+                          state.retained.set(id, saved);
+                          await prior?.records.close();
+                        }
+                        runtime.beginHandoff();
+                      },
+                    },
+                    types(rel),
+                    counted(runtime, rel, downstream),
+                  ),
+                (operator) => {
+                  runtime.onAbort((reason) => operator.abort(reason));
+                  runtime.dispose(() => operator.closed);
+                  return (async () => {
+                    try {
+                      if (saved) await operator.resume();
+                      else
+                        await child(
+                          runtime,
+                          operator,
+                          [...stops, () => operator.stopped],
+                          rel.op === "filter" ? undefined : rowsNeeded,
+                        );
+                    } catch (error) {
+                      if (!saved && operator.deferRowError(error)) {
+                        await operator.finish();
+                        return;
+                      }
+                      operator.abort(error);
+                      await operator.closed.catch(() => undefined);
+                      throw error;
+                    } finally {
+                      const profile = runtime.profile(rel);
+                      profile.spilledBytes += operator.spilledBytes;
+                      profile.spillPasses += operator.spillPasses;
+                    }
+                  })();
+                },
+              );
+            };
+          }
           fixed(rel, Math.max(4096, minimum));
           jsonWorkspaces.set(rel.id, slots);
           return (runtime, downstream, stops, rowsNeeded) =>
@@ -1191,7 +1328,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                   config = { signal: runtime.signal, ...outputOptions };
                 if (strategy.kind === "restore") {
                   const resume = phases.get(runtime)?.resume;
-                  if (resume?.rel !== rel.id) throw new Error("Missing saved restoration phase");
+                  if (resume?.kind !== "aggregate" || resume.rel !== rel.id)
+                    throw new Error("Missing saved restoration phase");
                   return new RestoredAggregateOperator(
                     aggregate,
                     context,
@@ -1211,7 +1349,10 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 if (strategy.kind === "hybrid") {
                   const state = phases.get(runtime);
                   if (!state) throw new Error("Missing aggregate phase execution");
-                  const resume = state.resume?.rel === rel.id ? state.resume.phase : undefined;
+                  const resume =
+                    state.resume?.kind === "aggregate" && state.resume.rel === rel.id
+                      ? state.resume.phase
+                      : undefined;
                   return new HybridAggregateOperator(
                     aggregate,
                     context,
@@ -1232,7 +1373,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                         ? {
                             handoff: async (phase: HybridPhase) => {
                               if (state.pending) throw new Error("Concurrent aggregate handoffs");
-                              state.pending = { rel: rel.id, phase };
+                              state.pending = { kind: "aggregate", rel: rel.id, phase };
                               // An EXCEPT right arm can retire only after preserving its
                               // accumulated/spilled left counts and first representatives.
                               for (const [id, parent] of state.excepts) {
@@ -1832,6 +1973,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   }
   const recipe = prepare(plan.root);
   const hasJson = jsonWorkspaces.size !== 0;
+  const hasInputSizedJson = [...jsonWorkspaces.values()].some((slots) => slots > 0);
   const jsonConstants = hasJson ? jsonLiteralBytes(plan) : 0;
   // One document may feed several output columns in the same copied result row.
   const jsonProgressColumns = Math.max(1, plan.columns.length);
@@ -1968,6 +2110,48 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             ? entry.minimum
             : entry.minimum(runtime.request.governor.capBytes),
       }));
+    // At most one unfinished JSON producer is active. Completed children are delivered
+    // from files, while unopened ancestors/EXCEPT siblings have no native JSON buffers.
+    const chooseJsonFrontier = (cut: Cut | null): number | null => {
+      const state = phases.get(runtime);
+      const search = (node: Rel): number | null => {
+        if (!active.has(node.id)) return null;
+        if (node.id === cut?.rel) return cut.kind === "json" && !cut.phase.emit ? node.id : null;
+        const children =
+          "inputs" in node
+            ? node.inputs.filter((_, i) => i !== 0 || !state?.retained.get(node.id)?.leftDone)
+            : "input" in node
+              ? [node.input]
+              : [];
+        for (const child of children) {
+          const next = search(child);
+          if (next !== null) return next;
+        }
+        return jsonPlanners.has(node.id) ? node.id : null;
+      };
+      return search(plan.root);
+    };
+    const configureJson = (list: typeof entries, cut: Cut | null): void => {
+      if (jsonPlanners.size === 0) return;
+      const frontier = chooseJsonFrontier(cut);
+      jsonFrontier.set(runtime, frontier);
+      if (jsonPlanners.size > 0)
+        runtime.resultProgressEnvelope(frontier !== null ? 0 : (cut?.phase.progressBytes ?? null));
+      for (const entry of list) {
+        const base = jsonPlanners.get(entry.rel.id);
+        if (base === undefined) continue;
+        const saved = cut?.kind === "json" && cut.rel === entry.rel.id ? cut.phase : null;
+        entry.minimum = saved
+          ? base +
+            (saved.emit ? 0 : (jsonCapacities.get(runtime)?.get(entry.rel.id) ?? saved.capacity)) +
+            saved.retainedBytes
+          : entry.rel.id === frontier
+            ? base + (jsonCapacities.get(runtime)?.get(entry.rel.id) ?? 4096)
+            : 0;
+        entry.loanSlots = 0;
+      }
+    };
+    configureJson(entries, null);
     const demand = new Map<number, number>();
     const findDemand = (node: Rel, need: number | null): void => {
       if (!active.has(node.id)) return;
@@ -2086,7 +2270,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         if (
           ![...(aggregateChoices.get(runtime)?.values() ?? [])].some(
             (choice) => choice.kind === "hybrid",
-          )
+          ) &&
+          ![...jsonPlanners.keys()].some((id) => active.has(id))
         )
           return then(runtime.reserve(entries), () => recipe(runtime, sink, []));
         runtime.enablePhases();
@@ -2136,13 +2321,33 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               };
               visitRemaining(plan.root);
               const next = entries.filter((entry) => remaining.has(entry.owner));
-              const aggregate = next.find((entry) => entry.rel.id === cut.rel);
-              if (!aggregate) throw new Error("Missing restore aggregate admission");
-              const restore = aggregatePlanners.get(cut.rel)?.restore;
-              if (!restore) throw new Error("Missing admitted restoration recipe");
-              aggregate.minimum = restore.minimum;
-              aggregate.loanSlots = restore.loans;
-              aggregateChoices.get(runtime)?.set(cut.rel, restore);
+              if (cut.kind === "json") {
+                const target = next.find((entry) => entry.rel.id === cut.rel),
+                  base = jsonPlanners.get(cut.rel);
+                if (!target || base === undefined) throw new Error("Missing JSON phase admission");
+                target.minimum = base + cut.phase.capacity + cut.phase.retainedBytes;
+                target.loanSlots = 0;
+                let capacities = jsonCapacities.get(runtime);
+                if (!capacities) {
+                  capacities = new Map();
+                  jsonCapacities.set(runtime, capacities);
+                }
+                capacities.set(
+                  cut.rel,
+                  cut.phase.emit
+                    ? 0
+                    : Math.max(cut.phase.capacity, 2 * (capacities.get(cut.rel) ?? 4096)),
+                );
+              } else {
+                const aggregate = next.find((entry) => entry.rel.id === cut.rel);
+                if (!aggregate) throw new Error("Missing restore aggregate admission");
+                const restore = aggregatePlanners.get(cut.rel)?.restore;
+                if (!restore) throw new Error("Missing admitted restoration recipe");
+                aggregate.minimum = restore.minimum;
+                aggregate.loanSlots = restore.loans;
+                aggregateChoices.get(runtime)?.set(cut.rel, restore);
+              }
+              configureJson(next, cut);
               // A cut in EXCEPT's left arm leaves its right input unopened. Carry the
               // original publication-stable bounds for those future sources into admission.
               let io = 0,
@@ -2153,11 +2358,21 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                   progress = Math.max(progress, bound.progress);
                 }
               runtime.readMinimum(io, progress, cut.phase.progressBytes);
-              await runtime.restorePhase(
-                next,
-                cut.phase.parameters.phaseBinding(runtime.signal),
-                idle.pool,
-              );
+              const binding = cut.phase.parameters.phaseBinding(runtime.signal);
+              const logicalInputs = binding.logicalBytes ?? binding.bytes;
+              if (
+                cut.kind === "json" &&
+                !cut.phase.emit &&
+                runtime.minimumBytes(next, logicalInputs, binding.largestSlot) +
+                  binding.bytes -
+                  logicalInputs >
+                  runtime.request.governor.capBytes
+              ) {
+                // Geometric slack is optional. Only the exact complete minimum can refuse.
+                jsonCapacities.get(runtime)?.set(cut.rel, cut.phase.capacity);
+                configureJson(next, cut);
+              }
+              await runtime.restorePhase(next, binding, idle.pool);
               sink.resumeBudget();
               await recipe(runtime, guarded, []);
               state.resume = null;
@@ -2173,7 +2388,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               [state.pending, state.resume].flatMap((cut) => (cut ? [cut.phase] : [])),
             );
             const cleanup = await Promise.allSettled([
-              ...[...retained].map((phase) => closeHybridPhase(phase)),
+              ...[...retained].map((phase) => closePhase(phase)),
               ...[...state.retained.values()].map((saved) => saved.records.close()),
             ]);
             state.retained.clear();
@@ -2191,7 +2406,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       if (!hasJson) return execute();
       const width = jsonConstants + 1;
       // Literal documents also bound result copies; no storage read contributes that size.
-      runtime.readMinimum(0, 4 * jsonConstants * jsonProgressColumns);
+      runtime.readMinimum(0, hasInputSizedJson ? 4 * jsonConstants * jsonProgressColumns : 0);
       jsonWidths.set(runtime, width);
       for (const entry of entries) entry.minimum += (jsonWorkspaces.get(entry.rel.id) ?? 0) * width;
       return execute();
@@ -2234,7 +2449,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         runtime.sourceBounds(bounds);
         runtime.readMinimum(
           io,
-          hasJson ? Math.max(progress, 4 * jsonConstants) * jsonProgressColumns : progress,
+          hasInputSizedJson
+            ? Math.max(progress, 4 * jsonConstants) * jsonProgressColumns
+            : progress,
         );
         if (
           windows &&

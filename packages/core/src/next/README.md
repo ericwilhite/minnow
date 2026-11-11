@@ -35,11 +35,15 @@ Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 | `owner/`      | ownership                        | Owner/client protocol (`protocol.ts`), wire payloads (re-exported from exec) and stream dictionaries (`frame.ts`), ledger routing (`outcomes.ts`), wire errors (`errors.ts`), client sequencing (`sequence.ts`), election, liveness and step-down (`election.ts`), public client API (`api.ts`), engine boundary and idle-transaction timer (`engine.ts`), planner port (`planner.ts`), the composed engine (`compose.ts`), the protocol server (`server.ts`) and client (`client.ts`), the owner worker runtime (`host.ts`), the port broker (`broker.ts`), the client-side election and lifecycle (`connector.ts`), Web Locks (`web-locks.ts`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 JSON extraction (`->`, `->>`) uses typed scalar kernels in a resumable project/filter frame.
-A fixed workspace is prepaid from read bounds and literals before opening a producer. It keeps
-raw JSON bytes exact and decodes text without parsing numbers into JS numbers. Document
-parameters and expanding producers without an admitted bound, front-end materialized JSON
-without source spelling (JSON_TABLE JSON columns), JSONB extraction, construction
-and aggregation remain typed refusals; the latter need the new growth-admission API.
+Raw JSON prepays an input-sized workspace and retains its spelling. JSONB text casts and
+extraction preserve exact decimal scale, PostgreSQL key ordering and last-duplicate semantics.
+Expanding JSON uses bounded native spill fragments, retires its producer, then waits cancellably
+for complete re-admission through the shared idle pool. Completed rows are delivered once from
+files using a separately funded row buffer. Unary/EXCEPT parents are supported; retaining
+join/window parents await B7's checkpoint seam and return typed 0A000 refusals.
+Document parameters, unbounded foreign document producers, front-end materialized JSON/JSONB
+without source spelling, JSON paths, construction and aggregation remain typed refusals.
+Canonical traversal is iterative and charged, with quadratic CPU for wide objects.
 
 ## Write-path measurements
 

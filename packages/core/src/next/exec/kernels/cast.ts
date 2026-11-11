@@ -601,10 +601,12 @@ export function compileCast(type: PhysicalType, input: Compiled, arena: OutputAr
     const refusal = castRefusal(source, target);
     if (refusal !== null) throw refuse(refusal);
   }
-  if (type.kind === "json" && !type.binary && from.kind === "text")
-    return compileJson(type, "validate_json", [input], arena);
-  if (type.kind === "text" && type.maxLength === undefined && from.kind === "json" && !from.binary)
-    return new Retype(type, input);
+  if (type.kind === "json" && from.kind === "text")
+    return compileJson(type, type.binary ? "validate_jsonb" : "validate_json", [input], arena);
+  if (type.kind === "text" && type.maxLength === undefined && from.kind === "json")
+    return from.binary
+      ? compileJson(type, "validate_jsonb", [input], arena)
+      : new Retype(type, input);
   if (
     type.kind === "text" &&
     (from.kind === "date" || from.kind === "timestamp" || from.kind === "interval")

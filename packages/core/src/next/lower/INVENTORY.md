@@ -71,7 +71,7 @@ Status:
 | `CAST`                                                                                                          | `cast` to the target type (`declaredTypeName` for numeric targets, C5)                                                                                                                                                                                                 | M1                                                                                                              |
 | `MINNOW_COLLATE`                                                                                                | the collation of the enclosing `compare` / `inList` / `SortKey`                                                                                                                                                                                                        | M1                                                                                                              |
 | `MINNOW_TIMESTAMP_TEXT`, `MINNOW_TO_CHAR_LOCAL`                                                                 | dropped: `timestamp(zoned: false)` already renders without a zone                                                                                                                                                                                                      | M1                                                                                                              |
-| `MINNOW_JSON_GET(_TEXT)`                                                                                        | `call` (`json_get`, `json_get_text`), typed JSON/text extraction; source-bounded project/filter execution                                                                                                                                                              | M1                                                                                                              |
+| `MINNOW_JSON_GET(_TEXT)`                                                                                        | `call` (`json_get`, `json_get_text`), typed JSON/JSONB extraction; source-bounded raw JSON and checkpointed JSONB project/filter execution                                                                                                                             | M1                                                                                                              |
 | `MINNOW_ARRAY_*`, `MINNOW_REGEX_MATCH`, `ARRAY`                                                                 | `call` (`array_at`…, `regex_match`)                                                                                                                                                                                                                                    | L                                                                                                               |
 | `MINNOW_TUPLE_KEY` (decorrelation)                                                                              | several `join` keys (one per tuple member, `nullSafe` per the decorrelator)                                                                                                                                                                                            | L                                                                                                               |
 | `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `LOCALTIME`                                                                | casts of the clock `param`                                                                                                                                                                                                                                             | M1                                                                                                              |
@@ -422,10 +422,25 @@ without a stable input envelope stay typed execution refusals. Non-NULL JSON mat
 the shipped front end (JSON_TABLE JSON columns) stays a
 typed lowering refusal because that normalizer discards decimal scale and original spelling.
 Use an explicit `'…'::JSON` literal for exact extraction. JSON expressions mixed with volatile
-evaluation also stay refused. JSONB extraction, JSON paths,
-JSON constructors and JSON aggregation remain refused. Construction and aggregation need the
-new admission API to charge growth and wait cancellably under transient pressure; they are
-separate work. No published engine behavior or stored format changes here.
+evaluation also stay refused.
+
+The private rebuild also executes `text::JSONB`, JSONB `->`/`->>` and `JSONB::text`. It preserves
+exact decimal digits and display scale, normalizes object keys in PostgreSQL's UTF8-length/byte
+order, keeps the last duplicate, and handles scalar integer selectors 0/-1 as PostgreSQL does.
+Invalid input retains PG's JSON, Unicode and numeric SQLSTATEs. A tiny numeric exponent may
+expand, so this path counts before allocation and checkpoints completed output plus unread input
+as bounded native spill fragments. It retires producer credit before FIFO, cancellable re-admission
+through B4's shared idle pool. Owned parameter bindings survive that handoff. Delivery uses a
+separately admitted single-row buffer; it neither reopens consumed sources nor replays completed rows.
+Filter/LIMIT demand and the stream position of row data errors survive the checkpoint; cancellation
+and storage faults still unwind immediately.
+Unary and EXCEPT parents are supported. Under retaining join/window parents, expanding JSON stays
+an explicit typed execution refusal (`0A000`, checkpoint seam pending) until B7 supplies that seam.
+Document parameters, lazy init values, foreign expanding document producers, front-end materialized
+JSON/JSONB literals and JSON ↔ JSONB casts remain explicit refusals. JSON paths, construction and
+aggregation remain separate work; guide-7/8 remain the only two catalogue refusals (64/66 execute).
+Canonicalization uses bounded scratch and iterative traversal, with quadratic CPU for wide objects;
+there is no claimed wide-object speedup. No published engine behavior or stored format changes here.
 
 The R21 registry records the shipped engine's canonicalized number-text difference for literal
 JSON decimals with a zero fractional part. Generated checks require the native result to match

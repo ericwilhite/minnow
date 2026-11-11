@@ -28,6 +28,7 @@ export class JsonScan {
     readonly bytes: Uint8Array,
     readonly slice: Slice,
     readonly unicodeStrings = false,
+    readonly numericValue?: (start: number, end: number) => SlicedJob<void>,
   ) {}
   due(): boolean {
     return (++this.#work & 1023) === 0 && this.slice.due();
@@ -80,6 +81,7 @@ export class JsonScan {
     bad();
   }
   *number(): SlicedJob<void> {
+    const start = this.at;
     if (this.bytes[this.at] === 45) this.at++;
     const first = this.bytes[this.at++] ?? -1;
     if (!digit(first)) bad();
@@ -106,6 +108,7 @@ export class JsonScan {
         if (this.due()) yield;
       }
     }
+    if (this.numericValue) yield* this.numericValue(start, this.at);
   }
   /** Find the maximum nesting first; the caller charges exactly this many stack bytes. */
   *depth(): SlicedJob<number> {

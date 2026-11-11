@@ -174,7 +174,9 @@ describe("kernel bindings onto ir/functions.ts (R19)", () => {
     ),
   )("cast %s: a kernel that evaluates, or a refusal", (_name, from, to) => {
     const input =
-      from === "text" && to === "json" ? texts(["{}", "null"]) : sample(physicalTypeOfSql(from));
+      from === "text" && (to === "json" || to === "jsonb")
+        ? texts(["{}", "null"])
+        : sample(physicalTypeOfSql(from));
     const run = () => {
       const compiled = compileFor(
         { op: "cast", input: col(0, input.type), type: physicalTypeOfSql(to) },

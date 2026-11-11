@@ -2991,3 +2991,127 @@ export const AGGREGATE_PROGRESS_REACH = [
   "concurrent prepared executions",
   "all credit returned",
 ] as const;
+
+/** JSONB canonical bytes preserve SQL NUMERIC scale, decoded key order and last duplicates. */
+export const JSONB_SQL_REACH = [
+  "profile bytes",
+  "EXCEPT below JSON",
+  "stored TEXT",
+  "EXCEPT left",
+  "EXCEPT right",
+  "derived",
+  "CTE",
+  "view",
+  "direct",
+  "key order",
+  "exact number",
+  "last duplicate",
+  "Unicode",
+  "array",
+  "negative index",
+  "number expansion",
+  "JSON null",
+  "scalar",
+  "missing or mismatch",
+] as const;
+
+/** JSON retry owns files/parameters but no live producer grant while a native group queues. */
+export const JSONB_PRESSURE_REACH = [
+  "large parameter fragments",
+  "owned parameters",
+  "complete producer retirement",
+  "FIFO wait",
+  "spill checkpoint",
+  "unary",
+  "EXCEPT right",
+  "queued cancellation",
+  "recovery",
+  "resume",
+  "returned files and grants",
+] as const;
+
+/** JSONB numeric spelling exercises both exponent signs, trailing scale and exact coefficients. */
+export const JSONB_NUMBER_REACH = [
+  "negative",
+  "positive",
+  "zero",
+  "negative exponent",
+  "positive exponent",
+  "zero exponent",
+  "long scale",
+  "short scale",
+] as const;
+/** Canonical traversal keeps decoded key ordering/last duplicates through nested containers. */
+export const JSONB_CANONICAL_REACH = [
+  "flat object",
+  "nested array",
+  "nested object",
+  "deep nesting",
+  "duplicate aliases",
+  "decoded UTF8 keys",
+  "beyond float precision",
+  "negative exponent",
+  "positive exponent",
+] as const;
+
+/** Fragmented JSON checkpoints restore a single admitted row under independent pressure. */
+export const JSONB_WIDE_REACH = [
+  "large parameter at cap",
+  "stored source",
+  "zero source",
+  "one output",
+  "five outputs",
+  "UTF8 megabyte",
+  "competing pressure",
+  "returned files and grants",
+] as const;
+
+/** Completed prefixes and unread suffixes partition a selected stream across repeated cuts. */
+export const JSONB_CONTINUATION_REACH = [
+  "completed prefix",
+  "current row",
+  "unread suffix",
+  "multiple growth cuts",
+  "source opened once",
+  "selection",
+  "dense",
+  "dictionary",
+  "flat",
+  "unequal boundaries",
+] as const;
+
+/** LIMIT/filter demand survives JSON growth without eagerly surfacing later row errors. */
+export const JSONB_DEMAND_REACH = [
+  "nested JSON error",
+  "nested data error",
+  "producer filter error",
+  "limit 0",
+  "limit 1",
+  "limit 2",
+  "project",
+  "filter",
+  "producer error",
+  "growth before demand satisfied",
+  "early error",
+] as const;
+
+/** A cut may checkpoint retaining ancestors, never a finishing descendant or a sibling. */
+export const JSONB_PARENT_REACH = [
+  "left arm",
+  "right arm",
+  "retaining seam refused",
+  "unary/EXCEPT supported",
+  "descendant excluded",
+  "sibling excluded",
+] as const;
+
+/** A blocking unary consumer delivers preceding rows before their saved terminal data error. */
+export const JSONB_DEFERRED_REACH = [
+  "arithmetic error",
+  "JSON error",
+  "limit 0",
+  "limit 1",
+  "limit 2",
+  "growth",
+  "no growth",
+] as const;

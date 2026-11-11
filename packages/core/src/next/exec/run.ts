@@ -178,6 +178,16 @@ export class QueryRuntime {
   #readBytes = 0;
   #progressBytes = 0;
   #savedProgressBytes = 0;
+  #resultProgressOverride: number | null = null;
+  /** A checkpoint producer emits no result until its delivery phase is admitted. */
+  resultProgressEnvelope(bytes: number | null): void {
+    this.#resultProgressOverride = bytes;
+  }
+  retainedProgressEnvelope(): number {
+    let bytes = 0;
+    for (const step of this.#operatorProgress.values()) bytes = Math.max(bytes, step);
+    return bytes;
+  }
   #readStep: ReadStep | null = null;
   #operatorProgress = new Map<number, number>();
   #readBounds = new Map<number, ReadBound>();
@@ -268,7 +278,7 @@ export class QueryRuntime {
       entries.reduce((sum, entry) => sum + entry.minimum, 0) +
       borrowers * progress +
       this.#readBytes +
-      (entries.length === 0 ? 0 : this.#window + Math.max(0, progress - this.#window))
+      (entries.length === 0 ? 0 : Math.max(this.#window, this.#resultProgressOverride ?? progress))
     );
   }
 
@@ -361,7 +371,10 @@ export class QueryRuntime {
       entries.filter(({ rel }) => canBorrow(rel)).map(({ rel }) => [rel.id, progress]),
     );
     const window = atomic && entries.length > 0 ? this.#window : 0;
-    const resultProgress = atomic && entries.length > 0 ? Math.max(0, progress - this.#window) : 0;
+    const resultProgress =
+      atomic && entries.length > 0
+        ? Math.max(0, (this.#resultProgressOverride ?? progress) - this.#window)
+        : 0;
     const prefix = `query#${String(this.request.queryId)}`;
     const parts: Array<{ label: string; minimumBytes: number; spillable: boolean }> = [];
     const add = (label: string, minimumBytes: number, spillable = false) => {

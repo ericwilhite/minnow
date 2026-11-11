@@ -5,6 +5,7 @@ import { ExecutionError, UnsupportedPlanError } from "../errors.js";
 import type { Slice, SlicedJob } from "../slices.js";
 import { JsonScan } from "./json-scan.js";
 import { JsonOutput } from "./json-output.js";
+import { canonicalJsonb } from "./jsonb-canonical.js";
 import {
   countIn,
   rowsIn,
@@ -78,6 +79,11 @@ export class JsonNode implements Compiled {
   }
   *#row(vectors: readonly Vector[], row: number, writer: JsonOutput): SlicedJob<boolean> {
     const first = vectors[0];
+    if (this.fn === "validate_jsonb") {
+      if (first === undefined || !isValidSlot(first, row)) return false;
+      yield* canonicalJsonb(valueBytes(first, row), writer, this.#memory, this.host.slice);
+      return true;
+    }
     if (this.fn === "validate_json") {
       if (first === undefined || !isValidSlot(first, row)) return false;
       yield* this.#validated(valueBytes(first, row));
@@ -102,7 +108,22 @@ export class JsonNode implements Compiled {
         if (flat.data.layout !== "i32") throw new TypeError("JSON index must be int4");
         selector = flat.data.values[slot] ?? 0;
       }
-      const span = yield* scan.field(selector);
+      let span = yield* scan.field(selector);
+      if (
+        span === null &&
+        first.type.kind === "json" &&
+        first.type.binary &&
+        typeof selector === "number" &&
+        (selector === 0 || selector === -1)
+      ) {
+        scan.at = 0;
+        yield* scan.space();
+        if (bytes[scan.at] !== 123 && bytes[scan.at] !== 91) {
+          const start = scan.at;
+          yield* scan.valueEnd();
+          span = { start, end: scan.at };
+        }
+      }
       if (span === null) return false;
       if (this.fn === "json_get_text") {
         if (bytes[span.start] === 110 && span.end - span.start === 4) return false;
@@ -111,7 +132,14 @@ export class JsonNode implements Compiled {
           return true;
         }
       }
-      yield* writer.copy(bytes.subarray(span.start, span.end));
+      if (first.type.kind === "json" && first.type.binary)
+        yield* canonicalJsonb(
+          bytes.subarray(span.start, span.end),
+          writer,
+          this.#memory,
+          this.host.slice,
+        );
+      else yield* writer.copy(bytes.subarray(span.start, span.end));
       return true;
     }
     throw new TypeError("Unknown JSON kernel " + this.fn);
