@@ -68,6 +68,9 @@ it.each(seedsFor("next-executor-quiet-policy", [0xe145, 0xe146]))(
       "root",
       "CPU",
       "restart",
+      "percentile frames primary",
+      "percentile component diagnostic",
+      "percentile component required",
     ]);
     await fc.assert(
       fc.asyncProperty(fc.integer({ min: 1, max: 100 }), fc.boolean(), async (gain, slower) => {
@@ -87,6 +90,29 @@ it.each(seedsFor("next-executor-quiet-policy", [0xe145, 0xe146]))(
         held[3] = record("scan_first_page", "frames", gain);
         expect(assessQuiet(held, policy).decision).toBe("REGRESSION");
         reach.reach("guard regression");
+        const medianPolicy = {
+          ...policy,
+          primary: "win_median_pct",
+          targetMs: 75,
+          queries: ["win_median_pct", "percentile-component", "scan_first_page"],
+        };
+        const medianRecords = [
+          record("win_median_pct", "frames", 0),
+          record("win_median_pct", "rows", -gain),
+          record("percentile-component", "frames", -gain),
+          record("scan_first_page", "frames", 0),
+          record("scan_first_page", "rows", 0),
+        ];
+        expect(assessQuiet(medianRecords, medianPolicy).decision).toBe("HELD");
+        reach.reach("percentile component diagnostic");
+        medianRecords[0] = record("win_median_pct", "frames", -gain);
+        expect(assessQuiet(medianRecords, medianPolicy).decision).toBe("ACCEPT");
+        reach.reach("percentile frames primary");
+        for (const delta of [0, gain]) {
+          medianRecords[2] = record("percentile-component", "frames", delta);
+          expect(assessQuiet(medianRecords, medianPolicy).decision).toBe("HELD");
+        }
+        reach.reach("percentile component required");
         for (const fault of ["order", "missing", "revision", "root", "CPU", "restart"] as const) {
           const bad = records(-gain),
             first = bad[0];

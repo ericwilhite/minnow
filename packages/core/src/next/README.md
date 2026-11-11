@@ -1913,7 +1913,7 @@ shipped-engine or stored-format change.
   before materializing key/state copies; source, literal and owned-parameter envelopes include
   compound keys and duplicate key columns.
   Fixed COUNT/float states with bounded fixed-width keys emit from independent admitted
-  I/O credit, including below binary parents. Genuinely ordered DISTINCT and ordered-set
+  I/O credit, including below binary parents. Genuinely ordered DISTINCT and uncertified ordered-set
   aggregates retain external sorting and their private progress owners.
   EXCEPT parent counts, representatives and first-left ordinals are checkpointed before
   retiring its right aggregate; completed left producers are not reopened. Generated pressure
@@ -1922,15 +1922,29 @@ shipped-engine or stored-format change.
   arguments without a proven materialization boundary, still use the external fallback.
   Direct-column FILTER transitions use conservative full-batch growth bounds. Pressure-only
   restoration pays sorting/I/O and a planned bounded minimum; plentiful-memory hash does not
-  spool or select that route. B1's separately routed uncharged
-  `ScratchSpillFile` extent-list metadata is outside the operator's bounded tape proof.
+  spool or select that route. The scratch service separately admits its fixed control/metadata
+  workspace and keeps scalar extent-chain coordinates per file; the spill suites own that
+  service's metadata proof.
   `aggregationProgress: false` retains the unexported parent benchmark control. The Node
   benchmark also accepts `--control-executor` for a pinned main executor over the same
   stored fixture; shared owner contract/error modules must preserve class identity.
   Ordinary hash aggregation still refuses GROUPING SETS and string/array/JSON aggregates
   (`UnsupportedPlanError`, construct `aggregate`, before allocation). Numeric ordered-set-only
-  lists use `agg/ordered-set.ts`: a group sort and spillable per-group value sorts, with
-  independently reserved minimums and loan owners. Mixed ordinary/ordered-set lists, interval
+  lists retain `agg/ordered-set.ts` as their bounded external fallback. Numeric percentile
+  lists may instead use `agg/percentile.ts`: exact dictionary-domain planning bounds at most
+  1024 byte-key groups and 2^21 source rows on the same pinned snapshot. The complete typed
+  value/null banks, group IDs, partition scratch, key growth and result buffers are admitted
+  together before input opens. Hash grouping and per-group rank selection avoid sorting the
+  complete input. NULL values are ignored, NaN sorts after infinity (before it for DESC), and
+  continuous interpolation uses PostgreSQL's `lo + weight * (hi - lo)` operation order.
+  Introselect has a paced heapsort fallback for adversarial pivots. Unknown domains, computed
+  sources, other numeric types, mode, or a resident minimum that cannot fit keep the external
+  recipe; no partly applied push is retried. `groupedPercentiles:false` retains that recipe for
+  diagnostics. The quiet driver includes a decoded, dictionary-keyed percentile component
+  alongside the whole `win_median_pct` frames and materialized-row boundaries. Acceptance
+  requires paired gains in both that isolated component and the whole frames, with no accepted
+  whole-query guard regression; a component cannot promote held whole frames. Timing is
+  queued, not claimed from loaded-host tests. Mixed ordinary/ordered-set lists, interval
   interpolation and array/group-key fractions remain explicit refusals.
 - `aggregate-pglite.test.ts` judges generated rows and batchings by PostgreSQL, including sums
   across ±2^127, with declared reach; `groups.test.ts` checks the group tables against a model
