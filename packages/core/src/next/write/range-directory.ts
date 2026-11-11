@@ -2,7 +2,7 @@
 import type { MaybePromise, KeyRange } from "../access/key-index.js";
 import type { SpaceReader } from "../access/space.js";
 import type { BlobRef, RunRef } from "../format/manifest.js";
-import type { Grant } from "../memory/governor.js";
+import type { ByteBudget } from "../access/space.js";
 import { taskClock, yieldTask } from "../exec/pipeline.js";
 import { StoreCorruptionError } from "../storage/contract.js";
 import { ByteReader } from "./bytes.js";
@@ -28,7 +28,7 @@ export class RangeDirectory {
   constructor(
     readonly ref: RunRef,
     readonly space: SpaceReader,
-    readonly budget: Grant,
+    readonly budget: ByteBudget,
     readonly range: KeyRange,
     readonly direction: number,
     readonly signal: AbortSignal,

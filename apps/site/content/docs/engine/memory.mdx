@@ -134,3 +134,14 @@ Database window passes yield to allow cancellation. These working buffers curren
 resident memory; they do not spill. Result memos use bounded dependency-table generations and a
 structural schema identity, so unrelated-table writes preserve warm results. Missing commit
 history invalidates the memo rather than guessing.
+
+The rebuild's internal index reader exposes `planRange(range, direction)` for query-wide
+admission. Planning holds no new native buffers or leases. Its `minimumBytes` covers merge
+heads, key copies, run navigation and bounded I/O, including a memtable publishing before
+opening. Range bounds must remain immutable for the plan and cursor's lifetime.
+
+The executor includes that minimum in its atomic query admission, then calls
+`plan.open({ budget, signal })` with a dedicated grant. A plan opens once. The cursor does
+not admit more memory, grow the grant or borrow shared progress credit. Closing it cancels
+pending work and releases its scratch after that work settles; the caller then closes the
+grant. This internal API does not enable a new SQL planner route or change stored bytes.

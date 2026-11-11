@@ -8,6 +8,9 @@ import {
 import { taskClock, yieldTask } from "../exec/pipeline.js";
 import type { RunRef } from "../format/manifest.js";
 import type { Grant } from "../memory/governor.js";
+import { MinimumBudget } from "../memory/working-set.js";
+import type { PlannedRange } from "./range-plan.js";
+import type { ByteBudget } from "../access/space.js";
 import { MAX_BLOB_BYTES } from "../access/space.js";
 import { compareBytes } from "../vector/varlen.js";
 import { rangeSide } from "./range-bound.js";
@@ -27,7 +30,10 @@ export class StreamingRangeCursor implements IndexCursor {
   #stopped(): boolean {
     return this.#closed;
   }
-  #grant: Grant | null = null;
+  #grant: ByteBudget | null = null;
+  #ownedGrant: Grant | null = null;
+  #account: MinimumBudget | null = null;
+  #unlink: (() => void) | null = null;
   #inputs: RangeInput[] = [];
   #heap: RangeInput[] = [];
   #size = 0;
@@ -39,9 +45,19 @@ export class StreamingRangeCursor implements IndexCursor {
     readonly index: ViewIndex,
     readonly range: KeyRange,
     direction: "asc" | "desc",
+    readonly admitted?: { plan: PlannedRange; budget: Grant; signal: AbortSignal },
   ) {
     this.#direction = direction === "asc" ? 1 : -1;
     this.#unwatch = index.table.snapshot.watchCursor(this);
+    if (admitted !== undefined) {
+      const cancel = () => {
+        this.#abort.abort(admitted.signal.reason);
+        this.close();
+      };
+      admitted.signal.addEventListener("abort", cancel, { once: true });
+      this.#unlink = () => admitted.signal.removeEventListener("abort", cancel);
+      if (admitted.signal.aborted) cancel();
+    }
   }
 
   /** Enumeration is synchronous: capture paid inputs before the first metadata read can publish. */
@@ -77,6 +93,7 @@ export class StreamingRangeCursor implements IndexCursor {
     for (const run of runs) stored(run, Infinity, pure);
   }
   #sizes(): { resident: number; minimum: number; keyBytes: number } {
+    if (this.admitted !== undefined) return this.admitted.plan.sizes;
     let resident = 1024,
       io = 0,
       keyBytes = 2048;
@@ -102,14 +119,26 @@ export class StreamingRangeCursor implements IndexCursor {
     for (;;) {
       const sizes = this.#sizes(),
         options = { label: "write index range", minimumBytes: sizes.minimum, spillable: false };
-      let grant = shared.governor.tryAdmit(options);
-      grant ??= (yield shared.governor.admit({ ...options, signal: this.#abort.signal })) as Grant;
+      let grant: ByteBudget;
+      if (this.admitted !== undefined) {
+        this.#account = new MinimumBudget(this.admitted.budget, sizes.minimum);
+        grant = this.#account;
+      } else {
+        let owned = shared.governor.tryAdmit(options);
+        owned ??= (yield shared.governor.admit({
+          ...options,
+          signal: this.#abort.signal,
+        })) as Grant;
+        this.#ownedGrant = owned;
+        grant = owned;
+      }
       this.#grant = grant;
       if (this.#stopped()) return;
       // Staging may have published during admission: recompute before allocating anything.
       const current = this.#sizes();
-      if (current.minimum > grant.held) {
-        grant.close();
+      if (this.#ownedGrant !== null && current.minimum > this.#ownedGrant.held) {
+        this.#ownedGrant.close();
+        this.#ownedGrant = null;
         this.#grant = null;
         continue;
       }
@@ -204,6 +233,7 @@ export class StreamingRangeCursor implements IndexCursor {
   }
   #consume(limit: number, out: Float64Array | null): MaybePromise<number> {
     this.index.table.snapshot.check();
+    this.admitted?.signal.throwIfAborted();
     if (this.#closed || limit === 0) return 0;
     if (this.#busy) throw new TypeError("Only one outstanding index cursor call is allowed");
     this.#busy = true;
@@ -212,6 +242,7 @@ export class StreamingRangeCursor implements IndexCursor {
       try {
         const result = work.next(value);
         if (!result.done) return result.value.then(resume, fail);
+        this.admitted?.signal.throwIfAborted();
         this.#busy = false;
         if (this.#stopped()) this.#dispose();
         return result.value;
@@ -388,7 +419,14 @@ export class StreamingRangeCursor implements IndexCursor {
     this.#size = 0;
     this.#pair = EMPTY;
     this.#previous = EMPTY;
-    this.#grant?.close();
+    if (this.#account !== null) {
+      this.#account.free(this.#account.allocated);
+      this.#account = null;
+    }
+    this.#ownedGrant?.close();
+    this.#ownedGrant = null;
+    this.#unlink?.();
+    this.#unlink = null;
     this.#grant = null;
     this.#unwatch();
   }

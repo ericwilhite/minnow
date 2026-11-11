@@ -2776,3 +2776,15 @@ export const JSON_LITERAL_PROGRESS_REACH = [
   "competing pressure",
   "returned all grants",
 ] as const;
+
+/** Admitted index ranges: publication, traversal, cancellation and atomic query admission. */
+export const WRITE_RANGE_ADMISSION_STATES = [
+  "asc",
+  "desc",
+  "publication",
+  "next",
+  "skip",
+  "cancel",
+  "close",
+  "concurrent",
+] as const;
