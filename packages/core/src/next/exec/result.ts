@@ -375,10 +375,15 @@ export class ResultChannel implements ResultStream {
 export function frameByteLength(payload: UnnumberedPayload): number {
   let bytes = 0;
   for (const buffer of frameTransferList(payload)) bytes += buffer.byteLength;
+  let counted: Set<readonly bigint[]> | null = null;
   for (const flat of flats(payload)) {
     const data = flat.data;
-    if (data.layout === "decimal" && data.coefficients.repr === "wide")
+    if (data.layout === "decimal" && data.coefficients.repr === "wide") {
+      counted ??= new Set();
+      if (counted.has(data.coefficients.values)) continue;
+      counted.add(data.coefficients.values);
       for (const value of data.coefficients.values) bytes += bigintBytes(value);
+    }
   }
   return bytes;
 }

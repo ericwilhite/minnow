@@ -10,6 +10,7 @@ import { Slice, runSliced, type SlicedJob } from "./slices.js";
 import type { MaybePromise } from "../access/key-index.js";
 import type { PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { ResultSink } from "./result-sink.js";
+import { outputCopyLayout } from "./output-copies.js";
 import {
   ExceptOperator,
   exceptKeyLayout,
@@ -1533,9 +1534,10 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             : setupWindow(rel, input, options.windowScalarArguments !== false);
         const physical = windowInputLayout(
           keys.exprs,
-          rel.op === "window" && rel.input.op === "project" ? rel.input.exprs : null,
-          rel.op === "window" && options.windowInputDeduplication !== false,
+          rel.input.op === "project" ? rel.input.exprs : null,
+          rel.op === "sort" || options.windowInputDeduplication !== false,
         );
+        const sortKeys = rel.op === "sort" ? order(rel.keys, keys.indexes.map(physical.index)) : [];
         const outputExprs = input.map((type, c): ScalarExpr => ({
           op: "column",
           index: physical.index(c),
@@ -1580,8 +1582,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 }
               : null;
           if (runtime === undefined || grant === null) {
-            if (windowSpec === null)
-              sortMode(keys.types, order(rel.op === "sort" ? rel.keys : [], keys.indexes));
+            if (windowSpec === null) sortMode(physical.types, sortKeys);
             else {
               validateWindowSpec(windowSpec);
               sortMode(physical.types, [
@@ -1609,8 +1610,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           if (rel.op === "sort")
             breaker = new SortOperator(
               {
-                types: keys.types,
-                keys: order(rel.keys, keys.indexes),
+                types: physical.types,
+                keys: sortKeys,
                 limit: runtime.bounds(rel).limit,
                 offset: runtime.bounds(rel).offset,
                 withTies: rel.withTies,
@@ -1634,7 +1635,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         );
         const base =
           rel.op === "sort"
-            ? sortMinimumBytes(keys.types)
+            ? sortMinimumBytes(physical.types)
             : windowMinimumBytes(physical.types, rel.functions.length);
         // The operator helper already includes its constructor's fixed buffers. Add only
         // this recipe's kernel arena; adding all measured bytes would count pools twice.
@@ -2000,7 +2001,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     lateSortIds.size === 0 && domainPlans === 0
       ? null
       : compilePlan(plan, { ...options, lateSort: false, domainCountSum: false });
+  const resultLayout = outputCopyLayout(plan.root);
   const genericProgram: Program = (runtime, sink) => {
+    if (resultLayout !== null && sink instanceof ResultSink) sink.copyLayout(resultLayout);
     runtime.resolveCall = resolveCall;
     // LIMIT zero never opens its input. Keep capability checks at prepare, but do not reserve
     // buffers for those unreachable pipelines (including when zero is a bound parameter).

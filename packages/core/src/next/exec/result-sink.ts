@@ -1,7 +1,7 @@
 /** Owned, compact result frames. Borrowed input is copied; authorized dedicated input stays charged through frame credit. */
 import type { MaybePromise } from "../access/key-index.js";
 import { OBJECT_OVERHEAD_BYTES, bigintBytes, type Grant, type Loan } from "../memory/governor.js";
-import type { PhysicalType } from "../types.js";
+import { samePhysicalType, type PhysicalType } from "../types.js";
 import { BATCH_ROWS, type Batch, type FlatVector } from "../vector/vector.js";
 import {
   ResultDictionaries,
@@ -9,6 +9,7 @@ import {
   type DictionaryFrame,
 } from "./result-dictionaries.js";
 import { ownedResultColumns } from "./result-owned.js";
+import type { ResultCopyLayout } from "./output-copies.js";
 import { ColumnStore } from "./column-store.js";
 import { slotOf, validAt } from "./kernels/vectors.js";
 import {
@@ -67,6 +68,8 @@ export class ResultSink implements Operator {
   #rows = 0;
   #finished = false;
   #budgetSuspended = false;
+  #layout: ResultCopyLayout | null = null;
+  #copyTypes: readonly PhysicalType[];
 
   constructor(
     readonly types: readonly PhysicalType[],
@@ -75,6 +78,7 @@ export class ResultSink implements Operator {
     readonly requiresLsn: number,
     options: ResultSinkOptions = {},
   ) {
+    this.#copyTypes = types;
     this.#dictionaries = new ResultDictionaries(grant);
     this.deferEnd = options.deferEnd ?? false;
     this.#maxRows = options.maxRows ?? null;
@@ -94,6 +98,36 @@ export class ResultSink implements Operator {
       rows /= 2;
     }
     this.#rowsPerFrame = rows;
+  }
+
+  /** Configure compiled positional aliases before input. All data still copies into
+   * one frame's owned storage; no buffer is shared with a producer or another frame.
+   */
+  copyLayout(layout: ResultCopyLayout): void {
+    this.#check();
+    if (this.#batch !== null || this.#frames.size > 0 || this.#rows !== 0)
+      throw new TypeError("Result copy layout must precede input");
+    if (
+      layout.restore.length !== this.types.length ||
+      layout.types.length !== layout.sources.length
+    )
+      throw new TypeError("Result copy layout differs from schema");
+    for (const [logical, physical] of layout.restore.entries()) {
+      const source = layout.sources[physical],
+        expected = this.types[logical];
+      const actual = source === undefined ? undefined : this.types[source];
+      const copied = layout.types[physical];
+      if (
+        actual === undefined ||
+        expected === undefined ||
+        copied === undefined ||
+        !samePhysicalType(actual, expected) ||
+        !samePhysicalType(copied, expected)
+      )
+        throw new TypeError("Result copy layout has an incompatible column");
+    }
+    this.#layout = layout;
+    this.#copyTypes = layout.types;
   }
 
   /** A direct terminal scan can amortize wide-column allocation with a larger owned batch.
@@ -173,7 +207,15 @@ export class ResultSink implements Operator {
     this.#transfer = transfer ?? null;
     this.#at = 0;
     try {
-      this.#dictionaryPlan = this.#dictionaries.plan(this.types, batch.columns);
+      const input =
+        this.#layout === null
+          ? batch.columns
+          : this.#layout.sources.map((source) => {
+              const column = batch.columns[source];
+              if (column === undefined) throw new TypeError("Result input outside copy layout");
+              return column;
+            });
+      this.#dictionaryPlan = this.#dictionaries.plan(this.#copyTypes, input);
       return this.#drain();
     } catch (error) {
       this.abort(error);
@@ -278,7 +320,7 @@ export class ResultSink implements Operator {
     for (const frame of this.#frames) this.#free(frame);
   }
 
-  #make(rows: number, types = this.#dictionaryPlan?.types ?? this.types): FrameStore {
+  #make(rows: number, types = this.#dictionaryPlan?.types ?? this.#copyTypes): FrameStore {
     const frame: FrameStore = {
       store: new ColumnStore(types, this.grant, {
         chunkRows: rows,
@@ -322,7 +364,7 @@ export class ResultSink implements Operator {
     try {
       const columns =
         frame.columns ??
-        this.types.map((_, c) => {
+        this.#copyTypes.map((_, c) => {
           const { form, length, validity, data } = frame.store.chunk(c, 0);
           const flat = { form, length, validity, data };
           return this.#dictionaryPlan === null
@@ -331,7 +373,19 @@ export class ResultSink implements Operator {
         });
       if (this.#dictionaryPlan !== null) this.#dictionaries.publish(this.#dictionaryPlan, frame);
       return this.channel.offer({
-        payload: { rowCount: rows, columns, dictionaries: frame.dictionaries },
+        payload: {
+          rowCount: rows,
+          columns:
+            this.#layout === null
+              ? columns
+              : this.#layout.restore.map((physical) => {
+                  const column = columns[physical];
+                  if (column === undefined)
+                    throw new TypeError("Result wire column outside copy layout");
+                  return column;
+                }),
+          dictionaries: frame.dictionaries,
+        },
         requiresLsn: this.requiresLsn,
         free: () => this.#free(frame),
       });
@@ -346,6 +400,7 @@ export class ResultSink implements Operator {
    */
   #offerOwned(batch: Batch): PushResult | null {
     const plan = this.#dictionaryPlan;
+    if (this.#layout !== null) return null;
     if (plan === null || (this.#maxRows !== null && batch.length > this.#maxRows)) return null;
     const columns = ownedResultColumns(batch, plan.ids, this.#transfer, this.grant);
     if (columns === null) return null;
@@ -469,8 +524,8 @@ export class ResultSink implements Operator {
           needed += this.#dictionaries.needed(this.#dictionaryPlan);
         // An empty store may not yet have observed numeric input tiers. Allow fixed-width
         // promotions, and charge any wide decimal coefficient copied into its one row.
-        needed += 32 * this.types.length;
-        for (const vector of batch.columns) {
+        needed += 32 * this.#copyTypes.length;
+        for (const vector of input) {
           const [source, slot] = slotOf(vector, row);
           const data = source.data;
           if (

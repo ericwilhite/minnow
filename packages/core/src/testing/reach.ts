@@ -77,11 +77,34 @@ export const HASH_OUTPUT_CREDIT_REACH = [
   "all charges returned",
 ] as const;
 
+/** Compiled aliases share frame-owned data, never source or another frame. */
+export const RESULT_ALIAS_FRAME_REACH = [
+  "one backing allocation",
+  "dictionary delta",
+  "wide numeric clone",
+  "cancel blocked",
+  "exact values",
+  "selected order",
+  "float bits",
+  "all charges returned",
+] as const;
+
 export const SORT_ADMISSION_ERROR_REACH = [
   "ordinary room exhausted",
   "repeated SQL projection",
-  "completed earlier step",
-  "initial step refusal",
+  "bounded spill and merge succeed",
+  "bounded topN succeeds",
+  "computed fields preserved",
+  "separate variable sources preserved",
+  "fixed-width alias rows exact",
+  "tiny variable aliases remain admissible",
+  "five aliases",
+  "six aliases",
+  "ascending alias key",
+  "descending alias key",
+  "leading marker",
+  "interleaved marker",
+  "NULL and unequal text rows",
   "cleanup returns all resources",
 ] as const;
 

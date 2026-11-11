@@ -1,4 +1,4 @@
-/** Compact only proven column aliases, preserving every logical window output position.
+/** Compact only proven column aliases, preserving every logical sort/window output position.
  * IR authority: column references are positional, immutable reads (ir/ir.ts). A projection's
  * repeated reference to the same input/type is the same value and validity bitmap. Computed
  * expressions remain distinct: neither equality of values nor volatility is inferred here.
