@@ -39,6 +39,22 @@ export const STEP_LOANS_REFUSAL_REACH = [
   "closed has precedence",
 ] as const;
 
+/** Complete prepared hash output credit survives reclaim until it is consumed or released. */
+export const HASH_PREPARED_CREDIT_REACH = [
+  "reserved credit is not a live buffer",
+  "credit consumed once",
+  "unused released before wait",
+] as const;
+
+export const HASH_OUTPUT_CREDIT_REACH = [
+  "reclaim after prepare",
+  "unused capacity reclaimed",
+  "PG exact output",
+  "cancel funded output",
+  "nullable membership",
+  "all charges returned",
+] as const;
+
 export const SORT_ADMISSION_ERROR_REACH = [
   "ordinary room exhausted",
   "repeated SQL projection",

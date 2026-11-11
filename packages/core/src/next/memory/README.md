@@ -88,6 +88,12 @@ repeating a wide source column across sort output aliases can still exceed its
 admitted progress lane; the planner must account for the expanded output or keep
 one copy until final projection.
 
+A hash transition charges its complete prepared peak before yielding. Its unused
+credit stays owned while emission or updates are suspended, so reclaim cannot
+shrink the funded step. Buffer allocation consumes that charge once; the next
+boundary releases any unused credit before asking for growth, and close releases
+it on cancellation. Other unused optional capacity remains reclaimable.
+
 An executor first sizes the widest reachable scan step, including encoded leases,
 decoded pages, dictionaries, directories and decode overlap. It adds every active
 operator's fixed buffers, each breaker's private progress space, parameter storage, and
