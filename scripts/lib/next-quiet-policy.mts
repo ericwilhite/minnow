@@ -1,4 +1,4 @@
-/** Whole-query frames decide acceptance; components and row materialization diagnose it. */
+/** Whole-query frames decide acceptance; the percentile component must independently gain. */
 import { isDeepStrictEqual } from "node:util";
 import { join } from "node:path";
 import { pairedCPU } from "./paired-cpu.mts";
@@ -37,9 +37,10 @@ export function assessQuiet(records: readonly QuietRecord[], policy: QuietPolicy
     throw new Error("Invalid frozen policy");
   const workers = new Map<string, number>();
   const expected = policy.queries.flatMap((query) =>
-    (query === "pk-source" ? ["frames"] : ["frames", "rows"]).map(
-      (boundary) => `${query}/${boundary}`,
-    ),
+    (query === "pk-source" || query === "percentile-component"
+      ? ["frames"]
+      : ["frames", "rows"]
+    ).map((boundary) => `${query}/${boundary}`),
   );
   const actual = records.map((r) => `${r.query}/${r.boundary}`);
   if (!isDeepStrictEqual(actual.sort(), [...expected].sort()))
@@ -101,10 +102,18 @@ export function assessQuiet(records: readonly QuietRecord[], policy: QuietPolicy
   const primary = results.find((r) => r.query === policy.primary && r.boundary === "frames");
   if (!primary) throw new Error("Primary frames result missing");
   const regression = results.some(
-    (r) => r.boundary === "frames" && r.query !== "pk-source" && r.paired.significantRegression,
+    (r) =>
+      r.boundary === "frames" &&
+      r.query !== "pk-source" &&
+      r.query !== "percentile-component" &&
+      r.paired.significantRegression,
   );
+  const percentile = results.find(
+    (r) => r.query === "percentile-component" && r.boundary === "frames",
+  );
+  const gain = primary.paired.acceptedGain && (percentile?.paired.acceptedGain ?? true);
   return {
-    decision: regression ? "REGRESSION" : primary.paired.acceptedGain ? "ACCEPT" : "HELD",
+    decision: regression ? "REGRESSION" : gain ? "ACCEPT" : "HELD",
     primary: policy.primary,
     targetMs: policy.targetMs,
     targetMet: primary.candidateMedianMs <= policy.targetMs,

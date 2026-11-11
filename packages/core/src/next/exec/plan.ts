@@ -49,6 +49,12 @@ import { scalarHashMinimum, dictionaryHashShape, dictionaryHashMinimum } from ".
 import { externalCallArguments } from "./agg/external-call.js";
 import { probeDictionaryGroups } from "./agg/dictionary-probe.js";
 import {
+  PercentileOperator,
+  supportsPercentile,
+  percentileMinimum,
+  type PercentileBound,
+} from "./agg/percentile.js";
+import {
   isOrderedSet,
   orderedSetArguments,
   orderedSetMinimumBytes,
@@ -470,6 +476,8 @@ export interface CompileOptions {
   readonly sortOwnership?: boolean;
   readonly sortDictionaries?: boolean;
   readonly sortCompression?: boolean;
+  /** Keep the external ordered-set recipe for diagnostics. */
+  readonly groupedPercentiles?: boolean;
   readonly lateSort?: boolean;
   /** False retains generic SQL sorting; true also permits legacy diagnostic cursors/IR. */
   readonly keyOrder?: boolean;
@@ -554,6 +562,19 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     readonly loans: number;
   }
   const aggregateChoices = new WeakMap<QueryRuntime, Map<number, AggregateStrategy>>();
+  const percentileChoices = new WeakMap<
+    QueryRuntime,
+    Map<number, { bound: PercentileBound; minimum: number }>
+  >();
+  const percentilePlanners = new Map<
+    number,
+    {
+      rel: Extract<Rel, { op: "aggregate" }>;
+      input: readonly PhysicalType[];
+      compiler: number;
+      shape: NonNullable<ReturnType<typeof dictionaryHashShape>>;
+    }
+  >();
   const hybridIo = 2 << 20;
   type Cut =
     | { readonly kind: "aggregate"; readonly rel: number; readonly phase: HybridPhase }
@@ -1188,8 +1209,49 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           const minimum = orderedSetMinimumBytes(aggregate, input) + measured;
           const loanSlots = aggregate.aggregates.length + 2;
           fixed(rel, minimum, rel.id, loanSlots);
-          return (runtime, downstream) =>
-            instantiate(
+          if (
+            options.groupedPercentiles !== false &&
+            !plan.volatile &&
+            supportsPercentile(aggregate, input)
+          ) {
+            const shape = dictionaryHashShape({ ...aggregate, aggregates: [] }, input);
+            if (shape !== null)
+              percentilePlanners.set(rel.id, { rel: aggregate, input, compiler: measured, shape });
+          }
+          return (runtime, downstream) => {
+            const selected = percentileChoices.get(runtime)?.get(rel.id);
+            if (selected)
+              return instantiate(
+                runtime,
+                rel,
+                input,
+                selected.minimum,
+                BATCH_ROWS,
+                (context, grant) =>
+                  new PercentileOperator(
+                    aggregate,
+                    context,
+                    grant,
+                    selected.bound,
+                    runtime.signal,
+                    counted(runtime, rel, downstream),
+                  ),
+                (operator) => {
+                  runtime.onAbort((reason) => operator.abort(reason));
+                  runtime.dispose(() => operator.closed);
+                  return (async () => {
+                    try {
+                      await child(runtime, operator, []);
+                    } catch (error) {
+                      operator.abort(error);
+                      await operator.closed.catch(() => undefined);
+                      throw error;
+                    }
+                  })();
+                },
+                true,
+              );
+            return instantiate(
               runtime,
               rel,
               input,
@@ -1223,6 +1285,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 })();
               },
             );
+          };
         }
         const top = groupTops.get(rel.id);
         const outputOptions: AggregateOptions = {
@@ -2180,6 +2243,44 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     const bounds = new Map<number, ReadBound>();
     const chooseAggregates = () => runSliced(choose(), new Slice(Infinity), () => undefined);
     const choose = function* (): SlicedJob<void> {
+      const selectedPercentiles = new Map<number, { bound: PercentileBound; minimum: number }>();
+      percentileChoices.set(runtime, selectedPercentiles);
+      for (const entry of entries) {
+        const planner = percentilePlanners.get(entry.rel.id);
+        if (!planner) continue;
+        const read = bounds.get(planner.shape.scanId);
+        if (!read) continue;
+        const proof = yield* readValue(
+          probeDictionaryGroups(
+            runtime.view,
+            planner.shape.source,
+            runtime.request.reads,
+            runtime.request.governor,
+            read,
+            runtime.signal,
+            `query#${String(runtime.request.queryId)}/percentile-domain-planning`,
+          ),
+        );
+        if (proof === null) continue;
+        const keys = dictionaryHashMinimum(
+          { ...planner.rel, aggregates: [] },
+          planner.input,
+          planner.shape,
+          proof,
+          0,
+          {},
+        );
+        if (keys === null) continue;
+        const bound = { rows: proof.rows, groups: Math.max(1, proof.groups), keyMinimum: keys };
+        const minimum = percentileMinimum(planner.rel, bound, planner.compiler);
+        const saved = { minimum: entry.minimum, loanSlots: entry.loanSlots };
+        entry.minimum = minimum;
+        entry.loanSlots = 0;
+        // Optional complete resident workspace: no private allocation or input has opened yet.
+        if (runtime.minimumBytes(entries) <= runtime.request.governor.capBytes)
+          selectedPercentiles.set(entry.rel.id, { bound, minimum });
+        else Object.assign(entry, saved);
+      }
       const choices = new Map<number, AggregateStrategy>();
       aggregateChoices.set(runtime, choices);
       for (const entry of entries) {
@@ -2259,8 +2360,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         best.loanSlots = external.loans;
       }
     };
+    const needsChoices = aggregatePlanners.size + percentilePlanners.size > 0;
     const execute = () =>
-      then(aggregatePlanners.size === 0 ? undefined : chooseAggregates(), () => {
+      then(needsChoices ? chooseAggregates() : undefined, () => {
         if (
           ![...(aggregateChoices.get(runtime)?.values() ?? [])].some(
             (choice) => choice.kind === "hybrid",

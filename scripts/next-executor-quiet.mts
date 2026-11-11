@@ -7,12 +7,14 @@ import { createRequire } from "node:module";
 import { loadavg, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { percentileComponent } from "./next-percentile-component.mts";
 import { pairedCPU } from "./lib/paired-cpu.mts";
 import { assessQuiet, type QuietRecord } from "./lib/next-quiet-policy.mts";
 import type { InputValue } from "../packages/core/dist/next/testing/executor-input.js";
 import type { Batch, FlatVector } from "../packages/core/dist/next/vector/vector.js";
 import type { WireFlat } from "../packages/core/dist/next/exec/result.js";
 
+const componentQuery = (query: string) => query === "pk-source" || query === "percentile-component";
 const hash = (bytes: Uint8Array | string) => createHash("sha256").update(bytes).digest("hex");
 const option = (key: string, fallback = "") => {
   const at = process.argv.indexOf(key);
@@ -72,6 +74,7 @@ interface Message {
 }
 
 async function arm(root: string, count: number, queries: string[]): Promise<void> {
+  const candidate = process.argv.includes("--candidate-arm");
   const frozen = await manifest(root);
   const module = join(root, "packages/core/dist/next/testing/storage-core.js");
   const runtime = (await import(
@@ -153,13 +156,16 @@ async function arm(root: string, count: number, queries: string[]): Promise<void
   await core.harness.path.quiesce();
   const sql = new Map(
     queries
-      .filter((id) => id !== "pk-source")
+      .filter((id) => !componentQuery(id))
       .map((id) => {
         const query = catalogue.W_QUERIES.find((q) => q.id === id);
         if (!query) throw new Error(`Unknown query: ${id}`);
         return [id, catalogue.sqlFor(query, "minnow", count)];
       }),
   );
+  const percentiles = queries.includes("percentile-component")
+    ? await percentileComponent(root, core, count, candidate, generator, spec)
+    : null;
   const identity = {
     root,
     revision: frozen.revision,
@@ -333,6 +339,7 @@ async function arm(root: string, count: number, queries: string[]): Promise<void
     serial = serial.then(async () => {
       try {
         if (request.op === "close") {
+          percentiles?.close();
           await core.close();
           process.send?.({ id: request.id, ok: true, value: { closed: true } });
           process.disconnect?.();
@@ -357,11 +364,15 @@ async function arm(root: string, count: number, queries: string[]): Promise<void
           result =
             componentPin && captured
               ? await component(captured, componentPin)
-              : await run(request.query, request.boundary ?? "verify");
+              : request.query === "percentile-component" && percentiles
+                ? await percentiles.run()
+                : await run(request.query, request.boundary ?? "verify");
           used = start ? process.cpuUsage(start) : null;
           elapsed = performance.now() - wall;
           if (componentPin && captured)
             result.digest = await verifyComponent(captured, result.rows, componentPin);
+          if (request.query === "percentile-component" && percentiles)
+            result.digest = percentiles.digest();
         } finally {
           componentPin?.release();
         }
@@ -406,7 +417,7 @@ async function controller(): Promise<void> {
   if (
     new Set(queries).size !== queries.length ||
     !queries.includes(primary) ||
-    primary === "pk-source"
+    componentQuery(primary)
   )
     throw new Error("A unique query set containing a whole-query primary is required");
   if (!checking && (baseline === candidate || before.revision === after.revision))
@@ -426,10 +437,18 @@ async function controller(): Promise<void> {
     if (exists) throw new Error(`Existing evidence would be overwritten: ${file}`);
   }
   const children: Array<{ child: ChildProcess; exited: Promise<void> }> = [];
-  const start = async (root: string, revision: string) => {
+  const start = async (root: string, revision: string, candidateArm: boolean) => {
     const child = fork(
       fileURLToPath(import.meta.url),
-      ["--arm", root, "--rows", checking ? "7" : "1000000", "--only", queries.join(",")],
+      [
+        "--arm",
+        root,
+        "--rows",
+        checking ? "7" : "1000000",
+        "--only",
+        queries.join(","),
+        ...(candidateArm ? ["--candidate-arm"] : []),
+      ],
       { execArgv: [], stdio: ["ignore", "inherit", "inherit", "ipc"] },
     );
     let next = 0;
@@ -494,15 +513,15 @@ async function controller(): Promise<void> {
   let a: Awaited<ReturnType<typeof start>> | undefined,
     b: Awaited<ReturnType<typeof start>> | undefined;
   try {
-    a = await start(baseline, before.revision);
-    b = await start(candidate, after.revision);
+    a = await start(baseline, before.revision, false);
+    b = await start(candidate, after.revision, true);
     for (const query of queries) {
       const expected = await a.ask({ op: "run", query, boundary: "verify", timed: false });
       const warm = await b.ask({ op: "run", query, boundary: "verify", timed: false });
       if (warm.digest !== expected.digest || warm.rows !== expected.rows)
         throw new Error(`Different full output: ${query}`);
       if (checking) continue;
-      for (const boundary of query === "pk-source" ? ["frames"] : ["frames", "rows"]) {
+      for (const boundary of componentQuery(query) ? ["frames"] : ["frames", "rows"]) {
         const samples: Array<{ control: Observation; candidate: Observation; order: string }> = [];
         for (let pair = 0; pair < 9; pair++) {
           const order = pair % 2 === 0 ? [a, b] : [b, a];
@@ -525,6 +544,11 @@ async function controller(): Promise<void> {
             result.rows !== expected.rows
           )
             throw new Error("Timed output count changed");
+          if (
+            (boundary === "rows" || componentQuery(query)) &&
+            (control.digest !== expected.digest || result.digest !== expected.digest)
+          )
+            throw new Error("Timed materialized output changed");
           samples.push({ control, candidate: result, order: pair % 2 === 0 ? "AB" : "BA" });
           // Validate after the adjacent timed pair, never between its two arms.
           for (const worker of [a, b]) {

@@ -271,14 +271,19 @@ materialization boundary use the external fallback; direct-column FILTER transit
 have a conservative full-batch growth bound. Varlen CASE output in an ordinary projection
 has a separate transient-pressure allocation gap, reproduced on main; this hash-state
 protocol does not make that expression buffer resumable. Genuinely ordered DISTINCT and
-ordered-set transitions retain external sorting with independent private progress lanes.
+uncertified ordered-set transitions retain external sorting with independent private progress lanes.
+A certified numeric percentile list can instead admit its complete row/group-bounded typed
+workspace atomically. Its planning probe releases every temporary grant before that wait;
+state, null bits, group IDs, shared selection scratch and output have no synchronous dependency
+on shared headroom. If that complete minimum cannot fit, it keeps the bounded external recipe
+before input opens. Cancellation drains the owned finish promise before returning state credit.
 The raw synchronous hash helpers still require a complete workspace; retrying a partly
 applied raw push after refusal is invalid.
 
-The operator tape's bounded disk-linked directory does not bound the shared scratch
-service's per-file extent list. That metadata is presently uncharged; B1 owns the routed
-fix. Pressure tests cover operator/native-buffer accounting, not a universal whole-service
-hard RAM bound. This limitation also applies to scratch-backed generated SQL cases.
+The operator tape's directory and the shared scratch service have separate bounds. The
+scratch service now admits fixed control/metadata workspaces and retains only scalar
+extent-chain coordinates per file. Aggregation pressure tests exercise operator/native-buffer
+accounting; the spill suites own the service metadata proof.
 
 ## Idle credit at a pressure handoff
 
