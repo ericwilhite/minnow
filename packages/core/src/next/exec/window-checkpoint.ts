@@ -9,6 +9,8 @@ export class WindowCheckpoint {
     readonly records: RecordCheckpoint,
     readonly nextOrdinal: bigint,
     readonly priorSpilledBytes: number,
+    /** False for a lazy snapshot: native runs retain stable order within peers. */
+    readonly hasOrdinals = true,
   ) {}
   /** Additional ordinary reader/copy workspace beyond the normal window recipe. */
   get minimumBytes(): number {

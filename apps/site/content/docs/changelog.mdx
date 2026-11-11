@@ -15,7 +15,8 @@ JSONB text, including decimal scale, duplicate keys and Unicode validation. Inva
 keep PostgreSQL’s error order, including competing Unicode, token and numeric range errors. Expanding values use
 charged spill checkpoints and cancellable re-admission through unary, EXCEPT, join and window
 parents. Eligible hybrid aggregates use the same handoff path; completed join builds are not
-read again and window input order is preserved. JSON paths,
+read again and window input order is preserved. Potential cuts retain the ordinary window
+fast routes through empty handoffs and until a nonempty checkpoint requires conversion. JSON paths,
 construction and aggregation remain refused. The shipped engine, public API and stored formats
 are unchanged; no migration is needed.
 

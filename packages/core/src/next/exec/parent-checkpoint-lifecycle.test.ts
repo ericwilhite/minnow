@@ -22,7 +22,7 @@ function deferred() {
 const reach = createReach("parent checkpoint IO", RETAINED_PARENT_IO_REACH);
 afterAll(() => reach.assertReached());
 for (const seed of seedsFor("next-parent-checkpoint-io", [0xb7a1, 0xb7a2]))
-  for (const kind of ["join", "window"] as const)
+  for (const kind of ["join", "window", "columnar window"] as const)
     for (const mode of ["append", "read"] as const)
       for (const { fault, cancel } of [
         { fault: false, cancel: true },
@@ -76,6 +76,7 @@ for (const seed of seedsFor("next-parent-checkpoint-io", [0xb7a1, 0xb7a2]))
           };
           const ws: WindowSpec = {
             checkpointable: true,
+            ...(kind === "columnar window" ? { sortPath: "sort" } : {}),
             types,
             partitionBy: [],
             orderBy: [{ column: 0, direction: "asc", nulls: "last", collation: null }],
@@ -90,7 +91,11 @@ for (const seed of seedsFor("next-parent-checkpoint-io", [0xb7a1, 0xb7a2]))
           const old =
             kind === "join"
               ? new HashJoin(js, { grant, spill, queryId: 1 })
-              : new WindowOperator(ws, { grant, spill, queryId: 1 }, sink);
+              : new WindowOperator(
+                  ws,
+                  { grant, spill, queryId: 1, columnar: kind === "columnar window" },
+                  sink,
+                );
           const input = old instanceof HashJoin ? old.build : old;
           for (const batch of batchesOf(types, [
             [1, "a".repeat(1024)],
@@ -120,7 +125,11 @@ for (const seed of seedsFor("next-parent-checkpoint-io", [0xb7a1, 0xb7a2]))
               armed = true;
               work = actor.restore(saved as Awaited<ReturnType<HashJoin["checkpoint"]>>);
             } else {
-              actor = new WindowOperator(ws, { grant: restoredGrant, spill, queryId: 1 }, sink);
+              actor = new WindowOperator(
+                ws,
+                { grant: restoredGrant, spill, queryId: 1, columnar: kind === "columnar window" },
+                sink,
+              );
               armed = true;
               work = actor.restore(saved as Awaited<ReturnType<WindowOperator["checkpoint"]>>);
             }
@@ -155,7 +164,7 @@ for (const seed of seedsFor("next-parent-checkpoint-io", [0xb7a1, 0xb7a2]))
             actor.abort(new Error("cleanup after work"));
             await actor.closed;
             if (fault) reach.reach("fault cleanup");
-            reach.reach(kind);
+            reach.reach(kind === "join" ? "join" : "window");
             reach.reach(mode);
           } finally {
             release.resolve();
@@ -327,100 +336,102 @@ for (const cancel of [false, true])
   });
 
 for (const seed of seedsFor("next-parent-checkpoint-reclaim", [0xb7c1, 0xb7c2]))
-  it(`window reclamation waits for its checkpoint borrow (${String(seed)})`, async () => {
-    reach.beginHistory();
-    const { TaskClock } = await import("./pipeline.js");
-    const governor = new Governor(64 * 1024 * 1024),
-      spill = new MemorySpillService(),
-      types = [INT, TEXT];
-    const nativeGrant = await governor.admit({
-      label: "resident checkpoint reclamation",
-      minimumBytes: windowRetainingMinimumBytes(types) + 8 * 1024 * 1024,
-      spillable: true,
-    });
-    let reclaim: (() => unknown) | undefined;
-    const grant = new Proxy(nativeGrant, {
-      get(target, property) {
-        if (property === "onReclaimRequest")
-          return (callback: () => unknown) => {
-            reclaim = callback;
-            target.onReclaimRequest(callback);
-          };
-        const value: unknown = Reflect.get(target, property);
-        return typeof value === "function" ? (value.bind(target) as unknown) : value;
-      },
-    });
-    const actor = new WindowOperator(
-      {
-        checkpointable: true,
-        types,
-        partitionBy: [],
-        orderBy: [{ column: 0, direction: "asc", nulls: "last", collation: null }],
-        functions: [{ fn: "rank", arg: null, frame: null, type: { kind: "int64" } }],
-      },
-      { grant, spill, queryId: seed, clock: new TaskClock(() => 0) },
-      new CollectSink(),
-    );
-    const rows = 8192 + (seed % 64);
-    for (const batch of batchesOf(
-      types,
-      Array.from({ length: rows }, (_, i) => [rows - i, "payload".repeat(7)]),
-    ))
-      if (actor.push(batch) === "blocked") await actor.ready();
-    expect(actor.profile.sort.runs, "multiple resident chunks, no original spill").toBe(0);
-    const entered = deferred(),
-      release = deferred();
-    let gated = false;
-    const create = spill.create.bind(spill);
-    spill.create = async (...args) => {
-      const file = await create(...args),
-        append = file.append.bind(file);
-      file.append = async (page) => {
-        if (!gated) {
-          gated = true;
-          entered.resolve();
-          await release.promise;
-        }
-        return append(page);
-      };
-      return file;
-    };
-    const work = actor.checkpoint();
-    void work.catch(() => undefined);
-    let saved: Awaited<ReturnType<WindowOperator["checkpoint"]>> | undefined,
-      reclaiming: Promise<unknown> | undefined;
-    try {
-      await entered.promise;
-      expect(reclaim).toBeTypeOf("function");
-      let reclaimed = false;
-      reclaiming = Promise.resolve(reclaim?.()).then(
-        () => {
-          reclaimed = true;
+  for (const columnar of [false, true])
+    it(`window reclamation waits for its checkpoint borrow (${String(seed)})`, async () => {
+      reach.beginHistory();
+      const { TaskClock } = await import("./pipeline.js");
+      const governor = new Governor(64 * 1024 * 1024),
+        spill = new MemorySpillService(),
+        types = [INT, TEXT];
+      const nativeGrant = await governor.admit({
+        label: "resident checkpoint reclamation",
+        minimumBytes: windowRetainingMinimumBytes(types) + 8 * 1024 * 1024,
+        spillable: true,
+      });
+      let reclaim: (() => unknown) | undefined;
+      const grant = new Proxy(nativeGrant, {
+        get(target, property) {
+          if (property === "onReclaimRequest")
+            return (callback: () => unknown) => {
+              reclaim = callback;
+              target.onReclaimRequest(callback);
+            };
+          const value: unknown = Reflect.get(target, property);
+          return typeof value === "function" ? (value.bind(target) as unknown) : value;
         },
-        (error: unknown) => {
-          reclaimed = true;
-          throw error;
+      });
+      const actor = new WindowOperator(
+        {
+          checkpointable: true,
+          ...(columnar ? { sortPath: "sort" } : {}),
+          types,
+          partitionBy: [],
+          orderBy: [{ column: 0, direction: "asc", nulls: "last", collation: null }],
+          functions: [{ fn: "rank", arg: null, frame: null, type: { kind: "int64" } }],
         },
+        { grant, spill, queryId: seed, columnar, clock: new TaskClock(() => 0) },
+        new CollectSink(),
       );
-      void reclaiming.catch(() => undefined);
-      // All ungated IO resolves in microtasks and the private clock never expires.
-      // A task turn therefore distinguishes waiting on the borrowed checkpoint from
-      // a reclaimer that sorts/truncates the resident chunks behind its back.
-      await new Promise<void>((done) => setImmediate(done));
-      expect(reclaimed, "reclamation must not mutate a checkpoint's borrowed chunks").toBe(false);
-      reach.reach("reclaim waits for checkpoint");
-      release.resolve();
-      saved = await work;
-      await reclaiming;
-      expect(saved.records.tape.rows).toBe(rows);
-    } finally {
-      release.resolve();
-      saved ??= await work.catch(() => undefined);
-      await reclaiming?.catch(() => undefined);
-      actor.abort(new Error("cleanup"));
-      await actor.closed;
-      await saved?.close();
-      expect(governor.usedBytes).toBe(0);
-      expect(spill.bytesInUse).toBe(0);
-    }
-  }, 30000);
+      const rows = 8192 + (seed % 64);
+      for (const batch of batchesOf(
+        types,
+        Array.from({ length: rows }, (_, i) => [rows - i, "payload".repeat(7)]),
+      ))
+        if (actor.push(batch) === "blocked") await actor.ready();
+      expect(actor.profile.sort.runs, "multiple resident chunks, no original spill").toBe(0);
+      const entered = deferred(),
+        release = deferred();
+      let gated = false;
+      const create = spill.create.bind(spill);
+      spill.create = async (...args) => {
+        const file = await create(...args),
+          append = file.append.bind(file);
+        file.append = async (page) => {
+          if (!gated) {
+            gated = true;
+            entered.resolve();
+            await release.promise;
+          }
+          return append(page);
+        };
+        return file;
+      };
+      const work = actor.checkpoint();
+      void work.catch(() => undefined);
+      let saved: Awaited<ReturnType<WindowOperator["checkpoint"]>> | undefined,
+        reclaiming: Promise<unknown> | undefined;
+      try {
+        await entered.promise;
+        expect(reclaim).toBeTypeOf("function");
+        let reclaimed = false;
+        reclaiming = Promise.resolve(reclaim?.()).then(
+          () => {
+            reclaimed = true;
+          },
+          (error: unknown) => {
+            reclaimed = true;
+            throw error;
+          },
+        );
+        void reclaiming.catch(() => undefined);
+        // All ungated IO resolves in microtasks and the private clock never expires.
+        // A task turn therefore distinguishes waiting on the borrowed checkpoint from
+        // a reclaimer that sorts/truncates the resident chunks behind its back.
+        await new Promise<void>((done) => setImmediate(done));
+        expect(reclaimed, "reclamation must not mutate a checkpoint's borrowed chunks").toBe(false);
+        reach.reach("reclaim waits for checkpoint");
+        release.resolve();
+        saved = await work;
+        await reclaiming;
+        expect(saved.records.tape.rows).toBe(rows);
+      } finally {
+        release.resolve();
+        saved ??= await work.catch(() => undefined);
+        await reclaiming?.catch(() => undefined);
+        actor.abort(new Error("cleanup"));
+        await actor.closed;
+        await saved?.close();
+        expect(governor.usedBytes).toBe(0);
+        expect(spill.bytesInUse).toBe(0);
+      }
+    }, 30000);

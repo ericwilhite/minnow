@@ -3317,11 +3317,18 @@ build values through subsequent repartitioning and chunk processing.
 
 A window opts in with `WindowSpec.checkpointable`. Its complete initial native
 minimum is `windowRetainingMinimumBytes(types, functions)`, which includes ordinal
-scratch and the sort's extra int64 column. It uses the general sort, with a hidden
-input ordinal as a final tie breaker. That ordinal is never a peer key or output
-column. `checkpoint()` saves native input values and the next ordinal before any
-frame transition has run. `restore(saved)` preserves peer and floating ROWS order.
-The ordinary grouped window path remains available to other windows.
+scratch and the sort's extra int64 column. Until an actual cut or grouped-store
+fallback, it uses the same grouped/columnar/general route as an ordinary window,
+without constructing or populating ordinals. Empty-prefix handoffs also keep that route;
+buffered JSON producers can hand off without retaining any ancestor rows. At a nonempty
+cut, grouped input moves to the
+general sort with its original arrival ordinals (including reverse chunk transfer).
+An untouched sort saves chronological pre-finish runs and the resident tail, stable
+within equal full keys. Restore assigns ordinals to that peer-stable prefix before
+copying it to the new general sort. The ordinal is never a peer key or output column.
+`checkpoint()` runs before any frame transition; `restore(saved)` preserves peer
+and floating ROWS order. The initial recipe conservatively reserves continuation
+workspace even when no cut occurs; it does not force a slower execution route.
 
 Descriptor `minimumBytes` and `restoreLoanSlots` are **additional** to the normal
 recipe. Window restore needs admitted ordinary reader/copy workspace; it cannot

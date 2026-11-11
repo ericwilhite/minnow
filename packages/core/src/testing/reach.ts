@@ -3511,6 +3511,7 @@ export const WINDOW_TOPK_LIFECYCLE_REACH = [
   "queued loan cancellation",
   "complete legacy step refused",
   "zero resources",
+] as const;
 
 /** Native retaining-parent continuation and ownership histories. */
 export const RETAINED_JOIN_REACH = [
@@ -3538,6 +3539,11 @@ export const RETAINED_WINDOW_REACH = [
   "NULL partition/order keys",
   "RANGE peers and lag",
   "non-finite floats",
+  "multichunk grouped prefix",
+  "generated multichunk prefix",
+  "lazy grouped cut",
+  "lazy columnar cut",
+  "lazy general cut",
 ] as const;
 
 /** Native retaining-parent continuation and ownership histories. */
@@ -3661,4 +3667,21 @@ export const RETAINING_GRAPH_REACH = [
   "descendant excluded",
   "sibling excluded",
   "no retaining ancestor",
+] as const;
+
+export const RETAINING_WINDOW_ROUTE_REACH = [
+  "JSON producer",
+  "hybrid producer",
+  "row_number",
+  "rank",
+  "sum",
+  "lag",
+  "avg",
+] as const;
+
+export const COLUMNAR_CHECKPOINT_REACH = [
+  "reclaim waits for replay",
+  "cancel retains replay credit",
+  "sealed full prefix",
+  "zero resources",
 ] as const;

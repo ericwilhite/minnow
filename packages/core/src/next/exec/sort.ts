@@ -1987,7 +1987,7 @@ class Sorter {
     );
   }
 
-  /** Window input boundary only: values retain a hidden stable ordinal. */
+  /** Pre-finish runs are chronological and stable within equal keys; resident input follows. */
   checkpoint(): Promise<RecordCheckpoint> {
     if (this.#closed || this.#checkpointWork)
       return Promise.reject(new Error("Sort checkpoint is not at an input boundary"));
@@ -2655,8 +2655,6 @@ class GeneralSortOperator implements Operator {
 /** The full numeric path is optional; the original sorter owns every other shape/fallback. */
 export class SortOperator implements Operator {
   checkpoint(): Promise<RecordCheckpoint> {
-    if (!(this.#operator instanceof GeneralSortOperator))
-      throw new Error("Columnar checkpoint is not supported");
     return this.#operator.checkpoint();
   }
 

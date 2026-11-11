@@ -437,7 +437,8 @@ and storage faults still unwind immediately.
 Unary, EXCEPT, supported join and window parents share the same JSON/hybrid-aggregate
 checkpoint controller. Only retaining ancestors participate; consumed join builds are not reopened.
 Checkpointable windows use their complete native initial minimum and separately admitted restore
-workspace before copying. Both producer kinds retain one shared idle account and cleanup ownership
+workspace before copying. They retain ordinary fast routes through empty-prefix handoffs
+and until a nonempty cut or grouped pressure fallback; only then is peer-stable input converted to ordinal continuation. Both producer kinds retain one shared idle account and cleanup ownership
 through cancellation, I/O faults and concurrent continuations.
 Document parameters, lazy init values, foreign expanding document producers, front-end materialized
 JSON/JSONB literals and JSON ↔ JSONB casts remain explicit refusals. JSON paths, construction and
