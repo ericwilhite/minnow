@@ -9,14 +9,14 @@ import { ChunkReader } from "../page/reader.js";
 import { oracleRows } from "./differential-adapter.js";
 import { createExecutor } from "../exec/create.js";
 
-it.each(["index", "fetch", "frame", "publish"] as const)(
+it.each(["index", "skip", "fetch", "frame", "publish"] as const)(
   "settles ordered-index %s before releasing query resources",
   async (phase) => {
     const reach = createReach("key-order lifecycle", [phase]);
     reach.beginHistory();
     const core = await new StorageCore(8192).open(),
       governor = new Governor(64 << 20);
-    const executor = createExecutor({ keyOrder: true });
+    const executor = createExecutor();
     core.executor.prepare = executor.prepare.bind(executor);
     const names = ["id", ...Array.from({ length: 16 }, (_, i) => `c${String(i)}`)];
     let pin: Snapshot | null = null,
@@ -42,7 +42,8 @@ it.each(["index", "fetch", "frame", "publish"] as const)(
         await core.harness.path.recycleLog();
         await core.harness.path.quiesce();
       }
-      const prepared = core.prepare("SELECT * FROM t ORDER BY id LIMIT 8");
+      const offset = phase === "skip" ? 11 : 0;
+      const prepared = core.prepare(`SELECT * FROM t ORDER BY id LIMIT 8 OFFSET ${String(offset)}`);
       pin = core.harness.path.pin();
       const gate = () =>
         new Promise<void>((resolve) => {
@@ -57,25 +58,39 @@ it.each(["index", "fetch", "frame", "publish"] as const)(
               return {
                 def: reader.def,
                 probe: reader.probe.bind(reader),
-                range: (range, dir) => {
-                  opens++;
-                  const cursor = reader.range(range, dir);
-                  cursors.push(cursor);
+                range: () => {
+                  throw new Error("Default SQL must use admitted cursors");
+                },
+                planRange: (range, dir) => {
+                  const plan = reader.planRange?.(range, dir);
+                  if (!plan) throw new Error("Missing native admitted cursor");
                   return {
-                    skip: cursor.skip.bind(cursor),
-                    next: async (out) => {
-                      const n = await cursor.next(out);
-                      if (phase === "index") await gate();
-                      if (phase === "publish" && !published) {
-                        await core.harness.path.recycleLog();
-                        await core.harness.path.quiesce();
-                        published = true;
-                      }
-                      return n;
-                    },
-                    close() {
-                      closes++;
-                      cursor.close();
+                    minimumBytes: plan.minimumBytes,
+                    open(options) {
+                      opens++;
+                      const cursor = plan.open(options);
+                      cursors.push(cursor);
+                      return {
+                        skip: async (count) => {
+                          const n = await cursor.skip(count);
+                          if (phase === "skip") await gate();
+                          return n;
+                        },
+                        next: async (out) => {
+                          const n = await cursor.next(out);
+                          if (phase === "index") await gate();
+                          if (phase === "publish" && !published) {
+                            await core.harness.path.recycleLog();
+                            await core.harness.path.quiesce();
+                            published = true;
+                          }
+                          return n;
+                        },
+                        close() {
+                          closes++;
+                          cursor.close();
+                        },
+                      };
                     },
                   };
                 },
@@ -148,7 +163,7 @@ it.each(["index", "fetch", "frame", "publish"] as const)(
         }
         await execution.executed;
         await execution.delivered;
-        expect(result).toEqual(input.slice(0, 8));
+        expect(result).toEqual(input.slice(offset, offset + 8));
         expect(published).toBe(true);
         expect(opens).toBe(1);
         expect(closes).toBe(1);

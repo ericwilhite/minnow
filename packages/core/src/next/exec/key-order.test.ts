@@ -13,11 +13,17 @@ import type { PhysicalPlan } from "../ir/ir.js";
 it.each(seedsFor("next-key-order-prefix", [0xe103, 0xe104]))(
   "bounds cursor reads and closes once (seed %i)",
   async (seed) => {
-    const reach = createReach("index prefix", ["zero", "offset", "multiple-batches", "closed"]);
+    const reach = createReach("index prefix", [
+      "zero",
+      "offset",
+      "offset-past-end",
+      "multiple-batches",
+      "closed",
+    ]);
     await fc.assert(
       fc.asyncProperty(
-        fc.integer({ min: 0, max: 4097 }),
-        fc.integer({ min: 0, max: 4097 }),
+        fc.integer({ min: 0, max: 6000 }),
+        fc.integer({ min: 0, max: 6000 }),
         async (limit, offset) => {
           reach.beginHistory();
           const governor = new Governor(8 << 20),
@@ -25,12 +31,16 @@ it.each(seedsFor("next-key-order-prefix", [0xe103, 0xe104]))(
           const arena = new OutputArena(grant, 2048);
           let at = 0,
             read = 0,
+            skips = 0,
             closes = 0,
             batches = 0;
           const source = new IndexOrderSource(
             {
-              skip() {
-                throw new Error("Planner does not route skip yet");
+              skip(count) {
+                skips++;
+                const n = Math.min(count, 5000 - at);
+                at += n;
+                return n;
               },
               next(out) {
                 const count = Math.min(out.length, 5000 - at);
@@ -60,11 +70,13 @@ it.each(seedsFor("next-key-order-prefix", [0xe103, 0xe104]))(
             expect(output).toEqual(
               Array.from({ length: 5000 }, (_, i) => i).slice(offset, offset + limit),
             );
-            expect(read).toBeLessThanOrEqual(limit === 0 ? 0 : limit + offset);
+            expect(read, "only surviving locators are materialized").toBe(output.length);
+            expect(skips).toBe(limit > 0 && offset > 0 ? 1 : 0);
             source.abort();
             expect(closes).toBe(1);
             if (limit === 0) reach.reach("zero");
             if (offset > 0 && limit > 0) reach.reach("offset");
+            if (offset >= 5000 && limit > 0) reach.reach("offset-past-end");
             if (batches > 1) reach.reach("multiple-batches");
             reach.reach("closed");
           } finally {
@@ -78,11 +90,12 @@ it.each(seedsFor("next-key-order-prefix", [0xe103, 0xe104]))(
       ),
       {
         seed,
-        numRuns: 12,
+        numRuns: 13,
         examples: [
           [0, 3],
           [4097, 0],
           [100, 3],
+          [1, 6000],
         ],
       },
     );
@@ -90,63 +103,69 @@ it.each(seedsFor("next-key-order-prefix", [0xe103, 0xe104]))(
   },
 );
 
-it("closes an aborted cursor but drains its in-flight write before closing output storage", async () => {
-  const governor = new Governor(8 << 20),
-    grant = await governor.admit({ label: "drain", minimumBytes: 1 << 20, spillable: true }),
-    arena = new OutputArena(grant, 2048);
-  let entered: (() => void) | undefined,
-    release: (() => void) | undefined,
-    closes = 0;
-  const arrived = new Promise<void>((resolve) => {
-    entered = resolve;
-  });
-  const source = new IndexOrderSource(
-    {
-      skip() {
-        throw new Error("Planner does not route skip yet");
-      },
-      next(out) {
-        entered?.();
-        return new Promise<number>((resolve) => {
-          release = () => {
-            out[0] = 42;
-            resolve(1);
-          };
-        });
-      },
-      close() {
-        closes++;
-      },
-    },
-    arena.flat({ kind: "locator", tableId: 1 }).vector,
-    new AbortController().signal,
-    1,
-    0,
-  );
-  const pending = source.next();
-  try {
-    await arrived;
-    source.abort();
-    let drained = false;
-    const closed = source.closed.then(() => {
-      drained = true;
+it.each(["next", "skip"] as const)(
+  "drains a pending cursor %s before closing output storage",
+  async (method) => {
+    const governor = new Governor(8 << 20),
+      grant = await governor.admit({ label: "drain", minimumBytes: 1 << 20, spillable: true }),
+      arena = new OutputArena(grant, 2048);
+    let entered: (() => void) | undefined,
+      release: (() => void) | undefined,
+      closes = 0;
+    const arrived = new Promise<void>((resolve) => {
+      entered = resolve;
     });
-    await Promise.resolve();
-    expect(drained, "cursor writes must drain before arena disposal").toBe(false);
-    expect(closes).toBe(1);
-    release?.();
-    expect(await pending).toBeNull();
-    await closed;
-    expect(drained).toBe(true);
-  } finally {
-    release?.();
-    await Promise.allSettled([pending, source.closed]);
-    source.abort();
-    arena.close();
-    grant.close();
-    expect(governor.usedBytes).toBe(0);
-  }
-});
+    const source = new IndexOrderSource(
+      {
+        skip(count) {
+          entered?.();
+          return new Promise<number>((resolve) => {
+            release = () => resolve(count);
+          });
+        },
+        next(out) {
+          entered?.();
+          return new Promise<number>((resolve) => {
+            release = () => {
+              out[0] = 42;
+              resolve(1);
+            };
+          });
+        },
+        close() {
+          closes++;
+        },
+      },
+      arena.flat({ kind: "locator", tableId: 1 }).vector,
+      new AbortController().signal,
+      1,
+      method === "skip" ? 17 : 0,
+    );
+    const pending = source.next();
+    try {
+      await arrived;
+      source.abort();
+      let drained = false;
+      const closed = source.closed.then(() => {
+        drained = true;
+      });
+      await Promise.resolve();
+      expect(drained, "cursor writes must drain before arena disposal").toBe(false);
+      expect(closes).toBe(1);
+      release?.();
+      expect(await pending).toBeNull();
+      await closed;
+      expect(drained).toBe(true);
+    } finally {
+      release?.();
+      await Promise.allSettled([pending, source.closed]);
+      source.abort();
+      arena.close();
+      grant.close();
+      expect(governor.usedBytes).toBe(0);
+    }
+  },
+);
 
 it.each(seedsFor("next-key-order-held-floor", [0xe105, 0xe106]))(
   "retains restore admission under a competing holder (seed %i)",

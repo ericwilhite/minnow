@@ -1,5 +1,6 @@
 /** Ordered index cursors and private locator fetches share the query's pinned view. */
-import type { IndexCursor } from "../access/key-index.js";
+import type { IndexCursor, IndexReader, IndexRangePlan } from "../access/key-index.js";
+import type { ReadBound } from "../page/read-bounds.js";
 import type { PhysicalPlan, Rel } from "../ir/ir.js";
 import { BATCH_ROWS, type FlatVector } from "../vector/vector.js";
 import { batchTargetFor, OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
@@ -12,6 +13,13 @@ import { memoryScanBufferBytes } from "./table-scan.js";
 import { sortMinimumBytes } from "./sort.js";
 import { isByteCollation } from "./sort-keys.js";
 import type { OperatorIdentity, QueryRuntime } from "./run.js";
+
+export function planIndexRange(reader: IndexReader, descending: boolean) {
+  const plan = reader.planRange?.({ lower: null, upper: null }, descending ? "desc" : "asc");
+  if (plan && (!Number.isSafeInteger(plan.minimumBytes) || plan.minimumBytes < 0))
+    throw new RangeError("invalid index cursor minimum");
+  return plan ?? null;
+}
 
 export class IndexOrderSource implements BatchSource {
   #pending: Promise<SourceItem | null> | null = null;
@@ -50,10 +58,18 @@ export class IndexOrderSource implements BatchSource {
       this.signal.throwIfAborted();
       const pending = pauseIfDue({ signal: this.signal });
       if (pending) await pending;
-      const size = Math.min(
-        BATCH_ROWS,
-        this.skip > 0 ? this.skip : Math.min(this.remaining, this.demand()),
-      );
+      if (this.skip > 0) {
+        const requested = this.skip;
+        const skipped = await this.cursor.skip(requested);
+        this.signal.throwIfAborted();
+        if (this.#aborted) return null;
+        if (!Number.isSafeInteger(skipped) || skipped < 0 || skipped > requested)
+          throw new RangeError("invalid index cursor skip count");
+        this.skip = 0;
+        if (skipped < requested) break;
+        continue;
+      }
+      const size = Math.min(BATCH_ROWS, this.remaining, this.demand());
       if (size <= 0) break;
       const count = await this.cursor.next(data.values.subarray(0, size));
       this.signal.throwIfAborted();
@@ -61,10 +77,6 @@ export class IndexOrderSource implements BatchSource {
       if (!Number.isInteger(count) || count < 0 || count > size)
         throw new RangeError("invalid index cursor count");
       if (count === 0) break;
-      if (this.skip > 0) {
-        this.skip -= count;
-        continue;
-      }
       this.remaining -= count;
       this.vector.length = count;
       this.rowsOut += count;
@@ -108,6 +120,21 @@ export function indexMinimums(shape: IndexShape, cap: number) {
   ];
 }
 
+export interface AdmittedIndexRead {
+  readonly plan: IndexRangePlan;
+  readonly cursor: OperatorIdentity;
+  readonly payload: ReadBound;
+}
+export function admittedIndexMinimums(shape: IndexShape, cap: number, read: AdmittedIndexRead) {
+  return [
+    ...indexMinimums(shape, cap).map((entry) => ({
+      ...entry,
+      minimum: entry.minimum + (entry.rel.id === shape.fetch.id ? read.payload.bytes : 0),
+    })),
+    { rel: read.cursor, minimum: read.plan.minimumBytes },
+  ];
+}
+
 export async function runIndexOrder(
   runtime: QueryRuntime,
   sink: Operator,
@@ -117,8 +144,11 @@ export async function runIndexOrder(
   offset: number,
   demand?: () => number,
   stopped?: () => boolean,
+  admitted?: AdmittedIndexRead,
 ): Promise<void> {
-  const entries = indexMinimums(shape, runtime.request.governor.capBytes);
+  const entries = admitted
+    ? admittedIndexMinimums(shape, runtime.request.governor.capBytes, admitted)
+    : indexMinimums(shape, runtime.request.governor.capBytes);
   const grants = [];
   for (const entry of entries)
     grants.push(
@@ -139,6 +169,14 @@ export async function runIndexOrder(
   const fetch = new LateFetchOperator(
     {
       snapshot: runtime.view,
+      ...(admitted
+        ? {
+            onePass: true,
+            boundedMemory: true,
+            readTable: () => runtime.table(shape.tableId, fetchGrant),
+            pages: runtime.readPages(runtime.view.pages),
+          }
+        : {}),
       tableId: shape.tableId,
       columns: shape.columns,
       types: shape.types,
@@ -159,9 +197,14 @@ export async function runIndexOrder(
   runtime.onAbort((reason) => fetch.abort(reason));
   runtime.dispose(() => fetch.closed);
   runtime.signal.throwIfAborted();
-  const cursor = runtime.view
-    .index(shape.tableId, indexId)
-    .range({ lower: null, upper: null }, shape.descending ? "desc" : "asc");
+  const cursorGrant = grants[3];
+  if (admitted && !cursorGrant) throw new Error("Missing admitted cursor budget");
+  const cursor =
+    admitted && cursorGrant
+      ? admitted.plan.open({ budget: cursorGrant, signal: runtime.signal })
+      : runtime.view
+          .index(shape.tableId, indexId)
+          .range({ lower: null, upper: null }, shape.descending ? "desc" : "asc");
   const source = new IndexOrderSource(
     cursor,
     vector,
@@ -209,7 +252,13 @@ export function orderedSort(plan: PhysicalPlan): {
     root = root.input;
   }
   const rel = root;
-  if (rel.op !== "sort" || rel.withTies || rel.limit === null || rel.keys.length === 0) return null;
+  if (
+    rel.op !== "sort" ||
+    rel.withTies ||
+    (rel.limit === null && rel.offset === null) ||
+    rel.keys.length === 0
+  )
+    return null;
   const project = rel.input;
   if (project.op !== "project" || project.input.op !== "scan") return null;
   const scan = project.input;

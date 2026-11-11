@@ -70,7 +70,15 @@ import { sortMode } from "./sort-keys.js";
 import type { SortColumn } from "./sort-keys.js";
 import { windowInputLayout, remapWindowFunction, literalWindowAmount } from "./window-input.js";
 import { TableScan, memoryScanBufferBytes } from "./table-scan.js";
-import { orderedSort, indexMinimums, runIndexOrder, type IndexShape } from "./key-order.js";
+import {
+  orderedSort,
+  indexMinimums,
+  admittedIndexMinimums,
+  planIndexRange,
+  runIndexOrder,
+  type IndexShape,
+  type AdmittedIndexRead,
+} from "./key-order.js";
 import {
   WindowOperator,
   windowMinimumBytes,
@@ -447,6 +455,7 @@ export interface CompileOptions {
   /** Parent control for the resident full numeric columnar sort. */
   readonly columnarSort?: boolean;
   readonly lateSort?: boolean;
+  /** False retains generic SQL sorting; true also permits legacy diagnostic cursors/IR. */
   readonly keyOrder?: boolean;
   readonly lateFetchOnce?: boolean;
   readonly groupTopN?: boolean;
@@ -1835,58 +1844,22 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   const jsonConstants = hasJson ? jsonLiteralBytes(plan) : 0;
   // One document may feed several output columns in the same copied result row.
   const jsonProgressColumns = Math.max(1, plan.columns.length);
-  // Keep this SQL strategy diagnostic until its
-  // cursor/fetch steps participate in the execution minimum and pass first-page acceptance.
-  // Explicit indexRange and SQL both require the diagnostic opt-in above.
-  const ordered = options.keyOrder === true ? orderedSort(plan) : null;
+  // SQL may use the exact PK order only with a complete caller-admitted cursor.
+  // Explicit indexRange and legacy cursors retain their separate diagnostic opt-in.
+  const ordered = options.keyOrder !== false ? orderedSort(plan) : null;
+  const cursorIdentity: OperatorIdentity = {
+    id: nextPhysicalId++,
+    op: "indexRange",
+    ...(ordered ? { profileAs: ordered.scan } : {}),
+  };
   // Extra helper buffers must not turn a formerly admissible small-cap query into a refusal.
   // Both strategies are capability-checked at prepare; only their execution resources differ.
   const fallback =
     lateSortIds.size === 0 && domainPlans === 0
       ? null
       : compilePlan(plan, { ...options, lateSort: false, domainCountSum: false });
-  const program: Program = (runtime, sink) => {
+  const genericProgram: Program = (runtime, sink) => {
     runtime.resolveCall = resolveCall;
-    if (ordered !== null) {
-      const { rel, scan, project } = ordered;
-      const table = runtime.view.catalog.table(scan.tableId);
-      const index = table?.indexes.find((i) => i.id === table.primaryKey);
-      if (
-        index?.kind === "ordered" &&
-        index.unique &&
-        index.columnIds.length === rel.keys.length &&
-        ordered.keys.every((column, i) => column === index.columnIds[i])
-      ) {
-        const bounds = runtime.bounds(rel);
-        if (bounds.limit === 0) return then(runtime.reserve([]), () => sink.finish());
-        const shape: IndexShape = {
-          tableId: scan.tableId,
-          columns: ordered.columns,
-          types: types(project),
-          source: scan,
-          fetch: project,
-          restore: rel,
-          descending: rel.keys[0]?.direction === "desc",
-        };
-        const entries = indexMinimums(shape, runtime.request.governor.capBytes);
-        const inputs = integerParameterBytes(plan, runtime.request.parameters);
-        if (
-          inputs !== null &&
-          runtime.minimumBytes(entries, inputs) <= runtime.request.governor.capBytes
-        )
-          return then(runtime.reserve(entries), () =>
-            then(runIndexOrder(runtime, sink, shape, index.id, bounds.limit, bounds.offset), () => {
-              for (const projection of ordered.projects) {
-                if (projection.id === project.id) continue;
-                const profile = runtime.profile(projection),
-                  output = runtime.profile(project);
-                profile.rowsOut = output.rowsOut;
-                profile.batchesOut = output.batchesOut;
-              }
-            }),
-          );
-      }
-    }
     // LIMIT zero never opens its input. Keep capability checks at prepare, but do not reserve
     // buffers for those unreachable pipelines (including when zero is a bound parameter).
     const active = new Set<number>();
@@ -2260,6 +2233,100 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       return yield* readValue(execute());
     };
     return runSliced(sizeSources(), new Slice(Infinity), () => undefined);
+  };
+  const program: Program = (runtime, sink) => {
+    runtime.resolveCall = resolveCall;
+    if (ordered === null) return genericProgram(runtime, sink);
+    const { rel, scan, project } = ordered;
+    const table = runtime.view.catalog.table(scan.tableId);
+    const index = table?.indexes.find((entry) => entry.id === table.primaryKey);
+    if (
+      index?.kind !== "ordered" ||
+      !index.unique ||
+      index.columnIds.length !== rel.keys.length ||
+      !ordered.keys.every((column, k) => column === index.columnIds[k])
+    )
+      return genericProgram(runtime, sink);
+    // Validate both bounds before zero admission, including OFFSET with LIMIT 0.
+    const bounds = runtime.bounds(rel);
+    if (bounds.limit === 0) return then(runtime.reserve([]), () => sink.finish());
+    const shape: IndexShape = {
+      tableId: scan.tableId,
+      columns: ordered.columns,
+      types: types(project),
+      source: scan,
+      fetch: project,
+      restore: rel,
+      descending: rel.keys[0]?.direction === "desc",
+    };
+    const cap = runtime.request.governor.capBytes;
+    const inputs = integerParameterBytes(plan, runtime.request.parameters);
+    // Keep the generic recipe without even opening an index reader when the fixed
+    // optional buffers plus owned inputs already do not fit.
+    if (inputs === null || runtime.minimumBytes(indexMinimums(shape, cap), inputs) > cap)
+      return genericProgram(runtime, sink);
+    const range = planIndexRange(runtime.view.index(scan.tableId, index.id), shape.descending);
+    const run = (read?: AdmittedIndexRead) => {
+      const entries = read ? admittedIndexMinimums(shape, cap, read) : indexMinimums(shape, cap);
+      return then(runtime.reserve(entries), () =>
+        then(
+          runIndexOrder(
+            runtime,
+            sink,
+            shape,
+            index.id,
+            bounds.limit,
+            bounds.offset,
+            undefined,
+            undefined,
+            read,
+          ),
+          () => {
+            for (const projection of ordered.projects) {
+              if (projection.id === project.id) continue;
+              const profile = runtime.profile(projection),
+                output = runtime.profile(project);
+              profile.rowsOut = output.rowsOut;
+              profile.batchesOut = output.batchesOut;
+            }
+          },
+        ),
+      );
+    };
+    if (range === null) return options.keyOrder === true ? run() : genericProgram(runtime, sink);
+    if (runtime.minimumBytes(indexMinimums(shape, cap), inputs) + range.minimumBytes > cap)
+      return genericProgram(runtime, sink);
+    const size = function* (): SlicedJob<void> {
+      // A locator may name any group. Size only the output columns, but use the
+      // complete pinned source rather than assuming a physical prefix for PK order.
+      const payload = yield* readValue(
+        boundSource(
+          runtime.view,
+          {
+            id: project.id,
+            tableId: scan.tableId,
+            columns: shape.columns,
+            types: shape.types,
+            windowBytes: 0,
+            stagingBytes: memoryScanBufferBytes(shape.types),
+            rows: null,
+          },
+          runtime.request.governor,
+          runtime.signal,
+          batchTargetFor(cap, 4),
+        ),
+      );
+      const read: AdmittedIndexRead = { plan: range, cursor: cursorIdentity, payload };
+      runtime.sourceBounds(new Map([[project.id, payload]]));
+      runtime.readMinimum(payload.io, payload.progress);
+      if (runtime.minimumBytes(admittedIndexMinimums(shape, cap, read), inputs) > cap) {
+        runtime.sourceBounds(new Map());
+        runtime.readMinimum(0, 0);
+        return yield* readValue(genericProgram(runtime, sink));
+      }
+      return yield* readValue(run(read));
+    };
+    return runSliced(size(), new Slice(Infinity), () => undefined);
   };
   return Object.assign(program, { atomic: true });
 }
