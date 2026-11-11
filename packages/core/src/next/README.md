@@ -1465,6 +1465,10 @@ released with their chunk readers rather than accumulating until snapshot releas
 Operators keep independent spillable growth grants. A failed growth allocation spills or runs
 at the minimum; it never waits for another execution's protected or pinned bytes. Private
 progress loans include unused fixed credit and must be repaid before another local loan.
+A recipe's explicit positive `loanSlots` also funds private progress for its base owner and
+helpers, including variable-output project/filter wrappers. Ordinary project/filter entries
+keep zero slots and acquire no extra progress reservation. The complete compound output
+bound must reach admission; the largest source value alone cannot bound a constructed row.
 Cancellation wakes read/admission callers; pending reads drain before their private I/O lane
 and execution grant close. The [governor README](memory/README.md) states the liveness argument,
 external progress assumptions and the legacy isolated-grant boundary.
@@ -1475,9 +1479,10 @@ multi-blob values and old/new output overlap are included. The provider's conser
 before outputs/downstream buffers, so small caps can still
 be below the admitted minimum even for small resident input. Legacy direct fixtures keep
 the borrowed API; they are not the production memory proof.
-Existing join/sort/window spilling remains active. Ordinary aggregation now reserves a complete
-certified hash workspace or uses bounded external aggregation from the start; it does not wait
-while retaining a partial hash table.
+Existing join/sort/window spilling remains active. Eligible ordinary aggregation retains certified
+fast paths and otherwise starts hybrid hash, spilling new groups under pressure. Variable-state
+checkpoints retire the producer before a larger restore admission waits; the integration limits
+are listed in the aggregation section below.
 Hash-join spill staging also has a known large-row defect: 600 kB build payloads at an 8 MiB
 budget can request a second progress loan. This is a bug, not an intended size limit.
 The result sink copies selected/dictionary/constant input into owned flat frames, with credit and
@@ -1858,28 +1863,41 @@ shipped-engine or stored-format change.
   The hash certificate is limited to 1024 possible groups and 2^21 active rows. Its minimum
   includes old/new arrays, tuple and translation tables, ordinary promotion, byte-arena
   compaction and output overlap (`agg/hash-bound.ts`). No float Sxx update is omitted.
-  Unknown/unproven shapes use `agg/external.ts` from the start: the shared spill sort orders
-  group keys plus an explicit input ordinal, and one group's transitions finish at a time.
-  SQL sort alone is not stable. Each call and nested sort has independent admitted progress
-  credit. DISTINCT uses a bounded value sort and adjacent SQL-equality deduplication; floating
-  SUM/AVG DISTINCT follow PostgreSQL's value-ordered transitions. The previous raw hash path
-  used first-occurrence order for floating DISTINCT; the executor now selects the ordered
-  external path for those calls. Redundant DISTINCT on byte extrema and boolean aggregates needs no set; other
-  extrema retain sorted DISTINCT representatives (including signed zero).
-  Group top-N remains bounded before winner rows reach the downstream sorter.
-  Admission waits FIFO while retaining no aggregate state or partial native reservation, and
-  cancellation drains readers, spill operations, output borrows and grants. Once admitted,
-  hash growth never needs shared headroom; external growth spills inside private progress lanes.
-  A complete minimum above the whole cap is the typed admission refusal. Low-level synchronous
-  `AggregateOperator`/`GroupTable`/`TypedLayout` callers must supply their complete workspace;
-  retrying a partly applied push after a refused synthetic charge is invalid.
-  Limits: this does not serialize/merge partial float states or replay aggregate rows. Unproven
-  and high-cardinality hash shapes can pay additional external-sort I/O, including scalar
-  COUNT(DISTINCT). Codebook certification adds a metadata/dictionary pass; a memory tail
-  additionally scans only the required key/payload columns. `aggregationProgress: false` is
-  the unexported parent benchmark control. `next-executor-bench.mts --whole-compare
-aggregation-progress --paired --repeats 9 --component aggregation-light` measures its Node
-  operator and whole-query CPU effects; the component excludes source certification.
+  Eligible column aggregates without a certificate start `agg/hybrid.ts`: synchronous
+  transitions consume only headroom funded at a cancellable async boundary. A frozen pass
+  keeps resident groups and sends new groups to stable hash partitions. A group's transition
+  order survives every pass; no float combine or reassociation is used. Completed groups
+  wait on an output tape once partitioning begins, so a later handoff cannot leave partially
+  populated unary parents.
+  Variable state checkpoints preserve every native transition field and DISTINCT member.
+  Remaining input is spooled once before producer readers, buffers and grants retire. The
+  owner-held snapshot pin survives. Result credit enters the governor's shared idle pool;
+  `admitGroup` atomically adopts that credit and admits the remaining restore minimum.
+  Already-admitted owned parameters may checkpoint only during this pressure handoff;
+  initial oversized-input refusal is unchanged and caller buffers are never reread.
+  Pressure-only restoration sorts saved records and suffix input by group key, record kind
+  and input ordinal. Exact fields and DISTINCT membership precede suffix transitions; only
+  one group is resident. It neither combines partial results nor retries hash partitions
+  indefinitely under skew. DISTINCT COUNT merges saved membership with suffix values, then
+  applies genuinely new values in suffix ordinal order. Cancellation drains every sort,
+  pass and credit wait. Compound saved rows are measured without emitters and fully funded
+  before materializing key/state copies; source, literal and owned-parameter envelopes include
+  compound keys and duplicate key columns.
+  Fixed COUNT/float states with bounded fixed-width keys emit from independent admitted
+  I/O credit, including below binary parents. Genuinely ordered DISTINCT and ordered-set
+  aggregates retain external sorting and their private progress owners.
+  EXCEPT parent counts, representatives and first-left ordinals are checkpointed before
+  retiring its right aggregate; completed left producers are not reopened. Generated pressure
+  covers an already-spilled left arm, ALL/DISTINCT, cancellation and exact wide integers.
+  Current limits: variable-state handoffs below a retaining join parent, and computed aggregate
+  arguments without a proven materialization boundary, still use the external fallback.
+  Direct-column FILTER transitions use conservative full-batch growth bounds. Pressure-only
+  restoration pays sorting/I/O and a planned bounded minimum; plentiful-memory hash does not
+  spool or select that route. B1's separately routed uncharged
+  `ScratchSpillFile` extent-list metadata is outside the operator's bounded tape proof.
+  `aggregationProgress: false` retains the unexported parent benchmark control. The Node
+  benchmark also accepts `--control-executor` for a pinned main executor over the same
+  stored fixture; shared owner contract/error modules must preserve class identity.
   Ordinary hash aggregation still refuses GROUPING SETS and string/array/JSON aggregates
   (`UnsupportedPlanError`, construct `aggregate`, before allocation). Numeric ordered-set-only
   lists use `agg/ordered-set.ts`: a group sort and spillable per-group value sorts, with

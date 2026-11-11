@@ -33,6 +33,7 @@ export async function aggregationComponents(
   queries: ReadonlyArray<{ id: string; sql: string }>,
   lightDirectory?: string,
   memoryProgress = false,
+  controlConstructor?: typeof AggregateOperator,
 ) {
   if (!Number.isSafeInteger(rounds) || rounds < 5) throw new RangeError("five rounds required");
   const records = [];
@@ -203,6 +204,7 @@ export async function aggregationComponents(
           memoryProgress
             ? {
                 boundedWorkspace: true,
+                ...(controlConstructor === undefined ? {} : { controlConstructor }),
                 paired: true,
                 operatorOnly: true,
                 omitAliases: true,

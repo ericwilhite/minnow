@@ -32,6 +32,7 @@ import type { FlatVector, Validity, Vector, VectorData } from "../../vector/vect
 import { copy, fitsInt64, int64Words, setBigInt, setNumber, toBigInt } from "../kernels/limbs.js";
 import { scaleAt, specialAt } from "../kernels/numeric.js";
 import { slotOf } from "../kernels/vectors.js";
+import { arrayGrowth } from "./growth.js";
 
 const TWO32 = 4294967296;
 /** A slot of a JS array of BigInts (its pointer). */
@@ -97,6 +98,25 @@ export class GroupValues {
     readonly charge: ByteCharge,
   ) {
     this.layout = layoutOf(type);
+  }
+
+  /** New buffers/arena copies before a batch; current buffers stay charged separately. */
+  growthBytes(groups: number, payload: number): number {
+    const slots = arrayGrowth(this.#capacity, Math.max(groups, 64), 64, true);
+    if (this.layout === "varlen" || this.layout === "fixed16") {
+      // Repeated replacements may compact and then resize. Bound both copies;
+      // input payload bounds every new byte written during the batch.
+      return (
+        slots +
+        (this.#used + payload > this.#bytes.length
+          ? 4 * Math.max(1024, this.#used + payload, 2 * this.#bytes.length)
+          : 0)
+      );
+    }
+    // A decimal can first acquire its limb/BigInt tiers during this update.
+    return (
+      slots + (this.layout === "decimal" ? 40 * Math.max(groups, this.#capacity) + 2 * payload : 0)
+    );
   }
 
   get length(): number {

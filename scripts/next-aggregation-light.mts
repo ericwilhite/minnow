@@ -70,6 +70,8 @@ export async function lightComparison(
     readonly operatorOnly?: boolean;
     readonly paired?: boolean;
     readonly control?: AggregateOptions;
+    /** Optional raw operator from the pinned main control bundle. */
+    readonly controlConstructor?: typeof AggregateOperator;
     /** Component control: same transitions inside a prepaid fixed workspace. */
     readonly boundedWorkspace?: boolean;
     readonly nativeKernel?: (input: LightInput) => LightResult;
@@ -225,6 +227,7 @@ export async function lightComparison(
     options: AggregateOptions = {},
     domainCountSum = false,
     bounded = false,
+    Constructor: typeof AggregateOperator = AggregateOperator,
   ) => {
     const grant = await core.harness.governor.admit({
       label: "light/operator",
@@ -291,7 +294,7 @@ export async function lightComparison(
     };
     const aggregate = domainCountSum
       ? new DomainCountSumOperator(rel, context, owned, sort ?? sink, configuration)
-      : new AggregateOperator(rel, context, owned, sort ?? sink, configuration);
+      : new Constructor(rel, context, owned, sort ?? sink, configuration);
     try {
       if (aggregate instanceof DomainCountSumOperator) {
         let probeAt = 0;
@@ -329,7 +332,7 @@ export async function lightComparison(
       return {
         rows,
         peakBytes: peak,
-        layoutRows: aggregate instanceof AggregateOperator ? aggregate.typedLayoutRows : 0,
+        layoutRows: aggregate instanceof Constructor ? aggregate.typedLayoutRows : 0,
         directRows: aggregate instanceof DomainCountSumOperator ? aggregate.directRows : 0,
       };
     } finally {
@@ -341,14 +344,17 @@ export async function lightComparison(
     }
   };
   const expected = plain();
-  assert.deepEqual((await operator(measurement.control)).rows, expected.rows);
+  assert.deepEqual(
+    (await operator(measurement.control, false, false, measurement.controlConstructor)).rows,
+    expected.rows,
+  );
   if (pipeline) assert.equal((await pipeline()).rows, expected.rows.length);
   // Preserve every Sxx array in the consumed result so its updates cannot be dead work.
   if (expected.sxx) for (const q of expected.sxx) assert.ok(q.every(Number.isFinite));
   measurement.collect?.();
   for (let k = 0; k < warmups; k++) {
     plain();
-    await operator(measurement.control);
+    await operator(measurement.control, false, false, measurement.controlConstructor);
     if (pipeline) await pipeline();
     measurement.collect?.();
   }
@@ -404,7 +410,7 @@ export async function lightComparison(
     bound: plain,
     split,
     native,
-    operator: () => operator(measurement.control),
+    operator: () => operator(measurement.control, false, false, measurement.controlConstructor),
     candidate: candidate
       ? () => operator(candidate, measurement.domainCountSum, measurement.boundedWorkspace)
       : undefined,
@@ -529,6 +535,6 @@ export async function lightComparison(
     ),
     componentOnly: pipeline === undefined && feed === undefined,
     limits:
-      "Optimistic fixed-workload TS observation, not a mathematical lower bound or universal JS impossibility result. Raw bound/split read flat decoded bytes/numbers and hash every text row. Native wide consumes the original decoded dictionary segments, hashes/maps all entries and translates every row within timing, then uses packed five-AVG state. No precomputed canonical IDs/ranks. All use exact collision equality. Highcard native includes an exact full-input min/max probe and direct-address COUNT/SUM state with an exact general-hash fallback for a wide domain; highcard split and both other DISTINCT kernels alias bound (not independent algorithms). Operator keeps original scan dictionary forms and includes matching sort/top-N, copying and governor/driver/task clock. Whole is prepared pipeline/owned frames; outer harness separately measures SQL through cleanup. Feed is scan/project/discard only, not additive with the other sinks. Setup/flattening (including numeric widening to Float64) excluded; kernel allocation/state/final ordering included. Borrowed immutable inputs need no key copy; no memory governor/spill/cancellation in plain TS. AVG Sxx retained. Plain kernels are diagnostics; operator/candidate configurations are reported separately.",
+      "Optimistic fixed-workload TS observation, not a mathematical lower bound or universal JS impossibility result. Raw bound/split read flat decoded bytes/numbers and hash every text row. Native wide consumes the original decoded dictionary segments, hashes/maps all entries and translates every row within timing, then uses packed five-AVG state. No precomputed canonical IDs/ranks. All use exact collision equality. Highcard native includes an exact full-input min/max probe and direct-address COUNT/SUM state with an exact general-hash fallback for a wide domain; highcard split and both other DISTINCT kernels alias bound (not independent algorithms). Operator keeps original scan dictionary forms and includes matching sort/top-N, copying and governor/driver/task clock. Whole is prepared pipeline/owned frames; outer harness separately measures SQL through cleanup. Feed is scan/project/discard only, not additive with the other sinks. Setup/flattening (including numeric widening to Float64) excluded; kernel allocation/state/final ordering included. Borrowed immutable inputs need no key copy; no memory governor/spill/cancellation in plain TS. AVG Sxx retained. Plain kernels are diagnostics; operator/candidate configurations are reported separately. An optional pinned main constructor controls the raw operator; its keys/states are bundled from that revision, with shared owner contracts only.",
   };
 }

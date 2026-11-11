@@ -35,6 +35,10 @@ export class SortGrants {
       for (const share of this.#shares.values()) this.#releaseExtra(share.extra);
     });
   }
+  #reclaimFailure(error: unknown): void {
+    // Read after the callback: it can also abort its owner synchronously.
+    if (!this.holdFrees) throw error;
+  }
   #releaseExtra(extra: Grant): void {
     const free = extra.held - extra.allocated - extra.loaned;
     if (free > 0) extra.release(free);
@@ -56,6 +60,27 @@ export class SortGrants {
             if (this.holdFrees) share.deferred += bytes;
             else target.free(bytes);
           };
+        if (property === "onReclaimRequest")
+          return (callback: (bytes: number) => unknown) =>
+            target.onReclaimRequest((bytes) => {
+              // A nested sort belongs to this execution. Its cancellation may reject an
+              // in-flight spill, but must not cancel an unrelated governor FIFO head.
+              // Genuine spill failures while the owner is active still propagate.
+              if (this.holdFrees) return;
+              try {
+                const work = callback(bytes);
+                return work instanceof Promise
+                  ? work.then(
+                      () => undefined,
+                      (error: unknown) => {
+                        this.#reclaimFailure(error);
+                      },
+                    )
+                  : work;
+              } catch (error) {
+                this.#reclaimFailure(error);
+              }
+            });
         if (property === "close") return () => undefined;
         if (property === "release") return () => this.#releaseExtra(extra);
         if (property === "borrow")
@@ -80,6 +105,15 @@ export class SortGrants {
     });
     this.#shares.set(proxy, share);
     return proxy;
+  }
+  /** Only funded ordinary credit may back synchronous state. Production helper grants'
+   * held totals also include an unused private progress lane; that lane is available only
+   * through a bounded temporary borrow, never by restarting a larger hash workspace. */
+  stateCapacity(grant: Grant): number {
+    const share = present(this.#shares.get(grant));
+    const privateBytes =
+      share.extra instanceof ReservedGrant ? (share.extra.progress?.capacity ?? 0) : 0;
+    return Math.max(0, share.grant.held - privateBytes - share.extra.loaned);
   }
   /** Initial fixed/private credit only; later optional headroom never enlarges this bound. */
   stepCapacity(grant: Grant): number {

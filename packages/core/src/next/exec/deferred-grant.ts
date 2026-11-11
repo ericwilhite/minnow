@@ -14,9 +14,21 @@ export class DeferredGrant implements Grant {
       onClose();
       return;
     }
+    if (this.#target !== null) throw new TypeError("Result budget already installed");
     this.#target = target;
     this.#onClose = onClose;
     if (this.#reclaim) target.onReclaimRequest(this.#reclaim);
+  }
+  /** A phase may move idle credit only after all frames and dictionary registry bytes return.
+   * The caller owns the detached native parts until transfer/reinstallation or cancellation. */
+  detach(): Grant {
+    const target = this.#target;
+    if (this.#closed || target === null) throw new GrantClosedError(this.label);
+    if (target.allocated !== 0 || target.loaned !== 0)
+      throw new TypeError("Result frames must return before budget handoff");
+    this.#target = null;
+    this.#onClose = null;
+    return target;
   }
   get held(): number {
     return this.#target?.held ?? 0;
@@ -49,6 +61,7 @@ export class DeferredGrant implements Grant {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#reclaim = null;
     this.#target?.close();
     this.#onClose?.();
     this.#target = null;

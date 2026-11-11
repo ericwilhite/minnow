@@ -10,6 +10,7 @@
  * them; the room goes back (the loan repaid) once the step has allocated and its usage has left.
  * One step at a time, so at most one loan at a time.
  */
+import type { SpillPageRef } from "../spill/contract.js";
 import type { Grant, Loan } from "../memory/governor.js";
 import type { PhysicalType } from "../types.js";
 import type { ByteCharge } from "../vector/varlen.js";
@@ -74,6 +75,11 @@ export class Pool implements ByteCharge {
 
   get loaned(): boolean {
     return this.#loan !== null;
+  }
+
+  /** Live suballocations, including ordinary overflow outside the prepaid pool. */
+  get used(): number {
+    return this.#used + this.#overflow;
   }
 
   /** Bytes of the pool's own room not in use. */
@@ -234,8 +240,17 @@ export class SpillIo {
   async readPage(run: SpilledRun, index: number): Promise<{ bytes: Uint8Array; charged: number }> {
     this.#checkOpen();
     const ref = run.pages[index];
+    if (ref === undefined) throw new RangeError("No such spill page");
+    return this.readRef(run, ref);
+  }
+  /** Read a ref held by an on-disk tape directory, through the same charge/drain boundary. */
+  async readRef(
+    run: SpilledRun,
+    ref: SpillPageRef,
+  ): Promise<{ bytes: Uint8Array; charged: number }> {
+    this.#checkOpen();
     const file = run.file;
-    if (ref === undefined || file === null) throw new RangeError("No such spill page");
+    if (file === null) throw new RangeError("No such spill page");
     if (!this.pool.allocate(ref.length)) {
       await this.need(ref.length);
       this.#checkOpen();
@@ -298,7 +313,7 @@ export class SpillIo {
       queryId: this.context.queryId,
       run: header.run,
       partition: header.partition,
-      sequence: run.pages.length,
+      sequence: run.pageCount,
     };
     let page = this.pages.encode(pageHeader, columns, staging.rows);
     if (page === null) {
@@ -306,7 +321,8 @@ export class SpillIo {
       page = this.pages.encode(pageHeader, columns, staging.rows);
       if (page === null) throw new RangeError("A spill page could not be encoded");
     }
-    await this.files.append(run, page, staging.rows);
+    if (run.write) await run.write(page, staging.rows);
+    else await this.files.append(run, page, staging.rows);
     this.pages.shrinkIf(oversized || this.pool.owes);
     this.reset(staging);
   }

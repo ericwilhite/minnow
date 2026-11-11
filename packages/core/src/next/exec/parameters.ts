@@ -160,6 +160,8 @@ function prepaid(charge: ByteCharge, bytes: number): ByteCharge {
 }
 
 export interface ParameterBinding {
+  /** Owned input bytes, excluding a pressure restore's temporary I/O reservation. */
+  readonly logicalBytes?: number;
   readonly bytes: number;
   readonly largestSlot: number;
   bind(charge: ByteCharge, statementTime?: bigint): MaybePromise<BoundParameters>;

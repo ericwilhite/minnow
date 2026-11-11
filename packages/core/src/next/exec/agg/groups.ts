@@ -29,8 +29,8 @@
  *
  * ## Memory
  * Every typed array is charged to the grant before it is constructed (`Charged.make`; the charge
- * is returned if construction throws). The executor admits a complete certified hash workspace
- * before constructing this synchronous table, or selects bounded external aggregation instead.
+ * is returned if construction throws). The executor funds a complete certified workspace or
+ * the next hybrid batch before entering this synchronous table.
  * This low-level ByteCharge seam cannot wait or recover from a partially applied assignment;
  * a refusal indicates a bad workspace certificate or an isolated caller's undersized budget.
  * `keyBytes` bounds what `emitKey` will allocate, so the
@@ -51,8 +51,9 @@ import {
   type VectorData,
 } from "../../vector/vector.js";
 import { int64Words } from "../kernels/limbs.js";
-import { IDENTITY, flatOf } from "../kernels/vectors.js";
+import { IDENTITY, flatOf, isValidSlot, slotOf } from "../kernels/vectors.js";
 import { GroupValues } from "./values.js";
+import { arrayGrowth, payloadBytes } from "./growth.js";
 
 type Typed = Uint8Array | Uint16Array | Uint32Array | Int32Array | Float64Array;
 interface TypedConstructor<T extends Typed> {
@@ -191,6 +192,8 @@ const validityBytes = (count: number): number => 4 * ((count + 31) >>> 5);
 /** One key column → dense value ids. */
 interface KeyColumn {
   readonly count: number;
+  growthBytes(key: Vector, rows: number): number;
+  lookup(key: Vector, row: number, encode: (key: Vector, row: number) => Uint8Array): number;
   /** What an int32 key column did (diagnostics, tests): its modes and moves between them. */
   readonly history?: ReadonlySet<Int32KeyEvent>;
   /** ids[row] for every active row; `length` is the batch's. */
@@ -204,6 +207,10 @@ interface KeyColumn {
 
 /** Open-addressing slots: id + 1 (0 empty) and the stored hash, side by side. */
 class Slots {
+  growthBytes(groups: number): number {
+    return arrayGrowth(this.ids.length, 2 * groups, 8, true);
+  }
+
   ids: Int32Array;
   hashes: Int32Array;
   mask = 1023;
@@ -241,6 +248,10 @@ class Slots {
 
 /** Per-id hashes and the "outside the slot table" marks, grown together. */
 class IdColumns {
+  growthBytes(groups: number): number {
+    return arrayGrowth(this.hashes.length, groups, 5, true);
+  }
+
   hashes: Int32Array;
   outside: Uint8Array;
   constructor(readonly memory: Charged) {
@@ -256,6 +267,36 @@ class IdColumns {
 
 /** bool, float4, float8 keys: f64 open addressing, the key beside its slot. */
 class NumberKeys implements KeyColumn {
+  lookup(key: Vector, row: number): number {
+    if (!isValidSlot(key, row)) return this.#nullId;
+    const [flat, index] = slotOf(key, row),
+      data = flat.data;
+    if (data.layout !== "f64" && data.layout !== "f32" && data.layout !== "bool")
+      throw new TypeError("Numeric lookup");
+    const value = (data.values[index] ?? 0) + 0,
+      nan = value !== value,
+      h = hashNumber(nan ? NaN : value),
+      slots = this.#slots;
+    let slot = h & slots.mask;
+    for (;;) {
+      const id = (slots.ids[slot] ?? 0) - 1;
+      if (id < 0) return -1;
+      const old = this.#slotKeys[slot] ?? 0;
+      if (slots.hashes[slot] === h && (old === value || (nan && old !== old))) return id;
+      slot = (slot + 1) & slots.mask;
+    }
+  }
+
+  growthBytes(_key: Vector, rows: number): number {
+    const groups = this.count + rows;
+    return (
+      this.#slots.growthBytes(groups) +
+      this.#idColumns.growthBytes(groups) +
+      arrayGrowth(this.#keys.length, groups, 8) +
+      arrayGrowth(this.#slotKeys.length, 2 * groups, 8, true)
+    );
+  }
+
   readonly #memory: Charged;
   readonly #slots: Slots;
   readonly #idColumns: IdColumns;
@@ -404,6 +445,61 @@ const DIRECT_MIN_SPAN = 1 << 12;
  * Group ids are first-seen order either way, so the mode never changes the output.
  */
 class Int32Keys implements KeyColumn {
+  lookup(key: Vector, row: number): number {
+    if (!isValidSlot(key, row)) return this.#nullId;
+    const [flat, index] = slotOf(key, row),
+      data = flat.data;
+    if (data.layout !== "i32") throw new TypeError("Integer lookup");
+    const value = data.values[index] ?? 0;
+    if (this.#direct !== null) {
+      const at = value - this.#base;
+      return at < 0 || at >= this.#direct.length ? -1 : (this.#direct[at] ?? 0) - 1;
+    }
+    let slot = hashInt32(value) & this.#mask;
+    for (;;) {
+      const id = (this.#table[2 * slot + 1] ?? 0) - 1;
+      if (id < 0) return -1;
+      if (this.#table[2 * slot] === value) return id;
+      slot = (slot + 1) & this.#mask;
+    }
+  }
+
+  growthBytes(key: Vector, rows: number): number {
+    const groups = this.count + rows;
+    let slots = this.#direct === null ? this.#mask + 1 : 1024;
+    while (MAX_LOAD * slots < this.count + Math.max(BATCH_ROWS, rows)) slots *= 2;
+    // Mode selection can allocate a direct table even without new group ids.
+    const flat = flatOf(key),
+      data = flat.data;
+    if (data.layout !== "i32") throw new TypeError("Expected int32 keys");
+    let low = this.#min,
+      high = this.#max;
+    for (let i = 0; i < flat.length; i++) {
+      low = Math.min(low, data.values[i] ?? 0);
+      high = Math.max(high, data.values[i] ?? 0);
+    }
+    const span = high - low + 1;
+    const inside =
+      this.#direct !== null && low >= this.#base && high < this.#base + this.#direct.length;
+    const direct =
+      !inside && span > 0 && span <= DIRECT_MAX_SPAN && span <= Math.max(DIRECT_MIN_SPAN, 2 * slots)
+        ? 4 * (span + 2 * Math.min(span >>> 2, (DIRECT_MAX_SPAN - span) >>> 1))
+        : 0;
+    const hashed = inside
+      ? 0
+      : this.#direct !== null
+        ? 8 * slots
+        : arrayGrowth(this.#mask + 1, groups / MAX_LOAD + 1, 8);
+    return (
+      arrayGrowth(this.#keys.length, groups, 4) +
+      Math.max(
+        direct,
+        inside ? 0 : Math.min(4 * DIRECT_MAX_SPAN, 12 * Math.max(DIRECT_MIN_SPAN, slots)),
+      ) +
+      hashed
+    );
+  }
+
   readonly #memory: Charged;
   /** Slot s holds the key at 2s and id + 1 at 2s + 1 (0: empty). Empty while direct. */
   #table: Int32Array;
@@ -668,6 +764,38 @@ class Int32Keys implements KeyColumn {
  * in either representation is the same key. No BigInt, no Map: every key is in charged arrays.
  */
 class Int64Keys implements KeyColumn {
+  lookup(key: Vector, row: number): number {
+    if (!isValidSlot(key, row)) return this.#nullId;
+    const [flat, index] = slotOf(key, row),
+      data = flat.data;
+    if (data.layout !== "int64") throw new TypeError("Int64 lookup");
+    let low: number, high: number;
+    if (data.values.repr === "safe") {
+      const value = data.values.values[index] ?? 0;
+      low = value | 0;
+      high = Math.floor(value / TWO32) | 0;
+    } else {
+      const words = int64Words(data.values.values);
+      low = words[2 * index] ?? 0;
+      high = words[2 * index + 1] ?? 0;
+    }
+    let slot = hashWords(low, high) & this.#mask;
+    for (;;) {
+      const id = (this.#table[3 * slot + 2] ?? 0) - 1;
+      if (id < 0) return -1;
+      if (this.#table[3 * slot] === low && this.#table[3 * slot + 1] === high) return id;
+      slot = (slot + 1) & this.#mask;
+    }
+  }
+
+  growthBytes(_key: Vector, rows: number): number {
+    const groups = this.count + rows;
+    return (
+      arrayGrowth(this.#keys.length / 2, groups, 8) +
+      arrayGrowth(this.#mask + 1, groups / MAX_LOAD + 1, 12, true)
+    );
+  }
+
   readonly #memory: Charged;
   /** Slot s: low word at 3s, high word at 3s + 1, id + 1 at 3s + 2 (0: empty). */
   #table: Int32Array;
@@ -815,6 +943,13 @@ class Int64Keys implements KeyColumn {
 /** Bytes per id in one arena: id i is `bytes[starts[i] … starts[i + 1])`. */
 /** Variable-length key bytes by id (exported for its direct test). */
 export class ByteArena {
+  growthBytes(groups: number, bytes: number): number {
+    return (
+      arrayGrowth(this.starts.length, groups + 1, 4) +
+      (bytes > this.bytes.length ? arrayGrowth(this.bytes.length, Math.max(4096, bytes), 1) : 0)
+    );
+  }
+
   bytes: Uint8Array;
   starts: Int32Array;
   /** `bytes` as a DataView: keys copy and compare four bytes at a time, at any offset. */
@@ -890,6 +1025,37 @@ const EMPTY = new Uint8Array(0);
 const EMPTY_VIEW = new DataView(EMPTY.buffer);
 
 class ByteKeys implements KeyColumn {
+  lookup(key: Vector, row: number): number {
+    if (!isValidSlot(key, row)) return this.#nullId;
+    const [flat, index] = slotOf(key, row),
+      data = flat.data;
+    if (data.layout !== "varlen" && data.layout !== "fixed16") throw new TypeError("Byte lookup");
+    const from = data.layout === "fixed16" ? 16 * index : (data.offsets[index] ?? 0);
+    const to = data.layout === "fixed16" ? from + 16 : (data.offsets[index + 1] ?? 0);
+    const h = xxHash32(data.bytes, 0, from, to) | 0,
+      slots = this.#slots;
+    let slot = h & slots.mask;
+    for (;;) {
+      const id = (slots.ids[slot] ?? 0) - 1;
+      if (id < 0) return -1;
+      if (slots.hashes[slot] === h && this.#arena.equals(id, data.bytes, from, to)) return id;
+      slot = (slot + 1) & slots.mask;
+    }
+  }
+
+  growthBytes(key: Vector, rows: number): number {
+    const extra = key.form === "dictionary" ? Math.max(rows, key.dictionary.length + 1) : rows;
+    const groups = this.count + extra;
+    return (
+      this.#slots.growthBytes(groups) +
+      this.#idColumns.growthBytes(groups) +
+      this.#arena.growthBytes(groups, (this.#arena.starts[this.count] ?? 0) + payloadBytes(key)) +
+      (key.form === "dictionary"
+        ? arrayGrowth(this.#translation.length, key.dictionary.length, 4, true)
+        : 0)
+    );
+  }
+
   readonly #slots: Slots;
   readonly #arena: ByteArena;
   /** The last key bytes array seen, and a DataView over exactly its bytes (one per array). */
@@ -1085,6 +1251,33 @@ class ByteKeys implements KeyColumn {
 
 /** Decimal, interval, JSON, array keys: equality-key bytes, first values kept for output. */
 class EncodedKeys implements KeyColumn {
+  lookup(key: Vector, row: number, encode: (key: Vector, row: number) => Uint8Array): number {
+    const bytes = encode(key, row),
+      h = xxHash32(bytes) | 0,
+      slots = this.#slots;
+    let slot = h & slots.mask;
+    for (;;) {
+      const id = (slots.ids[slot] ?? 0) - 1;
+      if (id < 0) return -1;
+      if (slots.hashes[slot] === h && this.#arena.equals(id, bytes, 0, bytes.length)) return id;
+      slot = (slot + 1) & slots.mask;
+    }
+  }
+
+  growthBytes(key: Vector, rows: number): number {
+    const groups = this.count + rows,
+      payload = payloadBytes(key),
+      encoded = 64 * (payload + rows * 16);
+    return (
+      this.#slots.growthBytes(groups) +
+      this.#idColumns.growthBytes(groups) +
+      this.#arena.growthBytes(groups, (this.#arena.starts[this.count] ?? 0) + encoded) +
+      this.#values.growthBytes(groups, payload) +
+      arrayGrowth(this.#batch.writer.bytes.length, encoded, 1, true) +
+      arrayGrowth(this.#batch.offsets.length, rows + 1, 4, true)
+    );
+  }
+
   readonly #slots: Slots;
   readonly #arena: ByteArena;
   readonly #values: GroupValues;
@@ -1179,6 +1372,47 @@ const DIRECT_BITS = 16;
  *   into a per-batch vector (one tight loop per column), then each row probes.
  */
 class TupleKeys {
+  lookup(ids: readonly Int32Array[], row: number): number {
+    let h = 0x2545f491,
+      slot = 0,
+      shift = 0;
+    for (let c = 0; c < this.width; c++) {
+      const id = ids[c]?.[row] ?? -1;
+      if (id < 0) return -1;
+      h = Math.imul(h ^ id, 0x9e3779b1) + c;
+      slot |= id << shift;
+      shift += this.#bits[c] ?? 0;
+    }
+    if (this.#direct !== null) return (this.#direct[slot] ?? 0) - 1;
+    h = finalize(h);
+    const slots = this.#slots;
+    slot = h & slots.mask;
+    for (;;) {
+      const id = (slots.ids[slot] ?? 0) - 1;
+      if (id < 0) return -1;
+      if (slots.hashes[slot] === h) {
+        let same = true;
+        for (let c = 0; c < this.width; c++)
+          if (this.columnIds[c]?.[id] !== ids[c]?.[row]) {
+            same = false;
+            break;
+          }
+        if (same) return id;
+      }
+      slot = (slot + 1) & slots.mask;
+    }
+  }
+
+  growthBytes(rows: number): number {
+    const groups = this.count + rows;
+    return (
+      arrayGrowth(this.#hashes.length, groups, 4) +
+      this.columnIds.reduce((n, ids) => n + arrayGrowth(ids.length, groups, 4), 0) +
+      this.#slots.growthBytes(groups) +
+      (this.#direct === null ? 0 : 2 * (1 << DIRECT_BITS) * 4)
+    );
+  }
+
   readonly #slots: Slots;
   /** Per key column: the value id of each group. */
   readonly columnIds: Int32Array[];
@@ -1415,6 +1649,39 @@ class TupleKeys {
 }
 
 export class GroupTable {
+  /** Lookup never admits a value/tuple or grows a translation cache. Complex key
+   * scratch belongs to the caller's independently admitted bounded I/O lane. */
+  lookup(
+    keys: readonly Vector[],
+    row: number,
+    encode: (key: Vector, row: number) => Uint8Array,
+  ): number {
+    for (let c = 0; c < this.#columns.length; c++) {
+      const column = this.#columns[c],
+        key = keys[c];
+      if (!column || !key) throw new RangeError("Missing lookup key");
+      const id = column.lookup(key, row, encode);
+      if (this.#tuple === null) return id;
+      if (id < 0) return -1;
+      const ids = this.#ids[c];
+      if (!ids) throw new Error("Missing tuple scratch");
+      ids[row] = id;
+    }
+    return this.#tuple?.lookup(this.#ids, row) ?? -1;
+  }
+
+  /** Includes all new buffers and within-batch geometric resize overlap. */
+  growthBytes(keys: readonly Vector[], rows: number): number {
+    let bytes = 4096 + (this.#tuple?.growthBytes(rows) ?? 0);
+    for (let c = 0; c < this.#columns.length; c++) {
+      const column = this.#columns[c],
+        key = keys[c];
+      if (!column || !key) throw new RangeError("Missing growth key");
+      bytes += column.growthBytes(key, rows);
+    }
+    return bytes;
+  }
+
   readonly #memory: Charged;
   readonly #columns: KeyColumn[] = [];
   readonly #tuple: TupleKeys | null = null;

@@ -63,10 +63,14 @@ import { IDENTITY, flatOf } from "../kernels/vectors.js";
 import { Charged, grownCapacity } from "./groups.js";
 import { bigintBytes } from "../../memory/governor.js";
 import { GroupValues } from "./values.js";
+import { arrayGrowth, payloadBytes } from "./growth.js";
+import type { StateRow, StateReader } from "./state-row.js";
 
 export interface Accumulator {
   readonly type: PhysicalType;
   grow(groups: number): void;
+  /** New buffer/variable-state allocation peak before the next batch. */
+  growthBytes?(groups: number, vector: Vector | null, rows: number): number;
   update(
     vector: Vector | null,
     gids: Int32Array,
@@ -84,6 +88,9 @@ export interface Accumulator {
    */
   prepare?(from: number, count: number, expired: () => boolean): number;
   close(): void;
+  /** Exact fields only; restore targets a fresh slot before any continuation rows. */
+  save?(group: number, row: StateRow): void;
+  restore?(group: number, row: StateReader): void;
   /**
    * One state serving a SUM and an AVG of the same argument (aggregate.ts shares it): the sum
    * (`average` false) or the average, as a vector of `type`. Exact sums only (NUMERIC, integers);
@@ -209,6 +216,18 @@ function validityFrom(present: Uint8Array, from: number, count: number): Validit
 // COUNT(*), COUNT(x)
 
 class CountAccumulator implements Accumulator {
+  save(group: number, row: StateRow): void {
+    row.number(this.#counts[group] ?? 0);
+  }
+  restore(group: number, row: StateReader): void {
+    this.grow(group + 1);
+    this.#counts[group] = row.number();
+  }
+
+  growthBytes(groups: number): number {
+    return arrayGrowth(this.#counts.length, groups, 8);
+  }
+
   readonly #memory: Charged;
   #counts: Float64Array = new Float64Array(0);
   constructor(
@@ -328,6 +347,32 @@ const SLOT_BYTES = 8;
  * overflow, never per row; only inputs already past 128 bits add to it directly.
  */
 class ExactSums {
+  save(group: number, row: StateRow): void {
+    row.float64(this.sums, group);
+    row.number(this.has[group] ?? 0);
+    for (let i = 0; i < 4; i++) row.number(this.carry[4 * group + i] ?? 0);
+    row.integer(this.wide?.[group] ?? 0n);
+  }
+  restore(group: number, row: StateReader): void {
+    this.grow(group + 1);
+    row.float64(this.sums, group);
+    this.has[group] = row.number();
+    let carried = false;
+    for (let i = 0; i < 4; i++) {
+      const word = row.number();
+      this.carry[4 * group + i] = word;
+      if (word !== 0) carried = true;
+    }
+    if (carried) this.carried++;
+    this.bound = Math.max(this.bound, Math.abs(this.sums[group] ?? 0));
+    const wide = row.integer();
+    if (wide !== 0n) this.#setOffset(group, wide);
+  }
+
+  growthBytes(groups: number): number {
+    return arrayGrowth(this.sums.length, groups, this.wide === null ? 25 : 41);
+  }
+
   readonly #memory: Charged;
   sums: Float64Array = new Float64Array(0);
   carry: Uint32Array = new Uint32Array(0);
@@ -656,6 +701,20 @@ function addFlat32(
 }
 
 class IntegerSumAccumulator implements Accumulator {
+  save(group: number, row: StateRow): void {
+    this.#sums.save(group, row);
+    if (this.#counts) this.#counts.save(group, row);
+  }
+  restore(group: number, row: StateReader): void {
+    this.grow(group + 1);
+    this.#sums.restore(group, row);
+    if (this.#counts) this.#counts.restore(group, row);
+  }
+
+  growthBytes(groups: number): number {
+    return this.#sums.growthBytes(groups) + (this.#counts?.growthBytes(groups) ?? 0);
+  }
+
   readonly #sums: ExactSums;
   readonly #counts: CountAccumulator | null;
   constructor(
@@ -1120,6 +1179,29 @@ export function updateGroupedPair(
 }
 
 class FloatSumAccumulator implements Accumulator {
+  save(group: number, row: StateRow): void {
+    row.float64(this.#sums, group);
+    row.number(this.average ? (this.#counts[group] ?? 0) : (this.#has[group] ?? 0));
+    if (this.average) row.float64(this.#squares, group);
+    else row.number(0);
+  }
+  restore(group: number, row: StateReader): void {
+    this.grow(group + 1);
+    row.float64(this.#sums, group);
+    const count = row.number();
+    if (this.average) {
+      this.#counts[group] = count;
+      row.float64(this.#squares, group);
+    } else {
+      this.#has[group] = count;
+      row.number();
+    }
+  }
+
+  growthBytes(groups: number): number {
+    return arrayGrowth(this.#sums.length, groups, this.average ? 24 : 9);
+  }
+
   readonly #memory: Charged;
   #sums: Float64Array = new Float64Array(0);
   /** AVG: the count per group. SUM keeps only `#has` (1 byte a group: it stays in cache). */
@@ -1408,6 +1490,35 @@ const SCALE_NONE = -2;
 const SCALE_MIXED = -1;
 
 class DecimalSumAccumulator implements Accumulator {
+  save(group: number, row: StateRow): void {
+    this.#sums.save(group, row);
+    // Uniform batches keep scale in the shared fast-path field; the per-group array
+    // is dormant until mixed scales arrive. Save the effective transition scale.
+    row.number(this.#scale >= 0 ? this.#scale : (this.#scales[group] ?? 0));
+    row.number(this.#flags[group] ?? 0);
+    row.number(this.#counts[group] ?? 0);
+  }
+  restore(group: number, row: StateReader): void {
+    this.grow(group + 1);
+    this.#sums.restore(group, row);
+    this.#scales[group] = row.number();
+    this.#flags[group] = row.number();
+    this.#counts[group] = row.number();
+    this.#scale = SCALE_MIXED;
+  }
+
+  growthBytes(groups: number): number {
+    // PG's maximum coefficient plus count bits fits 62KiB. A pending scale alignment
+    // can first promote each group to the wide tier; include its fields and coefficient.
+    // The fixed scratch is precharged separately before arithmetic/size inspection.
+    return (
+      this.#sums.growthBytes(groups) +
+      arrayGrowth(this.#flags.length, groups, 11) +
+      16 * Math.max(groups, this.#sums.sums.length) +
+      64 * 1024 * groups
+    );
+  }
+
   readonly #memory: Charged;
   readonly #sums: ExactSums;
   #scales: Uint16Array = new Uint16Array(0);
@@ -1956,6 +2067,31 @@ interface Ranking {
  * ranks are equal bytes, so a tie stores nothing new.
  */
 class MinMaxAccumulator implements Accumulator {
+  save(group: number, row: StateRow): void {
+    row.number(this.#has[group] ?? 0);
+    row.number(this.#numeric[group] ?? NaN);
+    row.value(this.#values.outputBytes(null, group, 1), () => this.#values.emit(group, 1));
+  }
+  restore(group: number, row: StateReader): void {
+    this.grow(group + 1);
+    this.#has[group] = row.number();
+    const numeric = row.number();
+    if (this.#numeric.length > group) this.#numeric[group] = numeric;
+    this.#values.set(group, row.value(), row.row);
+    if (this.#positionEpoch.length > group) this.#positionEpoch[group] = 0;
+  }
+
+  growthBytes(groups: number, vector: Vector | null): number {
+    const payload = vector === null ? 0 : payloadBytes(vector);
+    const dictionary = vector?.form === "dictionary" ? vector.dictionary.length : 0;
+    return (
+      arrayGrowth(this.#has.length, groups, this.#bytes ? 13 : 9) +
+      this.#values.growthBytes(groups, payload) +
+      32 * dictionary +
+      8 * BATCH_ROWS
+    );
+  }
+
   readonly #values: GroupValues;
   readonly #memory: Charged;
   #has: Uint8Array = new Uint8Array(0);
@@ -2353,6 +2489,20 @@ function minDense(
  * (exact for all three), no GroupValues indirection. Ties take the new value (−0 after 0).
  */
 class NumberMinMaxAccumulator implements Accumulator {
+  save(group: number, row: StateRow): void {
+    row.float64(this.#best, group);
+    row.number(this.#has[group] ?? 0);
+  }
+  restore(group: number, row: StateReader): void {
+    this.grow(group + 1);
+    row.float64(this.#best, group);
+    this.#has[group] = row.number();
+  }
+
+  growthBytes(groups: number): number {
+    return arrayGrowth(this.#best.length, groups, 9);
+  }
+
   readonly #memory: Charged;
   #best: Float64Array = new Float64Array(0);
   #has: Uint8Array = new Uint8Array(0);
@@ -2492,6 +2642,18 @@ const NULL_VALUES = {
 // BOOL_AND / BOOL_OR, single value
 
 class BoolAccumulator implements Accumulator {
+  save(group: number, row: StateRow): void {
+    row.number(this.#state[group] ?? 0);
+  }
+  restore(group: number, row: StateReader): void {
+    this.grow(group + 1);
+    this.#state[group] = row.number();
+  }
+
+  growthBytes(groups: number): number {
+    return arrayGrowth(this.#state.length, groups, 1);
+  }
+
   readonly #memory: Charged;
   /** 0 no value, 1 false, 2 true. */
   #state: Uint8Array = new Uint8Array(0);
@@ -2553,6 +2715,23 @@ class BoolAccumulator implements Accumulator {
 
 /** The front end's MINNOW_SINGLE_VALUE: a scalar subquery's one value, 21000 on a second row. */
 class SingleValueAccumulator implements Accumulator {
+  save(group: number, row: StateRow): void {
+    row.number(this.#seen[group] ?? 0);
+    row.value(this.#values.outputBytes(null, group, 1), () => this.#values.emit(group, 1));
+  }
+  restore(group: number, row: StateReader): void {
+    this.grow(group + 1);
+    this.#seen[group] = row.number();
+    this.#values.set(group, row.value(), row.row);
+  }
+
+  growthBytes(groups: number, vector: Vector | null): number {
+    return (
+      arrayGrowth(this.#seen.length, groups, 1) +
+      this.#values.growthBytes(groups, vector === null ? 0 : payloadBytes(vector))
+    );
+  }
+
   readonly #values: GroupValues;
   readonly #memory: Charged;
   #seen: Uint8Array = new Uint8Array(0);

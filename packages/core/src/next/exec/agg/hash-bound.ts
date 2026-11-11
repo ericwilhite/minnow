@@ -1,5 +1,5 @@
-/** Complete hash workspace certificates. Unknown domains use external aggregation;
- * neither sketches nor a prefix of the input can authorize a fixed hash workspace.
+/** Complete hash workspace certificates. Unknown domains return no certificate;
+ * the caller funds hybrid hash growth instead. Sketches and input prefixes never authorize a fixed workspace.
  */
 import type { Rel } from "../../ir/ir.js";
 import { layoutOf, type PhysicalType } from "../../types.js";

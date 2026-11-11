@@ -1,6 +1,7 @@
-/** COUNT(DISTINCT) ignores NULL and uses SQL equality. The memory-progress contract selects
- * external aggregation without a complete hash-domain proof. Hash-storage controls must not
- * change that fallback's working minimum; raw kernel suites retain their memory-saving checks.
+/** PostgreSQL nodeAgg.c "Spilling To Disk": ordinary groups start hash; pressure spills
+ * new groups. COUNT(DISTINCT) membership is exact. A genuinely ordered DISTINCT
+ * transition still uses external sorting. Hash storage controls preserve SQL results.
+ * Raw kernel suites separately prove the scalar byte set's memory-saving properties.
  */
 import fc from "fast-check";
 import { PGlite } from "@electric-sql/pglite";
@@ -8,6 +9,8 @@ import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach } from "../../testing/reach.js";
 import { currentEngine } from "../../testing/differential-current.js";
+import { HybridAggregateOperator } from "../exec/agg/hybrid.js";
+import { ScalarByteDistinct } from "../exec/agg/scalar-byte-distinct.js";
 import { ExternalAggregateOperator } from "../exec/agg/external.js";
 import { createExecutor } from "../exec/create.js";
 import { StorageCore } from "./storage-core.js";
@@ -32,9 +35,14 @@ it.each(seedsFor("next-executor-scalar-distinct", [0xe355, 0xe356]))(
       "uuid",
       "generic",
       "control",
-      "bounded external",
+      "resident hybrid hash",
+      "ordered distinct external",
+      "specialized membership",
+      "generic membership control",
     ]);
     const external = vi.spyOn(ExternalAggregateOperator.prototype, "finish");
+    const hybrid = vi.spyOn(HybridAggregateOperator.prototype, "finish");
+    const membership = vi.spyOn(ScalarByteDistinct.prototype, "filter");
     await pg.waitReady;
     try {
       const rows = Array.from({ length: 5121 }, (_, i) => ({
@@ -177,10 +185,27 @@ it.each(seedsFor("next-executor-scalar-distinct", [0xe355, 0xe356]))(
               old = await current.run({ kind: "sql", sql });
             expect(old.kind).toBe("rows");
             expect(old.rows).toEqual(expected);
-            const externalBefore = external.mock.calls.length;
+            const externalBefore = external.mock.calls.length,
+              hybridBefore = hybrid.mock.calls.length,
+              memberBefore = membership.mock.calls.length;
             const result = await core.execute(nextSql);
             if (!("batches" in result)) throw new Error("SELECT");
-            expect(external.mock.calls.length).toBeGreaterThan(externalBefore);
+            if (generic) {
+              expect(external.mock.calls.length).toBeGreaterThan(externalBefore);
+              reach.reach("ordered distinct external");
+            } else {
+              expect(hybrid.mock.calls.length).toBeGreaterThan(hybridBefore);
+              expect(external.mock.calls.length).toBe(externalBefore);
+              expect(
+                core.lastProfile?.operators.find((op) => op.op === "aggregate")?.spilledBytes,
+              ).toBe(0);
+              reach.reach("resident hybrid hash");
+              if (state !== 3) {
+                expect(membership.mock.calls.length).toBeGreaterThan(memberBefore);
+                reach.reach("specialized membership");
+              }
+            }
+            const memberAfter = membership.mock.calls.length;
             expect(oracleRows(result)).toEqual(expected);
             const candidate = core.lastProfile?.operators.find(
               (o) => o.op === "aggregate",
@@ -198,11 +223,18 @@ it.each(seedsFor("next-executor-scalar-distinct", [0xe355, 0xe356]))(
               if (state !== 3) {
                 expect(candidate).toBeDefined();
                 expect(before).toBeDefined();
-                expect(
-                  candidate ?? Infinity,
-                  "uncertified DISTINCT uses the same bounded external minimum under either hash-kernel control",
-                ).toBe(before);
-                reach.reach("bounded external");
+                if (generic) {
+                  // Ordered transitions do not instantiate either hash membership strategy.
+                  expect(candidate).toBe(before);
+                } else {
+                  // The required hash route can have different funded state sizes. It
+                  // must use the selected implementation and stay resident at this cap.
+                  expect(membership.mock.calls.length).toBe(memberAfter);
+                  expect(
+                    core.lastProfile?.operators.find((op) => op.op === "aggregate")?.spilledBytes,
+                  ).toBe(0);
+                  reach.reach("generic membership control");
+                }
                 reach.reach("null");
                 reach.reach("collision");
               }
@@ -230,6 +262,8 @@ it.each(seedsFor("next-executor-scalar-distinct", [0xe355, 0xe356]))(
       reach.assertReached();
     } finally {
       external.mockRestore();
+      hybrid.mockRestore();
+      membership.mockRestore();
       await current.close();
       await pg.close();
       await core.close();

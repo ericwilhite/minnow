@@ -1,12 +1,15 @@
-/** End-to-end SQL COUNT(DISTINCT) with independent oracles and bounded external storage.
- * Raw distinct-bitmap.test.ts retains the bitmap/pair memory-saving checks. */
+/** End-to-end exact hash COUNT(DISTINCT), including selected bitmap and pair controls.
+ * Law: PG nodeAgg.c "Spilling To Disk" and the lead's hybrid-hash ruling. Raw
+ * distinct-bitmap.test.ts separately proves the bitmap/pair memory-saving relationship.
+ */
 import fc from "fast-check";
 import { PGlite } from "@electric-sql/pglite";
 import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach } from "../../testing/reach.js";
 import { currentEngine } from "../../testing/differential-current.js";
-import { ExternalAggregateOperator } from "../exec/agg/external.js";
+import { HybridAggregateOperator } from "../exec/agg/hybrid.js";
+import { DistinctSet } from "../exec/agg/distinct.js";
 import { createExecutor } from "../exec/create.js";
 import { StorageCore } from "./storage-core.js";
 import { oracleRows } from "./differential-adapter.js";
@@ -25,9 +28,22 @@ it.each(seedsFor("next-executor-distinct-bitmap", [0xe245, 0xe246]))(
       "filter",
       "numeric",
       "pair-control",
-      "bounded external",
+      "resident hybrid hash",
+      "bitmap selected",
+      "pairs selected",
     ]);
-    const external = vi.spyOn(ExternalAggregateOperator.prototype, "finish");
+    const hybrid = vi.spyOn(HybridAggregateOperator.prototype, "finish"),
+      modes: number[] = [];
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- Invoked with .apply(this).
+    const filter = DistinctSet.prototype.filter;
+    const membership = vi.spyOn(DistinctSet.prototype, "filter").mockImplementation(function (
+      this: DistinctSet,
+      ...args
+    ) {
+      const result = filter.apply(this, args);
+      modes.push(this.checkpointMode);
+      return result;
+    });
     await pg.waitReady;
     try {
       for (const name of ["s", "m", "x", "e"]) {
@@ -70,10 +86,20 @@ it.each(seedsFor("next-executor-distinct-bitmap", [0xe245, 0xe246]))(
             const old = await current.run({ kind: "sql", sql });
             expect(old.kind).toBe("rows");
             expect(old.rows).toEqual(expected);
-            const externalBefore = external.mock.calls.length;
+            const hybridBefore = hybrid.mock.calls.length,
+              modeBefore = modes.length;
             const result = await core.execute(sql);
             if (!("batches" in result)) throw new Error("SELECT");
-            expect(external.mock.calls.length).toBeGreaterThan(externalBefore);
+            expect(hybrid.mock.calls.length).toBeGreaterThan(hybridBefore);
+            expect(
+              core.lastProfile?.operators.find((op) => op.op === "aggregate")?.spilledBytes,
+            ).toBe(0);
+            if (state !== 3) {
+              expect(modes.slice(modeBefore)).toContain(1);
+              reach.reach("bitmap selected");
+            }
+            const modeAfter = modes.length;
+            reach.reach("resident hybrid hash");
             expect(oracleRows(result)).toEqual(expected);
             const candidate = core.lastProfile?.operators.find(
               (o) => o.op === "aggregate",
@@ -91,11 +117,14 @@ it.each(seedsFor("next-executor-distinct-bitmap", [0xe245, 0xe246]))(
               if (state < 2) {
                 expect(candidate).toBeDefined();
                 expect(before).toBeDefined();
+                // Hash strategies legitimately reserve different state. Both stay
+                // resident here; the control must actually select pair membership.
+                expect(modes.length).toBeGreaterThan(modeAfter);
+                expect(modes.slice(modeAfter).every((mode) => mode === 0)).toBe(true);
                 expect(
-                  candidate ?? Infinity,
-                  "uncertified DISTINCT uses the same bounded external minimum under either hash-kernel control",
-                ).toBe(before);
-                reach.reach("bounded external");
+                  core.lastProfile?.operators.find((op) => op.op === "aggregate")?.spilledBytes,
+                ).toBe(0);
+                reach.reach("pairs selected");
               }
             } finally {
               core.executor.prepare = saved;
@@ -119,7 +148,8 @@ it.each(seedsFor("next-executor-distinct-bitmap", [0xe245, 0xe246]))(
       );
       reach.assertReached();
     } finally {
-      external.mockRestore();
+      hybrid.mockRestore();
+      membership.mockRestore();
       await current.close();
       await pg.close();
       await core.close();

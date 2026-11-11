@@ -10,6 +10,7 @@ export function admitWorkingSet(
   options: NativeGrantGroupOptions,
 ): readonly Grant[] | Promise<readonly Grant[]> {
   options.signal?.throwIfAborted();
+  if (options.idleCredit !== undefined) return governor.admitGroup(options);
   const parts = options.grants.map((part) => ({ ...part }));
   const total = parts.reduce((sum, part) => sum + part.minimumBytes, 0);
   const copied = { ...options, grants: parts };

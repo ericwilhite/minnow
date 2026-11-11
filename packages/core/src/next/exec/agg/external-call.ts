@@ -1,6 +1,8 @@
 /** One external group's transition state. DISTINCT follows PostgreSQL's ordered
  * value transitions, including floating SUM/AVG; the input ordinal breaks equal-value ties.
  */
+import type { CheckpointCall } from "./aggregate.js";
+import type { StateReader } from "./state-row.js";
 import type { AggregateCall } from "../../ir/ir.js";
 import type { Grant } from "../../memory/governor.js";
 import type { PhysicalType } from "../../types.js";
@@ -9,7 +11,7 @@ import { BATCH_ROWS, type Batch, type Selection, type Vector } from "../../vecto
 import { ColumnStore } from "../column-store.js";
 import { Predicate } from "../filter.js";
 import { compileExpr, type CompileContext } from "../kernels/compile.js";
-import { isValidSlot, slotOf, type Compiled } from "../kernels/vectors.js";
+import { isValidSlot, slotOf, IDENTITY, type Compiled } from "../kernels/vectors.js";
 import type { Operator } from "../pipeline.js";
 import { keysEqual, type SortColumn } from "../sort-keys.js";
 import { SortOperator, sortMinimumBytes, type SortContext } from "../sort.js";
@@ -82,6 +84,9 @@ export class ExternalCall {
   readonly #types: readonly PhysicalType[];
   readonly #valueGrant: Grant | null;
   #values: SortOperator | null = null;
+  readonly #ordinalGrant: Grant | null;
+  readonly #prefixOrdinal: Vector | null;
+  #ordinals: SortOperator | null = null;
   #accumulator: Accumulator;
   #used = 0;
   #largest = 0;
@@ -95,6 +100,7 @@ export class ExternalCall {
     readonly call: AggregateCall,
     readonly host: ExternalCallHost,
     slot: number,
+    readonly prefix?: CheckpointCall,
   ) {
     const compiled = externalCallArguments(call, host.context);
     this.#argument = compiled.argument;
@@ -135,10 +141,38 @@ export class ExternalCall {
         : null;
     this.#valueGrant =
       this.#previous === null ? null : host.grants.fork(sortMinimumBytes(this.#types), slot + 1);
+    this.#ordinalGrant =
+      prefix && this.#previous !== null
+        ? host.grants.fork(sortMinimumBytes(this.#types), slot + 2)
+        : null;
+    this.#prefixOrdinal =
+      prefix && this.#previous !== null
+        ? (() => {
+            if (call.fn !== "count") throw new Error("Prefix DISTINCT restoration requires COUNT");
+            if (!this.#charge.allocate(520)) throw new Error("Prefix ordinal was not admitted");
+            return {
+              form: "constant" as const,
+              type: ORDINAL,
+              length: BATCH_ROWS,
+              value: {
+                form: "flat" as const,
+                type: ORDINAL,
+                length: 1,
+                validity: null,
+                data: { layout: "f64" as const, values: Float64Array.of(-1) },
+              },
+            };
+          })()
+        : null;
     this.#restartSorts();
   }
   #newAccumulator(): Accumulator {
-    const a = accumulatorFor(this.call.fn, this.call.type, this.#valueType, this.#charge);
+    const a = accumulatorFor(
+      this.prefix?.stateFn ?? this.call.fn,
+      this.prefix?.stateType ?? this.call.type,
+      this.#valueType,
+      this.#charge,
+    );
     a.grow(1);
     return a;
   }
@@ -163,6 +197,41 @@ export class ExternalCall {
       abort: () => undefined,
     };
     this.#values = this.#makeSort(this.#valueGrant, [asc(0), asc(1)], valuesSink);
+    if (this.#ordinalGrant !== null) {
+      this.#ordinals = this.#makeSort(this.#ordinalGrant, [asc(1)], {
+        push: (batch) => {
+          const value = batch.columns[0];
+          if (!value) throw new Error("Missing restored DISTINCT candidate");
+          this.#accumulator.update(
+            value,
+            ZERO_GROUPS,
+            batch.selection?.rows ?? IDENTITY,
+            batch.selection?.count ?? batch.length,
+            true,
+          );
+          return "ready";
+        },
+        ready: () => Promise.resolve(),
+        finish: () => undefined,
+        abort: () => undefined,
+      });
+    }
+  }
+  async restoreState(reader: StateReader, bytes: number): Promise<void> {
+    if (!this.prefix || !this.#accumulator.restore) throw new Error("Missing exact prefix restore");
+    this.#largest = Math.max(this.#largest, bytes);
+    await this.#room(Math.max(externalCallMinimum(this.call), 32768 + 4 * bytes));
+    this.#pool.withStep(() => this.#accumulator.restore?.(0, reader));
+    if (this.prefix.mode) reader.number();
+  }
+  async restoreMember(value: Vector): Promise<void> {
+    if (!this.#values || !this.#prefixOrdinal) throw new Error("Missing prefix membership sort");
+    if (
+      isValidSlot(value, 0) &&
+      this.#values.push({ length: 1, columns: [value, this.#prefixOrdinal], selection: null }) ===
+        "blocked"
+    )
+      await this.#values.ready();
   }
   async #room(peak: number): Promise<void> {
     this.host.check();
@@ -248,9 +317,26 @@ export class ExternalCall {
       await this.#room(Math.max(externalCallMinimum(this.call), 32768 + 4 * size));
       if (this.#pool.withStep(() => previous.append([value], null, row, 1)) !== 1)
         throw new Error("External DISTINCT capture exceeded its admitted step");
+      if (this.prefix) {
+        const ordinal = batch.columns[1];
+        if (!ordinal) throw new Error("Missing prefix member ordinal");
+        const [flat, at] = slotOf(ordinal, row);
+        if (flat.data.layout !== "f64") throw new Error("Invalid prefix member ordinal");
+        if ((flat.data.values[at] ?? -1) < 0) continue;
+      }
       this.#rows[kept++] = row;
     }
-    this.#pool.withStep(() => this.#accumulator.update(value, ZERO_GROUPS, this.#rows, kept, true));
+    if (this.#ordinals) {
+      if (
+        kept &&
+        this.#ordinals.push({ ...batch, selection: { rows: this.#rows, count: kept } }) ===
+          "blocked"
+      )
+        await this.#ordinals.ready();
+    } else
+      this.#pool.withStep(() =>
+        this.#accumulator.update(value, ZERO_GROUPS, this.#rows, kept, true),
+      );
   }
 
   async emit(): Promise<Vector> {
@@ -259,6 +345,12 @@ export class ExternalCall {
       await this.#values.finish();
       await this.#values.closed;
       if (this.#valueGrant !== null) this.host.grants.reset(this.#valueGrant);
+      if (this.#ordinals) {
+        await this.#ordinals.finish();
+        await this.#ordinals.closed;
+        if (this.#ordinalGrant) this.host.grants.reset(this.#ordinalGrant);
+        this.#ordinals = null;
+      }
       this.#previous?.reset(true);
       this.#pool.settle();
       this.#sorts.clear();
@@ -269,7 +361,11 @@ export class ExternalCall {
     if (!this.#charge.allocate(bytes))
       throw new Error("External aggregate output was not admitted");
     this.#emitted = bytes;
-    this.#output = this.#pool.withStep(() => this.#accumulator.emit(0, 1));
+    this.#output = this.#pool.withStep(() =>
+      this.prefix && this.prefix.reads !== "own" && this.#accumulator.emitAs
+        ? this.#accumulator.emitAs(this.prefix.reads === "average", this.call.type, 0, 1)
+        : this.#accumulator.emit(0, 1),
+    );
     return this.#output;
   }
   restart(): void {
@@ -296,9 +392,11 @@ export class ExternalCall {
       this.#previous?.close();
       this.#sorts.clear();
       this.#values = null;
+      this.#ordinals = null;
       this.#pending = null;
       this.#charge.free(2 * BATCH_ROWS);
       this.#charge.free(this.#scratch);
+      if (this.#prefixOrdinal) this.#charge.free(520);
       this.#pool.close();
       const errors = results
         .filter((r): r is PromiseRejectedResult => r.status === "rejected")
