@@ -1,4 +1,4 @@
-/** Frame contract: one owned backing allocation per proven binding, shared only within a frame. */
+/** Frame contract: one owned backing allocation per logical column; aliases are independently mutable. */
 import fc from "fast-check";
 import { afterAll, expect, it } from "vitest";
 import { createReach, RESULT_ALIAS_FRAME_REACH } from "../../testing/reach.js";
@@ -20,11 +20,12 @@ import { vectorOf } from "./join-fixtures.js";
 import { ResultChannel, frameByteLength, type WireVector } from "./result.js";
 import { ResultSink } from "./result-sink.js";
 import { validAt } from "./kernels/vectors.js";
+import { ownedResultColumns } from "./result-owned.js";
 
 const reach = createReach("aliased result frames", RESULT_ALIAS_FRAME_REACH);
 afterAll(() => reach.assertReached());
 for (const seed of seedsFor("next-result-alias-frames", [0xb4f1, 0xb4f2]))
-  it(`owns one exact physical copy through transfer, selection and cancellation (${String(seed)})`, async () => {
+  it(`owns independent logical copies through transfer, selection and cancellation (${String(seed)})`, async () => {
     await fc.assert(
       fc.asyncProperty(
         fc.record({
@@ -114,7 +115,6 @@ for (const seed of seedsFor("next-result-alias-frames", [0xb4f1, 0xb4f2]))
               { windowBytes: 1 },
             );
             const sink = new ResultSink(types, grant, channel, 17, { now: () => 0 });
-            sink.copyLayout({ sources: [0, 1], restore, types: physical.map((v) => v.type) });
             let released = 0;
             const producer = (async () => {
               if (
@@ -142,7 +142,7 @@ for (const seed of seedsFor("next-result-alias-frames", [0xb4f1, 0xb4f2]))
                 const a = columns[0],
                   b = columns[1];
                 if (!a || !b) throw Error("missing frame columns");
-                expect(frame.byteLength).toBe(
+                expect(frame.byteLength).toBeGreaterThan(
                   frameByteLength({ ...frame.payload, columns: [a, b] }),
                 );
                 expect(frame.byteLength).toBeLessThanOrEqual(grant.allocated);
@@ -152,7 +152,7 @@ for (const seed of seedsFor("next-result-alias-frames", [0xb4f1, 0xb4f2]))
                   expect(sourceBuffers.has(buffer)).toBe(false);
                   buffers.add(buffer);
                 }
-                reach.reach("one backing allocation");
+                reach.reach("independent backing allocations");
                 const received = structuredClone(frame.payload, { transfer: [...frame.transfer] });
                 for (const delta of received.dictionaries) {
                   const entries = dictionaries.get(delta.id) ?? [];
@@ -176,6 +176,16 @@ for (const seed of seedsFor("next-result-alias-frames", [0xb4f1, 0xb4f2]))
                   actual.push(
                     received.columns.map((column, c) => cell(column, types[c] ?? I32, row)),
                   );
+                const otherAliases = structuredClone(received.columns.slice(1));
+                const corrupt = (value: unknown): void => {
+                  if (ArrayBuffer.isView(value)) new Uint8Array(value.buffer).fill(0xa5);
+                  else if (Array.isArray(value) && typeof value[0] === "bigint") value[0] = -999n;
+                  else if (value !== null && typeof value === "object")
+                    for (const child of Object.values(value)) corrupt(child);
+                };
+                corrupt(received.columns[0]);
+                expect(received.columns.slice(1)).toEqual(otherAliases);
+                reach.reach("consumer aliases isolated");
                 if (cancel) {
                   sink.discard(reason);
                   expect(grant.allocated).toBe(0);
@@ -222,3 +232,57 @@ for (const seed of seedsFor("next-result-alias-frames", [0xb4f1, 0xb4f2]))
       },
     );
   }, 60000);
+
+for (const seed of seedsFor("next-owned-result-aliases", [0xb4fd, 0xb4fe]))
+  it(`adopts a dedicated allocation at most once (${String(seed)})`, async () => {
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 1, max: 17 }),
+        fc.integer({ min: 2, max: 6 }),
+        async (rows, copies) => {
+          reach.beginHistory();
+          const governor = new Governor(8 << 20);
+          const grant = await governor.admit({
+            label: "dedicated alias source",
+            minimumBytes: 65536,
+            spillable: false,
+          });
+          const bytes = 4 * rows + 4 * Math.ceil(rows / 32);
+          try {
+            expect(grant.allocate(bytes)).toBe(true);
+            const values = Int32Array.from({ length: rows }, (_, i) => i),
+              validity = new Uint32Array(Math.ceil(rows / 32));
+            const vector: Vector = {
+              form: "flat",
+              type: I32,
+              length: rows,
+              validity,
+              data: { layout: "i32", values },
+            };
+            const result = ownedResultColumns(
+              {
+                length: rows,
+                selection: null,
+                columns: Array.from({ length: copies }, () => vector),
+              },
+              Array.from({ length: copies }, () => null),
+              {
+                release: () => undefined,
+                detachableBudget: grant,
+                detachableBuffers: new Set([values.buffer, validity.buffer]),
+              },
+              grant,
+            );
+            expect(result?.[0]).not.toBeNull();
+            expect(result?.slice(1)).toEqual(Array.from({ length: copies - 1 }, () => null));
+            reach.reach("dedicated aliases copy");
+          } finally {
+            grant.free(grant.allocated);
+            grant.close();
+            expect(governor.usedBytes).toBe(0);
+          }
+        },
+      ),
+      { seed, numRuns: 8 },
+    );
+  });

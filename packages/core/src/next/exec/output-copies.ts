@@ -1,5 +1,5 @@
-/** Copy each proven immutable column binding once; restore every logical output
- * position in its frame. Computed values and new producer rows stay distinct.
+/** Identify repeated immutable bindings for result-copy admission. Each logical output
+ * still owns independent mutable buffers. Computed values and new producer rows stay distinct.
  */
 import type { Rel } from "../ir/ir.js";
 import { samePhysicalType, type PhysicalType } from "../types.js";
@@ -8,9 +8,19 @@ export interface ResultCopyLayout {
   readonly sources: readonly number[];
   readonly restore: readonly number[];
   readonly types: readonly PhysicalType[];
+  /** Every repeated variable binding is an unchanged value from a table scan. */
+  readonly sourceBacked: boolean;
+  readonly variableCopies: number;
 }
 export function outputCopyLayout(root: Rel): ResultCopyLayout | null {
+  const sourceBindings = new Set<symbol>();
   const origins = (rel: Rel): symbol[] => {
+    if (rel.op === "scan")
+      return rel.output.map(() => {
+        const binding = Symbol();
+        sourceBindings.add(binding);
+        return binding;
+      });
     if (rel.op === "project") {
       const input = origins(rel.input);
       return rel.exprs.map((expr) => {
@@ -45,9 +55,25 @@ export function outputCopyLayout(root: Rel): ResultCopyLayout | null {
     }
   }
   if (sources.length === root.output.length) return null;
+  const counts = new Uint32Array(sources.length);
+  for (const slot of restore) counts[slot] = (counts[slot] ?? 0) + 1;
+  const variable = (physical: number): boolean =>
+    ["text", "bytes", "decimal", "array", "json", "enum"].includes(
+      root.output[sources[physical] ?? -1]?.type.kind ?? "",
+    );
+  let variableCopies = 1;
+  for (let physical = 0; physical < counts.length; physical++)
+    if (variable(physical)) variableCopies = Math.max(variableCopies, counts[physical] ?? 1);
   return {
     sources,
     restore,
+    variableCopies,
+    sourceBacked: sources.every(
+      (index, physical) =>
+        !variable(physical) ||
+        counts[physical] === 1 ||
+        sourceBindings.has(fields[index] ?? Symbol()),
+    ),
     types: sources.map((source) => {
       const column = root.output[source];
       if (!column) throw new TypeError("Result column outside layout");

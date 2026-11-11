@@ -144,6 +144,8 @@ export function boundSource(
   governor: MemoryGovernor,
   signal: AbortSignal,
   target: number,
+  // One-row result-copy sizing must not repeatedly inspect a whole remaining interval.
+  prefixRows = BATCH_ROWS,
 ): MaybePromise<ReadBound> {
   return run(size());
   function* size(): ReadJob<ReadBound> {
@@ -208,7 +210,7 @@ export function boundSource(
                         columns: source.columns,
                         chunk: first / BATCH_ROWS,
                         startRow: start,
-                        maxRows: end - start,
+                        maxRows: Math.min(prefixRows, end - start),
                         targetBytes: target,
                       },
                       { budget, pages: sizingPages, signal },

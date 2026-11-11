@@ -2002,8 +2002,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       ? null
       : compilePlan(plan, { ...options, lateSort: false, domainCountSum: false });
   const resultLayout = outputCopyLayout(plan.root);
+  const resultCopies = hasInputSizedJson ? 1 : (resultLayout?.variableCopies ?? 1);
   const genericProgram: Program = (runtime, sink) => {
-    if (resultLayout !== null && sink instanceof ResultSink) sink.copyLayout(resultLayout);
     runtime.resolveCall = resolveCall;
     // LIMIT zero never opens its input. Keep capability checks at prepare, but do not reserve
     // buffers for those unreachable pipelines (including when zero is a bound parameter).
@@ -2415,6 +2415,27 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           io = Math.max(io, bound.io);
           progress = Math.max(progress, bound.progress);
         }
+        if (resultCopies > 1 && resultLayout?.sourceBacked && !hasInputSizedJson) {
+          let resultProgress = 0;
+          for (const source of sources) {
+            // The normal read bound includes a batch-sized output floor. Copy admission
+            // needs a one-row envelope: otherwise 262 tiny aliases multiply that floor
+            // into a fictitious >1-GiB minimum. This metadata-only, publication-stable
+            // sizing pass releases every grant before complete execution admission.
+            const row = yield* readValue(
+              boundSource(
+                runtime.view,
+                { ...source, windowBytes: 0, rows: demand.get(source.id) ?? null },
+                runtime.request.governor,
+                runtime.signal,
+                1,
+                1,
+              ),
+            );
+            resultProgress = Math.max(resultProgress, row.progress);
+          }
+          runtime.resultCopySourceProgress(resultProgress);
+        }
         const jsonWidth = Math.max(jsonConstants, progress) + 1;
         if (hasJson) jsonWidths.set(runtime, jsonWidth);
         for (const [index, entry] of entries.entries())
@@ -2455,7 +2476,12 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     return runSliced(sizeSources(), new Slice(Infinity), () => undefined);
   };
   const program: Program = (runtime, sink) => {
+    // Logical aliases own independent client buffers. Keep the admitted key-order
+    // specialization on its existing unique-payload recipe; variable fanout uses
+    // the generic compact sort plus complete result-copy sizing below.
+    runtime.resultCopies(resultCopies);
     runtime.resolveCall = resolveCall;
+    if (resultCopies > 1) return genericProgram(runtime, sink);
     if (ordered === null) return genericProgram(runtime, sink);
     const { rel, scan, project } = ordered;
     const table = runtime.view.catalog.table(scan.tableId);

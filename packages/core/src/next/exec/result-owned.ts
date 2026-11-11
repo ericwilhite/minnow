@@ -5,6 +5,7 @@ import type { ByteBudget } from "../access/space.js";
 import type { Batch, DictionaryVector, FlatVector } from "../vector/vector.js";
 import type { Transfer } from "./pipeline.js";
 import type { WireVector } from "./result.js";
+import { frameTransferList } from "./frame-buffers.js";
 
 const EXACT_CAPACITY = (bytes: number): number => bytes;
 
@@ -106,5 +107,15 @@ export function ownedResultColumns(
       };
     return null;
   });
+  const adopted = new Set<ArrayBuffer>();
+  for (let c = 0; c < columns.length; c++) {
+    const column = columns[c];
+    if (!column) continue;
+    const buffers = frameTransferList({ rowCount: n, columns: [column], dictionaries: [] });
+    // An authorized source may repeat a buffer in several logical columns. Adopt it
+    // at most once; copy other aliases before source readiness/transfer can detach it.
+    if (buffers.some((buffer) => adopted.has(buffer))) columns[c] = null;
+    else for (const buffer of buffers) adopted.add(buffer);
+  }
   return columns.some((v) => v !== null) ? columns : null;
 }

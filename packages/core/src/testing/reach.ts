@@ -77,9 +77,11 @@ export const HASH_OUTPUT_CREDIT_REACH = [
   "all charges returned",
 ] as const;
 
-/** Compiled aliases share frame-owned data, never source or another frame. */
+/** Logical aliases own independent frame data, never source or another column. */
 export const RESULT_ALIAS_FRAME_REACH = [
-  "one backing allocation",
+  "independent backing allocations",
+  "consumer aliases isolated",
+  "dedicated aliases copy",
   "dictionary delta",
   "wide numeric clone",
   "cancel blocked",
@@ -3384,4 +3386,19 @@ export const JSONB_WIDE_DEADLINE_REACH = [
   "past old total deadline",
   "stalled work cancelled",
   "returned timer owners",
+] as const;
+
+export const SQL_ALIAS_ISOLATION_REACH = [
+  "text alias mutation",
+  "integer alias mutation",
+  "structured transfer",
+  "nullable aliases",
+  "all resources returned",
+] as const;
+export const FRAME_PACING_REACH = [
+  "flat aliases",
+  "dictionary aliases",
+  "wide arrays counted once",
+  "distinct backing",
+  "transferred payload",
 ] as const;

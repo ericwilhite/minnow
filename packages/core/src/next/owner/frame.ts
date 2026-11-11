@@ -130,40 +130,54 @@ export function transferFor(buffers: readonly ArrayBuffer[]): ArrayBuffer[] {
 /** Bytes a payload's typed arrays occupy (the client's estimate for release pacing). */
 export function payloadBytes(payload: FramePayload): number {
   let bytes = 0;
+  const seen = new Set<ArrayBufferLike | readonly bigint[]>();
+  const add = (view: ArrayBufferView | null | undefined): void => {
+    if (view == null || seen.has(view.buffer)) return;
+    seen.add(view.buffer);
+    bytes += view.buffer.byteLength;
+  };
   const flat = (column: WireFlat) => {
-    bytes += column.validity?.byteLength ?? 0;
+    add(column.validity);
     const data = column.data;
     switch (data.layout) {
       case "varlen":
-        bytes += data.bytes.byteLength + data.offsets.byteLength;
+        add(data.bytes);
+        add(data.offsets);
         return;
       case "fixed16":
-        bytes += data.bytes.byteLength;
+        add(data.bytes);
         return;
       case "int64":
-        bytes += data.values.values.byteLength;
+        add(data.values.values);
         return;
       case "interval":
-        bytes += data.months.byteLength + data.days.byteLength + data.micros.values.byteLength;
+        add(data.months);
+        add(data.days);
+        add(data.micros.values);
         return;
       case "decimal":
-        bytes +=
-          (data.scales?.byteLength ?? 0) +
-          (data.specials?.byteLength ?? 0) +
-          (data.coefficients.repr === "int128"
-            ? data.coefficients.limbs.byteLength
-            : data.coefficients.repr === "wide"
-              ? data.coefficients.values.length * 16
-              : data.coefficients.values.byteLength);
+        add(data.scales);
+        add(data.specials);
+        if (data.coefficients.repr === "int128") add(data.coefficients.limbs);
+        else if (data.coefficients.repr === "wide") {
+          const values = data.coefficients.values;
+          if (!seen.has(values)) {
+            seen.add(values);
+            bytes += values.length * 16;
+          }
+        } else add(data.coefficients.values);
         return;
       default:
-        bytes += data.values.byteLength;
+        add(data.values);
     }
   };
   for (const column of payload.columns) {
     if (column.form === "flat") flat(column);
     else if (column.form === "constant") flat(column.value);
-    else bytes += column.codes.byteLength + (column.validity?.byteLength ?? 0);
+    else {
+      add(column.codes);
+      add(column.validity);
+    }
   }
   for (const delta of payload.dictionaries) flat(delta.values);
   return bytes;
