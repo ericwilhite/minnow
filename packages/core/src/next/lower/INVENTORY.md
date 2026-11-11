@@ -32,7 +32,7 @@ Status:
 | `derived` (derived table, inlined CTE, view body)                      | the subtree, its output renamed                                                                                                                                                                                                                                                                  | M1                   |
 | `union` (`UNION`/`INTERSECT`/`EXCEPT` [`ALL`])                         | `setOp` (left-associative chain as the front end orders it)                                                                                                                                                                                                                                      | M3                   |
 | `recursive` (WITH RECURSIVE)                                           | `recursive` + `workTableScan`                                                                                                                                                                                                                                                                    | M3                   |
-| `recursive.series` (GENERATE_SERIES)                                   | `recursive` (a dedicated series source is a Phase 2 optimization)                                                                                                                                                                                                                                | M3                   |
+| `recursive.series` (GENERATE_SERIES)                                   | `series` (original argument arity and typed start/stop/step)                                                                                                                                                                                                                                     | M3                   |
 | `windowed` source + `WindowSpec`s                                      | `window`, one per distinct PARTITION BY / ORDER BY (partition, order and argument expressions are columns of the inner block); frame offsets are constants                                                                                                                                       | M3                   |
 | `joins[]` kind `inner`                                                 | `join` `inner`, `hash` on `left`/`right` keys, rest of `on` as `residual`; order chosen by the cost model                                                                                                                                                                                        | M3                   |
 | `crossJoinPlan` (comma join, CROSS JOIN)                               | `join` `cross` (or `inner` once WHERE supplies keys)                                                                                                                                                                                                                                             | M3                   |
@@ -325,12 +325,10 @@ catalogue suite checks its exact class, stage, construct and SQLSTATE, and execu
 SQL statement against PGlite to verify the authority outcome. These are capability limits of
 this unexported core; they do not describe the shipped engine's SQL support.
 
-| Cell     | Stage / construct   | Reason                                                                                                                                                                                            |
-| -------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| guide-7  | lower / function    | JSON_OBJECT and JSON_ARRAYAGG need heterogeneous typed construction and charged, spillable JSON accumulation.                                                                                     |
-| guide-8  | lower / function    | Whole-row json_agg needs record typing and bounded JSON accumulation; its expanded JSON_OBJECT is refused.                                                                                        |
-| guide-14 | lower / function    | Legacy DATE_ADD desugaring loses interval field provenance; calendar interval lowering and recursive execution are required. A user DATE_ADD call must not be mistaken for a PostgreSQL operator. |
-| guide-15 | execute / recursive | GENERATE_SERIES still needs bounded, cancellable work-table/fixpoint execution, plus interval arithmetic and EXTRACT.                                                                             |
+| Cell    | Stage / construct | Reason                                                                                                        |
+| ------- | ----------------- | ------------------------------------------------------------------------------------------------------------- |
+| guide-7 | lower / function  | JSON_OBJECT and JSON_ARRAYAGG need heterogeneous typed construction and charged, spillable JSON accumulation. |
+| guide-8 | lower / function  | Whole-row json_agg needs record typing and bounded JSON accumulation; its expanded JSON_OBJECT is refused.    |
 
 Canonical DATE literals now lower directly to epoch-day vectors using the binder's shared
 canonical parser. The shipped SQL front end still limits DATE literal spelling to AD years
@@ -373,7 +371,7 @@ slot, 128 per interval slot), reuse them and skip NULL/unselected garbage. Spars
 nonascending selections keep monotone output offsets. Differential tests construct PG input
 from independent ordinal date and interval fields and compare interval subtraction fields
 directly, rather than judging arithmetic through its text renderer. Guide-3 now executes
-unchanged against both PGlite and the shipped engine. JSON extraction below brings the frozen catalogue to 62/66 executions.
+unchanged against both PGlite and the shipped engine; guide-9 and guide-14/15 also execute unchanged.
 
 SQL TIMESTAMP literals now retain their original spelling in a parser-only weak side table,
 carried through plan cloning and structural identity. Lowering builds native microseconds from
@@ -414,7 +412,7 @@ give PostgreSQL's 42883. Raw JSON keeps its original number spelling, duplicate 
 whitespace; text extraction decodes strings and maps JSON null to SQL NULL. Object lookups use
 the last matching key. Missing paths and mismatched container types return SQL NULL, as in PG.
 The guide-9 SQL and datasets are unchanged: it now executes against PGlite and the shipped
-engine, bringing this branch's frozen catalogue to 62/66 executions.
+engine. The remaining frozen-catalogue refusals are guide-7/8 construction and aggregation.
 
 Projection/filter extraction runs one borrowed row at a time with a prepaid input-sized
 workspace, checks the shared task clock, and retains its source until downstream readiness.
@@ -433,3 +431,56 @@ The R21 registry records the shipped engine's canonicalized number-text differen
 JSON decimals with a zero fractional part. Generated checks require the native result to match
 PG's original JSON extraction and the shipped result to match an independent PG int4::text
 witness. Its matcher rejects unrelated wrong values; no tolerance or native-result waiver is used.
+
+## Calendar and recursive execution
+
+Date/timestamp/timestamptz plus or minus a finite interval now executes in fixed UTC. The
+kernel clamps the month, adds calendar days, then adds exact integer microseconds. Each
+calendar stage is range-checked before a later field can cancel it, as in PostgreSQL. Finite
+interval EXTRACT returns exact NUMERIC coefficients and PG display scales; interval comparisons
+use PG's 30-day-month duration, including NULL and infinity ordering. Infinite interval
+arithmetic/extraction, date/time EXTRACT overloads and dynamic TEXT-to-INTERVAL casts remain
+typed execution refusals.
+
+Only the native parser records the original INTERVAL arithmetic text and GENERATE_SERIES arity
+in private weak side tables, copied through query clones and included in expression identity.
+User DATE_ADD calls remain refused; normal shipped parsing and execution are unchanged. The
+shared SQL literal parser's existing safe-integer interval field limit still applies.
+
+Integer and timestamp GENERATE_SERIES in FROM uses a dedicated streaming operator with prepaid fixed
+batches, shared task-clock yields, cancellation and downstream demand. Original arity resolves
+against the R19 table before default-step synthesis. NULL arguments produce no rows; a zero
+step gives 22023 when demanded. Numeric series and timezone-argument series remain refused.
+There is no hidden row cap. PG materializes a FROM FunctionScan before LIMIT; the huge-range
+prefix check therefore uses a finite PG prefix witness, while >100,000-row counts use identical
+SQL against PG.
+
+UNION ALL recursion supports fixed-width work tables, simple VALUES/scan/series seeds and a
+linear filter/project step over its work-table scan. Two bounded staging buffers alternate
+between levels and spill wider frontiers through the shared pool. A fixed-size binary carry
+directory preserves FIFO page and row order without a resident page-reference list. The step
+frame is compiled once and reused; task yields, cancellation and demand continue across levels.
+All I/O/consumer borrows settle before cleanup. There is no recursion-depth cap.
+
+UNION DISTINCT recursion, variable-width/decimal work tables and nonlinear/join/aggregate steps
+remain explicit typed execution refusals. These are capability limits, not SQL row-count limits.
+The scratch backend's existing extent-directory bookkeeping remains outside this operator's
+fixed metadata proof. Real browser I/O and process RSS are not proved by the memory-service and
+ScratchSpillService/SimBackend properties. Under completely full ordinary memory, main's shared
+aggregate may refuse its 12-byte output; the recursive pressure property leaves 64 KiB for that
+existing output allocation. It still prevents optional spill-buffer growth. No recursive-specific
+refusal masks this separate shared aggregate issue.
+
+The unchanged guide-15 native result is compared to PostgreSQL's NUMERIC output. Only the
+independent shipped-engine witness casts busy_hours to float8, matching the current engine's
+EXTRACT type (R21). No tolerance or frozen-SQL correction is used.
+
+### DATE_PART and EXTRACT
+
+`DATE_PART` has its own R19 overloads returning `float8`; PostgreSQL 14+ `EXTRACT` returns
+`NUMERIC`. Native-only private call provenance survives child rewrites, clones and expression
+identity without a public model field. Finite interval DATE_PART uses PostgreSQL's float8
+operation order, including second/millisecond fractions and epoch cancellation; it does not
+convert the exact EXTRACT result after evaluation. Date/time DATE_PART kernels remain typed
+execution refusals. Its float8 type still rejects two-argument ROUND at lowering, as PostgreSQL
+does, including over date/timestamp arguments whose execution is not implemented yet.

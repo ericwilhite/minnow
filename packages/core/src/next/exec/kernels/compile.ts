@@ -10,6 +10,8 @@
  *   a kernel or a refusal. Anything else is `UnsupportedPlanError` here, never a wrong answer
  *   later.
  */
+import { compileIntervalExtract } from "./interval-extract.js";
+import { compileCalendarAdd } from "./calendar-add.js";
 import type { ScalarExpr } from "../../ir/ir.js";
 import type { PhysicalType } from "../../types.js";
 import { samePhysicalType } from "../../types.js";
@@ -176,6 +178,18 @@ function compileCall(expr: Extract<ScalarExpr, { op: "call" }>, context: Compile
       const [arg] = args;
       if (arg === undefined) throw new TypeError("neg takes one argument");
       return compileNegate(expr.type, arg, arena);
+    }
+    case "intervalExtract": {
+      const [field, input] = args;
+      if (field === undefined || input === undefined)
+        throw new TypeError("EXTRACT takes two arguments");
+      return compileIntervalExtract(expr.type, field, input, arena);
+    }
+    case "calendarAdd": {
+      const [left, right] = args;
+      if (left === undefined || right === undefined)
+        throw new TypeError("Calendar arithmetic takes two arguments");
+      return compileCalendarAdd(expr.type, expr.fn, left, right, arena);
     }
     case "temporalSub": {
       const [left, right] = args;

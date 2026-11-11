@@ -358,6 +358,14 @@ export type Rel =
       readonly all: boolean;
       readonly inputs: readonly Rel[];
     })
+  /** GENERATE_SERIES arguments are evaluated once before NULL/step/range admission. The
+   * input holds argument rows [start, stop, step]; output carries these three columns, advancing start.
+   * A FROM wrapper projects the visible series column. Streaming has no implicit row cap. */
+  | (RelBase & {
+      readonly op: "series";
+      readonly kind: "integer" | "timestamp";
+      readonly input: Rel;
+    })
   | (RelBase & {
       readonly op: "recursive";
       readonly workTable: number;

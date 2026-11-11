@@ -1536,8 +1536,8 @@ on-disk directory keeps one tail reference per partition. Fully colliding partit
 one-class pass. Stored representative ordinals preserve the first left value's float zero
 sign, NUMERIC scale and INTERVAL fields across reverse spill-page traversal. Types with
 unsupported equality remain typed refusals: JSONB/arrays, locators, blank-padded CHAR and
-zero or more than 31 columns. Plain JSON is a PG 42883 type error. The frozen catalogue now
-executes 62/66 cells. The operator/tape budget proof excludes the shared scratch service's
+zero or more than 31 columns. Plain JSON is a PG 42883 type error. The frozen catalogue also executes guide-9 JSON extraction and guide-14/15 calendar/recursive
+queries; guide-7/8 JSON construction/aggregation remain refused. The operator/tape budget proof excludes the shared scratch service's
 currently uncharged extent-list metadata (B1 owns that follow-up). No public API,
 shipped-engine or stored-format change.
 
@@ -1575,7 +1575,10 @@ shipped-engine or stored-format change.
   (`UnsupportedPlanError`, stage "execute"); `bindings.test.ts` fails on an unbound entry, a
   stale binding, or a kernel binding that does not evaluate. DATE difference and finite timestamp
   difference execute through `temporal-subtract.ts`; temporal output casts use `temporal-text.ts`.
-  Not implemented yet: other date/time/interval arithmetic, text functions, math functions other
+  Finite date/timestamp +/- interval, exact interval EXTRACT and interval duration comparisons
+  execute through dedicated kernels. DATE_PART over finite intervals returns float8 separately
+  from EXTRACT's NUMERIC result; date/time DATE_PART execution remains a typed refusal. Not implemented yet: other temporal arithmetic and EXTRACT
+  overloads, text functions, math functions other
   than numeric ROUND(numeric,int4), other casts to and from text, and bounded text casts.
 - SQL TIMESTAMP literals preserve source microseconds through parsing, plan clones and expression
   identity; lowering uses integer calendar/fraction fields, not the legacy millisecond Date.
@@ -2606,6 +2609,14 @@ not require a home cache directory.
   (NULL, a string literal) takes the other arm's type, and two unknowns are text.
 - A FULL JOIN with no hash-joinable condition lowers, though PostgreSQL refuses it (0A000): an
   intended extension (R24.2), checked against PostgreSQL's LEFT JOIN UNION ALL anti-join rewrite.
+- Integer and timestamp GENERATE_SERIES in FROM streams fixed prepaid batches with NULL/zero-step rules,
+  task yields, cancellation and LIMIT demand. Numeric series remains a typed lowering refusal.
+  Fixed-width UNION ALL recursion reuses one compiled linear filter/project step and two bounded
+  FIFO work tables; wide levels spill through the shared pool with a fixed binary directory.
+  Level/input order is preserved, including float8 SUM order. No depth or row cap is imposed.
+  UNION DISTINCT, variable-width/decimal tables and nonlinear/join/aggregate recursive steps remain
+  typed execution refusals. Existing SQL literal syntax/range limits still apply. Native-only
+  private interval/arity provenance does not change shipped engine behavior or published types.
 - Windows, set operations, recursive CTEs and GENERATE_SERIES, UPDATE … FROM, DELETE … USING and
   MERGE lower too. Numeric ordered sets lower with constant/parameter scalar fractions.
   Still refused (`UnsupportedPlanError`, stage "lower"): JSON aggregates, JSON constructors and paths, array / regex functions, batch UPDATE / DELETE (`batchWrite`), LATERAL the

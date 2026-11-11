@@ -606,6 +606,24 @@ function checkRel(rel: Rel, catalog: CatalogView): void {
             fail(where, `set operation column ${String(index)} of another type`);
       }
       return;
+    case "series": {
+      checkRel(rel.input, catalog);
+      if (rel.output.length !== 3 || rel.input.output.length !== 3) fail(where, "series width");
+      for (const [index, column] of rel.output.entries())
+        if (!sameBase(column.type, at(rel.input.output, index).type))
+          fail(where, "series argument type differs");
+      const first = at(rel.output, 0).type,
+        last = at(rel.output, 1).type,
+        step = at(rel.output, 2).type;
+      if (!sameBase(first, last)) fail(where, "series bounds differ");
+      if (
+        rel.kind === "timestamp"
+          ? first.kind !== "timestamp" || step.kind !== "interval"
+          : (first.kind !== "int32" && first.kind !== "int64") || !sameBase(first, step)
+      )
+        fail(where, "series argument types");
+      return;
+    }
     case "recursive": {
       if (context.workTables.has(rel.workTable)) fail(where, "work table bound twice");
       checkRel(rel.base, catalog);

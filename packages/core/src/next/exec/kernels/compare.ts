@@ -11,9 +11,11 @@
  *   operand against a constant is compared once per dictionary entry and then mapped by code; two
  *   operands over the same dictionary compare codes for (in)equality.
  * - Bool: false < true.
- * Explicit ICU collations, enums ordered by rank, intervals, JSON and arrays are not compiled here
+ * Intervals use a separate exact 30-day-month comparator. Explicit ICU collations, enums ordered
+ * by rank, JSON and arrays are not compiled here
  * yet (`compileCompare` throws `TypeError`, which the compiler reports as unsupported).
  */
+import { IntervalCompare } from "./interval-compare.js";
 import type { PhysicalType } from "../../types.js";
 import { layoutOf } from "../../types.js";
 import { compareBytes } from "../../vector/varlen.js";
@@ -580,6 +582,11 @@ export function compileCompare(
   collation: string | null,
   arena: OutputArena,
 ): Compiled {
+  if (
+    left.type.kind === "interval" &&
+    (collation === null || collation === "C" || collation === "default")
+  )
+    return new IntervalCompare(op, left, right, arena);
   checkComparable(left.type, collation);
   if (layoutOf(left.type) !== layoutOf(right.type))
     throw new TypeError(`cannot compare ${left.type.kind} with ${right.type.kind}`);
@@ -592,6 +599,7 @@ export function compileDistinctFrom(
   right: Compiled,
   arena: OutputArena,
 ): Compiled {
+  if (left.type.kind === "interval") return new IntervalCompare("=", left, right, arena, negated);
   checkComparable(left.type, null);
   if (layoutOf(left.type) !== layoutOf(right.type))
     throw new TypeError(`cannot compare ${left.type.kind} with ${right.type.kind}`);

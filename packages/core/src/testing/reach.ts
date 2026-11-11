@@ -2776,3 +2776,201 @@ export const JSON_LITERAL_PROGRESS_REACH = [
   "competing pressure",
   "returned all grants",
 ] as const;
+
+/** Calendar operators keep the interval's fields and clamp months before adding days/time. */
+export const CALENDAR_SQL_REACH = [
+  "timestamp",
+  "date",
+  "timestamptz",
+  "direct",
+  "derived",
+  "CTE",
+  "view",
+  "add",
+  "subtract",
+  "NULL",
+  "month end",
+  "sub-millisecond",
+  "negative field",
+] as const;
+
+/** INTERVAL EXTRACT keeps PostgreSQL field definitions, numeric scales and error admission. */
+export const INTERVAL_EXTRACT_SQL_REACH = [
+  "week",
+  "negative quarter",
+  "epoch",
+  "year",
+  "month",
+  "day",
+  "hour",
+  "minute",
+  "second",
+  "milliseconds",
+  "microseconds",
+  "decade",
+  "century",
+  "millennium",
+  "quarter",
+  "unsupported field",
+  "unknown field",
+  "NULL",
+  "negative fields",
+  "microsecond scale",
+  "large exact coefficient",
+  "direct",
+  "derived",
+  "CTE",
+] as const;
+
+/** Native interval ordering uses PG's 30-day month comparison, with exact wide fields. */
+export const INTERVAL_COMPARE_REACH = [
+  "flat",
+  "dictionary",
+  "constant",
+  "sparse",
+  "selected",
+  "strict comparison",
+  "NULL-safe comparison",
+  "NULL",
+  "infinity",
+  "30-day month equality",
+  "wide exact microseconds",
+  "returned charge",
+] as const;
+
+/** SRF arity/type resolution, strict NULL arguments and overflow-safe integer termination. */
+export const SERIES_SQL_REACH = [
+  "direct",
+  "derived",
+  "CTE",
+  "empty",
+  "NULL argument",
+  "int4",
+  "int8",
+  "int2 widening",
+  "timestamp",
+  "microsecond step",
+  "calendar step",
+  "last integer overflow stops",
+  "ambiguous overload",
+  "zero step",
+] as const;
+/** Native series has no inherited materialization cap and obeys consumer demand. */
+export const SERIES_LARGE_REACH = [
+  "past shipped row cap",
+  "LIMIT stops huge range",
+  "LIMIT 0 skips zero step",
+] as const;
+
+/** Binary carry directory stays bounded and traverses spill pages in append order. */
+export const RECURSIVE_TAPE_REACH = [
+  "one page",
+  "power-of-two carry",
+  "ragged roots",
+  "FIFO rows",
+  "corruption refusal",
+  "bounded metadata",
+  "returned bytes",
+] as const;
+
+/** UNION ALL includes all seed duplicates and NULL values until the step predicate empties. */
+export const RECURSIVE_SQL_REACH = [
+  "limited demand",
+  "filtered step",
+  "later selected slot",
+  "base only",
+  "step rows",
+  "empty base",
+  "NULL seed",
+  "duplicate seed",
+  "multiple seeds",
+  "negative step",
+  "zero value step",
+  "exact PG",
+] as const;
+/** Work-table spill preserves input order, hence the promised float8 accumulation order. */
+export const RECURSIVE_SPILL_REACH = [
+  "competing pressure",
+  "FIFO exact rows",
+  "ordered PG SUM",
+  "spill",
+  "scratch service",
+  "memory service",
+  "small cap",
+  "returned all bytes",
+] as const;
+/** Native calendar operations use full-range integer fields, never a millisecond Date. */
+export const CALENDAR_VECTOR_REACH = [
+  "flat",
+  "dictionary",
+  "constant",
+  "add",
+  "subtract",
+  "NULL",
+  "infinity",
+  "wide microseconds",
+  "PG error",
+  "exact text",
+  "returned charge",
+] as const;
+/** Every in-flight I/O/consumer borrow outlives cancellation and precedes resource release. */
+export const RECURSIVE_LIFECYCLE_REACH = [
+  "append",
+  "read",
+  "consumer",
+  "append failure",
+  "read failure",
+  "consumer failure",
+  "borrow fence",
+  "fault cleanup",
+  "returned all bytes",
+] as const;
+
+/** Adjacent parser intervals remain separate across CSE and cloned query scopes. */
+export const CALENDAR_IDENTITY_REACH = [
+  "aggregate",
+  "grouped",
+  "direct",
+  "derived",
+  "CTE",
+  "view",
+  "wide",
+  "small",
+  "adjacent exact",
+] as const;
+/** R17.1 output rendering depends on explicit bigint operands, not an implicit widening. */
+export const SERIES_RENDER_REACH = [
+  "explicit bigint",
+  "implicit int8",
+  "derived",
+  "direct",
+  "PG exact",
+] as const;
+/** Function identity affects SQL return types and overload selection, including through clones/CSE. */
+export const DATE_PART_SQL_REACH = [
+  "interval",
+  "date",
+  "timestamp",
+  "timestamptz",
+  "direct",
+  "derived",
+  "CTE",
+  "view",
+  "aggregate identity",
+  "NULL",
+  "PG result types",
+  "exact interval value",
+  "date/time typed refusal",
+  "float ROUND refused",
+  "numeric ROUND executes",
+  "float cancellation",
+  "epoch",
+  "second",
+  "milliseconds",
+  "microseconds",
+  "year",
+  "month",
+  "day",
+  "quarter",
+  "week",
+] as const;

@@ -227,7 +227,10 @@ describe("published core tarball", () => {
       // Timestamp source/precision admission: 1,023,032 packed / 4,434,467 unpacked
       // (+200 / +734 versus JSON_TABLE metadata alone). The packed cap is exceeded by
       // 32 bytes: raise it once by 250 bytes; leave the unpacked cap and isolation checks.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_023_250);
+      // Native-only interval/series provenance: 1,023,531 packed / 4,436,274 unpacked
+      // (+499 / +1,807 versus eef0ee76). No next/ or test files ship. Raise packed once
+      // by 500; keep the unpacked cap and every package-isolation assertion.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_023_750);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");

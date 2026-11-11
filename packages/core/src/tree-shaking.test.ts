@@ -43,22 +43,32 @@ const SQL_ENGINE_MODULES =
 // Raise this raw cap once by 512 bytes; keep the gzip cap and isolation checks.
 // Timestamp source/precision admission adds 326 raw / 148 gzip bytes: 1,172,985 / 351,332.
 // Only typed compilation records source; normal shipped SQL precision is unchanged. Caps stay.
-const COMPLETE_ENTRY_RAW_BUDGET = 1145.5 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 343.25 * 1024;
+// Native-only interval/series provenance over eef0ee76: 1,173,499 raw / 351,512 gzip
+// (+514 / +180). Raise raw once by 512 and gzip by 256; isolation assertions stay.
+// Native DATE_PART provenance over cb0d82a6: 1,173,747 raw / 351,607 gzip (+248 / +95).
+// Raise raw once by 256 bytes; gzip and every isolation assertion still fit.
+const COMPLETE_ENTRY_RAW_BUDGET = 1146.25 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 343.5 * 1024;
 // The engine with the larger durable adapter, OPFS.
 // JSON_TABLE metadata: 1,585,069 raw / 458,168 gzip bytes; counterfactual
 // 1,584,618 / 458,049 (+451 / +119). Raw cap +512 once, gzip cap unchanged.
 // Timestamp source/precision admission: 1,585,395 / 458,305 (+326 raw / +137 gzip); caps stay.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1548.25 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 447.75 * 1024;
+// Interval/series provenance: 1,585,909 raw / 458,456 gzip (+514 / +151).
+// Raise raw once by 512; the gzip cap still fits.
+// DATE_PART provenance: 1,586,157 raw / 458,542 gzip (+248 / +86).
+// Raise raw once by 256 and gzip by 128; no private rebuild/test input is reachable.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1549 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 447.875 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does.
 // JSON_TABLE metadata: 1,581,102 raw / 455,735 gzip bytes; counterfactual
 // 1,580,651 / 455,607 (+451 / +128). Raw cap +512 once, gzip cap unchanged.
 // Timestamp source/precision admission: 1,581,428 / 455,871 (+326 raw / +136 gzip).
 // This exceeds the old raw cap by 116 bytes: raise it once by 512; keep the gzip cap.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1544.75 * 1024;
-const INDEXEDDB_WORKER_GZIP_BUDGET = 445.25 * 1024;
+// Interval/series provenance: 1,581,942 raw / 456,043 gzip (+514 / +172).
+// Raise raw once by 512 and gzip by 256; worker/client isolation stays.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1545.25 * 1024;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 445.5 * 1024;
 // What a page that hosts the engine in a worker ships on the main thread: the client, the schema
 // DSL and error classes, the Kysely dialect and live queries, and the React hooks, with `kysely`
 // and `react` left to the application. 105.9 KiB raw / 31.6 KiB gzip.

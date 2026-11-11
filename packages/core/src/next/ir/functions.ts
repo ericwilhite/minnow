@@ -74,6 +74,17 @@ const same = (types: readonly SqlType[], arity: number): Overload[] =>
 
 /** `fn` → overloads. Names are PostgreSQL's function names, or the operator's name below. */
 export const FUNCTIONS: Readonly<Record<string, readonly Overload[]>> = {
+  // SRFs bind through this table too; execution uses a relational series node.
+  generate_series: [
+    { args: ["int4", "int4"], result: "int4" },
+    { args: ["int8", "int8"], result: "int8" },
+    { args: ["numeric", "numeric"], result: "numeric" },
+    { args: ["int4", "int4", "int4"], result: "int4" },
+    { args: ["int8", "int8", "int8"], result: "int8" },
+    { args: ["numeric", "numeric", "numeric"], result: "numeric" },
+    { args: ["timestamp", "timestamp", "interval"], result: "timestamp" },
+    { args: ["timestamptz", "timestamptz", "interval"], result: "timestamptz" },
+  ],
   // Operators: `+ - * / %`, unary `-`, and `||`.
   json_get: [
     { args: ["json", "text"], result: "json" },
@@ -188,6 +199,15 @@ export const FUNCTIONS: Readonly<Record<string, readonly Overload[]>> = {
     { args: ["text", "timestamp"], result: "numeric" },
     { args: ["text", "timestamptz"], result: "numeric" },
     { args: ["text", "interval"], result: "numeric" },
+  ],
+
+  /** DATE_PART keeps PostgreSQL's float8 result, separately from EXTRACT's NUMERIC. */
+  date_part: [
+    { args: ["text", "date"], result: "float8" },
+    { args: ["text", "time"], result: "float8" },
+    { args: ["text", "timestamp"], result: "float8" },
+    { args: ["text", "timestamptz"], result: "float8" },
+    { args: ["text", "interval"], result: "float8" },
   ],
 
   // Sequences: the sequence id is an int8 constant (access/catalog.ts `SequenceDef.id`).

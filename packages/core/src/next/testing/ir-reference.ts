@@ -691,6 +691,20 @@ export function run(rel: Rel, env: Environment): Row[] {
       return windowRows(rel, env);
     case "setOp":
       return setOpRows(rel, env);
+    case "series": {
+      if (rel.kind !== "integer") throw new ReferenceUnsupportedError("timestamp series");
+      const out: Row[] = [];
+      for (const row of run(rel.input, env)) {
+        const [start, stop, step] = row;
+        if (start === null || stop === null || step === null) continue;
+        if (typeof start !== "bigint" || typeof stop !== "bigint" || typeof step !== "bigint")
+          throw new ReferenceUnsupportedError("series argument");
+        if (step === 0n) throw new ReferenceSqlError("step size cannot equal zero", "22023");
+        for (let value = start; step > 0n ? value <= stop : value >= stop; value += step)
+          out.push([value, stop, step]);
+      }
+      return out;
+    }
     case "recursive":
       return recursiveRows(rel, env);
     case "workTableScan":

@@ -1,10 +1,16 @@
+import { rememberDatePart, copyDatePart, isDatePart } from "./date-part-sources.js";
 import {
   sourceLocksRelation,
   strongestRowLock,
   withRowLock,
   withRowLockCtes,
 } from "./row-locking.js";
+import { rememberSeriesArgumentCount, copySeriesArgumentCount } from "./series-sources.js";
 import { copyFrameOffset, rememberFrameOffset } from "./frame-offsets.js";
+import {
+  rememberIntervalArithmeticSource,
+  copyIntervalArithmeticSource,
+} from "./interval-arithmetic-sources.js";
 import { checkedInteger, checkedSum } from "./integer-exactness.js";
 import { castSqlValue, datetimeText } from "./sql-casts.js";
 import { parseJson } from "../block-format/json-parse.js";
@@ -299,7 +305,7 @@ export const statementDatetimeNames: ReadonlySet<string> = new Set([
 /** Standard function spellings that share one canonical plan name. */
 const functionSpellings: ReadonlyMap<string, string> = new Map([
   ["SUBSTRING", "SUBSTR"],
-  // DATE_PART('field', value) is EXTRACT(field FROM value) with the field as a string.
+  // Shipped alias; native compilation keeps DATE_PART provenance for its float8 result.
   ["DATE_PART", "EXTRACT"],
   ["CEILING", "CEIL"],
   ["CHAR_LENGTH", "LENGTH"],
@@ -3020,7 +3026,10 @@ function cloneTreeValue(value: unknown): unknown {
   for (const key of Object.keys(value)) {
     copy[key] = cloneTreeValue((value as Record<string, unknown>)[key]);
   }
+  copyDatePart(value, copy);
   copyFrameOffset(value, copy);
+  copySeriesArgumentCount(value, copy);
+  copyIntervalArithmeticSource(value, copy);
   return copy;
 }
 
@@ -4474,7 +4483,7 @@ export function mapChildExpressions(
   }
   if (expression.kind === "not") return { ...expression, operand: map(expression.operand) };
   if (expression.kind === "call") {
-    return {
+    const mapped: Expression = {
       ...expression,
       arguments: expression.arguments.map(map),
       ...(expression.aggregateOrderBy === undefined
@@ -4486,6 +4495,8 @@ export function mapChildExpressions(
             })),
           }),
     };
+    copyDatePart(expression, mapped);
+    return mapped;
   }
   if (expression.kind === "list") return { ...expression, items: expression.items.map(map) };
   if (expression.kind === "case") {
@@ -7438,7 +7449,8 @@ function generateSeriesSource(
     }
   }
   const step: Expression = given ?? { kind: "literal", value: 1 };
-  if (seriesStepIsZero(step)) throw new TypeError("GENERATE_SERIES step size cannot equal zero");
+  if (seriesStepIsZero(step) && !recordDeclaredTypes)
+    throw new TypeError("GENERATE_SERIES step size cannot equal zero");
   // PostgreSQL's timestamp series returns `timestamp` when both bounds are timestamps without
   // time zone, and `timestamp with time zone` otherwise; only the text of a value shows which.
   const local =
@@ -7535,6 +7547,8 @@ function generateSeriesSource(
       series: timestamps ? "timestamp" : "integer",
     },
   };
+  if (recordDeclaredTypes && recursive.recursive !== undefined)
+    rememberSeriesArgumentCount(recursive.recursive, args.length);
   return derivedTableSource(
     {
       sql: "(generate_series)",
@@ -11829,16 +11843,16 @@ class Parser {
       // already in hand, and folds into the date arithmetic DATE_ADD performs.
       if ((operator === "+" || operator === "-") && this.#isKeyword("INTERVAL")) {
         this.#keyword("INTERVAL");
-        const { months, milliseconds } = intervalLiteral(this.#take("string").text);
+        const text = this.#take("string").text;
+        const { months, milliseconds } = intervalLiteral(text);
         const sign = operator === "-" ? -1 : 1;
+        const elapsed: Expression = { kind: "literal", value: sign * milliseconds };
+        if (recordDeclaredTypes)
+          rememberIntervalArithmeticSource(elapsed, { text, subtract: operator === "-" });
         left = {
           kind: "call",
           name: "DATE_ADD",
-          arguments: [
-            left,
-            { kind: "literal", value: sign * months },
-            { kind: "literal", value: sign * milliseconds },
-          ],
+          arguments: [left, { kind: "literal", value: sign * months }, elapsed],
         };
         continue;
       }
@@ -12618,6 +12632,7 @@ class Parser {
         ...(distinct ? { distinct: true } : {}),
         ...(aggregateOrderBy === undefined ? {} : { aggregateOrderBy }),
       };
+      if (recordDeclaredTypes && upper === "DATE_PART") rememberDatePart(call);
       return upper === "ARRAY_AGG"
         ? { kind: "call", name: "MINNOW_ARRAY_FROM_JSON", arguments: [call] }
         : call;
@@ -15642,7 +15657,8 @@ function defaultAlias(expression: Expression): string {
     const operand = expression.arguments[0];
     if (operand?.kind === "column" || operand?.kind === "call") return defaultAlias(operand);
   }
-  if (expression.kind === "call") return expression.name.toLowerCase();
+  if (expression.kind === "call")
+    return isDatePart(expression) ? "date_part" : expression.name.toLowerCase();
   if (expression.kind === "wildcard")
     return expression.table === undefined ? "*" : `${expression.table}.*`;
   return "expression";

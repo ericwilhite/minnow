@@ -172,3 +172,18 @@ export function isNullLiteral(expr: ScalarExpr): boolean {
     expr.op === "literal" && expr.value.validity !== null && (expr.value.validity[0] ?? 0) === 0
   );
 }
+
+/** Exact native interval fields; never flatten calendar days into fractional milliseconds. */
+export function intervalLiteral(months: number, days: number, micros: bigint): ScalarExpr {
+  const type: PhysicalType = { kind: "interval" };
+  return {
+    op: "literal",
+    type,
+    value: flat(type, {
+      layout: "interval",
+      months: Int32Array.of(months),
+      days: Int32Array.of(days),
+      micros: int64Values(micros),
+    }),
+  };
+}

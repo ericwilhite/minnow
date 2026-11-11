@@ -476,18 +476,6 @@ export const CATALOGUE_REFUSALS: Readonly<Record<string, CatalogueRefusal>> = {
     stage: "lower",
     construct: "function",
   },
-  "guide-14": {
-    class: "UnsupportedPlanError",
-    sqlState: "0A000",
-    stage: "lower",
-    construct: "function",
-  },
-  "guide-15": {
-    class: "UnsupportedPlanError",
-    sqlState: "0A000",
-    stage: "execute",
-    construct: "recursive",
-  },
 };
 
 /** Each remaining cell has an explicit missing semantic capability and an authority outcome.
@@ -503,16 +491,6 @@ export const CATALOGUE_REFUSAL_REASONS: Readonly<
   "guide-8": {
     reason:
       "Whole-row json_agg requires record typing and bounded JSON accumulation; lowering currently expands the record to an unsupported JSON_OBJECT.",
-    pgState: "00000",
-  },
-  "guide-14": {
-    reason:
-      "The front end desugars month addition to legacy DATE_ADD(months,milliseconds), losing interval field provenance. Calendar-preserving interval lowering and recursive work-table execution are required; do not reinterpret a user DATE_ADD as a PG function.",
-    pgState: "00000",
-  },
-  "guide-15": {
-    reason:
-      "GENERATE_SERIES lowers to recursive/workTableScan. A bounded, cancellable fixpoint executor is unavailable; EXTRACT and interval arithmetic are also required.",
     pgState: "00000",
   },
 };
@@ -546,7 +524,13 @@ export const CATALOGUE_QUERY_AUTHORITY: Readonly<Record<string, string>> = {
  * Legacy windows return source order, so their outer float SUM accumulates in id order.
  * C2/R17.2 types 1.0 as NUMERIC; the old engine instead uses a plain double in S_q10.
  */
+// R21: the shipped engine's EXTRACT yields float8, while PostgreSQL/next use NUMERIC.
+// Cast only the independent legacy witness. The frozen guide-15 SQL and next PG answer stay exact.
 export const CATALOGUE_CURRENT_AUTHORITY: Readonly<Record<string, string>> = {
+  "guide-15": `SELECT day, COUNT(o.order_id) AS orders,
+    (EXTRACT(EPOCH FROM MAX(o.placed_at)-MIN(o.placed_at))/3600)::double precision AS busy_hours
+    FROM generate_series(TIMESTAMP '2025-03-01',TIMESTAMP '2025-03-31',INTERVAL '1 day') AS day
+    LEFT JOIN orders o ON DATE_TRUNC('day',o.placed_at)=day GROUP BY day ORDER BY day`,
   join_fact_fact_int:
     "SELECT COUNT(*) AS n, SUM(b.f01 ORDER BY a.id) AS s FROM events_wide a JOIN events_wide b ON b.id=a.i20 WHERE a.i05<5",
   win_running_sum:
