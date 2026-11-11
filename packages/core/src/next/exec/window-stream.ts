@@ -24,6 +24,7 @@
  * `NTH_LIMIT`. `streamable` names them; the operator refuses such a partition past its
  * resident limit.
  */
+import { NumericOutOfRangeError } from "./errors.js";
 import { WindowFloat } from "./window-float.js";
 import type { PhysicalType } from "../types.js";
 import type { FlatVector, Vector } from "../vector/vector.js";
@@ -177,6 +178,8 @@ export interface StreamHost {
   /** Output and gather stores draw from the spill pool (room made per bounded step). */
   readonly pool: Pool;
   readonly slice: Slice;
+  /** Stop only after a successfully delivered prefix. */
+  readonly stopped?: () => boolean;
   /** Pushes `count` dense rows (payload columns then one column per function). */
   push(columns: Vector[], count: number): SlicedJob<void>;
   /** A numeric function's results as a vector of its type. */
@@ -1055,6 +1058,7 @@ export class PartitionStream {
       outRows = 0;
     }.bind(this);
     for (;;) {
+      if (this.host.stopped?.()) return;
       // Read ahead until the next row to output is ready (or the run is over).
       while (next >= this.#read || !this.#ready(next)) {
         if (p >= run.pages.length) {
@@ -1079,6 +1083,7 @@ export class PartitionStream {
       if (this.#ended && !this.#ready(next)) throw new RangeError(this.#stall(next));
       // Output every ready row, in order.
       while (next < this.#read && this.#ready(next)) {
+        if (this.host.stopped?.()) return;
         const page = this.#pageOf(next);
         if (page === null) throw new RangeError("A window row's page is gone");
         // A run of ready rows of one page goes into the output chunk at once.
@@ -1099,20 +1104,27 @@ export class PartitionStream {
           continue;
         }
         for (let j = next; j < next + taken; j++) {
-          for (let f = 0; f < this.#calls.length; f++) {
-            const s = this.#calls[f];
-            if (s === undefined) continue;
-            const computation = this.#compute(
-              s,
-              f,
-              j,
-              outRows,
-              values[f] ?? new Float64Array(0),
-              valid[f] ?? new Uint8Array(0),
-              bigs,
-              ranges,
-            );
-            if (computation !== undefined) yield* computation;
+          try {
+            for (let f = 0; f < this.#calls.length; f++) {
+              const s = this.#calls[f];
+              if (s === undefined) continue;
+              const computation = this.#compute(
+                s,
+                f,
+                j,
+                outRows,
+                values[f] ?? new Float64Array(0),
+                valid[f] ?? new Uint8Array(0),
+                bigs,
+                ranges,
+              );
+              if (computation !== undefined) yield* computation;
+            }
+          } catch (error) {
+            if (!(error instanceof NumericOutOfRangeError)) throw error;
+            yield* flush();
+            if (this.host.stopped?.()) return;
+            throw error;
           }
           outRows++;
           if (this.host.slice.due()) yield;

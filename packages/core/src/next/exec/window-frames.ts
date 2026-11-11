@@ -286,6 +286,8 @@ export interface NumberArg {
 export interface NumberResult {
   readonly values: Float64Array;
   readonly valid: Uint8Array;
+  /** Optional per-output transition errors, surfaced by the operator at delivery. */
+  readonly errors?: Uint8Array;
   big: bigint[] | null;
 }
 
@@ -561,13 +563,15 @@ function* floatAggregate(
     prefix[0] = state.sum;
     counts[0] = 0;
     let last = -1;
+    let firstError = -1;
     for (let i = 0; i < n; i++) {
       last = Math.max(last, ends[i] ?? -1);
       if ((i & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
     }
     for (let j = 0; j <= last; j++) {
       if (arg.valid[j] === 1) state.add(arg.values[j] ?? 0);
-      state.check();
+      if (out.errors === undefined) state.check();
+      else if (state.bad && firstError < 0) firstError = j;
       prefix[j + 1] = state.sum;
       counts[j + 1] = state.count;
       if ((j & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
@@ -577,6 +581,7 @@ function* floatAggregate(
         count = end < 0 ? 0 : (counts[end + 1] ?? 0),
         sum = prefix[end + 1] ?? 0;
       out.valid[i] = count > 0 ? 1 : 0;
+      if (out.errors !== undefined) out.errors[i] = firstError >= 0 && end >= firstError ? 1 : 0;
       out.values[i] = count === 0 ? 0 : kind === "avg" ? sum / count : sum;
       if ((i & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
     }
@@ -597,10 +602,11 @@ function* floatAggregate(
     for (let r = 0; r < k; r++)
       for (let j = ranges[2 * r] ?? 0; j <= (ranges[2 * r + 1] ?? -1); j++) {
         if (arg.valid[j] === 1) state.add(arg.values[j] ?? 0);
-        state.check();
+        if (out.errors === undefined) state.check();
         if ((j & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
       }
     out.valid[i] = state.count > 0 ? 1 : 0;
+    if (out.errors !== undefined) out.errors[i] = state.bad ? 1 : 0;
     out.values[i] = state.count === 0 ? 0 : kind === "avg" ? state.sum / state.count : state.sum;
     if ((i & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
   }

@@ -3781,3 +3781,27 @@ export const WINDOW_FLOAT_REACH = [
   "unused prefix overflow",
   "exclusion fragments",
 ] as const;
+
+/** Window transition errors belong to demanded output frames, including early consumers. */
+export const WINDOW_FLOAT_DEMAND_REACH = [
+  "resident",
+  "streamed",
+  "sum",
+  "avg",
+  "LIMIT",
+  "OFFSET",
+  "error after demand",
+  "error within demand",
+  "NaN after overflow",
+  "cursor close",
+  "batch boundary",
+] as const;
+
+export const WINDOW_FLOAT_SQL_DEMAND_REACH = [
+  "LIMIT",
+  "OFFSET",
+  "existing order",
+  "result sort",
+  "whole partition",
+  "top-k filter",
+] as const;

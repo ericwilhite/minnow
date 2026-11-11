@@ -2268,7 +2268,11 @@ the target dataset and the separate 1M-row component runs.
   rules. Moving and excluded frames recompute their ordered members; head-anchored frames
   read cumulative state directly, without subtracting zero. Prefetching defers an error until
   an emitted frame consumes that prefix, so unused cumulative overflow cannot reject a valid
-  singleton frame. The three float states per function and AVG's streamed variance ring are
+  singleton frame. Resident evaluation records charged error bits by output row; streaming
+  flushes its valid prefix before raising a later frame error. LIMIT/OFFSET and blocked cursor
+  close can stop at that prefix, even within a batch. An exact global window order survives
+  column-only projections without a redundant sort; result-key and partitioned sorts still
+  demand every input frame. The three float states per function and AVG's streamed variance ring are
   charged before allocation. Exact integer sums retain their prefix path.
 - int8 values stay exact past 2^53 on both paths, as bigints where a double would round:
   sums, MIN/MAX, and RANGE keys and their offsets (RANGE over int8 compares exactly). COUNT

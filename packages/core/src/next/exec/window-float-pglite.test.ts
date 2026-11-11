@@ -2,11 +2,12 @@
 import { PGlite } from "@electric-sql/pglite";
 import { beforeAll, afterAll, it, expect } from "vitest";
 import { seedsFor, mulberry32 } from "../../testing/seeds.js";
-import { createReach, WINDOW_FLOAT_REACH } from "../../testing/reach.js";
+import { createReach, WINDOW_FLOAT_REACH, WINDOW_FLOAT_DEMAND_REACH } from "../../testing/reach.js";
 import { Governor } from "../memory/governor.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { ArraySource, CollectSink, INT, DBL, batchesOf, type Row } from "./join-fixtures.js";
 import type { Frame } from "./window-frames.js";
+import { LimitOperator } from "./limit.js";
 import { drive } from "./pipeline.js";
 import { WindowOperator, windowMinimumBytes } from "./window.js";
 import { AggregateOperator } from "./agg/aggregate.js";
@@ -16,6 +17,7 @@ import type { AggregateCall } from "../ir/ir.js";
 import type { Operator } from "./pipeline.js";
 import type { Batch } from "../vector/vector.js";
 import type { PhysicalType } from "../types.js";
+const demandReach = createReach("window float demand", WINDOW_FLOAT_DEMAND_REACH);
 const reach = createReach("window float transitions", WINDOW_FLOAT_REACH);
 let pg: PGlite;
 beforeAll(async () => {
@@ -25,6 +27,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await pg.close();
   reach.assertReached();
+  demandReach.assertReached();
 });
 const bound = (kind: Frame["start"]["kind"], offset: number | null = null) => ({ kind, offset });
 const frames: Array<[string, Frame]> = [
@@ -89,6 +92,11 @@ const frames: Array<[string, Frame]> = [
 // Exercise the general default-RANGE route as well as explicit ROWS frames.
 for (const [sql, frame] of frames.slice(0, 4))
   frames.push([sql.replace("ROWS", "RANGE"), { ...frame, unit: "range" }]);
+function frameAt(index: number): [string, Frame] {
+  const frame = frames[index];
+  if (frame === undefined) throw new RangeError("Generated window frame is missing");
+  return frame;
+}
 const scalar = (v: unknown): string => {
   if (v === null) return "NULL";
   if (Object.is(v, -0)) return "-0";
@@ -107,6 +115,7 @@ async function native(
   fn: string,
   frame: Frame,
   streamRows: number,
+  demand?: { limit: number; offset: number },
 ) {
   const types = [INT, type],
     governor = new Governor(64 << 20),
@@ -117,6 +126,10 @@ async function native(
       spillable: true,
     }),
     sink = new CollectSink(),
+    arena = new OutputArena(UNCHARGED, 2048),
+    limit =
+      demand === undefined ? null : new LimitOperator(demand.limit, demand.offset, arena, sink),
+    context = { grant, spill, queryId: 1, stopped: () => limit?.done === true },
     actor = new WindowOperator(
       {
         types,
@@ -125,8 +138,8 @@ async function native(
         streamRows,
         functions: [{ fn, arg: 1, frame, type: fn === "sum" ? type : DBL }],
       },
-      { grant, spill, queryId: 1 },
-      sink,
+      context,
+      limit ?? sink,
     );
   try {
     const batches: Batch[] = batchesOf(
@@ -154,6 +167,7 @@ async function native(
   } catch (error) {
     return { error: errorCode(error) };
   } finally {
+    arena.close();
     actor.abort(Error("test complete"));
     await actor.closed;
     expect(governor.usedBytes).toBe(0);
@@ -344,3 +358,146 @@ for (const seed of seedsFor("next-window-float-group-check", [0xb782, 0xb783]))
         expect(actual).toEqual(want);
       }
   });
+
+for (const seed of seedsFor("next-window-float-demand", [0xb790, 0xb791]))
+  it(`respects generated frame demand, seed ${String(seed)}`, async () => {
+    const random = mulberry32(seed);
+    for (const fn of ["sum", "avg"])
+      for (const streamRows of [1, 10000])
+        for (const frameIndex of [0, 1, 2, 3, 6, 8, 9, 10, 11])
+          for (const badAt of [1, 2, 4])
+            for (const offset of [0, 1, 2])
+              for (const limit of [1, 0, 2, 5]) {
+                demandReach.beginHistory();
+                demandReach.reach(streamRows === 1 ? "streamed" : "resident");
+                demandReach.reach(fn === "sum" ? "sum" : "avg");
+                demandReach.reach("LIMIT");
+                if (offset > 0) demandReach.reach("OFFSET");
+                if (badAt >= limit + offset) demandReach.reach("error after demand");
+                else demandReach.reach("error within demand");
+                demandReach.reach("NaN after overflow");
+                const values = Array.from({ length: 6 }, (_, i) =>
+                  i === badAt - 1 || i === badAt
+                    ? 1e308
+                    : i > badAt
+                      ? NaN
+                      : Math.floor(random() * 4),
+                );
+                const [sqlFrame, frame] = frameAt(frameIndex);
+                let authority;
+                try {
+                  const data = values
+                    .map((v, id) => `(${String(id)},'${scalar(v)}'::float8)`)
+                    .join(",");
+                  const result = await pg.query<{ v: number }>(
+                    `SELECT ${fn}(x) OVER(ORDER BY id ${sqlFrame}) v FROM(VALUES ${data})t(id,x) LIMIT ${String(limit)} OFFSET ${String(offset)}`,
+                  );
+                  authority = { values: result.rows.map((r) => scalar(r.v)) };
+                } catch (error) {
+                  authority = { error: errorCode(error) };
+                }
+                expect(
+                  await native(values, DBL, fn, frame, streamRows, { limit, offset }),
+                  JSON.stringify({ fn, streamRows, frameIndex, badAt, offset, limit }),
+                ).toEqual(authority);
+              }
+  }, 120000);
+
+for (const seed of seedsFor("next-window-float-cursor-demand", [0xb794, 0xb795]))
+  it(`closes a cursor before a future error (${String(seed)})`, async () => {
+    const random = mulberry32(seed);
+    for (const streamRows of [1, 10000])
+      for (const badAt of [1, 2049, 3001]) {
+        demandReach.beginHistory();
+        demandReach.reach("cursor close");
+        if (badAt > 2048) demandReach.reach("batch boundary");
+        const fn = random() < 0.5 ? "sum" : "avg";
+        const governor = new Governor(64 << 20),
+          spill = new MemorySpillService();
+        const grant = await governor.admit({
+          label: "cursor",
+          minimumBytes: windowMinimumBytes([INT, DBL]),
+          spillable: true,
+        });
+        const sink = new CollectSink();
+        let entered!: () => void, resume!: () => void;
+        const first = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        const gate = new Promise<void>((resolve) => {
+          resume = resolve;
+        });
+        const consumer: Operator = {
+          push(batch) {
+            sink.push(batch);
+            entered();
+            return "blocked";
+          },
+          ready: () => gate,
+          finish: () => sink.finish(),
+          abort: (error) => sink.abort(error),
+        };
+        const actor = new WindowOperator(
+          {
+            types: [INT, DBL],
+            partitionBy: [],
+            orderBy: [{ column: 0, direction: "asc", nulls: "last", collation: null }],
+            functions: [{ fn, arg: 1, type: DBL, frame: frameAt(1)[1] }],
+            streamRows,
+          },
+          { grant, spill, queryId: 1 },
+          consumer,
+        );
+        const values = Array.from({ length: badAt + 2 }, (_, i) =>
+          i === badAt - 1 || i === badAt ? 1e308 : i > badAt ? NaN : 0,
+        );
+        const work = Promise.resolve().then(() =>
+          drive(
+            new ArraySource(
+              batchesOf(
+                [INT, DBL],
+                values.map((x, id) => [id, x]),
+              ),
+            ),
+            actor,
+          ),
+        );
+        const settled = work.then(
+          () => ({ done: true }),
+          (error: unknown) => ({ error }),
+        );
+        try {
+          expect(
+            await Promise.race([
+              first.then(() => "prefix"),
+              settled.then(() => "failed before prefix"),
+            ]),
+          ).toBe("prefix");
+          expect(sink.rows.length).toBeGreaterThan(0);
+          expect(sink.rows.length).toBeLessThanOrEqual(badAt);
+          // PG's cursor may likewise close after fetching this prefix, without evaluating more.
+          await pg.exec("BEGIN");
+          const data = values.map((x, id) => `(${String(id)},'${scalar(x)}'::float8)`).join(",");
+          await pg.exec(
+            `DECLARE c CURSOR FOR SELECT ${fn}(x) OVER(ORDER BY id ROWS UNBOUNDED PRECEDING) v FROM(VALUES ${data})t(id,x)`,
+          );
+          const expected = await pg.query<{ v: number }>(
+            `FETCH ${String(sink.rows.length)} FROM c`,
+          );
+          expect(sink.rows.map((r) => scalar(r[2]))).toEqual(expected.rows.map((r) => scalar(r.v)));
+          await pg.exec("CLOSE c; COMMIT");
+          const reason = Error("cursor closed");
+          actor.abort(reason);
+          resume();
+          expect(await settled).toEqual({ error: reason });
+        } finally {
+          resume();
+          actor.abort(Error("test complete"));
+          await settled;
+          await actor.closed;
+          await pg.exec("ROLLBACK");
+          expect(governor.usedBytes).toBe(0);
+          expect(spill.bytesInUse).toBe(0);
+        }
+      }
+  }, 120000);

@@ -1023,7 +1023,7 @@ describe("window: growth charges the overlap (review B7-p2d-1 #5, governor rule 
       functions: [sum(3)],
     };
     // Scratch.bytes(capacity, functions 1, arguments 1).
-    const scratch = (capacity: number) => capacity * (20 + 8 + 22 + 9 + 12) + 12;
+    const scratch = (capacity: number) => capacity * (20 + 8 + 23 + 9 + 12) + 12;
     const sizes = await allocations(spec, rows);
     expect(sizes).toContain(scratch(3000));
     expect(sizes).toContain(scratch(10_000));

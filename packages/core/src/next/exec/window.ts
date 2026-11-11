@@ -27,6 +27,7 @@
  * refused (TypeError), as is a lag/lead default that is a column.
  */
 import { WindowCheckpoint, WINDOW_ORDINAL_BYTES } from "./window-checkpoint.js";
+import { NumericOutOfRangeError } from "./errors.js";
 import { WINDOW_FLOAT_STATE_BYTES } from "./window-float.js";
 import type { Grant, Loan } from "../memory/governor.js";
 import type { PhysicalType } from "../types.js";
@@ -278,6 +279,11 @@ function deferClose(grant: Grant): Grant {
   });
 }
 
+/** Output demand applies to evaluation, never to the blocking input sort. */
+export interface WindowContext extends SortContext {
+  readonly stopped?: () => boolean;
+}
+
 /** `ROW_NUMBER() / RANK() / … OVER (PARTITION BY … ORDER BY … frame)` (see the module comment). */
 export class WindowOperator implements Operator {
   readonly spec: WindowSpec;
@@ -301,12 +307,12 @@ export class WindowOperator implements Operator {
   readonly #cancel = new AbortController();
   readonly #grant: Grant;
 
-  constructor(spec: WindowSpec, context: SortContext, downstream: Operator) {
+  constructor(spec: WindowSpec, context: WindowContext, downstream: Operator) {
     validateWindowSpec(spec);
     this.spec = spec;
     const grant = deferClose(context.grant);
     this.#grant = context.grant;
-    const shared: SortContext = {
+    const shared: WindowContext = {
       ...context,
       grant,
       ...(spec.checkpointable
@@ -844,7 +850,7 @@ class Evaluator implements Operator {
 
   constructor(
     spec: WindowSpec,
-    readonly context: SortContext,
+    readonly context: WindowContext,
     readonly grant: Grant,
     readonly downstream: Operator,
   ) {
@@ -935,6 +941,10 @@ class Evaluator implements Operator {
     let result: MaybePromise<void>;
     try {
       this.checkAborted();
+      if (this.context.stopped?.()) {
+        transfer?.release();
+        return "ready";
+      }
       result = this.#sliced(this.#take(batch));
     } catch (error) {
       this.abort(error);
@@ -1019,7 +1029,7 @@ class Evaluator implements Operator {
     const { ids, starts, breaks, groupOf } = order;
     this.profile.rowsIn += rows.rows;
     this.profile.groupedRows += rows.rows;
-    for (let p = 0; p + 1 < starts.length; p++) {
+    for (let p = 0; p + 1 < starts.length && !this.context.stopped?.(); p++) {
       const s = starts[p] ?? 0;
       const e = starts[p + 1] ?? 0;
       if (e > s && this.#partitionColumn >= 0) {
@@ -1219,6 +1229,7 @@ class Evaluator implements Operator {
         yield* this.#gather(columns, from, r - from);
         from = r;
         yield* this.#flushPartition();
+        if (this.context.stopped?.()) return;
         this.#flag(0, 1);
         continue;
       }
@@ -1421,6 +1432,10 @@ class Evaluator implements Operator {
   *#flushPartition(): SlicedJob<void> {
     const n = this.#rows;
     if (n === 0) return;
+    if (this.context.stopped?.()) {
+      yield* this.#reset();
+      return;
+    }
     this.profile.partitions++;
     this.profile.largestPartition = Math.max(this.profile.largestPartition, n);
     if (this.#run !== null) this.profile.spilledPartitions++;
@@ -1489,6 +1504,7 @@ class Evaluator implements Operator {
       charge: this.charge,
       pool: this.pool,
       slice: this.slice,
+      stopped: () => this.context.stopped?.() === true,
       push: (columns, count) => this.#pushDense(columns, count),
       resultVector: (call, f, values, valid, big, count) => {
         const output = this.#outputs[f];
@@ -1700,11 +1716,15 @@ class Evaluator implements Operator {
     for (let f = 0; f < spec.functions.length; f++) {
       const call = spec.functions[f];
       if (call === undefined) continue;
+      const errorFlags = scratch.resultErrors[f];
+      if (errorFlags === undefined) throw new Error("Missing window error flags");
       const out: NumberResult = {
         values: (scratch.resultValues[f] ?? new Float64Array(0)).subarray(0, n),
         valid: (scratch.resultValid[f] ?? new Uint8Array(0)).subarray(0, n),
         big: null,
+        errors: errorFlags.subarray(0, n),
       };
+      out.errors?.fill(0);
       if (RANKING.has(call.fn)) {
         const amount = this.#amountOf(call, args, scratch, f, n);
         yield* ranking(call.fn as RankingKind, peers, amount, out, this.slice);
@@ -1768,7 +1788,7 @@ class Evaluator implements Operator {
     let at = 0;
     const run = this.#run;
     if (run !== null) {
-      for (let p = 0; p < run.pages.length; p++) {
+      for (let p = 0; p < run.pages.length && !this.context.stopped?.(); p++) {
         let page: { bytes: Uint8Array; charged: number } | null = null;
         yield this.io.readPage(run, p).then((held) => {
           page = held;
@@ -1791,7 +1811,7 @@ class Evaluator implements Operator {
       }
     }
     const store = this.#held;
-    for (let k = 0; k < store.chunkCount; k++) {
+    for (let k = 0; k < store.chunkCount && !this.context.stopped?.(); k++) {
       const columns = this.spec.types.map((_, c) => store.chunk(c, k));
       const rows = Math.min(store.chunkRows, store.rows - k * store.chunkRows);
       yield* this.#push(columns, scratch, at, rows, n);
@@ -1807,6 +1827,21 @@ class Evaluator implements Operator {
     count: number,
     n: number,
   ): SlicedJob<void> {
+    if (this.context.stopped?.()) return;
+    // Deliver the valid prefix before inspecting a later frame. LIMIT may finish, or a
+    // cursor may cancel while this prefix is borrowed, without ever requesting that row.
+    let prefix = count;
+    for (const errors of scratch.resultErrors)
+      for (let i = 0; i < prefix; i++)
+        if (errors[at + i] === 1) {
+          prefix = i;
+          break;
+        }
+    if (prefix < count) {
+      if (prefix > 0) yield* this.#push(held, scratch, at, prefix, n);
+      if (this.context.stopped?.()) return;
+      throw new NumericOutOfRangeError("value out of range: overflow");
+    }
     const columns: Vector[] = this.#withPartition([...held], count);
     for (let f = 0; f < this.spec.functions.length; f++) {
       const call = this.spec.functions[f];
@@ -2059,6 +2094,7 @@ class Scratch {
   readonly ends: Int32Array;
   readonly resultValues: Float64Array[];
   readonly resultValid: Uint8Array[];
+  readonly resultErrors: Uint8Array[];
   readonly targets: Int32Array[];
   readonly argValues: Float64Array[];
   readonly argValid: Uint8Array[];
@@ -2071,9 +2107,9 @@ class Scratch {
   readonly prefix: Float64Array;
 
   static bytes(capacity: number, functions: number, args: number): number {
-    // Peers (5 × 4), bounds (2 × 4), per function 22 (results, targets, a constant amount), per
+    // Peers (5 × 4), bounds (2 × 4), per function 23 (results, errors, targets, a constant amount), per
     // argument 9, and an allowance for the kernels' prefix arrays (12 per row).
-    return capacity * (20 + 8 + 22 * functions + 9 * args + 12) + 12;
+    return capacity * (20 + 8 + 23 * functions + 9 * args + 12) + 12;
   }
 
   constructor(
@@ -2094,6 +2130,7 @@ class Scratch {
     this.ends = new Int32Array(capacity);
     this.resultValues = Array.from({ length: functions }, () => new Float64Array(capacity));
     this.resultValid = Array.from({ length: functions }, () => new Uint8Array(capacity));
+    this.resultErrors = Array.from({ length: functions }, () => new Uint8Array(capacity));
     this.targets = Array.from({ length: functions }, () => new Int32Array(capacity));
     this.argValues = Array.from({ length: args }, () => new Float64Array(capacity));
     this.argValid = Array.from({ length: args }, () => new Uint8Array(capacity));

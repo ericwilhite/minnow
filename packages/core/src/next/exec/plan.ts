@@ -104,6 +104,8 @@ import {
   type WindowFunctionSpec,
 } from "./window.js";
 
+import { windowSuppliesOrder } from "./window-order.js";
+
 type Stop = () => boolean;
 type Recipe = (
   runtime: QueryRuntime,
@@ -707,6 +709,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   )
     terminalInput = terminalInput.input;
   const prepare = (rel: Rel): Recipe => {
+    if (rel.op === "sort" && !rel.withTies && windowSuppliesOrder(rel.input, rel.keys))
+      rel = { ...rel, op: "limit" };
+
     if (ids.has(rel.id))
       throw new UnsupportedPlanError("a repeated relational operator id", { construct: "plan" });
     ids.add(rel.id);
@@ -1673,6 +1678,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           grant: Grant | null,
           downstream: Operator,
           runtime?: QueryRuntime,
+          stops: readonly Stop[] = [],
         ) => {
           const extended = { ...context, input: keys.types };
           const output = new ProjectOperator(
@@ -1749,7 +1755,11 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             );
           else {
             if (windowSpec === null) throw new TypeError("missing window specification");
-            breaker = new WindowOperator(windowSpec, shared, output);
+            breaker = new WindowOperator(
+              windowSpec,
+              { ...shared, stopped: () => stops.some((stop) => stop()) },
+              output,
+            );
           }
           return { operator: new ProjectOperator(physical.exprs, context, breaker), breaker };
         };
@@ -1771,7 +1781,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         // this recipe's kernel arena; adding all measured bytes would count pools twice.
         const minimum = base + measured;
         fixed(rel, minimum);
-        return (runtime, downstream) =>
+        return (runtime, downstream, stops) =>
           rel.op === "sort" && runtime.bounds(rel).limit === 0
             ? downstream.finish()
             : instantiate(
@@ -1781,7 +1791,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 minimum + (phases.get(runtime)?.savedWindows.get(rel.id)?.minimumBytes ?? 0),
                 BATCH_ROWS,
                 (context, grant) =>
-                  make(context, grant, counted(runtime, rel, downstream), runtime),
+                  make(context, grant, counted(runtime, rel, downstream), runtime, stops),
                 ({ operator, breaker }) => {
                   if (breaker === null) throw new TypeError("missing execution breaker");
                   runtime.onAbort((reason) => operator.abort(reason));
