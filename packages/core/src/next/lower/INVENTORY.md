@@ -434,8 +434,11 @@ through B4's shared idle pool. Owned parameter bindings survive that handoff. De
 separately admitted single-row buffer; it neither reopens consumed sources nor replays completed rows.
 Filter/LIMIT demand and the stream position of row data errors survive the checkpoint; cancellation
 and storage faults still unwind immediately.
-Unary and EXCEPT parents are supported. Under retaining join/window parents, expanding JSON stays
-an explicit typed execution refusal (`0A000`, checkpoint seam pending) until B7 supplies that seam.
+Unary, EXCEPT, supported join and window parents share the same JSON/hybrid-aggregate
+checkpoint controller. Only retaining ancestors participate; consumed join builds are not reopened.
+Checkpointable windows use their complete native initial minimum and separately admitted restore
+workspace before copying. Both producer kinds retain one shared idle account and cleanup ownership
+through cancellation, I/O faults and concurrent continuations.
 Document parameters, lazy init values, foreign expanding document producers, front-end materialized
 JSON/JSONB literals and JSON ↔ JSONB casts remain explicit refusals. JSON paths, construction and
 aggregation remain separate work; guide-7/8 remain the only two catalogue refusals (64/66 execute).

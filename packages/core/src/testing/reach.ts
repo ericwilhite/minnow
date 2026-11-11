@@ -3319,7 +3319,7 @@ export const JSONB_DEMAND_REACH = [
 export const JSONB_PARENT_REACH = [
   "left arm",
   "right arm",
-  "retaining seam refused",
+  "retaining window supported",
   "unary/EXCEPT supported",
   "descendant excluded",
   "sibling excluded",
@@ -3553,4 +3553,112 @@ export const RETAINED_PARENT_IO_REACH = [
   "task deadline",
   "abort task resumption",
   "reclaim waits for checkpoint",
+] as const;
+
+/** SQL producer cuts must pass through the shared retaining-parent controller. */
+export const RETAINING_CONSUMER_REACH = [
+  "join",
+  "window",
+  "build",
+  "probe",
+  "JSON cut",
+  "native checkpoint",
+  "PG exact",
+  "kind INNER",
+  "kind LEFT",
+  "kind RIGHT",
+  "kind FULL",
+  "kind CROSS",
+  "kind semi",
+  "kind anti",
+  "kind mark",
+  "descendant excluded",
+  "actual build",
+  "actual probe",
+] as const;
+
+/** Observe both producer kinds reaching the SAME retaining-parent admission path. */
+export const RETAINING_AGGREGATE_REACH = [
+  "join",
+  "window",
+  "build",
+  "probe",
+  "aggregate cut",
+  "JSON cut",
+  "mixed producers",
+  "observed spill",
+  "shared idle account",
+  "PG exact",
+  "zero grants/files",
+  "kind INNER",
+  "kind LEFT",
+  "kind RIGHT",
+  "kind FULL",
+  "kind CROSS",
+  "kind semi",
+  "kind anti",
+  "kind mark",
+  "EXCEPT left retained",
+  "actual build",
+  "actual probe",
+] as const;
+
+/** Consumer-level owners, not merely native checkpoint API calls, survive pressure/failure. */
+export const RETAINING_LIFECYCLE_REACH = [
+  "producer json",
+  "producer aggregate",
+  "producer mixed",
+  "edge checkpoint",
+  "edge suspend",
+  "edge admission",
+  "edge restore",
+  "edge close",
+  "resume",
+  "cancel",
+  "fault",
+  "queued pressure",
+  "snapshot publication",
+  "owned parameters",
+  "demand",
+  "mixed transition",
+  "concurrent survivor",
+  "one idle account",
+  "large binding",
+  "small binding",
+  "limit 1",
+  "limit 2",
+  "limit 3",
+  "zero files/grants",
+  "restore bytes before construction",
+  "consumed build excluded",
+] as const;
+
+/** A native retaining parent must preserve demand and saved terminal error position. */
+export const RETAINING_ERROR_REACH = [
+  "zero demand",
+  "valid prefix",
+  "terminal error",
+  "state 22P02",
+  "state 22003",
+  "state 22P05",
+  "limit 0",
+  "limit 1",
+  "limit 5",
+  "limit 6",
+  "streaming projection",
+  "eager barrier",
+] as const;
+
+/** The same ancestry law applies to JSON and aggregate producers, independent of live callbacks. */
+export const RETAINING_GRAPH_REACH = [
+  "JSON producer",
+  "aggregate producer",
+  "join ancestor",
+  "window ancestor",
+  "EXCEPT ancestor",
+  "left path",
+  "right path",
+  "descendant excluded",
+  "sibling excluded",
+  "no retaining ancestor",
 ] as const;

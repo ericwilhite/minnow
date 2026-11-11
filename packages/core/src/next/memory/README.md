@@ -260,14 +260,19 @@ bounded fixed-width keys use the admitted I/O budget for emission, so an unchang
 resident group does not need fresh hash headroom merely to produce its result. Waits
 remain cancellable and use the shared task clock; cleanup drains all started I/O.
 
-The phase handoff reconstructs unary parents and checkpoints retained EXCEPT counts,
-first-left ordinals and representatives. A completed EXCEPT left arm is not reopened.
+JSON and hybrid-aggregate handoffs use one ancestor registry and the same shared idle account.
+They reconstruct unary parents and checkpoint retained EXCEPT counts, first-left ordinals and
+representatives, join build/match/deferred-probe state, and pre-evaluation window inputs.
+Completed EXCEPT left arms and completed join builds are excluded from restore admission and
+never reopened. Checkpointable windows pay the full native initial minimum, including hidden
+ordinal sorting; additional saved reader/copy bytes are added once from immutable base entries
+and admitted before construction or reads.
 Each sealed cut stays in an execution-owned cleanup slot across producer suspension,
 restore admission, parameter binding and the resumed recipe. Installing the next owner
 precedes clearing the previous slot. Cancellation drains both pending and resumed cuts
 before the execution settles; tests check spill bytes before the shared service closes.
-Current limits: retaining join parents and computed arguments without a proven
-materialization boundary use the external fallback; direct-column FILTER transitions
+Current limits: computed arguments without a proven materialization boundary use the
+external fallback; direct-column FILTER transitions
 have a conservative full-batch growth bound. Varlen CASE output in an ordinary projection
 has a separate transient-pressure allocation gap, reproduced on main; this hash-state
 protocol does not make that expression buffer resumable. Genuinely ordered DISTINCT and

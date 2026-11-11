@@ -109,29 +109,47 @@ export function jsonInputsBounded(expr: ScalarExpr, input: Rel): boolean {
   return true;
 }
 
-/** Only retaining ancestors participate in a JSON cut. A live descendant can be
+/** Only retaining ancestors participate in a JSON or aggregate cut. A live descendant can be
  * awaiting the cut's finish(), and must never be checkpointed from that same cut. */
-export function jsonRetainingParents(root: Rel): {
+export function phaseRetainingParents(root: Rel): {
   readonly supported: ReadonlySet<number>;
   readonly excepts: ReadonlyMap<number, ReadonlySet<number>>;
+  readonly joins: ReadonlyMap<number, ReadonlySet<number>>;
+  readonly windows: ReadonlyMap<number, ReadonlySet<number>>;
 } {
   const supported = new Set<number>(),
-    excepts = new Map<number, ReadonlySet<number>>();
-  const visit = (rel: Rel, allowed: boolean, ancestors: readonly number[]): void => {
+    excepts = new Map<number, ReadonlySet<number>>(),
+    joins = new Map<number, ReadonlySet<number>>(),
+    windows = new Map<number, ReadonlySet<number>>();
+  const visit = (
+    rel: Rel,
+    allowed: boolean,
+    ancestors: readonly number[],
+    joinIds: readonly number[],
+    windowIds: readonly number[],
+  ): void => {
     if (allowed) {
       supported.add(rel.id);
       excepts.set(rel.id, new Set(ancestors));
+      joins.set(rel.id, new Set(joinIds));
+      windows.set(rel.id, new Set(windowIds));
     }
-    const next = allowed && rel.op !== "join" && rel.op !== "window";
-    if ("input" in rel) visit(rel.input, next, ancestors);
+    if ("input" in rel)
+      visit(
+        rel.input,
+        allowed,
+        ancestors,
+        joinIds,
+        rel.op === "window" ? [...windowIds, rel.id] : windowIds,
+      );
     if ("left" in rel && "right" in rel) {
-      visit(rel.left, false, ancestors);
-      visit(rel.right, false, ancestors);
+      visit(rel.left, allowed, ancestors, [...joinIds, rel.id], windowIds);
+      visit(rel.right, allowed, ancestors, [...joinIds, rel.id], windowIds);
     }
     if ("inputs" in rel)
       for (const input of rel.inputs)
-        visit(input, next && rel.kind === "except", [...ancestors, rel.id]);
+        visit(input, allowed && rel.kind === "except", [...ancestors, rel.id], joinIds, windowIds);
   };
-  visit(root, true, []);
-  return { supported, excepts };
+  visit(root, true, [], [], []);
+  return { supported, excepts, joins, windows };
 }

@@ -39,8 +39,10 @@ Raw JSON prepays an input-sized workspace and retains its spelling. JSONB text c
 extraction preserve exact decimal scale, PostgreSQL key ordering and last-duplicate semantics.
 Expanding JSON uses bounded native spill fragments, retires its producer, then waits cancellably
 for complete re-admission through the shared idle pool. Completed rows are delivered once from
-files using a separately funded row buffer. Unary/EXCEPT parents are supported; retaining
-join/window parents await B7's checkpoint seam and return typed 0A000 refusals.
+files using a separately funded row buffer. JSON and eligible hybrid-aggregate producers use
+one ancestor registry, admission/restore controller and shared idle account through unary, EXCEPT,
+join and window parents. Consumed build siblings are not reopened. Window initial and additional
+restore workspace are fully admitted before construction or reads.
 Document parameters, unbounded foreign document producers, front-end materialized JSON/JSONB
 without source spelling, JSON paths, construction and aggregation remain typed refusals.
 Canonical traversal is iterative and charged, with quadratic CPU for wide objects.
@@ -1908,8 +1910,10 @@ shipped-engine or stored-format change.
   EXCEPT parent counts, representatives and first-left ordinals are checkpointed before
   retiring its right aggregate; completed left producers are not reopened. Generated pressure
   covers an already-spilled left arm, ALL/DISTINCT, cancellation and exact wide integers.
-  Current limits: variable-state handoffs below a retaining join parent, and computed aggregate
-  arguments without a proven materialization boundary, still use the external fallback.
+  Retaining join/window parents now share the same checkpoint registry and restore admission
+  with JSON producers. Saved joins preserve match bits and skip consumed build arms; windows
+  retain input ordinals before evaluation begins. Computed aggregate arguments without a
+  proven materialization boundary still use the external fallback.
   Direct-column FILTER transitions use conservative full-batch growth bounds. Pressure-only
   restoration pays sorting/I/O and a planned bounded minimum; plentiful-memory hash does not
   spool or select that route. B1's separately routed uncharged
@@ -3299,7 +3303,7 @@ clock and is reported separately. No timing campaign or absolute target pass is 
 ### Native retaining-parent checkpoints
 
 The join and window expose pressure-only native checkpoint primitives. These are
-internal operator APIs; SQL phase wiring remains a separate integration step.
+internal operator APIs used by the shared JSON/HybridPhase SQL controller.
 The planner must checkpoint retaining ancestors only, after the active input push
 has become ready and before a window's evaluation starts. Checkpointing a live
 descendant returning from `finish()` is invalid.
@@ -3333,5 +3337,8 @@ The native generated suites compare two successive restores with PGlite, includi
 observed spills, all join kinds, match bits, window peers, non-associative float
 sums, NULLs, dictionaries and selections. Separate gated I/O histories cover
 cancellation, injected failures and concurrent saved-file closure. These operator
-checks do not replace end-to-end JSON/aggregate phase admission, snapshot, demand
-or consumed-source checks in the phase planner.
+checks complement the generated SQL consumer suites: mixed JSON/aggregate cuts, exact
+PGlite rows, pressure, snapshots, demand, owned parameters, concurrent survivors and injected
+checkpoint/retirement/admission/restore/close failures. The controller tests also verify exact
+additional window restore bytes, consumed-build admission pruning and zero open file owners.
+The witnesses are finite; they do not claim exhaustive schedules or browser memory measurements.

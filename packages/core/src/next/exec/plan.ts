@@ -4,6 +4,8 @@ import {
   validateRecursive,
   compileRecursiveStep,
 } from "./recursive.js";
+import type { JoinCheckpoint } from "./join-checkpoint.js";
+import type { WindowCheckpoint } from "./window-checkpoint.js";
 import { SeriesOperator } from "./series.js";
 import { rankingBounds } from "./window-topk-plan.js";
 import { Slice, runSliced, type SlicedJob } from "./slices.js";
@@ -19,7 +21,7 @@ import {
 } from "./except.js";
 import { readValue, boundSource, type ReadSource, type ReadBound } from "../page/read-bounds.js";
 import { batchTargetFor, type Grant } from "../memory/governor.js";
-import { jsonLiteralBytes, jsonInputsBounded, jsonRetainingParents } from "./json-plan.js";
+import { jsonLiteralBytes, jsonInputsBounded, phaseRetainingParents } from "./json-plan.js";
 import { JsonExpressions } from "./json-expressions.js";
 import {
   JsonPhaseOperator,
@@ -90,6 +92,7 @@ import {
 import {
   WindowOperator,
   windowMinimumBytes,
+  windowRetainingMinimumBytes,
   validateWindowSpec,
   type WindowFunctionSpec,
 } from "./window.js";
@@ -526,7 +529,14 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     loanSlots = 0,
   ) => admissions.push({ rel, minimum, owner, loanSlots });
   let nextPhysicalId = 0;
+  const potentialHybridIds = new Set<number>();
   const findIds = (rel: Rel): void => {
+    if (
+      !plan.volatile &&
+      options.aggregationProgress !== false &&
+      (rel.op === "aggregate" || rel.op === "distinct")
+    )
+      potentialHybridIds.add(rel.id);
     nextPhysicalId = Math.max(nextPhysicalId, rel.id + 1);
     if (rel.op === "recursive") {
       findIds(rel.base);
@@ -563,6 +573,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   const jsonPlanners = new Map<number, number>();
   const jsonCapacities = new WeakMap<QueryRuntime, Map<number, number>>();
   const jsonFrontier = new WeakMap<QueryRuntime, number | null>();
+  const nativeParentIds = new Set<number>();
   const jsonDescendants = new Set<number>();
   const findJson = (rel: Rel): boolean => {
     let found =
@@ -579,30 +590,74 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     return found;
   };
   findJson(plan.root);
-  // Ordinary plans need no per-relation JSON retention metadata.
-  const { supported: jsonParents, excepts: jsonExceptParents } =
-    jsonDescendants.size > 0
-      ? jsonRetainingParents(plan.root)
-      : { supported: new Set<number>(), excepts: new Map<number, ReadonlySet<number>>() };
+  // Ordinary plans without possible JSON/hybrid cuts need no retention metadata.
+  const {
+    supported: phaseParents,
+    excepts: exceptParents,
+    joins: joinParents,
+    windows: windowParents,
+  } = jsonDescendants.size > 0 || potentialHybridIds.size > 0
+    ? phaseRetainingParents(plan.root)
+    : {
+        supported: new Set<number>(),
+        excepts: new Map<number, ReadonlySet<number>>(),
+        joins: new Map<number, ReadonlySet<number>>(),
+        windows: new Map<number, ReadonlySet<number>>(),
+      };
+  const checkpointableWindows = new Set<number>();
+  const registerPhaseProducer = (id: number): void => {
+    for (const window of windowParents.get(id) ?? []) checkpointableWindows.add(window);
+  };
   interface Phases {
     resume: Cut | null;
     pending: Cut | null;
     readonly excepts: Map<number, ExceptOperator>;
     readonly retained: Map<number, ExceptCheckpoint>;
+    readonly joins: Map<number, HashJoin>;
+    readonly windows: Map<number, WindowOperator>;
+    readonly savedJoins: Map<number, JoinCheckpoint>;
+    readonly savedWindows: Map<number, WindowCheckpoint>;
   }
   const phases = new WeakMap<QueryRuntime, Phases>();
-  // Unary ancestors are empty until their aggregate child emits. EXCEPT checkpoints
-  // exact counted left/right records before retirement; joins still need their own seam.
-  const phaseCapable = new Set<number>();
-  const markPhases = (rel: Rel, unary: boolean): void => {
-    if (unary && (rel.op === "aggregate" || rel.op === "distinct")) phaseCapable.add(rel.id);
-    if ("input" in rel) markPhases(rel.input, unary);
-    if ("left" in rel) markPhases(rel.left, false);
-    if ("right" in rel) markPhases(rel.right, false);
-    if ("inputs" in rel)
-      for (const input of rel.inputs) markPhases(input, unary && rel.kind === "except");
+  const checkpointRetainingParents = async (state: Phases, cutRelId: number): Promise<void> => {
+    for (const [id, parent] of state.excepts) {
+      // A descendant may still be returning from finish(), awaiting this
+      // cut. Only retaining ANCESTORS belong to this continuation.
+      if (!exceptParents.get(cutRelId)?.has(id)) continue;
+      const saved = await parent.checkpoint(),
+        prior = state.retained.get(id);
+      state.retained.set(id, saved);
+      await prior?.records.close();
+    }
+    // Publish every saved owner BEFORE closing the old one or awaiting retirement.
+    // Actors remain live until graph unwind; only ancestor IDs participate.
+    for (const [id, parent] of state.joins) {
+      if (!joinParents.get(cutRelId)?.has(id)) continue;
+      const saved = await parent.checkpoint(),
+        prior = state.savedJoins.get(id);
+      state.savedJoins.set(id, saved);
+      await prior?.close();
+    }
+    for (const [id, parent] of state.windows) {
+      if (!windowParents.get(cutRelId)?.has(id)) continue;
+      const saved = await parent.checkpoint(),
+        prior = state.savedWindows.get(id);
+      state.savedWindows.set(id, saved);
+      await prior?.close();
+    }
   };
-  markPhases(plan.root, true);
+
+  // Both producer kinds use the same ancestor graph and native checkpoint ownership.
+  const phaseCapable = new Set<number>();
+  const markPhases = (rel: Rel): void => {
+    if (phaseParents.has(rel.id) && (rel.op === "aggregate" || rel.op === "distinct"))
+      phaseCapable.add(rel.id);
+    if ("input" in rel) markPhases(rel.input);
+    if ("left" in rel) markPhases(rel.left);
+    if ("right" in rel) markPhases(rel.right);
+    if ("inputs" in rel) for (const input of rel.inputs) markPhases(input);
+  };
+  markPhases(plan.root);
   const aggregatePlanners = new Map<
     number,
     {
@@ -923,13 +978,14 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             (operator) => operator.abort(undefined),
           );
           if (jsonDescendants.has(rel.id)) {
-            if (!jsonParents.has(rel.id))
+            if (!phaseParents.has(rel.id))
               throw new UnsupportedPlanError(
                 "expanding JSON under a join/window retaining parent (checkpoint seam pending)",
                 { construct: "function" },
               );
             const base = Math.max(4096, minimum) + JSON_PHASE_FIXED + 2 * JSON_PHASE_IO;
             jsonPlanners.set(rel.id, base);
+            registerPhaseProducer(rel.id);
             fixed(rel, base);
             jsonWorkspaces.set(rel.id, 0);
             return (runtime, downstream, stops, rowsNeeded) => {
@@ -978,15 +1034,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                         if (!state || state.pending)
                           throw new Error("Missing/overlapping JSON phase owner");
                         state.pending = { kind: "json", rel: rel.id, phase };
-                        for (const [id, parent] of state.excepts) {
-                          // A descendant may still be returning from finish(), awaiting this
-                          // cut. Only retaining ANCESTORS belong to this continuation.
-                          if (!jsonExceptParents.get(rel.id)?.has(id)) continue;
-                          const saved = await parent.checkpoint(),
-                            prior = state.retained.get(id);
-                          state.retained.set(id, saved);
-                          await prior?.records.close();
-                        }
+                        await checkpointRetainingParents(state, rel.id);
                         runtime.beginHandoff();
                       },
                     },
@@ -1335,6 +1383,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             dictionary: plan.volatile ? null : dictionaryHashShape(aggregate, input),
             domain,
           });
+          if (aggregatePlanners.get(rel.id)?.hybrid != null) registerPhaseProducer(rel.id);
           fixed(rel, external.minimum, rel.id, external.loans);
           return (runtime, downstream) => {
             const strategy = aggregateChoices.get(runtime)?.get(rel.id);
@@ -1396,14 +1445,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                             handoff: async (phase: HybridPhase) => {
                               if (state.pending) throw new Error("Concurrent aggregate handoffs");
                               state.pending = { kind: "aggregate", rel: rel.id, phase };
-                              // An EXCEPT right arm can retire only after preserving its
-                              // accumulated/spilled left counts and first representatives.
-                              for (const [id, parent] of state.excepts) {
-                                const saved = await parent.checkpoint();
-                                const previous = state.retained.get(id);
-                                state.retained.set(id, saved);
-                                await previous?.records.close();
-                              }
+                              await checkpointRetainingParents(state, rel.id);
                               runtime.beginHandoff();
                             },
                           }
@@ -1526,6 +1568,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       }
       case "sort":
       case "window": {
+        if (rel.op === "window") nativeParentIds.add(rel.id);
         if (rel.op === "sort" && options.groupTopN !== false) {
           const shape = groupTopNShape(rel);
           if (shape) groupTops.set(shape.aggregate.id, shape.spec);
@@ -1584,6 +1627,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               ? {
                   types: physical.types,
                   ...(bound === undefined ? {} : { topK: bound }),
+                  ...(checkpointableWindows.has(rel.id) ? { checkpointable: true } : {}),
                   partitionBy: rel.partitionBy.map(physical.index),
                   orderBy: (keys as ReturnType<typeof setupWindow>).orderBy.map((key) => ({
                     ...key,
@@ -1656,7 +1700,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         const base =
           rel.op === "sort"
             ? sortMinimumBytes(keys.types)
-            : windowMinimumBytes(physical.types, rel.functions.length);
+            : checkpointableWindows.has(rel.id)
+              ? windowRetainingMinimumBytes(physical.types, rel.functions.length)
+              : windowMinimumBytes(physical.types, rel.functions.length);
         // The operator helper already includes its constructor's fixed buffers. Add only
         // this recipe's kernel arena; adding all measured bytes would count pools twice.
         const minimum = base + measured;
@@ -1668,7 +1714,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 runtime,
                 rel,
                 input,
-                minimum,
+                minimum + (phases.get(runtime)?.savedWindows.get(rel.id)?.minimumBytes ?? 0),
                 BATCH_ROWS,
                 (context, grant) =>
                   make(context, grant, counted(runtime, rel, downstream), runtime),
@@ -1676,16 +1722,34 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                   if (breaker === null) throw new TypeError("missing execution breaker");
                   runtime.onAbort((reason) => operator.abort(reason));
                   runtime.dispose(() => breaker.closed);
-                  return then(child(runtime, operator, []), () => {
-                    const p = breaker.profile,
-                      out = runtime.profile(rel);
-                    out.spilledBytes = p.spilledBytes + ("sort" in p ? p.sort.spilledBytes : 0);
-                    out.spillPasses = "mergePasses" in p ? p.mergePasses : p.sort.mergePasses;
-                  });
+                  return (async () => {
+                    const state = phases.get(runtime);
+                    if (breaker instanceof WindowOperator) state?.windows.set(rel.id, breaker);
+                    try {
+                      const saved = state?.savedWindows.get(rel.id);
+                      if (saved && breaker instanceof WindowOperator) {
+                        await breaker.restore(saved);
+                        if (state?.savedWindows.get(rel.id) === saved)
+                          state.savedWindows.delete(rel.id);
+                      }
+                      await child(runtime, operator, []);
+                      const p = breaker.profile,
+                        out = runtime.profile(rel);
+                      out.spilledBytes = p.spilledBytes + ("sort" in p ? p.sort.spilledBytes : 0);
+                      out.spillPasses = "mergePasses" in p ? p.mergePasses : p.sort.mergePasses;
+                    } catch (error) {
+                      operator.abort(error);
+                      await breaker.closed.catch(() => undefined);
+                      throw error;
+                    } finally {
+                      state?.windows.delete(rel.id);
+                    }
+                  })();
                 },
               );
       }
       case "join": {
+        nativeParentIds.add(rel.id);
         if (
           rel.algorithm === "nestedLoop" &&
           (rel.leftKeys.length !== 0 || rel.rightKeys.length !== 0)
@@ -1736,13 +1800,17 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           const join =
             runtime === undefined || grant === null
               ? null
-              : new HashJoin(spec, {
-                  grant,
-                  spill: runtime.request.spill,
-                  queryId: runtime.request.queryId,
-                  relId: rel.id,
-                  signal: runtime.signal,
-                });
+              : new HashJoin(
+                  spec,
+                  {
+                    grant,
+                    spill: runtime.request.spill,
+                    queryId: runtime.request.queryId,
+                    relId: rel.id,
+                    signal: runtime.signal,
+                  },
+                  phases.get(runtime)?.savedJoins.get(rel.id),
+                );
           const output = columns(lk.types).slice(0, lt.length);
           if (rel.kind === "mark")
             output.push({ op: "column", index: lk.types.length, type: { kind: "bool" } });
@@ -1806,14 +1874,30 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               if (join === null) throw new TypeError("missing execution join");
               runtime.onAbort((reason) => join.abort(reason));
               runtime.dispose(() => join.closed);
-              return then(right(runtime, build, []), () =>
-                then(left(runtime, probe, stops), () => {
+              return (async () => {
+                const state = phases.get(runtime);
+                state?.joins.set(rel.id, join);
+                try {
+                  const saved = state?.savedJoins.get(rel.id);
+                  if (saved) {
+                    await join.restore(saved);
+                    if (state?.savedJoins.get(rel.id) === saved) state.savedJoins.delete(rel.id);
+                  }
+                  if (!join.buildComplete) await right(runtime, build, []);
+                  if (runtime.handingOff) return;
+                  await left(runtime, probe, stops);
                   const p = join.profile,
                     out = runtime.profile(rel);
                   out.spilledBytes = p.spilledBytes;
                   out.spillPasses = p.spillPasses;
-                }),
-              );
+                } catch (error) {
+                  join.abort(error);
+                  await join.closed.catch(() => undefined);
+                  throw error;
+                } finally {
+                  state?.joins.delete(rel.id);
+                }
+              })();
             },
           );
       }
@@ -2114,9 +2198,13 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         const children =
           "inputs" in node
             ? node.inputs.filter((_, i) => i !== 0 || !state?.retained.get(node.id)?.leftDone)
-            : "input" in node
-              ? [node.input]
-              : [];
+            : "left" in node && "right" in node
+              ? state?.savedJoins.get(node.id)?.buildComplete
+                ? [node.left]
+                : [node.right, node.left]
+              : "input" in node
+                ? [node.input]
+                : [];
         for (const child of children) {
           const next = search(child);
           if (next !== null) return next;
@@ -2144,6 +2232,26 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             : 0;
         entry.loanSlots = 0;
       }
+    };
+    const nativeBase = new Map(
+      entries.map((entry) => [
+        entry.rel.id,
+        { minimum: entry.minimum, loanSlots: entry.loanSlots },
+      ]),
+    );
+    const configureRetained = (list: typeof entries): number => {
+      const state = phases.get(runtime);
+      let progress = 0;
+      for (const entry of list) {
+        const saved = state?.savedJoins.get(entry.rel.id) ?? state?.savedWindows.get(entry.rel.id);
+        if (!nativeParentIds.has(entry.rel.id)) continue;
+        const base = nativeBase.get(entry.rel.id);
+        if (!base) throw new Error("Missing retained-parent admission");
+        entry.minimum = base.minimum + (saved?.minimumBytes ?? 0);
+        entry.loanSlots = base.loanSlots + (saved?.restoreLoanSlots ?? 0);
+        progress = Math.max(progress, saved?.progressBytes ?? 0);
+      }
+      return progress;
     };
     configureJson(entries, null);
     const demand = new Map<number, number>();
@@ -2274,6 +2382,10 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           pending: null,
           excepts: new Map(),
           retained: new Map(),
+          joins: new Map(),
+          windows: new Map(),
+          savedJoins: new Map(),
+          savedWindows: new Map(),
         };
         phases.set(runtime, state);
         const guarded: Operator = {
@@ -2310,7 +2422,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                   }
                 } else if ("left" in node && "right" in node) {
                   visitRemaining(node.left);
-                  visitRemaining(node.right);
+                  if (!state.savedJoins.get(node.id)?.buildComplete) visitRemaining(node.right);
                 } else if ("input" in node) visitRemaining(node.input);
               };
               visitRemaining(plan.root);
@@ -2342,6 +2454,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 aggregateChoices.get(runtime)?.set(cut.rel, restore);
               }
               configureJson(next, cut);
+              const parentProgress = configureRetained(next);
               // A cut in EXCEPT's left arm leaves its right input unopened. Carry the
               // original publication-stable bounds for those future sources into admission.
               let io = 0,
@@ -2351,7 +2464,13 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                   io = Math.max(io, bound.io);
                   progress = Math.max(progress, bound.progress);
                 }
-              runtime.readMinimum(io, progress, cut.phase.progressBytes);
+              runtime.readMinimum(io, progress, Math.max(cut.phase.progressBytes, parentProgress));
+              if (jsonPlanners.size > 0)
+                runtime.resultProgressEnvelope(
+                  jsonFrontier.get(runtime) !== null
+                    ? 0
+                    : Math.max(cut.phase.progressBytes, parentProgress),
+                );
               const binding = cut.phase.parameters.phaseBinding(runtime.signal);
               const logicalInputs = binding.logicalBytes ?? binding.bytes;
               if (
@@ -2384,8 +2503,14 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             const cleanup = await Promise.allSettled([
               ...[...retained].map((phase) => closePhase(phase)),
               ...[...state.retained.values()].map((saved) => saved.records.close()),
+              ...[...state.savedJoins.values()].map((saved) => saved.close()),
+              ...[...state.savedWindows.values()].map((saved) => saved.close()),
             ]);
             state.retained.clear();
+            state.savedJoins.clear();
+            state.savedWindows.clear();
+            state.joins.clear();
+            state.windows.clear();
             phases.delete(runtime);
             idle.release();
             const errors = cleanup
