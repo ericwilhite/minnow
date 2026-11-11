@@ -1924,6 +1924,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             await recipe(runtime, guarded, []);
             while (state.pending) {
               const cut: Cut = state.pending;
+              // Keep a cleanup owner before clearing pending: producer suspension
+              // itself awaits consumer credit and can reject on cancellation.
+              state.resume = cut;
               state.pending = null;
               await runtime.suspendProducer(sink, idle.pool);
               const remaining = new Set<number>();
@@ -1950,7 +1953,6 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               aggregate.minimum = restore.minimum;
               aggregate.loanSlots = restore.loans;
               aggregateChoices.get(runtime)?.set(cut.rel, restore);
-              state.resume = cut;
               // A cut in EXCEPT's left arm leaves its right input unopened. Carry the
               // original publication-stable bounds for those future sources into admission.
               let io = 0,
@@ -1975,9 +1977,13 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             failure = error;
           }
           {
-            const retained = state.pending ?? state.resume;
+            // A resumed recipe may already have installed its next cut. Both
+            // slots remain owned until the corresponding files have drained.
+            const retained = new Set(
+              [state.pending, state.resume].flatMap((cut) => (cut ? [cut.phase] : [])),
+            );
             const cleanup = await Promise.allSettled([
-              ...(retained ? [closeHybridPhase(retained.phase)] : []),
+              ...[...retained].map((phase) => closeHybridPhase(phase)),
               ...[...state.retained.values()].map((saved) => saved.records.close()),
             ]);
             state.retained.clear();

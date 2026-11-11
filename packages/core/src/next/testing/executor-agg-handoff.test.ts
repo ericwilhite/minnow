@@ -433,11 +433,14 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
               await Promise.allSettled(jobs);
               await Promise.allSettled(executions.flatMap((e) => [e.executed, e.delivered]));
               snapshot.release();
-              await scratch?.close();
+              try {
+                expect(spill.bytesInUse).toBe(0);
+                expect(governor.usedBytes).toBe(0);
+              } finally {
+                await scratch?.close();
+              }
             }
             if (scratch) reach.reach("scratch service");
-            expect(spill.bytesInUse).toBe(0);
-            expect(governor.usedBytes).toBe(0);
             reach.reach("zero");
           },
         ),
