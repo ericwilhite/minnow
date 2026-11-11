@@ -1,4 +1,4 @@
-/** Node compiled-dist paired sort bench. Input/validation are untimed; both result boundaries
+/** Node compiled-dist paired sort/window bench. Input/validation are untimed; both boundaries
  * are reported. --fixture <v8 capture> selects the isolated operator; absent it loads W1M.
  * TMPDIR controls scratch. No benchmark assertion is a substitute for generated PG suites.
  */
@@ -13,6 +13,9 @@ import { pairedCPU } from "./lib/paired-cpu.mts";
 import { Governor } from "../packages/core/dist/next/memory/governor.js";
 import { MemorySpillService } from "../packages/core/dist/next/spill/memory-spill.js";
 import { SortOperator, sortMinimumBytes } from "../packages/core/dist/next/exec/sort.js";
+import { WindowOperator, windowMinimumBytes } from "../packages/core/dist/next/exec/window.js";
+import { windowShape } from "../packages/core/dist/next/exec/window-bench-fixtures.js";
+import type { Operator } from "../packages/core/dist/next/exec/pipeline.js";
 import { drive } from "../packages/core/dist/next/exec/pipeline.js";
 import { ArraySource } from "../packages/core/dist/next/exec/join-fixtures.js";
 import { createExecutor } from "../packages/core/dist/next/exec/create.js";
@@ -52,12 +55,14 @@ interface Result {
   digest: string;
   columnarRows?: number;
   sort?: SortOperator["profile"];
+  window?: WindowOperator["profile"];
 }
 const records: unknown[] = [];
 const compareStage = option("--compare-stage", "numeric");
-if (!["numeric", "ownership", "dictionary", "compression"].includes(compareStage))
+if (!["numeric", "ownership", "dictionary", "compression", "windowTopK"].includes(compareStage))
   throw new RangeError("Unknown comparison stage");
 const compileFlags = (candidate: boolean) => ({
+  windowTopK: compareStage !== "windowTopK" || candidate,
   columnarSort: compareStage !== "numeric" || candidate,
   sortOwnership: compareStage !== "ownership" || candidate,
   sortDictionaries: compareStage !== "dictionary" || candidate,
@@ -88,6 +93,9 @@ const metadata = {
         "packages/core/dist/next/exec/sort-compress.js",
         "packages/core/dist/next/exec/sort-lsd.js",
         "packages/core/dist/next/exec/plan.js",
+        "packages/core/dist/next/exec/window.js",
+        "packages/core/dist/next/exec/window-sort.js",
+        "packages/core/dist/next/exec/window-frames.js",
         "scripts/next-sort-columnar-bench.mts",
       ].map(async (path) => [
         path,
@@ -146,6 +154,8 @@ async function compare(
       verificationOnly: true,
       controlSort: first.sort,
       enabledSort: second.sort,
+      controlWindow: first.window,
+      enabledWindow: second.window,
     });
     await save();
     return;
@@ -372,9 +382,125 @@ async function measureComponent(fixture: NumericInput) {
   });
 }
 
+/** Native window plus its unchanged rank predicate/outer order, from decoded columns. */
+async function measureWindow(fixture: NumericInput, name: string) {
+  const ranking = name === "topk" || name === "rank";
+  const shape = windowShape(name, 0, false);
+  const orderBy = shape.spec.orderBy.map((key) => ({
+    ...key,
+    nulls: key.direction === "desc" ? ("first" as const) : ("last" as const),
+  }));
+  const types = fixture.types;
+  if (JSON.stringify(types) !== JSON.stringify(shape.types))
+    throw new Error("window fixture types differ");
+  const outputTypes = [...types, ...shape.spec.functions.map((call) => call.type)];
+  const columns = outputTypes.map((type, c) => ({ type, name: String(c) }));
+  const k = name === "topk" ? 3 : 2;
+  await compare(name + "-operator", async (candidate, boundary) => {
+    const governor = new Governor(256 << 20),
+      spill = new MemorySpillService();
+    const grant = await governor.admit({
+      label: "window component",
+      minimumBytes: windowMinimumBytes(types, shape.spec.functions.length),
+      spillable: true,
+    });
+    const resultGrant = await governor.admit({
+      label: "window result",
+      minimumBytes: 4 << 20,
+      spillable: true,
+    });
+    const sink = consumer(columns, boundary),
+      channel = new ResultChannel(
+        columns.map((column) => ({ ...column, nullable: true })),
+        { windowBytes: 2 << 20 },
+      );
+    const receiver = new ResultSink(outputTypes, resultGrant, channel, 0);
+    let outer: SortOperator | undefined,
+      outerGrant: Awaited<ReturnType<Governor["admit"]>> | undefined;
+    let downstream: Operator = receiver;
+    const selected = new Uint16Array(BATCH_ROWS);
+    if (!resultGrant.allocate(selected.byteLength)) throw new Error("filter scratch refused");
+    if (ranking) {
+      outerGrant = await governor.admit({
+        label: "ranking order",
+        minimumBytes: sortMinimumBytes(outputTypes),
+        spillable: true,
+      });
+      outer = new SortOperator(
+        {
+          types: outputTypes,
+          keys: [
+            { column: 0, direction: "asc", nulls: "last", collation: null },
+            { column: types.length, direction: "asc", nulls: "last", collation: null },
+            ...(name === "rank"
+              ? [{ column: 1, direction: "asc" as const, nulls: "last" as const, collation: null }]
+              : []),
+          ],
+          limit: null,
+          offset: 0,
+          withTies: false,
+        },
+        { grant: outerGrant, spill, queryId: 2 },
+        receiver,
+      );
+      const ordered = outer;
+      downstream = {
+        push(batch, transfer) {
+          const vector = batch.columns[types.length];
+          if (vector?.form !== "flat" || vector.data.layout !== "int64")
+            throw new Error("ranking output layout");
+          const values = vector.data.values.values;
+          let count = 0;
+          for (let row = 0; row < batch.length; row++)
+            if (Number(values[row]) <= k) selected[count++] = row;
+          return ordered.push({ ...batch, selection: { rows: selected, count } }, transfer);
+        },
+        ready: () => ordered.ready(),
+        finish: () => ordered.finish(),
+        abort: (reason) => ordered.abort(reason),
+      };
+    }
+    const op = new WindowOperator(
+      {
+        ...shape.spec,
+        orderBy,
+        ...(ranking && (compareStage !== "windowTopK" || candidate) ? { topK: k } : {}),
+      },
+      { grant, spill, queryId: 1 },
+      downstream,
+    );
+    try {
+      const feeding = Promise.resolve(drive(new ArraySource(fixture.batches), op)).catch(
+        (error: unknown) => {
+          channel.cancel(error);
+          throw error;
+        },
+      );
+      await Promise.all([feeding, consumeFrames(channel, columns, boundary, sink)]);
+      await op.closed;
+      await outer?.closed;
+      resultGrant.free(selected.byteLength);
+      resultGrant.close();
+      if (governor.usedBytes !== 0 || spill.bytesInUse !== 0)
+        throw new Error("window component leaked");
+      return { ...sink.result(), sort: op.profile.sort, window: op.profile };
+    } finally {
+      op.abort(new Error("benchmark finished"));
+      outer?.abort(new Error("benchmark finished"));
+      await op.closed;
+      await outer?.closed;
+      resultGrant.close();
+      outerGrant?.close();
+    }
+  });
+}
+
 const fixturePath = option("--fixture", "");
 if (fixturePath) {
-  await measureComponent(deserialize(await readFile(resolve(fixturePath))) as NumericInput);
+  const fixture = deserialize(await readFile(resolve(fixturePath))) as NumericInput;
+  const shape = option("--window-shape", "");
+  if (shape) await measureWindow(fixture, shape);
+  else await measureComponent(fixture);
 } else if (args.includes("--catalogue")) {
   const { CATALOGUE_REFUSALS } = await import("../packages/core/dist/next/testing/divergences.js");
   const fixture = JSON.parse(

@@ -5,6 +5,7 @@ import {
   compileRecursiveStep,
 } from "./recursive.js";
 import { SeriesOperator } from "./series.js";
+import { rankingBounds } from "./window-topk-plan.js";
 import { Slice, runSliced, type SlicedJob } from "./slices.js";
 /** Immutable pipeline recipes; every execution instantiates its own operators and kernels. */
 import type { MaybePromise } from "../access/key-index.js";
@@ -462,6 +463,8 @@ function domainSource(rel: Extract<Rel, { op: "aggregate" }>) {
 }
 
 export interface CompileOptions {
+  /** Diagnostic control for bounded sole rank/row_number windows. */
+  readonly windowTopK?: boolean;
   /** Parent control for the resident full numeric columnar sort. */
   readonly columnarSort?: boolean;
   readonly sortOwnership?: boolean;
@@ -492,6 +495,10 @@ export interface CompileOptions {
   readonly windowScalarArguments?: boolean;
 }
 export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): Program {
+  const windowBounds =
+    options.windowTopK === false || plan.volatile
+      ? new Map<number, number>()
+      : rankingBounds(plan.root);
   const bindings = new Map<string, ReturnType<typeof bindCall>>();
   const resolveCall: CallResolver = (fn, args) => {
     const key = fn + JSON.stringify(args);
@@ -1571,10 +1578,12 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             },
             downstream,
           );
+          const bound = windowBounds.get(rel.id);
           const windowSpec =
             rel.op === "window"
               ? {
                   types: physical.types,
+                  ...(bound === undefined ? {} : { topK: bound }),
                   partitionBy: rel.partitionBy.map(physical.index),
                   orderBy: (keys as ReturnType<typeof setupWindow>).orderBy.map((key) => ({
                     ...key,

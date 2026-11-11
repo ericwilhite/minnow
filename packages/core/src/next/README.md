@@ -2066,8 +2066,11 @@ shipped-engine or stored-format change.
   are rejected before key encoding. First-key ties and unsupported first-key types retain the
   full comparison. The fixed scalar snapshot is charged and retains no input buffers.
   Up to 65,536 kept rows, it holds its next compaction's store in reserve, so a full
-  grant compacts instead of spilling whenever it can hold the kept rows twice. `GroupTopKOperator` is ROW_NUMBER() ≤ k per partition (the row number appended);
-  after a compaction each partition keeps its k-th key, and rows that cannot beat it are dropped.
+  grant compacts instead of spilling whenever it can hold the kept rows twice. `GroupTopKOperator`
+  supports sole ROW_NUMBER() ≤ k and RANK() ≤ k bounds. RANK counts preceding rows and keeps
+  every peer at the K-th-row boundary, including across runs. After compaction, each partition
+  keeps its K-th key; a raw first numeric key rejects only strictly worse arrivals before full
+  encoding. Ties still take the exact full-key comparison.
 - Grant-or-spill: sorted runs of typed spill pages, merged with a fan-in the spill pool's room
   allows, in passes when needed; OFFSET rows are counted, not materialized.
 - A single key refused by the byte encoder drops its abandoned normalization buffers and
@@ -3265,3 +3268,30 @@ The rejected patch and complete records are in `scripts/browser-perf/experiments
 five full-width physical frame hashes equal the frozen parent. Post-campaign forced GC remains
 a diagnostic outside timing and sampled peaks; it is never used between the five passes.
 The memory gate and quiet-host throughput target remain outstanding.
+
+### Bounded ranking windows (performance candidate)
+
+`window-topk-plan.ts` recognizes a positive constant upper bound on a sole ROW_NUMBER or
+RANK result through direct column aliases. The compiler keeps the original SQL predicate.
+It excludes volatile plans, computed intermediate projections, shared window consumers,
+parameters and other functions. Native explicit-frame specs keep the ordinary evaluator;
+reviewed lowering already canonicalizes ranking frames away, following PostgreSQL's
+`windowfuncs.c` support hook. Rank gaps and every boundary peer survive compaction,
+first-key rejection and external merge. Large peer groups spill rather than truncate.
+
+The seeded native and real-SQL PGlite suites cover exact int64 low words, non-finite and
+NULL keys, both directions and NULL placements, dictionary selections, empty/global
+partitions, observed compaction/spill and conservative recognition. Native finish releases
+its unused evaluator's credit before resolving. Abort cancels a queued native loan and
+fences active spill appends, reads and downstream borrowers before releasing buffers or the
+window grant; `closed` includes that fence. The isolated legacy-governor cancellation
+histories retain five 600k TEXT values: a 64 MiB cap refuses the complete step above its
+8 MiB reserve, while 128 MiB provides a 16 MiB reserve in which the same request queues
+and cancels. This is test setup for the complete-step rule, not a production cap increase.
+The separate worker benchmark accepts
+`--compare-stage windowTopK --window-shape topk` (or `rank`) with prebuilt decoded `--fixture`
+batches. Its same-build toggle is a secondary diagnostic; quiet-host acceptance uses actual
+complete parent/candidate builds and nine AB/BA pairs, median gain greater than type-7 IQR,
+seven favorable pairs, and no reverse-rule regression on the other catalogue shapes.
+Delivered columnar frames are the acceptance clock. JS row materialization is outside that
+clock and is reported separately. No timing campaign or absolute target pass is claimed here.

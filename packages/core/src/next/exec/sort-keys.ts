@@ -864,7 +864,6 @@ export class FirstKeyThreshold {
   filter(vector: Vector, ids: Uint16Array | null, count: number, out: Uint16Array): number {
     if (!this.ready) return count;
     const desc = this.key.direction === "desc";
-    const nullsFirst = this.key.nulls === "first";
     let n = 0;
     const plain = vector.form === "flat" ? vector : null;
     if (plain !== null && plain.validity === null && !this.#null && !this.#integer) {
@@ -895,62 +894,69 @@ export class FirstKeyThreshold {
     }
     for (let i = 0; i < count; i++) {
       const row = ids === null ? i : (ids[i] ?? 0);
-      let flat: FlatVector;
-      let slot: number;
-      if (plain !== null) {
-        flat = plain;
-        slot = bit(plain.validity, row) ? row : -1;
-      } else {
-        [flat, slot] = resolveRow(vector, row);
-        if (slot >= 0 && !bit(flat.validity, slot)) slot = -1;
-      }
-      let order = 0;
-      if (slot < 0 || this.#null) {
-        if (slot < 0 !== this.#null) order = slot < 0 === nullsFirst ? -1 : 1;
-      } else {
-        const data = flat.data;
-        if (this.#integer && data.layout === "int64") {
-          let hi: number;
-          let lo: number;
-          if (data.values.repr === "safe") {
-            const value = data.values.values[slot] ?? 0;
-            hi = Math.floor(value / 4294967296) | 0;
-            lo = (value - hi * 4294967296) >>> 0;
-          } else {
-            const words = wordsOf(data.values.values);
-            hi = (words[slot * 2 + 1] ?? 0) | 0;
-            lo = (words[slot * 2] ?? 0) >>> 0;
-          }
-          order =
-            hi < this.#hi ? -1 : hi > this.#hi ? 1 : lo < this.#lo ? -1 : lo > this.#lo ? 1 : 0;
-        } else if (
-          !this.#integer &&
-          (data.layout === "f64" ||
-            data.layout === "f32" ||
-            data.layout === "i32" ||
-            data.layout === "bool")
-        ) {
-          const value = data.values[slot] ?? 0;
-          const bound = this.#value;
-          order =
-            value < bound
-              ? -1
-              : value > bound
-                ? 1
-                : value === bound
-                  ? 0
-                  : value !== value
-                    ? bound !== bound
-                      ? 0
-                      : 1
-                    : -1;
-        }
-        // Unsupported representations conservatively tie; they go to the full comparator.
-        if (desc) order = -order;
-      }
-      if (order <= 0) out[n++] = row;
+      if (this.accepts(vector, row)) out[n++] = row;
     }
     return n;
+  }
+
+  /** Raw first-key gate for a partition's threshold; ties always reach the full key. */
+  accepts(vector: Vector, row: number): boolean {
+    if (!this.ready) return true;
+    const desc = this.key.direction === "desc";
+    const nullsFirst = this.key.nulls === "first";
+    let flat: FlatVector;
+    let slot: number;
+    if (vector.form === "flat") {
+      flat = vector;
+      slot = bit(vector.validity, row) ? row : -1;
+    } else {
+      [flat, slot] = resolveRow(vector, row);
+      if (slot >= 0 && !bit(flat.validity, slot)) slot = -1;
+    }
+    let order = 0;
+    if (slot < 0 || this.#null) {
+      if (slot < 0 !== this.#null) order = slot < 0 === nullsFirst ? -1 : 1;
+    } else {
+      const data = flat.data;
+      if (this.#integer && data.layout === "int64") {
+        let hi: number;
+        let lo: number;
+        if (data.values.repr === "safe") {
+          const value = data.values.values[slot] ?? 0;
+          hi = Math.floor(value / 4294967296) | 0;
+          lo = (value - hi * 4294967296) >>> 0;
+        } else {
+          const words = wordsOf(data.values.values);
+          hi = (words[slot * 2 + 1] ?? 0) | 0;
+          lo = (words[slot * 2] ?? 0) >>> 0;
+        }
+        order = hi < this.#hi ? -1 : hi > this.#hi ? 1 : lo < this.#lo ? -1 : lo > this.#lo ? 1 : 0;
+      } else if (
+        !this.#integer &&
+        (data.layout === "f64" ||
+          data.layout === "f32" ||
+          data.layout === "i32" ||
+          data.layout === "bool")
+      ) {
+        const value = data.values[slot] ?? 0;
+        const bound = this.#value;
+        order =
+          value < bound
+            ? -1
+            : value > bound
+              ? 1
+              : value === bound
+                ? 0
+                : value !== value
+                  ? bound !== bound
+                    ? 0
+                    : 1
+                  : -1;
+      }
+      // Unsupported representations conservatively tie; they go to the full comparator.
+      if (desc) order = -order;
+    }
+    return order <= 0;
   }
 }
 

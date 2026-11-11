@@ -43,7 +43,13 @@ import {
 import { keysEqual, markChanges, type SortColumn } from "./sort-keys.js";
 import { PartitionStream, streamable, type StreamHost } from "./window-stream.js";
 import { GroupedRows, groupedSortable } from "./window-sort.js";
-import { SortOperator, sortMinimumBytes, type SortContext, type SortProfile } from "./sort.js";
+import {
+  GroupTopKOperator,
+  SortOperator,
+  sortMinimumBytes,
+  type SortContext,
+  type SortProfile,
+} from "./sort.js";
 import { Slice, runSliced, type SlicedJob } from "./slices.js";
 import { PageWriter, SpillFiles, SpilledRun } from "./spill-pages.js";
 import { Charge, Pool, SpillIo } from "./spill-pool.js";
@@ -83,6 +89,8 @@ export interface WindowFunctionSpec {
 }
 
 export interface WindowSpec {
+  /** Proven sole ranking-function upper bound; the outer predicate remains in place. */
+  readonly topK?: number;
   readonly types: readonly PhysicalType[];
   readonly partitionBy: readonly number[];
   readonly orderBy: readonly SortColumn[];
@@ -106,6 +114,8 @@ export interface WindowSpec {
 export const STREAM_ROWS = 1 << 22;
 
 export interface WindowProfile {
+  /** A proven sole ranking bound avoids full window payload/evaluation. */
+  boundedRanking: boolean;
   rowsIn: number;
   rowsOut: number;
   partitions: number;
@@ -256,12 +266,14 @@ function deferClose(grant: Grant): Grant {
 /** `ROW_NUMBER() / RANK() / … OVER (PARTITION BY … ORDER BY … frame)` (see the module comment). */
 export class WindowOperator implements Operator {
   readonly spec: WindowSpec;
-  readonly #sort: SortOperator;
+  readonly #sort: SortOperator | GroupTopKOperator;
+  readonly #boundedRanking: boolean;
   readonly #evaluator: Evaluator;
   /** The grouped sort's rows while it applies (null: the sort operator has the rows). */
   #grouped: GroupedRows | null = null;
   #pending: Promise<void> | null = null;
   #started = false;
+  #aborting: Promise<void> | null = null;
 
   constructor(spec: WindowSpec, context: SortContext, downstream: Operator) {
     validateWindowSpec(spec);
@@ -269,7 +281,18 @@ export class WindowOperator implements Operator {
     const grant = deferClose(context.grant);
     const shared: SortContext = { ...context, grant };
     this.#evaluator = new Evaluator(spec, shared, context.grant, downstream);
-    if (spec.sortPath !== "sort" && groupedSortable(spec.types, spec.partitionBy, spec.orderBy))
+    const call = spec.functions.length === 1 ? spec.functions[0] : undefined;
+    this.#boundedRanking =
+      spec.topK !== undefined &&
+      Number.isSafeInteger(spec.topK) &&
+      spec.topK > 0 &&
+      call?.frame === null &&
+      (call.fn === "rank" || call.fn === "row_number");
+    if (
+      !this.#boundedRanking &&
+      spec.sortPath !== "sort" &&
+      groupedSortable(spec.types, spec.partitionBy, spec.orderBy)
+    )
       try {
         this.#grouped = new GroupedRows(
           spec.types,
@@ -291,16 +314,34 @@ export class WindowOperator implements Operator {
       })),
       ...spec.orderBy,
     ];
-    this.#sort = new SortOperator(
-      { types: spec.types, keys, limit: null, offset: 0, withTies: false },
-      shared,
-      this.#evaluator,
-    );
+    this.#sort = this.#boundedRanking
+      ? new GroupTopKOperator(
+          {
+            types: spec.types,
+            partitionBy: spec.partitionBy,
+            orderBy: spec.orderBy,
+            k: spec.topK ?? 1,
+            ranking: call?.fn === "rank" ? "rank" : "row_number",
+            partitionNulls: "last",
+          },
+          shared,
+          downstream,
+        )
+      : new SortOperator(
+          { types: spec.types, keys, limit: null, offset: 0, withTies: false },
+          shared,
+          this.#evaluator,
+        );
   }
 
   get profile(): WindowProfile {
     const profile = this.#evaluator.profile;
     profile.sort = this.#sort.profile;
+    profile.boundedRanking = this.#boundedRanking;
+    if (this.#boundedRanking) {
+      profile.rowsIn = profile.sort.rowsIn;
+      profile.rowsOut = profile.sort.rowsOut;
+    }
     return profile;
   }
 
@@ -331,7 +372,10 @@ export class WindowOperator implements Operator {
   }
 
   get closed(): Promise<void> {
-    return Promise.all([this.#sort.closed, this.#evaluator.closed]).then(() => undefined);
+    return (
+      this.#aborting ??
+      Promise.all([this.#sort.closed, this.#evaluator.closed]).then(() => undefined)
+    );
   }
 
   /** PostgreSQL calculate_frame_offsets runs even for empty input, when first executed. */
@@ -389,7 +433,7 @@ export class WindowOperator implements Operator {
       if (grouped !== null) {
         // Once sorted, the sort operator is not needed: released before the evaluator ends.
         const sorted = this.#evaluator.finishGrouped(grouped, () => {
-          this.#sort.discard();
+          if (this.#sort instanceof SortOperator) this.#sort.discard();
         });
         const after = (done: boolean): MaybePromise<void> => {
           if (done) {
@@ -400,7 +444,16 @@ export class WindowOperator implements Operator {
           return this.#fallback().then(() => this.#sort.finish());
         };
         result = isPromise(sorted) ? sorted.then(after) : after(sorted);
-      } else result = this.#sort.finish();
+      } else {
+        result = this.#sort.finish();
+        if (this.#boundedRanking) {
+          const close = async () => {
+            this.#evaluator.close();
+            await this.closed;
+          };
+          result = isPromise(result) ? result.then(close) : close();
+        }
+      }
     } catch (error) {
       this.abort(error);
       throw error;
@@ -414,6 +467,18 @@ export class WindowOperator implements Operator {
 
   abort(reason: unknown): void {
     this.#sort.abort(reason);
+    if (this.#boundedRanking) {
+      this.#aborting ??= (async () => {
+        try {
+          await this.#sort.closed;
+        } finally {
+          this.#evaluator.abort(reason);
+          await this.#evaluator.closed;
+        }
+      })();
+      void this.#aborting.catch(() => undefined);
+      return;
+    }
     this.#evaluator.abort(reason);
     this.#grouped?.close();
     this.#grouped = null;
@@ -494,6 +559,7 @@ class Evaluator implements Operator {
   #closed = false;
   #closing: Promise<void> | null = null;
   readonly profile: WindowProfile = {
+    boundedRanking: false,
     rowsIn: 0,
     rowsOut: 0,
     partitions: 0,

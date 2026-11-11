@@ -3410,3 +3410,55 @@ export const SORT_TRANSFER_FAILURE_REACH = [
   "non-finite payload",
   "dictionary header before failure",
 ] as const;
+
+/** Bounded ranking preserves PostgreSQL row-count ranks and complete boundary peers. */
+export const WINDOW_TOPK_REACH = [
+  "row_number",
+  "rank",
+  "rank gaps",
+  "boundary peers",
+  "all peers without ORDER BY",
+  "NULL keys",
+  "non-finite keys",
+  "wide int64",
+  "C text partitions",
+  "unpartitioned",
+  "empty input",
+  "selected dictionary",
+  "ascending",
+  "descending",
+  "NULLS FIRST",
+  "NULLS LAST",
+  "compaction",
+  "spill",
+  "frame fallback",
+  "raw rejection",
+  "zero resources",
+] as const;
+
+export const WINDOW_TOPK_SQL_REACH = [
+  "rank",
+  "row_number",
+  "aliases",
+  "unbounded control",
+  "ordered PG rows",
+  "empty",
+  "rank frame canonicalization",
+  "computed guard",
+  "multiple functions",
+  "shared consumer",
+  "reverse comparison",
+  "strict bound",
+] as const;
+
+export const WINDOW_TOPK_LIFECYCLE_REACH = [
+  "append",
+  "read",
+  "consumer",
+  "charged until settlement",
+  "closed waits",
+  "all peers spill",
+  "queued loan cancellation",
+  "complete legacy step refused",
+  "zero resources",
+] as const;
