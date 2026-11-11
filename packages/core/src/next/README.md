@@ -2804,11 +2804,23 @@ budgets; callers must check support before depending on an atomic handoff.
 
 The store session exposes fixed 60 KiB metadata pages independently of operator
 spill. OPFS uses fenced `space-meta` data and `space-meta-index` compact-directory handles. IndexedDB uses negative numeric
-keys in `meta`, with one direct, epoch-checked request per page; it has no resident
-record directory. Writes borrow a prepaid frame until the transaction settles.
+keys in `meta`, without a resident record directory. Native misses and writes are
+epoch-checked transactions. Writes borrow a prepaid frame until the operation settles.
 IndexedDB requires a standalone frame so structured cloning cannot copy a larger
 underlying pool. Callers account for the native read response as well as their
 own frame.
+
+With an owner governor registration (`createIndexedDbBackend({ registerCache })`, or
+`chooseBackend`'s fourth accounting argument), IndexedDB retains at most 32 private pages and
+1 MiB including bookkeeping. One cache is shared by sessions of the same lease. Exact standalone
+buffers preserve compact 256-byte pages; buffer bytes plus 256 bytes per entry and a 2048-byte
+control allowance are charged before allocation. Refused credit selects a native operation with
+the caller's prepaid frame. Dirty eviction keeps its charge until the actual native transaction ends, even if a logical
+release already rejected, and then wakes pending admission. Page writes update the cached value, reset discards it, and the
+last session close flushes and drops entries before a concurrent reopen reads them. Lease loss
+refuses cache hits; queued work checks its fence again before touching cached frames. Retained
+state is drained or discarded. Without a registration there is no cache.
+The cache holds only reconstructible private pages, never durable markers, roots, data or log.
 
 These pages are reconstructible scratch, never a durable root or a recovery
 authority. The extent-space opener will reset them under its fence before use;
@@ -2825,7 +2837,7 @@ expose four, and native-release phases expose two. The inventory includes one
 release-range vectors. Six read-only metadata views and raw-list cursor windows
 can borrow the separately prepaid 1 MiB read slab. Native metadata writes still
 require standalone whole-buffer frames. Eight compact control pages have a fixed direct-mapped cache, covered by W;
-payload reads always use the native store and verify checksums. Callers serialize workspace
+payload reads use the metadata store (including the bounded IndexedDB cache) and verify checksums. Callers serialize workspace
 use before taking the mutation barrier, and never overlap source and reclaim
 phases. Frames and their borrowed slices cannot escape a phase. Journal cursors
 and writers retain scalar slots and phase identities, rather than old buffers.

@@ -75,7 +75,8 @@ import {
 } from "./contract.js";
 import { acquireFenced, type HeldLock, type LockManagerLike } from "./fence.js";
 import { ByteStore, inOrder } from "./idb-bytes.js";
-import type { CacheMemory } from "./extents.js";
+import type { CacheMemory, EvictableCacheLike } from "./extents.js";
+import { IdbMetadataCache, type MetadataCacheBacking } from "./idb-metadata-cache.js";
 import type { IdbDatabaseLike, IdbTransactionLike } from "./idb-like.js";
 import { chooseRoot, encodeRootSlot } from "./root-slot.js";
 import { preparedRoot } from "./root-memory.js";
@@ -118,6 +119,8 @@ export interface IndexedDbBackendOptions {
    * it with the memory governor. None by default.
    */
   readonly memory?: CacheMemory;
+  /** Register the bounded owner-private metadata cache with the governor. No cache without it. */
+  readonly registerCache?: (cache: EvictableCacheLike) => CacheMemory;
 }
 
 /** Consecutive log appends in one batch are joined into records of up to this many bytes. */
@@ -272,26 +275,45 @@ class TrackedConnection implements IdbDatabaseLike {
     mode: "readonly" | "readwrite",
     durability: "strict" | "relaxed",
     body: (tx: IdbTransactionLike) => void,
+    nativeSettled?: () => void,
   ): Promise<void> {
-    if (this.#closing) return Promise.reject(new StoreClosedError("The connection is closing"));
+    if (this.#closing) {
+      nativeSettled?.();
+      return Promise.reject(new StoreClosedError("The connection is closing"));
+    }
     const issued: Issued = { stores, mode, durability, tx: null, giveUp: settle, ended: settle };
     const start = (): Promise<void> => {
       // Queued behind the chain when the release stopped waiting: never created.
-      if (this.#stopped !== null) return Promise.reject(this.#stopped);
-      const created = this.#inner.transaction(stores, mode, durability, (tx) => {
-        issued.tx = tx;
-        if (this.#observe !== null)
-          issued.ended = this.#observe({
-            target: stores.filter((store) => store !== "meta").join("+") || "meta",
-            op: `${mode}/${durability}`,
-          });
-        if (this.#stopped !== null) tx.abort(this.#stopped);
-        else body(tx);
-      });
+      if (this.#stopped !== null) {
+        body = settle;
+        nativeSettled?.();
+        return Promise.reject(this.#stopped);
+      }
+      let created: Promise<void>;
+      try {
+        created = this.#inner.transaction(stores, mode, durability, (tx) => {
+          issued.tx = tx;
+          if (this.#observe !== null)
+            issued.ended = this.#observe({
+              target: stores.filter((store) => store !== "meta").join("+") || "meta",
+              op: `${mode}/${durability}`,
+            });
+          if (this.#stopped !== null) tx.abort(this.#stopped);
+          else body(tx);
+        });
+      } catch (error) {
+        body = settle;
+        nativeSettled?.();
+        throw error;
+      }
       // The platform's own end (complete or abort), even after a release gave up on it.
-      if (this.#observe !== null) {
+      if (this.#observe !== null || nativeSettled !== undefined) {
         const ended = () => {
-          issued.ended();
+          try {
+            issued.ended();
+          } finally {
+            nativeSettled?.();
+          }
         };
         created.then(ended, ended);
       }
@@ -384,15 +406,34 @@ class TrackedConnection implements IdbDatabaseLike {
 
 class IdbLease implements OwnerLease {
   readonly epoch: number;
-  readonly database: IdbDatabaseLike;
+  readonly database: TrackedConnection;
   readonly #lock: HeldLock;
   readonly #lost = new AbortController();
 
   readonly #closeConnection: () => Promise<ReleaseReport>;
+  #metadataCache: IdbMetadataCache | null = null;
+  #metadataUsers = 0;
+
+  metadataCache(register: (cache: EvictableCacheLike) => CacheMemory): IdbMetadataCache {
+    this.guard();
+    this.#metadataCache ??= new IdbMetadataCache(
+      new IdbMetadata(this, () => undefined),
+      register,
+      () => this.guard(),
+      this.signal,
+    );
+    this.#metadataUsers++;
+    return this.#metadataCache;
+  }
+  async releaseMetadataCache(cache: IdbMetadataCache): Promise<void> {
+    this.#metadataUsers--;
+    if (this.#metadataUsers === 0) await cache.idle();
+    else await cache.settled();
+  }
 
   constructor(
     lock: HeldLock,
-    database: IdbDatabaseLike,
+    database: TrackedConnection,
     epoch: number,
     closeConnection: () => Promise<ReleaseReport>,
   ) {
@@ -427,8 +468,14 @@ class IdbLease implements OwnerLease {
     stores: readonly string[],
     durability: "strict" | "relaxed",
     body: (tx: IdbTransactionLike) => void,
+    nativeSettled?: () => void,
   ): Promise<void> {
-    this.guard();
+    try {
+      this.guard();
+    } catch (error) {
+      nativeSettled?.();
+      throw error;
+    }
     return this.database.transaction(
       [...new Set([...stores, "meta"])],
       "readwrite",
@@ -443,6 +490,7 @@ class IdbLease implements OwnerLease {
           body(tx);
         });
       },
+      nativeSettled,
     );
   }
 
@@ -450,8 +498,17 @@ class IdbLease implements OwnerLease {
    * One read-only transaction over `stores` (plus `meta`) whose body runs only if the durable epoch
    * is still this lease's: a fenced owner's reads reject with `OwnershipLostError`.
    */
-  read(stores: readonly string[], body: (tx: IdbTransactionLike) => void): Promise<void> {
-    this.guard();
+  read(
+    stores: readonly string[],
+    body: (tx: IdbTransactionLike) => void,
+    nativeSettled?: () => void,
+  ): Promise<void> {
+    try {
+      this.guard();
+    } catch (error) {
+      nativeSettled?.();
+      throw error;
+    }
     return this.database.transaction(
       [...new Set([...stores, "meta"])],
       "readonly",
@@ -466,6 +523,7 @@ class IdbLease implements OwnerLease {
           body(tx);
         });
       },
+      nativeSettled,
     );
   }
 
@@ -564,6 +622,7 @@ class IdbSession implements StoreSession {
     log: ByteStore,
     batching: boolean,
     memory: CacheMemory | null,
+    readonly registerMetadataCache: ((cache: EvictableCacheLike) => CacheMemory) | null,
   ) {
     this.#lease = lease;
     this.epoch = lease.epoch;
@@ -754,11 +813,36 @@ class IdbSession implements StoreSession {
   }
 
   #metadata: MetadataStore | null = null;
+  #metadataCache: IdbMetadataCache | null = null;
   metadata(): MetadataStore {
     this.#live();
-    return (this.#metadata ??= new IdbMetadata(this.#lease, () => {
-      this.#live();
-    }));
+    if (this.#metadata === null) {
+      if (this.registerMetadataCache === null)
+        this.#metadata = new IdbMetadata(this.#lease, () => this.#live());
+      else {
+        const cache = this.#lease.metadataCache(this.registerMetadataCache);
+        this.#metadataCache = cache;
+        const check = () => {
+          this.#live();
+          this.#lease.guard();
+        };
+        this.#metadata = {
+          read: async (page, target) => {
+            check();
+            await cache.read(page, target);
+          },
+          write: async (page, bytes) => {
+            check();
+            await cache.write(page, bytes);
+          },
+          reset: async () => {
+            check();
+            await cache.reset();
+          },
+        };
+      }
+    }
+    return this.#metadata;
   }
 
   /** Guarantee 1: every queued write, then the root, in one strict transaction. */
@@ -1062,10 +1146,18 @@ class IdbSession implements StoreSession {
     if (this.#closing !== null) return this.#closing;
     this.#closed = true; // no new reservations while the existing transactions drain
     this.#closing = (async () => {
-      await this.#commit().catch(() => undefined);
-      this.#data.close();
-      this.#log.close();
-      this.#setTail(null);
+      try {
+        await this.#commit().catch(() => undefined);
+        if (this.#metadataCache !== null) {
+          const cache = this.#metadataCache;
+          this.#metadataCache = null;
+          await this.#lease.releaseMetadataCache(cache);
+        }
+      } finally {
+        this.#data.close();
+        this.#log.close();
+        this.#setTail(null);
+      }
     })();
     return this.#closing;
   }
@@ -1076,7 +1168,7 @@ const slotBytes = (value: unknown) => (value instanceof ArrayBuffer ? new Uint8A
 /** Negative numeric meta keys are owner-private fixed pages. No ByteStore or resident index.
  * Ordinary spill has a separate namespace; its sweep cannot erase these pages.
  */
-class IdbMetadata implements MetadataStore {
+class IdbMetadata implements MetadataCacheBacking {
   constructor(
     readonly lease: IdbLease,
     readonly guard: () => void,
@@ -1092,10 +1184,26 @@ class IdbMetadata implements MetadataStore {
       throw new RangeError("Bad metadata frame");
     return -page - 1;
   }
+  validate(page: number, bytes: Uint8Array, writing: boolean): void {
+    this.#key(page, bytes);
+    if (!writing && bytes.byteLength !== METADATA_PAGE_BYTES)
+      throw new RangeError("Bad metadata read frame");
+    if (
+      writing &&
+      (!(bytes.buffer instanceof ArrayBuffer) ||
+        bytes.byteOffset !== 0 ||
+        bytes.byteLength !== bytes.buffer.byteLength)
+    )
+      throw new TypeError("Metadata writes require a standalone prepaid frame");
+  }
   async read(page: number, target: Uint8Array): Promise<void> {
+    await this.load(page, target);
+  }
+  async load(page: number, target: Uint8Array): Promise<number> {
     this.guard();
+    this.validate(page, target, false);
     const key = this.#key(page, target);
-    if (target.byteLength !== METADATA_PAGE_BYTES) throw new RangeError("Bad metadata read frame");
+    let length = 0;
     await this.lease.read(["meta"], (tx) =>
       tx.store("meta").get(key, (value) => {
         if (
@@ -1103,21 +1211,35 @@ class IdbMetadata implements MetadataStore {
           (value.byteLength !== METADATA_PAGE_BYTES && value.byteLength !== METADATA_SMALL_BYTES)
         )
           throw new StoreCorruptionError("Missing or malformed metadata page");
+        length = value.byteLength;
         target.fill(0);
         target.set(new Uint8Array(value));
       }),
     );
+    return length;
   }
   async write(page: number, bytes: Uint8Array): Promise<void> {
     this.guard();
+    this.validate(page, bytes, true);
     const key = this.#key(page, bytes);
-    if (
-      !(bytes.buffer instanceof ArrayBuffer) ||
-      bytes.byteOffset !== 0 ||
-      bytes.byteLength !== bytes.buffer.byteLength
-    )
-      throw new TypeError("Metadata writes require a standalone prepaid frame");
     await this.lease.write(["meta"], "relaxed", (tx) => tx.store("meta").put(key, bytes.buffer));
+  }
+  async writeRetained(page: number, bytes: Uint8Array, nativeSettled: () => void): Promise<void> {
+    let queued = false;
+    try {
+      this.guard();
+      this.validate(page, bytes, true);
+      const write = this.lease.write(
+        ["meta"],
+        "relaxed",
+        (tx) => tx.store("meta").put(this.#key(page, bytes), bytes.buffer),
+        nativeSettled,
+      );
+      queued = true;
+      await write;
+    } finally {
+      if (!queued) nativeSettled();
+    }
   }
   async reset(): Promise<void> {
     this.guard();
@@ -1301,7 +1423,14 @@ export function createIndexedDbBackend(options: IndexedDbBackendOptions): Storag
           throw error;
         },
       );
-      return new IdbSession(owned, data, log, options.batching ?? true, memory);
+      return new IdbSession(
+        owned,
+        data,
+        log,
+        options.batching ?? true,
+        memory,
+        options.registerCache ?? null,
+      );
     },
     scratch(lease: OwnerLease): ScratchSpace {
       return new IdbScratch(own(lease));

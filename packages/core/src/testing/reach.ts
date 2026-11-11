@@ -3016,3 +3016,35 @@ export const WRITE_RANGE_ADMISSION_HISTORY_STATES = [
   "next",
   "skip after next",
 ] as const;
+
+/** Bounded private IndexedDB metadata cache, including asynchronous dirty eviction. */
+export const IDB_METADATA_CACHE_REACH = [
+  "coalesced private writes",
+  "exact compact charge",
+  "entry and byte cap pressure",
+  "credit refused native fallback",
+  "close and reopen",
+  "cached owner fenced",
+  "concurrent sessions and reset",
+  "dirty eviction wakes admission",
+  "malformed native page refused",
+  "failed refused replacement keeps old bytes",
+  "failed dirty eviction and reset retry",
+  "governor routed through chooser",
+  "unsettled native frame retains credit",
+  "queued operations fenced before execution",
+] as const;
+
+/** Failed private transactions preserve acknowledged bytes and cannot publish clean state. */
+export const IDB_METADATA_FAILURE_REACH = [
+  "dirty acknowledged page ahead of storage",
+  "failed first transaction",
+  "old flush committed before failed replacement",
+  "consecutive aborts",
+  "consecutive callback failures",
+  "successful transactions between failed bursts",
+  "full to compact replacement",
+  "compact to full replacement",
+  "both publication oracles after every action",
+  "close and reopen agreement",
+] as const;

@@ -152,6 +152,7 @@ async function backendFor(
       name,
       locks,
       memory: governor.registerCache({ evictableBytes: 0, evict: () => 0 }),
+      registerCache: (cache) => governor.registerCache(cache),
       database: async () => countDatabase(await openIndexedDb(indexedDB, name), counts),
     });
   const root = await navigator.storage.getDirectory();
