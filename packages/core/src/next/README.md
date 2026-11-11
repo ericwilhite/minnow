@@ -2282,6 +2282,13 @@ the target dataset and the separate 1M-row component runs.
   arrays grow at explicit capacities, with replacements charged while old arrays are live
   (governor rule 4). Result references are dropped before their charge is released.
 - lag and lead accept negative offsets (lead(x, −k) looks back), resident and streamed.
+  The private SQL lowerer accepts integer expressions and NULL offsets, parameters, optional
+  ORDER BY and frames, and resolves value/default to R19's PG anycompatible common type.
+  Defaults run only on out-of-range output rows, after earlier rows reach the consumer;
+  resident shifted segments and the streamed selection are charged and owned through readiness.
+  Column offsets retain the existing resident-only partition limitation. The published parser's
+  constant offset/default and ORDER BY restrictions are unchanged.
+  AVG(integer) intentionally returns float64 (A1/C11), rather than PostgreSQL NUMERIC.
 - A partition is held in memory and evaluated over typed arrays while the grant holds it, up
   to `streamRows` (4,194,304) rows.
 - A larger partition, or one the grant cannot hold, streams from its spilled pages. Memory is

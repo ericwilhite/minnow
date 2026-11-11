@@ -21,10 +21,11 @@
  *   yield when the slice is due, the abort check at every resumption and after backpressure.
  *
  * Supported: row_number, rank, dense_rank, percent_rank, cume_dist, ntile; lag, lead (offset a
- * constant or a column; default a constant), first_value, last_value, nth_value over any type;
+ * constant or a column; default a constant or a lazy scalar kernel), first_value, last_value,
+ * nth_value over any type;
  * count, count_star, and sum / avg / min / max of integers and floats (min / max also dates and
  * timestamps). RANGE offsets need one numeric ORDER BY key. Decimal and interval arguments are
- * refused (TypeError), as is a lag/lead default that is a column.
+ * refused (TypeError) for aggregate arguments; value functions gather any supported type.
  */
 import { WindowCheckpoint, WINDOW_ORDINAL_BYTES } from "./window-checkpoint.js";
 import { NumericOutOfRangeError } from "./errors.js";
@@ -86,6 +87,8 @@ export interface WindowFunctionSpec {
   readonly amount?: number | { readonly column: number } | null;
   /** lag/lead's default: a one-row vector of the argument's type; null for NULL. */
   readonly fallback?: Vector | null;
+  /** Evaluated only for DEFAULT_ROW positions of the current (sorted) input batch. */
+  readonly defaultValue?: (batch: Batch) => Vector;
   /** Null: PostgreSQL's default frame. */
   readonly frame: Frame | null;
   readonly type: PhysicalType;
@@ -249,6 +252,7 @@ export function validateWindowSpec(spec: WindowSpec): void {
  * it per row (window-sort.ts): its value goes out as a constant.
  */
 function partitionRead(spec: WindowSpec): boolean {
+  if (spec.functions.some((call) => call.defaultValue !== undefined)) return true;
   const part = spec.partitionBy[0];
   if (part === undefined || spec.partitionBy.length !== 1) return true;
   if (spec.orderBy.some((key) => key.column === part)) return true;
@@ -804,6 +808,8 @@ class Evaluator implements Operator {
   /** One batch's partition and peer boundaries (`markChanges`), charged (2 bytes a row). */
   #partChanged = new Uint8Array(BATCH_ROWS);
   #peerChanged = new Uint8Array(BATCH_ROWS);
+  /** A shifted input segment when a lazy default requires a row-level delivery boundary. */
+  #defaultBatch: ColumnStore | null = null;
   #scratch: Scratch | null = null;
   /** Bytes charged for the partition's bigint arrays (exact int64 past 2^53). */
   #bigBytes = 0;
@@ -1842,6 +1848,45 @@ class Evaluator implements Operator {
       if (this.context.stopped?.()) return;
       throw new NumericOutOfRangeError("value out of range: overflow");
     }
+    // Defaults can throw or be volatile. Split only batches containing a lazy default,
+    // evaluating each such row after its preceding output has been consumed. Other batches
+    // retain their normal vector path. The temporary segment is owned through readiness.
+    if (
+      count > 1 &&
+      this.spec.functions.some(
+        (call, f) =>
+          call.defaultValue !== undefined &&
+          scratch.targets[f]?.subarray(at, at + count).includes(DEFAULT_ROW),
+      )
+    ) {
+      let from = 0;
+      while (from < count && !this.context.stopped?.()) {
+        const needsDefault = (row: number) =>
+          this.spec.functions.some(
+            (call, f) =>
+              call.defaultValue !== undefined && scratch.targets[f]?.[at + row] === DEFAULT_ROW,
+          );
+        let end = from + 1;
+        if (!needsDefault(from)) while (end < count && !needsDefault(end)) end++;
+        if (from === 0) yield* this.#push(held, scratch, at, end, n);
+        else {
+          const segment = (this.#defaultBatch ??= new ColumnStore(this.spec.types, this.pool, {
+            chunkRows: BATCH_ROWS,
+            varlenBytes: 4096,
+          }));
+          segment.reset(true);
+          let done = from;
+          while (done < end) {
+            const taken = segment.append(held, null, done, end - done);
+            if (taken === 0) yield this.io.need(segment.appendNeed(held, done));
+            done += taken;
+          }
+          yield* this.#push(segment.vectors(), scratch, at + from, end - from, n);
+        }
+        from = end;
+      }
+      return;
+    }
     const columns: Vector[] = this.#withPartition([...held], count);
     for (let f = 0; f < this.spec.functions.length; f++) {
       const call = this.spec.functions[f];
@@ -1851,6 +1896,19 @@ class Evaluator implements Operator {
         const source = this.#sources[f];
         const targets = scratch.targets[f];
         if (source === null || source === undefined || targets === undefined) continue;
+        let fallback: Vector | null = null;
+        if (call.defaultValue !== undefined) {
+          // Reuse the charged id scratch as selection storage, then restore gather ids.
+          const rows = new Uint16Array(output.ids.buffer, 0, BATCH_ROWS);
+          let selected = 0;
+          for (let i = 0; i < count; i++) if (targets[at + i] === DEFAULT_ROW) rows[selected++] = i;
+          if (selected > 0)
+            fallback = call.defaultValue({
+              length: count,
+              columns: this.#withPartition([...held], count),
+              selection: { rows, count: selected },
+            });
+        }
         for (let i = 0; i < count; i++) {
           const t = targets[at + i] ?? NULL_ROW;
           output.ids[i] = t === NULL_ROW ? n : t === DEFAULT_ROW ? n + 1 : t;
@@ -1858,9 +1916,24 @@ class Evaluator implements Operator {
         output.gather.reset(true);
         let taken = 0;
         while (taken < count) {
-          taken += output.gather.appendFrom(source, [0], output.ids, taken, count - taken);
-          if (taken < count)
-            yield this.io.need(output.gather.appendFromNeed(source, [0], output.ids[taken] ?? 0));
+          const useDefault = fallback !== null && targets[at + taken] === DEFAULT_ROW;
+          let end = taken + 1;
+          while (
+            end < count &&
+            (fallback !== null && targets[at + end] === DEFAULT_ROW) === useDefault
+          )
+            end++;
+          const amount =
+            useDefault && fallback !== null
+              ? output.gather.append([fallback], null, taken, end - taken)
+              : output.gather.appendFrom(source, [0], output.ids, taken, end - taken);
+          if (amount === 0)
+            yield this.io.need(
+              useDefault && fallback !== null
+                ? output.gather.appendNeed([fallback], taken)
+                : output.gather.appendFromNeed(source, [0], output.ids[taken] ?? 0),
+            );
+          taken += amount;
         }
         columns.push(columnOf(output.gather.vectors(), 0));
         continue;
@@ -2068,6 +2141,8 @@ class Evaluator implements Operator {
     this.#newGroupBytes = 0;
     this.#loan?.repay();
     this.#loan = null;
+    this.#defaultBatch?.close();
+    this.#defaultBatch = null;
     this.pages.close();
     this.pool.close();
     this.profile.spilledBytes = this.files.written;

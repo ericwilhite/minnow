@@ -3805,3 +3805,37 @@ export const WINDOW_FLOAT_SQL_DEMAND_REACH = [
   "whole partition",
   "top-k filter",
 ] as const;
+
+/** SQL shift overload resolution, per-row evaluation and untyped argument contexts. */
+export const WINDOW_SHIFT_SQL_REACH = [
+  "lag",
+  "lead",
+  "partitions",
+  "negative offset",
+  "zero offset",
+  "NULL offset",
+  "row offset",
+  "row default",
+  "numeric common type",
+  "float common type",
+  "unknown default",
+  "NULL default",
+  "text default",
+  "int64 exact",
+  "lazy default",
+  "parameter offset",
+  "parameter default",
+  "no ORDER BY",
+  "invalid offset type",
+  "default demand",
+] as const;
+
+export const WINDOW_SHIFT_DELIVERY_REACH = [
+  "resident",
+  "streamed",
+  "lag",
+  "lead",
+  "NULL values",
+  "page boundary",
+  "default after demand",
+] as const;

@@ -1,3 +1,4 @@
+import { windowInputsOf } from "../../engine/window-inputs.js";
 import { frameOffsetMetadata } from "../../engine/frame-offsets.js";
 /**
  * Window functions: the front end's `windowed` source (an inner block computing every
@@ -263,8 +264,61 @@ export function lowerWindowed(
             ];
       if (result.fn === "ntile") args.push(int(spec.offset ?? 1, INT4));
       if (result.fn === "lag" || result.fn === "lead") {
-        args.push(int(spec.offset ?? 1, INT4));
-        const fallback = fallbackOf(spec.fallback, result.type, builder);
+        const inputs = windowInputsOf(spec);
+        if (inputs.offsetAlias === undefined) args.push(int(spec.offset ?? 1, INT4));
+        else {
+          const offsetIndex = position(inputs.offsetAlias),
+            offset = inner.columns[offsetIndex];
+          if (offset === undefined)
+            throw new PlanningError("Window offset input vanished", "XX000");
+          try {
+            args.push(
+              coerce(
+                {
+                  expr: column(offsetIndex, offset.type),
+                  nullable: offset.nullable,
+                  big: offset.big,
+                },
+                INT4,
+                "implicit",
+                builder.parameters,
+              ).expr,
+            );
+          } catch (error) {
+            if (!(error instanceof PlanningError)) throw error;
+            throw new PlanningError(
+              `function ${result.fn} with offset type ${offset.type.kind} does not exist`,
+              "42883",
+            );
+          }
+        }
+        const fallback =
+          inputs.fallbackExpression === undefined
+            ? fallbackOf(spec.fallback, result.type, builder)
+            : coerce(
+                lowerExpression(
+                  inputs.fallbackExpression.kind === "case"
+                    ? (inputs.fallbackExpression.otherwise ?? { kind: "literal", value: null })
+                    : inputs.fallbackExpression,
+                  {
+                    column: (reference) => {
+                      const index = inner.columns.findIndex((col) => col.name === reference);
+                      const input = inner.columns[index];
+                      return input === undefined
+                        ? undefined
+                        : {
+                            expr: column(index, input.type),
+                            nullable: input.nullable,
+                            big: input.big,
+                          };
+                    },
+                  },
+                  builder.state,
+                ),
+                result.type,
+                "implicit",
+                builder.parameters,
+              ).expr;
         if (fallback !== null) args.push(fallback);
       }
       if (result.fn === "nth_value") args.push(int(spec.offset ?? 1, INT4));

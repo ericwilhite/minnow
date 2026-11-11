@@ -28,7 +28,7 @@ import { NumericOutOfRangeError } from "./errors.js";
 import { WindowFloat } from "./window-float.js";
 import type { PhysicalType } from "../types.js";
 import type { FlatVector, Vector } from "../vector/vector.js";
-import { BATCH_ROWS } from "../vector/vector.js";
+import { BATCH_ROWS, type Batch } from "../vector/vector.js";
 import { ColumnStore, nullConstant } from "./column-store.js";
 import { keysEqual, markChanges, type SortColumn } from "./sort-keys.js";
 import type { Slice, SlicedJob } from "./slices.js";
@@ -46,6 +46,7 @@ import {
 export const NTH_LIMIT = 4096;
 
 export interface StreamFunction {
+  readonly defaultValue?: (batch: Batch) => Vector;
   readonly fn: string;
   readonly arg: number | null;
   readonly amount?: number | { readonly column: number } | null;
@@ -259,6 +260,7 @@ export class PartitionStream {
   #keyBig: bigint[] | null = null;
   /** Whether a call has a RANGE frame (its offsets compare the first key). */
   readonly #ranged: boolean;
+  #defaultRow = new Uint16Array(0);
   /** Bigint ring arrays live (each charged BIGINT_BYTES a ring slot). */
   #bigArrays = 0;
   readonly #prev: ColumnStore;
@@ -339,6 +341,9 @@ export class PartitionStream {
 
   /** Frees everything it holds. */
   close(): void {
+    const defaultBytes = this.#defaultRow.byteLength;
+    this.#defaultRow = new Uint16Array(0);
+    this.host.charge.free(defaultBytes);
     for (const page of this.#pages) this.host.io.releasePage(page.held);
     this.#pages = [];
     this.#resultBig.fill(null);
@@ -1024,6 +1029,15 @@ export class PartitionStream {
     const values = this.#calls.map(() => new Float64Array(BATCH_ROWS));
     const valid = this.#calls.map(() => new Uint8Array(BATCH_ROWS));
     const bigs: Array<bigint[] | null> = (this.#resultBig = this.#calls.map(() => null));
+    const hasLazyDefault = this.#calls.some((s) => s.call.defaultValue !== undefined);
+    const usesDefault = (row: number): boolean =>
+      hasLazyDefault &&
+      this.#calls.some((s) => {
+        if (s.call.defaultValue === undefined) return false;
+        const offset = typeof s.call.amount === "number" ? s.call.amount : 1;
+        const target = s.call.fn === "lag" ? row - offset : row + offset;
+        return target < 0 || target >= this.#total();
+      });
     let next = 0;
     let outRows = 0;
     let p = 0;
@@ -1083,6 +1097,7 @@ export class PartitionStream {
       if (this.#ended && !this.#ready(next)) throw new RangeError(this.#stall(next));
       // Output every ready row, in order.
       while (next < this.#read && this.#ready(next)) {
+        if (usesDefault(next)) yield* flush();
         if (this.host.stopped?.()) return;
         const page = this.#pageOf(next);
         if (page === null) throw new RangeError("A window row's page is gone");
@@ -1090,6 +1105,8 @@ export class PartitionStream {
         const pageEnd = page.start + page.rows;
         let end = next + 1;
         while (
+          !usesDefault(next) &&
+          !usesDefault(end) &&
           end < this.#read &&
           end < pageEnd &&
           end - next < BATCH_ROWS - outRows &&
@@ -1129,8 +1146,9 @@ export class PartitionStream {
           outRows++;
           if (this.host.slice.due()) yield;
         }
+        const usedDefault = usesDefault(next);
         next += taken;
-        if (outRows === BATCH_ROWS) yield* flush();
+        if (outRows === BATCH_ROWS || usedDefault) yield* flush();
         if (this.host.slice.due()) yield;
       }
       // Release what no future row needs.
@@ -1473,7 +1491,24 @@ export class PartitionStream {
       const k = typeof s.call.amount === "number" ? s.call.amount : 1;
       const target = fn === "lag" ? i - k : i + k;
       if (target >= 0 && target < this.#total()) fromRow(target);
-      else if (s.call.fallback !== undefined && s.call.fallback !== null)
+      else if (s.call.defaultValue !== undefined) {
+        const page = this.#pageOf(i);
+        if (page === null) throw new RangeError("A default's current row is gone");
+        const row = i - page.start;
+        if (this.#defaultRow.length === 0) {
+          if (!this.host.charge.allocate(2))
+            throw new RangeError("A window default selection did not fit");
+          this.#defaultRow = new Uint16Array(1);
+        }
+        this.#defaultRow[0] = row;
+        const vector = s.call.defaultValue({
+          length: page.rows,
+          columns: page.columns,
+          selection: { rows: this.#defaultRow, count: 1 },
+        });
+        if (gather.append([vector], null, row, 1) !== 1)
+          throw new RangeError("A window default did not fit");
+      } else if (s.call.fallback !== undefined && s.call.fallback !== null)
         gather.append([s.call.fallback], null, 0, 1);
       else nul();
       return;

@@ -54,10 +54,25 @@ export function windowInputLayout(
 export function remapWindowFunction(
   call: WindowFunctionSpec,
   index: (column: number) => number,
+  inputColumns?: number,
 ): WindowFunctionSpec {
+  const defaultValue = call.defaultValue;
   return {
     ...call,
     arg: call.arg === null ? null : index(call.arg),
+    ...(defaultValue === undefined
+      ? {}
+      : {
+          defaultValue: (batch: Parameters<NonNullable<WindowFunctionSpec["defaultValue"]>>[0]) =>
+            defaultValue({
+              ...batch,
+              columns: Array.from({ length: inputColumns ?? batch.columns.length }, (_, c) => {
+                const column = batch.columns[index(c)];
+                if (column === undefined) throw new TypeError("Window default input is missing");
+                return column;
+              }),
+            }),
+        }),
     ...(typeof call.amount === "object" && call.amount !== null
       ? { amount: { column: index(call.amount.column) } }
       : {}),

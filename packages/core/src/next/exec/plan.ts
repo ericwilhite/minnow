@@ -363,6 +363,7 @@ function setupWindow(
   const exprs: ScalarExpr[] = rel.orderBy.map((key) => key.expr);
   const positions = rel.functions.map((call, index) =>
     call.args.map((expr, argIndex) => {
+      if (argIndex === 2 && (call.fn === "lag" || call.fn === "lead")) return -1;
       if (amounts[index] !== undefined && argIndex === (call.fn === "ntile" ? 0 : 1)) return -1;
       const at = exprs.length;
       exprs.push(expr);
@@ -378,8 +379,10 @@ function setupWindow(
       const amountAt = call.fn === "ntile" ? args[0] : args[1];
       const fallback = call.args[2];
       const scalarAmount = amounts[index];
-      if (fallback !== undefined && fallback.op !== "literal" && fallback.op !== "param")
-        throw new UnsupportedPlanError("a row-dependent lag/lead default", { construct: "window" });
+      const lazyDefault =
+        fallback !== undefined && fallback.op !== "literal" && fallback.op !== "param"
+          ? compileExpr(fallback, context)
+          : null;
       const scalar = (expr: ScalarExpr | null): number | null => {
         if (expr === null) return null;
         if (expr.op !== "literal" && expr.op !== "param")
@@ -431,8 +434,11 @@ function setupWindow(
           : amountAt === -1 && scalarAmount !== undefined
             ? { amount: scalarAmount }
             : { amount: { column: at(keys.indexes, amountAt) } }),
+        ...(lazyDefault === null
+          ? {}
+          : { defaultValue: (batch: Batch) => lazyDefault.evaluate(batch, batch.selection) }),
         fallback:
-          fallback === undefined
+          fallback === undefined || lazyDefault !== null
             ? null
             : validating
               ? (compileExpr(fallback, context), null)
@@ -1706,7 +1712,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                   })),
                   functions: (keys as ReturnType<typeof setupWindow>)
                     .functions(extended, runtime === undefined)
-                    .map((call) => remapWindowFunction(call, physical.index)),
+                    .map((call) => remapWindowFunction(call, physical.index, keys.types.length)),
                 }
               : null;
           if (runtime === undefined || grant === null) {
