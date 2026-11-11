@@ -217,6 +217,24 @@ export class SortKeyEncoder {
     return [this.bytesVector, ...this.prefixVectors];
   }
 
+  /** Drop an abandoned key before any subsequent spill/progress request. */
+  reset(): void {
+    (this.bytesVector as { data: unknown }).data = {
+      layout: "varlen",
+      bytes: new Uint8Array(0),
+      offsets: this.keys.offsets,
+    };
+    this.keys.writer.reset();
+    this.keys.count = 0;
+    this.keys.offsets[0] = 0;
+    this.bytesVector.length = 0;
+    (this.bytesVector as { data: unknown }).data = {
+      layout: "varlen",
+      bytes: this.keys.writer.bytes,
+      offsets: this.keys.offsets,
+    };
+  }
+
   close(charge: ByteCharge): void {
     this.keys.close();
     charge.free(PREFIX_WORDS * (this.prefixes[0]?.length ?? 0) * 4);

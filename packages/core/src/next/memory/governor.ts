@@ -168,6 +168,8 @@ export interface NativeGrantGroupOptions {
 /** A non-spillable input or a fixed minimum cannot fit the owner's normal capacity. */
 export class MemoryAdmissionError extends RangeError {
   readonly code = "MINNOW_MEMORY_ADMISSION";
+  /** PostgreSQL's out_of_memory resource error (Appendix A). */
+  readonly sqlState = "53200";
   constructor(
     readonly label: string,
     readonly bytes: number,
@@ -175,6 +177,7 @@ export class MemoryAdmissionError extends RangeError {
   ) {
     super(
       `${label} needs a minimum above the cap: plan smaller batches (${String(bytes)} bytes, ${String(capacity)} available)`,
+      { cause: Object.freeze({ requestedBytes: bytes, admittedBytes: capacity }) },
     );
     this.name = "MemoryAdmissionError";
   }
