@@ -179,6 +179,28 @@ export class QueryRuntime {
   #progressBytes = 0;
   #savedProgressBytes = 0;
   #resultProgressOverride: number | null = null;
+  #resultCopies = 1;
+  #resultCopySourceProgress: number | null = null;
+  resultCopySourceProgress(bytes: number): void {
+    this.#resultCopySourceProgress = bytes;
+  }
+  resultCopies(copies: number): void {
+    if (!Number.isSafeInteger(copies) || copies < 1)
+      throw new TypeError("Positive result multiplicity required");
+    this.#resultCopies = copies;
+  }
+  #resultStep(inputs: number, largestInput: number): number {
+    // Multiply the source/owned-value envelope, not the four-MiB progress floor.
+    // Hundreds of tiny aliases need their actual frame minimum, not hundreds of blob loans.
+    return this.#resultProgressOverride === null
+      ? this.#stepBytes(
+          inputs,
+          largestInput,
+          this.#resultCopies,
+          this.#resultCopySourceProgress ?? this.#progressBytes,
+        )
+      : this.#resultProgressOverride * this.#resultCopies;
+  }
   /** A checkpoint producer emits no result until its delivery phase is admitted. */
   resultProgressEnvelope(bytes: number | null): void {
     this.#resultProgressOverride = bytes;
@@ -239,16 +261,21 @@ export class QueryRuntime {
     this.#expressionMultiplicity = multiplicity;
     this.#parameterProgress = true;
   }
-  #stepBytes(inputs: number, largestInput: number): number {
+  #stepBytes(
+    inputs: number,
+    largestInput: number,
+    copies = 1,
+    readProgress = this.#progressBytes,
+  ): number {
     // ReadBound.progress already covers a complete source prefix, not one cell.
     // Add newly materialized inline/literal/owned-parameter columns; multiply only
     // for repeated group-key positions, never again for the number of source columns.
     const current = this.#parameterProgress
-      ? this.#progressBytes * this.#expressionMultiplicity +
+      ? readProgress * this.#expressionMultiplicity +
         this.#expressionProgress +
         4 * inputs * this.#expressionMultiplicity
-      : Math.max(this.#progressBytes, largestInput);
-    return Math.max(MAX_BLOB_BYTES, this.#savedProgressBytes, current);
+      : Math.max(readProgress, largestInput);
+    return Math.max(MAX_BLOB_BYTES, copies * Math.max(this.#savedProgressBytes, current));
   }
   operatorStep(rel: OperatorIdentity): number {
     return this.#operatorProgress.get(rel.id) ?? 0;
@@ -278,7 +305,7 @@ export class QueryRuntime {
       entries.reduce((sum, entry) => sum + entry.minimum, 0) +
       borrowers * progress +
       this.#readBytes +
-      (entries.length === 0 ? 0 : Math.max(this.#window, this.#resultProgressOverride ?? progress))
+      (entries.length === 0 ? 0 : Math.max(this.#window, this.#resultStep(inputs, largestInput)))
     );
   }
 
@@ -373,7 +400,11 @@ export class QueryRuntime {
     const window = atomic && entries.length > 0 ? this.#window : 0;
     const resultProgress =
       atomic && entries.length > 0
-        ? Math.max(0, (this.#resultProgressOverride ?? progress) - this.#window)
+        ? Math.max(
+            0,
+            this.#resultStep(binding.logicalBytes ?? binding.bytes, binding.largestSlot) -
+              this.#window,
+          )
         : 0;
     const prefix = `query#${String(this.request.queryId)}`;
     const parts: Array<{ label: string; minimumBytes: number; spillable: boolean }> = [];

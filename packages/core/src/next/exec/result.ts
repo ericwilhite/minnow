@@ -9,7 +9,9 @@
  *   compaction, no copy.
  * - Every typed array in a payload covers its whole ArrayBuffer (offset 0, full length), and no
  *   buffer is shared with another frame or with the engine, so transferring moves exactly the
- *   frame's bytes (`frameTransferList` checks it).
+ *   frame's bytes (`frameTransferList` checks it). Logical aliases own separate mutable
+ *   data/codes/validity, so client mutation of one column cannot change another. Immutable
+ *   stream-dictionary entries remain shared by dictionary id.
  * - Columns keep their executor form (vector/vector.ts `VectorData`): exact int64 (`safe` f64 or
  *   BigInt64Array), decimal tiers, UTF-8 bytes, constants as one value. Types travel once, in the
  *   stream's `columns`. JS values and row objects are built by the client, on request.
@@ -375,10 +377,15 @@ export class ResultChannel implements ResultStream {
 export function frameByteLength(payload: UnnumberedPayload): number {
   let bytes = 0;
   for (const buffer of frameTransferList(payload)) bytes += buffer.byteLength;
+  let counted: Set<readonly bigint[]> | null = null;
   for (const flat of flats(payload)) {
     const data = flat.data;
-    if (data.layout === "decimal" && data.coefficients.repr === "wide")
+    if (data.layout === "decimal" && data.coefficients.repr === "wide") {
+      counted ??= new Set();
+      if (counted.has(data.coefficients.values)) continue;
+      counted.add(data.coefficients.values);
       for (const value of data.coefficients.values) bytes += bigintBytes(value);
+    }
   }
   return bytes;
 }

@@ -1342,6 +1342,16 @@ and output, retains the unconsumed suffix of a borrowed memory chunk, and applie
 predicates and deletions in vectorized ranges before bounding survivors. Separate filters and
 breakers stop demand propagation. `scripts/next-executor-bench.mts --component scan-limit`
 measures this scan/operator pair in interleaved Node CPU rounds over the real stored fixture.
+Ordinary sorts and top-N retain one physical slot for proven direct-column aliases,
+remap their keys, and restore every logical output afterward. Different source
+columns and computed expressions keep separate slots. At the result boundary,
+each logical alias owns independent mutable buffers, including after transfer.
+Complete execution admission funds those copies; repeated variable scan bindings
+use an additional publication-stable one-row sizing pass, with no producer or
+execution reservation held while it waits. Tiny aliases do not multiply the
+four-MiB progress floor. A detachable source buffer is adopted at most once;
+other aliases copy. Client release pacing counts each backing allocation once.
+
 Wide top-N queries can sort keys and row locators, then read the surviving payload columns
 through TableScan in physical order. A charged, spillable ordinal sort restores SQL order.
 The initial shape is an identity projection over an unfiltered scan with at least 16 columns,

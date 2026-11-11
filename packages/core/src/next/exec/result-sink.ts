@@ -1,7 +1,7 @@
 /** Owned, compact result frames. Borrowed input is copied; authorized dedicated input stays charged through frame credit. */
 import type { MaybePromise } from "../access/key-index.js";
 import { OBJECT_OVERHEAD_BYTES, bigintBytes, type Grant, type Loan } from "../memory/governor.js";
-import type { PhysicalType } from "../types.js";
+import { type PhysicalType } from "../types.js";
 import { BATCH_ROWS, type Batch, type FlatVector } from "../vector/vector.js";
 import {
   ResultDictionaries,
@@ -332,7 +332,11 @@ export class ResultSink implements Operator {
         });
       if (this.#dictionaryPlan !== null) this.#dictionaries.publish(this.#dictionaryPlan, frame);
       return this.channel.offer({
-        payload: { rowCount: rows, columns, dictionaries: frame.dictionaries },
+        payload: {
+          rowCount: rows,
+          columns,
+          dictionaries: frame.dictionaries,
+        },
         requiresLsn: this.requiresLsn,
         free: () => this.#free(frame),
       });
@@ -473,7 +477,7 @@ export class ResultSink implements Operator {
         // An empty store may not yet have observed numeric input tiers. Allow fixed-width
         // promotions, and charge any wide decimal coefficient copied into its one row.
         needed += 32 * this.types.length;
-        for (const vector of batch.columns) {
+        for (const vector of input) {
           const [source, slot] = slotOf(vector, row);
           const data = source.data;
           if (

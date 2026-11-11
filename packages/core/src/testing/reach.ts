@@ -77,11 +77,36 @@ export const HASH_OUTPUT_CREDIT_REACH = [
   "all charges returned",
 ] as const;
 
+/** Logical aliases own independent frame data, never source or another column. */
+export const RESULT_ALIAS_FRAME_REACH = [
+  "independent backing allocations",
+  "consumer aliases isolated",
+  "dedicated aliases copy",
+  "dictionary delta",
+  "wide numeric clone",
+  "cancel blocked",
+  "exact values",
+  "selected order",
+  "float bits",
+  "all charges returned",
+] as const;
+
 export const SORT_ADMISSION_ERROR_REACH = [
   "ordinary room exhausted",
   "repeated SQL projection",
-  "completed earlier step",
-  "initial step refusal",
+  "bounded spill and merge succeed",
+  "bounded topN succeeds",
+  "computed fields preserved",
+  "separate variable sources preserved",
+  "fixed-width alias rows exact",
+  "tiny variable aliases remain admissible",
+  "five aliases",
+  "six aliases",
+  "ascending alias key",
+  "descending alias key",
+  "leading marker",
+  "interleaved marker",
+  "NULL and unequal text rows",
   "cleanup returns all resources",
 ] as const;
 
@@ -3511,4 +3536,19 @@ export const WINDOW_TOPK_LIFECYCLE_REACH = [
   "queued loan cancellation",
   "complete legacy step refused",
   "zero resources",
+] as const;
+
+export const SQL_ALIAS_ISOLATION_REACH = [
+  "text alias mutation",
+  "integer alias mutation",
+  "structured transfer",
+  "nullable aliases",
+  "all resources returned",
+] as const;
+export const FRAME_PACING_REACH = [
+  "flat aliases",
+  "dictionary aliases",
+  "wide arrays counted once",
+  "distinct backing",
+  "transferred payload",
 ] as const;
