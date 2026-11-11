@@ -2262,7 +2262,14 @@ the target dataset and the separate 1M-row component runs.
   - EXCLUDE CURRENT ROW, GROUP and TIES;
   - for a non-NULL row, RANGE offsets treat NULL keys as below every value (NULLS FIRST) or
     above every value (NULLS LAST).
-- Float sums add a frame's members in order, as PostgreSQL does; exact sums use prefix sums.
+- Float SUM preserves a first negative zero; SUM(real) rounds each transition to binary32.
+  SUM and AVG reject finite-transition overflow with SQLSTATE 22003, including AVG's hidden
+  `float8_accum` variance-state overflow. NaN and infinite inputs follow PostgreSQL's transition
+  rules. Moving and excluded frames recompute their ordered members; head-anchored frames
+  read cumulative state directly, without subtracting zero. Prefetching defers an error until
+  an emitted frame consumes that prefix, so unused cumulative overflow cannot reject a valid
+  singleton frame. The three float states per function and AVG's streamed variance ring are
+  charged before allocation. Exact integer sums retain their prefix path.
 - int8 values stay exact past 2^53 on both paths, as bigints where a double would round:
   sums, MIN/MAX, and RANGE keys and their offsets (RANGE over int8 compares exactly). COUNT
   counts non-NULL rows only. Bigint state derived from int64 values is reserved at 48 bytes per fixed-capacity
@@ -2282,8 +2289,9 @@ the target dataset and the separate 1M-row component runs.
 - A few combinations cannot stream: a column-valued lag, lead, ntile or nth_value amount;
   nth_value past 4,096; and float sums or MIN/MAX over a moving frame that ends at UNBOUNDED
   FOLLOWING. Such a partition must fit the grant.
-- Partition and peer boundaries are found a batch at a time, column by column; plain frames
-  (no EXCLUDE) sum and count from prefix arrays reused across partitions.
+- Partition and peer boundaries are found a batch at a time, column by column. Integer sums
+  and counts use prefix arrays reused across partitions; float frames follow the transition
+  rules above.
 - Arrival, the per-partition kernels and emission run in slices, checking the abort signal
   (ruling R23).
 

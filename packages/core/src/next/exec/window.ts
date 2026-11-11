@@ -27,6 +27,7 @@
  * refused (TypeError), as is a lag/lead default that is a column.
  */
 import { WindowCheckpoint, WINDOW_ORDINAL_BYTES } from "./window-checkpoint.js";
+import { WINDOW_FLOAT_STATE_BYTES } from "./window-float.js";
 import type { Grant, Loan } from "../memory/governor.js";
 import type { PhysicalType } from "../types.js";
 import { setInt128 } from "../vector/int128.js";
@@ -169,6 +170,7 @@ export function windowMinimumBytes(types: readonly PhysicalType[], functions = 1
     // A streaming partition's working set for a bounded frame: its ring (4,096 rows), a few
     // pages in flight and the output chunk (window-stream.ts).
     functions * 4096 * 48 +
+    functions * 3 * WINDOW_FLOAT_STATE_BYTES +
     4096 * 16 +
     1024 * 1024 +
     64 * 1024
@@ -906,7 +908,11 @@ class Evaluator implements Operator {
           : new ColumnStore([call.type], this.pool, { varlenBytes: 4096 }),
       ids: new Int32Array(BATCH_ROWS),
     }));
-    if (!this.charge.allocate(spec.functions.length * BATCH_ROWS * 32 + 2 * BATCH_ROWS))
+    if (
+      !this.charge.allocate(
+        spec.functions.length * (BATCH_ROWS * 32 + 3 * WINDOW_FLOAT_STATE_BYTES) + 2 * BATCH_ROWS,
+      )
+    )
       throw new RangeError("A window's minimum must be admitted");
   }
 
@@ -1740,6 +1746,7 @@ class Evaluator implements Operator {
         out,
         this.slice,
         scratch,
+        type?.kind === "float32",
       );
       scratch.big[f] = out.big;
     }
@@ -2018,7 +2025,10 @@ class Evaluator implements Operator {
     this.#scratch?.big.fill(null);
     if (this.#bigBytes > 0) this.charge.free(this.#bigBytes);
     this.#bigBytes = 0;
-    this.charge.free(this.spec.functions.length * BATCH_ROWS * 32 + 2 * this.#partChanged.length);
+    this.charge.free(
+      this.spec.functions.length * (BATCH_ROWS * 32 + 3 * WINDOW_FLOAT_STATE_BYTES) +
+        2 * this.#partChanged.length,
+    );
     this.#scratchBytes = 0;
     this.#newGroupBytes = 0;
     this.#loan?.repay();

@@ -3765,3 +3765,19 @@ export const RETAINING_TOPK_SQL_CUT_REACH = [
   "exact PostgreSQL",
   "zero resources",
 ] as const;
+
+/** PG float transitions across frames and spill pages, including errors before later specials. */
+export const WINDOW_FLOAT_REACH = [
+  "signed zero",
+  "overflow",
+  "special values",
+  "float4",
+  "page boundaries",
+  "sum",
+  "avg",
+  "resident",
+  "streamed",
+  "22003",
+  "unused prefix overflow",
+  "exclusion fragments",
+] as const;

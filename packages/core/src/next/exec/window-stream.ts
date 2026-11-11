@@ -24,6 +24,7 @@
  * `NTH_LIMIT`. `streamable` names them; the operator refuses such a partition past its
  * resident limit.
  */
+import { WindowFloat } from "./window-float.js";
 import type { PhysicalType } from "../types.js";
 import type { FlatVector, Vector } from "../vector/vector.js";
 import { BATCH_ROWS } from "../vector/vector.js";
@@ -142,6 +143,12 @@ interface CallState {
   big: bigint[] | null;
   /** Running totals while reading (the next row's cumulative values start from them). */
   runSum: number;
+  readonly runFloat: WindowFloat | null;
+  readonly totalFloat: WindowFloat | null;
+  readonly scanFloat: WindowFloat | null;
+  runError: number;
+  totalError: number;
+  squares: Float64Array | null;
   runBig: bigint | null;
   runCount: number;
   runExtreme: number;
@@ -275,6 +282,7 @@ export class PartitionStream {
     this.#calls = spec.functions.map((call) => {
       const type = call.arg === null ? undefined : spec.types[call.arg];
       const value = VALUE.has(call.fn) && call.arg !== null;
+      const floating = (call.fn === "sum" || call.fn === "avg") && !integral(type);
       return {
         call,
         frame: effective(call, this.#ordered),
@@ -291,12 +299,24 @@ export class PartitionStream {
         count: new Float64Array(0),
         extreme: new Float64Array(0),
         big: null,
-        runSum: 0,
+        runSum: floating && call.fn === "sum" ? -0 : 0,
+        runFloat: floating
+          ? new WindowFloat(call.fn === "avg", call.fn === "sum" && type?.kind === "float32")
+          : null,
+        totalFloat: floating
+          ? new WindowFloat(call.fn === "avg", call.fn === "sum" && type?.kind === "float32")
+          : null,
+        scanFloat: floating
+          ? new WindowFloat(call.fn === "avg", call.fn === "sum" && type?.kind === "float32")
+          : null,
+        runError: -1,
+        totalError: -1,
+        squares: floating && call.fn === "avg" ? new Float64Array(0) : null,
         runBig: null,
         runCount: 0,
         runExtreme: Number.NaN,
         runSeen: false,
-        totalSum: 0,
+        totalSum: floating && call.fn === "sum" ? -0 : 0,
         totalBig: null,
         totalCount: 0,
         totalExtreme: Number.NaN,
@@ -323,6 +343,7 @@ export class PartitionStream {
     this.#resultBytes = 0;
     this.#keyBig = null;
     for (const state of this.#calls) {
+      state.squares = null;
       state.big = null;
       state.vBig = null;
       state.extremeBig = null;
@@ -389,7 +410,11 @@ export class PartitionStream {
               if (!x.ok) continue;
               state.totalCount++;
               if (state.sums) {
-                if (
+                if (state.totalFloat !== null) {
+                  state.totalFloat.add(x.value);
+                  state.totalSum = state.totalFloat.sum;
+                  if (state.totalError < 0 && state.totalFloat.bad) state.totalError = n + r;
+                } else if (
                   state.exact &&
                   (state.totalBig !== null ||
                     x.big !== null ||
@@ -501,6 +526,7 @@ export class PartitionStream {
       s.sum = grow(s.sum, (n) => new Float64Array(n));
       s.count = grow(s.count, (n) => new Float64Array(n));
       s.extreme = grow(s.extreme, (n) => new Float64Array(n));
+      if (s.squares !== null) s.squares = grow(s.squares, (n) => new Float64Array(n));
     }
     // Bigint backing arrays also grow at explicit capacities: no uncharged push/splice
     // spare capacity. Their replacements overlap the old arrays under the charge above.
@@ -522,7 +548,13 @@ export class PartitionStream {
 
   /** Ring bytes a row: the typed arrays, and each live bigint array's slot (BIGINT_BYTES). */
   #perRow(): number {
-    return 4 + 9 + this.#calls.length * (8 + 1 + 8 + 8 + 8) + this.#bigArrays * BIGINT_BYTES;
+    return (
+      4 +
+      9 +
+      this.#calls.length * (8 + 1 + 8 + 8 + 8) +
+      this.#calls.filter((s) => s.squares !== null).length * 8 +
+      this.#bigArrays * BIGINT_BYTES
+    );
   }
 
   /**
@@ -567,6 +599,7 @@ export class PartitionStream {
       move(s.sum);
       move(s.count);
       move(s.extreme);
+      if (s.squares !== null) move(s.squares);
       moveBig(s.big);
       moveBig(s.vBig);
       moveBig(s.extremeBig);
@@ -661,7 +694,11 @@ export class PartitionStream {
       if (x.ok) {
         s.runCount++;
         if (s.sums) {
-          if (
+          if (s.runFloat !== null) {
+            s.runFloat.add(x.value);
+            s.runSum = s.runFloat.sum;
+            if (s.runError < 0 && s.runFloat.bad) s.runError = j;
+          } else if (
             s.exact &&
             (s.runBig !== null || x.big !== null || Math.abs(s.runSum + x.value) > SAFE)
           ) {
@@ -685,6 +722,7 @@ export class PartitionStream {
         }
       }
       s.sum[at] = s.runSum;
+      if (s.squares !== null) s.squares[at] = s.runFloat?.squares ?? 0;
       if (s.big !== null) s.big[at] = s.runBig ?? BigInt(s.runSum);
       s.count[at] = s.runCount;
       s.extreme[at] = s.runSeen ? s.runExtreme : Number.NaN;
@@ -1225,25 +1263,37 @@ export class PartitionStream {
         }
         return;
       }
-      // Floats: the members in order. A first range from the head is the cumulative sum.
-      let sum = 0;
+      const state = s.scanFloat;
+      if (state === null) throw Error("missing float window state");
+      state.reset();
       let r = 0;
       if (k > 0 && (ranges[0] ?? 0) === 0) {
-        sum = sumTo(ranges[1] ?? -1);
+        const end = ranges[1] ?? -1,
+          total = end >= this.#read;
+        const error = total ? s.totalError : s.runError;
+        if (error >= 0 && end >= error) {
+          state.bad = true;
+          state.check();
+        }
+        state.sum = sumTo(end);
+        state.count = countTo(end);
+        state.squares = total ? (s.totalFloat?.squares ?? 0) : (s.squares?.[end - this.#base] ?? 0);
         r = 1;
       }
       if (scanRows(ranges, r, k) > WINDOW_STEP_ROWS)
         return this.#longFrame(s, f, at, values, valid, bigs, ranges, r, k, {
           kind: "sum",
-          value: sum,
+          state,
           count,
         });
-      for (; r < k; r++) {
-        const b = ranges[2 * r + 1] ?? -1;
-        for (let j = ranges[2 * r] ?? 0; j <= b; j++)
-          if (s.ok[j - this.#base] === 1) sum += s.v[j - this.#base] ?? 0;
-      }
-      values[at] = fn === "avg" ? sum / count : sum;
+      for (; r < k; r++)
+        for (let j = ranges[2 * r] ?? 0; j <= (ranges[2 * r + 1] ?? -1); j++)
+          if (s.ok[j - this.#base] === 1) {
+            state.add(s.v[j - this.#base] ?? 0);
+            state.check();
+          }
+      state.check();
+      values[at] = fn === "avg" ? state.sum / count : state.sum;
       return;
     }
     // MIN / MAX: a head-anchored prefix from the running extreme, the rest scanned.
@@ -1325,7 +1375,7 @@ export class PartitionStream {
     from: number,
     k: number,
     state:
-      | { kind: "sum"; value: number; count: number }
+      | { kind: "sum"; state: WindowFloat; count: number }
       | { kind: "float"; value: number; seen: boolean }
       | { kind: "big"; value: bigint | null },
   ): SlicedJob<void> {
@@ -1335,8 +1385,10 @@ export class PartitionStream {
       for (let j = ranges[2 * r] ?? 0; j <= end; j++) {
         const slot = j - this.#base;
         if (s.ok[slot] === 1) {
-          if (state.kind === "sum") state.value += s.v[slot] ?? 0;
-          else if (state.kind === "big") {
+          if (state.kind === "sum") {
+            state.state.add(s.v[slot] ?? 0);
+            state.state.check();
+          } else if (state.kind === "big") {
             const value = s.vBig?.[slot] ?? BigInt(s.v[slot] ?? 0);
             if (state.value === null || (max ? value > state.value : value < state.value))
               state.value = value;
@@ -1350,7 +1402,7 @@ export class PartitionStream {
       }
     }
     if (state.kind === "sum")
-      values[at] = s.call.fn === "avg" ? state.value / state.count : state.value;
+      values[at] = s.call.fn === "avg" ? state.state.sum / state.count : state.state.sum;
     else if (state.kind === "big") {
       values[at] = state.value === null ? 0 : Number(state.value);
       valid[at] = state.value === null ? 0 : 1;
