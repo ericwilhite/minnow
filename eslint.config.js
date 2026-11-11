@@ -96,6 +96,8 @@ export default tseslint.config(
       "packages/core/src/storage/contract-boundaries.test.ts",
       // The same, for the rebuild core's module layers (next/README.md).
       "packages/core/src/next/dependency-rules.test.ts",
+      // Inspects own/private retained allocator objects; this Node-only guard never ships.
+      "packages/core/src/next/testing/scratch-metadata-guards.test.ts",
       // Frozen native-file compatibility fixtures use Node I/O and bulk array checks.
       // These unexported test helpers never enter a browser package entry point.
       "packages/core/src/next/write/directory-compatibility.test.ts",

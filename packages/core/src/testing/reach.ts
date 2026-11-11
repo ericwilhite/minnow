@@ -3063,3 +3063,19 @@ export const SCRATCH_METADATA_REACH = [
   "allocator fence",
   "unsettled native metadata retains charge",
 ] as const;
+
+/** Independent checksum and retained-object guards for scratch allocator metadata. */
+export const SCRATCH_METADATA_GUARD_REACH = [
+  "inspected private ownership across growing extent counts",
+  "constant resident inventory matches prepaid workspace",
+  "inspected bounded release bookkeeping",
+  "inspected buffers released with charge",
+  "valid aligned offset redirected into live peer",
+  "valid aligned length changed",
+  "checksum byte flipped",
+  "unused padding byte flipped",
+  "corruption refused before release and reuse",
+  "corrupted first entry position",
+  "corrupted middle entry position",
+  "corrupted last entry position",
+] as const;
