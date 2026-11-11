@@ -36,7 +36,8 @@ for (const seed of seedsFor("next-retaining-window-routes", [0xb6c0, 0xb6c1]))
       fc.asyncProperty(
         fc.constantFrom("row_number", "rank", "sum", "lag", "avg"),
         fc.boolean(),
-        async (fn, json) => {
+        fc.boolean(),
+        async (fn, json, bounded) => {
           reach.beginHistory();
           const baseline = core.harness.governor.usedBytes;
           const source = json
@@ -44,9 +45,12 @@ for (const seed of seedsFor("next-retaining-window-routes", [0xb6c0, 0xb6c1]))
             : "SELECT k,p,sum(v) v FROM t GROUP BY p,k";
           const expr =
             fn === "sum" || fn === "avg" ? `${fn}(v)` : fn === "lag" ? "lag(v)" : `${fn}()`;
-          const sql = `SELECT k,p,${json ? "j::text," : ""}${expr} OVER(PARTITION BY ${json ? "j::text" : "p"} ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) w FROM (${source}) a ORDER BY p,k,v`;
+          const topK = bounded && (fn === "rank" || fn === "row_number");
+          const select = `SELECT k,p,v,${json ? "j::text," : ""}${expr} OVER(PARTITION BY ${json ? "j::text" : "p"} ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) w FROM (${source}) a`;
+          const sql = `SELECT * FROM (${select}) q ${topK ? "WHERE w<=3" : ""} ORDER BY p,k,v`;
           const profiles: Array<{
             checkpointable: boolean;
+            boundedRanking: boolean;
             groupedRows: number;
             spilledBytes: number;
           }> = [];
@@ -58,6 +62,7 @@ for (const seed of seedsFor("next-retaining-window-routes", [0xb6c0, 0xb6c1]))
             return Promise.resolve(finish.call(this)).then(() => {
               profiles.push({
                 checkpointable: this.spec.checkpointable === true,
+                boundedRanking: this.profile.boundedRanking,
                 groupedRows: this.profile.groupedRows,
                 spilledBytes: this.profile.sort.spilledBytes,
               });
@@ -71,11 +76,18 @@ for (const seed of seedsFor("next-retaining-window-routes", [0xb6c0, 0xb6c1]))
             expect(oracleRows(actual)).toEqual(expected);
             expect(profiles.length).toBeGreaterThan(0);
             expect(
-              profiles.every((p) => p.checkpointable && p.groupedRows > 0 && p.spilledBytes === 0),
+              profiles.every(
+                (p) =>
+                  p.checkpointable &&
+                  p.boundedRanking === topK &&
+                  (topK ? p.groupedRows === 0 : p.groupedRows > 0) &&
+                  p.spilledBytes === 0,
+              ),
               JSON.stringify(profiles),
             ).toBe(true);
             reach.reach(json ? "JSON producer" : "hybrid producer");
             reach.reach(fn);
+            if (topK) reach.reach(fn === "rank" ? "bounded rank" : "bounded row_number");
           } finally {
             spy.mockRestore();
           }
@@ -87,11 +99,15 @@ for (const seed of seedsFor("next-retaining-window-routes", [0xb6c0, 0xb6c1]))
         seed,
         numRuns: 10,
         examples: [
-          ["row_number", false],
-          ["rank", true],
-          ["sum", false],
-          ["lag", true],
-          ["avg", false],
+          ["row_number", false, false],
+          ["rank", true, false],
+          ["sum", false, false],
+          ["lag", true, false],
+          ["avg", false, false],
+          ["row_number", false, true],
+          ["rank", true, true],
+          ["row_number", true, true],
+          ["rank", false, true],
         ],
       },
     );

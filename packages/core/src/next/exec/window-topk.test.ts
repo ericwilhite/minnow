@@ -147,6 +147,7 @@ for (const seed of seedsFor("next-window-topk", [0xb710, 0xb711]))
                   actor,
                 );
                 await actor.closed;
+                expect(actor.profile.rowsIn).toBe(n);
                 expect(governor.usedBytes).toBe(0);
                 expect(spill.bytesInUse).toBe(0);
                 const actual = sink.rows.sort((a, b) => Number(a[2]) - Number(b[2]));

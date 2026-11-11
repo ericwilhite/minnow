@@ -22,7 +22,7 @@ function deferred() {
 const reach = createReach("parent checkpoint IO", RETAINED_PARENT_IO_REACH);
 afterAll(() => reach.assertReached());
 for (const seed of seedsFor("next-parent-checkpoint-io", [0xb7a1, 0xb7a2]))
-  for (const kind of ["join", "window", "columnar window"] as const)
+  for (const kind of ["join", "window", "columnar window", "top-k window"] as const)
     for (const mode of ["append", "read"] as const)
       for (const { fault, cancel } of [
         { fault: false, cancel: true },
@@ -76,6 +76,7 @@ for (const seed of seedsFor("next-parent-checkpoint-io", [0xb7a1, 0xb7a2]))
           };
           const ws: WindowSpec = {
             checkpointable: true,
+            ...(kind === "top-k window" ? { topK: 3 } : {}),
             ...(kind === "columnar window" ? { sortPath: "sort" } : {}),
             types,
             partitionBy: [],
@@ -165,6 +166,7 @@ for (const seed of seedsFor("next-parent-checkpoint-io", [0xb7a1, 0xb7a2]))
             await actor.closed;
             if (fault) reach.reach("fault cleanup");
             reach.reach(kind === "join" ? "join" : "window");
+            if (kind === "top-k window") reach.reach("top-k window");
             reach.reach(mode);
           } finally {
             release.resolve();

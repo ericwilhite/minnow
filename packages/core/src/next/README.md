@@ -3330,6 +3330,19 @@ copying it to the new general sort. The ordinal is never a peer key or output co
 and floating ROWS order. The initial recipe conservatively reserves continuation
 workspace even when no cut occurs; it does not force a slower execution route.
 
+A proven sole `rank` / `row_number` top-k stays on the bounded route, including under
+phase-capable parents. A checkpoint records its current candidates and all boundary peers
+for RANK; candidates discarded by an earlier local bound cannot enter any later global
+bound. Restoring that union into the bounded sorter is exact, without evaluating a window
+or reopening its source. ROW_NUMBER row identity uses the SQL ordering's tie-breaker.
+The original arrival count is retained separately from the smaller candidate count. Empty
+cuts keep the same fast route, and explicit-ordinal snapshots still use general restoration.
+Resident snapshots, grouped fallback, output emission and streamed staging count rows
+independently of payload columns,
+including a zero-column ranking input. Profiles count original arrivals after a restored
+candidate prefix and ordinary sorter input when no checkpoint counter is enabled. Candidate snapshot reads/writes use the same ownership and cancellation
+fences as ordinary sort checkpoints.
+
 Descriptor `minimumBytes` and `restoreLoanSlots` are **additional** to the normal
 recipe. Window restore needs admitted ordinary reader/copy workspace; it cannot
 borrow while another private step is retained. Join restore uses its ordinary

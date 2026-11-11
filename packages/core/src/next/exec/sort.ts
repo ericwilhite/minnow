@@ -2019,7 +2019,9 @@ class Sorter {
         for (let at = 0; at < this.store.chunkCount; at++) {
           this.checkAborted();
           const columns = this.spec.types.map((_, c) => this.store.chunk(c, at));
-          await records.write(columns, 0, columns[0]?.length ?? 0);
+          // A key-only window may have no payload columns. Its rows still exist.
+          const rows = Math.min(this.store.chunkRows, this.store.rows - at * this.store.chunkRows);
+          await records.write(columns, 0, rows);
         }
         await records.seal();
         this.checkAborted();
@@ -2789,6 +2791,19 @@ export class GroupTopKOperator implements Operator {
     const pending = this.#pending ?? Promise.resolve();
     this.#pending = null;
     return pending;
+  }
+
+  /** Before evaluation, only candidates that can still satisfy the proven bound matter.
+   * Runs/compactions retain the per-partition bound and all RANK boundary peers. Their
+   * union with a future suffix has the same bounded result. ROW_NUMBER identity is fixed
+   * by its SQL keys; the window retains the original arrival count separately.
+   */
+  async checkpoint(): Promise<RecordCheckpoint> {
+    await this.ready();
+    this.#sorter.checkAborted();
+    const work = this.#sorter.checkpoint();
+    this.#track(work);
+    return work;
   }
 
   finish(): MaybePromise<void> {

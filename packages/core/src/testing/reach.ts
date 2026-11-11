@@ -3559,6 +3559,7 @@ export const RETAINED_PARENT_IO_REACH = [
   "task deadline",
   "abort task resumption",
   "reclaim waits for checkpoint",
+  "top-k window",
 ] as const;
 
 /** SQL producer cuts must pass through the shared retaining-parent controller. */
@@ -3677,11 +3678,50 @@ export const RETAINING_WINDOW_ROUTE_REACH = [
   "sum",
   "lag",
   "avg",
+  "bounded rank",
+  "bounded row_number",
 ] as const;
 
 export const COLUMNAR_CHECKPOINT_REACH = [
   "reclaim waits for replay",
   "cancel retains replay credit",
   "sealed full prefix",
+  "zero resources",
+] as const;
+
+/** Top-k is sufficient state before a cut; generic restore must preserve its peer prefix. */
+export const RETAINED_TOPK_REACH = [
+  "rank",
+  "row_number",
+  "fast before cut",
+  "empty cut",
+  "nonempty cut",
+  "two cuts",
+  "compacted prefix",
+  "generated compacted prefix",
+  "spilled prefix",
+  "peer ties",
+  "NULL keys",
+  "no order",
+  "selected dictionary",
+  "zero resources",
+  "zero-payload rows",
+  "zero-payload grouped",
+  "zero-payload general",
+  "zero-payload stream",
+  "zero-payload grouped stream without cut",
+  "zero-payload multichunk",
+] as const;
+
+export const RETAINING_TOPK_SQL_CUT_REACH = [
+  "hybrid",
+  "JSONB",
+  "rank",
+  "row_number",
+  "empty cut",
+  "nonempty cut",
+  "two cuts",
+  "bounded after restore",
+  "exact PostgreSQL",
   "zero resources",
 ] as const;

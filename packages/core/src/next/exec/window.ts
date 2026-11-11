@@ -319,7 +319,6 @@ export class WindowOperator implements Operator {
     this.#evaluator = new Evaluator(spec, shared, context.grant, downstream);
     const call = spec.functions.length === 1 ? spec.functions[0] : undefined;
     this.#boundedRanking =
-      !spec.checkpointable &&
       spec.topK !== undefined &&
       Number.isSafeInteger(spec.topK) &&
       spec.topK > 0 &&
@@ -343,8 +342,18 @@ export class WindowOperator implements Operator {
         this.#grouped = null;
       }
     this.#sort = this.#boundedRanking
-      ? new GroupTopKOperator({types:spec.types,partitionBy:spec.partitionBy,orderBy:spec.orderBy,
-          k:spec.topK ?? 1,ranking:call?.fn === "rank" ? "rank" : "row_number",partitionNulls:"last"},shared,downstream)
+      ? new GroupTopKOperator(
+          {
+            types: spec.types,
+            partitionBy: spec.partitionBy,
+            orderBy: spec.orderBy,
+            k: spec.topK ?? 1,
+            ranking: call?.fn === "rank" ? "rank" : "row_number",
+            partitionNulls: "last",
+          },
+          shared,
+          downstream,
+        )
       : this.#makeSort(false);
   }
 
@@ -396,7 +405,8 @@ export class WindowOperator implements Operator {
   /** Only an actual cut/fallback pays for stable continuation ordinals. */
   async #enableOrdinals(): Promise<void> {
     if (this.#ordinals) return;
-    if(this.#sort instanceof GroupTopKOperator) this.#sort.abort(new Error("Window ranking route retired"));
+    if (this.#sort instanceof GroupTopKOperator)
+      this.#sort.abort(new Error("Window ranking route retired"));
     else this.#sort.discard();
     await this.#sort.closed;
     this.#boundedRanking = false;
@@ -435,7 +445,8 @@ export class WindowOperator implements Operator {
     profile.sort = this.#sort.profile;
     profile.boundedRanking = this.#boundedRanking;
     if (this.#boundedRanking) {
-      profile.rowsIn = profile.sort.rowsIn;
+      // A checkpoint may replay fewer candidates than original arrivals.
+      profile.rowsIn = this.spec.checkpointable ? Number(this.#nextOrdinal) : profile.sort.rowsIn;
       profile.rowsOut = profile.sort.rowsOut;
     }
     profile.spilledBytes = this.#priorSpilledBytes + this.#evaluator.files.written;
@@ -457,7 +468,7 @@ export class WindowOperator implements Operator {
       const store = grouped.store;
       for (let k = store.chunkCount - 1; k >= 0; k--) {
         const columns = grouped.batchColumns(k);
-        const length = columns[0]?.length ?? 0;
+        const length = Math.min(store.chunkRows, store.rows - k * store.chunkRows);
         if (
           length > 0 &&
           this.#sort.push(
@@ -597,7 +608,6 @@ export class WindowOperator implements Operator {
       );
     const work = (async () => {
       await this.ready();
-      if (this.#sort instanceof GroupTopKOperator) throw new TypeError("Ranking checkpoint adapter pending");
       // The grouped store is in arrival order. Its reverse-chunk fallback needs
       // explicit ordinals; an untouched sort instead snapshots stable peer order.
       if (this.#grouped && this.#grouped.rows > 0) await this.#fallback();
@@ -647,13 +657,18 @@ export class WindowOperator implements Operator {
       }
       this.#grouped?.close();
       this.#grouped = null;
-      await this.#enableOrdinals();
+      // A proven bounded ranking needs only its best prefix candidates. A pre-finish
+      // snapshot retains every relevant key/value, so replay into the bounded route is exact.
+      // A row_number whose row identity matters has its explicit SQL tie-breaker in the key.
+      // Explicit-ordinal snapshots from a general route still use its general continuation.
+      const bounded = this.#boundedRanking && !saved.hasOrdinals;
+      if (!bounded) await this.#enableOrdinals();
       let ordinal = 0n;
       await saved.records.read(this.#evaluator.io, async (columns, rows) => {
         // Before finish, sort runs are chronological, each stable for equal keys;
         // the resident tail follows them. Only peer order matters to a window.
         const batch = { columns, length: rows, selection: null };
-        const input = saved.hasOrdinals ? batch : this.#withOrdinals(batch, ordinal);
+        const input = bounded || saved.hasOrdinals ? batch : this.#withOrdinals(batch, ordinal);
         ordinal += BigInt(rows);
         if (this.#sort.push(input) === "blocked") await this.#sort.ready();
       });
@@ -1153,7 +1168,7 @@ class Evaluator implements Operator {
       const taken = this.#blockRows;
       for (let k = 0; k < block.chunkCount; k++) {
         const columns = this.spec.types.map((_, c) => block.chunk(c, k));
-        yield* this.#stage(columns, 0, columns[0]?.length ?? 0);
+        yield* this.#stage(columns, 0, Math.min(block.chunkRows, block.rows - k * block.chunkRows));
       }
       done += taken;
     }
@@ -1370,7 +1385,7 @@ class Evaluator implements Operator {
     try {
       for (let k = 0; k < held.chunkCount; k++) {
         const vectors = this.spec.types.map((_, c) => held.chunk(c, k));
-        const rows = vectors[0]?.length ?? 0;
+        const rows = Math.min(held.chunkRows, held.rows - k * held.chunkRows);
         await this.io.stage(staging, run, header, vectors, null, 0, rows);
       }
       await this.io.flush(staging, run, header);
@@ -1771,7 +1786,7 @@ class Evaluator implements Operator {
     const store = this.#held;
     for (let k = 0; k < store.chunkCount; k++) {
       const columns = this.spec.types.map((_, c) => store.chunk(c, k));
-      const rows = columns[0]?.length ?? 0;
+      const rows = Math.min(store.chunkRows, store.rows - k * store.chunkRows);
       yield* this.#push(columns, scratch, at, rows, n);
       at += rows;
     }
