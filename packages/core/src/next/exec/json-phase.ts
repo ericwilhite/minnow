@@ -23,6 +23,8 @@ import { Charge, Pool, SpillIo } from "./spill-pool.js";
 export const JSON_PHASE_IO = 512 << 10;
 export const JSON_PHASE_FIXED = 4096;
 export interface JsonPhase {
+  /** A streaming aggregate already enforces the exact two-copy value policy. */
+  readonly aggregateValueBytes?: number;
   readonly emit: boolean;
   readonly ownedDelivery: boolean;
   readonly error: ExecutionError | null;

@@ -81,6 +81,11 @@ const same = (types: readonly SqlType[], arity: number): Overload[] =>
 
 /** `fn` → overloads. Names are PostgreSQL's function names, or the operator's name below. */
 export const FUNCTIONS: Readonly<Record<string, readonly Overload[]>> = {
+  json_record_value: [{ args: ["json", "bool"], result: "json" }],
+  json_record: [
+    { args: ["bool", "bool"], result: "json" },
+    { args: ["bool", "bool", "any"], result: "json", variadic: true },
+  ],
   // PostgreSQL VARIADIC "any": independent argument types, including zero arguments.
   json_object: [
     { args: [], result: "json" },
@@ -262,6 +267,8 @@ export const FUNCTIONS: Readonly<Record<string, readonly Overload[]>> = {
  * type in the integer and float cases, so the call itself is always `nullif(T, T)`.
  */
 export const NON_STRICT_FUNCTIONS: ReadonlySet<string> = new Set([
+  "json_record",
+  "json_record_value",
   "json_build_object",
   "jsonb_build_object",
   "json_object",
@@ -421,7 +428,7 @@ export function physicalTypeOfSql(type: SqlType): PhysicalType {
 }
 
 /** An aggregate's argument pattern: a SQL type, `"T"` (any type), or T bound to an enum/array. */
-export type AggregateArg = SqlType | "T" | "anyenum" | "anyarray";
+export type AggregateArg = SqlType | "T" | "any" | "anyenum" | "anyarray";
 
 /** One overload of an aggregate (ir.ts `AggregateFn`). */
 export interface AggregateOverload {
@@ -492,6 +499,9 @@ export const AGGREGATES: Readonly<Record<AggregateFn, readonly AggregateOverload
   ],
   array_agg: [{ args: ["T"], result: "T[]" }],
   json_agg: [{ args: ["T"], result: "json" }],
+  jsonb_agg: [{ args: ["T"], result: "jsonb" }],
+  json_object_agg: [{ args: ["any", "any"], result: "json" }],
+  jsonb_object_agg: [{ args: ["any", "any"], result: "jsonb" }],
   percentile_cont: [
     { args: ["float8"], within: "float8", result: "float8" },
     { args: ["float8"], within: "interval", result: "interval" },
@@ -525,6 +535,7 @@ export function aggregateResult(
     if ((overload.within === undefined) !== (within === undefined)) continue;
     let bound: PhysicalType | undefined;
     const binds = (pattern: AggregateArg, actual: PhysicalType): boolean => {
+      if (pattern === "any") return true;
       if (pattern === "T" || pattern === "anyenum" || pattern === "anyarray") {
         if (pattern === "anyenum" && actual.kind !== "enum") return false;
         if (pattern === "anyarray" && actual.kind !== "array") return false;
@@ -570,6 +581,7 @@ export function aggregateArgument(fn: AggregateFn, arg: PhysicalType): PhysicalT
           overload.within === undefined &&
           only !== undefined &&
           only !== "T" &&
+          only !== "any" &&
           only !== "anyenum" &&
           only !== "anyarray" &&
           reachable.has(only)

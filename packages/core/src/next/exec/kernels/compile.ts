@@ -67,6 +67,16 @@ class ColumnNode implements Compiled {
   }
 }
 
+class RetypeNode implements Compiled {
+  constructor(
+    readonly type: PhysicalType,
+    readonly input: Compiled,
+  ) {}
+  evaluate(batch: Batch, rows: Selection | null): Vector {
+    return { ...this.input.evaluate(batch, rows), type: this.type };
+  }
+}
+
 class ConstantNode implements Compiled {
   readonly #vector: { form: "constant"; type: PhysicalType; length: number; value: FlatVector };
   constructor(
@@ -119,6 +129,7 @@ export function compileExpr(expr: ScalarExpr, context: CompileContext): Compiled
     case "param":
       return new ParamNode(expr.type, expr.slot, context.params);
     case "cast":
+      if (expr.jsonCanonical) return new RetypeNode(expr.type, sub(expr.input));
       return compileCast(expr.type, sub(expr.input), arena);
     case "compare":
       return compileCompare(expr.cmp, sub(expr.left), sub(expr.right), expr.collation, arena);

@@ -51,7 +51,11 @@ export function jsonInputsBounded(expr: ScalarExpr, input: Rel): boolean {
       case "setOp":
         return rel.inputs.every((child) => column(child, index));
       case "aggregate":
-        return rel.groupBy[index] !== undefined && column(rel.input, rel.groupBy[index]);
+        return index < rel.groupBy.length
+          ? rel.groupBy[index] !== undefined && column(rel.input, rel.groupBy[index])
+          : ["json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg"].includes(
+              rel.aggregates[index - rel.groupBy.length]?.fn ?? "",
+            );
       default:
         return false;
     }
@@ -75,6 +79,8 @@ export function jsonInputsBounded(expr: ScalarExpr, input: Rel): boolean {
       if (
         [
           "json_object",
+          "json_record",
+          "json_record_value",
           "json_build_object",
           "jsonb_build_object",
           "json_build_array",

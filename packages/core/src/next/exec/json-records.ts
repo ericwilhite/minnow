@@ -27,6 +27,12 @@ interface Writer {
   readonly vectors: readonly FlatVector[];
   readonly data: { layout: "varlen"; bytes: Uint8Array; offsets: Int32Array };
 }
+export interface StreamedJsonField {
+  readonly stream: true;
+  readonly type: PhysicalType;
+  readonly length: number | null;
+  readonly read: (visit: (bytes: Uint8Array) => Promise<void>) => Promise<void>;
+}
 export class JsonRecords {
   readonly #records: RecordCheckpoint;
   #writer: Writer | null;
@@ -113,49 +119,110 @@ export class JsonRecords {
     this.#payload = Math.max(this.#payload, payload);
     this.#extra = Math.max(this.#extra, extra);
     await this.#record(-1, payload, extra);
-    for (let c = 0; c < columns.length; c++) {
-      const value = columns[c];
-      if (!value) throw new Error("Missing JSON field");
-      if (!isValidSlot(value, row)) {
-        await this.#record(c, -1, 0);
-        continue;
-      }
-      const [flat, slot] = slotOf(value, row),
-        d = flat.data;
-      if (d.layout === "varlen") {
-        const start = d.offsets[slot] ?? 0,
-          length = (d.offsets[slot + 1] ?? start) - start;
-        for (let at = 0; at < Math.max(1, length); at += FRAGMENT)
-          await this.#record(
-            c,
-            at,
-            length,
-            d.bytes.subarray(start + at, start + Math.min(length, at + FRAGMENT)),
-          );
-      } else {
-        const store = new ColumnStore([value.type], writer.io.pool, {
-          chunkRows: 1,
-          targetBytes: FRAGMENT,
-          varlenBytes: 0,
-        });
-        try {
-          if (store.append([value], null, row, 1) !== 1)
-            throw new Error("JSON fixed cell not admitted");
-          const encoded = writer.io.pages.encode(
-            { queryId: writer.io.context.queryId, run: 0, partition: 0, sequence: 0 },
-            store.vectors(),
-            1,
-          );
-          if (!encoded || encoded.length > FRAGMENT)
-            throw new Error("JSON fixed cell exceeds fragment proof");
-          await this.#record(c, -2, encoded.length, encoded);
-        } finally {
-          store.close();
+    for (let c = 0; c < columns.length; c++) await this.#field(c, columns[c], row);
+    await this.#record(-2, 0, 0);
+    this.#rows++;
+  }
+  /** Same native row format, without assembling a complete growing JSON value in memory. */
+  async writeStreamed(fields: ReadonlyArray<Vector | StreamedJsonField>, row = 0): Promise<void> {
+    if (fields.length !== this.types.length) throw new Error("JSON streamed schema mismatch");
+    let payload = 0,
+      extra = 0;
+    for (const field of fields) {
+      if ("stream" in field) {
+        if (field.length !== null) {
+          payload = align(payload) + field.length;
+        }
+      } else if (isValidSlot(field, row)) {
+        payload = align(payload);
+        const [flat, slot] = slotOf(field, row),
+          data = flat.data;
+        if (data.layout === "varlen")
+          payload += (data.offsets[slot + 1] ?? 0) - (data.offsets[slot] ?? 0);
+        else {
+          const wide =
+            data.layout === "decimal" && data.coefficients.repr === "wide"
+              ? bigintBytes(data.coefficients.values[slot] ?? 0n)
+              : 0;
+          payload += 512 + wide;
+          extra += wide ? wide + 8 : 0;
         }
       }
     }
+    if (payload > 0x7fffffff || extra > 0x7fffffff)
+      throw new Error("JSON streamed row exceeds native offsets");
+    this.#payload = Math.max(this.#payload, payload);
+    this.#extra = Math.max(this.#extra, extra);
+    await this.#record(-1, payload, extra);
+    for (let c = 0; c < fields.length; c++) {
+      const field = fields[c];
+      if (!field) throw new Error("Missing JSON streamed field");
+      if (!("stream" in field)) {
+        await this.#field(c, field, row);
+        continue;
+      }
+      if (field.length === null) {
+        await this.#record(c, -1, 0);
+        continue;
+      }
+      const length = field.length;
+      let offset = 0;
+      await field.read(async (bytes) => {
+        for (let at = 0; at < bytes.length; at += FRAGMENT) {
+          const part = bytes.subarray(at, at + FRAGMENT);
+          if (offset + part.length > length)
+            throw new SpillCorruptionError("JSON streamed field overflow");
+          await this.#record(c, offset, length, part);
+          offset += part.length;
+        }
+      });
+      if (offset !== length) throw new SpillCorruptionError("JSON streamed field truncated");
+      if (length === 0) await this.#record(c, 0, 0);
+    }
     await this.#record(-2, 0, 0);
     this.#rows++;
+  }
+  async #field(c: number, value: Vector | undefined, row: number): Promise<void> {
+    const writer = this.#writer;
+    if (!writer) throw new Error("JSON records detached");
+    if (!value) throw new Error("Missing JSON field");
+    if (!isValidSlot(value, row)) {
+      await this.#record(c, -1, 0);
+      return;
+    }
+    const [flat, slot] = slotOf(value, row),
+      d = flat.data;
+    if (d.layout === "varlen") {
+      const start = d.offsets[slot] ?? 0,
+        length = (d.offsets[slot + 1] ?? start) - start;
+      for (let at = 0; at < Math.max(1, length); at += FRAGMENT)
+        await this.#record(
+          c,
+          at,
+          length,
+          d.bytes.subarray(start + at, start + Math.min(length, at + FRAGMENT)),
+        );
+    } else {
+      const store = new ColumnStore([value.type], writer.io.pool, {
+        chunkRows: 1,
+        targetBytes: FRAGMENT,
+        varlenBytes: 0,
+      });
+      try {
+        if (store.append([value], null, row, 1) !== 1)
+          throw new Error("JSON fixed cell not admitted");
+        const encoded = writer.io.pages.encode(
+          { queryId: writer.io.context.queryId, run: 0, partition: 0, sequence: 0 },
+          store.vectors(),
+          1,
+        );
+        if (!encoded || encoded.length > FRAGMENT)
+          throw new Error("JSON fixed cell exceeds fragment proof");
+        await this.#record(c, -2, encoded.length, encoded);
+      } finally {
+        store.close();
+      }
+    }
   }
   #detach(): void {
     const writer = this.#writer;

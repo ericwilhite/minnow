@@ -4741,3 +4741,129 @@ export const OWNED_PARAMETER_COLUMN_BOUNDS_REACH = [
   "original slot order",
   "phase binding bounds",
 ] as const;
+
+export const JSON_AGGREGATE_REACH = [
+  "object aggregation",
+  "array aggregation",
+  "JSON",
+  "JSONB",
+  "ascending",
+  "descending",
+  "empty input",
+  "all NULL values",
+  "omit NULL values",
+  "duplicate object keys",
+  "unique object keys",
+  "exact text",
+  "UTF8 key order",
+] as const;
+
+export const JSON_AGGREGATE_CAP_REACH = [
+  "exact cap divided by two succeeds",
+  "first byte above boundary refuses",
+  "JSON",
+  "JSONB",
+  "small inputs large aggregate",
+  "zero resources",
+] as const;
+
+export const JSON_AGGREGATE_PRESSURE_REACH = JSON_CONSTRUCT_PRESSURE_REACH;
+
+export const JSON_AGGREGATE_TYPED_REACH = [
+  "int4",
+  "numeric",
+  "float4",
+  "float8",
+  "json",
+  "jsonb",
+  "descending",
+  "ascending",
+  "FILTER",
+  "empty group",
+  "ordinary siblings",
+  "exact text",
+  "DISTINCT typed scalar",
+] as const;
+export const JSON_AGGREGATE_ERROR_REACH = [
+  "JSON",
+  "JSONB",
+  "unique",
+  "strict",
+  "NULL key",
+  "value conversion",
+  "descending",
+  "ascending",
+  "PG SQLSTATE",
+  "duplicate omitted NULL values",
+] as const;
+
+export const JSON_AGGREGATE_GROUP_REACH = [
+  "sixteen groups",
+  "thirty-two groups",
+  "observed native sort spill",
+  "ordered nonuniform members",
+  "ordinary sibling",
+  "exact PG text",
+  "zero resources",
+] as const;
+
+export const JSON_BLOB_REACH = [
+  "multiple native pages",
+  "forward byte order",
+  "zero resources",
+] as const;
+export const JSON_RECORD_REACH = [
+  "pretty record",
+  "compact record",
+  "nested ROW",
+  "JSONB record",
+  "present all-NULL row",
+  "absent outer row",
+  "aggregate record separators",
+  "exact PG text",
+] as const;
+
+export const JSON_BLOB_LIFETIME_REACH = [
+  "pending visitor",
+  "close waits",
+  "visitor fault",
+  "visitor resumes",
+  "zero resources",
+] as const;
+
+export const JSON_AGGREGATE_PARENT_REACH = [
+  "retaining join",
+  "retaining window",
+  "bound true",
+  "bound false",
+  "consumed build arm",
+  "JSONB",
+  "JSON",
+  "exact text",
+  "zero files",
+] as const;
+
+export const JSON_AGGREGATE_FILTER_REACH = [
+  "kept error",
+  "false mask",
+  "NULL mask",
+  "value expression",
+  "key expression",
+  "ordering expression",
+  "JSON",
+  "JSONB",
+  "mixed accepted and rejected rows",
+  "PG rows or SQLSTATE",
+  "filter error before value error",
+] as const;
+
+export const JSON_AGGREGATE_KEY_REACH = [
+  "scalar",
+  "object",
+  "array",
+  "one fractional zero",
+  "several fractional zeros",
+  "PG semantic equal pairs",
+  "typed key admission refusal",
+  "zero spill files",
+] as const;

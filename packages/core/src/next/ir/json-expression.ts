@@ -3,6 +3,7 @@ import type { ScalarExpr } from "./ir.js";
 
 /** Such expressions need the owner even when a CASE/COALESCE only relays a JSON column. */
 export function jsonExpression(expr: ScalarExpr): boolean {
+  if (expr.op === "cast" && expr.jsonCanonical) return jsonExpression(expr.input);
   if (
     (expr.op === "case" || (expr.op === "call" && expr.fn === "coalesce")) &&
     expr.type.kind === "json"
@@ -52,10 +53,13 @@ export function jsonExpression(expr: ScalarExpr): boolean {
 
 /** Binary JSON canonicalization can expand; its frame needs checkpoint/re-admission. */
 export function expandingJsonExpression(expr: ScalarExpr): boolean {
+  if (expr.op === "cast" && expr.jsonCanonical) return expandingJsonExpression(expr.input);
   if (
     expr.op === "call" &&
     [
       "json_object",
+      "json_record",
+      "json_record_value",
       "json_build_object",
       "jsonb_build_object",
       "json_build_array",

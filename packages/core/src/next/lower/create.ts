@@ -9,7 +9,7 @@ import type { TableRuleExpressions } from "../ir/rules.js";
 import { samePhysicalType } from "../types.js";
 import { ParameterTypes } from "./coerce.js";
 import { descriptorOf, lowerDdl, tableInput } from "./ddl.js";
-import { frontEndError, PlanningError } from "./errors.js";
+import { frontEndError, PlanningError, unsupported } from "./errors.js";
 import type { ExpressionState } from "./expressions.js";
 import type { RowLocking, CompiledQuery } from "../../plan/model.js";
 import { parseAny, parseQuery, prepareQuery } from "./frontend.js";
@@ -137,6 +137,7 @@ function rowLockIntent(lock: RowLocking | undefined): LoweredRowLocking {
 }
 
 function planned(plan: Planning, root: Rel, columns: readonly RelColumn[], catalog: CatalogView) {
+  if (columns.some((column) => column.record)) throw unsupported("function", "bare record output");
   return {
     rowLocking: rowLockIntent(plan.builder.rowLocking),
     plan: physicalPlan(root, outputColumns(columns), plan, catalog),

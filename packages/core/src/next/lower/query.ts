@@ -6,6 +6,7 @@
  * The FROM clause (sources, joins and their order, subqueries) is lower/from.ts.
  */
 import { strongestRowLock } from "../../engine/row-locking.js";
+import { jsonCallSource } from "../../engine/json-call-sources.js";
 import type { AggregateCall, AggregateFn, Bound, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { aggregateArgument, aggregateResult } from "../ir/functions.js";
 import type { PhysicalType } from "../types.js";
@@ -18,6 +19,7 @@ import {
   asBool,
   lowerCondition,
   lowerExpression,
+  lowerJsonValue,
   type Collated,
   type Scope,
 } from "./expressions.js";
@@ -54,6 +56,8 @@ interface AggregateDraft {
   readonly type: PhysicalType;
   readonly nullable: boolean;
   readonly big: boolean;
+  readonly filter?: Typed;
+  readonly json?: AggregateCall["json"];
 }
 
 const INT8: PhysicalType = { kind: "int64" };
@@ -69,6 +73,71 @@ function aggregateDraft(
   const settleArg = (arg: Expression): Typed =>
     settle(lowerExpression(arg, scope, state), builder.parameters);
   const [first] = expression.arguments;
+  if (name === "JSON_ARRAYAGG") {
+    const source = jsonCallSource(expression);
+    if (!source) throw unsupported("aggregate", "array_agg");
+    const object = source.includes("OBJECT_AGG"),
+      arity = object ? 2 : 1;
+    if (!first) throw new PlanningError("JSON aggregate needs an argument", "42883");
+    if (source === "JSON_ARRAYAGG" && distinct)
+      throw new PlanningError("JSON_ARRAYAGG DISTINCT is not supported by PostgreSQL", "42601");
+    const args = expression.arguments
+      .slice(0, arity)
+      .map((arg) => settle(lowerJsonValue(arg, scope, state), builder.parameters));
+    const binary =
+      source.startsWith("JSONB") ||
+      (source === "JSON_ARRAYAGG" &&
+        args[0]?.expr.type.kind === "json" &&
+        args[0].expr.type.binary);
+    const fn = object
+      ? binary
+        ? "jsonb_object_agg"
+        : "json_object_agg"
+      : binary
+        ? "jsonb_agg"
+        : "json_agg";
+    if (distinct) {
+      if (args.some((arg) => arg.expr.type.kind === "json" && !arg.expr.type.binary && !arg.record))
+        throw new PlanningError("could not identify an equality operator for type json", "42883");
+      const identities = new Set(
+        expression.arguments.slice(0, arity).map((arg) => encodeQueryIdentity(arg)),
+      );
+      if (
+        expression.aggregateOrderBy?.some(
+          (key) => !identities.has(encodeQueryIdentity(key.expression)),
+        )
+      )
+        throw new PlanningError(
+          "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list",
+          "42P10",
+        );
+      if (args.some((arg) => arg.record ?? arg.expr.type.kind === "json"))
+        throw unsupported(
+          "aggregate",
+          "DISTINCT JSONB or composite JSON input (native equality seam pending)",
+        );
+    }
+    const filter = expression.arguments[arity];
+    return {
+      fn,
+      args,
+      distinct,
+      orderBy: (expression.aggregateOrderBy ?? []).map((order) => ({
+        typed: settleArg(order.expression),
+        direction: order.direction,
+        nulls: order.nulls ?? (order.direction === "desc" ? "first" : "last"),
+      })),
+      type: { kind: "json", binary },
+      nullable: true,
+      big: false,
+      ...(filter ? { filter: asBool(lowerExpression(filter, scope, state), state) } : {}),
+      json: {
+        skipNulls: source.endsWith("STRICT") || source === "JSON_ARRAYAGG",
+        unique: source.includes("UNIQUE"),
+        record: args[0]?.record === true,
+      },
+    };
+  }
   if (name === "COUNT") {
     if (first === undefined || first.kind === "wildcard")
       return {
@@ -255,6 +324,21 @@ function aggregateDraft(
   }
 }
 
+/** PostgreSQL evaluates FILTER before either arguments or aggregate-local ordering keys. */
+function filteredArgument(value: Typed, filter: Typed | undefined): Typed {
+  if (!filter) return value;
+  return {
+    ...value,
+    nullable: true,
+    expr: {
+      op: "case",
+      branches: [{ when: filter.expr, then: value.expr }],
+      otherwise: null,
+      type: value.expr.type,
+    },
+  };
+}
+
 /** The output of a block's GROUP BY: keys first, then aggregates. */
 class Grouping {
   readonly keys: Typed[] = [];
@@ -300,6 +384,23 @@ class Grouping {
   /** The scope of expressions over the grouped rows (HAVING, the select list, ORDER BY). */
   scope(): Scope {
     return {
+      ...(this.source.rowPresence === undefined
+        ? {}
+        : {
+            rowPresence: (reference: string): Typed => {
+              const source = this.source.rowPresence?.(reference);
+              if (!source) throw new PlanningError("whole row is not in scope", "42803");
+              return {
+                ...source,
+                expr: mapColumns(source.expr, (index) => {
+                  const key = this.#keyColumns.get(index);
+                  if (key === undefined)
+                    throw new PlanningError("whole row must appear in GROUP BY", "42803");
+                  return key;
+                }),
+              };
+            },
+          }),
       match: (expression) => {
         const identity = encodeQueryIdentity(expression);
         const key = this.#keyIdentities.get(identity);
@@ -356,12 +457,13 @@ class Grouping {
       args: draft.args.map((arg) =>
         draft.fn === "percentile_cont" || draft.fn === "percentile_disc" || draft.fn === "mode"
           ? arg.expr
-          : argumentColumn(arg),
+          : argumentColumn(filteredArgument(arg, draft.filter)),
       ),
       distinct: draft.distinct,
-      filter: null,
+      filter: draft.filter ? argumentColumn(draft.filter) : null,
+      ...(draft.json ? { json: draft.json } : {}),
       orderBy: draft.orderBy.map((order): SortKey => ({
-        expr: argumentColumn(order.typed),
+        expr: argumentColumn(filteredArgument(order.typed, draft.filter)),
         direction: order.direction,
         nulls: order.nulls,
         collation: null,
@@ -498,7 +600,7 @@ export function lowerBlock(
       state,
     ),
   );
-  const raw = select.map((item) => lowerExpression(item.expression, outputScope, state));
+  const raw = select.map((item) => lowerJsonValue(item.expression, outputScope, state));
   const items: Collated[] = raw.map((typed) => settle(typed, builder.parameters));
   // Unknown-typed constants a set operation still resolves (placeholders keep their own rule).
   const pending = raw.map((typed) =>
@@ -574,6 +676,7 @@ export function lowerBlock(
     type: item.expr.type,
     nullable: item.nullable,
     big: item.big,
+    ...(item.record ? { record: true as const } : {}),
     ...(item.collation === undefined ? {} : { collation: item.collation }),
   }));
   current = {

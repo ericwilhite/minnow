@@ -66,6 +66,7 @@ export function* jsonValue(
   memory: JsonMemory,
   slice: Slice,
   key = false,
+  rawKey = false,
 ): SlicedJob<void> {
   if (!isValidSlot(vector, row)) {
     if (key)
@@ -90,7 +91,8 @@ export function* jsonValue(
           "22023",
         );
       yield* out.copy(bytes);
-    } else yield* quotedJson(bytes, out);
+    } else if (rawKey) yield* out.copy(bytes);
+    else yield* quotedJson(bytes, out);
     return;
   }
   let scratch = 0;
@@ -137,7 +139,7 @@ export function* jsonValue(
         const negative = coefficient < 0n,
           start = negative ? 1 : 0,
           integral = digits.length - start - scale;
-        if (key) out.put(34);
+        if (key && !rawKey) out.put(34);
         if (negative) out.put(45);
         if (integral <= 0) out.put(48);
         for (let i = 0; i < Math.max(integral, 0); i++) {
@@ -151,7 +153,7 @@ export function* jsonValue(
             if ((i & 1023) === 0 && slice.due()) yield;
           }
         }
-        if (key) out.put(34);
+        if (key && !rawKey) out.put(34);
         return;
       }
       case "date":
@@ -187,6 +189,7 @@ export function* jsonValue(
       default:
         throw new UnsupportedPlanError("JSON value type " + type.kind, { construct: "function" });
     }
+    if (rawKey) quote = false;
     if (quote) out.put(34);
     yield* jsonAscii(text, out);
     if (quote) out.put(34);

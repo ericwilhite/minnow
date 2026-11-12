@@ -12392,6 +12392,20 @@ class Parser {
           ...(fallback === null ? {} : { fallback }),
         };
       }
+      if (recordDeclaredTypes && upper === "ROW") {
+        const fields = this.#punctuation(")") ? [] : this.#expressionList();
+        if (fields.length > 0) this.#expectPunctuation(")");
+        const row: Expression = {
+          kind: "call",
+          name: "JSON_OBJECT",
+          arguments: fields.flatMap((field, i) => [
+            { kind: "literal", value: `f${String(i + 1)}` },
+            field,
+          ]),
+        };
+        rememberJsonCall(row, "ROW_VALUE");
+        return row;
+      }
       if (
         upper === "JSON_OBJECT" ||
         upper === "JSON_BUILD_OBJECT" ||
@@ -12419,8 +12433,17 @@ class Parser {
       // SUBSTRING/CEILING/CHAR_LENGTH are standard spellings; SUBSTR/CEIL/LENGTH are the
       // canonical plan names. ANY_VALUE picks an implementation-dependent row of the group
       // (T626); MIN is one such choice and reuses its accumulator exactly.
-      const name = (upper === "ANY_VALUE" ? "MIN" : (functionSpellings.get(upper) ?? upper)) as
-        AggregateName | ScalarFunctionName;
+      const nativeJsonAggregate =
+        recordDeclaredTypes &&
+        /^JSONB?_(?:AGG(?:_STRICT)?|OBJECT_AGG(?:_UNIQUE)?(?:_STRICT)?)$/u.test(upper);
+      const jsonObjectAggregate = nativeJsonAggregate && upper.includes("OBJECT_AGG");
+      const name = (
+        nativeJsonAggregate
+          ? "JSON_ARRAYAGG"
+          : upper === "ANY_VALUE"
+            ? "MIN"
+            : (functionSpellings.get(upper) ?? upper)
+      ) as AggregateName | ScalarFunctionName;
       if (
         name === "MINNOW_TUPLE_KEY" ||
         name === "MINNOW_COLLATE" ||
@@ -12461,20 +12484,28 @@ class Parser {
           if (this.#isKeyword("ORDER")) aggregateOrderBy = this.#orderByClause();
         } else if (name === "JSON_ARRAYAGG") {
           args.push(this.#expression());
+          if (jsonObjectAggregate) {
+            this.#expectPunctuation(",");
+            args.push(this.#expression());
+          }
           if (this.#isKeyword("ORDER")) aggregateOrderBy = this.#orderByClause();
         } else {
           args.push(...this.#expressionList());
         }
         this.#expectPunctuation(")");
       }
-      const distinctArity = name === "STRING_AGG" ? 2 : 1;
+      const distinctArity = name === "STRING_AGG" || jsonObjectAggregate ? 2 : 1;
       if (distinct && (args.length !== distinctArity || args[0]?.kind === "wildcard")) {
         throw new TypeError(`${name}(DISTINCT) requires exactly one scalar argument`);
       }
       if (name === "STRING_AGG" && args.length !== 2) {
         throw new TypeError("STRING_AGG requires a value and delimiter");
       }
-      if (aggregateNames.has(name as AggregateName) && name !== "STRING_AGG" && args.length !== 1)
+      if (
+        aggregateNames.has(name as AggregateName) &&
+        name !== "STRING_AGG" &&
+        args.length !== (jsonObjectAggregate ? 2 : 1)
+      )
         throw new TypeError(`${name} requires exactly one argument`);
       if (name === "JSON_ARRAYAGG" && args[0]?.kind === "wildcard") {
         throw new TypeError("JSON_ARRAYAGG requires a scalar value expression");
@@ -12486,7 +12517,10 @@ class Parser {
           this.usesStatementDatetime = true;
           args.unshift({ kind: "call", name: "CURRENT_DATE", arguments: [] });
         }
-        if (args.length < simple.minArgs || args.length > simple.maxArgs) {
+        if (
+          !(recordDeclaredTypes && upper === "ROW_TO_JSON") &&
+          (args.length < simple.minArgs || args.length > simple.maxArgs)
+        ) {
           const range =
             simple.minArgs === simple.maxArgs
               ? `exactly ${String(simple.minArgs)}`
@@ -12591,7 +12625,7 @@ class Parser {
         }
       }
       if (aggregateNames.has(name as AggregateName) && this.#isKeyword("FILTER")) {
-        if (name === "JSON_ARRAYAGG") {
+        if (name === "JSON_ARRAYAGG" && !recordDeclaredTypes) {
           throw new TypeError("JSON_ARRAYAGG FILTER is not supported; filter rows in WHERE");
         }
         // FILTER (WHERE cond) desugars into the aggregate's argument: rows failing the filter
@@ -12609,10 +12643,12 @@ class Parser {
           argument === undefined || argument.kind === "wildcard"
             ? { kind: "literal", value: 1 }
             : argument;
-        args.splice(0, args.length, {
-          kind: "case",
-          branches: [{ when: condition, then: kept }],
-        });
+        if (name === "JSON_ARRAYAGG") args.push(condition);
+        else
+          args.splice(0, args.length, {
+            kind: "case",
+            branches: [{ when: condition, then: kept }],
+          });
       }
       if (aggregateNames.has(name as AggregateName) && this.#isKeyword("OVER")) {
         if (name === "JSON_ARRAYAGG") {

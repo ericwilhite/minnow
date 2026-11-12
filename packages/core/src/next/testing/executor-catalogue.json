@@ -26852,15 +26852,13 @@
       "id": "guide-7",
       "dataset": "retail",
       "sql": "SELECT JSON_OBJECT(\n  'id' VALUE o.order_id,\n  'detail' VALUE JSON_OBJECT('status' VALUE o.status),\n  'items' VALUE JSON_ARRAYAGG(JSON_OBJECT('sku' VALUE p.sku))\n) AS document\nFROM orders o\nJOIN order_items i ON i.order_id = o.order_id\nJOIN products p ON p.product_id = i.product_id\nGROUP BY o.order_id, o.status",
-      "lowered": false,
-      "construct": "aggregate"
+      "lowered": true
     },
     {
       "id": "guide-8",
       "dataset": "retail",
       "sql": "SELECT c.customer_id,\n  (SELECT COALESCE(json_agg(agg), '[]')\n   FROM (SELECT o.order_id, o.total FROM orders o WHERE o.customer_id = c.customer_id) agg\n  ) AS orders\nFROM customers c",
-      "lowered": false,
-      "construct": "function"
+      "lowered": true
     },
     {
       "id": "guide-9",

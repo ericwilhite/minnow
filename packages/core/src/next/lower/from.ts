@@ -78,6 +78,7 @@ function byteCollation(collation: string | null | undefined): boolean {
 export const SOURCE_STRIDE = 1 << 16;
 /** The local index of a table source's row locator. */
 const LOCATOR_LOCAL = SOURCE_STRIDE - 1;
+const ROW_PRESENCE_LOCAL = SOURCE_STRIDE - 2;
 
 export const virtual = (source: number, local: number): number => source * SOURCE_STRIDE + local;
 export const sourceOf = (index: number): number => Math.floor(index / SOURCE_STRIDE);
@@ -108,6 +109,7 @@ interface Unit {
 type EntryKind = "base" | "inner" | "left" | "semi" | "anti" | "full";
 
 interface Resolved {
+  readonly record?: true;
   readonly local: number;
   readonly type: PhysicalType;
   readonly nullable: boolean;
@@ -183,6 +185,7 @@ function relationEntry(
             type: found.type,
             nullable: found.nullable,
             big: found.big,
+            ...(found.record ? { record: true as const } : {}),
             ...(found.collation === undefined ? {} : { collation: found.collation }),
           };
     },
@@ -370,11 +373,37 @@ export function lowerFrom(
     expr: column(virtual(entry.source, found.local), found.type),
     nullable: found.nullable || entry.nullSupplied,
     big: found.big,
+    ...(found.record ? { record: true as const } : {}),
     ...(found.collation === undefined ? {} : { collation: found.collation }),
   });
   const attachments: Attachment[] = [];
 
+  const rowMarkers = new Set<number>();
   const scope: Scope = {
+    rowPresence: (reference) => {
+      const entry = byQualifier(reference.slice(0, reference.indexOf(".")))[0];
+      if (!entry?.nullSupplied) return { expr: boolLiteral(true), nullable: false, big: false };
+      for (const name of entry.names()) {
+        const found = entry.resolve(name);
+        if (found && !found.nullable)
+          return {
+            expr: {
+              op: "isNull",
+              negated: true,
+              arg: typedOf(entry, found).expr,
+              type: { kind: "bool" },
+            },
+            nullable: false,
+            big: false,
+          };
+      }
+      rowMarkers.add(entry.source);
+      return {
+        expr: column(virtual(entry.source, ROW_PRESENCE_LOCAL), { kind: "bool" }),
+        nullable: true,
+        big: false,
+      };
+    },
     column: (reference) => {
       const dot = reference.indexOf(".");
       if (dot !== -1) {
@@ -798,7 +827,24 @@ export function lowerFrom(
           ...typed,
           expr: mapColumns(typed.expr, (index) => index - entry.source * SOURCE_STRIDE),
         }));
-        return entry.build(local, locators.has(entry.source));
+        const unit = entry.build(local, locators.has(entry.source));
+        if (!rowMarkers.has(entry.source)) return unit;
+        const columns: RelColumn[] = [
+          ...unit.columns,
+          { name: "\0row-presence", type: { kind: "bool" }, nullable: false, big: false },
+        ];
+        return {
+          ...unit,
+          columns,
+          layout: [...unit.layout, virtual(entry.source, ROW_PRESENCE_LOCAL)],
+          rel: {
+            op: "project",
+            id: builder.id(),
+            input: unit.rel,
+            exprs: [...unit.columns.map((c, i) => column(i, c.type)), boolLiteral(true)],
+            output: outputColumns(columns),
+          },
+        };
       };
       let acc: Unit | null = null;
       let group: Unit[] = [];

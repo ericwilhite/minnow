@@ -130,6 +130,9 @@ for (const [dataset, packed] of [
     // wall-clock fields, and keep DATE as PostgreSQL's text instead of a host-local midnight.
     const pg = new PGlite({
       parsers: {
+        // Compare exact JSON wire text, not the client parser's normalized objects.
+        114: (value) => value,
+        3802: (value) => value,
         1114: (value) => new Date(value.replace(" ", "T") + "Z"),
         1082: (value) => value,
         1186: (value) => value,
@@ -179,6 +182,15 @@ for (const [dataset, packed] of [
       await core.harness.path.recycleLog();
       await core.harness.path.quiesce();
       if (dataset === "retail") {
+        const joinSQL =
+          "SELECT o.order_id,i.order_item_id FROM orders o JOIN order_items i ON i.order_id=o.order_id JOIN products p ON p.product_id=i.product_id";
+        const stream = await core.execute(joinSQL);
+        if (!("batches" in stream)) throw new Error("Expected join stream");
+        expect(
+          oracleRows(stream),
+          "JSON aggregate authority must pin the actual native input order",
+        ).toEqual((await pg.query(joinSQL + " ORDER BY o.order_id,i.order_item_id DESC")).rows);
+
         // Establish the physical input order used by the ordered PG authority, rather than
         // assuming a heap scan happens to match an unspecified SQL result order.
         const scan = await core.execute("SELECT order_id FROM orders WHERE status = 'completed'");
@@ -307,6 +319,17 @@ for (const [dataset, packed] of [
           );
         }
         const witnessSQL = CATALOGUE_CURRENT_AUTHORITY[query.id];
+        if (query.id === "guide-7" || query.id === "guide-8") {
+          const nullFree = (value: unknown): boolean =>
+            value !== null && (typeof value !== "object" || Object.values(value).every(nullFree));
+          for (const row of pgRows)
+            for (const [index, value] of Object.values(row).entries())
+              if (prepared.columns[index]?.type.kind === "json")
+                expect(
+                  typeof value === "string" && nullFree(JSON.parse(value)),
+                  "legacy compact-text witness must not remove NULL members",
+                ).toBe(true);
+        }
         const legacyExpected =
           witnessSQL === undefined
             ? pgRows
