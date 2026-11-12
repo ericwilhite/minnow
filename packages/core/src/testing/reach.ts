@@ -126,6 +126,50 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+export const KEY_POINTER_CODEC_STATES = [
+  "shipped maximum",
+  "other lengths",
+  "adjacent directory",
+  "directory padding",
+  "round trip",
+  "invalid references",
+  "unknown tag",
+  "truncation",
+] as const;
+
+export const OVERFLOW_WRITER_STATES = [
+  "wide row identifiers",
+  "interleaved scratch",
+  "bulk supplied hashes",
+  "publication reader guards",
+  "payload failed",
+  "directory failed",
+  "block failed",
+  "tail failed",
+  "credit failed",
+  "native failed",
+  "construct failed",
+  "write failed",
+  "finish failed",
+  "waiting before encoder",
+  "cancelled admission",
+  "resumed admission",
+  "extended blocks",
+  "inline blocks",
+  "mixed blocks",
+  "funded until consumed",
+  "borrowed input",
+  "copied input",
+  "bottom tombstones",
+  "retained tombstones",
+  "acknowledged buffers detached",
+  "shipped maximum",
+  "multiple payload chunks",
+  "empty output",
+  "bounded budget",
+  "clean failure retry",
+] as const;
+
 export const RUN_KEY_CODEC_STATES = [
   "run encodings",
   "unknown run encoding",

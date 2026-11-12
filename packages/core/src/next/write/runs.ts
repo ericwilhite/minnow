@@ -31,12 +31,23 @@
  * (merges, range scans).
  *
  * ## Writing (`RunEncoder`; `RunBuilder` collects one in memory)
- * Encoded keys are at most 2 KiB; longer keys raise `IndexKeyTooLongError` when emitted, in both
- * ordinary and bulk paths. Entries are added in (key, rowId) order. A put and a tombstone of the same row id cancel (the
+ * Inline encoding 1 limits keys to 2 KiB; longer keys raise `IndexKeyTooLongError` in both
+ * ordinary and bulk paths. Opt-in encoding 2 streams larger keys through same-extent chunk
+ * directories and bounded extended blocks; its fences contain key pointers. Production
+ * selection waits for reader/catalog integration. Entries are added in (key, rowId) order.
+ * A put and a tombstone of the same row id cancel (the
  * row was inserted and deleted within the merged layers); a run written to the bottom level also
  * drops the tombstones left (no older put can exist below it).
  */
 import { RUN_CODEC, requireHeader, requireBits } from "../durable-format.js";
+import { readRunEncoding, requireEncoding, type RunEncoding } from "../format/encoding.js";
+import {
+  KEY_DIRECTORY_MAGIC,
+  KEY_DIRECTORY_VERSION,
+  EXTENDED_KEY_BLOCK,
+  type RunKeyStorage,
+} from "../format/key-pointer.js";
+import { RUN_KEY_PREFIX_BYTES, RUN_KEY_CHUNK_BYTES } from "../format/run-key.js";
 import type { BlobRef, RunRef } from "../format/manifest.js";
 import type { SingleEntries } from "./key-hash.js";
 import { hashKey } from "./key-hashes.js";
@@ -94,6 +105,8 @@ export interface EncodedRun extends RunSummary {
 
 /** What a finished `RunEncoder` reports (its tail parts were emitted last). */
 export interface RunSummary {
+  readonly encoding?: RunEncoding;
+  readonly keyStorage?: RunKeyStorage;
   /** Idempotent: the consumer has copied/published the output, or abandoned it. */
   release(): void;
   readonly entryCount: number;
@@ -109,6 +122,11 @@ export const RUN_ENCODER_MINIMUM = 256 * 1024;
 /** Native capacity is charged before construction; old and new coexist during resize. */
 class RunBuffers implements BufferAllocator {
   readonly #live = new Map<ArrayBufferLike, number>();
+  #metadata = 0;
+  hold(bytes: number): void {
+    charged(this.budget, bytes);
+    this.#metadata += bytes;
+  }
   constructor(readonly budget: ByteBudget) {}
   create(bytes: number): Uint8Array {
     charged(this.budget, bytes + RUN_BUFFER_OVERHEAD);
@@ -145,6 +163,9 @@ class RunBuffers implements BufferAllocator {
   close(): void {
     for (const bytes of this.#live.values()) this.budget.free(bytes);
     this.#live.clear();
+    const metadata = this.#metadata;
+    this.#metadata = 0;
+    if (metadata > 0) this.budget.free(metadata);
   }
 }
 
@@ -180,6 +201,16 @@ class RunTail extends ByteWriter {
       this.buffers.release(storage);
       throw error;
     }
+  }
+
+  /** Transfer a completed key directory without copying its funded backing. */
+  detach(target: RunBuffers): Uint8Array {
+    const out = this.bytes.subarray(0, this.length);
+    this.buffers.transfer(out, target);
+    this.bytes = EMPTY_KEY;
+    this.view = new DataView(EMPTY_KEY.buffer);
+    this.length = 0;
+    return out;
   }
 
   complete(target: RunBuffers, first: number, second?: number): Uint8Array {
@@ -279,19 +310,29 @@ export class RunEncoder {
   readonly #scratch: RunBuffers;
   readonly #output: RunBuffers;
   #finished = false;
+  readonly #pointer: ByteWriter | null;
+  readonly #keyDirectory: RunTail | null;
+  #hasDescriptor = false;
+  #minimumDescriptor: Uint8Array | null = null;
+  #maxKeyBytes = 0;
+  #extendedBlock = false;
 
   constructor(
     emit: (part: Uint8Array) => void,
     dropTombstones = false,
     readonly borrowKeys = false,
     budget: ByteBudget = UNCHARGED,
+    readonly encoding: RunEncoding = 1,
   ) {
     this.#emit = emit;
     this.#dropTombstones = dropTombstones;
-    this.#directDisabled = !borrowKeys;
+    readRunEncoding(encoding);
+    this.#directDisabled = !borrowKeys || encoding === 2;
     this.#scratch = new RunBuffers(budget);
     this.#output = new RunBuffers(budget);
     try {
+      this.#pointer = encoding === 2 ? new ByteWriter(128, this.#scratch) : null;
+      this.#keyDirectory = encoding === 2 ? new RunTail(128, 0, this.#scratch) : null;
       this.#index = new RunTail(4096, 5, this.#scratch);
       this.#fences = new RunTail(4096, 5, this.#scratch);
       this.#directory = new RunTail(64, 10, this.#scratch);
@@ -300,7 +341,7 @@ export class RunEncoder {
       this.#offsets = new Uint16Array(this.#scratch.create(BLOCK_BYTES * 2).buffer);
       this.#pendingKey = borrowKeys ? EMPTY_KEY : this.#scratch.create(64);
       this.#lastKey = borrowKeys ? EMPTY_KEY : this.#scratch.create(64);
-      if (borrowKeys) this.#directEntries = new Int32Array(this.#offsets.buffer);
+      if (borrowKeys && encoding === 1) this.#directEntries = new Int32Array(this.#offsets.buffer);
     } catch (error) {
       this.#scratch.close();
       throw error;
@@ -573,6 +614,48 @@ export class RunEncoder {
     if (this.#blocksInPartition === PARTITION_BLOCKS) this.#closePartition();
   }
 
+  /** Full canonical bytes determine equality and Bloom hashes; only storage is indirect. */
+  #describeKey(key: Uint8Array, start: number, length: number): void {
+    const pointer = need(this.#pointer);
+    pointer.reset();
+    pointer.u8(length <= MAX_KEY_BYTES ? 0 : 1);
+    if (length <= MAX_KEY_BYTES) {
+      pointer.varuint(length);
+      pointer.rawRange(key, start, start + length);
+    } else {
+      const directory = need(this.#keyDirectory);
+      directory.reset();
+      directory.u32(KEY_DIRECTORY_MAGIC);
+      directory.u8(KEY_DIRECTORY_VERSION);
+      directory.u8(1);
+      directory.varuint(length);
+      directory.varuint(RUN_KEY_PREFIX_BYTES);
+      directory.rawRange(key, start, start + RUN_KEY_PREFIX_BYTES);
+      directory.varuint(Math.ceil(length / RUN_KEY_CHUNK_BYTES));
+      for (let at = start; at < start + length; at += RUN_KEY_CHUNK_BYTES) {
+        const part = this.#output.copy(key, at, Math.min(at + RUN_KEY_CHUNK_BYTES, start + length));
+        directory.varuint(this.#offset);
+        directory.varuint(part.length);
+        directory.u32(xxHash32(part));
+        this.#put(part);
+      }
+      if (directory.length > MAX_INDEX_BYTES)
+        throw new RangeError("A key directory exceeds the blob cap");
+      const part = directory.detach(this.#output),
+        offset = this.#offset,
+        size = part.length,
+        checksum = xxHash32(part);
+      this.#put(part);
+      pointer.varuint(length);
+      pointer.varuint(RUN_KEY_PREFIX_BYTES);
+      pointer.rawRange(key, start, start + RUN_KEY_PREFIX_BYTES);
+      pointer.varuint(offset);
+      pointer.varuint(size);
+      pointer.u32(checksum);
+    }
+    this.#hasDescriptor = true;
+  }
+
   #emitPending(): void {
     this.#hasPending = false;
     this.#writeEntry(
@@ -598,10 +681,13 @@ export class RunEncoder {
     distinct: boolean,
   ): void {
     if (tombstone && this.#dropTombstones) return;
-    if (length > MAX_KEY_BYTES) throw new IndexKeyTooLongError(length);
+    const long = length > MAX_KEY_BYTES;
+    if (long && this.encoding === 1) throw new IndexKeyTooLongError(length);
     if (
       this.#count > 0 &&
-      (this.#block.length + entrySize(length) + (this.#count + 1) * 2 > BLOCK_BYTES ||
+      (this.#extendedBlock !== long ||
+        this.#block.length + (long ? 96 : entrySize(length)) + (this.#count + 1) * 2 >
+          BLOCK_BYTES ||
         this.#count >= 0xfff0)
     )
       this.#closeBlock();
@@ -616,9 +702,15 @@ export class RunEncoder {
         this.#lastStart,
         this.#lastStart + length,
       ) === 0;
+    if (this.encoding === 2 && (!same || !this.#hasDescriptor))
+      this.#describeKey(key, start, length);
     if (this.#count === 0) {
-      this.#fences.varuint(length);
-      this.#fences.rawRange(key, start, start + length);
+      if (this.#pointer !== null)
+        this.#fences.rawRange(this.#pointer.bytes, 0, this.#pointer.length);
+      else {
+        this.#fences.varuint(length);
+        this.#fences.rawRange(key, start, start + length);
+      }
     }
     if (!(this.#lastInBlock && same)) {
       if (this.#hashCount + 2 > this.#hashes.length) {
@@ -658,16 +750,23 @@ export class RunEncoder {
     this.#offsets[this.#count++] = block.length;
     // One reserve, then the entry's bytes in place: varuint length (a key is ≤ 2 KiB, so one
     // or two bytes), key, u32 row id low, u16 row id high, flags.
-    block.ensure(length + 9);
+    block.ensure(long ? need(this.#pointer).length + 7 : length + 9);
     const bytes = block.bytes;
     let at = block.length;
-    if (length < 0x80) bytes[at++] = length;
-    else {
-      bytes[at++] = (length & 0x7f) | 0x80;
-      bytes[at++] = length >>> 7;
+    if (long) {
+      const pointer = need(this.#pointer);
+      copyRange(bytes, at, pointer.bytes, 0, pointer.length);
+      at += pointer.length;
+      this.#extendedBlock = true;
+    } else {
+      if (length < 0x80) bytes[at++] = length;
+      else {
+        bytes[at++] = (length & 0x7f) | 0x80;
+        bytes[at++] = length >>> 7;
+      }
+      copyRange(bytes, at, key, start, start + length);
+      at += length;
     }
-    copyRange(bytes, at, key, start, start + length);
-    at += length;
     const low = rowId % 2 ** 32;
     const high = Math.floor(rowId / 2 ** 32);
     bytes[at] = low & 0xff;
@@ -680,6 +779,9 @@ export class RunEncoder {
     block.length = at + 7;
     this.#entryCount += 1;
     this.#minKey ??= this.#output.copy(key, start, start + length);
+    this.#maxKeyBytes = Math.max(this.#maxKeyBytes, length);
+    if (this.#pointer !== null)
+      this.#minimumDescriptor ??= this.#output.copy(this.#pointer.bytes, 0, this.#pointer.length);
   }
 
   #closeBlock(): void {
@@ -688,7 +790,7 @@ export class RunEncoder {
     const header = 2 + count * 2;
     const out = this.#output.create(header + this.#block.length);
     const view = new DataView(out.buffer);
-    view.setUint16(0, count, true);
+    view.setUint16(0, count | (this.#extendedBlock ? EXTENDED_KEY_BLOCK : 0), true);
     for (let k = 0; k < count; k++)
       view.setUint16(2 + k * 2, header + (this.#offsets[k] ?? 0), true);
     out.set(this.#block.bytes.subarray(0, this.#block.length), header);
@@ -699,6 +801,7 @@ export class RunEncoder {
     this.#blockCount += 1;
     this.#block.reset();
     this.#count = 0;
+    this.#extendedBlock = false;
     this.#lastInBlock = false;
     this.#blocksInPartition += 1;
     if (this.#blocksInPartition === PARTITION_BLOCKS) this.#closePartition();
@@ -745,9 +848,20 @@ export class RunEncoder {
       this.#lastStart,
       this.#lastStart + this.#lastLength,
     );
+    let keyStorage: RunKeyStorage | undefined;
+    if (this.#pointer !== null) {
+      const maximum = this.#output.copy(this.#pointer.bytes, 0, this.#pointer.length);
+      this.#output.hold(OBJECT_OVERHEAD_BYTES);
+      keyStorage = {
+        minimum: need(this.#minimumDescriptor),
+        maximum,
+        maxKeyBytes: this.#maxKeyBytes,
+      };
+    }
     this.#finished = true;
     const output = this.#output;
     return {
+      ...(keyStorage === undefined ? {} : { encoding: this.encoding, keyStorage }),
       entryCount: this.#entryCount,
       minKey,
       maxKey,
@@ -761,6 +875,9 @@ export class RunEncoder {
 
   /** Release scratch and borrowed inputs; unfinished output is aborted. Not resumable. */
   close(): void {
+    this.#pointer?.close();
+    this.#keyDirectory?.close();
+    this.#minimumDescriptor = null;
     this.#index.close();
     this.#fences.close();
     this.#directory.close();
@@ -787,7 +904,12 @@ export class RunBuilder {
   #queuedBytes = 0;
   #transferred = false;
 
-  constructor(dropTombstones = false, borrowKeys = false, budget: ByteBudget = UNCHARGED) {
+  constructor(
+    dropTombstones = false,
+    borrowKeys = false,
+    budget: ByteBudget = UNCHARGED,
+    encoding: RunEncoding = 1,
+  ) {
     this.#encoder = new RunEncoder(
       (part) => {
         this.#parts.push(part);
@@ -796,6 +918,7 @@ export class RunBuilder {
       dropTombstones,
       borrowKeys,
       budget,
+      encoding,
     );
   }
 
@@ -889,6 +1012,7 @@ export function encodeRun(keys: readonly SortedKey[]): EncodedRun | null {
 export function runRef(run: RunSummary, blobs: readonly BlobRef[], level = 0): RunRef {
   const count = blobs.length;
   return {
+    ...(run.encoding === 2 ? { encoding: 2 as const, keyStorage: need(run.keyStorage) } : {}),
     level,
     entryCount: run.entryCount,
     entries: need(blobs[count - 3]),
@@ -1081,6 +1205,7 @@ export class RunReader {
     budget: ByteBudget,
     charge: ByteBudget,
   ): MaybePromise<RunReader> {
+    requireEncoding("run reader", ref.encoding ?? 1, [1]);
     const fences = space.peek(ref.fences);
     const index = space.peek(ref.entries);
     const directory = space.peek(ref.bloom);

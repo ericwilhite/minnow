@@ -2206,3 +2206,11 @@ chunk coverage, checksum fields, overlap, extent bounds, truncation and unknown 
 root versions. Codec availability alone does not enable long-key writes; writer, reader,
 Bloom, summary and catalog-limit integration are separate stages. Short-key block bytes
 remain unchanged.
+
+The next stage's `write/overflow-writer.test.ts` exercises an opt-in overflow writer. It
+keeps data blocks within 4 KiB, puts payload chunks and their checksummed directory in the
+same extent, and keeps summary storage charged through consumption. Generated cases check
+precharge before native allocation, delayed acknowledgement, detached buffers, cancellation
+before admission, injected allocation/append failures and retry, bulk input, wide row IDs,
+and two interleaved encoders. The default production writer remains inline until reader and
+catalog integration is complete; premature overflow publication or reading is a typed refusal.

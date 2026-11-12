@@ -68,6 +68,7 @@
  * - **Exactly once** (ledger.ts): `clients` holds the committed outcomes as of `globalLsn`.
  */
 import { DURABLE_CODECS, DURABLE_FORMATS } from "../durable-format.js";
+import type { RunKeyStorage } from "./key-pointer.js";
 import type { RunEncoding } from "./encoding.js";
 import type { ClientLedgerEntry } from "./ledger.js";
 import type { LogIncarnation } from "./log-frame.js";
@@ -273,6 +274,7 @@ export interface IndexRoot {
 export interface RunRef {
   /** Absent in memory means inline; always explicit on disk. */
   readonly encoding?: RunEncoding;
+  readonly keyStorage?: RunKeyStorage;
   readonly level: number;
   /**
    * Present (true) on the second and later pieces of one merge output, which follow the first

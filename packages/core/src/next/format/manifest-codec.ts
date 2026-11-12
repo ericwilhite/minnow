@@ -42,7 +42,7 @@ import {
   METADATA_ENVELOPE_VERSION,
   requireTag,
 } from "../durable-format.js";
-import { requireEncoding, readRunEncoding } from "./encoding.js";
+import { requireEncoding, readRunEncoding, UnsupportedEncodingError } from "./encoding.js";
 import { LIST_PAGE_EXTENTS, type ExtentListPage } from "../storage/extent-list.js";
 import { MAX_BLOB_BYTES } from "../storage/extents.js";
 import type { ByteBudget, ExtentWriter } from "../storage/extents.js";
@@ -938,6 +938,8 @@ export async function writeGroupDirectory(
 // ── Root ───────────────────────────────────────────────────────────────────────────────────────
 
 function writeRun(out: RefWriter, run: RunRef): void {
+  if (run.keyStorage !== undefined)
+    throw new UnsupportedEncodingError("overflow publication", 2, [1]);
   out.body.u8(readRunEncoding(run.encoding ?? 1));
   // The level and the continuation flag share one integer: level × 2 + continues.
   out.body.uint(run.level * 2 + (run.continues === true ? 1 : 0));
