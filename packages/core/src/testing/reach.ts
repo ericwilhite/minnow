@@ -3842,6 +3842,7 @@ export const WINDOW_SHIFT_DELIVERY_REACH = [
 
 /** Current-row offset expressions must obey downstream window demand. */
 export const WINDOW_OFFSET_DEMAND_REACH = [
+  "offset coercion errors",
   "lag",
   "lead",
   "zero demand",
@@ -3859,4 +3860,20 @@ export const WINDOW_VOLATILE_DEFAULT_REACH = [
   "OFFSET",
   "no default evaluation",
   "default evaluation",
+  "dictionary offset validity",
+] as const;
+
+/** Partition/order reuse must preserve global ordering and incremental frame demand. */
+export const WINDOW_PARTITION_DEMAND_REACH = [
+  "sum",
+  "avg",
+  "computed partition",
+  "nullable partitions",
+  "ascending",
+  "descending",
+  "matching order",
+  "partition prefix",
+  "mismatching order",
+  "full ordered result",
+  "multiple partition keys",
 ] as const;

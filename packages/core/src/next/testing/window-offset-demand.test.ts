@@ -29,6 +29,22 @@ for (const seed of seedsFor("next-window-offset-demand", [0xb7a4, 0xb7a5]))
       }));
       await core.writeBatch("insertBatch", "w", rows);
       for (const row of rows) await pg.query("INSERT INTO w VALUES($1,$2)", [row.id, row.x]);
+      const compare = async (sql: string) => {
+        let expected, actual;
+        try {
+          expected = { rows: (await pg.query(sql)).rows };
+        } catch (error) {
+          expected = { error: code(error) };
+        }
+        try {
+          const result = await core.execute(sql);
+          if (!("batches" in result)) throw Error("query");
+          actual = { rows: oracleRows(result) };
+        } catch (error) {
+          actual = { error: code(error) };
+        }
+        expect(actual, sql).toEqual(expected);
+      };
       for (const size of [3, 12])
         for (const fn of ["lag", "lead"])
           for (const errorAt of [1, 3, 7].filter((row) => row < size))
@@ -49,21 +65,16 @@ for (const seed of seedsFor("next-window-offset-demand", [0xb7a4, 0xb7a5]))
                     : "error after demand",
               );
               const sql = `SELECT ${fn}(x,10/(${String(errorAt)}-id),7) OVER(ORDER BY id) v FROM w WHERE id<${String(size)} ${tail}`;
-              let expected, actual;
-              try {
-                expected = { rows: (await pg.query(sql)).rows };
-              } catch (error) {
-                expected = { error: code(error) };
-              }
-              try {
-                const result = await core.execute(sql);
-                if (!("batches" in result)) throw Error("query");
-                actual = { rows: oracleRows(result) };
-              } catch (error) {
-                actual = { error: code(error) };
-              }
-              expect(actual, sql).toEqual(expected);
+              await compare(sql);
             }
+      for (const fn of ["lag", "lead"])
+        for (const offset of ["'bad'", "'2147483648'", "CAST('bad' AS INTEGER)"])
+          for (const limit of [0, 1]) {
+            reach.reach("offset coercion errors");
+            await compare(
+              `SELECT ${fn}(x,${offset},7) OVER(ORDER BY id) v FROM w LIMIT ${String(limit)}`,
+            );
+          }
       reach.assertReached();
     } finally {
       await core.close();

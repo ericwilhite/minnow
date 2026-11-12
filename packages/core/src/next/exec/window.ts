@@ -1909,7 +1909,7 @@ class Evaluator implements Operator {
           const offset = call.offsetValue({ length: count, columns, selection: null });
           for (let row = 0; row < count; row++) {
             const [flat, slot] = slotOf(offset, row);
-            if (!isValidSlot(flat, slot)) targets[at + row] = NULL_ROW;
+            if (!isValidSlot(offset, row)) targets[at + row] = NULL_ROW;
             else {
               if (flat.data.layout !== "i32") throw new TypeError("Window offset must be int4");
               const amount = flat.data.values[slot] ?? 0;

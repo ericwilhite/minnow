@@ -2271,8 +2271,12 @@ the target dataset and the separate 1M-row component runs.
   singleton frame. Resident evaluation records charged error bits by output row; streaming
   flushes its valid prefix before raising a later frame error. LIMIT/OFFSET and blocked cursor
   close can stop at that prefix, even within a batch. An exact global window order survives
-  column-only projections without a redundant sort; result-key and partitioned sorts still
-  demand every input frame. The three float states per function and AVG's streamed variance ring are
+  column-only projections without a redundant sort. Matching partition/order prefixes reuse
+  globally ordered window output and demand frames incrementally. The grouped sorter ranks
+  partition values ascending with NULL last; other inputs use the general ordered sorter.
+  Result-key, direction/NULL/collation mismatches and computed output barriers retain their
+  blocking sort and demand every input frame. The three float states per function and AVG's
+  streamed variance ring are
   charged before allocation. Exact integer sums retain their prefix path.
 - int8 values stay exact past 2^53 on both paths, as bigints where a double would round:
   sums, MIN/MAX, and RANGE keys and their offsets (RANGE over int8 compares exactly). COUNT

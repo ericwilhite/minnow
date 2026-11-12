@@ -291,11 +291,9 @@ export function lowerWindowed(
           );
         if (inputs.offsetExpression === undefined) args.push(int(spec.offset ?? 1, INT4));
         else {
+          const offset = lowerInput(inputs.offsetExpression);
           try {
-            args.push(
-              coerce(lowerInput(inputs.offsetExpression), INT4, "implicit", builder.parameters)
-                .expr,
-            );
+            args.push(coerce(offset, INT4, "implicit", builder.parameters).expr);
           } catch (error) {
             if (!(error instanceof PlanningError)) throw error;
             throw new PlanningError(
