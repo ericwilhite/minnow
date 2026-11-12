@@ -3,12 +3,15 @@ import type { BlobRef, ByteBudget, ExtentReader } from "../storage/extents.js";
 import type { ColumnChunk, GroupRoot } from "../format/manifest.js";
 import { MetadataReader, type MaybePromise } from "../format/metadata-reader.js";
 import type { Held } from "../format/reachable.js";
+import type { QueryRoots, ScanRootFacts } from "./query-roots.js";
 import { ChunkReader } from "./reader.js";
 import type { ColumnStatistics } from "../types.js";
 
 export class GroupRead {
   #held: Held<GroupRoot> | null = null;
   #pending: Promise<GroupRoot> | null = null;
+  #facts: Held<ScanRootFacts> | null = null;
+  #preparing: Promise<void> | null = null;
   #epoch = 0;
   readonly #readers: ChunkReader[] = [];
   #summaries = 0;
@@ -16,6 +19,8 @@ export class GroupRead {
     readonly ref: BlobRef,
     readonly pages: ExtentReader,
     readonly budget: ByteBudget,
+    readonly roots?: QueryRoots,
+    readonly tableId = 0,
   ) {}
   root(): MaybePromise<GroupRoot> {
     if (this.#held !== null) return this.#held.value;
@@ -37,9 +42,38 @@ export class GroupRead {
     this.#pending = pending;
     return pending;
   }
+  prepare(columns: readonly number[]): MaybePromise<void> {
+    if (this.#held !== null) return;
+    if (this.#preparing !== null) return this.#preparing.then(() => this.prepare(columns));
+    if (this.#facts !== null) {
+      if (this.roots?.covers(this.tableId, columns)) return;
+      const root = this.root();
+      return root instanceof Promise ? root.then(() => undefined) : undefined;
+    }
+    if (this.roots === undefined) {
+      const root = this.root();
+      return root instanceof Promise ? root.then(() => undefined) : undefined;
+    }
+    const epoch = this.#epoch;
+    const keep = (facts: Held<ScanRootFacts>) => {
+      if (epoch !== this.#epoch) {
+        facts.release();
+        throw new Error("Group metadata read ended");
+      }
+      this.#facts = facts;
+    };
+    const got = this.roots.read(this.tableId, this.ref, this.pages, this.budget, columns);
+    if (!(got instanceof Promise)) return keep(got);
+    const pending = got.then(keep).finally(() => {
+      if (this.#preparing === pending) this.#preparing = null;
+    });
+    this.#preparing = pending;
+    return pending;
+  }
   chunk(id: number): ColumnChunk | null {
-    if (this.#held === null) throw new TypeError("Call root before reading a group chunk");
-    return this.#held.value.columns.find((column) => column.columnId === id) ?? null;
+    const facts = this.#held ?? this.#facts;
+    if (facts === null) throw new TypeError("Prepare root before reading a group chunk");
+    return facts.value.columns.find((column) => column.columnId === id) ?? null;
   }
   summaries(
     id: number,
@@ -72,6 +106,9 @@ export class GroupRead {
   release(): void {
     this.#epoch++;
     this.#pending = null;
+    this.#preparing = null;
+    this.#facts?.release();
+    this.#facts = null;
     for (const reader of this.#readers) reader.close();
     this.#readers.length = 0;
     if (this.#summaries > 0) this.budget.free(this.#summaries);

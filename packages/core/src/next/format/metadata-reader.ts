@@ -77,10 +77,11 @@ export class MetadataReader {
     }
     const parse = (bytes: Uint8Array): Held<T> => {
       const parsed = decode(bytes, budget);
-      if (cache === undefined) return held(parsed.value, () => budget.free(parsed.charge));
-      const shared = cache.admit(ref, parsed.value, parsed.charge);
+      const charge = parsed.charge;
+      if (cache === undefined) return held(parsed.value, () => budget.free(charge));
+      const shared = cache.admit(ref, parsed.value, charge);
       return held(shared, () => {
-        budget.free(parsed.charge);
+        budget.free(charge);
         cache.unpin(ref);
       });
     };

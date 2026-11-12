@@ -1,3 +1,4 @@
+import { prepareGroup } from "../page/query-roots.js";
 /**
  * The `scan` operator's source (ir/ir.ts): one table of a snapshot (access/snapshot.ts), every
  * segment in row-id order, batches of at most `BATCH_ROWS` rows and about `targetBytes`, its
@@ -726,7 +727,7 @@ export class TableScan implements BatchSource {
   // ── Group segments ──
 
   *#open(segment: GroupSegment): Step<OpenGroup | null> {
-    yield* this.#wait(segment.root(), () => segment.releaseRoot?.());
+    yield* this.#wait(prepareGroup(segment, this.#options.columns), () => segment.releaseRoot?.());
     const columns: GroupColumn[] = [];
     const opened: ChunkPages[] = [];
     const windowBytes =

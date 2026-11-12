@@ -3386,3 +3386,14 @@ PGlite rows, pressure, snapshots, demand, owned parameters, concurrent survivors
 checkpoint/retirement/admission/restore/close failures. The controller tests also verify exact
 additional window restore bytes, consumed-build admission pruning and zero open file owners.
 The witnesses are finite; they do not claim exhaustive schedules or browser memory measurements.
+
+Ordinary executor scans parse each complete group root during source sizing, then reuse the
+validated facts for their planned columns through a query-local cache. The cold parser still
+validates every stored column; complete-root APIs still return all columns and row-id metadata.
+Only the planned column facts survive in the cache, avoiding retention of unused column graphs.
+The original complete parse charge covers active holds and idle, evictable entries; optional
+selection scratch is charged before allocation. Refusal or eviction falls back to ordinary
+parsing without raising the read minimum. Readers release sizing holds before execution
+admission, and query cleanup drains readers before clearing and unregistering the cache on
+success, error or cancellation. Explicit non-retaining exports bypass this memo. Snapshot
+visibility and memory read hints remain local to the pinned snapshot.

@@ -2657,6 +2657,12 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               runtime.request.governor,
               runtime.signal,
               batchTargetFor(runtime.request.governor.capBytes, 4),
+              BATCH_ROWS,
+              runtime.metadataCaches(
+                source.retain !== false &&
+                  !(runtime.request.outputBuffers && source.windowBytes > 0),
+                sources,
+              ),
             ),
           );
           bounds.set(source.id, bound);
@@ -2678,6 +2684,11 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 runtime.signal,
                 1,
                 1,
+                runtime.metadataCaches(
+                  source.retain !== false &&
+                    !(runtime.request.outputBuffers && source.windowBytes > 0),
+                  sources,
+                ),
               ),
             );
             resultProgress = Math.max(resultProgress, row.progress);
@@ -2808,6 +2819,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           runtime.request.governor,
           runtime.signal,
           batchTargetFor(cap, 4),
+          BATCH_ROWS,
+          runtime.metadataCaches(),
         ),
       );
       const read: AdmittedIndexRead = { plan: range, cursor: cursorIdentity, payload };

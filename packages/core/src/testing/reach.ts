@@ -3765,3 +3765,23 @@ export const RETAINING_TOPK_SQL_CUT_REACH = [
   "exact PostgreSQL",
   "zero resources",
 ] as const;
+
+/** Query roots survive sizing handoff without retaining producer grants. */
+export const QUERY_ROOT_REUSE_REACH = [
+  "sizing and execution share validated root facts",
+  "multiple columns and batches",
+  "fresh query owns its roots",
+  "cancel after output",
+  "zero charges after close",
+] as const;
+
+/** Query-root ownership histories include pressure and cancellation, not only steady hits. */
+export const QUERY_ROOT_OWNERSHIP_REACH = [
+  "exact borrower charge",
+  "optional memo refusal keeps complete root",
+  "full reference isolation",
+  "active pin survives eviction",
+  "idle eviction reparses safely",
+  "pending cancellation drains",
+  "zero owner charges",
+] as const;

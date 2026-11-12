@@ -1355,6 +1355,29 @@ Add `MINNOW_EXPORT_SCAN_SHAPE_TRANSPORT=1` to compare the whole stand-in adapter
 real owner transfer path instead. Both modes assert which three module versions reached
 the worker. This historical transport comparison uses the old adapter, not the production
 `ResultSink`, and is explicitly excluded from Gate A.
+Ordinary executor scans validate each complete group root during source sizing, then reuse
+only the planned columns' facts through a query-local, governor-registered cache. The cold
+parser still validates every column, and complete-root APIs remain complete. Parsing charges
+the full root before allocation; selection scratch is also charged before allocation. Active
+readers hold the full parse charge; idle facts remain charged and evictable. Cache refusal or eviction safely falls back to decoding without increasing the
+read minimum. Explicit non-retaining export bypasses this memo. Query cleanup drains pending
+readers before clearing and unregistering the cache, including cancellation and error paths.
+`next/testing/root-reuse.test.ts` checks generated source equality, parse counts across columns
+and batches, query isolation and cancellation. `next/testing/query-root-ownership.test.ts` checks full-reference
+and table identity, complete-root fallback, eviction and cancelled in-flight reads with zero
+charges after cleanup.
+`scripts/query-root-component.mts` isolates a two-pass sizing/scan root handoff over synthetic
+wide metadata. `scripts/query-root-bench.mts --baseline <frozen-root> --candidate <frozen-root>`
+compares real executor frames from complete, separately built cores. Both use nine adjacent
+AB/BA CPU pairs and record wall time and host load; fixture creation and output validation
+are outside the timed region. The whole-query runner uses the committed wide generator,
+checks output digests before and after timing, and includes DISTINCT and a window guard by
+default. Add `--only scan_plain3 --warmups 10 --repeats 10` for ten fixed warmups
+per arm and ten complete query lifetimes per observation. The worker measures one CPU interval
+around those queries, records raw totals, and checks completed-query and row counts before
+normalizing per query. Warmups and source hashes are recorded separately. These are loaded-host
+diagnostics, not quiet-host Gate A measurements.
+
 The scan reuses verified header facts while the endpoint pages stay the same. Loading,
 releasing or materializing a page invalidates those facts. Exact-range varlen byte sizes
 are memoized separately; sparse selections are sized from their selected rows.

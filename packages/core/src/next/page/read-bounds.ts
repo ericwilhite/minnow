@@ -4,6 +4,7 @@ type ReadJob<T> = Generator<Promise<void>, T, void>;
 import type { ByteBudget, ExtentReader as SpaceReader, BlobRef } from "../storage/extents.js";
 import { ReadDeniedError } from "../storage/extents.js";
 import { MetadataReader } from "../format/metadata-reader.js";
+import type { QueryRoots, ScanRootFacts } from "./query-roots.js";
 import { parseCharge, ParseBudgetError } from "../format/manifest-codec.js";
 import { PageEncoding } from "../format/manifest.js";
 import type { Grant, MemoryGovernor } from "../memory/governor.js";
@@ -146,6 +147,7 @@ export function boundSource(
   target: number,
   // One-row result-copy sizing must not repeatedly inspect a whole remaining interval.
   prefixRows = BATCH_ROWS,
+  caches?: QueryRoots,
 ): MaybePromise<ReadBound> {
   return run(size());
   function* size(): ReadJob<ReadBound> {
@@ -315,12 +317,28 @@ export function boundSource(
         );
         const budget = new SizingBudget(grant, capacity);
         const readers: ChunkReader[] = [];
-        let root: Awaited<ReturnType<MetadataReader["groupRoot"]>> | null = null;
+        let root: import("../format/reachable.js").Held<ScanRootFacts> | null = null;
         let retry = false,
           required = capacity;
         try {
           io = Math.max(io, Math.min(MAX_READ_BYTES, segment.group.root.length));
-          root = yield* readValue(metadata.groupRoot(segment.group.root, budget));
+          root = yield* readValue(
+            retention.retain === false || caches === undefined
+              ? metadata.groupRoot(segment.group.root, budget)
+              : caches.read(
+                  source.tableId,
+                  segment.group.root,
+                  {
+                    peek: (ref, options) => sizingPages.peek(ref, options),
+                    read: (refs, options) =>
+                      sizingPages.read(refs, { ...options, signal, reuseBuffers: false }),
+                  },
+                  budget,
+                  source.domainColumn === undefined
+                    ? source.columns
+                    : [...source.columns, source.domainColumn],
+                ),
+          );
           if (source.domainColumn !== undefined && segment.liveRowCount !== 0)
             certificate.stored(
               segment.rowCount,
