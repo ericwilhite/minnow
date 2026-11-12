@@ -1386,6 +1386,18 @@ its timing cannot qualify an A/B campaign. Earlier persistent-worker results are
 because alternating execution order did not balance worker identity. These native loaded-host
 diagnostics are separate from quiet-host Gate A and the owner/MessagePort export transport.
 
+For parser changes, add `--decode-only` to the component command in both A/A and A/B.
+Both arms then parse complete roots without query or parsed-descriptor caches; every synthetic
+group uses distinct extent addresses. The default component mode still measures query-cache handoff.
+`scripts/query-root-profile.mts --runtime <frozen-root> --bundle <input.json>` captures a
+setup-excluded V8 profile of the same three-column scan, followed by a separate counter pass
+that records complete-root columns, chunk opens and decoded rows by column. Its sample shares
+are diagnostic: they are not an exact allocation of all-thread CPU, and sampled wall time can
+include host scheduling. GC remains a separate bucket. The extent-pair codec generator checks
+full safe-integer offsets and lengths, including shared offsets with distinct lengths and
+duplicate refusal after several such lengths; canonical byte and charge contracts stay unchanged.
+Use `--summarize <scan.cpuprofile>` to reclassify a saved profile without running the query again.
+
 The scan reuses verified header facts while the endpoint pages stay the same. Loading,
 releasing or materializing a page invalidates those facts. Exact-range varlen byte sizes
 are memoized separately; sparse selections are sized from their selected rows.

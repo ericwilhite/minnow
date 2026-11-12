@@ -3833,6 +3833,7 @@ export const QUERY_ROOT_VM_REACH = [
   "independent fixture restore",
   "exact row volume",
   "all workers drained",
+  "complete decode in both arms",
 ] as const;
 
 export const QUERY_ROOT_VOLUME_REACH = [
@@ -3848,6 +3849,7 @@ export const EXTENT_PAIR_CODEC_REACH = [
   "distinct offsets",
   "shared offset",
   "mixed offsets",
+  "low-word collisions",
   "wide safe integers",
   "small integers",
   "zero length",

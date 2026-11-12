@@ -13,7 +13,12 @@ import {
 import type { GroupRoot } from "./manifest.js";
 import type { ByteBudget } from "../storage/extents.js";
 
-const shapes = ["distinct offsets", "shared offset", "mixed offsets"] as const;
+const shapes = [
+  "distinct offsets",
+  "shared offset",
+  "mixed offsets",
+  "low-word collisions",
+] as const;
 const bases = [0, 2 ** 31, 2 ** 32, 2 ** 40, Number.MAX_SAFE_INTEGER - 1024] as const;
 
 function budget(): ByteBudget & { held: number } {
@@ -64,9 +69,12 @@ for (const seed of seedsFor("next-extent-pair-codecs", [0xb2e1, 0xb2e2]))
             columns: Array.from({ length: width }, (_, k) => {
               const extent = {
                 offset:
-                  base +
-                  (shape === "shared offset" ? 0 : shape === "mixed offsets" ? k % 3 : k * 64),
-                length: zeroLength ? k : k + 1,
+                  shape === "low-word collisions"
+                    ? (base % 2 ** 32) + k * 2 ** 32
+                    : base +
+                      (shape === "shared offset" ? 0 : shape === "mixed offsets" ? k % 3 : k * 64),
+                length:
+                  shape === "low-word collisions" ? (zeroLength ? 0 : 17) : zeroLength ? k : k + 1,
               };
               return {
                 columnId: k + 1,
