@@ -30,6 +30,55 @@ export interface StarInput {
   readonly rows: number;
   readonly shape: unknown;
 }
+/** Capture immutable dictionary prefixes without borrowing page buffers. Older captured
+ * prefixes remain valid; a later longer prefix under the same identity needs a new copy. */
+export function createStarVectorOwner(): (vector: Vector) => Vector {
+  const dictionaries = new Map<number, FlatVector>();
+  const flat = (vector: FlatVector): FlatVector => {
+    const d = vector.data,
+      validity = vector.validity?.slice() ?? null;
+    if (d.layout === "varlen") {
+      const from = d.offsets[0] ?? 0,
+        end = d.offsets[vector.length] ?? 0;
+      return {
+        ...vector,
+        validity,
+        data: {
+          layout: "varlen",
+          bytes: d.bytes.slice(from, end),
+          offsets: Int32Array.from(d.offsets.subarray(0, vector.length + 1), (p) => p - from),
+        },
+      };
+    }
+    if (d.layout === "f64" || d.layout === "bool")
+      return {
+        ...vector,
+        validity,
+        data: {
+          layout: d.layout,
+          values: d.values.slice(0, vector.length),
+        } as FlatVector["data"],
+      };
+    throw new Error(`Unexpected star fixture layout ${d.layout}`);
+  };
+  const own = (vector: Vector): Vector => {
+    if (vector.form === "flat") return flat(vector);
+    if (vector.form === "constant") return { ...vector, value: flat(vector.value) };
+    let value = dictionaries.get(vector.dictionaryId);
+    if (!value || value.length < vector.dictionary.length) {
+      value = flat(vector.dictionary);
+      dictionaries.set(vector.dictionaryId, value);
+    }
+    return {
+      ...vector,
+      validity: vector.validity?.slice() ?? null,
+      codes: vector.codes.slice(0, vector.length),
+      dictionary: value,
+    };
+  };
+  return own;
+}
+
 export async function starFixture(runtime: string, rows: number): Promise<StarInput> {
   const load = (name: string) =>
     import(pathToFileURL(join(runtime, "packages/core/dist/next", name + ".js")).href);
@@ -148,49 +197,7 @@ export async function starFixture(runtime: string, rows: number): Promise<StarIn
         spillable: false,
       }),
       arena = new OutputArena(grant, 2048);
-    const dictionaries = new Map<number, FlatVector>();
-    const flat = (vector: FlatVector): FlatVector => {
-      const d = vector.data,
-        validity = vector.validity?.slice() ?? null;
-      if (d.layout === "varlen") {
-        const from = d.offsets[0] ?? 0,
-          end = d.offsets[vector.length] ?? 0;
-        return {
-          ...vector,
-          validity,
-          data: {
-            layout: "varlen",
-            bytes: d.bytes.slice(from, end),
-            offsets: Int32Array.from(d.offsets.subarray(0, vector.length + 1), (p) => p - from),
-          },
-        };
-      }
-      if (d.layout === "f64" || d.layout === "bool")
-        return {
-          ...vector,
-          validity,
-          data: {
-            layout: d.layout,
-            values: d.values.slice(0, vector.length),
-          } as FlatVector["data"],
-        };
-      throw new Error(`Unexpected star fixture layout ${d.layout}`);
-    };
-    const own = (vector: Vector): Vector => {
-      if (vector.form === "flat") return flat(vector);
-      if (vector.form === "constant") return { ...vector, value: flat(vector.value) };
-      let value = dictionaries.get(vector.dictionaryId);
-      if (!value) {
-        value = flat(vector.dictionary);
-        dictionaries.set(vector.dictionaryId, value);
-      }
-      return {
-        ...vector,
-        validity: vector.validity?.slice() ?? null,
-        codes: vector.codes.slice(0, vector.length),
-        dictionary: value,
-      };
-    };
+    const own = createStarVectorOwner();
     try {
       for (const source of found) {
         const def = core.harness.path.catalog.table(source.tableId);

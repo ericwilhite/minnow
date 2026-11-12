@@ -3967,3 +3967,10 @@ export const STAR_COMPONENT_REACH = [
   "nonempty result",
   "zero charges",
 ] as const;
+
+export const STAR_FIXTURE_PREFIX_REACH = [
+  "growing identity",
+  "old prefix intact",
+  "owned backing",
+  "stable prefix reused",
+] as const;
