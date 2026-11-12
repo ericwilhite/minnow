@@ -3902,3 +3902,25 @@ export const JSONB_ALLOCATION_FAULT_REACH = [
   "original failure cause",
   "zero files/grants before close",
 ] as const;
+
+export const JSON_FLOAT_REACH = [
+  "decimal tie rounds down to even",
+  "decimal tie rounds up to even",
+  "float4 bits",
+  "float8 bits",
+  "near 2^24",
+  "near 2^53",
+  "rounding ties and neighbours",
+  "float4 midpoint exclusion",
+  "float8 midpoint exclusion",
+  "float4 subnormal",
+  "float8 subnormal",
+  "negative zero",
+  "positive zero",
+  "special values",
+  "exponent transitions",
+  "scalar JSON and JSONB",
+  "array constructors",
+  "scalar keys",
+  "exact PostgreSQL text",
+] as const;

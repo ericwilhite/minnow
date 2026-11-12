@@ -512,7 +512,11 @@ SQL array construction omits NULLs by default; build-array retains them. SQL/JSO
 JSONB output when a value argument is JSONB. Output and temporary buffers are counted/charged
 before allocation and use the existing JSON growth handoff, including cancellable re-admission.
 Scalar BOOL, integer, floating, NUMERIC, TEXT/enum, JSON, DATE, TIMESTAMP and finite INTERVAL
-values are supported. Array/UUID/BYTEA/composite value kernels, ROW_TO_JSON and JSON aggregates
+values are supported. Float rendering uses PostgreSQL's open binary rounding interval,
+closest shortest decimal with ties to even, and float4/float8 exponent thresholds. JSONB parses
+that exact decimal output; it does not round through a JavaScript number or use the lower
+precision float-to-NUMERIC cast. Subnormal values and signed zero follow PostgreSQL.
+Array/UUID/BYTEA/composite value kernels, ROW_TO_JSON and JSON aggregates
 retain typed refusals. JSON_OBJECT's array overload syntax is not supported. Existing document-provenance and
 volatile-expression limits remain. No new catalogue cell is enabled yet (64/66).
 

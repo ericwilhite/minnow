@@ -10,6 +10,11 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported rebuild's JSON and JSONB constructors now preserve PostgreSQL's float4/float8
+decimal spelling at rounding and exponent boundaries, including subnormals and signed zero.
+This fixes float values whose JavaScript spelling lost digits in JSONB. Shipped SQL behavior,
+the public API and stored formats are unchanged; no migration is needed.
+
 The unexported rebuild now constructs typed JSON objects and arrays, including the SQL
 `KEY … VALUE` form and PostgreSQL's `json_build_*` / `jsonb_build_*` spellings. It preserves
 PostgreSQL's text formatting, exact numeric scale, duplicate keys, escaping and NULL policies.

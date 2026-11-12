@@ -10,6 +10,7 @@ import { coefficientAt, scaleAt, specialAt } from "./numeric.js";
 import { isValidSlot, slotOf } from "./vectors.js";
 import type { JsonMemory } from "./json.js";
 import { JsonOutput } from "./json-output.js";
+import { jsonFloatText } from "./json-float.js";
 
 export const JSON_VALUE_KINDS = new Set([
   "bool",
@@ -56,27 +57,6 @@ export function* jsonAscii(text: string, out: JsonOutput): SlicedJob<void> {
     out.put(text.charCodeAt(i));
     if ((i & 1023) === 0 && out.slice.due()) yield;
   }
-}
-/** PG uses shortest roundtrip digits, scientific exponent below -4 / at DBL_DIG (FLT_DIG). */
-function floatText(value: number, single: boolean): string {
-  if (Object.is(value, -0)) return "-0";
-  let text = String(value);
-  if (single && Number.isFinite(value)) {
-    for (let digits = 1; digits <= 9; digits++) {
-      const candidate = value.toPrecision(digits);
-      if (Math.fround(Number(candidate)) === value) {
-        text = String(Number(candidate));
-        break;
-      }
-    }
-  }
-  if (value === 0 || !Number.isFinite(value)) return text;
-  const scientific = Number(text).toExponential();
-  const exponent = Number(scientific.slice(scientific.indexOf("e") + 1));
-  if (exponent >= (single ? 6 : 15) || exponent < -4) {
-    return scientific.replace(/e([+-])(\d)$/u, "e$10$2");
-  }
-  return text;
 }
 /** SQL keys are scalar output strings; JSON/arrays/records cannot be keys (22023). */
 export function* jsonValue(
@@ -139,7 +119,7 @@ export function* jsonValue(
       case "float64": {
         if (data.layout !== "f64" && data.layout !== "f32") throw new TypeError("Expected float");
         const value = data.values[slot] ?? 0;
-        text = floatText(value, type.kind === "float32");
+        text = jsonFloatText(value, type.kind === "float32");
         quote ||= !Number.isFinite(value);
         break;
       }
