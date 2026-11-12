@@ -1,5 +1,4 @@
 /** Complete validation precedes selective materialization; only owner-charged roots cross queries. */
-import { Buffer } from "node:buffer";
 import fc from "fast-check";
 import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
