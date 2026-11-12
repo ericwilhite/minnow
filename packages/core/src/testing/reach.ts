@@ -3886,3 +3886,14 @@ export const VALIDATED_ROOT_PRESSURE_REACH = [
   "no optional FIFO wait",
   "zero charges after fallback",
 ] as const;
+
+/** Packing interns extent identity within a complete root, never between selected graphs. */
+export const ROOT_PACKING_REACH = [
+  "one packed extent",
+  "row IDs share selected data",
+  "row IDs share unselected data",
+  "complete before selection",
+  "selection before complete",
+  "fresh selected extent graphs",
+  "canonical bytes and zero charges",
+] as const;

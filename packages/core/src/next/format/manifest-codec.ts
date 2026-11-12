@@ -564,13 +564,19 @@ class RootView {
       this.#typeCodes.byteLength
     );
   }
-  select(wanted?: readonly number[] | ((id: number) => boolean)): ColumnChunk[] {
+  select(
+    wanted?: readonly number[] | ((id: number) => boolean),
+    rowIdExtent?: ExtentRef,
+  ): ColumnChunk[] {
     const includes =
       typeof wanted === "function"
         ? wanted
         : (id: number) => wanted === undefined || wanted.includes(id);
     const reader = new ByteReader(this.of);
     const extents = new Map<number, ExtentRef>();
+    // Canonical first-use validation puts a column-backed row-ID extent at index zero.
+    // Only the COMPLETE root shares this retained object; selected graphs stay independent.
+    if (rowIdExtent !== undefined) extents.set(0, rowIdExtent);
     const extent = (): ExtentRef => {
       const index = reader.uint();
       let ref = extents.get(index);
@@ -602,7 +608,11 @@ class RootView {
   }
   root(header: GroupRoot): GroupRoot {
     let complete: readonly ColumnChunk[] | undefined;
-    const materialize = () => this.select();
+    const materialize = () =>
+      this.select(
+        undefined,
+        header.rowIds.kind === "column" ? header.rowIds.ref.extent : undefined,
+      );
     if (header.rowIds.kind === "column") {
       Object.freeze(header.rowIds.ref.extent);
       Object.freeze(header.rowIds.ref);
