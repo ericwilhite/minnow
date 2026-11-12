@@ -3938,3 +3938,32 @@ export const NUMERIC_BENCH_REACH = [
   "full timed volume",
   "zero charges",
 ] as const;
+/** Canonical star TEXT classes, shared across source dictionaries with exact NULL equality. */
+export const STAR_DICTIONARY_REACH = [
+  "flat",
+  "dictionary",
+  "constant",
+  "selection",
+  "NULL",
+  "dictionary epochs",
+  "cross-source equality",
+  "owned input",
+  "decoded groups",
+  "PGlite equality",
+  "zero resources",
+] as const;
+
+export const STAR_DICTIONARY_FUNDING_REACH = [
+  "charged before construction",
+  "denied construction",
+  "zero charges",
+] as const;
+
+export const STAR_COMPONENT_REACH = [
+  "native text",
+  "dictionary IDs",
+  "complete repeated lifetimes",
+  "empty result",
+  "nonempty result",
+  "zero charges",
+] as const;
