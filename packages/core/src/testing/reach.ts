@@ -3873,6 +3873,7 @@ export const VALIDATED_ROOT_REACH = [
   "owned encoded bytes survive source release",
   "unselected corruption refused",
   "complete eager equality",
+  "Buffer inputs own a tight copy",
   "concurrent admission drains",
   "cancelled borrower hands off or releases",
   "zero charges and detached binding",

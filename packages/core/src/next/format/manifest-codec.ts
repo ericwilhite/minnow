@@ -645,7 +645,7 @@ export function tryDecodeGroupRootView(
   const maximum = 2 * parseCharge(bytes.length) + bytes.length + ROOT_VIEW_FIXED_BYTES;
   if (!optionalParseAllocation(budget, maximum)) return null;
   try {
-    const view = new RootView(bytes.slice());
+    const view = new RootView(new Uint8Array(bytes));
     const reader = new ByteReader(view.of);
     const header = readGroupRoot(reader, view);
     reader.end();

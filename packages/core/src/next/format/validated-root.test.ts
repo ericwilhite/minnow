@@ -1,4 +1,5 @@
 /** Complete validation precedes selective materialization; only owner-charged roots cross queries. */
+import { Buffer } from "node:buffer";
 import fc from "fast-check";
 import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
@@ -251,6 +252,14 @@ it.each(seedsFor("next-validated-root", [0xb2f1, 0xb2f2]))(
             grant.free(lazy.charge);
             grant.free(eager.charge);
             reach.reach("complete eager equality");
+            // Buffer is a valid Uint8Array input, but its slice() aliases the source slab.
+            const sourceBuffer = Buffer.from(bytes);
+            const fromBuffer = tryDecodeGroupRootView(sourceBuffer, grant);
+            if (fromBuffer === null) throw new Error("optional Buffer test headroom");
+            sourceBuffer.fill(0);
+            expect(encodeGroupRoot(fromBuffer.value)).toEqual(bytes);
+            grant.free(fromBuffer.charge);
+            reach.reach("Buffer inputs own a tight copy");
           } finally {
             queries?.close();
             unbind();
