@@ -1713,6 +1713,14 @@ remain charged through publication. Budget denial, native allocation failure, ca
 and retry must return provisional charges before waiting for memory. This checks managed
 buffer ownership, not the JavaScript runtime's eventual garbage collection or native RSS.
 
+`merge-finish-budget.test.ts` reaches the default 896 KiB split boundary with compact,
+long-key inputs. Several independent encoder contexts share the real merge allowance,
+with input leases and writer staging still charged. Finish transfers the prepaid metadata
+backings instead of allocating second index and fence buffers. The generator checks stored
+fence bytes, header counts, continued charging until consumption, abort cleanup and progress
+while another execution holds its minimum. The review's two-reader, repeated nine-byte-key
+probe separately covers the large balanced index/fence case.
+
 `key-order-proof.test.ts` checks retained key order and ascending batch admission against an
 independent byte-order model. A normalized prefix proves order only when it differs; ties use
 full byte comparison. A batch must be strictly beyond every retained key before it can skip

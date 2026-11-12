@@ -30,6 +30,19 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+/** Default split metadata must finish within prepaid credit, without a copied-output peak. */
+export const WRITE_MERGE_FINISH_STATES = [
+  "borrowed keys",
+  "copied keys",
+  "other minimum held",
+  "charged metadata handoff",
+  "default split boundary",
+  "near private allowance",
+  "completed finish",
+  "abort after transfer",
+  "no credit refusal",
+] as const;
+
 /** Storage borrows emitted parts until append settles, including its failure path. */
 export const WRITE_RUN_OUTPUT_STATES = [
   "append failure",

@@ -118,10 +118,87 @@ class RunBuffers implements BufferAllocator {
     this.#live.delete(buffer.buffer);
     this.budget.free(bytes);
   }
+  /** Move one paid backing without allocating again or returning its credit prematurely. */
+  transfer(buffer: Uint8Array, target: RunBuffers): void {
+    const bytes = this.#live.get(buffer.buffer);
+    if (bytes === undefined || this.budget !== target.budget || target.#live.has(buffer.buffer))
+      throw new TypeError("Invalid run-buffer ownership transfer");
+    // Install first: if the ownership record cannot be made, scratch still owns the buffer.
+    target.#live.set(buffer.buffer, bytes);
+    this.#live.delete(buffer.buffer);
+  }
+
   close(): void {
     for (const bytes of this.#live.values()) this.budget.free(bytes);
     this.#live.clear();
   }
+}
+
+/**
+ * Metadata payload length excludes a prepaid prefix. Finish right-aligns its counts before
+ * the payload and transfers that same backing; it never copies a cardinality-sized tail.
+ * Keeping payload length/capacity separate preserves the old growth and split boundaries.
+ */
+class RunTail extends ByteWriter {
+  constructor(
+    initial: number,
+    readonly prefix: number,
+    readonly buffers: RunBuffers,
+  ) {
+    super(initial + prefix, buffers);
+    this.bytes = this.bytes.subarray(prefix);
+    this.view = new DataView(this.bytes.buffer, this.bytes.byteOffset, this.bytes.byteLength);
+  }
+
+  override ensure(extra: number): void {
+    if (this.length + extra <= this.bytes.length) return;
+    let capacity = Math.max(1, this.bytes.length * 2);
+    while (capacity < this.length + extra) capacity *= 2;
+    const storage = this.buffers.create(capacity + this.prefix);
+    try {
+      const grown = storage.subarray(this.prefix);
+      grown.set(this.bytes.subarray(0, this.length));
+      const view = new DataView(grown.buffer, grown.byteOffset, grown.byteLength);
+      this.buffers.release(this.bytes);
+      this.bytes = grown;
+      this.view = view;
+    } catch (error) {
+      this.buffers.release(storage);
+      throw error;
+    }
+  }
+
+  complete(target: RunBuffers, first: number, second?: number): Uint8Array {
+    const length = varuintBytes(first) + (second === undefined ? 0 : varuintBytes(second));
+    if (length > this.prefix) throw new RangeError("Run metadata prefix is too long");
+    const out = new Uint8Array(
+      this.bytes.buffer,
+      this.bytes.byteOffset - length,
+      length + this.length,
+    );
+    const at = putVaruint(out, 0, first);
+    if (second !== undefined) putVaruint(out, at, second);
+    this.buffers.transfer(out, target);
+    this.close(); // scratch drops its view; the output account still pays the full backing
+    return out;
+  }
+}
+
+function varuintBytes(value: number): number {
+  let bytes = 1;
+  while (value >= 128) {
+    bytes++;
+    value = Math.floor(value / 128);
+  }
+  return bytes;
+}
+function putVaruint(out: Uint8Array, at: number, value: number): number {
+  while (value >= 128) {
+    out[at++] = (value % 128) | 128;
+    value = Math.floor(value / 128);
+  }
+  out[at++] = value;
+  return at;
 }
 
 /** Bytes of one entry as the block-fill rule counts them (a varuint length is at most 5). */
@@ -143,11 +220,11 @@ export class RunEncoder {
   /** Offset of the next part within the run's extent. */
   #offset = 0;
   /** Per block: varuint offset, varuint length, u32 checksum (the count is prefixed at finish). */
-  readonly #index: ByteWriter;
+  readonly #index: RunTail;
   /** Per block: its first key, length-prefixed. */
-  readonly #fences: ByteWriter;
+  readonly #fences: RunTail;
   /** Per partition: varuint offset, varuint length, u32 checksum. */
-  readonly #directory: ByteWriter;
+  readonly #directory: RunTail;
   #blockCount = 0;
   #partitions = 0;
   #blocksInPartition = 0;
@@ -201,9 +278,9 @@ export class RunEncoder {
     this.#scratch = new RunBuffers(budget);
     this.#output = new RunBuffers(budget);
     try {
-      this.#index = new ByteWriter(4096, this.#scratch);
-      this.#fences = new ByteWriter(4096, this.#scratch);
-      this.#directory = new ByteWriter(64, this.#scratch);
+      this.#index = new RunTail(4096, 5, this.#scratch);
+      this.#fences = new RunTail(4096, 5, this.#scratch);
+      this.#directory = new RunTail(64, 10, this.#scratch);
       this.#hashes = new Uint32Array(this.#scratch.create(2048 * 4).buffer);
       this.#block = new ByteWriter(BLOCK_BYTES + 512, this.#scratch);
       this.#offsets = new Uint16Array(this.#scratch.create(BLOCK_BYTES * 2).buffer);
@@ -641,21 +718,14 @@ export class RunEncoder {
     this.#closePartition();
     const minKey = this.#minKey;
     if (this.#entryCount === 0 || minKey === null) return null;
-    const index = new ByteWriter(this.#index.length + 8, this.#output);
-    index.varuint(this.#blockCount);
-    index.rawRange(this.#index.bytes, 0, this.#index.length);
-    const fences = new ByteWriter(this.#fences.length + 8, this.#output);
-    fences.varuint(this.#blockCount);
-    fences.rawRange(this.#fences.bytes, 0, this.#fences.length);
-    const directory = new ByteWriter(this.#directory.length + 16, this.#output);
-    directory.varuint(PARTITION_BLOCKS);
-    directory.varuint(this.#partitions);
-    directory.rawRange(this.#directory.bytes, 0, this.#directory.length);
+    const index = this.#index.complete(this.#output, this.#blockCount);
+    const fences = this.#fences.complete(this.#output, this.#blockCount);
+    const directory = this.#directory.complete(this.#output, PARTITION_BLOCKS, this.#partitions);
     if (index.length > MAX_INDEX_BYTES || fences.length > MAX_INDEX_BYTES)
       throw new RangeError("An index run has more blocks than one run can index");
-    this.#put(index.bytes.subarray(0, index.length));
-    this.#put(fences.bytes.subarray(0, fences.length));
-    this.#put(directory.bytes.subarray(0, directory.length));
+    this.#put(index);
+    this.#put(fences);
+    this.#put(directory);
     const maxKey = this.#output.copy(
       this.#lastKey,
       this.#lastStart,
