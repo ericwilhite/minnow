@@ -233,7 +233,9 @@ describe("published core tarball", () => {
       // by 500; keep the unpacked cap and every package-isolation assertion.
       // Native JSON call provenance: 1,024,131 packed bytes. Raise packed cap once by 500;
       // rebuild code/tests stay excluded, and unpacked/isolation limits remain unchanged.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_024_250);
+      // Shipped lazy LAG/LEAD offsets and defaults (engine/window-inputs.ts) on top of that:
+      // 1,024,395 packed bytes. Raise packed cap once by 500; other limits unchanged.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_024_750);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");

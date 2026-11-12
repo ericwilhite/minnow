@@ -38,7 +38,8 @@ and evaluates a default only when that row has no target. LIMIT does not
 evaluate later offset errors or volatile defaults. A matching output partition/order prefix
 uses a globally ordered window path without forcing later frames through a redundant result
 sort; mismatching orders keep that sort. Published parser restrictions are unchanged.
-No public API or stored-format change; no migration is needed.
+No public API or stored-format change; no migration is needed. The shipped lazy LAG/LEAD
+evaluation adds 264 packed bytes to the core tarball; its packed cap rises once by 500 bytes.
 
 The unexported rebuild now executes text-to-JSONB casts, JSONB extraction and exact canonical
 JSONB text, including decimal scale, duplicate keys and Unicode validation. Invalid documents
