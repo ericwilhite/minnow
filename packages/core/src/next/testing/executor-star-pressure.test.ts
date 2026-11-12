@@ -122,7 +122,7 @@ it.each(seedsFor("next-star-pressure", [0xb76f, 0xb770]))(
         "INSERT INTO f SELECT 'k'||(i%24)::text,'k'||((i/24)%24)::text,'k'||((i/576)%24)::text,i::double precision/4 FROM generate_series(0,4096) i",
       );
       const sql =
-        "SELECT a.t AS x,b.t AS y,c.label AS z,count(*) AS n,sum(f.v) AS s FROM f JOIN a ON a.k=f.ka JOIN b ON b.k=f.kb JOIN c ON c.k=f.kc GROUP BY a.t,b.t,c.label";
+        "SELECT a.t AS x,b.t AS y,c.label AS z,count(*) AS n,sum(f.v) AS s,avg(f.v) AS a,min(f.v) AS lo,max(f.v) AS hi FROM f JOIN a ON a.k=f.ka JOIN b ON b.k=f.kb JOIN c ON c.k=f.kc GROUP BY a.t,b.t,c.label";
       const prepared = core.prepare(sql);
       await fc.assert(
         fc.asyncProperty(

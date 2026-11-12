@@ -13,6 +13,10 @@ afterEach(() => vi.restoreAllMocks());
 const literal = (v: string | number | boolean | null): string =>
   v === null ? "NULL" : typeof v === "string" ? `'${v.replaceAll("'", "''")}'` : String(v);
 const modes = [
+  "one-dimension",
+  "two-dimensions",
+  "attribute-boolean",
+  "left-fallback",
   "stored",
   "single-key",
   "memory",
@@ -106,13 +110,27 @@ it.each(seedsFor("next-executor-star-dictionary", [0xb76b, 0xb76c]))(
               mode === "memory" ? "f_memory" : mode === "mixed" ? "f_mixed" : "f_stored";
             const a = mode === "non-PK" ? "a_plain" : mode === "composite" ? "a_composite" : "a",
               c = mode === "wide" ? "c_wide" : "c";
-            const single = mode === "single-key";
+            const one = mode === "one-dimension",
+              two = mode === "two-dimensions",
+              left = mode === "left-fallback";
+            const single = mode === "single-key" || one;
+            const extra = single ? "" : two ? ",b.t AS y" : ",b.t AS y,c.label AS z";
+            const grouping = single ? "" : two ? ",b.t" : ",b.t,c.label";
+            const ordering = single ? "" : two ? ",y" : ",y,z";
+            const join = left ? "LEFT JOIN" : "JOIN";
+            const filter = left
+              ? "TRUE"
+              : mode === "attribute-boolean"
+                ? "(a.active OR a.t IS NULL) AND NOT (a.weight<2) AND (a.t IS NOT NULL OR a.weight>2) AND b.weight>1"
+                : one
+                  ? "a.active"
+                  : "a.active AND b.weight>1";
             const group = "a.t",
               value = mode === "computed" ? "f.v+0.25" : "f.v";
-            const sql = `SELECT ${group} AS x${single ? "" : ",b.t AS y,c.label AS z"},COUNT(*) AS n,SUM(${value}) AS s FROM ${table} f
-            JOIN ${a} a ON a.k=f.ka JOIN b ON b.k=f.kb JOIN ${c} c ON c.k=f.kc
-            WHERE a.active AND b.weight>1${mode === "wide" ? " AND f.v<1" : mode === "parameter" ? " AND f.v>$1" : ""}
-            GROUP BY ${group}${single ? "" : ",b.t,c.label"} ORDER BY ${sumOrder ? "s DESC," : ""}x ${descending ? "DESC" : "ASC"} NULLS FIRST${single ? "" : ",y,z"}
+            const sql = `SELECT ${group} AS x${extra},COUNT(*) AS n,SUM(${value}) AS s FROM ${table} f
+            ${join} ${a} a ON a.k=f.ka${one ? "" : ` ${join} b ON b.k=f.kb`}${one || two ? "" : ` ${join} ${c} c ON c.k=f.kc`}
+            WHERE ${filter}${mode === "wide" ? " AND f.v<1" : mode === "parameter" ? " AND f.v>$1" : ""}
+            GROUP BY ${group}${grouping} ORDER BY ${sumOrder ? "s DESC," : ""}x ${descending ? "DESC" : "ASC"} NULLS FIRST${ordering}
             LIMIT ${String(mode === "zero" ? 0 : single ? 2 : 7)} OFFSET 1`;
             const args = mode === "parameter" ? [0.5] : [];
             encode.mockClear();
@@ -122,7 +140,13 @@ it.each(seedsFor("next-executor-star-dictionary", [0xb76b, 0xb76c]))(
               throw new Error("Missing star rows");
             const rows = canonical(oracleRows(result));
             const selected =
-              mode === "stored" || mode === "single-key" || mode === "memory" || mode === "mixed";
+              mode === "stored" ||
+              mode === "single-key" ||
+              mode === "memory" ||
+              mode === "mixed" ||
+              one ||
+              two ||
+              mode === "attribute-boolean";
             expect(encode.mock.calls.length > 0).toBe(selected);
             if (selected) {
               expect(
@@ -151,9 +175,13 @@ it.each(seedsFor("next-executor-star-dictionary", [0xb76b, 0xb76c]))(
         ),
         {
           seed,
-          numRuns: 16,
+          numRuns: 20,
           examples: [
             ["stored", false, false],
+            ["one-dimension", false, false],
+            ["two-dimensions", true, true],
+            ["attribute-boolean", false, false],
+            ["left-fallback", true, false],
             ["single-key", false, false],
             ["memory", true, false],
             ["mixed", false, true],

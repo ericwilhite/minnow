@@ -52,6 +52,8 @@ const files = [
   "next-sort-runtime-worker.mts",
   "next-executor-workload/gen.mjs",
   "next-executor-workload/queries.mjs",
+  "next-star-workload/gen.mjs",
+  "next-star-workload/queries.mjs",
 ];
 const sha = (v: Uint8Array) => createHash("sha256").update(v).digest("hex");
 const sources = Object.fromEntries(
@@ -116,7 +118,12 @@ try {
       mode === "whole"
         ? {
             runtimeRoot,
-            workloadRoot: fileURLToPath(new URL("./next-executor-workload", import.meta.url)),
+            workloadRoot: resolve(
+              option(
+                "--workload-root",
+                fileURLToPath(new URL("./next-executor-workload", import.meta.url)),
+              ),
+            ),
             rows,
             image: bundle?.image,
             imageIdentity: bundle?.imageIdentity,

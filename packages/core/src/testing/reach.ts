@@ -4413,6 +4413,10 @@ export const STAR_BOUND_REACH = [
 ] as const;
 
 export const STAR_SQL_REACH = [
+  "one-dimension",
+  "two-dimensions",
+  "attribute-boolean",
+  "left-fallback",
   "stored",
   "single-key",
   "memory",
@@ -4452,6 +4456,12 @@ export const STAR_PRESSURE_REACH = [
 ] as const;
 
 export const STAR_FLOAT_REACH = [
+  "sum",
+  "avg",
+  "min",
+  "max",
+  "sxx",
+  "nulls",
   "finite",
   "special",
   "overflow",

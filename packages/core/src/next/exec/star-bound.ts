@@ -76,6 +76,8 @@ export function terminalStar(plan: PhysicalPlan, aggregate: number): boolean {
 export function starPredicate(expr: ScalarExpr | null): boolean {
   if (expr === null) return true;
   if (expr.op === "column" || expr.op === "literal") return true;
+  if (expr.op === "and" || expr.op === "or") return expr.args.every(starPredicate);
+  if (expr.op === "not" || expr.op === "isNull") return starPredicate(expr.arg);
   if (expr.op === "compare")
     return expr.collation === null && starPredicate(expr.left) && starPredicate(expr.right);
   if (expr.op === "distinctFrom") return starPredicate(expr.left) && starPredicate(expr.right);
@@ -205,8 +207,10 @@ export function starBound(
     return null;
   const capacity = Math.max(1024, 2 * groups);
   // Group tables: direct-table old/new <=512KiB; per-key integer hash/value/tuple arrays,
-  // resize overlap and batch IDs <128C. COUNT/SUM float fields and output overlap <128C/call.
-  // These two calls do not select the 21-call typed-layout bank or AVG promotion.
+  // resize overlap and batch IDs <128C. Per float call, AVG is the largest state:
+  // three f64 fields (24C), old/new growth <=72C, plus validity/output <=9C.
+  // SUM and fixed-width MIN/MAX are smaller. <=8 calls cannot select the 21-call bank.
+  // AVG keeps every Youngs-Cramer Sxx update and its PostgreSQL overflow check.
   const aggregate =
     (compiler.get(shape.aggregate.id) ?? 0) +
     (512 << 10) +
