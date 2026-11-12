@@ -4413,6 +4413,10 @@ export const STAR_BOUND_REACH = [
 ] as const;
 
 export const STAR_SQL_REACH = [
+  "like",
+  "ilike",
+  "not-like",
+  "escaped-like",
   "one-dimension",
   "two-dimensions",
   "attribute-boolean",
@@ -4471,4 +4475,23 @@ export const STAR_FLOAT_REACH = [
   "identical native sequence",
   "bit exact result",
   "PG ordered transitions",
+] as const;
+
+export const LIKE_REACH = [
+  "like",
+  "ilike",
+  "negated",
+  "values",
+  "escape error",
+  "flat",
+  "constant",
+  "dictionary",
+  "selected",
+  "null-arg",
+  "null-pattern",
+  "C",
+  "POSIX",
+  "unicode scalar",
+  "no escape",
+  "unicode escape",
 ] as const;

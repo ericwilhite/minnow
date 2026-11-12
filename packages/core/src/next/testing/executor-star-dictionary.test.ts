@@ -13,6 +13,10 @@ afterEach(() => vi.restoreAllMocks());
 const literal = (v: string | number | boolean | null): string =>
   v === null ? "NULL" : typeof v === "string" ? `'${v.replaceAll("'", "''")}'` : String(v);
 const modes = [
+  "like",
+  "ilike",
+  "not-like",
+  "escaped-like",
   "one-dimension",
   "two-dimensions",
   "attribute-boolean",
@@ -54,7 +58,7 @@ it.each(seedsFor("next-executor-star-dictionary", [0xb76b, 0xb76c]))(
         await pg.exec(ddl);
       }
       const keys = Array.from({ length: 12 }, (_, i) => `k${String(i)}`);
-      const texts = ["z", "a", "汉", "", null];
+      const texts = ["z", "a", "汉", "", null, "a_", "Z%", "Ä", "ä"];
       for (const name of ["a", "b", "c", "a_plain", "a_composite", "c_wide"]) {
         const composite = name === "a_composite";
         const ddl = `CREATE TABLE ${name}(k TEXT${name === "a_plain" || composite ? "" : " PRIMARY KEY"},t TEXT,label TEXT,active BOOLEAN,weight DOUBLE PRECISION${composite ? ", extra INTEGER, PRIMARY KEY(k,extra)" : ""})`;
@@ -118,13 +122,21 @@ it.each(seedsFor("next-executor-star-dictionary", [0xb76b, 0xb76c]))(
             const grouping = single ? "" : two ? ",b.t" : ",b.t,c.label";
             const ordering = single ? "" : two ? ",y" : ",y,z";
             const join = left ? "LEFT JOIN" : "JOIN";
-            const filter = left
-              ? "TRUE"
-              : mode === "attribute-boolean"
-                ? "(a.active OR a.t IS NULL) AND NOT (a.weight<2) AND (a.t IS NOT NULL OR a.weight>2) AND b.weight>1"
-                : one
-                  ? "a.active"
-                  : "a.active AND b.weight>1";
+            const filter = ["like", "ilike", "not-like", "escaped-like"].includes(mode)
+              ? mode === "ilike"
+                ? "a.t ILIKE 'Ä%'"
+                : mode === "not-like"
+                  ? "a.t NOT LIKE '%a%'"
+                  : mode === "escaped-like"
+                    ? "a.t LIKE '%!_%' ESCAPE '!'"
+                    : "a.t LIKE '%a%'"
+              : left
+                ? "TRUE"
+                : mode === "attribute-boolean"
+                  ? "(a.active OR a.t IS NULL) AND NOT (a.weight<2) AND (a.t IS NOT NULL OR a.weight>2) AND b.weight>1"
+                  : one
+                    ? "a.active"
+                    : "a.active AND b.weight>1";
             const group = "a.t",
               value = mode === "computed" ? "f.v+0.25" : "f.v";
             const sql = `SELECT ${group} AS x${extra},COUNT(*) AS n,SUM(${value}) AS s FROM ${table} f
@@ -146,7 +158,8 @@ it.each(seedsFor("next-executor-star-dictionary", [0xb76b, 0xb76c]))(
               mode === "mixed" ||
               one ||
               two ||
-              mode === "attribute-boolean";
+              mode === "attribute-boolean" ||
+              ["like", "ilike", "not-like", "escaped-like"].includes(mode);
             expect(encode.mock.calls.length > 0).toBe(selected);
             if (selected) {
               expect(
@@ -175,9 +188,13 @@ it.each(seedsFor("next-executor-star-dictionary", [0xb76b, 0xb76c]))(
         ),
         {
           seed,
-          numRuns: 20,
+          numRuns: 28,
           examples: [
             ["stored", false, false],
+            ["like", false, false],
+            ["ilike", true, true],
+            ["not-like", false, true],
+            ["escaped-like", true, false],
             ["one-dimension", false, false],
             ["two-dimensions", true, true],
             ["attribute-boolean", false, false],

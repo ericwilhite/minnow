@@ -4,6 +4,7 @@
  * Keeping every native join resident preserves its probe/duplicate-chain order when
  * TEXT equality classes become integers. No spill partition may reorder float inputs.
  */
+import { safeLikePattern } from "./kernels/like.js";
 import type { CatalogView } from "../access/catalog.js";
 import { MAX_BLOB_BYTES } from "../access/space.js";
 import type { PhysicalPlan, Rel, ScalarExpr } from "../ir/ir.js";
@@ -76,6 +77,7 @@ export function terminalStar(plan: PhysicalPlan, aggregate: number): boolean {
 export function starPredicate(expr: ScalarExpr | null): boolean {
   if (expr === null) return true;
   if (expr.op === "column" || expr.op === "literal") return true;
+  if (expr.op === "like") return safeLikePattern(expr) && starPredicate(expr.arg);
   if (expr.op === "and" || expr.op === "or") return expr.args.every(starPredicate);
   if (expr.op === "not" || expr.op === "isNull") return starPredicate(expr.arg);
   if (expr.op === "compare")

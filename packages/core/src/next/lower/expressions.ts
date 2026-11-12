@@ -625,6 +625,7 @@ export function lowerCondition(
           arg: arg.expr,
           pattern: pattern.expr,
           escape: escape ?? null,
+          collation: collationOf(arg, pattern),
           type: BOOL,
         },
         nullable: arg.nullable || pattern.nullable,
