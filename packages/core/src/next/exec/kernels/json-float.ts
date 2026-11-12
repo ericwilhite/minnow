@@ -33,7 +33,7 @@ function notation(coefficient: bigint, power: number, single: boolean): string {
       : digits.slice(0, point) + "." + digits.slice(point);
 }
 
-export function jsonFloatText(value: number, single: boolean): string {
+function exactFloatText(value: number, single: boolean): string {
   if (Object.is(value, -0)) return "-0";
   if (value === 0 || !Number.isFinite(value)) return String(value);
   const negative = value < 0;
@@ -91,4 +91,72 @@ export function jsonFloatText(value: number, single: boolean): string {
     return (negative ? "-" : "") + notation(coefficient, power, single);
   }
   throw new Error("No shortest float inside its binary rounding interval");
+}
+
+/** V8's shortest binary64 conversion also chooses nearest digits and even decimal ties.
+ * Below 2^53 a shortest decimal cannot be a binary midpoint: fractional midpoints
+ * need more significant digits than their neighbour, and integer midpoints start
+ * above the safe-integer range. Above that bound retain the exact open-interval proof.
+ * Binary32 neighbours/midpoints are exact binary64 values. A strictly interior
+ * rounded candidate proves its decimal is interior too; a rounded endpoint falls
+ * back. Power-of-two asymmetric intervals and near decimal ties also fall back.
+ */
+export function jsonFloatText(value: number, single: boolean): string {
+  if (value === 0) return Object.is(value, -0) ? "-0" : "0";
+  if (!Number.isFinite(value)) return String(value);
+  const magnitude = Math.abs(value);
+  if (!single) {
+    if (magnitude >= 2 ** 53) return exactFloatText(value, false);
+    return pgNotation(value, false);
+  }
+  bits.setFloat32(0, magnitude);
+  const word = bits.getUint32(0),
+    exponent = word >>> 23;
+  if ((word & 0x7fffff) === 0 && exponent > 1) return exactFloatText(value, true);
+  bits.setUint32(0, word - 1);
+  const lower = (magnitude + bits.getFloat32(0)) / 2;
+  bits.setUint32(0, word + 1);
+  // Largest finite float's next mathematical neighbour is 2^128, not Infinity.
+  const upper =
+    (magnitude +
+      (exponent === 254 && (word & 0x7fffff) === 0x7fffff ? 2 ** 128 : bits.getFloat32(0))) /
+    2;
+  for (let precision = 1; precision <= 9; precision++) {
+    const text = magnitude.toPrecision(precision);
+    const candidate = Number(text);
+    if (Math.fround(candidate) !== magnitude) continue;
+    if (!(candidate > lower && candidate < upper)) return exactFloatText(value, true);
+    const power = decimalPower(text, precision);
+    const mantissa = (word & 0x7fffff) + (exponent === 0 ? 0 : 0x800000);
+    const trailing = 31 - Math.clz32(mantissa & -mantissa);
+    // A decimal-grid tie requires exactly one uncancelled factor 2 downstairs.
+    // Multiplying/dividing by 5 never changes that valuation. This necessary test
+    // is exact; for positive decimal powers it may conservatively fall back.
+    if (Math.max(1, exponent) - 127 - 23 + trailing - power === -1)
+      return exactFloatText(value, true);
+    return pgNotation(value < 0 ? -candidate : candidate, true);
+  }
+  return exactFloatText(value, true);
+}
+
+/** Reuse native decimal digits; change notation only where PG's thresholds differ. */
+function pgNotation(value: number, single: boolean): string {
+  const magnitude = Math.abs(value);
+  if (magnitude >= 1e-4 && magnitude < (single ? 1e6 : 1e15)) return String(value);
+  const text = value.toExponential();
+  const at = text.length - 2;
+  return text.charCodeAt(at) === 43 || text.charCodeAt(at) === 45
+    ? text.slice(0, at + 1) + "0" + text.charAt(at + 1)
+    : text;
+}
+
+/** The exact grid toPrecision rounded on, including a carry into a new exponent. */
+function decimalPower(text: string, precision: number): number {
+  const e = text.indexOf("e");
+  if (e >= 0) return Number(text.slice(e + 1)) - precision + 1;
+  const point = text.indexOf(".");
+  if (text.charCodeAt(0) !== 48) return (point < 0 ? text.length : point) - precision;
+  let first = 2;
+  while (text.charCodeAt(first) === 48) first++;
+  return 2 - first - precision;
 }

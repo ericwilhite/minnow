@@ -12,6 +12,8 @@ compatibility policy and release process.
 
 The unexported rebuild's JSON and JSONB constructors now preserve PostgreSQL's float4/float8
 decimal spelling at rounding and exponent boundaries, including subnormals and signed zero.
+The ordinary path reuses proven native shortest digits; exact interval arithmetic remains for
+midpoint and decimal-tie cases. This avoids a BigInt search for each ordinary float value.
 This fixes float values whose JavaScript spelling lost digits in JSONB. Shipped SQL behavior,
 the public API and stored formats are unchanged; no migration is needed.
 

@@ -541,6 +541,13 @@ bound. Wide JS NUMERIC coefficients keep their charged per-field copy without co
 JSON sibling again. Encoded array fields already use transferable variable-width bytes.
 Existing oversized-parameter execution checks remain unchanged.
 
+Float serialization reuses native nearest-shortest digits on the proven common path. Binary64
+values below 2^53 cannot have a shortest decimal at an excluded binary midpoint; larger values
+retain the exact interval fallback. Binary32 candidates must lie strictly inside exact binary64
+midpoints; asymmetric power-of-two intervals and uncertain decimal ties use the same fallback.
+PG notation is applied without parsing a chosen binary64 decimal back through Number. No copied
+Ryu tables, per-row BigInt interval search on the ordinary path, or new admission allowance.
+
 Partial result ownership survives pending checkpoint I/O, cancellation and faults until that I/O
 settles. Offered frames own their backing storage until credit; foreign grants and reusable slabs
 remain ineligible for adoption. The ephemeral checkpoint descriptors do not change stored formats.
