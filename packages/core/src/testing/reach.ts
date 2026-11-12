@@ -17,6 +17,12 @@
  * (`packages/db/tests/oracle-reach.ts`). Like ./seeds.ts, this module is excluded from the
  * published tarball.
  */
+/** Reset refusal must see every legacy marker and both OPFS capability states. */
+export const LEGACY_REFUSAL_REACH = {
+  opfs: ["O5", "O6", "O7", "O8", "O9", "O10", "O11", "O12", "O13", "sync", "no sync", "pre-marker"],
+  idb: ["I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8"],
+} as const;
+
 export interface Reach<State extends string> {
   /** Starts one generated history. */
   beginHistory(): void;

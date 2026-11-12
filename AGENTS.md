@@ -19,13 +19,18 @@
 - Test all changes before committing.
 - Check for regressions.
 - Do not commit broken or unverified work.
-- Every change to a supported stored format must preserve automatic upgrades on open/load.
+- The 1.0 rebuild starts a new stored-format chain. No production 0.x database exists to
+  convert: next/ must refuse 0.x data without mutation, not upgrade it or open an empty store
+  over it. The first released 1.0 next/ format is the first supported predecessor in that chain;
+  unreleased next/ development formats are not supported predecessors.
+- Every subsequent change to a supported stored format must preserve automatic upgrades on open/load.
   Require frozen fixtures from every supported older writer and tests that open them through
   the ordinary API, preserve their data, continue writing, and reopen with the current build.
   Test interruption/power loss and retry at every conversion publication step, corruption
   refusal, concurrent openers, and older-writer refusal after upgrade. Manual export/import
   is not an acceptable upgrade path for a supported version. A format bump without this
-  regression coverage is unfinished, including during 0.x.
+  regression coverage is unfinished. Existing 0.x compatibility tests remain for the 0.x engine;
+  they do not imply a 0.x-to-1.0 converter.
 - A fix in an area a generated suite owns (the interaction simulator, the live, index, FTS and
   compaction oracles, the SQLite/PGlite diffs, the fast-check properties) carries this evidence
   in its commit message:

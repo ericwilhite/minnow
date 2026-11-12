@@ -10,6 +10,14 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The planned 1.0 storage reset starts a fresh supported-format chain; there is no 0.x-to-1.0
+converter. The unexported rebuild refuses existing 0.x IndexedDB and OPFS databases with
+`LegacyDataError` (`MINNOW_LEGACY_DATA`) before changing old data or creating a replacement.
+This includes readable OPFS directories in contexts without sync handles. Use a new database
+name or explicitly delete the old database. The current 0.x engine and its compatibility
+readers are unchanged; future upgrade and frozen-fixture obligations for the new chain start
+with the first released 1.0 writer.
+
 The unexported rebuild's JSON and JSONB constructors now preserve PostgreSQL's float4/float8
 decimal spelling at rounding and exponent boundaries, including subnormals and signed zero.
 The ordinary path reuses proven native shortest digits; exact interval arithmetic remains for

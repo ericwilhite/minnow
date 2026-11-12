@@ -38,7 +38,7 @@ A change is breaking when it is one of these:
 - **The API.** An export removed or renamed, a signature narrowed, or a default changed.
 - **SQL.** A form that used to run and no longer does, or one that runs and now answers
   differently. Additions to the [feature matrix](/docs/sql/feature-matrix) are not breaking.
-- **Stored data.** A database written by the old version that the new one cannot open. The locked
+- **Stored data.** A database written by the old version that the new one cannot open. Within the 0.x line, the locked
   byte contracts below narrow this category: a release cannot reinterpret or drop an existing
   block-format-2, snapshot-format-1/2, IndexedDB-schema-1/2/3/4, or OPFS-layout-6/7/8/9 reader or
   automatic converter.
@@ -59,6 +59,18 @@ The [changelog](/docs/changelog) is the release-by-release record. Each entry na
 packages published together and its additions and fixes; entries since 0.5.0 also record required
 migration steps and stored-format compatibility. `npm run version:check` refuses a workspace whose current package versions are not
 recorded there.
+
+## The 1.0 storage reset
+
+The planned 1.0 rebuild starts fresh. Its ordinary open refuses databases written by Minnow
+0.x with `MINNOW_LEGACY_DATA`, without changing them or opening an empty replacement. Use a
+fresh database name, or explicitly delete the old database. There is no 0.x-to-1.0 converter.
+The first released 1.0 format begins the new supported upgrade chain. Every later supported
+format change must preserve ordinary automatic open/load with frozen older-writer fixtures,
+continued writes and reopen, interruption/retry, corruption refusal, concurrent openers and
+older-writer refusal. Unreleased rebuild formats are not supported predecessors.
+
+The remaining byte contracts on this page describe the existing 0.x engine.
 
 ## The block format has its own version
 

@@ -52,6 +52,7 @@ import {
   type SyncFile,
 } from "./contract.js";
 import { acquireFenced, type HeldLock, type LockManagerLike } from "./fence.js";
+import { refuseLegacyOpfs } from "./legacy-data.js";
 import { FileScratch, FileStoreSession, type FileSet } from "./file-store.js";
 
 /** `FileSystemFileHandle`, as far as the backend uses it. */
@@ -61,6 +62,8 @@ export interface OpfsFileHandleLike {
 
 /** `FileSystemDirectoryHandle`, as far as the backend uses it. */
 export interface OpfsDirectoryLike {
+  /** Present on native handles: inspect before opening any writable sync handle. */
+  keys?(): AsyncIterableIterator<string>;
   getFileHandle(name: string, options?: { create?: boolean }): Promise<OpfsFileHandleLike>;
 }
 
@@ -358,7 +361,8 @@ function nextEpoch(file: SyncFile, unused: boolean): number {
  * Opens every file's handle in order and advances the epoch; on any failure closes every handle it
  * opened, then throws (quota failures as `StoreQuotaError`), so a retry finds the files free.
  */
-async function openFiles(directory: OpfsDirectoryLike): Promise<OpenFiles> {
+async function openFiles(directory: OpfsDirectoryLike, location: string): Promise<OpenFiles> {
+  await refuseLegacyOpfs(directory, location);
   const handles: SyncFile[] = [];
   try {
     for (const name of OPFS_FILE_NAMES) {
@@ -405,7 +409,7 @@ export function createOpfsBackend(options: OpfsBackendOptions): StorageBackend {
       const { lock, fence } = await acquireFenced(
         options.locks,
         `minnow:${options.name}`,
-        () => openFiles(options.directory),
+        () => openFiles(options.directory, options.name),
         (opened) => {
           closeAll(opened.handles);
         },

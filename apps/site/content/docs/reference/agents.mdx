@@ -329,12 +329,16 @@ machines: https://minnowdb.com/llms.txt
   `ON DELETE SET DEFAULT`. Every rejected form is an `unsupported` row of the feature matrix
   with its exact error; check each supported entry's note before assuming every PostgreSQL
   variant.
-- Supported stored-format upgrades run automatically through ordinary open/load, including
+- Within the 0.x line, supported stored-format upgrades run automatically through ordinary open/load, including
   IndexedDB schemas 1–7 to 8 and OPFS layouts 6–12 to 13. Do not add a required export/import
   step. Every format change needs frozen
   older-writer fixtures and data-preservation, continued-write/reopen, interruption/power-loss,
   corruption-refusal, concurrent-open and older-writer-barrier tests. Close older connections
   if they block an upgrade; quota/I/O failures must report an error and remain retryable.
+- The planned 1.0 rebuild starts a fresh format chain. It refuses 0.x databases unchanged with
+  `MINNOW_LEGACY_DATA`; use a new database name or explicitly delete the old database.
+  There is no 0.x-to-1.0 converter. Automatic-upgrade and frozen-fixture obligations for the
+  new chain start at its first released 1.0 format, not its unreleased development formats.
 - OPFS coordination exhaustion and queue overload throw `OpfsCoordinationError` from
   `@minnowdb/core`; `instanceof` survives worker RPC. Retry boot/migrate with bounded backoff;
   never delete a database merely because migration rejected. Established live queries retain

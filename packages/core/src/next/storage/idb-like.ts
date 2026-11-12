@@ -26,6 +26,7 @@
  * Bytes are stored as exact-size `ArrayBuffer`s, never Blobs (Firefox writes Blobs at 8 MB/s with
  * one fsync each) and never views (structured clone would copy the whole underlying buffer).
  */
+import { isLegacyIndexedDb, LegacyDataError, refuseLegacyIndexedDb } from "./legacy-data.js";
 import { StoreQuotaError } from "./contract.js";
 
 export type IdbKey = number | string;
@@ -102,20 +103,49 @@ function keyRange(range: IdbRange | null): IDBKeyRange | null {
 
 /** Opens (creating if needed) the database `name` on the platform's IndexedDB. */
 export async function openIndexedDb(factory: IDBFactory, name: string): Promise<IdbDatabaseLike> {
+  // Unversioned inspection precedes the native schema upgrade, including direct callers.
+  await refuseLegacyIndexedDb(factory, name);
   const database = await new Promise<IDBDatabase>((resolve, reject) => {
+    let failure: LegacyDataError | null = null;
+    let settled = false;
     const request = factory.open(name, IDB_VERSION);
     request.onupgradeneeded = () => {
+      // An old writer may have created the database since the preflight. Abort before edits.
+      if (isLegacyIndexedDb(Array.from(request.result.objectStoreNames))) {
+        failure = new LegacyDataError("indexeddb", name);
+        request.transaction?.abort();
+        return;
+      }
+      if (settled) {
+        request.transaction?.abort();
+        return;
+      }
       for (const store of IDB_STORES)
         if (!request.result.objectStoreNames.contains(store))
           request.result.createObjectStore(store);
     };
     request.onsuccess = () => {
-      resolve(request.result);
+      if (isLegacyIndexedDb(Array.from(request.result.objectStoreNames)))
+        failure = new LegacyDataError("indexeddb", name);
+      if (settled || failure !== null) request.result.close();
+      if (!settled) {
+        if (failure !== null) reject(failure);
+        else resolve(request.result);
+      }
+      settled = true;
     };
     request.onerror = () => {
-      reject(request.error ?? new Error(`Cannot open IndexedDB ${name}`));
+      const cause = failure ?? request.error ?? new Error(`Cannot open IndexedDB ${name}`);
+      if (!settled) {
+        // A racing old writer at I3–I8 can reject the native v2 open before upgrade fires.
+        if (errorName(cause) === "VersionError")
+          void refuseLegacyIndexedDb(factory, name).then(() => reject(cause), reject);
+        else reject(cause);
+      }
+      settled = true;
     };
     request.onblocked = () => {
+      settled = true;
       reject(new Error(`IndexedDB ${name} is blocked by an open connection of another version`));
     };
   });

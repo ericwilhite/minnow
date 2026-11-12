@@ -548,7 +548,13 @@ its memory-store results exclude payload fetch, SQL, owner transport and real di
   IndexedDB only on the private modes' refusals (`SecurityError`, `UnknownError`,
   `NotSupportedError`; other errors propagate), else memory (Safari Lockdown Mode). Before
   creating anything it refuses the pre-reset engine's data (`minnowdb/<name>` in OPFS, or an
-  IndexedDB database of the old engine's stores under the bare name) with `LegacyDataError`, and
+  IndexedDB database of the old engine's stores under the bare name) with `LegacyDataError`
+  (`MINNOW_LEGACY_DATA`): written by Minnow 0.x; 1.0 does not open it. There is no converter.
+  Use a new name or explicitly delete the old database. The first released 1.0 format starts
+  the new supported upgrade/fixture chain; unreleased next/ formats are not predecessors.
+  The legacy OPFS probe runs even without sync handles. Native IDB inspection never upgrades
+  the source, and native OPFS directory inspection precedes any writable handle. Refusal leaves
+  old bytes/schema untouched and creates no replacement database. The chooser also
   refuses to open OPFS over this name's IndexedDB store (`StoreConflictError`). Layout
   `minnow-core/` and `minnow-core:<name>`.
 - A writer that interleaves many builders (the page format's group writer) passes a `budget` to

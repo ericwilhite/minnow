@@ -471,6 +471,14 @@ A browser database's data lives in the user's browser, so it outlives every depl
 migration window and no way to reach back and rewrite it: if a format change makes yesterday's
 blocks unreadable, the first anyone hears is a user whose application will not open.
 
+The following corpus describes compatibility within the existing 0.x engine. The planned 1.0
+rebuild starts a fresh chain; its first released writer begins a new fixture obligation.
+`next/storage/legacy-data.test.ts` uses the old artifacts as refusal inputs instead: next open
+must report `MINNOW_LEGACY_DATA`, preserve every old byte/schema/record, and create no replacement.
+It covers frozen OPFS trees with and without sync-handle capability and actual I8 databases
+loaded from every frozen snapshot. Synthetic native I1–I8 shapes and O5/O11 markers extend
+refusal coverage; they are not claimed to be frozen older-writer images.
+
 `packages/core/format-fixtures/` holds one frozen database per released block/snapshot pair — a
 framed snapshot, which carries the raw block bytes verbatim, plus the answers that build gave to a
 fixed set of queries. Each manifest records the exact `@minnowdb/core` version that wrote it.
