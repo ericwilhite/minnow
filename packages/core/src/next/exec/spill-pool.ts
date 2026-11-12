@@ -16,6 +16,7 @@ import type { PhysicalType } from "../types.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import type { Vector } from "../vector/vector.js";
 import type { ColumnStore } from "./column-store.js";
+import { SORT_ROW_VIEW_BYTES, sortRowView } from "./sort-row.js";
 import {
   decodePage,
   type DecodedPage,
@@ -365,6 +366,43 @@ export class SpillIo {
       this.checkAborted();
       const paced = this.pace?.();
       if (paced != null) await paced;
+      const row = ids === null ? from + done : (ids[from + done] ?? 0);
+      if (
+        this.onFlush === null &&
+        staging.appendNeed(vectors, row) > Math.max(staging.targetBytes, 64 * 1024)
+      ) {
+        await this.flush(staging, run, header);
+        // The input's payload is already owned. One loan funds the borrowed-row
+        // views and page replacement together; no staging arena is copied first.
+        const metadata = staging.types.length * SORT_ROW_VIEW_BYTES;
+        await this.need(staging.appendNeed(vectors, row) + metadata + 64 * 1024);
+        const release = this.pool.pinStep();
+        try {
+          if (!this.pool.allocate(metadata)) throw new RangeError("Spill row views not admitted");
+          try {
+            // Checkpoint inputs can retain hidden sort keys beyond this schema.
+            // Match ColumnStore.append: only the declared prefix is serialized.
+            const views = vectors
+              .slice(0, staging.types.length)
+              .map((vector) => sortRowView(vector, row));
+            const page = this.pages.encode(
+              { queryId: this.context.queryId, ...header, sequence: run.pageCount },
+              views,
+              1,
+            );
+            if (page === null) throw new RangeError("Prepaid spill row could not be encoded");
+            if (run.write) await run.write(page, 1);
+            else await this.files.append(run, page, 1);
+            this.pages.shrinkIf(true);
+          } finally {
+            this.pool.free(metadata);
+          }
+        } finally {
+          release();
+        }
+        done++;
+        continue;
+      }
       done += staging.append(vectors, ids, from + done, count - done);
       // An oversized row may fit without a loan. Do not retain its arena in one partition
       // while filling the others: together they can pin a loan past this row-sized step.
@@ -383,7 +421,6 @@ export class SpillIo {
       // Not even one row fits an empty staging chunk: room for exactly that row, which then
       // goes out as a page of its own before the next step.
       // The step is the row and the page it becomes: room for both at once.
-      const row = ids === null ? from + done : (ids[from + done] ?? 0);
       const rowBytes = staging.appendNeed(vectors, row);
       await this.need(2 * rowBytes + 64 * 1024);
       const one = staging.append(vectors, ids, from + done, 1);

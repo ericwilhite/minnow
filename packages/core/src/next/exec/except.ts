@@ -364,8 +364,8 @@ export class ExceptOperator {
         right ? MAX_COUNT : ++this.#leftOrdinal,
       );
       if (this.#pool.owes) {
-        await this.#flush(0);
         this.#shrinkKeys();
+        await this.#flush(0);
       }
       this.profile.rowsIn++;
     }
@@ -389,6 +389,8 @@ export class ExceptOperator {
     row: number,
     level: number,
     mayFlush: boolean,
+    rowNeed: () => number,
+    pageBytes: number,
   ): Promise<Uint8Array> {
     const extract = () =>
       runSliced(
@@ -399,7 +401,12 @@ export class ExceptOperator {
     if ((await extract()) !== 1) {
       if (mayFlush) await this.#flush(level);
       if ((await extract()) !== 1) {
-        await this.#io.need(this.#scratch.requiredBytes + this.#keep);
+        // Encoding, a copied hash key and the representative coexist. Prepay that
+        // entire transition before taking its ONE loan; spill replaces the encoder
+        // with a page, rather than requesting another loan while the key is live.
+        await this.#io.need(
+          Math.max(2 * this.#scratch.requiredBytes + rowNeed(), 3 * pageBytes) + this.#keep,
+        );
         if ((await extract()) !== 1) throw new RangeError("EXCEPT key could not be encoded");
       }
     }
@@ -438,6 +445,8 @@ export class ExceptOperator {
       row,
       level,
       peel === undefined,
+      () => (location === undefined ? this.#store.appendNeed(columns, row) : 0),
+      location?.ref.length ?? 0,
     );
     const mask = this.context.hashMask ?? 0xffff_ffff;
     const hash = ((this.#scratch.hashes[0] ?? 0) & mask) >>> 0,
@@ -457,7 +466,9 @@ export class ExceptOperator {
         rowNeed = location === undefined ? this.#store.appendNeed(columns, row) : 0;
         need = bytes + rowNeed;
         if (!this.#pool.allocate(need, this.#headroom())) {
-          await this.#io.need(need + this.#headroom());
+          // Dropping the encoder funds its replacement page payload, but not
+          // that page's headers/views, directory nodes and allocation rounding.
+          await this.#io.need(need + Math.max(this.#headroom(), 128 * 1024));
           if (!this.#pool.allocate(need, this.#headroom()))
             throw new RangeError("EXCEPT row could not be held");
         }
@@ -679,70 +690,102 @@ export class ExceptOperator {
       await tape.close();
     }
   }
+  #pageStepBytes(bytes: number): number {
+    // One copied key coexists with up to three I/O representations (read,
+    // encoder and replacement page). The reserved I/O headroom overlaps those
+    // buffers: summing both would refuse a spill that fits the existing cap.
+    return bytes + Math.max(3 * bytes, this.#headroom()) + 128 * 1024;
+  }
   async #merge(tape: ExceptTape, level: number): Promise<void> {
     this.profile.spillPasses++;
     if (level >= LAST_LEVEL) {
       await this.#peel(tape);
       return;
     }
-    await tape.each(
-      this.#recordTypes,
-      async (columns, rows, ref) => {
-        for (let row = 0; row < rows; row++) {
-          await this.#pace();
-          await this.#add(
-            columns,
-            row,
-            countAt(columns[this.types.length], row),
-            countAt(columns[this.types.length + 1], row),
-            level,
-            countAt(columns[this.types.length + 2], row),
-            undefined,
-            rows === 1 && ref.length > this.#keep / 4 ? { tape, ref, row } : undefined,
-          );
-        }
-      },
-      async (ref) => {
-        if (ref.length > this.#keep / 4 && this.#table.size > 0) await this.#flush(level);
-      },
-    );
+    const pageStep: { release: (() => void) | null } = { release: null };
+    try {
+      await tape.each(
+        this.#recordTypes,
+        async (columns, rows, ref) => {
+          for (let row = 0; row < rows; row++) {
+            await this.#pace();
+            await this.#add(
+              columns,
+              row,
+              countAt(columns[this.types.length], row),
+              countAt(columns[this.types.length + 1], row),
+              level,
+              countAt(columns[this.types.length + 2], row),
+              undefined,
+              rows === 1 && ref.length > this.#keep / 4 ? { tape, ref, row } : undefined,
+            );
+          }
+          if (pageStep.release) {
+            // Keep the preflight through read/key/copy/write, including frees
+            // that temporarily leave fewer than the pool's base bytes live.
+            this.#shrinkKeys();
+            await this.#flush(level);
+            pageStep.release();
+            pageStep.release = null;
+          }
+        },
+        async (ref) => {
+          if (ref.length > this.#keep / 4) {
+            if (this.#table.size > 0) await this.#flush(level);
+            this.#shrinkKeys();
+            pageStep.release = this.#pool.pinStep();
+            await this.#io.need(this.#pageStepBytes(ref.length));
+          }
+        },
+      );
+    } finally {
+      pageStep.release?.();
+    }
     await this.#drain(level);
   }
   async #peel(tape: ExceptTape): Promise<void> {
     let input = tape;
     for (;;) {
       this.profile.collisionPasses++;
-      const rest = new ExceptTape(this.#io, LAST_LEVEL);
-      const staging = new ColumnStore(this.#recordTypes, this.#io.pool, {
-        chunkRows: 64,
-        targetBytes: 16 * 1024,
-        varlenBytes: 256,
-      });
-      await input.each(this.#recordTypes, async (columns, rows, ref) => {
-        for (let row = 0; row < rows; row++) {
-          await this.#pace();
-          await this.#add(
-            columns,
-            row,
-            countAt(columns[this.types.length], row),
-            countAt(columns[this.types.length + 1], row),
-            LAST_LEVEL,
-            countAt(columns[this.types.length + 2], row),
-            (values, at) => rest.stage(staging, values, at),
-            { tape: input, ref, row },
-          );
+      this.#shrinkKeys();
+      const releasePass = this.#pool.pinStep();
+      try {
+        await this.#io.need(this.#pageStepBytes(input.maxPageBytes));
+        const rest = new ExceptTape(this.#io, LAST_LEVEL);
+        const staging = new ColumnStore(this.#recordTypes, this.#io.pool, {
+          chunkRows: 64,
+          targetBytes: 16 * 1024,
+          varlenBytes: 256,
+        });
+        await input.each(this.#recordTypes, async (columns, rows, ref) => {
+          for (let row = 0; row < rows; row++) {
+            await this.#pace();
+            await this.#add(
+              columns,
+              row,
+              countAt(columns[this.types.length], row),
+              countAt(columns[this.types.length + 1], row),
+              LAST_LEVEL,
+              countAt(columns[this.types.length + 2], row),
+              (values, at) => rest.stage(staging, values, at),
+              { tape: input, ref, row },
+            );
+          }
+        });
+        await rest.flush(staging);
+        staging.close();
+        await this.#emit();
+        this.#reset();
+        if (input !== tape) await input.close();
+        if (rest.rows === 0) {
+          await rest.close();
+          return;
         }
-      });
-      await rest.flush(staging);
-      staging.close();
-      await this.#emit();
-      this.#reset();
-      if (input !== tape) await input.close();
-      if (rest.rows === 0) {
-        await rest.close();
-        return;
+        input = rest;
+      } finally {
+        this.#shrinkKeys();
+        releasePass();
       }
-      input = rest;
     }
   }
   async #finish(): Promise<void> {

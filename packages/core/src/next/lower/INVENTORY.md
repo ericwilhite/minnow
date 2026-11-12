@@ -401,8 +401,15 @@ JSONB/array semantic keys or locators. Plain JSON lacks equality and is rejected
 UNION DISTINCT and INTERSECT remain explicit execution refusals. Stored formats and shipped SQL
 behavior are unchanged. Generated SQL and resident/spilled real-scratch campaigns compare
 multiplicities, NULLs and representative float/NUMERIC/INTERVAL output exactly with PGlite.
-The operator/tape resident-state proof excludes the shared scratch service's uncharged extent
-metadata; its storage-owner fix is tracked separately.
+Wide EXCEPT rows preflight key encoding, the copied key and representative together. Spill
+pages borrow the input row rather than retaining a second staging arena. Recursive joins
+preflight page/key work and pin the complete single-row table/replay transition until its
+buffers close; dead key encodings retire before staging/output. Competing-grant generators
+compare native and lowered SQL with PGlite, including collision fallback and every join kind.
+The independent result-sink width bound for two large parameter-derived join outputs remains
+an admission-owner limitation (B6-join-result-admission handoff); it is not masked by a new
+set/join refusal. The operator/tape resident-state proof excludes backend implementation costs; shared scratch
+control credit is admitted separately.
 
 ## JSON extraction
 

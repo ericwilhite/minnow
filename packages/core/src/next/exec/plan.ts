@@ -1,3 +1,4 @@
+import { KeyLayout } from "./join-keys.js";
 import {
   RecursiveOperator,
   recursiveLayout,
@@ -531,6 +532,15 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     owner: number;
     loanSlots: number;
   }> = [];
+  const compoundColumns = new Map<number, number>();
+  const compoundCopies = new Map<number, number>();
+  const variableColumns = (input: readonly PhysicalType[]) =>
+    Math.max(
+      1,
+      input.filter((type) =>
+        ["text", "bytes", "json", "array", "enum", "decimal"].includes(type.kind),
+      ).length,
+    );
   const fixed = (
     rel: OperatorIdentity,
     minimum: number | ((cap: number) => number),
@@ -1827,6 +1837,16 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           rt = types(rel.right);
         const lk = keyProjection(lt, rel.leftKeys),
           rk = keyProjection(rt, rel.rightKeys);
+        compoundColumns.set(rel.id, Math.max(variableColumns(lk.types), variableColumns(rk.types)));
+        const correlated = rel.correlated ?? 0;
+        const encodedGroup =
+          rel.kind === "mark" &&
+          correlated > 0 &&
+          new KeyLayout(
+            lk.indexes.slice(0, correlated).map((index) => at(lk.types, index)),
+            rel.nullSafe.slice(0, correlated),
+          ).family === "enc";
+        compoundCopies.set(rel.id, encodedGroup ? 6 : 5);
         const predicateTypes = [...lt, ...rt];
         const make = (
           context: CompileContext,
@@ -1975,6 +1995,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           throw new TypeError("Missing EXCEPT arm");
         const input = types(rel);
         exceptKeyLayout(input);
+        compoundColumns.set(rel.id, variableColumns(input));
         const left = prepare(leftInput),
           right = prepare(rightInput);
         const minimum = exceptMinimumBytes(input);
@@ -2193,13 +2214,20 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       } else if ("input" in rel) visit(rel.input);
     };
     visit(plan.root);
-    if ([...aggregatePlanners.keys()].some((id) => active.has(id))) {
+    for (const [id, columns] of compoundColumns)
+      if (active.has(id)) runtime.operatorParameterColumns(id, columns, compoundCopies.get(id));
+    const hasAggregateProgress = [...aggregatePlanners.keys()].some((id) => active.has(id));
+    const hasCompoundProgress = admissions.some(
+      ({ rel }) => active.has(rel.id) && (rel.op === "join" || rel.op === "setOp"),
+    );
+    if (hasAggregateProgress || hasCompoundProgress) {
       // Inline values are <=64KiB by the stored format. This compound envelope is
-      // aggregation-only: B2's plain export minimum is unchanged. Larger source steps
+      // for heavy operators only: B2's plain export minimum is unchanged. Larger source steps
       // and owned parameter copies are added by the runtime's admitted progress rule.
       // Plan-owned literals can exceed the stored inline threshold. Their already-built
       // vectors give an exact byte bound without re-encoding or copying their payloads.
       let literalBytes = LARGE_VALUE_BYTES;
+      let operatorLiteralBytes = 0;
       const inspected = new Set<object>();
       const inspect = (value: unknown): void => {
         if (
@@ -2215,13 +2243,16 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         inspected.add(value);
         if ("form" in value && value.form === "flat" && "data" in value) {
           const data = (value as { data: { layout: string; bytes?: Uint8Array } }).data;
-          if (data.layout === "varlen")
-            literalBytes = Math.max(literalBytes, data.bytes?.byteLength ?? 0);
+          if (data.layout === "varlen") {
+            operatorLiteralBytes = Math.max(operatorLiteralBytes, data.bytes?.byteLength ?? 0);
+            literalBytes = Math.max(literalBytes, operatorLiteralBytes);
+          }
           return;
         }
         for (const child of Object.values(value)) inspect(child);
       };
       inspect(plan.root);
+      if (hasCompoundProgress) runtime.operatorLiteralProgress(operatorLiteralBytes);
       let inline = 0,
         sourceMultiplicity = 1;
       for (const planner of aggregatePlanners.values()) {
@@ -2241,7 +2272,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         // and parameter output is added separately by the runtime.
         sourceMultiplicity = Math.max(sourceMultiplicity, multiplicity);
       }
-      runtime.progressEnvelope(inline, sourceMultiplicity);
+      if (hasAggregateProgress) runtime.progressEnvelope(inline, sourceMultiplicity);
     }
     const entries = admissions
       .filter((entry) => active.has(entry.owner))

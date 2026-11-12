@@ -2700,6 +2700,7 @@ export const EXCEPT_SPILL_REACH = [
   "cleanup",
   "left duplicates",
   "right exceeds left",
+  "tight oversized pressure",
 ] as const;
 
 /** Canonical equality cannot discard the chosen left tuple's presentation. */
@@ -3886,4 +3887,88 @@ export const QUERY_ROOT_VOLUME_REACH = [
   "nonempty result",
   "exact callback work",
   "volume drift refusal",
+] as const;
+
+/** Compound set/join progress with a separate grant retaining all shared headroom. */
+export const COMPOUND_PROGRESS_REACH = [
+  "EXCEPT repeated parameter",
+  "join repeated parameter",
+  "EXCEPT literal",
+  "EXCEPT stored",
+  "EXCEPT",
+  "EXCEPT ALL",
+  "duplicates",
+  "join INNER",
+  "join LEFT",
+  "join RIGHT",
+  "join FULL",
+  "join RIGHT empty probe",
+  "join stored",
+  "join residual payload",
+  "join RIGHT empty payload",
+  "semi",
+  "anti",
+  "mark",
+  "PG exact",
+  "all ordinary credit occupied",
+  "cleanup",
+  "large recursive join",
+] as const;
+
+export const NATIVE_COMPOUND_REACH = [
+  "word key payload",
+  "empty probe",
+  "wide collision page",
+  "medium collision page",
+  "ordinary collision page",
+  "ALL",
+  "DISTINCT",
+  "collision fallback",
+  "NULL and duplicate keys",
+  "selected dictionary",
+  "raw key",
+  "encoded key",
+  "inner",
+  "left",
+  "right",
+  "full",
+  "semi",
+  "anti",
+  "mark",
+  "backpressure",
+] as const;
+
+/** Encoded C groups retain a separate key table beside the full-key MARK table. */
+export const MARK_GROUP_PROGRESS_REACH = [
+  "native",
+  "stored",
+  "TRUE",
+  "FALSE",
+  "UNKNOWN",
+  "bounded encoder",
+  "cleanup",
+] as const;
+
+export const COMPOUND_HISTORY_REACH = [
+  "afterEach restoration",
+  "abandoned shrinker stopped",
+  "abandoned observer stopped",
+  "queued execution cancelled",
+  "late closer inert",
+  "idempotent close",
+  "zero resources",
+] as const;
+
+export const COMPOUND_PROJECTION_REACH = [
+  "record",
+  "except",
+  "hidden large text",
+  "hidden integer",
+  "selected dictionary",
+  "selected flat",
+  "wide UTF8 prefix",
+  "nonzero slot",
+  "loan",
+  "PostgreSQL exact",
+  "zero resources",
 ] as const;

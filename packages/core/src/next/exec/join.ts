@@ -558,6 +558,15 @@ class Shared {
     return this.io.need(bytes);
   }
 
+  /** Routing and lookup keep hashes/null masks, never the encoded byte buffer.
+   * Return that loan before asking the staging/output step for another resource. */
+  resetKeys(): void {
+    if (!this.pool.owes) return;
+    this.scratch.encoded?.writer.reset();
+    this.scratch.encodedParts?.writer.reset();
+    this.pool.settle();
+  }
+
   reset(store: ColumnStore): void {
     this.io.reset(store);
   }
@@ -718,23 +727,28 @@ class Level {
     const parts = this.parts;
     const shared = this.shared;
     if (parts === null || rows === 0 || rows > BATCH_ROWS) return false;
-    const keyColumns = side === "build" ? shared.spec.buildKeys : shared.spec.probeKeys;
-    const keys = keyColumns.map((c) => columnOf(columns, c));
-    await extractAll(shared, keys, null, 0, rows, shared.scratch);
-    const mask = this.unmatchableMask();
-    for (let k = 0; k < rows; k++) if (((shared.scratch.nulls[k] ?? 0) & mask) !== 0) return false;
-    const counts = this.groupByPartition(null, 0, rows, false);
-    for (let p = 0; p < parts.fanout; p++) {
-      if ((counts[p + 1] ?? 0) - (counts[p] ?? 0) !== rows) continue;
-      if (side === "probe" && parts.resident[p] === true) return false;
-      const run = side === "build" ? parts.build[p] : parts.probe[p];
-      if (run === undefined) return false;
-      await shared.files.append(run, bytes, rows);
-      shared.profile.spilledBytes = shared.files.written;
-      shared.profile.forwardedPages++;
-      return true;
+    try {
+      const keyColumns = side === "build" ? shared.spec.buildKeys : shared.spec.probeKeys;
+      const keys = keyColumns.map((c) => columnOf(columns, c));
+      await extractAll(shared, keys, null, 0, rows, shared.scratch);
+      const mask = this.unmatchableMask();
+      for (let k = 0; k < rows; k++)
+        if (((shared.scratch.nulls[k] ?? 0) & mask) !== 0) return false;
+      const counts = this.groupByPartition(null, 0, rows, false);
+      for (let p = 0; p < parts.fanout; p++) {
+        if ((counts[p + 1] ?? 0) - (counts[p] ?? 0) !== rows) continue;
+        if (side === "probe" && parts.resident[p] === true) return false;
+        const run = side === "build" ? parts.build[p] : parts.probe[p];
+        if (run === undefined) return false;
+        await shared.files.append(run, bytes, rows);
+        shared.profile.spilledBytes = shared.files.written;
+        shared.profile.forwardedPages++;
+        return true;
+      }
+      return false;
+    } finally {
+      shared.resetKeys();
     }
-    return false;
   }
 
   /** Converts to partitioned mode, spilling every resident row. */
@@ -855,6 +869,7 @@ class Level {
       const counts = this.groupByPartition(ids, from + at, n, this.#dropsUnmatchedBuild());
       // `order` is overwritten by the next group: copy each partition's ids out first.
       const order = shared.order.slice(0, n);
+      shared.resetKeys();
       for (let p = 0; p < parts.fanout; p++) {
         const start = counts[p] ?? 0;
         const end = counts[p + 1] ?? 0;
@@ -950,6 +965,7 @@ class Level {
     );
     if (table === null) return false;
     this.table = table;
+    if (shared.kind === "mark") shared.resetKeys();
     shared.profile.table = table.kind;
     if (shared.kind === "right" || shared.kind === "full") {
       if (!this.#tableCharge.allocate(this.store.rows)) return this.#dropTable();
@@ -973,6 +989,8 @@ class Level {
     this.matched = null;
     this.groups?.close();
     this.groups = null;
+    this.groupScratch?.encoded?.close();
+    this.groupScratch?.encodedParts?.close();
     this.groupScratch = null;
     this.tNull = null;
     this.groupNulls = null;
@@ -1009,10 +1027,17 @@ class Level {
     const scratchBytes = KeyScratch.bytes(cLayout, BATCH_ROWS);
     if (!this.#tableCharge.allocate(scratchBytes)) return false;
     this.#extraBytes += scratchBytes;
-    const scratch = new KeyScratch(cLayout, BATCH_ROWS, {
-      allocate: () => true,
-      free: () => undefined,
-    });
+    const scratch = new KeyScratch(
+      cLayout,
+      BATCH_ROWS,
+      {
+        // Fixed arrays were prepaid above; variable encoders use real pool credit.
+        allocate: () => true,
+        free: () => undefined,
+      },
+      shared.pool,
+    );
+    this.groupScratch = scratch;
     const groups = yield* JoinTable.buildJob(
       this.store,
       shared.spec.buildKeys.slice(0, shared.correlated),
@@ -1025,7 +1050,10 @@ class Level {
     );
     if (groups === null) return false;
     this.groups = groups;
-    this.groupScratch = scratch;
+    if (shared.pool.owes) {
+      scratch.encoded?.writer.reset();
+      scratch.encodedParts?.writer.reset();
+    }
     return true;
   }
 
@@ -1321,6 +1349,7 @@ class Prober {
       const end = counts[p + 1] ?? 0;
       if (end > start && parts.resident[p] !== true) spilled.push([p, start, end]);
     }
+    shared.resetKeys();
     if (spilled.length === 0) return DONE;
     // Unmatchable rows were grouped into partition 0: exclude them from its spill.
     const order = shared.order.slice(0, active);
@@ -1374,6 +1403,7 @@ class Prober {
         else table.lookup(shared.scratch, count, shared.heads);
       }
     }
+    shared.resetKeys();
     shared.profile.probeRows += count;
     const kind = shared.kind;
     const residual = shared.spec.residual;
@@ -1532,13 +1562,10 @@ class Prober {
     // through emission instead of holding a second copy of an oversized value.
     const borrowProbe = n === 1 && batch.length === 1 && shared.pairProbe[0] === 0;
     let taken = borrowProbe ? 1 : probeOut.append(batch.columns, shared.pairProbe, 0, n);
-    const built = buildOut.appendFrom(
-      level.store,
-      shared.gatherColumns,
-      shared.pairBuild,
-      0,
-      taken,
-    );
+    const borrowBuild = taken === 1 && level.store.rows === 1 && shared.pairBuild[0] === 0;
+    const built = borrowBuild
+      ? 1
+      : buildOut.appendFrom(level.store, shared.gatherColumns, shared.pairBuild, 0, taken);
     if (built < taken) {
       probeOut.truncate(built);
       taken = built;
@@ -1554,7 +1581,12 @@ class Prober {
     const probeColumns = borrowProbe ? batch.columns : probeOut.vectors();
     const pairs: Batch = {
       length: taken,
-      columns: [...probeColumns, ...shared.matchedBuildColumns(probeColumns)],
+      columns: [
+        ...probeColumns,
+        ...(borrowBuild
+          ? shared.buildColumns.map((c) => level.store.chunk(c, 0))
+          : shared.matchedBuildColumns(probeColumns)),
+      ],
       selection: null,
     };
     const residual = shared.spec.residual;
@@ -1641,6 +1673,10 @@ class Prober {
         );
         if (done < resident.count) throw new RangeError("A mark join's group keys did not fit");
         yield* level.groups.lookupJob(level.groupScratch, resident.count, groupHeads, work, slice);
+        if (shared.pool.owes) {
+          level.groupScratch.encoded?.writer.reset();
+          level.groupScratch.encodedParts?.writer.reset();
+        }
       } else
         groupHeads.fill(
           store.rows > 0 && level.groups === null && correlated === 0 ? 1 : 0,
@@ -2504,12 +2540,16 @@ export class HashJoin {
       for (let i = 0; i < build.pages.length; i++) {
         const paced = shared.pace();
         if (paced !== null) await paced;
+        const ref = build.pages[i];
+        if (!ref) throw new Error("Missing build spill page");
+        await shared.need(3 * ref.length + 64 * 1024);
         const page = await shared.readPage(build, i);
         try {
           const { rows, columns } = await shared.decode(page, shared.buildTypes);
           shared.checkAborted();
           await sub.addPage(page.bytes, rows, columns);
         } finally {
+          shared.resetKeys();
           shared.releasePage(page);
         }
       }
@@ -2528,6 +2568,13 @@ export class HashJoin {
     for (let i = 0; i < probe.pages.length; i++) {
       const paced = shared.pace();
       if (paced !== null) await paced;
+      shared.reset(shared.probeOut);
+      shared.reset(shared.buildOut);
+      shared.reset(shared.buildPart);
+      shared.resetKeys();
+      const ref = probe.pages[i];
+      if (!ref) throw new Error("Missing probe spill page");
+      await shared.need((chunk === null ? 3 : 2) * ref.length + 64 * 1024);
       const page = await shared.readPage(probe, i);
       try {
         const { rows, columns } = await shared.decode(page, this.spec.probeTypes);
@@ -2553,7 +2600,24 @@ export class HashJoin {
    */
   async #chunked(level: number, build: SpilledRun, probe: SpilledRun): Promise<void> {
     const shared = this.#shared;
+    shared.resetKeys();
     const kind = this.spec.kind;
+    const groupLayout =
+      kind === "mark" && shared.correlated > 0
+        ? new KeyLayout(
+            shared.layout.types.slice(0, shared.correlated),
+            shared.layout.nullSafe.slice(0, shared.correlated),
+          )
+        : null;
+    const groupBytes =
+      kind === "mark"
+        ? 5 +
+          (groupLayout
+            ? KeyScratch.bytes(groupLayout, BATCH_ROWS) +
+              KeyScratch.bytes(groupLayout, 0) +
+              JoinTable.estimateBytes(groupLayout, 1)
+            : 0)
+        : 0;
     const words = Math.ceil(probe.rows / 32) + 1;
     const stateBytes = words * 8;
     // The state lives across every chunk: from the pool's idle staging room, else the grant.
@@ -2588,6 +2652,7 @@ export class HashJoin {
         };
         const sub = new Level(shared, level, false, chunkCharge);
         const loaded: Array<{ page: number; from: number; count: number }> = [];
+        let releaseStep: (() => void) | null = null;
         try {
           let reserved = false;
           while (page < build.pages.length) {
@@ -2610,7 +2675,11 @@ export class HashJoin {
                 retry =
                   sub.store.appendNeed(columns, row) +
                   JoinTable.estimateBytes(shared.layout, 1) +
-                  Math.max(bytes.charged, keep);
+                  (shared.layout.family === "enc" ? bytes.charged : 0) +
+                  (groupLayout?.family === "enc" ? bytes.charged : 0) +
+                  Math.max(bytes.charged, 2 * probePage, keep) +
+                  groupBytes +
+                  64 * 1024;
                 taken = 0;
               }
               if (taken > 0) loaded.push({ page, from: row, count: taken });
@@ -2624,6 +2693,7 @@ export class HashJoin {
               shared.releasePage(bytes);
             }
             if (retry > 0) {
+              releaseStep ??= shared.pool.pinStep();
               await shared.need(retry);
               reserved = true;
               continue;
@@ -2631,13 +2701,35 @@ export class HashJoin {
             if (full || (reserved && sub.store.rows > 0)) break;
           }
           // The chunk's table; give rows back (halving) while it does not fit.
-          // A single row cannot be halved: its small table uses actual pool capacity,
-          // then replay can obtain its own loan after the loading loan retires.
-          while (
-            !(await shared.sliced(
+          // A single row cannot be halved: its complete table/key/replay transition
+          // shares one pinned preflight through all intervening allocations/frees.
+          const buildTable = async () => {
+            if (sub.store.rows === 1) {
+              shared.resetKeys();
+              const key =
+                shared.layout.family === "enc"
+                  ? PageWriter.encodedBytes(
+                      shared.buildTypes.map((_, c) => sub.store.chunk(c, 0)),
+                      1,
+                    )
+                  : 0;
+              releaseStep ??= shared.pool.pinStep();
+              // The row may fit without using replay headroom while its encoded
+              // table does not. Preflight BEFORE either table/key allocation.
+              await shared.need(
+                JoinTable.estimateBytes(shared.layout, 1) +
+                  key +
+                  (groupLayout?.family === "enc" ? key : 0) +
+                  Math.max(key, 2 * probePage, keep) +
+                  groupBytes +
+                  64 * 1024,
+              );
+            }
+            return shared.sliced(
               sub.buildTableJob(sub.store.rows === 1 ? shared.pool : chunkCharge),
-            ))
-          ) {
+            );
+          };
+          while (!(await buildTable())) {
             if (sub.store.rows <= 1)
               throw new RangeError("A join chunk table could not be allocated for one row");
             let drop = sub.store.rows >> 1;
@@ -2653,6 +2745,7 @@ export class HashJoin {
               if (last.count === 0) loaded.pop();
             }
           }
+          shared.resetKeys();
           if (probe.rows > 0) await this.#replay(probe, sub, chunk);
           await this.#emitUnmatchedBuild(sub);
         } finally {
@@ -2660,6 +2753,8 @@ export class HashJoin {
           shared.probeOut.reset(true);
           shared.buildOut.reset(true);
           shared.buildPart.reset(true);
+          shared.resetKeys();
+          releaseStep?.();
           shared.pool.settle();
         }
       }
@@ -2735,6 +2830,19 @@ export class HashJoin {
     if (matched === null) return;
     const shared = this.#shared;
     const store = level.store;
+    if (store.rows === 1) {
+      if (matched[0] !== 1) {
+        const columns = [
+          ...shared.probeNulls.map((vector) => withLength(vector, 1)),
+          ...shared.buildColumns.map((c) => store.chunk(c, 0)),
+        ];
+        if (shared.emit({ length: 1, columns, selection: null }) === BLOCKED) {
+          await shared.waitDownstream();
+          shared.checkAborted();
+        }
+      }
+      return;
+    }
     const ids = shared.pairBuild;
     let n = 0;
     const flush = async () => {

@@ -10,6 +10,12 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported rebuild now reserves complete EXCEPT and hash-join progress steps before
+borrowing. Large keys, representative rows and spill pages no longer ask for a second loan
+while retaining the first under competing memory pressure. Wide spill rows borrow their input
+payload, and single-row joins borrow build outputs. Shipped SQL behavior, public APIs and stored
+formats are unchanged; no migration is needed.
+
 The unexported rebuild now executes text-to-JSONB casts, JSONB extraction and exact canonical
 JSONB text, including decimal scale, duplicate keys and Unicode validation. Invalid documents
 keep PostgreSQL’s error order, including competing Unicode, token and numeric range errors. Expanding values use
