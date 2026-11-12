@@ -3843,3 +3843,16 @@ export const QUERY_ROOT_VOLUME_REACH = [
   "exact callback work",
   "volume drift refusal",
 ] as const;
+
+export const EXTENT_PAIR_CODEC_REACH = [
+  "distinct offsets",
+  "shared offset",
+  "mixed offsets",
+  "wide safe integers",
+  "small integers",
+  "zero length",
+  "promoted set remembers every length",
+  "exact duplicate refusal",
+  "charge refusal before parse",
+  "zero charges after failure",
+] as const;
