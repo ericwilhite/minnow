@@ -3766,6 +3766,44 @@ export const RETAINING_TOPK_SQL_CUT_REACH = [
   "zero resources",
 ] as const;
 
+export const NATIVE_BENCH_IMAGE_IO_REACH = [
+  "empty file",
+  "one chunk",
+  "chunk tail",
+  "exact restore",
+  "immutable image",
+  "corrupt refusal",
+  "retry",
+  "cancel cleanup",
+  "capacity retained",
+  "borrowed owner live",
+] as const;
+export const NATIVE_BENCH_IMAGE_SQL_REACH = [
+  "NULL validity",
+  "dictionary text",
+  "UTF8",
+  "signed zero",
+  "ordinary reopen",
+  "continued writes",
+] as const;
+
+export const INDEPENDENT_CPU_REACH = [
+  "fresh process per pair",
+  "one live VM",
+  "AB startup",
+  "BA startup",
+  "roots hook",
+  "sizing hook",
+  "all-thread CPU",
+  "drained close",
+  "before and after verification",
+  "identity refusal",
+  "fingerprint refusal",
+  "post-run refusal",
+  "active cancellation",
+  "setup cancellation",
+] as const;
+
 /** Query roots survive sizing handoff without retaining producer grants. */
 export const QUERY_ROOT_REUSE_REACH = [
   "sizing and execution share validated root facts",
@@ -3784,4 +3822,24 @@ export const QUERY_ROOT_OWNERSHIP_REACH = [
   "idle eviction reparses safely",
   "pending cancellation drains",
   "zero owner charges",
+] as const;
+
+export const QUERY_ROOT_VM_REACH = [
+  "eighteen distinct real workers",
+  "reused worker refusal",
+  "forged arithmetic refusal",
+  "AB build startup",
+  "BA build startup",
+  "independent fixture restore",
+  "exact row volume",
+  "all workers drained",
+] as const;
+
+export const QUERY_ROOT_VOLUME_REACH = [
+  "one lifetime",
+  "many lifetimes",
+  "empty result",
+  "nonempty result",
+  "exact callback work",
+  "volume drift refusal",
 ] as const;

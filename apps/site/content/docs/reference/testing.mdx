@@ -1368,15 +1368,23 @@ and table identity, complete-root fallback, eviction and cancelled in-flight rea
 charges after cleanup.
 `scripts/query-root-component.mts` isolates a two-pass sizing/scan root handoff over synthetic
 wide metadata. `scripts/query-root-bench.mts --baseline <frozen-root> --candidate <frozen-root>`
-compares real executor frames from complete, separately built cores. Both use nine adjacent
-AB/BA CPU pairs and record wall time and host load; fixture creation and output validation
-are outside the timed region. The whole-query runner uses the committed wide generator,
-checks output digests before and after timing, and includes DISTINCT and a window guard by
-default. Add `--only scan_plain3 --warmups 10 --repeats 10` for ten fixed warmups
-per arm and ten complete query lifetimes per observation. The worker measures one CPU interval
-around those queries, records raw totals, and checks completed-query and row counts before
-normalizing per query. Warmups and source hashes are recorded separately. These are loaded-host
-diagnostics, not quiet-host Gate A measurements.
+compares the real three-column executor scan from complete, separately built cores. Both use
+B7's shared independent-process runner: every arm in every one of nine AB/BA pairs starts a
+fresh process, and build start order alternates too. One process closes before the next starts.
+The whole scan restores the same immutable native file image before opening the ordinary core;
+file hashes, lengths and retained allocation capacities are checked. Image creation, restore,
+verification and IPC are outside CPU timing. Each sample warms ten complete queries, then
+measures ten complete lifetimes under one all-thread process CPU clock, including natural GC.
+Raw totals and exact completed-query/row volumes are recorded before per-query normalization.
+
+Run an identical-build `--aa` control first. It must show neither a gain nor a regression by
+the paired rule; A/B requires its matching `--aa-report <results.json>`. The control must match
+the candidate revision, source hashes, row count, warmup/repeat policy and native image hash.
+Use the capture run's `input.json` with `--bundle` in both whole-scan campaigns. Component runs
+use the same protocol without a native image. `--smoke` is for small lifecycle tests only;
+its timing cannot qualify an A/B campaign. Earlier persistent-worker results are superseded
+because alternating execution order did not balance worker identity. These native loaded-host
+diagnostics are separate from quiet-host Gate A and the owner/MessagePort export transport.
 
 The scan reuses verified header facts while the endpoint pages stay the same. Loading,
 releasing or materializing a page invalidates those facts. Exact-range varlen byte sizes
