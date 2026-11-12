@@ -30,6 +30,23 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+/** Bulk sealed blocks preserve the ordinary run encoder's complete native output. */
+export const WRITE_DIRECT_RUN_STATES = [
+  "single",
+  "chains",
+  "filter",
+  "partition",
+  "long",
+  "empty key",
+  "wide row id",
+  "two-byte length",
+  "batch callback",
+  "per-row fallback",
+  "mixed widths",
+  "partial fallback",
+  "filtered batch",
+] as const;
+
 /** A 64-bit key table's half-full resize is funded before assignment. */
 export const INT64_GROWTH_REACH = [
   "funded transition",

@@ -36,6 +36,7 @@
  * drops the tombstones left (no older put can exist below it).
  */
 import type { BlobRef, RunRef } from "../format/manifest.js";
+import type { SingleEntries } from "./key-hash.js";
 import { hashKey } from "./key-hashes.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { ParseBudgetError } from "../format/manifest-codec.js";
@@ -51,6 +52,7 @@ export const PARTITION_BLOCKS = 256;
 const BLOOM_BITS_PER_KEY = 10;
 const BLOOM_HASHES = 7;
 const MAX_INDEX_BYTES = 1024 * 1024;
+const EMPTY_KEY = new Uint8Array(0);
 
 export interface RunEntry {
   readonly rowId: number;
@@ -113,10 +115,17 @@ export class RunEncoder {
   /** The block being filled: entries, and each entry's start. */
   readonly #block = new ByteWriter(BLOCK_BYTES + 512);
   readonly #offsets = new Uint16Array(BLOCK_BYTES);
+  // Reuse the ordinary offsets' backing store for buffered source slots, never per-row objects.
+  #directEntries: Int32Array | null = null;
+  #directData: SingleEntries | null = null;
+  #directCount = 0;
+  #directBytes = 0;
+  #directDisabled = true;
   #count = 0;
   /** The pending entry (held back so a put and its tombstone can cancel). */
-  #pendingKey = new Uint8Array(64);
+  #pendingKey: Uint8Array = new Uint8Array(64);
   #pendingLength = 0;
+  #pendingStart = 0;
   #pendingRowId = 0;
   #pendingTombstone = false;
   #hasPending = false;
@@ -125,17 +134,24 @@ export class RunEncoder {
   readonly #computed = { first: 0, second: 0 };
   #hasComputed = false;
   /** The last emitted key, and whether it is in the block being filled. */
-  #lastKey = new Uint8Array(64);
+  #lastKey: Uint8Array = new Uint8Array(64);
   #lastLength = 0;
+  #lastStart = 0;
   #lastInBlock = false;
   #entryCount = 0;
   #minKey: Uint8Array | null = null;
   /** Entries a put/tombstone pair cancelled (both counted). */
   cancelled = 0;
 
-  constructor(emit: (part: Uint8Array) => void, dropTombstones = false) {
+  constructor(
+    emit: (part: Uint8Array) => void,
+    dropTombstones = false,
+    readonly borrowKeys = false,
+  ) {
     this.#emit = emit;
     this.#dropTombstones = dropTombstones;
+    this.#directDisabled = !borrowKeys;
+    if (borrowKeys) this.#directEntries = new Int32Array(this.#offsets.buffer);
   }
 
   get entryCount(): number {
@@ -157,7 +173,14 @@ export class RunEncoder {
     if (!this.#hasPending) return true;
     return (
       rowId !== this.#pendingRowId ||
-      compareBytes(bytes, start, end, this.#pendingKey, 0, this.#pendingLength) !== 0
+      compareBytes(
+        bytes,
+        start,
+        end,
+        this.#pendingKey,
+        this.#pendingStart,
+        this.#pendingStart + this.#pendingLength,
+      ) !== 0
     );
   }
 
@@ -171,13 +194,21 @@ export class RunEncoder {
     hash?: number,
     bloomHash?: number,
   ): void {
+    this.#disableDirect();
     const length = end - start;
     if (this.#hasPending) {
       if (
         this.#pendingRowId === rowId &&
         this.#pendingTombstone !== tombstone &&
         this.#pendingLength === length &&
-        compareBytes(bytes, start, end, this.#pendingKey, 0, length) === 0
+        compareBytes(
+          bytes,
+          start,
+          end,
+          this.#pendingKey,
+          this.#pendingStart,
+          this.#pendingStart + length,
+        ) === 0
       ) {
         this.#hasPending = false; // a put and its tombstone cancel
         this.cancelled += 2;
@@ -185,9 +216,14 @@ export class RunEncoder {
       }
       this.#emitPending();
     }
-    if (length > this.#pendingKey.length)
-      this.#pendingKey = new Uint8Array(Math.max(length, this.#pendingKey.length * 2));
-    copyRange(this.#pendingKey, 0, bytes, start, end);
+    if (this.borrowKeys) {
+      this.#pendingKey = bytes;
+      this.#pendingStart = start;
+    } else {
+      if (length > this.#pendingKey.length)
+        this.#pendingKey = new Uint8Array(Math.max(length, this.#pendingKey.length * 2));
+      copyRange(this.#pendingKey, 0, bytes, start, end);
+    }
     this.#pendingLength = length;
     this.#pendingRowId = rowId;
     this.#pendingTombstone = tombstone;
@@ -196,11 +232,215 @@ export class RunEncoder {
     this.#hasPending = true;
   }
 
+  /** Strictly distinct next key; input remains immutable and owned until finish/close. */
+  addUniqueRange(
+    bytes: Uint8Array,
+    start: number,
+    end: number,
+    rowId: number,
+    hash: number,
+    bloomHash: number,
+  ): void {
+    this.#disableDirect();
+    if (this.#hasPending) this.#emitPending();
+    this.#writeEntry(bytes, start, end - start, rowId, false, hash, bloomHash, true);
+  }
+
+  /** Immutable, sorted single-chain slots; returns at the first multi-entry chain. */
+  addSingleBatch(
+    data: SingleEntries,
+    from: number,
+    to: number,
+    bound: number,
+    keep: ((rowId: number, tombstone: boolean) => boolean) | null = null,
+  ): number {
+    if (this.#directDisabled) return this.#singleFallback(data, from, to, bound, keep);
+    if (this.#directData !== null && this.#directData !== data) {
+      this.#disableDirect();
+      return this.#singleFallback(data, from, to, bound, keep);
+    }
+    this.#directData = data;
+    const positions = need(this.#directEntries);
+    for (let at = from; at < to; at++) {
+      const slot = data.order === null ? at : (data.order[at] ?? 0);
+      const head = data.heads[slot] ?? -1;
+      if (head < 0) continue;
+      if ((data.next[head] ?? -1) >= 0) return at;
+      if ((data.seqs[head] ?? 0) > bound) continue;
+      const rowId = data.rowIds[head] ?? 0,
+        tombstone = data.tombstones[head] === 1;
+      if (keep !== null && !keep(rowId, tombstone)) continue;
+      if (tombstone) {
+        this.#disableDirect();
+        this.add(
+          data.arena,
+          data.starts[slot] ?? 0,
+          data.ends[slot] ?? 0,
+          rowId,
+          true,
+          data.hashes[slot] ?? 0,
+          data.bloomHashes[slot] ?? 0,
+        );
+        return this.#singleFallback(data, at + 1, to, bound, keep);
+      }
+      const length = (data.ends[slot] ?? 0) - (data.starts[slot] ?? 0);
+      if (length > BLOCK_BYTES / 2) throw new RangeError("An index key is longer than 2 KiB");
+      if (
+        this.#directCount > 0 &&
+        (this.#directBytes + entrySize(length) + (this.#directCount + 1) * 2 > BLOCK_BYTES ||
+          this.#directCount >= 0xfff0)
+      )
+        this.#flushDirectBlock();
+      positions[this.#directCount++] = slot;
+      this.#directBytes += (length < 0x80 ? 1 : 2) + length + 7;
+    }
+    return to;
+  }
+
+  #singleFallback(
+    data: SingleEntries,
+    from: number,
+    to: number,
+    bound: number,
+    keep: ((rowId: number, tombstone: boolean) => boolean) | null,
+  ): number {
+    for (let at = from; at < to; at++) {
+      const slot = data.order === null ? at : (data.order[at] ?? 0);
+      const head = data.heads[slot] ?? -1;
+      if (head < 0) continue;
+      if ((data.next[head] ?? -1) >= 0) return at;
+      if ((data.seqs[head] ?? 0) > bound) continue;
+      const start = data.starts[slot] ?? 0,
+        end = data.ends[slot] ?? 0;
+      const rowId = data.rowIds[head] ?? 0,
+        hash = data.hashes[slot] ?? 0,
+        bloomHash = data.bloomHashes[slot] ?? 0;
+      const tombstone = data.tombstones[head] === 1;
+      if (keep !== null && !keep(rowId, tombstone)) continue;
+      if (tombstone) this.add(data.arena, start, end, rowId, true, hash, bloomHash);
+      else this.addUniqueRange(data.arena, start, end, rowId, hash, bloomHash);
+    }
+    return to;
+  }
+
+  #disableDirect(): void {
+    if (this.#directDisabled) return;
+    this.#directDisabled = true;
+    const data = this.#directData,
+      count = this.#directCount;
+    this.#directCount = 0;
+    this.#directBytes = 0;
+    if (data !== null)
+      for (let at = 0; at < count; at++) {
+        // Ordinary offsets overwrite only positions already consumed in this forward walk.
+        const slot = need(this.#directEntries)[at] ?? 0,
+          head = data.heads[slot] ?? -1;
+        const start = data.starts[slot] ?? 0;
+        this.#writeEntry(
+          data.arena,
+          start,
+          (data.ends[slot] ?? 0) - start,
+          data.rowIds[head] ?? 0,
+          false,
+          data.hashes[slot] ?? 0,
+          data.bloomHashes[slot] ?? 0,
+          true,
+        );
+      }
+    this.#directData = null;
+  }
+
+  #flushDirectBlock(): void {
+    const count = this.#directCount;
+    if (count === 0) return;
+    const data = need(this.#directData),
+      positions = need(this.#directEntries);
+    const header = 2 + count * 2;
+    const out = new Uint8Array(header + this.#directBytes),
+      view = new DataView(out.buffer);
+    view.setUint16(0, count, true);
+    const first = positions[0] ?? 0,
+      firstStart = data.starts[first] ?? 0,
+      firstEnd = data.ends[first] ?? 0;
+    this.#fences.varuint(firstEnd - firstStart);
+    this.#fences.rawRange(data.arena, firstStart, firstEnd);
+    this.#minKey ??= data.arena.slice(firstStart, firstEnd);
+    const needed = this.#hashCount + count * 2;
+    if (needed > this.#hashes.length) {
+      let capacity = this.#hashes.length * 2;
+      while (capacity < needed) capacity *= 2;
+      const grown = new Uint32Array(capacity);
+      grown.set(this.#hashes);
+      this.#hashes = grown;
+    }
+    let cursor = header;
+    for (let at = 0; at < count; at++) {
+      const slot = positions[at] ?? 0,
+        head = data.heads[slot] ?? -1;
+      const start = data.starts[slot] ?? 0,
+        end = data.ends[slot] ?? 0,
+        length = end - start;
+      view.setUint16(2 + at * 2, cursor, true);
+      if (length < 0x80) out[cursor++] = length;
+      else {
+        out[cursor++] = (length & 0x7f) | 0x80;
+        out[cursor++] = length >>> 7;
+      }
+      copyRange(out, cursor, data.arena, start, end);
+      cursor += length;
+      const rowId = data.rowIds[head] ?? 0;
+      view.setUint32(cursor, rowId % 2 ** 32, true);
+      view.setUint16(cursor + 4, Math.floor(rowId / 2 ** 32), true);
+      out[cursor + 6] = 0;
+      cursor += 7;
+      this.#hashes[this.#hashCount++] = (data.hashes[slot] ?? 0) >>> 0;
+      this.#hashes[this.#hashCount++] = ((data.bloomHashes[slot] ?? 0) | 1) >>> 0;
+    }
+    const last = positions[count - 1] ?? 0;
+    this.#lastKey = data.arena;
+    this.#lastStart = data.starts[last] ?? 0;
+    this.#lastLength = (data.ends[last] ?? 0) - this.#lastStart;
+    this.#computed.first = data.hashes[last] ?? 0;
+    this.#computed.second = data.bloomHashes[last] ?? 0;
+    this.#hasComputed = true;
+    this.#lastInBlock = false;
+    this.#index.varuint(this.#offset);
+    this.#index.varuint(out.length);
+    this.#index.u32(xxHash32(out));
+    this.#put(out);
+    this.#entryCount += count;
+    this.#blockCount++;
+    this.#directCount = 0;
+    this.#directBytes = 0;
+    this.#blocksInPartition++;
+    if (this.#blocksInPartition === PARTITION_BLOCKS) this.#closePartition();
+  }
+
   #emitPending(): void {
     this.#hasPending = false;
-    if (this.#pendingTombstone && this.#dropTombstones) return;
-    const key = this.#pendingKey;
-    const length = this.#pendingLength;
+    this.#writeEntry(
+      this.#pendingKey,
+      this.#pendingStart,
+      this.#pendingLength,
+      this.#pendingRowId,
+      this.#pendingTombstone,
+      this.#pendingHash,
+      this.#pendingBloomHash,
+      false,
+    );
+  }
+
+  #writeEntry(
+    key: Uint8Array,
+    start: number,
+    length: number,
+    rowId: number,
+    tombstone: boolean,
+    hash: number | undefined,
+    bloomHash: number | undefined,
+    distinct: boolean,
+  ): void {
+    if (tombstone && this.#dropTombstones) return;
     if (length > BLOCK_BYTES / 2) throw new RangeError("An index key is longer than 2 KiB");
     if (
       this.#count > 0 &&
@@ -209,10 +449,19 @@ export class RunEncoder {
     )
       this.#closeBlock();
     const same =
-      this.#lastLength === length && compareBytes(key, 0, length, this.#lastKey, 0, length) === 0;
+      !distinct &&
+      this.#lastLength === length &&
+      compareBytes(
+        key,
+        start,
+        start + length,
+        this.#lastKey,
+        this.#lastStart,
+        this.#lastStart + length,
+      ) === 0;
     if (this.#count === 0) {
       this.#fences.varuint(length);
-      this.#fences.rawRange(key, 0, length);
+      this.#fences.rawRange(key, start, start + length);
     }
     if (!(this.#lastInBlock && same)) {
       if (this.#hashCount + 2 > this.#hashes.length) {
@@ -223,10 +472,10 @@ export class RunEncoder {
       // The delta supplies canonical hashes. Disk merges compute the pair once per distinct
       // emitted key, then reuse it when the same key crosses a block or Bloom partition.
       if (!same || !this.#hasComputed) {
-        if (this.#pendingHash !== undefined && this.#pendingBloomHash !== undefined) {
-          this.#computed.first = this.#pendingHash;
-          this.#computed.second = this.#pendingBloomHash;
-        } else hashKey(key, 0, length, this.#computed);
+        if (hash !== undefined && bloomHash !== undefined) {
+          this.#computed.first = hash;
+          this.#computed.second = bloomHash;
+        } else hashKey(key, start, start + length, this.#computed);
         this.#hasComputed = true;
       }
       this.#hashes[this.#hashCount++] = this.#computed.first >>> 0;
@@ -234,14 +483,18 @@ export class RunEncoder {
     }
     this.#lastInBlock = true;
     if (!same) {
-      if (length > this.#lastKey.length)
-        this.#lastKey = new Uint8Array(Math.max(length, this.#lastKey.length * 2));
-      copyRange(this.#lastKey, 0, key, 0, length);
+      if (this.borrowKeys) {
+        this.#lastKey = key;
+        this.#lastStart = start;
+      } else {
+        if (length > this.#lastKey.length)
+          this.#lastKey = new Uint8Array(Math.max(length, this.#lastKey.length * 2));
+        copyRange(this.#lastKey, 0, key, start, start + length);
+      }
       this.#lastLength = length;
     }
     const block = this.#block;
     this.#offsets[this.#count++] = block.length;
-    const rowId = this.#pendingRowId;
     // One reserve, then the entry's bytes in place: varuint length (a key is ≤ 2 KiB, so one
     // or two bytes), key, u32 row id low, u16 row id high, flags.
     block.ensure(length + 9);
@@ -252,7 +505,7 @@ export class RunEncoder {
       bytes[at++] = (length & 0x7f) | 0x80;
       bytes[at++] = length >>> 7;
     }
-    copyRange(bytes, at, key, 0, length);
+    copyRange(bytes, at, key, start, start + length);
     at += length;
     const low = rowId % 2 ** 32;
     const high = Math.floor(rowId / 2 ** 32);
@@ -262,10 +515,10 @@ export class RunEncoder {
     bytes[at + 3] = (low >>> 24) & 0xff;
     bytes[at + 4] = high & 0xff;
     bytes[at + 5] = (high >>> 8) & 0xff;
-    bytes[at + 6] = this.#pendingTombstone ? 1 : 0;
+    bytes[at + 6] = tombstone ? 1 : 0;
     block.length = at + 7;
     this.#entryCount += 1;
-    this.#minKey ??= key.slice(0, length);
+    this.#minKey ??= key.slice(start, start + length);
   }
 
   #closeBlock(): void {
@@ -312,6 +565,7 @@ export class RunEncoder {
    * three blobs). Null when the run holds no entry (nothing at all was emitted then).
    */
   finish(): RunSummary | null {
+    this.#flushDirectBlock();
     if (this.#hasPending) this.#emitPending();
     this.#closeBlock();
     this.#closePartition();
@@ -335,8 +589,19 @@ export class RunEncoder {
     return {
       entryCount: this.#entryCount,
       minKey,
-      maxKey: this.#lastKey.slice(0, this.#lastLength),
+      maxKey: this.#lastKey.slice(this.#lastStart, this.#lastStart + this.#lastLength),
     };
+  }
+  /** Drop borrowed arena references before their owner releases its charge. Not resumable. */
+  close(): void {
+    if (this.borrowKeys) {
+      this.#pendingKey = EMPTY_KEY;
+      this.#lastKey = EMPTY_KEY;
+      this.#hasPending = false;
+      this.#directData = null;
+      this.#directCount = 0;
+      this.#directBytes = 0;
+    }
   }
 }
 
@@ -345,13 +610,39 @@ export class RunBuilder {
   readonly #parts: Uint8Array[] = [];
   readonly #encoder: RunEncoder;
 
-  constructor(dropTombstones = false) {
-    this.#encoder = new RunEncoder((part) => this.#parts.push(part), dropTombstones);
+  constructor(dropTombstones = false, borrowKeys = false) {
+    this.#encoder = new RunEncoder((part) => this.#parts.push(part), dropTombstones, borrowKeys);
   }
 
   /** Adds one entry; `key` is copied. Entries must come in (key, rowId) order. */
   add(key: Uint8Array, rowId: number, tombstone: boolean): void {
     this.#encoder.add(key, 0, key.length, rowId, tombstone);
+  }
+
+  addSingleBatch(
+    data: SingleEntries,
+    from: number,
+    to: number,
+    bound: number,
+    keep: ((rowId: number, tombstone: boolean) => boolean) | null = null,
+  ): number {
+    return this.#encoder.addSingleBatch(data, from, to, bound, keep);
+  }
+
+  /** Caller retains immutable input to finish/close; this key occurs only once in the run. */
+  addUniqueRange(
+    bytes: Uint8Array,
+    start: number,
+    end: number,
+    rowId: number,
+    hash: number,
+    bloomHash: number,
+  ): void {
+    this.#encoder.addUniqueRange(bytes, start, end, rowId, hash, bloomHash);
+  }
+
+  close(): void {
+    this.#encoder.close();
   }
 
   /** `add` of the key `bytes[start … end)`. Optional hashes are raw XXH32 with seeds 0 and KEY_BLOOM_SEED. */
@@ -373,9 +664,12 @@ export class RunBuilder {
 
   /** The finished run, or null when nothing remains. */
   finish(): EncodedRun | null {
-    const summary = this.#encoder.finish();
-    if (summary === null) return null;
-    return { parts: this.#parts, ...summary };
+    try {
+      const summary = this.#encoder.finish();
+      return summary === null ? null : { parts: this.#parts, ...summary };
+    } finally {
+      this.#encoder.close();
+    }
   }
 }
 

@@ -20,7 +20,7 @@ import {
   MEMTABLE_ROWS,
   type StagedPart,
 } from "./memtable.js";
-import type { KeyDelta } from "./key-hash.js";
+import type { KeyDelta, DeltaVisitor } from "./key-hash.js";
 
 /**
  * `openWritePath`'s input plus internal tuning for tests (never a public dial): smaller memtables
@@ -4661,17 +4661,37 @@ function encodeDelta(
   check: (() => void) | null = null,
   workspace?: ByteBudget,
 ): MaybePromise<EncodedRun | null> {
-  const builder = new RunBuilder();
-  const pending = delta.forEachSorted(
-    bound,
-    (arena, start, end, rowId, tombstone, hash, bloomHash) => {
-      builder.addRange(arena, start, end, rowId, tombstone, hash, bloomHash);
-    },
-    keep,
-    check,
-    workspace,
-  );
-  return pending instanceof Promise ? pending.then(() => builder.finish()) : builder.finish();
+  const builder = new RunBuilder(false, true);
+  const release = delta.retain();
+  const close = () => {
+    builder.close();
+    release();
+  };
+  const finish = () => {
+    try {
+      return builder.finish();
+    } finally {
+      close();
+    }
+  };
+  try {
+    const visit: DeltaVisitor = (arena, start, end, rowId, tombstone, hash, bloomHash, single) => {
+      if (single && !tombstone) builder.addUniqueRange(arena, start, end, rowId, hash, bloomHash);
+      else builder.addRange(arena, start, end, rowId, tombstone, hash, bloomHash);
+    };
+    visit.singles = (data, from, to, maximum, predicate) =>
+      builder.addSingleBatch(data, from, to, maximum, predicate);
+    const pending = delta.forEachSorted(bound, visit, keep, check, workspace);
+    return pending instanceof Promise
+      ? pending.then(finish, (error: unknown) => {
+          close();
+          throw error;
+        })
+      : finish();
+  } catch (error) {
+    close();
+    throw error;
+  }
 }
 
 /** Adds `extents` to a publication's retirements, each at most once. */

@@ -20,7 +20,7 @@ import { charged, copyRange, MemtableMemoryError, UNCHARGED, type Charge } from 
 
 import { OrderedEntries } from "./ordered-entries.js";
 
-type DeltaVisitor = (
+export type DeltaVisitor = ((
   arena: Uint8Array,
   start: number,
   end: number,
@@ -28,7 +28,31 @@ type DeltaVisitor = (
   tombstone: boolean,
   hash: number,
   bloomHash: number,
-) => void;
+  single: boolean,
+) => void) & {
+  singles?: (
+    data: SingleEntries,
+    from: number,
+    to: number,
+    bound: number,
+    keep: KeepEntry | null,
+  ) => number;
+};
+
+/** Borrowed immutable arrays; the traversal and encodeDelta retain the delta's ownership. */
+export interface SingleEntries {
+  readonly arena: Uint8Array;
+  readonly starts: Int32Array;
+  readonly ends: Int32Array;
+  readonly heads: Int32Array;
+  readonly next: Int32Array;
+  readonly seqs: Float64Array;
+  readonly rowIds: Float64Array;
+  readonly tombstones: Uint8Array;
+  readonly hashes: Int32Array;
+  readonly bloomHashes: Int32Array;
+  readonly order: Int32Array | null;
+}
 type KeepEntry = (rowId: number, tombstone: boolean) => boolean;
 
 /** Bytes of a fresh delta's arrays (slots 64×4, 5 key arrays 16×4, arena 256, entries 16×(8+8+1+4+4)). */
@@ -466,11 +490,27 @@ export class KeyDelta {
       const next = this.#next;
       const compareEntries = (a: number, b: number) =>
         (rowIds[a] ?? 0) - (rowIds[b] ?? 0) || (tombstones[a] ?? 0) - (tombstones[b] ?? 0);
+      const singles: SingleEntries | null =
+        visit.singles !== undefined
+          ? {
+              arena,
+              starts,
+              ends,
+              heads: this.#head,
+              next,
+              seqs,
+              rowIds,
+              tombstones,
+              hashes: this.#hashes,
+              bloomHashes: this.#bloomHashes,
+              order,
+            }
+          : null;
       let scratch: Int32Array = NO_ENTRIES;
       for (let slot = 0; slot < order.length;) {
         yield* checkpoint(check);
         const limit = Math.min(slot + 128, order.length);
-        slot = this.#emitSingles(order, slot, limit, bound, visit, keep);
+        slot = this.#emitSingles(order, slot, limit, bound, visit, keep, singles);
         if (slot === limit) continue;
         const keySlot = order[slot++] ?? 0;
         const start = starts[keySlot] ?? 0;
@@ -549,7 +589,10 @@ export class KeyDelta {
     bound: number,
     visit: DeltaVisitor,
     keep: KeepEntry | null,
+    singles: SingleEntries | null,
   ): number {
+    if (singles !== null && visit.singles !== undefined)
+      return visit.singles(singles, from, to, bound, keep);
     const arena = this.#arena,
       starts = this.#keyStart,
       ends = this.#keyEnd,
@@ -575,6 +618,7 @@ export class KeyDelta {
           tombstone,
           this.keyHash(slot),
           this.keyBloomHash(slot),
+          true,
         );
     }
     return to;
@@ -711,7 +755,7 @@ function emitEntries(
   const step = reverse ? -1 : 1;
   for (let k = from; k < to; k++, at += step) {
     const entry = entries[at] ?? 0;
-    visit(arena, start, end, rowIds[entry] ?? 0, tombstones[entry] === 1, hash, bloomHash);
+    visit(arena, start, end, rowIds[entry] ?? 0, tombstones[entry] === 1, hash, bloomHash, false);
   }
 }
 
