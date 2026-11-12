@@ -4413,6 +4413,10 @@ export const STAR_BOUND_REACH = [
 ] as const;
 
 export const STAR_SQL_REACH = [
+  "one-dimension",
+  "two-dimensions",
+  "attribute-boolean",
+  "left-fallback",
   "stored",
   "single-key",
   "memory",

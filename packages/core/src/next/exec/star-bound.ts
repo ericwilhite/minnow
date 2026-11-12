@@ -76,6 +76,8 @@ export function terminalStar(plan: PhysicalPlan, aggregate: number): boolean {
 export function starPredicate(expr: ScalarExpr | null): boolean {
   if (expr === null) return true;
   if (expr.op === "column" || expr.op === "literal") return true;
+  if (expr.op === "and" || expr.op === "or") return expr.args.every(starPredicate);
+  if (expr.op === "not" || expr.op === "isNull") return starPredicate(expr.arg);
   if (expr.op === "compare")
     return expr.collation === null && starPredicate(expr.left) && starPredicate(expr.right);
   if (expr.op === "distinctFrom") return starPredicate(expr.left) && starPredicate(expr.right);

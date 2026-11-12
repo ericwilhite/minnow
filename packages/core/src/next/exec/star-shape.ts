@@ -1,4 +1,4 @@
-/** Private representation recipe for a direct three-inner-join/grouped-float pipeline.
+/** Private representation recipe for a direct one-to-three-inner-join/grouped-float pipeline.
  * It changes equality-class representation, never join order or a transition expression.
  * Scans still evaluate their original predicates before the caller encodes their output.
  * Unknown/computed/residual/volatile shapes keep the original plan before input opens.
@@ -107,7 +107,7 @@ export function starDictionaryShape(rel: Aggregate, volatile: boolean): StarDict
     return output;
   };
   const input = visit(rel.input);
-  if (!input || joins !== 3 || scans.length !== 4) return null;
+  if (!input || joins < 1 || joins > 3 || scans.length !== joins + 1) return null;
   const bookIds = new Map<Origin, number>(),
     sources: Origin[][] = [];
   for (const scan of scans)
