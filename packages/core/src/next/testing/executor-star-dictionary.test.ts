@@ -14,6 +14,7 @@ const literal = (v: string | number | boolean | null): string =>
   v === null ? "NULL" : typeof v === "string" ? `'${v.replaceAll("'", "''")}'` : String(v);
 const modes = [
   "stored",
+  "single-key",
   "memory",
   "mixed",
   "non-PK",
@@ -105,13 +106,14 @@ it.each(seedsFor("next-executor-star-dictionary", [0xb76b, 0xb76c]))(
               mode === "memory" ? "f_memory" : mode === "mixed" ? "f_mixed" : "f_stored";
             const a = mode === "non-PK" ? "a_plain" : mode === "composite" ? "a_composite" : "a",
               c = mode === "wide" ? "c_wide" : "c";
+            const single = mode === "single-key";
             const group = "a.t",
               value = mode === "computed" ? "f.v+0.25" : "f.v";
-            const sql = `SELECT ${group} AS x,b.t AS y,c.label AS z,COUNT(*) AS n,SUM(${value}) AS s FROM ${table} f
+            const sql = `SELECT ${group} AS x${single ? "" : ",b.t AS y,c.label AS z"},COUNT(*) AS n,SUM(${value}) AS s FROM ${table} f
             JOIN ${a} a ON a.k=f.ka JOIN b ON b.k=f.kb JOIN ${c} c ON c.k=f.kc
             WHERE a.active AND b.weight>1${mode === "wide" ? " AND f.v<1" : mode === "parameter" ? " AND f.v>$1" : ""}
-            GROUP BY ${group},b.t,c.label ORDER BY ${sumOrder ? "s DESC," : ""}x ${descending ? "DESC" : "ASC"} NULLS FIRST,y,z
-            LIMIT ${String(mode === "zero" ? 0 : 7)} OFFSET 1`;
+            GROUP BY ${group}${single ? "" : ",b.t,c.label"} ORDER BY ${sumOrder ? "s DESC," : ""}x ${descending ? "DESC" : "ASC"} NULLS FIRST${single ? "" : ",y,z"}
+            LIMIT ${String(mode === "zero" ? 0 : single ? 2 : 7)} OFFSET 1`;
             const args = mode === "parameter" ? [0.5] : [];
             encode.mockClear();
             core.executor.prepare = candidate.prepare.bind(candidate);
@@ -119,7 +121,8 @@ it.each(seedsFor("next-executor-star-dictionary", [0xb76b, 0xb76c]))(
             if (result.kind !== "rows" || !("batches" in result))
               throw new Error("Missing star rows");
             const rows = canonical(oracleRows(result));
-            const selected = mode === "stored" || mode === "memory" || mode === "mixed";
+            const selected =
+              mode === "stored" || mode === "single-key" || mode === "memory" || mode === "mixed";
             expect(encode.mock.calls.length > 0).toBe(selected);
             if (selected) {
               expect(
@@ -151,6 +154,7 @@ it.each(seedsFor("next-executor-star-dictionary", [0xb76b, 0xb76c]))(
           numRuns: 16,
           examples: [
             ["stored", false, false],
+            ["single-key", false, false],
             ["memory", true, false],
             ["mixed", false, true],
             ["non-PK", true, false],

@@ -3987,6 +3987,7 @@ export const STAR_BOUND_REACH = [
 
 export const STAR_SQL_REACH = [
   "stored",
+  "single-key",
   "memory",
   "mixed",
   "non-PK",

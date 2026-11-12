@@ -1,0 +1,163 @@
+{
+  "schema": 1,
+  "status": "SQL source/PG/pressure proof; whole-query performance and full gate pending",
+  "codeRevision": "ec24b49592e2e374e6ba61542c24672a55e343f3",
+  "sources": {
+    "packages/core/src/next/exec/plan.ts": "43d2213d5566b1ec50810fed038ef674a516b4adb9cc764414437e9be2f949e2",
+    "packages/core/src/next/exec/star-bound.ts": "0bb55906c5205fea2d45194314862fc87747fae8777fcabda5cfa31c3d936369",
+    "packages/core/src/next/exec/star-dictionary.ts": "065706e1e75cf3ea4de4f7581d63a4b8665ff318aa21893b19c4a962a03d41d7",
+    "packages/core/src/next/exec/star-shape.ts": "60e698aa995831092b4d5f1a69d4551192008a824a142ed900c9df3e36b1e2f9",
+    "packages/core/src/next/exec/star-pipeline.ts": "22d0259e36b29ed861c9a133d27a5d3724e0d61a375796b764bf22da2a48bb90",
+    "packages/core/src/next/exec/agg/dictionary-probe.ts": "4a1c7d6a3e96188d1eaadc5ec11e5ae7b5b1081c08f7403b957b0b8b8cf1991c",
+    "packages/core/src/next/testing/executor-star-dictionary.test.ts": "93edd9ceddf45ce83257ee7460cd726dee41e3c75b748d0357e9054619ce8cdd",
+    "packages/core/src/next/testing/executor-star-pressure.test.ts": "7848eec52571fd633f5608228ef70462cd6261b62b5b4376bb4284ea33bdaebd",
+    "packages/core/src/next/testing/executor-star-float-order.test.ts": "d362d45d8a1460fa3af3eb35cf77dc9260c146f95fd26ca2b154effd19afb9bd",
+    "packages/core/src/next/exec/star-pipeline.test.ts": "9f8790084f4baef02995a3004fd7896fb84a863601b425a3a8c558caa49b4c75",
+    "packages/core/src/next/exec/star-bound.test.ts": "36acce972e40230d83a9b74419a966795467f1a798a18f6483f69732672d0668",
+    "packages/core/src/testing/reach.ts": "98d53b21f0a019223d305532a554c04759704e3a662c1faf2e130cd20da62633"
+  },
+  "authority": "PostgreSQL TEXT/NULL/GROUP BY/order, float8pl transitions and SQLSTATE22003; Snapshot immutable visibility, enforced catalog primary keys, pipeline borrow-through-ready, charge-before-allocation and complete atomic admission.",
+  "redAndMutants": [
+    {
+      "name": "parent-RED",
+      "exit": 1,
+      "seconds": 29.992921801051125,
+      "intended": "generated SQL certified route is absent",
+      "log": "/home/eric/.cache/b4-read-recipe/star-sql-mutant-parent-RED.log"
+    },
+    {
+      "name": "wrong-text-book",
+      "exit": 1,
+      "seconds": 35.105025524040684,
+      "intended": "PGlite output values differ",
+      "log": "/home/eric/.cache/b4-read-recipe/star-sql-mutant-wrong-text-book.log"
+    },
+    {
+      "name": "encoded-topN-active",
+      "exit": 1,
+      "seconds": 32.86386834096629,
+      "intended": "single TEXT key must not rank equality IDs",
+      "log": "/home/eric/.cache/b4-read-recipe/star-sql-mutant-encoded-topN-active.log"
+    },
+    {
+      "name": "omit-typed-resident-state",
+      "exit": 1,
+      "seconds": 17.46293312998023,
+      "intended": "exact native helper remains funded but resident state omitted",
+      "log": "/home/eric/.cache/b4-read-recipe/star-sql-mutant-omit-typed-resident-state.log"
+    },
+    {
+      "name": "forward-old-ownership",
+      "exit": 1,
+      "seconds": 1.2568279199767858,
+      "intended": "new borrowed columns must not detach old input token",
+      "log": "/home/eric/.cache/b4-read-recipe/star-sql-mutant-forward-old-ownership.log"
+    }
+  ],
+  "nonActivatingMutantAttempts": [
+    {
+      "name": "delete-only-topN-guard",
+      "exit": 0,
+      "credited": false,
+      "reason": "original TEXT plan never creates integer GroupTopN; single-key generated dimension plus an active encoded GroupTopN mutation now rejects"
+    },
+    {
+      "name": "reuse-original-TEXT-native-minimum",
+      "exit": 0,
+      "credited": false,
+      "reason": "old TEXT scratch minimum itself contains surplus versus typed scratch; exact typed helper with retained state omitted now rejects"
+    }
+  ],
+  "verification": [
+    {
+      "name": "focused",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "packages/core/src/next/exec/star-dictionary.test.ts",
+        "packages/core/src/next/exec/star-bound.test.ts",
+        "packages/core/src/next/exec/star-pipeline.test.ts",
+        "packages/core/src/next/testing/executor-star-dictionary.test.ts",
+        "packages/core/src/next/testing/executor-star-pressure.test.ts",
+        "packages/core/src/next/testing/executor-star-float-order.test.ts",
+        "scripts/star-component.test.ts",
+        "scripts/star-vector-owner.test.ts",
+        "packages/core/src/testing/seeds.test.ts",
+        "--config",
+        "/home/eric/.cache/b4-read-recipe/vitest-star-one.mts",
+        "--maxWorkers=1"
+      ],
+      "exit": 0,
+      "seconds": 69.07082779996563,
+      "log": "/home/eric/.cache/b4-read-recipe/star-sql-restored-focused.log"
+    },
+    {
+      "name": "node22",
+      "command": [
+        "/usr/bin/node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "packages/core/src/next/testing/executor-star-dictionary.test.ts",
+        "packages/core/src/next/testing/executor-star-pressure.test.ts",
+        "packages/core/src/next/testing/executor-star-float-order.test.ts",
+        "--config",
+        "/home/eric/.cache/b4-read-recipe/vitest-star-one.mts",
+        "--maxWorkers=1"
+      ],
+      "exit": 0,
+      "seconds": 53.69248488696758,
+      "log": "/home/eric/.cache/b4-read-recipe/star-sql-restored-node22.log"
+    },
+    {
+      "name": "lint",
+      "command": [
+        "npx",
+        "eslint",
+        "packages/core/src/next/exec/plan.ts",
+        "packages/core/src/next/exec/star-bound.ts",
+        "packages/core/src/next/exec/star-pipeline.ts",
+        "packages/core/src/next/exec/star-dictionary.test.ts",
+        "packages/core/src/next/exec/star-bound.test.ts",
+        "packages/core/src/next/exec/star-pipeline.test.ts",
+        "packages/core/src/next/testing/executor-star-dictionary.test.ts",
+        "packages/core/src/next/testing/executor-star-pressure.test.ts",
+        "packages/core/src/next/testing/executor-star-float-order.test.ts",
+        "packages/core/src/next/exec/agg/dictionary-probe.ts",
+        "packages/core/src/testing/reach.ts"
+      ],
+      "exit": 0,
+      "seconds": 16.37617433303967,
+      "log": "/home/eric/.cache/b4-read-recipe/star-sql-restored-lint.log"
+    }
+  ],
+  "reach": [
+    "STAR_SQL_REACH",
+    "STAR_PRESSURE_REACH",
+    "STAR_FLOAT_REACH",
+    "STAR_EDGE_REACH",
+    "STAR_BOUND_REACH"
+  ],
+  "seeds": {
+    "SQL": [46955, 46956],
+    "pressure": [46959, 46960],
+    "float": [46961, 46962],
+    "edge": [46957, 46958],
+    "bound": [46953, 46954]
+  },
+  "counts": {
+    "SQL_per_seed": 16,
+    "pressure_per_seed": 12,
+    "float_per_seed": 8,
+    "edge_per_seed": 15,
+    "bound_per_seed": 20
+  },
+  "limits": [
+    "No whole-query performance acceptance or full lead gate yet. Existing prototype component numbers are not whole-query claims.",
+    "Terminal three-inner-join direct-column stars only; parameter/volatile/computed/unproved/oversized plans keep generic execution.",
+    "All selected native joins are completely resident. Exact source domains/bytes may conservatively include unused or deleted dictionary entries.",
+    "PG ordered-ordinal oracle checks observed native float transitions. Unordered SQL joins need not have the same physical row order in PostgreSQL.",
+    "NaNs compare semantically; finite/infinite/negative-zero float results and native input ordering compare by IEEE bits. No AVG/Sxx transition change.",
+    "Node26 and Node22 correctness; no browser throughput/RSS claim; MemorySpillService verifies zero retained bytes before service close."
+  ]
+}
