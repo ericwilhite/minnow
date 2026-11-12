@@ -1033,7 +1033,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 runtime,
                 rel,
                 input,
-                base + capacity + retainedBytes,
+                base + capacity + (saved?.ownedDelivery ? 0 : retainedBytes),
                 BATCH_ROWS,
                 (context, grant) =>
                   new JsonPhaseOperator(
@@ -1041,6 +1041,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                     context,
                     {
                       grant,
+                      allocateResult: (bytes) => runtime.allocateResultOwned(bytes),
                       spill: runtime.request.spill,
                       queryId: runtime.request.queryId,
                       capacity,
@@ -2292,7 +2293,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         entry.minimum = saved
           ? base +
             (saved.emit ? 0 : (jsonCapacities.get(runtime)?.get(entry.rel.id) ?? saved.capacity)) +
-            saved.retainedBytes
+            (saved.ownedDelivery ? 0 : saved.retainedBytes)
           : entry.rel.id === frontier
             ? base + (jsonCapacities.get(runtime)?.get(entry.rel.id) ?? 4096)
             : 0;
@@ -2494,6 +2495,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         };
         phases.set(runtime, state);
         const guarded: Operator = {
+          reclassifiesTransfers: sink.reclassifiesTransfers,
           push: (batch, transfer) => sink.push(batch, transfer),
           ready: () => sink.ready(),
           finish: () => sink.finish(),
@@ -2570,12 +2572,21 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                   progress = Math.max(progress, bound.progress);
                 }
               runtime.readMinimum(io, progress, Math.max(cut.phase.progressBytes, parentProgress));
-              if (jsonPlanners.size > 0)
+              if (jsonPlanners.size > 0) {
+                const owned = cut.kind === "json" && cut.phase.ownedDelivery;
+                const frontier = jsonFrontier.get(runtime) !== null;
                 runtime.resultProgressEnvelope(
-                  jsonFrontier.get(runtime) !== null
-                    ? 0
-                    : Math.max(cut.phase.progressBytes, parentProgress),
+                  owned
+                    ? Math.max(
+                        (frontier ? 1 : 2) * cut.phase.retainedBytes,
+                        frontier ? 0 : parentProgress,
+                      )
+                    : frontier
+                      ? 0
+                      : Math.max(cut.phase.progressBytes, parentProgress),
+                  owned,
                 );
+              }
               const binding = cut.phase.parameters.phaseBinding(runtime.signal);
               const logicalInputs = binding.logicalBytes ?? binding.bytes;
               if (

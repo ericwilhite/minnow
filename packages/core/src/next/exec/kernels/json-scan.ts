@@ -179,7 +179,10 @@ export class JsonScan {
   }
   /** PostgreSQL's JSON parser lexes one token ahead before numeric semantic actions.
    * Return the measured stack depth without a separate, error-reordering sizing pass. */
-  *validate(stack: Uint8Array): SlicedJob<number> {
+  *validate(
+    stack: Uint8Array,
+    grow?: (previous: Uint8Array, required: number) => SlicedJob<Uint8Array>,
+  ): SlicedJob<number> {
     this.at = 0;
     let top = 0,
       peak = 0,
@@ -230,7 +233,11 @@ export class JsonScan {
       if (token === 123 || token === 91) {
         const object = token === 123;
         token = yield* this.token();
-        if (++top >= stack.length) bad();
+        if (++top >= stack.length) {
+          if (grow === undefined) bad();
+          stack = yield* grow(stack, top + 1);
+          if (top >= stack.length) bad();
+        }
         peak = Math.max(peak, top);
         stack[top] = object ? 1 : 5;
       } else if (token === NUMBER || token === 34 || token === WORD) {

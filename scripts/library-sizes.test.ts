@@ -39,9 +39,11 @@ describe("compressed download budgets", () => {
     // main's 556.75 KiB cap to 558 KiB: the old cap fails by 841 bytes; 439 bytes remain.
     // Native interval/series provenance: worker plus client is 571,449 gzip bytes.
     // Raise this combined cap once by 256 bytes; standalone client isolation is unchanged.
+    // Native JSON call provenance: 571,749 combined gzip bytes (+208 over d0562725).
+    // Raise this cap once by 256 bytes; private rebuild/test inputs stay unreachable.
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
-    ).toBeLessThanOrEqual(558.25 * 1024);
+    ).toBeLessThanOrEqual(558.5 * 1024);
   });
 });

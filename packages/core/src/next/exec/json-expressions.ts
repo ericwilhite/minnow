@@ -58,15 +58,18 @@ class JsonProject implements Operator {
     exprs: readonly ScalarExpr[],
     context: CompileContext,
     readonly downstream: Operator,
+    readonly pin: (value: Vector) => void,
   ) {
-    context.arena.take(128 + 24 * exprs.length);
+    context.arena.take(192 + 96 * exprs.length);
     this.#exprs = exprs.map((expr) => compileExpr(expr, context));
   }
   push(batch: Batch): PushResult {
     while (this.#cursor < this.#exprs.length) {
       const expr = this.#exprs[this.#cursor];
       if (expr === undefined) throw new Error("Missing JSON projection");
-      this.#columns[this.#cursor] = expr.evaluate(batch, batch.selection);
+      const value = expr.evaluate(batch, batch.selection);
+      this.#columns[this.#cursor] = value;
+      this.pin(value);
       this.#cursor++;
     }
     const result = this.downstream.push({
@@ -101,6 +104,9 @@ export class JsonExpressions implements Operator, JsonHost {
   readonly #inner: Operator;
   readonly #project: JsonProject | null;
   readonly #nodes: JsonNode[] = [];
+  readonly #dependencies = new Map<JsonNode, Set<JsonNode>>();
+  readonly #users = new Map<JsonNode, number>();
+  readonly #pinned = new Set<ArrayBufferLike>();
   readonly #requests = new Map<JsonNode, JsonRequest>();
   readonly #completed = new Map<JsonNode, number>();
   readonly #one: Selection;
@@ -141,7 +147,17 @@ export class JsonExpressions implements Operator, JsonHost {
     );
     installJsonHost(this.#arena, this);
     const compile = { ...context, arena: this.#arena };
-    this.#project = Array.isArray(exprs) ? new JsonProject(exprs, compile, downstream) : null;
+    this.#project = Array.isArray(exprs)
+      ? new JsonProject(exprs, compile, downstream, (value) => {
+          const flat =
+            value.form === "constant"
+              ? value.value
+              : value.form === "dictionary"
+                ? value.dictionary
+                : value;
+          if (flat.data.layout === "varlen") this.#pinned.add(flat.data.bytes.buffer);
+        })
+      : null;
     this.#inner = this.#project ?? new FilterOperator(exprs as ScalarExpr, compile, downstream);
     this.#arena.take((this.#workspace === null ? this.#nodes.length : 1) * shared.bytes);
     this.#running = true;
@@ -150,7 +166,9 @@ export class JsonExpressions implements Operator, JsonHost {
     return this.#nodes.length;
   }
   memory(node: JsonNode): JsonMemory {
-    this.#arena.take(512);
+    this.#arena.take(1024);
+    this.#dependencies.set(node, new Set());
+    this.#users.set(node, 0);
     const memory = this.#workspace ?? new JsonMemorySlice(this.shared.bytes);
     this.#nodes.push(node);
     this.#requests.set(node, new JsonRequest(node));
@@ -174,30 +192,64 @@ export class JsonExpressions implements Operator, JsonHost {
     this.shared.signal?.throwIfAborted();
     if (this.#aborted) throw this.#reason;
   }
+  /** Retire intermediate JSON values only after their consuming node has captured them.
+   * Already projected columns keep a pin through downstream readiness. Sibling inputs of
+   * an unfinished node retain references, so eviction cannot cause recomputation cycles. */
+  inputsConsumed(node: JsonNode): void {
+    const dependencies = this.#dependencies.get(node);
+    if (!dependencies) return;
+    for (const child of dependencies) {
+      const users = (this.#users.get(child) ?? 0) - 1;
+      if (users < 0) throw new Error("JSON dependency underflow");
+      this.#users.set(child, users);
+      const vector = this.#values.get(child);
+      const flat = vector?.form === "flat" ? vector : undefined;
+      if (
+        users === 0 &&
+        flat?.data.layout === "varlen" &&
+        !this.#pinned.has(flat.data.bytes.buffer)
+      ) {
+        child.reset();
+        this.#completed.delete(child);
+        this.#values.delete(child);
+      }
+    }
+    dependencies.clear();
+  }
   async #compute(request: JsonRequest): Promise<void> {
-    for (;;) {
-      this.#check();
-      if (this.slice.due()) {
-        await yieldTask();
-        afterYield(this.slice.clock);
+    try {
+      for (;;) {
         this.#check();
-      }
-      try {
-        const job = request.node.run(request.batch, request.rows);
-        let value: Vector;
-        try {
-          value = await runSliced(job, this.slice, () => this.#check());
-        } catch (error) {
-          request.node.discard(job);
-          throw error;
+        if (this.slice.due()) {
+          await yieldTask();
+          afterYield(this.slice.clock);
+          this.#check();
         }
-        this.#completed.set(request.node, this.#epoch);
-        this.#values.set(request.node, value);
-        return;
-      } catch (error) {
-        if (!(error instanceof JsonRequest)) throw error;
-        await this.#compute(error);
+        try {
+          const job = request.node.run(request.batch, request.rows);
+          let value: Vector;
+          try {
+            value = await runSliced(job, this.slice, () => this.#check());
+          } catch (error) {
+            request.node.discard(job);
+            throw error;
+          }
+          this.#completed.set(request.node, this.#epoch);
+          this.#values.set(request.node, value);
+          return;
+        } catch (error) {
+          if (!(error instanceof JsonRequest)) throw error;
+          const dependencies = this.#dependencies.get(request.node);
+          if (!dependencies) throw new Error("Missing JSON dependency owner", { cause: error });
+          if (!dependencies.has(error.node)) {
+            dependencies.add(error.node);
+            this.#users.set(error.node, (this.#users.get(error.node) ?? 0) + 1);
+          }
+          await this.#compute(error);
+        }
       }
+    } finally {
+      this.inputsConsumed(request.node);
     }
   }
   push(batch: Batch, transfer?: Transfer): PushResult {
@@ -228,6 +280,7 @@ export class JsonExpressions implements Operator, JsonHost {
         }
       }
       this.#project?.endRow();
+      this.#pinned.clear();
       for (const node of this.#nodes) node.reset();
       this.#values.clear();
       if (this.slice.due()) {
@@ -263,6 +316,7 @@ export class JsonExpressions implements Operator, JsonHost {
     if (this.#closed) return;
     this.#closed = true;
     this.#project?.endRow();
+    this.#pinned.clear();
     for (const node of this.#nodes) node.reset();
     this.#values.clear();
     this.#requests.clear();

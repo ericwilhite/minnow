@@ -10,6 +10,7 @@ import type { Batch, Selection } from "../vector/vector.js";
 import { afterYield, yieldTask, YIELD_INTERVAL_MS } from "./pipeline.js";
 import { Slice } from "./slices.js";
 import type { CompileContext } from "./kernels/compile.js";
+import type { ResultAllocator } from "./result-buffer.js";
 import { JsonExpressions } from "./json-expressions.js";
 import { JsonWorkspaceGrowth } from "./json-workspace.js";
 import { ExecutionError } from "./errors.js";
@@ -23,6 +24,7 @@ export const JSON_PHASE_IO = 512 << 10;
 export const JSON_PHASE_FIXED = 4096;
 export interface JsonPhase {
   readonly emit: boolean;
+  readonly ownedDelivery: boolean;
   readonly error: ExecutionError | null;
   readonly prefix: JsonRecords;
   readonly suffix: JsonRecords;
@@ -56,6 +58,7 @@ export interface JsonPhaseContext {
   readonly progressBytes: number;
   readonly signal: AbortSignal;
   readonly resume?: JsonPhase;
+  readonly allocateResult?: ResultAllocator;
   readonly rowsNeeded?: () => number;
   readonly stopped?: () => boolean;
   readonly handoff: (saved: JsonPhase) => Promise<void>;
@@ -95,12 +98,14 @@ export class JsonPhaseOperator implements Operator {
     output: readonly PhysicalType[],
     readonly downstream: Operator,
   ) {
+    if (shared.resume?.ownedDelivery && shared.allocateResult === undefined)
+      throw new Error("Missing owned JSON result allocation recipe");
     context.arena.take(JSON_PHASE_FIXED);
     this.#one = { rows: new Uint16Array(1), count: 1 };
     shared.dispose(() => this.#close());
     this.#rowError = shared.resume?.error ?? null;
     this.#produced = shared.resume?.prefix.rowCount ?? 0;
-    context.arena.take(shared.retainedBytes);
+    if (!shared.resume?.ownedDelivery) context.arena.take(shared.retainedBytes);
     this.#files = new SpillFiles(shared.spill, shared.queryId, {
       allocate: () => false,
       free: () => {
@@ -236,11 +241,23 @@ export class JsonPhaseOperator implements Operator {
     if (!saved) throw new Error("Missing saved JSON continuation");
     this.#restoreIo = (async () => {
       if (saved.emit) {
-        await saved.prefix.read(this.#read, this.shared.retainedBytes, async (columns, length) => {
-          if (this.shared.stopped?.()) return;
-          if (this.downstream.push({ columns, length, selection: null }) === "blocked")
-            await this.downstream.ready();
-        });
+        await saved.prefix.read(
+          this.#read,
+          this.shared.retainedBytes,
+          async (columns, length, transfer) => {
+            if (this.shared.stopped?.()) return;
+            // Retaining/probing parents borrow until ready; only an adopting chain
+            // receives the token. JsonRecords keeps the allocation live across either borrow.
+            if (
+              this.downstream.push(
+                { columns, length, selection: null },
+                this.downstream.reclassifiesTransfers === true ? transfer : undefined,
+              ) === "blocked"
+            )
+              await this.downstream.ready();
+          },
+          saved.ownedDelivery ? this.shared.allocateResult : undefined,
+        );
       } else {
         await saved.prefix.copyTo(this.#prefix, this.#read);
         await saved.suffix.read(this.#read, this.shared.retainedBytes, async (columns, length) =>
@@ -282,6 +299,9 @@ export class JsonPhaseOperator implements Operator {
     const retainedBytes = (emit ? this.#prefix : this.#suffix).retainedBytes;
     const saved: JsonPhase = {
       emit,
+      // JSON/array bytes transfer as varlen; fixed cells (including wide NUMERIC)
+      // retain their per-field sink copy, without forcing a copy of the whole row.
+      ownedDelivery: emit && this.shared.allocateResult !== undefined,
       error: this.#rowError,
       prefix: this.#prefix,
       suffix: this.#suffix,

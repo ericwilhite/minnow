@@ -10,6 +10,22 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported rebuild now constructs typed JSON objects and arrays, including the SQL
+`KEY … VALUE` form and PostgreSQL's `json_build_*` / `jsonb_build_*` spellings. It preserves
+PostgreSQL's text formatting, exact numeric scale, duplicate keys, escaping and NULL policies.
+Growing results use charged spill checkpoints and cancellable re-admission. JSON aggregation
+and whole-row rendering remain separate work. Results use charged, result-owned delivery buffers
+that transfer to consumer frames without another payload copy. A direct scalar delivery reserves
+two serialized row sizes plus bounded I/O, metadata and owned inputs; nested consumed values
+are retired. Transient pressure waits cancellably, while a complete irreducible recipe larger
+than the whole cap reports typed `53200`. The shipped engine, public API and stored formats
+are unchanged; no migration is needed. Private JSON call metadata adds 618 raw bytes to each
+engine entry (193/211/174 gzip bytes for main/OPFS/IndexedDB). Their measured raw caps rise
+once by 768/768/512 bytes and gzip by 128/256/256 bytes; the client bundle is unchanged.
+The generic worker plus separate client measures 571,749 gzip bytes; its combined cap rises
+once by 256 bytes. The core tarball measures 1,024,131 packed bytes; its packed cap rises once by 500 bytes to
+1,024,250. Private rebuild code and tests remain excluded.
+
 The unexported rebuild now executes text-to-JSONB casts, JSONB extraction and exact canonical
 JSONB text, including decimal scale, duplicate keys and Unicode validation. Invalid documents
 keep PostgreSQL’s error order, including competing Unicode, token and numeric range errors. Expanding values use
@@ -17,7 +33,7 @@ charged spill checkpoints and cancellable re-admission through unary, EXCEPT, jo
 parents. Eligible hybrid aggregates use the same handoff path; completed join builds are not
 read again and window input order is preserved. Potential cuts retain the ordinary window
 fast routes through empty handoffs and until a nonempty checkpoint requires conversion. JSON paths,
-construction and aggregation remain refused. The shipped engine, public API and stored formats
+aggregation and whole-row construction remain refused. The shipped engine, public API and stored formats
 are unchanged; no migration is needed.
 
 The unexported rebuild now keeps `DATE_PART(text, INTERVAL)` as PostgreSQL's double precision
@@ -46,7 +62,7 @@ The SELECT guide and internal analytics catalogue's guide-9 JSON example now cas
 resolving PostgreSQL's ambiguous untyped extraction operator (`42725`). Its data and path are
 unchanged. PostgreSQL, the current engine and the private rebuild return the same text result.
 The rebuild now has charged, cancellable JSON extraction kernels that preserve raw number text,
-duplicate keys and whitespace. JSON construction and aggregation remain separate follow-up work. Published runtime behavior, public API and
+duplicate keys and whitespace. JSON aggregation and whole-row rendering remain separate follow-up work. Published runtime behavior, public API and
 stored formats are unchanged; no migration is needed.
 
 Affected packages: `@minnowdb/core` (SQL feature metadata and compatibility documentation) and
@@ -103,7 +119,7 @@ no migration is needed.
 The unexported rebuild core now executes timestamp `DATE_TRUNC` in its fixed UTC session,
 keeps DATE literals in native date vectors, and executes constant `JSON_TABLE` TEXT/INTEGER rows
 through literal `UNION ALL` folding. JSON_TABLE declarations keep their types even for NULL-only rows.
-JSON constructors and unsupported set-operation shapes retain explicit typed refusals.
+Unsupported JSON value types and set-operation shapes retain explicit typed refusals.
 Recursion supports fixed-width `UNION ALL` work tables, simple seeds and linear filter/project
 steps; other recursive shapes remain refused. The internal catalogue records each remaining
 reason and its PostgreSQL outcome.

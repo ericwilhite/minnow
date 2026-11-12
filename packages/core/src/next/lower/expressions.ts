@@ -1,3 +1,4 @@
+import { jsonCallSource } from "../../engine/json-call-sources.js";
 import { isDatePart } from "../../engine/date-part-sources.js";
 /**
  * Front-end expressions (plan/model.ts `Expression`, `Predicate`) to typed IR scalar
@@ -643,6 +644,33 @@ function lowerCall(
   const name = expression.name;
   const args = expression.arguments;
   switch (name) {
+    case "JSON_OBJECT":
+    case "JSON_ARRAY":
+    case "TO_JSON": {
+      const source = jsonCallSource(expression) ?? name;
+      if (source === "ROW_TO_JSON" || source === "ROW_OBJECT" || source === "JSON_OBJECT_ARRAY")
+        throw unsupported("function", source.toLowerCase());
+      const fn =
+        name === "JSON_OBJECT"
+          ? source === "JSON_OBJECT"
+            ? "json_object"
+            : source.toLowerCase()
+          : name === "TO_JSON"
+            ? source.toLowerCase()
+            : source === "JSON_ARRAY"
+              ? "json_array"
+              : source.toLowerCase();
+      if (source.includes("BUILD_") && args.length > 100)
+        throw new PlanningError("cannot pass more than 100 arguments to a function", "54023");
+      if (name === "JSON_OBJECT" && args.length % 2 !== 0)
+        throw new PlanningError("argument list must have even number of elements", "22023");
+      return callFunction(
+        fn,
+        args.map((arg) => lowerExpression(arg, scope, state)),
+        state,
+        name === "TO_JSON" ? undefined : false,
+      );
+    }
     case "DATE_ADD": {
       const [value, , elapsed] = args;
       const source = elapsed === undefined ? undefined : intervalArithmeticSource(elapsed);

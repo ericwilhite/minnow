@@ -72,6 +72,19 @@ export function jsonInputsBounded(expr: ScalarExpr, input: Rel): boolean {
         (source.otherwise === null || origin(source.otherwise, rel))
       );
     if (source.op === "call") {
+      if (
+        [
+          "json_object",
+          "json_build_object",
+          "jsonb_build_object",
+          "json_build_array",
+          "jsonb_build_array",
+          "json_array",
+          "to_json",
+          "to_jsonb",
+        ].includes(source.fn)
+      )
+        return source.args.every((arg) => jsonInputsBounded(arg, rel));
       if (source.fn === "json_get" || source.fn === "json_get_text" || source.fn === "nullif")
         return source.args[0] !== undefined && origin(source.args[0], rel);
       if (source.fn === "coalesce") return source.args.every((arg) => origin(arg, rel));

@@ -324,11 +324,14 @@ function argSql(value: Typed, parameters: ParameterTypes): SqlType | "unknown" |
   return sqlTypeOf(value.expr.type);
 }
 
-function expand(overload: Overload, arity: number): ReadonlyArray<SqlType | "T"> | null {
+function expand(overload: Overload, arity: number): ReadonlyArray<SqlType | "T" | "any"> | null {
   if (overload.variadic === true) {
     if (arity < overload.args.length) return null;
     const last = overload.args.at(-1) ?? "T";
-    return [...overload.args, ...Array<SqlType | "T">(arity - overload.args.length).fill(last)];
+    return [
+      ...overload.args,
+      ...Array<SqlType | "T" | "any">(arity - overload.args.length).fill(last),
+    ];
   }
   return overload.args.length === arity ? overload.args : null;
 }
@@ -386,6 +389,31 @@ export function resolveFunction(
     const params = expand(overload, args.length);
     return params === null ? [] : [{ overload, params }];
   });
+  const heterogeneous = expanded.find(
+    ({ params }) => params.length > 0 && params.every((param) => param === "any"),
+  );
+  if (heterogeneous !== undefined) {
+    if (heterogeneous.overload.unknown === "error" && kinds.includes("unknown"))
+      throw new PlanningError(
+        "could not determine polymorphic type because input has type unknown",
+        "42804",
+      );
+    const types = args.map((arg) => settle(arg, parameters).expr.type);
+    const binary = (
+      heterogeneous.overload.jsonResult === "values"
+        ? types.filter((_, i) => i % 2 === 1)
+        : heterogeneous.overload.jsonResult === "arguments"
+          ? types
+          : []
+    ).some((type) => type.kind === "json" && type.binary);
+    return {
+      fn,
+      args: types,
+      result: binary
+        ? { kind: "json", binary: true }
+        : physicalTypeOfSql(heterogeneous.overload.result as SqlType),
+    };
+  }
   // A type-variable overload (coalesce, greatest…) takes the arguments' common type. A
   // zero-argument overload is an ordinary exact match (review finding 5).
   const generic = expanded.find(
@@ -398,7 +426,9 @@ export function resolveFunction(
   if (kinds.includes(null))
     throw new PlanningError(`function ${fn} does not accept these argument types`, "42883");
   const candidates: Candidate[] = expanded.flatMap(({ overload, params }) =>
-    params.includes("T") ? [] : [{ overload, params: params as readonly SqlType[] }],
+    params.includes("T") || params.includes("any")
+      ? []
+      : [{ overload, params: params as readonly SqlType[] }],
   );
   const resolved = (chosen: Candidate): Resolved => ({
     fn,

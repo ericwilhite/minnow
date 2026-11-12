@@ -19,6 +19,9 @@
  * - **Type variables.** `"T"` in an overload is one type shared by every `"T"` argument and the
  *   result (any type, including enums and arrays); lowering picks it as PostgreSQL picks a common
  *   type (UNION / CASE resolution) and casts each argument to it.
+ * - **Heterogeneous arguments.** `"any"` keeps each input type independently (PostgreSQL's
+ *   VARIADIC "any"); it never unifies JSON constructor members. Unknowns settle to text
+ *   unless the overload requires a known polymorphic input (`unknown: "error"`).
  * - Comparison, boolean logic, NULL tests, CASE, IN lists and LIKE are IR nodes, not calls.
  *   `compare` and `inList` take operands of one base type (lowering casts to the common type);
  *   type modifiers may differ and are ignored: a VARCHAR(2) column compares with a `text`
@@ -62,10 +65,14 @@ export type SqlType =
   | "bytea";
 
 export interface Overload {
-  readonly args: ReadonlyArray<SqlType | "T">;
+  readonly args: ReadonlyArray<SqlType | "T" | "any">;
   readonly result: SqlType | "T";
   /** The last argument repeats (`coalesce(T, T, …)`): one or more. */
   readonly variadic?: true;
+  /** SQL/JSON defaults to JSONB if a value argument is JSONB; build_* stays fixed. */
+  readonly jsonResult?: "values" | "arguments";
+  /** Polymorphic single-value conversion cannot infer an unknown input. */
+  readonly unknown?: "error";
 }
 
 const numericTypes = ["int2", "int4", "int8", "float4", "float8", "numeric"] as const;
@@ -74,6 +81,33 @@ const same = (types: readonly SqlType[], arity: number): Overload[] =>
 
 /** `fn` → overloads. Names are PostgreSQL's function names, or the operator's name below. */
 export const FUNCTIONS: Readonly<Record<string, readonly Overload[]>> = {
+  // PostgreSQL VARIADIC "any": independent argument types, including zero arguments.
+  json_object: [
+    { args: [], result: "json" },
+    { args: ["any"], result: "json", variadic: true, jsonResult: "values" },
+  ],
+  jsonb_build_object: [
+    { args: [], result: "jsonb" },
+    { args: ["any"], result: "jsonb", variadic: true },
+  ],
+  jsonb_build_array: [
+    { args: [], result: "jsonb" },
+    { args: ["any"], result: "jsonb", variadic: true },
+  ],
+  to_jsonb: [{ args: ["any"], result: "jsonb", unknown: "error" }],
+  json_build_object: [
+    { args: [], result: "json" },
+    { args: ["any"], result: "json", variadic: true },
+  ],
+  json_build_array: [
+    { args: [], result: "json" },
+    { args: ["any"], result: "json", variadic: true },
+  ],
+  json_array: [
+    { args: [], result: "json" },
+    { args: ["any"], result: "json", variadic: true, jsonResult: "arguments" },
+  ],
+  to_json: [{ args: ["any"], result: "json", unknown: "error" }],
   // SRFs bind through this table too; execution uses a relational series node.
   generate_series: [
     { args: ["int4", "int4"], result: "int4" },
@@ -228,6 +262,12 @@ export const FUNCTIONS: Readonly<Record<string, readonly Overload[]>> = {
  * type in the integer and float cases, so the call itself is always `nullif(T, T)`.
  */
 export const NON_STRICT_FUNCTIONS: ReadonlySet<string> = new Set([
+  "json_build_object",
+  "jsonb_build_object",
+  "json_object",
+  "json_build_array",
+  "jsonb_build_array",
+  "json_array",
   "coalesce",
   "greatest",
   "least",

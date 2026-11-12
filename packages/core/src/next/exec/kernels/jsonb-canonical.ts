@@ -1,6 +1,7 @@
 /** Exact JSONB text without a JS object tree or a recursive traversal stack.
  * Key selection scans in (UTF8 length, unsigned byte) order with bounded scratch.
- * This intentionally trades wide-object CPU for an input-sized metadata proof. */
+ * This intentionally trades wide-object CPU for an nesting-sized metadata proof. */
+import { JsonKeyCursor } from "./json-key.js";
 import { JsonScan, type JsonBytesSink } from "./json-scan.js";
 import { jsonbNumber } from "./jsonb-number.js";
 import type { JsonMemory } from "./json.js";
@@ -16,38 +17,60 @@ export function* canonicalJsonb(
   const scan = new JsonScan(bytes, slice, true, (start, end) =>
     jsonbNumber(bytes, start, end, DISCARD, slice),
   );
-  // Fund an input-sized validation stack before allocation. A validating sizing
-  // prepass would let a later lexical defect hide an earlier Unicode/range error.
-  // This transient bound is smaller than the canonical scratch held below.
-  const validationBytes = bytes.length + 1;
-  let depth: number;
+  // Grow only the real nesting stack. No error-reordering lexical sizing pass,
+  // and no full-document temporary allocation for a shallow, large string value.
+  let validationBytes = Math.min(bytes.length + 1, 64),
+    depth: number;
   yield* memory.take(validationBytes);
   try {
-    depth = yield* scan.validate(new Uint8Array(validationBytes));
+    depth = yield* scan.validate(new Uint8Array(validationBytes), function* (previous, required) {
+      const next = Math.min(bytes.length + 1, Math.max(required, previous.length * 2));
+      yield* memory.take(next);
+      let grown: Uint8Array;
+      try {
+        grown = new Uint8Array(next);
+        grown.set(previous);
+      } catch (error) {
+        memory.free(next);
+        throw error;
+      }
+      memory.free(validationBytes);
+      validationBytes = next;
+      return grown;
+    });
   } finally {
     memory.free(validationBytes);
   }
-  const held = 2 * bytes.length + 24 * depth + 512;
+  const held = 24 * depth + 512;
   yield* memory.take(held);
   try {
-    const a = new Uint8Array(bytes.length),
-      b = new Uint8Array(bytes.length);
-    // Six scalar positions per nesting level; no retained per-member objects or strings.
+    const a = new JsonKeyCursor(bytes),
+      b = new JsonKeyCursor(bytes);
     const frames = new Int32Array(depth * 6);
     let top = -1;
-    const decode = function* (start: number, end: number, output: Uint8Array): SlicedJob<number> {
-      let n = 0;
-      yield* scan.stringBytes(start, end, {
-        put: (byte) => {
-          output[n++] = byte;
-        },
-      });
-      return n;
-    };
-    const compare = function* (an: number, bn: number): SlicedJob<number> {
+    const compare = function* (
+      start: number,
+      end: number,
+      otherStart: number,
+      otherEnd: number,
+    ): SlicedJob<number> {
+      a.reset(start, end);
+      b.reset(otherStart, otherEnd);
+      let an = 0,
+        bn = 0;
+      while (a.next() !== null) {
+        if ((++an & 1023) === 0 && slice.due()) yield;
+      }
+      while (b.next() !== null) {
+        if ((++bn & 1023) === 0 && slice.due()) yield;
+      }
       if (an !== bn) return an < bn ? -1 : 1;
+      a.reset(start, end);
+      b.reset(otherStart, otherEnd);
       for (let i = 0; i < an; i++) {
-        if (a[i] !== b[i]) return (a[i] ?? 0) < (b[i] ?? 0) ? -1 : 1;
+        const av = a.next() ?? 0,
+          bv = b.next() ?? 0;
+        if (av !== bv) return av < bv ? -1 : 1;
         if ((i & 1023) === 0 && slice.due()) yield;
       }
       return 0;
@@ -149,18 +172,15 @@ export function* canonicalJsonb(
       while (bytes[scan.at] !== 125) {
         const start = scan.at;
         yield* scan.string();
-        const end = scan.at,
-          n = yield* decode(start, end, a);
+        const end = scan.at;
         let eligible = true;
         const previous = frames[base + 2] ?? -1;
         if (previous >= 0) {
-          const m = yield* decode(previous, frames[base + 3] ?? previous, b);
-          eligible = (yield* compare(n, m)) > 0;
+          eligible = (yield* compare(start, end, previous, frames[base + 3] ?? previous)) > 0;
         }
         let selected = eligible;
         if (eligible && best >= 0) {
-          const m = yield* decode(best, bestEnd, b);
-          selected = (yield* compare(n, m)) <= 0;
+          selected = (yield* compare(start, end, best, bestEnd)) <= 0;
         }
         yield* scan.space();
         scan.at++;

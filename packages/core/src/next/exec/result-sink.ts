@@ -8,6 +8,7 @@ import {
   type DictionaryPlan,
   type DictionaryFrame,
 } from "./result-dictionaries.js";
+import { ResultBuffers, takeResultBuffers } from "./result-buffer.js";
 import { ownedResultColumns } from "./result-owned.js";
 import { ColumnStore } from "./column-store.js";
 import { slotOf, validAt } from "./kernels/vectors.js";
@@ -56,6 +57,7 @@ export class ResultSink implements Operator {
   #dictionaryPlan: DictionaryPlan | null = null;
   readonly #abort = new AbortController();
   readonly #frames = new Set<FrameStore>();
+  readonly #ownedAllocations = new Set<ResultBuffers>();
   readonly #creditWaiters = new Set<() => void>();
   readonly #metadataBytes: number;
   readonly #rowsPerFrame: number;
@@ -95,6 +97,32 @@ export class ResultSink implements Operator {
       rows /= 2;
     }
     this.#rowsPerFrame = rows;
+  }
+
+  /** This phase's complete admission already funds the requested result allocation.
+   * Only consumer-owned frames can postpone it: wait for their credit, never self-admit. */
+  async allocateOwnedResult(bytes: number): Promise<ResultBuffers> {
+    for (;;) {
+      this.#check();
+      if (this.#budgetSuspended) throw new TypeError("Result allocation between phases");
+      if (this.grant.held - this.grant.allocated - this.grant.loaned >= bytes) {
+        const owned = new ResultBuffers(this.grant, bytes, () =>
+          this.#ownedAllocations.delete(owned),
+        );
+        this.#ownedAllocations.add(owned);
+        return owned;
+      }
+      if (this.#frames.size === 0)
+        throw new Error("Result-owned allocation exceeds its admitted delivery minimum");
+      await abortable(
+        new Promise<void>((resolve) => this.#creditWaiters.add(resolve)),
+        this.#abort.signal,
+      );
+    }
+  }
+
+  get ownsPartialResult(): boolean {
+    return this.#ownedAllocations.size > 0;
   }
 
   /** A direct terminal scan can amortize wide-column allocation with a larger owned batch.
@@ -390,12 +418,20 @@ export class ResultSink implements Operator {
         dictionaries: [],
       });
       const adoptedBytes = adoptedBuffers.reduce((sum, buffer) => sum + buffer.byteLength, 0);
-      if (!this.grant.allocate(adoptedBytes)) {
-        this.#free(frame);
-        return null;
+      const adoptedSet = new Set(adoptedBuffers);
+      const prepaid = takeResultBuffers(this.#transfer, this.grant, adoptedSet);
+      if (prepaid !== null) {
+        // The source already charged this exact result grant. Move its cleanup owner,
+        // never free/reacquire or charge the payload a second time.
+        frame.extraBytes += prepaid;
+      } else {
+        if (!this.grant.allocate(adoptedBytes)) {
+          this.#free(frame);
+          return null;
+        }
+        frame.extraBytes += adoptedBytes;
+        this.#transfer?.reclassify?.(adoptedSet);
       }
-      frame.extraBytes += adoptedBytes;
-      this.#transfer?.reclassify?.(new Set(adoptedBuffers));
       this.#at = batch.length;
       this.#rows += batch.length;
       const result = this.#offer(frame, batch.length);

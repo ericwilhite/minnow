@@ -118,18 +118,22 @@ it.each([
 });
 
 it.each([false, true])(
-  "funds scratch before creating value-sized buffers (refuse=%s)",
+  "funds bounded canonical traversal without full-document key copies (refuse=%s)",
   (refuse) => {
     const bytes = new TextEncoder().encode('{"n":"' + "x".repeat(1000) + '"}');
-    const Native = globalThis.Uint8Array;
+    const Native = globalThis.Uint8Array,
+      NativeFrames = globalThis.Int32Array;
     let used = 0,
-      largeAllocations = 0;
+      peak = 0,
+      largeAllocations = 0,
+      frameAllocations = 0;
     const denied = new Error("JSON scratch credit refused");
     const memory = {
-      // eslint-disable-next-line require-yield -- tests the synchronous pre-allocation boundary
+      // eslint-disable-next-line require-yield -- synchronous pre-allocation boundary
       *take(n: number) {
-        if (refuse && n >= 2 * bytes.length) throw denied;
+        if (refuse && n >= 512) throw denied;
         used += n;
+        peak = Math.max(peak, used);
       },
       free(n: number) {
         used -= n;
@@ -138,11 +142,15 @@ it.each([false, true])(
     };
     globalThis.Uint8Array = new Proxy(Native, {
       construct(target, args) {
-        if (args[0] === bytes.length) {
-          if (used < 2 * bytes.length) throw new Error("JSON scratch allocated before admission");
-          largeAllocations++;
-        }
+        if (typeof args[0] === "number" && args[0] >= bytes.length) largeAllocations++;
         return Reflect.construct(target, args, target) as Uint8Array;
+      },
+    });
+    globalThis.Int32Array = new Proxy(NativeFrames, {
+      construct(target, args) {
+        if (used < 512) throw new Error("Traversal allocated before admission");
+        frameAllocations++;
+        return Reflect.construct(target, args, target) as Int32Array;
       },
     });
     try {
@@ -151,10 +159,13 @@ it.each([false, true])(
       const run = () => runToEnd(canonicalJsonb(bytes, sink, memory, slice));
       if (refuse) expect(run).toThrow(denied);
       else run();
-      expect(largeAllocations).toBe(refuse ? 0 : 2);
+      expect(largeAllocations).toBe(0);
+      expect(frameAllocations).toBe(refuse ? 0 : 1);
+      expect(peak).toBeLessThanOrEqual(1024);
       expect(used).toBe(0);
     } finally {
       globalThis.Uint8Array = Native;
+      globalThis.Int32Array = NativeFrames;
     }
   },
 );

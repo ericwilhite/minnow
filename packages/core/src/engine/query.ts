@@ -1,3 +1,4 @@
+import { rememberJsonCall, copyJsonCall, jsonCallSource } from "./json-call-sources.js";
 import { rememberDatePart, copyDatePart, isDatePart } from "./date-part-sources.js";
 import {
   sourceLocksRelation,
@@ -3026,6 +3027,7 @@ function cloneTreeValue(value: unknown): unknown {
   for (const key of Object.keys(value)) {
     copy[key] = cloneTreeValue((value as Record<string, unknown>)[key]);
   }
+  copyJsonCall(value, copy);
   copyDatePart(value, copy);
   copyFrameOffset(value, copy);
   copySeriesArgumentCount(value, copy);
@@ -4495,6 +4497,7 @@ export function mapChildExpressions(
             })),
           }),
     };
+    copyJsonCall(expression, mapped);
     copyDatePart(expression, mapped);
     return mapped;
   }
@@ -5461,7 +5464,10 @@ function timestampTextSite(
     wrapped ??= [...node.arguments];
     wrapped[index] = timestampTextCall(argument, style);
   });
-  return wrapped === undefined ? node : { ...node, arguments: wrapped };
+  if (wrapped === undefined) return node;
+  const mapped = { ...node, arguments: wrapped };
+  copyJsonCall(node, mapped);
+  return mapped;
 }
 
 /**
@@ -5754,7 +5760,7 @@ export function expandRowReferences(
       }
       const columns = sourceColumns(source);
       if (columns.length === 0 || columns.some((name) => name.startsWith("\0"))) return undefined;
-      return {
+      const call: Expression = {
         kind: "call",
         name: "JSON_OBJECT",
         arguments: columns.flatMap((name) => [
@@ -5762,6 +5768,8 @@ export function expandRowReferences(
           { kind: "column", reference: `${source.alias}.${name}` },
         ]),
       };
+      if (recordDeclaredTypes) rememberJsonCall(call, "ROW_OBJECT");
+      return call;
     };
     if (pass.probing) {
       // The probe only reads: `mapChildExpressions` copies every node it maps, and writing
@@ -12382,7 +12390,7 @@ class Parser {
         upper === "JSON_BUILD_OBJECT" ||
         upper === "JSONB_BUILD_OBJECT"
       ) {
-        return this.#jsonObject();
+        return this.#jsonObject(upper);
       }
       if (upper === "DATE") {
         // PostgreSQL's date(x) is the DATE cast spelled as a function.
@@ -12632,6 +12640,14 @@ class Parser {
         ...(distinct ? { distinct: true } : {}),
         ...(aggregateOrderBy === undefined ? {} : { aggregateOrderBy }),
       };
+      if (
+        recordDeclaredTypes &&
+        (upper.startsWith("JSON") ||
+          upper === "TO_JSON" ||
+          upper === "TO_JSONB" ||
+          upper === "ROW_TO_JSON")
+      )
+        rememberJsonCall(call, upper);
       if (recordDeclaredTypes && upper === "DATE_PART") rememberDatePart(call);
       return upper === "ARRAY_AGG"
         ? { kind: "call", name: "MINNOW_ARRAY_FROM_JSON", arguments: [call] }
@@ -12815,7 +12831,15 @@ class Parser {
    * and the flat `'k', v` pair list. Both become one call whose arguments alternate key and
    * value, so the evaluator has a single shape to read.
    */
-  #jsonObject(): Expression {
+  #jsonObject(source: string): Expression {
+    if (recordDeclaredTypes && source !== "JSON_OBJECT") {
+      const args = this.#punctuation(")") ? [] : this.#expressionList();
+      if (args.length > 0) this.#expectPunctuation(")");
+      const call: Expression = { kind: "call", name: "JSON_OBJECT", arguments: args };
+      rememberJsonCall(call, source);
+      return call;
+    }
+    let nativeSource = source;
     const args: Expression[] = [];
     if (!this.#punctuation(")")) {
       for (;;) {
@@ -12825,6 +12849,7 @@ class Parser {
           this.#keyword("VALUE");
           args.push(this.#expression());
         } else {
+          if (recordDeclaredTypes && source === "JSON_OBJECT") nativeSource = "JSON_OBJECT_ARRAY";
           this.#expectPunctuation(",");
           args.push(this.#expression());
         }
@@ -12832,7 +12857,9 @@ class Parser {
       }
       this.#expectPunctuation(")");
     }
-    return { kind: "call", name: "JSON_OBJECT", arguments: args };
+    const call: Expression = { kind: "call", name: "JSON_OBJECT", arguments: args };
+    if (recordDeclaredTypes) rememberJsonCall(call, nativeSource);
+    return call;
   }
 
   #overClause(): {
@@ -15658,7 +15685,9 @@ function defaultAlias(expression: Expression): string {
     if (operand?.kind === "column" || operand?.kind === "call") return defaultAlias(operand);
   }
   if (expression.kind === "call")
-    return isDatePart(expression) ? "date_part" : expression.name.toLowerCase();
+    return isDatePart(expression)
+      ? "date_part"
+      : (jsonCallSource(expression) ?? expression.name).toLowerCase();
   if (expression.kind === "wildcard")
     return expression.table === undefined ? "*" : `${expression.table}.*`;
   return "expression";

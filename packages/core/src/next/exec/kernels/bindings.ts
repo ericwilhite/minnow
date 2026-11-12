@@ -89,6 +89,14 @@ export const CASE_RESULT_KINDS: ReadonlySet<PhysicalKind> = new Set<PhysicalKind
 ]);
 
 export const FUNCTION_BINDINGS: Readonly<Record<string, Binding | PerOverload>> = {
+  json_object: { kernel: "json" },
+  jsonb_build_object: { kernel: "json" },
+  jsonb_build_array: { kernel: "json" },
+  to_jsonb: { kernel: "json" },
+  json_build_object: { kernel: "json" },
+  json_build_array: { kernel: "json" },
+  json_array: { kernel: "json" },
+  to_json: { kernel: "json" },
   json_get: per({
     "json,text": { kernel: "json" },
     "json,int4": { kernel: "json" },
@@ -239,8 +247,8 @@ export function castRefusal(from: SqlType, to: SqlType): string | null {
 }
 
 /** The SQL type `type` stands for in an overload slot (`T` takes any). */
-function matches(slot: SqlType | "T", type: PhysicalType): boolean {
-  return slot === "T" || sqlTypeOf(type) === slot;
+function matches(slot: SqlType | "T" | "any", type: PhysicalType): boolean {
+  return slot === "T" || slot === "any" || sqlTypeOf(type) === slot;
 }
 
 /**

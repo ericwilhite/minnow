@@ -231,7 +231,9 @@ describe("published core tarball", () => {
       // Native-only interval/series provenance: 1,023,531 packed / 4,436,274 unpacked
       // (+499 / +1,807 versus eef0ee76). No next/ or test files ship. Raise packed once
       // by 500; keep the unpacked cap and every package-isolation assertion.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_023_750);
+      // Native JSON call provenance: 1,024,131 packed bytes. Raise packed cap once by 500;
+      // rebuild code/tests stay excluded, and unpacked/isolation limits remain unchanged.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_024_250);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");
