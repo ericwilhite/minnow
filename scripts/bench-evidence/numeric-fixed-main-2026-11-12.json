@@ -317,8 +317,45 @@
     }
   },
   "reproduce": {
-    "command": "node scripts/next-numeric-fixed-component.mts --mode MODE --control CONTROL_FROZEN --candidate CANDIDATE_FROZEN --bundle INPUT --aa-report NEUTRAL_AA --output OUTPUT",
-    "policy": "Run identical-build --aa first, then matching A/B; nine fresh serial-worker AB/BA pairs, type7 IQR. See raw receipt for concrete frozen roots/input identities and original CLI."
+    "environment": "Node26.12.0; TMPDIR under /home/eric/.cache; output directories must be new. Frozen manifests pin runtime and dependencies.",
+    "commands": [
+      {
+        "cohort": "root/cohorts/component-aa",
+        "calibrate": "node scripts/next-numeric-fixed-component.mts --mode component --rows 1000000 --only agg_numeric_grouped --control /home/eric/.cache/b4-read-recipe/frozen-numeric-main-control3ad --aa --output /home/eric/.cache/b4-read-recipe/reproduce/numeric-fixed-main-2026-11-12-root-cohorts-component-aa-aa",
+        "observe": null
+      },
+      {
+        "cohort": "root/cohorts/plain",
+        "calibrate": "node scripts/next-numeric-fixed-component.mts --mode component --rows 1000000 --only agg_numeric_grouped --control /home/eric/.cache/b4-read-recipe/frozen-numeric-main-control3ad --aa --output /home/eric/.cache/b4-read-recipe/reproduce/numeric-fixed-main-2026-11-12-root-cohorts-plain-aa --plain",
+        "observe": null
+      },
+      {
+        "cohort": "root/cohorts/whole-aa",
+        "calibrate": "node scripts/next-numeric-fixed-component.mts --mode whole --rows 1000000 --only agg_numeric_grouped --control /home/eric/.cache/b4-read-recipe/frozen-numeric-main-control3ad --bundle /home/eric/.cache/b4-read-recipe/balanced-million-input/input.json --aa --output /home/eric/.cache/b4-read-recipe/reproduce/numeric-fixed-main-2026-11-12-root-cohorts-whole-aa-aa",
+        "observe": null
+      },
+      {
+        "cohort": "root/cohorts/scalar-aa",
+        "calibrate": "node scripts/next-numeric-fixed-component.mts --mode whole --rows 1000000 --only agg_numeric_sum --control /home/eric/.cache/b4-read-recipe/frozen-numeric-main-control3ad --bundle /home/eric/.cache/b4-read-recipe/balanced-million-input/input.json --aa --output /home/eric/.cache/b4-read-recipe/reproduce/numeric-fixed-main-2026-11-12-root-cohorts-scalar-aa-aa",
+        "observe": null
+      },
+      {
+        "cohort": "root/cohorts/component-ab",
+        "calibrate": "node scripts/next-numeric-fixed-component.mts --mode component --rows 1000000 --only agg_numeric_grouped --control /home/eric/.cache/b4-read-recipe/frozen-numeric-main-control3ad --aa --output /home/eric/.cache/b4-read-recipe/reproduce/numeric-fixed-main-2026-11-12-root-cohorts-component-ab-aa",
+        "observe": "node scripts/next-numeric-fixed-component.mts --mode component --rows 1000000 --only agg_numeric_grouped --control /home/eric/.cache/b4-read-recipe/frozen-numeric-main-control3ad --candidate /home/eric/.cache/b4-read-recipe/frozen-numeric-main-candidate-af232 --aa-report /home/eric/.cache/b4-read-recipe/reproduce/numeric-fixed-main-2026-11-12-root-cohorts-component-ab-aa/result.json --output /home/eric/.cache/b4-read-recipe/reproduce/numeric-fixed-main-2026-11-12-root-cohorts-component-ab-ab"
+      },
+      {
+        "cohort": "root/cohorts/whole-ab",
+        "calibrate": "node scripts/next-numeric-fixed-component.mts --mode whole --rows 1000000 --only agg_numeric_grouped --control /home/eric/.cache/b4-read-recipe/frozen-numeric-main-control3ad --bundle /home/eric/.cache/b4-read-recipe/balanced-million-input/input.json --aa --output /home/eric/.cache/b4-read-recipe/reproduce/numeric-fixed-main-2026-11-12-root-cohorts-whole-ab-aa",
+        "observe": "node scripts/next-numeric-fixed-component.mts --mode whole --rows 1000000 --only agg_numeric_grouped --control /home/eric/.cache/b4-read-recipe/frozen-numeric-main-control3ad --bundle /home/eric/.cache/b4-read-recipe/balanced-million-input/input.json --candidate /home/eric/.cache/b4-read-recipe/frozen-numeric-main-candidate-af232 --aa-report /home/eric/.cache/b4-read-recipe/reproduce/numeric-fixed-main-2026-11-12-root-cohorts-whole-ab-aa/result.json --output /home/eric/.cache/b4-read-recipe/reproduce/numeric-fixed-main-2026-11-12-root-cohorts-whole-ab-ab"
+      },
+      {
+        "cohort": "root/cohorts/scalar-ab",
+        "calibrate": "node scripts/next-numeric-fixed-component.mts --mode whole --rows 1000000 --only agg_numeric_sum --control /home/eric/.cache/b4-read-recipe/frozen-numeric-main-control3ad --bundle /home/eric/.cache/b4-read-recipe/balanced-million-input/input.json --aa --output /home/eric/.cache/b4-read-recipe/reproduce/numeric-fixed-main-2026-11-12-root-cohorts-scalar-ab-aa",
+        "observe": "node scripts/next-numeric-fixed-component.mts --mode whole --rows 1000000 --only agg_numeric_sum --control /home/eric/.cache/b4-read-recipe/frozen-numeric-main-control3ad --bundle /home/eric/.cache/b4-read-recipe/balanced-million-input/input.json --candidate /home/eric/.cache/b4-read-recipe/frozen-numeric-main-candidate-af232 --aa-report /home/eric/.cache/b4-read-recipe/reproduce/numeric-fixed-main-2026-11-12-root-cohorts-scalar-ab-aa/result.json --output /home/eric/.cache/b4-read-recipe/reproduce/numeric-fixed-main-2026-11-12-root-cohorts-scalar-ab-ab"
+      }
+    ],
+    "policy": "Always fresh neutral identical-build A/A before A/B;9balanced pairs,10warmups/10lifetimes,type7 IQR. No concurrent own CPU jobs."
   },
   "limits": [
     "Node26.12 CPU, no browser/RSS/absolute GateB claim.",

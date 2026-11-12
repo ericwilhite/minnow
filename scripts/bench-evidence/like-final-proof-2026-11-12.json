@@ -1,0 +1,428 @@
+{
+  "schema": "B4-like-proof-summary-v1",
+  "status": "full gate green",
+  "sourceRevision": "9f541889a138cc1b4421f2f0f26607acde1b6553",
+  "sources": {
+    "packages/core/src/next/README.md": "7157582d9d72ebbfb3e0d2e0a49cfa55981eadd1056704ca8d661e166079b767",
+    "packages/core/src/next/exec/kernels/compile.ts": "0a25e827406ec62965d6e671873e5f15368b6574816417836c108dca9ee01d84",
+    "packages/core/src/next/exec/kernels/like-case.ts": "0a189563f5ba24c6be8cbd2381abb3cd1324d66d8dbc4caa3f27128ce0e2621d",
+    "packages/core/src/next/exec/kernels/like-pglite.test.ts": "28c32c5d73c35c29aefc7c1b153ec4b84e56ab4871375edaf2b94a0cd6bacf06",
+    "packages/core/src/next/exec/kernels/like.ts": "63da504ba9c8c4ac5e30b267563b9f209d685ffeb1c8149d52c94826c901380d",
+    "packages/core/src/next/exec/star-bound.ts": "91db925612f154537484462300100ecf20ea35eb5c2f5f38612c271a30181708",
+    "packages/core/src/next/ir/ir.ts": "dc0ac8b8fc47a1a388cad865e19e51eff4eae39b7476073f13939f8ebc564370",
+    "packages/core/src/next/lower/expressions.ts": "770d05d6d52368ad50ee826e87af0e6aa8fc2281269ecc6faeb89492970c71e6",
+    "packages/core/src/next/testing/executor-like.test.ts": "56f3e9c0b8b70d24143fda0d1544410bbc9b4697aa76e7e60bd0d8245e625436",
+    "packages/core/src/next/testing/executor-star-dictionary.test.ts": "8ce45fa854e6f88d838ed43b3178c20f7df7af2ea93ce0efed51187f696837ee",
+    "packages/core/src/testing/reach.ts": "01d2d95e284487e88443c3c5608e3a290794053296b808eb218dad65d87d9f68",
+    "scripts/generate-like-case.mts": "3cea3414a46f1d04baae945ecf92e2ac90ec20e18e1f9b34e92d3d9fbf3b78b0"
+  },
+  "law": {
+    "matching": "https://www.postgresql.org/docs/18/functions-matching.html",
+    "traversal": "https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/utils/adt/like_match.c",
+    "ctype": "Lead2026-11-12: default/default-collation C.UTF-8 simple lowercase; explicit C/POSIX ASCII-only. PGlite authority, no host JS casing.",
+    "constantFolding": "Lead2026-11-12: preserve uniform unopened LIMIT0, no LIKE-only folder. next SELECT1/0 LIMIT0=[]; PG22012. LIKE constant invalid pattern can similarly differ PG22025; OPEN-ISSUES records uniform future fix."
+  },
+  "correctness": {
+    "focused": "like-final-green.log:5files16tests",
+    "node22": "like-node22.log:3files8tests",
+    "mutants": [
+      "parent LIKE refusal rejected",
+      "UTF8 byte stepping rejected",
+      "ASCII-only default rejected",
+      "star eligibility disabled rejected"
+    ],
+    "mutantLogs": [
+      "/home/eric/.cache/b4-read-recipe/like-mutant-parent.log",
+      "/home/eric/.cache/b4-read-recipe/like-mutant-byte-underscore.log",
+      "/home/eric/.cache/b4-read-recipe/like-mutant-ascii-default.log",
+      "/home/eric/.cache/b4-read-recipe/like-mutant-star-disabled.log"
+    ],
+    "reach": [
+      "LIKE_REACH160runs x2 seeds0xb781/0xb782",
+      "next-like-sql64runs x2seeds0xb783/0xb784",
+      "STAR_SQL_REACH28runs x2 originalseeds0xb76b/0xb76c, original cases/seeds retained"
+    ],
+    "unicodeOracle": "All valid Unicode scalars1..10FFFF checked against PG lower;1364changed pairs compressed174ranges;124 host-JS differences avoided.",
+    "casePairHash": "15c04fa82ef4ab57582e5e6bdf7d9928ba38248cf969f31ae9d9053d0f1aeac1",
+    "regen": "TMPDIR=/home/eric/.cache/b4-read-recipe/tmp node scripts/generate-like-case.mts && npx prettier --write packages/core/src/next/exec/kernels/like-case.ts",
+    "initialCorrections": [
+      "test lint assertions/template types fixed",
+      "constant LIMIT0 expected-PG equality failed; separated as explicitly approved uniform planning difference, not silently waived"
+    ]
+  },
+  "shippedEngineUnchanged": {
+    "probe": "/home/eric/.cache/b4-read-recipe/shipped-ilike-probe.json",
+    "probeSha256": "850a8c7ecb93b26151530067fafdafe79ec27cfebac41f1e0582909416590d61",
+    "differences": [
+      {
+        "v": "\u0130",
+        "pat": "i",
+        "pg": true,
+        "shipped": false
+      },
+      {
+        "v": "\u03c2",
+        "pat": "\u03a3",
+        "pg": false,
+        "shipped": true
+      },
+      {
+        "v": "\u24b6",
+        "pat": "\u24d0",
+        "pg": false,
+        "shipped": true
+      },
+      {
+        "sql": "SELECT '\u00c4' COLLATE \"C\" ILIKE '\u00e4' AS x",
+        "shipped": [
+          {
+            "x": true
+          }
+        ],
+        "pg": [
+          {
+            "x": false
+          }
+        ]
+      },
+      {
+        "sql": "SELECT '\u0130' ILIKE 'i' AS x",
+        "shipped": [
+          {
+            "x": false
+          }
+        ],
+        "pg": [
+          {
+            "x": true
+          }
+        ]
+      }
+    ]
+  },
+  "compactedBenchArchives": [
+    {
+      "summary": "scripts/bench-evidence/star-dictionary-component-2026-11-12.json",
+      "summaryBytes": 10393,
+      "rawSha256": "dd30188a414d1d08faed4c4881b97babb34d0e6715a639c97146b7262a038a55",
+      "rawCache": "/home/eric/.cache/b4-read-recipe/raw-bench-archive/star-dictionary-component-2026-11-12-dd30188a414d.json"
+    },
+    {
+      "summary": "scripts/bench-evidence/star-sql-main-2026-11-12.json",
+      "summaryBytes": 8339,
+      "rawSha256": "bfdc0bf252d7419a3aa914d405290b9ddd405f067fa042b84fc733786fce9c51",
+      "rawCache": "/home/eric/.cache/b4-read-recipe/raw-bench-archive/star-sql-main-2026-11-12-bfdc0bf252d7.json"
+    },
+    {
+      "summary": "scripts/bench-evidence/numeric-fixed-main-2026-11-12.json",
+      "summaryBytes": 23151,
+      "rawSha256": "36049552a494e4296efa5246823e60b947d65ca6b288d21230ecd2186fcd448b",
+      "rawCache": "/home/eric/.cache/b4-read-recipe/raw-bench-archive/numeric-fixed-main-2026-11-12-36049552a494.json"
+    },
+    {
+      "summary": "scripts/bench-evidence/star-analytics-float-2026-11-12.json",
+      "summaryBytes": 7790,
+      "rawSha256": "ee90b8304cde1acfa4d6eee110c9d01f85586b2847073aa20b6c0c6f68968334",
+      "rawCache": "/home/eric/.cache/b4-read-recipe/raw-bench-archive/star-analytics-float-2026-11-12-ee90b8304cde.json"
+    },
+    {
+      "summary": "scripts/bench-evidence/star-analytics-attributes-2026-11-12.json",
+      "summaryBytes": 8115,
+      "rawSha256": "245cb70580db1f8fd36c942e43be7fc0775af16f034cb20385192711cff56222",
+      "rawCache": "/home/eric/.cache/b4-read-recipe/raw-bench-archive/star-analytics-attributes-2026-11-12-245cb70580db.json"
+    },
+    {
+      "summary": "scripts/bench-evidence/star-analytics-final-2026-11-12.json",
+      "summaryBytes": 14583,
+      "rawSha256": "bc763a33e40ac900b4b9f08ee2f1a8c5b430d334f9d5240e89c99ed0e5b1f665",
+      "rawCache": "/home/eric/.cache/b4-read-recipe/raw-bench-archive/star-analytics-final-2026-11-12-bc763a33e40a.json"
+    }
+  ],
+  "gate": {
+    "commit": "9f541889a138cc1b4421f2f0f26607acde1b6553",
+    "ci": false,
+    "maxWorkers": 2,
+    "records": [
+      {
+        "name": "build",
+        "command": ["npm", "run", "build"],
+        "exit": 0,
+        "seconds": 324.6830709329806,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-build.log"
+      },
+      {
+        "name": "typecheck",
+        "command": ["npm", "run", "typecheck"],
+        "exit": 0,
+        "seconds": 440.3738038269803,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-typecheck.log"
+      },
+      {
+        "name": "lint",
+        "command": ["npm", "run", "lint"],
+        "exit": 0,
+        "seconds": 633.1099348339485,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-lint.log"
+      },
+      {
+        "name": "format",
+        "command": ["npm", "run", "format"],
+        "exit": 0,
+        "seconds": 190.39153186406475,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-format.log"
+      },
+      {
+        "name": "api",
+        "command": ["npm", "run", "api:check"],
+        "exit": 0,
+        "seconds": 159.3019629509654,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-api.log"
+      },
+      {
+        "name": "version",
+        "command": ["npm", "run", "version:check"],
+        "exit": 0,
+        "seconds": 1.024475124082528,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-version.log"
+      },
+      {
+        "name": "resolver",
+        "command": [
+          "node",
+          "-e",
+          "const p=require.resolve('@minnowdb/core/package.json');if(!p.startsWith(process.cwd()+'/'))throw new Error(p);console.log(p)"
+        ],
+        "exit": 0,
+        "seconds": 0.06408701406326145,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-resolver.log"
+      },
+      {
+        "name": "g1",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/page",
+          "packages/core/src/next/format",
+          "packages/core/src/next/memory",
+          "packages/core/src/next/hash",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 126.21742869901937,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-g1.log",
+        "files": 45,
+        "tests": 474
+      },
+      {
+        "name": "g2",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/storage",
+          "packages/core/src/next/spill",
+          "packages/core/src/next/access",
+          "packages/core/src/next/keys",
+          "packages/core/src/next/vector",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 238.9041990180267,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-g2.log",
+        "files": 42,
+        "tests": 593
+      },
+      {
+        "name": "g3",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/exec",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 441.3254500289913,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-g3.log",
+        "files": 153,
+        "tests": 1615
+      },
+      {
+        "name": "g4-ir",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/ir",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 0.5967689719982445,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-g4-ir.log",
+        "files": 2,
+        "tests": 7
+      },
+      {
+        "name": "g4-lower",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/lower",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 2.7259628099855036,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-g4-lower.log",
+        "files": 8,
+        "tests": 56
+      },
+      {
+        "name": "g4-owner",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/owner",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 1.064734857995063,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-g4-owner.log",
+        "files": 4,
+        "tests": 28
+      },
+      {
+        "name": "g4-testing",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/testing",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 488.62135961209424,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-g4-testing.log",
+        "files": 168,
+        "tests": 1028
+      },
+      {
+        "name": "g4-dependency-rules",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/dependency-rules",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 0.9148749649757519,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-g4-dependency-rules.log",
+        "files": 1,
+        "tests": 3
+      },
+      {
+        "name": "g4-types",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/types",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 0.5538016220089048,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-g4-types.log",
+        "files": 1,
+        "tests": 28
+      },
+      {
+        "name": "g4-write",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/write",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 840.7924428799888,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-g4-write.log",
+        "files": 127,
+        "tests": 712
+      },
+      {
+        "name": "g5",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/browser/next-storage-run.test.ts",
+          "packages/core/src/tree-shaking.test.ts",
+          "packages/kysely/src/tree-shaking.test.ts",
+          "packages/core/src/testing/seeds.test.ts",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 5.644599794992246,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-g5.log",
+        "files": 4,
+        "tests": 64
+      },
+      {
+        "name": "g6-scripts",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "scripts",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 82.58028336998541,
+        "log": "/home/eric/.cache/b4-read-recipe/like-full-gate-g6-scripts.log",
+        "files": 44,
+        "tests": 223
+      }
+    ],
+    "complete": true
+  },
+  "gateTotals": {
+    "fileRuns": 599,
+    "tests": 4831
+  },
+  "limits": [
+    "Literal ESCAPE syntax is the existing frontend boundary; no shipped parser change. Kernel IR validates empty/single-codepoint escape and22025.",
+    "SIMILAR TO and other explicit collations remain typed unsupported.",
+    "Constant-space greedy matching, worst-case polynomial retry; no performance claim, regex, recursion or row/pattern-sized work allocation.",
+    "Only constant nonthrowing patterns enter pre-encoding star filters; variable/invalid patterns use generic execution.",
+    "General immutable constant-fold error timing intentionally remains per lead ruling; no LIKE-only constant folder.",
+    "No raw benchmark samples added; compact summaries and curated semantic witnesses only."
+  ]
+}

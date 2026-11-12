@@ -99,8 +99,20 @@
     }
   },
   "reproduce": {
-    "command": "node scripts/next-star-component.mts --mode whole --only QUERY --control CONTROL_FROZEN --candidate CANDIDATE_FROZEN --bundle INPUT --aa-report NEUTRAL_AA --output OUTPUT",
-    "policy": "Run identical-build --aa first, then matching A/B; nine fresh serial-worker AB/BA pairs, type7 IQR. See raw receipt for concrete frozen roots/input identities and original CLI."
+    "environment": "Node26.12.0; TMPDIR under /home/eric/.cache; output directories must be new. Frozen manifests pin runtime and dependencies.",
+    "commands": [
+      {
+        "cohort": "root/reports/wholeAA",
+        "calibrate": "node scripts/next-star-component.mts --mode whole --rows 1000000 --only join_star_3dims --control /home/eric/.cache/b4-read-recipe/frozen-numeric-main-candidate-af232 --bundle /home/eric/.cache/b4-read-recipe/balanced-million-input/input.json --aa --output /home/eric/.cache/b4-read-recipe/reproduce/star-sql-main-2026-11-12-root-reports-wholeAA-aa",
+        "observe": null
+      },
+      {
+        "cohort": "root/reports/wholeAB",
+        "calibrate": "node scripts/next-star-component.mts --mode whole --rows 1000000 --only join_star_3dims --control /home/eric/.cache/b4-read-recipe/frozen-numeric-main-candidate-af232 --bundle /home/eric/.cache/b4-read-recipe/balanced-million-input/input.json --aa --output /home/eric/.cache/b4-read-recipe/reproduce/star-sql-main-2026-11-12-root-reports-wholeAB-aa",
+        "observe": "node scripts/next-star-component.mts --mode whole --rows 1000000 --only join_star_3dims --control /home/eric/.cache/b4-read-recipe/frozen-numeric-main-candidate-af232 --bundle /home/eric/.cache/b4-read-recipe/balanced-million-input/input.json --candidate /home/eric/.cache/b4-read-recipe/frozen-star-sql-dc86d11b --aa-report /home/eric/.cache/b4-read-recipe/reproduce/star-sql-main-2026-11-12-root-reports-wholeAB-aa/result.json --output /home/eric/.cache/b4-read-recipe/reproduce/star-sql-main-2026-11-12-root-reports-wholeAB-ab"
+      }
+    ],
+    "policy": "Always fresh neutral identical-build A/A before A/B;9balanced pairs,10warmups/10lifetimes,type7 IQR. No concurrent own CPU jobs."
   },
   "limits": [
     "Node CPU only; no browser throughput, RSS, wall-time or absolute Gate B acceptance.",
