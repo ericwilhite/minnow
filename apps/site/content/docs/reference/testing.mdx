@@ -1369,6 +1369,13 @@ ordinary complete decoder. Optional preparation scratch does not increase execut
 minimum. Explicit non-retaining export bypasses owner admission and promotion. Query cleanup
 drains pending readers before releasing its facts; owner close clears roots and removes the
 cache binding. Visibility, deletion masks and snapshot-specific hints are never shared there.
+`next/page/directory-native-budget.test.ts` measures a fresh reader's complete page-load peak,
+then repeats the load through a parsed-directory hit at that same fixed budget. Generated wide
+floats and sparse NULLs check that optional metadata does not consume the admitted page
+workspace. Set `MINNOW_NATIVE_DIRECTORY_RUNTIME_URL` to a frozen runtime's root file URL
+(with a trailing slash) to replay the same law against a historical implementation. Every
+history runs against its parsed cache; versions with query-local preparation use that cache.
+
 `next/testing/validated-root.test.ts` checks selective and complete equality, unselected corruption,
 full identity, byte ownership, concurrent and cancelled borrowers, refusal and zero charges.
 `next/testing/root-reuse.test.ts` checks real executor source equality and validation reuse across

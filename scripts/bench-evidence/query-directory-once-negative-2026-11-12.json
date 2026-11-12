@@ -1,0 +1,154 @@
+{
+  "decision": "revert unaccepted experiment; not a performance gain",
+  "parent": "b5b23cf4a03e589079cfa44f4819506cea3c3260",
+  "candidate": "aa99aed9cab8e51f5dc143ac95e626fbe0631a69",
+  "evidence": "/home/eric/.cache/b2-read-once/REPORT.md",
+  "protocol": {
+    "affinity": "1-2",
+    "freshProcesses": 72,
+    "pairsPerComparison": 9,
+    "balancedStartupAndExecution": true,
+    "warmups": 10,
+    "completeLifetimesPerSample": 100,
+    "metric": "natural all-thread user+system CPU including GC; setup and verification excluded",
+    "biasFloorMs": 2.806979999999996,
+    "acceptance": "paired gain exceeds max(bias floor,matching AA magnitude)+paired IQR and >=7/9 favourable"
+  },
+  "fixture": {
+    "rows": 1000000,
+    "storedColumns": 200,
+    "selectedColumns": 3,
+    "independentGroups": 163,
+    "manifestSha256": "5bd1f5392dfe59ce931dd7cbdcca838b8c91e701f7a819aabc086681beb11ac9",
+    "outputFingerprint": "97b14146621e541062f85387b8c89b33f935c74f3a595ba8980833ecc379258e"
+  },
+  "summary": {
+    "aa-component": {
+      "parentMedianCPUMs": 10.152899999999999,
+      "candidateMedianCPUMs": 9.62919,
+      "pairedMedianDeltaMs": -0.7528000000000006,
+      "pairedIQRMs": 3.4023400000000006,
+      "favourablePairs": 5,
+      "pairs": 9,
+      "acceptedGain": false,
+      "acceptedRegression": false,
+      "wallPairedMedianDeltaMs": -0.3303226299999995,
+      "wallPairedIQRMs": 2.2420797799999947,
+      "load1Range": [7.03, 9.13]
+    },
+    "aa-whole": {
+      "parentMedianCPUMs": 49.5415,
+      "candidateMedianCPUMs": 49.28072,
+      "pairedMedianDeltaMs": -0.8858800000000073,
+      "pairedIQRMs": 14.948379999999986,
+      "favourablePairs": 5,
+      "pairs": 9,
+      "acceptedGain": false,
+      "acceptedRegression": false,
+      "wallPairedMedianDeltaMs": -1.4485669199999833,
+      "wallPairedIQRMs": 14.083751179999986,
+      "load1Range": [3.45, 10.55]
+    },
+    "ab-component": {
+      "parentMedianCPUMs": 5.24317,
+      "candidateMedianCPUMs": 6.264959999999999,
+      "pairedMedianDeltaMs": 0.8997999999999999,
+      "pairedIQRMs": 2.3172800000000002,
+      "favourablePairs": 1,
+      "pairs": 9,
+      "acceptedGain": false,
+      "acceptedRegression": false,
+      "wallPairedMedianDeltaMs": 0.18123500999999553,
+      "wallPairedIQRMs": 1.7629847799999974,
+      "load1Range": [3.22, 4.58]
+    },
+    "ab-whole": {
+      "parentMedianCPUMs": 46.166199999999996,
+      "candidateMedianCPUMs": 44.71053,
+      "pairedMedianDeltaMs": 2.381930000000004,
+      "pairedIQRMs": 8.891509999999997,
+      "favourablePairs": 3,
+      "pairs": 9,
+      "acceptedGain": false,
+      "acceptedRegression": false,
+      "wallPairedMedianDeltaMs": 0.8942075200000019,
+      "wallPairedIQRMs": 8.24494923999999,
+      "load1Range": [3.53, 4.95]
+    }
+  },
+  "mechanism": {
+    "activeReaderOpensBefore": 978,
+    "activeReaderOpensAfter": 489,
+    "uniqueChunks": 489,
+    "candidatePreparationVisits": 978,
+    "candidateDirectoryMisses": 489,
+    "candidateDirectoryHits": 489,
+    "candidateDirectoryBytesBeforeClose": 4569216,
+    "onlyOpenedColumns": [76, 80, 84]
+  },
+  "correctnessBlocker": {
+    "description": "optional cached-directory borrow consumes later page workspace at the old native ByteBudget peak",
+    "source": "native-cap-probe.mts in evidence directory",
+    "sourceSha256": "e2d8531bd451e6d076d480f7a4d53b4761002cb56bfb3f1d89d77ff4641e5b4c",
+    "rows": 2048,
+    "values": "Math.sin(row)*1.4142135623730951",
+    "ordinaryPeakBytes": 16976,
+    "candidateDirectoryHoldBytes": 9136,
+    "refusedPageBytes": 16400,
+    "error": "MINNOW_READ_DENIED",
+    "finalBudgetBytes": 0,
+    "finalGovernorBytes": 0
+  },
+  "diagnosticV8SelfTime": {
+    "isolatedComponentLifetimes": 1000,
+    "sampledMainIsolateOnly": true,
+    "candidateFullKeyPinUnpinAdmitTakePercent": 28.40766420059134,
+    "parentGCPercent": 3.362949339826631,
+    "candidateGCPercent": 5.740351964467857,
+    "notPairedAcceptance": true
+  },
+  "frozenInputs": {
+    "parent": 2708,
+    "candidate": 2714
+  },
+  "benchmarkSourcesAtCandidate": {
+    "query-root-bench.mts": "e8d6ac312157818f18a7a021e87693b8d544d4eed42fe0a4787eb9bc4154f6e9",
+    "query-root-component.mts": "e07f78da2f8429f26f5e340c4dd3af4304163282742ea856a41f5dfaa4ee0efb",
+    "next-executor-quiet.mts": "568a59755fdc562dfe2a7bac2a884a9a200e19c5a069f0ff403bcb8a78b15f7f",
+    "next-percentile-component.mts": "af1a8c9a9207f23d9e351653a020f7848efd44621fb1117b138204394f922cd9",
+    "query-root-runtime-worker.mts": "2ad7ca804c6ecf11e1762f40def72bd857b49f5159305462e6e81149af336722",
+    "query-root-component-worker.mts": "33adafeb8c404a35bc057b33af8e66aca41dc750045fa4a0351deefffd0c70c3",
+    "query-chunk-component.mts": "262708570ea7e3aa21dc6ac9ee098fc07fca6a855711db269a3e8a40b1fe702b",
+    "query-chunk-component-worker.mts": "21678662687cd3e9eaccf66b6e8ec3b405f56565f04ed2df49dcd0b6dfc8dfec",
+    "next-sort-runtime-worker.mts": "38d0f2a9ff9207f7d73e039e257a962449b317c7563256f57ec32bc64520d289",
+    "lib/independent-cpu.mts": "d5e9ee1df420f4cdc5f6709d0e29cbcc19b1f547d8e66c1063b32bff12894b4c",
+    "lib/native-storage-image.mts": "3d1f40b48ff450bdb01119b90e70b6bcc15e631047f5b701ed26ab4fe3f41674",
+    "lib/query-root-lifetimes.mts": "d37de77e8eb6ca712eadd8584eab227d724170965c66f3538dc5d76602041480",
+    "lib/paired-cpu.mts": "6c578f94613567937737d5be128634d293665fa1c87db3376324aa260873da69",
+    "next-executor-workload/gen.mjs": "8b3d70312ac54a87e69f2a0672ed49b024baab7cf9097d92cf6e11da0189fd95",
+    "next-executor-workload/queries.mjs": "abcc9f2809d04270569fe6b9e37867978d0c4c82e8a5ea331461d6f3a37347f2"
+  },
+  "limits": [
+    "No adopted production change; benchmark code survives at the candidate commit and in its frozen archive.",
+    "No browser RSS, OPFS cold export or Gate A absolute-throughput claim.",
+    "Candidate full next run interrupted on discovering the native-budget refusal; do not describe it as green.",
+    "Restored runtime must be verified separately; current main baseline is parent, not the rejected output-copy pair."
+  ],
+  "generatedRegression": {
+    "test": "packages/core/src/next/page/directory-native-budget.test.ts",
+    "seeds": ["0xb327", "0xb328"],
+    "historiesPerSeed": 12,
+    "reach": "NATIVE_DIRECTORY_BUDGET_REACH",
+    "dimensions": [
+      "2048..3072 wide f64 rows",
+      "independent NULL period 2..17",
+      "all valid or sparse NULLs",
+      "exact cold page-load budget followed by a parsed-cache hit"
+    ],
+    "runtimeReplayVariable": "MINNOW_NATIVE_DIRECTORY_RUNTIME_URL (file URL ending in /)",
+    "candidate": "RED /2 seed failures, MINNOW_READ_DENIED at page load",
+    "parent": "GREEN /2 seeds",
+    "restored": "GREEN /2 seeds",
+    "mutant": "same frozen rejected candidate reintroduces optional metadata credit consumption and is rejected"
+  }
+}

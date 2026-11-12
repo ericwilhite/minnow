@@ -4472,3 +4472,13 @@ export const STAR_FLOAT_REACH = [
   "bit exact result",
   "PG ordered transitions",
 ] as const;
+
+export const NATIVE_DIRECTORY_BUDGET_REACH = [
+  "parsed cache hit",
+  "independent native peak",
+  "wide float payload",
+  "sparse NULLs",
+  "all valid",
+  "fixed native peak funds page loads",
+  "zero charges after cleanup",
+] as const;
