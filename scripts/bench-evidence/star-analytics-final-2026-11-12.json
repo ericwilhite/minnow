@@ -5,60 +5,13 @@
   "base": "86635f0fd0a9ce63213695d41ee4a810c5d3cf9b",
   "summary": {
     "float": {
-      "receipt": "scripts/bench-evidence/star-analytics-float-2026-11-12.json",
+      "receipt": "/home/eric/.cache/b4-read-recipe/raw-bench-archive/star-analytics-float-2026-11-12-ee90b8304cde.json",
       "sha256": "ee90b8304cde1acfa4d6eee110c9d01f85586b2847073aa20b6c0c6f68968334",
       "codeRevision": "c4612c8297cd187a87f476f541cc82a2e82984db",
       "controlRevision": "86635f0fd0a9ce63213695d41ee4a810c5d3cf9b",
       "controlMedianMs": 1748.6754,
       "candidateMedianMs": 762.514,
       "pairs": {
-        "pairs": [
-          {
-            "control": 1807.9678,
-            "candidate": 656.2347,
-            "delta": -1151.7331
-          },
-          {
-            "control": 1673.0314999999998,
-            "candidate": 825.7323,
-            "delta": -847.2991999999998
-          },
-          {
-            "control": 1991.9608,
-            "candidate": 734.8719,
-            "delta": -1257.0889000000002
-          },
-          {
-            "control": 1639.2537,
-            "candidate": 763.3235,
-            "delta": -875.9302
-          },
-          {
-            "control": 1748.6754,
-            "candidate": 762.514,
-            "delta": -986.1614000000001
-          },
-          {
-            "control": 1924.2087999999999,
-            "candidate": 822.6126,
-            "delta": -1101.5962
-          },
-          {
-            "control": 1676.9485,
-            "candidate": 766.4519,
-            "delta": -910.4966
-          },
-          {
-            "control": 1583.9962,
-            "candidate": 755.4163,
-            "delta": -828.5799000000001
-          },
-          {
-            "control": 1907.4953,
-            "candidate": 718.4509,
-            "delta": -1189.0444
-          }
-        ],
         "medianDeltaMs": -986.1614000000001,
         "q1DeltaMs": -1151.7331,
         "q3DeltaMs": -875.9302,
@@ -72,64 +25,22 @@
         "requiredFavourable": 7,
         "acceptedGain": true,
         "significantRegression": false,
-        "noRegression": true
-      }
+        "noRegression": true,
+        "pairDeltasMs": [
+          -1151.7331, -847.2991999999998, -1257.0889000000002, -875.9302, -986.1614000000001,
+          -1101.5962, -910.4966, -828.5799000000001, -1189.0444
+        ]
+      },
+      "compactSummary": "scripts/bench-evidence/star-analytics-float-2026-11-12.json"
     },
     "attributes": {
-      "receipt": "scripts/bench-evidence/star-analytics-attributes-2026-11-12.json",
+      "receipt": "/home/eric/.cache/b4-read-recipe/raw-bench-archive/star-analytics-attributes-2026-11-12-245cb70580db.json",
       "sha256": "245cb70580db1f8fd36c942e43be7fc0775af16f034cb20385192711cff56222",
       "codeRevision": "0cfbc2e7a76d969aba034e74d41e86395e5cbf2c",
       "controlRevision": "c4612c8297cd187a87f476f541cc82a2e82984db",
       "controlMedianMs": 387.8644,
       "candidateMedianMs": 297.0167,
       "pairs": {
-        "pairs": [
-          {
-            "control": 411.7741,
-            "candidate": 297.0167,
-            "delta": -114.75739999999996
-          },
-          {
-            "control": 409.98429999999996,
-            "candidate": 306.67379999999997,
-            "delta": -103.31049999999999
-          },
-          {
-            "control": 366.6989,
-            "candidate": 294.62510000000003,
-            "delta": -72.07379999999995
-          },
-          {
-            "control": 353.63919999999996,
-            "candidate": 248.7262,
-            "delta": -104.91299999999995
-          },
-          {
-            "control": 427.13149999999996,
-            "candidate": 310.5232,
-            "delta": -116.60829999999999
-          },
-          {
-            "control": 426.9799,
-            "candidate": 416.9569,
-            "delta": -10.022999999999968
-          },
-          {
-            "control": 387.8644,
-            "candidate": 321.5132,
-            "delta": -66.3512
-          },
-          {
-            "control": 359.9905,
-            "candidate": 284.5177,
-            "delta": -75.4728
-          },
-          {
-            "control": 355.37,
-            "candidate": 263.152,
-            "delta": -92.21800000000002
-          }
-        ],
         "medianDeltaMs": -92.21800000000002,
         "q1DeltaMs": -104.91299999999995,
         "q3DeltaMs": -72.07379999999995,
@@ -143,8 +54,13 @@
         "requiredFavourable": 7,
         "acceptedGain": true,
         "significantRegression": false,
-        "noRegression": true
-      }
+        "noRegression": true,
+        "pairDeltasMs": [
+          -114.75739999999996, -103.31049999999999, -72.07379999999995, -104.91299999999995,
+          -116.60829999999999, -10.022999999999968, -66.3512, -75.4728, -92.21800000000002
+        ]
+      },
+      "compactSummary": "scripts/bench-evidence/star-analytics-attributes-2026-11-12.json"
     }
   },
   "timedPids": [
@@ -479,5 +395,10 @@
     "One-to-three INNER joins and TEXT dimension attributes; safe predicates only, otherwise exact generic fallback.",
     "Node whole-query CPU only; fresh serial worker per sample,10 warmups/10 timed complete lifetimes,9 AB/BA,type7 IQR, neutral matching AA. No component/browser/RSS/wall-time/absolute-target or unrelated-shape throughput claim.",
     "Initial foreground gate build deliberately stopped only own PID tree to avoid tool lifetime; saved *.foreground-start logs. Detached full gate restarted clean; no interrupted test results credited."
-  ]
+  ],
+  "rawArchive": {
+    "path": "/home/eric/.cache/b4-read-recipe/raw-bench-archive/star-analytics-final-2026-11-12-bc763a33e40a.json",
+    "sha256": "bc763a33e40ac900b4b9f08ee2f1a8c5b430d334f9d5240e89c99ed0e5b1f665",
+    "bytes": 16396
+  }
 }

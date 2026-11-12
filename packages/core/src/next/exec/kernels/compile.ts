@@ -10,6 +10,7 @@
  *   a kernel or a refusal. Anything else is `UnsupportedPlanError` here, never a wrong answer
  *   later.
  */
+import { compileLike } from "./like.js";
 import { compileIntervalExtract } from "./interval-extract.js";
 import { compileCalendarAdd } from "./calendar-add.js";
 import type { ScalarExpr } from "../../ir/ir.js";
@@ -152,7 +153,15 @@ export function compileExpr(expr: ScalarExpr, context: CompileContext): Compiled
         arena,
       );
     case "like":
-      throw new UnsupportedPlanError("LIKE (text kernels come next)");
+      return compileLike(
+        expr.mode,
+        expr.negated,
+        sub(expr.arg),
+        sub(expr.pattern),
+        expr.escape,
+        expr.collation,
+        arena,
+      );
     case "call":
       return compileCall(expr, context);
   }

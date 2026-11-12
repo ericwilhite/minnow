@@ -1766,6 +1766,19 @@ shipped-engine or stored-format change.
   dictionaries are first-seen order): a dictionary small for its batch is ranked by value once,
   and a group's best gets its place among those ranks by a binary search over values when the
   dictionary first meets it. Groups and dictionaries are only ever compared by value.
+- `kernels/like.ts`: LIKE/ILIKE and their negations match UTF-8 characters (`_`) and
+  arbitrary character sequences (`%`), with default backslash, literal Unicode ESCAPE,
+  or disabled escape (`ESCAPE ''`). NULL operands propagate; only selected rows run.
+  Matching uses constant-space cursors, no regular expression or decoded whole-row string.
+  Default/default-collation ILIKE uses the pinned PostgreSQL C.UTF-8 simple lowercase
+  table in `like-case.ts`; explicit C/POSIX folds ASCII only. This is the future database
+  ctype hook, independent of host JS Unicode versions. Other explicit collations and
+  SIMILAR TO remain typed unsupported. The frontend currently accepts literal ESCAPE only.
+  Safe literal patterns can filter dimensions before encoding; variable or invalid patterns
+  retain the generic route. Both routes use the same matcher.
+  Per the lead's uniform planning rule, LIMIT 0 keeps input unopened; PostgreSQL can instead
+  raise constant-folded immutable-expression errors (`SELECT 1/0 LIMIT 0`, or invalid constant
+  LIKE). This general planning difference needs one shared constant folder, not a LIKE patch.
 - `star-bound.ts` / `star-dictionary.ts`: a terminal one-to-three-inner-join grouped COUNT/float SUM/AVG/MIN/MAX
   may keep canonical TEXT equality IDs through the existing native joins and aggregate.
   Exact domains on the pinned snapshot and enforced single-column primary keys certify

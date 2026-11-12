@@ -106,7 +106,10 @@ export type ScalarExpr =
     }
   | {
       readonly op: "like";
+      /** Default LIKE byte order; ILIKE uses pinned C.UTF-8 simple lowercase.
+       * Explicit C/POSIX folds ASCII only. Future database ctype belongs here. */
       readonly mode: "like" | "ilike" | "similar";
+      readonly collation?: Collation;
       readonly negated: boolean;
       readonly arg: ScalarExpr;
       readonly pattern: ScalarExpr;
