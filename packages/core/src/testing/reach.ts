@@ -3866,6 +3866,7 @@ export const VALIDATED_ROOT_REACH = [
   "owner isolation",
   "warm hit skips all validation",
   "only selected columns materialize",
+  "many-alias selection stays funded",
   "fresh ref and statistic ownership",
   "pinned roots remain charged",
   "full reference identity",

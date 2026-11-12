@@ -80,11 +80,12 @@ export class QueryRoots {
       : parseCharge(length) + length;
   }
   #wanted(tableId: number, id: number): boolean {
-    return this.sources.some(
-      (source) =>
-        source.tableId === tableId && (source.columns.includes(id) || source.domainColumn === id),
-    );
+    for (const source of this.sources)
+      if (source.tableId === tableId && (source.columns.includes(id) || source.domainColumn === id))
+        return true;
+    return false;
   }
+
   covers(tableId: number, columns: readonly number[]): boolean {
     return columns.every((id) => this.#wanted(tableId, id));
   }
@@ -124,16 +125,8 @@ export class QueryRoots {
       try {
         const facts = {
           rowCount: full.value.rowCount,
-          columns: selectGroupRootColumns(
-            full.value,
-            this.sources.flatMap((source) =>
-              source.tableId !== tableId
-                ? []
-                : source.domainColumn === undefined
-                  ? [...source.columns]
-                  : [...source.columns, source.domainColumn],
-            ),
-          ),
+          // A predicate avoids an unbounded concatenation of IDs from repeated table aliases.
+          columns: selectGroupRootColumns(full.value, (id) => this.#wanted(tableId, id)),
         };
         const value = this.roots.admit(key, facts, size);
         if (separate !== 0) {

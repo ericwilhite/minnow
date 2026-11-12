@@ -564,7 +564,11 @@ class RootView {
       this.#typeCodes.byteLength
     );
   }
-  select(wanted?: readonly number[]): ColumnChunk[] {
+  select(wanted?: readonly number[] | ((id: number) => boolean)): ColumnChunk[] {
+    const includes =
+      typeof wanted === "function"
+        ? wanted
+        : (id: number) => wanted === undefined || wanted.includes(id);
     const reader = new ByteReader(this.of);
     const extents = new Map<number, ExtentRef>();
     const extent = (): ExtentRef => {
@@ -584,7 +588,7 @@ class RootView {
     const columns: ColumnChunk[] = [];
     for (let k = 0; k < this.#ids.length; k++) {
       const columnId = this.#ids[k] ?? 0;
-      if (wanted !== undefined && !wanted.includes(columnId)) continue;
+      if (!includes(columnId)) continue;
       reader.at = this.#positions[k] ?? 0;
       const type = this.#types[this.#typeCodes[k] ?? 0];
       if (!type) throw new ManifestCorruptionError("Missing validated type");
@@ -616,9 +620,14 @@ class RootView {
 }
 
 /** Complete semantics are unchanged; scan callers can avoid forcing the complete graph. */
-export function selectGroupRootColumns(root: GroupRoot, wanted: readonly number[]): ColumnChunk[] {
-  return (
-    rootViews.get(root)?.select(wanted) ?? root.columns.filter((c) => wanted.includes(c.columnId))
+export function selectGroupRootColumns(
+  root: GroupRoot,
+  wanted: readonly number[] | ((id: number) => boolean),
+): ColumnChunk[] {
+  const view = rootViews.get(root);
+  if (view !== undefined) return view.select(wanted);
+  return root.columns.filter((c) =>
+    typeof wanted === "function" ? wanted(c.columnId) : wanted.includes(c.columnId),
   );
 }
 /** Only private compact views create new per-query refs rather than borrowing eager objects. */

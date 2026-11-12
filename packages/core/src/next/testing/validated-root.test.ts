@@ -41,7 +41,8 @@ it.each(seedsFor("next-validated-root", [0xb2f1, 0xb2f2]))(
         fc.integer({ min: 24, max: 40 }),
         fc.boolean(),
         fc.integer({ min: 0, max: 3 }),
-        async (rowCount, count, rowColumn, shape) => {
+        fc.integer({ min: 4096, max: 6144 }),
+        async (rowCount, count, rowColumn, shape, aliasCount) => {
           reach.beginHistory();
           const type: PhysicalType = [
             { kind: "int64" },
@@ -174,6 +175,30 @@ it.each(seedsFor("next-validated-root", [0xb2f1, 0xb2f2]))(
             facts.release();
             queries.close();
             queries = undefined;
+            // A many-alias plan must fund any concatenated ID vector independently of root width.
+            const sources = Array.from({ length: aliasCount }, () => ({
+              tableId: 1,
+              columns: wanted,
+            }));
+            const flatten = sources.flatMap.bind(sources);
+            const copies = vi.spyOn(sources, "flatMap").mockImplementation((callback, thisArg) => {
+              const ids = flatten(callback, thisArg);
+              expect(grant.allocated).toBeGreaterThanOrEqual(8 * ids.length);
+              return ids;
+            });
+            queries = new QueryRoots(governor, sources, shared);
+            try {
+              const aliased = await queries.read(1, ref, space, grant, wanted);
+              expect(aliased.value.columns).toEqual(
+                root.columns.filter((c) => wanted.includes(c.columnId)),
+              );
+              aliased.release();
+              reach.reach("many-alias selection stays funded");
+            } finally {
+              copies.mockRestore();
+              queries.close();
+              queries = undefined;
+            }
             // Even a byte-invalidated source cannot mutate a successfully owned validated view.
             const source = space.peek(ref);
             if (!source) throw new Error("missing encoded root");
