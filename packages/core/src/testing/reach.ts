@@ -4133,3 +4133,71 @@ export const EXTENT_PAIR_CODEC_REACH = [
   "charge refusal before parse",
   "zero charges after failure",
 ] as const;
+
+/** Exact NUMERIC partials and winners: supported shapes plus every certificate fallback. */
+export const NUMERIC_FIXED_REACH = [
+  "fixed",
+  "selected",
+  "nulls",
+  "unsafe",
+  "int64",
+  "int64 negative",
+  "int64 exact",
+  "int64 boundaries",
+  "int64 carry overflow",
+  "int64 batch attempted",
+  "int128",
+  "wide",
+  "mixed",
+  "special",
+  "dictionary",
+  "constant",
+  "many groups",
+  "full batch",
+  "batch winners once per group",
+  "saved prefix before suffix",
+  "PGlite exact",
+  "zero charges",
+] as const;
+
+/** Negative declared scales expand the stored integer coefficient. */
+export const NUMERIC_COEFFICIENT_BOUND_REACH = [
+  "negative scale",
+  "ordinary update",
+  "fused admission",
+  "PGlite exact",
+  "zero charges",
+] as const;
+
+export const NUMERIC_FIXED_CHARGE_REACH = [
+  "sum",
+  "min",
+  "max",
+  "charged before construction",
+  "zero charges",
+] as const;
+
+export const NUMERIC_BENCH_REACH = [
+  "native and plain exact",
+  "single row",
+  "partial batch",
+  "multiple batches",
+  "dictionary epochs",
+  "full timed volume",
+  "zero charges",
+] as const;
+
+export const NUMERIC_FIXED_SQL_REACH = [
+  "small",
+  "int64 fit",
+  "positive overflow",
+  "negative overflow",
+  "cancelling overflow",
+  "grouped",
+  "scalar",
+  "selection",
+  "flushed scan",
+  "multi-batch",
+  "PGlite exact",
+  "zero resources",
+] as const;
