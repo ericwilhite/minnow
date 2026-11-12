@@ -42,6 +42,7 @@ import {
   METADATA_ENVELOPE_VERSION,
   requireTag,
 } from "../durable-format.js";
+import { requireEncoding, readRunEncoding } from "./encoding.js";
 import { LIST_PAGE_EXTENTS, type ExtentListPage } from "../storage/extent-list.js";
 import { MAX_BLOB_BYTES } from "../storage/extents.js";
 import type { ByteBudget, ExtentWriter } from "../storage/extents.js";
@@ -937,6 +938,7 @@ export async function writeGroupDirectory(
 // ── Root ───────────────────────────────────────────────────────────────────────────────────────
 
 function writeRun(out: RefWriter, run: RunRef): void {
+  out.body.u8(readRunEncoding(run.encoding ?? 1));
   // The level and the continuation flag share one integer: level × 2 + continues.
   out.body.uint(run.level * 2 + (run.continues === true ? 1 : 0));
   out.body.uint(run.entryCount);
@@ -949,6 +951,7 @@ function writeRun(out: RefWriter, run: RunRef): void {
 
 function readRun(refs: RefReader): RunRef {
   const reader = refs.bytes;
+  const encoding = readRunEncoding(reader.u8());
   const packed = reader.uint();
   const level = Math.floor(packed / 2);
   const entryCount = reader.uint();
@@ -957,7 +960,8 @@ function readRun(refs: RefReader): RunRef {
   const bloom = refs.blob();
   const minKey = reader.bytes();
   const maxKey = reader.bytes();
-  const run = { level, entryCount, entries, fences, bloom, minKey, maxKey };
+  const fields = { level, entryCount, entries, fences, bloom, minKey, maxKey };
+  const run: RunRef = encoding === 1 ? fields : { ...fields, encoding };
   return packed % 2 === 1 ? { ...run, continues: true } : run;
 }
 
@@ -1141,16 +1145,7 @@ export function decodeManifestRoot(bytes: Uint8Array, budget: ByteBudget): Parse
     (reader) => {
       const refs = new RefReader(reader, MAGIC.root, "manifest root");
       const formatVersion = reader.uint();
-      valid(
-        formatVersion <= MANIFEST_FORMAT_VERSION,
-        `Manifest format ${String(formatVersion)} is newer than this build reads`,
-      );
-      // Format 1 predates the extent list (ruling R25): only development builds wrote it, so it
-      // is refused rather than upgraded (DECISIONS.md "R25").
-      valid(
-        formatVersion === MANIFEST_FORMAT_VERSION,
-        `Manifest format ${String(formatVersion)} was written by a development build before extent lists; no supported release reads it`,
-      );
+      requireEncoding("manifest", formatVersion, [MANIFEST_FORMAT_VERSION]);
       const sequence = reader.uint();
       const epoch = reader.uint();
       const log = { salt: reader.u32(), firstLsn: reader.uint(), rootSequence: reader.uint() };

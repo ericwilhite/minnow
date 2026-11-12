@@ -268,6 +268,7 @@ function run(pool: readonly ExtentRef[]): fc.Arbitrary<RunRef> {
   return (
     fc
       .record({
+        encoding: fc.option(fc.constant(2 as const), { nil: undefined }),
         level: fc.nat({ max: 12 }),
         entryCount: fc.nat({ max: 2 ** 40 }),
         entries: blobIn(pool),
@@ -278,7 +279,10 @@ function run(pool: readonly ExtentRef[]): fc.Arbitrary<RunRef> {
         continues: fc.boolean(),
       })
       // `continues` is present only when true (one encoding per value).
-      .map(({ continues, ...rest }): RunRef => (continues ? { ...rest, continues: true } : rest))
+      .map(({ continues, encoding, ...rest }): RunRef => {
+        const value = encoding === undefined ? rest : { ...rest, encoding };
+        return continues ? { ...value, continues: true } : value;
+      })
   );
 }
 
@@ -375,7 +379,7 @@ afterAll(() => {
 
 const manifestRoot: fc.Arbitrary<ManifestRoot> = extents.chain((pool) =>
   fc.record({
-    formatVersion: fc.constant(2),
+    formatVersion: fc.constant(3),
     sequence: lsn,
     epoch: lsn,
     log: fc.record({ salt: fc.nat({ max: 0xffff_ffff }), firstLsn: lsn, rootSequence: lsn }),
@@ -654,7 +658,7 @@ describe("manifest codec rules", () => {
     expect(() => encodeGroupPage(groups)).toThrow(RangeError);
     expect(encodeGroupPage(groups.slice(0, GROUPS_PER_PAGE)).length).toBeLessThan(1 << 20);
     const huge: ManifestRoot = {
-      formatVersion: 2,
+      formatVersion: 3,
       sequence: 1,
       epoch: 1,
       log: { salt: 1, firstLsn: 1, rootSequence: 1 },
@@ -731,7 +735,7 @@ describe("manifest codec rules", () => {
   it("refuses a root written by a newer format", () => {
     const owner = big;
     const root: ManifestRoot = {
-      formatVersion: 3,
+      formatVersion: 4,
       sequence: 1,
       epoch: 1,
       log: { salt: 1, firstLsn: 1, rootSequence: 1 },
@@ -747,20 +751,11 @@ describe("manifest codec rules", () => {
     expect(() => decodeManifestRoot(encodeManifestRoot(root), tracked())).toThrow(/newer/);
   });
 
-  it("reads the frozen R25 writer fixture and continues encoding canonically", () => {
-    const bytes = Uint8Array.from(Buffer.from(frozenR25.rootHex, "hex"));
+  it("refuses the frozen unpublished R25 development root without upgrading", () => {
     const budget = tracked();
-    const parsed = decodeManifestRoot(bytes, budget);
-    expect(parsed.value.formatVersion).toBe(2);
-    expect(parsed.value.catalog.extent.offset).toBe(0);
-    expect(parsed.value.extentList).toHaveLength(1);
-    expect(encodeManifestRoot(parsed.value)).toEqual(bytes);
-    const next = { ...parsed.value, sequence: 2 };
-    budget.free(parsed.charge);
-    const reopened = decodeManifestRoot(encodeManifestRoot(next), budget);
-    expect(reopened.value.sequence).toBe(2);
-    expect(reopened.value.catalog).toEqual(next.catalog);
-    budget.free(reopened.charge);
+    expect(() =>
+      decodeManifestRoot(Uint8Array.from(Buffer.from(frozenR25.rootHex, "hex")), budget),
+    ).toThrow(/unpublished development/);
     expect(budget.held).toBe(0);
   });
 
@@ -781,7 +776,7 @@ describe("manifest codec rules", () => {
     };
     const budget = tracked();
     expect(() => decodeManifestRoot(encodeManifestRoot(root), budget)).toThrow(
-      /before extent lists/,
+      /unpublished development/,
     );
     expect(budget.held).toBe(0);
   });
@@ -789,7 +784,7 @@ describe("manifest codec rules", () => {
   it("refuses an extent list out of offset order or with a bad page count", () => {
     const page = (first: number, count: number) => ({ blob: ref(big), first, count });
     const rootWith = (extentList: ManifestRoot["extentList"]): ManifestRoot => ({
-      formatVersion: 2,
+      formatVersion: 3,
       sequence: 1,
       epoch: 1,
       log: { salt: 1, firstLsn: 1, rootSequence: 1 },

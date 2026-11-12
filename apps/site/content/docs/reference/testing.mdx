@@ -2191,3 +2191,18 @@ input, and both cache-hit and asynchronous reads through the production write pa
 require typed refusal, unchanged inputs and returned resources. Registry completeness also
 scans production persistence calls and durable reference fields independently of the registry
 and its decoder adapters, so omitting a format from both lists cannot hide its writer.
+### Rebuild long-key codec stages
+
+The unpublished rebuild manifest is version 3. Every stored run has an explicit inline or
+overflow encoding discriminator. Unsupported versions raise `UnsupportedEncodingError`;
+old development roots are refused without rewriting them. No published package contains
+`next/`, so this is not an upgrade of a supported stored format. The eventual shipped-engine
+cutover still needs its own upgrade evidence.
+
+`format/run-key.test.ts` generates canonical inline and overflow descriptors, including the
+49,155-byte encoded single-text primary-key maximum. It checks bounded prefixes, complete
+chunk coverage, checksum fields, overlap, extent bounds, truncation and unknown tags.
+`encoding-version.test.ts` checks typed refusal and returned parse charges for unsupported
+root versions. Codec availability alone does not enable long-key writes; writer, reader,
+Bloom, summary and catalog-limit integration are separate stages. Short-key block bytes
+remain unchanged.

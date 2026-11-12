@@ -11,8 +11,8 @@
 /** Shared reference-table envelope; the manifest also carries its logical format version2. */
 export const METADATA_ENVELOPE_VERSION = 1;
 /** Raise before publishing any incompatible nested durable codec. Never fence before checking. */
-export const DURABLE_READER_VERSION = 1;
-export const MANIFEST_FORMAT_VERSION = 2;
+export const DURABLE_READER_VERSION = 2;
+export const MANIFEST_FORMAT_VERSION = 3;
 export const ROOT_SLOT_HEADER_BYTES = 16;
 export const ROOT_SLOT_OVERHEAD = ROOT_SLOT_HEADER_BYTES + 4;
 

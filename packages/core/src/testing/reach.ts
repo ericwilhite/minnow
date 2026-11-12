@@ -126,6 +126,21 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+export const RUN_KEY_CODEC_STATES = [
+  "run encodings",
+  "unknown run encoding",
+  "inline",
+  "overflow",
+  "shipped text maximum",
+  "multiple chunks",
+  "unknown tag",
+  "truncation",
+  "extent bounds",
+  "length prefix count checksum",
+  "overlap",
+] as const;
+export const ENCODING_VERSION_STATES = ["old development", "newer", "previous root"] as const;
+
 export const WRITE_MERGE_SUMMARY_PRESSURE_STATES = [
   "other pinned bytes retained",
   "unwound before wait",

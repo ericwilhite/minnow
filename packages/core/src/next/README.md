@@ -1179,8 +1179,8 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
 - Every reference carries the checksum of what it names (a chunk's pages carry theirs).
 - Space is reusable only when neither the current durable root, nor the previous one (the other
   root slot), nor any pinned root reaches it (two generations), and startup reads both roots'
-  extent lists (ruling R25: `ManifestRoot.extentList`, format 2; format 1 roots, written only by
-  development builds, are refused).
+  extent lists (ruling R25: `ManifestRoot.extentList`). The current manifest is format 3,
+  with explicit run encoding; earlier unpublished development roots are refused.
 - Startup order: acquire the fence → open the store session → open the extent space (read the
   current and previous roots' extent lists) → open the write path (a single log scan and replay, `publishedRows`
   staging included) → spill sweep → ready.

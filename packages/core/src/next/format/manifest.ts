@@ -68,6 +68,7 @@
  * - **Exactly once** (ledger.ts): `clients` holds the committed outcomes as of `globalLsn`.
  */
 import { DURABLE_CODECS, DURABLE_FORMATS } from "../durable-format.js";
+import type { RunEncoding } from "./encoding.js";
 import type { ClientLedgerEntry } from "./ledger.js";
 import type { LogIncarnation } from "./log-frame.js";
 import type { ExtentList } from "../storage/extent-list.js";
@@ -77,6 +78,7 @@ import type { ColumnStatistics, PhysicalType, StatValue } from "../types.js";
 export type { ColumnStatistics, StatValue };
 
 /**
+ * 3: explicit run encoding (inline/overflow); all earlier rebuild roots were unpublished.
  * 2: the root names its extent list (ruling R25, `extentList`). Roots of format 1 were written
  * only by development builds (no supported writer: DECISIONS.md "R25") and are refused.
  */
@@ -269,6 +271,8 @@ export interface IndexRoot {
 }
 
 export interface RunRef {
+  /** Absent in memory means inline; always explicit on disk. */
+  readonly encoding?: RunEncoding;
   readonly level: number;
   /**
    * Present (true) on the second and later pieces of one merge output, which follow the first
