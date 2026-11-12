@@ -5,7 +5,7 @@
   "base": "86635f0fd0a9ce63213695d41ee4a810c5d3cf9b",
   "summary": {
     "float": {
-      "receipt": "scripts/bench-evidence/star-analytics-float-2026-11-12.json",
+      "receipt": "/home/eric/.cache/b4-read-recipe/raw-bench-archive/star-analytics-float-2026-11-12-ee90b8304cde.json",
       "sha256": "ee90b8304cde1acfa4d6eee110c9d01f85586b2847073aa20b6c0c6f68968334",
       "codeRevision": "c4612c8297cd187a87f476f541cc82a2e82984db",
       "controlRevision": "86635f0fd0a9ce63213695d41ee4a810c5d3cf9b",
@@ -73,10 +73,11 @@
         "acceptedGain": true,
         "significantRegression": false,
         "noRegression": true
-      }
+      },
+      "compactSummary": "scripts/bench-evidence/star-analytics-float-2026-11-12.json"
     },
     "attributes": {
-      "receipt": "scripts/bench-evidence/star-analytics-attributes-2026-11-12.json",
+      "receipt": "/home/eric/.cache/b4-read-recipe/raw-bench-archive/star-analytics-attributes-2026-11-12-245cb70580db.json",
       "sha256": "245cb70580db1f8fd36c942e43be7fc0775af16f034cb20385192711cff56222",
       "codeRevision": "0cfbc2e7a76d969aba034e74d41e86395e5cbf2c",
       "controlRevision": "c4612c8297cd187a87f476f541cc82a2e82984db",
@@ -144,7 +145,8 @@
         "acceptedGain": true,
         "significantRegression": false,
         "noRegression": true
-      }
+      },
+      "compactSummary": "scripts/bench-evidence/star-analytics-attributes-2026-11-12.json"
     }
   },
   "timedPids": [
