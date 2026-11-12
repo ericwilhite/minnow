@@ -4,7 +4,7 @@ import { PGlite } from "@electric-sql/pglite";
 import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach } from "../../testing/reach.js";
-import { Governor, type Grant } from "../memory/governor.js";
+import { Governor, type Grant, type EvictableCache } from "../memory/governor.js";
 import type { Execution } from "../exec/executor.js";
 import { PercentileOperator } from "../exec/agg/percentile.js";
 import { StorageCore } from "./storage-core.js";
@@ -16,6 +16,7 @@ it.each(seedsFor("next-percentile-admission", [0xe157, 0xe158]))(
     const core = await new StorageCore(8192).open(),
       pg = new PGlite();
     const reach = createReach("percentile admission", [
+      "only evictable metadata before minimum",
       "whole minimum waits",
       "no premature state",
       "holder releases",
@@ -54,6 +55,12 @@ it.each(seedsFor("next-percentile-admission", [0xe157, 0xe158]))(
           const governor = new Governor(cap << 20),
             nativeTry = governor.tryAdmit.bind(governor),
             nativeGroup = governor.admitGroup.bind(governor);
+          const caches: EvictableCache[] = [];
+          const register = governor.registerCache.bind(governor);
+          governor.registerCache = (cache) => {
+            caches.push(cache);
+            return register(cache);
+          };
           let holder: Grant | null = null,
             holderReady: Promise<void> | null = null,
             execution: Execution | undefined,
@@ -74,9 +81,14 @@ it.each(seedsFor("next-percentile-admission", [0xe157, 0xe158]))(
           };
           governor.tryAdmit = (options) => {
             if (options.label.endsWith("/fixed-buffers") && holderReady === null) {
-              expect(governor.usedBytes).toBe(0);
+              // Idle metadata is allowed by the governor's cache contract. Every byte must
+              // be evictable: no private producer/percentile workspace may survive sizing.
+              expect(governor.usedBytes).toBe(
+                caches.reduce((sum, cache) => sum + cache.evictableBytes, 0),
+              );
+              reach.reach("only evictable metadata before minimum");
               // A competing execution's COMPLETE minimum may use the shared reserve.
-              // Admit it through the same public atomic primitive, leaving only 4 KiB;
+              // Occupy the full cap so even a tiny idle metadata entry must be evicted;
               // no assumption about this query's minimum versus reserveBytes is needed.
               holderReady = nativeGroup({
                 label: "temporarily pinned competitor",
@@ -84,7 +96,7 @@ it.each(seedsFor("next-percentile-admission", [0xe157, 0xe158]))(
                 grants: [
                   {
                     label: "complete minimum",
-                    minimumBytes: governor.capBytes - 4096,
+                    minimumBytes: governor.capBytes,
                     spillable: false,
                   },
                 ],
@@ -111,7 +123,14 @@ it.each(seedsFor("next-percentile-admission", [0xe157, 0xe158]))(
             timer = setTimeout(() => reject(new Error("fixed admission was not reached")), 10000);
           });
           try {
-            await Promise.race([waiting, deadline]);
+            await Promise.race([
+              waiting,
+              deadline,
+              work.then((result) => {
+                if (result.error instanceof Error) throw result.error;
+                throw new Error("execution bypassed the blocked minimum", { cause: result.error });
+              }),
+            ]);
             expect(holder).not.toBeNull();
             expect(execution).toBeDefined();
             expect(governor.usedBytes).toBe((holder as Grant | null)?.held);

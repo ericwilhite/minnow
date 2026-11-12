@@ -66,7 +66,10 @@ export class BlobCache<T> implements EvictableCacheLike {
   misses = 0;
 
   /** `register` is the governor's `registerCache` (memory/governor.ts). */
-  constructor(register: (cache: EvictableCacheLike) => CacheMemory) {
+  constructor(
+    register: (cache: EvictableCacheLike) => CacheMemory,
+    readonly key: (ref: BlobRef) => string = blobKey,
+  ) {
     this.#memory = register(this);
   }
 
@@ -108,7 +111,7 @@ export class BlobCache<T> implements EvictableCacheLike {
 
   /** The entry for `ref`, pinned for the caller, or null. */
   pin(ref: BlobRef, options: PinOptions = {}): Pinned<T> | null {
-    const key = blobKey(ref);
+    const key = this.key(ref);
     const entry = this.#entries.get(key);
     if (entry === undefined) {
       this.misses++;
@@ -140,7 +143,7 @@ export class BlobCache<T> implements EvictableCacheLike {
    * the race (the caller's value is then garbage; its charge, of the same size, stands).
    */
   admit(ref: BlobRef, value: T, size: number): T {
-    const key = blobKey(ref);
+    const key = this.key(ref);
     const existing = this.#entries.get(key);
     if (existing !== undefined) {
       this.#take(key, existing, false);
@@ -156,7 +159,7 @@ export class BlobCache<T> implements EvictableCacheLike {
    * as it was pinned.
    */
   unpin(ref: BlobRef, options: PinOptions = {}): void {
-    const key = blobKey(ref);
+    const key = this.key(ref);
     const entry = this.#entries.get(key);
     if (entry === undefined || entry.pins === 0) throw new RangeError("unpin of an unpinned entry");
     const once = options.once === true;

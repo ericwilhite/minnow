@@ -1,6 +1,7 @@
 /** Query-scoped group roots close with the scan, without changing B3's snapshot implementation. */
 import type { GroupSegment, Segment, TableSnapshot } from "../access/snapshot.js";
 import type { ByteBudget, SpaceReader } from "../access/space.js";
+import { PREPARE_GROUP, type PreparedGroup, type QueryRoots } from "../page/query-roots.js";
 import { GroupRead } from "../page/group-read.js";
 
 export function readTable(
@@ -8,6 +9,7 @@ export function readTable(
   pages: SpaceReader,
   budget: ByteBudget,
   check: () => void,
+  caches?: QueryRoots,
 ): TableSnapshot {
   let last = -1,
     cached: Segment | undefined;
@@ -23,8 +25,12 @@ export function readTable(
         source = original[index];
       if (source?.kind !== "group") return source;
       if (last === index) return cached;
-      const root = new GroupRead(source.group.root, pages, budget);
-      const group: GroupSegment = {
+      const root = new GroupRead(source.group.root, pages, budget, caches, table.tableId);
+      const group: GroupSegment & PreparedGroup = {
+        [PREPARE_GROUP]: (columns) => {
+          check();
+          return root.prepare(columns);
+        },
         kind: "group",
         index: source.index,
         rowCount: source.rowCount,

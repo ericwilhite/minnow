@@ -58,6 +58,11 @@ interface Observation {
   boundary: string;
   rows: number;
   digest: string;
+  repeats: number;
+  completed: number;
+  totalRows: number;
+  cpuMsTotal?: number;
+  wallMsTotal?: number;
   cpuMs?: number;
   userMs?: number;
   systemMs?: number;
@@ -71,6 +76,7 @@ interface Message {
   query?: string;
   boundary?: string;
   timed?: boolean;
+  repeats?: number;
 }
 
 async function arm(root: string, count: number, queries: string[]): Promise<void> {
@@ -158,6 +164,8 @@ async function arm(root: string, count: number, queries: string[]): Promise<void
     queries
       .filter((id) => !componentQuery(id))
       .map((id) => {
+        // Plain projection companion to the aggregation/retaining guards; real executor frames.
+        if (id === "scan_plain3") return [id, "SELECT f02,f06,f10 FROM events_wide"];
         const query = catalogue.W_QUERIES.find((q) => q.id === id);
         if (!query) throw new Error(`Unknown query: ${id}`);
         return [id, catalogue.sqlFor(query, "minnow", count)];
@@ -353,6 +361,18 @@ async function arm(root: string, count: number, queries: string[]): Promise<void
           throw new Error("Unknown request");
         if (!request.timed && request.boundary !== "verify")
           throw new Error("Setup only validates full output");
+        const repeats = request.repeats ?? 1;
+        if (
+          !Number.isSafeInteger(repeats) ||
+          repeats < 1 ||
+          repeats > 1000 ||
+          (repeats !== 1 &&
+            (!request.timed ||
+              request.boundary !== "frames" ||
+              request.query === "pk-source" ||
+              request.query === "percentile-component"))
+        )
+          throw new Error("Invalid complete-query repeat count");
         // Input/output capture and validation are outside the isolated component clock.
         const componentPin = request.query === "pk-source" ? core.harness.path.pin() : null;
         const captured = componentPin ? new Float64Array(100) : null;
@@ -360,13 +380,24 @@ async function arm(root: string, count: number, queries: string[]): Promise<void
         const wall = request.timed ? performance.now() : 0;
         const start = request.timed ? process.cpuUsage() : null;
         let result: { rows: number; digest: string }, used: NodeJS.CpuUsage | null, elapsed: number;
+        let completed = 0,
+          totalRows = 0;
         try {
-          result =
+          const once = () =>
             componentPin && captured
-              ? await component(captured, componentPin)
+              ? component(captured, componentPin)
               : request.query === "percentile-component" && percentiles
-                ? await percentiles.run()
-                : await run(request.query, request.boundary ?? "verify");
+                ? percentiles.run()
+                : run(request.query ?? "", request.boundary ?? "verify");
+          result = await once();
+          completed++;
+          totalRows += result.rows;
+          for (let repeat = 1; repeat < repeats; repeat++) {
+            const next = await once();
+            if (next.rows !== result.rows) throw new Error("Repeated query row count drift");
+            completed++;
+            totalRows += next.rows;
+          }
           used = start ? process.cpuUsage(start) : null;
           elapsed = performance.now() - wall;
           if (componentPin && captured)
@@ -378,16 +409,21 @@ async function arm(root: string, count: number, queries: string[]): Promise<void
         }
         const value: Observation = {
           ...result,
+          repeats,
+          completed,
+          totalRows,
           query: request.query,
           boundary: request.boundary ?? "verify",
           load,
           identity,
           ...(used
             ? {
-                cpuMs: (used.user + used.system) / 1000,
-                userMs: used.user / 1000,
-                systemMs: used.system / 1000,
-                wallMs: elapsed,
+                cpuMs: (used.user + used.system) / 1000 / repeats,
+                userMs: used.user / 1000 / repeats,
+                systemMs: used.system / 1000 / repeats,
+                wallMs: elapsed / repeats,
+                cpuMsTotal: (used.user + used.system) / 1000,
+                wallMsTotal: elapsed,
               }
             : {}),
         };

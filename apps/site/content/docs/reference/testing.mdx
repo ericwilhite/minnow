@@ -1355,6 +1355,37 @@ Add `MINNOW_EXPORT_SCAN_SHAPE_TRANSPORT=1` to compare the whole stand-in adapter
 real owner transfer path instead. Both modes assert which three module versions reached
 the worker. This historical transport comparison uses the old adapter, not the production
 `ResultSink`, and is explicitly excluded from Gate A.
+Ordinary executor scans validate each complete group root during source sizing, then reuse
+only the planned columns' facts through a query-local, governor-registered cache. The cold
+parser still validates every column, and complete-root APIs remain complete. Parsing charges
+the full root before allocation; selection scratch is also charged before allocation. Active
+readers hold the full parse charge; idle facts remain charged and evictable. Cache refusal or eviction safely falls back to decoding without increasing the
+read minimum. Explicit non-retaining export bypasses this memo. Query cleanup drains pending
+readers before clearing and unregistering the cache, including cancellation and error paths.
+`next/testing/root-reuse.test.ts` checks generated source equality, parse counts across columns
+and batches, query isolation and cancellation. `next/testing/query-root-ownership.test.ts` checks full-reference
+and table identity, complete-root fallback, eviction and cancelled in-flight reads with zero
+charges after cleanup.
+`scripts/query-root-component.mts` isolates a two-pass sizing/scan root handoff over synthetic
+wide metadata. `scripts/query-root-bench.mts --baseline <frozen-root> --candidate <frozen-root>`
+compares the real three-column executor scan from complete, separately built cores. Both use
+B7's shared independent-process runner: every arm in every one of nine AB/BA pairs starts a
+fresh process, and build start order alternates too. One process closes before the next starts.
+The whole scan restores the same immutable native file image before opening the ordinary core;
+file hashes, lengths and retained allocation capacities are checked. Image creation, restore,
+verification and IPC are outside CPU timing. Each sample warms ten complete queries, then
+measures ten complete lifetimes under one all-thread process CPU clock, including natural GC.
+Raw totals and exact completed-query/row volumes are recorded before per-query normalization.
+
+Run an identical-build `--aa` control first. It must show neither a gain nor a regression by
+the paired rule; A/B requires its matching `--aa-report <results.json>`. The control must match
+the candidate revision, source hashes, row count, warmup/repeat policy and native image hash.
+Use the capture run's `input.json` with `--bundle` in both whole-scan campaigns. Component runs
+use the same protocol without a native image. `--smoke` is for small lifecycle tests only;
+its timing cannot qualify an A/B campaign. Earlier persistent-worker results are superseded
+because alternating execution order did not balance worker identity. These native loaded-host
+diagnostics are separate from quiet-host Gate A and the owner/MessagePort export transport.
+
 The scan reuses verified header facts while the endpoint pages stay the same. Loading,
 releasing or materializing a page invalidates those facts. Exact-range varlen byte sizes
 are memoized separately; sparse selections are sized from their selected rows.
