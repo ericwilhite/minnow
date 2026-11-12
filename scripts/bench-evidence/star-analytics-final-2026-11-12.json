@@ -1,0 +1,483 @@
+{
+  "schema": "B4-star-analytics-final-v1",
+  "status": "full gate green",
+  "checkedSourceRevision": "0cfbc2e7a76d969aba034e74d41e86395e5cbf2c",
+  "base": "86635f0fd0a9ce63213695d41ee4a810c5d3cf9b",
+  "summary": {
+    "float": {
+      "receipt": "scripts/bench-evidence/star-analytics-float-2026-11-12.json",
+      "sha256": "ee90b8304cde1acfa4d6eee110c9d01f85586b2847073aa20b6c0c6f68968334",
+      "codeRevision": "c4612c8297cd187a87f476f541cc82a2e82984db",
+      "controlRevision": "86635f0fd0a9ce63213695d41ee4a810c5d3cf9b",
+      "controlMedianMs": 1748.6754,
+      "candidateMedianMs": 762.514,
+      "pairs": {
+        "pairs": [
+          {
+            "control": 1807.9678,
+            "candidate": 656.2347,
+            "delta": -1151.7331
+          },
+          {
+            "control": 1673.0314999999998,
+            "candidate": 825.7323,
+            "delta": -847.2991999999998
+          },
+          {
+            "control": 1991.9608,
+            "candidate": 734.8719,
+            "delta": -1257.0889000000002
+          },
+          {
+            "control": 1639.2537,
+            "candidate": 763.3235,
+            "delta": -875.9302
+          },
+          {
+            "control": 1748.6754,
+            "candidate": 762.514,
+            "delta": -986.1614000000001
+          },
+          {
+            "control": 1924.2087999999999,
+            "candidate": 822.6126,
+            "delta": -1101.5962
+          },
+          {
+            "control": 1676.9485,
+            "candidate": 766.4519,
+            "delta": -910.4966
+          },
+          {
+            "control": 1583.9962,
+            "candidate": 755.4163,
+            "delta": -828.5799000000001
+          },
+          {
+            "control": 1907.4953,
+            "candidate": 718.4509,
+            "delta": -1189.0444
+          }
+        ],
+        "medianDeltaMs": -986.1614000000001,
+        "q1DeltaMs": -1151.7331,
+        "q3DeltaMs": -875.9302,
+        "iqrDeltaMs": 275.8028999999999,
+        "minDeltaMs": -1257.0889000000002,
+        "maxDeltaMs": -828.5799000000001,
+        "rangeDeltaMs": 428.5090000000001,
+        "spreadDeltaMs": 428.5090000000001,
+        "favoursCandidate": 9,
+        "favoursControl": 0,
+        "requiredFavourable": 7,
+        "acceptedGain": true,
+        "significantRegression": false,
+        "noRegression": true
+      }
+    },
+    "attributes": {
+      "receipt": "scripts/bench-evidence/star-analytics-attributes-2026-11-12.json",
+      "sha256": "245cb70580db1f8fd36c942e43be7fc0775af16f034cb20385192711cff56222",
+      "codeRevision": "0cfbc2e7a76d969aba034e74d41e86395e5cbf2c",
+      "controlRevision": "c4612c8297cd187a87f476f541cc82a2e82984db",
+      "controlMedianMs": 387.8644,
+      "candidateMedianMs": 297.0167,
+      "pairs": {
+        "pairs": [
+          {
+            "control": 411.7741,
+            "candidate": 297.0167,
+            "delta": -114.75739999999996
+          },
+          {
+            "control": 409.98429999999996,
+            "candidate": 306.67379999999997,
+            "delta": -103.31049999999999
+          },
+          {
+            "control": 366.6989,
+            "candidate": 294.62510000000003,
+            "delta": -72.07379999999995
+          },
+          {
+            "control": 353.63919999999996,
+            "candidate": 248.7262,
+            "delta": -104.91299999999995
+          },
+          {
+            "control": 427.13149999999996,
+            "candidate": 310.5232,
+            "delta": -116.60829999999999
+          },
+          {
+            "control": 426.9799,
+            "candidate": 416.9569,
+            "delta": -10.022999999999968
+          },
+          {
+            "control": 387.8644,
+            "candidate": 321.5132,
+            "delta": -66.3512
+          },
+          {
+            "control": 359.9905,
+            "candidate": 284.5177,
+            "delta": -75.4728
+          },
+          {
+            "control": 355.37,
+            "candidate": 263.152,
+            "delta": -92.21800000000002
+          }
+        ],
+        "medianDeltaMs": -92.21800000000002,
+        "q1DeltaMs": -104.91299999999995,
+        "q3DeltaMs": -72.07379999999995,
+        "iqrDeltaMs": 32.839200000000005,
+        "minDeltaMs": -116.60829999999999,
+        "maxDeltaMs": -10.022999999999968,
+        "rangeDeltaMs": 106.58530000000002,
+        "spreadDeltaMs": 106.58530000000002,
+        "favoursCandidate": 9,
+        "favoursControl": 0,
+        "requiredFavourable": 7,
+        "acceptedGain": true,
+        "significantRegression": false,
+        "noRegression": true
+      }
+    }
+  },
+  "timedPids": [
+    3917450, 3917543, 3917619, 3917674, 3917869, 3918348, 3918550, 3918589, 3918848, 3919146,
+    3919406, 3919592, 3919867, 3920189, 3920381, 3920523, 3920729, 3920916, 3921387, 3921569,
+    3921701, 3921894, 3922185, 3922413, 3922495, 3922567, 3922814, 3923003, 3923228, 3923413,
+    3923696, 3923923, 3924040, 3924166, 3924505, 3924876, 3929785, 3929814, 3929935, 3930124,
+    3930184, 3930200, 3930310, 3930360, 3930443, 3930509, 3930671, 3930827, 3930897, 3931363,
+    3932702, 3933376, 3933476, 3933638, 3933696, 3933719, 3933741, 3933759, 3933818, 3933857,
+    3933888, 3933910, 3933929, 3933989, 3934005, 3934042, 3934072, 3934124, 3934140, 3934161,
+    3934205, 3934279
+  ],
+  "frozenAudit": {
+    "frozen-analytics-control": {
+      "revision": "86635f0fd0a9ce63213695d41ee4a810c5d3cf9b",
+      "filesVerified": 2728,
+      "manifestSha256": "1923e0a2c9cb4bf6c45aa6fa846dc4d7f6072ad7d1e11b8ef8602c7212b2ab8e"
+    },
+    "frozen-analytics-candidate": {
+      "revision": "c4612c8297cd187a87f476f541cc82a2e82984db",
+      "filesVerified": 2728,
+      "manifestSha256": "6d6a6dbdb70eacf15189f7e229fef3d40e657e28d2180465e8bc701d03c66cd4"
+    },
+    "frozen-attributes-candidate": {
+      "revision": "0cfbc2e7a76d969aba034e74d41e86395e5cbf2c",
+      "filesVerified": 2728,
+      "manifestSha256": "8114037f40419b80c0212eb194ce9429db521d40620ee7fa2e241def79e8ff66"
+    }
+  },
+  "gate": {
+    "commit": "ac6581b52e41ca68b6c974344e91687a374384e8",
+    "ci": false,
+    "maxWorkers": 2,
+    "records": [
+      {
+        "name": "build",
+        "command": ["npm", "run", "build"],
+        "exit": 0,
+        "seconds": 289.11227955296636,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-build.log"
+      },
+      {
+        "name": "typecheck",
+        "command": ["npm", "run", "typecheck"],
+        "exit": 0,
+        "seconds": 133.14027964998968,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-typecheck.log"
+      },
+      {
+        "name": "lint",
+        "command": ["npm", "run", "lint"],
+        "exit": 0,
+        "seconds": 232.86701482895296,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-lint.log"
+      },
+      {
+        "name": "format",
+        "command": ["npm", "run", "format"],
+        "exit": 0,
+        "seconds": 65.34659515100066,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-format.log"
+      },
+      {
+        "name": "api",
+        "command": ["npm", "run", "api:check"],
+        "exit": 0,
+        "seconds": 66.39683433098253,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-api.log"
+      },
+      {
+        "name": "version",
+        "command": ["npm", "run", "version:check"],
+        "exit": 0,
+        "seconds": 0.49088423198554665,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-version.log"
+      },
+      {
+        "name": "resolver",
+        "command": [
+          "node",
+          "-e",
+          "const p=require.resolve('@minnowdb/core/package.json');if(!p.startsWith(process.cwd()+'/'))throw new Error(p);console.log(p)"
+        ],
+        "exit": 0,
+        "seconds": 0.03415462397970259,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-resolver.log"
+      },
+      {
+        "name": "g1",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/page",
+          "packages/core/src/next/format",
+          "packages/core/src/next/memory",
+          "packages/core/src/next/hash",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 88.74847485497594,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-g1.log",
+        "files": 45,
+        "tests": 474
+      },
+      {
+        "name": "g2",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/storage",
+          "packages/core/src/next/spill",
+          "packages/core/src/next/access",
+          "packages/core/src/next/keys",
+          "packages/core/src/next/vector",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 227.2614672050113,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-g2.log",
+        "files": 42,
+        "tests": 593
+      },
+      {
+        "name": "g3",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/exec",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 526.8504577319836,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-g3.log",
+        "files": 152,
+        "tests": 1611
+      },
+      {
+        "name": "g4-ir",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/ir",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 0.7482470489339903,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-g4-ir.log",
+        "files": 2,
+        "tests": 7
+      },
+      {
+        "name": "g4-lower",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/lower",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 3.3424753019353375,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-g4-lower.log",
+        "files": 8,
+        "tests": 56
+      },
+      {
+        "name": "g4-owner",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/owner",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 1.252462110016495,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-g4-owner.log",
+        "files": 4,
+        "tests": 28
+      },
+      {
+        "name": "g4-testing",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/testing",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 639.6562669989653,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-g4-testing.log",
+        "files": 167,
+        "tests": 1026
+      },
+      {
+        "name": "g4-dependency-rules",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/dependency-rules",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 1.4926017560064793,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-g4-dependency-rules.log",
+        "files": 1,
+        "tests": 3
+      },
+      {
+        "name": "g4-types",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/types",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 0.9027024239767343,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-g4-types.log",
+        "files": 1,
+        "tests": 28
+      },
+      {
+        "name": "g4-write",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/src/next/write",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 895.5401023019804,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-g4-write.log",
+        "files": 127,
+        "tests": 712
+      },
+      {
+        "name": "g5",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "packages/core/browser/next-storage-run.test.ts",
+          "packages/core/src/tree-shaking.test.ts",
+          "packages/kysely/src/tree-shaking.test.ts",
+          "packages/core/src/testing/seeds.test.ts",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 6.787214994081296,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-g5.log",
+        "files": 4,
+        "tests": 64
+      },
+      {
+        "name": "g6-scripts",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "scripts",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 112.33827361895237,
+        "log": "/home/eric/.cache/b4-read-recipe/analytics-full-gate-g6-scripts.log",
+        "files": 44,
+        "tests": 223
+      }
+    ],
+    "complete": true
+  },
+  "gateTotals": {
+    "fileRuns": 597,
+    "tests": 4825
+  },
+  "correctness": {
+    "commandsAndProof": "c4612c82 and0cfbc2e7 commit messages; cache star-analytics-* and star-attributes-* logs",
+    "reach": ["STAR_FLOAT_REACH", "STAR_SQL_REACH", "STAR_PRESSURE_REACH", "STAR_BOUND_REACH"],
+    "mutants": [
+      "sum-only eligibility",
+      "three-join-only restriction",
+      "omit safe Boolean eligibility"
+    ],
+    "node22": [
+      "float+pressure2files4tests",
+      "SQL/float/pressure3files6tests",
+      "final SQL/seeds2files7tests"
+    ],
+    "noRunsReduced": "float8->20,SQL16->20; original seeds/examples retained; SQL random histories preserved",
+    "initialCorrections": [
+      "float8runs did not reach every new example; raised20",
+      "cache mutation observer overconstrained printed source, corrected assertion/callsite and rerun"
+    ],
+    "ownership": "no native join/ColumnStore/page/format/admission/ResultSink production changes"
+  },
+  "limits": [
+    "LEFT remains generic: unseen NULL grouping classes and nullable-side uniqueness require stronger certification; PG fallback verified.",
+    "Float64 AVG/MIN/MAX only; existing count/Sx/Sxx transition including overflow remains unchanged. Up to8 aggregate calls; variable-width extrema stay generic.",
+    "One-to-three INNER joins and TEXT dimension attributes; safe predicates only, otherwise exact generic fallback.",
+    "Node whole-query CPU only; fresh serial worker per sample,10 warmups/10 timed complete lifetimes,9 AB/BA,type7 IQR, neutral matching AA. No component/browser/RSS/wall-time/absolute-target or unrelated-shape throughput claim.",
+    "Initial foreground gate build deliberately stopped only own PID tree to avoid tool lifetime; saved *.foreground-start logs. Detached full gate restarted clean; no interrupted test results credited."
+  ]
+}
