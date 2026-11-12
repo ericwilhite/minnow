@@ -19,7 +19,13 @@ import { ByteReader } from "./bytes.js";
 import { MetadataBudget } from "./budget.js";
 import { DEFAULT_MERGE_POLICY, MERGE_FIXED_BYTES, MERGE_INPUT_BYTES, mergeRuns } from "./merge.js";
 import { KeyDelta, type DeltaVisitor } from "./key-hash.js";
-import { RunBuilder, RUN_BUFFER_OVERHEAD, type RunReader } from "./runs.js";
+import {
+  IndexKeyTooLongError,
+  MAX_KEY_BYTES,
+  RunBuilder,
+  RUN_BUFFER_OVERHEAD,
+  type RunReader,
+} from "./runs.js";
 
 const reach = createReach("retained merge output", WRITE_MERGE_SUMMARY_STATES);
 const MiB = 1024 * 1024;
@@ -482,8 +488,9 @@ for (const seed of seedsFor("next-write-encoded-key-limit", [0xb5f4]))
               } else builder.addRange(key, 0, width, 1, false);
               builder.finish();
             } catch (error) {
-              if (!(error instanceof RangeError)) throw error;
-              expect(error.message).toBe("An index key is longer than 2 KiB");
+              if (!(error instanceof IndexKeyTooLongError)) throw error;
+              expect(error.code).toBe("MINNOW_INDEX_KEY_TOO_LONG");
+              expect(error.bytes).toBeGreaterThan(MAX_KEY_BYTES);
               refused = true;
             }
             expect(refused, "oversized input cannot produce a run").toBe(true);

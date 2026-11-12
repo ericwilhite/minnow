@@ -1731,7 +1731,7 @@ publication takes ownership or the output is abandoned.
 
 The unexported rebuild core's `RunEncoder` accepts encoded index keys of at most **2 KiB**,
 including component headers and payloads. Longer encoded keys, including 4 KiB keys, raise
-`RangeError` with the message `An index key is longer than 2 KiB` when encoded, in both
+`IndexKeyTooLongError` (code `MINNOW_INDEX_KEY_TOO_LONG`, a `RangeError` subclass) when encoded, in both
 ordinary and bulk paths. The limit is unchanged by the accounting fixes; the generated
 refusal cases also check cleanup. This is the rebuild encoder's limit, not a new limit on
 the shipped SQL engine.

@@ -31,7 +31,7 @@
  * (merges, range scans).
  *
  * ## Writing (`RunEncoder`; `RunBuilder` collects one in memory)
- * Encoded keys are at most 2 KiB; longer keys raise RangeError when emitted, in both
+ * Encoded keys are at most 2 KiB; longer keys raise `IndexKeyTooLongError` when emitted, in both
  * ordinary and bulk paths. Entries are added in (key, rowId) order. A put and a tombstone of the same row id cancel (the
  * row was inserted and deleted within the merged layers); a run written to the bottom level also
  * drops the tombstones left (no older put can exist below it).
@@ -50,6 +50,18 @@ import { OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
 import type { MaybePromise } from "../access/key-index.js";
 
 export const BLOCK_BYTES = 4096;
+
+/** The longest encoded index key a run block can hold: half a block. */
+export const MAX_KEY_BYTES = BLOCK_BYTES / 2;
+
+/** An encoded index key is longer than `MAX_KEY_BYTES`; no run can hold it. */
+export class IndexKeyTooLongError extends RangeError {
+  readonly code = "MINNOW_INDEX_KEY_TOO_LONG";
+  constructor(readonly bytes: number) {
+    super("An index key is longer than 2 KiB");
+    this.name = "IndexKeyTooLongError";
+  }
+}
 /** Blocks per Bloom partition (≈ 200 KiB of filter for typical keys). */
 export const PARTITION_BLOCKS = 256;
 const BLOOM_BITS_PER_KEY = 10;
@@ -427,7 +439,7 @@ export class RunEncoder {
         return this.#singleFallback(data, at + 1, to, bound, keep);
       }
       const length = (data.ends[slot] ?? 0) - (data.starts[slot] ?? 0);
-      if (length > BLOCK_BYTES / 2) throw new RangeError("An index key is longer than 2 KiB");
+      if (length > MAX_KEY_BYTES) throw new IndexKeyTooLongError(length);
       if (
         this.#directCount > 0 &&
         (this.#directBytes + entrySize(length) + (this.#directCount + 1) * 2 > BLOCK_BYTES ||
@@ -585,7 +597,7 @@ export class RunEncoder {
     distinct: boolean,
   ): void {
     if (tombstone && this.#dropTombstones) return;
-    if (length > BLOCK_BYTES / 2) throw new RangeError("An index key is longer than 2 KiB");
+    if (length > MAX_KEY_BYTES) throw new IndexKeyTooLongError(length);
     if (
       this.#count > 0 &&
       (this.#block.length + entrySize(length) + (this.#count + 1) * 2 > BLOCK_BYTES ||
