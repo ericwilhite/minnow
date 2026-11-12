@@ -1,4 +1,4 @@
-import { KeyLayout } from "./join-keys.js";
+import { KeyLayout, keyMultiplicity } from "./join-keys.js";
 import {
   RecursiveOperator,
   recursiveLayout,
@@ -534,6 +534,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   }> = [];
   const compoundColumns = new Map<number, number>();
   const compoundCopies = new Map<number, number>();
+  const compoundSourceMultiplicity = new Map<number, number>();
   const variableColumns = (input: readonly PhysicalType[]) =>
     Math.max(
       1,
@@ -1837,7 +1838,19 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           rt = types(rel.right);
         const lk = keyProjection(lt, rel.leftKeys),
           rk = keyProjection(rt, rel.rightKeys);
-        compoundColumns.set(rel.id, Math.max(variableColumns(lk.types), variableColumns(rk.types)));
+        compoundColumns.set(
+          rel.id,
+          Math.max(
+            variableColumns(lk.types),
+            variableColumns(rk.types),
+            variableColumns(lk.indexes.map((i) => at(lk.types, i))),
+            variableColumns(rk.indexes.map((i) => at(rk.types, i))),
+          ),
+        );
+        compoundSourceMultiplicity.set(
+          rel.id,
+          Math.max(keyMultiplicity(lk.indexes, lk.types), keyMultiplicity(rk.indexes, rk.types)),
+        );
         const correlated = rel.correlated ?? 0;
         const encodedGroup =
           rel.kind === "mark" &&
@@ -2215,7 +2228,13 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     };
     visit(plan.root);
     for (const [id, columns] of compoundColumns)
-      if (active.has(id)) runtime.operatorParameterColumns(id, columns, compoundCopies.get(id));
+      if (active.has(id))
+        runtime.operatorParameterColumns(
+          id,
+          columns,
+          compoundCopies.get(id),
+          compoundSourceMultiplicity.get(id),
+        );
     const hasAggregateProgress = [...aggregatePlanners.keys()].some((id) => active.has(id));
     const hasCompoundProgress = admissions.some(
       ({ rel }) => active.has(rel.id) && (rel.op === "join" || rel.op === "setOp"),

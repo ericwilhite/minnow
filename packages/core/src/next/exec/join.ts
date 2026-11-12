@@ -119,6 +119,7 @@ import {
   extractKeysJob,
   keyNulls,
   keyStepRows,
+  keyMultiplicity,
   levelHash,
 } from "./join-keys.js";
 import { PageWriter, SpillFiles, SpilledRun, type DecodedPage } from "./spill-pages.js";
@@ -429,6 +430,8 @@ class Shared {
   readonly work = new KeyWork();
   /** Mark joins: scratch for each tested key's compatibility test (index: key position). */
   readonly compat: Array<CompatScratch | undefined> = [];
+  readonly buildKeyMultiplicity: number;
+  readonly probeKeyMultiplicity: number;
 
   constructor(
     readonly spec: HashJoinSpec,
@@ -441,6 +444,10 @@ class Shared {
     const checked = checkJoinSpec(spec);
     this.correlated = checked.correlated;
     this.layout = checked.layout;
+    this.buildKeyMultiplicity =
+      this.layout.family === "enc" ? keyMultiplicity(spec.buildKeys, spec.buildTypes) : 1;
+    this.probeKeyMultiplicity =
+      this.layout.family === "enc" ? keyMultiplicity(spec.probeKeys, spec.probeTypes) : 1;
     this.conditioned = spec.residual !== null || (spec.filter ?? null) !== null;
     this.charge = new Charge(context.grant);
     if (!this.charge.allocate(SCRATCH_BYTES))
@@ -2195,7 +2202,14 @@ export class HashJoin {
         await probe.seal();
         shared.checkAborted();
         this.#checkpointed = true;
-        return new JoinCheckpoint(build, probe, this.#built, matches, { ...this.profile });
+        return new JoinCheckpoint(
+          build,
+          probe,
+          this.#built,
+          matches,
+          { ...this.profile },
+          Math.max(shared.buildKeyMultiplicity, shared.probeKeyMultiplicity),
+        );
       } catch (error) {
         await Promise.allSettled([build.close(), probe?.close()]);
         throw error;
@@ -2542,7 +2556,7 @@ export class HashJoin {
         if (paced !== null) await paced;
         const ref = build.pages[i];
         if (!ref) throw new Error("Missing build spill page");
-        await shared.need(3 * ref.length + 64 * 1024);
+        await shared.need((2 + shared.buildKeyMultiplicity) * ref.length + 64 * 1024);
         const page = await shared.readPage(build, i);
         try {
           const { rows, columns } = await shared.decode(page, shared.buildTypes);
@@ -2574,7 +2588,9 @@ export class HashJoin {
       shared.resetKeys();
       const ref = probe.pages[i];
       if (!ref) throw new Error("Missing probe spill page");
-      await shared.need((chunk === null ? 3 : 2) * ref.length + 64 * 1024);
+      await shared.need(
+        ((chunk === null ? 2 : 1) + shared.probeKeyMultiplicity) * ref.length + 64 * 1024,
+      );
       const page = await shared.readPage(probe, i);
       try {
         const { rows, columns } = await shared.decode(page, this.spec.probeTypes);
@@ -2641,7 +2657,9 @@ export class HashJoin {
         shared.profile.chunkPasses++;
         // A chunk fills the pool's idle room but leaves the replay's steps theirs: one page in
         // flight and the output chunks' growth.
-        const keep = 2 * POOL_PAGE_BYTES + probePage + 3 * STAGING_TARGET_BYTES;
+        const probeStep = (1 + shared.probeKeyMultiplicity) * probePage;
+        const keep =
+          2 * POOL_PAGE_BYTES + shared.probeKeyMultiplicity * probePage + 3 * STAGING_TARGET_BYTES;
         // Only a reserved single-row load may use replay headroom temporarily.
         let loadingFirst = false;
         const chunkCharge: ByteCharge = {
@@ -2672,12 +2690,28 @@ export class HashJoin {
                 // Give the page back before reserving the step. Loading holds the page;
                 // replay holds its headroom after that page is released. These peaks
                 // overlap the build row/table, but not each other.
+                const encodedKey =
+                  shared.layout.family === "enc"
+                    ? PageWriter.encodedBytes(
+                        shared.spec.buildKeys.map((c) => columnOf(columns, c)),
+                        rows,
+                      )
+                    : 0;
+                const encodedGroup =
+                  groupLayout?.family === "enc"
+                    ? PageWriter.encodedBytes(
+                        shared.spec.buildKeys
+                          .slice(0, shared.correlated)
+                          .map((c) => columnOf(columns, c)),
+                        rows,
+                      )
+                    : 0;
                 retry =
                   sub.store.appendNeed(columns, row) +
                   JoinTable.estimateBytes(shared.layout, 1) +
-                  (shared.layout.family === "enc" ? bytes.charged : 0) +
-                  (groupLayout?.family === "enc" ? bytes.charged : 0) +
-                  Math.max(bytes.charged, 2 * probePage, keep) +
+                  encodedKey +
+                  encodedGroup +
+                  Math.max(bytes.charged, encodedKey + encodedGroup, probeStep, keep) +
                   groupBytes +
                   64 * 1024;
                 taken = 0;
@@ -2709,18 +2743,29 @@ export class HashJoin {
               const key =
                 shared.layout.family === "enc"
                   ? PageWriter.encodedBytes(
-                      shared.buildTypes.map((_, c) => sub.store.chunk(c, 0)),
+                      shared.spec.buildKeys.map((c) => sub.store.chunk(c, 0)),
+                      1,
+                    )
+                  : 0;
+              const groupKey =
+                groupLayout?.family === "enc"
+                  ? PageWriter.encodedBytes(
+                      shared.spec.buildKeys
+                        .slice(0, shared.correlated)
+                        .map((c) => sub.store.chunk(c, 0)),
                       1,
                     )
                   : 0;
               releaseStep ??= shared.pool.pinStep();
+              // The copied table key coexists with the encoder or replay peak.
+              // Both bounds project the full key multiset, never the stored row.
               // The row may fit without using replay headroom while its encoded
               // table does not. Preflight BEFORE either table/key allocation.
               await shared.need(
                 JoinTable.estimateBytes(shared.layout, 1) +
                   key +
-                  (groupLayout?.family === "enc" ? key : 0) +
-                  Math.max(key, 2 * probePage, keep) +
+                  groupKey +
+                  Math.max(key + groupKey, probeStep, keep) +
                   groupBytes +
                   64 * 1024,
               );

@@ -189,6 +189,13 @@ literal bounds count every variable position in the physical row, including repe
 Literal byte bounds also fund a single literal result value; unopened zero-demand subtrees do
 not contribute a bound. This is an honest
 compound working-set reservation, not a relaxation of the one-loan rule or an increase to the shared reserve.
+Join keys are position lists, not sets: repeated indexes contribute again to the encoded
+key bound. Chunk loading and table construction measure projected key positions,
+including encoded MARK correlation prefixes. Replay and checkpoint bounds carry the
+maximum occurrence count of a variable-width source column. Parameter/literal sizing counts key
+positions separately from physical row columns; source-prefix sizing applies its
+occurrence factor once and leaves already-complete saved bounds intact.
+
 A complete query whose simultaneous protected working set exceeds its cap still receives
 its existing typed admission refusal.
 

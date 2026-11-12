@@ -143,6 +143,34 @@ export class KeyLayout {
   }
 }
 
+/** A row stores each column once; an encoded key stores every position, including repeats.
+ * Without per-column page statistics, max occurrence bounds any selected column's bytes. */
+export function keyMultiplicity(
+  indexes: readonly number[],
+  types: readonly PhysicalType[],
+): number {
+  let maximum = 1;
+  for (const column of indexes) {
+    const type = types[column];
+    // Fixed key components have bounded scalar encodings. Repeating an integer
+    // must not multiply an unrelated, potentially huge TEXT payload in its row.
+    if (
+      !type ||
+      !(
+        type.kind === "text" ||
+        type.kind === "bytes" ||
+        type.kind === "enum" ||
+        (type.kind === "decimal" && (type.precision === null || type.precision > 38))
+      )
+    )
+      continue;
+    let count = 0;
+    for (const candidate of indexes) if (candidate === column) count++;
+    maximum = Math.max(maximum, count);
+  }
+  return maximum;
+}
+
 // --- hashing -------------------------------------------------------------------------------
 
 export function fmix32(h: number): number {

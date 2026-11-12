@@ -406,6 +406,8 @@ pages borrow the input row rather than retaining a second staging arena. Recursi
 preflight page/key work and pin the complete single-row table/replay transition until its
 buffers close; dead key encodings retire before staging/output. Competing-grant generators
 compare native and lowered SQL with PGlite, including collision fallback and every join kind.
+Repeated key indexes, asymmetric duplicate predicates and encoded MARK correlation prefixes
+carry their complete key-position bounds through chunk load, table build, replay and restore.
 The independent result-sink width bound for two large parameter-derived join outputs remains
 an admission-owner limitation (B6-join-result-admission handoff); it is not masked by a new
 set/join refusal. The operator/tape resident-state proof excludes backend implementation costs; shared scratch

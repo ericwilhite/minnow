@@ -296,8 +296,15 @@ export class QueryRuntime {
   #operatorLiteralBytes = 0;
   readonly #operatorParameterColumns = new Map<number, number>();
   readonly #operatorCopies = new Map<number, number>();
-  operatorParameterColumns(id: number, columns: number, copies?: number): void {
+  readonly #operatorSourceMultiplicity = new Map<number, number>();
+  operatorParameterColumns(
+    id: number,
+    columns: number,
+    copies?: number,
+    sourceMultiplicity = 1,
+  ): void {
     this.#operatorParameterColumns.set(id, columns);
+    this.#operatorSourceMultiplicity.set(id, sourceMultiplicity);
     if (copies !== undefined) this.#operatorCopies.set(id, copies);
   }
   operatorLiteralProgress(bytes: number): void {
@@ -341,7 +348,8 @@ export class QueryRuntime {
           Math.max(inputs, (largestInput * columns) / this.#expressionMultiplicity),
           largestInput * columns,
           this.#parameterProgress ? copies / 4 : copies,
-          this.#parameterProgress ? this.#progressBytes : this.#progressBytes / 4,
+          (this.#parameterProgress ? this.#progressBytes : this.#progressBytes / 4) *
+            (this.#operatorSourceMultiplicity.get(rel.id) ?? 1),
           1,
         ),
       ),

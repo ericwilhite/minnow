@@ -3972,3 +3972,43 @@ export const COMPOUND_PROJECTION_REACH = [
   "PostgreSQL exact",
   "zero resources",
 ] as const;
+
+/** Every physical key occurrence must be prepaid, including duplicate input indexes. */
+export const JOIN_REPEATED_PROGRESS_REACH = [
+  "inner",
+  "left",
+  "right",
+  "full",
+  "semi",
+  "anti",
+  "mark",
+  "unique positions",
+  "duplicated position",
+  "repeated position",
+  "asymmetric repetitions",
+  "arena boundary",
+  "seventeen repeats",
+  "fixed repeats with large payload",
+  "encoded repeated correlation",
+  "retired grant and private restore lane",
+  "selected dictionary",
+  "ordinary credit occupied",
+  "observed chunk and loan",
+  "PG exact",
+  "zero resources",
+] as const;
+
+export const JOIN_REPEATED_SQL_REACH = [
+  "inner",
+  "left",
+  "right",
+  "full",
+  "stored source",
+  "repeated parameter",
+  "asymmetric repeated predicates",
+  "cross-field grid",
+  "single-row source envelope",
+  "ordinary credit occupied",
+  "PG exact",
+  "zero resources",
+] as const;
