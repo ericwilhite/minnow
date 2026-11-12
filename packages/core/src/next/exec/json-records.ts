@@ -10,6 +10,8 @@ import { SpillCorruptionError } from "../spill/contract.js";
 import { ColumnStore } from "./column-store.js";
 import { RecordCheckpoint } from "./record-checkpoint.js";
 import { decodePage } from "./spill-pages.js";
+import type { ResultAllocator, ResultBuffers } from "./result-buffer.js";
+import type { Transfer } from "./pipeline.js";
 import type { SpillIo } from "./spill-pool.js";
 import type { SpillService } from "../spill/contract.js";
 import { nullParameter } from "./parameters.js";
@@ -180,10 +182,11 @@ export class JsonRecords {
   async read(
     io: SpillIo,
     prepaid: number,
-    visit: (columns: readonly FlatVector[], rows: number) => Promise<void>,
+    visit: (columns: readonly FlatVector[], rows: number, transfer?: Transfer) => Promise<void>,
+    allocateResult?: ResultAllocator,
   ): Promise<void> {
     if (prepaid < this.retainedBytes) throw new Error("JSON restored row was not admitted");
-    const buffer = new Uint8Array(this.#payload),
+    const buffer = allocateResult ? EMPTY : new Uint8Array(this.#payload),
       columns: FlatVector[] = [];
     let active = false,
       cursor = 0,
@@ -195,6 +198,12 @@ export class JsonRecords {
       wide = 0,
       wideLimit = 0,
       payloadLimit = 0;
+    let owned: ResultBuffers | null = null,
+      currentBytes: Uint8Array = EMPTY;
+    const closeOwned = () => {
+      owned?.close();
+      owned = null;
+    };
     const charge = {
       allocate: (n: number) => {
         if (wide + n > wideLimit) return false;
@@ -209,119 +218,131 @@ export class JsonRecords {
     function bad(): never {
       throw new SpillCorruptionError("Invalid JSON checkpoint record");
     }
-    await this.#records.read(io, async (records, rows) => {
-      for (let row = 0; row < rows; row++) {
-        io.checkAborted();
-        const c = records[0],
-          o = records[1],
-          n = records[2],
-          v = records[3];
-        if (
-          !c ||
-          !o ||
-          !n ||
-          !v ||
-          c.data.layout !== "i32" ||
-          o.data.layout !== "i32" ||
-          n.data.layout !== "i32" ||
-          v.data.layout !== "varlen" ||
-          [c, o, n, v].some((x) => !isValidSlot(x, row))
-        )
-          bad();
-        const col = c.data.values[row] ?? 0,
-          offset = o.data.values[row] ?? 0,
-          length = n.data.values[row] ?? 0;
-        const bytes = v.data.bytes.subarray(v.data.offsets[row] ?? 0, v.data.offsets[row + 1] ?? 0);
-        if (col === -1) {
+    try {
+      await this.#records.read(io, async (records, rows) => {
+        for (let row = 0; row < rows; row++) {
+          io.checkAborted();
+          const c = records[0],
+            o = records[1],
+            n = records[2],
+            v = records[3];
           if (
-            active ||
-            length < 0 ||
-            length > this.#extra ||
-            offset < 0 ||
-            offset > this.#payload ||
-            bytes.length
+            !c ||
+            !o ||
+            !n ||
+            !v ||
+            c.data.layout !== "i32" ||
+            o.data.layout !== "i32" ||
+            n.data.layout !== "i32" ||
+            v.data.layout !== "varlen" ||
+            [c, o, n, v].some((x) => !isValidSlot(x, row))
           )
             bad();
-          active = true;
-          cursor = 0;
-          nextColumn = 0;
-          current = -1;
-          wide = 0;
-          wideLimit = length;
-          payloadLimit = offset;
-          columns.length = 0;
-          continue;
-        }
-        if (!active) bad();
-        if (col === -2) {
-          if (
-            nextColumn !== this.types.length ||
-            current !== -1 ||
-            bytes.length ||
-            offset ||
-            length
-          )
+          const col = c.data.values[row] ?? 0,
+            offset = o.data.values[row] ?? 0,
+            length = n.data.values[row] ?? 0;
+          const bytes = v.data.bytes.subarray(
+            v.data.offsets[row] ?? 0,
+            v.data.offsets[row + 1] ?? 0,
+          );
+          if (col === -1) {
+            if (
+              active ||
+              length < 0 ||
+              length > this.#extra ||
+              offset < 0 ||
+              offset > this.#payload ||
+              bytes.length
+            )
+              bad();
+            owned = allocateResult ? await allocateResult(this.retainedBytes) : null;
+            active = true;
+            cursor = 0;
+            nextColumn = 0;
+            current = -1;
+            wide = 0;
+            wideLimit = length;
+            payloadLimit = offset;
+            columns.length = 0;
+            continue;
+          }
+          if (!active) bad();
+          if (col === -2) {
+            if (
+              nextColumn !== this.types.length ||
+              current !== -1 ||
+              bytes.length ||
+              offset ||
+              length
+            )
+              bad();
+            try {
+              await visit(columns, 1, owned?.transfer);
+            } finally {
+              closeOwned();
+            }
+            columns.length = 0;
+            active = false;
+            continue;
+          }
+          if (col < 0 || col >= this.types.length || length < 0 || bytes.length > FRAGMENT) bad();
+          const type = this.types[col];
+          if (!type) bad();
+          if (offset === -1) {
+            if (col !== nextColumn || current !== -1 || length || bytes.length) bad();
+            columns.push(nullParameter(type));
+            nextColumn++;
+            continue;
+          }
+          if (offset === -2) {
+            if (layoutOf(type) === "varlen") bad();
+            if (col !== nextColumn || current !== -1 || length !== bytes.length) bad();
+            cursor = align(cursor);
+            if (cursor + length > payloadLimit) bad();
+            const cell = owned ? owned.bytes(length) : buffer.subarray(cursor, cursor + length);
+            cell.set(bytes);
+            const decoded = decodePage(cell, [type], charge);
+            if ("needed" in decoded || decoded.rows !== 1 || !decoded.columns[0]) bad();
+            columns.push(decoded.columns[0]);
+            cursor += length;
+            nextColumn++;
+            continue;
+          }
+          if (layoutOf(type) !== "varlen") bad();
+          if (current === -1) {
+            if (col !== nextColumn || offset !== 0) bad();
+            start = align(cursor);
+            if (start + length > payloadLimit) bad();
+            current = col;
+            at = 0;
+            total = length;
+            cursor = start + length;
+            currentBytes = owned ? owned.bytes(length) : buffer.subarray(start, cursor);
+            const offsets = owned ? new Int32Array(owned.bytes(8).buffer) : new Int32Array(2);
+            offsets[1] = length;
+            columns.push({
+              form: "flat",
+              type,
+              length: 1,
+              validity: null,
+              data: { layout: "varlen", bytes: currentBytes, offsets },
+            });
+          }
+          if (col !== current || offset !== at || length !== total || at + bytes.length > total)
             bad();
-          await visit(columns, 1);
-          columns.length = 0;
-          active = false;
-          continue;
+          currentBytes.set(bytes, at);
+          at += bytes.length;
+          if (at === total) {
+            current = -1;
+            nextColumn++;
+          }
         }
-        if (col < 0 || col >= this.types.length || length < 0 || bytes.length > FRAGMENT) bad();
-        const type = this.types[col];
-        if (!type) bad();
-        if (offset === -1) {
-          if (col !== nextColumn || current !== -1 || length || bytes.length) bad();
-          columns.push(nullParameter(type));
-          nextColumn++;
-          continue;
-        }
-        if (offset === -2) {
-          if (layoutOf(type) === "varlen") bad();
-          if (col !== nextColumn || current !== -1 || length !== bytes.length) bad();
-          cursor = align(cursor);
-          if (cursor + length > payloadLimit) bad();
-          buffer.set(bytes, cursor);
-          const decoded = decodePage(buffer.subarray(cursor, cursor + length), [type], charge);
-          if ("needed" in decoded || decoded.rows !== 1 || !decoded.columns[0]) bad();
-          columns.push(decoded.columns[0]);
-          cursor += length;
-          nextColumn++;
-          continue;
-        }
-        if (layoutOf(type) !== "varlen") bad();
-        if (current === -1) {
-          if (col !== nextColumn || offset !== 0) bad();
-          start = align(cursor);
-          if (start + length > payloadLimit) bad();
-          current = col;
-          at = 0;
-          total = length;
-          cursor = start + length;
-          columns.push({
-            form: "flat",
-            type,
-            length: 1,
-            validity: null,
-            data: {
-              layout: "varlen",
-              bytes: buffer.subarray(start, cursor),
-              offsets: Int32Array.of(0, length),
-            },
-          });
-        }
-        if (col !== current || offset !== at || length !== total || at + bytes.length > total)
-          bad();
-        buffer.set(bytes, start + at);
-        at += bytes.length;
-        if (at === total) {
-          current = -1;
-          nextColumn++;
-        }
-      }
-    });
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- the awaited record visitor mutates this state
-    if (active) bad();
+      });
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- the awaited record visitor mutates this state
+      if (active) bad();
+    } finally {
+      closeOwned();
+    }
   }
   close(): Promise<void> {
     return (this.#closing ??= this.#records.close().finally(() => this.#detach()));

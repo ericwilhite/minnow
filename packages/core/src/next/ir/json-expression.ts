@@ -17,7 +17,14 @@ export function jsonExpression(expr: ScalarExpr): boolean {
     return true;
   if (expr.op === "cast" && expr.type.kind === "json" && expr.input.type.kind === "text")
     return true;
-  if (expr.op === "call" && (expr.fn.startsWith("json_") || expr.fn === "to_json")) return true;
+  if (
+    expr.op === "call" &&
+    (expr.fn.startsWith("json_") ||
+      expr.fn.startsWith("jsonb_") ||
+      expr.fn === "to_json" ||
+      expr.fn === "to_jsonb")
+  )
+    return true;
   for (const value of Object.values(expr)) {
     if (value === null || typeof value !== "object") continue;
     if (Array.isArray(value)) {
@@ -45,6 +52,20 @@ export function jsonExpression(expr: ScalarExpr): boolean {
 
 /** Binary JSON canonicalization can expand; its frame needs checkpoint/re-admission. */
 export function expandingJsonExpression(expr: ScalarExpr): boolean {
+  if (
+    expr.op === "call" &&
+    [
+      "json_object",
+      "json_build_object",
+      "jsonb_build_object",
+      "json_build_array",
+      "jsonb_build_array",
+      "json_array",
+      "to_json",
+      "to_jsonb",
+    ].includes(expr.fn)
+  )
+    return true;
   if (
     expr.op === "cast" &&
     expr.type.kind === "text" &&

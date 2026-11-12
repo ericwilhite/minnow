@@ -1,3 +1,4 @@
+import { jsonCallSource } from "./json-call-sources.js";
 import { isDatePart } from "./date-part-sources.js";
 import { seriesArgumentCount } from "./series-sources.js";
 import { intervalArithmeticSource } from "./interval-arithmetic-sources.js";
@@ -44,6 +45,8 @@ export function encodeQueryIdentity(value: unknown, ancestors = new Set<object>(
       .join("")}}`;
   }
   // Exact frame literals participate even when their public double offsets are identical.
+  const json = jsonCallSource(value);
+  if (json !== undefined) encoded = `j${encodeQueryIdentity(json, ancestors)}${encoded}`;
   if (isDatePart(value)) encoded = `p${encoded}`;
   const interval = intervalArithmeticSource(value);
   if (interval !== undefined) encoded = `v${encodeQueryIdentity(interval, ancestors)}${encoded}`;

@@ -3887,3 +3887,163 @@ export const QUERY_ROOT_VOLUME_REACH = [
   "exact callback work",
   "volume drift refusal",
 ] as const;
+
+/** Heterogeneous constructor output is compared byte-for-byte, never parsed/reordered. */
+export const JSON_CONSTRUCT_REACH = [
+  "json_build_object",
+  "json_object",
+  "json_build_array",
+  "json_array",
+  "duplicate keys",
+  "NULL handling",
+  "int8 precision and numeric scale",
+  "nested typed JSON",
+  "UTF8",
+  "escapes",
+  "exact text",
+] as const;
+
+export const JSON_CONSTRUCT_PRESSURE_REACH = [
+  "observed admission wait",
+  "cancel waiting admission",
+  "resume waiting admission",
+  "growth handoff",
+  "unary ancestor",
+  "EXCEPT ancestor",
+  "exact text",
+  "zero resources",
+] as const;
+
+export const JSON_CONSTRUCT_NUMERIC_REACH = [
+  "wide coefficient",
+  "maximum integer digits",
+  "maximum scale",
+  "positive",
+  "negative",
+  "exact text",
+] as const;
+
+export const JSON_CONSTRUCT_CAP_REACH = [
+  "JSONB streaming canonicalization",
+  "JSON construction",
+  "largest fit",
+  "first cannot fit",
+  "result buffer identity",
+  "two copies",
+  "exact PostgreSQL",
+  "zero resources",
+] as const;
+
+export const JSON_CONSTRUCT_NESTED_REACH = [
+  "JSON",
+  "JSONB",
+  "deep dependencies",
+  "projected sibling pins",
+  "exact PostgreSQL",
+  "zero resources",
+] as const;
+
+export const JSON_RESULT_OWNERSHIP_REACH = [
+  "live result charge",
+  "delivery fence",
+  "one column",
+  "two columns",
+  "generated read cut",
+  "cancel while read",
+  "read fault",
+  "zero resources",
+] as const;
+
+export const JSON_RESULT_CONCURRENT_REACH = [
+  "two queries one governor",
+  "queued native admission",
+  "held opposite credit",
+  "cancel queued follower",
+  "resume queued follower",
+  "concurrent delivery",
+  "cancel concurrent delivery",
+  "exact PostgreSQL",
+  "zero resources",
+] as const;
+
+export const JSON_EXCEPT_RESULT_BOUND_REACH = [
+  "JSON",
+  "JSONB",
+  "larger retained left",
+  "exact PostgreSQL",
+  "zero spill",
+] as const;
+
+export const JSON_CONSTRUCT_ARITY_REACH = [
+  "JSON",
+  "JSONB",
+  "at boundary",
+  "above boundary",
+  "exact PostgreSQL",
+] as const;
+
+export const JSONB_KEY_CURSOR_REACH = [
+  "decoded UTF8 key lengths",
+  "same-length byte order",
+  "escaped Unicode aliases",
+  "supplementary Unicode aliases",
+  "control and syntax keys",
+  "last duplicate in generated order",
+  "constant-space key traversal",
+  "exact PostgreSQL",
+  "zero resources",
+] as const;
+
+export const JSON_RESULT_MIXED_REACH = [
+  "wide JS coefficient copy",
+  "compact coefficient copy",
+  "JSON",
+  "JSONB",
+  "fits whole cap",
+  "exact PostgreSQL",
+  "zero resources",
+] as const;
+
+export const JSONB_CONSTRUCT_ERROR_REACH = [
+  "Unicode before NULL key",
+  "numeric before NULL key",
+  "NULL key before Unicode",
+  "typed key before value",
+  "surrogate conversion",
+  "three or more defects",
+  "exact PostgreSQL SQLSTATE",
+  "zero spill",
+] as const;
+
+export const JSONB_ALLOCATION_FAULT_REACH = [
+  "allocator arena",
+  "allocator pool",
+  "allocator grant",
+  "early constructor",
+  "middle constructor",
+  "late constructor",
+  "original failure cause",
+  "zero files/grants before close",
+] as const;
+
+export const JSON_FLOAT_REACH = [
+  "decimal tie rounds down to even",
+  "decimal tie rounds up to even",
+  "float4 bits",
+  "float8 bits",
+  "near 2^24",
+  "near 2^53",
+  "rounding ties and neighbours",
+  "float4 midpoint exclusion",
+  "float8 midpoint exclusion",
+  "float4 subnormal",
+  "float8 subnormal",
+  "negative zero",
+  "positive zero",
+  "special values",
+  "exponent transitions",
+  "scalar JSON and JSONB",
+  "array constructors",
+  "scalar keys",
+  "exact PostgreSQL text",
+] as const;

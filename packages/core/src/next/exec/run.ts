@@ -29,6 +29,7 @@ import {
   type ParameterBinding,
 } from "./parameters.js";
 import { RESULT_FRAME_TARGET_BYTES, RESULT_WINDOW_BYTES, ResultChannel } from "./result.js";
+import type { ResultAllocator } from "./result-buffer.js";
 import { ResultSink } from "./result-sink.js";
 import type { ParameterSlots, CallResolver } from "./kernels/compile.js";
 import { ReservedGrant } from "./admission.js";
@@ -174,12 +175,21 @@ export class QueryRuntime {
   readonly #reserved = new Map<string, ReservedGrant>();
   readonly #phaseParts = new Map<ReservedGrant, Grant>();
   readonly #bounds = new Map<number, { readonly limit: number | null; readonly offset: number }>();
+  #allocateResult: ResultAllocator | null = null;
+  resultAllocator(allocate: ResultAllocator): void {
+    this.#allocateResult = allocate;
+  }
+  allocateResultOwned(bytes: number) {
+    if (this.#allocateResult === null) throw new Error("Missing result allocation recipe");
+    return this.#allocateResult(bytes);
+  }
   #atomicResult: DeferredGrant | null = null;
   #window = 0;
   #readBytes = 0;
   #progressBytes = 0;
   #savedProgressBytes = 0;
   #resultProgressOverride: number | null = null;
+  #resultOwnedMinimum = false;
   #resultCopies = 1;
   #resultCopySourceProgress: number | null = null;
   resultCopySourceProgress(bytes: number): void {
@@ -189,6 +199,11 @@ export class QueryRuntime {
     if (!Number.isSafeInteger(copies) || copies < 1)
       throw new TypeError("Positive result multiplicity required");
     this.#resultCopies = copies;
+  }
+  #resultWindow(): number {
+    // A buffered producer cannot offer a frame before its delivery handoff. Keep only
+    // bounded empty-sink metadata, rather than an unused full consumer byte window.
+    return this.#resultProgressOverride === 0 ? Math.min(this.#window, 4096) : this.#window;
   }
   #resultStep(inputs: number, largestInput: number): number {
     // Multiply the source/owned-value envelope, not the four-MiB progress floor.
@@ -200,11 +215,14 @@ export class QueryRuntime {
           this.#resultCopies,
           this.#resultCopySourceProgress ?? this.#progressBytes,
         )
-      : this.#resultProgressOverride * this.#resultCopies;
+      : // A JSON checkpoint bounds its complete serialized row, including repeated aliases.
+        // Only an input/source envelope needs the separate logical copy multiplier.
+        this.#resultProgressOverride * (this.#resultOwnedMinimum ? 1 : this.#resultCopies);
   }
   /** A checkpoint producer emits no result until its delivery phase is admitted. */
-  resultProgressEnvelope(bytes: number | null): void {
+  resultProgressEnvelope(bytes: number | null, owned = false): void {
     this.#resultProgressOverride = bytes;
+    this.#resultOwnedMinimum = owned;
   }
   retainedProgressEnvelope(): number {
     let bytes = 0;
@@ -328,7 +346,9 @@ export class QueryRuntime {
       entries.reduce((sum, entry) => sum + entry.minimum, 0) +
       borrowers * progress +
       this.#readBytes +
-      (entries.length === 0 ? 0 : Math.max(this.#window, this.#resultStep(inputs, largestInput)))
+      (entries.length === 0
+        ? 0
+        : Math.max(this.#resultWindow(), this.#resultStep(inputs, largestInput)))
     );
   }
 
@@ -420,13 +440,20 @@ export class QueryRuntime {
     this.#operatorProgress = new Map(
       entries.filter(({ rel }) => canBorrow(rel)).map(({ rel }) => [rel.id, progress]),
     );
-    const window = atomic && entries.length > 0 ? this.#window : 0;
+    const window =
+      atomic && entries.length > 0
+        ? Math.max(
+            this.#resultWindow(),
+            this.#resultOwnedMinimum
+              ? this.#resultStep(binding.logicalBytes ?? binding.bytes, binding.largestSlot)
+              : 0,
+          )
+        : 0;
     const resultProgress =
       atomic && entries.length > 0
         ? Math.max(
             0,
-            this.#resultStep(binding.logicalBytes ?? binding.bytes, binding.largestSlot) -
-              this.#window,
+            this.#resultStep(binding.logicalBytes ?? binding.bytes, binding.largestSlot) - window,
           )
         : 0;
     const prefix = `query#${String(this.request.queryId)}`;
@@ -943,9 +970,12 @@ export class QueryExecution implements Execution {
         this.#result?.close();
         request.signal?.removeEventListener("abort", onAbort);
       },
-      (error: unknown) => {
+      async (error: unknown) => {
         this.#delivered = true;
         this.#sink?.discard(error);
+        // A cancelled row reader may still be filling a result-owned backing allocation.
+        // Producer cleanup fences its borrowed IO; frame credit alone cannot retire it.
+        if (this.#sink?.ownsPartialResult) await this.executed.catch(() => undefined);
         this.#result?.close();
         request.signal?.removeEventListener("abort", onAbort);
         throw error;
@@ -1035,6 +1065,11 @@ export class QueryExecution implements Execution {
       runtime.view.observedLsn,
       { deferEnd: true, maxRows: this.request.resultFrameRows ?? null },
     );
+    runtime.resultAllocator((bytes) => {
+      const sink = this.#sink;
+      if (sink === null) throw new Error("Missing result sink");
+      return sink.allocateOwnedResult(bytes);
+    });
     runtime.onAbort((reason) => this.#sink?.abort(reason));
     try {
       const work = program(runtime, this.#sink);

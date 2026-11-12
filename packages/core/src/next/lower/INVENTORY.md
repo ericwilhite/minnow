@@ -325,10 +325,10 @@ catalogue suite checks its exact class, stage, construct and SQLSTATE, and execu
 SQL statement against PGlite to verify the authority outcome. These are capability limits of
 this unexported core; they do not describe the shipped engine's SQL support.
 
-| Cell    | Stage / construct | Reason                                                                                                        |
-| ------- | ----------------- | ------------------------------------------------------------------------------------------------------------- |
-| guide-7 | lower / function  | JSON_OBJECT and JSON_ARRAYAGG need heterogeneous typed construction and charged, spillable JSON accumulation. |
-| guide-8 | lower / function  | Whole-row json_agg needs record typing and bounded JSON accumulation; its expanded JSON_OBJECT is refused.    |
+| Cell    | Stage / construct | Reason                                                                                                    |
+| ------- | ----------------- | --------------------------------------------------------------------------------------------------------- |
+| guide-7 | lower / function  | JSON_OBJECT construction executes; JSON_ARRAYAGG still needs charged, spillable JSON accumulation.        |
+| guide-8 | lower / function  | Whole-row json_agg needs record typing and bounded JSON accumulation; its expanded ROW_OBJECT is refused. |
 
 Canonical DATE literals now lower directly to epoch-day vectors using the binder's shared
 canonical parser. The shipped SQL front end still limits DATE literal spelling to AD years
@@ -441,7 +441,7 @@ workspace before copying. They retain ordinary fast routes through empty-prefix 
 and until a nonempty cut or grouped pressure fallback; only then is peer-stable input converted to ordinal continuation. Both producer kinds retain one shared idle account and cleanup ownership
 through cancellation, I/O faults and concurrent continuations.
 Document parameters, lazy init values, foreign expanding document producers, front-end materialized
-JSON/JSONB literals and JSON ↔ JSONB casts remain explicit refusals. JSON paths, construction and
+JSON/JSONB literals and JSON ↔ JSONB casts remain explicit refusals. JSON paths and
 aggregation remain separate work; guide-7/8 remain the only two catalogue refusals (64/66 execute).
 Canonicalization uses bounded scratch and iterative traversal, with quadratic CPU for wide objects;
 there is no claimed wide-object speedup. No published engine behavior or stored format changes here.
@@ -503,3 +503,51 @@ operation order, including second/millisecond fractions and epoch cancellation; 
 convert the exact EXTRACT result after evaluation. Date/time DATE_PART kernels remain typed
 execution refusals. Its float8 type still rejects two-argument ROUND at lowering, as PostgreSQL
 does, including over date/timestamp arguments whose execution is not implemented yet.
+
+Typed scalar JSON construction now executes: SQL `JSON_OBJECT(KEY … VALUE …)` / `JSON_ARRAY`,
+`json_build_object` / `json_build_array` and their JSONB variants, plus single-value `to_json`
+and `to_jsonb`. Each argument retains its own physical type. JSON preserves pair order,
+duplicates, spaces and exact NUMERIC display scale; JSONB uses the existing canonicalizer.
+SQL array construction omits NULLs by default; build-array retains them. SQL/JSON selects
+JSONB output when a value argument is JSONB. Output and temporary buffers are counted/charged
+before allocation and use the existing JSON growth handoff, including cancellable re-admission.
+Scalar BOOL, integer, floating, NUMERIC, TEXT/enum, JSON, DATE, TIMESTAMP and finite INTERVAL
+values are supported. Float rendering uses PostgreSQL's open binary rounding interval,
+closest shortest decimal with ties to even, and float4/float8 exponent thresholds. JSONB parses
+that exact decimal output; it does not round through a JavaScript number or use the lower
+precision float-to-NUMERIC cast. Subnormal values and signed zero follow PostgreSQL.
+Array/UUID/BYTEA/composite value kernels, ROW_TO_JSON and JSON aggregates
+retain typed refusals. JSON_OBJECT's array overload syntax is not supported. Existing document-provenance and
+volatile-expression limits remain. No new catalogue cell is enabled yet (64/66).
+
+#### JSON value admission and delivery
+
+A completed variable-width JSON row is reconstructed directly into tight, result-owned buffers.
+Those buffers transfer to the result frame without another payload copy or a free/reacquire gap;
+consumer credit releases them. The delivery recipe reserves **two serialized row sizes**, plus
+bounded I/O, fixed metadata, already-owned parameters and any retaining parent's actual minimum.
+For a direct scalar value this is a 2× serialized-byte envelope, not a multiplier on every
+intermediate expression. An unfinished expression frontier separately admits its restored input
+and builder. Consumed nested values are retired; JSONB key comparison decodes keys in constant
+space and validation stacks grow only with actual nesting.
+
+A value whose complete irreducible recipe exceeds the whole governor cap gets typed `53200`.
+Transient pressure instead waits cancellably after handing off the old graph. The generated cap
+property proves the two-row + owned-parameter size law, executes its largest fitting value, and
+checks the first value above it. Repeated aliases count their actual output columns once. Other
+simultaneously retained plan state can require additional space; this does not promise arbitrary
+joins, deeply nested documents or wide JS NUMERIC/array output under a universal 2× whole-query
+bound. Wide JS NUMERIC coefficients keep their charged per-field copy without copying the
+JSON sibling again. Encoded array fields already use transferable variable-width bytes.
+Existing oversized-parameter execution checks remain unchanged.
+
+Float serialization reuses native nearest-shortest digits on the proven common path. Binary64
+values below 2^53 cannot have a shortest decimal at an excluded binary midpoint; larger values
+retain the exact interval fallback. Binary32 candidates must lie strictly inside exact binary64
+midpoints; asymmetric power-of-two intervals and uncertain decimal ties use the same fallback.
+PG notation is applied without parsing a chosen binary64 decimal back through Number. No copied
+Ryu tables, per-row BigInt interval search on the ordinary path, or new admission allowance.
+
+Partial result ownership survives pending checkpoint I/O, cancellation and faults until that I/O
+settles. Offered frames own their backing storage until credit; foreign grants and reusable slabs
+remain ineligible for adoption. The ephemeral checkpoint descriptors do not change stored formats.

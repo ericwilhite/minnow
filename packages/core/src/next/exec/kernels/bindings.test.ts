@@ -82,7 +82,7 @@ function sample(type: PhysicalType): FlatVector {
 /** The argument types of one call of `overload`, with `T` as `variable`. */
 function argumentTypes(overload: Overload, variable: PhysicalType): PhysicalType[] {
   const slots = overload.variadic === true ? [...overload.args, ...overload.args] : overload.args;
-  return slots.map((slot) => (slot === "T" ? variable : physicalTypeOfSql(slot)));
+  return slots.map((slot) => (slot === "T" || slot === "any" ? variable : physicalTypeOfSql(slot)));
 }
 
 function callOf(fn: string, overload: Overload, types: readonly PhysicalType[]): ScalarExpr {

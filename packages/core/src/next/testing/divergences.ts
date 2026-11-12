@@ -468,7 +468,7 @@ export const CATALOGUE_REFUSALS: Readonly<Record<string, CatalogueRefusal>> = {
     class: "UnsupportedPlanError",
     sqlState: "0A000",
     stage: "lower",
-    construct: "function",
+    construct: "aggregate",
   },
   "guide-8": {
     class: "UnsupportedPlanError",
@@ -485,12 +485,12 @@ export const CATALOGUE_REFUSAL_REASONS: Readonly<
 > = {
   "guide-7": {
     reason:
-      "JSON_OBJECT / JSON_ARRAYAGG need typed heterogeneous constructors and a charged, spillable JSON accumulator; the R19 scalar table has no JSON constructor overload yet.",
+      "JSON_OBJECT construction now executes; JSON_ARRAYAGG still needs a charged, spillable JSON accumulator.",
     pgState: "00000",
   },
   "guide-8": {
     reason:
-      "Whole-row json_agg requires record typing and bounded JSON accumulation; lowering currently expands the record to an unsupported JSON_OBJECT.",
+      "Whole-row json_agg requires record typing and bounded JSON accumulation; its parser-expanded record remains an explicit ROW_OBJECT refusal.",
     pgState: "00000",
   },
 };

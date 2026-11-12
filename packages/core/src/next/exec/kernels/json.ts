@@ -3,6 +3,7 @@ import type { PhysicalType } from "../../types.js";
 import type { Batch, FlatVector, Selection, Vector } from "../../vector/vector.js";
 import { ExecutionError, UnsupportedPlanError } from "../errors.js";
 import type { Slice, SlicedJob } from "../slices.js";
+import { jsonValue, JSON_VALUE_KINDS } from "./json-value.js";
 import { JsonScan } from "./json-scan.js";
 import { JsonOutput } from "./json-output.js";
 import { canonicalJsonb } from "./jsonb-canonical.js";
@@ -15,6 +16,17 @@ import {
   type OutputArena,
 } from "./vectors.js";
 
+const CONSTRUCTORS = new Set([
+  "json_object",
+  "json_build_object",
+  "jsonb_build_object",
+  "json_build_array",
+  "jsonb_build_array",
+  "json_array",
+  "to_json",
+  "to_jsonb",
+]);
+
 export interface JsonMemory {
   take(bytes: number): SlicedJob<void>;
   free(bytes: number): void;
@@ -22,6 +34,7 @@ export interface JsonMemory {
 export interface JsonHost {
   readonly slice: Slice;
   memory(node: JsonNode): JsonMemory;
+  inputsConsumed?(node: JsonNode): void;
   evaluate(node: JsonNode, batch: Batch, rows: Selection | null): Vector;
 }
 const hosts = new WeakMap<OutputArena, JsonHost>();
@@ -35,6 +48,8 @@ export class JsonNode implements Compiled {
   readonly #validity: Uint32Array;
   readonly #active: Uint8Array;
   readonly #memory: JsonMemory;
+  readonly #raw: Array<Uint8Array | undefined>;
+  #rawBytes = 0;
   #bytes = 0;
   #writing = false;
   constructor(
@@ -45,7 +60,10 @@ export class JsonNode implements Compiled {
     arena: OutputArena,
   ) {
     // Charge kernel wrappers, frame metadata and bounded cursor temporaries before allocation.
-    arena.take(1024 + args.length * 32 + arena.capacity + 4096);
+    const rawCapacity =
+      type.kind === "json" && type.binary && CONSTRUCTORS.has(fn) ? arena.capacity : 0;
+    arena.take(1024 + args.length * 32 + arena.capacity + 8 * rawCapacity + 4096);
+    this.#raw = new Array<Uint8Array | undefined>(rawCapacity);
     this.#active = new Uint8Array(arena.capacity);
     const out = arena.flat(type);
     if (out.vector.data.layout !== "varlen") throw new TypeError("Expected variable JSON output");
@@ -61,8 +79,10 @@ export class JsonNode implements Compiled {
     return this.host.evaluate(this, batch, rows);
   }
   reset(): void {
-    if (this.#bytes > 0) this.#memory.free(this.#bytes);
+    if (this.#bytes + this.#rawBytes > 0) this.#memory.free(this.#bytes + this.#rawBytes);
     this.#bytes = 0;
+    this.#rawBytes = 0;
+    this.#raw.fill(undefined);
     this.#data.bytes = new Uint8Array(0);
   }
   *#validated(bytes: Uint8Array): SlicedJob<JsonScan> {
@@ -77,8 +97,92 @@ export class JsonNode implements Compiled {
     }
     return scan;
   }
+  *#value(value: Vector, row: number, writer: JsonOutput, key = false): SlicedJob<void> {
+    // JSONB converts each argument before advancing to the next pair. Deferring all
+    // conversion to the completed raw object would let a later bad key hide this value's error.
+    if (
+      !key &&
+      this.type.kind === "json" &&
+      this.type.binary &&
+      value.type.kind === "json" &&
+      !value.type.binary &&
+      isValidSlot(value, row)
+    )
+      yield* canonicalJsonb(valueBytes(value, row), writer, this.#memory, this.host.slice);
+    else yield* jsonValue(value, row, writer, this.#memory, this.host.slice, key);
+  }
+  *#construct(vectors: readonly Vector[], row: number, writer: JsonOutput): SlicedJob<boolean> {
+    const first = vectors[0];
+    if (this.fn === "to_json" || this.fn === "to_jsonb") {
+      if (first === undefined || !isValidSlot(first, row)) return false;
+      yield* this.#value(first, row, writer);
+      return true;
+    }
+    const object =
+      this.fn === "json_build_object" ||
+      this.fn === "jsonb_build_object" ||
+      this.fn === "json_object";
+    if (object && vectors.length % 2 !== 0)
+      throw new ExecutionError(
+        "argument list must have even number of elements",
+        "MINNOW_JSON_PAIRS",
+        "22023",
+      );
+    writer.put(object ? 123 : 91);
+    let emitted = false;
+    for (let i = 0; i < vectors.length; i += object ? 2 : 1) {
+      const value = vectors[i];
+      if (value === undefined) throw new TypeError("Missing JSON argument");
+      if (this.fn === "json_array" && !isValidSlot(value, row)) continue;
+      if (emitted) {
+        writer.put(44);
+        writer.put(32);
+      }
+      emitted = true;
+      if (object && this.type.kind === "json" && this.type.binary && !isValidSlot(value, row))
+        throw new ExecutionError(
+          `argument ${String(i + 1)}: key must not be null`,
+          "MINNOW_JSON_KEY_NULL",
+          "22023",
+        );
+      yield* this.#value(value, row, writer, object);
+      if (object) {
+        writer.put(32);
+        writer.put(58);
+        writer.put(32);
+        const member = vectors[i + 1];
+        if (member === undefined) throw new TypeError("Missing JSON member");
+        yield* this.#value(member, row, writer);
+      }
+    }
+    writer.put(object ? 125 : 93);
+    return true;
+  }
   *#row(vectors: readonly Vector[], row: number, writer: JsonOutput): SlicedJob<boolean> {
     const first = vectors[0];
+    if (CONSTRUCTORS.has(this.fn)) {
+      if (this.type.kind !== "json" || !this.type.binary)
+        return yield* this.#construct(vectors, row, writer);
+      if (!this.#writing) {
+        const counter = new JsonOutput(null, this.host.slice);
+        const valid = yield* this.#construct(vectors, row, counter);
+        if (!valid) return false;
+        yield* this.#memory.take(counter.position);
+        this.#rawBytes += counter.position;
+        const bytes = new Uint8Array(counter.position);
+        this.#raw[row] = bytes;
+        yield* this.#construct(vectors, row, new JsonOutput(bytes, this.host.slice));
+      }
+      const bytes = this.#raw[row];
+      if (bytes === undefined) return false;
+      yield* canonicalJsonb(bytes, writer, this.#memory, this.host.slice);
+      if (this.#writing) {
+        this.#memory.free(bytes.length);
+        this.#rawBytes -= bytes.length;
+        this.#raw[row] = undefined;
+      }
+      return true;
+    }
     if (this.fn === "validate_jsonb") {
       if (first === undefined || !isValidSlot(first, row)) return false;
       yield* canonicalJsonb(valueBytes(first, row), writer, this.#memory, this.host.slice);
@@ -160,6 +264,10 @@ export class JsonNode implements Compiled {
         if (yield* this.#row(vectors, row, counter))
           this.#validity[row >>> 5] = (this.#validity[row >>> 5] ?? 0) | (1 << (row & 31));
       }
+    // Binary constructors have captured their arguments once into a raw row. Their
+    // children can now retire before final canonical output, avoiding a third full copy.
+    if (this.type.kind === "json" && this.type.binary && this.#rawBytes > 0)
+      this.host.inputsConsumed?.(this);
     if (counter.position > 0x7fff_ffff)
       throw new ExecutionError("JSON result is too large", "MINNOW_JSON_SIZE", "54000");
     yield* this.#memory.take(counter.position);
@@ -186,6 +294,8 @@ export function compileJson(
   args: readonly Compiled[],
   arena: OutputArena,
 ): Compiled {
+  if (CONSTRUCTORS.has(fn) && args.some((arg) => !JSON_VALUE_KINDS.has(arg.type.kind)))
+    throw new UnsupportedPlanError("JSON construction value type", { construct: "function" });
   const host = hosts.get(arena);
   if (host === undefined)
     throw new UnsupportedPlanError("JSON expression outside a resumable projection/filter", {

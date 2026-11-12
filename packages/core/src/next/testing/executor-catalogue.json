@@ -26853,7 +26853,7 @@
       "dataset": "retail",
       "sql": "SELECT JSON_OBJECT(\n  'id' VALUE o.order_id,\n  'detail' VALUE JSON_OBJECT('status' VALUE o.status),\n  'items' VALUE JSON_ARRAYAGG(JSON_OBJECT('sku' VALUE p.sku))\n) AS document\nFROM orders o\nJOIN order_items i ON i.order_id = o.order_id\nJOIN products p ON p.product_id = i.product_id\nGROUP BY o.order_id, o.status",
       "lowered": false,
-      "construct": "function"
+      "construct": "aggregate"
     },
     {
       "id": "guide-8",
