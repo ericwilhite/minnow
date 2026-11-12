@@ -105,6 +105,11 @@ class SizingBudget implements ByteBudget {
     this.allocated = needed;
     return true;
   }
+  optionalAllocate(bytes: number): boolean {
+    if (this.allocated + bytes > this.capacity || !this.owner.allocate(bytes)) return false;
+    this.allocated += bytes;
+    return true;
+  }
   free(bytes: number): void {
     this.owner.free(bytes);
     this.allocated -= bytes;
@@ -312,10 +317,22 @@ export function boundSource(
         Math.max(65536, parseCharge(segment.group.root.length) + segment.group.root.length),
       );
       for (;;) {
-        const grant = yield* readValue(
-          scratchMinimum(governor, "read-step/sizing", capacity, signal),
-        );
-        const budget = new SizingBudget(grant, capacity);
+        signal.throwIfAborted();
+        const preferred = Math.max(capacity, caches?.sizingBytes(segment.group.root.length) ?? 0);
+        // Optional recipe construction must never wait, jump FIFO or raise the ordinary
+        // source-sizing minimum. Pressure and a queued admission use the old path unchanged.
+        const immediate =
+          preferred > capacity && preferred <= governor.capBytes - governor.reserveBytes
+            ? governor.tryAdmit({
+                label: "read-step/sizing",
+                minimumBytes: preferred,
+                spillable: false,
+              })
+            : null;
+        const grant =
+          immediate ??
+          (yield* readValue(scratchMinimum(governor, "read-step/sizing", capacity, signal)));
+        const budget = new SizingBudget(grant, immediate === null ? capacity : preferred);
         const readers: ChunkReader[] = [];
         let root: import("../format/reachable.js").Held<ScanRootFacts> | null = null;
         let retry = false,

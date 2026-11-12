@@ -1,6 +1,7 @@
 /** One query's admissions, resources and the executed/delivered lifecycle. */
 import type { MaybePromise } from "../access/key-index.js";
 import { SnapshotReleasedError } from "../access/snapshot.js";
+import { metadataCachesFor } from "../format/metadata-reader.js";
 import { QueryRoots, type RootColumns } from "../page/query-roots.js";
 import { readTable } from "./read-table.js";
 import type { ByteBudget } from "../access/space.js";
@@ -217,12 +218,16 @@ export class QueryRuntime {
   #nonRetainingReads = false;
   #queryRoots: QueryRoots | undefined;
 
-  /** Optional, query-local parsed roots; no sizing lease survives execution admission. */
+  /** Query-local selected facts may borrow owner validation; no sizing lease survives admission. */
   metadataCaches(retain = true, sources?: readonly RootColumns[]): QueryRoots | undefined {
     if (!retain || this.#closed || this.signal.aborted) return undefined;
     if (this.#queryRoots !== undefined) return this.#queryRoots;
     if (sources === undefined) return undefined;
-    const roots = new QueryRoots(this.request.governor, sources);
+    const roots = new QueryRoots(
+      this.request.governor,
+      sources,
+      metadataCachesFor(this.view.pages),
+    );
     this.#queryRoots = roots;
     // Global cleanup runs last, after phase readers, in-flight jobs and caller pins drain.
     this.#dispose.unshift(() => {

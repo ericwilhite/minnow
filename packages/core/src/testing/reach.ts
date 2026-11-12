@@ -3809,6 +3809,7 @@ export const QUERY_ROOT_REUSE_REACH = [
   "sizing and execution share validated root facts",
   "multiple columns and batches",
   "fresh query owns its roots",
+  "later query reuses owner validation",
   "cancel after output",
   "zero charges after close",
 ] as const;
@@ -3834,6 +3835,7 @@ export const QUERY_ROOT_VM_REACH = [
   "exact row volume",
   "all workers drained",
   "complete decode in both arms",
+  "owner cache in both arms",
 ] as const;
 
 export const QUERY_ROOT_VOLUME_REACH = [
@@ -3857,4 +3859,28 @@ export const EXTENT_PAIR_CODEC_REACH = [
   "exact duplicate refusal",
   "charge refusal before parse",
   "zero charges after failure",
+] as const;
+
+/** Complete owner validation and private selective materialization are independently observed. */
+export const VALIDATED_ROOT_REACH = [
+  "owner isolation",
+  "warm hit skips all validation",
+  "only selected columns materialize",
+  "fresh ref and statistic ownership",
+  "pinned roots remain charged",
+  "full reference identity",
+  "optional refusal preserves ordinary minimum",
+  "owned encoded bytes survive source release",
+  "unselected corruption refused",
+  "complete eager equality",
+  "concurrent admission drains",
+  "cancelled borrower hands off or releases",
+  "zero charges and detached binding",
+] as const;
+
+export const VALIDATED_ROOT_PRESSURE_REACH = [
+  "optional workspace refused synchronously",
+  "ordinary native bound unchanged",
+  "no optional FIFO wait",
+  "zero charges after fallback",
 ] as const;

@@ -181,6 +181,48 @@ for (const seed of seedsFor("query-root-independent-entry", [0xb2f1, 0xb2f2]))
       }
       expect(new Set([...pids, ...complete.map((sample) => sample.identity.pid)]).size).toBe(36);
       reach.reach("complete decode in both arms");
+      const sharedOutput = join(dir, "validated-owner");
+      await run(
+        process.execPath,
+        [
+          join(dirname(entry), "query-root-component.mts"),
+          "--baseline",
+          runtime,
+          "--candidate",
+          runtime,
+          "--aa",
+          "--smoke",
+          "--validated-roots",
+          "--warmups",
+          "1",
+          "--repeats",
+          "1",
+          "--output",
+          sharedOutput,
+        ],
+        { maxBuffer: 4 << 20, env: { ...process.env, TMPDIR: dir } },
+      );
+      const shared = JSON.parse(await readFile(join(sharedOutput, "results.json"), "utf8")) as {
+        result: typeof component.result;
+      };
+      const owners = shared.result.records[0]?.samples;
+      if (owners === undefined) throw new Error("Missing owner-cache samples");
+      expect(owners).toHaveLength(18);
+      for (const sample of owners) {
+        expect(sample.identity.identity.cached).toBe(true);
+        expect((sample.identity.identity as { validatedRoots?: boolean }).validatedRoots).toBe(
+          true,
+        );
+        expect(sample.rows).toBe(978);
+      }
+      expect(
+        new Set([
+          ...pids,
+          ...complete.map((s) => s.identity.pid),
+          ...owners.map((s) => s.identity.pid),
+        ]).size,
+      ).toBe(54);
+      reach.reach("owner cache in both arms");
       reach.assertReached();
     } finally {
       await rm(dir, { recursive: true, force: true });

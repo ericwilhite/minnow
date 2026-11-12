@@ -1,4 +1,4 @@
-/** Complete roots are parsed once; selected scan facts stay resident, with query-owned, evictable accounting. */
+/** Complete roots are validated once per owner; selected scan facts stay query-owned and evictable. */
 import fc from "fast-check";
 import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
@@ -62,7 +62,12 @@ it.each(seedsFor("next-query-root-reuse", [0xb2e1, 0xb2e2]))(
               const result = await core.execute(sql);
               if (!("batches" in result)) throw new Error("missing query rows");
               expect(oracleRows(result)).toEqual(rows.map(({ f, i, t }) => ({ f, i, t })));
-              expect(spy.mock.calls.length).toBe(groups);
+              // The second query must not repeat complete validation. The owner may already
+              // hold roots before the first query; cold validation is covered independently.
+              if (query === 1) {
+                expect(spy.mock.calls.length).toBe(0);
+                reach.reach("later query reuses owner validation");
+              }
               reach.reach("sizing and execution share validated root facts");
               reach.reach("multiple columns and batches");
             }

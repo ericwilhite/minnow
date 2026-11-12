@@ -31,6 +31,7 @@ interface AAReport {
   smoke: boolean;
   mode: string;
   decodeOnly: boolean;
+  validatedRoots: boolean;
   rows: number;
   warmups: number;
   repeats: number;
@@ -96,6 +97,9 @@ export function auditRootWorkers(result: Result, repeats: number): void {
 }
 export async function runQueryRootBench(mode: "whole" | "component" = "whole") {
   const decodeOnly = process.argv.includes("--decode-only");
+  const validatedRoots = process.argv.includes("--validated-roots");
+  if (validatedRoots && (decodeOnly || mode !== "component"))
+    throw new Error("--validated-roots requires handoff component mode");
   if (decodeOnly && mode !== "component") throw new Error("--decode-only requires component mode");
   const aa = process.argv.includes("--aa"),
     smoke = process.argv.includes("--smoke") || process.argv.includes("--check");
@@ -221,6 +225,7 @@ export async function runQueryRootBench(mode: "whole" | "component" = "whole") {
         checked.smoke ||
         checked.mode !== mode ||
         checked.decodeOnly !== decodeOnly ||
+        checked.validatedRoots !== validatedRoots ||
         checked.rows !== rows ||
         checked.repeats !== repeats ||
         checked.warmups !== warmups ||
@@ -260,8 +265,9 @@ export async function runQueryRootBench(mode: "whole" | "component" = "whole") {
         execArgv: ["--max-old-space-size=2048"],
         data: {
           runtimeRoot: root,
-          cached: decodeOnly ? false : cached,
+          cached: decodeOnly ? false : validatedRoots ? true : cached,
           decodeOnly,
+          validatedRoots,
           warmups,
           repeats,
         } satisfies RootComponentConfig,
@@ -289,6 +295,7 @@ export async function runQueryRootBench(mode: "whole" | "component" = "whole") {
       smoke,
       mode,
       decodeOnly,
+      validatedRoots,
       rows,
       warmups,
       repeats,

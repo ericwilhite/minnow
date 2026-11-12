@@ -3397,3 +3397,10 @@ parsing without raising the read minimum. Readers release sizing holds before ex
 admission, and query cleanup drains readers before clearing and unregistering the cache on
 success, error or cancellation. Explicit non-retaining exports bypass this memo. Snapshot
 visibility and memory read hints remain local to the pinned snapshot.
+
+The executor can reuse the owner's validated group roots across queries. These are private,
+governor-charged, evictable views over owned bytes: cold validation checks every column, while
+scans materialize only their selected metadata. Complete-root readers still see every column.
+Pressure falls back to the ordinary decoder; non-retaining export does not populate or promote
+this cache. The stored format and execution minima are unchanged. Ownership, cancellation and
+fresh-process comparisons are documented in the docs site's testing reference.

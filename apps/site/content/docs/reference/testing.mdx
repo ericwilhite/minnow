@@ -1355,17 +1355,24 @@ Add `MINNOW_EXPORT_SCAN_SHAPE_TRANSPORT=1` to compare the whole stand-in adapter
 real owner transfer path instead. Both modes assert which three module versions reached
 the worker. This historical transport comparison uses the old adapter, not the production
 `ResultSink`, and is explicitly excluded from Gate A.
-Ordinary executor scans validate each complete group root during source sizing, then reuse
-only the planned columns' facts through a query-local, governor-registered cache. The cold
-parser still validates every column, and complete-root APIs remain complete. Parsing charges
-the full root before allocation; selection scratch is also charged before allocation. Active
-readers hold the full parse charge; idle facts remain charged and evictable. Cache refusal or eviction safely falls back to decoding without increasing the
-read minimum. Explicit non-retaining export bypasses this memo. Query cleanup drains pending
-readers before clearing and unregistering the cache, including cancellation and error paths.
-`next/testing/root-reuse.test.ts` checks generated source equality, parse counts across columns
-and batches, query isolation and cancellation. `next/testing/query-root-ownership.test.ts` checks full-reference
-and table identity, complete-root fallback, eviction and cancelled in-flight reads with zero
-charges after cleanup.
+Ordinary executor scans reuse the write-path owner's governor-registered group-root cache.
+A cold miss validates the complete immutable root, including every unselected column and all
+canonical checks. The optional compact entry owns its encoded bytes and navigation indexes;
+subsequent queries select metadata directly from those validated offsets. Complete-root APIs
+still expose every column. Validation authority is scoped to the exact owner and full blob
+identity, including both containing-extent fields, blob offset, length and checksum.
+
+Both construction and active borrowing are charged before allocation. Idle entries are charged
+and evictable; selected facts use the existing query-local cache through sizing and execution.
+Pressure can evict either cache or decline compact construction/borrowing, falling back to the
+ordinary complete decoder. Optional preparation scratch does not increase execution's native
+minimum. Explicit non-retaining export bypasses owner admission and promotion. Query cleanup
+drains pending readers before releasing its facts; owner close clears roots and removes the
+cache binding. Visibility, deletion masks and snapshot-specific hints are never shared there.
+`next/format/validated-root.test.ts` checks selective and complete equality, unselected corruption,
+full identity, byte ownership, concurrent and cancelled borrowers, refusal and zero charges.
+`next/testing/root-reuse.test.ts` checks real executor source equality and validation reuse across
+queries; `next/testing/query-root-ownership.test.ts` covers query facts, eviction and cancellation.
 `scripts/query-root-component.mts` isolates a two-pass sizing/scan root handoff over synthetic
 wide metadata. `scripts/query-root-bench.mts --baseline <frozen-root> --candidate <frozen-root>`
 compares the real three-column executor scan from complete, separately built cores. Both use
@@ -1389,6 +1396,10 @@ diagnostics are separate from quiet-host Gate A and the owner/MessagePort export
 For parser changes, add `--decode-only` to the component command in both A/A and A/B.
 Both arms then parse complete roots without query or parsed-descriptor caches; every synthetic
 group uses distinct extent addresses. The default component mode still measures query-cache handoff.
+For cross-query validated-root changes use `--validated-roots` instead in both A/A and A/B:
+both builds receive the same owner cache and use their query-local handoff; each observation
+spans fresh query lifetimes while the owner remains open. The parent may ignore the newer
+optional owner binding. This mode includes selected metadata materialization, not only cache lookup.
 `scripts/query-root-profile.mts --runtime <frozen-root> --bundle <input.json>` captures a
 setup-excluded V8 profile of the same three-column scan, followed by a separate counter pass
 that records complete-root columns, chunk opens and decoded rows by column. Its sample shares

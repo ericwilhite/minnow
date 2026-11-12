@@ -129,7 +129,7 @@ import { ByteWriter } from "./bytes.js";
 import { Catalog, decodeLogged, type LoggedChange } from "./catalog.js";
 import { decodeColumn, isNullAt, MEMORY_CHUNK_ROWS } from "./columns.js";
 import { IDLE_FLUSH_MS, LogAppender, type LogPosition } from "./log.js";
-import { BlobCache } from "../format/blob-cache.js";
+import { BlobCache, fullBlobKey } from "../format/blob-cache.js";
 import {
   decodeManifestRoot,
   encodeGroupRoot,
@@ -144,7 +144,7 @@ import {
   writeGroupDirectory,
   type GroupPageEntry,
 } from "../format/manifest-codec.js";
-import { manifestReader, MetadataReader } from "../format/metadata-reader.js";
+import { manifestReader, MetadataReader, bindMetadataCaches } from "../format/metadata-reader.js";
 import { readRows } from "./rows.js";
 import { RunBuilder, RunReader, runRef, type EncodedRun } from "./runs.js";
 import { Sequences } from "./sequences.js";
@@ -490,6 +490,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #roots = new Map<ManifestRoot, { refs: number; readonly bytes: number }>();
   /** Group roots, directory pages and indexes: decoded once, cached under the governor. */
   readonly #metadata: MetadataReader;
+  readonly #unbindMetadataCaches: () => void;
   readonly #metadataCaches: ReadonlyArray<BlobCache<unknown>>;
   /** Planning totals per table (from `TableRoot.statistics` at open; updated at each flush). */
   readonly #summaries = new Map<number, Map<number, Totals>>();
@@ -647,7 +648,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
       Math.min(8 * 1024 * 1024, Math.floor(input.governor.capBytes / 32)),
     );
     const caches = {
-      groupRoots: new BlobCache<GroupRoot>((cache) => input.governor.registerCache(cache)),
+      validatedRoots: true,
+      groupRoots: new BlobCache<GroupRoot>(
+        (cache) => input.governor.registerCache(cache),
+        fullBlobKey,
+      ),
       groupPages: new BlobCache<readonly GroupRef[]>((cache) =>
         input.governor.registerCache(cache),
       ),
@@ -720,6 +725,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       groupRoot: (ref, budget) => this.#metadata.groupRoot(ref, budget),
       bitmap: (ref) => this.#bitmap(ref),
     };
+    this.#unbindMetadataCaches = bindMetadataCaches(input.space, caches);
   }
 
   // ── Open and recovery ────────────────────────────────────────────────────────────────────
@@ -2575,6 +2581,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       for (const memtable of this.#published) memtable.releaseAll();
       this.#currentPin?.release();
       this.#currentPin = null;
+      this.#unbindMetadataCaches();
       for (const cache of this.#metadataCaches) cache.clear();
       this.#lists.close();
       this.#metadataGrant.close();

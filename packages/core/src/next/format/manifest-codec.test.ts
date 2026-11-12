@@ -12,6 +12,8 @@ import {
   decodeGroupIndex,
   decodeGroupPage,
   decodeGroupRoot,
+  tryDecodeGroupRootView,
+  selectGroupRootColumns,
   decodeManifestRoot,
   decodeTableStatistics,
   encodeGroupIndex,
@@ -397,6 +399,12 @@ const manifestRoot: fc.Arbitrary<ManifestRoot> = extents.chain((pool) =>
   }),
 );
 
+function decodeValidatedGroupRoot(bytes: Uint8Array, budget: ByteBudget) {
+  const parsed = tryDecodeGroupRootView(bytes, budget);
+  if (parsed === null) throw new Error("unbounded test budget refused a validated view");
+  return parsed;
+}
+
 /** Decoded values compare structurally; extents decode to shared objects of equal value. */
 function roundTrip<T>(
   value: T,
@@ -416,7 +424,22 @@ function roundTrip<T>(
 describe.each(SEEDS)("manifest codecs round-trip (seed %i)", (seed) => {
   it("group roots", () => {
     fc.assert(
-      fc.property(groupRoot, (root) => roundTrip(root, encodeGroupRoot, decodeGroupRoot)),
+      fc.property(groupRoot, (root) => {
+        roundTrip(root, encodeGroupRoot, decodeGroupRoot);
+        const bytes = encodeGroupRoot(root),
+          budget = tracked();
+        const lazy = tryDecodeGroupRootView(bytes, budget);
+        if (lazy === null) throw new Error("unbounded test budget refused a validated view");
+        expect(lazy.value).toEqual(root);
+        expect(encodeGroupRoot(lazy.value)).toEqual(bytes);
+        const wanted = root.columns.filter((_, i) => (i & 1) === 0).map((c) => c.columnId);
+        expect(selectGroupRootColumns(lazy.value, wanted)).toEqual(
+          root.columns.filter((c) => wanted.includes(c.columnId)),
+        );
+        expect(selectGroupRootColumns(lazy.value, [])).toEqual([]);
+        budget.free(lazy.charge);
+        expect(budget.held).toBe(0);
+      }),
       {
         seed,
         numRuns: RUNS,
@@ -500,6 +523,7 @@ describe.each(SEEDS)("manifest codecs round-trip (seed %i)", (seed) => {
               const budget = tracked();
               for (const decode of [
                 decodeGroupRoot,
+                decodeValidatedGroupRoot,
                 decodeManifestRoot,
                 decodeGroupPage,
                 decodeGroupIndex,

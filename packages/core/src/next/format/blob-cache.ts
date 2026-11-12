@@ -52,6 +52,10 @@ export interface Pinned<T> {
 export const blobKey = (ref: BlobRef): string =>
   `${String(blobAddress(ref))}:${String(ref.length)}:${String(ref.checksum)}`;
 
+/** Validation authority requires the full containing extent, not only the flattened address. */
+export const fullBlobKey = (ref: BlobRef): string =>
+  `${String(ref.extent.offset)}:${String(ref.extent.length)}:${String(ref.offset)}:${String(ref.length)}:${String(ref.checksum)}`;
+
 export class BlobCache<T> implements EvictableCacheLike {
   readonly #memory: CacheMemory;
   readonly #entries = new Map<string, Entry<T>>();

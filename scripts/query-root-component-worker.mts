@@ -11,6 +11,8 @@ export interface RootComponentConfig {
   cached: boolean;
   /** Full-parser comparison uses distinct group addresses, not repeated number/string keys. */
   decodeOnly?: boolean;
+  /** Same query-local cache in both arms; only the candidate understands the owner binding. */
+  validatedRoots?: boolean;
   warmups: number;
   repeats: number;
 }
@@ -70,6 +72,19 @@ export default async function createRootComponent(
   const pages = config.decodeOnly
     ? { peek: space.peek.bind(space), read: space.read.bind(space) }
     : space;
+  const blobCaches = config.validatedRoots
+    ? ((await load(
+        "format/blob-cache",
+      )) as typeof import("../packages/core/dist/next/format/blob-cache.js"))
+    : undefined;
+  const groupRoots = blobCaches
+    ? new blobCaches.BlobCache<GroupRoot>(
+        (c) => governor.registerCache(c),
+        (ref) =>
+          `${ref.extent.offset}:${ref.extent.length}:${ref.offset}:${ref.length}:${ref.checksum}`,
+      )
+    : undefined;
+  const shared = groupRoots ? { groupRoots, validatedRoots: true } : undefined;
   const selected = [2, 6, 10],
     expectedVisits = 2 * blobs.length * selected.length;
   const expected = roots.map((root) => ({
@@ -81,7 +96,7 @@ export default async function createRootComponent(
     .digest("hex");
   async function once(verify = false) {
     const owner = cache
-      ? new cache.QueryRoots(governor, [{ tableId: 1, columns: selected }])
+      ? new cache.QueryRoots(governor, [{ tableId: 1, columns: selected }], shared)
       : undefined;
     const reader = new metadata.MetadataReader(pages);
     let visits = 0;
@@ -121,6 +136,7 @@ export default async function createRootComponent(
       runtimeRoot: config.runtimeRoot,
       cached: config.cached,
       decodeOnly: config.decodeOnly ?? false,
+      validatedRoots: config.validatedRoots ?? false,
       groups: 163,
       storedColumns: 200,
       selected,
@@ -141,6 +157,7 @@ export default async function createRootComponent(
       return await queryLifetimes(config.repeats, expectedVisits, () => once());
     },
     async close() {
+      groupRoots?.clear();
       grant.close();
       if (governor.usedBytes !== 0) throw new Error("Root component charge leak");
     },
