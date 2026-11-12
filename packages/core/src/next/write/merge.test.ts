@@ -130,6 +130,7 @@ describe("streaming merge", () => {
         space,
         writer,
         grant,
+        outputBudget: grant,
         readers,
         level: 1,
         bottom,

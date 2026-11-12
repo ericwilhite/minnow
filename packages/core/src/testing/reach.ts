@@ -30,6 +30,77 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+export const WRITE_MERGE_SUMMARY_PRESSURE_STATES = [
+  "other pinned bytes retained",
+  "unwound before wait",
+  "waiting at barrier",
+  "cancelled without retry",
+  "resumed same split policy",
+] as const;
+export const WRITE_MERGE_KEY_LIMIT_STATES = [
+  "ordinary typed refusal",
+  "bulk typed refusal",
+  "four KiB refusal",
+  "refusal cleanup",
+] as const;
+
+/** Completed merge pieces leave reusable working credit but remain funded until publication. */
+export const WRITE_MERGE_SUMMARY_STATES = [
+  "fan one",
+  "fan thirty two",
+  "intermediate fan",
+  "hundreds of pieces",
+  "thousands of pieces",
+  "exact two KiB keys",
+  "small cap",
+  "fund before refund",
+  "failure after funding",
+  "retry after failure",
+  "retained output owned",
+  "output consumed",
+] as const;
+
+/** Default split metadata must finish within prepaid credit, without a copied-output peak. */
+export const WRITE_MERGE_FINISH_STATES = [
+  "borrowed keys",
+  "copied keys",
+  "other minimum held",
+  "charged metadata handoff",
+  "default split boundary",
+  "near private allowance",
+  "completed finish",
+  "abort after transfer",
+  "no credit refusal",
+] as const;
+
+/** Storage borrows emitted parts until append settles, including its failure path. */
+export const WRITE_RUN_OUTPUT_STATES = [
+  "append failure",
+  "append acknowledgement",
+  "boundary ownership",
+  "abort or publication cleanup",
+] as const;
+
+/** Native run capacities are prepaid and ownership survives delivery, abort and retry. */
+export const WRITE_RUN_ACCOUNTING_STATES = [
+  "bulk",
+  "ordinary",
+  "budget denial",
+  "native failure",
+  "constructor refund",
+  "drain rejection",
+  "abort",
+  "retry",
+  "retained output",
+  "consumed output",
+  "bloom partition",
+  "bounded stream",
+  "acknowledged consumption",
+  "pressure wait",
+  "pressure cancellation",
+  "pressure resume",
+] as const;
+
 /** Bulk sealed blocks preserve the ordinary run encoder's complete native output. */
 export const WRITE_DIRECT_RUN_STATES = [
   "single",

@@ -29,7 +29,10 @@
  *   never fails the write path (engine.ts): its writer is aborted, the inputs stay, the failure is
  *   counted, and it is retried once with a quarter of the split bound before the inputs are left
  *   alone until they change.
- * - Charges its working memory to a grant of its own, admitted before it starts.
+ * - Charges reusable working memory to a private grant admitted before it starts. Completed
+ *   pieces move their boundary-key and descriptor ownership to the publication account before
+ *   the old charge is returned. That account grows with piece count; temporary pressure unwinds
+ *   the provisional writer/leases/output before the owner's cancellable metadata retry waits.
  * - Yields to the event loop (a task, not a microtask) when the shared worker clock is due
  *   (exec/pipeline.ts, ruling R23.5), and stops at a slice boundary when the write path closes.
  *   Its scratch is owned by the merge (never module-level), so two merges could interleave.
@@ -38,13 +41,13 @@
  *   runs readable. A crash before the publish leaves orphans the next open frees.
  */
 import type { ExtentRef, RunRef } from "../format/manifest.js";
-import type { Grant } from "../memory/governor.js";
-import type { SpaceReader } from "../access/space.js";
+import { OBJECT_OVERHEAD_BYTES, type Grant } from "../memory/governor.js";
+import type { ByteBudget, SpaceReader } from "../access/space.js";
 import type { ExtentBuilder, ExtentWriter, ReadLease } from "../storage/extents.js";
 import { compareBytes } from "../vector/varlen.js";
 import { taskClock, yieldTask } from "../exec/pipeline.js";
-import { need } from "./bytes.js";
-import { RunEncoder, type RunReader } from "./runs.js";
+import { charged, need } from "./bytes.js";
+import { RUN_BUFFER_OVERHEAD, RunEncoder, type RunReader } from "./runs.js";
 
 export { yieldTask, YIELD_INTERVAL_MS } from "../exec/pipeline.js";
 
@@ -276,6 +279,9 @@ export interface MergeInput {
   readonly writer: ExtentWriter;
   /** The merge's own grant: leases and staging (`MERGE_FIXED_BYTES` + inputs). */
   readonly grant: Grant;
+  /** Publication ownership, growing with piece count. The owner must unwind/retry on pressure
+   * before waiting; live keys never wait inside the fixed working account. */
+  readonly outputBudget: ByteBudget;
   /** Input readers, newest first. */
   readonly readers: readonly RunReader[];
   /** The output level. */
@@ -287,6 +293,8 @@ export interface MergeInput {
 }
 
 export interface MergeOutput {
+  /** Boundary-key ownership remains charged until publication or abort. */
+  release(): void;
   /** The output runs in ascending key order (none when everything cancelled). */
   readonly runs: readonly RunRef[];
   readonly entriesIn: number;
@@ -299,13 +307,20 @@ export interface MergeOutput {
 
 /** Runs one merge (see "A merge"); the caller publishes its runs or aborts the writer. */
 export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
-  const { space, writer, grant, policy } = input;
+  const { space, writer, grant, policy, outputBudget } = input;
   // The estimate: the inputs' extents (the output is no larger, short of block repacking).
   let estimate = 0;
   for (const reader of input.readers) estimate += runExtent(reader.ref).length;
   const cursors = input.readers.map((reader, k) => new Cursor(reader, k, space, grant));
   const heap = new Heap();
   const runs: RunRef[] = [];
+  let outputCharge = 0;
+  const release = () => {
+    const bytes = outputCharge;
+    outputCharge = 0;
+    if (bytes > 0) outputBudget.free(bytes);
+  };
+  let complete = false;
   let builder: ExtentBuilder | null = null;
   let queue: Uint8Array[] = [];
   let queued = 0;
@@ -315,10 +330,15 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
   let cancelled = 0;
   let slices = 0;
   const open = (): ExtentBuilder => writer.open(Math.max(64 * 1024, estimate - written + 4096));
-  let encoder = new RunEncoder((part) => {
-    queue.push(part);
-    queued += part.length;
-  }, input.bottom);
+  let encoder = new RunEncoder(
+    (part) => {
+      queue.push(part);
+      queued += part.length;
+    },
+    input.bottom,
+    false,
+    grant,
+  );
   const drain = async (): Promise<void> => {
     if (queue.length === 0) return;
     const target = (builder ??= open());
@@ -329,30 +349,48 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
     written += queued;
     queued = 0;
     await target.append(parts);
+    for (const part of parts) encoder.releasePart(part);
   };
   const finishRun = async (): Promise<void> => {
     const summary = encoder.finish();
-    cancelled += encoder.cancelled;
-    await drain();
-    const target = builder;
-    builder = null;
-    if (target === null) return;
-    const sealed = await target.seal();
-    if (summary === null || sealed === null) return;
-    const blobs = sealed.blobs;
-    const count = blobs.length;
-    entriesOut += summary.entryCount;
-    const piece: RunRef = {
-      level: input.level,
-      entryCount: summary.entryCount,
-      entries: need(blobs[count - 3]),
-      fences: need(blobs[count - 2]),
-      bloom: need(blobs[count - 1]),
-      minKey: summary.minKey,
-      maxKey: summary.maxKey,
-    };
-    // Every piece after the first continues this output's sorted run.
-    runs.push(runs.length === 0 ? piece : { ...piece, continues: true });
+    try {
+      cancelled += encoder.cancelled;
+      encoder.close();
+      await drain();
+      const target = builder;
+      builder = null;
+      if (target === null) return;
+      const sealed = await target.seal();
+      if (summary === null || sealed === null) return;
+      // Keys are exact native copies. Fund their existing backing and retained descriptors
+      // before constructing the RunRef or refunding the encoder's old ownership. The
+      // publication account grows normally, or throws to the outer unwind/retry boundary.
+      const bytes =
+        summary.minKey.buffer.byteLength +
+        summary.maxKey.buffer.byteLength +
+        2 * RUN_BUFFER_OVERHEAD +
+        6 * OBJECT_OVERHEAD_BYTES;
+      charged(outputBudget, bytes);
+      outputCharge += bytes;
+      const blobs = sealed.blobs;
+      const count = blobs.length;
+      entriesOut += summary.entryCount;
+      const piece: RunRef = {
+        level: input.level,
+        entryCount: summary.entryCount,
+        entries: need(blobs[count - 3]),
+        fences: need(blobs[count - 2]),
+        bloom: need(blobs[count - 1]),
+        minKey: summary.minKey,
+        maxKey: summary.maxKey,
+      };
+      // Every piece after the first continues this output's sorted run.
+      runs.push(runs.length === 0 ? piece : { ...piece, continues: true });
+    } finally {
+      // Appended payload is consumed; retained keys are now paid by publication, or the
+      // attempted piece is abandoned. No per-encoder release closure is retained.
+      summary?.release();
+    }
   };
   try {
     for (const cursor of cursors) if (await cursor.load()) heap.push(cursor);
@@ -364,10 +402,15 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
         (policy.splitEntries !== null && encoder.entryCount >= policy.splitEntries);
       if (full && encoder.canEndBefore(top.bytes, top.keyStart, top.keyEnd, top.rowId)) {
         await finishRun();
-        encoder = new RunEncoder((part) => {
-          queue.push(part);
-          queued += part.length;
-        }, input.bottom);
+        encoder = new RunEncoder(
+          (part) => {
+            queue.push(part);
+            queued += part.length;
+          },
+          input.bottom,
+          false,
+          grant,
+        );
       }
       encoder.add(top.bytes, top.keyStart, top.keyEnd, top.rowId, top.tombstone);
       entriesIn += 1;
@@ -390,8 +433,11 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
       } else if (sinceCheck >= 256 && policy.sliceEntries === null) sinceCheck = 0;
     }
     await finishRun();
+    complete = true;
   } finally {
+    encoder.close();
+    if (!complete) release();
     for (const cursor of cursors) cursor.release();
   }
-  return { runs, entriesIn, entriesOut, cancelled, bytesWritten: written, slices };
+  return { runs, entriesIn, entriesOut, cancelled, bytesWritten: written, slices, release };
 }

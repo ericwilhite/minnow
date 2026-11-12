@@ -6,7 +6,14 @@ import { xxHash32 } from "../hash/xxhash32.js";
 import * as canonicalHash from "../hash/xxhash32.js";
 import * as hashing from "./key-hashes.js";
 import { KeyDelta } from "./key-hash.js";
-import { RunBuilder } from "./runs.js";
+import { RunBuilder, type EncodedRun } from "./runs.js";
+
+/** Byte identity excludes the new ownership callback; all stored parts and metadata remain checked. */
+function stored(run: EncodedRun | null) {
+  return run === null
+    ? null
+    : { parts: run.parts, entryCount: run.entryCount, minKey: run.minKey, maxKey: run.maxKey };
+}
 
 const reach = createReach("write-key-hash-reuse", WRITE_KEY_HASH_REACH);
 afterAll(() => reach.assertReached());
@@ -104,7 +111,10 @@ for (const seed of seedsFor("write-key-hash-reuse", [0x5eed, 0x91])) {
             const before = spy.mock.calls.length;
             const actual = cached.finish();
             expect(spy.mock.calls.length).toBe(before);
-            expect(actual).toEqual(canonical.finish());
+            const expected = canonical.finish();
+            expect(stored(actual)).toEqual(stored(expected));
+            actual?.release();
+            expected?.release();
             reach.reach("identical run bytes");
           } finally {
             spy.mockRestore();
@@ -166,7 +176,11 @@ it("reuses a repeated disk key across blocks and Bloom partitions, preserving ca
         reference.addRange(key, 0, key.length, row, true, hashes.first, hashes.second);
       }
     }
-    expect(builder.finish()).toEqual(reference.finish());
+    const actual = builder.finish(),
+      expected = reference.finish();
+    expect(stored(actual)).toEqual(stored(expected));
+    actual?.release();
+    expected?.release();
     expect(spy).toHaveBeenCalledTimes(1);
   } finally {
     spy.mockRestore();
