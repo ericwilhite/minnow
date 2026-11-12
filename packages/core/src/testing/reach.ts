@@ -3927,6 +3927,8 @@ export const JSON_CONSTRUCT_CAP_REACH = [
   "JSONB streaming canonicalization",
   "JSON construction",
   "largest fit",
+  "above result window floor",
+  "small result window",
   "first cannot fit",
   "result buffer identity",
   "two copies",
@@ -3938,8 +3940,18 @@ export const JSON_CONSTRUCT_NESTED_REACH = [
   "JSON",
   "JSONB",
   "deep dependencies",
+  "multi-fragment control expansion",
   "projected sibling pins",
   "exact PostgreSQL",
+  "zero resources",
+] as const;
+
+export const JSON_CONSTRUCT_HISTORY_REACH = [
+  "afterEach restoration",
+  "abandoned shrinker stopped",
+  "queued execution cancelled",
+  "late closer inert",
+  "idempotent close",
   "zero resources",
 ] as const;
 
