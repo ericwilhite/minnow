@@ -60,6 +60,14 @@ const INITIAL_BYTES = 64 * 4 + 5 * 16 * 4 + 256 + 16 * 25;
 const ENTRY_BYTES = 25;
 const NO_ENTRIES = new Int32Array(0);
 
+/** Six big-endian bytes, zero padded, fit exactly in a JS integer. Ties still compare bytes. */
+function orderPrefix(bytes: Uint8Array, start: number, end: number): number {
+  let prefix = 0;
+  for (let at = start; at < start + 6; at++)
+    prefix = prefix * 256 + (at < end ? (bytes[at] ?? 0) : 0);
+  return prefix;
+}
+
 export class KeyDelta {
   readonly #charge: Charge;
   /** Retained arrays/ranges plus the workspaces of active traversals. */
@@ -128,6 +136,17 @@ export class KeyDelta {
     return this.#maxKeyBytes;
   }
   keyCount = 0;
+  /** All allocated key slots, including those retained after rollback, are ascending. */
+  #ascendingKeys = true;
+  #lastPrefix: number | null = null;
+  /** Entries below this bound are distinct ascending slots, entry id = key slot. */
+  #ascendingEntryPrefix = 0;
+  get ascendingEntryPrefix(): number {
+    return this.#ascendingEntryPrefix;
+  }
+  get ascendingKeys(): boolean {
+    return this.#ascendingKeys;
+  }
   #rowIds: Float64Array;
   #seqs: Float64Array;
   #tombstones: Uint8Array;
@@ -253,7 +272,77 @@ export class KeyDelta {
     const hash = this.#computed.first | 0,
       bloomHash = this.#computed.second | 0;
     let keySlot = this.find(key, start, end, hash);
-    if (keySlot < 0) keySlot = this.#insertKey(key, start, end, hash, bloomHash);
+    const newKey = keySlot < 0;
+    if (newKey) keySlot = this.#insertKey(key, start, end, hash, bloomHash);
+    return this.#addEntry(keySlot, rowId, seq, tombstone, newKey);
+  }
+
+  /**
+   * Validates a strictly ascending batch of five-byte keys (INT/DATE's normal equality form).
+   * Complete unsigned payloads prove order; exactly one byte boundary check joins prior keys.
+   * All validation precedes mutation. Other layouts, duplicates or disorder use ordinary add.
+   */
+  addOrderedBatch(
+    bytes: Uint8Array,
+    offsets: Int32Array,
+    count: number,
+    rowId: number,
+    seq: number,
+  ): boolean {
+    if (!this.#ascendingKeys || count === 0) return false;
+    const first = offsets[0] ?? 0;
+    const tag = bytes[first];
+    let previous = -1;
+    for (let k = 0; k < count; k++) {
+      const start = offsets[k] ?? 0,
+        end = offsets[k + 1] ?? 0;
+      if (end - start !== 5 || start < 0 || end > bytes.length || bytes[start] !== tag)
+        return false;
+      const word =
+        (((bytes[start + 1] ?? 0) << 24) |
+          ((bytes[start + 2] ?? 0) << 16) |
+          ((bytes[start + 3] ?? 0) << 8) |
+          (bytes[start + 4] ?? 0)) >>>
+        0;
+      if (word <= previous) return false;
+      previous = word;
+    }
+    if (
+      this.keyCount > 0 &&
+      compareBytes(
+        this.#arena,
+        this.keyStart(this.keyCount - 1),
+        this.keyEnd(this.keyCount - 1),
+        bytes,
+        first,
+        offsets[1] ?? first,
+      ) >= 0
+    )
+      return false;
+    for (let k = 0; k < count; k++) {
+      const start = offsets[k] ?? 0,
+        end = offsets[k + 1] ?? 0;
+      hashKey(bytes, start, end, this.#computed);
+      const slot = this.#insertKey(
+        bytes,
+        start,
+        end,
+        this.#computed.first | 0,
+        this.#computed.second | 0,
+        true,
+      );
+      this.#addEntry(slot, rowId + k, seq, false, true);
+    }
+    return true;
+  }
+
+  #addEntry(
+    keySlot: number,
+    rowId: number,
+    seq: number,
+    tombstone: boolean,
+    newKey: boolean,
+  ): number {
     const entry = this.entryCount;
     if (entry >= this.#rowIds.length) this.#growEntries();
     this.#rowIds[entry] = rowId;
@@ -274,7 +363,10 @@ export class KeyDelta {
         (a, b) => this.#compareEntry(a, b),
       );
     }
-    this.#ordered.add(entry);
+    // A fresh slot in an ascending key arena is greater than every previous entry's key.
+    this.#ordered.add(entry, newKey && this.#ascendingKeys);
+    if (entry === this.#ascendingEntryPrefix && newKey && keySlot === entry && this.#ascendingKeys)
+      this.#ascendingEntryPrefix++;
     this.#head[keySlot] = entry;
     this.entryCount = entry + 1;
     return entry;
@@ -284,6 +376,7 @@ export class KeyDelta {
   pop(entry: number): void {
     if (entry !== this.entryCount - 1)
       throw new RangeError("Key delta entries are removed newest first");
+    this.#ascendingEntryPrefix = Math.min(this.#ascendingEntryPrefix, entry);
     this.#ordered?.remove(entry);
     const keySlot = this.#keyOf[entry] ?? 0;
     this.#head[keySlot] = this.#next[entry] ?? -1;
@@ -312,7 +405,14 @@ export class KeyDelta {
     return (this.#bloomHashes[slot] ?? 0) >>> 0;
   }
 
-  #insertKey(key: Uint8Array, start: number, end: number, hash: number, bloomHash: number): number {
+  #insertKey(
+    key: Uint8Array,
+    start: number,
+    end: number,
+    hash: number,
+    bloomHash: number,
+    ordered = false,
+  ): number {
     const index = this.keyCount;
     if (index >= this.#hashes.length) this.#growKeys();
     if ((index + 1) * 2 > this.#slots.length) this.#rehash(this.#slots.length * 2);
@@ -331,6 +431,30 @@ export class KeyDelta {
         throw error;
       }
       this.#free(freed);
+    }
+    if (ordered) this.#lastPrefix = null;
+    else if (this.#ascendingKeys) {
+      const prefix = orderPrefix(key, start, end);
+      const prior =
+        this.#lastPrefix ??
+        (index > 0
+          ? orderPrefix(this.#arena, this.keyStart(index - 1), this.keyEnd(index - 1))
+          : 0);
+      if (
+        index > 0 &&
+        (prior > prefix ||
+          (prior === prefix &&
+            compareBytes(
+              this.#arena,
+              this.keyStart(index - 1),
+              this.keyEnd(index - 1),
+              key,
+              start,
+              end,
+            ) > 0))
+      )
+        this.#ascendingKeys = false;
+      this.#lastPrefix = prefix;
     }
     copyRange(this.#arena, this.#arenaUsed, key, start, end);
     this.#hashes[index] = hash;
@@ -430,6 +554,7 @@ export class KeyDelta {
 
   /**
    * Entries in key-byte order and, per key, (row id, put before tombstone) order.
+   * Proven ascending key slots need no permutation, comparison scan or order workspace.
    * Ordered chains are visited linearly; arbitrary chains use an in-place O(n log n) heapsort.
    * Large traversals share the worker task clock, and suspend only for a real task yield.
    * Scratch belongs to this traversal: another traversal can run while this one yields.
@@ -468,22 +593,19 @@ export class KeyDelta {
       const ends = this.#keyEnd;
       const compareSlots = (a: number, b: number) =>
         compareBytes(arena, starts[a] ?? 0, ends[a] ?? 0, arena, starts[b] ?? 0, ends[b] ?? 0);
-      const orderBytes = this.keyCount * 4;
-      this.#reserve(orderBytes, workspace);
-      workspaceBytes += orderBytes;
-      const order = new Int32Array(this.keyCount);
-      let ascending = true;
-      for (let from = 0; from < this.keyCount; from += 128) {
-        yield* checkpoint(check);
-        ascending = fillKeyOrder(
-          order,
-          from,
-          Math.min(from + 128, order.length),
-          ascending,
-          compareSlots,
-        );
+      const keyCount = this.keyCount;
+      let order: Int32Array | null = null;
+      if (!this.#ascendingKeys) {
+        const orderBytes = keyCount * 4;
+        this.#reserve(orderBytes, workspace);
+        workspaceBytes += orderBytes;
+        order = new Int32Array(keyCount);
+        for (let from = 0; from < keyCount; from += 128) {
+          yield* checkpoint(check);
+          for (let k = from; k < Math.min(from + 128, keyCount); k++) order[k] = k;
+        }
+        yield* sortIndices(order, order.length, compareSlots, check);
       }
-      if (!ascending) yield* sortIndices(order, order.length, compareSlots, check);
       const rowIds = this.#rowIds;
       const seqs = this.#seqs;
       const tombstones = this.#tombstones;
@@ -507,12 +629,12 @@ export class KeyDelta {
             }
           : null;
       let scratch: Int32Array = NO_ENTRIES;
-      for (let slot = 0; slot < order.length;) {
+      for (let slot = 0; slot < keyCount;) {
         yield* checkpoint(check);
-        const limit = Math.min(slot + 128, order.length);
+        const limit = Math.min(slot + 128, keyCount);
         slot = this.#emitSingles(order, slot, limit, bound, visit, keep, singles);
         if (slot === limit) continue;
-        const keySlot = order[slot++] ?? 0;
+        const keySlot = order === null ? slot++ : (order[slot++] ?? 0);
         const start = starts[keySlot] ?? 0;
         const end = ends[keySlot] ?? 0;
         const head = this.#head[keySlot] ?? -1;
@@ -583,7 +705,7 @@ export class KeyDelta {
 
   /** Ordinary bounded loop: row emission stays outside the generator's suspension state. */
   #emitSingles(
-    order: Int32Array,
+    order: Int32Array | null,
     from: number,
     to: number,
     bound: number,
@@ -602,7 +724,7 @@ export class KeyDelta {
       rowIds = this.#rowIds,
       tombstones = this.#tombstones;
     for (let at = from; at < to; at++) {
-      const slot = order[at] ?? 0,
+      const slot = order === null ? at : (order[at] ?? 0),
         head = heads[slot] ?? -1;
       if (head < 0) continue;
       if ((next[head] ?? -1) >= 0) return at;
@@ -654,7 +776,8 @@ export class KeyDelta {
     const ends = this.#keyEnd;
     let min = 0;
     let max = 0;
-    for (let slot = 1; slot < this.keyCount; slot++) {
+    if (this.#ascendingKeys) max = this.keyCount - 1;
+    for (let slot = 1; !this.#ascendingKeys && slot < this.keyCount; slot++) {
       const start = starts[slot] ?? 0;
       const end = ends[slot] ?? 0;
       if (compareBytes(arena, start, end, arena, starts[min] ?? 0, ends[min] ?? 0) < 0) min = slot;
@@ -718,21 +841,6 @@ export class KeyDelta {
     }
     return out;
   }
-}
-
-/** Fill one bounded key-order batch without a suspension inside its hot loop. */
-function fillKeyOrder(
-  order: Int32Array,
-  from: number,
-  to: number,
-  ascending: boolean,
-  compare: (a: number, b: number) => number,
-): boolean {
-  for (let k = from; k < to; k++) {
-    order[k] = k;
-    if (ascending && k > 0 && compare(k - 1, k) > 0) ascending = false;
-  }
-  return ascending;
 }
 
 /** Emit one bounded chain batch; direction handles newest-first chains without sorting. */

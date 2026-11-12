@@ -111,6 +111,22 @@ for (const seed of seedsFor("next-write-partial-delta-rollback", [0xb3d0]))
               if (++calls === at) throw error;
               return original(...args);
             });
+            // The batch and scalar APIs fail before the same key, after the same completed
+            // prefix. Keep the data/retry oracle unchanged when ingress is batched.
+            const originalBatch = delta.addOrderedBatch.bind(delta);
+            const batchSpy = vi
+              .spyOn(delta, "addOrderedBatch")
+              .mockImplementation((bytes, offsets, count, first, seq) => {
+                const untilFailure = at - calls;
+                if (untilFailure > count) {
+                  const admitted = originalBatch(bytes, offsets, count, first, seq);
+                  if (admitted) calls += count;
+                  return admitted;
+                }
+                if (!originalBatch(bytes, offsets, untilFailure - 1, first, seq)) return false;
+                calls += untilFailure;
+                throw error;
+              });
             const attempt = (st: Statement) =>
               s.remove
                 ? st.table(table).delete(batch(locators(targets, table)), null)
@@ -119,6 +135,7 @@ for (const seed of seedsFor("next-write-partial-delta-rollback", [0xb3d0]))
               await expect(autocommit(p, attempt)).rejects.toBe(error);
             } finally {
               spy.mockRestore();
+              batchSpy.mockRestore();
             }
             reach.reach("partial key prefix");
             // Pending markers are reused by later transactions. Its second statement must still

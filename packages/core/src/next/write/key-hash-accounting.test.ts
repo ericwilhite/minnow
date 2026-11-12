@@ -169,8 +169,11 @@ for (const seed of seedsFor("next-write-delta-accounting", [0xb3c1]))
               },
               (kind, bytes) => {
                 if (kind !== "Int32Array") return;
-                const live = constructors++ === 0 ? bytes : order + scratch + bytes;
-                if (constructors === 1) {
+                // Fixture-derived order proof, independent of engine diagnostics. Ascending
+                // unique keys need no order buffer; duplicate keys need only chain scratch.
+                const hasOrder = s.unique && s.reverse;
+                const live = order + scratch + bytes;
+                if (constructors++ === 0 && hasOrder) {
                   order = bytes;
                   reach.reach("order buffer");
                 } else {
@@ -184,7 +187,10 @@ for (const seed of seedsFor("next-write-delta-accounting", [0xb3c1]))
                 ).toBeGreaterThanOrEqual(live);
               },
             );
-            expect(constructors).toBeGreaterThan(0);
+            if (s.unique && !s.reverse) {
+              expect(constructors).toBe(0);
+              reach.reach("implicit ordered traversal");
+            } else expect(constructors).toBeGreaterThan(0);
             expect(paid.peak).toBeGreaterThanOrEqual(base + independentPeak);
             expect(paid.bytes).toBe(base);
             expect(delta.bytes).toBe(retained);

@@ -44,7 +44,7 @@ async function encode(
 ) {
   const builder: Builder = new RunBuilder(drop, bulk);
   const release = delta.retain();
-  const stats = { rows: 0, batches: 0 };
+  const stats = { rows: 0, batches: 0, implicit: 0, permuted: 0 };
   let ownerReleased = false;
   const after = () => {
     if (options.releaseOwner && !ownerReleased) {
@@ -64,6 +64,8 @@ async function encode(
     if (bulk && builder.addSingleBatch !== undefined)
       visit.singles = (data, from, to, maximum, predicate) => {
         stats.batches++;
+        if (data.order === null) stats.implicit++;
+        else stats.permuted++;
         const end = builder.addSingleBatch?.(data, from, to, maximum, predicate) ?? from;
         after();
         return end;
@@ -113,6 +115,7 @@ for (const seed of seedsFor("next-write-direct-run", [0xb5d1]))
       fc.asyncProperty(
         fc.constantFrom(
           "single",
+          "unordered",
           "chains",
           "filter",
           "partition",
@@ -147,7 +150,7 @@ for (const seed of seedsFor("next-write-direct-run", [0xb5d1]))
           try {
             for (let i = 0; i < count; i++) {
               const bytes = key(
-                i,
+                shape === "unordered" ? count - i : i,
                 shape === "mixed widths" ? ([5, 127, 128, 129, 2048][i % 5] ?? 5) : length,
               );
               const row = base + i * 4;
@@ -164,6 +167,10 @@ for (const seed of seedsFor("next-write-direct-run", [0xb5d1]))
             if (base >= 2 ** 31) reach.reach("wide row id");
             if (length >= 128) reach.reach("two-byte length");
             if (actual.stats.batches > 0) reach.reach("batch callback");
+            if (actual.stats.implicit > 0) reach.reach("implicit order batch");
+            if (actual.stats.permuted > 0) reach.reach("permuted order batch");
+            if (shape === "unordered" && length >= 5)
+              expect(actual.stats.permuted).toBeGreaterThan(0);
             if (actual.stats.rows > 0) reach.reach("per-row fallback");
             if (shape === "chains" && length >= 5) reach.reach("partial fallback");
             if (shape === "filter" && length >= 5) {

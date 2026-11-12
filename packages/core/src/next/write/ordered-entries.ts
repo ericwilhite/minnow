@@ -148,11 +148,12 @@ export class OrderedEntries {
     }
     return this.#choose(a, b, direction);
   }
-  add(entry: number): void {
+  /** afterLast is a caller's proof that this entry is greater than every retained entry. */
+  add(entry: number, afterLast = false): void {
     if (
       this.#count === 0 &&
       entry === this.#linear &&
-      (entry === 0 || this.compare(entry - 1, entry) < 0)
+      (entry === 0 || afterLast || this.compare(entry - 1, entry) < 0)
     ) {
       this.#linear++;
       this.version++;
@@ -160,7 +161,8 @@ export class OrderedEntries {
     }
     const last = this.#leaves[this.#count - 1];
     const position =
-      last !== undefined && this.compare(last.entries[last.count - 1] ?? 0, entry) < 0
+      last !== undefined &&
+      (afterLast || this.compare(last.entries[last.count - 1] ?? 0, entry) < 0)
         ? (this.#count - 1) * LEAF + last.count
         : this.#tailSeek((e) => this.compare(e, entry));
     let i = Math.floor(position / LEAF),

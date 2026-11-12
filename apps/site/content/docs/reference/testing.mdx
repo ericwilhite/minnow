@@ -1703,6 +1703,12 @@ rows and wide row IDs. The key delta stays pinned until the final block is encod
 builder aborts; releasing its owner early must not release those bytes. Mixed chains fall
 back to the ordinary serializer without changing a partially filled block.
 
+`key-order-proof.test.ts` checks retained key order and ascending batch admission against an
+independent byte-order model. A normalized prefix proves order only when it differs; ties use
+full byte comparison. A batch must be strictly beyond every retained key before it can skip
+lookups. Generated bulk-encoder cases exercise both implicit order and explicit permutations,
+and partial-failure tests cut the same completed key prefix in either ingress path.
+
 Each worker runs one excluded warmup before its measured pass. Nine or more pairs alternate
 AB/BA order. CPU includes all Node threads; wall time is separate. The acceptance rule uses
 paired CPU deltas: their median gain must exceed their interquartile range (IQR), and at least
