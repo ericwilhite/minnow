@@ -32,6 +32,8 @@ export function probeDictionaryGroups(
   read: ReadBound,
   signal: AbortSignal,
   label = "aggregate-domain-planning",
+  maxGroups = 1024,
+  allowScan = false,
 ): MaybePromise<PartitionBounds | null> {
   const slice = new Slice(YIELD_INTERVAL_MS);
   return runSliced(certify(), slice, () => undefined);
@@ -60,7 +62,7 @@ export function probeDictionaryGroups(
     };
     try {
       check();
-      probe = new GroupPartitionProbe(source.types, source.payloads.length, domains, 1024, 1);
+      probe = new GroupPartitionProbe(source.types, source.payloads.length, domains, maxGroups, 1);
       const table = readTable(
         yield* readValue(view.table(source.tableId, { budget })),
         view.pages,
@@ -68,9 +70,9 @@ export function probeDictionaryGroups(
         check,
       );
       probe.sourceRows(table.liveRowCount);
-      if (
-        table.segments.some((segment) => segment.kind === "memory" && segment.liveRowCount !== 0)
-      ) {
+      const scanRows = function* (): SlicedJob<PartitionBounds | null> {
+        const activeProbe = probe;
+        if (!activeProbe) throw new Error("Missing exact domain probe");
         // The pinned rows can repoint at publication. Reuse the public bounded scan contract,
         // with only key/payload columns, instead of borrowing an unbounded legacy memory chunk.
         const columns = [...new Set([...source.keys, ...source.payloads])];
@@ -113,7 +115,7 @@ export function probeDictionaryGroups(
                 if (!vector) throw new Error("Missing memory domain payload");
                 return vector;
               });
-              if (!probe.offer(keys, payloads, item.batch.length, item.batch.selection, true))
+              if (!activeProbe.offer(keys, payloads, item.batch.length, item.batch.selection, true))
                 return null;
             } finally {
               item.transfer?.release();
@@ -123,13 +125,16 @@ export function probeDictionaryGroups(
               check();
             }
           }
-          return probe.seal();
+          return activeProbe.seal();
         } finally {
           scan?.abort();
           arena.close();
         }
-      }
-      for (const segment of table.segments) {
+      };
+      if (table.segments.some((segment) => segment.kind === "memory" && segment.liveRowCount !== 0))
+        return yield* scanRows();
+      let scanFlat = false;
+      segments: for (const segment of table.segments) {
         check();
         if (segment.liveRowCount === 0) continue;
         // Memory rows were handled through the publication-stable bounded scan above.
@@ -169,7 +174,11 @@ export function probeDictionaryGroups(
               }),
             );
             try {
-              if (!pages.isDictionaryRange(0, pages.rowCount)) return null;
+              if (!pages.isDictionaryRange(0, pages.rowCount)) {
+                if (!allowScan) return null;
+                scanFlat = true;
+                break segments;
+              }
               const dictionary = yield* readValue(pages.loadDictionary());
               if (dictionary === null) return null;
               if (
@@ -190,7 +199,7 @@ export function probeDictionaryGroups(
           segment.releaseRoot?.();
         }
       }
-      return probe.seal();
+      return scanFlat ? yield* scanRows() : probe.seal();
     } finally {
       probe?.close();
       for (const part of parts) part.close();

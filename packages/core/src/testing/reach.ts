@@ -4364,3 +4364,101 @@ export const ROOT_PACKING_REACH = [
   "fresh selected extent graphs",
   "canonical bytes and zero charges",
 ] as const;
+
+/** Canonical star TEXT classes, shared across source dictionaries with exact NULL equality. */
+export const STAR_DICTIONARY_REACH = [
+  "flat",
+  "dictionary",
+  "constant",
+  "selection",
+  "NULL",
+  "dictionary epochs",
+  "cross-source equality",
+  "owned input",
+  "decoded groups",
+  "PGlite equality",
+  "zero resources",
+] as const;
+
+export const STAR_DICTIONARY_FUNDING_REACH = [
+  "charged before construction",
+  "denied construction",
+  "zero charges",
+] as const;
+
+export const STAR_COMPONENT_REACH = [
+  "native text",
+  "dictionary IDs",
+  "complete repeated lifetimes",
+  "empty result",
+  "nonempty result",
+  "zero charges",
+] as const;
+
+export const STAR_FIXTURE_PREFIX_REACH = [
+  "growing identity",
+  "old prefix intact",
+  "owned backing",
+  "stable prefix reused",
+] as const;
+
+export const STAR_BOUND_REACH = [
+  "complete resident bounds",
+  "missing",
+  "not-PK",
+  "wide",
+  "many",
+  "volatile",
+  "alias",
+] as const;
+
+export const STAR_SQL_REACH = [
+  "stored",
+  "single-key",
+  "memory",
+  "mixed",
+  "non-PK",
+  "composite",
+  "parameter",
+  "wide",
+  "computed",
+  "zero",
+  "resident joins",
+  "PG exact",
+  "generic exact",
+  "ascending",
+  "descending",
+  "aggregate order",
+  "lexical top-N",
+] as const;
+
+export const STAR_EDGE_REACH = ["ready", "blocked", "cancel", "map-error", "push-error"] as const;
+
+export const STAR_PRESSURE_REACH = [
+  "release",
+  "wait-cancel",
+  "read-cancel",
+  "read-fault",
+  "output-cancel",
+  "concurrent",
+  "publish",
+  "reclaim",
+  "atomic wait",
+  "holder release",
+  "PG exact",
+  "protected prepared credit",
+  "pinned growth",
+  "zero resources",
+] as const;
+
+export const STAR_FLOAT_REACH = [
+  "finite",
+  "special",
+  "overflow",
+  "empty",
+  "batch boundary",
+  "nonempty",
+  "identical native sequence",
+  "bit exact result",
+  "PG ordered transitions",
+] as const;
