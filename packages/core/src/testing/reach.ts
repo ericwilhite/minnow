@@ -3877,6 +3877,7 @@ export const QUERY_ROOT_VM_REACH = [
   "independent fixture restore",
   "exact row volume",
   "all workers drained",
+  "complete decode in both arms",
 ] as const;
 
 export const QUERY_ROOT_VOLUME_REACH = [
@@ -4046,4 +4047,18 @@ export const JSON_FLOAT_REACH = [
   "array constructors",
   "scalar keys",
   "exact PostgreSQL text",
+] as const;
+
+export const EXTENT_PAIR_CODEC_REACH = [
+  "distinct offsets",
+  "shared offset",
+  "mixed offsets",
+  "low-word collisions",
+  "wide safe integers",
+  "small integers",
+  "zero length",
+  "promoted set remembers every length",
+  "exact duplicate refusal",
+  "charge refusal before parse",
+  "zero charges after failure",
 ] as const;

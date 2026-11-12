@@ -9,6 +9,8 @@ import type { GroupRoot } from "../packages/core/dist/next/format/manifest.js";
 export interface RootComponentConfig {
   runtimeRoot: string;
   cached: boolean;
+  /** Full-parser comparison uses distinct group addresses, not repeated number/string keys. */
+  decodeOnly?: boolean;
   warmups: number;
   repeats: number;
 }
@@ -39,7 +41,10 @@ export default async function createRootComponent(
     rowCount: 6144,
     rowIds: { kind: "dense" },
     columns: Array.from({ length: 200 }, (_, c) => {
-      const extent = { offset: (c + 1) * 4096, length: 1024 };
+      const extent = {
+        offset: config.decodeOnly ? (g * 200 + c + 1) * 65536 : (c + 1) * 4096,
+        length: 1024,
+      };
       return {
         columnId: c + 1,
         type: { kind: "int32", bits: 32 },
@@ -60,18 +65,25 @@ export default async function createRootComponent(
     minimumBytes: 1 << 20,
     spillable: false,
   });
+  // A parser component must not silently become an owner-recipe hit after recipe integration.
+  // Keep verified encoded reads, with optional parsed/attach hooks absent in both arms.
+  const pages = config.decodeOnly
+    ? { peek: space.peek.bind(space), read: space.read.bind(space) }
+    : space;
   const selected = [2, 6, 10],
     expectedVisits = 2 * blobs.length * selected.length;
   const expected = roots.map((root) => ({
     rowCount: root.rowCount,
     columns: root.columns.filter((c) => selected.includes(c.columnId)),
   }));
-  const expectedHash = createHash("sha256").update(JSON.stringify(expected)).digest("hex");
+  const expectedHash = createHash("sha256")
+    .update(JSON.stringify(config.decodeOnly ? roots : expected))
+    .digest("hex");
   async function once(verify = false) {
     const owner = cache
       ? new cache.QueryRoots(governor, [{ tableId: 1, columns: selected }])
       : undefined;
-    const reader = new metadata.MetadataReader(space);
+    const reader = new metadata.MetadataReader(pages);
     let visits = 0;
     try {
       for (let pass = 0; pass < 2; pass++)
@@ -79,9 +91,11 @@ export default async function createRootComponent(
           const ref = blobs[g];
           if (!ref) throw new Error("Missing root");
           const held = owner
-            ? await owner.read(1, ref, space, grant, selected)
+            ? await owner.read(1, ref, pages, grant, selected)
             : await reader.groupRoot(ref, grant);
           try {
+            if (verify && config.decodeOnly && !isDeepStrictEqual(held.value, roots[g]))
+              throw new Error("Complete root decode equality");
             const value = {
               rowCount: held.value.rowCount,
               columns: held.value.columns.filter((c) => selected.includes(c.columnId)),
@@ -106,13 +120,14 @@ export default async function createRootComponent(
     identity: {
       runtimeRoot: config.runtimeRoot,
       cached: config.cached,
+      decodeOnly: config.decodeOnly ?? false,
       groups: 163,
       storedColumns: 200,
       selected,
       repeats: config.repeats,
       warmups: config.warmups,
     },
-    workloads: ["root_handoff"],
+    workloads: ["root_handoff", "root_decode"],
     boundaries: ["roots"],
     async verify() {
       await once(true);

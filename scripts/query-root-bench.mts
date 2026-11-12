@@ -30,6 +30,7 @@ interface AAReport {
   purpose: string;
   smoke: boolean;
   mode: string;
+  decodeOnly: boolean;
   rows: number;
   warmups: number;
   repeats: number;
@@ -94,6 +95,8 @@ export function auditRootWorkers(result: Result, repeats: number): void {
   }
 }
 export async function runQueryRootBench(mode: "whole" | "component" = "whole") {
+  const decodeOnly = process.argv.includes("--decode-only");
+  if (decodeOnly && mode !== "component") throw new Error("--decode-only requires component mode");
   const aa = process.argv.includes("--aa"),
     smoke = process.argv.includes("--smoke") || process.argv.includes("--check");
   const rows = Number(option("--rows", process.argv.includes("--check") ? "7" : "1000000")),
@@ -106,7 +109,8 @@ export async function runQueryRootBench(mode: "whole" | "component" = "whole") {
     warmups > 1000
   )
     throw new Error("Invalid query observation policy");
-  const selectedWorkload = mode === "whole" ? "scan_plain3" : "root_handoff";
+  const selectedWorkload =
+    mode === "whole" ? "scan_plain3" : decodeOnly ? "root_decode" : "root_handoff";
   if (option("--only", selectedWorkload) !== selectedWorkload)
     throw new Error("This runner measures only its declared root workload");
   const parentRoot = resolve(option("--baseline")),
@@ -216,6 +220,7 @@ export async function runQueryRootBench(mode: "whole" | "component" = "whole") {
         checked.purpose !== "identical-build-control" ||
         checked.smoke ||
         checked.mode !== mode ||
+        checked.decodeOnly !== decodeOnly ||
         checked.rows !== rows ||
         checked.repeats !== repeats ||
         checked.warmups !== warmups ||
@@ -253,14 +258,20 @@ export async function runQueryRootBench(mode: "whole" | "component" = "whole") {
         cwd: root,
         revision,
         execArgv: ["--max-old-space-size=2048"],
-        data: { runtimeRoot: root, cached, warmups, repeats } satisfies RootComponentConfig,
+        data: {
+          runtimeRoot: root,
+          cached: decodeOnly ? false : cached,
+          decodeOnly,
+          warmups,
+          repeats,
+        } satisfies RootComponentConfig,
       };
     };
     const result = await runIndependentCPU({
       control: spec(aa ? candidateRoot : parentRoot, aa ? candidate.revision : parent.revision, aa),
       candidate: spec(candidateRoot, candidate.revision, true),
       purpose: aa ? "identical-build-control" : "true-parent",
-      workloads: [mode === "whole" ? "scan_plain3" : "root_handoff"],
+      workloads: [selectedWorkload],
       boundaries: [mode === "whole" ? "frames" : "roots"],
       primaryBoundary: mode === "whole" ? "frames" : "roots",
       pairs: 9,
@@ -277,6 +288,7 @@ export async function runQueryRootBench(mode: "whole" | "component" = "whole") {
       purpose: result.purpose,
       smoke,
       mode,
+      decodeOnly,
       rows,
       warmups,
       repeats,

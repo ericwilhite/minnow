@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { expect, it } from "vitest";
@@ -138,6 +138,49 @@ for (const seed of seedsFor("query-root-independent-entry", [0xb2f1, 0xb2f2]))
       reach.reach("exact row volume");
       // All child exit fences are awaited by the runner before its successful exit above.
       reach.reach("all workers drained");
+      const componentOutput = join(dir, "complete-decode");
+      await run(
+        process.execPath,
+        [
+          join(dirname(entry), "query-root-component.mts"),
+          "--baseline",
+          runtime,
+          "--candidate",
+          runtime,
+          "--aa",
+          "--smoke",
+          "--decode-only",
+          "--warmups",
+          "1",
+          "--repeats",
+          "1",
+          "--output",
+          componentOutput,
+        ],
+        { maxBuffer: 4 << 20, env: { ...process.env, TMPDIR: dir } },
+      );
+      const component = JSON.parse(
+        await readFile(join(componentOutput, "results.json"), "utf8"),
+      ) as {
+        result: {
+          records: Array<{
+            samples: Array<{
+              rows: number;
+              identity: { pid: number; identity: { cached: boolean; decodeOnly?: boolean } };
+            }>;
+          }>;
+        };
+      };
+      const complete = component.result.records[0]?.samples;
+      if (complete === undefined) throw new Error("Missing complete-root samples");
+      expect(complete).toHaveLength(18);
+      for (const sample of complete) {
+        expect(sample.identity.identity.cached).toBe(false);
+        expect(sample.identity.identity.decodeOnly).toBe(true);
+        expect(sample.rows).toBe(978);
+      }
+      expect(new Set([...pids, ...complete.map((sample) => sample.identity.pid)]).size).toBe(36);
+      reach.reach("complete decode in both arms");
       reach.assertReached();
     } finally {
       await rm(dir, { recursive: true, force: true });

@@ -196,13 +196,21 @@ class RefReader {
     valid(bytes.u32() === magic, `Not a ${what}`);
     valid(bytes.u8() === VERSION, `Unknown ${what} version`);
     const count = bytes.count(2);
-    const seen = new Set<string>();
+    // Offsets and lengths are exact safe integers. Avoid formatting every pair; most
+    // offsets occur once, and only the legal same-offset/different-length case needs a Set.
+    const seen = new Map<number, number | Set<number>>();
     for (let k = 0; k < count; k++) {
       const offset = bytes.uint();
       const length = bytes.uint();
-      const key = `${String(offset)}:${String(length)}`;
-      valid(!seen.has(key), "An extent appears twice in an extent table");
-      seen.add(key);
+      const previous = seen.get(offset);
+      if (previous === undefined) seen.set(offset, length);
+      else if (typeof previous === "number") {
+        valid(previous !== length, "An extent appears twice in an extent table");
+        seen.set(offset, new Set([previous, length]));
+      } else {
+        valid(!previous.has(length), "An extent appears twice in an extent table");
+        previous.add(length);
+      }
       this.extents.push({ offset, length });
     }
   }
