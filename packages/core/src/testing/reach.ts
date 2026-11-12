@@ -5385,3 +5385,15 @@ export const WINDOW_RING_GROWTH_CASES = [
   { rows: 16_385, state: "above 16384 rows" },
   { rows: 30_000, state: "original 30000-row partition" },
 ] as const;
+
+export const AGG_WIDE_PROGRESS_REACH = [
+  "repeated parameter",
+  "distinct parameters",
+  "UTF8 widths",
+  "ASCII widths",
+  "pinned ordinary room",
+  "bounded sort loan",
+  "PG exact",
+  "partial staged row",
+  "cancelled loan",
+] as const;

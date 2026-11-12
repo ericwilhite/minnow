@@ -1,0 +1,163 @@
+{
+  "change": "Complete admitted aggregate sort progress for repeated owned parameter positions",
+  "parent": "b5b7d1fd3bbd4aafb795d5a4f29bb61e1098a9ec",
+  "authority": "Native complete-step admission contract in next/memory/README.md; PostgreSQL grouping result via PGlite",
+  "regression": {
+    "sql": "SELECT count(*) n FROM (SELECT $1::text a,$1::text b,$1::text c FROM generate_series(1,2) g(i)) q GROUP BY a,b,c",
+    "parameterUtf8Bytes": 800000,
+    "capBytes": 268435456,
+    "pressure": "Competing admitted grant holds all remaining ordinary headroom through query termination",
+    "parent": "MemoryAdmissionError53200; reported demand7187940, private capacity4054112",
+    "shrunkRed": {
+      "demand": 4433424,
+      "capacity": 3711968,
+      "keys": 2,
+      "parameterUtf8Bytes": 780000
+    }
+  },
+  "campaign": {
+    "suite": "packages/core/src/next/testing/executor-agg-wide-progress.test.ts",
+    "seeds": [46993, 46994],
+    "runsPerSeed": 8,
+    "previousRunCount": 6,
+    "reasonForIncrease": "Retain all4original examples plus2random histories and add2cancellation examples",
+    "dimensions": [
+      "2..4logical grouping positions",
+      "780000..800000ASCII orUTF8 bytes per slot",
+      "repeated/distinct owned parameters",
+      "full ordinary pressure",
+      "exactPGlite result",
+      "cancellation at private loan",
+      "partially grown empty staging row",
+      "zero governor/spill cleanup"
+    ]
+  },
+  "mutants": [
+    {
+      "mutant": "alias-copies",
+      "exit": 1,
+      "seconds": 23.772992509999312,
+      "log": "/home/eric/.cache/b4-read-recipe/agg-wide-mutant-alias-copies.log"
+    },
+    {
+      "mutant": "partial-stage",
+      "exit": 1,
+      "seconds": 24.495079207932577,
+      "log": "/home/eric/.cache/b4-read-recipe/agg-wide-mutant-partial-stage.log"
+    }
+  ],
+  "limits": [
+    "Private next core only; shipped engine and stored format unchanged",
+    "No throughput, browser or RSS claim",
+    "Owned parameter provenance does not newly certify arbitrary source-backed expanding expressions"
+  ],
+  "rawEvidenceDirectory": "/home/eric/.cache/b4-read-recipe",
+  "reproduce": "TMPDIR=/path/to/scratch npx vitest run packages/core/src/next/testing/executor-agg-wide-progress.test.ts --maxWorkers=2",
+  "sourceSha256": {
+    "packages/core/src/next/README.md": "6c5c5a0e28ade40b86e59df924dd42b80b8a5d3dc9e962908b206d6fa64d55ce",
+    "packages/core/src/next/exec/parameter-checkpoint.test.ts": "d6893036f1fbf8b47e6368de2b7682510915c375dac80af3b44ba4ee06786d73",
+    "packages/core/src/next/exec/parameter-checkpoint.ts": "1bcc4c29d0382e94e2967882faa909fa3aadffdfb525dbcda610034f41f5870c",
+    "packages/core/src/next/exec/parameters.ts": "61b41daf5f56725d64d6a62c65df90593e2cfbaaca6ade1f970f5591d064de9d",
+    "packages/core/src/next/exec/plan.ts": "20a42d945d8e7edc07408e8d3a597e80bc1589c0218fadeec7132da43de63b27",
+    "packages/core/src/next/exec/run.ts": "253a47d827a7345c8bb101714bec011529c97d4a11ce0ffd02f522c1fd22e67b",
+    "packages/core/src/next/exec/spill-pool.ts": "be395c6b5f8e66fc65d08a34f8ac374ab11826f059de85d8310967c214881640",
+    "packages/core/src/testing/reach.ts": "9e5d79aff112383674406a35d0f7e229ec43b58071673901f7fab36222b7342d",
+    "packages/core/src/next/exec/agg/parameter-copies.ts": "0e7e17a7679b3279fc6caf233bd3fa48b8671d6cd50e137b8b95676cca53a2e3",
+    "packages/core/src/next/testing/executor-agg-wide-progress.test.ts": "18bceeef2362737a992816c803af09a3187e651d176aaf7ecd0f701cd9f58cc3"
+  },
+  "preflight": [
+    {
+      "name": "format",
+      "command": [
+        "npx",
+        "prettier",
+        "--write",
+        "packages/core/src/next/README.md",
+        "packages/core/src/next/exec/parameter-checkpoint.test.ts",
+        "packages/core/src/next/exec/parameter-checkpoint.ts",
+        "packages/core/src/next/exec/parameters.ts",
+        "packages/core/src/next/exec/plan.ts",
+        "packages/core/src/next/exec/run.ts",
+        "packages/core/src/next/exec/spill-pool.ts",
+        "packages/core/src/testing/reach.ts",
+        "packages/core/src/next/exec/agg/parameter-copies.ts",
+        "packages/core/src/next/testing/executor-agg-wide-progress.test.ts"
+      ],
+      "exit": 0,
+      "seconds": 5.244445629999973,
+      "log": "/home/eric/.cache/b4-read-recipe/agg-wide-preflight-format.log"
+    },
+    {
+      "name": "lint",
+      "command": [
+        "npx",
+        "eslint",
+        "packages/core/src/next/exec/parameter-checkpoint.test.ts",
+        "packages/core/src/next/exec/parameter-checkpoint.ts",
+        "packages/core/src/next/exec/parameters.ts",
+        "packages/core/src/next/exec/plan.ts",
+        "packages/core/src/next/exec/run.ts",
+        "packages/core/src/next/exec/spill-pool.ts",
+        "packages/core/src/testing/reach.ts",
+        "packages/core/src/next/exec/agg/parameter-copies.ts",
+        "packages/core/src/next/testing/executor-agg-wide-progress.test.ts"
+      ],
+      "exit": 0,
+      "seconds": 29.20494884008076,
+      "log": "/home/eric/.cache/b4-read-recipe/agg-wide-preflight-lint.log"
+    },
+    {
+      "name": "core-build",
+      "command": ["node", "node_modules/typescript/bin/tsc", "-b", "packages/core"],
+      "exit": 0,
+      "seconds": 97.9485402640421,
+      "log": "/home/eric/.cache/b4-read-recipe/agg-wide-preflight-core-build.log"
+    },
+    {
+      "name": "focused",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "packages/core/src/next/testing/executor-agg-wide-progress.test.ts",
+        "packages/core/src/next/exec/parameter-charge.test.ts",
+        "packages/core/src/next/exec/parameter-checkpoint.test.ts",
+        "packages/core/src/next/exec/parameters.test.ts",
+        "packages/core/src/next/exec/phase-pool.test.ts",
+        "packages/core/src/next/exec/sort-progress.test.ts",
+        "packages/core/src/next/testing/executor-agg-handoff.test.ts",
+        "--config",
+        "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+        "--maxWorkers=2"
+      ],
+      "exit": 0,
+      "seconds": 139.90877494192682,
+      "log": "/home/eric/.cache/b4-read-recipe/agg-wide-preflight-focused.log"
+    },
+    {
+      "name": "node22",
+      "command": [
+        "/usr/bin/node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "packages/core/src/next/testing/executor-agg-wide-progress.test.ts",
+        "--config",
+        "/home/eric/.cache/b4-read-recipe/vitest-star-two.mts",
+        "--maxWorkers=2"
+      ],
+      "exit": 0,
+      "seconds": 48.91924709104933,
+      "log": "/home/eric/.cache/b4-read-recipe/agg-wide-preflight-node22.log"
+    }
+  ],
+  "preflightCounts": {
+    "focused": {
+      "files": 7,
+      "tests": 27
+    },
+    "node22": {
+      "files": 1,
+      "tests": 2
+    }
+  }
+}

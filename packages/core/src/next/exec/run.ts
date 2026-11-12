@@ -322,8 +322,11 @@ export class QueryRuntime {
   operatorLiteralProgress(bytes: number): void {
     this.#operatorLiteralBytes = bytes;
   }
+  #parameterCopies: ReadonlyArray<ReadonlyMap<number, number>> = [];
+  #parameterSlotBytes: readonly number[] | undefined;
   /** Complete variable-output envelope; ordinary project/filter leave it at zero. */
-  progressEnvelope(bytes: number, multiplicity = 1, sourceMultiplicity = multiplicity): void {
+  progressEnvelope(bytes: number, multiplicity = 1, sourceMultiplicity = multiplicity, parameterCopies: ReadonlyArray<ReadonlyMap<number, number>> = []): void {
+    this.#parameterCopies = parameterCopies;
     this.#expressionProgress = bytes;
     this.#expressionMultiplicity = multiplicity;
     this.#sourceMultiplicity = sourceMultiplicity;
@@ -367,10 +370,22 @@ export class QueryRuntime {
     // ReadBound.progress already covers a complete source prefix, not one cell.
     // Add newly materialized inline/literal/owned-parameter columns; multiply only
     // for repeated group-key positions, never again for the number of source columns.
+    // Actual binding bounds weight each repeated slot separately. A large unrelated
+    // parameter must not be multiplied by the alias count of a small one.
+    let repeated = 0;
+    for (const profile of this.#parameterCopies) {
+      let bytes = 0;
+      for (const [slot, count] of profile)
+        bytes +=
+          Math.max(0, count - this.#expressionMultiplicity) *
+          (this.#parameterSlotBytes?.[slot] ?? inputs);
+      repeated = Math.max(repeated, bytes);
+    }
     const current = this.#parameterProgress
       ? readProgress * this.#sourceMultiplicity +
         this.#expressionProgress +
-        4 * inputs * this.#expressionMultiplicity
+        4 * inputs * this.#expressionMultiplicity +
+        4 * repeated
       : Math.max(readProgress, largestInput);
     return Math.max(MAX_BLOB_BYTES, savedCopies * this.#savedProgressBytes, copies * current);
   }
@@ -548,6 +563,7 @@ export class QueryRuntime {
     binding: ParameterBinding,
     idleCredit?: Grant,
   ): MaybePromise<void> {
+    this.#parameterSlotBytes = binding.slotBytes;
     const atomic = this.#atomicResult !== null;
     const progress = (rel: OperatorIdentity) =>
       atomic

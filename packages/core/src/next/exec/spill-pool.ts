@@ -440,11 +440,20 @@ export class SpillIo {
       // goes out as a page of its own before the next step.
       // The step is the row and the page it becomes: room for both at once.
       const rowBytes = staging.appendNeed(vectors, row);
-      await this.need(2 * rowBytes + 64 * 1024);
-      const one = staging.append(vectors, ids, from + done, 1);
-      if (one === 0) throw new RangeError("A spill staging row could not be allocated");
-      done += one;
-      await this.flush(staging, run, header);
+      // A failed append may already have grown some columns. appendNeed is the
+      // REMAINING growth, while the encoded page still contains the complete row.
+      // Existing retention + remaining growth bounds that page; retain overlap
+      // until both the row and page have left, even across internal arena frees.
+      const release = this.pool.pinStep();
+      try {
+        await this.need(staging.retainedBytes + 2 * rowBytes + 64 * 1024);
+        const one = staging.append(vectors, ids, from + done, 1);
+        if (one === 0) throw new RangeError("A spill staging row could not be allocated");
+        done += one;
+        await this.flush(staging, run, header);
+      } finally {
+        release();
+      }
     }
   }
 }

@@ -29,6 +29,7 @@ import { Slice, runSliced, type SlicedJob } from "./slices.js";
 import type { MaybePromise } from "../access/key-index.js";
 import type { PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { ResultSink } from "./result-sink.js";
+import { aggregateParameterCopies } from "./agg/parameter-copies.js";
 import { outputCopyLayout } from "./output-copies.js";
 import {
   ExceptOperator,
@@ -2770,6 +2771,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       let inline = 0,
         sourceMultiplicity = 1,
         inputMultiplicity = 1;
+      const parameterCopies = [...aggregatePlanners.values()].filter(p => active.has(p.rel.id)).map(p => aggregateParameterCopies(p.rel.input, p.rel.groupBy));
       for (const planner of [
         ...aggregatePlanners.values(),
         ...[...jsonAggregateRecipes.values()].filter((p) => p.loans > 1),
@@ -2811,7 +2813,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         );
       }
       if (hasAggregateProgress)
-        runtime.progressEnvelope(inline, inputMultiplicity, sourceMultiplicity);
+        runtime.progressEnvelope(inline, inputMultiplicity, sourceMultiplicity, parameterCopies);
     }
     const entries = admissions
       .filter((entry) => active.has(entry.owner))

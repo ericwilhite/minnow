@@ -1331,6 +1331,10 @@ and the owner import it directly.
 - A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable
   operator works inside its admitted minimum.
 - Growth is charged before it happens, including the overlap while a buffer is copied.
+- Aggregate sort minima count every variable-width parameter position, including projected
+  aliases, using each owned slot's binding bound before admission. Pressure checkpoints preserve
+  those widths without rereading caller buffers. Spill staging reserves the complete row/page
+  overlap even when an unsuccessful append has already grown some column buffers.
 - Caches are evicted before anything spills. Several may register (the space's page cache, the
   decoded directory and metadata caches, the inflated-page cache); eviction takes the entry unused
   longest across all of them (`oldestUnusedAt`).
