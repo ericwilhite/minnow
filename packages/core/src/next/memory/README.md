@@ -191,10 +191,12 @@ not contribute a bound. This is an honest
 compound working-set reservation, not a relaxation of the one-loan rule or an increase to the shared reserve.
 Join keys are position lists, not sets: repeated indexes contribute again to the encoded
 key bound. Chunk loading and table construction measure projected key positions,
-including encoded MARK correlation prefixes. Replay and checkpoint bounds carry the
-maximum occurrence count of a variable-width source column. Parameter/literal sizing counts key
-positions separately from physical row columns; source-prefix sizing applies its
-occurrence factor once and leaves already-complete saved bounds intact.
+including encoded MARK correlation prefixes. Spill writers record scalar key-page bounds
+before replay reads; saved continuations retain these bounds without old grants or vectors.
+SQL admission follows each repeated column to its literal, owned parameter slot or selected
+source-column prefix. An unrelated payload keeps its ordinary row bound. Per-slot sizes
+survive pressure checkpoints; already-complete saved bounds are not multiplied again.
+Unknown expanding expressions keep their existing conservative recipe.
 
 A complete query whose simultaneous protected working set exceeds its cap still receives
 its existing typed admission refusal.

@@ -16,15 +16,14 @@ export class JoinCheckpoint {
     /** RIGHT/FULL append an internal bool: already matched before the cut. */
     readonly hasMatches: boolean,
     readonly profile: Readonly<HashJoinProfile>,
-    /** Maximum occurrences of one variable-width source column in either key. */
-    readonly keyMultiplicity = 1,
   ) {}
   /** A read page, staging growth overlap and an encoded output page. */
   get progressBytes(): number {
-    return (
-      6 * this.keyMultiplicity * Math.max(this.build.maxPageBytes, this.probe.maxPageBytes) +
-      64 * 1024
-    );
+    const row = Math.max(this.build.maxPageBytes, this.probe.maxPageBytes);
+    // The ordinary six-copy row bound already funds one occurrence of each key.
+    // Only encoded key bytes beyond that row add simultaneous key workspace.
+    const extra = Math.max(0, this.build.maxKeyBytes, this.probe.maxKeyBytes) - row;
+    return 6 * row + 4 * Math.max(0, extra) + 64 * 1024;
   }
   /** Includes directory pages appended lazily by HashTape.read(). */
   get spilledBytes(): number {

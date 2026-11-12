@@ -3989,6 +3989,9 @@ export const JOIN_REPEATED_PROGRESS_REACH = [
   "arena boundary",
   "seventeen repeats",
   "fixed repeats with large payload",
+  "partitioned four MB key page",
+  "forwarded distinct-key partition",
+  "small key large payload",
   "encoded repeated correlation",
   "retired grant and private restore lane",
   "selected dictionary",
@@ -4009,6 +4012,18 @@ export const JOIN_REPEATED_SQL_REACH = [
   "cross-field grid",
   "single-row source envelope",
   "ordinary credit occupied",
+  "small key large payload",
+  "32 MiB cap",
+  "independent key and payload slots",
+  "independent key and payload literals",
+  "8 MiB literal cap",
   "PG exact",
   "zero resources",
+] as const;
+
+/** Pressure restore sizes each owned slot independently, in its original position. */
+export const OWNED_PARAMETER_COLUMN_BOUNDS_REACH = [
+  "independent slot bounds",
+  "original slot order",
+  "phase binding bounds",
 ] as const;

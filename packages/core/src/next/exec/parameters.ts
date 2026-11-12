@@ -164,6 +164,8 @@ export interface ParameterBinding {
   readonly logicalBytes?: number;
   readonly bytes: number;
   readonly largestSlot: number;
+  /** Per-slot bounds survive phase handoffs; payload slots must not size unrelated keys. */
+  readonly slotBytes?: readonly number[];
   bind(charge: ByteCharge, statementTime?: bigint): MaybePromise<BoundParameters>;
 }
 
@@ -210,6 +212,7 @@ export function prepareParameters(
     return {
       bytes,
       largestSlot: Math.max(0, ...sizes),
+      slotBytes: sizes,
       bind(charge, statementTime = 0n) {
         const pool = prepaid(charge, bytes);
         function* convert(): SlicedJob<BoundParameters> {

@@ -86,6 +86,9 @@ export interface ReadBound {
   readonly bytes: number;
   readonly io: number;
   readonly progress: number;
+  /** Conservative logical column-value bound, without the progress-lane floor.
+   * A selected key column can be sized independently from other row payloads. */
+  readonly valueBytes?: number;
   readonly windowBytes: number;
   readonly domain?: Int32Domain;
 }
@@ -178,6 +181,7 @@ export function boundSource(
     let maximum = 0,
       io = 0,
       largestValue = 0,
+      valueBytes = 0,
       remaining = source.rows;
     for (const segment of table.segments) {
       signal.throwIfAborted();
@@ -242,6 +246,7 @@ export function boundSource(
                   );
                   io = Math.max(io, hint.ioBytes);
                   largestValue = Math.max(largestValue, output);
+                  valueBytes = Math.max(valueBytes, hint.outputBytes);
                   start += hint.rowCount;
                   const pause = pauseIfDue(task);
                   if (pause) yield pause;
@@ -303,6 +308,7 @@ export function boundSource(
         maximum = Math.max(maximum, worst);
         io = Math.max(io, columns === 0 ? 0 : MAX_READ_BYTES);
         largestValue = Math.max(largestValue, logical);
+        valueBytes = Math.max(valueBytes, logical);
         const pause = pauseIfDue(task);
         if (pause) yield pause;
         continue;
@@ -401,13 +407,19 @@ export function boundSource(
               const dictionary = reader.directory.dictionary;
               if (dictionary) {
                 const beforeDictionary = budget.allocated;
-                yield* readValue(reader.loadDictionary());
-                dictionaries +=
+                const decoded = yield* readValue(reader.loadDictionary());
+                const dictionaryBytes =
                   dictionary.length +
                   budget.allocated -
                   beforeDictionary +
                   4 * dictionary.rowCount +
                   1024;
+                dictionaries += dictionaryBytes;
+                valueBytes = Math.max(
+                  valueBytes,
+                  dictionaryBytes,
+                  decoded?.data.layout === "varlen" ? decoded.data.bytes.byteLength : 0,
+                );
                 io = Math.max(io, Math.min(MAX_READ_BYTES, dictionary.length));
               }
               for (const [index, page] of reader.directory.pages.entries()) {
@@ -425,7 +437,19 @@ export function boundSource(
                   const beforePage = budget.allocated;
                   yield* readValue(reader.load([index]));
                   raw = Math.max(encoded, budget.allocated - beforePage);
+                  if (
+                    !page.largeRegion &&
+                    ["text", "bytes", "json", "array", "enum"].includes(type.kind)
+                  )
+                    valueBytes = Math.max(
+                      valueBytes,
+                      reader.varlenBytes(
+                        page.firstRow,
+                        Math.min(rows, page.firstRow + page.rowCount),
+                      ),
+                    );
                 }
+                if (!page.largeRegion) valueBytes = Math.max(valueBytes, raw);
                 for (let w = first; w <= last; w++) {
                   held[w] = (held[w] ?? 0) + encoded + raw + lane + 1024;
                   encodedBytes[w] = (encodedBytes[w] ?? 0) + encoded;
@@ -435,6 +459,7 @@ export function boundSource(
                     const large = reader.largeValueBytes(from, to);
                     values[w] = (values[w] ?? 0) + large;
                     largestValue = Math.max(largestValue, large);
+                    valueBytes = Math.max(valueBytes, large);
                     io = Math.max(io, Math.min(MAX_READ_BYTES, large));
                   }
                 }
@@ -509,6 +534,7 @@ export function boundSource(
       bytes: maximum,
       io,
       progress: Math.max(65536, 4 * largestValue),
+      valueBytes,
       windowBytes,
       ...retention,
       ...(domain === undefined ? {} : { domain }),

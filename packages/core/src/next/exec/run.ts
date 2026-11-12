@@ -296,15 +296,8 @@ export class QueryRuntime {
   #operatorLiteralBytes = 0;
   readonly #operatorParameterColumns = new Map<number, number>();
   readonly #operatorCopies = new Map<number, number>();
-  readonly #operatorSourceMultiplicity = new Map<number, number>();
-  operatorParameterColumns(
-    id: number,
-    columns: number,
-    copies?: number,
-    sourceMultiplicity = 1,
-  ): void {
+  operatorParameterColumns(id: number, columns: number, copies?: number): void {
     this.#operatorParameterColumns.set(id, columns);
-    this.#operatorSourceMultiplicity.set(id, sourceMultiplicity);
     if (copies !== undefined) this.#operatorCopies.set(id, copies);
   }
   operatorLiteralProgress(bytes: number): void {
@@ -333,27 +326,50 @@ export class QueryRuntime {
       : Math.max(readProgress, largestInput);
     return Math.max(MAX_BLOB_BYTES, savedCopies * this.#savedProgressBytes, copies * current);
   }
-  #operatorStepBytes(rel: OperatorIdentity, inputs: number, largestInput: number): number {
+  #operatorStepBytes(
+    rel: OperatorIdentity,
+    inputs: number,
+    largestInput: number,
+    slots: readonly number[] = [],
+  ): number {
     const copies = this.#operatorCopies.get(rel.id) ?? progressCopies(rel);
+    const columns = this.#columnProgress.get(rel.id)?.(slots, largestInput);
+    if (columns !== undefined && columns !== null)
+      return Math.ceil(
+        Math.max(
+          MAX_BLOB_BYTES,
+          this.#savedProgressBytes,
+          copies * (this.#progressBytes / 4 + columns.row + columns.repeated),
+        ),
+      );
     if (copies === 1) return this.#stepBytes(inputs, largestInput);
     // ReadBound.progress and the aggregate expression/parameter envelope already
     // cover FOUR copies. A raw parameter largestSlot does not. Normalize those
     // units before applying this operator's compound bound, and never multiply
     // a checkpoint's already complete restore/replay envelope again.
-    const columns = this.#operatorParameterColumns.get(rel.id) ?? 1;
+    const variableColumns = this.#operatorParameterColumns.get(rel.id) ?? 1;
     return Math.ceil(
       Math.max(
-        copies * columns * this.#operatorLiteralBytes,
+        copies * variableColumns * this.#operatorLiteralBytes,
         this.#stepBytes(
-          Math.max(inputs, (largestInput * columns) / this.#expressionMultiplicity),
-          largestInput * columns,
+          Math.max(inputs, (largestInput * variableColumns) / this.#expressionMultiplicity),
+          largestInput * variableColumns,
           this.#parameterProgress ? copies / 4 : copies,
-          (this.#parameterProgress ? this.#progressBytes : this.#progressBytes / 4) *
-            (this.#operatorSourceMultiplicity.get(rel.id) ?? 1),
+          this.#parameterProgress ? this.#progressBytes : this.#progressBytes / 4,
           1,
         ),
       ),
     );
+  }
+  readonly #columnProgress = new Map<
+    number,
+    (slots: readonly number[], largest: number) => { row: number; repeated: number } | null
+  >();
+  operatorColumnProgress(
+    id: number,
+    bound: (slots: readonly number[], largest: number) => { row: number; repeated: number } | null,
+  ): void {
+    this.#columnProgress.set(id, bound);
   }
   operatorStep(rel: OperatorIdentity): number {
     return this.#operatorProgress.get(rel.id) ?? 0;
@@ -463,7 +479,12 @@ export class QueryRuntime {
     const atomic = this.#atomicResult !== null;
     const progress = (rel: OperatorIdentity) =>
       atomic
-        ? this.#operatorStepBytes(rel, binding.logicalBytes ?? binding.bytes, binding.largestSlot)
+        ? this.#operatorStepBytes(
+            rel,
+            binding.logicalBytes ?? binding.bytes,
+            binding.largestSlot,
+            binding.slotBytes,
+          )
         : 0;
     // A helper slot explicitly declares bounded variable output, including project/filter
     // wrappers. Fund the base owner and every helper together, also after a phase restore.

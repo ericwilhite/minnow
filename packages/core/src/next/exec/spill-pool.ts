@@ -14,7 +14,7 @@ import type { SpillPageRef } from "../spill/contract.js";
 import type { Grant, Loan } from "../memory/governor.js";
 import type { PhysicalType } from "../types.js";
 import type { ByteCharge } from "../vector/varlen.js";
-import type { Vector } from "../vector/vector.js";
+import type { Vector, FlatVector } from "../vector/vector.js";
 import type { ColumnStore } from "./column-store.js";
 import { SORT_ROW_VIEW_BYTES, sortRowView } from "./sort-row.js";
 import {
@@ -234,6 +234,15 @@ export class SpillIo {
 
   /** Called with each staging chunk before it is encoded as a page (the sort measures pages). */
   onFlush: ((staging: ColumnStore) => void) | null = null;
+  /** Scalar page statistics only; does not disable borrowed oversized-row writes. */
+  onPage:
+    | ((
+        run: SpilledRun,
+        columns: readonly FlatVector[],
+        rows: number,
+        header: { run: number; partition: number },
+      ) => void)
+    | null = null;
 
   /** Room in the pool for one bounded step of `bytes` (see `Pool`). */
   need(bytes: number): Promise<void> {
@@ -331,6 +340,7 @@ export class SpillIo {
     if (staging.rows === 0) return;
     this.onFlush?.(staging);
     const columns = staging.vectors();
+    this.onPage?.(run, columns, staging.rows, header);
     const oversized =
       staging.rows === 1 && PageWriter.encodedBytes(columns, 1) > staging.targetBytes;
     const pageHeader = {
@@ -385,6 +395,7 @@ export class SpillIo {
             const views = vectors
               .slice(0, staging.types.length)
               .map((vector) => sortRowView(vector, row));
+            this.onPage?.(run, views, 1, header);
             const page = this.pages.encode(
               { queryId: this.context.queryId, ...header, sequence: run.pageCount },
               views,

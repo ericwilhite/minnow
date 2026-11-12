@@ -1,3 +1,4 @@
+import { joinKeyPageBytes } from "./join-key-size.js";
 /**
  * The hash join (track B7, increment 1): typed tables, every join kind, residual ON conditions,
  * grace/hybrid spill with recursive repartitioning and chunked heavy hitters, and dynamic join
@@ -119,7 +120,6 @@ import {
   extractKeysJob,
   keyNulls,
   keyStepRows,
-  keyMultiplicity,
   levelHash,
 } from "./join-keys.js";
 import { PageWriter, SpillFiles, SpilledRun, type DecodedPage } from "./spill-pages.js";
@@ -430,8 +430,8 @@ class Shared {
   readonly work = new KeyWork();
   /** Mark joins: scratch for each tested key's compatibility test (index: key position). */
   readonly compat: Array<CompatScratch | undefined> = [];
-  readonly buildKeyMultiplicity: number;
-  readonly probeKeyMultiplicity: number;
+  /** Largest encoded key page in each live run; scalar metadata, never row payload. */
+  readonly keyPages = new WeakMap<SpilledRun, number>();
 
   constructor(
     readonly spec: HashJoinSpec,
@@ -444,10 +444,6 @@ class Shared {
     const checked = checkJoinSpec(spec);
     this.correlated = checked.correlated;
     this.layout = checked.layout;
-    this.buildKeyMultiplicity =
-      this.layout.family === "enc" ? keyMultiplicity(spec.buildKeys, spec.buildTypes) : 1;
-    this.probeKeyMultiplicity =
-      this.layout.family === "enc" ? keyMultiplicity(spec.probeKeys, spec.probeTypes) : 1;
     this.conditioned = spec.residual !== null || (spec.filter ?? null) !== null;
     this.charge = new Charge(context.grant);
     if (!this.charge.allocate(SCRATCH_BYTES))
@@ -465,6 +461,8 @@ class Shared {
       },
       () => this.pace(),
     );
+    this.io.onPage = (run, columns, rows, header) =>
+      this.keyPage(run, columns, rows, (header.run & 0x1000) !== 0 ? "probe" : "build");
     this.scratch = new KeyScratch(this.layout, BATCH_ROWS, this.charge, this.pool);
     if (spec.kind === "mark")
       for (let i = this.correlated; i < this.layout.types.length; i++) {
@@ -591,6 +589,25 @@ class Shared {
     types: readonly PhysicalType[],
   ): Promise<DecodedPage> {
     return this.io.decode(page, types);
+  }
+
+  keyPage(
+    run: SpilledRun,
+    columns: readonly Vector[],
+    rows: number,
+    side: "build" | "probe",
+  ): void {
+    const positions = side === "build" ? this.spec.buildKeys : this.spec.probeKeys;
+    if (this.layout.family !== "enc") return;
+    const bytes = joinKeyPageBytes(
+      positions.map((c) => {
+        const column = columnOf(columns, c);
+        if (column.form !== "flat") throw new Error("Spill key statistics require flat columns");
+        return column;
+      }),
+      rows,
+    );
+    this.keyPages.set(run, Math.max(this.keyPages.get(run) ?? 0, bytes));
   }
 
   async flush(
@@ -747,6 +764,7 @@ class Level {
         if (side === "probe" && parts.resident[p] === true) return false;
         const run = side === "build" ? parts.build[p] : parts.probe[p];
         if (run === undefined) return false;
+        shared.keyPage(run, columns, rows, side);
         await shared.files.append(run, bytes, rows);
         shared.profile.spilledBytes = shared.files.written;
         shared.profile.forwardedPages++;
@@ -2141,7 +2159,12 @@ export class HashJoin {
       const types = matches
         ? [...this.spec.buildTypes, { kind: "bool" } as PhysicalType]
         : this.spec.buildTypes;
-      const build = new RecordCheckpoint(shared.io, shared.context.spill, types);
+      const build = new RecordCheckpoint(
+        shared.io,
+        shared.context.spill,
+        types,
+        this.spec.buildKeys,
+      );
       let probe: RecordCheckpoint | null = null;
       try {
         await level.flushStaging("build");
@@ -2193,7 +2216,12 @@ export class HashJoin {
             if (run && !parts.resident[p]) await copy(run, build, "build");
           }
         await build.seal();
-        probe = new RecordCheckpoint(shared.io, shared.context.spill, this.spec.probeTypes);
+        probe = new RecordCheckpoint(
+          shared.io,
+          shared.context.spill,
+          this.spec.probeTypes,
+          this.spec.probeKeys,
+        );
         if (parts)
           for (let p = 0; p < parts.fanout; p++) {
             const run = parts.probe[p];
@@ -2202,14 +2230,7 @@ export class HashJoin {
         await probe.seal();
         shared.checkAborted();
         this.#checkpointed = true;
-        return new JoinCheckpoint(
-          build,
-          probe,
-          this.#built,
-          matches,
-          { ...this.profile },
-          Math.max(shared.buildKeyMultiplicity, shared.probeKeyMultiplicity),
-        );
+        return new JoinCheckpoint(build, probe, this.#built, matches, { ...this.profile });
       } catch (error) {
         await Promise.allSettled([build.close(), probe?.close()]);
         throw error;
@@ -2556,7 +2577,7 @@ export class HashJoin {
         if (paced !== null) await paced;
         const ref = build.pages[i];
         if (!ref) throw new Error("Missing build spill page");
-        await shared.need((2 + shared.buildKeyMultiplicity) * ref.length + 64 * 1024);
+        await shared.need(2 * ref.length + (shared.keyPages.get(build) ?? 0) + 64 * 1024);
         const page = await shared.readPage(build, i);
         try {
           const { rows, columns } = await shared.decode(page, shared.buildTypes);
@@ -2589,7 +2610,7 @@ export class HashJoin {
       const ref = probe.pages[i];
       if (!ref) throw new Error("Missing probe spill page");
       await shared.need(
-        ((chunk === null ? 2 : 1) + shared.probeKeyMultiplicity) * ref.length + 64 * 1024,
+        (chunk === null ? 2 : 1) * ref.length + (shared.keyPages.get(probe) ?? 0) + 64 * 1024,
       );
       const page = await shared.readPage(probe, i);
       try {
@@ -2657,9 +2678,9 @@ export class HashJoin {
         shared.profile.chunkPasses++;
         // A chunk fills the pool's idle room but leaves the replay's steps theirs: one page in
         // flight and the output chunks' growth.
-        const probeStep = (1 + shared.probeKeyMultiplicity) * probePage;
-        const keep =
-          2 * POOL_PAGE_BYTES + shared.probeKeyMultiplicity * probePage + 3 * STAGING_TARGET_BYTES;
+        const keyPage = shared.keyPages.get(probe) ?? 0;
+        const probeStep = probePage + keyPage;
+        const keep = 2 * POOL_PAGE_BYTES + Math.max(probePage, keyPage) + 3 * STAGING_TARGET_BYTES;
         // Only a reserved single-row load may use replay headroom temporarily.
         let loadingFirst = false;
         const chunkCharge: ByteCharge = {
@@ -2692,14 +2713,14 @@ export class HashJoin {
                 // overlap the build row/table, but not each other.
                 const encodedKey =
                   shared.layout.family === "enc"
-                    ? PageWriter.encodedBytes(
+                    ? joinKeyPageBytes(
                         shared.spec.buildKeys.map((c) => columnOf(columns, c)),
                         rows,
                       )
                     : 0;
                 const encodedGroup =
                   groupLayout?.family === "enc"
-                    ? PageWriter.encodedBytes(
+                    ? joinKeyPageBytes(
                         shared.spec.buildKeys
                           .slice(0, shared.correlated)
                           .map((c) => columnOf(columns, c)),
@@ -2742,14 +2763,14 @@ export class HashJoin {
               shared.resetKeys();
               const key =
                 shared.layout.family === "enc"
-                  ? PageWriter.encodedBytes(
+                  ? joinKeyPageBytes(
                       shared.spec.buildKeys.map((c) => sub.store.chunk(c, 0)),
                       1,
                     )
                   : 0;
               const groupKey =
                 groupLayout?.family === "enc"
-                  ? PageWriter.encodedBytes(
+                  ? joinKeyPageBytes(
                       shared.spec.buildKeys
                         .slice(0, shared.correlated)
                         .map((c) => sub.store.chunk(c, 0)),

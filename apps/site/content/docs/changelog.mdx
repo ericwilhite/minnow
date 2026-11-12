@@ -13,7 +13,9 @@ compatibility policy and release process.
 The unexported rebuild now reserves complete EXCEPT and hash-join progress steps before
 borrowing. Large keys, representative rows and spill pages no longer ask for a second loan
 while retaining the first under competing memory pressure. Key bounds count repeated join-key
-positions, including chunk replay and saved continuations. Wide spill rows borrow their input
+positions, including partition forwarding, chunk replay and saved continuations. Key bounds
+follow individual columns and parameter slots, so tiny repeated keys do not multiply unrelated
+payload bytes or cause a false over-cap refusal. Wide spill rows borrow their input
 payload, and single-row joins borrow build outputs. Shipped SQL behavior, public APIs and stored
 formats are unchanged; no migration is needed.
 

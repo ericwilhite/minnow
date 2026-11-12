@@ -408,6 +408,8 @@ buffers close; dead key encodings retire before staging/output. Competing-grant 
 compare native and lowered SQL with PGlite, including collision fallback and every join kind.
 Repeated key indexes, asymmetric duplicate predicates and encoded MARK correlation prefixes
 carry their complete key-position bounds through chunk load, table build, replay and restore.
+These bounds follow the selected key columns, not unrelated payloads. Spill-page and saved
+key statistics cover distinct-key partition forwarding as well as collision/chunk fallback.
 The independent result-sink width bound for two large parameter-derived join outputs remains
 an admission-owner limitation (B6-join-result-admission handoff); it is not masked by a new
 set/join refusal. The operator/tape resident-state proof excludes backend implementation costs; shared scratch
