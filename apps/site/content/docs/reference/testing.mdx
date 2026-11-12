@@ -2162,3 +2162,19 @@ The owner allocates one fixed 64-byte allowance for the single active plan, reta
 success, failure and cancellation and released on close. The plan borrows its row selection
 without another copy. The check covers one and several admission chunks and proves the allowance
 is allocated during the wait, rather than inferring it from a zero balance after close.
+
+Query-local chunk preparation is checked by `next/testing/chunk-facts.test.ts` and
+`next/page/query-directory.test.ts`. Generated inline scans count actual directory parses and
+active reader opens across admission and execution, compare NULL-bearing output with source
+values, and cancel a blocked pre-admission read. Independent fresh uncached readers provide
+reference bounds for dictionary, gzip and values over 64 KiB across multiple groups, changed
+prefixes, partial and empty selections. The ownership law covers precharge, full references,
+context revalidation, Buffer-backed source reuse, pressure, eviction, one-pass refusal and late
+completion after close. Every history drains governor charges.
+
+`scripts/query-chunk-component.mts` isolates two directory passes over 163 independent groups
+and three selected columns. It includes query-cache registration, handoff and disposal, and
+checks complete canonical directory bytes and unchanged native sizing charges outside timing.
+Use the same frozen runtimes, fixed two-core affinity, nine fresh-process AB/BA pairs and
+matching A/A controls as the root benchmark above. No payload decode or transport is timed in
+this component; the real executor whole-query benchmark remains the acceptance check.

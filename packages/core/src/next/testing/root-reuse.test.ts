@@ -80,7 +80,8 @@ it.each(seedsFor("next-query-root-reuse", [0xb2e1, 0xb2e2]))(
             await Promise.allSettled([run.execution.executed, run.execution.delivered]);
             run.release();
             reach.reach("cancel after output");
-            expect(registrations.length).toBe(3);
+            // Three queries each register roots and directory facts.
+            expect(registrations.length).toBe(6);
             expect(registrations.every((entry) => entry.closed)).toBe(true);
             expect(registrations.every((entry) => entry.cache.evictableBytes === 0)).toBe(true);
             registry.mockRestore();

@@ -3951,6 +3951,7 @@ export const QUERY_ROOT_VM_REACH = [
   "all workers drained",
   "complete decode in both arms",
   "owner cache in both arms",
+  "chunk preparation in both control arms",
 ] as const;
 
 export const QUERY_ROOT_VOLUME_REACH = [
@@ -4363,4 +4364,37 @@ export const ROOT_PACKING_REACH = [
   "selection before complete",
   "fresh selected extent graphs",
   "canonical bytes and zero charges",
+] as const;
+
+export const QUERY_CHUNK_FACTS_REACH = [
+  "one active inline reader per chunk",
+  "one directory parse per query",
+  "fresh query owns its directory facts",
+  "selected columns and multiple batches",
+  "NULL and exact source values",
+  "cancel before admission drains facts",
+  "zero charges after query and owner close",
+] as const;
+
+export const PREPARED_BOUND_REACH = [
+  "fresh uncached reference",
+  "complete bounds unchanged",
+  "multiple groups and changed prefixes",
+  "empty selection",
+  "selected column subset",
+  "zero charges",
+] as const;
+
+export const QUERY_DIRECTORY_REACH = [
+  "full cache graph prepaid before parse",
+  "active directory survives eviction",
+  "source reuse cannot mutate metadata",
+  "synchronous validated hit",
+  "full directory reference identity",
+  "type and data bounds rechecked",
+  "refusal keeps original native minimum",
+  "idle facts evict",
+  "explicit once does not admit directory facts",
+  "late completion cannot retain after close",
+  "zero charges",
 ] as const;

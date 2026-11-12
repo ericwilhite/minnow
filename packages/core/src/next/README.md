@@ -3438,3 +3438,15 @@ scans materialize only their selected metadata. Complete-root readers still see 
 Pressure falls back to the ordinary decoder; non-retaining export does not populate or promote
 this cache. The stored format and execution minima are unchanged. Ownership, cancellation and
 fresh-process comparisons are documented in the docs site's testing reference.
+
+Ordinary query admission also prepares immutable chunk directories for its selected columns.
+Inline sizing reads their validated facts without constructing an active chunk reader; execution
+opens one reader from those same facts. A query-local, governor-registered cache owns the
+directories between sizing and execution, charged before parsing at the complete encoded-size
+parse bound. Idle entries are evictable. Optional retention refusal keeps the original native
+read minimum and falls back to ordinary parsing. Dictionary, gzip and large-value sizing still
+creates a short-lived reader when their complete header proofs require it. No reader, sizing
+grant, visibility result or snapshot hint survives in the cache. Cancellation drains outstanding
+reads, releases preparations, and clears/unregisters the query cache; late completions cannot
+retain entries. Explicit one-pass reads never admit new directory facts. Source statistics and
+sketch bytes are copied into owned arrays, including when encoded input is a Node Buffer.

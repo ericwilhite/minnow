@@ -18,6 +18,7 @@ import {
 import type { Held } from "../format/reachable.js";
 import type { MemoryGovernor } from "../memory/governor.js";
 import type { BlobRef, ByteBudget, ExtentReader } from "../storage/extents.js";
+import { QueryDirectoryCache, withQueryDirectories } from "./directory-cache.js";
 
 export interface RootColumns {
   readonly tableId: number;
@@ -55,6 +56,8 @@ export class QueryRoots {
   }
   readonly roots: BlobCache<ScanRootFacts>;
   readonly #unregister: (() => void) | undefined;
+  readonly #unregisterDirectories: (() => void) | undefined;
+  readonly directories: QueryDirectoryCache;
   #closed = false;
   constructor(
     governor: MemoryGovernor,
@@ -72,6 +75,25 @@ export class QueryRoots {
         `${String((ref as RootKey)[TABLE])}:${String(ref.extent.offset)}:${String(ref.extent.length)}:${String(ref.offset)}:${String(ref.length)}:${String(ref.checksum)}`,
     );
     this.#unregister = unregister;
+    let unregisterDirectories: (() => void) | undefined;
+    try {
+      this.directories = new QueryDirectoryCache((cache) => {
+        const memory = governor.registerCache(cache);
+        unregisterDirectories = memory.unregister?.bind(memory);
+        return {
+          charge: (bytes) => !this.#closed && memory.charge(bytes),
+          release: (bytes) => memory.release(bytes),
+        };
+      });
+    } catch (error) {
+      this.roots.clear();
+      this.#unregister?.();
+      throw error;
+    }
+    this.#unregisterDirectories = unregisterDirectories;
+  }
+  reader(pages: ExtentReader): ExtentReader {
+    return this.#closed ? pages : withQueryDirectories(pages, this.directories);
   }
   /** Optional construction workspace, never part of the returned execution minimum. */
   sizingBytes(length: number): number {
@@ -170,6 +192,8 @@ export class QueryRoots {
     if (this.#closed) return;
     this.#closed = true;
     this.roots.clear();
+    this.directories.clear();
+    this.#unregisterDirectories?.();
     this.#unregister?.();
   }
 }

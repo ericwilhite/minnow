@@ -97,6 +97,8 @@ import { check, chunkTagOf, PageCorruptionError, ValueTag } from "./format.js";
 import { inflatedLength, inflateInto } from "./gzip.js";
 import type { InflatedPageCache } from "./inflated-cache.js";
 import type { BlobCache } from "../format/blob-cache.js";
+import { optionalParseAllocation, parseCharge } from "../format/manifest-codec.js";
+import { QueryDirectoryCache, queryDirectories } from "./directory-cache.js";
 
 export { MAX_BLOB_BYTES, MAX_READ_BYTES };
 
@@ -368,6 +370,16 @@ interface Stream {
   page: SharedLease | null;
 }
 
+/** A prepaid directory fact. reader() creates mutable payload state only when needed.
+ * release() closes that reader, or returns the metadata hold if no reader was made. */
+export interface PreparedChunk {
+  readonly directory: ChunkDirectory;
+  /** Ordinary native-reader charge, independent of optional cache representation. */
+  readonly nativeBytes: number;
+  reader(): ChunkReader;
+  release(): void;
+}
+
 export class ChunkReader {
   readonly chunk: ColumnChunk;
   readonly directory: ChunkDirectory;
@@ -376,7 +388,7 @@ export class ChunkReader {
   readonly #pages: Array<PageView | undefined>;
   readonly #held: Array<Held | undefined>;
   readonly #pending = new Map<number, Promise<void>>();
-  readonly #directoryCharge: number;
+  readonly #releaseDirectory: () => void;
   readonly #int128: boolean;
   readonly #facts = {
     valid: false,
@@ -395,8 +407,6 @@ export class ChunkReader {
     this.#facts.bytesFrom = -1;
   }
 
-  /** The directory cache entry this reader pins, or null. */
-  readonly #directoryPin: BlobRef | null;
   #dictionaryPending: Promise<void> | null = null;
   #dictionary: PageDictionary | null = null;
   #dictionaryHeld: Held | null = null;
@@ -429,15 +439,13 @@ export class ChunkReader {
     chunk: ColumnChunk,
     directory: ChunkDirectory,
     options: ChunkReadOptions,
-    directoryBytes: number,
-    directoryPin: BlobRef | null,
+    releaseDirectory: () => void,
   ) {
     this.#space = space;
     this.#options = options;
     this.chunk = chunk;
     this.directory = directory;
-    this.#directoryCharge = directoryBytes;
-    this.#directoryPin = directoryPin;
+    this.#releaseDirectory = releaseDirectory;
     const { min, max } = chunk.statistics;
     this.#int128 =
       directory.tag === ValueTag.dec64 &&
@@ -457,52 +465,106 @@ export class ChunkReader {
     chunk: ColumnChunk,
     options: ChunkReadOptions,
   ): MaybePromise<ChunkReader> {
+    const prepared = ChunkReader.prepare(space, chunk, options);
+    const open = (facts: PreparedChunk) => {
+      try {
+        return facts.reader();
+      } catch (error) {
+        facts.release();
+        throw error;
+      }
+    };
+    return prepared instanceof Promise ? prepared.then(open) : open(prepared);
+  }
+
+  /** Validate once into query facts without constructing an active reader for directory-only sizing.
+   * Optional query retention uses a full encoded-size parse bound. Refusal falls back to the
+   * ordinary native charge; a larger optional entry never raises an execution minimum. */
+  static prepare(
+    space: ExtentReader,
+    chunk: ColumnChunk,
+    options: ChunkReadOptions,
+  ): MaybePromise<PreparedChunk> {
     const ref = chunk.directory;
-    const cache = options.directories;
-    // A one-pass reader's pin leaves the directory's eviction order alone (review B2-p2h #2).
+    let cache: BlobCache<ChunkDirectory> | undefined =
+      options.directories ?? queryDirectories(space);
+    const query = cache instanceof QueryDirectoryCache;
     const pinning = options.once === true ? PEEK_ONCE : undefined;
+    const make = (
+      directory: ChunkDirectory,
+      bytes: number,
+      owner?: BlobCache<ChunkDirectory>,
+      once?: { readonly once: true },
+    ): PreparedChunk => {
+      let released = false,
+        reader: ChunkReader | null = null;
+      const free = () => {
+        if (released) return;
+        released = true;
+        options.budget.free(bytes);
+        owner?.unpin(ref, once);
+      };
+      return {
+        directory,
+        nativeBytes: directoryCharge(directory) + DECODE_MEMO_BYTES,
+        reader() {
+          if (released) throw new ReaderClosedError();
+          return (reader ??= new ChunkReader(space, chunk, directory, options, free));
+        },
+        release() {
+          if (reader === null) free();
+          else reader.close();
+        },
+      };
+    };
     const hit = cache?.pin(ref, pinning) ?? null;
     if (cache !== undefined && hit !== null) {
-      // Cached and parsed already: charged to this reader while it holds it, unpinned at close.
       try {
         check(
           hit.value.tag === chunkTagOf(chunk.type),
           "Page directory tag differs from the column type",
         );
-        // The entry was parsed for whichever chunk read it first (review B2-p2a #1).
         checkDirectoryWithin(hit.value, chunk.data.length);
       } catch (error) {
         cache.unpin(ref, pinning);
         throw error;
       }
-      if (!options.budget.allocate(hit.size + DECODE_MEMO_BYTES)) {
-        cache.unpin(ref, pinning);
-        throw new PageBudgetError(hit.size + DECODE_MEMO_BYTES);
-      }
-      return new ChunkReader(space, chunk, hit.value, options, hit.size + DECODE_MEMO_BYTES, ref);
+      const bytes = hit.size + DECODE_MEMO_BYTES;
+      const funded = query
+        ? optionalParseAllocation(options.budget, bytes)
+        : options.budget.allocate(bytes);
+      if (funded) return make(hit.value, bytes, cache, pinning);
+      cache.unpin(ref, pinning);
+      if (!query) throw new PageBudgetError(bytes);
+      cache = undefined;
     }
-    const build = (bytes: Uint8Array): ChunkReader => {
-      // Charged from the header's page count before the parse builds anything (B2-2 #4).
-      const charge = directoryChargeOf(sized(bytes, ref.length));
-      if (!options.budget.allocate(charge + DECODE_MEMO_BYTES))
-        throw new PageBudgetError(charge + DECODE_MEMO_BYTES);
-      let directory: ChunkDirectory;
+    const build = (bytes: Uint8Array): PreparedChunk => {
+      const native = directoryChargeOf(sized(bytes, ref.length));
+      if (!options.budget.allocate(native + DECODE_MEMO_BYTES))
+        throw new PageBudgetError(native + DECODE_MEMO_BYTES);
+      let charge = native;
+      // Full parse credit also covers owned sketch/bound bytes and the bounded cache wrapper.
+      const optional =
+        cache instanceof QueryDirectoryCache ? Math.max(native, parseCharge(ref.length)) : native;
+      const retainAllowed = cache !== undefined && options.once !== true;
+      let retain = retainAllowed;
+      if (retain && optional > native) {
+        if (optionalParseAllocation(options.budget, optional - native)) charge = optional;
+        else retain = false;
+      }
       try {
-        directory = parseDirectory(bytes, chunk.data.length);
+        const directory = parseDirectory(bytes, chunk.data.length);
         check(
           directory.tag === chunkTagOf(chunk.type),
           "Page directory tag differs from the column type",
         );
+        if (!retain || cache === undefined) return make(directory, charge + DECODE_MEMO_BYTES);
+        const shared = cache.admit(ref, directory, charge);
+        return make(shared, charge + DECODE_MEMO_BYTES, cache);
       } catch (error) {
         options.budget.free(charge + DECODE_MEMO_BYTES);
         throw error;
       }
-      // A one-pass scan uses cached directories but keeps none it parsed (`options.once`).
-      if (cache === undefined || options.once === true)
-        return new ChunkReader(space, chunk, directory, options, charge + DECODE_MEMO_BYTES, null);
-      // Pinned for this reader; another reader's earlier entry wins a race (same bytes, same charge).
-      const shared = cache.admit(ref, directory, charge);
-      return new ChunkReader(space, chunk, shared, options, charge + DECODE_MEMO_BYTES, ref);
     };
     const cached = options.once === true ? space.peek(ref, PEEK_ONCE) : space.peek(ref);
     if (cached !== null) return build(cached);
@@ -1272,9 +1334,7 @@ export class ChunkReader {
     this.#dictionaryHeld = null;
     this.#dictionary = null;
     this.#dictionaryVector = null;
-    this.#options.budget.free(this.#directoryCharge);
-    if (this.#directoryPin !== null)
-      this.#options.directories?.unpin(this.#directoryPin, this.#pinning);
+    this.#releaseDirectory();
   }
 
   // ── Predicates on encoded pages (predicate.ts, select.ts) ─────────────────────────────

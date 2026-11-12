@@ -260,9 +260,11 @@ export class QueryRuntime {
     this.#savedProgressBytes = savedProgress;
   }
   readPages(pages: Snapshot["pages"]): Snapshot["pages"] {
-    return this.#readBytes === 0
-      ? pages
-      : (this.#readStep?.reader(pages, this.#nonRetainingReads) ?? pages);
+    const reader =
+      this.#readBytes === 0
+        ? pages
+        : (this.#readStep?.reader(pages, this.#nonRetainingReads) ?? pages);
+    return this.metadataCaches(!this.#nonRetainingReads)?.reader(reader) ?? reader;
   }
   readBoundary(): void {
     this.#readStep?.beforeDownstream();
