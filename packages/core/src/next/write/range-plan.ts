@@ -2,6 +2,7 @@
 import type { IndexRangePlan, KeyRange } from "../access/key-index.js";
 import { MAX_BLOB_BYTES } from "../access/space.js";
 import { StreamingRangeCursor } from "./range-cursor.js";
+import { runKeyBytes } from "./overflow-keys.js";
 import { rangeRunBytes } from "./range-input.js";
 import type { ViewIndex } from "./view.js";
 
@@ -30,10 +31,16 @@ export function planIndexRange(
     keyBytes = Math.max(keyBytes, delta?.maxKeyBytes ?? 0);
     const slots = 1 + Math.max(1, memtable.staged?.runs.get(id)?.length ?? 0);
     resident += slots * (512 + 4096 + 512);
+    for (const run of memtable.staged?.runs.get(id) ?? []) {
+      keyBytes = Math.max(keyBytes, runKeyBytes(run));
+      // slots already paid a legacy block; reserve each overflow workspace as well.
+      resident += Math.max(0, rangeRunBytes(run, sign) - 4608);
+    }
     io = true;
   }
   for (const run of table.tableView.runs.get(id) ?? []) {
     resident += 512 + rangeRunBytes(run, sign);
+    keyBytes = Math.max(keyBytes, runKeyBytes(run));
     io = true;
   }
   resident += keyBytes * 2;

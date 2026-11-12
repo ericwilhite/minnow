@@ -1,11 +1,14 @@
 /** Scalar cursor positions over shared, governed navigation indexes. Stored bytes are unchanged. */
+import { OverflowKeys } from "./overflow-keys.js";
+import { ByteReader as KeyReader } from "../format/bytes.js";
+import { readKeyPointer } from "../format/key-pointer.js";
 import type { MaybePromise, KeyRange } from "../access/key-index.js";
 import type { SpaceReader } from "../access/space.js";
 import type { BlobRef, RunRef } from "../format/manifest.js";
 import type { ByteBudget } from "../access/space.js";
 import { taskClock, yieldTask } from "../exec/pipeline.js";
 import { StoreCorruptionError } from "../storage/contract.js";
-import { ByteReader } from "./bytes.js";
+import { ByteReader, need } from "./bytes.js";
 import { rangeSide } from "./range-bound.js";
 import {
   runNavigation,
@@ -32,9 +35,66 @@ export class RangeDirectory {
     readonly range: KeyRange,
     readonly direction: number,
     readonly signal: AbortSignal,
+    readonly keys: OverflowKeys | null = null,
   ) {}
   open(): MaybePromise<void> {
+    if (this.keys !== null) return this.#openOverflow();
     return runNavigation(this.#open());
+  }
+  async #openOverflow(): Promise<void> {
+    const keys = need(this.keys);
+    const count = await withRawDirectory(
+      this.space,
+      this.ref.entries,
+      this.budget,
+      this.signal,
+      (bytes) => new ByteReader(bytes).varuint(),
+    );
+    this.#count = count;
+    if (count === 0) return;
+    const bound = this.direction > 0 ? this.range.lower : this.range.upper;
+    let low = 0,
+      high = count;
+    if (bound !== null) {
+      while (low < high) {
+        const mid = Math.floor((low + high) / 2);
+        // Copy only one bounded descriptor while the fence lease is held. Resolve its
+        // payload AFTER withDirectory returns and releases that lease.
+        const pointer = await withDirectory(
+          this.space,
+          this.ref.fences,
+          "overflow-fences",
+          this.budget,
+          this.signal,
+          function* (
+            this: RangeDirectory,
+            bytes: Uint8Array,
+            positions: Uint32Array | null,
+            actual: number,
+            start: number,
+          ) {
+            if (actual !== count) throw new StoreCorruptionError("Run fence count differs");
+            const r = new ByteReader(bytes, positions === null ? start : positions[mid]);
+            if (positions === null)
+              for (let k = 0; k < mid; k++) {
+                if ((k & 127) === 0) {
+                  this.signal.throwIfAborted();
+                  if (taskClock.due()) yield yieldTask();
+                }
+                skipDirectoryRecord(r, "overflow-fences");
+              }
+            return readKeyPointer(new KeyReader(bytes.subarray(r.offset)), this.ref.fences.offset);
+          }.bind(this),
+        );
+        const full = await keys.resolve(pointer);
+        const side = rangeSide(this.range, full);
+        if (this.direction > 0 ? side < 0 : side <= 0) low = mid + 1;
+        else high = mid;
+      }
+      this.#block = this.direction > 0 ? Math.max(0, low - 1) : low - 1;
+      if (this.#block < 0) return;
+    } else this.#block = this.direction > 0 ? 0 : count - 1;
+    await this.#at(this.#block, true);
   }
   *#open(): Generator<Promise<unknown>, void, unknown> {
     this.signal.throwIfAborted();

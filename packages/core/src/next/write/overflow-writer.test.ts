@@ -5,7 +5,6 @@ import { seedsFor } from "../../testing/seeds.js";
 import { createReach, OVERFLOW_WRITER_STATES } from "../../testing/reach.js";
 import { UnsupportedEncodingError } from "../format/encoding.js";
 import { encodeManifestRoot } from "../format/manifest-codec.js";
-import type { SpaceReader } from "../access/space.js";
 import { ByteReader as MetaReader } from "../format/bytes.js";
 import {
   readKeyPointer,
@@ -21,14 +20,7 @@ import type { ByteBudget } from "../access/space.js";
 import { OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
 import { KeyDelta, type DeltaVisitor } from "./key-hash.js";
 import { ByteReader, MemtableMemoryError } from "./bytes.js";
-import {
-  RunEncoder,
-  RunBuilder,
-  RunReader,
-  runRef,
-  RUN_BUFFER_OVERHEAD,
-  type RunSummary,
-} from "./runs.js";
+import { RunEncoder, RunBuilder, runRef, RUN_BUFFER_OVERHEAD, type RunSummary } from "./runs.js";
 
 const NativeBytes = Uint8Array;
 const reach = createReach("overflow writer", OVERFLOW_WRITER_STATES);
@@ -219,14 +211,6 @@ function encode(
       const stored = runRef(summary, refs);
       expect(stored.encoding).toBe(2);
       expect(stored.keyStorage).toBe(storage);
-      const unready = {
-        peek() {
-          throw new Error("reader touched storage before encoding guard");
-        },
-      } as unknown as SpaceReader;
-      expect(() => RunReader.open(unready, stored, budget, budget)).toThrow(
-        UnsupportedEncodingError,
-      );
       const blob = refs[0];
       if (!blob) throw new Error("missing fixture blob");
       expect(() =>

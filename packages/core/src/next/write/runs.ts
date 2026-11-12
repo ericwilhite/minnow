@@ -40,6 +40,11 @@
  * drops the tombstones left (no older put can exist below it).
  */
 import { RUN_CODEC, requireHeader, requireBits } from "../durable-format.js";
+
+import { overflowKeyBytes } from "./overflow-keys.js";
+import { RunRangeInput, rangeRunBytes } from "./range-input.js";
+import { ByteReader as KeyReader } from "../format/bytes.js";
+import { readKeyPointer } from "../format/key-pointer.js";
 import { readRunEncoding, requireEncoding, type RunEncoding } from "../format/encoding.js";
 import {
   KEY_DIRECTORY_MAGIC,
@@ -52,7 +57,7 @@ import type { BlobRef, RunRef } from "../format/manifest.js";
 import type { SingleEntries } from "./key-hash.js";
 import { hashKey } from "./key-hashes.js";
 import { xxHash32 } from "../hash/xxhash32.js";
-import { ParseBudgetError } from "../format/manifest-codec.js";
+import { ParseBudgetError, parseCharge } from "../format/manifest-codec.js";
 import { StoreCorruptionError } from "../storage/contract.js";
 import type { ByteBudget, SpaceReader } from "../access/space.js";
 import { compareBytes } from "../vector/varlen.js";
@@ -1079,8 +1084,10 @@ function parseBloom(bytes: Uint8Array): Bloom {
   return { bits, hashes: bytes[4] ?? 0, array: bytes.slice(5) };
 }
 
-function readRefs(reader: ByteReader, extent: BlobRef["extent"]): BlobRef[] {
+function readRefs(reader: ByteReader, extent: BlobRef["extent"], maximum = Infinity): BlobRef[] {
   const count = reader.varuint();
+  if (count > maximum || count > Math.floor((reader.bytes.length - reader.offset) / 6))
+    throw new StoreCorruptionError("Run reference count exceeds its admitted bound");
   return Array.from({ length: count }, () => ({
     extent,
     offset: reader.varuint(),
@@ -1133,10 +1140,16 @@ export class RunReader {
   ) {
     const fenceReader = new ByteReader(fences);
     const fenceCount = fenceReader.varuint();
-    this.#firstKeys = Array.from({ length: fenceCount }, () => fenceReader.blob().slice());
+    if ((ref.encoding ?? 1) === 2) {
+      // Validate bounded descriptors only; never expand resident full-key fence arrays.
+      this.#firstKeys = [];
+      const r = new KeyReader(fences.subarray(fenceReader.offset));
+      for (let k = 0; k < fenceCount; k++) readKeyPointer(r, ref.fences.offset);
+      fenceReader.offset += r.at;
+    } else this.#firstKeys = Array.from({ length: fenceCount }, () => fenceReader.blob().slice());
     fenceReader.end();
     const indexReader = new ByteReader(index);
-    this.#blocks = readRefs(indexReader, ref.entries.extent);
+    this.#blocks = readRefs(indexReader, ref.entries.extent, ref.entryCount);
     indexReader.end();
     if (this.#blocks.length !== fenceCount)
       throw new StoreCorruptionError("A run's fences and blocks differ");
@@ -1165,7 +1178,15 @@ export class RunReader {
       ref.fences.length +
       blocks * (48 + 64) +
       Math.ceil((ref.entryCount * BLOOM_BITS_PER_KEY) / 8) +
-      13 * Math.ceil(blocks / PARTITION_BLOCKS)
+      13 * Math.ceil(blocks / PARTITION_BLOCKS) +
+      ((ref.encoding ?? 1) === 2
+        ? ref.fences.length +
+          ref.entries.length +
+          ref.bloom.length +
+          Math.ceil((ref.entryCount * BLOOM_BITS_PER_KEY) / 8) +
+          13 * Math.ceil(blocks / PARTITION_BLOCKS) +
+          parseCharge(2112)
+        : 0)
     );
   }
 
@@ -1185,12 +1206,15 @@ export class RunReader {
     charge: ByteBudget,
   ): RunReader {
     const bytes = RunReader.residentCharge(fences, blooms);
-    if (!charge.allocate(bytes)) throw new ParseBudgetError(bytes);
+    const scratch = (ref.encoding ?? 1) === 2 ? parseCharge(2112) : 0;
+    if (!charge.allocate(bytes + scratch)) throw new ParseBudgetError(bytes + scratch);
     try {
       return new RunReader(ref, fences, index, partitionBlocks, blooms, bytes);
     } catch (error) {
       charge.free(bytes);
       throw error;
+    } finally {
+      if (scratch > 0) charge.free(scratch);
     }
   }
 
@@ -1205,7 +1229,11 @@ export class RunReader {
     budget: ByteBudget,
     charge: ByteBudget,
   ): MaybePromise<RunReader> {
-    requireEncoding("run reader", ref.encoding ?? 1, [1]);
+    requireEncoding("run reader", ref.encoding ?? 1, [1, 2]);
+    if ((ref.encoding ?? 1) === 2) {
+      overflowKeyBytes(ref);
+      return RunReader.#openOverflow(space, ref, budget, charge);
+    }
     const fences = space.peek(ref.fences);
     const index = space.peek(ref.entries);
     const directory = space.peek(ref.bloom);
@@ -1234,12 +1262,56 @@ export class RunReader {
     })();
   }
 
+  /** Encoding 2 pays raw-copy/resident/codec overlap before reading or constructing arrays. */
+  static async #openOverflow(
+    space: SpaceReader,
+    ref: RunRef,
+    budget: ByteBudget,
+    charge: ByteBudget,
+  ): Promise<RunReader> {
+    const bound = RunReader.residentBound(ref);
+    if (!charge.allocate(bound)) throw new ParseBudgetError(bound);
+    let retained = 0;
+    try {
+      const [fences, index, directory] = await readAll(
+        space,
+        [ref.fences, ref.entries, ref.bloom],
+        budget,
+      );
+      const blockCount = new ByteReader(need(index)).varuint();
+      if (
+        blockCount < 1 ||
+        blockCount > ref.entryCount ||
+        blockCount !== new ByteReader(need(fences)).varuint()
+      )
+        throw new StoreCorruptionError("Run block count differs from its entries or fences");
+      const { partitionBlocks, refs } = RunReader.#directory(ref, need(directory));
+      let bloomBytes = 0;
+      for (const part of refs) bloomBytes += part.length;
+      const blocks = Math.min(ref.entryCount, Math.floor((ref.entries.length - 1) / 6));
+      if (
+        bloomBytes >
+        Math.ceil((ref.entryCount * BLOOM_BITS_PER_KEY) / 8) +
+          13 * Math.ceil(blocks / PARTITION_BLOCKS)
+      )
+        throw new StoreCorruptionError("Run Bloom bytes exceed its entry bound");
+      const blooms = await readAll(space, refs, budget);
+      const bytes = RunReader.residentCharge(need(fences), blooms);
+      const reader = new RunReader(ref, need(fences), need(index), partitionBlocks, blooms, bytes);
+      retained = bytes;
+      return reader;
+    } finally {
+      charge.free(bound - retained);
+    }
+  }
+
   static #directory(ref: RunRef, bytes: Uint8Array): { partitionBlocks: number; refs: BlobRef[] } {
     const reader = new ByteReader(bytes);
     const partitionBlocks = reader.varuint();
-    if (partitionBlocks === 0)
+    if (partitionBlocks !== PARTITION_BLOCKS)
       throw new StoreCorruptionError("A run's Bloom directory is malformed");
-    const refs = readRefs(reader, ref.bloom.extent);
+    const blocks = Math.min(ref.entryCount, Math.floor((ref.entries.length - 1) / 6));
+    const refs = readRefs(reader, ref.bloom.extent, Math.ceil(blocks / partitionBlocks));
     reader.end();
     return { partitionBlocks, refs };
   }
@@ -1280,6 +1352,7 @@ export class RunReader {
 
   mayContain(key: Uint8Array): boolean {
     if (compare(key, this.ref.minKey) < 0 || compare(key, this.ref.maxKey) > 0) return false;
+    if ((this.ref.encoding ?? 1) === 2) return this.#bloomHas(key, 0, this.#blocks.length);
     const [first, end] = this.#blocksFor(key);
     return this.#bloomHas(key, first, end);
   }
@@ -1313,6 +1386,8 @@ export class RunReader {
     hash?: number,
     bloomHash?: number,
   ): MaybePromise<void> {
+    if ((this.ref.encoding ?? 1) === 2)
+      return this.#lookupOverflow(space, key, out, budget, hash, bloomHash);
     if (compare(key, this.ref.minKey) < 0 || compare(key, this.ref.maxKey) > 0) return;
     const [first, end] = this.#blocksFor(key);
     if (!this.#bloomHas(key, first, end, hash, bloomHash)) return;
@@ -1336,6 +1411,38 @@ export class RunReader {
     });
   }
 
+  async #lookupOverflow(
+    space: SpaceReader,
+    key: Uint8Array,
+    out: RunEntry[],
+    budget: ByteBudget,
+    hash?: number,
+    bloomHash?: number,
+  ): Promise<void> {
+    if (!this.#bloomHas(key, 0, this.#blocks.length, hash, bloomHash)) return;
+    const bytes = rangeRunBytes(this.ref, 1);
+    charged(budget, bytes);
+    let input: RunRangeInput | undefined;
+    try {
+      input = new RunRangeInput(
+        space,
+        budget,
+        this.ref,
+        { lower: { kind: "atLeast", key }, upper: { kind: "through", key } },
+        1,
+        Infinity,
+        new AbortController().signal,
+      );
+      await input.open();
+      while (await input.advance())
+        if (compare(input.key(), key) === 0)
+          out.push({ rowId: input.rowId, tombstone: input.tombstone });
+    } finally {
+      input?.close();
+      budget.free(bytes);
+    }
+  }
+
   /**
    * Streams every entry in order, from the block that may hold `from` (or the first). `visit`
    * returns true to stop. The key is a view valid during the call.
@@ -1347,6 +1454,31 @@ export class RunReader {
     from: Uint8Array | null = null,
     drain?: () => MaybePromise<void>,
   ): Promise<void> {
+    if ((this.ref.encoding ?? 1) === 2) {
+      const bytes = rangeRunBytes(this.ref, 1);
+      charged(budget, bytes);
+      let input: RunRangeInput | undefined;
+      try {
+        input = new RunRangeInput(
+          space,
+          budget,
+          this.ref,
+          { lower: from === null ? null : { kind: "atLeast", key: from }, upper: null },
+          1,
+          Infinity,
+          new AbortController().signal,
+        );
+        await input.open();
+        while (await input.advance()) {
+          if (visit(input.key(), input.rowId, input.tombstone)) return;
+          await drain?.();
+        }
+      } finally {
+        input?.close();
+        budget.free(bytes);
+      }
+      return;
+    }
     const start = from === null ? 0 : this.#blocksFor(from)[0];
     for (let block = start; block < this.#blocks.length; block++) {
       const ref = need(this.#blocks[block]);

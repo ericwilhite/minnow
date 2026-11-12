@@ -5,26 +5,28 @@ import { createReach } from "../../testing/reach.js";
 import { SimLocks } from "../storage/sim-disk.js";
 import { openDirectory } from "./directory-compat-api.js";
 import { DirectoryFiles } from "./directory-fixture-files.js";
-import { frozenDirectory, readDirectoryFixture } from "./directory-frozen.js";
+import { directoryPeer, currentDirectoryFixture } from "./directory-current.test-support.js";
 import { partition, expected } from "./directory-tails-test-support.js";
 const reach = createReach("next-directory-compat-fixtures", [
-  "frozen packed tail",
+  "reused packed tail",
   "partial extent retained after edit",
   "shared extent carry retired",
   "full-page carry",
   "full-page plus tail",
 ]);
-let legacy: Awaited<ReturnType<typeof frozenDirectory>>;
+let legacy: Awaited<ReturnType<typeof directoryPeer>>;
 beforeAll(async () => {
-  legacy = await frozenDirectory();
+  legacy = await directoryPeer();
 });
 afterAll(async () => {
   await legacy.dispose();
 });
 for (const n of [4095, 4099])
-  it(`frozen packed-${String(n)} opens, normalizes, writes and reopens`, async () => {
+  it(`reused packed-${String(n)} opens, normalizes, writes and reopens`, async () => {
     reach.beginHistory();
-    const native = DirectoryFiles.load(await readDirectoryFixture(`packed-${String(n)}`));
+    const native = DirectoryFiles.load(
+      await currentDirectoryFixture(n === 4095 ? "packed-4095" : "packed-4099"),
+    );
     const gate = new SimLocks();
     const old = await legacy.open(native, gate);
     try {
@@ -64,11 +66,11 @@ for (const n of [4095, 4099])
     } finally {
       await again.close();
     }
-    reach.reach("frozen packed tail");
+    reach.reach("reused packed tail");
   }, 120_000);
 it("edits only the last page of a shared partial extent, then carries it", async () => {
   reach.beginHistory();
-  const native = DirectoryFiles.load(await readDirectoryFixture("packed-0"));
+  const native = DirectoryFiles.load(await currentDirectoryFixture("packed-0"));
   const gate = new SimLocks();
   const db = await openDirectory(native, gate);
   try {
@@ -116,7 +118,7 @@ it("edits only the last page of a shared partial extent, then carries it", async
 
 it("canonical all-bits tail carries into a full page across both writers", async () => {
   reach.beginHistory();
-  const files = DirectoryFiles.load(await readDirectoryFixture("packed-0")),
+  const files = DirectoryFiles.load(await currentDirectoryFixture("packed-0")),
     locks = new SimLocks();
   const initial = await openDirectory(files, locks);
   try {
@@ -129,12 +131,12 @@ it("canonical all-bits tail carries into a full page across both writers", async
   } finally {
     await initial.close();
   }
-  const baseline = await legacy.open(files, locks);
+  const peer = await legacy.open(files, locks);
   try {
-    deepStrictEqual(await baseline.rows(), expected(4095));
-    await baseline.stamp(4095);
+    deepStrictEqual(await peer.rows(), expected(4095));
+    await peer.stamp(4095);
   } finally {
-    await baseline.close();
+    await peer.close();
   }
   const current = await openDirectory(files, locks);
   try {
@@ -176,7 +178,7 @@ it("canonical all-bits tail carries into a full page across both writers", async
   reach.reach("full-page carry");
   reach.reach("full-page plus tail");
 }, 120_000);
-it("reached frozen-fixture, shared-edit and boundary states", () => reach.assertReached());
+it("reached current-fixture, shared-edit and boundary states", () => reach.assertReached());
 
 it("the committed shard population covers every tail exactly once", async () => {
   const folder = new URL("./directory-compat/", import.meta.url);

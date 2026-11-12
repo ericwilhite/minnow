@@ -126,6 +126,50 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+export const MERGE_STOP_STATES = [
+  "slice callback",
+  "no entries after stop",
+  "working charge returned",
+  "single entry slice",
+  "partial block slice",
+  "clock chunk slice",
+] as const;
+
+export const OVERFLOW_READER_STATES = [
+  "point reads",
+  "missing shared prefix",
+  "cursor drain",
+  "ascending",
+  "descending",
+  "prefix seek",
+  "mixed inline blocks",
+  "cached reads",
+  "cold reads",
+  "multi chunk",
+  "single chunk",
+  "equal prefixes full comparison",
+  "wide row ids",
+  "read failure",
+  "retry",
+  "unknown directory version",
+  "corrupt descriptor",
+  "capacity refusal",
+  "cancellation",
+  "split merge",
+  "owned merge heads",
+  "fan in 32",
+  "other fan in",
+  "hot key crosses fences",
+  "close during read",
+  "cancel during read",
+  "interleaved readers",
+  "native precharge",
+  "metadata precharge",
+  "invalid entry count",
+  "shipped key maximum",
+  "exact inline prefix",
+] as const;
+
 export const KEY_POINTER_CODEC_STATES = [
   "shipped maximum",
   "other lengths",
@@ -2743,17 +2787,17 @@ export const DIRECTORY_APPEND_REACH = [
   "exact cleanup",
 ] as const;
 
-/** Every legal twelve-bit canonical directory tail is opened by both supported builds. */
+/** Every legal twelve-bit canonical directory tail is opened by independent current builds. */
 export const DIRECTORY_COMPAT_TAILS = Array.from({ length: 4096 }, (_, n) => `tail ${String(n)}`);
 export const DIRECTORY_COMPAT_REACH = [
-  "current to baseline continuation",
-  "baseline to current continuation",
+  "current to peer continuation",
+  "peer to current continuation",
   "every value preserved",
   "exact cleanup",
   "range end reopened",
   "full-page carry",
   "full-page plus tail",
-  "frozen packed tail",
+  "reused packed tail",
   "partial extent retained after edit",
   "shared extent carry retired",
 ] as const;
@@ -2773,13 +2817,13 @@ export const DIRECTORY_TRANSITION_REACH = [
   "acknowledged values recovered",
   "retry both writers",
   "interrupted current writer",
-  "interrupted baseline writer",
+  "interrupted peer writer",
   "concurrent current owner",
-  "concurrent baseline owner",
+  "concurrent peer owner",
   "damaged page refused",
   "damaged index refused",
   "damage refused by current",
-  "damage refused by baseline",
+  "damage refused by peer",
 ] as const;
 
 /** The fused publication proof, including exact rejection and a non-timing scan-count guard. */

@@ -105,6 +105,7 @@ export default tseslint.config(
       "packages/core/src/next/write/directory-compatibility.test.ts",
       "packages/core/src/next/write/directory-publication-compat.test.ts",
       "packages/core/src/next/write/directory-frozen.ts",
+      "packages/core/src/next/write/directory-current.test-support.ts",
       "packages/core/src/next/write/directory-tails-test-support.ts",
       // Reads the front end's sources off disk to pin the messages lowering's SQLSTATE map
       // depends on (lower/errors.ts).

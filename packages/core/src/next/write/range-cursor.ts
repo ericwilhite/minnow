@@ -14,6 +14,7 @@ import type { ByteBudget } from "../access/space.js";
 import { MAX_BLOB_BYTES } from "../access/space.js";
 import { compareBytes } from "../vector/varlen.js";
 import { rangeSide } from "./range-bound.js";
+import { runKeyBytes } from "./overflow-keys.js";
 import { need } from "./bytes.js";
 import type { KeyDelta } from "./key-hash.js";
 import { DeltaRangeInput, RunRangeInput, rangeRunBytes, type RangeInput } from "./range-input.js";
@@ -102,6 +103,7 @@ export class StreamingRangeCursor implements IndexCursor {
       if (delta !== null) keyBytes = Math.max(keyBytes, delta.maxKeyBytes);
       if (run !== null) {
         resident += rangeRunBytes(run, this.#direction);
+        keyBytes = Math.max(keyBytes, runKeyBytes(run));
         // Fixed credit for one verified directory blob and one one-pass block. Parsed
         // navigation belongs to the governed cache, not this non-spillable admission.
         io = MAX_BLOB_BYTES;
@@ -269,6 +271,7 @@ export class StreamingRangeCursor implements IndexCursor {
    */
   #disjoint(head: RunRangeInput): boolean {
     if (
+      (head.ref.encoding ?? 1) === 2 ||
       rangeSide(this.range, head.ref.minKey) !== 0 ||
       rangeSide(this.range, head.ref.maxKey) !== 0
     )

@@ -7,6 +7,9 @@ import type { ByteBudget } from "../access/space.js";
 import { StoreCorruptionError } from "../storage/contract.js";
 import { compareBytes } from "../vector/varlen.js";
 import { need } from "./bytes.js";
+import { ByteReader as KeyReader, valid } from "../format/bytes.js";
+import { EXTENDED_KEY_BLOCK, readKeyPointer } from "../format/key-pointer.js";
+import { OverflowKeys, overflowKeyBytes } from "./overflow-keys.js";
 import type { KeyDelta } from "./key-hash.js";
 
 export interface RangeInput {
@@ -129,16 +132,18 @@ export class DeltaRangeInput implements RangeInput {
 
 /** One decoded block and scalar navigation, independent of the number of blocks. */
 export function rangeRunBytes(_ref: RunRef, _direction: number): number {
-  void _ref;
   void _direction;
-  return 4096 + 512;
+  return 4096 + 512 + ((_ref.encoding ?? 1) === 2 ? overflowKeyBytes(_ref) : 0);
 }
 export class RunRangeInput implements RangeInput {
   readonly #directory: RangeDirectory;
+  readonly #keys: OverflowKeys | null;
+  #keyBytes: Uint8Array = new Uint8Array(0);
+  #extended = false;
   pending = true;
-  readonly #buffer = new Uint8Array(4096);
+  #buffer = new Uint8Array(4096);
   #bytes = this.#buffer.subarray(0, 0);
-  readonly #view = new DataView(this.#buffer.buffer);
+  #view = new DataView(this.#buffer.buffer);
   #walk: Generator<Promise<unknown> | true, void, unknown> | null = null;
   #block = 0;
   #ordinal = -1;
@@ -167,16 +172,17 @@ export class RunRangeInput implements RangeInput {
     readonly pure = false,
   ) {
     this.rowId = direction > 0 ? -Infinity : Infinity;
-    this.#directory = new RangeDirectory(ref, space, budget, range, direction, signal);
+    this.#keys = (ref.encoding ?? 1) === 2 ? new OverflowKeys(ref, space, budget, signal) : null;
+    this.#directory = new RangeDirectory(ref, space, budget, range, direction, signal, this.#keys);
   }
   open(): MaybePromise<void> {
     return this.#directory.open();
   }
   key(): Uint8Array {
-    return this.#bytes.subarray(this.#keyStart, this.#keyEnd);
+    return this.#keyBytes.subarray(this.#keyStart, this.#keyEnd);
   }
   bytes(): Uint8Array {
-    return this.pending ? (this.direction > 0 ? this.ref.minKey : this.ref.maxKey) : this.#bytes;
+    return this.pending ? (this.direction > 0 ? this.ref.minKey : this.ref.maxKey) : this.#keyBytes;
   }
   keyStart(): number {
     return this.pending ? 0 : this.#keyStart;
@@ -185,13 +191,28 @@ export class RunRangeInput implements RangeInput {
     return this.pending ? this.bytes().length : this.#keyEnd;
   }
   advance(): MaybePromise<boolean> {
+    if (this.#closed) return false;
     this.#walk ??= this.#scan();
     return this.#step();
   }
+  #waiting = false;
   readonly #step = (value?: unknown): MaybePromise<boolean> => {
+    this.#waiting = false;
     const next = need(this.#walk).next(value);
-    if (next.done) return false;
-    return next.value === true ? true : next.value.then(this.#step);
+    if (next.done) {
+      this.#walk = null;
+      return false;
+    }
+    if (next.value === true) return true;
+    this.#waiting = true;
+    return next.value.then(this.#step, (error: unknown) => {
+      this.#waiting = false;
+      this.#walk?.return();
+      this.#walk = null;
+      if (this.#closed) return false;
+      this.close();
+      throw error;
+    });
   };
   *#scan(): Generator<Promise<unknown> | true, void, unknown> {
     while (!this.#stopped()) {
@@ -227,26 +248,47 @@ export class RunRangeInput implements RangeInput {
       if (this.#stopped()) return;
       const bytes = this.#bytes,
         view = this.#view;
-      let at = view.getUint16(2 + this.#ordinal * 2, true),
-        length = 0,
-        scale = 1;
-      if (at < 2 + this.#count * 2 || at >= bytes.length)
-        throw new StoreCorruptionError("Invalid index entry offset");
-      for (;;) {
-        const b = bytes[at++] ?? 0;
-        length += (b & 127) * scale;
-        if (b < 128) break;
-        scale *= 128;
-        if (scale > 2 ** 28) throw new StoreCorruptionError("Invalid key length");
+      const start = view.getUint16(2 + this.#ordinal * 2, true);
+      const end =
+        this.#ordinal + 1 < this.#count
+          ? view.getUint16(2 + (this.#ordinal + 1) * 2, true)
+          : bytes.length;
+      valid(
+        start >= 2 + this.#count * 2 && end <= bytes.length && end - start >= 8,
+        "Invalid index entry bounds",
+      );
+      if (this.#extended) {
+        const r = new KeyReader(bytes.subarray(start, end - 7));
+        const pointer = readKeyPointer(r, ref.offset);
+        r.end();
+        valid(pointer.kind === "overflow", "Inline entry in overflow block");
+        this.#keyBytes = (yield need(this.#keys).resolve(pointer)) as Uint8Array;
+        if (this.#stopped()) return;
+        this.#keyStart = 0;
+        this.#keyEnd = this.#keyBytes.length;
+      } else {
+        let at = start,
+          length = 0,
+          scale = 1;
+        for (;;) {
+          const b = bytes[at++];
+          if (b === undefined || at > end - 7)
+            throw new StoreCorruptionError("Truncated key length");
+          length += (b & 127) * scale;
+          if (b < 128) break;
+          scale *= 128;
+          if (scale > 2 ** 28) throw new StoreCorruptionError("Invalid key length");
+        }
+        if (length > 2048 || at + length + 7 !== end)
+          throw new StoreCorruptionError("Truncated index entry");
+        this.#keyBytes = this.#bytes;
+        this.#keyStart = at;
+        this.#keyEnd = at + length;
       }
-      if (length > 2048 || at + length + 7 > bytes.length)
-        throw new StoreCorruptionError("Truncated index entry");
-      this.#keyStart = at;
-      this.#keyEnd = at + length;
-      this.rowId =
-        view.getUint32(at + length, true) + view.getUint16(at + length + 4, true) * 2 ** 32;
-      this.tombstone = ((bytes[at + length + 6] ?? 0) & 1) !== 0;
-      const side = rangeSide(this.range, this.#bytes, this.#keyStart, this.#keyEnd);
+      this.rowId = view.getUint32(end - 7, true) + view.getUint16(end - 3, true) * 2 ** 32;
+      valid((bytes[end - 1] ?? 0) <= 1, "Invalid index entry flags");
+      this.tombstone = ((bytes[end - 1] ?? 0) & 1) !== 0;
+      const side = rangeSide(this.range, this.#keyBytes, this.#keyStart, this.#keyEnd);
       if (side * this.direction > 0) return;
       if (side === 0 && (this.tombstone || this.rowId < this.limit)) yield true;
       this.#ordinal += this.direction;
@@ -259,6 +301,7 @@ export class RunRangeInput implements RangeInput {
    * Leave the generator at the last consumed ordinal; advance resumes at its successor.
    */
   skipBlock(max: number): number {
+    if (this.#keys !== null) throw new TypeError("Overflow runs require exact key iteration");
     const bytes = this.#bytes,
       view = this.#view;
     let count = 0,
@@ -303,6 +346,7 @@ export class RunRangeInput implements RangeInput {
         visible + 1 < this.#count ? view.getUint16(2 + (visible + 1) * 2, true) : bytes.length;
       if (length > 2048 || at + length + 7 !== end)
         throw new StoreCorruptionError("Truncated index entry");
+      this.#keyBytes = this.#bytes;
       this.#keyStart = at;
       this.#keyEnd = at + length;
       this.rowId = view.getUint32(end - 7, true) + view.getUint16(end - 3, true) * 2 ** 32;
@@ -345,9 +389,14 @@ export class RunRangeInput implements RangeInput {
     return skipped;
   }
   #loaded(bytes: Uint8Array): void {
+    if (bytes.length > this.#buffer.length) throw new StoreCorruptionError("Oversized index block");
     this.#buffer.set(bytes);
     this.#bytes = this.#buffer.subarray(0, bytes.length);
-    this.#count = this.#view.getUint16(0, true);
+    const stored = bytes.length < 2 ? 0 : this.#view.getUint16(0, true);
+    this.#extended = (stored & EXTENDED_KEY_BLOCK) !== 0;
+    if (this.#extended && this.#keys === null)
+      throw new StoreCorruptionError("Overflow block in inline run");
+    this.#count = stored & ~EXTENDED_KEY_BLOCK;
     if (bytes.length < 2 || this.#count * 2 + 2 > bytes.length)
       throw new StoreCorruptionError("Invalid index block entry count");
     if (this.#fixedEntryBytes > 0 && this.#count !== (bytes.length - 2) / this.#fixedEntryBytes)
@@ -357,6 +406,15 @@ export class RunRangeInput implements RangeInput {
   }
   close(): void {
     this.#closed = true;
-    this.#walk = null;
+    this.#keys?.close();
+    this.#buffer = new Uint8Array(0);
+    this.#bytes = this.#keyBytes = this.#buffer;
+    this.#view = new DataView(this.#buffer.buffer);
+    // Resume an in-flight read so its finally releases the lease. Otherwise discard the
+    // suspended entry frame now, before the caller returns its workspace credit.
+    if (!this.#waiting) {
+      this.#walk?.return();
+      this.#walk = null;
+    }
   }
 }

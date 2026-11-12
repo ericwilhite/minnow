@@ -4,8 +4,8 @@ registerDirectoryTails(
   3840,
   createReach("next-directory-tails-3840", [
     ...DIRECTORY_COMPAT_TAILS.slice(3840, 3968),
-    "current to baseline continuation",
-    "baseline to current continuation",
+    "current to peer continuation",
+    "peer to current continuation",
     "every value preserved",
     "exact cleanup",
     "range end reopened",

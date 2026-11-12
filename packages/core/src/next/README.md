@@ -3522,3 +3522,9 @@ Larger resident peer arrays retain their ordinary-credit growth and copy-overlap
 `window-peer-pressure.test.ts` compares seeded structural-key results with PGlite while
 a competitor holds all remaining credit; `window-emit-peak.test.ts` checks fitting-step
 peaks against the parent accounting model, including allocations on the pool boundary.
+
+Long-key reader stage: encoding 2 uses one admitted complete-key head per active input.
+Point reads and range fence seeks compare complete bytes on prefix ties. Mixed merges use
+owned heads for every input, so a legacy input cannot pin a block lease across overflow I/O.
+Merge minima include the actual head capacities; the owner's close signal cancels payload reads.
+The production writer and root-publication guard remain unchanged until summary/catalog integration.

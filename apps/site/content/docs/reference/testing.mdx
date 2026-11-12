@@ -2039,16 +2039,22 @@ pages. This bounds both encoding work and the page index. Each history audits ex
 reopens, verifies every expected value and returns every governor charge. The original full-page
 boundary workload retains its groups, operations, assertions and deadline.
 
-The directory's byte grammar and versions are unchanged, but physical packing changes the
-page and index bytes. Both packing policies support successful continuation in both directions.
-Committed native-file fixtures and a self-contained baseline reader/writer bundle are frozen at
-`4133d25a`; tests never regenerate them. The ordinary-open campaign covers every tail total from
-0 through 4,095 in 32 independent ranges of 128 states. Every state reads all values in both builds, makes
-durable writes, and reopens. It also covers the full-page carry, packed-tail normalization,
-and an edited page whose extent still holds unchanged partial pages.
+The directory page grammar stays unchanged. The rebuild's root format is now version 3;
+no older `next/` writer is supported because no published package includes the rebuild.
+Archived development roots and the `4133d25a` writer are kept only for explicit refusal tests.
+Packing tests seed fresh version-3 roots over the unchanged packed group/page payloads;
+this test bootstrap discards the archived root slots and runs no migration. A separately
+bundled current writer supplies an independent module graph for continuing-writer and
+competing-opener checks. This does not prove older-writer compatibility.
+
+The ordinary-open campaign still covers every tail total from 0 through 4,095 in 32 independent
+ranges of 128 states. Every state reads all values in both current module graphs, makes durable
+writes, and reopens. It also covers the full-page carry, packed-tail normalization, and an edited
+page whose extent still holds unchanged partial pages. Seeds, states and physical fault edges
+are retained. Both current writers must preserve the same unchanged directory prefix.
 
 The exhaustive ranges use the ordinary startup policy, without repeating test-only physical
-audits at every open. Each range reopens its final baseline write and audits its boundary carry.
+audits at every open. Each range reopens its final peer write and audits its boundary carry.
 Transition histories explicitly audit current and previous ownership.
 They interrupt both writers after directory page/index writes and each native publication step: data flush,
 root write, root truncate and root flush. Strictly acknowledged values must survive recovery;
@@ -2056,7 +2062,7 @@ both writers continue writing and reopen. Each transition also refuses damaged p
 bytes and queues two competing openers in both build orders. Declared reach covers all tail
 states, transition types and publication edges. The physical crash model uses honest flushes
 with seeded lost/torn pending writes; this is Node fixture evidence, not a real-browser crash
-campaign. To explicitly regenerate fixtures from the pinned writer, run
+campaign. To reproduce the archived development payload fixtures from the pinned writer, run
 `npx vite-node scripts/write-next-directory-fixtures.mts`; scratch uses `os.tmpdir()`.
 
 Ordered-root startup regressions require a streaming union without the unordered free-map sort,
@@ -2207,10 +2213,19 @@ root versions. Codec availability alone does not enable long-key writes; writer,
 Bloom, summary and catalog-limit integration are separate stages. Short-key block bytes
 remain unchanged.
 
-The next stage's `write/overflow-writer.test.ts` exercises an opt-in overflow writer. It
+`write/overflow-writer.test.ts` exercises an opt-in overflow writer. It
 keeps data blocks within 4 KiB, puts payload chunks and their checksummed directory in the
 same extent, and keeps summary storage charged through consumption. Generated cases check
 precharge before native allocation, delayed acknowledgement, detached buffers, cancellation
 before admission, injected allocation/append failures and retry, bulk input, wide row IDs,
 and two interleaved encoders. The default production writer remains inline until reader and
-catalog integration is complete; premature overflow publication or reading is a typed refusal.
+catalog integration is complete; premature overflow publication is a typed refusal.
+
+`write/overflow-readers.test.ts` checks point reads, both range directions, exact fence seeks
+and mixed-run merges against complete key bytes. Generated shared prefixes must not collapse
+distinct keys, and an inline key that prefixes a longer key is still an exact point lookup.
+Keys may span payload chunks; hot keys span blocks. Readers prepay a reusable full-key head
+and parsing workspace, release a block lease before resolving its key, and pass tests that
+poison every returned lease. The campaign includes fan-in 32, output splits, interleaved
+readers, read failures, close/cancel during I/O, retry and typed structural refusals. These
+codec tests do not certify the later catalog-limit policy or the shipped-format cutover.

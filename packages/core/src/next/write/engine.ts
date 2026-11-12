@@ -155,6 +155,7 @@ import {
   levelZero,
   MERGE_FIXED_BYTES,
   MERGE_INPUT_BYTES,
+  mergeWorkingBytes,
   MergeAbortedError,
   mergeRuns,
   planMerge,
@@ -4110,7 +4111,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const started = performance.now();
     const grant = await this.#credits.acquireMerge(
       `merge t${String(state.tableId)} i${String(indexId)}`,
-      MERGE_FIXED_BYTES + inputs.length * MERGE_INPUT_BYTES,
+      mergeWorkingBytes(inputs),
     );
     let writer: ExtentWriter;
     try {
@@ -4153,6 +4154,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
                 splitBytes: Math.floor(this.#mergePolicy.splitBytes / divisor),
               },
         stopped: () => this.#closed || this.failure !== null,
+        signal: this.#commitAbort.signal,
       });
       unlock = await this.#lock();
       // The inputs must still be where they were: contiguous in the current list of a live table
