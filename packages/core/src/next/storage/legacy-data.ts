@@ -1,3 +1,5 @@
+import { StoreCorruptionError } from "./contract.js";
+
 /** Read-only identification of the shipped 0.x stores. This is a refusal, never an upgrade. */
 export class LegacyDataError extends Error {
   readonly code = "MINNOW_LEGACY_DATA";
@@ -55,15 +57,50 @@ export async function refuseLegacyIndexedDb(factory: IDBFactory, name: string): 
 
 /** Native directory handles enumerate entries; internal storage-kit adapters need not do so. */
 export async function refuseLegacyOpfs(
-  directory: { keys?(): AsyncIterableIterator<string> },
+  directory: {
+    keys?(): AsyncIterableIterator<string>;
+    getFileHandle(name: string, options?: { create?: boolean }): Promise<unknown>;
+  },
   location: string,
+  nativeFiles: readonly string[],
 ): Promise<void> {
   if (directory.keys === undefined) return;
-  for await (const name of directory.keys())
+  for await (const name of directory.keys()) {
     if (
-      ["format.json", "wal", "checkpoint-a", "checkpoint-b", "extents", "snapshots-v1"].includes(
-        name,
-      )
+      [
+        "format.json",
+        "wal",
+        "wal-acknowledgements",
+        "checkpoint-a",
+        "checkpoint-b",
+        "extents",
+        "temp",
+        "snapshots-v1",
+      ].includes(name) ||
+      name.startsWith("upgrade-")
     )
       throw new LegacyDataError("opfs", location);
+    // A partial old tree can lose every marker. Only native files are admitted; unknown
+    // contents are not evidence of a fresh database. Do not label arbitrary junk as 0.x.
+    if (!nativeFiles.includes(name))
+      throw new StoreCorruptionError(
+        `Unrecognized OPFS entry "${name}" at "${location}"; use a new database name or explicitly remove the old data`,
+      );
+    // The name alone is insufficient: a directory called "data" would otherwise fail only
+    // after earlier native files had already been created. This lookup never creates a file.
+    try {
+      await directory.getFileHandle(name, { create: false });
+    } catch (error) {
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "name" in error &&
+        error.name === "TypeMismatchError"
+      )
+        throw new StoreCorruptionError(
+          `OPFS entry "${name}" at "${location}" is a directory, not a native file`,
+        );
+      throw error;
+    }
+  }
 }

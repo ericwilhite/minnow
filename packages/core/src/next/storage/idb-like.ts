@@ -144,9 +144,16 @@ export async function openIndexedDb(factory: IDBFactory, name: string): Promise<
       }
       settled = true;
     };
-    request.onblocked = () => {
+    request.onblocked = (event) => {
       settled = true;
-      reject(new Error(`IndexedDB ${name} is blocked by an open connection of another version`));
+      // The native schema is v2. A blocked upgrade from v1 is the I1 legacy marker,
+      // including a writer that won the race after preflight and kept its connection.
+      // Another open would queue behind this blocked request and never inspect it.
+      reject(
+        event.oldVersion === 1
+          ? new LegacyDataError("indexeddb", name)
+          : new Error(`IndexedDB ${name} is blocked by an open connection of another version`),
+      );
     };
   });
   return {

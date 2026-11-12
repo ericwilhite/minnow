@@ -554,7 +554,10 @@ its memory-store results exclude payload fetch, SQL, owner transport and real di
   the new supported upgrade/fixture chain; unreleased next/ formats are not predecessors.
   The legacy OPFS probe runs even without sync handles. Native IDB inspection never upgrades
   the source, and native OPFS directory inspection precedes any writable handle. Refusal leaves
-  old bytes/schema untouched and creates no replacement database. The chooser also
+  old bytes/schema untouched and creates no replacement database. Partial legacy trees are
+  refused even if only an acknowledgement file survives; direct native directories admit only
+  native file names and file kinds, never unknown contents. A blocked I1 native-open race keeps
+  `MINNOW_LEGACY_DATA` and its guidance while the old writer holds its connection. The chooser also
   refuses to open OPFS over this name's IndexedDB store (`StoreConflictError`). Layout
   `minnow-core/` and `minnow-core:<name>`.
 - A writer that interleaves many builders (the page format's group writer) passes a `budget` to

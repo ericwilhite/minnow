@@ -362,7 +362,7 @@ function nextEpoch(file: SyncFile, unused: boolean): number {
  * opened, then throws (quota failures as `StoreQuotaError`), so a retry finds the files free.
  */
 async function openFiles(directory: OpfsDirectoryLike, location: string): Promise<OpenFiles> {
-  await refuseLegacyOpfs(directory, location);
+  await refuseLegacyOpfs(directory, location, OPFS_FILE_NAMES);
   const handles: SyncFile[] = [];
   try {
     for (const name of OPFS_FILE_NAMES) {

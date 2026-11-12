@@ -9,7 +9,12 @@ import { expect, it } from "vitest";
 import { MinnowDatabase } from "../../engine/database.js";
 import { IndexedDbBlockStore } from "../../storage/indexeddb.js";
 import { MemoryOpfs } from "../../testing/opfs-shim.js";
-import { createReach, LEGACY_REFUSAL_REACH } from "../../testing/reach.js";
+import {
+  createReach,
+  LEGACY_REFUSAL_REACH,
+  LEGACY_PARTIAL_TREE_REACH,
+  LEGACY_HELD_WRITER_REACH,
+} from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { openIndexedDb } from "./idb-like.js";
 import { createOpfsBackend } from "./opfs.js";
@@ -378,3 +383,141 @@ it("refuses the frozen orphan tree and binary fold-ceiling fixture unchanged", a
     expect(writes).toBe(0);
   }
 });
+
+for (const seed of seedsFor("next-legacy-refusal-partial", [0xb211, 0xb212])) {
+  it(`refuses generated nonempty subsets of every frozen OPFS tree seed ${String(seed)}`, async () => {
+    const reach = createReach("partial legacy trees", LEGACY_PARTIAL_TREE_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.array(fc.boolean(), { minLength: 1, maxLength: 64 }),
+        fc.nat(),
+        async (mask, first) => {
+          reach.beginHistory();
+          for (const fixture of frozen) {
+            const entries = Object.entries(fixture.files);
+            const selected = entries.filter(
+              (_, index) => index === first % entries.length || mask[index % mask.length],
+            );
+            const shim = new MemoryOpfs();
+            for (const [path, bytes] of selected)
+              shim.writeFileBytes(path, Buffer.from(bytes, "base64"));
+            const before = await tree(shim.root);
+            let writes = 0;
+            shim.setWriteFault(() => {
+              writes++;
+              throw new Error("partial tree must not be written");
+            });
+            shim.setDeleteFault(() => {
+              writes++;
+              throw new Error("partial tree must not be removed");
+            });
+            const directory = await (
+              await shim.root.getDirectoryHandle("minnowdb")
+            ).getDirectoryHandle("native-fixture");
+            await refused(
+              () =>
+                createOpfsBackend({
+                  name: "native-fixture",
+                  directory,
+                  locks: new SimLocks(),
+                }).acquire(),
+              "opfs",
+            );
+            expect(await tree(shim.root)).toEqual(before);
+            expect(writes).toBe(0);
+            if (selected.length < entries.length) reach.reach("partial");
+            if (!selected.some(([path]) => path.endsWith("/format.json"))) reach.reach("no marker");
+          }
+          // Reviewer pin, inside every generated history: only the genuine O13 acknowledgement bytes survive.
+          const newest = frozen.find((fixture) => fixture.layoutFormatVersion === 13);
+          const witness = newest?.files["minnowdb/native-fixture/wal-acknowledgements"];
+          if (witness === undefined) throw new Error("Missing frozen acknowledgement witness");
+          const shim = new MemoryOpfs();
+          shim.writeFileBytes("db/wal-acknowledgements", Buffer.from(witness, "base64"));
+          const before = await tree(shim.root);
+          const directory = await shim.root.getDirectoryHandle("db");
+          await refused(
+            () => createOpfsBackend({ name: "db", directory, locks: new SimLocks() }).acquire(),
+            "opfs",
+          );
+          expect(await tree(shim.root)).toEqual(before);
+          reach.reach("ack only");
+          for (const kind of [
+            "unknown file",
+            "unknown directory",
+            "native name directory",
+          ] as const) {
+            const shim = new MemoryOpfs();
+            if (kind === "unknown file")
+              shim.writeFileBytes("db/unrecognized", new Uint8Array([1]));
+            else
+              await (
+                await shim.root.getDirectoryHandle("db", { create: true })
+              ).getDirectoryHandle(kind === "native name directory" ? "data" : "unrecognized", {
+                create: true,
+              });
+            const before = await tree(shim.root);
+            const directory = await shim.root.getDirectoryHandle("db");
+            await expect(
+              createOpfsBackend({ name: "db", directory, locks: new SimLocks() }).acquire(),
+            ).rejects.toMatchObject({ code: "MINNOW_STORE_CORRUPT" });
+            expect(await tree(shim.root)).toEqual(before);
+            reach.reach(kind);
+          }
+        },
+      ),
+      { seed, numRuns: 16 },
+    );
+    reach.assertReached();
+  });
+  it(`keeps typed refusal while a racing old IDB writer retains its connection seed ${String(seed)}`, async () => {
+    const reach = createReach("held legacy writer", LEGACY_HELD_WRITER_REACH);
+    await fc.assert(
+      fc.asyncProperty(names, fc.boolean(), async (name, held) => {
+        reach.beginHistory();
+        reach.reach(held ? "held" : "closed");
+        for (const version of [1, 2, 8]) {
+          const inner = new IDBFactory();
+          let old: IDBDatabase | undefined;
+          let raced = false;
+          const factory = {
+            open(databaseName: string, target?: number) {
+              if (target === 2 && !raced) {
+                raced = true;
+                const request = inner.open(databaseName, version);
+                request.onupgradeneeded = () => {
+                  for (const store of ["catalog", "manifests", "blocks"])
+                    request.result
+                      .createObjectStore(store)
+                      .put(new Uint8Array([7, 8, 9]), "preserved");
+                };
+                request.onsuccess = () => {
+                  old = request.result;
+                  if (!held) old.close();
+                };
+              }
+              return inner.open(databaseName, target);
+            },
+          } as IDBFactory;
+          try {
+            await refused(async () => {
+              const db = await openIndexedDb(factory, name);
+              db.close();
+            }, "indexeddb");
+          } finally {
+            old?.close();
+          }
+          expect(await inner.databases()).toEqual([{ name, version }]);
+          const db = await native(inner, name);
+          expect(Array.from(db.objectStoreNames)).toEqual(["blocks", "catalog", "manifests"]);
+          db.close();
+          if (version === 1 && held) reach.reach("I1 blocked");
+          if (version === 2) reach.reach("I2");
+          if (version === 8) reach.reach("I8");
+        }
+      }),
+      { seed, numRuns: 12 },
+    );
+    reach.assertReached();
+  });
+}

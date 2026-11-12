@@ -10,6 +10,11 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The rebuild's 0.x refusal also covers partial OPFS trees, including a surviving
+`wal-acknowledgements` file. Unknown directory contents are refused before native file creation.
+An I1 writer that races native open and keeps its connection receives the same actionable
+`MINNOW_LEGACY_DATA` refusal. No public API or stored-format change; old bytes remain untouched.
+
 The planned 1.0 storage reset starts a fresh supported-format chain; there is no 0.x-to-1.0
 converter. The unexported rebuild refuses existing 0.x IndexedDB and OPFS databases with
 `LegacyDataError` (`MINNOW_LEGACY_DATA`) before changing old data or creating a replacement.

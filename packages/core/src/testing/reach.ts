@@ -18,6 +18,16 @@
  * published tarball.
  */
 /** Reset refusal must see every legacy marker and both OPFS capability states. */
+export const LEGACY_PARTIAL_TREE_REACH = [
+  "partial",
+  "no marker",
+  "ack only",
+  "unknown file",
+  "unknown directory",
+  "native name directory",
+] as const;
+export const LEGACY_HELD_WRITER_REACH = ["held", "closed", "I1 blocked", "I2", "I8"] as const;
+
 export const LEGACY_REFUSAL_REACH = {
   opfs: ["O5", "O6", "O7", "O8", "O9", "O10", "O11", "O12", "O13", "sync", "no sync", "pre-marker"],
   idb: ["I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8"],
