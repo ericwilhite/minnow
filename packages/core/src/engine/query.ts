@@ -9,6 +9,12 @@ import {
 import { rememberSeriesArgumentCount, copySeriesArgumentCount } from "./series-sources.js";
 import { copyFrameOffset, rememberFrameOffset } from "./frame-offsets.js";
 import {
+  mapWindowInputs,
+  completeWindowInputs,
+  typedWindowShift,
+  windowInputsOf,
+} from "./window-inputs.js";
+import {
   rememberIntervalArithmeticSource,
   copyIntervalArithmeticSource,
 } from "./interval-arithmetic-sources.js";
@@ -2764,14 +2770,7 @@ function bindExpression(expression: Expression, values: readonly QueryParameter[
     return expression;
   }
   if (expression.kind === "window") {
-    expression.partitionBy = expression.partitionBy.map((part) => bindExpression(part, values));
-    for (const order of expression.orderBy) {
-      order.expression = bindExpression(order.expression, values);
-    }
-    if (expression.argument !== undefined) {
-      expression.argument = bindExpression(expression.argument, values);
-    }
-    return expression;
+    return mapWindowExpression(expression, (part) => bindExpression(part, values), true);
   }
   return expression;
 }
@@ -3030,6 +3029,7 @@ function cloneTreeValue(value: unknown): unknown {
   copyJsonCall(value, copy);
   copyDatePart(value, copy);
   copyFrameOffset(value, copy);
+  mapWindowInputs(value, copy, (expression) => cloneTreeValue(expression) as Expression);
   copySeriesArgumentCount(value, copy);
   copyIntervalArithmeticSource(value, copy);
   return copy;
@@ -4458,10 +4458,13 @@ export function childExpressions(expression: Expression): Expression[] {
   }
   if (expression.kind === "fts") return expression.columns === "*" ? [] : [...expression.columns];
   if (expression.kind === "window") {
+    const inputs = windowInputsOf(expression);
     return [
       ...expression.partitionBy,
       ...expression.orderBy.map((order) => order.expression),
       ...(expression.argument === undefined ? [] : [expression.argument]),
+      ...(inputs.offsetExpression === undefined ? [] : [inputs.offsetExpression]),
+      ...(inputs.fallbackExpression === undefined ? [] : [inputs.fallbackExpression]),
     ];
   }
   return [];
@@ -5486,10 +5489,7 @@ export function annotateTimestampText(
   }
   const visit = (child: Expression): Expression => annotateTimestampText(child, column, tables);
   if (expression.kind === "window") {
-    expression.partitionBy = expression.partitionBy.map(visit);
-    for (const order of expression.orderBy) order.expression = visit(order.expression);
-    if (expression.argument !== undefined) expression.argument = visit(expression.argument);
-    return expression;
+    return mapWindowExpression(expression, visit, true);
   }
   let replacements: Map<Expression, Expression> | undefined;
   for (const child of childExpressions(expression)) {
@@ -5972,12 +5972,7 @@ export function resolveStatementDatetimes(
           : value;
     }
     if (expression.kind === "window") {
-      // A window's own clauses are positions mapChildExpressions cannot rebuild; the plan is
-      // already a private clone, so they are rewritten in place.
-      expression.partitionBy = expression.partitionBy.map(substitute);
-      for (const order of expression.orderBy) order.expression = substitute(order.expression);
-      if (expression.argument !== undefined) expression.argument = substitute(expression.argument);
-      return expression;
+      return mapWindowExpression(expression, substitute, true);
     }
     return mapChildExpressions(expression, substitute);
   };
@@ -6257,6 +6252,23 @@ function exactConstantFold(
   return folded === undefined ? undefined : { value: folded, seeded };
 }
 
+function mapWindowExpression(
+  expression: Extract<Expression, { kind: "window" }>,
+  visit: (expression: Expression) => Expression,
+  inPlace = false,
+): Extract<Expression, { kind: "window" }> {
+  const target = inPlace
+    ? expression
+    : {
+        ...expression,
+        orderBy: expression.orderBy.map((order) => ({ ...order })),
+      };
+  target.partitionBy = expression.partitionBy.map(visit);
+  for (const order of target.orderBy) order.expression = visit(order.expression);
+  if (expression.argument !== undefined) target.argument = visit(expression.argument);
+  return mapWindowInputs(expression, target, visit);
+}
+
 /**
  * Rewrites every seeded constant arithmetic subtree of this expression to its exact fold. A
  * folded value demotes back to an ordinary number literal when it reads back identically from
@@ -6316,17 +6328,7 @@ function resolveExactNumericConstants(expression: Expression): Expression {
     return expression;
   }
   if (expression.kind === "window") {
-    return {
-      ...expression,
-      partitionBy: expression.partitionBy.map(resolveExactNumericConstants),
-      orderBy: expression.orderBy.map((order) => ({
-        ...order,
-        expression: resolveExactNumericConstants(order.expression),
-      })),
-      ...(expression.argument === undefined
-        ? {}
-        : { argument: resolveExactNumericConstants(expression.argument) }),
-    };
+    return mapWindowExpression(expression, resolveExactNumericConstants);
   }
   const resolved = mapChildExpressions(expression, resolveExactNumericConstants);
   if (resolved.kind === "call") {
@@ -12341,6 +12343,13 @@ class Parser {
             `${upper} takes a value, an optional offset, and an optional default`,
           );
         }
+        if (recordDeclaredTypes) {
+          const typed = typedWindowShift(upper, lagArgs);
+          if (typed !== undefined) {
+            this.#keyword("OVER");
+            return Object.assign(typed, this.#overClause());
+          }
+        }
         const constant = (expression: Expression, label: string): QueryValue => {
           if (
             hasAggregate(expression) ||
@@ -12365,8 +12374,7 @@ class Parser {
           fallbackExpression === undefined ? null : constant(fallbackExpression, "default");
         this.#keyword("OVER");
         const { partitionBy, orderBy, frame } = this.#overClause();
-        if (frame !== undefined && !recordDeclaredTypes)
-          throw new TypeError(`${upper} does not take a window frame`);
+        if (frame !== undefined) throw new TypeError(`${upper} does not take a window frame`);
         if (orderBy.length === 0) {
           throw new TypeError(`${upper} requires ORDER BY inside OVER (...)`);
         }
@@ -12382,7 +12390,6 @@ class Parser {
           argument,
           offset,
           ...(fallback === null ? {} : { fallback }),
-          ...(frame === undefined ? {} : { frame }),
         };
       }
       if (
@@ -13499,15 +13506,7 @@ function unifyGroupedReferences<
     }
     if (expression.kind === "subquery" || expression.kind === "exists") return expression;
     if (expression.kind === "window") {
-      return {
-        ...expression,
-        partitionBy: expression.partitionBy.map(respell),
-        orderBy: expression.orderBy.map((order) => ({
-          ...order,
-          expression: respell(order.expression),
-        })),
-        ...(expression.argument === undefined ? {} : { argument: respell(expression.argument) }),
-      };
+      return mapWindowExpression(expression, respell);
     }
     return mapChildExpressions(expression, respell);
   };
@@ -14427,17 +14426,7 @@ export function bindPendingSelectShapes(
       return { ...expression, block: bindBlock(expression.block) };
     }
     if (expression.kind === "window") {
-      return {
-        ...expression,
-        partitionBy: expression.partitionBy.map(bindExpressionBlocks),
-        orderBy: expression.orderBy.map((order) => ({
-          ...order,
-          expression: bindExpressionBlocks(order.expression),
-        })),
-        ...(expression.argument === undefined
-          ? {}
-          : { argument: bindExpressionBlocks(expression.argument) }),
-      };
+      return mapWindowExpression(expression, bindExpressionBlocks);
     }
     return mapChildExpressions(expression, bindExpressionBlocks);
   };
@@ -15238,11 +15227,7 @@ function desugarWindows(
   ): void => {
     // Full-text nodes evaluate against a scanned base table; a window's hidden columns
     // compute over the windowed wrapper where no such scan exists.
-    const windowInputs = [
-      ...expression.partitionBy,
-      ...expression.orderBy.map((order) => order.expression),
-      ...(expression.argument === undefined ? [] : [expression.argument]),
-    ];
+    const windowInputs = childExpressions(expression);
     if (windowInputs.some(containsFtsExpression)) {
       throw new TypeError("Full-text MATCH and BM25 are not supported inside OVER(...)");
     }
@@ -15254,20 +15239,28 @@ function desugarWindows(
     if (windowInputs.some(containsWindow)) {
       throw new TypeError("Window functions cannot be nested inside OVER(...)");
     }
-    windows.push({
-      alias,
-      name: expression.name,
-      partitionAliases: expression.partitionBy.map(hide),
-      orderAliases: expression.orderBy.map((order) => ({
-        alias: hide(order.expression),
-        direction: order.direction,
-        ...(order.nulls === undefined ? {} : { nulls: order.nulls }),
-      })),
-      ...(expression.argument === undefined ? {} : { argumentAlias: hide(expression.argument) }),
-      ...(expression.offset === undefined ? {} : { offset: expression.offset }),
-      ...(expression.fallback === undefined ? {} : { fallback: expression.fallback }),
-      ...(expression.frame === undefined ? {} : { frame: expression.frame }),
-    });
+    windows.push(
+      completeWindowInputs(
+        expression,
+        {
+          alias,
+          name: expression.name,
+          partitionAliases: expression.partitionBy.map(hide),
+          orderAliases: expression.orderBy.map((order) => ({
+            alias: hide(order.expression),
+            direction: order.direction,
+            ...(order.nulls === undefined ? {} : { nulls: order.nulls }),
+          })),
+          ...(expression.argument === undefined
+            ? {}
+            : { argumentAlias: hide(expression.argument) }),
+          ...(expression.offset === undefined ? {} : { offset: expression.offset }),
+          ...(expression.fallback === undefined ? {} : { fallback: expression.fallback }),
+          ...(expression.frame === undefined ? {} : { frame: expression.frame }),
+        },
+        hide,
+      ),
+    );
   };
 
   /**

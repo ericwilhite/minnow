@@ -1,3 +1,4 @@
+import "./window-inputs.js";
 /**
  * The front end's passes, run over the new catalog (lower/lowerer.ts steps 1–3): what
  * `MinnowDatabase.#applyCatalogRewrites` and `createPreparedColumnarQuery` run today, with each

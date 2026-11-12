@@ -494,6 +494,9 @@ still validates those literals while parsing. Minnow says "frame starting offset
 negative"; PostgreSQL says "invalid preceding or following size in window function". For negative float offsets outside double
 precision, Minnow reports this negative-offset error before PostgreSQL's `22003` overflow error.
 
+Window `AVG` returns a JavaScript number (float64), including for integer inputs.
+PostgreSQL returns `NUMERIC` for `AVG(integer)`; Minnow keeps its float64 result contract.
+
 `DISTINCT` window aggregates are not supported. Windows work in both the select list and
 `ORDER BY`; `WHERE`, `GROUP BY`, and `HAVING` cannot contain them.
 

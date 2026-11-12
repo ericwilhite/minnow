@@ -33,6 +33,13 @@ The generic worker plus separate client measures 571,749 gzip bytes; its combine
 once by 256 bytes. The core tarball measures 1,024,131 packed bytes; its packed cap rises once by 500 bytes to
 1,024,250. Private rebuild code and tests remain excluded.
 
+The unexported rebuild evaluates LAG/LEAD offset expressions only for demanded output rows,
+and evaluates a default only when that row has no target. LIMIT does not
+evaluate later offset errors or volatile defaults. A matching output partition/order prefix
+uses a globally ordered window path without forcing later frames through a redundant result
+sort; mismatching orders keep that sort. Published parser restrictions are unchanged.
+No public API or stored-format change; no migration is needed.
+
 The unexported rebuild now executes text-to-JSONB casts, JSONB extraction and exact canonical
 JSONB text, including decimal scale, duplicate keys and Unicode validation. Invalid documents
 keep PostgreSQL’s error order, including competing Unicode, token and numeric range errors. Expanding values use

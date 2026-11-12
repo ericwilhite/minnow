@@ -22,6 +22,7 @@
  * Errors are PostgreSQL's: a NULL frame offset 22004, a negative one 22013, ntile ≤ 0 22014,
  * nth_value ≤ 0 22016.
  */
+import { WindowFloat } from "./window-float.js";
 import { SLICE_ROWS, type Slice, type SlicedJob } from "./slices.js";
 
 /** Fixed-cost prefix/frame work between task-clock checks. */
@@ -285,6 +286,8 @@ export interface NumberArg {
 export interface NumberResult {
   readonly values: Float64Array;
   readonly valid: Uint8Array;
+  /** Optional per-output transition errors, surfaced by the operator at delivery. */
+  readonly errors?: Uint8Array;
   big: bigint[] | null;
 }
 
@@ -346,7 +349,12 @@ export function* aggregate(
   out: NumberResult,
   slice: Slice,
   work: AggregateScratch | null = null,
+  narrow = false,
 ): SlicedJob<void> {
+  if (!exact && (kind === "sum" || kind === "avg") && arg !== null) {
+    yield* floatAggregate(kind, arg, peers, exclude, starts, ends, out, slice, work, narrow);
+    return;
+  }
   const n = peers.n;
   const ranges = new Int32Array(6);
   const valid = arg?.valid ?? null;
@@ -529,6 +537,79 @@ export function* aggregate(
     out.big !== null
   )
     yield* bigExtremes(kind === "max", arg, peers, exclude, starts, ends, out, slice);
+}
+
+/** Float prefixes are read directly, without subtracting the signed-zero identity.
+ * Restart moving/excluded frames with the full PG transition, including AVG's Sxx.
+ */
+function* floatAggregate(
+  kind: "sum" | "avg",
+  arg: NumberArg,
+  peers: Peers,
+  exclude: Frame["exclude"],
+  starts: Int32Array,
+  ends: Int32Array,
+  out: NumberResult,
+  slice: Slice,
+  work: AggregateScratch | null,
+  narrow: boolean,
+): SlicedJob<void> {
+  const state = new WindowFloat(kind === "avg", kind === "sum" && narrow),
+    n = peers.n;
+  const running = exclude === "no-others" && (yield* isRunning(starts, n, slice));
+  if (running) {
+    const prefix = work !== null && work.prefix.length > n ? work.prefix : new Float64Array(n + 1);
+    const counts = work !== null && work.counts.length > n ? work.counts : new Int32Array(n + 1);
+    prefix[0] = state.sum;
+    counts[0] = 0;
+    let last = -1;
+    let firstError = -1;
+    for (let i = 0; i < n; i++) {
+      last = Math.max(last, ends[i] ?? -1);
+      if ((i & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
+    }
+    for (let j = 0; j <= last; j++) {
+      if (arg.valid[j] === 1) state.add(arg.values[j] ?? 0);
+      if (out.errors === undefined) state.check();
+      else if (state.bad && firstError < 0) firstError = j;
+      prefix[j + 1] = state.sum;
+      counts[j + 1] = state.count;
+      if ((j & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
+    }
+    for (let i = 0; i < n; i++) {
+      const end = ends[i] ?? -1,
+        count = end < 0 ? 0 : (counts[end + 1] ?? 0),
+        sum = prefix[end + 1] ?? 0;
+      out.valid[i] = count > 0 ? 1 : 0;
+      if (out.errors !== undefined) out.errors[i] = firstError >= 0 && end >= firstError ? 1 : 0;
+      out.values[i] = count === 0 ? 0 : kind === "avg" ? sum / count : sum;
+      if ((i & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
+    }
+    return;
+  }
+  const ranges = new Int32Array(6);
+  for (let i = 0; i < n; i++) {
+    state.reset();
+    const k = membersOf(
+      exclude,
+      i,
+      starts[i] ?? 0,
+      ends[i] ?? -1,
+      peers.start[i] ?? i,
+      peers.end[i] ?? i,
+      ranges,
+    );
+    for (let r = 0; r < k; r++)
+      for (let j = ranges[2 * r] ?? 0; j <= (ranges[2 * r + 1] ?? -1); j++) {
+        if (arg.valid[j] === 1) state.add(arg.values[j] ?? 0);
+        if (out.errors === undefined) state.check();
+        if ((j & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
+      }
+    out.valid[i] = state.count > 0 ? 1 : 0;
+    if (out.errors !== undefined) out.errors[i] = state.bad ? 1 : 0;
+    out.values[i] = state.count === 0 ? 0 : kind === "avg" ? state.sum / state.count : state.sum;
+    if ((i & (WINDOW_STEP_ROWS - 1)) === WINDOW_STEP_ROWS - 1 && slice.due()) yield;
+  }
 }
 
 /** MIN/MAX over exact bigints (int64 past 2^53): compared as bigints. */

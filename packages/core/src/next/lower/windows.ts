@@ -1,3 +1,4 @@
+import { windowInputsOf } from "../../engine/window-inputs.js";
 import { frameOffsetMetadata } from "../../engine/frame-offsets.js";
 /**
  * Window functions: the front end's `windowed` source (an inner block computing every
@@ -15,7 +16,13 @@ import { frameOffsetMetadata } from "../../engine/frame-offsets.js";
 import type { ScalarExpr, SortKey, WindowCall, WindowFrameBound } from "../ir/ir.js";
 import { aggregateArgument, aggregateResult } from "../ir/functions.js";
 import type { PhysicalType } from "../types.js";
-import type { QueryValue, TableSource, WindowFrame, WindowSpec } from "../../plan/model.js";
+import type {
+  Expression,
+  QueryValue,
+  TableSource,
+  WindowFrame,
+  WindowSpec,
+} from "../../plan/model.js";
 import { baseType, coerce, type Typed } from "./coerce.js";
 import { PlanningError, unsupported } from "./errors.js";
 import { lowerExpression } from "./expressions.js";
@@ -263,8 +270,65 @@ export function lowerWindowed(
             ];
       if (result.fn === "ntile") args.push(int(spec.offset ?? 1, INT4));
       if (result.fn === "lag" || result.fn === "lead") {
-        args.push(int(spec.offset ?? 1, INT4));
-        const fallback = fallbackOf(spec.fallback, result.type, builder);
+        const inputs = windowInputsOf(spec);
+        const lowerInput = (expression: Expression) =>
+          lowerExpression(
+            expression,
+            {
+              column: (reference) => {
+                const index = inner.columns.findIndex((col) => col.name === reference);
+                const input = inner.columns[index];
+                return input === undefined
+                  ? undefined
+                  : {
+                      expr: column(index, input.type),
+                      nullable: input.nullable,
+                      big: input.big,
+                    };
+              },
+            },
+            builder.state,
+          );
+        if (inputs.offsetExpression === undefined) args.push(int(spec.offset ?? 1, INT4));
+        else {
+          const offset = lowerInput(inputs.offsetExpression);
+          try {
+            args.push(coerce(offset, INT4, "implicit", builder.parameters).expr);
+          } catch (error) {
+            if (!(error instanceof PlanningError)) throw error;
+            throw new PlanningError(
+              `function ${result.fn} with this offset type does not exist`,
+              "42883",
+            );
+          }
+        }
+        const fallback =
+          inputs.fallbackExpression === undefined
+            ? fallbackOf(spec.fallback, result.type, builder)
+            : coerce(
+                lowerExpression(
+                  inputs.fallbackExpression.kind === "case"
+                    ? (inputs.fallbackExpression.otherwise ?? { kind: "literal", value: null })
+                    : inputs.fallbackExpression,
+                  {
+                    column: (reference) => {
+                      const index = inner.columns.findIndex((col) => col.name === reference);
+                      const input = inner.columns[index];
+                      return input === undefined
+                        ? undefined
+                        : {
+                            expr: column(index, input.type),
+                            nullable: input.nullable,
+                            big: input.big,
+                          };
+                    },
+                  },
+                  builder.state,
+                ),
+                result.type,
+                "implicit",
+                builder.parameters,
+              ).expr;
         if (fallback !== null) args.push(fallback);
       }
       if (result.fn === "nth_value") args.push(int(spec.offset ?? 1, INT4));

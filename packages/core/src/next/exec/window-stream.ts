@@ -24,9 +24,11 @@
  * `NTH_LIMIT`. `streamable` names them; the operator refuses such a partition past its
  * resident limit.
  */
+import { NumericOutOfRangeError } from "./errors.js";
+import { WindowFloat } from "./window-float.js";
 import type { PhysicalType } from "../types.js";
 import type { FlatVector, Vector } from "../vector/vector.js";
-import { BATCH_ROWS } from "../vector/vector.js";
+import { BATCH_ROWS, type Batch } from "../vector/vector.js";
 import { ColumnStore, nullConstant } from "./column-store.js";
 import { keysEqual, markChanges, type SortColumn } from "./sort-keys.js";
 import type { Slice, SlicedJob } from "./slices.js";
@@ -44,6 +46,8 @@ import {
 export const NTH_LIMIT = 4096;
 
 export interface StreamFunction {
+  readonly offsetValue?: (batch: Batch) => Vector;
+  readonly defaultValue?: (batch: Batch) => Vector;
   readonly fn: string;
   readonly arg: number | null;
   readonly amount?: number | { readonly column: number } | null;
@@ -80,6 +84,7 @@ function effective(call: StreamFunction, ordered: boolean): Frame {
 
 /** Why a call cannot stream, or null when it can. */
 export function streamable(spec: StreamSpec, call: StreamFunction): string | null {
+  if (call.offsetValue !== undefined) return `${call.fn} with an amount from a scalar expression`;
   const amount = call.amount;
   if (amount !== undefined && amount !== null && typeof amount !== "number")
     return `${call.fn} with an amount from a column`;
@@ -142,6 +147,12 @@ interface CallState {
   big: bigint[] | null;
   /** Running totals while reading (the next row's cumulative values start from them). */
   runSum: number;
+  readonly runFloat: WindowFloat | null;
+  readonly totalFloat: WindowFloat | null;
+  readonly scanFloat: WindowFloat | null;
+  runError: number;
+  totalError: number;
+  squares: Float64Array | null;
   runBig: bigint | null;
   runCount: number;
   runExtreme: number;
@@ -170,6 +181,8 @@ export interface StreamHost {
   /** Output and gather stores draw from the spill pool (room made per bounded step). */
   readonly pool: Pool;
   readonly slice: Slice;
+  /** Stop only after a successfully delivered prefix. */
+  readonly stopped?: () => boolean;
   /** Pushes `count` dense rows (payload columns then one column per function). */
   push(columns: Vector[], count: number): SlicedJob<void>;
   /** A numeric function's results as a vector of its type. */
@@ -249,6 +262,7 @@ export class PartitionStream {
   #keyBig: bigint[] | null = null;
   /** Whether a call has a RANGE frame (its offsets compare the first key). */
   readonly #ranged: boolean;
+  #defaultRow = new Uint16Array(0);
   /** Bigint ring arrays live (each charged BIGINT_BYTES a ring slot). */
   #bigArrays = 0;
   readonly #prev: ColumnStore;
@@ -275,6 +289,7 @@ export class PartitionStream {
     this.#calls = spec.functions.map((call) => {
       const type = call.arg === null ? undefined : spec.types[call.arg];
       const value = VALUE.has(call.fn) && call.arg !== null;
+      const floating = (call.fn === "sum" || call.fn === "avg") && !integral(type);
       return {
         call,
         frame: effective(call, this.#ordered),
@@ -291,12 +306,24 @@ export class PartitionStream {
         count: new Float64Array(0),
         extreme: new Float64Array(0),
         big: null,
-        runSum: 0,
+        runSum: floating && call.fn === "sum" ? -0 : 0,
+        runFloat: floating
+          ? new WindowFloat(call.fn === "avg", call.fn === "sum" && type?.kind === "float32")
+          : null,
+        totalFloat: floating
+          ? new WindowFloat(call.fn === "avg", call.fn === "sum" && type?.kind === "float32")
+          : null,
+        scanFloat: floating
+          ? new WindowFloat(call.fn === "avg", call.fn === "sum" && type?.kind === "float32")
+          : null,
+        runError: -1,
+        totalError: -1,
+        squares: floating && call.fn === "avg" ? new Float64Array(0) : null,
         runBig: null,
         runCount: 0,
         runExtreme: Number.NaN,
         runSeen: false,
-        totalSum: 0,
+        totalSum: floating && call.fn === "sum" ? -0 : 0,
         totalBig: null,
         totalCount: 0,
         totalExtreme: Number.NaN,
@@ -316,6 +343,9 @@ export class PartitionStream {
 
   /** Frees everything it holds. */
   close(): void {
+    const defaultBytes = this.#defaultRow.byteLength;
+    this.#defaultRow = new Uint16Array(0);
+    this.host.charge.free(defaultBytes);
     for (const page of this.#pages) this.host.io.releasePage(page.held);
     this.#pages = [];
     this.#resultBig.fill(null);
@@ -323,6 +353,7 @@ export class PartitionStream {
     this.#resultBytes = 0;
     this.#keyBig = null;
     for (const state of this.#calls) {
+      state.squares = null;
       state.big = null;
       state.vBig = null;
       state.extremeBig = null;
@@ -389,7 +420,11 @@ export class PartitionStream {
               if (!x.ok) continue;
               state.totalCount++;
               if (state.sums) {
-                if (
+                if (state.totalFloat !== null) {
+                  state.totalFloat.add(x.value);
+                  state.totalSum = state.totalFloat.sum;
+                  if (state.totalError < 0 && state.totalFloat.bad) state.totalError = n + r;
+                } else if (
                   state.exact &&
                   (state.totalBig !== null ||
                     x.big !== null ||
@@ -501,6 +536,7 @@ export class PartitionStream {
       s.sum = grow(s.sum, (n) => new Float64Array(n));
       s.count = grow(s.count, (n) => new Float64Array(n));
       s.extreme = grow(s.extreme, (n) => new Float64Array(n));
+      if (s.squares !== null) s.squares = grow(s.squares, (n) => new Float64Array(n));
     }
     // Bigint backing arrays also grow at explicit capacities: no uncharged push/splice
     // spare capacity. Their replacements overlap the old arrays under the charge above.
@@ -522,7 +558,13 @@ export class PartitionStream {
 
   /** Ring bytes a row: the typed arrays, and each live bigint array's slot (BIGINT_BYTES). */
   #perRow(): number {
-    return 4 + 9 + this.#calls.length * (8 + 1 + 8 + 8 + 8) + this.#bigArrays * BIGINT_BYTES;
+    return (
+      4 +
+      9 +
+      this.#calls.length * (8 + 1 + 8 + 8 + 8) +
+      this.#calls.filter((s) => s.squares !== null).length * 8 +
+      this.#bigArrays * BIGINT_BYTES
+    );
   }
 
   /**
@@ -567,6 +609,7 @@ export class PartitionStream {
       move(s.sum);
       move(s.count);
       move(s.extreme);
+      if (s.squares !== null) move(s.squares);
       moveBig(s.big);
       moveBig(s.vBig);
       moveBig(s.extremeBig);
@@ -661,7 +704,11 @@ export class PartitionStream {
       if (x.ok) {
         s.runCount++;
         if (s.sums) {
-          if (
+          if (s.runFloat !== null) {
+            s.runFloat.add(x.value);
+            s.runSum = s.runFloat.sum;
+            if (s.runError < 0 && s.runFloat.bad) s.runError = j;
+          } else if (
             s.exact &&
             (s.runBig !== null || x.big !== null || Math.abs(s.runSum + x.value) > SAFE)
           ) {
@@ -685,6 +732,7 @@ export class PartitionStream {
         }
       }
       s.sum[at] = s.runSum;
+      if (s.squares !== null) s.squares[at] = s.runFloat?.squares ?? 0;
       if (s.big !== null) s.big[at] = s.runBig ?? BigInt(s.runSum);
       s.count[at] = s.runCount;
       s.extreme[at] = s.runSeen ? s.runExtreme : Number.NaN;
@@ -983,6 +1031,15 @@ export class PartitionStream {
     const values = this.#calls.map(() => new Float64Array(BATCH_ROWS));
     const valid = this.#calls.map(() => new Uint8Array(BATCH_ROWS));
     const bigs: Array<bigint[] | null> = (this.#resultBig = this.#calls.map(() => null));
+    const hasLazyDefault = this.#calls.some((s) => s.call.defaultValue !== undefined);
+    const usesDefault = (row: number): boolean =>
+      hasLazyDefault &&
+      this.#calls.some((s) => {
+        if (s.call.defaultValue === undefined) return false;
+        const offset = typeof s.call.amount === "number" ? s.call.amount : 1;
+        const target = s.call.fn === "lag" ? row - offset : row + offset;
+        return target < 0 || target >= this.#total();
+      });
     let next = 0;
     let outRows = 0;
     let p = 0;
@@ -1017,6 +1074,7 @@ export class PartitionStream {
       outRows = 0;
     }.bind(this);
     for (;;) {
+      if (this.host.stopped?.()) return;
       // Read ahead until the next row to output is ready (or the run is over).
       while (next >= this.#read || !this.#ready(next)) {
         if (p >= run.pages.length) {
@@ -1041,12 +1099,16 @@ export class PartitionStream {
       if (this.#ended && !this.#ready(next)) throw new RangeError(this.#stall(next));
       // Output every ready row, in order.
       while (next < this.#read && this.#ready(next)) {
+        if (usesDefault(next)) yield* flush();
+        if (this.host.stopped?.()) return;
         const page = this.#pageOf(next);
         if (page === null) throw new RangeError("A window row's page is gone");
         // A run of ready rows of one page goes into the output chunk at once.
         const pageEnd = page.start + page.rows;
         let end = next + 1;
         while (
+          !usesDefault(next) &&
+          !usesDefault(end) &&
           end < this.#read &&
           end < pageEnd &&
           end - next < BATCH_ROWS - outRows &&
@@ -1061,26 +1123,34 @@ export class PartitionStream {
           continue;
         }
         for (let j = next; j < next + taken; j++) {
-          for (let f = 0; f < this.#calls.length; f++) {
-            const s = this.#calls[f];
-            if (s === undefined) continue;
-            const computation = this.#compute(
-              s,
-              f,
-              j,
-              outRows,
-              values[f] ?? new Float64Array(0),
-              valid[f] ?? new Uint8Array(0),
-              bigs,
-              ranges,
-            );
-            if (computation !== undefined) yield* computation;
+          try {
+            for (let f = 0; f < this.#calls.length; f++) {
+              const s = this.#calls[f];
+              if (s === undefined) continue;
+              const computation = this.#compute(
+                s,
+                f,
+                j,
+                outRows,
+                values[f] ?? new Float64Array(0),
+                valid[f] ?? new Uint8Array(0),
+                bigs,
+                ranges,
+              );
+              if (computation !== undefined) yield* computation;
+            }
+          } catch (error) {
+            if (!(error instanceof NumericOutOfRangeError)) throw error;
+            yield* flush();
+            if (this.host.stopped?.()) return;
+            throw error;
           }
           outRows++;
           if (this.host.slice.due()) yield;
         }
+        const usedDefault = usesDefault(next);
         next += taken;
-        if (outRows === BATCH_ROWS) yield* flush();
+        if (outRows === BATCH_ROWS || usedDefault) yield* flush();
         if (this.host.slice.due()) yield;
       }
       // Release what no future row needs.
@@ -1225,25 +1295,37 @@ export class PartitionStream {
         }
         return;
       }
-      // Floats: the members in order. A first range from the head is the cumulative sum.
-      let sum = 0;
+      const state = s.scanFloat;
+      if (state === null) throw Error("missing float window state");
+      state.reset();
       let r = 0;
       if (k > 0 && (ranges[0] ?? 0) === 0) {
-        sum = sumTo(ranges[1] ?? -1);
+        const end = ranges[1] ?? -1,
+          total = end >= this.#read;
+        const error = total ? s.totalError : s.runError;
+        if (error >= 0 && end >= error) {
+          state.bad = true;
+          state.check();
+        }
+        state.sum = sumTo(end);
+        state.count = countTo(end);
+        state.squares = total ? (s.totalFloat?.squares ?? 0) : (s.squares?.[end - this.#base] ?? 0);
         r = 1;
       }
       if (scanRows(ranges, r, k) > WINDOW_STEP_ROWS)
         return this.#longFrame(s, f, at, values, valid, bigs, ranges, r, k, {
           kind: "sum",
-          value: sum,
+          state,
           count,
         });
-      for (; r < k; r++) {
-        const b = ranges[2 * r + 1] ?? -1;
-        for (let j = ranges[2 * r] ?? 0; j <= b; j++)
-          if (s.ok[j - this.#base] === 1) sum += s.v[j - this.#base] ?? 0;
-      }
-      values[at] = fn === "avg" ? sum / count : sum;
+      for (; r < k; r++)
+        for (let j = ranges[2 * r] ?? 0; j <= (ranges[2 * r + 1] ?? -1); j++)
+          if (s.ok[j - this.#base] === 1) {
+            state.add(s.v[j - this.#base] ?? 0);
+            state.check();
+          }
+      state.check();
+      values[at] = fn === "avg" ? state.sum / count : state.sum;
       return;
     }
     // MIN / MAX: a head-anchored prefix from the running extreme, the rest scanned.
@@ -1325,7 +1407,7 @@ export class PartitionStream {
     from: number,
     k: number,
     state:
-      | { kind: "sum"; value: number; count: number }
+      | { kind: "sum"; state: WindowFloat; count: number }
       | { kind: "float"; value: number; seen: boolean }
       | { kind: "big"; value: bigint | null },
   ): SlicedJob<void> {
@@ -1335,8 +1417,10 @@ export class PartitionStream {
       for (let j = ranges[2 * r] ?? 0; j <= end; j++) {
         const slot = j - this.#base;
         if (s.ok[slot] === 1) {
-          if (state.kind === "sum") state.value += s.v[slot] ?? 0;
-          else if (state.kind === "big") {
+          if (state.kind === "sum") {
+            state.state.add(s.v[slot] ?? 0);
+            state.state.check();
+          } else if (state.kind === "big") {
             const value = s.vBig?.[slot] ?? BigInt(s.v[slot] ?? 0);
             if (state.value === null || (max ? value > state.value : value < state.value))
               state.value = value;
@@ -1350,7 +1434,7 @@ export class PartitionStream {
       }
     }
     if (state.kind === "sum")
-      values[at] = s.call.fn === "avg" ? state.value / state.count : state.value;
+      values[at] = s.call.fn === "avg" ? state.state.sum / state.count : state.state.sum;
     else if (state.kind === "big") {
       values[at] = state.value === null ? 0 : Number(state.value);
       valid[at] = state.value === null ? 0 : 1;
@@ -1409,7 +1493,24 @@ export class PartitionStream {
       const k = typeof s.call.amount === "number" ? s.call.amount : 1;
       const target = fn === "lag" ? i - k : i + k;
       if (target >= 0 && target < this.#total()) fromRow(target);
-      else if (s.call.fallback !== undefined && s.call.fallback !== null)
+      else if (s.call.defaultValue !== undefined) {
+        const page = this.#pageOf(i);
+        if (page === null) throw new RangeError("A default's current row is gone");
+        const row = i - page.start;
+        if (this.#defaultRow.length === 0) {
+          if (!this.host.charge.allocate(2))
+            throw new RangeError("A window default selection did not fit");
+          this.#defaultRow = new Uint16Array(1);
+        }
+        this.#defaultRow[0] = row;
+        const vector = s.call.defaultValue({
+          length: page.rows,
+          columns: page.columns,
+          selection: { rows: this.#defaultRow, count: 1 },
+        });
+        if (gather.append([vector], null, row, 1) !== 1)
+          throw new RangeError("A window default did not fit");
+      } else if (s.call.fallback !== undefined && s.call.fallback !== null)
         gather.append([s.call.fallback], null, 0, 1);
       else nul();
       return;

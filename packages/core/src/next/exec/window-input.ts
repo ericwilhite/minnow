@@ -5,6 +5,7 @@
  */
 import type { ScalarExpr } from "../ir/ir.js";
 import { samePhysicalType } from "../types.js";
+import type { Batch, Vector } from "../vector/vector.js";
 import type { WindowFunctionSpec } from "./window.js";
 
 export function windowInputLayout(
@@ -54,10 +55,22 @@ export function windowInputLayout(
 export function remapWindowFunction(
   call: WindowFunctionSpec,
   index: (column: number) => number,
+  inputColumns?: number,
 ): WindowFunctionSpec {
+  const remap = (evaluate: (batch: Batch) => Vector) => (batch: Batch) =>
+    evaluate({
+      ...batch,
+      columns: Array.from({ length: inputColumns ?? batch.columns.length }, (_, c) => {
+        const column = batch.columns[index(c)];
+        if (column === undefined) throw new TypeError("Window scalar input is missing");
+        return column;
+      }),
+    });
   return {
     ...call,
     arg: call.arg === null ? null : index(call.arg),
+    ...(call.defaultValue === undefined ? {} : { defaultValue: remap(call.defaultValue) }),
+    ...(call.offsetValue === undefined ? {} : { offsetValue: remap(call.offsetValue) }),
     ...(typeof call.amount === "object" && call.amount !== null
       ? { amount: { column: index(call.amount.column) } }
       : {}),

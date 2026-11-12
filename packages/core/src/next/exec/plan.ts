@@ -104,6 +104,8 @@ import {
   type WindowFunctionSpec,
 } from "./window.js";
 
+import { windowSuppliesOrder } from "./window-order.js";
+
 type Stop = () => boolean;
 type Recipe = (
   runtime: QueryRuntime,
@@ -361,6 +363,8 @@ function setupWindow(
   const exprs: ScalarExpr[] = rel.orderBy.map((key) => key.expr);
   const positions = rel.functions.map((call, index) =>
     call.args.map((expr, argIndex) => {
+      if ((argIndex === 1 || argIndex === 2) && (call.fn === "lag" || call.fn === "lead"))
+        return -1;
       if (amounts[index] !== undefined && argIndex === (call.fn === "ntile" ? 0 : 1)) return -1;
       const at = exprs.length;
       exprs.push(expr);
@@ -376,8 +380,17 @@ function setupWindow(
       const amountAt = call.fn === "ntile" ? args[0] : args[1];
       const fallback = call.args[2];
       const scalarAmount = amounts[index];
-      if (fallback !== undefined && fallback.op !== "literal" && fallback.op !== "param")
-        throw new UnsupportedPlanError("a row-dependent lag/lead default", { construct: "window" });
+      const offset = call.args[1];
+      const lazyOffset =
+        (call.fn === "lag" || call.fn === "lead") &&
+        offset !== undefined &&
+        scalarAmount === undefined
+          ? compileExpr(offset, context)
+          : null;
+      const lazyDefault =
+        fallback !== undefined && fallback.op !== "literal" && fallback.op !== "param"
+          ? compileExpr(fallback, context)
+          : null;
       const scalar = (expr: ScalarExpr | null): number | null => {
         if (expr === null) return null;
         if (expr.op !== "literal" && expr.op !== "param")
@@ -424,13 +437,18 @@ function setupWindow(
         fn: call.fn,
         arg,
         type: call.type,
-        ...(amountAt === undefined
+        ...(lazyOffset !== null
+          ? { offsetValue: (batch: Batch) => lazyOffset.evaluate(batch, batch.selection) }
+          : amountAt === undefined
+            ? {}
+            : amountAt === -1 && scalarAmount !== undefined
+              ? { amount: scalarAmount }
+              : { amount: { column: at(keys.indexes, amountAt) } }),
+        ...(lazyDefault === null
           ? {}
-          : amountAt === -1 && scalarAmount !== undefined
-            ? { amount: scalarAmount }
-            : { amount: { column: at(keys.indexes, amountAt) } }),
+          : { defaultValue: (batch: Batch) => lazyDefault.evaluate(batch, batch.selection) }),
         fallback:
-          fallback === undefined
+          fallback === undefined || lazyDefault !== null
             ? null
             : validating
               ? (compileExpr(fallback, context), null)
@@ -707,6 +725,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   )
     terminalInput = terminalInput.input;
   const prepare = (rel: Rel): Recipe => {
+    if (rel.op === "sort" && !rel.withTies && windowSuppliesOrder(rel.input, rel.keys))
+      rel = { ...rel, op: "limit" };
+
     if (ids.has(rel.id))
       throw new UnsupportedPlanError("a repeated relational operator id", { construct: "plan" });
     ids.add(rel.id);
@@ -1674,6 +1695,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           grant: Grant | null,
           downstream: Operator,
           runtime?: QueryRuntime,
+          stops: readonly Stop[] = [],
         ) => {
           const extended = { ...context, input: keys.types };
           const output = new ProjectOperator(
@@ -1701,7 +1723,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                   })),
                   functions: (keys as ReturnType<typeof setupWindow>)
                     .functions(extended, runtime === undefined)
-                    .map((call) => remapWindowFunction(call, physical.index)),
+                    .map((call) => remapWindowFunction(call, physical.index, keys.types.length)),
                 }
               : null;
           if (runtime === undefined || grant === null) {
@@ -1750,7 +1772,11 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             );
           else {
             if (windowSpec === null) throw new TypeError("missing window specification");
-            breaker = new WindowOperator(windowSpec, shared, output);
+            breaker = new WindowOperator(
+              windowSpec,
+              { ...shared, stopped: () => stops.some((stop) => stop()) },
+              output,
+            );
           }
           return { operator: new ProjectOperator(physical.exprs, context, breaker), breaker };
         };
@@ -1772,7 +1798,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         // this recipe's kernel arena; adding all measured bytes would count pools twice.
         const minimum = base + measured;
         fixed(rel, minimum);
-        return (runtime, downstream) =>
+        return (runtime, downstream, stops) =>
           rel.op === "sort" && runtime.bounds(rel).limit === 0
             ? downstream.finish()
             : instantiate(
@@ -1782,7 +1808,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 minimum + (phases.get(runtime)?.savedWindows.get(rel.id)?.minimumBytes ?? 0),
                 BATCH_ROWS,
                 (context, grant) =>
-                  make(context, grant, counted(runtime, rel, downstream), runtime),
+                  make(context, grant, counted(runtime, rel, downstream), runtime, stops),
                 ({ operator, breaker }) => {
                   if (breaker === null) throw new TypeError("missing execution breaker");
                   runtime.onAbort((reason) => operator.abort(reason));

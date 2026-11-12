@@ -4201,3 +4201,115 @@ export const NUMERIC_FIXED_SQL_REACH = [
   "PGlite exact",
   "zero resources",
 ] as const;
+
+/** PG float transitions across frames and spill pages, including errors before later specials. */
+export const WINDOW_FLOAT_REACH = [
+  "signed zero",
+  "overflow",
+  "special values",
+  "float4",
+  "page boundaries",
+  "sum",
+  "avg",
+  "resident",
+  "streamed",
+  "22003",
+  "unused prefix overflow",
+  "exclusion fragments",
+] as const;
+
+/** Window transition errors belong to demanded output frames, including early consumers. */
+export const WINDOW_FLOAT_DEMAND_REACH = [
+  "resident",
+  "streamed",
+  "sum",
+  "avg",
+  "LIMIT",
+  "OFFSET",
+  "error after demand",
+  "error within demand",
+  "NaN after overflow",
+  "cursor close",
+  "batch boundary",
+] as const;
+
+export const WINDOW_FLOAT_SQL_DEMAND_REACH = [
+  "LIMIT",
+  "OFFSET",
+  "existing order",
+  "result sort",
+  "whole partition",
+  "top-k filter",
+] as const;
+
+/** SQL shift overload resolution, per-row evaluation and untyped argument contexts. */
+export const WINDOW_SHIFT_SQL_REACH = [
+  "lag",
+  "lead",
+  "partitions",
+  "negative offset",
+  "zero offset",
+  "NULL offset",
+  "row offset",
+  "row default",
+  "numeric common type",
+  "float common type",
+  "unknown default",
+  "NULL default",
+  "text default",
+  "int64 exact",
+  "lazy default",
+  "parameter offset",
+  "parameter default",
+  "no ORDER BY",
+  "invalid offset type",
+  "default demand",
+] as const;
+
+export const WINDOW_SHIFT_DELIVERY_REACH = [
+  "resident",
+  "streamed",
+  "lag",
+  "lead",
+  "NULL values",
+  "page boundary",
+  "default after demand",
+] as const;
+
+/** Current-row offset expressions must obey downstream window demand. */
+export const WINDOW_OFFSET_DEMAND_REACH = [
+  "offset coercion errors",
+  "lag",
+  "lead",
+  "zero demand",
+  "error demanded",
+  "error after demand",
+] as const;
+
+/** Volatile defaults execute exactly once for each demanded out-of-range target. */
+export const WINDOW_VOLATILE_DEFAULT_REACH = [
+  "lag",
+  "lead",
+  "resident",
+  "streamed",
+  "zero demand",
+  "OFFSET",
+  "no default evaluation",
+  "default evaluation",
+  "dictionary offset validity",
+] as const;
+
+/** Partition/order reuse must preserve global ordering and incremental frame demand. */
+export const WINDOW_PARTITION_DEMAND_REACH = [
+  "sum",
+  "avg",
+  "computed partition",
+  "nullable partitions",
+  "ascending",
+  "descending",
+  "matching order",
+  "partition prefix",
+  "mismatching order",
+  "full ordered result",
+  "multiple partition keys",
+] as const;
