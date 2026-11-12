@@ -63,6 +63,7 @@ it.each([0, 3])("merge uses the worker budget (prior work %i ms)", async (priorW
       space: h.space,
       writer,
       grant,
+      outputBudget: grant,
       readers: [reader],
       level: 1,
       bottom: true,

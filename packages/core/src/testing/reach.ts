@@ -30,6 +30,36 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+export const WRITE_MERGE_SUMMARY_PRESSURE_STATES = [
+  "other pinned bytes retained",
+  "unwound before wait",
+  "waiting at barrier",
+  "cancelled without retry",
+  "resumed same split policy",
+] as const;
+export const WRITE_MERGE_KEY_LIMIT_STATES = [
+  "ordinary typed refusal",
+  "bulk typed refusal",
+  "four KiB refusal",
+  "refusal cleanup",
+] as const;
+
+/** Completed merge pieces leave reusable working credit but remain funded until publication. */
+export const WRITE_MERGE_SUMMARY_STATES = [
+  "fan one",
+  "fan thirty two",
+  "intermediate fan",
+  "hundreds of pieces",
+  "thousands of pieces",
+  "exact two KiB keys",
+  "small cap",
+  "fund before refund",
+  "failure after funding",
+  "retry after failure",
+  "retained output owned",
+  "output consumed",
+] as const;
+
 /** Default split metadata must finish within prepaid credit, without a copied-output peak. */
 export const WRITE_MERGE_FINISH_STATES = [
   "borrowed keys",

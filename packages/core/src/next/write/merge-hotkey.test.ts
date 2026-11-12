@@ -61,6 +61,7 @@ it("eight runs of 800 row ids under one 1,000-byte key merge within the fence bo
       space: harness.space,
       writer: out,
       grant,
+      outputBudget: grant,
       readers,
       level: 1,
       bottom: true,

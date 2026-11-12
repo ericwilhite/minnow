@@ -31,7 +31,8 @@
  * (merges, range scans).
  *
  * ## Writing (`RunEncoder`; `RunBuilder` collects one in memory)
- * Entries are added in (key, rowId) order. A put and a tombstone of the same row id cancel (the
+ * Encoded keys are at most 2 KiB; longer keys raise RangeError when emitted, in both
+ * ordinary and bulk paths. Entries are added in (key, rowId) order. A put and a tombstone of the same row id cancel (the
  * row was inserted and deleted within the merged layers); a run written to the bottom level also
  * drops the tombstones left (no older put can exist below it).
  */

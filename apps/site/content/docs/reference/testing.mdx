@@ -1721,6 +1721,21 @@ fence bytes, header counts, continued charging until consumption, abort cleanup 
 while another execution holds its minimum. The review's two-reader, repeated nine-byte-key
 probe separately covers the large balanced index/fence case.
 
+`merge-summary.test.ts` accumulates hundreds or thousands of completed pieces with
+fan-in from 1 to 32 and encoded keys up to exactly 2 KiB. Completed boundary keys and
+run descriptors belong to the publication metadata account, which grows with the output;
+the fixed merge grant funds reusable work only. The new account pays before the encoder's
+charge is refunded. Temporary pressure aborts provisional work and releases input leases
+and output allocations before the cancellable metadata retry waits. Charges remain until
+publication takes ownership or the output is abandoned.
+
+The unexported rebuild core's `RunEncoder` accepts encoded index keys of at most **2 KiB**,
+including component headers and payloads. Longer encoded keys, including 4 KiB keys, raise
+`RangeError` with the message `An index key is longer than 2 KiB` when encoded, in both
+ordinary and bulk paths. The limit is unchanged by the accounting fixes; the generated
+refusal cases also check cleanup. This is the rebuild encoder's limit, not a new limit on
+the shipped SQL engine.
+
 `key-order-proof.test.ts` checks retained key order and ascending batch admission against an
 independent byte-order model. A normalized prefix proves order only when it differs; ties use
 full byte comparison. A batch must be strictly beyond every retained key before it can skip

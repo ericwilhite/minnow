@@ -4130,6 +4130,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         space: this.#space,
         writer,
         grant,
+        outputBudget: this.#metadataBudget,
         readers,
         level: plan.level + 1,
         bottom: plan.bottom,
