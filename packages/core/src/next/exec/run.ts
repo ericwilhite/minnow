@@ -1,7 +1,6 @@
 /** One query's admissions, resources and the executed/delivered lifecycle. */
 import type { MaybePromise } from "../access/key-index.js";
 import { SnapshotReleasedError } from "../access/snapshot.js";
-import { metadataCachesFor } from "../format/metadata-reader.js";
 import { QueryRoots, type RootColumns } from "../page/query-roots.js";
 import { readTable } from "./read-table.js";
 import type { ByteBudget } from "../access/space.js";
@@ -223,11 +222,7 @@ export class QueryRuntime {
     if (!retain || this.#closed || this.signal.aborted) return undefined;
     if (this.#queryRoots !== undefined) return this.#queryRoots;
     if (sources === undefined) return undefined;
-    const roots = new QueryRoots(
-      this.request.governor,
-      sources,
-      metadataCachesFor(this.view.pages),
-    );
+    const roots = QueryRoots.forReader(this.request.governor, sources, this.view.pages);
     this.#queryRoots = roots;
     // Global cleanup runs last, after phase readers, in-flight jobs and caller pins drain.
     this.#dispose.unshift(() => {

@@ -9,8 +9,8 @@ import {
 } from "../../testing/reach.js";
 import type { Snapshot } from "../access/snapshot.js";
 import { boundSource } from "../page/read-bounds.js";
-import { ByteReader, ManifestCorruptionError } from "./bytes.js";
-import { BlobCache, fullBlobKey } from "./blob-cache.js";
+import { ByteReader, ManifestCorruptionError } from "../format/bytes.js";
+import { BlobCache, fullBlobKey } from "../format/blob-cache.js";
 import {
   decodeGroupRoot,
   encodeGroupRoot,
@@ -18,9 +18,13 @@ import {
   parseCharge,
   selectGroupRootColumns,
   tryDecodeGroupRootView,
-} from "./manifest-codec.js";
-import { bindMetadataCaches, metadataCachesFor, MetadataReader } from "./metadata-reader.js";
-import type { GroupRoot } from "./manifest.js";
+} from "../format/manifest-codec.js";
+import {
+  bindMetadataCaches,
+  metadataCachesFor,
+  MetadataReader,
+} from "../format/metadata-reader.js";
+import type { GroupRoot } from "../format/manifest.js";
 import type { PhysicalType } from "../types.js";
 import { MemoryExtentSpace } from "../page/memory-extents.js";
 import { GroupRead } from "../page/group-read.js";

@@ -3,6 +3,7 @@ import { BlobCache } from "../format/blob-cache.js";
 import type { ColumnChunk, GroupRoot } from "../format/manifest.js";
 import {
   MetadataReader,
+  metadataCachesFor,
   type MaybePromise,
   type MetadataCaches,
 } from "../format/metadata-reader.js";
@@ -44,6 +45,14 @@ const TABLE = Symbol("query root table");
 type RootKey = BlobRef & { readonly [TABLE]?: number };
 
 export class QueryRoots {
+  /** Keep format cache ownership behind the page layer used by the executor. */
+  static forReader(
+    governor: MemoryGovernor,
+    sources: readonly RootColumns[],
+    pages: ExtentReader,
+  ): QueryRoots {
+    return new QueryRoots(governor, sources, metadataCachesFor(pages));
+  }
   readonly roots: BlobCache<ScanRootFacts>;
   readonly #unregister: (() => void) | undefined;
   #closed = false;

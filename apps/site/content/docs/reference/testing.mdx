@@ -1369,7 +1369,7 @@ ordinary complete decoder. Optional preparation scratch does not increase execut
 minimum. Explicit non-retaining export bypasses owner admission and promotion. Query cleanup
 drains pending readers before releasing its facts; owner close clears roots and removes the
 cache binding. Visibility, deletion masks and snapshot-specific hints are never shared there.
-`next/format/validated-root.test.ts` checks selective and complete equality, unselected corruption,
+`next/testing/validated-root.test.ts` checks selective and complete equality, unselected corruption,
 full identity, byte ownership, concurrent and cancelled borrowers, refusal and zero charges.
 `next/testing/root-reuse.test.ts` checks real executor source equality and validation reuse across
 queries; `next/testing/query-root-ownership.test.ts` covers query facts, eviction and cancellation.
