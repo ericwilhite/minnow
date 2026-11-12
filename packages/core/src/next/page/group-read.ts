@@ -34,7 +34,7 @@ export class GroupRead {
       this.#held = held;
       return held.value;
     };
-    const got = new MetadataReader(this.pages).groupRoot(this.ref, this.budget);
+    const got = new MetadataReader(this.pages, this.roots?.shared).groupRoot(this.ref, this.budget);
     if (!(got instanceof Promise)) return keep(got);
     const pending = got.then(keep).finally(() => {
       if (this.#pending === pending) this.#pending = null;

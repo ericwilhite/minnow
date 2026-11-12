@@ -453,49 +453,232 @@ export function encodeGroupRoot(root: GroupRoot): Uint8Array {
 }
 
 export function decodeGroupRoot(bytes: Uint8Array, budget: ByteBudget): Parsed<GroupRoot> {
-  return charged(bytes, budget, (reader) => {
-    const refs = new RefReader(reader, MAGIC.group, "group root");
-    const rowCount = reader.uint();
-    valid(rowCount >= 1 && rowCount <= MAX_GROUP_ROWS, "Bad group row count");
-    const rowIdKind = reader.u8();
-    valid(rowIdKind <= 1, "Bad row-id kind");
-    const rowIds: GroupRoot["rowIds"] =
-      rowIdKind === 0 ? { kind: "dense" } : { kind: "column", ref: refs.blob() };
-    const typeCount = reader.count(1);
-    const types: PhysicalType[] = [];
-    // Canonical like the extent table: distinct types, first used in table order, all used.
-    const typeKeys = new Set<string>();
-    for (let k = 0; k < typeCount; k++) {
-      const type = readType(reader);
-      const key = typeKey(type);
-      valid(!typeKeys.has(key), "A type appears twice in a group root's type table");
-      typeKeys.add(key);
-      types.push(type);
-    }
-    let nextType = 0;
-    const count = reader.count(8);
-    const columns: ColumnChunk[] = [];
-    const seen = new Set<number>();
-    for (let k = 0; k < count; k++) {
-      const columnId = reader.uint();
-      valid(!seen.has(columnId), "A column appears twice in a group root");
-      seen.add(columnId);
-      const typeAt = reader.uint();
-      const type = types[typeAt];
-      valid(type !== undefined, "Reference to an unknown column type");
-      valid(typeAt <= nextType, "Type table entries are not in first-use order");
-      if (typeAt === nextType) nextType++;
-      const data = refs.data();
-      const directory = refs.blob();
-      const statistics = readStatistics(reader);
-      valid(statistics.nullCount <= rowCount, "More nulls than rows");
-      const distinctSketch = refs.optionalBlob();
+  return charged(bytes, budget, readGroupRoot);
+}
+
+/** The complete validator is shared by eager decoding and optional validated views. */
+function readGroupRoot(reader: ByteReader, capture?: RootView): GroupRoot {
+  const refs = new RefReader(reader, MAGIC.group, "group root");
+  const rowCount = reader.uint();
+  valid(rowCount >= 1 && rowCount <= MAX_GROUP_ROWS, "Bad group row count");
+  const rowIdKind = reader.u8();
+  valid(rowIdKind <= 1, "Bad row-id kind");
+  const rowIds: GroupRoot["rowIds"] =
+    rowIdKind === 0 ? { kind: "dense" } : { kind: "column", ref: refs.blob() };
+  const typeCount = reader.count(1);
+  const types: PhysicalType[] = [];
+  // Canonical like the extent table: distinct types, first used in table order, all used.
+  const typeKeys = new Set<string>();
+  for (let k = 0; k < typeCount; k++) {
+    const type = readType(reader);
+    const key = typeKey(type);
+    valid(!typeKeys.has(key), "A type appears twice in a group root's type table");
+    typeKeys.add(key);
+    types.push(type);
+  }
+  let nextType = 0;
+  const count = reader.count(8);
+  capture?.begin(refs.extents, types, count);
+  const columns: ColumnChunk[] = [];
+  const seen = new Set<number>();
+  for (let k = 0; k < count; k++) {
+    const columnId = reader.uint();
+    valid(!seen.has(columnId), "A column appears twice in a group root");
+    seen.add(columnId);
+    const typeAt = reader.uint();
+    const type = types[typeAt];
+    valid(type !== undefined, "Reference to an unknown column type");
+    valid(typeAt <= nextType, "Type table entries are not in first-use order");
+    if (typeAt === nextType) nextType++;
+    capture?.column(k, columnId, typeAt, reader.at);
+    const data = refs.data();
+    const directory = refs.blob();
+    const statistics = readStatistics(reader);
+    valid(statistics.nullCount <= rowCount, "More nulls than rows");
+    const distinctSketch = refs.optionalBlob();
+    if (capture === undefined)
       columns.push({ columnId, type, data, directory, statistics, distinctSketch });
+  }
+  valid(nextType === types.length, "A type table entry is never used");
+  refs.end();
+  return { rowCount, rowIds, columns };
+}
+
+/** Optional probes must not increase a sizing pass's mandatory admission requirement. */
+export interface OptionalParseBudget extends ByteBudget {
+  optionalAllocate?(bytes: number): boolean;
+}
+export function optionalParseAllocation(budget: ByteBudget, bytes: number): boolean {
+  const optional = budget as OptionalParseBudget;
+  return optional.optionalAllocate?.(bytes) ?? budget.allocate(bytes);
+}
+
+const ROOT_VIEW_FIXED_BYTES = 1024;
+const rootViews = new WeakMap<GroupRoot, RootView>();
+
+function freezeRootType(type: PhysicalType): void {
+  if (type.kind === "array") freezeRootType(type.element);
+  if (type.kind === "enum") Object.freeze(type.labels);
+  Object.freeze(type);
+}
+
+/** Private immutable navigation, never a decoded graph of the unselected columns. */
+class RootView {
+  #extents = new Float64Array(0);
+  #types: readonly PhysicalType[] = [];
+  #ids = new Float64Array(0);
+  #positions = new Uint32Array(0);
+  #typeCodes = new Uint32Array(0);
+  constructor(readonly of: Uint8Array) {}
+  begin(extents: readonly ExtentRef[], types: PhysicalType[], count: number): void {
+    this.#extents = new Float64Array(2 * extents.length);
+    for (let k = 0; k < extents.length; k++) {
+      const extent = extents[k];
+      if (!extent) throw new ManifestCorruptionError("Missing validated extent");
+      this.#extents[k * 2] = extent.offset;
+      this.#extents[k * 2 + 1] = extent.length;
     }
-    valid(nextType === types.length, "A type table entry is never used");
-    refs.end();
-    return { rowCount, rowIds, columns };
-  });
+    for (const type of types) freezeRootType(type);
+    this.#types = Object.freeze(types);
+    this.#ids = new Float64Array(count);
+    this.#positions = new Uint32Array(count);
+    this.#typeCodes = new Uint32Array(count);
+  }
+  column(k: number, id: number, type: number, position: number): void {
+    this.#ids[k] = id;
+    this.#positions[k] = position;
+    this.#typeCodes[k] = type;
+  }
+  get count(): number {
+    return this.#ids.length;
+  }
+  get charge(): number {
+    // Full eager-graph bound remains prepaid if a COMPLETE consumer requests columns later.
+    return (
+      parseCharge(this.of.length) +
+      this.of.byteLength +
+      ROOT_VIEW_FIXED_BYTES +
+      this.#extents.byteLength +
+      this.#ids.byteLength +
+      this.#positions.byteLength +
+      this.#typeCodes.byteLength
+    );
+  }
+  select(
+    wanted?: readonly number[] | ((id: number) => boolean),
+    rowIdExtent?: ExtentRef,
+  ): ColumnChunk[] {
+    const includes =
+      typeof wanted === "function"
+        ? wanted
+        : (id: number) => wanted === undefined || wanted.includes(id);
+    const reader = new ByteReader(this.of);
+    const extents = new Map<number, ExtentRef>();
+    // Canonical first-use validation puts a column-backed row-ID extent at index zero.
+    // Only the COMPLETE root shares this retained object; selected graphs stay independent.
+    if (rowIdExtent !== undefined) extents.set(0, rowIdExtent);
+    const extent = (): ExtentRef => {
+      const index = reader.uint();
+      let ref = extents.get(index);
+      if (ref === undefined) {
+        ref = { offset: this.#extents[index * 2] ?? 0, length: this.#extents[index * 2 + 1] ?? 0 };
+        extents.set(index, ref);
+      }
+      return ref;
+    };
+    const data = (): ChunkData => {
+      const ref = extent();
+      return { extent: ref, offset: reader.uint(), length: reader.uint() };
+    };
+    const blob = (): BlobRef => ({ ...data(), checksum: reader.u32() });
+    const columns: ColumnChunk[] = [];
+    for (let k = 0; k < this.#ids.length; k++) {
+      const columnId = this.#ids[k] ?? 0;
+      if (!includes(columnId)) continue;
+      reader.at = this.#positions[k] ?? 0;
+      const type = this.#types[this.#typeCodes[k] ?? 0];
+      if (!type) throw new ManifestCorruptionError("Missing validated type");
+      const chunkData = data(),
+        directory = blob(),
+        statistics = readStatistics(reader);
+      const distinctSketch = reader.u8() === 0 ? null : blob();
+      columns.push({ columnId, type, data: chunkData, directory, statistics, distinctSketch });
+    }
+    return columns;
+  }
+  root(header: GroupRoot): GroupRoot {
+    let complete: readonly ColumnChunk[] | undefined;
+    const materialize = () =>
+      this.select(
+        undefined,
+        header.rowIds.kind === "column" ? header.rowIds.ref.extent : undefined,
+      );
+    if (header.rowIds.kind === "column") {
+      Object.freeze(header.rowIds.ref.extent);
+      Object.freeze(header.rowIds.ref);
+    }
+    const root: GroupRoot = Object.freeze({
+      rowCount: header.rowCount,
+      rowIds: Object.freeze(header.rowIds),
+      get columns() {
+        return (complete ??= materialize());
+      },
+    });
+    rootViews.set(root, this);
+    return root;
+  }
+}
+
+/** Complete semantics are unchanged; scan callers can avoid forcing the complete graph. */
+export function selectGroupRootColumns(
+  root: GroupRoot,
+  wanted: readonly number[] | ((id: number) => boolean),
+): ColumnChunk[] {
+  const view = rootViews.get(root);
+  if (view !== undefined) return view.select(wanted);
+  return root.columns.filter((c) =>
+    typeof wanted === "function" ? wanted(c.columnId) : wanted.includes(c.columnId),
+  );
+}
+/** Only private compact views create new per-query refs rather than borrowing eager objects. */
+export function isValidatedGroupRoot(root: GroupRoot): boolean {
+  return rootViews.has(root);
+}
+export function groupRootColumnCount(root: GroupRoot): number {
+  return rootViews.get(root)?.count ?? root.columns.length;
+}
+
+/**
+ * Optional cache representation. All original checks run before publishing any view. The
+ * encoded copy and packed arrays are private; no pool/cache/lease bytes are retained. Refusal
+ * returns null so a fitting ordinary decode can proceed with its original minimum.
+ */
+export function tryDecodeGroupRootView(
+  bytes: Uint8Array,
+  budget: ByteBudget,
+): Parsed<GroupRoot> | null {
+  if (bytes.length > MAX_BLOB_BYTES)
+    throw new ManifestCorruptionError("A group root exceeds its cap");
+  // 16E+16C <= 8*encodedLength: extent/column regions have at least 2E and 8C bytes.
+  // Reserve the whole construction peak, including transient complete validation objects.
+  const maximum = 2 * parseCharge(bytes.length) + bytes.length + ROOT_VIEW_FIXED_BYTES;
+  if (!optionalParseAllocation(budget, maximum)) return null;
+  try {
+    const view = new RootView(new Uint8Array(bytes));
+    const reader = new ByteReader(view.of);
+    const header = readGroupRoot(reader, view);
+    reader.end();
+    const value = view.root(header),
+      charge = view.charge;
+    budget.free(maximum - charge);
+    return { value, charge };
+  } catch (error) {
+    budget.free(maximum);
+    if (error instanceof ManifestCorruptionError) throw error;
+    throw new ManifestCorruptionError(`Manifest blob does not decode: ${String(error)}`, {
+      cause: error,
+    });
+  }
 }
 
 // ── Table statistics (`TableRoot.statistics`) ──────────────────────────────────────────────────

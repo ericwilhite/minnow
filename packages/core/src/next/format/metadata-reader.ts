@@ -20,7 +20,8 @@ import {
   decodeGroupIndex,
   decodeGroupPage,
   decodeGroupRoot,
-  ParseBudgetError,
+  tryDecodeGroupRootView,
+  optionalParseAllocation,
   type GroupPageEntry,
   type Parsed,
 } from "./manifest-codec.js";
@@ -30,9 +31,25 @@ import type { Held, ManifestReader } from "./reachable.js";
 export type MaybePromise<T> = T | Promise<T>;
 
 export interface MetadataCaches {
+  /** Owner opt-in: complete validation with private selective materialization. */
+  readonly validatedRoots?: boolean;
   readonly groupRoots?: BlobCache<GroupRoot>;
   readonly groupPages?: BlobCache<readonly GroupRef[]>;
   readonly groupIndexes?: BlobCache<readonly GroupPageEntry[]>;
+}
+
+// The owner already registers/clears these caches. This weak binding adds no second cache,
+// and neither a query nor a snapshot controls their lifetime. Different spaces are isolated.
+const ownerCaches = new WeakMap<ExtentReader, MetadataCaches>();
+export function bindMetadataCaches(space: ExtentReader, caches: MetadataCaches): () => void {
+  if (ownerCaches.has(space)) throw new Error("Metadata caches already bound to this owner");
+  ownerCaches.set(space, caches);
+  return () => {
+    if (ownerCaches.get(space) === caches) ownerCaches.delete(space);
+  };
+}
+export function metadataCachesFor(space: ExtentReader): MetadataCaches | undefined {
+  return ownerCaches.get(space);
 }
 
 type Decoder<T> = (bytes: Uint8Array, budget: ByteBudget) => Parsed<T>;
@@ -47,7 +64,13 @@ export class MetadataReader {
   }
 
   groupRoot(ref: BlobRef, budget: ByteBudget): MaybePromise<Held<GroupRoot>> {
-    return this.#read(ref, budget, decodeGroupRoot, this.#caches.groupRoots);
+    return this.#read(
+      ref,
+      budget,
+      decodeGroupRoot,
+      this.#caches.groupRoots,
+      this.#caches.validatedRoots === true ? tryDecodeGroupRootView : undefined,
+    );
   }
 
   groupPage(ref: BlobRef, budget: ByteBudget): MaybePromise<Held<readonly GroupRef[]>> {
@@ -63,26 +86,35 @@ export class MetadataReader {
     budget: ByteBudget,
     decode: Decoder<T>,
     cache: BlobCache<T> | undefined,
+    optionalDecode?: (bytes: Uint8Array, budget: ByteBudget) => Parsed<T> | null,
   ): MaybePromise<Held<T>> {
     const hit = cache?.pin(ref) ?? null;
     if (cache !== undefined && hit !== null) {
-      if (!budget.allocate(hit.size)) {
-        cache.unpin(ref);
-        throw new ParseBudgetError(hit.size);
+      const owner = cache;
+      if (optionalParseAllocation(budget, hit.size)) {
+        return held(hit.value, () => {
+          budget.free(hit.size);
+          owner.unpin(ref);
+        });
       }
-      return held(hit.value, () => {
-        budget.free(hit.size);
-        cache.unpin(ref);
-      });
+      cache.unpin(ref);
+      // A larger optional representation must not raise the ordinary read minimum.
+      cache = undefined;
+      optionalDecode = undefined;
     }
     const parse = (bytes: Uint8Array): Held<T> => {
-      const parsed = decode(bytes, budget);
+      const optional = optionalDecode?.(bytes, budget);
+      const parsed = optional ?? decode(bytes, budget);
       const charge = parsed.charge;
-      if (cache === undefined) return held(parsed.value, () => budget.free(charge));
-      const shared = cache.admit(ref, parsed.value, charge);
+      // Only one representation/charge is admitted per key. A declined optional build is
+      // uncached, avoiding a concurrent eager/view race with different resident sizes.
+      if (cache === undefined || (optionalDecode !== undefined && optional == null))
+        return held(parsed.value, () => budget.free(charge));
+      const owner = cache;
+      const shared = owner.admit(ref, parsed.value, charge);
       return held(shared, () => {
         budget.free(charge);
-        cache.unpin(ref);
+        owner.unpin(ref);
       });
     };
     const resident = this.#space.peek(ref);

@@ -235,12 +235,12 @@ export class QueryRuntime {
   #nonRetainingReads = false;
   #queryRoots: QueryRoots | undefined;
 
-  /** Optional, query-local parsed roots; no sizing lease survives execution admission. */
+  /** Query-local selected facts may borrow owner validation; no sizing lease survives admission. */
   metadataCaches(retain = true, sources?: readonly RootColumns[]): QueryRoots | undefined {
     if (!retain || this.#closed || this.signal.aborted) return undefined;
     if (this.#queryRoots !== undefined) return this.#queryRoots;
     if (sources === undefined) return undefined;
-    const roots = new QueryRoots(this.request.governor, sources);
+    const roots = QueryRoots.forReader(this.request.governor, sources, this.view.pages);
     this.#queryRoots = roots;
     // Global cleanup runs last, after phase readers, in-flight jobs and caller pins drain.
     this.#dispose.unshift(() => {

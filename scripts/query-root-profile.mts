@@ -124,6 +124,9 @@ try {
   const { ChunkReader } = (await loadModule(
     "page/reader",
   )) as typeof import("../packages/core/dist/next/page/reader.js");
+  const codec = (await loadModule(
+    "format/manifest-codec",
+  )) as typeof import("../packages/core/dist/next/format/manifest-codec.js");
   const root = MetadataReader.prototype.groupRoot,
     open = ChunkReader.open,
     decode = ChunkReader.prototype.decodeRange,
@@ -132,8 +135,17 @@ try {
   MetadataReader.prototype.groupRoot = function (ref, budget) {
     const got = root.call(this, ref, budget);
     const keep = (held: Awaited<typeof got>) => {
-      inc("completeRoots");
-      inc("completeColumns", held.value.columns.length);
+      inc("rootBorrows");
+      const lazy = Object.getOwnPropertyDescriptor(held.value, "columns")?.get !== undefined;
+      inc(lazy ? "lazyRootBorrows" : "eagerRootBorrows");
+      // Never force all columns merely to count a lazy view. Older runtimes have no helper.
+      inc(
+        "metadataColumnSlots",
+        typeof codec.groupRootColumnCount === "function"
+          ? codec.groupRootColumnCount(held.value)
+          : held.value.columns.length,
+      );
+      if (lazy) return held;
       const extents = new Set<object>();
       if (held.value.rowIds.kind === "column") extents.add(held.value.rowIds.ref.extent);
       for (const column of held.value.columns) {
@@ -225,6 +237,14 @@ function category(stack: readonly Frame[]): string {
   if (first === "(garbage collector)") return "GC (unassigned)";
   if (first !== undefined && ["(program)", "(idle)", "(root)"].includes(first))
     return "idle/program";
+  if (
+    stack.some(
+      (frame) =>
+        frame.url.includes("/next/format/manifest-codec.js") &&
+        ["select", "selectGroupRootColumns"].includes(frame.functionName),
+    )
+  )
+    return "validated metadata materialization";
   for (const frame of stack) {
     const u = frame.url,
       n = frame.functionName;

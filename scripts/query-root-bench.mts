@@ -31,6 +31,9 @@ interface AAReport {
   smoke: boolean;
   mode: string;
   decodeOnly: boolean;
+  validatedRoots: boolean;
+  aaBiasFloorMs: number;
+  affinity: string | null;
   rows: number;
   warmups: number;
   repeats: number;
@@ -38,6 +41,19 @@ interface AAReport {
   sources: Record<string, string>;
   imageHash: string | null;
   result: Result;
+}
+/** The lead's stricter rule: paired gain exceeds BOTH observed bias and paired IQR. */
+export function biasAdjustedGain(
+  cpu: Pick<
+    ReturnType<typeof pairedCPU>,
+    "medianDeltaMs" | "iqrDeltaMs" | "favoursCandidate" | "requiredFavourable"
+  >,
+  biasMs: number,
+): boolean {
+  if (!Number.isFinite(biasMs) || biasMs < 0) throw new Error("Invalid A/A bias");
+  return (
+    -cpu.medianDeltaMs > biasMs + cpu.iqrDeltaMs && cpu.favoursCandidate >= cpu.requiredFavourable
+  );
 }
 function normalized(result: Result, repeats: number) {
   return result.records.map((record) => ({
@@ -96,6 +112,19 @@ export function auditRootWorkers(result: Result, repeats: number): void {
 }
 export async function runQueryRootBench(mode: "whole" | "component" = "whole") {
   const decodeOnly = process.argv.includes("--decode-only");
+  const validatedRoots = process.argv.includes("--validated-roots");
+  const aaBiasFloorMs = Number(option("--aa-bias-ms", "0"));
+  if (!Number.isFinite(aaBiasFloorMs) || aaBiasFloorMs < 0)
+    throw new Error("Invalid A/A bias floor");
+  const affinity =
+    process.platform === "linux"
+      ? (/^Cpus_allowed_list:\s*(.+)$/m
+          .exec(await readFile("/proc/self/status", "utf8"))?.[1]
+          ?.trim() ?? null)
+      : null;
+  let observedBiasMs = aaBiasFloorMs;
+  if (validatedRoots && (decodeOnly || mode !== "component"))
+    throw new Error("--validated-roots requires handoff component mode");
   if (decodeOnly && mode !== "component") throw new Error("--decode-only requires component mode");
   const aa = process.argv.includes("--aa"),
     smoke = process.argv.includes("--smoke") || process.argv.includes("--check");
@@ -221,6 +250,9 @@ export async function runQueryRootBench(mode: "whole" | "component" = "whole") {
         checked.smoke ||
         checked.mode !== mode ||
         checked.decodeOnly !== decodeOnly ||
+        checked.validatedRoots !== validatedRoots ||
+        checked.aaBiasFloorMs !== aaBiasFloorMs ||
+        checked.affinity !== affinity ||
         checked.rows !== rows ||
         checked.repeats !== repeats ||
         checked.warmups !== warmups ||
@@ -237,7 +269,12 @@ export async function runQueryRootBench(mode: "whole" | "component" = "whole") {
         )
       )
         throw new Error("A/A build identity mismatch");
+      observedBiasMs = Math.max(
+        aaBiasFloorMs,
+        ...normalized(checked.result, repeats).map((r) => Math.abs(r.cpu.medianDeltaMs)),
+      );
       if (
+        aaBiasFloorMs === 0 &&
         checked.result.records.some(
           (r) => r.acceptance.acceptedGain || r.acceptance.significantRegression,
         )
@@ -260,8 +297,9 @@ export async function runQueryRootBench(mode: "whole" | "component" = "whole") {
         execArgv: ["--max-old-space-size=2048"],
         data: {
           runtimeRoot: root,
-          cached: decodeOnly ? false : cached,
+          cached: decodeOnly ? false : validatedRoots ? true : cached,
           decodeOnly,
+          validatedRoots,
           warmups,
           repeats,
         } satisfies RootComponentConfig,
@@ -289,6 +327,10 @@ export async function runQueryRootBench(mode: "whole" | "component" = "whole") {
       smoke,
       mode,
       decodeOnly,
+      validatedRoots,
+      aaBiasFloorMs,
+      affinity,
+      observedBiasMs,
       rows,
       warmups,
       repeats,
@@ -298,12 +340,19 @@ export async function runQueryRootBench(mode: "whole" | "component" = "whole") {
       imageHash,
       result,
       normalized: normalized(result, repeats),
+      biasAdjusted: normalized(result, repeats).map((record) => ({
+        workload: record.workload,
+        biasMs: observedBiasMs,
+        requiredGainMs: observedBiasMs + record.cpu.iqrDeltaMs,
+        acceptedGain: !aa && !smoke && biasAdjustedGain(record.cpu, observedBiasMs),
+      })),
     };
     await writeFile(join(output, "results.json"), JSON.stringify(report, null, 2) + "\n");
     console.log(JSON.stringify(report.normalized));
     if (
       aa &&
       !smoke &&
+      aaBiasFloorMs === 0 &&
       result.records.some((r) => r.acceptance.acceptedGain || r.acceptance.significantRegression)
     )
       throw new Error(

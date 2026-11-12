@@ -3924,6 +3924,7 @@ export const QUERY_ROOT_REUSE_REACH = [
   "sizing and execution share validated root facts",
   "multiple columns and batches",
   "fresh query owns its roots",
+  "later query reuses owner validation",
   "cancel after output",
   "zero charges after close",
 ] as const;
@@ -3949,6 +3950,7 @@ export const QUERY_ROOT_VM_REACH = [
   "exact row volume",
   "all workers drained",
   "complete decode in both arms",
+  "owner cache in both arms",
 ] as const;
 
 export const QUERY_ROOT_VOLUME_REACH = [
@@ -4324,4 +4326,41 @@ export const WINDOW_PARTITION_DEMAND_REACH = [
   "mismatching order",
   "full ordered result",
   "multiple partition keys",
+] as const;
+
+/** Complete owner validation and private selective materialization are independently observed. */
+export const VALIDATED_ROOT_REACH = [
+  "owner isolation",
+  "warm hit skips all validation",
+  "only selected columns materialize",
+  "many-alias selection stays funded",
+  "fresh ref and statistic ownership",
+  "pinned roots remain charged",
+  "full reference identity",
+  "optional refusal preserves ordinary minimum",
+  "owned encoded bytes survive source release",
+  "unselected corruption refused",
+  "complete eager equality",
+  "Buffer inputs own a tight copy",
+  "concurrent admission drains",
+  "cancelled borrower hands off or releases",
+  "zero charges and detached binding",
+] as const;
+
+export const VALIDATED_ROOT_PRESSURE_REACH = [
+  "optional workspace refused synchronously",
+  "ordinary native bound unchanged",
+  "no optional FIFO wait",
+  "zero charges after fallback",
+] as const;
+
+/** Packing interns extent identity within a complete root, never between selected graphs. */
+export const ROOT_PACKING_REACH = [
+  "one packed extent",
+  "row IDs share selected data",
+  "row IDs share unselected data",
+  "complete before selection",
+  "selection before complete",
+  "fresh selected extent graphs",
+  "canonical bytes and zero charges",
 ] as const;
