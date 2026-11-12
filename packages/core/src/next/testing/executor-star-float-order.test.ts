@@ -24,7 +24,10 @@ const bits = (n: number) => {
 };
 const text = (s: string | null) =>
   s === null ? "NULL::text" : `'${s.replaceAll("'", "''")}'::text`;
-const float = (n: number) => `'${Object.is(n, -0) ? "-0" : String(n)}'::double precision`;
+const float = (n: number | null) =>
+  n === null
+    ? "NULL::double precision"
+    : `'${Object.is(n, -0) ? "-0" : String(n)}'::double precision`;
 const canonical = (rows: Array<Record<string, unknown>>) =>
   rows
     .map((r) => ({
@@ -35,7 +38,7 @@ const canonical = (rows: Array<Record<string, unknown>>) =>
     .sort((a, b) => JSON.stringify(a.keys).localeCompare(JSON.stringify(b.keys)));
 interface Trace {
   keys: Array<string | null>;
-  value: number;
+  value: number | null;
 }
 
 it.each(seedsFor("next-star-float-order", [0xb771, 0xb772]))(
@@ -61,19 +64,24 @@ it.each(seedsFor("next-star-float-order", [0xb771, 0xb772]))(
       let history = 0;
       await fc.assert(
         fc.asyncProperty(
-          fc.constantFrom("finite", "special", "overflow"),
+          fc.constantFrom("sum", "avg", "min", "max"),
+          fc.constantFrom("finite", "special", "overflow", "sxx", "nulls"),
           fc.constantFrom(0, 65, 2049),
           fc.integer({ min: 0, max: 7 }),
-          async (regime, n, shift) => {
+          async (fn, regime, n, shift) => {
             reach.beginHistory();
             const table = `f${String(history++)}`;
             await core.execute(`CREATE TABLE ${table}(ka TEXT,kb TEXT,kc TEXT,v DOUBLE PRECISION)`);
             const values =
-              regime === "finite"
-                ? [1e16, 1, -1e16, -0, 2 ** -40, -(2 ** -40), 0.25]
-                : regime === "special"
-                  ? [Infinity, -Infinity, NaN, -0, 1, -1, 0.25]
-                  : [1e308];
+              regime === "nulls"
+                ? [null]
+                : regime === "finite"
+                  ? [1e16, 1, -1e16, -0, 2 ** -40, -(2 ** -40), 0.25]
+                  : regime === "special"
+                    ? [Infinity, -Infinity, NaN, -0, 1, -1, 0.25]
+                    : regime === "sxx"
+                      ? [1e154, -1e154, 1]
+                      : [1e308];
             await core.writeBatch(
               "insertBatch",
               table,
@@ -81,12 +89,12 @@ it.each(seedsFor("next-star-float-order", [0xb771, 0xb772]))(
                 ka: `k${String(i % 8)}`,
                 kb: `k${String(Math.floor(i / 8) % 8)}`,
                 kc: `k${String(Math.floor(i / 64) % 8)}`,
-                v: values[(i + shift) % values.length] ?? 0,
+                v: values[(i + shift) % values.length] ?? (regime === "nulls" ? null : 0),
               })),
             );
             await core.harness.path.recycleLog();
             await core.harness.path.quiesce();
-            const sql = `SELECT a.t AS x,b.t AS y,c.label AS z,count(*) AS n,sum(f.v) AS s FROM ${table} f JOIN a ON a.k=f.ka JOIN b ON b.k=f.kb JOIN c ON c.k=f.kc GROUP BY a.t,b.t,c.label`;
+            const sql = `SELECT a.t AS x,b.t AS y,c.label AS z,count(*) AS n,${fn}(f.v) AS s FROM ${table} f JOIN a ON a.k=f.ka JOIN b ON b.k=f.kb JOIN c ON c.k=f.kc GROUP BY a.t,b.t,c.label`;
             const observe = async (coded: boolean) => {
               const maps = new Map<number, Map<number | null, string | null>>(),
                 trace: Trace[] = [];
@@ -126,7 +134,7 @@ it.each(seedsFor("next-star-float-order", [0xb771, 0xb772]))(
                 .spyOn(AggregateOperator.prototype, "pushPrepared")
                 .mockImplementation(function (this: AggregateOperator, ...args) {
                   const [batch] = args;
-                  const arg = this.rel.aggregates.find((a) => a.fn === "sum")?.args[0];
+                  const arg = this.rel.aggregates.find((a) => a.fn === fn)?.args[0];
                   if (arg?.op !== "column") throw new Error("Missing observed float sum");
                   const vector = batch.columns[arg.index];
                   if (!vector) throw new Error("Missing float input");
@@ -147,7 +155,8 @@ it.each(seedsFor("next-star-float-order", [0xb771, 0xb772]))(
                       return map.get(value) ?? null;
                     });
                     const value = valueAt(vector, row);
-                    if (typeof value !== "number") throw new Error("Expected float transition");
+                    if (value !== null && typeof value !== "number")
+                      throw new Error("Expected float transition");
                     trace.push({ keys, value });
                   }
                   return pushPrepared.call(this, ...args);
@@ -172,7 +181,10 @@ it.each(seedsFor("next-star-float-order", [0xb771, 0xb772]))(
             const control = await observe(false),
               candidate = await observe(true);
             const sequence = (trace: Trace[]) =>
-              trace.map((row) => ({ keys: row.keys, bits: bits(row.value) }));
+              trace.map((row) => ({
+                keys: row.keys,
+                bits: row.value === null ? null : bits(row.value),
+              }));
             expect(sequence(candidate.trace)).toEqual(sequence(control.trace));
             if (!control.error) {
               expect(control.trace).toHaveLength(n);
@@ -186,7 +198,7 @@ it.each(seedsFor("next-star-float-order", [0xb771, 0xb772]))(
               expect(candidate.result).toEqual(control.result);
             }
             if (control.trace.length > 0) {
-              const query = `SELECT x,y,z,count(*) AS n,sum(v ORDER BY ord) AS s FROM (VALUES ${control.trace.map((r, i) => `(${r.keys.map(text).join(",")},${float(r.value)},${String(i)})`).join(",")}) t(x,y,z,v,ord) GROUP BY x,y,z`;
+              const query = `SELECT x,y,z,count(*) AS n,${fn}(v ORDER BY ord) AS s FROM (VALUES ${control.trace.map((r, i) => `(${r.keys.map(text).join(",")},${float(r.value)},${String(i)})`).join(",")}) t(x,y,z,v,ord) GROUP BY x,y,z`;
               if (control.error)
                 await expect(pg.query(query)).rejects.toMatchObject({ code: "22003" });
               else
@@ -197,6 +209,7 @@ it.each(seedsFor("next-star-float-order", [0xb771, 0xb772]))(
             }
             expect(core.spill.bytesInUse).toBe(0);
             reach.reach(regime);
+            reach.reach(fn);
             reach.reach(n === 0 ? "empty" : n > 2048 ? "batch boundary" : "nonempty");
             reach.reach("identical native sequence");
             reach.reach("bit exact result");
@@ -204,13 +217,21 @@ it.each(seedsFor("next-star-float-order", [0xb771, 0xb772]))(
         ),
         {
           seed,
-          numRuns: 8,
+          numRuns: 20,
           examples: [
-            ["finite", 65, 0],
-            ["finite", 2049, 1],
-            ["special", 2049, 2],
-            ["overflow", 65, 0],
-            ["finite", 0, 0],
+            ["sum", "finite", 65, 0],
+            ["sum", "finite", 2049, 1],
+            ["sum", "special", 2049, 2],
+            ["sum", "overflow", 65, 0],
+            ["sum", "finite", 0, 0],
+            ["avg", "finite", 2049, 1],
+            ["avg", "sxx", 2049, 0],
+            ["avg", "special", 65, 0],
+            ["min", "special", 2049, 0],
+            ["max", "special", 2049, 0],
+            ["avg", "nulls", 65, 0],
+            ["min", "nulls", 65, 0],
+            ["max", "nulls", 65, 0],
           ],
         },
       );

@@ -39,7 +39,7 @@ export function starDictionaryShape(rel: Aggregate, volatile: boolean): StarDict
         a.filter === null &&
         a.orderBy.length === 0 &&
         ((a.fn === "count_star" && a.args.length === 0) ||
-          (a.fn === "sum" &&
+          (["sum", "avg", "min", "max"].includes(a.fn) &&
             a.args.length === 1 &&
             a.args[0]?.op === "column" &&
             a.args[0].type.kind === "float64")),

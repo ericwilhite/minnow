@@ -4452,6 +4452,12 @@ export const STAR_PRESSURE_REACH = [
 ] as const;
 
 export const STAR_FLOAT_REACH = [
+  "sum",
+  "avg",
+  "min",
+  "max",
+  "sxx",
+  "nulls",
   "finite",
   "special",
   "overflow",
