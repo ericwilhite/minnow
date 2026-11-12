@@ -44215,5 +44215,290 @@
       "spill_hash_join_text": "955ac6528ec4b7577fd5456b205509a4fa6058a4510d36de90115100560004a9"
     }
   },
-  "componentShape": "Gate B agg_numeric_grouped: text key, two exact NUMERIC SUMs, MIN/MAX; same accumulator implements AVG, whose exact division/count/fallback is tested separately. No AVG-specific throughput claim."
+  "componentShape": "Gate B agg_numeric_grouped: text key, two exact NUMERIC SUMs, MIN/MAX; same accumulator implements AVG, whose exact division/count/fallback is tested separately. No AVG-specific throughput claim.",
+  "validation": {
+    "fullGate": [
+      {
+        "group": 1,
+        "command": [
+          "npx",
+          "vitest",
+          "run",
+          "packages/core/src/next/page",
+          "packages/core/src/next/format",
+          "packages/core/src/next/memory",
+          "packages/core/src/next/hash",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-numeric-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 146.41965099598747,
+        "log": "/home/eric/.cache/b4-read-recipe/numeric-main-tests-1.log",
+        "files": 43,
+        "tests": 470
+      },
+      {
+        "group": 2,
+        "command": [
+          "npx",
+          "vitest",
+          "run",
+          "packages/core/src/next/storage",
+          "packages/core/src/next/spill",
+          "packages/core/src/next/access",
+          "packages/core/src/next/keys",
+          "packages/core/src/next/vector",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-numeric-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 300.3517955840798,
+        "log": "/home/eric/.cache/b4-read-recipe/numeric-main-tests-2.log",
+        "files": 42,
+        "tests": 593
+      },
+      {
+        "group": 3,
+        "command": [
+          "npx",
+          "vitest",
+          "run",
+          "packages/core/src/next/exec",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-numeric-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 635.0040695619537,
+        "log": "/home/eric/.cache/b4-read-recipe/numeric-main-tests-3.log",
+        "files": 145,
+        "tests": 1564
+      },
+      {
+        "group": 4,
+        "split": true,
+        "exit": 0,
+        "files": 286,
+        "tests": 1769,
+        "seconds": 2664.2707151690265,
+        "parts": [
+          {
+            "folder": "ir",
+            "command": [
+              "node",
+              "node_modules/vitest/vitest.mjs",
+              "run",
+              "packages/core/src/next/ir",
+              "--config",
+              "/home/eric/.cache/b4-read-recipe/vitest-numeric-two.mts",
+              "--maxWorkers=2"
+            ],
+            "exit": 0,
+            "seconds": 1.2245020680129528,
+            "files": 2,
+            "tests": 7,
+            "log": "/home/eric/.cache/b4-read-recipe/numeric-main-tests-4-ir.log"
+          },
+          {
+            "folder": "lower",
+            "command": [
+              "node",
+              "node_modules/vitest/vitest.mjs",
+              "run",
+              "packages/core/src/next/lower",
+              "--config",
+              "/home/eric/.cache/b4-read-recipe/vitest-numeric-two.mts",
+              "--maxWorkers=2"
+            ],
+            "exit": 0,
+            "seconds": 4.05148234392982,
+            "files": 8,
+            "tests": 56,
+            "log": "/home/eric/.cache/b4-read-recipe/numeric-main-tests-4-lower.log"
+          },
+          {
+            "folder": "owner",
+            "command": [
+              "node",
+              "node_modules/vitest/vitest.mjs",
+              "run",
+              "packages/core/src/next/owner",
+              "--config",
+              "/home/eric/.cache/b4-read-recipe/vitest-numeric-two.mts",
+              "--maxWorkers=2"
+            ],
+            "exit": 0,
+            "seconds": 1.5189042370766401,
+            "files": 4,
+            "tests": 28,
+            "log": "/home/eric/.cache/b4-read-recipe/numeric-main-tests-4-owner.log"
+          },
+          {
+            "folder": "dependency-rules",
+            "command": [
+              "node",
+              "node_modules/vitest/vitest.mjs",
+              "run",
+              "packages/core/src/next/dependency-rules",
+              "--config",
+              "/home/eric/.cache/b4-read-recipe/vitest-numeric-two.mts",
+              "--maxWorkers=2"
+            ],
+            "exit": 0,
+            "seconds": 1.474493031972088,
+            "files": 1,
+            "tests": 3,
+            "log": "/home/eric/.cache/b4-read-recipe/numeric-main-tests-4-dependency-rules.log"
+          },
+          {
+            "folder": "types",
+            "command": [
+              "node",
+              "node_modules/vitest/vitest.mjs",
+              "run",
+              "packages/core/src/next/types",
+              "--config",
+              "/home/eric/.cache/b4-read-recipe/vitest-numeric-two.mts",
+              "--maxWorkers=2"
+            ],
+            "exit": 0,
+            "seconds": 0.7984798779943958,
+            "files": 1,
+            "tests": 28,
+            "log": "/home/eric/.cache/b4-read-recipe/numeric-main-tests-4-types.log"
+          },
+          {
+            "folder": "testing",
+            "command": [
+              "node",
+              "node_modules/vitest/vitest.mjs",
+              "run",
+              "packages/core/src/next/testing",
+              "--config",
+              "/home/eric/.cache/b4-read-recipe/vitest-numeric-two.mts",
+              "--maxWorkers=2"
+            ],
+            "exit": 0,
+            "seconds": 1195.0415087359725,
+            "files": 147,
+            "tests": 950,
+            "log": "/home/eric/.cache/b4-read-recipe/numeric-main-tests-4-testing.log"
+          },
+          {
+            "folder": "write",
+            "command": [
+              "node",
+              "node_modules/vitest/vitest.mjs",
+              "run",
+              "packages/core/src/next/write",
+              "--config",
+              "/home/eric/.cache/b4-read-recipe/vitest-numeric-two.mts",
+              "--maxWorkers=2"
+            ],
+            "exit": 0,
+            "seconds": 1460.1613448740682,
+            "files": 123,
+            "tests": 697,
+            "log": "/home/eric/.cache/b4-read-recipe/numeric-main-tests-4-write.log"
+          }
+        ]
+      },
+      {
+        "group": 5,
+        "command": [
+          "npx",
+          "vitest",
+          "run",
+          "packages/core/browser/next-storage-run.test.ts",
+          "packages/core/src/tree-shaking.test.ts",
+          "packages/kysely/src/tree-shaking.test.ts",
+          "packages/core/src/testing/seeds.test.ts",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-numeric-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 20.810124109964818,
+        "log": "/home/eric/.cache/b4-read-recipe/numeric-main-tests-5.log",
+        "files": 4,
+        "tests": 64
+      },
+      {
+        "group": 6,
+        "command": [
+          "npx",
+          "vitest",
+          "run",
+          "scripts",
+          "--config",
+          "/home/eric/.cache/b4-read-recipe/vitest-numeric-two.mts",
+          "--maxWorkers=2"
+        ],
+        "exit": 0,
+        "seconds": 257.23407154297456,
+        "log": "/home/eric/.cache/b4-read-recipe/numeric-main-tests-6.log",
+        "files": 42,
+        "tests": 218
+      }
+    ],
+    "staticFinalAttempts": {
+      "typecheck": {
+        "name": "typecheck",
+        "command": ["npm", "run", "typecheck"],
+        "exit": 0,
+        "seconds": 235.69885811500717,
+        "log": "/home/eric/.cache/b4-read-recipe/numeric-main-gate-typecheck.log"
+      },
+      "lint": {
+        "name": "lint",
+        "command": ["npm", "run", "lint"],
+        "exit": 0,
+        "seconds": 406.81811257696245,
+        "log": "/home/eric/.cache/b4-read-recipe/numeric-main-gate-lint.log"
+      },
+      "format": {
+        "name": "format",
+        "command": ["npm", "run", "format"],
+        "exit": 0,
+        "seconds": 93.73135966609698,
+        "log": "/home/eric/.cache/b4-read-recipe/numeric-main-gate-format.log"
+      },
+      "api": {
+        "name": "api",
+        "command": ["npm", "run", "api:check"],
+        "exit": 0,
+        "log": "/home/eric/.cache/b4-read-recipe/numeric-main-gate-api.log"
+      },
+      "version": {
+        "name": "version",
+        "command": ["npm", "run", "version:check"],
+        "exit": 0,
+        "log": "/home/eric/.cache/b4-read-recipe/numeric-main-gate-version.log"
+      }
+    },
+    "buildAndSite": {
+      "exit": 0,
+      "observedExecSession": 55442,
+      "log": "/home/eric/.cache/b4-read-recipe/numeric-main-gate-build.log"
+    },
+    "node22": {
+      "exit": 0,
+      "tests": 2,
+      "seconds": 13.63,
+      "log": "/home/eric/.cache/b4-read-recipe/numeric-main-node22.log"
+    },
+    "resolver": "/home/eric/.cache/b4-numeric-fixed/packages/core/package.json",
+    "interruptedGroup4": {
+      "outerExit": 143,
+      "childExit": "unrecorded",
+      "printedFiles": 286,
+      "printedTests": 1769,
+      "acceptedAsClean": false,
+      "log": "/home/eric/.cache/b4-read-recipe/numeric-main-tests-4-interrupted.log",
+      "action": "rerun all seven folders separately, retaining all seeds and run counts"
+    },
+    "allOriginalSeedsAndRunCountsRetained": true
+  }
 }
