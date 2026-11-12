@@ -36,6 +36,8 @@ const CASES = [
   "int64",
   "int64 negative",
   "int64 exact",
+  "int64 boundaries",
+  "int64 carry overflow",
   "int128",
   "wide",
   "mixed",
@@ -76,7 +78,14 @@ it.each(seedsFor("next-numeric-fixed", [0xb721, 0xb722]))(
         async (kind, coefficient, baseScale) => {
           reach.beginHistory();
           const groups = kind === "many groups" ? 1025 : kind === "constant" ? 1 : 3;
-          const length = kind === "full batch" ? 2048 : kind === "many groups" ? 1025 : 65;
+          const length =
+            kind === "int64 boundaries"
+              ? 3
+              : kind === "full batch"
+                ? 2048
+                : kind === "many groups"
+                  ? 1025
+                  : 65;
           const gov = new Governor(32 << 20);
           const grant = await gov.admit({
             label: "numeric fold",
@@ -110,6 +119,12 @@ it.each(seedsFor("next-numeric-fixed", [0xb721, 0xb722]))(
                 if (kind === "special" && i % 11 === 0)
                   return ["NaN", "Infinity", "-Infinity"][i % 3] as
                     "NaN" | "Infinity" | "-Infinity";
+                if (kind === "int64 boundaries")
+                  return [[(1n << 63n) - 1n, -(1n << 63n), -1n][i % 3] ?? 0n, scale];
+                if (kind === "int64 carry overflow") {
+                  const edge = (1n << 63n) - 1n;
+                  return [[edge, 1n, -1n, -edge - 1n, -1n, 1n][Math.floor(i / 3) % 6] ?? 0n, scale];
+                }
                 const magnitude = kind.startsWith("int64")
                   ? (kind === "int64 negative" || (kind === "int64 exact" && i % 2 !== 0)
                       ? -1n

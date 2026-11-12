@@ -3897,6 +3897,8 @@ export const NUMERIC_FIXED_REACH = [
   "int64",
   "int64 negative",
   "int64 exact",
+  "int64 boundaries",
+  "int64 carry overflow",
   "int64 batch attempted",
   "int128",
   "wide",
@@ -3937,4 +3939,19 @@ export const NUMERIC_BENCH_REACH = [
   "dictionary epochs",
   "full timed volume",
   "zero charges",
+] as const;
+
+export const NUMERIC_FIXED_SQL_REACH = [
+  "small",
+  "int64 fit",
+  "positive overflow",
+  "negative overflow",
+  "cancelling overflow",
+  "grouped",
+  "scalar",
+  "selection",
+  "flushed scan",
+  "multi-batch",
+  "PGlite exact",
+  "zero resources",
 ] as const;
