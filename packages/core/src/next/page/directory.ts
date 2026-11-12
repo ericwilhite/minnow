@@ -166,7 +166,7 @@ class Reader {
   }
   raw(count: number): Uint8Array {
     this.#need(count);
-    const out = new Uint8Array(this.bytes.subarray(this.at, this.at + count));
+    const out = this.bytes.slice(this.at, this.at + count);
     this.at += count;
     return out;
   }

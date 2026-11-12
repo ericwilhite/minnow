@@ -10,7 +10,7 @@ import { PageEncoding } from "../format/manifest.js";
 import type { Grant, MemoryGovernor } from "../memory/governor.js";
 import { admitWorkingSet } from "../memory/working-set.js";
 import { MemoryAdmissionError } from "../memory/governor.js";
-import { ChunkReader, PageBudgetError, type PreparedChunk } from "../page/reader.js";
+import { ChunkReader, PageBudgetError } from "../page/reader.js";
 import { MAX_VALUE_BYTES } from "./large-value.js";
 import { MAX_BLOB_BYTES, MAX_READ_BYTES } from "../storage/extents.js";
 import { BATCH_ROWS, dataBytes } from "../vector/vector.js";
@@ -333,7 +333,7 @@ export function boundSource(
           immediate ??
           (yield* readValue(scratchMinimum(governor, "read-step/sizing", capacity, signal)));
         const budget = new SizingBudget(grant, immediate === null ? capacity : preferred);
-        const readers: Array<{ close(): void }> = [];
+        const readers: ChunkReader[] = [];
         let root: import("../format/reachable.js").Held<ScanRootFacts> | null = null;
         let retry = false,
           required = capacity;
@@ -389,9 +389,9 @@ export function boundSource(
                 throw new TypeError("read bound column");
               const chunk = root.value.columns.find((candidate) => candidate.columnId === column);
               if (!chunk) continue;
-
-              // Exact-sized encoded reads keep this attempt's complete reservation a hard limit.
-              // Only ordinary query metadata may survive in its separately charged cache.
+              const before = budget.allocated;
+              // No directory/inflate admission is needed by the sizing pass. Exact-sized
+              // encoded reads keep this attempt's complete reservation a hard limit.
               const pages: SpaceReader = {
                 peek: () => null,
                 read: (refs, options) =>
@@ -403,41 +403,22 @@ export function boundSource(
                     signal,
                   }),
               };
-              let prepared: PreparedChunk;
-              if (caches === undefined || retention.retain === false) {
-                // Preserve the independent complete reader path for unprepared/one-pass callers.
-                const before = budget.allocated;
-                const reader = yield* readValue(
-                  ChunkReader.open(pages, chunk, { budget, once: true, signal, task }),
-                );
-                prepared = {
-                  directory: reader.directory,
-                  nativeBytes: budget.allocated - before,
-                  reader: () => reader,
-                  release: () => reader.close(),
-                };
-              } else {
-                prepared = yield* readValue(
-                  ChunkReader.prepare(caches.reader(pages), chunk, {
-                    budget,
-                    // Ordinary query-local facts; the exact facade still keeps payload reads bounded.
-                    once: false,
-                    signal,
-                    task,
-                  }),
-                );
-              }
-              readers.push({ close: () => prepared.release() });
-              directories += prepared.nativeBytes;
-              // Directory-only facts need no mutable reader. Header proofs create it lazily.
-              const headerReader = () => prepared.reader();
-              const directory = prepared.directory;
+              const reader = yield* readValue(
+                ChunkReader.open(pages, chunk, {
+                  budget,
+                  once: true,
+                  signal,
+                  task,
+                }),
+              );
+              readers.push(reader);
+              directories += budget.allocated - before;
               largestOpen = Math.max(largestOpen, chunk.directory.length);
               io = Math.max(io, Math.min(MAX_READ_BYTES, chunk.directory.length));
-              const dictionary = directory.dictionary;
+              const dictionary = reader.directory.dictionary;
               if (dictionary) {
                 const beforeDictionary = budget.allocated;
-                yield* readValue(headerReader().loadDictionary());
+                yield* readValue(reader.loadDictionary());
                 dictionaries +=
                   dictionary.length +
                   budget.allocated -
@@ -446,7 +427,7 @@ export function boundSource(
                   1024;
                 io = Math.max(io, Math.min(MAX_READ_BYTES, dictionary.length));
               }
-              for (const [index, page] of directory.pages.entries()) {
+              for (const [index, page] of reader.directory.pages.entries()) {
                 if (page.firstRow >= rows) break;
                 const encoded = page.length;
                 let raw = encoded;
@@ -459,7 +440,7 @@ export function boundSource(
                 io = Math.max(io, Math.min(MAX_READ_BYTES, encoded));
                 if (page.largeRegion || page.encoding & PageEncoding.gzip) {
                   const beforePage = budget.allocated;
-                  yield* readValue(headerReader().load([index]));
+                  yield* readValue(reader.load([index]));
                   raw = Math.max(encoded, budget.allocated - beforePage);
                 }
                 for (let w = first; w <= last; w++) {
@@ -468,20 +449,19 @@ export function boundSource(
                   if (page.largeRegion) {
                     const from = Math.max(w * span, page.firstRow),
                       to = Math.min(rows, (w + 1) * span, page.firstRow + page.rowCount);
-                    const large = headerReader().largeValueBytes(from, to);
+                    const large = reader.largeValueBytes(from, to);
                     values[w] = (values[w] ?? 0) + large;
                     largestValue = Math.max(largestValue, large);
                     io = Math.max(io, Math.min(MAX_READ_BYTES, large));
                   }
                 }
-                if (page.largeRegion || page.encoding & PageEncoding.gzip)
-                  headerReader().release([index]);
+                reader.release([index]);
                 if ((index & 63) === 0) {
                   const pause = pauseIfDue(task);
                   if (pause) yield pause;
                 }
               }
-              prepared.release();
+              reader.close();
               readers.pop();
               const pause = pauseIfDue(task);
               if (pause) yield pause;

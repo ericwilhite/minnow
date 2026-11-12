@@ -13,7 +13,6 @@ import { runIndependentCPU, startCPUWorker, type CPUArm } from "./lib/independen
 import { pairedCPU } from "./lib/paired-cpu.mts";
 import type { RootRunConfig } from "./query-root-runtime-worker.mts";
 import type { RootComponentConfig } from "./query-root-component-worker.mts";
-import type { ChunkComponentConfig } from "./query-chunk-component-worker.mts";
 
 const option = (key: string, fallback = "") => {
   const at = process.argv.indexOf(key);
@@ -111,7 +110,7 @@ export function auditRootWorkers(result: Result, repeats: number): void {
     }
   }
 }
-export async function runQueryRootBench(mode: "whole" | "component" | "chunks" = "whole") {
+export async function runQueryRootBench(mode: "whole" | "component" = "whole") {
   const decodeOnly = process.argv.includes("--decode-only");
   const validatedRoots = process.argv.includes("--validated-roots");
   const aaBiasFloorMs = Number(option("--aa-bias-ms", "0"));
@@ -140,13 +139,7 @@ export async function runQueryRootBench(mode: "whole" | "component" | "chunks" =
   )
     throw new Error("Invalid query observation policy");
   const selectedWorkload =
-    mode === "whole"
-      ? "scan_plain3"
-      : mode === "chunks"
-        ? "chunk_preparation"
-        : decodeOnly
-          ? "root_decode"
-          : "root_handoff";
+    mode === "whole" ? "scan_plain3" : decodeOnly ? "root_decode" : "root_handoff";
   if (option("--only", selectedWorkload) !== selectedWorkload)
     throw new Error("This runner measures only its declared root workload");
   const parentRoot = resolve(option("--baseline")),
@@ -172,8 +165,6 @@ export async function runQueryRootBench(mode: "whole" | "component" | "chunks" =
     "next-percentile-component.mts",
     "query-root-runtime-worker.mts",
     "query-root-component-worker.mts",
-    "query-chunk-component.mts",
-    "query-chunk-component-worker.mts",
     "next-sort-runtime-worker.mts",
     "lib/independent-cpu.mts",
     "lib/native-storage-image.mts",
@@ -299,20 +290,6 @@ export async function runQueryRootBench(mode: "whole" | "component" | "chunks" =
           expected: bundle.expected,
         });
       }
-      if (mode === "chunks")
-        return {
-          module: fileURLToPath(new URL("./query-chunk-component-worker.mts", import.meta.url)),
-          cwd: root,
-          revision,
-          execArgv: ["--max-old-space-size=2048"],
-          data: {
-            runtimeRoot: root,
-            reuse: cached,
-            warmups,
-            repeats,
-            groups: smoke ? 3 : 163,
-          } satisfies ChunkComponentConfig,
-        };
       return {
         module: fileURLToPath(new URL("./query-root-component-worker.mts", import.meta.url)),
         cwd: root,
@@ -333,8 +310,8 @@ export async function runQueryRootBench(mode: "whole" | "component" | "chunks" =
       candidate: spec(candidateRoot, candidate.revision, true),
       purpose: aa ? "identical-build-control" : "true-parent",
       workloads: [selectedWorkload],
-      boundaries: [mode === "whole" ? "frames" : mode === "chunks" ? "chunks" : "roots"],
-      primaryBoundary: mode === "whole" ? "frames" : mode === "chunks" ? "chunks" : "roots",
+      boundaries: [mode === "whole" ? "frames" : "roots"],
+      primaryBoundary: mode === "whole" ? "frames" : "roots",
       pairs: 9,
       settleMs: smoke ? 0 : 1000,
       signal: abort.signal,

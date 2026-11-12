@@ -223,53 +223,6 @@ for (const seed of seedsFor("query-root-independent-entry", [0xb2f1, 0xb2f2]))
         ]).size,
       ).toBe(54);
       reach.reach("owner cache in both arms");
-      const chunksOutput = join(dir, "chunk-facts");
-      await run(
-        process.execPath,
-        [
-          join(dirname(entry), "query-chunk-component.mts"),
-          "--baseline",
-          runtime,
-          "--candidate",
-          runtime,
-          "--aa",
-          "--smoke",
-          "--warmups",
-          "1",
-          "--repeats",
-          "1",
-          "--output",
-          chunksOutput,
-        ],
-        { maxBuffer: 4 << 20, env: { ...process.env, TMPDIR: dir } },
-      );
-      const chunks = JSON.parse(await readFile(join(chunksOutput, "results.json"), "utf8")) as {
-        result: {
-          records: Array<{
-            samples: Array<{
-              rows: number;
-              identity: { pid: number; identity: { reuse: boolean; groups: number } };
-            }>;
-          }>;
-        };
-      };
-      const prepared = chunks.result.records[0]?.samples;
-      if (!prepared) throw new Error("Missing chunk fact samples");
-      expect(prepared).toHaveLength(18);
-      for (const sample of prepared) {
-        expect(sample.identity.identity.reuse).toBe(true);
-        expect(sample.identity.identity.groups).toBe(3);
-        expect(sample.rows).toBe(18);
-      }
-      expect(
-        new Set([
-          ...pids,
-          ...complete.map((s) => s.identity.pid),
-          ...owners.map((s) => s.identity.pid),
-          ...prepared.map((s) => s.identity.pid),
-        ]).size,
-      ).toBe(72);
-      reach.reach("chunk preparation in both control arms");
       reach.assertReached();
     } finally {
       await rm(dir, { recursive: true, force: true });
