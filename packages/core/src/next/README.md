@@ -1745,10 +1745,20 @@ shipped-engine or stored-format change.
 - `states.ts`: struct-of-arrays state per aggregate, no object per group. Integer and NUMERIC
   sums are exact at any size: an f64 part within ±2^52, a 128-bit carry, and past that an exact
   BigInt offset per group that changes only when the carry overflows (or for inputs already
-  wider than 128 bits), never per row. A scalar NUMERIC SUM over a declared precision ≤ 12 is
-  fused: four accumulators, no per-row check. Without GROUP BY, the batches of several such
+  wider than 128 bits), never per row. A scalar NUMERIC SUM whose stored coefficient has at most
+  12 digits (declared precision plus negative-scale expansion) is fused: four accumulators, no
+  per-row check. Without GROUP BY, the batches of several such
   columns that qualify (no NULL, every row) are summed in one loop over up to four columns
-  (`fusedSums`), and a SUM and an AVG of one exact column share one state. Accumulator loops
+  (`fusedSums`), and a SUM and an AVG of one exact column share one state. For at most 1,024
+  groups, finite flat fixed-scale NUMERIC batches certify each active coefficient below 10^12
+  before folding exact integer partials once per group. Flat signed-int64 batches instead
+  use two-word integer partials with a signed-overflow check before committing any group. An
+  overflow discards all batch scratch and applies the original rows through the exact carry
+  path. Both SUM and AVG retain exact totals and counts; saved state does not include scratch.
+  Batch MIN/MAX compares safe coefficients
+  and stores one winner per group. Their scratch is charged during growth and is not transition
+  state. NULLs and selections are respected; mixed scales, specials, wider tiers, failed bounds
+  and larger group tables retain the general paths. Accumulator loops
   start from −0 (a double), so V8 keeps them unboxed. Float SUM and AVG follow PostgreSQL's float8pl and
   float8_accum, including their 22003 rules. MIN/MAX ties take the newer value, as PostgreSQL
   does (MIN(1.5, 1.50) is 1.50); int8 and NUMERIC comparisons use words and limbs.

@@ -16,8 +16,9 @@
  *   offset for the group (`ExactSums`), so sums of any size are exact like PostgreSQL's; BigInts
  *   appear only at those overflows, for inputs already wider than 128 bits, at emit per group,
  *   and for a NUMERIC alignment past 128 bits.
- * - The fused scalar NUMERIC SUM: when the input's declared precision is ≤ 12 (|coefficient| <
- *   10^12, so one batch of 2,048 values sums below 2^51 exactly) and the batch is in the safe
+ * - The fused scalar NUMERIC SUM: when the input's stored-coefficient precision is ≤ 12
+ *   (declared precision plus any negative-scale expansion; |coefficient| < 10^12, so one batch
+ *   of 2,048 values sums below 2^51 exactly) and the batch is in the safe
  *   tier with one scale, a batch is summed with four independent accumulators and no per-row
  *   check, then folded into the state once.
  * - NUMERIC SUM's display scale is the largest input scale of the group (PostgreSQL); a group that
@@ -1489,6 +1490,10 @@ const NEG = 8;
 const SCALE_NONE = -2;
 const SCALE_MIXED = -1;
 
+/** Batch-local grouped NUMERIC folding: every integer partial is below 2^51. */
+const FIXED_GROUPS = 1024;
+const FIXED_COEFFICIENT = 1e12;
+
 class DecimalSumAccumulator implements Accumulator {
   save(group: number, row: StateRow): void {
     this.#sums.save(group, row);
@@ -1514,6 +1519,9 @@ class DecimalSumAccumulator implements Accumulator {
     return (
       this.#sums.growthBytes(groups) +
       arrayGrowth(this.#flags.length, groups, 11) +
+      (grownCapacity(this.#flags.length, groups) <= FIXED_GROUPS && groups > this.#flags.length
+        ? arrayGrowth(this.#partials.length, groups, 18)
+        : 0) +
       16 * Math.max(groups, this.#sums.sums.length) +
       64 * 1024 * groups
     );
@@ -1524,9 +1532,13 @@ class DecimalSumAccumulator implements Accumulator {
   #scales: Uint16Array = new Uint16Array(0);
   #flags: Uint8Array = new Uint8Array(0);
   #counts: Float64Array = new Float64Array(0);
+  /** Scratch only: no transition fields, and never live across a suspension. */
+  #partials: Float64Array = new Float64Array(0);
+  #partialWords: Uint32Array = new Uint32Array(0);
+  #batchCounts: Uint16Array = new Uint16Array(0);
   /** The scale every group with a value has, or SCALE_NONE / SCALE_MIXED. */
   #scale = SCALE_NONE;
-  /** |coefficient| < 10^precision for every input value (the type's declared precision), or null. */
+  /** |coefficient| < 10^precision, accounting for a negative declared scale stored at scale 0. */
   readonly #precision: number | null;
   constructor(
     readonly type: PhysicalType,
@@ -1536,7 +1548,10 @@ class DecimalSumAccumulator implements Accumulator {
   ) {
     this.#memory = new Charged(charge);
     this.#sums = new ExactSums(charge);
-    this.#precision = inputType.kind === "decimal" ? inputType.precision : null;
+    this.#precision =
+      inputType.kind === "decimal" && inputType.precision !== null
+        ? inputType.precision + Math.max(0, -(inputType.scale ?? 0))
+        : null;
   }
   grow(groups: number): void {
     this.#sums.grow(groups);
@@ -1545,6 +1560,11 @@ class DecimalSumAccumulator implements Accumulator {
     this.#scales = this.#memory.uint16(this.#scales, capacity);
     this.#flags = this.#memory.uint8(this.#flags, capacity);
     this.#counts = this.#memory.float64(this.#counts, capacity);
+    if (capacity <= FIXED_GROUPS) {
+      this.#partials = this.#memory.float64(this.#partials, capacity);
+      this.#partialWords = this.#memory.uint32(this.#partialWords, 2 * capacity);
+      this.#batchCounts = this.#memory.uint16(this.#batchCounts, capacity);
+    }
   }
   update(
     vector: Vector | null,
@@ -1613,6 +1633,7 @@ class DecimalSumAccumulator implements Accumulator {
         return true;
       }
       if (!scalar && reader.codes === null && reader.stride === 1) {
+        if (this.#groupBatch(values, validity, gids, rows, count)) return true;
         addFlat(sums, values, validity, gids, rows, count);
         for (let k = 0; k < count; k++) {
           const i = rows[k] ?? 0;
@@ -1636,6 +1657,14 @@ class DecimalSumAccumulator implements Accumulator {
     }
     // int64 / int128 tiers: straight into the carry limbs.
     const words = coefficients.repr === "int64" ? int64Words(coefficients.values) : null;
+    if (
+      !scalar &&
+      words !== null &&
+      reader.codes === null &&
+      reader.stride === 1 &&
+      this.#groupWords(words, validity, gids, rows, count)
+    )
+      return true;
     for (let k = 0; k < count; k++) {
       const i = rows[k] ?? 0;
       if (!validAt(validity, i)) continue;
@@ -1646,6 +1675,92 @@ class DecimalSumAccumulator implements Accumulator {
       const slot = slotAt(reader, i);
       if (words !== null) sums.spillWords(g, words, slot);
       else if (coefficients.repr === "int128") sums.addCarry(g, coefficients.limbs, slot);
+    }
+    return true;
+  }
+  /**
+   * Certify the actual active coefficients before committing any transition. With at most
+   * BATCH_ROWS values and |c| < 10^12, every partial prefix is an exactly representable integer
+   * below 2^51. NUMERIC addition is exact, so folding that partial into ExactSums once per group
+   * preserves PostgreSQL's sum and display scale; no float transition is reassociated.
+   * A failed certificate leaves only disposable scratch and falls back to the ordinary path.
+   */
+  #groupBatch(
+    values: Float64Array,
+    validity: Validity | null,
+    gids: Int32Array,
+    rows: Uint16Array,
+    count: number,
+  ): boolean {
+    const groups = this.#flags.length;
+    if (groups > FIXED_GROUPS || this.#partials.length < groups || count > BATCH_ROWS) return false;
+    const partials = this.#partials;
+    const ns = this.#batchCounts;
+    partials.fill(0);
+    ns.fill(0);
+    for (let k = 0; k < count; k++) {
+      const i = rows[k] ?? 0;
+      if (!validAt(validity, i)) continue;
+      const v = values[i] ?? 0;
+      if (!(v > -FIXED_COEFFICIENT && v < FIXED_COEFFICIENT)) return false;
+      const g = gids[i] ?? 0;
+      partials[g] = (partials[g] ?? 0) + v;
+      ns[g] = (ns[g] ?? 0) + 1;
+    }
+    for (let g = 0; g < groups; g++)
+      if ((this.#counts[g] ?? 0) > MAX_SAFE - (ns[g] ?? 0)) return false;
+    for (let g = 0; g < groups; g++) {
+      const n = ns[g] ?? 0;
+      if (n === 0) continue;
+      this.#flags[g] = (this.#flags[g] ?? 0) | HAS;
+      this.#sums.has[g] = 1;
+      this.#counts[g] = (this.#counts[g] ?? 0) + n;
+      this.#sums.add(g, partials[g] ?? 0);
+    }
+    return true;
+  }
+  /** Exact signed-int64 batch prefixes. No transition is committed until every prefix
+   * and count fits. A signed overflow restarts the original batch on the exact carry path;
+   * neither a wrapped partial nor a partially committed group can escape. The supported
+   * little-endian limb layout is the same contract as kernels/limbs.ts.
+   */
+  #groupWords(
+    words: Uint32Array,
+    validity: Validity | null,
+    gids: Int32Array,
+    rows: Uint16Array,
+    count: number,
+  ): boolean {
+    const groups = this.#flags.length;
+    if (groups > FIXED_GROUPS || this.#partialWords.length < 2 * groups || count > BATCH_ROWS)
+      return false;
+    const partials = this.#partialWords,
+      ns = this.#batchCounts;
+    partials.fill(0);
+    ns.fill(0);
+    for (let k = 0; k < count; k++) {
+      const i = rows[k] ?? 0;
+      if (!validAt(validity, i)) continue;
+      const g = gids[i] ?? 0,
+        at = 2 * g;
+      const oldHi = (partials[at + 1] ?? 0) | 0;
+      const hi = (words[2 * i + 1] ?? 0) | 0;
+      const lo = (partials[at] ?? 0) + (words[2 * i] ?? 0);
+      const sumHi = (oldHi + hi + (lo >= 4294967296 ? 1 : 0)) | 0;
+      if (((oldHi ^ sumHi) & (hi ^ sumHi)) < 0) return false;
+      partials[at] = lo;
+      partials[at + 1] = sumHi;
+      ns[g] = (ns[g] ?? 0) + 1;
+    }
+    for (let g = 0; g < groups; g++)
+      if ((this.#counts[g] ?? 0) > MAX_SAFE - (ns[g] ?? 0)) return false;
+    for (let g = 0; g < groups; g++) {
+      const n = ns[g] ?? 0;
+      if (n === 0) continue;
+      this.#flags[g] = (this.#flags[g] ?? 0) | HAS;
+      this.#sums.has[g] = 1;
+      this.#counts[g] = (this.#counts[g] ?? 0) + n;
+      this.#sums.spillWords(g, partials, g);
     }
     return true;
   }
@@ -2086,6 +2201,11 @@ class MinMaxAccumulator implements Accumulator {
     const dictionary = vector?.form === "dictionary" ? vector.dictionary.length : 0;
     return (
       arrayGrowth(this.#has.length, groups, this.#bytes ? 13 : 9) +
+      (this.type.kind === "decimal" &&
+      grownCapacity(this.#has.length, groups) <= FIXED_GROUPS &&
+      groups > this.#has.length
+        ? arrayGrowth(this.#winners.length, groups, 4)
+        : 0) +
       this.#values.growthBytes(groups, payload) +
       32 * dictionary +
       8 * BATCH_ROWS
@@ -2097,6 +2217,8 @@ class MinMaxAccumulator implements Accumulator {
   #has: Uint8Array = new Uint8Array(0);
   // Exact numeric winners; NaN marks a winner requiring the word comparator.
   #numeric: Float64Array = new Float64Array(0);
+  /** Batch-local NUMERIC winner rows, charged before growth; never saved as state. */
+  #winners: Int32Array = new Int32Array(0);
   /** Byte-compared layouts (varlen, fixed16): may take the ranked path. */
   readonly #bytes: boolean;
   #ranking: Ranking | null = null;
@@ -2130,6 +2252,8 @@ class MinMaxAccumulator implements Accumulator {
     if (groups > this.#has.length) {
       const capacity = grownCapacity(this.#has.length, groups);
       this.#has = this.#memory.uint8(this.#has, capacity);
+      if (this.type.kind === "decimal" && capacity <= FIXED_GROUPS)
+        this.#winners = this.#memory.int32(this.#winners, capacity);
       if (layoutOf(this.type) === "int64")
         this.#numeric = this.#memory.float64(this.#numeric, capacity);
       if (this.#bytes) {
@@ -2200,6 +2324,41 @@ class MinMaxAccumulator implements Accumulator {
     const has = this.#has;
     const better = this.max ? 1 : -1;
     const data = reader.flat.data;
+    if (
+      data.layout === "decimal" &&
+      data.coefficients.repr === "safe" &&
+      data.scale !== null &&
+      data.specials === null &&
+      reader.codes === null &&
+      reader.stride === 1 &&
+      this.#has.length <= FIXED_GROUPS &&
+      this.#winners.length >= this.#has.length
+    ) {
+      // One scale and finite exact coefficients: compare candidates as numbers, then compare
+      // only the batch winner with the old state. Equal values take the last active input row,
+      // preserving numeric_smaller/larger's representation and cross-batch scale behavior.
+      const winners = this.#winners;
+      const coefficients = data.coefficients.values;
+      winners.fill(-1);
+      for (let k = 0; k < count; k++) {
+        const i = rows[k] ?? 0;
+        if (!validAt(reader.validity, i)) continue;
+        const g = scalar ? 0 : (gids[i] ?? 0);
+        const old = winners[g] ?? -1;
+        const v = coefficients[i] ?? 0;
+        if (old < 0 || (this.max ? v >= (coefficients[old] ?? 0) : v <= (coefficients[old] ?? 0)))
+          winners[g] = i;
+      }
+      for (let g = 0; g < has.length; g++) {
+        const i = winners[g] ?? -1;
+        if (i < 0) continue;
+        if (has[g] === 0 || compareToStored(values, g, reader.flat, i) !== better) {
+          has[g] = 1;
+          values.set(g, vector, i);
+        }
+      }
+      return;
+    }
     if (data.layout === "int64") {
       const source = data.values;
       const numeric = this.#numeric;
