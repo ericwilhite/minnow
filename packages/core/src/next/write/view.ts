@@ -4,6 +4,7 @@
  * from the published group after a re-point), and index probes and ranges that resolve put and
  * tombstone entries across memtable deltas and durable runs under the view's bound.
  */
+import { compareRunBound, runOutsideKeys } from "./run-bounds.js";
 import { hashKey } from "./key-hashes.js";
 import { MemoryReads } from "./memory-read.js";
 import { planIndexRange } from "./range-plan.js";
@@ -744,14 +745,15 @@ export function otherIndexLayersEndBefore(
   own: KeyDelta,
 ): boolean {
   const before = (max: Uint8Array) => compareBytes(max, 0, max.length, key, 0, key.length) < 0;
-  for (const run of table.runs.get(indexId) ?? NO_RUNS) if (!before(run.maxKey)) return false;
+  for (const run of table.runs.get(indexId) ?? NO_RUNS)
+    if (compareRunBound(run, "max", key) >= 0) return false;
   for (const memtable of table.memtables) {
     for (const run of memtable.staged?.runs.get(indexId) ?? NO_RUNS)
-      if (!before(run.maxKey)) return false;
+      if (compareRunBound(run, "max", key) >= 0) return false;
     const published = memtable.published;
     if (published !== null && memtable.deltasDropped) {
       const run = published.runs.get(indexId);
-      if (run !== undefined && !before(run.maxKey)) return false;
+      if (run !== undefined && compareRunBound(run, "max", key) >= 0) return false;
       continue;
     }
     const delta = memtable.deltas.get(indexId);
@@ -851,9 +853,7 @@ export class ViewIndex implements IndexReader {
     this.#skip = null;
     if (low === null || high === null) return;
     let skip: Set<RunRef> | null = null;
-    const outside = (run: RunRef) =>
-      compareBytes(run.maxKey, 0, run.maxKey.length, low, 0, low.length) < 0 ||
-      compareBytes(run.minKey, 0, run.minKey.length, high, 0, high.length) > 0;
+    const outside = (run: RunRef) => runOutsideKeys(run, low, high);
     for (const run of this.table.tableView.runs.get(this.def.id) ?? NO_RUNS)
       if (outside(run)) (skip ??= new Set()).add(run);
     for (const memtable of this.table.tableView.memtables) {
@@ -877,14 +877,14 @@ export class ViewIndex implements IndexReader {
       compareBytes(max, 0, max.length, low, 0, low.length) < 0 ||
       compareBytes(min, 0, min.length, high, 0, high.length) > 0;
     for (const run of this.table.tableView.runs.get(this.def.id) ?? NO_RUNS)
-      if (!outside(run.minKey, run.maxKey)) return true;
+      if (!runOutsideKeys(run, low, high)) return true;
     for (const memtable of this.table.tableView.memtables) {
       for (const run of memtable.staged?.runs.get(this.def.id) ?? NO_RUNS)
-        if (!outside(run.minKey, run.maxKey)) return true;
+        if (!runOutsideKeys(run, low, high)) return true;
       const published = memtable.published;
       if (published !== null && memtable.deltasDropped) {
         const run = published.runs.get(this.def.id);
-        if (run !== undefined && !outside(run.minKey, run.maxKey)) return true;
+        if (run !== undefined && !runOutsideKeys(run, low, high)) return true;
         continue;
       }
       const delta = memtable.deltas.get(this.def.id);

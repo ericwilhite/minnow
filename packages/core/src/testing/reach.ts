@@ -126,6 +126,65 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+export const OVERFLOW_PUBLICATION_STATES = [
+  "hundreds of retained summaries",
+  "maximum text pieces",
+  "other piece widths",
+  "thirty-two inputs",
+  "other input counts",
+  "thirty-two MiB cap",
+  "sixty-four MiB cap",
+  "before data flush",
+  "before root write",
+  "before root truncate",
+  "before root flush",
+  "recovered retry continues",
+  "independent current openers",
+] as const;
+
+export const OVERFLOW_INTEGRITY_STATES = [
+  "minimum contradiction",
+  "maximum contradiction",
+  "capacity outside data",
+  "cross-extent refusal",
+  "unknown run version",
+  "shared-prefix corruption",
+  "different-prefix corruption",
+  "checksummed future directory",
+  "native payload CRC",
+] as const;
+
+export const OVERFLOW_ROOT_STATES = [
+  "ordinary point reads",
+  "admitted ascending",
+  "admitted descending",
+  "allocation-free planning",
+  "published overflow root",
+  "old snapshot after publication",
+  "durable reopen",
+  "continued writes",
+  "shipped UTF16 maximum",
+  "other key lengths",
+] as const;
+
+export const OVERFLOW_SUMMARY_STATES = [
+  "bounded native summaries",
+  "crossed partition boundary",
+  "full-key Bloom",
+  "supplied hashes",
+  "computed hashes",
+  "multiple chunks",
+  "single chunk",
+  "ascending",
+  "descending",
+  "prefix ties retained",
+  "pending heads",
+  "range bounds and skip",
+  "fan in eight",
+  "other fan in",
+  "hot overflow partitions",
+] as const;
+
 export const MERGE_STOP_STATES = [
   "slice callback",
   "no entries after stop",
@@ -185,7 +244,7 @@ export const OVERFLOW_WRITER_STATES = [
   "wide row identifiers",
   "interleaved scratch",
   "bulk supplied hashes",
-  "publication reader guards",
+  "bounded root round trip",
   "payload failed",
   "directory failed",
   "block failed",

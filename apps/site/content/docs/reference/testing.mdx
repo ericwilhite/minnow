@@ -2218,8 +2218,8 @@ keeps data blocks within 4 KiB, puts payload chunks and their checksummed direct
 same extent, and keeps summary storage charged through consumption. Generated cases check
 precharge before native allocation, delayed acknowledgement, detached buffers, cancellation
 before admission, injected allocation/append failures and retry, bulk input, wide row IDs,
-and two interleaved encoders. The default production writer remains inline until reader and
-catalog integration is complete; premature overflow publication is a typed refusal.
+and two interleaved encoders. The default production writer remains inline until
+catalog-limit integration is complete. Overflow runs can now be published in the current root.
 
 `write/overflow-readers.test.ts` checks point reads, both range directions, exact fence seeks
 and mixed-run merges against complete key bytes. Generated shared prefixes must not collapse
@@ -2229,3 +2229,13 @@ and parsing workspace, release a block lease before resolving its key, and pass 
 poison every returned lease. The campaign includes fan-in 32, output splits, interleaved
 readers, read failures, close/cancel during I/O, retry and typed structural refusals. These
 codec tests do not certify the later catalog-limit policy or the shipped-format cutover.
+
+`write/overflow-summary.test.ts` checks complete-key Bloom membership across real filter
+partitions, conservative prefix summaries, and ordered pending heads in both range directions.
+`write/overflow-root.test.ts` checks ordinary point/range reads, old snapshots, continued writes
+and reopen with an opt-in overflow writer. `write/overflow-integrity.test.ts` refuses
+contradictory endpoints, impossible capacities, cross-extent descriptors, damaged payloads and
+checksummed unknown directory versions. `write/overflow-publication.test.ts` retains hundreds
+of funded output summaries under 32/64 MiB caps, faults every native root-publication step,
+retries after recovery, and opens an overflow root from an independent current module graph.
+These are new-encoding tests, not evidence for the separate shipped-format cutover.

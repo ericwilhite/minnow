@@ -14,6 +14,7 @@ import type { ByteBudget } from "../access/space.js";
 import { MAX_BLOB_BYTES } from "../access/space.js";
 import { compareBytes } from "../vector/varlen.js";
 import { rangeSide } from "./range-bound.js";
+import { runOutsideRange } from "./run-bounds.js";
 import { runKeyBytes } from "./overflow-keys.js";
 import { need } from "./bytes.js";
 import type { KeyDelta } from "./key-hash.js";
@@ -69,7 +70,7 @@ export class StreamingRangeCursor implements IndexCursor {
       table = this.index.table;
     const primary = this.index.def.role === "primary";
     const stored = (run: RunRef, limit: number, pure = false) => {
-      if (rangeSide(this.range, run.maxKey) < 0 || rangeSide(this.range, run.minKey) > 0) return;
+      if (runOutsideRange(run, this.range)) return;
       visit(null, run, limit, pure);
     };
     for (const memtable of table.tableView.memtables) {
@@ -188,6 +189,11 @@ export class StreamingRangeCursor implements IndexCursor {
     }
   }
   #less(a: RangeInput, b: RangeInput): boolean {
+    // Prefix summaries cannot order an unresolved descending maximum against a full head.
+    // Resolve all pending overflow inputs first; their one head/input is already admitted.
+    const left = a instanceof RunRangeInput && a.pending && (a.ref.encoding ?? 1) === 2;
+    const right = b instanceof RunRangeInput && b.pending && (b.ref.encoding ?? 1) === 2;
+    if (left !== right) return left;
     return (
       (compareBytes(a.bytes(), a.keyStart(), a.keyEnd(), b.bytes(), b.keyStart(), b.keyEnd()) ||
         a.rowId - b.rowId) *

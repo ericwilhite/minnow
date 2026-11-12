@@ -1,4 +1,6 @@
 import frozenR25 from "./root-r25.fixture.json";
+import { ByteWriter as KeyPointerWriter } from "./bytes.js";
+import { writeKeyPointer } from "./key-pointer.js";
 import fc from "fast-check";
 import { afterAll, describe, expect, it } from "vitest";
 import { createReach } from "../../testing/reach.js";
@@ -280,7 +282,29 @@ function run(pool: readonly ExtentRef[]): fc.Arbitrary<RunRef> {
       })
       // `continues` is present only when true (one encoding per value).
       .map(({ continues, encoding, ...rest }): RunRef => {
-        const value = encoding === undefined ? rest : { ...rest, encoding };
+        const inline = (bytes: Uint8Array) => {
+          const out = new KeyPointerWriter();
+          writeKeyPointer(out, { kind: "inline", bytes }, rest.entries.offset);
+          return out.finish();
+        };
+        const minKey = rest.minKey.subarray(0, rest.entries.offset),
+          maxKey = rest.maxKey.subarray(0, rest.entries.offset);
+        const value =
+          encoding === undefined
+            ? rest
+            : {
+                ...rest,
+                encoding,
+                minKey,
+                maxKey,
+                fences: rest.entries,
+                bloom: rest.entries,
+                keyStorage: {
+                  minimum: inline(minKey),
+                  maximum: inline(maxKey),
+                  maxKeyBytes: Math.max(minKey.length, maxKey.length),
+                },
+              };
         return continues ? { ...value, continues: true } : value;
       })
   );

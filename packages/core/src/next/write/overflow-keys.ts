@@ -23,13 +23,17 @@ export function runKeyBytes(ref: RunRef): number {
     bytes !== undefined && Number.isSafeInteger(bytes) && bytes >= 0,
     "Missing or invalid run key capacity",
   );
+  valid(bytes <= ref.entries.offset, "Run key capacity exceeds its stored data");
   return bytes;
 }
 const directoryBound = (bytes: number): number => 80 + 16 * Math.ceil(bytes / RUN_KEY_CHUNK_BYTES);
 /** Caller charges this fixed workspace before constructing OverflowKeys. No per-key growth. */
-export function overflowKeyBytes(ref: RunRef): number {
-  const bytes = runKeyBytes(ref);
+export function overflowCapacityBytes(bytes: number): number {
+  valid(Number.isSafeInteger(bytes) && bytes >= 0, "Invalid key workspace capacity");
   return bytes + parseCharge(Math.max(2112, directoryBound(bytes))) + 512;
+}
+export function overflowKeyBytes(ref: RunRef): number {
+  return overflowCapacityBytes(runKeyBytes(ref));
 }
 export function pointerFrom(bytes: Uint8Array, before: number): KeyPointer {
   const r = new ByteReader(bytes),

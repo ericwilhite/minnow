@@ -291,6 +291,8 @@ export interface RunRef {
   /** Every Nth key with its entry offset, for binary search without reading the run. */
   readonly fences: BlobRef;
   readonly bloom: BlobRef;
+  /** Full inline bounds, or bounded overflow prefixes. Prefix ties never prove disjointness;
+   * keyStorage carries complete lengths/payload pointers for encoding2. */
   readonly minKey: Uint8Array;
   readonly maxKey: Uint8Array;
 }

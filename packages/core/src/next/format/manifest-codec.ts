@@ -1,6 +1,6 @@
 /**
  * Byte codecs of the manifest (ruling R15.3): the root, the paged group directory and the group
- * root. Shapes are format/manifest.ts; this file fixes their bytes (format version 1).
+ * root. Shapes are format/manifest.ts: manifest version3; other blob grammars version1.
  *
  * ## Common rules
  * - Every blob starts with a 4-byte magic and a version byte; integers are varints (bytes.ts).
@@ -42,7 +42,8 @@ import {
   METADATA_ENVELOPE_VERSION,
   requireTag,
 } from "../durable-format.js";
-import { requireEncoding, readRunEncoding, UnsupportedEncodingError } from "./encoding.js";
+import { requireEncoding, readRunEncoding } from "./encoding.js";
+import { readKeyPointer } from "./key-pointer.js";
 import { LIST_PAGE_EXTENTS, type ExtentListPage } from "../storage/extent-list.js";
 import { MAX_BLOB_BYTES } from "../storage/extents.js";
 import type { ByteBudget, ExtentWriter } from "../storage/extents.js";
@@ -938,8 +939,6 @@ export async function writeGroupDirectory(
 // ── Root ───────────────────────────────────────────────────────────────────────────────────────
 
 function writeRun(out: RefWriter, run: RunRef): void {
-  if (run.keyStorage !== undefined)
-    throw new UnsupportedEncodingError("overflow publication", 2, [1]);
   out.body.u8(readRunEncoding(run.encoding ?? 1));
   // The level and the continuation flag share one integer: level × 2 + continues.
   out.body.uint(run.level * 2 + (run.continues === true ? 1 : 0));
@@ -947,8 +946,53 @@ function writeRun(out: RefWriter, run: RunRef): void {
   out.blob(run.entries);
   out.blob(run.fences);
   out.blob(run.bloom);
-  out.body.bytes(run.minKey);
-  out.body.bytes(run.maxKey);
+  if ((run.encoding ?? 1) === 2) {
+    const storage = run.keyStorage;
+    valid(storage !== undefined, "Missing run key storage");
+    valid(
+      run.entries.extent.offset === run.fences.extent.offset &&
+        run.entries.extent.length === run.fences.extent.length &&
+        run.entries.extent.offset === run.bloom.extent.offset &&
+        run.entries.extent.length === run.bloom.extent.length,
+      "A run's key storage crosses extents",
+    );
+    const bounds = checkBoundaries(
+      storage.minimum,
+      storage.maximum,
+      storage.maxKeyBytes,
+      run.entries.offset,
+    );
+    valid(
+      sameBytes(run.minKey, bounds.minKey) && sameBytes(run.maxKey, bounds.maxKey),
+      "Run boundary differs from its stored descriptor",
+    );
+    out.body.uint(storage.maxKeyBytes);
+    out.body.bytes(storage.minimum);
+    out.body.bytes(storage.maximum);
+  } else {
+    out.body.bytes(run.minKey);
+    out.body.bytes(run.maxKey);
+  }
+}
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+function checkBoundaries(minimum: Uint8Array, maximum: Uint8Array, max: number, before: number) {
+  valid(Number.isSafeInteger(max) && max >= 0 && max <= before, "Invalid run key capacity");
+  const read = (bytes: Uint8Array) => {
+    valid(bytes.length <= 2112, "Oversized run boundary");
+    const r = new ByteReader(bytes),
+      pointer = readKeyPointer(r, before);
+    r.end();
+    valid(
+      (pointer.kind === "inline" ? pointer.bytes.length : pointer.length) <= max,
+      "Run boundary exceeds key capacity",
+    );
+    return pointer.kind === "inline" ? pointer.bytes : pointer.prefix;
+  };
+  return { minKey: read(minimum), maxKey: read(maximum) };
 }
 
 function readRun(refs: RefReader): RunRef {
@@ -960,10 +1004,39 @@ function readRun(refs: RefReader): RunRef {
   const entries = refs.blob();
   const fences = refs.blob();
   const bloom = refs.blob();
-  const minKey = reader.bytes();
-  const maxKey = reader.bytes();
-  const fields = { level, entryCount, entries, fences, bloom, minKey, maxKey };
-  const run: RunRef = encoding === 1 ? fields : { ...fields, encoding };
+  let run: RunRef;
+  if (encoding === 2) {
+    const maxKeyBytes = reader.uint(),
+      minimum = reader.bytes(),
+      maximum = reader.bytes();
+    const bounds = checkBoundaries(minimum, maximum, maxKeyBytes, entries.offset);
+    valid(
+      entries.extent.offset === fences.extent.offset &&
+        entries.extent.length === fences.extent.length &&
+        entries.extent.offset === bloom.extent.offset &&
+        entries.extent.length === bloom.extent.length,
+      "A run's key storage crosses extents",
+    );
+    run = {
+      encoding,
+      level,
+      entryCount,
+      entries,
+      fences,
+      bloom,
+      ...bounds,
+      keyStorage: { minimum, maximum, maxKeyBytes },
+    };
+  } else
+    run = {
+      level,
+      entryCount,
+      entries,
+      fences,
+      bloom,
+      minKey: reader.bytes(),
+      maxKey: reader.bytes(),
+    };
   return packed % 2 === 1 ? { ...run, continues: true } : run;
 }
 

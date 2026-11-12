@@ -3,8 +3,7 @@ import fc from "fast-check";
 import { afterAll, expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, OVERFLOW_WRITER_STATES } from "../../testing/reach.js";
-import { UnsupportedEncodingError } from "../format/encoding.js";
-import { encodeManifestRoot } from "../format/manifest-codec.js";
+import { encodeManifestRoot, decodeManifestRoot } from "../format/manifest-codec.js";
 import { ByteReader as MetaReader } from "../format/bytes.js";
 import {
   readKeyPointer,
@@ -24,6 +23,9 @@ import { RunEncoder, RunBuilder, runRef, RUN_BUFFER_OVERHEAD, type RunSummary } 
 
 const NativeBytes = Uint8Array;
 const reach = createReach("overflow writer", OVERFLOW_WRITER_STATES);
+function boundary(key: Uint8Array | undefined): Uint8Array | undefined {
+  return key !== undefined && key.length > 2048 ? key.subarray(0, 32) : key;
+}
 function sameBytes(actual: Uint8Array | undefined, expected: Uint8Array | undefined): void {
   if (actual === undefined || expected === undefined) throw new Error("missing expected key");
   expect(Buffer.compare(actual, expected), "complete key byte equality").toBe(0);
@@ -213,39 +215,46 @@ function encode(
       expect(stored.keyStorage).toBe(storage);
       const blob = refs[0];
       if (!blob) throw new Error("missing fixture blob");
-      expect(() =>
-        encodeManifestRoot({
-          formatVersion: 3,
-          sequence: 1,
-          epoch: 1,
-          log: { salt: 1, firstLsn: 1, rootSequence: 1 },
-          globalLsn: 0,
-          catalogVersion: 1,
-          catalog: blob,
-          nextTableId: 2,
-          sequences: [],
-          tables: [
-            {
-              tableId: 1,
-              schemaVersion: 1,
-              nextRowId: id,
-              flushedThroughLsn: 0,
-              liveRowCount: expected.length,
-              groups: blob,
-              groupCount: 0,
-              staged: [],
-              keyIndex: { indexId: 1, columnIds: [1], unique: true, runs: [stored] },
-              secondaryIndexes: [],
-              statistics: null,
-            },
-          ],
-          clients: [],
-          extentList: [],
-        }),
-      ).toThrow(UnsupportedEncodingError);
-      reach.reach("publication reader guards");
-      sameBytes(summary.minKey, expected[0]?.key);
-      sameBytes(summary.maxKey, expected.at(-1)?.key);
+      const rootBytes = encodeManifestRoot({
+        formatVersion: 3,
+        sequence: 1,
+        epoch: 1,
+        log: { salt: 1, firstLsn: 1, rootSequence: 1 },
+        globalLsn: 0,
+        catalogVersion: 1,
+        catalog: blob,
+        nextTableId: 2,
+        sequences: [],
+        tables: [
+          {
+            tableId: 1,
+            schemaVersion: 1,
+            nextRowId: id,
+            flushedThroughLsn: 0,
+            liveRowCount: expected.length,
+            groups: blob,
+            groupCount: 0,
+            staged: [],
+            keyIndex: { indexId: 1, columnIds: [1], unique: true, runs: [stored] },
+            secondaryIndexes: [],
+            statistics: null,
+          },
+        ],
+        clients: [],
+        extentList: [],
+      });
+      const rootDecoded = decodeManifestRoot(rootBytes, {
+        allocate: () => true,
+        free: () => undefined,
+      });
+      expect(rootDecoded.value.tables[0]?.keyIndex?.runs[0]).toEqual(stored);
+      reach.reach("bounded root round trip");
+      sameBytes(summary.minKey, boundary(expected[0]?.key));
+      sameBytes(summary.maxKey, boundary(expected.at(-1)?.key));
+      expect(
+        arrays.reduce((n, a) => n + a.buffer.byteLength, 0),
+        "bounded native summary storage",
+      ).toBeLessThanOrEqual(2 * (2048 + 2112));
       const map = new Map(persisted.map((p) => [p.offset, p.data]));
       const get = (at: number, length: number, checksum: number) => {
         const b = map.get(at);
@@ -585,10 +594,10 @@ it("two overflow encoders retain private scratch when their operations interleav
     first = one.finish();
     second = two.finish();
     if (!first || !second) throw new Error("missing interleaved summaries");
-    sameBytes(first.minKey, a);
-    sameBytes(first.maxKey, a);
-    sameBytes(second.minKey, b);
-    sameBytes(second.maxKey, b);
+    sameBytes(first.minKey, boundary(a));
+    sameBytes(first.maxKey, boundary(a));
+    sameBytes(second.minKey, boundary(b));
+    sameBytes(second.maxKey, boundary(b));
     expect(payloadA).toHaveLength(1);
     expect(payloadB).toHaveLength(1);
     sameBytes(payloadA[0], a);

@@ -41,6 +41,7 @@
  */
 import { RUN_CODEC, requireHeader, requireBits } from "../durable-format.js";
 
+import { runOutsideKeys } from "./run-bounds.js";
 import { overflowKeyBytes } from "./overflow-keys.js";
 import { RunRangeInput, rangeRunBytes } from "./range-input.js";
 import { ByteReader as KeyReader } from "../format/bytes.js";
@@ -71,7 +72,7 @@ export const BLOCK_BYTES = RUN_CODEC.blockBytes;
 /** The longest encoded index key a run block can hold: half a block. */
 export const MAX_KEY_BYTES = BLOCK_BYTES / 2;
 
-/** An encoded index key is longer than `MAX_KEY_BYTES`; no run can hold it. */
+/** Inline encoding 1 cannot hold this encoded key. */
 export class IndexKeyTooLongError extends RangeError {
   readonly code = "MINNOW_INDEX_KEY_TOO_LONG";
   constructor(readonly bytes: number) {
@@ -783,7 +784,11 @@ export class RunEncoder {
     bytes[at + 6] = tombstone ? 1 : 0;
     block.length = at + 7;
     this.#entryCount += 1;
-    this.#minKey ??= this.#output.copy(key, start, start + length);
+    this.#minKey ??= this.#output.copy(
+      key,
+      start,
+      start + (this.encoding === 2 && long ? RUN_KEY_PREFIX_BYTES : length),
+    );
     this.#maxKeyBytes = Math.max(this.#maxKeyBytes, length);
     if (this.#pointer !== null)
       this.#minimumDescriptor ??= this.#output.copy(this.#pointer.bytes, 0, this.#pointer.length);
@@ -851,7 +856,10 @@ export class RunEncoder {
     const maxKey = this.#output.copy(
       this.#lastKey,
       this.#lastStart,
-      this.#lastStart + this.#lastLength,
+      this.#lastStart +
+        (this.encoding === 2 && this.#lastLength > MAX_KEY_BYTES
+          ? RUN_KEY_PREFIX_BYTES
+          : this.#lastLength),
     );
     let keyStorage: RunKeyStorage | undefined;
     if (this.#pointer !== null) {
@@ -1298,10 +1306,84 @@ export class RunReader {
       const blooms = await readAll(space, refs, budget);
       const bytes = RunReader.residentCharge(need(fences), blooms);
       const reader = new RunReader(ref, need(fences), need(index), partitionBlocks, blooms, bytes);
+      await reader.#verifyBoundaries(space, need(fences), budget);
       retained = bytes;
       return reader;
     } finally {
       charge.free(bound - retained);
+    }
+  }
+
+  /** Root summaries must name the actual first/last keys, not merely plausible prefixes.
+   * Check bounded records only, synchronously within each lease; no full payload head needed. */
+  async #verifyBoundaries(
+    space: SpaceReader,
+    fences: Uint8Array,
+    budget: ByteBudget,
+  ): Promise<void> {
+    const storage = need(this.ref.keyStorage);
+    const first = new ByteReader(fences);
+    first.varuint();
+    const pointer = new KeyReader(fences.subarray(first.offset));
+    readKeyPointer(pointer, this.ref.fences.offset);
+    if (
+      compareBytes(
+        fences,
+        first.offset,
+        first.offset + pointer.at,
+        storage.minimum,
+        0,
+        storage.minimum.length,
+      ) !== 0
+    )
+      throw new StoreCorruptionError("Run minimum differs from its first fence");
+    const last = need(this.#blocks.at(-1));
+    if (
+      last.length < 2 ||
+      last.length > BLOCK_BYTES ||
+      last.offset + last.length > this.ref.entries.offset
+    )
+      throw new StoreCorruptionError("Invalid last run block bounds");
+    const check = (block: Uint8Array): void => {
+      const v = new DataView(block.buffer, block.byteOffset, block.byteLength);
+      if (block.length < 2) throw new StoreCorruptionError("Truncated last run block");
+      const word = v.getUint16(0, true),
+        count = word & ~EXTENDED_KEY_BLOCK;
+      if (count < 1 || count * 2 + 2 > block.length)
+        throw new StoreCorruptionError("Invalid last run block count");
+      const start = v.getUint16(2 + (count - 1) * 2, true),
+        end = block.length - 7;
+      if (start < 2 + count * 2 || start >= end)
+        throw new StoreCorruptionError("Invalid last run entry bounds");
+      const extended = (word & EXTENDED_KEY_BLOCK) !== 0;
+      if (extended) {
+        const r = new KeyReader(block.subarray(start, end));
+        const p = readKeyPointer(r, last.offset);
+        r.end();
+        if (p.kind !== "overflow") throw new StoreCorruptionError("Inline key in overflow block");
+      } else {
+        const r = new KeyReader(block.subarray(start, end));
+        if (r.bytes().length > MAX_KEY_BYTES)
+          throw new StoreCorruptionError("Oversized inline key");
+        r.end();
+      }
+      const maximum = storage.maximum;
+      if (
+        (!extended && maximum[0] !== 0) ||
+        compareBytes(block, start, end, maximum, extended ? 0 : 1, maximum.length) !== 0
+      )
+        throw new StoreCorruptionError("Run maximum differs from its last entry");
+    };
+    const cached = space.peek(last);
+    if (cached !== null) {
+      check(cached);
+      return;
+    }
+    const lease = await space.read([last], { budget, retain: false });
+    try {
+      check(need(lease.bytes[0]));
+    } finally {
+      lease.release();
     }
   }
 
@@ -1351,7 +1433,7 @@ export class RunReader {
   }
 
   mayContain(key: Uint8Array): boolean {
-    if (compare(key, this.ref.minKey) < 0 || compare(key, this.ref.maxKey) > 0) return false;
+    if (runOutsideKeys(this.ref, key)) return false;
     if ((this.ref.encoding ?? 1) === 2) return this.#bloomHas(key, 0, this.#blocks.length);
     const [first, end] = this.#blocksFor(key);
     return this.#bloomHas(key, first, end);

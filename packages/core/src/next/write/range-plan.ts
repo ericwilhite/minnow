@@ -2,7 +2,7 @@
 import type { IndexRangePlan, KeyRange } from "../access/key-index.js";
 import { MAX_BLOB_BYTES } from "../access/space.js";
 import { StreamingRangeCursor } from "./range-cursor.js";
-import { runKeyBytes } from "./overflow-keys.js";
+import { runKeyBytes, overflowCapacityBytes } from "./overflow-keys.js";
 import { rangeRunBytes } from "./range-input.js";
 import type { ViewIndex } from "./view.js";
 
@@ -27,15 +27,26 @@ export function planIndexRange(
   // Neither later writes (invisible at this bound) nor publication can add a memtable to
   // this immutable TableView. Truncating a staged run cannot increase its run count.
   for (const memtable of table.tableView.memtables) {
-    const delta = memtable.deltas.get(id);
-    keyBytes = Math.max(keyBytes, delta?.maxKeyBytes ?? 0);
-    const slots = 1 + Math.max(1, memtable.staged?.runs.get(id)?.length ?? 0);
+    const delta = memtable.deltas.get(id),
+      published = memtable.published?.runs.get(id);
+    const width = Math.max(
+      delta?.maxKeyBytes ?? 0,
+      published === undefined ? 0 : runKeyBytes(published),
+    );
+    keyBytes = Math.max(keyBytes, width);
+    const staged = memtable.staged?.runs.get(id) ?? [];
+    const slots = 1 + Math.max(1, staged.length);
     resident += slots * (512 + 4096 + 512);
-    for (const run of memtable.staged?.runs.get(id) ?? []) {
+    const possible = width > 2048 ? overflowCapacityBytes(width) : 0;
+    resident += Math.max(
+      possible,
+      published === undefined ? 0 : rangeRunBytes(published, sign) - 4608,
+    );
+    for (const run of staged) {
       keyBytes = Math.max(keyBytes, runKeyBytes(run));
-      // slots already paid a legacy block; reserve each overflow workspace as well.
-      resident += Math.max(0, rangeRunBytes(run, sign) - 4608);
+      resident += Math.max(possible, rangeRunBytes(run, sign) - 4608);
     }
+    if (staged.length === 0) resident += possible;
     io = true;
   }
   for (const run of table.tableView.runs.get(id) ?? []) {
