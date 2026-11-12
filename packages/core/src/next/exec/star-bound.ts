@@ -22,6 +22,38 @@ export interface StarBound {
   readonly joins: ReadonlyMap<number, number>;
 }
 
+/** Cheap catalog-only eligibility before opening any domain proof reader. */
+export function starPrimaryKeys(
+  shape: StarDictionaryShape,
+  catalog: Pick<CatalogView, "table">,
+): boolean {
+  const leaf = (input: Rel, key: ScalarExpr | undefined): boolean => {
+    if (key?.op !== "column") return false;
+    let index = key.index,
+      node = input;
+    while (node.op === "project") {
+      const expr = node.exprs[index];
+      if (expr?.op !== "column") return false;
+      index = expr.index;
+      node = node.input;
+    }
+    if (node.op !== "scan") return false;
+    const table = catalog.table(node.tableId),
+      primary = table?.indexes.find((i) => i.id === table.primaryKey);
+    return (
+      primary?.unique === true &&
+      primary.columnIds.length === 1 &&
+      primary.columnIds[0] === node.columns[index]
+    );
+  };
+  return [...shape.typed.values()].every(
+    (node) =>
+      node.op !== "join" ||
+      (node.leftKeys.length === 1 &&
+        (leaf(node.left, node.leftKeys[0]) || leaf(node.right, node.rightKeys[0]))),
+  );
+}
+
 /** Only a terminal grouped star, with non-expanding, non-aliasing ancestors. */
 export function terminalStar(plan: PhysicalPlan, aggregate: number): boolean {
   if (plan.volatile || plan.parameters.length !== 0) return false;

@@ -3984,3 +3984,53 @@ export const STAR_BOUND_REACH = [
   "volatile",
   "alias",
 ] as const;
+
+export const STAR_SQL_REACH = [
+  "stored",
+  "memory",
+  "mixed",
+  "non-PK",
+  "composite",
+  "parameter",
+  "wide",
+  "computed",
+  "zero",
+  "resident joins",
+  "PG exact",
+  "generic exact",
+  "ascending",
+  "descending",
+  "aggregate order",
+  "lexical top-N",
+] as const;
+
+export const STAR_EDGE_REACH = ["ready", "blocked", "cancel", "map-error", "push-error"] as const;
+
+export const STAR_PRESSURE_REACH = [
+  "release",
+  "wait-cancel",
+  "read-cancel",
+  "read-fault",
+  "output-cancel",
+  "concurrent",
+  "publish",
+  "reclaim",
+  "atomic wait",
+  "holder release",
+  "PG exact",
+  "protected prepared credit",
+  "pinned growth",
+  "zero resources",
+] as const;
+
+export const STAR_FLOAT_REACH = [
+  "finite",
+  "special",
+  "overflow",
+  "empty",
+  "batch boundary",
+  "nonempty",
+  "identical native sequence",
+  "bit exact result",
+  "PG ordered transitions",
+] as const;

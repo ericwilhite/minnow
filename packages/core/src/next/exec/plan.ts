@@ -51,6 +51,17 @@ import {
 import { scalarHashMinimum, dictionaryHashShape, dictionaryHashMinimum } from "./agg/hash-bound.js";
 import { externalCallArguments } from "./agg/external-call.js";
 import { probeDictionaryGroups } from "./agg/dictionary-probe.js";
+import { starDictionaryShape, type StarDictionaryShape } from "./star-shape.js";
+import {
+  starBound,
+  starPrimaryKeys,
+  starPredicate,
+  terminalStar,
+  type StarBound,
+} from "./star-bound.js";
+import { StarDictionaryBooks } from "./star-dictionary.js";
+import { starColumns } from "./star-pipeline.js";
+import type { PartitionBounds } from "./agg/partition-probe.js";
 import {
   PercentileOperator,
   supportsPercentile,
@@ -473,6 +484,8 @@ function domainSource(rel: Extract<Rel, { op: "aggregate" }>) {
 }
 
 export interface CompileOptions {
+  /** False retains ordinary TEXT producers for star-join diagnostic controls. */
+  readonly starDictionary?: boolean;
   /** Diagnostic control for bounded sole rank/row_number windows. */
   readonly windowTopK?: boolean;
   /** Parent control for the resident full numeric columnar sort. */
@@ -558,6 +571,18 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   };
   findIds(plan.root);
   const readSources = new Map<number, ReadSource>();
+  const starPlanners = new Map<
+    number,
+    { shape: StarDictionaryShape; identity: OperatorIdentity }
+  >();
+  const starCompilers = new Map<number, number>();
+  const starChoices = new WeakMap<
+    QueryRuntime,
+    { shape: StarDictionaryShape; identity: OperatorIdentity; bound: StarBound }
+  >();
+  const starBooks = new WeakMap<QueryRuntime, StarDictionaryBooks>();
+  const starRel = (runtime: QueryRuntime, rel: Rel): Rel =>
+    starChoices.get(runtime)?.shape.typed.get(rel.id) ?? rel;
   const jsonWorkspaces = new Map<number, number>();
   const jsonWidths = new WeakMap<QueryRuntime, number>();
 
@@ -951,7 +976,11 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                   abort: () => scan.abort(),
                 };
                 runtime.pipeline();
-                const result = drive(source, counted(runtime, rel, downstream), runtime.signal);
+                const books = starBooks.get(runtime);
+                const outputSink = books?.shape.columns.has(rel.id)
+                  ? starColumns((batch) => books.encode(rel.id, batch), downstream)
+                  : downstream;
+                const result = drive(source, counted(runtime, rel, outputSink), runtime.signal);
                 return then(result, () => {
                   const profile = runtime.profile(rel);
                   profile.pagesRead = scan.stats.pagesRead;
@@ -1134,11 +1163,19 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               },
             );
         }
-        const setup = (context: CompileContext, sink: Operator) =>
+        const setup = (context: CompileContext, sink: Operator, runtime?: QueryRuntime) =>
           rel.op === "filter"
             ? new FilterOperator(rel.predicate, context, sink)
             : rel.op === "project"
-              ? new ProjectOperator(rel.exprs, context, sink)
+              ? (() => {
+                  const actual = runtime ? starRel(runtime, rel) : rel;
+                  if (actual.op !== "project") throw new Error("Star project changed operator");
+                  return new ProjectOperator(
+                    actual.exprs,
+                    { ...context, input: types(actual.input) },
+                    sink,
+                  );
+                })()
               : new LimitOperator(null, 0, context.arena, sink);
         const minimum = measureCompilerBuffers(
           compilation,
@@ -1191,7 +1228,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                     context.arena,
                     counted(runtime, rel, downstream),
                   )
-                : setup(context, counted(runtime, rel, downstream)),
+                : setup(context, counted(runtime, rel, downstream), runtime),
             (operator) => {
               runtime.onAbort((reason) => operator.abort(reason));
               const childStops =
@@ -1371,6 +1408,22 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           (operator) => operator.abort(undefined),
         );
         if (options.aggregationProgress !== false) {
+          const star =
+            options.starDictionary === false ||
+            rel.op !== "aggregate" ||
+            !terminalStar(plan, rel.id)
+              ? null
+              : starDictionaryShape(aggregate, plan.volatile);
+          if (star) {
+            const identity: OperatorIdentity = {
+              id: nextPhysicalId++,
+              op: "project",
+              profileAs: rel,
+            };
+            starPlanners.set(rel.id, { shape: star, identity });
+            starCompilers.set(rel.id, minimum);
+            fixed(identity, 0, rel.id);
+          }
           const externalCompiler = measureCompilerBuffers(
             compilation,
             input,
@@ -1449,7 +1502,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           });
           if (aggregatePlanners.get(rel.id)?.hybrid != null) registerPhaseProducer(rel.id);
           fixed(rel, external.minimum, rel.id, external.loans);
-          return (runtime, downstream) => {
+          const executeAggregate: Recipe = (runtime, downstream) => {
             const strategy = aggregateChoices.get(runtime)?.get(rel.id);
             if (strategy === undefined) throw new Error("Aggregation strategy was not admitted");
             return instantiate(
@@ -1461,6 +1514,20 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               (context, grant) => {
                 const target = counted(runtime, rel, downstream),
                   config = { signal: runtime.signal, ...outputOptions };
+                const selected = starChoices.get(runtime);
+                if (selected?.shape.aggregate.id === rel.id) {
+                  // Equality IDs have no lexical order. The original parent sort/top-N sees
+                  // restored TEXT; never select groups by the encoded key values here.
+                  delete config.outputTopN;
+                  const actual = selected.shape.aggregate;
+                  return new AggregateOperator(
+                    actual,
+                    { ...context, input: types(actual.input) },
+                    grant,
+                    target,
+                    config,
+                  );
+                }
                 if (strategy.kind === "restore") {
                   const resume = phases.get(runtime)?.resume;
                   if (resume?.kind !== "aggregate" || resume.rel !== rel.id)
@@ -1587,6 +1654,35 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 })();
               },
               strategy.kind === "hash" || strategy.kind === "domain",
+            );
+          };
+          return (runtime, downstream, stops) => {
+            const selected = starChoices.get(runtime);
+            if (selected?.shape.aggregate.id !== rel.id)
+              return executeAggregate(runtime, downstream, stops);
+            return instantiate(
+              runtime,
+              selected.identity,
+              [],
+              selected.bound.books,
+              1,
+              (_context, grant) => new StarDictionaryBooks(selected.shape, grant),
+              (books) => {
+                starBooks.set(runtime, books);
+                return (async () => {
+                  try {
+                    await executeAggregate(
+                      runtime,
+                      starColumns((batch) => books.decode(batch), downstream),
+                      stops,
+                    );
+                  } finally {
+                    starBooks.delete(runtime);
+                    books.close();
+                  }
+                })();
+              },
+              true,
             );
           };
         }
@@ -1823,17 +1919,20 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           });
         const left = prepare(rel.left),
           right = prepare(rel.right),
-          lt = types(rel.left),
-          rt = types(rel.right);
-        const lk = keyProjection(lt, rel.leftKeys),
-          rk = keyProjection(rt, rel.rightKeys);
-        const predicateTypes = [...lt, ...rt];
+          lt = types(rel.left);
         const make = (
           context: CompileContext,
           grant: Grant | null,
           downstream: Operator,
           runtime?: QueryRuntime,
         ) => {
+          const actual = runtime ? starRel(runtime, rel) : rel;
+          if (actual.op !== "join") throw new Error("Star join changed operator");
+          const lt = types(actual.left),
+            rt = types(actual.right),
+            lk = keyProjection(lt, actual.leftKeys),
+            rk = keyProjection(rt, actual.rightKeys),
+            predicateTypes = [...lt, ...rt];
           const predicateContext = { ...context, input: predicateTypes };
           const spec: HashJoinSpec = {
             kind: rel.kind === "cross" ? "inner" : rel.kind,
@@ -1925,13 +2024,15 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         // The operator helper already includes its constructor's fixed buffers. Add only
         // this recipe's kernel arena; adding all measured bytes would count pools twice.
         const minimum = base + measured;
+        starCompilers.set(rel.id, measured);
         fixed(rel, minimum);
-        return (runtime, downstream, stops) =>
-          instantiate(
+        return (runtime, downstream, stops) => {
+          const complete = starChoices.get(runtime)?.bound.joins.get(rel.id);
+          return instantiate(
             runtime,
             rel,
             lt,
-            minimum,
+            complete ?? minimum,
             BATCH_ROWS,
             (context, grant) => make(context, grant, counted(runtime, rel, downstream), runtime),
             ({ join, build, probe }) => {
@@ -1963,7 +2064,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 }
               })();
             },
+            complete !== undefined,
           );
+        };
       }
       case "setOp": {
         if (rel.kind !== "except" || rel.inputs.length !== 2)
@@ -2470,6 +2573,72 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         best.minimum = external.minimum;
         best.loanSlots = external.loans;
       }
+      starChoices.delete(runtime);
+      if (runtime.request.statement === null)
+        for (const planner of starPlanners.values()) {
+          const { shape, identity } = planner;
+          if (
+            !active.has(shape.aggregate.id) ||
+            !starPrimaryKeys(shape, runtime.view.catalog) ||
+            shape.scans.some((scan) => !starPredicate(scan.filter))
+          )
+            continue;
+          const proofs = new Map<number, PartitionBounds>();
+          for (const scan of shape.scans) {
+            const read = bounds.get(scan.id);
+            if (!read) break;
+            const indices = scan.output.flatMap((column, index) =>
+              column.type.kind === "text" ? [index] : [],
+            );
+            const proof = yield* readValue(
+              probeDictionaryGroups(
+                runtime.view,
+                {
+                  tableId: scan.tableId,
+                  keys: indices.map((i) => at(scan.columns, i)),
+                  types: indices.map((i) => at(scan.output, i).type),
+                  payloads: [],
+                },
+                runtime.request.reads,
+                runtime.request.governor,
+                read,
+                runtime.signal,
+                `query#${String(runtime.request.queryId)}/star-domain-planning`,
+                Number.MAX_SAFE_INTEGER,
+                true,
+              ),
+            );
+            if (proof === null) break;
+            proofs.set(scan.id, proof);
+          }
+          const bound = starBound(shape, runtime.view.catalog, proofs, starCompilers);
+          if (bound === null) continue;
+          const minima = new Map([
+            ...bound.joins,
+            [identity.id, bound.books],
+            [shape.aggregate.id, bound.aggregate],
+          ]);
+          const saved = entries.flatMap((entry) => {
+            const minimum = minima.get(entry.rel.id);
+            if (minimum === undefined) return [];
+            const prior = { entry, minimum: entry.minimum, loanSlots: entry.loanSlots };
+            entry.minimum = minimum;
+            entry.loanSlots = 0;
+            return [prior];
+          });
+          if (runtime.minimumBytes(entries) > runtime.request.governor.capBytes) {
+            for (const prior of saved) {
+              prior.entry.minimum = prior.minimum;
+              prior.entry.loanSlots = prior.loanSlots;
+            }
+            continue;
+          }
+          // All probe grants have closed. Only numeric facts survive this complete atomic
+          // admission; no source buffer or private partial reservation waits for credit.
+          choices.set(shape.aggregate.id, { kind: "hash", minimum: bound.aggregate, loans: 0 });
+          starChoices.set(runtime, { shape, identity, bound });
+          break;
+        }
     };
     const needsChoices = aggregatePlanners.size + percentilePlanners.size > 0;
     const execute = () =>

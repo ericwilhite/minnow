@@ -1766,6 +1766,16 @@ shipped-engine or stored-format change.
   dictionaries are first-seen order): a dictionary small for its batch is ranked by value once,
   and a group's best gets its place among those ranks by a binary search over values when the
   dictionary first meets it. Groups and dictionaries are only ever compared by value.
+- `star-bound.ts` / `star-dictionary.ts`: a terminal three-inner-join grouped COUNT/float SUM
+  may keep canonical TEXT equality IDs through the existing native joins and aggregate.
+  Exact domains on the pinned snapshot and enforced single-column primary keys certify
+  complete resident join/codebook/state/output grants, admitted together before input opens.
+  A bounded proof scans plain keys when dictionary metadata cannot certify them. Proof
+  grants close before whole admission. Unknown domains, excessive bounds, unproved uniqueness,
+  parameters, volatile/computed producers or insufficient whole-cap room retain the generic
+  route. All selected joins stay resident, preserving native per-group float transition order.
+  Group keys become TEXT again before lexical sort/top-N; equality IDs are never lexical ranks.
+  `starDictionary:false` is the private diagnostic control, not a public SQL option.
 - SUM over int2/int4 reads the decoded Int32Array directly and, while no batch can push a part
   past ±2^52 (a bound on every part, rescanned about once per 2^21 rows), skips the per-row
   check; near the limit it takes the checked loop and the carry.
