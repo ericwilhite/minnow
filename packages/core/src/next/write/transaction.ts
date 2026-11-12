@@ -1291,19 +1291,25 @@ export class TableWriterImpl implements TableWriter {
       });
       const first = delta.entryCount;
       try {
-        for (let k = 0; k < count; k++) {
-          const row = rows === null ? from + k : (rows[from + k] ?? 0);
-          if (!noNulls && this.#hasNullKey(index, columns, row)) continue;
-          const rowId = typeof rowIds === "number" ? rowIds + k : (rowIds[k] ?? 0);
-          delta.add(
-            keys.writer.bytes,
-            keys.offsets[k] ?? 0,
-            keys.offsets[k + 1] ?? 0,
-            rowId,
-            seq,
-            false,
-          );
-        }
+        const appended =
+          rows === null &&
+          typeof rowIds === "number" &&
+          noNulls &&
+          delta.addOrderedBatch(keys.writer.bytes, keys.offsets, count, rowIds, seq);
+        if (!appended)
+          for (let k = 0; k < count; k++) {
+            const row = rows === null ? from + k : (rows[from + k] ?? 0);
+            if (!noNulls && this.#hasNullKey(index, columns, row)) continue;
+            const rowId = typeof rowIds === "number" ? rowIds + k : (rowIds[k] ?? 0);
+            delta.add(
+              keys.writer.bytes,
+              keys.offsets[k] ?? 0,
+              keys.offsets[k + 1] ?? 0,
+              rowId,
+              seq,
+              false,
+            );
+          }
       } finally {
         // Record completed entries even if a later allocation throws.
         const added = delta.entryCount - first;
@@ -1355,14 +1361,21 @@ export class TableWriterImpl implements TableWriter {
     const bytes = delta.keyArena();
     let low = delta.keyOf(from);
     let high = low;
-    for (let entry = from + 1; entry < to; entry++) {
+    const proven = to <= delta.ascendingEntryPrefix;
+    if (proven) high = delta.keyOf(to - 1);
+    for (let entry = from + 1; !proven && entry < to; entry++) {
       const slot = delta.keyOf(entry);
       const start = delta.keyStart(slot);
       const end = delta.keyEnd(slot);
-      if (compareBytes(bytes, start, end, bytes, delta.keyStart(low), delta.keyEnd(low)) < 0)
-        low = slot;
-      if (compareBytes(bytes, start, end, bytes, delta.keyStart(high), delta.keyEnd(high)) > 0)
-        high = slot;
+      if (delta.ascendingKeys) {
+        if (slot < low) low = slot;
+        if (slot > high) high = slot;
+      } else {
+        if (compareBytes(bytes, start, end, bytes, delta.keyStart(low), delta.keyEnd(low)) < 0)
+          low = slot;
+        if (compareBytes(bytes, start, end, bytes, delta.keyStart(high), delta.keyEnd(high)) > 0)
+          high = slot;
+      }
     }
     const lowKey = delta.keyBytes(low);
     const highKey = delta.keyBytes(high);

@@ -30,6 +30,49 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+/** Bulk sealed blocks preserve the ordinary run encoder's complete native output. */
+export const WRITE_DIRECT_RUN_STATES = [
+  "single",
+  "unordered",
+  "chains",
+  "filter",
+  "partition",
+  "long",
+  "empty key",
+  "wide row id",
+  "two-byte length",
+  "batch callback",
+  "per-row fallback",
+  "mixed widths",
+  "partial fallback",
+  "filtered batch",
+  "implicit order batch",
+  "permuted order batch",
+] as const;
+
+/** Batched normalized-key admission checks unsigned payloads and the prior arena boundary. */
+export const WRITE_KEY_BATCH_PROOF_STATES = [
+  "ordered batch",
+  "one boundary",
+  "batch fallback",
+  "unsigned payload",
+  "signed boundary",
+  "boundary rejection",
+] as const;
+
+/** Retained key-slot order proofs survive ties, disorder, chains and rollback. */
+export const WRITE_KEY_ORDER_PROOF_STATES = [
+  "ascending",
+  "descending",
+  "late disorder",
+  "prefix ties",
+  "empty and zero extension",
+  "rollback",
+  "duplicates",
+  "zero workspace",
+  "byte fallback",
+] as const;
+
 /** A 64-bit key table's half-full resize is funded before assignment. */
 export const INT64_GROWTH_REACH = [
   "funded transition",
@@ -2140,6 +2183,7 @@ export const WRITE_DELTA_ACCOUNTING_STATES = [
   "constructor precharge",
   "initial constructor failure",
   "order buffer",
+  "implicit ordered traversal",
   "chain growth overlap",
   "full memtable",
   "visitor failure",

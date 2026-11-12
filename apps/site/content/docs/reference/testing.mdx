@@ -1697,6 +1697,18 @@ Disk merges compute the pair for keys read from storage, then reuse it across bl
 Structural write optimizations require a paired whole-load gain; component gains alone do not
 qualify.
 
+`run-direct.test.ts` compares borrowed single-entry batches with the ordinary owned encoder.
+It checks complete native run bytes across block and Bloom boundaries, mixed chains, filtered
+rows and wide row IDs. The key delta stays pinned until the final block is encoded or the
+builder aborts; releasing its owner early must not release those bytes. Mixed chains fall
+back to the ordinary serializer without changing a partially filled block.
+
+`key-order-proof.test.ts` checks retained key order and ascending batch admission against an
+independent byte-order model. A normalized prefix proves order only when it differs; ties use
+full byte comparison. A batch must be strictly beyond every retained key before it can skip
+lookups. Generated bulk-encoder cases exercise both implicit order and explicit permutations,
+and partial-failure tests cut the same completed key prefix in either ingress path.
+
 Each worker runs one excluded warmup before its measured pass. Nine or more pairs alternate
 AB/BA order. CPU includes all Node threads; wall time is separate. The acceptance rule uses
 paired CPU deltas: their median gain must exceed their interquartile range (IQR), and at least
