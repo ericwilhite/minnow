@@ -572,16 +572,20 @@ produces an empty array/object. JSON object text keeps duplicates, key order and
 JSONB orders keys by UTF8 length then bytes and retains the last non-skipped value. Numeric
 scale, float spelling, escapes and record separators follow PG exactly. ROW_TO_JSON (including
 its spacing argument), TO_JSON(record), TO_JSONB(record), nested ROW values, and absent outer
-rows preserve their distinct NULL rules. A present all-NULL row remains an object.
+rows preserve their distinct NULL rules. A present all-NULL row remains an object. Record
+labels retain their declared spelling, duplicates and quoted identifier identity through derived
+queries, CTEs, wildcard expansion and projection rewrites; unique binding ids stay separate.
 
 Only one group and bounded fragments are resident. Values append to native BYTES pages with
 file-backed links; key/value/order sorts use the shared spill service and task clock. JSONB
 object values are converted in input order before the key-selection sort. No per-group or
 per-value page-reference array grows with input. COUNT/SUM/AVG/MIN/MAX/boolean scalar siblings
 share the existing charged accumulators one group at a time. JSONB and SQL-array grouping
-keys remain typed `0A000` refusals: group boundaries require semantic equality, not equality
-of wire bytes (PostgreSQL groups JSONB `1` and `1.0` together). Plain JSON grouping reports
-PostgreSQL's `42883`. Primitive grouping keys remain supported. Ordered/distinct scalar siblings,
+keys use PostgreSQL semantic equality, including numeric scale differences and NULL array
+elements. Comparisons charge both decoded operands before allocating either. Wide representative
+keys spill between rows and restore inside a complete prepaid read/compare/write step, so no
+progress loan survives from one input row to the next. Plain JSON grouping reports
+PostgreSQL's `42883`. Ordered/distinct scalar siblings,
 DISTINCT object aggregates, DISTINCT JSONB/composite inputs, grouping sets, windowed JSON
 aggregates and SQL/JSON RETURNING/NULL policy clauses remain unsupported. Typed scalar array
 DISTINCT honors PG ordering; plain JSON has no equality operator (42883).
@@ -593,6 +597,13 @@ are streamed into result-owned buffers and transferred without another payload c
 canonical JSONB-to-TEXT cast (or representation-preserving JSON-to-TEXT) forwards ownership;
 raw JSONB scans/literals still canonicalize. Only file delivery survives the cut, so its physical
 reservation is a project, profiled as the aggregate, with no retired sort-progress loans.
+
+The fixed JSON transition workspace admits a tiny `json_agg`, `jsonb_agg` or `json_object_agg`
+under a 4 MiB complete query cap. JSONB object key deduplication retains the shared sort
+recipe; the small-cap suite uses 8..10 MiB
+for that family. Semantic source operands use a measured one-row bound rather than multiplying
+a whole batch-sized read floor. Owned delivery includes its exact frame metadata alongside
+the transferred payload.
 
 Other retaining parents keep their actual native minima/progress reservations; this is not a
 2x whole-query bound for arbitrary compositions. The independent boundary generator uses

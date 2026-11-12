@@ -1,4 +1,4 @@
-import { jsonCallSource } from "../../engine/json-call-sources.js";
+import { jsonCallSource, rowFieldSource, rowObjectSource } from "../../engine/json-call-sources.js";
 import { isDatePart } from "../../engine/date-part-sources.js";
 /**
  * Front-end expressions (plan/model.ts `Expression`, `Predicate`) to typed IR scalar
@@ -58,7 +58,9 @@ export interface Scope {
   /** A column reference as the front end writes it (`a`, `t.a`), or undefined if unknown. */
   column(reference: string): Typed | undefined;
   /** Presence of a whole row, distinct from an actual row whose fields are all NULL. */
-  rowPresence?(reference: string): Typed;
+  rowPresence?(qualifier: string): Typed;
+  /** Exact source identity and declaration ordinal, independent of printed dotted names. */
+  rowField?(qualifier: string, ordinal: number): Typed | undefined;
   /**
    * Whether `qualifier` names a FROM entry here or in an enclosing query, so an unknown `t.a`
    * is "missing FROM-clause entry" (42P01) rather than an unknown column. Absent: cannot tell.
@@ -646,6 +648,11 @@ export function lowerJsonValue(
   state: ExpressionState,
 ): Collated {
   if (expression.kind === "column") {
+    const field = rowFieldSource(expression);
+    if (field !== undefined) {
+      const value = scope.rowField?.(field.qualifier, field.ordinal);
+      if (value !== undefined) return value;
+    }
     const value = scope.column(expression.reference);
     if (value?.record) return value;
   }
@@ -667,7 +674,9 @@ function lowerJsonRecord(
   const field = expression.arguments[1];
   const presence =
     jsonCallSource(expression) === "ROW_OBJECT" && field?.kind === "column"
-      ? (scope.rowPresence?.(field.reference) ?? {
+      ? (scope.rowPresence?.(
+          rowObjectSource(expression) ?? field.reference.slice(0, field.reference.indexOf(".")),
+        ) ?? {
           expr: boolLiteral(true),
           nullable: false,
           big: false,
@@ -939,7 +948,10 @@ export function lowerExpression(
       };
     }
     case "column": {
-      const resolved = scope.column(expression.reference);
+      const field = rowFieldSource(expression);
+      const resolved =
+        (field === undefined ? undefined : scope.rowField?.(field.qualifier, field.ordinal)) ??
+        scope.column(expression.reference);
       if (resolved?.record)
         throw unsupported("function", "composite value outside a JSON consumer");
       if (resolved !== undefined) return resolved;

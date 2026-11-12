@@ -235,7 +235,11 @@ describe("published core tarball", () => {
       // rebuild code/tests stay excluded, and unpacked/isolation limits remain unchanged.
       // Shipped lazy LAG/LEAD offsets and defaults (engine/window-inputs.ts) on top of that:
       // 1,024,395 packed bytes. Raise packed cap once by 500; other limits unchanged.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_024_750);
+      // Aggregate/record provenance: 1,024,526 packed bytes (+395). Raise once by 500;
+      // unpacked and package-isolation budgets stay unchanged; next/ and tests do not ship.
+      // Reviewed record identity: 1,025,206 packed bytes (+680); raise once by 750.
+      // Unpacked and isolation budgets stay unchanged; no next/ or test output ships.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_025_500);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");

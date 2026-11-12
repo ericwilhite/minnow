@@ -124,6 +124,7 @@ interface Entry {
   /** Null-supplied by an outer join: its columns read NULL-extended, nothing is pushed into it. */
   readonly nullSupplied: boolean;
   resolve(name: string): Resolved | undefined;
+  field(ordinal: number): Resolved | undefined;
   /** Visible column names, for `*`. */
   names(): string[];
   /** The entry's relation over `pushed` conjuncts (typed over its local positions). */
@@ -170,24 +171,29 @@ function relationEntry(
   builder: PlanBuilder,
 ): Entry {
   const columns = inner.columns;
+  let visible: readonly number[] | null = null;
+  const field = (local: number): Resolved | undefined => {
+    const found = columns[local];
+    return found === undefined
+      ? undefined
+      : {
+          local,
+          type: found.type,
+          nullable: found.nullable,
+          big: found.big,
+          ...(found.record ? { record: true as const } : {}),
+          ...(found.collation === undefined ? {} : { collation: found.collation }),
+        };
+  };
   return {
     source,
     kind,
     qualifiers,
     nullSupplied,
-    resolve: (name) => {
-      const local = columns.findIndex((candidate) => candidate.name === name);
-      const found = columns[local];
-      return found === undefined
-        ? undefined
-        : {
-            local,
-            type: found.type,
-            nullable: found.nullable,
-            big: found.big,
-            ...(found.record ? { record: true as const } : {}),
-            ...(found.collation === undefined ? {} : { collation: found.collation }),
-          };
+    resolve: (name) => field(columns.findIndex((candidate) => candidate.name === name)),
+    field: (ordinal) => {
+      visible ??= columns.flatMap((c, i) => (c.name.startsWith(HIDDEN) ? [] : [i]));
+      return field(visible[ordinal] ?? -1);
     },
     names: () => columns.map((col) => col.name).filter((name) => !name.startsWith(HIDDEN)),
     build: (pushed) => {
@@ -224,6 +230,7 @@ function tableEntry(
   builder: PlanBuilder,
 ): Entry {
   const read = new TableRead(table, alias);
+  let fields: typeof table.columns | null = null;
   return {
     source,
     kind,
@@ -239,6 +246,17 @@ function tableEntry(
         nullable: def.nullable,
         big: def.type.kind === "int64",
       };
+    },
+    field: (ordinal) => {
+      const def = (fields ??= table.columns.filter((c) => !c.name.startsWith(HIDDEN)))[ordinal];
+      return def === undefined
+        ? undefined
+        : {
+            local: read.use(def),
+            type: def.type,
+            nullable: def.nullable,
+            big: def.type.kind === "int64",
+          };
     },
     names: () => table.columns.map((def) => def.name),
     build: (pushed, locator) => {
@@ -380,8 +398,13 @@ export function lowerFrom(
 
   const rowMarkers = new Set<number>();
   const scope: Scope = {
-    rowPresence: (reference) => {
-      const entry = byQualifier(reference.slice(0, reference.indexOf(".")))[0];
+    rowField: (qualifier, ordinal) => {
+      const entry = byQualifier(qualifier)[0];
+      const found = entry?.field(ordinal);
+      return entry && found ? typedOf(entry, found) : undefined;
+    },
+    rowPresence: (qualifier) => {
+      const entry = byQualifier(qualifier)[0];
       if (!entry?.nullSupplied) return { expr: boolLiteral(true), nullable: false, big: false };
       for (const name of entry.names()) {
         const found = entry.resolve(name);

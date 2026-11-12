@@ -1,4 +1,12 @@
-import { rememberJsonCall, copyJsonCall, jsonCallSource } from "./json-call-sources.js";
+import {
+  rememberJsonCall,
+  copyJsonCall,
+  jsonCallSource,
+  rememberRowOutputName,
+  rowOutputName,
+  rememberRowField,
+  rememberRowObject,
+} from "./json-call-sources.js";
 import { rememberDatePart, copyDatePart, isDatePart } from "./date-part-sources.js";
 import {
   sourceLocksRelation,
@@ -5759,16 +5767,30 @@ export function expandRowReferences(
         return undefined;
       }
       const columns = sourceColumns(source);
+      if (recordDeclaredTypes && columns.some((name) => name === "*" || name.endsWith(".*")))
+        return undefined;
       if (columns.length === 0 || columns.some((name) => name.startsWith("\0"))) return undefined;
       const call: Expression = {
         kind: "call",
         name: "JSON_OBJECT",
-        arguments: columns.flatMap((name) => [
-          { kind: "literal", value: name },
-          { kind: "column", reference: `${source.alias}.${name}` },
-        ]),
+        arguments: columns.flatMap((name, ordinal) => {
+          const field: Expression = { kind: "column", reference: `${source.alias}.${name}` };
+          if (recordDeclaredTypes) rememberRowField(field, source.alias, ordinal);
+          return [
+            {
+              kind: "literal",
+              value: recordDeclaredTypes
+                ? (sourceRowOutputNames(source, tableColumns)?.[ordinal] ?? name)
+                : name,
+            },
+            field,
+          ];
+        }),
       };
-      if (recordDeclaredTypes) rememberJsonCall(call, "ROW_OBJECT");
+      if (recordDeclaredTypes) {
+        rememberJsonCall(call, "ROW_OBJECT");
+        rememberRowObject(call, source.alias);
+      }
       return call;
     };
     if (pass.probing) {
@@ -10828,7 +10850,12 @@ class Parser {
         // `SELECT amount total`: a label needs no AS, as in PostgreSQL and SQLite.
         alias = this.#identifier();
       }
-      items.push({ expression, alias });
+      const item = { expression, alias };
+      if (recordDeclaredTypes) {
+        rememberRowOutputName(expression, alias);
+        rememberRowOutputName(item, alias);
+      }
+      items.push(item);
       if (!this.#punctuation(",")) break;
     }
     for (const item of items) {
@@ -13548,7 +13575,9 @@ function unifyGroupedReferences<
   };
   const unified: T = {
     ...block,
-    select: block.select.map((item) => ({ ...item, expression: respell(item.expression) })),
+    select: block.select.map((item) =>
+      rowSelectItem(item, { expression: respell(item.expression) }),
+    ),
     groupBy: block.groupBy.map(respell),
     having: block.having.map((predicate) => ({
       ...predicate,
@@ -13801,7 +13830,9 @@ function desugarComposedFullJoin(
       ...parts,
       base: source,
       joins: [],
-      select: parts.select.map((item) => ({ ...item, expression: rewrite(item.expression) })),
+      select: parts.select.map((item) =>
+        rowSelectItem(item, { expression: rewrite(item.expression) }),
+      ),
       predicates: parts.predicates.map((predicate) => ({
         ...predicate,
         left: rewrite(predicate.left),
@@ -14063,10 +14094,11 @@ function lowerSelectBlock(
         sql,
         base: source,
         joins: [],
-        select: inner.select.map((item) => ({
-          expression: { kind: "column", reference: item.alias },
-          alias: item.alias,
-        })),
+        select: inner.select.map((item) =>
+          rowSelectItem(item, {
+            expression: { kind: "column", reference: item.alias },
+          }),
+        ),
         distinct: true,
         predicates: [],
         groupBy: [],
@@ -14405,6 +14437,61 @@ function sourceWildcardColumns(
   return columnsOf(source.table)?.filter((name) => !name.startsWith("\0"));
 }
 
+/** A rewritten projection keeps declaration labels independently of its expression ids. */
+function rowSelectItem(
+  item: SelectItem,
+  changes: Partial<SelectItem>,
+  renamed?: string,
+): SelectItem {
+  const mapped = { ...item, ...changes };
+  if (!recordDeclaredTypes) return mapped;
+  const name = renamed ?? rowOutputName(item) ?? rowOutputName(item.expression);
+  if (name !== undefined) {
+    rememberRowOutputName(mapped, name);
+    rememberRowOutputName(mapped.expression, name);
+  }
+  return mapped;
+}
+/** Record labels never inherit result-object collision suffixes. */
+function sourceRowOutputNames(
+  source: TableSource,
+  columnsOf: (table: string) => readonly string[] | undefined,
+): readonly string[] | undefined {
+  if (source.columnAliases !== undefined) return source.columnAliases;
+  const unionProjection =
+    source.derived?.base.union !== undefined &&
+    source.derived.select[0]?.expression.kind === "wildcard";
+  const block = unionProjection
+    ? source.derived?.base.union?.blocks[0]
+    : (source.derived ??
+      source.union?.blocks[0] ??
+      source.windowed?.block ??
+      source.recursive?.base);
+  if (block === undefined) return sourceWildcardColumns(source, columnsOf);
+  const names = block.select
+    .filter((item) => !item.alias.startsWith("\0"))
+    .map((item) => rowOutputName(item) ?? rowOutputName(item.expression) ?? item.alias);
+  return source.windowed === undefined
+    ? names
+    : [...names, ...source.windowed.windows.map((item) => item.alias)];
+}
+function rowWildcardItem(
+  source: TableSource,
+  name: string,
+  ordinal: number,
+  alias: string,
+  columnsOf: (table: string) => readonly string[] | undefined,
+): SelectItem {
+  const expression: Expression = { kind: "column", reference: `${source.alias}.${name}` };
+  if (recordDeclaredTypes) {
+    rememberRowOutputName(expression, sourceRowOutputNames(source, columnsOf)?.[ordinal] ?? name);
+    rememberRowField(expression, source.alias, ordinal);
+  }
+  const item = { expression, alias };
+  if (recordDeclaredTypes) rememberRowOutputName(item, rowOutputName(expression) ?? alias);
+  return item;
+}
+
 /** Whether any block still needs source schemas before its SELECT shape can be lowered. */
 export function planHasPendingSelectShapes(plan: CompiledQuery): boolean {
   if (
@@ -14517,10 +14604,15 @@ export function bindPendingSelectShapes(
         throw new TypeError(`Unknown table for ${table}.*: ${table}`);
       }
       return selected.flatMap(({ source, columns }) =>
-        (columns ?? []).map((name) => ({
-          expression: { kind: "column" as const, reference: `${source.alias}.${name}` },
-          alias: (contributed.get(name) ?? 0) > 1 ? `${source.alias}.${name}` : name,
-        })),
+        (columns ?? []).map((name, ordinal) =>
+          rowWildcardItem(
+            source,
+            name,
+            ordinal,
+            (contributed.get(name) ?? 0) > 1 ? `${source.alias}.${name}` : name,
+            columnsOf,
+          ),
+        ),
       );
     });
     numberRepeatedOutputs(items);
@@ -14755,15 +14847,12 @@ function expandQualifiedWildcards(
       if (columns === undefined || columns.length === 0) {
         throw new TypeError(`${table}.* requires known columns for: ${source.table}`);
       }
-      return columns.map((name) => {
+      return columns.map((name, ordinal) => {
         const output = multiple ? `${source.alias}.${name}` : name;
         // Keep the source-qualified input reference even though one source exposes a bare output
         // name. ORDER BY can legally spell either form (`id` or `orders.id`), and the latter must
         // still match this select item after the wildcard has expanded.
-        return {
-          expression: { kind: "column" as const, reference: `${source.alias}.${name}` },
-          alias: output,
-        };
+        return rowWildcardItem(source, name, ordinal, output, columnsOf);
       });
     });
     numberRepeatedOutputs(block.select);
@@ -14925,10 +15014,11 @@ function assembleOrderByExpressionBlock(
   // output names such as `people.id` are legal result labels but are not legal internal column
   // references there — the dot would be read as the vanished `people` source qualifier. Carry
   // every visible value through a private dot-free name and restore its public label outside.
-  const visibleInner = parts.select.map((item, index) => ({
-    ...item,
-    alias: item.alias.includes(".") ? `(order visible ${String(index + 1)})` : item.alias,
-  }));
+  const visibleInner = parts.select.map((item, index) =>
+    rowSelectItem(item, {
+      alias: item.alias.includes(".") ? `(order visible ${String(index + 1)})` : item.alias,
+    }),
+  );
   const visibleAlias = new Map(
     parts.select.map(
       (item, index) => [item.alias, visibleInner[index]?.alias ?? item.alias] as const,
@@ -14952,13 +15042,14 @@ function assembleOrderByExpressionBlock(
     sql: parts.sql,
     base: source,
     joins: [],
-    select: parts.select.map((item, index) => ({
-      expression: {
-        kind: "column",
-        reference: visibleInner[index]?.alias ?? item.alias,
-      } satisfies Expression,
-      alias: item.alias,
-    })),
+    select: parts.select.map((item, index) =>
+      rowSelectItem(item, {
+        expression: {
+          kind: "column",
+          reference: visibleInner[index]?.alias ?? item.alias,
+        } satisfies Expression,
+      }),
+    ),
     predicates: [],
     groupBy: [],
     having: [],
@@ -15094,10 +15185,15 @@ function renameBlockOutputs(block: CompiledQuery, columns: readonly string[], na
       `CTE ${name} declares ${String(columns.length)} columns but selects ${String(block.select.length)}`,
     );
   }
-  block.select = block.select.map((item, index) => ({
-    ...item,
-    alias: columns[index] ?? item.alias,
-  }));
+  block.select = block.select.map((item, index) =>
+    rowSelectItem(
+      item,
+      {
+        alias: columns[index] ?? item.alias,
+      },
+      columns[index] ?? item.alias,
+    ),
+  );
 }
 
 /**
@@ -15235,7 +15331,7 @@ function desugarWindows(
   const innerSelect: SelectItem[] = select.flatMap((item, index) =>
     containsWindow(item.expression)
       ? []
-      : [{ ...item, alias: internalAliases[index] ?? item.alias }],
+      : [rowSelectItem(item, { alias: internalAliases[index] ?? item.alias })],
   );
   const windows: WindowSpec[] = [];
   let hidden = 0;
@@ -15331,21 +15427,19 @@ function desugarWindows(
   const projections = select.map((item, index) => {
     const internalAlias = internalAliases[index] ?? item.alias;
     if (!containsWindow(item.expression)) {
-      return {
+      return rowSelectItem(item, {
         expression: { kind: "column" as const, reference: internalAlias },
-        alias: item.alias,
-      };
+      });
     }
     // A window that is the whole select item carries a private source-safe name through the
     // windowed source, then the wrapper restores the public output alias.
     if (item.expression.kind === "window") {
       registerWindow(item.expression, internalAlias);
-      return {
+      return rowSelectItem(item, {
         expression: { kind: "column" as const, reference: internalAlias },
-        alias: item.alias,
-      };
+      });
     }
-    return { expression: split(item.expression), alias: item.alias };
+    return rowSelectItem(item, { expression: split(item.expression) });
   });
   if (innerSelect.length === 0) {
     innerSelect.push({ expression: { kind: "literal", value: 1 }, alias: "(window 0)" });

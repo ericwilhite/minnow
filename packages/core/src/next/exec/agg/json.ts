@@ -1,3 +1,5 @@
+import { JsonGroupRow } from "./json-group-row.js";
+import { JsonGroupKeys } from "./json-group-keys.js";
 import { JSON_VALUE_KINDS } from "../kernels/json-value.js";
 import { JsonOrdinaryTransition, ordinaryJsonCall } from "./json-ordinary.js";
 /** File-backed JSON transitions share the ordinary sort, spill and phase admission protocol. */
@@ -21,7 +23,7 @@ import { Charge, Pool, SpillIo } from "../spill-pool.js";
 import { PageWriter, SpillFiles } from "../spill-pages.js";
 import { ColumnStore } from "../column-store.js";
 import { SortOperator, sortMinimumBytes, type SortContext } from "../sort.js";
-import { keysEqual, type SortColumn } from "../sort-keys.js";
+import { keysEqual, operandBytes, type SortColumn } from "../sort-keys.js";
 import { JsonRecords } from "../json-records.js";
 import type { JsonPhaseContext, JsonPhase } from "../json-phase.js";
 import { ParameterCheckpoint } from "../parameter-checkpoint.js";
@@ -38,12 +40,13 @@ import { ExecutionError, UnsupportedPlanError } from "../errors.js";
 
 type AggregateRel = Extract<Rel, { op: "aggregate" }>;
 const INT8: PhysicalType = { kind: "int64" };
-const ownMinimum = (rel: AggregateRel) => (2 << 20) + rel.aggregates.length * (256 << 10);
+// Two bounded record writers, shared page/directory scratch and grouping metadata.
+// Each transition separately funds its 64 KiB serializer plus bounded metadata;
+// input sort grants and growing values are charged outside this fixed workspace.
+const ownMinimum = (rel: AggregateRel) => (512 << 10) + rel.aggregates.length * (256 << 10);
 export const isJsonAggregate = (call: AggregateCall): boolean =>
   ["json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg"].includes(call.fn);
 export function jsonAggregateMinimum(rel: AggregateRel, input: readonly PhysicalType[]): number {
-  // Sorted order does not imply byte equality: JSONB 1 and 1.0 are one PG group.
-  // Keep structural keys outside this transition until semantic boundary equality is available.
   for (const index of rel.groupBy) {
     const type = input[index];
     if (type?.kind === "json" && !type.binary)
@@ -52,10 +55,6 @@ export function jsonAggregateMinimum(rel: AggregateRel, input: readonly Physical
         "MINNOW_JSON_GROUP_KEY",
         "42883",
       );
-    if (type?.kind === "json" || type?.kind === "array")
-      throw new UnsupportedPlanError("JSONB/array aggregate grouping equality", {
-        construct: "aggregate",
-      });
   }
   for (const call of rel.aggregates) {
     if (!isJsonAggregate(call)) ordinaryJsonCall(call);
@@ -118,9 +117,10 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
   readonly #directory: TapeDirectory;
   readonly #prefix: JsonRecords;
   readonly #suffix: JsonRecords;
-  readonly #keys: ColumnStore;
+  readonly #keys: JsonGroupRow;
   readonly #keyTypes: readonly PhysicalType[];
   readonly #keyOrder: readonly SortColumn[];
+  readonly #semanticKeys: JsonGroupKeys | null;
   readonly #rows: Uint16Array;
   readonly #ordinal: FlatVector & {
     data: { layout: "int64"; values: { repr: "int64"; values: BigInt64Array } };
@@ -184,10 +184,25 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
       nulls: "last",
       collation: null,
     }));
-    this.#keys = new ColumnStore(this.#keyTypes, this.pool, {
-      chunkRows: 1,
-      targetBytes: Infinity,
-    });
+    this.#semanticKeys = this.#keyTypes.some((t) => t.kind === "json" || t.kind === "array")
+      ? new JsonGroupKeys(
+          this.#keyTypes,
+          this.#keyOrder,
+          this.pool,
+          this.#ownGrant,
+          this.#controller.signal,
+          () => this.pace(),
+        )
+      : null;
+    this.#keys = new JsonGroupRow(
+      this.#keyTypes,
+      this.#keyOrder,
+      this.pool,
+      this.io,
+      this.#ownGrant,
+      shared.spill,
+      this.#controller.signal,
+    );
     if (!this.pool.allocate(14 * BATCH_ROWS + 4096))
       throw new Error("JSON grouping metadata not admitted");
     this.#rows = new Uint16Array(BATCH_ROWS);
@@ -367,17 +382,21 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
       const row = ids?.[at] ?? at;
       if (
         this.#started &&
-        !keysEqual(this.#keyTypes, this.#keyOrder, this.#keys.vectors(), 0, keys, row)
+        !(this.#semanticKeys || this.#keys.fileBacked
+          ? await this.#sameKey(keys, row)
+          : keysEqual(this.#keyTypes, this.#keyOrder, this.#keys.vectors(), 0, keys, row))
       )
         await this.#emit(true);
       if (!this.#started) {
-        if (keys.length) await this.capture(this.#keys, keys, row);
+        if (keys.length) await this.#keys.capture(keys, row);
         this.#started = true;
       }
       let end = at + 1;
       while (
         end < n &&
-        keysEqual(this.#keyTypes, this.#keyOrder, keys, row, keys, ids?.[end] ?? end)
+        (this.#semanticKeys
+          ? await this.#semanticKeys.equal(keys, row, keys, ids?.[end] ?? end)
+          : keysEqual(this.#keyTypes, this.#keyOrder, keys, row, keys, ids?.[end] ?? end))
       ) {
         end++;
         if ((end & 1023) === 0) await this.pace();
@@ -388,13 +407,23 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
       at = end;
     }
   }
+  async #sameKey(keys: readonly Vector[], row: number): Promise<boolean> {
+    const extra = this.#semanticKeys
+      ? this.#keys.operandBytes + operandBytes(this.#keyTypes, this.#keyOrder, keys, row, row + 1)
+      : 0;
+    const result = { equal: false };
+    await this.#keys.read(extra, async (previous) => {
+      result.equal = this.#semanticKeys
+        ? await this.#semanticKeys.equal(previous, 0, keys, row)
+        : keysEqual(this.#keyTypes, this.#keyOrder, previous, 0, keys, row);
+    });
+    return result.equal;
+  }
   async #emit(restart: boolean): Promise<void> {
-    const fields: Array<Vector | import("../json-records.js").StreamedJsonField> = [
-      ...this.#keys.vectors(),
-    ];
+    const fields: Array<Vector | import("../json-records.js").StreamedJsonField> = [];
     for (const t of this.#transitions) fields.push(await t.result());
     // Each transition shares one I/O lane: serialize the completed fields in column order.
-    await this.#prefix.writeStreamed(fields);
+    await this.#keys.read(0, async (keys) => this.#prefix.writeStreamed([...keys, ...fields]));
     if (restart) for (const t of this.#transitions) await t.restart();
     this.#started = false;
   }
@@ -426,6 +455,7 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
     }
     await this.#prefix.seal();
     await this.#suffix.seal();
+    await this.#keys.close();
     const parameters = new ParameterCheckpoint(this.#directory);
     await parameters.save(this.context.params.slots);
     this.#directory.detach();
@@ -465,13 +495,13 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
       await this.#finishWork?.catch(() => undefined);
       await this.#sortedPending?.catch(() => undefined);
       const results = await Promise.allSettled([
+        this.#keys.close(),
         ...(this.#sort ? [this.#sort.closed] : []),
         ...this.#transitions.map((t) => t.close()),
         ...(this.#transferred
           ? []
           : [this.#prefix.close(), this.#suffix.close(), this.#files.closeAll()]),
       ]);
-      this.#keys.close();
       this.#directory.detach();
       this.#pages.close();
       this.pool.free(14 * BATCH_ROWS + 4096);
@@ -497,6 +527,7 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
   get spilledBytes(): number {
     return (
       this.#written +
+      this.#keys.spilledBytes +
       (this.#sort?.profile.spilledBytes ?? 0) +
       this.#files.written +
       this.#prefix.files.written +

@@ -30,7 +30,7 @@ import {
 } from "./parameters.js";
 import { RESULT_FRAME_TARGET_BYTES, RESULT_WINDOW_BYTES, ResultChannel } from "./result.js";
 import type { ResultAllocator } from "./result-buffer.js";
-import { ResultSink } from "./result-sink.js";
+import { ResultSink, resultFrameMetadataBytes } from "./result-sink.js";
 import type { ParameterSlots, CallResolver } from "./kernels/compile.js";
 import { ReservedGrant } from "./admission.js";
 import { DeferredGrant } from "./deferred-grant.js";
@@ -310,6 +310,7 @@ export class QueryRuntime {
   }
   #expressionProgress = 0;
   #expressionMultiplicity = 1;
+  #sourceMultiplicity = 1;
   #parameterProgress = false;
   #operatorLiteralBytes = 0;
   readonly #operatorParameterColumns = new Map<number, number>();
@@ -322,9 +323,10 @@ export class QueryRuntime {
     this.#operatorLiteralBytes = bytes;
   }
   /** Complete variable-output envelope; ordinary project/filter leave it at zero. */
-  progressEnvelope(bytes: number, multiplicity = 1): void {
+  progressEnvelope(bytes: number, multiplicity = 1, sourceMultiplicity = multiplicity): void {
     this.#expressionProgress = bytes;
     this.#expressionMultiplicity = multiplicity;
+    this.#sourceMultiplicity = sourceMultiplicity;
     this.#parameterProgress = true;
   }
   #stepBytes(
@@ -338,7 +340,7 @@ export class QueryRuntime {
     // Add newly materialized inline/literal/owned-parameter columns; multiply only
     // for repeated group-key positions, never again for the number of source columns.
     const current = this.#parameterProgress
-      ? readProgress * this.#expressionMultiplicity +
+      ? readProgress * this.#sourceMultiplicity +
         this.#expressionProgress +
         4 * inputs * this.#expressionMultiplicity
       : Math.max(readProgress, largestInput);
@@ -423,7 +425,11 @@ export class QueryRuntime {
       this.#readBytes +
       (entries.length === 0
         ? 0
-        : Math.max(this.#resultWindow(), this.#resultStep(inputs, largestInput)))
+        : Math.max(
+            this.#resultWindow(),
+            this.#resultStep(inputs, largestInput) +
+              (this.#resultOwnedMinimum ? resultFrameMetadataBytes(this.plan.columns.length) : 0),
+          ))
     );
   }
 
@@ -526,7 +532,8 @@ export class QueryRuntime {
         ? Math.max(
             this.#resultWindow(),
             this.#resultOwnedMinimum
-              ? this.#resultStep(binding.logicalBytes ?? binding.bytes, binding.largestSlot)
+              ? this.#resultStep(binding.logicalBytes ?? binding.bytes, binding.largestSlot) +
+                  resultFrameMetadataBytes(this.plan.columns.length)
               : 0,
           )
         : 0;

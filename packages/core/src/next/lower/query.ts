@@ -401,6 +401,24 @@ class Grouping {
               };
             },
           }),
+      ...(this.source.rowField === undefined
+        ? {}
+        : {
+            rowField: (qualifier: string, ordinal: number): Typed | undefined => {
+              const resolved = this.source.rowField?.(qualifier, ordinal);
+              if (resolved === undefined) return undefined;
+              const key =
+                resolved.expr.op === "column"
+                  ? this.#keyColumns.get(resolved.expr.index)
+                  : undefined;
+              if (key === undefined)
+                throw new PlanningError(
+                  `column "${qualifier}" must appear in the GROUP BY clause or be used in an aggregate function`,
+                  "42803",
+                );
+              return this.#keyColumn(key);
+            },
+          }),
       match: (expression) => {
         const identity = encodeQueryIdentity(expression);
         const key = this.#keyIdentities.get(identity);

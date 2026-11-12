@@ -1,5 +1,6 @@
 import { expressionInputBytes, projectedInputBytes } from "./input-size-plan.js";
 import { KeyLayout } from "./join-keys.js";
+import { jsonGroupWorkspaceMultiplier } from "./agg/json-group-keys.js";
 import { canonicalJsonText } from "./json-canonical-plan.js";
 import {
   JsonAggregateOperator,
@@ -662,7 +663,15 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   const closePhase = (phase: HybridPhase | JsonPhase): Promise<void> =>
     "checkpoint" in phase ? closeHybridPhase(phase) : closeJsonPhase(phase);
   const jsonPlanners = new Map<number, number>();
-  const jsonAggregateRecipes = new Map<number, { minimum: number; loans: number }>();
+  const jsonAggregateRecipes = new Map<
+    number,
+    {
+      minimum: number;
+      loans: number;
+      rel: Extract<Rel, { op: "aggregate" }>;
+      input: readonly PhysicalType[];
+    }
+  >();
   const jsonCapacities = new WeakMap<QueryRuntime, Map<number, number>>();
   const jsonFrontier = new WeakMap<QueryRuntime, number | null>();
   const nativeParentIds = new Set<number>();
@@ -1348,7 +1357,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             loans = jsonAggregateLoans(aggregate);
           const deliveryBase = JSON_PHASE_FIXED + 2 * JSON_PHASE_IO + 4096;
           jsonPlanners.set(rel.id, deliveryBase);
-          jsonAggregateRecipes.set(rel.id, { minimum, loans });
+          jsonAggregateRecipes.set(rel.id, { minimum, loans, rel: aggregate, input });
           registerPhaseProducer(rel.id);
           fixed(rel, minimum, rel.id, loans);
           if (!phaseParents.has(rel.id))
@@ -2568,10 +2577,11 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     }
     for (const [id, columns] of compoundColumns)
       if (active.has(id)) runtime.operatorParameterColumns(id, columns, compoundCopies.get(id));
-    const hasAggregateProgress = [...aggregatePlanners.keys()].some((id) => active.has(id));
+    const hasAggregateProgress = [...aggregatePlanners.keys(), ...[...jsonAggregateRecipes.values()].filter(p => p.loans > 1).map(p => p.rel.id)].some((id) => active.has(id));
     const hasCompoundProgress = admissions.some(
       ({ rel }) => active.has(rel.id) && (rel.op === "join" || rel.op === "setOp"),
     );
+    let jsonSourceOperands = 1;
     if (hasAggregateProgress || hasCompoundProgress) {
       // Inline values are <=64KiB by the stored format. This compound envelope is
       // for heavy operators only: B2's plain export minimum is unchanged. Larger source steps
@@ -2580,6 +2590,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       // vectors give an exact byte bound without re-encoding or copying their payloads.
       let literalBytes = LARGE_VALUE_BYTES;
       let operatorLiteralBytes = 0;
+      let jsonLiteralBytes = 0;
       const inspected = new Set<object>();
       const inspect = (value: unknown): void => {
         if (
@@ -2598,6 +2609,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           if (data.layout === "varlen") {
             operatorLiteralBytes = Math.max(operatorLiteralBytes, data.bytes?.byteLength ?? 0);
             literalBytes = Math.max(literalBytes, operatorLiteralBytes);
+            jsonLiteralBytes = Math.max(jsonLiteralBytes, data.bytes?.byteLength ?? 0);
           }
           return;
         }
@@ -2606,25 +2618,47 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       inspect(plan.root);
       if (hasCompoundProgress) runtime.operatorLiteralProgress(operatorLiteralBytes);
       let inline = 0,
-        sourceMultiplicity = 1;
-      for (const planner of aggregatePlanners.values()) {
+        sourceMultiplicity = 1,
+        inputMultiplicity = 1;
+      for (const planner of [
+        ...aggregatePlanners.values(),
+        ...[...jsonAggregateRecipes.values()].filter((p) => p.loans > 1),
+      ]) {
         if (!active.has(planner.rel.id)) continue;
+        const json = jsonAggregateRecipes.has(planner.rel.id);
         const variable = planner.input.reduce((n, type) => {
           if (["text", "bytes", "json", "array", "enum", "decimal"].includes(type.kind)) {
-            return n + literalBytes;
+            return n + (json ? jsonLiteralBytes : literalBytes);
           }
           return n + 16;
         }, 0);
         const copies = new Map<number, number>();
         for (const column of planner.rel.groupBy) copies.set(column, (copies.get(column) ?? 0) + 1);
-        const multiplicity = Math.max(1, ...copies.values());
-        inline = Math.max(inline, 4 * multiplicity * variable);
+        // The shared semantic sorter/comparator can hold two decoded key trees.
+        // Its established allowances are 24 bytes/JSONB byte and 32/array byte.
+        // Relative to the ordinary four-copy row envelope, fund those operands
+        // plus the encoded read/key/write step: ceil((2*allowance+4)/4).
+        const semantic = json
+          ? jsonGroupWorkspaceMultiplier(planner.input, planner.rel.groupBy)
+          : 1;
+        const multiplicity = semantic * Math.max(1, ...copies.values());
+        // JSON literals are measured exactly: the stored inline ceiling is not a
+        // lower bound on a one-byte key. Source/parameter/checkpoint bytes enter
+        // through their own measured bounds. Wide representative restoration also
+        // needs the native record metadata and bounded I/O workspace.
+        const keyWorkspace =
+          json && planner.rel.groupBy.length > 0
+            ? 2048 + 2560 * planner.rel.groupBy.length + (512 << 10)
+            : 0;
+        inline = Math.max(inline, 4 * multiplicity * variable + keyWorkspace);
         // The source hint already bounds all selected columns together. Only a
         // repeated key position duplicates that whole prefix; extra inline/literal
         // and parameter output is added separately by the runtime.
-        sourceMultiplicity = Math.max(sourceMultiplicity, multiplicity);
+        inputMultiplicity = Math.max(inputMultiplicity, multiplicity);
+        sourceMultiplicity = Math.max(sourceMultiplicity, Math.max(1, ...copies.values()));
+        jsonSourceOperands = Math.max(jsonSourceOperands, semantic);
       }
-      if (hasAggregateProgress) runtime.progressEnvelope(inline, sourceMultiplicity);
+      if (hasAggregateProgress) runtime.progressEnvelope(inline, inputMultiplicity, sourceMultiplicity);
     }
     const entries = admissions
       .filter((entry) => active.has(entry.owner))
@@ -2742,6 +2776,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     findDemand(plan.root, null);
     const sources = [...readSources.values()].filter((source) => active.has(source.id));
     const bounds = new Map<number, ReadBound>();
+    const sourceOperandBytes = new Map<number, number>();
     const chooseAggregates = () => runSliced(choose(), new Slice(Infinity), () => undefined);
     const choose = function* (): SlicedJob<void> {
       const selectedPercentiles = new Map<number, { bound: PercentileBound; minimum: number }>();
@@ -3024,9 +3059,29 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               for (const [id, bound] of bounds)
                 if (remaining.has(id)) {
                   io = Math.max(io, bound.io);
-                  progress = Math.max(progress, bound.progress);
+                  progress = Math.max(progress, bound.progress + (sourceOperandBytes.get(id) ?? 0));
                 }
-              runtime.readMinimum(io, progress, Math.max(cut.phase.progressBytes, parentProgress));
+              const jsonKeyCopies = Math.max(
+                0,
+                ...next.flatMap((entry) => {
+                  const builder =
+                    entry.rel.op === "aggregate"
+                      ? jsonAggregateRecipes.get(entry.rel.id)
+                      : undefined;
+                  return builder && builder.loans > 1
+                    ? [4 * jsonGroupWorkspaceMultiplier(builder.input, builder.rel.groupBy)]
+                    : [];
+                }),
+              );
+              runtime.readMinimum(
+                io,
+                progress,
+                Math.max(
+                  cut.phase.progressBytes,
+                  parentProgress,
+                  cut.kind === "json" ? jsonKeyCopies * cut.phase.retainedBytes : 0,
+                ),
+              );
               if (jsonPlanners.size > 0) {
                 const owned = cut.kind === "json" && cut.phase.ownedDelivery;
                 const frontier = jsonFrontier.get(runtime) !== null;
@@ -3162,8 +3217,24 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               widths.set(index, row.valueBytes ?? row.progress / 4);
               keyColumnBytes.set(source.id, widths);
             }
+          if (jsonSourceOperands > 1) {
+            // Comparison decodes one row, not an entire batch target. Size that
+            // publication-stable prefix without retaining sizing grants, then add
+            // its extra semantic operands to the normal live source envelope.
+            const row = yield* readValue(
+              boundSource(
+                runtime.view,
+                { ...source, windowBytes: 0, rows: demand.get(source.id) ?? null },
+                runtime.request.governor,
+                runtime.signal,
+                1,
+                1,
+              ),
+            );
+            sourceOperandBytes.set(source.id, (jsonSourceOperands - 1) * row.progress);
+          }
           io = Math.max(io, bound.io);
-          progress = Math.max(progress, bound.progress);
+          progress = Math.max(progress, bound.progress + (sourceOperandBytes.get(source.id) ?? 0));
         }
         if (resultCopies > 1 && resultLayout?.sourceBacked && !hasInputSizedJson) {
           let resultProgress = 0;

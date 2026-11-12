@@ -1,4 +1,4 @@
-import { copyJsonCall, jsonCallSource } from "./json-call-sources.js";
+import { copyJsonCall, jsonCallSource, rowFieldSource } from "./json-call-sources.js";
 import { encodeQueryIdentity } from "./query-identity.js";
 import { dateIsoString } from "../date-value.js";
 import { crossJoinPlan } from "../plan/model.js";
@@ -3807,6 +3807,19 @@ function referencedOutputAliases(
   const visit = (expression: Expression): void => {
     if (!state.provable) return;
     if (expression.kind === "column") {
+      // A deferred whole row is expanded only after a pending wildcard has bound.
+      // Its declaration cannot be pruned before that expansion names every field.
+      if (declaredTypesActive() && expression.reference === source.alias) {
+        state.provable = false;
+        return;
+      }
+      const field = rowFieldSource(expression);
+      if (field?.qualifier === source.alias) {
+        const name = source.derived?.select[field.ordinal]?.alias;
+        if (name === undefined) state.provable = false;
+        else referenced.add(name);
+        return;
+      }
       const parts = expression.reference.split(".");
       if (parts.length === 2) {
         if (parts[0] === source.alias) referenced.add(parts[1] ?? "");
