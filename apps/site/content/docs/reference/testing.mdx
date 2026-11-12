@@ -1393,6 +1393,14 @@ its timing cannot qualify an A/B campaign. Earlier persistent-worker results are
 because alternating execution order did not balance worker identity. These native loaded-host
 diagnostics are separate from quiet-host Gate A and the owner/MessagePort export transport.
 
+A campaign can explicitly use `--aa-bias-ms <ms>` in both controls and comparisons when a
+recorded control bias must be carried into the decision. The raw A/A decision remains visible;
+A/B then requires a paired CPU gain greater than the larger of that floor and its matching
+A/A median magnitude, **plus** paired IQR, with the usual favourable-pair count. The report's
+`biasAdjusted` decision is authoritative for that mode. A zero floor keeps the strict neutral
+control policy. Linux reports bind the current CPU affinity; use the same `taskset -c` mask
+for A/A and A/B. These constrained native comparisons are separate from quiet-host acceptance.
+
 For parser changes, add `--decode-only` to the component command in both A/A and A/B.
 Both arms then parse complete roots without query or parsed-descriptor caches; every synthetic
 group uses distinct extent addresses. The default component mode still measures query-cache handoff.
