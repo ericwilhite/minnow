@@ -16,7 +16,13 @@ import { frameOffsetMetadata } from "../../engine/frame-offsets.js";
 import type { ScalarExpr, SortKey, WindowCall, WindowFrameBound } from "../ir/ir.js";
 import { aggregateArgument, aggregateResult } from "../ir/functions.js";
 import type { PhysicalType } from "../types.js";
-import type { QueryValue, TableSource, WindowFrame, WindowSpec } from "../../plan/model.js";
+import type {
+  Expression,
+  QueryValue,
+  TableSource,
+  WindowFrame,
+  WindowSpec,
+} from "../../plan/model.js";
 import { baseType, coerce, type Typed } from "./coerce.js";
 import { PlanningError, unsupported } from "./errors.js";
 import { lowerExpression } from "./expressions.js";
@@ -265,29 +271,35 @@ export function lowerWindowed(
       if (result.fn === "ntile") args.push(int(spec.offset ?? 1, INT4));
       if (result.fn === "lag" || result.fn === "lead") {
         const inputs = windowInputsOf(spec);
-        if (inputs.offsetAlias === undefined) args.push(int(spec.offset ?? 1, INT4));
+        const lowerInput = (expression: Expression) =>
+          lowerExpression(
+            expression,
+            {
+              column: (reference) => {
+                const index = inner.columns.findIndex((col) => col.name === reference);
+                const input = inner.columns[index];
+                return input === undefined
+                  ? undefined
+                  : {
+                      expr: column(index, input.type),
+                      nullable: input.nullable,
+                      big: input.big,
+                    };
+              },
+            },
+            builder.state,
+          );
+        if (inputs.offsetExpression === undefined) args.push(int(spec.offset ?? 1, INT4));
         else {
-          const offsetIndex = position(inputs.offsetAlias),
-            offset = inner.columns[offsetIndex];
-          if (offset === undefined)
-            throw new PlanningError("Window offset input vanished", "XX000");
           try {
             args.push(
-              coerce(
-                {
-                  expr: column(offsetIndex, offset.type),
-                  nullable: offset.nullable,
-                  big: offset.big,
-                },
-                INT4,
-                "implicit",
-                builder.parameters,
-              ).expr,
+              coerce(lowerInput(inputs.offsetExpression), INT4, "implicit", builder.parameters)
+                .expr,
             );
           } catch (error) {
             if (!(error instanceof PlanningError)) throw error;
             throw new PlanningError(
-              `function ${result.fn} with offset type ${offset.type.kind} does not exist`,
+              `function ${result.fn} with this offset type does not exist`,
               "42883",
             );
           }

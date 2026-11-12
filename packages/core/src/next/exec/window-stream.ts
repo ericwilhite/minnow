@@ -46,6 +46,7 @@ import {
 export const NTH_LIMIT = 4096;
 
 export interface StreamFunction {
+  readonly offsetValue?: (batch: Batch) => Vector;
   readonly defaultValue?: (batch: Batch) => Vector;
   readonly fn: string;
   readonly arg: number | null;
@@ -83,6 +84,7 @@ function effective(call: StreamFunction, ordered: boolean): Frame {
 
 /** Why a call cannot stream, or null when it can. */
 export function streamable(spec: StreamSpec, call: StreamFunction): string | null {
+  if (call.offsetValue !== undefined) return `${call.fn} with an amount from a scalar expression`;
   const amount = call.amount;
   if (amount !== undefined && amount !== null && typeof amount !== "number")
     return `${call.fn} with an amount from a column`;

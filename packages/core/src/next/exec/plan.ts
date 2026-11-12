@@ -363,7 +363,8 @@ function setupWindow(
   const exprs: ScalarExpr[] = rel.orderBy.map((key) => key.expr);
   const positions = rel.functions.map((call, index) =>
     call.args.map((expr, argIndex) => {
-      if (argIndex === 2 && (call.fn === "lag" || call.fn === "lead")) return -1;
+      if ((argIndex === 1 || argIndex === 2) && (call.fn === "lag" || call.fn === "lead"))
+        return -1;
       if (amounts[index] !== undefined && argIndex === (call.fn === "ntile" ? 0 : 1)) return -1;
       const at = exprs.length;
       exprs.push(expr);
@@ -379,6 +380,13 @@ function setupWindow(
       const amountAt = call.fn === "ntile" ? args[0] : args[1];
       const fallback = call.args[2];
       const scalarAmount = amounts[index];
+      const offset = call.args[1];
+      const lazyOffset =
+        (call.fn === "lag" || call.fn === "lead") &&
+        offset !== undefined &&
+        scalarAmount === undefined
+          ? compileExpr(offset, context)
+          : null;
       const lazyDefault =
         fallback !== undefined && fallback.op !== "literal" && fallback.op !== "param"
           ? compileExpr(fallback, context)
@@ -429,11 +437,13 @@ function setupWindow(
         fn: call.fn,
         arg,
         type: call.type,
-        ...(amountAt === undefined
-          ? {}
-          : amountAt === -1 && scalarAmount !== undefined
-            ? { amount: scalarAmount }
-            : { amount: { column: at(keys.indexes, amountAt) } }),
+        ...(lazyOffset !== null
+          ? { offsetValue: (batch: Batch) => lazyOffset.evaluate(batch, batch.selection) }
+          : amountAt === undefined
+            ? {}
+            : amountAt === -1 && scalarAmount !== undefined
+              ? { amount: scalarAmount }
+              : { amount: { column: at(keys.indexes, amountAt) } }),
         ...(lazyDefault === null
           ? {}
           : { defaultValue: (batch: Batch) => lazyDefault.evaluate(batch, batch.selection) }),

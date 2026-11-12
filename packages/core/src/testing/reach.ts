@@ -3839,3 +3839,24 @@ export const WINDOW_SHIFT_DELIVERY_REACH = [
   "page boundary",
   "default after demand",
 ] as const;
+
+/** Current-row offset expressions must obey downstream window demand. */
+export const WINDOW_OFFSET_DEMAND_REACH = [
+  "lag",
+  "lead",
+  "zero demand",
+  "error demanded",
+  "error after demand",
+] as const;
+
+/** Volatile defaults execute exactly once for each demanded out-of-range target. */
+export const WINDOW_VOLATILE_DEFAULT_REACH = [
+  "lag",
+  "lead",
+  "resident",
+  "streamed",
+  "zero demand",
+  "OFFSET",
+  "no default evaluation",
+  "default evaluation",
+] as const;

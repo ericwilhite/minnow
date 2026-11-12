@@ -21,13 +21,14 @@
  *   yield when the slice is due, the abort check at every resumption and after backpressure.
  *
  * Supported: row_number, rank, dense_rank, percent_rank, cume_dist, ntile; lag, lead (offset a
- * constant or a column; default a constant or a lazy scalar kernel), first_value, last_value,
- * nth_value over any type;
+ * constant, a column or a lazy scalar kernel; default a constant or a lazy scalar kernel),
+ * first_value, last_value and nth_value over any type;
  * count, count_star, and sum / avg / min / max of integers and floats (min / max also dates and
  * timestamps). RANGE offsets need one numeric ORDER BY key. Decimal and interval arguments are
  * refused (TypeError) for aggregate arguments; value functions gather any supported type.
  */
 import { WindowCheckpoint, WINDOW_ORDINAL_BYTES } from "./window-checkpoint.js";
+import { slotOf, isValidSlot } from "./kernels/vectors.js";
 import { NumericOutOfRangeError } from "./errors.js";
 import { WINDOW_FLOAT_STATE_BYTES } from "./window-float.js";
 import type { Grant, Loan } from "../memory/governor.js";
@@ -87,6 +88,8 @@ export interface WindowFunctionSpec {
   readonly amount?: number | { readonly column: number } | null;
   /** lag/lead's default: a one-row vector of the argument's type; null for NULL. */
   readonly fallback?: Vector | null;
+  /** Current-row int4 offset, evaluated only when that output row is demanded. */
+  readonly offsetValue?: (batch: Batch) => Vector;
   /** Evaluated only for DEFAULT_ROW positions of the current (sorted) input batch. */
   readonly defaultValue?: (batch: Batch) => Vector;
   /** Null: PostgreSQL's default frame. */
@@ -252,7 +255,10 @@ export function validateWindowSpec(spec: WindowSpec): void {
  * it per row (window-sort.ts): its value goes out as a constant.
  */
 function partitionRead(spec: WindowSpec): boolean {
-  if (spec.functions.some((call) => call.defaultValue !== undefined)) return true;
+  if (
+    spec.functions.some((call) => call.defaultValue !== undefined || call.offsetValue !== undefined)
+  )
+    return true;
   const part = spec.partitionBy[0];
   if (part === undefined || spec.partitionBy.length !== 1) return true;
   if (spec.orderBy.some((key) => key.column === part)) return true;
@@ -1744,6 +1750,7 @@ class Evaluator implements Operator {
         yield* frameBounds(call.frame, ordered, peers, key, starts, ends, this.slice);
       const exclude = call.frame?.exclude ?? "no-others";
       if (VALUE.has(call.fn)) {
+        if (call.offsetValue !== undefined) continue;
         const amount = this.#amountOf(call, args, scratch, f, n);
         const targets = (scratch.targets[f] ?? new Int32Array(0)).subarray(0, n);
         yield* valueRows(
@@ -1848,15 +1855,16 @@ class Evaluator implements Operator {
       if (this.context.stopped?.()) return;
       throw new NumericOutOfRangeError("value out of range: overflow");
     }
-    // Defaults can throw or be volatile. Split only batches containing a lazy default,
-    // evaluating each such row after its preceding output has been consumed. Other batches
-    // retain their normal vector path. The temporary segment is owned through readiness.
+    // Offsets and defaults can throw or be volatile. Split scalar-offset rows and rows
+    // needing a lazy default, evaluating each after its preceding output is consumed.
+    // Other batches retain their normal vector path. The temporary segment is owned through readiness.
     if (
       count > 1 &&
       this.spec.functions.some(
         (call, f) =>
-          call.defaultValue !== undefined &&
-          scratch.targets[f]?.subarray(at, at + count).includes(DEFAULT_ROW),
+          call.offsetValue !== undefined ||
+          (call.defaultValue !== undefined &&
+            scratch.targets[f]?.subarray(at, at + count).includes(DEFAULT_ROW)),
       )
     ) {
       let from = 0;
@@ -1864,7 +1872,8 @@ class Evaluator implements Operator {
         const needsDefault = (row: number) =>
           this.spec.functions.some(
             (call, f) =>
-              call.defaultValue !== undefined && scratch.targets[f]?.[at + row] === DEFAULT_ROW,
+              call.offsetValue !== undefined ||
+              (call.defaultValue !== undefined && scratch.targets[f]?.[at + row] === DEFAULT_ROW),
           );
         let end = from + 1;
         if (!needsDefault(from)) while (end < count && !needsDefault(end)) end++;
@@ -1896,6 +1905,19 @@ class Evaluator implements Operator {
         const source = this.#sources[f];
         const targets = scratch.targets[f];
         if (source === null || source === undefined || targets === undefined) continue;
+        if (call.offsetValue !== undefined) {
+          const offset = call.offsetValue({ length: count, columns, selection: null });
+          for (let row = 0; row < count; row++) {
+            const [flat, slot] = slotOf(offset, row);
+            if (!isValidSlot(flat, slot)) targets[at + row] = NULL_ROW;
+            else {
+              if (flat.data.layout !== "i32") throw new TypeError("Window offset must be int4");
+              const amount = flat.data.values[slot] ?? 0;
+              const target = call.fn === "lag" ? at + row - amount : at + row + amount;
+              targets[at + row] = target >= 0 && target < n ? target : DEFAULT_ROW;
+            }
+          }
+        }
         let fallback: Vector | null = null;
         if (call.defaultValue !== undefined) {
           // Reuse the charged id scratch as selection storage, then restore gather ids.

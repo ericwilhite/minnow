@@ -95,7 +95,7 @@ function completeWindowInputs(
 ): WindowSpec {
   const metadata = inputs.get(expression);
   if (metadata === undefined) return spec;
-  // Only dependencies are eager. Scalar default work remains at the demanded output row.
+  // Only dependencies are eager. Scalar offset/default work stays at the demanded row.
   const defaultInput = (input: Expression): Expression =>
     input.kind === "column" || isAggregateCall(input)
       ? { kind: "column", reference: hide(input) }
@@ -103,7 +103,7 @@ function completeWindowInputs(
   return rememberWindowInputs(spec, {
     ...(metadata.offsetExpression === undefined
       ? {}
-      : { offsetAlias: hide(metadata.offsetExpression) }),
+      : { offsetExpression: defaultInput(metadata.offsetExpression) }),
     ...(metadata.fallbackExpression === undefined
       ? {}
       : { fallbackExpression: defaultInput(metadata.fallbackExpression) }),
