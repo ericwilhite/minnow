@@ -1,12 +1,12 @@
 import fc from "fast-check";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import type { PhysicalPlan, Rel } from "../ir/ir.js";
-import { StorageCore } from "../testing/storage-core.js";
+import { StorageCore } from "./storage-core.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, STAR_BOUND_REACH } from "../../testing/reach.js";
-import type { PartitionBounds } from "./agg/partition-probe.js";
-import { starDictionaryShape, type StarDictionaryShape } from "./star-shape.js";
-import { starBound, terminalStar } from "./star-bound.js";
+import type { PartitionBounds } from "../exec/agg/partition-probe.js";
+import { starDictionaryShape, type StarDictionaryShape } from "../exec/star-shape.js";
+import { starBound, terminalStar } from "../exec/star-bound.js";
 
 let core: StorageCore, plan: PhysicalPlan, shape: StarDictionaryShape;
 beforeAll(async () => {

@@ -4,7 +4,7 @@ import fc from "fast-check";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import type { Rel } from "../ir/ir.js";
 import type { Batch, Vector } from "../vector/vector.js";
-import { StorageCore } from "../testing/storage-core.js";
+import { StorageCore } from "./storage-core.js";
 import { seedsFor } from "../../testing/seeds.js";
 import {
   createReach,
@@ -12,11 +12,11 @@ import {
   STAR_DICTIONARY_FUNDING_REACH,
 } from "../../testing/reach.js";
 import { Governor } from "../memory/governor.js";
-import { vectorOf } from "./join-fixtures.js";
-import { valueAt } from "./kernels/test-support.js";
-import { isValidSlot } from "./kernels/vectors.js";
-import { starDictionaryShape } from "./star-shape.js";
-import { StarDictionaryBooks } from "./star-dictionary.js";
+import { vectorOf } from "../exec/join-fixtures.js";
+import { valueAt } from "../exec/kernels/test-support.js";
+import { isValidSlot } from "../exec/kernels/vectors.js";
+import { starDictionaryShape } from "../exec/star-shape.js";
+import { StarDictionaryBooks } from "../exec/star-dictionary.js";
 
 const SQL = `SELECT a.t,b.t,c.label,count(*),sum(f.v) FROM fact f
  JOIN a ON a.k=f.ka JOIN b ON b.k=f.kb JOIN c ON c.k=f.kc
