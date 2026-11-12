@@ -3974,3 +3974,13 @@ export const STAR_FIXTURE_PREFIX_REACH = [
   "owned backing",
   "stable prefix reused",
 ] as const;
+
+export const STAR_BOUND_REACH = [
+  "complete resident bounds",
+  "missing",
+  "not-PK",
+  "wide",
+  "many",
+  "volatile",
+  "alias",
+] as const;

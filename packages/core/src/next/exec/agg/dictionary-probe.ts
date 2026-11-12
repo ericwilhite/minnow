@@ -32,6 +32,7 @@ export function probeDictionaryGroups(
   read: ReadBound,
   signal: AbortSignal,
   label = "aggregate-domain-planning",
+  maxGroups = 1024,
 ): MaybePromise<PartitionBounds | null> {
   const slice = new Slice(YIELD_INTERVAL_MS);
   return runSliced(certify(), slice, () => undefined);
@@ -60,7 +61,7 @@ export function probeDictionaryGroups(
     };
     try {
       check();
-      probe = new GroupPartitionProbe(source.types, source.payloads.length, domains, 1024, 1);
+      probe = new GroupPartitionProbe(source.types, source.payloads.length, domains, maxGroups, 1);
       const table = readTable(
         yield* readValue(view.table(source.tableId, { budget })),
         view.pages,
