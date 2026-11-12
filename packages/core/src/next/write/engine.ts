@@ -104,6 +104,7 @@ import { walkReachable } from "../format/reachable.js";
 import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
 import { OBJECT_OVERHEAD_BYTES, type Grant, type Loan } from "../memory/governor.js";
 import { WriteCredits } from "./credits.js";
+import { RunSink } from "./run-output.js";
 import { writeStepMinimum, type WriteStepMinimum } from "./minimum.js";
 import { MetadataBudget } from "./budget.js";
 import { GroupWriter } from "../page/writer.js";
@@ -146,7 +147,7 @@ import {
 } from "../format/manifest-codec.js";
 import { manifestReader, MetadataReader } from "../format/metadata-reader.js";
 import { readRows } from "./rows.js";
-import { RunBuilder, RunReader, runRef, type EncodedRun } from "./runs.js";
+import { RunBuilder, RunReader, RUN_ENCODER_MINIMUM, type RunSummary } from "./runs.js";
 import { Sequences } from "./sequences.js";
 import {
   DEFAULT_MERGE_POLICY,
@@ -730,7 +731,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       input.governor,
       {
         rows: MINIMUM_BYTES,
-        metadata: 4096 + 2 * parseCharge(raw) + 5 * (raw + 512),
+        metadata: RUN_ENCODER_MINIMUM + 4096 + 2 * parseCharge(raw) + 5 * (raw + 512),
         commits: COMMIT_MINIMUM_BYTES,
         merge:
           input.tuning?.merges?.mode === "off"
@@ -2728,6 +2729,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     let def: TableDef = current;
     let definitionCharge = 0;
     const writer = this.#space.beginWrite(`flush t${String(state.tableId)}`);
+    const outputs: RunSummary[] = [];
     const retired: ExtentRef[] = [];
     // Directory chunks and the root this publication made: it owns them until a state holds them.
     let created: GroupDirectory | null = null;
@@ -2781,9 +2783,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
               null,
               () => this.#check(),
               this.#metadataBudget,
+              writer,
+              outputs,
             );
             if (run === null) continue;
-            runs.set(index.id, runRef(run, (await writer.write(run.parts)).blobs));
+            runs.set(index.id, run);
           }
           if (runs.size > 0) rowless.set(memtable, runs);
           this.maintenance.rowlessRuns += runs.size;
@@ -2823,9 +2827,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
               null,
               () => this.#check(),
               this.#metadataBudget,
+              writer,
+              outputs,
             );
             if (run === null) continue;
-            runs.set(index.id, runRef(run, (await writer.write(run.parts)).blobs));
+            runs.set(index.id, run);
           }
           // Staged runs of an index dropped since staging do not fold: they are retired here.
           const indexIds = new Set(def.indexes.map((index) => index.id));
@@ -2861,10 +2867,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
             null,
             () => this.#check(),
             this.#metadataBudget,
+            writer,
+            outputs,
           );
           if (run === null) continue;
-          const written = await writer.write(run.parts);
-          runs.set(index.id, runRef(run, written.blobs));
+          runs.set(index.id, run);
         }
         newGroups.push(group);
         published.set(memtable, { group, root: groupRoot, runs });
@@ -3117,6 +3124,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (writer.state === "open") await writer.abort().catch(() => undefined);
       throw error;
     } finally {
+      for (const output of outputs) output.release();
       if (definitionCharge > 0) this.#chargeMetadata(-definitionCharge);
       delta.settle();
       created?.releaseCreation();
@@ -3301,6 +3309,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     // What the new parts hold before they are installed (review B3-p2c-1 #1): a failure at any
     // step, writing any part, gives every pin and residual delta back.
     const owned: Provisional = { pins: [], deltas: [] };
+    const outputs: RunSummary[] = [];
     let installed = false;
     let madeRoot: ManifestRoot | null = null;
     try {
@@ -3330,13 +3339,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
           for (const memtable of kept) {
             const part = need(memtable.staged);
             if (part.group.liveRowCount === memtable.rowCount) continue;
-            parts.set(memtable, await this.#truncateStaged(writer, memtable, part, retired));
+            parts.set(
+              memtable,
+              await this.#truncateStaged(writer, memtable, part, retired, outputs),
+            );
             this.#check();
             rewrote = true;
             this.maintenance.stagedTruncations += 1;
           }
         for (const [part, memtable] of (adds.get(state) ?? []).entries()) {
-          const written = await this.#writeStaged(writer, def, memtable, id, owned, part);
+          const written = await this.#writeStaged(writer, def, memtable, id, owned, part, outputs);
           this.#check();
           parts.set(memtable, written.part);
           residuals.set(memtable, written.residual);
@@ -3446,6 +3458,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     } finally {
       delta.settle();
       if (madeRoot !== null) this.#releaseRoot(madeRoot);
+      for (const output of outputs) output.release();
       if (!installed) {
         for (const pin of owned.pins) pin.release();
         for (const residual of owned.deltas) residual.releaseCharge();
@@ -3465,6 +3478,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     stagingId: number,
     owned: Provisional,
     index: number,
+    outputs: RunSummary[],
   ): Promise<{
     part: StagedPart;
     residual: Map<number, KeyDelta>;
@@ -3489,11 +3503,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
         (rowId, tombstone) => !tombstone && rowId >= first && rowId < end,
         () => this.#check(),
         this.#metadataBudget,
+        writer,
+        outputs,
       );
       if (run !== null) {
-        const written = await writer.write(run.parts);
         this.#check();
-        runs.set(indexId, [runRef(run, written.blobs)]);
+        runs.set(indexId, [run]);
       }
       const next = memtable.newDelta();
       owned.deltas.push(next);
@@ -3543,6 +3558,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     memtable: Memtable,
     part: StagedPart,
     retired: ExtentRef[],
+    outputs: RunSummary[],
   ): Promise<StagedPart> {
     const from = writer.extents.length;
     const live = memtable.rowCount;
@@ -3559,17 +3575,24 @@ export class WritePathImpl implements WritePath, EngineHooks {
         old.push(runExtent(run));
         const reader = await this.#runReader(run);
         this.#check();
-        const builder = new RunBuilder();
-        await reader.cursor(this.#space, this.#grant, (key, rowId, tombstone) => {
-          if (rowId < end) builder.add(key.slice(), rowId, tombstone);
-          return false;
-        });
-        this.#check();
-        const encoded = builder.finish();
-        if (encoded !== null) {
-          const written = await writer.write(encoded.parts);
+        const builder = new RunBuilder(false, false, this.#metadataBudget);
+        const sink = new RunSink(builder, writer, runExtent(run).length);
+        try {
+          await reader.cursor(
+            this.#space,
+            this.#grant,
+            (key, rowId, tombstone) => {
+              if (rowId < end) builder.add(key, rowId, tombstone);
+              return false;
+            },
+            null,
+            () => sink.drain(),
+          );
           this.#check();
-          kept.push(runRef(encoded, written.blobs));
+          const encoded = await sink.finish(outputs);
+          if (encoded !== null) kept.push(encoded);
+        } finally {
+          builder.close();
         }
       }
       if (kept.length > 0) runs.set(indexId, kept);
@@ -4078,22 +4101,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
       `merge t${String(state.tableId)} i${String(indexId)}`,
       MERGE_FIXED_BYTES + inputs.length * MERGE_INPUT_BYTES,
     );
-    // The encoder's buffers and the staging queue (the space charges leases and its own staging).
-    const working = MERGE_FIXED_BYTES - 512 * 1024;
-    if (!grant.allocate(working)) {
-      this.#credits.releaseMerge(grant);
-      throw new RangeError("A merge's admitted grant cannot hold its working memory");
-    }
     let writer: ExtentWriter;
     try {
       writer = this.#space.beginWrite(`merge t${String(state.tableId)} i${String(indexId)}`, {
         budget: grant,
       });
     } catch (error) {
-      grant.free(working);
       this.#credits.releaseMerge(grant);
       throw error;
     }
+    let output: Awaited<ReturnType<typeof mergeRuns>> | null = null;
     let unlock: (() => void) | null = null;
     let madeRoot: ManifestRoot | null = null;
     const delta = new DeltaPublication(
@@ -4109,7 +4126,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     try {
       const readers: RunReader[] = [];
       for (const ref of inputs) readers.push(await this.#runReader(ref));
-      const output = await mergeRuns({
+      output = await mergeRuns({
         space: this.#space,
         writer,
         grant,
@@ -4177,6 +4194,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.shared.readers.holdUntilOlderClose(() => {
         this.#dropRunReaders(inputs);
       });
+      output.release(); // the published root now owns and accounts its boundary keys
       await this.#prepareMinimum();
       const counters = this.maintenance;
       counters.merges += 1;
@@ -4198,7 +4216,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       delta.settle();
       if (madeRoot !== null) this.#releaseRoot(madeRoot);
       unlock?.();
-      grant.free(working);
+      output?.release();
       this.#credits.releaseMerge(grant);
     }
   }
@@ -4650,30 +4668,19 @@ function quietTable(state: TableState): boolean {
   );
 }
 
-/**
- * A run of `delta`'s entries with `seq ≤ bound` (and `keep`), streamed from the delta into the
- * encoder: no per-key or per-entry objects (perf step 1).
- */
-function encodeDelta(
+/** Streams a retained delta into bounded, charged output batches. */
+async function encodeDelta(
   delta: KeyDelta,
   bound: number,
-  keep: ((rowId: number, tombstone: boolean) => boolean) | null = null,
-  check: (() => void) | null = null,
-  workspace?: ByteBudget,
-): MaybePromise<EncodedRun | null> {
-  const builder = new RunBuilder(false, true);
+  keep: ((rowId: number, tombstone: boolean) => boolean) | null,
+  check: () => void,
+  workspace: ByteBudget,
+  writer: ExtentWriter,
+  outputs: RunSummary[],
+): Promise<RunRef | null> {
+  const builder = new RunBuilder(false, true, workspace);
+  const sink = new RunSink(builder, writer, delta.bytes);
   const release = delta.retain();
-  const close = () => {
-    builder.close();
-    release();
-  };
-  const finish = () => {
-    try {
-      return builder.finish();
-    } finally {
-      close();
-    }
-  };
   try {
     const visit: DeltaVisitor = (arena, start, end, rowId, tombstone, hash, bloomHash, single) => {
       if (single && !tombstone) builder.addUniqueRange(arena, start, end, rowId, hash, bloomHash);
@@ -4681,16 +4688,12 @@ function encodeDelta(
     };
     visit.singles = (data, from, to, maximum, predicate) =>
       builder.addSingleBatch(data, from, to, maximum, predicate);
-    const pending = delta.forEachSorted(bound, visit, keep, check, workspace);
-    return pending instanceof Promise
-      ? pending.then(finish, (error: unknown) => {
-          close();
-          throw error;
-        })
-      : finish();
-  } catch (error) {
-    close();
-    throw error;
+    visit.flush = () => sink.drain();
+    await delta.forEachSorted(bound, visit, keep, check, workspace);
+    return await sink.finish(outputs);
+  } finally {
+    builder.close();
+    release();
   }
 }
 

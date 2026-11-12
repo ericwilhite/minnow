@@ -6,7 +6,7 @@ import { taskClock, yieldTask } from "../exec/pipeline.js";
 import type { Catalog } from "./catalog.js";
 import { GroupDirectory } from "./groups.js";
 import { MERGE_FIXED_BYTES, MERGE_INPUT_BYTES } from "./merge.js";
-import { RunReader } from "./runs.js";
+import { RUN_ENCODER_MINIMUM, RunReader } from "./runs.js";
 import type { WriteState } from "./state.js";
 
 export interface WriteStepMinimum {
@@ -71,7 +71,13 @@ export function writeStepMinimum(
       yield;
     }
     return {
-      metadata: 4096 + directory + runMetadata + 2 * parseCharge(largest) + 5 * (raw + 512),
+      metadata:
+        RUN_ENCODER_MINIMUM +
+        4096 +
+        directory +
+        runMetadata +
+        2 * parseCharge(largest) +
+        5 * (raw + 512),
       merge: merging ? MERGE_FIXED_BYTES + Math.max(runs, fanIn) * MERGE_INPUT_BYTES : 0,
     };
   }

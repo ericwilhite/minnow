@@ -44,7 +44,7 @@ import type { ExtentBuilder, ExtentWriter, ReadLease } from "../storage/extents.
 import { compareBytes } from "../vector/varlen.js";
 import { taskClock, yieldTask } from "../exec/pipeline.js";
 import { need } from "./bytes.js";
-import { RunEncoder, type RunReader } from "./runs.js";
+import { RunEncoder, type RunReader, type RunSummary } from "./runs.js";
 
 export { yieldTask, YIELD_INTERVAL_MS } from "../exec/pipeline.js";
 
@@ -287,6 +287,8 @@ export interface MergeInput {
 }
 
 export interface MergeOutput {
+  /** Boundary-key ownership remains charged until publication or abort. */
+  release(): void;
   /** The output runs in ascending key order (none when everything cancelled). */
   readonly runs: readonly RunRef[];
   readonly entriesIn: number;
@@ -306,6 +308,11 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
   const cursors = input.readers.map((reader, k) => new Cursor(reader, k, space, grant));
   const heap = new Heap();
   const runs: RunRef[] = [];
+  const summaries: RunSummary[] = [];
+  const release = () => {
+    for (const summary of summaries) summary.release();
+  };
+  let complete = false;
   let builder: ExtentBuilder | null = null;
   let queue: Uint8Array[] = [];
   let queued = 0;
@@ -315,10 +322,15 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
   let cancelled = 0;
   let slices = 0;
   const open = (): ExtentBuilder => writer.open(Math.max(64 * 1024, estimate - written + 4096));
-  let encoder = new RunEncoder((part) => {
-    queue.push(part);
-    queued += part.length;
-  }, input.bottom);
+  let encoder = new RunEncoder(
+    (part) => {
+      queue.push(part);
+      queued += part.length;
+    },
+    input.bottom,
+    false,
+    grant,
+  );
   const drain = async (): Promise<void> => {
     if (queue.length === 0) return;
     const target = (builder ??= open());
@@ -329,10 +341,13 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
     written += queued;
     queued = 0;
     await target.append(parts);
+    for (const part of parts) encoder.releasePart(part);
   };
   const finishRun = async (): Promise<void> => {
     const summary = encoder.finish();
+    if (summary !== null) summaries.push(summary);
     cancelled += encoder.cancelled;
+    encoder.close();
     await drain();
     const target = builder;
     builder = null;
@@ -364,10 +379,15 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
         (policy.splitEntries !== null && encoder.entryCount >= policy.splitEntries);
       if (full && encoder.canEndBefore(top.bytes, top.keyStart, top.keyEnd, top.rowId)) {
         await finishRun();
-        encoder = new RunEncoder((part) => {
-          queue.push(part);
-          queued += part.length;
-        }, input.bottom);
+        encoder = new RunEncoder(
+          (part) => {
+            queue.push(part);
+            queued += part.length;
+          },
+          input.bottom,
+          false,
+          grant,
+        );
       }
       encoder.add(top.bytes, top.keyStart, top.keyEnd, top.rowId, top.tombstone);
       entriesIn += 1;
@@ -390,8 +410,11 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
       } else if (sinceCheck >= 256 && policy.sliceEntries === null) sinceCheck = 0;
     }
     await finishRun();
+    complete = true;
   } finally {
+    encoder.close();
+    if (!complete) release();
     for (const cursor of cursors) cursor.release();
   }
-  return { runs, entriesIn, entriesOut, cancelled, bytesWritten: written, slices };
+  return { runs, entriesIn, entriesOut, cancelled, bytesWritten: written, slices, release };
 }

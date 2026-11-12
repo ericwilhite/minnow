@@ -30,6 +30,8 @@ export type DeltaVisitor = ((
   bloomHash: number,
   single: boolean,
 ) => void) & {
+  /** Bounded output drain; input ownership remains retained through its settlement. */
+  flush?: () => MaybePromise<void>;
   singles?: (
     data: SingleEntries,
     from: number,
@@ -571,7 +573,14 @@ export class KeyDelta {
     const work = this.#sortedWork(bound, visit, keep, check, workspace);
     const resume = (): MaybePromise<void> => {
       const next = work.next();
-      return next.done ? undefined : next.value.then(resume);
+      return next.done
+        ? undefined
+        : next.value.then(resume, (error: unknown) => {
+            // A consumer drain may reject. Close the suspended generator so its workspace and
+            // retained traversal ownership settle before the publication owner retries.
+            work.return(undefined);
+            throw error;
+          });
     };
     return resume();
   }
@@ -633,6 +642,8 @@ export class KeyDelta {
         yield* checkpoint(check);
         const limit = Math.min(slot + 128, keyCount);
         slot = this.#emitSingles(order, slot, limit, bound, visit, keep, singles);
+        const drained = visit.flush?.();
+        if (drained instanceof Promise) yield drained;
         if (slot === limit) continue;
         const keySlot = order === null ? slot++ : (order[slot++] ?? 0);
         const start = starts[keySlot] ?? 0;
@@ -689,6 +700,8 @@ export class KeyDelta {
             this.keyBloomHash(keySlot),
             visit,
           );
+          const drained = visit.flush?.();
+          if (drained instanceof Promise) yield drained;
         }
       }
     } finally {

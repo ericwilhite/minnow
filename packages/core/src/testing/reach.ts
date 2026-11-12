@@ -30,6 +30,34 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+/** Storage borrows emitted parts until append settles, including its failure path. */
+export const WRITE_RUN_OUTPUT_STATES = [
+  "append failure",
+  "append acknowledgement",
+  "boundary ownership",
+  "abort or publication cleanup",
+] as const;
+
+/** Native run capacities are prepaid and ownership survives delivery, abort and retry. */
+export const WRITE_RUN_ACCOUNTING_STATES = [
+  "bulk",
+  "ordinary",
+  "budget denial",
+  "native failure",
+  "constructor refund",
+  "drain rejection",
+  "abort",
+  "retry",
+  "retained output",
+  "consumed output",
+  "bloom partition",
+  "bounded stream",
+  "acknowledged consumption",
+  "pressure wait",
+  "pressure cancellation",
+  "pressure resume",
+] as const;
+
 /** Bulk sealed blocks preserve the ordinary run encoder's complete native output. */
 export const WRITE_DIRECT_RUN_STATES = [
   "single",

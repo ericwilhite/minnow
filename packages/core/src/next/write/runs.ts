@@ -43,7 +43,9 @@ import { ParseBudgetError } from "../format/manifest-codec.js";
 import { StoreCorruptionError } from "../storage/contract.js";
 import type { ByteBudget, SpaceReader } from "../access/space.js";
 import { compareBytes } from "../vector/varlen.js";
-import { ByteReader, ByteWriter, copyRange, need } from "./bytes.js";
+import { ByteReader, ByteWriter, charged, copyRange, need, UNCHARGED } from "./bytes.js";
+import type { BufferAllocator } from "./commit-buffers.js";
+import { OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
 import type { MaybePromise } from "../access/key-index.js";
 
 export const BLOCK_BYTES = 4096;
@@ -68,7 +70,7 @@ const compare = (a: Uint8Array, b: Uint8Array): number =>
   compareBytes(a, 0, a.length, b, 0, b.length);
 
 /** The parts of one run, ready for `ExtentWriter.write`, and how to assemble its `RunRef`. */
-export interface EncodedRun {
+export interface EncodedRun extends RunSummary {
   /** Blocks and Bloom partitions in stored order, then the block index, fences and Bloom directory. */
   readonly parts: readonly Uint8Array[];
   readonly entryCount: number;
@@ -78,9 +80,48 @@ export interface EncodedRun {
 
 /** What a finished `RunEncoder` reports (its tail parts were emitted last). */
 export interface RunSummary {
+  /** Idempotent: the consumer has copied/published the output, or abandoned it. */
+  release(): void;
   readonly entryCount: number;
   readonly minKey: Uint8Array;
   readonly maxKey: Uint8Array;
+}
+
+/** Buffer, view, ownership record and queue slot, in governor object units. */
+export const RUN_BUFFER_OVERHEAD = 3 * OBJECT_OVERHEAD_BYTES;
+/** Initial encoder headroom; larger resident metadata retries after its writer unwinds. */
+export const RUN_ENCODER_MINIMUM = 256 * 1024;
+
+/** Native capacity is charged before construction; old and new coexist during resize. */
+class RunBuffers implements BufferAllocator {
+  readonly #live = new Map<ArrayBufferLike, number>();
+  constructor(readonly budget: ByteBudget) {}
+  create(bytes: number): Uint8Array {
+    charged(this.budget, bytes + RUN_BUFFER_OVERHEAD);
+    try {
+      const out = new Uint8Array(bytes);
+      this.#live.set(out.buffer, bytes + RUN_BUFFER_OVERHEAD);
+      return out;
+    } catch (error) {
+      this.budget.free(bytes + RUN_BUFFER_OVERHEAD);
+      throw error;
+    }
+  }
+  copy(bytes: Uint8Array, from = 0, to = bytes.length): Uint8Array {
+    const out = this.create(to - from);
+    copyRange(out, 0, bytes, from, to);
+    return out;
+  }
+  release(buffer: ArrayBufferView): void {
+    const bytes = this.#live.get(buffer.buffer);
+    if (bytes === undefined) return;
+    this.#live.delete(buffer.buffer);
+    this.budget.free(bytes);
+  }
+  close(): void {
+    for (const bytes of this.#live.values()) this.budget.free(bytes);
+    this.#live.clear();
+  }
 }
 
 /** Bytes of one entry as the block-fill rule counts them (a varuint length is at most 5). */
@@ -93,7 +134,8 @@ const entrySize = (keyLength: number): number => 5 + keyLength + 7;
  * Parts are placed back to back from offset 0 of the run's own extent, in emit order: blocks,
  * each partition's Bloom filter after its last block, then the block index, fences and Bloom
  * directory. Scratch (the pending entry, the last key, the block) belongs to the instance: two
- * encoders never share it, and nothing of it is live across a caller's await (R23).
+ * encoders never share it (R23). Emitted parts never alias scratch; their charge remains with
+ * the consumer until append settles. Finished boundary keys stay charged until publication.
  */
 export class RunEncoder {
   readonly #emit: (part: Uint8Array) => void;
@@ -101,20 +143,20 @@ export class RunEncoder {
   /** Offset of the next part within the run's extent. */
   #offset = 0;
   /** Per block: varuint offset, varuint length, u32 checksum (the count is prefixed at finish). */
-  readonly #index = new ByteWriter(4096);
+  readonly #index: ByteWriter;
   /** Per block: its first key, length-prefixed. */
-  readonly #fences = new ByteWriter(4096);
+  readonly #fences: ByteWriter;
   /** Per partition: varuint offset, varuint length, u32 checksum. */
-  readonly #directory = new ByteWriter(64);
+  readonly #directory: ByteWriter;
   #blockCount = 0;
   #partitions = 0;
   #blocksInPartition = 0;
   /** Bloom probes (h1, h2) of the current partition's keys, one pair per distinct key per block. */
-  #hashes = new Uint32Array(2048);
+  #hashes: Uint32Array;
   #hashCount = 0;
   /** The block being filled: entries, and each entry's start. */
-  readonly #block = new ByteWriter(BLOCK_BYTES + 512);
-  readonly #offsets = new Uint16Array(BLOCK_BYTES);
+  readonly #block: ByteWriter;
+  #offsets: Uint16Array;
   // Reuse the ordinary offsets' backing store for buffered source slots, never per-row objects.
   #directEntries: Int32Array | null = null;
   #directData: SingleEntries | null = null;
@@ -123,7 +165,7 @@ export class RunEncoder {
   #directDisabled = true;
   #count = 0;
   /** The pending entry (held back so a put and its tombstone can cancel). */
-  #pendingKey: Uint8Array = new Uint8Array(64);
+  #pendingKey: Uint8Array;
   #pendingLength = 0;
   #pendingStart = 0;
   #pendingRowId = 0;
@@ -134,7 +176,7 @@ export class RunEncoder {
   readonly #computed = { first: 0, second: 0 };
   #hasComputed = false;
   /** The last emitted key, and whether it is in the block being filled. */
-  #lastKey: Uint8Array = new Uint8Array(64);
+  #lastKey: Uint8Array;
   #lastLength = 0;
   #lastStart = 0;
   #lastInBlock = false;
@@ -143,15 +185,35 @@ export class RunEncoder {
   /** Entries a put/tombstone pair cancelled (both counted). */
   cancelled = 0;
 
+  readonly #scratch: RunBuffers;
+  readonly #output: RunBuffers;
+  #finished = false;
+
   constructor(
     emit: (part: Uint8Array) => void,
     dropTombstones = false,
     readonly borrowKeys = false,
+    budget: ByteBudget = UNCHARGED,
   ) {
     this.#emit = emit;
     this.#dropTombstones = dropTombstones;
     this.#directDisabled = !borrowKeys;
-    if (borrowKeys) this.#directEntries = new Int32Array(this.#offsets.buffer);
+    this.#scratch = new RunBuffers(budget);
+    this.#output = new RunBuffers(budget);
+    try {
+      this.#index = new ByteWriter(4096, this.#scratch);
+      this.#fences = new ByteWriter(4096, this.#scratch);
+      this.#directory = new ByteWriter(64, this.#scratch);
+      this.#hashes = new Uint32Array(this.#scratch.create(2048 * 4).buffer);
+      this.#block = new ByteWriter(BLOCK_BYTES + 512, this.#scratch);
+      this.#offsets = new Uint16Array(this.#scratch.create(BLOCK_BYTES * 2).buffer);
+      this.#pendingKey = borrowKeys ? EMPTY_KEY : this.#scratch.create(64);
+      this.#lastKey = borrowKeys ? EMPTY_KEY : this.#scratch.create(64);
+      if (borrowKeys) this.#directEntries = new Int32Array(this.#offsets.buffer);
+    } catch (error) {
+      this.#scratch.close();
+      throw error;
+    }
   }
 
   get entryCount(): number {
@@ -220,8 +282,11 @@ export class RunEncoder {
       this.#pendingKey = bytes;
       this.#pendingStart = start;
     } else {
-      if (length > this.#pendingKey.length)
-        this.#pendingKey = new Uint8Array(Math.max(length, this.#pendingKey.length * 2));
+      if (length > this.#pendingKey.length) {
+        const grown = this.#scratch.create(Math.max(length, this.#pendingKey.length * 2));
+        this.#scratch.release(this.#pendingKey);
+        this.#pendingKey = grown;
+      }
       copyRange(this.#pendingKey, 0, bytes, start, end);
     }
     this.#pendingLength = length;
@@ -356,7 +421,7 @@ export class RunEncoder {
     const data = need(this.#directData),
       positions = need(this.#directEntries);
     const header = 2 + count * 2;
-    const out = new Uint8Array(header + this.#directBytes),
+    const out = this.#output.create(header + this.#directBytes),
       view = new DataView(out.buffer);
     view.setUint16(0, count, true);
     const first = positions[0] ?? 0,
@@ -364,13 +429,14 @@ export class RunEncoder {
       firstEnd = data.ends[first] ?? 0;
     this.#fences.varuint(firstEnd - firstStart);
     this.#fences.rawRange(data.arena, firstStart, firstEnd);
-    this.#minKey ??= data.arena.slice(firstStart, firstEnd);
+    this.#minKey ??= this.#output.copy(data.arena, firstStart, firstEnd);
     const needed = this.#hashCount + count * 2;
     if (needed > this.#hashes.length) {
       let capacity = this.#hashes.length * 2;
       while (capacity < needed) capacity *= 2;
-      const grown = new Uint32Array(capacity);
+      const grown = new Uint32Array(this.#scratch.create(capacity * 4).buffer);
       grown.set(this.#hashes);
+      this.#scratch.release(this.#hashes);
       this.#hashes = grown;
     }
     let cursor = header;
@@ -465,8 +531,9 @@ export class RunEncoder {
     }
     if (!(this.#lastInBlock && same)) {
       if (this.#hashCount + 2 > this.#hashes.length) {
-        const grown = new Uint32Array(this.#hashes.length * 2);
+        const grown = new Uint32Array(this.#scratch.create(this.#hashes.byteLength * 2).buffer);
         grown.set(this.#hashes);
+        this.#scratch.release(this.#hashes);
         this.#hashes = grown;
       }
       // The delta supplies canonical hashes. Disk merges compute the pair once per distinct
@@ -487,8 +554,11 @@ export class RunEncoder {
         this.#lastKey = key;
         this.#lastStart = start;
       } else {
-        if (length > this.#lastKey.length)
-          this.#lastKey = new Uint8Array(Math.max(length, this.#lastKey.length * 2));
+        if (length > this.#lastKey.length) {
+          const grown = this.#scratch.create(Math.max(length, this.#lastKey.length * 2));
+          this.#scratch.release(this.#lastKey);
+          this.#lastKey = grown;
+        }
         copyRange(this.#lastKey, 0, key, start, start + length);
       }
       this.#lastLength = length;
@@ -518,14 +588,14 @@ export class RunEncoder {
     bytes[at + 6] = tombstone ? 1 : 0;
     block.length = at + 7;
     this.#entryCount += 1;
-    this.#minKey ??= key.slice(start, start + length);
+    this.#minKey ??= this.#output.copy(key, start, start + length);
   }
 
   #closeBlock(): void {
     const count = this.#count;
     if (count === 0) return;
     const header = 2 + count * 2;
-    const out = new Uint8Array(header + this.#block.length);
+    const out = this.#output.create(header + this.#block.length);
     const view = new DataView(out.buffer);
     view.setUint16(0, count, true);
     for (let k = 0; k < count; k++)
@@ -545,7 +615,7 @@ export class RunEncoder {
 
   #closePartition(): void {
     if (this.#blocksInPartition === 0) return;
-    const bloom = encodeBloom(this.#hashes, this.#hashCount);
+    const bloom = encodeBloom(this.#hashes, this.#hashCount, this.#output);
     this.#directory.varuint(this.#offset);
     this.#directory.varuint(bloom.length);
     this.#directory.u32(xxHash32(bloom));
@@ -571,47 +641,92 @@ export class RunEncoder {
     this.#closePartition();
     const minKey = this.#minKey;
     if (this.#entryCount === 0 || minKey === null) return null;
-    const index = new ByteWriter(this.#index.length + 8);
+    const index = new ByteWriter(this.#index.length + 8, this.#output);
     index.varuint(this.#blockCount);
     index.rawRange(this.#index.bytes, 0, this.#index.length);
-    const fences = new ByteWriter(this.#fences.length + 8);
+    const fences = new ByteWriter(this.#fences.length + 8, this.#output);
     fences.varuint(this.#blockCount);
     fences.rawRange(this.#fences.bytes, 0, this.#fences.length);
-    const directory = new ByteWriter(this.#directory.length + 16);
+    const directory = new ByteWriter(this.#directory.length + 16, this.#output);
     directory.varuint(PARTITION_BLOCKS);
     directory.varuint(this.#partitions);
     directory.rawRange(this.#directory.bytes, 0, this.#directory.length);
     if (index.length > MAX_INDEX_BYTES || fences.length > MAX_INDEX_BYTES)
       throw new RangeError("An index run has more blocks than one run can index");
-    this.#put(index.finish());
-    this.#put(fences.finish());
-    this.#put(directory.finish());
+    this.#put(index.bytes.subarray(0, index.length));
+    this.#put(fences.bytes.subarray(0, fences.length));
+    this.#put(directory.bytes.subarray(0, directory.length));
+    const maxKey = this.#output.copy(
+      this.#lastKey,
+      this.#lastStart,
+      this.#lastStart + this.#lastLength,
+    );
+    this.#finished = true;
+    const output = this.#output;
     return {
       entryCount: this.#entryCount,
       minKey,
-      maxKey: this.#lastKey.slice(this.#lastStart, this.#lastStart + this.#lastLength),
+      maxKey,
+      release: () => output.close(),
     };
   }
-  /** Drop borrowed arena references before their owner releases its charge. Not resumable. */
+  /** The extent writer has resolved append(); it no longer borrows this part. */
+  releasePart(part: Uint8Array): void {
+    this.#output.release(part);
+  }
+
+  /** Release scratch and borrowed inputs; unfinished output is aborted. Not resumable. */
   close(): void {
-    if (this.borrowKeys) {
-      this.#pendingKey = EMPTY_KEY;
-      this.#lastKey = EMPTY_KEY;
-      this.#hasPending = false;
-      this.#directData = null;
-      this.#directCount = 0;
-      this.#directBytes = 0;
-    }
+    this.#index.close();
+    this.#fences.close();
+    this.#directory.close();
+    this.#block.close();
+    this.#scratch.close();
+    this.#hashes = new Uint32Array(0);
+    this.#offsets = new Uint16Array(0);
+    this.#pendingKey = EMPTY_KEY;
+    this.#lastKey = EMPTY_KEY;
+    this.#minKey = null;
+    this.#hasPending = false;
+    this.#directData = null;
+    this.#directEntries = null;
+    this.#directCount = 0;
+    this.#directBytes = 0;
+    if (!this.#finished) this.#output.close();
   }
 }
 
-/** Collects a whole run in memory (a flush's run: one memtable's delta). */
+/** Collects encoded parts until finish or a bounded consumer takes and releases them. */
 export class RunBuilder {
   readonly #parts: Uint8Array[] = [];
   readonly #encoder: RunEncoder;
+  #queuedBytes = 0;
+  #transferred = false;
 
-  constructor(dropTombstones = false, borrowKeys = false) {
-    this.#encoder = new RunEncoder((part) => this.#parts.push(part), dropTombstones, borrowKeys);
+  constructor(dropTombstones = false, borrowKeys = false, budget: ByteBudget = UNCHARGED) {
+    this.#encoder = new RunEncoder(
+      (part) => {
+        this.#parts.push(part);
+        this.#queuedBytes += part.length;
+      },
+      dropTombstones,
+      borrowKeys,
+      budget,
+    );
+  }
+
+  get queuedBytes(): number {
+    return this.#queuedBytes;
+  }
+
+  /** Bounded streaming consumer; returned buffers stay charged until releasePart after append. */
+  takeParts(): Uint8Array[] {
+    this.#queuedBytes = 0;
+    return this.#parts.splice(0);
+  }
+
+  releasePart(part: Uint8Array): void {
+    this.#encoder.releasePart(part);
   }
 
   /** Adds one entry; `key` is copied. Entries must come in (key, rowId) order. */
@@ -643,6 +758,10 @@ export class RunBuilder {
 
   close(): void {
     this.#encoder.close();
+    if (!this.#transferred) {
+      this.#parts.length = 0;
+      this.#queuedBytes = 0;
+    }
   }
 
   /** `add` of the key `bytes[start … end)`. Optional hashes are raw XXH32 with seeds 0 and KEY_BLOOM_SEED. */
@@ -666,6 +785,7 @@ export class RunBuilder {
   finish(): EncodedRun | null {
     try {
       const summary = this.#encoder.finish();
+      this.#transferred = summary !== null;
       return summary === null ? null : { parts: this.#parts, ...summary };
     } finally {
       this.#encoder.close();
@@ -682,7 +802,7 @@ export function encodeRun(keys: readonly SortedKey[]): EncodedRun | null {
 }
 
 /** The `RunRef` of an encoded run once `ExtentWriter.write(run.parts)` returned its blobs. */
-export function runRef(run: EncodedRun, blobs: readonly BlobRef[], level = 0): RunRef {
+export function runRef(run: RunSummary, blobs: readonly BlobRef[], level = 0): RunRef {
   const count = blobs.length;
   return {
     level,
@@ -696,10 +816,14 @@ export function runRef(run: EncodedRun, blobs: readonly BlobRef[], level = 0): R
 }
 
 /** One partition's Bloom filter over `count / 2` keys' probe pairs (exported for its test). */
-export function encodeBloom(hashes: Uint32Array, count: number): Uint8Array {
+export function encodeBloom(
+  hashes: Uint32Array,
+  count: number,
+  allocator?: BufferAllocator,
+): Uint8Array {
   const keys = count / 2;
   const bits = Math.max(64, Math.ceil((keys * BLOOM_BITS_PER_KEY) / 8) * 8);
-  const out = new Uint8Array(5 + bits / 8);
+  const out = allocator?.create(5 + bits / 8) ?? new Uint8Array(5 + bits / 8);
   new DataView(out.buffer).setUint32(0, bits, true);
   out[4] = BLOOM_HASHES;
   // (h1 + p·h2) mod bits, stepped: (h1 mod bits) + p·(h2 mod bits), wrapping at bits. Exactly
@@ -1011,6 +1135,7 @@ export class RunReader {
     budget: ByteBudget,
     visit: (key: Uint8Array, rowId: number, tombstone: boolean) => boolean,
     from: Uint8Array | null = null,
+    drain?: () => MaybePromise<void>,
   ): Promise<void> {
     const start = from === null ? 0 : this.#blocksFor(from)[0];
     for (let block = start; block < this.#blocks.length; block++) {
@@ -1029,6 +1154,7 @@ export class RunReader {
       } finally {
         release?.();
       }
+      await drain?.();
     }
   }
 

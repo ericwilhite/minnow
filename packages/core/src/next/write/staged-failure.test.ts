@@ -43,7 +43,7 @@ interface Fault {
   readonly part: number;
   /** Which stage publication of the transaction it hits (0: the first). */
   readonly publication: number;
-  /** For `write`: which write call of that publication's writer fails. */
+  /** For `write`: which append call of that publication's writer fails (whole or streaming). */
   readonly call: number;
   readonly trials: number;
 }
@@ -110,21 +110,27 @@ async function run(fault: Fault): Promise<void> {
     abort: () => undefined,
   };
   const path: WritePathImpl = await harness.open();
-  // A writer of the stage publication's whole I/O: one of its writes fails.
+  // Every native append, including streamed index runs, belongs to the stage publication.
+  // Faulting append rather than the write convenience method keeps both paths observable.
   const beginWrite = harness.space.beginWrite.bind(harness.space);
   harness.space.beginWrite = (label, options) => {
     const writer = beginWrite(label, options);
     if (label !== "stage" || !armed || fault.step !== "write") return writer;
     if (publications !== fault.publication) return writer;
     let calls = 0;
-    const write = writer.write.bind(writer);
-    writer.write = (parts) => {
-      if (armed && calls++ === fault.call) {
-        armed = false;
-        reach.reach("failure at write");
-        return Promise.reject(new Error("injected failure at write"));
-      }
-      return write(parts);
+    const open = writer.open.bind(writer);
+    writer.open = (capacity) => {
+      const builder = open(capacity),
+        append = builder.append.bind(builder);
+      builder.append = (parts) => {
+        if (armed && calls++ === fault.call) {
+          armed = false;
+          reach.reach("failure at write");
+          return Promise.reject(new Error("injected failure at write"));
+        }
+        return append(parts);
+      };
+      return builder;
     };
     return writer;
   };
