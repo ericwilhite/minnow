@@ -23,6 +23,7 @@ const TEST_ONLY = new Set([
   "write/directory-fixture-files.ts",
   "write/directory-compat-api.ts",
   "write/directory-frozen.ts",
+  "write/directory-current.test-support.ts",
   "write/directory-tails-test-support.ts",
 ]);
 function productionFiles(dir: string): string[] {
@@ -138,14 +139,14 @@ export function discoverDurableSources(): {
         }
       }
       if (
-        relative(NEXT, path) === "format/manifest.ts" &&
+        ["format/manifest.ts", "format/run-key.ts", "format/key-pointer.ts"].includes(relative(NEXT, path)) &&
         ts.isTypeReferenceNode(node) &&
-        ["BlobRef", "ChunkData"].includes(node.typeName.getText())
+        (["BlobRef", "ChunkData", "KeyChunk", "RunKeyStorage"].includes(node.typeName.getText()) || (node.typeName.getText() === "Uint8Array" && owner(node) === "RunKeyStorage"))
       ) {
         const parts: string[] = [];
         for (const parent of parents(node)) {
           if (ts.isPropertySignature(parent)) parts.unshift(parent.name.getText());
-          if (ts.isInterfaceDeclaration(parent)) {
+          if (ts.isInterfaceDeclaration(parent) || ts.isTypeAliasDeclaration(parent)) {
             parts.unshift(parent.name.getText());
             break;
           }
@@ -159,7 +160,7 @@ export function discoverDurableSources(): {
   return { sites, refs: refs.sort() };
 }
 
-const RUN = ["runBlock", "runIndex", "runFences", "runBloomDirectory", "runBloom"];
+const RUN = ["runBlock", "runIndex", "runFences", "runBloomDirectory", "runBloom", "runKeyPointer", "runKeyDescriptor", "runKeyDirectory", "runKeyPayload"];
 const LOG = ["logFrame", "commitBody", "column", "catalogChange", "arrayValue"];
 /** count is source call sites, not executions. [] means transport/private scratch, not a new codec. */
 export const DURABLE_EMISSIONS: Readonly<
@@ -302,6 +303,11 @@ export const DURABLE_REFERENCES: Readonly<Record<string, readonly string[]>> = {
   "ColumnChunk.data": ["page"],
   "ColumnChunk.directory": ["pageDirectory"],
   "ColumnChunk.distinctSketch": ["sketch"],
+  "RunRef.keyStorage": ["runKeyPointer"],
+  "RunKeyStorage.minimum": ["runKeyPointer"],
+  "RunKeyStorage.maximum": ["runKeyPointer"],
+  "KeyPointer.directory": ["runKeyDirectory"],
+  "RunKey.chunks": ["runKeyPayload"],
   "RunRef.entries": ["runIndex", "runBlock"],
   "RunRef.fences": ["runFences"],
   "RunRef.bloom": ["runBloomDirectory", "runBloom"],

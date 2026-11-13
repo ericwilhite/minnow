@@ -1,9 +1,11 @@
 /** Bounded key records/fences; the chunk directory and payload precede their referencing block. */
+import { DURABLE_CODECS, DURABLE_FORMATS, RUN_CODEC, requireTag } from "../durable-format.js";
+import { ManifestCorruptionError } from "./bytes.js";
 import { ByteReader, ByteWriter, valid } from "./bytes.js";
 import { type KeyChunk, RUN_KEY_PREFIX_BYTES } from "./run-key.js";
-export const KEY_DIRECTORY_MAGIC = 0x31444b4d;
-export const KEY_DIRECTORY_VERSION = 1;
-export const EXTENDED_KEY_BLOCK = 0x8000;
+export const KEY_DIRECTORY_MAGIC = DURABLE_FORMATS.runKeyDirectory.magic;
+export const KEY_DIRECTORY_VERSION = DURABLE_FORMATS.runKeyDirectory.version;
+export const EXTENDED_KEY_BLOCK = RUN_CODEC.extendedKeyBlock;
 export type KeyPointer =
   | { readonly kind: "inline"; readonly bytes: Uint8Array }
   | {
@@ -44,7 +46,7 @@ export function writeKeyPointer(
   before: number,
 ): void {
   check(pointer, before);
-  out.u8(pointer.kind === "inline" ? 0 : 1);
+  out.u8(pointer.kind === "inline" ? DURABLE_CODECS.keyDescriptor.inline : DURABLE_CODECS.keyDescriptor.overflow);
   if (pointer.kind === "inline") {
     out.bytes(pointer.bytes);
     return;
@@ -60,9 +62,9 @@ export function readKeyPointer(
   before: number,
 ): KeyPointer {
   const tag = input.u8();
-  valid(tag === 0 || tag === 1, "Unknown key pointer tag");
+  requireTag(tag, Object.values(DURABLE_CODECS.keyDescriptor), "key pointer tag", ManifestCorruptionError);
   const pointer: KeyPointer =
-    tag === 0
+    tag === DURABLE_CODECS.keyDescriptor.inline
       ? { kind: "inline", bytes: input.bytes() }
       : {
           kind: "overflow",

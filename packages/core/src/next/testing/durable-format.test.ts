@@ -87,7 +87,7 @@ const blob: BlobRef = {
   checksum: 7,
 };
 const manifest: ManifestRoot = {
-  formatVersion: 2,
+  formatVersion: MANIFEST_FORMAT_VERSION,
   sequence: 1,
   epoch: 1,
   log: { salt: 7, firstLsn: 1, rootSequence: 1 },
@@ -500,7 +500,7 @@ for (const seed of seedsFor("next-durable-aliases", [0xb227, 0xb228]))
           metadata.uint();
           metadata.uint();
         }
-        for (const version of [0, 1, 3 + (unknown % 124)]) {
+        for (const version of [0, 1, MANIFEST_FORMAT_VERSION + 1 + (unknown % 124)]) {
           const bytes = manifestBytes.slice();
           bytes[metadata.at] = version;
           await refused(
@@ -947,7 +947,7 @@ for (const seed of seedsFor("next-durable-before-fence", [0xb22f, 0xb230]))
   it(`refuses a newer root before all native mutations seed ${String(seed)}`, async () => {
     const reach = createReach("durable startup", DURABLE_STARTUP_REACH);
     await fc.assert(
-      fc.asyncProperty(fc.integer({ min: 2, max: 8 }), async (future) => {
+      fc.asyncProperty(fc.integer({ min: DURABLE_READER_VERSION + 1, max: 8 }), async (future) => {
         reach.beginHistory();
         for (const field of ["minimum reader", "manifest format"] as const)
           for (const slot of ["root-0", "root-1"] as const)

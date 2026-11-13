@@ -1,4 +1,5 @@
 /** Unpublished rebuild formats have explicit refusal, never implicit upgrade. */
+import { DURABLE_CODECS } from "../durable-format.js";
 import { ManifestCorruptionError } from "./bytes.js";
 
 export class UnsupportedEncodingError extends ManifestCorruptionError {
@@ -23,8 +24,8 @@ export function requireEncoding(
   if (!supported.includes(version)) throw new UnsupportedEncodingError(format, version, supported);
 }
 
-export const INLINE_RUN_ENCODING = 1;
-export const OVERFLOW_RUN_ENCODING = 2;
+export const INLINE_RUN_ENCODING = DURABLE_CODECS.runEncoding.inline;
+export const OVERFLOW_RUN_ENCODING = DURABLE_CODECS.runEncoding.overflow;
 export type RunEncoding = typeof INLINE_RUN_ENCODING | typeof OVERFLOW_RUN_ENCODING;
 export function readRunEncoding(version: number): RunEncoding {
   requireEncoding("run", version, [INLINE_RUN_ENCODING, OVERFLOW_RUN_ENCODING]);

@@ -8,7 +8,7 @@
  * checksummed slot is not an empty/torn slot. Reserved masks enumerate every permitted bit;
  * writers emit zero for the remainder, readers refuse it. Scratch/transport are not durable.
  */
-/** Shared reference-table envelope; the manifest also carries its logical format version2. */
+/** Shared reference-table envelope; the manifest also carries its logical format version3. */
 export const METADATA_ENVELOPE_VERSION = 1;
 /** Raise before publishing any incompatible nested durable codec. Never fence before checking. */
 export const DURABLE_READER_VERSION = 2;
@@ -32,7 +32,7 @@ export interface FormatField {
   /** Permitted bits; every other bit is reserved-zero. */
   readonly mask?: number;
 }
-/** Header selectors can name an outer envelope (manifest envelope1) plus its logical version2. */
+/** Header selectors can name an outer envelope (manifest envelope1) plus its logical version3. */
 interface Format {
   readonly magic: number | null;
   readonly version: number;
@@ -217,6 +217,7 @@ export const DURABLE_CODECS = {
     "dropTable",
     "createIndex",
     "dropIndex",
+    "invalidateIndex",
     "putSequence",
     "dropSequence",
     "createView",
@@ -225,6 +226,9 @@ export const DURABLE_CODECS = {
     "dropType",
   ],
   jsonNumber: ["NaN", "Infinity", "-Infinity", "-0"],
+  indexKeyLimit: ["scalar", "tuple"],
+  runEncoding: { inline: 1, overflow: 2 },
+  keyDescriptor: { inline: 0, overflow: 1 },
   indexKind: ["ordered", "equality"],
   indexRole: ["primary", "unique", "secondary", "foreignKey"],
   foreignKeyAction: ["restrict", "cascade", "setNull"],
@@ -350,6 +354,15 @@ export const DURABLE_FORMATS = {
   ]),
   catalog: inherited("manifest", "Catalog.decode"),
   catalogChange: inherited("commitBody", "decodeLogged"),
+  runKeyPointer: inherited("manifest", "readKeyPointer", [
+    { name: "kind", offset: 0, width: 1, values: [0, 1] },
+  ]),
+  runKeyDescriptor: inherited("runKeyDirectory", "readRunKey", [
+    { name: "kind", offset: 0, width: 1, values: [0, 1] },
+  ]),
+  runKeyDirectory: envelope(0x31444b4d, "OverflowKeys.resolve"),
+  // Raw bytes inherit the checked directory and full-key length; checksums are BlobRef checks.
+  runKeyPayload: inherited("runKeyDirectory", "OverflowKeys.resolve:payload"),
   runBlock: inherited("manifest", "blockEntries/RunReader.lookup/cursor"),
   runIndex: inherited("manifest", "RunReader.open:index"),
   runFences: inherited("manifest", "RunReader.open:fences"),
@@ -451,6 +464,10 @@ export const RUN_CODEC = {
   bitsPerKey: 10,
   version: 1,
   flags: 1,
+  extendedKeyBlock: 0x8000,
+  keyPrefixBytes: 32,
+  keyChunkBytes: 64 * 1024,
+  inlineKeyBytes: 2048,
   hashes: 7,
   seed1: 0,
   seed2: 0x9747b28c,

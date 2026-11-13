@@ -43,6 +43,10 @@ export const DURABLE_REGISTRY_REACH = [
   "runFences",
   "runBloomDirectory",
   "runBloom",
+  "runKeyPointer",
+  "runKeyDescriptor",
+  "runKeyDirectory",
+  "runKeyPayload",
   "arrayValue",
 ] as const;
 export const DELETION_BITMAP_REACH = [

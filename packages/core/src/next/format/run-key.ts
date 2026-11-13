@@ -2,10 +2,12 @@
  * Prefixes accelerate ordering only; equality requires the complete canonical key.
  * Bounds/context are validated before allocating decoded chunk arrays. The owner funds codecs.
  */
+import { DURABLE_CODECS, RUN_CODEC, requireTag } from "../durable-format.js";
+import { ManifestCorruptionError } from "./bytes.js";
 import { ByteReader, ByteWriter, valid } from "./bytes.js";
 
-export const RUN_KEY_PREFIX_BYTES = 32;
-export const RUN_KEY_CHUNK_BYTES = 64 * 1024;
+export const RUN_KEY_PREFIX_BYTES = RUN_CODEC.keyPrefixBytes;
+export const RUN_KEY_CHUNK_BYTES = RUN_CODEC.keyChunkBytes;
 export interface KeyChunk {
   readonly offset: number;
   readonly length: number;
@@ -56,7 +58,7 @@ function check(key: RunKey, payloadEnd: number): void {
 
 export function writeRunKey(out: ByteWriter, key: RunKey, payloadEnd: number): void {
   check(key, payloadEnd);
-  out.u8(key.kind === "inline" ? 0 : 1);
+  out.u8(key.kind === "inline" ? DURABLE_CODECS.keyDescriptor.inline : DURABLE_CODECS.keyDescriptor.overflow);
   if (key.kind === "inline") {
     out.bytes(key.bytes);
     return;
@@ -73,9 +75,9 @@ export function writeRunKey(out: ByteWriter, key: RunKey, payloadEnd: number): v
 
 export function readRunKey(input: ByteReader, payloadEnd: number): RunKey {
   const tag = input.u8();
-  valid(tag === 0 || tag === 1, "Unknown key descriptor tag");
+  requireTag(tag, Object.values(DURABLE_CODECS.keyDescriptor), "key descriptor tag", ManifestCorruptionError);
   let key: RunKey;
-  if (tag === 0) key = { kind: "inline", bytes: input.bytes() };
+  if (tag === DURABLE_CODECS.keyDescriptor.inline) key = { kind: "inline", bytes: input.bytes() };
   else {
     const length = input.uint(),
       prefix = input.bytes(),
