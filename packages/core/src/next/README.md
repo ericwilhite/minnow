@@ -354,6 +354,32 @@ its memory-store results exclude payload fetch, SQL, owner transport and real di
 - Text stays UTF-8 until output.
 - A consumer borrows a batch until it signals readiness, or owns it under an explicit transfer.
 
+### Durable format registry (`durable-format.ts`)
+
+`DURABLE_FORMATS` lists every durable family, version, magic and parent envelope.
+`DURABLE_CODECS` lists codec tags; permitted masks define canonical reserved-zero bits.
+Raw pages, columns and run parts inherit their directory, body or manifest version.
+Unknown versions, tags and reserved bits produce a typed `MINNOW_` refusal. An intact
+unsupported native header never means an empty store. Checksum-invalid slots still follow
+ordinary dual-slot recovery. Private scratch journals and spill encodings are listed separately;
+they are not recovery authorities. Snapshot entries are design reservations, with no loader yet.
+
+The 16-byte native root header now carries a minimum-reader version and the inner manifest
+format before its opaque payload. Both are checksummed. Acquisition checks both root slots
+before creating OPFS files or advancing an owner epoch; IndexedDB checks in the strict fence
+transaction before enqueueing any write. Unsupported root barriers use
+`DurableFormatError` (`MINNOW_FORMAT_UNSUPPORTED`). Publishers, including prepaid root frames,
+emit the registry values. Every future incompatible nested codec must raise this outer barrier
+before writing incompatible data or log bytes, so an older reader cannot advance the newer owner's epoch before refusing.
+Its eleven formerly reserved high bits carry biased selectors: minimum-reader minus1 in
+bits21..23 and manifest-format minus2 in bits24..31. Zero selects reader1/manifest2, so current
+bytes and charges stay unchanged. The first released1.0 writer starts the supported fixture
+and automatic-upgrade chain. The shipped0.x engine is unchanged.
+
+`testing/durable-format.test.ts` sweeps real decoder entry points with unsupported selectors
+and every reserved bit, checks typed refusal, unchanged inputs and returned charges, and
+checks future roots leave native epoch/log/root/metadata images unchanged with zero writes.
+
 ### Checksum (`hash/xxhash32.ts`)
 
 - xxHash32 is the one checksum of the new core (log frames, header and root slots, blobs and

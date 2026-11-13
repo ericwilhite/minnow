@@ -2170,3 +2170,11 @@ The owner allocates one fixed 64-byte allowance for the single active plan, reta
 success, failure and cancellation and released on close. The plan borrows its row selection
 without another copy. The check covers one and several admission chunks and proves the allowance
 is allocated during the wait, rather than inferring it from a zero balance after close.
+
+The rebuild's durable-format registry is swept through real decoder entry points by
+`next/testing/durable-format.test.ts`. Generated cases cover unknown versions and tags,
+every reserved bit, strict boolean selectors and alignment padding. The checks require typed
+refusal, unchanged bytes and returned allocation charges. A future minimum-reader or manifest
+format in either root slot must refuse before any native write: IndexedDB's epoch and records
+and OPFS's file tree remain unchanged. Checksum-invalid torn slots retain their ordinary
+recovery behavior. Snapshot registry entries remain design-only until export/load is implemented.

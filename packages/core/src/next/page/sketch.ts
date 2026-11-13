@@ -11,10 +11,11 @@
  * Serialized form: u8 precision (10), u8 form (0 dense, 1 sparse), u16 entry count; dense is the
  * 1,024 registers, sparse is `count` × (u16 register, u8 value) for the non-zero registers.
  */
+import { requireHeader, DURABLE_CODECS } from "../durable-format.js";
 import { xxHash32 } from "../hash/xxhash32.js";
-import { check } from "./format.js";
+import { check, PageCorruptionError } from "./format.js";
 
-export const SKETCH_PRECISION = 10;
+export const SKETCH_PRECISION = DURABLE_CODECS.sketchPrecision;
 const REGISTERS = 1 << SKETCH_PRECISION;
 
 /** murmur3's 32-bit finalizer. Hashes are int32 (never boxed): only their bits matter. */
@@ -109,6 +110,7 @@ export class DistinctSketch {
 
   static parse(bytes: Uint8Array): DistinctSketch {
     check(bytes.length >= 4 && bytes[0] === SKETCH_PRECISION, "Bad distinct sketch header");
+    requireHeader("sketch", bytes, PageCorruptionError);
     const form = bytes[1] ?? 0;
     const count = (bytes[2] ?? 0) | ((bytes[3] ?? 0) << 8);
     const sketch = new DistinctSketch();

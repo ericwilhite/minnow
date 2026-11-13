@@ -220,3 +220,14 @@ The catalogue checks original SQL gives PG 42883, records legacy acceptance, the
 corrected SQL through PostgreSQL, the shipped engine and the real rebuild executor. Its original
 frozen fingerprint is still checked after reversing only those three SQL corrections.
 Authority: https://www.postgresql.org/docs/18/functions-math.html.
+
+## Durable format freeze and mixed-version fencing
+
+The first released1.0 writer starts the supported stored-format chain. Pre-release next/ roots
+now interpret the11 reserved high sequence bits in the16-byte outer header as biased
+minimum-reader/manifest selectors. Zero selects reader1/manifest2, preserving current bytes. Both root slots must pass their checksummed
+version barrier before native file creation or any epoch update. Semantic manifest replay still
+follows ownership, but a future nested format must raise the outer requirement when publishing.
+Unknown intact formats refuse, never recover as empty. `durable-format.ts` is the canonical
+registry; raw inner codecs inherit explicit versioned parents. Snapshot constants are reserved
+for the design only. The generated decoder sweep and zero-write native histories enforce this.

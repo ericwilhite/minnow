@@ -53,6 +53,8 @@
  * cannot be incremented, refuses ownership with `StoreCorruptionError`: two owners must never
  * share an epoch.
  */
+import { ROOT_SLOT_OVERHEAD } from "../durable-format.js";
+import { validLogHeaderEnvelope } from "./durable-header.js";
 import {
   LOG_HEADER_SLOT_BYTES,
   METADATA_PAGE_BYTES,
@@ -79,7 +81,7 @@ import { ByteStore, inOrder } from "./idb-bytes.js";
 import type { CacheMemory, EvictableCacheLike } from "./extents.js";
 import { IdbMetadataCache, type MetadataCacheBacking } from "./idb-metadata-cache.js";
 import type { IdbDatabaseLike, IdbTransactionLike } from "./idb-like.js";
-import { chooseRoot, encodeRootSlot } from "./root-slot.js";
+import { chooseRoot, decodeRootSlot, encodeRootSlot } from "./root-slot.js";
 import { preparedRoot } from "./root-memory.js";
 
 export interface IndexedDbBackendOptions {
@@ -803,7 +805,7 @@ class IdbSession implements StoreSession {
     await this.#read(["roots"], (tx) => {
       tx.store("roots").get(`slot-${String(slot)}`, (value) => {
         bytes = slotBytes(value);
-        if (bytes !== null && bytes.length > (1 << 20) + 20)
+        if (bytes !== null && bytes.length > (1 << 20) + ROOT_SLOT_OVERHEAD)
           throw new StoreCorruptionError("Root slot exceeds1MiB payload");
       });
     });
@@ -1165,7 +1167,12 @@ class IdbSession implements StoreSession {
   }
 }
 
-const slotBytes = (value: unknown) => (value instanceof ArrayBuffer ? new Uint8Array(value) : null);
+const slotBytes = (value: unknown): Uint8Array | null => {
+  if (value === undefined) return null;
+  if (!(value instanceof ArrayBuffer))
+    throw new StoreCorruptionError("Unknown root/header record representation");
+  return new Uint8Array(value);
+};
 
 /** Negative numeric meta keys are owner-private fixed pages. No ByteStore or resident index.
  * Ordinary spill has a separate namespace; its sweep cannot erase these pages.
@@ -1450,8 +1457,22 @@ export function createIndexedDbBackend(options: IndexedDbBackendOptions): Storag
           let epoch = 0;
           // The fence: one strict transaction moves the durable epoch past every older owner's.
           await db
-            .transaction(["meta"], "readwrite", "strict", (tx) => {
+            .transaction(["meta", "roots"], "readwrite", "strict", (tx) => {
               const meta = tx.store("meta");
+              let checked = 0;
+              const ready = () => {
+                if (++checked === 5) meta.put("epoch", epoch);
+              };
+              for (const slot of [0, 1]) {
+                tx.store("roots").get(`slot-${String(slot)}`, (value) => {
+                  decodeRootSlot(slotBytes(value), true);
+                  ready();
+                });
+                meta.get(`header-${String(slot)}`, (value) => {
+                  validLogHeaderEnvelope(slotBytes(value));
+                  ready();
+                });
+              }
               meta.get("epoch", (stored) => {
                 // Missing: a new store. Anything else must be a counter that can still increase
                 // (review B1-p2c finding 1): a malformed or exhausted one would let two owners share
@@ -1468,7 +1489,7 @@ export function createIndexedDbBackend(options: IndexedDbBackendOptions): Storag
                   tx.abort(new StoreCorruptionError("The epoch counter is exhausted"));
                   return;
                 } else epoch = stored + 1;
-                meta.put("epoch", epoch);
+                ready();
               });
             })
             .catch((error: unknown) => {

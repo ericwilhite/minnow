@@ -36,6 +36,7 @@
  * row was inserted and deleted within the merged layers); a run written to the bottom level also
  * drops the tombstones left (no older put can exist below it).
  */
+import { RUN_CODEC, requireHeader, requireBits } from "../durable-format.js";
 import type { BlobRef, RunRef } from "../format/manifest.js";
 import type { SingleEntries } from "./key-hash.js";
 import { hashKey } from "./key-hashes.js";
@@ -49,7 +50,7 @@ import type { BufferAllocator } from "./commit-buffers.js";
 import { OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
 import type { MaybePromise } from "../access/key-index.js";
 
-export const BLOCK_BYTES = 4096;
+export const BLOCK_BYTES = RUN_CODEC.blockBytes;
 
 /** The longest encoded index key a run block can hold: half a block. */
 export const MAX_KEY_BYTES = BLOCK_BYTES / 2;
@@ -63,9 +64,9 @@ export class IndexKeyTooLongError extends RangeError {
   }
 }
 /** Blocks per Bloom partition (≈ 200 KiB of filter for typical keys). */
-export const PARTITION_BLOCKS = 256;
-const BLOOM_BITS_PER_KEY = 10;
-const BLOOM_HASHES = 7;
+export const PARTITION_BLOCKS = RUN_CODEC.partitionBlocks;
+const BLOOM_BITS_PER_KEY = RUN_CODEC.bitsPerKey;
+const BLOOM_HASHES = RUN_CODEC.hashes;
 const MAX_INDEX_BYTES = 1024 * 1024;
 const EMPTY_KEY = new Uint8Array(0);
 
@@ -946,6 +947,7 @@ interface Bloom {
 }
 
 function parseBloom(bytes: Uint8Array): Bloom {
+  requireHeader("runBloom", bytes, StoreCorruptionError);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const bits = view.getUint32(0, true);
   if (bits === 0 || bytes.length !== 5 + bits / 8)
@@ -1286,10 +1288,37 @@ function rowIdAt(view: DataView, at: number): number {
   return view.getUint32(at, true) + view.getUint16(at + 4, true) * 2 ** 32;
 }
 
+function validateBlock(block: Uint8Array, view: DataView, count: number): void {
+  if (count < 1 || 2 + 2 * count > block.length || block.length > BLOCK_BYTES + 2)
+    throw new StoreCorruptionError("Run block offsets are invalid");
+  let end = 2 + 2 * count;
+  for (let index = 0; index < count; index++) {
+    let at = view.getUint16(2 + 2 * index, true);
+    if (at !== end || at >= block.length)
+      throw new StoreCorruptionError("Run block entries do not tile its bytes");
+    const first = block[at++] ?? 0;
+    let length = first;
+    if (first >= 128) {
+      if (at >= block.length) throw new StoreCorruptionError("Run key length is truncated");
+      const second = block[at++] ?? 0;
+      if (second === 0 || second >= 128)
+        throw new StoreCorruptionError("Run key length is not canonical");
+      length = (first & 127) + second * 128;
+    }
+    end = at + length + 7;
+    if (length > MAX_KEY_BYTES || end > block.length)
+      throw new StoreCorruptionError("Run block entry is truncated or too wide");
+    requireBits(block[end - 1] ?? 0, RUN_CODEC.flags, "run entry flags", StoreCorruptionError);
+  }
+  if (end !== block.length) throw new StoreCorruptionError("Run block has trailing bytes");
+}
+
 /** Appends the entries of `key` in `block` to `out`. */
 function searchBlock(block: Uint8Array, key: Uint8Array, out: RunEntry[]): void {
+  if (block.length < 2) throw new StoreCorruptionError("Run block is truncated");
   const view = new DataView(block.buffer, block.byteOffset, block.byteLength);
   const count = view.getUint16(0, true);
+  validateBlock(block, view, count);
   let lo = 0;
   let hi = count;
   while (lo < hi) {
@@ -1321,8 +1350,10 @@ function forEachEntry(
   block: Uint8Array,
   visit: (key: Uint8Array, rowId: number, tombstone: boolean) => boolean,
 ): boolean {
+  if (block.length < 2) throw new StoreCorruptionError("Run block is truncated");
   const view = new DataView(block.buffer, block.byteOffset, block.byteLength);
   const count = view.getUint16(0, true);
+  validateBlock(block, view, count);
   for (let k = 0; k < count; k++) {
     const { keyStart, keyEnd } = locate(block, view, k);
     const tombstone = ((block[keyEnd + 6] ?? 0) & 1) === 1;

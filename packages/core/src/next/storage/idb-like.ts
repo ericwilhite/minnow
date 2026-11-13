@@ -26,6 +26,7 @@
  * Bytes are stored as exact-size `ArrayBuffer`s, never Blobs (Firefox writes Blobs at 8 MB/s with
  * one fsync each) and never views (structured clone would copy the whole underlying buffer).
  */
+import { DURABLE_FORMATS, DurableFormatError } from "../durable-format.js";
 import { isLegacyIndexedDb, LegacyDataError, refuseLegacyIndexedDb } from "./legacy-data.js";
 import { StoreQuotaError } from "./contract.js";
 
@@ -86,7 +87,7 @@ export const IDB_STORES = [
   "spill",
   "spill-index",
 ] as const;
-export const IDB_VERSION = 2;
+export const IDB_VERSION = DURABLE_FORMATS.indexedDb.version;
 
 const errorName = (error: unknown): string =>
   typeof error === "object" && error !== null && "name" in error ? String(error.name) : "";
@@ -139,7 +140,10 @@ export async function openIndexedDb(factory: IDBFactory, name: string): Promise<
       if (!settled) {
         // A racing old writer at I3–I8 can reject the native v2 open before upgrade fires.
         if (errorName(cause) === "VersionError")
-          void refuseLegacyIndexedDb(factory, name).then(() => reject(cause), reject);
+          void refuseLegacyIndexedDb(factory, name).then(
+            () => reject(new DurableFormatError("Unknown native IndexedDB schema version")),
+            reject,
+          );
         else reject(cause);
       }
       settled = true;

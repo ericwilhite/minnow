@@ -38,12 +38,13 @@
  *   body loses at most the newest acknowledged group silently (older loss is detected); an
  *   in-order write-back loss may drop a suffix of groups, never reorder or invent one.
  */
+import { validLogHeaderEnvelope } from "../storage/durable-header.js";
+import { DURABLE_CODECS, DURABLE_FORMATS, requireHeader } from "../durable-format.js";
 import { xxHash32 } from "../hash/xxhash32.js";
-import { LOG_HEADER_SLOT_BYTES } from "../storage/contract.js";
 
-export const FRAME_MAGIC = 0x464c4e4d; // "MNLF"
-export const HEADER_MAGIC = 0x484c4e4d; // "MNLH"
-export const LOG_FORMAT_VERSION = 1;
+export const FRAME_MAGIC = DURABLE_FORMATS.logFrame.magic; // "MNLF"
+export const HEADER_MAGIC = DURABLE_FORMATS.logHeader.magic; // "MNLH"
+export const LOG_FORMAT_VERSION = DURABLE_FORMATS.logHeader.version;
 export const FRAME_HEADER_BYTES = 28;
 export const LOG_HEADER_BYTES = 52;
 /** Largest frame, envelope included; bigger transactions split into parts. */
@@ -59,7 +60,7 @@ export const MAX_FRAME_BODY_BYTES = MAX_FRAME_BYTES - 32;
 export const RECOVERY_SCAN_BYTES = MAX_FRAME_BYTES + FRAME_HEADER_BYTES;
 export const MAX_FRAME_PARTS = 0xffff;
 
-export const FrameKind = { commit: 1 } as const;
+export const FrameKind = DURABLE_CODECS.frame;
 export type FrameKind = (typeof FrameKind)[keyof typeof FrameKind];
 
 export class LogCorruptionError extends Error {
@@ -158,14 +159,10 @@ export function encodeLogHeader(header: LogHeader, into?: Uint8Array): Uint8Arra
   return bytes;
 }
 
-/** A slot's header, or null when it is empty, torn, unsafe, or from another format version. */
+/** Empty/torn slots return null; intact unsupported formats and reserved bits refuse. */
 export function decodeLogHeader(bytes: Uint8Array | null): LogHeader | null {
-  if (bytes === null || bytes.length < LOG_HEADER_BYTES || bytes.length > LOG_HEADER_SLOT_BYTES)
-    return null;
+  if (bytes === null || !validLogHeaderEnvelope(bytes, LogCorruptionError)) return null;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  if (view.getUint32(0, true) !== HEADER_MAGIC) return null;
-  if (view.getUint32(48, true) !== xxHash32(bytes, 0, 0, 48)) return null;
-  if (view.getUint32(4, true) !== LOG_FORMAT_VERSION) return null;
   const header = {
     salt: view.getUint32(8, true),
     generation: getU53(view, 12),
@@ -275,8 +272,7 @@ class LogScanState {
   frameLength(head: Uint8Array): number | null {
     if (head.length < FRAME_HEADER_BYTES) return null;
     const view = new DataView(head.buffer, head.byteOffset, FRAME_HEADER_BYTES);
-    if (view.getUint32(0, true) !== FRAME_MAGIC || view.getUint32(4, true) !== this.#salt)
-      return null;
+    if (view.getUint32(4, true) !== this.#salt) return null;
     const bodyLength = view.getUint32(16, true);
     return bodyLength > MAX_FRAME_BODY_BYTES ? null : frameLength(bodyLength);
   }
@@ -293,8 +289,11 @@ class LogScanState {
     const frameLsn = getU53(view, 8);
     const partIndex = view.getUint16(22, true);
     const partCount = view.getUint16(24, true);
-    if (frameLsn !== this.#lsn + 1 || bytes[20] !== FrameKind.commit) return null;
-    if (bytes[21] !== 0 || view.getUint16(26, true) !== 0) return null;
+    requireHeader("logFrame", bytes, LogCorruptionError);
+    if (frameLsn !== this.#lsn + 1) return null;
+    const bodyEnd = FRAME_HEADER_BYTES + view.getUint32(16, true);
+    for (let at = bodyEnd; at < length - 4; at++)
+      if (bytes[at] !== 0) throw new LogCorruptionError("Nonzero log frame padding");
     if (partCount < 1 || partIndex >= partCount) return null;
     const continues =
       partIndex === 0

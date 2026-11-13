@@ -16,21 +16,14 @@
  *     7 publishedRows varuint tableId, varuint schemaVersion, varuint transaction,
  *                     varuint rootSequence, varuint indexes, varuint indexId…
  */
+import { DURABLE_CODECS, DURABLE_FORMATS, requireTag } from "../durable-format.js";
 import type { BodyEffect, CommitFrameBody } from "../format/log-frame.js";
 import { LogCorruptionError } from "../format/log-frame.js";
 import { SMALL_COMMIT_BYTES } from "./commit-buffers.js";
 import { ByteReader, ByteWriter } from "./bytes.js";
 
-const VERSION = 1;
-const KIND = {
-  createTable: 1,
-  alterTable: 2,
-  dropTable: 3,
-  catalog: 4,
-  sequence: 5,
-  rows: 6,
-  publishedRows: 7,
-} as const;
+const VERSION = DURABLE_FORMATS.commitBody.version;
+const KIND = DURABLE_CODECS.effect;
 
 /**
  * Encodes a commit body. Into a given `into` writer the result is a view of its bytes, valid until
@@ -122,7 +115,7 @@ export function decodeBody(bytes: Uint8Array): CommitFrameBody {
     const reader = new ByteReader(bytes);
     if (reader.u8() !== VERSION) throw new LogCorruptionError("Unknown commit body version");
     let request: CommitFrameBody["request"] = null;
-    if (reader.u8() === 1) {
+    if (readFlag(reader)) {
       const clientId = reader.blob().slice();
       const sequence = reader.varuint();
       const sentAtMs = reader.f64();
@@ -138,6 +131,12 @@ export function decodeBody(bytes: Uint8Array): CommitFrameBody {
     if (error instanceof LogCorruptionError) throw error;
     throw new LogCorruptionError(`A commit body is malformed: ${String(error)}`);
   }
+}
+
+function readFlag(reader: ByteReader): boolean {
+  const value = reader.u8();
+  requireTag(value, DURABLE_CODECS.boolean, "commit flag", LogCorruptionError);
+  return value === 1;
 }
 
 function decodeEffect(reader: ByteReader): BodyEffect {
@@ -162,7 +161,7 @@ function decodeEffect(reader: ByteReader): BodyEffect {
       const tableId = reader.varuint();
       const schemaVersion = reader.varuint();
       let inserts: Extract<BodyEffect, { kind: "rows" }>["inserts"] = null;
-      if (reader.u8() === 1) {
+      if (readFlag(reader)) {
         const firstRowId = reader.varuint();
         const rowCount = reader.varuint();
         const columnCount = reader.varuint();
@@ -170,7 +169,7 @@ function decodeEffect(reader: ByteReader): BodyEffect {
         inserts = { firstRowId, rowCount, columns };
       }
       let deletes: Extract<BodyEffect, { kind: "rows" }>["deletes"] = null;
-      if (reader.u8() === 1) {
+      if (readFlag(reader)) {
         const n = reader.varuint();
         const rowIds = reader.f64Array(n);
         const keys = Array.from({ length: n }, () => {

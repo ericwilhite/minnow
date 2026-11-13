@@ -156,8 +156,24 @@ it("keeps replaced tails charged through settlement and closes only after draini
   const database: IdbDatabaseLike = {
     close: () => undefined,
     async transaction(stores, mode, durability, body) {
-      await inner.transaction(stores, mode, durability, body);
-      if (mode === "readwrite" && stores.includes("roots")) {
+      const publication = { writes: 0 };
+      await inner.transaction(stores, mode, durability, (tx) =>
+        body({
+          abort: (error) => tx.abort(error),
+          store: (name) => {
+            const store = tx.store(name);
+            return {
+              ...store,
+              put: (key, value) => {
+                if (name === "roots") publication.writes++;
+                store.put(key, value);
+              },
+            };
+          },
+        }),
+      );
+      // Acquisition reads roots to validate the pre-fence version barrier; only hold a publication.
+      if (publication.writes > 0) {
         entered();
         await gate;
       }

@@ -56,14 +56,15 @@
  * writer puts up to 7 zero bytes before it), so pages read together into one buffer are viewed
  * in place.
  */
+import { DURABLE_CODECS, DURABLE_FORMATS, PAGE_CODEC } from "../durable-format.js";
 import type { PhysicalType } from "../types.js";
 
-export const PAGE_FORMAT_VERSION = 1;
+export const PAGE_FORMAT_VERSION = DURABLE_FORMATS.page.version;
 export const PAGE_HEADER_BYTES = 16;
 /** Rows per delta block: a delta page restarts its prefix sum every this many rows. */
-export const DELTA_BLOCK = 128;
+export const DELTA_BLOCK = PAGE_CODEC.deltaRows;
 /** The largest exponent of a `scaledFloat` page (10^15 is exact; integers stay safe). */
-export const SCALED_FLOAT_MAX_EXPONENT = 15;
+export const SCALED_FLOAT_MAX_EXPONENT = PAGE_CODEC.scaledFloatMaxExponent;
 /**
  * The one validity rule of a `scaledFloat` page's integers, shared by writer and reader (review
  * B2-p2i #1): the base and base + the largest stored delta are safe integers, so every row's
@@ -73,45 +74,16 @@ export function scaledFloatSafe(base: number, maxDelta: number): boolean {
   return Number.isSafeInteger(base) && Number.isSafeInteger(base + maxDelta);
 }
 /** Text and bytes statistics keep at most this many bytes of a bound. */
-export const STAT_PREFIX_BYTES = 32;
+export const STAT_PREFIX_BYTES = PAGE_CODEC.statPrefixBytes;
 
 /** The stored value family of a page or chunk. */
-export const ValueTag = {
-  bool: 1,
-  i32: 2,
-  i64: 3,
-  f64: 4,
-  f32: 5,
-  varlen: 6,
-  fixed16: 7,
-  interval: 8,
-  /** Decimal coefficients in the int64 tier (also the chunk tag of every decimal chunk). */
-  dec64: 9,
-  /** Decimal coefficients as 128-bit limbs. */
-  dec128: 10,
-} as const;
+export const ValueTag = DURABLE_CODECS.value;
 export type ValueTagValue = (typeof ValueTag)[keyof typeof ValueTag];
 
-export const PageFlag = {
-  validity: 1,
-  allNull: 2,
-  delta: 4,
-  specials: 8,
-  /** Every valid int64-family value is within ±(2^53 − 1): decodable into the f64 fast path. */
-  safe: 16,
-  /** Decimal page of a mixed-scale chunk: a u16 scale per row (a section after the specials). */
-  scales: 32,
-  /** Decimal page of a mixed-scale chunk whose valid rows share one scale: it is `aux`. */
-  uniformScale: 64,
-  /**
-   * Plain varlen page with out-of-line values (large-value.ts): a bitmap section marks the rows
-   * whose slot holds a large-value pointer instead of the value.
-   */
-  large: 128,
-} as const;
+export const PageFlag = DURABLE_CODECS.pageFlag;
 
 /** The directory's scale field of a mixed-scale decimal chunk (each page carries its scales). */
-export const MIXED_SCALE = 0xffff_ffff;
+export const MIXED_SCALE = PAGE_CODEC.mixedScale;
 
 /** Stored bytes that cannot be what the writer wrote: checksum, structure or range failures. */
 export class PageCorruptionError extends Error {

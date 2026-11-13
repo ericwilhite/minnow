@@ -4,6 +4,7 @@
  * check failure is `StoreCorruptionError`: these bytes came from storage after a checksum passed,
  * so a structural mismatch is a format or software bug, never data.
  */
+import { DURABLE_CODECS, requireTag } from "../durable-format.js";
 import { StoreCorruptionError } from "../storage/contract.js";
 import { SMALL_COMMIT_BYTES, StreamCommit, type BufferAllocator } from "./commit-buffers.js";
 
@@ -386,7 +387,15 @@ export function decodeJson(bytes: Uint8Array): unknown {
     return JSON.parse(decoder.decode(bytes), (_key, item: unknown) => {
       if (typeof item === "object" && item !== null) {
         if ("$bigint" in item && typeof item.$bigint === "string") return BigInt(item.$bigint);
-        if ("$number" in item && typeof item.$number === "string") return Number(item.$number);
+        if ("$number" in item && typeof item.$number === "string") {
+          requireTag(
+            item.$number,
+            DURABLE_CODECS.jsonNumber,
+            "stored JSON number tag",
+            StoreCorruptionError,
+          );
+          return Number(item.$number);
+        }
         if ("$bytes" in item && Array.isArray(item.$bytes))
           return Uint8Array.from(item.$bytes as number[]);
       }

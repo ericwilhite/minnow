@@ -11,6 +11,8 @@
  *   reuses nothing a durable structure names, because nothing durable named it).
  * - `version` is assigned by the caller from a write-path-wide counter that never goes back.
  */
+import { DURABLE_CODECS, requireTag } from "../durable-format.js";
+import { StoreCorruptionError } from "../storage/contract.js";
 import type { BufferAllocator } from "./commit-buffers.js";
 import {
   CatalogChangeError,
@@ -581,7 +583,14 @@ export class Catalog implements CatalogView {
   }
 
   static decode(bytes: Uint8Array): Catalog {
-    return new Catalog(decodeJson(bytes) as CatalogData);
+    try {
+      const data = decodeJson(bytes) as CatalogData;
+      for (const table of data.tables) validateStoredTable(table);
+      return new Catalog(data);
+    } catch (error) {
+      if (error instanceof StoreCorruptionError) throw error;
+      throw new StoreCorruptionError(`A stored catalog is malformed: ${String(error)}`);
+    }
   }
 }
 
@@ -615,6 +624,140 @@ export function encodeLogged(change: LoggedChange, allocator?: BufferAllocator):
   return encodeJson(change, allocator);
 }
 
+function validateStoredType(type: PhysicalType, depth = 0): void {
+  if (depth > 8) throw new StoreCorruptionError("Stored array type nesting exceeds its cap");
+  requireTag(type.kind, DURABLE_CODECS.physical, "stored physical type", StoreCorruptionError);
+  if (type.kind === "array") validateStoredType(type.element, depth + 1);
+  if (type.kind === "int32")
+    requireTag(type.bits, DURABLE_CODECS.int32Bits, "stored integer width", StoreCorruptionError);
+  if (type.kind === "json")
+    requireTag(type.binary, DURABLE_CODECS.jsonBoolean, "stored JSON mode", StoreCorruptionError);
+  if (type.kind === "timestamp")
+    requireTag(
+      type.zoned,
+      DURABLE_CODECS.jsonBoolean,
+      "stored timestamp mode",
+      StoreCorruptionError,
+    );
+}
+function validateStoredIndex(index: IndexDef): void {
+  requireTag(index.unique, DURABLE_CODECS.jsonBoolean, "stored unique flag", StoreCorruptionError);
+  requireTag(index.kind, DURABLE_CODECS.indexKind, "stored index kind", StoreCorruptionError);
+  requireTag(index.role, DURABLE_CODECS.indexRole, "stored index role", StoreCorruptionError);
+}
+function validateStoredTable(table: TableDef): void {
+  for (const column of table.columns) {
+    validateStoredType(column.type);
+    requireTag(
+      column.nullable,
+      DURABLE_CODECS.jsonBoolean,
+      "stored nullable flag",
+      StoreCorruptionError,
+    );
+    // Wire discriminator validation only; physicalTypeOf remains the sole SQL-type mapping.
+    requireTag(
+      column.declared.type,
+      DURABLE_CODECS.simpleSql,
+      "stored SQL type",
+      StoreCorruptionError,
+    );
+    if (column.declared.sqlDomain !== undefined)
+      requireTag(
+        column.declared.sqlDomain.kind,
+        DURABLE_CODECS.sqlDomain,
+        "stored SQL domain",
+        StoreCorruptionError,
+      );
+    if (column.declared.integer !== undefined)
+      requireTag(
+        column.declared.integer,
+        DURABLE_CODECS.presentFlag,
+        "stored integer flag",
+        StoreCorruptionError,
+      );
+    if (column.declared.withoutTimeZone !== undefined)
+      requireTag(
+        column.declared.withoutTimeZone,
+        DURABLE_CODECS.presentFlag,
+        "stored timezone flag",
+        StoreCorruptionError,
+      );
+    if (column.declared.declaredLength !== undefined)
+      requireTag(
+        column.declared.declaredLength.fixed,
+        DURABLE_CODECS.jsonBoolean,
+        "stored fixed-width flag",
+        StoreCorruptionError,
+      );
+    const missing = column.missing;
+    if (missing !== null) {
+      requireTag(
+        missing.form,
+        DURABLE_CODECS.vectorForm,
+        "stored missing vector form",
+        StoreCorruptionError,
+      );
+      validateStoredType(missing.type);
+      requireTag(
+        missing.data.layout,
+        DURABLE_CODECS.columnLayout,
+        "stored missing layout",
+        StoreCorruptionError,
+      );
+      if (missing.data.layout === "int64")
+        requireTag(
+          missing.data.values.repr,
+          DURABLE_CODECS.vectorIntegerRepr,
+          "stored integer representation",
+          StoreCorruptionError,
+        );
+      if (missing.data.layout === "decimal")
+        requireTag(
+          missing.data.coefficients.repr,
+          DURABLE_CODECS.vectorDecimalRepr,
+          "stored coefficient representation",
+          StoreCorruptionError,
+        );
+      if (missing.data.layout === "interval")
+        requireTag(
+          missing.data.micros.repr,
+          DURABLE_CODECS.vectorIntegerRepr,
+          "stored interval representation",
+          StoreCorruptionError,
+        );
+    }
+  }
+  for (const index of table.indexes) validateStoredIndex(index);
+  for (const foreignKey of table.foreignKeys) {
+    requireTag(
+      foreignKey.enforced,
+      DURABLE_CODECS.jsonBoolean,
+      "stored foreign-key enforcement flag",
+      StoreCorruptionError,
+    );
+    requireTag(
+      foreignKey.onDelete,
+      DURABLE_CODECS.foreignKeyAction,
+      "stored foreign-key action",
+      StoreCorruptionError,
+    );
+  }
+}
+
 export function decodeLogged(bytes: Uint8Array): LoggedChange {
-  return decodeJson(bytes) as LoggedChange;
+  try {
+    const value = decodeJson(bytes) as LoggedChange;
+    requireTag(
+      value.op,
+      DURABLE_CODECS.catalogOperation,
+      "catalog operation",
+      StoreCorruptionError,
+    );
+    if (value.op === "createTable") validateStoredTable(value.table);
+    if (value.op === "createIndex") validateStoredIndex(value.index);
+    return value;
+  } catch (error) {
+    if (error instanceof StoreCorruptionError) throw error;
+    throw new StoreCorruptionError(`A logged catalog change is malformed: ${String(error)}`);
+  }
 }

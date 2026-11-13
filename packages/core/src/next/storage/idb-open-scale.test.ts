@@ -59,11 +59,13 @@ it.each([0, 1, 129, 8193, 32769])(
     );
     raw.close();
     const requests: string[] = [];
+    const roots: string[] = [];
     const values: unknown[] = [];
     const observe = (name: string, method: string, then: (value: unknown) => void) => {
-      if (name !== "meta") requests.push(`${name}.${method}`);
+      if (name === "roots") roots.push(`${name}.${method}`);
+      else if (name !== "meta") requests.push(`${name}.${method}`);
       return (value: unknown) => {
-        if (name !== "meta" && value !== undefined) {
+        if (name !== "meta" && name !== "roots" && value !== undefined) {
           const found: unknown[] = Array.isArray(value) ? value : [value];
           values.push(...found);
         }
@@ -106,6 +108,8 @@ it.each([0, 1, 129, 8193, 32769])(
       expect(await session.dataLength()).toBe(Math.max(0, (records - 1) * 4096 + 8));
       expect(session.logLength()).toBe(Math.max(0, (records - 1) * 4096 + 8));
       // Count point requests too: a loop of get()/last() must fail just like bulk enumeration.
+      // Fixed pre-fence version checks are independent of data/log record count.
+      expect(roots).toEqual(["roots.get", "roots.get"]);
       expect(requests.length).toBeLessThanOrEqual(2);
       expect(values.length).toBeLessThanOrEqual(2);
       for (const value of values)

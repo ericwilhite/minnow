@@ -15,6 +15,7 @@
  * nulls (`RangeError` otherwise: the caller sizes and allocates from the directory statistics).
  * An int64-family target in the `safe` representation is allowed only for pages flagged safe.
  */
+import { requireHeader } from "../durable-format.js";
 import type { PageEntry } from "../format/manifest.js";
 import { PageEncoding } from "../format/manifest.js";
 import type { FlatVector, Int64Values, Validity, VectorData } from "../vector/vector.js";
@@ -168,6 +169,11 @@ export function checkDictionaryCodes(view: PageView, size: number): void {
   check(view.aux < size, "Dictionary code outside the dictionary");
 }
 
+/** Every alignment hole is canonical zero; no payload bytes are inspected by this helper. */
+function zeroPadding(bytes: Uint8Array, start: number, end: number): void {
+  for (let at = start; at < end; at++) check(bytes[at] === 0, "Nonzero page alignment padding");
+}
+
 /**
  * `dictionarySize`: the chunk's dictionary entries (its directory's dictionary page), checked
  * against a dictionary page's codes (`checkDictionaryCodes`); omitted, the caller checks before
@@ -182,6 +188,7 @@ export function parsePage(
 ): PageView {
   const bytes = aligned(stored);
   check(bytes.length >= PAGE_HEADER_BYTES, "Page is shorter than its header");
+  requireHeader("page", bytes, PageCorruptionError);
   const kind = bytes[0] ?? 0;
   const tag = bytes[1] ?? 0;
   const flags = bytes[2] ?? 0;
@@ -243,6 +250,7 @@ export function parsePage(
     check(rest === 0 || (validity[count - 1] ?? 0) >>> rest === 0, "Validity bits past the page");
     nullCount = rows - countBits(validity, rows);
     check(nullCount > 0 && nullCount < rows, "Partly-null page without a partial validity");
+    zeroPadding(bytes, at + count * 4, at + align8(count * 4));
     at += align8(count * 4);
   }
   check(nullCount === entry.nullCount, "Page null count differs from its directory entry");
@@ -251,6 +259,7 @@ export function parsePage(
     check(bytes.length >= at + rows, "Page specials are truncated");
     specials = bytes.subarray(at, at + rows);
     for (let row = 0; row < rows; row++) check((specials[row] ?? 0) <= 3, "Bad decimal special");
+    zeroPadding(bytes, at + rows, at + align8(rows));
     at += align8(rows);
   }
   let scales: Uint16Array | null = null;
@@ -259,6 +268,7 @@ export function parsePage(
     scales = new Uint16Array(bytes.buffer, bytes.byteOffset + at, rows);
     for (let row = 0; row < rows; row++)
       check((scales[row] ?? 0) <= NUMERIC_MAX_SCALE, "Decimal scale out of range");
+    zeroPadding(bytes, at + rows * 2, at + align8(rows * 2));
     at += align8(rows * 2);
   }
   let large: Uint32Array | null = null;
@@ -273,6 +283,7 @@ export function parsePage(
         validity === null || ((large[word] ?? 0) & ~(validity[word] ?? 0)) === 0,
         "A null row is marked large",
       );
+    zeroPadding(bytes, at + count * 4, at + align8(count * 4));
     at += align8(count * 4);
   }
   const start = at;
@@ -293,6 +304,7 @@ export function parsePage(
   switch (kind) {
     case PageEncoding.constant: {
       if (allNull) break;
+      if (tag === ValueTag.bool) check((bytes[start] ?? 2) <= 1, "Unknown stored boolean value");
       if (tag === ValueTag.varlen) {
         check(width === 0, "Bad constant varlen width");
         length = start + aux;
@@ -314,6 +326,7 @@ export function parsePage(
       if (tag === ValueTag.varlen) {
         check(width === 2 || width === 4, "Bad varlen offset width");
         const offsetBytes = align8((rows + 1) * width);
+        zeroPadding(bytes, start + (rows + 1) * width, start + offsetBytes);
         length = start + offsetBytes + aux;
         fits(length);
         const offsets =
@@ -348,6 +361,8 @@ export function parsePage(
       check(width === plainWidth(tag) && width > 0, "Bad plain width");
       if (tag === ValueTag.interval) {
         const lane = align8(rows * 4);
+        zeroPadding(bytes, start + rows * 4, start + lane);
+        zeroPadding(bytes, start + lane + rows * 4, start + lane * 2);
         length = start + lane * 2 + rows * 8;
       } else length = start + rows * width;
       fits(length);
@@ -364,6 +379,10 @@ export function parsePage(
       length = start + validityBytes(rows);
       fits(length);
       plain = new Uint32Array(buffer, offset + start, (rows + 31) >>> 5);
+      check(
+        (rows & 31) === 0 || (plain[plain.length - 1] ?? 0) >>> (rows & 31) === 0,
+        "Nonzero boolean bitmap padding",
+      );
       break;
     }
     case PageEncoding.frameOfReference: {
@@ -425,6 +444,7 @@ export function parsePage(
       const deltasAt = start + 8;
       const deltaBytes = align8(rows * width);
       fits(deltasAt + deltaBytes + 8);
+      zeroPadding(bytes, deltasAt + rows * width, deltasAt + deltaBytes);
       // The writer's own rule (format.ts `scaledFloatSafe`) on the stored deltas, not on what
       // the width could hold (review B2-p2i #1).
       if (width > 0) unsigned = unsignedView(buffer, offset + deltasAt, width, rows);
@@ -442,6 +462,7 @@ export function parsePage(
       check(counts[1] === 0 && count <= rows, "Bad scaled-float patch count");
       const positionsAt = deltasAt + deltaBytes + 8;
       const valuesAt = positionsAt + align8(count * 4);
+      zeroPadding(bytes, positionsAt + count * 4, valuesAt);
       length = valuesAt + count * 8;
       fits(length);
       patches = new Uint32Array(buffer, offset + positionsAt, count);
