@@ -2272,7 +2272,7 @@ reserving space for 65,536 wide rows when the group contains only a few. The hin
 codec decision or page boundary. `page/known-rows.test.ts` compares native page and tail bytes
 with the ordinary estimator; the integration campaign refuses exaggerated reservations
 before a memory store could allocate a multi-gigabyte buffer.
-`write/wide-row-recycle.test.ts` also exercises the ordinary native flush with 1, 4, 6 or 8 JSONB
+`testing/wide-row-recycle.test.ts` also exercises the ordinary native flush with 1, 4, 6 or 8 JSONB
 columns, values on both sides of the 64 KiB large-value boundary, and explicit validity
 bitmaps. It checks complete append progress, bounded reservations before storage allocation,
 charged encoder scratch and cleanup, then compares every native value before and after

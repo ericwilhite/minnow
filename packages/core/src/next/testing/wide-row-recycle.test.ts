@@ -5,13 +5,13 @@ import fc from "fast-check";
 import { afterAll, expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, WIDE_ROW_RECYCLE_STATES } from "../../testing/reach.js";
-import { StorageCore } from "../testing/storage-core.js";
+import { StorageCore } from "./storage-core.js";
 import { Governor, type Grant } from "../memory/governor.js";
 import { GroupWriter } from "../page/writer.js";
 import { ChunkReader } from "../page/reader.js";
 import { defined, targetFor, valueAt, vectorOf } from "../page/test-support.js";
 import type { FlatVector } from "../vector/vector.js";
-import { need } from "./bytes.js";
+import { need } from "../write/bytes.js";
 
 const reach = createReach("native wide-row recycle progress", WIDE_ROW_RECYCLE_STATES);
 afterAll(() => reach.assertReached());
