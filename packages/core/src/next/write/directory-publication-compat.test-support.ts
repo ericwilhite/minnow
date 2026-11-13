@@ -4,13 +4,13 @@
  * The campaign's histories are split across directory-publication-compat-1..4.test.ts so parallel
  * runners can share them; each file runs one slot of the seeds (both builds) and one transition's
  * competing-open and damage cases. Each records what it reached (testing/reach-union.ts), and
- * directory-publication-compat.reach.test.ts asserts the union against the declared reach. Every
+ * directory-publication-compat.reach.test.ts asserts the union against the declared reach. The
+ * part files create the reach and draw the seeds (testing/directory-compat-seeds.test-support.ts):
+ * next/ modules other than tests use the old code only as types (dependency-rules.test.ts). Every
  * seed, build, transition and edge runs exactly as the single file ran it. */
 import { deepStrictEqual } from "node:assert/strict";
 import { beforeAll, afterAll, expect, it } from "vitest";
-import { createReach, DIRECTORY_TRANSITION_REACH } from "../../testing/reach.js";
-import { recordReach } from "../../testing/reach-union.js";
-import { seedsFor } from "../../testing/seeds.js";
+import type { DIRECTORY_TRANSITION_REACH, Reach } from "../../testing/reach.js";
 import { SimLocks, SimulatedCrash } from "../storage/sim-disk.js";
 import { openDirectory, type DirectoryDb } from "./directory-compat-api.js";
 import { DirectoryFiles, simulatedImage, type DirectoryImage } from "./directory-fixture-files.js";
@@ -21,8 +21,8 @@ import { yieldTask } from "./merge.js";
 
 /** How many files the campaign is split across. */
 export const PARTS = 4;
-const SEEDS = seedsFor("next-directory-publication-compat", [28011, 28012, 28013, 28014]);
-const reach = createReach("next-directory-transition", DIRECTORY_TRANSITION_REACH);
+/** The campaign's reach, as this file's part recorded it. */
+let reach: Reach<(typeof DIRECTORY_TRANSITION_REACH)[number]>;
 const transitions = ["packed normalization", "full carry", "partial edit", "shared carry"] as const;
 const edges = [
   "page written",
@@ -37,16 +37,20 @@ const range = (n: number) => Array.from({ length: n }, (_, k) => k);
 let old: Awaited<ReturnType<typeof directoryPeer>>;
 let images: Record<Transition, DirectoryImage>;
 /**
- * Defines part `part` (1..PARTS) of the campaign in the calling test file (`fileUrl` is its
- * `import.meta.url`): the shared fixtures, its slot of the seeds for both builds, and the
- * competing-open and damage cases of its transition.
+ * Defines part `part` (1..PARTS) of the campaign in the calling test file: the shared fixtures,
+ * its slot of `seeds` (the campaign's whole list) for both builds, and the competing-open and
+ * damage cases of its transition, all reaching into `recorded` (the file's recorded reach).
  */
-export function directoryCompatPart(part: number, fileUrl: string): void {
-  recordReach("next-directory-transition", reach, fileUrl);
+export function directoryCompatPart(
+  part: number,
+  recorded: Reach<(typeof DIRECTORY_TRANSITION_REACH)[number]>,
+  seeds: readonly number[],
+): void {
+  reach = recorded;
   useFixtures();
   const transition = transitions[part - 1];
   if (transition === undefined) throw new Error(`no part ${String(part)} of ${String(PARTS)}`);
-  for (const seed of SEEDS.filter((_, i) => i % PARTS === part - 1)) interruptionCases(seed);
+  for (const seed of seeds.filter((_, i) => i % PARTS === part - 1)) interruptionCases(seed);
   competingOpenCases(transition);
   damageCases(transition);
 }

@@ -15,4 +15,3 @@ export const REACH_UNIONS = {
     union: "packages/core/src/next/write/directory-publication-compat.reach.test.ts",
   },
 } as const satisfies Record<string, { files: readonly string[]; union: string }>;
-

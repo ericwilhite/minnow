@@ -105,6 +105,7 @@ export default defineConfig({
         "packages/core/src/next/write/directory-publication-compat.test-support.ts",
         "packages/core/src/testing/reach-union.ts",
         "packages/core/src/testing/reach-unions.ts",
+        "packages/core/src/testing/directory-compat-seeds.test-support.ts",
       ],
       /**
        * A ratchet, not a target. Each floor sits just under what the suite measured when it was
