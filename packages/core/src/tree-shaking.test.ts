@@ -49,8 +49,12 @@ const SQL_ENGINE_MODULES =
 // Raise raw once by 256 bytes; gzip and every isolation assertion still fit.
 // Native JSON call provenance over d0562725: 1,174,365 raw / 351,800 gzip (+618 / +193).
 // Raise raw once by 768 and gzip by 128; private rebuild/test inputs remain unreachable.
-const COMPLETE_ENTRY_RAW_BUDGET = 1147 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 343.625 * 1024;
+// Native JSON aggregate/record provenance: 1,175,197 raw / 352,090 gzip bytes.
+// Raise raw once by 1,024 and gzip by 256; private rebuild/test inputs stay excluded.
+// Reviewed field identity/provenance: 1,176,394 raw / 352,610 gzip (+1,197 / +520).
+// Raise raw once by 1,280 and gzip by 640; all added bytes are shared parser/optimizer.
+const COMPLETE_ENTRY_RAW_BUDGET = 1149.25 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 344.5 * 1024;
 // The engine with the larger durable adapter, OPFS.
 // JSON_TABLE metadata: 1,585,069 raw / 458,168 gzip bytes; counterfactual
 // 1,584,618 / 458,049 (+451 / +119). Raw cap +512 once, gzip cap unchanged.
@@ -61,8 +65,11 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 343.625 * 1024;
 // Raise raw once by 256 and gzip by 128; no private rebuild/test input is reachable.
 // Native JSON call provenance: 1,586,775 raw / 458,753 gzip (+618 / +211).
 // Raise raw once by 768 and gzip by 256; isolation assertions stay unchanged.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1549.75 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 448.125 * 1024;
+// Aggregate/record provenance: 1,587,607 raw / 459,089 gzip. Raw +1,024, gzip +256 once.
+// Reviewed record identity: 1,588,804 raw / 459,592 gzip (+1,197 / +503).
+// Raise raw once by 1,280 and gzip by 640; private rebuild/test inputs remain excluded.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1552 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 449 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does.
 // JSON_TABLE metadata: 1,581,102 raw / 455,735 gzip bytes; counterfactual
@@ -73,8 +80,12 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 448.125 * 1024;
 // Raise raw once by 512 and gzip by 256; worker/client isolation stays.
 // Native JSON call provenance: 1,582,808 raw / 456,328 gzip (+618 / +174).
 // Raise raw once by 512 and gzip by 256; the client entry changes by zero bytes.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1545.75 * 1024;
-const INDEXEDDB_WORKER_GZIP_BUDGET = 445.75 * 1024;
+// Aggregate/record provenance: 1,583,642 raw / 456,615 gzip. Raw +1,024, gzip +256 once.
+// The standalone client is byte-identical; isolation assertions stay unchanged.
+// Reviewed record identity: 1,584,839 raw / 457,039 gzip (+1,197 / +424).
+// Raise raw once by 1,280 and gzip by 512; standalone client and isolation checks stay.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1548 * 1024;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 446.5 * 1024;
 // What a page that hosts the engine in a worker ships on the main thread: the client, the schema
 // DSL and error classes, the Kysely dialect and live queries, and the React hooks, with `kysely`
 // and `react` left to the application. 105.9 KiB raw / 31.6 KiB gzip.

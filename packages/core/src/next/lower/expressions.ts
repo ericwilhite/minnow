@@ -1,4 +1,4 @@
-import { jsonCallSource } from "../../engine/json-call-sources.js";
+import { jsonCallSource, rowFieldSource, rowObjectSource } from "../../engine/json-call-sources.js";
 import { isDatePart } from "../../engine/date-part-sources.js";
 /**
  * Front-end expressions (plan/model.ts `Expression`, `Predicate`) to typed IR scalar
@@ -57,6 +57,10 @@ export type SubqueryRequest =
 export interface Scope {
   /** A column reference as the front end writes it (`a`, `t.a`), or undefined if unknown. */
   column(reference: string): Typed | undefined;
+  /** Presence of a whole row, distinct from an actual row whose fields are all NULL. */
+  rowPresence?(qualifier: string): Typed;
+  /** Exact source identity and declaration ordinal, independent of printed dotted names. */
+  rowField?(qualifier: string, ordinal: number): Typed | undefined;
   /**
    * Whether `qualifier` names a FROM entry here or in an enclosing query, so an unknown `t.a`
    * is "missing FROM-clause entry" (42P01) rather than an unknown column. Absent: cannot tell.
@@ -637,6 +641,62 @@ export function lowerCondition(
   }
 }
 
+/** A record is rendered only in a JSON consumer; bare record output remains unsupported. */
+export function lowerJsonValue(
+  expression: Expression,
+  scope: Scope,
+  state: ExpressionState,
+): Collated {
+  if (expression.kind === "column") {
+    const field = rowFieldSource(expression);
+    if (field !== undefined) {
+      const value = scope.rowField?.(field.qualifier, field.ordinal);
+      if (value !== undefined) return value;
+    }
+    const value = scope.column(expression.reference);
+    if (value?.record) return value;
+  }
+
+  if (
+    expression.kind === "call" &&
+    ["ROW_OBJECT", "ROW_VALUE"].includes(jsonCallSource(expression) ?? "")
+  )
+    return lowerJsonRecord(expression, scope, state, { kind: "literal", value: false });
+  return lowerExpression(expression, scope, state);
+}
+
+function lowerJsonRecord(
+  expression: Extract<Expression, { kind: "call" }>,
+  scope: Scope,
+  state: ExpressionState,
+  pretty: Expression,
+): Collated {
+  const field = expression.arguments[1];
+  const presence =
+    jsonCallSource(expression) === "ROW_OBJECT" && field?.kind === "column"
+      ? (scope.rowPresence?.(
+          rowObjectSource(expression) ?? field.reference.slice(0, field.reference.indexOf(".")),
+        ) ?? {
+          expr: boolLiteral(true),
+          nullable: false,
+          big: false,
+        })
+      : { expr: boolLiteral(true), nullable: false, big: false };
+  return {
+    ...callFunction(
+      "json_record",
+      [
+        presence,
+        coerce(lowerExpression(pretty, scope, state), BOOL, "implicit", state.parameters),
+        ...expression.arguments.map((arg) => lowerJsonValue(arg, scope, state)),
+      ],
+      state,
+      true,
+    ),
+    record: true,
+  };
+}
+
 function lowerCall(
   expression: Extract<Expression, { kind: "call" }>,
   scope: Scope,
@@ -649,7 +709,62 @@ function lowerCall(
     case "JSON_ARRAY":
     case "TO_JSON": {
       const source = jsonCallSource(expression) ?? name;
-      if (source === "ROW_TO_JSON" || source === "ROW_OBJECT" || source === "JSON_OBJECT_ARRAY")
+      if (source === "ROW_TO_JSON") {
+        const first = args[0];
+        if (
+          (args.length === 1 || args.length === 2) &&
+          first?.kind === "call" &&
+          ["ROW_OBJECT", "ROW_VALUE"].includes(jsonCallSource(first) ?? "")
+        ) {
+          const { record: ignored, ...rendered } = lowerJsonRecord(
+            first,
+            scope,
+            state,
+            args[1] ?? { kind: "literal", value: false },
+          );
+          void ignored;
+          return rendered;
+        }
+        if (first && (args.length === 1 || args.length === 2)) {
+          const value =
+            first.kind === "literal" && first.value === null
+              ? coerce(
+                  lowerExpression(first, scope, state),
+                  { kind: "json", binary: false },
+                  "implicit",
+                  state.parameters,
+                )
+              : lowerJsonValue(first, scope, state);
+          if (value.record || (first.kind === "literal" && first.value === null))
+            return callFunction(
+              "json_record_value",
+              [
+                value,
+                coerce(
+                  lowerExpression(args[1] ?? { kind: "literal", value: false }, scope, state),
+                  BOOL,
+                  "implicit",
+                  state.parameters,
+                ),
+              ],
+              state,
+              true,
+            );
+        }
+        throw new PlanningError("function row_to_json does not exist for these types", "42883");
+      }
+      if (
+        name === "TO_JSON" &&
+        args[0]?.kind === "call" &&
+        ["ROW_OBJECT", "ROW_VALUE"].includes(jsonCallSource(args[0]) ?? "")
+      ) {
+        const record = lowerJsonRecord(args[0], scope, state, { kind: "literal", value: false });
+        if (source === "TO_JSONB") return callFunction("to_jsonb", [record], state);
+        const { record: ignored, ...rendered } = record;
+        void ignored;
+        return rendered;
+      }
+      if (source === "ROW_OBJECT" || source === "ROW_VALUE" || source === "JSON_OBJECT_ARRAY")
         throw unsupported("function", source.toLowerCase());
       const fn =
         name === "JSON_OBJECT"
@@ -667,7 +782,7 @@ function lowerCall(
         throw new PlanningError("argument list must have even number of elements", "22023");
       return callFunction(
         fn,
-        args.map((arg) => lowerExpression(arg, scope, state)),
+        args.map((arg) => lowerJsonValue(arg, scope, state)),
         state,
         name === "TO_JSON" ? undefined : false,
       );
@@ -833,7 +948,12 @@ export function lowerExpression(
       };
     }
     case "column": {
-      const resolved = scope.column(expression.reference);
+      const field = rowFieldSource(expression);
+      const resolved =
+        (field === undefined ? undefined : scope.rowField?.(field.qualifier, field.ordinal)) ??
+        scope.column(expression.reference);
+      if (resolved?.record)
+        throw unsupported("function", "composite value outside a JSON consumer");
       if (resolved !== undefined) return resolved;
       const dot = expression.reference.indexOf(".");
       const qualifier = dot === -1 ? null : expression.reference.slice(0, dot);

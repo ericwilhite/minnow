@@ -4749,3 +4749,287 @@ export const WINDOW_PEER_PRESSURE_REACH = [
   "all credit occupied",
   "unpressured",
 ] as const;
+
+export const JSON_AGGREGATE_REACH = [
+  "object aggregation",
+  "array aggregation",
+  "JSON",
+  "JSONB",
+  "ascending",
+  "descending",
+  "empty input",
+  "all NULL values",
+  "omit NULL values",
+  "duplicate object keys",
+  "unique object keys",
+  "exact text",
+  "UTF8 key order",
+] as const;
+
+export const JSON_AGGREGATE_CAP_REACH = [
+  "exact cap divided by two succeeds",
+  "first byte above boundary refuses",
+  "JSON",
+  "JSONB",
+  "small inputs large aggregate",
+  "zero resources",
+] as const;
+
+export const JSON_AGGREGATE_PRESSURE_REACH = JSON_CONSTRUCT_PRESSURE_REACH;
+
+export const JSON_AGGREGATE_TYPED_REACH = [
+  "int4",
+  "numeric",
+  "float4",
+  "float8",
+  "json",
+  "jsonb",
+  "descending",
+  "ascending",
+  "FILTER",
+  "empty group",
+  "ordinary siblings",
+  "exact text",
+  "DISTINCT typed scalar",
+] as const;
+
+export const JSON_AGGREGATE_ERROR_REACH = [
+  "JSON",
+  "JSONB",
+  "unique",
+  "strict",
+  "NULL key",
+  "value conversion",
+  "descending",
+  "ascending",
+  "PG SQLSTATE",
+  "duplicate omitted NULL values",
+] as const;
+
+export const JSON_AGGREGATE_GROUP_REACH = [
+  "sixteen groups",
+  "thirty-two groups",
+  "observed native sort spill",
+  "ordered nonuniform members",
+  "ordinary sibling",
+  "exact PG text",
+  "zero resources",
+] as const;
+
+export const JSON_BLOB_REACH = [
+  "multiple native pages",
+  "forward byte order",
+  "zero resources",
+] as const;
+
+export const JSON_RECORD_REACH = [
+  "pretty record",
+  "compact record",
+  "nested ROW",
+  "JSONB record",
+  "present all-NULL row",
+  "absent outer row",
+  "aggregate record separators",
+  "exact PG text",
+] as const;
+
+export const JSON_BLOB_LIFETIME_REACH = [
+  "pending visitor",
+  "close waits",
+  "visitor fault",
+  "visitor resumes",
+  "zero resources",
+] as const;
+
+export const JSON_AGGREGATE_PARENT_REACH = [
+  "retaining join",
+  "retaining window",
+  "bound true",
+  "bound false",
+  "consumed build arm",
+  "JSONB",
+  "JSON",
+  "exact text",
+  "zero files",
+] as const;
+
+export const JSON_AGGREGATE_FILTER_REACH = [
+  "kept error",
+  "false mask",
+  "NULL mask",
+  "value expression",
+  "key expression",
+  "ordering expression",
+  "JSON",
+  "JSONB",
+  "mixed accepted and rejected rows",
+  "PG rows or SQLSTATE",
+  "filter error before value error",
+] as const;
+
+export const JSON_AGGREGATE_KEY_REACH = [
+  "scalar",
+  "object",
+  "array",
+  "one fractional zero",
+  "several fractional zeros",
+  "PG semantic equal pairs",
+  "JSONB key",
+  "SQL array key",
+  "numeric array scale equality",
+  "exact PostgreSQL groups",
+  "zero spill files",
+] as const;
+
+export const JSON_RECORD_NAMES_REACH = [
+  "duplicate",
+  "dotted",
+  "case-sensitive",
+  "embedded quote",
+  "mixed labels",
+  "derived",
+  "CTE",
+  "wildcard",
+  "nested record",
+  "hidden ORDER BY",
+  "DISTINCT",
+  "CTE column list",
+  "derived column list",
+  "window fields",
+  "literal UNION ALL",
+  "aliased wildcard",
+  "computed fields",
+  "typed fields",
+  "pretty",
+  "compact",
+  "exact JSON and JSONB text",
+] as const;
+
+export const JSON_AGGREGATE_SMALL_CAP_REACH = [
+  "json_agg",
+  "jsonb_agg",
+  "json_object_agg",
+  "jsonb_object_agg",
+  "four MiB cap",
+  "larger small cap",
+  "empty aggregate",
+  "nonempty aggregate",
+  "zero resources",
+  "tiny JSONB group key",
+] as const;
+
+export const JSON_GROUP_ROW_PRESSURE_REACH = [
+  "observed spilled representative",
+  "no retained key loan",
+  "observed loan repaid",
+  "semantic JSONB key",
+  "semantic interval array key",
+  "observed loan within compiled envelope",
+  "byte text key",
+  "multibyte key",
+  "ASCII key",
+  "cancel next restore",
+  "restore for output",
+  "exact PG equality",
+  "zero resources",
+] as const;
+
+export const JSON_GROUP_SQL_PRESSURE_REACH = [
+  "ordinary credit occupied",
+  "async initial group admission",
+  "producer credit occupied",
+  "delivery credit occupied",
+  "wide retained TEXT key",
+  "wide semantic JSONB key",
+  "expanded JSONB key",
+  "exact PG aggregate",
+  "observed spill",
+  "zero resources",
+] as const;
+
+/** Independent field widths keep semantic grouping from inheriting payload copies. */
+export const JSON_GROUP_WIDTH_REACH = [
+  "payload wider than key",
+  "key at least payload width",
+  "65536-byte payload",
+  "other payload width",
+  "wide restored payload tiny key",
+  "tiny key",
+  "wide key",
+  "sixteen MiB cap",
+  "independent small cap",
+  "exact PostgreSQL output",
+  "zero resources",
+  "expanding numeric key",
+  "ordinary canonical key",
+] as const;
+
+export const JSON_RECORD_WIDTH_REACH = [
+  "copy after seal",
+  "first field bound",
+  "second field bound",
+  "append does not shrink bounds",
+  "exact restored bytes",
+  "UTF8 fields",
+  "ASCII fields",
+  "zero resources",
+] as const;
+
+/** Actual grouping consumers own key operands; unrelated lanes and delivery do not. */
+export const JSON_GROUP_SCOPED_REACH = [
+  "one key",
+  "four distinct keys",
+  "ASCII keys",
+  "UTF8 keys",
+  "multiple inputs",
+  "competing credit includes reserve",
+  "observed spill",
+  "sixteen MiB cap",
+  "exact PG output",
+  "zero resources",
+] as const;
+
+/** Byte-valued array group equality borrows one encoded element at a time. */
+export const JSON_BYTE_ARRAY_GROUP_REACH = [
+  "text",
+  "bytes",
+  "enum",
+  "0 dimensions",
+  "1 dimensions",
+  "2 dimensions",
+  "same",
+  "value",
+  "bounds",
+  "shape",
+  "null",
+  "redundant bitmap equality",
+  "NULL elements",
+  "NULL arrays",
+  "exact PG equality",
+] as const;
+
+/** Additional consumer phases keep their independent cap and pressure reach explicit. */
+export const JSON_GROUP_CONSUMER_REACH = {
+  single: ["single input", "ten MiB cap"],
+  composed: ["thirty-two MiB cap"],
+  ordered: ["structural aggregate ORDER BY"],
+  parent: ["two groups", "parent consumer pressure"],
+  sort: ["sort"],
+  window: ["window", "bounded window key range"],
+  opaque: [
+    "opaque aggregate result",
+    "small result",
+    "large result",
+    "ASCII literal",
+    "UTF8 literal",
+    "two groups",
+    "four groups",
+    "twelve MiB cap",
+    "sixteen MiB cap",
+    "parent consumer pressure",
+    "competing credit includes reserve",
+    "observed spill",
+    "exact PG output",
+    "zero resources",
+  ],
+} as const;

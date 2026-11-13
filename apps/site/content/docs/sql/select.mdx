@@ -305,6 +305,11 @@ SELECT c.customer_id,
 FROM customers c
 ```
 
+The current engine returns compact JSON strings. Whitespace and numeric spelling can differ
+from PostgreSQL's JSON text; the rebuild preserves PostgreSQL's spelling. Add `ORDER BY` inside
+an aggregate when array order matters: without it, PostgreSQL may visit a group's rows in a
+different order.
+
 The same rule applies through `JSON_QUERY`. Ordinary text that happens to contain JSON remains a
 JSON string; cast it to `JSON`/`JSONB` or pass it through a JSON constructor when it should embed
 as a document.

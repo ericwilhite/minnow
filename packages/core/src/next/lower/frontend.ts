@@ -121,6 +121,7 @@ function prepareTypedQuery(parsed: CompiledQuery, catalog: CatalogView): Compile
   if (front.keys.size > 0)
     plan = extendGroupByWithKeyDependents(plan, (name) => front.keys.get(name), columnsOf);
   plan = bindPendingSelectShapes(plan, columnsOf);
+  plan = expandRowReferences(plan, columnsOf);
   plan = mergeJoinColumns(plan, columnsOf);
   plan = expandSourceColumnAliases(plan, columnsOf);
   plan = expandNaturalJoins(plan, columnsOf);

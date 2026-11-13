@@ -68,6 +68,8 @@ function run<T>(job: ReadJob<T>): MaybePromise<T> {
 }
 
 export interface ReadSource {
+  /** Also measure the largest cell of one selected key column, without a batch sum. */
+  readonly singleValueBound?: boolean;
   /** Explicit terminal export: sizing misses must not pollute the shared cache. */
   readonly retain?: boolean;
   readonly id: number;
@@ -188,6 +190,9 @@ export function boundSource(
       largestValue = 0,
       valueBytes = 0,
       remaining = source.rows;
+    const single = source.singleValueBound === true;
+    if (single && source.columns.length !== 1)
+      throw new TypeError("Single-value sizing needs one column");
     for (const segment of table.segments) {
       signal.throwIfAborted();
       if (remaining === 0) break;
@@ -432,11 +437,23 @@ export function boundSource(
                   4 * dictionary.rowCount +
                   1024;
                 dictionaries += dictionaryBytes;
-                valueBytes = Math.max(
-                  valueBytes,
-                  dictionaryBytes,
-                  decoded?.data.layout === "varlen" ? decoded.data.bytes.byteLength : 0,
-                );
+                if (single && decoded?.data.layout === "varlen") {
+                  for (let row = 0; row < decoded.length; row++) {
+                    valueBytes = Math.max(
+                      valueBytes,
+                      (decoded.data.offsets[row + 1] ?? 0) - (decoded.data.offsets[row] ?? 0),
+                    );
+                    if ((row & 1023) === 0) {
+                      const pause = pauseIfDue(task);
+                      if (pause) yield pause;
+                    }
+                  }
+                } else
+                  valueBytes = Math.max(
+                    valueBytes,
+                    dictionaryBytes,
+                    decoded?.data.layout === "varlen" ? decoded.data.bytes.byteLength : 0,
+                  );
                 io = Math.max(io, Math.min(MAX_READ_BYTES, dictionary.length));
               }
               for (const [index, page] of reader.directory.pages.entries()) {
@@ -450,23 +467,39 @@ export function boundSource(
                 const first = Math.floor(page.firstRow / span),
                   last = Math.floor((Math.min(rows, page.firstRow + page.rowCount) - 1) / span);
                 io = Math.max(io, Math.min(MAX_READ_BYTES, encoded));
-                if (page.largeRegion || page.encoding & PageEncoding.gzip) {
+                const singleVarlen =
+                  single && ["text", "bytes", "json", "array", "enum"].includes(type.kind);
+                if (page.largeRegion || page.encoding & PageEncoding.gzip || singleVarlen) {
                   const beforePage = budget.allocated;
                   yield* readValue(reader.load([index]));
                   raw = Math.max(encoded, budget.allocated - beforePage);
                   if (
                     !page.largeRegion &&
                     ["text", "bytes", "json", "array", "enum"].includes(type.kind)
-                  )
-                    valueBytes = Math.max(
-                      valueBytes,
-                      reader.varlenBytes(
-                        page.firstRow,
-                        Math.min(rows, page.firstRow + page.rowCount),
-                      ),
-                    );
+                  ) {
+                    if (single) {
+                      for (
+                        let row = page.firstRow;
+                        row < Math.min(rows, page.firstRow + page.rowCount);
+                        row++
+                      ) {
+                        valueBytes = Math.max(valueBytes, reader.varlenBytes(row, row + 1));
+                        if ((row & 1023) === 0) {
+                          const pause = pauseIfDue(task);
+                          if (pause) yield pause;
+                        }
+                      }
+                    } else
+                      valueBytes = Math.max(
+                        valueBytes,
+                        reader.varlenBytes(
+                          page.firstRow,
+                          Math.min(rows, page.firstRow + page.rowCount),
+                        ),
+                      );
+                  }
                 }
-                if (!page.largeRegion) valueBytes = Math.max(valueBytes, raw);
+                if (!page.largeRegion && !singleVarlen) valueBytes = Math.max(valueBytes, raw);
                 for (let w = first; w <= last; w++) {
                   held[w] = (held[w] ?? 0) + encoded + raw + lane + 1024;
                   encodedBytes[w] = (encodedBytes[w] ?? 0) + encoded;
@@ -476,7 +509,15 @@ export function boundSource(
                     const large = reader.largeValueBytes(from, to);
                     values[w] = (values[w] ?? 0) + large;
                     largestValue = Math.max(largestValue, large);
-                    valueBytes = Math.max(valueBytes, large);
+                    if (single) {
+                      for (let row = from; row < to; row++) {
+                        valueBytes = Math.max(valueBytes, reader.largeValueBytes(row, row + 1));
+                        if ((row & 1023) === 0) {
+                          const pause = pauseIfDue(task);
+                          if (pause) yield pause;
+                        }
+                      }
+                    } else valueBytes = Math.max(valueBytes, large);
                     io = Math.max(io, Math.min(MAX_READ_BYTES, large));
                   }
                 }

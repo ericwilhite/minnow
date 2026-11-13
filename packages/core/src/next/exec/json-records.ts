@@ -27,20 +27,31 @@ interface Writer {
   readonly vectors: readonly FlatVector[];
   readonly data: { layout: "varlen"; bytes: Uint8Array; offsets: Int32Array };
 }
+export interface StreamedJsonField {
+  readonly stream: true;
+  readonly type: PhysicalType;
+  readonly length: number | null;
+  readonly read: (visit: (bytes: Uint8Array) => Promise<void>) => Promise<void>;
+}
 export class JsonRecords {
   readonly #records: RecordCheckpoint;
   #writer: Writer | null;
   #payload = 0;
   #rows = 0;
   #extra = 0;
+  readonly #columnBytes: number[];
+  readonly #writerBytes: number;
   #closing: Promise<void> | null = null;
   constructor(
     parent: SpillIo,
     service: SpillService,
     readonly types: readonly PhysicalType[],
   ) {
-    if (!parent.pool.allocate(WRITER_BYTES)) throw new Error("JSON record metadata not admitted");
+    this.#writerBytes = WRITER_BYTES + 8 * types.length;
+    if (!parent.pool.allocate(this.#writerBytes))
+      throw new Error("JSON record metadata not admitted");
     try {
+      this.#columnBytes = Array.from(types, () => 0);
       const headers = new Int32Array(3),
         data = { layout: "varlen" as const, bytes: EMPTY, offsets: new Int32Array(2) };
       const vectors: FlatVector[] = Array.from({ length: 3 }, (_, i) => ({
@@ -54,7 +65,7 @@ export class JsonRecords {
       this.#records = new RecordCheckpoint(parent, service, [I32, I32, I32, BYTES]);
       this.#writer = { io: parent, headers, vectors, data };
     } catch (error) {
-      parent.pool.free(WRITER_BYTES);
+      parent.pool.free(this.#writerBytes);
       throw error;
     }
   }
@@ -63,6 +74,13 @@ export class JsonRecords {
   }
   get retainedBytes(): number {
     return this.#payload + this.#extra + 2048 + 2048 * this.types.length;
+  }
+  /** Per-field high-water marks survive detach without retaining a row or grant. */
+  columnBytes(column: number): number {
+    return this.#columnBytes[column] ?? 0;
+  }
+  #bound(column: number, bytes: number): void {
+    this.#columnBytes[column] = Math.max(this.#columnBytes[column] ?? 0, bytes);
   }
   get files() {
     return this.#records.files;
@@ -93,18 +111,22 @@ export class JsonRecords {
     if (!writer) throw new Error("JSON records detached");
     let payload = 0,
       extra = 0;
-    for (const value of columns) {
+    for (const [column, value] of columns.entries()) {
       if (!isValidSlot(value, row)) continue;
       const [flat, slot] = slotOf(value, row),
         d = flat.data;
       payload = align(payload);
-      if (d.layout === "varlen") payload += (d.offsets[slot + 1] ?? 0) - (d.offsets[slot] ?? 0);
-      else {
+      if (d.layout === "varlen") {
+        const length = (d.offsets[slot + 1] ?? 0) - (d.offsets[slot] ?? 0);
+        payload += length;
+        this.#bound(column, length);
+      } else {
         const wide =
           d.layout === "decimal" && d.coefficients.repr === "wide"
             ? bigintBytes(d.coefficients.values[slot] ?? 0n)
             : 0;
         payload += 512 + wide;
+        this.#bound(column, 512 + wide);
         extra += wide ? wide + 8 : 0;
       }
     }
@@ -113,54 +135,119 @@ export class JsonRecords {
     this.#payload = Math.max(this.#payload, payload);
     this.#extra = Math.max(this.#extra, extra);
     await this.#record(-1, payload, extra);
-    for (let c = 0; c < columns.length; c++) {
-      const value = columns[c];
-      if (!value) throw new Error("Missing JSON field");
-      if (!isValidSlot(value, row)) {
+    for (let c = 0; c < columns.length; c++) await this.#field(c, columns[c], row);
+    await this.#record(-2, 0, 0);
+    this.#rows++;
+  }
+  /** Same native row format, without assembling a complete growing JSON value in memory. */
+  async writeStreamed(fields: ReadonlyArray<Vector | StreamedJsonField>, row = 0): Promise<void> {
+    if (fields.length !== this.types.length) throw new Error("JSON streamed schema mismatch");
+    let payload = 0,
+      extra = 0;
+    for (const [column, field] of fields.entries()) {
+      if ("stream" in field) {
+        if (field.length !== null) {
+          payload = align(payload) + field.length;
+          this.#bound(column, field.length);
+        }
+      } else if (isValidSlot(field, row)) {
+        payload = align(payload);
+        const [flat, slot] = slotOf(field, row),
+          data = flat.data;
+        if (data.layout === "varlen") {
+          const length = (data.offsets[slot + 1] ?? 0) - (data.offsets[slot] ?? 0);
+          payload += length;
+          this.#bound(column, length);
+        } else {
+          const wide =
+            data.layout === "decimal" && data.coefficients.repr === "wide"
+              ? bigintBytes(data.coefficients.values[slot] ?? 0n)
+              : 0;
+          payload += 512 + wide;
+          this.#bound(column, 512 + wide);
+          extra += wide ? wide + 8 : 0;
+        }
+      }
+    }
+    if (payload > 0x7fffffff || extra > 0x7fffffff)
+      throw new Error("JSON streamed row exceeds native offsets");
+    this.#payload = Math.max(this.#payload, payload);
+    this.#extra = Math.max(this.#extra, extra);
+    await this.#record(-1, payload, extra);
+    for (let c = 0; c < fields.length; c++) {
+      const field = fields[c];
+      if (!field) throw new Error("Missing JSON streamed field");
+      if (!("stream" in field)) {
+        await this.#field(c, field, row);
+        continue;
+      }
+      if (field.length === null) {
         await this.#record(c, -1, 0);
         continue;
       }
-      const [flat, slot] = slotOf(value, row),
-        d = flat.data;
-      if (d.layout === "varlen") {
-        const start = d.offsets[slot] ?? 0,
-          length = (d.offsets[slot + 1] ?? start) - start;
-        for (let at = 0; at < Math.max(1, length); at += FRAGMENT)
-          await this.#record(
-            c,
-            at,
-            length,
-            d.bytes.subarray(start + at, start + Math.min(length, at + FRAGMENT)),
-          );
-      } else {
-        const store = new ColumnStore([value.type], writer.io.pool, {
-          chunkRows: 1,
-          targetBytes: FRAGMENT,
-          varlenBytes: 0,
-        });
-        try {
-          if (store.append([value], null, row, 1) !== 1)
-            throw new Error("JSON fixed cell not admitted");
-          const encoded = writer.io.pages.encode(
-            { queryId: writer.io.context.queryId, run: 0, partition: 0, sequence: 0 },
-            store.vectors(),
-            1,
-          );
-          if (!encoded || encoded.length > FRAGMENT)
-            throw new Error("JSON fixed cell exceeds fragment proof");
-          await this.#record(c, -2, encoded.length, encoded);
-        } finally {
-          store.close();
+      const length = field.length;
+      let offset = 0;
+      await field.read(async (bytes) => {
+        for (let at = 0; at < bytes.length; at += FRAGMENT) {
+          const part = bytes.subarray(at, at + FRAGMENT);
+          if (offset + part.length > length)
+            throw new SpillCorruptionError("JSON streamed field overflow");
+          await this.#record(c, offset, length, part);
+          offset += part.length;
         }
-      }
+      });
+      if (offset !== length) throw new SpillCorruptionError("JSON streamed field truncated");
+      if (length === 0) await this.#record(c, 0, 0);
     }
     await this.#record(-2, 0, 0);
     this.#rows++;
   }
+  async #field(c: number, value: Vector | undefined, row: number): Promise<void> {
+    const writer = this.#writer;
+    if (!writer) throw new Error("JSON records detached");
+    if (!value) throw new Error("Missing JSON field");
+    if (!isValidSlot(value, row)) {
+      await this.#record(c, -1, 0);
+      return;
+    }
+    const [flat, slot] = slotOf(value, row),
+      d = flat.data;
+    if (d.layout === "varlen") {
+      const start = d.offsets[slot] ?? 0,
+        length = (d.offsets[slot + 1] ?? start) - start;
+      for (let at = 0; at < Math.max(1, length); at += FRAGMENT)
+        await this.#record(
+          c,
+          at,
+          length,
+          d.bytes.subarray(start + at, start + Math.min(length, at + FRAGMENT)),
+        );
+    } else {
+      const store = new ColumnStore([value.type], writer.io.pool, {
+        chunkRows: 1,
+        targetBytes: FRAGMENT,
+        varlenBytes: 0,
+      });
+      try {
+        if (store.append([value], null, row, 1) !== 1)
+          throw new Error("JSON fixed cell not admitted");
+        const encoded = writer.io.pages.encode(
+          { queryId: writer.io.context.queryId, run: 0, partition: 0, sequence: 0 },
+          store.vectors(),
+          1,
+        );
+        if (!encoded || encoded.length > FRAGMENT)
+          throw new Error("JSON fixed cell exceeds fragment proof");
+        await this.#record(c, -2, encoded.length, encoded);
+      } finally {
+        store.close();
+      }
+    }
+  }
   #detach(): void {
     const writer = this.#writer;
     this.#writer = null;
-    if (writer) writer.io.pool.free(WRITER_BYTES);
+    if (writer) writer.io.pool.free(this.#writerBytes);
   }
   async seal(): Promise<void> {
     await this.#records.seal();
@@ -178,6 +265,7 @@ export class JsonRecords {
     target.#rows += this.#rows;
     target.#payload = Math.max(target.#payload, this.#payload);
     target.#extra = Math.max(target.#extra, this.#extra);
+    for (const [column, bytes] of this.#columnBytes.entries()) target.#bound(column, bytes);
   }
   async read(
     io: SpillIo,
@@ -308,7 +396,7 @@ export class JsonRecords {
             nextColumn++;
             continue;
           }
-          if (layoutOf(type) !== "varlen") bad();
+          if (layoutOf(type) !== "varlen" || length > this.columnBytes(col)) bad();
           if (current === -1) {
             if (col !== nextColumn || offset !== 0) bad();
             start = align(cursor);

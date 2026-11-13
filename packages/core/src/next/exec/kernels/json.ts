@@ -17,6 +17,8 @@ import {
 } from "./vectors.js";
 
 const CONSTRUCTORS = new Set([
+  "json_record",
+  "json_record_value",
   "json_object",
   "json_build_object",
   "jsonb_build_object",
@@ -113,6 +115,53 @@ export class JsonNode implements Compiled {
   }
   *#construct(vectors: readonly Vector[], row: number, writer: JsonOutput): SlicedJob<boolean> {
     const first = vectors[0];
+    if (this.fn === "json_record_value") {
+      const spacing = vectors[1];
+      if (!first || !spacing || !isValidSlot(first, row) || !isValidSlot(spacing, row))
+        return false;
+      const [flag, slot] = slotOf(spacing, row);
+      if (flag.data.layout !== "bool") throw new Error("Invalid record spacing");
+      const bytes = valueBytes(first, row);
+      if (!flag.data.values[slot]) {
+        yield* writer.copy(bytes);
+        return true;
+      }
+      let depth = 0,
+        string = false,
+        escaped = false,
+        start = 0;
+      for (let i = 0; i < bytes.length; i++) {
+        const c = bytes[i] ?? 0;
+        if (string) {
+          if (escaped) escaped = false;
+          else if (c === 92) escaped = true;
+          else if (c === 34) string = false;
+        } else if (c === 34) string = true;
+        else if (c === 123 || c === 91) depth++;
+        else if (c === 125 || c === 93) depth--;
+        else if (c === 44 && depth === 1) {
+          yield* writer.copy(bytes.subarray(start, i + 1));
+          writer.put(10);
+          writer.put(32);
+          start = i + 1;
+        }
+        if ((i & 1023) === 0 && this.host.slice.due()) yield;
+      }
+      yield* writer.copy(bytes.subarray(start));
+      return true;
+    }
+    const record = this.fn === "json_record";
+    let pretty = false;
+    if (record) {
+      const p = vectors[1];
+      if (!first || !p || !isValidSlot(first, row) || !isValidSlot(p, row)) return false;
+      const [presence, ps] = slotOf(first, row),
+        [spacing, ss] = slotOf(p, row);
+      if (presence.data.layout !== "bool" || spacing.data.layout !== "bool")
+        throw new TypeError("Invalid record flags");
+      if (!presence.data.values[ps]) return false;
+      pretty = spacing.data.values[ss] !== 0;
+    }
     if (this.fn === "to_json" || this.fn === "to_jsonb") {
       if (first === undefined || !isValidSlot(first, row)) return false;
       yield* this.#value(first, row, writer);
@@ -121,7 +170,8 @@ export class JsonNode implements Compiled {
     const object =
       this.fn === "json_build_object" ||
       this.fn === "jsonb_build_object" ||
-      this.fn === "json_object";
+      this.fn === "json_object" ||
+      record;
     if (object && vectors.length % 2 !== 0)
       throw new ExecutionError(
         "argument list must have even number of elements",
@@ -130,13 +180,18 @@ export class JsonNode implements Compiled {
       );
     writer.put(object ? 123 : 91);
     let emitted = false;
-    for (let i = 0; i < vectors.length; i += object ? 2 : 1) {
+    for (let i = record ? 2 : 0; i < vectors.length; i += object ? 2 : 1) {
       const value = vectors[i];
       if (value === undefined) throw new TypeError("Missing JSON argument");
       if (this.fn === "json_array" && !isValidSlot(value, row)) continue;
       if (emitted) {
         writer.put(44);
-        writer.put(32);
+        if (record) {
+          if (pretty) {
+            writer.put(10);
+            writer.put(32);
+          }
+        } else writer.put(32);
       }
       emitted = true;
       if (object && this.type.kind === "json" && this.type.binary && !isValidSlot(value, row))
@@ -147,9 +202,9 @@ export class JsonNode implements Compiled {
         );
       yield* this.#value(value, row, writer, object);
       if (object) {
-        writer.put(32);
+        if (!record) writer.put(32);
         writer.put(58);
-        writer.put(32);
+        if (!record) writer.put(32);
         const member = vectors[i + 1];
         if (member === undefined) throw new TypeError("Missing JSON member");
         yield* this.#value(member, row, writer);

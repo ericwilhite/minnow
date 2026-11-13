@@ -1,5 +1,19 @@
-import { expressionInputBytes, projectedInputBytes } from "./input-size-plan.js";
+import { columnInputBytes, expressionInputBytes, projectedInputBytes } from "./input-size-plan.js";
 import { KeyLayout } from "./join-keys.js";
+import { byteArrayGroupKey } from "./agg/json-array-key.js";
+import {
+  jsonGroupConsumer,
+  jsonStructuralSort,
+  singleGroupInput,
+  type JsonStructuralSort,
+} from "./json-group-size-plan.js";
+import { canonicalJsonText } from "./json-canonical-plan.js";
+import {
+  JsonAggregateOperator,
+  jsonAggregateMinimum,
+  jsonAggregateLoans,
+  isJsonAggregate,
+} from "./agg/json.js";
 import {
   RecursiveOperator,
   recursiveLayout,
@@ -655,6 +669,15 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   const closePhase = (phase: HybridPhase | JsonPhase): Promise<void> =>
     "checkpoint" in phase ? closeHybridPhase(phase) : closeJsonPhase(phase);
   const jsonPlanners = new Map<number, number>();
+  const jsonAggregateRecipes = new Map<
+    number,
+    {
+      minimum: number;
+      loans: number;
+      rel: Extract<Rel, { op: "aggregate" }>;
+      input: readonly PhysicalType[];
+    }
+  >();
   const jsonCapacities = new WeakMap<QueryRuntime, Map<number, number>>();
   const jsonFrontier = new WeakMap<QueryRuntime, number | null>();
   const nativeParentIds = new Set<number>();
@@ -662,7 +685,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   const findJson = (rel: Rel): boolean => {
     let found =
       (rel.op === "project" && rel.exprs.some(expandingJsonExpression)) ||
-      (rel.op === "filter" && expandingJsonExpression(rel.predicate));
+      (rel.op === "filter" && expandingJsonExpression(rel.predicate)) ||
+      (rel.op === "aggregate" && rel.aggregates.some(isJsonAggregate));
     if ("input" in rel) found = findJson(rel.input) || found;
     if ("left" in rel && "right" in rel) {
       const left = findJson(rel.left),
@@ -1036,21 +1060,27 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       case "limit": {
         const child = prepare(rel.input),
           input = types(rel.input);
+        const exprs =
+          rel.op === "project"
+            ? jsonDescendants.size
+              ? rel.exprs.map((expr) => canonicalJsonText(expr, rel.input))
+              : rel.exprs
+            : rel.op === "filter"
+              ? jsonDescendants.size
+                ? canonicalJsonText(rel.predicate, rel.input)
+                : rel.predicate
+              : [];
         if (
           rel.op !== "limit" &&
-          ((rel.op === "project"
-            ? rel.exprs.some(jsonExpression)
-            : jsonExpression(rel.predicate)) ||
-            jsonDescendants.has(rel.input.id))
+          (Array.isArray(exprs) ? exprs.some(jsonExpression) : jsonExpression(exprs as ScalarExpr))
         ) {
           if (plan.volatile)
             throw new UnsupportedPlanError("JSON expressions mixed with volatile evaluation", {
               construct: "function",
             });
-          const exprs = rel.op === "project" ? rel.exprs : rel.predicate;
           if (
             rel.op === "project"
-              ? rel.exprs.some((expr) => !jsonInputsBounded(expr, rel.input))
+              ? (exprs as readonly ScalarExpr[]).some((expr) => !jsonInputsBounded(expr, rel.input))
               : !jsonInputsBounded(exprs as ScalarExpr, rel.input)
           )
             throw new UnsupportedPlanError("JSON document without a bounded source envelope", {
@@ -1206,13 +1236,17 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         }
         const setup = (context: CompileContext, sink: Operator, runtime?: QueryRuntime) =>
           rel.op === "filter"
-            ? new FilterOperator(rel.predicate, context, sink)
+            ? new FilterOperator(exprs as ScalarExpr, context, sink)
             : rel.op === "project"
               ? (() => {
                   const actual = runtime ? starRel(runtime, rel) : rel;
                   if (actual.op !== "project") throw new Error("Star project changed operator");
                   return new ProjectOperator(
-                    actual.exprs,
+                    actual === rel
+                      ? (exprs as readonly ScalarExpr[])
+                      : jsonDescendants.size
+                        ? actual.exprs.map((expr) => canonicalJsonText(expr, actual.input))
+                        : actual.exprs,
                     { ...context, input: types(actual.input) },
                     sink,
                   );
@@ -1324,6 +1358,110 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 groupingSets: null,
                 aggregates: [],
               };
+        if (aggregate.aggregates.some(isJsonAggregate)) {
+          const minimum = jsonAggregateMinimum(aggregate, input),
+            loans = jsonAggregateLoans(aggregate);
+          const deliveryBase = JSON_PHASE_FIXED + 2 * JSON_PHASE_IO + 4096;
+          jsonPlanners.set(rel.id, deliveryBase);
+          jsonAggregateRecipes.set(rel.id, { minimum, loans, rel: aggregate, input });
+          registerPhaseProducer(rel.id);
+          fixed(rel, minimum, rel.id, loans);
+          if (!phaseParents.has(rel.id))
+            throw new UnsupportedPlanError("JSON aggregate phase parent", {
+              construct: "aggregate",
+            });
+          return (runtime, downstream, stops, rowsNeeded) => {
+            const resume = phases.get(runtime)?.resume;
+            const saved =
+              resume?.kind === "json" && resume.rel === rel.id ? resume.phase : undefined;
+            if (!saved && jsonFrontier.get(runtime) !== rel.id) {
+              const waiting: Operator = {
+                push: () => {
+                  throw new Error("JSON aggregate frontier emitted early");
+                },
+                ready: () => Promise.resolve(),
+                finish: () => undefined,
+                abort: () => undefined,
+              };
+              return child(runtime, waiting, stops);
+            }
+            const shared = (grant: Grant) => ({
+              grant,
+              allocateResult: (bytes: number) => runtime.allocateResultOwned(bytes),
+              spill: runtime.request.spill,
+              queryId: runtime.request.queryId,
+              capacity: saved ? 0 : runtime.request.governor.capBytes,
+              retainedBytes: saved?.retainedBytes ?? 0,
+              progressBytes: runtime.retainedProgressEnvelope(),
+              signal: runtime.signal,
+              ...(rowsNeeded === undefined ? {} : { rowsNeeded }),
+              stopped: () => stops.some((stop) => stop()),
+              dispose: (release: () => void | Promise<void>) => runtime.dispose(release),
+              handoff: async (phase: JsonPhase) => {
+                const state = phases.get(runtime);
+                if (!state || state.pending)
+                  throw new Error("Missing/overlapping JSON aggregate phase");
+                const retaining =
+                  (exceptParents.get(rel.id)?.size ?? 0) +
+                    (joinParents.get(rel.id)?.size ?? 0) +
+                    (windowParents.get(rel.id)?.size ?? 0) >
+                  0;
+                const admitted = retaining
+                  ? {
+                      ...phase,
+                      progressBytes: Math.max(phase.progressBytes, 4 * phase.retainedBytes),
+                    }
+                  : phase;
+                state.pending = { kind: "json" as const, rel: rel.id, phase: admitted };
+                await checkpointRetainingParents(state, rel.id);
+                runtime.beginHandoff();
+              },
+            });
+            return instantiate(
+              runtime,
+              saved ? { id: rel.id, op: "project", profileAs: rel } : rel,
+              input,
+              saved ? deliveryBase : minimum,
+              BATCH_ROWS,
+              (context, grant) =>
+                saved
+                  ? new JsonPhaseOperator(
+                      [],
+                      context,
+                      { ...shared(grant), resume: saved },
+                      types(rel),
+                      counted(runtime, rel, downstream),
+                    )
+                  : new JsonAggregateOperator(
+                      aggregate,
+                      context,
+                      {
+                        ...shared(grant),
+                        loans: Array.from({ length: loans }, (_, slot) => runtime.loan(rel, slot)),
+                      },
+                      counted(runtime, rel, downstream),
+                    ),
+              (operator) => {
+                runtime.onAbort((reason) => operator.abort(reason));
+                runtime.dispose(() => operator.closed);
+                return (async () => {
+                  try {
+                    if (operator instanceof JsonPhaseOperator) await operator.resume();
+                    else await child(runtime, operator, [...stops, () => operator.stopped]);
+                  } catch (error) {
+                    operator.abort(error);
+                    await operator.closed.catch(() => undefined);
+                    throw error;
+                  } finally {
+                    const profile = runtime.profile(rel);
+                    profile.spilledBytes += operator.spilledBytes;
+                    profile.spillPasses += operator.spillPasses;
+                  }
+                })();
+              },
+            );
+          };
+        }
         if (aggregate.aggregates.some(isOrderedSet)) {
           const measured = measureCompilerBuffers(
             compilation,
@@ -2352,10 +2490,15 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     // LIMIT zero never opens its input. Keep capability checks at prepare, but do not reserve
     // buffers for those unreachable pipelines (including when zero is a bound parameter).
     const active = new Set<number>();
+    const structuralSorts = new Map<number, JsonStructuralSort>();
     const visit = (rel: Rel): void => {
       // Lowering stores ORDER BY's LIMIT on its sort. Zero must not open even its pools.
       if ((rel.op === "sort" || rel.op === "limit") && runtime.bounds(rel).limit === 0) return;
       active.add(rel.id);
+      if (jsonAggregateRecipes.size) {
+        const sort = jsonStructuralSort(rel);
+        if (sort) structuralSorts.set(rel.id, sort);
+      }
       if (rel.op === "recursive") {
         visit(rel.base);
         visit(rel.step);
@@ -2371,8 +2514,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     visit(plan.root);
     // Query-local scalar key bounds. They are populated by complete sizing passes,
     // before any execution grant exists; no native vectors/grants are retained here.
-    const keySources = new Map<number, Set<number>>();
-    const keyColumnBytes = new Map<number, Map<number, number>>();
+    const joinKeySources = new Map<number, Set<number>>();
+    const joinKeyColumnBytes = new Map<number, Map<number, number>>();
     const rowSources = new Map<object, Map<number, Map<number, number>>>();
     for (const [id, arms] of keyedInputs) {
       if (!active.has(id)) continue;
@@ -2391,9 +2534,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         for (const [source, columns] of counts)
           for (const [index, count] of columns)
             if (count > 1) {
-              const keys = keySources.get(source) ?? new Set<number>();
+              const keys = joinKeySources.get(source) ?? new Set<number>();
               keys.add(index);
-              keySources.set(source, keys);
+              joinKeySources.set(source, keys);
             }
         for (const column of arm.repeats.keys()) {
           const expr = arm.exprs[column];
@@ -2401,9 +2544,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             expressionInputBytes(expr, arm.input, {
               parameter: () => 0,
               source(source, index) {
-                const columns = keySources.get(source) ?? new Set<number>();
+                const columns = joinKeySources.get(source) ?? new Set<number>();
                 columns.add(index);
-                keySources.set(source, columns);
+                joinKeySources.set(source, columns);
                 return 0;
               },
             });
@@ -2419,7 +2562,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           for (const [source, columns] of rowSources.get(arm) ?? [])
             for (const [index, count] of columns)
               if (count > 1) {
-                const bytes = keyColumnBytes.get(source)?.get(index);
+                const bytes = joinKeyColumnBytes.get(source)?.get(index);
                 if (bytes === undefined) return null;
                 rowExtra += (count - 1) * bytes;
               }
@@ -2429,7 +2572,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             const key = expr
               ? expressionInputBytes(expr, arm.input, {
                   ...base,
-                  source: (source, index) => keyColumnBytes.get(source)?.get(index) ?? null,
+                  source: (source, index) => joinKeyColumnBytes.get(source)?.get(index) ?? null,
                 })
               : null;
             if (key === null) return null;
@@ -2445,7 +2588,147 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     }
     for (const [id, columns] of compoundColumns)
       if (active.has(id)) runtime.operatorParameterColumns(id, columns, compoundCopies.get(id));
-    const hasAggregateProgress = [...aggregatePlanners.keys()].some((id) => active.has(id));
+    const jsonGroupSources = new Map<number, Set<number>>();
+    const jsonGroupColumnBytes = new Map<number, Map<number, number>>();
+    let semanticActive = active;
+    const jsonGroups = [...jsonAggregateRecipes.values()].filter(
+      (p) => p.loans > 1 && active.has(p.rel.id),
+    );
+    for (const planner of jsonGroups) {
+      const consumers = Array.from({ length: planner.loans }, (_, slot) =>
+        jsonGroupConsumer(planner.rel, slot),
+      );
+      for (const key of new Set(consumers.flatMap((c) => c?.columns ?? []))) {
+        if (
+          !["text", "bytes", "json", "array", "enum", "decimal"].includes(
+            planner.input[key]?.kind ?? "",
+          )
+        )
+          continue;
+        columnInputBytes(planner.rel.input, key, {
+          parameter: () => 0,
+          source(source, column) {
+            const columns = jsonGroupSources.get(source) ?? new Set<number>();
+            columns.add(column);
+            jsonGroupSources.set(source, columns);
+            return 0;
+          },
+        });
+      }
+    }
+    for (const sort of structuralSorts.values())
+      for (const key of sort.keys)
+        expressionInputBytes(key, sort.input, {
+          parameter: () => 0,
+          source(source, column) {
+            const columns = jsonGroupSources.get(source) ?? new Set<number>();
+            columns.add(column);
+            jsonGroupSources.set(source, columns);
+            return 0;
+          },
+        });
+    for (const planner of jsonGroups) runtime.helperOnlyProgress(planner.rel.id);
+    const pairAllowance = (kind: string | undefined) =>
+      kind === "json" ? 48 : kind === "array" ? 64 : 0;
+    let opaqueConsumerStep = 0;
+    runtime.groupKeyProgress((id, loanSlot, slots, largest, minimum, ordinary) => {
+      // A sort can retain operands while its consumer compares group boundaries.
+      // Fund each actual comparator/sort's keys; unrelated helper lanes stay ordinary.
+      // Most plans/borrowers have no semantic grouping workspace. Avoid walking all
+      // source bounds or building size closures on their ordinary admission path.
+      if (loanSlot === undefined) {
+        if (minimum === 0 || !semanticActive.has(id) || !structuralSorts.has(id)) return 0;
+      } else if (
+        !semanticActive.has(id) ||
+        jsonFrontier.get(runtime) !== id ||
+        !jsonGroups.some((p) => p.rel.id === id)
+      )
+        return 0;
+      const fallback = Math.max(
+        largest,
+        jsonConstants,
+        ...[...bounds.values()].map((b) => b.progress / 4),
+      );
+      const sizes = {
+        parameter: (slot: number) => slots[slot] ?? largest,
+        source: (source: number, column: number) =>
+          jsonGroupColumnBytes.get(source)?.get(column) ?? (bounds.get(source)?.progress ?? 0) / 4,
+        saved(id: number, column: number) {
+          const cut = phases.get(runtime)?.resume;
+          return cut?.kind === "json" && cut.phase.emit && cut.rel === id
+            ? cut.phase.prefix.columnBytes(column)
+            : undefined;
+        },
+      };
+      if (loanSlot === undefined) {
+        const sort = structuralSorts.get(id);
+        if (!sort || !semanticActive.has(id) || minimum === 0) return 0;
+        // Outer sorts/windows still decode their own keys after the aggregate cut.
+        // Only that native borrower gets this workspace; it is never saved globally.
+        let bytes = 0,
+          opaque = false;
+        for (const key of sort.keys) {
+          const width = expressionInputBytes(key, sort.input, sizes);
+          if (width === null) opaque = true;
+          else bytes += pairAllowance(key.type.kind) * width + 80;
+        }
+        // An aggregate result does not exist until its checkpoint. Keep its legacy
+        // native step while opaque; another literal/source prefix is not this key.
+        // Exact checkpoint fields take over as soon as the producer exposes them.
+        return Math.max(ordinary + bytes, opaque ? opaqueConsumerStep : 0);
+      }
+      let maximum = 0;
+      for (const planner of jsonGroups) {
+        if (planner.rel.id !== id || !semanticActive.has(planner.rel.id)) continue;
+        if (jsonFrontier.get(runtime) !== planner.rel.id) continue;
+        const consumer = jsonGroupConsumer(planner.rel, loanSlot);
+        if (!consumer) return 0;
+        const one = singleGroupInput(planner.rel.input);
+        if (one && consumer.boundary) return 0;
+        const operands = 2;
+        let bytes = 0,
+          keyBytes = 0;
+        const variable = (kind: string) =>
+          ["text", "bytes", "json", "array", "enum", "decimal"].includes(kind);
+        let rowBytes = 2048 + 256 * (consumer.columns.length + 1);
+        for (const column of consumer.columns) {
+          const type = planner.input[column];
+          rowBytes += variable(type?.kind ?? "")
+            ? (columnInputBytes(planner.rel.input, column, sizes) ?? fallback)
+            : 16;
+        }
+
+        const counts = new Map<number, number>();
+        for (const key of consumer.keys) counts.set(key, (counts.get(key) ?? 0) + 1);
+        for (const [key, count] of counts) {
+          const kind = planner.input[key]?.kind;
+          const allowance =
+            consumer.boundary && byteArrayGroupKey(planner.input[key]) ? 0 : pairAllowance(kind);
+          const operand = variable(kind ?? "")
+            ? (columnInputBytes(planner.rel.input, key, sizes) ?? fallback)
+            : 16;
+          // Native JsonRecords fixed cells include a bounded page and, for wide
+          // NUMERIC, its separately restored coefficient. Varlen cells stay raw.
+          keyBytes +=
+            count * (kind === "decimal" ? 512 + 2 * operand : variable(kind ?? "") ? operand : 512);
+          if (allowance > 0) bytes += allowance * count * operand + 40 * operands * count;
+        }
+        opaqueConsumerStep = Math.max(opaqueConsumerStep, ordinary + bytes);
+        if (bytes === 0) return 0;
+        // These are complete consumer steps, not additions to the common row
+        // envelope. The sort holds two pages and one output row; the comparator
+        // restores one representative and its bounded record IO alongside trees.
+        bytes += consumer.boundary
+          ? keyBytes + 7 * consumer.keys.length + 2048 + 2048 * consumer.keys.length + (512 << 10)
+          : 3 * rowBytes + (64 << 10);
+        maximum = Math.max(maximum, bytes);
+      }
+      return maximum;
+    });
+    const hasAggregateProgress = [
+      ...aggregatePlanners.keys(),
+      ...[...jsonAggregateRecipes.values()].filter((p) => p.loans > 1).map((p) => p.rel.id),
+    ].some((id) => active.has(id));
     const hasCompoundProgress = admissions.some(
       ({ rel }) => active.has(rel.id) && (rel.op === "join" || rel.op === "setOp"),
     );
@@ -2457,6 +2740,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       // vectors give an exact byte bound without re-encoding or copying their payloads.
       let literalBytes = LARGE_VALUE_BYTES;
       let operatorLiteralBytes = 0;
+      let jsonLiteralBytes = 0;
       const inspected = new Set<object>();
       const inspect = (value: unknown): void => {
         if (
@@ -2475,6 +2759,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           if (data.layout === "varlen") {
             operatorLiteralBytes = Math.max(operatorLiteralBytes, data.bytes?.byteLength ?? 0);
             literalBytes = Math.max(literalBytes, operatorLiteralBytes);
+            jsonLiteralBytes = Math.max(jsonLiteralBytes, data.bytes?.byteLength ?? 0);
           }
           return;
         }
@@ -2483,25 +2768,50 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       inspect(plan.root);
       if (hasCompoundProgress) runtime.operatorLiteralProgress(operatorLiteralBytes);
       let inline = 0,
-        sourceMultiplicity = 1;
-      for (const planner of aggregatePlanners.values()) {
+        sourceMultiplicity = 1,
+        inputMultiplicity = 1;
+      for (const planner of [
+        ...aggregatePlanners.values(),
+        ...[...jsonAggregateRecipes.values()].filter((p) => p.loans > 1),
+      ]) {
         if (!active.has(planner.rel.id)) continue;
-        const variable = planner.input.reduce((n, type) => {
+        const json = jsonAggregateRecipes.has(planner.rel.id);
+        const variable = planner.input.reduce((n, type, column) => {
           if (["text", "bytes", "json", "array", "enum", "decimal"].includes(type.kind)) {
-            return n + literalBytes;
+            const width = json
+              ? columnInputBytes(planner.rel.input, column, {
+                  parameter: () => 0,
+                  source: () => 0,
+                })
+              : null;
+            return n + (json ? (width ?? jsonLiteralBytes) : literalBytes);
           }
           return n + 16;
         }, 0);
         const copies = new Map<number, number>();
         for (const column of planner.rel.groupBy) copies.set(column, (copies.get(column) ?? 0) + 1);
-        const multiplicity = Math.max(1, ...copies.values());
-        inline = Math.max(inline, 4 * multiplicity * variable);
+        // Ordinary row copies and semantic key operands have independent bounds.
+        const multiplicity = json ? 1 : Math.max(1, ...copies.values());
+        // JSON literals are measured exactly: the stored inline ceiling is not a
+        // lower bound on a one-byte key. Source/parameter/checkpoint bytes enter
+        // through their own measured bounds. Wide representative restoration also
+        // needs the native record metadata and bounded I/O workspace.
+        const keyWorkspace =
+          json && planner.rel.groupBy.length > 0
+            ? 2048 + 2560 * planner.rel.groupBy.length + (512 << 10)
+            : 0;
+        inline = Math.max(inline, 4 * multiplicity * variable + keyWorkspace);
         // The source hint already bounds all selected columns together. Only a
         // repeated key position duplicates that whole prefix; extra inline/literal
         // and parameter output is added separately by the runtime.
-        sourceMultiplicity = Math.max(sourceMultiplicity, multiplicity);
+        inputMultiplicity = Math.max(inputMultiplicity, multiplicity);
+        sourceMultiplicity = Math.max(
+          sourceMultiplicity,
+          json ? 1 : Math.max(1, ...copies.values()),
+        );
       }
-      if (hasAggregateProgress) runtime.progressEnvelope(inline, sourceMultiplicity);
+      if (hasAggregateProgress)
+        runtime.progressEnvelope(inline, inputMultiplicity, sourceMultiplicity);
     }
     const entries = admissions
       .filter((entry) => active.has(entry.owner))
@@ -2549,14 +2859,21 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         const base = jsonPlanners.get(entry.rel.id);
         if (base === undefined) continue;
         const saved = cut?.kind === "json" && cut.rel === entry.rel.id ? cut.phase : null;
+        const builder = jsonAggregateRecipes.get(entry.rel.id);
+        if (builder)
+          entry.rel = {
+            id: entry.rel.id,
+            op: saved?.emit || entry.rel.id !== frontier ? "project" : "aggregate",
+            profileAs: { id: entry.rel.id, op: "aggregate" },
+          };
         entry.minimum = saved
           ? base +
             (saved.emit ? 0 : (jsonCapacities.get(runtime)?.get(entry.rel.id) ?? saved.capacity)) +
             (saved.ownedDelivery ? 0 : saved.retainedBytes)
           : entry.rel.id === frontier
-            ? base + (jsonCapacities.get(runtime)?.get(entry.rel.id) ?? 4096)
+            ? (builder?.minimum ?? base + (jsonCapacities.get(runtime)?.get(entry.rel.id) ?? 4096))
             : 0;
-        entry.loanSlots = 0;
+        entry.loanSlots = !saved && entry.rel.id === frontier ? (builder?.loans ?? 0) : 0;
       }
     };
     const nativeBase = new Map(
@@ -2885,6 +3202,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 aggregate.loanSlots = restore.loans;
                 aggregateChoices.get(runtime)?.set(cut.rel, restore);
               }
+              semanticActive = remaining;
               configureJson(next, cut);
               const parentProgress = configureRetained(next);
               // A cut in EXCEPT's left arm leaves its right input unopened. Carry the
@@ -2903,7 +3221,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 runtime.resultProgressEnvelope(
                   owned
                     ? Math.max(
-                        (frontier ? 1 : 2) * cut.phase.retainedBytes,
+                        (frontier || cut.phase.aggregateValueBytes !== undefined ? 1 : 2) *
+                          cut.phase.retainedBytes,
                         frontier ? 0 : parentProgress,
                       )
                     : frontier
@@ -2917,7 +3236,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               if (
                 cut.kind === "json" &&
                 !cut.phase.emit &&
-                runtime.minimumBytes(next, logicalInputs, binding.largestSlot) +
+                runtime.minimumBytes(next, logicalInputs, binding.largestSlot, binding.slotBytes) +
                   binding.bytes -
                   logicalInputs >
                   runtime.request.governor.capBytes
@@ -3002,7 +3321,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             ),
           );
           bounds.set(source.id, bound);
-          const keyColumns = keySources.get(source.id);
+          const keyColumns = joinKeySources.get(source.id);
           if (keyColumns)
             for (const index of keyColumns) {
               const column = source.columns[index],
@@ -3027,10 +3346,37 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                   runtime.metadataCaches(source.retain !== false, sources),
                 ),
               );
-              const widths = keyColumnBytes.get(source.id) ?? new Map<number, number>();
+              const widths = joinKeyColumnBytes.get(source.id) ?? new Map<number, number>();
               widths.set(index, row.valueBytes ?? row.progress / 4);
-              keyColumnBytes.set(source.id, widths);
+              joinKeyColumnBytes.set(source.id, widths);
             }
+          for (const column of jsonGroupSources.get(source.id) ?? []) {
+            const name = source.columns[column],
+              type = source.types[column];
+            if (name === undefined || type === undefined)
+              throw new Error("Missing semantic key column");
+            const row = yield* readValue(
+              boundSource(
+                runtime.view,
+                {
+                  ...source,
+                  columns: [name],
+                  singleValueBound: true,
+                  types: [type],
+                  stagingBytes: 0,
+                  windowBytes: 0,
+                  rows: demand.get(source.id) ?? null,
+                },
+                runtime.request.governor,
+                runtime.signal,
+                1,
+                1,
+              ),
+            );
+            const columns = jsonGroupColumnBytes.get(source.id) ?? new Map<number, number>();
+            columns.set(column, row.valueBytes ?? row.progress / 4);
+            jsonGroupColumnBytes.set(source.id, columns);
+          }
           io = Math.max(io, bound.io);
           progress = Math.max(progress, bound.progress);
         }

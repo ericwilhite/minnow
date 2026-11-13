@@ -353,3 +353,24 @@ phase handoff, already-admitted owned parameter copies may be checkpointed. Init
 oversized-parameter refusal remains unchanged. Byte payloads are written in bounded
 fragments and restored only inside the new admitted input account. Caller buffers
 are never reread; their contents may already have changed.
+
+## JSON group comparisons and delivery
+
+JSONB and SQL-array group boundaries reserve both decoded semantic operands as one step.
+Representatives using at most 64 KiB of charged storage remain in the fixed workspace;
+larger keys use a native
+record file between input rows. Restoration prepays its retained row, comparison operands
+and bounded I/O before reading. Every borrowed byte retires before the next row.
+Semantic source bounds measure one row separately from the ordinary batch read envelope;
+parameters and expanding JSON checkpoints retain their complete measured bounds.
+Tiny ungrouped JSON aggregates use 512 KiB of shared fixed workspace plus 256 KiB per
+transition, with independent sort minima where needed. This is not a whole-query 2x bound.
+Result-owned delivery additionally reserves the exact frame descriptor metadata, so a
+fully occupied ordinary pool cannot make adopting an already charged payload need a new loan.
+
+JSON aggregate semantic grouping budgets follow the grouping columns separately from
+aggregate payloads. JSONB comparison reserves two decoded trees (24 bytes per encoded
+key byte per tree); SQL arrays use 32 bytes per key byte per tree. Ordinary encoded
+row copies remain separate. Literal and owned parameter fields retain their own bounds;
+source keys use selected-column one-row bounds. Expanding JSON checkpoints retain
+per-field byte high-water marks for the next atomic admission, without old grants.

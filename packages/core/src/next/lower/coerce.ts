@@ -33,6 +33,8 @@ import {
  * Its `expr` is a placeholder (text) until `coerce` or `settle` fixes it.
  */
 export interface Typed {
+  /** Internal composite rendered as JSON bytes only for a later JSON consumer. */
+  readonly record?: true;
   readonly expr: ScalarExpr;
   readonly nullable: boolean;
   /** Renders as a JS bigint (ruling R17.1; lower/result.ts). */
@@ -390,7 +392,8 @@ export function resolveFunction(
     return params === null ? [] : [{ overload, params }];
   });
   const heterogeneous = expanded.find(
-    ({ params }) => params.length > 0 && params.every((param) => param === "any"),
+    ({ params }) =>
+      params.includes("any") && params.every((param, i) => param === "any" || kinds[i] === param),
   );
   if (heterogeneous !== undefined) {
     if (heterogeneous.overload.unknown === "error" && kinds.includes("unknown"))
@@ -398,7 +401,11 @@ export function resolveFunction(
         "could not determine polymorphic type because input has type unknown",
         "42804",
       );
-    const types = args.map((arg) => settle(arg, parameters).expr.type);
+    const types = args.map((arg, i) =>
+      heterogeneous.params[i] === "any"
+        ? settle(arg, parameters).expr.type
+        : physicalTypeOfSql(heterogeneous.params[i] as SqlType),
+    );
     const binary = (
       heterogeneous.overload.jsonResult === "values"
         ? types.filter((_, i) => i % 2 === 1)

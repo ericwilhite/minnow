@@ -41,9 +41,13 @@ describe("compressed download budgets", () => {
     // Raise this combined cap once by 256 bytes; standalone client isolation is unchanged.
     // Native JSON call provenance: 571,749 combined gzip bytes (+208 over d0562725).
     // Raise this cap once by 256 bytes; private rebuild/test inputs stay unreachable.
+    // Aggregate/record provenance: 572,077 combined gzip bytes (+328); client unchanged.
+    // Raise once by 256 bytes; native/test inputs remain excluded.
+    // Reviewed record identity: 572,499 combined gzip bytes (+422); client unchanged.
+    // Raise once by 512; shared parser/optimizer only, with no next/ or test inputs.
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
-    ).toBeLessThanOrEqual(558.5 * 1024);
+    ).toBeLessThanOrEqual(559.25 * 1024);
   });
 });

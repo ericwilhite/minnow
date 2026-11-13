@@ -78,6 +78,7 @@ function byteCollation(collation: string | null | undefined): boolean {
 export const SOURCE_STRIDE = 1 << 16;
 /** The local index of a table source's row locator. */
 const LOCATOR_LOCAL = SOURCE_STRIDE - 1;
+const ROW_PRESENCE_LOCAL = SOURCE_STRIDE - 2;
 
 export const virtual = (source: number, local: number): number => source * SOURCE_STRIDE + local;
 export const sourceOf = (index: number): number => Math.floor(index / SOURCE_STRIDE);
@@ -108,6 +109,7 @@ interface Unit {
 type EntryKind = "base" | "inner" | "left" | "semi" | "anti" | "full";
 
 interface Resolved {
+  readonly record?: true;
   readonly local: number;
   readonly type: PhysicalType;
   readonly nullable: boolean;
@@ -122,6 +124,7 @@ interface Entry {
   /** Null-supplied by an outer join: its columns read NULL-extended, nothing is pushed into it. */
   readonly nullSupplied: boolean;
   resolve(name: string): Resolved | undefined;
+  field(ordinal: number): Resolved | undefined;
   /** Visible column names, for `*`. */
   names(): string[];
   /** The entry's relation over `pushed` conjuncts (typed over its local positions). */
@@ -168,23 +171,29 @@ function relationEntry(
   builder: PlanBuilder,
 ): Entry {
   const columns = inner.columns;
+  let visible: readonly number[] | null = null;
+  const field = (local: number): Resolved | undefined => {
+    const found = columns[local];
+    return found === undefined
+      ? undefined
+      : {
+          local,
+          type: found.type,
+          nullable: found.nullable,
+          big: found.big,
+          ...(found.record ? { record: true as const } : {}),
+          ...(found.collation === undefined ? {} : { collation: found.collation }),
+        };
+  };
   return {
     source,
     kind,
     qualifiers,
     nullSupplied,
-    resolve: (name) => {
-      const local = columns.findIndex((candidate) => candidate.name === name);
-      const found = columns[local];
-      return found === undefined
-        ? undefined
-        : {
-            local,
-            type: found.type,
-            nullable: found.nullable,
-            big: found.big,
-            ...(found.collation === undefined ? {} : { collation: found.collation }),
-          };
+    resolve: (name) => field(columns.findIndex((candidate) => candidate.name === name)),
+    field: (ordinal) => {
+      visible ??= columns.flatMap((c, i) => (c.name.startsWith(HIDDEN) ? [] : [i]));
+      return field(visible[ordinal] ?? -1);
     },
     names: () => columns.map((col) => col.name).filter((name) => !name.startsWith(HIDDEN)),
     build: (pushed) => {
@@ -221,6 +230,7 @@ function tableEntry(
   builder: PlanBuilder,
 ): Entry {
   const read = new TableRead(table, alias);
+  let fields: typeof table.columns | null = null;
   return {
     source,
     kind,
@@ -236,6 +246,17 @@ function tableEntry(
         nullable: def.nullable,
         big: def.type.kind === "int64",
       };
+    },
+    field: (ordinal) => {
+      const def = (fields ??= table.columns.filter((c) => !c.name.startsWith(HIDDEN)))[ordinal];
+      return def === undefined
+        ? undefined
+        : {
+            local: read.use(def),
+            type: def.type,
+            nullable: def.nullable,
+            big: def.type.kind === "int64",
+          };
     },
     names: () => table.columns.map((def) => def.name),
     build: (pushed, locator) => {
@@ -370,11 +391,42 @@ export function lowerFrom(
     expr: column(virtual(entry.source, found.local), found.type),
     nullable: found.nullable || entry.nullSupplied,
     big: found.big,
+    ...(found.record ? { record: true as const } : {}),
     ...(found.collation === undefined ? {} : { collation: found.collation }),
   });
   const attachments: Attachment[] = [];
 
+  const rowMarkers = new Set<number>();
   const scope: Scope = {
+    rowField: (qualifier, ordinal) => {
+      const entry = byQualifier(qualifier)[0];
+      const found = entry?.field(ordinal);
+      return entry && found ? typedOf(entry, found) : undefined;
+    },
+    rowPresence: (qualifier) => {
+      const entry = byQualifier(qualifier)[0];
+      if (!entry?.nullSupplied) return { expr: boolLiteral(true), nullable: false, big: false };
+      for (const name of entry.names()) {
+        const found = entry.resolve(name);
+        if (found && !found.nullable)
+          return {
+            expr: {
+              op: "isNull",
+              negated: true,
+              arg: typedOf(entry, found).expr,
+              type: { kind: "bool" },
+            },
+            nullable: false,
+            big: false,
+          };
+      }
+      rowMarkers.add(entry.source);
+      return {
+        expr: column(virtual(entry.source, ROW_PRESENCE_LOCAL), { kind: "bool" }),
+        nullable: true,
+        big: false,
+      };
+    },
     column: (reference) => {
       const dot = reference.indexOf(".");
       if (dot !== -1) {
@@ -798,7 +850,24 @@ export function lowerFrom(
           ...typed,
           expr: mapColumns(typed.expr, (index) => index - entry.source * SOURCE_STRIDE),
         }));
-        return entry.build(local, locators.has(entry.source));
+        const unit = entry.build(local, locators.has(entry.source));
+        if (!rowMarkers.has(entry.source)) return unit;
+        const columns: RelColumn[] = [
+          ...unit.columns,
+          { name: "\0row-presence", type: { kind: "bool" }, nullable: false, big: false },
+        ];
+        return {
+          ...unit,
+          columns,
+          layout: [...unit.layout, virtual(entry.source, ROW_PRESENCE_LOCAL)],
+          rel: {
+            op: "project",
+            id: builder.id(),
+            input: unit.rel,
+            exprs: [...unit.columns.map((c, i) => column(i, c.type)), boolLiteral(true)],
+            output: outputColumns(columns),
+          },
+        };
       };
       let acc: Unit | null = null;
       let group: Unit[] = [];

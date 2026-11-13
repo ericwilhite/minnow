@@ -41,6 +41,36 @@ name or explicitly delete the old database. The current 0.x engine and its compa
 readers are unchanged; future upgrade and frozen-fixture obligations for the new chain start
 with the first released 1.0 writer.
 
+The unexported rebuild sizes JSON aggregate semantic grouping workspace from grouping
+keys separately from payload columns. Wide payloads with small JSONB keys no longer
+inherit the key decoder's multiplier and falsely exceed the query cap. Decoded grouping
+workspace is reserved only at the consumers that use it, rather than copied into every
+progress lane and later delivery phase. Aggregate ORDER BY helpers independently fund
+their actual structural ordering keys. Outer sorts and windows reserve their own key
+workspace after handoff; aggregate results use measured checkpoint fields rather than
+unrelated input literals. Wide stored array boundaries compare byte-valued elements
+directly, preserving small-cap execution under competing memory pressure. Shipped behavior,
+public APIs and stored formats are unchanged; no migration is needed.
+
+The unexported rebuild now executes JSON array/object aggregation with primitive, JSONB and SQL-array
+grouping keys and whole-row JSON rendering,
+enabling all 66 frozen catalogue cells. Aggregate ORDER BY, FILTER, NULL policies, duplicate
+keys and output text match PostgreSQL. Whole-row rendering preserves duplicate and quoted
+field names independently of internal binding ids. Group boundaries use PostgreSQL equality;
+wide representative keys spill without retaining a progress loan between rows. Tiny scalar
+aggregates use a smaller fixed workspace. Growing groups use charged native spill fragments and
+cancellable admission. Direct delivery accepts a single final aggregate value at half the cap;
+its next byte reports typed `53200`. Result-owned delivery avoids another payload copy. The shipped engine,
+public API and stored formats are unchanged; no migration is needed. Native parser/optimizer
+provenance adds 2,029/2,029/2,031 raw bytes to main/OPFS/IndexedDB (810/839/711 gzip)
+relative to the constructor front end. Their raw caps rise by 2,304 bytes and gzip by
+896/896/768 across the aggregate and field-identity changes. Before rebase, the worker plus separate client
+measured 572,499 gzip bytes; its combined cap rose by 768, with the client unchanged. The core
+tarball measured 1,025,206 packed bytes on that baseline. After integration with main `92b8e192`,
+it measures 1,025,470 packed and 4,442,940 unpacked bytes. The combined packed cap is 1,025,500,
+750 bytes above main's 1,024,750; no further increase is needed. Private rebuild/test inputs
+remain excluded; unpacked and isolation budgets stay unchanged.
+
 The unexported rebuild's JSON and JSONB constructors now preserve PostgreSQL's float4/float8
 decimal spelling at rounding and exponent boundaries, including subnormals and signed zero.
 The ordinary path reuses proven native shortest digits; exact interval arithmetic remains for
@@ -51,8 +81,7 @@ the public API and stored formats are unchanged; no migration is needed.
 The unexported rebuild now constructs typed JSON objects and arrays, including the SQL
 `KEY … VALUE` form and PostgreSQL's `json_build_*` / `jsonb_build_*` spellings. It preserves
 PostgreSQL's text formatting, exact numeric scale, duplicate keys, escaping and NULL policies.
-Growing results use charged spill checkpoints and cancellable re-admission. JSON aggregation
-and whole-row rendering remain separate work. Results use charged, result-owned delivery buffers
+Growing results use charged spill checkpoints and cancellable re-admission. JSON aggregation and whole-row rendering now use the same controller. Results use charged, result-owned delivery buffers
 that transfer to consumer frames without another payload copy. A direct scalar delivery reserves
 two serialized row sizes plus bounded I/O, metadata and owned inputs; nested consumed values
 are retired. Transient pressure waits cancellably, while a complete irreducible recipe larger
@@ -87,8 +116,7 @@ keep PostgreSQL’s error order, including competing Unicode, token and numeric 
 charged spill checkpoints and cancellable re-admission through unary, EXCEPT, join and window
 parents. Eligible hybrid aggregates use the same handoff path; completed join builds are not
 read again and window input order is preserved. Potential cuts retain the ordinary window
-fast routes through empty handoffs and until a nonempty checkpoint requires conversion. JSON paths,
-aggregation and whole-row construction remain refused. The shipped engine, public API and stored formats
+fast routes through empty handoffs and until a nonempty checkpoint requires conversion. JSON paths remain refused; aggregation and whole-row rendering are covered above. The shipped engine, public API and stored formats
 are unchanged; no migration is needed.
 
 The unexported rebuild now keeps `DATE_PART(text, INTERVAL)` as PostgreSQL's double precision
@@ -117,7 +145,7 @@ The SELECT guide and internal analytics catalogue's guide-9 JSON example now cas
 resolving PostgreSQL's ambiguous untyped extraction operator (`42725`). Its data and path are
 unchanged. PostgreSQL, the current engine and the private rebuild return the same text result.
 The rebuild now has charged, cancellable JSON extraction kernels that preserve raw number text,
-duplicate keys and whitespace. JSON aggregation and whole-row rendering remain separate follow-up work. Published runtime behavior, public API and
+duplicate keys and whitespace. JSON aggregation and whole-row rendering now execute as described above. Published runtime behavior, public API and
 stored formats are unchanged; no migration is needed.
 
 Affected packages: `@minnowdb/core` (SQL feature metadata and compatibility documentation) and

@@ -463,37 +463,29 @@ export type CatalogueRefusal =
       readonly stage: "lower" | "execute";
       readonly construct: string | null;
     };
-export const CATALOGUE_REFUSALS: Readonly<Record<string, CatalogueRefusal>> = {
-  "guide-7": {
-    class: "UnsupportedPlanError",
-    sqlState: "0A000",
-    stage: "lower",
-    construct: "aggregate",
-  },
-  "guide-8": {
-    class: "UnsupportedPlanError",
-    sqlState: "0A000",
-    stage: "lower",
-    construct: "function",
-  },
-};
+export const CATALOGUE_REFUSALS: Readonly<Record<string, CatalogueRefusal>> = {};
 
-/** Each remaining cell has an explicit missing semantic capability and an authority outcome.
- * These explain capability refusals, never waive a successful result comparison. */
+/** No frozen catalogue cells remain refused. Refusals outside this catalogue stay in INVENTORY. */
 export const CATALOGUE_REFUSAL_REASONS: Readonly<
   Record<string, { readonly reason: string; readonly pgState: "00000" | "42725" }>
-> = {
-  "guide-7": {
-    reason:
-      "JSON_OBJECT construction now executes; JSON_ARRAYAGG still needs a charged, spillable JSON accumulator.",
-    pgState: "00000",
-  },
-  "guide-8": {
-    reason:
-      "Whole-row json_agg requires record typing and bounded JSON accumulation; its parser-expanded record remains an explicit ROW_OBJECT refusal.",
-    pgState: "00000",
-  },
-};
+> = {};
+
+/** JSON aggregates preserve their input stream order. The frozen SQL omits aggregate ORDER BY,
+ * which PostgreSQL documents as unspecified. For this fixed, plentiful-memory catalogue shape,
+ * next's join emits each order's items in order_item_id DESC (verified by the harness). Pin PG
+ * to that same input order, without changing frozen SQL, data, or comparing reordered arrays.
+ * The correlated record aggregate receives order_id ASC; pin its authority likewise.
+ * JSON parser overrides in the harness preserve PG's wire text, including whitespace and keys.
+ */
+const JSON_GUIDE_7 = (direction: "ASC" | "DESC") => `SELECT JSON_OBJECT(
+  'id' VALUE o.order_id, 'detail' VALUE JSON_OBJECT('status' VALUE o.status),
+  'items' VALUE JSON_ARRAYAGG(JSON_OBJECT('sku' VALUE p.sku) ORDER BY i.order_item_id ${direction})
+) AS document FROM orders o JOIN order_items i ON i.order_id=o.order_id
+JOIN products p ON p.product_id=i.product_id GROUP BY o.order_id,o.status`;
+const JSON_GUIDE_8 = `SELECT c.customer_id,
+  (SELECT COALESCE(json_agg(agg ORDER BY agg.order_id), '[]')
+   FROM (SELECT o.order_id,o.total FROM orders o WHERE o.customer_id=c.customer_id) agg) AS orders
+FROM customers c`;
 
 /** PostgreSQL's unordered FLOAT8 SUM permits different accumulation orders. These two
  * unchanged catalogue cells promise next-core input order (agg/states.ts, stable group radix
@@ -503,6 +495,8 @@ export const CATALOGUE_REFUSAL_REASONS: Readonly<
  * https://www.postgresql.org/docs/18/functions-aggregate.html (input order unspecified).
  */
 export const CATALOGUE_QUERY_AUTHORITY: Readonly<Record<string, string>> = {
+  "guide-7": JSON_GUIDE_7("DESC"),
+  "guide-8": JSON_GUIDE_8,
   "guide-13": `WITH monthly AS (
     SELECT DATE_TRUNC('month', placed_at) AS month, SUM(total ORDER BY order_id) AS revenue
     FROM orders WHERE status = 'completed' GROUP BY DATE_TRUNC('month', placed_at)
@@ -527,6 +521,11 @@ export const CATALOGUE_QUERY_AUTHORITY: Readonly<Record<string, string>> = {
 // R21: the shipped engine's EXTRACT yields float8, while PostgreSQL/next use NUMERIC.
 // Cast only the independent legacy witness. The frozen guide-15 SQL and next PG answer stay exact.
 export const CATALOGUE_CURRENT_AUTHORITY: Readonly<Record<string, string>> = {
+  // R21: legacy emits compact JSON strings. These frozen documents have no JSON nulls
+  // (asserted in the harness), so PG json_strip_nulls changes whitespace only. The
+  // independent PG witness stays exact text; next is compared to the original spelling.
+  "guide-7": `SELECT json_strip_nulls(document)::text AS document FROM (${JSON_GUIDE_7("ASC")})q`,
+  "guide-8": `SELECT customer_id,json_strip_nulls(orders)::text AS orders FROM (${JSON_GUIDE_8})q`,
   "guide-15": `SELECT day, COUNT(o.order_id) AS orders,
     (EXTRACT(EPOCH FROM MAX(o.placed_at)-MIN(o.placed_at))/3600)::double precision AS busy_hours
     FROM generate_series(TIMESTAMP '2025-03-01',TIMESTAMP '2025-03-31',INTERVAL '1 day') AS day

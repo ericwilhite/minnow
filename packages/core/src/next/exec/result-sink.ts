@@ -47,6 +47,10 @@ export interface ResultSinkOptions {
   readonly now?: () => number;
 }
 
+/** Frame wrappers coexist with a source's already charged result-owned buffers. */
+export const resultFrameMetadataBytes = (columns: number): number =>
+  OBJECT_OVERHEAD_BYTES * (3 + 2 * columns);
+
 export class ResultSink implements Operator {
   readonly reclassifiesTransfers = true;
   readonly deferEnd: boolean;
@@ -84,7 +88,7 @@ export class ResultSink implements Operator {
     this.#clock = clockFor(options.now);
     if (this.#maxRows !== null && (!Number.isSafeInteger(this.#maxRows) || this.#maxRows <= 0))
       throw new TypeError("positive result frame row limit required");
-    this.#metadataBytes = OBJECT_OVERHEAD_BYTES * (3 + 2 * types.length);
+    this.#metadataBytes = resultFrameMetadataBytes(types.length);
     this.#target = Math.min(RESULT_FRAME_TARGET_BYTES, channel.windowBytes);
     let rows = 1;
     const maximum = Math.min(BATCH_ROWS, this.#maxRows ?? BATCH_ROWS);

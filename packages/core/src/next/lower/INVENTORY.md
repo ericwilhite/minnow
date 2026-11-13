@@ -61,34 +61,34 @@ Status:
 
 ## Expressions (`Expression`)
 
-| Front-end construct                                                                                             | IR                                                                                                                                                                                                                                                                     | Status                                                                                                          |
-| --------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `literal`                                                                                                       | `literal` (integer: int4, else int8, else numeric, by magnitude; `exactText`/`decimal` → numeric with its scale; `timestamp`/`zoned` → timestamp(tz); `sqlDomain` → that type; string → PostgreSQL's `unknown`, typed by context)                                      | M1                                                                                                              |
-| `parameter`                                                                                                     | `param` slot `index`; type from its position (or `parameterTypes`), `text` when nothing fixes it                                                                                                                                                                       | M1                                                                                                              |
-| `column`                                                                                                        | `column` by position                                                                                                                                                                                                                                                   | M1                                                                                                              |
-| `binary` (`+ - * / % ‖`)                                                                                        | `call` (`add`, `sub`, `mul`, `div`, `mod`, `concat`) resolved by operand types; `integer` flag ignored: integer `/` falls out of int types                                                                                                                             | M1                                                                                                              |
-| `call` scalar function                                                                                          | `call` with the PostgreSQL function name, overload resolved                                                                                                                                                                                                            | M1                                                                                                              |
-| `CAST`                                                                                                          | `cast` to the target type (`declaredTypeName` for numeric targets, C5)                                                                                                                                                                                                 | M1                                                                                                              |
-| `MINNOW_COLLATE`                                                                                                | the collation of the enclosing `compare` / `inList` / `SortKey`                                                                                                                                                                                                        | M1                                                                                                              |
-| `MINNOW_TIMESTAMP_TEXT`, `MINNOW_TO_CHAR_LOCAL`                                                                 | dropped: `timestamp(zoned: false)` already renders without a zone                                                                                                                                                                                                      | M1                                                                                                              |
-| `MINNOW_JSON_GET(_TEXT)`                                                                                        | `call` (`json_get`, `json_get_text`), typed JSON/JSONB extraction; source-bounded raw JSON and checkpointed JSONB project/filter execution                                                                                                                             | M1                                                                                                              |
-| `MINNOW_ARRAY_*`, `MINNOW_REGEX_MATCH`, `ARRAY`                                                                 | `call` (`array_at`…, `regex_match`)                                                                                                                                                                                                                                    | L                                                                                                               |
-| `MINNOW_TUPLE_KEY` (decorrelation)                                                                              | several `join` keys (one per tuple member, `nullSafe` per the decorrelator)                                                                                                                                                                                            | L                                                                                                               |
-| `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `LOCALTIME`                                                                | casts of the clock `param`                                                                                                                                                                                                                                             | M1                                                                                                              |
-| `NEXTVAL`, `CURRVAL` (sequence name resolved from the catalog)                                                  | `call` `nextval` / `currval` with the sequence id                                                                                                                                                                                                                      | M1                                                                                                              |
-| `RANDOM`, `GEN_RANDOM_UUID`                                                                                     | `call`; sets `volatile`                                                                                                                                                                                                                                                | M1                                                                                                              |
-| aggregate `call` (COUNT, SUM, AVG, MIN, MAX, STRING_AGG, JSON_ARRAYAGG, percentiles, MODE, MINNOW_SINGLE_VALUE) | `AggregateCall` (`distinct`, `filter`, `orderBy`); SUM(int2/int4) → int64, SUM(int8) → decimal(null, 0), AVG(int/float) → float64 (C11)                                                                                                                                | M1 (scalar-fraction numeric ordered sets supported; interval interpolation and JSON aggregates: L, `aggregate`) |
-| `window`                                                                                                        | `WindowCall` in a `window` operator (the front end already moved them into `windowed` sources)                                                                                                                                                                         | M3                                                                                                              |
-| `condition` comparisons, `IS [NOT] DISTINCT FROM`, `IS [NOT] NULL`, `IS TRUE`                                   | `compare`, `distinctFrom`, `isNull`; `IS TRUE` is `distinctFrom` (negated, literal true)                                                                                                                                                                               | M1                                                                                                              |
-| `condition` `IN` / `NOT IN` list                                                                                | `inList`                                                                                                                                                                                                                                                               | M1                                                                                                              |
-| `condition` `= ANY(array)` / `<> ALL(array)`                                                                    | `inList` for an `ARRAY[…]` of constants; `call` `any_array` / `all_array` (three-valued) for an array value                                                                                                                                                            | M3 for `ARRAY[…]`; L (`function`) for array values                                                              |
-| `condition` LIKE / ILIKE / SIMILAR TO                                                                           | `like` (`escape`)                                                                                                                                                                                                                                                      | M1                                                                                                              |
-| `logical`, `not`, `case`, `list`                                                                                | `and`/`or` (flattened), `not`, `case`, `inList` items                                                                                                                                                                                                                  | M1                                                                                                              |
-| uncorrelated `subquery` (scalar)                                                                                | `initPlans` slot + `param` (a `single_value` aggregate raises 21000 on a second row)                                                                                                                                                                                   | M3                                                                                                              |
-| uncorrelated `IN (subquery)` / `exists`                                                                         | `join` `semi` / `anti` / `mark`; an init plan where no join can attach (HAVING, grouped select lists, DML expressions)                                                                                                                                                 | M3                                                                                                              |
-| correlated `subquery` / `exists` / quantified, left by the decorrelator                                         | `apply` (`scalar` / `exists` / `quantified`), bindings into slots, `memoize` unless volatile. The decorrelator turns nearly all of them into joins first, and the front end refuses the shapes it cannot (see "Still needed" 4), so `apply` is rarely reached from SQL | M3                                                                                                              |
-| correlated subquery elsewhere (inside an aggregate argument, ORDER BY of a window)                              | none                                                                                                                                                                                                                                                                   | U (`correlatedSubquery`)                                                                                        |
-| a function the kernels do not provide yet                                                                       | none                                                                                                                                                                                                                                                                   | U (`function`)                                                                                                  |
+| Front-end construct                                                                                             | IR                                                                                                                                                                                                                                                                     | Status                                                                                                                 |
+| --------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `literal`                                                                                                       | `literal` (integer: int4, else int8, else numeric, by magnitude; `exactText`/`decimal` → numeric with its scale; `timestamp`/`zoned` → timestamp(tz); `sqlDomain` → that type; string → PostgreSQL's `unknown`, typed by context)                                      | M1                                                                                                                     |
+| `parameter`                                                                                                     | `param` slot `index`; type from its position (or `parameterTypes`), `text` when nothing fixes it                                                                                                                                                                       | M1                                                                                                                     |
+| `column`                                                                                                        | `column` by position                                                                                                                                                                                                                                                   | M1                                                                                                                     |
+| `binary` (`+ - * / % ‖`)                                                                                        | `call` (`add`, `sub`, `mul`, `div`, `mod`, `concat`) resolved by operand types; `integer` flag ignored: integer `/` falls out of int types                                                                                                                             | M1                                                                                                                     |
+| `call` scalar function                                                                                          | `call` with the PostgreSQL function name, overload resolved                                                                                                                                                                                                            | M1                                                                                                                     |
+| `CAST`                                                                                                          | `cast` to the target type (`declaredTypeName` for numeric targets, C5)                                                                                                                                                                                                 | M1                                                                                                                     |
+| `MINNOW_COLLATE`                                                                                                | the collation of the enclosing `compare` / `inList` / `SortKey`                                                                                                                                                                                                        | M1                                                                                                                     |
+| `MINNOW_TIMESTAMP_TEXT`, `MINNOW_TO_CHAR_LOCAL`                                                                 | dropped: `timestamp(zoned: false)` already renders without a zone                                                                                                                                                                                                      | M1                                                                                                                     |
+| `MINNOW_JSON_GET(_TEXT)`                                                                                        | `call` (`json_get`, `json_get_text`), typed JSON/JSONB extraction; source-bounded raw JSON and checkpointed JSONB project/filter execution                                                                                                                             | M1                                                                                                                     |
+| `MINNOW_ARRAY_*`, `MINNOW_REGEX_MATCH`, `ARRAY`                                                                 | `call` (`array_at`…, `regex_match`)                                                                                                                                                                                                                                    | L                                                                                                                      |
+| `MINNOW_TUPLE_KEY` (decorrelation)                                                                              | several `join` keys (one per tuple member, `nullSafe` per the decorrelator)                                                                                                                                                                                            | L                                                                                                                      |
+| `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `LOCALTIME`                                                                | casts of the clock `param`                                                                                                                                                                                                                                             | M1                                                                                                                     |
+| `NEXTVAL`, `CURRVAL` (sequence name resolved from the catalog)                                                  | `call` `nextval` / `currval` with the sequence id                                                                                                                                                                                                                      | M1                                                                                                                     |
+| `RANDOM`, `GEN_RANDOM_UUID`                                                                                     | `call`; sets `volatile`                                                                                                                                                                                                                                                | M1                                                                                                                     |
+| aggregate `call` (COUNT, SUM, AVG, MIN, MAX, STRING_AGG, JSON_ARRAYAGG, percentiles, MODE, MINNOW_SINGLE_VALUE) | `AggregateCall` (`distinct`, `filter`, `orderBy`); SUM(int2/int4) → int64, SUM(int8) → decimal(null, 0), AVG(int/float) → float64 (C11)                                                                                                                                | M1 (scalar-fraction numeric ordered sets supported; JSON aggregates supported; interval interpolation: L, `aggregate`) |
+| `window`                                                                                                        | `WindowCall` in a `window` operator (the front end already moved them into `windowed` sources)                                                                                                                                                                         | M3                                                                                                                     |
+| `condition` comparisons, `IS [NOT] DISTINCT FROM`, `IS [NOT] NULL`, `IS TRUE`                                   | `compare`, `distinctFrom`, `isNull`; `IS TRUE` is `distinctFrom` (negated, literal true)                                                                                                                                                                               | M1                                                                                                                     |
+| `condition` `IN` / `NOT IN` list                                                                                | `inList`                                                                                                                                                                                                                                                               | M1                                                                                                                     |
+| `condition` `= ANY(array)` / `<> ALL(array)`                                                                    | `inList` for an `ARRAY[…]` of constants; `call` `any_array` / `all_array` (three-valued) for an array value                                                                                                                                                            | M3 for `ARRAY[…]`; L (`function`) for array values                                                                     |
+| `condition` LIKE / ILIKE / SIMILAR TO                                                                           | `like` (`escape`)                                                                                                                                                                                                                                                      | M1                                                                                                                     |
+| `logical`, `not`, `case`, `list`                                                                                | `and`/`or` (flattened), `not`, `case`, `inList` items                                                                                                                                                                                                                  | M1                                                                                                                     |
+| uncorrelated `subquery` (scalar)                                                                                | `initPlans` slot + `param` (a `single_value` aggregate raises 21000 on a second row)                                                                                                                                                                                   | M3                                                                                                                     |
+| uncorrelated `IN (subquery)` / `exists`                                                                         | `join` `semi` / `anti` / `mark`; an init plan where no join can attach (HAVING, grouped select lists, DML expressions)                                                                                                                                                 | M3                                                                                                                     |
+| correlated `subquery` / `exists` / quantified, left by the decorrelator                                         | `apply` (`scalar` / `exists` / `quantified`), bindings into slots, `memoize` unless volatile. The decorrelator turns nearly all of them into joins first, and the front end refuses the shapes it cannot (see "Still needed" 4), so `apply` is rarely reached from SQL | M3                                                                                                                     |
+| correlated subquery elsewhere (inside an aggregate argument, ORDER BY of a window)                              | none                                                                                                                                                                                                                                                                   | U (`correlatedSubquery`)                                                                                               |
+| a function the kernels do not provide yet                                                                       | none                                                                                                                                                                                                                                                                   | U (`function`)                                                                                                         |
 
 ## Statements (`CompiledStatement`)
 
@@ -318,17 +318,13 @@ The literal plan-cache scanner uses these signed integer ranges too, including b
 minima. Lifted slots and the client's own parameter types agree with the original
 PG-typed expression; decimal spellings and nonliteral arithmetic stay unlifted.
 
-## Remaining frozen-catalogue refusals
+## Frozen catalogue
 
-The registry in `testing/divergences.ts` names every remaining refusal and its reason. The
-catalogue suite checks its exact class, stage, construct and SQLSTATE, and executes each refused
-SQL statement against PGlite to verify the authority outcome. These are capability limits of
-this unexported core; they do not describe the shipped engine's SQL support.
-
-| Cell    | Stage / construct | Reason                                                                                                    |
-| ------- | ----------------- | --------------------------------------------------------------------------------------------------------- |
-| guide-7 | lower / function  | JSON_OBJECT construction executes; JSON_ARRAYAGG still needs charged, spillable JSON accumulation.        |
-| guide-8 | lower / function  | Whole-row json_agg needs record typing and bounded JSON accumulation; its expanded ROW_OBJECT is refused. |
+All **66/66** cells now lower and execute against PGlite and the shipped engine. Frozen SQL
+and data are unchanged by JSON aggregation. The refusal registries are empty; this does not
+claim every SQL form outside the frozen catalogue. Unordered JSON aggregate authorities pin
+PG to the measured input order for those shapes. PG wire JSON text is compared exactly;
+the shipped compact-text witness is separate and guarded against removing NULL members.
 
 Canonical DATE literals now lower directly to epoch-day vectors using the binder's shared
 canonical parser. The shipped SQL front end still limits DATE literal spelling to AD years
@@ -452,8 +448,8 @@ workspace before copying. They retain ordinary fast routes through empty-prefix 
 and until a nonempty cut or grouped pressure fallback; only then is peer-stable input converted to ordinal continuation. Both producer kinds retain one shared idle account and cleanup ownership
 through cancellation, I/O faults and concurrent continuations.
 Document parameters, lazy init values, foreign expanding document producers, front-end materialized
-JSON/JSONB literals and JSON ↔ JSONB casts remain explicit refusals. JSON paths and
-aggregation remain separate work; guide-7/8 remain the only two catalogue refusals (64/66 execute).
+JSON/JSONB literals and JSON ↔ JSONB casts remain explicit refusals. JSON paths remain separate work. JSON aggregation and whole-row JSON rendering now enable
+guide-7/8 (66/66 execute).
 Canonicalization uses bounded scratch and iterative traversal, with quadratic CPU for wide objects;
 there is no claimed wide-object speedup. No published engine behavior or stored format changes here.
 
@@ -527,9 +523,10 @@ values are supported. Float rendering uses PostgreSQL's open binary rounding int
 closest shortest decimal with ties to even, and float4/float8 exponent thresholds. JSONB parses
 that exact decimal output; it does not round through a JavaScript number or use the lower
 precision float-to-NUMERIC cast. Subnormal values and signed zero follow PostgreSQL.
-Array/UUID/BYTEA/composite value kernels, ROW_TO_JSON and JSON aggregates
-retain typed refusals. JSON_OBJECT's array overload syntax is not supported. Existing document-provenance and
-volatile-expression limits remain. No new catalogue cell is enabled yet (64/66).
+Array/UUID/BYTEA value kernels retain typed refusals. JSON_OBJECT's array overload syntax is not
+supported. Existing document-provenance and volatile-expression limits remain. Whole-row values
+are accepted only by JSON consumers, with a private record category through derived projections;
+bare record output and other record operations remain typed refusals.
 
 #### JSON value admission and delivery
 
@@ -562,3 +559,83 @@ Ryu tables, per-row BigInt interval search on the ordinary path, or new admissio
 Partial result ownership survives pending checkpoint I/O, cancellation and faults until that I/O
 settles. Offered frames own their backing storage until credit; foreign grants and reusable slabs
 remain ineligible for adoption. The ephemeral checkpoint descriptors do not change stored formats.
+
+#### JSON aggregation and records
+
+`json_agg`, `jsonb_agg`, SQL `JSON_ARRAYAGG`, `json_object_agg` and `jsonb_object_agg` execute
+with aggregate-local ORDER BY and FILTER. FILTER masks both argument and ordering evaluation,
+so rejected rows do not raise their conversion errors; filter errors precede value errors.
+Strict and unique object variants retain PostgreSQL's
+NULL-key, duplicate-key and transition-error order. SQL array aggregation omits SQL NULLs by
+default; ordinary arrays retain them. Empty input is SQL NULL; strict nonempty all-NULL input
+produces an empty array/object. JSON object text keeps duplicates, key order and PG spacing;
+JSONB orders keys by UTF8 length then bytes and retains the last non-skipped value. Numeric
+scale, float spelling, escapes and record separators follow PG exactly. ROW_TO_JSON (including
+its spacing argument), TO_JSON(record), TO_JSONB(record), nested ROW values, and absent outer
+rows preserve their distinct NULL rules. A present all-NULL row remains an object. Record
+labels retain their declared spelling, duplicates and quoted identifier identity through derived
+queries, CTEs, wildcard expansion and projection rewrites; unique binding ids stay separate.
+
+Only one group and bounded fragments are resident. Values append to native BYTES pages with
+file-backed links; key/value/order sorts use the shared spill service and task clock. JSONB
+object values are converted in input order before the key-selection sort. No per-group or
+per-value page-reference array grows with input. COUNT/SUM/AVG/MIN/MAX/boolean scalar siblings
+share the existing charged accumulators one group at a time. JSONB and SQL-array grouping
+keys use PostgreSQL semantic equality, including numeric scale differences and NULL array
+elements. Comparisons charge both decoded operands before allocating either. Wide representative
+keys spill between rows and restore inside a complete prepaid read/compare/write step, so no
+progress loan survives from one input row to the next. Plain JSON grouping reports
+PostgreSQL's `42883`. Ordered/distinct scalar siblings,
+DISTINCT object aggregates, DISTINCT JSONB/composite inputs, grouping sets, windowed JSON
+aggregates and SQL/JSON RETURNING/NULL policy clauses remain unsupported. Typed scalar array
+DISTINCT honors PG ordering; plain JSON has no equality operator (42883).
+
+A final single serialized aggregate value is checked against **cap / 2** as it streams: equality
+fits; its next byte reports typed 53200 with the exact requested two-copy size. Intermediate
+JSONB duplicate values spill and are not mistaken for the final value. Completed aggregate rows
+are streamed into result-owned buffers and transferred without another payload copy. A proved
+canonical JSONB-to-TEXT cast (or representation-preserving JSON-to-TEXT) forwards ownership;
+raw JSONB scans/literals still canonicalize. Only file delivery survives the cut, so its physical
+reservation is a project, profiled as the aggregate, with no retired sort-progress loans.
+
+The fixed JSON transition workspace admits a tiny `json_agg`, `jsonb_agg` or `json_object_agg`
+under a 4 MiB complete query cap. JSONB object key deduplication retains the shared sort
+recipe; the small-cap suite uses 8..10 MiB
+for that family. Semantic source operands use a measured one-row bound rather than multiplying
+a whole batch-sized read floor. Owned delivery includes its exact frame metadata alongside
+the transferred payload.
+
+Other retaining parents keep their actual native minima/progress reservations; this is not a
+2x whole-query bound for arbitrary compositions. The independent boundary generator uses
+16..20 MiB caps and actual storage; the pressure family uses 64 MiB because its existing EXCEPT
+and extraction recipe exceeds 32 MiB. A competing native grant fills all remaining credit,
+including reserve, proving waits/cancellation without reducing history sizes or seed counts.
+Direct EXCEPT of multi-MiB TEXT under forced pressure retains a pre-existing compound-loan bug,
+reproduced without JSON on base 96448f6b; no JSON-specific refusal masks it. See the B6 EXCEPT
+progress-loan handoff for the separate reproducer. Private ephemeral pages do not change a
+supported stored format or require migration.
+
+JSON aggregate semantic grouping admission measures each grouping-key column independently
+from payload columns, including literal, owned-parameter, source and restored JSON fields.
+The 24-byte/JSONB-byte and 32-byte/array-byte decoded-key allowances apply to the two
+key operands, while unrelated payloads retain their ordinary row-copy reservation.
+These operands are reserved only for the active grouping/aggregate sort and boundary comparator,
+not for unrelated helper lanes or later delivery phases. A proven single input row needs
+no boundary comparator. Text, bytea and enum array boundaries compare bounded encoded
+element views instead of building another pair of decoded arrays; the grouping sort
+still funds its decoded operands. Numeric and interval arrays retain semantic comparison.
+Generated 10/16 MiB controls include 64 KiB literal JSONB keys, four distinct keys and
+wide stored JSONB/SQL-array keys while competing grants occupy all remaining credit.
+Separate 32 MiB histories add an aggregate ORDER BY using the same wide structural key:
+its second sort independently funds the decoded operands it actually consumes. Additional
+32 MiB histories reoccupy credit after the aggregate cut and exercise outer structural
+ORDER BY and window keys. Window controls use 60–64 KiB JSONB /6–6.5 KiB array keys:
+larger structural window keys hit the pre-existing native peer-flag allocation failure
+under competing credit (also reproduced on 55684d20 at 128 MiB), routed to the window owner.
+Those native consumers fund their own decoded operands;
+the semantic allowance is never carried as a global checkpoint envelope. Before aggregate
+outputs exist, outer structural consumers keep their native step bound; after checkpoint,
+their actual field widths replace it. An unrelated source prefix or literal is not an
+aggregate output width. Generated 12/16 MiB histories cover tiny/large opaque JSONB results
+under competing credit. Scalar
+aggregate ORDER BY lanes never inherit structural grouping-key decoder workspace.

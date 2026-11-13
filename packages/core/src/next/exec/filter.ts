@@ -128,8 +128,18 @@ export class ProjectOperator implements Operator {
     context: CompileContext,
     readonly downstream: Operator,
   ) {
-    this.#columnsOnly = exprs.every((expr) => expr.op === "column")
-      ? exprs.map((expr) => expr.index)
+    this.#columnsOnly = exprs.every(
+      (expr) =>
+        expr.op === "column" ||
+        (expr.op === "cast" && expr.jsonCanonical && expr.input.op === "column"),
+    )
+      ? exprs.map((expr) =>
+          expr.op === "column"
+            ? expr.index
+            : expr.op === "cast" && expr.input.op === "column"
+              ? expr.input.index
+              : -1,
+        )
       : null;
     this.#exprs = exprs.map((expr) => compileExpr(expr, context));
     this.#columns = new Array<Vector>(exprs.length);
@@ -141,10 +151,11 @@ export class ProjectOperator implements Operator {
   push(batch: Batch, transfer?: Transfer): PushResult {
     if (transfer?.detachableBuffers && this.#columnsOnly !== null) {
       // New column-list ownership: a retaining receiver must never observe #columns reused.
-      const columns = this.#columnsOnly.map((index) => {
+      const columns = this.#columnsOnly.map((index, c) => {
         const vector = batch.columns[index];
         if (vector === undefined) throw new TypeError("Missing projected column");
-        return vector;
+        const type = this.types[c];
+        return type && type.kind !== vector.type.kind ? { ...vector, type } : vector;
       });
       return this.downstream.push({ ...batch, columns }, transfer);
     }

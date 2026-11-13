@@ -15,6 +15,7 @@ import type { PlanningStatistics } from "./statistics.js";
 
 /** An output column of a lowered relation, with what result descriptors need. */
 export interface RelColumn {
+  readonly record?: true;
   readonly name: string;
   readonly type: PhysicalType;
   readonly nullable: boolean;
@@ -289,6 +290,7 @@ export function relationScope(columns: readonly RelColumn[], qualifiers: readonl
         expr: column(index, found.type),
         nullable: found.nullable,
         big: found.big,
+        ...(found.record ? { record: true as const } : {}),
         ...(found.collation === undefined ? {} : { collation: found.collation }),
       };
     },

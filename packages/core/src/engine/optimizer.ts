@@ -1,3 +1,4 @@
+import { copyJsonCall, jsonCallSource, rowFieldSource } from "./json-call-sources.js";
 import { encodeQueryIdentity } from "./query-identity.js";
 import { dateIsoString } from "../date-value.js";
 import { crossJoinPlan } from "../plan/model.js";
@@ -1866,6 +1867,30 @@ function decorrelateScalarSubquery(
   const inner = subquery.block;
   const passthrough = scalarPassthrough(inner);
   if (passthrough !== undefined) return passthrough;
+  // Native JSON result typing must precede an empty correlated-input fallback.
+  // Hoist a literal COALESCE fallback around the existing scalar aggregate rewrite;
+  // resolving COALESCE(NULL, '[]') alone would incorrectly settle it as TEXT.
+  const wrapped = inner.select[0];
+  if (
+    declaredTypesActive() &&
+    wrapped?.expression.kind === "call" &&
+    wrapped.expression.name === "COALESCE" &&
+    wrapped.expression.arguments.length === 2
+  ) {
+    const [aggregate, fallback] = wrapped.expression.arguments;
+    if (
+      aggregate?.kind === "call" &&
+      aggregate.name === "JSON_ARRAYAGG" &&
+      jsonCallSource(aggregate) !== undefined &&
+      fallback?.kind === "literal"
+    ) {
+      inner.select[0] = { ...wrapped, expression: aggregate };
+      return {
+        ...wrapped.expression,
+        arguments: [decorrelateScalarSubquery(block, subquery, scope, nextAlias), fallback],
+      };
+    }
+  }
   const item = inner.select[0];
   if (
     inner.select.length !== 1 ||
@@ -2176,6 +2201,7 @@ function decorrelateGeneralScalar(
         arguments: arguments_,
         ...(aggregateOrder === undefined ? {} : { aggregateOrderBy: aggregateOrder }),
       };
+      copyJsonCall(expression, rewritten);
       return rewritten;
     }
     if (expression.kind === "column" || expression.kind === "wildcard") {
@@ -2490,6 +2516,7 @@ function decorrelateNonEqualityScalar(
     ...aggregate,
     arguments: [{ kind: "column", reference: `${innerRowsAlias}.${correlationValueAlias}` }],
   };
+  copyJsonCall(aggregate, joinedAggregate);
   const probeReferences = correlationProbeColumns(probesAlias, keys);
   const aggregateBlock: CompiledQuery = {
     sql: "(range-correlated scalar aggregate)",
@@ -3467,7 +3494,9 @@ function foldExpression(expression: Expression): Expression {
         // A function that rejects its constant arguments folds nowhere; execution reports it.
       }
     }
-    return { ...expression, arguments: foldedArguments };
+    const rewritten = { ...expression, arguments: foldedArguments };
+    copyJsonCall(expression, rewritten);
+    return rewritten;
   }
   if (expression.kind === "list") {
     return { ...expression, items: expression.items.map(foldExpression) };
@@ -3656,7 +3685,9 @@ function rewriteForInner(
       if (rewritten === undefined) return undefined;
       rewrittenArguments.push(rewritten);
     }
-    return { ...expression, arguments: rewrittenArguments };
+    const rewritten = { ...expression, arguments: rewrittenArguments };
+    copyJsonCall(expression, rewritten);
+    return rewritten;
   }
   if (expression.kind === "list") {
     const rewrittenItems: Expression[] = [];
@@ -3776,6 +3807,19 @@ function referencedOutputAliases(
   const visit = (expression: Expression): void => {
     if (!state.provable) return;
     if (expression.kind === "column") {
+      // A deferred whole row is expanded only after a pending wildcard has bound.
+      // Its declaration cannot be pruned before that expansion names every field.
+      if (declaredTypesActive() && expression.reference === source.alias) {
+        state.provable = false;
+        return;
+      }
+      const field = rowFieldSource(expression);
+      if (field?.qualifier === source.alias) {
+        const name = source.derived?.select[field.ordinal]?.alias;
+        if (name === undefined) state.provable = false;
+        else referenced.add(name);
+        return;
+      }
       const parts = expression.reference.split(".");
       if (parts.length === 2) {
         if (parts[0] === source.alias) referenced.add(parts[1] ?? "");

@@ -30,7 +30,7 @@ import {
 } from "./parameters.js";
 import { RESULT_FRAME_TARGET_BYTES, RESULT_WINDOW_BYTES, ResultChannel } from "./result.js";
 import type { ResultAllocator } from "./result-buffer.js";
-import { ResultSink } from "./result-sink.js";
+import { ResultSink, resultFrameMetadataBytes } from "./result-sink.js";
 import type { ParameterSlots, CallResolver } from "./kernels/compile.js";
 import { ReservedGrant } from "./admission.js";
 import { DeferredGrant } from "./deferred-grant.js";
@@ -310,6 +310,7 @@ export class QueryRuntime {
   }
   #expressionProgress = 0;
   #expressionMultiplicity = 1;
+  #sourceMultiplicity = 1;
   #parameterProgress = false;
   #operatorLiteralBytes = 0;
   readonly #operatorParameterColumns = new Map<number, number>();
@@ -322,10 +323,39 @@ export class QueryRuntime {
     this.#operatorLiteralBytes = bytes;
   }
   /** Complete variable-output envelope; ordinary project/filter leave it at zero. */
-  progressEnvelope(bytes: number, multiplicity = 1): void {
+  progressEnvelope(bytes: number, multiplicity = 1, sourceMultiplicity = multiplicity): void {
     this.#expressionProgress = bytes;
     this.#expressionMultiplicity = multiplicity;
+    this.#sourceMultiplicity = sourceMultiplicity;
     this.#parameterProgress = true;
+  }
+  readonly #helperOnlyProgress = new Set<number>();
+  /** This parent allocates fixed shares; all of its borrowers are explicit helpers. */
+  helperOnlyProgress(id: number): void {
+    this.#helperOnlyProgress.add(id);
+  }
+  #groupKeyProgress:
+    | ((
+        id: number,
+        loanSlot: number | undefined,
+        slots: readonly number[],
+        largest: number,
+        minimum: number,
+        ordinary: number,
+      ) => number)
+    | null = null;
+  /** Only the native consumer's lane owns its decoded semantic grouping operands. */
+  groupKeyProgress(
+    bound: (
+      id: number,
+      loanSlot: number | undefined,
+      slots: readonly number[],
+      largest: number,
+      minimum: number,
+      ordinary: number,
+    ) => number,
+  ): void {
+    this.#groupKeyProgress = bound;
   }
   #stepBytes(
     inputs: number,
@@ -338,7 +368,7 @@ export class QueryRuntime {
     // Add newly materialized inline/literal/owned-parameter columns; multiply only
     // for repeated group-key positions, never again for the number of source columns.
     const current = this.#parameterProgress
-      ? readProgress * this.#expressionMultiplicity +
+      ? readProgress * this.#sourceMultiplicity +
         this.#expressionProgress +
         4 * inputs * this.#expressionMultiplicity
       : Math.max(readProgress, largestInput);
@@ -397,33 +427,55 @@ export class QueryRuntime {
     entries: ReadonlyArray<{ rel: OperatorIdentity; minimum: number; loanSlots?: number }>,
     inputs = 0,
     largestInput = 0,
+    slots: readonly number[] = [],
   ): number {
     if (this.#atomicResult === null)
       return inputs + entries.reduce((sum, entry) => sum + entry.minimum, 0);
-    const borrowers = entries
-      .filter(
-        ({ rel, loanSlots }) =>
-          (loanSlots ?? 0) > 0 ||
-          rel.op === "sort" ||
-          rel.op === "aggregate" ||
-          rel.op === "join" ||
-          rel.op === "window" ||
-          rel.op === "setOp",
-      )
-      .reduce(
-        (sum, entry) =>
-          sum +
-          (1 + (entry.loanSlots ?? 0)) * this.#operatorStepBytes(entry.rel, inputs, largestInput),
-        0,
-      );
+    let protectedBytes = 0;
+    for (const entry of entries) {
+      const progress = this.#operatorStepBytes(entry.rel, inputs, largestInput, slots);
+      if (!(
+        (entry.loanSlots ?? 0) > 0 ||
+        ["sort", "aggregate", "join", "window", "setOp"].includes(entry.rel.op)
+      ))
+        continue;
+      if (entry.rel.op !== "aggregate" || !this.#helperOnlyProgress.has(entry.rel.id))
+        protectedBytes += Math.max(
+          progress,
+          this.#groupKeyProgress?.(
+            entry.rel.id,
+            undefined,
+            slots,
+            largestInput,
+            entry.minimum,
+            progress,
+          ) ?? 0,
+        );
+      for (let slot = 0; slot < (entry.loanSlots ?? 0); slot++)
+        protectedBytes += Math.max(
+          progress,
+          this.#groupKeyProgress?.(
+            entry.rel.id,
+            slot,
+            slots,
+            largestInput,
+            entry.minimum,
+            progress,
+          ) ?? 0,
+        );
+    }
     return (
       inputs +
       entries.reduce((sum, entry) => sum + entry.minimum, 0) +
-      borrowers +
+      protectedBytes +
       this.#readBytes +
       (entries.length === 0
         ? 0
-        : Math.max(this.#resultWindow(), this.#resultStep(inputs, largestInput)))
+        : Math.max(
+            this.#resultWindow(),
+            this.#resultStep(inputs, largestInput) +
+              (this.#resultOwnedMinimum ? resultFrameMetadataBytes(this.plan.columns.length) : 0),
+          ))
     );
   }
 
@@ -507,7 +559,8 @@ export class QueryRuntime {
           )
         : 0;
     // A helper slot explicitly declares bounded variable output, including project/filter
-    // wrappers. Fund the base owner and every helper together, also after a phase restore.
+    // wrappers. Fund each native borrower together, also after a phase restore. A parent
+    // that only splits fixed shares does not need another unused progress lane.
     const explicitLoans = new Set(
       entries.filter((entry) => entry.loanSlot !== undefined).map((entry) => entry.rel.id),
     );
@@ -526,7 +579,8 @@ export class QueryRuntime {
         ? Math.max(
             this.#resultWindow(),
             this.#resultOwnedMinimum
-              ? this.#resultStep(binding.logicalBytes ?? binding.bytes, binding.largestSlot)
+              ? this.#resultStep(binding.logicalBytes ?? binding.bytes, binding.largestSlot) +
+                  resultFrameMetadataBytes(this.plan.columns.length)
               : 0,
           )
         : 0;
@@ -558,7 +612,27 @@ export class QueryRuntime {
     const operators = entries.map((entry) => ({
       entry,
       base: add(`${key(entry)}/minimum`, entry.minimum),
-      progress: add(`${key(entry)}/progress`, this.#operatorProgress.get(entry.rel.id) ?? 0),
+      progress: add(
+        `${key(entry)}/progress`,
+        canBorrow(entry.rel) &&
+          !(
+            entry.loanSlot === undefined &&
+            entry.rel.op === "aggregate" &&
+            this.#helperOnlyProgress.has(entry.rel.id)
+          )
+          ? Math.max(
+              progress(entry.rel),
+              this.#groupKeyProgress?.(
+                entry.rel.id,
+                entry.loanSlot,
+                binding.slotBytes ?? [],
+                binding.largestSlot,
+                entry.minimum,
+                progress(entry.rel),
+              ) ?? 0,
+            )
+          : 0,
+      ),
       extra: add(`${key(entry)}/growth`, 0, true),
     }));
     const started = performance.now();

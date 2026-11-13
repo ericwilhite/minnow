@@ -61,6 +61,8 @@ export type ScalarExpr =
       readonly input: ScalarExpr;
       readonly type: PhysicalType;
       readonly assignment?: true;
+      /** Private executor proof: canonical JSONB bytes can transfer as TEXT. Recomputed at preparation. */
+      readonly jsonCanonical?: true;
     }
   | {
       readonly op: "compare";
@@ -147,6 +149,9 @@ export type AggregateFn =
   | "string_agg"
   | "array_agg"
   | "json_agg"
+  | "jsonb_agg"
+  | "json_object_agg"
+  | "jsonb_object_agg"
   | "percentile_cont"
   | "percentile_disc"
   | "mode"
@@ -160,6 +165,11 @@ export interface AggregateCall {
   readonly filter: ScalarExpr | null;
   readonly orderBy: readonly SortKey[];
   readonly type: PhysicalType;
+  readonly json?: {
+    readonly skipNulls: boolean;
+    readonly unique: boolean;
+    readonly record: boolean;
+  };
 }
 
 export interface WindowFrameBound {
