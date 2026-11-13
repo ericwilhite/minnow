@@ -1331,7 +1331,18 @@ and the owner import it directly.
 - A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable
   operator works inside its admitted minimum.
 - Growth is charged before it happens, including the overlap while a buffer is copied.
-- Aggregate progress follows each borrowing lane's complete row layout. The hash wrapper and
+- Aggregate input packing carries each proven parameter/column binding once through
+  hash tables and spill rows, then restores logical key positions after aggregation.
+  Identity casts and structurally identical CASE/COALESCE/NULLIF over those bindings
+  can share storage; the original producer still evaluates every expression in order.
+  Other computed values, typmod casts and GROUPING SETS retain their original layout.
+  Restore steps over known byte/native scalar layouts with fixed-width transitions
+  share one admitted peak: decoded input
+  pages, output row, and one retained group key. Unused feed room is returned before
+  merge/capture; per-helper limits do not replicate that peak. Wide pooled records
+  use the existing value comparator, without a normalized byte-key sidecar. Variable
+  transitions, parsed operands, and unknown widths retain their independent recipes.
+- Aggregate progress follows each borrowing lane's complete physical row layout. The hash wrapper and
   fixed COUNT transitions do not reserve unused sort lanes. Conditional outputs use the largest
   reachable branch: COALESCE stops at a proven non-null constant, and its alternatives are never
   summed. Owned parameter bounds survive pressure checkpoints without rereading caller buffers.

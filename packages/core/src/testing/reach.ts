@@ -5399,6 +5399,11 @@ export const AGG_WIDE_PROGRESS_REACH = [
 ] as const;
 
 export const AGG_ADMISSION_PEAK_REACH = [
+  "distinct",
+  "one key",
+  "sixteen keys",
+  "eight key witness",
+  "twelve key witness",
   "short",
   "null-prefix",
   "direct",
@@ -5417,4 +5422,43 @@ export const AGG_ADMISSION_PEAK_REACH = [
   "nullable-max",
   "max not sum",
   "small output lane",
+] as const;
+
+export const AGG_STEP_PEAK_REACH = [
+  "raw restore pages",
+  "saved prefix",
+  "distinct keys",
+  "repeated keys",
+  "repinned after admission",
+  "restore",
+  "shared peak",
+  "trim live key",
+  "cancel live key",
+  "PG exact",
+  "UTF8",
+  "ASCII",
+  "one logical wide key",
+  "sixteen logical keys",
+  "zero",
+] as const;
+
+export const AGG_PACKED_BINDINGS_REACH = [
+  "computed key",
+  "logical aliases",
+  "distinct params",
+  "typmod preserved",
+  "nulls",
+  "remapped arguments",
+  "PG exact",
+] as const;
+
+export const AGG_COLUMN_PROGRESS_REACH = [
+  "one key",
+  "sixteen keys",
+  "NULL",
+  "ASCII",
+  "UTF8",
+  "pinned",
+  "PG exact",
+  "zero",
 ] as const;

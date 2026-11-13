@@ -244,5 +244,128 @@
     "packages/core/src/next/exec/run.ts": "fa476a2dcde422051c69611225dd63bbb4109bed9844094633b8c242a1beab44",
     "packages/core/src/testing/reach.ts": "97594966cf91ed3269426426b02ee3b6f001e6062eec9172c7dbefc3eda03ebe",
     "packages/core/src/next/testing/executor-agg-admission-peak.test.ts": "042ab63e123d7a571beb954a753ee154474110dfd7419b3e00d1ff4073dfbebd"
+  },
+  "physicalStepReReview": {
+    "reviewedParent": "e50019eb9154dcafca706c1069e82dd28272ffe4",
+    "reference": "b5b7d1fd3bbd4aafb795d5a4f29bb61e1098a9ec",
+    "law": [
+      "memory/governor.ts rules2\u20135; complete minima and charge before allocation",
+      "ir/ir.ts positional immutable bindings; PostgreSQL results via PGlite"
+    ],
+    "model": {
+      "R": "largest physical record payload; proven duplicate bindings stored once",
+      "A": "finite output arena: round a field through1MiB, exact above it",
+      "K": "one retained group key arena (rounded)",
+      "sharedPeak": "2R + A + K + codec/chunk framing; A>=R covers feed<=3R too",
+      "ownership": "helper-local borrow limits, one native backing account; close after last constructed helper",
+      "boundary": "pin complete step across iterator next/yield; trim unused backing, reuse same prepaid loan",
+      "wideSort": "existing value comparison, no normalized-key payload",
+      "fallback": "variable transitions, parsed operands, wide coefficients and unknown widths retain independent recipes",
+      "hybridPeak": "one read row plus old/new canonical key buffers <=5R + framing; freeze lookup scratch released before partition encoding; complete I/O step prepared before lookup"
+    },
+    "realParentProbe": [
+      {
+        "keys": 1,
+        "parameterUtf8Bytes": 800000,
+        "capBytes": 67108864,
+        "referencePeak": 19512652,
+        "candidatePeak": 13368228
+      },
+      {
+        "keys": 8,
+        "parameterUtf8Bytes": 800000,
+        "capBytes": 67108864,
+        "referencePeak": 43893524,
+        "reviewedPeak": 49880948,
+        "candidatePeak": 13376420
+      },
+      {
+        "keys": 12,
+        "parameterUtf8Bytes": 800000,
+        "capBytes": 67108864,
+        "referencePeak": 57806724,
+        "reviewedRestoreMinimum": 79052600,
+        "candidatePeak": 13376420
+      },
+      {
+        "keys": 16,
+        "parameterUtf8Bytes": 800000,
+        "capBytes": 134217728,
+        "referencePeak": 71719924,
+        "candidatePeak": 13376420
+      }
+    ],
+    "probeResult": "all reference/candidate rows count2, no spills, zero governor/spill bytes; separate fresh processes; NOT CPU evidence",
+    "referenceSourceVerification": "archive matches b5b7d1fd plan/run/parameters/parameter-checkpoint/spill-pool byte for byte",
+    "campaign": {
+      "admission": {
+        "seeds": [46995, 46996],
+        "numRuns": 32,
+        "previousNumRuns": 12,
+        "keys": "1..16",
+        "parameters": "repeated and distinct",
+        "assertion": "PG exact and candidate peak <= fitting real-parent policy; matching cooperative pacing; same fixture/cap",
+        "examples": "all previous modes retained;1/8/12/16 repeated/distinct added; increased runs retain examples AND randomized histories"
+      },
+      "restore": {
+        "seeds": [46997, 46998],
+        "numRuns": 16,
+        "keys": "1..16,900k..1100k UTF8 bytes,6..12 rows",
+        "reach": [
+          "competing holder",
+          "whole phase admission and re-pinning",
+          "saved prefix",
+          "raw restore pages",
+          "live retained key",
+          "cancellation",
+          "PG exact",
+          "zero charges"
+        ]
+      },
+      "bindings": {
+        "seeds": [46999, 47000],
+        "numRuns": 16,
+        "reach": [
+          "logical aliases",
+          "distinct params",
+          "NULLs",
+          "numeric typmod",
+          "dynamic CASE",
+          "remapped aggregate arguments",
+          "PG exact"
+        ]
+      },
+      "storedKeys": {
+        "seeds": [47001, 47002],
+        "numRuns": 8,
+        "keys": "1..16 repeated stored columns,800k bytes,ASCII/UTF8,NULL",
+        "pressure": "competing holder retains ordinary credit until termination",
+        "result": "PG exact and zero charges"
+      },
+      "originalPressure": "46993/46994,8runs unchanged; repeated/distinct parameters,partial staging and cancellation"
+    },
+    "mutants": [
+      "unpacked input",
+      "different slots collapsed",
+      "replicated helper backing",
+      "complete workspace retained per capture",
+      "merge pages omitted",
+      "normalized key sidecar restored",
+      "wrong logical output aliases"
+    ],
+    "reproduce": "TMPDIR=<cache scratch> npx vitest run packages/core/src/next/testing/executor-agg-admission-peak.test.ts packages/core/src/next/testing/executor-agg-step-peak.test.ts packages/core/src/next/testing/executor-agg-wide-progress.test.ts --maxWorkers=2 (root and project worker limits both2; MINNOW_SEED replays)",
+    "rawEvidence": "/home/eric/.cache/b4-read-recipe/agg-step-*",
+    "limits": [
+      "not CPU/performance/browser/RSS acceptance",
+      "no new certificate for parsed operands or unbounded expressions",
+      "pinned CASE/NULLIF/COALESCE projection-arena refusal before aggregation remains pre-existing; ordinary stored-column case is now generated GREEN",
+      "no constant folding or stored-format change"
+    ],
+    "verification": {
+      "focused": "8files26tests GREEN",
+      "node22": "3files10tests GREEN",
+      "mutants": "7 rejected, no timeout/setup rejection",
+      "fullGateCommand": "agg-step-full-gate.py; full gate run on final commit, results in cache"
+    }
   }
 }

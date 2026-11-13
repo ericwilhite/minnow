@@ -8,6 +8,7 @@ import { taskClock } from "../task.js";
 import { MAX_BLOB_BYTES } from "../access/space.js";
 import { Governor } from "../memory/governor.js";
 import { StepLoans } from "../memory/step-loans.js";
+import { createExecutor } from "../exec/create.js";
 import { QueryRuntime } from "../exec/run.js";
 import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
@@ -33,12 +34,13 @@ it.each(seedsFor("next-agg-admission-peak", [0xb793, 0xb794]))(
       await pg.waitReady;
       await fc.assert(
         fc.asyncProperty(
-          fc.integer({ min: 2, max: 4 }),
+          fc.integer({ min: 1, max: 16 }),
           fc.integer({ min: 980000, max: 1000000 }),
           fc.constantFrom(
             "short",
             "null-prefix",
             "direct",
+            "distinct",
             "max",
             "case",
             "nullif",
@@ -51,11 +53,13 @@ it.each(seedsFor("next-agg-admission-peak", [0xb793, 0xb794]))(
             reach.beginHistory();
             const large = unicode ? "汉".repeat(Math.floor(bytes / 3)) : "x".repeat(bytes);
             const args =
-              shape === "nullable-max"
-                ? [null, large]
-                : shape === "max"
-                  ? [large, unicode ? "字".repeat(large.length) : "y".repeat(large.length)]
-                  : [large];
+              shape === "distinct"
+                ? Array.from({ length: n }, (_, i) => large + String(i))
+                : shape === "nullable-max"
+                  ? [null, large]
+                  : shape === "max"
+                    ? [large, unicode ? "字".repeat(large.length) : "y".repeat(large.length)]
+                    : [large];
             const expr =
               shape === "short"
                 ? "coalesce('k'::text,$1::text)"
@@ -71,7 +75,7 @@ it.each(seedsFor("next-agg-admission-peak", [0xb793, 0xb794]))(
                           ? "coalesce($1::text,$2::text)"
                           : "$1::text";
             const keys = Array.from({ length: n }, (_, i) => `a${String(i)}`);
-            const sql = `SELECT count(*) n FROM (SELECT ${keys.map((k) => `${expr} AS ${k}`).join(",")} FROM generate_series(1,2))q GROUP BY ${keys.join(",")}`;
+            const sql = `SELECT count(*) n FROM (SELECT ${keys.map((k, i) => `${shape === "distinct" ? `$${String(i + 1)}::text` : expr} AS ${k}`).join(",")} FROM generate_series(1,2))q GROUP BY ${keys.join(",")}`;
             const expected = (await pg.query(sql, args)).rows;
             const run = async (legacy: boolean, cap: number, query = sql, values = args) => {
               const governor = new Governor(cap),
@@ -153,7 +157,10 @@ it.each(seedsFor("next-agg-admission-peak", [0xb793, 0xb794]))(
                     return borrow.call(this, bytes, signal);
                   }),
                 );
-                const prepare = core.executor.prepare.bind(core.executor);
+                const executor = legacy
+                  ? createExecutor({ aggregateInputPacking: false })
+                  : core.executor;
+                const prepare = executor.prepare.bind(executor);
                 mocks.push(
                   vi.spyOn(core.executor, "prepare").mockImplementation((plan) => {
                     const p = prepare(plan);
@@ -174,18 +181,19 @@ it.each(seedsFor("next-agg-admission-peak", [0xb793, 0xb794]))(
                 expect(core.spill.bytesInUse).toBe(0);
               }
             };
-            const anchor = await run(true, 128 << 20);
+            const anchor = await run(true, 512 << 20);
             expect(anchor.restores).toBe(0);
             expect(anchor.spill).toBe(0);
             // Compensate the governor's ordinary 1/8 reserve, then just 64KiB slack.
             // Same fixture/cap on both paths; no resource expectation derived from candidate.
-            const cap = near
-              ? Math.ceil((anchor.peak * 8) / 7 / 65536) * 65536 + 65536
-              : (shape === "short" || shape === "null-prefix"
-                  ? 32
-                  : shape === "max" || shape === "nullable-max"
-                    ? 128
-                    : 64) << 20;
+            const cap =
+              near || n > 4 || shape === "distinct"
+                ? Math.ceil((anchor.peak * 8) / 7 / 65536) * 65536 + 65536
+                : (shape === "short" || shape === "null-prefix"
+                    ? 32
+                    : shape === "max" || shape === "nullable-max"
+                      ? 128
+                      : 64) << 20;
             const parent = await run(true, cap),
               candidate = await run(false, cap);
             expect(parent.restores).toBe(0);
@@ -204,6 +212,10 @@ it.each(seedsFor("next-agg-admission-peak", [0xb793, 0xb794]))(
             expect(candidate.restores).toBe(0);
             expect(candidate.spill).toBe(0);
             reach.reach(shape);
+            if (n === 1) reach.reach("one key");
+            if (n === 16) reach.reach("sixteen keys");
+            if (n === 8 && bytes === 800000) reach.reach("eight key witness");
+            if (n === 12 && bytes === 800000) reach.reach("twelve key witness");
             reach.reach(unicode ? "UTF8" : "ASCII");
             if (near) reach.reach("near parent peak");
             if (n === 3 && bytes === 1000000 && !unicode && shape === "short" && !near)
@@ -217,8 +229,16 @@ it.each(seedsFor("next-agg-admission-peak", [0xb793, 0xb794]))(
         ),
         {
           seed,
-          numRuns: 12,
+          numRuns: 32,
           examples: [
+            [1, 800000, "direct", false, true],
+            [8, 800000, "direct", false, true],
+            [12, 800000, "direct", false, true],
+            [16, 800000, "direct", false, true],
+            [1, 800000, "distinct", false, true],
+            [8, 800000, "distinct", false, true],
+            [12, 800000, "distinct", false, true],
+            [16, 800000, "distinct", false, true],
             [3, 1000000, "short", false, false],
             [3, 1000000, "direct", false, false],
             [3, 1000000, "max", false, true],

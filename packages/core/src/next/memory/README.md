@@ -374,3 +374,19 @@ key byte per tree); SQL arrays use 32 bytes per key byte per tree. Ordinary enco
 row copies remain separate. Literal and owned parameter fields retain their own bounds;
 source keys use selected-column one-row bounds. Expanding JSON checkpoints retain
 per-field byte high-water marks for the next atomic admission, without old grants.
+
+## Aggregate physical steps
+
+Logical aliases are packed before aggregation, so a spill row contains each proven
+immutable binding once. Its merge bound covers two decoded pages plus the output
+row/page; saved group keys separately use the rounded one-row arena. Fixed-transition
+restoration over known byte/native scalar layouts shares a native progress account
+across helpers: the simultaneous peak
+is bounded by feed (decoded/aligned input plus writer) or merge (inputs, output, one
+saved key). Helpers retain local limits, but actual allocations charge that account
+once. Feed room is trimmed before merge and capture; live key bytes remain charged.
+The account closes only after its last helper, including cancellation cleanup.
+Progress never backs persistent hash state. Wide pooled records select raw-value
+comparison before sorting, so spill pages have no additional normalized-key payload.
+Unknown widths, parsed operands, wide coefficients, and variable transitions keep
+their independent recipes; the new shared bound does not certify those layouts.

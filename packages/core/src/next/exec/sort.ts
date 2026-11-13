@@ -137,6 +137,8 @@ export interface GroupTopKSpec {
 }
 
 export interface SortContext {
+  /** Raw record recipe: no additional normalized byte-key payload in spill pages. */
+  readonly valueComparison?: boolean;
   /** Spillable; the operator closes it when done or aborted. */
   readonly grant: Grant;
   readonly spill: SpillService;
@@ -439,7 +441,7 @@ class Sorter {
     this.spec = spec;
     this.slice = new Slice(YIELD_INTERVAL_MS, context.clock);
     this.width = spec.types.length;
-    this.mode = sortMode(spec.types, spec.keys);
+    this.mode = context.valueComparison ? "compare" : sortMode(spec.types, spec.keys);
     this.#keyStorage = this.mode === "keys";
     this.operands = emptyOperands(spec.types, spec.keys);
     this.decodes = needsOperands(spec.types, spec.keys);

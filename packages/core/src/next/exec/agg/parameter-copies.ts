@@ -2,7 +2,9 @@
  * Conditional widths are maxima over reachable outputs, not a union of parameter slots.
  * These are sizing facts only: no expression is evaluated and no caller buffer is read.
  */
+import type { PhysicalType } from "../../types.js";
 import type { Rel, ScalarExpr } from "../../ir/ir.js";
+import { BATCH_TARGET_BYTES } from "../../vector/vector.js";
 import { MAX_BLOB_BYTES } from "../../access/space.js";
 
 type Width =
@@ -11,6 +13,7 @@ type Width =
   | { readonly op: "sum" | "max"; readonly args: readonly Width[] }
   | { readonly op: "unknown" };
 export interface AggregateProgressLayout {
+  readonly simple: boolean;
   readonly input: readonly Width[];
   readonly keys: readonly Width[];
   readonly calls: ReadonlyArray<{
@@ -19,6 +22,20 @@ export interface AggregateProgressLayout {
     readonly distinct: boolean;
   }>;
 }
+/** These layouts have no parsed operands or wide coefficient/object arrays. */
+export const simpleAggregateType = (type: PhysicalType): boolean =>
+  [
+    "text",
+    "bytes",
+    "bool",
+    "int32",
+    "int64",
+    "float32",
+    "float64",
+    "date",
+    "time",
+    "timestamp",
+  ].includes(type.kind);
 const zero: Width = { op: "bytes", bytes: 0 };
 const variable = (e: ScalarExpr) =>
   ["text", "bytes", "json", "array", "enum", "decimal"].includes(e.type.kind);
@@ -118,6 +135,7 @@ export function aggregateProgressLayout(
     return { op: "unknown" };
   };
   return {
+    simple: rel.input.output.every((c) => simpleAggregateType(c.type)),
     input: rel.input.output.map((_, i) => column(rel.input, i)),
     keys: rel.groupBy.map((i) => column(rel.input, i)),
     calls: rel.aggregates.map((call) => ({
@@ -147,20 +165,25 @@ function bytes(width: Width, slots: readonly number[] | undefined): number | nul
     }
   }
 }
-/** Sort.prepareMerge: two one-row pages and the larger of a page or output arena.
- * Page framing/alignment, 2048-row chunk offsets/validity, operand and view metadata
- * are bounded by 32KiB per column +64KiB. Oversized staging also fits: its
- * remaining-growth overlap is <=2*arena <=2*row+arena (arena<2*row).
- * Unknown producers keep the existing complete source envelope, never guessed widths.
+/** One merge step holds two decoded pages and one output row/page, not a complete
+ * merge per logical key. The physical input layout packs proven aliases first. Finite
+ * sort arenas round a field up only through their target; larger fields are exact.
+ * The saved group key has an infinite target and always rounds up.
+ * Framing covers chunk masks/offsets, alignment, scalar views and fixed codec scratch.
+ * Unknown producers retain the complete source envelope, never guessed cell widths.
  */
-function rowStep(row: readonly Width[], slots: readonly number[] | undefined): number | null {
+function rowStep(
+  row: readonly Width[],
+  slots: readonly number[] | undefined,
+  target = Infinity,
+): number | null {
   let payload = 0,
     arena = 0;
   for (const field of row) {
     const n = bytes(field, slots);
     if (n === null) return null;
     payload += n;
-    arena += n > 0 ? 2 ** Math.ceil(Math.log2(n)) : 0;
+    arena += n > target ? n : n > 0 ? 2 ** Math.ceil(Math.log2(n)) : 0;
   }
   const framing = 64 * 1024 + (row.length + 8) * 32768;
   return 2 * payload + Math.max(payload + 4096, arena) + framing;
@@ -172,17 +195,45 @@ export function aggregateLaneBytes(
   baseline: number,
   slots: readonly number[] | undefined,
 ): number {
+  const fixed = layout.simple && !layout.calls.some((call) => call.variable);
+  const step = (row: readonly Width[]) =>
+    rowStep(row, slots, fixed ? BATCH_TARGET_BYTES : Infinity);
   const full = () =>
     Math.max(
       MAX_BLOB_BYTES,
-      rowStep(layout.input, slots) ?? baseline,
-      ...layout.calls.map((call) => rowStep([...layout.keys, call.width], slots) ?? baseline),
-      rowStep(layout.keys, slots) ?? baseline,
+      step(layout.input) ?? baseline,
+      ...layout.calls.map((call) => step([...layout.keys, call.width]) ?? baseline),
+      step(layout.keys) ?? baseline,
     );
   // The wrapper owns fixed compiler/native buffers; all borrows go through named helpers.
   if (slot === undefined || (kind === "hybrid" && slot === 0)) return 0;
-  if (slot === 1 || (slot === 0 && kind === "restore")) return full();
-  if (slot === 0) return Math.max(MAX_BLOB_BYTES, rowStep(layout.keys, slots) ?? baseline);
+  if (slot === 1) {
+    if (kind === "hybrid" && layout.simple) {
+      let row = payload(layout.input, slots);
+      const key = payload(layout.keys, slots);
+      if (row !== null && key !== null) {
+        for (const call of layout.calls) {
+          const value = bytes(call.width, slots);
+          if (value === null) return full();
+          row = Math.max(row, key + value);
+        }
+        // One read row plus old/new canonical keys: each key is <=2R after
+        // escaping. Frozen lookup ends before partition encoding; raw staging
+        // needs at most three rows. This is ONE step, not five rows per key.
+        return Math.max(full(), 5 * row + framing(layout.input.length));
+      }
+    }
+    return full();
+  }
+  if (slot === 0 && kind === "restore" && fixed) {
+    const row = payload(layout.input, slots),
+      keys = keyArena(layout.keys, slots);
+    return row === null || keys === null
+      ? full()
+      : Math.max(MAX_BLOB_BYTES, Math.max(2 * row, keys) + framing(layout.input.length));
+  }
+  if (slot === 0 && kind === "restore") return full();
+  if (slot === 0) return Math.max(MAX_BLOB_BYTES, step(layout.keys) ?? baseline);
   let index = 2;
   for (const call of layout.calls) {
     const count = 1 + Number(call.distinct) * (kind === "restore" ? 2 : 1);
@@ -192,4 +243,69 @@ export function aggregateLaneBytes(
   }
   // Optional top-N over finished groups retains their keys and variable results.
   return full();
+}
+
+function framing(columns: number): number {
+  return 65536 + (columns + 8) * 32768;
+}
+function payload(row: readonly Width[], slots: readonly number[] | undefined): number | null {
+  let total = 0;
+  for (const field of row) {
+    const n = bytes(field, slots);
+    if (n === null) return null;
+    total += n;
+  }
+  return total;
+}
+function keyArena(
+  row: readonly Width[],
+  slots: readonly number[] | undefined,
+  target = Infinity,
+): number | null {
+  let total = 0;
+  for (const field of row) {
+    const n = bytes(field, slots);
+    if (n === null) return null;
+    total += n > target ? n : n > 0 ? 2 ** Math.ceil(Math.log2(n)) : 0;
+  }
+  return total;
+}
+/** Feed and merge are successive steps. Feed holds a decoded/aligned record plus
+ * the sort writer; merge holds two input pages + output + ONE saved group key.
+ * Give helpers local limits but back their actual allocations with this single peak.
+ * They must trim unused feed room before merge/capture; no credit is used by hash state.
+ * Variable transition helpers retain their own state/codec bounds concurrently.
+ */
+export function aggregateSharedBytes(
+  layout: AggregateProgressLayout,
+  kind: "hybrid" | "external" | "restore",
+  slots: readonly number[] | undefined,
+  lanes: readonly number[],
+): number | null {
+  if (!layout.simple || kind !== "restore" || layout.calls.some((call) => call.variable))
+    return null;
+  const input = payload(layout.input, slots),
+    keys = keyArena(layout.keys, slots);
+  if (input === null || keys === null) return null;
+  let row = input,
+    output = keyArena(layout.input, slots, BATCH_TARGET_BYTES) ?? 0;
+  for (const call of layout.calls) {
+    const value = bytes(call.width, slots),
+      key = payload(layout.keys, slots);
+    if (value === null || key === null) return null;
+    row = Math.max(row, key + value);
+    output = Math.max(
+      output,
+      keyArena([...layout.keys, call.width], slots, BATCH_TARGET_BYTES) ?? 0,
+    );
+  }
+  const calls = lanes.slice(2).reduce((n, b) => n + b, 0);
+  // R=max record payload, A=finite output arena, K=one saved-key arena.
+  // Feed needs <=3R; merge needs 2R+A+K. A>=R, so the latter covers both.
+  const peak =
+    Math.max(MAX_BLOB_BYTES, 2 * row + output + keys + 2 * framing(layout.input.length)) + calls;
+  // Both bounds include native fixed minima separately. Keeping the smaller proven
+  // bound avoids growing admission for a narrow input with many fixed-width fields.
+  const separate = lanes.reduce((n, b) => n + b, 0);
+  return peak < separate ? peak : null;
 }

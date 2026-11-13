@@ -1,5 +1,6 @@
 /** Pressure-only stable restoration. Saved fields/membership precede suffix rows;
  * one group is resident, no partial aggregate result is ever combined. */
+import { MAX_BLOB_BYTES } from "../../access/space.js";
 import type { Rel } from "../../ir/ir.js";
 import type { Grant } from "../../memory/governor.js";
 import type { PhysicalType } from "../../types.js";
@@ -13,6 +14,7 @@ import { keysEqual, type SortColumn } from "../sort-keys.js";
 import { SortOperator, sortMinimumBytes } from "../sort.js";
 import { PageWriter, decodePage } from "../spill-pages.js";
 import { Charge, Pool, SpillIo } from "../spill-pool.js";
+import { simpleAggregateType } from "./parameter-copies.js";
 import type { HybridPhase } from "./hybrid.js";
 import { ExternalCall, externalCallMinimum, externalCallDistinct } from "./external-call.js";
 import { SortGrants } from "./sort-grants.js";
@@ -54,6 +56,7 @@ export function restoredLoans(rel: AggregateRel): number {
   return 2 + rel.aggregates.reduce((n, call) => n + 1 + 2 * Number(externalCallDistinct(call)), 0);
 }
 interface RestoreContext {
+  readonly sharedStep?: boolean;
   readonly grant: Grant;
   readonly loans: readonly Grant[];
   readonly spill: SpillService;
@@ -79,6 +82,7 @@ export class RestoredAggregateOperator {
   readonly #metadata: readonly Vector[];
   #payload: FlatVector;
   readonly #offsets: Int32Array;
+  readonly #sharedStep: boolean;
   #started = false;
   #nextOrdinal = 0;
   #memberOrdinal = 0;
@@ -94,6 +98,13 @@ export class RestoredAggregateOperator {
     readonly phase: HybridPhase,
     readonly downstream: Operator,
   ) {
+    this.#sharedStep =
+      context.input.every(simpleAggregateType) &&
+      !rel.aggregates.some(
+        (call) =>
+          call.args[0] &&
+          ["text", "bytes", "json", "array", "enum", "decimal"].includes(call.args[0].type.kind),
+      );
     this.grants = new SortGrants(shared.grant, shared.loans);
     this.#own = this.grants.fork(ownMinimum(context.input), 0);
     this.#pool = new Pool(new Charge(this.#own), ownMinimum(context.input));
@@ -193,14 +204,21 @@ export class RestoredAggregateOperator {
     if (pending) await pending;
   }
   sortContext(grant: Grant) {
-    return { ...this.shared, grant };
+    return {
+      ...this.shared,
+      grant,
+      // Wide pooled steps store raw records: a normalized byte-key sidecar would
+      // be an additional payload. Narrow keys fit the normal minimum/floor.
+      valueComparison:
+        this.shared.sharedStep === true &&
+        this.grants.stepCapacity(this.#own) - ownMinimum(this.context.input) > MAX_BLOB_BYTES,
+    };
   }
   async #room(): Promise<void> {
-    await this.#pool.need(
-      Math.max(0, this.grants.stepCapacity(this.#own) - this.#pool.used),
+    await this.#pool.prepareStep(
+      this.grants.stepCapacity(this.#own),
       this.#own,
       this.shared.signal,
-      true,
     );
   }
   async #push(
@@ -229,11 +247,32 @@ export class RestoredAggregateOperator {
     )
       await this.#sort.ready();
   }
+  /** The old page is released inside next(). Pin the COMPLETE read step before
+   * that await, through the yielded borrow, so release/settle cannot leave only
+   * a raw-page loan for the following decode or record. */
+  async *#read<T>(source: AsyncIterable<T>): AsyncGenerator<T> {
+    const input = source[Symbol.asyncIterator]();
+    try {
+      for (;;) {
+        await this.#room();
+        const unpin = this.#pool.pinStep();
+        try {
+          const next = await input.next();
+          if (next.done) return;
+          yield next.value;
+        } finally {
+          unpin();
+        }
+      }
+    } finally {
+      await input.return?.();
+    }
+  }
   async #feed(): Promise<void> {
     await this.#room();
     this.phase.directory.attach(this.#io, this.#pool);
     try {
-      for await (const record of this.phase.checkpoint.records()) {
+      for await (const record of this.#read(this.phase.checkpoint.records())) {
         await this.pace();
         await this.#room();
         const columns = [...this.#nulls];
@@ -284,7 +323,7 @@ export class RestoredAggregateOperator {
         ...this.phase.pending.map((p) => p.run),
       ];
       for (const run of runs)
-        for await (const batch of run.read(this.context.input)) {
+        for await (const batch of this.#read(run.read(this.context.input))) {
           await this.pace();
           const rows = rowsIn(batch.selection),
             count = countIn(batch.selection, batch.length);
@@ -295,7 +334,7 @@ export class RestoredAggregateOperator {
         }
       if (this.phase.output) {
         const output = [...this.#keyTypes, ...this.rel.aggregates.map((a) => a.type)];
-        for await (const batch of this.phase.output.read(output)) {
+        for await (const batch of this.#read(this.phase.output.read(output))) {
           this.check();
           if (this.downstream.push(batch) === "blocked") await this.downstream.ready();
         }
@@ -309,9 +348,18 @@ export class RestoredAggregateOperator {
   async #capture(keys: readonly Vector[], row: number): Promise<void> {
     this.#keys.reset(true);
     this.#pool.settle();
-    await this.#room();
+    const need = this.#keys.appendNeed(keys, row);
+    if (!this.#sharedStep) await this.#room();
+    else
+      await this.#pool.need(
+        need + this.#keys.retainedBytes + 65536,
+        this.#own,
+        this.shared.signal,
+        true,
+      );
     if (this.#pool.withStep(() => this.#keys.append(keys, null, row, 1)) !== 1)
       throw new Error("Restored key exceeded its admitted step");
+    if (this.#sharedStep) this.#pool.trimStep();
   }
   #number(vector: Vector | undefined, row: number): number {
     if (!vector) throw new Error("Missing restoration record tag");
@@ -354,11 +402,11 @@ export class RestoredAggregateOperator {
       const from = flat.data.offsets[slot] ?? 0,
         to = flat.data.offsets[slot + 1] ?? from;
       const bytes = flat.data.bytes.subarray(from, to);
-      await this.#room();
+      if (!this.#sharedStep) await this.#room();
       const types = tag === 0 ? this.phase.checkpoint.stateTypes(call) : valueTypes(this.rel, call);
       let decoded = decodePage(bytes, types, this.#pool);
       if ("needed" in decoded) {
-        await this.#room();
+        await this.#pool.need(decoded.needed, this.#own, this.shared.signal, true);
         decoded = decodePage(bytes, types, this.#pool);
       }
       if ("needed" in decoded) throw new Error("Saved fields exceeded decode admission");
@@ -381,6 +429,7 @@ export class RestoredAggregateOperator {
         }
       } finally {
         this.#pool.free(decoded.charged);
+        if (this.#sharedStep) this.#pool.trimStep();
       }
     }
   }
@@ -404,6 +453,7 @@ export class RestoredAggregateOperator {
   async finish(): Promise<void> {
     try {
       await this.#feed();
+      this.#pool.trimStep();
       await this.#sort.finish();
       this.profile.spilledBytes += this.#sort.profile.spilledBytes;
       this.profile.spillPasses = this.#sort.profile.mergePasses + 1;

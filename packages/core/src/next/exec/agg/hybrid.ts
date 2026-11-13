@@ -425,6 +425,13 @@ export class HybridAggregateOperator implements Operator {
     const frozen = this.#frozen,
       parts = this.#parts;
     if (!frozen || !parts) throw new Error("No frozen pass");
+    const grant = this.#io.context.grant;
+    await this.#ioPool.prepareStep(
+      this.#grants.stepCapacity(grant),
+      grant,
+      this.#controller.signal,
+    );
+    const unpin = this.#ioPool.pinStep();
     try {
       frozen.encode(
         batch,
@@ -446,6 +453,9 @@ export class HybridAggregateOperator implements Operator {
           this.#residentRows[resident++] = row;
         }
       }
+      // IDs and row ordinals now own the result; no encoded lookup key survives
+      // into partition-key resize or row staging on this same I/O account.
+      frozen.releaseBorrow();
       if (resident > 0) {
         const selection: Selection = { rows: this.#residentRows, count: resident },
           selected = { ...batch, selection };
@@ -473,6 +483,7 @@ export class HybridAggregateOperator implements Operator {
       }
     } finally {
       frozen.releaseBorrow();
+      unpin();
     }
   }
   async #queue(runs: readonly HashTape[], level: number): Promise<void> {
