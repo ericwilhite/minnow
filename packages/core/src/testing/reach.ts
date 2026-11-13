@@ -5722,3 +5722,27 @@ export const EXPRESSION_FENCE_REACH = [
   "cancelled suspension",
   "cleanup zero",
 ] as const;
+
+export const BYTE_GROWTH_REACH = [
+  "funded transition",
+  "dictionary",
+  "flat",
+  "single key",
+  "compound keys",
+  "selected",
+  "large then small",
+  "zero",
+] as const;
+
+export const HASH_TRANSITION_REACH = [
+  "ordinary",
+  "pinned spill",
+  "reclaim release",
+  "cancel reclaim",
+  "PG exact",
+  "distinct parameters",
+  "repeated parameters",
+  "compound keys",
+  "UTF8",
+  "zero",
+] as const;

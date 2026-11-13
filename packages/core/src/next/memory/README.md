@@ -439,3 +439,15 @@ payload without overlapping a smaller stale pressure arena. Fixed compiler buffe
 remain admitted, borrowed source values are untouched, and ordinary batch reuse is
 unchanged. The two-batch peak generator checks this boundary against the fitting normal
 path, including partial pressure followed by an ordinary batch.
+
+### Hash key resize steps
+
+A byte-key arena funds its current buffer plus one replacement, separately for each
+key column. Its batch bound covers that pair once; allocation clips speculative
+geometric growth to the same pair envelope. In particular, an exact large first
+allocation followed by a tiny key cannot request four times that exact size and
+consume another column's promised headroom. The envelope ends after group assignment.
+No transition or row scan is added to the funded path. Existing batch-boundary
+`HashWorkspace.prepare` waits cancellably for reclaimable credit; if the complete
+step cannot be funded, Hybrid splits or transfers exact state before retrying.
+No wait on another execution's pinned minimum is introduced.

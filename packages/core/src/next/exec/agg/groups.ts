@@ -945,11 +945,17 @@ class Int64Keys implements KeyColumn {
 /** Bytes per id in one arena: id i is `bytes[starts[i] … starts[i + 1])`. */
 /** Variable-length key bytes by id (exported for its direct test). */
 export class ByteArena {
+  #growthPeak = Infinity;
   growthBytes(groups: number, bytes: number): number {
-    return (
-      arrayGrowth(this.starts.length, groups + 1, 4) +
-      (bytes > this.bytes.length ? arrayGrowth(this.bytes.length, Math.max(4096, bytes), 1) : 0)
-    );
+    const current = this.bytes.length;
+    // This arena holds only its current buffer and one replacement. Count that pair
+    // once. A large exact jump followed by a tiny key must not request an unrelated
+    // 4x replacement beyond the funded pair. Other columns keep their own envelope.
+    this.#growthPeak = bytes > current ? arrayGrowth(current, Math.max(4096, bytes), 1) : current;
+    return arrayGrowth(this.starts.length, groups + 1, 4) + this.#growthPeak - current;
+  }
+  finishGrowth(): void {
+    this.#growthPeak = Infinity;
   }
 
   bytes: Uint8Array;
@@ -975,7 +981,13 @@ export class ByteArena {
       // 2× while small, 4× from LARGE_ARRAY bytes: fewer copies of a large arena.
       const next = this.memory.make(
         Uint8Array,
-        Math.max(4096, grownCapacity(this.bytes.length, at + length)),
+        Math.max(
+          at + length,
+          Math.min(
+            Math.max(4096, grownCapacity(this.bytes.length, at + length)),
+            this.#growthPeak - this.bytes.length,
+          ),
+        ),
       );
       next.set(this.bytes.subarray(0, at));
       this.memory.give(this.bytes.byteLength);
@@ -1159,6 +1171,7 @@ class ByteKeys implements KeyColumn {
       }
       return translation;
     } finally {
+      this.#arena.finishGrowth();
       this.#source = EMPTY;
       this.#sourceView = EMPTY_VIEW;
     }
@@ -1168,6 +1181,7 @@ class ByteKeys implements KeyColumn {
       this.#assign(key, length, selection, ids);
     } finally {
       // Nothing of the batch outlives the call (its bytes are borrowed).
+      this.#arena.finishGrowth();
       this.#source = EMPTY;
       this.#sourceView = EMPTY_VIEW;
     }
@@ -1297,19 +1311,29 @@ class EncodedKeys implements KeyColumn {
     this.#batch = new KeyBatch(memory.charge);
   }
   assign(key: Vector, length: number, selection: Selection | null, ids: Int32Array): void {
-    const rows = selection === null ? IDENTITY : selection.rows;
-    const count = selection === null ? length : selection.count;
-    const columns = [{ vector: key, direction: "asc" as const, nulls: "last" as const }];
-    let from = 0;
-    while (from < count) {
-      const result = encodeKeyBatch("equality", columns, { length, selection }, this.#batch, from);
-      if (!result.done && result.encoded === 0)
-        throw new RangeError("A group key's encoding was refused by its grant");
-      for (let k = 0; k < result.encoded; k++) {
-        const row = rows[from + k] ?? 0;
-        ids[row] = this.#id(this.#batch.key(k), key, row);
+    try {
+      const rows = selection === null ? IDENTITY : selection.rows;
+      const count = selection === null ? length : selection.count;
+      const columns = [{ vector: key, direction: "asc" as const, nulls: "last" as const }];
+      let from = 0;
+      while (from < count) {
+        const result = encodeKeyBatch(
+          "equality",
+          columns,
+          { length, selection },
+          this.#batch,
+          from,
+        );
+        if (!result.done && result.encoded === 0)
+          throw new RangeError("A group key's encoding was refused by its grant");
+        for (let k = 0; k < result.encoded; k++) {
+          const row = rows[from + k] ?? 0;
+          ids[row] = this.#id(this.#batch.key(k), key, row);
+        }
+        from += result.encoded;
       }
-      from += result.encoded;
+    } finally {
+      this.#arena.finishGrowth();
     }
   }
   #id(bytes: Uint8Array, key: Vector, row: number): number {
