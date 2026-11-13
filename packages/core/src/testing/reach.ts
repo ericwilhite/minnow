@@ -5490,3 +5490,14 @@ export const AGG_CALL_PREFIX_REACH = [
   "PG suffix exact",
   "zero charges",
 ] as const;
+
+export const AGG_SORT_WORKSPACE_REACH = [
+  "value sort",
+  "ordinal sort",
+  "exact arena",
+  "rounded arena",
+  "page output",
+  "arena output",
+  "owner correction propagated",
+  "metadata retained",
+] as const;

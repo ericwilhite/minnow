@@ -6,6 +6,7 @@ import type { PhysicalType } from "../../types.js";
 import type { Rel, ScalarExpr } from "../../ir/ir.js";
 import { BATCH_TARGET_BYTES } from "../../vector/vector.js";
 import { MAX_BLOB_BYTES } from "../../access/space.js";
+import { sortMergeWorkspaceBytes } from "../sort.js";
 import {
   externalCallMinimum,
   externalCallDistinct,
@@ -192,8 +193,7 @@ function rowStep(
     payload += n;
     arena += n > target ? n : n > 0 ? 2 ** Math.ceil(Math.log2(n)) : 0;
   }
-  const framing = 64 * 1024 + (row.length + 8) * 32768;
-  return 2 * payload + Math.max(payload + 4096, arena) + framing;
+  return sortMergeWorkspaceBytes(payload, arena, (row.length + 8) * 32768);
 }
 export function aggregateLaneBytes(
   layout: AggregateProgressLayout,

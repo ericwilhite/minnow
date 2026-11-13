@@ -1349,7 +1349,8 @@ and the owner import it directly.
   External transition/capture helpers share their sizing function with admission: their total
   pool peak is max(fixed minimum, 32 KiB + four times the largest value); the progress lane
   funds only its deficit above that fixed minimum. DISTINCT's value and
-  ordinal sorts keep the merge-row recipe. Slot assignment uses the same DISTINCT predicate
+  ordinal sorts keep the merge-row recipe, using the same `sortMergeWorkspaceBytes` function
+  as the runtime sorter. Slot assignment uses the same DISTINCT predicate
   as construction, so redundant TEXT MIN/MAX DISTINCT never shifts a later helper's credit.
   Restored byte extrema measure the decoded value they copy; encoded framing stays funded
   by the host I/O lane and is not counted as additional retained value.

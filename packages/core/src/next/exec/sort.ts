@@ -95,6 +95,29 @@ const INT: PhysicalType = { kind: "int32", bits: 32 };
 const BIGINT: PhysicalType = { kind: "int64" };
 /** Most spill runs one merge reads at once. */
 export const MAX_FAN_IN = 64;
+/** Complete wide merge workspace: two input pages/operands, one output,
+ * optional retained row/key, caller-owned row metadata, and fixed codec scratch.
+ * Admission may supply conservative page/arena/metadata bounds; runtime supplies
+ * measured maxima. Keep this arithmetic shared with aggregate DISTINCT planning.
+ */
+export function sortMergeWorkspaceBytes(
+  pageBytes: number,
+  outputBytes: number,
+  rowMetadataBytes: number,
+  pageOperandBytes = 0,
+  heldKeyBytes?: number,
+): number {
+  const held = heldKeyBytes === undefined ? 0 : outputBytes + 2 * heldKeyBytes + 16 * 1024;
+  return (
+    2 * pageBytes +
+    held +
+    Math.max(pageBytes + 4096, outputBytes) +
+    (2 + Number(heldKeyBytes !== undefined)) * pageOperandBytes +
+    rowMetadataBytes +
+    64 * 1024
+  );
+}
+
 /**
  * Sort scratch reserved per row as rows arrive: ids, then (prefix words, row id) tuples and the
  * radix's copy of them, and a byte for the MSD stack (n / 49 ranges of 12 bytes; compare and
@@ -1801,16 +1824,14 @@ class Sorter {
       this.#mergeStep = this.pool.pinStep();
       // Two input pages plus the larger of a spill page or one output row. No later buffer
       // asks for more credit while either cursor holds the step. Normal pages keep their path.
-      const held = this.spec.heldRow
-        ? this.#wideOutputBytes + 2 * this.#pageKeyBytes + 16 * 1024
-        : 0;
       await this.io.need(
-        2 * page +
-          held +
-          Math.max(page + 4096, this.#wideOutputBytes) +
-          (2 + Number(this.spec.heldRow)) * this.#pageOperands +
-          SORT_ROW_VIEW_BYTES * this.storeTypes.length +
-          64 * 1024,
+        sortMergeWorkspaceBytes(
+          page,
+          this.#wideOutputBytes,
+          SORT_ROW_VIEW_BYTES * this.storeTypes.length,
+          this.#pageOperands,
+          this.spec.heldRow ? this.#pageKeyBytes : undefined,
+        ),
       );
       this.checkAborted();
     }
