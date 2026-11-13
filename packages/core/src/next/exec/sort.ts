@@ -426,6 +426,7 @@ class Sorter {
   /** Compare mode: most operand bytes of one written page (a merge input holds one). */
   #pageOperands = 0;
   #stepCompare = false;
+  readonly #semanticMinimum: number;
   readonly #activeCursors: Set<Cursor> | null;
   /** A loan for operands of rows stored before compare mode (repaid after their run). */
   #operandLoan: { repay(): void } | null = null;
@@ -468,6 +469,7 @@ class Sorter {
     readonly context: SortContext,
   ) {
     this.spec = spec;
+    this.#semanticMinimum = context.semanticStep ? context.grant.held : 0;
     this.slice = new Slice(YIELD_INTERVAL_MS, context.clock);
     this.width = spec.types.length;
     this.mode = context.valueComparison ? "compare" : sortMode(spec.types, spec.keys);
@@ -1271,6 +1273,17 @@ class Sorter {
     this.#stepCompare = true;
     dropOperands(this.operands, this.charge);
     for (const cursor of this.#activeCursors ?? []) dropOperands(cursor.operands, this.pool);
+  }
+
+  /** The final resident order no longer needs cached trees. Retire them before
+   * the JSON consumer allocates its own pair; reusable fixed/progress credit stays. */
+  finishSemanticComparisons(): void {
+    if (!this.context.semanticStep || !this.decodes || this.mode !== "compare") return;
+    this.#useSemanticStep();
+    const grant = this.context.grant;
+    const unusedGrowth =
+      grant.held - Math.max(this.#semanticMinimum, grant.allocated + grant.loaned);
+    if (unusedGrowth > 0) grant.release(unusedGrowth);
   }
 
   #residentSemanticPeak(): number {
@@ -2713,6 +2726,7 @@ class GeneralSortOperator implements Operator {
         end++;
         if (slice.tick()) yield;
       }
+    sorter.finishSemanticComparisons();
     const count = Math.max(0, end - spec.offset);
     const range: Range = { kind: "store", ids: all, from: spec.offset, count };
     yield* emitJob(this.#emitter, range, spec.offset, count, 0, slice);

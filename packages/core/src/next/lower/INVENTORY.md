@@ -622,7 +622,10 @@ key operands, while unrelated payloads retain their ordinary row-copy reservatio
 Internal JSON aggregate sorts and the boundary comparator share one charged column-pair
 workspace. Comparisons decode at most two values of one key at a time, drop them before
 the next key, and release the workspace before downstream work. Ordinary admitted sort
-caches remain available; progress loans never become retained decoded caches. The host
+caches remain available during sorting; a completed resident JSON sort drops its cached
+trees and unused ordinary growth before yielding to the aggregate's own comparison.
+The initially admitted minimum stays protected. Progress loans never become retained
+decoded caches. The host
 reserves the maximum pair once, not a sum over columns or helper lanes. Raw-row/page IO
 remains separately charged to each actual consumer, and later delivery phases do not
 inherit the decoded workspace. Ordinary-only grouping keeps its existing admission bound;
@@ -680,3 +683,9 @@ source-prefix admission domain while preserving aggregate ORDER BY; tiny payload
 skipped for the two 2026-11-13 source blockers in OPEN-ISSUES.md (B5 recycleLog; B2/B4 source
 admission), both independently reproduced on 477c3794. It must be re-enabled when those
 entries close. This does not claim storage-fold or source-admission correctness.
+
+Known admission limit: a single large nested JSONB literal grouping key can still
+over-reserve fixed/helper workspace at a 16 MiB cap, even though its decoded pair
+allowance is below the cap. Such a plan can report the existing typed 53200
+admission-size error. This predates the shared-pair path and remains a separate
+memory-admission follow-up; the resident cache-lifetime fix runs after admission.

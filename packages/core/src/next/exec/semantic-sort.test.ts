@@ -108,3 +108,64 @@ it("merges four charged semantic runs and lends the shared pair to its consumer"
   expect(governor.usedBytes).toBe(0);
   expect(spill.bytesInUse).toBe(0);
 }, 60000);
+
+it("retires resident semantic caches before delivery but preserves its admitted minimum", async () => {
+  const types: PhysicalType[] = Array.from({ length: 3 }, () => ({ kind: "json", binary: true }));
+  const keys = types.map((_, column) => ({
+    column,
+    direction: "asc" as const,
+    nulls: "last" as const,
+    collation: null,
+  }));
+  const governor = new Governor(32 << 20),
+    spill = new MemorySpillService();
+  const minimum = sortMinimumBytes(types) + (1 << 20);
+  const grant = await governor.admit({
+    label: "cached semantic sort",
+    minimumBytes: minimum,
+    spillable: true,
+  });
+  const host = await governor.admit({
+    label: "cached semantic host",
+    minimumBytes: 1 << 20,
+    spillable: true,
+  });
+  const signal = new AbortController(),
+    pool = new Pool(new Charge(host), 1 << 20);
+  const step = new SemanticStep(pool, host, signal.signal),
+    sink = new CollectSink();
+  let heldDuringDelivery = 0;
+  const consumer: Operator = {
+    push(batch) {
+      heldDuringDelivery = grant.held;
+      return sink.push(batch);
+    },
+    ready: () => sink.ready(),
+    finish: () => sink.finish(),
+    abort: (reason) => sink.abort(reason),
+  };
+  const sort = new SortOperator(
+    { types, keys, offset: 0, limit: null, withTies: false },
+    { grant, spill, queryId: 518, signal: signal.signal, semanticStep: step },
+    consumer,
+  );
+  try {
+    for (const batch of batchesOf(
+      types,
+      [3, 1, 2, 0].map((n) => types.map(() => JSON.stringify({ x: "a".repeat(256), n }))),
+    ))
+      if (sort.push(batch) === "blocked") await sort.ready();
+    await sort.finish();
+    expect(sort.profile.operandBytes).toBeGreaterThan(0); // ordinary cached comparisons ran
+    expect(heldDuringDelivery).toBeGreaterThanOrEqual(minimum);
+  } finally {
+    sort.abort(new Error("resident cache test cleanup"));
+    await sort.closed;
+    await step.close();
+    pool.close();
+    host.close();
+    grant.close();
+  }
+  expect(governor.usedBytes).toBe(0);
+  expect(spill.bytesInUse).toBe(0);
+});

@@ -5605,3 +5605,23 @@ export const JSON_GROUP_STEP_COUNTS_REACH = [
   "keys 15",
   "keys 16",
 ] as const;
+
+/** Nested structural controls must never exceed the frozen fitting main peaks. */
+export const JSON_GROUP_NESTED_PEAK_REACH = [
+  "wide first key",
+  "wide middle key",
+  "wide last key",
+  "uniform widths",
+  "UTF8",
+  "ASCII",
+  "ascending aggregate",
+  "descending aggregate",
+  "NULL first key",
+  "NULL middle key",
+  "NULL last key",
+  "sixteen MiB",
+  "nested keys",
+  "exact PostgreSQL text",
+  "no peak rise",
+  "zero resources",
+] as const;
