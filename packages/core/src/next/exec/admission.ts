@@ -20,6 +20,8 @@ export class ReservedGrant implements Grant {
   #used = 0;
   #closed = false;
   #closing = false;
+  #closeHolds = 0;
+  #closeRequested = false;
   #loan: Loan | null = null;
   #loanExtra = 0;
   #reclaim: ((bytes: number) => unknown) | null = null;
@@ -181,8 +183,28 @@ export class ReservedGrant implements Grant {
     }
     this.close();
   }
+  /** Compiler buffers share this account with a native breaker. Keep their existing
+   * charge alive until the recipe's last expression borrow ends; no new credit or loan. */
+  holdClose(): () => void {
+    if (this.#closed) throw new GrantClosedError(this.label);
+    this.#closeHolds++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.#closeHolds--;
+      if (this.#closeHolds === 0 && this.#closeRequested) {
+        this.#closeRequested = false;
+        this.close();
+      }
+    };
+  }
   close(): void {
     if (this.#closed) return;
+    if (this.#closeHolds > 0) {
+      this.#closeRequested = true;
+      return;
+    }
     if (this.bounded && this.allocated > 0) {
       // Dedicated terminal frames can retain dictionary readers after the producer ends.
       // Their source minimum remains charged until the last transfer releases its leases.

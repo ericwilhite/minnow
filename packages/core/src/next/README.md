@@ -3636,3 +3636,11 @@ pairs with type-7 IQR decisions and per-run load averages. Inputs are ESM helper
 exporting `fts` (as in the review probe) or plain helper modules; use the true pre-extraction
 parent ac8e2af1, not the slower6088bc57 adapter, as the primary control. This is a helper
 component clock, not whole-query or row-materialization evidence.
+
+Wide TEXT/BYTES conditional projections try the ordinary allocation first. Only a denial
+selects payload sizing and smaller batches. At a single row CASE/COALESCE/NULLIF borrow
+the selected input, preserving lazy evaluation and downstream readiness without a new
+worst-case reservation. Failed vectorized expression batches in projections and filters
+replay in row order, delivering complete earlier rows before the first data error. Target
+lists evaluate left to right; CASE/COALESCE keep their masks. Replay depends on volatile
+kernels staying refused. Other expanding expressions keep their dedicated admission paths.

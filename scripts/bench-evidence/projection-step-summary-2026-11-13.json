@@ -1,0 +1,35 @@
+{
+  "parent": "74403e472d6d2bbe9dd2362057609b44723fd652",
+  "cases": 416,
+  "parentSuccesses": 151,
+  "candidateSuccesses": 349,
+  "lostSuccesses": [],
+  "wrongResults": [],
+  "peakIncreases": [],
+  "unpinnedTotalIncreases": [],
+  "cleanupZero": true,
+  "maxQueryPeakDelta": 0,
+  "maxQueryPeakSaving": 497152,
+  "success": true,
+  "candidateSourceHashes": {
+    "exec/filter.ts": "dd3def37fa62de1ae1b06fe6f74181541baf3d64f4e9d688608170d2b9fec48c",
+    "exec/projection-step.ts": "423c932d61f086934e01cce6be5c8c21fa4b03cabc4b0f8323316999803c176b",
+    "exec/kernels/case.ts": "c8f02ecb45a6ec91c2c4c778458e2136901a657ed63bb65484083af6d5d5e614",
+    "exec/kernels/vectors.ts": "6d2addcf105c12aaec8cdf5d112a5e2b0e9c9f977775e338f316ce5ea134100e",
+    "exec/plan.ts": "f33ab68069c25aa3c8bdf09dd8c818ba64bdb4cc30a39bc8e9915d0836573703",
+    "exec/result-sink.ts": "8ba40eb44eeb404ba42f73d2acb1105026ccdae86986f21809206ea51195683f",
+    "exec/admission.ts": "3ea15f6793a74d35023aebb918889c42293ba35c4fac9a71a0ec5a42738ba37b",
+    "exec/run.ts": "3a377ec230db7adf16e2e03f45322eac0483d9c95ef79709a5caca496ecf8036",
+    "exec/kernels/compile.ts": "8a1f1665dd1b8eeb92e53c2fb665cd1f5ae2996202433344a066ba1abd02afac"
+  },
+  "rawLogHashes": {
+    "parent": "20cb241cfd1540a69086466a22cf48c44dd10a73fe6c4731d95689c97ed79e2e",
+    "candidate": "7ab5eb55708d62d41834f87355fcd6a8d08e42bc910a19a073ea7680263696fa"
+  },
+  "fixture": "Two 800000-byte text rows; CASE/nested COALESCE-NULLIF/NULLIF/short COALESCE; parameter and stored-column inputs; 1,2,4,8,12,16 repeated keys; 16,32,64,128 MiB; pinned/unpinned. Plus32 direct wide-result histories (one column,32/128MiB,pinned/unpinned).",
+  "clock": "Deterministic shared task clock for equal batching; no CPU/timing claim.",
+  "reproduce": "TMPDIR=<cache-dir> node node_modules/vite-node/dist/cli.mjs --script <cache-dir>/compare-{parent,candidate}.mts; python <cache-dir>/compare-peaks.py",
+  "artifacts": "/home/eric/.cache/b4-projection/",
+  "limits": "151 main successes compared; adaptive competitor total peaks excluded per existing lead waiver.48cap-minimum refusals and19hash-transition errors match actual main. Lazy ordinary execution again exposes5of those19that eager splitting had happened to avoid; no new hash fix or CPU/browser/RSS claim here.",
+  "twoBatchPeakLaw": "Seeds47029/47030 keep12runs: an ordinary-fitting first batch and funded second batch stay at or below main. With lazy preflight both stay vectorized. The previous eager-preflight partial-prefix expectation was removed explicitly; denial progress remains in47027/47028,47025/47026."
+}

@@ -15,6 +15,7 @@ import { compileIntervalExtract } from "./interval-extract.js";
 import { compileCalendarAdd } from "./calendar-add.js";
 import type { ScalarExpr } from "../../ir/ir.js";
 import type { PhysicalType } from "../../types.js";
+import type { MaybePromise } from "../../access/key-index.js";
 import { samePhysicalType } from "../../types.js";
 import {
   allocateFlat,
@@ -42,6 +43,12 @@ export interface ParameterSlots {
 }
 
 export interface CompileContext {
+  /** The execution owns every helper operator's cancellation and pending borrow fence,
+   * including sort/join keys and recursive steps, not only top-level relational stages. */
+  readonly ownOperator?: (operator: {
+    abort(reason: unknown): void;
+    readonly closed: MaybePromise<void>;
+  }) => void;
   readonly arena: OutputArena;
   readonly params: ParameterSlots;
   /** Types of the input's columns, by position. */

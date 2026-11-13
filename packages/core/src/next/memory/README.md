@@ -311,9 +311,9 @@ precedes clearing the previous slot. Cancellation drains both pending and resume
 before the execution settles; tests check spill bytes before the shared service closes.
 Current limits: computed arguments without a proven materialization boundary use the
 external fallback; direct-column FILTER transitions
-have a conservative full-batch growth bound. Varlen CASE output in an ordinary projection
-has a separate transient-pressure allocation gap, reproduced on main; this hash-state
-protocol does not make that expression buffer resumable. Genuinely ordered DISTINCT and
+have a conservative full-batch growth bound. Conditional TEXT/BYTES projection outputs
+use the pressure-only sub-batching protocol below; uncertified expanding expressions
+still need their own complete step protocol. Genuinely ordered DISTINCT and
 uncertified ordered-set transitions retain external sorting with independent private progress lanes.
 A certified numeric percentile list can instead admit its complete row/group-bounded typed
 workspace atomically. Its planning probe releases every temporary grant before that wait;
@@ -390,3 +390,52 @@ Progress never backs persistent hash state. Wide pooled records select raw-value
 comparison before sorting, so spill pages have no additional normalized-key payload.
 Unknown widths, parsed operands, wide coefficients, and variable transitions keep
 their independent recipes; the new shared bound does not certify those layouts.
+
+### Conditional projection steps
+
+TEXT/BYTES CASE, COALESCE and NULLIF projections first try the ordinary batch
+allocation. Successful batches neither inspect widths nor run a sizing recipe. An
+internal allocation denial delivers no rows; the owner retires that attempt's partial
+payloads, then bounds intermediate buffers from borrowed slots and reachable branches.
+Each materializing selector is counted once, including old/new resize overlap. The check
+reserves nothing and runs synchronously with the retry, without a competing allocation.
+
+When credit is insufficient, the owner halves the active prefix down to one row.
+Single-row selector chains borrow their surviving value (or emit null), needing no
+variable payload bytes. Pressure prefixes grow exactly. Input transfers and reusable
+outputs stay owned until downstream readiness; cancellation stops the loop and cleanup
+waits for the borrow fence. There is no global memory wait while retaining input pins,
+and no extra worst-case admission minimum.
+
+A vectorized expression data error takes the same precise path in ordinary and pressured
+execution: replay the failed batch in input-row order, evaluate each row's target list
+in order, offer complete successful rows, then raise the first failing expression of
+the first failing row. Filters likewise replay their failed batch and offer earlier
+survivors before the error. CASE/COALESCE masks stay lazy. Only expression evaluation is
+caught: downstream errors and cancellation are not replayed. This is safe only while
+volatile kernels remain refused; the generated volatile-refusal guard must be revisited
+before allowing them. No already delivered prefix is replayed.
+
+The memory certificate covers borrowed TEXT/BYTES leaves, identity casts and conditional
+selectors. Other variable producers retain their operator-specific protocols (JSON has
+its own pressure handoff). An expanding producer needs a proof for its smallest step;
+otherwise checkpoint evaluated values and release pins before atomic re-admission.
+
+All compiled expression operators, including internal sort/join key helpers and
+recursive steps, register with their recipe owner. Cleanup waits for pending expression
+borrows even when the plan has no pressure phases. While the compiler arena exists,
+its reserved account defers a native breaker's close; after every borrow ends, the arena
+releases its buffers and the owner releases that close hold. This adds no credit or loan.
+An inactive helper returns no promise, preserving synchronous ordinary completion.
+
+The receiving result sink also uses exact varlen growth for a one-row copied frame.
+Rounding that payload to the entire byte window would leave no room for its separately
+charged offsets and frame metadata, forcing an unnecessary progress loan under a pinned
+competitor. Multi-row frame sizing and complete admission envelopes are unchanged.
+
+After each pressure prefix reaches downstream readiness, its dead assembler payloads
+and vector references are retired. A later funded full batch therefore allocates its
+payload without overlapping a smaller stale pressure arena. Fixed compiler buffers
+remain admitted, borrowed source values are untouched, and ordinary batch reuse is
+unchanged. The two-batch peak generator checks this boundary against the fitting normal
+path, including partial pressure followed by an ordinary batch.

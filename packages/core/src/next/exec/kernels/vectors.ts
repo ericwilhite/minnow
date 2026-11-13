@@ -53,20 +53,31 @@ export function validAt(validity: Validity | null, row: number): boolean {
   return validity === null || ((validity[row >>> 5] ?? 0) & (1 << (row & 31))) !== 0;
 }
 
+/** Internal allocation denial; only this condition may select pressure sub-batching. */
+export class ExpressionMemoryError extends RangeError {
+  constructor(bytes: number) {
+    super(`An expression's ${String(bytes)}-byte buffer was refused by its grant`);
+    this.name = "ExpressionMemoryError";
+  }
+}
+
 /** Output buffers of compiled expressions, charged to one grant and freed together. */
 export class OutputArena {
   #charged = 0;
+  readonly #retire: Array<() => void> = [];
   constructor(
     readonly charge: ByteCharge,
     readonly capacity: number,
     /** The caller retains borrowed branch values until downstream readiness. */
-    readonly borrowVarlen = false,
+    public borrowVarlen = false,
   ) {}
+
+  /** Adaptive projection steps avoid geometric over-allocation across disjoint prefixes. */
+  exactVarlenGrowth = false;
 
   /** Charges `bytes` or throws a `RangeError` (compile-time minimums are admitted first). */
   take(bytes: number): void {
-    if (!this.charge.allocate(bytes))
-      throw new RangeError(`An expression's ${String(bytes)}-byte buffer was refused by its grant`);
+    if (!this.charge.allocate(bytes)) throw new ExpressionMemoryError(bytes);
     this.#charged += bytes;
   }
 
@@ -100,7 +111,19 @@ export class OutputArena {
     return this.#charged;
   }
 
+  /** Registered by variable assemblers, not borrowed source buffers. */
+  onVarlenRetire(retire: () => void): void {
+    this.#retire.push(retire);
+  }
+
+  /** Only after downstream readiness: all previous output vectors have expired. */
+  retireVarlen(): void {
+    for (const retire of this.#retire) retire();
+  }
+
   close(): void {
+    this.retireVarlen();
+    this.#retire.length = 0;
     if (this.#charged > 0) this.charge.free(this.#charged);
     this.#charged = 0;
   }

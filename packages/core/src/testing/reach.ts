@@ -5665,3 +5665,60 @@ export const FTS_SHARED_REACH = [
   "repeated query terms",
   "empty query and NULL truth",
 ] as const;
+
+export const PROJECTION_PROGRESS_REACH = [
+  "wide result delivery",
+  "NULL input",
+  "NULLIF equal",
+  "CASE",
+  "nested COALESCE NULLIF",
+  "column CASE",
+  "short reachable branch",
+  "cancelled",
+  "PG exact",
+  "pinned competitor",
+  "ASCII",
+  "UTF8",
+] as const;
+
+export const PROJECTION_SPLIT_REACH = [
+  "adaptive to ordinary",
+  "multi-row prefix",
+  "dense",
+  "sparse",
+  "exact values",
+  "one evaluation",
+  "no payload allocation",
+  "held borrow",
+  "cancel wait",
+  "error once",
+] as const;
+
+export const PROJECTION_PEAK_REACH = [
+  "fitting first",
+  "ordinary second",
+  "no peak increase",
+] as const;
+
+export const EXPRESSION_ERROR_REACH = [
+  "denied prefix error",
+  "single row",
+  "full batch",
+  "filter",
+  "target list",
+  "pinned competitor",
+  "ordinary",
+  "emitted prefix",
+  "first row error",
+  "division first",
+  "overflow first",
+  "lazy COALESCE CASE",
+] as const;
+
+export const EXPRESSION_FENCE_REACH = [
+  "shallow ambient stack",
+  "join key",
+  "sort key",
+  "cancelled suspension",
+  "cleanup zero",
+] as const;

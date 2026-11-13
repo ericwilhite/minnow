@@ -318,7 +318,9 @@ export class ResultSink implements Operator {
         varlenBytes: 64,
         // ColumnStore permits one oversized row even with a finite target. Keeping that
         // target makes its arena grow to the actual need, rather than doubling past reserve.
-        targetBytes: this.#target,
+        // One row cannot be split further: geometric spare bytes are optional and
+        // must not consume the metadata's admitted credit under pinned pressure.
+        targetBytes: rows === 1 ? 0 : this.#target,
       }),
       columns: null,
       dictionaries: [],

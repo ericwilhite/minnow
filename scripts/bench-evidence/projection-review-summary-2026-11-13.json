@@ -1,0 +1,73 @@
+{
+  "fixture": "review CASE over1024 already-decoded alternating bool/short TEXT rows;10000pushes,3000warmups per fresh VM",
+  "control": "74403e472d6d2bbe9dd2362057609b44723fd652",
+  "clock": "process user+system CPU, all threads and natural GC; no forced GC; setup/verification/IPC excluded",
+  "lifecycle": "fresh VM per arm/workload/boundary/round; serial arms, alternating AB/BA",
+  "quartiles": "type7 linear interpolation at(n-1)*p",
+  "rawArtifact": "/home/eric/.cache/b4-projection/review-cpu.json",
+  "rawSha256": "58aa79269c41e337825e4af96d1b0f5ce65f052ed960aca37763ceaf79c688b9",
+  "reproduce": "TMPDIR=<scratch> node scripts/projection-step-cpu.mts <built-main-root> <built-candidate-root> <scratch>/cpu.json 74403e472d6d2bbe9dd2362057609b44723fd652 <candidate-sha>",
+  "sourceHashes": {
+    "scripts/projection-step-cpu.mts": "32093883a51af50c5c49b2b82b90b2fd52edb6f05ef3e2d83b1fd8107c4fb34c",
+    "scripts/projection-step-worker.mts": "f251b90a93f81805ac2100f7e9e258954254a252cc0b3a88eda1fcc910a5a626",
+    "scripts/lib/independent-cpu.mts": "d5e9ee1df420f4cdc5f6709d0e29cbcc19b1f547d8e66c1063b32bff12894b4c",
+    "scripts/lib/paired-cpu.mts": "6c578f94613567937737d5be128634d293665fa1c87db3376324aa260873da69",
+    "packages/core/src/next/exec/filter.ts": "dd3def37fa62de1ae1b06fe6f74181541baf3d64f4e9d688608170d2b9fec48c",
+    "packages/core/src/next/exec/kernels/vectors.ts": "6d2addcf105c12aaec8cdf5d112a5e2b0e9c9f977775e338f316ce5ea134100e",
+    "packages/core/src/next/exec/kernels/case.ts": "c8f02ecb45a6ec91c2c4c778458e2136901a657ed63bb65484083af6d5d5e614",
+    "packages/core/src/next/exec/admission.ts": "3ea15f6793a74d35023aebb918889c42293ba35c4fac9a71a0ec5a42738ba37b",
+    "packages/core/src/next/exec/plan.ts": "f33ab68069c25aa3c8bdf09dd8c818ba64bdb4cc30a39bc8e9915d0836573703",
+    "packages/core/src/next/exec/run.ts": "3a377ec230db7adf16e2e03f45322eac0483d9c95ef79709a5caca496ecf8036",
+    "packages/core/src/next/exec/kernels/compile.ts": "8a1f1665dd1b8eeb92e53c2fb665cd1f5ae2996202433344a066ba1abd02afac"
+  },
+  "aa": {
+    "controlMedianMs": 791.892,
+    "candidateMedianMs": 800.781,
+    "pairedDeltasMs": [
+      18.206999999999994, 20.607999999999947, -2.048000000000002, 14.780999999999949,
+      22.47199999999998, -5.572999999999979, -4.692000000000007, 2.6219999999999573,
+      26.517999999999915
+    ],
+    "medianDeltaMs": 14.780999999999949,
+    "iqrDeltaMs": 22.65599999999995,
+    "minDeltaMs": -5.572999999999979,
+    "maxDeltaMs": 26.517999999999915,
+    "rangeDeltaMs": 32.090999999999894,
+    "favoursCandidate": 3,
+    "favoursControl": 6,
+    "acceptedGain": false,
+    "significantRegression": false,
+    "distinctTimedPids": 18,
+    "preflightCalls": 0,
+    "loadRange": [0.5, 0.61]
+  },
+  "ab": {
+    "controlMedianMs": 836.61,
+    "candidateMedianMs": 810.019,
+    "pairedDeltasMs": [
+      -51.281999999999925, 12.586999999999989, 8.037000000000035, -56.000999999999976,
+      2.5850000000000364, -46.30499999999995, -3.518000000000029, 14.745999999999981,
+      -13.607999999999947
+    ],
+    "medianDeltaMs": -3.518000000000029,
+    "iqrDeltaMs": 54.341999999999985,
+    "minDeltaMs": -56.000999999999976,
+    "maxDeltaMs": 14.745999999999981,
+    "rangeDeltaMs": 70.74699999999996,
+    "favoursCandidate": 5,
+    "favoursControl": 4,
+    "acceptedGain": false,
+    "significantRegression": false,
+    "distinctTimedPids": 18,
+    "preflightCalls": 0,
+    "loadRange": [0.64, 1.02]
+  },
+  "decision": "Neutral A/A. Ordinary operator within observed paired noise of main; no accepted reverse regression. No speedup/equivalence/whole-query CPU claim.",
+  "limits": "Loaded Node26.12 host; operator only. Complete main peak campaign and full gate separate. Earlier valid pre-fence samples retained as review-cpu-prefence-736684e2.*, earlier build-overlap run discarded and retained as review-cpu-overlapped-build-invalid.*.",
+  "measuredDistHashes": {
+    "exec/filter.js": "a4c8a391d69727c40cc4920a6aae715d279e449c2d51eab72d0f9ac017441056",
+    "exec/kernels/vectors.js": "8a9a2ae4c7e1d6e8e8832750141da47f774e8ec2e63578f0c3a48a3a23420ca3",
+    "exec/kernels/case.js": "c8968a064f209bde1b716ef2212ac570d3d1df845e178f3b8c79610f5dd8666b"
+  },
+  "implementation": "1d641fa3a0cc7b077698d78250dd550e41445c81"
+}
