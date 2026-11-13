@@ -821,6 +821,8 @@ class Evaluator implements Operator {
   #bigBytes = 0;
   #scratchBytes = 0;
   #newGroupBytes = 0;
+  /** Initial flags share prepaid emit workspace, never progress-loan room. */
+  #newGroupPooled = false;
   readonly #outputs: Output[];
   /** Every input column (the grouped path's gathers). */
   readonly #allColumns: readonly number[];
@@ -874,7 +876,8 @@ class Evaluator implements Operator {
       collation: null,
     }));
     this.charge = new Charge(context.grant);
-    this.pool = new Pool(this.charge, POOL_BYTES);
+    // Flags, remembered keys, staging and output coexist in one prepaid step envelope.
+    this.pool = new Pool(this.charge, POOL_BYTES, true);
     this.files = new SpillFiles(context.spill, context.queryId, this.charge);
     this.pages = new PageWriter(this.pool, 16 * 1024);
     this.io = new SpillIo(this.pool, this.files, this.pages, context, () => {
@@ -1259,12 +1262,14 @@ class Evaluator implements Operator {
     if (i >= this.#newGroup.length) {
       const size = Math.max(4096, this.#newGroup.length * 2, i + 1);
       // Charged in full while the old flags are copied (governor rule 4), then the old freed.
-      if (!this.charge.allocate(size))
+      const pooled = size === 4096 && !this.pool.owes && this.pool.room >= size;
+      if (!(pooled ? this.pool : this.charge).allocate(size))
         throw new RangeError("Window peer flags could not be allocated");
       const grown = new Uint8Array(size);
       grown.set(this.#newGroup);
       this.#newGroup = grown;
-      this.charge.free(this.#newGroupBytes);
+      (this.#newGroupPooled ? this.pool : this.charge).free(this.#newGroupBytes);
+      this.#newGroupPooled = pooled;
       this.#newGroupBytes = size;
     }
     this.#newGroup[i] = value;
@@ -2122,12 +2127,20 @@ class Evaluator implements Operator {
     }
   }
 
+  #dropPeerFlags(): void {
+    const bytes = this.#newGroupBytes;
+    this.#newGroup = new Uint8Array(0);
+    this.#newGroupBytes = 0;
+    if (bytes > 0) (this.#newGroupPooled ? this.pool : this.charge).free(bytes);
+    this.#newGroupPooled = false;
+  }
+
   /** Frees the partition scratch and the peer flags (grown again by the next partition). */
   #dropScratch(): void {
     if (this.#scratchBytes > 0) this.charge.free(this.#scratchBytes);
     this.#scratchBytes = 0;
     this.#scratch = null;
-    if (this.#newGroupBytes > 0) this.charge.free(this.#newGroupBytes);
+    this.#dropPeerFlags();
     this.#newGroupBytes = 0;
     this.#newGroup = new Uint8Array(0);
   }
@@ -2151,7 +2164,7 @@ class Evaluator implements Operator {
     this.#staged?.close();
     this.#staged = null;
     if (this.#scratchBytes > 0) this.charge.free(this.#scratchBytes);
-    if (this.#newGroupBytes > 0) this.charge.free(this.#newGroupBytes);
+    this.#dropPeerFlags();
     this.#scratch?.big.fill(null);
     if (this.#bigBytes > 0) this.charge.free(this.#bigBytes);
     this.#bigBytes = 0;

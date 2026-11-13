@@ -4741,3 +4741,11 @@ export const OWNED_PARAMETER_COLUMN_BOUNDS_REACH = [
   "original slot order",
   "phase binding bounds",
 ] as const;
+
+/** Native window emission shares prepaid workspace under complete competing admission. */
+export const WINDOW_PEER_PRESSURE_REACH = [
+  "jsonb",
+  "array",
+  "all credit occupied",
+  "unpressured",
+] as const;

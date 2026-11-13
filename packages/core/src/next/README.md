@@ -3510,3 +3510,15 @@ scans materialize only their selected metadata. Complete-root readers still see 
 Pressure falls back to the ordinary decoder; non-retaining export does not populate or promote
 this cache. The stored format and execution minima are unchanged. Ownership, cancellation and
 fresh-process comparisons are documented in the docs site's testing reference.
+
+### Window peer emission under complete admission
+
+Initial 4 KiB peer flags share the window's existing prepaid spill/output pool. They
+never consume progress-loan room. Remembered keys, staging, decoder and output buffers
+continue to use that same envelope. For this window pool, ordinary overflow charges only
+the uncovered part of a buffer: one emit step counts its live bytes once, rather than
+paying for both unused pool room and a whole overflow buffer. Native minima are unchanged.
+Larger resident peer arrays retain their ordinary-credit growth and copy-overlap accounting.
+`window-peer-pressure.test.ts` compares seeded structural-key results with PGlite while
+a competitor holds all remaining credit; `window-emit-peak.test.ts` checks fitting-step
+peaks against the parent accounting model, including allocations on the pool boundary.

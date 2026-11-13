@@ -62,8 +62,10 @@ export class Pool implements ByteCharge {
   loans = 0;
   largestLoan = 0;
   constructor(
-    readonly charge: Charge,
+    readonly charge: ByteCharge,
     size: number,
+    /** Shared emit workspace charges only the part outside its prepaid envelope. */
+    readonly splitOverflow = false,
   ) {
     if (!charge.allocate(size)) throw new RangeError("A join's spill pool must be admitted");
     this.#size = size;
@@ -99,9 +101,14 @@ export class Pool implements ByteCharge {
       if (this.#extra > 0) this.#consumed = true;
       return true;
     }
-    if (this.#extra === 0 && this.charge.allocate(bytes)) {
-      this.#overflow += bytes;
-      return true;
+    if (this.#extra === 0) {
+      const pooled = this.splitOverflow ? Math.max(0, this.#size - keep - this.#used) : 0;
+      const overflow = bytes - pooled;
+      if (this.charge.allocate(overflow)) {
+        this.#used += pooled;
+        this.#overflow += overflow;
+        return true;
+      }
     }
     return false;
   }
