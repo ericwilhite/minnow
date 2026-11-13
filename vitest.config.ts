@@ -19,7 +19,15 @@ export default defineConfig({
   // The site's own modules import each other through the `@/` alias its tsconfig declares, so a
   // test of one of them resolves the same way the browser build does.
   resolve: {
-    alias: { "@/": `${fileURLToPath(new URL("./apps/site", import.meta.url))}/` },
+    alias: [
+      { find: "@/", replacement: `${fileURLToPath(new URL("./apps/site", import.meta.url))}/` },
+      // A default-option PGlite starts from the run's initdb snapshot instead of running initdb
+      // (scripts/pglite-snapshot.client.ts); exactly the bare package name, nothing under it.
+      {
+        find: /^@electric-sql\/pglite$/u,
+        replacement: fileURLToPath(new URL("./scripts/pglite-snapshot.client.ts", import.meta.url)),
+      },
+    ],
   },
   test: {
     // Each file may start whole engines and durable-store simulations. Unbounded file-level
@@ -31,7 +39,8 @@ export default defineConfig({
     sequence: { sequencer: DurationSequencer },
     // A fresh directory per run where split reach campaigns record what their files reached
     // (packages/core/src/testing/reach-union.ts).
-    globalSetup: ["./scripts/reach-directory.ts"],
+    // And one just-initialised PGlite data directory per run (scripts/pglite-snapshot.ts).
+    globalSetup: ["./scripts/reach-directory.ts", "./scripts/pglite-snapshot.ts"],
     // Test builds re-verify a cached blob's checksum when its lease is released or it is evicted
     // (packages/core/src/next/storage/verify-cached.ts): a consumer that writes into bytes the
     // cache treats as immutable fails loudly in whichever suite does it.
