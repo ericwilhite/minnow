@@ -2271,7 +2271,14 @@ Known-size memtable flushes give the page writer an estimate-only row-count hint
 reserving space for 65,536 wide rows when the group contains only a few. The hint changes no
 codec decision or page boundary. `page/known-rows.test.ts` compares native page and tail bytes
 with the ordinary estimator; the integration campaign refuses exaggerated reservations
-before a memory store could allocate a multi-gigabyte buffer. The separate shipped-format
+before a memory store could allocate a multi-gigabyte buffer.
+`write/wide-row-recycle.test.ts` also exercises the ordinary native flush with 1, 4, 6 or 8 JSONB
+columns, values on both sides of the 64 KiB large-value boundary, and explicit validity
+bitmaps. It checks complete append progress, bounded reservations before storage allocation,
+charged encoder scratch and cleanup, then compares every native value before and after
+reopen. Its 10-second recycle deadline is a liveness check, not a performance target; the
+reservation bound catches the old full-group extrapolation without allocating gigabytes.
+The separate shipped-format
 cutover and quiet-host performance acceptance remain outside these correctness campaigns.
 
 Catalog-dependent run capacities are checked after WAL replay has restored the catalog. A table's
