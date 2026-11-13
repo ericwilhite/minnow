@@ -205,6 +205,31 @@ export const LONG_KEY_ACTION_STATES = [
   "escaped key expansion at admission",
 ] as const;
 
+export const WIDE_ROW_RECYCLE_STATES = [
+  "bounded reservations",
+  "charged encoder",
+  "complete append",
+  "inline wide values",
+  "large value boundary",
+  "JSONB columns 1",
+  "JSONB columns 4",
+  "JSONB columns 6",
+  "JSONB columns 8",
+  "width 16383",
+  "width 32767",
+  "width 43690",
+  "width 65520",
+  "width 65537",
+  "width 131072",
+  "two rows",
+  "three rows",
+  "validity bitmap",
+  "no validity bitmap",
+  "exact native readback",
+  "exact reopened readback",
+  "all charges released",
+] as const;
+
 export const KNOWN_ROW_ESTIMATE_STATES = [
   "native bytes identical",
   "bounded hint",
