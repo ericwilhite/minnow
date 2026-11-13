@@ -17,6 +17,13 @@
  * (`packages/db/tests/oracle-reach.ts`). Like ./seeds.ts, this module is excluded from the
  * published tarball.
  */
+/** Ordered hot-key traversal stays linear relative to the legacy input scan. */
+export const HOT_KEY_SORT_WORK_STATES = [
+  "exact ordered rows",
+  "linear stream work",
+  "bounded legacy ratio",
+] as const;
+
 /** Reset refusal must see every legacy marker and both OPFS capability states. */
 export const DIRECTORY_REFUSAL_REACH = [
   "old development root refused",
