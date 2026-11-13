@@ -1,3 +1,9 @@
+export {
+  MAX_FTS_QUERY_TERMS,
+  MAX_FTS_TOKENS_PER_DOCUMENT,
+  MAX_INDEXED_STRING_CHARACTERS,
+} from "../full-text/limits.js";
+import { MAX_FTS_QUERY_TERMS } from "../full-text/limits.js";
 import { dateIsoString, dateMilliseconds } from "../date-value.js";
 import {
   assertWellFormedString,
@@ -3552,18 +3558,12 @@ export interface FtsCandidates {
 
 /** Aggregate row-id ceiling for one postings candidate read. Overflow falls back to a scan. */
 export const MAX_FTS_CANDIDATE_ROW_IDS = 65_536;
-/** Query-term cardinality shared by the parser and every postings adapter boundary. */
-export const MAX_FTS_QUERY_TERMS = 32;
 /** Retained metadata/value ceiling for one ordered postings read. Overflow falls back to a scan. */
 export const MAX_FTS_ORDERED_READ_BYTES = 67_108_864 as number; // 64 MiB
 /** Hard public mutation bounds for one streamed postings-build chunk. */
 export const MAX_FTS_POSTINGS_PER_CHUNK = 65_536;
 export const MAX_FTS_POSTING_ROW_IDS_PER_CHUNK = 1_048_576;
 export const MAX_FTS_POSTING_TERM_CHARACTERS = 65_536;
-/** Indexed string values are bounded; non-indexed block strings retain the physical block cap. */
-export const MAX_INDEXED_STRING_CHARACTERS = 16_384;
-/** Maximum normalized tokens retained from one indexed document. */
-export const MAX_FTS_TOKENS_PER_DOCUMENT = 4_096;
 /** Bounded catalog/TOC cardinality. Oversized accelerators invalidate and queries scan. */
 export const MAX_FTS_BASE_CHUNKS = 4_096;
 export const MAX_FTS_DELTA_CHUNKS = 128;

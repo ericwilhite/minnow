@@ -3617,3 +3617,13 @@ covered by the generated window campaigns and the PGlite adversarial-float cases
 Allocation observers belong to individual grants, so an abandoned history cannot
 observe or restore another history's method. No production deadline or coverage
 floor changes.
+
+### Shared full-text semantics (stage 1)
+
+`full-text.ts` exposes the permitted representation-neutral `src/full-text` leaf: tokenizer v1,
+plain-value renderer v1, scorer v1, matching and exact corpus-stat helpers. The shipped adapter
+alone decodes legacy tagged values and retains its existing compilation cache. Native physical
+values will be adapted at the scan boundary; importing this leaf does not yet enable native SQL
+MATCH/BM25. Native execution must charge tokenizer workspace before calling these allocating
+helpers and must not adopt the shipped process cache. Dependency tests pin the leaf's complete
+neutral import closure; generated SQL comparisons use an independent token/stat/score model.

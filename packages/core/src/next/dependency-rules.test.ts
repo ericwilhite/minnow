@@ -68,6 +68,11 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
     "owner",
   ],
 };
+// Representation-neutral shared FTS leaf: never an escape hatch into either executor.
+const FTS_LEAVES = new Set(
+  ["semantics.js", "limits.js"].map((name) => join(SRC, "full-text", name)),
+);
+
 const BRIDGES = new Set(["lower", "owner", "testing"]);
 
 function sourceFiles(directory: string): string[] {
@@ -124,10 +129,25 @@ describe("next/ dependency rules", () => {
     }
   });
 
+  it("shared FTS leaves have only neutral transitive dependencies", () => {
+    const allowed = new Set([
+      ...FTS_LEAVES,
+      join(SRC, "date-value.js"),
+      join(SRC, "block-format/unicode.js"),
+    ]);
+    for (const target of allowed) {
+      const file = target.replace(/\.js$/, ".ts");
+      for (const edge of importsOf(file))
+        expect(allowed.has(edge.target), `${file} imports ${edge.target}`).toBe(true);
+    }
+  });
+
   it("non-bridge next/ sources use the old code only as types", () => {
     for (const file of sourceFiles(NEXT)) {
       if (BRIDGES.has(moduleOf(file)) || file.endsWith(".test.ts")) continue;
-      for (const edge of importsOf(file).filter((candidate) => !inNext(candidate.target)))
+      for (const edge of importsOf(file).filter(
+        (candidate) => !inNext(candidate.target) && !FTS_LEAVES.has(candidate.target),
+      ))
         expect(edge.typeOnly, `${relative(SRC, file)} imports ${relative(SRC, edge.target)}`).toBe(
           true,
         );
