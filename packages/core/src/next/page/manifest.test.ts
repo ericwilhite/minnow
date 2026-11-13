@@ -126,7 +126,7 @@ describe("manifest metadata end to end", () => {
     const catalog = defined((await writer.write([encoder.encode('{"tables":[]}')])).blobs[0]);
     const empty: BlobRef = { extent: { offset: 0, length: 0 }, offset: 0, length: 0, checksum: 0 };
     const root: ManifestRoot = {
-      formatVersion: 2,
+      formatVersion: 3,
       sequence: 1,
       epoch: 1,
       log: { salt: 7, firstLsn: 1, rootSequence: 1 },
@@ -252,7 +252,7 @@ describe("manifest metadata end to end", () => {
     // The walk works over the same reader (a ManifestReader).
     const found = await reachable(
       {
-        formatVersion: 2,
+        formatVersion: 3,
         sequence: 1,
         epoch: 1,
         log: { salt: 1, firstLsn: 1, rootSequence: 1 },

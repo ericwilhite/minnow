@@ -18,6 +18,19 @@
  * published tarball.
  */
 /** Reset refusal must see every legacy marker and both OPFS capability states. */
+export const DURABLE_LONG_KEY_REACH = [
+  "WAL-only invalidation",
+  "replayed invalidation",
+  "memory",
+  "sim",
+  "13107-unit boundary",
+  "older OPFS zero writes",
+  "older IDB zero writes",
+  "first root slot",
+  "second root slot",
+  "complete native tree",
+  "partial native tree",
+] as const;
 export const DURABLE_REGISTRY_REACH = [
   "snapshot",
   "snapshotFrame",
@@ -47,6 +60,10 @@ export const DURABLE_REGISTRY_REACH = [
   "runFences",
   "runBloomDirectory",
   "runBloom",
+  "runKeyPointer",
+  "runKeyDescriptor",
+  "runKeyDirectory",
+  "runKeyPayload",
   "arrayValue",
 ] as const;
 export const DELETION_BITMAP_REACH = [
@@ -129,6 +146,252 @@ export interface Reach<State extends string> {
   /** Fails for each declared state that too few histories entered. */
   assertReached(): void;
 }
+
+export const WIDE_KEY_BATCH_STATES = [
+  "wide insert slices",
+  "wide sparse selected offsets",
+  "wide dense offsets",
+  "wide backfill slices",
+  "wide backfill visible before replay",
+  "wide replay tail",
+  "wide conflict tail",
+  "wide update tail",
+  "wide delete tail",
+  "wide thirty-two MiB",
+  "wide sixty-four MiB",
+  "wide scalar provenance",
+  "wide one-twenty-eight MiB",
+  "wide tuple provenance",
+] as const;
+
+export const CATALOG_RUN_LIMIT_STATES = [
+  "catalog capacity refusal",
+  "intact capacity continues",
+  "refused open retries",
+] as const;
+
+export const LONG_KEY_ACTION_STATES = [
+  "pending byte freeze",
+  "byte freeze rollback",
+  "byte freeze savepoint",
+  "bounded overflow drain",
+  "thirty-two MiB flush",
+  "sixty-four MiB flush",
+  "forward planned",
+  "reverse planned",
+  "future width at fixed admission",
+  "automatic overflow selection",
+  "NUL published key",
+  "invalid support rekey",
+  "selective durable fallback",
+  "fallback allocation cleanup",
+  "foreign cascade",
+  "foreign restrict",
+  "foreign set null",
+  "pre-full pending pressure",
+  "wide ingress at thirty-two MiB",
+  "whole wide ingress below cap",
+  "escaped key expansion at admission",
+] as const;
+
+export const KNOWN_ROW_ESTIMATE_STATES = [
+  "native bytes identical",
+  "bounded hint",
+  "long row projection",
+] as const;
+
+export const LONG_KEY_LIMIT_STATES = [
+  "catalog policy corruption refusal",
+  "float32 full equality width",
+  "other fixed equality widths",
+  "canonical domain term costs",
+  "enum without native cache",
+  "other domain components",
+  "typed semantic refusal",
+  "legacy scalar secondary",
+  "composite primary budget",
+  "secondary tuple budget",
+  "scalar primary budget",
+  "flat",
+  "constant",
+  "dictionary",
+  "UTF16 astral",
+  "embedded NUL",
+  "other Unicode",
+  "UTF8 width is not units",
+  "write refusal atomic",
+  "invalid secondary scans",
+  "prepared replan",
+  "update and delete",
+  "durable catalog policy",
+  "old ready snapshot",
+  "transaction undo",
+  "savepoint undo",
+  "backfill invalidation",
+  "backfill replay",
+] as const;
+
+export const OVERFLOW_PUBLICATION_STATES = [
+  "hundreds of retained summaries",
+  "maximum text pieces",
+  "other piece widths",
+  "thirty-two inputs",
+  "other input counts",
+  "thirty-two MiB cap",
+  "sixty-four MiB cap",
+  "before data flush",
+  "before root write",
+  "before root truncate",
+  "before root flush",
+  "recovered retry continues",
+  "independent current openers",
+] as const;
+
+export const OVERFLOW_INTEGRITY_STATES = [
+  "minimum contradiction",
+  "maximum contradiction",
+  "capacity outside data",
+  "cross-extent refusal",
+  "unknown run version",
+  "shared-prefix corruption",
+  "different-prefix corruption",
+  "checksummed future directory",
+  "native payload CRC",
+] as const;
+
+export const OVERFLOW_ROOT_STATES = [
+  "ordinary point reads",
+  "admitted ascending",
+  "admitted descending",
+  "allocation-free planning",
+  "published overflow root",
+  "old snapshot after publication",
+  "durable reopen",
+  "continued writes",
+  "shipped UTF16 maximum",
+  "other key lengths",
+] as const;
+
+export const OVERFLOW_SUMMARY_STATES = [
+  "bounded native summaries",
+  "crossed partition boundary",
+  "full-key Bloom",
+  "supplied hashes",
+  "computed hashes",
+  "multiple chunks",
+  "single chunk",
+  "ascending",
+  "descending",
+  "prefix ties retained",
+  "pending heads",
+  "range bounds and skip",
+  "fan in eight",
+  "other fan in",
+  "hot overflow partitions",
+] as const;
+
+export const MERGE_STOP_STATES = [
+  "slice callback",
+  "no entries after stop",
+  "working charge returned",
+  "single entry slice",
+  "partial block slice",
+  "clock chunk slice",
+] as const;
+
+export const OVERFLOW_READER_STATES = [
+  "point reads",
+  "missing shared prefix",
+  "cursor drain",
+  "ascending",
+  "descending",
+  "prefix seek",
+  "mixed inline blocks",
+  "cached reads",
+  "cold reads",
+  "multi chunk",
+  "single chunk",
+  "equal prefixes full comparison",
+  "wide row ids",
+  "read failure",
+  "retry",
+  "unknown directory version",
+  "corrupt descriptor",
+  "capacity refusal",
+  "cancellation",
+  "split merge",
+  "owned merge heads",
+  "fan in 32",
+  "other fan in",
+  "hot key crosses fences",
+  "close during read",
+  "cancel during read",
+  "interleaved readers",
+  "native precharge",
+  "metadata precharge",
+  "invalid entry count",
+  "shipped key maximum",
+  "exact inline prefix",
+] as const;
+
+export const KEY_POINTER_CODEC_STATES = [
+  "shipped maximum",
+  "other lengths",
+  "adjacent directory",
+  "directory padding",
+  "round trip",
+  "invalid references",
+  "unknown tag",
+  "truncation",
+] as const;
+
+export const OVERFLOW_WRITER_STATES = [
+  "wide row identifiers",
+  "interleaved scratch",
+  "bulk supplied hashes",
+  "bounded root round trip",
+  "payload failed",
+  "directory failed",
+  "block failed",
+  "tail failed",
+  "credit failed",
+  "native failed",
+  "construct failed",
+  "write failed",
+  "finish failed",
+  "waiting before encoder",
+  "cancelled admission",
+  "resumed admission",
+  "extended blocks",
+  "inline blocks",
+  "mixed blocks",
+  "funded until consumed",
+  "borrowed input",
+  "copied input",
+  "bottom tombstones",
+  "retained tombstones",
+  "acknowledged buffers detached",
+  "shipped maximum",
+  "multiple payload chunks",
+  "empty output",
+  "bounded budget",
+  "clean failure retry",
+] as const;
+
+export const RUN_KEY_CODEC_STATES = [
+  "run encodings",
+  "unknown run encoding",
+  "inline",
+  "overflow",
+  "shipped text maximum",
+  "multiple chunks",
+  "unknown tag",
+  "truncation",
+  "extent bounds",
+  "length prefix count checksum",
+  "overlap",
+] as const;
+export const ENCODING_VERSION_STATES = ["old development", "newer", "previous root"] as const;
 
 export const WRITE_MERGE_SUMMARY_PRESSURE_STATES = [
   "other pinned bytes retained",
@@ -2688,17 +2951,17 @@ export const DIRECTORY_APPEND_REACH = [
   "exact cleanup",
 ] as const;
 
-/** Every legal twelve-bit canonical directory tail is opened by both supported builds. */
+/** Every legal twelve-bit canonical directory tail is opened by independent current builds. */
 export const DIRECTORY_COMPAT_TAILS = Array.from({ length: 4096 }, (_, n) => `tail ${String(n)}`);
 export const DIRECTORY_COMPAT_REACH = [
-  "current to baseline continuation",
-  "baseline to current continuation",
+  "current to peer continuation",
+  "peer to current continuation",
   "every value preserved",
   "exact cleanup",
   "range end reopened",
   "full-page carry",
   "full-page plus tail",
-  "frozen packed tail",
+  "reused packed tail",
   "partial extent retained after edit",
   "shared extent carry retired",
 ] as const;
@@ -2718,13 +2981,13 @@ export const DIRECTORY_TRANSITION_REACH = [
   "acknowledged values recovered",
   "retry both writers",
   "interrupted current writer",
-  "interrupted baseline writer",
+  "interrupted peer writer",
   "concurrent current owner",
-  "concurrent baseline owner",
+  "concurrent peer owner",
   "damaged page refused",
   "damaged index refused",
   "damage refused by current",
-  "damage refused by baseline",
+  "damage refused by peer",
 ] as const;
 
 /** The fused publication proof, including exact rejection and a non-timing scan-count guard. */

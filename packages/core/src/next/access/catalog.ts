@@ -20,7 +20,8 @@
  *   `UnindexableTypeError`. An enum index is equality-only (`IndexDef.kind`).
  * - **Every enforced foreign key has a supporting index** on the referencing columns (role
  *   `"foreignKey"`, created with the constraint unless an index with those leading columns
- *   exists), so a parent's delete or rekey finds its children by index probe, never by a scan.
+ *   exists). A parent's delete or rekey probes it while it is valid; after an oversized
+ *   nonunique tuple invalidates that path, an exact scan of the reference columns takes over.
  * - **Named types** (ruling R17.7): `CREATE TYPE … AS ENUM` is a `TypeDef`; a column of that type
  *   has an enum `PhysicalType` with the same name and labels. A type a column uses cannot be
  *   dropped.
@@ -95,6 +96,12 @@ export interface IndexDef {
   /** `ordered`: equality and ranges in key-byte order; `equality`: lookups only (enum). */
   readonly kind: "ordered" | "equality";
   readonly role: "primary" | "unique" | "secondary" | "foreignKey";
+  /** Invalid nonunique indexes retain their identity but cannot answer queries. Writes scan
+   * instead after the shipped term limit is exceeded. Old snapshots keep their ready catalog. */
+  readonly invalid?: true;
+  /** Omitted: scalar one-column primary, tuple otherwise. A future shipped-format importer
+   * retains scalar secondary provenance here; storage encoding never decides semantic limits. */
+  readonly keyLimit?: "scalar" | "tuple";
 }
 
 export interface ForeignKeyDef {
@@ -160,7 +167,7 @@ export type CatalogChange =
   | { readonly kind: "createTable"; readonly table: TableInput }
   | { readonly kind: "alterTable"; readonly tableId: number; readonly table: TableInput }
   | { readonly kind: "dropTable"; readonly tableId: number }
-  | { readonly kind: "createIndex"; readonly index: Omit<IndexDef, "id" | "kind"> }
+  | { readonly kind: "createIndex"; readonly index: Omit<IndexDef, "id" | "kind" | "invalid"> }
   | { readonly kind: "dropIndex"; readonly indexId: number }
   | { readonly kind: "createSequence"; readonly sequence: Omit<SequenceDef, "id"> }
   | { readonly kind: "alterSequence"; readonly sequence: SequenceDef }

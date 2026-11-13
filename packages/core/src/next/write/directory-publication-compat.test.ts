@@ -7,7 +7,7 @@ import { seedsFor } from "../../testing/seeds.js";
 import { SimLocks, SimulatedCrash } from "../storage/sim-disk.js";
 import { openDirectory, type DirectoryDb } from "./directory-compat-api.js";
 import { DirectoryFiles, simulatedImage, type DirectoryImage } from "./directory-fixture-files.js";
-import { frozenDirectory, readDirectoryFixture } from "./directory-frozen.js";
+import { directoryPeer, currentDirectoryFixture } from "./directory-current.test-support.js";
 import { decodeGroupPage, decodeGroupIndex } from "../format/manifest-codec.js";
 import { partition } from "./directory-tails-test-support.js";
 import { yieldTask } from "./merge.js";
@@ -23,11 +23,11 @@ const edges = [
 ] as const;
 type Transition = (typeof transitions)[number];
 const range = (n: number) => Array.from({ length: n }, (_, k) => k);
-let old: Awaited<ReturnType<typeof frozenDirectory>>;
+let old: Awaited<ReturnType<typeof directoryPeer>>;
 let images: Record<Transition, DirectoryImage>;
 beforeAll(async () => {
-  old = await frozenDirectory();
-  const empty = await readDirectoryFixture("packed-0");
+  old = await directoryPeer();
+  const empty = await currentDirectoryFixture("packed-0");
   const files = DirectoryFiles.load(empty),
     locks = new SimLocks();
   const db = await openDirectory(files, locks);
@@ -40,8 +40,8 @@ beforeAll(async () => {
   await edited.settle();
   await edited.close();
   images = {
-    "packed normalization": await readDirectoryFixture("packed-4099"),
-    "full carry": await readDirectoryFixture("packed-4095"),
+    "packed normalization": await currentDirectoryFixture("packed-4099"),
+    "full carry": await currentDirectoryFixture("packed-4095"),
     "partial edit": shared,
     "shared carry": files.image(),
   };
@@ -76,7 +76,7 @@ function crashCause(error: unknown): boolean {
   return false;
 }
 for (const seed of seedsFor("next-directory-publication-compat", [28011, 28012, 28013, 28014]))
-  for (const build of ["current", "baseline"] as const)
+  for (const build of ["current", "peer"] as const)
     it(`publication interruption and ordinary retry ${build}, seed ${String(seed)}`, async () => {
       for (const transition of transitions)
         for (const edge of edges) {
@@ -94,9 +94,7 @@ for (const seed of seedsFor("next-directory-publication-compat", [28011, 28012, 
               : transition === "full carry"
                 ? [4096]
                 : transition === "partial edit"
-                  ? build === "current"
-                    ? [1]
-                    : [7]
+                  ? [1]
                   : [8];
           const nextCounts =
             transition === "packed normalization"
@@ -104,16 +102,10 @@ for (const seed of seedsFor("next-directory-publication-compat", [28011, 28012, 
               : transition === "full carry"
                 ? [4096]
                 : transition === "partial edit"
-                  ? build === "current"
-                    ? [4, 2, 1]
-                    : [7]
+                  ? [4, 2, 1]
                   : [8];
           const kept =
-            transition === "packed normalization"
-              ? 1
-              : transition === "partial edit" && build === "current"
-                ? 2
-                : 0;
+            transition === "packed normalization" ? 1 : transition === "partial edit" ? 2 : 0;
           let indexSeen = false;
           if (kept > 0) expect(before[0]?.ref.extent.offset).toBe(before[1]?.ref.extent.offset);
           const begin = db.space.beginWrite.bind(db.space);
@@ -197,11 +189,7 @@ for (const seed of seedsFor("next-directory-publication-compat", [28011, 28012, 
             await retry.space.audit();
             const recovered = await retry.pages();
             const counts = recovered.map((p) => p.groupCount);
-            // An old publication may survive as packed [7], or replay in the current build
-            // may perform the edit as [4,2,1]. Both are supported before another rewrite.
-            if (build === "baseline" && transition === "partial edit")
-              expect(["7", "4,2,1"]).toContain(counts.join(","));
-            else deepStrictEqual(counts, nextCounts);
+            deepStrictEqual(counts, nextCounts);
             deepStrictEqual(recovered.slice(0, kept), before.slice(0, kept));
             await retry.insert([10000]);
             await retry.settle();
@@ -217,14 +205,14 @@ for (const seed of seedsFor("next-directory-publication-compat", [28011, 28012, 
             await retry.close();
           }
           expect(retry.governor.usedBytes).toBe(0);
-          const baseline = await old.open(disk, locks);
+          const peer = await old.open(disk, locks);
           try {
-            deepStrictEqual(await baseline.rows(), [...values(transition), 10000]);
-            await baseline.insert([10001]);
-            await baseline.settle();
-            await baseline.space.audit();
+            deepStrictEqual(await peer.rows(), [...values(transition), 10000]);
+            await peer.insert([10001]);
+            await peer.settle();
+            await peer.space.audit();
           } finally {
-            await baseline.close();
+            await peer.close();
           }
           const reopened = await openDirectory(disk, locks);
           try {
@@ -241,7 +229,7 @@ for (const seed of seedsFor("next-directory-publication-compat", [28011, 28012, 
         }
     }, 300_000);
 for (const transition of transitions)
-  for (const first of ["current", "baseline"] as const)
+  for (const first of ["current", "peer"] as const)
     it(`two competing opens: ${first} owns ${transition}`, async () => {
       reach.beginHistory();
       const files = DirectoryFiles.load(images[transition]),
@@ -281,7 +269,7 @@ for (const transition of transitions)
       reach.reach(transition);
     }, 60_000);
 for (const transition of transitions)
-  for (const build of ["current", "baseline"] as const)
+  for (const build of ["current", "peer"] as const)
     it(`${build} refuses damaged page/index after ${transition}`, async () => {
       reach.beginHistory();
       const files = DirectoryFiles.load(images[transition]),

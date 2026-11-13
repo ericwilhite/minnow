@@ -1806,12 +1806,18 @@ charge is refunded. Temporary pressure aborts provisional work and releases inpu
 and output allocations before the cancellable metadata retry waits. Charges remain until
 publication takes ownership or the output is abandoned.
 
-The unexported rebuild core's `RunEncoder` accepts encoded index keys of at most **2 KiB**,
-including component headers and payloads. Longer encoded keys, including 4 KiB keys, raise
-`IndexKeyTooLongError` (code `MINNOW_INDEX_KEY_TOO_LONG`, a `RangeError` subclass) when encoded, in both
-ordinary and bulk paths. The limit is unchanged by the accounting fixes; the generated
-refusal cases also check cleanup. This is the rebuild encoder's limit, not a new limit on
-the shipped SQL engine.
+The unpublished rebuild's inline run encoding still refuses encoded keys over **2 KiB**
+with `IndexKeyTooLongError` (`MINNOW_INDEX_KEY_TOO_LONG`, a `RangeError` subclass).
+The write path now selects overflow encoding for longer admitted keys. Its semantic limit
+comes from the catalog path: a single TEXT primary key permits **16,384 UTF-16 units**
+(up to 49,155 encoded bytes), while secondary tuple terms share a **65,536-character**
+budget. A text component spends five term characters per UTF-16 unit plus five terminator
+characters, so a one-text secondary supports 13,106 units. Composite primary keys also
+obey the shipped hidden scalar locator's 16,384-character whole-term ceiling.
+A unique path refuses excess values with `IndexKeyLimitError` (the same stable code).
+A nonunique path keeps its catalog identity, becomes invalid atomically, and queries scan.
+Imported scalar secondary provenance has a separate catalog policy. These limits apply to
+mutation keys; they do not impose a blanket length cap on query parameters.
 
 `key-order-proof.test.ts` checks retained key order and ascending batch admission against an
 independent byte-order model. A normalized prefix proves order only when it differs; ties use
@@ -2039,16 +2045,22 @@ pages. This bounds both encoding work and the page index. Each history audits ex
 reopens, verifies every expected value and returns every governor charge. The original full-page
 boundary workload retains its groups, operations, assertions and deadline.
 
-The directory's byte grammar and versions are unchanged, but physical packing changes the
-page and index bytes. Both packing policies support successful continuation in both directions.
-Committed native-file fixtures and a self-contained baseline reader/writer bundle are frozen at
-`4133d25a`; tests never regenerate them. The ordinary-open campaign covers every tail total from
-0 through 4,095 in 32 independent ranges of 128 states. Every state reads all values in both builds, makes
-durable writes, and reopens. It also covers the full-page carry, packed-tail normalization,
-and an edited page whose extent still holds unchanged partial pages.
+The directory page grammar stays unchanged. The rebuild's root format is now version 3;
+no older `next/` writer is supported because no published package includes the rebuild.
+Archived development roots and the `4133d25a` writer are kept only for explicit refusal tests.
+Packing tests seed fresh version-3 roots over the unchanged packed group/page payloads;
+this test bootstrap discards the archived root slots and runs no migration. A separately
+bundled current writer supplies an independent module graph for continuing-writer and
+competing-opener checks. This does not prove older-writer compatibility.
+
+The ordinary-open campaign still covers every tail total from 0 through 4,095 in 32 independent
+ranges of 128 states. Every state reads all values in both current module graphs, makes durable
+writes, and reopens. It also covers the full-page carry, packed-tail normalization, and an edited
+page whose extent still holds unchanged partial pages. Seeds, states and physical fault edges
+are retained. Both current writers must preserve the same unchanged directory prefix.
 
 The exhaustive ranges use the ordinary startup policy, without repeating test-only physical
-audits at every open. Each range reopens its final baseline write and audits its boundary carry.
+audits at every open. Each range reopens its final peer write and audits its boundary carry.
 Transition histories explicitly audit current and previous ownership.
 They interrupt both writers after directory page/index writes and each native publication step: data flush,
 root write, root truncate and root flush. Strictly acknowledged values must survive recovery;
@@ -2056,7 +2068,7 @@ both writers continue writing and reopen. Each transition also refuses damaged p
 bytes and queues two competing openers in both build orders. Declared reach covers all tail
 states, transition types and publication edges. The physical crash model uses honest flushes
 with seeded lost/torn pending writes; this is Node fixture evidence, not a real-browser crash
-campaign. To explicitly regenerate fixtures from the pinned writer, run
+campaign. To reproduce the archived development payload fixtures from the pinned writer, run
 `npx vite-node scripts/write-next-directory-fixtures.mts`; scratch uses `os.tmpdir()`.
 
 Ordered-root startup regressions require a streaming union without the unordered free-map sort,
@@ -2191,3 +2203,108 @@ input, and both cache-hit and asynchronous reads through the production write pa
 require typed refusal, unchanged inputs and returned resources. Registry completeness also
 scans production persistence calls and durable reference fields independently of the registry
 and its decoder adapters, so omitting a format from both lists cannot hide its writer.
+
+### Rebuild long-key codec stages
+
+The unpublished rebuild manifest is version 3. Every stored run has an explicit inline or
+overflow encoding discriminator. Unsupported versions raise `UnsupportedEncodingError`;
+old development roots are refused without rewriting them. No published package contains
+`next/`, so this is not an upgrade of a supported stored format. The 1.0 rebuild starts a new chain: it refuses 0.x data without mutation. No 0.x converter
+is implied; the existing 0.x compatibility suites remain specific to the 0.x engine.
+
+`format/run-key.test.ts` generates canonical inline and overflow descriptors, including the
+49,155-byte encoded single-text primary-key maximum. It checks bounded prefixes, complete
+chunk coverage, checksum fields, overlap, extent bounds, truncation and unknown tags.
+`encoding-version.test.ts` checks typed refusal and returned parse charges for unsupported
+root versions. The writer, readers, Bloom filters, summaries and catalog-limit admission now use this
+encoding together. Short-key block bytes remain unchanged.
+
+`write/overflow-writer.test.ts` exercises an opt-in overflow writer. It
+keeps data blocks within 4 KiB, puts payload chunks and their checksummed directory in the
+same extent, and keeps summary storage charged through consumption. Generated cases check
+precharge before native allocation, delayed acknowledgement, detached buffers, cancellation
+before admission, injected allocation/append failures and retry, bulk input, wide row IDs,
+and two interleaved encoders. Short-key runs retain inline encoding; admitted longer keys
+select overflow encoding and publish through the current root.
+
+`write/overflow-readers.test.ts` checks point reads, both range directions, exact fence seeks
+and mixed-run merges against complete key bytes. Generated shared prefixes must not collapse
+distinct keys, and an inline key that prefixes a longer key is still an exact point lookup.
+Keys may span payload chunks; hot keys span blocks. Readers prepay a reusable full-key head
+and parsing workspace, release a block lease before resolving its key, and pass tests that
+poison every returned lease. The campaign includes fan-in 32, output splits, interleaved
+readers, read failures, close/cancel during I/O, retry and typed structural refusals. These
+codec tests do not certify the later catalog-limit policy or the shipped-format cutover.
+
+`write/overflow-summary.test.ts` checks complete-key Bloom membership across real filter
+partitions, conservative prefix summaries, and ordered pending heads in both range directions.
+`write/overflow-root.test.ts` checks ordinary point/range reads, old snapshots, continued writes
+and reopen with an opt-in overflow writer. `write/overflow-integrity.test.ts` refuses
+contradictory endpoints, impossible capacities, cross-extent descriptors, damaged payloads and
+checksummed unknown directory versions. `write/overflow-publication.test.ts` retains hundreds
+of funded output summaries under 32/64 MiB caps, faults every native root-publication step,
+retries after recovery, and opens an overflow root from an independent current module graph.
+These are new-encoding tests, not evidence for the separate shipped-format cutover.
+
+`testing/long-key-limits.test.ts` compares flat, constant and dictionary-vector admission
+with the shipped scalar and tuple term helpers. It checks canonical domain component costs,
+unique refusal, nonunique invalidation, statement/savepoint rollback, backfill and WAL replay.
+Ordinary storage APIs exercise writes and point reads. Real owner SQL scans and a prepared
+query verify that invalidation changes the catalog version and replans away from incomplete
+indexes. This base's executor still refuses SQL modify and bounded index operators; these
+tests do not claim to implement them. SQL's zero-byte refusal remains separate from raw
+physical-key tests.
+
+`write/long-key-actions.test.ts` checks the maximum TEXT width and embedded NULs, including
+an old range plan admitted after a larger invisible key was published. It admits full heads
+without growing the planned grant. Invalid FK-support indexes use an exact scan of only the
+reference columns; rekey, CASCADE, SET NULL and RESTRICT remain correct after reopen.
+Faults at allocation boundaries check cleanup, including a partially constructed key batch.
+Wide flushes drain by bytes and reserve encoder credit from catalog bounds before starting.
+The generated cap cases include 32 and 64 MiB. Input admission prepays old/new column and
+key-arena overlap, then recomputes that need after relief. A wide memtable can freeze before
+its row limit; pending rows stage through the existing publication protocol. Commit, rollback
+and rollback to a savepoint all retain the correct prefix after such a freeze. A retained
+allocation from another execution forces this relief before the memtable is full.
+
+Known-size memtable flushes give the page writer an estimate-only row-count hint. This avoids
+reserving space for 65,536 wide rows when the group contains only a few. The hint changes no
+codec decision or page boundary. `page/known-rows.test.ts` compares native page and tail bytes
+with the ordinary estimator; the integration campaign refuses exaggerated reservations
+before a memory store could allocate a multi-gigabyte buffer. The separate shipped-format
+cutover and quiet-host performance acceptance remain outside these correctness campaigns.
+
+Catalog-dependent run capacities are checked after WAL replay has restored the catalog. A table's
+durable checkpoint can lead the global catalog checkpoint; physical runs for a dropped index can
+also remain until retirement. Structural extent and descriptor checks still run independently.
+`write/catalog-run-limits.test.ts` rewrites a native checksummed root to give an otherwise valid
+run a capacity beyond its recovered catalog path, checks typed refusal and cleanup, and reopens
+intact controls. Refused opens release state pins and native owners before grants, without
+publishing; repairing the root then permits an ordinary retry. The exhaustive crash sweep and
+catalog/drop campaign enforce the replay order.
+
+`write/wide-key-batches.test.ts` checks complete borrowed batches whose encoded keys exceed
+the 1 MiB key work target. Insert admission splits wide key-bearing input by bytes; index puts, FK checks,
+updates, deletes, conflict probes and replay consume every completed key batch. A publication
+barrier keeps the new index out of the root until close, so ordinary reopen must replay the
+entire backfill. Checks cover both the live build and the replayed tail.
+
+The one-index ingress campaign keeps its 160-row, 32/64 MiB histories, now including borrowed
+batches of 80 or 160 maximum-width keys, rollback and savepoints. The two-index lifecycle campaign
+uses 32 MiB for 32 rows and 64/128 MiB for 48/80 rows. Larger pre-flush snapshots retain old
+key deltas, and their complete peak plus private commit credit can exceed 32 MiB; the tests
+do not promise that an execution whose whole minimum exceeds the cap can run there. No
+production budget or stored encoding changes for this batching fix. Existing statement row,
+conflict and undo scratch copies remain outside the codec's native-allocation proof.
+
+Byte slicing is restricted to key-bearing input. A large unindexed payload keeps its ordinary
+admission and publication boundaries; the bounded memory-read campaign checks its original
+logical prefixes without changing its fixture or expectations.
+
+The long-key registry integration requires reader version 2 in the outer root-slot header
+and manifest version 3. It registers inline/overflow runs, pointer and chunk descriptors,
+the checksummed key directory, raw payload references and the extended-block bit. The
+independent persistence inventory includes these references. `durable-long-keys.test.ts`
+checks WAL-only nonunique invalidation at 13,107 UTF-16 units and an independently bundled
+reader with capability 1: OPFS and IndexedDB must refuse before native writes. The strict
+catalog-operation registry admits `invalidateIndex` while still rejecting unknown operations.

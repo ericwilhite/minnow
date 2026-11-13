@@ -1179,8 +1179,8 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
 - Every reference carries the checksum of what it names (a chunk's pages carry theirs).
 - Space is reusable only when neither the current durable root, nor the previous one (the other
   root slot), nor any pinned root reaches it (two generations), and startup reads both roots'
-  extent lists (ruling R25: `ManifestRoot.extentList`, format 2; format 1 roots, written only by
-  development builds, are refused).
+  extent lists (ruling R25: `ManifestRoot.extentList`). The current manifest is format 3,
+  with explicit run encoding; earlier unpublished development roots are refused.
 - Startup order: acquire the fence → open the store session → open the extent space (read the
   current and previous roots' extent lists) → open the write path (a single log scan and replay, `publishedRows`
   staging included) → spill sweep → ready.
@@ -3573,3 +3573,9 @@ Catalog capture/sequence scope and native load/publication composition are subse
 Stream writers validate the16-byte identity and safe-integer LSN before charging or cloning them.
 A failing source iterator's `return()` cannot replace the primary typed legacy/format/cancel refusal;
 reader-owned buffers are released even if upstream cleanup fails synchronously or asynchronously.
+
+Long-key reader stage: encoding 2 uses one admitted complete-key head per active input.
+Point reads and range fence seeks compare complete bytes on prefix ties. Mixed merges use
+owned heads for every input, so a legacy input cannot pin a block lease across overflow I/O.
+Merge minima include the actual head capacities; the owner's close signal cancels payload reads.
+The production writer and root-publication guard remain unchanged until summary/catalog integration.

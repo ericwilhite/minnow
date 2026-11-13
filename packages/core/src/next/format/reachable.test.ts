@@ -181,7 +181,7 @@ function fixture(): Fixture {
   want(catalog, "catalog");
   // Only the fields the walk reads are meaningful here.
   const root = {
-    formatVersion: 2,
+    formatVersion: 3,
     sequence: 3,
     epoch: 1,
     log: { salt: 1, firstLsn: 1, rootSequence: 1 },

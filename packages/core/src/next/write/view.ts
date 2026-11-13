@@ -7,6 +7,7 @@
 import { decodeDeletionBitmap } from "../format/deletion-bitmap.js";
 import type { TaskWork } from "../task.js";
 import { ParseBudgetError, decodeGroupRoot } from "../format/manifest-codec.js";
+import { compareRunBound, runOutsideKeys } from "./run-bounds.js";
 import { hashKey } from "./key-hashes.js";
 import { MemoryReads } from "./memory-read.js";
 import { planIndexRange } from "./range-plan.js";
@@ -14,6 +15,7 @@ import { StreamingRangeCursor } from "./range-cursor.js";
 import type { Held } from "../format/reachable.js";
 import type { CatalogView, ColumnDef, IndexDef, TableDef } from "../access/catalog.js";
 import {
+  IndexUnavailableError,
   inKeyRange,
   prefixRange,
   type IndexCursor,
@@ -833,6 +835,7 @@ export class SnapshotImpl implements Snapshot {
       const def = table.def.indexes.find((index) => index.id === indexId);
       if (def === undefined)
         throw new RangeError(`Table ${String(tableId)} has no index ${String(indexId)}`);
+      if (def.invalid === true) throw new IndexUnavailableError(def.id);
       reader = new ViewIndex(def, table);
       this.#indexes.set(key, reader);
     }
@@ -907,14 +910,15 @@ export function otherIndexLayersEndBefore(
   own: KeyDelta,
 ): boolean {
   const before = (max: Uint8Array) => compareBytes(max, 0, max.length, key, 0, key.length) < 0;
-  for (const run of table.runs.get(indexId) ?? NO_RUNS) if (!before(run.maxKey)) return false;
+  for (const run of table.runs.get(indexId) ?? NO_RUNS)
+    if (compareRunBound(run, "max", key) >= 0) return false;
   for (const memtable of table.memtables) {
     for (const run of memtable.staged?.runs.get(indexId) ?? NO_RUNS)
-      if (!before(run.maxKey)) return false;
+      if (compareRunBound(run, "max", key) >= 0) return false;
     const published = memtable.published;
     if (published !== null && memtable.deltasDropped) {
       const run = published.runs.get(indexId);
-      if (run !== undefined && !before(run.maxKey)) return false;
+      if (run !== undefined && compareRunBound(run, "max", key) >= 0) return false;
       continue;
     }
     const delta = memtable.deltas.get(indexId);
@@ -951,6 +955,7 @@ export class ViewIndex implements IndexReader {
 
   /** `resolve` of the key `bytes[start … end)` (a view is made only if a run is searched). */
   resolveRange(bytes: Uint8Array, start: number, end: number, out: number[]): MaybePromise<void> {
+    if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
     const done = this.#begin(bytes, start, end);
     return done === undefined ? this.#deliver(out) : done.then(() => this.#deliver(out));
   }
@@ -963,6 +968,7 @@ export class ViewIndex implements IndexReader {
     hash?: number,
     bloomHash?: number,
   ): MaybePromise<number> {
+    if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
     const done = this.#begin(bytes, start, end, hash, bloomHash);
     return done === undefined ? this.#hitCount : done.then(() => this.#hitCount);
   }
@@ -1014,9 +1020,7 @@ export class ViewIndex implements IndexReader {
     this.#skip = null;
     if (low === null || high === null) return;
     let skip: Set<RunRef> | null = null;
-    const outside = (run: RunRef) =>
-      compareBytes(run.maxKey, 0, run.maxKey.length, low, 0, low.length) < 0 ||
-      compareBytes(run.minKey, 0, run.minKey.length, high, 0, high.length) > 0;
+    const outside = (run: RunRef) => runOutsideKeys(run, low, high);
     for (const run of this.table.tableView.runs.get(this.def.id) ?? NO_RUNS)
       if (outside(run)) (skip ??= new Set()).add(run);
     for (const memtable of this.table.tableView.memtables) {
@@ -1040,14 +1044,14 @@ export class ViewIndex implements IndexReader {
       compareBytes(max, 0, max.length, low, 0, low.length) < 0 ||
       compareBytes(min, 0, min.length, high, 0, high.length) > 0;
     for (const run of this.table.tableView.runs.get(this.def.id) ?? NO_RUNS)
-      if (!outside(run.minKey, run.maxKey)) return true;
+      if (!runOutsideKeys(run, low, high)) return true;
     for (const memtable of this.table.tableView.memtables) {
       for (const run of memtable.staged?.runs.get(this.def.id) ?? NO_RUNS)
-        if (!outside(run.minKey, run.maxKey)) return true;
+        if (!runOutsideKeys(run, low, high)) return true;
       const published = memtable.published;
       if (published !== null && memtable.deltasDropped) {
         const run = published.runs.get(this.def.id);
-        if (run !== undefined && !outside(run.minKey, run.maxKey)) return true;
+        if (run !== undefined && !runOutsideKeys(run, low, high)) return true;
         continue;
       }
       const delta = memtable.deltas.get(this.def.id);
@@ -1271,17 +1275,20 @@ export class ViewIndex implements IndexReader {
 
   planRange(range: KeyRange, direction: "asc" | "desc"): IndexRangePlan {
     this.table.snapshot.check();
+    if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
     if (this.def.kind !== "ordered") throw new TypeError("An equality index serves lookups only");
     return planIndexRange(this, range, direction);
   }
 
   range(range: KeyRange, direction: "asc" | "desc"): IndexCursor {
+    if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
     if (this.def.kind !== "ordered") throw new TypeError("An equality index serves lookups only");
     return new StreamingRangeCursor(this, range, direction);
   }
 
   /** Every live (key, rowId) in `range`, resolved, sorted by key then row id. */
   async collect(range: KeyRange): Promise<Array<{ key: Uint8Array; rowId: number }>> {
+    if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
     const snapshot = this.table.snapshot;
     const shared = snapshot.shared;
     const bound = snapshot.bound;

@@ -47,7 +47,9 @@ import type { ExtentBuilder, ExtentWriter, ReadLease } from "../storage/extents.
 import { compareBytes } from "../vector/varlen.js";
 import { taskClock, yieldTask } from "../exec/pipeline.js";
 import { charged, need } from "./bytes.js";
-import { RUN_BUFFER_OVERHEAD, RunEncoder, type RunReader } from "./runs.js";
+import { RunRangeInput, rangeRunBytes } from "./range-input.js";
+import { runKeyBytes } from "./overflow-keys.js";
+import { RUN_BUFFER_OVERHEAD, RunEncoder, runRef, type RunReader } from "./runs.js";
 
 export { yieldTask, YIELD_INTERVAL_MS } from "../exec/pipeline.js";
 
@@ -63,6 +65,18 @@ const BATCH_BLOCKS = 16;
 export const MERGE_FIXED_BYTES = 4 * 1024 * 1024;
 /** And per input: one batch of blocks (≤ 16 × ~4 KiB). */
 export const MERGE_INPUT_BYTES = BATCH_BLOCKS * 4200;
+export function mergeInputBytes(ref: RunRef): number {
+  return Math.max(MERGE_INPUT_BYTES, rangeRunBytes(ref, 1));
+}
+export function mergeWorkingBytes(refs: readonly RunRef[]): number {
+  let bytes = MERGE_FIXED_BYTES,
+    longest = 2048;
+  for (const ref of refs) {
+    bytes += mergeInputBytes(ref);
+    longest = Math.max(longest, runKeyBytes(ref));
+  }
+  return bytes + (longest > 2048 ? 8 * longest : 0);
+}
 
 export interface MergePolicy {
   readonly fanIn: number;
@@ -123,6 +137,81 @@ export function levelZero(runs: readonly RunRef[]): number {
 /** A run's extent: its entries, fences and Bloom directory share it (runs.ts "Stored form"). */
 export function runExtent(run: RunRef): ExtentRef {
   return run.entries.extent;
+}
+
+interface MergeHead {
+  readonly order: number;
+  readonly bytes: Uint8Array;
+  readonly keyStart: number;
+  readonly keyEnd: number;
+  readonly rowId: number;
+  readonly tombstone: boolean;
+  load(): Promise<boolean>;
+  advance(): boolean;
+  release(): void;
+}
+/** No borrowed leases survive a head load, including for inline inputs of a mixed merge. */
+class OwnedCursor implements MergeHead {
+  readonly #input: RunRangeInput;
+  readonly #bytes: number;
+  #closed = false;
+  constructor(
+    reader: RunReader,
+    readonly order: number,
+    space: SpaceReader,
+    readonly budget: Grant,
+    signal: AbortSignal,
+  ) {
+    this.#bytes = rangeRunBytes(reader.ref, 1);
+    charged(budget, this.#bytes);
+    try {
+      this.#input = new RunRangeInput(
+        space,
+        budget,
+        reader.ref,
+        { lower: null, upper: null },
+        1,
+        Infinity,
+        signal,
+      );
+    } catch (error) {
+      budget.free(this.#bytes);
+      throw error;
+    }
+  }
+  #opened = false;
+  async load(): Promise<boolean> {
+    if (!this.#opened) {
+      await this.#input.open();
+      this.#input.pending = false;
+      this.#opened = true;
+    }
+    return await this.#input.advance();
+  }
+  advance(): boolean {
+    return false;
+  }
+  get bytes(): Uint8Array {
+    return this.#input.bytes();
+  }
+  get keyStart(): number {
+    return this.#input.keyStart();
+  }
+  get keyEnd(): number {
+    return this.#input.keyEnd();
+  }
+  get rowId(): number {
+    return this.#input.rowId;
+  }
+  get tombstone(): boolean {
+    return this.#input.tombstone;
+  }
+  release(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#input.close();
+    this.budget.free(this.#bytes);
+  }
 }
 
 /** One input: its blocks read a batch at a time; its current entry. */
@@ -220,7 +309,7 @@ class Cursor {
 }
 
 /** Orders cursors by (key, row id, input order): the merge's heap. */
-function less(a: Cursor, b: Cursor): boolean {
+function less(a: MergeHead, b: MergeHead): boolean {
   const order = compareBytes(a.bytes, a.keyStart, a.keyEnd, b.bytes, b.keyStart, b.keyEnd);
   if (order !== 0) return order < 0;
   if (a.rowId !== b.rowId) return a.rowId < b.rowId;
@@ -228,9 +317,9 @@ function less(a: Cursor, b: Cursor): boolean {
 }
 
 class Heap {
-  readonly items: Cursor[] = [];
+  readonly items: MergeHead[] = [];
 
-  push(cursor: Cursor): void {
+  push(cursor: MergeHead): void {
     const items = this.items;
     items.push(cursor);
     let k = items.length - 1;
@@ -290,6 +379,8 @@ export interface MergeInput {
   readonly policy: MergePolicy;
   /** True when the merge must stop (checked at every slice boundary). */
   readonly stopped: () => boolean;
+  /** Cancels outstanding overflow payload/directory I/O when the owner closes. */
+  readonly signal?: AbortSignal;
 }
 
 export interface MergeOutput {
@@ -311,7 +402,9 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
   // The estimate: the inputs' extents (the output is no larger, short of block repacking).
   let estimate = 0;
   for (const reader of input.readers) estimate += runExtent(reader.ref).length;
-  const cursors = input.readers.map((reader, k) => new Cursor(reader, k, space, grant));
+  const overflow = input.readers.some((reader) => (reader.ref.encoding ?? 1) === 2);
+  const signal = input.signal ?? new AbortController().signal;
+  const cursors: MergeHead[] = [];
   const heap = new Heap();
   const runs: RunRef[] = [];
   let outputCharge = 0;
@@ -338,6 +431,7 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
     input.bottom,
     false,
     grant,
+    overflow ? 2 : 1,
   );
   const drain = async (): Promise<void> => {
     if (queue.length === 0) return;
@@ -369,21 +463,18 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
         summary.minKey.buffer.byteLength +
         summary.maxKey.buffer.byteLength +
         2 * RUN_BUFFER_OVERHEAD +
-        6 * OBJECT_OVERHEAD_BYTES;
+        6 * OBJECT_OVERHEAD_BYTES +
+        (summary.keyStorage === undefined
+          ? 0
+          : summary.keyStorage.minimum.buffer.byteLength +
+            summary.keyStorage.maximum.buffer.byteLength +
+            2 * RUN_BUFFER_OVERHEAD +
+            OBJECT_OVERHEAD_BYTES);
       charged(outputBudget, bytes);
       outputCharge += bytes;
       const blobs = sealed.blobs;
-      const count = blobs.length;
       entriesOut += summary.entryCount;
-      const piece: RunRef = {
-        level: input.level,
-        entryCount: summary.entryCount,
-        entries: need(blobs[count - 3]),
-        fences: need(blobs[count - 2]),
-        bloom: need(blobs[count - 1]),
-        minKey: summary.minKey,
-        maxKey: summary.maxKey,
-      };
+      const piece = runRef(summary, blobs, input.level);
       // Every piece after the first continues this output's sorted run.
       runs.push(runs.length === 0 ? piece : { ...piece, continues: true });
     } finally {
@@ -393,7 +484,15 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
     }
   };
   try {
-    for (const cursor of cursors) if (await cursor.load()) heap.push(cursor);
+    for (let k = 0; k < input.readers.length; k++) {
+      signal.throwIfAborted();
+      const reader = need(input.readers[k]);
+      const cursor = overflow
+        ? new OwnedCursor(reader, k, space, grant, signal)
+        : new Cursor(reader, k, space, grant);
+      cursors.push(cursor);
+      if (await cursor.load()) heap.push(cursor);
+    }
     let sinceCheck = 0;
     while (heap.items.length > 0) {
       const top = need(heap.items[0]);
@@ -410,6 +509,7 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
           input.bottom,
           false,
           grant,
+          overflow ? 2 : 1,
         );
       }
       encoder.add(top.bytes, top.keyStart, top.keyEnd, top.rowId, top.tombstone);

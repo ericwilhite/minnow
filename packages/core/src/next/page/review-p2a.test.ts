@@ -42,7 +42,7 @@ const EMPTY: BlobRef = { extent: { offset: 0, length: 0 }, offset: 0, length: 0,
 const MAGIC = { root: 0x31524d4d, page: 0x3150474d, group: 0x3152474d };
 const ref: BlobRef = { extent: { offset: 0, length: 4096 }, offset: 0, length: 10, checksum: 0 };
 const root: ManifestRoot = {
-  formatVersion: 2,
+  formatVersion: 3,
   sequence: 1,
   epoch: 1,
   log: { salt: 1, firstLsn: 1, rootSequence: 1 },
@@ -308,7 +308,7 @@ describe("review B2-p2a #3, #4: strings and ledger keys decode as written", () =
       out.uint(1); // extent table: the catalog's extent
       out.uint(0);
       out.uint(4096);
-      for (const n of [2, 1, 1]) out.uint(n); // format version, sequence, epoch
+      for (const n of [3, 1, 1]) out.uint(n); // format version, sequence, epoch
       out.u32(1); // log salt
       for (const n of [1, 1, 1, 1, 0, 0, 10]) out.uint(n); // log, lsn, catalog version, catalog
       out.u32(0);

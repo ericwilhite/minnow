@@ -1,4 +1,4 @@
-/** Frozen writer bytes are loaded through ordinary backends, opened, written and reopened. */
+/** Current root publication/reopen plus explicit refusal of unpublished development roots. */
 import { describe, expect, it } from "vitest";
 import fixture from "./root-r25.fixture.json";
 import development from "./root-before-r25.fixture.json";
@@ -8,6 +8,9 @@ import {
   ManifestCorruptionError,
 } from "./manifest-codec.js";
 import { listedRootExtents, reachableExtents } from "./reachable.js";
+import { MANIFEST_FORMAT_VERSION, type ManifestRoot } from "./manifest.js";
+import { UnsupportedEncodingError } from "./encoding.js";
+import { xxHash32 } from "../hash/xxhash32.js";
 import { ExtentListKeeper } from "../storage/extent-list.js";
 import { createOpfsBackend } from "../storage/opfs.js";
 import { createIndexedDbBackend } from "../storage/indexeddb.js";
@@ -46,7 +49,7 @@ function backend(kind: "opfs" | "indexeddb"): StorageBackend {
         },
       });
 }
-async function seed(store: StorageBackend, corrupt = false) {
+async function seed(store: StorageBackend, corrupt = false, old = false) {
   const lease = await store.acquire();
   try {
     const session = await store.open(lease);
@@ -55,7 +58,29 @@ async function seed(store: StorageBackend, corrupt = false) {
       if (corrupt && index === 1) data[0] = (data[0] ?? 0) ^ 1;
       await session.writeData(payload.offset, data);
     }
-    await session.publish(bytes(fixture.rootHex));
+    const catalogBytes = bytes(required(fixture.payloads[0]).hex),
+      listBytes = bytes(required(fixture.payloads[1]).hex);
+    const ref = (offset: number, value: Uint8Array) => ({
+      extent: { offset, length: value.length },
+      offset: 0,
+      length: value.length,
+      checksum: xxHash32(value),
+    });
+    const root: ManifestRoot = {
+      formatVersion: MANIFEST_FORMAT_VERSION,
+      sequence: 1,
+      epoch: lease.epoch,
+      log: { salt: 1, firstLsn: 1, rootSequence: 1 },
+      globalLsn: 0,
+      catalogVersion: 1,
+      catalog: ref(0, catalogBytes),
+      nextTableId: 1,
+      sequences: [],
+      tables: [],
+      clients: [],
+      extentList: [{ blob: ref(4096, listBytes), first: 0, count: 1 }],
+    };
+    await session.publish(old ? bytes(fixture.rootHex) : encodeManifestRoot(root));
     await session.close();
   } finally {
     await lease.release();
@@ -63,8 +88,8 @@ async function seed(store: StorageBackend, corrupt = false) {
 }
 
 for (const kind of ["opfs", "indexeddb"] as const)
-  describe(`frozen manifest 2 on ${kind}`, () => {
-    it("preserves its catalog, continues publication, and reopens both roots through their lists", async () => {
+  describe(`current manifest on ${kind}`, () => {
+    it("preserves its catalog, continues publication, and reopens both current roots through their lists", async () => {
       const store = backend(kind);
       await seed(store);
       const lease = await store.acquire();
@@ -121,6 +146,23 @@ for (const kind of ["opfs", "indexeddb"] as const)
         await session.close();
       } finally {
         await next.release();
+      }
+    });
+    it("refuses the unpublished v2 root on repeated open without rewriting it", async () => {
+      const store = backend(kind);
+      await seed(store, false, true);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const lease = await store.acquire();
+        try {
+          const session = await store.open(lease);
+          await expect(openExtentSpace(session, options())).rejects.toBeInstanceOf(
+            UnsupportedEncodingError,
+          );
+          expect(await session.readRoot()).toEqual(bytes(fixture.rootHex));
+          await session.close();
+        } finally {
+          await lease.release();
+        }
       }
     });
     it("refuses a damaged frozen list page without repairing it", async () => {

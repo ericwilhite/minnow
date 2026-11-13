@@ -3,9 +3,11 @@ import type { MaybePromise } from "../access/key-index.js";
 import type { RunRef } from "../format/manifest.js";
 import { parseCharge } from "../format/manifest-codec.js";
 import { taskClock, yieldTask } from "../exec/pipeline.js";
+import { indexMaximumKeyBytes } from "./index-limits.js";
 import type { Catalog } from "./catalog.js";
 import { GroupDirectory } from "./groups.js";
-import { MERGE_FIXED_BYTES, MERGE_INPUT_BYTES } from "./merge.js";
+import { mergeInputBytes, MERGE_FIXED_BYTES, MERGE_INPUT_BYTES } from "./merge.js";
+import { runKeyBytes } from "./overflow-keys.js";
 import { RUN_ENCODER_MINIMUM, RunReader } from "./runs.js";
 import type { WriteState } from "./state.js";
 
@@ -28,7 +30,9 @@ export function writeStepMinimum(
     let largest = raw,
       runs = 0,
       directory = 0,
-      runMetadata = 0;
+      runMetadata = 0,
+      mergeBytes = MERGE_INPUT_BYTES,
+      keyBytes = 2048;
     for (const def of catalog.tables) {
       largest = Math.max(largest, 512 + def.columns.length * 512);
       yield;
@@ -47,12 +51,17 @@ export function writeStepMinimum(
         largest = Math.max(largest, view.groups.root(group).length);
         yield;
       }
-      for (const index of catalog.table(view.tableId)?.indexes ?? []) {
+      const definition = catalog.table(view.tableId);
+      for (const index of definition?.indexes ?? []) {
+        if (definition !== undefined)
+          keyBytes = Math.max(keyBytes, indexMaximumKeyBytes(index, definition));
         const refs = view.runs.get(index.id) ?? [];
         let missing = 0,
           pending = 0;
         for (const ref of refs) {
           if (!known.has(ref)) missing += RunReader.residentBound(ref);
+          mergeBytes = Math.max(mergeBytes, mergeInputBytes(ref));
+          keyBytes = Math.max(keyBytes, runKeyBytes(ref));
           yield;
         }
         for (const memtable of view.memtables) {
@@ -60,6 +69,8 @@ export function writeStepMinimum(
           for (const ref of memtable.staged?.runs.get(index.id) ?? []) {
             pending++;
             if (!known.has(ref)) missing += RunReader.residentBound(ref);
+            mergeBytes = Math.max(mergeBytes, mergeInputBytes(ref));
+            keyBytes = Math.max(keyBytes, runKeyBytes(ref));
             yield;
           }
           yield;
@@ -73,12 +84,17 @@ export function writeStepMinimum(
     return {
       metadata:
         RUN_ENCODER_MINIMUM +
+        (keyBytes > 2048 ? 8 * keyBytes : 0) +
         4096 +
         directory +
         runMetadata +
         2 * parseCharge(largest) +
         5 * (raw + 512),
-      merge: merging ? MERGE_FIXED_BYTES + Math.max(runs, fanIn) * MERGE_INPUT_BYTES : 0,
+      merge: merging
+        ? MERGE_FIXED_BYTES +
+          Math.max(runs, fanIn) * mergeBytes +
+          (keyBytes > 2048 ? 8 * keyBytes : 0)
+        : 0,
     };
   }
   const work = calculate();

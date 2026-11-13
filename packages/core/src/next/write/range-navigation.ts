@@ -10,9 +10,11 @@ import type { BlobRef } from "../format/manifest.js";
 import { blobKey } from "../format/blob-cache.js";
 import { abortable, taskClock, yieldTask } from "../exec/pipeline.js";
 import { StoreCorruptionError } from "../storage/contract.js";
+import { ByteReader as KeyReader } from "../format/bytes.js";
+import { readKeyPointer } from "../format/key-pointer.js";
 import { ByteReader, need } from "./bytes.js";
 
-export type DirectoryKind = "entries" | "fences";
+export type DirectoryKind = "entries" | "fences" | "overflow-fences";
 const EMPTY = new Uint32Array(0);
 /** Cache-owned descriptor; no cursor stores it or an array/view derived from it. */
 export class DirectoryNavigation {
@@ -63,6 +65,10 @@ export function skipDirectoryRecord(r: ByteReader, kind: DirectoryKind): void {
     r.varuint();
     r.varuint();
     r.u32();
+  } else if (kind === "overflow-fences") {
+    const key = new KeyReader(r.bytes.subarray(r.offset));
+    readKeyPointer(key, Number.MAX_SAFE_INTEGER);
+    r.offset += key.at;
   } else {
     const bytes = r.varuint();
     if (bytes > 2048 || r.offset + bytes > r.bytes.length)

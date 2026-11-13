@@ -9,7 +9,7 @@
 
 /** Manifest metadata (root, group directory, group root) that cannot be what was written. */
 export class ManifestCorruptionError extends Error {
-  readonly code = "MINNOW_MANIFEST_CORRUPT";
+  readonly code: string = "MINNOW_MANIFEST_CORRUPT";
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "ManifestCorruptionError";

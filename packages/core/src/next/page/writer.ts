@@ -101,6 +101,9 @@ export interface GroupWriterOptions {
   readonly writer: ExtentWriter;
   /** Rows per group (default 65,536, the most a locator position addresses). */
   readonly maxRows?: number;
+  /** Known final row count, only for physical extent capacity estimates. Does not change
+   * page boundaries, codec selection or dictionary policy. Default: maxRows. */
+  readonly estimatedRows?: number;
   readonly pageBytes?: number;
   readonly rawPageBytes?: number;
   readonly inlineBytes?: number;
@@ -304,7 +307,7 @@ class ChunkSink {
     const column = this.column;
     const rows = Math.max(1, column.rowsWritten + column.rows);
     const perRow = (this.inlineBytes + next) / rows;
-    const estimate = Math.ceil(perRow * this.writer.options.maxRows * 1.1) + 8192;
+    const estimate = Math.ceil(perRow * this.writer.options.estimatedRows * 1.1) + 8192;
     this.builder = this.writer.extents.open(Math.max(estimate, this.inlineBytes + next + 8192));
     const pages = this.inline.splice(0);
     this.inlineBytes = 0;
@@ -1362,6 +1365,7 @@ function columnWriter(writer: GroupWriter, column: WriterColumn): ColumnWriter {
 
 interface ResolvedOptions {
   readonly maxRows: number;
+  readonly estimatedRows: number;
   readonly maxChunkBytes: number;
   readonly pageBytes: number;
   readonly rawPageBytes: number;
@@ -1391,8 +1395,12 @@ export class GroupWriter {
     const maxRows = options.maxRows ?? MAX_GROUP_ROWS;
     if (!(Number.isInteger(maxRows) && maxRows > 0 && maxRows <= MAX_GROUP_ROWS))
       throw new RangeError("A group holds 1 … 65,536 rows");
+    const estimatedRows = options.estimatedRows ?? maxRows;
+    if (!Number.isInteger(estimatedRows) || estimatedRows < 1 || estimatedRows > maxRows)
+      throw new RangeError("Expected group rows must fit maxRows");
     this.options = {
       maxRows,
+      estimatedRows,
       pageBytes: options.pageBytes ?? DEFAULTS.pageBytes,
       rawPageBytes: Math.min(MAX_RAW_PAGE_BYTES, options.rawPageBytes ?? DEFAULTS.rawPageBytes),
       inlineBytes: options.inlineBytes ?? DEFAULTS.inlineBytes,

@@ -7,6 +7,10 @@ import { SimLocks } from "../storage/sim-disk.js";
 import { StoreCorruptionError } from "../storage/contract.js";
 import { openExtentSpace } from "../storage/space.js";
 import { listedRootExtents, reachableExtents } from "../format/reachable.js";
+import { encodeManifestRoot } from "../format/manifest-codec.js";
+import { MANIFEST_FORMAT_VERSION } from "../format/manifest.js";
+import { need } from "./bytes.js";
+import { xxHash32 } from "../hash/xxhash32.js";
 import fixture from "../format/root-r25.fixture.json";
 import { countingBudget, countingMemory } from "../storage/space-test-support.js";
 
@@ -124,7 +128,30 @@ it("retains whole-store orphan refusal in ordinary audit and test-build open", a
     const session = await backend.open(seed);
     for (const payload of fixture.payloads)
       await session.writeData(payload.offset, hex(payload.hex));
-    await session.publish(hex(fixture.rootHex));
+    const catalogBytes = hex(need(fixture.payloads[0]).hex),
+      listBytes = hex(need(fixture.payloads[1]).hex);
+    const ref = (offset: number, bytes: Uint8Array) => ({
+      extent: { offset, length: bytes.length },
+      offset: 0,
+      length: bytes.length,
+      checksum: xxHash32(bytes),
+    });
+    await session.publish(
+      encodeManifestRoot({
+        formatVersion: MANIFEST_FORMAT_VERSION,
+        sequence: 1,
+        epoch: seed.epoch,
+        log: { salt: 1, firstLsn: 1, rootSequence: 1 },
+        globalLsn: 0,
+        catalogVersion: 1,
+        catalog: ref(0, catalogBytes),
+        nextTableId: 1,
+        sequences: [],
+        tables: [],
+        clients: [],
+        extentList: [{ blob: ref(4096, listBytes), first: 0, count: 1 }],
+      }),
+    );
     await session.close();
   } finally {
     await seed.release();

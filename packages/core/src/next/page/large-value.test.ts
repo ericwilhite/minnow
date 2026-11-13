@@ -580,7 +580,7 @@ describe("out-of-line values", () => {
     ]);
     const catalog = defined((await writer.write([new Uint8Array(4)])).blobs[0]);
     const manifest: ManifestRoot = {
-      formatVersion: 2,
+      formatVersion: 3,
       sequence: 1,
       epoch: 1,
       log: { salt: 1, firstLsn: 1, rootSequence: 1 },

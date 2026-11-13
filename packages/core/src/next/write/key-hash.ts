@@ -407,6 +407,15 @@ export class KeyDelta {
     return (this.#bloomHashes[slot] ?? 0) >>> 0;
   }
 
+  /** Conservative pre-admission for distinct incoming key bytes, including resize overlap.
+   * No arrays are allocated or changed; a freeze can make this estimate unnecessary. */
+  appendKeyBytes(bytes: number): number {
+    if (this.#arenaUsed + bytes <= this.#arena.length) return 0;
+    let size = this.#arena.length * 2;
+    while (size < this.#arenaUsed + bytes) size *= 2;
+    return size;
+  }
+
   #insertKey(
     key: Uint8Array,
     start: number,
@@ -638,9 +647,15 @@ export class KeyDelta {
             }
           : null;
       let scratch: Int32Array = NO_ENTRIES;
+      // A 128-key work slice can contain many MiB of overflow payload. Drain by bytes for
+      // wide keys; short-key batches retain their existing CPU path and exact output bytes.
+      const keySlice =
+        visit.flush !== undefined && this.#maxKeyBytes > 2048
+          ? Math.max(1, Math.min(128, Math.floor((256 * 1024) / (this.#maxKeyBytes + 256))))
+          : 128;
       for (let slot = 0; slot < keyCount;) {
         yield* checkpoint(check);
-        const limit = Math.min(slot + 128, keyCount);
+        const limit = Math.min(slot + keySlice, keyCount);
         slot = this.#emitSingles(order, slot, limit, bound, visit, keep, singles);
         const drained = visit.flush?.();
         if (drained instanceof Promise) yield drained;
