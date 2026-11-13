@@ -329,6 +329,11 @@ export class QueryRuntime {
     this.#sourceMultiplicity = sourceMultiplicity;
     this.#parameterProgress = true;
   }
+  #groupKeyProgress: ((slots: readonly number[], largest: number) => number) | null = null;
+  /** Additional semantic operands, bounded from key columns rather than complete rows. */
+  groupKeyProgress(bound: (slots: readonly number[], largest: number) => number): void {
+    this.#groupKeyProgress = bound;
+  }
   #stepBytes(
     inputs: number,
     largestInput: number,
@@ -399,6 +404,7 @@ export class QueryRuntime {
     entries: ReadonlyArray<{ rel: OperatorIdentity; minimum: number; loanSlots?: number }>,
     inputs = 0,
     largestInput = 0,
+    slots: readonly number[] = [],
   ): number {
     if (this.#atomicResult === null)
       return inputs + entries.reduce((sum, entry) => sum + entry.minimum, 0);

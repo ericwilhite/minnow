@@ -39,14 +39,19 @@ export class JsonRecords {
   #payload = 0;
   #rows = 0;
   #extra = 0;
+  readonly #columnBytes: number[];
+  readonly #writerBytes: number;
   #closing: Promise<void> | null = null;
   constructor(
     parent: SpillIo,
     service: SpillService,
     readonly types: readonly PhysicalType[],
   ) {
-    if (!parent.pool.allocate(WRITER_BYTES)) throw new Error("JSON record metadata not admitted");
+    this.#writerBytes = WRITER_BYTES + 8 * types.length;
+    if (!parent.pool.allocate(this.#writerBytes))
+      throw new Error("JSON record metadata not admitted");
     try {
+      this.#columnBytes = Array.from(types, () => 0);
       const headers = new Int32Array(3),
         data = { layout: "varlen" as const, bytes: EMPTY, offsets: new Int32Array(2) };
       const vectors: FlatVector[] = Array.from({ length: 3 }, (_, i) => ({
@@ -60,7 +65,7 @@ export class JsonRecords {
       this.#records = new RecordCheckpoint(parent, service, [I32, I32, I32, BYTES]);
       this.#writer = { io: parent, headers, vectors, data };
     } catch (error) {
-      parent.pool.free(WRITER_BYTES);
+      parent.pool.free(this.#writerBytes);
       throw error;
     }
   }
@@ -69,6 +74,13 @@ export class JsonRecords {
   }
   get retainedBytes(): number {
     return this.#payload + this.#extra + 2048 + 2048 * this.types.length;
+  }
+  /** Per-field high-water marks survive detach without retaining a row or grant. */
+  columnBytes(column: number): number {
+    return this.#columnBytes[column] ?? 0;
+  }
+  #bound(column: number, bytes: number): void {
+    this.#columnBytes[column] = Math.max(this.#columnBytes[column] ?? 0, bytes);
   }
   get files() {
     return this.#records.files;
@@ -99,18 +111,22 @@ export class JsonRecords {
     if (!writer) throw new Error("JSON records detached");
     let payload = 0,
       extra = 0;
-    for (const value of columns) {
+    for (const [column, value] of columns.entries()) {
       if (!isValidSlot(value, row)) continue;
       const [flat, slot] = slotOf(value, row),
         d = flat.data;
       payload = align(payload);
-      if (d.layout === "varlen") payload += (d.offsets[slot + 1] ?? 0) - (d.offsets[slot] ?? 0);
-      else {
+      if (d.layout === "varlen") {
+        const length = (d.offsets[slot + 1] ?? 0) - (d.offsets[slot] ?? 0);
+        payload += length;
+        this.#bound(column, length);
+      } else {
         const wide =
           d.layout === "decimal" && d.coefficients.repr === "wide"
             ? bigintBytes(d.coefficients.values[slot] ?? 0n)
             : 0;
         payload += 512 + wide;
+        this.#bound(column, 512 + wide);
         extra += wide ? wide + 8 : 0;
       }
     }
@@ -128,23 +144,27 @@ export class JsonRecords {
     if (fields.length !== this.types.length) throw new Error("JSON streamed schema mismatch");
     let payload = 0,
       extra = 0;
-    for (const field of fields) {
+    for (const [column, field] of fields.entries()) {
       if ("stream" in field) {
         if (field.length !== null) {
           payload = align(payload) + field.length;
+          this.#bound(column, field.length);
         }
       } else if (isValidSlot(field, row)) {
         payload = align(payload);
         const [flat, slot] = slotOf(field, row),
           data = flat.data;
-        if (data.layout === "varlen")
-          payload += (data.offsets[slot + 1] ?? 0) - (data.offsets[slot] ?? 0);
-        else {
+        if (data.layout === "varlen") {
+          const length = (data.offsets[slot + 1] ?? 0) - (data.offsets[slot] ?? 0);
+          payload += length;
+          this.#bound(column, length);
+        } else {
           const wide =
             data.layout === "decimal" && data.coefficients.repr === "wide"
               ? bigintBytes(data.coefficients.values[slot] ?? 0n)
               : 0;
           payload += 512 + wide;
+          this.#bound(column, 512 + wide);
           extra += wide ? wide + 8 : 0;
         }
       }
@@ -227,7 +247,7 @@ export class JsonRecords {
   #detach(): void {
     const writer = this.#writer;
     this.#writer = null;
-    if (writer) writer.io.pool.free(WRITER_BYTES);
+    if (writer) writer.io.pool.free(this.#writerBytes);
   }
   async seal(): Promise<void> {
     await this.#records.seal();
@@ -245,6 +265,7 @@ export class JsonRecords {
     target.#rows += this.#rows;
     target.#payload = Math.max(target.#payload, this.#payload);
     target.#extra = Math.max(target.#extra, this.#extra);
+    for (const [column, bytes] of this.#columnBytes.entries()) target.#bound(column, bytes);
   }
   async read(
     io: SpillIo,
@@ -375,7 +396,7 @@ export class JsonRecords {
             nextColumn++;
             continue;
           }
-          if (layoutOf(type) !== "varlen") bad();
+          if (layoutOf(type) !== "varlen" || length > this.columnBytes(col)) bad();
           if (current === -1) {
             if (col !== nextColumn || offset !== 0) bad();
             start = align(cursor);

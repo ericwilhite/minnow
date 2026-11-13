@@ -4936,3 +4936,38 @@ export const JSON_GROUP_SQL_PRESSURE_REACH = [
   "observed spill",
   "zero resources",
 ] as const;
+
+/** Independent field widths keep semantic grouping from inheriting payload copies. */
+export const JSON_GROUP_WIDTH_REACH = [
+  "payload wider than key",
+  "key at least payload width",
+  "65536-byte payload",
+  "other payload width",
+  "wide restored payload tiny key",
+  "tiny key",
+  "wide key",
+  "sixteen MiB cap",
+  "independent small cap",
+  "exact PostgreSQL output",
+  "zero resources",
+  "expanding numeric key",
+  "ordinary canonical key",
+] as const;
+
+/** Pressure restore sizes each owned slot independently, in its original position. */
+export const OWNED_PARAMETER_COLUMN_BOUNDS_REACH = [
+  "independent slot bounds",
+  "original slot order",
+  "phase binding bounds",
+] as const;
+
+export const JSON_RECORD_WIDTH_REACH = [
+  "copy after seal",
+  "first field bound",
+  "second field bound",
+  "append does not shrink bounds",
+  "exact restored bytes",
+  "UTF8 fields",
+  "ASCII fields",
+  "zero resources",
+] as const;

@@ -367,3 +367,10 @@ Tiny ungrouped JSON aggregates use 512 KiB of shared fixed workspace plus 256 Ki
 transition, with independent sort minima where needed. This is not a whole-query 2x bound.
 Result-owned delivery additionally reserves the exact frame descriptor metadata, so a
 fully occupied ordinary pool cannot make adopting an already charged payload need a new loan.
+
+JSON aggregate semantic grouping budgets follow the grouping columns separately from
+aggregate payloads. JSONB comparison reserves two decoded trees (24 bytes per encoded
+key byte per tree); SQL arrays use 32 bytes per key byte per tree. Ordinary encoded
+row copies remain separate. Literal and owned parameter fields retain their own bounds;
+source keys use selected-column one-row bounds. Expanding JSON checkpoints retain
+per-field byte high-water marks for the next atomic admission, without old grants.

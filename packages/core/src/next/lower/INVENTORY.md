@@ -614,3 +614,8 @@ Direct EXCEPT of multi-MiB TEXT under forced pressure retains a pre-existing com
 reproduced without JSON on base 96448f6b; no JSON-specific refusal masks it. See the B6 EXCEPT
 progress-loan handoff for the separate reproducer. Private ephemeral pages do not change a
 supported stored format or require migration.
+
+JSON aggregate semantic grouping admission measures each grouping-key column independently
+from payload columns, including literal, owned-parameter, source and restored JSON fields.
+The 24-byte/JSONB-byte and 32-byte/array-byte decoded-key allowances apply to the two
+key operands, while unrelated payloads retain their ordinary row-copy reservation.
