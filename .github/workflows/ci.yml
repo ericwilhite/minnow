@@ -353,6 +353,8 @@ jobs:
         with:
           pattern: durations-playwright-*
           path: durations
+      # Listing loads the specs, which import the built core package.
+      - run: npx tsc -b packages/core
       - name: Require every library test in exactly one part
         run: |
           for browser in chromium firefox webkit; do
