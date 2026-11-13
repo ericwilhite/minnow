@@ -36,6 +36,12 @@
  * bigints are minimal; ledger counts are in key order (`<` on UTF-16 code units). A blob over
  * its cap is refused before it is charged.
  */
+import {
+  DURABLE_CODECS,
+  DURABLE_FORMATS,
+  METADATA_ENVELOPE_VERSION,
+  requireTag,
+} from "../durable-format.js";
 import { LIST_PAGE_EXTENTS, type ExtentListPage } from "../storage/extent-list.js";
 import { MAX_BLOB_BYTES } from "../storage/extents.js";
 import type { ByteBudget, ExtentWriter } from "../storage/extents.js";
@@ -67,13 +73,13 @@ export const GROUPS_PER_PAGE = 4096;
 const MAX_GROUP_ROWS = 65_536;
 
 const MAGIC = {
-  root: 0x3152_4d4d, // "MMR1"
-  index: 0x3149_474d, // "MGI1"
-  page: 0x3150_474d, // "MGP1"
-  group: 0x3152_474d, // "MGR1"
-  statistics: 0x3154_534d, // "MST1"
+  root: DURABLE_FORMATS.manifest.magic,
+  index: DURABLE_FORMATS.groupIndex.magic,
+  page: DURABLE_FORMATS.groupPage.magic,
+  group: DURABLE_FORMATS.groupRoot.magic,
+  statistics: DURABLE_FORMATS.tableStatistics.magic,
 } as const;
-const VERSION = 1;
+const VERSION = METADATA_ENVELOPE_VERSION;
 
 /** A decoded value and the bytes charged for it (its holder frees them). */
 export interface Parsed<T> {
@@ -247,31 +253,14 @@ class RefReader {
 
   optionalBlob(): BlobRef | null {
     const flag = this.bytes.u8();
-    valid(flag <= 1, "Bad optional reference flag");
+    requireTag(flag, DURABLE_CODECS.boolean, "optional reference flag", ManifestCorruptionError);
     return flag === 0 ? null : this.blob();
   }
 }
 
 // ── Physical types and statistics ──────────────────────────────────────────────────────────────
 
-const TYPE_TAGS = [
-  "bool",
-  "int32",
-  "int64",
-  "float64",
-  "float32",
-  "decimal",
-  "date",
-  "time",
-  "timestamp",
-  "interval",
-  "text",
-  "bytes",
-  "json",
-  "uuid",
-  "enum",
-  "array",
-] as const;
+const TYPE_TAGS = DURABLE_CODECS.physical;
 
 function writeType(out: ByteWriter, type: PhysicalType, depth = 0): void {
   if (depth > 8) throw new RangeError("Array types nest too deeply");
@@ -307,7 +296,7 @@ function writeType(out: ByteWriter, type: PhysicalType, depth = 0): void {
 
 function readFlag(reader: ByteReader): boolean {
   const flag = reader.u8();
-  valid(flag <= 1, "Bad flag byte");
+  requireTag(flag, DURABLE_CODECS.boolean, "manifest flag", ManifestCorruptionError);
   return flag === 1;
 }
 

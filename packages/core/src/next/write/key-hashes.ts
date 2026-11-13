@@ -1,5 +1,6 @@
 /** Canonical run Bloom seeds. These values are part of the stored-byte contract. */
-export const KEY_BLOOM_SEED = 0x9747b28c;
+import { RUN_CODEC } from "../durable-format.js";
+export const KEY_BLOOM_SEED = RUN_CODEC.seed2;
 
 /** Reusable scalar scratch, never a per-key allocation. `second` is raw, not forced odd. */
 export interface KeyHashes {

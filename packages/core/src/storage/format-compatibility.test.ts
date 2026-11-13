@@ -1,7 +1,8 @@
 /**
- * Golden compatibility tests for the v1 storage contract. There was no pre-v1 persisted-data
- * contract, so the corpus intentionally starts with block format 2 and framed snapshot format 1.
- * From this lock onward, every shipped format stays readable and keeps answering the same fixed
+ * Golden compatibility tests within the shipped 0.x engine. The corpus intentionally starts
+ * with block format 2 and framed snapshot format 1. The planned next/ 1.0 reset refuses these
+ * databases unchanged; its supported chain starts with the first released 1.0 writer.
+ * Within the 0.x line, every shipped format stays readable and keeps answering the same fixed
  * queries. A new writer format must add a fixture before changing the Minnow-owned framing or
  * logical payload.
  */

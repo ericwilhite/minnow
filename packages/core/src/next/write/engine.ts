@@ -12,6 +12,7 @@
  *   space, and its readers are re-pointed (ruling R16.3).
  * - **Recovery** (`openWritePath`): the single log scan, truncation and replay of startup step 4.
  */
+import { decodeDeletionBitmap } from "../format/deletion-bitmap.js";
 import {
   ArenaPool,
   groupRootOf,
@@ -724,7 +725,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       pinState: (state, label) => this.#pinState(state, label),
       runReader: (ref) => this.#runReader(ref),
       groupRoot: (ref, budget) => this.#metadata.groupRoot(ref, budget),
-      bitmap: (ref) => this.#bitmap(ref),
+      bitmap: (ref, rowCount) => this.#bitmap(ref, rowCount),
     };
     this.#unbindMetadataCaches = bindMetadataCaches(input.space, caches);
   }
@@ -1300,7 +1301,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       memtable.storedRows = ref.rowCount;
       memtable.mark(lsn);
       if (ref.deletions !== null) {
-        const bits = await this.#bitmap(ref.deletions);
+        const bits = await this.#bitmap(ref.deletions, ref.rowCount);
         for (let position = 0; position < ref.rowCount; position++)
           if (((bits[position >>> 5] ?? 0) & (1 << (position & 31))) !== 0)
             memtable.deletions.set(position, lsn);
@@ -2642,9 +2643,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     return opened;
   }
 
-  #bitmap(ref: BlobRef): Uint32Array | Promise<Uint32Array> {
+  #bitmap(ref: BlobRef, rowCount: number): Uint32Array | Promise<Uint32Array> {
     const peeked = this.#space.peek(ref);
-    const decode = (bytes: Uint8Array) => new Uint32Array(bytes.slice().buffer);
+    const decode = (bytes: Uint8Array) => decodeDeletionBitmap(bytes, rowCount);
     if (peeked !== null) return decode(peeked);
     return readBlob(this.#space, ref, this.#grant).then(decode);
   }
@@ -2807,7 +2808,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
           // the memtable kept (tombstones of older rows) become a run of their own.
           foldedStagings.add(part.stagingId);
           const base =
-            part.group.deletions === null ? null : await this.#bitmap(part.group.deletions);
+            part.group.deletions === null
+              ? null
+              : await this.#bitmap(part.group.deletions, part.group.rowCount);
           const isSet = (position: number) =>
             base !== null && ((base[position >>> 5] ?? 0) & (1 << (position & 31))) !== 0;
           const deleted = memtable
@@ -2896,7 +2899,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
         const folded = groupDeletions(view, groupId, through);
         if (folded.length === 0) continue;
         const group = before.get(at);
-        const old = group.deletions === null ? null : await this.#bitmap(group.deletions);
+        const old =
+          group.deletions === null ? null : await this.#bitmap(group.deletions, group.rowCount);
         const deletions = await this.#writeBitmap(writer, group.rowCount, old, folded);
         if (group.deletions !== null) retired.push(group.deletions.extent);
         changes.set(at, { ...group, deletions, liveRowCount: group.liveRowCount - folded.length });

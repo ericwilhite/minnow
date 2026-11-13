@@ -24,6 +24,7 @@
  * the durable root's list at open, never from earlier callbacks (a sink that failed mid-publication
  * is rebuilt by reopening).
  */
+import { DURABLE_FORMATS, requireHeader } from "../durable-format.js";
 import { pauseIfDue, sortInSlices, type TaskWork } from "../task.js";
 import { StoreCorruptionError } from "./contract.js";
 import {
@@ -39,8 +40,8 @@ import {
 /** Extents per list page at most (16 bytes each: 64 KiB of entries). */
 export const LIST_PAGE_EXTENTS = 4096;
 
-const MAGIC = 0x314c584d; // "MXL1"
-const VERSION = 1;
+const MAGIC = DURABLE_FORMATS.extentList.magic; // "MXL1"
+const VERSION = DURABLE_FORMATS.extentList.version;
 const HEADER = 16;
 const ENTRY = 16;
 
@@ -75,6 +76,7 @@ export function decodeListPage(bytes: Uint8Array, page: ExtentListPage): ExtentR
     throw new StoreCorruptionError(`Extent list page at ${String(page.first)}: ${why}`);
   };
   if (bytes.length < HEADER) fail("too short");
+  requireHeader("extentList", bytes, StoreCorruptionError);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   if (view.getUint32(0, true) !== MAGIC) fail("not an extent list page");
   if (view.getUint16(4, true) !== VERSION)

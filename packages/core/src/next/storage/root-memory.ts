@@ -3,6 +3,8 @@
  * Oversized roots need ordinary caller credit before allocating; no admission is awaited.
  * Native publication borrows the frame itself, never encoding/copying it a second time.
  */
+import { DURABLE_FORMATS, ROOT_SLOT_HEADER_BYTES, ROOT_SLOT_OVERHEAD } from "../durable-format.js";
+import { writeRootVersion } from "./root-slot.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { pauseIfDue, type TaskWork } from "../task.js";
 import {
@@ -16,7 +18,7 @@ import type { StoreSession } from "./contract.js";
 export const ROOT_BANK_BYTES = 128 * 1024;
 export const SMALL_ROOT_BYTES = 18 * 1024;
 const FRAME_OVERHEAD = 512;
-const ROOT_HEADER = 20;
+const ROOT_HEADER = ROOT_SLOT_OVERHEAD;
 interface PreparedRoot {
   readonly token: object;
   readonly frame: RootFrame;
@@ -158,7 +160,7 @@ export class RootFrame {
     readonly small: boolean,
   ) {
     this.#slot = new Uint8Array(length + ROOT_HEADER);
-    this.#bytes = this.#slot.subarray(16, 16 + length);
+    this.#bytes = this.#slot.subarray(ROOT_SLOT_HEADER_BYTES, ROOT_SLOT_HEADER_BYTES + length);
   }
   get bytes(): Uint8Array {
     if (this.#refs === 0) throw new TypeError("Released root frame");
@@ -176,10 +178,11 @@ export class RootFrame {
   prepare(session: StoreSession, slot: 0 | 1, sequence: number): void {
     if (!Number.isSafeInteger(sequence) || sequence < 1) throw new RangeError("Bad root sequence");
     const view = new DataView(this.#slot.buffer);
-    view.setUint32(0, 0x54524e4d, true);
+    view.setUint32(0, DURABLE_FORMATS.rootSlot.magic, true);
     view.setUint32(4, sequence >>> 0, true);
     view.setUint32(8, Math.floor(sequence / 2 ** 32), true);
     view.setUint32(12, this.bytes.length, true);
+    writeRootVersion(view);
     view.setUint32(this.#slot.length - 4, xxHash32(this.#slot, 0, 0, this.#slot.length - 4), true);
     prepared.set(this.bytes, { token: session.rootWriterToken ?? session, slot, frame: this });
   }

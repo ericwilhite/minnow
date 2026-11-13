@@ -8,12 +8,23 @@
  * previous root) still wins.
  *
  * Slot layout (little-endian): magic u32 "MNRT" | sequence u32 lo | sequence u32 hi |
- * root length u32 | root bytes | xxHash32 of everything before it (seed 0).
+ * root length u32 | root bytes | xxHash32 of everything before it (seed0).
+ * The sequence high word uses low21 bits for the u53 sequence; bits21..23 hold minimum-reader
+ * minus1, bits24..31 hold manifest-format minus2. Initial selectors encode as zero.
  */
+import {
+  DURABLE_FORMATS,
+  DURABLE_READER_VERSION,
+  MANIFEST_FORMAT_VERSION,
+  ROOT_SLOT_HEADER_BYTES,
+  DurableFormatError,
+  requireHeader,
+} from "../durable-format.js";
+import { StoreCorruptionError } from "./contract.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 
-const MAGIC = 0x54524e4d; // "MNRT"
-const HEADER = 16;
+const MAGIC = DURABLE_FORMATS.rootSlot.magic; // "MNRT"
+const HEADER = ROOT_SLOT_HEADER_BYTES;
 
 export interface RootSlot {
   readonly sequence: number;
@@ -28,21 +39,30 @@ export function encodeRootSlot(sequence: number, root: Uint8Array): Uint8Array {
   view.setUint32(4, sequence >>> 0, true);
   view.setUint32(8, Math.floor(sequence / 2 ** 32), true);
   view.setUint32(12, root.length, true);
+  writeRootVersion(view);
   bytes.set(root, HEADER);
   view.setUint32(HEADER + root.length, xxHash32(bytes, 0, 0, HEADER + root.length), true);
   return bytes;
 }
 
-/** A slot's root, or null when the slot is empty, torn or not a root slot. */
+/** Shared by the prepaid root frame; no allocation or dependency on the inner codec. */
+export function writeRootVersion(view: DataView): void {
+  view.setUint8(10, (view.getUint8(10) & 31) | ((DURABLE_READER_VERSION - 1) << 5));
+  view.setUint8(11, MANIFEST_FORMAT_VERSION - 2);
+}
+
+/** Empty/torn slots return null; an intact unsupported identity/version refuses before fencing. */
 export function decodeRootSlot(bytes: Uint8Array | null, borrow = false): RootSlot | null {
   if (bytes === null || bytes.length < HEADER + 4) return null;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  if (view.getUint32(0, true) !== MAGIC) return null;
   const length = view.getUint32(12, true);
   if (HEADER + length + 4 > bytes.length) return null;
   if (view.getUint32(HEADER + length, true) !== xxHash32(bytes, 0, 0, HEADER + length)) return null;
+  requireHeader("rootSlot", bytes, DurableFormatError);
+  if (view.getUint32(4, true) === 0 && (view.getUint32(8, true) & 0x1fffff) === 0)
+    throw new StoreCorruptionError("A root slot has sequence zero");
   return {
-    sequence: view.getUint32(4, true) + view.getUint32(8, true) * 2 ** 32,
+    sequence: view.getUint32(4, true) + (view.getUint32(8, true) & 0x1fffff) * 2 ** 32,
     root: borrow ? bytes.subarray(HEADER, HEADER + length) : bytes.slice(HEADER, HEADER + length),
   };
 }

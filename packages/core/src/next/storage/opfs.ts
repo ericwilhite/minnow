@@ -20,7 +20,9 @@
  * ## Acquisition (`storage/fence.ts` `acquireFenced`)
  * 1. The Web Lock `minnow:<db>` (`navigator.locks`, adapted to `LockManagerLike`).
  * 2. Every file's sync handle, opened in a fixed order with bounded retry: the lock frees
- *    2 ms–2 s before a dead owner's handles. Busy is `NoModificationAllowedError` (Chromium,
+ *    2 ms–2 s before a dead owner's handles. Read-only root/log/epoch snapshots reject
+ *    unsupported headers before file creation; the root minimum-reader barrier is rechecked
+ *    under the handles before the epoch advances. Busy is `NoModificationAllowedError` (Chromium,
  *    Firefox) or `InvalidStateError` (WebKit). Handles opened before a busy one are closed before
  *    the retry. `mode` is not passed: Firefox and WebKit ignore it and Chromium's non-default
  *    modes do not exclude.
@@ -35,9 +37,13 @@
  *
  * ## Not here
  * Page lifecycle (`pagehide` terminate, `freeze` step-down) belongs to the ownership track. The
- * engine never touches OPFS outside these handles, and clients never open these files: any
+ * engine uses read-only Blob snapshots for pre-fence format checks; afterward it uses only
+ * these handles. Clients never open these files: any
  * other opener would block the owner.
  */
+import { ROOT_SLOT_OVERHEAD, DURABLE_FORMATS, requireHeader } from "../durable-format.js";
+import { decodeRootSlot } from "./root-slot.js";
+import { validLogHeaderEnvelope } from "./durable-header.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import {
   OwnershipLostError,
@@ -52,15 +58,20 @@ import {
   type SyncFile,
 } from "./contract.js";
 import { acquireFenced, type HeldLock, type LockManagerLike } from "./fence.js";
+import { refuseLegacyOpfs } from "./legacy-data.js";
 import { FileScratch, FileStoreSession, type FileSet } from "./file-store.js";
 
 /** `FileSystemFileHandle`, as far as the backend uses it. */
 export interface OpfsFileHandleLike {
+  /** Native read-only snapshot, used before creating files in a possibly future store. */
+  getFile?(): Promise<Blob>;
   createSyncAccessHandle(): Promise<SyncFile>;
 }
 
 /** `FileSystemDirectoryHandle`, as far as the backend uses it. */
 export interface OpfsDirectoryLike {
+  /** Present on native handles: inspect before opening any writable sync handle. */
+  keys?(): AsyncIterableIterator<string>;
   getFileHandle(name: string, options?: { create?: boolean }): Promise<OpfsFileHandleLike>;
 }
 
@@ -292,7 +303,7 @@ function closeAll(handles: readonly SyncFile[]): void {
  * live owner holds. Slot: magic u32 "MNEP" | value u32 lo | value u32 hi | xxHash32 of the 12.
  */
 export const EPOCH_SLOT_BYTES = 512;
-const EPOCH_MAGIC = 0x50454e4d; // "MNEP"
+const EPOCH_MAGIC = DURABLE_FORMATS.epochSlot.magic; // "MNEP"
 
 export function encodeEpochSlot(value: number): Uint8Array {
   const bytes = new Uint8Array(16);
@@ -304,11 +315,12 @@ export function encodeEpochSlot(value: number): Uint8Array {
   return bytes;
 }
 
-/** A slot's value, or null when the slot is empty, torn or not an epoch slot. */
+/** Empty/torn slots return null; intact unsupported identities/reserved bits refuse. */
 function decodeEpochSlot(bytes: Uint8Array): number | null {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  if (bytes.length < 16 || view.getUint32(0, true) !== EPOCH_MAGIC) return null;
+  if (bytes.length < 16) return null;
   if (view.getUint32(12, true) !== xxHash32(bytes, 0, 0, 12)) return null;
+  requireHeader("epochSlot", bytes, StoreCorruptionError);
   const value = view.getUint32(4, true) + view.getUint32(8, true) * 2 ** 32;
   return Number.isSafeInteger(value) && value >= 1 ? value : null;
 }
@@ -318,7 +330,8 @@ function readAll(file: SyncFile, at: number, length: number): Uint8Array {
   let done = 0;
   while (done < length) {
     const read = file.read(buffer.subarray(done), { at: at + done });
-    if (read <= 0) break;
+    if (read <= 0)
+      throw new StoreCorruptionError("Native header read made no progress inside the file");
     done += read;
   }
   return buffer;
@@ -354,19 +367,88 @@ function nextEpoch(file: SyncFile, unused: boolean): number {
   return next;
 }
 
+/** Native Blob snapshots read only bounded root/header bytes before missing files are created.
+ * Payload roots stay opaque to storage; taking the owner fence still precedes semantic replay.
+ */
+async function checkExistingFormats(directory: OpfsDirectoryLike): Promise<void> {
+  for (const name of ["root-0", "root-1", "log", "epoch"]) {
+    let handle: OpfsFileHandleLike;
+    try {
+      handle = await directory.getFileHandle(name, { create: false });
+    } catch (error) {
+      if (errorName(error) === "NotFoundError") continue;
+      throw error;
+    }
+    if (handle.getFile === undefined) continue; // Trusted raw storage-kit adapters.
+    const file = await handle.getFile();
+    if (name.startsWith("root-")) {
+      if (file.size > (1 << 20) + ROOT_SLOT_OVERHEAD)
+        throw new StoreCorruptionError("Root slot exceeds1MiB payload");
+      decodeRootSlot(new Uint8Array(await file.arrayBuffer()), true);
+    } else
+      for (const slot of [0, 1]) {
+        const start = slot * EPOCH_SLOT_BYTES;
+        const bytes = new Uint8Array(
+          await file.slice(start, start + (name === "epoch" ? 16 : 512)).arrayBuffer(),
+        );
+        if (name === "epoch") decodeEpochSlot(bytes);
+        else validLogHeaderEnvelope(bytes);
+      }
+  }
+}
+
 /**
  * Opens every file's handle in order and advances the epoch; on any failure closes every handle it
  * opened, then throws (quota failures as `StoreQuotaError`), so a retry finds the files free.
  */
-async function openFiles(directory: OpfsDirectoryLike): Promise<OpenFiles> {
+async function openFiles(directory: OpfsDirectoryLike, location: string): Promise<OpenFiles> {
+  await refuseLegacyOpfs(directory, location, OPFS_FILE_NAMES);
+  await checkExistingFormats(directory);
   const handles: SyncFile[] = [];
   try {
+    const existing = new Map<string, SyncFile>();
+    // Own and validate existing files BEFORE creating missing files. A departing owner may
+    // have replaced a root since the Blob snapshot; a partial future tree must stay partial.
     for (const name of OPFS_FILE_NAMES) {
-      const file = await directory.getFileHandle(name, { create: true });
-      handles.push(await file.createSyncAccessHandle());
+      let file: OpfsFileHandleLike;
+      try {
+        file = await directory.getFileHandle(name, { create: false });
+      } catch (error) {
+        if (errorName(error) === "NotFoundError") continue;
+        throw error;
+      }
+      const handle = await file.createSyncAccessHandle();
+      handles.push(handle);
+      existing.set(name, handle);
+      if (name.startsWith("root-")) {
+        const length = handle.getSize();
+        if (length > (1 << 20) + ROOT_SLOT_OVERHEAD)
+          throw new StoreCorruptionError("Root slot exceeds1MiB payload");
+        decodeRootSlot(readAll(handle, 0, length), true);
+      } else if (name === "log" || name === "epoch")
+        for (const slot of [0, 1]) {
+          const start = slot * EPOCH_SLOT_BYTES;
+          const bytes = readAll(
+            handle,
+            start,
+            Math.min(name === "epoch" ? 16 : 512, Math.max(0, handle.getSize() - start)),
+          );
+          if (name === "epoch") decodeEpochSlot(bytes);
+          else validLogHeaderEnvelope(bytes);
+        }
+    }
+    const ordered: SyncFile[] = [];
+    for (const name of OPFS_FILE_NAMES) {
+      let handle = existing.get(name);
+      if (handle === undefined) {
+        const file = await directory.getFileHandle(name, { create: true });
+        handle = await file.createSyncAccessHandle();
+        handles.push(handle);
+      }
+      ordered.push(handle);
     }
     const [log, data, root0, root1, scratch, epochFile, metadata, metadataIndex, spillMetadata] =
-      handles as [
+      ordered as [
         SyncFile,
         SyncFile,
         SyncFile,
@@ -405,7 +487,7 @@ export function createOpfsBackend(options: OpfsBackendOptions): StorageBackend {
       const { lock, fence } = await acquireFenced(
         options.locks,
         `minnow:${options.name}`,
-        () => openFiles(options.directory),
+        () => openFiles(options.directory, options.name),
         (opened) => {
           closeAll(opened.handles);
         },

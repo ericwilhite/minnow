@@ -14,6 +14,10 @@
  *      (`isBusyError`). An owner whose lock is stolen (AbortError) closes its handles at once.
  *    - `epoch` (IndexedDB, which has no exclusive handle): acquisition increments a durable epoch
  *      record; every readwrite transaction reads it first and aborts if it moved.
+ * Before advancing the durable epoch or creating missing native files, acquisition validates both
+ * checksummed root-slot reader/manifest barriers (root-slot.ts). Unsupported requirements refuse
+ * without a native write; opaque manifest replay still follows ownership. OPFS rechecks existing
+ * exclusive handles before creating missing files; IDB checks before enqueueing its epoch put.
  * If the fence is still held when `timeoutMs` passes, acquisition fails with
  * `OwnerUnresponsiveError` (a frozen or hung owner: the caller reports it and retries later).
  * A lock steal never lets a second owner write while the first still holds the handle fence.

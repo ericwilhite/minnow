@@ -17,6 +17,102 @@
  * (`packages/db/tests/oracle-reach.ts`). Like ./seeds.ts, this module is excluded from the
  * published tarball.
  */
+/** Reset refusal must see every legacy marker and both OPFS capability states. */
+export const DURABLE_REGISTRY_REACH = [
+  "rootSlot",
+  "epochSlot",
+  "logHeader",
+  "logFrame",
+  "manifest",
+  "groupRoot",
+  "groupPage",
+  "deletionBitmap",
+  "groupIndex",
+  "tableStatistics",
+  "extentList",
+  "pageDirectory",
+  "page",
+  "largeValue",
+  "sketch",
+  "commitBody",
+  "column",
+  "catalog",
+  "catalogChange",
+  "runBlock",
+  "runIndex",
+  "runFences",
+  "runBloomDirectory",
+  "runBloom",
+  "arrayValue",
+] as const;
+export const DELETION_BITMAP_REACH = [
+  "empty",
+  "partial word",
+  "whole word",
+  "multiple words",
+  "unaligned input",
+  "short",
+  "long",
+  "nonword length",
+  "tail bit",
+  "unchanged input",
+  "cache hit",
+  "async read",
+] as const;
+
+export const DURABLE_FIELD_REACH = [
+  "request flag",
+  "column flag",
+  "column boolean",
+  "NULL payload",
+  "array boolean",
+  "catalog operation",
+  "run flags",
+  "array bitmap",
+  "page padding",
+] as const;
+
+export const DURABLE_STARTUP_REACH = [
+  "minimum reader",
+  "manifest format",
+  "root-0",
+  "root-1",
+  "fresh snapshot",
+  "stale snapshot",
+  "partial tree",
+  "complete tree",
+  "OPFS unchanged",
+  "IDB unchanged",
+  "zero writes",
+] as const;
+export const DURABLE_ALIAS_REACH = ["logical manifest", "lazy root", "dictionary"] as const;
+export const DURABLE_NATIVE_REACH = ["rootSlot", "logHeader", "OPFS", "IDB"] as const;
+export const DURABLE_CATALOG_REACH = [
+  "physical",
+  "index kind",
+  "index role",
+  "foreign action",
+  "scalar number",
+  "missing form",
+  "missing layout",
+] as const;
+export const DURABLE_READ_REACH = ["blocked", "progress"] as const;
+
+export const LEGACY_PARTIAL_TREE_REACH = [
+  "partial",
+  "no marker",
+  "ack only",
+  "unknown file",
+  "unknown directory",
+  "native name directory",
+] as const;
+export const LEGACY_HELD_WRITER_REACH = ["held", "closed", "I1 blocked", "I2", "I8"] as const;
+
+export const LEGACY_REFUSAL_REACH = {
+  opfs: ["O5", "O6", "O7", "O8", "O9", "O10", "O11", "O12", "O13", "sync", "no sync", "pre-marker"],
+  idb: ["I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8"],
+} as const;
+
 export interface Reach<State extends string> {
   /** Starts one generated history. */
   beginHistory(): void;

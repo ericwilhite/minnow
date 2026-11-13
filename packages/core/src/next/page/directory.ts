@@ -28,16 +28,17 @@
  * plain varlen pages only) lies between the previous page and its own: the page's pointers must
  * tile it (decode.ts `parsePage`), so no value aliases another or a page (review B2-p2b #1).
  */
+import { DURABLE_FORMATS, requireHeader } from "../durable-format.js";
 import type { PageEntry, StatValue } from "../format/manifest.js";
 import { PageEncoding } from "../format/manifest.js";
 import { NUMERIC_MAX_SCALE } from "../types.js";
-import { check, MIXED_SCALE, ValueTag } from "./format.js";
+import { check, MIXED_SCALE, ValueTag, PageCorruptionError } from "./format.js";
 import { LARGE_VALUE_BYTES } from "./large-value.js";
 
-const MAGIC = 0x3144_504d; // "MPD1"
+const MAGIC = DURABLE_FORMATS.pageDirectory.magic; // "MPD1"
 /** Every blob is at most 1 MiB (storage track ruling); a page directory is a blob. */
 export const MAX_DIRECTORY_BYTES = 1024 * 1024;
-const VERSION = 1;
+const VERSION = DURABLE_FORMATS.pageDirectory.version;
 
 export interface ChunkDirectory {
   readonly tag: number;
@@ -322,6 +323,7 @@ export function checkDirectoryWithin(directory: ChunkDirectory, extentLength: nu
  */
 export function parseDirectory(bytes: Uint8Array, extentLength: number): ChunkDirectory {
   check(bytes.length <= MAX_DIRECTORY_BYTES, "Page directory exceeds the blob cap");
+  requireHeader("pageDirectory", bytes, PageCorruptionError);
   const reader = new Reader(bytes);
   check(reader.u32() === MAGIC, "Not a page directory");
   check(reader.u8() === VERSION, "Unknown page directory version");

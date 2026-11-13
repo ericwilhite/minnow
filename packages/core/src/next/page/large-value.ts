@@ -15,11 +15,12 @@
  * data range (like `PageEntry.offset`); part i is `[offset + i × VALUE_PART_BYTES, …)`, the last
  * one shorter.
  */
-import { check } from "./format.js";
+import { DURABLE_FORMATS, LARGE_CODEC, requireHeader } from "../durable-format.js";
+import { check, PageCorruptionError } from "./format.js";
 
-export const LARGE_VALUE_BYTES = 64 * 1024;
-export const MAX_VALUE_BYTES = 64 * 1024 * 1024;
-export const VALUE_PART_BYTES = 1024 * 1024;
+export const LARGE_VALUE_BYTES = LARGE_CODEC.inlineLimit;
+export const MAX_VALUE_BYTES = LARGE_CODEC.valueLimit;
+export const VALUE_PART_BYTES = LARGE_CODEC.partBytes;
 const HEADER = 16;
 const TWO32 = 4_294_967_296;
 
@@ -42,7 +43,7 @@ export function encodePointer(pointer: LargePointer): Uint8Array {
     throw new RangeError("Pointer part count disagrees with its length");
   const out = new Uint8Array(pointerBytes(parts));
   const view = new DataView(out.buffer);
-  view.setUint8(0, 1);
+  view.setUint8(0, DURABLE_FORMATS.largeValue.version);
   view.setUint16(2, parts, true);
   view.setUint32(4, pointer.length, true);
   const high = Math.floor(pointer.offset / TWO32);
@@ -57,8 +58,8 @@ export function encodePointer(pointer: LargePointer): Uint8Array {
 /** Decodes and checks a pointer stored in `bytes[start … end)` (`PageCorruptionError`). */
 export function decodePointer(bytes: Uint8Array, start: number, end: number): LargePointer {
   check(end - start >= HEADER, "Large-value pointer is truncated");
+  requireHeader("largeValue", bytes.subarray(start, end), PageCorruptionError);
   const view = new DataView(bytes.buffer, bytes.byteOffset + start, end - start);
-  check(view.getUint8(0) === 1 && view.getUint8(1) === 0, "Unknown large-value pointer");
   const parts = view.getUint16(2, true);
   const length = view.getUint32(4, true);
   const offset = view.getUint32(8, true) + view.getUint32(12, true) * TWO32;

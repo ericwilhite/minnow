@@ -20,6 +20,7 @@
  * Element types: every scalar type except JSON (and never arrays of arrays: use dimensions).
  * Zero dimensions is the empty array, and the only one (`validateArrayValue`). Decoding validates.
  */
+import { DURABLE_CODECS, DURABLE_FORMATS, requireHeader, requireTag } from "../durable-format.js";
 import type { PhysicalType } from "../types.js";
 
 export type ArrayElement =
@@ -40,7 +41,7 @@ export interface ArrayValue {
   readonly elements: ReadonlyArray<ArrayElement | null>;
 }
 
-export const MAX_ARRAY_DIMENSIONS = 6;
+export const MAX_ARRAY_DIMENSIONS = DURABLE_CODECS.arrayDimensions;
 
 export class MalformedArrayError extends Error {
   readonly code = "MINNOW_MALFORMED_ARRAY";
@@ -54,33 +55,37 @@ export class MalformedArrayError extends Error {
 export function arrayElementTag(type: PhysicalType): number {
   switch (type.kind) {
     case "bool":
-      return 1;
+      return DURABLE_CODECS.arrayElement.bool;
     case "int32":
-      return type.bits === 16 ? 2 : 3;
+      return type.bits === 16
+        ? DURABLE_CODECS.arrayElement.int16
+        : DURABLE_CODECS.arrayElement.int32;
     case "int64":
-      return 4;
+      return DURABLE_CODECS.arrayElement.int64;
     case "float32":
-      return 5;
+      return DURABLE_CODECS.arrayElement.float32;
     case "float64":
-      return 6;
+      return DURABLE_CODECS.arrayElement.float64;
     case "decimal":
-      return 7;
+      return DURABLE_CODECS.arrayElement.decimal;
     case "date":
-      return 8;
+      return DURABLE_CODECS.arrayElement.date;
     case "time":
-      return 9;
+      return DURABLE_CODECS.arrayElement.time;
     case "timestamp":
-      return type.zoned ? 11 : 10;
+      return type.zoned
+        ? DURABLE_CODECS.arrayElement.timestamptz
+        : DURABLE_CODECS.arrayElement.timestamp;
     case "interval":
-      return 12;
+      return DURABLE_CODECS.arrayElement.interval;
     case "text":
-      return 13;
+      return DURABLE_CODECS.arrayElement.text;
     case "bytes":
-      return 14;
+      return DURABLE_CODECS.arrayElement.bytes;
     case "uuid":
-      return 15;
+      return DURABLE_CODECS.arrayElement.uuid;
     case "enum":
-      return 16;
+      return DURABLE_CODECS.arrayElement.enum;
     case "json":
     case "array":
     case "locator":
@@ -292,7 +297,7 @@ export function encodeArrayValue(element: PhysicalType, value: ArrayValue): Uint
   const count = elements.length;
   const writer = new Writer();
   const hasNulls = elements.some((item) => item === null);
-  writer.u8(1);
+  writer.u8(DURABLE_FORMATS.arrayValue.version);
   writer.u8(tag);
   writer.u8(dimensions.length);
   writer.u8(hasNulls ? 1 : 0);
@@ -376,6 +381,7 @@ export function encodeArrayValue(element: PhysicalType, value: ArrayValue): Uint
 
 export function decodeArrayValue(element: PhysicalType, bytes: Uint8Array): ArrayValue {
   const tag = arrayElementTag(element);
+  requireHeader("arrayValue", bytes, MalformedArrayError);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let at = 0;
   const need = (size: number) => {
@@ -384,7 +390,8 @@ export function decodeArrayValue(element: PhysicalType, bytes: Uint8Array): Arra
     at += size;
     return start;
   };
-  if (view.getUint8(need(1)) !== 1) throw new MalformedArrayError("Unknown array version");
+  if (view.getUint8(need(1)) !== DURABLE_FORMATS.arrayValue.version)
+    throw new MalformedArrayError("Unknown array version");
   if (view.getUint8(need(1)) !== tag) throw new MalformedArrayError("Array element type mismatch");
   const ndims = view.getUint8(need(1));
   const flags = view.getUint8(need(1));
@@ -402,6 +409,8 @@ export function decodeArrayValue(element: PhysicalType, bytes: Uint8Array): Arra
   }
   if (count > bytes.length * 8) throw new MalformedArrayError("Array dimensions exceed the value");
   const nulls = (flags & 1) === 1 ? bytes.subarray(need(Math.ceil(count / 8)), at) : null;
+  if (nulls !== null && (count & 7) !== 0 && (nulls[nulls.length - 1] ?? 0) >>> (count & 7) !== 0)
+    throw new MalformedArrayError("Nonzero array null bitmap padding");
   const elements: Array<ArrayElement | null> = [];
   for (let index = 0; index < count; index++) {
     if (nulls !== null && ((nulls[index >>> 3] ?? 0) & (1 << (index & 7))) !== 0) {
@@ -409,9 +418,12 @@ export function decodeArrayValue(element: PhysicalType, bytes: Uint8Array): Arra
       continue;
     }
     switch (tag) {
-      case 1:
-        elements.push(view.getUint8(need(1)) === 1);
+      case 1: {
+        const value = view.getUint8(need(1));
+        requireTag(value, DURABLE_CODECS.boolean, "array boolean", MalformedArrayError);
+        elements.push(value === 1);
         break;
+      }
       case 2:
       case 3:
       case 8:

@@ -11,6 +11,7 @@
  * Publication order (guarantee 1): flush the data file; write the inactive root slot; flush it.
  * A torn slot fails its checksum and the other slot, the previous root, stays current.
  */
+import { ROOT_SLOT_OVERHEAD } from "../durable-format.js";
 import { chooseRoot, encodeRootSlot } from "./root-slot.js";
 import { preparedRoot } from "./root-memory.js";
 import {
@@ -112,7 +113,8 @@ export class FileStoreSession implements StoreSession {
   async readRootSlot(slot: 0 | 1): Promise<Uint8Array | null> {
     const file = this.#live().roots[slot],
       length = file.getSize();
-    if (length > (1 << 20) + 20) throw new StoreCorruptionError("Root slot exceeds1MiB payload");
+    if (length > (1 << 20) + ROOT_SLOT_OVERHEAD)
+      throw new StoreCorruptionError("Root slot exceeds1MiB payload");
     return length === 0 ? null : readExact(file, 0, length);
   }
 

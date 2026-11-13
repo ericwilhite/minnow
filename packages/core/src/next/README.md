@@ -354,6 +354,43 @@ its memory-store results exclude payload fetch, SQL, owner transport and real di
 - Text stays UTF-8 until output.
 - A consumer borrows a batch until it signals readiness, or owns it under an explicit transfer.
 
+### Durable format registry (`durable-format.ts`)
+
+`DURABLE_FORMATS` lists every durable family, version, magic and parent envelope.
+`DURABLE_CODECS` lists codec tags; permitted masks define canonical reserved-zero bits.
+Raw pages, columns and run parts inherit their directory, body or manifest version.
+Unknown versions, tags and reserved bits produce a typed `MINNOW_` refusal. An intact
+unsupported native header never means an empty store. Checksum-invalid slots still follow
+ordinary dual-slot recovery. Private scratch journals and spill encodings are listed separately;
+they are not recovery authorities. Snapshot entries are design reservations, with no loader yet.
+
+The 16-byte native root header now carries a minimum-reader version and the inner manifest
+format before its opaque payload. Both are checksummed. Acquisition checks both root slots
+before creating OPFS files or advancing an owner epoch; IndexedDB checks in the strict fence
+transaction before enqueueing any write. Unsupported root barriers use
+`DurableFormatError` (`MINNOW_FORMAT_UNSUPPORTED`). Publishers, including prepaid root frames,
+emit the registry values. Every future incompatible nested codec must raise this outer barrier
+before writing incompatible data or log bytes, so an older reader cannot advance the newer owner's epoch before refusing.
+Its eleven formerly reserved high bits carry biased selectors: minimum-reader minus1 in
+bits21..23 and manifest-format minus2 in bits24..31. Zero selects reader1/manifest2, so current
+bytes and charges stay unchanged. The first released1.0 writer starts the supported fixture
+and automatic-upgrade chain. The shipped0.x engine is unchanged.
+
+Group deletion bitmaps inherit the enclosing group-page version. They store exactly
+`ceil(rowCount / 32)` little-endian u32 words, with unused high bits zero. Cache-hit and
+async readers validate length and tail bits before creating their owned word copy; malformed
+bitmaps raise `StoreCorruptionError`. The writer's bytes and version stay unchanged.
+
+Completeness is checked against an independent source inventory: typed persistence calls
+and durable `BlobRef`/`ChunkData` fields must each have an explicit object-kind classification.
+A new emission site or reference fails even when its registry entry and decoder adapter are
+both missing. Composed codecs are listed at their outer emission boundary; reflective calls
+still require review. The inventory changes no production storage API.
+
+`testing/durable-format.test.ts` sweeps real decoder entry points with unsupported selectors
+and every reserved bit, checks typed refusal, unchanged inputs and returned charges, and
+checks future roots leave native epoch/log/root/metadata images unchanged with zero writes.
+
 ### Checksum (`hash/xxhash32.ts`)
 
 - xxHash32 is the one checksum of the new core (log frames, header and root slots, blobs and
@@ -548,7 +585,16 @@ its memory-store results exclude payload fetch, SQL, owner transport and real di
   IndexedDB only on the private modes' refusals (`SecurityError`, `UnknownError`,
   `NotSupportedError`; other errors propagate), else memory (Safari Lockdown Mode). Before
   creating anything it refuses the pre-reset engine's data (`minnowdb/<name>` in OPFS, or an
-  IndexedDB database of the old engine's stores under the bare name) with `LegacyDataError`, and
+  IndexedDB database of the old engine's stores under the bare name) with `LegacyDataError`
+  (`MINNOW_LEGACY_DATA`): written by Minnow 0.x; 1.0 does not open it. There is no converter.
+  Use a new name or explicitly delete the old database. The first released 1.0 format starts
+  the new supported upgrade/fixture chain; unreleased next/ formats are not predecessors.
+  The legacy OPFS probe runs even without sync handles. Native IDB inspection never upgrades
+  the source, and native OPFS directory inspection precedes any writable handle. Refusal leaves
+  old bytes/schema untouched and creates no replacement database. Partial legacy trees are
+  refused even if only an acknowledgement file survives; direct native directories admit only
+  native file names and file kinds, never unknown contents. A blocked I1 native-open race keeps
+  `MINNOW_LEGACY_DATA` and its guidance while the old writer holds its connection. The chooser also
   refuses to open OPFS over this name's IndexedDB store (`StoreConflictError`). Layout
   `minnow-core/` and `minnow-core:<name>`.
 - A writer that interleaves many builders (the page format's group writer) passes a `budget` to

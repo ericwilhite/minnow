@@ -10,6 +10,32 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported rebuild registers durable group deletion bitmaps under the enclosing group-page
+version. Reads now refuse wrong lengths or nonzero unused bits with a typed corruption error.
+The registry completeness check independently inventories persistence calls and durable
+references. No stored-byte, version or public API change; canonical existing bitmaps remain readable.
+
+The unexported rebuild centralizes durable versions, codec tags and reserved-zero bits.
+Decoders refuse unsupported selectors with typed errors. Native root slots now carry a
+checksummed minimum-reader and manifest-format barrier, checked before owner epoch updates
+or OPFS file creation. An older reader therefore cannot fence a newer writer before refusing.
+This changes unreleased rebuild bytes only; the shipped0.x engine and its stored formats are
+unchanged. No supported next/ format has shipped; its upgrade chain starts at released1.0.
+Portable snapshot export/load is still a design, not an available API.
+
+The rebuild's 0.x refusal also covers partial OPFS trees, including a surviving
+`wal-acknowledgements` file. Unknown directory contents are refused before native file creation.
+An I1 writer that races native open and keeps its connection receives the same actionable
+`MINNOW_LEGACY_DATA` refusal. No public API or stored-format change; old bytes remain untouched.
+
+The planned 1.0 storage reset starts a fresh supported-format chain; there is no 0.x-to-1.0
+converter. The unexported rebuild refuses existing 0.x IndexedDB and OPFS databases with
+`LegacyDataError` (`MINNOW_LEGACY_DATA`) before changing old data or creating a replacement.
+This includes readable OPFS directories in contexts without sync handles. Use a new database
+name or explicitly delete the old database. The current 0.x engine and its compatibility
+readers are unchanged; future upgrade and frozen-fixture obligations for the new chain start
+with the first released 1.0 writer.
+
 The unexported rebuild's JSON and JSONB constructors now preserve PostgreSQL's float4/float8
 decimal spelling at rounding and exponent boundaries, including subnormals and signed zero.
 The ordinary path reuses proven native shortest digits; exact interval arithmetic remains for

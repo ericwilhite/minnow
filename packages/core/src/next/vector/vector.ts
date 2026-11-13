@@ -56,6 +56,7 @@
  * 6. Buffers handed to a helper worker are transferred, not shared: the sender gives up the
  *    ArrayBuffer (SharedArrayBuffer is never required).
  */
+import { DURABLE_CODECS } from "../durable-format.js";
 import { layoutOf, type Layout, type PhysicalType } from "../types.js";
 
 /** Most rows in a batch: keeps selections in Uint16Array and a narrow column in L1/L2. */
@@ -101,12 +102,7 @@ export interface WideCoefficients {
   readonly values: bigint[];
 }
 
-export const DecimalSpecial = {
-  finite: 0,
-  nan: 1,
-  positiveInfinity: 2,
-  negativeInfinity: 3,
-} as const;
+export const DecimalSpecial = DURABLE_CODECS.decimalSpecialTag;
 
 export type VectorData =
   | { readonly layout: "bool"; readonly values: Uint8Array }

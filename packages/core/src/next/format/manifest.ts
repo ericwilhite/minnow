@@ -67,6 +67,7 @@
  *   that obligation once `globalLsn` covers the DROP: an earlier catalog still needs the build.
  * - **Exactly once** (ledger.ts): `clients` holds the committed outcomes as of `globalLsn`.
  */
+import { DURABLE_CODECS, DURABLE_FORMATS } from "../durable-format.js";
 import type { ClientLedgerEntry } from "./ledger.js";
 import type { LogIncarnation } from "./log-frame.js";
 import type { ExtentList } from "../storage/extent-list.js";
@@ -79,7 +80,7 @@ export type { ColumnStatistics, StatValue };
  * 2: the root names its extent list (ruling R25, `extentList`). Roots of format 1 were written
  * only by development builds (no supported writer: DECISIONS.md "R25") and are refused.
  */
-export const MANIFEST_FORMAT_VERSION = 2;
+export const MANIFEST_FORMAT_VERSION = DURABLE_FORMATS.manifest.version;
 
 /**
  * Data-space addresses are the storage track's (storage/extents.ts, ruling R15.1): an `ExtentRef`
@@ -207,7 +208,8 @@ export interface GroupRef {
   /** Rows not marked in `deletions`. */
   readonly liveRowCount: number;
   readonly root: BlobRef;
-  /** Deletion bitmap over the group's row positions, or null when nothing is deleted. */
+  /** Raw LE u32 deletion words, inherited group-page version; exactly ceil(rowCount/32)*4
+   * bytes with unused tail bits zero. Null when nothing is deleted. */
   readonly deletions: BlobRef | null;
 }
 
@@ -234,22 +236,7 @@ export interface ColumnChunk {
   readonly distinctSketch: BlobRef | null;
 }
 
-export const PageEncoding = {
-  plain: 1,
-  constant: 2,
-  bitmap: 3,
-  /** Frame of reference + delta at u8/u16/u32 widths. */
-  frameOfReference: 4,
-  dictionary: 5,
-  /**
-   * float64 values that are exact decimals: frame-of-reference integers over 10^exponent, with
-   * the values that are not (−0, NaN, ±Infinity, subnormals, inexact decimals) patched in as
-   * their own 8 bytes (page/format.ts). Decodes bit-identically.
-   */
-  scaledFloat: 6,
-  /** Plain or dictionary, then gzip (only when it saves ≥2× on a page ≥16 KiB). */
-  gzip: 128,
-} as const;
+export const PageEncoding = DURABLE_CODECS.page;
 
 export interface PageEntry {
   /** Byte offset (relative to the start of the `ColumnChunk.data` blob) and length of the page. */
