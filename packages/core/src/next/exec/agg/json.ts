@@ -1,3 +1,4 @@
+import { SemanticStep } from "../semantic-step.js";
 import { JsonGroupRow } from "./json-group-row.js";
 import { JsonGroupKeys } from "./json-group-keys.js";
 import { JSON_VALUE_KINDS } from "../kernels/json-value.js";
@@ -112,6 +113,7 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
   readonly #controller = new AbortController();
   readonly #grants: SortGrants;
   readonly #ownGrant: Grant;
+  readonly #semanticStep: SemanticStep;
   readonly #files: SpillFiles;
   readonly #pages: PageWriter;
   readonly #directory: TapeDirectory;
@@ -151,6 +153,7 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
     this.#grants = new SortGrants(shared.grant, shared.loans);
     this.#ownGrant = this.#grants.fork(ownMinimum(rel), 0);
     this.pool = new Pool(new Charge(this.#ownGrant), ownMinimum(rel));
+    this.#semanticStep = new SemanticStep(this.pool, this.#ownGrant, this.#controller.signal);
     this.#files = new SpillFiles(shared.spill, shared.queryId, {
       allocate: () => false,
       free: () => {
@@ -192,6 +195,7 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
           this.#ownGrant,
           this.#controller.signal,
           () => this.pace(),
+          this.#semanticStep,
         )
       : null;
     this.#keys = new JsonGroupRow(
@@ -288,6 +292,7 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
   }
   sortContext(grant: Grant): SortContext {
     return {
+      semanticStep: this.#semanticStep,
       grant,
       spill: this.shared.spill,
       queryId: this.shared.queryId,
@@ -502,6 +507,7 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
           ? []
           : [this.#prefix.close(), this.#suffix.close(), this.#files.closeAll()]),
       ]);
+      await this.#semanticStep.close();
       this.#directory.detach();
       this.#pages.close();
       this.pool.free(14 * BATCH_ROWS + 4096);

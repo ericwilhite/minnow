@@ -18,6 +18,11 @@ page bounds and preserve snapshot visibility. Closing the write path keeps resid
 source buffers charged until existing read snapshots release them, including scans
 already in flight. No public API or stored-format change.
 
+The unexported rebuild shares one charged decoded-key pair across JSON aggregate grouping
+and internal sorts under memory pressure, rather than summing workspace across all keys
+and helpers. Wide literal grouping keys can now fit below the same memory cap. Ordinary
+sort caches remain available when admitted. No public API or stored-format change.
+
 The unexported window executor funds its initial peer flags from existing prepaid emit
 workspace, avoiding a below-cap refusal under competing memory grants. Shared window
 buffers count only their uncovered overflow bytes; native minima are unchanged.

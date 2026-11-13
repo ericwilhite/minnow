@@ -1,5 +1,5 @@
 /** A single input row needs no group-boundary comparison; sort preflight stays unchanged. */
-import type { Rel, ScalarExpr } from "../ir/ir.js";
+import type { Collation, Rel, ScalarExpr } from "../ir/ir.js";
 export function singleGroupInput(rel: Rel): boolean {
   switch (rel.op) {
     case "values":
@@ -24,6 +24,7 @@ export interface JsonGroupConsumer {
   readonly keys: readonly number[];
   readonly columns: readonly number[];
   readonly boundary: boolean;
+  readonly collations?: readonly Collation[];
 }
 export function jsonGroupConsumer(
   rel: Extract<Rel, { op: "aggregate" }>,
@@ -44,12 +45,20 @@ export function jsonGroupConsumer(
     const args = call.args.map(column);
     if (call.fn.includes("object")) {
       if (order.length && next++ === slot)
-        return { keys: order, columns: [...args, ...order], boundary: false };
+        return {
+          keys: order,
+          columns: [...args, ...order],
+          boundary: false,
+          collations: call.orderBy.map((k) => k.collation),
+        };
       // Object dedup sorts TEXT field names and ordinals, never structural input values.
       if ((call.fn === "jsonb_object_agg" || call.json?.unique) && next++ === slot) return null;
     } else if ((call.distinct || order.length) && next++ === slot)
       return {
         keys: call.distinct ? args.slice(0, 1) : order,
+        collations: call.distinct
+          ? [call.orderBy[0]?.collation ?? null]
+          : call.orderBy.map((k) => k.collation),
         columns: [...args, ...order],
         boundary: false,
       };

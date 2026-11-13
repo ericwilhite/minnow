@@ -619,15 +619,21 @@ JSON aggregate semantic grouping admission measures each grouping-key column ind
 from payload columns, including literal, owned-parameter, source and restored JSON fields.
 The 24-byte/JSONB-byte and 32-byte/array-byte decoded-key allowances apply to the two
 key operands, while unrelated payloads retain their ordinary row-copy reservation.
-These operands are reserved only for the active grouping/aggregate sort and boundary comparator,
-not for unrelated helper lanes or later delivery phases. A proven single input row needs
+Internal JSON aggregate sorts and the boundary comparator share one charged column-pair
+workspace. Comparisons decode at most two values of one key at a time, drop them before
+the next key, and release the workspace before downstream work. Ordinary admitted sort
+caches remain available; progress loans never become retained decoded caches. The host
+reserves the maximum pair once, not a sum over columns or helper lanes. Raw-row/page IO
+remains separately charged to each actual consumer, and later delivery phases do not
+inherit the decoded workspace. Ordinary-only grouping keeps its existing admission bound;
+encoded variable-key sorts and wide NUMERIC keep their existing compound IO envelope. A proven single input row needs
 no boundary comparator. Text, bytea and enum array boundaries compare bounded encoded
 element views instead of building another pair of decoded arrays; the grouping sort
 still funds its decoded operands. Numeric and interval arrays retain semantic comparison.
 Generated 10/16 MiB controls include 64 KiB literal JSONB keys, four distinct keys and
 wide stored JSONB/SQL-array keys while competing grants occupy all remaining credit.
 Separate 32 MiB histories add an aggregate ORDER BY using the same wide structural key:
-its second sort independently funds the decoded operands it actually consumes. Additional
+its second sort uses the same shared column-pair workspace when caches cannot fit. Additional
 32 MiB histories reoccupy credit after the aggregate cut and exercise outer structural
 ORDER BY and window keys. Window controls use 60–64 KiB JSONB /6–6.5 KiB array keys:
 larger structural window keys hit the pre-existing native peer-flag allocation failure
@@ -665,3 +671,12 @@ algorithm, repair the separate recycleLog hang, or change stored formats. Genera
 PGlite checks cover 1–8 wide JSONB columns, ASCII/UTF8, 1–8 rows at 16/64 MiB, admission
 cancellation, publication with invisible NULL rows, actual stored-root IO, and multiple
 JSON producers through EXCEPT. Paired main controls assert no peak increase.
+
+The step-peak generator covers 1–16 literal/computed grouping keys at 16 MiB, and stored
+JSONB/SQL-array shapes with 1–4 keys, bounded to 256 KiB total source-prefix bytes with
+metadata margin and at most 128 KiB key text per row (literal/computed key text retains 256 KiB).
+Stored histories with 64 KiB payloads use two equal-key rows to stay inside the supported
+source-prefix admission domain while preserving aggregate ORDER BY; tiny payloads retain 2–17 rows. Seeds, six histories per key/seed, and the four explicit examples stay fixed. The pinned six-wide-stored-JSONB case is explicitly
+skipped for the two 2026-11-13 source blockers in OPEN-ISSUES.md (B5 recycleLog; B2/B4 source
+admission), both independently reproduced on 477c3794. It must be re-enabled when those
+entries close. This does not claim storage-fold or source-admission correctness.

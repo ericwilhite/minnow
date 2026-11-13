@@ -34,6 +34,7 @@
  * loans cover one bounded step. `push` returns `blocked` while a run is written; `finish` awaits
  * downstream readiness. Without a spill the whole sort runs without an await.
  */
+import { semanticStepBytes, type SemanticStep } from "./semantic-step.js";
 import { RecordCheckpoint } from "./record-checkpoint.js";
 import type { Grant } from "../memory/governor.js";
 import { stringBytes } from "../memory/governor.js";
@@ -162,6 +163,9 @@ export interface GroupTopKSpec {
 export interface SortContext {
   /** Raw record recipe: no additional normalized byte-key payload in spill pages. */
   readonly valueComparison?: boolean;
+
+  /** Optional JSON-host workspace; decoded caches are ordinary, never required progress. */
+  readonly semanticStep?: SemanticStep;
   /** Spillable; the operator closes it when done or aborted. */
   readonly grant: Grant;
   readonly spill: SpillService;
@@ -421,6 +425,8 @@ class Sorter {
   readonly slice: Slice;
   /** Compare mode: most operand bytes of one written page (a merge input holds one). */
   #pageOperands = 0;
+  #stepCompare = false;
+  readonly #activeCursors: Set<Cursor> | null;
   /** A loan for operands of rows stored before compare mode (repaid after their run). */
   #operandLoan: { repay(): void } | null = null;
   /** Longest key bytes stored: within the prefix words no full comparison is needed. */
@@ -468,6 +474,7 @@ class Sorter {
     this.#keyStorage = this.mode === "keys";
     this.operands = emptyOperands(spec.types, spec.keys);
     this.decodes = needsOperands(spec.types, spec.keys);
+    this.#activeCursors = context.semanticStep && this.decodes ? new Set() : null;
     this.#partKeys = spec.keys.slice(0, spec.partition);
     this.#reservesCompaction =
       this.mode === "keys" &&
@@ -506,7 +513,7 @@ class Sorter {
     this.io.onFlush = (staging) => {
       const columns = staging.vectors();
       this.#observePageKeys(columns, staging.rows);
-      if (this.mode !== "keys" && this.decodes) {
+      if (this.mode !== "keys" && this.decodes && !context.semanticStep) {
         const bytes = operandBytes(spec.types, spec.keys, columns, 0, staging.rows);
         this.#pageOperands = Math.max(this.#pageOperands, bytes);
       }
@@ -1179,6 +1186,16 @@ class Sorter {
         y.offsets[j + 1] ?? 0,
       );
     }
+    if (this.#stepCompare)
+      return this.#semanticStep().compare(
+        this,
+        this.spec.types,
+        this.spec.keys,
+        chunkColumns(store, a >>> store.chunkShift),
+        a & store.chunkMask,
+        chunkColumns(store, b >>> store.chunkShift),
+        b & store.chunkMask,
+      );
     return compareRows(
       this.spec.types,
       this.spec.keys,
@@ -1206,7 +1223,11 @@ class Sorter {
    * operands (a decode's cost is its bytes), the deadline checked after each.
    */
   *#decodeStoreJob(slice: Slice): SlicedJob<number> {
-    if (this.mode !== "compare" || !this.decodes) return 0;
+    if (this.mode !== "compare" || !this.decodes || this.#stepCompare) return 0;
+    if (this.context.semanticStep && this.context.grant.loaned > 0) {
+      this.#useSemanticStep();
+      return 0;
+    }
     const store = this.store;
     const operands = this.operands;
     const { types, keys } = this.spec;
@@ -1227,11 +1248,60 @@ class Sorter {
         for (let row = from; row < to && needed === 0; row++)
           needed = decodeOperands(types, keys, columns, row, row + 1, this.charge, operands);
       }
-      if (needed > 0) return needed;
+      if (needed > 0) {
+        if (this.context.semanticStep) {
+          this.#useSemanticStep();
+          return 0;
+        }
+        return needed;
+      }
       if (slice.due()) yield;
     }
     if (operands.bytes > this.profile.operandBytes) this.profile.operandBytes = operands.bytes;
     return 0;
+  }
+
+  #semanticStep(): SemanticStep {
+    const step = this.context.semanticStep;
+    if (!step) throw new Error("Missing semantic comparison workspace");
+    return step;
+  }
+
+  #useSemanticStep(): void {
+    this.#stepCompare = true;
+    dropOperands(this.operands, this.charge);
+    for (const cursor of this.#activeCursors ?? []) dropOperands(cursor.operands, this.pool);
+  }
+
+  #residentSemanticPeak(): number {
+    let peak = 0;
+    for (let row = 0; row < this.store.rows;) {
+      const count = Math.min(this.store.chunkRows, this.store.rows - row);
+      peak = Math.max(
+        peak,
+        semanticStepBytes(
+          this.spec.types,
+          this.spec.keys,
+          chunkColumns(this.store, row >>> this.store.chunkShift),
+          0,
+          count,
+        ),
+      );
+      row += count;
+    }
+    return peak;
+  }
+
+  async #primeMergeStep(cursors: readonly Cursor[]): Promise<void> {
+    if (!this.#stepCompare || cursors.length < 2) return;
+    let peak = 0;
+    for (const cursor of cursors)
+      peak = Math.max(
+        peak,
+        semanticStepBytes(this.spec.types, this.spec.keys, cursor.columns, cursor.pos, cursor.rows),
+      );
+    await this.#semanticStep().prepare(this, peak);
+    this.checkAborted();
   }
 
   /** Bytes the resident rows' missing operands would charge. */
@@ -1471,7 +1541,7 @@ class Sorter {
       for (const column of columns) views.push(sortRowView(column, row));
       for (const column of tail) views.push(sortRowView(column, key));
       this.#observePageKeys(views, 1);
-      if (this.mode !== "keys" && this.decodes)
+      if (this.mode !== "keys" && this.decodes && !this.context.semanticStep)
         this.#pageOperands = Math.max(
           this.#pageOperands,
           operandBytes(this.spec.types, this.spec.keys, views, 0, 1),
@@ -1591,8 +1661,16 @@ class Sorter {
       this.#toCompare();
     }
     if ((yield* this.#decodeStoreJob(slice)) > 0) return null;
-    yield* mergeSortJob(ids, temp, (a, b) => this.compareIds(a, b), slice);
-    return ids;
+    try {
+      if (this.#stepCompare && n > 1) {
+        yield this.#semanticStep().prepare(this, this.#residentSemanticPeak());
+        this.checkAborted();
+      }
+      yield* mergeSortJob(ids, temp, (a, b) => this.compareIds(a, b), slice);
+      return ids;
+    } finally {
+      this.context.semanticStep?.release(this);
+    }
   }
 
   /**
@@ -1600,6 +1678,8 @@ class Sorter {
    * ranks or their decoded strings do not fit (compare mode then). Sliced like the sort.
    */
   *#rankOrder(slice: Slice): SlicedJob<((a: number, b: number) => number) | null> {
+    // Internal semantic consumers may cache ranks only from ordinary credit too.
+    if (this.context.semanticStep && this.context.grant.loaned > 0) return null;
     const store = this.store;
     const n = store.rows;
     const ranks: Array<Int32Array | null> = [];
@@ -1881,7 +1961,11 @@ class Sorter {
           pos: 0,
         };
         cursors.push(cursor);
-        if (!(await this.#nextPage(cursor, types))) cursors.pop();
+        this.#activeCursors?.add(cursor);
+        if (!(await this.#nextPage(cursor, types))) {
+          cursors.pop();
+          this.#activeCursors?.delete(cursor);
+        }
       }
       const heap = cursors.slice();
       const less = (a: Cursor, b: Cursor) => this.#compareCursors(a, a.pos, b, b.pos) < 0;
@@ -1900,6 +1984,7 @@ class Sorter {
           i = m;
         }
       };
+      if (this.#stepCompare) await this.#primeMergeStep(heap);
       for (let i = (heap.length >> 1) - 1; i >= 0; i--) sift(i);
       while (heap.length > 0) {
         this.checkAborted();
@@ -1912,6 +1997,7 @@ class Sorter {
         let end = top.pos + 1;
         if (next === null) end = top.rows;
         else while (end < top.rows && this.#compareCursors(top, end, next, next.pos) <= 0) end++;
+        this.context.semanticStep?.release(this);
         yield {
           kind: "page",
           columns: top.columns,
@@ -1927,10 +2013,15 @@ class Sorter {
           const last = heap.pop();
           if (last !== undefined && last !== top) heap[0] = last;
         }
+        if (this.#stepCompare) await this.#primeMergeStep(heap);
         if (heap.length > 0) sift(0);
       }
     } finally {
-      for (const cursor of cursors) this.#releaseCursor(cursor);
+      this.context.semanticStep?.release(this);
+      for (const cursor of cursors) {
+        this.#releaseCursor(cursor);
+        this.#activeCursors?.delete(cursor);
+      }
     }
   }
 
@@ -1959,7 +2050,9 @@ class Sorter {
       cursor.rows = decoded.rows;
       cursor.pos = 0;
       if (cursor.rows === 0) continue;
-      if (this.mode === "keys" || !this.decodes) return true;
+      if (this.context.semanticStep && (this.context.grant.loaned > 0 || this.pool.owes))
+        this.#useSemanticStep();
+      if (this.mode === "keys" || !this.decodes || this.#stepCompare) return true;
       const { types: values, keys } = this.spec;
       const needed = decodeOperands(
         values,
@@ -1971,6 +2064,10 @@ class Sorter {
         cursor.operands,
       );
       if (needed === 0) return true;
+      if (this.context.semanticStep) {
+        this.#useSemanticStep();
+        return true;
+      }
       if (retried) throw new RangeError("A spill page's sort operands could not be decoded");
       retried = true;
       const step = held.charged + needed;
@@ -1981,7 +2078,17 @@ class Sorter {
   }
 
   #compareCursors(a: Cursor, i: number, b: Cursor, j: number): number {
-    if (this.mode !== "keys")
+    if (this.mode !== "keys") {
+      if (this.#stepCompare)
+        return this.#semanticStep().compare(
+          this,
+          this.spec.types,
+          this.spec.keys,
+          a.columns,
+          i,
+          b.columns,
+          j,
+        );
       return compareRows(
         this.spec.types,
         this.spec.keys,
@@ -1992,6 +2099,7 @@ class Sorter {
         a.operands,
         b.operands,
       );
+    }
     for (let w = 0; w < PREFIX_WORDS; w++) {
       const x = int32At(a.columns[this.prefixColumn + w], i) >>> 0;
       const y = int32At(b.columns[this.prefixColumn + w], j) >>> 0;
@@ -2083,6 +2191,7 @@ class Sorter {
     }
     if (this.#closed) return;
     this.#closed = true;
+    this.context.semanticStep?.release(this);
     this.store.close();
     this.encoder?.close(this.pool);
     this.directEncoder?.close(this.pool);
@@ -2448,8 +2557,11 @@ class GeneralSortOperator implements Operator {
   #working: Promise<void> | null = null;
   #reclaiming: Promise<void> | null = null;
   #finishing = false;
+  #draining: Promise<void> | null = null;
 
   constructor(spec: SortSpec, context: SortContext, downstream: Operator) {
+    if (context.semanticStep && (spec.limit !== null || spec.offset !== 0 || spec.withTies))
+      throw new Error("Shared semantic workspace requires an unbounded internal JSON sort");
     this.spec = spec;
     const keep = spec.limit === null ? null : spec.offset + spec.limit;
     this.#sorter = new Sorter(
@@ -2498,7 +2610,7 @@ class GeneralSortOperator implements Operator {
   }
 
   get closed(): Promise<void> {
-    return this.#sorter.closed;
+    return this.#draining ?? this.#sorter.closed;
   }
 
   push(batch: Batch, transfer?: Transfer): PushResult {
@@ -2570,8 +2682,19 @@ class GeneralSortOperator implements Operator {
         await this.#emitter.downstream.finish();
       }, fail);
     };
-    if (isPromise(resident)) return resident.then(after, fail);
-    return after(resident);
+    const result = isPromise(resident) ? resident.then(after, fail) : after(resident);
+    if (!this.#sorter.context.semanticStep || !isPromise(result)) return result;
+    const work = result;
+    this.#working = work;
+    void work.then(
+      () => {
+        if (this.#working === work) this.#working = null;
+      },
+      () => {
+        if (this.#working === work) this.#working = null;
+      },
+    );
+    return work;
   }
 
   /**
@@ -2669,6 +2792,19 @@ class GeneralSortOperator implements Operator {
   }
 
   abort(reason: unknown): void {
+    if (this.#sorter.context.semanticStep) {
+      this.#sorter.cancel(reason);
+      this.#done = true;
+      this.#draining ??= (async () => {
+        await this.#working?.catch(() => undefined);
+        await this.#reclaiming?.catch(() => undefined);
+        this.#emitter.close();
+        this.#sorter.close();
+        await this.#sorter.closed;
+      })();
+      void this.#draining.catch(() => undefined);
+      return;
+    }
     this.#sorter.abort(reason);
     if (!this.#done) {
       this.#done = true;

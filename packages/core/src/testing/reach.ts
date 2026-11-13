@@ -5567,3 +5567,41 @@ export const SOURCE_MIDSCAN_REACH = [
   "exact PostgreSQL rows",
   "zero query resources",
 ] as const;
+
+/** Each fixed key-count cell generates independent widths/payloads and real pressure. */
+export const JSON_GROUP_STEP_REACH = [
+  "sixteen MiB cap",
+  "all competing credit occupied",
+  "exact PostgreSQL text",
+  "wide payload",
+  "tiny payload",
+  "UTF8",
+  "ASCII",
+  "FILTER",
+  "unfiltered",
+  "SQL NULL key",
+  "nonnull keys",
+  "multiple inputs",
+  "observed spill",
+  "zero resources",
+] as const;
+
+/** Every literal/computed key count is a permanent step-peak generator dimension. */
+export const JSON_GROUP_STEP_COUNTS_REACH = [
+  "keys 1",
+  "keys 2",
+  "keys 3",
+  "keys 4",
+  "keys 5",
+  "keys 6",
+  "keys 7",
+  "keys 8",
+  "keys 9",
+  "keys 10",
+  "keys 11",
+  "keys 12",
+  "keys 13",
+  "keys 14",
+  "keys 15",
+  "keys 16",
+] as const;

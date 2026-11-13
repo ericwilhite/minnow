@@ -6,7 +6,8 @@ import type { Vector, FlatVector } from "../../vector/vector.js";
 import { ColumnStore } from "../column-store.js";
 import { JsonRecords } from "../json-records.js";
 import type { Pool, SpillIo } from "../spill-pool.js";
-import { operandBytes, type SortColumn } from "../sort-keys.js";
+import type { SortColumn } from "../sort-keys.js";
+import { semanticStepBytes } from "../semantic-step.js";
 
 const RESIDENT_BYTES = 64 << 10;
 const IO_BYTES = 512 << 10;
@@ -49,7 +50,7 @@ export class JsonGroupRow {
     }
     this.#resident.reset(true);
     this.pool.settle();
-    this.#operandBytes = operandBytes(this.types, this.order, columns, row, row + 1);
+    this.#operandBytes = semanticStepBytes(this.types, this.order, columns, row, row + 1) / 2;
     if (this.#resident.appendNeed(columns, row) <= RESIDENT_BYTES) {
       // The fixed aggregate workspace funds this bounded state, never a loan.
       if (this.#resident.append(columns, null, row, 1) !== 1)
