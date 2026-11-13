@@ -419,3 +419,10 @@ The receiving result sink also uses exact varlen growth for a one-row copied fra
 Rounding that payload to the entire byte window would leave no room for its separately
 charged offsets and frame metadata, forcing an unnecessary progress loan under a pinned
 competitor. Multi-row frame sizing and complete admission envelopes are unchanged.
+
+After each pressure prefix reaches downstream readiness, its dead assembler payloads
+and vector references are retired. A later funded full batch therefore allocates its
+payload without overlapping a smaller stale pressure arena. Fixed compiler buffers
+remain admitted, borrowed source values are untouched, and ordinary batch reuse is
+unchanged. The two-batch peak generator checks this boundary against the fitting normal
+path, including partial pressure followed by an ordinary batch.

@@ -216,6 +216,10 @@ export class ProjectOperator implements Operator {
         const rows = (batch.selection?.rows ?? IDENTITY).subarray(start, start + count);
         const result = this.#push({ ...batch, selection: { rows, count } });
         if (result === "blocked") await this.#hold.ready(this.downstream);
+        // Retire only expired outputs. Otherwise a small pressure arena overlaps a
+        // following full batch's replacement, exceeding the normal fitting peak.
+        this.#columns.length = 0;
+        arena.retireVarlen();
         start += count;
         if (this.#slice.due()) {
           await yieldTask();

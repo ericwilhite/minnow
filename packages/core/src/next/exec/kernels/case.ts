@@ -28,6 +28,7 @@ import {
 } from "./vectors.js";
 
 const TRUE = 1;
+const EMPTY = new Uint8Array(0);
 /** "No part" in the row-owner map (Uint16Array: more than 255 branches are fine). */
 const NONE = 0xffff;
 
@@ -43,13 +44,19 @@ interface Part {
 class Parts {
   readonly list: Part[] = [];
   readonly #pool: Part[];
+  readonly #empty: Vector;
   constructor(size: number, type: PhysicalType) {
     const empty = nullConstant(type);
+    this.#empty = empty;
     const rows: Selection = { rows: IDENTITY, count: 0 };
     this.#pool = Array.from({ length: size }, () => ({ vector: empty, rows }));
   }
   reset(): void {
     this.list.length = 0;
+  }
+  retire(): void {
+    this.reset();
+    for (const part of this.#pool) part.vector = this.#empty;
   }
   push(vector: Vector, rows: Selection): void {
     const part = this.#pool[this.list.length];
@@ -92,7 +99,7 @@ class Assembler {
   #int64: FlatVector | null = null;
   readonly #validity: Uint32Array;
   readonly #owner: Uint16Array;
-  #bytes: Uint8Array = new Uint8Array(0);
+  #bytes: Uint8Array = EMPTY;
   readonly #offsets: Int32Array | null = null;
   readonly #scales: Uint16Array | null = null;
   readonly #safe: Float64Array | null = null;
@@ -110,6 +117,11 @@ class Assembler {
     arena.take(2 * capacity);
     this.#owner = new Uint16Array(capacity);
     if (this.#layout === "varlen") {
+      arena.onVarlenRetire(() => {
+        const size = this.#bytes.length;
+        this.#bytes = EMPTY;
+        if (size > 0) arena.give(size);
+      });
       arena.take(4 * (capacity + 1));
       this.#offsets = new Int32Array(capacity + 1);
     } else if (this.#layout === "decimal") {
@@ -403,6 +415,7 @@ class CaseNode implements Compiled {
   ) {
     if (branches.length >= NONE) throw new TypeError("too many CASE branches");
     this.#parts = new Parts(branches.length + 1, type);
+    arena.onVarlenRetire(() => this.#parts.retire());
     this.#assembler = new Assembler(type, arena);
     this.#taken = branches.map(() => selection(arena));
     this.#a = selection(arena);
@@ -453,6 +466,7 @@ class CoalesceNode implements Compiled {
   ) {
     if (args.length >= NONE) throw new TypeError("too many COALESCE arguments");
     this.#parts = new Parts(args.length, type);
+    arena.onVarlenRetire(() => this.#parts.retire());
     this.#assembler = new Assembler(type, arena);
     this.#kept = args.map(() => selection(arena));
     this.#a = selection(arena);

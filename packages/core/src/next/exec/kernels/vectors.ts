@@ -56,6 +56,7 @@ export function validAt(validity: Validity | null, row: number): boolean {
 /** Output buffers of compiled expressions, charged to one grant and freed together. */
 export class OutputArena {
   #charged = 0;
+  readonly #retire: Array<() => void> = [];
   constructor(
     readonly charge: ByteCharge,
     readonly capacity: number,
@@ -103,7 +104,19 @@ export class OutputArena {
     return this.#charged;
   }
 
+  /** Registered by variable assemblers, not borrowed source buffers. */
+  onVarlenRetire(retire: () => void): void {
+    this.#retire.push(retire);
+  }
+
+  /** Only after downstream readiness: all previous output vectors have expired. */
+  retireVarlen(): void {
+    for (const retire of this.#retire) retire();
+  }
+
   close(): void {
+    this.retireVarlen();
+    this.#retire.length = 0;
     if (this.#charged > 0) this.charge.free(this.#charged);
     this.#charged = 0;
   }

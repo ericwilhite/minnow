@@ -5554,3 +5554,9 @@ export const PROJECTION_SPLIT_REACH = [
   "cancel wait",
   "error once",
 ] as const;
+
+export const PROJECTION_PEAK_REACH = [
+  "partial first",
+  "ordinary second",
+  "no peak increase",
+] as const;

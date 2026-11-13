@@ -12,10 +12,10 @@
   "maxQueryPeakSaving": 39588600,
   "success": true,
   "candidateSourceHashes": {
-    "exec/filter.ts": "b24ab872b9548d7e5f0e28eda615af9f399ae6bc4a8941a5298e0fa287e2b3d4",
-    "exec/projection-step.ts": "8a06e0eecf282f1e1a3a63151aac42d8ffa75726df1625e17cd0f2361802857d",
-    "exec/kernels/case.ts": "523d16e62379104a5f4eb5acb8822cc8e853a07b6338cbf7e6460d48752d03e5",
-    "exec/kernels/vectors.ts": "146164ca7887b8452e7fb1023072cb36e6a9919d4a74909011f64da54ab445d0",
+    "exec/filter.ts": "c7f5a16d731971e6e9e8aca160d2e65a93e8ca7242b330e59f5a3ec045dd4279",
+    "exec/projection-step.ts": "423c932d61f086934e01cce6be5c8c21fa4b03cabc4b0f8323316999803c176b",
+    "exec/kernels/case.ts": "c8f02ecb45a6ec91c2c4c778458e2136901a657ed63bb65484083af6d5d5e614",
+    "exec/kernels/vectors.ts": "2f6e29dab5c8edd9f4273ec80410e358aa2b4f1bb82818f6668e2a088c5a04e3",
     "exec/plan.ts": "5f7637887d03709a4dd9e145d46802a179bde9807972eaf33231beb990298fa1",
     "exec/result-sink.ts": "8ba40eb44eeb404ba42f73d2acb1105026ccdae86986f21809206ea51195683f"
   },
@@ -27,5 +27,6 @@
   "clock": "Deterministic shared task clock for equal batching; no CPU/timing claim.",
   "reproduce": "TMPDIR=<cache-dir> node node_modules/vite-node/dist/cli.mjs --script <cache-dir>/compare-{parent,candidate}.mts; python <cache-dir>/compare-peaks.py",
   "artifacts": "/home/eric/.cache/b4-projection/",
-  "limits": "151 common successes compared; adaptive competitor total peaks excluded per existing lead waiver. 48 cap-minimum refusals and 14 hash-transition errors remain. All 14 hash-transition errors are identical on actual main. No CPU/browser/RSS or new producer support claim."
+  "limits": "151 common successes compared; adaptive competitor total peaks excluded per existing lead waiver. 48 cap-minimum refusals and 14 hash-transition errors remain. All 14 hash-transition errors are identical on actual main. No CPU/browser/RSS or new producer support claim.",
+  "twoBatchPeakLaw": "Generated operator law: partial first batch followed by a funded full batch must not exceed normal fitting allocation. Retire expired assembler payloads at downstream readiness. Seeds47029/47030,12runs each. Parent/e037 RED96608>64472 and59864>40040 bytes; GREEN no increase."
 }

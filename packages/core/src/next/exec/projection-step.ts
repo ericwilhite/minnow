@@ -32,6 +32,13 @@ export function projectionStep(exprs: readonly ScalarExpr[], params: ParameterSl
     e.op === "literal" ? e.value : e.op === "param" ? params.slots[e.slot] : undefined;
   const visit = (e: ScalarExpr): Bound | null => {
     if (layoutOf(e.type) === "varlen" && !variable(e)) return null;
+    // These selectors may lazily promote a full fixed-width/coefficient buffer.
+    // Their separate fixed-tier admission is not proved by a varlen-payload bound.
+    if (
+      (e.op === "case" || (e.op === "call" && ["coalesce", "nullif"].includes(e.fn))) &&
+      ["int64", "decimal", "interval"].includes(layoutOf(e.type))
+    )
+      return null;
     let children: readonly ScalarExpr[];
     switch (e.op) {
       case "column":
