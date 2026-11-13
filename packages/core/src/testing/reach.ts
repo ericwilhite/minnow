@@ -5575,3 +5575,10 @@ export const EXPRESSION_ERROR_REACH = [
   "overflow first",
   "lazy COALESCE CASE",
 ] as const;
+
+export const EXPRESSION_FENCE_REACH = [
+  "join key",
+  "sort key",
+  "cancelled suspension",
+  "cleanup zero",
+] as const;

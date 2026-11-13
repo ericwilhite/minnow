@@ -104,6 +104,7 @@ import {
 import { compileExpr, type CompileContext, type CallResolver } from "./kernels/compile.js";
 import { bindCall } from "./kernels/bindings.js";
 import { OutputArena, isValidSlot, slotOf } from "./kernels/vectors.js";
+import { ReservedGrant } from "./admission.js";
 import { LimitOperator } from "./limit.js";
 import { nullParameter, integerParameterBytes } from "./parameters.js";
 import { drive, isPromise, type BatchSource, type Operator } from "./pipeline.js";
@@ -174,11 +175,15 @@ function columns(input: readonly PhysicalType[]): ScalarExpr[] {
 class Resources {
   readonly arena: OutputArena;
   #closed = false;
+  #closing: Promise<void> | undefined;
+  readonly #releaseClose: (() => void) | undefined;
+  readonly operators: Array<{ readonly closed: MaybePromise<void> }> = [];
   constructor(
     readonly grant: Grant,
     capacity: number,
   ) {
-    // Breakers own their grant and may close it in finish/abort before the kernel arena closes.
+    // Native breaker's close must not retire still-borrowed compiler buffers.
+    this.#releaseClose = grant instanceof ReservedGrant ? grant.holdClose() : undefined;
     this.arena = new OutputArena(
       {
         allocate: (bytes) => grant.allocate(bytes),
@@ -189,11 +194,27 @@ class Resources {
       capacity,
     );
   }
-  close(): void {
-    if (this.#closed) return;
+  close(): MaybePromise<void> {
+    if (this.#closed) return this.#closing;
     this.#closed = true;
-    this.arena.close();
-    this.grant.close();
+    const waiting: Array<Promise<void>> = [];
+    for (const operator of this.operators) {
+      const closed = operator.closed;
+      if (isPromise(closed)) waiting.push(closed);
+    }
+    this.operators.length = 0;
+    const release = () => {
+      try {
+        this.arena.close();
+      } finally {
+        this.#releaseClose?.();
+        this.grant.close();
+      }
+    };
+    // Inactive helpers stay synchronous. A cancelled driver may leave a helper at a
+    // task yield: its input borrow must finish BEFORE this arena/grant is retired.
+    if (waiting.length) return (this.#closing = Promise.allSettled(waiting).then(release));
+    release();
   }
 }
 
@@ -289,6 +310,10 @@ function instantiate<T>(
           const value = setup(
             {
               arena: resources.arena,
+              ownOperator: (operator) => {
+                resources.operators.push(operator);
+                runtime.onAbort((reason) => operator.abort(reason));
+              },
               params: runtime.params,
               input,
               ...(runtime.resolveCall === undefined ? {} : { resolveCall: runtime.resolveCall }),
@@ -1330,8 +1355,6 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 : setup(context, counted(runtime, rel, downstream), runtime, grant),
             (operator) => {
               runtime.onAbort((reason) => operator.abort(reason));
-              if (operator instanceof ProjectOperator || operator instanceof FilterOperator)
-                runtime.dispose(() => operator.closed);
               const childStops =
                 operator instanceof LimitOperator ? [...stops, () => operator.done] : stops;
               return childStops.some((stop) => stop())

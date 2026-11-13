@@ -102,7 +102,7 @@ export class QueryRuntime {
   }
   /** Nested recipes retire their own readers/operators before returning native credit.
    * The snapshot pin belongs to Execution and is deliberately outside these scopes. */
-  resource<T>(body: () => MaybePromise<T>, release: () => void): MaybePromise<T> {
+  resource<T>(body: () => MaybePromise<T>, release: () => MaybePromise<void>): MaybePromise<T> {
     const scope: ResourcePhase | null = this.#phaseCapable
       ? { parent: this.#scope, jobs: [], aborters: [] }
       : null;
@@ -110,10 +110,7 @@ export class QueryRuntime {
     let failed = false,
       reason: unknown;
     const finish = (): MaybePromise<void> => {
-      if (!scope) {
-        release();
-        return;
-      }
+      if (!scope) return release();
       if (this.#scope !== scope) throw new Error("Producer scopes overlapped");
       this.#scope = scope.parent;
       const errors: unknown[] = [];
@@ -144,8 +141,11 @@ export class QueryRuntime {
           }
         }
         scope.aborters.length = 0;
-        release();
-        if (errors.length) throw new AggregateError(errors, "Producer phase cleanup failed");
+        const retired = release();
+        const report = () => {
+          if (errors.length) throw new AggregateError(errors, "Producer phase cleanup failed");
+        };
+        return retired instanceof Promise ? retired.then(report) : report();
       };
       return drain(0);
     };

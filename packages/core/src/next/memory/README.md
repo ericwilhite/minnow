@@ -421,6 +421,13 @@ selectors. Other variable producers retain their operator-specific protocols (JS
 its own pressure handoff). An expanding producer needs a proof for its smallest step;
 otherwise checkpoint evaluated values and release pins before atomic re-admission.
 
+All compiled expression operators, including internal sort/join key helpers and
+recursive steps, register with their recipe owner. Cleanup waits for pending expression
+borrows even when the plan has no pressure phases. While the compiler arena exists,
+its reserved account defers a native breaker's close; after every borrow ends, the arena
+releases its buffers and the owner releases that close hold. This adds no credit or loan.
+An inactive helper returns no promise, preserving synchronous ordinary completion.
+
 The receiving result sink also uses exact varlen growth for a one-row copied frame.
 Rounding that payload to the entire byte window would leave no room for its separately
 charged offsets and frame metadata, forcing an unnecessary progress loan under a pinned

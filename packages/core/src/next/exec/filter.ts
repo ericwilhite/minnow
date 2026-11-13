@@ -108,6 +108,7 @@ export class FilterOperator implements Operator {
     readonly downstream: Operator,
   ) {
     this.#predicate = new Predicate(predicate, context);
+    context.ownOperator?.(this);
   }
   push(batch: Batch, transfer?: Transfer): PushResult {
     this.#pending = null;
@@ -164,6 +165,7 @@ export class FilterOperator implements Operator {
     return this.downstream.finish();
   }
   abort(reason: unknown): void {
+    if (this.#aborted) return;
     this.#aborted = true;
     this.#reason = reason;
     this.#hold.abort();
@@ -206,6 +208,7 @@ export class ProjectOperator implements Operator {
     this.#exprs = exprs.map((expr) => compileExpr(expr, context));
     this.#columns = new Array<Vector>(exprs.length);
     this.types = this.#exprs.map((expr) => expr.type);
+    context.ownOperator?.(this);
   }
   readonly #context: CompileContext;
   get reclassifiesTransfers(): boolean {
@@ -339,6 +342,7 @@ export class ProjectOperator implements Operator {
     return this.downstream.finish();
   }
   abort(reason: unknown): void {
+    if (this.#aborted) return;
     this.#aborted = true;
     this.#reason = reason;
     this.#hold.abort();
