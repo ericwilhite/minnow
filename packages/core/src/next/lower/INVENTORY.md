@@ -670,7 +670,8 @@ the complete physical group's row count, not the shorter visible prefix.
 This fallback does not run for already-fitting plans. Multi-chunk or mixed live sources
 retain their previous conservative publication envelope; this change does not add a
 source checkpoint/re-admission protocol. It does not change the writer's publication
-algorithm, repair the separate recycleLog hang, or change stored formats. Generated
+algorithm or stored formats. The independently fixed recycleLog regression remains
+covered by the wide-row storage suite. Generated
 PGlite checks cover 1–8 wide JSONB columns, ASCII/UTF8, 1–8 rows at 16/64 MiB, admission
 cancellation, publication with invisible NULL rows, actual stored-root IO, and multiple
 JSON producers through EXCEPT. Paired main controls assert no peak increase.
@@ -679,10 +680,10 @@ The step-peak generator covers 1–16 literal/computed grouping keys at 16 MiB, 
 JSONB/SQL-array shapes with 1–4 keys, bounded to 256 KiB total source-prefix bytes with
 metadata margin and at most 128 KiB key text per row (literal/computed key text retains 256 KiB).
 Stored histories with 64 KiB payloads use two equal-key rows to stay inside the supported
-source-prefix admission domain while preserving aggregate ORDER BY; tiny payloads retain 2–17 rows. Seeds, six histories per key/seed, and the four explicit examples stay fixed. The pinned six-wide-stored-JSONB case is explicitly
-skipped for the two 2026-11-13 source blockers in OPEN-ISSUES.md (B5 recycleLog; B2/B4 source
-admission), both independently reproduced on 477c3794. It must be re-enabled when those
-entries close. This does not claim storage-fold or source-admission correctness.
+source-prefix admission domain while preserving aggregate ORDER BY; tiny payloads retain 2–17 rows. Seeds, six histories per key/seed, and the four explicit examples stay fixed. The pinned six-wide-stored-JSONB case now runs at 16 MiB: the recycleLog and source
+admission blockers reproduced on 477c3794 are fixed on integrated main. This keeps the
+original stored regression alongside the broader bounded generator, without claiming
+universal storage-fold or source-admission correctness.
 
 Known admission limit: a single large nested JSONB literal grouping key can still
 over-reserve fixed/helper workspace at a 16 MiB cap, even though its decoded pair

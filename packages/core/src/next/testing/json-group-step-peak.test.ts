@@ -113,10 +113,9 @@ describe.each(seedsFor("next-json-group-step-peak", [0xb740, 0xb741]))(
   },
 );
 
-// OPEN-ISSUES.md, "2026-11-13: found by B6's step-peak sweep": B5's
-// recycleLog loop, then B2/B4's source admission. Re-enable this exact history
-// when those entries close. The general stored sweep retains 1..4 wide keys.
-it.skip("known source blocker: six wide stored JSONB keys at 16MiB", async () => {
+// The former recycleLog/source-admission blockers are fixed on integrated main.
+// Keep their original six-wide stored shape as a permanent 16 MiB regression.
+it("groups six wide stored JSONB keys at 16MiB", async () => {
   const campaign = new JsonCampaign(),
     history = await campaign.history(16 << 20);
   try {

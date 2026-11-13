@@ -2665,7 +2665,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     }
   }
 
-  /** Both close and a refused open release native owners and state pins before their grants.
+  /** A refused open has no caller-owned readers: release native owners before their grants.
+   * Normal close instead defers resident ownership until existing read pins release.
    * This does not touch the appender or publish: open may fail before either is ready. */
   #releaseOwned(): void {
     this.keys.close();

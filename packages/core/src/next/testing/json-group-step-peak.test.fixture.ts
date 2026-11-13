@@ -28,7 +28,7 @@ export interface StepCase {
   readonly unicode: boolean;
   readonly filter: boolean;
   readonly nullKey: boolean;
-  /** Exact known-blocker reproduction overrides only its diagnostic key-text total. */
+  /** Pinned stored regression overrides only its diagnostic key-text total. */
   readonly storedKeyBudget?: number;
 }
 export async function retireStepHistories(): Promise<void> {
