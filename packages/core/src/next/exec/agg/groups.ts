@@ -948,11 +948,12 @@ export class ByteArena {
   #growthPeak = Infinity;
   growthBytes(groups: number, bytes: number): number {
     const current = this.bytes.length;
-    // This arena holds only its current buffer and one replacement. Count that pair
-    // once. A large exact jump followed by a tiny key must not request an unrelated
-    // 4x replacement beyond the funded pair. Other columns keep their own envelope.
-    this.#growthPeak = bytes > current ? arrayGrowth(current, Math.max(4096, bytes), 1) : current;
-    return arrayGrowth(this.starts.length, groups + 1, 4) + this.#growthPeak - current;
+    const growth = bytes > current ? arrayGrowth(current, Math.max(4096, bytes), 1) : 0;
+    // The caller already counts current in workspace.used. New headroom covers one
+    // replacement at a time; speculative 4x jumps must stay inside that pair peak.
+    // Keep each column's envelope separate, including across multiple resizes.
+    this.#growthPeak = current + growth;
+    return arrayGrowth(this.starts.length, groups + 1, 4) + growth;
   }
   finishGrowth(): void {
     this.#growthPeak = Infinity;

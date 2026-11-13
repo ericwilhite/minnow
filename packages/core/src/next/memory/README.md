@@ -443,7 +443,8 @@ path, including partial pressure followed by an ordinary batch.
 ### Hash key resize steps
 
 A byte-key arena funds its current buffer plus one replacement, separately for each
-key column. Its batch bound covers that pair once; allocation clips speculative
+key column. The caller counts its existing buffer in `workspace.used`; the batch bound adds only
+new headroom. Allocation clips speculative
 geometric growth to the same pair envelope. In particular, an exact large first
 allocation followed by a tiny key cannot request four times that exact size and
 consume another column's promised headroom. The envelope ends after group assignment.
