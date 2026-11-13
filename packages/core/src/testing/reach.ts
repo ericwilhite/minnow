@@ -126,6 +126,90 @@ export interface Reach<State extends string> {
   assertReached(): void;
 }
 
+export const WIDE_KEY_BATCH_STATES = [
+  "wide insert slices",
+  "wide sparse selected offsets",
+  "wide dense offsets",
+  "wide backfill slices",
+  "wide backfill visible before replay",
+  "wide replay tail",
+  "wide conflict tail",
+  "wide update tail",
+  "wide delete tail",
+  "wide thirty-two MiB",
+  "wide sixty-four MiB",
+  "wide scalar provenance",
+  "wide one-twenty-eight MiB",
+  "wide tuple provenance",
+] as const;
+
+export const CATALOG_RUN_LIMIT_STATES = [
+  "catalog capacity refusal",
+  "intact capacity continues",
+  "refused open retries",
+] as const;
+
+export const LONG_KEY_ACTION_STATES = [
+  "pending byte freeze",
+  "byte freeze rollback",
+  "byte freeze savepoint",
+  "bounded overflow drain",
+  "thirty-two MiB flush",
+  "sixty-four MiB flush",
+  "forward planned",
+  "reverse planned",
+  "future width at fixed admission",
+  "automatic overflow selection",
+  "NUL published key",
+  "invalid support rekey",
+  "selective durable fallback",
+  "fallback allocation cleanup",
+  "foreign cascade",
+  "foreign restrict",
+  "foreign set null",
+  "pre-full pending pressure",
+  "wide ingress at thirty-two MiB",
+  "whole wide ingress below cap",
+  "escaped key expansion at admission",
+] as const;
+
+export const KNOWN_ROW_ESTIMATE_STATES = [
+  "native bytes identical",
+  "bounded hint",
+  "long row projection",
+] as const;
+
+export const LONG_KEY_LIMIT_STATES = [
+  "catalog policy corruption refusal",
+  "float32 full equality width",
+  "other fixed equality widths",
+  "canonical domain term costs",
+  "enum without native cache",
+  "other domain components",
+  "typed semantic refusal",
+  "legacy scalar secondary",
+  "composite primary budget",
+  "secondary tuple budget",
+  "scalar primary budget",
+  "flat",
+  "constant",
+  "dictionary",
+  "UTF16 astral",
+  "embedded NUL",
+  "other Unicode",
+  "UTF8 width is not units",
+  "write refusal atomic",
+  "invalid secondary scans",
+  "prepared replan",
+  "update and delete",
+  "durable catalog policy",
+  "old ready snapshot",
+  "transaction undo",
+  "savepoint undo",
+  "backfill invalidation",
+  "backfill replay",
+] as const;
+
 export const OVERFLOW_PUBLICATION_STATES = [
   "hundreds of retained summaries",
   "maximum text pieces",

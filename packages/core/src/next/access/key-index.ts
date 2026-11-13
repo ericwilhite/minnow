@@ -246,3 +246,12 @@ export function resolveVersions(
     );
   return live.sort((a, b) => a - b);
 }
+
+/** The retained identity exists, but its physical entries are incomplete. Replan to a scan. */
+export class IndexUnavailableError extends Error {
+  readonly code = "MINNOW_INDEX_UNAVAILABLE";
+  constructor(readonly indexId: number) {
+    super(`Index ${String(indexId)} is invalid; use a table scan`);
+    this.name = "IndexUnavailableError";
+  }
+}

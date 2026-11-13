@@ -70,6 +70,7 @@ export type LoggedChange =
     }
   | { readonly op: "dropTable"; readonly tableId: number }
   | { readonly op: "createIndex"; readonly index: IndexDef }
+  | { readonly op: "invalidateIndex"; readonly tableId: number; readonly indexId: number }
   | { readonly op: "dropIndex"; readonly tableId: number; readonly indexId: number }
   | { readonly op: "putSequence"; readonly sequence: SequenceDef }
   | { readonly op: "dropSequence"; readonly sequenceId: number }
@@ -96,6 +97,21 @@ function intRange(type: PhysicalType): { min: bigint; max: bigint } {
   throw new CatalogChangeError(`An identity column must be an integer, not ${type.kind}`);
 }
 
+/** JSON input can carry fields outside IndexDef's compile-time unions. */
+function validateIndexPolicy(index: {
+  readonly unique: boolean;
+  readonly columnIds: readonly number[];
+  readonly invalid?: unknown;
+  readonly keyLimit?: unknown;
+}): void {
+  if (index.invalid !== undefined && (index.invalid !== true || index.unique))
+    throw new StoreCorruptionError("Invalid unique-index availability flag");
+  if (index.keyLimit !== undefined && index.keyLimit !== "scalar" && index.keyLimit !== "tuple")
+    throw new StoreCorruptionError("Unknown index key-limit policy");
+  if (index.keyLimit === "scalar" && index.columnIds.length !== 1)
+    throw new StoreCorruptionError("A scalar index key-limit policy requires one column");
+}
+
 export class Catalog implements CatalogView {
   readonly version: number;
   readonly counters: CatalogCounters;
@@ -109,6 +125,7 @@ export class Catalog implements CatalogView {
   readonly #types: ReadonlyMap<number, TypeDef>;
 
   constructor(data: CatalogData) {
+    for (const table of data.tables) for (const index of table.indexes) validateIndexPolicy(index);
     this.version = data.version;
     this.counters = data.counters;
     this.tables = data.tables;
@@ -216,6 +233,8 @@ export class Catalog implements CatalogView {
       case "createIndex": {
         const input = change.index;
         const table = this.#requireTable(input.tableId);
+        if (input.keyLimit === "scalar" && input.columnIds.length !== 1)
+          throw new CatalogChangeError("A scalar index requires one column");
         if (table.indexes.some((index) => index.name === input.name))
           throw new CatalogChangeError(`Index ${input.name} already exists`);
         const index = this.#indexDef(
@@ -226,7 +245,12 @@ export class Catalog implements CatalogView {
           input.unique,
           input.role,
         );
-        return [{ op: "createIndex", index }];
+        return [
+          {
+            op: "createIndex",
+            index: input.keyLimit === undefined ? index : { ...index, keyLimit: input.keyLimit },
+          },
+        ];
       }
       case "dropIndex": {
         const table = this.tables.find((candidate) =>
@@ -538,6 +562,23 @@ export class Catalog implements CatalogView {
         tables = tables.map((table) =>
           table.id === change.index.tableId
             ? { ...table, indexes: [...table.indexes, change.index] }
+            : table,
+        );
+        break;
+      case "invalidateIndex":
+        if (
+          this.table(change.tableId)?.indexes.find((index) => index.id === change.indexId)
+            ?.unique !== false
+        )
+          throw new CatalogChangeError("Only a nonunique index can be invalidated");
+        tables = tables.map((table) =>
+          table.id === change.tableId
+            ? {
+                ...table,
+                indexes: table.indexes.map((index) =>
+                  index.id === change.indexId ? { ...index, invalid: true as const } : index,
+                ),
+              }
             : table,
         );
         break;

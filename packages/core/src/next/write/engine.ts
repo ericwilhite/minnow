@@ -1,3 +1,4 @@
+import { indexLimitViolation, indexMaximumKeyBytes } from "./index-limits.js";
 /**
  * The write path (access/write-path.ts): one engine per open database, in the owner.
  *
@@ -853,11 +854,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
       await engine.#load();
       await engine.#prepareMinimum();
       await engine.#recover();
+      await engine.#validateRunLimits();
       engine.#recovering = false;
       if (input.deferInitialMaintenance !== true) engine.startInitialMaintenance();
       return engine;
     } catch (error) {
-      if (engine !== null) engine.#signal?.removeEventListener("abort", engine.#abortCommit);
+      if (engine !== null) {
+        engine.#closed = true;
+        engine.#signal?.removeEventListener("abort", engine.#abortCommit);
+        engine.#releaseOwned();
+      }
       commitBuffers?.close();
       credits.close();
       throw error;
@@ -955,6 +961,31 @@ export class WritePathImpl implements WritePath, EngineHooks {
       // The first state holds them now (or the open failed and nothing does).
       for (const directory of built) directory.releaseCreation();
       this.#releaseRoot(root);
+    }
+  }
+
+  /** Table publication may lead the global catalog checkpoint. Resolve path limits only
+   * after catalog WAL replay; dropped indexes can still have retired runs in the physical
+   * state and must not be mistaken for dangling live catalog entries. The root codec has
+   * already checked their structural extent bounds, independently of SQL path admission. */
+  async #validateRunLimits(): Promise<void> {
+    for (const state of this.#tables.values()) {
+      const def = this.#catalog.table(state.tableId);
+      if (def === undefined) continue;
+      for (const index of def.indexes) {
+        const maximum = indexMaximumKeyBytes(index, def);
+        function* runs() {
+          yield* state.view.runs.get(index.id) ?? [];
+          for (const memtable of state.view.memtables)
+            yield* memtable.staged?.runs.get(index.id) ?? [];
+        }
+        for (const run of runs()) {
+          this.#check();
+          if ((run.keyStorage?.maxKeyBytes ?? 0) > maximum)
+            throw new ManifestCorruptionError("Run key capacity exceeds its catalog path");
+          if (taskClock.due()) await yieldTask();
+        }
+      }
     }
   }
 
@@ -1056,7 +1087,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     );
   }
 
+  #replayInvalidIndexes = new Set<number>();
   async #replay(replayer: Replayer, lsn: number, body: CommitFrameBody): Promise<void> {
+    this.#replayInvalidIndexes.clear();
     const effects: Effect[] = body.effects.map((effect) => replayEffect(effect));
     if (body.request !== null) effects.push({ kind: "request" });
     const decisions = replayer.next(lsn, effects);
@@ -1084,6 +1117,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
           throw new LogCorruptionError(`The write path cannot replay ${effect.kind} yet`);
       }
     }
+    for (const id of this.#replayInvalidIndexes)
+      if (this.#catalog.index(id)?.invalid !== true)
+        throw new LogCorruptionError("Oversized nonunique key lacks logged invalidation");
     // As at commit: a staged commit's live tail freezes, so its fold can run once replay ends.
     for (const tableId of published ?? []) {
       const state = this.#tables.get(tableId);
@@ -1362,6 +1398,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const keys = new KeyBatch(this.#grant);
     try {
       for (const index of indexes) {
+        if (index.invalid === true) continue;
+        if (indexLimitViolation(index, def, vectors, rows, 0, rowIds.length) !== null) {
+          if (index.unique)
+            throw new LogCorruptionError("Logged unique key exceeds its catalog limit");
+          this.#replayInvalidIndexes.add(index.id);
+          continue;
+        }
         const delta = memtable.deltas.get(index.id);
         if (delta === undefined) continue;
         const columns = index.columnIds.map((columnId) => ({
@@ -1371,18 +1414,26 @@ export class WritePathImpl implements WritePath, EngineHooks {
         }));
         const length = vectors[0]?.length ?? rowIds.length;
         const selection = rows === null ? null : { rows, count: rows.length };
-        encodeKeyBatch("equality", columns, { length, selection }, keys);
-        for (let k = 0; k < rowIds.length; k++) {
-          const row = rows === null ? k : (rows[k] ?? 0);
-          if (columns.some((column) => isNullAt(column.vector, row))) continue;
-          delta.add(
-            keys.writer.bytes,
-            keys.offsets[k] ?? 0,
-            keys.offsets[k + 1] ?? 0,
-            rowIds[k] ?? 0,
-            seq,
-            false,
-          );
+        for (let from = 0; from < rowIds.length;) {
+          const result = encodeKeyBatch("equality", columns, { length, selection }, keys, from);
+          if (!result.done && result.reason === "denied")
+            throw new MemtableMemoryError(result.requiredBytes);
+          if (result.encoded === 0)
+            throw new LogCorruptionError("A nonempty replay key batch made no progress");
+          for (let k = 0; k < result.encoded; k++) {
+            const at = from + k,
+              row = rows === null ? at : (rows[at] ?? 0);
+            if (columns.some((column) => isNullAt(column.vector, row))) continue;
+            delta.add(
+              keys.writer.bytes,
+              keys.offsets[k] ?? 0,
+              keys.offsets[k + 1] ?? 0,
+              rowIds[at] ?? 0,
+              seq,
+              false,
+            );
+          }
+          from += result.encoded;
         }
       }
     } finally {
@@ -1809,30 +1860,31 @@ export class WritePathImpl implements WritePath, EngineHooks {
   /**
    * Ensures the write path's grant can take `bytes` more memtable memory before an insert
    * (ruling 6): grows the grant, and when the governor refuses, freezes the largest live
-   * memtables that hold no pending rows and waits for their flushes. Throws
+   * memtables and flushes committed rows or stages pending rows. Recomputes capacity growth
+   * after relief so a small next batch never carries the old arena's resize estimate. Throws
    * `MemtableMemoryError` when nothing more can be freed.
    */
-  admit(bytes: number): MaybePromise<void> {
+  admit(bytes: number, growth?: () => number): MaybePromise<void> {
     const prepared = this.#prepareMinimum();
     return prepared instanceof Promise
-      ? this.#admitAfterMinimum(prepared, bytes)
-      : this.#admitRows(bytes);
+      ? this.#admitAfterMinimum(prepared, bytes, growth)
+      : this.#admitRows(bytes, growth);
   }
 
-  #admitAfterMinimum(prepared: Promise<void>, bytes: number): Promise<void> {
-    return prepared.then(() => this.#admitRows(bytes));
+  #admitAfterMinimum(prepared: Promise<void>, bytes: number, growth?: () => number): Promise<void> {
+    return prepared.then(() => this.#admitRows(bytes, growth));
   }
 
-  #admitRows(bytes: number): MaybePromise<void> {
+  #admitRows(bytes: number, growth?: () => number): MaybePromise<void> {
     this.#check();
     // A large transaction's full memtables are staged first: its rows never stay resident whole.
     const stage = this.#stageCandidates();
     if (stage !== null)
       return this.#stage(stage).then(() =>
-        this.#headroom(bytes) ? undefined : this.#relieve(bytes),
+        this.#headroom(bytes + (growth?.() ?? 0)) ? undefined : this.#relieve(bytes, growth),
       );
-    if (this.#headroom(bytes)) return;
-    return this.#relieve(bytes);
+    if (this.#headroom(bytes + (growth?.() ?? 0))) return;
+    return this.#relieve(bytes, growth);
   }
 
   #headroom(bytes: number): boolean {
@@ -1843,15 +1895,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
     return reclaimed >= bytes || this.#grant.tryGrow(bytes - reclaimed);
   }
 
-  async #relieve(bytes: number): Promise<void> {
+  async #relieve(bytes: number, growth?: () => number): Promise<void> {
     for (let attempt = 0; attempt < 8; attempt++) {
       const live = [...this.#tables.values()]
         .map((state) => state.view.memtables[state.view.memtables.length - 1])
         .filter(
-          (memtable): memtable is Memtable =>
-            memtable?.state === "live" &&
-            memtable.rowCount > 0 &&
-            memtable.visibleRows(MAX_LSN) === memtable.rowCount,
+          (memtable): memtable is Memtable => memtable?.state === "live" && memtable.rowCount > 0,
         )
         .sort((a, b) => b.bytes - a.bytes);
       for (const memtable of live.slice(0, 2)) {
@@ -1860,11 +1909,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
           ...need(this.#tables.get(memtable.tableId)).view,
         });
       }
+      // A byte-limited live memtable may freeze before its row limit, including pending
+      // transaction rows. Freezing is representation-only; row/delta undo still names it,
+      // and staging remaps those records before releasing their native buffers.
+      const stage = this.#stageCandidates();
+      if (stage !== null) await this.#stage(stage);
       this.#scheduleFlush();
       await this.#appender.flush();
       await this.#flushes;
       this.#check();
-      if (this.#headroom(bytes)) return;
+      if (this.#headroom(bytes + (growth?.() ?? 0))) return;
     }
     throw new MemtableMemoryError(bytes);
   }
@@ -2578,25 +2632,31 @@ export class WritePathImpl implements WritePath, EngineHooks {
     try {
       if (this.#appender.failure === null) await this.#appender.close();
     } finally {
-      this.keys.close();
-      for (const state of this.#tables.values())
-        for (const memtable of state.view.memtables) memtable.releaseAll();
-      for (const memtable of this.#published) memtable.releaseAll();
-      this.#currentPin?.release();
-      this.#currentPin = null;
-      this.#unbindMetadataCaches();
-      for (const cache of this.#metadataCaches) cache.clear();
-      this.#lists.close();
-      this.#metadataGrant.close();
-      this.#columns.close();
-      this.#body.close();
-      this.#sequenceBody.close();
-      this.#commitBuffers.close();
-      this.#arenaPool.close();
-      this.#grant.free(OBJECT_OVERHEAD_BYTES);
-      this.#grant.close();
-      this.#credits.close();
+      this.#releaseOwned();
     }
+  }
+
+  /** Both close and a refused open release native owners and state pins before their grants.
+   * This does not touch the appender or publish: open may fail before either is ready. */
+  #releaseOwned(): void {
+    this.keys.close();
+    for (const state of this.#tables.values())
+      for (const memtable of state.view.memtables) memtable.releaseAll();
+    for (const memtable of this.#published) memtable.releaseAll();
+    this.#currentPin?.release();
+    this.#currentPin = null;
+    this.#unbindMetadataCaches();
+    for (const cache of this.#metadataCaches) cache.clear();
+    this.#lists.close();
+    this.#metadataGrant.close();
+    this.#columns.close();
+    this.#body.close();
+    this.#sequenceBody.close();
+    this.#commitBuffers.close();
+    this.#arenaPool.close();
+    this.#grant.free(OBJECT_OVERHEAD_BYTES);
+    this.#grant.close();
+    this.#credits.close();
   }
 
   // ── Shared caches ────────────────────────────────────────────────────────────────────────
@@ -3587,7 +3647,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         old.push(runExtent(run));
         const reader = await this.#runReader(run);
         this.#check();
-        const builder = new RunBuilder(false, false, this.#metadataBudget);
+        const builder = new RunBuilder(false, false, this.#metadataBudget, run.encoding ?? 1);
         const sink = new RunSink(builder, writer, runExtent(run).length);
         try {
           await reader.cursor(
@@ -4249,6 +4309,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   async #writeGroup(writer: ExtentWriter, def: TableDef, memtable: Memtable): Promise<GroupRoot> {
     const group = new GroupWriter({
+      estimatedRows: memtable.rowCount,
       columns: def.columns.map((column) => ({ columnId: column.id, type: column.type })),
       writer,
       charge: this.#grant,
@@ -4692,7 +4753,7 @@ async function encodeDelta(
   writer: ExtentWriter,
   outputs: RunSummary[],
 ): Promise<RunRef | null> {
-  const builder = new RunBuilder(false, true, workspace);
+  const builder = new RunBuilder(false, true, workspace, delta.maxKeyBytes > 2048 ? 2 : 1);
   const sink = new RunSink(builder, writer, delta.bytes);
   const release = delta.retain();
   try {

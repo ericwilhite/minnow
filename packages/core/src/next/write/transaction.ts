@@ -13,6 +13,8 @@
  * and foreign keys are checked at `Statement.end()`: during the statement a key that collides with
  * a live row is only a suspect, re-verified at the end against everything the statement wrote.
  */
+import { indexLimitViolation } from "./index-limits.js";
+import { scanIndexHolders } from "./index-scan.js";
 import { SMALL_COMMIT_BYTES, type BufferAllocator } from "./commit-buffers.js";
 import {
   CatalogChangeError,
@@ -47,10 +49,16 @@ import type { BodyEffect } from "../format/log-frame.js";
 import { encodeKeyBatch, KeyBatch, type KeyColumn } from "../keys/key-encoding.js";
 import { samePhysicalType } from "../types.js";
 import { compareBytes } from "../vector/varlen.js";
-import type { Batch, FlatVector, Selection, Vector } from "../vector/vector.js";
+import {
+  BATCH_TARGET_BYTES,
+  type Batch,
+  type FlatVector,
+  type Selection,
+  type Vector,
+} from "../vector/vector.js";
 import type { ByteWriter } from "./bytes.js";
 import { Catalog, encodeLogged, type LoggedChange } from "./catalog.js";
-import { ColumnChunk, encodeColumn, isNullAt, MEMORY_CHUNK_ROWS } from "./columns.js";
+import { ColumnChunk, encodeColumn, isNullAt, sourceSlot, MEMORY_CHUNK_ROWS } from "./columns.js";
 import type { KeyDelta } from "./key-hash.js";
 import type { Memtable } from "./memtable.js";
 import { readRows } from "./rows.js";
@@ -61,7 +69,7 @@ import {
   otherIndexLayersEndBefore,
   type TableSnapshotImpl,
 } from "./view.js";
-import { need } from "./bytes.js";
+import { need, MemtableMemoryError } from "./bytes.js";
 
 /** Everything committed and pending (constraint checks see the whole transaction). */
 export const ALL = PENDING_BASE + MAX_STATEMENTS;
@@ -98,7 +106,7 @@ export interface EngineHooks {
   /** Adds an index's delta to the table's live memtable (createIndex). */
   addIndexDelta(tableId: number, indexId: number): Memtable;
   /** Ensures memtable memory for about `bytes` more before an insert (backpressure). */
-  admit(bytes: number): MaybePromise<void>;
+  admit(bytes: number, growth?: () => number): MaybePromise<void>;
   commit(tx: TransactionImpl, request: CommitRequest | null): Promise<CommitReceipt>;
   release(tx: TransactionImpl): void;
   label(): string;
@@ -727,7 +735,12 @@ export class StatementImpl implements Statement {
    */
   current(): SnapshotImpl {
     const state = this.tx.hooks.state();
-    if (this.#current !== null && this.#current.state === state) return this.#current;
+    if (
+      this.#current !== null &&
+      this.#current.state === state &&
+      this.#current.catalog === this.tx.catalog
+    )
+      return this.#current;
     this.#current?.releaseInternal();
     this.#current = this.#fresh();
     return this.#current;
@@ -772,6 +785,21 @@ export class StatementImpl implements Statement {
     }
     if (plain) this.#plain = writer;
     return writer;
+  }
+
+  /** Internal, logged and undoable: never drop a key from a planner-ready nonunique index. */
+  invalidateIndexes(tableId: number, ids: readonly number[]): MaybePromise<void> {
+    const before = this.tx.catalog;
+    const logged: LoggedChange[] = ids
+      .filter((id) => before.index(id)?.invalid !== true)
+      .map((indexId) => ({ op: "invalidateIndex", tableId, indexId }));
+    if (logged.length === 0) return;
+    const version = this.tx.hooks.nextCatalogVersion();
+    const catalog = logged.reduce((next, change) => next.apply(change, version), before);
+    return settle(this.tx.hooks.prepareCatalog(catalog), () => {
+      this.tx.undo.push({ kind: "catalog", statement: this.ordinal, before, logged });
+      this.tx.catalog = catalog;
+    });
   }
 
   changeCatalog(change: CatalogChange): MaybePromise<{ readonly id: number | null }> {
@@ -930,30 +958,37 @@ export class StatementImpl implements Statement {
         const support = need(child.indexes.find((index) => index.id === fk.supportIndexId));
         const index = new ViewIndex(nonUnique(support), view.internalTable(child.id));
         for (const check of mine) {
-          const children = await index.holders(
-            check.key,
-            support.columnIds.length > fk.columnIds.length,
-          );
-          if (children.length === 0) continue;
-          const parent = need(this.tx.catalog.table(check.parentTableId));
-          const key = need(parent.indexes.find((candidate) => candidate.id === check.indexId));
-          let rows = plans.get(child.id);
-          if (rows === undefined) plans.set(child.id, (rows = new Map<number, NewValues>()));
-          for (const rowId of children) {
-            let columns = rows.get(rowId);
-            if (columns === undefined) rows.set(rowId, (columns = new Map() as NewValues));
-            fk.columnIds.forEach((columnId, k) => {
-              if (columns.has(columnId)) return; // a shared column: the same original key
-              const parentColumn = key.columnIds[k];
-              columns.set(columnId, {
-                vector: need(
-                  check.next?.vectors[
-                    parent.columns.findIndex((column) => column.id === parentColumn)
-                  ],
-                ),
-                row: check.next?.row ?? 0,
+          const scanned =
+            support.invalid === true
+              ? await scanIndexHolders(view.internalTable(child.id), fk.columnIds, check.key)
+              : null;
+          try {
+            const children =
+              scanned?.value ??
+              (await index.holders(check.key, support.columnIds.length > fk.columnIds.length));
+            if (children.length === 0) continue;
+            const parent = need(this.tx.catalog.table(check.parentTableId));
+            const key = need(parent.indexes.find((candidate) => candidate.id === check.indexId));
+            let rows = plans.get(child.id);
+            if (rows === undefined) plans.set(child.id, (rows = new Map<number, NewValues>()));
+            for (const rowId of children) {
+              let columns = rows.get(rowId);
+              if (columns === undefined) rows.set(rowId, (columns = new Map() as NewValues));
+              fk.columnIds.forEach((columnId, k) => {
+                if (columns.has(columnId)) return; // a shared column: the same original key
+                const parentColumn = key.columnIds[k];
+                columns.set(columnId, {
+                  vector: need(
+                    check.next?.vectors[
+                      parent.columns.findIndex((column) => column.id === parentColumn)
+                    ],
+                  ),
+                  row: check.next?.row ?? 0,
+                });
               });
-            });
+            }
+          } finally {
+            scanned?.release();
           }
         }
       }
@@ -989,25 +1024,38 @@ export class StatementImpl implements Statement {
         const support = need(child.indexes.find((index) => index.id === fk.supportIndexId));
         // A covering supporting index holds the reference as a key prefix (ruling 4). The view is
         // read now: an earlier action may have rewritten these children.
-        const children = await new ViewIndex(
-          nonUnique(support),
-          this.current().internalTable(child.id),
-        ).holders(check.key, support.columnIds.length > fk.columnIds.length);
-        if (children.length === 0) continue;
-        const writer = new TableWriterImpl(this, child, { onRepeat: "first" });
-        if (fk.onDelete === "cascade") await writer.applyDelete(children);
-        else if (fk.onDelete === "setNull")
-          await writer.applyUpdate(
-            children,
-            fk.columnIds,
-            fk.columnIds.map((columnId) => ({
-              vector: nullVector(need(child.columns.find((column) => column.id === columnId)).type),
-              row: 0,
-            })),
-            true,
-          );
-        else
-          throw new ForeignKeyViolationError(check.parentTableId, fk.id, "referenced", check.key);
+        const table = this.current().internalTable(child.id);
+        const scanned =
+          this.tx.catalog.index(support.id)?.invalid === true
+            ? await scanIndexHolders(table, fk.columnIds, check.key)
+            : null;
+        try {
+          const children =
+            scanned?.value ??
+            (await new ViewIndex(nonUnique(support), table).holders(
+              check.key,
+              support.columnIds.length > fk.columnIds.length,
+            ));
+          if (children.length === 0) continue;
+          const writer = new TableWriterImpl(this, child, { onRepeat: "first" });
+          if (fk.onDelete === "cascade") await writer.applyDelete(children);
+          else if (fk.onDelete === "setNull")
+            await writer.applyUpdate(
+              children,
+              fk.columnIds,
+              fk.columnIds.map((columnId) => ({
+                vector: nullVector(
+                  need(child.columns.find((column) => column.id === columnId)).type,
+                ),
+                row: 0,
+              })),
+              true,
+            );
+          else
+            throw new ForeignKeyViolationError(check.parentTableId, fk.id, "referenced", check.key);
+        } finally {
+          scanned?.release();
+        }
       }
   }
 
@@ -1132,26 +1180,45 @@ export class TableWriterImpl implements TableWriter {
     rows: Uint16Array | null,
     count = rows?.length ?? 0,
   ): MaybePromise<void> {
+    return settle(this.#prepareKeyLimits(this.def.indexes, columns, rows, 0, count), () =>
+      this.#insertPreparedRows(columns, rows, count),
+    );
+  }
+
+  #insertPreparedRows(
+    columns: readonly Vector[],
+    rows: Uint16Array | null,
+    count: number,
+  ): MaybePromise<void> {
     if (count <= MEMORY_CHUNK_ROWS) {
-      const plan: RowPlan = { rows, from: 0, count };
-      return settle(this.statement.tx.hooks.admit(this.#estimate(columns, plan)), () =>
-        this.#insertRows(columns, plan),
-      );
+      const plan: RowPlan = { rows, from: 0, count },
+        bytes = this.#estimate(columns, plan);
+      if (bytes <= BATCH_TARGET_BYTES || count <= 1 || !this.#wideKeys(columns, plan))
+        return settle(
+          this.statement.tx.hooks.admit(bytes, () => this.#growth(columns, plan)),
+          () => this.#insertRows(columns, plan),
+        );
     }
-    // Preserve the original admission/staging boundaries, but share the same row plan instead
-    // of manufacturing a selection and new subarray views at each boundary.
+    // Keep ordinary batches unchanged. Wide borrowed input is admitted and staged in byte
+    // slices, never as one oversized native column/key arena or incomplete key batch.
     let offset = 0;
     const next = (): MaybePromise<void> =>
       this.statement.guard(() => {
         while (offset < count) {
-          const plan: RowPlan = {
+          let plan: RowPlan = {
             rows,
             from: offset,
             count: Math.min(MEMORY_CHUNK_ROWS, count - offset),
           };
+          let bytes = this.#estimate(columns, plan);
+          while (plan.count > 1 && bytes > BATCH_TARGET_BYTES && this.#wideKeys(columns, plan)) {
+            plan = { rows, from: offset, count: Math.ceil(plan.count / 2) };
+            bytes = this.#estimate(columns, plan);
+          }
           offset += plan.count;
-          const pending = settle(this.statement.tx.hooks.admit(this.#estimate(columns, plan)), () =>
-            this.statement.guard(() => this.#insertRows(columns, plan)),
+          const pending = settle(
+            this.statement.tx.hooks.admit(bytes, () => this.#growth(columns, plan)),
+            () => this.statement.guard(() => this.#insertRows(columns, plan)),
           );
           if (pending instanceof Promise) return pending.then(next);
         }
@@ -1159,74 +1226,135 @@ export class TableWriterImpl implements TableWriter {
     return next();
   }
 
+  #inputBytes(vector: Vector, plan: RowPlan): number {
+    if (vector.form === "flat" && vector.data.layout === "varlen" && plan.rows === null)
+      return (
+        (vector.data.offsets[plan.from + plan.count] ?? 0) - (vector.data.offsets[plan.from] ?? 0)
+      );
+    if (
+      vector.type.kind !== "text" &&
+      vector.type.kind !== "bytes" &&
+      vector.type.kind !== "enum" &&
+      vector.type.kind !== "json" &&
+      vector.type.kind !== "array"
+    )
+      return 0;
+    const slot: { flat: FlatVector | null; index: number } = { flat: null, index: -1 };
+    let bytes = 0;
+    for (let i = plan.from; i < plan.from + plan.count; i++) {
+      sourceSlot(vector, plan.rows === null ? i : (plan.rows[i] ?? 0), slot);
+      if (slot.index < 0 || slot.flat.data.layout !== "varlen") continue;
+      bytes +=
+        (slot.flat.data.offsets[slot.index + 1] ?? 0) - (slot.flat.data.offsets[slot.index] ?? 0);
+    }
+    return bytes;
+  }
+
+  /** Recomputed after relief: native capacity growth is paid BEFORE append, including the
+   * old/new arena overlap. A freeze/stage returns zero for the old arenas instead of making
+   * the next small batch wait for a stale multi-MiB growth estimate. */
+  #growth(columns: readonly Vector[], plan: RowPlan): number {
+    const live = this.statement.tx.hooks.state().tables.get(this.tableId)?.memtables.at(-1);
+    if (live?.state !== "live") return 0;
+    let bytes = 0;
+    for (let c = 0; c < columns.length; c++) {
+      const chunk = live.chunks[c]?.at(-1),
+        arena = chunk?.arena;
+      if (chunk === undefined || arena == null) continue;
+      const wanted =
+        (chunk.offsets?.[chunk.length] ?? 0) + this.#inputBytes(need(columns[c]), plan);
+      if (wanted <= arena.length) continue;
+      let size = arena.length * 2;
+      while (size < wanted) size *= 2;
+      bytes += size;
+    }
+    for (const index of this.def.indexes) {
+      if (this.statement.catalog.index(index.id)?.invalid === true) continue;
+      let wanted = 32 * plan.count * index.columnIds.length;
+      for (const id of index.columnIds)
+        wanted += 2 * this.#inputBytes(need(columns[this.#columnIndex(id)]), plan);
+      bytes += live.deltas.get(index.id)?.appendKeyBytes(wanted) ?? 0;
+    }
+    return bytes;
+  }
+
+  /** Only key-bearing input needs the new byte-sliced ingress. Large unindexed payloads keep
+   * their existing admission/publication boundaries. Escaping may double raw key bytes; fixed
+   * components and tuple headers fit within the per-column upper bound used here. */
+  #wideKeys(columns: readonly Vector[], plan: RowPlan): boolean {
+    let bytes = 0;
+    for (const index of this.def.indexes) {
+      if (this.statement.catalog.index(index.id)?.invalid === true) continue;
+      bytes += plan.count * 17 * index.columnIds.length;
+      for (const id of index.columnIds)
+        bytes += 2 * this.#inputBytes(need(columns[this.#columnIndex(id)]), plan);
+      if (bytes > BATCH_TARGET_BYTES) return true;
+    }
+    return false;
+  }
+
   /** Same capacity estimate; a contiguous varlen range uses its two end offsets. */
   #estimate(columns: readonly Vector[], plan: RowPlan): number {
     let bytes =
       4096 * columns.length + plan.count * (16 * columns.length + 96 * this.def.indexes.length);
-    for (const vector of columns)
-      if (vector.form === "flat" && vector.data.layout === "varlen") {
-        const offsets = vector.data.offsets;
-        if (plan.rows === null)
-          bytes += 2 * ((offsets[plan.from + plan.count] ?? 0) - (offsets[plan.from] ?? 0));
-        else
-          for (let k = plan.from; k < plan.from + plan.count; k++) {
-            const row = plan.rows[k] ?? 0;
-            bytes += 2 * ((offsets[row + 1] ?? 0) - (offsets[row] ?? 0));
-          }
-      }
+    for (const vector of columns) bytes += 2 * this.#inputBytes(vector, plan);
     return bytes;
   }
 
   #insertRows(columns: readonly Vector[], plan: RowPlan): MaybePromise<void> {
     const tx = this.statement.tx,
       seq = this.statement.seq;
-    let puts: Array<Promise<void>> | null = null;
     const rowIds: number[] | null = this.def.foreignKeys.length > 0 ? [] : null;
     let done = 0;
-    while (done < plan.count) {
-      const { memtable, created, frozen } = tx.hooks.liveMemtable(this.tableId, plan.count - done);
-      if (created)
+    const next = (): MaybePromise<void> => {
+      while (done < plan.count) {
+        const { memtable, created, frozen } = tx.hooks.liveMemtable(
+          this.tableId,
+          plan.count - done,
+        );
+        if (created)
+          tx.undo.push({
+            kind: "freeze",
+            statement: this.statement.ordinal,
+            tableId: this.tableId,
+            created: memtable,
+            frozen,
+          });
+        const take = Math.min(memtable.capacity, plan.count - done),
+          before = memtable.rowCount;
+        memtable.append(columns, plan.rows, plan.from + done, take);
+        memtable.mark(seq);
         tx.undo.push({
-          kind: "freeze",
+          kind: "rows",
           statement: this.statement.ordinal,
           tableId: this.tableId,
-          created: memtable,
-          frozen,
+          memtable,
+          before,
+          count: take,
         });
-      const take = Math.min(memtable.capacity, plan.count - done),
-        before = memtable.rowCount;
-      memtable.append(columns, plan.rows, plan.from + done, take);
-      memtable.mark(seq);
-      tx.undo.push({
-        kind: "rows",
-        statement: this.statement.ordinal,
-        tableId: this.tableId,
-        memtable,
-        before,
-        count: take,
-      });
-      const firstRowId = memtable.firstRowId + before;
-      if (rowIds !== null) for (let k = 0; k < take; k++) rowIds.push(firstRowId + k);
-      const put = this.putKeys(
-        this.def.indexes,
-        columns,
-        plan.rows,
-        firstRowId,
-        memtable,
-        plan.from + done,
-        take,
-      );
-      if (put instanceof Promise) (puts ??= []).push(put);
-      done += take;
-    }
-    // Foreign-key insertions keep the materialized selection contract above.
-    if (rowIds !== null)
-      this.#childChecks(
-        columns,
-        need(plan.rows).subarray(plan.from, plan.from + plan.count),
-        rowIds,
-      );
-    return puts === null ? undefined : Promise.all(puts).then(() => undefined);
+        const firstRowId = memtable.firstRowId + before;
+        if (rowIds !== null) for (let k = 0; k < take; k++) rowIds.push(firstRowId + k);
+        const put = this.#putValidKeys(
+          this.def.indexes,
+          columns,
+          plan.rows,
+          firstRowId,
+          memtable,
+          plan.from + done,
+          take,
+        );
+        done += take;
+        if (put instanceof Promise) return put.then(next);
+      }
+      // Foreign-key insertions keep the materialized selection contract above.
+      if (rowIds !== null)
+        this.#childChecks(
+          columns,
+          need(plan.rows).subarray(plan.from, plan.from + plan.count),
+          rowIds,
+        );
+    };
+    return next();
   }
 
   #keyColumns(index: IndexDef, columns: readonly Vector[]): KeyColumn[] {
@@ -1238,25 +1366,33 @@ export class TableWriterImpl implements TableWriter {
   }
 
   /** Encodes the keys of `index` for `rows` (physical rows of `columns`, or all when null). */
-  #encode(
+  /** KeyBatch's byte target is a work boundary, never a limit on a borrowed mutation batch.
+   * Each yielded view is borrowed until the next iteration; consumers copy only retained keys.
+   * Allocation refusal is distinct from a full batch and never silently drops a completed tail. */
+  *#encode(
     index: IndexDef,
     columns: readonly Vector[],
     rows: Uint16Array | null,
     count: number,
     from = 0,
     take = (rows?.length ?? count) - from,
-  ): KeyBatch {
-    const keys = this.#keys;
-    const selection = rows === null ? null : { rows, count: from + take };
-    const result = encodeKeyBatch(
-      "equality",
-      this.#keyColumns(index, columns),
-      { length: rows === null ? from + take : count, selection },
-      keys,
-      from,
-    );
-    if (!result.done) throw new RangeError("An index key batch did not fit its byte target");
-    return keys;
+  ): Generator<{ keys: KeyBatch; offset: number; count: number }> {
+    const keys = this.#keys,
+      selection = rows === null ? null : { rows, count: from + take };
+    for (let cursor = from; cursor < from + take;) {
+      const result = encodeKeyBatch(
+        "equality",
+        this.#keyColumns(index, columns),
+        { length: rows === null ? from + take : count, selection },
+        keys,
+        cursor,
+      );
+      if (!result.done && result.reason === "denied")
+        throw new MemtableMemoryError(result.requiredBytes);
+      if (result.encoded === 0) throw new Error("A nonempty key batch made no progress");
+      yield { keys, offset: cursor - from, count: result.encoded };
+      cursor += result.encoded;
+    }
   }
 
   #hasNullKey(index: IndexDef, columns: readonly Vector[], row: number): boolean {
@@ -1278,38 +1414,81 @@ export class TableWriterImpl implements TableWriter {
     from = 0,
     count = rows?.length ?? (typeof rowIds === "number" ? 0 : rowIds.length),
   ): MaybePromise<void> {
+    return settle(this.#prepareKeyLimits(indexes, columns, rows, from, count), () =>
+      this.#putValidKeys(indexes, columns, rows, rowIds, memtable, from, count),
+    );
+  }
+
+  #prepareKeyLimits(
+    indexes: readonly IndexDef[],
+    columns: readonly Vector[],
+    rows: Uint16Array | null,
+    from: number,
+    count: number,
+  ): MaybePromise<void> {
+    const invalid: number[] = [];
+    for (const index of indexes) {
+      if (this.statement.catalog.index(index.id)?.invalid === true) continue;
+      const failure = indexLimitViolation(index, this.def, columns, rows, from, count);
+      if (failure !== null) {
+        if (index.unique) throw failure;
+        invalid.push(index.id);
+      }
+    }
+    return this.statement.invalidateIndexes(this.tableId, invalid);
+  }
+
+  #putValidKeys(
+    indexes: readonly IndexDef[],
+    columns: readonly Vector[],
+    rows: Uint16Array | null,
+    rowIds: readonly number[] | number,
+    memtable: Memtable,
+    from: number,
+    count: number,
+  ): MaybePromise<void> {
     const tx = this.statement.tx;
     const seq = this.statement.seq;
     let checks: Array<Promise<void>> | null = null;
     for (const index of indexes) {
+      if (this.statement.catalog.index(index.id)?.invalid === true) continue;
       const delta = memtable.deltas.get(index.id);
       if (delta === undefined) continue;
-      const keys = this.#encode(index, columns, rows, columns[0]?.length ?? count, from, count);
       const noNulls = index.columnIds.every((id) => {
         const vector = columns[this.#columnIndex(id)];
         return vector?.form === "flat" && vector.validity === null;
       });
       const first = delta.entryCount;
       try {
-        const appended =
-          rows === null &&
-          typeof rowIds === "number" &&
-          noNulls &&
-          delta.addOrderedBatch(keys.writer.bytes, keys.offsets, count, rowIds, seq);
-        if (!appended)
-          for (let k = 0; k < count; k++) {
-            const row = rows === null ? from + k : (rows[from + k] ?? 0);
-            if (!noNulls && this.#hasNullKey(index, columns, row)) continue;
-            const rowId = typeof rowIds === "number" ? rowIds + k : (rowIds[k] ?? 0);
-            delta.add(
-              keys.writer.bytes,
-              keys.offsets[k] ?? 0,
-              keys.offsets[k + 1] ?? 0,
-              rowId,
-              seq,
-              false,
-            );
-          }
+        for (const { keys, offset, count: part } of this.#encode(
+          index,
+          columns,
+          rows,
+          columns[0]?.length ?? count,
+          from,
+          count,
+        )) {
+          const appended =
+            rows === null &&
+            typeof rowIds === "number" &&
+            noNulls &&
+            delta.addOrderedBatch(keys.writer.bytes, keys.offsets, part, rowIds + offset, seq);
+          if (!appended)
+            for (let k = 0; k < part; k++) {
+              const at = offset + k,
+                row = rows === null ? from + at : (rows[from + at] ?? 0);
+              if (!noNulls && this.#hasNullKey(index, columns, row)) continue;
+              const rowId = typeof rowIds === "number" ? rowIds + at : (rowIds[at] ?? 0);
+              delta.add(
+                keys.writer.bytes,
+                keys.offsets[k] ?? 0,
+                keys.offsets[k + 1] ?? 0,
+                rowId,
+                seq,
+                false,
+              );
+            }
+        }
       } finally {
         // Record completed entries even if a later allocation throws.
         const added = delta.entryCount - first;
@@ -1429,19 +1608,25 @@ export class TableWriterImpl implements TableWriter {
       if (parentIndex === undefined) continue;
       // Encode the child columns in the parent key's order (same types: DDL checked).
       const index: IndexDef = { ...parentIndex, tableId: this.tableId, columnIds: fk.columnIds };
-      const keys = this.#encode(index, columns, rows, columns[0]?.length ?? count);
-      for (let k = 0; k < count; k++) {
-        const row = rows === null ? k : (rows[k] ?? 0);
-        if (this.#hasNullKey(index, columns, row)) continue;
-        this.statement.childChecks.push({
-          childTableId: this.tableId,
-          rowId: rowIds[k] ?? 0,
-          fkId: fk.id,
-          parentTableId: fk.parentTableId,
-          parentIndexId: fk.parentIndexId,
-          key: keys.key(k).slice(),
-        });
-      }
+      for (const { keys, offset, count: part } of this.#encode(
+        index,
+        columns,
+        rows,
+        columns[0]?.length ?? count,
+      ))
+        for (let k = 0; k < part; k++) {
+          const at = offset + k,
+            row = rows === null ? at : (rows[at] ?? 0);
+          if (this.#hasNullKey(index, columns, row)) continue;
+          this.statement.childChecks.push({
+            childTableId: this.tableId,
+            rowId: rowIds[at] ?? 0,
+            fkId: fk.id,
+            parentTableId: fk.parentTableId,
+            parentIndexId: fk.parentIndexId,
+            key: keys.key(k).slice(),
+          });
+        }
     }
   }
 
@@ -1587,15 +1772,15 @@ export class TableWriterImpl implements TableWriter {
       const removed = this.#deleteRows(table, rowIds, old);
       for (const index of this.def.indexes)
         if (this.#referenced.has(index.id)) {
-          const keys = this.#encode(index, old, null, rowIds.length);
-          for (let k = 0; k < rowIds.length; k++)
-            if (!this.#hasNullKey(index, old, k))
-              this.statement.parentChecks.push({
-                parentTableId: this.tableId,
-                indexId: index.id,
-                key: keys.key(k).slice(),
-                next: null,
-              });
+          for (const { keys, offset, count } of this.#encode(index, old, null, rowIds.length))
+            for (let k = 0; k < count; k++)
+              if (!this.#hasNullKey(index, old, offset + k))
+                this.statement.parentChecks.push({
+                  parentTableId: this.tableId,
+                  indexId: index.id,
+                  key: keys.key(k).slice(),
+                  next: null,
+                });
         }
       return removed;
     });
@@ -1605,22 +1790,24 @@ export class TableWriterImpl implements TableWriter {
   #parentChecksForChange(old: readonly Vector[], next: readonly Vector[], count: number): void {
     for (const index of this.def.indexes) {
       if (!this.#referenced.has(index.id)) continue;
-      const before = this.#encode(index, old, null, count);
-      const oldKeys = Array.from({ length: count }, (_, k) => before.key(k).slice());
-      const after = this.#encode(index, next, null, count);
-      for (let k = 0; k < count; k++) {
-        if (this.#hasNullKey(index, old, k)) continue;
-        const key = oldKeys[k] as Uint8Array;
-        const now = after.key(k);
-        const same = key.length === now.length && key.every((byte, b) => byte === now[b]);
-        if (!same)
-          this.statement.parentChecks.push({
-            parentTableId: this.tableId,
-            indexId: index.id,
-            key,
-            next: { vectors: next, row: k },
-          });
-      }
+      const oldKeys: Uint8Array[] = [];
+      for (const { keys, count: part } of this.#encode(index, old, null, count))
+        for (let k = 0; k < part; k++) oldKeys.push(keys.key(k).slice());
+      for (const { keys, offset, count: part } of this.#encode(index, next, null, count))
+        for (let k = 0; k < part; k++) {
+          const at = offset + k;
+          if (this.#hasNullKey(index, old, at)) continue;
+          const key = need(oldKeys[at]),
+            now = keys.key(k);
+          const same = key.length === now.length && key.every((byte, b) => byte === now[b]);
+          if (!same)
+            this.statement.parentChecks.push({
+              parentTableId: this.tableId,
+              indexId: index.id,
+              key,
+              next: { vectors: next, row: at },
+            });
+        }
     }
   }
 
@@ -1642,20 +1829,25 @@ export class TableWriterImpl implements TableWriter {
     const live = tx.hooks.liveMemtable(this.tableId, 0).memtable;
     const keysPerRow: Uint8Array[][] = rowIds.map(() => []);
     for (const index of this.def.indexes) {
+      if (this.statement.catalog.index(index.id)?.invalid === true) {
+        for (const keys of keysPerRow) keys.push(NULL_KEY);
+        continue;
+      }
       const delta = live.deltas.get(index.id);
-      const keys = this.#encode(index, old, null, rowIds.length);
       const first = delta?.entryCount ?? 0;
       try {
-        for (let k = 0; k < rowIds.length; k++) {
-          if (this.#hasNullKey(index, old, k)) {
-            keysPerRow[k]?.push(NULL_KEY);
-            continue;
+        for (const { keys, offset, count } of this.#encode(index, old, null, rowIds.length))
+          for (let k = 0; k < count; k++) {
+            const at = offset + k;
+            if (this.#hasNullKey(index, old, at)) {
+              keysPerRow[at]?.push(NULL_KEY);
+              continue;
+            }
+            const start = keys.offsets[k] ?? 0,
+              end = keys.offsets[k + 1] ?? 0;
+            keysPerRow[at]?.push(keys.writer.bytes.slice(start, end));
+            delta?.add(keys.writer.bytes, start, end, rowIds[at] ?? 0, seq, true);
           }
-          const start = keys.offsets[k] ?? 0;
-          const end = keys.offsets[k + 1] ?? 0;
-          keysPerRow[k]?.push(keys.writer.bytes.slice(start, end));
-          delta?.add(keys.writer.bytes, start, end, rowIds[k] ?? 0, seq, true);
-        }
       } finally {
         if (delta !== undefined && delta.entryCount > first)
           tx.undo.push({
@@ -1725,8 +1917,10 @@ export class TableWriterImpl implements TableWriter {
       const seen = indexes.map(() => new Map<string, number>());
       const found: number[] = [];
       const keyed = indexes.map((index) => {
-        const keys = this.#encode(index, batch.columns, rows, batch.length);
-        return Array.from({ length: rows.length }, (_, k) => keys.key(k).slice());
+        const copied: Uint8Array[] = [];
+        for (const { keys, count } of this.#encode(index, batch.columns, rows, batch.length))
+          for (let k = 0; k < count; k++) copied.push(keys.key(k).slice());
+        return copied;
       });
       const decide = (k: number): MaybePromise<void> => {
         for (; k < rows.length; k++) {
@@ -1735,7 +1929,7 @@ export class TableWriterImpl implements TableWriter {
           for (let i = 0; i < indexes.length; i++) {
             const index = need(indexes[i]);
             if (this.#hasNullKey(index, batch.columns, row)) continue;
-            const key = keyed[i]?.[k] as Uint8Array;
+            const key = need(keyed[i]?.[k]);
             const result = new ViewIndex(index, table).resolve(key, found);
             if (result instanceof Promise) return result.then(() => decide(k));
             if (found.length > 0) {
@@ -1760,7 +1954,7 @@ export class TableWriterImpl implements TableWriter {
             for (let i = 0; i < indexes.length; i++) {
               const index = need(indexes[i]);
               if (this.#hasNullKey(index, batch.columns, row)) continue;
-              const text = String.fromCharCode(...(keyed[i]?.[k] as Uint8Array));
+              const text = String.fromCharCode(...need(keyed[i]?.[k]));
               if (!seen[i]?.has(text)) seen[i]?.set(text, row);
             }
         }

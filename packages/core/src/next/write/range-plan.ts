@@ -1,4 +1,5 @@
 /** Publication-wide minimum: planning references only the snapshot's existing metadata. */
+import { indexMaximumKeyBytes } from "./index-limits.js";
 import type { IndexRangePlan, KeyRange } from "../access/key-index.js";
 import { MAX_BLOB_BYTES } from "../access/space.js";
 import { StreamingRangeCursor } from "./range-cursor.js";
@@ -31,6 +32,7 @@ export function planIndexRange(
       published = memtable.published?.runs.get(id);
     const width = Math.max(
       delta?.maxKeyBytes ?? 0,
+      memtable.state === "live" ? indexMaximumKeyBytes(index.def, table.def) : 0,
       published === undefined ? 0 : runKeyBytes(published),
     );
     keyBytes = Math.max(keyBytes, width);

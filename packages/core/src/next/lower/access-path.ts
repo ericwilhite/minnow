@@ -207,7 +207,7 @@ export function accessPath(
 
   // 1. A unique index fully fixed by equalities (or one column by an IN list): keyLookup.
   const unique = table.indexes
-    .filter((index) => index.unique)
+    .filter((index) => index.unique && index.invalid !== true)
     .sort((a, b) => Number(b.role === "primary") - Number(a.role === "primary"));
   for (const index of unique) {
     const positions = index.columnIds.map(positionOf);
@@ -245,7 +245,7 @@ export function accessPath(
   // 2. An ordered index bounding few rows: indexRange.
   let best: { index: IndexDef; fraction: number; rel: Rel; used: Set<number> } | null = null;
   for (const index of table.indexes) {
-    if (index.kind !== "ordered") continue;
+    if (index.kind !== "ordered" || index.invalid === true) continue;
     const prefix: ScalarExpr[] = [];
     const used = new Set<number>();
     let fraction = 1;

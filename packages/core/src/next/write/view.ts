@@ -12,6 +12,7 @@ import { StreamingRangeCursor } from "./range-cursor.js";
 import type { Held } from "../format/reachable.js";
 import type { CatalogView, ColumnDef, IndexDef, TableDef } from "../access/catalog.js";
 import {
+  IndexUnavailableError,
   inKeyRange,
   prefixRange,
   type IndexCursor,
@@ -671,6 +672,7 @@ export class SnapshotImpl implements Snapshot {
       const def = table.def.indexes.find((index) => index.id === indexId);
       if (def === undefined)
         throw new RangeError(`Table ${String(tableId)} has no index ${String(indexId)}`);
+      if (def.invalid === true) throw new IndexUnavailableError(def.id);
       reader = new ViewIndex(def, table);
       this.#indexes.set(key, reader);
     }
@@ -790,6 +792,7 @@ export class ViewIndex implements IndexReader {
 
   /** `resolve` of the key `bytes[start … end)` (a view is made only if a run is searched). */
   resolveRange(bytes: Uint8Array, start: number, end: number, out: number[]): MaybePromise<void> {
+    if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
     const done = this.#begin(bytes, start, end);
     return done === undefined ? this.#deliver(out) : done.then(() => this.#deliver(out));
   }
@@ -802,6 +805,7 @@ export class ViewIndex implements IndexReader {
     hash?: number,
     bloomHash?: number,
   ): MaybePromise<number> {
+    if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
     const done = this.#begin(bytes, start, end, hash, bloomHash);
     return done === undefined ? this.#hitCount : done.then(() => this.#hitCount);
   }
@@ -1108,17 +1112,20 @@ export class ViewIndex implements IndexReader {
 
   planRange(range: KeyRange, direction: "asc" | "desc"): IndexRangePlan {
     this.table.snapshot.check();
+    if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
     if (this.def.kind !== "ordered") throw new TypeError("An equality index serves lookups only");
     return planIndexRange(this, range, direction);
   }
 
   range(range: KeyRange, direction: "asc" | "desc"): IndexCursor {
+    if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
     if (this.def.kind !== "ordered") throw new TypeError("An equality index serves lookups only");
     return new StreamingRangeCursor(this, range, direction);
   }
 
   /** Every live (key, rowId) in `range`, resolved, sorted by key then row id. */
   async collect(range: KeyRange): Promise<Array<{ key: Uint8Array; rowId: number }>> {
+    if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
     const snapshot = this.table.snapshot;
     const shared = snapshot.shared;
     const bound = snapshot.bound;

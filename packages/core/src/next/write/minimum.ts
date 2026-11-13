@@ -3,6 +3,7 @@ import type { MaybePromise } from "../access/key-index.js";
 import type { RunRef } from "../format/manifest.js";
 import { parseCharge } from "../format/manifest-codec.js";
 import { taskClock, yieldTask } from "../exec/pipeline.js";
+import { indexMaximumKeyBytes } from "./index-limits.js";
 import type { Catalog } from "./catalog.js";
 import { GroupDirectory } from "./groups.js";
 import { mergeInputBytes, MERGE_FIXED_BYTES, MERGE_INPUT_BYTES } from "./merge.js";
@@ -50,7 +51,10 @@ export function writeStepMinimum(
         largest = Math.max(largest, view.groups.root(group).length);
         yield;
       }
-      for (const index of catalog.table(view.tableId)?.indexes ?? []) {
+      const definition = catalog.table(view.tableId);
+      for (const index of definition?.indexes ?? []) {
+        if (definition !== undefined)
+          keyBytes = Math.max(keyBytes, indexMaximumKeyBytes(index, definition));
         const refs = view.runs.get(index.id) ?? [];
         let missing = 0,
           pending = 0;
@@ -80,6 +84,7 @@ export function writeStepMinimum(
     return {
       metadata:
         RUN_ENCODER_MINIMUM +
+        (keyBytes > 2048 ? 8 * keyBytes : 0) +
         4096 +
         directory +
         runMetadata +
