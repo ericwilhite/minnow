@@ -2267,6 +2267,12 @@ its row limit; pending rows stage through the existing publication protocol. Com
 and rollback to a savepoint all retain the correct prefix after such a freeze. A retained
 allocation from another execution forces this relief before the memtable is full.
 
+`scripts/write-hot-key-cpu.test.ts` checks hot-key ordering work structurally. It counts
+row/sequence input reads on the delta's arrays, requires a linear bound, and compares that
+work with the legacy traversal. It preserves the generated keys and exact row order. CPU
+samples are diagnostic evidence only: JIT, GC and shared runners must not decide this law.
+An unnecessary hot-chain heapsort is rejected by the work bound without a timing threshold.
+
 The long-key range, poisoned-reader, retained-summary and byte-bounded flush campaigns put
 each original history in a separate test body. Every body regenerates the original fast-check stream with the same
 seed, run count and examples; only its assigned history performs storage work. Together the
