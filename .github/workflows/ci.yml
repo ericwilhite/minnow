@@ -68,12 +68,13 @@ jobs:
       - name: Heap plateau
         run: npm run soak:memory
 
-  # The unit suite under coverage, in six parts. Every test file runs in exactly one part, chosen
+  # The unit suite under coverage, in seven parts. Every test file runs in exactly one part, chosen
   # by its measured duration (scripts/test-shards.ts, weights in scripts/test-durations.json) so the
   # parts finish together; each part starts its longest files first. The maintenance workload has
   # a deadline, so vitest.config.ts runs it alone after the rest of whichever part holds it, as in
-  # a whole run. A part's wall time is bounded below by its longest file:
-  # directory-publication-compat.test.ts, about twelve minutes under coverage on a hosted runner.
+  # a whole run. A part's wall time is bounded below by its longest file, about nine minutes under
+  # coverage on a hosted runner (spill/chaos-crash.test.ts). A campaign split across files keeps
+  # its files and its reach-union check in one part.
   unit:
     name: Unit tests with coverage (${{ matrix.part }})
     runs-on: ubuntu-latest
@@ -81,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [1/6, 2/6, 3/6, 4/6, 5/6, 6/6]
+        part: [1/7, 2/7, 3/7, 4/7, 5/7, 6/7, 7/7]
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/install
@@ -144,6 +145,15 @@ jobs:
       # Replays every part's results, fails on any failed test, and enforces the coverage floors.
       - name: Merge the parts and enforce the coverage floors
         run: npm run test:coverage -- --merge-reports
+      # The parts choose their files by measured duration; this proves from what each part
+      # reported that together they ran every test file a whole run would, each exactly once.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: durations-vitest-coverage-*
+          path: durations/coverage
+          merge-multiple: true
+      - name: Require every test file in exactly one part
+        run: npx vite-node scripts/check-parts.mts vitest durations/coverage
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v7
@@ -183,17 +193,16 @@ jobs:
         # (playwright.shared.mjs, weights in scripts/browser-durations.json); every spec runs in
         # exactly one part. Playwright's own --shard cut equal spec counts in file order, which left
         # one WebKit part 18 minutes beside another's 11. Each engine's rebuild-owner and site suites
-        # run once: on Chromium's and Firefox's first part, whose `reserve` (that work's length in
-        # the weights' units) leaves it correspondingly less of the library; and for WebKit on a job
-        # of their own, because its macOS runners have room for one worker and those two suites
-        # alone take about ten minutes there.
+        # run once: on Chromium's and Firefox's first part, which takes correspondingly less of the
+        # library (`firstPartReserve` in the weights, which every part reads, so all compute the
+        # same split); and for WebKit on a job of their own, because its macOS runners have room
+        # for one worker and those two suites alone take about ten minutes there.
         include:
           - name: chromium 1/2
             browser: chromium
             os: ubuntu-latest
             cache_path: ~/.cache/ms-playwright
             part: 1/2
-            reserve: 640000
             artifact: chromium-1
             site: true
             consumer: true
@@ -208,7 +217,6 @@ jobs:
             os: ubuntu-latest
             cache_path: ~/.cache/ms-playwright
             part: 1/2
-            reserve: 650000
             artifact: firefox-1
             site: true
           - name: firefox 2/2
@@ -268,7 +276,6 @@ jobs:
         env:
           MINNOW_BROWSER: ${{ matrix.browser }}
           MINNOW_BROWSER_PART: ${{ matrix.part }}
-          MINNOW_BROWSER_RESERVE: ${{ matrix.reserve }}
       - name: Upload library reports, traces, and plans
         if: always() && (steps.library.outcome == 'success' || steps.library.outcome == 'failure')
         uses: actions/upload-artifact@v7
@@ -330,12 +337,29 @@ jobs:
     if: always()
     needs: browser-matrix
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Require every browser engine
         env:
           BROWSER_MATRIX_RESULT: ${{ needs.browser-matrix.result }}
         run: test "$BROWSER_MATRIX_RESULT" = "success"
+      # The library parts choose their specs by measured duration; this proves from what each part
+      # reported that together they ran every test an unsplit run lists, each exactly once.
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/install
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: durations-playwright-*
+          path: durations
+      - name: Require every library test in exactly one part
+        run: |
+          for browser in chromium firefox webkit; do
+            mkdir -p "parts/$browser"
+            cp durations/durations-playwright-"$browser"-*/*.json "parts/$browser/"
+            npx vite-node scripts/check-parts.mts playwright "$browser" "parts/$browser"
+          done
 
   engines-floor-part:
     name: Unit tests on the oldest supported Node (${{ matrix.shard }})
@@ -345,10 +369,20 @@ jobs:
     # slowly as 24 (40-76 s each); with three hash-count shards, two took ~25 of their 30 minutes
     # and one overran on 2026-11-11.
     timeout-minutes: 30
+    # The first part also runs the full `npm run build` on Node 22; the rest only build what the
+    # tests import. Every part gives the first one the same head start in its assignment, so the
+    # reserve must be the same for all of them, which a job-level value guarantees.
+    env:
+      MINNOW_SHARD_RESERVE: "110000"
     strategy:
       fail-fast: false
       matrix:
-        shard: [1/4, 2/4, 3/4, 4/4]
+        include:
+          - shard: 1/4
+            build: true
+          - shard: 2/4
+          - shard: 3/4
+          - shard: 4/4
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/install
@@ -356,8 +390,11 @@ jobs:
           # package.json declares ">=22". This job is what makes that claim true rather than
           # aspirational — node:sqlite in particular moved between 22 and 24.
           node-version: 22
-      - run: npm run build
-      # Both projects, so the maintenance workload runs in whichever shard holds it, alone and
+      - if: matrix.build
+        run: npm run build
+      - if: ${{ !matrix.build }}
+        run: npm run test:prepare
+      # Every project, so the maintenance workload runs in whichever shard holds it, alone and
       # after that shard's other files, as in a whole run.
       - run: >-
           npm run test:unit -- --shard=${{ matrix.shard }} --reporter=default --reporter=json
@@ -379,9 +416,20 @@ jobs:
     if: always()
     needs: engines-floor-part
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Require every shard
         env:
           ENGINES_FLOOR_RESULT: ${{ needs.engines-floor-part.result }}
         run: test "$ENGINES_FLOOR_RESULT" = "success"
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/install
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: durations-vitest-plain-*
+          path: durations/plain
+          merge-multiple: true
+      - name: Require every test file in exactly one part
+        run: npx vite-node scripts/check-parts.mts vitest durations/plain

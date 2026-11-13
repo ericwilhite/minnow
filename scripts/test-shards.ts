@@ -76,10 +76,14 @@ export default class DurationSequencer extends BaseSequencer {
     unitOf.forEach((unit, i) =>
       unitWeight.set(unit, (unitWeight.get(unit) ?? 0) + (weights[i] ?? 0)),
     );
+    // Other work the first part also does before its tests (`MINNOW_SHARD_RESERVE`, milliseconds
+    // of wall time: the oldest-Node part that runs the full build) holds all its workers.
+    const reserve = (Number(process.env.MINNOW_SHARD_RESERVE ?? "") || 0) * all;
     const unitParts = assignParts(
       units,
       units.map((unit) => unitWeight.get(unit) ?? 0),
       count,
+      [reserve],
     );
     const partOf = new Map(units.map((unit, i) => [unit, unitParts[i]]));
     const parts = unitOf.map((unit) => partOf.get(unit));

@@ -130,26 +130,31 @@ announces an id so clients resend and owners register again;
 
 The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push and pull
 request, spread across parallel jobs. One job runs the format, type, lint, build, API contract,
-SQLLogicTest, and heap-plateau checks. The unit suite runs under coverage in six Vitest parts; a
+SQLLogicTest, and heap-plateau checks. The unit suite runs under coverage in seven Vitest parts; a
 final job merges their results and coverage and enforces the coverage floors on the whole suite,
 exactly as `npm run test:coverage` does. The `Format, types, lint, build, unit tests` check requires
 all of them, and the `Unit tests on the oldest supported Node` check requires all four of that
-suite's parts on Node 22.
+suite's parts on Node 22. The first of those also runs the full `npm run build` on Node 22.
 
 The parts are balanced by measured duration, not by file count. Every test file runs in exactly one
 part, and each part starts its longest files first. `scripts/test-shards.ts` does this for Vitest's
 `--shard`, using the per-file times in `scripts/test-durations.json`; the maintenance workload still
 runs alone, after the rest of whichever part holds it. The weights only steer the split: a stale or
-missing weight makes a part slower, but it cannot skip a file or run one twice. Each CI part uploads
+missing weight makes a part slower, but it cannot skip a file or run one twice. That holds only if
+every part computes the same split, so after the parts finish, each gate reads what every part
+reported running and fails unless together they ran exactly what one unsplit run lists, each test
+once (`scripts/check-parts.mts`). Each CI part uploads
 its timings as a `durations-*` artifact; refresh the weights from a run with
 `gh run download <run id> --pattern 'durations-*' --dir .cache/durations` and
-`npm run test:durations -- .cache/durations`.
+`npm run test:durations -- .cache/durations`. A file's time varies by about half from run to run
+with what shares its runner, so a refresh averages each measurement with the committed weight.
 
 Browser jobs run independently: Chromium and Firefox on Linux, and WebKit on macOS. Each engine's
 library suite is split into parts the same way, by the per-spec times in
 `scripts/browser-durations.json` (`MINNOW_BROWSER_PART=1/3 MINNOW_BROWSER=webkit` selects a part
-locally). The rebuild-owner and site suites run once per engine, and Chromium also runs the packed
-consumer. Every engine there has OPFS in workers, so a missing OPFS API fails these jobs rather than
+locally). The rebuild-owner and site suites run once per engine: on the first Chromium and Firefox
+parts, which take correspondingly less of the library, and in a WebKit job of their own. Chromium
+also runs the packed consumer. Every engine there has OPFS in workers, so a missing OPFS API fails these jobs rather than
 skipping their OPFS cases. The `Real browsers` check requires every engine to pass. Splitting the
 jobs preserves their 45-minute deadlines and leaves time to save failure artifacts. A test that passes only on retry still fails the gate. Workflow dependency installation
 retries network failures up to three times, with short delays; other installation failures stop

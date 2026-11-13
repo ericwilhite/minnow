@@ -6,12 +6,14 @@
  *
  * CI uploads one JSON report per part: `vitest-coverage-*.json` from the coverage parts,
  * `vitest-plain-*.json` from the oldest-Node parts, and `playwright-<browser>-*.json` from each
- * real-browser part. Each profile present in the input replaces the committed one whole, so a
- * deleted file's weight leaves with it; a profile with no reports keeps its committed weights.
- * The weights only steer the split, never which files run, so a stale table costs time, not
- * coverage.
+ * real-browser part. A file's time varies by half from run to run with what shares its runner,
+ * so a measured file's new weight is the mean of its committed weight and this measurement, and the
+ * table settles over refreshes rather than chasing one run. A file measured for the first time
+ * takes its measurement; a file this refresh did not measure keeps its weight while it exists and
+ * leaves the table once it is deleted. The weights only steer the split, never which files run, so
+ * a stale table costs time, not coverage.
  */
-import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -53,6 +55,18 @@ function repositoryPath(path: string): string {
     if (at >= 0) return posix.slice(at + 1);
   }
   return relative(root, path).split("\\").join("/");
+}
+
+/** The committed profile updated with a refresh's measurements (see the header). */
+function settle(committed: Profile | undefined, measured: Profile): Profile {
+  const next: Profile = {};
+  for (const [file, weight] of Object.entries(committed ?? {}))
+    if (!(file in measured) && existsSync(join(root, file))) next[file] = weight;
+  for (const [file, weight] of Object.entries(measured)) {
+    const before = committed?.[file];
+    next[file] = before === undefined ? weight : Math.round((before + weight) / 2);
+  }
+  return sorted(next);
 }
 
 function sorted(profile: Profile): Profile {
@@ -101,14 +115,14 @@ for (const input of inputs) {
 
 if (vitest.size > 0) {
   const table = JSON.parse(readFileSync(vitestTable, "utf8")) as Record<string, Profile>;
-  for (const [profile, measured] of vitest) table[profile] = sorted(measured);
+  for (const [profile, measured] of vitest) table[profile] = settle(table[profile], measured);
   writeFileSync(vitestTable, `${JSON.stringify(table, null, 2)}\n`);
   for (const [profile, measured] of vitest)
     console.log(`vitest ${profile}: ${String(Object.keys(measured).length)} files`);
 }
 if (browsers.size > 0) {
   const table = JSON.parse(readFileSync(browserTable, "utf8")) as Record<string, Profile>;
-  for (const [browser, measured] of browsers) table[browser] = sorted(measured);
+  for (const [browser, measured] of browsers) table[browser] = settle(table[browser], measured);
   writeFileSync(browserTable, `${JSON.stringify(table, null, 2)}\n`);
   for (const [browser, measured] of browsers)
     console.log(`playwright ${browser}: ${String(Object.keys(measured).length)} files`);

@@ -109,5 +109,9 @@
     "packages/core/browser-tests/worker.spec.ts": 8032,
     "packages/core/browser-tests/write-scope-admission-bench.spec.ts": 0,
     "packages/core/browser-tests/write-scope-admission.spec.ts": 47736
+  },
+  "firstPartReserve": {
+    "chromium": 648000,
+    "firefox": 828000
   }
 }

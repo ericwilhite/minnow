@@ -68,8 +68,8 @@ function listFiles(dir) {
  * Playwright's `--shard` cuts the file list into equal counts in file order, and three specs hold
  * about half of each engine's time, so one WebKit part ran 18 minutes beside another's 11. Here
  * the parts are chosen by the measured per-browser durations in scripts/browser-durations.json
- * (`MINNOW_BROWSER` names the browser; `MINNOW_BROWSER_RESERVE` is other work the first part also
- * runs, in the same units). Every spec the config would run goes to exactly one part,
+ * (`MINNOW_BROWSER` names the browser; its `firstPartReserve` there is the other work CI's first
+ * part also runs, in the same units). Every spec the config would run goes to exactly one part,
  * whatever the table says: it only steers the split (scripts/test-parts.mjs).
  *
  * @param {string} testDir the config's testDir
@@ -85,7 +85,7 @@ export function partTestMatch(testDir, testIgnore) {
   );
   const browser = process.env.MINNOW_BROWSER ?? "";
   const weights = table[browser];
-  if (weights === undefined)
+  if (weights === undefined || browser === "firstPartReserve")
     throw new Error(`MINNOW_BROWSER must name a browser in browser-durations.json, got ${browser}`);
   const root = fileURLToPath(new URL(".", import.meta.url));
   const specs = listFiles(isAbsolute(testDir) ? testDir : join(root, testDir))
@@ -93,9 +93,10 @@ export function partTestMatch(testDir, testIgnore) {
     .map((file) => relative(root, file).split("\\").join("/"))
     .sort();
   const fallback = defaultWeight(weights);
-  // Work the first part also runs besides the library (another runner's suites), so it takes
-  // correspondingly less of the library.
-  const reserve = Number(process.env.MINNOW_BROWSER_RESERVE ?? "") || 0;
+  // The first part also runs the engine's owner and site suites in CI, so it takes correspondingly
+  // less of the library. The reserve lives in the table every part reads, never in one part's
+  // environment: parts that computed different assignments would skip specs or run them twice.
+  const reserve = table.firstPartReserve?.[browser] ?? 0;
   const parts = assignParts(
     specs,
     specs.map((spec) => weights[spec] ?? fallback),
