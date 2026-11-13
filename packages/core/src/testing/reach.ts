@@ -4612,3 +4612,19 @@ export const SNAPSHOT_INPUT_REACH = [
   "sync close failure",
   "async close failure",
 ] as const;
+
+export const SNAPSHOT_EXPORT_LIFETIME_REACH = [
+  "one persisted group",
+  "many persisted groups",
+  "stalled producer cancelled",
+  "stalled",
+  "throws",
+  "rejects",
+] as const;
+
+export const SNAPSHOT_SOURCE_REACH = [
+  "resident vector",
+  "published constant page",
+  "published dictionary page",
+  "array byte equality",
+] as const;

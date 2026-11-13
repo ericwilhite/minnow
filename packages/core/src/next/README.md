@@ -3522,7 +3522,11 @@ until it settles. A refused or cancelled stream must never be published as a dat
 
 `write/snapshot-export.ts` adds `exportPinnedSnapshot`: it takes ownership of a committed pin,
 borrows the matching catalog byte producer, and waits for sink consumption before advancing.
-Every exit releases the pin. It emits stable visible row order, including committed memory rows,
+Every exit releases the pin, even when a catalog producer stalls or its cleanup never settles.
+Export uses the optional internal `portableSegments` traversal: one temporary segment and
+export-owned decoded root at a time; ordinary query segment and cache lifetimes are unchanged.
+Traversal close releases its metadata and memory borrows before the next segment.
+It emits stable visible row order, including committed memory rows,
 with deleted/pending rows excluded. Source pages use one-pass non-retaining reads. The optional
 internal memory `portableChunk` hook hands back either a resident borrow or published storage;
 a publication during export cannot force a whole large value into a decode buffer.

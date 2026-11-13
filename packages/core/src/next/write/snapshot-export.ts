@@ -1,4 +1,5 @@
 /** Pinned logical export. No source writes, native addresses, whole-table or whole-value copy. */
+import { snapshotInput } from "./snapshot-iterator.js";
 import { DURABLE_CODECS } from "../durable-format.js";
 import type { ColumnDef } from "../access/catalog.js";
 import { MAX_LSN, type Segment, type Snapshot } from "../access/snapshot.js";
@@ -215,7 +216,7 @@ export async function exportPinnedSnapshot(
     let catalogBytes = 0,
       catalogCrc = 0,
       part = 1;
-    for await (const chunk of catalog) {
+    for await (const chunk of snapshotInput(catalog, work.signal)) {
       await pace(work);
       for (let from = 0; from < chunk.length; from += SNAPSHOT_PAYLOAD_BYTES) {
         const bytes = chunk.subarray(from, from + SNAPSHOT_PAYLOAD_BYTES);
@@ -241,7 +242,11 @@ export async function exportPinnedSnapshot(
         snapshotNumbers([def.id, def.schemaVersion, columns.length], record.subarray(0, 24));
         await output.frame(SnapshotKind.tableBegin, tableObject, 0, record.subarray(0, 24));
         let emitted = 0;
-        for (const segment of table.segments) {
+        if (table.portableSegments === undefined)
+          throw new SnapshotScopeError(
+            "This table reader does not support bounded portable traversal",
+          );
+        for await (const segment of table.portableSegments(work)) {
           const deleted = await segment.deletions();
           for (let first = 0; first < segment.rowCount; first += SNAPSHOT_BLOCK_ROWS) {
             await pace(work);
@@ -357,7 +362,6 @@ export async function exportPinnedSnapshot(
               }
             }
             emitted += count;
-            if (segment.kind === "group") segment.releaseRoot?.();
           }
         }
         if (emitted !== table.liveRowCount)

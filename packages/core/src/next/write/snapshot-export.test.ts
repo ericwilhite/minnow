@@ -2,7 +2,11 @@
 import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
-import { createReach, SNAPSHOT_EXPORT_REACH } from "../../testing/reach.js";
+import {
+  createReach,
+  SNAPSHOT_EXPORT_REACH,
+  SNAPSHOT_EXPORT_LIFETIME_REACH,
+} from "../../testing/reach.js";
 import { SnapshotKind, SnapshotStreamReader } from "../format/snapshot.js";
 import type { ByteBudget } from "../storage/extents.js";
 import { exportPinnedSnapshot } from "./snapshot-export.js";
@@ -129,9 +133,16 @@ for (const seed of seedsFor("next-snapshot-export", [0xb253, 0xb254]))
                   st.table(table).delete(batch(locators([0], table)), null),
                 );
               reach.reach(deleted ? "deleted rows" : "all live");
-              if (mode === "persisted") await path.flush();
+              if (mode === "persisted") await path.recycleLog();
               const pin = path.pin();
-              if (mode === "repoint") await path.flush();
+              if (mode === "repoint") await path.recycleLog();
+              const checked = pin.table(table, { budget: new Budget() });
+              const firstSegment = checked.segments[0];
+              expect(firstSegment?.kind).toBe(mode === "persisted" ? "group" : "memory");
+              if (firstSegment?.kind === "memory") {
+                const borrowed = await firstSegment.portableChunk?.(1, 0);
+                expect(borrowed?.kind).toBe(mode === "repoint" ? "stored" : "resident");
+              }
               const chunks: Uint8Array[] = [],
                 budget = new Budget();
               let calls = 0;
@@ -146,7 +157,7 @@ for (const seed of seedsFor("next-snapshot-export", [0xb253, 0xb254]))
                       await autocommit(path, (st) =>
                         st.table(table).insert(batch(ints([999]), texts(["later"])), null),
                       );
-                      if (mode === "during export") await path.flush();
+                      if (mode === "during export") await path.recycleLog();
                     }
                   },
                 },
@@ -221,7 +232,7 @@ it("streams a large durable value with bounded charged frame memory", async () =
     });
     const text = "z".repeat(3 * 1024 * 1024 + 17);
     await autocommit(path, (st) => st.table(table).insert(batch(ints([1]), texts([text])), null));
-    await path.flush();
+    await path.recycleLog();
     const chunks: Uint8Array[] = [],
       budget = new Budget(5 << 20);
     await exportPinnedSnapshot(
@@ -280,7 +291,7 @@ for (const seed of seedsFor("next-snapshot-export-chunks", [0xb255, 0xb256]))
             );
             expect(await values(bytes)).toEqual([ids, strings]);
             expect(budget.used).toBe(0);
-            await path.flush();
+            await path.recycleLog();
           }
         } finally {
           await h.close();
@@ -321,4 +332,181 @@ it("refuses a statement view without ending its caller-owned lifetime", async ()
     await h.close();
   }
   expect(h.governor.usedBytes).toBe(0);
+});
+
+for (const seed of seedsFor("next-snapshot-export-lifetime", [0xb25d, 0xb25e]))
+  it(`bounds metadata and interrupts stalled catalog producers seed ${String(seed)}`, async () => {
+    const reach = createReach("snapshot export lifetime", SNAPSHOT_EXPORT_LIFETIME_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 20, max: 48 }),
+        fc.constantFrom("stalled", "throws", "rejects"),
+        async (groups, cleanup) => {
+          reach.beginHistory();
+          const peaks: number[] = [];
+          for (const count of [1, groups]) {
+            const h = new Harness("strict", "memory", 1);
+            let path = await h.open();
+            try {
+              await autocommit(path, (st) =>
+                st.changeCatalog({
+                  kind: "createTable",
+                  table: tableInput("many", [column("id", INT, false)]),
+                }),
+              );
+              for (let i = 0; i < count; i++) {
+                await autocommit(path, (st) => st.table(1).insert(batch(ints([i])), null));
+                await path.quiesce();
+              }
+              await path.recycleLog();
+              await h.close();
+              path = await h.open();
+              const pin = path.pin(),
+                table = pin.table(1, { budget: new Budget() });
+              expect(table.segments.filter((s) => s.kind === "group").length).toBe(count);
+              let segmentArrays = 0;
+              const originalTable = pin.table.bind(pin);
+              pin.table = (...args) =>
+                new Proxy(originalTable(...args), {
+                  get(target, key) {
+                    if (key === "segments") segmentArrays++;
+                    if (key === "portableSegments") return target.portableSegments.bind(target);
+                    return Reflect.get(target, key, target) as unknown;
+                  },
+                });
+              const b = new Budget();
+              let footer = -1;
+              await exportPinnedSnapshot(
+                pin,
+                new Uint8Array(16),
+                catalog(),
+                {
+                  write(bytes) {
+                    if (bytes[4] === SnapshotKind.footer) footer = b.used;
+                  },
+                },
+                b,
+              );
+              // Only the frame/control credits remain: no borrowed root survives traversal.
+              expect(footer).toBeLessThanOrEqual((1 << 20) + 8192 + 2048);
+              expect(b.used).toBe(0);
+              expect(segmentArrays).toBe(0);
+              peaks.push(b.peak);
+              reach.reach(count === 1 ? "one persisted group" : "many persisted groups");
+            } finally {
+              await h.close();
+            }
+            expect(h.governor.usedBytes).toBe(0);
+          }
+          expect(Math.abs((peaks[0] ?? 0) - (peaks[1] ?? 0))).toBeLessThan(4096);
+          const h = new Harness("strict", "memory"),
+            path = await h.open(),
+            pin = path.pin(),
+            b = new Budget(),
+            controller = new AbortController();
+          let enter!: () => void, unblock!: () => void;
+          const entered = new Promise<void>((r) => {
+              enter = r;
+            }),
+            blocked = new Promise<IteratorResult<Uint8Array>>((r) => {
+              unblock = () => r({ done: true, value: undefined });
+            });
+          const source: AsyncIterable<Uint8Array> = {
+            [Symbol.asyncIterator]() {
+              return {
+                next() {
+                  enter();
+                  return blocked;
+                },
+                return() {
+                  if (cleanup === "throws") throw new Error("cleanup throws");
+                  if (cleanup === "rejects") return Promise.reject(new Error("cleanup rejects"));
+                  return new Promise<IteratorResult<Uint8Array>>(() => undefined);
+                },
+              };
+            },
+          };
+          let settled = false;
+          const task = exportPinnedSnapshot(
+            pin,
+            new Uint8Array(16),
+            source,
+            { write: () => undefined },
+            b,
+            {
+              signal: controller.signal,
+            },
+          )
+            .catch((error: unknown) => {
+              expect(error).toBe(controller.signal.reason);
+            })
+            .finally(() => {
+              settled = true;
+            });
+          try {
+            await entered;
+            controller.abort(new Error("stalled catalog cancelled"));
+            await Promise.race([task, new Promise((r) => setTimeout(r, 100))]);
+            expect(settled).toBe(true);
+            expect(pin.released).toBe(true);
+            expect(b.used).toBe(0);
+            reach.reach("stalled producer cancelled");
+            reach.reach(cleanup);
+          } finally {
+            unblock();
+            await task;
+            await h.close();
+          }
+        },
+      ),
+      { seed, numRuns: 9 },
+    );
+    reach.assertReached();
+  }, 60_000);
+
+// Pinned review history: cancellation must settle before the producer is unblocked.
+it("cancels the pinned stalled-catalog history without awaiting producer cleanup", async () => {
+  const h = new Harness("strict", "memory"),
+    path = await h.open(),
+    pin = path.pin(),
+    b = new Budget(),
+    controller = new AbortController();
+  let enter!: () => void, unblock!: () => void;
+  const ready = new Promise<void>((r) => {
+      enter = r;
+    }),
+    gate = new Promise<void>((r) => {
+      unblock = r;
+    });
+  let settled = false;
+  const task = exportPinnedSnapshot(
+    pin,
+    new Uint8Array(16),
+    (async function* () {
+      enter();
+      await gate;
+      yield new Uint8Array([1]);
+    })(),
+    { write: () => undefined },
+    b,
+    { signal: controller.signal },
+  )
+    .catch((error: unknown) => {
+      expect(error).toBe(controller.signal.reason);
+    })
+    .finally(() => {
+      settled = true;
+    });
+  try {
+    await ready;
+    controller.abort(new Error("cancel review history"));
+    await Promise.race([task, new Promise((r) => setTimeout(r, 100))]);
+    expect(settled).toBe(true);
+    expect(pin.released).toBe(true);
+    expect(b.used).toBe(0);
+  } finally {
+    unblock();
+    await task;
+    await h.close();
+  }
 });

@@ -105,6 +105,10 @@ for (const seed of seedsFor("next-snapshot-physical", [0xb257, 0xb258]))
           make(INT, [salt, null, -salt]),
           make({ kind: "float32" }, [-0, null, Math.fround(salt / 3)]),
           make({ kind: "float64" }, [-0, null, salt / 7]),
+          make({ kind: "date" }, [salt, null, -salt]),
+          make({ kind: "time" }, [123456789n, null, 86400000000n]),
+          make({ kind: "timestamp", zoned: false }, [-(2n ** 60n), null, 2n ** 60n]),
+          make({ kind: "timestamp", zoned: true }, [2n ** 60n, null, -123n]),
           make({ kind: "int64" }, [2n ** 60n + BigInt(salt), null, -(2n ** 61n)]),
           make({ kind: "interval" }, [
             { months: salt, days: -3, micros: 2n ** 60n },
@@ -117,6 +121,15 @@ for (const seed of seedsFor("next-snapshot-physical", [0xb257, 0xb258]))
               { coefficient: 2n ** 100n + BigInt(salt), special: 0, scale: 3 },
               null,
               { coefficient: -123n, special: 0, scale: 7 },
+            ],
+            "int128",
+          ),
+          make(
+            { kind: "decimal", precision: null, scale: null },
+            [
+              { coefficient: 0n, special: 1, scale: 0 },
+              { coefficient: 0n, special: 2, scale: 0 },
+              { coefficient: 0n, special: 3, scale: 0 },
             ],
             "int128",
           ),
@@ -146,11 +159,14 @@ for (const seed of seedsFor("next-snapshot-physical", [0xb257, 0xb258]))
             await autocommit(path, (st) =>
               st.table(1).insert(batch(ints([1, 2, 3]), ...vectors), null),
             );
-            if (persisted) await path.flush();
+            if (persisted) await path.recycleLog();
             const bytes: Uint8Array[] = [],
-              b = budget();
+              b = budget(),
+              pin = path.pin(),
+              table = pin.table(1, { budget: b });
+            expect(table.segments[0]?.kind).toBe(persisted ? "group" : "memory");
             await exportPinnedSnapshot(
-              path.pin(),
+              pin,
               new Uint8Array(16),
               catalog(),
               {

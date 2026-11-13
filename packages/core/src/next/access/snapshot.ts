@@ -97,6 +97,7 @@
  *   (`WritePathStats`), and bounded as above. Buffers it hands out are immutable: never write to
  *   them.
  */
+import type { TaskWork } from "../task.js";
 import type { ColumnChunk, GroupRef, GroupRoot } from "../format/manifest.js";
 import type { Layout } from "../types.js";
 import type { ColumnStatistics } from "../types.js";
@@ -179,6 +180,9 @@ export interface TableSnapshot {
   readonly liveRowCount: number;
   /** In row-id order; `segments[i].index === i` is the locator segment. */
   readonly segments: readonly Segment[];
+  /** Export-only traversal: at most one temporary segment/root alive, released on advance/close.
+   * Never materializes segments or pins metadata for the whole table. Missing means unsupported. */
+  portableSegments?(work?: TaskWork): AsyncIterable<Segment>;
 }
 
 export type Segment = GroupSegment | MemorySegment;
