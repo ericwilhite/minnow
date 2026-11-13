@@ -1,0 +1,30 @@
+{
+  "parent": "74403e472d6d2bbe9dd2362057609b44723fd652",
+  "cases": 384,
+  "parentSuccesses": 133,
+  "candidateSuccesses": 322,
+  "lostSuccesses": [],
+  "wrongResults": [],
+  "peakIncreases": [],
+  "unpinnedTotalIncreases": [],
+  "cleanupZero": true,
+  "maxQueryPeakDelta": 0,
+  "maxQueryPeakSaving": 39588600,
+  "success": true,
+  "candidateSourceHashes": {
+    "exec/filter.ts": "b24ab872b9548d7e5f0e28eda615af9f399ae6bc4a8941a5298e0fa287e2b3d4",
+    "exec/projection-step.ts": "8a06e0eecf282f1e1a3a63151aac42d8ffa75726df1625e17cd0f2361802857d",
+    "exec/kernels/case.ts": "523d16e62379104a5f4eb5acb8822cc8e853a07b6338cbf7e6460d48752d03e5",
+    "exec/kernels/vectors.ts": "146164ca7887b8452e7fb1023072cb36e6a9919d4a74909011f64da54ab445d0",
+    "exec/plan.ts": "5f7637887d03709a4dd9e145d46802a179bde9807972eaf33231beb990298fa1"
+  },
+  "rawLogHashes": {
+    "parent": "221f052061fafddf2d3b6b0edc911432fb2a20f431121b64051029c6953e2fc3",
+    "candidate": "98e7cd3bffc8053eb53e4a7ca9429cba2358d67b50f991435747fc5e15ddb946"
+  },
+  "fixture": "Two 800000-byte text rows; CASE/nested COALESCE-NULLIF/NULLIF/short COALESCE; parameter and stored-column inputs; 1,2,4,8,12,16 repeated keys; 16,32,64,128 MiB; pinned/unpinned.",
+  "clock": "Deterministic shared task clock for equal batching; no CPU/timing claim.",
+  "reproduce": "TMPDIR=<cache-dir> node node_modules/vite-node/dist/cli.mjs --script <cache-dir>/compare-{parent,candidate}.mts; python <cache-dir>/compare-peaks.py",
+  "artifacts": "/home/eric/.cache/b4-projection/",
+  "limits": "133 common successes compared; adaptive competitor total peaks excluded per existing lead waiver. 48 cap-minimum refusals and 14 hash-transition errors remain. All 14 hash-transition errors are identical on actual main. No CPU/browser/RSS or new producer support claim."
+}

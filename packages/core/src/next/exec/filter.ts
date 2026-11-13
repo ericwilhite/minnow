@@ -20,6 +20,10 @@ import type { PhysicalType } from "../types.js";
 import type { Batch, Selection, Vector } from "../vector/vector.js";
 import { compileExpr, selectTrue, type CompileContext } from "./kernels/compile.js";
 import type { Compiled } from "./kernels/vectors.js";
+import { projectionStep } from "./projection-step.js";
+import { IDENTITY } from "./kernels/vectors.js";
+import { Slice } from "./slices.js";
+import { afterYield, yieldTask, YIELD_INTERVAL_MS } from "./pipeline.js";
 import type { MaybePromise } from "../access/key-index.js";
 import type { Operator, PushResult, Transfer } from "./pipeline.js";
 
@@ -118,6 +122,11 @@ export class FilterOperator implements Operator {
 }
 
 export class ProjectOperator implements Operator {
+  #pending: Promise<void> | null = null;
+  #aborted = false;
+  #reason: unknown;
+  readonly #step: ReturnType<typeof projectionStep>;
+  readonly #slice = new Slice(YIELD_INTERVAL_MS);
   readonly #exprs: readonly Compiled[];
   readonly #columnsOnly: readonly number[] | null;
   readonly #columns: Vector[];
@@ -127,7 +136,10 @@ export class ProjectOperator implements Operator {
     exprs: readonly ScalarExpr[],
     context: CompileContext,
     readonly downstream: Operator,
+    readonly progress?: { available(): number; readonly signal: AbortSignal },
   ) {
+    this.#step = progress ? projectionStep(exprs, context.params) : null;
+    this.#context = context;
     this.#columnsOnly = exprs.every(
       (expr) =>
         expr.op === "column" ||
@@ -145,10 +157,24 @@ export class ProjectOperator implements Operator {
     this.#columns = new Array<Vector>(exprs.length);
     this.types = this.#exprs.map((expr) => expr.type);
   }
+  readonly #context: CompileContext;
   get reclassifiesTransfers(): boolean {
     return this.#columnsOnly !== null && this.downstream.reclassifiesTransfers === true;
   }
   push(batch: Batch, transfer?: Transfer): PushResult {
+    this.#check();
+    this.#pending = null;
+    if (
+      this.#step &&
+      this.progress &&
+      this.#step(batch, 0, batch.selection?.count ?? batch.length) > this.progress.available()
+    ) {
+      this.#pending = this.#steps(batch).finally(() => transfer?.release());
+      return "blocked";
+    }
+    return this.#push(batch, transfer);
+  }
+  #push(batch: Batch, transfer?: Transfer): PushResult {
     if (transfer?.detachableBuffers && this.#columnsOnly !== null) {
       // New column-list ownership: a retaining receiver must never observe #columns reused.
       const columns = this.#columnsOnly.map((index, c) => {
@@ -171,13 +197,52 @@ export class ProjectOperator implements Operator {
     });
     return this.#hold.after(result, transfer);
   }
+  async #steps(batch: Batch): Promise<void> {
+    const n = batch.selection?.count ?? batch.length;
+    const progress = this.progress,
+      step = this.#step;
+    if (!progress || !step) throw new Error("Missing projection preflight");
+    const arena = this.#context.arena;
+    const borrow = arena.borrowVarlen,
+      exact = arena.exactVarlenGrowth;
+    try {
+      arena.borrowVarlen = true;
+      arena.exactVarlenGrowth = true;
+      for (let start = 0; start < n;) {
+        this.#check();
+        let count = n - start;
+        while (count > 1 && step(batch, start, count) > progress.available())
+          count = Math.max(1, Math.floor(count / 2));
+        const rows = (batch.selection?.rows ?? IDENTITY).subarray(start, start + count);
+        const result = this.#push({ ...batch, selection: { rows, count } });
+        if (result === "blocked") await this.#hold.ready(this.downstream);
+        start += count;
+        if (this.#slice.due()) {
+          await yieldTask();
+          afterYield(this.#slice.clock);
+        }
+      }
+    } finally {
+      arena.borrowVarlen = borrow;
+      arena.exactVarlenGrowth = exact;
+    }
+  }
+  #check(): void {
+    if (this.#aborted) throw this.#reason;
+    this.progress?.signal.throwIfAborted();
+  }
+  get closed(): Promise<void> {
+    return this.#pending?.catch(() => undefined) ?? Promise.resolve();
+  }
   ready(): Promise<void> {
-    return this.#hold.ready(this.downstream);
+    return this.#pending ?? this.#hold.ready(this.downstream);
   }
   finish(): MaybePromise<void> {
     return this.downstream.finish();
   }
   abort(reason: unknown): void {
+    this.#aborted = true;
+    this.#reason = reason;
     this.#hold.abort();
     this.downstream.abort(reason);
   }

@@ -3617,3 +3617,8 @@ covered by the generated window campaigns and the PGlite adversarial-float cases
 Allocation observers belong to individual grants, so an abandoned history cannot
 observe or restore another history's method. No production deadline or coverage
 floor changes.
+
+Wide TEXT/BYTES conditional projections preflight their payload workspace and split
+unfunded batches before evaluation. At a single row CASE/COALESCE/NULLIF borrow the
+selected input, preserving lazy evaluation and downstream readiness without a new
+worst-case reservation. Other expanding expressions keep their dedicated admission paths.

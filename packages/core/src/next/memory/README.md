@@ -390,3 +390,27 @@ Progress never backs persistent hash state. Wide pooled records select raw-value
 comparison before sorting, so spill pages have no additional normalized-key payload.
 Unknown widths, parsed operands, wide coefficients, and variable transitions keep
 their independent recipes; the new shared bound does not certify those layouts.
+
+### Conditional projection steps
+
+TEXT/BYTES CASE, COALESCE and NULLIF projections preflight their intermediate output
+buffers before evaluating the batch. Bounds follow borrowed source slots and reachable
+literal/parameter branches. Each materializing selector is counted once, including
+old/new resize overlap. The check reserves nothing and runs in the same synchronous
+step as the kernels; it cannot race another execution for ordinary headroom.
+
+When credit is insufficient, the owner halves the active prefix before evaluation,
+down to one row. Single-row selector chains borrow their one surviving value (or emit
+null), so they need zero variable payload bytes even with a pinned competitor.
+Pressure prefixes use exact-size growth rather than geometric spare capacity. The
+input transfer and reusable outputs stay owned until downstream readiness; cancellation
+stops the prefix loop, and cleanup waits for that borrow fence. No expression is retried,
+no input pin is held across a global memory wait, and no extra worst-case minimum is
+reserved. The normal funded batch keeps its existing allocation and execution path.
+
+This certificate covers borrowed TEXT/BYTES leaves, identity casts and conditional
+selectors. Other variable producers retain their existing operator-specific protocols
+(JSON has its own pressure handoff). An expanding producer must not be added to this
+certificate without proving its smallest step: if it cannot fit, checkpoint its evaluated
+values and release input pins before a cancellable atomic re-admission; never replay
+volatile evaluation or an already raised error. Current selector chains need no handoff.

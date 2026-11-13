@@ -60,8 +60,11 @@ export class OutputArena {
     readonly charge: ByteCharge,
     readonly capacity: number,
     /** The caller retains borrowed branch values until downstream readiness. */
-    readonly borrowVarlen = false,
+    public borrowVarlen = false,
   ) {}
+
+  /** Adaptive projection steps avoid geometric over-allocation across disjoint prefixes. */
+  exactVarlenGrowth = false;
 
   /** Charges `bytes` or throws a `RangeError` (compile-time minimums are admitted first). */
   take(bytes: number): void {

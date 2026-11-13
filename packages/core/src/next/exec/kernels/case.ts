@@ -93,7 +93,6 @@ class Assembler {
   readonly #validity: Uint32Array;
   readonly #owner: Uint16Array;
   #bytes: Uint8Array = new Uint8Array(0);
-  readonly #borrowVarlen: boolean;
   readonly #offsets: Int32Array | null = null;
   readonly #scales: Uint16Array | null = null;
   readonly #safe: Float64Array | null = null;
@@ -106,7 +105,6 @@ class Assembler {
   ) {
     this.#arena = arena;
     this.#layout = layoutOf(type);
-    this.#borrowVarlen = arena.borrowVarlen;
     const capacity = arena.capacity;
     this.#validity = arena.validity();
     arena.take(2 * capacity);
@@ -129,7 +127,7 @@ class Assembler {
     // Other slots are unspecified by Compiled; no bytes need copying or growing.
     const part = parts[0];
     if (
-      this.#borrowVarlen &&
+      this.#arena.borrowVarlen &&
       this.#layout === "varlen" &&
       parts.length === 1 &&
       part !== undefined &&
@@ -264,7 +262,7 @@ class Assembler {
       }
     }
     if (this.#bytes.length < total) {
-      const size = Math.max(total, 2 * this.#bytes.length);
+      const size = this.#arena.exactVarlenGrowth ? total : Math.max(total, 2 * this.#bytes.length);
       this.#arena.take(size);
       if (this.#bytes.length > 0) this.#arena.give(this.#bytes.length);
       this.#bytes = new Uint8Array(size);

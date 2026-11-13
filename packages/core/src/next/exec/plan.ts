@@ -1240,7 +1240,12 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               },
             );
         }
-        const setup = (context: CompileContext, sink: Operator, runtime?: QueryRuntime) =>
+        const setup = (
+          context: CompileContext,
+          sink: Operator,
+          runtime?: QueryRuntime,
+          grant?: Grant,
+        ) =>
           rel.op === "filter"
             ? new FilterOperator(exprs as ScalarExpr, context, sink)
             : rel.op === "project"
@@ -1255,6 +1260,19 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                         : actual.exprs,
                     { ...context, input: types(actual.input) },
                     sink,
+                    runtime && grant
+                      ? {
+                          signal: runtime.signal,
+                          available: () =>
+                            Math.max(0, grant.held - grant.allocated - grant.loaned) +
+                            Math.max(
+                              0,
+                              runtime.request.governor.capBytes -
+                                runtime.request.governor.reserveBytes -
+                                runtime.request.governor.usedBytes,
+                            ),
+                        }
+                      : undefined,
                   );
                 })()
               : new LimitOperator(null, 0, context.arena, sink);
@@ -1301,7 +1319,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             input,
             minimum,
             BATCH_ROWS,
-            (context) =>
+            (context, grant) =>
               rel.op === "limit"
                 ? new LimitOperator(
                     runtime.bounds(rel).limit,
@@ -1309,9 +1327,10 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                     context.arena,
                     counted(runtime, rel, downstream),
                   )
-                : setup(context, counted(runtime, rel, downstream), runtime),
+                : setup(context, counted(runtime, rel, downstream), runtime, grant),
             (operator) => {
               runtime.onAbort((reason) => operator.abort(reason));
+              if (operator instanceof ProjectOperator) runtime.dispose(() => operator.closed);
               const childStops =
                 operator instanceof LimitOperator ? [...stops, () => operator.done] : stops;
               return childStops.some((stop) => stop())

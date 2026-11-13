@@ -5528,6 +5528,8 @@ export const AGG_SORT_WORKSPACE_REACH = [
 ] as const;
 
 export const PROJECTION_PROGRESS_REACH = [
+  "NULL input",
+  "NULLIF equal",
   "CASE",
   "nested COALESCE NULLIF",
   "column CASE",
@@ -5537,4 +5539,15 @@ export const PROJECTION_PROGRESS_REACH = [
   "pinned competitor",
   "ASCII",
   "UTF8",
+] as const;
+
+export const PROJECTION_SPLIT_REACH = [
+  "dense",
+  "sparse",
+  "exact values",
+  "one evaluation",
+  "no payload allocation",
+  "held borrow",
+  "cancel wait",
+  "error once",
 ] as const;

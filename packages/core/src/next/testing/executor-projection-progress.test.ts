@@ -30,24 +30,39 @@ it.each(seedsFor("next-projection-progress", [0xb7b1, 0xb7b2]))(
     const reach = createReach("projection progress", PROJECTION_PROGRESS_REACH);
     try {
       await pg.waitReady;
-      await core.execute("CREATE TABLE projection_values(a TEXT,i INTEGER)");
-      await pg.exec("CREATE TABLE projection_values(a TEXT,i INTEGER)");
+      await core.execute("CREATE TABLE projection_values(a TEXT,i INTEGER,h INTEGER)");
+      await pg.exec("CREATE TABLE projection_values(a TEXT,i INTEGER,h INTEGER)");
+      let history = 0;
       await fc.assert(
         fc.asyncProperty(
           fc.integer({ min: 0, max: shapes.length - 1 }),
           fc.integer({ min: 580000, max: 810000 }),
           fc.boolean(),
           fc.boolean(),
-          async (shape, width, unicode, cancel) => {
+          fc.integer({ min: 0, max: 2 }),
+          async (shape, width, unicode, cancel, input) => {
             reach.beginHistory();
-            const value = unicode ? "汉".repeat(Math.floor(width / 3)) : "x".repeat(width);
+            history++;
+            const value =
+              input === 1
+                ? null
+                : input === 2
+                  ? "absent"
+                  : unicode
+                    ? "汉".repeat(Math.floor(width / 3))
+                    : "x".repeat(width);
             if (shape === 2) {
-              await core.execute("DELETE FROM projection_values");
-              await pg.exec("DELETE FROM projection_values");
-              for (const i of [1, 2]) {
-                await core.execute("INSERT INTO projection_values VALUES($1,$2)", [value, i]);
-                await pg.query("INSERT INTO projection_values VALUES($1,$2)", [value, i]);
-              }
+              await core.writeBatch(
+                "insertBatch",
+                "projection_values",
+                [1, 2].map((i) => ({ a: value, i, h: history })),
+              );
+              for (const i of [1, 2])
+                await pg.query("INSERT INTO projection_values VALUES($1,$2,$3)", [
+                  value,
+                  i,
+                  history,
+                ]);
             }
             const governor = new Governor(128 << 20);
             let competitor = await governor.admit({
@@ -72,6 +87,10 @@ it.each(seedsFor("next-projection-progress", [0xb7b1, 0xb7b2]))(
                       ),
                     ).toBe(true);
                     observed.pinned = true;
+                    if (cancel) {
+                      observed.cancelled = true;
+                      queueMicrotask(() => abort.abort());
+                    }
                   }
                 }),
               );
@@ -136,7 +155,7 @@ it.each(seedsFor("next-projection-progress", [0xb7b1, 0xb7b2]))(
               const [expression, name] = selected;
               const source =
                 shape === 2
-                  ? "projection_values"
+                  ? `(SELECT a,i FROM projection_values WHERE h=${String(history)})src`
                   : "(SELECT $1::text a,i FROM generate_series(1,2)g(i))src";
               const sql = `SELECT count(*) n FROM (SELECT ${expression} k FROM ${source})q GROUP BY k`;
               const args = shape === 2 ? [] : [value];
@@ -155,6 +174,8 @@ it.each(seedsFor("next-projection-progress", [0xb7b1, 0xb7b2]))(
                 );
                 reach.reach(name);
                 reach.reach("PG exact");
+                if (input === 1) reach.reach("NULL input");
+                if (shape === 1 && input === 2) reach.reach("NULLIF equal");
               }
               expect(observed.pinned).toBe(true);
 
@@ -174,11 +195,13 @@ it.each(seedsFor("next-projection-progress", [0xb7b1, 0xb7b2]))(
           numRuns: 8,
           endOnFailure: true,
           examples: [
-            [0, 800000, false, false],
-            [1, 800000, true, false],
-            [2, 800000, false, false],
-            [3, 800000, false, false],
-            [0, 800000, false, true],
+            [0, 800000, false, false, 0],
+            [1, 800000, true, false, 0],
+            [2, 800000, false, false, 0],
+            [3, 800000, false, false, 0],
+            [0, 800000, false, true, 0],
+            [0, 800000, false, false, 1],
+            [1, 800000, false, false, 2],
           ],
         },
       );
