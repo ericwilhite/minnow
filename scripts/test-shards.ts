@@ -15,7 +15,18 @@
 import { relative } from "node:path";
 import { BaseSequencer, type TestSpecification } from "vitest/node";
 import table from "./test-durations.json" with { type: "json" };
+import { REACH_UNIONS } from "../packages/core/src/testing/reach-unions.ts";
 import { assignParts, defaultWeight } from "./test-parts.mjs";
+
+/**
+ * Files that must share a part: a split reach campaign's files and the file that asserts their
+ * union, which reads what they recorded in this run (packages/core/src/testing/reach-union.ts).
+ */
+const together = new Map<string, string>(
+  Object.entries(REACH_UNIONS).flatMap(([campaign, { files, union }]) =>
+    [...files, union].map((file) => [file, `reach:${campaign}`] as const),
+  ),
+);
 
 /** Milliseconds per repository-relative test file, measured under one way of running the suite. */
 export type DurationProfile = Readonly<Record<string, number>>;
@@ -50,14 +61,28 @@ export default class DurationSequencer extends BaseSequencer {
     const workers = (config: { maxWorkers: unknown }) =>
       Math.max(1, Number(config.maxWorkers) || 1);
     const all = workers(this.ctx.config);
-    // The project name keeps a file that two projects both include apart in the key.
-    const keys = files.map((spec) => `${this.key(spec)}\0${spec.project.name}`);
     // A project with fewer workers than the run (`fileParallelism: false` resolves to one: the
     // maintenance workload) holds the rest of its part's workers idle while its files run.
     const weights = files.map(
       (spec) => (weight(this.key(spec)) * all) / Math.min(all, workers(spec.project.config)),
     );
-    const parts = assignParts(keys, weights, count);
+    // One unit per group of files that must share a part; any other file is its own unit. The
+    // project name keeps a file that two projects both include apart.
+    const unitOf = files.map(
+      (spec) => together.get(this.key(spec)) ?? `${this.key(spec)}\0${spec.project.name}`,
+    );
+    const units = [...new Set(unitOf)];
+    const unitWeight = new Map(units.map((unit) => [unit, 0]));
+    unitOf.forEach((unit, i) =>
+      unitWeight.set(unit, (unitWeight.get(unit) ?? 0) + (weights[i] ?? 0)),
+    );
+    const unitParts = assignParts(
+      units,
+      units.map((unit) => unitWeight.get(unit) ?? 0),
+      count,
+    );
+    const partOf = new Map(units.map((unit, i) => [unit, unitParts[i]]));
+    const parts = unitOf.map((unit) => partOf.get(unit));
     return files.filter((_, i) => parts[i] === index - 1);
   }
 

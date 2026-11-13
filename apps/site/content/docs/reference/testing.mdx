@@ -478,6 +478,14 @@ values, `ALTER TABLE` on populated tables, and index lookups that returned rows.
 declare patched, moved, replaced, shrunk, re-run, and rekeyed deliveries. A `MINNOW_SEED` replay
 checks one history, so reach stands aside then.
 
+A campaign can be split across several test files so parallel runners share its histories. The
+directory publication compatibility campaign runs in four files, one slot of its seeds each. Then
+no single file sees every history, so no file asserts reach on its own subset. Each file records
+what its histories reached in the run's reach directory, and a `*.reach.test.ts` file asserts the
+union against the declared states (`testing/reach-union.ts`). The test sequencer keeps those files
+in the same CI part and runs the union check after them. The union fails if any declared file left
+no record or ran no histories, so a file that silently stopped running cannot pass.
+
 ## Format compatibility
 
 A browser database's data lives in the user's browser, so it outlives every deploy. There is no

@@ -155,6 +155,8 @@
     "!dist/testing/seeds.*",
     "!dist/testing/oracle.*",
     "!dist/testing/reach.*",
+    "!dist/testing/reach-union.*",
+    "!dist/testing/reach-unions.*",
     "!dist/testing/live-publication.*",
     "!dist/testing/semantic-corpus.*",
     "!dist/testing/maintenance-diagnostics.*",

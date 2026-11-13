@@ -7,18 +7,13 @@
  *
  * `MINNOW_CRASH_STEP=n` starts the sweep at step n (to replay a failure first).
  *
- * The index-merge sweep, the longest case, is in crash-sweep-merges.test.ts so a parallel runner
- * can start it beside these; the scenarios and checks are in crash-sweep.test-support.ts.
+ * The index-merge and large-transaction sweeps, the longest cases, are in crash-sweep-merges.test.ts
+ * and crash-sweep-staged.test.ts so parallel runners can start them beside these; the scenarios and
+ * checks are in crash-sweep.test-support.ts.
  */
 import { describe, expect, it } from "vitest";
 import type { SimDisk } from "../storage/sim-disk.js";
-import {
-  MEMTABLE_ROWS,
-  type Outcome,
-  scenario,
-  stagedScenario,
-  sweep,
-} from "./crash-sweep.test-support.js";
+import { MEMTABLE_ROWS, type Outcome, scenario, sweep } from "./crash-sweep.test-support.js";
 import {
   autocommit,
   batch,
@@ -115,17 +110,5 @@ describe("crash sweep", () => {
     expect(path.state().root.log.firstLsn).toBeGreaterThan(1);
     await probe.close();
     await sweep(make);
-  }, 1_800_000);
-
-  it("survives a crash at every physical step of large transactions (staging, commit, fold)", async () => {
-    const make = (disk?: SimDisk) =>
-      new Harness("strict", "sim", 8, disk, { merges: { mode: "off" } });
-    // The clean run stages, folds, and drops a rolled-back staging.
-    const clean = make();
-    await stagedScenario(clean, { acked: new Map(), uncertain: new Map(), atomic: [] });
-    const path = await clean.open();
-    expect(path.state().root.tables.every((table) => table.staged.length === 0)).toBe(true);
-    await clean.close();
-    await sweep(make, stagedScenario);
   }, 1_800_000);
 });

@@ -1,8 +1,15 @@
 /** Copy-on-write packing transitions are atomic across all physical publication edges. Both
- * supported builds must refuse damaged pages and serialize competing ordinary openers. */
+ * supported builds must refuse damaged pages and serialize competing ordinary openers.
+ *
+ * The campaign's histories are split across directory-publication-compat-1..4.test.ts so parallel
+ * runners can share them; each file runs one slot of the seeds (both builds) and one transition's
+ * competing-open and damage cases. Each records what it reached (testing/reach-union.ts), and
+ * directory-publication-compat.reach.test.ts asserts the union against the declared reach. Every
+ * seed, build, transition and edge runs exactly as the single file ran it. */
 import { deepStrictEqual } from "node:assert/strict";
 import { beforeAll, afterAll, expect, it } from "vitest";
 import { createReach, DIRECTORY_TRANSITION_REACH } from "../../testing/reach.js";
+import { recordReach } from "../../testing/reach-union.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { SimLocks, SimulatedCrash } from "../storage/sim-disk.js";
 import { openDirectory, type DirectoryDb } from "./directory-compat-api.js";
@@ -11,6 +18,10 @@ import { directoryPeer, currentDirectoryFixture } from "./directory-current.test
 import { decodeGroupPage, decodeGroupIndex } from "../format/manifest-codec.js";
 import { partition } from "./directory-tails-test-support.js";
 import { yieldTask } from "./merge.js";
+
+/** How many files the campaign is split across. */
+export const PARTS = 4;
+const SEEDS = seedsFor("next-directory-publication-compat", [28011, 28012, 28013, 28014]);
 const reach = createReach("next-directory-transition", DIRECTORY_TRANSITION_REACH);
 const transitions = ["packed normalization", "full carry", "partial edit", "shared carry"] as const;
 const edges = [
@@ -25,30 +36,47 @@ type Transition = (typeof transitions)[number];
 const range = (n: number) => Array.from({ length: n }, (_, k) => k);
 let old: Awaited<ReturnType<typeof directoryPeer>>;
 let images: Record<Transition, DirectoryImage>;
-beforeAll(async () => {
-  old = await directoryPeer();
-  const empty = await currentDirectoryFixture("packed-0");
-  const files = DirectoryFiles.load(empty),
-    locks = new SimLocks();
-  const db = await openDirectory(files, locks);
-  await db.insert(range(7));
-  await db.settle();
-  await db.close();
-  const shared = files.image();
-  const edited = await openDirectory(files, locks);
-  await edited.delete(6);
-  await edited.settle();
-  await edited.close();
-  images = {
-    "packed normalization": await currentDirectoryFixture("packed-4099"),
-    "full carry": await currentDirectoryFixture("packed-4095"),
-    "partial edit": shared,
-    "shared carry": files.image(),
-  };
-}, 60_000);
-afterAll(async () => {
-  await old.dispose();
-});
+/**
+ * Defines part `part` (1..PARTS) of the campaign in the calling test file (`fileUrl` is its
+ * `import.meta.url`): the shared fixtures, its slot of the seeds for both builds, and the
+ * competing-open and damage cases of its transition.
+ */
+export function directoryCompatPart(part: number, fileUrl: string): void {
+  recordReach("next-directory-transition", reach, fileUrl);
+  useFixtures();
+  const transition = transitions[part - 1];
+  if (transition === undefined) throw new Error(`no part ${String(part)} of ${String(PARTS)}`);
+  for (const seed of SEEDS.filter((_, i) => i % PARTS === part - 1)) interruptionCases(seed);
+  competingOpenCases(transition);
+  damageCases(transition);
+}
+/** The fixtures every part shares: the peer build and the four transitions' starting images. */
+function useFixtures(): void {
+  beforeAll(async () => {
+    old = await directoryPeer();
+    const empty = await currentDirectoryFixture("packed-0");
+    const files = DirectoryFiles.load(empty),
+      locks = new SimLocks();
+    const db = await openDirectory(files, locks);
+    await db.insert(range(7));
+    await db.settle();
+    await db.close();
+    const shared = files.image();
+    const edited = await openDirectory(files, locks);
+    await edited.delete(6);
+    await edited.settle();
+    await edited.close();
+    images = {
+      "packed normalization": await currentDirectoryFixture("packed-4099"),
+      "full carry": await currentDirectoryFixture("packed-4095"),
+      "partial edit": shared,
+      "shared carry": files.image(),
+    };
+  }, 60_000);
+  afterAll(async () => {
+    await old.dispose();
+  });
+}
 const values = (transition: Transition) =>
   transition === "packed normalization"
     ? range(4100)
@@ -75,7 +103,7 @@ function crashCause(error: unknown): boolean {
       return true;
   return false;
 }
-for (const seed of seedsFor("next-directory-publication-compat", [28011, 28012, 28013, 28014]))
+function interruptionCases(seed: number): void {
   for (const build of ["current", "peer"] as const)
     it(`publication interruption and ordinary retry ${build}, seed ${String(seed)}`, async () => {
       for (const transition of transitions)
@@ -228,7 +256,8 @@ for (const seed of seedsFor("next-directory-publication-compat", [28011, 28012, 
           reach.reach(`interrupted ${build} writer`);
         }
     }, 300_000);
-for (const transition of transitions)
+}
+function competingOpenCases(transition: Transition): void {
   for (const first of ["current", "peer"] as const)
     it(`two competing opens: ${first} owns ${transition}`, async () => {
       reach.beginHistory();
@@ -268,7 +297,8 @@ for (const transition of transitions)
       reach.reach(`concurrent ${first} owner`);
       reach.reach(transition);
     }, 60_000);
-for (const transition of transitions)
+}
+function damageCases(transition: Transition): void {
   for (const build of ["current", "peer"] as const)
     it(`${build} refuses damaged page/index after ${transition}`, async () => {
       reach.beginHistory();
@@ -302,4 +332,4 @@ for (const transition of transitions)
       reach.reach(`damage refused by ${build}`);
       reach.reach(transition);
     }, 60_000);
-it("reached packing transition failure and concurrency states", () => reach.assertReached());
+}

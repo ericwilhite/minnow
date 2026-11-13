@@ -4,6 +4,7 @@ import { configDefaults, defineConfig } from "vitest/config";
 import DurationSequencer from "./scripts/test-shards.ts";
 
 const maintenanceWorkload = "packages/core/src/engine/maintenance-under-load.test.ts";
+const reachUnions = "packages/**/*.reach.test.ts";
 
 /**
  * Set by CI on each part of the unit suite it spreads across runners (`.github/workflows/ci.yml`).
@@ -28,6 +29,9 @@ export default defineConfig({
     // `--shard` splits by measured file duration rather than file count, and every run starts its
     // longest files first, so a quarter-hour file never starts last (scripts/test-shards.ts).
     sequence: { sequencer: DurationSequencer },
+    // A fresh directory per run where split reach campaigns record what their files reached
+    // (packages/core/src/testing/reach-union.ts).
+    globalSetup: ["./scripts/reach-directory.ts"],
     // Test builds re-verify a cached blob's checksum when its lease is released or it is evicted
     // (packages/core/src/next/storage/verify-cached.ts): a consumer that writes into bytes the
     // cache treats as immutable fails loudly in whichever suite does it.
@@ -42,7 +46,7 @@ export default defineConfig({
             "scripts/**/*.test.ts",
             "apps/site/{lib,bench,components}/**/*.test.ts",
           ],
-          exclude: [...configDefaults.exclude, maintenanceWorkload],
+          exclude: [...configDefaults.exclude, maintenanceWorkload, reachUnions],
           // `npm run test:packed`: every segment the engine can pack is packed.
           setupFiles:
             process.env.MINNOW_FORCE_PACKING === "1" ? ["scripts/forced-packing.setup.ts"] : [],
@@ -60,6 +64,16 @@ export default defineConfig({
           // deadline. Run the unchanged workload alone, then merge coverage from both projects.
           fileParallelism: false,
           sequence: { groupOrder: 2 },
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: "reach",
+          // Each asserts the union of what a split campaign's files reached, so it runs after
+          // them; scripts/test-shards.ts keeps it in their run part.
+          include: [reachUnions],
+          sequence: { groupOrder: 3 },
         },
       },
     ],
@@ -82,12 +96,15 @@ export default defineConfig({
       // Only the shipped library. The site is covered by its own browser runner, and measuring
       // it here would average a docs app into the engine's numbers.
       include: ["packages/*/src/**/*.ts"],
-      // The crash sweep's scenarios moved out of crash-sweep.test.ts only so its longest case can
-      // run in a parallel file; they stay out of the measured code, as they were.
+      // Test code moved out of *.test.ts files only so their cases can run in parallel files, and
+      // the split campaigns' reach union, stay out of the measured code, as test code always was.
       exclude: [
         "**/*.test.ts",
         "**/*.spec.ts",
         "packages/core/src/next/write/crash-sweep.test-support.ts",
+        "packages/core/src/next/write/directory-publication-compat.test-support.ts",
+        "packages/core/src/testing/reach-union.ts",
+        "packages/core/src/testing/reach-unions.ts",
       ],
       /**
        * A ratchet, not a target. Each floor sits just under what the suite measured when it was
