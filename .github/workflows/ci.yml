@@ -44,7 +44,11 @@ jobs:
       # On this fresh checkout, its `tsc -b --force` is the clean package build: there is no
       # earlier output to reuse. The site, scripts, and browser harnesses are checked against it.
       - run: npm run typecheck
+      # Type-aware ESLint over the whole repository outgrew Node's default ~4 GiB heap (run
+      # 43344943754 failed with a heap OOM at 3.9 GiB). Public runners have 16 GiB.
       - run: npm run lint
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
       # `npm run build` is `clean`, that same forced package build, then the site. The packages
       # were just built from scratch by the step above, so only the site is left to build.
       - name: Build the site
