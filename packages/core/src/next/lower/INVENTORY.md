@@ -639,3 +639,24 @@ their actual field widths replace it. An unrelated source prefix or literal is n
 aggregate output width. Generated 12/16 MiB histories cover tiny/large opaque JSONB results
 under competing credit. Scalar
 aggregate ORDER BY lanes never inherit structural grouping-key decoder workspace.
+
+#### Memory-source admission retry
+
+When the ordinary complete plan exceeds its cap, a query may acquire an explicit
+read recipe for a single resident memory chunk. The write owner retains and charges
+that existing storage through publication; the reader pays for caller-owned outputs
+and copy scratch, without reserving a hypothetical maximum root and directory.
+The exact prepared table is reused in sizing and execution, including across producer
+handoffs, and the lease closes after native query work drains. Ordinary `readHint`
+calls still acquire no chunk borrow. Closing a recipe invalidates its lower-cost hints.
+An already-published memory segment instead uses the ordinary validated stored-group
+recipe, retaining the old snapshot's visible prefix. Stored null-count pruning uses
+the complete physical group's row count, not the shorter visible prefix.
+
+This fallback does not run for already-fitting plans. Multi-chunk or mixed live sources
+retain their previous conservative publication envelope; this change does not add a
+source checkpoint/re-admission protocol. It does not change the writer's publication
+algorithm, repair the separate recycleLog hang, or change stored formats. Generated
+PGlite checks cover 1–8 wide JSONB columns, ASCII/UTF8, 1–8 rows at 16/64 MiB, admission
+cancellation, publication with invisible NULL rows, actual stored-root IO, and multiple
+JSON producers through EXCEPT. Paired main controls assert no peak increase.

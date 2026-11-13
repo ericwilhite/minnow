@@ -5103,3 +5103,28 @@ export const SNAPSHOT_SOURCE_REACH = [
   "published dictionary page",
   "array byte equality",
 ] as const;
+
+/** Read-source admission: actual wide prefixes, not hypothetical maximum-format publications. */
+export const SOURCE_WIDE_ADMISSION_REACH = [
+  "six or more wide columns",
+  "scheduler-normalized allocation peak",
+  "few columns",
+  "single row",
+  "multiple rows",
+  "UTF8",
+  "ASCII",
+  "exact PostgreSQL rows",
+  "zero resources",
+] as const;
+
+export const SOURCE_READ_RECIPE_REACH = [
+  "owner-charged publication retention",
+  "competing credit without partial execution holdings",
+  "cancelled admission",
+  "exact PostgreSQL rows",
+  "actual published root recipe",
+  "caller-funded complete roots",
+  "invisible suffix excluded",
+  "producer handoff",
+  "zero resources before owner pin release",
+] as const;

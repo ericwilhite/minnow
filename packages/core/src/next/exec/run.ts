@@ -4,7 +4,7 @@ import { SnapshotReleasedError } from "../access/snapshot.js";
 import { QueryRoots, type RootColumns } from "../page/query-roots.js";
 import { readTable } from "./read-table.js";
 import type { ByteBudget } from "../access/space.js";
-import type { Snapshot, TableSnapshot } from "../access/snapshot.js";
+import type { Snapshot, TableSnapshot, TableReadRecipe } from "../access/snapshot.js";
 import type { Bound, PhysicalPlan, Rel } from "../ir/ir.js";
 import type { Grant } from "../memory/governor.js";
 import {
@@ -282,6 +282,49 @@ export class QueryRuntime {
   readBoundary(): void {
     this.#readStep?.beforeDownstream();
   }
+  readonly #sourceRecipes = new Map<number, TableReadRecipe>();
+  /** Sizing and execution must use the SAME retained source; never reopen after publication. */
+  sourceView(): Pick<Snapshot, "table" | "pages"> {
+    if (this.#sourceRecipes.size === 0) return this.view;
+    return {
+      pages: this.view.pages,
+      table: (id, options) => this.#sourceRecipes.get(id)?.table ?? this.view.table(id, options),
+    };
+  }
+  retryResidentSources(
+    sources: ReadonlyArray<{ readonly tableId: number }>,
+  ): MaybePromise<boolean> {
+    let changed = false;
+    const remaining = sources.values();
+    const install = (tableId: number, table: TableSnapshot): void => {
+      this.signal.throwIfAborted();
+      if (this.#closed) throw new QueryCancelledError();
+      const recipe = table.prepareRead?.();
+      if (!recipe) return;
+      // Retain the source through producer handoffs until whole-query read jobs drain.
+      this.#sourceRecipes.set(tableId, recipe);
+      changed = true;
+    };
+    const next = (): MaybePromise<boolean> => {
+      for (let item = remaining.next(); !item.done; item = remaining.next()) {
+        this.signal.throwIfAborted();
+        const { tableId } = item.value;
+        if (this.#sourceRecipes.has(tableId)) continue;
+        const table = this.view.table(tableId, {
+          budget: { allocate: () => false, free: () => undefined },
+        });
+        if (table instanceof Promise)
+          return table.then((table) => {
+            install(tableId, table);
+            return next();
+          });
+        install(tableId, table);
+      }
+      return changed;
+    };
+    return next();
+  }
+
   table(id: number, budget: ByteBudget): MaybePromise<TableSnapshot> {
     const wrap = (table: TableSnapshot) =>
       readTable(
@@ -294,7 +337,7 @@ export class QueryRuntime {
         },
         this.metadataCaches(!this.#nonRetainingReads),
       );
-    const table = this.view.table(id, { budget });
+    const table = this.#sourceRecipes.get(id)?.table ?? this.view.table(id, { budget });
     return table instanceof Promise ? table.then(wrap) : wrap(table);
   }
 
@@ -965,7 +1008,38 @@ export class QueryRuntime {
     this.#closed = true;
     this.#bounds.clear();
     this.params.slots = [];
-    return this.#releaseResources();
+    if (this.#sourceRecipes.size === 0) return this.#releaseResources();
+    const closeSources = () => {
+      let first: unknown,
+        failed = false;
+      for (const recipe of this.#sourceRecipes.values()) {
+        try {
+          recipe.close();
+        } catch (error) {
+          if (!failed) {
+            first = error;
+            failed = true;
+          }
+        }
+      }
+      this.#sourceRecipes.clear();
+      if (failed) throw first;
+    };
+    const fail = (error: unknown): never => {
+      try {
+        closeSources();
+      } catch {
+        /* Preserve the first native cleanup failure. */
+      }
+      throw error;
+    };
+    try {
+      const work = this.#releaseResources();
+      if (work instanceof Promise) return work.then(closeSources, fail);
+    } catch (error) {
+      fail(error);
+    }
+    closeSources();
   }
   #releaseResources(): MaybePromise<void> {
     const jobs = this.#dispose.splice(0).reverse();

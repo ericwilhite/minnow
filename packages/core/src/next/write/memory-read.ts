@@ -44,6 +44,8 @@ export interface MemoryReadSource {
   /** Only used synchronously: never retain the view across a suspension or in a hint. */
   resident(columnId: number, chunk: number): FlatVector | null;
   publishedRoot(): BlobRef;
+  /** Explicit source recipe, independently owned by the query, keeps this chunk resident. */
+  retained?(chunk: number): boolean;
   check(): void;
   /** Snapshot release cancels work; unregister only after pending reads have drained. */
   watch(close: () => void): () => void;
@@ -86,8 +88,12 @@ function* pause(check: () => void): Generator<Promise<unknown>, void, unknown> {
 
 /** Segment-owned token validation holds descriptors only, never producer payloads. */
 export class MemoryReads {
-  readonly #hints = new WeakSet<MemoryReadHint>();
+  #hints = new WeakSet<MemoryReadHint>();
   constructor(readonly source: MemoryReadSource) {}
+  /** Ending the explicit lease invalidates its lower-cost hints. */
+  invalidateHints(): void {
+    this.#hints = new WeakSet();
+  }
 
   hint(request: MemoryReadRequest, context: MemoryReadContext): MaybePromise<MemoryReadHint> {
     this.#validate(request);
@@ -280,7 +286,8 @@ export class MemoryReads {
       this.source.rowCount - input.chunk * MEMORY_CHUNK_ROWS - input.startRow,
       MEMORY_CHUNK_ROWS - input.startRow,
     );
-    const charge = WORK + rows * 8 + 256 + input.columns.length * 256;
+    const retained = this.source.retained?.(input.chunk) === true;
+    const charge = (retained ? 4096 : WORK) + rows * 8 + 256 + input.columns.length * 256;
     if (!context.budget.allocate(charge)) throw new PageBudgetError(charge);
     try {
       // Copy before any suspension, after charging the request/Set/output descriptors.
@@ -369,9 +376,14 @@ export class MemoryReads {
         rowCount: count,
         outputs: Object.freeze(outputs),
         outputBytes,
-        residentBytes: MEMORY_READ_RESIDENT_BYTES + gzip,
-        scratchBytes: 1024 + WORK + DECODER_SCRATCH + rows * 8 + 256 + request.columns.length * 256,
-        ioBytes: MAX_READ_BYTES,
+        residentBytes: retained ? 0 : MEMORY_READ_RESIDENT_BYTES + gzip,
+        scratchBytes:
+          1024 +
+          (retained ? 4096 : WORK + DECODER_SCRATCH) +
+          rows * 8 +
+          256 +
+          request.columns.length * 256,
+        ioBytes: retained ? 0 : MAX_READ_BYTES,
         oversized: outputBytes > request.targetBytes,
         token: Object.freeze({}),
       });
@@ -396,7 +408,9 @@ export class MemoryReads {
     const type = this.source.column(columnId)?.type;
     if (type === undefined) throw new RangeError("Missing memory column");
     // Covers scalar decode, object/BigInt temporaries and possible parse alignment copies.
-    if (!context.budget.allocate(WORK)) throw new PageBudgetError(WORK);
+    const retained = this.source.retained?.(r.chunk) === true;
+    const work = retained ? 4096 : WORK;
+    if (!context.budget.allocate(work)) throw new PageBudgetError(work);
     try {
       out.flat.length = 0;
       let written = 0,
@@ -450,6 +464,7 @@ export class MemoryReads {
         if (!copied) break;
       }
       if (published) {
+        if (retained) throw new Error("Retained source recipe lost its resident storage");
         yield* this.#withReader(columnId, context, check, function* (reader) {
           const scalar = scalarOutput(type);
           const mask = new Uint8Array(1),
@@ -538,7 +553,7 @@ export class MemoryReads {
         ...(required === undefined ? {} : { need: required }),
       };
     } finally {
-      context.budget.free(WORK);
+      context.budget.free(work);
     }
   }
   #copyResident(

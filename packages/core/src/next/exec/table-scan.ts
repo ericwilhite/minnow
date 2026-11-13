@@ -790,7 +790,11 @@ export class TableScan implements BatchSource {
           this.#options.encodedPushdown ?? true,
           this.stats,
         );
-        if (!compiled.mayMatch(segment.rowCount, chunk.statistics)) {
+        // Statistics count the COMPLETE stored group, including an invisible suffix of
+        // a re-pointed memory snapshot. Its visible rowCount is only the scan boundary.
+        // Synthetic readers may supply only the legacy visible count.
+        const stored: { readonly rowCount?: number } = segment.group;
+        if (!compiled.mayMatch(stored.rowCount ?? segment.rowCount, chunk.statistics)) {
           for (const pages of opened) {
             this.stats.pagesPruned += pages.pagesInRange(0, pages.rowCount)[1];
             pages.close();
