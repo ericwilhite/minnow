@@ -98,6 +98,8 @@ export default tseslint.config(
       "packages/core/src/next/dependency-rules.test.ts",
       // Node-only source inventory; no browser or production module imports this fixture.
       "packages/core/src/next/testing/durable-inventory.ts",
+      // Independently bundles an older-capability reader; owns its os.tmpdir fixture.
+      "packages/core/src/next/testing/durable-long-keys.test.ts",
       // Inspects own/private retained allocator objects; this Node-only guard never ships.
       "packages/core/src/next/testing/scratch-metadata-guards.test.ts",
       // Frozen native-file compatibility fixtures use Node I/O and bulk array checks.

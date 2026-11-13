@@ -139,9 +139,12 @@ export function discoverDurableSources(): {
         }
       }
       if (
-        ["format/manifest.ts", "format/run-key.ts", "format/key-pointer.ts"].includes(relative(NEXT, path)) &&
+        ["format/manifest.ts", "format/run-key.ts", "format/key-pointer.ts"].includes(
+          relative(NEXT, path),
+        ) &&
         ts.isTypeReferenceNode(node) &&
-        (["BlobRef", "ChunkData", "KeyChunk", "RunKeyStorage"].includes(node.typeName.getText()) || (node.typeName.getText() === "Uint8Array" && owner(node) === "RunKeyStorage"))
+        (["BlobRef", "ChunkData", "KeyChunk", "RunKeyStorage"].includes(node.typeName.getText()) ||
+          (node.typeName.getText() === "Uint8Array" && owner(node) === "RunKeyStorage"))
       ) {
         const parts: string[] = [];
         for (const parent of parents(node)) {
@@ -160,7 +163,17 @@ export function discoverDurableSources(): {
   return { sites, refs: refs.sort() };
 }
 
-const RUN = ["runBlock", "runIndex", "runFences", "runBloomDirectory", "runBloom", "runKeyPointer", "runKeyDescriptor", "runKeyDirectory", "runKeyPayload"];
+const RUN = [
+  "runBlock",
+  "runIndex",
+  "runFences",
+  "runBloomDirectory",
+  "runBloom",
+  "runKeyPointer",
+  "runKeyDescriptor",
+  "runKeyDirectory",
+  "runKeyPayload",
+];
 const LOG = ["logFrame", "commitBody", "column", "catalogChange", "arrayValue"];
 /** count is source call sites, not executions. [] means transport/private scratch, not a new codec. */
 export const DURABLE_EMISSIONS: Readonly<

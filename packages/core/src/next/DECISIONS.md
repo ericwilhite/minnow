@@ -231,11 +231,12 @@ follows ownership, but a future nested format must raise the outer requirement w
 Unknown intact formats refuse, never recover as empty. `durable-format.ts` is the canonical
 registry; raw inner codecs inherit explicit versioned parents. Snapshot constants are reserved
 for the design only. The generated decoder sweep and zero-write native histories enforce this.
+
 ## Long index keys: unpublished format 3 (B5, 2026-11-12)
 
 Manifest version 3 explicitly discriminates inline and overflow-capable runs. Unknown/newer
 encodings are typed refusals. The rebuild has never shipped: there are no supported older
 next/ writers to upgrade, and no next/-to-next/ migration or new frozen predecessor fixtures
 are required. Existing development fixtures test refusal, not compatibility. Short-key data
-blocks retain their exact bytes. The shipped-format-to-rebuild cutover is a separate upgrade
-obligation; this decision does not waive its supported-writer fixture and interruption coverage.
+blocks retain their exact bytes. The 1.0 rebuild starts a new chain and refuses 0.x data without mutation, rather than
+converting it. Subsequent supported 1.0 formats require ordinary-open upgrade evidence.

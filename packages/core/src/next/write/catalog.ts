@@ -682,6 +682,20 @@ function validateStoredType(type: PhysicalType, depth = 0): void {
     );
 }
 function validateStoredIndex(index: IndexDef): void {
+  if (index.keyLimit !== undefined)
+    requireTag(
+      index.keyLimit,
+      DURABLE_CODECS.indexKeyLimit,
+      "index key limit",
+      StoreCorruptionError,
+    );
+  if (index.invalid !== undefined)
+    requireTag(
+      index.invalid,
+      DURABLE_CODECS.presentFlag,
+      "invalid index flag",
+      StoreCorruptionError,
+    );
   requireTag(index.unique, DURABLE_CODECS.jsonBoolean, "stored unique flag", StoreCorruptionError);
   requireTag(index.kind, DURABLE_CODECS.indexKind, "stored index kind", StoreCorruptionError);
   requireTag(index.role, DURABLE_CODECS.indexRole, "stored index role", StoreCorruptionError);

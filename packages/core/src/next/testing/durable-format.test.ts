@@ -26,6 +26,10 @@ import {
   type DurableFormatName,
   type FormatField,
 } from "../durable-format.js";
+import { ByteWriter as MetadataWriter } from "../format/bytes.js";
+import { readKeyPointer, writeKeyPointer } from "../format/key-pointer.js";
+import { readRunKey, writeRunKey } from "../format/run-key.js";
+import { OverflowKeys, overflowKeyBytes } from "../write/overflow-keys.js";
 import { ByteReader as MetadataReader } from "../format/bytes.js";
 import { decodeDeletionBitmap } from "../format/deletion-bitmap.js";
 import { xxHash32 } from "../hash/xxhash32.js";
@@ -259,6 +263,97 @@ function runAdapter(
     },
   };
 }
+function overflowAdapters(): Pick<
+  Record<DurableFormatName, Adapter>,
+  "runKeyPointer" | "runKeyDescriptor" | "runKeyDirectory" | "runKeyPayload"
+> {
+  const payload = new Uint8Array(2049).fill(97),
+    key = {
+      kind: "overflow" as const,
+      length: payload.length,
+      prefix: payload.slice(0, 32),
+      chunks: [{ offset: 0, length: payload.length, checksum: xxHash32(payload) }],
+    },
+    descriptor = new MetadataWriter();
+  writeRunKey(descriptor, key, payload.length);
+  const directory = new MetadataWriter();
+  directory.u32(DURABLE_FORMATS.runKeyDirectory.magic);
+  directory.u8(1);
+  for (const byte of descriptor.finish()) directory.u8(byte);
+  const dir = directory.finish(),
+    pointer = {
+      kind: "overflow" as const,
+      length: payload.length,
+      prefix: key.prefix,
+      directory: { offset: payload.length, length: dir.length, checksum: xxHash32(dir) },
+    },
+    encoded = new MetadataWriter();
+  writeKeyPointer(encoded, pointer, 4096);
+  const decode =
+    (which: "directory" | "payload") =>
+    async (bytes: Uint8Array, funding: ReturnType<typeof budget>) => {
+      const run = encodeRun([
+        { key: Uint8Array.of(97), entries: [{ rowId: 1, tombstone: false }] },
+      ]);
+      if (run === null) throw new Error("missing run");
+      const ref = {
+        ...runRef(
+          run,
+          run.parts.map((part, i) => ({ ...blob, offset: i * 128, length: part.length })),
+        ),
+        encoding: 2 as const,
+        entries: { ...blob, offset: 4096 },
+        keyStorage: {
+          minimum: encoded.finish(),
+          maximum: encoded.finish(),
+          maxKeyBytes: payload.length,
+        },
+      };
+      const space: ExtentReader = {
+        peek: (ref) =>
+          ref.offset === payload.length
+            ? which === "directory"
+              ? bytes
+              : dir
+            : which === "payload"
+              ? bytes
+              : payload,
+        read: () => Promise.reject(new Error("unexpected cold read")),
+      };
+      const charge = overflowKeyBytes(ref);
+      funding.allocate(charge);
+      const keys = new OverflowKeys(ref, space, funding, new AbortController().signal);
+      try {
+        expect(await keys.resolve(pointer)).toEqual(payload);
+        return 1;
+      } finally {
+        keys.close();
+        funding.free(charge);
+      }
+    };
+  return {
+    runKeyPointer: {
+      bytes: encoded.finish(),
+      decode: (bytes) => {
+        const r = new MetadataReader(bytes),
+          p = readKeyPointer(r, 4096);
+        r.end();
+        return p;
+      },
+    },
+    runKeyDescriptor: {
+      bytes: descriptor.finish(),
+      decode: (bytes) => {
+        const r = new MetadataReader(bytes),
+          p = readRunKey(r, payload.length);
+        r.end();
+        return p;
+      },
+    },
+    runKeyDirectory: { bytes: dir, decode: decode("directory") },
+    runKeyPayload: { bytes: payload, decode: decode("payload") },
+  };
+}
 function adapters(): Record<
   Exclude<DurableFormatName, "snapshot" | "snapshotFrame" | "indexedDb">,
   Adapter
@@ -367,6 +462,7 @@ function adapters(): Record<
     },
     catalog: { bytes: Catalog.empty().encode(), decode: (bytes) => Catalog.decode(bytes) },
     catalogChange: { bytes: encodeLogged({ op: "dropTable", tableId: 1 }), decode: decodeLogged },
+    ...overflowAdapters(),
     runBlock: runAdapter("runBlock"),
     runIndex: runAdapter("runIndex"),
     runFences: runAdapter("runFences"),
@@ -468,8 +564,8 @@ for (const seed of seedsFor("next-durable-registry", [0xb221, 0xb222]))
               await refused(
                 {
                   bytes: adapter.bytes,
-                  decode: (child, b) => {
-                    parent.decode(bytes, b);
+                  decode: async (child, b) => {
+                    await parent.decode(bytes, b);
                     return adapter.decode(child, b);
                   },
                 },

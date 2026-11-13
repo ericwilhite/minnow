@@ -2203,13 +2203,14 @@ input, and both cache-hit and asynchronous reads through the production write pa
 require typed refusal, unchanged inputs and returned resources. Registry completeness also
 scans production persistence calls and durable reference fields independently of the registry
 and its decoder adapters, so omitting a format from both lists cannot hide its writer.
+
 ### Rebuild long-key codec stages
 
 The unpublished rebuild manifest is version 3. Every stored run has an explicit inline or
 overflow encoding discriminator. Unsupported versions raise `UnsupportedEncodingError`;
 old development roots are refused without rewriting them. No published package contains
-`next/`, so this is not an upgrade of a supported stored format. The eventual shipped-engine
-cutover still needs its own upgrade evidence.
+`next/`, so this is not an upgrade of a supported stored format. The 1.0 rebuild starts a new chain: it refuses 0.x data without mutation. No 0.x converter
+is implied; the existing 0.x compatibility suites remain specific to the 0.x engine.
 
 `format/run-key.test.ts` generates canonical inline and overflow descriptors, including the
 49,155-byte encoded single-text primary-key maximum. It checks bounded prefixes, complete
@@ -2299,3 +2300,11 @@ conflict and undo scratch copies remain outside the codec's native-allocation pr
 Byte slicing is restricted to key-bearing input. A large unindexed payload keeps its ordinary
 admission and publication boundaries; the bounded memory-read campaign checks its original
 logical prefixes without changing its fixture or expectations.
+
+The long-key registry integration requires reader version 2 in the outer root-slot header
+and manifest version 3. It registers inline/overflow runs, pointer and chunk descriptors,
+the checksummed key directory, raw payload references and the extended-block bit. The
+independent persistence inventory includes these references. `durable-long-keys.test.ts`
+checks WAL-only nonunique invalidation at 13,107 UTF-16 units and an independently bundled
+reader with capability 1: OPFS and IndexedDB must refuse before native writes. The strict
+catalog-operation registry admits `invalidateIndex` while still rejecting unknown operations.

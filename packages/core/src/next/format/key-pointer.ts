@@ -46,7 +46,11 @@ export function writeKeyPointer(
   before: number,
 ): void {
   check(pointer, before);
-  out.u8(pointer.kind === "inline" ? DURABLE_CODECS.keyDescriptor.inline : DURABLE_CODECS.keyDescriptor.overflow);
+  out.u8(
+    pointer.kind === "inline"
+      ? DURABLE_CODECS.keyDescriptor.inline
+      : DURABLE_CODECS.keyDescriptor.overflow,
+  );
   if (pointer.kind === "inline") {
     out.bytes(pointer.bytes);
     return;
@@ -62,7 +66,12 @@ export function readKeyPointer(
   before: number,
 ): KeyPointer {
   const tag = input.u8();
-  requireTag(tag, Object.values(DURABLE_CODECS.keyDescriptor), "key pointer tag", ManifestCorruptionError);
+  requireTag(
+    tag,
+    Object.values(DURABLE_CODECS.keyDescriptor),
+    "key pointer tag",
+    ManifestCorruptionError,
+  );
   const pointer: KeyPointer =
     tag === DURABLE_CODECS.keyDescriptor.inline
       ? { kind: "inline", bytes: input.bytes() }

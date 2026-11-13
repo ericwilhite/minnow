@@ -39,7 +39,7 @@
  * row was inserted and deleted within the merged layers); a run written to the bottom level also
  * drops the tombstones left (no older put can exist below it).
  */
-import { RUN_CODEC, requireHeader, requireBits } from "../durable-format.js";
+import { DURABLE_CODECS, RUN_CODEC, requireHeader, requireBits } from "../durable-format.js";
 
 import { runOutsideKeys } from "./run-bounds.js";
 import { overflowKeyBytes } from "./overflow-keys.js";
@@ -624,7 +624,11 @@ export class RunEncoder {
   #describeKey(key: Uint8Array, start: number, length: number): void {
     const pointer = need(this.#pointer);
     pointer.reset();
-    pointer.u8(length <= MAX_KEY_BYTES ? 0 : 1);
+    pointer.u8(
+      length <= MAX_KEY_BYTES
+        ? DURABLE_CODECS.keyDescriptor.inline
+        : DURABLE_CODECS.keyDescriptor.overflow,
+    );
     if (length <= MAX_KEY_BYTES) {
       pointer.varuint(length);
       pointer.rawRange(key, start, start + length);
@@ -633,7 +637,7 @@ export class RunEncoder {
       directory.reset();
       directory.u32(KEY_DIRECTORY_MAGIC);
       directory.u8(KEY_DIRECTORY_VERSION);
-      directory.u8(1);
+      directory.u8(DURABLE_CODECS.keyDescriptor.overflow);
       directory.varuint(length);
       directory.varuint(RUN_KEY_PREFIX_BYTES);
       directory.rawRange(key, start, start + RUN_KEY_PREFIX_BYTES);

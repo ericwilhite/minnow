@@ -18,6 +18,19 @@
  * published tarball.
  */
 /** Reset refusal must see every legacy marker and both OPFS capability states. */
+export const DURABLE_LONG_KEY_REACH = [
+  "WAL-only invalidation",
+  "replayed invalidation",
+  "memory",
+  "sim",
+  "13107-unit boundary",
+  "older OPFS zero writes",
+  "older IDB zero writes",
+  "first root slot",
+  "second root slot",
+  "complete native tree",
+  "partial native tree",
+] as const;
 export const DURABLE_REGISTRY_REACH = [
   "rootSlot",
   "epochSlot",

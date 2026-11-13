@@ -58,7 +58,11 @@ function check(key: RunKey, payloadEnd: number): void {
 
 export function writeRunKey(out: ByteWriter, key: RunKey, payloadEnd: number): void {
   check(key, payloadEnd);
-  out.u8(key.kind === "inline" ? DURABLE_CODECS.keyDescriptor.inline : DURABLE_CODECS.keyDescriptor.overflow);
+  out.u8(
+    key.kind === "inline"
+      ? DURABLE_CODECS.keyDescriptor.inline
+      : DURABLE_CODECS.keyDescriptor.overflow,
+  );
   if (key.kind === "inline") {
     out.bytes(key.bytes);
     return;
@@ -75,7 +79,12 @@ export function writeRunKey(out: ByteWriter, key: RunKey, payloadEnd: number): v
 
 export function readRunKey(input: ByteReader, payloadEnd: number): RunKey {
   const tag = input.u8();
-  requireTag(tag, Object.values(DURABLE_CODECS.keyDescriptor), "key descriptor tag", ManifestCorruptionError);
+  requireTag(
+    tag,
+    Object.values(DURABLE_CODECS.keyDescriptor),
+    "key descriptor tag",
+    ManifestCorruptionError,
+  );
   let key: RunKey;
   if (tag === DURABLE_CODECS.keyDescriptor.inline) key = { kind: "inline", bytes: input.bytes() };
   else {
