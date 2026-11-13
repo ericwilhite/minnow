@@ -5526,3 +5526,15 @@ export const AGG_SORT_WORKSPACE_REACH = [
   "owner correction propagated",
   "metadata retained",
 ] as const;
+
+export const PROJECTION_PROGRESS_REACH = [
+  "CASE",
+  "nested COALESCE NULLIF",
+  "column CASE",
+  "short reachable branch",
+  "cancelled",
+  "PG exact",
+  "pinned competitor",
+  "ASCII",
+  "UTF8",
+] as const;
