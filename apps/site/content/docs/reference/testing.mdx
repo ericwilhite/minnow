@@ -2267,6 +2267,17 @@ its row limit; pending rows stage through the existing publication protocol. Com
 and rollback to a savepoint all retain the correct prefix after such a freeze. A retained
 allocation from another execution forces this relief before the memtable is full.
 
+The long-key range, poisoned-reader, retained-summary and byte-bounded flush campaigns put
+each original history in a separate test body. Every body regenerates the original fast-check stream with the same
+seed, run count and examples; only its assigned history performs storage work. Together the
+bodies execute every original history exactly once. The route opens for all shrink candidates
+after a failure, so smaller counterexamples remain visible. This bounds work per body under
+V8 coverage without shortening keys, reducing fan-in or removing prefix ties, either scan
+direction, skip checks or publication pieces. Reach still counts the original histories.
+Local coverage timings guide this split; ordinary CI keeps its generous hang backstops and
+has no 40-second performance assertion. `testing/history-body.test.ts` checks exact routing,
+examples and shrinking. The shared helper uses the excluded `.test-support` naming pattern.
+
 Known-size memtable flushes give the page writer an estimate-only row-count hint. This avoids
 reserving space for 65,536 wide rows when the group contains only a few. The hint changes no
 codec decision or page boundary. `page/known-rows.test.ts` compares native page and tail bytes

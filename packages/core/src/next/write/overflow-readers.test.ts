@@ -1,5 +1,6 @@
 /** Exact canonical-key order, independent of short prefixes and lease lifetimes. */
 import fc from "fast-check";
+import { historyBody } from "../../testing/history-body.test-support.js";
 import { afterAll, expect, it } from "vitest";
 import { createReach, OVERFLOW_READER_STATES } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
@@ -135,139 +136,147 @@ function expectEntry(
   expect(actual.rowId).toBe(expected.rowId);
   expect(actual.tombstone).toBe(expected.tombstone);
 }
+const readerHistories = 30;
 for (const seed of seedsFor("next-overflow-readers", [0xb503]))
-  it(`point/range/cursor match complete bytes with poisoned leases (seed ${String(seed)})`, async () => {
-    await fc.assert(
-      fc.asyncProperty(
-        fc.constantFrom(2049, 4096, 49155, 65537),
-        fc.boolean(),
-        fc.integer({ min: 9, max: 180 }),
-        async (width, hot, count) => {
-          reach.beginHistory();
-          const entries = Array.from({ length: count }, (_, i) => ({
-            key: key(i % 5 === 0 ? 12 : width, Math.floor(i / 2)),
-            rowId: 2 ** 40 + i,
-            tombstone: i % 7 === 0,
-          }))
-            .concat([{ key: key(width, 0).slice(0, 32), rowId: 2 ** 41, tombstone: false }])
-            .sort((a, b) => compare(a.key, b.key) || a.rowId - b.rowId);
-          const f = fixture(entries, hot),
-            b = new Budget();
-          let reader: RunReader | undefined;
-          try {
-            const before = f.reads;
-            await expect(
-              RunReader.open(f.space, f.ref, b, { allocate: () => false, free: () => undefined }),
-            ).rejects.toBeInstanceOf(ParseBudgetError);
-            expect(f.reads, "metadata admission touches no I/O").toBe(before);
-            reach.reach("metadata precharge");
-            reader = await RunReader.open(f.space, f.ref, b, b);
-            expect(reader.bytes).toBeLessThanOrEqual(RunReader.residentBound(f.ref));
-            for (const e of entries) {
-              const out: Array<{ rowId: number; tombstone: boolean }> = [];
-              await reader.lookup(f.space, e.key, out, b);
-              expect(out).toEqual(
-                entries
-                  .filter((x) => compare(x.key, e.key) === 0)
-                  .map(({ rowId, tombstone }) => ({ rowId, tombstone })),
-              );
-            }
-            reach.reach("point reads");
-            const missing: Array<{ rowId: number; tombstone: boolean }> = [];
-            await reader.lookup(f.space, key(width, count + 100), missing, b);
-            expect(missing).toEqual([]);
-            reach.reach("missing shared prefix");
-            let n = 0;
-            await reader.cursor(
-              f.space,
-              b,
-              (bytes, rowId, tombstone) => {
-                expectEntry(bytes, { rowId, tombstone }, need(entries[n++]));
-                return false;
-              },
-              null,
-              () => Promise.resolve(),
-            );
-            expect(n).toBe(entries.length);
-            reach.reach("cursor drain");
-            const ranges: KeyRange[] = [
-              { lower: null, upper: null },
-              {
-                lower: { kind: "after", key: need(entries[2]).key },
-                upper: { kind: "before", key: need(entries[count - 2]).key },
-              },
-              {
-                lower: { kind: "atLeast", key: key(width, 0).slice(0, 32) },
-                upper: { kind: "through", key: key(width, 0).slice(0, 32) },
-              },
-            ];
-            for (const range of ranges)
-              for (const direction of [1, -1]) {
-                const bytes = rangeRunBytes(f.ref, direction);
-                expect(b.allocate(bytes)).toBe(true);
-                const Native = Uint8Array;
-                let nativeBytes = 0;
-                let input: RunRangeInput;
-                try {
-                  globalThis.Uint8Array = new Proxy(Native, {
-                    construct(target, args) {
-                      const size: unknown = args[0];
-                      if (typeof size === "number") {
-                        nativeBytes += size;
-                        expect(
-                          nativeBytes,
-                          "workspace precharges native blocks and heads",
-                        ).toBeLessThanOrEqual(bytes);
-                      }
-                      return Reflect.construct(target, args) as Uint8Array;
-                    },
-                  });
-                  input = new RunRangeInput(
-                    f.space,
-                    b,
-                    f.ref,
-                    range,
-                    direction,
-                    Infinity,
-                    new AbortController().signal,
+  for (let ordinal = 0; ordinal < readerHistories; ordinal++)
+    it(`point/range/cursor match complete bytes with poisoned leases (seed ${String(seed)}, history ${String(ordinal + 1)})`, async () => {
+      const enter = historyBody(ordinal);
+      await fc.assert(
+        fc.asyncProperty(
+          fc.constantFrom(2049, 4096, 49155, 65537),
+          fc.boolean(),
+          fc.integer({ min: 9, max: 180 }),
+          async (width, hot, count) =>
+            enter(async () => {
+              reach.beginHistory();
+              const entries = Array.from({ length: count }, (_, i) => ({
+                key: key(i % 5 === 0 ? 12 : width, Math.floor(i / 2)),
+                rowId: 2 ** 40 + i,
+                tombstone: i % 7 === 0,
+              }))
+                .concat([{ key: key(width, 0).slice(0, 32), rowId: 2 ** 41, tombstone: false }])
+                .sort((a, b) => compare(a.key, b.key) || a.rowId - b.rowId);
+              const f = fixture(entries, hot),
+                b = new Budget();
+              let reader: RunReader | undefined;
+              try {
+                const before = f.reads;
+                await expect(
+                  RunReader.open(f.space, f.ref, b, {
+                    allocate: () => false,
+                    free: () => undefined,
+                  }),
+                ).rejects.toBeInstanceOf(ParseBudgetError);
+                expect(f.reads, "metadata admission touches no I/O").toBe(before);
+                reach.reach("metadata precharge");
+                reader = await RunReader.open(f.space, f.ref, b, b);
+                expect(reader.bytes).toBeLessThanOrEqual(RunReader.residentBound(f.ref));
+                for (const e of entries) {
+                  const out: Array<{ rowId: number; tombstone: boolean }> = [];
+                  await reader.lookup(f.space, e.key, out, b);
+                  expect(out).toEqual(
+                    entries
+                      .filter((x) => compare(x.key, e.key) === 0)
+                      .map(({ rowId, tombstone }) => ({ rowId, tombstone })),
                   );
-                } finally {
-                  globalThis.Uint8Array = Native;
                 }
-                reach.reach("native precharge");
-                try {
-                  await input.open();
-                  input.pending = false;
-                  const wanted = entries.filter((e) => inKeyRange(range, e.key));
-                  if (direction < 0) wanted.reverse();
-                  let n = 0;
-                  while (await input.advance()) expectEntry(input.key(), input, need(wanted[n++]));
-                  expect(n).toBe(wanted.length);
-                  reach.reach(direction > 0 ? "ascending" : "descending");
-                } finally {
-                  input.close();
-                  b.free(bytes);
-                }
+                reach.reach("point reads");
+                const missing: Array<{ rowId: number; tombstone: boolean }> = [];
+                await reader.lookup(f.space, key(width, count + 100), missing, b);
+                expect(missing).toEqual([]);
+                reach.reach("missing shared prefix");
+                let n = 0;
+                await reader.cursor(
+                  f.space,
+                  b,
+                  (bytes, rowId, tombstone) => {
+                    expectEntry(bytes, { rowId, tombstone }, need(entries[n++]));
+                    return false;
+                  },
+                  null,
+                  () => Promise.resolve(),
+                );
+                expect(n).toBe(entries.length);
+                reach.reach("cursor drain");
+                const ranges: KeyRange[] = [
+                  { lower: null, upper: null },
+                  {
+                    lower: { kind: "after", key: need(entries[2]).key },
+                    upper: { kind: "before", key: need(entries[count - 2]).key },
+                  },
+                  {
+                    lower: { kind: "atLeast", key: key(width, 0).slice(0, 32) },
+                    upper: { kind: "through", key: key(width, 0).slice(0, 32) },
+                  },
+                ];
+                for (const range of ranges)
+                  for (const direction of [1, -1]) {
+                    const bytes = rangeRunBytes(f.ref, direction);
+                    expect(b.allocate(bytes)).toBe(true);
+                    const Native = Uint8Array;
+                    let nativeBytes = 0;
+                    let input: RunRangeInput;
+                    try {
+                      globalThis.Uint8Array = new Proxy(Native, {
+                        construct(target, args) {
+                          const size: unknown = args[0];
+                          if (typeof size === "number") {
+                            nativeBytes += size;
+                            expect(
+                              nativeBytes,
+                              "workspace precharges native blocks and heads",
+                            ).toBeLessThanOrEqual(bytes);
+                          }
+                          return Reflect.construct(target, args) as Uint8Array;
+                        },
+                      });
+                      input = new RunRangeInput(
+                        f.space,
+                        b,
+                        f.ref,
+                        range,
+                        direction,
+                        Infinity,
+                        new AbortController().signal,
+                      );
+                    } finally {
+                      globalThis.Uint8Array = Native;
+                    }
+                    reach.reach("native precharge");
+                    try {
+                      await input.open();
+                      input.pending = false;
+                      const wanted = entries.filter((e) => inKeyRange(range, e.key));
+                      if (direction < 0) wanted.reverse();
+                      let n = 0;
+                      while (await input.advance())
+                        expectEntry(input.key(), input, need(wanted[n++]));
+                      expect(n).toBe(wanted.length);
+                      reach.reach(direction > 0 ? "ascending" : "descending");
+                    } finally {
+                      input.close();
+                      b.free(bytes);
+                    }
+                  }
+                if (width === 49155) reach.reach("shipped key maximum");
+                reach.reach("exact inline prefix");
+                reach.reach("prefix seek");
+                reach.reach("mixed inline blocks");
+                reach.reach(hot ? "cached reads" : "cold reads");
+                reach.reach(width > 65536 ? "multi chunk" : "single chunk");
+                reach.reach("equal prefixes full comparison");
+                reach.reach("wide row ids");
+              } finally {
+                if (reader) b.free(reader.bytes);
+                f.run.release();
               }
-            if (width === 49155) reach.reach("shipped key maximum");
-            reach.reach("exact inline prefix");
-            reach.reach("prefix seek");
-            reach.reach("mixed inline blocks");
-            reach.reach(hot ? "cached reads" : "cold reads");
-            reach.reach(width > 65536 ? "multi chunk" : "single chunk");
-            reach.reach("equal prefixes full comparison");
-            reach.reach("wide row ids");
-          } finally {
-            if (reader) b.free(reader.bytes);
-            f.run.release();
-          }
-          expect(f.leases).toBe(0);
-          expect(b.used).toBe(0);
-        },
-      ),
-      { seed, numRuns: 30 },
-    );
-  }, 120_000);
+              expect(f.leases).toBe(0);
+              expect(b.used).toBe(0);
+            }),
+        ),
+        { seed, numRuns: readerHistories },
+      );
+    }, 120_000);
 
 for (const seed of seedsFor("next-overflow-reader-faults", [0xb504]))
   it(`release errors, cancellation and structural corruption (seed ${String(seed)})`, async () => {

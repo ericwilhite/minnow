@@ -1,5 +1,6 @@
 /** Summary prefixes are conservative; Bloom membership always hashes complete canonical keys. */
 import fc from "fast-check";
+import { historyBody } from "../../testing/history-body.test-support.js";
 import { afterAll, expect, it } from "vitest";
 import { createReach, OVERFLOW_SUMMARY_STATES } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
@@ -130,122 +131,127 @@ for (const seed of seedsFor("next-overflow-summary-bloom", [0xb50a]))
     );
   }, 120_000);
 
+const rangeHistories = 12;
 for (const seed of seedsFor("next-overflow-summary-ranges", [0xb50b]))
-  it(`retains prefix ties and resolves pending heads in either direction (seed ${String(seed)})`, async () => {
-    await fc.assert(
-      fc.asyncProperty(
-        fc.constantFrom(2, 3, 8),
-        fc.constantFrom(2049, 49155, 65537),
-        fc.integer({ min: 9, max: 17 }),
-        async (fan, width, perRun) => {
-          reach.beginHistory();
-          const h = new Harness("strict", "memory");
-          await h.open();
-          const writer = h.space.beginWrite("overlapping summary prefixes");
-          const summaries: Array<NonNullable<ReturnType<RunBuilder["finish"]>>> = [],
-            refs: RunRef[] = [];
-          const all: Array<{ key: Uint8Array; rowId: number }> = [];
-          try {
-            for (let run = 0; run < fan; run++) {
-              const builder = new RunBuilder(false, false, UNCHARGED, 2);
-              for (let i = 0; i < perRun; i++) {
-                const rowId = i * fan + run,
-                  bytes = key(width, rowId, true);
-                builder.add(bytes, rowId, false);
-                all.push({ key: bytes, rowId });
-              }
-              const summary = need(builder.finish());
-              summaries.push(summary);
-              const ref = runRef(summary, (await writer.write(summary.parts)).blobs);
-              refs.push(ref);
-              expect(ref.minKey.length).toBe(32);
-              expect(ref.maxKey.length).toBe(32);
-            }
-            all.sort((a, b) => Buffer.compare(a.key, b.key) || a.rowId - b.rowId);
-            const ranges: KeyRange[] = [
-              { lower: null, upper: null },
-              {
-                lower: { kind: "atLeast", key: need(all[1]).key },
-                upper: { kind: "through", key: need(all.at(-2)).key },
-              },
-              {
-                lower: { kind: "after", key: need(all[1]).key },
-                upper: { kind: "before", key: need(all.at(-2)).key },
-              },
-              {
-                lower: { kind: "atLeast", key: need(all[0]).key.subarray(0, 32) },
-                upper: { kind: "through", key: need(all[0]).key.subarray(0, 32) },
-              },
-              { lower: { kind: "after", key: need(all[0]).key.subarray(0, 32) }, upper: null },
-            ];
-            const fake = {
-              def: { id: 1, role: "secondary", unique: false, kind: "ordered" },
-              table: {
-                tableView: {
-                  runs: new Map([[1, refs]]),
-                  memtables: [],
-                  groups: { liveRowCount: all.length },
-                },
-                snapshot: {
-                  bound: Infinity,
-                  shared: { governor: h.governor, space: h.space },
-                  check: () => undefined,
-                  watchCursor() {
-                    return () => undefined;
+  for (let ordinal = 0; ordinal < rangeHistories; ordinal++)
+    it(`retains prefix ties and resolves pending heads in either direction (seed ${String(seed)}, history ${String(ordinal + 1)})`, async () => {
+      const enter = historyBody(ordinal);
+      await fc.assert(
+        fc.asyncProperty(
+          fc.constantFrom(2, 3, 8),
+          fc.constantFrom(2049, 49155, 65537),
+          fc.integer({ min: 9, max: 17 }),
+          async (fan, width, perRun) =>
+            enter(async () => {
+              reach.beginHistory();
+              const h = new Harness("strict", "memory");
+              await h.open();
+              const writer = h.space.beginWrite("overlapping summary prefixes");
+              const summaries: Array<NonNullable<ReturnType<RunBuilder["finish"]>>> = [],
+                refs: RunRef[] = [];
+              const all: Array<{ key: Uint8Array; rowId: number }> = [];
+              try {
+                for (let run = 0; run < fan; run++) {
+                  const builder = new RunBuilder(false, false, UNCHARGED, 2);
+                  for (let i = 0; i < perRun; i++) {
+                    const rowId = i * fan + run,
+                      bytes = key(width, rowId, true);
+                    builder.add(bytes, rowId, false);
+                    all.push({ key: bytes, rowId });
+                  }
+                  const summary = need(builder.finish());
+                  summaries.push(summary);
+                  const ref = runRef(summary, (await writer.write(summary.parts)).blobs);
+                  refs.push(ref);
+                  expect(ref.minKey.length).toBe(32);
+                  expect(ref.maxKey.length).toBe(32);
+                }
+                all.sort((a, b) => Buffer.compare(a.key, b.key) || a.rowId - b.rowId);
+                const ranges: KeyRange[] = [
+                  { lower: null, upper: null },
+                  {
+                    lower: { kind: "atLeast", key: need(all[1]).key },
+                    upper: { kind: "through", key: need(all.at(-2)).key },
                   },
-                },
-                locator: (row: number) => row,
-              },
-            } as unknown as ViewIndex;
-            for (const range of ranges) {
-              for (let r = 0; r < refs.length; r++) {
-                const actual = all.filter((e) => e.rowId % fan === r);
-                if (actual.some((e) => inKeyRange(range, e.key)))
-                  expect(runOutsideRange(need(refs[r]), range)).toBe(false);
-                for (const e of actual) expect(runOutsideKeys(need(refs[r]), e.key)).toBe(false);
-              }
-              const expected = all.filter((e) => inKeyRange(range, e.key));
-              for (const direction of ["asc", "desc"] as const) {
-                const wanted = (direction === "asc" ? expected : [...expected].reverse()).map(
-                  (e) => e.rowId,
-                );
-                for (const skipping of [false, true]) {
-                  const cursor = new StreamingRangeCursor(fake, range, direction),
-                    out = new Float64Array(7);
-                  try {
-                    const start = skipping ? Math.floor(wanted.length / 2) : 0;
-                    if (skipping) expect(await cursor.skip(start)).toBe(start);
-                    const actual: number[] = [];
-                    for (;;) {
-                      const n = await cursor.next(out);
-                      if (n === 0) break;
-                      for (let i = 0; i < n; i++) actual.push(need(out[i]));
-                    }
-                    expect(actual, "pending prefix heads preserve full-key order").toEqual(
-                      wanted.slice(start),
+                  {
+                    lower: { kind: "after", key: need(all[1]).key },
+                    upper: { kind: "before", key: need(all.at(-2)).key },
+                  },
+                  {
+                    lower: { kind: "atLeast", key: need(all[0]).key.subarray(0, 32) },
+                    upper: { kind: "through", key: need(all[0]).key.subarray(0, 32) },
+                  },
+                  { lower: { kind: "after", key: need(all[0]).key.subarray(0, 32) }, upper: null },
+                ];
+                const fake = {
+                  def: { id: 1, role: "secondary", unique: false, kind: "ordered" },
+                  table: {
+                    tableView: {
+                      runs: new Map([[1, refs]]),
+                      memtables: [],
+                      groups: { liveRowCount: all.length },
+                    },
+                    snapshot: {
+                      bound: Infinity,
+                      shared: { governor: h.governor, space: h.space },
+                      check: () => undefined,
+                      watchCursor() {
+                        return () => undefined;
+                      },
+                    },
+                    locator: (row: number) => row,
+                  },
+                } as unknown as ViewIndex;
+                for (const range of ranges) {
+                  for (let r = 0; r < refs.length; r++) {
+                    const actual = all.filter((e) => e.rowId % fan === r);
+                    if (actual.some((e) => inKeyRange(range, e.key)))
+                      expect(runOutsideRange(need(refs[r]), range)).toBe(false);
+                    for (const e of actual)
+                      expect(runOutsideKeys(need(refs[r]), e.key)).toBe(false);
+                  }
+                  const expected = all.filter((e) => inKeyRange(range, e.key));
+                  for (const direction of ["asc", "desc"] as const) {
+                    const wanted = (direction === "asc" ? expected : [...expected].reverse()).map(
+                      (e) => e.rowId,
                     );
-                  } finally {
-                    cursor.close();
+                    for (const skipping of [false, true]) {
+                      const cursor = new StreamingRangeCursor(fake, range, direction),
+                        out = new Float64Array(7);
+                      try {
+                        const start = skipping ? Math.floor(wanted.length / 2) : 0;
+                        if (skipping) expect(await cursor.skip(start)).toBe(start);
+                        const actual: number[] = [];
+                        for (;;) {
+                          const n = await cursor.next(out);
+                          if (n === 0) break;
+                          for (let i = 0; i < n; i++) actual.push(need(out[i]));
+                        }
+                        expect(actual, "pending prefix heads preserve full-key order").toEqual(
+                          wanted.slice(start),
+                        );
+                      } finally {
+                        cursor.close();
+                      }
+                    }
+                    reach.reach(direction === "asc" ? "ascending" : "descending");
                   }
                 }
-                reach.reach(direction === "asc" ? "ascending" : "descending");
+                reach.reach("prefix ties retained");
+                reach.reach("pending heads");
+                reach.reach("range bounds and skip");
+                reach.reach(fan === 8 ? "fan in eight" : "other fan in");
+              } finally {
+                for (const s of summaries) s.release();
+                await writer.abort();
+                await h.close();
               }
-            }
-            reach.reach("prefix ties retained");
-            reach.reach("pending heads");
-            reach.reach("range bounds and skip");
-            reach.reach(fan === 8 ? "fan in eight" : "other fan in");
-          } finally {
-            for (const s of summaries) s.release();
-            await writer.abort();
-            await h.close();
-          }
-          expect(h.governor.usedBytes).toBe(0);
-        },
-      ),
-      { seed, numRuns: 12 },
-    );
-  }, 120_000);
+              expect(h.governor.usedBytes).toBe(0);
+            }),
+        ),
+        { seed, numRuns: rangeHistories },
+      );
+    }, 120_000);
 
 for (const seed of seedsFor("next-overflow-hot-partitions", [0xb50f]))
   it(`retains full-key probes when a hot key crosses partitions (seed ${String(seed)})`, async () => {

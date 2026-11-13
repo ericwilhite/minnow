@@ -1,5 +1,6 @@
 /** Limits belong to catalog paths. Live range admission and FK fallback must remain complete. */
 import fc from "fast-check";
+import { historyBody } from "../../testing/history-body.test-support.js";
 import { afterAll, expect, it, vi } from "vitest";
 import { createReach, LONG_KEY_ACTION_STATES } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
@@ -338,171 +339,181 @@ for (const seed of seedsFor("next-long-fk-fallback", [0xb516]))
     );
   }, 180_000);
 
+const flushHistories = 24;
 for (const seed of seedsFor("next-long-flush-bytes", [0xb51a]))
-  it(`drains wide flushes by bytes under a constrained cap (seed ${String(seed)})`, async () => {
-    await fc.assert(
-      fc.asyncProperty(
-        fc.constantFrom(769, 16384),
-        fc.constantFrom(32, 64),
-        fc.constantFrom("auto", "commit", "rollback", "savepoint"),
-        fc.constantFrom(8, 80, 160),
-        fc.constantFrom("\u0800", "\0"),
-        async (units, cap, outcome, batchRows, glyph) => {
-          reach.beginHistory();
-          const h = new Harness("strict", "memory", 160, undefined, { merges: { mode: "off" } });
-          Object.assign(h, { governor: new Governor(cap << 20) });
-          await h.open();
-          const method = Object.getOwnPropertyDescriptor(RunSink.prototype, "drain")
-            ?.value as unknown;
-          if (typeof method !== "function") throw new Error("RunSink drain missing");
-          const drain = method as (
-            this: RunSink,
-            ...args: Parameters<RunSink["drain"]>
-          ) => ReturnType<RunSink["drain"]>;
-          let calls = 0;
-          let pressure: Awaited<ReturnType<Governor["admit"]>> | undefined;
-          let foreignBuffer: Uint8Array | undefined;
-          const observed = vi.spyOn(RunSink.prototype, "drain").mockImplementation(function (
-            this: RunSink,
-            ...args
-          ) {
-            expect(
-              this.builder.queuedBytes,
-              "overflow payload queue is bounded before append",
-            ).toBeLessThanOrEqual(512 * 1024);
-            calls++;
-            return drain.apply(this, args);
-          });
-          try {
-            let t = 0;
-            await autocommit(h.path, async (s) => {
-              t = need(
-                (
-                  await s.changeCatalog({
-                    kind: "createTable",
-                    table: tableInput("wide", [column("k", TEXT, false), column("n", INT, false)]),
-                  })
-                ).id,
-              );
-            });
-            if (units === 16384 && cap === 32 && outcome !== "auto") {
-              await h.path.quiesce();
-              const bytes =
-                h.governor.capBytes -
-                h.governor.reserveBytes -
-                h.governor.usedBytes -
-                6 * 1024 * 1024;
-              expect(bytes).toBeGreaterThan(0);
-              pressure = await h.governor.admit({
-                label: "another execution",
-                minimumBytes: bytes,
-                spillable: false,
+  for (let ordinal = 0; ordinal < flushHistories; ordinal++)
+    it(`drains wide flushes by bytes under a constrained cap (seed ${String(seed)}, history ${String(ordinal + 1)})`, async () => {
+      const enter = historyBody(ordinal);
+      await fc.assert(
+        fc.asyncProperty(
+          fc.constantFrom(769, 16384),
+          fc.constantFrom(32, 64),
+          fc.constantFrom("auto", "commit", "rollback", "savepoint"),
+          fc.constantFrom(8, 80, 160),
+          fc.constantFrom("\u0800", "\0"),
+          async (units, cap, outcome, batchRows, glyph) =>
+            enter(async () => {
+              reach.beginHistory();
+              const h = new Harness("strict", "memory", 160, undefined, {
+                merges: { mode: "off" },
               });
-              expect(pressure.allocate(bytes)).toBe(true);
-              foreignBuffer = new Uint8Array(bytes).fill(0x5a);
-              reach.reach("pre-full pending pressure");
-            }
-            const tx = outcome === "auto" ? null : await h.path.begin();
-            let save: ReturnType<NonNullable<typeof tx>["savepoint"]> | undefined;
-            try {
-              for (let from = 0; from < 160;) {
-                const boundary = outcome === "savepoint" ? 80 : 160;
-                const take = Math.min(batchRows, boundary - (from % boundary));
-                const input = batch(
-                  texts(Array.from({ length: take }, (_, i) => value(units, from + i, glyph))),
-                  ints(Array.from({ length: take }, (_, i) => from + i)),
-                );
-                if (tx === null) await autocommit(h.path, (s) => s.table(t).insert(input, null));
-                else {
-                  const statement = tx.statement({ rules });
-                  try {
-                    await statement.table(t).insert(input, null);
-                    await statement.end();
-                  } catch (error) {
-                    statement.rollback();
-                    throw error;
+              Object.assign(h, { governor: new Governor(cap << 20) });
+              await h.open();
+              const method = Object.getOwnPropertyDescriptor(RunSink.prototype, "drain")
+                ?.value as unknown;
+              if (typeof method !== "function") throw new Error("RunSink drain missing");
+              const drain = method as (
+                this: RunSink,
+                ...args: Parameters<RunSink["drain"]>
+              ) => ReturnType<RunSink["drain"]>;
+              let calls = 0;
+              let pressure: Awaited<ReturnType<Governor["admit"]>> | undefined;
+              let foreignBuffer: Uint8Array | undefined;
+              const observed = vi.spyOn(RunSink.prototype, "drain").mockImplementation(function (
+                this: RunSink,
+                ...args
+              ) {
+                expect(
+                  this.builder.queuedBytes,
+                  "overflow payload queue is bounded before append",
+                ).toBeLessThanOrEqual(512 * 1024);
+                calls++;
+                return drain.apply(this, args);
+              });
+              try {
+                let t = 0;
+                await autocommit(h.path, async (s) => {
+                  t = need(
+                    (
+                      await s.changeCatalog({
+                        kind: "createTable",
+                        table: tableInput("wide", [
+                          column("k", TEXT, false),
+                          column("n", INT, false),
+                        ]),
+                      })
+                    ).id,
+                  );
+                });
+                if (units === 16384 && cap === 32 && outcome !== "auto") {
+                  await h.path.quiesce();
+                  const bytes =
+                    h.governor.capBytes -
+                    h.governor.reserveBytes -
+                    h.governor.usedBytes -
+                    6 * 1024 * 1024;
+                  expect(bytes).toBeGreaterThan(0);
+                  pressure = await h.governor.admit({
+                    label: "another execution",
+                    minimumBytes: bytes,
+                    spillable: false,
+                  });
+                  expect(pressure.allocate(bytes)).toBe(true);
+                  foreignBuffer = new Uint8Array(bytes).fill(0x5a);
+                  reach.reach("pre-full pending pressure");
+                }
+                const tx = outcome === "auto" ? null : await h.path.begin();
+                let save: ReturnType<NonNullable<typeof tx>["savepoint"]> | undefined;
+                try {
+                  for (let from = 0; from < 160;) {
+                    const boundary = outcome === "savepoint" ? 80 : 160;
+                    const take = Math.min(batchRows, boundary - (from % boundary));
+                    const input = batch(
+                      texts(Array.from({ length: take }, (_, i) => value(units, from + i, glyph))),
+                      ints(Array.from({ length: take }, (_, i) => from + i)),
+                    );
+                    if (tx === null)
+                      await autocommit(h.path, (s) => s.table(t).insert(input, null));
+                    else {
+                      const statement = tx.statement({ rules });
+                      try {
+                        await statement.table(t).insert(input, null);
+                        await statement.end();
+                      } catch (error) {
+                        statement.rollback();
+                        throw error;
+                      }
+                      if (from + take === 80) save = tx.savepoint();
+                    }
+                    from += take;
                   }
-                  if (from + take === 80) save = tx.savepoint();
-                }
-                from += take;
-              }
-              if (tx !== null) {
-                if (units === 16384 && cap === 32) {
-                  expect(h.path.maintenance.stages).toBeGreaterThan(0);
-                  reach.reach("pending byte freeze");
-                }
-                if (outcome === "rollback") {
-                  tx.rollback();
-                  reach.reach("byte freeze rollback");
-                } else {
-                  if (outcome === "savepoint") {
-                    tx.rollbackTo(need(save));
-                    reach.reach("byte freeze savepoint");
+                  if (tx !== null) {
+                    if (units === 16384 && cap === 32) {
+                      expect(h.path.maintenance.stages).toBeGreaterThan(0);
+                      reach.reach("pending byte freeze");
+                    }
+                    if (outcome === "rollback") {
+                      tx.rollback();
+                      reach.reach("byte freeze rollback");
+                    } else {
+                      if (outcome === "savepoint") {
+                        tx.rollbackTo(need(save));
+                        reach.reach("byte freeze savepoint");
+                      }
+                      const receipt = await tx.commit(null);
+                      await receipt.durable;
+                    }
                   }
-                  const receipt = await tx.commit(null);
-                  await receipt.durable;
+                } catch (error) {
+                  tx?.rollback();
+                  throw error;
                 }
-              }
-            } catch (error) {
-              tx?.rollback();
-              throw error;
-            }
-            await autocommit(h.path, (s) =>
-              s.table(t).insert(batch(texts(["sentinel"]), ints([160])), null),
-            );
-            await h.path.quiesce();
-            // quiesce waits runnable flushes; it does not freeze a commit's live tail.
-            // Escaped-NUL byte boundaries can therefore remain WAL-only. The original BMP
-            // cases still require a drain; every actual drain is checked for every glyph.
-            if (glyph === "\u0800" && (outcome === "auto" || outcome === "commit"))
-              expect(calls).toBeGreaterThan(0);
-            await h.reopen();
-            const view = h.path.pin();
-            try {
-              for (const n of [0, 79, 159]) {
-                const out: number[] = [];
-                await view
-                  .index(t, need(view.catalog.table(t)?.primaryKey))
-                  .resolve(key(value(units, n, glyph)), out);
-                expect(out).toHaveLength(
-                  outcome === "rollback" || (outcome === "savepoint" && n >= 80) ? 0 : 1,
+                await autocommit(h.path, (s) =>
+                  s.table(t).insert(batch(texts(["sentinel"]), ints([160])), null),
                 );
+                await h.path.quiesce();
+                // quiesce waits runnable flushes; it does not freeze a commit's live tail.
+                // Escaped-NUL byte boundaries can therefore remain WAL-only. The original BMP
+                // cases still require a drain; every actual drain is checked for every glyph.
+                if (glyph === "\u0800" && (outcome === "auto" || outcome === "commit"))
+                  expect(calls).toBeGreaterThan(0);
+                await h.reopen();
+                const view = h.path.pin();
+                try {
+                  for (const n of [0, 79, 159]) {
+                    const out: number[] = [];
+                    await view
+                      .index(t, need(view.catalog.table(t)?.primaryKey))
+                      .resolve(key(value(units, n, glyph)), out);
+                    expect(out).toHaveLength(
+                      outcome === "rollback" || (outcome === "savepoint" && n >= 80) ? 0 : 1,
+                    );
+                  }
+                } finally {
+                  view.release();
+                }
+                if (calls > 0) reach.reach("bounded overflow drain");
+                reach.reach(cap === 32 ? "thirty-two MiB flush" : "sixty-four MiB flush");
+                if (cap === 32 && batchRows === 80) reach.reach("wide ingress at thirty-two MiB");
+                if (cap === 32 && batchRows === 160 && outcome !== "savepoint")
+                  reach.reach("whole wide ingress below cap");
+                if (glyph === "\0") reach.reach("escaped key expansion at admission");
+              } finally {
+                observed.mockRestore();
+                if (foreignBuffer !== undefined) expect(foreignBuffer[0]).toBe(0x5a);
+                pressure?.close();
+                await h.close();
               }
-            } finally {
-              view.release();
-            }
-            if (calls > 0) reach.reach("bounded overflow drain");
-            reach.reach(cap === 32 ? "thirty-two MiB flush" : "sixty-four MiB flush");
-            if (cap === 32 && batchRows === 80) reach.reach("wide ingress at thirty-two MiB");
-            if (cap === 32 && batchRows === 160 && outcome !== "savepoint")
-              reach.reach("whole wide ingress below cap");
-            if (glyph === "\0") reach.reach("escaped key expansion at admission");
-          } finally {
-            observed.mockRestore();
-            if (foreignBuffer !== undefined) expect(foreignBuffer[0]).toBe(0x5a);
-            pressure?.close();
-            await h.close();
-          }
-          expect(h.governor.usedBytes).toBe(0);
+              expect(h.governor.usedBytes).toBe(0);
+            }),
+        ),
+        {
+          seed,
+          numRuns: flushHistories,
+          examples: [
+            [16384, 32, "commit", 160, "\0"],
+            [16384, 32, "rollback", 160, "\0"],
+            [16384, 32, "savepoint", 80, "\0"],
+            [16384, 32, "auto", 160, "\u0800"],
+            [16384, 32, "commit", 160, "\u0800"],
+            [16384, 32, "rollback", 160, "\u0800"],
+            [16384, 32, "commit", 8, "\u0800"],
+            [16384, 32, "commit", 80, "\u0800"],
+            [16384, 32, "rollback", 8, "\u0800"],
+            [16384, 32, "rollback", 80, "\u0800"],
+            [16384, 32, "savepoint", 8, "\u0800"],
+            [16384, 32, "savepoint", 80, "\u0800"],
+          ],
         },
-      ),
-      {
-        seed,
-        numRuns: 24,
-        examples: [
-          [16384, 32, "commit", 160, "\0"],
-          [16384, 32, "rollback", 160, "\0"],
-          [16384, 32, "savepoint", 80, "\0"],
-          [16384, 32, "auto", 160, "\u0800"],
-          [16384, 32, "commit", 160, "\u0800"],
-          [16384, 32, "rollback", 160, "\u0800"],
-          [16384, 32, "commit", 8, "\u0800"],
-          [16384, 32, "commit", 80, "\u0800"],
-          [16384, 32, "rollback", 8, "\u0800"],
-          [16384, 32, "rollback", 80, "\u0800"],
-          [16384, 32, "savepoint", 8, "\u0800"],
-          [16384, 32, "savepoint", 80, "\u0800"],
-        ],
-      },
-    );
-  }, 180_000);
+      );
+    }, 180_000);
