@@ -1,14 +1,26 @@
 import { defineConfig } from "@playwright/test";
-import { browserProjects, localUrl, runnerDefaults } from "./playwright.shared.mjs";
+import {
+  browserProjects,
+  localUrl,
+  partReporters,
+  partTestMatch,
+  runnerDefaults,
+} from "./playwright.shared.mjs";
 
 const port = 4180;
+const testDir = "./packages/core/browser-tests";
+// The rebuild owner's specs need a cross-origin-isolated server (fine timers, SharedArrayBuffer)
+// and run under playwright.next-owner.config.ts; here their isolation check would fail.
+const testIgnore = /next-owner.*\.spec\.ts$/u;
+// CI's parts (`MINNOW_BROWSER_PART`) split the specs by measured duration; unset, all of them.
+const testMatch = partTestMatch(testDir, testIgnore);
 
 export default defineConfig({
   ...runnerDefaults,
-  testDir: "./packages/core/browser-tests",
-  // The rebuild owner's specs need a cross-origin-isolated server (fine timers, SharedArrayBuffer)
-  // and run under playwright.next-owner.config.ts; here their isolation check would fail.
-  testIgnore: /next-owner.*\.spec\.ts$/u,
+  testDir,
+  testIgnore,
+  ...(testMatch === undefined ? {} : { testMatch }),
+  reporter: [...runnerDefaults.reporter, ...partReporters()],
   webServer: {
     command: `node apps/site/scripts/vendor-engines.mjs && npx vite --config vite.library.config.ts --host 127.0.0.1 --port ${String(port)} --strictPort`,
     url: `${localUrl(port)}/packages/core/browser/`,
