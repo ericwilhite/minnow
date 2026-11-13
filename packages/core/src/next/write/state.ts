@@ -163,6 +163,6 @@ export interface Shared {
    * synchronous on a hit, charged to `budget` until the `Held` is released.
    */
   groupRoot(ref: BlobRef, budget: ByteBudget): MaybePromise<Held<GroupRoot>>;
-  /** A group's durable deletion bitmap (bit set = deleted), or null. */
-  bitmap(ref: BlobRef): Uint32Array | Promise<Uint32Array>;
+  /** A group's canonical deletion words (bit set = deleted), checked against its stored row count. */
+  bitmap(ref: BlobRef, rowCount: number): Uint32Array | Promise<Uint32Array>;
 }

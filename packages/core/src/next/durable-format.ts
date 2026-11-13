@@ -298,6 +298,7 @@ export const DURABLE_FORMATS = {
   manifest: { ...envelope(0x31524d4d, "decodeManifestRoot"), version: MANIFEST_FORMAT_VERSION },
   groupRoot: envelope(0x3152474d, "decodeGroupRoot/tryDecodeGroupRootView"),
   groupPage: envelope(0x3150474d, "decodeGroupPage"),
+  deletionBitmap: inherited("groupPage", "decodeDeletionBitmap"),
   groupIndex: envelope(0x3149474d, "decodeGroupIndex"),
   tableStatistics: envelope(0x3154534d, "decodeTableStatistics"),
   extentList: {
@@ -426,6 +427,7 @@ export const RESERVED_MASKS = {
   pageFlags: 255,
   booleanBitmapTail: 0,
   validityBitmapTail: 0,
+  deletionBitmapTail: 0,
   arrayNullBitmapTail: 0,
   alignmentPadding: 0,
   scaledFloatPatchReserved: 0,

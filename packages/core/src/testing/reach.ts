@@ -26,6 +26,7 @@ export const DURABLE_REGISTRY_REACH = [
   "manifest",
   "groupRoot",
   "groupPage",
+  "deletionBitmap",
   "groupIndex",
   "tableStatistics",
   "extentList",
@@ -44,6 +45,21 @@ export const DURABLE_REGISTRY_REACH = [
   "runBloom",
   "arrayValue",
 ] as const;
+export const DELETION_BITMAP_REACH = [
+  "empty",
+  "partial word",
+  "whole word",
+  "multiple words",
+  "unaligned input",
+  "short",
+  "long",
+  "nonword length",
+  "tail bit",
+  "unchanged input",
+  "cache hit",
+  "async read",
+] as const;
+
 export const DURABLE_FIELD_REACH = [
   "request flag",
   "column flag",

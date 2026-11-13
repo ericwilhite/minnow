@@ -1,5 +1,10 @@
 /** Registry law: unknown durable identities/tags/reserved bits never mean empty or decoded data. */
 import fc from "fast-check";
+import {
+  discoverDurableSources,
+  DURABLE_EMISSIONS,
+  DURABLE_REFERENCES,
+} from "./durable-inventory.js";
 import { expect, it } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
 import {
@@ -22,6 +27,7 @@ import {
   type FormatField,
 } from "../durable-format.js";
 import { ByteReader as MetadataReader } from "../format/bytes.js";
+import { decodeDeletionBitmap } from "../format/deletion-bitmap.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { decodeRootSlot, encodeRootSlot } from "../storage/root-slot.js";
 import { encodeEpochSlot, createOpfsBackend, type OpfsDirectoryLike } from "../storage/opfs.js";
@@ -317,6 +323,10 @@ function adapters(): Record<
       decode: parsed(decodeGroupRoot),
       also: [parsed(tryDecodeGroupRootView)],
     },
+    deletionBitmap: {
+      bytes: new Uint8Array([1, 0, 0, 0]),
+      decode: (bytes) => decodeDeletionBitmap(bytes, 2),
+    },
     groupPage: { bytes: encodeGroupPage([group]), decode: parsed(decodeGroupPage) },
     groupIndex: {
       bytes: encodeGroupIndex([
@@ -536,6 +546,14 @@ it("has a real adapter for every implemented byte decoder and keeps snapshot des
   expect(DURABLE_READER_VERSION).toBeLessThanOrEqual(8);
   expect(MANIFEST_FORMAT_VERSION).toBeGreaterThanOrEqual(2);
   expect(MANIFEST_FORMAT_VERSION).toBeLessThanOrEqual(257);
+  const discovered = discoverDurableSources();
+  expect([...discovered.sites.keys()].sort()).toEqual(Object.keys(DURABLE_EMISSIONS).sort());
+  for (const [site, count] of discovered.sites)
+    expect(count, site).toBe(DURABLE_EMISSIONS[site]?.count);
+  expect(discovered.refs).toEqual(Object.keys(DURABLE_REFERENCES).sort());
+  const emitted = new Set(Object.values(DURABLE_EMISSIONS).flatMap((site) => site.kinds));
+  for (const kinds of Object.values(DURABLE_REFERENCES))
+    for (const kind of kinds) expect(emitted.has(kind), `unemitted reference ${kind}`).toBe(true);
   expect(
     Object.keys(DURABLE_FORMATS)
       .filter(
@@ -544,11 +562,14 @@ it("has a real adapter for every implemented byte decoder and keeps snapshot des
           name !== "indexedDb",
       )
       .sort(),
-  ).toEqual(Object.keys(all).sort());
+  ).toEqual([...emitted].filter((kind) => kind !== "indexedDb").sort());
+  expect(Object.keys(all).sort()).toEqual(
+    [...emitted].filter((kind) => kind !== "indexedDb").sort(),
+  );
   expect([...DURABLE_REGISTRY_REACH].sort()).toEqual(Object.keys(all).sort());
   expect(DURABLE_FORMATS.snapshot.state).toBe("design");
   expect(Object.isFrozen(DURABLE_FORMATS.page.fields)).toBe(true);
-});
+}, 60_000); // The source inventory builds a TypeScript program, independently of decoder execution.
 
 for (const seed of seedsFor("next-durable-fields", [0xb223, 0xb224]))
   it(`refuses embedded discriminators before returning decoded values seed ${String(seed)}`, async () => {

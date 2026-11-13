@@ -155,7 +155,7 @@ class GroupSegmentImpl implements GroupSegment {
     const delta = groupDeletions(this.view.tableView, this.#groupId, this.view.snapshot.bound);
     const ref = this.directory.deletions(this.position);
     if (ref === null) return deletionVector(this.rowCount, null, delta);
-    return settle(this.view.snapshot.shared.bitmap(ref), (bits) =>
+    return settle(this.view.snapshot.shared.bitmap(ref, this.rowCount), (bits) =>
       deletionVector(this.rowCount, bits, delta),
     );
   }

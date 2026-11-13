@@ -10,6 +10,11 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported rebuild registers durable group deletion bitmaps under the enclosing group-page
+version. Reads now refuse wrong lengths or nonzero unused bits with a typed corruption error.
+The registry completeness check independently inventories persistence calls and durable
+references. No stored-byte, version or public API change; canonical existing bitmaps remain readable.
+
 The unexported rebuild centralizes durable versions, codec tags and reserved-zero bits.
 Decoders refuse unsupported selectors with typed errors. Native root slots now carry a
 checksummed minimum-reader and manifest-format barrier, checked before owner epoch updates

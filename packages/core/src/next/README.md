@@ -376,6 +376,17 @@ bits21..23 and manifest-format minus2 in bits24..31. Zero selects reader1/manife
 bytes and charges stay unchanged. The first released1.0 writer starts the supported fixture
 and automatic-upgrade chain. The shipped0.x engine is unchanged.
 
+Group deletion bitmaps inherit the enclosing group-page version. They store exactly
+`ceil(rowCount / 32)` little-endian u32 words, with unused high bits zero. Cache-hit and
+async readers validate length and tail bits before creating their owned word copy; malformed
+bitmaps raise `StoreCorruptionError`. The writer's bytes and version stay unchanged.
+
+Completeness is checked against an independent source inventory: typed persistence calls
+and durable `BlobRef`/`ChunkData` fields must each have an explicit object-kind classification.
+A new emission site or reference fails even when its registry entry and decoder adapter are
+both missing. Composed codecs are listed at their outer emission boundary; reflective calls
+still require review. The inventory changes no production storage API.
+
 `testing/durable-format.test.ts` sweeps real decoder entry points with unsupported selectors
 and every reserved bit, checks typed refusal, unchanged inputs and returned charges, and
 checks future roots leave native epoch/log/root/metadata images unchanged with zero writes.

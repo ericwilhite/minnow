@@ -2178,3 +2178,9 @@ refusal, unchanged bytes and returned allocation charges. A future minimum-reade
 format in either root slot must refuse before any native write: IndexedDB's epoch and records
 and OPFS's file tree remain unchanged. Checksum-invalid torn slots retain their ordinary
 recovery behavior. Snapshot registry entries remain design-only until export/load is implemented.
+
+Deletion-bitmap cases cover exact word lengths, every unused tail bit, aligned and unaligned
+input, and both cache-hit and asynchronous reads through the production write path. They
+require typed refusal, unchanged inputs and returned resources. Registry completeness also
+scans production persistence calls and durable reference fields independently of the registry
+and its decoder adapters, so omitting a format from both lists cannot hide its writer.

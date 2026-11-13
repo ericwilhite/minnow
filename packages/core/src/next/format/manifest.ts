@@ -208,7 +208,8 @@ export interface GroupRef {
   /** Rows not marked in `deletions`. */
   readonly liveRowCount: number;
   readonly root: BlobRef;
-  /** Deletion bitmap over the group's row positions, or null when nothing is deleted. */
+  /** Raw LE u32 deletion words, inherited group-page version; exactly ceil(rowCount/32)*4
+   * bytes with unused tail bits zero. Null when nothing is deleted. */
   readonly deletions: BlobRef | null;
 }
 
