@@ -18,6 +18,17 @@
  * published tarball.
  */
 /** Reset refusal must see every legacy marker and both OPFS capability states. */
+export const DIRECTORY_REFUSAL_REACH = [
+  "old development root refused",
+  "old development writer refused",
+  "payload bytes unchanged",
+  "native refusal before fencing",
+  "zero native writes",
+  "entire native image unchanged",
+  "packed-0",
+  "packed-4095",
+  "packed-4099",
+] as const;
 export const DURABLE_LONG_KEY_REACH = [
   "WAL-only invalidation",
   "replayed invalidation",

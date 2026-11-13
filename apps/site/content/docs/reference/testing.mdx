@@ -2308,3 +2308,10 @@ independent persistence inventory includes these references. `durable-long-keys.
 checks WAL-only nonunique invalidation at 13,107 UTF-16 units and an independently bundled
 reader with capability 1: OPFS and IndexedDB must refuse before native writes. The strict
 catalog-operation registry admits `invalidateIndex` while still rejecting unknown operations.
+
+Archived development directory roots are refused by the outer durable-format gate with
+`MINNOW_FORMAT_UNSUPPORTED`, before the inner manifest decoder runs. The directory-refusal
+campaign checks the exact code, zero writable OPFS handles and writes, and the complete
+unchanged native file image for all three frozen directory shapes. The pre-registry archived
+writer still refuses the current root with `MINNOW_MANIFEST_CORRUPT`; its separate check
+preserves root/data payloads, without claiming that obsolete writer has a pre-fence gate.
