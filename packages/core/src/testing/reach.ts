@@ -5577,6 +5577,7 @@ export const EXPRESSION_ERROR_REACH = [
 ] as const;
 
 export const EXPRESSION_FENCE_REACH = [
+  "shallow ambient stack",
   "join key",
   "sort key",
   "cancelled suspension",
