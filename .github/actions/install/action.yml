@@ -1,0 +1,37 @@
+# Node and the workspace's dependencies, for every CI job.
+#
+# `npm ci` takes most of a minute on every one of CI's runners. Its result is a pure function of the
+# manifests, the lockfile, the platform, and Node, so it is cached under a key that hashes all of
+# them: any change that could make `npm ci` install something different, or refuse to (a
+# package.json out of step with the lockfile), misses the cache and runs the real `npm ci`.
+name: Install
+description: Set up Node and install the workspace's locked dependencies.
+inputs:
+  node-version:
+    description: Node version for actions/setup-node.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v5
+      id: node
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: npm
+    - uses: actions/cache@v6
+      id: modules
+      with:
+        path: |
+          node_modules
+          packages/*/node_modules
+          apps/*/node_modules
+        key: node-modules-${{ runner.os }}-${{ runner.arch }}-node-${{ steps.node.outputs.node-version }}-${{ hashFiles('package-lock.json', 'package.json', 'packages/*/package.json', 'apps/*/package.json', 'scripts/ci-install.sh') }}
+    - if: steps.modules.outputs.cache-hit != 'true'
+      shell: bash
+      run: bash scripts/ci-install.sh
+    # `npm ci` also runs the workspaces' own install scripts, and their output lives outside
+    # node_modules and depends on the checkout (the site's `fumadocs-mdx` indexes its MDX), so a
+    # restored install runs them here exactly as `npm ci` would have.
+    - if: steps.modules.outputs.cache-hit == 'true'
+      shell: bash
+      run: npm run postinstall --workspaces --if-present

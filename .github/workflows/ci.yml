@@ -6,7 +6,8 @@
 # still runs it. The performance gate deliberately lives in its own scheduled workflow — it
 # measures a machine as much as the code, so it must never block a merge.
 #
-# The long suites are spread across parallel runners. Each split gate ends in an aggregate job
+# The long suites are spread across parallel runners, in parts balanced by measured duration so
+# they finish together (scripts/test-parts.mjs). Each split gate ends in an aggregate job
 # with a stable name — `Format, types, lint, build, unit tests`, `Unit tests on the oldest
 # supported Node`, and `Real browsers` — that fails unless every part of it passed, so a required
 # check names the gate rather than however it happens to be split.
@@ -16,6 +17,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The whole gate on any branch (`gh workflow run CI --ref <branch>`), e.g. a merge candidate,
+  # without opening a pull request. Release publishing follows only push runs on main.
+  workflow_dispatch:
 
 # A newer push to the same branch makes the older run irrelevant.
 concurrency:
@@ -27,16 +31,14 @@ permissions:
 
 jobs:
   static:
-    name: Format, types, lint, build, API contract, SQLLogicTest
+    name: Format, types, lint, build, API contract, SQLLogicTest, heap plateau
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: ./.github/actions/install
         with:
           node-version: 24
-          cache: npm
-      - run: bash scripts/ci-install.sh
       # First, because a version that only moved on one package is a broken install rather than a
       # broken build, and nothing later in this job would notice.
       - run: npm run version:check
@@ -60,40 +62,32 @@ jobs:
       # The committed portable SQLLogicTest profile adds 6,345 result-checked queries without
       # network access. It is intentionally standard local/PR coverage, not a nightly-only net.
       - run: npm run test:sql:standard
+      # Forced-GC samples across repeated queries, writes, live subscriptions, and database
+      # lifecycles. Caches may warm once; a continuing post-warmup climb fails the merge gate. It
+      # takes seconds, so it rides on this job's install rather than holding a runner of its own.
+      - name: Heap plateau
+        run: npm run soak:memory
 
-  # The unit suite under coverage, in parts. Vitest assigns each file to exactly one of the four
-  # shards by a hash of its path. The maintenance workload is a fifth part: it has a deadline, and
-  # vitest.config.ts runs it alone rather than beside unrelated database simulators. The shards
-  # exclude it by name (`!maintenance`) rather than naming `unit`, so a project added later still
-  # runs in them.
+  # The unit suite under coverage, in seven parts. Every test file runs in exactly one part, chosen
+  # by its measured duration (scripts/test-shards.ts, weights in scripts/test-durations.json) so the
+  # parts finish together; each part starts its longest files first. The maintenance workload has
+  # a deadline, so vitest.config.ts runs it alone after the rest of whichever part holds it, as in
+  # a whole run. A part's wall time is bounded below by its longest file, about nine minutes under
+  # coverage on a hosted runner (spill/chaos-crash.test.ts). A campaign split across files keeps
+  # its files and its reach-union check in one part.
   unit:
     name: Unit tests with coverage (${{ matrix.part }})
     runs-on: ubuntu-latest
-    # Vitest runs one file's tests serially, so the heaviest file bounds its shard however the rest
-    # are spread. That is the schema interaction simulator, whose fake-IndexedDB seeds take about a
-    # quarter of an hour under coverage on a hosted runner; the rest of a shard runs beside it.
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - part: 1/4
-            filter: --project='!maintenance' --shard=1/4
-          - part: 2/4
-            filter: --project='!maintenance' --shard=2/4
-          - part: 3/4
-            filter: --project='!maintenance' --shard=3/4
-          - part: 4/4
-            filter: --project='!maintenance' --shard=4/4
-          - part: maintenance
-            filter: --project=maintenance
+        part: [1/7, 2/7, 3/7, 4/7, 5/7, 6/7, 7/7]
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: ./.github/actions/install
         with:
           node-version: 24
-          cache: npm
-      - run: bash scripts/ci-install.sh
       # The suite imports the packages through their built entry points, and the console snippet
       # tests check against the declaration bundle generated from them. The site itself is built
       # and checked by the static job.
@@ -101,7 +95,9 @@ jobs:
       # The blob report carries this part's results and coverage to the merge below, which is where
       # the coverage floors are judged.
       - name: Test ${{ matrix.part }}
-        run: npm run test:coverage -- ${{ matrix.filter }} --reporter=default --reporter=blob
+        run: >-
+          npm run test:coverage -- --shard=${{ matrix.part }} --reporter=default --reporter=blob
+          --reporter=json --outputFile.json=durations/vitest-coverage-${{ strategy.job-index }}.json
         env:
           MINNOW_COVERAGE_PART: "1"
       - name: Upload this part's report
@@ -115,6 +111,16 @@ jobs:
           # A rerun of a failed part replaces its earlier report; the merge reads the latest of each.
           overwrite: true
           retention-days: 7
+      # Per-file durations for refreshing the part weights (`npm run test:durations`).
+      - name: Upload this part's durations
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: durations-vitest-coverage-${{ strategy.job-index }}
+          path: durations/
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
 
   # Coverage rather than a bare run: the thresholds in vitest.config.ts are a ratchet, and a
   # ratchet nothing turns is just a number in a file. Merged here, they are judged on every part's
@@ -128,11 +134,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: ./.github/actions/install
         with:
           node-version: 24
-          cache: npm
-      - run: bash scripts/ci-install.sh
       - uses: actions/download-artifact@v8
         with:
           pattern: unit-blob-*
@@ -141,6 +145,15 @@ jobs:
       # Replays every part's results, fails on any failed test, and enforces the coverage floors.
       - name: Merge the parts and enforce the coverage floors
         run: npm run test:coverage -- --merge-reports
+      # The parts choose their files by measured duration; this proves from what each part
+      # reported that together they ran every test file a whole run would, each exactly once.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: durations-vitest-coverage-*
+          path: durations/coverage
+          merge-multiple: true
+      - name: Require every test file in exactly one part
+        run: npx vite-node scripts/check-parts.mts vitest durations/coverage
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v7
@@ -169,21 +182,6 @@ jobs:
           test "$UNIT_RESULT" = "success"
           test "$COVERAGE_RESULT" = "success"
 
-  memory:
-    name: Heap plateau
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 24
-          cache: npm
-      - run: bash scripts/ci-install.sh
-      # Forced-GC samples across repeated queries, writes, live subscriptions, and database
-      # lifecycles. Caches may warm once; a continuing post-warmup climb fails the merge gate.
-      - run: npm run soak:memory
-
   browser-matrix:
     name: Real browser (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -191,52 +189,71 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Firefox and WebKit split their library suites in two: WebKit's macOS runners leave room
-        # for one Playwright worker, and Firefox spends up to ten minutes in the SQLLogicTest file
-        # alone. Playwright shards whole spec files, so each engine's site suite (two files) runs
-        # once, on its first shard.
+        # Each engine's library suite is split into parts by measured spec duration
+        # (playwright.shared.mjs, weights in scripts/browser-durations.json); every spec runs in
+        # exactly one part. Playwright's own --shard cut equal spec counts in file order, which left
+        # one WebKit part 18 minutes beside another's 11. Each engine's rebuild-owner and site suites
+        # run once: on Chromium's and Firefox's first part, which takes correspondingly less of the
+        # library (`firstPartReserve` in the weights, which every part reads, so all compute the
+        # same split); and for WebKit on a job of their own, because its macOS runners have room
+        # for one worker and those two suites alone take about ten minutes there.
         include:
-          - name: chromium
+          - name: chromium 1/2
             browser: chromium
             os: ubuntu-latest
             cache_path: ~/.cache/ms-playwright
-            artifact: chromium
+            part: 1/2
+            artifact: chromium-1
             site: true
+            consumer: true
+          - name: chromium 2/2
+            browser: chromium
+            os: ubuntu-latest
+            cache_path: ~/.cache/ms-playwright
+            part: 2/2
+            artifact: chromium-2
           - name: firefox 1/2
             browser: firefox
             os: ubuntu-latest
             cache_path: ~/.cache/ms-playwright
-            shard: 1/2
+            part: 1/2
             artifact: firefox-1
             site: true
           - name: firefox 2/2
             browser: firefox
             os: ubuntu-latest
             cache_path: ~/.cache/ms-playwright
-            shard: 2/2
+            part: 2/2
             artifact: firefox-2
-            site: false
-          - name: webkit 1/2
+          - name: webkit 1/3
             browser: webkit
             os: macos-latest
             cache_path: ~/Library/Caches/ms-playwright
-            shard: 1/2
+            part: 1/3
             artifact: webkit-1
-            site: true
-          - name: webkit 2/2
+          - name: webkit 2/3
             browser: webkit
             os: macos-latest
             cache_path: ~/Library/Caches/ms-playwright
-            shard: 2/2
+            part: 2/3
             artifact: webkit-2
-            site: false
+          - name: webkit 3/3
+            browser: webkit
+            os: macos-latest
+            cache_path: ~/Library/Caches/ms-playwright
+            part: 3/3
+            artifact: webkit-3
+          - name: webkit owner and site
+            browser: webkit
+            os: macos-latest
+            cache_path: ~/Library/Caches/ms-playwright
+            artifact: webkit-site
+            site: true
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: ./.github/actions/install
         with:
           node-version: 24
-          cache: npm
-      - run: bash scripts/ci-install.sh
       # Cache each browser against the Playwright version that asks for it.
       - name: Resolve Playwright version
         id: playwright
@@ -254,7 +271,11 @@ jobs:
         if: runner.os == 'Linux'
       - name: Test library in ${{ matrix.name }}
         id: library
-        run: npm run test:browser:library -- --project ${{ matrix.browser }} ${{ matrix.shard && format('--shard={0}', matrix.shard) || '' }}
+        if: matrix.part
+        run: npm run test:browser:library -- --project ${{ matrix.browser }}
+        env:
+          MINNOW_BROWSER: ${{ matrix.browser }}
+          MINNOW_BROWSER_PART: ${{ matrix.part }}
       - name: Upload library reports, traces, and plans
         if: always() && (steps.library.outcome == 'success' || steps.library.outcome == 'failure')
         uses: actions/upload-artifact@v7
@@ -264,8 +285,17 @@ jobs:
             playwright-report/
             test-results/
           retention-days: 14
-      # The rebuild owner's specs run once per engine, on its first shard, under their own
-      # cross-origin-isolated server. R6 latency targets are reported here and enforced only in the
+      # Per-spec durations for refreshing the part weights (`npm run test:durations`).
+      - name: Upload library durations
+        if: always() && (steps.library.outcome == 'success' || steps.library.outcome == 'failure')
+        uses: actions/upload-artifact@v7
+        with:
+          name: durations-playwright-${{ matrix.artifact }}
+          path: durations/
+          if-no-files-found: ignore
+          retention-days: 14
+      # The rebuild owner's specs run once per engine, under their own cross-origin-isolated
+      # server. R6 latency targets are reported here and enforced only in the
       # browser performance lane.
       - name: Test rebuild owner in ${{ matrix.browser }}
         id: next-owner
@@ -297,7 +327,7 @@ jobs:
       # This catches missing tarball files, dependency ranges, declarations, and worker chunks that
       # workspace links cannot expose. It launches Chromium, so run it once on that installed leg.
       - name: Test packed consumer
-        if: matrix.browser == 'chromium'
+        if: matrix.consumer
         run: npm run test:consumer
 
   # Preserve the stable required-check name while making any failed, cancelled, or skipped matrix
@@ -307,37 +337,80 @@ jobs:
     if: always()
     needs: browser-matrix
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Require every browser engine
         env:
           BROWSER_MATRIX_RESULT: ${{ needs.browser-matrix.result }}
         run: test "$BROWSER_MATRIX_RESULT" = "success"
+      # The library parts choose their specs by measured duration; this proves from what each part
+      # reported that together they ran every test an unsplit run lists, each exactly once.
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/install
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: durations-playwright-*
+          path: durations
+      # Listing loads the specs, which import the built core package.
+      - run: npx tsc -b packages/core
+      - name: Require every library test in exactly one part
+        run: |
+          for browser in chromium firefox webkit; do
+            mkdir -p "parts/$browser"
+            cp durations/durations-playwright-"$browser"-*/*.json "parts/$browser/"
+            npx vite-node scripts/check-parts.mts playwright "$browser" "parts/$browser"
+          done
 
   engines-floor-part:
     name: Unit tests on the oldest supported Node (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # The whole unit suite without coverage, in three shards. Node 22 runs the fake-indexeddb
-    # simulator seeds about twice as slowly as 24 (40-76 s each); with the rebuild's suites two
-    # shards took ~25 of their 30 minutes and one overran on 2026-11-11.
+    # The whole unit suite without coverage, in four parts balanced by measured file duration
+    # (scripts/test-shards.ts). Node 22 runs the fake-indexeddb simulator seeds about twice as
+    # slowly as 24 (40-76 s each); with three hash-count shards, two took ~25 of their 30 minutes
+    # and one overran on 2026-11-11.
     timeout-minutes: 30
+    # The first part also runs the full `npm run build` on Node 22; the rest only build what the
+    # tests import. Every part gives the first one the same head start in its assignment, so the
+    # reserve must be the same for all of them, which a job-level value guarantees.
+    env:
+      MINNOW_SHARD_RESERVE: "110000"
     strategy:
       fail-fast: false
       matrix:
-        shard: [1/3, 2/3, 3/3]
+        include:
+          - shard: 1/4
+            build: true
+          - shard: 2/4
+          - shard: 3/4
+          - shard: 4/4
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: ./.github/actions/install
         with:
           # package.json declares ">=22". This job is what makes that claim true rather than
           # aspirational — node:sqlite in particular moved between 22 and 24.
           node-version: 22
-          cache: npm
-      - run: bash scripts/ci-install.sh
-      - run: npm run build
-      # Both projects, so the maintenance workload runs in whichever shard holds it, alone and
+      - if: matrix.build
+        run: npm run build
+      - if: ${{ !matrix.build }}
+        run: npm run test:prepare
+      # Every project, so the maintenance workload runs in whichever shard holds it, alone and
       # after that shard's other files, as in a whole run.
-      - run: npm run test:unit -- --shard=${{ matrix.shard }}
+      - run: >-
+          npm run test:unit -- --shard=${{ matrix.shard }} --reporter=default --reporter=json
+          --outputFile.json=durations/vitest-plain-${{ strategy.job-index }}.json
+      # Per-file durations for refreshing the part weights (`npm run test:durations`).
+      - name: Upload this part's durations
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: durations-vitest-plain-${{ strategy.job-index }}
+          path: durations/
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
 
   # Preserve the stable check name for the oldest-Node gate: it passes only when every shard did.
   engines-floor:
@@ -345,9 +418,20 @@ jobs:
     if: always()
     needs: engines-floor-part
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Require every shard
         env:
           ENGINES_FLOOR_RESULT: ${{ needs.engines-floor-part.result }}
         run: test "$ENGINES_FLOOR_RESULT" = "success"
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/install
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: durations-vitest-plain-*
+          path: durations/plain
+          merge-multiple: true
+      - name: Require every test file in exactly one part
+        run: npx vite-node scripts/check-parts.mts vitest durations/plain

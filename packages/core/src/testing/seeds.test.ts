@@ -10,12 +10,20 @@ const regressionSeeds = regressions as { suites: Record<string, readonly number[
 const coreSource = fileURLToPath(new URL("..", import.meta.url));
 const repoRoot = fileURLToPath(new URL("../../../..", import.meta.url));
 
-/** Every test file under packages/core/src, with its text. */
+/**
+ * Every test file under packages/core/src, with its text. A `*.test-support.ts` module counts: a
+ * campaign split across files draws its seeds there once and runs every one of them across its
+ * files (next/write/directory-publication-compat.test-support.ts).
+ */
 function testFiles(): Array<{ path: string; text: string }> {
   return (
     readdirSync(coreSource, { recursive: true, encoding: "utf8" })
       // This file quotes registry keys in its own assertions; it iterates no suite.
-      .filter((name) => name.endsWith(".test.ts") && !name.endsWith("seeds.test.ts"))
+      .filter(
+        (name) =>
+          (name.endsWith(".test.ts") || name.endsWith(".test-support.ts")) &&
+          !name.endsWith("seeds.test.ts"),
+      )
       .map((name) => ({
         path: join(coreSource, name),
         text: readFileSync(join(coreSource, name), "utf8"),

@@ -86,6 +86,9 @@ export default tseslint.config(
       // Reads the test sources and the soak runner off disk to prove every recorded regression
       // seed is iterated by exactly one suite the soak explores.
       "packages/core/src/testing/seeds.test.ts",
+      // Records and reads a split reach campaign's per-file reach through the run's directory.
+      "packages/core/src/testing/reach-union.ts",
+      "packages/core/src/testing/reach-union.test.ts",
       // The Playwright runner's shared config and its flaky-test reporter are Node processes.
       "playwright*.mjs",
       // Reads the checked-in format fixtures off disk; they are the databases earlier builds
@@ -105,7 +108,7 @@ export default tseslint.config(
       // Frozen native-file compatibility fixtures use Node I/O and bulk array checks.
       // These unexported test helpers never enter a browser package entry point.
       "packages/core/src/next/write/directory-compatibility.test.ts",
-      "packages/core/src/next/write/directory-publication-compat.test.ts",
+      "packages/core/src/next/write/directory-publication-compat.test-support.ts",
       "packages/core/src/next/write/directory-frozen.ts",
       "packages/core/src/next/write/directory-current.test-support.ts",
       "packages/core/src/next/write/directory-tails-test-support.ts",

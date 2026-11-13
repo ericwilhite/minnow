@@ -129,20 +129,46 @@ announces an id so clients resend and owners register again;
 [the SharedWorker restart note](https://github.com/ericwilhite/minnow/blob/main/packages/core/src/next/owner/webkit-sharedworker.md) has the measurements and the repro.
 
 The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push and pull
-request, spread across parallel jobs. One job runs the format, type, lint, build, API contract, and
-SQLLogicTest checks. The unit suite runs under coverage in four Vitest shards, with the maintenance
-workload alone in a fifth job; a final job merges their results and coverage and enforces the
-coverage floors on the whole suite, exactly as `npm run test:coverage` does. The
-`Format, types, lint, build, unit tests` check requires all of them, and the
-`Unit tests on the oldest supported Node` check requires both of that suite's shards on Node 22.
-Browser jobs run independently: Chromium and Firefox on Linux, and WebKit on macOS. Each engine
-runs the library and site suites, Firefox and WebKit with the library suite split across two
-runners; Chromium also runs the packed consumer. Every engine there has OPFS in workers, so a
-missing OPFS API fails these jobs rather than skipping their OPFS cases. The `Real browsers`
-check requires every engine to pass. Splitting the jobs preserves their 45-minute deadlines and leaves time to save failure
-artifacts. A test that passes only on retry still fails the gate. Workflow dependency installation
+request, spread across parallel jobs. One job runs the format, type, lint, build, API contract,
+SQLLogicTest, and heap-plateau checks. The unit suite runs under coverage in seven Vitest parts; a
+final job merges their results and coverage and enforces the coverage floors on the whole suite,
+exactly as `npm run test:coverage` does. The `Format, types, lint, build, unit tests` check requires
+all of them, and the `Unit tests on the oldest supported Node` check requires all four of that
+suite's parts on Node 22. The first of those also runs the full `npm run build` on Node 22.
+
+The parts are balanced by measured duration, not by file count. Every test file runs in exactly one
+part, and each part starts its longest files first. `scripts/test-shards.ts` does this for Vitest's
+`--shard`, using the per-file times in `scripts/test-durations.json`; the maintenance workload still
+runs alone, after the rest of whichever part holds it. The weights only steer the split: a stale or
+missing weight makes a part slower, but it cannot skip a file or run one twice. That holds only if
+every part computes the same split, so after the parts finish, each gate reads what every part
+reported running and fails unless together they ran exactly what one unsplit run lists, each test
+once (`scripts/check-parts.mts`). Each CI part uploads
+its timings as a `durations-*` artifact; refresh the weights from a run with
+`gh run download <run id> --pattern 'durations-*' --dir .cache/durations` and
+`npm run test:durations -- .cache/durations`. A file's time varies by about half from run to run
+with what shares its runner, so a refresh averages each measurement with the committed weight.
+
+More than two hundred test files start PGlite, and a fresh instance runs initdb first: about three
+seconds each. Under Vitest, a `new PGlite()` or `PGlite.create()` with no arguments instead loads a
+data directory dumped once per run, by the run's global setup, from the installed PGlite right
+after its own initdb (`scripts/pglite-snapshot.ts`). It is never committed. A call with any
+argument runs initdb as usual. `scripts/pglite-snapshot.test.ts` checks that the two starts are
+indistinguishable: the whole catalog, every setting, and the transaction and OID counters.
+`MINNOW_PGLITE_SNAPSHOT=off` turns the snapshot off for a run.
+
+Browser jobs run independently: Chromium and Firefox on Linux, and WebKit on macOS. Each engine's
+library suite is split into parts the same way, by the per-spec times in
+`scripts/browser-durations.json` (`MINNOW_BROWSER_PART=1/3 MINNOW_BROWSER=webkit` selects a part
+locally). The rebuild-owner and site suites run once per engine: on the first Chromium and Firefox
+parts, which take correspondingly less of the library, and in a WebKit job of their own. Chromium
+also runs the packed consumer. Every engine there has OPFS in workers, so a missing OPFS API fails these jobs rather than
+skipping their OPFS cases. The `Real browsers` check requires every engine to pass. Splitting the
+jobs preserves their 45-minute deadlines and leaves time to save failure artifacts. A test that passes only on retry still fails the gate. Workflow dependency installation
 retries network failures up to three times, with short delays; other installation failures stop
-immediately. These retries do not rerun tests or bypass release gates.
+immediately. These retries do not rerun tests or bypass release gates. The merge gate restores
+`node_modules` from a cache keyed on the lockfile, every `package.json`, the platform, and the Node
+version, and runs the real `npm ci` whenever any of them differs.
 `.github/workflows/sql-conformance.yml` runs the full SQL profile and long simulator
 nightly and on demand. Both it and the release workflow also run
 `test:browser:conformance`: the entire core browser suite, including the full pinned SQL corpus
@@ -464,6 +490,14 @@ database with rows, and, in their own campaigns, rekeys, retired-key reads, refu
 values, `ALTER TABLE` on populated tables, and index lookups that returned rows. The live oracles
 declare patched, moved, replaced, shrunk, re-run, and rekeyed deliveries. A `MINNOW_SEED` replay
 checks one history, so reach stands aside then.
+
+A campaign can be split across several test files so parallel runners share its histories. The
+directory publication compatibility campaign runs in four files, one slot of its seeds each. Then
+no single file sees every history, so no file asserts reach on its own subset. Each file records
+what its histories reached in the run's reach directory, and a `*.reach.test.ts` file asserts the
+union against the declared states (`testing/reach-union.ts`). The test sequencer keeps those files
+in the same CI part and runs the union check after them. The union fails if any declared file left
+no record or ran no histories, so a file that silently stopped running cannot pass.
 
 ## Format compatibility
 

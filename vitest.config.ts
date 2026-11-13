@@ -1,8 +1,10 @@
 import { fileURLToPath } from "node:url";
 import { availableParallelism } from "node:os";
 import { configDefaults, defineConfig } from "vitest/config";
+import DurationSequencer from "./scripts/test-shards.ts";
 
 const maintenanceWorkload = "packages/core/src/engine/maintenance-under-load.test.ts";
+const reachUnions = "packages/**/*.reach.test.ts";
 
 /**
  * Set by CI on each part of the unit suite it spreads across runners (`.github/workflows/ci.yml`).
@@ -17,13 +19,28 @@ export default defineConfig({
   // The site's own modules import each other through the `@/` alias its tsconfig declares, so a
   // test of one of them resolves the same way the browser build does.
   resolve: {
-    alias: { "@/": `${fileURLToPath(new URL("./apps/site", import.meta.url))}/` },
+    alias: [
+      { find: "@/", replacement: `${fileURLToPath(new URL("./apps/site", import.meta.url))}/` },
+      // A default-option PGlite starts from the run's initdb snapshot instead of running initdb
+      // (scripts/pglite-snapshot.client.ts); exactly the bare package name, nothing under it.
+      {
+        find: /^@electric-sql\/pglite$/u,
+        replacement: fileURLToPath(new URL("./scripts/pglite-snapshot.client.ts", import.meta.url)),
+      },
+    ],
   },
   test: {
     // Each file may start whole engines and durable-store simulations. Unbounded file-level
     // parallelism turns CPU/heap contention into unrelated timeouts on large developer hosts.
     // Keep the existing deadlines and bound simultaneous heavy suites instead.
     maxWorkers: Math.min(4, availableParallelism()),
+    // `--shard` splits by measured file duration rather than file count, and every run starts its
+    // longest files first, so a quarter-hour file never starts last (scripts/test-shards.ts).
+    sequence: { sequencer: DurationSequencer },
+    // A fresh directory per run where split reach campaigns record what their files reached
+    // (packages/core/src/testing/reach-union.ts).
+    // And one just-initialised PGlite data directory per run (scripts/pglite-snapshot.ts).
+    globalSetup: ["./scripts/reach-directory.ts", "./scripts/pglite-snapshot.ts"],
     // Test builds re-verify a cached blob's checksum when its lease is released or it is evicted
     // (packages/core/src/next/storage/verify-cached.ts): a consumer that writes into bytes the
     // cache treats as immutable fails loudly in whichever suite does it.
@@ -38,7 +55,7 @@ export default defineConfig({
             "scripts/**/*.test.ts",
             "apps/site/{lib,bench,components}/**/*.test.ts",
           ],
-          exclude: [...configDefaults.exclude, maintenanceWorkload],
+          exclude: [...configDefaults.exclude, maintenanceWorkload, reachUnions],
           // `npm run test:packed`: every segment the engine can pack is packed.
           setupFiles:
             process.env.MINNOW_FORCE_PACKING === "1" ? ["scripts/forced-packing.setup.ts"] : [],
@@ -56,6 +73,16 @@ export default defineConfig({
           // deadline. Run the unchanged workload alone, then merge coverage from both projects.
           fileParallelism: false,
           sequence: { groupOrder: 2 },
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: "reach",
+          // Each asserts the union of what a split campaign's files reached, so it runs after
+          // them; scripts/test-shards.ts keeps it in their run part.
+          include: [reachUnions],
+          sequence: { groupOrder: 3 },
         },
       },
     ],
@@ -78,7 +105,17 @@ export default defineConfig({
       // Only the shipped library. The site is covered by its own browser runner, and measuring
       // it here would average a docs app into the engine's numbers.
       include: ["packages/*/src/**/*.ts"],
-      exclude: ["**/*.test.ts", "**/*.spec.ts"],
+      // Test code moved out of *.test.ts files only so their cases can run in parallel files, and
+      // the split campaigns' reach union, stay out of the measured code, as test code always was.
+      exclude: [
+        "**/*.test.ts",
+        "**/*.spec.ts",
+        "packages/core/src/next/write/crash-sweep.test-support.ts",
+        "packages/core/src/next/write/directory-publication-compat.test-support.ts",
+        "packages/core/src/testing/reach-union.ts",
+        "packages/core/src/testing/reach-unions.ts",
+        "packages/core/src/testing/directory-compat-seeds.test-support.ts",
+      ],
       /**
        * A ratchet, not a target. Each floor sits just under what the suite measured when it was
        * written, so the gate fails when coverage falls rather than when it merely stops rising.
