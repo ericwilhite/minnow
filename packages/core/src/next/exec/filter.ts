@@ -235,8 +235,10 @@ export class ProjectOperator implements Operator {
     if (this.#aborted) throw this.#reason;
     this.progress?.signal.throwIfAborted();
   }
-  get closed(): Promise<void> {
-    return this.#pending?.catch(() => undefined) ?? Promise.resolve();
+  get closed(): MaybePromise<void> {
+    // An ordinary projection never suspended. Do not turn synchronous execution
+    // into a microtask merely by registering its optional borrow fence.
+    return this.#pending?.catch(() => undefined);
   }
   ready(): Promise<void> {
     return this.#pending ?? this.#hold.ready(this.downstream);
