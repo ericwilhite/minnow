@@ -53,6 +53,14 @@ export function validAt(validity: Validity | null, row: number): boolean {
   return validity === null || ((validity[row >>> 5] ?? 0) & (1 << (row & 31))) !== 0;
 }
 
+/** Internal allocation denial; only this condition may select pressure sub-batching. */
+export class ExpressionMemoryError extends RangeError {
+  constructor(bytes: number) {
+    super(`An expression's ${String(bytes)}-byte buffer was refused by its grant`);
+    this.name = "ExpressionMemoryError";
+  }
+}
+
 /** Output buffers of compiled expressions, charged to one grant and freed together. */
 export class OutputArena {
   #charged = 0;
@@ -69,8 +77,7 @@ export class OutputArena {
 
   /** Charges `bytes` or throws a `RangeError` (compile-time minimums are admitted first). */
   take(bytes: number): void {
-    if (!this.charge.allocate(bytes))
-      throw new RangeError(`An expression's ${String(bytes)}-byte buffer was refused by its grant`);
+    if (!this.charge.allocate(bytes)) throw new ExpressionMemoryError(bytes);
     this.#charged += bytes;
   }
 

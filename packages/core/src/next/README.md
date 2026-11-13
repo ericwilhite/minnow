@@ -3618,7 +3618,10 @@ Allocation observers belong to individual grants, so an abandoned history cannot
 observe or restore another history's method. No production deadline or coverage
 floor changes.
 
-Wide TEXT/BYTES conditional projections preflight their payload workspace and split
-unfunded batches before evaluation. At a single row CASE/COALESCE/NULLIF borrow the
-selected input, preserving lazy evaluation and downstream readiness without a new
-worst-case reservation. Other expanding expressions keep their dedicated admission paths.
+Wide TEXT/BYTES conditional projections try the ordinary allocation first. Only a denial
+selects payload sizing and smaller batches. At a single row CASE/COALESCE/NULLIF borrow
+the selected input, preserving lazy evaluation and downstream readiness without a new
+worst-case reservation. Failed vectorized expression batches in projections and filters
+replay in row order, delivering complete earlier rows before the first data error. Target
+lists evaluate left to right; CASE/COALESCE keep their masks. Replay depends on volatile
+kernels staying refused. Other expanding expressions keep their dedicated admission paths.

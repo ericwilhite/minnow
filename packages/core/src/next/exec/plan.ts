@@ -1330,7 +1330,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 : setup(context, counted(runtime, rel, downstream), runtime, grant),
             (operator) => {
               runtime.onAbort((reason) => operator.abort(reason));
-              if (operator instanceof ProjectOperator) runtime.dispose(() => operator.closed);
+              if (operator instanceof ProjectOperator || operator instanceof FilterOperator)
+                runtime.dispose(() => operator.closed);
               const childStops =
                 operator instanceof LimitOperator ? [...stops, () => operator.done] : stops;
               return childStops.some((stop) => stop())

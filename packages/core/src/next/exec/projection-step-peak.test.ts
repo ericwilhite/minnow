@@ -105,8 +105,8 @@ it.each(seedsFor("projection-step-peak", [0xb7b5, 0xb7b6]))(
               expect(pushes - first).toBe(1);
               expect(total).toBe(2 * rows);
               if (adaptive) {
-                expect(first).toBeGreaterThan(1);
-                reach.reach("partial first");
+                expect(first).toBe(1);
+                reach.reach("fitting first");
                 reach.reach("ordinary second");
               } else expect(peak).toBe(fixed + rows * width);
               return peak;

@@ -21,11 +21,21 @@ import type { Batch, Selection, Vector } from "../vector/vector.js";
 import { compileExpr, selectTrue, type CompileContext } from "./kernels/compile.js";
 import type { Compiled } from "./kernels/vectors.js";
 import { projectionStep } from "./projection-step.js";
-import { IDENTITY } from "./kernels/vectors.js";
+import { ExpressionMemoryError, IDENTITY } from "./kernels/vectors.js";
+import { ExecutionError } from "./errors.js";
 import { Slice } from "./slices.js";
 import { afterYield, yieldTask, YIELD_INTERVAL_MS } from "./pipeline.js";
 import type { MaybePromise } from "../access/key-index.js";
 import type { Operator, PushResult, Transfer } from "./pipeline.js";
+
+/**
+ * Only data errors select precise replay. Cancellation, admission, capability and internal
+ * failures retain their original ownership/error path. Replay is safe because volatile
+ * kernel bindings are refused; revisit this protocol BEFORE adding any volatile kernel.
+ */
+function dataError(error: unknown): boolean {
+  return error instanceof ExecutionError && error.sqlState !== "57014";
+}
 
 /** The conjuncts of `predicate` (nested ANDs flattened), in order. */
 export function conjuncts(predicate: ScalarExpr): ScalarExpr[] {
@@ -87,16 +97,28 @@ class TransferHold {
 
 export class FilterOperator implements Operator {
   readonly #predicate: Predicate;
+  readonly #slice = new Slice(YIELD_INTERVAL_MS);
   readonly #hold = new TransferHold();
+  #pending: Promise<void> | null = null;
+  #aborted = false;
+  #reason: unknown;
   constructor(
     predicate: ScalarExpr,
-    context: CompileContext,
+    readonly context: CompileContext,
     readonly downstream: Operator,
   ) {
     this.#predicate = new Predicate(predicate, context);
   }
   push(batch: Batch, transfer?: Transfer): PushResult {
-    const selection = this.#predicate.select(batch);
+    this.#pending = null;
+    let selection: Selection;
+    try {
+      selection = this.#predicate.select(batch);
+    } catch (error) {
+      if (!dataError(error)) throw error;
+      this.#pending = this.#precise(batch).finally(() => transfer?.release());
+      return "blocked";
+    }
     if (selection.count === 0) {
       transfer?.release();
       return "ready";
@@ -109,13 +131,41 @@ export class FilterOperator implements Operator {
     });
     return this.#hold.after(result, transfer);
   }
+  async #precise(batch: Batch): Promise<void> {
+    const arena = this.context.arena;
+    arena.retireVarlen();
+    const borrow = arena.borrowVarlen;
+    arena.borrowVarlen = true;
+    try {
+      const rows = batch.selection?.rows ?? IDENTITY;
+      for (let k = 0; k < (batch.selection?.count ?? batch.length); k++) {
+        if (this.#aborted) throw this.#reason;
+        const one = { ...batch, selection: { rows: rows.subarray(k, k + 1), count: 1 } };
+        const selection = this.#predicate.select(one);
+        if (selection.count && this.downstream.push({ ...one, selection }) === "blocked")
+          await this.downstream.ready();
+        arena.retireVarlen();
+        if (this.#slice.due()) {
+          await yieldTask();
+          afterYield(this.#slice.clock);
+        }
+      }
+    } finally {
+      arena.borrowVarlen = borrow;
+    }
+  }
+  get closed(): MaybePromise<void> {
+    return this.#pending?.catch(() => undefined);
+  }
   ready(): Promise<void> {
-    return this.#hold.ready(this.downstream);
+    return this.#pending ?? this.#hold.ready(this.downstream);
   }
   finish(): MaybePromise<void> {
     return this.downstream.finish();
   }
   abort(reason: unknown): void {
+    this.#aborted = true;
+    this.#reason = reason;
     this.#hold.abort();
     this.downstream.abort(reason);
   }
@@ -164,17 +214,6 @@ export class ProjectOperator implements Operator {
   push(batch: Batch, transfer?: Transfer): PushResult {
     this.#check();
     this.#pending = null;
-    if (
-      this.#step &&
-      this.progress &&
-      this.#step(batch, 0, batch.selection?.count ?? batch.length) > this.progress.available()
-    ) {
-      this.#pending = this.#steps(batch).finally(() => transfer?.release());
-      return "blocked";
-    }
-    return this.#push(batch, transfer);
-  }
-  #push(batch: Batch, transfer?: Transfer): PushResult {
     if (transfer?.detachableBuffers && this.#columnsOnly !== null) {
       // New column-list ownership: a retaining receiver must never observe #columns reused.
       const columns = this.#columnsOnly.map((index, c) => {
@@ -185,17 +224,62 @@ export class ProjectOperator implements Operator {
       });
       return this.downstream.push({ ...batch, columns }, transfer);
     }
+    try {
+      this.#evaluate(batch);
+    } catch (error) {
+      if (error instanceof ExpressionMemoryError && this.#step && this.progress) {
+        // Failed attempts delivered nothing. Release their partial payload before sizing;
+        // successful ordinary batches never scan widths or consult the preflight recipe.
+        this.#context.arena.retireVarlen();
+        this.#pending = this.#steps(batch).finally(() => transfer?.release());
+      } else if (dataError(error)) {
+        this.#pending = this.#precise(batch).finally(() => transfer?.release());
+      } else throw error;
+      return "blocked";
+    }
+    return this.#deliver(batch, transfer);
+  }
+  #evaluate(batch: Batch): void {
     for (let c = 0; c < this.#exprs.length; c++) {
       const expr = this.#exprs[c];
-      if (expr === undefined) continue;
-      this.#columns[c] = expr.evaluate(batch, batch.selection);
+      if (expr !== undefined) this.#columns[c] = expr.evaluate(batch, batch.selection);
     }
+  }
+  #deliver(batch: Batch, transfer?: Transfer): PushResult {
     const result = this.downstream.push({
       length: batch.length,
       columns: this.#columns,
       selection: batch.selection,
     });
     return this.#hold.after(result, transfer);
+  }
+  async #precise(batch: Batch): Promise<void> {
+    const arena = this.#context.arena;
+    arena.retireVarlen();
+    const borrow = arena.borrowVarlen,
+      exact = arena.exactVarlenGrowth;
+    arena.borrowVarlen = true;
+    arena.exactVarlenGrowth = true;
+    try {
+      const rows = batch.selection?.rows ?? IDENTITY;
+      for (let k = 0; k < (batch.selection?.count ?? batch.length); k++) {
+        this.#check();
+        const one = { ...batch, selection: { rows: rows.subarray(k, k + 1), count: 1 } };
+        // Row first, then target-list order. A row is offered only after every expression
+        // succeeded, and its borrow expires before evaluating the next row.
+        this.#evaluate(one);
+        if (this.#deliver(one) === "blocked") await this.#hold.ready(this.downstream);
+        this.#columns.length = 0;
+        arena.retireVarlen();
+        if (this.#slice.due()) {
+          await yieldTask();
+          afterYield(this.#slice.clock);
+        }
+      }
+    } finally {
+      arena.borrowVarlen = borrow;
+      arena.exactVarlenGrowth = exact;
+    }
   }
   async #steps(batch: Batch): Promise<void> {
     const n = batch.selection?.count ?? batch.length;
@@ -214,8 +298,16 @@ export class ProjectOperator implements Operator {
         while (count > 1 && step(batch, start, count) > progress.available())
           count = Math.max(1, Math.floor(count / 2));
         const rows = (batch.selection?.rows ?? IDENTITY).subarray(start, start + count);
-        const result = this.#push({ ...batch, selection: { rows, count } });
-        if (result === "blocked") await this.#hold.ready(this.downstream);
+        const part = { ...batch, selection: { rows, count } };
+        try {
+          this.#evaluate(part);
+        } catch (error) {
+          if (!dataError(error)) throw error;
+          await this.#precise(part);
+          start += count;
+          continue;
+        }
+        if (this.#deliver(part) === "blocked") await this.#hold.ready(this.downstream);
         // Retire only expired outputs. Otherwise a small pressure arena overlaps a
         // following full batch's replacement, exceeding the normal fitting peak.
         this.#columns.length = 0;

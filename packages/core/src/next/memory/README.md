@@ -311,9 +311,9 @@ precedes clearing the previous slot. Cancellation drains both pending and resume
 before the execution settles; tests check spill bytes before the shared service closes.
 Current limits: computed arguments without a proven materialization boundary use the
 external fallback; direct-column FILTER transitions
-have a conservative full-batch growth bound. Varlen CASE output in an ordinary projection
-has a separate transient-pressure allocation gap, reproduced on main; this hash-state
-protocol does not make that expression buffer resumable. Genuinely ordered DISTINCT and
+have a conservative full-batch growth bound. Conditional TEXT/BYTES projection outputs
+use the pressure-only sub-batching protocol below; uncertified expanding expressions
+still need their own complete step protocol. Genuinely ordered DISTINCT and
 uncertified ordered-set transitions retain external sorting with independent private progress lanes.
 A certified numeric percentile list can instead admit its complete row/group-bounded typed
 workspace atomically. Its planning probe releases every temporary grant before that wait;
@@ -393,27 +393,33 @@ their independent recipes; the new shared bound does not certify those layouts.
 
 ### Conditional projection steps
 
-TEXT/BYTES CASE, COALESCE and NULLIF projections preflight their intermediate output
-buffers before evaluating the batch. Bounds follow borrowed source slots and reachable
-literal/parameter branches. Each materializing selector is counted once, including
-old/new resize overlap. The check reserves nothing and runs in the same synchronous
-step as the kernels; it cannot race another execution for ordinary headroom.
+TEXT/BYTES CASE, COALESCE and NULLIF projections first try the ordinary batch
+allocation. Successful batches neither inspect widths nor run a sizing recipe. An
+internal allocation denial delivers no rows; the owner retires that attempt's partial
+payloads, then bounds intermediate buffers from borrowed slots and reachable branches.
+Each materializing selector is counted once, including old/new resize overlap. The check
+reserves nothing and runs synchronously with the retry, without a competing allocation.
 
-When credit is insufficient, the owner halves the active prefix before evaluation,
-down to one row. Single-row selector chains borrow their one surviving value (or emit
-null), so they need zero variable payload bytes even with a pinned competitor.
-Pressure prefixes use exact-size growth rather than geometric spare capacity. The
-input transfer and reusable outputs stay owned until downstream readiness; cancellation
-stops the prefix loop, and cleanup waits for that borrow fence. No expression is retried,
-no input pin is held across a global memory wait, and no extra worst-case minimum is
-reserved. The normal funded batch keeps its existing allocation and execution path.
+When credit is insufficient, the owner halves the active prefix down to one row.
+Single-row selector chains borrow their surviving value (or emit null), needing no
+variable payload bytes. Pressure prefixes grow exactly. Input transfers and reusable
+outputs stay owned until downstream readiness; cancellation stops the loop and cleanup
+waits for the borrow fence. There is no global memory wait while retaining input pins,
+and no extra worst-case admission minimum.
 
-This certificate covers borrowed TEXT/BYTES leaves, identity casts and conditional
-selectors. Other variable producers retain their existing operator-specific protocols
-(JSON has its own pressure handoff). An expanding producer must not be added to this
-certificate without proving its smallest step: if it cannot fit, checkpoint its evaluated
-values and release input pins before a cancellable atomic re-admission; never replay
-volatile evaluation or an already raised error. Current selector chains need no handoff.
+A vectorized expression data error takes the same precise path in ordinary and pressured
+execution: replay the failed batch in input-row order, evaluate each row's target list
+in order, offer complete successful rows, then raise the first failing expression of
+the first failing row. Filters likewise replay their failed batch and offer earlier
+survivors before the error. CASE/COALESCE masks stay lazy. Only expression evaluation is
+caught: downstream errors and cancellation are not replayed. This is safe only while
+volatile kernels remain refused; the generated volatile-refusal guard must be revisited
+before allowing them. No already delivered prefix is replayed.
+
+The memory certificate covers borrowed TEXT/BYTES leaves, identity casts and conditional
+selectors. Other variable producers retain their operator-specific protocols (JSON has
+its own pressure handoff). An expanding producer needs a proof for its smallest step;
+otherwise checkpoint evaluated values and release pins before atomic re-admission.
 
 The receiving result sink also uses exact varlen growth for a one-row copied frame.
 Rounding that payload to the entire byte window would leave no room for its separately

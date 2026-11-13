@@ -1,4 +1,4 @@
-/** Splitting happens BEFORE evaluation: no volatile work or data error is retried. */
+/** Allocation denial retries deterministic kernels; successful adaptive outputs retain borrows. */
 import fc from "fast-check";
 import { afterEach, expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
@@ -10,12 +10,13 @@ import * as compiler from "./kernels/compile.js";
 import { OutputArena } from "./kernels/vectors.js";
 import { BOOL, TEXT, col, texts, numbers, valueAt } from "./kernels/test-support.js";
 import { ProjectOperator } from "./filter.js";
+import { DivisionByZeroError } from "./errors.js";
 import type { Operator } from "./pipeline.js";
 
 const compile = compiler.compileExpr;
 afterEach(() => vi.restoreAllMocks());
 it.each(seedsFor("projection-split", [0xb7b3, 0xb7b4]))(
-  "splits without replay and retains borrows seed%i",
+  "splits after denial and retains borrows seed%i",
   async (seed) => {
     const reach = createReach("projection split", PROJECTION_SPLIT_REACH);
     await fc.assert(
@@ -59,14 +60,14 @@ it.each(seedsFor("projection-split", [0xb7b3, 0xb7b4]))(
               ...node,
               type: node.type,
               evaluate: (b, rows) => {
+                const result = node.evaluate(b, rows);
                 const n = rows?.count ?? b.length;
                 for (let k = 0; k < n; k++) {
                   const row = rows?.rows[k] ?? k;
                   counts[row] = (counts[row] ?? 0) + 1;
-                  if (error && !cancel && row === (sparse ? 3 : 1))
-                    throw new Error("one data error");
+                  if (error && !cancel && row === (sparse ? 3 : 1)) throw new DivisionByZeroError();
                 }
-                return node.evaluate(b, rows);
+                return result;
               },
             };
           });
@@ -147,7 +148,7 @@ it.each(seedsFor("projection-split", [0xb7b3, 0xb7b4]))(
             expect(operator.push(batch, { release: () => released++ })).toBe("blocked");
             if (cancel || error)
               await expect(operator.ready()).rejects.toThrow(
-                cancel ? "cancel wait" : "one data error",
+                cancel ? "cancel wait" : "division by zero",
               );
             else {
               await operator.ready();
@@ -157,15 +158,16 @@ it.each(seedsFor("projection-split", [0xb7b3, 0xb7b4]))(
               if (!funded) expect(pushes).toBe(rows.length);
               reach.reach("exact values");
             }
-            expect([...counts].every((n) => n <= 1)).toBe(true);
+            if (!error) {
+              expect([...counts].every((n) => n <= 1)).toBe(true);
+              reach.reach("one evaluation");
+            }
             expect(released).toBe(1);
             expect(grant.allocated - fixed).toBeLessThanOrEqual(stepCredit);
             if (!funded) {
               expect(grant.allocated).toBe(fixed);
               reach.reach("no payload allocation");
             }
-            reach.reach("one evaluation");
-            reach.reach("no payload allocation");
             reach.reach("held borrow");
             reach.reach(sparse ? "sparse" : "dense");
             if (cancel) reach.reach("cancel wait");

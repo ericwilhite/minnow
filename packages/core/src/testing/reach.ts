@@ -5556,7 +5556,22 @@ export const PROJECTION_SPLIT_REACH = [
 ] as const;
 
 export const PROJECTION_PEAK_REACH = [
-  "partial first",
+  "fitting first",
   "ordinary second",
   "no peak increase",
+] as const;
+
+export const EXPRESSION_ERROR_REACH = [
+  "denied prefix error",
+  "single row",
+  "full batch",
+  "filter",
+  "target list",
+  "pinned competitor",
+  "ordinary",
+  "emitted prefix",
+  "first row error",
+  "division first",
+  "overflow first",
+  "lazy COALESCE CASE",
 ] as const;
