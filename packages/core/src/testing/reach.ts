@@ -19,6 +19,9 @@
  */
 /** Reset refusal must see every legacy marker and both OPFS capability states. */
 export const DURABLE_REGISTRY_REACH = [
+  "snapshot",
+  "snapshotFrame",
+  "snapshotFooter",
   "rootSlot",
   "epochSlot",
   "logHeader",
@@ -4557,4 +4560,20 @@ export const STAR_FLOAT_REACH = [
   "identical native sequence",
   "bit exact result",
   "PG ordered transitions",
+] as const;
+
+export const SNAPSHOT_CODEC_REACH = [
+  "empty tables",
+  "table rows",
+  "zero columns",
+  "multiple columns",
+  "split input",
+  "large part",
+  "truncation",
+  "corruption",
+  "reorder",
+  "quota",
+  "cancel",
+  "trailing",
+  "all kinds",
 ] as const;

@@ -3494,3 +3494,28 @@ scans materialize only their selected metadata. Complete-root readers still see 
 Pressure falls back to the ordinary decoder; non-retaining export does not populate or promote
 this cache. The stored format and execution minima are unchanged. Ownership, cancellation and
 fresh-process comparisons are documented in the docs site's testing reference.
+
+### Portable snapshot1 framing (B2)
+
+`format/snapshot.ts` implements the independent portable container, not a native root backup.
+The 64-byte MNSN header selects version1 and codecSet1 before a target may be opened. MINSNAP1
+archives from Minnow0.x receive `MINNOW_LEGACY_DATA`; there is no conversion chain from0.x.
+Each MNSF frame carries at most1MiB, an ordinal, an object and part ID, header/body CRC32,
+and zero padding to8 bytes. Unknown selectors, reserved bits, damaged frames, missing footer,
+reordering and trailing bytes receive `MINNOW_SNAPSHOT_FORMAT`.
+
+Object IDs are consecutive from1; parts begin at0, continue from1 and end at the next index.
+TABLE_BEGIN/END enclose complete blocks of every column in ascending column-ID order. A block
+has1–65,536 rows and the same contiguous logical row range for every column. Empty tables have
+no column blocks. TABLE_BEGIN contains three u53s (table, schema, column count); COLUMN_BEGIN
+contains six (table, column, schema, first row, rows, encoded bytes). COLUMN_END is two u53s
+(bytes, rows); TABLE_END one (rows). CATALOG_END is u53 bytes, u32 catalog CRC, u32 zero.
+The80-byte footer contains UUID/LSN, catalog CRC, reserved zero, five u53 counts (preceding frames,
+objects, tables, rows, column bytes), preceding-stream CRC and reserved zero. Every integer is LE.
+The outer grammar alone does not validate column/catalog semantics or authorize publication.
+
+Stream sinks borrow bytes until `write()` settles. Reader frames borrow until advance or close.
+Both sides charge their bounded control and encoded buffers before allocation. Reader input
+chunks are charged whole while borrowed; producers should yield bounded chunks. Close/cancel
+returns all reader charges, including a suspended frame; an already-started sink remains charged
+until it settles. A refused or cancelled stream must never be published as a database.
