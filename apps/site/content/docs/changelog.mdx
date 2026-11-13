@@ -38,7 +38,13 @@ with the first released 1.0 writer.
 
 The unexported rebuild sizes JSON aggregate semantic grouping workspace from grouping
 keys separately from payload columns. Wide payloads with small JSONB keys no longer
-inherit the key decoder's multiplier and falsely exceed the query cap. Shipped behavior,
+inherit the key decoder's multiplier and falsely exceed the query cap. Decoded grouping
+workspace is reserved only at the consumers that use it, rather than copied into every
+progress lane and later delivery phase. Aggregate ORDER BY helpers independently fund
+their actual structural ordering keys. Outer sorts and windows reserve their own key
+workspace after handoff; aggregate results use measured checkpoint fields rather than
+unrelated input literals. Wide stored array boundaries compare byte-valued elements
+directly, preserving small-cap execution under competing memory pressure. Shipped behavior,
 public APIs and stored formats are unchanged; no migration is needed.
 
 The unexported rebuild now executes JSON array/object aggregation with primitive, JSONB and SQL-array
@@ -53,10 +59,12 @@ its next byte reports typed `53200`. Result-owned delivery avoids another payloa
 public API and stored formats are unchanged; no migration is needed. Native parser/optimizer
 provenance adds 2,029/2,029/2,031 raw bytes to main/OPFS/IndexedDB (810/839/711 gzip)
 relative to the constructor front end. Their raw caps rise by 2,304 bytes and gzip by
-896/896/768 across the aggregate and field-identity changes. The worker plus separate client
-measures 572,499 gzip bytes; its combined cap rises by 768, with the client unchanged. The core
-tarball measures 1,025,206 packed bytes; its packed cap rises by 1,250 to 1,025,500.
-Private rebuild/test inputs remain excluded; unpacked and isolation budgets stay unchanged.
+896/896/768 across the aggregate and field-identity changes. Before rebase, the worker plus separate client
+measured 572,499 gzip bytes; its combined cap rose by 768, with the client unchanged. The core
+tarball measured 1,025,206 packed bytes on that baseline. After integration with main `92b8e192`,
+it measures 1,025,470 packed and 4,442,940 unpacked bytes. The combined packed cap is 1,025,500,
+750 bytes above main's 1,024,750; no further increase is needed. Private rebuild/test inputs
+remain excluded; unpacked and isolation budgets stay unchanged.
 
 The unexported rebuild's JSON and JSONB constructors now preserve PostgreSQL's float4/float8
 decimal spelling at rounding and exponent boundaries, including subnormals and signed zero.

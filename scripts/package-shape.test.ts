@@ -239,6 +239,9 @@ describe("published core tarball", () => {
       // unpacked and package-isolation budgets stay unchanged; next/ and tests do not ship.
       // Reviewed record identity: 1,025,206 packed bytes (+680); raise once by 750.
       // Unpacked and isolation budgets stay unchanged; no next/ or test output ships.
+      // Rebased onto main92b8e192: 1,025,470 packed / 4,442,940 unpacked bytes.
+      // Combined packed cap is +750 over main (1,024,750); no further increase.
+      // Keep every unpacked/isolation limit; next/ and tests remain excluded.
       expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_025_500);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");

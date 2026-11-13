@@ -619,3 +619,23 @@ JSON aggregate semantic grouping admission measures each grouping-key column ind
 from payload columns, including literal, owned-parameter, source and restored JSON fields.
 The 24-byte/JSONB-byte and 32-byte/array-byte decoded-key allowances apply to the two
 key operands, while unrelated payloads retain their ordinary row-copy reservation.
+These operands are reserved only for the active grouping/aggregate sort and boundary comparator,
+not for unrelated helper lanes or later delivery phases. A proven single input row needs
+no boundary comparator. Text, bytea and enum array boundaries compare bounded encoded
+element views instead of building another pair of decoded arrays; the grouping sort
+still funds its decoded operands. Numeric and interval arrays retain semantic comparison.
+Generated 10/16 MiB controls include 64 KiB literal JSONB keys, four distinct keys and
+wide stored JSONB/SQL-array keys while competing grants occupy all remaining credit.
+Separate 32 MiB histories add an aggregate ORDER BY using the same wide structural key:
+its second sort independently funds the decoded operands it actually consumes. Additional
+32 MiB histories reoccupy credit after the aggregate cut and exercise outer structural
+ORDER BY and window keys. Window controls use 60–64 KiB JSONB /6–6.5 KiB array keys:
+larger structural window keys hit the pre-existing native peer-flag allocation failure
+under competing credit (also reproduced on 55684d20 at 128 MiB), routed to the window owner.
+Those native consumers fund their own decoded operands;
+the semantic allowance is never carried as a global checkpoint envelope. Before aggregate
+outputs exist, outer structural consumers keep their native step bound; after checkpoint,
+their actual field widths replace it. An unrelated source prefix or literal is not an
+aggregate output width. Generated 12/16 MiB histories cover tiny/large opaque JSONB results
+under competing credit. Scalar
+aggregate ORDER BY lanes never inherit structural grouping-key decoder workspace.

@@ -4954,13 +4954,6 @@ export const JSON_GROUP_WIDTH_REACH = [
   "ordinary canonical key",
 ] as const;
 
-/** Pressure restore sizes each owned slot independently, in its original position. */
-export const OWNED_PARAMETER_COLUMN_BOUNDS_REACH = [
-  "independent slot bounds",
-  "original slot order",
-  "phase binding bounds",
-] as const;
-
 export const JSON_RECORD_WIDTH_REACH = [
   "copy after seal",
   "first field bound",
@@ -4971,3 +4964,62 @@ export const JSON_RECORD_WIDTH_REACH = [
   "ASCII fields",
   "zero resources",
 ] as const;
+
+/** Actual grouping consumers own key operands; unrelated lanes and delivery do not. */
+export const JSON_GROUP_SCOPED_REACH = [
+  "one key",
+  "four distinct keys",
+  "ASCII keys",
+  "UTF8 keys",
+  "multiple inputs",
+  "competing credit includes reserve",
+  "observed spill",
+  "sixteen MiB cap",
+  "exact PG output",
+  "zero resources",
+] as const;
+
+/** Byte-valued array group equality borrows one encoded element at a time. */
+export const JSON_BYTE_ARRAY_GROUP_REACH = [
+  "text",
+  "bytes",
+  "enum",
+  "0 dimensions",
+  "1 dimensions",
+  "2 dimensions",
+  "same",
+  "value",
+  "bounds",
+  "shape",
+  "null",
+  "redundant bitmap equality",
+  "NULL elements",
+  "NULL arrays",
+  "exact PG equality",
+] as const;
+
+/** Additional consumer phases keep their independent cap and pressure reach explicit. */
+export const JSON_GROUP_CONSUMER_REACH = {
+  single: ["single input", "ten MiB cap"],
+  composed: ["thirty-two MiB cap"],
+  ordered: ["structural aggregate ORDER BY"],
+  parent: ["two groups", "parent consumer pressure"],
+  sort: ["sort"],
+  window: ["window", "bounded window key range"],
+  opaque: [
+    "opaque aggregate result",
+    "small result",
+    "large result",
+    "ASCII literal",
+    "UTF8 literal",
+    "two groups",
+    "four groups",
+    "twelve MiB cap",
+    "sixteen MiB cap",
+    "parent consumer pressure",
+    "competing credit includes reserve",
+    "observed spill",
+    "exact PG output",
+    "zero resources",
+  ],
+} as const;

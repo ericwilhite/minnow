@@ -23,7 +23,7 @@ import { Charge, Pool, SpillIo } from "../spill-pool.js";
 import { PageWriter, SpillFiles } from "../spill-pages.js";
 import { ColumnStore } from "../column-store.js";
 import { SortOperator, sortMinimumBytes, type SortContext } from "../sort.js";
-import { keysEqual, operandBytes, type SortColumn } from "../sort-keys.js";
+import { keysEqual, type SortColumn } from "../sort-keys.js";
 import { JsonRecords } from "../json-records.js";
 import type { JsonPhaseContext, JsonPhase } from "../json-phase.js";
 import { ParameterCheckpoint } from "../parameter-checkpoint.js";
@@ -196,7 +196,7 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
       : null;
     this.#keys = new JsonGroupRow(
       this.#keyTypes,
-      this.#keyOrder,
+      this.#semanticKeys?.decodedKeys ?? this.#keyOrder,
       this.pool,
       this.io,
       this.#ownGrant,
@@ -409,7 +409,7 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
   }
   async #sameKey(keys: readonly Vector[], row: number): Promise<boolean> {
     const extra = this.#semanticKeys
-      ? this.#keys.operandBytes + operandBytes(this.#keyTypes, this.#keyOrder, keys, row, row + 1)
+      ? this.#keys.operandBytes + this.#semanticKeys.operandBytes(keys, row)
       : 0;
     const result = { equal: false };
     await this.#keys.read(extra, async (previous) => {

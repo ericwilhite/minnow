@@ -1,5 +1,12 @@
 import { columnInputBytes, expressionInputBytes, projectedInputBytes } from "./input-size-plan.js";
 import { KeyLayout } from "./join-keys.js";
+import { byteArrayGroupKey } from "./agg/json-array-key.js";
+import {
+  jsonGroupConsumer,
+  jsonStructuralSort,
+  singleGroupInput,
+  type JsonStructuralSort,
+} from "./json-group-size-plan.js";
 import { canonicalJsonText } from "./json-canonical-plan.js";
 import {
   JsonAggregateOperator,
@@ -2483,10 +2490,15 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     // LIMIT zero never opens its input. Keep capability checks at prepare, but do not reserve
     // buffers for those unreachable pipelines (including when zero is a bound parameter).
     const active = new Set<number>();
+    const structuralSorts = new Map<number, JsonStructuralSort>();
     const visit = (rel: Rel): void => {
       // Lowering stores ORDER BY's LIMIT on its sort. Zero must not open even its pools.
       if ((rel.op === "sort" || rel.op === "limit") && runtime.bounds(rel).limit === 0) return;
       active.add(rel.id);
+      if (jsonAggregateRecipes.size) {
+        const sort = jsonStructuralSort(rel);
+        if (sort) structuralSorts.set(rel.id, sort);
+      }
       if (rel.op === "recursive") {
         visit(rel.base);
         visit(rel.step);
@@ -2576,59 +2588,147 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     }
     for (const [id, columns] of compoundColumns)
       if (active.has(id)) runtime.operatorParameterColumns(id, columns, compoundCopies.get(id));
-    const keySources = new Map<number, Set<number>>();
-    const keyColumnBytes = new Map<number, Map<number, number>>();
+    const jsonGroupSources = new Map<number, Set<number>>();
+    const jsonGroupColumnBytes = new Map<number, Map<number, number>>();
     let semanticActive = active;
     const jsonGroups = [...jsonAggregateRecipes.values()].filter(
       (p) => p.loans > 1 && active.has(p.rel.id),
     );
     for (const planner of jsonGroups) {
-      for (const key of planner.rel.groupBy) {
+      const consumers = Array.from({ length: planner.loans }, (_, slot) =>
+        jsonGroupConsumer(planner.rel, slot),
+      );
+      for (const key of new Set(consumers.flatMap((c) => c?.columns ?? []))) {
+        if (
+          !["text", "bytes", "json", "array", "enum", "decimal"].includes(
+            planner.input[key]?.kind ?? "",
+          )
+        )
+          continue;
         columnInputBytes(planner.rel.input, key, {
           parameter: () => 0,
           source(source, column) {
-            const columns = keySources.get(source) ?? new Set<number>();
+            const columns = jsonGroupSources.get(source) ?? new Set<number>();
             columns.add(column);
-            keySources.set(source, columns);
+            jsonGroupSources.set(source, columns);
             return 0;
           },
         });
       }
     }
-    runtime.groupKeyProgress((slots, largest) => {
+    for (const sort of structuralSorts.values())
+      for (const key of sort.keys)
+        expressionInputBytes(key, sort.input, {
+          parameter: () => 0,
+          source(source, column) {
+            const columns = jsonGroupSources.get(source) ?? new Set<number>();
+            columns.add(column);
+            jsonGroupSources.set(source, columns);
+            return 0;
+          },
+        });
+    for (const planner of jsonGroups) runtime.helperOnlyProgress(planner.rel.id);
+    const pairAllowance = (kind: string | undefined) =>
+      kind === "json" ? 48 : kind === "array" ? 64 : 0;
+    let opaqueConsumerStep = 0;
+    runtime.groupKeyProgress((id, loanSlot, slots, largest, minimum, ordinary) => {
+      // A sort can retain operands while its consumer compares group boundaries.
+      // Fund each actual comparator/sort's keys; unrelated helper lanes stay ordinary.
+      // Most plans/borrowers have no semantic grouping workspace. Avoid walking all
+      // source bounds or building size closures on their ordinary admission path.
+      if (loanSlot === undefined) {
+        if (minimum === 0 || !semanticActive.has(id) || !structuralSorts.has(id)) return 0;
+      } else if (
+        !semanticActive.has(id) ||
+        jsonFrontier.get(runtime) !== id ||
+        !jsonGroups.some((p) => p.rel.id === id)
+      )
+        return 0;
+      const fallback = Math.max(
+        largest,
+        jsonConstants,
+        ...[...bounds.values()].map((b) => b.progress / 4),
+      );
+      const sizes = {
+        parameter: (slot: number) => slots[slot] ?? largest,
+        source: (source: number, column: number) =>
+          jsonGroupColumnBytes.get(source)?.get(column) ?? (bounds.get(source)?.progress ?? 0) / 4,
+        saved(id: number, column: number) {
+          const cut = phases.get(runtime)?.resume;
+          return cut?.kind === "json" && cut.phase.emit && cut.rel === id
+            ? cut.phase.prefix.columnBytes(column)
+            : undefined;
+        },
+      };
+      if (loanSlot === undefined) {
+        const sort = structuralSorts.get(id);
+        if (!sort || !semanticActive.has(id) || minimum === 0) return 0;
+        // Outer sorts/windows still decode their own keys after the aggregate cut.
+        // Only that native borrower gets this workspace; it is never saved globally.
+        let bytes = 0,
+          opaque = false;
+        for (const key of sort.keys) {
+          const width = expressionInputBytes(key, sort.input, sizes);
+          if (width === null) opaque = true;
+          else bytes += pairAllowance(key.type.kind) * width + 80;
+        }
+        // An aggregate result does not exist until its checkpoint. Keep its legacy
+        // native step while opaque; another literal/source prefix is not this key.
+        // Exact checkpoint fields take over as soon as the producer exposes them.
+        return Math.max(ordinary + bytes, opaque ? opaqueConsumerStep : 0);
+      }
       let maximum = 0;
       for (const planner of jsonGroups) {
-        if (!semanticActive.has(planner.rel.id)) continue;
+        if (planner.rel.id !== id || !semanticActive.has(planner.rel.id)) continue;
         if (jsonFrontier.get(runtime) !== planner.rel.id) continue;
-        let bytes = 0;
+        const consumer = jsonGroupConsumer(planner.rel, loanSlot);
+        if (!consumer) return 0;
+        const one = singleGroupInput(planner.rel.input);
+        if (one && consumer.boundary) return 0;
+        const operands = 2;
+        let bytes = 0,
+          keyBytes = 0;
+        const variable = (kind: string) =>
+          ["text", "bytes", "json", "array", "enum", "decimal"].includes(kind);
+        let rowBytes = 2048 + 256 * (consumer.columns.length + 1);
+        for (const column of consumer.columns) {
+          const type = planner.input[column];
+          rowBytes += variable(type?.kind ?? "")
+            ? (columnInputBytes(planner.rel.input, column, sizes) ?? fallback)
+            : 16;
+        }
+
         const counts = new Map<number, number>();
-        for (const key of planner.rel.groupBy) counts.set(key, (counts.get(key) ?? 0) + 1);
+        for (const key of consumer.keys) counts.set(key, (counts.get(key) ?? 0) + 1);
         for (const [key, count] of counts) {
           const kind = planner.input[key]?.kind;
-          const allowance = kind === "json" ? 48 : kind === "array" ? 64 : 0;
-          if (allowance === 0 && count === 1) continue;
-          const width = columnInputBytes(planner.rel.input, key, {
-            parameter: (slot) => slots[slot] ?? largest,
-            source: (source, column) => keyColumnBytes.get(source)?.get(column) ?? null,
-            saved(id, column) {
-              const cut = phases.get(runtime)?.resume;
-              return cut?.kind === "json" && cut.phase.emit && cut.rel === id
-                ? cut.phase.prefix.columnBytes(column)
-                : undefined;
-            },
-          });
-          // Unknown producers keep the previous conservative single-key fallback.
-          // A completed expanding JSON producer instead supplies its exact field bound.
-          const operand =
-            width ??
-            Math.max(largest, jsonConstants, ...[...bounds.values()].map((b) => b.progress / 4));
-          bytes += (allowance * count + 4 * (count - 1)) * operand + 80 * count;
+          const allowance =
+            consumer.boundary && byteArrayGroupKey(planner.input[key]) ? 0 : pairAllowance(kind);
+          const operand = variable(kind ?? "")
+            ? (columnInputBytes(planner.rel.input, key, sizes) ?? fallback)
+            : 16;
+          // Native JsonRecords fixed cells include a bounded page and, for wide
+          // NUMERIC, its separately restored coefficient. Varlen cells stay raw.
+          keyBytes +=
+            count * (kind === "decimal" ? 512 + 2 * operand : variable(kind ?? "") ? operand : 512);
+          if (allowance > 0) bytes += allowance * count * operand + 40 * operands * count;
         }
+        opaqueConsumerStep = Math.max(opaqueConsumerStep, ordinary + bytes);
+        if (bytes === 0) return 0;
+        // These are complete consumer steps, not additions to the common row
+        // envelope. The sort holds two pages and one output row; the comparator
+        // restores one representative and its bounded record IO alongside trees.
+        bytes += consumer.boundary
+          ? keyBytes + 7 * consumer.keys.length + 2048 + 2048 * consumer.keys.length + (512 << 10)
+          : 3 * rowBytes + (64 << 10);
         maximum = Math.max(maximum, bytes);
       }
       return maximum;
     });
-    const hasAggregateProgress = [...aggregatePlanners.keys(), ...[...jsonAggregateRecipes.values()].filter(p => p.loans > 1).map(p => p.rel.id)].some((id) => active.has(id));
+    const hasAggregateProgress = [
+      ...aggregatePlanners.keys(),
+      ...[...jsonAggregateRecipes.values()].filter((p) => p.loans > 1).map((p) => p.rel.id),
+    ].some((id) => active.has(id));
     const hasCompoundProgress = admissions.some(
       ({ rel }) => active.has(rel.id) && (rel.op === "join" || rel.op === "setOp"),
     );
@@ -2710,7 +2810,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           json ? 1 : Math.max(1, ...copies.values()),
         );
       }
-      if (hasAggregateProgress) runtime.progressEnvelope(inline, inputMultiplicity, sourceMultiplicity);
+      if (hasAggregateProgress)
+        runtime.progressEnvelope(inline, inputMultiplicity, sourceMultiplicity);
     }
     const entries = admissions
       .filter((entry) => active.has(entry.owner))
@@ -3249,7 +3350,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               widths.set(index, row.valueBytes ?? row.progress / 4);
               joinKeyColumnBytes.set(source.id, widths);
             }
-          for (const column of keySources.get(source.id) ?? []) {
+          for (const column of jsonGroupSources.get(source.id) ?? []) {
             const name = source.columns[column],
               type = source.types[column];
             if (name === undefined || type === undefined)
@@ -3272,9 +3373,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 1,
               ),
             );
-            const columns = keyColumnBytes.get(source.id) ?? new Map<number, number>();
+            const columns = jsonGroupColumnBytes.get(source.id) ?? new Map<number, number>();
             columns.set(column, row.valueBytes ?? row.progress / 4);
-            keyColumnBytes.set(source.id, columns);
+            jsonGroupColumnBytes.set(source.id, columns);
           }
           io = Math.max(io, bound.io);
           progress = Math.max(progress, bound.progress);
