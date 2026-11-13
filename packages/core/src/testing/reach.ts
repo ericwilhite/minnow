@@ -5655,3 +5655,13 @@ export const JSON_GROUP_NESTED_GENERATED_REACH = [
   "exact PostgreSQL text",
   "zero resources",
 ] as const;
+
+/** Shared FTS v1 semantics independently checked against shipped SQL before native wiring. */
+export const FTS_SHARED_REACH = [
+  "filtered ranking retains whole-corpus stats",
+  "whole corpus includes NULL/empty rows",
+  "cross-column AND",
+  "prefix df union",
+  "repeated query terms",
+  "empty query and NULL truth",
+] as const;

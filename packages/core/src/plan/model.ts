@@ -1,3 +1,5 @@
+import type { FtsStats } from "../full-text/semantics.js";
+export type { FtsStats } from "../full-text/semantics.js";
 /**
  * The dependency-light logical plan shared by the SQL compiler, optimizer, vector executor, and
  * external typed-query builders. Keep executable parser/engine code out of this module: importing
@@ -160,16 +162,6 @@ export type ScalarFunctionName =
   | "MAKE_DATE"
   | "MAKE_TIMESTAMP"
   | "AGE";
-
-/** Exact BM25 corpus statistics attached to a cloned scoring node before execution. */
-export interface FtsStats {
-  /** Every row of the corpus, including all-null documents. */
-  docCount: number;
-  /** Total tokens across all documents. */
-  totalTokens: number;
-  /** Documents containing each query term, aligned with the query's term order. */
-  dfByTerm: number[];
-}
 
 /** PostgreSQL's name of a declared numeric type (engine/query.ts `compileWithDeclaredTypes`). */
 export type DeclaredNumericTypeName =
