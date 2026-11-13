@@ -289,9 +289,17 @@ export interface MemoryOutputNeed {
   readonly shape: MemoryOutputLayout;
 }
 
+/** Portable exporter borrow: resident chunk or immutable published storage, never both. */
+export type PortableChunk =
+  | { readonly kind: "resident"; readonly vector: Vector; readonly firstRow: number }
+  | { readonly kind: "stored"; readonly chunk: ColumnChunk; readonly firstRow: number };
+
 /** Rows in memory, stored as immutable chunks of `MEMORY_CHUNK_ROWS` rows. */
 export interface MemorySegment extends SegmentBase {
   readonly kind: "memory";
+  /** Internal snapshot exporter: same borrow lifetime as chunk(), without decoding large values.
+   * Missing on alternate readers means unsupported; it must never fall back to an empty chunk. */
+  portableChunk?(columnId: number, chunk: number): MaybePromise<PortableChunk>;
   /**
    * Sizes a common logical prefix before allocation. Bounds remain sufficient after publication;
    * identical requests keep their prefix and may only shrink byte bounds. No sizing borrow.

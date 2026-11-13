@@ -3519,3 +3519,21 @@ Both sides charge their bounded control and encoded buffers before allocation. R
 chunks are charged whole while borrowed; producers should yield bounded chunks. Close/cancel
 returns all reader charges, including a suspended frame; an already-started sink remains charged
 until it settles. A refused or cancelled stream must never be published as a database.
+
+`write/snapshot-export.ts` adds `exportPinnedSnapshot`: it takes ownership of a committed pin,
+borrows the matching catalog byte producer, and waits for sink consumption before advancing.
+Every exit releases the pin. It emits stable visible row order, including committed memory rows,
+with deleted/pending rows excluded. Source pages use one-pass non-retaining reads. The optional
+internal memory `portableChunk` hook hands back either a resident borrow or published storage;
+a publication during export cannot force a whole large value into a decode buffer.
+
+Portable column1 starts with a16-byte MNPC header: version1, layout tag1–9, zero flags, row count
+(1–256), and a zero reserved word. Fixed rows carry validity0/1, then canonical LE value lanes
+for valid rows. Floats copy their raw words. Int64 uses signed64; decimal uses signed128 plus
+u16 scale and u8 special; interval uses i32 months/days and signed64 micros; UUID uses16 bytes.
+Varlen rows are NULL0, or DEFINE1/u32 length/value bytes followed by REF2/u32 code0. Each definition
+replaces the one-entry dictionary. This bounded dictionary keeps strings as bytes/codes and streams
+large entries across1MiB frame boundaries. Column framing declares and verifies total encoded bytes.
+The exporter holds one1MiB payload window, small fixed scratch and one column reader; buffers
+for frames, pages and retained dictionary/metadata borrows remain charged separately.
+Catalog capture/sequence scope and native load/publication composition are subsequent stages.

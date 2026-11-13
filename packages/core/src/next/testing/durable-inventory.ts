@@ -169,7 +169,7 @@ export const DURABLE_EMISSIONS: Readonly<
 > = {
   "format/snapshot.ts:SnapshotStreamWriter.#emit:this.sink.write -> SnapshotSink.write": {
     count: 1,
-    kinds: ["snapshot", "snapshotFrame", "snapshotFooter"],
+    kinds: ["snapshot", "snapshotFrame", "snapshotFooter", "snapshotColumn"],
   },
   "format/manifest-codec.ts:writeGroupDirectory:writer.write -> ExtentWriter.write": {
     count: 2,

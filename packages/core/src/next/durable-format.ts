@@ -121,6 +121,7 @@ export const DURABLE_CODECS = {
   },
   frame: { commit: 1 },
   legacySnapshotPrefix: [0x4d, 0x49, 0x4e, 0x53, 0x4e, 0x41, 0x50, 0x31],
+  snapshotValue: { null: 0, define: 1, reference: 2 },
   snapshot: {
     catalogBegin: 1,
     catalogPart: 2,
@@ -408,6 +409,21 @@ export const DURABLE_FORMATS = {
       zero(32, 4),
     ],
     decoder: "decodeSnapshotFrame",
+    state: "implemented",
+  },
+  snapshotColumn: {
+    magic: 0x43504e4d,
+    version: 1,
+    parent: "snapshot",
+    versionIn: "header",
+    fields: [
+      magic(0x43504e4d),
+      version(4),
+      { name: "layout", offset: 5, width: 1, values: [1, 2, 3, 4, 5, 6, 7, 8, 9] },
+      zero(6, 2),
+      zero(12, 4),
+    ],
+    decoder: "decodeSnapshotColumnHeader",
     state: "implemented",
   },
   snapshotFooter: inherited("snapshot", "decodeSnapshotFooter", [

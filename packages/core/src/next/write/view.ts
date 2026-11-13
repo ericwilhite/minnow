@@ -35,6 +35,7 @@ import {
   type MemoryReadHint,
   type MemoryChunkStep,
   type PageSummary,
+  type PortableChunk,
   type Segment,
   type Snapshot,
   type TableReadOptions,
@@ -311,6 +312,28 @@ class MemorySegmentImpl implements MemorySegment {
       });
     }
     return out;
+  }
+
+  portableChunk(columnId: number, chunk: number): MaybePromise<PortableChunk> {
+    this.view.snapshot.check();
+    const first = chunk * MEMORY_CHUNK_ROWS;
+    const length = Math.min(MEMORY_CHUNK_ROWS, this.rowCount - first);
+    if (!(Number.isInteger(chunk) && chunk >= 0 && length > 0))
+      throw new RangeError("Portable chunk outside segment");
+    const published = this.memtable.published;
+    if (published === null) {
+      this.memtable.borrow(chunk, this.borrowed);
+      this.borrowed = chunk;
+      const stored = this.memtable.chunks[this.view.columnIndex(columnId)]?.[chunk];
+      if (stored === undefined) throw new RangeError("A memtable chunk is missing");
+      return { kind: "resident", vector: stored.view(length), firstRow: first };
+    }
+    return settle(groupRootOf(published.groupRoot), (root) => {
+      this.view.snapshot.check();
+      const stored = root.columns.find((candidate) => candidate.columnId === columnId);
+      if (stored === undefined) throw new RangeError("Published portable column missing");
+      return { kind: "stored", chunk: stored, firstRow: 0 };
+    });
   }
 
   chunk(

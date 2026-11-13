@@ -1,6 +1,10 @@
 /** Registry law: unknown durable identities/tags/reserved bits never mean empty or decoded data. */
 import fc from "fast-check";
 import {
+  encodeSnapshotColumnHeader,
+  decodeSnapshotColumnHeader,
+} from "../write/snapshot-column.js";
+import {
   encodeSnapshotHeader,
   decodeSnapshotHeader,
   encodeSnapshotFrame,
@@ -283,7 +287,13 @@ function adapters(): Record<Exclude<DurableFormatName, "indexedDb">, Adapter> {
     { frames: 3, objects: 1, tables: 0, rows: 0, columnBytes: 0, catalogCrc: 1, streamCrc: 1 },
     footer,
   );
+  const portable = new Uint8Array(16);
+  encodeSnapshotColumnHeader(integer.type, 2, portable);
   return {
+    snapshotColumn: {
+      bytes: portable,
+      decode: (bytes) => decodeSnapshotColumnHeader(integer.type, bytes),
+    },
     snapshot: {
       bytes: snapshot,
       decode: decodeSnapshotHeader,

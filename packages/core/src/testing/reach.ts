@@ -22,6 +22,7 @@ export const DURABLE_REGISTRY_REACH = [
   "snapshot",
   "snapshotFrame",
   "snapshotFooter",
+  "snapshotColumn",
   "rootSlot",
   "epochSlot",
   "logHeader",
@@ -4576,4 +4577,26 @@ export const SNAPSHOT_CODEC_REACH = [
   "cancel",
   "trailing",
   "all kinds",
+] as const;
+
+export const SNAPSHOT_EXPORT_REACH = [
+  "deleted rows",
+  "all live",
+  "resident",
+  "persisted",
+  "repoint",
+  "during export",
+  "quota",
+  "cancel",
+] as const;
+
+export const SNAPSHOT_PHYSICAL_REACH = [
+  "bool",
+  "i32",
+  "f32",
+  "f64",
+  "int64",
+  "interval",
+  "decimal",
+  "fixed16",
 ] as const;

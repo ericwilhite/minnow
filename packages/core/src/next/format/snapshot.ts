@@ -119,7 +119,7 @@ export function snapshotFrameBytes(payloadBytes: number): number {
   check(payloadBytes <= SNAPSHOT_PAYLOAD_BYTES, "Snapshot payload exceeds1MiB");
   return Math.ceil((40 + payloadBytes + 4) / 8) * 8;
 }
-export function encodeSnapshotFrame(frame: SnapshotFrame, into: Uint8Array): void {
+function prepareSnapshotFrame(frame: SnapshotFrame, into: Uint8Array): void {
   requireTag(frame.kind, Object.values(SnapshotKind), "snapshot frame kind", SnapshotFormatError);
   whole(frame.ordinal, "ordinal");
   whole(frame.objectId, "object id");
@@ -140,7 +140,10 @@ export function encodeSnapshotFrame(frame: SnapshotFrame, into: Uint8Array): voi
   view.setUint32(28, frame.payload.length, true);
   view.setUint32(36, snapshotCrc32(into.subarray(0, 36)), true);
   into.set(frame.payload, 40);
-  view.setUint32(
+}
+export function encodeSnapshotFrame(frame: SnapshotFrame, into: Uint8Array): void {
+  prepareSnapshotFrame(frame, into);
+  viewOf(into).setUint32(
     40 + frame.payload.length,
     snapshotCrc32(into.subarray(0, 40 + frame.payload.length)),
     true,
@@ -271,7 +274,7 @@ class Order {
   #tableRows = 0;
   #expectedBytes = 0;
   constructor(readonly header: SnapshotHeader) {}
-  consume(frame: SnapshotFrame, streamCrc: number): void {
+  consume(frame: SnapshotFrame, streamCrc: number, catalogCrc: number): void {
     check(
       !this.done && frame.ordinal === this.ordinal,
       "Snapshot ordinal missing, duplicated or reordered",
@@ -355,7 +358,7 @@ class Order {
       this.#bytes += payload.length;
       whole(this.#bytes, "object bytes");
       if (kind === SnapshotKind.catalogPart) {
-        this.catalogCrc = snapshotCrc32(payload, this.catalogCrc);
+        this.catalogCrc = catalogCrc;
         this.#catalogBytes += payload.length;
       } else {
         this.columnBytes += payload.length;
@@ -455,6 +458,15 @@ async function pace(work: SnapshotWork): Promise<void> {
   if (pending !== undefined) await pending;
   work.signal?.throwIfAborted();
 }
+/** Bound checksum CPU as well as I/O continuations on the shared worker clock. */
+async function streamCrc(bytes: Uint8Array, previous: number, work: SnapshotWork): Promise<number> {
+  let crc = previous;
+  for (let from = 0; from < bytes.length; from += 65536) {
+    await pace(work);
+    crc = snapshotCrc32(bytes.subarray(from, from + 65536), crc);
+  }
+  return crc;
+}
 function charge(budget: ByteBudget, bytes: number): void {
   if (!budget.allocate(bytes)) throw new SnapshotBudgetError(bytes);
 }
@@ -505,6 +517,7 @@ export class SnapshotStreamWriter {
   }
   async #emit(bytes: Uint8Array): Promise<void> {
     await pace(this.work);
+    check(!this.#closed, "Snapshot writer closed");
     await this.sink.write(bytes, this.work.signal);
     this.work.signal?.throwIfAborted();
   }
@@ -523,12 +536,24 @@ export class SnapshotStreamWriter {
       charge(this.budget, size);
       funded = true;
       const bytes = new Uint8Array(size);
-      encodeSnapshotFrame(
+      prepareSnapshotFrame(
         { kind, ordinal: this.#order.ordinal, objectId, partIndex, payload },
         bytes,
       );
-      this.#order.consume(decodeSnapshotFrame(bytes), this.#crc);
-      const next = kind === SnapshotKind.footer ? this.#crc : snapshotCrc32(bytes, this.#crc);
+      const end = 40 + payload.length;
+      viewOf(bytes).setUint32(end, await streamCrc(bytes.subarray(0, end), 0, this.work), true);
+      const own = bytes.subarray(40, end);
+      const catalogCrc =
+        kind === SnapshotKind.catalogPart
+          ? await streamCrc(own, this.#order.catalogCrc, this.work)
+          : this.#order.catalogCrc;
+      this.#order.consume(
+        { kind, ordinal: this.#order.ordinal, objectId, partIndex, payload: own },
+        this.#crc,
+        catalogCrc,
+      );
+      const next =
+        kind === SnapshotKind.footer ? this.#crc : await streamCrc(bytes, this.#crc, this.work);
       await this.#emit(bytes);
       this.#crc = next;
     } catch (error) {
@@ -596,7 +621,14 @@ export class SnapshotStreamReader {
     let reader: SnapshotStreamReader | undefined;
     try {
       reader = new SnapshotStreamReader(input[Symbol.asyncIterator](), budget, work);
-      reader.#headerBytes = await reader.#exact(64);
+      const prefix = await reader.#exact(8);
+      try {
+        if (DURABLE_CODECS.legacySnapshotPrefix.every((byte, i) => prefix[i] === byte))
+          throw new LegacySnapshotError();
+        reader.#headerBytes = await reader.#exact(64, prefix);
+      } finally {
+        reader.#free(prefix);
+      }
       reader.#order = new Order(decodeSnapshotHeader(reader.#headerBytes));
       reader.#crc = snapshotCrc32(reader.#headerBytes);
       return reader;
@@ -689,9 +721,23 @@ export class SnapshotStreamReader {
           const header = decodeSnapshotFrameHeader(prefix),
             size = snapshotFrameBytes(header.payloadBytes);
           bytes = await this.#exact(size, prefix);
-          const frame = decodeSnapshotFrame(bytes);
-          order.consume(frame, this.#crc);
-          if (frame.kind !== SnapshotKind.footer) this.#crc = snapshotCrc32(bytes, this.#crc);
+          const end = 40 + header.payloadBytes;
+          check(
+            viewOf(bytes).getUint32(end, true) ===
+              (await streamCrc(bytes.subarray(0, end), 0, this.work)),
+            "Snapshot frame CRC mismatch",
+          );
+          for (let at = end + 4; at < bytes.length; at++)
+            check(bytes[at] === 0, "Nonzero snapshot frame padding");
+          const frame = { ...header, payload: bytes.subarray(40, end) };
+          const catalogCrc =
+            frame.kind === SnapshotKind.catalogPart
+              ? await streamCrc(frame.payload, order.catalogCrc, this.work)
+              : order.catalogCrc;
+          order.consume(frame, this.#crc, catalogCrc);
+          if (frame.kind !== SnapshotKind.footer)
+            this.#crc = await streamCrc(bytes, this.#crc, this.work);
+          check(!this.#closed, "Snapshot reader closed");
           yield frame;
         } finally {
           this.#free(prefix);

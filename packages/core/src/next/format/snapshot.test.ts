@@ -192,7 +192,9 @@ for (const seed of seedsFor("next-snapshot-codec", [0xb251, 0xb252]))
           };
           const encoded = new Uint8Array(snapshotFrameBytes(large.length));
           encodeSnapshotFrame(frame, encoded);
-          expect(decodeSnapshotFrame(encoded).payload).toEqual(large);
+          const decoded = decodeSnapshotFrame(encoded).payload;
+          expect(decoded.length).toBe(large.length);
+          expect(decoded.every((byte, i) => byte === large[i])).toBe(true);
           reach.reach("large part");
         },
       ),
@@ -266,5 +268,53 @@ it("keeps a pending sink charged through close and releases a reader closed whil
   reader.close();
   expect(budget.used).toBe(0);
   await stream.return(undefined);
+  expect(budget.used).toBe(0);
+});
+
+it("paces large frame checksum work on the shared clock before delivery", async () => {
+  let tick = 0,
+    turns = 0,
+    active = false,
+    writes = 0;
+  const clock = new TaskClock(() => tick++),
+    abort = new AbortController(),
+    budget = new Budget();
+  const work = {
+    clock,
+    signal: abort.signal,
+    yieldTask: () =>
+      new Promise<void>((resolve) =>
+        setTimeout(() => {
+          if (active && ++turns === 2) abort.abort(new Error("checksum cancel message"));
+          resolve();
+        }, 0),
+      ),
+  };
+  const writer = await SnapshotStreamWriter.open(
+    { id: new Uint8Array(16), sourceLsn: 0 },
+    {
+      write: () => {
+        writes++;
+      },
+    },
+    budget,
+    work,
+  );
+  await writer.frame(SnapshotKind.catalogBegin, 1, 0, new Uint8Array());
+  active = true;
+  tick += 8;
+  await expect(
+    writer.frame(SnapshotKind.catalogPart, 1, 1, new Uint8Array(SNAPSHOT_PAYLOAD_BYTES)),
+  ).rejects.toThrow("checksum cancel message");
+  expect(turns).toBe(2);
+  expect(writes).toBe(2);
+  expect(budget.used).toBe(0);
+});
+
+it("refuses even a short legacy snapshot before asking for a body", async () => {
+  const budget = new Budget();
+  await expect(
+    SnapshotStreamReader.open(chunks(new TextEncoder().encode("MINSNAP1"), 1), budget),
+  ).rejects.toMatchObject({ code: "MINNOW_LEGACY_DATA" });
   expect(budget.used).toBe(0);
 });
