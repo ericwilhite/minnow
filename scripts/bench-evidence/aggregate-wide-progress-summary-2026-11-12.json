@@ -200,7 +200,7 @@
         "COALESCE known non-null prefix/nested/NULL first/alternative max",
         "CASE false branch",
         "NULLIF output",
-        "literal short key lanes<=standard4MiB step",
+        "literal short key lanes<=standard1MiB step",
         "32MiB/64MiB witnesses",
         "caps above the matching parent peak",
         "PG exact; no spill or restore; peak<=parent; zero held/spill"
@@ -222,7 +222,20 @@
     ],
     "evidenceHash": "f85b51735cf452485144422d6cd9e43a00ca682983809d5eb93e4304b75a9093",
     "rawEvidenceDirectory": "/home/eric/.cache/b4-read-recipe",
-    "reproduce": "TMPDIR=/path/to/scratch npx vitest run packages/core/src/next/testing/executor-agg-admission-peak.test.ts packages/core/src/next/testing/executor-agg-wide-progress.test.ts --maxWorkers=2"
+    "reproduce": "TMPDIR=/path/to/scratch npx vitest run packages/core/src/next/testing/executor-agg-admission-peak.test.ts packages/core/src/next/testing/executor-agg-wide-progress.test.ts --maxWorkers=2",
+    "fullGate": {
+      "sourceCommit": "8cd184f2c952d16ce360cca8af592bb6cf532831",
+      "complete": true,
+      "steps": 19,
+      "files": 601,
+      "tests": 4835,
+      "ci": false,
+      "maxWorkers": 2,
+      "allScripts": true,
+      "buildSiteTypeLintFormatApiVersionResolver": true,
+      "rawSha256": "7fa8400e9d739fb4f232eefa5a62c37ac3c47b70d4ae9edefa290e1efda5b3d1",
+      "rawLog": "/home/eric/.cache/b4-read-recipe/agg-review-full-gate.json"
+    }
   },
   "sourceSha256": {
     "packages/core/src/next/README.md": "cf2d13c9a0306ec8046be3485132999a3ca66182f6245a9a1c9d6e5030149ef4",
