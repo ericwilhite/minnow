@@ -24,6 +24,7 @@
     "test:unit": "vitest run",
     "test:coverage": "vitest run --coverage",
     "test:prepare": "tsc -b --pretty false && node apps/site/scripts/generate-playground-types.mjs",
+    "test:durations": "vite-node scripts/test-durations.mts",
     "test:browser": "npm run test:browser:library && npm run test:browser:site",
     "test:browser:library": "tsc -b packages/core --force && playwright test --config playwright.library.config.ts",
     "test:browser:pos": "tsc -b packages/core --force && MINNOW_POS_ACCEPTANCE=1 playwright test --config playwright.library.config.ts packages/core/browser-tests/pos.spec.ts --workers=1",

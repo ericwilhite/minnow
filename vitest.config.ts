@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 import { availableParallelism } from "node:os";
 import { configDefaults, defineConfig } from "vitest/config";
+import DurationSequencer from "./scripts/test-shards.ts";
 
 const maintenanceWorkload = "packages/core/src/engine/maintenance-under-load.test.ts";
 
@@ -24,6 +25,9 @@ export default defineConfig({
     // parallelism turns CPU/heap contention into unrelated timeouts on large developer hosts.
     // Keep the existing deadlines and bound simultaneous heavy suites instead.
     maxWorkers: Math.min(4, availableParallelism()),
+    // `--shard` splits by measured file duration rather than file count, and every run starts its
+    // longest files first, so a quarter-hour file never starts last (scripts/test-shards.ts).
+    sequence: { sequencer: DurationSequencer },
     // Test builds re-verify a cached blob's checksum when its lease is released or it is evicted
     // (packages/core/src/next/storage/verify-cached.ts): a consumer that writes into bytes the
     // cache treats as immutable fails loudly in whichever suite does it.
@@ -78,7 +82,13 @@ export default defineConfig({
       // Only the shipped library. The site is covered by its own browser runner, and measuring
       // it here would average a docs app into the engine's numbers.
       include: ["packages/*/src/**/*.ts"],
-      exclude: ["**/*.test.ts", "**/*.spec.ts"],
+      // The crash sweep's scenarios moved out of crash-sweep.test.ts only so its longest case can
+      // run in a parallel file; they stay out of the measured code, as they were.
+      exclude: [
+        "**/*.test.ts",
+        "**/*.spec.ts",
+        "packages/core/src/next/write/crash-sweep.test-support.ts",
+      ],
       /**
        * A ratchet, not a target. Each floor sits just under what the suite measured when it was
        * written, so the gate fails when coverage falls rather than when it merely stops rising.

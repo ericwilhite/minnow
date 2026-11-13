@@ -5,6 +5,8 @@ dist/
 coverage/
 # Vitest blob reports, one per CI unit-test part, merged by `vitest run --merge-reports`.
 .vitest-reports/
+# Per-part test durations CI uploads for `npm run test:durations`.
+/durations/
 playwright-report/
 test-results/
 *.tsbuildinfo
