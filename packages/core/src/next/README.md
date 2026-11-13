@@ -1331,10 +1331,13 @@ and the owner import it directly.
 - A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable
   operator works inside its admitted minimum.
 - Growth is charged before it happens, including the overlap while a buffer is copied.
-- Aggregate sort minima count every variable-width parameter position, including projected
-  aliases, using each owned slot's binding bound before admission. Pressure checkpoints preserve
-  those widths without rereading caller buffers. Spill staging reserves the complete row/page
-  overlap even when an unsuccessful append has already grown some column buffers.
+- Aggregate progress follows each borrowing lane's complete row layout. The hash wrapper and
+  fixed COUNT transitions do not reserve unused sort lanes. Conditional outputs use the largest
+  reachable branch: COALESCE stops at a proven non-null constant, and its alternatives are never
+  summed. Owned parameter bounds survive pressure checkpoints without rereading caller buffers.
+  Spill staging reserves the complete row/page overlap even when an unsuccessful append has
+  already grown some column buffers. The generated no-pressure campaign compares fitting plans'
+  peaks with the pre-change admission policy, including caps just above the parent's peak.
 - Caches are evicted before anything spills. Several may register (the space's page cache, the
   decoded directory and metadata caches, the inflated-page cache); eviction takes the entry unused
   longest across all of them (`oldestUnusedAt`).

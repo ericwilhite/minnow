@@ -5397,3 +5397,24 @@ export const AGG_WIDE_PROGRESS_REACH = [
   "partial staged row",
   "cancelled loan",
 ] as const;
+
+export const AGG_ADMISSION_PEAK_REACH = [
+  "short",
+  "null-prefix",
+  "direct",
+  "max",
+  "case",
+  "nullif",
+  "UTF8",
+  "ASCII",
+  "near parent peak",
+  "32MiB short witness",
+  "64MiB restore witness",
+  "PG exact",
+  "peak no higher",
+  "zero",
+  "nested",
+  "nullable-max",
+  "max not sum",
+  "small output lane",
+] as const;

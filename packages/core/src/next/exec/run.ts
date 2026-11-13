@@ -38,6 +38,7 @@ import { ReadStep } from "./read-step.js";
 import { admitWorkingSet } from "../memory/working-set.js";
 import { MAX_BLOB_BYTES } from "../access/space.js";
 import { StepLoans } from "../memory/step-loans.js";
+import { aggregateLaneBytes, type AggregateProgressLayout } from "./agg/parameter-copies.js";
 import type { ReadBound } from "../page/read-bounds.js";
 
 /** A set/join transition can retain an encoded key, its hash copy and a
@@ -322,11 +323,10 @@ export class QueryRuntime {
   operatorLiteralProgress(bytes: number): void {
     this.#operatorLiteralBytes = bytes;
   }
-  #parameterCopies: ReadonlyArray<ReadonlyMap<number, number>> = [];
+  #aggregateLanes = new Map<number, {kind: "hybrid" | "external" | "restore"; layout: AggregateProgressLayout}>();
   #parameterSlotBytes: readonly number[] | undefined;
   /** Complete variable-output envelope; ordinary project/filter leave it at zero. */
-  progressEnvelope(bytes: number, multiplicity = 1, sourceMultiplicity = multiplicity, parameterCopies: ReadonlyArray<ReadonlyMap<number, number>> = []): void {
-    this.#parameterCopies = parameterCopies;
+  progressEnvelope(bytes: number, multiplicity = 1, sourceMultiplicity = multiplicity): void {
     this.#expressionProgress = bytes;
     this.#expressionMultiplicity = multiplicity;
     this.#sourceMultiplicity = sourceMultiplicity;
@@ -370,22 +370,10 @@ export class QueryRuntime {
     // ReadBound.progress already covers a complete source prefix, not one cell.
     // Add newly materialized inline/literal/owned-parameter columns; multiply only
     // for repeated group-key positions, never again for the number of source columns.
-    // Actual binding bounds weight each repeated slot separately. A large unrelated
-    // parameter must not be multiplied by the alias count of a small one.
-    let repeated = 0;
-    for (const profile of this.#parameterCopies) {
-      let bytes = 0;
-      for (const [slot, count] of profile)
-        bytes +=
-          Math.max(0, count - this.#expressionMultiplicity) *
-          (this.#parameterSlotBytes?.[slot] ?? inputs);
-      repeated = Math.max(repeated, bytes);
-    }
     const current = this.#parameterProgress
       ? readProgress * this.#sourceMultiplicity +
         this.#expressionProgress +
-        4 * inputs * this.#expressionMultiplicity +
-        4 * repeated
+        4 * inputs * this.#expressionMultiplicity
       : Math.max(readProgress, largestInput);
     return Math.max(MAX_BLOB_BYTES, savedCopies * this.#savedProgressBytes, copies * current);
   }
@@ -434,6 +422,17 @@ export class QueryRuntime {
   ): void {
     this.#columnProgress.set(id, bound);
   }
+  aggregateProgress(id: number, kind: string, layout: AggregateProgressLayout): void {
+    if (kind === "hybrid" || kind === "external" || kind === "restore")
+      this.#aggregateLanes.set(id, { kind, layout });
+    else this.#aggregateLanes.delete(id);
+  }
+  #laneBytes(rel: OperatorIdentity, slot: number | undefined, baseline: number, slots = this.#parameterSlotBytes): number {
+    const recipe = this.#aggregateLanes.get(rel.id);
+    return recipe
+      ? aggregateLaneBytes(recipe.layout, recipe.kind, slot, baseline, slots)
+      : baseline;
+  }
   operatorStep(rel: OperatorIdentity): number {
     return this.#operatorProgress.get(rel.id) ?? 0;
   }
@@ -456,7 +455,7 @@ export class QueryRuntime {
         continue;
       if (entry.rel.op !== "aggregate" || !this.#helperOnlyProgress.has(entry.rel.id))
         protectedBytes += Math.max(
-          progress,
+          this.#laneBytes(entry.rel, undefined, progress, slots),
           this.#groupKeyProgress?.(
             entry.rel.id,
             undefined,
@@ -468,7 +467,7 @@ export class QueryRuntime {
         );
       for (let slot = 0; slot < (entry.loanSlots ?? 0); slot++)
         protectedBytes += Math.max(
-          progress,
+          this.#laneBytes(entry.rel, slot, progress, slots),
           this.#groupKeyProgress?.(
             entry.rel.id,
             slot,
@@ -637,7 +636,7 @@ export class QueryRuntime {
             this.#helperOnlyProgress.has(entry.rel.id)
           )
           ? Math.max(
-              progress(entry.rel),
+              this.#laneBytes(entry.rel, entry.loanSlot, progress(entry.rel)),
               this.#groupKeyProgress?.(
                 entry.rel.id,
                 entry.loanSlot,

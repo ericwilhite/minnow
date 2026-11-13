@@ -53,18 +53,6 @@
   ],
   "rawEvidenceDirectory": "/home/eric/.cache/b4-read-recipe",
   "reproduce": "TMPDIR=/path/to/scratch npx vitest run packages/core/src/next/testing/executor-agg-wide-progress.test.ts --maxWorkers=2",
-  "sourceSha256": {
-    "packages/core/src/next/README.md": "6c5c5a0e28ade40b86e59df924dd42b80b8a5d3dc9e962908b206d6fa64d55ce",
-    "packages/core/src/next/exec/parameter-checkpoint.test.ts": "d6893036f1fbf8b47e6368de2b7682510915c375dac80af3b44ba4ee06786d73",
-    "packages/core/src/next/exec/parameter-checkpoint.ts": "1bcc4c29d0382e94e2967882faa909fa3aadffdfb525dbcda610034f41f5870c",
-    "packages/core/src/next/exec/parameters.ts": "61b41daf5f56725d64d6a62c65df90593e2cfbaaca6ade1f970f5591d064de9d",
-    "packages/core/src/next/exec/plan.ts": "20a42d945d8e7edc07408e8d3a597e80bc1589c0218fadeec7132da43de63b27",
-    "packages/core/src/next/exec/run.ts": "253a47d827a7345c8bb101714bec011529c97d4a11ce0ffd02f522c1fd22e67b",
-    "packages/core/src/next/exec/spill-pool.ts": "be395c6b5f8e66fc65d08a34f8ac374ab11826f059de85d8310967c214881640",
-    "packages/core/src/testing/reach.ts": "9e5d79aff112383674406a35d0f7e229ec43b58071673901f7fab36222b7342d",
-    "packages/core/src/next/exec/agg/parameter-copies.ts": "0e7e17a7679b3279fc6caf233bd3fa48b8671d6cd50e137b8b95676cca53a2e3",
-    "packages/core/src/next/testing/executor-agg-wide-progress.test.ts": "18bceeef2362737a992816c803af09a3187e651d176aaf7ecd0f701cd9f58cc3"
-  },
   "preflight": [
     {
       "name": "format",
@@ -159,5 +147,89 @@
       "files": 1,
       "tests": 2
     }
+  },
+  "initialSourceSha256": {
+    "packages/core/src/next/README.md": "6c5c5a0e28ade40b86e59df924dd42b80b8a5d3dc9e962908b206d6fa64d55ce",
+    "packages/core/src/next/exec/parameter-checkpoint.test.ts": "d6893036f1fbf8b47e6368de2b7682510915c375dac80af3b44ba4ee06786d73",
+    "packages/core/src/next/exec/parameter-checkpoint.ts": "1bcc4c29d0382e94e2967882faa909fa3aadffdfb525dbcda610034f41f5870c",
+    "packages/core/src/next/exec/parameters.ts": "61b41daf5f56725d64d6a62c65df90593e2cfbaaca6ade1f970f5591d064de9d",
+    "packages/core/src/next/exec/plan.ts": "20a42d945d8e7edc07408e8d3a597e80bc1589c0218fadeec7132da43de63b27",
+    "packages/core/src/next/exec/run.ts": "253a47d827a7345c8bb101714bec011529c97d4a11ce0ffd02f522c1fd22e67b",
+    "packages/core/src/next/exec/spill-pool.ts": "be395c6b5f8e66fc65d08a34f8ac374ab11826f059de85d8310967c214881640",
+    "packages/core/src/testing/reach.ts": "9e5d79aff112383674406a35d0f7e229ec43b58071673901f7fab36222b7342d",
+    "packages/core/src/next/exec/agg/parameter-copies.ts": "0e7e17a7679b3279fc6caf233bd3fa48b8671d6cd50e137b8b95676cca53a2e3",
+    "packages/core/src/next/testing/executor-agg-wide-progress.test.ts": "18bceeef2362737a992816c803af09a3187e651d176aaf7ecd0f701cd9f58cc3"
+  },
+  "reviewFixup": {
+    "reviewedParent": "1355d31b",
+    "comparisonParent": "b5b7d1fd",
+    "change": "Bound reachable conditional outputs and charge complete rows only to the named lanes that borrow them",
+    "peakSummary": [
+      {
+        "shape": "short",
+        "capMiB": 32,
+        "parameterUtf8Bytes": 1000000,
+        "parentMaxPeakBytes": 23337594,
+        "candidateMaxPeakBytes": 9823834,
+        "maxPeakSavingBytes": 13513760,
+        "schedules": ["ordinary shared clock", "paced shared clock"],
+        "spilledBytes": 0,
+        "resultCount": 2
+      },
+      {
+        "shape": "direct",
+        "capMiB": 64,
+        "parameterUtf8Bytes": 1000000,
+        "parentMaxPeakBytes": 50230320,
+        "candidateMaxPeakBytes": 45373984,
+        "maxPeakSavingBytes": 4856336,
+        "schedules": ["ordinary shared clock", "paced shared clock"],
+        "spilledBytes": 0,
+        "resultCount": 2
+      }
+    ],
+    "legacyControlVerifiedAgainstRealParent": true,
+    "peakComparator": "Same deterministic paced shared-clock schedule; separate real-clock reviewer and competing-holder replays. Yield pacing changes the pre-change peak, so caps cannot be calibrated from one uncontrolled observation.",
+    "campaign": {
+      "suite": "executor-agg-admission-peak.test.ts",
+      "seeds": [46995, 46996],
+      "runsPerSeed": 12,
+      "dimensions": [
+        "2..4 keys",
+        "980000..1000000 ASCII/UTF8 bytes",
+        "COALESCE known non-null prefix/nested/NULL first/alternative max",
+        "CASE false branch",
+        "NULLIF output",
+        "literal short key lanes<=standard4MiB step",
+        "32MiB/64MiB witnesses",
+        "caps above the matching parent peak",
+        "PG exact; no spill or restore; peak<=parent; zero held/spill"
+      ]
+    },
+    "preflight": {
+      "focusedFiles": 7,
+      "focusedTests": 20,
+      "node22Files": 2,
+      "node22Tests": 4,
+      "coreBuild": true,
+      "lint": true,
+      "format": true
+    },
+    "mutants": [
+      "all COALESCE args reachable",
+      "replicate full row on every helper",
+      "sum conditional alternatives"
+    ],
+    "evidenceHash": "f85b51735cf452485144422d6cd9e43a00ca682983809d5eb93e4304b75a9093",
+    "rawEvidenceDirectory": "/home/eric/.cache/b4-read-recipe",
+    "reproduce": "TMPDIR=/path/to/scratch npx vitest run packages/core/src/next/testing/executor-agg-admission-peak.test.ts packages/core/src/next/testing/executor-agg-wide-progress.test.ts --maxWorkers=2"
+  },
+  "sourceSha256": {
+    "packages/core/src/next/README.md": "cf2d13c9a0306ec8046be3485132999a3ca66182f6245a9a1c9d6e5030149ef4",
+    "packages/core/src/next/exec/agg/parameter-copies.ts": "1321451a8c90e8ab13dabd95e752947fcc93a2a63a02610a56518562f76fc461",
+    "packages/core/src/next/exec/plan.ts": "4647515a768051b965c9bced0d3c7e450b2ef9fd7a55db3e7eed963235255d5c",
+    "packages/core/src/next/exec/run.ts": "fa476a2dcde422051c69611225dd63bbb4109bed9844094633b8c242a1beab44",
+    "packages/core/src/testing/reach.ts": "97594966cf91ed3269426426b02ee3b6f001e6062eec9172c7dbefc3eda03ebe",
+    "packages/core/src/next/testing/executor-agg-admission-peak.test.ts": "042ab63e123d7a571beb954a753ee154474110dfd7419b3e00d1ff4073dfbebd"
   }
 }
