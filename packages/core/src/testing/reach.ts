@@ -4600,3 +4600,15 @@ export const SNAPSHOT_PHYSICAL_REACH = [
   "decimal",
   "fixed16",
 ] as const;
+
+export const SNAPSHOT_INPUT_REACH = [
+  "short id",
+  "long id",
+  "invalid lsn",
+  "no writes",
+  "zero charges",
+  "legacy refusal",
+  "version refusal",
+  "sync close failure",
+  "async close failure",
+] as const;

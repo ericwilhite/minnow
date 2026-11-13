@@ -3537,3 +3537,7 @@ large entries across1MiB frame boundaries. Column framing declares and verifies 
 The exporter holds one1MiB payload window, small fixed scratch and one column reader; buffers
 for frames, pages and retained dictionary/metadata borrows remain charged separately.
 Catalog capture/sequence scope and native load/publication composition are subsequent stages.
+
+Stream writers validate the16-byte identity and safe-integer LSN before charging or cloning them.
+A failing source iterator's `return()` cannot replace the primary typed legacy/format/cancel refusal;
+reader-owned buffers are released even if upstream cleanup fails synchronously or asynchronously.

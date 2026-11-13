@@ -490,6 +490,8 @@ export class SnapshotStreamWriter {
     budget: ByteBudget,
     work: SnapshotWork = {},
   ): Promise<SnapshotStreamWriter> {
+    check(header.id.length === 16, "Invalid snapshot identity size");
+    whole(header.sourceLsn, "LSN");
     charge(budget, SNAPSHOT_CONTROL_BYTES);
     let writer: SnapshotStreamWriter | undefined;
     try {
@@ -761,6 +763,12 @@ export class SnapshotStreamReader {
     this.#headerBytes = null;
     this.#order = null;
     this.budget.free(SNAPSHOT_CONTROL_BYTES);
-    void Promise.resolve(this.input.return?.()).catch(() => undefined);
+    // Custom iterators may throw before returning a promise. Cleanup must not replace the
+    // primary typed legacy/format/cancel refusal; our buffers have already been released.
+    try {
+      void Promise.resolve(this.input.return?.()).catch(() => undefined);
+    } catch {
+      // Upstream cleanup is best effort, for both synchronous and asynchronous failures.
+    }
   }
 }
