@@ -8,11 +8,10 @@
  * function, ROWS / RANGE / GROUPS with offsets, every EXCLUDE, NULL keys, resident and spilled
  * (tight grants spill the sort and big partitions), with and without backpressure.
  */
-import { afterAll, describe, expect, it, vi } from "vitest";
-import { Charge } from "./spill-pool.js";
-import { createReach } from "../../testing/reach.js";
+import { afterAll, describe, expect, it } from "vitest";
+import { createReach, WINDOW_RING_GROWTH_CASES } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
-import { Governor } from "../memory/governor.js";
+import { Governor, type Grant } from "../memory/governor.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import type { PhysicalType } from "../types.js";
 import {
@@ -276,6 +275,24 @@ function fallbackValue(call: WindowFunctionSpec): Value {
 
 // --- the operator -------------------------------------------------------------------------
 
+/** A grant-local observer has no shared method to restore after an abandoned body. */
+function observeGrant(grant: Grant, observed?: number[]): Grant {
+  if (observed === undefined) return grant;
+  return new Proxy(grant, {
+    get(target, key) {
+      if (key === "allocate")
+        return (bytes: number) => {
+          observed.push(bytes);
+          return target.allocate(bytes);
+        };
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function"
+        ? (value as (...args: unknown[]) => unknown).bind(target)
+        : value;
+    },
+  });
+}
+
 export async function runWindow(
   spec: WindowSpec,
   rows: readonly Row[],
@@ -285,6 +302,7 @@ export async function runWindow(
     batchRows?: number;
     dictionary?: boolean;
     int64?: "safe" | "int64";
+    allocations?: number[];
   } = {},
 ) {
   const minimum = windowMinimumBytes(spec.types, spec.functions.length);
@@ -298,8 +316,11 @@ export async function runWindow(
   const governor = new Governor(cap);
   const spill = new MemorySpillService();
   const grant = await governor.admit({ label: "window", minimumBytes: minimum, spillable: true });
+  // Observe only this history's grant. An abandoned body cannot capture another test's
+  // allocations or restore over its observer (unlike a shared Charge.prototype spy).
+  const ownedGrant = observeGrant(grant, options.allocations);
   const sink = new CollectSink(options.blockEvery ?? 0);
-  const op = new WindowOperator(spec, { grant, spill, queryId: 6 }, sink);
+  const op = new WindowOperator(spec, { grant: ownedGrant, spill, queryId: 6 }, sink);
   await drive(
     new ArraySource(
       batchesOf(spec.types, rows, {
@@ -963,25 +984,36 @@ describe("window: growth charges the overlap (review B7-p2d-1 #5, governor rule 
     check = true,
   ): Promise<number[]> {
     const sizes: number[] = [];
-    // eslint-disable-next-line @typescript-eslint/unbound-method -- called with `this` below
-    const allocate = Charge.prototype.allocate;
-    const spy = vi.spyOn(Charge.prototype, "allocate").mockImplementation(function (
-      this: Charge,
-      bytes: number,
-    ) {
-      sizes.push(bytes);
-      return allocate.call(this, bytes);
-    });
-    try {
-      const result = await runWindow(spec, rows);
-      // (The oracle is quadratic in the frame: a 20,000-row frame is checked by its sums.)
-      if (check) checkWindow(spec, rows, result.rows);
-      else expect(result.rows.length).toBe(rows.length);
-    } finally {
-      spy.mockRestore();
-    }
+    const result = await runWindow(spec, rows, { allocations: sizes });
+    if (check) checkWindow(spec, rows, result.rows);
+    else expect(result.rows.length).toBe(rows.length);
     return sizes;
   }
+  it("an abandoned allocation observer cannot capture or retire a later history", async () => {
+    const governor = new Governor(8 << 20);
+    const first = await governor.admit({ label: "old", minimumBytes: 1024, spillable: true });
+    const second = await governor.admit({ label: "next", minimumBytes: 1024, spillable: true });
+    const a: number[] = [],
+      b: number[] = [];
+    const old = observeGrant(first, a),
+      next = observeGrant(second, b);
+    try {
+      expect(old.allocate(17)).toBe(true);
+      expect(next.allocate(23)).toBe(true);
+      // The abandoned observer is still alive after the later history starts.
+      expect(old.allocate(19)).toBe(true);
+      expect(a).toEqual([17, 19]);
+      expect(b).toEqual([23]);
+      old.close();
+      expect(next.allocate(29)).toBe(true);
+      expect(b).toEqual([23, 29]);
+    } finally {
+      first.close();
+      second.close();
+    }
+    expect(governor.usedBytes).toBe(0);
+  });
+
   const sum = (offset: number): WindowFunctionSpec => ({
     fn: "sum",
     arg: X,
@@ -994,21 +1026,39 @@ describe("window: growth charges the overlap (review B7-p2d-1 #5, governor rule 
     type: DBL,
   });
 
-  it("a streamed partition's ring", async () => {
-    // ROWS 20000 PRECEDING keeps 20,001 rows: the ring grows 16,384 → 32,768.
-    const rows = generateRows(mulberry32(0x77), 30_000, 1).map((row): Row => [0, ...row.slice(1)]);
-    const spec: WindowSpec = {
-      types: TYPES,
-      partitionBy: [P],
-      orderBy: [{ column: ID, direction: "asc", nulls: "last", collation: null }],
-      functions: [sum(20_000)],
-      streamRows: 64,
-    };
-    const perRow = 4 + 9 + 1 * (8 + 1 + 8 + 8 + 8);
-    const sizes = await allocations(spec, rows, false);
-    expect(sizes).toContain(32_768 * perRow);
-    expect(sizes).toContain(16_384 * perRow);
-  }, 120_000);
+  for (const { rows: count, state } of WINDOW_RING_GROWTH_CASES)
+    it(`a streamed partition's ring (${String(count)} rows)`, async () => {
+      // Keep the original seed, 30k-row history and 20k lookback. A singleton frame still
+      // retains the ring's rows but avoids re-adding 20,001 floats per output under V8 coverage.
+      const rows = generateRows(mulberry32(0x77), count, 1).map((row): Row => [0, ...row.slice(1)]);
+      const reach = createReach(`ring ${String(count)}`, [state]);
+      reach.beginHistory();
+      const call = sum(20_000);
+      const spec: WindowSpec = {
+        types: TYPES,
+        partitionBy: [P],
+        orderBy: [{ column: ID, direction: "asc", nulls: "last", collation: null }],
+        functions: [
+          {
+            ...call,
+            frame: {
+              unit: "rows",
+              start: { kind: "preceding", offset: 20_000 },
+              exclude: "no-others",
+              end: { kind: "preceding", offset: 20_000 },
+            },
+          },
+        ],
+        streamRows: 64,
+      };
+      const perRow = 4 + 9 + 1 * (8 + 1 + 8 + 8 + 8);
+      const sizes = await allocations(spec, rows);
+      expect(sizes).toContain(16_384 * perRow);
+      if (count > 16_384) expect(sizes).toContain(32_768 * perRow);
+      else expect(sizes).not.toContain(32_768 * perRow);
+      reach.reach(state);
+      reach.assertReached();
+    }, 120_000);
 
   it("a resident partition's scratch", async () => {
     // Partitions of 3,000 then 10,000 rows: the scratch grows from 3,000 to 10,000 rows.

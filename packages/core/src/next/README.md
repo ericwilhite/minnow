@@ -3522,3 +3522,15 @@ Larger resident peer arrays retain their ordinary-credit growth and copy-overlap
 `window-peer-pressure.test.ts` compares seeded structural-key results with PGlite while
 a competitor holds all remaining credit; `window-emit-peak.test.ts` checks fitting-step
 peaks against the parent accounting model, including allocations on the pool boundary.
+
+### Coverage-bounded streamed ring checks
+
+The ring-growth allocation test uses independent 16,383-, 16,384-, 16,385- and
+30,000-row bodies with the original 0x77 fixture seed. A singleton SUM frame
+20,000 rows behind the current row preserves the 16,384-to-32,768 growth boundary
+without repeatedly adding a 20,001-value frame under V8 coverage. Each result is
+checked against the existing window oracle. Moving float SUM arithmetic remains
+covered by the generated window campaigns and the PGlite adversarial-float cases.
+Allocation observers belong to individual grants, so an abandoned history cannot
+observe or restore another history's method. No production deadline or coverage
+floor changes.

@@ -4749,3 +4749,11 @@ export const WINDOW_PEER_PRESSURE_REACH = [
   "all credit occupied",
   "unpressured",
 ] as const;
+
+/** Independent histories retain the streamed ring's exact capacity boundary under coverage. */
+export const WINDOW_RING_GROWTH_CASES = [
+  { rows: 16_383, state: "below 16384 rows" },
+  { rows: 16_384, state: "at 16384 rows" },
+  { rows: 16_385, state: "above 16384 rows" },
+  { rows: 30_000, state: "original 30000-row partition" },
+] as const;
