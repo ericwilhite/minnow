@@ -1331,6 +1331,32 @@ and the owner import it directly.
 - A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable
   operator works inside its admitted minimum.
 - Growth is charged before it happens, including the overlap while a buffer is copied.
+- Aggregate input packing carries each proven parameter/column binding once through
+  hash tables and spill rows, then restores logical key positions after aggregation.
+  Identity casts and structurally identical CASE/COALESCE/NULLIF over those bindings
+  can share storage; the original producer still evaluates every expression in order.
+  Other computed values, typmod casts and GROUPING SETS retain their original layout.
+  Restore steps over known byte/native scalar layouts with fixed-width transitions
+  share one admitted peak: decoded input
+  pages, output row, and one retained group key. Unused feed room is returned before
+  merge/capture; per-helper limits do not replicate that peak. Wide pooled records
+  use the existing value comparator, without a normalized byte-key sidecar. Variable
+  transitions, parsed operands, and unknown widths retain their independent recipes.
+- Aggregate progress follows each borrowing lane's complete physical row layout. The hash wrapper and
+  fixed COUNT transitions do not reserve unused sort lanes. Conditional outputs use the largest
+  reachable branch: COALESCE stops at a proven non-null constant, and its alternatives are never
+  summed. Owned parameter bounds survive pressure checkpoints without rereading caller buffers.
+  External transition/capture helpers share their sizing function with admission: their total
+  pool peak is max(fixed minimum, 32 KiB + four times the largest value); the progress lane
+  funds only its deficit above that fixed minimum. DISTINCT's value and
+  ordinal sorts keep the merge-row recipe, using the same `sortMergeWorkspaceBytes` function
+  as the runtime sorter. Slot assignment uses the same DISTINCT predicate
+  as construction, so redundant TEXT MIN/MAX DISTINCT never shifts a later helper's credit.
+  Restored byte extrema measure the decoded value they copy; encoded framing stays funded
+  by the host I/O lane and is not counted as additional retained value.
+  Spill staging reserves the complete row/page overlap even when an unsuccessful append has
+  already grown some column buffers. The generated no-pressure campaign compares fitting plans'
+  peaks with the pre-change admission policy, including caps just above the parent's peak.
 - Caches are evicted before anything spills. Several may register (the space's page cache, the
   decoded directory and metadata caches, the inflated-page cache); eviction takes the entry unused
   longest across all of them (`oldestUnusedAt`).

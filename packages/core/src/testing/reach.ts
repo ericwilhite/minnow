@@ -5410,3 +5410,119 @@ export const WINDOW_RING_GROWTH_CASES = [
   { rows: 16_385, state: "above 16384 rows" },
   { rows: 30_000, state: "original 30000-row partition" },
 ] as const;
+
+export const AGG_WIDE_PROGRESS_REACH = [
+  "repeated parameter",
+  "distinct parameters",
+  "UTF8 widths",
+  "ASCII widths",
+  "pinned ordinary room",
+  "bounded sort loan",
+  "PG exact",
+  "partial staged row",
+  "cancelled loan",
+] as const;
+
+export const AGG_ADMISSION_PEAK_REACH = [
+  "distinct",
+  "one key",
+  "sixteen keys",
+  "eight key witness",
+  "twelve key witness",
+  "short",
+  "null-prefix",
+  "direct",
+  "max",
+  "case",
+  "nullif",
+  "UTF8",
+  "ASCII",
+  "near parent peak",
+  "32MiB short witness",
+  "64MiB restore witness",
+  "PG exact",
+  "peak no higher",
+  "zero",
+  "nested",
+  "nullable-max",
+  "max not sum",
+  "small output lane",
+] as const;
+
+export const AGG_STEP_PEAK_REACH = [
+  "raw restore pages",
+  "saved prefix",
+  "distinct keys",
+  "repeated keys",
+  "repinned after admission",
+  "restore",
+  "shared peak",
+  "trim live key",
+  "cancel live key",
+  "PG exact",
+  "UTF8",
+  "ASCII",
+  "one logical wide key",
+  "sixteen logical keys",
+  "zero",
+] as const;
+
+export const AGG_PACKED_BINDINGS_REACH = [
+  "computed key",
+  "logical aliases",
+  "distinct params",
+  "typmod preserved",
+  "nulls",
+  "remapped arguments",
+  "PG exact",
+] as const;
+
+export const AGG_COLUMN_PROGRESS_REACH = [
+  "one key",
+  "sixteen keys",
+  "NULL",
+  "ASCII",
+  "UTF8",
+  "pinned",
+  "PG exact",
+  "zero",
+] as const;
+
+export const AGG_CALL_PROGRESS_REACH = [
+  "max",
+  "min",
+  "omitted extrema DISTINCT",
+  "wide extrema DISTINCT",
+  "preceding DISTINCT",
+  "following DISTINCT",
+  "wide DISTINCT",
+  "ASCII",
+  "UTF8",
+  "pinned competitor",
+  "transition loan",
+  "PG exact",
+  "cancelled",
+] as const;
+
+export const AGG_CALL_PREFIX_REACH = [
+  "MIN",
+  "MAX",
+  "ASCII",
+  "UTF8",
+  "nonempty saved value",
+  "encoded framing excluded",
+  "one exact loan",
+  "PG suffix exact",
+  "zero charges",
+] as const;
+
+export const AGG_SORT_WORKSPACE_REACH = [
+  "value sort",
+  "ordinal sort",
+  "exact arena",
+  "rounded arena",
+  "page output",
+  "arena output",
+  "owner correction propagated",
+  "metadata retained",
+] as const;

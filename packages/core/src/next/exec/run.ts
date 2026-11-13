@@ -38,6 +38,11 @@ import { ReadStep } from "./read-step.js";
 import { admitWorkingSet } from "../memory/working-set.js";
 import { MAX_BLOB_BYTES } from "../access/space.js";
 import { StepLoans } from "../memory/step-loans.js";
+import {
+  aggregateLaneBytes,
+  aggregateSharedBytes,
+  type AggregateProgressLayout,
+} from "./agg/parameter-copies.js";
 import type { ReadBound } from "../page/read-bounds.js";
 
 /** A set/join transition can retain an encoded key, its hash copy and a
@@ -322,6 +327,15 @@ export class QueryRuntime {
   operatorLiteralProgress(bytes: number): void {
     this.#operatorLiteralBytes = bytes;
   }
+  #aggregateLanes = new Map<
+    number,
+    { kind: "hybrid" | "external" | "restore"; layout: AggregateProgressLayout }
+  >();
+  #parameterSlotBytes: readonly number[] | undefined;
+  #sharedAggregateSteps = new Set<number>();
+  aggregateSharedStep(rel: OperatorIdentity): boolean {
+    return this.#sharedAggregateSteps.has(rel.id);
+  }
   /** Complete variable-output envelope; ordinary project/filter leave it at zero. */
   progressEnvelope(bytes: number, multiplicity = 1, sourceMultiplicity = multiplicity): void {
     this.#expressionProgress = bytes;
@@ -419,6 +433,30 @@ export class QueryRuntime {
   ): void {
     this.#columnProgress.set(id, bound);
   }
+  aggregateProgress(id: number, kind: string, layout: AggregateProgressLayout): void {
+    if (kind === "hybrid" || kind === "external" || kind === "restore")
+      this.#aggregateLanes.set(id, { kind, layout });
+    else this.#aggregateLanes.delete(id);
+  }
+  #laneBytes(
+    rel: OperatorIdentity,
+    slot: number | undefined,
+    baseline: number,
+    slots: readonly number[] | undefined = this.#parameterSlotBytes,
+    largest = 0,
+    minimum = 0,
+  ): number {
+    if (slot === undefined && rel.op === "aggregate" && this.#helperOnlyProgress.has(rel.id))
+      return 0;
+    const recipe = this.#aggregateLanes.get(rel.id);
+    const ordinary = recipe
+      ? aggregateLaneBytes(recipe.layout, recipe.kind, slot, baseline, slots)
+      : baseline;
+    return Math.max(
+      ordinary,
+      this.#groupKeyProgress?.(rel.id, slot, slots ?? [], largest, minimum, baseline) ?? 0,
+    );
+  }
   operatorStep(rel: OperatorIdentity): number {
     return this.#operatorProgress.get(rel.id) ?? 0;
   }
@@ -433,36 +471,19 @@ export class QueryRuntime {
       return inputs + entries.reduce((sum, entry) => sum + entry.minimum, 0);
     let protectedBytes = 0;
     for (const entry of entries) {
-      const progress = this.#operatorStepBytes(entry.rel, inputs, largestInput, slots);
-      if (!(
+      const canBorrow =
         (entry.loanSlots ?? 0) > 0 ||
-        ["sort", "aggregate", "join", "window", "setOp"].includes(entry.rel.op)
-      ))
-        continue;
-      if (entry.rel.op !== "aggregate" || !this.#helperOnlyProgress.has(entry.rel.id))
-        protectedBytes += Math.max(
-          progress,
-          this.#groupKeyProgress?.(
-            entry.rel.id,
-            undefined,
-            slots,
-            largestInput,
-            entry.minimum,
-            progress,
-          ) ?? 0,
-        );
-      for (let slot = 0; slot < (entry.loanSlots ?? 0); slot++)
-        protectedBytes += Math.max(
-          progress,
-          this.#groupKeyProgress?.(
-            entry.rel.id,
-            slot,
-            slots,
-            largestInput,
-            entry.minimum,
-            progress,
-          ) ?? 0,
-        );
+        ["sort", "aggregate", "join", "window", "setOp"].includes(entry.rel.op);
+      if (!canBorrow) continue;
+      const progress = this.#operatorStepBytes(entry.rel, inputs, largestInput, slots);
+      const lanes = Array.from({ length: entry.loanSlots ?? 0 }, (_, slot) =>
+        this.#laneBytes(entry.rel, slot, progress, slots, largestInput, entry.minimum),
+      );
+      const recipe = this.#aggregateLanes.get(entry.rel.id);
+      const shared = recipe ? aggregateSharedBytes(recipe.layout, recipe.kind, slots, lanes) : null;
+      protectedBytes +=
+        this.#laneBytes(entry.rel, undefined, progress, slots, largestInput, entry.minimum) +
+        (shared ?? lanes.reduce((sum, bytes) => sum + bytes, 0));
     }
     return (
       inputs +
@@ -548,6 +569,7 @@ export class QueryRuntime {
     binding: ParameterBinding,
     idleCredit?: Grant,
   ): MaybePromise<void> {
+    this.#parameterSlotBytes = binding.slotBytes;
     const atomic = this.#atomicResult !== null;
     const progress = (rel: OperatorIdentity) =>
       atomic
@@ -609,32 +631,52 @@ export class QueryRuntime {
       : null;
     const key = (entry: Reservation) =>
       `${entry.rel.op}#${String(entry.rel.id)}${entry.loanSlot === undefined ? "" : `/loan/${String(entry.loanSlot)}`}`;
-    const operators = entries.map((entry) => ({
-      entry,
-      base: add(`${key(entry)}/minimum`, entry.minimum),
-      progress: add(
-        `${key(entry)}/progress`,
-        canBorrow(entry.rel) &&
-          !(
-            entry.loanSlot === undefined &&
-            entry.rel.op === "aggregate" &&
-            this.#helperOnlyProgress.has(entry.rel.id)
+    const sharedParts = new Map<number, number>();
+    for (const entry of entries) {
+      if (entry.loanSlot !== undefined) continue;
+      const recipe = this.#aggregateLanes.get(entry.rel.id);
+      if (!recipe) continue;
+      const baseline = this.#operatorProgress.get(entry.rel.id) ?? 0;
+      const lanes = entries
+        .filter((e) => e.rel.id === entry.rel.id && e.loanSlot !== undefined)
+        .map((e) =>
+          this.#laneBytes(
+            e.rel,
+            e.loanSlot,
+            baseline,
+            binding.slotBytes,
+            binding.largestSlot,
+            e.minimum,
+          ),
+        );
+      const peak = aggregateSharedBytes(
+        recipe.layout,
+        recipe.kind,
+        this.#parameterSlotBytes,
+        lanes,
+      );
+      if (peak !== null) sharedParts.set(entry.rel.id, add(`${key(entry)}/step-peak`, peak));
+    }
+    this.#sharedAggregateSteps = new Set(sharedParts.keys());
+    const operators = entries.map((entry) => {
+      const capacity = canBorrow(entry.rel)
+        ? this.#laneBytes(
+            entry.rel,
+            entry.loanSlot,
+            this.#operatorProgress.get(entry.rel.id) ?? 0,
+            binding.slotBytes,
+            binding.largestSlot,
+            entry.minimum,
           )
-          ? Math.max(
-              progress(entry.rel),
-              this.#groupKeyProgress?.(
-                entry.rel.id,
-                entry.loanSlot,
-                binding.slotBytes ?? [],
-                binding.largestSlot,
-                entry.minimum,
-                progress(entry.rel),
-              ) ?? 0,
-            )
-          : 0,
-      ),
-      extra: add(`${key(entry)}/growth`, 0, true),
-    }));
+        : 0;
+      return {
+        entry,
+        capacity,
+        base: add(`${key(entry)}/minimum`, entry.minimum),
+        progress: add(`${key(entry)}/progress`, sharedParts.has(entry.rel.id) ? 0 : capacity),
+        extra: add(`${key(entry)}/growth`, 0, true),
+      };
+    });
     const started = performance.now();
     const admitted = admitWorkingSet(this.request.governor, {
       label: `${prefix}/fixed-buffers`,
@@ -661,18 +703,35 @@ export class QueryRuntime {
         if (!grant) throw new TypeError("missing native minimum part");
         return grant;
       };
-      const phase = (base: number, extra: number, extraProgress: number, bounded: boolean) => {
+      const sharedUses = new Map<number, number>();
+      const phase = (
+        base: number,
+        extra: number,
+        extraProgress: number,
+        bounded: boolean,
+        shared?: { index: number; capacity: number },
+      ) => {
         const fixed = at(base),
           growth = at(extra),
-          lane = at(extraProgress);
-        const capacity = parts[extraProgress]?.minimumBytes ?? 0;
+          lane = at(shared?.index ?? extraProgress);
+        const capacity = shared?.capacity ?? parts[extraProgress]?.minimumBytes ?? 0;
+        // Installation is synchronous. Count constructed owners, so an interrupted
+        // install cannot leave references for helpers that were never created.
+        if (shared) sharedUses.set(shared.index, (sharedUses.get(shared.index) ?? 0) + 1);
         const share = new ReservedGrant(
           fixed,
           growth,
           parts[base]?.minimumBytes ?? 0,
-          atomic ? new StepLoans(lane, capacity, lane.label) : null,
+          atomic ? new StepLoans(lane, capacity, parts[extraProgress]?.label ?? lane.label) : null,
           bounded,
-          () => lane.close(),
+          () => {
+            if (shared) {
+              const left = (sharedUses.get(shared.index) ?? 1) - 1;
+              sharedUses.set(shared.index, left);
+              if (left > 0) return;
+            }
+            lane.close();
+          },
           true,
         );
         this.#phaseParts.set(share, lane);
@@ -700,8 +759,15 @@ export class QueryRuntime {
       this.dispose(() => parameterGrant.close());
       const attach = (slots: ParameterSlots) => {
         this.params.slots = slots.slots;
-        for (const { entry, base, progress: lane, extra } of operators) {
-          const share = phase(base, extra, lane, this.#readBounds.has(entry.rel.id));
+        for (const { entry, base, progress: lane, extra, capacity } of operators) {
+          const sharedIndex = sharedParts.get(entry.rel.id);
+          const share = phase(
+            base,
+            extra,
+            lane,
+            this.#readBounds.has(entry.rel.id),
+            sharedIndex === undefined ? undefined : { index: sharedIndex, capacity },
+          );
           this.#meter(share, entry.rel, false);
           this.#reserved.set(key(entry), share);
           this.dispose(() => share.close());

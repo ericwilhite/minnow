@@ -59,6 +59,7 @@ export class Pool implements ByteCharge {
   #consumed = false;
   #steps = 0;
   #pins = 0;
+  #trimmed = 0;
   loans = 0;
   largestLoan = 0;
   constructor(
@@ -144,8 +145,17 @@ export class Pool implements ByteCharge {
       this.#beginStep(shortfall);
       return;
     }
-    if (this.#loan !== null)
+    if (this.#loan !== null) {
+      // trimStep returned unused backing, not the active loan's ownership. Refill
+      // that same prepaid step without a second borrow or any new admission.
+      if (shortfall <= this.#trimmed && this.charge.allocate(shortfall)) {
+        this.#trimmed -= shortfall;
+        this.#size += shortfall;
+        this.#beginStep(shortfall);
+        return;
+      }
       throw new RangeError("A join step needed a second progress loan before repaying its first");
+    }
     const loan = await grant.borrow(shortfall, signal);
     this.loans++;
     this.largestLoan = Math.max(this.largestLoan, shortfall);
@@ -156,6 +166,12 @@ export class Pool implements ByteCharge {
     this.#loan = loan;
     this.#size += shortfall;
     this.#beginStep(shortfall);
+  }
+
+  /** Prepare a complete pool step. Ordinary overflow is independently funded: it
+   * cannot subtract from this backing, or freeing it would require a second loan. */
+  prepareStep(bytes: number, grant: Grant, signal?: AbortSignal): Promise<void> {
+    return this.need(Math.max(0, bytes - this.#used), grant, signal, true);
   }
 
   #beginStep(extra: number): void {
@@ -203,9 +219,32 @@ export class Pool implements ByteCharge {
     this.charge.free(this.#extra);
     this.#size -= this.#extra;
     this.#extra = 0;
+    this.#trimmed = 0;
     const loan = this.#loan;
     this.#loan = null;
     loan?.repay();
+  }
+
+  /** Return unused temporary backing at an explicit phase boundary. Live buffers and
+   * the one-loan ownership fence remain; another helper may use only the returned bytes. */
+  trimStep(): void {
+    if (this.#steps !== 0 || this.#pins !== 0) throw new Error("Cannot trim a pinned spill step");
+    const unused = Math.min(
+      this.#extra,
+      Math.max(0, this.#size - Math.max(this.#base, this.#used)),
+    );
+    if (unused > 0) {
+      this.charge.free(unused);
+      this.#size -= unused;
+      this.#extra -= unused;
+      if (this.#loan !== null) this.#trimmed += unused;
+    }
+    if (this.#extra === 0) {
+      this.#trimmed = 0;
+      const loan = this.#loan;
+      this.#loan = null;
+      loan?.repay();
+    }
   }
 
   close(): void {
@@ -214,6 +253,7 @@ export class Pool implements ByteCharge {
     this.charge.free(this.#size);
     this.#size = this.#base;
     this.#pins = 0;
+    this.#trimmed = 0;
     this.#extra = 0;
     this.#consumed = false;
     this.#loan = null;
@@ -440,11 +480,20 @@ export class SpillIo {
       // goes out as a page of its own before the next step.
       // The step is the row and the page it becomes: room for both at once.
       const rowBytes = staging.appendNeed(vectors, row);
-      await this.need(2 * rowBytes + 64 * 1024);
-      const one = staging.append(vectors, ids, from + done, 1);
-      if (one === 0) throw new RangeError("A spill staging row could not be allocated");
-      done += one;
-      await this.flush(staging, run, header);
+      // A failed append may already have grown some columns. appendNeed is the
+      // REMAINING growth, while the encoded page still contains the complete row.
+      // Existing retention + remaining growth bounds that page; retain overlap
+      // until both the row and page have left, even across internal arena frees.
+      const release = this.pool.pinStep();
+      try {
+        await this.need(staging.retainedBytes + 2 * rowBytes + 64 * 1024);
+        const one = staging.append(vectors, ids, from + done, 1);
+        if (one === 0) throw new RangeError("A spill staging row could not be allocated");
+        done += one;
+        await this.flush(staging, run, header);
+      } finally {
+        release();
+      }
     }
   }
 }

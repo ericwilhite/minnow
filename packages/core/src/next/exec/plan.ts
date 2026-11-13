@@ -29,6 +29,8 @@ import { Slice, runSliced, type SlicedJob } from "./slices.js";
 import type { MaybePromise } from "../access/key-index.js";
 import type { PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { ResultSink } from "./result-sink.js";
+import { aggregateProgressLayout } from "./agg/parameter-copies.js";
+import { packAggregateInputs } from "./agg/input-layout.js";
 import { outputCopyLayout } from "./output-copies.js";
 import {
   ExceptOperator,
@@ -518,6 +520,8 @@ function domainSource(rel: Extract<Rel, { op: "aggregate" }>) {
 }
 
 export interface CompileOptions {
+  /** False retains logical aggregate key copies for admission regression controls. */
+  readonly aggregateInputPacking?: boolean;
   /** False retains ordinary TEXT producers for star-join diagnostic controls. */
   readonly starDictionary?: boolean;
   /** Diagnostic control for bounded sole rank/row_number windows. */
@@ -554,6 +558,8 @@ export interface CompileOptions {
   readonly windowScalarArguments?: boolean;
 }
 export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): Program {
+  if (options.aggregateInputPacking !== false)
+    plan = { ...plan, root: packAggregateInputs(plan.root) };
   const windowBounds =
     options.windowTopK === false || plan.volatile
       ? new Map<number, number>()
@@ -1716,6 +1722,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                     context,
                     {
                       grant,
+                      sharedStep: runtime.aggregateSharedStep(rel),
                       loans: Array.from({ length: strategy.loans }, (_, slot) =>
                         runtime.loan(rel, slot),
                       ),
@@ -3117,6 +3124,11 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     const needsChoices = aggregatePlanners.size + percentilePlanners.size > 0;
     const execute = () =>
       then(needsChoices ? chooseAggregates() : undefined, () => {
+        for (const [id, strategy] of aggregateChoices.get(runtime) ?? []) {
+          const planner = aggregatePlanners.get(id);
+          if (planner)
+            runtime.aggregateProgress(id, strategy.kind, aggregateProgressLayout(planner.rel));
+        }
         if (
           ![...(aggregateChoices.get(runtime)?.values() ?? [])].some(
             (choice) => choice.kind === "hybrid",
@@ -3201,6 +3213,13 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 aggregate.minimum = restore.minimum;
                 aggregate.loanSlots = restore.loans;
                 aggregateChoices.get(runtime)?.set(cut.rel, restore);
+                const planner = aggregatePlanners.get(cut.rel);
+                if (planner)
+                  runtime.aggregateProgress(
+                    cut.rel,
+                    restore.kind,
+                    aggregateProgressLayout(planner.rel),
+                  );
               }
               semanticActive = remaining;
               configureJson(next, cut);
