@@ -5625,3 +5625,26 @@ export const JSON_GROUP_NESTED_PEAK_REACH = [
   "no peak rise",
   "zero resources",
 ] as const;
+
+/** New widths/container depths and NULL-group layouts, beyond frozen peak controls. */
+export const JSON_GROUP_NESTED_GENERATED_REACH = [
+  "one key",
+  "multiple keys",
+  "six keys",
+  "wide widths",
+  "narrow widths",
+  "shallow nesting",
+  "nested containers",
+  "deep nesting",
+  "SQL NULL groups",
+  "no NULL groups",
+  "multiple NULL groups",
+  "ASCII",
+  "UTF8",
+  "observed resident cache",
+  "decoded cache retired",
+  "unused growth returned",
+  "new random shape",
+  "exact PostgreSQL text",
+  "zero resources",
+] as const;
