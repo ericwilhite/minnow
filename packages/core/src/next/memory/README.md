@@ -414,3 +414,8 @@ selectors. Other variable producers retain their existing operator-specific prot
 certificate without proving its smallest step: if it cannot fit, checkpoint its evaluated
 values and release input pins before a cancellable atomic re-admission; never replay
 volatile evaluation or an already raised error. Current selector chains need no handoff.
+
+The receiving result sink also uses exact varlen growth for a one-row copied frame.
+Rounding that payload to the entire byte window would leave no room for its separately
+charged offsets and frame metadata, forcing an unnecessary progress loan under a pinned
+competitor. Multi-row frame sizing and complete admission envelopes are unchanged.

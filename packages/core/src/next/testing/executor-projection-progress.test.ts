@@ -40,7 +40,8 @@ it.each(seedsFor("next-projection-progress", [0xb7b1, 0xb7b2]))(
           fc.boolean(),
           fc.boolean(),
           fc.integer({ min: 0, max: 2 }),
-          async (shape, width, unicode, cancel, input) => {
+          fc.boolean(),
+          async (shape, width, unicode, cancel, input, direct) => {
             reach.beginHistory();
             history++;
             const value =
@@ -157,7 +158,9 @@ it.each(seedsFor("next-projection-progress", [0xb7b1, 0xb7b2]))(
                 shape === 2
                   ? `(SELECT a,i FROM projection_values WHERE h=${String(history)})src`
                   : "(SELECT $1::text a,i FROM generate_series(1,2)g(i))src";
-              const sql = `SELECT count(*) n FROM (SELECT ${expression} k FROM ${source})q GROUP BY k`;
+              const sql = direct
+                ? `SELECT ${expression} k FROM ${source}`
+                : `SELECT count(*) n FROM (SELECT ${expression} k FROM ${source})q GROUP BY k`;
               const args = shape === 2 ? [] : [value];
               if (cancel) {
                 await expect(core.execute(sql, args)).rejects.toMatchObject({ sqlState: "57014" });
@@ -174,6 +177,7 @@ it.each(seedsFor("next-projection-progress", [0xb7b1, 0xb7b2]))(
                 );
                 reach.reach(name);
                 reach.reach("PG exact");
+                if (direct && input === 0) reach.reach("wide result delivery");
                 if (input === 1) reach.reach("NULL input");
                 if (shape === 1 && input === 2) reach.reach("NULLIF equal");
               }
@@ -195,13 +199,15 @@ it.each(seedsFor("next-projection-progress", [0xb7b1, 0xb7b2]))(
           numRuns: 8,
           endOnFailure: true,
           examples: [
-            [0, 800000, false, false, 0],
-            [1, 800000, true, false, 0],
-            [2, 800000, false, false, 0],
-            [3, 800000, false, false, 0],
-            [0, 800000, false, true, 0],
-            [0, 800000, false, false, 1],
-            [1, 800000, false, false, 2],
+            [0, 800000, false, false, 0, false],
+            [1, 800000, true, false, 0, false],
+            [2, 800000, false, false, 0, false],
+            [3, 800000, false, false, 0, false],
+            [0, 800000, false, true, 0, false],
+            [0, 800000, false, false, 1, false],
+            [1, 800000, false, false, 2, false],
+            [0, 800000, false, false, 0, true],
+            [2, 800000, true, false, 0, true],
           ],
         },
       );

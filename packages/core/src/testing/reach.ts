@@ -5528,6 +5528,7 @@ export const AGG_SORT_WORKSPACE_REACH = [
 ] as const;
 
 export const PROJECTION_PROGRESS_REACH = [
+  "wide result delivery",
   "NULL input",
   "NULLIF equal",
   "CASE",
@@ -5542,6 +5543,8 @@ export const PROJECTION_PROGRESS_REACH = [
 ] as const;
 
 export const PROJECTION_SPLIT_REACH = [
+  "adaptive to ordinary",
+  "multi-row prefix",
   "dense",
   "sparse",
   "exact values",

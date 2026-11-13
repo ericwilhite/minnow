@@ -24,7 +24,8 @@ it.each(seedsFor("projection-split", [0xb7b3, 0xb7b4]))(
         fc.boolean(),
         fc.boolean(),
         fc.boolean(),
-        async (width, sparse, cancel, error) => {
+        fc.boolean(),
+        async (width, sparse, cancel, error, funded) => {
           reach.beginHistory();
           const governor = new Governor(16 << 20);
           const grant = await governor.admit({
@@ -62,7 +63,8 @@ it.each(seedsFor("projection-split", [0xb7b3, 0xb7b4]))(
                 for (let k = 0; k < n; k++) {
                   const row = rows?.rows[k] ?? k;
                   counts[row] = (counts[row] ?? 0) + 1;
-                  if (error && row === (sparse ? 3 : 1)) throw new Error("one data error");
+                  if (error && !cancel && row === (sparse ? 3 : 1))
+                    throw new Error("one data error");
                 }
                 return node.evaluate(b, rows);
               },
@@ -70,6 +72,10 @@ it.each(seedsFor("projection-split", [0xb7b3, 0xb7b4]))(
           });
           let released = 0,
             pushes = 0;
+          let ordinary = false,
+            holdNext = false,
+            releaseExpected = 0;
+          let releaseNext: () => void = () => undefined;
           const actual: unknown[] = [];
           let fail: (reason: unknown) => void = () => undefined;
           let operator: ProjectOperator | undefined;
@@ -80,10 +86,17 @@ it.each(seedsFor("projection-split", [0xb7b3, 0xb7b4]))(
               const vector = b.columns[0];
               if (!vector) throw new Error("Missing borrowed output");
               const before = valueAt(vector, first);
-              actual.push(before);
-              expect(released).toBe(0);
+              const active = b.selection?.count ?? b.length;
+              for (let k = 0; k < active; k++)
+                actual.push(valueAt(vector, b.selection?.rows[k] ?? k));
+              if (active > 1) reach.reach("multi-row prefix");
+              expect(released).toBe(releaseExpected);
               const wait = new Promise<void>((resolve, reject) => {
                 fail = reject;
+                if (holdNext) {
+                  releaseNext = resolve;
+                  return;
+                }
                 queueMicrotask(() => {
                   try {
                     expect(valueAt(vector, first)).toEqual(before);
@@ -109,11 +122,25 @@ it.each(seedsFor("projection-split", [0xb7b3, 0xb7b4]))(
               [expr],
               { arena, params: { slots: [] }, input: [BOOL, TEXT] },
               sink,
-              { available: () => 0, signal: abort.signal },
+              {
+                available: () =>
+                  ordinary
+                    ? grant.held -
+                      grant.allocated +
+                      governor.capBytes -
+                      governor.reserveBytes -
+                      governor.usedBytes
+                    : funded
+                      ? grant.held - grant.allocated
+                      : 0,
+                signal: abort.signal,
+              },
             );
             mock.mockRestore();
             grant.release(grant.held - grant.allocated);
             const fixed = grant.allocated;
+            const stepCredit = funded ? 4 * (width + 1) : 0;
+            if (stepCredit) expect(grant.tryGrow(stepCredit)).toBe(true);
             expect(
               competitor.allocate(governor.capBytes - governor.reserveBytes - governor.usedBytes),
             ).toBe(true);
@@ -126,18 +153,47 @@ it.each(seedsFor("projection-split", [0xb7b3, 0xb7b4]))(
               await operator.ready();
               const rows = batch.selection ? [...batch.selection.rows] : [0, 1, 2, 3, 4, 5, 6, 7];
               expect(actual).toEqual(rows.map((r) => values[r]));
-              expect(pushes).toBe(rows.length);
+              expect(pushes).toBeLessThanOrEqual(rows.length);
+              if (!funded) expect(pushes).toBe(rows.length);
               reach.reach("exact values");
             }
             expect([...counts].every((n) => n <= 1)).toBe(true);
             expect(released).toBe(1);
-            expect(grant.allocated).toBe(fixed);
+            expect(grant.allocated - fixed).toBeLessThanOrEqual(stepCredit);
+            if (!funded) {
+              expect(grant.allocated).toBe(fixed);
+              reach.reach("no payload allocation");
+            }
             reach.reach("one evaluation");
             reach.reach("no payload allocation");
             reach.reach("held borrow");
             reach.reach(sparse ? "sparse" : "dense");
             if (cancel) reach.reach("cancel wait");
             else if (error) reach.reach("error once");
+            else {
+              // A following funded batch must wait on ITS borrow, not an already settled
+              // readiness promise left over from the adaptive prefix loop.
+              ordinary = true;
+              holdNext = true;
+              releaseExpected = 1;
+              competitor.close();
+              counts.fill(0);
+              expect(operator.push(batch, { release: () => released++ })).toBe("blocked");
+              let settled = false;
+              const next = operator.ready().then(() => {
+                settled = true;
+              });
+              await Promise.resolve();
+              await Promise.resolve();
+              expect(settled).toBe(false);
+              expect(released).toBe(1);
+              releaseNext();
+              await next;
+              expect(released).toBe(2);
+              const active = batch.selection ? [...batch.selection.rows] : [0, 1, 2, 3, 4, 5, 6, 7];
+              expect(active.every((row) => counts[row] === 1)).toBe(true);
+              reach.reach("adaptive to ordinary");
+            }
           } finally {
             mock.mockRestore();
             abort.signal.removeEventListener("abort", onAbort);
@@ -155,10 +211,11 @@ it.each(seedsFor("projection-split", [0xb7b3, 0xb7b4]))(
         numRuns: 12,
         endOnFailure: true,
         examples: [
-          [80000, false, false, false],
-          [80000, true, false, false],
-          [80000, false, true, false],
-          [80000, true, false, true],
+          [80000, false, false, false, false],
+          [80000, true, false, false, false],
+          [80000, false, true, false, false],
+          [80000, true, false, true, false],
+          [80000, false, false, false, true],
         ],
       },
     );
