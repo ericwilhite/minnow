@@ -8658,3 +8658,27 @@ export const REGISTRY_THREE_CHECKPOINT_REACH = [
   "fixed metadata",
   "zero ownership",
 ] as const;
+
+export const SNAPSHOT_LOAD_REACH = [
+  "interrupted prefix",
+  "old target intact",
+  "retry complete",
+  "native reopen",
+  "continued writes",
+  "quota safe",
+] as const;
+
+export const SNAPSHOT_LOAD_FAULT_REACH = [
+  "quota",
+  "before publication",
+  "after publication",
+  "cancel",
+] as const;
+
+export const SNAPSHOT_NATIVE_LAYOUT_REACH = [
+  "sparse nulls",
+  "all valid",
+  "all scalar and byte layouts",
+] as const;
+
+export const SNAPSHOT_LOAD_OPEN_REACH = ["wait until discard", "wait until publication"] as const;

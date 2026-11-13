@@ -195,6 +195,32 @@ export const DURABLE_EMISSIONS: Readonly<
     count: 1,
     kinds: ["ftsRoot", "ftsTerms", "ftsPostings", "ftsDocuments", "ftsDelta"],
   },
+  "write/snapshot-stage.ts:SnapshotStagedColumn.append:this.builder.append -> ExtentBuilder.append":
+    { count: 1, kinds: [] },
+  "write/snapshot-native.ts:SnapshotNativeBuilder.#append:builder.append -> ExtentBuilder.append": {
+    count: 1,
+    kinds: ["page", "pageDirectory", "largeValue", "arrayValue"],
+  },
+  "write/snapshot-native.ts:SnapshotNativeBuilder.group:this.writer.write -> ExtentWriter.write": {
+    count: 1,
+    kinds: ["groupRoot"],
+  },
+  "write/snapshot-load.ts:NativeTable.flush:this.writer.write -> ExtentWriter.write": {
+    count: 1,
+    kinds: ["groupPage"],
+  },
+  "write/snapshot-load.ts:NativeTable.finish:this.writer.write -> ExtentWriter.write": {
+    count: 2,
+    kinds: ["groupIndex", "tableStatistics"],
+  },
+  "write/snapshot-load.ts:loadSnapshot:writer.write -> ExtentWriter.write": {
+    count: 1,
+    kinds: ["catalog"],
+  },
+  "write/snapshot-load.ts:loadSnapshot:target.space.publish -> ExtentSpace.publish": {
+    count: 1,
+    kinds: ["manifest"],
+  },
   "format/snapshot.ts:SnapshotStreamWriter.#emit:this.sink.write -> SnapshotSink.write": {
     count: 1,
     kinds: ["snapshot", "snapshotFrame", "snapshotFooter", "snapshotColumn"],

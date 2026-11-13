@@ -4253,3 +4253,20 @@ Native command records keep independent accepted-row checkpoints for uniqueness,
 original follow-input preparation and reference checks. Completing one phase cannot
 suppress another phase or later writes on the same token. This is bookkeeping for
 the guarded provider; the follow preparation/action scheduler is not enabled here.
+
+`write/snapshot-load.ts` adds the internal stage3 native loader. Its target factory must hold
+an exclusive, recovered and settled owner with no active writer/maintenance, and report logical
+emptiness and the actual last LSN. Replacement is explicit. Header and catalog checks precede
+target acquisition. Verified portable bytes are staged in writer-owned extents, reconstructed
+as native chunks with common row boundaries, then discarded. Frames, row coordinates, parts,
+metadata descriptors and codecs are charged before allocation. A complete native root with a
+fresh log incarnation is published once, only after footer, CRCs, counts and physical EOF.
+An interrupted pre-publication load discards staging; retry starts from byte0. Publication
+rejection is indeterminate: close/reopen and inspect the native root, never free data it may
+reach. Old generations remain under the usual two-root/pin rules, and quota never truncates
+the old root/log to make room. Callers reopen the ordinary write path after publication.
+
+Stage3's internal catalog seam currently accepts native catalog bytes and explicitly refuses
+sequences, indexes/constraints and missing/backfill vectors pending portable catalog1/stage4.
+It is not a complete owner load command or a frozen portable format. No supported stored
+format changes, existing upgrade chain or public package API are introduced by this stage.
