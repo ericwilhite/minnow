@@ -10,6 +10,11 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported window executor funds its initial peer flags from existing prepaid emit
+workspace, avoiding a below-cap refusal under competing memory grants. Shared window
+buffers count only their uncovered overflow bytes; native minima are unchanged.
+No public API or stored-format change; no migration is needed.
+
 The unexported rebuild registers durable group deletion bitmaps under the enclosing group-page
 version. Reads now refuse wrong lengths or nonzero unused bits with a typed corruption error.
 The registry completeness check independently inventories persistence calls and durable
