@@ -9,6 +9,7 @@ import type { TaskWork } from "../task.js";
 import { ParseBudgetError, decodeGroupRoot } from "../format/manifest-codec.js";
 import { compareRunBound, runOutsideKeys } from "./run-bounds.js";
 import { hashKey } from "./key-hashes.js";
+import { GroupRead } from "../page/group-read.js";
 import { MemoryReads } from "./memory-read.js";
 import { planIndexRange } from "./range-plan.js";
 import { StreamingRangeCursor } from "./range-cursor.js";
@@ -45,6 +46,7 @@ import {
   type Snapshot,
   type TableReadOptions,
   type TableSnapshot,
+  type TableReadRecipe,
 } from "../access/snapshot.js";
 import type { ByteBudget, SpacePin } from "../access/space.js";
 import type {
@@ -60,7 +62,7 @@ import { packLocator } from "../vector/locator.js";
 import { allocateData } from "../vector/vector.js";
 import type { FlatVector, Selection } from "../vector/vector.js";
 import { compareBytes } from "../vector/varlen.js";
-import { MEMORY_CHUNK_ROWS } from "./columns.js";
+import { MEMORY_CHUNK_ROWS, type ColumnChunk as MemoryColumn } from "./columns.js";
 import type { GroupDirectory } from "./groups.js";
 import { groupRootOf, type Memtable } from "./memtable.js";
 import type { KeyDelta } from "./key-hash.js";
@@ -327,6 +329,32 @@ class MemorySegmentImpl implements MemorySegment {
   /** The chunk index the reader currently borrows (−1: none). */
   borrowed = -1;
   #reads: MemoryReads | null = null;
+  #retained: readonly MemoryColumn[] | null = null;
+
+  /** One existing owner-charged chunk. Never captures a flat view across append growth. */
+  retainResident(): (() => void) | null {
+    if (
+      this.rowCount < 1 ||
+      this.rowCount > MEMORY_CHUNK_ROWS ||
+      this.memtable.published !== null ||
+      this.#retained ||
+      this.memtable.columns.length !== this.view.columns.length ||
+      this.memtable.columns.some((column, index) => column.id !== this.view.columns[index]?.id)
+    )
+      return null;
+    const columns = this.memtable.chunks.map((list) => need(list[0]));
+    this.memtable.borrow(0, this.borrowed);
+    this.borrowed = 0;
+    this.#retained = columns;
+    return () => this.releaseResident();
+  }
+  releaseResident(): void {
+    if (this.#retained === null) return;
+    this.#retained = null;
+    this.#reads?.invalidateHints();
+    if (this.borrowed >= 0) this.memtable.unborrow(this.borrowed);
+    this.borrowed = -1;
+  }
 
   #bounded(): MemoryReads {
     return (this.#reads ??= new MemoryReads({
@@ -334,7 +362,11 @@ class MemorySegmentImpl implements MemorySegment {
       column: (id) => this.view.column(id),
       check: () => this.view.snapshot.check(),
       publishedRoot: () => need(this.memtable.published).group.root,
+      retained: (chunk) => chunk === 0 && this.#retained !== null,
       resident: (columnId, chunk) => {
+        const retained =
+          chunk === 0 ? this.#retained?.[this.view.columnIndex(columnId)] : undefined;
+        if (retained) return retained.view(this.rowCount);
         if (this.memtable.published !== null) return null;
         const stored = this.memtable.chunks[this.view.columnIndex(columnId)]?.[chunk];
         if (stored === undefined) throw new RangeError("A memtable chunk is missing");
@@ -615,6 +647,49 @@ export class TableSnapshotImpl implements TableSnapshot {
     this.#columnIndex = columnIndex(def);
   }
 
+  /** Admission fallback only: retain at most one native memory chunk. Other sources keep
+   * their existing publication-stable recipe. Query close and snapshot close both release it. */
+  prepareRead(): TableReadRecipe | null {
+    const segments = this.segments;
+    const segment = segments.length === 1 ? segments[0] : undefined;
+    if (!(segment instanceof MemorySegmentImpl)) return null;
+    const published = segment.memtable.published;
+    if (published !== null) {
+      // The stable source is stored already. Use the ordinary validated-root/group
+      // reader and its actual page recipe, not the memory re-point worst case.
+      const reader = new GroupRead(published.group.root, this.snapshot.pages, this.budget);
+      const group: GroupSegment = {
+        kind: "group",
+        index: segment.index,
+        rowCount: segment.rowCount,
+        staged: false,
+        get liveRowCount() {
+          return segment.liveRowCount;
+        },
+        group: published.group,
+        deletions: () => segment.deletions(),
+        root: () => reader.root(),
+        releaseRoot: () => reader.release(),
+        chunk: (id) => reader.chunk(id),
+        statistics: (id) => reader.chunk(id)?.statistics ?? null,
+        pages: (id) => reader.summaries(id),
+      };
+      const table: TableSnapshot = {
+        tableId: this.tableId,
+        schemaVersion: this.schemaVersion,
+        columns: this.columns,
+        get liveRowCount() {
+          return group.liveRowCount;
+        },
+        segments: [group],
+      };
+      return { table, close: () => reader.release() };
+    }
+    const close = segment.retainResident();
+    if (close === null) return null;
+    return { table: this, close };
+  }
+
   /** Built on first use (point reads and inserts never need them). */
   get segments(): readonly Segment[] {
     if (this.#segments === null) {
@@ -691,11 +766,13 @@ export class TableSnapshotImpl implements TableSnapshot {
   /** Ends every memory segment's borrow (the snapshot is released). */
   endBorrows(): void {
     if (this.#segments === null) return;
-    for (const segment of this.#segments)
+    for (const segment of this.#segments) {
+      if (segment instanceof MemorySegmentImpl) segment.releaseResident();
       if (segment instanceof MemorySegmentImpl && segment.borrowed >= 0) {
         segment.memtable.unborrow(segment.borrowed);
         segment.borrowed = -1;
       }
+    }
   }
 
   column(columnId: number): ColumnDef | undefined {

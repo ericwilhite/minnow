@@ -188,13 +188,15 @@ export class WriteCredits {
     this.#stop.abort(reason);
   }
 
-  close(): void {
+  /** Closing readers may inherit the existing row account, without re-admission/copying. */
+  close({ keepRowsForReaders = false }: { readonly keepRowsForReaders?: boolean } = {}): void {
     if (this.#closed) return;
     if (this.#mergeActive)
       throw new Error("Native write steps must settle before their accounts close");
     this.#closed = true;
     this.cancel(new GrantClosedError("write owner minimum"));
     this.signal?.removeEventListener("abort", this.#abort);
-    for (const grant of [this.rows, this.metadata, this.commits, this.merge]) grant.close();
+    for (const grant of [this.metadata, this.commits, this.merge]) grant.close();
+    if (!keepRowsForReaders) this.rows.close();
   }
 }

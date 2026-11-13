@@ -57,7 +57,9 @@
  *   decoded them (R5), never to the cache.
  * - **Memory.** Legacy `MemorySegment.chunk` borrows one `MEMORY_CHUNK_ROWS`-row chunk.
  *   Bounded calls first use `readHint` to size a publication-stable logical prefix, then fill
- *   caller-owned, precharged outputs. They never borrow a whole chunk or replace output buffers.
+ *   caller-owned, precharged outputs, without replacing output buffers. Ordinary hints do not
+ *   borrow a chunk. An explicit query-owned admission recipe may retain one existing chunk,
+ *   charged to the write owner, until that recipe closes.
  * - **Live rows.** `Segment.deletions()` gives the view's deletion vector; `liveRows` turns a
  *   position range into a selection. Deletion bitmaps of groups are blobs read through the cache.
  *
@@ -93,6 +95,10 @@
  *   be used after release (the executor's aborted pipeline never touches them again).
  * - After release every method throws `SnapshotReleasedError` (defined here; exec/fetch.ts uses
  *   it). Locators die with the pin.
+ * - Closing the write path stops writers, not caller-owned read pins. Existing pins retain
+ *   the native row account and resident storage until their release fence drains. No reader
+ *   may keep using vectors after it releases its pin; a query closes its source recipe after
+ *   native work settles, returning its chunk borrow before the pin itself is released.
  * - Memory: a pin costs O(1) owner heap; what it retains is the write path's, reported as debt
  *   (`WritePathStats`), and bounded as above. Buffers it hands out are immutable: never write to
  *   them.
@@ -170,6 +176,12 @@ export interface TableReadOptions {
   readonly budget: ByteBudget;
 }
 
+/** Query-owned admission recipe. Drain native reads, close it, then release the owner pin. */
+export interface TableReadRecipe {
+  readonly table: TableSnapshot;
+  close(): void;
+}
+
 export interface TableSnapshot {
   readonly tableId: number;
   /** The schema version this view reads the table under. */
@@ -183,6 +195,9 @@ export interface TableSnapshot {
   /** Export-only traversal: at most one temporary segment/root alive, released on advance/close.
    * Never materializes segments or pins metadata for the whole table. Missing means unsupported. */
   portableSegments?(work?: TaskWork): AsyncIterable<Segment>;
+  /** Optional admission retry. Existing owner-charged storage may stay resident through
+   * publication. It never changes visibility, and close releases the retention. */
+  prepareRead?(): TableReadRecipe | null;
 }
 
 export type Segment = GroupSegment | MemorySegment;
@@ -219,7 +234,8 @@ interface SegmentBase {
   pages(columnId: number): MaybePromise<readonly PageSummary[]>;
 }
 
-/** A durable (or the open transaction's staged) column group. */
+/** A durable/staged group, or an old memory snapshot's visible prefix of that group.
+ * The group ref/statistics cover all stored rows; rowCount bounds the visible prefix. */
 export interface GroupSegment extends SegmentBase {
   readonly kind: "group";
   readonly group: GroupRef;
@@ -260,6 +276,7 @@ export interface MemoryReadHint {
   readonly outputBytes: number;
   /** Prepared capacities and stable layouts, in request column order; no value payload. */
   readonly outputs: readonly MemoryOutputNeed[];
+  /** Query-owned reader state; an explicit retained input stays charged to its write owner. */
   readonly residentBytes: number;
   readonly scratchBytes: number;
   readonly ioBytes: number;

@@ -3319,7 +3319,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         for (const source of sources) {
           const bound = yield* readValue(
             boundSource(
-              runtime.view,
+              runtime.sourceView(),
               {
                 ...source,
                 windowBytes: windows ? source.windowBytes : 0,
@@ -3349,7 +3349,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 throw new Error("Missing join key source column");
               const row = yield* readValue(
                 boundSource(
-                  runtime.view,
+                  runtime.sourceView(),
                   {
                     ...source,
                     columns: [column],
@@ -3376,7 +3376,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               throw new Error("Missing semantic key column");
             const row = yield* readValue(
               boundSource(
-                runtime.view,
+                runtime.sourceView(),
                 {
                   ...source,
                   columns: [name],
@@ -3408,7 +3408,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             // sizing pass releases every grant before complete execution admission.
             const row = yield* readValue(
               boundSource(
-                runtime.view,
+                runtime.sourceView(),
                 { ...source, windowBytes: 0, rows: demand.get(source.id) ?? null },
                 runtime.request.governor,
                 runtime.signal,
@@ -3439,16 +3439,20 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             ? Math.max(progress, 4 * jsonConstants) * jsonProgressColumns
             : progress,
         );
-        if (
-          windows &&
-          runtime.minimumBytes(entries) > runtime.request.governor.capBytes &&
-          [...bounds.values()].some((bound) => bound.windowBytes > 0)
-        ) {
+        const overCap = runtime.minimumBytes(entries) > runtime.request.governor.capBytes;
+        if (windows && overCap && [...bounds.values()].some((bound) => bound.windowBytes > 0)) {
           // Coalesced export windows are optional. All sizing holds have ended: retry the
           // ordinary bounded batch before treating the execution minimum as over-cap.
           windows = false;
           continue;
         }
+        // Preserve an existing cheaper strategy before changing source retention.
+        if (
+          overCap &&
+          !(fallback !== null && aggregatePlanners.size === 0) &&
+          (yield* readValue(runtime.retryResidentSources(sources)))
+        )
+          continue;
         break;
       }
       if (
