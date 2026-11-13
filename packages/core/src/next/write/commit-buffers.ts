@@ -12,7 +12,7 @@ export const LOG_QUEUE_BYTES = 1024 * 1024;
 export interface BufferAllocator {
   create(bytes: number): Uint8Array;
   release(buffer: Uint8Array): void;
-  /** Non-buffer transient memory (the bounded JSON spelling of catalog metadata). */
+  /** Non-buffer transient codec memory (for example, request-count JSON spelling). */
   reserve?(bytes: number): () => void;
 }
 

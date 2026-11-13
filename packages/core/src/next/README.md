@@ -164,19 +164,37 @@ traversal is suspended keeps its source arrays charged until the last traversal 
 `write/key-hash-accounting.test.ts` intercepts native constructors independently of the
 charge callbacks and checks capacities, overlap, refusal, constructor failures and release.
 
+### Versioned catalog grammar
+
+`durable-format.ts` assigns MCAT1 logical records, MCRT1 native indexes, MCPG1 data pages and
+MCHG1 WAL changes. Required fields use registered numeric IDs; unknown required fields,
+features and versions refuse. Optional display extensions remain opaque through rewrites.
+Records retain exact typed vectors, decimal coefficients, bigint sequence settings and UTF8
+identifier boundaries. An individual record is capped at 4 MiB. Catalogs stream one admitted
+record at a time across 256 KiB pages and 64-way indexes, including records crossing pages.
+Read/abort/cancel paths return codec IO and temporary graph-validation charges. This does not
+claim new accounting for the existing CatalogView definition residency model.
+
+The manifest names the catalog tree, not a JSON blob. Reachability checks child depth and
+summaries plus contiguous fragment offsets, and reclamation retires every old index/data page.
+The reader/manifest/commit-body development selectors are 3/4/2; older unpublished selectors
+refuse. The released 1.0 format has no supported predecessor yet. Trigger/FTS families 20/21
+are reserved required work, not permission to execute inert definitions. Snapshot catalog frame
+adapters are a separate integration step over the same portable MCAT stream.
+
 ### Commit encoding under the cap
 
 Commit encoding has a separate, fixed 6 MiB minimum, admitted before the engine runs. It charges
 buffer capacities before allocation, counts old and new buffers during growth, and returns each
 ownership charge once. The bound includes reusable column/body writers, sequence scratch, frame
 and queue metadata, a joined append buffer, headers and bounded temporary codec objects. A small
-catalog's temporary JSON spelling is reserved before stringification. The queue's 1 MiB bound
+catalog change uses one preflighted exact MCAT record buffer, without JSON stringification. The queue's 1 MiB bound
 counts frame metadata as well as payload; its caller waits for the storage drain when full.
 
 Small commits retain the single-buffer codec while their body and estimated temporary workspace
 fit about 512 KiB. Staging remains the preferred path where eligible. Other large commits encode
-the same version-1 body through bounded byte windows into one existing multipart frame at a time.
-Neither body bytes, frame sizes/checksums, effect order nor the stored format change. A partial
+the same current-version body through bounded byte windows into one existing multipart frame at a time.
+Windowing preserves the frame envelope, row-column encoding and effect order. A partial
 multipart prefix never advances the appender's acknowledged transaction boundary; recovery drops
 it under the ordinary scanner's rules. This path streams directly and creates no spill files.
 Any future spill must use the owner's temporary spill service and remain outside recovery.

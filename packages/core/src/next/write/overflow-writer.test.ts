@@ -1,3 +1,4 @@
+import { MANIFEST_FORMAT_VERSION } from "../durable-format.js";
 /** Approved overflow format: complete keys survive bounded storage and ownership transfer. */
 import fc from "fast-check";
 import { afterAll, expect, it } from "vitest";
@@ -216,7 +217,7 @@ function encode(
       const blob = refs[0];
       if (!blob) throw new Error("missing fixture blob");
       const rootBytes = encodeManifestRoot({
-        formatVersion: 3,
+        formatVersion: MANIFEST_FORMAT_VERSION,
         sequence: 1,
         epoch: 1,
         log: { salt: 1, firstLsn: 1, rootSequence: 1 },

@@ -1,3 +1,15 @@
+import {
+  encodeCatalogStream,
+  decodeCatalogStream,
+  encodeCatalogChange,
+  type CatalogStreamData,
+} from "../write/catalog-stream.js";
+import {
+  encodeCatalogRoot,
+  decodeCatalogRoot,
+  encodeCatalogPage,
+  decodeCatalogPage,
+} from "../format/catalog-pages.js";
 /** Registry law: unknown durable identities/tags/reserved bits never mean empty or decoded data. */
 import fc from "fast-check";
 import {
@@ -82,7 +94,7 @@ import { DistinctSketch } from "../page/sketch.js";
 import { encodeBody, decodeBody } from "../write/body.js";
 import { encodeColumn, decodeColumn } from "../write/columns.js";
 import { Catalog, decodeLogged, encodeLogged } from "../write/catalog.js";
-import { encodeJson } from "../write/bytes.js";
+import { ByteReader } from "../write/bytes.js";
 import { encodeRun, runRef, RunReader, blockEntries } from "../write/runs.js";
 import { encodeArrayValue, decodeArrayValue } from "../vector/array-value.js";
 import type { FlatVector } from "../vector/vector.js";
@@ -506,6 +518,19 @@ function adapters(): Record<Exclude<DurableFormatName, "indexedDb">, Adapter> {
       bytes: encodeColumn(integer, 0, 2),
       decode: (bytes) => decodeColumn(bytes, integer.type),
     },
+    catalogRoot: {
+      bytes: encodeCatalogRoot({
+        depth: 0,
+        bytes: 1,
+        pages: 1,
+        children: [{ ref: blob, bytes: 1, pages: 1 }],
+      }),
+      decode: parsed(decodeCatalogRoot),
+    },
+    catalogPage: {
+      bytes: encodeCatalogPage({ offset: 0, data: new Uint8Array([1]) }),
+      decode: parsed(decodeCatalogPage),
+    },
     catalog: { bytes: Catalog.empty().encode(), decode: (bytes) => Catalog.decode(bytes) },
     catalogChange: { bytes: encodeLogged({ op: "dropTable", tableId: 1 }), decode: decodeLogged },
     ...overflowAdapters(),
@@ -605,7 +630,9 @@ for (const seed of seedsFor("next-durable-registry", [0xb221, 0xb222]))
               const field = DURABLE_FORMATS[parentName].fields.find((f) => f.name === "version");
               if (field === undefined) throw new Error(`Missing parent version: ${parentName}`);
               const bytes = parent.bytes.slice();
-              fieldValue(new DataView(bytes.buffer), field, unknown);
+              let future = unknown;
+              while ((field as FormatField).values?.includes(future)) future++;
+              fieldValue(new DataView(bytes.buffer), field, future);
               parent.repair?.(bytes);
               await refused(
                 {
@@ -757,7 +784,10 @@ for (const seed of seedsFor("next-durable-fields", [0xb223, 0xb224]))
           "array boolean",
         );
         reach.reach("array boolean");
-        const change = encodeJson({ op: `future-${String(unknown)}`, tableId: 1 });
+        const change = encodeCatalogChange({
+          op: `future-${String(unknown)}`,
+          tableId: 1,
+        } as unknown as Parameters<typeof encodeCatalogChange>[0]);
         await refused({ bytes: change, decode: decodeLogged }, change, "catalog operation");
         reach.reach("catalog operation");
         const run = adapters().runBlock.bytes.slice();
@@ -974,9 +1004,8 @@ for (const seed of seedsFor("next-durable-catalog", [0xb22b, 0xb22c]))
       },
       1,
     ).catalog;
-    const text = new TextDecoder().decode(source.encode());
     const clone = () =>
-      JSON.parse(text) as {
+      decodeCatalogStream(source.encode()) as unknown as {
         version: unknown;
         tables: Array<{
           columns: Array<{ type: { kind: string }; missing: unknown }>;
@@ -1010,7 +1039,21 @@ for (const seed of seedsFor("next-durable-catalog", [0xb22b, 0xb22c]))
           if (kind === "missing form") column.missing = { ...integer, length: 1, form: future };
           if (kind === "missing layout")
             column.missing = { ...integer, length: 1, data: { ...integer.data, layout: future } };
-          const bytes = encodeJson(data);
+          // Invalid scalar type has no writer representation: corrupt the version's TLV payload.
+          const bytes =
+            kind === "scalar number"
+              ? source.encode()
+              : encodeCatalogStream(data as unknown as CatalogStreamData);
+          if (kind === "scalar number") {
+            // MCAT header16, metadata kind/version/length, first tag/length, then u53 version.
+            const input = new ByteReader(bytes.subarray(16));
+            input.varuint();
+            input.varuint();
+            input.varuint();
+            input.varuint();
+            input.varuint();
+            bytes[16 + input.offset] = 0xff;
+          }
           await refused(
             { bytes, decode: (bytes) => Catalog.decode(bytes) },
             bytes,

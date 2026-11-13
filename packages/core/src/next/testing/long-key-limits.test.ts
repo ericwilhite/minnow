@@ -1,3 +1,8 @@
+import {
+  decodeCatalogStream,
+  encodeCatalogStream,
+  type CatalogStreamData,
+} from "../write/catalog-stream.js";
 /** Cutover capability authority is the shipped index-path policy, not PostgreSQL's btree cap. */
 import fc from "fast-check";
 import { afterAll, expect, it } from "vitest";
@@ -8,7 +13,7 @@ import { createReach, LONG_KEY_LIMIT_STATES } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { normalizeSqlDomainValue } from "../../engine/sql-domains.js";
 import { Catalog } from "../write/catalog.js";
-import { need, UNCHARGED, decodeJson, encodeJson } from "../write/bytes.js";
+import { need, UNCHARGED } from "../write/bytes.js";
 import {
   batch,
   column,
@@ -628,7 +633,7 @@ for (const seed of seedsFor("next-index-policy-corruption", [0xb519]))
             },
             1,
           ).catalog;
-          const data = decodeJson(catalog.encode()) as {
+          const data = decodeCatalogStream(catalog.encode()) as unknown as {
             tables: Array<{ indexes: Array<Record<string, unknown>> }>;
           };
           const index = need(data.tables[0]?.indexes[0]);
@@ -639,9 +644,9 @@ for (const seed of seedsFor("next-index-policy-corruption", [0xb519]))
             index.keyLimit = "scalar";
             index.columnIds = [1, 2];
           }
-          expect(() => Catalog.decode(encodeJson(data))).toThrow(
-            expect.objectContaining({ code: "MINNOW_STORE_CORRUPT" }),
-          );
+          expect(() =>
+            Catalog.decode(encodeCatalogStream(data as unknown as CatalogStreamData)),
+          ).toThrow(expect.objectContaining({ code: "MINNOW_STORE_CORRUPT" }));
           reach.reach("catalog policy corruption refusal");
         },
       ),

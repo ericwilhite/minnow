@@ -70,6 +70,14 @@ format change must preserve ordinary automatic open/load with frozen older-write
 continued writes and reopen, interruption/retry, corruption refusal, concurrent openers and
 older-writer refusal. Unreleased rebuild formats are not supported predecessors.
 
+The unexported rebuild gives catalogs their own versioned binary grammar. Catalog records keep
+stable field IDs and exact typed values. Native storage splits the logical stream across bounded,
+checksummed pages; the write-ahead log uses the same record definitions for catalog changes.
+Readers reject unknown required fields or versions with a typed error. Unknown optional display
+fields survive a read and rewrite. Catalog pages participate in ordinary reachability and reclamation.
+These are unreleased development formats, not a change to the published 0.x formats or a public
+snapshot API. Triggers and full-text search remain required work before the 1.0 format freeze.
+
 The remaining byte contracts on this page describe the existing 0.x engine.
 
 ## The block format has its own version

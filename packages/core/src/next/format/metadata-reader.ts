@@ -14,6 +14,12 @@
  *
  * It satisfies reachable.ts `ManifestReader` (bind a budget with `manifestReader`).
  */
+import {
+  decodeCatalogRoot,
+  decodeCatalogPage,
+  type CatalogRoot,
+  type CatalogPage,
+} from "./catalog-pages.js";
 import type { BlobRef, ByteBudget, ExtentReader } from "../storage/extents.js";
 import type { BlobCache } from "./blob-cache.js";
 import {
@@ -61,6 +67,13 @@ export class MetadataReader {
   constructor(space: ExtentReader, caches: MetadataCaches = {}) {
     this.#space = space;
     this.#caches = caches;
+  }
+
+  catalogRoot(ref: BlobRef, budget: ByteBudget): MaybePromise<Held<CatalogRoot>> {
+    return this.#read(ref, budget, decodeCatalogRoot, undefined);
+  }
+  catalogPage(ref: BlobRef, budget: ByteBudget): MaybePromise<Held<CatalogPage>> {
+    return this.#read(ref, budget, decodeCatalogPage, undefined);
   }
 
   groupRoot(ref: BlobRef, budget: ByteBudget): MaybePromise<Held<GroupRoot>> {
@@ -144,6 +157,8 @@ function held<T>(value: T, release: () => void): Held<T> {
 /** A `ManifestReader` (reachable.ts) over `reader`, charging `budget`. */
 export function manifestReader(reader: MetadataReader, budget: ByteBudget): ManifestReader {
   return {
+    catalogRoot: async (ref) => reader.catalogRoot(ref, budget),
+    catalogPage: async (ref) => reader.catalogPage(ref, budget),
     groupIndex: async (ref) => reader.groupIndex(ref, budget),
     groupPage: async (ref) => reader.groupPage(ref, budget),
     groupRoot: async (ref) => reader.groupRoot(ref, budget),

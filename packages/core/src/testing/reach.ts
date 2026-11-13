@@ -73,6 +73,8 @@ export const DURABLE_REGISTRY_REACH = [
   "column",
   "catalog",
   "catalogChange",
+  "catalogRoot",
+  "catalogPage",
   "runBlock",
   "runIndex",
   "runFences",
@@ -5654,4 +5656,120 @@ export const JSON_GROUP_NESTED_GENERATED_REACH = [
   "new random shape",
   "exact PostgreSQL text",
   "zero resources",
+] as const;
+
+/** MCAT fields must carry exact values and distinguish corruption from future semantics. */
+export const CATALOG_RECORD_REACH = [
+  "record round trip",
+  "single charged output",
+  "exact bigint",
+  "unknown optional retained",
+  "unknown required refused",
+  "truncated refused",
+  "duplicate/out-of-order refused",
+  "small field id",
+  "wide field id",
+  "maximum field id",
+] as const;
+
+export const CATALOG_PAGE_REACH = [
+  "single page",
+  "multiple pages",
+  "leaf index",
+  "internal index",
+  "exact page bytes",
+  "exact references",
+  "truncation refused",
+  "future version refused",
+  "flags refused",
+  "zero charged resources",
+] as const;
+
+export const CATALOG_STORAGE_REACH = [
+  "exact catalog values",
+  "bounded workspace",
+  "actual data pages",
+  "cancelled iterator cleanup",
+  "zero resources",
+] as const;
+
+export const CATALOG_STORAGE_FAULT_REACH = [
+  "data write cutoff",
+  "index write cutoff",
+  "old root unchanged",
+  "writer aborted",
+  "zero temporary allocations",
+] as const;
+
+export const CATALOG_STREAM_REACH = [
+  "empty catalog",
+  "multiple tables",
+  "WAL exact round trip",
+  "one owned record",
+  "future version refused",
+  "flags refused",
+  "truncation refused",
+  "zero buffers",
+] as const;
+export const CATALOG_FRAGMENT_REACH = [
+  "single-byte fragments",
+  "multiple-byte fragments",
+  "empty fragments",
+  "exact descriptors",
+  "iterator closed",
+  "cancellation",
+  "zero buffers",
+] as const;
+
+export const CATALOG_NATIVE_REACH = [
+  "WAL replay exact",
+  "native checkpoint exact",
+  "continued writes exact",
+  "single data page",
+  "multiple data pages",
+  "quoted UTF8 identifiers",
+  "exact sequence config",
+  "zero resources",
+] as const;
+
+export const CATALOG_GRAPH_REACH = [
+  "counter rewind",
+  "duplicate columns",
+  "dangling index",
+  "dangling foreign key",
+  "dangling identity",
+  "relation name collision",
+  "dangling primary key",
+  "duplicate enum labels",
+] as const;
+
+export const CATALOG_LOG_SHAPE_REACH = [
+  "createTable",
+  "dropTable",
+  "createIndex",
+  "invalidateIndex",
+  "dropIndex",
+  "putSequence",
+  "dropSequence",
+  "createView",
+  "dropView",
+  "createType",
+  "dropType",
+  "missing required field",
+  "contradictory field",
+] as const;
+
+export const CATALOG_TREE_REACH = [
+  "exact fragments",
+  "parent summary refused",
+  "page offset refused",
+  "early return cleanup",
+  "cancellation cleanup",
+  "zero resources",
+] as const;
+
+export const CATALOG_RECYCLE_REACH = [
+  "publish-held sequence reservation",
+  "deferral observed",
+  "reserved values durable",
 ] as const;

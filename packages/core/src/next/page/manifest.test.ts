@@ -1,3 +1,5 @@
+import { writeTestCatalog } from "../format/catalog-test-support.js";
+import { MANIFEST_FORMAT_VERSION } from "../durable-format.js";
 /**
  * The manifest codecs (format/manifest-codec.ts), the metadata reader and the directory cache
  * end to end over the in-memory extent space: real chunks, group roots, paged group directories
@@ -123,10 +125,10 @@ describe("manifest metadata end to end", () => {
   it("the open walk reaches exactly the extents a root's writes sealed", async () => {
     const space = new MemoryExtentSpace();
     const { writer, directory } = await writeTable(space, 5, 3000);
-    const catalog = defined((await writer.write([encoder.encode('{"tables":[]}')])).blobs[0]);
+    const catalog = await writeTestCatalog(writer);
     const empty: BlobRef = { extent: { offset: 0, length: 0 }, offset: 0, length: 0, checksum: 0 };
     const root: ManifestRoot = {
-      formatVersion: 3,
+      formatVersion: MANIFEST_FORMAT_VERSION,
       sequence: 1,
       epoch: 1,
       log: { salt: 7, firstLsn: 1, rootSequence: 1 },
@@ -252,13 +254,13 @@ describe("manifest metadata end to end", () => {
     // The walk works over the same reader (a ManifestReader).
     const found = await reachable(
       {
-        formatVersion: 3,
+        formatVersion: MANIFEST_FORMAT_VERSION,
         sequence: 1,
         epoch: 1,
         log: { salt: 1, firstLsn: 1, rootSequence: 1 },
         globalLsn: 1,
         catalogVersion: 1,
-        catalog: ref,
+        catalog: await writeTestCatalog(space.beginWrite("catalog walk fixture")),
         nextTableId: 2,
         sequences: [],
         tables: [],
@@ -267,7 +269,7 @@ describe("manifest metadata end to end", () => {
       },
       manifestReader(reader, budget),
     );
-    expect(found.length).toBe(1);
+    expect(found.length).toBe(2); // native catalog root and its payload page
   });
 });
 

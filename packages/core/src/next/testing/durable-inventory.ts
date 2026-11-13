@@ -13,6 +13,7 @@ import { join, relative } from "node:path";
 
 const NEXT = join(import.meta.dirname, "..");
 const TEST_ONLY = new Set([
+  "format/catalog-test-support.ts",
   "storage/conformance.ts",
   "storage/kit.ts",
   "storage/extents.examples.ts",
@@ -141,9 +142,12 @@ export function discoverDurableSources(): {
         }
       }
       if (
-        ["format/manifest.ts", "format/run-key.ts", "format/key-pointer.ts"].includes(
-          relative(NEXT, path),
-        ) &&
+        [
+          "format/manifest.ts",
+          "format/run-key.ts",
+          "format/key-pointer.ts",
+          "format/catalog-pages.ts",
+        ].includes(relative(NEXT, path)) &&
         ts.isTypeReferenceNode(node) &&
         (["BlobRef", "ChunkData", "KeyChunk", "RunKeyStorage"].includes(node.typeName.getText()) ||
           (node.typeName.getText() === "Uint8Array" && owner(node) === "RunKeyStorage"))
@@ -270,9 +274,13 @@ export const DURABLE_EMISSIONS: Readonly<
     kinds: ["manifest"],
   },
   "storage/space.ts:Writer.write:builder.append -> ExtentBuilder.append": { count: 1, kinds: [] },
-  "write/engine.ts:WritePathImpl.open:writer.write -> ExtentWriter.write": {
+  "write/catalog-storage.ts:node:writer.write -> ExtentWriter.write": {
     count: 1,
-    kinds: ["catalog"],
+    kinds: ["catalogRoot"],
+  },
+  "write/catalog-storage.ts:flush:writer.write -> ExtentWriter.write": {
+    count: 1,
+    kinds: ["catalogPage", "catalog"],
   },
   "write/engine.ts:WritePathImpl.#writeFlush:writer.write -> ExtentWriter.write": {
     count: 2,
@@ -285,10 +293,6 @@ export const DURABLE_EMISSIONS: Readonly<
   "write/engine.ts:WritePathImpl.#writeBitmap:writer.write -> ExtentWriter.write": {
     count: 1,
     kinds: ["deletionBitmap"],
-  },
-  "write/engine.ts:WritePathImpl.#nextRoot:writer.write -> ExtentWriter.write": {
-    count: 1,
-    kinds: ["catalog"],
   },
   "write/log.ts:LogAppender.appendStream:this.#session.appendLog -> StoreSession.appendLog": {
     count: 1,
@@ -312,7 +316,8 @@ export const DURABLE_EMISSIONS: Readonly<
 };
 /** Durable references declared by the schema, independently of its encoders and registry. */
 export const DURABLE_REFERENCES: Readonly<Record<string, readonly string[]>> = {
-  "ManifestRoot.catalog": ["catalog"],
+  "ManifestRoot.catalog": ["catalogRoot"],
+  "CatalogChild.ref": ["catalogRoot", "catalogPage"],
   "TableRoot.groups": ["groupIndex", "groupPage"],
   "TableRoot.staged.groups": ["groupIndex", "groupPage"],
   "TableRoot.statistics": ["tableStatistics"],

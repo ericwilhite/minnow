@@ -1,3 +1,4 @@
+import { MANIFEST_FORMAT_VERSION } from "../durable-format.js";
 /** Verified bytes still need endpoint/version checks; native CRC failures are never answers. */
 import fc from "fast-check";
 import { afterAll, expect, it, vi } from "vitest";
@@ -18,7 +19,7 @@ const reach = createReach("overflow integrity", OVERFLOW_INTEGRITY_STATES);
 afterAll(() => reach.assertReached());
 function root(ref: RunRef, catalog: ManifestRoot["catalog"]): ManifestRoot {
   return {
-    formatVersion: 3,
+    formatVersion: MANIFEST_FORMAT_VERSION,
     sequence: 1,
     epoch: 1,
     log: { salt: 1, firstLsn: 1, rootSequence: 1 },

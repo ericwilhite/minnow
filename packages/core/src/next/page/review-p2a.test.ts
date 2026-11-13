@@ -1,3 +1,5 @@
+import { writeTestCatalog } from "../format/catalog-test-support.js";
+import { MANIFEST_FORMAT_VERSION } from "../durable-format.js";
 /**
  * Review B2-p2a (rebuild/format-p2a 43686a2): each probe of the review, as a test that rejects
  * it. Findings: 1 cached directories skip the chunk bounds check; 2 the governor kept only its
@@ -42,7 +44,7 @@ const EMPTY: BlobRef = { extent: { offset: 0, length: 0 }, offset: 0, length: 0,
 const MAGIC = { root: 0x31524d4d, page: 0x3150474d, group: 0x3152474d };
 const ref: BlobRef = { extent: { offset: 0, length: 4096 }, offset: 0, length: 10, checksum: 0 };
 const root: ManifestRoot = {
-  formatVersion: 3,
+  formatVersion: MANIFEST_FORMAT_VERSION,
   sequence: 1,
   epoch: 1,
   log: { salt: 1, firstLsn: 1, rootSequence: 1 },
@@ -308,7 +310,7 @@ describe("review B2-p2a #3, #4: strings and ledger keys decode as written", () =
       out.uint(1); // extent table: the catalog's extent
       out.uint(0);
       out.uint(4096);
-      for (const n of [3, 1, 1]) out.uint(n); // format version, sequence, epoch
+      for (const n of [MANIFEST_FORMAT_VERSION, 1, 1]) out.uint(n); // format version, sequence, epoch
       out.u32(1); // log salt
       for (const n of [1, 1, 1, 1, 0, 0, 10]) out.uint(n); // log, lsn, catalog version, catalog
       out.u32(0);
@@ -438,7 +440,7 @@ describe("review B2-p2a #6: the walk cross-checks directories against what refer
       statistics: null,
       ...shape.table,
     };
-    const catalog = (await writer.write([new Uint8Array(4)])).blobs[0] ?? ref;
+    const catalog = await writeTestCatalog(writer);
     return { space, bytes: encodeManifestRoot({ ...root, catalog, tables: [tableRoot] }) };
   }
 
@@ -485,6 +487,7 @@ describe("review B2-p2a #6: the walk cross-checks directories against what refer
     if (idx === undefined) throw new Error("not written");
     const bad: ManifestRoot = {
       ...root,
+      catalog: await writeTestCatalog(writer),
       tables: [
         {
           tableId: 1,
@@ -597,7 +600,14 @@ describe("review B2-p2a #6: the walk cross-checks directories against what refer
       statistics: null,
     };
     await expect(
-      walk({ space, bytes: encodeManifestRoot({ ...root, catalog: gr, tables: [table] }) }),
+      walk({
+        space,
+        bytes: encodeManifestRoot({
+          ...root,
+          catalog: await writeTestCatalog(writer),
+          tables: [table],
+        }),
+      }),
     ).rejects.toThrow(/dense group's row-id range/u);
   });
 });

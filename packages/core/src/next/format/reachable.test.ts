@@ -1,3 +1,4 @@
+import { MANIFEST_FORMAT_VERSION } from "../durable-format.js";
 import { describe, expect, it } from "vitest";
 import type { BlobRef, ExtentRef } from "../storage/extents.js";
 import type {
@@ -181,7 +182,7 @@ function fixture(): Fixture {
   want(catalog, "catalog");
   // Only the fields the walk reads are meaningful here.
   const root = {
-    formatVersion: 3,
+    formatVersion: MANIFEST_FORMAT_VERSION,
     sequence: 3,
     epoch: 1,
     log: { salt: 1, firstLsn: 1, rootSequence: 1 },
@@ -206,7 +207,12 @@ function fixture(): Fixture {
       },
     };
   };
+  const catalogPage = blob();
+  want(catalogPage, "catalog-page");
   const reader: ManifestReader = {
+    catalogRoot: async () =>
+      held({ depth: 0, bytes: 1, pages: 1, children: [{ ref: catalogPage, bytes: 1, pages: 1 }] }),
+    catalogPage: async () => held({ offset: 0, data: new Uint8Array([1]) }),
     groupIndex: async (ref) => held(indexes.get(ref) ?? []),
     groupPage: async (ref) => held(pages.get(ref) ?? []),
     groupRoot: async (ref) => {
@@ -253,6 +259,7 @@ describe("reachability walk", () => {
     const { root, reader } = fixture();
     let rootsRead = 0;
     const counting: ManifestReader = {
+      ...reader,
       groupIndex: (ref) => reader.groupIndex(ref),
       groupPage: (ref) => reader.groupPage(ref),
       groupRoot: async (ref) => {
@@ -269,6 +276,7 @@ describe("reachability walk", () => {
     const { root, reader, outstanding } = fixture();
     let calls = 0;
     const failing: ManifestReader = {
+      ...reader,
       groupIndex: (ref) => reader.groupIndex(ref),
       groupPage: (ref) => reader.groupPage(ref),
       // The fifth group root of a batch fails; the others of its batch were decoded.
@@ -343,7 +351,13 @@ describe("reachability walk", () => {
             rootOf.set(group.root, await unwrap(reader.groupRoot(group.root)));
         }
       }
+    const catalogRootValue = await unwrap(reader.catalogRoot(root.catalog));
+    const catalogPageRef = catalogRootValue.children[0]?.ref;
+    if (!catalogPageRef) throw new Error("Missing catalog page fixture");
+    const catalogPageValue = await unwrap(reader.catalogPage(catalogPageRef));
     const walker = reachableExtents({
+      decodeCatalogRoot: () => parsed(catalogRootValue),
+      decodeCatalogPage: () => parsed(catalogPageValue),
       decodeRoot: () => parsed(root),
       decodeGroupIndex: (bytes) => parsed(indexOf.get(refOf(bytes)) ?? []),
       decodeGroupPage: (bytes) => parsed(pageOf.get(refOf(bytes)) ?? []),
