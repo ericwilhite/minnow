@@ -54,11 +54,17 @@ describe("storage contract boundaries", () => {
             "../block-format/index.js",
             "../block-format/physical.js",
             "../date-value.js",
+            // Import-free version-1 FTS limit constants shared by both engines.
+            "../full-text/limits.js",
           ],
           `${file} imports ${specifier}`,
         ).toContain(specifier);
       }
     }
+  });
+
+  it("the shared full-text limits the contract may import stay import-free", () => {
+    expect(importsOf(join(SRC, "full-text", "limits.ts"))).toEqual([]);
   });
 
   it("the toolkit imports only the contract, block-format, and itself", () => {
