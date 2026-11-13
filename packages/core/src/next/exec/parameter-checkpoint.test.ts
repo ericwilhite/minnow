@@ -173,7 +173,6 @@ it.each(seedsFor("owned-parameter-native-checkpoint", [0xb4c9, 0xb4ca]))(
         let grant: import("../memory/governor.js").Grant | undefined;
         try {
           await cp.save(owned);
-
           const binding = cp.binding();
           owned.length = 0;
           old.close();

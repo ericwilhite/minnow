@@ -6,6 +6,11 @@ import type { PhysicalType } from "../../types.js";
 import type { Rel, ScalarExpr } from "../../ir/ir.js";
 import { BATCH_TARGET_BYTES } from "../../vector/vector.js";
 import { MAX_BLOB_BYTES } from "../../access/space.js";
+import {
+  externalCallMinimum,
+  externalCallDistinct,
+  externalCallStepBytes,
+} from "./external-call-layout.js";
 
 type Width =
   | { readonly op: "bytes"; readonly bytes: number }
@@ -20,6 +25,7 @@ export interface AggregateProgressLayout {
     readonly width: Width;
     readonly variable: boolean;
     readonly distinct: boolean;
+    readonly minimum: number;
   }>;
 }
 /** These layouts have no parsed operands or wide coefficient/object arrays. */
@@ -141,7 +147,8 @@ export function aggregateProgressLayout(
     calls: rel.aggregates.map((call) => ({
       width: call.args[0] ? expr(call.args[0], rel.input) : zero,
       variable: call.args[0] ? variable(call.args[0]) : false,
-      distinct: call.distinct,
+      distinct: externalCallDistinct(call),
+      minimum: externalCallMinimum(call),
     })),
   };
 }
@@ -237,8 +244,21 @@ export function aggregateLaneBytes(
   let index = 2;
   for (const call of layout.calls) {
     const count = 1 + Number(call.distinct) * (kind === "restore" ? 2 : 1);
-    if (slot < index + count)
-      return call.variable ? Math.max(MAX_BLOB_BYTES, rowStep([call.width], slots) ?? baseline) : 0;
+    if (slot < index + count) {
+      if (!call.variable) return 0;
+      const width = bytes(call.width, slots);
+      // The state helper and its DISTINCT sorts have different complete steps.
+      // Match construction's helper predicate and order before assigning either bound.
+      // State peak includes its fixed pool: only the deficit belongs to this lane.
+      return Math.max(
+        MAX_BLOB_BYTES,
+        slot === index
+          ? width === null
+            ? baseline
+            : externalCallStepBytes(call.minimum, width) - call.minimum
+          : (rowStep([call.width], slots) ?? baseline),
+      );
+    }
     index += count;
   }
   // Optional top-N over finished groups retains their keys and variable results.

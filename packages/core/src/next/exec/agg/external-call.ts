@@ -19,6 +19,14 @@ import { Charge, Pool } from "../spill-pool.js";
 import { SortGrants } from "./sort-grants.js";
 import { accumulatorFor, type Accumulator } from "./states.js";
 
+import {
+  numericCall,
+  externalCallMinimum,
+  externalCallDistinct,
+  externalCallStepBytes,
+} from "./external-call-layout.js";
+export { externalCallMinimum, externalCallDistinct } from "./external-call-layout.js";
+
 const ORDINAL: PhysicalType = { kind: "float64" };
 const ZERO_GROUPS = new Int32Array(BATCH_ROWS); // Immutable: every row of this group updates slot 0.
 const asc = (column: number): SortColumn => ({
@@ -28,20 +36,7 @@ const asc = (column: number): SortColumn => ({
   collation: null,
 });
 const VALUE_ORDER = [asc(0)];
-const numericCall = (call: AggregateCall) =>
-  call.type.kind === "decimal" || call.args[0]?.type.kind === "decimal";
 const NUMERIC_SCRATCH = 384 * 1024;
-export const externalCallMinimum = (call: AggregateCall): number =>
-  numericCall(call) ? 640 * 1024 : 128 * 1024;
-export function externalCallDistinct(call: AggregateCall): boolean {
-  if (!call.distinct || call.args.length === 0) return false;
-  if (call.fn === "bool_and" || call.fn === "bool_or") return false;
-  // Byte-equal extrema have the same display. Float signed zero and decimal scales
-  // have distinct representations: retain DISTINCT's first representative there.
-  if (call.fn === "min" || call.fn === "max")
-    return !["text", "bytes", "uuid", "enum", "bool"].includes(call.args[0]?.type.kind ?? "");
-  return true;
-}
 /** Compiler buffers only: do not reserve unused hash tables in the external recipe. */
 export function externalCallArguments(
   call: AggregateCall,
@@ -219,8 +214,21 @@ export class ExternalCall {
   }
   async restoreState(reader: StateReader, bytes: number): Promise<void> {
     if (!this.prefix || !this.#accumulator.restore) throw new Error("Missing exact prefix restore");
-    this.#largest = Math.max(this.#largest, bytes);
-    await this.#room(Math.max(externalCallMinimum(this.call), 32768 + 4 * bytes));
+    let width = bytes;
+    if (this.call.fn === "min" || this.call.fn === "max") {
+      // The host owns the decoded page and its framing. Byte extrema copy only
+      // their value field; use the same payload units as add() and admission.
+      let payload: number | null = null;
+      for (const column of reader.columns)
+        if (column.data.layout === "varlen")
+          payload = Math.max(
+            payload ?? 0,
+            (column.data.offsets[reader.row + 1] ?? 0) - (column.data.offsets[reader.row] ?? 0),
+          );
+      width = payload ?? bytes;
+    }
+    this.#largest = Math.max(this.#largest, width);
+    await this.#room(externalCallStepBytes(externalCallMinimum(this.call), width));
     this.#pool.withStep(() => this.#accumulator.restore?.(0, reader));
     if (this.prefix.mode) reader.number();
   }
@@ -290,7 +298,7 @@ export class ExternalCall {
     } else {
       // FILTER rows can be sparse; preserve their exact positions and order.
       this.#largest = Math.max(this.#largest, this.#width(value, selected.rows, selected.count));
-      await this.#room(Math.max(externalCallMinimum(this.call), 32768 + 4 * this.#largest));
+      await this.#room(externalCallStepBytes(externalCallMinimum(this.call), this.#largest));
       await this.host.pace();
       this.#pool.withStep(() =>
         this.#accumulator.update(value, ZERO_GROUPS, selected.rows, selected.count, true),
@@ -314,7 +322,7 @@ export class ExternalCall {
       previous.reset(true);
       this.#pool.settle();
       const size = this.#widthAt(value, row);
-      await this.#room(Math.max(externalCallMinimum(this.call), 32768 + 4 * size));
+      await this.#room(externalCallStepBytes(externalCallMinimum(this.call), size));
       if (this.#pool.withStep(() => previous.append([value], null, row, 1)) !== 1)
         throw new Error("External DISTINCT capture exceeded its admitted step");
       if (this.prefix) {

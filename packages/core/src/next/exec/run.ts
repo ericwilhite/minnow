@@ -327,7 +327,10 @@ export class QueryRuntime {
   operatorLiteralProgress(bytes: number): void {
     this.#operatorLiteralBytes = bytes;
   }
-  #aggregateLanes = new Map<number, {kind: "hybrid" | "external" | "restore"; layout: AggregateProgressLayout}>();
+  #aggregateLanes = new Map<
+    number,
+    { kind: "hybrid" | "external" | "restore"; layout: AggregateProgressLayout }
+  >();
   #parameterSlotBytes: readonly number[] | undefined;
   #sharedAggregateSteps = new Set<number>();
   aggregateSharedStep(rel: OperatorIdentity): boolean {
@@ -436,14 +439,23 @@ export class QueryRuntime {
     else this.#aggregateLanes.delete(id);
   }
   #laneBytes(
-    rel: OperatorIdentity, slot: number | undefined, baseline: number,
+    rel: OperatorIdentity,
+    slot: number | undefined,
+    baseline: number,
     slots: readonly number[] | undefined = this.#parameterSlotBytes,
-    largest = 0, minimum = 0,
+    largest = 0,
+    minimum = 0,
   ): number {
-    if (slot === undefined && rel.op === "aggregate" && this.#helperOnlyProgress.has(rel.id)) return 0;
+    if (slot === undefined && rel.op === "aggregate" && this.#helperOnlyProgress.has(rel.id))
+      return 0;
     const recipe = this.#aggregateLanes.get(rel.id);
-    const ordinary = recipe ? aggregateLaneBytes(recipe.layout, recipe.kind, slot, baseline, slots) : baseline;
-    return Math.max(ordinary, this.#groupKeyProgress?.(rel.id, slot, slots ?? [], largest, minimum, baseline) ?? 0);
+    const ordinary = recipe
+      ? aggregateLaneBytes(recipe.layout, recipe.kind, slot, baseline, slots)
+      : baseline;
+    return Math.max(
+      ordinary,
+      this.#groupKeyProgress?.(rel.id, slot, slots ?? [], largest, minimum, baseline) ?? 0,
+    );
   }
   operatorStep(rel: OperatorIdentity): number {
     return this.#operatorProgress.get(rel.id) ?? 0;
@@ -459,15 +471,18 @@ export class QueryRuntime {
       return inputs + entries.reduce((sum, entry) => sum + entry.minimum, 0);
     let protectedBytes = 0;
     for (const entry of entries) {
-      const canBorrow = (entry.loanSlots ?? 0) > 0 ||
+      const canBorrow =
+        (entry.loanSlots ?? 0) > 0 ||
         ["sort", "aggregate", "join", "window", "setOp"].includes(entry.rel.op);
       if (!canBorrow) continue;
       const progress = this.#operatorStepBytes(entry.rel, inputs, largestInput, slots);
-      const lanes = Array.from({length: entry.loanSlots ?? 0}, (_, slot) =>
-        this.#laneBytes(entry.rel, slot, progress, slots, largestInput, entry.minimum));
+      const lanes = Array.from({ length: entry.loanSlots ?? 0 }, (_, slot) =>
+        this.#laneBytes(entry.rel, slot, progress, slots, largestInput, entry.minimum),
+      );
       const recipe = this.#aggregateLanes.get(entry.rel.id);
       const shared = recipe ? aggregateSharedBytes(recipe.layout, recipe.kind, slots, lanes) : null;
-      protectedBytes += this.#laneBytes(entry.rel, undefined, progress, slots, largestInput, entry.minimum) +
+      protectedBytes +=
+        this.#laneBytes(entry.rel, undefined, progress, slots, largestInput, entry.minimum) +
         (shared ?? lanes.reduce((sum, bytes) => sum + bytes, 0));
     }
     return (
@@ -624,7 +639,16 @@ export class QueryRuntime {
       const baseline = this.#operatorProgress.get(entry.rel.id) ?? 0;
       const lanes = entries
         .filter((e) => e.rel.id === entry.rel.id && e.loanSlot !== undefined)
-        .map((e) => this.#laneBytes(e.rel, e.loanSlot, baseline, binding.slotBytes, binding.largestSlot, e.minimum));
+        .map((e) =>
+          this.#laneBytes(
+            e.rel,
+            e.loanSlot,
+            baseline,
+            binding.slotBytes,
+            binding.largestSlot,
+            e.minimum,
+          ),
+        );
       const peak = aggregateSharedBytes(
         recipe.layout,
         recipe.kind,
@@ -635,10 +659,16 @@ export class QueryRuntime {
     }
     this.#sharedAggregateSteps = new Set(sharedParts.keys());
     const operators = entries.map((entry) => {
-      const capacity = canBorrow(entry.rel) ? this.#laneBytes(
-        entry.rel, entry.loanSlot, this.#operatorProgress.get(entry.rel.id) ?? 0,
-        binding.slotBytes, binding.largestSlot, entry.minimum,
-      ) : 0;
+      const capacity = canBorrow(entry.rel)
+        ? this.#laneBytes(
+            entry.rel,
+            entry.loanSlot,
+            this.#operatorProgress.get(entry.rel.id) ?? 0,
+            binding.slotBytes,
+            binding.largestSlot,
+            entry.minimum,
+          )
+        : 0;
       return {
         entry,
         capacity,

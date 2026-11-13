@@ -1346,6 +1346,13 @@ and the owner import it directly.
   fixed COUNT transitions do not reserve unused sort lanes. Conditional outputs use the largest
   reachable branch: COALESCE stops at a proven non-null constant, and its alternatives are never
   summed. Owned parameter bounds survive pressure checkpoints without rereading caller buffers.
+  External transition/capture helpers share their sizing function with admission: their total
+  pool peak is max(fixed minimum, 32 KiB + four times the largest value); the progress lane
+  funds only its deficit above that fixed minimum. DISTINCT's value and
+  ordinal sorts keep the merge-row recipe. Slot assignment uses the same DISTINCT predicate
+  as construction, so redundant TEXT MIN/MAX DISTINCT never shifts a later helper's credit.
+  Restored byte extrema measure the decoded value they copy; encoded framing stays funded
+  by the host I/O lane and is not counted as additional retained value.
   Spill staging reserves the complete row/page overlap even when an unsuccessful append has
   already grown some column buffers. The generated no-pressure campaign compares fitting plans'
   peaks with the pre-change admission policy, including caps just above the parent's peak.

@@ -7,6 +7,11 @@ import { createReach, AGG_WIDE_PROGRESS_REACH } from "../../testing/reach.js";
 import { Governor } from "../memory/governor.js";
 import { StepLoans } from "../memory/step-loans.js";
 import { ColumnStore } from "../exec/column-store.js";
+import { ReservedGrant } from "../exec/admission.js";
+import { Charge, Pool, SpillIo } from "../exec/spill-pool.js";
+import { PageWriter, SpillFiles, SpilledRun } from "../exec/spill-pages.js";
+import { MemorySpillService } from "../spill/memory-spill.js";
+import { TEXT, texts, valueAt } from "../exec/kernels/test-support.js";
 import { QueryRuntime } from "../exec/run.js";
 import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
@@ -17,6 +22,90 @@ const borrow = StepLoans.prototype.borrow;
 // eslint-disable-next-line @typescript-eslint/unbound-method -- applied with original receiver
 const appendNeed = ColumnStore.prototype.appendNeed;
 afterEach(() => vi.restoreAllMocks());
+/** Main's borrowed-row fast path avoids partial staging. Consumers with onFlush
+ * still use the arena path: exercise it with the same generated fields and real
+ * competing credit, rather than weakening the original partial-row reach. */
+async function partialStaging(values: readonly string[]): Promise<void> {
+  const governor = new Governor(32 << 20),
+    base = (5 << 20) / 4,
+    progress = 16 << 20;
+  const parts = await governor.admitGroup({
+    label: "partial staging",
+    includesProgress: true,
+    grants: [
+      { label: "fixed", minimumBytes: base, spillable: false },
+      { label: "step", minimumBytes: progress, spillable: false },
+      { label: "growth", minimumBytes: 0, spillable: true },
+    ],
+  });
+  const fixed = parts[0],
+    step = parts[1],
+    growth = parts[2];
+  if (!fixed || !step || !growth) throw new Error("missing partial staging grants");
+  const grant = new ReservedGrant(
+    fixed,
+    growth,
+    base,
+    new StepLoans(step, progress, "partial staging"),
+    false,
+    undefined,
+    true,
+  );
+  const pool = new Pool(new Charge(grant), base),
+    pages = new PageWriter(pool),
+    spill = new MemorySpillService();
+  const files = new SpillFiles(spill, 1, pool),
+    run = new SpilledRun();
+  const store = new ColumnStore(
+    values.map(() => TEXT),
+    pool,
+    { chunkRows: 1, targetBytes: Infinity },
+  );
+  const io = new SpillIo(pool, files, pages, { grant, queryId: 1 }, () => undefined);
+  io.onFlush = (chunk) => expect(chunk.rows).toBe(1);
+  const blocker = await governor.admit({
+    label: "partial row competitor",
+    minimumBytes: 0,
+    spillable: true,
+  });
+  try {
+    expect(blocker.allocate(governor.capBytes - governor.reserveBytes - governor.usedBytes)).toBe(
+      true,
+    );
+    const vectors = values.map((value) => texts([value]));
+    expect(store.append(vectors, null, 0, 1)).toBe(0);
+    expect(store.rows).toBe(0);
+    expect(store.retainedBytes).toBeGreaterThan(1 << 20);
+    await io.stage(store, run, { run: 0, partition: 0 }, vectors, null, 0, 1);
+    await io.flush(store, run, { run: 0, partition: 0 });
+    expect(run.rows).toBe(1);
+    const page = await io.readPage(run, 0);
+    try {
+      const decoded = await io.decode(
+        page,
+        values.map(() => TEXT),
+      );
+      for (const [column, value] of values.entries()) {
+        const vector = decoded.columns[column];
+        if (!vector) throw new Error("missing staged field");
+        expect(valueAt(vector, 0)).toBe(value);
+      }
+    } finally {
+      io.releasePage(page);
+    }
+  } finally {
+    await files.closeAll();
+    store.close();
+    pages.close();
+    pool.close();
+    grant.close();
+    for (const part of parts) part.close();
+    blocker.close();
+    expect(governor.usedBytes).toBe(0);
+    expect(spill.bytesInUse).toBe(0);
+  }
+}
+
 it.each(seedsFor("next-agg-wide-progress", [0xb791, 0xb792]))(
   "wide aggregate sort under pinned ordinary credit seed%i",
   async (seed) => {
@@ -123,7 +212,11 @@ it.each(seedsFor("next-agg-wide-progress", [0xb791, 0xb792]))(
                   throw new Error("missing group rows");
                 expect(oracleRows(result)).toEqual((await pg.query(sql, args)).rows);
                 reach.reach("PG exact");
-                if (staging.partial) reach.reach("partial staged row");
+                await partialStaging(
+                  Array.from({ length: n }, (_, i) => args[distinct ? i : 0] ?? value),
+                );
+                expect(staging.partial).toBe(true);
+                reach.reach("partial staged row");
               }
               expect(occupied).toBe(true);
               expect(requests.length).toBeGreaterThan(0);

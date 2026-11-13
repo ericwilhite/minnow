@@ -5462,3 +5462,31 @@ export const AGG_COLUMN_PROGRESS_REACH = [
   "PG exact",
   "zero",
 ] as const;
+
+export const AGG_CALL_PROGRESS_REACH = [
+  "max",
+  "min",
+  "omitted extrema DISTINCT",
+  "wide extrema DISTINCT",
+  "preceding DISTINCT",
+  "following DISTINCT",
+  "wide DISTINCT",
+  "ASCII",
+  "UTF8",
+  "pinned competitor",
+  "transition loan",
+  "PG exact",
+  "cancelled",
+] as const;
+
+export const AGG_CALL_PREFIX_REACH = [
+  "MIN",
+  "MAX",
+  "ASCII",
+  "UTF8",
+  "nonempty saved value",
+  "encoded framing excluded",
+  "one exact loan",
+  "PG suffix exact",
+  "zero charges",
+] as const;

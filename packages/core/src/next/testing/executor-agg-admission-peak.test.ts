@@ -14,8 +14,6 @@ import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
 // Capture originals once; a timeout must not make the next history capture a spy.
 // eslint-disable-next-line @typescript-eslint/unbound-method -- original receiver supplied
-const envelope = QueryRuntime.prototype.progressEnvelope;
-// eslint-disable-next-line @typescript-eslint/unbound-method -- original receiver supplied
 const restore = QueryRuntime.prototype.restorePhase;
 // eslint-disable-next-line @typescript-eslint/unbound-method -- original receiver supplied
 const borrow = StepLoans.prototype.borrow;
@@ -119,15 +117,8 @@ it.each(seedsFor("next-agg-admission-peak", [0xb793, 0xb794]))(
                   }),
                 );
                 if (legacy) {
-                  // Exact pre-1355 admission: one old input envelope on every owner/helper.
-                  // The shared staging correction is dormant: these parent controls stay hash.
-                  mocks.push(
-                    vi
-                      .spyOn(QueryRuntime.prototype, "progressEnvelope")
-                      .mockImplementation(function (this: QueryRuntime, bytes, multiple) {
-                        return envelope.call(this, bytes, multiple);
-                      }),
-                  );
+                  // Current main's admission: keep its per-operator/source/semantic
+                  // bounds intact; disable only this stack's aggregate recipes/packing.
                   if (Object.hasOwn(QueryRuntime.prototype, "aggregateProgress"))
                     mocks.push(
                       vi
