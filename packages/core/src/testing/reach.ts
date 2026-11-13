@@ -2771,6 +2771,7 @@ export const EXCEPT_SPILL_REACH = [
   "cleanup",
   "left duplicates",
   "right exceeds left",
+  "tight oversized pressure",
 ] as const;
 
 /** Canonical equality cannot discard the chosen left tuple's presentation. */
@@ -4504,4 +4505,143 @@ export const LIKE_REACH = [
   "unicode scalar",
   "no escape",
   "unicode escape",
+] as const;
+
+/** Compound set/join progress with a separate grant retaining all shared headroom. */
+export const COMPOUND_PROGRESS_REACH = [
+  "EXCEPT repeated parameter",
+  "join repeated parameter",
+  "EXCEPT literal",
+  "EXCEPT stored",
+  "EXCEPT",
+  "EXCEPT ALL",
+  "duplicates",
+  "join INNER",
+  "join LEFT",
+  "join RIGHT",
+  "join FULL",
+  "join RIGHT empty probe",
+  "join stored",
+  "join residual payload",
+  "join RIGHT empty payload",
+  "semi",
+  "anti",
+  "mark",
+  "PG exact",
+  "all ordinary credit occupied",
+  "cleanup",
+  "large recursive join",
+] as const;
+
+export const NATIVE_COMPOUND_REACH = [
+  "word key payload",
+  "empty probe",
+  "wide collision page",
+  "medium collision page",
+  "ordinary collision page",
+  "ALL",
+  "DISTINCT",
+  "collision fallback",
+  "NULL and duplicate keys",
+  "selected dictionary",
+  "raw key",
+  "encoded key",
+  "inner",
+  "left",
+  "right",
+  "full",
+  "semi",
+  "anti",
+  "mark",
+  "backpressure",
+] as const;
+
+/** Encoded C groups retain a separate key table beside the full-key MARK table. */
+export const MARK_GROUP_PROGRESS_REACH = [
+  "native",
+  "stored",
+  "TRUE",
+  "FALSE",
+  "UNKNOWN",
+  "bounded encoder",
+  "cleanup",
+] as const;
+
+export const COMPOUND_HISTORY_REACH = [
+  "afterEach restoration",
+  "abandoned shrinker stopped",
+  "abandoned observer stopped",
+  "queued execution cancelled",
+  "late closer inert",
+  "idempotent close",
+  "zero resources",
+] as const;
+
+export const COMPOUND_PROJECTION_REACH = [
+  "record",
+  "except",
+  "hidden large text",
+  "hidden integer",
+  "selected dictionary",
+  "selected flat",
+  "wide UTF8 prefix",
+  "nonzero slot",
+  "loan",
+  "PostgreSQL exact",
+  "zero resources",
+] as const;
+
+/** Every physical key occurrence must be prepaid, including duplicate input indexes. */
+export const JOIN_REPEATED_PROGRESS_REACH = [
+  "inner",
+  "left",
+  "right",
+  "full",
+  "semi",
+  "anti",
+  "mark",
+  "unique positions",
+  "duplicated position",
+  "repeated position",
+  "asymmetric repetitions",
+  "arena boundary",
+  "seventeen repeats",
+  "fixed repeats with large payload",
+  "partitioned four MB key page",
+  "forwarded distinct-key partition",
+  "small key large payload",
+  "encoded repeated correlation",
+  "retired grant and private restore lane",
+  "selected dictionary",
+  "ordinary credit occupied",
+  "observed chunk and loan",
+  "PG exact",
+  "zero resources",
+] as const;
+
+export const JOIN_REPEATED_SQL_REACH = [
+  "inner",
+  "left",
+  "right",
+  "full",
+  "stored source",
+  "repeated parameter",
+  "asymmetric repeated predicates",
+  "cross-field grid",
+  "single-row source envelope",
+  "ordinary credit occupied",
+  "small key large payload",
+  "32 MiB cap",
+  "independent key and payload slots",
+  "independent key and payload literals",
+  "8 MiB literal cap",
+  "PG exact",
+  "zero resources",
+] as const;
+
+/** Pressure restore sizes each owned slot independently, in its original position. */
+export const OWNED_PARAMETER_COLUMN_BOUNDS_REACH = [
+  "independent slot bounds",
+  "original slot order",
+  "phase binding bounds",
 ] as const;

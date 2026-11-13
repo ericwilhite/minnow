@@ -178,6 +178,7 @@ export class ParameterCheckpoint {
       bytes: this.#bytes,
       logicalBytes: this.#bytes,
       largestSlot: this.#largestSlot,
+      slotBytes: this.#slots.map((slot) => slot.retained),
       bind: async (charge) => ({ slots: (await this.restore(charge)).slots }),
     };
   }
@@ -191,6 +192,7 @@ export class ParameterCheckpoint {
       bytes: binding.bytes + ioBytes,
       logicalBytes: this.#bytes,
       largestSlot: binding.largestSlot,
+      ...(binding.slotBytes === undefined ? {} : { slotBytes: binding.slotBytes }),
       bind: async (charge) => {
         const native = charge as Grant;
         if (typeof native.borrow !== "function")

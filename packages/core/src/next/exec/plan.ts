@@ -1,3 +1,5 @@
+import { expressionInputBytes, projectedInputBytes } from "./input-size-plan.js";
+import { KeyLayout } from "./join-keys.js";
 import {
   RecursiveOperator,
   recursiveLayout,
@@ -562,6 +564,23 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     owner: number;
     loanSlots: number;
   }> = [];
+  const compoundColumns = new Map<number, number>();
+  const compoundCopies = new Map<number, number>();
+  const keyedInputs = new Map<
+    number,
+    ReadonlyArray<{
+      input: Rel;
+      exprs: readonly ScalarExpr[];
+      repeats: ReadonlyMap<number, number>;
+    }>
+  >();
+  const variableColumns = (input: readonly PhysicalType[]) =>
+    Math.max(
+      1,
+      input.filter((type) =>
+        ["text", "bytes", "json", "array", "enum", "decimal"].includes(type.kind),
+      ).length,
+    );
   const fixed = (
     rel: OperatorIdentity,
     minimum: number | ((cap: number) => number),
@@ -1946,7 +1965,33 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           });
         const left = prepare(rel.left),
           right = prepare(rel.right),
-          lt = types(rel.left);
+          lt = types(rel.left),
+          rt = types(rel.right);
+        const lk = keyProjection(lt, rel.leftKeys),
+          rk = keyProjection(rt, rel.rightKeys);
+        compoundColumns.set(rel.id, Math.max(variableColumns(lk.types), variableColumns(rk.types)));
+        const repeated = (indexes: readonly number[], input: readonly PhysicalType[]) => {
+          const counts = new Map<number, number>();
+          for (const index of indexes)
+            if (
+              ["text", "bytes", "json", "array", "enum", "decimal"].includes(at(input, index).kind)
+            )
+              counts.set(index, (counts.get(index) ?? 0) + 1);
+          return new Map([...counts].filter(([, count]) => count > 1));
+        };
+        keyedInputs.set(rel.id, [
+          { input: rel.left, exprs: lk.exprs, repeats: repeated(lk.indexes, lk.types) },
+          { input: rel.right, exprs: rk.exprs, repeats: repeated(rk.indexes, rk.types) },
+        ]);
+        const correlated = rel.correlated ?? 0;
+        const encodedGroup =
+          rel.kind === "mark" &&
+          correlated > 0 &&
+          new KeyLayout(
+            lk.indexes.slice(0, correlated).map((index) => at(lk.types, index)),
+            rel.nullSafe.slice(0, correlated),
+          ).family === "enc";
+        compoundCopies.set(rel.id, encodedGroup ? 6 : 5);
         const make = (
           context: CompileContext,
           grant: Grant | null,
@@ -2105,6 +2150,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           throw new TypeError("Missing EXCEPT arm");
         const input = types(rel);
         exceptKeyLayout(input);
+        compoundColumns.set(rel.id, variableColumns(input));
         const left = prepare(leftInput),
           right = prepare(rightInput);
         const minimum = exceptMinimumBytes(input);
@@ -2323,13 +2369,94 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       } else if ("input" in rel) visit(rel.input);
     };
     visit(plan.root);
-    if ([...aggregatePlanners.keys()].some((id) => active.has(id))) {
+    // Query-local scalar key bounds. They are populated by complete sizing passes,
+    // before any execution grant exists; no native vectors/grants are retained here.
+    const keySources = new Map<number, Set<number>>();
+    const keyColumnBytes = new Map<number, Map<number, number>>();
+    const rowSources = new Map<object, Map<number, Map<number, number>>>();
+    for (const [id, arms] of keyedInputs) {
+      if (!active.has(id)) continue;
+      for (const arm of arms) {
+        const counts = new Map<number, Map<number, number>>();
+        projectedInputBytes(arm.exprs, arm.input, {
+          parameter: () => 0,
+          source(source, index, coefficient) {
+            const columns = counts.get(source) ?? new Map<number, number>();
+            columns.set(index, (columns.get(index) ?? 0) + coefficient);
+            counts.set(source, columns);
+            return 0;
+          },
+        });
+        rowSources.set(arm, counts);
+        for (const [source, columns] of counts)
+          for (const [index, count] of columns)
+            if (count > 1) {
+              const keys = keySources.get(source) ?? new Set<number>();
+              keys.add(index);
+              keySources.set(source, keys);
+            }
+        for (const column of arm.repeats.keys()) {
+          const expr = arm.exprs[column];
+          if (expr)
+            expressionInputBytes(expr, arm.input, {
+              parameter: () => 0,
+              source(source, index) {
+                const columns = keySources.get(source) ?? new Set<number>();
+                columns.add(index);
+                keySources.set(source, columns);
+                return 0;
+              },
+            });
+        }
+      }
+      runtime.operatorColumnProgress(id, (slots, largest) => {
+        let maximum = { row: 0, repeated: 0 };
+        for (const arm of arms) {
+          const base = { parameter: (slot: number) => slots[slot] ?? largest, source: () => 0 };
+          const row = projectedInputBytes(arm.exprs, arm.input, base);
+          if (row === null) return null;
+          let rowExtra = row;
+          for (const [source, columns] of rowSources.get(arm) ?? [])
+            for (const [index, count] of columns)
+              if (count > 1) {
+                const bytes = keyColumnBytes.get(source)?.get(index);
+                if (bytes === undefined) return null;
+                rowExtra += (count - 1) * bytes;
+              }
+          let bytes = 0;
+          for (const [column, count] of arm.repeats) {
+            const expr = arm.exprs[column];
+            const key = expr
+              ? expressionInputBytes(expr, arm.input, {
+                  ...base,
+                  source: (source, index) => keyColumnBytes.get(source)?.get(index) ?? null,
+                })
+              : null;
+            if (key === null) return null;
+            bytes += (count - 1) * key;
+          }
+          maximum = {
+            row: Math.max(maximum.row, rowExtra),
+            repeated: Math.max(maximum.repeated, bytes),
+          };
+        }
+        return maximum;
+      });
+    }
+    for (const [id, columns] of compoundColumns)
+      if (active.has(id)) runtime.operatorParameterColumns(id, columns, compoundCopies.get(id));
+    const hasAggregateProgress = [...aggregatePlanners.keys()].some((id) => active.has(id));
+    const hasCompoundProgress = admissions.some(
+      ({ rel }) => active.has(rel.id) && (rel.op === "join" || rel.op === "setOp"),
+    );
+    if (hasAggregateProgress || hasCompoundProgress) {
       // Inline values are <=64KiB by the stored format. This compound envelope is
-      // aggregation-only: B2's plain export minimum is unchanged. Larger source steps
+      // for heavy operators only: B2's plain export minimum is unchanged. Larger source steps
       // and owned parameter copies are added by the runtime's admitted progress rule.
       // Plan-owned literals can exceed the stored inline threshold. Their already-built
       // vectors give an exact byte bound without re-encoding or copying their payloads.
       let literalBytes = LARGE_VALUE_BYTES;
+      let operatorLiteralBytes = 0;
       const inspected = new Set<object>();
       const inspect = (value: unknown): void => {
         if (
@@ -2345,13 +2472,16 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         inspected.add(value);
         if ("form" in value && value.form === "flat" && "data" in value) {
           const data = (value as { data: { layout: string; bytes?: Uint8Array } }).data;
-          if (data.layout === "varlen")
-            literalBytes = Math.max(literalBytes, data.bytes?.byteLength ?? 0);
+          if (data.layout === "varlen") {
+            operatorLiteralBytes = Math.max(operatorLiteralBytes, data.bytes?.byteLength ?? 0);
+            literalBytes = Math.max(literalBytes, operatorLiteralBytes);
+          }
           return;
         }
         for (const child of Object.values(value)) inspect(child);
       };
       inspect(plan.root);
+      if (hasCompoundProgress) runtime.operatorLiteralProgress(operatorLiteralBytes);
       let inline = 0,
         sourceMultiplicity = 1;
       for (const planner of aggregatePlanners.values()) {
@@ -2371,7 +2501,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         // and parameter output is added separately by the runtime.
         sourceMultiplicity = Math.max(sourceMultiplicity, multiplicity);
       }
-      runtime.progressEnvelope(inline, sourceMultiplicity);
+      if (hasAggregateProgress) runtime.progressEnvelope(inline, sourceMultiplicity);
     }
     const entries = admissions
       .filter((entry) => active.has(entry.owner))
@@ -2872,6 +3002,35 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             ),
           );
           bounds.set(source.id, bound);
+          const keyColumns = keySources.get(source.id);
+          if (keyColumns)
+            for (const index of keyColumns) {
+              const column = source.columns[index],
+                type = source.types[index];
+              if (column === undefined || type === undefined)
+                throw new Error("Missing join key source column");
+              const row = yield* readValue(
+                boundSource(
+                  runtime.view,
+                  {
+                    ...source,
+                    columns: [column],
+                    types: [type],
+                    stagingBytes: 0,
+                    windowBytes: 0,
+                    rows: demand.get(source.id) ?? null,
+                  },
+                  runtime.request.governor,
+                  runtime.signal,
+                  batchTargetFor(runtime.request.governor.capBytes, 4),
+                  BATCH_ROWS,
+                  runtime.metadataCaches(source.retain !== false, sources),
+                ),
+              );
+              const widths = keyColumnBytes.get(source.id) ?? new Map<number, number>();
+              widths.set(index, row.valueBytes ?? row.progress / 4);
+              keyColumnBytes.set(source.id, widths);
+            }
           io = Math.max(io, bound.io);
           progress = Math.max(progress, bound.progress);
         }

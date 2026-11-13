@@ -41,6 +41,15 @@ sort; mismatching orders keep that sort. Published parser restrictions are uncha
 No public API or stored-format change; no migration is needed. The shipped lazy LAG/LEAD
 evaluation adds 264 packed bytes to the core tarball; its packed cap rises once by 500 bytes.
 
+The unexported rebuild now reserves complete EXCEPT and hash-join progress steps before
+borrowing. Large keys, representative rows and spill pages no longer ask for a second loan
+while retaining the first under competing memory pressure. Key bounds count repeated join-key
+positions, including partition forwarding, chunk replay and saved continuations. Key bounds
+follow individual columns and parameter slots, so tiny repeated keys do not multiply unrelated
+payload bytes or cause a false over-cap refusal. Wide spill rows borrow their input
+payload, and single-row joins borrow build outputs. Shipped SQL behavior, public APIs and stored
+formats are unchanged; no migration is needed.
+
 The unexported rebuild now executes text-to-JSONB casts, JSONB extraction and exact canonical
 JSONB text, including decimal scale, duplicate keys and Unicode validation. Invalid documents
 keep PostgreSQL’s error order, including competing Unicode, token and numeric range errors. Expanding values use

@@ -1,3 +1,4 @@
+import { joinKeyPageBytes } from "./join-key-size.js";
 /** Pressure-only native records that outlive a producer's admitted buffers. The
  * detached descriptor holds files and types, never its writer's pool or grant. */
 import type { SpillService } from "../spill/contract.js";
@@ -22,10 +23,12 @@ export class RecordCheckpoint {
   #sealed = false;
   #closing: Promise<void> | null = null;
   #maxPageBytes = 0;
+  #maxKeyBytes = 0;
   constructor(
     parent: SpillIo,
     service: SpillService,
     readonly types: readonly PhysicalType[],
+    keys: readonly number[] = [],
   ) {
     this.files = new SpillFiles(service, parent.context.queryId, {
       allocate: () => false,
@@ -46,6 +49,20 @@ export class RecordCheckpoint {
         parent.checkAborted,
         parent.pace,
       );
+      if (keys.length)
+        io.onPage = (_run, columns, rows) => {
+          this.#maxKeyBytes = Math.max(
+            this.#maxKeyBytes,
+            joinKeyPageBytes(
+              keys.map((c) => {
+                const column = columns[c];
+                if (!column) throw new Error("Missing checkpoint key column");
+                return column;
+              }),
+              rows,
+            ),
+          );
+        };
       directory = new TapeDirectory(io, parent.pool);
       staging = new ColumnStore(types, parent.pool, {
         chunkRows: 64,
@@ -67,6 +84,9 @@ export class RecordCheckpoint {
       pages?.close();
       throw error;
     }
+  }
+  get maxKeyBytes(): number {
+    return this.#maxKeyBytes;
   }
   get maxPageBytes(): number {
     return this.#maxPageBytes;

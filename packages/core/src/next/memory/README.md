@@ -166,6 +166,41 @@ that lane before returning the execution's reservation. Task pacing uses the sha
 
 ## Legacy isolated grants
 
+EXCEPT and hash joins preflight a compound transition before their first loan: key encoding,
+representative/table ownership, copied hash keys and page/replay workspace. A borrowed wide
+row is encoded straight into its spill page, and a single-row join output borrows its build
+chunk. Borrowed spill rows keep only the staging schema’s declared prefix; hidden source
+sort keys never become extra checkpoint fields. Page-step preflight takes the maximum
+of reserved I/O workspace and overlapping read/encoder/page buffers, rather than
+adding the same workspace twice. Dead encodings retire before the next phase. The chunk table/replay step pins its
+preflight credit through all intermediate frees; it returns that credit only after the
+chunk and temporary outputs close. The pool's second-loan guard stays in force.
+
+Complete execution admission bounds EXCEPT by four variable-row copies (key, copied key,
+doubling representative arena); joins add a fifth for the probe/key replay overlap. MARK
+joins with encoded correlation groups also keep a separate group-key table and reserve a
+sixth copy; their variable group encoders are charged to the shared pool and closed with
+the table. The
+one-MiB blob floor is applied after multiplying actual source/parameter bounds, so
+small-row minima and unrelated operators keep their existing floor. Source/read and aggregate
+expression envelopes already contain four copies and are normalized before applying this
+recipe; complete checkpoint restore envelopes are never multiplied again. Parameter and
+literal bounds count every variable position in the physical row, including repeated bindings.
+Literal byte bounds also fund a single literal result value; unopened zero-demand subtrees do
+not contribute a bound. This is an honest
+compound working-set reservation, not a relaxation of the one-loan rule or an increase to the shared reserve.
+Join keys are position lists, not sets: repeated indexes contribute again to the encoded
+key bound. Chunk loading and table construction measure projected key positions,
+including encoded MARK correlation prefixes. Spill writers record scalar key-page bounds
+before replay reads; saved continuations retain these bounds without old grants or vectors.
+SQL admission follows each repeated column to its literal, owned parameter slot or selected
+source-column prefix. An unrelated payload keeps its ordinary row bound. Per-slot sizes
+survive pressure checkpoints; already-complete saved bounds are not multiplied again.
+Unknown expanding expressions keep their existing conservative recipe.
+
+A complete query whose simultaneous protected working set exceeds its cap still receives
+its existing typed admission refusal.
+
 Existing direct operator fixtures can still admit incomplete minima and use the shared
 progress reserve. They must repay a loan without requesting another memory resource.
 They are not the executor's concurrent-execution admission protocol. The compatibility

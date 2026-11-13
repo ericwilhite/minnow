@@ -19,7 +19,11 @@ export class JoinCheckpoint {
   ) {}
   /** A read page, staging growth overlap and an encoded output page. */
   get progressBytes(): number {
-    return 6 * Math.max(this.build.maxPageBytes, this.probe.maxPageBytes) + 64 * 1024;
+    const row = Math.max(this.build.maxPageBytes, this.probe.maxPageBytes);
+    // The ordinary six-copy row bound already funds one occurrence of each key.
+    // Only encoded key bytes beyond that row add simultaneous key workspace.
+    const extra = Math.max(0, this.build.maxKeyBytes, this.probe.maxKeyBytes) - row;
+    return 6 * row + 4 * Math.max(0, extra) + 64 * 1024;
   }
   /** Includes directory pages appended lazily by HashTape.read(). */
   get spilledBytes(): number {

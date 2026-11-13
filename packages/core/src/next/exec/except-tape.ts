@@ -6,6 +6,7 @@ import { int64At } from "../vector/int64.js";
 import { SpillIo } from "./spill-pool.js";
 import { PageWriter, SpilledRun } from "./spill-pages.js";
 import { ColumnStore } from "./column-store.js";
+import { SORT_ROW_VIEW_BYTES, sortRowView } from "./sort-row.js";
 
 const TAPE_FIXED_BYTES = 2048;
 const INDEX_TYPES = [
@@ -18,6 +19,7 @@ export class ExceptTape {
   readonly run = new SpilledRun();
   #tip: SpillPageRef | null = null;
   #sequence = 0;
+  #maxPageBytes = 0;
   #closed = false;
   readonly #offset: Float64Array;
   readonly #length: Int32Array;
@@ -60,6 +62,9 @@ export class ExceptTape {
   get rows(): number {
     return this.run.rows;
   }
+  get maxPageBytes(): number {
+    return this.#maxPageBytes;
+  }
   async #append(
     columns: readonly FlatVector[],
     rows: number,
@@ -81,6 +86,7 @@ export class ExceptTape {
     await this.io.files.append(this.run, page, counted);
     const ref = this.run.pages.pop();
     if (ref === undefined) throw new Error("Missing EXCEPT tape page");
+    if (counted > 0) this.#maxPageBytes = Math.max(this.#maxPageBytes, ref.length);
     this.io.checkAborted();
     return ref;
   }
@@ -89,6 +95,11 @@ export class ExceptTape {
     const columns = store.vectors();
     const large = PageWriter.encodedBytes(columns, store.rows) > store.targetBytes;
     const data = await this.#append(columns, store.rows, store.rows);
+    await this.#link(data);
+    this.io.pages.shrinkIf(large || this.io.pool.owes);
+    this.io.reset(store);
+  }
+  async #link(data: SpillPageRef): Promise<void> {
     for (let k = 0; k < 2; k++) {
       const ref = k === 0 ? this.#tip : data;
       this.#offset[k] = ref?.offset ?? 0;
@@ -96,10 +107,27 @@ export class ExceptTape {
       this.#checksum[k] = ref?.checksum ?? 0;
     }
     this.#tip = await this.#append(this.#index, 2, 0);
-    this.io.pages.shrinkIf(large || this.io.pool.owes);
-    this.io.reset(store);
   }
   async stage(store: ColumnStore, columns: readonly Vector[], row: number): Promise<void> {
+    // A wide input is already borrowed. Encode it directly instead of pinning a
+    // power-of-two staging copy while asking for the page encoder's second loan.
+    if (store.appendNeed(columns, row) > Math.max(store.targetBytes, 64 * 1024)) {
+      await this.flush(store);
+      const metadata = store.types.length * SORT_ROW_VIEW_BYTES;
+      await this.io.need(metadata);
+      if (!this.io.pool.allocate(metadata)) throw new RangeError("EXCEPT row views not admitted");
+      try {
+        const views = columns
+          .slice(0, store.types.length)
+          .map((column) => sortRowView(column, row));
+        const data = await this.#append(views, 1, 1);
+        await this.#link(data);
+        this.io.pages.shrinkIf(true);
+      } finally {
+        this.io.pool.free(metadata);
+      }
+      return;
+    }
     if (store.append(columns, null, row, 1) === 0) {
       await this.flush(store);
       if (store.append(columns, null, row, 1) === 0) {

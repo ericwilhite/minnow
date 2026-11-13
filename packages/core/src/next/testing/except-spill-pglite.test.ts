@@ -180,6 +180,7 @@ it.each(seedsFor("next-except-spill", [0xb62f, 0xb630]))(
           expect(spill.bytesInUse).toBe(0);
           reach.reach(shape.all ? "ALL" : "DISTINCT");
           if (shape.oversized) reach.reach("oversized page");
+          if (shape.tight && shape.oversized) reach.reach("tight oversized pressure");
           reach.reach(shape.scratch ? "scratch backend" : "memory backend");
           reach.reach(shape.dictionary ? "dictionary" : "flat");
           reach.reach("NULL keys");

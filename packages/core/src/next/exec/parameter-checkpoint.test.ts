@@ -1,7 +1,7 @@
 import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
-import { createReach } from "../../testing/reach.js";
+import { createReach, OWNED_PARAMETER_COLUMN_BOUNDS_REACH } from "../../testing/reach.js";
 import { Governor } from "../memory/governor.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { bindParameter } from "./parameters.js";
@@ -18,6 +18,7 @@ it.each(seedsFor("owned-parameter-checkpoint", [0xb4c5, 0xb4c6]))(
       "shared prefix",
       "caller mutation",
       "old grant released",
+      ...OWNED_PARAMETER_COLUMN_BOUNDS_REACH,
       "zero",
     ]);
     await fc.assert(
@@ -53,6 +54,15 @@ it.each(seedsFor("owned-parameter-checkpoint", [0xb4c5, 0xb4c6]))(
         let restored: Awaited<ReturnType<ParameterCheckpoint["restore"]>> | undefined;
         try {
           await cp.save(owned);
+          // Slot identity survives pressure re-admission: the empty key must not
+          // inherit either wide payload's bound, even when their inputs alias.
+          const binding = cp.binding(),
+            phase = cp.phaseBinding(new AbortController().signal);
+          const sizes = expected.map((bytes) => 512 + bytes.length);
+          expect(binding.slotBytes).toEqual(sizes);
+          expect(phase.slotBytes).toEqual(sizes);
+          expect(phase.logicalBytes).toBe(sizes.reduce((n, size) => n + size, 0));
+          for (const state of OWNED_PARAMETER_COLUMN_BOUNDS_REACH) reach.reach(state);
           owned = [];
           old.free(old.allocated);
           old.close();

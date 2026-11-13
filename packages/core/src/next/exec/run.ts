@@ -40,6 +40,16 @@ import { MAX_BLOB_BYTES } from "../access/space.js";
 import { StepLoans } from "../memory/step-loans.js";
 import type { ReadBound } from "../page/read-bounds.js";
 
+/** A set/join transition can retain an encoded key, its hash copy and a
+ * doubling representative arena (or a replacement page). Admit that compound
+ * working set up front; joins also retain the probe page while looking up its
+ * key against that representative/table. Callers still preflight one loan,
+ * never grow a live loan.
+ * This does not change the global reserve or the capacity of unrelated operators. */
+function progressCopies(rel: OperatorIdentity): number {
+  return rel.op === "join" ? 5 : rel.op === "setOp" ? 4 : 1;
+}
+
 interface Reservation {
   readonly rel: OperatorIdentity;
   readonly minimum: number;
@@ -206,12 +216,17 @@ export class QueryRuntime {
     return this.#resultProgressOverride === 0 ? Math.min(this.#window, 4096) : this.#window;
   }
   #resultStep(inputs: number, largestInput: number): number {
-    // Multiply the source/owned-value envelope, not the four-MiB progress floor.
+    // Multiply the source/owned-value envelope, not the one-MiB blob floor.
     // Hundreds of tiny aliases need their actual frame minimum, not hundreds of blob loans.
     return this.#resultProgressOverride === null
       ? this.#stepBytes(
           inputs,
-          largestInput,
+          Math.max(
+            largestInput,
+            this.#operatorLiteralBytes > 0
+              ? this.#operatorLiteralBytes + 4096 + 256 * this.plan.columns.length
+              : 0,
+          ),
           this.#resultCopies,
           this.#resultCopySourceProgress ?? this.#progressBytes,
         )
@@ -296,6 +311,16 @@ export class QueryRuntime {
   #expressionProgress = 0;
   #expressionMultiplicity = 1;
   #parameterProgress = false;
+  #operatorLiteralBytes = 0;
+  readonly #operatorParameterColumns = new Map<number, number>();
+  readonly #operatorCopies = new Map<number, number>();
+  operatorParameterColumns(id: number, columns: number, copies?: number): void {
+    this.#operatorParameterColumns.set(id, columns);
+    if (copies !== undefined) this.#operatorCopies.set(id, copies);
+  }
+  operatorLiteralProgress(bytes: number): void {
+    this.#operatorLiteralBytes = bytes;
+  }
   /** Complete variable-output envelope; ordinary project/filter leave it at zero. */
   progressEnvelope(bytes: number, multiplicity = 1): void {
     this.#expressionProgress = bytes;
@@ -307,6 +332,7 @@ export class QueryRuntime {
     largestInput: number,
     copies = 1,
     readProgress = this.#progressBytes,
+    savedCopies = copies,
   ): number {
     // ReadBound.progress already covers a complete source prefix, not one cell.
     // Add newly materialized inline/literal/owned-parameter columns; multiply only
@@ -316,7 +342,52 @@ export class QueryRuntime {
         this.#expressionProgress +
         4 * inputs * this.#expressionMultiplicity
       : Math.max(readProgress, largestInput);
-    return Math.max(MAX_BLOB_BYTES, copies * Math.max(this.#savedProgressBytes, current));
+    return Math.max(MAX_BLOB_BYTES, savedCopies * this.#savedProgressBytes, copies * current);
+  }
+  #operatorStepBytes(
+    rel: OperatorIdentity,
+    inputs: number,
+    largestInput: number,
+    slots: readonly number[] = [],
+  ): number {
+    const copies = this.#operatorCopies.get(rel.id) ?? progressCopies(rel);
+    const columns = this.#columnProgress.get(rel.id)?.(slots, largestInput);
+    if (columns !== undefined && columns !== null)
+      return Math.ceil(
+        Math.max(
+          MAX_BLOB_BYTES,
+          this.#savedProgressBytes,
+          copies * (this.#progressBytes / 4 + columns.row + columns.repeated),
+        ),
+      );
+    if (copies === 1) return this.#stepBytes(inputs, largestInput);
+    // ReadBound.progress and the aggregate expression/parameter envelope already
+    // cover FOUR copies. A raw parameter largestSlot does not. Normalize those
+    // units before applying this operator's compound bound, and never multiply
+    // a checkpoint's already complete restore/replay envelope again.
+    const variableColumns = this.#operatorParameterColumns.get(rel.id) ?? 1;
+    return Math.ceil(
+      Math.max(
+        copies * variableColumns * this.#operatorLiteralBytes,
+        this.#stepBytes(
+          Math.max(inputs, (largestInput * variableColumns) / this.#expressionMultiplicity),
+          largestInput * variableColumns,
+          this.#parameterProgress ? copies / 4 : copies,
+          this.#parameterProgress ? this.#progressBytes : this.#progressBytes / 4,
+          1,
+        ),
+      ),
+    );
+  }
+  readonly #columnProgress = new Map<
+    number,
+    (slots: readonly number[], largest: number) => { row: number; repeated: number } | null
+  >();
+  operatorColumnProgress(
+    id: number,
+    bound: (slots: readonly number[], largest: number) => { row: number; repeated: number } | null,
+  ): void {
+    this.#columnProgress.set(id, bound);
   }
   operatorStep(rel: OperatorIdentity): number {
     return this.#operatorProgress.get(rel.id) ?? 0;
@@ -329,7 +400,6 @@ export class QueryRuntime {
   ): number {
     if (this.#atomicResult === null)
       return inputs + entries.reduce((sum, entry) => sum + entry.minimum, 0);
-    const progress = this.#stepBytes(inputs, largestInput);
     const borrowers = entries
       .filter(
         ({ rel, loanSlots }) =>
@@ -340,11 +410,16 @@ export class QueryRuntime {
           rel.op === "window" ||
           rel.op === "setOp",
       )
-      .reduce((sum, entry) => sum + 1 + (entry.loanSlots ?? 0), 0);
+      .reduce(
+        (sum, entry) =>
+          sum +
+          (1 + (entry.loanSlots ?? 0)) * this.#operatorStepBytes(entry.rel, inputs, largestInput),
+        0,
+      );
     return (
       inputs +
       entries.reduce((sum, entry) => sum + entry.minimum, 0) +
-      borrowers * progress +
+      borrowers +
       this.#readBytes +
       (entries.length === 0
         ? 0
@@ -422,9 +497,15 @@ export class QueryRuntime {
     idleCredit?: Grant,
   ): MaybePromise<void> {
     const atomic = this.#atomicResult !== null;
-    const progress = atomic
-      ? this.#stepBytes(binding.logicalBytes ?? binding.bytes, binding.largestSlot)
-      : 0;
+    const progress = (rel: OperatorIdentity) =>
+      atomic
+        ? this.#operatorStepBytes(
+            rel,
+            binding.logicalBytes ?? binding.bytes,
+            binding.largestSlot,
+            binding.slotBytes,
+          )
+        : 0;
     // A helper slot explicitly declares bounded variable output, including project/filter
     // wrappers. Fund the base owner and every helper together, also after a phase restore.
     const explicitLoans = new Set(
@@ -438,7 +519,7 @@ export class QueryRuntime {
       rel.op === "window" ||
       rel.op === "setOp";
     this.#operatorProgress = new Map(
-      entries.filter(({ rel }) => canBorrow(rel)).map(({ rel }) => [rel.id, progress]),
+      entries.filter(({ rel }) => canBorrow(rel)).map(({ rel }) => [rel.id, progress(rel)]),
     );
     const window =
       atomic && entries.length > 0
