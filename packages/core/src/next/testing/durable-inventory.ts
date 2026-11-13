@@ -68,6 +68,7 @@ function context(node: ts.Node): string {
   return "<module>";
 }
 const BOUNDARIES = new Set([
+  "SnapshotSink.write",
   "ExtentWriter.write",
   "ExtentBuilder.append",
   "ExtentSpace.publish",
@@ -130,6 +131,7 @@ export function discoverDurableSources(): {
           const file = declaration.getSourceFile().fileName;
           const seam =
             /storage\/(?:extents|contract|idb-like)\.ts$/u.test(file) ||
+            file.endsWith("/format/snapshot.ts") ||
             file.endsWith("/lib.dom.d.ts");
           if (seam && BOUNDARIES.has(target)) {
             const key = `${relative(NEXT, path)}:${context(node)}:${node.expression.getText()} -> ${target}`;
@@ -165,6 +167,10 @@ const LOG = ["logFrame", "commitBody", "column", "catalogChange", "arrayValue"];
 export const DURABLE_EMISSIONS: Readonly<
   Record<string, { count: number; kinds: readonly string[] }>
 > = {
+  "format/snapshot.ts:SnapshotStreamWriter.#emit:this.sink.write -> SnapshotSink.write": {
+    count: 1,
+    kinds: ["snapshot", "snapshotFrame", "snapshotFooter", "snapshotColumn"],
+  },
   "format/manifest-codec.ts:writeGroupDirectory:writer.write -> ExtentWriter.write": {
     count: 2,
     kinds: ["groupPage", "groupIndex"],

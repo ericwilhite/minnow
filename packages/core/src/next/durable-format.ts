@@ -120,6 +120,8 @@ export const DURABLE_CODECS = {
     large: 128,
   },
   frame: { commit: 1 },
+  legacySnapshotPrefix: [0x4d, 0x49, 0x4e, 0x53, 0x4e, 0x41, 0x50, 0x31],
+  snapshotValue: { null: 0, define: 1, reference: 2 },
   snapshot: {
     catalogBegin: 1,
     catalogPart: 2,
@@ -375,7 +377,7 @@ export const DURABLE_FORMATS = {
     decoder: "decodeArrayValue",
     state: "implemented",
   },
-  // Reservation only. There is no production next portable snapshot decoder yet.
+  // Portable snapshot1 is independent of native storage layouts.
   snapshot: {
     magic: 0x4e534e4d,
     version: 1,
@@ -389,8 +391,8 @@ export const DURABLE_FORMATS = {
       { name: "LSN high reserved", offset: 36, width: 4, mask: 0x1fffff },
       ...[40, 44, 48, 52, 56].map((offset) => zero(offset, 4)),
     ],
-    decoder: "none: design only",
-    state: "design",
+    decoder: "decodeSnapshotHeader",
+    state: "implemented",
   },
   snapshotFrame: {
     magic: 0x46534e4d,
@@ -406,9 +408,34 @@ export const DURABLE_FORMATS = {
       { name: "object high reserved", offset: 20, width: 4, mask: 0x1fffff },
       zero(32, 4),
     ],
-    decoder: "none: design only",
-    state: "design",
+    decoder: "decodeSnapshotFrame",
+    state: "implemented",
   },
+  snapshotColumn: {
+    magic: 0x43504e4d,
+    version: 1,
+    parent: "snapshot",
+    versionIn: "header",
+    fields: [
+      magic(0x43504e4d),
+      version(4),
+      { name: "layout", offset: 5, width: 1, values: [1, 2, 3, 4, 5, 6, 7, 8, 9] },
+      zero(6, 2),
+      zero(12, 4),
+    ],
+    decoder: "decodeSnapshotColumnHeader",
+    state: "implemented",
+  },
+  snapshotFooter: inherited("snapshot", "decodeSnapshotFooter", [
+    zero(28, 4),
+    zero(76, 4),
+    ...[20, 36, 44, 52, 60, 68].map((offset) => ({
+      name: "u53 high reserved",
+      offset,
+      width: 4 as const,
+      mask: 0x1fffff,
+    })),
+  ]),
 } as const satisfies Readonly<Record<string, Format>>;
 export type DurableFormatName = keyof typeof DURABLE_FORMATS;
 

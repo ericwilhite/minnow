@@ -1531,11 +1531,27 @@ export class ChunkReader {
     return this.#values.has(row);
   }
 
+  /** Nullable length from a loaded page; does not materialize an out-of-line value. */
+  valueLength(row: number): number | null {
+    this.#live();
+    const page = pageIndexOf(this.directory.pages, row),
+      view = this.#view(page);
+    const local = row - at(this.directory.pages, page).firstRow;
+    if (local < 0 || local >= view.rowCount) throw new RangeError("Row outside the chunk");
+    if (view.tag !== ValueTag.varlen) throw new TypeError("Expected varlen page");
+    if (
+      view.allNull ||
+      (view.validity !== null && ((view.validity[local >>> 5] ?? 0) & (1 << (local & 31))) === 0)
+    )
+      return null;
+    return this.varlenBytes(row, row + 1);
+  }
+
   /**
    * Streams the value of chunk row `row` (its page must be loaded): an inline value as one
    * array, an out-of-line one part by part (≤ 1 MiB each, verified, charged while it is held).
    * Each yielded array is valid until the next step; nothing is yielded for null. Inline
-   * parts retain the page's shared read lease (possibly covering other pages too), independent
+   * parts retain the page/dictionary's shared read lease (possibly covering other pages too), independent
    * of page release, or a charged copy if the page was peeked/inflated without a lease.
    * Out-of-line memory: one part, whatever the value's size. Retained leases stay charged whole.
    *
@@ -1608,6 +1624,32 @@ export class ChunkReader {
     if (view.validity !== null && (((view.validity[local >>> 5] ?? 0) >>> (local & 31)) & 1) === 0)
       return null;
     if (view.allNull) return null;
+    if (view.tag !== ValueTag.varlen) throw new TypeError("Expected varlen page");
+    if (view.kind === PageEncoding.dictionary) {
+      const dictionary = this.#dictionary,
+        code = view.unsigned === null ? view.aux : (view.unsigned[local] ?? 0);
+      if (dictionary?.offsets === null || dictionary === null)
+        throw new TypeError("Missing varlen dictionary");
+      const from = dictionary.offsets[code] ?? 0,
+        end = dictionary.offsets[code + 1] ?? 0;
+      return this.#holdPart(
+        dictionary.bytes,
+        from,
+        end,
+        stream,
+        this.#dictionaryHeld?.lease ?? null,
+      );
+    }
+    if (view.kind === PageEncoding.constant) {
+      if (view.data === null) throw new TypeError("Missing constant bytes");
+      return this.#holdPart(
+        view.data,
+        0,
+        view.data.length,
+        stream,
+        this.#held[page]?.lease ?? null,
+      );
+    }
     return isLarge(view, local)
       ? this.#valueRefs(view, local)
       : this.#inlinePart(view, local, stream, this.#held[page]?.lease ?? null);
@@ -1633,6 +1675,16 @@ export class ChunkReader {
     // cheaper per value than copying; a peeked/inflated page has no lease, so copy it.
     const from = offsets[local] ?? 0;
     const end = offsets[local + 1] ?? 0;
+    return this.#holdPart(data, from, end, stream, lease);
+  }
+
+  #holdPart(
+    data: Uint8Array,
+    from: number,
+    end: number,
+    stream: Stream,
+    lease: SharedLease | null,
+  ): Uint8Array {
     if (lease !== null) {
       lease.retain();
       stream.page = lease;

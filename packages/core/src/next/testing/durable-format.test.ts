@@ -1,6 +1,19 @@
 /** Registry law: unknown durable identities/tags/reserved bits never mean empty or decoded data. */
 import fc from "fast-check";
 import {
+  encodeSnapshotColumnHeader,
+  decodeSnapshotColumnHeader,
+} from "../write/snapshot-column.js";
+import {
+  encodeSnapshotHeader,
+  decodeSnapshotHeader,
+  encodeSnapshotFrame,
+  decodeSnapshotFrame,
+  encodeSnapshotFooter,
+  decodeSnapshotFooter,
+  snapshotCrc32,
+} from "../format/snapshot.js";
+import {
   discoverDurableSources,
   DURABLE_EMISSIONS,
   DURABLE_REFERENCES,
@@ -259,11 +272,44 @@ function runAdapter(
     },
   };
 }
-function adapters(): Record<
-  Exclude<DurableFormatName, "snapshot" | "snapshotFrame" | "indexedDb">,
-  Adapter
-> {
+function adapters(): Record<Exclude<DurableFormatName, "indexedDb">, Adapter> {
+  const header = { id: new Uint8Array(16), sourceLsn: 3 };
+  const snapshot = new Uint8Array(64);
+  encodeSnapshotHeader(header, snapshot);
+  const snapshotFrame = new Uint8Array(48);
+  encodeSnapshotFrame(
+    { kind: 1, ordinal: 0, objectId: 1, partIndex: 0, payload: new Uint8Array(0) },
+    snapshotFrame,
+  );
+  const footer = new Uint8Array(80);
+  encodeSnapshotFooter(
+    header,
+    { frames: 3, objects: 1, tables: 0, rows: 0, columnBytes: 0, catalogCrc: 1, streamCrc: 1 },
+    footer,
+  );
+  const portable = new Uint8Array(16);
+  encodeSnapshotColumnHeader(integer.type, 2, portable);
   return {
+    snapshotColumn: {
+      bytes: portable,
+      decode: (bytes) => decodeSnapshotColumnHeader(integer.type, bytes),
+    },
+    snapshot: {
+      bytes: snapshot,
+      decode: decodeSnapshotHeader,
+      repair: (bytes) =>
+        new DataView(bytes.buffer).setUint32(60, snapshotCrc32(bytes.subarray(0, 60)), true),
+    },
+    snapshotFrame: {
+      bytes: snapshotFrame,
+      decode: decodeSnapshotFrame,
+      repair: (bytes) => {
+        const v = new DataView(bytes.buffer);
+        v.setUint32(36, snapshotCrc32(bytes.subarray(0, 36)), true);
+        v.setUint32(40, snapshotCrc32(bytes.subarray(0, 40)), true);
+      },
+    },
+    snapshotFooter: { bytes: footer, decode: (bytes) => decodeSnapshotFooter(header, bytes) },
     rootSlot: {
       bytes: encodeRootSlot(1, new Uint8Array([1, 2, 3])),
       decode: (bytes) => decodeRootSlot(bytes),
@@ -540,7 +586,7 @@ for (const seed of seedsFor("next-durable-aliases", [0xb227, 0xb228]))
     reach.assertReached();
   });
 
-it("has a real adapter for every implemented byte decoder and keeps snapshot design-only", () => {
+it("has a real adapter for every implemented byte decoder including portable snapshot1", () => {
   const all = adapters();
   expect(DURABLE_READER_VERSION).toBeGreaterThanOrEqual(1);
   expect(DURABLE_READER_VERSION).toBeLessThanOrEqual(8);
@@ -556,18 +602,14 @@ it("has a real adapter for every implemented byte decoder and keeps snapshot des
     for (const kind of kinds) expect(emitted.has(kind), `unemitted reference ${kind}`).toBe(true);
   expect(
     Object.keys(DURABLE_FORMATS)
-      .filter(
-        (name) =>
-          DURABLE_FORMATS[name as DurableFormatName].state === "implemented" &&
-          name !== "indexedDb",
-      )
+      .filter((name) => name !== "indexedDb")
       .sort(),
   ).toEqual([...emitted].filter((kind) => kind !== "indexedDb").sort());
   expect(Object.keys(all).sort()).toEqual(
     [...emitted].filter((kind) => kind !== "indexedDb").sort(),
   );
   expect([...DURABLE_REGISTRY_REACH].sort()).toEqual(Object.keys(all).sort());
-  expect(DURABLE_FORMATS.snapshot.state).toBe("design");
+  expect(DURABLE_FORMATS.snapshot.state).toBe("implemented");
   expect(Object.isFrozen(DURABLE_FORMATS.page.fields)).toBe(true);
 }, 60_000); // The source inventory builds a TypeScript program, independently of decoder execution.
 

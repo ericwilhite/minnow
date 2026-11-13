@@ -4,6 +4,9 @@
  * from the published group after a re-point), and index probes and ranges that resolve put and
  * tombstone entries across memtable deltas and durable runs under the view's bound.
  */
+import { decodeDeletionBitmap } from "../format/deletion-bitmap.js";
+import type { TaskWork } from "../task.js";
+import { ParseBudgetError, decodeGroupRoot } from "../format/manifest-codec.js";
 import { hashKey } from "./key-hashes.js";
 import { MemoryReads } from "./memory-read.js";
 import { planIndexRange } from "./range-plan.js";
@@ -35,6 +38,7 @@ import {
   type MemoryReadHint,
   type MemoryChunkStep,
   type PageSummary,
+  type PortableChunk,
   type Segment,
   type Snapshot,
   type TableReadOptions,
@@ -117,6 +121,16 @@ function missingStatistics(column: ColumnDef | undefined, rows: number): ColumnS
   return { nullCount: rows, min: null, max: null, dictionarySize: null };
 }
 
+/** Count without allocating a deletion-position array during table totals. */
+function groupDeletedCount(view: TableView, groupId: number, bound: number): number {
+  let count = 0;
+  for (const seq of view.groupDeletes.byGroup.get(groupId)?.values() ?? [])
+    if (seq > view.foldedThrough && seq <= bound) count++;
+  for (const seq of view.groupSources.get(groupId)?.deletions.values() ?? [])
+    if (seq > view.foldedThrough && seq <= bound) count++;
+  return count;
+}
+
 class GroupSegmentImpl implements GroupSegment {
   readonly kind = "group" as const;
   readonly staged = false;
@@ -125,6 +139,8 @@ class GroupSegmentImpl implements GroupSegment {
   #group: GroupRef | null = null;
   #root: GroupRoot | null = null;
   #deleted: number | null = null;
+  #portableRoot: Held<GroupRoot> | null = null;
+  #closed = false;
 
   /** Group `position` of `directory`, read from its columns (`group` decodes it on demand). */
   constructor(
@@ -132,6 +148,8 @@ class GroupSegmentImpl implements GroupSegment {
     readonly directory: GroupDirectory,
     readonly position: number,
     readonly view: TableSnapshotImpl,
+    readonly portable = false,
+    readonly portableWork: TaskWork = {},
   ) {
     this.rowCount = directory.rowCount(position);
     this.#groupId = directory.groupId(position);
@@ -143,9 +161,9 @@ class GroupSegmentImpl implements GroupSegment {
 
   get liveRowCount(): number {
     if (this.#deleted === null) {
-      const delta = groupDeletions(this.view.tableView, this.#groupId, this.view.snapshot.bound);
+      const delta = groupDeletedCount(this.view.tableView, this.#groupId, this.view.snapshot.bound);
       // The durable bitmap is in the group's live count; delta positions are not in it.
-      this.#deleted = this.rowCount - this.directory.liveRows(this.position) + delta.length;
+      this.#deleted = this.rowCount - this.directory.liveRows(this.position) + delta;
     }
     return this.rowCount - this.#deleted;
   }
@@ -155,9 +173,32 @@ class GroupSegmentImpl implements GroupSegment {
     const delta = groupDeletions(this.view.tableView, this.#groupId, this.view.snapshot.bound);
     const ref = this.directory.deletions(this.position);
     if (ref === null) return deletionVector(this.rowCount, null, delta);
+    if (this.portable) return this.#portableDeletions(ref, delta);
     return settle(this.view.snapshot.shared.bitmap(ref, this.rowCount), (bits) =>
       deletionVector(this.rowCount, bits, delta),
     );
+  }
+
+  async #portableDeletions(
+    ref: import("../storage/extents.js").BlobRef,
+    delta: number[],
+  ): Promise<DeletionVector | null> {
+    const lease = await this.view.snapshot.pages.read([ref], {
+      budget: this.view.budget,
+      retain: false,
+      task: this.portableWork,
+      ...(this.portableWork.signal === undefined ? {} : { signal: this.portableWork.signal }),
+    });
+    try {
+      this.view.snapshot.check();
+      return deletionVector(
+        this.rowCount,
+        decodeDeletionBitmap(need(lease.bytes[0]), this.rowCount),
+        delta,
+      );
+    } finally {
+      lease.release();
+    }
   }
 
   /** The group root's read while it is in flight (concurrent first calls share it). */
@@ -172,7 +213,12 @@ class GroupSegmentImpl implements GroupSegment {
     if (this.#root !== null) return this.#root;
     const got =
       this.#pending ??
-      this.view.snapshot.shared.groupRoot(this.directory.root(this.position), this.view.budget);
+      (this.portable
+        ? this.#readPortableRoot()
+        : this.view.snapshot.shared.groupRoot(
+            this.directory.root(this.position),
+            this.view.budget,
+          ));
     if (got instanceof Promise && this.#pending !== got) {
       this.#pending = got;
       // A failed read is not kept: concurrent callers share its rejection, a later call retries
@@ -182,12 +228,54 @@ class GroupSegmentImpl implements GroupSegment {
       });
     }
     return settle(got, (held) => {
+      if (this.#closed || this.view.snapshot.released) {
+        held.release();
+        throw new SnapshotReleasedError();
+      }
       if (this.#root === null) {
         this.#root = held.value;
-        this.view.snapshot.hold(held);
+        if (this.portable) this.#portableRoot = held;
+        else this.view.snapshot.hold(held);
       }
       return this.#root;
     });
+  }
+
+  async #readPortableRoot(): Promise<Held<GroupRoot>> {
+    const lease = await this.view.snapshot.pages.read([this.directory.root(this.position)], {
+      budget: this.view.budget,
+      retain: false,
+      task: this.portableWork,
+      ...(this.portableWork.signal === undefined ? {} : { signal: this.portableWork.signal }),
+    });
+    try {
+      this.view.snapshot.check();
+      const parsed = decodeGroupRoot(need(lease.bytes[0]), this.view.budget);
+      let released = false;
+      return {
+        value: parsed.value,
+        release: () => {
+          if (released) return;
+          released = true;
+          this.view.budget.free(parsed.charge);
+        },
+      };
+    } finally {
+      lease.release();
+    }
+  }
+
+  releaseRoot(): void {
+    if (!this.portable) return; // Ordinary callers retain their existing snapshot lifetime.
+    this.#portableRoot?.release();
+    this.#portableRoot = null;
+    this.#root = null;
+    this.#pending = null;
+  }
+
+  closePortable(): void {
+    this.#closed = true;
+    this.releaseRoot();
   }
 
   #requireRoot(): GroupRoot {
@@ -311,6 +399,28 @@ class MemorySegmentImpl implements MemorySegment {
       });
     }
     return out;
+  }
+
+  portableChunk(columnId: number, chunk: number): MaybePromise<PortableChunk> {
+    this.view.snapshot.check();
+    const first = chunk * MEMORY_CHUNK_ROWS;
+    const length = Math.min(MEMORY_CHUNK_ROWS, this.rowCount - first);
+    if (!(Number.isInteger(chunk) && chunk >= 0 && length > 0))
+      throw new RangeError("Portable chunk outside segment");
+    const published = this.memtable.published;
+    if (published === null) {
+      this.memtable.borrow(chunk, this.borrowed);
+      this.borrowed = chunk;
+      const stored = this.memtable.chunks[this.view.columnIndex(columnId)]?.[chunk];
+      if (stored === undefined) throw new RangeError("A memtable chunk is missing");
+      return { kind: "resident", vector: stored.view(length), firstRow: first };
+    }
+    return settle(groupRootOf(published.groupRoot), (root) => {
+      this.view.snapshot.check();
+      const stored = root.columns.find((candidate) => candidate.columnId === columnId);
+      if (stored === undefined) throw new RangeError("Published portable column missing");
+      return { kind: "stored", chunk: stored, firstRow: 0 };
+    });
   }
 
   chunk(
@@ -519,8 +629,61 @@ export class TableSnapshotImpl implements TableSnapshot {
 
   get liveRowCount(): number {
     let total = 0;
-    for (const segment of this.segments) total += segment.liveRowCount;
+    const groups = this.tableView.groups;
+    for (let position = 0; position < groups.count; position++)
+      total +=
+        groups.liveRows(position) -
+        groupDeletedCount(this.tableView, groups.groupId(position), this.snapshot.bound);
+    for (const memtable of this.tableView.memtables) {
+      const rows = memtable.visibleRows(this.snapshot.bound);
+      total += rows;
+      for (const [position, seq] of memtable.deletions)
+        if (position < rows && seq <= this.snapshot.bound) total--;
+    }
     return total;
+  }
+
+  async *portableSegments(work: TaskWork = {}): AsyncGenerator<Segment> {
+    this.snapshot.check();
+    // One segment, deletion positions (<=65,536), root hold/iterator wrappers; not O(groups).
+    const credit = 1024 * 1024;
+    if (!this.budget.allocate(credit)) throw new ParseBudgetError(credit);
+    let active: GroupSegmentImpl | MemorySegmentImpl | null = null;
+    const close = () => {
+      if (active instanceof GroupSegmentImpl) active.closePortable();
+      else if (active !== null && active.borrowed >= 0) {
+        active.memtable.unborrow(active.borrowed);
+        active.borrowed = -1;
+      }
+      active = null;
+    };
+    const unwatch = this.snapshot.watchCursor({ close });
+    try {
+      const groups = this.tableView.groups;
+      for (let position = 0; position < groups.count; position++) {
+        this.snapshot.check();
+        active = new GroupSegmentImpl(position, groups, position, this, true, work);
+        try {
+          yield active;
+        } finally {
+          close();
+        }
+      }
+      let index = groups.count;
+      for (const memtable of this.tableView.memtables) {
+        this.snapshot.check();
+        active = new MemorySegmentImpl(index++, memtable, this);
+        try {
+          yield active;
+        } finally {
+          close();
+        }
+      }
+    } finally {
+      close();
+      unwatch();
+      this.budget.free(credit);
+    }
   }
 
   /** Ends every memory segment's borrow (the snapshot is released). */

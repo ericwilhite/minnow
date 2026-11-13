@@ -3522,3 +3522,54 @@ Larger resident peer arrays retain their ordinary-credit growth and copy-overlap
 `window-peer-pressure.test.ts` compares seeded structural-key results with PGlite while
 a competitor holds all remaining credit; `window-emit-peak.test.ts` checks fitting-step
 peaks against the parent accounting model, including allocations on the pool boundary.
+
+### Portable snapshot1 framing (B2)
+
+`format/snapshot.ts` implements the independent portable container, not a native root backup.
+The 64-byte MNSN header selects version1 and codecSet1 before a target may be opened. MINSNAP1
+archives from Minnow0.x receive `MINNOW_LEGACY_DATA`; there is no conversion chain from0.x.
+Each MNSF frame carries at most1MiB, an ordinal, an object and part ID, header/body CRC32,
+and zero padding to8 bytes. Unknown selectors, reserved bits, damaged frames, missing footer,
+reordering and trailing bytes receive `MINNOW_SNAPSHOT_FORMAT`.
+
+Object IDs are consecutive from1; parts begin at0, continue from1 and end at the next index.
+TABLE_BEGIN/END enclose complete blocks of every column in ascending column-ID order. A block
+has1–65,536 rows and the same contiguous logical row range for every column. Empty tables have
+no column blocks. TABLE_BEGIN contains three u53s (table, schema, column count); COLUMN_BEGIN
+contains six (table, column, schema, first row, rows, encoded bytes). COLUMN_END is two u53s
+(bytes, rows); TABLE_END one (rows). CATALOG_END is u53 bytes, u32 catalog CRC, u32 zero.
+The80-byte footer contains UUID/LSN, catalog CRC, reserved zero, five u53 counts (preceding frames,
+objects, tables, rows, column bytes), preceding-stream CRC and reserved zero. Every integer is LE.
+The outer grammar alone does not validate column/catalog semantics or authorize publication.
+
+Stream sinks borrow bytes until `write()` settles. Reader frames borrow until advance or close.
+Both sides charge their bounded control and encoded buffers before allocation. Reader input
+chunks are charged whole while borrowed; producers should yield bounded chunks. Close/cancel
+returns all reader charges, including a suspended frame; an already-started sink remains charged
+until it settles. A refused or cancelled stream must never be published as a database.
+
+`write/snapshot-export.ts` adds `exportPinnedSnapshot`: it takes ownership of a committed pin,
+borrows the matching catalog byte producer, and waits for sink consumption before advancing.
+Every exit releases the pin, even when a catalog producer stalls or its cleanup never settles.
+Export uses the optional internal `portableSegments` traversal: one temporary segment and
+export-owned decoded root at a time; ordinary query segment and cache lifetimes are unchanged.
+Traversal close releases its metadata and memory borrows before the next segment.
+It emits stable visible row order, including committed memory rows,
+with deleted/pending rows excluded. Source pages use one-pass non-retaining reads. The optional
+internal memory `portableChunk` hook hands back either a resident borrow or published storage;
+a publication during export cannot force a whole large value into a decode buffer.
+
+Portable column1 starts with a16-byte MNPC header: version1, layout tag1–9, zero flags, row count
+(1–256), and a zero reserved word. Fixed rows carry validity0/1, then canonical LE value lanes
+for valid rows. Floats copy their raw words. Int64 uses signed64; decimal uses signed128 plus
+u16 scale and u8 special; interval uses i32 months/days and signed64 micros; UUID uses16 bytes.
+Varlen rows are NULL0, or DEFINE1/u32 length/value bytes followed by REF2/u32 code0. Each definition
+replaces the one-entry dictionary. This bounded dictionary keeps strings as bytes/codes and streams
+large entries across1MiB frame boundaries. Column framing declares and verifies total encoded bytes.
+The exporter holds one1MiB payload window, small fixed scratch and one column reader; buffers
+for frames, pages and retained dictionary/metadata borrows remain charged separately.
+Catalog capture/sequence scope and native load/publication composition are subsequent stages.
+
+Stream writers validate the16-byte identity and safe-integer LSN before charging or cloning them.
+A failing source iterator's `return()` cannot replace the primary typed legacy/format/cancel refusal;
+reader-owned buffers are released even if upstream cleanup fails synchronously or asynchronously.

@@ -19,6 +19,10 @@
  */
 /** Reset refusal must see every legacy marker and both OPFS capability states. */
 export const DURABLE_REGISTRY_REACH = [
+  "snapshot",
+  "snapshotFrame",
+  "snapshotFooter",
+  "snapshotColumn",
   "rootSlot",
   "epochSlot",
   "logHeader",
@@ -5033,3 +5037,69 @@ export const JSON_GROUP_CONSUMER_REACH = {
     "zero resources",
   ],
 } as const;
+
+export const SNAPSHOT_CODEC_REACH = [
+  "empty tables",
+  "table rows",
+  "zero columns",
+  "multiple columns",
+  "split input",
+  "large part",
+  "truncation",
+  "corruption",
+  "reorder",
+  "quota",
+  "cancel",
+  "trailing",
+  "all kinds",
+] as const;
+
+export const SNAPSHOT_EXPORT_REACH = [
+  "deleted rows",
+  "all live",
+  "resident",
+  "persisted",
+  "repoint",
+  "during export",
+  "quota",
+  "cancel",
+] as const;
+
+export const SNAPSHOT_PHYSICAL_REACH = [
+  "bool",
+  "i32",
+  "f32",
+  "f64",
+  "int64",
+  "interval",
+  "decimal",
+  "fixed16",
+] as const;
+
+export const SNAPSHOT_INPUT_REACH = [
+  "short id",
+  "long id",
+  "invalid lsn",
+  "no writes",
+  "zero charges",
+  "legacy refusal",
+  "version refusal",
+  "sync close failure",
+  "async close failure",
+] as const;
+
+export const SNAPSHOT_EXPORT_LIFETIME_REACH = [
+  "one persisted group",
+  "many persisted groups",
+  "stalled producer cancelled",
+  "stalled",
+  "throws",
+  "rejects",
+] as const;
+
+export const SNAPSHOT_SOURCE_REACH = [
+  "resident vector",
+  "published constant page",
+  "published dictionary page",
+  "array byte equality",
+] as const;
