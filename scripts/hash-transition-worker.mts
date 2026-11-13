@@ -80,6 +80,7 @@ export default async function create(context: CPUWorkerContext): Promise<CPUWork
   }
   async function query(check: boolean): Promise<void> {
     const result = await core.execute(sql);
+    if (result.kind !== "rows" || !("batches" in result)) throw new Error("Missing grouped rows");
     const values = oracleRows(result);
     assert.equal(values.length, groups);
     if (check) {
