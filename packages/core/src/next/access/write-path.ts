@@ -249,8 +249,11 @@ export interface WritePath {
    */
   statistics(tableId: number): TableSummary | null;
   /**
-   * Flushes, writes the final header, releases pins and memtables. Rejects open transactions
-   * (rolled back) and pending begins with `WritePathClosedError`. Idempotent.
+   * Flushes, writes the final header, and releases writer-owned pins and buffers. Rejects open
+   * transactions (rolled back) and pending begins with `WritePathClosedError`. Idempotent.
+   * Existing read snapshots remain caller-owned: their resident rows and native row account
+   * stay charged until those callers release the last pin after execution settles. Close
+   * transfers that lifetime without copying or waiting on the readers themselves.
    */
   close(): Promise<void>;
 }

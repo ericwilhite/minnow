@@ -107,7 +107,7 @@ import { OBJECT_OVERHEAD_BYTES, type Grant, type Loan } from "../memory/governor
 import { WriteCredits } from "./credits.js";
 import { RunSink } from "./run-output.js";
 import { writeStepMinimum, type WriteStepMinimum } from "./minimum.js";
-import { MetadataBudget } from "./budget.js";
+import { MetadataBudget, releaseIdle } from "./budget.js";
 import { GroupWriter } from "../page/writer.js";
 import type { StoreSession } from "../storage/contract.js";
 import { ExtentListKeeper, type ExtentList } from "../storage/extent-list.js";
@@ -2578,9 +2578,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (this.#appender.failure === null) await this.#appender.close();
     } finally {
       this.keys.close();
-      for (const state of this.#tables.values())
-        for (const memtable of state.view.memtables) memtable.releaseAll();
-      for (const memtable of this.#published) memtable.releaseAll();
       this.#currentPin?.release();
       this.#currentPin = null;
       this.#unbindMetadataCaches();
@@ -2591,10 +2588,25 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#body.close();
       this.#sequenceBody.close();
       this.#commitBuffers.close();
-      this.#arenaPool.close();
       this.#grant.free(OBJECT_OVERHEAD_BYTES);
-      this.#grant.close();
-      this.#credits.close();
+      // A read pin belongs to its caller until execution settles. Closing this
+      // writer cannot free arrays still retained by that reader. Hand the existing
+      // native row account and arena pool to the older-reader release fence; no
+      // copies, new credit or wait on a reader that may itself be awaiting close().
+      this.#arenaPool.clear();
+      this.#grant.onReclaimRequest(() => {
+        this.#arenaPool.clear();
+        return releaseIdle(this.#grant);
+      });
+      releaseIdle(this.#grant);
+      this.#credits.close({ keepRowsForReaders: true });
+      this.shared.readers.holdUntilOlderClose(() => {
+        for (const state of this.#tables.values())
+          for (const memtable of state.view.memtables) memtable.releaseAll();
+        for (const memtable of this.#published) memtable.releaseAll();
+        this.#arenaPool.close();
+        this.#grant.close();
+      });
     }
   }
 

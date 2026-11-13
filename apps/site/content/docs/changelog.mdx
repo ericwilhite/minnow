@@ -14,7 +14,9 @@ The unexported rebuild can retry an over-cap memory-source recipe by retaining o
 existing, owner-charged chunk through publication. Small wide-column scans no longer
 reserve the largest possible future metadata graph before they can read their rows.
 Already-fitting plans keep their previous path. Published prefixes use validated
-page bounds and preserve snapshot visibility. No public API or stored-format change.
+page bounds and preserve snapshot visibility. Closing the write path keeps resident
+source buffers charged until existing read snapshots release them, including scans
+already in flight. No public API or stored-format change.
 
 The unexported window executor funds its initial peer flags from existing prepaid emit
 workspace, avoiding a below-cap refusal under competing memory grants. Shared window

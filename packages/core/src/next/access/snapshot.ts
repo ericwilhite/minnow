@@ -95,6 +95,10 @@
  *   be used after release (the executor's aborted pipeline never touches them again).
  * - After release every method throws `SnapshotReleasedError` (defined here; exec/fetch.ts uses
  *   it). Locators die with the pin.
+ * - Closing the write path stops writers, not caller-owned read pins. Existing pins retain
+ *   the native row account and resident storage until their release fence drains. No reader
+ *   may keep using vectors after it releases its pin; a query closes its source recipe after
+ *   native work settles, returning its chunk borrow before the pin itself is released.
  * - Memory: a pin costs O(1) owner heap; what it retains is the write path's, reported as debt
  *   (`WritePathStats`), and bounded as above. Buffers it hands out are immutable: never write to
  *   them.

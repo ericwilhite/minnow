@@ -5128,3 +5128,19 @@ export const SOURCE_READ_RECIPE_REACH = [
   "producer handoff",
   "zero resources before owner pin release",
 ] as const;
+
+/** Source ownership is checked after native column reads, not just before admission. */
+export const SOURCE_MIDSCAN_REACH = [
+  "after first column",
+  "after second column",
+  "publication during scan",
+  "observed compaction",
+  "writer close retains charged source",
+  "snapshot release during scan",
+  "cancellation during scan",
+  "source recipe returns borrow after execution",
+  "last pin returns retained charge",
+  "two reader release fence",
+  "exact PostgreSQL rows",
+  "zero query resources",
+] as const;

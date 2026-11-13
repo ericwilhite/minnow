@@ -649,6 +649,11 @@ and copy scratch, without reserving a hypothetical maximum root and directory.
 The exact prepared table is reused in sizing and execution, including across producer
 handoffs, and the lease closes after native query work drains. Ordinary `readHint`
 calls still acquire no chunk borrow. Closing a recipe invalidates its lower-cost hints.
+Closing the write path stops writers but does not release caller-owned read snapshots.
+Its existing native row account, arena pool and resident rows pass to the older-reader
+release fence; unused account headroom returns immediately. Borrowed data stays charged
+through an in-flight scan, and the last pin releases the account without a copy or new
+admission. The write close does not wait on readers that may themselves be awaiting it.
 An already-published memory segment instead uses the ordinary validated stored-group
 recipe, retaining the old snapshot's visible prefix. Stored null-count pruning uses
 the complete physical group's row count, not the shorter visible prefix.
