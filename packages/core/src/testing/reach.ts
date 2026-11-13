@@ -8777,3 +8777,16 @@ export const SNAPSHOT_SOURCE_STABILITY_REACH = [
   "spool",
   "stable retry",
 ] as const;
+
+export const SNAPSHOT_SEQUENCE_CAPTURE_REACH = [
+  "ascending",
+  "descending",
+  "cycling",
+  "setval",
+  "restored",
+  "uninitialized",
+  "read only",
+  "older horizon preserved",
+  "released",
+  "denied",
+] as const;

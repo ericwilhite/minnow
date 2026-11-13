@@ -4316,3 +4316,12 @@ The digest has two 32-bit mixing lanes and detects accidental source changes; it
 adversarial integrity/authentication guarantee. The source must still honor immutable exact
 reads. This check also applies to owner-spooled input. Cancellation drains started reads and
 returns verification scratch before admission retries.
+
+`Sequences.capture(lsn, definitions, budget)` is the stage4 read-only restart-horizon primitive.
+It charges its immutable result before allocation and runs synchronously. Unlike checkpoint,
+it never prunes reservation history or logs a new reservation. Export must capture it in the
+same synchronous call as its committed pin, before awaiting output or a catalog producer.
+An untouched sequence captures its configured start; restored and setval horizons retain their
+exact bigint values. The result stays charged until its idempotent `release()`.
+Catalog lanes and logged changes use the common binary MCAT/MCHG codecs; stage4 does not add
+a parallel tagged-JSON grammar.
