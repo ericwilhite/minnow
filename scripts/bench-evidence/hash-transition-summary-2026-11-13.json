@@ -1,0 +1,185 @@
+{
+  "purpose": "Hash-key memory correctness; ordinary-path CPU guard, no speedup claim",
+  "control": "2e3d7ecba613389caabb0b962a6e4d6094707863",
+  "candidate": "16cc7299eb84f0bfcc3f8af9b59d56d6e39e5a4e",
+  "clock": "process CPU all threads, fresh serial VM per arm/workload/boundary; balanced AB/BA; natural GC; 10 warmups",
+  "uniqueTimedPIDs": 72,
+  "quartiles": "type 7, linear interpolation (n-1)*p",
+  "fixture": "32768 stored/decoded TEXT rows, 8192 account-NNNNNNNN groups; exact keys/counts/IDs checked before/after",
+  "records": [
+    {
+      "phase": "aa",
+      "boundary": "operator",
+      "iterations": 50,
+      "medianControlMs": 398.213,
+      "medianCandidateMs": 394.427,
+      "medianDeltaMs": -5.574000000000012,
+      "iqrDeltaMs": 12.379000000000019,
+      "rangeDeltaMs": [-21.229000000000042, 9.860000000000014],
+      "pairDeltasMs": [
+        -5.574000000000012, 9.860000000000014, 2.855000000000018, -10.737000000000023,
+        1.641999999999996, -13.649000000000001, -9.012999999999977, -21.229000000000042,
+        -2.4259999999999877
+      ],
+      "favoursCandidate": 6,
+      "acceptedGain": false,
+      "significantRegression": false,
+      "load1Range": [16.61, 19.19]
+    },
+    {
+      "phase": "aa",
+      "boundary": "query",
+      "iterations": 10,
+      "medianControlMs": 390.973,
+      "medianCandidateMs": 401.488,
+      "medianDeltaMs": 13.519999999999982,
+      "iqrDeltaMs": 42.247999999999934,
+      "rangeDeltaMs": [-79.12600000000003, 68.007],
+      "pairDeltasMs": [
+        -42.72700000000003, -3.7799999999999727, 68.007, 40.849999999999966, -79.12600000000003,
+        19.557999999999993, 9.420000000000016, 38.46799999999996, 13.519999999999982
+      ],
+      "favoursCandidate": 3,
+      "acceptedGain": false,
+      "significantRegression": false,
+      "load1Range": [18.51, 20.54]
+    },
+    {
+      "phase": "ab",
+      "boundary": "operator",
+      "iterations": 50,
+      "medianControlMs": 407.466,
+      "medianCandidateMs": 403.982,
+      "medianDeltaMs": -3.4839999999999804,
+      "iqrDeltaMs": 8.190000000000055,
+      "rangeDeltaMs": [-30.406999999999982, 63.471000000000004],
+      "pairDeltasMs": [
+        -4.822000000000003, 2.2350000000000136, -5.955000000000041, -13.659999999999968,
+        -3.4839999999999804, -0.7970000000000255, 26.14300000000003, 63.471000000000004,
+        -30.406999999999982
+      ],
+      "favoursCandidate": 6,
+      "acceptedGain": false,
+      "significantRegression": false,
+      "load1Range": [18.39, 19.5]
+    },
+    {
+      "phase": "ab",
+      "boundary": "query",
+      "iterations": 10,
+      "medianControlMs": 325.484,
+      "medianCandidateMs": 363.407,
+      "medianDeltaMs": 15.285000000000025,
+      "iqrDeltaMs": 53.111999999999966,
+      "rangeDeltaMs": [-93.64300000000003, 76.42899999999997],
+      "pairDeltasMs": [
+        19.035000000000025, -93.64300000000003, 76.42899999999997, 63.14699999999999,
+        56.79499999999996, 4.3349999999999795, 15.285000000000025, -65.96699999999998,
+        3.6829999999999927
+      ],
+      "favoursCandidate": 2,
+      "acceptedGain": false,
+      "significantRegression": false,
+      "load1Range": [17.42, 18.46]
+    }
+  ],
+  "peaks": {
+    "candidate": "16cc7299eb84f0bfcc3f8af9b59d56d6e39e5a4e",
+    "records": [
+      {
+        "name": "main",
+        "parent": "ac8e2af1eee5caf5722aadf68a40e4cd45e3f824",
+        "cases": 416,
+        "parentSuccesses": 151,
+        "candidateSuccesses": 368,
+        "lostSuccesses": [],
+        "wrongResults": [],
+        "peakIncreases": [],
+        "unpinnedTotalIncreases": [],
+        "hashErrorsFixed": 19,
+        "remainingHashErrors": 0,
+        "maxQueryPeakDelta": 0,
+        "maxQueryPeakSaving": 497152,
+        "cleanupZero": true,
+        "success": true
+      },
+      {
+        "name": "control",
+        "parent": "2e3d7ecba613389caabb0b962a6e4d6094707863",
+        "cases": 416,
+        "parentSuccesses": 349,
+        "candidateSuccesses": 368,
+        "lostSuccesses": [],
+        "wrongResults": [],
+        "peakIncreases": [],
+        "unpinnedTotalIncreases": [],
+        "hashErrorsFixed": 19,
+        "remainingHashErrors": 0,
+        "maxQueryPeakDelta": 0,
+        "maxQueryPeakSaving": 0,
+        "cleanupZero": true,
+        "success": true
+      }
+    ],
+    "sourceHashes": {
+      "packages/core/src/next/exec/agg/groups.ts": "b3852eaefe3a66cd34c579e391dcd2116cda813447ec4e3f72a0ad82885abc64",
+      "packages/core/src/next/exec/agg/growth.ts": "bd7f26697416756ea4a52735913767af5352ab36aa5c837731bb96fc1938f2f8"
+    },
+    "rawHashes": {
+      "compare-main.log": "2ff40136d63660403fbafa23cbfad7752a4d5342d59fc88c88468eb677d3daa9",
+      "compare-control.log": "f8366472617fab73caf5369662d2ac02bec227a293b9d47659fa7d79505b5a5f",
+      "compare-candidate.log": "380f675064746515a8df8e3010662259cedbfecf995c13225242d9f3b4960982"
+    }
+  },
+  "mutants": [
+    {
+      "name": "parent-original",
+      "exit": 1,
+      "reason": "HashHeadroomError",
+      "rejected": true,
+      "seconds": 11.282278261031024,
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "packages/core/src/next/exec/agg/byte-growth.test.ts",
+        "packages/core/src/next/testing/executor-hash-transition.test.ts",
+        "--config",
+        "/home/eric/.cache/b4-projection/vitest-star-two.mts",
+        "--maxWorkers=2"
+      ]
+    },
+    {
+      "name": "no-byte-funding",
+      "exit": 1,
+      "reason": "HashHeadroomError",
+      "rejected": true,
+      "seconds": 1.8839261470129713,
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "packages/core/src/next/exec/agg/byte-growth.test.ts",
+        "--config",
+        "/home/eric/.cache/b4-projection/vitest-star-two.mts",
+        "--maxWorkers=2"
+      ]
+    }
+  ],
+  "hashes": {
+    "cpu-final.json": "9c9f0a733ec19d27c5e069adc6743a573b7a0de4c6d928cc808e9e63cd64ce7b",
+    "cpu-before-type-guard.json": "888773b32f802931b8a0710f94f509aea5f6c109b37b309faf7bb2278052f490",
+    "control-runtime-hashes.json": "b4fcd755630367bd8d95c82381bec9f23a122208d8504237833dd2a37591aeec",
+    "candidate-runtime-hashes.json": "fc5ad6a3610a7db2bec45884e1df1b392659eac6d2530c02988ade473111467f",
+    "mutants.json": "49ed862c19fda838e8dbfa30651825c9f3792af1ab39c2d9665c72f8a09cb827",
+    "hash-transition-worker.mts": "22ea10685bc833eab7dfca205b07abc182960f4d3e0f0c53bef797ed397c70f3",
+    "hash-transition-cpu.mts": "3fa6056b084796339c7ca8d95759ef9ebebca61efc7b62e7d4bde7e68ddd101e"
+  },
+  "reproduction": "TMPDIR=<scratch> node scripts/hash-transition-cpu.mts <built-control> <built-candidate> <raw-output.json> <controlSHA> <candidateSHA>",
+  "limits": [
+    "No throughput/browser/RSS or accepted CPU improvement claim.",
+    "48 unchanged complete-minimum-over-cap refusals remain in the 416-case matrix.",
+    "Earlier guard before benchmark-only type narrowing was also neutral; retained raw samples.",
+    "Raw samples, comparison matrix and source archives remain under /home/eric/.cache/b4-hash-transition."
+  ]
+}
