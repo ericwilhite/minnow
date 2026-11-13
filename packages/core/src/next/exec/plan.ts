@@ -2639,8 +2639,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       kind === "json" ? 48 : kind === "array" ? 64 : 0;
     let opaqueConsumerStep = 0;
     runtime.groupKeyProgress((id, loanSlot, slots, largest, minimum, ordinary) => {
-      // A sort can retain operands while its consumer compares group boundaries.
-      // Fund each actual comparator/sort's keys; unrelated helper lanes stay ordinary.
+      // Internal JSON sorts release their shared semantic pair before yielding to
+      // a group boundary. Only the host lane funds that workspace, once.
       // Most plans/borrowers have no semantic grouping workspace. Avoid walking all
       // source bounds or building size closures on their ordinary admission path.
       if (loanSlot === undefined) {
@@ -2684,53 +2684,71 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         // Exact checkpoint fields take over as soon as the producer exposes them.
         return Math.max(ordinary + bytes, opaque ? opaqueConsumerStep : 0);
       }
-      let maximum = 0;
       for (const planner of jsonGroups) {
         if (planner.rel.id !== id || !semanticActive.has(planner.rel.id)) continue;
         if (jsonFrontier.get(runtime) !== planner.rel.id) continue;
         const consumer = jsonGroupConsumer(planner.rel, loanSlot);
-        if (!consumer) return 0;
-        const one = singleGroupInput(planner.rel.input);
-        if (one && consumer.boundary) return 0;
-        const operands = 2;
-        let bytes = 0,
-          keyBytes = 0;
-        const variable = (kind: string) =>
-          ["text", "bytes", "json", "array", "enum", "decimal"].includes(kind);
-        let rowBytes = 2048 + 256 * (consumer.columns.length + 1);
-        for (const column of consumer.columns) {
-          const type = planner.input[column];
-          rowBytes += variable(type?.kind ?? "")
+        if (!consumer && loanSlot !== 0) return 0;
+        const consumers = Array.from({ length: planner.loans }, (_, slot) =>
+          jsonGroupConsumer(planner.rel, slot),
+        ).filter(
+          (c): c is NonNullable<typeof c> =>
+            c !== null && !(c.boundary && singleGroupInput(planner.rel.input)),
+        );
+        let semantic = 0;
+        for (const c of consumers)
+          for (const [position, key] of c.keys.entries()) {
+            const kind = planner.input[key]?.kind;
+            const collation = c.collations?.[position];
+            const allowance =
+              c.boundary && byteArrayGroupKey(planner.input[key])
+                ? 0
+                : kind === "text" &&
+                    collation &&
+                    !["C", "POSIX", "default", "ucs_basic"].includes(collation)
+                  ? 4
+                  : pairAllowance(kind);
+            if (allowance)
+              semantic = Math.max(
+                semantic,
+                allowance * (columnInputBytes(planner.rel.input, key, sizes) ?? fallback) + 80,
+              );
+          }
+        opaqueConsumerStep = Math.max(opaqueConsumerStep, ordinary + semantic);
+        // This change belongs to decoded semantic keys. Keep ordinary-only plans
+        // byte-for-byte in their existing admission model (including outer bounds).
+        if (semantic === 0) return 0;
+        const columns = loanSlot === 0 ? planner.input.map((_, i) => i) : consumer?.columns;
+        if (!columns) return 0;
+        // Encoded variable keys add a separate escaped-key column to each page;
+        // wide NUMERIC also has coefficient copies. Preserve those existing compound
+        // IO envelopes instead of treating their stored pages as three raw rows.
+        if (columns.some((column) => planner.input[column]?.kind === "decimal"))
+          return loanSlot === 0 ? ordinary + semantic : 0;
+        if (
+          loanSlot !== 0 &&
+          consumer &&
+          !consumer.keys.some((k) => ["json", "array"].includes(planner.input[k]?.kind ?? "")) &&
+          consumer.keys.some((k) =>
+            ["text", "bytes", "enum", "decimal"].includes(planner.input[k]?.kind ?? ""),
+          )
+        )
+          return 0;
+        let raw = 2048 + 256 * (columns.length + 1);
+        for (const column of columns) {
+          const kind = planner.input[column]?.kind;
+          raw += ["text", "bytes", "json", "array", "enum", "decimal"].includes(kind ?? "")
             ? (columnInputBytes(planner.rel.input, column, sizes) ?? fallback)
             : 16;
         }
-
-        const counts = new Map<number, number>();
-        for (const key of consumer.keys) counts.set(key, (counts.get(key) ?? 0) + 1);
-        for (const [key, count] of counts) {
-          const kind = planner.input[key]?.kind;
-          const allowance =
-            consumer.boundary && byteArrayGroupKey(planner.input[key]) ? 0 : pairAllowance(kind);
-          const operand = variable(kind ?? "")
-            ? (columnInputBytes(planner.rel.input, key, sizes) ?? fallback)
-            : 16;
-          // Native JsonRecords fixed cells include a bounded page and, for wide
-          // NUMERIC, its separately restored coefficient. Varlen cells stay raw.
-          keyBytes +=
-            count * (kind === "decimal" ? 512 + 2 * operand : variable(kind ?? "") ? operand : 512);
-          if (allowance > 0) bytes += allowance * count * operand + 40 * operands * count;
-        }
-        opaqueConsumerStep = Math.max(opaqueConsumerStep, ordinary + bytes);
-        if (bytes === 0) return 0;
-        // These are complete consumer steps, not additions to the common row
-        // envelope. The sort holds two pages and one output row; the comparator
-        // restores one representative and its bounded record IO alongside trees.
-        bytes += consumer.boundary
-          ? keyBytes + 7 * consumer.keys.length + 2048 + 2048 * consumer.keys.length + (512 << 10)
-          : 3 * rowBytes + (64 << 10);
-        maximum = Math.max(maximum, bytes);
+        // Host record IO/representative restoration and serialization are a compound
+        // raw-row step. Internal sorts hold two pages and one output copy. Their
+        // decoded pair is paid ONCE on lane0, never on every borrowing entry.
+        return {
+          complete: loanSlot === 0 ? 4 * raw + (512 << 10) + semantic : 3 * raw + (64 << 10),
+        };
       }
-      return maximum;
+      return 0;
     });
     const hasAggregateProgress = [
       ...aggregatePlanners.keys(),

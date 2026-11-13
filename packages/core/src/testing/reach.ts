@@ -5574,3 +5574,84 @@ export const SOURCE_MIDSCAN_REACH = [
   "exact PostgreSQL rows",
   "zero query resources",
 ] as const;
+
+/** Each fixed key-count cell generates independent widths/payloads and real pressure. */
+export const JSON_GROUP_STEP_REACH = [
+  "sixteen MiB cap",
+  "all competing credit occupied",
+  "exact PostgreSQL text",
+  "wide payload",
+  "tiny payload",
+  "UTF8",
+  "ASCII",
+  "FILTER",
+  "unfiltered",
+  "SQL NULL key",
+  "nonnull keys",
+  "multiple inputs",
+  "observed spill",
+  "zero resources",
+] as const;
+
+/** Every literal/computed key count is a permanent step-peak generator dimension. */
+export const JSON_GROUP_STEP_COUNTS_REACH = [
+  "keys 1",
+  "keys 2",
+  "keys 3",
+  "keys 4",
+  "keys 5",
+  "keys 6",
+  "keys 7",
+  "keys 8",
+  "keys 9",
+  "keys 10",
+  "keys 11",
+  "keys 12",
+  "keys 13",
+  "keys 14",
+  "keys 15",
+  "keys 16",
+] as const;
+
+/** Nested structural controls must never exceed the frozen fitting main peaks. */
+export const JSON_GROUP_NESTED_PEAK_REACH = [
+  "wide first key",
+  "wide middle key",
+  "wide last key",
+  "uniform widths",
+  "UTF8",
+  "ASCII",
+  "ascending aggregate",
+  "descending aggregate",
+  "NULL first key",
+  "NULL middle key",
+  "NULL last key",
+  "sixteen MiB",
+  "nested keys",
+  "exact PostgreSQL text",
+  "no peak rise",
+  "zero resources",
+] as const;
+
+/** New widths/container depths and NULL-group layouts, beyond frozen peak controls. */
+export const JSON_GROUP_NESTED_GENERATED_REACH = [
+  "one key",
+  "multiple keys",
+  "six keys",
+  "wide widths",
+  "narrow widths",
+  "shallow nesting",
+  "nested containers",
+  "deep nesting",
+  "SQL NULL groups",
+  "no NULL groups",
+  "multiple NULL groups",
+  "ASCII",
+  "UTF8",
+  "observed resident cache",
+  "decoded cache retired",
+  "unused growth returned",
+  "new random shape",
+  "exact PostgreSQL text",
+  "zero resources",
+] as const;

@@ -4,14 +4,8 @@ import type { Grant } from "../../memory/governor.js";
 import type { PhysicalType } from "../../types.js";
 import type { Vector } from "../../vector/vector.js";
 import type { Pool } from "../spill-pool.js";
-import {
-  compareRows,
-  decodeOperands,
-  dropOperands,
-  emptyOperands,
-  operandBytes,
-  type SortColumn,
-} from "../sort-keys.js";
+import { SemanticStep, semanticStepBytes } from "../semantic-step.js";
+import type { SortColumn } from "../sort-keys.js";
 /** Pair of semantic trees plus encoded read/key/write workspace, relative to four row copies. */
 export function jsonGroupWorkspaceMultiplier(
   types: readonly PhysicalType[],
@@ -32,12 +26,13 @@ export class JsonGroupKeys {
     readonly grant: Grant,
     readonly signal: AbortSignal,
     readonly pace: () => Promise<void>,
+    readonly step = new SemanticStep(pool, grant, signal),
   ) {
     this.#byteArrays = keys.filter((k) => byteArrayGroupKey(types[k.column]));
     this.decodedKeys = keys.filter((k) => !byteArrayGroupKey(types[k.column]));
   }
   operandBytes(columns: readonly Vector[], row: number): number {
-    return operandBytes(this.types, this.decodedKeys, columns, row, row + 1);
+    return semanticStepBytes(this.types, this.decodedKeys, columns, row, row + 1) / 2;
   }
   async equal(
     left: readonly Vector[],
@@ -52,24 +47,12 @@ export class JsonGroupKeys {
       if (!a || !b) throw new Error("Missing array grouping vector");
       if (!(await equalByteArrayKeys(a, i, b, j, this.pace))) return false;
     }
-    const a = emptyOperands(this.types, this.decodedKeys),
-      b = emptyOperands(this.types, this.decodedKeys);
     const bytes = this.operandBytes(left, i) + this.operandBytes(right, j);
-    // Preflight both live decoded rows as one step, before building either tree.
-    await this.pool.need(bytes, this.grant, this.signal);
-    const release = this.pool.pinStep();
+    await this.step.prepare(this, bytes);
     try {
-      if (
-        decodeOperands(this.types, this.decodedKeys, left, i, i + 1, this.pool, a) !== 0 ||
-        decodeOperands(this.types, this.decodedKeys, right, j, j + 1, this.pool, b) !== 0
-      )
-        throw new Error("JSON grouping operands were not admitted");
-      this.signal.throwIfAborted();
-      return compareRows(this.types, this.decodedKeys, left, i, right, j, a, b, 0, 0) === 0;
+      return this.step.compare(this, this.types, this.decodedKeys, left, i, right, j) === 0;
     } finally {
-      dropOperands(a, this.pool);
-      dropOperands(b, this.pool);
-      release();
+      this.step.release(this);
     }
   }
 }

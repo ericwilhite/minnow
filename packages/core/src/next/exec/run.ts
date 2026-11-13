@@ -399,7 +399,7 @@ export class QueryRuntime {
         largest: number,
         minimum: number,
         ordinary: number,
-      ) => number)
+      ) => number | { complete: number })
     | null = null;
   /** Only the native consumer's lane owns its decoded semantic grouping operands. */
   groupKeyProgress(
@@ -410,7 +410,7 @@ export class QueryRuntime {
       largest: number,
       minimum: number,
       ordinary: number,
-    ) => number,
+    ) => number | { complete: number },
   ): void {
     this.#groupKeyProgress = bound;
   }
@@ -495,7 +495,7 @@ export class QueryRuntime {
     const ordinary = recipe
       ? aggregateLaneBytes(recipe.layout, recipe.kind, slot, baseline, slots)
       : baseline;
-    return Math.max(
+    return scopedProgress(
       ordinary,
       this.#groupKeyProgress?.(rel.id, slot, slots ?? [], largest, minimum, baseline) ?? 0,
     );
@@ -1452,4 +1452,9 @@ export class QueryExecution implements Execution {
       reject();
     }
   }
+}
+
+/** A known native helper can bound its complete step from its actual columns. */
+function scopedProgress(ordinary: number, scoped: number | { complete: number }): number {
+  return typeof scoped === "number" ? Math.max(ordinary, scoped) : scoped.complete;
 }
