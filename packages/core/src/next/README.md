@@ -3627,3 +3627,12 @@ values will be adapted at the scan boundary; importing this leaf does not yet en
 MATCH/BM25. Native execution must charge tokenizer workspace before calling these allocating
 helpers and must not adopt the shipped process cache. Dependency tests pin the leaf's complete
 neutral import closure; generated SQL comparisons use an independent token/stat/score model.
+
+The shipped FTS row adapter passes its renderer directly to the shared matching/scoring loops;
+it does not create a second iterable. NULL/undefined/boolean members skip the renderer, and
+NULL-only documents return without allocating term-presence/frequency arrays.
+`scripts/fts-row-adapter-bench.mts parent.mjs candidate.mjs` runs ten interleaved AB/BA CPU
+pairs with type-7 IQR decisions and per-run load averages. Inputs are ESM helper bundles
+exporting `fts` (as in the review probe) or plain helper modules; use the true pre-extraction
+parent ac8e2af1, not the slower6088bc57 adapter, as the primary control. This is a helper
+component clock, not whole-query or row-materialization evidence.

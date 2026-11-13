@@ -6,28 +6,22 @@ import { MAX_FTS_QUERY_TERMS } from "../full-text/limits.js";
 import { externalSqlDomainValue, fullTextDomainText } from "./sql-domains.js";
 import { tokenizeQuery, type FtsQueryTerm, type FtsStats } from "../full-text/semantics.js";
 
-/** Decode legacy tagged values once; the leaf never learns the shipped storage representation. */
-function documentValue(value: unknown): unknown {
-  return fullTextDomainText(value) ?? externalSqlDomainValue(value);
-}
-function* documentValues(values: Iterable<unknown>): Iterable<unknown> {
-  for (const value of values) yield documentValue(value);
-}
 export function renderDocumentValue(value: unknown): string | undefined {
-  return shared.renderDocumentValue(documentValue(value));
+  const domainText = fullTextDomainText(value);
+  return domainText ?? shared.renderDocumentValue(externalSqlDomainValue(value));
 }
 export function ftsMatchTruth(
   terms: readonly FtsQueryTerm[],
   values: Iterable<unknown>,
 ): boolean | null {
-  return shared.ftsMatchTruth(terms, documentValues(values));
+  return shared.ftsMatchTruth(terms, values, renderDocumentValue);
 }
 export function ftsBm25Row(
   terms: readonly FtsQueryTerm[],
   values: Iterable<unknown>,
   stats: FtsStats,
 ): number | null {
-  return shared.ftsBm25Row(terms, documentValues(values), stats);
+  return shared.ftsBm25Row(terms, values, stats, renderDocumentValue);
 }
 
 const queryTermsCache = new Map<string, FtsQueryTerm[]>();

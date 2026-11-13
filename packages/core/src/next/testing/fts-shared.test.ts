@@ -71,6 +71,41 @@ it("pins independent v1 tokenizer, renderer and scorer fixtures", () => {
   expect(native.ftsMatchTruth([], [""])).toBe(false);
 });
 
+it("applies representation callbacks once per renderable member", () => {
+  const cell = {},
+    seen: unknown[] = [];
+  const renderer = (value: unknown): string | undefined => {
+    seen.push(value);
+    return value === cell ? "alpha" : undefined;
+  };
+  const terms = native.tokenizeQuery("alpha");
+  expect(native.ftsMatchTruth(terms, [null, cell], renderer)).toBe(true);
+  expect(
+    native.ftsBm25Row(
+      terms,
+      [cell, null],
+      { docCount: 1, totalTokens: 1, dfByTerm: [1] },
+      renderer,
+    ),
+  ).toBe(0.28768207245178085);
+  expect(seen).toEqual([cell, cell]);
+});
+
+it("does not render or tokenize NULL-only documents", () => {
+  let calls = 0;
+  const renderer = (): string => {
+    calls++;
+    throw new Error("unexpected renderer");
+  };
+  const terms = native.tokenizeQuery("alpha al*");
+  const stats = { docCount: 1, totalTokens: 0, dfByTerm: [0, 0] };
+  expect(native.ftsMatchTruth(terms, [null, undefined, false], renderer)).toBeNull();
+  expect(native.ftsBm25Row(terms, [null, undefined, false], stats, renderer)).toBeNull();
+  expect(calls).toBe(0);
+  expect(shipped.ftsMatchTruth(terms, [null, null])).toBeNull();
+  expect(shipped.ftsBm25Row(terms, [null, null], stats)).toBeNull();
+});
+
 for (const seed of seedsFor("next-fts-shared", [0xb7f1, 0xb7f2]))
   it(`matches independent ASCII model and shipped SQL, seed ${String(seed)}`, async () => {
     const random = mulberry32(seed),

@@ -12,7 +12,8 @@ compatibility policy and release process.
 
 Full-text tokenization, plain-value document rendering and BM25 scoring now share an internal
 implementation between the shipped engine and the rebuild. Query behavior and stored formats
-are unchanged; no migration is needed.
+are unchanged; no migration is needed. The row adapter avoids an extra iterator per search;
+NULL-only documents skip temporary matching/scoring arrays.
 
 The unexported rebuild can retry an over-cap memory-source recipe by retaining one
 existing, owner-charged chunk through publication. Small wide-column scans no longer

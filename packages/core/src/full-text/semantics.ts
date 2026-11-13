@@ -173,15 +173,18 @@ export function fullTermsMask(termCount: number): number {
 export function ftsMatchTruth(
   terms: readonly FtsQueryTerm[],
   values: Iterable<unknown>,
+  render: (value: unknown) => string | undefined = renderDocumentValue,
 ): boolean | null {
   let anyPresent = false;
-  const present = new Array<boolean>(terms.length).fill(false);
+  let present: boolean[] | undefined;
   let satisfied = 0;
   for (const value of values) {
-    const rendered = renderDocumentValue(value);
+    if (value === null || value === undefined || typeof value === "boolean") continue;
+    const rendered = render(value);
     if (rendered === undefined) continue;
     anyPresent = true;
     if (terms.length === 0 || satisfied === terms.length) continue;
+    present ??= new Array<boolean>(terms.length).fill(false);
     for (const token of tokenize(rendered)) {
       for (let index = 0; index < terms.length; index += 1) {
         const term = terms[index];
@@ -308,14 +311,17 @@ export function ftsBm25Row(
   terms: readonly FtsQueryTerm[],
   values: Iterable<unknown>,
   stats: FtsStats,
+  render: (value: unknown) => string | undefined = renderDocumentValue,
 ): number | null {
   let anyPresent = false;
   let docLength = 0;
-  const frequencies = new Array<number>(terms.length).fill(0);
+  let frequencies: number[] | undefined;
   for (const value of values) {
-    const rendered = renderDocumentValue(value);
+    if (value === null || value === undefined || typeof value === "boolean") continue;
+    const rendered = render(value);
     if (rendered === undefined) continue;
     anyPresent = true;
+    frequencies ??= new Array<number>(terms.length).fill(0);
     const tokens = tokenize(rendered);
     docLength += tokens.length;
     const partial = termFrequencies(tokens, terms);
@@ -323,7 +329,7 @@ export function ftsBm25Row(
       frequencies[index] = (frequencies[index] ?? 0) + (partial[index] ?? 0);
     }
   }
-  if (!anyPresent) return null;
+  if (!anyPresent || frequencies === undefined) return null;
   return bm25DocumentScore(frequencies, docLength, stats);
 }
 
