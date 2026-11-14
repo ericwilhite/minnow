@@ -6225,3 +6225,108 @@ export const FTS_TERM_FENCE_REACH = [
   "no child read needed",
   "drained",
 ] as const;
+
+export const ORDERED_WIDE_REACH = [
+  "aliases",
+  "distinct bindings",
+  "16 keys",
+  "12 keys",
+  "pinned",
+  "top-N",
+  "full sort",
+  "PG exact",
+  "zero",
+] as const;
+
+export const SEQUENCE_SQL_REACH = [
+  "element modifiers",
+  "string",
+  "typed array",
+  "NULL element",
+  "empty input",
+  "DISTINCT",
+  "ORDER BY",
+  "groups",
+  "FILTER",
+  "PG exact",
+  "zero",
+] as const;
+
+export const ARRAY_CONCAT_REACH = [
+  "derived boundary",
+  "bounds 54000",
+  "prepend 22003",
+  "charged output",
+  "cat",
+  "append",
+  "prepend",
+  "NULL",
+  "empty",
+  "multidimensional",
+  "lower bound",
+  "constant",
+  "dimension error",
+  "PG exact",
+  "zero",
+] as const;
+
+export const SEQUENCE_PRESSURE_REACH = [
+  "independent aliases",
+  "string",
+  "array",
+  "concat",
+  "pinned",
+  "handoff",
+  "cancel",
+  "expansion",
+  "PG exact",
+  "zero",
+] as const;
+
+export const SEQUENCE_CAP_REACH = [
+  "string",
+  "array",
+  "NULL bitmap",
+  "exact boundary",
+  "next byte refuses",
+  "zero",
+] as const;
+
+export const SEQUENCE_BYTES_REACH = [
+  "empty",
+  "large",
+  "shared prefix",
+  "caller mutation",
+  "PG exact",
+  "zero",
+] as const;
+
+export const SEQUENCE_ARRAY_INPUT_REACH = [
+  "bounds precedence",
+  "bounds 54000",
+  "numeric scale equality",
+  "DISTINCT",
+  "same",
+  "null",
+  "empty",
+  "mismatch",
+  "multidim",
+  "PG exact",
+  "bounds",
+  "FILTER",
+  "DESC",
+  "zero",
+] as const;
+
+export const SEQUENCE_PREFIX_REACH = [
+  "grouped prefix",
+  "54000",
+  "22003",
+  "pinned",
+  "ordinary",
+  "prefix",
+  "first row",
+  "zero",
+] as const;
+
+export const CONCAT_SLICE_REACH = ["complete", "cancel", "bitmap yield", "zero"] as const;

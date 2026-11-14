@@ -81,3 +81,24 @@ export function outputCopyLayout(root: Rel): ResultCopyLayout | null {
     }),
   };
 }
+
+/** Count terminal aliases of one checkpoint row. Only unchanged positional wrappers
+ * are certified here; expanding expressions retain their own complete-row phase. */
+export function checkpointDeliveryCopies(root: Rel, producer: Rel): readonly number[] | undefined {
+  const route = (rel: Rel): Array<number | null> | null => {
+    if (rel.id === producer.id) return rel.output.map((_, i) => i);
+    if (!("input" in rel)) return null;
+    const input = route(rel.input);
+    if (!input) return null;
+    if (rel.op === "project")
+      return rel.exprs.map((e) => (e.op === "column" ? (input[e.index] ?? null) : null));
+    if (["filter", "sort", "limit"].includes(rel.op))
+      return rel.output.map((_, i) => input[i] ?? null);
+    return null;
+  };
+  const fields = route(root);
+  if (!fields) return undefined;
+  const copies = producer.output.map(() => 0);
+  for (const field of fields) if (field !== null) copies[field] = (copies[field] ?? 0) + 1;
+  return copies.some((n) => n > 1) ? copies : undefined;
+}

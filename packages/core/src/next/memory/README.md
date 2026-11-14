@@ -85,10 +85,12 @@ than its admitted lane raises the same error before allocating or waiting; it
 does not consume the lane or hide a still-active-loan ownership violation.
 This structured refusal does not repair an underestimated minimum. Sorts retain
 one physical copy of each proven direct-column alias and restore logical columns
-after sorting. The result sink also copies those bindings once, restoring logical
-wire positions with references to that frame's owned vectors. Its transfer list
-and wide-coefficient accounting count each backing allocation once. No buffer is
-shared with a producer or another frame. Computed values and new producer rows
+after sorting, following bindings through nested projections (including aggregate
+packing's restoration projection). This avoids funding repeated spill payloads
+for unchanged values. Result admission still counts every delivered logical field;
+the sink gives each client-visible alias independent mutable buffers. Its transfer
+list and wide-coefficient accounting count each backing allocation once. No buffer is
+shared with a producer, another logical field or another frame. Computed values and new producer rows
 stay distinct; this recipe does not infer equality or reassociate expressions.
 
 The int8 key-growth bound follows its own half-full rehash threshold, including
@@ -480,3 +482,24 @@ admission. Restoration applies the saved state before those rows, without reasso
 The partially changed lookup is never reused. Existing batch-boundary reclaim waits
 remain cancellable; a pinned holder selects split/spill. Ordinary funded batches do
 not scan widths again, change buffer capacities, or reserve additional memory.
+
+Growing sequence aggregates (`string_agg`, `array_agg`) reuse the native fragment and
+phase-handoff protocol. Fixed serializer/bitmap buffers and one scalar codec scratch
+are charged before allocation; full values stay file-backed until the producer graph
+retires. The delivery admission includes the measured serialized row, bounded read I/O,
+owned parameters and retained native-parent minima. The actual complete delivery minimum uses the serialized output, including array headers
+and NULL bitmaps. Sequence results adopt tight buffers directly; unlike JSON conversion,
+they do not impose an automatic two-times-value refusal.
+A direct projection that repeats a result field adds only its independently mutable
+client copies to that row's peak; maxima from different groups are never summed.
+Text/array concatenation uses the same expanding-expression handoff. No kernel waits
+for global credit with a pinned input, and caller parameter buffers are never reread.
+Its native serializers run inside the existing byte-expression runner: the count pass
+reserves exact output, the copy pass slices payload and NULL-bitmap work on the shared
+task clock, and cancellation unwinds the prepaid scalar scratch and output charge.
+
+Row-local value-size failures (SQLSTATE 54000) use the same saved-prefix ownership
+as row data errors (22xxx). The producer is retired, the complete prefix is admitted
+and delivered, then the error is raised. This does not defer memory admission
+(53200), cancellation, unsupported plans or storage faults. Aggregate array bounds
+are checked at finalization so a later transition error retains PostgreSQL's precedence.

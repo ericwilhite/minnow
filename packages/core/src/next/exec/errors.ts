@@ -17,6 +17,15 @@ export class ExecutionError extends Error {
   }
 }
 
+/** A row's data or value-size failure belongs after its already completed prefix.
+ * Memory admission (53200), storage, cancellation and unsupported plans never replay. */
+export function rowValueError(error: unknown): error is ExecutionError {
+  return (
+    error instanceof ExecutionError &&
+    (error.sqlState.startsWith("22") || error.sqlState === "54000")
+  );
+}
+
 /** The execution was cancelled (signal, `Execution.cancel`, or the consumer cancelled results). */
 export class QueryCancelledError extends ExecutionError {
   constructor(reason?: unknown) {

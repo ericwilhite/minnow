@@ -13,7 +13,7 @@ import type { CompileContext } from "./kernels/compile.js";
 import type { ResultAllocator } from "./result-buffer.js";
 import { JsonExpressions } from "./json-expressions.js";
 import { JsonWorkspaceGrowth } from "./json-workspace.js";
-import { ExecutionError } from "./errors.js";
+import { ExecutionError, rowValueError } from "./errors.js";
 import { JsonRecords } from "./json-records.js";
 import { ParameterCheckpoint } from "./parameter-checkpoint.js";
 import { TapeDirectory } from "./agg/hash-tape.js";
@@ -25,6 +25,7 @@ export const JSON_PHASE_FIXED = 4096;
 export interface JsonPhase {
   /** A streaming aggregate already enforces the exact two-copy value policy. */
   readonly aggregateValueBytes?: number;
+  readonly deliveryBytes?: number;
   readonly emit: boolean;
   readonly ownedDelivery: boolean;
   readonly error: ExecutionError | null;
@@ -52,6 +53,7 @@ export async function closeJsonPhase(saved: JsonPhase): Promise<void> {
     );
 }
 export interface JsonPhaseContext {
+  readonly deliveryCopies?: readonly number[];
   readonly grant: Grant;
   readonly spill: SpillService;
   readonly queryId: number;
@@ -213,10 +215,10 @@ export class JsonPhaseOperator implements Operator {
       if (pause) await pause;
     }
   }
-  /** Only row data exceptions are delayed to their stream position. Cancellation, storage
+  /** Only row data/value-size exceptions are delayed to their stream position. Cancellation, storage
    * faults, unsupported plans and admission failures always unwind immediately. */
   deferRowError(error: unknown): boolean {
-    if (!(error instanceof ExecutionError) || !error.sqlState.startsWith("22")) return false;
+    if (!rowValueError(error)) return false;
     if (this.#failedRow) return true;
     this.#rowError = new ExecutionError(error.message, error.code, error.sqlState);
     this.#failedRow = true;

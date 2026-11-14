@@ -1,0 +1,227 @@
+{
+  "task": "native growing sequence aggregates and text/array concatenation",
+  "base": "4ed3168c31032c98775fd96632c5c01a4855625b",
+  "authority": "PostgreSQL/PGlite sequence aggregate, aggregate-local ORDER BY/DISTINCT/FILTER, NULL and array dimensional semantics; existing array-value.ts native format; governor complete admitted step contract",
+  "generated": {
+    "SQL": [47049, 47050, 36],
+    "array_concat": [47051, 47052, 64],
+    "pressure": [47053, 47054, 12],
+    "complete_delivery_cap": [47055, 47056, 4],
+    "owned_bytes": [47057, 47058, 8],
+    "array_inputs": [47059, 47060, 24],
+    "total_histories": 328,
+    "examples_are_included_in_numRuns": true,
+    "error_prefix": [47061, 47062, 8],
+    "cancellable_bitmap": [47063, 47064, 8]
+  },
+  "focused_green": {
+    "files": 8,
+    "tests": 278,
+    "log": "/home/eric/.cache/b4-growing/GREEN-resumable.log",
+    "additional_bitmap": {
+      "files": 1,
+      "tests": 2,
+      "log": "/home/eric/.cache/b4-growing/GREEN-slices.log"
+    },
+    "typecheck": "/home/eric/.cache/b4-growing/types-ready.log",
+    "lint": "/home/eric/.cache/b4-growing/lint-ready.log"
+  },
+  "pressure": {
+    "caps_mib": [12, 16, 20],
+    "result_bytes_up_to": 4000092,
+    "large_alias_peak_bytes": 11367640,
+    "cleanup": "query governor and spill bytes zero before service close",
+    "cap_boundary": "calibrate complete restore minimum with a large cap; replay at exactly that cap succeeds; one more serialized output byte refuses with requested minimum cap+1; no automatic 2x sequence value refusal"
+  },
+  "mutants": [
+    {
+      "name": "RED-parent",
+      "exit": 1,
+      "intended": true,
+      "seconds": 22.38745809008833,
+      "log": "/home/eric/.cache/b4-growing/RED-parent.log",
+      "reason": "UnsupportedPlanError"
+    },
+    {
+      "name": "delimiter-current-row",
+      "exit": 1,
+      "intended": true,
+      "seconds": 22.802683511050418,
+      "log": "/home/eric/.cache/b4-growing/delimiter-current-row.log",
+      "reason": "AssertionError"
+    },
+    {
+      "name": "drop-NULL-elements",
+      "exit": 1,
+      "intended": true,
+      "seconds": 18.309043929097243,
+      "log": "/home/eric/.cache/b4-growing/drop-NULL-elements.log",
+      "reason": "AssertionError"
+    },
+    {
+      "name": "drop-lower-bounds",
+      "exit": 1,
+      "intended": true,
+      "seconds": 13.01763730100356,
+      "log": "/home/eric/.cache/b4-growing/drop-lower-bounds.log",
+      "reason": "AssertionError"
+    },
+    {
+      "name": "unfunded-alias-copy",
+      "exit": 1,
+      "intended": true,
+      "seconds": 18.69995291903615,
+      "log": "/home/eric/.cache/b4-growing/unfunded-alias-copy.log",
+      "reason": "MemoryAdmissionError"
+    },
+    {
+      "name": "skip-concat-charge",
+      "exit": 1,
+      "intended": true,
+      "seconds": 8.531158233992755,
+      "log": "/home/eric/.cache/b4-growing/skip-concat-charge.log",
+      "reason": "AssertionError"
+    },
+    {
+      "name": "arbitrary-two-copy-refusal",
+      "exit": 1,
+      "intended": true,
+      "seconds": 17.39124189503491,
+      "log": "/home/eric/.cache/b4-growing/arbitrary-two-copy-refusal.log",
+      "reason": "MemoryAdmissionError"
+    },
+    {
+      "name": "bytewise-distinct-arrays",
+      "exit": 1,
+      "intended": true,
+      "seconds": 19.435617710929364,
+      "log": "/home/eric/.cache/b4-growing/bytewise-distinct-arrays.log",
+      "reason": "AssertionError"
+    },
+    {
+      "name": "missing-bounds",
+      "exit": 1,
+      "intended": true,
+      "seconds": 4.052109602023847,
+      "log": "/home/eric/.cache/b4-growing/missing-bounds.log"
+    },
+    {
+      "name": "missing-prepend-overflow",
+      "exit": 1,
+      "intended": true,
+      "seconds": 3.919783069053665,
+      "log": "/home/eric/.cache/b4-growing/missing-prepend-overflow.log"
+    },
+    {
+      "name": "early-array-final-bounds",
+      "exit": 1,
+      "intended": true,
+      "seconds": 8.068865329027176,
+      "log": "/home/eric/.cache/b4-growing/early-array-final-bounds.log"
+    },
+    {
+      "name": "drop-size-prefix",
+      "exit": 1,
+      "intended": true,
+      "seconds": 7.607547749998048,
+      "log": "/home/eric/.cache/b4-growing/drop-size-prefix.log"
+    },
+    {
+      "name": "drop-group-size-prefix",
+      "exit": 1,
+      "intended": true,
+      "seconds": 8.298565183067694,
+      "log": "/home/eric/.cache/b4-growing/drop-group-size-prefix.log"
+    },
+    {
+      "name": "unsliced-null-bitmap",
+      "exit": 1,
+      "intended": true,
+      "log": "/home/eric/.cache/b4-growing/unsliced-null-bitmap.log"
+    },
+    {
+      "name": "unfunded-native-concat",
+      "exit": 1,
+      "intended": true,
+      "log": "/home/eric/.cache/b4-growing/unfunded-native-concat.log"
+    }
+  ],
+  "raw": "/home/eric/.cache/b4-growing",
+  "performance": "New formerly unsupported paths; no CPU gain or benchmark acceptance claim. Existing paths covered by full lead gate.",
+  "reproduce": "TMPDIR=/home/eric/.cache/b4-growing/tmp npx vitest run packages/core/src/next/testing/sequence-aggregate-pglite.test.ts packages/core/src/next/testing/sequence-array-input.test.ts packages/core/src/next/testing/sequence-aggregate-cap.test.ts packages/core/src/next/testing/sequence-bytes-delivery.test.ts packages/core/src/next/testing/sequence-delivery-pressure.test.ts packages/core/src/next/testing/concat-pglite.test.ts --maxWorkers=2 packages/core/src/next/testing/sequence-error-prefix.test.ts packages/core/src/next/exec/kernels/concat-slices.test.ts",
+  "limits": [
+    "Stored native array element types only; JSON elements require a separate stored-format design.",
+    "ARRAY constructors, SQL array casts/parameters, BYTEA SQL DDL/casts and mixed-element array casts remain pre-existing typed refusals.",
+    "Native byte parameter test uses explicit lowerer parameter types.",
+    "No constant folding, shipped-engine execution change, browser performance or new stored-format version.",
+    "Concat expression placements without the existing resumable project/filter host are typed-refused; no synchronous wide-copy fallback."
+  ],
+  "sha256": {
+    "packages/core/src/engine/query.ts": "1098ec6cf5adfb98774ea0da7a938206f25707390899e4e78f11a652ffc5e7fe",
+    "packages/core/src/next/README.md": "79f3a4b4b3f401959895c9df136d33d8c9c8a9b57bd17218641260e739ce8457",
+    "packages/core/src/next/exec/agg/json-values.ts": "5e53eb909a19711550d3fa4b2eda74d02e14f6c513278e7f4c3b8ee522e7cebb",
+    "packages/core/src/next/exec/agg/json.ts": "7b60ab4a5c11754f39c454ded6ca4c5894b14ef9327765274d00aca5173807de",
+    "packages/core/src/next/exec/json-group-size-plan.ts": "f56b08b0e7d33d13515bdfac3a132f904657713a27c5b0202ebef1161d9d8a2e",
+    "packages/core/src/next/exec/json-phase.ts": "7c258c0ebcaca0b6c5e16833566593f7322d636a8808e8159fadb516c38c7367",
+    "packages/core/src/next/exec/json-records.ts": "d9893ea018c8dbbdc066f826f5032640e7bdba55ee1dbe5af700350b908aa046",
+    "packages/core/src/next/exec/kernels/bindings.test.ts": "7124b647de423b96fb188013fd80fb726f4499de0f853fd24a72d57d2b67830e",
+    "packages/core/src/next/exec/kernels/bindings.ts": "7122694c0836a81e5bc1f1b45cac1531c0b4fd8ee0464aee6ca6a414adb04c0c",
+    "packages/core/src/next/exec/kernels/compile.ts": "377bbc49bc53f52d02c2e2691dfe5e21c6b69a55c0000e496c97c004a6337a05",
+    "packages/core/src/next/exec/output-copies.ts": "ef939638a6c7366c0e6990398b17bb01f27cc2a9c66cc15177152b6e9db404f6",
+    "packages/core/src/next/exec/plan.ts": "331fffbce22b97a733f70ebae66f14176595c8b7d1ec4970a3ec1acf5d05c345",
+    "packages/core/src/next/ir/functions.ts": "b19ef49be82976611bfb141ed2482ad4a1c257848609573c3ce13b97cc7afcd7",
+    "packages/core/src/next/ir/json-expression.ts": "ecb28d2eac9052842ba74e29bccc16efc9b60dbc964203b4ac9046eacdd772b8",
+    "packages/core/src/next/lower/coerce.ts": "4a64bba27a431d8aca05d5bf161024bfb58d7d85aa1f82dcc575d800df15a3b1",
+    "packages/core/src/next/lower/expressions.ts": "4c4b6a12aef6d0652b484c0f4f399275d7f67f8692840ca5a129e26857ace8ec",
+    "packages/core/src/next/lower/query.ts": "5137e76c196d9c45046fd50421dd4839cf7f4ccef2e95602aa7e8a5a2eda9bdd",
+    "packages/core/src/next/memory/README.md": "1b30a093731afb74291c8a5ef15f6f305dd3f117c9acc30ca4d3c3c07c21d24d",
+    "packages/core/src/next/testing/differential-adapter.ts": "381dc7072fcbbd16b17d2217578eaee6a3208fbd7c16b781fd33816bcf81ef61",
+    "packages/core/src/testing/reach.ts": "df65d181033a0544b9b03729c77ad6a0a6bed6852ef9b8ea7f093c170e6fbd17",
+    "packages/core/src/next/exec/agg/sequence.ts": "4c9c8cc3220b645b0587aef36412f020fcc7e5525a8ed4bdb62860ba8e1d627e",
+    "packages/core/src/next/exec/array-data.ts": "deac859961e96da78ed25a4ced4eeab72436a5404e3a66dd6b816add5cc3e523",
+    "packages/core/src/next/testing/concat-pglite.test.ts": "e097e8e40d51141ffb5470587ff638314220cdd0db0d5bfa3bebb7edd332949b",
+    "packages/core/src/next/exec/kernels/concat.ts": "aea748f3475d89776f7a6d8fee155898e22bf13f03d4c98ee6dd1d7076b73b6c",
+    "packages/core/src/next/testing/sequence-aggregate-cap.test.ts": "3d8af0aa2c7f327f5657e42b535c45498a355aa9679761b40a0476534a56df7e",
+    "packages/core/src/next/testing/sequence-aggregate-pglite.test.ts": "dc387d620597e60fd2381b6ff2dbad14b324b606f3f075fd769d2edd9e4925d0",
+    "packages/core/src/next/testing/sequence-array-input.test.ts": "897b09b918172a60d2c234924a45500bbb8477d0823c2a082fcae2f2727bc2a4",
+    "packages/core/src/next/testing/sequence-bytes-delivery.test.ts": "63021b675c5d03ec108f3935c71fca82eb2ca00bafb0703eccbf88fceaca01a6",
+    "packages/core/src/next/testing/sequence-delivery-pressure.test.ts": "260aca97ee531b7ccb3fcae9caefde3b56511712c910e2527a11ab2003b0b01b",
+    "packages/core/src/next/ir/functions.test.ts": "84ad427924370ce05f241d2400e481372a9e390bd3e9ddd4151ff09990a4da5d",
+    "packages/core/src/next/exec/errors.ts": "a696382a6f31d563d40778788d20e0abdd74d2759871100f7c70539ce3a8faae",
+    "packages/core/src/next/exec/kernels/json.ts": "6120f84fc2c62557d2ab6d85d142224969bc73194b990dca4545141ff860cfbc",
+    "packages/core/src/next/exec/kernels/concat-slices.test.ts": "1c6caef26741e0076ebaace5a0dad6c093e141a136ce7dc5d10f996a2a12d7ae",
+    "packages/core/src/next/testing/sequence-error-prefix.test.ts": "6cef5e1581ea2410b0dc4b68411645a72edc6d8331341791681865e6ae1482bd"
+  },
+  "signature_audit": {
+    "red": "first gate g4-ir: unbound result T in array_append(any,any)",
+    "fix": "bind T at the array operand; scalar argument follows its element type",
+    "green": "13 files/332 tests IR/lower/bindings/native concat/SQL; combined19 files/361 tests",
+    "mutant": "array operand restored to any: functions.test rejects"
+  },
+  "polymorphic_elements": {
+    "law": "PostgreSQL anycompatiblearray binds base element types; appending cannot round a scalar to the existing array element typmod",
+    "generated": "numeric fixed element dimension + scalar append, both seeds; unchanged36 histories/seed",
+    "mutant": "restoring prior typmod coercion emits1.23 instead of1.2345; exact PG assertion rejects",
+    "raw": "/home/eric/.cache/b4-growing/modifier-mutant.log"
+  },
+  "test_placement": {
+    "law": "next/dependency-rules forbids exec tests from importing next/testing",
+    "fix": "Move native concat PG property unchanged into next/testing; keep all seeds/run counts/assertions",
+    "green": "dependency rules + relocated PG:2 files6 tests; no allowlist change"
+  },
+  "array_bound_authority": {
+    "rule": "PG ArrayCheckBounds' one-past-end bound; prepend checks its setter index then restores the original lower bound. Final array_agg bounds follow all transitions, so later NULL array input raises22004 before final54000.",
+    "input_guard": "Independently materialize exact PG inputs; generated derived arrays exercise internally valid upper INT_MAX without crediting a literal refusal.",
+    "raw": [
+      "/home/eric/.cache/b4-growing/array-boundary-expanded.log",
+      "/home/eric/.cache/b4-growing/array-derived-pg.log"
+    ]
+  },
+  "row_error_prefix": {
+    "rule": "Row-local22xxx and54000 preserve complete earlier rows before raising.53200/cancel/unsupported/storage are immediate.",
+    "red": "/home/eric/.cache/b4-growing/RED-size-prefix-published.log",
+    "oracle": "PG DECLARE CURSOR/FETCH1; direct concatenation and grouped finalization; ordinary and pinned"
+  },
+  "resumable": "Native concat count/copy/bitmap serializer uses existing JsonNode/JsonMemory runner and shared task clock; compact NULL arrays are sliced and cancellable; per-row unsorted sequence transitions pace too.",
+  "full_gate": "Final frozen-tip full gate follows; earlier attempts are preserved with their real integration failures and subsequent corrections, not relabeled GREEN."
+}

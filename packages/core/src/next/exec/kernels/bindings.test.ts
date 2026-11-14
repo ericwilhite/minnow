@@ -25,6 +25,7 @@ import {
   type Binding,
 } from "./bindings.js";
 import { BOOL, batchOf, cmp, col, compileFor, decimals, numbers, texts } from "./test-support.js";
+import { arrayElementTag, encodeArrayValue } from "../../vector/array-value.js";
 
 const SQL_TYPES: readonly SqlType[] = [
   "bool",
@@ -71,6 +72,27 @@ function sample(type: PhysicalType): FlatVector {
       return texts(type.kind === "json" ? ["{}", "null"] : ["a", "b"], type);
     case "enum":
       return texts(["x", "y"], type);
+    case "array": {
+      const bytes = encodeArrayValue(type.element, {
+        dimensions: [],
+        lowerBounds: [],
+        elements: [],
+      });
+      const payload = new Uint8Array(2 * bytes.length);
+      payload.set(bytes);
+      payload.set(bytes, bytes.length);
+      return {
+        form: "flat",
+        type,
+        length: 2,
+        validity: null,
+        data: {
+          layout: "varlen",
+          bytes: payload,
+          offsets: Int32Array.of(0, bytes.length, payload.length),
+        },
+      };
+    }
     default: {
       const vector = allocateFlat(type, 2);
       vector.length = 2;
@@ -82,11 +104,20 @@ function sample(type: PhysicalType): FlatVector {
 /** The argument types of one call of `overload`, with `T` as `variable`. */
 function argumentTypes(overload: Overload, variable: PhysicalType): PhysicalType[] {
   const slots = overload.variadic === true ? [...overload.args, ...overload.args] : overload.args;
-  return slots.map((slot) => (slot === "T" || slot === "any" ? variable : physicalTypeOfSql(slot)));
+  return slots.map((slot, i) =>
+    overload.arrayArgument === i
+      ? { kind: "array", element: variable }
+      : slot === "T" || slot === "any"
+        ? variable
+        : physicalTypeOfSql(slot),
+  );
 }
 
 function callOf(fn: string, overload: Overload, types: readonly PhysicalType[]): ScalarExpr {
-  const result = overload.result === "T" ? types[0] : physicalTypeOfSql(overload.result);
+  const result =
+    overload.result === "T"
+      ? types[overload.arrayArgument ?? 0]
+      : physicalTypeOfSql(overload.result);
   return {
     op: "call",
     fn,
@@ -167,7 +198,16 @@ describe("kernel bindings onto ir/functions.ts (R19)", () => {
           expect([...output.data.values.subarray(0, 2)]).toEqual([1, 0]);
         }
       };
-      if ("refused" in binding) refusedWith(run, binding.construct);
+      let supportedElement = true;
+      if (overload.arrayArgument !== undefined) {
+        try {
+          arrayElementTag(variable);
+        } catch {
+          supportedElement = false;
+        }
+      }
+      if (!supportedElement) refusedWith(run, "function");
+      else if ("refused" in binding) refusedWith(run, binding.construct);
       else if (binding.kinds !== undefined && !binding.kinds.has(variable.kind))
         refusedWith(run, "function");
       else expect(run).not.toThrow();

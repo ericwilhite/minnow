@@ -39,6 +39,7 @@ export class JsonRecords {
   #payload = 0;
   #rows = 0;
   #extra = 0;
+  #deliveryPayload = 0;
   readonly #columnBytes: number[];
   readonly #writerBytes: number;
   #closing: Promise<void> | null = null;
@@ -46,6 +47,7 @@ export class JsonRecords {
     parent: SpillIo,
     service: SpillService,
     readonly types: readonly PhysicalType[],
+    readonly deliveryCopies?: readonly number[],
   ) {
     this.#writerBytes = WRITER_BYTES + 8 * types.length;
     if (!parent.pool.allocate(this.#writerBytes))
@@ -74,6 +76,11 @@ export class JsonRecords {
   }
   get retainedBytes(): number {
     return this.#payload + this.#extra + 2048 + 2048 * this.types.length;
+  }
+  /** Coupled row peak: one restored owned row plus independent copies of its aliases.
+   * Measure each actual row, never sum unrelated per-column high-water marks. */
+  get deliveryBytes(): number {
+    return Math.max(this.retainedBytes, this.#deliveryPayload + 2048 + 2048 * this.types.length);
   }
   /** Per-field high-water marks survive detach without retaining a row or grant. */
   columnBytes(column: number): number {
@@ -143,8 +150,10 @@ export class JsonRecords {
   async writeStreamed(fields: ReadonlyArray<Vector | StreamedJsonField>, row = 0): Promise<void> {
     if (fields.length !== this.types.length) throw new Error("JSON streamed schema mismatch");
     let payload = 0,
-      extra = 0;
+      extra = 0,
+      copies = 0;
     for (const [column, field] of fields.entries()) {
+      const before = payload;
       if ("stream" in field) {
         if (field.length !== null) {
           payload = align(payload) + field.length;
@@ -168,7 +177,11 @@ export class JsonRecords {
           extra += wide ? wide + 8 : 0;
         }
       }
+      copies +=
+        Math.max(0, (this.deliveryCopies?.[column] ?? 1) - 1) *
+        (Math.max(64, payload - before) + 288);
     }
+    this.#deliveryPayload = Math.max(this.#deliveryPayload, payload + extra + copies);
     if (payload > 0x7fffffff || extra > 0x7fffffff)
       throw new Error("JSON streamed row exceeds native offsets");
     this.#payload = Math.max(this.#payload, payload);

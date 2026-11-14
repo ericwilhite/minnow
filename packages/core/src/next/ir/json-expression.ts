@@ -1,8 +1,13 @@
-/** Expressions that require a resumable JSON evaluation frame. */
+/** Expressions that use the shared resumable variable-output evaluation frame. */
 import type { ScalarExpr } from "./ir.js";
 
 /** Such expressions need the owner even when a CASE/COALESCE only relays a JSON column. */
 export function jsonExpression(expr: ScalarExpr): boolean {
+  if (
+    expr.op === "call" &&
+    ["textcat", "array_cat", "array_append", "array_prepend"].includes(expr.fn)
+  )
+    return true;
   if (expr.op === "cast" && expr.jsonCanonical) return jsonExpression(expr.input);
   if (
     (expr.op === "case" || (expr.op === "call" && expr.fn === "coalesce")) &&
@@ -53,6 +58,11 @@ export function jsonExpression(expr: ScalarExpr): boolean {
 
 /** Binary JSON canonicalization can expand; its frame needs checkpoint/re-admission. */
 export function expandingJsonExpression(expr: ScalarExpr): boolean {
+  if (
+    expr.op === "call" &&
+    ["textcat", "array_cat", "array_append", "array_prepend"].includes(expr.fn)
+  )
+    return true;
   if (expr.op === "cast" && expr.jsonCanonical) return expandingJsonExpression(expr.input);
   if (
     expr.op === "call" &&

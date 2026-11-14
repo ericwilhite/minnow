@@ -12670,7 +12670,8 @@ class Parser {
           argument === undefined || argument.kind === "wildcard"
             ? { kind: "literal", value: 1 }
             : argument;
-        if (name === "JSON_ARRAYAGG") args.push(condition);
+        if (name === "JSON_ARRAYAGG" || (name === "STRING_AGG" && recordDeclaredTypes))
+          args.push(condition);
         else
           args.splice(0, args.length, {
             kind: "case",
