@@ -2,7 +2,12 @@
 import type { ScalarExpr } from "../ir/ir.js";
 import type { Vector } from "../vector/vector.js";
 import type { TableRules } from "../access/modify.js";
-import { CheckViolationError, NotNullViolationError } from "../access/modify.js";
+import {
+  CheckViolationError,
+  ClosedSetViolationError,
+  NotNullViolationError,
+} from "../access/modify.js";
+import { varlenMatchesString } from "../vector/varlen.js";
 import { expressionDataError } from "./expression-errors.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import { BATCH_ROWS, type Batch, type Selection } from "../vector/vector.js";
@@ -223,23 +228,42 @@ class Evaluator implements BoundTableRules {
     this.#validate(batch);
     const prefix = this.#prefix;
     prefix.count = 0;
-    let notNull: { row: number; column: number } | null = null;
+    let columnFailure: NotNullViolationError | ClosedSetViolationError | null = null;
     for (let k = 0; k < (batch.selection?.count ?? batch.length); k++) {
       const row = batch.selection?.rows[k] ?? k;
-      for (const [c, column] of this.program.table.columns.entries()) {
-        const value = batch.columns[c];
-        if (!column.nullable && value && !isValidSlot(value, row)) {
-          notNull = { row, column: column.id };
-          break;
-        }
-      }
-      if (notNull) break;
+      columnFailure = this.#columnFailure(batch, row);
+      if (columnFailure) break;
       prefix.rows[prefix.count++] = row;
     }
-    const failure = this.check(notNull ? { ...batch, selection: prefix } : batch, changed);
+    const failure = this.check(columnFailure ? { ...batch, selection: prefix } : batch, changed);
     if (failure) throw new CheckViolationError(this.program.table.id, failure.checkId, failure.row);
-    if (notNull)
-      throw new NotNullViolationError(this.program.table.id, notNull.column, notNull.row);
+    if (columnFailure) throw columnFailure;
+  }
+  #columnFailure(
+    batch: Batch,
+    row: number,
+  ): NotNullViolationError | ClosedSetViolationError | null {
+    for (const [c, column] of this.program.table.columns.entries()) {
+      const value = batch.columns[c];
+      if (!value) throw new TypeError("Missing complete-row column");
+      if (!isValidSlot(value, row)) {
+        if (!column.nullable)
+          return new NotNullViolationError(this.program.table.id, column.id, row);
+        continue;
+      }
+      if (column.allowedValues !== undefined) {
+        const data = flatOf(value).data;
+        if (data.layout !== "varlen")
+          throw new TypeError("A closed text set received a non-text vector");
+        if (
+          !column.allowedValues.some((label) =>
+            varlenMatchesString(data, slotIndex(value, row), label),
+          )
+        )
+          return new ClosedSetViolationError(this.program.table.id, column.id, row);
+      }
+    }
+    return null;
   }
   generate(batch: Batch, changed: readonly number[]): void {
     this.#validate(batch);
@@ -275,13 +299,7 @@ class Evaluator implements BoundTableRules {
         }
         // All generated values precede constraint checking for this row. A NULL
         // generated result is a 23502, not a later row's arithmetic exception.
-        for (const [i, col] of this.program.table.columns.entries()) {
-          const v = columns[i];
-          if (!col.nullable && v && !isValidSlot(v, row))
-            throw new NotNullViolationError(this.program.table.id, col.id, row);
-        }
-        const failure = this.check(one, changed);
-        if (failure) throw new CheckViolationError(this.program.table.id, failure.checkId, row);
+        this.validate(one, changed);
         arena.retireVarlen();
       }
     } finally {

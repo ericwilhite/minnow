@@ -1634,7 +1634,9 @@ into hidden columns and removed from visible results. No runtime code generation
 The owner composition uses it by default; protocol tests over `StandinWritePath` explicitly keep
 their synthetic executor. Native INSERT VALUES/SELECT, UPDATE, DELETE, ON CONFLICT and RETURNING
 execute with statement snapshot input spools. Joined/index inputs retain locator identity;
-repeat tracking and returned rows use charged, spillable state. Shared row rules stay alive
+repeat tracking and returned rows use charged, spillable state. Complete-row validation includes
+closed text sets as well as NOT NULL and CHECK, including precise generated-error replay.
+Closed-set failures retain their column identity and active physical row order. Shared row rules stay alive
 through native FK actions. Unsupported modification kinds and kernel overloads remain typed refusals.
 This factory does not turn those missing capabilities into current-engine fallbacks. The
 lowerer emits joins and windows for the factory; SQL catalogue tests exercise them through

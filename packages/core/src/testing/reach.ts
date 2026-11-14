@@ -7778,3 +7778,32 @@ export const STATEMENT_RULE_REACH = [
   "plain guarded",
   "guard before mutation",
 ] as const;
+
+/** Closed text sets cannot disappear when complete-row CHECK/generated validation is installed. */
+export const MODIFY_CLOSED_SET_REACH = [
+  "INSERT",
+  "UPDATE",
+  "upsert insert",
+  "upsert proposed",
+  "upsert assignment",
+  "CHECK",
+  "no CHECK",
+  "generated",
+  "no generated",
+  "first invalid row",
+  "column identity",
+  "rollback",
+  "NULL and UTF8 allowed",
+] as const;
+
+/** Closed-set checks share normal and exceptional generated-row validation. */
+export const CLOSED_SET_REPLAY_REACH = [
+  "flat",
+  "dictionary",
+  "constant",
+  "selection",
+  "all rows",
+  "before later generated error",
+  "single active row",
+  "physical row and column",
+] as const;

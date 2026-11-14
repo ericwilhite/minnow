@@ -84,7 +84,9 @@ snapshot; statement errors roll back earlier rows. Unique and foreign-key checks
 existing write path. CHECK constraints and stored generated columns now use the shared,
 charged row-rule program, retained through native FK actions. Generation runs inside the
 statement rule scope; an earlier row's NOT NULL or named CHECK failure precedes a later
-row's generated-expression error. Direct generated assignments remain refused; DEFAULT
+row's generated-expression error. Closed text sets remain enforced alongside CHECK and
+generated columns, including conflict proposals and assignments; violations retain their
+column identity and the first invalid row. Direct generated assignments remain refused; DEFAULT
 recomputes the value. Modification input uses a charged, bounded spill spool; read
 reservations retire before the writer starts, so a writer waiting for memory cannot pin
 its own producer. Single-table UPDATE and DELETE avoid statement-wide target sets;

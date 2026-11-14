@@ -195,7 +195,7 @@ export interface ConflictOutput {
  * order); they must not retain the batch.
  */
 export interface TableRules {
-  /** Optional shared complete-row validator: physical row order, NOT NULL then named CHECKs. */
+  /** Optional complete-row validator: physical rows, column NOT NULL/closed sets, named CHECKs. */
   validate?(batch: Batch, columnIds: readonly number[] | null): void;
   /**
    * CHECK constraints over the active rows: the first failing row (physical) and constraint id,
@@ -214,7 +214,7 @@ export interface TableRules {
    * binding-owned buffers, valid until that binding's next generate/close; writer copies finish
    * before reuse. OLD and target wrappers must be distinct, even when their old data is shared).
    * A SQL data error in speculative batch generation is replayed by row: generated columns,
-   * NOT NULL, then CHECKs in constraint-name order. An earlier constraint failure can therefore
+   * NOT NULL/closed sets, then CHECKs in constraint-name order. An earlier failure can therefore
    * throw its typed constraint error from generate(), before a later row's expression error.
    */
   generate(batch: Batch, columnIds: readonly number[]): void;
