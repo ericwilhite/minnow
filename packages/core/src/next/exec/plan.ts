@@ -1,4 +1,9 @@
-import { columnInputBytes, expressionInputBytes, projectedInputBytes } from "./input-size-plan.js";
+import {
+  columnInputBytes,
+  expressionInputBytes,
+  projectedInputBytes,
+  sourceValueBytes,
+} from "./input-size-plan.js";
 import { KeyLayout } from "./join-keys.js";
 import { byteArrayGroupKey } from "./agg/json-array-key.js";
 import {
@@ -28,7 +33,7 @@ import { Slice, runSliced, type SlicedJob } from "./slices.js";
 /** Immutable pipeline recipes; every execution instantiates its own operators and kernels. */
 import type { MaybePromise } from "../access/key-index.js";
 import type { PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
-import { ResultSink } from "./result-sink.js";
+import { ResultSink, resultRowStepBytes } from "./result-sink.js";
 import { aggregateProgressLayout } from "./agg/parameter-copies.js";
 import { packAggregateInputs } from "./agg/input-layout.js";
 import { outputCopyLayout } from "./output-copies.js";
@@ -1063,7 +1068,11 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                           owner?.admitDictionary(dictionary) ?? false,
                         borrowOutputOnRefusal: true,
                       }),
-                  ...(rowsNeeded === undefined ? {} : { rowsNeeded }),
+                  ...(runtime.sourceBatchRows(rel.id) === undefined
+                    ? rowsNeeded === undefined
+                      ? {}
+                      : { rowsNeeded }
+                    : { rowsNeeded: () => Math.min(rowsNeeded?.() ?? BATCH_ROWS, 1) }),
                 });
                 runtime.onAbort(() => scan.abort());
                 const source: BatchSource = {
@@ -1288,14 +1297,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                     runtime && grant
                       ? {
                           signal: runtime.signal,
-                          available: () =>
-                            Math.max(0, grant.held - grant.allocated - grant.loaned) +
-                            Math.max(
-                              0,
-                              runtime.request.governor.capBytes -
-                                runtime.request.governor.reserveBytes -
-                                runtime.request.governor.usedBytes,
-                            ),
+                          available: () => runtime.projectionAvailable(grant),
                         }
                       : undefined,
                   );
@@ -2640,6 +2642,33 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       if (active.has(id)) runtime.operatorParameterColumns(id, columns, compoundCopies.get(id));
     const jsonGroupSources = new Map<number, Set<number>>();
     const jsonGroupColumnBytes = new Map<number, Map<number, number>>();
+    const resultSources = new Map<number, Set<number>>();
+    const resultColumnBytes = new Map<number, Map<number, number>>();
+    const resultWidth = (slots: readonly number[], largest: number, collect = false) => {
+      const widths: number[] = [];
+      for (let column = 0; column < plan.columns.length; column++) {
+        const width = columnInputBytes(plan.root, column, {
+          parameter: (slot) => slots[slot] ?? largest,
+          source(source, column) {
+            if (collect) {
+              const columns = resultSources.get(source) ?? new Set<number>();
+              columns.add(column);
+              resultSources.set(source, columns);
+              return 0;
+            }
+            return resultColumnBytes.get(source)?.get(column) ?? null;
+          },
+        });
+        if (width === null) return null;
+        widths.push(width);
+      }
+      return resultRowStepBytes(widths);
+    };
+    // This recipe belongs to aggregate outputs/unreturned grouping keys. Keep plain
+    // source/expression delivery on its existing envelope, including expanding kernels.
+    const aggregateResult = aggregatePlanners.size + jsonAggregateRecipes.size > 0;
+    const knownResult = aggregateResult && resultWidth([], 0, true) !== null;
+    if (aggregateResult) runtime.resultRowProgress((slots, largest) => resultWidth(slots, largest));
     let semanticActive = active;
     const jsonGroups = [...jsonAggregateRecipes.values()].filter(
       (p) => p.loans > 1 && active.has(p.rel.id),
@@ -2997,6 +3026,19 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     findDemand(plan.root, null);
     const sources = [...readSources.values()].filter((source) => active.has(source.id));
     const bounds = new Map<number, ReadBound>();
+    // Publication-stable row facts survive producer retirement, without retaining input.
+    const boundedSourceRows = new Map<number, Map<number, number>>();
+    let boundedColumns: Map<number, Set<number>> | null = null;
+    const aggregateLayout = (rel: Extract<Rel, { op: "aggregate" }>) =>
+      aggregateProgressLayout(
+        rel,
+        (source, column) => boundedSourceRows.get(source)?.get(column) ?? null,
+      );
+    const configureChoice = (id: number, strategy: AggregateStrategy) => {
+      const planner = aggregatePlanners.get(id);
+      if (planner) runtime.aggregateProgress(id, strategy.kind, aggregateLayout(planner.rel));
+    };
+    let choicesReady = false;
     const chooseAggregates = () => runSliced(choose(), new Slice(Infinity), () => undefined);
     const choose = function* (): SlicedJob<void> {
       const selectedPercentiles = new Map<number, { bound: PercentileBound; minimum: number }>();
@@ -3084,6 +3126,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           }
         }
         choices.set(entry.rel.id, strategy);
+        configureChoice(entry.rel.id, strategy);
         entry.minimum = strategy.minimum;
         entry.loanSlots = strategy.loans;
       }
@@ -3096,12 +3139,14 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           const planner = aggregatePlanners.get(entry.rel.id),
             prior = choices.get(entry.rel.id);
           const fallback = planner?.hybrid ?? planner?.external;
-          if (!planner || !fallback || prior?.kind === fallback.kind) continue;
+          if (!planner || !fallback || !prior || prior.kind === fallback.kind) continue;
           const saved = { minimum: entry.minimum, loanSlots: entry.loanSlots };
           entry.minimum = fallback.minimum;
           entry.loanSlots = fallback.loans;
+          configureChoice(entry.rel.id, fallback);
           const candidate = runtime.minimumBytes(entries);
           Object.assign(entry, saved);
+          configureChoice(entry.rel.id, prior);
           if (candidate < total) {
             best = entry;
             total = candidate;
@@ -3112,6 +3157,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         const external = planner?.hybrid ?? planner?.external;
         if (!external) throw new Error("Missing external fallback");
         choices.set(best.rel.id, external);
+        configureChoice(best.rel.id, external);
         best.minimum = external.minimum;
         best.loanSlots = external.loans;
       }
@@ -3168,7 +3214,10 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             entry.loanSlots = 0;
             return [prior];
           });
+          const priorStrategy = choices.get(shape.aggregate.id);
+          configureChoice(shape.aggregate.id, { kind: "hash", minimum: bound.aggregate, loans: 0 });
           if (runtime.minimumBytes(entries) > runtime.request.governor.capBytes) {
+            if (priorStrategy) configureChoice(shape.aggregate.id, priorStrategy);
             for (const prior of saved) {
               prior.entry.minimum = prior.minimum;
               prior.entry.loanSlots = prior.loanSlots;
@@ -3181,15 +3230,11 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           starChoices.set(runtime, { shape, identity, bound });
           break;
         }
+      choicesReady = true;
     };
     const needsChoices = aggregatePlanners.size + percentilePlanners.size > 0;
     const execute = () =>
-      then(needsChoices ? chooseAggregates() : undefined, () => {
-        for (const [id, strategy] of aggregateChoices.get(runtime) ?? []) {
-          const planner = aggregatePlanners.get(id);
-          if (planner)
-            runtime.aggregateProgress(id, strategy.kind, aggregateProgressLayout(planner.rel));
-        }
+      then(needsChoices && !choicesReady ? chooseAggregates() : undefined, () => {
         if (
           ![...(aggregateChoices.get(runtime)?.values() ?? [])].some(
             (choice) => choice.kind === "hybrid",
@@ -3276,11 +3321,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 aggregateChoices.get(runtime)?.set(cut.rel, restore);
                 const planner = aggregatePlanners.get(cut.rel);
                 if (planner)
-                  runtime.aggregateProgress(
-                    cut.rel,
-                    restore.kind,
-                    aggregateProgressLayout(planner.rel),
-                  );
+                  runtime.aggregateProgress(cut.rel, restore.kind, aggregateLayout(planner.rel));
               }
               semanticActive = remaining;
               configureJson(next, cut);
@@ -3372,7 +3413,22 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     }
     const sizeSources = function* (): SlicedJob<void> {
       const fixedMinimums = entries.map((entry) => entry.minimum);
-      let windows = true;
+      let windows = true,
+        singleRows = false,
+        resultSizing = false;
+      const boundedScans = new Set<number>();
+      const collect = (rel: Rel): void => {
+        if (rel.op === "scan" && rel.filter === null) boundedScans.add(rel.id);
+        if (rel.op === "join") {
+          collect(rel.left);
+          collect(rel.right);
+        } else if (rel.op === "recursive") {
+          collect(rel.base);
+          collect(rel.step);
+        } else if ("inputs" in rel) for (const child of rel.inputs) collect(child);
+        else if ("input" in rel) collect(rel.input);
+      };
+      collect(plan.root);
       for (;;) {
         let io = 0,
           progress = 0;
@@ -3384,6 +3440,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               {
                 ...source,
                 windowBytes: windows ? source.windowBytes : 0,
+                ...(singleRows && boundedScans.has(source.id) ? { batchRows: 1 as const } : {}),
                 ...(runtime.request.outputBuffers && source.windowBytes > 0
                   ? { retain: false }
                   : {}),
@@ -3401,6 +3458,48 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             ),
           );
           bounds.set(source.id, bound);
+          if (bound.batchRows === 1) {
+            if (boundedColumns === null) {
+              boundedColumns = new Map();
+              for (const planner of aggregatePlanners.values())
+                if (active.has(planner.rel.id))
+                  aggregateProgressLayout(planner.rel, (id, column) => {
+                    const columns = boundedColumns?.get(id) ?? new Set<number>();
+                    columns.add(column);
+                    boundedColumns?.set(id, columns);
+                    return null;
+                  });
+            }
+            const values = new Map<number, number>();
+            for (const column of boundedColumns.get(source.id) ?? []) {
+              const name = source.columns[column],
+                type = source.types[column];
+              if (name === undefined || type === undefined)
+                throw new Error("Missing aggregate source column");
+              const cell = yield* readValue(
+                boundSource(
+                  runtime.sourceView(),
+                  {
+                    ...source,
+                    columns: [name],
+                    types: [type],
+                    singleValueBound: true,
+                    batchRows: 1,
+                    stagingBytes: 0,
+                    windowBytes: 0,
+                    rows: demand.get(source.id) ?? null,
+                  },
+                  runtime.request.governor,
+                  runtime.signal,
+                  1,
+                  1,
+                  runtime.metadataCaches(source.retain !== false, sources),
+                ),
+              );
+              values.set(column, sourceValueBytes(cell));
+            }
+            boundedSourceRows.set(source.id, values);
+          }
           const keyColumns = joinKeySources.get(source.id);
           if (keyColumns)
             for (const index of keyColumns) {
@@ -3457,6 +3556,33 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             columns.set(column, row.valueBytes ?? row.progress / 4);
             jsonGroupColumnBytes.set(source.id, columns);
           }
+          for (const column of resultSizing ? (resultSources.get(source.id) ?? []) : []) {
+            const name = source.columns[column],
+              type = source.types[column];
+            if (name === undefined || type === undefined) throw new Error("Missing result column");
+            const row = yield* readValue(
+              boundSource(
+                runtime.sourceView(),
+                {
+                  ...source,
+                  batchRows: 1,
+                  columns: [name],
+                  types: [type],
+                  stagingBytes: 0,
+                  windowBytes: 0,
+                  rows: demand.get(source.id) ?? null,
+                },
+                runtime.request.governor,
+                runtime.signal,
+                1,
+                1,
+                runtime.metadataCaches(source.retain !== false, sources),
+              ),
+            );
+            const columns = resultColumnBytes.get(source.id) ?? new Map<number, number>();
+            columns.set(column, Math.max(row.valueBytes ?? 0, row.progress / 4));
+            resultColumnBytes.set(source.id, columns);
+          }
           io = Math.max(io, bound.io);
           progress = Math.max(progress, bound.progress);
         }
@@ -3500,10 +3626,27 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             ? Math.max(progress, 4 * jsonConstants) * jsonProgressColumns
             : progress,
         );
+        // Judge the chosen native lanes, not dormant external helpers. Selection
+        // happens once on the ordinary path; only a sizing retry repeats it.
+        if (needsChoices) yield* readValue(chooseAggregates());
         const overCap = runtime.minimumBytes(entries) > runtime.request.governor.capBytes;
         if (windows && overCap && [...bounds.values()].some((bound) => bound.windowBytes > 0)) {
           // Coalesced export windows are optional. All sizing holds have ended: retry the
           // ordinary bounded batch before treating the execution minimum as over-cap.
+          windows = false;
+          continue;
+        }
+        if (overCap && knownResult && !resultSizing && resultSources.size > 0) {
+          // Ordinary source-result copies keep the already proven read envelope.
+          // Only an over-cap minimum needs these additional per-emitted-column facts.
+          resultSizing = true;
+          continue;
+        }
+        if (overCap && !singleRows && sources.some((source) => boundedScans.has(source.id))) {
+          // No producer is open. Shrink the real read step before declaring its complete
+          // minimum irreducible: interval-wide multi-blob payloads need not coexist.
+          // Enforce the same bound in TableScan, not just in the sizing arithmetic.
+          singleRows = true;
           windows = false;
           continue;
         }

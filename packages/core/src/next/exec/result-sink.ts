@@ -51,6 +51,14 @@ export interface ResultSinkOptions {
 export const resultFrameMetadataBytes = (columns: number): number =>
   OBJECT_OVERHEAD_BYTES * (3 + 2 * columns);
 
+/** A failed multi-row attempt returns its buffers before retrying at one row.
+ * #make(1) uses targetBytes=0, so each field's arena is exact, overlapping only
+ * its initial 64 bytes while resizing. Producer buffers are charged elsewhere;
+ * the ordinary frame window funds bounded small/multi-row attempts. */
+export function resultRowStepBytes(widths: readonly number[]): number {
+  return widths.reduce((n, width) => n + Math.max(64, width), 0) + 64 + 4096 + 288 * widths.length;
+}
+
 export class ResultSink implements Operator {
   readonly reclassifiesTransfers = true;
   readonly deferEnd: boolean;

@@ -1,0 +1,867 @@
+{
+  "purpose": "Hash key-admission recovery; ordinary-path guard, no CPU gain claim",
+  "design": "Keep parent allocation policy. Denied key admission has no transitions: discard+split empty prefix; checkpoint exact committed prefix before spooling untouched suffix and phase handoff. No ordinary retry counter or extra sizing.",
+  "control": "82e4aa000662b450e3f63f999d4103b9d6eedd32",
+  "candidate": "0e2c21dcf6a191df89a231186cd01352f98a79eb",
+  "clock": "Process CPU all threads; fresh serial VM per arm/workload/boundary; balanced AB/BA; natural GC; 10 warmups; setup and before/after exact verification outside clock.",
+  "uniqueTimedPIDs": 72,
+  "quartiles": "type 7, linear interpolation (n-1)*p",
+  "fixture": "32768 decoded/stored TEXT rows,8192 account-NNNNNNNN groups,count4. Native boundary is complete Hybrid COUNT including admission/emission/cleanup; SQL uses quiesced real write/storage.",
+  "records": [
+    {
+      "phase": "aa",
+      "boundary": "operator",
+      "iterations": 50,
+      "medianControlMs": 257.429,
+      "medianCandidateMs": 280.435,
+      "medianDeltaMs": 27.442999999999984,
+      "iqrDeltaMs": 50.144000000000005,
+      "rangeDeltaMs": [-57.147999999999996, 126.87499999999997],
+      "pairDeltasMs": [
+        27.442999999999984, 39.186000000000035, 121.54799999999997, -10.95799999999997,
+        -0.5880000000000223, -57.147999999999996, -42.43099999999998, 32.464, 126.87499999999997
+      ],
+      "favoursCandidate": 4,
+      "acceptedGain": false,
+      "significantRegression": false,
+      "load1Range": [3.1, 3.47]
+    },
+    {
+      "phase": "aa",
+      "boundary": "query",
+      "iterations": 10,
+      "medianControlMs": 155.969,
+      "medianCandidateMs": 157.697,
+      "medianDeltaMs": 4.561000000000007,
+      "iqrDeltaMs": 7.244999999999976,
+      "rangeDeltaMs": [-48.68000000000001, 21.55000000000001],
+      "pairDeltasMs": [
+        21.55000000000001, -3.460000000000008, 4.531999999999982, 0.5470000000000255,
+        4.561000000000007, 10.631, 5.661000000000001, -48.68000000000001, 7.792000000000002
+      ],
+      "favoursCandidate": 2,
+      "acceptedGain": false,
+      "significantRegression": false,
+      "load1Range": [3.29, 3.5]
+    },
+    {
+      "phase": "ab",
+      "boundary": "operator",
+      "iterations": 50,
+      "medianControlMs": 323.217,
+      "medianCandidateMs": 365.226,
+      "medianDeltaMs": -3.7210000000000036,
+      "iqrDeltaMs": 105.90899999999999,
+      "rangeDeltaMs": [-172.51500000000001, 177.94400000000002],
+      "pairDeltasMs": [
+        -3.7210000000000036, -15.70999999999998, -6.070999999999998, 42.009000000000015,
+        90.19900000000001, -172.51500000000001, 126.24700000000001, 177.94400000000002,
+        -72.92800000000005
+      ],
+      "favoursCandidate": 5,
+      "acceptedGain": false,
+      "significantRegression": false,
+      "load1Range": [3.46, 4.39]
+    },
+    {
+      "phase": "ab",
+      "boundary": "query",
+      "iterations": 10,
+      "medianControlMs": 161.81,
+      "medianCandidateMs": 155.578,
+      "medianDeltaMs": -13.329000000000008,
+      "iqrDeltaMs": 37.494,
+      "rangeDeltaMs": [-84.11699999999999, 21.900000000000006],
+      "pairDeltasMs": [
+        -84.11699999999999, 4.431999999999988, 21.900000000000006, 17.687999999999988,
+        -17.994999999999976, -13.329000000000008, 16.49199999999999, -70.666, -21.00200000000001
+      ],
+      "favoursCandidate": 5,
+      "acceptedGain": false,
+      "significantRegression": false,
+      "load1Range": [4.19, 4.39]
+    }
+  ],
+  "peaks": {
+    "candidate": "0e2c21dcf6a191df89a231186cd01352f98a79eb",
+    "records": [
+      {
+        "name": "main",
+        "parent": "82e4aa000662b450e3f63f999d4103b9d6eedd32",
+        "cases": 416,
+        "parentSuccesses": 349,
+        "candidateSuccesses": 368,
+        "lostSuccesses": [],
+        "wrongResults": [],
+        "peakIncreases": [],
+        "unpinnedTotalIncreases": [],
+        "hashErrorsFixed": 19,
+        "remainingHashErrors": 0,
+        "maxQueryPeakDelta": 0,
+        "maxQueryPeakSaving": 0,
+        "cleanupZero": true,
+        "success": true
+      },
+      {
+        "name": "control",
+        "parent": "82e4aa000662b450e3f63f999d4103b9d6eedd32",
+        "cases": 416,
+        "parentSuccesses": 349,
+        "candidateSuccesses": 368,
+        "lostSuccesses": [],
+        "wrongResults": [],
+        "peakIncreases": [],
+        "unpinnedTotalIncreases": [],
+        "hashErrorsFixed": 19,
+        "remainingHashErrors": 0,
+        "maxQueryPeakDelta": 0,
+        "maxQueryPeakSaving": 0,
+        "cleanupZero": true,
+        "success": true
+      }
+    ],
+    "sourceHashes": {
+      "packages/core/src/next/exec/agg/groups.ts": "a4fa0305ff0837d452a0d3dee2f7519a3ac5513d5ceaaa6509e62b5fc4ee18d9",
+      "packages/core/src/next/exec/agg/growth.ts": "c1113894d393a69764e5119c6ec2978c427321c73e39c7f8be36623d0b1378e0",
+      "packages/core/src/next/exec/agg/hybrid.ts": "dbf07f67d95b5cfd2c21012681b925201044d27ad570c563c8b526275c3219fa"
+    },
+    "rawHashes": {
+      "compare-main.log": "60fa8d26eb3ab71381baec40289dad7e554ea50b4eb1b2b92013f30dab581fcc",
+      "compare-control.log": "90b3ad458fede4a5b9c63fac25e7f24b6972b67f0d368f3b43d71f865c215b78",
+      "compare-candidate.log": "b53445f6d0824117da381da9a47994839960ea67e9ee9d38df519f8719eba99c"
+    }
+  },
+  "parentPeakGenerator": {
+    "parent": "82e4aa00",
+    "seeds": [47041, 47042],
+    "historiesPerSeed": 32,
+    "fixed": 20,
+    "random": 12,
+    "unequalWidthHistories": 5,
+    "columns": [2, 3, 4, 8, 16],
+    "forms": ["flat dense", "flat selected", "dictionary dense", "dictionary selected"],
+    "reference": "Captured parent ceilings embedded in parent-peak.test.ts; candidate never defines the ceiling."
+  },
+  "coverage": {
+    "native": {
+      "seeds": [47037, 47038],
+      "historiesPerSeed": 17,
+      "fixed": 5,
+      "random": 12
+    },
+    "sql": {
+      "seeds": [47039, 47040],
+      "historiesPerSeed": 18,
+      "fixed": 10,
+      "random": 8,
+      "dimensions": [
+        "shared/distinct parameters",
+        "UTF8",
+        "mixed fixed/byte keys",
+        "2048-row float prefix then suffix",
+        "pinned spill",
+        "reclaim release",
+        "cancel",
+        "zero charges"
+      ]
+    },
+    "node22": "3files6tests PASS"
+  },
+  "mutants": [
+    {
+      "name": "no-key-recovery",
+      "exit": 1,
+      "reason": "HashHeadroomError",
+      "rejected": true,
+      "seconds": 12.335010105045512,
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "packages/core/src/next/exec/agg/byte-growth.test.ts",
+        "packages/core/src/next/testing/executor-hash-transition.test.ts",
+        "--config",
+        "/home/eric/.cache/b4-projection/vitest-star-two.mts",
+        "--maxWorkers=2"
+      ]
+    },
+    {
+      "name": "keep-incomplete-keys",
+      "exit": 1,
+      "reason": "RangeError: offset is out of bounds",
+      "rejected": true,
+      "seconds": 6.19785876700189,
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "packages/core/src/next/exec/agg/byte-growth.test.ts",
+        "--config",
+        "/home/eric/.cache/b4-projection/vitest-star-two.mts",
+        "--maxWorkers=2"
+      ]
+    },
+    {
+      "name": "drop-pending-input",
+      "exit": 1,
+      "reason": "AssertionError",
+      "rejected": true,
+      "seconds": 12.69167847908102,
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "packages/core/src/next/testing/executor-hash-transition.test.ts",
+        "--config",
+        "/home/eric/.cache/b4-projection/vitest-star-two.mts",
+        "--maxWorkers=2"
+      ]
+    },
+    {
+      "name": "clip-future-arena-capacity",
+      "exit": 1,
+      "reason": "less than or equal",
+      "rejected": true,
+      "seconds": 4.71645842900034,
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "packages/core/src/next/exec/agg/parent-peak.test.ts",
+        "--config",
+        "/home/eric/.cache/b4-projection/vitest-star-two.mts",
+        "--maxWorkers=2"
+      ]
+    }
+  ],
+  "rejectedDesign": {
+    "design": "Per-arena speculative capacity clipping",
+    "parentFittingNativeHistories": 152,
+    "peakIncreases": 41,
+    "exampleBytes": [18213625, 26687889],
+    "evidence": "Earlier raw probe,CPU and partial gates retained under ../rebased and ../recovery;superseded by recovery design."
+  },
+  "hashes": {
+    "cpu-final.json": "3463edf351381d640a1d6e493d25fa02df71628a2b0e042658b7b75a4e8a8d40",
+    "control-runtime-hashes.json": "eb44f38e28c873ecd12a5c30cdb1153bf8276b6ae3be72c3d64902376b32fee1",
+    "candidate-runtime-hashes.json": "ffd5545ab41b339cf567907bb72cf177493233ed8b830f506d7d2affba7f4826",
+    "mutants.json": "5b0780e16c6cfb22b376289b97d59da78c60bf9595e2903a4c15ca3e37c45f55",
+    "node22.log": "2be3a8bc6396486aec1f40cd95ebdef7f6909531b3999e70d264386d8d4607aa",
+    "hash-transition-worker.mts": "9200f50e6dfd57ce13335f25efe1d3f5de1b05d5f12303cbf2c1e81df6d70b02",
+    "hash-transition-cpu.mts": "3fa6056b084796339c7ca8d95759ef9ebebca61efc7b62e7d4bde7e68ddd101e",
+    "parent-peak.test.ts": "f31c56a93946fd26abff3f4488440ba63b7f48aa2a343bc1a1ef354e4593ebaa"
+  },
+  "reproduction": "TMPDIR=<scratch> node scripts/hash-transition-cpu.mts <built-main> <built-candidate> <raw-output.json> <mainSHA> <candidateSHA>",
+  "limits": [
+    "Prior 48 irreducible/unchanged-over-cap classification was wrong; review-2 audit recovers all 48, with per-case cap arithmetic below.",
+    "No accepted CPU improvement,format/API/transition-order/browser/RSS/throughput claim.",
+    "Raw samples/source/runtime archives stay under /home/eric/.cache/b4-hash-transition/final;earlier attempts retained."
+  ],
+  "review2": {
+    "control": "bfaa2e29262a2c4f42a3effab788ada3c92b8735",
+    "main": "82e4aa000662b450e3f63f999d4103b9d6eedd32",
+    "cases": 416,
+    "parentSuccesses": 368,
+    "candidateSuccesses": 416,
+    "recoveredRefusals": 48,
+    "remainingRefusals": 0,
+    "lostSuccesses": 0,
+    "wrongResults": 0,
+    "higherQueryPeaks": 0,
+    "higherUnpinnedTotalPeaks": 0,
+    "maxQueryPeakDelta": 0,
+    "maxQueryPeakSaving": 5613584,
+    "rawHashes": {
+      "compare-control.log": "dd098bd4815f753892e82946380cf1e869f3a68eeb1ccdab2a60b339d027d339",
+      "compare-candidate.log": "2372c6065beb19bb24445ee6cee87d75d783923db05aa4c722b6c55e76492b2c",
+      "pg-audit.log": "7e8ac08f212dcb80e3b499cf1146979b958f185558a75cf323beecca414f34e0"
+    },
+    "termOrder": ["read", "result", "source", "projects", "aggregate", "helpers", "other"],
+    "refusalAudit": [
+      {
+        "case": ["column", "case", 1, 16, false, false],
+        "oldMinimum": 25098759,
+        "initialTerms": [800000, 1048576, 4287999, 35332, 2651140, 4360448, 0],
+        "minimum": 13183495,
+        "largestPassMinimum": 13183495,
+        "peak": 13183495,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "case", 1, 16, true, false],
+        "oldMinimum": 25098759,
+        "initialTerms": [800000, 1048576, 4287999, 35332, 2651140, 4360448, 0],
+        "minimum": 13183495,
+        "largestPassMinimum": 13183495,
+        "peak": 13183495,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "case", 2, 16, false, false],
+        "oldMinimum": 25134091,
+        "initialTerms": [800000, 1048576, 4287999, 70664, 2651140, 4360448, 0],
+        "minimum": 13218827,
+        "largestPassMinimum": 13218827,
+        "peak": 13218827,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "case", 2, 16, true, false],
+        "oldMinimum": 25134091,
+        "initialTerms": [800000, 1048576, 4287999, 70664, 2651140, 4360448, 0],
+        "minimum": 13218827,
+        "largestPassMinimum": 13218827,
+        "peak": 13218827,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "case", 4, 16, false, false],
+        "oldMinimum": 25188371,
+        "initialTerms": [800000, 1048576, 4287999, 124944, 2651140, 4360448, 0],
+        "minimum": 13273107,
+        "largestPassMinimum": 13273107,
+        "peak": 13273107,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "case", 4, 16, true, false],
+        "oldMinimum": 25188371,
+        "initialTerms": [800000, 1048576, 4287999, 124944, 2651140, 4360448, 0],
+        "minimum": 13273107,
+        "largestPassMinimum": 13273107,
+        "peak": 13273107,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "case", 8, 16, false, false],
+        "oldMinimum": 25296931,
+        "initialTerms": [800000, 1048576, 4287999, 233504, 2651140, 4360448, 0],
+        "minimum": 13381667,
+        "largestPassMinimum": 13381667,
+        "peak": 13381667,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "case", 8, 16, true, false],
+        "oldMinimum": 25296931,
+        "initialTerms": [800000, 1048576, 4287999, 233504, 2651140, 4360448, 0],
+        "minimum": 13381667,
+        "largestPassMinimum": 13381667,
+        "peak": 13381667,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "case", 12, 16, false, false],
+        "oldMinimum": 25405491,
+        "initialTerms": [800000, 1048576, 4287999, 342064, 2651140, 4360448, 0],
+        "minimum": 13490227,
+        "largestPassMinimum": 13490227,
+        "peak": 13490227,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "case", 12, 16, true, false],
+        "oldMinimum": 25405491,
+        "initialTerms": [800000, 1048576, 4287999, 342064, 2651140, 4360448, 0],
+        "minimum": 13490227,
+        "largestPassMinimum": 13490227,
+        "peak": 13490227,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "case", 16, 16, false, false],
+        "oldMinimum": 25514051,
+        "initialTerms": [800000, 1048576, 4287999, 450624, 2651140, 4360448, 0],
+        "minimum": 13598787,
+        "largestPassMinimum": 13598787,
+        "peak": 13598787,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "case", 16, 16, true, false],
+        "oldMinimum": 25514051,
+        "initialTerms": [800000, 1048576, 4287999, 450624, 2651140, 4360448, 0],
+        "minimum": 13598787,
+        "largestPassMinimum": 13598787,
+        "peak": 13598787,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nested", 1, 16, false, false],
+        "oldMinimum": 25129611,
+        "initialTerms": [800000, 1048576, 4285823, 68360, 2651140, 4360448, 0],
+        "minimum": 13214347,
+        "largestPassMinimum": 13214347,
+        "peak": 13214347,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nested", 1, 16, true, false],
+        "oldMinimum": 25129611,
+        "initialTerms": [800000, 1048576, 4285823, 68360, 2651140, 4360448, 0],
+        "minimum": 13214347,
+        "largestPassMinimum": 13214347,
+        "peak": 13214347,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nested", 2, 16, false, false],
+        "oldMinimum": 25197971,
+        "initialTerms": [800000, 1048576, 4285823, 136720, 2651140, 4360448, 0],
+        "minimum": 13282707,
+        "largestPassMinimum": 13282707,
+        "peak": 13282707,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nested", 2, 16, true, false],
+        "oldMinimum": 25197971,
+        "initialTerms": [800000, 1048576, 4285823, 136720, 2651140, 4360448, 0],
+        "minimum": 13282707,
+        "largestPassMinimum": 13282707,
+        "peak": 13282707,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nested", 4, 16, false, false],
+        "oldMinimum": 25318307,
+        "initialTerms": [800000, 1048576, 4285823, 257056, 2651140, 4360448, 0],
+        "minimum": 13403043,
+        "largestPassMinimum": 13403043,
+        "peak": 13403043,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nested", 4, 16, true, false],
+        "oldMinimum": 25318307,
+        "initialTerms": [800000, 1048576, 4285823, 257056, 2651140, 4360448, 0],
+        "minimum": 13403043,
+        "largestPassMinimum": 13403043,
+        "peak": 13403043,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nested", 8, 16, false, false],
+        "oldMinimum": 25558979,
+        "initialTerms": [800000, 1048576, 4285823, 497728, 2651140, 4360448, 0],
+        "minimum": 13643715,
+        "largestPassMinimum": 13643715,
+        "peak": 13643715,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nested", 8, 16, true, false],
+        "oldMinimum": 25558979,
+        "initialTerms": [800000, 1048576, 4285823, 497728, 2651140, 4360448, 0],
+        "minimum": 13643715,
+        "largestPassMinimum": 13643715,
+        "peak": 13643715,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nested", 12, 16, false, false],
+        "oldMinimum": 25799651,
+        "initialTerms": [800000, 1048576, 4285823, 738400, 2651140, 4360448, 0],
+        "minimum": 13884387,
+        "largestPassMinimum": 13884387,
+        "peak": 13884387,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nested", 12, 16, true, false],
+        "oldMinimum": 25799651,
+        "initialTerms": [800000, 1048576, 4285823, 738400, 2651140, 4360448, 0],
+        "minimum": 13884387,
+        "largestPassMinimum": 13884387,
+        "peak": 13884387,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nested", 16, 16, false, false],
+        "oldMinimum": 26040323,
+        "initialTerms": [800000, 1048576, 4285823, 979072, 2651140, 4360448, 0],
+        "minimum": 14125059,
+        "largestPassMinimum": 14125059,
+        "peak": 14125059,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nested", 16, 16, true, false],
+        "oldMinimum": 26040323,
+        "initialTerms": [800000, 1048576, 4285823, 979072, 2651140, 4360448, 0],
+        "minimum": 14125059,
+        "largestPassMinimum": 14125059,
+        "peak": 14125059,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nullif", 1, 16, false, false],
+        "oldMinimum": 25096583,
+        "initialTerms": [800000, 1048576, 4285823, 35332, 2651140, 4360448, 0],
+        "minimum": 13181319,
+        "largestPassMinimum": 13181319,
+        "peak": 13181319,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nullif", 1, 16, true, false],
+        "oldMinimum": 25096583,
+        "initialTerms": [800000, 1048576, 4285823, 35332, 2651140, 4360448, 0],
+        "minimum": 13181319,
+        "largestPassMinimum": 13181319,
+        "peak": 13181319,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nullif", 2, 16, false, false],
+        "oldMinimum": 25131915,
+        "initialTerms": [800000, 1048576, 4285823, 70664, 2651140, 4360448, 0],
+        "minimum": 13216651,
+        "largestPassMinimum": 13216651,
+        "peak": 13216651,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nullif", 2, 16, true, false],
+        "oldMinimum": 25131915,
+        "initialTerms": [800000, 1048576, 4285823, 70664, 2651140, 4360448, 0],
+        "minimum": 13216651,
+        "largestPassMinimum": 13216651,
+        "peak": 13216651,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nullif", 4, 16, false, false],
+        "oldMinimum": 25186195,
+        "initialTerms": [800000, 1048576, 4285823, 124944, 2651140, 4360448, 0],
+        "minimum": 13270931,
+        "largestPassMinimum": 13270931,
+        "peak": 13270931,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nullif", 4, 16, true, false],
+        "oldMinimum": 25186195,
+        "initialTerms": [800000, 1048576, 4285823, 124944, 2651140, 4360448, 0],
+        "minimum": 13270931,
+        "largestPassMinimum": 13270931,
+        "peak": 13270931,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nullif", 8, 16, false, false],
+        "oldMinimum": 25294755,
+        "initialTerms": [800000, 1048576, 4285823, 233504, 2651140, 4360448, 0],
+        "minimum": 13379491,
+        "largestPassMinimum": 13379491,
+        "peak": 13379491,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nullif", 8, 16, true, false],
+        "oldMinimum": 25294755,
+        "initialTerms": [800000, 1048576, 4285823, 233504, 2651140, 4360448, 0],
+        "minimum": 13379491,
+        "largestPassMinimum": 13379491,
+        "peak": 13379491,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nullif", 12, 16, false, false],
+        "oldMinimum": 25403315,
+        "initialTerms": [800000, 1048576, 4285823, 342064, 2651140, 4360448, 0],
+        "minimum": 13488051,
+        "largestPassMinimum": 13488051,
+        "peak": 13488051,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nullif", 12, 16, true, false],
+        "oldMinimum": 25403315,
+        "initialTerms": [800000, 1048576, 4285823, 342064, 2651140, 4360448, 0],
+        "minimum": 13488051,
+        "largestPassMinimum": 13488051,
+        "peak": 13488051,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nullif", 16, 16, false, false],
+        "oldMinimum": 25511875,
+        "initialTerms": [800000, 1048576, 4285823, 450624, 2651140, 4360448, 0],
+        "minimum": 13596611,
+        "largestPassMinimum": 13596611,
+        "peak": 13596611,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "nullif", 16, 16, true, false],
+        "oldMinimum": 25511875,
+        "initialTerms": [800000, 1048576, 4285823, 450624, 2651140, 4360448, 0],
+        "minimum": 13596611,
+        "largestPassMinimum": 13596611,
+        "peak": 13596611,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "short", 1, 16, false, false],
+        "oldMinimum": 19484807,
+        "initialTerms": [1600000, 1048576, 7485823, 37124, 2651140, 1048576, 0],
+        "minimum": 13871239,
+        "largestPassMinimum": 13871239,
+        "peak": 13871239,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "short", 1, 16, true, false],
+        "oldMinimum": 19484807,
+        "initialTerms": [1600000, 1048576, 7485823, 37124, 2651140, 1048576, 0],
+        "minimum": 13871239,
+        "largestPassMinimum": 13871239,
+        "peak": 13871239,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "short", 2, 16, false, false],
+        "oldMinimum": 19521931,
+        "initialTerms": [1600000, 1048576, 7485823, 74248, 2651140, 1048576, 0],
+        "minimum": 13908363,
+        "largestPassMinimum": 13908363,
+        "peak": 13908363,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "short", 2, 16, true, false],
+        "oldMinimum": 19521931,
+        "initialTerms": [1600000, 1048576, 7485823, 74248, 2651140, 1048576, 0],
+        "minimum": 13908363,
+        "largestPassMinimum": 13908363,
+        "peak": 13908363,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "short", 4, 16, false, false],
+        "oldMinimum": 19579795,
+        "initialTerms": [1600000, 1048576, 7485823, 132112, 2651140, 1048576, 0],
+        "minimum": 13966227,
+        "largestPassMinimum": 13966227,
+        "peak": 13966227,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "short", 4, 16, true, false],
+        "oldMinimum": 19579795,
+        "initialTerms": [1600000, 1048576, 7485823, 132112, 2651140, 1048576, 0],
+        "minimum": 13966227,
+        "largestPassMinimum": 13966227,
+        "peak": 13966227,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "short", 8, 16, false, false],
+        "oldMinimum": 19695523,
+        "initialTerms": [1600000, 1048576, 7485823, 247840, 2651140, 1048576, 0],
+        "minimum": 14081955,
+        "largestPassMinimum": 14081955,
+        "peak": 14081955,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "short", 8, 16, true, false],
+        "oldMinimum": 19695523,
+        "initialTerms": [1600000, 1048576, 7485823, 247840, 2651140, 1048576, 0],
+        "minimum": 14081955,
+        "largestPassMinimum": 14081955,
+        "peak": 14081955,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "short", 12, 16, false, false],
+        "oldMinimum": 19811251,
+        "initialTerms": [1600000, 1048576, 7485823, 363568, 2651140, 1048576, 0],
+        "minimum": 14197683,
+        "largestPassMinimum": 14197683,
+        "peak": 14197683,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "short", 12, 16, true, false],
+        "oldMinimum": 19811251,
+        "initialTerms": [1600000, 1048576, 7485823, 363568, 2651140, 1048576, 0],
+        "minimum": 14197683,
+        "largestPassMinimum": 14197683,
+        "peak": 14197683,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "short", 16, 16, false, false],
+        "oldMinimum": 19926979,
+        "initialTerms": [1600000, 1048576, 7485823, 479296, 2651140, 1048576, 0],
+        "minimum": 14313411,
+        "largestPassMinimum": 14313411,
+        "peak": 14313411,
+        "irreducibleTerm": null,
+        "PGexact": true
+      },
+      {
+        "case": ["column", "short", 16, 16, true, false],
+        "oldMinimum": 19926979,
+        "initialTerms": [1600000, 1048576, 7485823, 479296, 2651140, 1048576, 0],
+        "minimum": 14313411,
+        "largestPassMinimum": 14313411,
+        "peak": 14313411,
+        "irreducibleTerm": null,
+        "PGexact": true
+      }
+    ],
+    "reproduction": "node node_modules/vitest/vitest.mjs run packages/core/src/next/testing/executor-result-progress.test.ts packages/core/src/next/testing/executor-hash-transition.test.ts packages/core/src/next/testing/executor-source-value-bound.test.ts --maxWorkers=2",
+    "rawRoot": "/home/eric/.cache/b4-hash-review-2",
+    "generators": {
+      "keyTransition": {
+        "seeds": [47039, 47040],
+        "runs": 23,
+        "fixed": 15,
+        "random": 8,
+        "keys": "1..16 with explicit12/16",
+        "capsMiB": [16, 32, 64, 128, 256],
+        "distinctParameterCapFloorMiB": 128
+      },
+      "resultProgress": {
+        "seeds": [47043, 47044],
+        "runs": 30,
+        "fixed": 18,
+        "random": 12,
+        "outputs": ["COUNT", "group key", "MIN/MAX", "independent aliases"],
+        "sources": ["parameter", "stored column", "small-row tail"]
+      }
+    },
+    "mutants": [
+      {
+        "name": "RED-parent",
+        "reason": "19484807 bytes",
+        "rejected": true
+      },
+      {
+        "name": "mutant-input-as-output",
+        "reason": "expected false to be true",
+        "rejected": true
+      },
+      {
+        "name": "mutant-unsplit-source",
+        "reason": "MemoryAdmissionError",
+        "rejected": true
+      },
+      {
+        "name": "mutant-scan-without-row-limit",
+        "reason": "expected 2 to be less than or equal to 1",
+        "rejected": true
+      },
+      {
+        "name": "mutant-wider-speculative-growth",
+        "reason": "less than or equal to",
+        "rejected": true
+      },
+      {
+        "name": "mutant-fixed-cap",
+        "reason": "16 MiB",
+        "rejected": true
+      }
+    ],
+    "verification": "Current8files45tests/core typecheck/changed lint GREEN. Superseded f8dd gate/CPU remain in rawRoot; final exact-tip gate and fresh guard will be recorded separately before reporting.",
+    "inlineFollowup": {
+      "authority": "ReadBound.valueBytes conservative cell bound; progress may remain65536 for64001-byte inline values.",
+      "selection": "Size chosen native lanes before retry; one selection on ordinary path. Refine result only for aggregate plans and only when tighter.",
+      "sources": "Single-value bounds per referenced column; no whole dictionary as one cell.",
+      "seeds": [47045, 47046],
+      "runs": 14,
+      "fixed": 4,
+      "random": 10,
+      "reach": [
+        "progress floor insufficient",
+        "large values",
+        "UTF8",
+        "repeated rows",
+        "multiple columns",
+        "charged sizing",
+        "zero"
+      ],
+      "proof": [
+        {
+          "name": "inline-RED-parent",
+          "exit": 1,
+          "rejected": true,
+          "seconds": 6.009964998927899,
+          "command": [
+            "node",
+            "node_modules/vitest/vitest.mjs",
+            "run",
+            "packages/core/src/next/testing/executor-source-value-bound.test.ts",
+            "--config",
+            "/home/eric/.cache/b4-hash-review-2/gate/vitest-star-two.mts",
+            "--maxWorkers=2"
+          ]
+        },
+        {
+          "name": "inline-mutant-progress-only",
+          "exit": 1,
+          "rejected": true,
+          "seconds": 6.111117382068187,
+          "command": [
+            "node",
+            "node_modules/vitest/vitest.mjs",
+            "run",
+            "packages/core/src/next/testing/executor-source-value-bound.test.ts",
+            "--config",
+            "/home/eric/.cache/b4-hash-review-2/gate/vitest-star-two.mts",
+            "--maxWorkers=2"
+          ]
+        }
+      ]
+    }
+  }
+}

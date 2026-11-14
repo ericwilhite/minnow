@@ -68,6 +68,8 @@ function run<T>(job: ReadJob<T>): MaybePromise<T> {
 }
 
 export interface ReadSource {
+  /** Pressure-only unfiltered scan step. The executor enforces this row bound. */
+  readonly batchRows?: 1;
   /** Also measure the largest cell of one selected key column, without a batch sum. */
   readonly singleValueBound?: boolean;
   /** Explicit terminal export: sizing misses must not pollute the shared cache. */
@@ -84,6 +86,7 @@ export interface ReadSource {
   readonly domainColumn?: number;
 }
 export interface ReadBound {
+  readonly batchRows?: 1;
   readonly retain?: boolean;
   readonly bytes: number;
   readonly io: number;
@@ -226,7 +229,7 @@ export function boundSource(
                         columns: source.columns,
                         chunk: first / BATCH_ROWS,
                         startRow: start,
-                        maxRows: Math.min(prefixRows, end - start),
+                        maxRows: Math.min(source.batchRows ?? prefixRows, end - start),
                         targetBytes: target,
                       },
                       { budget, pages: sizingPages, signal },
@@ -506,7 +509,19 @@ export function boundSource(
                   if (page.largeRegion) {
                     const from = Math.max(w * span, page.firstRow),
                       to = Math.min(rows, (w + 1) * span, page.firstRow + page.rowCount);
-                    const large = reader.largeValueBytes(from, to);
+                    // An enforced one-row scan never assembles all large values in
+                    // this metadata interval together. Keep encoded page/directory
+                    // overlap unchanged; only the decoded multi-blob payload is a max.
+                    let large = 0;
+                    if (source.batchRows === 1) {
+                      for (let row = from; row < to; row++) {
+                        large = Math.max(large, reader.largeValueBytes(row, row + 1));
+                        if ((row & 1023) === 0) {
+                          const pause = pauseIfDue(task);
+                          if (pause) yield pause;
+                        }
+                      }
+                    } else large = reader.largeValueBytes(from, to);
                     values[w] = (values[w] ?? 0) + large;
                     largestValue = Math.max(largestValue, large);
                     if (single) {
@@ -589,6 +604,7 @@ export function boundSource(
     }
     const domain = certificate.result();
     return {
+      ...(source.batchRows === undefined ? {} : { batchRows: source.batchRows }),
       bytes: maximum,
       io,
       progress: Math.max(65536, 4 * largestValue),

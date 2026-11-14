@@ -32,7 +32,8 @@
  * is returned if construction throws). The executor funds a complete certified workspace or
  * the next hybrid batch before entering this synchronous table.
  * This low-level ByteCharge seam cannot wait or recover from a partially applied assignment;
- * a refusal indicates a bad workspace certificate or an isolated caller's undersized budget.
+ * The hybrid owner retires a denied tentative key admission before applying transitions;
+ * isolated callers must supply a complete workspace certificate.
  * `keyBytes` bounds what `emitKey` will allocate, so the
  * operator charges an output batch before building it.
  */

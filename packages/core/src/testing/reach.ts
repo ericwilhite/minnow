@@ -5928,3 +5928,85 @@ export const CATALOG_RESERVATION_REACH = [
   "required",
   "display retained",
 ] as const;
+
+export const BYTE_GROWTH_REACH = [
+  "key denial split",
+  "funded transition",
+  "dictionary",
+  "flat",
+  "single key",
+  "compound keys",
+  "selected",
+  "large then small",
+  "zero",
+] as const;
+
+export const HASH_TRANSITION_REACH = [
+  "12 keys",
+  "16 keys",
+  "16 MiB",
+  "32 MiB",
+  "64 MiB",
+  "128 MiB",
+  "mixed fixed/byte keys",
+  "resident prefix",
+  "saved float prefix",
+  "ordinary",
+  "pinned spill",
+  "reclaim release",
+  "cancel reclaim",
+  "PG exact",
+  "distinct parameters",
+  "repeated parameters",
+  "compound keys",
+  "UTF8",
+  "zero",
+] as const;
+
+export const HASH_PARENT_PEAK_REACH = [
+  "2 keys",
+  "3 keys",
+  "4 keys",
+  "8 keys",
+  "16 keys",
+  "dictionary",
+  "flat",
+  "selected",
+  "dense",
+  "unequal widths",
+  "later batch",
+  "parent peak",
+  "zero",
+] as const;
+
+export const HASH_RESULT_PROGRESS_REACH = [
+  "emitted aliases",
+  "small row tail",
+  "COUNT only",
+  "emitted key",
+  "variable aggregate",
+  "one-row scan",
+  "column",
+  "parameter",
+  "competitor",
+  "12 keys",
+  "16 keys",
+  "16 MiB",
+  "32 MiB",
+  "64 MiB",
+  "128 MiB",
+  "unreachable wide branch",
+  "fitting peak",
+  "PG exact",
+  "zero",
+] as const;
+
+export const HASH_SOURCE_VALUE_REACH = [
+  "progress floor insufficient",
+  "large values",
+  "UTF8",
+  "repeated rows",
+  "multiple columns",
+  "charged sizing",
+  "zero",
+] as const;
