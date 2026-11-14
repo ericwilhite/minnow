@@ -3741,6 +3741,10 @@ of commit order. The column root binds semantic versions, schema/generation, mut
 base/covered LSNs, corpus totals, next document ID and building/ready/invalid state. Only a
 building root may hold an owner/expiry lease. A paged directory groups column roots per table.
 The reference walker validates child identity, depth, bounds and totals before exposing them.
+Every reference, including the initial root, is checked for safe extent bounds and the 256 KiB
+page limit before any read or lease allocation. Invalid references produce typed manifest
+corruption errors. Unique term counts must agree with equal/distinct fences and cannot exceed
+the number of bounded UTF16 keys inside the interval; these checks need no child IO.
 
 Encoding measures before allocating one exact charged output. Parsing reserves a bounded
 per-page object/typed-lane allowance before construction; returned decoded ownership remains

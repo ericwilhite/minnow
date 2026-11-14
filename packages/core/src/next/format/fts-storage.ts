@@ -12,6 +12,7 @@ import type {
 import { pauseIfDue } from "../task.js";
 import { ManifestCorruptionError } from "./bytes.js";
 import {
+  validateFtsReference,
   encodeFts,
   decodeFts,
   ftsDocumentSummary,
@@ -54,6 +55,8 @@ export async function readFtsNode<K extends FtsFormatName>(
   reader: ExtentReader,
   signal?: AbortSignal,
 ): Promise<FtsNodeLease<K>> {
+  signal?.throwIfAborted();
+  validateFtsReference(ref);
   let lease: ReadLease | undefined = await reader.read([ref], {
     budget,
     ...(signal ? { signal } : {}),

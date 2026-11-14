@@ -52,6 +52,9 @@ rebuild bytes only (reader 4, manifest 5, commit body 3); no supported next/ wri
 The development format now registers bounded native full-text root, term, posting, document
 and append-delta pages plus portable per-column definitions. Definitions survive catalog WAL
 replay/checkpoint; native page references and build leases remain outside the portable catalog.
+FTS page references are checked against their extent bounds and the 256 KiB limit before
+reading bytes, including the initial root. Impossible term counts and key fences are refused
+as corruption without reading child pages. These validation fixes change no stored grammar.
 This storage foundation does not build indexes or select an indexed query route. Snapshot
 postings maintenance and rebuild are later integration stages.
 The published 0.x engine and its stored formats are unchanged; no migration is needed.

@@ -52,7 +52,8 @@ function tokens(n: bigint): void {
 function term(s: string): void {
   valid(typeof s === "string" && s.length > 0 && s.length <= G.termUnits, "Invalid FTS term");
 }
-function blob(r: BlobRef): void {
+/** Validate borrowed references before IO as well as embedded references during decoding. */
+export function validateFtsReference(r: BlobRef): void {
   whole(r.extent.offset, "extent offset");
   whole(r.extent.length, "extent length", true);
   whole(r.offset, "blob offset");
@@ -68,7 +69,7 @@ function blob(r: BlobRef): void {
   valid(r.length <= G.pageBytes, "FTS page reference exceeds cap");
 }
 function ids(r: FtsIdRef): void {
-  blob(r.ref);
+  validateFtsReference(r.ref);
   whole(r.count, "subtree count");
   whole(r.first, "first id");
   whole(r.last, "last id");
@@ -88,8 +89,22 @@ function docs(r: FtsDocumentRef, posting = false): void {
   );
   if (posting) valid(r.count > 0 && r.tokens >= BigInt(r.count), "Empty/invalid FTS postings");
 }
+/** Rank in the finite preorder of all nonempty UTF16 strings of length <=termUnits.
+ * The 32-unit bound limits these temporaries to 513 bits, inside codec scratch. */
+function termOrdinal(value: string): bigint {
+  let span = 1n,
+    rank = 0n;
+  for (let i = G.termUnits - 1; i >= 0; i--) {
+    if (i < value.length) {
+      rank += BigInt(value.charCodeAt(i)) * span;
+      if (i + 1 < value.length) rank++;
+    }
+    span = 65536n * span + 1n;
+  }
+  return rank;
+}
 function terms(r: FtsTermRef): void {
-  blob(r.ref);
+  validateFtsReference(r.ref);
   tokens(r.count);
   tokens(r.tokens);
   valid(r.count <= r.tokens, "FTS terms exceed tokens");
@@ -98,7 +113,18 @@ function terms(r: FtsTermRef): void {
   else {
     term(r.first);
     term(r.last);
-    valid(r.first <= r.last, "Invalid FTS term bounds");
+    valid(
+      r.count === 1n ? r.first === r.last : r.first < r.last,
+      "FTS term count disagrees with fences",
+    );
+    // A prefix and its immediate NUL extension are adjacent; at maximum key length,
+    // adjacent final code units are adjacent keys too. Counting arbitrary distinct
+    // keys inside these intervals would otherwise allow a locally impossible tree.
+    if (r.count > 2n)
+      valid(
+        r.count <= termOrdinal(r.last) - termOrdinal(r.first) + 1n,
+        "FTS term count exceeds fence capacity",
+      );
   }
 }
 function delta(r: FtsDeltaRef): void {
@@ -181,7 +207,7 @@ class Output {
     }
   }
   ref(r: BlobRef): void {
-    blob(r);
+    validateFtsReference(r);
     this.uint(r.extent.offset);
     this.uint(r.extent.length);
     this.uint(r.offset);
@@ -259,7 +285,7 @@ class Input extends ByteReader {
       length: this.uint(),
       checksum: this.u32(),
     };
-    blob(value);
+    validateFtsReference(value);
     return value;
   }
   idRef(): FtsIdRef {

@@ -246,7 +246,7 @@ for (const seed of seedsFor("next-fts-storage", [0xb81d, 0xb81e]))
               "ftsRoot",
               {
                 ...built.column,
-                terms: built.column.terms ? { ...built.column.terms, first: "0" } : null,
+                terms: built.column.terms ? { ...built.column.terms, first: "0", last: "0" } : null,
               },
               account,
               writer,

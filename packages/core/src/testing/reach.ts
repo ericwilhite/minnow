@@ -6193,3 +6193,35 @@ export const FTS_CATALOG_FEATURE_REACH = [
   "out of order",
   "future typed",
 ] as const;
+
+export const FTS_REFERENCE_GUARD_REACH = [
+  "checksummed oversized root",
+  "beyond generic read cap",
+  "outside extent",
+  "zero length",
+  "negative offset",
+  "fractional length",
+  "unsafe extent end",
+  "invalid checksum",
+  "nonfinite",
+  "legal boundary reaches IO",
+  "all five grammars",
+  "initial walker root",
+  "no allocation or IO",
+] as const;
+
+export const FTS_TERM_FENCE_REACH = [
+  "equal fences multiple terms",
+  "singleton distinct fences",
+  "reversed fences",
+  "adjacent prefix capacity",
+  "maximum length interval capacity",
+  "ftsTerms",
+  "ftsRoot",
+  "ftsDelta",
+  "exact boundary accepted",
+  "raw surrogate",
+  "NUL code unit",
+  "no child read needed",
+  "drained",
+] as const;
