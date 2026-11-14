@@ -1,3 +1,4 @@
+import { statementRuleReach } from "./statement-reach.js";
 import { cursorMinimum, runIndexAccess, indexExpressions, indexMetadata } from "./index-access.js";
 import {
   UpsertWriter,
@@ -917,6 +918,12 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           );
           fixed(rel, (_cap, runtime) => minimum(runtime));
           return (runtime, _downstream, stops) => {
+            if (
+              runtime.request.statement &&
+              (runtime.request.rowRules?.requiresTriggers ??
+                statementRuleReach(runtime.request.statement.catalog, rel.tableId, rel).triggers)
+            )
+              throw new UnsupportedPlanError("trigger firing requires its admitted native runtime");
             if (rel.kind === "upsert") {
               const table = runtime.request.statement?.catalog.table(rel.tableId);
               const conflict = rel.onConflict;
@@ -1069,6 +1076,12 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           };
         }
         return (runtime, downstream, stops) => {
+          if (
+            runtime.request.statement &&
+            (runtime.request.rowRules?.requiresTriggers ??
+              statementRuleReach(runtime.request.statement.catalog, rel.tableId, rel).triggers)
+          )
+            throw new UnsupportedPlanError("trigger firing requires its admitted native runtime");
           const statement = runtime.request.statement;
           if (statement === null) throw new TypeError("modify requires a statement");
           const writer = statement.table(rel.tableId, {

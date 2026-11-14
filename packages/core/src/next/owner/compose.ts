@@ -989,6 +989,7 @@ class ComposedSession implements EngineSession {
         tx.catalog,
         lowered.plan.root.tableId,
         this.#rules(() => tx.catalog),
+        lowered.plan.root,
       );
       const statement = tx.statement({
         rules: (id) => rowRules.table(id),
@@ -1030,6 +1031,7 @@ class ComposedSession implements EngineSession {
           tx.catalog,
           lowered.plan.root.tableId,
           this.#rules(() => tx.catalog),
+          lowered.plan.root,
         );
         const statement = tx.statement({
           rules: (id) => rowRules.table(id),
@@ -1160,6 +1162,7 @@ class ComposedSession implements EngineSession {
           tx.catalog,
           followUp.plan.root.tableId,
           this.#rules(() => tx.catalog),
+          followUp.plan.root,
         );
         const next = tx.statement({
           rules: (id) => rowRules.table(id),

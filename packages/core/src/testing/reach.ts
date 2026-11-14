@@ -7761,3 +7761,20 @@ export const TRIGGER_PREFIX_TARGET_REACH = [
   "resident",
   "no primary effect",
 ] as const;
+
+/** Immutable trigger targets and FK edges must enter native rule/admission reach. */
+export const STATEMENT_RULE_REACH = [
+  "rule minimum includes body targets",
+  "raw executor guarded",
+  "informational update only",
+  "generated key propagation",
+  "FK preserves budget",
+  "budget diamond",
+  "budget zero refuses",
+  "unrelated update",
+  "insert stops FK edge",
+  "delete event differs",
+  "RETURNING guarded",
+  "plain guarded",
+  "guard before mutation",
+] as const;

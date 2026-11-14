@@ -15,15 +15,20 @@ export async function startModification(
   const prepared = core.executor.prepare(lowered.plan);
   const tx = await core.harness.path.begin();
   if (lowered.plan.root.op !== "modify") throw new TypeError("Missing modification root");
-  const rowRules = new StatementRules(tx.catalog, lowered.plan.root.tableId, (id) => {
-    const table = tx.catalog.table(id);
-    if (!table) throw new TypeError("Missing rule table");
-    return compileTableRules(
-      table,
-      tx.catalog.version,
-      core.lowerer.lowerTableRules(table, tx.catalog),
-    );
-  });
+  const rowRules = new StatementRules(
+    tx.catalog,
+    lowered.plan.root.tableId,
+    (id) => {
+      const table = tx.catalog.table(id);
+      if (!table) throw new TypeError("Missing rule table");
+      return compileTableRules(
+        table,
+        tx.catalog.version,
+        core.lowerer.lowerTableRules(table, tx.catalog),
+      );
+    },
+    lowered.plan.root,
+  );
   const statement = tx.statement({ rules: (id) => rowRules.table(id), targets: rowRules.targets });
   try {
     const execution = prepared.execute({

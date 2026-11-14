@@ -202,7 +202,11 @@ summaries plus contiguous fragment offsets, and reclamation retires every old in
 The reader/manifest/commit-body development selectors are 7/8/6; older unpublished selectors
 refuse. The released 1.0 format has no supported predecessor yet. Trigger family20 now carries dialect-versioned bodies and stable OLD/NEW/target dependencies
 (body30/binding31/column32). Definitions and CREATE/DROP lowering persist through WAL and
-checkpoint; trigger scheduling/body execution is the next integration unit. FTS declarations persist without making an index ready. Snapshot catalog frame
+checkpoint; trigger scheduling/body execution is the next integration unit. Writes whose event
+can reach a stored trigger refuse before mutation until that runtime is installed. Rule admission
+walks stable trigger target IDs and referential edges with event, assigned columns and remaining
+body budget; informational update-follow edges and generated keys are included. Unrelated writes
+keep their existing execution path. FTS declarations persist without making an index ready. Snapshot catalog frame
 adapters are a separate integration step over the same portable MCAT stream.
 
 ### Relational catalog and managed migration

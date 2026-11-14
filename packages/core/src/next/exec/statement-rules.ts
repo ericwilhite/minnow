@@ -1,4 +1,5 @@
 /** Statement bindings are funded by the root admission, and outlive all root/FK writer borrows. */
+import { statementRuleReach } from "./statement-reach.js";
 import type { CatalogView } from "../access/catalog.js";
 import type { SpillService } from "../spill/contract.js";
 import { ModifyTargetSet, MODIFY_TARGET_SET_BYTES } from "./modify-target-set.js";
@@ -16,6 +17,7 @@ import { ExpressionMemoryError } from "./kernels/vectors.js";
 
 export class StatementRules {
   readonly #tables: number[];
+  readonly requiresTriggers: boolean;
   readonly #bound = new Map<number, BoundTableRules>();
   readonly #native = new Map<number, TableRules>();
   #targets: ModifyTargetSet | null = null;
@@ -34,21 +36,11 @@ export class StatementRules {
     readonly catalog: CatalogView,
     readonly root: number,
     readonly lookup: (id: number) => TableRules,
+    modify?: Extract<Rel, { op: "modify" }>,
   ) {
-    const reachable = new Set([root]);
-    let more = true;
-    while (more) {
-      more = false;
-      for (const table of catalog.tables)
-        if (
-          !reachable.has(table.id) &&
-          table.foreignKeys.some((fk) => reachable.has(fk.parentTableId))
-        ) {
-          reachable.add(table.id);
-          more = true;
-        }
-    }
-    this.#tables = [...reachable].filter((id) => {
+    const reach = statementRuleReach(catalog, root, modify);
+    this.requiresTriggers = reach.triggers;
+    this.#tables = reach.tables.filter((id) => {
       const table = catalog.table(id);
       return (
         table && (table.checks.length > 0 || table.columns.some((c) => c.generatedSql !== null))
