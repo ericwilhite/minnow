@@ -90,6 +90,14 @@ export interface Statement {
   /** The catalog including this transaction's DDL so far. */
   readonly catalog: CatalogView;
   /**
+   * Separately pinned read of the current statement's own write prefix, for a trigger body.
+   * Unlike view, includes this statement's writes. Consume/spool the complete body input
+   * before performing its mutations: reads and mutations of a statement do not run concurrently.
+   * The caller releases after all read borrows drain; end/rollback also invalidates the pin.
+   * Keep it through the corresponding writer calls when supplying inputView for locators.
+   */
+  readOwn(): Snapshot;
+  /**
    * A writer for one table. A statement may hold several writers of one table with different
    * options (MERGE); they share the statement's state: repeat detection, deferred checks.
    */
@@ -107,6 +115,9 @@ export interface Statement {
 }
 
 export interface TableWriteOptions {
+  /** Locators from this statement's readOwn() pin, not its start view. A foreign pin,
+   * even from the same transaction/path, is refused. Caller retains it through writes. */
+  readonly inputView?: Snapshot;
   /** Columns an `update` batch assigns, in batch order after the locator. Default: none. */
   readonly assigned?: readonly number[];
   /**

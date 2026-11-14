@@ -17,6 +17,11 @@ formats. `value::text` and `text || value` now work in the rebuild. Array text s
 renderer's PostgreSQL quoting. The shipped engine, public API and stored formats are unchanged; no
 migration is needed.
 
+The private 1.0 write path adds separately owned current-statement read pins and validates
+body-writer locator origins, for trigger substatement integration. Released pins retire from
+the root's active ownership set; commit and rollback close remaining pins. No shipped behavior,
+public API or stored format changes.
+
 - The private 1.0 row-rule evaluator preserves PostgreSQL's first error across generated
   expressions, NOT NULL and CHECKs when batch evaluation fails. CHECKs use constraint-name
   order. Successful generated batches retain vectorized evaluation; shipped 0.x behavior and
