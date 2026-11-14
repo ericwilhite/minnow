@@ -869,7 +869,12 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         if (!["insert", "update", "delete", "upsert"].includes(rel.kind))
           throw new UnsupportedPlanError("modify kind or RETURNING", { construct: "modify" });
         const child = prepare(rel.input);
-        if (rel.returning !== null || rel.kind === "upsert" || rel.usesRules) {
+        if (
+          rel.returning !== null ||
+          rel.kind === "upsert" ||
+          rel.usesRules ||
+          (rel.onRepeat === "first" && !rel.uniqueTargets)
+        ) {
           if (
             rel.returning !== null &&
             rel.kind !== "insert" &&
@@ -974,7 +979,12 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 };
                 let writer: UpsertWriter | ReturningWriter;
                 try {
-                  runtime.request.rowRules?.bind(pool, runtime.signal);
+                  runtime.request.rowRules?.bind(
+                    pool,
+                    runtime.signal,
+                    runtime.request.spill,
+                    runtime.request.queryId,
+                  );
                   writer =
                     rel.kind === "upsert"
                       ? new UpsertWriter(
@@ -1010,10 +1020,13 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                       await returned.close();
                     } finally {
                       arena.close();
-                      runtime.request.rowRules?.close();
-                      pool.close();
-                      release();
-                      grant.close();
+                      try {
+                        await runtime.request.rowRules?.close();
+                      } finally {
+                        pool.close();
+                        release();
+                        grant.close();
+                      }
                     }
                     throw error;
                   })();
@@ -1032,10 +1045,13 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                       await retireInput();
                       await returned.close();
                     } finally {
-                      runtime.request.rowRules?.close();
-                      pool.close();
-                      release();
-                      grant.close();
+                      try {
+                        await runtime.request.rowRules?.close();
+                      } finally {
+                        pool.close();
+                        release();
+                        grant.close();
+                      }
                       runtime.modification = null;
                     }
                   })());

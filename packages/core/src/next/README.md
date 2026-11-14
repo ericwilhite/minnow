@@ -230,10 +230,10 @@ column, and DSL counters advance past explicit safe integer values. SQL SERIAL a
 IDENTITY use PostgreSQL sequence semantics instead. Restart uses the existing durable reservation
 horizon; unused reserved values may be skipped after recovery.
 
-Limits: general `modify` IR execution is still outside this catalog stage. SQL/DSL definition
-and query differentials use PGlite; native TableWriter/persistence tests do not claim SQL DML
-execution. ALWAYS identity retains its generation mode and rejects explicit assignments; identity options
-still refuse with 0A000 instead of losing the clause.
+The catalog-stage SQL/DSL definition and query differentials use PGlite; its native
+TableWriter/persistence tests are separate from the generated SQL DML execution suites.
+ALWAYS identity is retained and enforces DEFAULT versus explicit assignment. Unsupported
+identity options refuse with 0A000 instead of losing the clause.
 Named enums that shadow an underlying built-in `pg_type` name require SQL namespaces and
 explicitly refuse; quoted aliases such as `"integer"` retain their separate enum identity.
 Named types accept at most 65,536 labels (the current two-byte native sort rank), each at
@@ -1628,9 +1628,10 @@ must keep that grant alive for the bound vectors' lifetime. Computed join/sort/w
 into hidden columns and removed from visible results. No runtime code generation is used.
 
 The owner composition uses it by default; protocol tests over `StandinWritePath` explicitly keep
-their synthetic executor. DML, keyed nested-loop joins, index lookup, bounded or locator-producing
-index ranges, fetch, init plans, apply, UNION/INTERSECT and
-recursion are still typed prepare-time refusals, as are unsupported existing kernel overloads.
+their synthetic executor. Native INSERT VALUES/SELECT, UPDATE, DELETE, ON CONFLICT and RETURNING
+execute with statement snapshot input spools. Joined/index inputs retain locator identity;
+repeat tracking and returned rows use charged, spillable state. Shared row rules stay alive
+through native FK actions. Unsupported modification kinds and kernel overloads remain typed refusals.
 This factory does not turn those missing capabilities into current-engine fallbacks. The
 lowerer emits joins and windows for the factory; SQL catalogue tests exercise them through
 real storage and result delivery.
@@ -1681,7 +1682,7 @@ rule adapts only direct integer AVG outputs according to C11; it grants no float
 over the real write path and flushed MemoryBackend storage. Ingestion is outside query timing;
 this is not the browser Gate B lane.
 
-The full interface contract includes the following (DML remains unimplemented by the factory):
+The full interface contract includes the following:
 
 - `executor.prepare(plan)` compiles a plan once; execute accepts raw values and binds after
   admission. Explicit `bind(values, grant)` also requires an admitted execution budget;

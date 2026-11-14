@@ -88,8 +88,11 @@ row's generated-expression error. Direct generated assignments remain refused; D
 recomputes the value. Modification input uses a charged, bounded spill spool; read
 reservations retire before the writer starts, so a writer waiting for memory cannot pin
 its own producer. Single-table UPDATE and DELETE avoid statement-wide target sets;
-UPDATE FROM visits matching source rows in source order. The shipped engine and stored
-formats are unchanged.
+UPDATE FROM visits matching source rows in source order. Joined modifications and upserts
+track repeated native row identities with a fixed charged bitmap cache and a spilled paged
+directory. Duplicate suppression follows row-rule evaluation. Single-row upsert writes
+coalesce contiguous undo ranges without crossing statement or catalog boundaries, keeping
+commit projection bounded. The shipped engine and stored formats are unchanged.
 
 The unexported rebuild casts integers, NUMERIC (keeping scale), float4/float8 (PostgreSQL's
 shortest spelling), boolean, date, time, timestamp, timestamptz (UTC), interval (including

@@ -257,7 +257,8 @@ export class QueryRuntime {
       this.plan.root.op === "modify" &&
       this.plan.root.returning === null &&
       this.plan.root.kind !== "upsert" &&
-      !this.plan.root.usesRules
+      !this.plan.root.usesRules &&
+      this.plan.root.onRepeat !== "first"
         ? modifySpoolBytes(this.plan.root.input.output.length)
         : 0;
     return (

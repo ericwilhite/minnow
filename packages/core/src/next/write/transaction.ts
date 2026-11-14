@@ -707,12 +707,24 @@ export class StatementImpl implements Statement {
   #plain: TableWriterImpl | null = null;
   /** Row ids this statement updated or deleted, per table (row-affected-twice). */
   #touchedMap: Map<number, Set<number>> | null = null;
+  readonly targets: StatementOptions["targets"];
 
   get touched(): Map<number, Set<number>> {
     return (this.#touchedMap ??= new Map());
   }
   /** Whether this statement inserted row `rowId` of `tableId` (ON CONFLICT `statement`). */
   inserted(tableId: number, rowId: number): boolean {
+    // Native IDs only advance. A row below the statement-visible high-water mark
+    // cannot have been inserted by this statement. Do not rescan its entire growing
+    // undo stream for every existing-row upsert; inspect only immutable view facts.
+    const start = this.view.internalTable(tableId);
+    const groups = start.tableView.groups;
+    let before = groups.count === 0 ? -1 : groups.get(groups.count - 1).lastRowId;
+    for (const memtable of start.tableView.memtables) {
+      const count = memtable.visibleRows(this.view.bound);
+      if (count > 0) before = Math.max(before, memtable.firstRowId + count - 1);
+    }
+    if (rowId <= before) return false;
     const undo = this.tx.undo;
     for (let k = this.#start; k < undo.length; k++) {
       const entry = undo[k];
@@ -757,6 +769,7 @@ export class StatementImpl implements Statement {
     this.seq = pendingSeq(ordinal);
     this.#rules = options.rules;
     this.#signal = options.signal;
+    this.targets = options.targets;
     this.#start = tx.undo.length;
     this.#startCatalog = tx.catalog;
   }
@@ -1261,6 +1274,10 @@ export class TableWriterImpl implements TableWriter {
   readonly #onRepeat: "error" | "first";
   readonly #inputView: SnapshotImpl | null;
   readonly #uniqueTargets: boolean;
+  // One scalar cursor per existing writer: repeated one-row upserts must not leave
+  // a row effect per input for the bounded commit encoder's repeated passes.
+  #lastRowsUndo = -1;
+  #lastRowsCatalog = -1;
   /** Indexes of other tables' foreign keys that reference this table's keys. */
   readonly #referenced: ReadonlySet<number>;
 
@@ -1564,23 +1581,39 @@ export class TableWriterImpl implements TableWriter {
           });
         const take = Math.min(memtable.capacity, plan.count - done),
           before = memtable.rowCount;
-        tx.reserveFtsRowUndo();
+        const previous = tx.undo[this.#lastRowsUndo];
+        const coalesce =
+          previous?.kind === "rows" &&
+          previous.ftsKeyed !== undefined &&
+          previous.statement === this.statement.ordinal &&
+          previous.memtable === memtable &&
+          previous.before + previous.count === before &&
+          this.#lastRowsCatalog === this.statement.catalog.version;
+        // FTS reserves one embedded flag per retained entry, not per append. An
+        // extension keeps its funded flag (including true) and needs no new slot.
+        if (!coalesce) tx.reserveFtsRowUndo();
         try {
           memtable.append(columns, plan.rows, plan.from + done, take);
           memtable.mark(seq);
         } catch (error) {
-          tx.releaseFtsRowUndo();
+          if (!coalesce) tx.releaseFtsRowUndo();
           throw error;
         }
-        tx.undo.push({
-          kind: "rows",
-          ftsKeyed: false,
-          statement: this.statement.ordinal,
-          tableId: this.tableId,
-          memtable,
-          before,
-          count: take,
-        });
+        if (coalesce) {
+          tx.undo[this.#lastRowsUndo] = { ...previous, count: previous.count + take };
+        } else {
+          this.#lastRowsUndo = tx.undo.length;
+          this.#lastRowsCatalog = this.statement.catalog.version;
+          tx.undo.push({
+            kind: "rows",
+            ftsKeyed: false,
+            statement: this.statement.ordinal,
+            tableId: this.tableId,
+            memtable,
+            before,
+            count: take,
+          });
+        }
         const firstRowId = memtable.firstRowId + before;
         if (rowIds !== null) for (let k = 0; k < take; k++) rowIds.push(firstRowId + k);
         const put = this.#putValidKeys(
@@ -1880,7 +1913,7 @@ export class TableWriterImpl implements TableWriter {
   }
 
   /** Row ids of the active rows' locators (column 0), applying the row-affected-twice rule. */
-  #targets(batch: Batch): { rows: Uint16Array; rowIds: number[] } {
+  #targets(batch: Batch): MaybePromise<{ rows: Uint16Array; rowIds: number[] }> {
     const locators = batch.columns[0];
     if (
       locators?.form !== "flat" ||
@@ -1891,43 +1924,64 @@ export class TableWriterImpl implements TableWriter {
     const snapshot = this.#inputView ?? this.statement.view;
     snapshot.check();
     const view = snapshot.internalTable(this.tableId);
-    let touched = this.#uniqueTargets ? undefined : this.statement.touched.get(this.tableId);
-    if (!this.#uniqueTargets && touched === undefined) {
+    const locatorValues = locators.data.values;
+    const tracker = this.#uniqueTargets ? undefined : this.statement.targets;
+    let touched =
+      this.#uniqueTargets || tracker ? undefined : this.statement.touched.get(this.tableId);
+    if (!this.#uniqueTargets && !tracker && touched === undefined) {
       touched = new Set();
       this.statement.touched.set(this.tableId, touched);
     }
     const kept: number[] = [];
     const rowIds: number[] = [];
-    for (const row of activeRows(batch)) {
-      if (
-        locators.validity !== null &&
-        ((locators.validity[row >>> 5] ?? 0) & (1 << (row & 31))) === 0
-      )
-        throw new TypeError("An update or delete target has a null locator");
-      const rowId = view.rowId(locators.data.values[row] ?? 0);
-      if (touched?.has(rowId)) {
-        if (this.#onRepeat === "error") throw new CardinalityViolationError(this.tableId, row);
-        continue;
+    const active = activeRows(batch);
+    const visit = (from: number): MaybePromise<void> => {
+      for (let k = from; k < active.length; k++) {
+        const row = need(active[k]);
+        if (
+          locators.validity !== null &&
+          ((locators.validity[row >>> 5] ?? 0) & (1 << (row & 31))) === 0
+        )
+          throw new TypeError("An update or delete target has a null locator");
+        snapshot.check();
+        const rowId = view.rowId(locatorValues[row] ?? 0);
+        const keep = (seen: boolean) => {
+          if (seen) {
+            if (this.#onRepeat === "error") throw new CardinalityViolationError(this.tableId, row);
+            return;
+          }
+          touched?.add(rowId);
+          kept.push(row);
+          rowIds.push(rowId);
+        };
+        const seen = tracker?.testAndSet(this.tableId, rowId) ?? touched?.has(rowId) ?? false;
+        if (seen instanceof Promise)
+          return seen.then((value) => {
+            keep(value);
+            return visit(k + 1);
+          });
+        keep(seen);
       }
-      touched?.add(rowId);
-      kept.push(row);
-      rowIds.push(rowId);
-    }
-    return { rows: Uint16Array.from(kept), rowIds };
+    };
+    return settle(visit(0), () => ({ rows: Uint16Array.from(kept), rowIds }));
   }
 
   update(batch: Batch, written: Selection | null): MaybePromise<number> {
     return this.statement.guard(() => {
       this.statement.beginMutation();
       this.#checkShape(batch.columns, 1, this.#assigned);
-      const { rows, rowIds } = this.#targets(batch);
-      if (written !== null) {
-        written.rows.set(rows);
-        written.count = rows.length;
-      }
-      if (rowIds.length === 0) return 0;
-      const sources = this.#assigned.map((_, k) => ({ vector: need(batch.columns[k + 1]), rows }));
-      return settle(this.#update(rowIds, this.#assigned, sources, false), () => rowIds.length);
+      return settle(this.#targets(batch), ({ rows, rowIds }) => {
+        if (written !== null) {
+          written.rows.set(rows);
+          written.count = rows.length;
+        }
+        if (rowIds.length === 0) return 0;
+        const sources = this.#assigned.map((_, k) => ({
+          vector: need(batch.columns[k + 1]),
+          rows,
+        }));
+        return settle(this.#update(rowIds, this.#assigned, sources, false), () => rowIds.length);
+      });
     });
   }
 
@@ -2012,13 +2066,14 @@ export class TableWriterImpl implements TableWriter {
       this.statement.beginMutation();
       if (batch.columns.length !== 1)
         throw new TypeError("A delete batch holds the locator column only");
-      const { rows, rowIds } = this.#targets(batch);
-      if (written !== null) {
-        written.rows.set(rows);
-        written.count = rows.length;
-      }
-      if (rowIds.length === 0) return 0;
-      return settle(this.#delete(rowIds), () => rowIds.length);
+      return settle(this.#targets(batch), ({ rows, rowIds }) => {
+        if (written !== null) {
+          written.rows.set(rows);
+          written.count = rows.length;
+        }
+        if (rowIds.length === 0) return 0;
+        return settle(this.#delete(rowIds), () => rowIds.length);
+      });
     });
   }
 

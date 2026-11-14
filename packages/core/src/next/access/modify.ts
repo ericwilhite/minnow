@@ -78,6 +78,9 @@ export interface StatementOptions {
    * statement writes, including rows written by foreign-key actions.
    */
   readonly rules: (tableId: number) => TableRules;
+  /** Admitted, bounded repeat tracking. Returns true if this native row ID was already seen.
+   * Shared by every writer of the statement; the owner fences borrows before closing it. */
+  readonly targets?: { testAndSet(tableId: number, rowId: number): MaybePromise<boolean> };
   /** Cancels waits inside the statement (backpressure, index reads). */
   readonly signal?: AbortSignal;
 }

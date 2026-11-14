@@ -990,7 +990,11 @@ class ComposedSession implements EngineSession {
         lowered.plan.root.tableId,
         this.#rules(() => tx.catalog),
       );
-      const statement = tx.statement({ rules: (id) => rowRules.table(id), signal: context.signal });
+      const statement = tx.statement({
+        rules: (id) => rowRules.table(id),
+        targets: rowRules.targets,
+        signal: context.signal,
+      });
       let execution: Execution;
       try {
         execution = this.#execute(
@@ -1029,6 +1033,7 @@ class ComposedSession implements EngineSession {
         );
         const statement = tx.statement({
           rules: (id) => rowRules.table(id),
+          targets: rowRules.targets,
           signal: context.signal,
         });
         let execution: Execution;
@@ -1156,7 +1161,11 @@ class ComposedSession implements EngineSession {
           followUp.plan.root.tableId,
           this.#rules(() => tx.catalog),
         );
-        const next = tx.statement({ rules: (id) => rowRules.table(id), signal: context.signal });
+        const next = tx.statement({
+          rules: (id) => rowRules.table(id),
+          targets: rowRules.targets,
+          signal: context.signal,
+        });
         const execution = this.#execute(
           followUp.plan,
           boundParameters(plannedFollowUp, []),

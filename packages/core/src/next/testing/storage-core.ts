@@ -132,7 +132,10 @@ export class StorageCore implements NextCore {
           this.lowerer.lowerTableRules(table, tx.catalog),
         );
       });
-      const statement = tx.statement({ rules: (id) => rowRules.table(id) });
+      const statement = tx.statement({
+        rules: (id) => rowRules.table(id),
+        targets: rowRules.targets,
+      });
       const execution = prepared.execute({
         snapshot: null,
         rowRules,

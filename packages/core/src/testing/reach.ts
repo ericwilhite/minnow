@@ -7706,3 +7706,58 @@ export const MODIFY_RULE_PRESSURE_REACH = [
   "64 MiB",
   "spill cleanup",
 ] as const;
+
+/** Repeat-tracker cache eviction and identity domains; generated b5c6 histories. */
+export const MODIFY_TARGET_SET_REACH = [
+  "evicted leaf",
+  "repeated target",
+  "separate tables",
+  "wide row identity",
+  "fixed charged envelope",
+  "complete cleanup",
+] as const;
+/** Large shared-scope inputs and native repeat policy; b5c7 includes20k target witness. */
+export const MODIFY_LARGE_TARGETS_REACH = [
+  "coalesced row undo",
+  "joined first match",
+  "large upsert",
+  "joined delete",
+  "no native repeat Set",
+  "64 MiB",
+  "complete cleanup",
+] as const;
+/** Create/write/read borrows survive cancellation until the backend returns. */
+export const MODIFY_TARGET_CANCEL_REACH = [
+  "create",
+  "append",
+  "read",
+  "borrow fenced",
+  "idempotent cleanup",
+] as const;
+/** Single-row write coalescing must retain catalog boundaries, rollback and recovery. */
+export const WRITE_ROW_UNDO_REACH = [
+  "visible row shortcut",
+  "new row classified",
+  "coalesced append",
+  "catalog boundary",
+  "frozen memtable",
+  "commit",
+  "statement rollback",
+  "transaction rollback",
+  "reopen",
+] as const;
+/** Moving repeat suppression ahead of generated evaluation loses required errors. */
+export const MODIFY_DUPLICATE_RULES_REACH = [
+  "ignored generated error",
+  "statement rollback",
+  "duplicate source values",
+] as const;
+/** Prefix pin expiry can occur while the bounded target tracker awaits its own spill I/O. */
+export const TRIGGER_PREFIX_TARGET_REACH = [
+  "expired during wait",
+  "UPDATE",
+  "DELETE",
+  "published",
+  "resident",
+  "no primary effect",
+] as const;

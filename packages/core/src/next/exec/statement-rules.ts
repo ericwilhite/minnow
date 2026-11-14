@@ -1,5 +1,7 @@
 /** Statement bindings are funded by the root admission, and outlive all root/FK writer borrows. */
 import type { CatalogView } from "../access/catalog.js";
+import type { SpillService } from "../spill/contract.js";
+import { ModifyTargetSet, MODIFY_TARGET_SET_BYTES } from "./modify-target-set.js";
 import type { TableRules } from "../access/modify.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import { BATCH_ROWS, type Batch, type Vector } from "../vector/vector.js";
@@ -16,6 +18,15 @@ export class StatementRules {
   readonly #tables: number[];
   readonly #bound = new Map<number, BoundTableRules>();
   readonly #native = new Map<number, TableRules>();
+  #targets: ModifyTargetSet | null = null;
+  #closing: Promise<void> | null = null;
+  readonly targets = {
+    testAndSet: (tableId: number, rowId: number): Promise<boolean> => {
+      if (!this.#targets)
+        throw new UnsupportedPlanError("repeat tracking requires its admitted scope");
+      return this.#targets.testAndSet(tableId, rowId);
+    },
+  };
   #charge: ByteCharge | null = null;
   #metadata = 0;
   #denied = 0;
@@ -46,11 +57,14 @@ export class StatementRules {
   }
   /** No program/buffer reference survives sizing. Eviction during admission remains safe. */
   minimumBytes(): number {
-    return this.#tables.length === 0
-      ? 0
-      : 4096 +
+    return (
+      MODIFY_TARGET_SET_BYTES +
+      (this.#tables.length === 0
+        ? 0
+        : 4096 +
           this.#tables.length * 1024 +
-          this.#tables.reduce((n, id) => n + tableRuleMinimumBytes(this.lookup(id), BATCH_ROWS), 0);
+          this.#tables.reduce((n, id) => n + tableRuleMinimumBytes(this.lookup(id), BATCH_ROWS), 0))
+    );
   }
   progressCopies(): number {
     let generated = 0;
@@ -96,7 +110,7 @@ export class StatementRules {
     const returned = projectedInputBytes(rel.returning ?? [], source, sizes);
     return returned === null ? null : generated + returned;
   }
-  bind(charge: ByteCharge, signal: AbortSignal): void {
+  bind(charge: ByteCharge, signal: AbortSignal, spill: SpillService, queryId: number): void {
     if (this.#charge) throw new TypeError("Statement row rules already bound");
     this.#metadata = this.#tables.length === 0 ? 0 : 4096 + this.#tables.length * 1024;
     if (!charge.allocate(this.#metadata)) throw new ExpressionMemoryError(this.#metadata);
@@ -110,6 +124,7 @@ export class StatementRules {
       free: (n) => charge.free(n),
     };
     try {
+      this.#targets = new ModifyTargetSet(counted, spill, queryId, signal);
       for (const id of this.#tables) {
         const bound = bindTableRules(this.lookup(id), counted, { capacity: BATCH_ROWS, signal });
         this.#bound.set(id, bound);
@@ -123,7 +138,7 @@ export class StatementRules {
         });
       }
     } catch (error) {
-      this.close();
+      void this.close(); // Binding precedes all spill I/O; cleanup is synchronous here.
       throw error;
     }
   }
@@ -186,12 +201,18 @@ export class StatementRules {
     }
   }
 
-  close(): void {
+  close(): void | Promise<void> {
+    if (this.#closing) return this.#closing;
     for (const bound of this.#bound.values()) bound.close();
     this.#bound.clear();
     this.#native.clear();
     this.#charge?.free(this.#metadata);
     this.#charge = null;
     this.#metadata = 0;
+    const targets = this.#targets;
+    this.#targets = null;
+    const closing = targets?.close();
+    if (closing instanceof Promise) this.#closing = closing;
+    return closing;
   }
 }

@@ -136,6 +136,7 @@ it.each(["before", "after"])("handles cancellation %s statement completion", asy
       const statement = {
         ordinal: real.ordinal,
         view: real.view,
+        readOwn: real.readOwn.bind(real),
         catalog: real.catalog,
         table: real.table.bind(real),
         changeCatalog: real.changeCatalog.bind(real),
