@@ -8,11 +8,12 @@ export function snapshotReturningParameters(
   builder: PlanBuilder,
 ): LoweredWrite {
   const rel = write.rel;
-  if (rel.op !== "modify" || rel.returning === null) return write;
+  if (rel.op !== "modify") return write;
   const table = builder.catalog.table(rel.tableId);
   if (!table) throw new TypeError("Missing RETURNING table");
   const parameters: Array<Extract<ScalarExpr, { op: "param" }>> = [];
   const slots = new Map<number, number>();
+  let base = table.columns.length + (rel.passthrough ?? 0);
   const map = (expr: ScalarExpr): ScalarExpr => {
     switch (expr.op) {
       case "param": {
@@ -24,7 +25,7 @@ export function snapshotReturningParameters(
         }
         return {
           op: "column",
-          index: table.columns.length + (rel.passthrough ?? 0) + position,
+          index: base + position,
           type: expr.type,
         };
       }
@@ -58,7 +59,17 @@ export function snapshotReturningParameters(
         return { ...expr, arg: map(expr.arg), pattern: map(expr.pattern) };
     }
   };
-  const returning = rel.returning.map(map);
+  const returning = rel.returning?.map(map) ?? null;
+  base =
+    2 * table.columns.length + (rel.onConflict?.assignments.length ?? 0) + (rel.passthrough ?? 0);
+  const onConflict =
+    rel.onConflict === null
+      ? null
+      : {
+          ...rel.onConflict,
+          assignments: rel.onConflict.assignments.map((a) => ({ ...a, expr: map(a.expr) })),
+          where: rel.onConflict.where === null ? null : map(rel.onConflict.where),
+        };
   if (parameters.length === 0) return write;
   const input: Rel = {
     op: "project",
@@ -83,6 +94,12 @@ export function snapshotReturningParameters(
   };
   return {
     ...write,
-    rel: { ...rel, input, returning, passthrough: (rel.passthrough ?? 0) + parameters.length },
+    rel: {
+      ...rel,
+      input,
+      returning,
+      onConflict,
+      passthrough: (rel.passthrough ?? 0) + parameters.length,
+    },
   };
 }

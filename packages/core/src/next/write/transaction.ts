@@ -2156,6 +2156,7 @@ export class TableWriterImpl implements TableWriter {
               return index;
             });
       const rows = activeRows(batch);
+      this.#validate(batch.columns, rows, batch.length, null);
       const current = this.statement.current();
       const table = current.internalTable(this.tableId);
       const view = this.statement.view.internalTable(this.tableId);

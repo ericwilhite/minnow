@@ -15,7 +15,7 @@ export function returningShape(rel: ModifyRel): {
   width: number;
   types: readonly PhysicalType[];
 } {
-  const start = rel.kind === "insert" ? 0 : 1 + rel.assigned.length;
+  const start = rel.kind === "insert" || rel.kind === "upsert" ? 0 : 1 + rel.assigned.length;
   const width = rel.input.output.length - start - (rel.passthrough ?? 0);
   return { start, width, types: rel.input.output.slice(start).map((column) => column.type) };
 }

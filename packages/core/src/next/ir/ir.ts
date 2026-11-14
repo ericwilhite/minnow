@@ -436,7 +436,8 @@ export type Rel =
    *   Assignments are evaluated in list order, each once per row, and assignment `j` may also
    *   read column `2n + i` for `i < j`: the value assignment `i` produced. Lowering recomputes a
    *   stored generated column from those values, so a volatile assigned expression is evaluated
-   *   once (review B6-p2a finding 3).
+   *   once (review B6-p2a finding 3). Snapshotted parameter/passthrough values follow
+   *   all assignment slots at `2n + assignments.length`.
    * - `returning`: the affected table row (new values for insert, update and upsert; old values
    *   for delete), then the input's passthrough columns (`passthrough`, below).
    * - `merge` actions: see `MergeAction`.

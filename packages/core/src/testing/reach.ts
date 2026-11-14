@@ -7634,3 +7634,28 @@ export const MIXED_SOURCE_RECIPE_REACH = [
   "exact original rows",
   "all credit returned",
 ] as const;
+
+export const MODIFY_UPSERT_REACH = [
+  "without RETURNING",
+  "proposed NOT NULL before conflict",
+  "composite primary target",
+  "repeated unique target",
+  "FK valid update",
+  "FK rollback",
+  "primary target",
+  "unique target",
+  "target permutation",
+  "target order",
+  "EXCLUDED",
+  "WHERE true",
+  "WHERE false",
+  "targetless nothing",
+  "targeted nothing",
+  "multi-row proposals",
+  "insert select",
+  "null unique tuples",
+  "repeated existing",
+  "repeated inserted",
+  "non-arbiter unique rollback",
+  "arbiter assignment refused",
+] as const;

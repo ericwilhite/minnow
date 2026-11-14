@@ -1,4 +1,11 @@
 import {
+  UpsertWriter,
+  UpsertExpressions,
+  upsertTypes,
+  upsertMetadata,
+  upsertWorkspace,
+} from "./modify-upsert.js";
+import {
   ReturningWriter,
   returningShape,
   returningMetadata,
@@ -858,21 +865,29 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     ids.add(rel.id);
     switch (rel.op) {
       case "modify": {
-        if (!["insert", "update", "delete"].includes(rel.kind))
+        if (!["insert", "update", "delete", "upsert"].includes(rel.kind))
           throw new UnsupportedPlanError("modify kind or RETURNING", { construct: "modify" });
         const child = prepare(rel.input);
-        if (rel.returning !== null) {
-          if (rel.kind !== "insert" && !rel.oldRow)
+        if (rel.returning !== null || rel.kind === "upsert") {
+          if (rel.kind !== "insert" && rel.kind !== "upsert" && !rel.oldRow)
             throw new UnsupportedPlanError("RETURNING needs the original statement row");
           const shape = returningShape(rel);
-          const exprs = rel.returning;
+          const exprs = rel.returning ?? [];
           const compiler =
-            returningMetadata(rel) +
+            (rel.kind === "upsert"
+              ? upsertMetadata(rel) + upsertWorkspace(rel)
+              : returningMetadata(rel)) +
             measureCompilerBuffers(
               compilation,
               shape.types,
               MODIFY_ROWS,
-              (context) => new ProjectOperator(exprs, context, DISCARD),
+              (context) => {
+                if (rel.kind === "upsert") {
+                  context.arena.flat({ kind: "locator", tableId: rel.tableId });
+                  new UpsertExpressions(rel, { ...context, input: upsertTypes(rel) });
+                }
+                return new ProjectOperator(exprs, context, DISCARD);
+              },
               (operator) => operator.abort(undefined),
             );
           const minimum =
@@ -888,8 +903,25 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             2 * (variableColumns(types(rel)) + variableColumns(types(rel.input))),
           );
           fixed(rel, minimum);
-          return (runtime, _downstream, stops) =>
-            then(runtime.admit(`modify#${String(rel.id)}`, minimum, true, rel), (grant) => {
+          return (runtime, _downstream, stops) => {
+            if (rel.kind === "upsert") {
+              const table = runtime.request.statement?.catalog.table(rel.tableId);
+              const conflict = rel.onConflict;
+              if (
+                table &&
+                conflict?.assignments.some((assignment) =>
+                  table.indexes.some(
+                    (index) =>
+                      (index.id === table.primaryKey || conflict.arbiters.includes(index.id)) &&
+                      index.columnIds.includes(assignment.column),
+                  ),
+                )
+              )
+                throw new UnsupportedPlanError(
+                  "ON CONFLICT DO UPDATE cannot reassign the conflict key",
+                );
+            }
+            return then(runtime.admit(`modify#${String(rel.id)}`, minimum, true, rel), (grant) => {
               if (!(grant instanceof ReservedGrant))
                 throw new TypeError("RETURNING needs atomic phase admission");
               const release = grant.holdClose();
@@ -928,15 +960,29 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 params: { slots: [] },
                 resolveCall,
               };
-              const writer = new ReturningWriter(
-                rel,
-                statement,
-                table,
-                context,
-                returned,
-                runtime.signal,
-                runtime.counts,
-              );
+              const writer =
+                rel.kind === "upsert"
+                  ? new UpsertWriter(
+                      rel,
+                      statement,
+                      table,
+                      context,
+                      rel.returning === null ? _downstream : returned,
+                      pool,
+                      grant,
+                      runtime.request.reads,
+                      runtime.signal,
+                      runtime.counts,
+                    )
+                  : new ReturningWriter(
+                      rel,
+                      statement,
+                      table,
+                      context,
+                      returned,
+                      runtime.signal,
+                      runtime.counts,
+                    );
               let retired: Promise<void> | null = null,
                 closed: Promise<void> | null = null;
               const retireInput = () =>
@@ -954,12 +1000,20 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                     pool.close();
                     release();
                     grant.close();
+                    runtime.modification = null;
                   }
                 })());
-              runtime.modification = { spool: input, writer, returned, retireInput, close };
+              runtime.modification = {
+                spool: input,
+                writer,
+                ...(rel.returning === null ? {} : { returned }),
+                retireInput,
+                close,
+              };
               runtime.onAbort((reason) => writer.abort(reason));
               return child(runtime, input, stops);
             });
+          };
         }
         return (runtime, downstream, stops) => {
           const statement = runtime.request.statement;

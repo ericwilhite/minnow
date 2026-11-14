@@ -254,7 +254,9 @@ export class QueryRuntime {
     // A buffered producer cannot offer a frame before its delivery handoff. Keep only
     // bounded empty-sink metadata, rather than an unused full consumer byte window.
     const spool =
-      this.plan.root.op === "modify" && this.plan.root.returning === null
+      this.plan.root.op === "modify" &&
+      this.plan.root.returning === null &&
+      this.plan.root.kind !== "upsert"
         ? modifySpoolBytes(this.plan.root.input.output.length)
         : 0;
     return (

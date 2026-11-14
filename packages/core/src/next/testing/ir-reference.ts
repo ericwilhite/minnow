@@ -823,14 +823,19 @@ function modifyRows(rel: Extract<Rel, { op: "modify" }>, env: Environment): Row[
           if (touched.has(found))
             throw new ReferenceSqlError("affects a row a second time", "21000");
           const existing = stored[found] ?? [];
-          const both = [...existing, ...proposed];
+          const both = [
+            ...existing,
+            ...proposed,
+            ...rel.onConflict.assignments.map(() => null),
+            ...extra,
+          ];
           if (rel.onConflict.where !== null && evaluate(rel.onConflict.where, both, env) !== true)
             continue;
           const next = [...existing];
           // In list order; assignment j reads earlier values as columns 2n + i (ir.ts).
-          for (const assignment of rel.onConflict.assignments) {
+          for (const [j, assignment] of rel.onConflict.assignments.entries()) {
             const value = evaluate(assignment.expr, both, env);
-            both.push(value);
+            both[2 * table.columns.length + j] = value;
             next[table.columns.findIndex((column) => column.id === assignment.column)] = value;
           }
           validate(next);

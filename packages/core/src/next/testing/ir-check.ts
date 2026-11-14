@@ -467,7 +467,13 @@ function checkRel(rel: Rel, catalog: CatalogView): void {
         fail(where, "delete input lacks the locator");
       if (rel.onConflict !== null) {
         const reads = [...row, ...row];
-        for (const assignment of rel.onConflict.assignments) {
+        // Holes reject forward assignment reads, while parameters live after all
+        // assignment slots and must already be available to WHERE/SET.
+        const start = reads.length;
+        reads.length += rel.onConflict.assignments.length;
+        reads.push(...input.slice(row.length));
+        if (rel.onConflict.where !== null) checkExpr(rel.onConflict.where, reads, where);
+        for (const [j, assignment] of rel.onConflict.assignments.entries()) {
           checkExpr(assignment.expr, reads, where);
           const column = table.columns.find((candidate) => candidate.id === assignment.column);
           if (column === undefined || !samePhysicalType(assignment.expr.type, column.type))
@@ -475,9 +481,8 @@ function checkRel(rel: Rel, catalog: CatalogView): void {
               where,
               `conflict assignment of column ${String(assignment.column)} has another type`,
             );
-          reads.push({ name: column.name, type: column.type, nullable: true });
+          reads[start + j] = { name: column.name, type: column.type, nullable: true };
         }
-        if (rel.onConflict.where !== null) checkExpr(rel.onConflict.where, [...row, ...row], where);
       }
       const extra =
         (rel.passthrough ?? 0) === 0 ? [] : input.slice(input.length - (rel.passthrough ?? 0));
