@@ -17,6 +17,7 @@ import {
 } from "../format/snapshot.js";
 import { Catalog } from "./catalog.js";
 import { loadSnapshot, type SnapshotLoadTarget } from "./snapshot-load.js";
+import { snapshotBlob } from "./snapshot-source.js";
 import { column, INT, tableInput } from "./test-support.js";
 async function archive(rows: number): Promise<Uint8Array[]> {
   const catalog =
@@ -68,8 +69,8 @@ async function archive(rows: number): Promise<Uint8Array[]> {
   writer.close();
   return parts;
 }
-async function* input(chunks: readonly Uint8Array[]): AsyncGenerator<Uint8Array> {
-  yield* chunks;
+function input(chunks: readonly Uint8Array[]) {
+  return snapshotBlob(new Blob(chunks.map((chunk) => chunk.slice().buffer)));
 }
 async function openTarget(
   backend: MemoryBackend,
@@ -123,43 +124,32 @@ for (const seed of seedsFor("next-snapshot-retirement", [0xb26b, 0xb26c]))
           const backend = new MemoryBackend(),
             governor = new Governor(32 << 20),
             chunks = await archive(rows);
-          const prepare = await governor.admit({
-            label: "old setup",
-            minimumBytes: 16 << 20,
-            spillable: false,
-          });
-          try {
-            await loadSnapshot(input(chunks), () => openTarget(backend, governor, 0), prepare);
-          } finally {
-            prepare.close();
-          }
+          const prepare = new Governor(16 << 20);
+          await loadSnapshot(input(chunks), () => openTarget(backend, governor, 0), prepare);
+          expect(prepare.usedBytes).toBe(0);
           expect(governor.usedBytes).toBe(0);
-          const grant = await governor.admit({
-            label: "replace fixed step",
-            minimumBytes: 6 << 20,
-            spillable: false,
-          });
+          const loadGovernor = new Governor(6 << 20);
           let peak = 0;
-          const budget = {
-            allocate(n: number) {
-              const ok = grant.allocate(n);
-              if (ok) peak = Math.max(peak, grant.allocated);
-              return ok;
-            },
-            free(n: number) {
-              grant.free(n);
-            },
+          const admit = loadGovernor.admitGroup.bind(loadGovernor);
+          loadGovernor.admitGroup = async (options) => {
+            const grants = await admit(options);
+            for (const grant of grants) {
+              const allocate = grant.allocate.bind(grant);
+              grant.allocate = (bytes) => {
+                const ok = allocate(bytes);
+                peak = Math.max(peak, grant.allocated);
+                return ok;
+              };
+            }
+            return grants;
           };
-          try {
-            await loadSnapshot(
-              input(await archive(0)),
-              () => openTarget(backend, governor, 1),
-              budget,
-              { replace: true },
-            );
-          } finally {
-            grant.close();
-          }
+          await loadSnapshot(
+            input(await archive(0)),
+            () => openTarget(backend, governor, 1),
+            loadGovernor,
+            { replace: true },
+          );
+          expect(loadGovernor.usedBytes).toBe(0);
           expect(governor.usedBytes).toBe(0);
           peaks.push(peak);
           const opened = await openTarget(backend, governor, 2),

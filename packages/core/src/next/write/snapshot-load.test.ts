@@ -1,4 +1,6 @@
 /** Atomic load law: old/absent or complete native root, never a portable prefix. */
+import { Governor, type Grant } from "../memory/governor.js";
+import { spoolSnapshotInput, type ReplayableSnapshotInput } from "./snapshot-source.js";
 import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
@@ -9,9 +11,11 @@ import {
   SNAPSHOT_NATIVE_LAYOUT_REACH,
   SNAPSHOT_LOAD_OPEN_REACH,
   SNAPSHOT_CATALOG_REFUSAL_REACH,
+  SNAPSHOT_ADMISSION_REACH,
 } from "../../testing/reach.js";
 import { decodeManifestRoot } from "../format/manifest-codec.js";
 import { listedRootExtents, reachableExtents } from "../format/reachable.js";
+import { FileScratch } from "../storage/file-store.js";
 import { SimDisk } from "../storage/sim-disk.js";
 import { openExtentSpace } from "../storage/space.js";
 import type { ByteBudget, ExtentSpace } from "../storage/extents.js";
@@ -39,23 +43,79 @@ import {
   tableInput,
   texts,
 } from "./test-support.js";
-class Budget implements ByteBudget {
-  used = 0;
-  peak = 0;
-  constructor(readonly cap = 32 << 20) {}
+class Budget extends Governor implements ByteBudget {
+  #used = 0;
+  #peak = 0;
+  get used(): number {
+    return this.#used + this.usedBytes;
+  }
+  get peak(): number {
+    return Math.max(this.#peak, this.peakBytes);
+  }
+  constructor(readonly cap = 32 << 20) {
+    super(cap);
+  }
   allocate(n: number): boolean {
-    if (this.used + n > this.cap) return false;
-    this.used += n;
-    this.peak = Math.max(this.peak, this.used);
+    if (this.#used + n > this.cap) return false;
+    this.#used += n;
+    this.#peak = Math.max(this.#peak, this.#used);
     return true;
   }
   free(n: number): void {
-    this.used -= n;
-    if (this.used < 0) throw new Error("double free");
+    this.#used -= n;
+    if (this.#used < 0) throw new Error("double free");
   }
 }
-async function* input(chunks: readonly Uint8Array[]): AsyncGenerator<Uint8Array> {
-  yield* chunks;
+function input(
+  chunks: readonly Uint8Array[],
+  before?: (offset: number, signal: AbortSignal) => Promise<void>,
+): ReplayableSnapshotInput {
+  return {
+    byteLength: chunks.reduce((sum, chunk) => sum + chunk.length, 0),
+    async readInto(offset, into, signal) {
+      signal.throwIfAborted();
+      await before?.(offset, signal);
+      signal.throwIfAborted();
+      let start = 0,
+        copied = 0;
+      for (const chunk of chunks) {
+        if (start + chunk.length > offset && copied < into.length) {
+          const at = Math.max(0, offset - start),
+            take = Math.min(chunk.length - at, into.length - copied);
+          into.set(chunk.subarray(at, at + take), copied);
+          copied += take;
+          offset += take;
+        }
+        start += chunk.length;
+      }
+      if (copied !== into.length) throw new Error("short fixture source");
+    },
+  };
+}
+function stalled(
+  chunks: readonly Uint8Array[],
+  enter: () => void,
+  gate: Promise<void>,
+): ReplayableSnapshotInput {
+  const end = chunks.slice(0, -1).reduce((sum, chunk) => sum + chunk.length, 0);
+  return input(chunks, async (offset, signal) => {
+    if (offset < end) return;
+    enter();
+    let cancel!: () => void;
+    try {
+      await Promise.race([
+        gate,
+        new Promise<never>((_, reject) => {
+          cancel = () =>
+            reject(signal.reason instanceof Error ? signal.reason : new Error("source cancelled"));
+          signal.addEventListener("abort", cancel, { once: true });
+          if (signal.aborted) cancel();
+        }),
+      ]);
+    } finally {
+      signal.removeEventListener("abort", cancel);
+    }
+  });
 }
 async function fixture(values: ReadonlyArray<number | null>, large = false): Promise<Uint8Array[]> {
   const h = new Harness("strict", "memory"),
@@ -117,14 +177,17 @@ async function target(
   currentLsn = 0,
   empty = true,
   observe?: (space: ExtentSpace) => void,
+  prepaid?: Grant,
 ): Promise<SnapshotLoadTarget> {
   const lease = await h.backend.acquire(),
     session = await h.backend.open(lease),
-    startup = await h.governor.admit({
-      label: "load startup",
-      minimumBytes: 8 << 20,
-      spillable: true,
-    });
+    startup =
+      prepaid ??
+      (await h.governor.admit({
+        label: "load startup",
+        minimumBytes: 8 << 20,
+        spillable: true,
+      }));
   try {
     const space = await openExtentSpace(session, {
       reachable: listedRootExtents(),
@@ -143,7 +206,7 @@ async function target(
         try {
           await space.close();
         } finally {
-          startup.close();
+          if (prepaid === undefined) startup.close();
           try {
             await session.close();
           } finally {
@@ -153,7 +216,7 @@ async function target(
       },
     };
   } catch (error) {
-    startup.close();
+    if (prepaid === undefined) startup.close();
     await session.close();
     await lease.release();
     throw error;
@@ -331,11 +394,15 @@ it("discards every incomplete frame prefix and never publishes before physical E
   const h = new Harness("strict", "memory"),
     b = new Budget();
   let eof = false;
+  const source = input(chunks);
   await loadSnapshot(
-    (async function* () {
-      yield* chunks;
-      eof = true;
-    })(),
+    {
+      byteLength: source.byteLength,
+      async readInto(offset, into, signal) {
+        await source.readInto(offset, into, signal);
+        if (offset + into.length === source.byteLength) eof = true;
+      },
+    },
     () =>
       target(h, 0, true, (space) => {
         const publish = space.publish.bind(space);
@@ -379,19 +446,7 @@ for (const seed of seedsFor("next-snapshot-load-faults", [0xb263, 0xb264]))
             gate = new Promise<void>((r) => {
               unblock = r;
             });
-          const stream =
-            mode === "cancel"
-              ? (async function* () {
-                  for (let i = 0; i < chunks.length; i++) {
-                    if (i === chunks.length - 1) {
-                      entered();
-                      await gate;
-                    }
-                    const chunk = chunks[i];
-                    if (chunk !== undefined) yield chunk;
-                  }
-                })()
-              : input(chunks);
+          const stream = mode === "cancel" ? stalled(chunks, entered, gate) : input(chunks);
           const task = loadSnapshot(
             stream,
             () =>
@@ -660,7 +715,12 @@ for (const seed of seedsFor("next-snapshot-native-layouts", [0xb265, 0xb266]))
           }
           async function body(chunks: readonly Uint8Array[]): Promise<Uint8Array[]> {
             const funding = new Budget(),
-              reader = await SnapshotStreamReader.open(input(chunks), funding),
+              reader = await SnapshotStreamReader.open(
+                (async function* () {
+                  yield* chunks;
+                })(),
+                funding,
+              ),
               parts: Uint8Array[] = [];
             for await (const frame of reader.frames())
               if (frame.kind === SnapshotKind.columnPart) parts.push(frame.payload.slice());
@@ -691,7 +751,7 @@ for (const seed of seedsFor("next-snapshot-native-layouts", [0xb265, 0xb266]))
   }, 60000);
 
 for (const seed of seedsFor("next-snapshot-load-openers", [0xb267, 0xb268]))
-  it(`keeps competing ordinary openers behind the publication fence seed ${String(seed)}`, async () => {
+  it(`keeps competing openers at complete generations across admission retries seed ${String(seed)}`, async () => {
     const reach = createReach("snapshot load openers", SNAPSHOT_LOAD_OPEN_REACH);
     await fc.assert(
       fc.asyncProperty(fc.boolean(), async (cancel) => {
@@ -709,21 +769,9 @@ for (const seed of seedsFor("next-snapshot-load-openers", [0xb267, 0xb268]))
           gate = new Promise<void>((r) => {
             unblock = r;
           });
-        const loading = loadSnapshot(
-          (async function* () {
-            for (let i = 0; i < chunks.length; i++) {
-              if (i === chunks.length - 1) {
-                enter();
-                await gate;
-              }
-              const chunk = chunks[i];
-              if (chunk !== undefined) yield chunk;
-            }
-          })(),
-          () => target(h),
-          b,
-          { signal: controller.signal },
-        );
+        const loading = loadSnapshot(stalled(chunks, enter, gate), () => target(h), b, {
+          signal: controller.signal,
+        });
         await ready;
         const opening = contents(h).then((rows) => {
           opened = true;
@@ -739,14 +787,16 @@ for (const seed of seedsFor("next-snapshot-load-openers", [0xb267, 0xb268]))
             unblock();
             await loading;
           }
-          expect(await opening).toEqual(
-            cancel
-              ? []
-              : [
-                  [12, "value12"],
-                  [null, null],
-                ],
-          );
+          const complete = [
+            [12, "value12"],
+            [null, null],
+          ];
+          // Dropping an unpublished attempt releases its fence before re-admission. A queued
+          // opener may observe the old empty generation, never a partially loaded table.
+          const observed = await opening;
+          if (cancel) expect(observed).toEqual([]);
+          else expect([[], complete]).toContainEqual(observed);
+          expect(await contents(h)).toEqual(cancel ? [] : complete);
           expect(b.used).toBe(0);
           expect(h.governor.usedBytes).toBe(0);
           reach.reach(cancel ? "wait until discard" : "wait until publication");
@@ -766,7 +816,12 @@ async function corruptCatalog(
   change: (value: Record<string, unknown>) => void,
 ): Promise<Uint8Array[]> {
   const b = new Budget(),
-    reader = await SnapshotStreamReader.open(input(chunks), b),
+    reader = await SnapshotStreamReader.open(
+      (async function* () {
+        yield* chunks;
+      })(),
+      b,
+    ),
     out: Uint8Array[] = [];
   const writer = await SnapshotStreamWriter.open(
     reader.header,
@@ -880,6 +935,147 @@ for (const seed of seedsFor("next-snapshot-catalog-refusal", [0xb269, 0xb26a]))
         expect(h.governor.usedBytes).toBe(0);
       }),
       { seed, numRuns: 6 },
+    );
+    reach.assertReached();
+  }, 60000);
+
+for (const seed of seedsFor("next-snapshot-admission", [0xb26f, 0xb270]))
+  it(`replays only after dropping held inputs under real governor contention seed ${String(seed)}`, async () => {
+    const reach = createReach("snapshot admission", SNAPSHOT_ADMISSION_REACH);
+    await fc.assert(
+      fc.asyncProperty(fc.integer({ min: 1, max: 100 }), async (value) => {
+        reach.beginHistory();
+        for (const cancel of [false, true]) {
+          const chunks = await fixture([value, null]),
+            h = new Harness("strict", "memory"),
+            governor = h.governor;
+          const startup = await governor.admit({
+            label: "prepaid owner startup",
+            minimumBytes: 8 << 20,
+            spillable: false,
+          });
+          const prepared = await target(h, 0, true, undefined, startup);
+          const preparedState: { owner?: SnapshotLoadTarget } = { owner: prepared };
+          const baseline = governor.usedBytes;
+          const [holder] = await governor.admitGroup({
+            label: "temporary contention",
+            includesProgress: true,
+            grants: [
+              {
+                label: "contender",
+                minimumBytes: governor.capBytes - baseline - (2 << 20),
+                spillable: false,
+              },
+            ],
+          });
+          if (holder === undefined) throw new Error("missing contender");
+          expect(holder.allocate(holder.held)).toBe(true);
+          const controller = new AbortController();
+          let queued!: () => void,
+            opens = 0,
+            readsAtZero = 0;
+          const waiting = new Promise<void>((resolve) => {
+            queued = resolve;
+          });
+          const admit = governor.admitGroup.bind(governor);
+          governor.admitGroup = (options) => {
+            const requested = options.grants.reduce((sum, part) => sum + part.minimumBytes, 0);
+            if (options.label === "portable snapshot load" && requested > 2 << 20) queued();
+            return admit(options);
+          };
+          const source = input(chunks, async (offset) => {
+            if (offset === 0) readsAtZero++;
+          });
+          const loading = loadSnapshot(
+            source,
+            () => {
+              opens++;
+              const first = preparedState.owner;
+              if (first !== undefined) {
+                delete preparedState.owner;
+                return Promise.resolve(first);
+              }
+              return target(h, 0, true, undefined, startup);
+            },
+            governor,
+            { signal: controller.signal },
+          );
+          // Attach a rejection observer before generated cancellation can reject.
+          void loading.catch(() => undefined);
+          try {
+            await Promise.race([
+              waiting,
+              loading.then(() => {
+                throw new Error("load completed while its working step was blocked");
+              }),
+            ]);
+            await new Promise<void>((r) => setImmediate(r));
+            expect(governor.usedBytes).toBe(baseline + holder.held);
+            expect(opens).toBe(0);
+            reach.reach("unwind before wait");
+            if (cancel) {
+              controller.abort(new Error("cancel admission"));
+              await expect(loading).rejects.toThrow("cancel admission");
+              reach.reach("cancel queued");
+            } else {
+              holder.close();
+              await loading;
+              expect(readsAtZero).toBeGreaterThan(1);
+              expect(startup.allocated).toBe(0);
+              reach.reach("release and replay");
+            }
+          } finally {
+            controller.abort();
+            holder.close();
+            await loading.catch(() => undefined);
+            await preparedState.owner?.close();
+            startup.close();
+            governor.admitGroup = admit;
+          }
+          expect(governor.usedBytes).toBe(0);
+          expect(await contents(h)).toEqual(
+            cancel
+              ? []
+              : [
+                  [value, `value${String(value)}`],
+                  [null, null],
+                ],
+          );
+          const small = new Governor(2 << 20);
+          await expect(loadSnapshot(input(chunks), () => target(h), small)).rejects.toMatchObject({
+            sqlState: "53200",
+          });
+          expect(small.usedBytes).toBe(0);
+          reach.reach("only above cap refused");
+        }
+        // Owner-edge adaptation uses the identical core path, with private disk scratch.
+        const chunks = await fixture([value]),
+          disk = new SimDisk(),
+          file = disk.open("snapshot-owner-scratch", true),
+          scratch = new FileScratch(file, () => undefined),
+          governor = new Governor(32 << 20),
+          h = new Harness("strict", "memory");
+        const spool = await spoolSnapshotInput(
+          (async function* () {
+            yield* chunks;
+          })(),
+          { scratch, offset: 4096, capacity: 8 << 20 },
+          governor,
+          { maxChunkBytes: 1 << 20 },
+        );
+        try {
+          await loadSnapshot(spool, () => target(h), governor);
+          expect(await contents(h)).toEqual([[value, `value${String(value)}`]]);
+          expect(governor.usedBytes).toBe(1024); // owner source handle, until explicitly closed
+          reach.reach("one shot via spool");
+        } finally {
+          await spool.close();
+          expect(file.getSize()).toBe(4096);
+          file.close();
+          expect(governor.usedBytes).toBe(0);
+        }
+      }),
+      { seed, numRuns: 4 },
     );
     reach.assertReached();
   }, 60000);

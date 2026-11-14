@@ -2,6 +2,8 @@
  * The target factory owns a settled/exclusive owner (no active WritePath or background writers).
  * Publication rejection is indeterminate: close/reopen, never abort possibly published extents.
  */
+import { MemoryAdmissionError, type MemoryGovernor } from "../memory/governor.js";
+import { SnapshotReplay, type ReplayableSnapshotInput } from "./snapshot-source.js";
 import type { TableDef } from "../access/catalog.js";
 import { MAX_LSN } from "../access/snapshot.js";
 import {
@@ -19,16 +21,24 @@ import {
   encodeManifestRoot,
   encodeTableStatistics,
   parseCharge,
+  ParseBudgetError,
   type GroupPageEntry,
 } from "../format/manifest-codec.js";
 import {
+  SnapshotBudgetError,
   SnapshotKind,
   SnapshotStreamReader,
   snapshotU53,
   type SnapshotWork,
 } from "../format/snapshot.js";
 import { ExtentListKeeper } from "../storage/extent-list.js";
-import type { BlobRef, ByteBudget, ExtentSpace, ExtentWriter } from "../storage/extents.js";
+import {
+  ReadDeniedError,
+  type BlobRef,
+  type ByteBudget,
+  type ExtentSpace,
+  type ExtentWriter,
+} from "../storage/extents.js";
 import { decodeJson } from "./bytes.js";
 import { validateSnapshotCatalog } from "./snapshot-catalog-validate.js";
 import { Catalog } from "./catalog.js";
@@ -179,8 +189,77 @@ class NativeTable {
   }
 }
 
-/** Internal stage3 entry point. Its catalog decoder is replaced by portable catalog1 in stage4. */
+/** Whole-attempt admission: unwind all retained inputs before a cancellable retry at byte 0.
+ * The target factory must use an already-funded owner, never queue memory admission itself. */
 export async function loadSnapshot(
+  input: ReplayableSnapshotInput,
+  openTarget: () => Promise<SnapshotLoadTarget>,
+  governor: MemoryGovernor,
+  options: SnapshotLoadOptions = {},
+): Promise<void> {
+  let minimum = 1024;
+  for (;;) {
+    const [grant] = await governor.admitGroup({
+      label: "portable snapshot load",
+      includesProgress: true,
+      grants: [{ label: "snapshot complete step", minimumBytes: minimum, spillable: false }],
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    });
+    if (grant === undefined) throw new TypeError("Missing snapshot load grant");
+    let shortfall: { bytes: number; required: number } | undefined;
+    const budget: ByteBudget = {
+      ordinarySource: () => grant,
+      allocate(bytes) {
+        const required = grant.allocated + bytes;
+        if (required > grant.held) {
+          shortfall = { bytes, required };
+          return false;
+        }
+        if (!grant.allocate(bytes)) throw new TypeError("Lost snapshot step admission");
+        return true;
+      },
+      free(bytes) {
+        grant.free(bytes);
+      },
+    };
+    let replay: SnapshotReplay | undefined;
+    let control = false;
+    try {
+      if (!budget.allocate(512)) throw new SnapshotBudgetError(512);
+      control = true;
+      replay = new SnapshotReplay(input, budget, options.signal);
+      await loadAttempt(replay, openTarget, budget, options);
+      return;
+    } catch (error) {
+      if (
+        !(
+          error instanceof SnapshotBudgetError ||
+          error instanceof ParseBudgetError ||
+          error instanceof ReadDeniedError
+        ) ||
+        shortfall?.bytes !== error.bytes
+      )
+        throw error;
+      const required = shortfall.required;
+      if (required > governor.capBytes)
+        throw new MemoryAdmissionError("portable snapshot load", required, governor.capBytes);
+      // Round only inside the cap: rounding must not turn a fitting step into a 53200.
+      const availableAfterUnwind = governor.capBytes - governor.usedBytes + grant.held;
+      minimum = Math.max(required, Math.min(availableAfterUnwind, minimum * 2));
+    } finally {
+      try {
+        await replay?.close();
+      } finally {
+        if (control) budget.free(512);
+        grant.close();
+      }
+    }
+    // No grant, input, target, pin or unpublished writer survives this admission boundary.
+  }
+}
+
+/** One private, entirely discardable attempt. No input is retained by the retry wrapper. */
+async function loadAttempt(
   input: AsyncIterable<Uint8Array>,
   openTarget: () => Promise<SnapshotLoadTarget>,
   budget: ByteBudget,
@@ -238,6 +317,10 @@ export async function loadSnapshot(
         stage3Scope(catalog);
         catalogParts.length = 0;
         account.free(catalogLength); // part copies consumed; slots remain funded
+        // Prove the publication step fits before acquiring the owner. Its scratch is not
+        // allocated until publication, so it need not overlap temporary extent-list encoding.
+        account.take(4 * 1024 * 1024);
+        account.free(4 * 1024 * 1024);
         target = await openTarget();
         snapshotCheck(
           target.empty || options.replace === true,
@@ -396,7 +479,7 @@ export async function loadSnapshot(
       clients: [],
       extentList: prepared.list,
     };
-    account.take(4 * 1024 * 1024); // RefWriter growth/output + publication/decoded-root scratch bound
+    account.take(4 * 1024 * 1024);
     const rootBytes = encodeManifestRoot(root);
     await snapshotPace(options);
     await target.space.publish(rootBytes, {
@@ -411,6 +494,15 @@ export async function loadSnapshot(
     listPrepared = false;
   } catch (error) {
     failed = true;
+    if (
+      writer?.state === "indeterminate" &&
+      (error instanceof SnapshotBudgetError ||
+        error instanceof ReadDeniedError ||
+        error instanceof ParseBudgetError)
+    )
+      throw new SnapshotScopeError(
+        "Indeterminate publication: reopen target before retrying snapshot load",
+      );
     if (writer?.state === "open") await writer.abort().catch(() => undefined);
     if (scratchWriter?.state === "open") await scratchWriter.abort().catch(() => undefined);
     throw error;

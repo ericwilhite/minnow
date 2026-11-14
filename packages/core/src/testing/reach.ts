@@ -8705,3 +8705,11 @@ export const SNAPSHOT_RETIRE_CURRENT_REACH = [
   "pin survives replacement",
   "exact retired inventory",
 ] as const;
+
+export const SNAPSHOT_ADMISSION_REACH = [
+  "unwind before wait",
+  "cancel queued",
+  "release and replay",
+  "only above cap refused",
+  "one shot via spool",
+] as const;

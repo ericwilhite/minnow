@@ -213,11 +213,11 @@ export const DURABLE_EMISSIONS: Readonly<
     count: 2,
     kinds: ["groupIndex", "tableStatistics"],
   },
-  "write/snapshot-load.ts:loadSnapshot:writer.write -> ExtentWriter.write": {
+  "write/snapshot-load.ts:loadAttempt:writer.write -> ExtentWriter.write": {
     count: 1,
     kinds: ["catalog"],
   },
-  "write/snapshot-load.ts:loadSnapshot:target.space.publish -> ExtentSpace.publish": {
+  "write/snapshot-load.ts:loadAttempt:target.space.publish -> ExtentSpace.publish": {
     count: 1,
     kinds: ["manifest"],
   },

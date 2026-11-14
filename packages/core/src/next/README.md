@@ -4281,3 +4281,15 @@ Complete snapshot replacement borrows the extent space's immutable, disk-backed 
 inventory as retirement claims. It does not collect old extents in a JavaScript Set or array.
 The ordinary exact retirement proof, two-generation delay and snapshot pins still apply;
 replacing a larger old database therefore needs no per-old-extent resident load allocation.
+
+The internal loader accepts an immutable `ReplayableSnapshotInput` (exact offset reads) and the
+owner's real governor. It admits a complete working step before retaining input. A mandatory
+allocation shortfall discards the unpublished attempt and releases its input, staging and owner
+before a cancellable admission wait, then replays from offset zero. Only a required step above
+the cap is `53200`; optional writer buffers still fall back to existing bounded slabs. The target
+factory uses prepaid owner resources and must not wait for admission while inputs are retained.
+An opener queued during a discarded attempt may see the old generation before retry completes.
+It never sees a partial new generation. One-shot sources spool at the owner edge through
+`spoolSnapshotInput` into an exclusive scratch reservation, then follow the same loader path.
+The owner declares the maximum borrowed chunk capacity; the copy step is admitted before pulling
+it. The spool handle stays charged until `close()`, which releases only its own scratch range.
