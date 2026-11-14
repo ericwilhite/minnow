@@ -3842,3 +3842,19 @@ NO ACTION default. The schema inspector exposes these modes and stored trigger i
 MCAT foreignKey10's required field9 carries onUpdate; these development bytes need the
 next pre-fence selector allocation before publication. Native RI execution/trigger firing
 remain the separate joint B6/B5b consumer described in the inventory.
+
+### FTS insert-delta page writer (stage4 primitive)
+
+`format/fts-append.ts` streams ordered accepted documents and `(term, rowId, tf)`
+postings into the registered native trees. It funds fixed leaf buffers, bounded fanout
+frontiers and term descriptors before construction. `FTS_APPEND_MINIMUM_BYTES` includes
+that workspace, codec scratch and one maximum encoded output; callers also fund their
+input read/sort window. No whole-delta map or native array sort is used. IDs and totals
+remain exact; NULL document presence is preserved. Term keys are copied through a bounded
+UTF16 scratch lane, so a short slice cannot retain a large caller-owned source string.
+IO ownership uses the existing fenced
+FTS writer. Returned descriptors retain a transferred charge until their lease is released; release
+drops references before refund. The caller owns abort, staging and publication. This primitive does not yet
+attach FTS effects to row commits, checkpoint native roots, invalidate indexes, replay
+claims or deduplicate requests. Those are the remaining stage4 integration work, described
+in the B7/B5b write seam; SQL still uses the scan route.

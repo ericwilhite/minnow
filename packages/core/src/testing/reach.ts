@@ -6838,3 +6838,15 @@ export const TRIGGER_WIRE_REACH = [
   "plain name",
   "UTF8 name",
 ] as const;
+
+export const FTS_APPEND_REACH = [
+  "exact documents",
+  "exact postings",
+  "wide IDs",
+  "raw UTF16",
+  "NULL documents",
+  "empty renderable",
+  "charged workspace",
+  "drained",
+  "empty",
+] as const;
