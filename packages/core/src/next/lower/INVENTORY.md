@@ -788,3 +788,10 @@ validation and ALTER/reopen retention. Parser provenance stays outside published
 DTOs; the schema metadata inspector retains the effective actions. Repeated ON DELETE or
 ON UPDATE clauses refuse with42601. The shared row/command/RI consumer is B5b's execution
 unit; storing/lowering these modes alone does not enable their execution.
+
+### Trigger AFTER runtime component (B6)
+
+The scalar-reference AfterQueue now spills with bounded FIFO epoch metadata and releases read
+progress before callbacks. This component does not enable SQL trigger firing: the controller,
+typed OLD/NEW body input, native registry and B5b Statement.end/RI consumer still need their
+joint end-to-end verification. Accepted catalog/DDL behavior above is unchanged.

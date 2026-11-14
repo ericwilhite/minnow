@@ -17,6 +17,10 @@ formats. `value::text` and `text || value` now work in the rebuild. Array text s
 renderer's PostgreSQL quoting. The shipped engine, public API and stored formats are unchanged; no
 migration is needed.
 
+The private rebuild adds a spillable AFTER-event queue with bounded metadata. Child events
+append behind the existing frame; pending IO and continuations drain before cleanup. This is
+runtime groundwork only: native trigger SQL stays disabled until the joint firing integration.
+
 The private trigger runner's current-prefix pin has a read phase, then a locator-only phase.
 It refuses data rereads after statement mutation begins, while later write batches retain
 locator resolution. Generated prefix tests cover publication, index maintenance, cancellation,

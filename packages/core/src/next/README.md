@@ -3851,3 +3851,15 @@ entry points assert this with an O(1) statement mutation epoch; ordinary snapsho
 immutable contract. Release clears the callback so a retained expired pin cannot retain its
 statement. Prefix lifecycle histories assert borrowed chunks, memtables, reader registrations
 and the native row account drain to zero.
+
+The trigger runtime's AfterQueue is a bounded FIFO over native scratch pages. Each active frame
+has at most two tape epochs: drain the old epoch completely, then switch to events appended by
+its RI callbacks. Packets carry scalar command/frame, image and trigger/RI IDs only. The root
+registry owns row images and referential keys; the queue owns no per-event Map or file.
+TRIGGER_AFTER_QUEUE_BYTES prepays 256 KiB of ordinary workspace per live frame (root plus one
+body frame). Repeated/spilled events do not increase that minimum. RecursiveTape.eachCopied
+copies a bounded scalar window and drops native read buffers/progress loans before invoking
+continuations, so a callback can append or run a nested producer without hold-and-wait.
+Close fences pending appends, reads and continuations before closing files or freeing scratch;
+cleanup attempts both epochs and surfaces close failures. This is a verified runtime component;
+SQL firing still needs the joint controller, typed body runner and native Statement.end hooks.

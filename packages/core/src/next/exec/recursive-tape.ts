@@ -5,7 +5,7 @@ import type { SpillPageRef } from "../spill/contract.js";
 import { SpillCorruptionError } from "../spill/contract.js";
 import { int64At } from "../vector/int64.js";
 import { SpillIo } from "./spill-pool.js";
-import { SpilledRun, SpillClosedError } from "./spill-pages.js";
+import { SpilledRun, SpillClosedError, type DecodedPage } from "./spill-pages.js";
 // Byte offsets are safe JS integers: fewer than 2^53 pages, hence at most 53 carry levels.
 const LEVELS = 53,
   METADATA = 16384;
@@ -139,9 +139,25 @@ export class RecursiveTape {
       throw error;
     }
   }
-  async each(
+  each(
     types: readonly PhysicalType[],
     visit: (columns: readonly Vector[], rows: number) => Promise<boolean>,
+  ): Promise<void> {
+    return this.#each(types, visit, null);
+  }
+  /** Copy into caller-prepaid ordinary scratch, then retire read buffers/loans BEFORE
+   * continuation. Trigger AFTER queues append during continuation; no read loan may span it. */
+  eachCopied(
+    types: readonly PhysicalType[],
+    copy: (columns: readonly Vector[], rows: number) => void,
+    visit: () => Promise<boolean>,
+  ): Promise<void> {
+    return this.#each(types, () => visit(), copy);
+  }
+  async #each(
+    types: readonly PhysicalType[],
+    visit: (columns: readonly Vector[], rows: number) => Promise<boolean>,
+    copy: ((columns: readonly Vector[], rows: number) => void) | null,
   ): Promise<void> {
     this.#reading = true;
     let top = 0;
@@ -160,11 +176,24 @@ export class RecursiveTape {
         this.#stack[top] = null;
         if (frame == null) throw new SpillCorruptionError("Missing recursive directory frame");
         if (frame.level === 0) {
-          const data = await this.#read(frame.ref, types);
-          try {
-            if (!(await visit(data.decoded.columns, data.decoded.rows))) return;
-          } finally {
-            this.io.releasePage(data.page);
+          let data: { page: { bytes: Uint8Array; charged: number }; decoded: DecodedPage } | null =
+            await this.#read(frame.ref, types);
+          if (copy === null) {
+            try {
+              if (!(await visit(data.decoded.columns, data.decoded.rows))) return;
+            } finally {
+              this.io.releasePage(data.page);
+            }
+          } else {
+            try {
+              copy(data.decoded.columns, data.decoded.rows);
+            } finally {
+              this.io.releasePage(data.page);
+              // eslint-disable-next-line no-useless-assignment -- Drop native buffers before async continuation.
+              data = null;
+            }
+            this.#check();
+            if (!(await visit([], 0))) return;
           }
           continue;
         }

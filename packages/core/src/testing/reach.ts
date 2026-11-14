@@ -6853,3 +6853,26 @@ export const TRIGGER_PREFIX_LIFECYCLE_REACH = [
   "single row batches",
   "several row batches",
 ] as const;
+
+export const TRIGGER_AFTER_QUEUE_REACH = [
+  "spilled pages",
+  "append during drain",
+  "cancel continuation",
+  "FIFO order",
+  "wide IDs exact",
+  "empty",
+  "one row",
+  "multiple blocks or rows",
+  "fixed metadata and ordinary credit",
+  "zero ownership",
+] as const;
+
+export const TRIGGER_QUEUE_READ_REACH = [
+  "actual competing-credit loan",
+  "progress returned before continuation",
+  "directory carry",
+  "one page",
+  "wide scalar IDs",
+  "ordinary IDs",
+  "zero ownership",
+] as const;
