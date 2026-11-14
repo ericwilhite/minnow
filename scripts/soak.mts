@@ -77,6 +77,10 @@ const SUITES: Suite[] = [
   { name: "unicode-properties", file: "packages/core/src/block-format/unicode.test.ts" },
   { name: "record-json-properties", file: "packages/core/src/storage/toolkit/wire.test.ts" },
   { name: "temp-owner-lifecycle", file: "packages/core/src/storage/temp-owner-lifecycle.test.ts" },
+  {
+    name: "next-write-extent-deltas",
+    file: "packages/core/src/next/write/extent-deltas.test.ts",
+  },
 ];
 
 function argument(flag: string): string | undefined {
