@@ -472,6 +472,8 @@ export type Rel =
        * (access/ `TableWriteOptions.onRepeat`.)
        */
       readonly onRepeat: "error" | "first";
+      /** Lowering proves a single-table scan/probe emits each original target at most once. */
+      readonly uniqueTargets?: boolean;
       readonly onConflict: {
         /**
          * The unique indexes a proposed row conflicts on, tried in order (access/

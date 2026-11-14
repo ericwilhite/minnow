@@ -859,6 +859,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           const writer = statement.table(rel.tableId, {
             assigned: rel.assigned,
             onRepeat: rel.onRepeat,
+            uniqueTargets: rel.uniqueTargets === true,
           });
           let pending: Promise<void> | null = null;
           const sink: Operator = {
@@ -883,7 +884,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             finish: () => downstream.finish(),
             abort: (reason) => downstream.abort(reason),
           };
-          return child(runtime, sink, stops);
+          const spool = runtime.modifyOutput?.(sink);
+          if (!spool) throw new TypeError("Missing modification input spool");
+          return child(runtime, spool, stops);
         };
       }
       case "indexRange": {
@@ -2288,6 +2291,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             predicateTypes = [...lt, ...rt];
           const predicateContext = { ...context, input: predicateTypes };
           const spec: HashJoinSpec = {
+            oldestFirst: plan.root.op === "modify" && plan.root.onRepeat === "first",
             kind: rel.kind === "cross" ? "inner" : rel.kind,
             probeTypes: lk.types,
             buildTypes: rk.types,

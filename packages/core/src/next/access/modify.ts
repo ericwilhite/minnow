@@ -132,6 +132,9 @@ export interface TableWriteOptions {
    * skips the repeat (UPDATE … FROM, DELETE … USING). Default `"error"`.
    */
   readonly onRepeat?: "error" | "first";
+  /** Caller proves one visit per original target; omit repeat tracking for a scan/probe.
+   * Never set for a join, MERGE or ON CONFLICT input. */
+  readonly uniqueTargets?: boolean;
 }
 
 export interface TableWriter {

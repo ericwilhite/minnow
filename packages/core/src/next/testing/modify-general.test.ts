@@ -49,6 +49,8 @@ it.each(seedsFor("next-general-modify", [0xb5b1, 0xb5b2]))(
               `INSERT INTO dml VALUES ${Array.from({ length: n }, (_, i) => `(${String(i + 1)},${String((i + 1) * 10)})`).join(",")}`,
             );
             reach.reach("multi-row VALUES");
+            await all("INSERT INTO dml SELECT id + 20000, v + 20000 FROM dml LIMIT 0");
+            reach.reach("empty producer");
             await all(`UPDATE dml SET v = v + ${String(delta)} WHERE id % 2 = 0`);
             reach.reach("expression update");
             await compare();

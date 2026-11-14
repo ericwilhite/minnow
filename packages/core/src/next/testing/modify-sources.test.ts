@@ -45,13 +45,21 @@ it.each(seedsFor("next-modify-sources", [0xb5b3, 0xb5b4]))(
           await all("INSERT INTO target VALUES (1,10),(2,20),(3,30)");
           await all("INSERT INTO child VALUES (11,1),(12,2),(13,3)");
           await all(
-            `INSERT INTO source VALUES (1,1,${String(delta)}),(2,1,${String(delta)}),(3,2,${String(delta)})`,
+            `INSERT INTO source VALUES (1,1,${String(delta)}),(2,1,${String(delta + 100)}),(3,2,${String(delta)})`,
           );
           const updated = await all(
             "UPDATE target SET v = target.v + source.delta FROM source WHERE target.id = source.link",
           );
           expect("rowCount" in updated ? updated.rowCount : null).toBe(2);
+          const first = await core.execute("SELECT * FROM target ORDER BY id");
+          if (first.kind !== "rows" || !("batches" in first)) throw new Error("rows");
+          expect(oracleRows(first)).toEqual([
+            { id: 1, v: 10 + delta },
+            { id: 2, v: 20 + delta },
+            { id: 3, v: 30 },
+          ]);
           reach.reach("UPDATE FROM duplicate matches");
+          reach.reach("first distinct source wins");
           await compare("target");
           const deleted = await all(
             "DELETE FROM target USING source WHERE target.id = source.link",

@@ -74,7 +74,11 @@ The unexported rebuild now executes INSERT VALUES, INSERT SELECT, UPDATE and DEL
 its native statement writer for scan-based plans. RETURNING, ON CONFLICT and
 index-based modification inputs remain unfinished. Reads use the statement
 snapshot; statement errors roll back earlier rows. Unique and foreign-key checks use the
-existing write path. The shipped engine and stored formats are unchanged.
+existing write path. Modification input uses a charged, bounded spill spool; read
+reservations retire before the writer starts, so a writer waiting for memory cannot pin
+its own producer. Single-table UPDATE and DELETE avoid statement-wide target sets;
+UPDATE FROM visits matching source rows in source order. The shipped engine and stored
+formats are unchanged.
 
 The unexported rebuild casts integers, NUMERIC (keeping scale), float4/float8 (PostgreSQL's
 shortest spelling), boolean, date, time, timestamp, timestamptz (UTC), interval (including

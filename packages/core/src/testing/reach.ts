@@ -7563,6 +7563,7 @@ export const FTS_CLAIM_CODEC_REACH = [
 
 export const GENERAL_MODIFY_REACH = [
   "multi-row VALUES",
+  "empty producer",
   "expression update",
   "INSERT SELECT snapshot",
   "primary key update snapshot",
@@ -7572,7 +7573,19 @@ export const GENERAL_MODIFY_REACH = [
 
 export const MODIFY_SOURCES_REACH = [
   "UPDATE FROM duplicate matches",
+  "first distinct source wins",
   "DELETE USING duplicate matches",
   "delete cascade",
   "missing parent rollback",
+] as const;
+
+/** Native modification phases must retire producer credit before a writer can wait. */
+export const MODIFY_PROGRESS_REACH = [
+  "64 MiB",
+  "single UPDATE no target set",
+  "single DELETE no target set",
+  "read grants retired",
+  "20000 updated",
+  "20000 deleted",
+  "bounded spill workspace",
 ] as const;

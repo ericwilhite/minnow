@@ -1,3 +1,5 @@
+import { ModifySpool, modifySpoolBytes } from "./modify-spool.js";
+import type { Operator } from "./pipeline.js";
 /** One query's admissions, resources and the executed/delivered lifecycle. */
 import type { MaybePromise } from "../access/key-index.js";
 import { SnapshotReleasedError } from "../access/snapshot.js";
@@ -81,6 +83,9 @@ const HANDOFF = new Error("Producer retired at aggregation phase handoff");
 
 /** Per-execution only: never retained by an immutable prepared plan. */
 export class QueryRuntime {
+  /** Input is materialized before native writes; only this bounded spool survives producer retirement. */
+  modification: { spool: ModifySpool; writer: Operator } | null = null;
+  modifyOutput: ((writer: Operator) => Operator) | null = null;
   readonly counts = { inserted: 0, updated: 0, deleted: 0 };
   #phaseCapable = false;
   #handoff = false;
@@ -242,7 +247,11 @@ export class QueryRuntime {
   #resultWindow(): number {
     // A buffered producer cannot offer a frame before its delivery handoff. Keep only
     // bounded empty-sink metadata, rather than an unused full consumer byte window.
-    return this.#resultProgressOverride === 0 ? Math.min(this.#window, 4096) : this.#window;
+    const spool =
+      this.plan.root.op === "modify" ? modifySpoolBytes(this.plan.root.input.output.length) : 0;
+    return (
+      spool + (this.#resultProgressOverride === 0 ? Math.min(this.#window, 4096) : this.#window)
+    );
   }
   #tighterResultRow(inputs: number, largest: number, slots: readonly number[]): number | null {
     if (this.#resultProgressOverride !== null) return null;
@@ -576,7 +585,7 @@ export class QueryRuntime {
       entries.reduce((sum, entry) => sum + entry.minimum, 0) +
       protectedBytes +
       this.#readBytes +
-      (entries.length === 0
+      (entries.length === 0 && this.plan.root.op !== "modify"
         ? 0
         : Math.max(
             this.#resultWindow(),
@@ -688,7 +697,7 @@ export class QueryRuntime {
       binding.slotBytes ?? [],
     );
     const window =
-      atomic && entries.length > 0
+      atomic && (entries.length > 0 || this.plan.root.op === "modify")
         ? Math.max(
             this.#resultWindow(),
             this.#resultOwnedMinimum
@@ -703,7 +712,7 @@ export class QueryRuntime {
           )
         : 0;
     const resultProgress =
-      atomic && entries.length > 0
+      atomic && (entries.length > 0 || this.plan.root.op === "modify")
         ? Math.max(
             0,
             this.#resultStep(
@@ -1316,6 +1325,7 @@ export class QueryExecution implements Execution {
   #runtime: QueryRuntime | null = null;
   #sink: ResultSink | null = null;
   #result: Grant | null = null;
+  #modifySpool: ModifySpool | null = null;
   #async = false;
   #settling = false;
   #delivered = false;
@@ -1357,8 +1367,9 @@ export class QueryExecution implements Execution {
     });
     const onAbort = () => this.cancel(request.signal?.reason);
     this.delivered = this.results.delivered.then(
-      () => {
+      async () => {
         this.#delivered = true;
+        await this.#modifySpool?.close();
         this.#result?.close();
         request.signal?.removeEventListener("abort", onAbort);
       },
@@ -1367,7 +1378,9 @@ export class QueryExecution implements Execution {
         this.#sink?.discard(error);
         // A cancelled row reader may still be filling a result-owned backing allocation.
         // Producer cleanup fences its borrowed IO; frame credit alone cannot retire it.
-        if (this.#sink?.ownsPartialResult) await this.executed.catch(() => undefined);
+        if (this.#sink?.ownsPartialResult || this.#modifySpool)
+          await this.executed.catch(() => undefined);
+        await this.#modifySpool?.close();
         this.#result?.close();
         request.signal?.removeEventListener("abort", onAbort);
         throw error;
@@ -1462,6 +1475,18 @@ export class QueryExecution implements Execution {
       if (sink === null) throw new Error("Missing result sink");
       return sink.allocateOwnedResult(bytes);
     });
+    runtime.modifyOutput = (writer) => {
+      if (this.plan.root.op !== "modify") throw new TypeError("Missing modification root");
+      this.#modifySpool = new ModifySpool(
+        this.plan.root.input.output.map((column) => column.type),
+        grant,
+        this.request.spill,
+        this.request.queryId,
+        this.#controller.signal,
+      );
+      runtime.modification = { spool: this.#modifySpool, writer };
+      return this.#modifySpool;
+    };
     runtime.onAbort((reason) => this.#sink?.abort(reason));
     try {
       const work = program(runtime, this.#sink);
@@ -1517,7 +1542,13 @@ export class QueryExecution implements Execution {
           ? close()
           : Promise.resolve(close()).then(() => {
               this.#controller.signal.throwIfAborted();
-              return this.request.statement?.end(this.#controller.signal);
+              const modification = this.#runtime?.modification;
+              const write = modification
+                ? modification.spool.drain(modification.writer)
+                : Promise.resolve();
+              return write
+                .then(() => this.#modifySpool?.close())
+                .then(() => this.request.statement?.end(this.#controller.signal));
             });
       if (cleanup instanceof Promise) {
         this.#async = true;

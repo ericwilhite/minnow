@@ -689,6 +689,7 @@ export function lowerUpdate(statement: Update, builder: PlanBuilder): LoweredWri
       assigned: [...assigned, ...dependents].map((entry) => entry.def.id),
       // A target row joined to several source rows is updated once, from the first (PostgreSQL).
       onRepeat: statement.from === undefined ? "error" : "first",
+      uniqueTargets: statement.from === undefined,
       onConflict: null,
       returning: returning?.exprs ?? null,
       ...(passthrough.length === 0 ? {} : { passthrough: passthrough.length }),
@@ -732,6 +733,7 @@ export function lowerDelete(statement: Delete, builder: PlanBuilder): LoweredWri
       input,
       assigned: [],
       onRepeat: statement.from === undefined ? "error" : "first",
+      uniqueTargets: statement.from === undefined,
       onConflict: null,
       returning: returning?.exprs ?? null,
       ...(passthrough.length === 0 ? {} : { passthrough: passthrough.length }),

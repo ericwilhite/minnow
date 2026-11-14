@@ -888,7 +888,10 @@ export class StatementImpl implements Statement {
       return new TableWriterImpl(this, def, options);
     }
     // The common case (no options, the same table again) skips the keyed lookup.
-    const plain = options.assigned === undefined && options.onRepeat === undefined;
+    const plain =
+      options.assigned === undefined &&
+      options.onRepeat === undefined &&
+      options.uniqueTargets !== true;
     if (plain && this.#plain?.tableId === tableId) return this.#plain;
     if (plain && this.#plain === null && this.#writers === null) {
       // The first writer of a statement needs no map.
@@ -900,9 +903,9 @@ export class StatementImpl implements Statement {
     if (this.#writers === null) {
       this.#writers = new Map();
       if (this.#plain !== null)
-        this.#writers.set(`${String(this.#plain.tableId)}::error`, this.#plain);
+        this.#writers.set(`${String(this.#plain.tableId)}::error:false`, this.#plain);
     }
-    const key = `${String(tableId)}:${(options.assigned ?? []).join(",")}:${options.onRepeat ?? "error"}`;
+    const key = `${String(tableId)}:${(options.assigned ?? []).join(",")}:${options.onRepeat ?? "error"}:${String(options.uniqueTargets === true)}`;
     let writer = this.#writers.get(key);
     if (writer === undefined) {
       const def = this.tx.catalog.table(tableId);
@@ -1257,6 +1260,7 @@ export class TableWriterImpl implements TableWriter {
   readonly #assigned: readonly number[];
   readonly #onRepeat: "error" | "first";
   readonly #inputView: SnapshotImpl | null;
+  readonly #uniqueTargets: boolean;
   /** Indexes of other tables' foreign keys that reference this table's keys. */
   readonly #referenced: ReadonlySet<number>;
 
@@ -1271,6 +1275,7 @@ export class TableWriterImpl implements TableWriter {
     this.#inputView =
       options.inputView === undefined ? null : statement.writerView(options.inputView);
     this.#onRepeat = options.onRepeat ?? "error";
+    this.#uniqueTargets = options.uniqueTargets === true;
     this.#referenced = referencedIndexes(statement.catalog, def.id);
   }
 
@@ -1873,8 +1878,8 @@ export class TableWriterImpl implements TableWriter {
     const snapshot = this.#inputView ?? this.statement.view;
     snapshot.check();
     const view = snapshot.internalTable(this.tableId);
-    let touched = this.statement.touched.get(this.tableId);
-    if (touched === undefined) {
+    let touched = this.#uniqueTargets ? undefined : this.statement.touched.get(this.tableId);
+    if (!this.#uniqueTargets && touched === undefined) {
       touched = new Set();
       this.statement.touched.set(this.tableId, touched);
     }
@@ -1887,11 +1892,11 @@ export class TableWriterImpl implements TableWriter {
       )
         throw new TypeError("An update or delete target has a null locator");
       const rowId = view.rowId(locators.data.values[row] ?? 0);
-      if (touched.has(rowId)) {
+      if (touched?.has(rowId)) {
         if (this.#onRepeat === "error") throw new CardinalityViolationError(this.tableId, row);
         continue;
       }
-      touched.add(rowId);
+      touched?.add(rowId);
       kept.push(row);
       rowIds.push(rowId);
     }
