@@ -8,11 +8,11 @@
  * checksummed slot is not an empty/torn slot. Reserved masks enumerate every permitted bit;
  * writers emit zero for the remainder, readers refuse it. Scratch/transport are not durable.
  */
-/** Shared reference-table envelope; the manifest also carries its logical format version4. */
+/** Shared reference-table envelope; the manifest also carries its logical format version5. */
 export const METADATA_ENVELOPE_VERSION = 1;
 /** Raise before publishing any incompatible nested durable codec. Never fence before checking. */
-export const DURABLE_READER_VERSION = 3;
-export const MANIFEST_FORMAT_VERSION = 4;
+export const DURABLE_READER_VERSION = 4;
+export const MANIFEST_FORMAT_VERSION = 5;
 export const ROOT_SLOT_HEADER_BYTES = 16;
 export const ROOT_SLOT_OVERHEAD = ROOT_SLOT_HEADER_BYTES + 4;
 
@@ -32,7 +32,7 @@ export interface FormatField {
   /** Permitted bits; every other bit is reserved-zero. */
   readonly mask?: number;
 }
-/** Header selectors can name an outer envelope (manifest envelope1) plus its logical version4. */
+/** Header selectors can name an outer envelope (manifest envelope1) plus its logical version5. */
 interface Format {
   readonly magic: number | null;
   readonly version: number;
@@ -81,6 +81,8 @@ const inherited = (parent: string, decoder: string, fields: readonly FormatField
   }) as const satisfies Format;
 
 export const DURABLE_CODECS = {
+  ftsNode: { leaf: 0, branch: 1 },
+  ftsState: { building: 0, ready: 1, invalid: 2 },
   catalogFieldFlags: { required: 1, knownMask: 1 },
   catalogTypedArray: { uint8: 1, int32: 2, uint32: 3, float32: 4, float64: 5, int64: 6, uint16: 7 },
   catalogStorage: { typed: 0, expanded: 1 },
@@ -229,6 +231,9 @@ export const DURABLE_CODECS = {
     "dropView",
     "createType",
     "dropType",
+    "createFts",
+    "upsertFts",
+    "dropFts",
   ],
   jsonNumber: ["NaN", "Infinity", "-Infinity", "-0"],
   indexKeyLimit: ["scalar", "tuple"],
@@ -244,7 +249,7 @@ export const DURABLE_CODECS = {
 } as const;
 
 /** MCAT1 schema positions are durable field ids (index+1); ~ means optional, ? nullable.
- * Record families20/21 are reserved for REQUIRED1.0 trigger/FTS implementation by B6/B7.
+ * Family21/config26 implement portable FTS definitions; family20 remains trigger-owned.
  * Do not reorder: append fields/families under the catalog reader capability gate. */
 /** Lead-confirmed catalog1 allocation; selectors are isolated at stage1 integration. */
 export const CATALOG_NATIVE_GRAMMAR = {
@@ -258,6 +263,18 @@ export const CATALOG_NATIVE_GRAMMAR = {
   pageBytes: 256 * 1024,
   fanOut: 64,
   maximumDepth: 8,
+} as const;
+
+/** Physical page limits; long dictionaries/lists use trees, never a total-document limit. */
+export const FTS_NATIVE_GRAMMAR = {
+  pageBytes: 256 * 1024,
+  fanOut: 64,
+  maximumDepth: 8,
+  leafRows: 4096,
+  termEntries: 1024,
+  deltaEntries: 64,
+  termUnits: 32,
+  ownerUnits: 128,
 } as const;
 
 export const CATALOG_RECORD_KINDS = {
@@ -288,6 +305,7 @@ export const CATALOG_RECORD_KINDS = {
   ftsState: 28,
 } as const;
 
+export const CATALOG_FTS_FEATURE = 1;
 export const CATALOG_RECORD_SCHEMAS = {
   catalog: ["version:u", "counters:counters", "requiredFeatures:[u]", "sections:[section]"],
   counters: [
@@ -298,6 +316,7 @@ export const CATALOG_RECORD_SCHEMAS = {
     "nextSequenceId:u",
     "nextViewId:u",
     "nextTypeId:u",
+    "nextFtsId:u",
   ],
   table: [
     "id:u",
@@ -410,23 +429,9 @@ export const CATALOG_RECORD_SCHEMAS = {
     "typeId:u~",
     "expectedVersion:u",
     "version:u",
+    "fts:fts~",
+    "ftsId:u~",
   ],
-  section: ["kind:u", "count:u"],
-} as const;
-
-/** Reserved semantic fields are unsupported even when their wire flag says optional.
- * Never preserve these as opaque display extensions: their ids already have future semantics.
- * FTS implementation removes each reservation only while installing its checked live schema.
- */
-export const CATALOG_RESERVED_FIELDS = {
-  counters: [{ id: 8, name: "nextFtsId", type: "u" }],
-  change: [
-    { id: 15, name: "fts", type: "fts" },
-    { id: 16, name: "ftsId", type: "u" },
-  ],
-} as const;
-/** Allocated record families, not supported record decoders or an FTS readiness claim. */
-export const CATALOG_RESERVED_RECORD_SCHEMAS = {
   fts: [
     "id:u",
     "tableId:u",
@@ -436,7 +441,28 @@ export const CATALOG_RESERVED_RECORD_SCHEMAS = {
     "scorerVersion:u",
     "config:ftsConfig",
   ],
-  ftsConfig: [],
+  ftsConfig: ["version:u"],
+  section: ["kind:u", "count:u"],
+} as const;
+
+/** Reserved semantic fields are unsupported even when their wire flag says optional.
+ * Never preserve these as opaque display extensions: their ids already have future semantics.
+ * FTS implementation removes each reservation only while installing its checked live schema.
+ */
+export const CATALOG_RESERVED_FIELDS = {
+  fts: [
+    { id: 8, name: "future semantics 8", type: "u" },
+    { id: 9, name: "future semantics 9", type: "u" },
+    { id: 10, name: "future semantics 10", type: "u" },
+    { id: 11, name: "future semantics 11", type: "u" },
+    { id: 12, name: "future semantics 12", type: "u" },
+    { id: 13, name: "future semantics 13", type: "u" },
+    { id: 14, name: "future semantics 14", type: "u" },
+    { id: 15, name: "future semantics 15", type: "u" },
+  ],
+} as const;
+/** Coverage and build state are native, not portable catalog definitions. */
+export const CATALOG_RESERVED_RECORD_SCHEMAS = {
   ftsCoverage: [],
   ftsState: [],
 } as const;
@@ -454,9 +480,62 @@ export const CATALOG_CHANGE_FIELDS = {
   dropView: ["viewId"],
   createType: ["type"],
   dropType: ["typeId"],
+  createFts: ["fts"],
+  upsertFts: ["fts"],
+  dropFts: ["ftsId"],
 } as const;
 
 export const DURABLE_FORMATS = {
+  ftsRoot: {
+    ...envelope(0x5254464d, "decodeFts"), // MFTR
+    fields: [
+      magic(0x5254464d),
+      version(4),
+      zero(5, 1),
+      { name: "node kind", offset: 6, width: 1, values: [0, 1] },
+      zero(7, 1),
+    ],
+  },
+  ftsTerms: {
+    ...envelope(0x5454464d, "decodeFts"), // MFTT
+    fields: [
+      magic(0x5454464d),
+      version(4),
+      zero(5, 1),
+      { name: "node kind", offset: 6, width: 1, values: [0, 1] },
+      zero(7, 1),
+    ],
+  },
+  ftsPostings: {
+    ...envelope(0x5054464d, "decodeFts"), // MFTP
+    fields: [
+      magic(0x5054464d),
+      version(4),
+      zero(5, 1),
+      { name: "node kind", offset: 6, width: 1, values: [0, 1] },
+      zero(7, 1),
+    ],
+  },
+  ftsDocuments: {
+    ...envelope(0x4454464d, "decodeFts"), // MFTD
+    fields: [
+      magic(0x4454464d),
+      version(4),
+      zero(5, 1),
+      { name: "node kind", offset: 6, width: 1, values: [0, 1] },
+      zero(7, 1),
+    ],
+  },
+  ftsDelta: {
+    ...envelope(0x4c54464d, "decodeFts"), // MFTL
+    fields: [
+      magic(0x4c54464d),
+      version(4),
+      zero(5, 1),
+      { name: "node kind", offset: 6, width: 1, values: [0, 1] },
+      zero(7, 1),
+    ],
+  },
   indexedDb: {
     magic: null,
     version: 2,
@@ -562,9 +641,9 @@ export const DURABLE_FORMATS = {
   ]),
   commitBody: {
     magic: null,
-    version: 2,
+    version: 3,
     versionIn: "header",
-    fields: [{ ...version(0), values: [2] }],
+    fields: [{ ...version(0), values: [3] }],
     decoder: "decodeBody",
     state: "implemented",
   },

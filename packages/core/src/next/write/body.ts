@@ -1,7 +1,7 @@
 /**
  * The commit-body codec (format/log-frame.ts `CommitFrameBody`, "codec: write-path track").
  *
- *   u8 version (2; catalog effects contain MCHG1)
+ *   u8 version (3; catalog effects contain MCHG1)
  *   u8 hasRequest; [blob clientId, varuint sequence, f64 sentAtMs, string countsJson]
  *   varuint effectCount; effects, each `u8 kind` then:
  *     1 createTable   varuint tableId, blob definition

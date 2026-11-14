@@ -4,8 +4,10 @@
 import { pauseIfDue, type TaskWork } from "../task.js";
 import {
   CATALOG_NATIVE_GRAMMAR as grammar,
+  CATALOG_FTS_FEATURE,
   CATALOG_RECORD_KINDS as kinds,
 } from "../durable-format.js";
+import type { FtsDef } from "../access/fts-def.js";
 import type { TableDef, SequenceDef, ViewDef, TypeDef } from "../access/catalog.js";
 import type { CatalogCounters, LoggedChange } from "./catalog.js";
 import type { BufferAllocator } from "./commit-buffers.js";
@@ -28,6 +30,7 @@ export interface CatalogStreamData {
   readonly sequences: readonly SequenceDef[];
   readonly views: readonly ViewDef[];
   readonly types: readonly TypeDef[];
+  readonly fts: readonly FtsDef[];
   /** Unknown display fields from the metadata record; never consulted for semantics. */
   readonly wireMetadata?: unknown;
 }
@@ -42,6 +45,7 @@ const sections = [
   ["sequence", "sequences"],
   ["view", "views"],
   ["namedType", "types"],
+  ["fts", "fts"],
 ] as const;
 const HEADER_BYTES = 16;
 export const CATALOG_RECORD_BYTES = 4 * 1024 * 1024;
@@ -81,7 +85,7 @@ function metadata(data: CatalogStreamData): Metadata {
   const result = {
     version: data.version,
     counters: data.counters,
-    requiredFeatures: [],
+    requiredFeatures: data.fts.length ? [CATALOG_FTS_FEATURE] : [],
     sections: sections.map(([kind, key]) => ({ kind: kinds[kind], count: data[key].length })),
   };
   retainCatalogExtensions(data.wireMetadata, result);
@@ -151,7 +155,12 @@ export function encodeCatalogStream(data: CatalogStreamData): Uint8Array {
 }
 function checkMetadata(value: unknown): Metadata {
   const meta = value as Metadata;
-  if (meta.requiredFeatures.length)
+  let previousFeature = 0;
+  for (const feature of meta.requiredFeatures) {
+    check(feature > previousFeature, "Duplicate/out-of-order catalog required feature");
+    previousFeature = feature;
+  }
+  if (meta.requiredFeatures.some((feature) => feature !== CATALOG_FTS_FEATURE))
     throw new UnsupportedCatalogError(`features ${meta.requiredFeatures.join(",")}`);
   check(meta.sections.length === sections.length, "Catalog section set is incomplete");
   for (const [i, [kind]] of sections.entries())
@@ -162,7 +171,13 @@ export function decodeCatalogStream(bytes: Uint8Array): CatalogStreamData {
   const input = new ByteReader(bytes);
   readHeader(input, grammar.streamMagic);
   const meta = checkMetadata(readCatalogRecord("catalog", input));
-  const groups: Record<string, unknown[]> = { tables: [], sequences: [], views: [], types: [] };
+  const groups: Record<string, unknown[]> = {
+    tables: [],
+    sequences: [],
+    views: [],
+    types: [],
+    fts: [],
+  };
   for (const [i, [kind, key]] of sections.entries()) {
     const count = meta.sections[i]?.count;
     check(
@@ -184,6 +199,7 @@ export function decodeCatalogStream(bytes: Uint8Array): CatalogStreamData {
     sequences: groups.sequences as SequenceDef[],
     views: groups.views as ViewDef[],
     types: groups.types as TypeDef[],
+    fts: groups.fts as FtsDef[],
     wireMetadata: meta,
   };
 }
@@ -308,7 +324,13 @@ export async function decodeCatalogParts(
       allocator.release(first);
     }
     const meta = checkMetadata(await record("catalog"));
-    const groups: Record<string, unknown[]> = { tables: [], sequences: [], views: [], types: [] };
+    const groups: Record<string, unknown[]> = {
+      tables: [],
+      sequences: [],
+      views: [],
+      types: [],
+      fts: [],
+    };
     for (const [i, [kind, key]] of sections.entries()) {
       const count = meta.sections[i]?.count;
       check(count !== undefined, "Missing catalog section");
@@ -326,6 +348,7 @@ export async function decodeCatalogParts(
       sequences: groups.sequences as SequenceDef[],
       views: groups.views as ViewDef[],
       types: groups.types as TypeDef[],
+      fts: groups.fts as FtsDef[],
       wireMetadata: meta,
     };
   } finally {

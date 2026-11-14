@@ -310,9 +310,14 @@ export function currentDirectoryFixture(
         // Test-only bootstrap, not an upgrade: archive roots are discarded above. Reuse only
         // the frozen group/page payloads. Definitions are fresh current-writer input, and the
         // current writer creates the new MCAT tree/list; ordinary open never accepts old JSON.
-        const data = Catalog.fromStored(
-          decodeJson(raw(recipe.catalog)) as CatalogStreamData,
-        ).encode();
+        const legacy = decodeJson(raw(recipe.catalog)) as CatalogStreamData;
+        const data = Catalog.fromStored({
+          ...legacy,
+          // These archived JSON recipes predate FTS. Supply current logical declarations,
+          // never defaults in the ordinary stored decoder or an old-root upgrade path.
+          fts: [],
+          counters: { ...legacy.counters, nextFtsId: 1 },
+        }).encode();
         const extents = recipe.extentList
           .flatMap((page) => decodeListPage(raw(page.blob), page))
           .filter((ref) => ref.offset !== recipe.catalog.extent.offset);

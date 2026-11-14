@@ -312,6 +312,7 @@ function catalogAt(version: number): CatalogView {
     sequences: [],
     views: [],
     types: [],
+    fts: [],
     table: () => undefined,
     tableByName: () => undefined,
     sequence: () => undefined,

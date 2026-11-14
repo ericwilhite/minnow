@@ -50,6 +50,11 @@ export const DURABLE_LONG_KEY_REACH = [
   "partial native tree",
 ] as const;
 export const DURABLE_REGISTRY_REACH = [
+  "ftsRoot",
+  "ftsTerms",
+  "ftsPostings",
+  "ftsDocuments",
+  "ftsDelta",
   "snapshot",
   "snapshotFrame",
   "snapshotFooter",
@@ -5815,6 +5820,9 @@ export const CATALOG_GRAPH_REACH = [
 ] as const;
 
 export const CATALOG_LOG_SHAPE_REACH = [
+  "createFts",
+  "upsertFts",
+  "dropFts",
   "createTable",
   "dropTable",
   "createIndex",
@@ -5921,9 +5929,9 @@ export const CATALOG_SAFE_VALUES_REACH = [
 ] as const;
 
 export const CATALOG_RESERVATION_REACH = [
-  "counter 8",
-  "change 15",
-  "change 16",
+  "fts 8",
+  "fts 9",
+  "fts 10",
   "optional",
   "required",
   "display retained",
@@ -6105,6 +6113,40 @@ export const FTS_ARRAY_RENDER_REACH = [
   "drained",
 ] as const;
 
+export const FTS_DEFINITION_REACH = [
+  "exact definition",
+  "large IDs",
+  "tokenizerVersion",
+  "rendererVersion",
+  "scorerVersion",
+  "config version",
+  "invalid IDs",
+  "physical state excluded",
+  "fixed config",
+] as const;
+
+export const FTS_CODEC_REACH = [
+  "ftsRoot",
+  "ftsTerms",
+  "ftsPostings",
+  "ftsDocuments",
+  "ftsDelta",
+  "leaf",
+  "branch",
+  "wide IDs",
+  "raw UTF16",
+  "charged ownership",
+  "drained",
+] as const;
+
+export const FTS_SELECTOR_REACH = [
+  "reader4 barrier",
+  "manifest5 barrier",
+  "commit body3",
+  "wide sequence preserved",
+  "checksummed roundtrip",
+] as const;
+
 export const ARRAY_VISITOR_REACH = [
   "empty",
   "nonempty",
@@ -6113,4 +6155,73 @@ export const ARRAY_VISITOR_REACH = [
   "borrowed bytes",
   "owned decoder bytes",
   "exact shapes",
+] as const;
+
+export const FTS_CATALOG_REACH = [
+  "WAL",
+  "native pages",
+  "fragmented stream",
+  "portable definitions",
+  "stable IDs",
+  "drop table",
+  "stale WAL",
+  "invalid binding",
+  "unknown semantics",
+  "display extensions",
+  "drained",
+] as const;
+export const FTS_STORAGE_REACH = [
+  "early close",
+  "IO failure",
+  "root",
+  "directory",
+  "terms branch",
+  "postings branch",
+  "documents branch",
+  "delta branch",
+  "exact graph",
+  "orphan excluded",
+  "parent bounds",
+  "cancel",
+  "write fence",
+  "read fence",
+  "drained",
+] as const;
+
+export const FTS_CATALOG_FEATURE_REACH = [
+  "duplicate supported",
+  "out of order",
+  "future typed",
+] as const;
+
+export const FTS_REFERENCE_GUARD_REACH = [
+  "checksummed oversized root",
+  "beyond generic read cap",
+  "outside extent",
+  "zero length",
+  "negative offset",
+  "fractional length",
+  "unsafe extent end",
+  "invalid checksum",
+  "nonfinite",
+  "legal boundary reaches IO",
+  "all five grammars",
+  "initial walker root",
+  "no allocation or IO",
+] as const;
+
+export const FTS_TERM_FENCE_REACH = [
+  "equal fences multiple terms",
+  "singleton distinct fences",
+  "reversed fences",
+  "adjacent prefix capacity",
+  "maximum length interval capacity",
+  "ftsTerms",
+  "ftsRoot",
+  "ftsDelta",
+  "exact boundary accepted",
+  "raw surrogate",
+  "NUL code unit",
+  "no child read needed",
+  "drained",
 ] as const;

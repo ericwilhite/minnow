@@ -79,6 +79,8 @@ import type { ColumnStatistics, PhysicalType, StatValue } from "../types.js";
 export type { ColumnStatistics, StatValue };
 
 /**
+ * 5: reader/WAL gates allocated for the native FTS grammar before the first supported writer.
+ * 4: the versioned MCAT catalog tree.
  * 3: explicit run encoding (inline/overflow); all earlier rebuild roots were unpublished.
  * 2: the root names its extent list (ruling R25, `extentList`). Roots of format 1 were written
  * only by development builds (no supported writer: DECISIONS.md "R25") and are refused.

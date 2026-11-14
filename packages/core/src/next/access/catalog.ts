@@ -32,6 +32,7 @@
  *   created; its `parentIndexId` is then `"primary"` or `{ unique: name }` of the same input.
  */
 import type { SqlTypeDescriptor, PhysicalType } from "../types.js";
+import type { FtsDef } from "./fts-def.js";
 import type { FlatVector } from "../vector/vector.js";
 
 export interface CatalogView {
@@ -41,6 +42,7 @@ export interface CatalogView {
   readonly views: readonly ViewDef[];
   /** Named types (ruling R17.7). */
   readonly types: readonly TypeDef[];
+  readonly fts: readonly FtsDef[];
   type(typeId: number): TypeDef | undefined;
   typeByName(name: string): TypeDef | undefined;
   /** By id; undefined when absent (dropped ids are never reused). */
@@ -175,7 +177,10 @@ export type CatalogChange =
   | { readonly kind: "createView"; readonly view: Omit<ViewDef, "id"> }
   | { readonly kind: "dropView"; readonly viewId: number }
   | { readonly kind: "createType"; readonly type: Omit<TypeDef, "id"> }
-  | { readonly kind: "dropType"; readonly typeId: number };
+  | { readonly kind: "dropType"; readonly typeId: number }
+  | { readonly kind: "createFts"; readonly fts: Omit<FtsDef, "id"> }
+  | { readonly kind: "upsertFts"; readonly fts: FtsDef }
+  | { readonly kind: "dropFts"; readonly ftsId: number };
 
 /**
  * A table definition as DDL supplies it. Existing columns, indexes and constraints keep their ids

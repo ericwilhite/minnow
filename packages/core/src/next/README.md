@@ -169,8 +169,8 @@ charge callbacks and checks capacities, overlap, refusal, constructor failures a
 `durable-format.ts` assigns MCAT1 logical records, MCRT1 native indexes, MCPG1 data pages and
 MCHG1 WAL changes. Each field is an ID varuint, flags byte (bit 0 required), length varuint
 and payload. Field IDs span u53; every reserved flag bit refuses. Required fields use registered numeric IDs; unknown required fields,
-features and versions refuse. Reserved semantic fields also refuse when marked optional; FTS
-field/family allocations are registered before implementation. Optional display extensions remain
+features and versions refuse. Reserved future semantic fields also refuse when marked optional.
+FTS definitions use family21/config26; physical state never becomes opaque catalog data. Optional display extensions remain
 opaque through rewrites.
 Records retain exact typed vectors, decimal coefficients, bigint sequence settings and UTF8
 identifier boundaries. An individual record is capped at 4 MiB. Catalogs stream one admitted
@@ -191,9 +191,9 @@ version gaps from rolled-back DDL. DROP TABLE carries its MCHG definition too.
 
 The manifest names the catalog tree, not a JSON blob. Reachability checks child depth and
 summaries plus contiguous fragment offsets, and reclamation retires every old index/data page.
-The reader/manifest/commit-body development selectors are 3/4/2; older unpublished selectors
-refuse. The released 1.0 format has no supported predecessor yet. Trigger/FTS families 20/21
-are reserved required work, not permission to execute inert definitions. Snapshot catalog frame
+The reader/manifest/commit-body development selectors are 4/5/3; older unpublished selectors
+refuse. The released 1.0 format has no supported predecessor yet. Trigger family20 remains
+reserved. FTS declarations persist without making an index ready. Snapshot catalog frame
 adapters are a separate integration step over the same portable MCAT stream.
 
 ### Commit encoding under the cap
@@ -3721,3 +3721,45 @@ The renderer-2 array limit counts PG output characters, not encoded bytes. A bor
 large text/BYTEA elements are checked before decoding. The existing allocating array decoder
 still returns owned byte elements and shares shape/element validation with the visitor.
 PG array quoting uses its six ASCII whitespace characters, not JavaScript's Unicode `\s`.
+
+### Native FTS durable foundations (B7 stage 3)
+
+The central registry assigns five version-1 page grammars: `ftsRoot` (MFTR), `ftsTerms`
+(MFTT), `ftsPostings` (MFTP), `ftsDocuments` (MFTD) and `ftsDelta` (MFTL). Every page starts
+with little-endian u32 magic, u8 version, zero flags, u8 leaf/branch kind and a zero reserved
+byte. Pages are at most 256 KiB; trees have fanout64 and depth at most8. IDs/LSNs use minimal
+u53 varints. Token/term totals use bounded exact unsigned bigint varints; totals can exceed
+2^53. There are no positions. Dictionary terms use raw UTF16 code units in big-endian order,
+including the tokenizer's legal truncated high surrogate; replacing them with UTF8 loses keys.
+
+Postings have delta-coded ascending document IDs and u16 frequencies. Document leaves keep
+IDs, u16 token lengths and a renderable bit, distinguishing NULL from empty renderable text.
+Both use up to4096 owned typed slots. Term leaves hold up to1024 keys and posting subtree
+references. Branch descriptors carry exact subtree fences/counts/token totals. Delta leaves
+hold up to64 increasing commit LSNs with document/term roots; document-ID bounds are independent
+of commit order. The column root binds semantic versions, schema/generation, mutation epoch,
+base/covered LSNs, corpus totals, next document ID and building/ready/invalid state. Only a
+building root may hold an owner/expiry lease. A paged directory groups column roots per table.
+The reference walker validates child identity, depth, bounds and totals before exposing them.
+Every reference, including the initial root, is checked for safe extent bounds and the 256 KiB
+page limit before any read or lease allocation. Invalid references produce typed manifest
+corruption errors. Unique term counts must agree with equal/distinct fences and cannot exceed
+the number of bounded UTF16 keys inside the interval; these checks need no child IO.
+
+Encoding measures before allocating one exact charged output. Parsing reserves a bounded
+per-page object/typed-lane allowance before construction; returned decoded ownership remains
+charged until release. IO holds encoded buffers until write settlement and read leases through
+cancellation; consumers must drain or close borrowed tree iterators. The writer is provisional:
+its caller owns abort/publication. Stage3 does not attach native FTS roots to live manifests,
+maintain row-write deltas, prove cross-tree document unions, build indexes or select indexed
+queries. Those are later stages; SQL continues through the stage2 whole-corpus scan route.
+
+MCAT21 fields1..7 are id/tableId/columnId/tokenizerVersion/rendererVersion/scorerVersion/config.
+Config26 field1 version1 selects the whole fixed tokenizer1/renderer2/scorer1 configuration.
+Counter field8 is nextFtsId; MCHG fields15/16 carry a definition/ID for create/upsert/drop.
+Definitions are ordered by stable ID, unique per live column, and removed with their table;
+dropped IDs are never reused. WAL keeps the existing expected/resulting version preconditions.
+Required feature1 marks a stream containing declarations. Unknown semantic versions refuse;
+optional display extensions survive copies/replay. Definition fields8..15 and families27/28
+remain reserved rather than silently storing future semantics or native lease/coverage state.
+Snapshots will rebuild postings from rows; this stage only supplies the portable definition.

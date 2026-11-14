@@ -81,6 +81,7 @@ export function prepareExecutorExport(
       sequences: [],
       views: [],
       types: [],
+      fts: [],
       table: unsupported,
       tableByName: unsupported,
       sequence: unsupported,

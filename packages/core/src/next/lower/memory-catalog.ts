@@ -25,6 +25,7 @@ const indexKeyKind = (type: PhysicalType): IndexDef["kind"] =>
   type.kind === "enum" ? "equality" : "ordered";
 
 class Snapshot implements CatalogView {
+  readonly fts = [];
   constructor(
     readonly version: number,
     readonly tables: readonly TableDef[],
