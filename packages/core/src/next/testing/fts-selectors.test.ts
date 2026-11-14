@@ -1,4 +1,4 @@
-/** Independent golden selectors allocated by the lead: reader5/manifest6/commitBody4.
+/** Independent golden selectors allocated by the lead: reader6/manifest7/commitBody5.
  * These are development bytes, not a supported predecessor or an indexed-query claim.
  */
 import fc from "fast-check";
@@ -9,7 +9,7 @@ import { encodeRootSlot, decodeRootSlot } from "../storage/root-slot.js";
 import { encodeBody, decodeBody } from "../write/body.js";
 
 for (const seed of seedsFor("next-fts-selectors", [0xb817, 0xb818]))
-  it(`emits the independently allocated FTS barriers (${String(seed)})`, () => {
+  it(`emits the independently allocated catalog barriers (${String(seed)})`, () => {
     const reach = createReach("FTS selectors", FTS_SELECTOR_REACH);
     fc.assert(
       fc.property(
@@ -22,16 +22,16 @@ for (const seed of seedsFor("next-fts-selectors", [0xb817, 0xb818]))
           reach.beginHistory();
           const checkBody = () => {
             const encoded = encodeBody({ request: null, effects: [] });
-            expect([...encoded], "commit-body4 ABI").toEqual([4, 0, 0]);
+            expect([...encoded], "commit-body5 ABI").toEqual([5, 0, 0]);
             expect(decodeBody(encoded)).toEqual({ request: null, effects: [] });
-            reach.reach("commit body4");
+            reach.reach("commit body5");
           };
           if (seed & 1) checkBody();
           const encoded = encodeRootSlot(sequence, payload);
-          expect((encoded[10] ?? 0) >>> 5, "minimum-reader5 ABI").toBe(4);
-          reach.reach("reader5 barrier");
-          expect(encoded[11], "manifest6 ABI").toBe(4);
-          reach.reach("manifest6 barrier");
+          expect((encoded[10] ?? 0) >>> 5, "minimum-reader6 ABI").toBe(5);
+          reach.reach("reader6 barrier");
+          expect(encoded[11], "manifest7 ABI").toBe(5);
+          reach.reach("manifest7 barrier");
           const decoded = decodeRootSlot(encoded);
           expect(decoded?.sequence).toBe(sequence);
           expect(decoded?.root).toEqual(payload);

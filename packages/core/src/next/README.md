@@ -208,7 +208,7 @@ bodies and both recursive arms without executing them. Explicit stable enum-to-t
 refuse stored generation; implicit assignment follows PostgreSQL’s separate coercion rule. The codec validates ordered dependencies,
 references, ownership and cycles before exposing stored definitions. Semantic extension fields
 may be absent but, when present, carry the required wire flag; they are never display extensions.
-These additions select reader5/manifest6/commitBody4 before any write. They change only
+These additions and the trigger record family select reader6/manifest7/commitBody5 before any write. They change only
 unreleased development formats; the first released1.0 writer starts the supported chain.
 
 `composeEngine().migrate()` is the owner-local schema bridge. It uses the existing schema planner

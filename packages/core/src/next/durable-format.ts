@@ -8,11 +8,11 @@
  * checksummed slot is not an empty/torn slot. Reserved masks enumerate every permitted bit;
  * writers emit zero for the remainder, readers refuse it. Scratch/transport are not durable.
  */
-/** Shared reference-table envelope; the manifest also carries its logical format version6. */
+/** Shared reference-table envelope; the manifest also carries its logical format version7. */
 export const METADATA_ENVELOPE_VERSION = 1;
 /** Raise before publishing any incompatible nested durable codec. Never fence before checking. */
-export const DURABLE_READER_VERSION = 5;
-export const MANIFEST_FORMAT_VERSION = 6;
+export const DURABLE_READER_VERSION = 6;
+export const MANIFEST_FORMAT_VERSION = 7;
 export const ROOT_SLOT_HEADER_BYTES = 16;
 export const ROOT_SLOT_OVERHEAD = ROOT_SLOT_HEADER_BYTES + 4;
 
@@ -32,7 +32,7 @@ export interface FormatField {
   /** Permitted bits; every other bit is reserved-zero. */
   readonly mask?: number;
 }
-/** Header selectors can name an outer envelope (manifest envelope1) plus its logical version6. */
+/** Header selectors can name an outer envelope (manifest envelope1) plus its logical version7. */
 interface Format {
   readonly magic: number | null;
   readonly version: number;
@@ -713,9 +713,9 @@ export const DURABLE_FORMATS = {
   ]),
   commitBody: {
     magic: null,
-    version: 4,
+    version: 5,
     versionIn: "header",
-    fields: [{ ...version(0), values: [4] }],
+    fields: [{ ...version(0), values: [5] }],
     decoder: "decodeBody",
     state: "implemented",
   },
