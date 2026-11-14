@@ -4270,3 +4270,9 @@ Stage3's internal catalog seam currently accepts native catalog bytes and explic
 sequences, indexes/constraints and missing/backfill vectors pending portable catalog1/stage4.
 It is not a complete owner load command or a frozen portable format. No supported stored
 format changes, existing upgrade chain or public package API are introduced by this stage.
+
+Stage3 load validates its accepted catalog subset before target acquisition: unknown fields,
+duplicate IDs/names, unsafe integers, allocation-counter floors and unresolved references
+are refused. Views, sequences, indexes/constraints and missing/backfill vectors require the
+stage4 MCAT adapter and receive a typed refusal here; trigger/managed/FTS fields cannot disappear
+through a permissive catalog constructor. This is an unreleased development interface.

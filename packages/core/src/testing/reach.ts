@@ -8682,3 +8682,12 @@ export const SNAPSHOT_NATIVE_LAYOUT_REACH = [
 ] as const;
 
 export const SNAPSHOT_LOAD_OPEN_REACH = ["wait until discard", "wait until publication"] as const;
+
+export const SNAPSHOT_CATALOG_REFUSAL_REACH = [
+  "duplicate table name",
+  "counter floor",
+  "duplicate column id",
+  "unsafe id",
+  "unresolved reference",
+  "unsupported field",
+] as const;

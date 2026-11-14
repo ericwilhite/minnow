@@ -8,15 +8,23 @@ import {
   SNAPSHOT_LOAD_FAULT_REACH,
   SNAPSHOT_NATIVE_LAYOUT_REACH,
   SNAPSHOT_LOAD_OPEN_REACH,
+  SNAPSHOT_CATALOG_REFUSAL_REACH,
 } from "../../testing/reach.js";
 import { decodeManifestRoot } from "../format/manifest-codec.js";
 import { listedRootExtents, reachableExtents } from "../format/reachable.js";
 import { SimDisk } from "../storage/sim-disk.js";
 import { openExtentSpace } from "../storage/space.js";
 import type { ByteBudget, ExtentSpace } from "../storage/extents.js";
-import { SnapshotKind, SnapshotStreamReader } from "../format/snapshot.js";
+import {
+  SnapshotKind,
+  SnapshotStreamReader,
+  SnapshotStreamWriter,
+  snapshotCrc32,
+  snapshotNumbers,
+} from "../format/snapshot.js";
 import { vectorOf } from "../page/test-support.js";
 import { encodeArrayValue } from "../vector/array-value.js";
+import { decodeJson, encodeJson } from "./bytes.js";
 import { Catalog } from "./catalog.js";
 import { exportPinnedSnapshot } from "./snapshot-export.js";
 import { loadSnapshot, type SnapshotLoadTarget } from "./snapshot-load.js";
@@ -747,6 +755,129 @@ for (const seed of seedsFor("next-snapshot-load-openers", [0xb267, 0xb268]))
           await loading.catch(() => undefined);
           await opening;
         }
+      }),
+      { seed, numRuns: 6 },
+    );
+    reach.assertReached();
+  }, 60000);
+
+async function corruptCatalog(
+  chunks: readonly Uint8Array[],
+  change: (value: Record<string, unknown>) => void,
+): Promise<Uint8Array[]> {
+  const b = new Budget(),
+    reader = await SnapshotStreamReader.open(input(chunks), b),
+    out: Uint8Array[] = [];
+  const writer = await SnapshotStreamWriter.open(
+    reader.header,
+    {
+      write(bytes) {
+        out.push(bytes.slice());
+      },
+    },
+    b,
+  );
+  let length = 0,
+    crc = 0;
+  try {
+    for await (const frame of reader.frames()) {
+      if (frame.kind === SnapshotKind.footer) continue;
+      let bytes = frame.payload;
+      if (frame.kind === SnapshotKind.catalogPart) {
+        const data = decodeJson(bytes) as Record<string, unknown>;
+        change(data);
+        bytes = encodeJson(data);
+        length = bytes.length;
+        crc = snapshotCrc32(bytes);
+      } else if (frame.kind === SnapshotKind.catalogEnd) {
+        bytes = new Uint8Array(16);
+        snapshotNumbers([length, 0], bytes);
+        new DataView(bytes.buffer).setUint32(8, crc, true);
+      }
+      await writer.frame(frame.kind, frame.objectId, frame.partIndex, bytes);
+    }
+    await writer.finish();
+  } finally {
+    reader.close();
+    writer.close();
+  }
+  expect(b.used).toBe(0);
+  return out;
+}
+for (const seed of seedsFor("next-snapshot-catalog-refusal", [0xb269, 0xb26a]))
+  it(`refuses checksum-valid catalog mutations before target acquisition seed ${String(seed)}`, async () => {
+    const reach = createReach("snapshot catalog refusal", SNAPSHOT_CATALOG_REFUSAL_REACH);
+    await fc.assert(
+      fc.asyncProperty(fc.integer({ min: 1, max: 10000 }), async (salt) => {
+        reach.beginHistory();
+        const chunks = await fixture([salt, null]),
+          h = new Harness("strict", "memory"),
+          path = await h.open();
+        await autocommit(path, (st) =>
+          st.changeCatalog({
+            kind: "createTable",
+            table: tableInput("old", [column("n", INT), column("s", { kind: "text" })], {
+              primaryKey: null,
+            }),
+          }),
+        );
+        await autocommit(path, (st) =>
+          st.table(1).insert(batch(ints([777]), texts(["old"])), null),
+        );
+        const lsn = path.appliedLsn;
+        await h.close();
+        for (const mutation of SNAPSHOT_CATALOG_REFUSAL_REACH) {
+          const damaged = await corruptCatalog(chunks, (data) => {
+            const tables = data.tables as Array<Record<string, unknown>>,
+              table = tables[0];
+            if (table === undefined) throw new Error("missing fixture table");
+            const columns = table.columns as Array<Record<string, unknown>>,
+              first = columns[0];
+            if (first === undefined) throw new Error("missing fixture column");
+            switch (mutation) {
+              case "duplicate table name":
+                tables.push({ ...table, id: salt + 10 });
+                (data.counters as Record<string, unknown>).nextTableId = salt + 11;
+                break;
+              case "counter floor":
+                (data.counters as Record<string, unknown>).nextTableId = 1;
+                break;
+              case "duplicate column id":
+                columns.push({ ...first });
+                break;
+              case "unsafe id":
+                table.id = Number.MAX_SAFE_INTEGER + 1;
+                break;
+              case "unresolved reference":
+                first.identitySequence = salt + 100;
+                break;
+              case "unsupported field":
+                table.triggers = [{ id: salt }];
+                break;
+            }
+          });
+          let opens = 0;
+          const b = new Budget();
+          await expect(
+            loadSnapshot(
+              input(damaged),
+              () => {
+                opens++;
+                return target(h, lsn, false);
+              },
+              b,
+              { replace: true },
+            ),
+          ).rejects.toMatchObject({
+            code:
+              mutation === "unsupported field" ? "MINNOW_SNAPSHOT_SCOPE" : "MINNOW_SNAPSHOT_FORMAT",
+          });
+          expect(opens).toBe(0);
+          expect(b.used).toBe(0);
+          reach.reach(mutation);
+        }
+        expect(await contents(h)).toEqual([[777, "old"]]);
+        expect(h.governor.usedBytes).toBe(0);
       }),
       { seed, numRuns: 6 },
     );

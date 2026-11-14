@@ -35,6 +35,8 @@ import type {
   ExtentSpace,
   ExtentWriter,
 } from "../storage/extents.js";
+import { decodeJson } from "./bytes.js";
+import { validateSnapshotCatalog } from "./snapshot-catalog-validate.js";
 import { Catalog } from "./catalog.js";
 import { SnapshotScopeError } from "./snapshot-export.js";
 import { SnapshotNativeBuilder, snapshotBlockEnd } from "./snapshot-native.js";
@@ -237,6 +239,7 @@ export async function loadSnapshot(
           catalogBytes.set(part, at);
           at += part.length;
         }
+        validateSnapshotCatalog(decodeJson(catalogBytes));
         catalog = Catalog.decode(catalogBytes);
         stage3Scope(catalog);
         catalogParts.length = 0;
