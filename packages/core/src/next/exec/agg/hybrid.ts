@@ -115,8 +115,6 @@ export class HybridAggregateOperator implements Operator {
   #restore: Promise<void> | null = null;
   #savedParameters: ParameterCheckpoint | null = null;
   readonly #stack: Pass[] = [];
-  /** Discarded tentative key admissions (diagnostics, not aggregate state). */
-  keyRetries = 0;
   readonly profile = {
     spilledBytes: 0,
     passes: 0,
@@ -357,7 +355,6 @@ export class HybridAggregateOperator implements Operator {
       // peaks even when the parent's allocation fits. The guard charges old+new
       // once and stops before allocation. Retire this incomplete lookup before
       // retrying: its new IDs/layout need not be usable after a denied resize.
-      this.keyRetries++;
       if (previous === 0) {
         this.#resetEmpty();
         yield* this.#split(batch);

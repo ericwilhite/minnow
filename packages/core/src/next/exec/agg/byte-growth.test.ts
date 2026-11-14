@@ -1,6 +1,6 @@
 /** A denied speculative key resize must split before any aggregate transition. */
 import fc from "fast-check";
-import { expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { seedsFor } from "../../../testing/seeds.js";
 import { createReach, BYTE_GROWTH_REACH } from "../../../testing/reach.js";
 import { Governor } from "../../memory/governor.js";
@@ -9,8 +9,12 @@ import { ArraySource, CollectSink } from "../join-fixtures.js";
 import { OutputArena } from "../kernels/vectors.js";
 import { drive } from "../pipeline.js";
 import { HybridAggregateOperator } from "./hybrid.js";
+import { HashWorkspace, HashHeadroomError } from "./hash-workspace.js";
 import { TEXT, I64, texts, dictionary } from "../kernels/test-support.js";
 import type { Batch } from "../../vector/vector.js";
+// eslint-disable-next-line @typescript-eslint/unbound-method -- captured once; wrapper preserves receiver
+const allocate = HashWorkspace.prototype.allocate;
+afterEach(() => vi.restoreAllMocks());
 
 it.each(seedsFor("hash-byte-transition", [0xb7bd, 0xb7be]))(
   "retires incomplete keys and splits before transitions seed%i",
@@ -43,6 +47,17 @@ it.each(seedsFor("hash-byte-transition", [0xb7bd, 0xb7be]))(
             sink = new CollectSink(),
             arena = new OutputArena(grant, 2048);
           const types = Array.from({ length: columns }, () => TEXT);
+          let denials = 0;
+          const allocation = vi
+            .spyOn(HashWorkspace.prototype, "allocate")
+            .mockImplementation(function (this: HashWorkspace, bytes: number) {
+              try {
+                return allocate.call(this, bytes);
+              } catch (error) {
+                if (error instanceof HashHeadroomError) denials++;
+                throw error;
+              }
+            });
           const operator = new HybridAggregateOperator(
             {
               op: "aggregate",
@@ -94,15 +109,15 @@ it.each(seedsFor("hash-byte-transition", [0xb7bd, 0xb7be]))(
             await drive(new ArraySource(batches), operator);
             expect(sink.rows).toHaveLength(4);
             expect(sink.rows.map((r) => Number(r[columns]))).toEqual([1, 1, 1, 1]);
-            if (operator.keyRetries > 0) reach.reach("key denial split");
-            if (width === 800000 && columns === 1 && !reverse)
-              expect(operator.keyRetries).toBeGreaterThan(0);
+            if (denials > 0) reach.reach("key denial split");
+            if (width === 800000 && columns === 1 && !reverse) expect(denials).toBeGreaterThan(0);
             reach.reach("funded transition");
             reach.reach(encoded ? "dictionary" : "flat");
             reach.reach(columns === 1 ? "single key" : "compound keys");
             if (selected) reach.reach("selected");
             if (!reverse) reach.reach("large then small");
           } finally {
+            allocation.mockRestore();
             operator.abort(new Error("cleanup"));
             await operator.closed;
             arena.close();
