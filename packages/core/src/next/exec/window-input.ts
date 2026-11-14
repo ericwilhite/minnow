@@ -3,10 +3,35 @@
  * repeated reference to the same input/type is the same value and validity bitmap. Computed
  * expressions remain distinct: neither equality of values nor volatility is inferred here.
  */
-import type { ScalarExpr } from "../ir/ir.js";
+import type { Rel, ScalarExpr } from "../ir/ir.js";
 import { samePhysicalType } from "../types.js";
 import type { Batch, Vector } from "../vector/vector.js";
 import type { WindowFunctionSpec } from "./window.js";
+
+/** Follow immutable column bindings through the whole projection chain. Aggregate
+ * input packing restores logical aliases in an inner projection; a second SELECT
+ * must not turn those aliases back into independent sort payloads. Computed
+ * expressions remain separate, and evaluation is left to the original producer.
+ */
+export function inputBindings(rel: Rel): readonly ScalarExpr[] | null {
+  if (rel.op !== "project") return null;
+  const origins = (input: Rel): symbol[] => {
+    if (input.op !== "project") return input.output.map(() => Symbol());
+    const parent = origins(input.input);
+    return input.exprs.map((expr) => {
+      const source = expr.op === "column" ? input.input.output[expr.index] : undefined;
+      return expr.op === "column" && source && samePhysicalType(expr.type, source.type)
+        ? (parent[expr.index] ?? Symbol())
+        : Symbol();
+    });
+  };
+  const fields = origins(rel);
+  return rel.output.map((column, index) => ({
+    op: "column",
+    index: fields.indexOf(fields[index] ?? Symbol()),
+    type: column.type,
+  }));
+}
 
 export function windowInputLayout(
   exprs: readonly ScalarExpr[],

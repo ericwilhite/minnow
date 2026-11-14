@@ -1449,7 +1449,8 @@ predicates and deletions in vectorized ranges before bounding survivors. Separat
 breakers stop demand propagation. `scripts/next-executor-bench.mts --component scan-limit`
 measures this scan/operator pair in interleaved Node CPU rounds over the real stored fixture.
 Ordinary sorts and top-N retain one physical slot for proven direct-column aliases,
-remap their keys, and restore every logical output afterward. Different source
+including aliases restored by aggregate packing through nested projections. They
+remap their keys and restore every logical output afterward. Different source
 columns and computed expressions keep separate slots. At the result boundary,
 each logical alias owns independent mutable buffers, including after transfer.
 Complete execution admission funds those copies; repeated variable scan bindings

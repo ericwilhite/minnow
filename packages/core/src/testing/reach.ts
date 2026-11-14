@@ -6114,3 +6114,15 @@ export const ARRAY_VISITOR_REACH = [
   "owned decoder bytes",
   "exact shapes",
 ] as const;
+
+export const ORDERED_WIDE_REACH = [
+  "aliases",
+  "distinct bindings",
+  "16 keys",
+  "12 keys",
+  "pinned",
+  "top-N",
+  "full sort",
+  "PG exact",
+  "zero",
+] as const;

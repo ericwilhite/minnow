@@ -1,7 +1,12 @@
 import { vectorOf } from "./join-fixtures.js";
 import { expect, it } from "vitest";
-import { windowInputLayout, remapWindowFunction, literalWindowAmount } from "./window-input.js";
-import type { ScalarExpr } from "../ir/ir.js";
+import {
+  windowInputLayout,
+  inputBindings,
+  remapWindowFunction,
+  literalWindowAmount,
+} from "./window-input.js";
+import type { Rel, ScalarExpr } from "../ir/ir.js";
 import { seedsFor, mulberry32 } from "../../testing/seeds.js";
 const int = { kind: "int32", bits: 32 } as const;
 const col = (index: number): ScalarExpr => ({ op: "column", index, type: int });
@@ -48,8 +53,65 @@ for (const seed of seedsFor("window-input-layout", [0xb710, 0xb711]))
       );
       expect(layout.restore.map((index) => physical[index])).toEqual(logical);
       expect(layout.exprs.length).toBeLessThanOrEqual(3);
+      const base: Rel = {
+        op: "values",
+        id: 0,
+        rows: [],
+        output: [0, 1, 2].map((i) => ({ name: String(i), type: int, nullable: true })),
+      };
+      let nested: Rel = {
+        op: "project",
+        id: 1,
+        input: base,
+        exprs: projection,
+        output: projection.map((_, i) => ({ name: String(i), type: int, nullable: true })),
+      };
+      for (let depth = 0; depth < 4; depth++)
+        nested = {
+          op: "project",
+          id: 2 + depth,
+          input: nested,
+          exprs: nested.output.map((_, i) => col(i)),
+          output: nested.output,
+        };
+      const packed = windowInputLayout(exprs, inputBindings(nested));
+      expect(
+        packed.restore.map(
+          (i) => logical[(packed.exprs[i] as Extract<ScalarExpr, { op: "column" }>).index],
+        ),
+      ).toEqual(logical);
+      expect(packed.types.length).toBe(layout.types.length);
     }
   });
+
+it("does not equate a computed slot with a deeper source column at the same index", () => {
+  const value = vectorOf(int, [9]);
+  if (value.form !== "flat") throw new Error("literal");
+  const base: Rel = {
+    op: "values",
+    id: 0,
+    rows: [],
+    output: [{ name: "x", type: int, nullable: false }],
+  };
+  const inner: Rel = {
+    op: "project",
+    id: 1,
+    input: base,
+    exprs: [{ op: "literal", type: int, value }, col(0)],
+    output: [
+      { name: "a", type: int, nullable: false },
+      { name: "b", type: int, nullable: false },
+    ],
+  };
+  const outer: Rel = {
+    op: "project",
+    id: 2,
+    input: inner,
+    exprs: [col(0), col(1), col(0)],
+    output: [...inner.output, { name: "a", type: int, nullable: false }],
+  };
+  expect(windowInputLayout(outer.exprs, inputBindings(outer)).restore).toEqual([0, 1, 0]);
+});
 
 it("keeps exact int4 amounts scalar but retains NULL, computed and wider arguments", () => {
   const literal = (amount: number | null): ScalarExpr => {

@@ -121,7 +121,12 @@ import { OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
 import { SortOperator, sortMinimumBytes } from "./sort.js";
 import { sortMode } from "./sort-keys.js";
 import type { SortColumn } from "./sort-keys.js";
-import { windowInputLayout, remapWindowFunction, literalWindowAmount } from "./window-input.js";
+import {
+  windowInputLayout,
+  inputBindings,
+  remapWindowFunction,
+  literalWindowAmount,
+} from "./window-input.js";
 import { TableScan, memoryScanBufferBytes } from "./table-scan.js";
 import {
   orderedSort,
@@ -2012,7 +2017,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             : setupWindow(rel, input, options.windowScalarArguments !== false);
         const physical = windowInputLayout(
           keys.exprs,
-          rel.input.op === "project" ? rel.input.exprs : null,
+          inputBindings(rel.input),
           rel.op === "sort" || options.windowInputDeduplication !== false,
         );
         const sortKeys = rel.op === "sort" ? order(rel.keys, keys.indexes.map(physical.index)) : [];

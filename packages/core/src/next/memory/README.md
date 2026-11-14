@@ -85,10 +85,12 @@ than its admitted lane raises the same error before allocating or waiting; it
 does not consume the lane or hide a still-active-loan ownership violation.
 This structured refusal does not repair an underestimated minimum. Sorts retain
 one physical copy of each proven direct-column alias and restore logical columns
-after sorting. The result sink also copies those bindings once, restoring logical
-wire positions with references to that frame's owned vectors. Its transfer list
-and wide-coefficient accounting count each backing allocation once. No buffer is
-shared with a producer or another frame. Computed values and new producer rows
+after sorting, following bindings through nested projections (including aggregate
+packing's restoration projection). This avoids funding repeated spill payloads
+for unchanged values. Result admission still counts every delivered logical field;
+the sink gives each client-visible alias independent mutable buffers. Its transfer
+list and wide-coefficient accounting count each backing allocation once. No buffer is
+shared with a producer, another logical field or another frame. Computed values and new producer rows
 stay distinct; this recipe does not infer equality or reassociate expressions.
 
 The int8 key-growth bound follows its own half-full rehash threshold, including
