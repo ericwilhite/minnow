@@ -2206,6 +2206,16 @@ cases terminate the worker before closing the tab. Loss is required only for thi
 unsaved JavaScript state; relaxed durability does not require data loss. Ordinary tab teardown
 can process hidden/pagehide or graceful close and flush, with browser-dependent scheduling.
 
+The internal expression-helper cancellation test holds a sort or join key's precise replay
+at explicit consumer backpressure. It fixes source batching so a valid row and a later error
+reach the same batch; an elapsed source slice can otherwise flush single rows and never
+suspend that replay. Cancellation awaits the compiler's request for the helper's real close
+fence, checks that its grant is still held, and releases the consumer before awaiting helper
+and execution settlement. No row may be delivered after cancellation, and cleanup must return
+all charges. Both committed seeds, shallow stack settings, examples and generated histories
+run without stack-name hooks or timer-based settlement windows. The test timeout is only a
+hang backstop; this check does not measure cancellation latency.
+
 The rebuild's staging-retirement campaign holds an index flush at its publication barrier,
 rolls back staged rows, and drops their table while the catalog checkpoint still retains it.
 Generated memtable sizes, staging lengths, and memory/simulated backends check that the

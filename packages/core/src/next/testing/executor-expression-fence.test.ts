@@ -3,6 +3,7 @@ import fc from "fast-check";
 import { afterEach, expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, EXPRESSION_FENCE_REACH } from "../../testing/reach.js";
+import * as filter from "../exec/filter.js";
 import { QueryRuntime } from "../exec/run.js";
 import type { Grant } from "../memory/governor.js";
 import { Governor } from "../memory/governor.js";
@@ -10,10 +11,12 @@ import { Slice } from "../exec/slices.js";
 import * as pipeline from "../exec/pipeline.js";
 import { StorageCore } from "./storage-core.js";
 // eslint-disable-next-line @typescript-eslint/unbound-method -- original receiver retained
-const due = Slice.prototype.due;
-// eslint-disable-next-line @typescript-eslint/unbound-method -- original receiver retained
 const admit = QueryRuntime.prototype.admit;
-const yieldTask = pipeline.yieldTask;
+const ProjectOperator = filter.ProjectOperator;
+// eslint-disable-next-line @typescript-eslint/unbound-method -- getter called with its original receiver
+const closed = Object.getOwnPropertyDescriptor(ProjectOperator.prototype, "closed")?.get as (
+  this: filter.ProjectOperator,
+) => void | Promise<void>;
 const originalStackLimit = Error.stackTraceLimit;
 afterEach(() => {
   vi.restoreAllMocks();
@@ -44,7 +47,15 @@ it.each(seedsFor("executor-expression-fence", [0xb7bb, 0xb7bc]))(
             const paused = new Promise<void>((resolve) => {
               resume = resolve;
             });
-            let suspended = false;
+            let fenceRequested: () => void = () => undefined;
+            const closing = new Promise<void>((resolve) => {
+              fenceRequested = resolve;
+            });
+            let helper: filter.ProjectOperator | undefined;
+            let helperFence: Promise<void> | undefined;
+            let pushes = 0;
+            const restores: Array<() => void> = [];
+            const controller = new AbortController();
             let keyGrant: Grant | undefined;
             const admitMock = vi
               .spyOn(QueryRuntime.prototype, "admit")
@@ -56,48 +67,62 @@ it.each(seedsFor("executor-expression-fence", [0xb7bb, 0xb7bc]))(
                 };
                 return pipeline.isPromise(grant) ? grant.then(record) : record(grant);
               });
-            const inReplay = () => {
-              // Spy wrappers can bury the real suspension below V8's ambient ten frames.
-              // Bound this tiny plan's capture locally; restore the caller's setting before
-              // returning. The generated shallow setting proves the hook cannot silently miss.
-              const limit = Error.stackTraceLimit;
-              try {
-                Error.stackTraceLimit = 100;
-                return new Error().stack?.includes("precise") === true;
-              } finally {
-                Error.stackTraceLimit = limit;
-              }
-            };
-            let probe = () => inReplay();
-            for (let depth = 0; depth < 20; depth++) {
-              const inner = probe;
-              probe = () => inner();
-            }
-            expect(
-              (function preciseHookWitness() {
-                return probe();
-              })(),
-              "suspension hook must see the continuation through deep spy frames",
-            ).toBe(true);
-            const dueMock = vi.spyOn(Slice.prototype, "due").mockImplementation(function (
-              this: Slice,
+            // The error must share a batch with earlier valid rows. An elapsed source
+            // slice can instead flush one-row batches: replay then throws on its first
+            // row, never reaching the suspension this law needs. Freeze slicing and
+            // suspend via explicit consumer credit, independently of stack names/time.
+            const dueMock = vi.spyOn(Slice.prototype, "due").mockReturnValue(false);
+            const projectMock = vi.spyOn(filter, "ProjectOperator").mockImplementation(function (
+              ...args: ConstructorParameters<typeof ProjectOperator>
             ) {
-              return inReplay() || due.call(this);
-            });
-            const yieldMock = vi.spyOn(pipeline, "yieldTask").mockImplementation(() => {
-              if (inReplay() && !suspended) {
-                suspended = true;
-                enter();
-                return paused;
+              const project = new ProjectOperator(...args);
+              if (args[0].some((expr) => expr.op !== "column")) {
+                const downstream = project.downstream;
+                const push = downstream.push.bind(downstream);
+                const ready = downstream.ready.bind(downstream);
+                const pushMock = vi
+                  .spyOn(downstream, "push")
+                  .mockImplementation((batch, transfer) => {
+                    // A full-batch data error delivers nothing. A one-row selection on
+                    // the original batch proves this is its precise replay continuation.
+                    expect(batch.length).toBe(n);
+                    expect(batch.selection?.count).toBe(1);
+                    pushes++;
+                    push(batch, transfer);
+                    return "blocked";
+                  });
+                const readyMock = vi.spyOn(downstream, "ready").mockImplementation(async () => {
+                  // Let native work settle before holding the helper's borrow. Abort
+                  // cannot reject that work and bypass our controlled continuation.
+                  await ready();
+                  helper = project;
+                  enter();
+                  await paused;
+                });
+                restores.push(
+                  () => pushMock.mockRestore(),
+                  () => readyMock.mockRestore(),
+                );
               }
-              return yieldTask();
+              return project;
             });
+            const closedMock = vi
+              .spyOn(ProjectOperator.prototype, "closed", "get")
+              .mockImplementation(function (this: filter.ProjectOperator) {
+                const pending = closed.call(this);
+                if (this === helper) {
+                  expect(pipeline.isPromise(pending)).toBe(true);
+                  if (pipeline.isPromise(pending)) helperFence = pending;
+                  fenceRequested();
+                }
+                return pending;
+              });
             const prepareMock = vi.spyOn(core.executor, "prepare").mockImplementation((plan) => {
               const q = prepare(plan);
               return {
                 ...q,
                 execute: (request) =>
-                  q.execute({ ...request, governor, signal: AbortSignal.timeout(30000) }),
+                  q.execute({ ...request, governor, signal: controller.signal }),
               };
             });
             const sql = join
@@ -111,39 +136,47 @@ it.each(seedsFor("executor-expression-fence", [0xb7bb, 0xb7bc]))(
             ]).then(() => {
               settled = true;
             });
-            const deadline = setTimeout(() => {
-              enter();
-              run.execution.cancel(new Error("replay entry deadline"));
-            }, 10000);
+            const unexpectedSettlement = completed.then(() => {
+              throw new Error("execution settled before its controlled helper fence");
+            });
             try {
-              await entered;
-              expect(suspended).toBe(true);
+              await Promise.race([entered, unexpectedSettlement]);
+              expect(helper).toBeDefined();
+              const pushesBeforeCancel = pushes;
               run.execution.cancel();
-              await new Promise((resolve) => setTimeout(resolve, 20));
+              await Promise.race([closing, unexpectedSettlement]);
               expect(
                 settled,
-                "execution must retain compiler resources until the helper exits its yield",
+                "execution must retain compiler resources until the helper exits its borrow",
               ).toBe(false);
               expect(governor.usedBytes).toBeGreaterThan(0);
               expect(
                 keyGrant?.held,
                 "native breaker must not retire its helper's compiler grant",
               ).toBeGreaterThan(0);
+              reach.reach("helper close fence");
               resume();
+              await helperFence;
               await completed;
+              expect(pushes, "a cancelled helper must not deliver another row").toBe(
+                pushesBeforeCancel,
+              );
+              reach.reach("no post-cancel rows");
               reach.reach(join ? "join key" : "sort key");
               reach.reach("cancelled suspension");
               if (traceLimit === 1) reach.reach("shallow ambient stack");
             } finally {
               Error.stackTraceLimit = previousLimit;
-              clearTimeout(deadline);
+              controller.abort();
               resume();
               run.execution.cancel();
               await completed;
               run.release();
               prepareMock.mockRestore();
               dueMock.mockRestore();
-              yieldMock.mockRestore();
+              closedMock.mockRestore();
+              projectMock.mockRestore();
+              for (const restore of restores) restore();
               admitMock.mockRestore();
               expect(governor.usedBytes).toBe(0);
               expect(core.spill.bytesInUse).toBe(0);
