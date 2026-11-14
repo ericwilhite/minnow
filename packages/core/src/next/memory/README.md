@@ -482,3 +482,24 @@ admission. Restoration applies the saved state before those rows, without reasso
 The partially changed lookup is never reused. Existing batch-boundary reclaim waits
 remain cancellable; a pinned holder selects split/spill. Ordinary funded batches do
 not scan widths again, change buffer capacities, or reserve additional memory.
+
+Growing sequence aggregates (`string_agg`, `array_agg`) reuse the native fragment and
+phase-handoff protocol. Fixed serializer/bitmap buffers and one scalar codec scratch
+are charged before allocation; full values stay file-backed until the producer graph
+retires. The delivery admission includes the measured serialized row, bounded read I/O,
+owned parameters and retained native-parent minima. The actual complete delivery minimum uses the serialized output, including array headers
+and NULL bitmaps. Sequence results adopt tight buffers directly; unlike JSON conversion,
+they do not impose an automatic two-times-value refusal.
+A direct projection that repeats a result field adds only its independently mutable
+client copies to that row's peak; maxima from different groups are never summed.
+Text/array concatenation uses the same expanding-expression handoff. No kernel waits
+for global credit with a pinned input, and caller parameter buffers are never reread.
+Its native serializers run inside the existing byte-expression runner: the count pass
+reserves exact output, the copy pass slices payload and NULL-bitmap work on the shared
+task clock, and cancellation unwinds the prepaid scalar scratch and output charge.
+
+Row-local value-size failures (SQLSTATE 54000) use the same saved-prefix ownership
+as row data errors (22xxx). The producer is retired, the complete prefix is admitted
+and delivered, then the error is raised. This does not defer memory admission
+(53200), cancellation, unsupported plans or storage faults. Aggregate array bounds
+are checked at finalization so a later transition error retains PostgreSQL's precedence.

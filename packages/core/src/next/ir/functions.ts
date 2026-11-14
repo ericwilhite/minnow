@@ -73,6 +73,8 @@ export interface Overload {
   readonly jsonResult?: "values" | "arguments";
   /** Polymorphic single-value conversion cannot infer an unknown input. */
   readonly unknown?: "error";
+  /** Array append/prepend keeps this argument's array type; the other is its element. */
+  readonly arrayArgument?: 0 | 1;
 }
 
 const numericTypes = ["int2", "int4", "int8", "float4", "float8", "numeric"] as const;
@@ -172,6 +174,9 @@ export const FUNCTIONS: Readonly<Record<string, readonly Overload[]>> = {
   neg: [...same(numericTypes, 1), { args: ["interval"], result: "interval" }],
   /** `||` on text (PostgreSQL's textcat); a non-text operand is cast to text first. */
   textcat: [{ args: ["text", "text"], result: "text" }],
+  array_cat: [{ args: ["T", "T"], result: "T" }],
+  array_append: [{ args: ["T", "any"], result: "T", arrayArgument: 0 }],
+  array_prepend: [{ args: ["any", "T"], result: "T", arrayArgument: 1 }],
 
   // Mathematical functions.
   abs: same(numericTypes, 1),
@@ -270,6 +275,9 @@ export const FUNCTIONS: Readonly<Record<string, readonly Overload[]>> = {
  */
 export const NON_STRICT_FUNCTIONS: ReadonlySet<string> = new Set([
   "fts_match",
+  "array_cat",
+  "array_append",
+  "array_prepend",
   "json_record",
   "json_record_value",
   "json_build_object",
@@ -557,7 +565,8 @@ export function aggregateResult(
       continue;
     }
     if (result === "T[]") {
-      if (bound !== undefined) return { kind: "array", element: bound };
+      if (bound !== undefined)
+        return bound.kind === "array" ? bound : { kind: "array", element: bound };
       continue;
     }
     return typeof result === "string" ? physicalTypeOfSql(result) : result;

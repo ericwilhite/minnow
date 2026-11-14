@@ -314,7 +314,7 @@ export function sqlLiteral(type: string, value: SqlValue): string {
 }
 
 /** Explicit synchronous test host. Production uses the charged, yielding expression operator. */
-function installSynchronousJson(arena: OutputArena): void {
+export function installSynchronousJson(arena: OutputArena): void {
   const budgets = new WeakMap<JsonNode, JsonMemory>();
   const slice = new Slice(Infinity);
   installJsonHost(arena, {

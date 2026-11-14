@@ -33,6 +33,13 @@ export interface JsonMemory {
   take(bytes: number): SlicedJob<void>;
   free(bytes: number): void;
 }
+/** A native byte-valued row serializer using the same admitted, cancellable runner. */
+export type ByteRowWriter = (
+  vectors: readonly Vector[],
+  row: number,
+  output: JsonOutput,
+  memory: JsonMemory,
+) => SlicedJob<boolean>;
 export interface JsonHost {
   readonly slice: Slice;
   memory(node: JsonNode): JsonMemory;
@@ -60,6 +67,7 @@ export class JsonNode implements Compiled {
     readonly args: readonly Compiled[],
     readonly host: JsonHost,
     arena: OutputArena,
+    readonly rowWriter?: ByteRowWriter,
   ) {
     // Charge kernel wrappers, frame metadata and bounded cursor temporaries before allocation.
     const rawCapacity =
@@ -214,6 +222,7 @@ export class JsonNode implements Compiled {
     return true;
   }
   *#row(vectors: readonly Vector[], row: number, writer: JsonOutput): SlicedJob<boolean> {
+    if (this.rowWriter) return yield* this.rowWriter(vectors, row, writer, this.#memory);
     const first = vectors[0];
     if (CONSTRUCTORS.has(this.fn)) {
       if (this.type.kind !== "json" || !this.type.binary)
@@ -348,15 +357,16 @@ export function compileJson(
   fn: string,
   args: readonly Compiled[],
   arena: OutputArena,
+  rowWriter?: ByteRowWriter,
 ): Compiled {
   if (CONSTRUCTORS.has(fn) && args.some((arg) => !JSON_VALUE_KINDS.has(arg.type.kind)))
     throw new UnsupportedPlanError("JSON construction value type", { construct: "function" });
   const host = hosts.get(arena);
   if (host === undefined)
-    throw new UnsupportedPlanError("JSON expression outside a resumable projection/filter", {
+    throw new UnsupportedPlanError("variable expression outside a resumable projection/filter", {
       construct: "function",
     });
-  return new JsonNode(type, fn, args, host, arena);
+  return new JsonNode(type, fn, args, host, arena, rowWriter);
 }
 
 function valueBytes(vector: Vector, row: number): Uint8Array {

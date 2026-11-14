@@ -52,6 +52,7 @@ interface AggregateDraft {
     readonly typed: Typed;
     readonly direction: "asc" | "desc";
     readonly nulls: "first" | "last";
+    readonly argument?: number;
   }>;
   readonly type: PhysicalType;
   readonly nullable: boolean;
@@ -61,6 +62,36 @@ interface AggregateDraft {
 }
 
 const INT8: PhysicalType = { kind: "int64" };
+
+/** Exact structural identity after coercion (including privately normalized
+ * temporal casts). No evaluation or reassociation: ORDER BY may reuse its
+ * argument slot just as PostgreSQL's aggregate target list does. */
+function sameExpression(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
+  if (ArrayBuffer.isView(a) || ArrayBuffer.isView(b)) {
+    if (
+      !ArrayBuffer.isView(a) ||
+      !ArrayBuffer.isView(b) ||
+      a.constructor !== b.constructor ||
+      a.byteLength !== b.byteLength
+    )
+      return false;
+    const x = new Uint8Array(a.buffer, a.byteOffset, a.byteLength),
+      y = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+    return true;
+  }
+  const x = Object.entries(a),
+    y = Object.entries(b);
+  return (
+    x.length === y.length &&
+    x.every(
+      ([key, value]) =>
+        Object.hasOwn(b, key) && sameExpression(value, (b as Record<string, unknown>)[key]),
+    )
+  );
+}
 
 function aggregateDraft(
   expression: Extract<Expression, { kind: "call" }>,
@@ -286,7 +317,7 @@ function aggregateDraft(
     case "STRING_AGG": {
       const [, separator] = expression.arguments;
       if (separator === undefined) throw new PlanningError("string_agg needs a delimiter", "42601");
-      const text: PhysicalType = { kind: "text" };
+      const text: PhysicalType = type.kind === "bytes" ? type : { kind: "text" };
       const value = coerce(arg, text, "implicit", builder.parameters);
       const delimiter = coerce(
         lowerExpression(separator, scope, state),
@@ -296,12 +327,18 @@ function aggregateDraft(
       );
       const orderBy = (expression.aggregateOrderBy ?? []).map((order) => ({
         typed: settleArg(order.expression),
+        argument: expression.arguments
+          .slice(0, 2)
+          .findIndex((a) => encodeQueryIdentity(a) === encodeQueryIdentity(order.expression)),
         direction: order.direction,
         nulls: order.nulls ?? (order.direction === "desc" ? ("first" as const) : ("last" as const)),
       }));
       return {
         fn: "string_agg",
         args: [value, delimiter],
+        ...(expression.arguments[2]
+          ? { filter: asBool(lowerExpression(expression.arguments[2], scope, state), state) }
+          : {}),
         distinct,
         orderBy,
         type: text,
@@ -322,6 +359,50 @@ function aggregateDraft(
     default:
       throw unsupported("aggregate", name.toLowerCase());
   }
+}
+
+/** The shared front end preserves ARRAY_AGG as its legacy JSON adapter. Recover
+ * the original typed aggregate here, without changing the shipped parser/engine. */
+function arrayAggregate(expression: Expression): Extract<Expression, { kind: "call" }> | null {
+  if (expression.kind !== "call" || expression.name !== "MINNOW_ARRAY_FROM_JSON") return null;
+  const call = expression.arguments[0],
+    wrapped = call?.kind === "call" ? call.arguments[0] : undefined;
+  return call?.kind === "call" &&
+    call.name === "JSON_ARRAYAGG" &&
+    wrapped?.kind === "call" &&
+    wrapped.name === "MINNOW_ARRAY_ELEMENT"
+    ? call
+    : null;
+}
+function arrayDraft(
+  call: Extract<Expression, { kind: "call" }>,
+  scope: Scope,
+  builder: PlanBuilder,
+): AggregateDraft {
+  const wrapped = call.arguments[0],
+    arg = wrapped?.kind === "call" ? wrapped.arguments[0] : undefined;
+  if (!arg) throw new PlanningError("array_agg needs an argument", "42883");
+  const value = settle(lowerExpression(arg, scope, builder.state), builder.parameters);
+  const type = aggregateResult("array_agg", [value.expr.type]);
+  if (!type) throw new PlanningError("array_agg type", "42883");
+  const filter = call.arguments[1];
+  return {
+    fn: "array_agg",
+    args: [value],
+    type,
+    nullable: true,
+    big: false,
+    distinct: call.distinct === true,
+    ...(filter
+      ? { filter: asBool(lowerExpression(filter, scope, builder.state), builder.state) }
+      : {}),
+    orderBy: (call.aggregateOrderBy ?? []).map((k) => ({
+      typed: settle(lowerExpression(k.expression, scope, builder.state), builder.parameters),
+      argument: encodeQueryIdentity(arg) === encodeQueryIdentity(k.expression) ? 0 : -1,
+      direction: k.direction,
+      nulls: k.nulls ?? (k.direction === "desc" ? ("first" as const) : ("last" as const)),
+    })),
+  };
 }
 
 /** PostgreSQL evaluates FILTER before either arguments or aggregate-local ordering keys. */
@@ -423,11 +504,20 @@ class Grouping {
         const identity = encodeQueryIdentity(expression);
         const key = this.#keyIdentities.get(identity);
         if (key !== undefined) return this.#keyColumn(key);
-        if (!isAggregateCall(expression)) return undefined;
+        const array = arrayAggregate(expression);
+        if (!isAggregateCall(expression) && array === null) return undefined;
         let position = this.#aggregateIdentities.get(identity);
         if (position === undefined) {
           position = this.aggregates.length;
-          this.aggregates.push(aggregateDraft(expression, this.source, this.builder));
+          this.aggregates.push(
+            array
+              ? arrayDraft(array, this.source, this.builder)
+              : aggregateDraft(
+                  expression as Extract<Expression, { kind: "call" }>,
+                  this.source,
+                  this.builder,
+                ),
+          );
           this.#aggregateIdentities.set(identity, position);
         }
         return this.#aggregateColumn(position);
@@ -470,24 +560,47 @@ class Grouping {
       });
       return column(index, typed.expr.type);
     };
-    const calls: AggregateCall[] = this.aggregates.map((draft) => ({
-      fn: draft.fn,
-      args: draft.args.map((arg) =>
+    const calls: AggregateCall[] = this.aggregates.map((draft) => {
+      const args = draft.args.map((arg) =>
         draft.fn === "percentile_cont" || draft.fn === "percentile_disc" || draft.fn === "mode"
           ? arg.expr
           : argumentColumn(filteredArgument(arg, draft.filter)),
-      ),
-      distinct: draft.distinct,
-      filter: draft.filter ? argumentColumn(draft.filter) : null,
-      ...(draft.json ? { json: draft.json } : {}),
-      orderBy: draft.orderBy.map((order): SortKey => ({
-        expr: argumentColumn(filteredArgument(order.typed, draft.filter)),
-        direction: order.direction,
-        nulls: order.nulls,
-        collation: null,
-      })),
-      type: draft.type,
-    }));
+      );
+      return {
+        fn: draft.fn,
+        args,
+        distinct: draft.distinct,
+        filter: draft.filter ? argumentColumn(draft.filter) : null,
+        ...(draft.json ? { json: draft.json } : {}),
+        orderBy: draft.orderBy.map((order): SortKey => {
+          const index =
+            order.argument !== undefined && order.argument >= 0
+              ? order.argument
+              : draft.fn === "array_agg" || draft.fn === "string_agg"
+                ? draft.args.findIndex((a) => sameExpression(a.expr, order.typed.expr))
+                : -1;
+          if (
+            draft.distinct &&
+            (draft.fn === "array_agg" || draft.fn === "string_agg") &&
+            index < 0
+          )
+            throw new PlanningError(
+              "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list",
+              "42P10",
+            );
+          return {
+            expr:
+              index >= 0
+                ? (args[index] ?? argumentColumn(filteredArgument(order.typed, draft.filter)))
+                : argumentColumn(filteredArgument(order.typed, draft.filter)),
+            direction: order.direction,
+            nulls: order.nulls,
+            collation: null,
+          };
+        }),
+        type: draft.type,
+      };
+    });
     const pre: Rel = {
       op: "project",
       id: this.builder.id(),

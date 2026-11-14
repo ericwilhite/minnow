@@ -36,6 +36,7 @@ import { int128At } from "../vector/int128.js";
 import { int64At } from "../vector/int64.js";
 import { isValid } from "../vector/validity.js";
 import { decodeUtf8 } from "../vector/varlen.js";
+import { decodeArrayValue, type ArrayElement } from "../vector/array-value.js";
 import type { Batch, FlatVector, Vector } from "../vector/vector.js";
 
 /** A columnar result: output columns and batches (the core may reuse nothing across them). */
@@ -155,6 +156,58 @@ function flatValue(vector: FlatVector, row: number): unknown {
       return decimalText(coefficient, data.scale ?? data.scales?.[row] ?? 0);
     }
     case "varlen":
+      if (vector.type.kind === "bytes")
+        return data.bytes.slice(data.offsets[row] ?? 0, data.offsets[row + 1] ?? 0);
+      if (vector.type.kind === "array") {
+        const type = vector.type.element;
+        const array = decodeArrayValue(
+          type,
+          data.bytes.subarray(data.offsets[row] ?? 0, data.offsets[row + 1] ?? 0),
+        );
+        const element = (v: ArrayElement | null): unknown => {
+          if (v === null) return null;
+          if (v instanceof Uint8Array) {
+            if (type.kind === "bytes") return v;
+            if (type.kind === "uuid") {
+              const h = Array.from(v, (x) => x.toString(16).padStart(2, "0")).join("");
+              return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+            }
+            return new TextDecoder().decode(v);
+          }
+          if (typeof v === "object")
+            return "coefficient" in v
+              ? (v.special ?? decimalText(v.coefficient, v.scale))
+              : formatSqlInterval(v.months, v.days, v.micros);
+          if (typeof v === "bigint") {
+            if (type.kind === "time") {
+              const n = Number(v),
+                s = Math.floor(n / 1000000),
+                f = n % 1000000;
+              return `${String(Math.floor(s / 3600)).padStart(2, "0")}:${String(Math.floor(s / 60) % 60).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}${f ? `.${String(f).padStart(6, "0").replace(/0+$/u, "")}` : ""}`;
+            }
+            if (type.kind === "timestamp") {
+              if (v === TIMESTAMP_POS_INFINITY || v === TIMESTAMP_NEG_INFINITY)
+                return { infiniteTimestamp: String(v > 0n) };
+              const unix = v + PG_EPOCH_UNIX_MICROS;
+              return unix % 1000n
+                ? { subMillisecondTimestamp: unix.toString() }
+                : new Date(Number(unix / 1000n));
+            }
+            return v >= -BigInt(Number.MAX_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER)
+              ? Number(v)
+              : v;
+          }
+          return type.kind === "date" ? formatDate(Number(v)) : v;
+        };
+        let at = 0;
+        const nest = (depth: number): unknown[] =>
+          Array.from({ length: array.dimensions[depth] ?? 0 }, () =>
+            depth + 1 === array.dimensions.length
+              ? element(array.elements[at++] ?? null)
+              : nest(depth + 1),
+          );
+        return nest(0);
+      }
       if (vector.type.kind === "text" || vector.type.kind === "enum" || vector.type.kind === "json")
         return decodeUtf8(data, row);
       throw new UnsupportedOracleValueError(vector.type);

@@ -1805,6 +1805,28 @@ shipped-engine or stored-format change.
 
 ### Aggregation (`exec/agg/`)
 
+- `sequence.ts` implements PostgreSQL `string_agg` (text and native byte parameters)
+  and `array_agg`, including per-call ORDER BY, DISTINCT and FILTER. NULL string values
+  are ignored; each contributing row supplies its delimiter, and a NULL delimiter adds
+  nothing. Arrays retain scalar types, element NULLs, dimensions and lower bounds;
+  array inputs must be non-NULL, nonempty and identically shaped. Empty input returns NULL.
+  Growing output streams into charged bounded spill fragments. Once measured, the complete
+  native result row is admitted before reconstruction; direct output aliases reserve their
+  extra independent copies from the same measured row. Cancellation closes every fragment.
+  Array bounds follow PostgreSQL's constructor/setter checks; aggregate final bounds wait
+  until transition errors (including NULL array inputs) have been considered. Row-local
+  data and value-size errors preserve the cursor's complete earlier rows, including under
+  pressure and through grouped aggregate delivery.
+- Text `||` is strict. Array `||` supports concatenation and typed element append/prepend,
+  including PostgreSQL's non-strict NULL-array behavior. These kernels copy native array
+  headers, bitmaps and payload views without a growing decoded element list. Expanding
+  projection output uses the existing resumable complete-row phase; copying and NULL-bitmap
+  repacking obey the shared task clock. Placements without that resumable project/filter
+  host are typed-refused. Existing limitations
+  remain: SQL ARRAY constructors/text-to-array casts, BYTEA DDL/casts, JSON array elements
+  and casts between different array element types are unsupported. Native stored arrays
+  and explicitly typed lowerer byte parameters exercise the supported typed paths.
+
 - `aggregate.ts`: the `aggregate` operator. Each batch maps its rows to dense group ids, then
   every aggregate (after its FILTER and DISTINCT) updates its state. `finish` emits groups in
   first-seen order unless the eligible output top-N below retains only winners. Batches hold
@@ -3677,7 +3699,7 @@ Wide TEXT/BYTES conditional projections try the ordinary allocation first. Only 
 selects payload sizing and smaller batches. At a single row CASE/COALESCE/NULLIF borrow
 the selected input, preserving lazy evaluation and downstream readiness without a new
 worst-case reservation. Failed vectorized expression batches in projections and filters
-replay in row order, delivering complete earlier rows before the first data error. Target
+replay in row order, delivering complete earlier rows before the first data/value-size error. Target
 lists evaluate left to right; CASE/COALESCE keep their masks. Replay depends on volatile
 kernels staying refused. Other expanding expressions keep their dedicated admission paths.
 

@@ -1,4 +1,6 @@
 import { SemanticStep } from "../semantic-step.js";
+import { SequenceTransition, isSequenceAggregate, sequenceSortTypes } from "./sequence.js";
+import { arrayElementTag } from "../../vector/array-value.js";
 import { JsonGroupRow } from "./json-group-row.js";
 import { JsonGroupKeys } from "./json-group-keys.js";
 import { JSON_VALUE_KINDS } from "../kernels/json-value.js";
@@ -37,7 +39,7 @@ import {
   type JsonAggregateHost,
 } from "./json-values.js";
 import { JsonObjectTransition, jsonObjectMinimum } from "./json-object.js";
-import { ExecutionError, UnsupportedPlanError } from "../errors.js";
+import { ExecutionError, UnsupportedPlanError, rowValueError } from "../errors.js";
 
 type AggregateRel = Extract<Rel, { op: "aggregate" }>;
 const INT8: PhysicalType = { kind: "int64" };
@@ -46,6 +48,7 @@ const INT8: PhysicalType = { kind: "int64" };
 // input sort grants and growing values are charged outside this fixed workspace.
 const ownMinimum = (rel: AggregateRel) => (512 << 10) + rel.aggregates.length * (256 << 10);
 export const isJsonAggregate = (call: AggregateCall): boolean =>
+  isSequenceAggregate(call) ||
   ["json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg"].includes(call.fn);
 export function jsonAggregateMinimum(rel: AggregateRel, input: readonly PhysicalType[]): number {
   for (const index of rel.groupBy) {
@@ -59,7 +62,25 @@ export function jsonAggregateMinimum(rel: AggregateRel, input: readonly Physical
   }
   for (const call of rel.aggregates) {
     if (!isJsonAggregate(call)) ordinaryJsonCall(call);
-    else if (
+    else if (isSequenceAggregate(call)) {
+      if (
+        call.args.some((a) => a.op !== "column") ||
+        call.orderBy.some((k) => k.expr.op !== "column") ||
+        (call.filter !== null && call.filter.op !== "column")
+      )
+        throw new UnsupportedPlanError("unprojected sequence aggregate input", {
+          construct: "aggregate",
+        });
+      if (call.fn === "array_agg") {
+        if (call.type.kind !== "array")
+          throw new UnsupportedPlanError("array_agg result type", { construct: "aggregate" });
+        try {
+          arrayElementTag(call.type.element);
+        } catch {
+          throw new UnsupportedPlanError("array_agg element type", { construct: "aggregate" });
+        }
+      }
+    } else if (
       call.args.some((arg) => arg.op !== "column" || !JSON_VALUE_KINDS.has(arg.type.kind)) ||
       call.orderBy.some((key) => key.expr.op !== "column") ||
       (call.filter !== null && call.filter.op !== "column")
@@ -83,7 +104,9 @@ export function jsonAggregateMinimum(rel: AggregateRel, input: readonly Physical
           : c.fn.includes("object")
             ? jsonObjectMinimum(c)
             : c.distinct || c.orderBy.length
-              ? sortMinimumBytes(jsonArraySortTypes(c))
+              ? sortMinimumBytes(
+                  isSequenceAggregate(c) ? sequenceSortTypes(c) : jsonArraySortTypes(c),
+                )
               : 0),
       0,
     )
@@ -174,6 +197,7 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
       this.io,
       shared.spill,
       rel.output.map((c) => c.type),
+      shared.deliveryCopies,
     );
     this.#suffix = new JsonRecords(this.io, shared.spill, context.input);
     this.#keyTypes = rel.groupBy.map((i) => {
@@ -224,6 +248,10 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
     let loanSlot = rel.groupBy.length ? 2 : 1;
     for (const call of rel.aggregates) {
       if (!isJsonAggregate(call)) this.#transitions.push(new JsonOrdinaryTransition(call, this));
+      else if (isSequenceAggregate(call))
+        this.#transitions.push(
+          new SequenceTransition(call, this, call.distinct || call.orderBy.length ? loanSlot++ : 0),
+        );
       else if (call.fn.includes("object"))
         this.#transitions.push(
           new JsonObjectTransition(
@@ -311,6 +339,17 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
       this.check();
     }
   }
+  groupKeys(types: readonly PhysicalType[], keys: readonly SortColumn[]): JsonGroupKeys {
+    return new JsonGroupKeys(
+      types,
+      keys,
+      this.pool,
+      this.#ownGrant,
+      this.#controller.signal,
+      () => this.pace(),
+      this.#semanticStep,
+    );
+  }
   async capture(store: ColumnStore, vectors: readonly Vector[], row: number): Promise<void> {
     store.reset(true);
     this.pool.settle();
@@ -321,10 +360,14 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
     if (store.append(vectors, null, row, 1) !== 1)
       throw new Error("JSON group capture was not admitted");
   }
-  checkValueLength(length: number): void {
+  checkValueLength(length: number, copies = 2): void {
     this.#maxValue = Math.max(this.#maxValue, length);
-    if (2 * length > this.shared.capacity)
-      throw new MemoryAdmissionError("JSON aggregate value", 2 * length, this.shared.capacity);
+    if (copies * length > this.shared.capacity)
+      throw new MemoryAdmissionError(
+        "native aggregate value",
+        copies * length,
+        this.shared.capacity,
+      );
   }
   spilled(bytes: number): void {
     this.#written += bytes;
@@ -357,7 +400,7 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
     } else await this.#groups(augmented);
   }
   #defer(error: unknown): boolean {
-    if (!(error instanceof ExecutionError) || !error.sqlState.startsWith("22")) return false;
+    if (!rowValueError(error)) return false;
     this.#transitionError = error;
     this.#rowError = new ExecutionError(error.message, error.code, error.sqlState);
     for (const t of this.#transitions) t.abort(error);
@@ -479,6 +522,7 @@ export class JsonAggregateOperator implements Operator, JsonAggregateHost {
       writtenAtHandoff:
         this.#files.written + this.#prefix.files.written + this.#suffix.files.written,
       aggregateValueBytes: this.#maxValue,
+      deliveryBytes: this.#prefix.deliveryBytes,
     };
     await this.shared.handoff(saved);
     this.#transferred = true;

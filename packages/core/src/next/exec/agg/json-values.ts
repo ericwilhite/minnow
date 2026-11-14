@@ -1,3 +1,4 @@
+import type { JsonGroupKeys } from "./json-group-keys.js";
 /** JSON transitions consume typed values; only bounded fragments are resident. */
 import type { AggregateCall } from "../../ir/ir.js";
 import type { PhysicalType } from "../../types.js";
@@ -31,11 +32,12 @@ export interface JsonAggregateHost {
   readonly memory: JsonMemory;
   check(): void;
   pace(): Promise<void>;
+  groupKeys(types: readonly PhysicalType[], keys: readonly SortColumn[]): JsonGroupKeys;
   capture(store: ColumnStore, vectors: readonly Vector[], row: number): Promise<void>;
   forkSort(minimum: number, slot: number): Grant;
   sortContext(grant: Grant): SortContext;
   resetSort(grant: Grant): void;
-  checkValueLength(length: number): void;
+  checkValueLength(length: number, copies?: number): void;
   spilled(bytes: number): void;
 }
 export interface JsonTransition {

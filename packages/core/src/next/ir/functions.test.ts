@@ -46,6 +46,10 @@ describe("the IR function table (ruling R17.5)", () => {
     for (const [fn, overloads] of Object.entries(FUNCTIONS))
       for (const overload of overloads) {
         if (overload.result === "T") expect(overload.args, fn).toContain("T");
+        if (overload.arrayArgument !== undefined) {
+          expect(overload.args[overload.arrayArgument], fn).toBe("T");
+          expect(overload.result, fn).toBe("T");
+        }
         if (overload.variadic === true) expect(overload.args.length, fn).toBeGreaterThan(0);
       }
   });

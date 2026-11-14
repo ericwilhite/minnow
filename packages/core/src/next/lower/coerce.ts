@@ -15,7 +15,7 @@ import {
 } from "../ir/functions.js";
 import type { ScalarExpr } from "../ir/ir.js";
 import { samePhysicalType, type PhysicalType } from "../types.js";
-import { PlanningError } from "./errors.js";
+import { PlanningError, unsupported } from "./errors.js";
 import {
   boolLiteral,
   decimalLiteral,
@@ -386,6 +386,31 @@ export function resolveFunction(
 ): Resolved {
   const overloads = FUNCTIONS[fn];
   if (overloads === undefined) throw new PlanningError(`function ${fn} does not exist`, "42883");
+  const array = overloads.find((o) => o.arrayArgument !== undefined);
+  if (array?.arrayArgument !== undefined && args.length === 2) {
+    const at = array.arrayArgument,
+      value = args[at];
+    if (!value) throw new PlanningError("Missing array operand", "42883");
+    const type = settle(value, parameters).expr.type;
+    if (type.kind !== "array") throw new PlanningError(`${fn} requires an array`, "42883");
+    const scalar = args[1 - at];
+    if (!scalar) throw new PlanningError("Missing array element", "42883");
+    // anycompatiblearray binds base element types, not a stored NUMERIC/VARCHAR
+    // typmod. Appending must not round or truncate the new scalar to that modifier.
+    const member: Typed = {
+      expr: { op: "column", index: 0, type: baseType(type.element) },
+      nullable: true,
+      big: false,
+    };
+    const element = baseType(commonType([member, scalar], parameters, fn));
+    if (!sameBase(element, type.element))
+      throw unsupported("function", "array element promotion requires an array cast");
+    return {
+      fn,
+      args: at === 0 ? [type, element] : [element, type],
+      result: { kind: "array", element },
+    };
+  }
   const kinds = args.map((arg) => argSql(arg, parameters));
   const expanded = overloads.flatMap((overload) => {
     const params = expand(overload, args.length);

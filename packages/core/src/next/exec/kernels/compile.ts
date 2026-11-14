@@ -12,6 +12,7 @@
  */
 import { compileFtsMatch } from "./fts.js";
 import { compileLike } from "./like.js";
+import { compileConcat } from "./concat.js";
 import { compileIntervalExtract } from "./interval-extract.js";
 import { compileCalendarAdd } from "./calendar-add.js";
 import type { ScalarExpr } from "../../ir/ir.js";
@@ -200,6 +201,8 @@ function compileCall(expr: Extract<ScalarExpr, { op: "call" }>, context: Compile
           construct: "fullTextSearch",
         });
       return compileFtsMatch(args, arena);
+    case "concat":
+      return compileConcat(expr.fn, expr.type, args, arena);
     case "json":
       return compileJson(expr.type, expr.fn, args, arena);
     case "arith": {

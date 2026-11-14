@@ -971,6 +971,17 @@ export function lowerExpression(
       const left = lowerExpression(expression.left, scope, state);
       const right = lowerExpression(expression.right, scope, state);
       if (expression.operator === "||") {
+        const leftArray = left.expr.type.kind === "array",
+          rightArray = right.expr.type.kind === "array";
+        if (leftArray || rightArray) {
+          const fn =
+            (leftArray && rightArray) || left.pending !== undefined || right.pending !== undefined
+              ? "array_cat"
+              : leftArray
+                ? "array_append"
+                : "array_prepend";
+          return callFunction(fn, [left, right], state);
+        }
         const text: PhysicalType = { kind: "text" };
         const asText = (value: Typed) =>
           coerce(

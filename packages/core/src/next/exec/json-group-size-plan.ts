@@ -30,12 +30,38 @@ export function jsonGroupConsumer(
   rel: Extract<Rel, { op: "aggregate" }>,
   slot: number,
 ): JsonGroupConsumer | null {
-  if (slot === 0) return { keys: rel.groupBy, columns: rel.groupBy, boundary: true };
+  if (slot === 0) {
+    // The owning lane also compares one pair of DISTINCT sequence values after the
+    // helper sorter releases its comparison workspace. Fund the actual key types.
+    const keys = [
+      ...new Set([
+        ...rel.groupBy,
+        ...rel.aggregates.flatMap((call) =>
+          call.distinct && (call.fn === "array_agg" || call.fn === "string_agg")
+            ? call.args.map((a) => {
+                if (a.op !== "column") throw new Error("Sequence argument not projected");
+                return a.index;
+              })
+            : [],
+        ),
+      ]),
+    ];
+    return { keys, columns: keys, boundary: true };
+  }
   if (slot === 1 && rel.groupBy.length)
     return { keys: rel.groupBy, columns: rel.input.output.map((_, i) => i), boundary: false };
   let next = rel.groupBy.length ? 2 : 1;
   for (const call of rel.aggregates) {
-    if (!["json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg"].includes(call.fn))
+    if (
+      ![
+        "json_agg",
+        "jsonb_agg",
+        "json_object_agg",
+        "jsonb_object_agg",
+        "string_agg",
+        "array_agg",
+      ].includes(call.fn)
+    )
       continue;
     const column = (expr: ScalarExpr): number => {
       if (expr.op !== "column") throw new Error("JSON sort input must be projected");
@@ -55,9 +81,9 @@ export function jsonGroupConsumer(
       if ((call.fn === "jsonb_object_agg" || call.json?.unique) && next++ === slot) return null;
     } else if ((call.distinct || order.length) && next++ === slot)
       return {
-        keys: call.distinct ? args.slice(0, 1) : order,
+        keys: call.distinct ? args : order,
         collations: call.distinct
-          ? [call.orderBy[0]?.collation ?? null]
+          ? args.map((_, i) => call.orderBy[i]?.collation ?? null)
           : call.orderBy.map((k) => k.collation),
         columns: [...args, ...order],
         boundary: false,

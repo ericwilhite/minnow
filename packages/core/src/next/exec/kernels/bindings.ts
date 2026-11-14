@@ -30,7 +30,8 @@ export type CallKernel =
   | "calendarAdd"
   | "intervalExtract"
   | "json"
-  | "fts";
+  | "fts"
+  | "concat";
 
 export type Binding =
   | {
@@ -87,6 +88,7 @@ export const CASE_RESULT_KINDS: ReadonlySet<PhysicalKind> = new Set<PhysicalKind
   "json",
   "enum",
   "interval",
+  "array",
 ]);
 
 export const FUNCTION_BINDINGS: Readonly<Record<string, Binding | PerOverload>> = {
@@ -149,7 +151,10 @@ export const FUNCTION_BINDINGS: Readonly<Record<string, Binding | PerOverload>> 
     ...each(["int2", "int4", "int8", "numeric"], 2, ARITH),
   }),
   neg: per({ ...each(NUMERIC, 1, { kernel: "neg" }), interval: INTERVAL }),
-  textcat: refuse("text concatenation (text kernels come next)"),
+  textcat: { kernel: "concat" },
+  array_cat: { kernel: "concat", kinds: new Set(["array"]) },
+  array_append: { kernel: "concat" },
+  array_prepend: { kernel: "concat" },
 
   abs: refuse("mathematical functions (come next)"),
   round: per({
