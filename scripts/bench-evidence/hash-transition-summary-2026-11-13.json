@@ -1,89 +1,89 @@
 {
-  "purpose": "Hash-key memory correctness; ordinary-path CPU guard, no speedup claim",
+  "purpose": "Hash key-admission recovery; ordinary-path guard, no CPU gain claim",
+  "design": "Keep parent allocation policy. Denied key admission has no transitions: discard+split empty prefix; checkpoint exact committed prefix before spooling untouched suffix and phase handoff. No ordinary retry counter or extra sizing.",
   "control": "82e4aa000662b450e3f63f999d4103b9d6eedd32",
-  "candidate": "fb1622f5c28164f5a4567417e28ae91d93427257",
-  "clock": "process CPU all threads, fresh serial VM per arm/workload/boundary; balanced AB/BA; natural GC; 10 warmups",
+  "candidate": "0e2c21dcf6a191df89a231186cd01352f98a79eb",
+  "clock": "Process CPU all threads; fresh serial VM per arm/workload/boundary; balanced AB/BA; natural GC; 10 warmups; setup and before/after exact verification outside clock.",
   "uniqueTimedPIDs": 72,
   "quartiles": "type 7, linear interpolation (n-1)*p",
-  "fixture": "32768 stored/decoded TEXT rows, 8192 account-NNNNNNNN groups; exact keys/counts/IDs checked before/after",
+  "fixture": "32768 decoded/stored TEXT rows,8192 account-NNNNNNNN groups,count4. Native boundary is complete Hybrid COUNT including admission/emission/cleanup; SQL uses quiesced real write/storage.",
   "records": [
     {
       "phase": "aa",
       "boundary": "operator",
       "iterations": 50,
-      "medianControlMs": 326.689,
-      "medianCandidateMs": 241.744,
-      "medianDeltaMs": -41.29499999999996,
-      "iqrDeltaMs": 129.127,
-      "rangeDeltaMs": [-118.82900000000001, 72.781],
+      "medianControlMs": 257.429,
+      "medianCandidateMs": 280.435,
+      "medianDeltaMs": 27.442999999999984,
+      "iqrDeltaMs": 50.144000000000005,
+      "rangeDeltaMs": [-57.147999999999996, 126.87499999999997],
       "pairDeltasMs": [
-        -118.82900000000001, 34.504999999999995, -113.67600000000002, 72.781, -41.29499999999996,
-        -4.694000000000017, -94.62200000000001, -52.984999999999985, 42.71199999999999
+        27.442999999999984, 39.186000000000035, 121.54799999999997, -10.95799999999997,
+        -0.5880000000000223, -57.147999999999996, -42.43099999999998, 32.464, 126.87499999999997
       ],
-      "favoursCandidate": 6,
+      "favoursCandidate": 4,
       "acceptedGain": false,
       "significantRegression": false,
-      "load1Range": [3.66, 4.78]
+      "load1Range": [3.1, 3.47]
     },
     {
       "phase": "aa",
       "boundary": "query",
       "iterations": 10,
-      "medianControlMs": 198.054,
-      "medianCandidateMs": 192.165,
-      "medianDeltaMs": -7.3940000000000055,
-      "iqrDeltaMs": 15.12299999999999,
-      "rangeDeltaMs": [-50.375, 52.781000000000006],
+      "medianControlMs": 155.969,
+      "medianCandidateMs": 157.697,
+      "medianDeltaMs": 4.561000000000007,
+      "iqrDeltaMs": 7.244999999999976,
+      "rangeDeltaMs": [-48.68000000000001, 21.55000000000001],
       "pairDeltasMs": [
-        -50.375, 52.781000000000006, -14.728000000000009, -4.984000000000009, -22.97399999999999,
-        -1.8540000000000134, -7.3940000000000055, -16.977000000000004, 10.169000000000011
+        21.55000000000001, -3.460000000000008, 4.531999999999982, 0.5470000000000255,
+        4.561000000000007, 10.631, 5.661000000000001, -48.68000000000001, 7.792000000000002
       ],
-      "favoursCandidate": 7,
+      "favoursCandidate": 2,
       "acceptedGain": false,
       "significantRegression": false,
-      "load1Range": [4.71, 5.38]
+      "load1Range": [3.29, 3.5]
     },
     {
       "phase": "ab",
       "boundary": "operator",
       "iterations": 50,
-      "medianControlMs": 187.344,
-      "medianCandidateMs": 192.229,
-      "medianDeltaMs": 12.832999999999998,
-      "iqrDeltaMs": 24.27800000000002,
-      "rangeDeltaMs": [-2.2719999999999914, 35.861999999999995],
+      "medianControlMs": 323.217,
+      "medianCandidateMs": 365.226,
+      "medianDeltaMs": -3.7210000000000036,
+      "iqrDeltaMs": 105.90899999999999,
+      "rangeDeltaMs": [-172.51500000000001, 177.94400000000002],
       "pairDeltasMs": [
-        29.321000000000026, 12.832999999999998, 2.531000000000006, 35.861999999999995,
-        5.043000000000006, -2.2719999999999914, 6.965000000000003, 30.27000000000001,
-        23.078000000000003
+        -3.7210000000000036, -15.70999999999998, -6.070999999999998, 42.009000000000015,
+        90.19900000000001, -172.51500000000001, 126.24700000000001, 177.94400000000002,
+        -72.92800000000005
       ],
-      "favoursCandidate": 1,
+      "favoursCandidate": 5,
       "acceptedGain": false,
       "significantRegression": false,
-      "load1Range": [4.49, 4.99]
+      "load1Range": [3.46, 4.39]
     },
     {
       "phase": "ab",
       "boundary": "query",
       "iterations": 10,
-      "medianControlMs": 165.8,
-      "medianCandidateMs": 164.323,
-      "medianDeltaMs": -5.584000000000003,
-      "iqrDeltaMs": 23.94999999999999,
-      "rangeDeltaMs": [-39.537000000000006, 27.846000000000004],
+      "medianControlMs": 161.81,
+      "medianCandidateMs": 155.578,
+      "medianDeltaMs": -13.329000000000008,
+      "iqrDeltaMs": 37.494,
+      "rangeDeltaMs": [-84.11699999999999, 21.900000000000006],
       "pairDeltasMs": [
-        -7.219999999999999, 4.59699999999998, -5.584000000000003, 13.540999999999997,
-        -3.7690000000000055, -20.682999999999993, -39.537000000000006, -19.35300000000001,
-        27.846000000000004
+        -84.11699999999999, 4.431999999999988, 21.900000000000006, 17.687999999999988,
+        -17.994999999999976, -13.329000000000008, 16.49199999999999, -70.666, -21.00200000000001
       ],
-      "favoursCandidate": 6,
+      "favoursCandidate": 5,
       "acceptedGain": false,
       "significantRegression": false,
-      "load1Range": [3.99, 4.37]
+      "load1Range": [4.19, 4.39]
     }
   ],
   "peaks": {
-    "candidate": "fb1622f5c28164f5a4567417e28ae91d93427257",
+    "candidate": "0e2c21dcf6a191df89a231186cd01352f98a79eb",
     "records": [
       {
         "name": "main",
@@ -121,22 +121,59 @@
       }
     ],
     "sourceHashes": {
-      "packages/core/src/next/exec/agg/groups.ts": "b3852eaefe3a66cd34c579e391dcd2116cda813447ec4e3f72a0ad82885abc64",
-      "packages/core/src/next/exec/agg/growth.ts": "bd7f26697416756ea4a52735913767af5352ab36aa5c837731bb96fc1938f2f8"
+      "packages/core/src/next/exec/agg/groups.ts": "a4fa0305ff0837d452a0d3dee2f7519a3ac5513d5ceaaa6509e62b5fc4ee18d9",
+      "packages/core/src/next/exec/agg/growth.ts": "c1113894d393a69764e5119c6ec2978c427321c73e39c7f8be36623d0b1378e0",
+      "packages/core/src/next/exec/agg/hybrid.ts": "dbf07f67d95b5cfd2c21012681b925201044d27ad570c563c8b526275c3219fa"
     },
     "rawHashes": {
-      "compare-main.log": "efea864bf723e464d5a3970b24d5e836c3dc28ac035c5fa3e7c18ca4811df8ff",
-      "compare-control.log": "46f19ca8e72a95c2fb1e35850b6d44d284d1471da1d5a8f556ef74e37c0e34ea",
-      "compare-candidate.log": "e6a9b0e442a282a45bcb8979f641ffa309966475aefde98724bb800c1e6cd5a9"
+      "compare-main.log": "60fa8d26eb3ab71381baec40289dad7e554ea50b4eb1b2b92013f30dab581fcc",
+      "compare-control.log": "90b3ad458fede4a5b9c63fac25e7f24b6972b67f0d368f3b43d71f865c215b78",
+      "compare-candidate.log": "b53445f6d0824117da381da9a47994839960ea67e9ee9d38df519f8719eba99c"
     }
+  },
+  "parentPeakGenerator": {
+    "parent": "82e4aa00",
+    "seeds": [47041, 47042],
+    "historiesPerSeed": 32,
+    "fixed": 20,
+    "random": 12,
+    "unequalWidthHistories": 5,
+    "columns": [2, 3, 4, 8, 16],
+    "forms": ["flat dense", "flat selected", "dictionary dense", "dictionary selected"],
+    "reference": "Captured parent ceilings embedded in parent-peak.test.ts; candidate never defines the ceiling."
+  },
+  "coverage": {
+    "native": {
+      "seeds": [47037, 47038],
+      "historiesPerSeed": 17,
+      "fixed": 5,
+      "random": 12
+    },
+    "sql": {
+      "seeds": [47039, 47040],
+      "historiesPerSeed": 18,
+      "fixed": 10,
+      "random": 8,
+      "dimensions": [
+        "shared/distinct parameters",
+        "UTF8",
+        "mixed fixed/byte keys",
+        "2048-row float prefix then suffix",
+        "pinned spill",
+        "reclaim release",
+        "cancel",
+        "zero charges"
+      ]
+    },
+    "node22": "3files6tests PASS"
   },
   "mutants": [
     {
-      "name": "parent-original",
+      "name": "no-key-recovery",
       "exit": 1,
       "reason": "HashHeadroomError",
       "rejected": true,
-      "seconds": 12.618596637970768,
+      "seconds": 12.335010105045512,
       "command": [
         "node",
         "node_modules/vitest/vitest.mjs",
@@ -149,11 +186,11 @@
       ]
     },
     {
-      "name": "no-byte-funding",
+      "name": "keep-incomplete-keys",
       "exit": 1,
-      "reason": "HashHeadroomError",
+      "reason": "RangeError: offset is out of bounds",
       "rejected": true,
-      "seconds": 5.895835728966631,
+      "seconds": 6.19785876700189,
       "command": [
         "node",
         "node_modules/vitest/vitest.mjs",
@@ -163,21 +200,61 @@
         "/home/eric/.cache/b4-projection/vitest-star-two.mts",
         "--maxWorkers=2"
       ]
+    },
+    {
+      "name": "drop-pending-input",
+      "exit": 1,
+      "reason": "AssertionError",
+      "rejected": true,
+      "seconds": 12.69167847908102,
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "packages/core/src/next/testing/executor-hash-transition.test.ts",
+        "--config",
+        "/home/eric/.cache/b4-projection/vitest-star-two.mts",
+        "--maxWorkers=2"
+      ]
+    },
+    {
+      "name": "clip-future-arena-capacity",
+      "exit": 1,
+      "reason": "less than or equal",
+      "rejected": true,
+      "seconds": 4.71645842900034,
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "packages/core/src/next/exec/agg/parent-peak.test.ts",
+        "--config",
+        "/home/eric/.cache/b4-projection/vitest-star-two.mts",
+        "--maxWorkers=2"
+      ]
     }
   ],
-  "hashes": {
-    "cpu-final.json": "24c3be3b44fba9c8507219b049a19136b4c5bf47c44c86134678e097c057770c",
-    "control-runtime-hashes.json": "eb44f38e28c873ecd12a5c30cdb1153bf8276b6ae3be72c3d64902376b32fee1",
-    "candidate-runtime-hashes.json": "a66d311fbf38bcb63d2928a7fd7cdcac551693f02a276b55ec8b6db3a0e7093c",
-    "mutants.json": "f34af7f8f7aca661e155657a728a08664412bc125259a60f00f1f408fa3307ca",
-    "hash-transition-worker.mts": "22ea10685bc833eab7dfca205b07abc182960f4d3e0f0c53bef797ed397c70f3",
-    "hash-transition-cpu.mts": "3fa6056b084796339c7ca8d95759ef9ebebca61efc7b62e7d4bde7e68ddd101e"
+  "rejectedDesign": {
+    "design": "Per-arena speculative capacity clipping",
+    "parentFittingNativeHistories": 152,
+    "peakIncreases": 41,
+    "exampleBytes": [18213625, 26687889],
+    "evidence": "Earlier raw probe,CPU and partial gates retained under ../rebased and ../recovery;superseded by recovery design."
   },
-  "reproduction": "TMPDIR=<scratch> node scripts/hash-transition-cpu.mts <built-control> <built-candidate> <raw-output.json> <controlSHA> <candidateSHA>",
+  "hashes": {
+    "cpu-final.json": "3463edf351381d640a1d6e493d25fa02df71628a2b0e042658b7b75a4e8a8d40",
+    "control-runtime-hashes.json": "eb44f38e28c873ecd12a5c30cdb1153bf8276b6ae3be72c3d64902376b32fee1",
+    "candidate-runtime-hashes.json": "ffd5545ab41b339cf567907bb72cf177493233ed8b830f506d7d2affba7f4826",
+    "mutants.json": "5b0780e16c6cfb22b376289b97d59da78c60bf9595e2903a4c15ca3e37c45f55",
+    "node22.log": "2be3a8bc6396486aec1f40cd95ebdef7f6909531b3999e70d264386d8d4607aa",
+    "hash-transition-worker.mts": "9200f50e6dfd57ce13335f25efe1d3f5de1b05d5f12303cbf2c1e81df6d70b02",
+    "hash-transition-cpu.mts": "3fa6056b084796339c7ca8d95759ef9ebebca61efc7b62e7d4bde7e68ddd101e",
+    "parent-peak.test.ts": "f31c56a93946fd26abff3f4488440ba63b7f48aa2a343bc1a1ef354e4593ebaa"
+  },
+  "reproduction": "TMPDIR=<scratch> node scripts/hash-transition-cpu.mts <built-main> <built-candidate> <raw-output.json> <mainSHA> <candidateSHA>",
   "limits": [
-    "No throughput/browser/RSS or accepted CPU improvement claim.",
-    "48 unchanged complete-minimum-over-cap refusals remain in the 416-case matrix.",
-    "Pre-rebase guard campaigns remain under the parent cache directory; this summary uses current main.",
-    "Raw samples, comparison matrix and source archives remain under /home/eric/.cache/b4-hash-transition/rebased."
+    "48unchanged complete-minimum-over-cap refusals in416case matrix.",
+    "No accepted CPU improvement,format/API/transition-order/browser/RSS/throughput claim.",
+    "Raw samples/source/runtime archives stay under /home/eric/.cache/b4-hash-transition/final;earlier attempts retained."
   ]
 }
