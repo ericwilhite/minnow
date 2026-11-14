@@ -359,6 +359,9 @@ class RecordingStatement implements Statement {
     this.view = viewOf(statementBound(1), catalogVersion);
     this.catalog = this.view.catalog;
   }
+  readOwn(): never {
+    throw new Error("prefix reads are not in this recording example");
+  }
   table(tableId: number): TableWriter {
     this.calls.push(`table:${String(tableId)}`);
     const insert = (batch: Batch, written: Selection | null): number => {

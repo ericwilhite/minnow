@@ -6523,3 +6523,19 @@ export const IDENTITY_ALWAYS_REACH = [
   "plain",
   "quoted",
 ] as const;
+
+export const TRIGGER_PREFIX_REACH = [
+  "independent pins",
+  "expired writer refused",
+  "published",
+  "resident",
+  "start view unchanged",
+  "prefix rewrite",
+  "foreign pin refused",
+  "released pin refused",
+  "rollback",
+  "commit",
+  "end releases pin",
+  "multiple bodies",
+  "one body",
+] as const;

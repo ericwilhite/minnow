@@ -38,7 +38,13 @@ import {
   type TableWriteOptions,
   type TableWriter,
 } from "../access/modify.js";
-import { MAX_STATEMENTS, pendingSeq, statementBound, PENDING_BASE } from "../access/snapshot.js";
+import {
+  type Snapshot,
+  MAX_STATEMENTS,
+  pendingSeq,
+  statementBound,
+  PENDING_BASE,
+} from "../access/snapshot.js";
 import {
   TransactionStateError,
   type CommitReceipt,
@@ -747,6 +753,24 @@ export class StatementImpl implements Statement {
   }
 
   #current: SnapshotImpl | null = null;
+  #ownReads: Set<SnapshotImpl> | null = null;
+  #ownOrigins: WeakSet<SnapshotImpl> | null = null;
+
+  readOwn(): SnapshotImpl {
+    this.#checkOpen();
+    const view = this.#fresh(() => this.#ownReads?.delete(view));
+    (this.#ownReads ??= new Set()).add(view);
+    (this.#ownOrigins ??= new WeakSet()).add(view);
+    return view;
+  }
+  /** Native origin check, shared by construction and locator use; never trust matching IDs. */
+  writerView(view: Snapshot): SnapshotImpl {
+    this.#checkOpen();
+    if (!(view instanceof SnapshotImpl) || !this.#ownOrigins?.has(view))
+      throw new TransactionStateError("A writer inputView must come from this statement's readOwn");
+    view.check();
+    return view;
+  }
 
   /**
    * A view of everything committed and pending, for checks: one per statement, replaced when the
@@ -766,7 +790,7 @@ export class StatementImpl implements Statement {
     return this.#current;
   }
 
-  #fresh(): SnapshotImpl {
+  #fresh(onRelease?: () => void): SnapshotImpl {
     return new SnapshotImpl({
       state: this.tx.hooks.state(),
       bound: ALL,
@@ -775,11 +799,18 @@ export class StatementImpl implements Statement {
       shared: this.tx.hooks.shared,
       label: `${this.tx.hooks.label()}/checks`,
       statementView: false,
+      ...(onRelease === undefined ? {} : { onRelease }),
     });
   }
 
   table(tableId: number, options: TableWriteOptions = {}): TableWriterImpl {
     if (this.#state !== "open") throw new TransactionStateError(`The statement is ${this.#state}`);
+    if (options.inputView !== undefined) {
+      const def = this.tx.catalog.table(tableId);
+      if (def === undefined) throw new RangeError(`Table ${String(tableId)} does not exist`);
+      // A body owns this writer/pin pair; never alias it with the start-view writer cache.
+      return new TableWriterImpl(this, def, options);
+    }
     // The common case (no options, the same table again) skips the keyed lookup.
     const plain = options.assigned === undefined && options.onRepeat === undefined;
     if (plain && this.#plain?.tableId === tableId) return this.#plain;
@@ -910,6 +941,9 @@ export class StatementImpl implements Statement {
   }
 
   #releaseViews(): void {
+    for (const view of this.#ownReads ?? []) view.releaseInternal();
+    this.#ownReads = null;
+    this.#ownOrigins = null;
     this.#view?.releaseInternal();
     this.#view = null;
     this.#current?.releaseInternal();
@@ -1113,6 +1147,7 @@ export class TableWriterImpl implements TableWriter {
   readonly #keys: KeyBatch;
   readonly #assigned: readonly number[];
   readonly #onRepeat: "error" | "first";
+  readonly #inputView: SnapshotImpl | null;
   /** Indexes of other tables' foreign keys that reference this table's keys. */
   readonly #referenced: ReadonlySet<number>;
 
@@ -1124,6 +1159,8 @@ export class TableWriterImpl implements TableWriter {
     this.tableId = def.id;
     this.#keys = statement.tx.hooks.keys;
     this.#assigned = options.assigned ?? [];
+    this.#inputView =
+      options.inputView === undefined ? null : statement.writerView(options.inputView);
     this.#onRepeat = options.onRepeat ?? "error";
     this.#referenced = referencedIndexes(statement.catalog, def.id);
   }
@@ -1715,7 +1752,9 @@ export class TableWriterImpl implements TableWriter {
       locators.type.kind !== "locator"
     )
       throw new TypeError("Column 0 must be a flat locator vector");
-    const view = this.statement.view.internalTable(this.tableId);
+    const snapshot = this.#inputView ?? this.statement.view;
+    snapshot.check();
+    const view = snapshot.internalTable(this.tableId);
     let touched = this.statement.touched.get(this.tableId);
     if (touched === undefined) {
       touched = new Set();

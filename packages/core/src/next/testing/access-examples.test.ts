@@ -535,6 +535,9 @@ function recordingStatement(existing: ReadonlyMap<number, number>): {
     ordinal: 1,
     view: readSnapshot(),
     catalog,
+    readOwn: () => {
+      throw new Error("prefix reads are not in this recording example");
+    },
     table: () => writer,
     changeCatalog: () => ({ id: null }),
     end: async () => {

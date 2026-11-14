@@ -748,3 +748,14 @@ predecessor exists. Native-only DEFAULT assignment markers cover upsert and MERG
 identity/default/NULL declarations refuse42601. Existing generated-column assignment rules
 and SQL BY DEFAULT/SERIAL explicit-value behavior are unchanged. Runtime sequence execution
 remains the owner/executor's existing integration responsibility, not a generic DML enablement.
+
+### Trigger current-prefix write seam (B6 / B5b)
+
+`Statement.readOwn()` returns a separately owned native pin including the root statement's
+writes, distinct from the internal constraint-check pin and the root start view. A body fully
+consumes/spools its read input before mutation; concurrent reads and writes within one statement
+are not supported. `TableWriteOptions.inputView` accepts only that statement's pins and resolves
+UPDATE/DELETE locators in their view. Those writers bypass the ordinary start-view cache.
+Released/foreign pins refuse, and root end/rollback invalidates all remaining body pins. Origin
+tracking is weak; released snapshots do not accumulate in the statement's active-read set.
+This is an internal adapter seam, not CREATE TRIGGER lowering or general DML enablement.

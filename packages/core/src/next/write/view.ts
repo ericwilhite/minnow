@@ -887,6 +887,8 @@ export interface SnapshotParts {
   readonly label: string;
   /** Statement views are released by their statement only. */
   readonly statementView: boolean;
+  /** Internal statement-owned prefix pins retire their owner's strong reference on release. */
+  readonly onRelease?: () => void;
 }
 
 export class SnapshotImpl implements Snapshot {
@@ -901,6 +903,7 @@ export class SnapshotImpl implements Snapshot {
   readonly #reader: number;
   readonly #statementView: boolean;
   #released = false;
+  #onRelease: (() => void) | undefined;
   // Made on first use: most write-path views read one table through one index, or nothing.
   #indexes: Map<string, ViewIndex> | null = null;
   #tables: Map<number, TableSnapshotImpl> | null = null;
@@ -917,6 +920,7 @@ export class SnapshotImpl implements Snapshot {
     this.#pin = parts.shared.pinState(parts.state, parts.label);
     this.#reader = parts.shared.readers.open();
     this.#statementView = parts.statementView;
+    this.#onRelease = parts.onRelease;
   }
 
   get released(): boolean {
@@ -1014,6 +1018,9 @@ export class SnapshotImpl implements Snapshot {
   releaseInternal(): void {
     if (this.#released) return;
     this.#released = true;
+    const notify = this.#onRelease;
+    this.#onRelease = undefined;
+    notify?.();
     if (this.#holds !== null) for (const held of this.#holds) held.release();
     this.#holds = null;
     if (this.#handed !== null) for (const table of this.#handed) table.endBorrows();
