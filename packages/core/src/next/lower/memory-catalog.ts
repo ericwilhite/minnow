@@ -4,6 +4,7 @@
  * ids as the contract says (never reused) and bumps `version` on every change. It does not
  * validate data (NOT NULL over existing rows, type changes): that is the write path's job.
  */
+import { validateTriggerCatalog, type TriggerDef } from "../access/trigger-def.js";
 import type {
   CatalogChange,
   CatalogView,
@@ -34,6 +35,7 @@ class Snapshot implements CatalogView {
     readonly sequences: readonly SequenceDef[],
     readonly views: readonly ViewDef[],
     readonly types: readonly TypeDef[] = [],
+    readonly triggers: readonly TriggerDef[] = [],
   ) {}
   table(tableId: number): TableDef | undefined {
     return this.tables.find((table) => table.id === tableId);
@@ -176,6 +178,7 @@ export class MemoryCatalog {
         parentIndexId: found,
         supportIndexId: null,
         onDelete: key.onDelete,
+        onUpdate: key.onUpdate ?? "follow",
         enforced: key.enforced,
       };
     });
@@ -208,8 +211,22 @@ export class MemoryCatalog {
     let sequences = view.sequences;
     let views = view.views;
     let types = view.types;
+    let triggers = view.triggers;
     let created: number | null = null;
     switch (change.kind) {
+      case "createTrigger": {
+        if (triggers.some((t) => t.name === change.trigger.name))
+          throw new CatalogChangeError("Trigger exists");
+        const def = { ...change.trigger, id: this.#id() };
+        triggers = [...triggers, def];
+        created = def.id;
+        break;
+      }
+      case "dropTrigger":
+        if (!triggers.some((t) => t.id === change.triggerId))
+          throw new CatalogChangeError("Unknown trigger");
+        triggers = triggers.filter((t) => t.id !== change.triggerId);
+        break;
       case "createTable": {
         if (this.#nameTaken(change.table.name))
           throw new CatalogChangeError(`${change.table.name} exists`);
@@ -272,6 +289,7 @@ export class MemoryCatalog {
         break;
       }
       case "dropTable":
+        triggers = triggers.filter((t) => t.tableId !== change.tableId);
         if (view.table(change.tableId) === undefined) throw new CatalogChangeError("No such table");
         tables = tables.filter((table) => table.id !== change.tableId);
         sequences = sequences.filter((sequence) => sequence.ownedBy?.tableId !== change.tableId);
@@ -368,7 +386,8 @@ export class MemoryCatalog {
         views = views.filter((entry) => entry.id !== change.viewId);
         break;
     }
-    this.#view = new Snapshot(view.version + 1, tables, sequences, views, types);
+    validateTriggerCatalog({ tables, triggers, types, sequences });
+    this.#view = new Snapshot(view.version + 1, tables, sequences, views, types, triggers);
     return { id: created };
   }
 }

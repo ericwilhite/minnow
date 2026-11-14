@@ -252,6 +252,14 @@ const documentedSqlCases: DocumentedSqlCase[] = [
     file: "sql/dml.mdx",
     block: 18,
     setup: [
+      "CREATE TABLE parents (id INTEGER PRIMARY KEY)",
+      "CREATE TABLE children (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parents(id) ON DELETE CASCADE, value INTEGER CHECK(value > 0))",
+    ],
+  },
+  {
+    file: "sql/dml.mdx",
+    block: 19,
+    setup: [
       "CREATE TABLE stock (sku TEXT PRIMARY KEY, on_hand INTEGER)",
       "CREATE TABLE shipments (sku TEXT, qty INTEGER, at TIMESTAMP)",
       "INSERT INTO stock VALUES ('A-1', 2)",
@@ -260,7 +268,7 @@ const documentedSqlCases: DocumentedSqlCase[] = [
   },
   {
     file: "sql/dml.mdx",
-    block: 19,
+    block: 20,
     setup: [
       "CREATE TABLE stock (sku TEXT PRIMARY KEY, on_hand INTEGER)",
       "CREATE TABLE delivery (sku TEXT, qty INTEGER)",
@@ -363,10 +371,10 @@ describe("the other SQL guides' examples", () => {
     const blocksByFile = new Map(
       files.map((file) => [file, sqlBlocks(`${docsRoot}/${file}`)] as const),
     );
-    expect([...blocksByFile.values()].reduce((count, blocks) => count + blocks.length, 0)).toBe(47);
+    expect([...blocksByFile.values()].reduce((count, blocks) => count + blocks.length, 0)).toBe(48);
     expect(
       new Set(documentedSqlCases.map(({ file, block }) => `${file}#${String(block)}`)).size,
-    ).toBe(47);
+    ).toBe(48);
 
     const failures: string[] = [];
     for (const testCase of documentedSqlCases) {

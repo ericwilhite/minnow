@@ -316,6 +316,7 @@ export function currentDirectoryFixture(
           // These archived JSON recipes predate FTS. Supply current logical declarations,
           // never defaults in the ordinary stored decoder or an old-root upgrade path.
           fts: [],
+          triggers: [],
           counters: { ...legacy.counters, nextFtsId: 1 },
         }).encode();
         const extents = recipe.extentList

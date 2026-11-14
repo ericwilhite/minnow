@@ -57,6 +57,11 @@ import {
   decodeCatalogChange,
   type CatalogStreamData,
 } from "./catalog-stream.js";
+import {
+  validateTriggerDef,
+  validateTriggerCatalog,
+  type TriggerDef,
+} from "../access/trigger-def.js";
 import { validateFtsDef, type FtsDef } from "../access/fts-def.js";
 import { DurableFormatError } from "../durable-format.js";
 import { retainCatalogExtensions, UnsupportedCatalogError } from "./catalog-records.js";
@@ -72,6 +77,7 @@ export interface CatalogCounters {
   readonly nextViewId: number;
   readonly nextTypeId: number;
   readonly nextFtsId: number;
+  readonly nextTriggerId: number;
 }
 
 const FIRST_COUNTERS: CatalogCounters = {
@@ -83,6 +89,7 @@ const FIRST_COUNTERS: CatalogCounters = {
   nextViewId: 1,
   nextTypeId: 1,
   nextFtsId: 1,
+  nextTriggerId: 1,
 };
 
 /** A change as the log carries it: every id resolved, nothing left to validate. */
@@ -110,7 +117,9 @@ export type CatalogOperation =
   | { readonly op: "dropType"; readonly typeId: number }
   | { readonly op: "createFts"; readonly fts: FtsDef }
   | { readonly op: "upsertFts"; readonly fts: FtsDef }
-  | { readonly op: "dropFts"; readonly ftsId: number };
+  | { readonly op: "dropFts"; readonly ftsId: number }
+  | { readonly op: "createTrigger"; readonly trigger: TriggerDef }
+  | { readonly op: "dropTrigger"; readonly triggerId: number };
 
 /** Every WAL operation binds its predecessor and its live-assigned resulting version. */
 export type LoggedChange = CatalogOperation & {
@@ -152,6 +161,7 @@ export class Catalog implements CatalogView {
   readonly views: readonly ViewDef[];
   readonly types: readonly TypeDef[];
   readonly fts: readonly FtsDef[];
+  readonly triggers: readonly TriggerDef[];
   readonly wireMetadata?: unknown;
   readonly #tables: ReadonlyMap<number, TableDef>;
   readonly #tablesByName: ReadonlyMap<string, TableDef>;
@@ -168,6 +178,7 @@ export class Catalog implements CatalogView {
     this.views = data.views;
     this.types = data.types;
     this.fts = data.fts;
+    this.triggers = data.triggers;
     this.#tables = new Map(data.tables.map((table) => [table.id, table]));
     this.#tablesByName = new Map(data.tables.map((table) => [table.name, table]));
     this.#sequences = new Map(data.sequences.map((sequence) => [sequence.id, sequence]));
@@ -183,6 +194,7 @@ export class Catalog implements CatalogView {
       views: [],
       types: [],
       fts: [],
+      triggers: [],
     });
   }
 
@@ -224,6 +236,7 @@ export class Catalog implements CatalogView {
       views: this.views,
       types: this.types,
       fts: this.fts,
+      triggers: this.triggers,
     };
   }
 
@@ -267,6 +280,16 @@ export class Catalog implements CatalogView {
 
   #plan(change: CatalogChange): CatalogOperation[] {
     switch (change.kind) {
+      case "createTrigger":
+        if (this.triggers.some((t) => t.name === change.trigger.name))
+          throw new CatalogChangeError(`Trigger ${change.trigger.name} already exists`);
+        return [
+          { op: "createTrigger", trigger: { ...change.trigger, id: this.counters.nextTriggerId } },
+        ];
+      case "dropTrigger":
+        if (!this.triggers.some((t) => t.id === change.triggerId))
+          throw new CatalogChangeError("Unknown trigger identity");
+        return [{ op: "dropTrigger", triggerId: change.triggerId }];
       case "createFts":
         return [{ op: "createFts", fts: { ...change.fts, id: this.counters.nextFtsId } }];
       case "upsertFts":
@@ -282,6 +305,12 @@ export class Catalog implements CatalogView {
       case "dropTable": {
         const table = this.#requireTable(change.tableId);
         this.#requireUnreferenced("table", table.id);
+        if (
+          this.triggers.some(
+            (t) => t.tableId !== table.id && t.statements.some((b) => b.targetTableId === table.id),
+          )
+        )
+          throw new CatalogChangeError(`Table ${table.name} is a trigger target`);
         for (const other of this.tables)
           for (const fk of other.foreignKeys)
             if (fk.parentTableId === table.id && other.id !== table.id && fk.enforced)
@@ -566,6 +595,7 @@ export class Catalog implements CatalogView {
               prior.parentTableId === key.parentTableId &&
               prior.parentIndexId === key.parentIndexId &&
               prior.onDelete === key.onDelete &&
+              prior.onUpdate === (key.onUpdate ?? "follow") &&
               prior.columnIds.length === key.columns.length &&
               prior.columnIds.every((id, i) => id === input.columns[key.columns[i] ?? -1]?.id),
           ),
@@ -573,6 +603,26 @@ export class Catalog implements CatalogView {
     )
       throw new CatalogChangeError("Changing enforced foreign keys requires data validation");
     const operations = this.#planCreateTable(input, before);
+    for (const op of operations)
+      if (op.op === "createTable") {
+        try {
+          validateTriggerCatalog({
+            ...this.#data(),
+            tables: this.tables.map((t) => (t.id === before.id ? op.table : t)),
+            sequences: [
+              ...this.sequences.filter(
+                (s) =>
+                  s.ownedBy?.tableId !== before.id ||
+                  op.table.columns.some((c) => c.identitySequence === s.id),
+              ),
+              ...op.sequences,
+            ],
+          });
+        } catch (error) {
+          if (error instanceof StoreCorruptionError) throw new CatalogChangeError(error.message);
+          throw error;
+        }
+      }
     return operations.map((operation) =>
       operation.op === "createTable" ? { ...operation, op: "alterTable" as const } : operation,
     );
@@ -780,6 +830,7 @@ export class Catalog implements CatalogView {
         parentIndexId: parentIndex.id,
         supportIndexId,
         onDelete: input_.onDelete,
+        onUpdate: input_.onUpdate ?? "follow",
         enforced: input_.enforced,
       });
     }
@@ -821,8 +872,26 @@ export class Catalog implements CatalogView {
     const bump = (key: keyof CatalogCounters, used: number) => {
       counters[key] = Math.max(counters[key], used + 1);
     };
-    let { tables, sequences, views, types, fts } = data;
+    let { tables, sequences, views, types, fts, triggers } = data;
     switch (change.op) {
+      case "createTrigger": {
+        const def = change.trigger;
+        validateTriggerDef(def);
+        if (
+          def.id < counters.nextTriggerId ||
+          def.id >= Number.MAX_SAFE_INTEGER ||
+          triggers.some((t) => t.name === def.name)
+        )
+          throw new StoreCorruptionError("Invalid trigger identity/name allocation");
+        bump("nextTriggerId", def.id);
+        triggers = [...triggers, def];
+        break;
+      }
+      case "dropTrigger":
+        if (!triggers.some((t) => t.id === change.triggerId))
+          throw new StoreCorruptionError("Unknown dropped trigger identity");
+        triggers = triggers.filter((t) => t.id !== change.triggerId);
+        break;
       case "createFts":
       case "upsertFts": {
         const def = change.fts;
@@ -884,6 +953,7 @@ export class Catalog implements CatalogView {
         break;
       }
       case "dropTable":
+        triggers = triggers.filter((t) => t.tableId !== change.tableId);
         fts = fts.filter((def) => def.tableId !== change.tableId);
         tables = tables.filter((table) => table.id !== change.tableId);
         sequences = sequences.filter((sequence) => sequence.ownedBy?.tableId !== change.tableId);
@@ -948,6 +1018,7 @@ export class Catalog implements CatalogView {
         types = types.filter((type) => type.id !== change.typeId);
         break;
     }
+    validateTriggerCatalog({ tables, triggers, types, sequences });
     return new Catalog({
       wireMetadata: this.wireMetadata,
       version,
@@ -957,6 +1028,7 @@ export class Catalog implements CatalogView {
       views,
       types,
       fts,
+      triggers,
     });
   }
 
@@ -979,7 +1051,19 @@ export class Catalog implements CatalogView {
       data.sequences.length +
       data.views.length +
       data.types.length +
-      data.fts.length;
+      data.fts.length +
+      data.triggers.length;
+    for (const trigger of data.triggers)
+      for (const body of trigger.statements)
+        entries +=
+          1 +
+          body.bindings.length +
+          body.columns.length +
+          body.typeIds.length +
+          body.sequenceIds.length +
+          body.insertColumnIds.length +
+          body.defaultColumnIds.length +
+          body.assignedColumnIds.length;
     for (const table of data.tables)
       entries +=
         table.columns.length +
@@ -1089,6 +1173,11 @@ function validateStoredCatalog(data: CatalogData): void {
   ids(data.views, data.counters.nextViewId, "view");
   ids(data.types, data.counters.nextTypeId, "type");
   ids(data.fts, data.counters.nextFtsId, "FTS");
+  ids(data.triggers, data.counters.nextTriggerId, "trigger");
+  for (const trigger of data.triggers)
+    for (const body of trigger.statements)
+      for (const ref of [...body.bindings, ...body.columns]) validateCatalogType(ref.type);
+  validateTriggerCatalog(data);
   const bindings = new Set<string>();
   let previousFtsId = 0;
   for (const def of data.fts) {
@@ -1208,6 +1297,8 @@ function createdId(change: LoggedChange | null): number | null {
       return change.view.id;
     case "createType":
       return change.type.id;
+    case "createTrigger":
+      return change.trigger.id;
     case "createFts":
       return change.fts.id;
     default:
@@ -1373,6 +1464,12 @@ function validateStoredTable(table: TableDef): void {
       "stored foreign-key action",
       StoreCorruptionError,
     );
+    requireTag(
+      foreignKey.onUpdate,
+      DURABLE_CODECS.foreignKeyUpdateAction,
+      "stored foreign-key update action",
+      StoreCorruptionError,
+    );
   }
 }
 
@@ -1406,10 +1503,23 @@ export function decodeLogged(bytes: Uint8Array): LoggedChange {
       )
         throw new StoreCorruptionError(`Unexpected logged catalog field ${name}`);
     const record = value as unknown as Record<string, unknown>;
-    for (const name of ["tableId", "indexId", "sequenceId", "viewId", "typeId", "ftsId"] as const) {
+    for (const name of [
+      "tableId",
+      "indexId",
+      "sequenceId",
+      "viewId",
+      "typeId",
+      "ftsId",
+      "triggerId",
+    ] as const) {
       const id = record[name];
       if (name in record && !(typeof id === "number" && id > 0))
         throw new StoreCorruptionError(`Invalid logged catalog id ${name}`);
+    }
+    if (value.op === "createTrigger") {
+      validateTriggerDef(value.trigger);
+      for (const body of value.trigger.statements)
+        for (const ref of [...body.bindings, ...body.columns]) validateCatalogType(ref.type);
     }
     if (value.op === "createFts" || value.op === "upsertFts") validateFtsDef(value.fts);
     if (value.op === "createTable" || value.op === "alterTable") validateStoredTable(value.table);

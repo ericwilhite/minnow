@@ -119,6 +119,11 @@ because it says what happens anyway; `ON UPDATE RESTRICT`, `NO ACTION`, `SET NUL
 `SET DEFAULT` are rejected. Unlike PostgreSQL, a reference with no `ON UPDATE` clause follows too,
 instead of refusing the key change.
 
+At the 1.0 cutover, omitting `ON UPDATE` still follows the parent row. Explicit clauses
+retain their specified action instead: `CASCADE`, `RESTRICT`, `NO ACTION`, `SET NULL`, or
+`SET DEFAULT`. The rebuild catalog distinguishes the implicit follow action from explicit
+`CASCADE`, so a future format change cannot silently replace this product default.
+
 `NOT ENFORCED` keeps the relationship without requiring the parent row to exist, for a table that
 holds only part of its parent's rows. Such a reference takes no `ON DELETE` action but still
 follows a rekey:

@@ -5,6 +5,9 @@ import {
 } from "./identifier-sources.js";
 import {
   rememberAlwaysIdentity,
+  rememberForeignKeyActions,
+  type ForeignKeyActionSource,
+  type ReferentialSourceAction,
   rememberCatalogDrop,
   builtInCatalogType,
   rememberCatalogDeclarations,
@@ -2297,6 +2300,11 @@ export function compileStatement(sql: string): CompiledStatement {
       (keyword === "CREATE" || keyword === "DROP") &&
       second?.kind === "identifier" &&
       second.text.toUpperCase() === "TRIGGER";
+    if (recordDeclaredTypes && isTriggerDdl) {
+      const name = tokens[2];
+      if (name?.kind === "identifier" && name.quoted !== true)
+        tokens[2] = { ...name, text: name.text.toLowerCase() };
+    }
     if (!isTriggerDdl) rejectSemicolons(tokens);
     if (
       keyword === "BEGIN" ||
@@ -9061,7 +9069,9 @@ class Parser {
   /**
    * `REFERENCES parent(column) [ON DELETE action] [ON UPDATE CASCADE] [NOT ENFORCED]` (E141-04,
    * T191). A reference always follows its parent's rekey, so `ON UPDATE CASCADE` states what
-   * happens anyway and every other `ON UPDATE` action is refused rather than silently ignored.
+   * happens anyway and every other `ON UPDATE` action is refused on the shipped path.
+   * Native capture retains all explicit actions outside the published DTO, and records
+   * omitted ON UPDATE as the product's follow behavior.
    * `NOT ENFORCED` keeps the relationship without requiring the parent row to exist, the way
    * `enforced: false` does in the schema API.
    */
@@ -9081,23 +9091,41 @@ class Parser {
       throw new TypeError("FOREIGN KEY and REFERENCES must name the same number of columns");
     }
     let onDelete: ForeignKeyDefinition["onDelete"] = "restrict";
+    const nativeActions:
+      | {
+          onDelete: ReferentialSourceAction;
+          onUpdate: ForeignKeyActionSource["onUpdate"];
+        }
+      | undefined = recordDeclaredTypes ? { onDelete: "no action", onUpdate: "follow" } : undefined;
+    let seenDelete = false,
+      seenUpdate = false;
     let enforced = true;
     for (;;) {
       if (this.#isKeyword("ON")) {
         this.#keyword("ON");
         const event = this.#isKeyword("DELETE") ? "delete" : "update";
         this.#keyword(event === "delete" ? "DELETE" : "UPDATE");
-        if (event === "update") {
+        if (recordDeclaredTypes && (event === "delete" ? seenDelete : seenUpdate))
+          throw new TypeError(`Multiple ON ${event.toUpperCase()} clauses are not allowed`);
+        if (event === "delete") seenDelete = true;
+        else seenUpdate = true;
+        if (event === "update" && !recordDeclaredTypes) {
           if (!this.#isKeyword("CASCADE")) {
             const action = this.#referentialAction();
             throw new TypeError(
-              `ON UPDATE ${action === "restrict" ? "RESTRICT / NO ACTION" : action.toUpperCase()} is not supported: a rekey always moves its references (use ON UPDATE CASCADE or omit the clause)`,
+              `ON UPDATE ${action === "restrict" || action === "no action" ? "RESTRICT / NO ACTION" : action.toUpperCase()} is not supported: a rekey always moves its references (use ON UPDATE CASCADE or omit the clause)`,
             );
           }
           this.#keyword("CASCADE");
           continue;
         }
-        onDelete = this.#referentialAction();
+        const action = this.#referentialAction();
+        if (event === "update") {
+          if (nativeActions) nativeActions.onUpdate = action;
+        } else {
+          if (nativeActions) nativeActions.onDelete = action;
+          onDelete = action === "no action" || action === "set default" ? "restrict" : action;
+        }
         continue;
       }
       if (this.#isKeyword("ENFORCED")) {
@@ -9119,10 +9147,15 @@ class Parser {
       }
       break;
     }
-    if (!enforced && onDelete !== "restrict") {
+    if (
+      !enforced &&
+      (nativeActions
+        ? nativeActions.onDelete !== "restrict" && nativeActions.onDelete !== "no action"
+        : onDelete !== "restrict")
+    ) {
       throw new TypeError("A NOT ENFORCED foreign key cannot declare an ON DELETE action");
     }
-    return {
+    const key: ForeignKeyDefinition = {
       name,
       column: columns[0] ?? "",
       ...(columns.length === 1 ? {} : { columns }),
@@ -9131,9 +9164,11 @@ class Parser {
       onDelete,
       ...(enforced ? {} : { enforced: false }),
     };
+    if (nativeActions) rememberForeignKeyActions(key, nativeActions);
+    return key;
   }
 
-  #referentialAction(): ForeignKeyDefinition["onDelete"] {
+  #referentialAction(): ReferentialSourceAction {
     if (this.#isKeyword("CASCADE")) {
       this.#keyword("CASCADE");
       return "cascade";
@@ -9141,7 +9176,10 @@ class Parser {
     if (this.#isKeyword("SET")) {
       this.#keyword("SET");
       if (this.#isKeyword("DEFAULT")) {
-        throw new TypeError("SET DEFAULT is not supported; use SET NULL or CASCADE");
+        if (!recordDeclaredTypes)
+          throw new TypeError("SET DEFAULT is not supported; use SET NULL or CASCADE");
+        this.#keyword("DEFAULT");
+        return "set default";
       }
       this.#keyword("NULL");
       return "set null";
@@ -9149,7 +9187,7 @@ class Parser {
     if (this.#isKeyword("NO")) {
       this.#keyword("NO");
       this.#keyword("ACTION");
-      return "restrict";
+      return "no action";
     }
     this.#keyword("RESTRICT");
     return "restrict";

@@ -43,7 +43,13 @@ export function describeForeignKey(key: ForeignKeyInfo): string {
   const from = key.columns.join(", ");
   const to = `${key.parentTable}.${key.parentColumns.join(", ")}`;
   const rule = key.onDelete === "restrict" ? "" : ` · on delete ${key.onDelete}`;
-  return `${from} → ${to}${rule}${key.enforced ? "" : " · not enforced"}`;
+  const update =
+    key.onUpdate === undefined
+      ? ""
+      : key.onUpdate === "follow"
+        ? " · follows rekeys (default)"
+        : ` · on update ${key.onUpdate}`;
+  return `${from} → ${to}${rule}${update}${key.enforced ? "" : " · not enforced"}`;
 }
 
 /**

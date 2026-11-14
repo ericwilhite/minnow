@@ -191,9 +191,10 @@ version gaps from rolled-back DDL. DROP TABLE carries its MCHG definition too.
 
 The manifest names the catalog tree, not a JSON blob. Reachability checks child depth and
 summaries plus contiguous fragment offsets, and reclamation retires every old index/data page.
-The reader/manifest/commit-body development selectors are 5/6/4; older unpublished selectors
-refuse. The released 1.0 format has no supported predecessor yet. Trigger family20 remains
-reserved. FTS declarations persist without making an index ready. Snapshot catalog frame
+The reader/manifest/commit-body development selectors are 7/8/6; older unpublished selectors
+refuse. The released 1.0 format has no supported predecessor yet. Trigger family20 now carries dialect-versioned bodies and stable OLD/NEW/target dependencies
+(body30/binding31/column32). Definitions and CREATE/DROP lowering persist through WAL and
+checkpoint; trigger scheduling/body execution is the next integration unit. FTS declarations persist without making an index ready. Snapshot catalog frame
 adapters are a separate integration step over the same portable MCAT stream.
 
 ### Relational catalog and managed migration
@@ -207,7 +208,7 @@ bodies and both recursive arms without executing them. Explicit stable enum-to-t
 refuse stored generation; implicit assignment follows PostgreSQL’s separate coercion rule. The codec validates ordered dependencies,
 references, ownership and cycles before exposing stored definitions. Semantic extension fields
 may be absent but, when present, carry the required wire flag; they are never display extensions.
-These additions select reader5/manifest6/commitBody4 before any write. They change only
+The required effective-FK-action field selects reader7/manifest8/commitBody6 before any write. This changes only
 unreleased development formats; the first released1.0 writer starts the supported chain.
 
 `composeEngine().migrate()` is the owner-local schema bridge. It uses the existing schema planner
@@ -222,7 +223,8 @@ horizon; unused reserved values may be skipped after recovery.
 
 Limits: general `modify` IR execution is still outside this catalog stage. SQL/DSL definition
 and query differentials use PGlite; native TableWriter/persistence tests do not claim SQL DML
-execution. ALWAYS identity and identity options refuse with 0A000 instead of losing the clause.
+execution. ALWAYS identity retains its generation mode and rejects explicit assignments; identity options
+still refuse with 0A000 instead of losing the clause.
 Named enums that shadow an underlying built-in `pg_type` name require SQL namespaces and
 explicitly refuse; quoted aliases such as `"integer"` retain their separate enum identity.
 Named types accept at most 65,536 labels (the current two-byte native sort rank), each at
@@ -3831,3 +3833,12 @@ Required feature1 marks a stream containing declarations. Unknown semantic versi
 optional display extensions survive copies/replay. Definition fields8..15 and families27/28
 remain reserved rather than silently storing future semantics or native lease/coverage state.
 Snapshots will rebuild postings from rows; this stage only supplies the portable definition.
+
+### FK action provenance
+
+Native foreign-key records preserve exact explicit DELETE/UPDATE actions. An omitted
+ON UPDATE is stored as `follow`, distinct from explicit CASCADE and from PostgreSQL's
+NO ACTION default. The schema inspector exposes these modes and stored trigger identities.
+MCAT foreignKey10's required field9 carries onUpdate; these development bytes need the
+next pre-fence selector allocation before publication. Native RI execution/trigger firing
+remain the separate joint B6/B5b consumer described in the inventory.

@@ -313,6 +313,7 @@ function catalogAt(version: number): CatalogView {
     views: [],
     types: [],
     fts: [],
+    triggers: [],
     table: () => undefined,
     tableByName: () => undefined,
     sequence: () => undefined,

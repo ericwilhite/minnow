@@ -65,7 +65,9 @@ export interface CatalogForeignKey {
   readonly columns: readonly string[];
   readonly parentTable: string;
   readonly parentColumns: readonly string[];
-  readonly onDelete: "restrict" | "cascade" | "set null";
+  readonly onDelete: "restrict" | "cascade" | "set null" | "no action" | "set default";
+  /** Native 1.0 catalogs retain the effective action. Omission's product default is follow. */
+  readonly onUpdate?: "follow" | "restrict" | "cascade" | "set null" | "no action" | "set default";
   /** Whether writes and parent deletes enforce this relationship. */
   readonly enforced: boolean;
 }

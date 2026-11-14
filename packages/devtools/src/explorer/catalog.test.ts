@@ -111,6 +111,7 @@ describe("toCatalog", () => {
                 parentTable: "people",
                 parentColumns: ["id"],
                 onDelete: "restrict",
+                onUpdate: "set null",
                 enforced: true,
               },
             ],
@@ -138,6 +139,7 @@ describe("toCatalog", () => {
     ]);
     const people = catalog[0];
     expect(people?.foreignKeys?.[0]?.parentTable).toBe("people");
+    expect(people?.foreignKeys?.[0]?.onUpdate).toBe("set null");
     expect(people?.checks).toEqual([{ name: "positive", sql: "id > 0" }]);
     expect(people?.triggers).toEqual([{ name: "audit", event: "insert", timing: "after" }]);
     expect(people?.primaryKey).toEqual(["id"]);

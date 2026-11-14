@@ -64,6 +64,7 @@ import { lowerTableRules } from "./rules.js";
 import { classifyStatement } from "./statement.js";
 import { ctasDataClause } from "./ctas.js";
 import { integerLiteralValue } from "./literals.js";
+import { createTriggerChange, protectTriggerChange } from "./triggers.js";
 import { rowOutputName } from "../../engine/json-call-sources.js";
 
 /** PostgreSQL settings SHOW answers with the current engine's fixed values. */
@@ -282,6 +283,20 @@ function lowerStatement(text: string, context: LoweringContext): LoweredStatemen
       return lowerModify(text, statement, context);
     case "merge":
       return lowerModify(text, statement, context);
+    case "create-trigger": {
+      const change = createTriggerChange(statement, context, (sql, types) => {
+        const parsed = parseAny(sql);
+        if (
+          !("statement" in parsed) ||
+          (parsed.statement.kind !== "insert" &&
+            parsed.statement.kind !== "update" &&
+            parsed.statement.kind !== "delete")
+        )
+          throw unsupported("trigger", "a non-DML trigger body");
+        return lowerModify(sql, parsed.statement, { ...context, parameterTypes: types });
+      });
+      return { ...base, kind: "ddl", parameters: [], change, followUp: null };
+    }
     case "transaction": {
       const modes = transactionModes(statement.modes ?? []);
       return {
@@ -586,6 +601,7 @@ function lowerStatement(text: string, context: LoweringContext): LoweredStatemen
     }
     default: {
       const result = lowerDdl(statement, context.catalog);
+      protectTriggerChange(result.change, context.catalog);
       return {
         ...base,
         kind: "ddl",

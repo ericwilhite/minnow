@@ -117,12 +117,12 @@ for (const store of ["indexeddb", "opfs"] as const satisfies readonly StoreKind[
         compatibleReadAcceptance: 1,
         nonportableReadsAccepted: 29,
         compatibleMutationsCompared: 31,
-        compatibleWritesAccepted: 40,
-        nonportableWritesAccepted: 7,
+        compatibleWritesAccepted: 39,
+        nonportableWritesAccepted: 8,
         // Fixed, independently authored postconditions overlay the acceptance categories above.
         // They cover mutation targets, triggers, transactions, and the highest-risk catalog DDL.
         behaviorProbedFeatures: 79,
-        behaviorProbeSteps: 158,
+        behaviorProbeSteps: 163,
         behaviorProbeOracleComparisons: 2,
         unsupportedRejected: 65,
       });

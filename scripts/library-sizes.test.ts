@@ -48,9 +48,11 @@ describe("compressed download budgets", () => {
     // Catalog/type/identifier/CTE provenance: 573,238 combined gzip bytes.
     // Raise once by 768 over main; audit against b091f51d confirms the client is unchanged
     // and only shared parser/provenance modules grow. No next/ or test input ships.
+    // Exact native FK provenance / schema-action comparison: 573,644 combined gzip bytes.
+    // Raise once by 256; client stays byte-identical and private rebuild inputs stay excluded.
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
-    ).toBeLessThanOrEqual(560 * 1024);
+    ).toBeLessThanOrEqual(560.25 * 1024);
   });
 });

@@ -32,6 +32,7 @@
  *   created; its `parentIndexId` is then `"primary"` or `{ unique: name }` of the same input.
  */
 import type { SqlTypeDescriptor, PhysicalType } from "../types.js";
+import type { TriggerDef } from "./trigger-def.js";
 import type { FtsDef } from "./fts-def.js";
 import type { FlatVector } from "../vector/vector.js";
 
@@ -43,6 +44,7 @@ export interface CatalogView {
   /** Named types (ruling R17.7). */
   readonly types: readonly TypeDef[];
   readonly fts: readonly FtsDef[];
+  readonly triggers: readonly TriggerDef[];
   type(typeId: number): TypeDef | undefined;
   typeByName(name: string): TypeDef | undefined;
   /** By id; undefined when absent (dropped ids are never reused). */
@@ -146,6 +148,9 @@ export interface IndexDef {
   readonly keyLimit?: "scalar" | "tuple";
 }
 
+export type ForeignKeyAction = "restrict" | "noAction" | "cascade" | "setNull" | "setDefault";
+export type ForeignKeyUpdateAction = ForeignKeyAction | "follow";
+
 export interface ForeignKeyDef {
   readonly id: number;
   readonly name: string;
@@ -156,11 +161,10 @@ export interface ForeignKeyDef {
   readonly parentIndexId: number;
   /** The supporting index on `columnIds` (see "Rules"); null when `enforced` is false. */
   readonly supportIndexId: number | null;
-  readonly onDelete: "restrict" | "cascade" | "setNull";
-  /**
-   * A parent rekey (UPDATE of its key) always rewrites the reference in the same statement
-   * (today's behaviour; PostgreSQL's ON UPDATE CASCADE).
-   */
+  readonly onDelete: ForeignKeyAction;
+  /** Omission is recorded as follow, the product row-identity contract, not PG NO ACTION. */
+  readonly onUpdate: ForeignKeyUpdateAction;
+
   readonly enforced: boolean;
 }
 
@@ -234,7 +238,9 @@ export type CatalogChange =
   | { readonly kind: "dropType"; readonly typeId: number }
   | { readonly kind: "createFts"; readonly fts: Omit<FtsDef, "id"> }
   | { readonly kind: "upsertFts"; readonly fts: FtsDef }
-  | { readonly kind: "dropFts"; readonly ftsId: number };
+  | { readonly kind: "dropFts"; readonly ftsId: number }
+  | { readonly kind: "createTrigger"; readonly trigger: Omit<TriggerDef, "id"> }
+  | { readonly kind: "dropTrigger"; readonly triggerId: number };
 
 /**
  * A table definition as DDL supplies it. Existing columns, indexes and constraints keep their ids
@@ -265,10 +271,11 @@ export interface TableInput {
   readonly foreignKeys: ReadonlyArray<
     Omit<
       ForeignKeyDef,
-      "id" | "columnIds" | "supportIndexId" | "parentTableId" | "parentIndexId"
+      "id" | "columnIds" | "supportIndexId" | "parentTableId" | "parentIndexId" | "onUpdate"
     > & {
       readonly id?: number;
       readonly columns: readonly number[];
+      readonly onUpdate?: ForeignKeyUpdateAction;
       /** `"self"`: the table this input defines (ruling R17.7). */
       readonly parentTableId: number | "self";
       /** For `"self"`: this input's `"primary"` key or one of its `unique` constraints by name. */

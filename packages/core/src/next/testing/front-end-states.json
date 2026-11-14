@@ -191,6 +191,11 @@
   },
   {
     "file": "query.ts",
+    "message": "Multiple ON X clauses are not allowed",
+    "state": "42601"
+  },
+  {
+    "file": "query.ts",
     "message": "ON UPDATE X is not supported: a rekey always moves its references (use ON UPDATE CASCADE or omit the clause)",
     "state": "0A000"
   },

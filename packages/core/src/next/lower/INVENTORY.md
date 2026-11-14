@@ -116,7 +116,7 @@ Status:
 | `create-sequence`                                             | `createSequence` (start 1, increment 1, int8 bounds, no cycle: what the front end parses)                                                                                                                               | M1                                          |
 | `create-view`, `drop-view`                                    | `createView` / `dropView`; compatible OR REPLACE keeps the stable view ID, inferred outputs and dependencies                                                                                                            | M1                                          |
 | `create-enum`, native `drop-type`                             | named `createType` / `dropType`; columns and casts resolve the immutable catalog, preserving quoted names                                                                                                               | catalog stage 2                             |
-| `create-trigger`, `drop-trigger`                              | none (the catalog has no triggers)                                                                                                                                                                                      | U (`trigger`)                               |
+| `create-trigger`, `drop-trigger`                              | MCAT trigger definitions and typed OLD/NEW body bindings (runtime integration separate)                                                                                                                                 | DDL                                         |
 | `transaction`                                                 | `LoweredTransactionControl`                                                                                                                                                                                             | M1                                          |
 | `set`, `show`                                                 | `LoweredUtility`                                                                                                                                                                                                        | M1                                          |
 
@@ -759,3 +759,32 @@ UPDATE/DELETE locators in their view. Those writers bypass the ordinary start-vi
 Released/foreign pins refuse, and root end/rollback invalidates all remaining body pins. Origin
 tracking is weak; released snapshots do not accumulate in the statement's active-read set.
 This is an internal adapter seam, not CREATE TRIGGER lowering or general DML enablement.
+
+### Trigger definitions (B6 stage3 catalog unit)
+
+CREATE/DROP TRIGGER lower to stable-ID catalog changes. MCAT family20 stores event/timing,
+dialect1 and ordered body statements (family30), exact typed OLD/NEW bindings (31), and target
+column dependencies (32). Counter9 and MCHG17/18 retain trigger identity across drop/recreate,
+WAL and checkpoint. Source/target views, own-table writes, keyed INSERT targets, keyless mutation
+targets, forbidden OLD/NEW, generated assignments and invalid target/defaults refuse before
+admission. Schema changes cannot rename/drop/retype referenced columns, change positional INSERT
+arity, remove required defaults or drop referenced targets/types/sequences. Dropping the owner
+removes its triggers. Bodies retain every binding occurrence and SQL order. Unquoted trigger names fold to lowercase;
+quoted names retain their spelling, as PostgreSQL requires for trigger-name ordering. Runtime firing and
+the joint B5b AFTER/RI action hook are a separate integration unit; this catalog change does not
+enable a generic modify path or change the shipped engine.
+
+The resolved user-name prefix `RI_ConstraintTrigger_` is reserved for native system triggers
+(42939). PostgreSQL and the shipped engine accept it: this is an explicit 1.0 refusal so native
+durable RI IDs need not emulate PostgreSQL OIDs. Unquoted names fold before this check.
+
+### Exact foreign-key action descriptors (B6 / B5b)
+
+Native SQL preserves the five explicit PG actions for DELETE and UPDATE. Omitted ON UPDATE
+is stored as `follow`, the documented product row-identity behavior (unlike PG NO ACTION).
+Omitted SQL ON DELETE is stored as `noAction`; legacy schema inputs keep their declared
+blocking action. MCAT foreignKey10 field9 is required `onUpdate`, with centralized enum
+validation and ALTER/reopen retention. Parser provenance stays outside published compiled
+DTOs; the schema metadata inspector retains the effective actions. Repeated ON DELETE or
+ON UPDATE clauses refuse with42601. The shared row/command/RI consumer is B5b's execution
+unit; storing/lowering these modes alone does not enable their execution.

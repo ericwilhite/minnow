@@ -8,11 +8,11 @@
  * checksummed slot is not an empty/torn slot. Reserved masks enumerate every permitted bit;
  * writers emit zero for the remainder, readers refuse it. Scratch/transport are not durable.
  */
-/** Shared reference-table envelope; the manifest also carries its logical format version6. */
+/** Shared reference-table envelope; the manifest also carries its logical format version8. */
 export const METADATA_ENVELOPE_VERSION = 1;
 /** Raise before publishing any incompatible nested durable codec. Never fence before checking. */
-export const DURABLE_READER_VERSION = 5;
-export const MANIFEST_FORMAT_VERSION = 6;
+export const DURABLE_READER_VERSION = 7;
+export const MANIFEST_FORMAT_VERSION = 8;
 export const ROOT_SLOT_HEADER_BYTES = 16;
 export const ROOT_SLOT_OVERHEAD = ROOT_SLOT_HEADER_BYTES + 4;
 
@@ -32,7 +32,7 @@ export interface FormatField {
   /** Permitted bits; every other bit is reserved-zero. */
   readonly mask?: number;
 }
-/** Header selectors can name an outer envelope (manifest envelope1) plus its logical version6. */
+/** Header selectors can name an outer envelope (manifest envelope1) plus its logical version8. */
 interface Format {
   readonly magic: number | null;
   readonly version: number;
@@ -236,6 +236,8 @@ export const DURABLE_CODECS = {
     "upsertFts",
     "dropFts",
     "alterTable",
+    "createTrigger",
+    "dropTrigger",
   ],
   jsonNumber: ["NaN", "Infinity", "-Infinity", "-0"],
   indexKeyLimit: ["scalar", "tuple"],
@@ -244,7 +246,8 @@ export const DURABLE_CODECS = {
   keyDescriptor: { inline: 0, overflow: 1 },
   indexKind: ["ordered", "equality"],
   indexRole: ["primary", "unique", "secondary", "foreignKey"],
-  foreignKeyAction: ["restrict", "cascade", "setNull"],
+  foreignKeyAction: ["restrict", "noAction", "cascade", "setNull", "setDefault"],
+  foreignKeyUpdateAction: ["restrict", "noAction", "cascade", "setNull", "setDefault", "follow"],
   vectorForm: ["flat"],
   vectorIntegerRepr: ["safe", "int64"],
   vectorDecimalRepr: ["safe", "int64", "int128", "wide"],
@@ -311,9 +314,13 @@ export const CATALOG_RECORD_KINDS = {
   ftsCoverage: 27,
   ftsState: 28,
   viewSource: 29,
+  triggerBody: 30,
+  triggerBinding: 31,
+  triggerColumn: 32,
 } as const;
 
 export const CATALOG_FTS_FEATURE = 1;
+export const CATALOG_TRIGGER_FEATURE = 2;
 export const CATALOG_RECORD_SCHEMAS = {
   catalog: ["version:u", "counters:counters", "requiredFeatures:[u]", "sections:[section]"],
   counters: [
@@ -325,6 +332,7 @@ export const CATALOG_RECORD_SCHEMAS = {
     "nextViewId:u",
     "nextTypeId:u",
     "nextFtsId:u",
+    "nextTriggerId:u",
   ],
   table: [
     "id:u",
@@ -400,6 +408,7 @@ export const CATALOG_RECORD_SCHEMAS = {
     "supportIndexId:u?",
     "onDelete:s",
     "enforced:b",
+    "onUpdate:s",
   ],
   check: [
     "id:u",
@@ -465,7 +474,34 @@ export const CATALOG_RECORD_SCHEMAS = {
     "version:u",
     "fts:fts~",
     "ftsId:u~",
+    "trigger:trigger~",
+    "triggerId:u~",
   ],
+  trigger: [
+    "id:u",
+    "name:s",
+    "tableId:u",
+    "event:s",
+    "timing:s",
+    "dialectVersion:u",
+    "statements:[triggerBody]",
+  ],
+  triggerBody: [
+    "sql:s",
+    "kind:s",
+    "targetTableId:u",
+    "targetName:s",
+    "bindings:[triggerBinding]",
+    "columns:[triggerColumn]",
+    "insertColumnIds:[u]",
+    "defaultColumnIds:[u]",
+    "implicitArity:u?",
+    "assignedColumnIds:[u]",
+    "typeIds:[u]",
+    "sequenceIds:[u]",
+  ],
+  triggerBinding: ["columnId:u", "name:s", "type:physical", "source:s"],
+  triggerColumn: ["columnId:u", "name:s", "type:physical"],
   fts: [
     "id:u",
     "tableId:u",
@@ -519,6 +555,8 @@ export const CATALOG_CHANGE_FIELDS = {
   createFts: ["fts"],
   upsertFts: ["fts"],
   dropFts: ["ftsId"],
+  createTrigger: ["trigger"],
+  dropTrigger: ["triggerId"],
 } as const;
 
 export const DURABLE_FORMATS = {
@@ -677,9 +715,9 @@ export const DURABLE_FORMATS = {
   ]),
   commitBody: {
     magic: null,
-    version: 4,
+    version: 6,
     versionIn: "header",
-    fields: [{ ...version(0), values: [4] }],
+    fields: [{ ...version(0), values: [6] }],
     decoder: "decodeBody",
     state: "implemented",
   },

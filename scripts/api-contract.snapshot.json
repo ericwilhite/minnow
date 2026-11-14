@@ -208,7 +208,7 @@
               "name": "CatalogForeignKey",
               "kind": "type",
               "declarations": [
-                "export interface CatalogForeignKey {\n    readonly name: string;\n    readonly columns: readonly string[];\n    readonly parentTable: string;\n    readonly parentColumns: readonly string[];\n    readonly onDelete: \"restrict\" | \"cascade\" | \"set null\";\n    readonly enforced: boolean;\n}"
+                "export interface CatalogForeignKey {\n    readonly name: string;\n    readonly columns: readonly string[];\n    readonly parentTable: string;\n    readonly parentColumns: readonly string[];\n    readonly onDelete: \"restrict\" | \"cascade\" | \"set null\" | \"no action\" | \"set default\";\n    readonly onUpdate?: \"follow\" | \"restrict\" | \"cascade\" | \"set null\" | \"no action\" | \"set default\";\n    readonly enforced: boolean;\n}"
               ]
             },
             {

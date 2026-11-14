@@ -298,6 +298,40 @@ admitted, and views cannot own or be targeted by triggers. A later column or def
 would invalidate a stored body is refused; a write already staged under the old trigger catalog
 gets a schema conflict instead of publishing stale effects.
 
+### 1.0 cutover: foreign-key actions and trigger order
+
+The current 0.x engine cascades child changes before a parent's BEFORE DELETE trigger. The
+1.0 rebuild follows PostgreSQL: the parent's BEFORE trigger runs first, then the parent row
+changes. Referential actions run as system AFTER triggers, sorted by name alongside user
+AFTER triggers. Child changes run their own BEFORE triggers; child AFTER events join the
+pending queue and can run after the remaining parent AFTER triggers. Quoted user names that
+sort before `RI_ConstraintTrigger_*` can run before the action; ordinary lowercase names sort
+after that system prefix. UPDATE actions and rekeys follow the same scheduling model.
+BEFORE triggers also use name order, rather than creation order. Unquoted trigger names fold
+to lowercase; quoted names keep their spelling.
+
+The 1.0 rebuild reserves the exact resolved-name prefix `RI_ConstraintTrigger_` for those
+system triggers. Creating a user trigger with that prefix fails with SQLSTATE `42939`
+(`reserved_name`). The current 0.x engine accepts it, so rename such triggers before the
+cutover. For example, `"RI_ConstraintTrigger_audit"` is reserved; unquoted
+`RI_ConstraintTrigger_audit` folds to `ri_constrainttrigger_audit` and is outside that prefix.
+All other names follow PostgreSQL's trigger-name ordering.
+
+For example, suppose `children.parent_id` references `parents.id` with ON DELETE CASCADE,
+and `children.value` has CHECK(value > 0):
+
+```sql
+CREATE TRIGGER validate_children BEFORE DELETE ON parents
+BEGIN
+  UPDATE children SET value = -1 WHERE parent_id = OLD.id;
+END
+```
+
+In 0.x, deleting a parent can succeed because its children have already been deleted when this
+body runs. At the 1.0 cutover, the child still exists when BEFORE runs: its CHECK fails and the
+entire parent delete rolls back. This is an intentional behavior change. Trigger bodies and
+FK actions remain atomic with the originating statement.
+
 ## Atomicity
 
 One statement is one commit. Several statements that must land together belong in a
