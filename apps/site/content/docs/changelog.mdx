@@ -17,6 +17,12 @@ visible base-table corpus before WHERE/LIMIT, with exact document-frequency unio
 multiple columns and prefixes. Its raw-column spool spills under memory pressure; tokenizer
 workspace and score buffers are admitted before allocation.
 
+Array documents are bounded by their rendered character length, so legal BIGINT arrays
+larger than 64 KiB on disk remain searchable. Array quoting uses PostgreSQL's whitespace
+set exactly, including near the 16,384-character boundary. Rendering visits elements without
+retaining a decoded array tree; its workspace stays funded before allocation. This changes
+no shipped 0.x behavior or stored format.
+
 Document renderer version 2 deliberately uses PostgreSQL text forms for TIME and SQL arrays:
 fractional TIME zeros are dropped, and arrays use PostgreSQL quoting/escaping rather than the
 original JSON-array spelling. JSON follows `json::text` source-text preservation; JSONB follows

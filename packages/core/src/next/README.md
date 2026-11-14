@@ -3705,3 +3705,9 @@ Native renderer 2 follows PG TIME/array/JSON/JSONB text laws (public FTS page / 
 real native SQL against shipped SQL for the common forms and pin the deliberate renderer-2
 changes against PGlite. No ready-index route, durable FTS grammars, background builds, snapshot
 FTS records or throughput claim is included in stage 2.
+
+The renderer-2 array limit counts PG output characters, not encoded bytes. A borrowed
+`visitArrayValue` walk retains bounded rendered fragments rather than a decoded element tree;
+large text/BYTEA elements are checked before decoding. The existing allocating array decoder
+still returns owned byte elements and shares shape/element validation with the visitor.
+PG array quoting uses its six ASCII whitespace characters, not JavaScript's Unicode `\s`.

@@ -154,6 +154,17 @@ function twosComplement(value: bigint): Uint8Array {
 }
 
 function fromTwosComplement(bytes: Uint8Array): bigint {
+  let length = bytes.length;
+  while (length > 1) {
+    const last = bytes[length - 1],
+      next = bytes[length - 2] ?? 0;
+    if ((last === 0 && (next & 0x80) === 0) || (last === 0xff && (next & 0x80) !== 0)) length--;
+    else break;
+  }
+  // log2(10)<4: every legal NUMERIC coefficient fits this conservative bound.
+  if (length > Math.ceil((NUMERIC_MAX_INTEGER_DIGITS + NUMERIC_MAX_SCALE) / 2) + 1)
+    throw new MalformedArrayError("Array NUMERIC coefficient is out of range");
+  bytes = bytes.subarray(0, length);
   if (bytes.length === 0) return 0n;
   const digits: string[] = [];
   for (let index = bytes.length - 1; index >= 0; index--)
@@ -268,9 +279,7 @@ function checkElement(element: PhysicalType, tag: number, item: ArrayElement): v
  * `array_fill(1, '{0}')` are both `{}` with no dimensions): a dimension of length 0 is refused,
  * never normalized here. A value that fails is never narrowed or truncated.
  */
-export function validateArrayValue(element: PhysicalType, value: ArrayValue): void {
-  const tag = arrayElementTag(element);
-  const { dimensions, lowerBounds, elements } = value;
+function arraySize(dimensions: readonly number[], lowerBounds: readonly number[]): number {
   if (dimensions.length > MAX_ARRAY_DIMENSIONS || lowerBounds.length !== dimensions.length)
     throw new MalformedArrayError("Bad array dimensions");
   let count = dimensions.length === 0 ? 0 : 1;
@@ -285,6 +294,12 @@ export function validateArrayValue(element: PhysicalType, value: ArrayValue): vo
     count *= length;
   });
   if (count > MAX_ARRAY_ELEMENTS) throw new MalformedArrayError("Too many array elements");
+  return count;
+}
+export function validateArrayValue(element: PhysicalType, value: ArrayValue): void {
+  const tag = arrayElementTag(element);
+  const { dimensions, lowerBounds, elements } = value;
+  const count = arraySize(dimensions, lowerBounds);
   if (count !== elements.length)
     throw new MalformedArrayError("Dimensions do not match the elements");
   for (const item of elements) if (item !== null) checkElement(element, tag, item);
@@ -379,7 +394,19 @@ export function encodeArrayValue(element: PhysicalType, value: ArrayValue): Uint
   return writer.bytes.slice(0, writer.length);
 }
 
-export function decodeArrayValue(element: PhysicalType, bytes: Uint8Array): ArrayValue {
+/** Element byte views are borrowed for the callback; no decoded element tree is retained.
+ * beforeBytes lets bounded consumers reject a payload before text validation allocates.
+ * Callbacks must not publish results until the visit returns and trailing bytes are checked. */
+export interface ArrayValueVisitor {
+  begin(shape: Pick<ArrayValue, "dimensions" | "lowerBounds">, count: number): void;
+  element(value: ArrayElement | null): void;
+  beforeBytes?(value: Uint8Array): void;
+}
+export function visitArrayValue(
+  element: PhysicalType,
+  bytes: Uint8Array,
+  visitor: ArrayValueVisitor,
+): void {
   const tag = arrayElementTag(element);
   requireHeader("arrayValue", bytes, MalformedArrayError);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -411,41 +438,48 @@ export function decodeArrayValue(element: PhysicalType, bytes: Uint8Array): Arra
   const nulls = (flags & 1) === 1 ? bytes.subarray(need(Math.ceil(count / 8)), at) : null;
   if (nulls !== null && (count & 7) !== 0 && (nulls[nulls.length - 1] ?? 0) >>> (count & 7) !== 0)
     throw new MalformedArrayError("Nonzero array null bitmap padding");
-  const elements: Array<ArrayElement | null> = [];
+  if (arraySize(dimensions, lowerBounds) !== count)
+    throw new MalformedArrayError("Invalid array dimensions");
+  visitor.begin({ dimensions, lowerBounds }, count);
+  const emit = (value: ArrayElement | null): void => {
+    if (value instanceof Uint8Array) visitor.beforeBytes?.(value);
+    if (value !== null) checkElement(element, tag, value);
+    visitor.element(value);
+  };
   for (let index = 0; index < count; index++) {
     if (nulls !== null && ((nulls[index >>> 3] ?? 0) & (1 << (index & 7))) !== 0) {
-      elements.push(null);
+      emit(null);
       continue;
     }
     switch (tag) {
       case 1: {
         const value = view.getUint8(need(1));
         requireTag(value, DURABLE_CODECS.boolean, "array boolean", MalformedArrayError);
-        elements.push(value === 1);
+        emit(value === 1);
         break;
       }
       case 2:
       case 3:
       case 8:
-        elements.push(view.getInt32(need(4), true));
+        emit(view.getInt32(need(4), true));
         break;
       case 4:
       case 9:
       case 10:
       case 11:
-        elements.push(view.getBigInt64(need(8), true));
+        emit(view.getBigInt64(need(8), true));
         break;
       case 5:
-        elements.push(view.getFloat32(need(4), true));
+        emit(view.getFloat32(need(4), true));
         break;
       case 6:
-        elements.push(view.getFloat64(need(8), true));
+        emit(view.getFloat64(need(8), true));
         break;
       case 7: {
         const special = view.getUint8(need(1));
         if (special > 3) throw new MalformedArrayError("Bad NUMERIC special");
         if (special !== 0) {
-          elements.push({
+          emit({
             coefficient: 0n,
             scale: 0,
             special: special === 1 ? "NaN" : special === 2 ? "Infinity" : "-Infinity",
@@ -454,27 +488,38 @@ export function decodeArrayValue(element: PhysicalType, bytes: Uint8Array): Arra
         }
         const scale = view.getUint16(need(2), true);
         const length = view.getUint32(need(4), true);
-        elements.push({ coefficient: fromTwosComplement(bytes.subarray(need(length), at)), scale });
+        emit({ coefficient: fromTwosComplement(bytes.subarray(need(length), at)), scale });
         break;
       }
       case 12: {
         const months = view.getInt32(need(4), true);
         const days = view.getInt32(need(4), true);
-        elements.push({ months, days, micros: view.getBigInt64(need(8), true) });
+        emit({ months, days, micros: view.getBigInt64(need(8), true) });
         break;
       }
       case 15:
-        elements.push(bytes.slice(need(16), at));
+        emit(bytes.subarray(need(16), at));
         break;
       default: {
         const length = view.getUint32(need(4), true);
-        elements.push(bytes.slice(need(length), at));
+        emit(bytes.subarray(need(length), at));
       }
     }
   }
   if (at !== bytes.length) throw new MalformedArrayError("Trailing bytes after the array value");
-  const value = { dimensions, lowerBounds, elements };
-  // Stored bytes are checked like written values: a decoded value is always a valid one.
-  validateArrayValue(element, value);
-  return value;
+}
+
+/** Allocating compatibility API: unlike the visitor, returned byte elements are owned. */
+export function decodeArrayValue(element: PhysicalType, bytes: Uint8Array): ArrayValue {
+  let shape: Pick<ArrayValue, "dimensions" | "lowerBounds"> = { dimensions: [], lowerBounds: [] };
+  const elements: Array<ArrayElement | null> = [];
+  visitArrayValue(element, bytes, {
+    begin(value) {
+      shape = value;
+    },
+    element(value) {
+      elements.push(value instanceof Uint8Array ? value.slice() : value);
+    },
+  });
+  return { ...shape, elements };
 }

@@ -1,7 +1,7 @@
 /** Version-2 native FTS logical rendering; never tokenize encoded vector bytes or dictionary codes. */
 import { MAX_INDEXED_STRING_CHARACTERS, renderDocumentValue } from "../full-text.js";
 import { formatDate, formatTimestamp, unixMillisFromTimestamp } from "../temporal.js";
-import { decodeArrayValue, type ArrayElement } from "../vector/array-value.js";
+import { visitArrayValue, type ArrayElement } from "../vector/array-value.js";
 import type { PhysicalType } from "../types.js";
 import { jsonFloatText } from "./kernels/json-float.js";
 import { formatSqlTimestamp, formatSqlInterval } from "../temporal-text.js";
@@ -53,7 +53,7 @@ function arrayElement(value: ArrayElement | null, type: PhysicalType): string {
   if (value instanceof Uint8Array) {
     if (type.kind === "bytes") text = hexText(value);
     else if (type.kind === "uuid") text = uuidText(value, 0);
-    else text = new TextDecoder().decode(value);
+    else text = new TextDecoder("utf-8", { ignoreBOM: true }).decode(value);
   } else if (typeof value === "object") {
     if ("coefficient" in value) {
       const negative = value.coefficient < 0n;
@@ -73,18 +73,14 @@ function arrayElement(value: ArrayElement | null, type: PhysicalType): string {
   else if (type.kind === "float64" || type.kind === "float32")
     text = jsonFloatText(Number(value), type.kind === "float32");
   else text = String(value);
-  return text === "" || /^null$/iu.test(text) || /[{},"\\\s]/u.test(text)
+  return text === "" || /^null$/iu.test(text) || /[{},"\\ \t\n\r\v\f]/u.test(text)
     ? '"' + text.replace(/["\\]/gu, (value) => "\\" + value) + '"'
     : text;
 }
 function arrayText(bytes: Uint8Array, element: PhysicalType): string {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const dimensions = bytes[2] ?? 0;
-  let count = dimensions ? 1 : 0;
-  for (let d = 0; d < dimensions; d++) count *= view.getInt32(4 + 8 * d, true);
-  if (count > 8192 || bytes.length > 65536)
-    throw new RangeError("Full-text values cannot exceed 16384 characters");
-  const value = decodeArrayValue(element, bytes);
+  let dimensions: readonly number[] = [],
+    lowerBounds: readonly number[] = [];
+  const rendered: string[] = [];
   let at = 0,
     produced = 0;
   const account = (text: string): string => {
@@ -93,22 +89,42 @@ function arrayText(bytes: Uint8Array, element: PhysicalType): string {
       throw new RangeError("Full-text values cannot exceed 16384 characters");
     return text;
   };
+  visitArrayValue(element, bytes, {
+    begin(shape, count) {
+      // Even one-character elements need commas and outer braces: 2*n+1 characters.
+      if (count > 0 && 2 * count + 1 > MAX_INDEXED_STRING_CHARACTERS)
+        throw new RangeError("Full-text values cannot exceed 16384 characters");
+      dimensions = shape.dimensions;
+      lowerBounds = shape.lowerBounds;
+    },
+    beforeBytes(value) {
+      // A UTF-8 code unit needs at most four bytes; BYTEA output needs two hex digits.
+      // These per-element lower bounds cannot reject a document that fits its text limit.
+      if (
+        element.kind === "bytes"
+          ? value.length > 8191
+          : value.length > 4 * MAX_INDEXED_STRING_CHARACTERS
+      )
+        throw new RangeError("Full-text values cannot exceed 16384 characters");
+    },
+    element(value) {
+      rendered.push(account(arrayElement(value, element)));
+    },
+  });
   const nested = (dimension: number): string => {
-    const length = value.dimensions[dimension] ?? 0;
+    const length = dimensions[dimension] ?? 0;
     const parts = new Array<string>(length);
     for (let i = 0; i < length; i++)
       parts[i] =
-        dimension + 1 === value.dimensions.length
-          ? account(arrayElement(value.elements[at++] ?? null, element))
-          : nested(dimension + 1);
+        dimension + 1 === dimensions.length ? (rendered[at++] ?? "NULL") : nested(dimension + 1);
     account("{" + ",".repeat(Math.max(0, length - 1)) + "}");
     return "{" + parts.join(",") + "}";
   };
-  const bounds = value.lowerBounds.some((bound) => bound !== 1)
-    ? value.dimensions
+  const bounds = lowerBounds.some((bound) => bound !== 1)
+    ? dimensions
         .map(
           (length, d) =>
-            `[${String(value.lowerBounds[d])}:${String((value.lowerBounds[d] ?? 1) + length - 1)}]`,
+            `[${String(lowerBounds[d])}:${String((lowerBounds[d] ?? 1) + length - 1)}]`,
         )
         .join("") + "="
     : "";

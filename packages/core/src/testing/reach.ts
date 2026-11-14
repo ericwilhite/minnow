@@ -6088,3 +6088,28 @@ export const FTS_QUERY_REACH = [
   "constant parsed once",
   "drained",
 ] as const;
+
+/** Renderer-v2 array output uses PG's character length and array_out quoting. */
+export const FTS_ARRAY_RENDER_REACH = [
+  "leading whitespace",
+  "trailing whitespace",
+  "ASCII whitespace",
+  "Unicode whitespace",
+  "exact PostgreSQL text",
+  "below character limit",
+  "at character limit",
+  "above limit refused",
+  "BIGINT encoded over64KiB",
+  "MATCH BM25 SQL",
+  "drained",
+] as const;
+
+export const ARRAY_VISITOR_REACH = [
+  "empty",
+  "nonempty",
+  "NULL",
+  "beforeBytes hook",
+  "borrowed bytes",
+  "owned decoder bytes",
+  "exact shapes",
+] as const;

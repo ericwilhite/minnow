@@ -41,6 +41,11 @@ to a term. JSON and JSONB follow their distinct SQL text rules instead of the 0.
 renderer. Ordinary text, numbers, DATE, timestamp and INTERVAL documents keep their existing
 rendering rules. Boolean columns remain excluded; an all-NULL document still returns SQL NULL.
 
+The array document limit counts characters in PostgreSQL's rendered text, not its binary
+storage bytes. Array quoting recognizes only PostgreSQL's whitespace set (space, tab, LF,
+CR, vertical tab and form feed), plus its special array characters. Other Unicode whitespace
+such as a non-breaking space does not add quotes. A leading U+FEFF remains value content.
+
 These are deliberate 1.0 changes. The shipped 0.x engine keeps renderer version 1 and its
 existing results. The [1.0 storage cutover](/docs/changelog) starts a new database and rebuilds
 FTS data; existing 0.x postings are never reused. The unexported 1.0 scan route supports MATCH
