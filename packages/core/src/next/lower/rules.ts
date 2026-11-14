@@ -4,13 +4,15 @@
  * expressions inlined into insert and update plans.
  */
 import type { CatalogView, ColumnDef, TableDef } from "../access/catalog.js";
+import { identifierSource } from "../../engine/identifier-sources.js";
+import { expressionObjects } from "./expression-objects.js";
 import type { ScalarExpr } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
 import {
+  childExpressions,
   compileCheckExpression,
   compileDefaultExpression,
   compileWithDeclaredTypes,
-  expressionColumnNames,
 } from "../../engine/query.js";
 import type { Expression } from "../../plan/model.js";
 import { coerce, ParameterTypes, type Typed } from "./coerce.js";
@@ -25,6 +27,12 @@ export function rowScope(
   values: (position: number, def: ColumnDef) => Typed,
 ): Scope {
   return {
+    columnParts: (parts) => {
+      if (parts.length > 1 && !qualifiers.includes(parts[0] ?? "")) return undefined;
+      const position = table.columns.findIndex((def) => def.name === parts.at(-1));
+      const def = table.columns[position];
+      return def === undefined ? undefined : values(position, def);
+    },
     column: (reference) => {
       const dot = reference.indexOf(".");
       if (dot !== -1 && !qualifiers.includes(reference.slice(0, dot))) return undefined;
@@ -66,7 +74,28 @@ function parseRule(sql: string, check: string | null): Expression {
 
 /** The column names a stored expression reads. */
 export function ruleColumns(sql: string): string[] {
-  return expressionColumnNames(parseRule(sql, null)).map((name) => name.split(".").at(-1) ?? name);
+  return ruleReferences(parseRule(sql, null)).map((reference) => reference.name);
+}
+
+/** SQL text remains durable, so references discarded by IR folding still count. */
+export function ruleDependencies(sql: string, catalog: CatalogView) {
+  const parsed = parseRule(sql, null);
+  return { ...expressionObjects(parsed, catalog), references: ruleReferences(parsed) };
+}
+/** Exact identifier boundaries, never split a quoted display string on its embedded dot. */
+export function ruleReferences(
+  expression: Expression,
+): Array<{ name: string; qualifier: string | undefined }> {
+  if (expression.kind === "column") {
+    const parts = identifierSource(expression)?.parts ?? expression.reference.split(".");
+    return [
+      {
+        name: parts.at(-1) ?? "",
+        qualifier: parts.length > 1 ? parts.slice(0, -1).join(".") : undefined,
+      },
+    ];
+  }
+  return childExpressions(expression).flatMap(ruleReferences);
 }
 
 /** The default of `def` (assignment-cast to its type), or NULL. Reads no column. */

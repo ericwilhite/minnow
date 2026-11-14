@@ -8,11 +8,11 @@
  * checksummed slot is not an empty/torn slot. Reserved masks enumerate every permitted bit;
  * writers emit zero for the remainder, readers refuse it. Scratch/transport are not durable.
  */
-/** Shared reference-table envelope; the manifest also carries its logical format version5. */
+/** Shared reference-table envelope; the manifest also carries its logical format version6. */
 export const METADATA_ENVELOPE_VERSION = 1;
 /** Raise before publishing any incompatible nested durable codec. Never fence before checking. */
-export const DURABLE_READER_VERSION = 4;
-export const MANIFEST_FORMAT_VERSION = 5;
+export const DURABLE_READER_VERSION = 5;
+export const MANIFEST_FORMAT_VERSION = 6;
 export const ROOT_SLOT_HEADER_BYTES = 16;
 export const ROOT_SLOT_OVERHEAD = ROOT_SLOT_HEADER_BYTES + 4;
 
@@ -32,7 +32,7 @@ export interface FormatField {
   /** Permitted bits; every other bit is reserved-zero. */
   readonly mask?: number;
 }
-/** Header selectors can name an outer envelope (manifest envelope1) plus its logical version5. */
+/** Header selectors can name an outer envelope (manifest envelope1) plus its logical version6. */
 interface Format {
   readonly magic: number | null;
   readonly version: number;
@@ -228,12 +228,14 @@ export const DURABLE_CODECS = {
     "putSequence",
     "dropSequence",
     "createView",
+    "replaceView",
     "dropView",
     "createType",
     "dropType",
     "createFts",
     "upsertFts",
     "dropFts",
+    "alterTable",
   ],
   jsonNumber: ["NaN", "Infinity", "-Infinity", "-0"],
   indexKeyLimit: ["scalar", "tuple"],
@@ -263,6 +265,8 @@ export const CATALOG_NATIVE_GRAMMAR = {
   pageBytes: 256 * 1024,
   fanOut: 64,
   maximumDepth: 8,
+  maximumEnumLabels: 65536,
+  maximumEnumLabelBytes: 63,
 } as const;
 
 /** Physical page limits; long dictionaries/lists use trees, never a total-document limit. */
@@ -300,9 +304,13 @@ export const CATALOG_RECORD_KINDS = {
   trigger: 20,
   fts: 21,
   section: 22,
+  expressionDependencies: 23,
+  dependency: 24,
+  viewOutput: 25,
   ftsConfig: 26,
   ftsCoverage: 27,
   ftsState: 28,
+  viewSource: 29,
 } as const;
 
 export const CATALOG_FTS_FEATURE = 1;
@@ -327,6 +335,7 @@ export const CATALOG_RECORD_SCHEMAS = {
     "indexes:[index]",
     "foreignKeys:[foreignKey]",
     "checks:[check]",
+    "managed:b~!",
   ],
   column: [
     "id:u",
@@ -338,6 +347,11 @@ export const CATALOG_RECORD_SCHEMAS = {
     "generatedSql:s?",
     "identitySequence:u?",
     "missing:vector?",
+    "typeId:u~!",
+    "allowedValues:[s]~!",
+    "defaultDependencies:expressionDependencies~!",
+    "generatedDependencies:expressionDependencies~!",
+    "autoIncrement:b~!",
   ],
   physical: [
     "kind:s",
@@ -374,6 +388,7 @@ export const CATALOG_RECORD_SCHEMAS = {
     "role:s",
     "invalid:b~",
     "keyLimit:s~",
+    "directions:[s]~!",
   ],
   foreignKey: [
     "id:u",
@@ -385,7 +400,17 @@ export const CATALOG_RECORD_SCHEMAS = {
     "onDelete:s",
     "enforced:b",
   ],
-  check: ["id:u", "name:s", "conditionSql:s", "columnIds:[u]"],
+  check: [
+    "id:u",
+    "name:s",
+    "conditionSql:s",
+    "columnIds:[u]",
+    "dependencies:expressionDependencies~!",
+  ],
+  expressionDependencies: ["dialectVersion:u", "columnIds:[u]", "sequenceIds:[u]", "typeIds:[u]~!"],
+  dependency: ["kind:s", "objectId:u", "columnIds:[u]"],
+  viewOutput: ["name:s", "type:physical", "declared:declared", "nullable:b"],
+  viewSource: ["kind:s", "objectId:u", "columnIds:[u]", "outputCount:u"],
   sequence: [
     "id:u",
     "name:s",
@@ -397,7 +422,15 @@ export const CATALOG_RECORD_SCHEMAS = {
     "ownedBy:owned?",
   ],
   owned: ["tableId:u", "columnId:u"],
-  view: ["id:u", "name:s", "bodySql:s"],
+  view: [
+    "id:u",
+    "name:s",
+    "bodySql:s",
+    "managed:b~!",
+    "outputs:[viewOutput]~!",
+    "dependencies:[dependency]~!",
+    "sourceSchemas:[viewSource]~!",
+  ],
   namedType: ["id:u", "name:s", "labels:[s]"],
   vector: ["form:s", "type:physical", "length:u", "validity:typed?", "data:vectorData"],
   vectorData: [
@@ -470,6 +503,7 @@ export const CATALOG_RESERVED_RECORD_SCHEMAS = {
 /** Conditional fields of a resolved WAL operation; all listed fields are required. */
 export const CATALOG_CHANGE_FIELDS = {
   createTable: ["table", "sequences"],
+  alterTable: ["table", "sequences"],
   dropTable: ["tableId"],
   createIndex: ["index"],
   invalidateIndex: ["tableId", "indexId"],
@@ -477,6 +511,7 @@ export const CATALOG_CHANGE_FIELDS = {
   putSequence: ["sequence"],
   dropSequence: ["sequenceId"],
   createView: ["view"],
+  replaceView: ["view"],
   dropView: ["viewId"],
   createType: ["type"],
   dropType: ["typeId"],
@@ -641,9 +676,9 @@ export const DURABLE_FORMATS = {
   ]),
   commitBody: {
     magic: null,
-    version: 3,
+    version: 4,
     versionIn: "header",
-    fields: [{ ...version(0), values: [3] }],
+    fields: [{ ...version(0), values: [4] }],
     decoder: "decodeBody",
     state: "implemented",
   },

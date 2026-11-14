@@ -1,4 +1,4 @@
-/** Independent golden selectors allocated by the lead: reader4/manifest5/commitBody3.
+/** Independent golden selectors allocated by the lead: reader5/manifest6/commitBody4.
  * These are development bytes, not a supported predecessor or an indexed-query claim.
  */
 import fc from "fast-check";
@@ -22,16 +22,16 @@ for (const seed of seedsFor("next-fts-selectors", [0xb817, 0xb818]))
           reach.beginHistory();
           const checkBody = () => {
             const encoded = encodeBody({ request: null, effects: [] });
-            expect([...encoded], "commit-body3 ABI").toEqual([3, 0, 0]);
+            expect([...encoded], "commit-body4 ABI").toEqual([4, 0, 0]);
             expect(decodeBody(encoded)).toEqual({ request: null, effects: [] });
-            reach.reach("commit body3");
+            reach.reach("commit body4");
           };
           if (seed & 1) checkBody();
           const encoded = encodeRootSlot(sequence, payload);
-          expect((encoded[10] ?? 0) >>> 5, "minimum-reader4 ABI").toBe(3);
-          reach.reach("reader4 barrier");
-          expect(encoded[11], "manifest5 ABI").toBe(3);
-          reach.reach("manifest5 barrier");
+          expect((encoded[10] ?? 0) >>> 5, "minimum-reader5 ABI").toBe(4);
+          reach.reach("reader5 barrier");
+          expect(encoded[11], "manifest6 ABI").toBe(4);
+          reach.reach("manifest6 barrier");
           const decoded = decodeRootSlot(encoded);
           expect(decoded?.sequence).toBe(sequence);
           expect(decoded?.root).toEqual(payload);

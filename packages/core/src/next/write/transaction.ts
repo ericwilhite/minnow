@@ -29,6 +29,7 @@ import {
   ConflictKind,
   ForeignKeyViolationError,
   NotNullViolationError,
+  ClosedSetViolationError,
   UniqueViolationError,
   type ConflictOutput,
   type Statement,
@@ -48,7 +49,8 @@ import {
 import type { BodyEffect } from "../format/log-frame.js";
 import { encodeKeyBatch, KeyBatch, type KeyColumn } from "../keys/key-encoding.js";
 import { samePhysicalType } from "../types.js";
-import { compareBytes } from "../vector/varlen.js";
+import { int64At } from "../vector/int64.js";
+import { compareBytes, varlenMatchesString } from "../vector/varlen.js";
 import {
   BATCH_TARGET_BYTES,
   type Batch,
@@ -62,6 +64,7 @@ import { ColumnChunk, encodeColumn, isNullAt, sourceSlot, MEMORY_CHUNK_ROWS } fr
 import type { KeyDelta } from "./key-hash.js";
 import type { Memtable } from "./memtable.js";
 import { readRows } from "./rows.js";
+import { validateAlterNullability } from "./alter-validation.js";
 import type { GroupDeletes, Shared, WriteState } from "./state.js";
 import {
   SnapshotImpl,
@@ -110,6 +113,7 @@ export interface EngineHooks {
   commit(tx: TransactionImpl, request: CommitRequest | null): Promise<CommitReceipt>;
   release(tx: TransactionImpl): void;
   label(): string;
+  advanceIdentity(sequenceId: number, atLeast: bigint): MaybePromise<void>;
 }
 
 export type Undo =
@@ -538,6 +542,13 @@ export function jsonBound(value: unknown, limit: number): number {
 }
 
 function catalogEffect(change: LoggedChange, allocator?: BufferAllocator): BodyEffect {
+  if (change.op === "alterTable")
+    return {
+      kind: "alterTable",
+      tableId: change.table.id,
+      schemaVersion: change.table.schemaVersion,
+      definition: encodeLogged(change, allocator),
+    };
   if (change.op === "createTable")
     return {
       kind: "createTable",
@@ -716,7 +727,7 @@ export class StatementImpl implements Statement {
 
   /** Runs `work`; any error fails the statement (its only valid call is then `rollback`). */
   guard<T>(work: () => MaybePromise<T>): MaybePromise<T> {
-    if (this.#state !== "open") throw new TransactionStateError(`The statement is ${this.#state}`);
+    this.#checkOpen();
     try {
       const result = work();
       if (result instanceof Promise)
@@ -729,6 +740,10 @@ export class StatementImpl implements Statement {
       this.#state = "failed";
       throw error;
     }
+  }
+
+  #checkOpen(): void {
+    if (this.#state !== "open") throw new TransactionStateError(`The statement is ${this.#state}`);
   }
 
   #current: SnapshotImpl | null = null;
@@ -817,18 +832,28 @@ export class StatementImpl implements Statement {
     return this.guard(() => {
       const before = this.tx.catalog;
       const { catalog, logged, id } = before.change(change, this.tx.hooks.nextCatalogVersion());
-      return settle(this.tx.hooks.prepareCatalog(catalog), () =>
-        this.guard(() => {
-          this.tx.undo.push({ kind: "catalog", statement: this.ordinal, before, logged });
-          this.tx.catalog = catalog;
-          const work: Array<MaybePromise<void>> = [];
-          for (const entry of logged) {
-            if (entry.op === "createTable")
-              this.tx.hooks.createTableState(entry.table, entry.table.id);
-            if (entry.op === "createIndex") work.push(this.#backfill(entry.index));
-          }
-          return settle(all(work), () => ({ id }));
-        }),
+      const validate =
+        change.kind === "alterTable"
+          ? validateAlterNullability(
+              this.current().internalTable(change.tableId),
+              need(catalog.table(change.tableId)),
+              () => this.#checkOpen(),
+            )
+          : undefined;
+      return settle(validate, () =>
+        settle(this.tx.hooks.prepareCatalog(catalog), () =>
+          this.guard(() => {
+            this.tx.undo.push({ kind: "catalog", statement: this.ordinal, before, logged });
+            this.tx.catalog = catalog;
+            const work: Array<MaybePromise<void>> = [];
+            for (const entry of logged) {
+              if (entry.op === "createTable")
+                this.tx.hooks.createTableState(entry.table, entry.table.id);
+              if (entry.op === "createIndex") work.push(this.#backfill(entry.index));
+            }
+            return settle(all(work), () => ({ id }));
+          }),
+        ),
       );
     });
   }
@@ -1136,13 +1161,26 @@ export class TableWriterImpl implements TableWriter {
     changed: readonly number[] | null,
   ): void {
     this.def.columns.forEach((column, c) => {
-      if (column.nullable) return;
+      if (column.nullable && column.allowedValues === undefined) return;
       const vector = need(columns[c]);
-      if (vector.form === "flat" && vector.validity === null) return;
+      if (vector.form === "flat" && vector.validity === null && column.allowedValues === undefined)
+        return;
       const count = rows?.length ?? length;
       for (let k = 0; k < count; k++) {
         const row = rows === null ? k : (rows[k] ?? 0);
-        if (isNullAt(vector, row)) throw new NotNullViolationError(this.tableId, column.id, row);
+        if (isNullAt(vector, row)) {
+          if (!column.nullable) throw new NotNullViolationError(this.tableId, column.id, row);
+          continue;
+        }
+        if (column.allowedValues !== undefined) {
+          const slot = { flat: null as FlatVector | null, index: -1 };
+          sourceSlot(vector, row, slot);
+          const data = slot.flat.data;
+          if (data.layout !== "varlen")
+            throw new TypeError("A closed text set received a non-text vector");
+          if (!column.allowedValues.some((label) => varlenMatchesString(data, slot.index, label)))
+            throw new ClosedSetViolationError(this.tableId, column.id, row);
+        }
       }
     });
     if (this.def.checks.length === 0) return;
@@ -1191,8 +1229,35 @@ export class TableWriterImpl implements TableWriter {
     rows: Uint16Array | null,
     count = rows?.length ?? 0,
   ): MaybePromise<void> {
-    return settle(this.#prepareKeyLimits(this.def.indexes, columns, rows, 0, count), () =>
-      this.#insertPreparedRows(columns, rows, count),
+    const advances: Array<MaybePromise<void>> = [];
+    for (const [position, column] of this.def.columns.entries())
+      if (column.autoIncrement === true && column.identitySequence !== null) {
+        let maximum = 0n;
+        const vector = need(columns[position]),
+          slot = { flat: null as FlatVector | null, index: -1 };
+        for (let k = 0; k < count; k++) {
+          const row = rows?.[k] ?? k;
+          sourceSlot(vector, row, slot);
+          if (slot.index < 0) continue;
+          const data = slot.flat.data;
+          let value: bigint;
+          if (data.layout === "int64") value = int64At(data.values, slot.index);
+          else if (data.layout === "i32" || data.layout === "f64") {
+            const number = data.values[slot.index] ?? 0;
+            if (!Number.isSafeInteger(number))
+              throw new CatalogChangeError("An auto-increment value must be a safe whole number");
+            value = BigInt(number);
+          } else throw new TypeError("Auto-increment input has another layout");
+          if (value > maximum) maximum = value;
+        }
+        advances.push(
+          this.statement.tx.hooks.advanceIdentity(column.identitySequence, maximum + 1n),
+        );
+      }
+    return settle(all(advances), () =>
+      settle(this.#prepareKeyLimits(this.def.indexes, columns, rows, 0, count), () =>
+        this.#insertPreparedRows(columns, rows, count),
+      ),
     );
   }
 

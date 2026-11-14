@@ -55,11 +55,7 @@ describe("SQL → physical type mapping", () => {
       { type: "string", sqlDomain: { kind: "enum", name: "mood", values: ["sad", "ok"] } },
       { kind: "enum", name: "mood", labels: ["sad", "ok"] },
     ],
-    [
-      "string with enumValues",
-      { type: "string", enumValues: ["a", "b"] },
-      { kind: "enum", name: "", labels: ["a", "b"] },
-    ],
+    ["string with enumValues", { type: "string", enumValues: ["a", "b"] }, { kind: "text" }],
     [
       "INTEGER[]",
       { type: "string", sqlDomain: { kind: "array", element: "integer" } },

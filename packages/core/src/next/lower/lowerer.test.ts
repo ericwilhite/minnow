@@ -130,10 +130,15 @@ describe("DDL", () => {
     });
   });
 
-  it("refuses what the write path cannot declare yet (R17.7)", () => {
-    const { run } = database();
-    expect(() => run("CREATE TABLE t (id SERIAL PRIMARY KEY)")).toThrow(UnsupportedPlanError);
-    expect(() => run("CREATE TYPE mood AS ENUM ('sad', 'ok')")).toThrow(UnsupportedPlanError);
+  it("lowers owned identity and named enum declarations (R17.7)", () => {
+    const { catalog } = database(
+      "CREATE TYPE mood AS ENUM ('sad', 'ok')",
+      "CREATE TABLE t (id SERIAL PRIMARY KEY, state mood)",
+    );
+    expect(catalog.view.typeByName("mood")?.labels).toEqual(["sad", "ok"]);
+    const table = catalog.view.tableByName("t");
+    expect(table?.columns[0]?.identitySequence).not.toBeNull();
+    expect(table?.columns[1]?.typeId).toBe(catalog.view.typeByName("mood")?.id);
   });
 });
 

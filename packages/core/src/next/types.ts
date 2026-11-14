@@ -15,6 +15,7 @@
  *   INTERVAL is three fields.
  */
 import type { SimpleDataType, SqlDomain } from "../storage/types.js";
+import { CATALOG_NATIVE_GRAMMAR } from "./durable-format.js";
 
 export interface BoolType {
   readonly kind: "bool";
@@ -197,6 +198,9 @@ export const INT64_MAX = 2n ** 63n - 1n;
 export const MICROS_PER_DAY = 86_400_000_000;
 /** PostgreSQL's NUMERIC limits: 131,072 digits before the point, 16,383 after. */
 export const NUMERIC_MAX_SCALE = 16_383;
+/** Current native enum sort keys store a two-byte declaration rank. */
+export const ENUM_LABEL_LIMIT = CATALOG_NATIVE_GRAMMAR.maximumEnumLabels;
+export const ENUM_LABEL_BYTES = CATALOG_NATIVE_GRAMMAR.maximumEnumLabelBytes;
 
 /**
  * The front end's description of one column or typed expression, as the catalog and the
@@ -254,7 +258,8 @@ export function requireDeclaredWidths(descriptor: SqlTypeDescriptor, context: st
  * | TEXT / VARCHAR / CHAR            | text                             |
  * | JSON / JSONB                     | json (binary false / true)       |
  * | UUID                             | uuid                             |
- * | enum type, string with enumValues| enum                             |
+ * | named enum type                  | enum                             |
+ * | string with enumValues           | text (separate column restriction) |
  * | element[]                        | array(element)                   |
  */
 export function physicalTypeOf(descriptor: SqlTypeDescriptor): PhysicalType {
@@ -291,8 +296,6 @@ export function physicalTypeOf(descriptor: SqlTypeDescriptor): PhysicalType {
     case "datetime":
       return { kind: "timestamp", zoned: descriptor.withoutTimeZone !== true };
     case "string": {
-      if (descriptor.enumValues !== undefined)
-        return { kind: "enum", name: "", labels: [...descriptor.enumValues] };
       // Native storage can carry bytes even though the SQL parser has no BYTEA surface yet.
       if (descriptor.declaredTypeName?.toUpperCase() === "BYTEA") return { kind: "bytes" };
       const width = descriptor.declaredLength;

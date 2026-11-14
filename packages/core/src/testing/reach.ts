@@ -5823,6 +5823,7 @@ export const CATALOG_LOG_SHAPE_REACH = [
   "createFts",
   "upsertFts",
   "dropFts",
+  "alterTable",
   "createTable",
   "dropTable",
   "createIndex",
@@ -5831,6 +5832,7 @@ export const CATALOG_LOG_SHAPE_REACH = [
   "putSequence",
   "dropSequence",
   "createView",
+  "replaceView",
   "dropView",
   "createType",
   "dropType",
@@ -6140,9 +6142,9 @@ export const FTS_CODEC_REACH = [
 ] as const;
 
 export const FTS_SELECTOR_REACH = [
-  "reader4 barrier",
-  "manifest5 barrier",
-  "commit body3",
+  "reader5 barrier",
+  "manifest6 barrier",
+  "commit body4",
   "wide sequence preserved",
   "checksummed roundtrip",
 ] as const;
@@ -6409,4 +6411,246 @@ export const TEXT_OUTPUT_SLICE_REACH = [
   "cancel",
   "redundant sign bytes",
   "zero",
+] as const;
+
+export const CATALOG_RELATIONSHIPS_REACH = [
+  "dangling column",
+  "generated self",
+  "default column",
+  "identity default",
+  "closed set",
+  "named type",
+  "view column",
+  "view cycle",
+  "view outputs",
+  "ordered dependencies",
+  "identity owner",
+] as const;
+
+export const CATALOG_SEMANTIC_FIELDS_REACH = [
+  "managed",
+  "typeId",
+  "allowedValues",
+  "defaultDependencies",
+  "generatedDependencies",
+  "autoIncrement",
+  "directions",
+  "dependencies",
+  "outputs",
+  "viewDependencies",
+  "viewSourceSchemas",
+  "expressionTypes",
+  "downgrade refused",
+] as const;
+
+export const CATALOG_ENUM_REACH = [
+  "NULL",
+  "valid label",
+  "invalid label",
+  "unicode label",
+  "empty label",
+  "different named enum",
+  "closed NULL",
+  "closed valid",
+  "closed invalid",
+  "closed text order",
+] as const;
+
+export const CATALOG_ENUM_LABELS_REACH = [
+  "valid label",
+  "wide label",
+  "ASCII",
+  "BMP",
+  "astral",
+  "63 bytes",
+  "64 bytes",
+  "rank limit fits",
+  "rank limit refused",
+] as const;
+
+export const CATALOG_ALTER_REACH = [
+  "published",
+  "resident",
+  "old snapshot",
+  "backfill",
+  "rename",
+  "drop",
+  "reopen",
+  "rollback",
+] as const;
+
+export const CATALOG_ALTER_WIDE_REACH = [
+  "multipart",
+  "small commit",
+  "exact backfill",
+  "new-schema rows",
+] as const;
+
+export const CATALOG_MIGRATION_REACH = [
+  "view declaration",
+  "invalid view rollback",
+  "DSL number counter",
+  "DSL integer counter",
+  "published integer maximum",
+  "resident integer maximum",
+  "managed",
+  "rename",
+  "widen set",
+  "backfill",
+  "adopt counter",
+  "explicit advances",
+  "idempotent",
+  "stale CAS",
+  "NOT NULL rollback",
+  "reopen",
+  "unmanaged survives",
+] as const;
+
+export const CATALOG_OBJECTS_REACH = [
+  "replace identity",
+  "view drop dependency",
+  "output compatibility",
+  "duplicate output",
+  "type dependency",
+  "quoted view output",
+  "drop type",
+  "sequence dependency",
+  "checkpoint restart",
+  "WAL restart",
+  "called restart",
+  "uncalled restart",
+  "drop sequence",
+] as const;
+
+export const CATALOG_MIGRATION_PUBLICATION_REACH = [
+  "publication after read",
+  "NULL only in suffix",
+  "maximum only in suffix",
+  "three chunks",
+  "two chunks",
+] as const;
+
+export const CATALOG_OWNED_NAMES_REACH = [
+  "collision",
+  "no collision",
+  "long ASCII",
+  "long Unicode",
+  "quoted names",
+] as const;
+
+export const CATALOG_STAGE2_DDL_REACH = [
+  "index descending",
+  "index ascending",
+  "self FK enforcement",
+  "named enum",
+  "self unique",
+  "self primary",
+  "identity",
+  "explicit integer",
+  "plain",
+  "case",
+  "dot",
+  "quote",
+  "view outputs",
+  "view dependency",
+  "checkpoint reopen",
+] as const;
+
+export const CATALOG_TYPE_NAMESPACE_REACH = [
+  "scalar builtin",
+  "array builtin",
+  "catalog composite",
+  "pseudo builtin",
+  "implicit pg_catalog first",
+  "quoted alias",
+  "novel custom",
+] as const;
+
+export const CATALOG_EXPRESSION_TYPES_REACH = [
+  "default",
+  "generated",
+  "check",
+  "literal data",
+  "check sequence",
+  "checkpoint",
+  "WAL",
+  "allocated IDs",
+  "dangling type",
+  "duplicate type",
+  "noncanonical types",
+] as const;
+
+export const CATALOG_VIEW_PRUNING_REACH = [
+  "plain unused",
+  "unused referrer",
+  "nested unused",
+  "recursive unused",
+  "materialized",
+  "used CTE admitted",
+  "ordinary query preserved",
+  "replacement identity",
+  "column precision",
+] as const;
+
+export const CATALOG_GENERATED_ENUM_REACH = [
+  "explicit stable refused",
+  "assignment allowed",
+  "default allowed",
+  "text",
+  "varchar",
+] as const;
+
+export const CATALOG_FTS_ALTER_REACH = [
+  "SQL dependency refusal",
+  "direct dependency refusal",
+  "rename",
+  "original name",
+  "checkpoint",
+  "WAL",
+  "scan after ALTER",
+  "first column",
+  "middle column",
+  "last column",
+] as const;
+
+export const ALTER_DEPENDENCIES_REACH = [
+  "generated",
+  "generated only",
+  "check",
+  "view",
+  "index",
+  "forward drops",
+  "reverse drops",
+  "multiple drops",
+  "short row",
+  "long row",
+  "quoted name",
+  "checkpoint",
+  "WAL",
+  "referenced drop refused",
+] as const;
+
+export const ADDED_ENUM_REACH = [
+  "plain",
+  "quoted",
+  "checkpoint",
+  "WAL",
+  "type drop refused",
+] as const;
+
+export const CATALOG_VIEW_SOURCES_REACH = [
+  "simple",
+  "qualified",
+  "derived",
+  "CTE",
+  "USING",
+  "NATURAL",
+  "nested replacement",
+  "column alias list",
+  "plain name",
+  "quoted name",
+  "checkpoint",
+  "WAL",
+  "reopen",
+  "binding corruption refused",
 ] as const;

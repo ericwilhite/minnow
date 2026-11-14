@@ -191,10 +191,46 @@ version gaps from rolled-back DDL. DROP TABLE carries its MCHG definition too.
 
 The manifest names the catalog tree, not a JSON blob. Reachability checks child depth and
 summaries plus contiguous fragment offsets, and reclamation retires every old index/data page.
-The reader/manifest/commit-body development selectors are 4/5/3; older unpublished selectors
+The reader/manifest/commit-body development selectors are 5/6/4; older unpublished selectors
 refuse. The released 1.0 format has no supported predecessor yet. Trigger family20 remains
 reserved. FTS declarations persist without making an index ready. Snapshot catalog frame
 adapters are a separate integration step over the same portable MCAT stream.
+
+### Relational catalog and managed migration
+
+Columns retain named type IDs, closed text restrictions and default/generated expression
+dependencies, including named types in casts erased by constant folding; CHECKs retain their
+column IDs and expression dialect. Views retain inferred output
+descriptors, base table/column, view, enum and sequence dependencies. Compatible replacement
+preserves the view ID; drops refuse live dependencies, including native FTS column bindings. Definition binding includes unused CTE
+bodies and both recursive arms without executing them. Explicit stable enum-to-text casts
+refuse stored generation; implicit assignment follows PostgreSQL’s separate coercion rule. The codec validates ordered dependencies,
+references, ownership and cycles before exposing stored definitions. Semantic extension fields
+may be absent but, when present, carry the required wire flag; they are never display extensions.
+These additions select reader5/manifest6/commitBody4 before any write. They change only
+unreleased development formats; the first released1.0 writer starts the supported chain.
+
+`composeEngine().migrate()` is the owner-local schema bridge. It uses the existing schema planner
+and one write transaction, checks an optional expected catalog version under the writer lock,
+and preserves unmanaged objects. The transport client is not a second migration implementation.
+Native ALTER keeps stable column IDs, frozen missing values and old snapshots. A new-schema write
+starts another memtable; publication always writes each memtable's original physical columns.
+NOT NULL validation reads only live validity bits. Sequence adoption reads only its integer
+column, and DSL counters advance past explicit safe integer values. SQL SERIAL and BY DEFAULT
+IDENTITY use PostgreSQL sequence semantics instead. Restart uses the existing durable reservation
+horizon; unused reserved values may be skipped after recovery.
+
+Limits: general `modify` IR execution is still outside this catalog stage. SQL/DSL definition
+and query differentials use PGlite; native TableWriter/persistence tests do not claim SQL DML
+execution. ALWAYS identity and identity options refuse with 0A000 instead of losing the clause.
+Named enums that shadow an underlying built-in `pg_type` name require SQL namespaces and
+explicitly refuse; quoted aliases such as `"integer"` retain their separate enum identity.
+Named types accept at most 65,536 labels (the current two-byte native sort rank), each at
+most 63 UTF8 bytes. A wider type explicitly refuses rather than truncating a sort key.
+SQL's separate statement/token limits also apply.
+Type/generated rewrites, new row constraints during ALTER, and backfills the literal lowerer
+cannot represent remain explicit refusals. Trigger firing and portable catalog adapters are later approved stages; native FTS
+scan/definitions are integrated, while its durable postings publication remains separate. No released next/ format exists yet; this is not freeze readiness.
 
 ### Commit encoding under the cap
 

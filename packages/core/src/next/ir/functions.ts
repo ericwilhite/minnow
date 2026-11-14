@@ -337,6 +337,7 @@ export const EXPLICIT_CASTS: Readonly<Partial<Record<SqlType, readonly SqlType[]
  * whose elements cast. Anything else is 42846.
  */
 export function explicitCastAllowed(from: PhysicalType, to: PhysicalType): boolean {
+  if (from.kind === "enum" && to.kind === "enum") return samePhysicalType(from, to);
   if (from.kind === to.kind && from.kind !== "array") return true;
   if (from.kind === "text" || to.kind === "text") return true;
   if (from.kind === "array" && to.kind === "array")

@@ -7,7 +7,8 @@
  */
 import type { MaybePromise } from "../access/key-index.js";
 import { ChunkReader } from "../page/reader.js";
-import type { FlatVector } from "../vector/vector.js";
+import type { FlatVector, Vector } from "../vector/vector.js";
+import { missingVector } from "./missing-value.js";
 import { allocateData } from "../vector/vector.js";
 import { ColumnChunk, MEMORY_CHUNK_ROWS } from "./columns.js";
 import { groupRootOf, type Memtable } from "./memtable.js";
@@ -36,7 +37,7 @@ export function readRows(
     list.push({ slot, position: locator % 65_536 });
   });
   // Each output column is filled slot by slot in request order: stage per-slot sources first.
-  const sources = new Array<{ vectors: FlatVector[]; index: number } | undefined>(rowIds.length);
+  const sources = new Array<{ vectors: Vector[]; index: number } | undefined>(rowIds.length);
   const pending: Array<Promise<void>> = [];
   const borrowed = new Map<Memtable, Set<number>>();
   const release = (): void => {
@@ -59,7 +60,12 @@ export function readRows(
               memtable.borrow(chunk, -1);
               chunks.add(chunk);
             }
-            const vectors = columns.map((_, c) => {
+            const vectors = columns.map((column, position) => {
+              const c =
+                memtable.schemaVersion === table.schemaVersion
+                  ? position
+                  : memtable.columns.findIndex((stored) => stored.id === column.id);
+              if (c < 0) return missingVector(column, MEMORY_CHUNK_ROWS);
               const stored = memtable.chunks[c]?.[chunk];
               if (stored === undefined) throw new RangeError("A memtable row is missing");
               return stored.view();
@@ -110,7 +116,7 @@ async function readGroupRows(
   table: TableSnapshotImpl,
   root: import("../format/manifest.js").GroupRoot,
   rows: ReadonlyArray<{ slot: number; position: number }>,
-  sources: Array<{ vectors: FlatVector[]; index: number } | undefined>,
+  sources: Array<{ vectors: Vector[]; index: number } | undefined>,
 ): Promise<void> {
   const shared = table.snapshot.shared;
   const positions = Int32Array.from(
@@ -118,19 +124,11 @@ async function readGroupRows(
     (row) => row.position,
   );
   const order = [...rows].sort((a, b) => a.position - b.position);
-  const vectors: FlatVector[] = [];
+  const vectors: Vector[] = [];
   for (const column of table.columns) {
     const stored = root.columns.find((chunk) => chunk.columnId === column.id);
     if (stored === undefined) {
-      // The group predates the column: every row reads as NULL (no defaults stored yet).
-      const vector: FlatVector = {
-        form: "flat",
-        type: column.type,
-        length: positions.length,
-        validity: new Uint32Array(Math.ceil(positions.length / 32)),
-        data: allocateData(column.type, positions.length),
-      };
-      vectors.push(vector);
+      vectors.push(missingVector(column, positions.length));
       continue;
     }
     const reader = await ChunkReader.open(shared.space, stored, { budget: shared.budget });

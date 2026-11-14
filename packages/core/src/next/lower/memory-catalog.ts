@@ -18,6 +18,8 @@ import type {
   TypeDef,
 } from "../access/catalog.js";
 import { CatalogChangeError } from "../access/catalog.js";
+import { resolveDependencies, tableUsesObject } from "../access/catalog-dependencies.js";
+import { ownedSequenceName } from "../access/catalog-names.js";
 import type { PhysicalType } from "../types.js";
 
 /** keys/key-encoding.ts `indexKeyKind` without the import lowering's layer forbids: enums are equality-only. */
@@ -31,6 +33,7 @@ class Snapshot implements CatalogView {
     readonly tables: readonly TableDef[],
     readonly sequences: readonly SequenceDef[],
     readonly views: readonly ViewDef[],
+    readonly types: readonly TypeDef[] = [],
   ) {}
   table(tableId: number): TableDef | undefined {
     return this.tables.find((table) => table.id === tableId);
@@ -41,13 +44,11 @@ class Snapshot implements CatalogView {
   sequence(sequenceId: number): SequenceDef | undefined {
     return this.sequences.find((sequence) => sequence.id === sequenceId);
   }
-  // Named types (R17.7): the in-memory catalog defines none.
-  readonly types: readonly TypeDef[] = [];
-  type(): TypeDef | undefined {
-    return undefined;
+  type(id: number): TypeDef | undefined {
+    return this.types.find((type) => type.id === id);
   }
-  typeByName(): TypeDef | undefined {
-    return undefined;
+  typeByName(name: string): TypeDef | undefined {
+    return this.types.find((type) => type.name === name);
   }
 }
 
@@ -75,10 +76,28 @@ export class MemoryCatalog {
 
   #table(input: TableInput, previous: TableDef | null): TableDef {
     const id = previous?.id ?? this.#id();
-    const columns: ColumnDef[] = input.columns.map((column) => ({
-      ...column,
-      id: column.id ?? this.#id(),
-    }));
+    const columns: ColumnDef[] = input.columns.map(
+      ({ identity: _identity, defaultDependencies: _d, generatedDependencies: _g, ...column }) => {
+        void _identity;
+        void _d;
+        void _g;
+        return { ...column, id: column.id ?? this.#id() };
+      },
+    );
+    const ids = columns.map((column) => column.id);
+    input.columns.forEach((source, i) => {
+      const column = columns[i];
+      if (!column) throw new CatalogChangeError("Missing column");
+      columns[i] = {
+        ...column,
+        ...(source.defaultDependencies === undefined
+          ? {}
+          : { defaultDependencies: resolveDependencies(source.defaultDependencies, ids) }),
+        ...(source.generatedDependencies === undefined
+          ? {}
+          : { generatedDependencies: resolveDependencies(source.generatedDependencies, ids) }),
+      };
+    });
     const columnId = (position: number): number => {
       const column = columns[position];
       if (column === undefined)
@@ -165,11 +184,15 @@ export class MemoryCatalog {
       name: check.name,
       conditionSql: check.conditionSql,
       columnIds: check.columns.map(columnId),
+      ...(check.dependencies === undefined
+        ? {}
+        : { dependencies: resolveDependencies(check.dependencies, ids) }),
     }));
     return {
       id,
       name: input.name,
       schemaVersion: (previous?.schemaVersion ?? 0) + 1,
+      ...(input.managed === undefined ? {} : { managed: input.managed }),
       columns,
       primaryKey,
       indexes,
@@ -184,12 +207,58 @@ export class MemoryCatalog {
     let tables = view.tables;
     let sequences = view.sequences;
     let views = view.views;
+    let types = view.types;
     let created: number | null = null;
     switch (change.kind) {
       case "createTable": {
         if (this.#nameTaken(change.table.name))
           throw new CatalogChangeError(`${change.table.name} exists`);
-        const table = this.#table(change.table, null);
+        const initial = this.#table(change.table, null);
+        const columns = initial.columns.map((column, i) => {
+          const identity = change.table.columns[i]?.identity;
+          if (!identity) return column;
+          if (column.type.kind !== "int32" && column.type.kind !== "int64")
+            throw new CatalogChangeError("Identity needs an integer");
+          const min =
+            column.type.kind === "int64"
+              ? -(1n << 63n)
+              : column.type.bits === 16
+                ? -32768n
+                : -2147483648n;
+          const max =
+            column.type.kind === "int64"
+              ? (1n << 63n) - 1n
+              : column.type.bits === 16
+                ? 32767n
+                : 2147483647n;
+          const id = this.#id();
+          sequences = [
+            ...sequences,
+            {
+              id,
+              name: ownedSequenceName(
+                initial.name,
+                column.name,
+                (name) =>
+                  this.#nameTaken(name) ||
+                  sequences.some((entry) => entry.name === name) ||
+                  initial.indexes.some((entry) => entry.name === name),
+              ),
+              start: identity.start,
+              increment: identity.increment,
+              min: identity.increment > 0n ? 1n : min,
+              max: identity.increment > 0n ? max : -1n,
+              cycle: false,
+              ownedBy: { tableId: initial.id, columnId: column.id },
+            },
+          ];
+          return {
+            ...column,
+            identitySequence: id,
+            defaultDependencies: { dialectVersion: 1, columnIds: [], sequenceIds: [id] },
+          };
+        });
+        const table = { ...initial, columns };
         tables = [...tables, table];
         created = table.id;
         break;
@@ -205,6 +274,7 @@ export class MemoryCatalog {
       case "dropTable":
         if (view.table(change.tableId) === undefined) throw new CatalogChangeError("No such table");
         tables = tables.filter((table) => table.id !== change.tableId);
+        sequences = sequences.filter((sequence) => sequence.ownedBy?.tableId !== change.tableId);
         break;
       case "createIndex": {
         if (this.#nameTaken(change.index.name))
@@ -241,9 +311,21 @@ export class MemoryCatalog {
           entry.id === change.sequence.id ? change.sequence : entry,
         );
         break;
-      case "dropSequence":
+      case "dropSequence": {
+        const sequence = sequences.find((sequence) => sequence.id === change.sequenceId);
+        if (
+          sequence?.ownedBy != null ||
+          tables.some((table) => tableUsesObject(table, "sequence", change.sequenceId)) ||
+          views.some((view) =>
+            view.dependencies?.some(
+              (dep) => dep.kind === "sequence" && dep.objectId === change.sequenceId,
+            ),
+          )
+        )
+          throw new CatalogChangeError("Sequence in use");
         sequences = sequences.filter((entry) => entry.id !== change.sequenceId);
         break;
+      }
       case "createView": {
         if (this.#nameTaken(change.view.name))
           throw new CatalogChangeError(`${change.view.name} exists`);
@@ -252,11 +334,41 @@ export class MemoryCatalog {
         created = created_.id;
         break;
       }
+      case "replaceView":
+        if (!views.some((view) => view.id === change.view.id))
+          throw new CatalogChangeError("No such view");
+        views = views.map((view) => (view.id === change.view.id ? change.view : view));
+        break;
+      case "createType": {
+        if (types.some((type) => type.name === change.type.name))
+          throw new CatalogChangeError("Type exists");
+        const type = { ...change.type, id: this.#id() };
+        types = [...types, type];
+        created = type.id;
+        break;
+      }
+      case "dropType":
+        if (
+          tables.some((table) =>
+            tableUsesObject(
+              table,
+              "type",
+              change.typeId,
+              types.find((type) => type.id === change.typeId)?.name,
+            ),
+          ) ||
+          views.some((view) =>
+            view.dependencies?.some((dep) => dep.kind === "type" && dep.objectId === change.typeId),
+          )
+        )
+          throw new CatalogChangeError("Type in use");
+        types = types.filter((type) => type.id !== change.typeId);
+        break;
       case "dropView":
         views = views.filter((entry) => entry.id !== change.viewId);
         break;
     }
-    this.#view = new Snapshot(view.version + 1, tables, sequences, views);
+    this.#view = new Snapshot(view.version + 1, tables, sequences, views, types);
     return { id: created };
   }
 }
