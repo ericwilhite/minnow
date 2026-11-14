@@ -8690,6 +8690,8 @@ export const SNAPSHOT_CATALOG_REFUSAL_REACH = [
   "unsafe id",
   "unresolved reference",
   "unsupported field",
+  "unsupported trigger",
+  "unsupported fts",
 ] as const;
 
 export const SNAPSHOT_RETIREMENT_REACH = [

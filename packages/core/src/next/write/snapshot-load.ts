@@ -39,7 +39,12 @@ import {
   type ExtentSpace,
   type ExtentWriter,
 } from "../storage/extents.js";
-import { decodeJson } from "./bytes.js";
+import { decodeCatalogStream } from "./catalog-stream.js";
+import { writeCatalogStorage } from "./catalog-storage.js";
+import { UnsupportedCatalogError } from "./catalog-records.js";
+import { SnapshotFormatError } from "../format/snapshot.js";
+import { StoreCorruptionError } from "../storage/contract.js";
+import { DurableFormatError } from "../durable-format.js";
 import { validateSnapshotCatalog } from "./snapshot-catalog-validate.js";
 import { Catalog } from "./catalog.js";
 import { SnapshotScopeError } from "./snapshot-export.js";
@@ -312,8 +317,16 @@ async function loadAttempt(
           catalogBytes.set(part, at);
           at += part.length;
         }
-        validateSnapshotCatalog(decodeJson(catalogBytes));
-        catalog = Catalog.decode(catalogBytes);
+        try {
+          const data = decodeCatalogStream(catalogBytes);
+          validateSnapshotCatalog(data);
+          catalog = Catalog.fromStored(data, budget);
+        } catch (error) {
+          if (error instanceof UnsupportedCatalogError) throw new SnapshotScopeError(error.message);
+          if (error instanceof StoreCorruptionError || error instanceof DurableFormatError)
+            throw new SnapshotFormatError(error.message);
+          throw error;
+        }
         stage3Scope(catalog);
         catalogParts.length = 0;
         account.free(catalogLength); // part copies consumed; slots remain funded
@@ -459,9 +472,7 @@ async function loadAttempt(
       "Incomplete native snapshot generation",
     );
     await scratchWriter.abort();
-    const writtenCatalog = await writer.write([catalogBytes]),
-      catalogRef = writtenCatalog.blobs[0];
-    snapshotCheck(catalogRef !== undefined, "Missing native catalog");
+    const catalogRef = await writeCatalogStorage(writer, catalog, budget, options.signal);
     list = new ExtentListKeeper([], { reader: target.space, budget, ...options });
     const prepared = await list.prepare(1, { added: writer.extents, released: [], writer });
     listPrepared = true;

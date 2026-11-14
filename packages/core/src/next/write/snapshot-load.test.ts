@@ -32,7 +32,10 @@ import {
 } from "../format/snapshot.js";
 import { vectorOf } from "../page/test-support.js";
 import { encodeArrayValue } from "../vector/array-value.js";
-import { decodeJson, encodeJson } from "./bytes.js";
+import { ByteReader, ByteWriter } from "./bytes.js";
+import { decodeCatalogStream, encodeCatalogStream } from "./catalog-stream.js";
+import { ftsDef } from "../access/fts-def.js";
+import { CATALOG_RECORD_KINDS } from "../durable-format.js";
 import { Catalog } from "./catalog.js";
 import { exportPinnedSnapshot } from "./snapshot-export.js";
 import { loadSnapshot, type SnapshotLoadTarget } from "./snapshot-load.js";
@@ -816,9 +819,46 @@ for (const seed of seedsFor("next-snapshot-load-openers", [0xb267, 0xb268]))
     reach.assertReached();
   }, 60000);
 
+/** A nonrepresentable ID cannot pass the canonical encoder, so mutate its wire field.
+ * Reframe every MCAT length and outer CRC afterward; no malformed transport shortcut. */
+function unsafeCatalogId(bytes: Uint8Array): Uint8Array {
+  const input = new ByteReader(bytes),
+    out = new ByteWriter();
+  out.raw(input.raw(16));
+  let changed = false;
+  while (input.offset < bytes.length) {
+    const kind = input.varuint(),
+      version = input.varuint(),
+      body = input.blob();
+    out.varuint(kind);
+    out.varuint(version);
+    if (kind !== CATALOG_RECORD_KINDS.table || changed) {
+      out.blob(body);
+      continue;
+    }
+    const fields = new ByteReader(body),
+      encoded = new ByteWriter();
+    while (fields.offset < body.length) {
+      const id = fields.varuint(),
+        flags = fields.u8(),
+        payload = fields.blob();
+      encoded.varuint(id);
+      encoded.u8(flags);
+      if (id === 1) {
+        encoded.blob(new Uint8Array([128, 128, 128, 128, 128, 128, 128, 16]));
+        changed = true;
+      } else encoded.blob(payload);
+    }
+    out.blob(encoded.finish());
+  }
+  expect(changed).toBe(true);
+  return out.finish();
+}
+
 async function corruptCatalog(
   chunks: readonly Uint8Array[],
   change: (value: Record<string, unknown>) => void,
+  unsafeId = false,
 ): Promise<Uint8Array[]> {
   const b = new Budget(),
     reader = await SnapshotStreamReader.open(
@@ -844,9 +884,10 @@ async function corruptCatalog(
       if (frame.kind === SnapshotKind.footer) continue;
       let bytes = frame.payload;
       if (frame.kind === SnapshotKind.catalogPart) {
-        const data = decodeJson(bytes) as Record<string, unknown>;
-        change(data);
-        bytes = encodeJson(data);
+        const data = decodeCatalogStream(bytes);
+        change(data as unknown as Record<string, unknown>);
+        bytes = encodeCatalogStream(data);
+        if (unsafeId) bytes = unsafeCatalogId(bytes);
         length = bytes.length;
         crc = snapshotCrc32(bytes);
       } else if (frame.kind === SnapshotKind.catalogEnd) {
@@ -887,35 +928,75 @@ for (const seed of seedsFor("next-snapshot-catalog-refusal", [0xb269, 0xb26a]))
         const lsn = path.appliedLsn;
         await h.close();
         for (const mutation of SNAPSHOT_CATALOG_REFUSAL_REACH) {
-          const damaged = await corruptCatalog(chunks, (data) => {
-            const tables = data.tables as Array<Record<string, unknown>>,
-              table = tables[0];
-            if (table === undefined) throw new Error("missing fixture table");
-            const columns = table.columns as Array<Record<string, unknown>>,
-              first = columns[0];
-            if (first === undefined) throw new Error("missing fixture column");
-            switch (mutation) {
-              case "duplicate table name":
-                tables.push({ ...table, id: salt + 10 });
-                (data.counters as Record<string, unknown>).nextTableId = salt + 11;
-                break;
-              case "counter floor":
-                (data.counters as Record<string, unknown>).nextTableId = 1;
-                break;
-              case "duplicate column id":
-                columns.push({ ...first });
-                break;
-              case "unsafe id":
-                table.id = Number.MAX_SAFE_INTEGER + 1;
-                break;
-              case "unresolved reference":
-                first.identitySequence = salt + 100;
-                break;
-              case "unsupported field":
-                table.triggers = [{ id: salt }];
-                break;
-            }
-          });
+          const damaged = await corruptCatalog(
+            chunks,
+            (data) => {
+              const tables = data.tables as Array<Record<string, unknown>>,
+                table = tables[0];
+              if (table === undefined) throw new Error("missing fixture table");
+              const columns = table.columns as Array<Record<string, unknown>>,
+                first = columns[0];
+              if (first === undefined) throw new Error("missing fixture column");
+              switch (mutation) {
+                case "duplicate table name":
+                  tables.push({ ...table, id: salt + 10 });
+                  (data.counters as Record<string, unknown>).nextTableId = salt + 11;
+                  break;
+                case "counter floor":
+                  (data.counters as Record<string, unknown>).nextTableId = 1;
+                  break;
+                case "duplicate column id":
+                  columns.push({ ...first });
+                  break;
+                case "unsafe id":
+                  // Inject an out-of-u53 varint below: the canonical encoder refuses it.
+                  table.id = 1;
+                  break;
+                case "unresolved reference":
+                  first.identitySequence = salt + 100;
+                  break;
+                case "unsupported trigger":
+                  tables.push({ ...table, id: 2, name: "audit", columns: [] });
+                  (data.counters as Record<string, unknown>).nextTableId = 3;
+                  (data.counters as Record<string, unknown>).nextTriggerId = 2;
+                  data.triggers = [
+                    {
+                      id: 1,
+                      name: "copy",
+                      tableId: 1,
+                      event: "insert",
+                      timing: "after",
+                      dialectVersion: 1,
+                      statements: [
+                        {
+                          sql: 'INSERT INTO "audit" DEFAULT VALUES',
+                          kind: "insert",
+                          targetTableId: 2,
+                          targetName: "audit",
+                          bindings: [],
+                          columns: [],
+                          insertColumnIds: [],
+                          defaultColumnIds: [],
+                          implicitArity: null,
+                          assignedColumnIds: [],
+                          typeIds: [],
+                          sequenceIds: [],
+                        },
+                      ],
+                    },
+                  ];
+                  break;
+                case "unsupported fts":
+                  data.fts = [ftsDef(1, 1, 2)];
+                  (data.counters as Record<string, unknown>).nextFtsId = 2;
+                  break;
+                case "unsupported field":
+                  table.managed = true;
+                  break;
+              }
+            },
+            mutation === "unsafe id",
+          );
           let opens = 0;
           const b = new Budget();
           await expect(
@@ -929,8 +1010,9 @@ for (const seed of seedsFor("next-snapshot-catalog-refusal", [0xb269, 0xb26a]))
               { replace: true },
             ),
           ).rejects.toMatchObject({
-            code:
-              mutation === "unsupported field" ? "MINNOW_SNAPSHOT_SCOPE" : "MINNOW_SNAPSHOT_FORMAT",
+            code: mutation.startsWith("unsupported")
+              ? "MINNOW_SNAPSHOT_SCOPE"
+              : "MINNOW_SNAPSHOT_FORMAT",
           });
           expect(opens).toBe(0);
           expect(b.used).toBe(0);
@@ -1151,7 +1233,7 @@ for (const seed of seedsFor("next-snapshot-structured", [0xb271, 0xb272]))
     await fc.assert(
       fc.asyncProperty(fc.integer({ min: 1, max: 32 }), async (size) => {
         reach.beginHistory();
-        const bytesType: PhysicalType = { kind: "bytes" },
+        const bytesType: PhysicalType = { kind: "text" },
           arrayType: PhysicalType = { kind: "array", element: bytesType };
         const original = encodeArrayValue(bytesType, {
           dimensions: [2],
@@ -1298,7 +1380,7 @@ for (const seed of seedsFor("next-snapshot-structured", [0xb271, 0xb272]))
 
 for (const layout of ["bytes", "json", "decimal", "padded decimal"] as const)
   it(`streams large ${layout} values without materializing value graphs`, async () => {
-    const element: PhysicalType = { kind: "bytes" };
+    const element: PhysicalType = { kind: "text" };
     const decimalType: PhysicalType = { kind: "decimal", precision: null, scale: null };
     let example: { type: PhysicalType; value: Uint8Array };
     if (layout === "bytes")
@@ -1344,11 +1426,13 @@ for (const layout of ["bytes", "json", "decimal", "padded decimal"] as const)
     const h = new Harness("strict", "memory"),
       funding = new Governor(16 << 20),
       archive = await structuredArchive(example.type, example.value);
+    let opened = false;
     try {
       await loadSnapshot(input(archive), () => target(h), funding);
       expect(funding.usedBytes).toBe(0);
-      const path = await h.open(),
-        pin = path.pin(),
+      const path = await h.open();
+      opened = true;
+      const pin = path.pin(),
         exported: Uint8Array[] = [];
       try {
         const catalog = pin.catalog;
@@ -1391,7 +1475,7 @@ for (const layout of ["bytes", "json", "decimal", "padded decimal"] as const)
       }
       expect(funding.peakBytes).toBeLessThanOrEqual(16 << 20);
     } finally {
-      await h.close();
+      if (opened) await h.close();
     }
   }, 60000);
 

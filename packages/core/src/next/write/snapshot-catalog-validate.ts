@@ -1,6 +1,6 @@
 /** Stage3's accepted logical catalog subset. Validate raw fields BEFORE Catalog's maps can
  * hide duplicate identities or unknown fields, and BEFORE acquiring/fencing the target.
- * Stage4 replaces this legacy JSON adapter with B6's common MCAT validation.
+ * MCAT performs full native validation; this phase additionally restricts load semantics.
  */
 import { SnapshotScopeError } from "./snapshot-export.js";
 import { snapshotCheck } from "./snapshot-stage.js";
@@ -38,7 +38,17 @@ function name(value: unknown, seen: Set<string>): void {
 }
 export function validateSnapshotCatalog(value: unknown): void {
   const data = record(value);
-  fields(data, ["version", "counters", "tables", "sequences", "views", "types"]);
+  fields(data, [
+    "version",
+    "counters",
+    "tables",
+    "sequences",
+    "views",
+    "types",
+    "fts",
+    "triggers",
+    "wireMetadata",
+  ]);
   integer(data.version, true);
   const counters = record(data.counters),
     counterKeys = [
@@ -49,6 +59,8 @@ export function validateSnapshotCatalog(value: unknown): void {
       "nextSequenceId",
       "nextViewId",
       "nextTypeId",
+      "nextFtsId",
+      "nextTriggerId",
     ];
   fields(counters, counterKeys);
   for (const key of counterKeys) integer(counters[key]);
@@ -66,7 +78,10 @@ export function validateSnapshotCatalog(value: unknown): void {
   const sequences = list(data.sequences),
     views = list(data.views),
     types = list(data.types);
-  // TODO(B6): complete sequence/view semantics through MCAT, not opaque JSON fields.
+  // TODO(B6/B2 stage4): carry trigger/FTS/managed semantics or refuse, never silently drop.
+  if (list(data.triggers).length || list(data.fts).length)
+    throw new SnapshotScopeError("Stage3 trigger/FTS snapshot reconstruction is unsupported");
+  // TODO(B6): complete sequence/view semantics through the shared MCAT grammar.
   if (sequences.length || views.length)
     throw new SnapshotScopeError("Stage3 snapshot sequences/views are unsupported");
   const typeNames = new Map<string, readonly unknown[]>();

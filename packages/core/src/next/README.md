@@ -4266,16 +4266,20 @@ rejection is indeterminate: close/reopen and inspect the native root, never free
 reach. Old generations remain under the usual two-root/pin rules, and quota never truncates
 the old root/log to make room. Callers reopen the ordinary write path after publication.
 
-Stage3's internal catalog seam currently accepts native catalog bytes and explicitly refuses
-sequences, indexes/constraints and missing/backfill vectors pending portable catalog1/stage4.
+Stage3's internal catalog seam uses the common MCAT logical grammar and native
+`Catalog.fromStored` graph validation before target acquisition. Publication writes MCRT catalog
+pages through `writeCatalogStorage`, with the merged reader7/manifest8/body6 contract.
+Sequences, views, indexes/constraints, missing/backfill vectors, triggers, FTS and managed fields
+have explicit typed TODO refusals until stage4 supports their complete semantics.
 It is not a complete owner load command or a frozen portable format. No supported stored
 format changes, existing upgrade chain or public package API are introduced by this stage.
 
 Stage3 load validates its accepted catalog subset before target acquisition: unknown fields,
 duplicate IDs/names, unsafe integers, allocation-counter floors and unresolved references
 are refused. Views, sequences, indexes/constraints and missing/backfill vectors require the
-stage4 MCAT adapter and receive a typed refusal here; trigger/managed/FTS fields cannot disappear
-through a permissive catalog constructor. This is an unreleased development interface.
+stage4 scope and receive a typed refusal here. Required MCAT features are checked, optional
+display extensions follow native preservation rules, and unsupported trigger/managed/FTS
+semantics cannot disappear through catalog construction. This is an unreleased development interface.
 
 Complete snapshot replacement borrows the extent space's immutable, disk-backed current-root
 inventory as retirement claims. It does not collect old extents in a JavaScript Set or array.
