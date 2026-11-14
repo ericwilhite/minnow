@@ -49,6 +49,10 @@ jobs:
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ${{ matrix.os }}
     timeout-minutes: 360
+    # The conformance step builds the core first, which outgrew Node's default ~2 GiB heap on
+    # the macOS WebKit runners (Release run 43647072337: heap OOM, exit 134). Same as ci.yml.
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
     strategy:
       fail-fast: false
       matrix:
