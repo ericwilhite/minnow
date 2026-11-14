@@ -118,7 +118,7 @@ function* sizeOf(
   if (value === null) return SLOT_BYTES + dataBytes(type, 1) + 4;
   if (type.kind === "decimal") return numericBytes(type, value, scratch);
   if (type.kind === "bytes" && value instanceof Uint8Array) return SLOT_BYTES + value.byteLength;
-  if (type.kind !== "text" || typeof value !== "string")
+  if ((type.kind !== "text" && type.kind !== "enum") || typeof value !== "string")
     return SLOT_BYTES + (typeof value === "string" ? 8 * value.length : 0);
   let bytes = 0,
     nextCheck = 8192;
@@ -259,7 +259,13 @@ export function prepareParameters(
             }
             const value = inputValue(plan, values, slot);
             if (value === undefined) throw new ParameterBindError("missing parameter", slot);
-            if (type.kind === "text" && typeof value === "string") {
+            if ((type.kind === "text" || type.kind === "enum") && typeof value === "string") {
+              if (type.kind === "enum" && !type.labels.includes(value))
+                throw new ParameterBindError(
+                  `invalid input value for enum ${type.name}: "${value}"`,
+                  slot,
+                  "22P02",
+                );
               if (value.includes("\0"))
                 throw new ParameterBindError(
                   `$${String(slot + 1)}: text cannot contain a zero byte`,
@@ -356,6 +362,7 @@ export function checkParameterType(type: PhysicalType): void {
   )
     return;
   if (type.kind === "text" && type.maxLength === undefined) return;
+  if (type.kind === "enum") return;
   throw new UnsupportedPlanError(`a ${type.kind} parameter`, { construct: "parameter" });
 }
 
@@ -536,6 +543,10 @@ function materialize(
         return typeof value === "string" || value instanceof Date
           ? clockParameter(type, timestamp(value, type.zoned))
           : invalid();
+      case "enum":
+        if (typeof value !== "string" || !type.labels.includes(value))
+          throw new RangeError(`invalid input value for enum ${type.name}: "${String(value)}"`);
+        return text(value, type);
       case "text":
         return typeof value === "string" ? text(value, type) : invalid();
       case "bytes": {
@@ -550,6 +561,7 @@ function materialize(
     throw new ParameterBindError(
       `$${String(slot + 1)}: ${error instanceof Error ? error.message : String(error)}`,
       slot,
+      type.kind === "enum" ? "22P02" : "22023",
     );
   }
 }

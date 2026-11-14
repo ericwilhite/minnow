@@ -52,11 +52,40 @@ export interface CatalogView {
   sequence(sequenceId: number): SequenceDef | undefined;
 }
 
+/** Durable, resolved expression dependencies; column ids are local to their owning table. */
+export interface ExpressionDependencies {
+  readonly dialectVersion: number;
+  readonly columnIds: readonly number[];
+  readonly sequenceIds: readonly number[];
+  /** Absent means no named types; includes casts erased by constant folding. */
+  readonly typeIds?: readonly number[];
+}
+/** Column positions in a not-yet-created/replaced table input, resolved to stable IDs once. */
+export interface InputExpressionDependencies {
+  readonly dialectVersion: number;
+  readonly columns: readonly number[];
+  readonly sequenceIds: readonly number[];
+  readonly typeIds?: readonly number[];
+}
+export interface CatalogDependency {
+  readonly kind: "table" | "view" | "type" | "sequence";
+  readonly objectId: number;
+  readonly columnIds: readonly number[];
+}
+export interface ViewOutput {
+  readonly name: string;
+  readonly type: PhysicalType;
+  readonly declared: SqlTypeDescriptor;
+  readonly nullable: boolean;
+}
+
 export interface TableDef {
   readonly id: number;
   readonly name: string;
   /** Increases with every ALTER of this table (format/replay.ts checks frames against it). */
   readonly schemaVersion: number;
+  /** Only schema-owned objects may be removed implicitly by an authoritative migration. */
+  readonly managed?: boolean;
   /** Live columns in catalog order (dropped columns are absent; their ids are not reused). */
   readonly columns: readonly ColumnDef[];
   /** The primary key's index, or null for a table without one. */
@@ -80,12 +109,19 @@ export interface ColumnDef {
   readonly generatedSql: string | null;
   /** The sequence behind SERIAL / IDENTITY / AUTOINCREMENT, or null. */
   readonly identitySequence: number | null;
+  /** Schema-DSL counter semantics: explicit safe integers advance the owned sequence. */
+  readonly autoIncrement?: true;
   /**
    * The value of rows stored before the column existed (ALTER TABLE ADD COLUMN with a constant
    * default; PostgreSQL's `attmissingval`): a length-1 flat vector, null via its validity. Null
    * when such rows read as SQL NULL.
    */
   readonly missing: FlatVector | null;
+  /** A named enum identity; closed text sets use allowedValues instead. */
+  readonly typeId?: number;
+  readonly allowedValues?: readonly string[];
+  readonly defaultDependencies?: ExpressionDependencies;
+  readonly generatedDependencies?: ExpressionDependencies;
 }
 
 export interface IndexDef {
@@ -98,6 +134,8 @@ export interface IndexDef {
   /** `ordered`: equality and ranges in key-byte order; `equality`: lookups only (enum). */
   readonly kind: "ordered" | "equality";
   readonly role: "primary" | "unique" | "secondary" | "foreignKey";
+  /** Declaration only: physical index keys remain ascending; mixed ordering still sorts. */
+  readonly directions?: ReadonlyArray<"asc" | "desc">;
   /** Invalid nonunique indexes retain their identity but cannot answer queries. Writes scan
    * instead after the shipped term limit is exceeded. Old snapshots keep their ready catalog. */
   readonly invalid?: true;
@@ -129,6 +167,7 @@ export interface CheckDef {
   readonly name: string;
   /** The condition (SQL text) over this table's columns. False fails; NULL passes. */
   readonly conditionSql: string;
+  readonly dependencies?: ExpressionDependencies;
   /** Columns the condition reads, so an UPDATE that assigns none of them skips the check. */
   readonly columnIds: readonly number[];
 }
@@ -156,6 +195,9 @@ export interface ViewDef {
   readonly id: number;
   readonly name: string;
   readonly bodySql: string;
+  readonly managed?: boolean;
+  readonly outputs?: readonly ViewOutput[];
+  readonly dependencies?: readonly CatalogDependency[];
 }
 
 /**
@@ -176,6 +218,7 @@ export type CatalogChange =
   | { readonly kind: "dropSequence"; readonly sequenceId: number }
   | { readonly kind: "createView"; readonly view: Omit<ViewDef, "id"> }
   | { readonly kind: "dropView"; readonly viewId: number }
+  | { readonly kind: "replaceView"; readonly view: ViewDef }
   | { readonly kind: "createType"; readonly type: Omit<TypeDef, "id"> }
   | { readonly kind: "dropType"; readonly typeId: number }
   | { readonly kind: "createFts"; readonly fts: Omit<FtsDef, "id"> }
@@ -188,8 +231,11 @@ export type CatalogChange =
  */
 export interface TableInput {
   readonly name: string;
+  readonly managed?: boolean;
   readonly columns: ReadonlyArray<
-    Omit<ColumnDef, "id"> & {
+    Omit<ColumnDef, "id" | "defaultDependencies" | "generatedDependencies"> & {
+      readonly defaultDependencies?: InputExpressionDependencies;
+      readonly generatedDependencies?: InputExpressionDependencies;
       readonly id?: number;
       /**
        * An owned identity sequence to create with the table (SERIAL, IDENTITY, AUTOINCREMENT;
@@ -219,7 +265,8 @@ export interface TableInput {
     }
   >;
   readonly checks: ReadonlyArray<
-    Omit<CheckDef, "id" | "columnIds"> & {
+    Omit<CheckDef, "id" | "columnIds" | "dependencies"> & {
+      readonly dependencies?: InputExpressionDependencies;
       readonly id?: number;
       readonly columns: readonly number[];
     }

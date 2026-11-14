@@ -35,6 +35,9 @@
  * started execution continues as an ordinary `Run`: nothing is executed twice.
  */
 import type { CatalogView } from "../access/catalog.js";
+import type { AnyTable, SchemaDefinition, MigrationPlan } from "../../engine/schema.js";
+import { migrateCatalog, type MigrationOptions } from "./catalog-migration.js";
+import { inspectCatalog } from "../lower/catalog-schema.js";
 import type { Statement, TableRules } from "../access/modify.js";
 import type { Snapshot } from "../access/snapshot.js";
 import type {
@@ -286,11 +289,18 @@ function countsOf(
   return { [name]: summary.rowCount };
 }
 
-export function composeEngine(options: ComposeOptions): OwnerEngine {
+/** Owner-local schema entry point; the transport client remains a separate composition. */
+export interface CatalogOwnerEngine extends OwnerEngine {
+  migrate(
+    definition: SchemaDefinition<readonly AnyTable[]>,
+    options?: MigrationOptions,
+  ): Promise<MigrationPlan>;
+}
+export function composeEngine(options: ComposeOptions): CatalogOwnerEngine {
   return new ComposedEngine(options);
 }
 
-class ComposedEngine implements OwnerEngine {
+class ComposedEngine implements CatalogOwnerEngine {
   createReturnPool(capBytes: number): ReturnPool {
     return new ReturnPool(this.#options.governor, capBytes);
   }
@@ -491,9 +501,24 @@ class ComposedEngine implements OwnerEngine {
 
   admin(op: string): Promise<unknown> {
     if (op === "catalog")
-      return Promise.resolve(structuredClone(this.#options.writePath.catalog.tables));
+      return Promise.resolve(structuredClone(inspectCatalog(this.#options.writePath.catalog)));
     if (op === "storageStats") return Promise.resolve({ ...this.#options.writePath.stats() });
     return Promise.reject(new TypeError(`Admin operation ${op} is not available yet`));
+  }
+
+  async migrate(
+    definition: SchemaDefinition<readonly AnyTable[]>,
+    options: MigrationOptions = {},
+  ): Promise<MigrationPlan> {
+    const result = await migrateCatalog(
+      this.#options.writePath,
+      this.#options.planner,
+      this.#options.governor,
+      definition,
+      options,
+    );
+    if (result.steps.length) this.committed(result.changedTables);
+    return { steps: result.steps };
   }
 
   flushPending(): Promise<void> {

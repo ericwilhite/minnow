@@ -168,6 +168,7 @@ it.each(seedsFor("next-catalog-log-shape", [0xb760, 0xb761]))(
     };
     const inputs: CatalogOperation[] = [
       { op: "createTable", table, sequences: [] },
+      { op: "alterTable", table, sequences: [] },
       { op: "dropTable", tableId: 1 },
       { op: "createIndex", index },
       { op: "invalidateIndex", tableId: 1, indexId: 1 },
@@ -175,6 +176,7 @@ it.each(seedsFor("next-catalog-log-shape", [0xb760, 0xb761]))(
       { op: "putSequence", sequence },
       { op: "dropSequence", sequenceId: 1 },
       { op: "createView", view: { id: 1, name: "v", bodySql: "SELECT 1" } },
+      { op: "replaceView", view: { id: 1, name: "v", bodySql: "SELECT 2" } },
       { op: "dropView", viewId: 1 },
       { op: "createType", type: { id: 1, name: "typ", labels: ["a"] } },
       { op: "dropType", typeId: 1 },

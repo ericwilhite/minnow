@@ -16,7 +16,7 @@ export type UnsupportedConstruct =
   | "merge"
   /** CREATE TRIGGER / DROP TRIGGER and firing (the new catalog has no triggers). */
   | "trigger"
-  /** CREATE TYPE … AS ENUM and columns of a named enum type (the new catalog has no types). */
+  /** Reserved category for enum forms beyond the implemented named catalog types. */
   | "enumType"
   /** `@@` / BM25 full-text search (no IR operator). */
   | "fullTextSearch"
@@ -38,11 +38,11 @@ export type UnsupportedConstruct =
   | "setOp"
   /** Ordered-set aggregates (percentile_cont/disc, mode) and JSON aggregates. */
   | "aggregate"
-  /** SERIAL / IDENTITY columns (needs the write path's owned sequences, R17.7). */
+  /** An identity form beyond SERIAL / BY DEFAULT and schema counters. */
   | "identityColumn"
-  /** A foreign key to its own table (needs the write path's "self" parent, R17.7). */
+  /** Reserved category for self-reference forms beyond PRIMARY/UNIQUE targets. */
   | "selfReference"
-  /** CREATE OR REPLACE VIEW over an existing view (two catalog changes). */
+  /** Reserved category for view replacement beyond compatible output descriptors. */
   | "replaceView"
   /** A batch write that finds rows by key (update / delete batches need a lookup join, M3). */
   | "batchWrite";
@@ -103,6 +103,8 @@ export const FRONT_END_STATES: ReadonlyArray<readonly [RegExp, string]> = [
   // An argument type no overload takes: "UPPER requires a string argument".
   [/^\S+ (requires an? [\w ]+ argument|takes [\w ]+ arguments)$/u, "42883"],
   [/^Unsupported CAST target: /u, "42704"],
+  [/^(?:GENERATED ALWAYS AS IDENTITY|IDENTITY sequence options) /u, "0A000"],
+  [/^IDENTITY requires ALWAYS or BY DEFAULT$/u, "42601"],
   [/column names must be unique/u, "42701"],
   [/must appear in GROUP BY/u, "42803"],
   [/^HAVING conditions must use aggregates, literals, or GROUP BY expressions$/u, "42803"],

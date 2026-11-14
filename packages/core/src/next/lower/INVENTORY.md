@@ -114,8 +114,8 @@ Status:
 | `create-index`, `drop-index`                                  | `createIndex` (role `secondary`; `unique` → role `unique`) / `dropIndex` (looked up by name)                                                                                                                            | M1                                          |
 | `drop-table`                                                  | `dropTable`                                                                                                                                                                                                             | M1                                          |
 | `create-sequence`                                             | `createSequence` (start 1, increment 1, int8 bounds, no cycle: what the front end parses)                                                                                                                               | M1                                          |
-| `create-view`, `drop-view`                                    | `createView` (body SQL) / `dropView`; OR REPLACE → drop + create in one statement                                                                                                                                       | M1                                          |
-| `create-enum`                                                 | none (the catalog has no types)                                                                                                                                                                                         | U (`enumType`), R (access 3)                |
+| `create-view`, `drop-view`                                    | `createView` / `dropView`; compatible OR REPLACE keeps the stable view ID, inferred outputs and dependencies                                                                                                            | M1                                          |
+| `create-enum`, native `drop-type`                             | named `createType` / `dropType`; columns and casts resolve the immutable catalog, preserving quoted names                                                                                                               | catalog stage 2                             |
 | `create-trigger`, `drop-trigger`                              | none (the catalog has no triggers)                                                                                                                                                                                      | U (`trigger`)                               |
 | `transaction`                                                 | `LoweredTransactionControl`                                                                                                                                                                                             | M1                                          |
 | `set`, `show`                                                 | `LoweredUtility`                                                                                                                                                                                                        | M1                                          |
@@ -228,11 +228,13 @@ refused by typed preparation.
 
 1. **Owned sequences.** `TableInput` column `identity: { start, increment } | null`: the write
    path creates the owned sequence with the table and sets `identitySequence` and `ownedBy`.
-   Until then SERIAL / IDENTITY is `UnsupportedPlanError("identityColumn")`.
+   SERIAL and BY DEFAULT IDENTITY lower to this path. ALWAYS and sequence options explicitly
+   refuse with 0A000. Schema counters also retain explicit-value advancement semantics.
 2. **Self-referencing foreign keys.** `TableInput.foreignKeys[].parentTableId` accepts `"self"`.
-   Until then `UnsupportedPlanError("selfReference")`.
+   SQL resolves its own PRIMARY/UNIQUE declaration before catalog IDs are assigned.
 3. **Enum types** in the catalog (`TypeDef { id, name, labels }`, `createType` / `dropType`).
-   Until then `UnsupportedPlanError("enumType")`.
+   SQL CREATE/DROP and enum casts resolve these identities. Closed DSL text sets remain TEXT
+   restrictions, so they keep text ordering rather than enum declaration ordering.
 4. **Planning statistics**: a synchronous per-table summary at the current root (live rows; per
    column null count, bounds, distinct estimate, average width) for `PlanningStatistics`.
 5. **VARCHAR(n) on write** (R17.4): lowering puts an assignment cast on every written value, so

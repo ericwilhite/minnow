@@ -47,7 +47,7 @@ export class ParameterBindError extends ExecutionError {
     /** The 0-based placeholder index ($1 is 0), or null for a count mismatch. */
     readonly slot: number | null,
     /** Integer bound overflow uses PostgreSQL's range SQLSTATE. */
-    state: "22023" | "22003" = "22023",
+    state: "22023" | "22003" | "22P02" = "22023",
   ) {
     super(message, "MINNOW_PARAMETER_BIND", slot === null ? "08P01" : state);
     this.name = "ParameterBindError";

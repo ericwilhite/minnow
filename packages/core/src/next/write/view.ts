@@ -11,6 +11,7 @@ import { compareRunBound, runOutsideKeys } from "./run-bounds.js";
 import { hashKey } from "./key-hashes.js";
 import { GroupRead } from "../page/group-read.js";
 import { MemoryReads } from "./memory-read.js";
+import { missingScalar, missingVector } from "./missing-value.js";
 import { planIndexRange } from "./range-plan.js";
 import { StreamingRangeCursor } from "./range-cursor.js";
 import type { Held } from "../format/reachable.js";
@@ -121,8 +122,12 @@ function deletionVector(
 // ── Segments ───────────────────────────────────────────────────────────────────────────────────
 
 function missingStatistics(column: ColumnDef | undefined, rows: number): ColumnStatistics {
-  void column;
-  return { nullCount: rows, min: null, max: null, dictionarySize: null };
+  const missing = column?.missing;
+  const valid =
+    missing !== undefined &&
+    missing !== null &&
+    (missing.validity === null || ((missing.validity[0] ?? 0) & 1) !== 0);
+  return { nullCount: valid ? 0 : rows, min: null, max: null, dictionarySize: null };
 }
 
 /** Count without allocating a deletion-position array during table totals. */
@@ -302,7 +307,11 @@ class GroupSegmentImpl implements GroupSegment {
       const chunk = this.chunk(columnId);
       if (chunk === null)
         return [
-          { firstRow: 0, rowCount: this.rowCount, ...missingStatistics(undefined, this.rowCount) },
+          {
+            firstRow: 0,
+            rowCount: this.rowCount,
+            ...missingStatistics(this.view.column(columnId), this.rowCount),
+          },
         ];
       return settle(
         ChunkReader.open(this.view.snapshot.shared.space, chunk, { budget: this.view.budget }),
@@ -331,15 +340,20 @@ class MemorySegmentImpl implements MemorySegment {
   #reads: MemoryReads | null = null;
   #retained: readonly MemoryColumn[] | null = null;
 
+  #storedIndex(columnId: number): number {
+    // The ordinary path keeps its O(1) lookup. Only a catalog-only ALTER needs remapping.
+    return this.memtable.schemaVersion === this.view.schemaVersion
+      ? this.view.columnIndex(columnId)
+      : this.memtable.columns.findIndex((column) => column.id === columnId);
+  }
+
   /** One existing owner-charged chunk. Never captures a flat view across append growth. */
   retainResident(): (() => void) | null {
     if (
       this.rowCount < 1 ||
       this.rowCount > MEMORY_CHUNK_ROWS ||
       this.memtable.published !== null ||
-      this.#retained ||
-      this.memtable.columns.length !== this.view.columns.length ||
-      this.memtable.columns.some((column, index) => column.id !== this.view.columns[index]?.id)
+      this.#retained
     )
       return null;
     const columns = this.memtable.chunks.map((list) => need(list[0]));
@@ -363,12 +377,17 @@ class MemorySegmentImpl implements MemorySegment {
       check: () => this.view.snapshot.check(),
       publishedRoot: () => need(this.memtable.published).group.root,
       retained: (chunk) => chunk === 0 && this.#retained !== null,
+      ...(this.memtable.schemaVersion === this.view.schemaVersion
+        ? {}
+        : {
+            missing: (id: number) =>
+              this.#storedIndex(id) >= 0 ? null : missingScalar(need(this.view.column(id))),
+          }),
       resident: (columnId, chunk) => {
-        const retained =
-          chunk === 0 ? this.#retained?.[this.view.columnIndex(columnId)] : undefined;
+        const retained = chunk === 0 ? this.#retained?.[this.#storedIndex(columnId)] : undefined;
         if (retained) return retained.view(this.rowCount);
         if (this.memtable.published !== null) return null;
-        const stored = this.memtable.chunks[this.view.columnIndex(columnId)]?.[chunk];
+        const stored = this.memtable.chunks[this.#storedIndex(columnId)]?.[chunk];
         if (stored === undefined) throw new RangeError("A memtable chunk is missing");
         return stored.view(Math.min(MEMORY_CHUNK_ROWS, this.rowCount - chunk * MEMORY_CHUNK_ROWS));
       },
@@ -408,7 +427,15 @@ class MemorySegmentImpl implements MemorySegment {
   }
 
   pages(columnId: number): readonly PageSummary[] {
-    const c = this.view.columnIndex(columnId);
+    const c = this.#storedIndex(columnId);
+    if (c < 0)
+      return [
+        {
+          firstRow: 0,
+          rowCount: this.rowCount,
+          ...missingStatistics(this.view.column(columnId), this.rowCount),
+        },
+      ];
     const out: PageSummary[] = [];
     for (let first = 0; first < this.rowCount; first += MEMORY_CHUNK_ROWS) {
       const rows = Math.min(MEMORY_CHUNK_ROWS, this.rowCount - first);
@@ -441,11 +468,18 @@ class MemorySegmentImpl implements MemorySegment {
     const length = Math.min(MEMORY_CHUNK_ROWS, this.rowCount - first);
     if (!(Number.isInteger(chunk) && chunk >= 0 && length > 0))
       throw new RangeError("Portable chunk outside segment");
+    const columnIndex = this.#storedIndex(columnId);
+    if (columnIndex < 0)
+      return {
+        kind: "resident",
+        vector: missingVector(need(this.view.column(columnId)), length),
+        firstRow: first,
+      };
     const published = this.memtable.published;
     if (published === null) {
       this.memtable.borrow(chunk, this.borrowed);
       this.borrowed = chunk;
-      const stored = this.memtable.chunks[this.view.columnIndex(columnId)]?.[chunk];
+      const stored = this.memtable.chunks[columnIndex]?.[chunk];
       if (stored === undefined) throw new RangeError("A memtable chunk is missing");
       return { kind: "resident", vector: stored.view(length), firstRow: first };
     }
@@ -471,12 +505,21 @@ class MemorySegmentImpl implements MemorySegment {
     if (!(length > 0)) throw new RangeError(`Chunk ${String(chunk)} is outside the segment`);
     if (!(Number.isInteger(startRow) && startRow >= 0 && startRow < length))
       throw new RangeError("startRow is outside the chunk");
+    const columnIndex = this.#storedIndex(columnId);
+    if (columnIndex < 0)
+      return {
+        vector: missingVector(need(this.view.column(columnId)), length),
+        firstRow: 0,
+        rowCount: length,
+        complete: true,
+        reason: null,
+      };
     const published = this.memtable.published;
     if (published === null) {
       // One borrowed chunk per segment, charged to the write path until the borrow ends.
       this.memtable.borrow(chunk, this.borrowed);
       this.borrowed = chunk;
-      const c = this.view.columnIndex(columnId);
+      const c = columnIndex;
       const stored = this.memtable.chunks[c]?.[chunk];
       if (stored === undefined) throw new RangeError("A memtable chunk is missing");
       return {
@@ -671,8 +714,18 @@ export class TableSnapshotImpl implements TableSnapshot {
         root: () => reader.root(),
         releaseRoot: () => reader.release(),
         chunk: (id) => reader.chunk(id),
-        statistics: (id) => reader.chunk(id)?.statistics ?? null,
-        pages: (id) => reader.summaries(id),
+        statistics: (id) =>
+          reader.chunk(id)?.statistics ?? missingStatistics(this.column(id), segment.rowCount),
+        pages: (id) =>
+          reader.chunk(id) === null
+            ? [
+                {
+                  firstRow: 0,
+                  rowCount: segment.rowCount,
+                  ...missingStatistics(this.column(id), segment.rowCount),
+                },
+              ]
+            : reader.summaries(id),
       };
       const table: TableSnapshot = {
         tableId: this.tableId,

@@ -1,4 +1,4 @@
-import type { RowLocking } from "../../plan/model.js";
+import type { RowLocking, CompiledQuery } from "../../plan/model.js";
 /**
  * Building blocks every lowering module shares: the per-statement `PlanBuilder`, lowered
  * relations with their result-descriptor columns, the lazily-collected `TableRead`, scopes over
@@ -12,6 +12,7 @@ import type { ParameterTypes, Typed } from "./coerce.js";
 import { PlanningError } from "./errors.js";
 import type { ExpressionState, Scope } from "./expressions.js";
 import type { PlanningStatistics } from "./statistics.js";
+import type { OuterResolver } from "./from.js";
 
 /** An output column of a lowered relation, with what result descriptors need. */
 export interface RelColumn {
@@ -43,6 +44,15 @@ export interface LoweredRel {
  * the statistics and costs the join order is chosen with.
  */
 export class PlanBuilder {
+  /** Bound source references, before access/optimizer pruning; stable catalog identities. */
+  readonly columnDependencies = new Map<number, Set<number>>();
+  /** Definition-only binding; returned relations are discarded, never execution inputs. */
+  catalogDeclarations?: (query: CompiledQuery, outer?: OuterResolver) => void;
+  depend(table: TableDef, columnId: number): void {
+    let columns = this.columnDependencies.get(table.id);
+    if (columns === undefined) this.columnDependencies.set(table.id, (columns = new Set()));
+    columns.add(columnId);
+  }
   /** Aggregated while lowering queries, including DML subqueries. */
   rowLocking: RowLocking | undefined;
   #nextId = 1;

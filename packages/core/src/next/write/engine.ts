@@ -1140,7 +1140,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const effect = need(body.effects[i]);
       if (
         decisions[i] &&
-        (effect.kind === "catalog" || effect.kind === "createTable" || effect.kind === "dropTable")
+        (effect.kind === "catalog" ||
+          effect.kind === "createTable" ||
+          effect.kind === "dropTable" ||
+          effect.kind === "alterTable")
       ) {
         const change = need(decodeCatalogEffect(effect));
         if (
@@ -1158,6 +1161,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const effect = need(body.effects[k]);
       switch (effect.kind) {
         case "createTable":
+        case "alterTable":
         case "catalog":
         case "dropTable":
           await this.#replayCatalog(effect, lsn);
@@ -1172,8 +1176,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
           await this.#replayPublished(effect, lsn);
           (published ??= new Set()).add(effect.tableId);
           break;
-        case "alterTable":
-          throw new LogCorruptionError(`The write path cannot replay ${effect.kind} yet`);
       }
     }
     for (const id of this.#replayInvalidIndexes)
@@ -1529,6 +1531,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
     return this.#catalog;
   }
 
+  advanceIdentity(sequenceId: number, atLeast: bigint): MaybePromise<void> {
+    const result = this.sequences.advance(sequenceId, atLeast);
+    return result instanceof Promise ? result.then(() => undefined) : undefined;
+  }
+
   nextCatalogVersion(): number {
     this.#version += 1;
     return this.#version;
@@ -1559,7 +1566,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     if (state === undefined) throw new RangeError(`Table ${String(tableId)} has no state`);
     const memtables = state.view.memtables;
     const last = memtables[memtables.length - 1];
-    if (last?.state === "live") {
+    const def = this.#def(tableId);
+    if (last?.state === "live" && last.schemaVersion === def.schemaVersion) {
       if (rows === 0) return { memtable: last, created: false, frozen: null };
       const pending = last.visibleRows(MAX_LSN) < last.rowCount;
       const fits = !last.full && last.capacity >= Math.min(rows, MEMORY_CHUNK_ROWS);
@@ -1572,7 +1580,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
       last.measure();
       frozen = last;
     }
-    const def = this.#def(tableId);
     const firstRowId =
       last === undefined ? state.nextRowId : Math.max(state.nextRowId, last.rowIdEnd);
     const memtable = new Memtable(
@@ -3000,7 +3007,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           this.maintenance.stagedFolds += 1;
           continue;
         }
-        const groupRoot = await this.#writeGroup(writer, def, memtable);
+        const groupRoot = await this.#writeGroup(writer, memtable);
         const rootBlob = need((await writer.write([encodeGroupRoot(groupRoot)])).blobs[0]);
         const deleted = memtable.deletedUnder(through, memtable.rowCount);
         let deletions: BlobRef | null = null;
@@ -3632,7 +3639,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
    */
   async #writeStaged(
     writer: ExtentWriter,
-    def: TableDef,
+    _def: TableDef,
     memtable: Memtable,
     stagingId: number,
     owned: Provisional,
@@ -3645,7 +3652,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }> {
     const from = writer.extents.length;
     this.#stageFault?.("group", index);
-    const groupRoot = await this.#writeGroup(writer, def, memtable);
+    const groupRoot = await this.#writeGroup(writer, memtable);
     this.#check();
     const rootBlob = need((await writer.write([encodeGroupRoot(groupRoot)])).blobs[0]);
     this.#check();
@@ -4404,10 +4411,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
     }
   }
 
-  async #writeGroup(writer: ExtentWriter, def: TableDef, memtable: Memtable): Promise<GroupRoot> {
+  async #writeGroup(writer: ExtentWriter, memtable: Memtable): Promise<GroupRoot> {
     const group = new GroupWriter({
       estimatedRows: memtable.rowCount,
-      columns: def.columns.map((column) => ({ columnId: column.id, type: column.type })),
+      // A catalog-only ALTER never rewrites an older immutable memtable's physical schema.
+      columns: memtable.columns.map((column) => ({ columnId: column.id, type: column.type })),
       writer,
       charge: this.#grant,
     });
@@ -4739,7 +4747,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
       catalogVersion: catalog.version,
       catalog: catalogRef,
       nextTableId: catalog.counters.nextTableId,
-      sequences: this.sequences.checkpoint(globalLsn),
+      sequences: this.sequences
+        .checkpoint(globalLsn)
+        .filter((entry) => catalog.sequence(entry.sequenceId) !== undefined),
       tables,
       clients,
       // Replaced by the publication's prepared list (`#listed`) before it is encoded.
@@ -5132,7 +5142,12 @@ export async function openWritePath(input: OpenWritePathInput): Promise<WritePat
 
 /** A WAL table effect and its MCHG definition must name the same operation and identity. */
 function decodeCatalogEffect(effect: BodyEffect): LoggedChange | null {
-  if (effect.kind !== "catalog" && effect.kind !== "createTable" && effect.kind !== "dropTable")
+  if (
+    effect.kind !== "catalog" &&
+    effect.kind !== "createTable" &&
+    effect.kind !== "dropTable" &&
+    effect.kind !== "alterTable"
+  )
     return null;
   const change = decodeLogged(effect.definition);
   if (
@@ -5140,7 +5155,12 @@ function decodeCatalogEffect(effect: BodyEffect): LoggedChange | null {
       (change.op !== "createTable" || change.table.id !== effect.tableId)) ||
     (effect.kind === "dropTable" &&
       (change.op !== "dropTable" || change.tableId !== effect.tableId)) ||
-    (effect.kind === "catalog" && (change.op === "createTable" || change.op === "dropTable"))
+    (effect.kind === "alterTable" &&
+      (change.op !== "alterTable" ||
+        change.table.id !== effect.tableId ||
+        change.table.schemaVersion !== effect.schemaVersion)) ||
+    (effect.kind === "catalog" &&
+      (change.op === "createTable" || change.op === "dropTable" || change.op === "alterTable"))
   )
     throw new LogCorruptionError("A catalog effect disagrees with its logged definition");
   return change;

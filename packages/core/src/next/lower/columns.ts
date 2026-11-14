@@ -1,3 +1,4 @@
+import type { CatalogView } from "../access/catalog.js";
 /**
  * Column types from DDL: the front end's column definition, compiled under
  * `compileWithDeclaredTypes` (engine/query.ts), to the new catalog's physical type and declared
@@ -28,10 +29,14 @@ export interface DeclaredColumnType {
 /**
  * The physical type and declared descriptor of one DDL column. Throws `TypeError` (from
  * `requireDeclaredWidths`) for a numeric column compiled without `compileWithDeclaredTypes`, and
- * `UnsupportedPlanError` for a named enum type (`CREATE TYPE … AS ENUM`, which the new catalog
- * cannot declare yet) or an array of an element type the new core does not name.
+ * `PlanningError` for an unknown named type, or `UnsupportedPlanError` for an array of an
+ * element type the new core does not name. Named enums resolve against the supplied catalog.
  */
-export function declaredColumnType(column: FrontEndColumn, context: string): DeclaredColumnType {
+export function declaredColumnType(
+  column: FrontEndColumn,
+  context: string,
+  catalog?: CatalogView,
+): DeclaredColumnType {
   const declared: SqlTypeDescriptor = {
     type: column.type,
     ...(column.integer === true ? { integer: true as const } : {}),
@@ -42,10 +47,17 @@ export function declaredColumnType(column: FrontEndColumn, context: string): Dec
     ...(column.declaredLength === undefined ? {} : { declaredLength: column.declaredLength }),
   };
   requireDeclaredWidths(declared, context);
-  // The front end reads an unknown type name as an enum without labels. The new catalog has no
-  // named types (CREATE TYPE is refused, R17.7), so the name names nothing: 42704.
-  if (declared.sqlDomain?.kind === "enum" && declared.sqlDomain.values.length === 0)
-    throw new PlanningError(`type "${declared.sqlDomain.name}" does not exist`, "42704");
+  // Unknown SQL names arrive as enum descriptors; resolve them against the immutable catalog.
+  if (declared.sqlDomain?.kind === "enum" && declared.sqlDomain.values.length === 0) {
+    const named = catalog?.typeByName(declared.sqlDomain.name);
+    if (named === undefined)
+      throw new PlanningError(`type "${declared.sqlDomain.name}" does not exist`, "42704");
+    const resolved = {
+      ...declared,
+      sqlDomain: { ...declared.sqlDomain, values: [...named.labels] },
+    };
+    return { type: physicalTypeOf(resolved), declared: resolved };
+  }
   try {
     return { type: physicalTypeOf(declared), declared };
   } catch (error) {

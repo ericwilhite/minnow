@@ -1,5 +1,6 @@
 import { jsonCallSource, rowFieldSource, rowObjectSource } from "../../engine/json-call-sources.js";
 import { isDatePart } from "../../engine/date-part-sources.js";
+import { identifierSource } from "../../engine/identifier-sources.js";
 /**
  * Front-end expressions (plan/model.ts `Expression`, `Predicate`) to typed IR scalar
  * expressions. Names resolve through a `Scope`; types follow PostgreSQL (lower/coerce.ts).
@@ -55,6 +56,7 @@ export type SubqueryRequest =
 
 /** How names (and, in a grouped block, whole expressions) resolve. */
 export interface Scope {
+  columnParts?(parts: readonly string[]): Typed | undefined;
   /** A column reference as the front end writes it (`a`, `t.a`), or undefined if unknown. */
   column(reference: string): Typed | undefined;
   /** FTS document expansion / snapshot-corpus registration, owned by lower/fts.ts. */
@@ -87,6 +89,8 @@ export interface ExpressionState {
   /** The statement clock's slot (allocated on first use). */
   clock(): number;
   volatile: boolean;
+  /** Stable explicit casts are legal in queries/defaults but not stored generation. */
+  stable?: boolean;
   sequences: boolean;
   /**
    * Subqueries in scopes that cannot attach one (HAVING, grouped select lists, DML
@@ -174,10 +178,19 @@ const BINARY_FUNCTIONS: Readonly<Record<string, string>> = {
 };
 
 /** The type a CAST target literal names (`"number-integer"` + `declaredTypeName`, …). */
-export function castTargetType(target: Expression): PhysicalType {
+export function castTargetType(
+  target: Expression,
+  catalog?: import("../access/catalog.js").CatalogView,
+): PhysicalType {
   if (target.kind !== "literal" || typeof target.value !== "string")
     throw new PlanningError("Malformed CAST target", "42601");
   const value = target.value;
+  if (value.startsWith("enum:")) {
+    const name = value.slice(5),
+      named = catalog?.typeByName(name);
+    if (named === undefined) throw new PlanningError(`type "${name}" does not exist`, "42704");
+    return { kind: "enum", name: named.name, labels: named.labels };
+  }
   switch (value) {
     case "number-integer":
       return target.declaredTypeName === "smallint"
@@ -809,12 +822,12 @@ function lowerCall(
       const [operand, target] = args;
       if (operand === undefined || target === undefined)
         throw new PlanningError("Malformed CAST", "42601");
-      return coerce(
-        lowerExpression(operand, scope, state),
-        castTargetType(target),
-        "explicit",
-        state.parameters,
-      );
+      const input = lowerExpression(operand, scope, state),
+        type = castTargetType(target, state.catalog);
+      // enum_out can change after a label rename. Assignment coercion is distinct:
+      // PostgreSQL permits a generated TEXT column assigned an enum expression.
+      if (input.expr.type.kind === "enum" && type.kind === "text") state.stable = true;
+      return coerce(input, type, "explicit", state.parameters);
     }
     case "MINNOW_JSON_GET":
     case "MINNOW_JSON_GET_TEXT": {
@@ -951,14 +964,24 @@ export function lowerExpression(
     }
     case "column": {
       const field = rowFieldSource(expression);
+      const source = identifierSource(expression);
       const resolved =
         (field === undefined ? undefined : scope.rowField?.(field.qualifier, field.ordinal)) ??
-        scope.column(expression.reference);
+        (source !== undefined && scope.columnParts !== undefined
+          ? scope.columnParts(source.parts)
+          : scope.column(expression.reference));
       if (resolved?.record)
         throw unsupported("function", "composite value outside a JSON consumer");
       if (resolved !== undefined) return resolved;
       const dot = expression.reference.indexOf(".");
-      const qualifier = dot === -1 ? null : expression.reference.slice(0, dot);
+      const qualifier =
+        source === undefined
+          ? dot === -1
+            ? null
+            : expression.reference.slice(0, dot)
+          : source.parts.length > 1
+            ? (source.parts[0] ?? null)
+            : null;
       if (qualifier !== null && scope.knowsQualifier?.(qualifier) === false)
         throw new PlanningError(`missing FROM-clause entry for table "${qualifier}"`, "42P01");
       throw new PlanningError(`column "${expression.reference}" does not exist`, "42703");

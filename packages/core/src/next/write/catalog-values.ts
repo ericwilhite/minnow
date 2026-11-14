@@ -3,6 +3,7 @@ import {
   physicalTypeOf,
   samePhysicalType,
   layoutOf,
+  ENUM_LABEL_LIMIT,
   type PhysicalType,
   type SqlTypeDescriptor,
 } from "../types.js";
@@ -61,6 +62,7 @@ export function validateCatalogType(value: unknown, depth = 0): void {
         typeof type.name === "string" &&
           Array.isArray(type.labels) &&
           type.labels.length > 0 &&
+          type.labels.length <= ENUM_LABEL_LIMIT &&
           type.labels.every((l) => typeof l === "string") &&
           new Set(type.labels).size === type.labels.length,
         "Invalid stored enum labels",

@@ -244,7 +244,9 @@ describe("published core tarball", () => {
       // Keep every unpacked/isolation limit; next/ and tests remain excluded.
       // Shared full-text search leaf (tokenizer/renderer/scorer used by both engines):
       // 1,026,368 packed bytes (+868). Raise once by 1,000; other limits unchanged.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_026_500);
+      // Catalog/type/identifier/CTE provenance: 1,027,594 packed / 4,449,807 unpacked.
+      // Raise once by 1,500 over main; unpacked/isolation budgets and next/ exclusion stay.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_028_000);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");

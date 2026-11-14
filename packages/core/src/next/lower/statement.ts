@@ -4,7 +4,7 @@
  * end's `CompiledStatement` alone, before any catalog lookup, so the owner can classify a request
  * (protocol "standalone" rules, owner/sequence.ts) without lowering it.
  */
-import type { CompiledStatement } from "../../engine/query.js";
+import type { NativeStatement } from "./statements.js";
 
 export type StatementKind = "query" | "modify" | "ddl" | "transactionControl" | "utility";
 
@@ -24,6 +24,8 @@ const DDL_COMMANDS = {
   // PostgreSQL reports CREATE TABLE AS with the tag of the rows it inserted.
   "create-table-as": "SELECT",
   "create-enum": "CREATE TYPE",
+  "drop-type": "DROP TYPE",
+  "drop-sequence": "DROP SEQUENCE",
   "create-sequence": "CREATE SEQUENCE",
   "create-index": "CREATE INDEX",
   "drop-index": "DROP INDEX",
@@ -35,7 +37,7 @@ const DDL_COMMANDS = {
   "add-column": "ALTER TABLE",
   "rename-column": "ALTER TABLE",
   "drop-column": "ALTER TABLE",
-} as const satisfies Partial<Record<CompiledStatement["kind"], string>>;
+} as const satisfies Partial<Record<NativeStatement["kind"], string>>;
 
 const TRANSACTION_COMMANDS = {
   begin: "BEGIN",
@@ -51,7 +53,7 @@ const TRANSACTION_COMMANDS = {
  * `compileWithDeclaredTypes` (lowering always is); compiled without it, the front end makes it an
  * unfiltered DELETE and keeps no trace of the spelling, so it reports `DELETE`.
  */
-export function classifyStatement(statement: CompiledStatement): StatementClass {
+export function classifyStatement(statement: NativeStatement): StatementClass {
   switch (statement.kind) {
     case "select":
       return { kind: "query", command: "SELECT", controlsTransaction: false };

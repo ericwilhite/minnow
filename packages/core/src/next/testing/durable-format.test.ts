@@ -1052,7 +1052,7 @@ for (const seed of seedsFor("next-durable-catalog", [0xb22b, 0xb22c]))
             {
               name: "id",
               type: { kind: "int32", bits: 32 },
-              declared: { type: "number" },
+              declared: { type: "number", integer: true, declaredTypeName: "INTEGER" },
               nullable: false,
               defaultSql: null,
               generatedSql: null,

@@ -1,10 +1,22 @@
 import {
+  identifierSource,
+  rememberIdentifierSource,
+  copyIdentifierSource,
+} from "./identifier-sources.js";
+import {
+  rememberCatalogDrop,
+  builtInCatalogType,
+  rememberCatalogDeclarations,
+  copyCatalogDeclarations,
+} from "./catalog-ddl-sources.js";
+import {
   rememberJsonCall,
   copyJsonCall,
   jsonCallSource,
   rememberRowOutputName,
   rowOutputName,
   rememberRowField,
+  rowFieldSource,
   rememberRowObject,
 } from "./json-call-sources.js";
 import { rememberDatePart, copyDatePart, isDatePart } from "./date-part-sources.js";
@@ -1384,6 +1396,7 @@ export function compileQuery(sql: string, options: CompileQueryOptions = {}): Co
   } catch (error) {
     throwLocated(error, offset, parser?.span ?? { start: 0, end: text.length });
   }
+  const catalogPlan = plan;
   let compiled: CompiledQuery;
   try {
     // A derived source's alias used as a value (`json_agg(agg)`) expands here, where its
@@ -1413,6 +1426,7 @@ export function compileQuery(sql: string, options: CompileQueryOptions = {}): Co
     if (parser.usesStatementDatetime) block.usesStatementDatetime = true;
     if (parser.usesSequenceCalls) block.usesSequenceCalls = true;
     if (parser.usesVolatileFunctions) block.usesVolatileFunctions = true;
+    if (recordDeclaredTypes) copyCatalogDeclarations(catalogPlan, block);
     withRowLockCtes(block, parser.rowLockingCtes);
     withRowLock(block, parser.rowLocking);
   }
@@ -2358,7 +2372,11 @@ export function compileStatement(sql: string): CompiledStatement {
           index += 1;
         }
         if (tokens[index + 1]?.kind !== "eof") throw new TypeError("Unexpected input after ENUM");
-        return { kind: "create-enum", name: name.text, values };
+        return {
+          kind: "create-enum",
+          name: recordDeclaredTypes && name.quoted !== true ? name.text.toLowerCase() : name.text,
+          values,
+        };
       }
       if (second?.kind === "identifier" && second.text.toUpperCase() === "SEQUENCE") {
         const name = tokens[2];
@@ -2388,6 +2406,22 @@ export function compileStatement(sql: string): CompiledStatement {
       return parser.parseAlterTable();
     }
     if (keyword === "DROP") {
+      if (
+        recordDeclaredTypes &&
+        second?.kind === "identifier" &&
+        (second.text.toUpperCase() === "TYPE" || second.text.toUpperCase() === "SEQUENCE")
+      ) {
+        // Reuse the identifier/IF EXISTS/RESTRICT grammar without changing the shipped DTO.
+        tokens[1] = { ...second, text: "TABLE" };
+        const at = tokens[2]?.text.toUpperCase() === "IF" ? 4 : 2,
+          named = tokens[at];
+        if (named?.kind === "identifier" && named.quoted !== true)
+          tokens[at] = { ...named, text: named.text.toLowerCase() };
+        parser = new Parser(tokens, text);
+        const statement = parser.parseDropTable();
+        rememberCatalogDrop(statement, second.text.toUpperCase() === "TYPE" ? "type" : "sequence");
+        return statement;
+      }
       if (second?.kind === "identifier" && second.text.toUpperCase() === "VIEW") {
         parser = new Parser(tokens);
         return parser.parseDropView();
@@ -3035,6 +3069,8 @@ function cloneTreeValue(value: unknown): unknown {
     copy[key] = cloneTreeValue((value as Record<string, unknown>)[key]);
   }
   copyJsonCall(value, copy);
+  copyIdentifierSource(value, copy);
+  if (recordDeclaredTypes) copyCatalogDeclarations(value, copy);
   copyDatePart(value, copy);
   copyFrameOffset(value, copy);
   mapWindowInputs(value, copy, (expression) => cloneTreeValue(expression) as Expression);
@@ -3907,8 +3943,14 @@ function assertTopLevelNamesResolve(
   const aliases = sources.map((source) => source.alias);
   const known = sources.map((source) => columnsOf(source.table));
   const outputs = new Set(plan.select.map((item) => item.alias));
+  const references = (expression: Expression): string[] =>
+    expression.kind === "column"
+      ? !recordDeclaredTypes || rowFieldSource(expression) === undefined
+        ? [expression.reference]
+        : []
+      : childExpressions(expression).flatMap(references);
   const check = (expression: Expression): void => {
-    for (const reference of expressionColumns(expression)) {
+    for (const reference of references(expression)) {
       const dot = reference.indexOf(".");
       if (dot !== -1) {
         const position = aliases.indexOf(reference.slice(0, dot));
@@ -5678,11 +5720,19 @@ export function foldIdentifierCase(
     );
     // A bare column's written spelling, so an implicit output name can follow the fold.
     const writtenNames = block.select.map((item) =>
-      item.expression.kind === "column" ? bareColumnName(item.expression.reference) : undefined,
+      item.expression.kind === "column"
+        ? (identifierSource(item.expression)?.parts.at(-1) ??
+          bareColumnName(item.expression.reference))
+        : undefined,
     );
     const rewrite = (expression: Expression): void => {
       if (expression.kind === "column") {
-        if (orderByAliases.has(expression)) return;
+        if (
+          orderByAliases.has(expression) ||
+          identifierSource(expression) !== undefined ||
+          (recordDeclaredTypes && rowFieldSource(expression) !== undefined)
+        )
+          return;
         const folded = foldReference(expression.reference);
         if (folded === undefined) return;
         if (pass.probing) pass.needed = true;
@@ -5713,7 +5763,9 @@ export function foldIdentifierCase(
     if (!pass.probing) {
       block.select.forEach((item, index) => {
         if (item.expression.kind !== "column") return;
-        const name = bareColumnName(item.expression.reference);
+        const name =
+          identifierSource(item.expression)?.parts.at(-1) ??
+          bareColumnName(item.expression.reference);
         if (item.alias !== name && item.alias === writtenNames[index]) item.alias = name;
       });
     }
@@ -8467,9 +8519,24 @@ class Parser {
   }
 
   /** PG skips a SELECT CTE only at refcount zero, even when its referrer is unused. */
-  #recordRowLockCtes(declarations: readonly CompiledQuery[]): void {
+  #recordRowLockCtes(declarations: readonly CompiledQuery[], query: CompiledQuery): void {
     for (const body of declarations)
       if ((this.#cteRefCounts.get(body) ?? 0) > 0) this.rowLockingCtes.push(body);
+    if (recordDeclaredTypes)
+      rememberCatalogDeclarations(query, () =>
+        declarations
+          .filter((body) => (this.#cteRefCounts.get(body) ?? 0) === 0)
+          .map((body) => {
+            const recursive = [...this.#recursiveCtes].find(([, value]) => value.base === body);
+            return recursive
+              ? {
+                  table: `(recursive catalog) ${recursive[0]}`,
+                  alias: "__catalog_cte",
+                  recursive: recursive[1],
+                }
+              : { table: "(subquery catalog)", alias: "__catalog_cte", derived: body };
+          }),
+      );
   }
 
   /** The optional `(a, b, c)` between a CTE's name and its AS. */
@@ -8505,7 +8572,7 @@ class Parser {
     const declarations = this.#withClause();
     const plan = this.#queryExpression(sql);
     this.#take("eof");
-    this.#recordRowLockCtes(declarations);
+    this.#recordRowLockCtes(declarations, plan);
     return plan;
   }
 
@@ -8522,7 +8589,7 @@ class Parser {
       try {
         const declarations = this.#withClause();
         const plan = this.#queryExpression(sql);
-        this.#recordRowLockCtes(declarations);
+        this.#recordRowLockCtes(declarations, plan);
         return plan;
       } finally {
         this.#ctes.clear();
@@ -9095,18 +9162,27 @@ class Parser {
   #identityClause(): boolean {
     const start = this.#index;
     this.#keyword("GENERATED");
+    let mode: "always" | "byDefault" | undefined;
     if (this.#isKeyword("BY")) {
       this.#keyword("BY");
       this.#keyword("DEFAULT");
+      mode = "byDefault";
     } else if (this.#isKeyword("ALWAYS")) {
       this.#keyword("ALWAYS");
+      mode = "always";
     }
     if (this.#isKeyword("AS")) {
       this.#keyword("AS");
       if (this.#isKeyword("IDENTITY")) {
         this.#keyword("IDENTITY");
+        if (recordDeclaredTypes && mode === undefined)
+          throw new TypeError("IDENTITY requires ALWAYS or BY DEFAULT");
+        if (recordDeclaredTypes && mode === "always")
+          throw new TypeError("GENERATED ALWAYS AS IDENTITY is not supported");
         // Sequence options in parentheses are accepted and ignored; the counter starts at 1.
         if (this.#punctuation("(")) {
+          if (recordDeclaredTypes)
+            throw new TypeError("IDENTITY sequence options are not supported");
           let depth = 1;
           while (depth > 0) {
             const token = this.#peek();
@@ -9330,7 +9406,11 @@ class Parser {
     declaredTypeName?: DeclaredNumericTypeName;
     declaredLength?: DeclaredTextLength;
   } {
-    const word = this.#identifier().toUpperCase();
+    const typeToken = this.#peek();
+    const declared = this.#identifier();
+    const word = declared.toUpperCase();
+    if (recordDeclaredTypes && typeToken.quoted === true && !builtInCatalogType(declared))
+      return { value: `enum:${declared}` };
     if (word === "NUMERIC" || word === "DECIMAL") {
       let precision: number | undefined;
       let scale: number | undefined;
@@ -9354,7 +9434,12 @@ class Parser {
       return { value: "number", ...declaredType(word) };
     }
     const mapped = createTableTypeNames.get(word);
-    if (mapped === undefined) throw new TypeError(`Unsupported CAST target: ${word}`);
+    if (mapped === undefined) {
+      // Only the rebuild resolves user-defined names against its immutable catalog.
+      if (recordDeclaredTypes)
+        return { value: `enum:${typeToken.quoted === true ? declared : declared.toLowerCase()}` };
+      throw new TypeError(`Unsupported CAST target: ${word}`);
+    }
     const multiWord = this.#multiWordTypeTail(word);
     let width: number | undefined;
     if (this.#punctuation("(")) {
@@ -9417,8 +9502,11 @@ class Parser {
     declaredTypeName?: DeclaredNumericTypeName;
     declaredLength?: DeclaredTextLength;
   } {
+    const typeToken = this.#peek();
     const declared = this.#identifier();
     const word = declared.toUpperCase();
+    if (recordDeclaredTypes && typeToken.quoted === true && !builtInCatalogType(declared))
+      return { type: "string", sqlDomain: { kind: "enum", name: declared, values: [] } };
     if (word === "SERIAL" || word === "BIGSERIAL" || word === "SMALLSERIAL") {
       // PostgreSQL's serial pseudo-types: an integer column fed by an auto-increment default.
       return {
@@ -9456,7 +9544,15 @@ class Parser {
     }
     const mapped = createTableTypeNames.get(word);
     if (mapped === undefined) {
-      return { type: "string", sqlDomain: { kind: "enum", name: declared, values: [] } };
+      return {
+        type: "string",
+        sqlDomain: {
+          kind: "enum",
+          name:
+            recordDeclaredTypes && typeToken.quoted !== true ? declared.toLowerCase() : declared,
+          values: [],
+        },
+      };
     }
     // `TIME WITH TIME ZONE` stays the TIME domain: the zone tail is parsed with the type name.
     let zone = this.#timestampZoneTail(word);
@@ -12014,15 +12110,22 @@ class Parser {
     if (quotedIdentifier) {
       // A quoted identifier is always a plain reference — never a keyword, literal, or function.
       let reference = identifier;
+      const parts = [identifier],
+        quoted = [true];
       if (this.#punctuation(".")) {
         // E051-07: `"alias".*` selects one source's columns, same as the unquoted form.
         if (this.#peek().kind === "operator" && this.#peek().text === "*") {
           this.#index += 1;
           return { kind: "wildcard", table: identifier };
         }
-        reference += `.${this.#identifier()}`;
+        quoted.push(this.#peek().quoted === true);
+        const name = this.#identifier();
+        parts.push(name);
+        reference += `.${name}`;
       }
-      return { kind: "column", reference };
+      const result: Expression = { kind: "column", reference };
+      if (recordDeclaredTypes) rememberIdentifierSource(result, parts, quoted);
+      return result;
     }
     const upper = identifier.toUpperCase();
     if (upper === "TRUE" || upper === "FALSE" || upper === "NULL")
@@ -12724,15 +12827,23 @@ class Parser {
         : call;
     }
     let reference = identifier;
+    const parts = [identifier],
+      quoted = [false];
     if (this.#punctuation(".")) {
       // E051-07: `alias.*` selects one source's columns.
       if (this.#peek().kind === "operator" && this.#peek().text === "*") {
         this.#index += 1;
         return { kind: "wildcard", table: identifier };
       }
-      reference += `.${this.#identifier()}`;
+      quoted.push(this.#peek().quoted === true);
+      const name = this.#identifier();
+      parts.push(name);
+      reference += `.${name}`;
     }
-    return { kind: "column", reference };
+    const result: Expression = { kind: "column", reference };
+    if (recordDeclaredTypes && quoted.some(Boolean))
+      rememberIdentifierSource(result, parts, quoted);
+    return result;
   }
 
   /** The parenthesized column set of a full-text expression: `(*)` or `(col[, col...])`. */
@@ -15801,7 +15912,11 @@ function numberRepeatedOutputs(items: readonly SelectItem[]): void {
 
 function defaultAlias(expression: Expression): string {
   if (expression.kind === "column")
-    return expression.reference.split(".").at(-1) ?? expression.reference;
+    return (
+      identifierSource(expression)?.parts.at(-1) ??
+      expression.reference.split(".").at(-1) ??
+      expression.reference
+    );
   if (expression.kind === "call" && expression.name === "CAST") {
     // PostgreSQL names `CAST(placed AS DATE)` and `placed::date` after what they cast.
     const operand = expression.arguments[0];

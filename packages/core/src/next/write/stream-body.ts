@@ -336,10 +336,16 @@ export async function streamBody(
             ? KIND.dropTable
             : change.op === "createTable"
               ? KIND.createTable
-              : KIND.catalog,
+              : change.op === "alterTable"
+                ? KIND.alterTable
+                : KIND.catalog,
         );
         if (change.op === "dropTable") writer.varuint(change.tableId);
         if (change.op === "createTable") writer.varuint(change.table.id);
+        if (change.op === "alterTable") {
+          writer.varuint(change.table.id);
+          writer.varuint(change.table.schemaVersion);
+        }
         const length = catalogChangeByteLength(change);
         writer.varuint(length);
         if (writer.intersects(length)) writeCatalogChange(writer, change);

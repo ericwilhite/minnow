@@ -43,6 +43,8 @@ export interface MemoryReadSource {
   column(columnId: number): ColumnDef | undefined;
   /** Only used synchronously: never retain the view across a suspension or in a hint. */
   resident(columnId: number, chunk: number): FlatVector | null;
+  /** Schema-only column: the same catalog-owned scalar in every old row, even after publication. */
+  missing?(columnId: number): FlatVector | null;
   publishedRoot(): BlobRef;
   /** Explicit source recipe, independently owned by the query, keeps this chunk resident. */
   retained?(chunk: number): boolean;
@@ -270,6 +272,12 @@ export class MemoryReads {
     rows: number,
     each: (row: number, bytes: number) => void,
   ): boolean {
+    const missing = this.source.missing?.(columnId);
+    if (missing) {
+      const bytes = memoryValueBytes(missing, 0);
+      for (let row = 0; row < rows; row++) each(row, bytes);
+      return true;
+    }
     const vector = this.source.resident(columnId, r.chunk);
     if (vector === null) return false;
     for (let row = 0; row < rows; row++) each(row, memoryValueBytes(vector, r.startRow + row));
@@ -318,7 +326,7 @@ export class MemoryReads {
             }),
           );
         // Fixed columns still need their format envelope, including recovered gzip pages.
-        else if (this.source.resident(id, request.chunk) === null)
+        else if (!this.source.missing?.(id) && this.source.resident(id, request.chunk) === null)
           gzip = Math.max(
             gzip,
             yield* this.#withReader(id, context, check, function* (reader) {
@@ -563,10 +571,12 @@ export class MemoryReads {
     out: ChunkOutput,
     accept: (source: FlatVector, row: number) => boolean,
   ): boolean | null {
-    const vector = this.source.resident(columnId, r.chunk);
+    const missing = this.source.missing?.(columnId);
+    const vector = missing ?? this.source.resident(columnId, r.chunk);
     if (vector === null) return null;
-    if (!accept(vector, r.startRow + row)) return false;
-    copyMemoryRow(vector, r.startRow + row, out.flat, row);
+    const slot = missing ? 0 : r.startRow + row;
+    if (!accept(vector, slot)) return false;
+    copyMemoryRow(vector, slot, out.flat, row);
     out.codes[row] = row;
     return true;
   }

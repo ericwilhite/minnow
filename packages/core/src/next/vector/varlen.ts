@@ -14,6 +14,30 @@ import { BATCH_TARGET_BYTES, type VectorData } from "./vector.js";
 
 type VarlenData = Extract<VectorData, { layout: "varlen" }>;
 
+/** Compare a UTF-8 slot with an existing label without allocating either representation. */
+export function varlenMatchesString(data: VarlenData, slot: number, label: string): boolean {
+  let cursor = data.offsets[slot] ?? 0;
+  const end = data.offsets[slot + 1] ?? 0;
+  for (let i = 0; i < label.length; i++) {
+    const point = label.codePointAt(i) ?? 0;
+    if (point > 0xffff) i++;
+    const width = point < 0x80 ? 1 : point < 0x800 ? 2 : point < 0x10000 ? 3 : 4;
+    if (cursor + width > end) return false;
+    const first =
+      width === 1
+        ? point
+        : width === 2
+          ? 0xc0 | (point >>> 6)
+          : width === 3
+            ? 0xe0 | (point >>> 12)
+            : 0xf0 | (point >>> 18);
+    if (data.bytes[cursor++] !== first) return false;
+    for (let shift = (width - 2) * 6; shift >= 0; shift -= 6)
+      if (data.bytes[cursor++] !== (0x80 | ((point >>> shift) & 0x3f))) return false;
+  }
+  return cursor === end;
+}
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 

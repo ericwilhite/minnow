@@ -241,6 +241,7 @@ function tableEntry(
     resolve: (name) => {
       const def = read.columnByName(name);
       if (def === undefined) return undefined;
+      builder.depend(table, def.id);
       return {
         local: read.use(def),
         type: def.type,
@@ -250,6 +251,7 @@ function tableEntry(
     },
     field: (ordinal) => {
       const def = (fields ??= table.columns.filter((c) => !c.name.startsWith(HIDDEN)))[ordinal];
+      if (def !== undefined) builder.depend(table, def.id);
       return def === undefined
         ? undefined
         : {

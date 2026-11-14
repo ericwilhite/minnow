@@ -1,7 +1,7 @@
 /**
  * The `Lowerer` (lower/lowerer.ts): one statement text to a `LoweredStatement`.
  */
-import type { CatalogChange, CatalogView, TableDef } from "../access/catalog.js";
+import type { CatalogChange, CatalogDependency, CatalogView, TableDef } from "../access/catalog.js";
 import type { CreateTableInput } from "../../engine/catalog-mutations.js";
 import type { CompiledStatement, TransactionMode } from "../../engine/query.js";
 import type { OutputColumn, PhysicalPlan, Rel } from "../ir/ir.js";
@@ -13,6 +13,13 @@ import { frontEndError, PlanningError, unsupported } from "./errors.js";
 import type { ExpressionState } from "./expressions.js";
 import type { RowLocking, CompiledQuery } from "../../plan/model.js";
 import { parseAny, parseQuery, prepareQuery } from "./frontend.js";
+import {
+  captureCatalogDeclarations,
+  catalogDeclarations,
+} from "../../engine/catalog-ddl-sources.js";
+import type { TableSource } from "../../plan/model.js";
+import type { OuterResolver } from "./from.js";
+import { expressionObjects } from "./expression-objects.js";
 import type {
   LoweredModify,
   LoweredRowLocking,
@@ -50,6 +57,8 @@ import { resultColumn } from "./result.js";
 import { lowerTableRules } from "./rules.js";
 import { classifyStatement } from "./statement.js";
 import { ctasDataClause } from "./ctas.js";
+import { integerLiteralValue } from "./literals.js";
+import { rowOutputName } from "../../engine/json-call-sources.js";
 
 /** PostgreSQL settings SHOW answers with the current engine's fixed values. */
 const SETTINGS: Readonly<Record<string, string>> = {
@@ -314,6 +323,176 @@ function lowerStatement(text: string, context: LoweringContext): LoweredStatemen
           column: resultColumn({ name, type: { kind: "text" }, nullable: false }, false),
           value,
         },
+      };
+    }
+    case "create-view": {
+      const before = context.catalog.views.find((view) => view.name === statement.view);
+      if (before !== undefined && statement.orReplace !== true)
+        throw new PlanningError(`relation "${statement.view}" already exists`, "42P07");
+      if (context.catalog.tableByName(statement.view) !== undefined)
+        throw new PlanningError(`relation "${statement.view}" already exists`, "42P07");
+      const parsed = captureCatalogDeclarations(() => parseQuery(statement.sql));
+      const dependencies: CatalogDependency[] = [];
+      const seen = new Set<object>();
+      const visit = (value: unknown): void => {
+        if (typeof value !== "object" || value === null || seen.has(value)) return;
+        seen.add(value);
+        const entry = value as Record<string, unknown>;
+        if (
+          typeof entry.table === "string" &&
+          typeof entry.alias === "string" &&
+          !entry.derived &&
+          !entry.recursive &&
+          !entry.union
+        ) {
+          const view = context.catalog.views.find((view) => view.name === entry.table);
+          if (
+            view !== undefined &&
+            !dependencies.some((dep) => dep.kind === "view" && dep.objectId === view.id)
+          )
+            dependencies.push({ kind: "view", objectId: view.id, columnIds: [] });
+        }
+        for (const nested of Object.values(entry)) visit(nested);
+      };
+      visit(parsed);
+      const plan = planning(placeholderCount(parsed), context);
+      if (plan.placeholders > 0)
+        throw new PlanningError("there is no parameter in a view definition", "42P02");
+      const metadataPlans: Array<{
+        block: ReturnType<typeof lowerBlock>;
+        builder: PlanBuilder;
+        parsed: CompiledQuery;
+      }> = [];
+      const visitedDeclarations = new Map<readonly object[], Set<OuterResolver | undefined>>();
+      const bindDeclarations = (query: CompiledQuery, outer?: OuterResolver): void => {
+        const sources = catalogDeclarations(query);
+        if (!sources) return;
+        let contexts = visitedDeclarations.get(sources);
+        if (!contexts) visitedDeclarations.set(sources, (contexts = new Set()));
+        if (contexts.has(outer)) return;
+        contexts.add(outer);
+        for (const source of sources) {
+          const probe = parseQuery("SELECT * FROM __catalog_cte");
+          probe.base = source as TableSource;
+          const child = planning(0, context);
+          child.builder.catalogDeclarations = bindDeclarations;
+          const block = lowerBlock(prepareQuery(probe, context.catalog), child.builder, outer);
+          visit(probe);
+          metadataPlans.push({ block, builder: child.builder, parsed: probe });
+        }
+      };
+      plan.builder.catalogDeclarations = bindDeclarations;
+      const block = lowerBlock(prepareQuery(parsed, context.catalog), plan.builder);
+      const addDependency = (kind: "sequence" | "type", objectId: number) => {
+        if (!dependencies.some((dep) => dep.kind === kind && dep.objectId === objectId))
+          dependencies.push({ kind, objectId, columnIds: [] });
+      };
+      for (const source of [parsed, ...metadataPlans.map((item) => item.parsed)]) {
+        const sourceObjects = expressionObjects(source, context.catalog);
+        for (const id of sourceObjects.typeIds) addDependency("type", id);
+        for (const id of sourceObjects.sequenceIds) addDependency("sequence", id);
+      }
+      const semanticSeen = new Set<object>();
+      const semantic = (value: unknown): void => {
+        if (typeof value !== "object" || value === null || semanticSeen.has(value)) return;
+        semanticSeen.add(value);
+        const entry = value as Record<string, unknown>;
+        if (entry.kind === "enum" && typeof entry.name === "string") {
+          const named = context.catalog.typeByName(entry.name);
+          if (named) addDependency("type", named.id);
+        }
+        if (
+          entry.op === "call" &&
+          ["nextval", "currval", "setval"].includes(String(entry.fn)) &&
+          Array.isArray(entry.args)
+        ) {
+          const first = entry.args[0] as import("../ir/ir.js").ScalarExpr | undefined,
+            id = first && integerLiteralValue(first);
+          if (id !== null && id !== undefined) addDependency("sequence", Number(id));
+        }
+        for (const child of Object.values(entry)) semantic(child);
+      };
+      for (const item of [{ block, builder: plan.builder }, ...metadataPlans]) {
+        semantic(item.block.rel);
+        semantic(item.block.columns);
+        for (const id of item.builder.reads) {
+          let dep = dependencies.find((dep) => dep.kind === "table" && dep.objectId === id);
+          if (!dep) {
+            dep = { kind: "table", objectId: id, columnIds: [] };
+            dependencies.push(dep);
+          }
+          const columns = new Set([
+            ...dep.columnIds,
+            ...(item.builder.columnDependencies.get(id) ?? []),
+          ]);
+          dependencies[dependencies.indexOf(dep)] = {
+            ...dep,
+            columnIds: [...columns].sort((a, b) => a - b),
+          };
+        }
+      }
+      if (before) {
+        const pending = dependencies
+            .filter((dep) => dep.kind === "view")
+            .map((dep) => dep.objectId),
+          visited = new Set<number>();
+        while (pending.length) {
+          const id = pending.pop();
+          if (id === undefined || visited.has(id)) continue;
+          if (id === before.id)
+            throw new PlanningError(
+              `infinite recursion detected in rules for relation "${before.name}"`,
+              "42P17",
+            );
+          visited.add(id);
+          for (const dep of context.catalog.views.find((view) => view.id === id)?.dependencies ??
+            [])
+            if (dep.kind === "view") pending.push(dep.objectId);
+        }
+      }
+      const outputs = block.columns.map((column) => ({
+        name: column.name,
+        type: column.type,
+        declared: descriptorOf(column.type),
+        nullable: column.nullable,
+      }));
+      if (
+        !parsed.select.some((item) => item.expression.kind === "wildcard") &&
+        parsed.select.length === outputs.length
+      )
+        outputs.forEach((output, i) => {
+          const item = parsed.select[i];
+          if (item) output.name = rowOutputName(item) ?? item.alias;
+        });
+      if (new Set(outputs.map((column) => column.name)).size !== outputs.length)
+        throw new PlanningError("column specified more than once in view", "42701");
+      if (
+        before?.outputs &&
+        (outputs.length < before.outputs.length ||
+          before.outputs.some(
+            (column, i) =>
+              column.name !== outputs.at(i)?.name ||
+              !samePhysicalType(column.type, outputs.at(i)?.type ?? column.type),
+          ))
+      )
+        throw new PlanningError("cannot change name or type of view column", "42P16");
+      const view = { name: statement.view, bodySql: statement.sql, outputs, dependencies };
+      return {
+        ...base,
+        kind: "ddl",
+        parameters: [],
+        change:
+          before === undefined
+            ? { kind: "createView", view }
+            : {
+                kind: "replaceView",
+                view: {
+                  ...view,
+                  id: before.id,
+                  ...(before.managed === undefined ? {} : { managed: before.managed }),
+                },
+              },
+        followUp: null,
       };
     }
     case "create-table-as": {

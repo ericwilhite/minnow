@@ -42,6 +42,7 @@ import {
 import { compileJson } from "./json.js";
 import { compileTemporalText } from "./temporal-text.js";
 import { castRefusal } from "./bindings.js";
+import { EnumCast } from "./enum.js";
 import { coefficientAt, scaleAt, specialAt, type DecimalData } from "./numeric.js";
 import {
   nullConstant,
@@ -592,6 +593,9 @@ export function compileCast(type: PhysicalType, input: Compiled, arena: OutputAr
   const from = input.type;
   const source = sqlTypeOf(from);
   const target = sqlTypeOf(type);
+  if (type.kind === "enum" && from.kind === "text") return new EnumCast(type, input);
+  if (type.kind === "text" && type.maxLength === undefined && from.kind === "enum")
+    return new Retype(type, input);
   const refuse = (reason: string) =>
     new UnsupportedPlanError(
       `a cast from ${source ?? from.kind} to ${target ?? type.kind}: ${reason}`,

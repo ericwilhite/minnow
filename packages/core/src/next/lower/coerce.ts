@@ -114,6 +114,10 @@ function typeName(type: PhysicalType): string {
 function constantOf(text: string, type: PhysicalType, context: CoercionContext): ScalarExpr {
   const assignment = context === "assignment";
   switch (type.kind) {
+    case "enum":
+      if (!type.labels.includes(text))
+        throw new PlanningError(`invalid input value for enum ${type.name}: "${text}"`, "22P02");
+      return textLiteral(text, type);
     case "json":
       if (!type.binary) {
         // Syntax validation only; retain duplicates, number spellings and whitespace.

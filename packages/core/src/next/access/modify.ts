@@ -244,6 +244,20 @@ export class NotNullViolationError extends ConstraintError {
   }
 }
 
+/** A closed text set is a column restriction, not a named enum with label-order comparison. */
+export class ClosedSetViolationError extends ConstraintError {
+  readonly code = "MINNOW_CLOSED_SET_VIOLATION";
+  readonly sqlState = "23514";
+  constructor(
+    tableId: number,
+    readonly columnId: number,
+    readonly row: number,
+  ) {
+    super(`Value outside the closed set of column ${String(columnId)}`, tableId);
+    this.name = "ClosedSetViolationError";
+  }
+}
+
 /** 23514. `row` as for `NotNullViolationError`. */
 export class CheckViolationError extends ConstraintError {
   readonly code = "MINNOW_CHECK_VIOLATION";

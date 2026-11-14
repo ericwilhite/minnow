@@ -576,6 +576,7 @@ export function lowerBlock(
   builder: PlanBuilder,
   outer?: OuterResolver,
 ): LoweredRel & { readonly pointRead?: boolean } {
+  builder.catalogDeclarations?.(block, outer);
   builder.rowLocking = strongestRowLock([builder.rowLocking, block.rowLocking]);
   if (block.pendingSelectShape !== undefined)
     throw new PlanningError("unbound select shape", "XX000");

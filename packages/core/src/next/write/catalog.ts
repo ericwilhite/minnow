@@ -43,9 +43,13 @@ import {
   INT32_MIN,
   INT64_MAX,
   INT64_MIN,
+  ENUM_LABEL_LIMIT,
+  ENUM_LABEL_BYTES,
   samePhysicalType,
 } from "../types.js";
 import type { PhysicalType } from "../types.js";
+import { resolveDependencies, tableUsesObject } from "../access/catalog-dependencies.js";
+import { ownedSequenceName } from "../access/catalog-names.js";
 import {
   decodeCatalogStream,
   encodeCatalogStream,
@@ -56,6 +60,8 @@ import {
 import { validateFtsDef, type FtsDef } from "../access/fts-def.js";
 import { DurableFormatError } from "../durable-format.js";
 import { retainCatalogExtensions, UnsupportedCatalogError } from "./catalog-records.js";
+import { validateRelationalCatalog } from "./catalog-relationships.js";
+import { utf8Length } from "../vector/varlen.js";
 
 export interface CatalogCounters {
   readonly nextTableId: number;
@@ -86,6 +92,11 @@ export type CatalogOperation =
       readonly table: TableDef;
       readonly sequences: readonly SequenceDef[];
     }
+  | {
+      readonly op: "alterTable";
+      readonly table: TableDef;
+      readonly sequences: readonly SequenceDef[];
+    }
   | { readonly op: "dropTable"; readonly tableId: number }
   | { readonly op: "createIndex"; readonly index: IndexDef }
   | { readonly op: "invalidateIndex"; readonly tableId: number; readonly indexId: number }
@@ -94,6 +105,7 @@ export type CatalogOperation =
   | { readonly op: "dropSequence"; readonly sequenceId: number }
   | { readonly op: "createView"; readonly view: ViewDef }
   | { readonly op: "dropView"; readonly viewId: number }
+  | { readonly op: "replaceView"; readonly view: ViewDef }
   | { readonly op: "createType"; readonly type: TypeDef }
   | { readonly op: "dropType"; readonly typeId: number }
   | { readonly op: "createFts"; readonly fts: FtsDef }
@@ -238,6 +250,13 @@ export class Catalog implements CatalogView {
       return entry;
     });
     const next = logged.reduce<Catalog>((catalog, entry) => catalog.apply(entry, version), this);
+    try {
+      validateStoredCatalog(next.#data());
+      validateRelationalCatalog(next.#data());
+    } catch (error) {
+      if (error instanceof StoreCorruptionError) throw new CatalogChangeError(error.message);
+      throw error;
+    }
     const id = createdId(logged[0] ?? null);
     return { catalog: next, logged, id };
   }
@@ -259,9 +278,10 @@ export class Catalog implements CatalogView {
       case "createTable":
         return this.#planCreateTable(change.table);
       case "alterTable":
-        throw new CatalogChangeError("ALTER TABLE is not supported by the write path yet");
+        return this.#planAlterTable(change.tableId, change.table);
       case "dropTable": {
         const table = this.#requireTable(change.tableId);
+        this.#requireUnreferenced("table", table.id);
         for (const other of this.tables)
           for (const fk of other.foreignKeys)
             if (fk.parentTableId === table.id && other.id !== table.id && fk.enforced)
@@ -288,7 +308,11 @@ export class Catalog implements CatalogView {
         return [
           {
             op: "createIndex",
-            index: input.keyLimit === undefined ? index : { ...index, keyLimit: input.keyLimit },
+            index: {
+              ...index,
+              ...(input.keyLimit === undefined ? {} : { keyLimit: input.keyLimit }),
+              ...(input.directions === undefined ? {} : { directions: input.directions }),
+            },
           },
         ];
       }
@@ -325,6 +349,15 @@ export class Catalog implements CatalogView {
           throw new CatalogChangeError(`Sequence ${String(change.sequenceId)} does not exist`);
         if (sequence.ownedBy !== null)
           throw new CatalogChangeError(`Sequence ${sequence.name} belongs to a column`);
+        this.#requireUnreferenced("sequence", sequence.id);
+        if (
+          this.tables.some((table) =>
+            table.columns.some((column) =>
+              column.defaultDependencies?.sequenceIds.includes(sequence.id),
+            ),
+          )
+        )
+          throw new CatalogChangeError(`Sequence ${sequence.name} is used by a default`);
         return [{ op: "dropSequence", sequenceId: sequence.id }];
       }
       case "createView": {
@@ -332,9 +365,32 @@ export class Catalog implements CatalogView {
           throw new CatalogChangeError(`Relation ${change.view.name} already exists`);
         return [{ op: "createView", view: { ...change.view, id: this.counters.nextViewId } }];
       }
+      case "replaceView": {
+        const before = this.views.find((view) => view.id === change.view.id);
+        if (before === undefined)
+          throw new CatalogChangeError("The view to replace does not exist");
+        if (before.name !== change.view.name)
+          throw new CatalogChangeError("View replacement cannot rename the view");
+        if (before.outputs !== undefined) {
+          const outputs = change.view.outputs;
+          if (
+            outputs === undefined ||
+            outputs.length < before.outputs.length ||
+            before.outputs.some((output, i) => {
+              const next = outputs.at(i);
+              return next?.name !== output.name || !samePhysicalType(next.type, output.type);
+            })
+          )
+            throw new CatalogChangeError(
+              "View replacement cannot change existing output names or types",
+            );
+        }
+        return [{ op: "replaceView", view: { ...before, ...change.view } }];
+      }
       case "dropView": {
         if (!this.views.some((view) => view.id === change.viewId))
           throw new CatalogChangeError(`View ${String(change.viewId)} does not exist`);
+        this.#requireUnreferenced("view", change.viewId);
         return [{ op: "dropView", viewId: change.viewId }];
       }
       case "createType": {
@@ -348,6 +404,7 @@ export class Catalog implements CatalogView {
         const type = this.#types.get(change.typeId);
         if (type === undefined)
           throw new CatalogChangeError(`Type ${String(change.typeId)} does not exist`);
+        this.#requireUnreferenced("type", type.id);
         for (const table of this.tables)
           for (const column of table.columns)
             if (column.type.kind === "enum" && column.type.name === type.name)
@@ -364,6 +421,20 @@ export class Catalog implements CatalogView {
     if (table === undefined)
       throw new CatalogChangeError(`Table ${String(tableId)} does not exist`);
     return table;
+  }
+
+  #requireUnreferenced(kind: "table" | "view" | "type" | "sequence", objectId: number): void {
+    if (kind === "type" || kind === "sequence") {
+      const name = kind === "type" ? this.type(objectId)?.name : undefined;
+      const table = this.tables.find((table) => tableUsesObject(table, kind, objectId, name));
+      if (table)
+        throw new CatalogChangeError(`${kind} ${String(objectId)} is used by table ${table.name}`);
+    }
+    const view = this.views.find((view) =>
+      view.dependencies?.some((dep) => dep.kind === kind && dep.objectId === objectId),
+    );
+    if (view !== undefined)
+      throw new CatalogChangeError(`${kind} ${String(objectId)} is used by view ${view.name}`);
   }
 
   #indexDef(
@@ -385,25 +456,157 @@ export class Catalog implements CatalogView {
     return { id, name, tableId: table.id, columnIds, unique, kind, role };
   }
 
-  #planCreateTable(input: TableInput): CatalogOperation[] {
-    if (this.#nameTaken(input.name))
+  #planAlterTable(tableId: number, input: TableInput): CatalogOperation[] {
+    const before = this.#requireTable(tableId);
+    const seen = new Set<number>();
+    for (const column of input.columns)
+      if (column.id !== undefined) {
+        const prior = before.columns.find((entry) => entry.id === column.id);
+        if (!prior || seen.has(column.id))
+          throw new CatalogChangeError("ALTER names an unknown or repeated column identity");
+        seen.add(column.id);
+        if (
+          prior.name !== column.name &&
+          (before.checks.some((check) => check.columnIds.includes(column.id ?? -1)) ||
+            before.columns.some((other) =>
+              other.generatedDependencies?.columnIds.includes(column.id ?? -1),
+            ) ||
+            this.views.some((view) =>
+              view.dependencies?.some(
+                (dep) =>
+                  dep.kind === "table" &&
+                  dep.objectId === tableId &&
+                  dep.columnIds.includes(column.id ?? -1),
+              ),
+            ))
+        )
+          throw new CatalogChangeError(
+            "Cannot rename a column used by a stored expression or view",
+          );
+        if (!samePhysicalType(prior.type, column.type))
+          throw new CatalogChangeError("ALTER column type requires a rewrite");
+        if (prior.generatedSql !== column.generatedSql)
+          throw new CatalogChangeError("Changing a generated expression requires a rewrite");
+        if (column.identitySequence !== prior.identitySequence && column.identitySequence !== null)
+          throw new CatalogChangeError("ALTER cannot adopt another column's sequence");
+        if (column.identity != null && prior.identitySequence !== null)
+          throw new CatalogChangeError("ALTER cannot replace an owned sequence");
+        if (
+          column.allowedValues !== undefined &&
+          (prior.allowedValues === undefined ||
+            prior.allowedValues.some((value) => !column.allowedValues?.includes(value)))
+        )
+          throw new CatalogChangeError("ALTER cannot narrow a closed text set");
+        if (prior.missing !== column.missing && (prior.missing !== null || column.missing !== null))
+          throw new CatalogChangeError("ALTER cannot replace a frozen missing value");
+      }
+    const currentPrimary =
+      before.indexes.find((index) => index.id === before.primaryKey)?.columnIds ?? [];
+    const nextPrimary = input.primaryKey?.map((position) => input.columns[position]?.id) ?? [];
+    if (
+      currentPrimary.length !== nextPrimary.length ||
+      currentPrimary.some((id, i) => id !== nextPrimary[i])
+    )
+      throw new CatalogChangeError("Changing a primary key requires a rebuild");
+    for (const column of before.columns)
+      if (!seen.has(column.id)) {
+        if (
+          before.indexes.some((index) => index.columnIds.includes(column.id)) ||
+          before.checks.some((check) => check.columnIds.includes(column.id)) ||
+          before.foreignKeys.some((key) => key.columnIds.includes(column.id)) ||
+          before.columns.some((other) =>
+            other.generatedDependencies?.columnIds.includes(column.id),
+          ) ||
+          this.views.some((view) =>
+            view.dependencies?.some(
+              (dep) =>
+                dep.kind === "table" &&
+                dep.objectId === tableId &&
+                dep.columnIds.includes(column.id),
+            ),
+          )
+        )
+          throw new CatalogChangeError(`Column ${column.name} is used by another object`);
+      }
+    // Existing constraints are stable; adding/changing row constraints needs data validation.
+    if (
+      input.unique.length !== before.indexes.filter((index) => index.role === "unique").length ||
+      input.unique.some(
+        (key) =>
+          !before.indexes.some(
+            (index) =>
+              index.id === key.id &&
+              index.name === key.name &&
+              index.columnIds.length === key.columns.length &&
+              index.columnIds.every((id, i) => id === input.columns[key.columns[i] ?? -1]?.id),
+          ),
+      )
+    )
+      throw new CatalogChangeError("Changing UNIQUE constraints requires an index build");
+    if (
+      input.checks.length !== before.checks.length ||
+      input.checks.some(
+        (check) =>
+          !before.checks.some(
+            (prior) => prior.id === check.id && prior.conditionSql === check.conditionSql,
+          ),
+      )
+    )
+      throw new CatalogChangeError("Changing CHECK constraints requires data validation");
+    if (
+      input.foreignKeys.some(
+        (key) =>
+          key.enforced &&
+          !before.foreignKeys.some(
+            (prior) =>
+              prior.id === key.id &&
+              prior.enforced &&
+              prior.parentTableId === key.parentTableId &&
+              prior.parentIndexId === key.parentIndexId &&
+              prior.onDelete === key.onDelete &&
+              prior.columnIds.length === key.columns.length &&
+              prior.columnIds.every((id, i) => id === input.columns[key.columns[i] ?? -1]?.id),
+          ),
+      )
+    )
+      throw new CatalogChangeError("Changing enforced foreign keys requires data validation");
+    const operations = this.#planCreateTable(input, before);
+    return operations.map((operation) =>
+      operation.op === "createTable" ? { ...operation, op: "alterTable" as const } : operation,
+    );
+  }
+
+  #planCreateTable(input: TableInput, previous?: TableDef): CatalogOperation[] {
+    if (this.#nameTaken(input.name) && previous?.name !== input.name)
       throw new CatalogChangeError(`Relation ${input.name} already exists`);
     const counters = { ...this.counters };
-    const tableId = counters.nextTableId;
+    const tableId = previous?.id ?? counters.nextTableId;
     const names = new Set<string>();
     const primary = new Set(input.primaryKey ?? []);
     const sequences: SequenceDef[] = [];
     const columns: ColumnDef[] = input.columns.map((column, position) => {
       if (names.has(column.name)) throw new CatalogChangeError(`Column ${column.name} is repeated`);
       names.add(column.name);
-      const id = counters.nextColumnId++;
+      const id =
+        previous !== undefined && column.id !== undefined ? column.id : counters.nextColumnId++;
       let identitySequence = column.identitySequence;
       if (column.identity !== undefined && column.identity !== null) {
-        const range = intRange(column.type);
+        const range =
+          column.autoIncrement && column.type.kind === "float64"
+            ? { min: 1n, max: BigInt(Number.MAX_SAFE_INTEGER) }
+            : intRange(column.type);
         const increment = column.identity.increment;
         const sequence: SequenceDef = {
           id: counters.nextSequenceId++,
-          name: `${input.name}_${column.name}_seq`,
+          name: ownedSequenceName(
+            input.name,
+            column.name,
+            (name) =>
+              this.#nameTaken(name) ||
+              this.sequences.some((sequence) => sequence.name === name) ||
+              this.tables.some((table) => table.indexes.some((index) => index.name === name)) ||
+              sequences.some((sequence) => sequence.name === name),
+          ),
           increment,
           min: increment > 0n ? 1n : range.min,
           max: increment > 0n ? range.max : -1n,
@@ -427,7 +630,10 @@ export class Catalog implements CatalogView {
         defaultSql: column.defaultSql,
         generatedSql: column.generatedSql,
         identitySequence,
-        missing: null,
+        ...(column.autoIncrement === true ? { autoIncrement: true as const } : {}),
+        missing: previous === undefined ? null : column.missing,
+        ...(column.typeId === undefined ? {} : { typeId: column.typeId }),
+        ...(column.allowedValues === undefined ? {} : { allowedValues: column.allowedValues }),
       };
     });
     const at = (position: number, what: string): ColumnDef => {
@@ -436,13 +642,35 @@ export class Catalog implements CatalogView {
         throw new CatalogChangeError(`${what} names column position ${String(position)}`);
       return column;
     };
+    const ids = columns.map((column) => column.id);
+    input.columns.forEach((source, position) => {
+      const column = at(position, "Expression dependencies");
+      columns[position] = {
+        ...column,
+        ...(source.defaultDependencies === undefined
+          ? {}
+          : { defaultDependencies: resolveDependencies(source.defaultDependencies, ids) }),
+        ...(source.generatedDependencies === undefined
+          ? {}
+          : { generatedDependencies: resolveDependencies(source.generatedDependencies, ids) }),
+        ...(column.identitySequence === null
+          ? {}
+          : {
+              defaultDependencies: {
+                dialectVersion: 1,
+                columnIds: [],
+                sequenceIds: [column.identitySequence],
+              },
+            }),
+      };
+    });
     const shape = { id: tableId, columns };
     const indexes: IndexDef[] = [];
     let primaryKey: number | null = null;
     if (input.primaryKey !== null) {
       const index = this.#indexDef(
         shape,
-        counters.nextIndexId++,
+        previous?.primaryKey ?? counters.nextIndexId++,
         `${input.name}_pkey`,
         input.primaryKey.map((position) => at(position, "The primary key").id),
         true,
@@ -457,7 +685,7 @@ export class Catalog implements CatalogView {
         throw new CatalogChangeError(`Constraint ${unique.name} is repeated`);
       const index = this.#indexDef(
         shape,
-        counters.nextIndexId++,
+        (previous !== undefined ? unique.id : undefined) ?? counters.nextIndexId++,
         unique.name,
         unique.columns.map((position) => at(position, `Unique ${unique.name}`).id),
         true,
@@ -466,6 +694,8 @@ export class Catalog implements CatalogView {
       indexes.push(index);
       uniqueByName.set(unique.name, index);
     }
+    for (const index of previous?.indexes ?? [])
+      if (index.role === "secondary" || index.role === "foreignKey") indexes.push(index);
     const foreignKeys: ForeignKeyDef[] = [];
     for (const input_ of input.foreignKeys) {
       const columnIds = input_.columns.map(
@@ -540,7 +770,7 @@ export class Catalog implements CatalogView {
         }
       }
       foreignKeys.push({
-        id: counters.nextConstraintId++,
+        id: (previous !== undefined ? input_.id : undefined) ?? counters.nextConstraintId++,
         name: input_.name,
         columnIds,
         parentTableId,
@@ -551,15 +781,19 @@ export class Catalog implements CatalogView {
       });
     }
     const checks: CheckDef[] = input.checks.map((check) => ({
-      id: counters.nextConstraintId++,
+      id: (previous !== undefined ? check.id : undefined) ?? counters.nextConstraintId++,
       name: check.name,
       conditionSql: check.conditionSql,
       columnIds: check.columns.map((position) => at(position, `Check ${check.name}`).id),
+      ...(check.dependencies === undefined
+        ? {}
+        : { dependencies: resolveDependencies(check.dependencies, ids) }),
     }));
     const table: TableDef = {
       id: tableId,
       name: input.name,
-      schemaVersion: 1,
+      schemaVersion: previous === undefined ? 1 : previous.schemaVersion + 1,
+      ...(input.managed === undefined ? {} : { managed: input.managed }),
       columns,
       primaryKey,
       indexes,
@@ -617,9 +851,15 @@ export class Catalog implements CatalogView {
           throw new StoreCorruptionError("Unknown FTS id");
         fts = fts.filter((entry) => entry.id !== change.ftsId);
         break;
-      case "createTable": {
+      case "createTable":
+      case "alterTable": {
         const table = change.table;
-        if (this.#tables.has(table.id))
+        if (
+          change.op === "alterTable" &&
+          this.table(table.id)?.schemaVersion !== table.schemaVersion - 1
+        )
+          throw new StoreCorruptionError("A catalog ALTER skips its table schema version");
+        if (change.op === "createTable" && this.#tables.has(table.id))
           throw new CatalogChangeError(`Table ${String(table.id)} exists`);
         bump("nextTableId", table.id);
         for (const column of table.columns) bump("nextColumnId", column.id);
@@ -627,7 +867,16 @@ export class Catalog implements CatalogView {
         for (const fk of table.foreignKeys) bump("nextConstraintId", fk.id);
         for (const check of table.checks) bump("nextConstraintId", check.id);
         for (const sequence of change.sequences) bump("nextSequenceId", sequence.id);
-        tables = [...tables, table];
+        tables =
+          change.op === "createTable"
+            ? [...tables, table]
+            : tables.map((prior) => (prior.id === table.id ? table : prior));
+        if (change.op === "alterTable")
+          sequences = sequences.filter(
+            (sequence) =>
+              sequence.ownedBy?.tableId !== table.id ||
+              table.columns.some((column) => column.identitySequence === sequence.id),
+          );
         sequences = [...sequences, ...change.sequences];
         break;
       }
@@ -682,6 +931,9 @@ export class Catalog implements CatalogView {
         bump("nextViewId", change.view.id);
         views = [...views, change.view];
         break;
+      case "replaceView":
+        views = views.map((view) => (view.id === change.view.id ? change.view : view));
+        break;
       case "dropView":
         views = views.filter((view) => view.id !== change.viewId);
         break;
@@ -731,10 +983,38 @@ export class Catalog implements CatalogView {
         table.indexes.length +
         table.checks.length +
         table.foreignKeys.length;
-    const scratch = 1024 + entries * 256;
+    for (const table of data.tables) {
+      for (const column of table.columns)
+        entries +=
+          (column.defaultDependencies?.columnIds.length ?? 0) +
+          (column.defaultDependencies?.sequenceIds.length ?? 0) +
+          (column.defaultDependencies?.typeIds?.length ?? 0) +
+          (column.generatedDependencies?.columnIds.length ?? 0) +
+          (column.generatedDependencies?.sequenceIds.length ?? 0) +
+          (column.generatedDependencies?.typeIds?.length ?? 0) +
+          (column.allowedValues?.length ?? 0);
+      for (const condition of table.checks)
+        entries +=
+          (condition.dependencies?.columnIds.length ?? 0) +
+          (condition.dependencies?.sequenceIds.length ?? 0) +
+          (condition.dependencies?.typeIds?.length ?? 0);
+    }
+    for (const view of data.views)
+      entries +=
+        (view.outputs?.length ?? 0) +
+        (view.dependencies?.reduce((n, dep) => n + 1 + dep.columnIds.length, 0) ?? 0);
+    // Enum duplicate checks own one temporary Set at a time. Prepay its largest
+    // label table, not the sum across definitions/columns visited sequentially.
+    let labels = 0;
+    for (const type of data.types)
+      if (Array.isArray(type.labels)) labels = Math.max(labels, type.labels.length);
+    for (const table of data.tables)
+      for (const column of table.columns) labels = Math.max(labels, enumLabelCount(column.type));
+    const scratch = 1024 + entries * 256 + labels * 64;
     if (budget && !budget.allocate(scratch)) throw new ParseBudgetError(scratch);
     try {
       validateStoredCatalog(data);
+      validateRelationalCatalog(data);
       return new Catalog(data);
     } catch (error) {
       if (
@@ -748,6 +1028,18 @@ export class Catalog implements CatalogView {
       budget?.free(scratch);
     }
   }
+}
+
+/** Sizing precedes semantic validation: do not trust the asserted physical-type shape. */
+function enumLabelCount(value: unknown): number {
+  for (let depth = 0; depth <= 8; depth++) {
+    if (typeof value !== "object" || value === null || !("kind" in value)) return 0;
+    if (value.kind === "enum")
+      return "labels" in value && Array.isArray(value.labels) ? value.labels.length : 0;
+    if (value.kind !== "array" || !("element" in value)) return 0;
+    value = value.element;
+  }
+  return 0;
 }
 
 /** Validate the complete stored graph, never a transient drop/recreate during ALTER replay. */
@@ -891,7 +1183,12 @@ function validateStoredCatalog(data: CatalogData): void {
     );
   }
   for (const type of data.types)
-    check(new Set(type.labels).size === type.labels.length, "Duplicate stored enum label");
+    check(
+      type.labels.length <= ENUM_LABEL_LIMIT &&
+        type.labels.every((label) => utf8Length(label) <= ENUM_LABEL_BYTES) &&
+        new Set(type.labels).size === type.labels.length,
+      "Invalid stored enum labels",
+    );
 }
 
 function createdId(change: LoggedChange | null): number | null {
@@ -934,6 +1231,13 @@ function validateStoredIndex(index: IndexDef): void {
   positiveId(index.id);
   positiveId(index.tableId);
   if (!index.columnIds.length) throw new StoreCorruptionError("Empty stored index key");
+  if (
+    index.directions !== undefined &&
+    (index.directions.length !== index.columnIds.length || index.directions.length === 0)
+  )
+    throw new StoreCorruptionError("Invalid stored index directions");
+  for (const direction of index.directions ?? [])
+    requireTag(direction, ["asc", "desc"], "index direction", StoreCorruptionError);
   index.columnIds.forEach(positiveId);
   if (index.keyLimit !== undefined)
     requireTag(
@@ -1104,18 +1408,18 @@ export function decodeLogged(bytes: Uint8Array): LoggedChange {
         throw new StoreCorruptionError(`Invalid logged catalog id ${name}`);
     }
     if (value.op === "createFts" || value.op === "upsertFts") validateFtsDef(value.fts);
-    if (value.op === "createTable") validateStoredTable(value.table);
+    if (value.op === "createTable" || value.op === "alterTable") validateStoredTable(value.table);
     if (value.op === "createIndex") validateStoredIndex(value.index);
     if (value.op === "putSequence") {
       positiveId(value.sequence.id);
       validateSequence(value.sequence);
     }
-    if (value.op === "createTable")
+    if (value.op === "createTable" || value.op === "alterTable")
       for (const sequence of value.sequences) {
         positiveId(sequence.id);
         validateSequence(sequence);
       }
-    if (value.op === "createView") positiveId(value.view.id);
+    if (value.op === "createView" || value.op === "replaceView") positiveId(value.view.id);
     if (value.op === "createType") positiveId(value.type.id);
     return value;
   } catch (error) {

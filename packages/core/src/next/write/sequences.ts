@@ -226,6 +226,15 @@ export class Sequences implements SequenceAccess {
     return this.#run(() => this.#set(sequenceId, value, isCalled));
   }
 
+  /** DSL explicit values only move a counter forward, serialized with next/set under pressure. */
+  advance(sequenceId: number, atLeast: bigint): MaybePromise<number> {
+    return this.#run(() => {
+      const state = this.#state(sequenceId);
+      if (state.next >= atLeast) return state.blockLsn;
+      return this.#set(sequenceId, atLeast - 1n, true);
+    });
+  }
+
   #set(sequenceId: number, value: bigint, isCalled: boolean): MaybePromise<number> {
     const state = this.#state(sequenceId);
     const { increment, min, max } = state.def;

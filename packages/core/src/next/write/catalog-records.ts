@@ -54,7 +54,16 @@ function shape(kind: CatalogRecordKind) {
 function field(spec: string) {
   const [name, raw] = spec.split(":");
   check(name !== undefined && raw !== undefined, "Invalid catalog schema");
-  return { name, spec: raw.endsWith("~") ? raw.slice(0, -1) : raw, optional: raw.endsWith("~") };
+  // ~! may be absent when unused, but is semantic when present: older readers must refuse it.
+  const critical = raw.endsWith("!");
+  const type = critical ? raw.slice(0, -1) : raw;
+  const optional = type.endsWith("~");
+  return {
+    name,
+    spec: optional ? type.slice(0, -1) : type,
+    optional,
+    required: critical || !optional,
+  };
 }
 const typed = [
   [DURABLE_CODECS.catalogTypedArray.uint8, Uint8Array],
@@ -312,7 +321,7 @@ function entries(
       check(f.optional, `Missing catalog field ${f.name}`);
       continue;
     }
-    visit(id, f.optional ? 0 : DURABLE_CODECS.catalogFieldFlags.required, f.spec, v);
+    visit(id, f.required ? DURABLE_CODECS.catalogFieldFlags.required : 0, f.spec, v);
   }
   let last = definitions.length;
   for (const extension of record[opaque] ?? []) {
@@ -414,7 +423,7 @@ function readRecord(input: ByteReader, kind: CatalogRecordKind, depth: number): 
       continue;
     }
     const f = field(definition);
-    check(required !== f.optional, "Invalid catalog field requirement flag");
+    check(required === f.required, "Invalid catalog field requirement flag");
     result[f.name] = get(payload, f.spec, depth + 1);
     payload.end();
   }

@@ -10,6 +10,23 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported rebuild retains named enum identities, owned identity and schema counters,
+managed table/view flags, index directions, view outputs and stable expression dependencies in
+the versioned catalog. Named type references survive expression folding, and stored view
+dependencies include unused CTE bodies and recursive steps. Compatible view replacement preserves identity. Native catalog-only
+column changes preserve frozen backfills and older snapshots across publication and replay.
+The owner-local migration entry point checks the catalog version under the writer lock, applies
+changes atomically, validates NOT NULL against live rows and protects unmanaged objects.
+Closed schema text sets retain text ordering; explicit schema counter values advance their owned
+sequence. This changes unreleased rebuild bytes only; the published engine and its formats are
+unchanged. These catalog additions select development reader 5, manifest 6 and commit body 4.
+Trigger firing and portable catalog adapters remain later stages; native FTS scan and
+durable FTS declarations are retained by these catalog changes.
+The shared parser provenance adds 1,226 packed bytes; its packed cap rises once by 1,500 bytes,
+and the combined worker/client download cap rises once by 768 gzip bytes. Engine entry bundle
+caps rise once by 2 KiB raw and 768 gzip bytes; the larger adapter measures about 450 KiB gzip. Rebuild code stays
+excluded from published packages.
+
 ### Planned 1.0 cutover: full-text search
 
 The unexported 1.0 engine lowers MATCH/BM25 and evaluates them by scan. BM25 uses the whole
@@ -48,7 +65,8 @@ Informational foreign keys may retain a dropped parent across checkpoint and reo
 safe-integer payloads reject nonfinite, fractional, unsafe and negative-zero values; NULL payloads
 stay uninterpreted. Reserved future semantic FTS fields refuse even when marked optional.
 This changes unreleased
-rebuild bytes only (reader 4, manifest 5, commit body 3); no supported next/ writer has shipped.
+rebuild bytes only (original FTS allocation: reader 4, manifest 5, commit body 3; the catalog
+extensions above select 5/6/4). No supported next/ writer has shipped.
 The development format now registers bounded native full-text root, term, posting, document
 and append-delta pages plus portable per-column definitions. Definitions survive catalog WAL
 replay/checkpoint; native page references and build leases remain outside the portable catalog.

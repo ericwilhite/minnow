@@ -45,9 +45,12 @@ describe("compressed download budgets", () => {
     // Raise once by 256 bytes; native/test inputs remain excluded.
     // Reviewed record identity: 572,499 combined gzip bytes (+422); client unchanged.
     // Raise once by 512; shared parser/optimizer only, with no next/ or test inputs.
+    // Catalog/type/identifier/CTE provenance: 573,238 combined gzip bytes.
+    // Raise once by 768 over main; audit against b091f51d confirms the client is unchanged
+    // and only shared parser/provenance modules grow. No next/ or test input ships.
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
-    ).toBeLessThanOrEqual(559.25 * 1024);
+    ).toBeLessThanOrEqual(560 * 1024);
   });
 });
