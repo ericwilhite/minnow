@@ -1,6 +1,8 @@
 /** Atomic load law: old/absent or complete native root, never a portable prefix. */
 import { Governor, type Grant } from "../memory/governor.js";
 import { spoolSnapshotInput, type ReplayableSnapshotInput } from "./snapshot-source.js";
+import type { PhysicalType } from "../types.js";
+import { encodeSnapshotColumnHeader } from "./snapshot-column.js";
 import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
@@ -12,6 +14,8 @@ import {
   SNAPSHOT_LOAD_OPEN_REACH,
   SNAPSHOT_CATALOG_REFUSAL_REACH,
   SNAPSHOT_ADMISSION_REACH,
+  SNAPSHOT_STRUCTURED_REACH,
+  SNAPSHOT_LOAD_ROOT_REACH,
 } from "../../testing/reach.js";
 import { decodeManifestRoot } from "../format/manifest-codec.js";
 import { listedRootExtents, reachableExtents } from "../format/reachable.js";
@@ -517,24 +521,25 @@ for (const seed of seedsFor("next-snapshot-load-faults", [0xb263, 0xb264]))
     reach.assertReached();
   }, 60000);
 
+async function oldTarget(h: Harness): Promise<number> {
+  const path = await h.open();
+  await autocommit(path, (st) =>
+    st.changeCatalog({
+      kind: "createTable",
+      table: tableInput("old", [column("n", INT), column("s", { kind: "text" })], {
+        primaryKey: null,
+      }),
+    }),
+  );
+  await autocommit(path, (st) => st.table(1).insert(batch(ints([777]), texts(["old"])), null));
+  await path.recycleLog();
+  const lsn = path.appliedLsn;
+  await h.close();
+  return lsn;
+}
+
 it("recovers old or complete data after every physical publication step", async () => {
   const chunks = await fixture([10, null, 30]);
-  async function oldTarget(h: Harness): Promise<number> {
-    const path = await h.open();
-    await autocommit(path, (st) =>
-      st.changeCatalog({
-        kind: "createTable",
-        table: tableInput("old", [column("n", INT), column("s", { kind: "text" })], {
-          primaryKey: null,
-        }),
-      }),
-    );
-    await autocommit(path, (st) => st.table(1).insert(batch(ints([777]), texts(["old"])), null));
-    await path.recycleLog();
-    const lsn = path.appliedLsn;
-    await h.close();
-    return lsn;
-  }
   let steps = 0;
   const baseline = new Harness("strict", "sim"),
     initial = await oldTarget(baseline),
@@ -1076,6 +1081,390 @@ for (const seed of seedsFor("next-snapshot-admission", [0xb26f, 0xb270]))
         }
       }),
       { seed, numRuns: 4 },
+    );
+    reach.assertReached();
+  }, 60000);
+
+/** Construct a valid container around arbitrary value bytes: all frame/catalog/footer CRCs
+ * are recomputed. These are semantic corruptions, never outer-integrity failures. */
+async function structuredArchive(type: PhysicalType, value: Uint8Array): Promise<Uint8Array[]> {
+  let catalog = Catalog.empty();
+  const element = type.kind === "array" ? type.element : type;
+  if (element.kind === "enum")
+    catalog = catalog.change(
+      { kind: "createType", type: { name: element.name, labels: element.labels } },
+      1,
+    ).catalog;
+  catalog = catalog.change(
+    {
+      kind: "createTable",
+      table: tableInput("structured", [column("v", type)], { primaryKey: null }),
+    },
+    1,
+  ).catalog;
+  const chunks: Uint8Array[] = [],
+    funding = new Budget(),
+    catalogBytes = catalog.encode();
+  const writer = await SnapshotStreamWriter.open(
+    { id: new Uint8Array(16), sourceLsn: 0 },
+    {
+      write(bytes) {
+        chunks.push(bytes.slice());
+      },
+    },
+    funding,
+  );
+  const numbers = new Uint8Array(48),
+    data = new Uint8Array(26 + value.length);
+  try {
+    await writer.frame(SnapshotKind.catalogBegin, 1, 0, numbers.subarray(0, 0));
+    await writer.frame(SnapshotKind.catalogPart, 1, 1, catalogBytes);
+    snapshotNumbers([catalogBytes.length, 0], numbers.subarray(0, 16));
+    new DataView(numbers.buffer).setUint32(8, snapshotCrc32(catalogBytes), true);
+    await writer.frame(SnapshotKind.catalogEnd, 1, 2, numbers.subarray(0, 16));
+    snapshotNumbers([1, 1, 1], numbers.subarray(0, 24));
+    await writer.frame(SnapshotKind.tableBegin, 2, 0, numbers.subarray(0, 24));
+    encodeSnapshotColumnHeader(type, 1, data.subarray(0, 16));
+    data[16] = 1;
+    new DataView(data.buffer).setUint32(17, value.length, true);
+    data.set(value, 21);
+    data[21 + value.length] = 2;
+    snapshotNumbers([1, 1, 1, 0, 1, data.length], numbers);
+    await writer.frame(SnapshotKind.columnBegin, 3, 0, numbers);
+    let part = 1;
+    for (let at = 0; at < data.length; at += 1 << 20)
+      await writer.frame(SnapshotKind.columnPart, 3, part++, data.subarray(at, at + (1 << 20)));
+    snapshotNumbers([data.length, 1], numbers.subarray(0, 16));
+    await writer.frame(SnapshotKind.columnEnd, 3, part, numbers.subarray(0, 16));
+    snapshotNumbers([1], numbers.subarray(0, 8));
+    await writer.frame(SnapshotKind.tableEnd, 2, 1, numbers.subarray(0, 8));
+    await writer.finish();
+    return chunks;
+  } finally {
+    writer.close();
+    expect(funding.used).toBe(0);
+  }
+}
+for (const seed of seedsFor("next-snapshot-structured", [0xb271, 0xb272]))
+  it(`refuses checksum-valid malformed structured payloads before publication seed ${String(seed)}`, async () => {
+    const reach = createReach("snapshot structured", SNAPSHOT_STRUCTURED_REACH);
+    await fc.assert(
+      fc.asyncProperty(fc.integer({ min: 1, max: 32 }), async (size) => {
+        reach.beginHistory();
+        const bytesType: PhysicalType = { kind: "bytes" },
+          arrayType: PhysicalType = { kind: "array", element: bytesType };
+        const original = encodeArrayValue(bytesType, {
+          dimensions: [2],
+          lowerBounds: [1],
+          elements: [new Uint8Array(size), new Uint8Array([1, 2])],
+        });
+        const cases: Array<{
+          name: (typeof SNAPSHOT_STRUCTURED_REACH)[number];
+          type: PhysicalType;
+          value: Uint8Array;
+        }> = [];
+        const mutate = (
+          name: (typeof SNAPSHOT_STRUCTURED_REACH)[number],
+          change: (bytes: Uint8Array) => void,
+        ) => {
+          const value = original.slice();
+          change(value);
+          cases.push({ name, type: arrayType, value });
+        };
+        mutate("array version", (bytes) => {
+          bytes[0] = 2;
+        });
+        mutate("array element tag", (bytes) => {
+          bytes[1] = 255;
+        });
+        mutate("array dimensions", (bytes) => {
+          bytes[2] = 7;
+        });
+        mutate("array flags", (bytes) => {
+          bytes[3] = 2;
+        });
+        mutate("array dimension length", (bytes) => {
+          new DataView(bytes.buffer).setInt32(4, -1, true);
+        });
+        mutate("array lower bound", (bytes) => {
+          new DataView(bytes.buffer).setInt32(8, 2147483647, true);
+        });
+        mutate("array element length", (bytes) => {
+          new DataView(bytes.buffer).setUint32(12, 0xffffffff, true);
+        });
+        cases.push({
+          name: "array truncated element",
+          type: arrayType,
+          value: original.slice(0, -1),
+        });
+        const nulls = encodeArrayValue(bytesType, {
+          dimensions: [1],
+          lowerBounds: [1],
+          elements: [null],
+        });
+        nulls[12] = 128;
+        cases.push({ name: "array null tail", type: arrayType, value: nulls });
+        const bool = encodeArrayValue(
+          { kind: "bool" },
+          { dimensions: [1], lowerBounds: [1], elements: [true] },
+        );
+        bool[12] = 2;
+        cases.push({
+          name: "array boolean",
+          type: { kind: "array", element: { kind: "bool" } },
+          value: bool,
+        });
+        const decType: PhysicalType = { kind: "decimal", precision: null, scale: null };
+        const decimal = encodeArrayValue(decType, {
+          dimensions: [1],
+          lowerBounds: [1],
+          elements: [{ coefficient: 1n, scale: 2 }],
+        });
+        const special = decimal.slice();
+        special[12] = 4;
+        cases.push({
+          name: "array decimal special",
+          type: { kind: "array", element: decType },
+          value: special,
+        });
+        const overflow = new Uint8Array(19 + 70000);
+        overflow.set(decimal.subarray(0, 19));
+        new DataView(overflow.buffer).setUint32(15, 70000, true);
+        overflow[overflow.length - 1] = 64;
+        cases.push({
+          name: "array decimal overflow",
+          type: { kind: "array", element: decType },
+          value: overflow,
+        });
+        cases.push({
+          name: "array unsupported element",
+          type: { kind: "array", element: { kind: "json", binary: false } },
+          value: new Uint8Array([1, 1, 0, 0]),
+        });
+        const scale = decimal.slice();
+        new DataView(scale.buffer).setUint16(13, 0xffff, true);
+        cases.push({
+          name: "array decimal scale",
+          type: { kind: "array", element: decType },
+          value: scale,
+        });
+        cases.push({
+          name: "json grammar",
+          type: { kind: "json", binary: false },
+          value: new TextEncoder().encode('{"a":[1,]}'),
+        });
+        cases.push({
+          name: "json utf8",
+          type: { kind: "json", binary: true },
+          value: new Uint8Array([34, 255, 34]),
+        });
+        cases.push({
+          name: "enum label",
+          type: { kind: "enum", name: "mood", labels: ["ok", "sad"] },
+          value: new TextEncoder().encode("missing"),
+        });
+        cases.push({ name: "text utf8", type: { kind: "text" }, value: new Uint8Array([255]) });
+        cases.push({
+          name: "text bom length",
+          type: { kind: "text", maxLength: 1 },
+          value: new TextEncoder().encode("\ufeffa"),
+        });
+        cases.push({
+          name: "text length",
+          type: { kind: "text", maxLength: 1 },
+          value: new TextEncoder().encode("ab"),
+        });
+        const h = new Harness("strict", "memory"),
+          lsn = await oldTarget(h);
+        try {
+          for (const example of cases) {
+            const funding = new Governor(32 << 20);
+            const archive = await structuredArchive(example.type, example.value);
+            await expect(
+              loadSnapshot(input(archive), () => target(h, lsn, false), funding, { replace: true }),
+            ).rejects.toMatchObject({ code: "MINNOW_SNAPSHOT_FORMAT" });
+            expect(funding.usedBytes).toBe(0);
+            expect(await contents(h)).toEqual([[777, "old"]]);
+            reach.reach(example.name);
+          }
+        } finally {
+          await h.close();
+        }
+      }),
+      { seed, numRuns: 4 },
+    );
+    reach.assertReached();
+  }, 60000);
+
+for (const layout of ["bytes", "json", "decimal", "padded decimal"] as const)
+  it(`streams large ${layout} values without materializing value graphs`, async () => {
+    const element: PhysicalType = { kind: "bytes" };
+    const decimalType: PhysicalType = { kind: "decimal", precision: null, scale: null };
+    let example: { type: PhysicalType; value: Uint8Array };
+    if (layout === "bytes")
+      example = {
+        type: { kind: "array", element },
+        value: encodeArrayValue(element, {
+          dimensions: [2],
+          lowerBounds: [-3],
+          elements: [new Uint8Array((2 << 20) + 17).fill(73), null],
+        }),
+      };
+    else if (layout === "json")
+      example = {
+        type: { kind: "json", binary: false },
+        value: new TextEncoder().encode(
+          "[".repeat(1500) + '{"s":"' + "x".repeat((2 << 20) + 17) + '"}' + "]".repeat(1500),
+        ),
+      };
+    else if (layout === "decimal")
+      example = {
+        type: { kind: "array", element: decimalType },
+        value: encodeArrayValue(decimalType, {
+          dimensions: [3],
+          lowerBounds: [1],
+          elements: [
+            { coefficient: -(1n << 60000n), scale: 9 },
+            { coefficient: 0n, scale: 0, special: "Infinity" },
+            null,
+          ],
+        }),
+      };
+    else {
+      const base = encodeArrayValue(decimalType, {
+        dimensions: [1],
+        lowerBounds: [1],
+        elements: [{ coefficient: 1n, scale: 2 }],
+      });
+      const value = new Uint8Array(19 + 70000);
+      value.set(base);
+      new DataView(value.buffer).setUint32(15, 70000, true);
+      example = { type: { kind: "array", element: decimalType }, value };
+    }
+    const h = new Harness("strict", "memory"),
+      funding = new Governor(16 << 20),
+      archive = await structuredArchive(example.type, example.value);
+    try {
+      await loadSnapshot(input(archive), () => target(h), funding);
+      expect(funding.usedBytes).toBe(0);
+      const path = await h.open(),
+        pin = path.pin(),
+        exported: Uint8Array[] = [];
+      try {
+        const catalog = pin.catalog;
+        if (!(catalog instanceof Catalog)) throw new Error("catalog");
+        await exportPinnedSnapshot(
+          pin,
+          new Uint8Array(16),
+          (async function* () {
+            yield catalog.encode();
+          })(),
+          {
+            write(bytes) {
+              exported.push(bytes.slice());
+            },
+          },
+          new Budget(),
+        );
+        const body = async (chunks: Uint8Array[]) => {
+          const b = new Budget(),
+            reader = await SnapshotStreamReader.open(
+              (async function* () {
+                yield* chunks;
+              })(),
+              b,
+            ),
+            parts: Uint8Array[] = [];
+          try {
+            for await (const frame of reader.frames())
+              if (frame.kind === SnapshotKind.columnPart) parts.push(frame.payload.slice());
+          } finally {
+            reader.close();
+            expect(b.used).toBe(0);
+          }
+          return parts;
+        };
+        expect(await body(exported)).toEqual(await body(archive));
+      } finally {
+        pin.release();
+        await h.close();
+      }
+      expect(funding.peakBytes).toBeLessThanOrEqual(16 << 20);
+    } finally {
+      await h.close();
+    }
+  }, 60000);
+
+for (const seed of seedsFor("next-snapshot-load-root-credit", [0xb273, 0xb274]))
+  it(`hands large native root ownership to the same governor seed ${String(seed)}`, async () => {
+    const reach = createReach("snapshot load root credit", SNAPSHOT_LOAD_ROOT_REACH);
+    await fc.assert(
+      fc.asyncProperty(fc.integer({ min: 1024, max: 1028 }), async (count) => {
+        reach.beginHistory();
+        let catalog = Catalog.empty();
+        for (let i = 0; i < count; i++)
+          catalog = catalog.change(
+            { kind: "createTable", table: tableInput(`t${String(i)}`, [], { primaryKey: null }) },
+            1,
+          ).catalog;
+        const chunks: Uint8Array[] = [],
+          b = new Budget(),
+          numbers = new Uint8Array(24),
+          bytes = catalog.encode();
+        const writer = await SnapshotStreamWriter.open(
+          { id: new Uint8Array(16), sourceLsn: 0 },
+          {
+            write(part) {
+              chunks.push(part.slice());
+            },
+          },
+          b,
+        );
+        try {
+          await writer.frame(SnapshotKind.catalogBegin, 1, 0, numbers.subarray(0, 0));
+          await writer.frame(SnapshotKind.catalogPart, 1, 1, bytes);
+          snapshotNumbers([bytes.length, 0], numbers.subarray(0, 16));
+          new DataView(numbers.buffer).setUint32(8, snapshotCrc32(bytes), true);
+          await writer.frame(SnapshotKind.catalogEnd, 1, 2, numbers.subarray(0, 16));
+          for (let id = 1; id <= count; id++) {
+            snapshotNumbers([id, 1, 0], numbers);
+            await writer.frame(SnapshotKind.tableBegin, id + 1, 0, numbers);
+            snapshotNumbers([0], numbers.subarray(0, 8));
+            await writer.frame(SnapshotKind.tableEnd, id + 1, 1, numbers.subarray(0, 8));
+          }
+          await writer.finish();
+        } finally {
+          writer.close();
+          expect(b.used).toBe(0);
+        }
+        const h = new Harness("strict", "memory");
+        let size = 0;
+        await loadSnapshot(
+          input(chunks),
+          () =>
+            target(h, 0, true, (space) => {
+              const publish = space.publish.bind(space);
+              space.publish = (root, change) => {
+                size = root.length;
+                return publish(root, change);
+              };
+            }),
+          h.governor,
+        );
+        expect(size).toBeGreaterThan(18 * 1024);
+        expect(h.governor.usedBytes).toBe(0);
+        const path = await h.open();
+        try {
+          expect(path.catalog.tables).toHaveLength(count);
+        } finally {
+          await h.close();
+        }
+        expect(h.governor.usedBytes).toBe(0);
+        reach.reach("oversized native root");
+        reach.reach("same governor handoff");
+        reach.reach("zero after reopen");
+      }),
+      { seed, numRuns: 2 },
     );
     reach.assertReached();
   }, 60000);

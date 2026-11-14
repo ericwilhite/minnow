@@ -4293,3 +4293,11 @@ It never sees a partial new generation. One-shot sources spool at the owner edge
 `spoolSnapshotInput` into an exclusive scratch reservation, then follow the same loader path.
 The owner declares the maximum borrowed chunk capacity; the copy step is admitted before pulling
 it. The spool handle stays charged until `close()`, which releases only its own scratch range.
+
+Portable load validates structured value payloads before reconstructing a native group. Array
+version/type/dimensions, null bitmap padding, scalar ranges and internal element lengths must
+be valid, not merely checksummed. JSON must be complete UTF-8 JSON; text must be valid UTF-8
+within its declared length, and enum bytes must name a declared label. Validation streams from
+private staging in bounded windows without constructing an array/JSON value graph. Array
+NUMERIC work is bounded by the supported precision; JSON nesting state grows only with depth
+and is charged, including resize overlap. Admission and cancellation follow the same replay path.

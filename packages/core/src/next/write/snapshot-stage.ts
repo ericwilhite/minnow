@@ -1,4 +1,5 @@
 /** Verified portable bytes live only in writer-owned, unpublished extents. No table-sized buffer. */
+import { validateSnapshotValue } from "./snapshot-validate-value.js";
 import type { ColumnDef } from "../access/catalog.js";
 import { SnapshotBudgetError, SnapshotFormatError, type SnapshotWork } from "../format/snapshot.js";
 import type {
@@ -168,6 +169,12 @@ export class SnapshotStagedColumn {
     } finally {
       reader.close();
     }
+    if (snapshotValueWidth(this.column.type) === 0)
+      for (let row = 0; row < this.rows; row++) {
+        const length = this.lengths[row] ?? 0xffffffff;
+        if (length !== 0xffffffff)
+          await validateSnapshotValue(this, space, this.offsets[row] ?? 0, length);
+      }
   }
   async discard(): Promise<void> {
     if (this.#sealed !== null) await this.writer.discard(this.#sealed.extent);

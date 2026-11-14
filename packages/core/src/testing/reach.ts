@@ -8713,3 +8713,32 @@ export const SNAPSHOT_ADMISSION_REACH = [
   "only above cap refused",
   "one shot via spool",
 ] as const;
+
+export const SNAPSHOT_STRUCTURED_REACH = [
+  "array version",
+  "array element tag",
+  "array dimensions",
+  "array flags",
+  "array dimension length",
+  "array lower bound",
+  "array element length",
+  "array truncated element",
+  "array null tail",
+  "array boolean",
+  "array decimal special",
+  "array decimal scale",
+  "array decimal overflow",
+  "array unsupported element",
+  "json grammar",
+  "json utf8",
+  "enum label",
+  "text utf8",
+  "text length",
+  "text bom length",
+] as const;
+
+export const SNAPSHOT_LOAD_ROOT_REACH = [
+  "oversized native root",
+  "same governor handoff",
+  "zero after reopen",
+] as const;
