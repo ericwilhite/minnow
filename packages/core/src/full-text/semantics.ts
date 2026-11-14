@@ -64,20 +64,24 @@ function emitRun(tokens: string[], run: string): void {
     pushToken(tokens, run);
     return;
   }
-  const characters = Array.from(run);
   let start = 0;
-  while (start < characters.length) {
-    const isCjk = CJK.test(characters[start] ?? "");
-    let end = start + 1;
-    while (end < characters.length && CJK.test(characters[end] ?? "") === isCjk) end += 1;
-    if (isCjk) {
-      if (end - start === 1) pushToken(tokens, characters[start] ?? "");
-      for (let index = start; index < end - 1; index += 1) {
-        pushToken(tokens, (characters[index] ?? "") + (characters[index + 1] ?? ""));
-      }
-    } else {
-      pushToken(tokens, characters.slice(start, end).join(""));
+  while (start < run.length) {
+    const first = String.fromCodePoint(run.codePointAt(start) ?? 0);
+    const isCjk = CJK.test(first);
+    let end = start + first.length;
+    let previous = first;
+    let count = 1;
+    while (end < run.length) {
+      const current = String.fromCodePoint(run.codePointAt(end) ?? 0);
+      if (CJK.test(current) !== isCjk) break;
+      if (isCjk) pushToken(tokens, previous + current);
+      previous = current;
+      count++;
+      end += current.length;
     }
+    if (isCjk) {
+      if (count === 1) pushToken(tokens, first);
+    } else pushToken(tokens, run.slice(start, end));
     start = end;
   }
 }
@@ -132,7 +136,7 @@ export function tokenizeQuery(query: string): FtsQueryTerm[] {
   return terms;
 }
 
-function termMatches(token: string, term: FtsQueryTerm): boolean {
+export function termMatches(token: string, term: FtsQueryTerm): boolean {
   return term.prefix ? token.startsWith(term.term) : token === term.term;
 }
 

@@ -90,7 +90,10 @@ function callOf(fn: string, overload: Overload, types: readonly PhysicalType[]):
   return {
     op: "call",
     fn,
-    args: types.map((type, k) => col(k, type)),
+    // AGAINST supplies a literal/owned parameter, not a row-dependent expression.
+    args: types.map((type, k) =>
+      fn === "fts_match" && k === 0 ? { op: "literal", type, value: texts(["a"]) } : col(k, type),
+    ),
     type: result ?? BOOL,
   };
 }
@@ -146,7 +149,7 @@ describe("kernel bindings onto ir/functions.ts (R19)", () => {
       const types = argumentTypes(overload, variable);
       const run = () => {
         const compiled = compileFor(callOf(fn, overload, types), types);
-        compiled.evaluate(
+        const output = compiled.evaluate(
           batchOf(
             types.map((type, index) =>
               fn === "date_trunc" && index === 0
@@ -158,6 +161,11 @@ describe("kernel bindings onto ir/functions.ts (R19)", () => {
           ),
           null,
         );
+        if (fn === "fts_match") {
+          if (output.form !== "flat" || output.data.layout !== "bool")
+            throw new TypeError("MATCH output");
+          expect([...output.data.values.subarray(0, 2)]).toEqual([1, 0]);
+        }
       };
       if ("refused" in binding) refusedWith(run, binding.construct);
       else if (binding.kinds !== undefined && !binding.kinds.has(variable.kind))

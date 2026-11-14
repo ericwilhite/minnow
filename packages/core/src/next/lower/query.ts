@@ -657,6 +657,7 @@ export function lowerBlock(
 
   // Assemble bottom-up: every expression is typed, so the FROM clause can be built and its
   // virtual columns mapped to positions.
+  // A scoring corpus is the visible base table, before WHERE or demand bounds.
   const base = from.build(conjuncts);
   const positions = new Map(base.layout.map((index, position) => [index, position]));
   const remap = (expr: ScalarExpr): ScalarExpr =>

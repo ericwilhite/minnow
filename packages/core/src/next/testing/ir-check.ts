@@ -277,10 +277,12 @@ function checkExpr(expr: ScalarExpr, input: readonly OutputColumn[], where: stri
         if (params.length !== kinds.length) return false;
         const variable = expr.args[params.indexOf("T")]?.type;
         return (
-          params.every((param, index) =>
-            param === "T"
-              ? variable !== undefined && sameBase(expr.args[index]?.type ?? variable, variable)
-              : param === kinds[index],
+          params.every(
+            (param, index) =>
+              param === "any" ||
+              (param === "T"
+                ? variable !== undefined && sameBase(expr.args[index]?.type ?? variable, variable)
+                : param === kinds[index]),
           ) &&
           (overload.result === "T"
             ? variable !== undefined && sameBase(variable, expr.type)
@@ -352,6 +354,24 @@ function checkRel(rel: Rel, catalog: CatalogView): void {
         for (const cell of row) checkExpr(cell, [], where);
         checkOutput(row, rel.output, where);
       }
+      return;
+    case "fts":
+      checkRel(rel.input, catalog);
+      for (const call of rel.calls) {
+        for (const column of call.columns)
+          checkPosition(column, rel.input.output.length, where, "FTS column");
+        checkExpr(call.query, [], where);
+        if (
+          call.query.type.kind !== "text" ||
+          (call.query.op !== "literal" && call.query.op !== "param")
+        )
+          fail(where, "FTS query is not scalar text");
+      }
+      if (rel.output.length !== rel.input.output.length + rel.calls.length)
+        fail(where, "FTS output width");
+      checkSameColumns(rel.input.output, rel.output.slice(0, rel.input.output.length), where);
+      for (const output of rel.output.slice(rel.input.output.length))
+        if (output.type.kind !== "float64") fail(where, "FTS score is not float64");
       return;
     case "filter":
       checkRel(rel.input, catalog);
@@ -670,6 +690,14 @@ export function checkPlan(plan: PhysicalPlan, catalog: CatalogView): void {
   try {
     if (plan.placeholderCount > plan.parameters.length) fail("plan", "placeholders past the slots");
     for (let slot = 0; slot < plan.placeholderCount; slot += 1) global.add(slot);
+    for (const mapping of plan.ftsParameters ?? []) {
+      if (mapping.source < 0 || mapping.source >= plan.placeholderCount)
+        fail("FTS parameter", "source is not a placeholder");
+      if (mapping.slot < plan.placeholderCount || global.has(mapping.slot))
+        fail("FTS parameter", "duplicate slot producer");
+      checkSlotType(mapping.slot, { kind: "text" }, "FTS parameter");
+      global.add(mapping.slot);
+    }
     if (plan.clockSlot !== null) {
       checkSlotType(plan.clockSlot, { kind: "timestamp", zoned: true }, "clock");
       if (plan.clockSlot < plan.placeholderCount) fail("clock", "slot is a placeholder");

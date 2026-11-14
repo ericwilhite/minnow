@@ -18,7 +18,8 @@ it("pins independent v1 tokenizer, renderer and scorer fixtures", () => {
     native.FTS_TOKENIZER_VERSION,
     native.FTS_RENDER_VERSION,
     native.FTS_SCORER_VERSION,
-  ]).toEqual([1, 1, 1]);
+  ]).toEqual([1, 2, 1]);
+  expect(shipped.FTS_RENDER_VERSION).toBe(1);
   expect(native.tokenize).toBe(shipped.tokenize);
   expect(native.bm25Score).toBe(shipped.bm25Score);
   const corpus = new native.FtsStatsAccumulator(native.tokenizeQuery("alpha al*"));

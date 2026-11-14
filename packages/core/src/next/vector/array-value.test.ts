@@ -1,11 +1,12 @@
 import fc from "fast-check";
 import { describe, expect, it, vi } from "vitest";
-import { createReach } from "../../testing/reach.js";
+import { createReach, ARRAY_VISITOR_REACH } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import type { PhysicalType } from "../types.js";
 import {
   MalformedArrayError,
   decodeArrayValue,
+  visitArrayValue,
   encodeArrayValue,
   type ArrayElement,
   type ArrayValue,
@@ -65,6 +66,7 @@ const shapes = fc.oneof(
 
 describe("array stored values (review A1-3 finding 1)", () => {
   it.each(SEEDS)("round-trips every supported element type exactly (seed %i)", (seed) => {
+    const reach = createReach(`array visitor ${String(seed)}`, ARRAY_VISITOR_REACH);
     for (const [type, element] of ELEMENTS)
       fc.assert(
         fc.property(
@@ -76,7 +78,37 @@ describe("array stored values (review A1-3 finding 1)", () => {
               .map((elements): ArrayValue => ({ ...shape, elements }));
           }),
           (value) => {
-            const decoded = decodeArrayValue(type, encodeArrayValue(type, value));
+            reach.beginHistory();
+            const encoded = encodeArrayValue(type, value);
+            const decoded = decodeArrayValue(type, encoded);
+            const visited: Array<ArrayElement | null> = [];
+            visitArrayValue(type, encoded, {
+              begin(shape, count) {
+                expect(shape).toEqual({
+                  dimensions: value.dimensions,
+                  lowerBounds: value.lowerBounds,
+                });
+                expect(count).toBe(value.elements.length);
+                reach.reach(count === 0 ? "empty" : "nonempty");
+              },
+              beforeBytes(bytes) {
+                expect(bytes.buffer).toBe(encoded.buffer);
+                reach.reach("beforeBytes hook");
+              },
+              element(item) {
+                if (item instanceof Uint8Array) {
+                  expect(item.buffer).toBe(encoded.buffer);
+                  reach.reach("borrowed bytes");
+                  const owned = decoded.elements[visited.length];
+                  expect(owned instanceof Uint8Array && owned.buffer !== encoded.buffer).toBe(true);
+                  reach.reach("owned decoder bytes");
+                }
+                if (item === null) reach.reach("NULL");
+                visited.push(item instanceof Uint8Array ? item.slice() : item);
+              },
+            });
+            expect(visited).toEqual(decoded.elements);
+            reach.reach("exact shapes");
             expect(decoded).toEqual({
               ...value,
               elements: value.elements.map((item) =>
@@ -87,6 +119,7 @@ describe("array stored values (review A1-3 finding 1)", () => {
         ),
         { seed, numRuns: 200 },
       );
+    reach.assertReached();
   });
 
   it("keeps what an equality key folds: interval fields and NUMERIC display scale (review probe)", () => {

@@ -81,6 +81,8 @@ const same = (types: readonly SqlType[], arity: number): Overload[] =>
 
 /** `fn` → overloads. Names are PostgreSQL's function names, or the operator's name below. */
 export const FUNCTIONS: Readonly<Record<string, readonly Overload[]>> = {
+  // AGAINST is a literal/owned TEXT parameter; document arguments remain row-dependent.
+  fts_match: [{ args: ["text", "any"], result: "bool", variadic: true }],
   json_record_value: [{ args: ["json", "bool"], result: "json" }],
   json_record: [
     { args: ["bool", "bool"], result: "json" },
@@ -267,6 +269,7 @@ export const FUNCTIONS: Readonly<Record<string, readonly Overload[]>> = {
  * type in the integer and float cases, so the call itself is always `nullif(T, T)`.
  */
 export const NON_STRICT_FUNCTIONS: ReadonlySet<string> = new Set([
+  "fts_match",
   "json_record",
   "json_record_value",
   "json_build_object",

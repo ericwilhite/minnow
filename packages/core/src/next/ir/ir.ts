@@ -223,6 +223,12 @@ interface RelBase {
   readonly output: readonly OutputColumn[];
 }
 
+/** A snapshot-corpus BM25 scan pass. Input is unfiltered; appended columns are scores. */
+export interface FtsScanCall {
+  readonly columns: readonly number[];
+  readonly query: ScalarExpr;
+}
+
 export type Rel =
   | (RelBase & {
       readonly op: "scan";
@@ -295,6 +301,11 @@ export type Rel =
    */
   | (RelBase & { readonly op: "input" })
   | (RelBase & { readonly op: "values"; readonly rows: ReadonlyArray<readonly ScalarExpr[]> })
+  | (RelBase & {
+      readonly op: "fts";
+      readonly input: Rel;
+      readonly calls: readonly FtsScanCall[];
+    })
   | (RelBase & { readonly op: "filter"; readonly input: Rel; readonly predicate: ScalarExpr })
   | (RelBase & {
       readonly op: "project";
@@ -519,6 +530,10 @@ export type MergeAction =
 
 export interface PhysicalPlan {
   readonly root: Rel;
+  /** Validated per execution even when no row reaches an FTS expression. */
+  readonly ftsQueries?: readonly ScalarExpr[];
+  /** Execution-owned raw text copies: FTS must not search a coerced numeric parameter. */
+  readonly ftsParameters?: ReadonlyArray<{ readonly source: number; readonly slot: number }>;
   /** SQL locking intent excludes access-route shortcuts; it does not implement row locks. */
   readonly hasRowLocking?: boolean;
   /** Visible output: names and types, in order. */

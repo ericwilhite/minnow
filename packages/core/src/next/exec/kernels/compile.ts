@@ -10,6 +10,7 @@
  *   a kernel or a refusal. Anything else is `UnsupportedPlanError` here, never a wrong answer
  *   later.
  */
+import { compileFtsMatch } from "./fts.js";
 import { compileLike } from "./like.js";
 import { compileIntervalExtract } from "./interval-extract.js";
 import { compileCalendarAdd } from "./calendar-add.js";
@@ -193,6 +194,12 @@ function compileCall(expr: Extract<ScalarExpr, { op: "call" }>, context: Compile
     args.map((arg) => arg.type),
   );
   switch (binding.kernel) {
+    case "fts":
+      if (expr.args[0]?.op !== "literal" && expr.args[0]?.op !== "param")
+        throw new UnsupportedPlanError("a full-text query other than a literal or parameter", {
+          construct: "fullTextSearch",
+        });
+      return compileFtsMatch(args, arena);
     case "json":
       return compileJson(expr.type, expr.fn, args, arena);
     case "arith": {

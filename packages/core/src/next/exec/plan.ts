@@ -1,3 +1,4 @@
+import { FtsPlan, configurePlanFtsArena } from "./fts-plan.js";
 import {
   columnInputBytes,
   expressionInputBytes,
@@ -304,6 +305,7 @@ function instantiate<T>(
         });
       }
       const resources = new Resources(grant, capacity);
+      configurePlanFtsArena(runtime, resources.arena);
       runtime.dispose(() => resources.close());
       // Fixed buffers remain charged. Only unused holdings can be surrendered to another admission.
       grant.onReclaimRequest(() => {
@@ -639,6 +641,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   ) => admissions.push({ rel, minimum, owner, loanSlots });
   let nextPhysicalId = 0;
   const potentialHybridIds = new Set<number>();
+  const fts = new FtsPlan(plan);
   const findIds = (rel: Rel): void => {
     if (
       !plan.volatile &&
@@ -646,6 +649,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       (rel.op === "aggregate" || rel.op === "distinct")
     )
       potentialHybridIds.add(rel.id);
+    fts.inspect(rel);
     nextPhysicalId = Math.max(nextPhysicalId, rel.id + 1);
     if (rel.op === "recursive") {
       findIds(rel.base);
@@ -1074,26 +1078,38 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                       : { rowsNeeded }
                     : { rowsNeeded: () => Math.min(rowsNeeded?.() ?? BATCH_ROWS, 1) }),
                 });
-                runtime.onAbort(() => scan.abort());
-                const source: BatchSource = {
-                  next: () => (stops.some((stop) => stop()) ? (scan.abort(), null) : scan.next()),
-                  abort: () => scan.abort(),
-                };
-                runtime.pipeline();
                 const books = starBooks.get(runtime);
                 const outputSink = books?.shape.columns.has(rel.id)
                   ? starColumns((batch) => books.encode(rel.id, batch), downstream)
                   : downstream;
-                const result = drive(source, counted(runtime, rel, outputSink), runtime.signal);
-                return then(result, () => {
-                  const profile = runtime.profile(rel);
-                  profile.pagesRead = scan.stats.pagesRead;
-                  profile.pagesPruned = scan.stats.pagesPruned;
-                  scan.close();
-                });
+                return fts.scan(runtime, rel, scan, counted(runtime, rel, outputSink), stops);
               }),
           );
         };
+      }
+      case "fts": {
+        const child = prepare(rel.input),
+          input = types(rel.input);
+        const minimum = fts.minimum(input, rel.calls.length);
+        fixed(rel, minimum);
+        return (runtime, downstream, stops) =>
+          instantiate(
+            runtime,
+            rel,
+            input,
+            minimum + fts.extra(runtime, rel.id),
+            BATCH_ROWS,
+            (context, grant) =>
+              fts.operator(
+                runtime,
+                input,
+                rel.calls,
+                context,
+                grant,
+                counted(runtime, rel, downstream),
+              ),
+            (operator) => fts.corpus(runtime, rel, operator, () => child(runtime, operator, stops)),
+          );
       }
       case "filter":
       case "project":
@@ -1204,8 +1220,12 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                     counted(runtime, rel, downstream),
                   ),
                 (operator) => {
+                  fts.borrow(runtime, rel.id, operator);
                   runtime.onAbort((reason) => operator.abort(reason));
-                  runtime.dispose(() => operator.closed);
+                  runtime.dispose(async () => {
+                    await operator.closed;
+                    fts.forget(runtime, operator);
+                  });
                   return (async () => {
                     try {
                       if (saved) await operator.resume();
@@ -1255,8 +1275,12 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                   counted(runtime, rel, downstream),
                 ),
               (operator) => {
+                fts.borrow(runtime, rel.id, operator);
                 runtime.onAbort((reason) => operator.abort(reason));
-                runtime.dispose(() => operator.closed);
+                runtime.dispose(async () => {
+                  await operator.closed;
+                  fts.forget(runtime, operator);
+                });
                 return (async () => {
                   try {
                     await child(
@@ -1279,30 +1303,36 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           sink: Operator,
           runtime?: QueryRuntime,
           grant?: Grant,
-        ) =>
-          rel.op === "filter"
-            ? new FilterOperator(exprs as ScalarExpr, context, sink)
-            : rel.op === "project"
-              ? (() => {
-                  const actual = runtime ? starRel(runtime, rel) : rel;
-                  if (actual.op !== "project") throw new Error("Star project changed operator");
-                  return new ProjectOperator(
-                    actual === rel
-                      ? (exprs as readonly ScalarExpr[])
-                      : jsonDescendants.size
-                        ? actual.exprs.map((expr) => canonicalJsonText(expr, actual.input))
-                        : actual.exprs,
-                    { ...context, input: types(actual.input) },
-                    sink,
-                    runtime && grant
-                      ? {
-                          signal: runtime.signal,
-                          available: () => runtime.projectionAvailable(grant),
-                        }
-                      : undefined,
-                  );
-                })()
-              : new LimitOperator(null, 0, context.arena, sink);
+          stops: readonly Stop[] = [],
+        ) => {
+          const progress =
+            runtime && grant
+              ? {
+                  signal: runtime.signal,
+                  available: () => runtime.projectionAvailable(grant),
+                }
+              : undefined;
+          let actualExprs = exprs;
+          if (rel.op === "project") {
+            const actual = runtime ? starRel(runtime, rel) : rel;
+            if (actual.op !== "project") throw new Error("Star project changed operator");
+            actualExprs =
+              actual === rel
+                ? exprs
+                : jsonDescendants.size
+                  ? actual.exprs.map((expr) => canonicalJsonText(expr, actual.input))
+                  : actual.exprs;
+            context = { ...context, input: types(actual.input) };
+          }
+          return (
+            fts.expressions(actualExprs, context, sink, runtime, progress, stops) ??
+            (rel.op === "filter"
+              ? new FilterOperator(actualExprs as ScalarExpr, context, sink)
+              : rel.op === "project"
+                ? new ProjectOperator(actualExprs as readonly ScalarExpr[], context, sink, progress)
+                : new LimitOperator(null, 0, context.arena, sink))
+          );
+        };
         const minimum = measureCompilerBuffers(
           compilation,
           input,
@@ -1354,23 +1384,25 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                     context.arena,
                     counted(runtime, rel, downstream),
                   )
-                : setup(context, counted(runtime, rel, downstream), runtime, grant),
+                : setup(context, counted(runtime, rel, downstream), runtime, grant, stops),
             (operator) => {
               runtime.onAbort((reason) => operator.abort(reason));
               const childStops =
                 operator instanceof LimitOperator ? [...stops, () => operator.done] : stops;
-              return childStops.some((stop) => stop())
-                ? operator.finish()
-                : child(
-                    runtime,
-                    operator,
-                    childStops,
-                    operator instanceof LimitOperator
-                      ? () => operator.inputNeeded(rowsNeeded?.() ?? Infinity)
-                      : rel.op === "filter"
-                        ? undefined
-                        : rowsNeeded,
-                  );
+              const run = () =>
+                childStops.some((stop) => stop())
+                  ? operator.finish()
+                  : child(
+                      runtime,
+                      operator,
+                      childStops,
+                      operator instanceof LimitOperator
+                        ? () => operator.inputNeeded(rowsNeeded?.() ?? Infinity)
+                        : rel.op === "filter"
+                          ? undefined
+                          : rowsNeeded,
+                    );
+              return fts.runExpressions(runtime, operator, run);
             },
           );
         };
@@ -3403,6 +3435,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         })();
       });
     if (sources.length === 0) {
+      for (const entry of entries) entry.minimum += fts.extra(runtime, entry.rel.id);
+
       if (!hasJson) return execute();
       const width = jsonConstants + 1;
       // Literal documents also bound result copies; no storage read contributes that size.
@@ -3432,6 +3466,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       for (;;) {
         let io = 0,
           progress = 0;
+        let ftsSourceBytes = fts.declared;
         bounds.clear();
         for (const source of sources) {
           const bound = yield* readValue(
@@ -3500,6 +3535,12 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             }
             boundedSourceRows.set(source.id, values);
           }
+          if (fts.enabled)
+            ftsSourceBytes = Math.max(
+              ftsSourceBytes,
+              yield* fts.sourceBytes(runtime, source, demand.get(source.id) ?? null),
+            );
+
           const keyColumns = joinKeySources.get(source.id);
           if (keyColumns)
             for (const index of keyColumns) {
@@ -3612,13 +3653,15 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           }
           runtime.resultCopySourceProgress(resultProgress);
         }
+        fts.size(runtime, ftsSourceBytes);
         const jsonWidth = Math.max(jsonConstants, progress) + 1;
         if (hasJson) jsonWidths.set(runtime, jsonWidth);
         for (const [index, entry] of entries.entries())
           entry.minimum =
             (fixedMinimums[index] ?? 0) +
             (bounds.get(entry.rel.id)?.bytes ?? 0) +
-            (hasJson ? (jsonWorkspaces.get(entry.rel.id) ?? 0) * jsonWidth : 0);
+            (hasJson ? (jsonWorkspaces.get(entry.rel.id) ?? 0) * jsonWidth : 0) +
+            fts.extra(runtime, entry.rel.id);
         runtime.sourceBounds(bounds);
         runtime.readMinimum(
           io,
@@ -3773,5 +3816,5 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     };
     return runSliced(size(), new Slice(Infinity), () => undefined);
   };
-  return Object.assign(program, { atomic: true });
+  return fts.wrap(program, () => nextPhysicalId++);
 }

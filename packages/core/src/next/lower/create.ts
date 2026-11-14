@@ -115,6 +115,15 @@ function physicalPlan(
 ): PhysicalPlan {
   return {
     root,
+    ...(plan.builder.ftsQueries.length ? { ftsQueries: [...plan.builder.ftsQueries] } : {}),
+    ...(plan.builder.ftsParameters.size
+      ? {
+          ftsParameters: [...plan.builder.ftsParameters].map(([source, slot]) => ({
+            source,
+            slot,
+          })),
+        }
+      : {}),
     columns,
     parameters: [...plan.state.parameters.settled(), ...plan.builder.slots],
     placeholderCount: plan.placeholders,

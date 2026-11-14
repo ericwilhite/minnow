@@ -57,6 +57,8 @@ export type SubqueryRequest =
 export interface Scope {
   /** A column reference as the front end writes it (`a`, `t.a`), or undefined if unknown. */
   column(reference: string): Typed | undefined;
+  /** FTS document expansion / snapshot-corpus registration, owned by lower/fts.ts. */
+  fts?(expression: Extract<Expression, { kind: "fts" }>, scope: Scope): Typed;
   /** Presence of a whole row, distinct from an actual row whose fields are all NULL. */
   rowPresence?(qualifier: string): Typed;
   /** Exact source identity and declaration ordinal, independent of printed dotted names. */
@@ -1059,6 +1061,7 @@ export function lowerExpression(
       // PostgreSQL forbids it (WHERE, GROUP BY, an aggregate's argument).
       throw new PlanningError("window functions are not allowed here", "42P20");
     case "fts":
-      throw unsupported("fullTextSearch", "full-text search");
+      if (scope.fts) return scope.fts(expression, scope);
+      throw unsupported("fullTextSearch", "full-text search in this scope");
   }
 }

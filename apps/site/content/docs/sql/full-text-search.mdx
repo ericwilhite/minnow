@@ -23,6 +23,34 @@ SELECT name FROM products WHERE MATCH(*) AGAINST 'yirgacheffe'
 text form, so `MATCH(*) AGAINST '2025'` finds rows by a date column as well as by text. Internal
 row locators are never searchable or returned by `SELECT *`.
 
+## Planned 1.0 document rendering
+
+The 1.0 engine uses document-renderer version 2. It searches the stored SQL value rather
+than the spelling used to insert it. These forms follow PostgreSQL's default text output:
+
+| Type       | Search text in 1.0                                                                                                                                                 |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `TIME`     | `HH:MM:SS`, with fractional seconds when present and trailing zeros dropped. `10:00:00.500` and `10:00:00.5` both search as `10:00:00.5`.                          |
+| SQL arrays | PostgreSQL array text, with braces, element quoting, escaping, NULL elements, and non-default lower bounds. Original JSON-array escape spellings are not searched. |
+| `JSON`     | The stored JSON text, as PostgreSQL returns `json::text`; its whitespace, number spelling and string escapes remain significant to tokenization.                   |
+| `JSONB`    | PostgreSQL's stored JSONB text: canonical object order and string escaping, with the stored numeric display scale.                                                 |
+
+For example, a 1.0 TIME value above contains the token `5`, not `500`. An actual newline
+inside an array element splits terms; the original JSON escape `\n` no longer adds an `n`
+to a term. JSON and JSONB follow their distinct SQL text rules instead of the 0.x tagged JSON
+renderer. Ordinary text, numbers, DATE, timestamp and INTERVAL documents keep their existing
+rendering rules. Boolean columns remain excluded; an all-NULL document still returns SQL NULL.
+
+The array document limit counts characters in PostgreSQL's rendered text, not its binary
+storage bytes. Array quoting recognizes only PostgreSQL's whitespace set (space, tab, LF,
+CR, vertical tab and form feed), plus its special array characters. Other Unicode whitespace
+such as a non-breaking space does not add quotes. A leading U+FEFF remains value content.
+
+These are deliberate 1.0 changes. The shipped 0.x engine keeps renderer version 1 and its
+existing results. The [1.0 storage cutover](/docs/changelog) starts a new database and rebuilds
+FTS data; existing 0.x postings are never reused. The unexported 1.0 scan route supports MATCH
+and BM25 now; its durable accelerator and public cutover remain in development.
+
 ## Ranking
 
 `BM25` scores a row against the same query, and is an ordinary expression — select it, order by

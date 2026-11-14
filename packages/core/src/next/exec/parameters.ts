@@ -45,7 +45,7 @@ export function integerParameterBytes(
   for (let slot = 0; slot < plan.parameters.length; slot++) {
     const type = plan.parameters[slot];
     if (type?.kind !== "int32" && type?.kind !== "int64") return null;
-    const value = slot < plan.placeholderCount ? values[slot] : null;
+    const value = inputValue(plan, values, slot);
     if (value !== null && typeof value !== "number" && typeof value !== "bigint") return null;
     bytes += SLOT_BYTES + (value === null ? dataBytes(type, 1) + 4 : 0);
   }
@@ -169,6 +169,30 @@ export interface ParameterBinding {
   bind(charge: ByteCharge, statementTime?: bigint): MaybePromise<BoundParameters>;
 }
 
+/** Each private FTS text copy participates in the same sizing, ownership and checkpoint
+ * path as every ordinary slot. Numeric uses never rewrite its original query spelling. */
+function inputValue(
+  plan: PhysicalPlan,
+  values: readonly ParameterValue[],
+  slot: number,
+): ParameterValue | undefined {
+  const source =
+    slot < plan.placeholderCount
+      ? slot
+      : plan.ftsParameters?.find((mapping) => mapping.slot === slot)?.source;
+  return source === undefined ? null : values[source];
+}
+export function validateParameterCount(
+  plan: PhysicalPlan,
+  values: readonly ParameterValue[],
+): void {
+  if (values.length !== plan.placeholderCount)
+    throw new ParameterBindError(
+      `Expected ${String(plan.placeholderCount)} parameters, received ${String(values.length)}`,
+      null,
+    );
+}
+
 /** Only scans caller-owned inputs; does not create encoded copies or numeric scratch. */
 export function prepareParameters(
   plan: PhysicalPlan,
@@ -177,11 +201,20 @@ export function prepareParameters(
   capacity = Infinity,
   scratch?: ByteCharge,
 ): MaybePromise<ParameterBinding> {
-  if (values.length !== plan.placeholderCount)
-    throw new ParameterBindError(
-      `Expected ${String(plan.placeholderCount)} parameters, received ${String(values.length)}`,
-      null,
-    );
+  validateParameterCount(plan, values);
+  for (const mapping of plan.ftsParameters ?? []) {
+    if (
+      !Number.isInteger(mapping.source) ||
+      mapping.source < 0 ||
+      mapping.source >= plan.placeholderCount ||
+      !Number.isInteger(mapping.slot) ||
+      mapping.slot < plan.placeholderCount ||
+      plan.parameters[mapping.slot]?.kind !== "text"
+    )
+      throw new ParameterBindError("Invalid FTS parameter copy", mapping.slot);
+    if (typeof values[mapping.source] !== "string")
+      throw new TypeError("A full-text search query parameter must be a string");
+  }
   const slice = new Slice(YIELD_INTERVAL_MS);
   function* size(): SlicedJob<ParameterBinding> {
     let bytes = 0;
@@ -189,7 +222,7 @@ export function prepareParameters(
     for (let slot = 0; slot < plan.parameters.length; slot++) {
       const type = plan.parameters[slot];
       if (type === undefined) throw new TypeError("missing parameter type");
-      const value = slot < plan.placeholderCount ? values[slot] : null;
+      const value = inputValue(plan, values, slot);
       if (value === undefined)
         throw new ParameterBindError(
           `$${String(slot + 1)}: undefined is not a parameter value`,
@@ -224,7 +257,7 @@ export function prepareParameters(
               slots.push(clockParameter(type, statementTime));
               continue;
             }
-            const value = slot < plan.placeholderCount ? values[slot] : null;
+            const value = inputValue(plan, values, slot);
             if (value === undefined) throw new ParameterBindError("missing parameter", slot);
             if (type.kind === "text" && typeof value === "string") {
               if (value.includes("\0"))

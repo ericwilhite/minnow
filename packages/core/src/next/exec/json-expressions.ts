@@ -1,3 +1,4 @@
+import { inheritFtsWorkspace, installFtsHost, type FtsMatchNode } from "./kernels/fts.js";
 /** One borrowed row at a time: resumable JSON kernels without changing synchronous kernel callers. */
 import type { ScalarExpr } from "../ir/ir.js";
 import type { Batch, Selection, Vector } from "../vector/vector.js";
@@ -104,6 +105,7 @@ export class JsonExpressions implements Operator, JsonHost {
   readonly #inner: Operator;
   readonly #project: JsonProject | null;
   readonly #nodes: JsonNode[] = [];
+  readonly #ftsNodes: FtsMatchNode[] = [];
   readonly #dependencies = new Map<JsonNode, Set<JsonNode>>();
   readonly #users = new Map<JsonNode, number>();
   readonly #pinned = new Set<ArrayBufferLike>();
@@ -145,6 +147,8 @@ export class JsonExpressions implements Operator, JsonHost {
       context.arena.capacity,
       true,
     );
+    inheritFtsWorkspace(context.arena, this.#arena);
+    installFtsHost(this.#arena, (node) => this.#ftsNodes.push(node));
     installJsonHost(this.#arena, this);
     const compile = { ...context, arena: this.#arena };
     this.#project = Array.isArray(exprs)
@@ -159,6 +163,7 @@ export class JsonExpressions implements Operator, JsonHost {
         })
       : null;
     this.#inner = this.#project ?? new FilterOperator(exprs as ScalarExpr, compile, downstream);
+    installFtsHost(this.#arena, null);
     this.#arena.take((this.#workspace === null ? this.#nodes.length : 1) * shared.bytes);
     this.#running = true;
   }
@@ -263,6 +268,7 @@ export class JsonExpressions implements Operator, JsonHost {
   }
   async #rows(batch: Batch): Promise<void> {
     const count = batch.selection?.count ?? batch.length;
+    const hasFts = this.#ftsNodes.length > 0;
     this.#batch.length = batch.length;
     this.#batch.columns = batch.columns;
     for (let k = 0; k < count; k++) {
@@ -270,6 +276,19 @@ export class JsonExpressions implements Operator, JsonHost {
       if (this.shared.stopped?.()) break;
       this.#epoch++;
       this.#one.rows[0] = batch.selection?.rows[k] ?? k;
+      // FTS arguments are inert named columns. Prepare without replaying any JSON or
+      // volatile scalar; keep document errors deferred until the kernel is demanded.
+      if (hasFts)
+        for (const node of this.#ftsNodes) {
+          try {
+            await runSliced(node.compute(this.#batch, this.#one, this.slice), this.slice, () =>
+              this.#check(),
+            );
+          } catch (error) {
+            this.#check();
+            node.fail(error);
+          }
+        }
       for (;;) {
         try {
           if (this.#inner.push(this.#batch) === "blocked") await this.#inner.ready();
@@ -280,6 +299,7 @@ export class JsonExpressions implements Operator, JsonHost {
         }
       }
       this.#project?.endRow();
+      if (hasFts) for (const node of this.#ftsNodes) node.clear();
       this.#pinned.clear();
       for (const node of this.#nodes) node.reset();
       this.#values.clear();
@@ -316,6 +336,7 @@ export class JsonExpressions implements Operator, JsonHost {
     if (this.#closed) return;
     this.#closed = true;
     this.#project?.endRow();
+    for (const node of this.#ftsNodes) node.clear();
     this.#pinned.clear();
     for (const node of this.#nodes) node.reset();
     this.#values.clear();
