@@ -8977,10 +8977,24 @@ class Parser {
         throw new TypeError(`Generated column ${column.name} cannot also have a DEFAULT`);
       }
       if (column.generatedValue === undefined) continue;
-      for (const reference of expressionColumnNames(
-        compileCheckExpression(column.generatedValue.sql, `generated ${table}.${column.name}`),
-      )) {
-        const referencedName = reference.split(".").at(-1) ?? reference;
+      const expression = compileCheckExpression(
+        column.generatedValue.sql,
+        `generated ${table}.${column.name}`,
+      );
+      const exactNames = (node: Expression): string[] =>
+        node.kind === "column"
+          ? [
+              identifierSource(node)?.parts.at(-1) ??
+                node.reference.split(".").at(-1) ??
+                node.reference,
+            ]
+          : childExpressions(node).flatMap(exactNames);
+      const references = recordDeclaredTypes
+        ? exactNames(expression)
+        : expressionColumnNames(expression).map(
+            (reference) => reference.split(".").at(-1) ?? reference,
+          );
+      for (const referencedName of references) {
         const referenced = columns.find(({ name }) => name === referencedName);
         if (referenced === undefined) {
           throw new TypeError(

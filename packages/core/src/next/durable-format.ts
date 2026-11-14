@@ -310,6 +310,7 @@ export const CATALOG_RECORD_KINDS = {
   ftsConfig: 26,
   ftsCoverage: 27,
   ftsState: 28,
+  viewSource: 29,
 } as const;
 
 export const CATALOG_FTS_FEATURE = 1;
@@ -409,6 +410,7 @@ export const CATALOG_RECORD_SCHEMAS = {
   expressionDependencies: ["dialectVersion:u", "columnIds:[u]", "sequenceIds:[u]", "typeIds:[u]~!"],
   dependency: ["kind:s", "objectId:u", "columnIds:[u]"],
   viewOutput: ["name:s", "type:physical", "declared:declared", "nullable:b"],
+  viewSource: ["kind:s", "objectId:u", "columnIds:[u]", "outputCount:u"],
   sequence: [
     "id:u",
     "name:s",
@@ -427,6 +429,7 @@ export const CATALOG_RECORD_SCHEMAS = {
     "managed:b~!",
     "outputs:[viewOutput]~!",
     "dependencies:[dependency]~!",
+    "sourceSchemas:[viewSource]~!",
   ],
   namedType: ["id:u", "name:s", "labels:[s]"],
   vector: ["form:s", "type:physical", "length:u", "validity:typed?", "data:vectorData"],

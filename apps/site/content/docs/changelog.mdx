@@ -13,7 +13,11 @@ compatibility policy and release process.
 The unexported rebuild retains named enum identities, owned identity and schema counters,
 managed table/view flags, index directions, view outputs and stable expression dependencies in
 the versioned catalog. Named type references survive expression folding, and stored view
-dependencies include unused CTE bodies and recursive steps. Compatible view replacement preserves identity. Native catalog-only
+dependencies include unused CTE bodies and recursive steps. Compatible view replacement preserves identity.
+Stored views keep their definition-time source columns and referenced-view output prefixes,
+so adding a column or appending a view output does not widen an older wildcard view.
+Dropping unrelated columns preserves all remaining generated/CHECK dependency identities,
+and adding a named-enum column retains its type identity across checkpoint and reopen. Native catalog-only
 column changes preserve frozen backfills and older snapshots across publication and replay.
 The owner-local migration entry point checks the catalog version under the writer lock, applies
 changes atomically, validates NOT NULL against live rows and protects unmanaged objects.

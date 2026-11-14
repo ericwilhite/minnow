@@ -692,3 +692,21 @@ over-reserve fixed/helper workspace at a 16 MiB cap, even though its decoded pai
 allowance is below the cap. Such a plan can report the existing typed 53200
 admission-size error. This predates the shared-pair path and remains a separate
 memory-admission follow-up; the resident cache-lifetime fix runs after admission.
+
+### Catalog ALTER and frozen view bindings (B6 stage2 review)
+
+DROP COLUMN rebuilds positional catalog inputs from the kept stable column IDs, including
+nested generated/CHECK dependencies. ADD COLUMN retains the named-enum type ID. Stored SQL
+views capture definition-time source column IDs/order and referenced-view output prefixes
+(MCAT view field7, family29). Wildcards, NATURAL/USING keys and source alias lists bind to those
+schemas; later added columns and appended replacement outputs remain invisible to older views.
+Checkpoint/WAL reopen uses the same binding. Historical unused column slots are not live
+dependencies. Legacy internal view fixtures without binding metadata retain their old behavior;
+new SQL CREATE/REPLACE always emits it. Column-alias projections can retain conservative column
+dependencies; this does not make a wildcard expand against the later catalog.
+
+Shipped-surface audit: GENERATED ALWAYS identity is accepted by the shipped engine as the
+same counter as BY DEFAULT (including explicit values); native parity is a required follow-up
+before freeze, alongside the shared row-rule/modify integration. CREATE SEQUENCE options
+(negative increment/CYCLE included) and ALTER TYPE ADD VALUE are already refused by the shipped
+engine. Their native typed refusals remain; no extra support is claimed here.

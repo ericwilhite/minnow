@@ -1,5 +1,6 @@
 import "./window-inputs.js";
-import { identifierSource } from "../../engine/identifier-sources.js";
+import { identifierSource, rememberIdentifierSource } from "../../engine/identifier-sources.js";
+import { bindViewSources, viewSources } from "./view-sources.js";
 import { rememberRowField } from "../../engine/json-call-sources.js";
 import { PlanningError } from "./errors.js";
 import { catalogDrop } from "../../engine/catalog-ddl-sources.js";
@@ -53,7 +54,7 @@ export function frontEndCatalog(catalog: CatalogView): FrontEndCatalog {
   if (cached !== undefined) return cached;
   const columns = new Map<string, readonly string[]>();
   const keys = new Map<string, readonly string[]>();
-  for (const table of catalog.tables) {
+  for (const table of [...catalog.tables, ...viewSources(catalog).tables.values()]) {
     columns.set(
       table.name,
       table.columns.map((column) => column.name),
@@ -72,6 +73,10 @@ export function frontEndCatalog(catalog: CatalogView): FrontEndCatalog {
         view.name,
         view.outputs.map((column) => column.name),
       );
+  for (const [name, binding] of viewSources(catalog).views) {
+    views.set(name, binding.view.bodySql);
+    columns.set(name, binding.view.outputs?.slice(0, binding.count).map((c) => c.name) ?? []);
+  }
   cached = { columns, keys, views };
   facts.set(catalog, cached);
   return cached;
@@ -177,7 +182,29 @@ function prepareTypedQuery(parsed: CompiledQuery, catalog: CatalogView): Compile
     if (sql === undefined) return undefined;
     let body = bodies.get(name);
     if (body === undefined) {
-      body = parseQuery(sql);
+      const projection = viewSources(catalog).views.get(name);
+      const view = projection?.view ?? catalog.views.find((v) => v.name === name);
+      body = foldIdentifierCase(parseQuery(sql), front.columns);
+      if (view) bindViewSources(body, view, catalog);
+      if (projection) {
+        // Bind before projecting the historical prefix. Alias lists would make later
+        // projection pruning look like a schema-width change to the shared front end.
+        body = bindPendingSelectShapes(body, columnsOf);
+        const wrapper = parseQuery("SELECT 1");
+        const alias = "__view_source";
+        wrapper.base = {
+          table: "(bound view)",
+          alias,
+          derived: body,
+        };
+        wrapper.select = (projection.view.outputs ?? []).slice(0, projection.count).map((c, i) => {
+          const expression = { kind: "column" as const, reference: `${alias}.${c.name}` };
+          rememberIdentifierSource(expression, [alias, c.name], [true, true]);
+          rememberRowField(expression, alias, i);
+          return { expression, alias: c.name };
+        });
+        body = wrapper;
+      }
       bodies.set(name, body);
     }
     return body;

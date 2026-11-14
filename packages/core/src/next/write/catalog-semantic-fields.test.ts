@@ -83,6 +83,12 @@ for (const seed of seedsFor("next-catalog-semantic-fields", [0xb790, 0xb791]))
         record: { id: 1, name: "v", bodySql: "SELECT 1", dependencies: [] },
       },
       {
+        kind: "view",
+        id: 7,
+        field: "viewSourceSchemas",
+        record: { id: 1, name: "v", bodySql: "SELECT 1", sourceSchemas: [] },
+      },
+      {
         kind: "expressionDependencies",
         id: 4,
         field: "expressionTypes",

@@ -1,3 +1,4 @@
+import { viewSources } from "./view-sources.js";
 /**
  * A FROM clause (`base` + `joins` of a compiled block, or a DML statement's target and sources)
  * as one relation: its sources, the join tree, and the subqueries its expressions attach.
@@ -383,7 +384,9 @@ export function lowerFrom(
         columns: [],
         rows: 1,
       });
-    const table = builder.catalog.tableByName(source.table);
+    const table =
+      builder.catalog.tableByName(source.table) ??
+      viewSources(builder.catalog).tables.get(source.table);
     if (table === undefined)
       throw new PlanningError(`relation "${source.table}" does not exist`, "42P01");
     return tableEntry(id, kind, nullSupplied, table, source.alias, builder);

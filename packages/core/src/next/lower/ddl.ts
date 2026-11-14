@@ -390,11 +390,18 @@ export function validateRules(input: TableInput, catalog: CatalogView): TableInp
 }
 
 /** The table's current definition as a `TableInput` (every entry keeps its id). */
-export function currentInput(table: TableDef): {
+export function currentInput(
+  table: TableDef,
+  kept = table.columns,
+): {
   columns: Array<TableInput["columns"][number]>;
   input: Omit<TableInput, "columns">;
 } {
-  const position = (id: number) => table.columns.findIndex((column) => column.id === id);
+  const position = (id: number) => {
+    const index = kept.findIndex((column) => column.id === id);
+    if (index < 0) throw new PlanningError("cannot remove a referenced column", "2BP01");
+    return index;
+  };
   const primary = table.indexes.find((index) => index.id === table.primaryKey);
   const inputDependencies = (
     deps: import("../access/catalog.js").ExpressionDependencies,
@@ -405,7 +412,7 @@ export function currentInput(table: TableDef): {
     ...(deps.typeIds === undefined ? {} : { typeIds: deps.typeIds }),
   });
   return {
-    columns: table.columns.map((column) => {
+    columns: kept.map((column) => {
       const { defaultDependencies, generatedDependencies, ...rest } = column;
       return {
         ...rest,
@@ -579,6 +586,7 @@ export function lowerDdl(statement: NativeStatement, catalog: CatalogView): DdlR
         );
       const { type, declared } = declaredColumnType(front, `${table.name}.${front.name}`, catalog);
       const { columns, input } = currentInput(table);
+      const namedType = type.kind === "enum" ? catalog.typeByName(type.name) : undefined;
       const added = {
         name: front.name,
         type,
@@ -588,6 +596,7 @@ export function lowerDdl(statement: NativeStatement, catalog: CatalogView): DdlR
         generatedSql: null,
         identitySequence: null,
         missing: missingValue(front, type, catalog),
+        ...(namedType === undefined ? {} : { typeId: namedType.id }),
       };
       const next: TableInput = { ...input, columns: [...columns, added] };
       return {
@@ -629,25 +638,14 @@ export function lowerDdl(statement: NativeStatement, catalog: CatalogView): DdlR
           `cannot drop column ${def.name} of table ${table.name} because other objects depend on it`,
           "2BP01",
         );
-      const { columns, input } = currentInput(table);
-      const shift = (positions: readonly number[]) =>
-        positions.map((p) => (p > position ? p - 1 : p));
+      // Resolve every constraint and nested rule reference from its stable ID against
+      // the FINAL live column order. Never shift one layer while reusing old positions.
+      const { columns, input } = currentInput(
+        table,
+        table.columns.filter((c) => c.id !== def.id),
+      );
       return {
-        change: {
-          kind: "alterTable",
-          tableId: table.id,
-          table: {
-            ...input,
-            columns: columns.filter((_, index) => index !== position),
-            primaryKey: input.primaryKey === null ? null : shift(input.primaryKey),
-            unique: input.unique.map((entry) => ({ ...entry, columns: shift(entry.columns) })),
-            foreignKeys: input.foreignKeys.map((entry) => ({
-              ...entry,
-              columns: shift(entry.columns),
-            })),
-            checks: input.checks.map((entry) => ({ ...entry, columns: shift(entry.columns) })),
-          },
-        },
+        change: { kind: "alterTable", tableId: table.id, table: { ...input, columns } },
         followUp: null,
       };
     }

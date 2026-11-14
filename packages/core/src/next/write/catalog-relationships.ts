@@ -161,6 +161,68 @@ export function validateRelationalCatalog(data: CatalogStreamData): void {
         check(typeof output.nullable === "boolean", "Invalid view output nullability");
       }
     }
+    const schemas = new Set<string>();
+    for (const source of view.sourceSchemas ?? []) {
+      requireTag(source.kind, ["table", "view"], "view source kind", StoreCorruptionError);
+      const key = `${source.kind}:${String(source.objectId)}`;
+      check(!schemas.has(key), "Repeated view source schema");
+      schemas.add(key);
+      check(
+        view.dependencies?.some(
+          (dep) => dep.kind === source.kind && dep.objectId === source.objectId,
+        ) === true,
+        "View source without dependency",
+      );
+      check(
+        Number.isSafeInteger(source.outputCount) && source.outputCount >= 0,
+        "Invalid view output prefix",
+      );
+      if (source.kind === "table") {
+        const table = tables.get(source.objectId);
+        check(table !== undefined && source.outputCount === 0, "Invalid view table source");
+        const unique = new Set(source.columnIds);
+        check(
+          unique.size === source.columnIds.length &&
+            source.columnIds.every(
+              (id) => Number.isSafeInteger(id) && id > 0 && id < data.counters.nextColumnId,
+            ),
+          "Invalid historical view column slots",
+        );
+        check(
+          source.columnIds.every(
+            (id) =>
+              !data.tables.some(
+                (t) => t.id !== source.objectId && t.columns.some((c) => c.id === id),
+              ),
+          ),
+          "Foreign view column slot",
+        );
+        const dep = view.dependencies.find(
+          (dep) => dep.kind === "table" && dep.objectId === source.objectId,
+        );
+        check(
+          dep?.columnIds.every((id) => unique.has(id)) === true,
+          "View source misses dependency",
+        );
+      } else {
+        const output = views.get(source.objectId)?.outputs;
+        check(
+          output !== undefined &&
+            source.columnIds.length === 0 &&
+            source.outputCount <= output.length,
+          "Invalid stored view output prefix",
+        );
+      }
+    }
+    if (view.sourceSchemas !== undefined)
+      check(
+        (view.dependencies ?? []).every(
+          (dep) =>
+            (dep.kind !== "table" && dep.kind !== "view") ||
+            schemas.has(`${dep.kind}:${String(dep.objectId)}`),
+        ),
+        "View is missing a source schema",
+      );
     const seen = new Set<string>();
     for (const dep of view.dependencies ?? []) {
       requireTag(

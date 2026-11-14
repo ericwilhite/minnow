@@ -191,6 +191,14 @@ export interface TypeDef {
   readonly labels: readonly string[];
 }
 
+/** Table fields retain declaration order, including historical unused slots; view fields
+ * retain an immutable output prefix (compatible replacement can only append outputs). */
+export interface ViewSourceSchema {
+  readonly kind: "table" | "view";
+  readonly objectId: number;
+  readonly columnIds: readonly number[];
+  readonly outputCount: number;
+}
 export interface ViewDef {
   readonly id: number;
   readonly name: string;
@@ -198,6 +206,7 @@ export interface ViewDef {
   readonly managed?: boolean;
   readonly outputs?: readonly ViewOutput[];
   readonly dependencies?: readonly CatalogDependency[];
+  readonly sourceSchemas?: readonly ViewSourceSchema[];
 }
 
 /**

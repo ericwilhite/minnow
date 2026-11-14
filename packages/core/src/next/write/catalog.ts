@@ -1002,7 +1002,8 @@ export class Catalog implements CatalogView {
     for (const view of data.views)
       entries +=
         (view.outputs?.length ?? 0) +
-        (view.dependencies?.reduce((n, dep) => n + 1 + dep.columnIds.length, 0) ?? 0);
+        (view.dependencies?.reduce((n, dep) => n + 1 + dep.columnIds.length, 0) ?? 0) +
+        (view.sourceSchemas?.reduce((n, source) => n + 1 + source.columnIds.length, 0) ?? 0);
     // Enum duplicate checks own one temporary Set at a time. Prepay its largest
     // label table, not the sum across definitions/columns visited sequentially.
     let labels = 0;

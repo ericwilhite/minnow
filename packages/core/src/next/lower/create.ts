@@ -1,7 +1,13 @@
 /**
  * The `Lowerer` (lower/lowerer.ts): one statement text to a `LoweredStatement`.
  */
-import type { CatalogChange, CatalogDependency, CatalogView, TableDef } from "../access/catalog.js";
+import type {
+  CatalogChange,
+  CatalogDependency,
+  CatalogView,
+  TableDef,
+  ViewSourceSchema,
+} from "../access/catalog.js";
 import type { CreateTableInput } from "../../engine/catalog-mutations.js";
 import type { CompiledStatement, TransactionMode } from "../../engine/query.js";
 import type { OutputColumn, PhysicalPlan, Rel } from "../ir/ir.js";
@@ -476,7 +482,41 @@ function lowerStatement(text: string, context: LoweringContext): LoweredStatemen
           ))
       )
         throw new PlanningError("cannot change name or type of view column", "42P16");
-      const view = { name: statement.view, bodySql: statement.sql, outputs, dependencies };
+      const sourceSchemas: ViewSourceSchema[] = dependencies.flatMap((dep): ViewSourceSchema[] => {
+        if (dep.kind === "table") {
+          const source = context.catalog.table(dep.objectId);
+          if (!source) throw new PlanningError("Missing view table", "42P01");
+          return [
+            {
+              kind: "table",
+              objectId: source.id,
+              columnIds: source.columns.map((c) => c.id),
+              outputCount: 0,
+            },
+          ];
+        }
+        if (dep.kind === "view") {
+          const source = context.catalog.views.find((v) => v.id === dep.objectId);
+          if (!source?.outputs)
+            throw new PlanningError("Cannot bind a view without an output descriptor", "0A000");
+          return [
+            {
+              kind: "view",
+              objectId: source.id,
+              columnIds: [],
+              outputCount: source.outputs.length,
+            },
+          ];
+        }
+        return [];
+      });
+      const view = {
+        name: statement.view,
+        bodySql: statement.sql,
+        outputs,
+        dependencies,
+        sourceSchemas,
+      };
       return {
         ...base,
         kind: "ddl",

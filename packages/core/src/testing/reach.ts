@@ -6252,6 +6252,7 @@ export const CATALOG_SEMANTIC_FIELDS_REACH = [
   "dependencies",
   "outputs",
   "viewDependencies",
+  "viewSourceSchemas",
   "expressionTypes",
   "downgrade refused",
 ] as const;
@@ -6416,4 +6417,44 @@ export const CATALOG_FTS_ALTER_REACH = [
   "first column",
   "middle column",
   "last column",
+] as const;
+
+export const ALTER_DEPENDENCIES_REACH = [
+  "generated",
+  "check",
+  "view",
+  "index",
+  "forward drops",
+  "reverse drops",
+  "multiple drops",
+  "short row",
+  "long row",
+  "quoted name",
+  "checkpoint",
+  "WAL",
+  "referenced drop refused",
+] as const;
+export const ADDED_ENUM_REACH = [
+  "plain",
+  "quoted",
+  "checkpoint",
+  "WAL",
+  "type drop refused",
+] as const;
+
+export const CATALOG_VIEW_SOURCES_REACH = [
+  "simple",
+  "qualified",
+  "derived",
+  "CTE",
+  "USING",
+  "NATURAL",
+  "nested replacement",
+  "column alias list",
+  "plain name",
+  "quoted name",
+  "checkpoint",
+  "WAL",
+  "reopen",
+  "binding corruption refused",
 ] as const;
