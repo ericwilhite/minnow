@@ -53,6 +53,12 @@ for (const seed of seedsFor("next-catalog-semantic-fields", [0xb790, 0xb791]))
         record: { ...table.columns[0], autoIncrement: true },
       },
       {
+        kind: "column",
+        id: 15,
+        field: "identityAlways",
+        record: { ...table.columns[0], identityAlways: true },
+      },
+      {
         kind: "index",
         id: 10,
         field: "directions",

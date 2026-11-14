@@ -56,8 +56,10 @@ const SQL_ENGINE_MODULES =
 // Catalog/type/identifier/CTE provenance over b091f51d: 1,178,390 raw / 353,405 gzip.
 // Audit attributes +2,062 raw to shared query/identifier/catalog source modules only.
 // Raise raw once by 2KiB, gzip by 768 bytes; all private-input/isolation checks stay.
-const COMPLETE_ENTRY_RAW_BUDGET = 1151.25 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 345.25 * 1024;
+// Native ALWAYS identity / DEFAULT provenance: 1,179,056 raw bytes. Raise raw cap once
+// by 512 bytes and gzip by 128 (353,621 gzip); private-input/isolation caps stay.
+const COMPLETE_ENTRY_RAW_BUDGET = 1151.75 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 345.375 * 1024;
 // The engine with the larger durable adapter, OPFS.
 // JSON_TABLE metadata: 1,585,069 raw / 458,168 gzip bytes; counterfactual
 // 1,584,618 / 458,049 (+451 / +119). Raw cap +512 once, gzip cap unchanged.
@@ -73,8 +75,10 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 345.25 * 1024;
 // Raise raw once by 1,280 and gzip by 640; private rebuild/test inputs remain excluded.
 // Final catalog provenance: 1,590,805 raw / 460,396 gzip bytes.
 // Raise raw once by 2KiB and gzip by 768; no next/ or test input ships.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1554 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 449.75 * 1024;
+// Native ALWAYS identity / DEFAULT provenance: 1,591,482 raw bytes. Raw cap +512 once;
+// gzip cap +128 once (460,583 gzip); private-input/isolation checks stay.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1554.5 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 449.875 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does.
 // JSON_TABLE metadata: 1,581,102 raw / 455,735 gzip bytes; counterfactual
@@ -91,7 +95,9 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 449.75 * 1024;
 // Raise raw once by 1,280 and gzip by 512; standalone client and isolation checks stay.
 // Final catalog provenance: 1,586,840 raw / 457,772 gzip bytes.
 // Raise raw once by 2KiB, gzip by 768; standalone client stays byte-identical.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1550 * 1024;
+// Native ALWAYS identity / DEFAULT provenance: 1,587,517 raw bytes. Raw cap +512 once;
+// gzip, standalone client and all isolation assertions stay unchanged.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1550.5 * 1024;
 const INDEXEDDB_WORKER_GZIP_BUDGET = 447.25 * 1024;
 // What a page that hosts the engine in a worker ships on the main thread: the client, the schema
 // DSL and error classes, the Kysely dialect and live queries, and the React hooks, with `kysely`

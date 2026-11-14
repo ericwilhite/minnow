@@ -6248,6 +6248,7 @@ export const CATALOG_SEMANTIC_FIELDS_REACH = [
   "defaultDependencies",
   "generatedDependencies",
   "autoIncrement",
+  "identityAlways",
   "directions",
   "dependencies",
   "outputs",
@@ -6502,4 +6503,23 @@ export const ROW_RULE_ORDER_REACH = [
   "plain name",
   "quoted name",
   "UTF8 names",
+] as const;
+
+export const IDENTITY_ALWAYS_REACH = [
+  "explicit refused",
+  "explicit allowed",
+  "insert select",
+  "update",
+  "upsert",
+  "merge",
+  "default allowed",
+  "batch input",
+  "checkpoint",
+  "WAL",
+  "invalid mode refused",
+  "smallint",
+  "integer",
+  "bigint",
+  "plain",
+  "quoted",
 ] as const;

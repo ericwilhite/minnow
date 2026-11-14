@@ -39,3 +39,12 @@ export function copyCatalogDeclarations(source: object, target: object): void {
   const sources = declarations.get(source);
   if (sources) declarations.set(target, sources);
 }
+
+/** Native-only identity mode, carried by the default object through column copies. */
+const alwaysIdentities = new WeakSet();
+export function rememberAlwaysIdentity(value: object): void {
+  alwaysIdentities.add(value);
+}
+export function alwaysIdentity(value: object | undefined): boolean {
+  return value !== undefined && alwaysIdentities.has(value);
+}

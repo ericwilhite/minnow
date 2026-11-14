@@ -15,6 +15,12 @@ compatibility policy and release process.
   order. Successful generated batches retain vectorized evaluation; shipped 0.x behavior and
   stored formats are unchanged.
 
+The unexported rebuild retains `GENERATED ALWAYS AS IDENTITY` in its catalog and applies
+PostgreSQL's assignment rules: omitted values and DEFAULT use the owned sequence; explicit
+user values fail with 428C9, including UPDATE, upsert, MERGE and batch inputs. The published
+0.x engine keeps its existing counter-alias behavior. This adds a required semantic field to
+unreleased rebuild catalog records; no released format or public API changes.
+
 The unexported rebuild adds charged, statement-owned CHECK and stored-generated-column
 kernels shared by ordinary writes and foreign-key actions. CHECK passes NULL and preserves
 row/constraint error order; generated recomputation keeps the old row intact for key checks.

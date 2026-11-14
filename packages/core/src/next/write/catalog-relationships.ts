@@ -59,6 +59,23 @@ export function validateRelationalCatalog(data: CatalogStreamData): void {
           "Identity sequence has another owner",
         );
       }
+      if (column.identityAlways !== undefined) {
+        requireTag(
+          column.identityAlways,
+          DURABLE_CODECS.presentFlag,
+          "identity mode",
+          StoreCorruptionError,
+        );
+        check(
+          column.identitySequence !== null &&
+            column.autoIncrement !== true &&
+            !column.nullable &&
+            column.generatedSql === null &&
+            column.defaultSql === null &&
+            (column.type.kind === "int32" || column.type.kind === "int64"),
+          "Invalid ALWAYS identity column",
+        );
+      }
       if (column.autoIncrement !== undefined) {
         requireTag(
           column.autoIncrement,

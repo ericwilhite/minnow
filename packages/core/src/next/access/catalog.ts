@@ -111,6 +111,8 @@ export interface ColumnDef {
   readonly identitySequence: number | null;
   /** Schema-DSL counter semantics: explicit safe integers advance the owned sequence. */
   readonly autoIncrement?: true;
+  /** SQL GENERATED ALWAYS identity: user assignments accept DEFAULT only. */
+  readonly identityAlways?: true;
   /**
    * The value of rows stored before the column existed (ALTER TABLE ADD COLUMN with a constant
    * default; PostgreSQL's `attmissingval`): a length-1 flat vector, null via its validity. Null

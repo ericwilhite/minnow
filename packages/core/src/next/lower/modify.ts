@@ -300,7 +300,7 @@ export function lowerInsert(statement: Insert, builder: PlanBuilder): LoweredWri
       return targets.map((def, index): Typed => {
         const value = row[index] ?? null;
         if (isDefaultInsertValue(value)) return defaultValue(def, state);
-        if (def.generatedSql !== null)
+        if (def.generatedSql !== null || def.identityAlways === true)
           throw new PlanningError(
             `cannot insert a non-DEFAULT value into column "${def.name}"`,
             "428C9",
@@ -332,7 +332,7 @@ export function lowerInsert(statement: Insert, builder: PlanBuilder): LoweredWri
     };
   }
   for (const def of targets)
-    if (def.generatedSql !== null && statement.query !== undefined)
+    if ((def.generatedSql !== null || def.identityAlways === true) && statement.query !== undefined)
       throw new PlanningError(
         `cannot insert a non-DEFAULT value into column "${def.name}"`,
         "428C9",
@@ -416,7 +416,11 @@ function conflictClause(
       : (clause.assignments ?? []);
   for (const pair of pairs) {
     const def = columnNamed(table, pair.column);
-    if (def.generatedSql !== null) throw generatedAssignmentError(def);
+    if (
+      def.generatedSql !== null ||
+      (def.identityAlways === true && !isUpdateDefaultAssignment(pair.expression))
+    )
+      throw generatedAssignmentError(def);
     const value = isUpdateDefaultAssignment(pair.expression)
       ? defaultValue(def, builder.state)
       : coerce(
@@ -588,7 +592,10 @@ export function lowerUpdate(statement: Update, builder: PlanBuilder): LoweredWri
     const def = columnNamed(table, assignment.column);
     if (assigned.some((entry) => entry.def.id === def.id))
       throw new PlanningError(`multiple assignments to same column "${def.name}"`, "42601");
-    if (def.generatedSql !== null && !isUpdateDefaultAssignment(assignment.expression))
+    if (
+      (def.generatedSql !== null || def.identityAlways === true) &&
+      !isUpdateDefaultAssignment(assignment.expression)
+    )
       throw generatedAssignmentError(def);
     if (def.generatedSql !== null) continue;
     const value = isUpdateDefaultAssignment(assignment.expression)
@@ -797,7 +804,11 @@ export function lowerMerge(statement: Merge, builder: PlanBuilder): LoweredWrite
       const assigned: Array<{ def: ColumnDef; value: Typed }> = [];
       for (const assignment of branch.action.assignments) {
         const def = columnNamed(table, assignment.column);
-        if (def.generatedSql !== null) throw generatedAssignmentError(def);
+        if (
+          def.generatedSql !== null ||
+          (def.identityAlways === true && !isUpdateDefaultAssignment(assignment.expression))
+        )
+          throw generatedAssignmentError(def);
         const value = isUpdateDefaultAssignment(assignment.expression)
           ? defaultValue(def, state)
           : coerce(
@@ -848,7 +859,10 @@ export function lowerMerge(statement: Merge, builder: PlanBuilder): LoweredWrite
       const expression = branch.action.values[index];
       if (expression === undefined)
         throw new PlanningError("INSERT has more target columns than expressions", "42601");
-      if (def.generatedSql !== null && !isUpdateDefaultAssignment(expression))
+      if (
+        (def.generatedSql !== null || def.identityAlways === true) &&
+        !isUpdateDefaultAssignment(expression)
+      )
         throw new PlanningError(
           `cannot insert a non-DEFAULT value into column "${def.name}"`,
           "428C9",
@@ -1018,7 +1032,7 @@ export function lowerBatchWrite(
   const table = targetTable(shape.table, builder);
   const targets = shape.names.map((name) => columnNamed(table, name));
   for (const def of targets)
-    if (def.generatedSql !== null)
+    if (def.generatedSql !== null || def.identityAlways === true)
       throw new PlanningError(
         `cannot insert a non-DEFAULT value into column "${def.name}"`,
         "428C9",

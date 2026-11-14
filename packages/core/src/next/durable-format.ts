@@ -352,6 +352,7 @@ export const CATALOG_RECORD_SCHEMAS = {
     "defaultDependencies:expressionDependencies~!",
     "generatedDependencies:expressionDependencies~!",
     "autoIncrement:b~!",
+    "identityAlways:b~!",
   ],
   physical: [
     "kind:s",
