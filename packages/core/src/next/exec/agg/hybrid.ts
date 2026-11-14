@@ -115,6 +115,8 @@ export class HybridAggregateOperator implements Operator {
   #restore: Promise<void> | null = null;
   #savedParameters: ParameterCheckpoint | null = null;
   readonly #stack: Pass[] = [];
+  /** Discarded tentative key admissions (diagnostics, not aggregate state). */
+  keyRetries = 0;
   readonly profile = {
     spilledBytes: 0,
     passes: 0,
@@ -345,8 +347,29 @@ export class HybridAggregateOperator implements Operator {
       yield* readValue(this.#routeFrozen(batch));
       return;
     }
-    const ids = this.#hash.assignGroups(batch),
-      groups = this.#hash.groupCount;
+    let ids: Int32Array;
+    try {
+      ids = this.#hash.assignGroups(batch);
+    } catch (error) {
+      if (!(error instanceof HashHeadroomError)) throw error;
+      // Key admission is append-only, and no transition has consumed this batch.
+      // Keep the ordinary growth policy: clipping an arena changes later batch
+      // peaks even when the parent's allocation fits. The guard charges old+new
+      // once and stops before allocation. Retire this incomplete lookup before
+      // retrying: its new IDs/layout need not be usable after a denied resize.
+      this.keyRetries++;
+      if (previous === 0) {
+        this.#resetEmpty();
+        yield* this.#split(batch);
+      } else {
+        // Canonical representatives and states of the committed prefix survive
+        // key insertion. Restore that exact prefix before any row in this batch;
+        // never reuse the partially changed lookup or combine aggregate states.
+        yield* readValue(this.#evict(batch, error.requested));
+      }
+      return;
+    }
+    const groups = this.#hash.groupCount;
     const state =
       this.#workspace.used +
       this.#hash.stateGrowthBytes(batch, groups, this.shared.fixed ? 0 : 4096);

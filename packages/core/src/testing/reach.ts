@@ -5724,6 +5724,7 @@ export const EXPRESSION_FENCE_REACH = [
 ] as const;
 
 export const BYTE_GROWTH_REACH = [
+  "key denial split",
   "funded transition",
   "dictionary",
   "flat",
@@ -5735,6 +5736,8 @@ export const BYTE_GROWTH_REACH = [
 ] as const;
 
 export const HASH_TRANSITION_REACH = [
+  "resident prefix",
+  "saved float prefix",
   "ordinary",
   "pinned spill",
   "reclaim release",

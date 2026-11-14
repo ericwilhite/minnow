@@ -442,13 +442,14 @@ path, including partial pressure followed by an ordinary batch.
 
 ### Hash key resize steps
 
-A byte-key arena funds its current buffer plus one replacement, separately for each
-key column. The caller counts its existing buffer in `workspace.used`; the batch bound adds only
-new headroom. Allocation clips speculative
-geometric growth to the same pair envelope. In particular, an exact large first
-allocation followed by a tiny key cannot request four times that exact size and
-consume another column's promised headroom. The envelope ends after group assignment.
-No transition or row scan is added to the funded path. Existing batch-boundary
-`HashWorkspace.prepare` waits cancellably for reclaimable credit; if the complete
-step cannot be funded, Hybrid splits or transfers exact state before retrying.
-No wait on another execution's pinned minimum is introduced.
+Key admission uses the ordinary growth policy and its existing batch request.
+The hash allocation guard measures current buffers plus the requested replacement
+once, before allocating; it never grows credit synchronously. If speculation would
+exceed funded headroom, no aggregate transition has consumed that batch yet.
+An empty pass discards the incomplete key table and splits its input prefix. A pass
+with committed groups checkpoints only their canonical keys and exact state, spools
+the untouched batch/suffix, then retires the old producer graph before atomic phase
+admission. Restoration applies the saved state before those rows, without reassociation.
+The partially changed lookup is never reused. Existing batch-boundary reclaim waits
+remain cancellable; a pinned holder selects split/spill. Ordinary funded batches do
+not scan widths again, change buffer capacities, or reserve additional memory.

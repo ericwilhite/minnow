@@ -28,16 +28,17 @@ it.each(seedsFor("executor-hash-transition", [0xb7bf, 0xb7c0]))(
           fc.integer({ min: 0, max: 3 }),
           fc.boolean(),
           fc.boolean(),
-          async (width, count, mode, distinct, unicode) => {
+          fc.boolean(),
+          async (width, count, mode, distinct, unicode, prefill) => {
             reach.beginHistory();
             const value = unicode ? "汉".repeat(Math.floor(width / 3)) : "x".repeat(width);
             const args = Array.from({ length: distinct ? count : 1 }, (_, c) => value + String(c));
             const keys = Array.from({ length: count }, (_, c) => `k${String(c)}`);
             const expressions = keys.map(
               (k, c) =>
-                `CASE WHEN i=1 THEN $${String(distinct ? c + 1 : 1)}::text ELSE 'k' END ${k}`,
+                `CASE WHEN i=${prefill ? "2049" : "1"} THEN $${String(distinct ? c + 1 : 1)}::text ${prefill ? "WHEN i=2050 THEN 'k' ELSE 'p'" : "ELSE 'k'"} END ${k}`,
             );
-            const sql = `SELECT count(*) n FROM (SELECT ${expressions.join(",")} FROM generate_series(1,3)g(i))q GROUP BY ${keys.join(",")}`;
+            const sql = `SELECT count(*) n,sum(v) s,avg(v) a FROM (SELECT ${expressions.join(",")},CASE WHEN i%3=0 THEN 1e16::float8 WHEN i%3=1 THEN 1::float8 ELSE -1e16::float8 END v FROM generate_series(1,${prefill ? "2052" : "3"})g(i))q GROUP BY ${keys.join(",")}`;
             const governor = new Governor(256 << 20);
             let competitor = await governor.admit({
               label: "competitor",
@@ -122,6 +123,13 @@ it.each(seedsFor("executor-hash-transition", [0xb7bf, 0xb7c0]))(
                   canonical((await pg.query<Record<string, unknown>>(sql, args)).rows),
                 );
                 reach.reach("PG exact");
+                if (prefill) {
+                  reach.reach("resident prefix");
+                  if (mode === 0) {
+                    expect(phases).toBeGreaterThan(0);
+                    reach.reach("saved float prefix");
+                  }
+                }
                 if (mode === 0) reach.reach("ordinary");
                 if (mode === 1) {
                   expect(phases).toBeGreaterThan(0);
@@ -151,12 +159,14 @@ it.each(seedsFor("executor-hash-transition", [0xb7bf, 0xb7c0]))(
           numRuns: 8,
           endOnFailure: true,
           examples: [
-            [800000, 1, 0, false, false],
-            [800000, 1, 1, false, false],
-            [800000, 3, 2, true, false],
-            [800000, 1, 3, false, false],
-            [800000, 16, 0, false, false],
-            [800000, 8, 1, true, true],
+            [800000, 1, 0, false, false, false],
+            [800000, 1, 1, false, false, false],
+            [800000, 3, 2, true, false, false],
+            [800000, 1, 3, false, false, false],
+            [800000, 16, 0, false, false, false],
+            [800000, 8, 1, true, true, false],
+            [800000, 1, 0, false, false, true],
+            [600000, 3, 1, true, false, true],
           ],
         },
       );

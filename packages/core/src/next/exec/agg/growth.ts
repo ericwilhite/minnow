@@ -4,9 +4,9 @@ import type { Vector } from "../../vector/vector.js";
 
 /** Sum of all new buffers in a sequence of geometric resizes is <2x its final buffer.
  * Existing buffers remain in the caller's current allocation. The bound therefore covers
- * every old/new overlap for geometric resizes within a single input batch. ByteArena
- * also clips arbitrary exact jumps to this pair peak: otherwise a large exact resize
- * followed by a tiny append could request 4x the exact size, outside this envelope.
+ * geometric old/new overlaps within a batch. Arbitrary exact byte-arena jumps can
+ * leave that series: the allocation guard then reports the actual pair peak, and
+ * the hybrid owner retires tentative key admission before any transition/retry.
  */
 export function arrayGrowth(length: number, needed: number, bytes: number, double = false): number {
   if (needed <= length) return 0;
