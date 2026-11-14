@@ -6330,3 +6330,83 @@ export const SEQUENCE_PREFIX_REACH = [
 ] as const;
 
 export const CONCAT_SLICE_REACH = ["complete", "cancel", "bitmap yield", "zero"] as const;
+
+export const TEXT_OUTPUT_REACH = [
+  "int2",
+  "int4",
+  "int8",
+  "numeric",
+  "float4",
+  "float8",
+  "boolean",
+  "date",
+  "time",
+  "timestamp",
+  "timestamptz",
+  "interval",
+  "uuid",
+  "json",
+  "jsonb",
+  "array",
+  "NULL",
+  "numeric scale",
+  "24:00",
+  "infinity",
+  "direct",
+  "derived",
+  "CTE",
+  "PG exact",
+  "zero",
+] as const;
+
+export const ARRAY_TEXT_OUTPUT_REACH = [
+  "enum",
+  "numeric specials",
+  "mixed lower bounds",
+  "text",
+  "bytes",
+  "scalar elements",
+  "numeric scale",
+  "boolean t/f",
+  "PG float",
+  "temporal elements",
+  "multidimensional",
+  "bounds",
+  "NULL array",
+  "NULL elements",
+  "empty array",
+  "shared FTS",
+  "PG exact",
+  "zero",
+] as const;
+
+export const TEXT_OUTPUT_PRESSURE_REACH = [
+  "array",
+  "numeric",
+  "bytes",
+  "PG exact",
+  "cancel",
+  "pinned",
+  "handoff",
+  "independent aliases",
+  "owned byte input",
+  "ten MB result",
+  "zero",
+] as const;
+
+export const TEXT_OPERATOR_REACH = [
+  "left text",
+  "right text",
+  "unknown text",
+  "JSONB stays unsupported",
+  "undefined operator",
+  "zero",
+] as const;
+export const TEXT_OUTPUT_SLICE_REACH = [
+  "funded decode",
+  "complete",
+  "before decode yield",
+  "cancel",
+  "redundant sign bytes",
+  "zero",
+] as const;

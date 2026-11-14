@@ -224,10 +224,9 @@ export const FUNCTION_BINDINGS: Readonly<Record<string, Binding | PerOverload>> 
 /**
  * Explicit casts (`explicitCastAllowed`) with no kernel yet, as "from→to" over SQL types; every
  * other allowed pair has one in cast.ts. `*` stands for any type of the table; implemented
- * temporal output casts are exceptions selected by castRefusal before its wildcard.
+ * output functions to unbounded TEXT are implemented; input casts retain the wildcard refusal.
  */
 export const CAST_REFUSALS: ReadonlyMap<string, string> = new Map([
-  ["*→text", "casts to text (output functions come with the text kernels)"],
   ["text→*", "casts from text (input functions come with the text kernels)"],
   ["bool→int4", "bool ↔ int4 casts"],
   ["int4→bool", "bool ↔ int4 casts"],
@@ -247,10 +246,7 @@ export function castRefusal(from: SqlType, to: SqlType): string | null {
     ((from === "json" || from === "jsonb") && to === "text")
   )
     return null;
-  if (to === "text")
-    return from === "date" || from === "timestamp" || from === "timestamptz" || from === "interval"
-      ? null
-      : (CAST_REFUSALS.get("*→text") ?? null);
+  if (to === "text") return null;
   if (from === "text") return CAST_REFUSALS.get("text→*") ?? null;
   return CAST_REFUSALS.get(`${from}→${to}`) ?? null;
 }

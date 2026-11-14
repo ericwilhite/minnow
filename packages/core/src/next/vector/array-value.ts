@@ -1,6 +1,7 @@
 /**
  * The stored form of a SQL array value (DECISIONS.md C9): one reversible binary value per row in a
- * `varlen` vector, decoded to `ArrayValue` before any operation. It is not a key and is never
+ * `varlen` vector, read incrementally or through the allocating `ArrayValue` compatibility API.
+ * It is not a key and is never
  * compared as bytes: ordering and equality use exec/semantic.ts (`compareArrays`,
  * `arrayEqualityKey`) on the decoded value, and arrays cannot be indexed (keys/key-encoding.ts).
  *
@@ -166,10 +167,14 @@ function fromTwosComplement(bytes: Uint8Array): bigint {
     throw new MalformedArrayError("Array NUMERIC coefficient is out of range");
   bytes = bytes.subarray(0, length);
   if (bytes.length === 0) return 0n;
-  const digits: string[] = [];
-  for (let index = bytes.length - 1; index >= 0; index--)
-    digits.push((bytes[index] ?? 0).toString(16).padStart(2, "0"));
-  return BigInt.asIntN(bytes.length * 8, BigInt(`0x${digits.join("")}`));
+  const hex = new Uint8Array(2 * bytes.length),
+    alphabet = "0123456789abcdef";
+  for (let index = 0; index < bytes.length; index++) {
+    const byte = bytes[bytes.length - index - 1] ?? 0;
+    hex[2 * index] = alphabet.charCodeAt(byte >>> 4);
+    hex[2 * index + 1] = alphabet.charCodeAt(byte & 15);
+  }
+  return BigInt.asIntN(bytes.length * 8, BigInt(`0x${new TextDecoder().decode(hex)}`));
 }
 
 /** PostgreSQL's MaxArraySize: the most elements an array may hold. */
@@ -402,11 +407,22 @@ export interface ArrayValueVisitor {
   element(value: ArrayElement | null): void;
   beforeBytes?(value: Uint8Array): void;
 }
-export function visitArrayValue(
+/** One element's decode workspace, yielded BEFORE allocating its coefficient or
+ * label. Callers admit it before resuming; zero is a bounded-work clock checkpoint.
+ * Existing allocating/visitor APIs retain their caller-funded decode contract. */
+export interface ArrayDecodeScratch {
+  readonly scratchBytes: number;
+}
+export function isArrayDecodeScratch(
+  value: ArrayElement | null | ArrayDecodeScratch,
+): value is ArrayDecodeScratch {
+  return value !== null && typeof value === "object" && "scratchBytes" in value;
+}
+export function* arrayValueElements(
   element: PhysicalType,
   bytes: Uint8Array,
-  visitor: ArrayValueVisitor,
-): void {
+  visitor: Pick<ArrayValueVisitor, "begin" | "beforeBytes">,
+): Generator<ArrayElement | null | ArrayDecodeScratch, void> {
   const tag = arrayElementTag(element);
   requireHeader("arrayValue", bytes, MalformedArrayError);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -441,45 +457,45 @@ export function visitArrayValue(
   if (arraySize(dimensions, lowerBounds) !== count)
     throw new MalformedArrayError("Invalid array dimensions");
   visitor.begin({ dimensions, lowerBounds }, count);
-  const emit = (value: ArrayElement | null): void => {
-    if (value instanceof Uint8Array) visitor.beforeBytes?.(value);
+  const checked = (value: ArrayElement | null, bytesChecked = false): ArrayElement | null => {
+    if (!bytesChecked && value instanceof Uint8Array) visitor.beforeBytes?.(value);
     if (value !== null) checkElement(element, tag, value);
-    visitor.element(value);
+    return value;
   };
   for (let index = 0; index < count; index++) {
     if (nulls !== null && ((nulls[index >>> 3] ?? 0) & (1 << (index & 7))) !== 0) {
-      emit(null);
+      yield checked(null);
       continue;
     }
     switch (tag) {
       case 1: {
         const value = view.getUint8(need(1));
         requireTag(value, DURABLE_CODECS.boolean, "array boolean", MalformedArrayError);
-        emit(value === 1);
+        yield checked(value === 1);
         break;
       }
       case 2:
       case 3:
       case 8:
-        emit(view.getInt32(need(4), true));
+        yield checked(view.getInt32(need(4), true));
         break;
       case 4:
       case 9:
       case 10:
       case 11:
-        emit(view.getBigInt64(need(8), true));
+        yield checked(view.getBigInt64(need(8), true));
         break;
       case 5:
-        emit(view.getFloat32(need(4), true));
+        yield checked(view.getFloat32(need(4), true));
         break;
       case 6:
-        emit(view.getFloat64(need(8), true));
+        yield checked(view.getFloat64(need(8), true));
         break;
       case 7: {
         const special = view.getUint8(need(1));
         if (special > 3) throw new MalformedArrayError("Bad NUMERIC special");
         if (special !== 0) {
-          emit({
+          yield checked({
             coefficient: 0n,
             scale: 0,
             special: special === 1 ? "NaN" : special === 2 ? "Infinity" : "-Infinity",
@@ -488,25 +504,54 @@ export function visitArrayValue(
         }
         const scale = view.getUint16(need(2), true);
         const length = view.getUint32(need(4), true);
-        emit({ coefficient: fromTwosComplement(bytes.subarray(need(length), at)), scale });
+        const encoded = bytes.subarray(need(length), at);
+        // Strip redundant sign extension before sizing, preserving the old decoder's
+        // accepted values. Long extension-only input must still obey the task clock.
+        let significant = encoded.length;
+        while (significant > 1) {
+          const last = encoded[significant - 1],
+            next = encoded[significant - 2] ?? 0;
+          if ((last === 0 && (next & 128) === 0) || (last === 255 && (next & 128) !== 0))
+            significant--;
+          else break;
+          if ((significant & 8191) === 0) yield { scratchBytes: 0 };
+        }
+        if (significant > Math.ceil((NUMERIC_MAX_INTEGER_DIGITS + NUMERIC_MAX_SCALE) / 2) + 1)
+          throw new MalformedArrayError("Array NUMERIC coefficient is out of range");
+        yield { scratchBytes: 4096 + 16 * significant };
+        yield checked({ coefficient: fromTwosComplement(encoded.subarray(0, significant)), scale });
         break;
       }
       case 12: {
         const months = view.getInt32(need(4), true);
         const days = view.getInt32(need(4), true);
-        emit({ months, days, micros: view.getBigInt64(need(8), true) });
+        yield checked({ months, days, micros: view.getBigInt64(need(8), true) });
         break;
       }
       case 15:
-        emit(bytes.subarray(need(16), at));
+        yield checked(bytes.subarray(need(16), at));
         break;
       default: {
         const length = view.getUint32(need(4), true);
-        emit(bytes.subarray(need(length), at));
+        const payload = bytes.subarray(need(length), at);
+        if (tag === 16) {
+          visitor.beforeBytes?.(payload);
+          yield { scratchBytes: 2048 + 2 * payload.length };
+        }
+        yield checked(payload, tag === 16);
       }
     }
   }
   if (at !== bytes.length) throw new MalformedArrayError("Trailing bytes after the array value");
+}
+
+export function visitArrayValue(
+  element: PhysicalType,
+  bytes: Uint8Array,
+  visitor: ArrayValueVisitor,
+): void {
+  for (const value of arrayValueElements(element, bytes, visitor))
+    if (!isArrayDecodeScratch(value)) visitor.element(value);
 }
 
 /** Allocating compatibility API: unlike the visitor, returned byte elements are owned. */

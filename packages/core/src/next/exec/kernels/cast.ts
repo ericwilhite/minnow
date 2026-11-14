@@ -40,6 +40,7 @@ import {
   UnsupportedPlanError,
 } from "../errors.js";
 import { compileJson } from "./json.js";
+import { compileTextOutput } from "./text-output.js";
 import { compileTemporalText } from "./temporal-text.js";
 import { castRefusal } from "./bindings.js";
 import { coefficientAt, scaleAt, specialAt, type DecimalData } from "./numeric.js";
@@ -612,6 +613,8 @@ export function compileCast(type: PhysicalType, input: Compiled, arena: OutputAr
     (from.kind === "date" || from.kind === "timestamp" || from.kind === "interval")
   )
     return compileTemporalText(type, input, arena);
+  if (type.kind === "text" && from.kind !== "text" && from.kind !== "enum")
+    return compileTextOutput(type, input, arena);
   if (NUMERIC.has(from.kind) && NUMERIC.has(type.kind)) {
     switch (type.kind) {
       case "int32":

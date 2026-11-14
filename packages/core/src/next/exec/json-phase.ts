@@ -53,6 +53,8 @@ export async function closeJsonPhase(saved: JsonPhase): Promise<void> {
     );
 }
 export interface JsonPhaseContext {
+  /** Native text is fully serialized before sealing; result allocation adopts it once. */
+  readonly nativeTextOutput?: boolean;
   readonly deliveryCopies?: readonly number[];
   readonly grant: Grant;
   readonly spill: SpillService;
@@ -139,7 +141,7 @@ export class JsonPhaseOperator implements Operator {
     this.#write = create();
     this.#directory = new TapeDirectory(this.#write, this.#write.pool);
     this.#constructionCleanup.push(() => this.#directory.detach());
-    this.#prefix = new JsonRecords(this.#write, shared.spill, output);
+    this.#prefix = new JsonRecords(this.#write, shared.spill, output, shared.deliveryCopies);
     this.#constructionCleanup.push(() => this.#prefix.close());
     this.#suffix = new JsonRecords(this.#write, shared.spill, context.input);
     this.#constructionCleanup.push(() => this.#suffix.close());
@@ -306,6 +308,9 @@ export class JsonPhaseOperator implements Operator {
       // JSON/array bytes transfer as varlen; fixed cells (including wide NUMERIC)
       // retain their per-field sink copy, without forcing a copy of the whole row.
       ownedDelivery: emit && this.shared.allocateResult !== undefined,
+      ...(emit && this.shared.nativeTextOutput
+        ? { deliveryBytes: this.#prefix.deliveryBytes }
+        : {}),
       error: this.#rowError,
       prefix: this.#prefix,
       suffix: this.#suffix,

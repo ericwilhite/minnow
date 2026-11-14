@@ -1712,7 +1712,15 @@ shipped-engine or stored-format change.
   execute through dedicated kernels. DATE_PART over finite intervals returns float8 separately
   from EXTRACT's NUMERIC result; date/time DATE_PART execution remains a typed refusal. Not implemented yet: other temporal arithmetic and EXTRACT
   overloads, text functions, math functions other
-  than numeric ROUND(numeric,int4), other casts to and from text, and bounded text casts.
+  than numeric ROUND(numeric,int4), most casts from text, and bounded text casts.
+  Output casts to unbounded TEXT support integers, NUMERIC (display scale retained),
+  PG-shortest float4/float8, boolean (`true`/`false`), date, time, timestamp/timestamptz
+  (session UTC), interval, UUID, JSON/JSONB and native arrays. `sql-array-text.ts` is
+  the shared `array_out` renderer for casts and FTS renderer2: dimensions, lower bounds,
+  element NULLs and quoting survive. The FTS document limit applies only to FTS.
+  Text `||` accepts a non-array scalar on either side when the other operand is text.
+  JSONB/BYTEA concatenation remains typed-refused; two known non-text operands without
+  their own supported overload raise 42883 rather than being silently stringified.
 - SQL TIMESTAMP literals preserve source microseconds through parsing, plan clones and expression
   identity; lowering uses integer calendar/fraction fields, not the legacy millisecond Date.
   Parser provenance lives in an internal weak side table, never in published model fields.
@@ -1823,8 +1831,9 @@ shipped-engine or stored-format change.
   projection output uses the existing resumable complete-row phase; copying and NULL-bitmap
   repacking obey the shared task clock. Placements without that resumable project/filter
   host are typed-refused. Existing limitations
-  remain: SQL ARRAY constructors/text-to-array casts, BYTEA DDL/casts, JSON array elements
-  and casts between different array element types are unsupported. Native stored arrays
+  remain: SQL ARRAY constructors/text-to-array casts, BYTEA SQL input/DDL, JSON array elements
+  and casts between different array element types are unsupported. Array-to-unbounded-TEXT
+  output is supported; array-to-bounded-text remains refused with other bounded text casts. Native stored arrays
   and explicitly typed lowerer byte parameters exercise the supported typed paths.
 
 - `aggregate.ts`: the `aggregate` operator. Each batch maps its rows to dense group ids, then

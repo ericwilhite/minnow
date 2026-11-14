@@ -3,6 +3,19 @@ import type { Rel, ScalarExpr } from "../ir/ir.js";
 
 /** Constants can feed VALUES/derived sources as well as a direct extractor argument. */
 export function jsonLiteralBytes(value: unknown): number {
+  const fixedText =
+    value !== null &&
+    typeof value === "object" &&
+    "op" in value &&
+    value.op === "cast" &&
+    "type" in value &&
+    (value.type as { kind: string }).kind === "text" &&
+    "input" in value &&
+    ["bool", "int32", "int64", "float32", "float64", "time", "uuid"].includes(
+      (value.input as ScalarExpr).type.kind,
+    )
+      ? 48
+      : 0;
   if (value === null || typeof value !== "object" || ArrayBuffer.isView(value)) return 0;
   if ("op" in value && value.op === "literal" && "value" in value) {
     const vector = value.value as {
@@ -14,7 +27,7 @@ export function jsonLiteralBytes(value: unknown): number {
       ? Math.max(0, (vector.data.offsets?.[1] ?? 0) - (vector.data.offsets?.[0] ?? 0))
       : 0;
   }
-  let maximum = 0;
+  let maximum = fixedText;
   for (const child of Array.isArray(value) ? value : Object.values(value))
     maximum = Math.max(maximum, jsonLiteralBytes(child));
   return maximum;

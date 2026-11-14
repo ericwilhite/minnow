@@ -24,7 +24,7 @@ export function formatSqlTimestamp(micros: bigint, zoned: boolean): string {
     seconds = Math.floor(time / 1000000);
   return `${bc ? date.slice(0, -3) : date} ${pad(Math.floor(seconds / 3600))}:${pad(Math.floor(seconds / 60) % 60)}:${pad(seconds % 60)}${fraction(time % 1000000)}${zoned ? "+00" : ""}${bc ? " BC" : ""}`;
 }
-/** Recognize PG's native sentinel tuples only to refuse unsupported interval infinities. */
+/** PostgreSQL's native interval infinity tuples. */
 export function isInfiniteInterval(months: number, days: number, micros: bigint): boolean {
   return (
     (months === 2147483647 && days === 2147483647 && micros === 9223372036854775807n) ||
@@ -32,6 +32,7 @@ export function isInfiniteInterval(months: number, days: number, micros: bigint)
   );
 }
 export function formatSqlInterval(months: number, days: number, micros: bigint): string {
+  if (isInfiniteInterval(months, days, micros)) return months < 0 ? "-infinity" : "infinity";
   const parts: string[] = [];
   let before = false;
   for (const [value, unit] of [
@@ -53,4 +54,11 @@ export function formatSqlInterval(months: number, days: number, micros: bigint):
     );
   }
   return parts.join(" ");
+}
+
+/** TIME WITHOUT TIME ZONE includes PostgreSQL's exact24:00 endpoint. */
+export function formatSqlTime(value: bigint): string {
+  const seconds = value / 1_000_000n,
+    remainder = value % 1_000_000n;
+  return `${String(seconds / 3600n).padStart(2, "0")}:${String((seconds / 60n) % 60n).padStart(2, "0")}:${String(seconds % 60n).padStart(2, "0")}${remainder ? "." + String(remainder).padStart(6, "0").replace(/0+$/u, "") : ""}`;
 }

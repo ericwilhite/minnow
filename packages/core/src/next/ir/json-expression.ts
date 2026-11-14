@@ -4,6 +4,24 @@ import type { ScalarExpr } from "./ir.js";
 /** Such expressions need the owner even when a CASE/COALESCE only relays a JSON column. */
 export function jsonExpression(expr: ScalarExpr): boolean {
   if (
+    expr.op === "cast" &&
+    expr.type.kind === "text" &&
+    [
+      "bool",
+      "int32",
+      "int64",
+      "float32",
+      "float64",
+      "decimal",
+      "time",
+      "uuid",
+      "array",
+      "bytes",
+    ].includes(expr.input.type.kind)
+  )
+    return true;
+
+  if (
     expr.op === "call" &&
     ["textcat", "array_cat", "array_append", "array_prepend"].includes(expr.fn)
   )
@@ -59,6 +77,13 @@ export function jsonExpression(expr: ScalarExpr): boolean {
 /** Binary JSON canonicalization can expand; its frame needs checkpoint/re-admission. */
 export function expandingJsonExpression(expr: ScalarExpr): boolean {
   if (
+    expr.op === "cast" &&
+    expr.type.kind === "text" &&
+    ["decimal", "array", "bytes"].includes(expr.input.type.kind)
+  )
+    return true;
+
+  if (
     expr.op === "call" &&
     ["textcat", "array_cat", "array_append", "array_prepend"].includes(expr.fn)
   )
@@ -110,6 +135,31 @@ export function expandingJsonExpression(expr: ScalarExpr): boolean {
         "then" in child &&
         (expandingJsonExpression((child as { then: ScalarExpr }).then) ||
           expandingJsonExpression((child as { when: ScalarExpr }).when))
+      )
+        return true;
+    }
+  }
+  return false;
+}
+
+/** New scalar/array output functions serialize native TEXT before a phase is sealed.
+ * Completed native rows need their measured delivery copies, not JSON conversion scratch. */
+export function nativeTextExpression(expr: ScalarExpr): boolean {
+  if (
+    expr.op === "cast" &&
+    expr.type.kind === "text" &&
+    ["decimal", "array", "bytes"].includes(expr.input.type.kind)
+  )
+    return true;
+  for (const value of Object.values(expr)) {
+    if (value === null || typeof value !== "object" || ArrayBuffer.isView(value)) continue;
+    for (const child of Array.isArray(value) ? value : [value]) {
+      if (child === null || typeof child !== "object") continue;
+      if ("op" in child && nativeTextExpression(child as ScalarExpr)) return true;
+      if (
+        "then" in child &&
+        (nativeTextExpression((child as { then: ScalarExpr }).then) ||
+          nativeTextExpression((child as { when: ScalarExpr }).when))
       )
         return true;
     }

@@ -1,0 +1,180 @@
+{
+  "task": "PostgreSQL output-function casts to unbounded TEXT",
+  "base": "9966c23feb19b0126a601afb0d081570faa1f822",
+  "authority": "PGlite/PostgreSQL output functions, array_out and text||anynonarray overloads; existing C9 native array bytes; memory/README complete-step admission contract",
+  "generated": {
+    "SQL": [47065, 47066, 96],
+    "array_out": [47067, 47068, 96],
+    "pressure": [47069, 47070, 12],
+    "operator_resolution": [47071, 47072, 32],
+    "decode_slices": [47073, 47074, 16],
+    "total_histories": 504,
+    "examples_included_in_numRuns": true
+  },
+  "green": {
+    "files": 12,
+    "tests": 298,
+    "log": "/home/eric/.cache/b4-text-output/GREEN-precommit.log",
+    "lint": "/home/eric/.cache/b4-text-output/lint-ready.log",
+    "core_tsc": "/home/eric/.cache/b4-text-output/types-ready.log"
+  },
+  "red": {
+    "SQL": "/home/eric/.cache/b4-text-output/RED-output.log",
+    "native_delivery": "/home/eric/.cache/b4-text-output/RED-pressure-native-delivery.log",
+    "native_delivery_refusal_bytes": 21079176,
+    "cap_bytes": 16777216
+  },
+  "pressure": {
+    "native_text_result_bytes": 10000001,
+    "input_array_bytes": 250012,
+    "cap_bytes": 16777216,
+    "proof": "completes with pinned competition; measured native output plus alias copies; output bytes do not inherit FTS limit or whole-row JSON conversion multiplier",
+    "cleanup": "governor and spill zero before shared service closes",
+    "other_dimensions": [
+      "native byte caller mutation after admission",
+      "NUMERIC zero with scale16383",
+      "independent mutable client aliases",
+      "cancellation during phase admission",
+      "scratch funding before coefficient decode",
+      "cancellation at decode yield",
+      "redundant sign extension sizes normalized"
+    ]
+  },
+  "mutants": [
+    {
+      "name": "bool-short",
+      "intended": true,
+      "exit": 1,
+      "seconds": 8.84470091003459,
+      "log": "/home/eric/.cache/b4-text-output/bool-short.log"
+    },
+    {
+      "name": "strip-scale",
+      "intended": true,
+      "exit": 1,
+      "seconds": 8.570808673044667,
+      "log": "/home/eric/.cache/b4-text-output/strip-scale.log"
+    },
+    {
+      "name": "js-float",
+      "intended": true,
+      "exit": 1,
+      "seconds": 8.165745269041508,
+      "log": "/home/eric/.cache/b4-text-output/js-float.log"
+    },
+    {
+      "name": "drop-bounds",
+      "intended": true,
+      "exit": 1,
+      "seconds": 4.553157320944592,
+      "log": "/home/eric/.cache/b4-text-output/drop-bounds.log"
+    },
+    {
+      "name": "drop-whitespace-quote",
+      "intended": true,
+      "exit": 1,
+      "seconds": 4.768759261933155,
+      "log": "/home/eric/.cache/b4-text-output/drop-whitespace-quote.log"
+    },
+    {
+      "name": "fts-cap-on-cast",
+      "intended": true,
+      "exit": 1,
+      "seconds": 8.778754857019521,
+      "log": "/home/eric/.cache/b4-text-output/fts-cap-on-cast.log"
+    },
+    {
+      "name": "drop-delivery-measure",
+      "intended": true,
+      "exit": 1,
+      "seconds": 14.259399074013345,
+      "log": "/home/eric/.cache/b4-text-output/drop-delivery-measure.log"
+    },
+    {
+      "name": "unfunded-coefficient",
+      "intended": true,
+      "exit": 1,
+      "seconds": 4.856790688936599,
+      "log": "/home/eric/.cache/b4-text-output/unfunded-coefficient.log"
+    },
+    {
+      "name": "no-decode-yield",
+      "intended": true,
+      "exit": 1,
+      "seconds": 4.1420556280063465,
+      "log": "/home/eric/.cache/b4-text-output/no-decode-yield.log"
+    },
+    {
+      "name": "size-padded-coefficient",
+      "intended": true,
+      "exit": 1,
+      "seconds": 4.503050180035643,
+      "log": "/home/eric/.cache/b4-text-output/size-padded-coefficient.log"
+    },
+    {
+      "name": "stringify-undefined-operator",
+      "intended": true,
+      "exit": 1,
+      "seconds": 10.43734006898012,
+      "log": "/home/eric/.cache/b4-text-output/stringify-undefined-operator.log"
+    },
+    {
+      "name": "retain-coefficient-scratch",
+      "exit": 1,
+      "intended": true,
+      "seconds": 4.104862189968117,
+      "log": "/home/eric/.cache/b4-text-output/retain-coefficient-scratch.log"
+    }
+  ],
+  "implementation": {
+    "array_renderer": "one sqlArrayText used by native casts and bounded FTSv2 wrapper",
+    "float_formatter": "existing jsonFloatText PG-shortest implementation reused unchanged",
+    "numeric": "shared decimalAscii preserves scale and streams padding; compact ASCII hex decode funded before allocation",
+    "interval": "existing PG sentinel bytes now print infinity/-infinity; finite/default style unchanged",
+    "overloads": "explicit text supports anynonarray; JSONB/BYTEA own concat stays typed-refused; known nontext without supported overload raises42883"
+  },
+  "assumptions": [
+    "session UTC",
+    "default ISO DateStyle",
+    "postgres IntervalStyle",
+    "positive/default extra_float_digits",
+    "existing native array scalar codecs except JSON"
+  ],
+  "limits": [
+    "unexported core",
+    "bounded TEXT, most TEXT input casts, SQL ARRAY constructors/array parameters/mixed-element array casts and BYTEA SQL input/DDL remain existing typed refusals",
+    "JSONB/BYTEA own concatenation not implemented",
+    "existing typed parameter input contracts unchanged",
+    "six pre-existing computed CASE-key aggregation pressure refusals unchanged",
+    "no stored layout/version, shipped executor, constant folding or browser/CPU performance claim"
+  ],
+  "reproduce": "TMPDIR=/home/eric/.cache/b4-text-output npx vitest run packages/core/src/next/testing/text-output-pglite.test.ts packages/core/src/next/testing/array-text-output-pglite.test.ts packages/core/src/next/testing/text-output-pressure.test.ts packages/core/src/next/testing/text-operator-resolution.test.ts packages/core/src/next/exec/kernels/text-output-slices.test.ts --maxWorkers=2",
+  "sha256": {
+    "packages/core/src/next/exec/kernels/text-output-slices.test.ts": "f27cf46bd33f77b9a60e5996ce2c41fe63d5dcf119efefd8d1c4565f29ad80e3",
+    "packages/core/src/next/exec/kernels/text-output.ts": "9dd1f8079a260565e905ea6260d771669380b3d28ab74b0ae1c76372da143f3c",
+    "packages/core/src/next/exec/sql-array-text.ts": "4031352cf1f56ca3d68cb09650aad7ae444977200ecd1678d8737e07e656164e",
+    "packages/core/src/next/testing/array-text-output-pglite.test.ts": "cf5885ab241db1aad042e8014d3ba0eafefc82513add63e22c610f7f7bedaa09",
+    "packages/core/src/next/testing/text-operator-resolution.test.ts": "9d5d92995b6886ec942d9f644c472e2ffabf8781524a85e919ae49205970b0a0",
+    "packages/core/src/next/testing/text-output-cases.test.fixture.ts": "00296af3f95f2e84711207e86b2297575424e79334e73bcc39104141802a7e63",
+    "packages/core/src/next/testing/text-output-pglite.test.ts": "195e536dd57ddd131e7d05f90f39018a0203a735fc6919c7e26f52eba476ee18",
+    "packages/core/src/next/testing/text-output-pressure.test.ts": "2d709a1e5d2fbcb67ad605d206784fc45feeb8ba5d6e5a740cbe17fcc84b4308",
+    "packages/core/src/next/README.md": "a98b9715fb70f71d07a6bb708b9b217eac14808326408362ab33cf07267af938",
+    "packages/core/src/next/exec/fts-value.ts": "18095da812e6dfc75c8ac2c2bc4cfd722e03c61640044c12b06e4437d7c629a5",
+    "packages/core/src/next/exec/json-phase.ts": "c17c99d08cc768a84d98c46ff5ce4ce2a481d16a8e34d556c5a4ce3baff2cd46",
+    "packages/core/src/next/exec/json-plan.ts": "45c25b834c4624a420ab95fa5ec8ab3f8164e469a7973dbce45ae268ab16449c",
+    "packages/core/src/next/exec/kernels/bindings.ts": "788b53d93bd7a6dc4078e029e7db112e579ffc15739a9b8b1720ab5539740ef2",
+    "packages/core/src/next/exec/kernels/cast.ts": "89b0d3b5e6b7299f1835c4c7b7b4d7500d766e91cd1bdc468675c7a82e070b5b",
+    "packages/core/src/next/exec/kernels/json-value.ts": "820284ccc06177eeae3580dc7ef5e02efda2d9939bfd8e47a7af9700f8a57090",
+    "packages/core/src/next/exec/kernels/temporal-casts-pglite.test.ts": "4851b1efec70d1a9fac7f1af23c2996933d42f67b1fa79f14fc67e9acf1377a3",
+    "packages/core/src/next/exec/kernels/temporal-text.ts": "3e611a33698cceaa44837acfd8ca55f0b30a4e5c32588c4903549f27db545437",
+    "packages/core/src/next/exec/plan.ts": "d79a53a69008c3d488de4b61a9b49a5f6c04e01507d48d88517b50183bcfc337",
+    "packages/core/src/next/ir/json-expression.ts": "5675760c5bc60dbefe6be5b21c64968edddf72e7c5535511896870d10815a3e1",
+    "packages/core/src/next/lower/expressions.ts": "0ee2fb9ec01a5a17141e6baf9c442f2a331293dc81f842d3e3be3c67cfab5203",
+    "packages/core/src/next/memory/README.md": "6cd110806b188faeae6182035cf103dcac024176401dc97af045499adf67cae9",
+    "packages/core/src/next/temporal-text.ts": "7ec9bf5fa25caf20542407c736007384a2a8b2c4f526f44d67dcadd0ff5f4a87",
+    "packages/core/src/next/vector/array-value.ts": "493d517bf77b04469d8dbf6b7e4d250e0b307aec96d9987bdd6abfd8b3adc4f8",
+    "packages/core/src/testing/reach.ts": "8f06e48b5b159773984c5649ffcd9e26a0d39bd4dab940d9b8a66fc7fa854a26"
+  },
+  "raw": "/home/eric/.cache/b4-text-output",
+  "full_gate": "Full frozen-tip lead gate follows commit; base rebase gate already GREEN726files5958tests plus6345SQLqueries"
+}
