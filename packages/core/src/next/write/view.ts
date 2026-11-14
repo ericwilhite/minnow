@@ -1463,6 +1463,12 @@ export class ViewIndex implements IndexReader {
     return rows;
   }
 
+  planProbe(key: Uint8Array): IndexRangePlan {
+    this.table.snapshot.check();
+    if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
+    return planIndexRange(this, prefixRange(key), "asc");
+  }
+
   planRange(range: KeyRange, direction: "asc" | "desc"): IndexRangePlan {
     this.table.snapshot.checkRead();
     if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);

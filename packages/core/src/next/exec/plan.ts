@@ -1,3 +1,4 @@
+import { cursorMinimum, runIndexAccess, indexExpressions, indexMetadata } from "./index-access.js";
 import {
   UpsertWriter,
   UpsertExpressions,
@@ -590,7 +591,7 @@ export interface CompileOptions {
   /** Keep the external ordered-set recipe for diagnostics. */
   readonly groupedPercentiles?: boolean;
   readonly lateSort?: boolean;
-  /** False retains generic SQL sorting; true also permits legacy diagnostic cursors/IR. */
+  /** True keeps the legacy unbounded diagnostic cursor recipe as a benchmark control. */
   readonly keyOrder?: boolean;
   readonly lateFetchOnce?: boolean;
   readonly groupTopN?: boolean;
@@ -636,7 +637,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     throw new UnsupportedPlanError("init plans", { construct: "initPlan" });
   const admissions: Array<{
     rel: OperatorIdentity;
-    minimum: number | ((cap: number) => number);
+    minimum: number | ((cap: number, runtime: QueryRuntime) => number);
     owner: number;
     loanSlots: number;
   }> = [];
@@ -659,7 +660,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     );
   const fixed = (
     rel: OperatorIdentity,
-    minimum: number | ((cap: number) => number),
+    minimum: number | ((cap: number, runtime: QueryRuntime) => number),
     owner = rel.id,
     loanSlots = 0,
   ) => admissions.push({ rel, minimum, owner, loanSlots });
@@ -1051,37 +1052,75 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           return child(runtime, spool, stops);
         };
       }
+      case "keyLookup":
       case "indexRange": {
-        if (options.keyOrder !== true)
-          throw new UnsupportedPlanError(
-            "index range requires the diagnostic keyOrder opt-in; the cursor and fetch lack query-minimum integration",
-            {
-              construct: "indexRange",
-            },
-          );
-        if (rel.lower !== null || rel.upper !== null || rel.emitLocator)
-          throw new UnsupportedPlanError("bounded or locator-producing index range", {
-            construct: "indexRange",
-          });
-        const shape: IndexShape = {
+        if (
+          options.keyOrder === true &&
+          rel.op === "indexRange" &&
+          rel.lower === null &&
+          rel.upper === null &&
+          !rel.emitLocator
+        ) {
+          const shape: IndexShape = {
+            tableId: rel.tableId,
+            columns: rel.columns,
+            types: types(rel),
+            source: { id: nextPhysicalId++, op: "indexRange", profileAs: rel },
+            fetch: rel,
+            restore: { id: nextPhysicalId++, op: "sort", profileAs: rel },
+            descending: rel.descending,
+          };
+          const placeholders = indexMinimums(shape, 1);
+          for (let i = 0; i < placeholders.length; i++) {
+            const entry = placeholders[i];
+            if (!entry) throw new Error("index minimum");
+            fixed(entry.rel, (cap) => indexMinimums(shape, cap)[i]?.minimum ?? 0, rel.id);
+          }
+          return (runtime, sink, stops, demand) =>
+            runIndexOrder(runtime, sink, shape, rel.indexId, null, 0, demand, () =>
+              stops.some((stop) => stop()),
+            );
+        }
+        const input = types(rel).slice(0, rel.columns.length);
+        const compiler = measureCompilerBuffers(
+          compilation,
+          [],
+          BATCH_ROWS,
+          (context) => indexExpressions(rel, context),
+          () => undefined,
+        );
+        const extra = indexMetadata(rel) + compiler + BATCH_ROWS * 32 + 32768;
+        const minimum = (cap: number, runtime: QueryRuntime) =>
+          extra + batchTargetFor(cap, 4) + cursorMinimum(runtime, rel);
+        readSources.set(rel.id, {
+          id: rel.id,
           tableId: rel.tableId,
           columns: rel.columns,
-          types: types(rel),
-          source: { id: nextPhysicalId++, op: "indexRange", profileAs: rel },
-          fetch: rel,
-          restore: { id: nextPhysicalId++, op: "sort", profileAs: rel },
-          descending: rel.descending,
-        };
-        const placeholders = indexMinimums(shape, 1);
-        for (let i = 0; i < placeholders.length; i++) {
-          const entry = placeholders[i];
-          if (!entry) throw new Error("index minimum");
-          fixed(entry.rel, (cap) => indexMinimums(shape, cap)[i]?.minimum ?? 0, rel.id);
-        }
-        return (runtime, sink, stops, demand) =>
-          runIndexOrder(runtime, sink, shape, rel.indexId, null, 0, demand, () =>
-            stops.some((stop) => stop()),
-          );
+          types: input,
+          stagingBytes: memoryScanBufferBytes(input),
+          windowBytes: 0,
+          rows: null,
+        });
+        fixed(rel, minimum, rel.id, 1);
+        compoundColumns.set(rel.id, variableColumns(input));
+        compoundCopies.set(rel.id, 8);
+        const sort =
+          rel.op === "keyLookup"
+            ? { id: nextPhysicalId++, op: "sort" as const, profileAs: rel }
+            : null;
+        const sortMinimum = sortMinimumBytes([{ kind: "float64" }]);
+        if (sort) fixed(sort, sortMinimum, rel.id);
+        return (runtime, downstream, stops) =>
+          stops.some((stop) => stop())
+            ? downstream.finish()
+            : runIndexAccess(
+                runtime,
+                rel,
+                counted(runtime, rel, downstream),
+                minimum(runtime.request.governor.capBytes, runtime),
+                sort,
+                sortMinimum,
+              );
       }
       case "recursive": {
         validateRecursive(rel);
@@ -3176,7 +3215,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         minimum:
           typeof entry.minimum === "number"
             ? entry.minimum
-            : entry.minimum(runtime.request.governor.capBytes),
+            : entry.minimum(runtime.request.governor.capBytes, runtime),
       }));
     // At most one unfinished JSON producer is active. Completed children are delivered
     // from files, while unopened ancestors/EXCEPT siblings have no native JSON buffers.

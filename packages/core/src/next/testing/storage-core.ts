@@ -16,6 +16,7 @@ import type { WireDictionary, WireFlat } from "../exec/result.js";
 import { bindParameter } from "../exec/parameters.js";
 import { ColumnStore } from "../exec/column-store.js";
 import { compileTableRules } from "../exec/rules.js";
+import type { LoweringContext } from "../lower/lowerer.js";
 import { createLowerer } from "../lower/create.js";
 import { ChunkReader } from "../page/reader.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
@@ -38,7 +39,7 @@ export class StorageCore implements NextCore {
     await this.harness.open();
     return this;
   }
-  context() {
+  context(): LoweringContext {
     return {
       catalog: this.harness.path.catalog,
       statistics: { table: () => null },

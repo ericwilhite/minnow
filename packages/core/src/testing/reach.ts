@@ -7659,3 +7659,22 @@ export const MODIFY_UPSERT_REACH = [
   "non-arbiter unique rollback",
   "arbiter assignment refused",
 ] as const;
+
+export const MODIFY_INDEX_REACH = [
+  "keyLookup",
+  "indexRange",
+  "duplicate keys",
+  "text key",
+  "composite key",
+  "inclusive bound",
+  "exclusive bound",
+  "nonunique range",
+  "parameter bounds",
+  "rekey snapshot",
+  "key delete",
+  "range delete",
+  "absent target",
+  "null key",
+  "stored segments",
+  "memory segments",
+] as const;

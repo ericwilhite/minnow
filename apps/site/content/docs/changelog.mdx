@@ -71,7 +71,7 @@ write renderer also invalidates acceleration rather than rejecting accepted rows
 No supported 1.0 stored-format predecessor exists yet.
 
 The unexported rebuild now executes INSERT VALUES, INSERT SELECT, UPDATE and DELETE through
-its native statement writer for scan-based plans. RETURNING reports inserted rows,
+its native statement writer for scans, index lookups and bounded index ranges. RETURNING reports inserted rows,
 new UPDATE values and old DELETE values through charged spillable storage, and delivers
 rows only after the statement succeeds. ON CONFLICT supports primary and unique arbiters,
 permuted composite targets, DO NOTHING (including a bare target), and DO UPDATE with
@@ -79,7 +79,7 @@ EXCLUDED and WHERE. A repeated affected target rolls back the statement; assignm
 arbiter or primary-key columns are refused as in the shipped engine. Proposed rows are
 validated before arbitration: a conflicting DO NOTHING row with a NOT NULL violation is
 rejected, matching PostgreSQL (the shipped engine currently skips that check).
-Index-based modification inputs remain unfinished. Reads use the statement
+Index inputs retain original row locators and suppress repeated probe matches. Reads use the statement
 snapshot; statement errors roll back earlier rows. Unique and foreign-key checks use the
 existing write path. Modification input uses a charged, bounded spill spool; read
 reservations retire before the writer starts, so a writer waiting for memory cannot pin
