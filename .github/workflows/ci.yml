@@ -186,6 +186,10 @@ jobs:
     name: Real browser (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    # Each browser step first runs `tsc -b packages/core --force`, which outgrew Node's default
+    # ~2 GiB heap on the macOS WebKit runners (run 43632940757: heap OOM, exit 134).
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
     strategy:
       fail-fast: false
       matrix:
