@@ -3682,6 +3682,13 @@ kernels staying refused. Other expanding expressions keep their dedicated admiss
 
 ### Native FTS scan route (B7 stage 2)
 
+`exec/fts-plan.ts` owns FTS workspace sizing, query validation, operator construction and
+borrowed-source lifetime fences. The generic planner supplies actual input expressions,
+counted sinks and its grant-aware projection progress hook. Scan batch/row demand and
+aggregate/result admission remain in `plan.ts`; FTS adds small calls to that compiler seam.
+Non-FTS sources skip FTS sizing work. This keeps changes to the common input-size imports
+and scan admission independent of FTS preparation.
+
 `lower/fts.ts` lowers MATCH to the R19 non-strict `fts_match` kernel. BM25 appends a native
 `fts` corpus operator before WHERE, GROUP BY and demand bounds. It accumulates integer N/T/df
 counts over visible input, with a per-document union across repeated columns and prefix terms,
