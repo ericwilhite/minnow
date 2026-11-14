@@ -6459,3 +6459,27 @@ export const CATALOG_VIEW_SOURCES_REACH = [
   "reopen",
   "binding corruption refused",
 ] as const;
+
+export const ROW_RULES_REACH = [
+  "dictionary",
+  "flat",
+  "inactive preserved",
+  "CHECK false",
+  "generated parity",
+  "NULL passes",
+  "generated CHECK dependency",
+  "charged buffers",
+  "selection",
+  "dense",
+  "OLD unchanged",
+  "row error precedence",
+  "expression error",
+] as const;
+export const ROW_RULES_FK_REACH = [
+  "published source",
+  "resident source",
+  "OLD wrapper preserved",
+  "CHECK rollback",
+  "generated recomputed",
+  "statement atomicity",
+] as const;

@@ -710,3 +710,21 @@ same counter as BY DEFAULT (including explicit values); native parity is a requi
 before freeze, alongside the shared row-rule/modify integration. CREATE SEQUENCE options
 (negative increment/CYCLE included) and ALTER TYPE ADD VALUE are already refused by the shipped
 engine. Their native typed refusals remain; no extra support is claimed here.
+
+### Shared row-rule execution (B6 / B5b)
+
+`compileTableRules` retains validation-only immutable programs for the catalog cache. Its
+optional fourth `{charge,capacity,signal}` argument or `bindTableRules` supplies statement-owned
+CHECK/generated kernels. CHECK passes NULL, stops at the first physical row/catalog constraint,
+and evaluates throwing expressions only when reached. Proven total comparisons use batched
+kernels. Generated values are charged, flattened into result-owned buffers, preserve inactive
+slots and include generated IDs when filtering dependent CHECKs. FK actions retain OLD wrappers
+and use the same binding through statement.end(); CHECK errors roll the statement back.
+
+`tableRuleMinimumBytes` measures fixed buffers only; variable output/coefficient growth remains
+charged. Internal ExpressionMemoryError requires caller preflight/re-admission or cancellable
+waiting, never a below-cap SQL refusal. B5b owns that DML routing and general modify enablement.
+A live bound instance must not enter the evictable catalog RuleCache. Existing unsupported
+expression overloads/casts still refuse at binding; defaults/clock/sequences stay caller-owned.
+Generated assignment legality remains in lowering (428C9); FK recomputation is not a user
+assignment. This module introduces no trigger firing or persisted-format change.

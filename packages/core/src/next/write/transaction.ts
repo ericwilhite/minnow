@@ -1804,7 +1804,12 @@ export class TableWriterImpl implements TableWriter {
       const one = new Uint16Array(1);
       const columns: FlatVector[] = this.def.columns.map((column, c) => {
         const k = assigned.get(c);
-        if (k === undefined) return need(old[c]);
+        // Generated outputs replace data in this wrapper. OLD must keep its own wrapper
+        // for deletion, parent-key comparisons and rollback; underlying bytes stay borrowed.
+        if (k === undefined) {
+          const previous = need(old[c]);
+          return generate && column.generatedSql !== null ? { ...previous } : previous;
+        }
         const source = need(sources[k]);
         const chunk = new ColumnChunk(column.type);
         for (const row of source.rows) {
