@@ -1,3 +1,9 @@
+import fc from "fast-check";
+import { seedsFor } from "../src/testing/seeds.js";
+import { createReach, LISTED_REOPEN_CATALOG_REACH } from "../src/testing/reach.js";
+import { decodeCatalogParts } from "../src/next/write/catalog-stream.js";
+import { CatalogBuffers, catalogStorageParts } from "../src/next/write/catalog-storage.js";
+import { Catalog } from "../src/next/write/catalog.js";
 import { expect, it } from "vitest";
 import { buildListedReopenSpace, openListedReopen } from "./next-storage-listed-reopen.js";
 import { MemoryBackend } from "../src/next/storage/memory-store.js";
@@ -70,3 +76,45 @@ it("startup does not walk group roots; the explicit audit still refuses their co
     await opened.close();
   }
 });
+
+for (const seed of seedsFor("next-listed-reopen-catalog", [0xb77a, 0xb77b]))
+  it(`persists native catalog trees through listed publications seed ${String(seed)}`, async () => {
+    const reach = createReach("listed reopen catalog", LISTED_REOPEN_CATALOG_REACH);
+    await fc.assert(
+      fc.asyncProperty(fc.constantFrom(1, 17, 4097), async (groups) => {
+        reach.beginHistory();
+        const backend = new MemoryBackend();
+        await buildListedReopenSpace(backend, groups, 4096);
+        const opened = await openListedReopen(backend);
+        const budget = countingBudget(Infinity);
+        const buffers = new CatalogBuffers(budget);
+        try {
+          const root = decodeManifestRoot(required(opened.space.root), budget);
+          try {
+            const data = await decodeCatalogParts(
+              catalogStorageParts(root.value.catalog, opened.space, budget),
+              buffers,
+            );
+            const catalog = Catalog.fromStored(data, budget);
+            expect(catalog.tableByName("reopen")?.id).toBe(root.value.tables[0]?.tableId);
+            expect(catalog.version).toBe(root.value.catalogVersion);
+            expect(catalog.counters.nextTableId).toBe(root.value.nextTableId);
+            reach.reach("native catalog");
+            expect(root.value.sequence).toBe(groups > 4096 ? 2 : 1);
+            reach.reach(groups > 4096 ? "multiple publications" : "single publication");
+          } finally {
+            budget.free(root.charge);
+          }
+          await opened.space.audit();
+          reach.reach("audit");
+        } finally {
+          buffers.close();
+          await opened.close();
+        }
+        expect(budget.used).toBe(0);
+        reach.reach("no IO charge");
+      }),
+      { seed, numRuns: 8, examples: [[1], [17], [4097]] },
+    );
+    reach.assertReached();
+  });

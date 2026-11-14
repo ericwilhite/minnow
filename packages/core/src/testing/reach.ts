@@ -6010,3 +6010,11 @@ export const HASH_SOURCE_VALUE_REACH = [
   "charged sizing",
   "zero",
 ] as const;
+
+export const LISTED_REOPEN_CATALOG_REACH = [
+  "native catalog",
+  "single publication",
+  "multiple publications",
+  "audit",
+  "no IO charge",
+] as const;

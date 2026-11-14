@@ -3267,7 +3267,9 @@ mutation; it does not claim the write path's separate metadata admission policy 
 
 `MINNOW_NEXT_STORAGE_REOPEN=1` enables the Chromium storage reopen lane in
 `browser-tests/next-storage.spec.ts`: 100k and 1M real, empty-column group roots, one extent per
-group, published in batches of 16,384 through `ExtentListKeeper`. Each of three reopens uses a
+group, published in batches of 16,384 through `ExtentListKeeper`. The fixture writes the native
+MCRT/MCPG catalog tree through the production catalog writer; its manifest never points directly
+at logical MCAT bytes. The unit-lane `browser/next-storage-*.test.ts` checks reopen and audit. Each of three reopens uses a
 fresh worker over the disk-backed profile. It reports backend setup, fence, session/index loading, extent-space
 startup and list-cache bytes read (including coalescing gaps). Root byte counts are separate;
 IndexedDB opens data/log byte spaces with last-record boundary lookups and selects persisted

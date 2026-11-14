@@ -1,6 +1,7 @@
 /** R25 storage startup lane. Real manifest/group codecs, one extent per group, batched publications.
  * Empty-column groups isolate metadata startup from data page I/O. This is not write-path/log replay.
  */
+import { writeCatalogStorage } from "../src/next/write/catalog-storage.js";
 import { Catalog } from "../src/next/write/catalog.js";
 import type { BlobRef } from "../src/next/storage/extents.js";
 import type { StorageBackend } from "../src/next/storage/contract.js";
@@ -51,26 +52,24 @@ export async function buildListedReopenSpace(
     let pages: readonly GroupPageEntry[] = [];
     const groupBytes = encodeGroupRoot({ rowCount: 1, rowIds: { kind: "dense" }, columns: [] });
     // A multiple of GROUPS_PER_PAGE keeps previous directory pages unchanged.
-    const catalogBytes = Catalog.empty()
-      .change(
-        {
-          kind: "createTable",
-          table: {
-            name: "reopen",
-            columns: [],
-            primaryKey: null,
-            unique: [],
-            foreignKeys: [],
-            checks: [],
-          },
+    const catalogData = Catalog.empty().change(
+      {
+        kind: "createTable",
+        table: {
+          name: "reopen",
+          columns: [],
+          primaryKey: null,
+          unique: [],
+          foreignKeys: [],
+          checks: [],
         },
-        1,
-      )
-      .catalog.encode();
+      },
+      1,
+    ).catalog;
     for (let at = 0; at < groups; at += batch) {
       const writer = space.beginWrite("reopen-groups");
       const catalog: BlobRef =
-        root?.catalog ?? required((await writer.write([catalogBytes])).blobs[0]);
+        root?.catalog ?? (await writeCatalogStorage(writer, catalogData, countingBudget(Infinity)));
       const refs: GroupRef[] = [];
       const end = Math.min(groups, at + batch);
       for (let i = at; i < end; i++) {
