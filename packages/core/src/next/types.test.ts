@@ -127,3 +127,8 @@ describe("text widths (ruling R17.4)", () => {
     expect(physicalTypeOfName("DATETIME")).toEqual({ kind: "timestamp", zoned: false });
   });
 });
+
+it("maps an explicit native BYTEA descriptor without treating TEXT as bytes", () => {
+  expect(physicalTypeOf({ type: "string", declaredTypeName: "BYTEA" })).toEqual({ kind: "bytes" });
+  expect(physicalTypeOf({ type: "string", declaredTypeName: "TEXT" })).toEqual({ kind: "text" });
+});

@@ -5816,8 +5816,18 @@ export const CATALOG_MISSING_REACH = [
   "wide",
   "per-value scale",
   "scale-only declaration",
+  "native bytes",
   "length",
   "validity",
   "type",
   "conditional payload",
+] as const;
+
+export const CATALOG_NULL_DECIMAL_REACH = [
+  "live special refused",
+  "live scale refused",
+  "live value",
+  "NULL payload ignored",
+  "scale zero",
+  "scale boundary",
 ] as const;

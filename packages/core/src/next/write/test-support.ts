@@ -64,6 +64,8 @@ function declared(type: PhysicalType): SqlTypeDescriptor {
           ...(type.scale === null ? {} : { scale: type.scale }),
         },
       };
+    case "bytes":
+      return { type: "string", declaredTypeName: "BYTEA" };
     case "text":
       return {
         type: "string",

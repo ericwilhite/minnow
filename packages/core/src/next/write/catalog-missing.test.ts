@@ -94,6 +94,10 @@ function fixture(index: number, value: number): FlatVector {
         specials: null,
       };
       break;
+    case 13:
+      type = { kind: "bytes" };
+      data = { layout: "varlen", offsets: Int32Array.of(0, 2), bytes: Uint8Array.of(255, 0) };
+      break;
     default: {
       const bytes = new TextEncoder().encode("汉".repeat(value % 8));
       type = { kind: "text" };
@@ -107,7 +111,7 @@ for (const seed of seedsFor("next-catalog-missing-shapes", [0xb772, 0xb773]))
     const reach = createReach("catalog missing shape", CATALOG_MISSING_REACH);
     fc.assert(
       fc.property(
-        fc.integer({ min: 0, max: 12 }),
+        fc.integer({ min: 0, max: 13 }),
         fc.integer({ min: 0, max: 3 }),
         fc.integer({ min: 0, max: 32000 }),
         (which, fault, value) => {
@@ -129,6 +133,7 @@ for (const seed of seedsFor("next-catalog-missing-shapes", [0xb772, 0xb773]))
           const restored = Catalog.decode(encodeCatalogStream(stored));
           expect(restored.tables[0]?.columns[0]?.missing).toEqual(vector);
           reach.reach(vector.data.layout);
+          if (vector.type.kind === "bytes") reach.reach("native bytes");
           if (
             vector.type.kind === "decimal" &&
             vector.type.precision === null &&
@@ -171,7 +176,7 @@ for (const seed of seedsFor("next-catalog-missing-shapes", [0xb772, 0xb773]))
         seed,
         numRuns: 32,
         examples: [
-          ...Array.from({ length: 13 }, (_, i) => [i, 0, 1] as [number, number, number]),
+          ...Array.from({ length: 14 }, (_, i) => [i, 0, 1] as [number, number, number]),
           [0, 1, 2],
           [0, 2, 3],
           [0, 3, 4],

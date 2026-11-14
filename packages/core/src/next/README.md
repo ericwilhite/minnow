@@ -176,7 +176,9 @@ record at a time across 256 KiB pages and 64-way indexes, including records cros
 Read/abort/cancel paths return codec IO and temporary graph-validation charges. This does not
 claim new accounting for the existing CatalogView definition residency model.
 
-Catalog admission checks per-kind fields, declared/physical type agreement, exact missing-value
+Native byte columns have an explicit BYTEA catalog descriptor; SQL BYTEA remains refused by the
+front end. Per-slot decimal payloads under SQL NULL stay uninterpreted; active scales/specials
+retain their bounds. Catalog admission checks per-kind fields, declared/physical type agreement, exact missing-value
 shapes and FK support-key coherence. Enforced references require a live matching parent;
 informational references may retain the allocated identity of a dropped parent. MCHG changes
 carry their expected predecessor and live-assigned resulting catalog version. Recovery checks

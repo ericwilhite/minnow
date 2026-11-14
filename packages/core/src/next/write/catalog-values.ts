@@ -127,6 +127,13 @@ export function validateCatalogDeclared(declared: SqlTypeDescriptor, physical: P
     else if (domain.kind === "array") shape(domain, ["kind", "element"]);
     else shape(domain, ["kind"]);
   }
+  if (physical.kind === "bytes")
+    check(
+      declared.sqlDomain === undefined &&
+        declared.declaredLength === undefined &&
+        declared.enumValues === undefined,
+      "A native byte descriptor has conflicting text/domain fields",
+    );
   check(
     samePhysicalType(physicalTypeOf(declared), physical),
     "Declared and physical catalog types differ",
@@ -179,7 +186,8 @@ export function validateCatalogMissing(vector: FlatVector, type: PhysicalType): 
     "Invalid stored missing-vector validity",
   );
   const n = vector.length,
-    data = vector.data;
+    data = vector.data,
+    active = vector.validity === null || ((vector.validity[0] ?? 0) & 1) !== 0;
   check(data.layout === layoutOf(type), "Stored missing-vector layout differs");
   switch (data.layout) {
     case "bool":
@@ -230,7 +238,9 @@ export function validateCatalogMissing(vector: FlatVector, type: PhysicalType): 
       integerData(data.coefficients, n, true);
       check(
         data.scale === null
-          ? data.scales instanceof Uint16Array && data.scales.length === n
+          ? data.scales instanceof Uint16Array &&
+              data.scales.length === n &&
+              (!active || data.scales.every((scale) => scale <= 16383))
           : Number.isInteger(data.scale) &&
               data.scale >= 0 &&
               data.scale <= 16383 &&
@@ -241,7 +251,7 @@ export function validateCatalogMissing(vector: FlatVector, type: PhysicalType): 
         data.specials === null ||
           (data.specials instanceof Uint8Array &&
             data.specials.length === n &&
-            data.specials.every((s) => s <= 3)),
+            (!active || data.specials.every((s) => s <= 3))),
         "Invalid stored decimal specials",
       );
       break;

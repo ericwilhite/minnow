@@ -81,7 +81,7 @@ export interface TextType {
   readonly maxLength?: number;
   readonly fixed?: true;
 }
-/** Arbitrary bytes. Reserved: the current front end has no BYTEA. */
+/** Native bytes, described as BYTEA in catalogs. The SQL front end still refuses BYTEA. */
 export interface BytesType {
   readonly kind: "bytes";
 }
@@ -293,6 +293,8 @@ export function physicalTypeOf(descriptor: SqlTypeDescriptor): PhysicalType {
     case "string": {
       if (descriptor.enumValues !== undefined)
         return { kind: "enum", name: "", labels: [...descriptor.enumValues] };
+      // Native storage can carry bytes even though the SQL parser has no BYTEA surface yet.
+      if (descriptor.declaredTypeName?.toUpperCase() === "BYTEA") return { kind: "bytes" };
       const width = descriptor.declaredLength;
       if (width === undefined) return { kind: "text" };
       return width.fixed
