@@ -779,9 +779,13 @@ export function lowerDdl(statement: NativeStatement, catalog: CatalogView): DdlR
         change: { kind: "createType", type: { name: statement.name, labels: statement.values } },
         followUp: null,
       };
+    case "drop-trigger": {
+      const trigger = catalog.triggers.find((t) => t.name === statement.name);
+      if (!trigger) throw new PlanningError(`trigger "${statement.name}" does not exist`, "42704");
+      return { change: { kind: "dropTrigger", triggerId: trigger.id }, followUp: null };
+    }
     case "create-trigger":
-    case "drop-trigger":
-      throw unsupported("trigger", "triggers");
+      throw new PlanningError("CREATE TRIGGER needs body lowering context", "XX000");
     default:
       throw new PlanningError(`${statement.kind} is not DDL`, "XX000");
   }

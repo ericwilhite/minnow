@@ -183,6 +183,34 @@ it.each(seedsFor("next-catalog-log-shape", [0xb760, 0xb761]))(
       { op: "createFts", fts: ftsDef(1, 1, 1) },
       { op: "upsertFts", fts: ftsDef(1, 1, 1) },
       { op: "dropFts", ftsId: 1 },
+      {
+        op: "createTrigger",
+        trigger: {
+          id: 1,
+          name: "tr",
+          tableId: 1,
+          event: "insert",
+          timing: "after",
+          dialectVersion: 1,
+          statements: [
+            {
+              sql: "INSERT INTO sink DEFAULT VALUES",
+              kind: "insert",
+              targetTableId: 2,
+              targetName: "sink",
+              bindings: [],
+              columns: [],
+              insertColumnIds: [],
+              defaultColumnIds: [],
+              implicitArity: null,
+              assignedColumnIds: [],
+              typeIds: [],
+              sequenceIds: [],
+            },
+          ],
+        },
+      },
+      { op: "dropTrigger", triggerId: 1 },
     ];
     const operations: LoggedChange[] = inputs.map((operation) => ({
       ...operation,

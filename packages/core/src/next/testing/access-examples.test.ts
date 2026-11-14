@@ -149,6 +149,7 @@ const catalog: CatalogView = {
   views: [],
   types: [],
   fts: [],
+  triggers: [],
   table: () => undefined,
   tableByName: () => undefined,
   sequence: () => undefined,

@@ -98,7 +98,9 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 449.875 * 1024;
 // Native ALWAYS identity / DEFAULT provenance: 1,587,517 raw bytes. Raw cap +512 once;
 // gzip, standalone client and all isolation assertions stay unchanged.
 const INDEXEDDB_WORKER_RAW_BUDGET = 1550.5 * 1024;
-const INDEXEDDB_WORKER_GZIP_BUDGET = 447.25 * 1024;
+// Native trigger-name folding: 1,587,617 raw / 457,994 gzip bytes (+100 / +28).
+// The old gzip cap is exceeded by 10 bytes. Raise once by 128; raw and isolation caps stay.
+const INDEXEDDB_WORKER_GZIP_BUDGET = 447.375 * 1024;
 // What a page that hosts the engine in a worker ships on the main thread: the client, the schema
 // DSL and error classes, the Kysely dialect and live queries, and the React hooks, with `kysely`
 // and `react` left to the application. 105.9 KiB raw / 31.6 KiB gzip.

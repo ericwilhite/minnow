@@ -32,6 +32,7 @@
  *   created; its `parentIndexId` is then `"primary"` or `{ unique: name }` of the same input.
  */
 import type { SqlTypeDescriptor, PhysicalType } from "../types.js";
+import type { TriggerDef } from "./trigger-def.js";
 import type { FtsDef } from "./fts-def.js";
 import type { FlatVector } from "../vector/vector.js";
 
@@ -43,6 +44,7 @@ export interface CatalogView {
   /** Named types (ruling R17.7). */
   readonly types: readonly TypeDef[];
   readonly fts: readonly FtsDef[];
+  readonly triggers: readonly TriggerDef[];
   type(typeId: number): TypeDef | undefined;
   typeByName(name: string): TypeDef | undefined;
   /** By id; undefined when absent (dropped ids are never reused). */
@@ -234,7 +236,9 @@ export type CatalogChange =
   | { readonly kind: "dropType"; readonly typeId: number }
   | { readonly kind: "createFts"; readonly fts: Omit<FtsDef, "id"> }
   | { readonly kind: "upsertFts"; readonly fts: FtsDef }
-  | { readonly kind: "dropFts"; readonly ftsId: number };
+  | { readonly kind: "dropFts"; readonly ftsId: number }
+  | { readonly kind: "createTrigger"; readonly trigger: Omit<TriggerDef, "id"> }
+  | { readonly kind: "dropTrigger"; readonly triggerId: number };
 
 /**
  * A table definition as DDL supplies it. Existing columns, indexes and constraints keep their ids

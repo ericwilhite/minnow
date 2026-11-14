@@ -2297,6 +2297,11 @@ export function compileStatement(sql: string): CompiledStatement {
       (keyword === "CREATE" || keyword === "DROP") &&
       second?.kind === "identifier" &&
       second.text.toUpperCase() === "TRIGGER";
+    if (recordDeclaredTypes && isTriggerDdl) {
+      const name = tokens[2];
+      if (name?.kind === "identifier" && name.quoted !== true)
+        tokens[2] = { ...name, text: name.text.toLowerCase() };
+    }
     if (!isTriggerDdl) rejectSemicolons(tokens);
     if (
       keyword === "BEGIN" ||

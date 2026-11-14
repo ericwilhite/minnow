@@ -5,8 +5,10 @@ import { pauseIfDue, type TaskWork } from "../task.js";
 import {
   CATALOG_NATIVE_GRAMMAR as grammar,
   CATALOG_FTS_FEATURE,
+  CATALOG_TRIGGER_FEATURE,
   CATALOG_RECORD_KINDS as kinds,
 } from "../durable-format.js";
+import type { TriggerDef } from "../access/trigger-def.js";
 import type { FtsDef } from "../access/fts-def.js";
 import type { TableDef, SequenceDef, ViewDef, TypeDef } from "../access/catalog.js";
 import type { CatalogCounters, LoggedChange } from "./catalog.js";
@@ -31,6 +33,7 @@ export interface CatalogStreamData {
   readonly views: readonly ViewDef[];
   readonly types: readonly TypeDef[];
   readonly fts: readonly FtsDef[];
+  readonly triggers: readonly TriggerDef[];
   /** Unknown display fields from the metadata record; never consulted for semantics. */
   readonly wireMetadata?: unknown;
 }
@@ -45,6 +48,7 @@ const sections = [
   ["sequence", "sequences"],
   ["view", "views"],
   ["namedType", "types"],
+  ["trigger", "triggers"],
   ["fts", "fts"],
 ] as const;
 const HEADER_BYTES = 16;
@@ -85,7 +89,10 @@ function metadata(data: CatalogStreamData): Metadata {
   const result = {
     version: data.version,
     counters: data.counters,
-    requiredFeatures: data.fts.length ? [CATALOG_FTS_FEATURE] : [],
+    requiredFeatures: [
+      ...(data.fts.length ? [CATALOG_FTS_FEATURE] : []),
+      ...(data.triggers.length ? [CATALOG_TRIGGER_FEATURE] : []),
+    ],
     sections: sections.map(([kind, key]) => ({ kind: kinds[kind], count: data[key].length })),
   };
   retainCatalogExtensions(data.wireMetadata, result);
@@ -160,11 +167,25 @@ function checkMetadata(value: unknown): Metadata {
     check(feature > previousFeature, "Duplicate/out-of-order catalog required feature");
     previousFeature = feature;
   }
-  if (meta.requiredFeatures.some((feature) => feature !== CATALOG_FTS_FEATURE))
+  if (
+    meta.requiredFeatures.some(
+      (feature) => feature !== CATALOG_FTS_FEATURE && feature !== CATALOG_TRIGGER_FEATURE,
+    )
+  )
     throw new UnsupportedCatalogError(`features ${meta.requiredFeatures.join(",")}`);
   check(meta.sections.length === sections.length, "Catalog section set is incomplete");
   for (const [i, [kind]] of sections.entries())
     check(meta.sections[i]?.kind === kinds[kind], "Duplicate/out-of-order catalog section");
+  for (const [kind, feature] of [
+    [kinds.fts, CATALOG_FTS_FEATURE],
+    [kinds.trigger, CATALOG_TRIGGER_FEATURE],
+  ] as const) {
+    const present = (meta.sections.find((s) => s.kind === kind)?.count ?? 0) > 0;
+    check(
+      meta.requiredFeatures.includes(feature) === present,
+      "Catalog feature/section disagreement",
+    );
+  }
   return meta;
 }
 export function decodeCatalogStream(bytes: Uint8Array): CatalogStreamData {
@@ -177,6 +198,7 @@ export function decodeCatalogStream(bytes: Uint8Array): CatalogStreamData {
     views: [],
     types: [],
     fts: [],
+    triggers: [],
   };
   for (const [i, [kind, key]] of sections.entries()) {
     const count = meta.sections[i]?.count;
@@ -200,6 +222,7 @@ export function decodeCatalogStream(bytes: Uint8Array): CatalogStreamData {
     views: groups.views as ViewDef[],
     types: groups.types as TypeDef[],
     fts: groups.fts as FtsDef[],
+    triggers: groups.triggers as TriggerDef[],
     wireMetadata: meta,
   };
 }
@@ -330,6 +353,7 @@ export async function decodeCatalogParts(
       views: [],
       types: [],
       fts: [],
+      triggers: [],
     };
     for (const [i, [kind, key]] of sections.entries()) {
       const count = meta.sections[i]?.count;
@@ -349,6 +373,7 @@ export async function decodeCatalogParts(
       views: groups.views as ViewDef[],
       types: groups.types as TypeDef[],
       fts: groups.fts as FtsDef[],
+      triggers: groups.triggers as TriggerDef[],
       wireMetadata: meta,
     };
   } finally {

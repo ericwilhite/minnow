@@ -253,14 +253,16 @@ for (const seed of seedsFor("next-fts-independent-stream", [0xb81f, 0xb820]))
             [6, Uint8Array.of(1)],
             [7, Uint8Array.of(1)],
             [8, Uint8Array.of(count + 1)],
+            [9, Uint8Array.of(1)],
           ]);
           const sections = new ByteWriter();
-          sections.varuint(5);
+          sections.varuint(6);
           for (const [kind, n] of [
             [3, 1],
             [12, 0],
             [14, 0],
             [15, 0],
+            [20, 0],
             [21, count],
           ] as const)
             sections.raw(
@@ -304,7 +306,7 @@ for (const seed of seedsFor("next-fts-catalog-features", [0xb821, 0xb822]))
     fc.assert(
       fc.property(
         fc.integer({ min: 2, max: 20 }),
-        fc.integer({ min: 2, max: Number.MAX_SAFE_INTEGER }),
+        fc.integer({ min: 3, max: Number.MAX_SAFE_INTEGER }),
         (copies, future) => {
           reach.beginHistory();
           for (const [name, features] of [
@@ -316,7 +318,7 @@ for (const seed of seedsFor("next-fts-catalog-features", [0xb821, 0xb822]))
               version: 0,
               counters: empty.counters,
               requiredFeatures: features,
-              sections: [3, 12, 14, 15, 21].map((kind) => ({ kind, count: 0 })),
+              sections: [3, 12, 14, 15, 20, 21].map((kind) => ({ kind, count: 0 })),
             });
             try {
               const out = new ByteWriter();

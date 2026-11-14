@@ -236,6 +236,8 @@ export const DURABLE_CODECS = {
     "upsertFts",
     "dropFts",
     "alterTable",
+    "createTrigger",
+    "dropTrigger",
   ],
   jsonNumber: ["NaN", "Infinity", "-Infinity", "-0"],
   indexKeyLimit: ["scalar", "tuple"],
@@ -311,9 +313,13 @@ export const CATALOG_RECORD_KINDS = {
   ftsCoverage: 27,
   ftsState: 28,
   viewSource: 29,
+  triggerBody: 30,
+  triggerBinding: 31,
+  triggerColumn: 32,
 } as const;
 
 export const CATALOG_FTS_FEATURE = 1;
+export const CATALOG_TRIGGER_FEATURE = 2;
 export const CATALOG_RECORD_SCHEMAS = {
   catalog: ["version:u", "counters:counters", "requiredFeatures:[u]", "sections:[section]"],
   counters: [
@@ -325,6 +331,7 @@ export const CATALOG_RECORD_SCHEMAS = {
     "nextViewId:u",
     "nextTypeId:u",
     "nextFtsId:u",
+    "nextTriggerId:u",
   ],
   table: [
     "id:u",
@@ -465,7 +472,34 @@ export const CATALOG_RECORD_SCHEMAS = {
     "version:u",
     "fts:fts~",
     "ftsId:u~",
+    "trigger:trigger~",
+    "triggerId:u~",
   ],
+  trigger: [
+    "id:u",
+    "name:s",
+    "tableId:u",
+    "event:s",
+    "timing:s",
+    "dialectVersion:u",
+    "statements:[triggerBody]",
+  ],
+  triggerBody: [
+    "sql:s",
+    "kind:s",
+    "targetTableId:u",
+    "targetName:s",
+    "bindings:[triggerBinding]",
+    "columns:[triggerColumn]",
+    "insertColumnIds:[u]",
+    "defaultColumnIds:[u]",
+    "implicitArity:u?",
+    "assignedColumnIds:[u]",
+    "typeIds:[u]",
+    "sequenceIds:[u]",
+  ],
+  triggerBinding: ["columnId:u", "name:s", "type:physical", "source:s"],
+  triggerColumn: ["columnId:u", "name:s", "type:physical"],
   fts: [
     "id:u",
     "tableId:u",
@@ -519,6 +553,8 @@ export const CATALOG_CHANGE_FIELDS = {
   createFts: ["fts"],
   upsertFts: ["fts"],
   dropFts: ["ftsId"],
+  createTrigger: ["trigger"],
+  dropTrigger: ["triggerId"],
 } as const;
 
 export const DURABLE_FORMATS = {

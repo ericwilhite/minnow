@@ -192,8 +192,9 @@ version gaps from rolled-back DDL. DROP TABLE carries its MCHG definition too.
 The manifest names the catalog tree, not a JSON blob. Reachability checks child depth and
 summaries plus contiguous fragment offsets, and reclamation retires every old index/data page.
 The reader/manifest/commit-body development selectors are 5/6/4; older unpublished selectors
-refuse. The released 1.0 format has no supported predecessor yet. Trigger family20 remains
-reserved. FTS declarations persist without making an index ready. Snapshot catalog frame
+refuse. The released 1.0 format has no supported predecessor yet. Trigger family20 now carries dialect-versioned bodies and stable OLD/NEW/target dependencies
+(body30/binding31/column32). Definitions and CREATE/DROP lowering persist through WAL and
+checkpoint; trigger scheduling/body execution is the next integration unit. FTS declarations persist without making an index ready. Snapshot catalog frame
 adapters are a separate integration step over the same portable MCAT stream.
 
 ### Relational catalog and managed migration
@@ -222,7 +223,8 @@ horizon; unused reserved values may be skipped after recovery.
 
 Limits: general `modify` IR execution is still outside this catalog stage. SQL/DSL definition
 and query differentials use PGlite; native TableWriter/persistence tests do not claim SQL DML
-execution. ALWAYS identity and identity options refuse with 0A000 instead of losing the clause.
+execution. ALWAYS identity retains its generation mode and rejects explicit assignments; identity options
+still refuse with 0A000 instead of losing the clause.
 Named enums that shadow an underlying built-in `pg_type` name require SQL namespaces and
 explicitly refuse; quoted aliases such as `"integer"` retain their separate enum identity.
 Named types accept at most 65,536 labels (the current two-byte native sort rank), each at
