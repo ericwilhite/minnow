@@ -6105,6 +6105,14 @@ export const FTS_ARRAY_RENDER_REACH = [
   "drained",
 ] as const;
 
+export const FTS_SELECTOR_REACH = [
+  "reader4 barrier",
+  "manifest5 barrier",
+  "commit body3",
+  "wide sequence preserved",
+  "checksummed roundtrip",
+] as const;
+
 export const ARRAY_VISITOR_REACH = [
   "empty",
   "nonempty",

@@ -1,6 +1,6 @@
 /**
  * Byte codecs of the manifest (ruling R15.3): the root, the paged group directory and the group
- * root. Shapes are format/manifest.ts: manifest version3; other blob grammars version1.
+ * root. Shapes are format/manifest.ts: manifest version5; other blob grammars version1.
  *
  * ## Common rules
  * - Every blob starts with a 4-byte magic and a version byte; integers are varints (bytes.ts).

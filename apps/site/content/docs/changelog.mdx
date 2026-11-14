@@ -49,7 +49,9 @@ Informational foreign keys may retain a dropped parent across checkpoint and reo
 safe-integer payloads reject nonfinite, fractional, unsafe and negative-zero values; NULL payloads
 stay uninterpreted. Reserved semantic FTS fields refuse even when marked optional.
 This changes unreleased
-rebuild bytes only (reader 3, manifest 4, commit body 2); no supported next/ writer has shipped.
+rebuild bytes only (reader 4, manifest 5, commit body 3); no supported next/ writer has shipped.
+The next development selectors are allocated for native FTS metadata before its grammars
+and catalog support land. This allocation alone does not add a ready-index query route.
 The published 0.x engine and its stored formats are unchanged; no migration is needed.
 
 The unexported rebuild can retry an over-cap memory-source recipe by retaining one
