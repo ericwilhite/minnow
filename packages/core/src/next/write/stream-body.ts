@@ -1,4 +1,6 @@
-/** Existing version-1 commit bytes, projected a frame at a time without materialized columns. */
+/** Registered commit bytes projected a frame at a time without materialized columns. */
+import { DURABLE_CODECS, DURABLE_FORMATS } from "../durable-format.js";
+import { catalogChangeByteLength, writeCatalogChange } from "./catalog-stream.js";
 import type { CommitRequest } from "../access/write-path.js";
 import type { FlatVector } from "../vector/vector.js";
 import type { LoggedChange } from "./catalog.js";
@@ -8,6 +10,7 @@ import type { PublishedRows, TransactionImpl, Undo } from "./transaction.js";
 import { need } from "./bytes.js";
 import { taskClock, yieldTask } from "../exec/pipeline.js";
 import { ByteWindow } from "./window.js";
+const KIND = DURABLE_CODECS.effect;
 
 async function pause(check: () => void): Promise<void> {
   check();
@@ -305,7 +308,7 @@ export async function streamBody(
   check: () => void = () => undefined,
   order?: Int32Array,
 ): Promise<number> {
-  writer.u8(1);
+  writer.u8(DURABLE_FORMATS.commitBody.version);
   if (request === null) writer.u8(0);
   else {
     writer.u8(1);
@@ -328,18 +331,23 @@ export async function streamBody(
     switch (effect.kind) {
       case "catalog": {
         const change = effect.change;
-        if (change.op === "dropTable") {
-          writer.u8(3);
-          writer.varuint(change.tableId);
-        } else {
-          writer.u8(change.op === "createTable" ? 1 : 4);
-          if (change.op === "createTable") writer.varuint(change.table.id);
-          await jsonBlob(writer, change, check);
-        }
+        writer.u8(
+          change.op === "dropTable"
+            ? KIND.dropTable
+            : change.op === "createTable"
+              ? KIND.createTable
+              : KIND.catalog,
+        );
+        if (change.op === "dropTable") writer.varuint(change.tableId);
+        if (change.op === "createTable") writer.varuint(change.table.id);
+        const length = catalogChangeByteLength(change);
+        writer.varuint(length);
+        if (writer.intersects(length)) writeCatalogChange(writer, change);
+        else writer.skip(length);
         break;
       }
       case "published":
-        writer.u8(7);
+        writer.u8(KIND.publishedRows);
         writer.varuint(effect.memtable.tableId);
         writer.varuint(effect.memtable.schemaVersion);
         writer.varuint(effect.names.transaction);
@@ -349,7 +357,7 @@ export async function streamBody(
         break;
       case "inserts": {
         const { memtable, from, count } = effect;
-        writer.u8(6);
+        writer.u8(KIND.rows);
         writer.varuint(memtable.tableId);
         writer.varuint(memtable.schemaVersion);
         writer.u8(1);
@@ -369,7 +377,7 @@ export async function streamBody(
         break;
       }
       case "deletes": {
-        writer.u8(6);
+        writer.u8(KIND.rows);
         writer.varuint(effect.tableId);
         writer.varuint(effect.schemaVersion);
         writer.u8(0);

@@ -130,6 +130,13 @@ import { MemtableMemoryError } from "./bytes.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { ByteWriter } from "./bytes.js";
 import { Catalog, decodeLogged, type LoggedChange } from "./catalog.js";
+import {
+  CatalogBuffers,
+  catalogStorageParts,
+  catalogStorageEvents,
+  writeCatalogStorage,
+} from "./catalog-storage.js";
+import { decodeCatalogParts } from "./catalog-stream.js";
 import { decodeColumn, isNullAt, MEMORY_CHUNK_ROWS } from "./columns.js";
 import { IDLE_FLUSH_MS, LogAppender, type LogPosition } from "./log.js";
 import { BlobCache, fullBlobKey } from "../format/blob-cache.js";
@@ -776,8 +783,19 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (space.root === null) {
         lists = new ExtentListKeeper([], { reader: space, budget: grant });
         catalog = Catalog.empty();
-        const writer = space.beginWrite("initial root");
-        const written = await writer.write([catalog.encode()]);
+        const { writer, catalogRef } = await metadataBudget.retry(
+          async () => {
+            const writer = space.beginWrite("initial root");
+            const catalogRef = await writeCatalogStorage(
+              writer,
+              catalog,
+              metadataBudget,
+              input.options.signal,
+            );
+            return { writer, catalogRef };
+          },
+          () => input.options.signal?.throwIfAborted(),
+        );
         const salt = (crypto.getRandomValues(new Uint32Array(1))[0] ?? 1) >>> 0;
         root = {
           formatVersion: MANIFEST_FORMAT_VERSION,
@@ -786,7 +804,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           log: { salt, firstLsn: 1, rootSequence: 1 },
           globalLsn: 0,
           catalogVersion: 0,
-          catalog: need(written.blobs[0]),
+          catalog: catalogRef,
           nextTableId: 1,
           sequences: [],
           tables: [],
@@ -843,8 +861,30 @@ export class WritePathImpl implements WritePath, EngineHooks {
         root = parsed.value;
         // Built from the durable root's list, never from earlier callbacks (ruling R25).
         lists = new ExtentListKeeper(root.extentList, { reader: space, budget: grant });
-        catalog = Catalog.decode(await readBlob(space, root.catalog, grant));
+        catalog = await metadataBudget.retry(
+          async () => {
+            const buffers = new CatalogBuffers(metadataBudget);
+            try {
+              return Catalog.fromStored(
+                await decodeCatalogParts(
+                  catalogStorageParts(root.catalog, space, metadataBudget, input.options.signal),
+                  buffers,
+                  input.options.signal ? { signal: input.options.signal } : undefined,
+                ),
+                metadataBudget,
+              );
+            } finally {
+              buffers.close();
+            }
+          },
+          () => input.options.signal?.throwIfAborted(),
+        );
       }
+      if (
+        catalog.version !== root.catalogVersion ||
+        catalog.counters.nextTableId !== root.nextTableId
+      )
+        throw new ManifestCorruptionError("Catalog version/counters disagree with manifest root");
       engine = new WritePathImpl(input, credits, grant, commitBuffers, root, catalog, {
         grant: metadataGrant,
         budget: metadataBudget,
@@ -1093,6 +1133,25 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const effects: Effect[] = body.effects.map((effect) => replayEffect(effect));
     if (body.request !== null) effects.push({ kind: "request" });
     const decisions = replayer.next(lsn, effects);
+    // Validate the entire atomic catalog chain before applying any row/sequence/catalog effect.
+    let predecessor = this.#catalog.version;
+    let firstCatalog = true;
+    for (let i = 0; i < body.effects.length; i++) {
+      const effect = need(body.effects[i]);
+      if (
+        decisions[i] &&
+        (effect.kind === "catalog" || effect.kind === "createTable" || effect.kind === "dropTable")
+      ) {
+        const change = need(decodeCatalogEffect(effect));
+        if (
+          change.expectedVersion !== predecessor ||
+          (firstCatalog && change.version <= predecessor)
+        )
+          throw new LogCorruptionError("A logged catalog change has the wrong predecessor");
+        predecessor = change.version;
+        firstCatalog = false;
+      }
+    }
     let published: Set<number> | null = null;
     for (let k = 0; k < body.effects.length; k++) {
       if (decisions[k] !== true) continue;
@@ -1140,12 +1199,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   async #replayCatalog(effect: BodyEffect, lsn: number): Promise<void> {
-    let change: LoggedChange;
-    if (effect.kind === "dropTable") change = { op: "dropTable", tableId: effect.tableId };
-    else if (effect.kind === "createTable" || effect.kind === "catalog")
-      change = decodeLogged(effect.definition);
-    else return;
-    const catalog = this.#catalog.apply(change, ++this.#version);
+    const change = decodeCatalogEffect(effect);
+    if (change === null) return;
+    const catalog = this.#catalog.apply(change, change.version);
+    this.#version = Math.max(this.#version, change.version);
     this.#catalog = catalog;
     this.#catalogHistory.push({ lsn, catalog });
     if (change.op === "createTable") {
@@ -4564,8 +4621,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
         throw new TypeError("A root must carry every table root it publishes (see #flushable)");
     let catalogRef = this.#root.catalog;
     if (catalog.version !== this.#root.catalogVersion) {
-      catalogRef = need((await writer.write([catalog.encode()])).blobs[0]);
-      retired.push(this.#root.catalog.extent);
+      catalogRef = await writeCatalogStorage(writer, catalog, this.#metadataBudget, this.#signal);
+      const oldCatalog: ExtentRef[] = [];
+      for await (const event of catalogStorageEvents(
+        this.#root.catalog,
+        this.#space,
+        this.#metadataBudget,
+        this.#signal,
+      ))
+        oldCatalog.push(event.ref.extent);
+      retireOnce(retired, oldCatalog);
     }
     const tables: TableRoot[] = [];
     for (const def of catalog.tables) {
@@ -4699,10 +4764,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const seen = new Set<string>();
     // Use the worker deadline across tables, publications and prior exec/write work.
     // A cached metadata promise is not a task boundary.
-    for await (const reached of walkReachable(
-      single,
-      manifestReader(this.#metadata, this.#grant),
-    )) {
+    for await (const reached of walkReachable(single, manifestReader(this.#metadata, this.#grant), {
+      skipCatalog: true,
+    })) {
       this.#check();
       this.#signal?.throwIfAborted();
       if (taskClock.due()) {
@@ -5054,4 +5118,20 @@ class DeltaPublication {
 /** `openWritePath` (access/write-path.ts `OpenWritePath`). */
 export async function openWritePath(input: OpenWritePathInput): Promise<WritePath> {
   return WritePathImpl.open(input);
+}
+
+/** A WAL table effect and its MCHG definition must name the same operation and identity. */
+function decodeCatalogEffect(effect: BodyEffect): LoggedChange | null {
+  if (effect.kind !== "catalog" && effect.kind !== "createTable" && effect.kind !== "dropTable")
+    return null;
+  const change = decodeLogged(effect.definition);
+  if (
+    (effect.kind === "createTable" &&
+      (change.op !== "createTable" || change.table.id !== effect.tableId)) ||
+    (effect.kind === "dropTable" &&
+      (change.op !== "dropTable" || change.tableId !== effect.tableId)) ||
+    (effect.kind === "catalog" && (change.op === "createTable" || change.op === "dropTable"))
+  )
+    throw new LogCorruptionError("A catalog effect disagrees with its logged definition");
+  return change;
 }

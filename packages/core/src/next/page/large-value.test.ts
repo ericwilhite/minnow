@@ -1,3 +1,5 @@
+import { writeTestCatalog } from "../format/catalog-test-support.js";
+import { MANIFEST_FORMAT_VERSION } from "../durable-format.js";
 /**
  * Out-of-line large values (ruling R15.4, large-value.ts): written as ≤ 1 MiB parts through the
  * chunk's extent builder, read back with bounded memory (loaded, charged before the read, in
@@ -578,9 +580,9 @@ describe("out-of-line values", () => {
         deletions: null,
       },
     ]);
-    const catalog = defined((await writer.write([new Uint8Array(4)])).blobs[0]);
+    const catalog = await writeTestCatalog(writer);
     const manifest: ManifestRoot = {
-      formatVersion: 3,
+      formatVersion: MANIFEST_FORMAT_VERSION,
       sequence: 1,
       epoch: 1,
       log: { salt: 1, firstLsn: 1, rootSequence: 1 },

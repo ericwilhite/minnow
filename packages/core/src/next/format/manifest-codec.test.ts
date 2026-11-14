@@ -1,3 +1,4 @@
+import { MANIFEST_FORMAT_VERSION } from "../durable-format.js";
 import frozenR25 from "./root-r25.fixture.json";
 import { ByteWriter as KeyPointerWriter } from "./bytes.js";
 import { writeKeyPointer } from "./key-pointer.js";
@@ -403,7 +404,7 @@ afterAll(() => {
 
 const manifestRoot: fc.Arbitrary<ManifestRoot> = extents.chain((pool) =>
   fc.record({
-    formatVersion: fc.constant(3),
+    formatVersion: fc.constant(MANIFEST_FORMAT_VERSION),
     sequence: lsn,
     epoch: lsn,
     log: fc.record({ salt: fc.nat({ max: 0xffff_ffff }), firstLsn: lsn, rootSequence: lsn }),
@@ -682,7 +683,7 @@ describe("manifest codec rules", () => {
     expect(() => encodeGroupPage(groups)).toThrow(RangeError);
     expect(encodeGroupPage(groups.slice(0, GROUPS_PER_PAGE)).length).toBeLessThan(1 << 20);
     const huge: ManifestRoot = {
-      formatVersion: 3,
+      formatVersion: MANIFEST_FORMAT_VERSION,
       sequence: 1,
       epoch: 1,
       log: { salt: 1, firstLsn: 1, rootSequence: 1 },
@@ -759,7 +760,7 @@ describe("manifest codec rules", () => {
   it("refuses a root written by a newer format", () => {
     const owner = big;
     const root: ManifestRoot = {
-      formatVersion: 4,
+      formatVersion: MANIFEST_FORMAT_VERSION + 1,
       sequence: 1,
       epoch: 1,
       log: { salt: 1, firstLsn: 1, rootSequence: 1 },
@@ -808,7 +809,7 @@ describe("manifest codec rules", () => {
   it("refuses an extent list out of offset order or with a bad page count", () => {
     const page = (first: number, count: number) => ({ blob: ref(big), first, count });
     const rootWith = (extentList: ManifestRoot["extentList"]): ManifestRoot => ({
-      formatVersion: 3,
+      formatVersion: MANIFEST_FORMAT_VERSION,
       sequence: 1,
       epoch: 1,
       log: { salt: 1, firstLsn: 1, rootSequence: 1 },

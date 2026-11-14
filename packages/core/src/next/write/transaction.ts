@@ -544,7 +544,12 @@ function catalogEffect(change: LoggedChange, allocator?: BufferAllocator): BodyE
       tableId: change.table.id,
       definition: encodeLogged(change, allocator),
     };
-  if (change.op === "dropTable") return { kind: "dropTable", tableId: change.tableId };
+  if (change.op === "dropTable")
+    return {
+      kind: "dropTable",
+      tableId: change.tableId,
+      definition: encodeLogged(change, allocator),
+    };
   return { kind: "catalog", definition: encodeLogged(change, allocator) };
 }
 
@@ -790,11 +795,17 @@ export class StatementImpl implements Statement {
   /** Internal, logged and undoable: never drop a key from a planner-ready nonunique index. */
   invalidateIndexes(tableId: number, ids: readonly number[]): MaybePromise<void> {
     const before = this.tx.catalog;
+    const version = this.tx.hooks.nextCatalogVersion();
     const logged: LoggedChange[] = ids
       .filter((id) => before.index(id)?.invalid !== true)
-      .map((indexId) => ({ op: "invalidateIndex", tableId, indexId }));
+      .map((indexId, position) => ({
+        op: "invalidateIndex",
+        tableId,
+        indexId,
+        expectedVersion: position === 0 ? before.version : version,
+        version,
+      }));
     if (logged.length === 0) return;
-    const version = this.tx.hooks.nextCatalogVersion();
     const catalog = logged.reduce((next, change) => next.apply(change, version), before);
     return settle(this.tx.hooks.prepareCatalog(catalog), () => {
       this.tx.undo.push({ kind: "catalog", statement: this.ordinal, before, logged });

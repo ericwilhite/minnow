@@ -16,6 +16,19 @@ are unchanged; no migration is needed. The row adapter avoids an extra iterator 
 NULL-only documents skip temporary matching/scoring arrays. The shared module adds 868 packed
 bytes to the core tarball; its packed cap rises once by 1,000 bytes.
 
+The unexported rebuild replaces generic JSON catalog persistence with versioned binary catalog
+records, bounded native catalog pages and matching logged catalog changes. Unknown required
+fields and versions are refused; exact typed values and optional display extensions survive
+rewrites. Reachability and reclamation include every catalog page. Fields use separate ID and flag
+bytes; reserved flags and inconsistent type, vector and reference shapes are refused. Logged
+catalog changes bind their expected predecessor and resulting version before row replay.
+Informational foreign keys may retain a dropped parent across checkpoint and reopen. Live
+safe-integer payloads reject nonfinite, fractional, unsafe and negative-zero values; NULL payloads
+stay uninterpreted. Reserved semantic FTS fields refuse even when marked optional.
+This changes unreleased
+rebuild bytes only (reader 3, manifest 4, commit body 2); no supported next/ writer has shipped.
+The published 0.x engine and its stored formats are unchanged; no migration is needed.
+
 The unexported rebuild can retry an over-cap memory-source recipe by retaining one
 existing, owner-charged chunk through publication. Small wide-column scans no longer
 reserve the largest possible future metadata graph before they can read their rows.

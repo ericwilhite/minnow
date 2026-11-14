@@ -1,3 +1,11 @@
+import { Catalog } from "./catalog.js";
+import { decodeJson, need } from "./bytes.js";
+import type { CatalogStreamData } from "./catalog-stream.js";
+import { encodeCatalogPage, encodeCatalogRoot } from "../format/catalog-pages.js";
+import { decodeListPage, encodeListPage, LIST_PAGE_EXTENTS } from "../storage/extent-list.js";
+import type { BlobRef } from "../storage/extents.js";
+import { xxHash32 } from "../hash/xxhash32.js";
+import { MANIFEST_FORMAT_VERSION } from "../durable-format.js";
 /** Current-root bootstrap over unchanged directory payloads, not a next-to-next upgrade.
  * Archived root slots are discarded. Current and independently bundled current writers own
  * the continuing-writer tests; archived writers/roots are used only for explicit refusal. */
@@ -11,13 +19,12 @@ import { encodeManifestRoot } from "../format/manifest-codec.js";
 import { readDirectoryFixture } from "./directory-frozen.js";
 import { DirectoryFiles, type DirectoryImage } from "./directory-fixture-files.js";
 import type { openDirectory } from "./directory-compat-api.js";
-import { need } from "./bytes.js";
 /** Current-format test roots over unchanged packed group/page payloads.
  * Never loaded as a migration; old root slots are discarded before these are freshly encoded. */
 import type { ManifestRoot } from "../format/manifest.js";
 export const DIRECTORY_RECIPES = {
   "packed-0": {
-    formatVersion: 3,
+    formatVersion: MANIFEST_FORMAT_VERSION,
     sequence: 2,
     epoch: 1,
     log: {
@@ -79,7 +86,7 @@ export const DIRECTORY_RECIPES = {
     ],
   },
   "packed-4095": {
-    formatVersion: 3,
+    formatVersion: MANIFEST_FORMAT_VERSION,
     sequence: 3,
     epoch: 1,
     log: {
@@ -175,7 +182,7 @@ export const DIRECTORY_RECIPES = {
     ],
   },
   "packed-4099": {
-    formatVersion: 3,
+    formatVersion: MANIFEST_FORMAT_VERSION,
     sequence: 3,
     epoch: 1,
     log: {
@@ -292,7 +299,53 @@ export function currentDirectoryFixture(
     try {
       const session = await backend.open(lease);
       try {
-        const root = DIRECTORY_RECIPES[name];
+        const recipe = DIRECTORY_RECIPES[name];
+        const stored = files.files.get("data");
+        if (!stored) throw new Error("Missing physical directory payload");
+        const raw = (ref: BlobRef) =>
+          stored.bytes.subarray(
+            ref.extent.offset + ref.offset,
+            ref.extent.offset + ref.offset + ref.length,
+          );
+        // Test-only bootstrap, not an upgrade: archive roots are discarded above. Reuse only
+        // the frozen group/page payloads. Definitions are fresh current-writer input, and the
+        // current writer creates the new MCAT tree/list; ordinary open never accepts old JSON.
+        const data = Catalog.fromStored(
+          decodeJson(raw(recipe.catalog)) as CatalogStreamData,
+        ).encode();
+        const extents = recipe.extentList
+          .flatMap((page) => decodeListPage(raw(page.blob), page))
+          .filter((ref) => ref.offset !== recipe.catalog.extent.offset);
+        let at = Math.ceil(stored.size / 4096) * 4096;
+        const put = async (bytes: Uint8Array): Promise<BlobRef> => {
+          const extent = { offset: at, length: bytes.length };
+          at += Math.ceil(bytes.length / 4096) * 4096;
+          await session.writeData(extent.offset, bytes);
+          return { extent, offset: 0, length: bytes.length, checksum: xxHash32(bytes) };
+        };
+        const page = await put(encodeCatalogPage({ offset: 0, data }));
+        const catalog = await put(
+          encodeCatalogRoot({
+            depth: 0,
+            bytes: data.length,
+            pages: 1,
+            children: [{ ref: page, bytes: data.length, pages: 1 }],
+          }),
+        );
+        extents.push(page.extent, catalog.extent);
+        extents.sort((a, b) => a.offset - b.offset);
+        const extentList: Array<ManifestRoot["extentList"][number]> = [];
+        for (let i = 0; i < extents.length; i += LIST_PAGE_EXTENTS) {
+          const values = extents.slice(i, i + LIST_PAGE_EXTENTS),
+            first = values[0];
+          if (!first) throw new Error("Empty current directory fixture list");
+          extentList.push({
+            blob: await put(encodeListPage(values)),
+            first: first.offset,
+            count: values.length,
+          });
+        }
+        const root = { ...recipe, catalog, extentList };
         // Both slots are fresh current publications. No old root parser or converter runs.
         for (let step = 1; step <= 2; step++)
           await session.publish(

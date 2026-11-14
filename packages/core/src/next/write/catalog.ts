@@ -1,3 +1,10 @@
+import {
+  validateCatalogType,
+  validateCatalogDeclared,
+  validateCatalogMissing,
+} from "./catalog-values.js";
+import type { ByteBudget } from "../storage/extents.js";
+import { ParseBudgetError } from "../format/manifest-codec.js";
 /**
  * The catalog the write path keeps (access/catalog.ts): immutable `Catalog` values, the DDL
  * validation that produces the next one, and the logged form of every change, so replay applies
@@ -11,7 +18,7 @@
  *   reuses nothing a durable structure names, because nothing durable named it).
  * - `version` is assigned by the caller from a write-path-wide counter that never goes back.
  */
-import { DURABLE_CODECS, requireTag } from "../durable-format.js";
+import { CATALOG_CHANGE_FIELDS, DURABLE_CODECS, requireTag } from "../durable-format.js";
 import { StoreCorruptionError } from "../storage/contract.js";
 import type { BufferAllocator } from "./commit-buffers.js";
 import {
@@ -39,7 +46,14 @@ import {
   samePhysicalType,
 } from "../types.js";
 import type { PhysicalType } from "../types.js";
-import { decodeJson, encodeJson } from "./bytes.js";
+import {
+  decodeCatalogStream,
+  encodeCatalogStream,
+  encodeCatalogChange,
+  decodeCatalogChange,
+  type CatalogStreamData,
+} from "./catalog-stream.js";
+import { UnsupportedCatalogError } from "./catalog-records.js";
 
 export interface CatalogCounters {
   readonly nextTableId: number;
@@ -62,7 +76,7 @@ const FIRST_COUNTERS: CatalogCounters = {
 };
 
 /** A change as the log carries it: every id resolved, nothing left to validate. */
-export type LoggedChange =
+export type CatalogOperation =
   | {
       readonly op: "createTable";
       readonly table: TableDef;
@@ -79,14 +93,13 @@ export type LoggedChange =
   | { readonly op: "createType"; readonly type: TypeDef }
   | { readonly op: "dropType"; readonly typeId: number };
 
-interface CatalogData {
+/** Every WAL operation binds its predecessor and its live-assigned resulting version. */
+export type LoggedChange = CatalogOperation & {
+  readonly expectedVersion: number;
   readonly version: number;
-  readonly counters: CatalogCounters;
-  readonly tables: readonly TableDef[];
-  readonly sequences: readonly SequenceDef[];
-  readonly views: readonly ViewDef[];
-  readonly types: readonly TypeDef[];
-}
+};
+
+type CatalogData = CatalogStreamData;
 
 function intRange(type: PhysicalType): { min: bigint; max: bigint } {
   if (type.kind === "int32")
@@ -119,6 +132,7 @@ export class Catalog implements CatalogView {
   readonly sequences: readonly SequenceDef[];
   readonly views: readonly ViewDef[];
   readonly types: readonly TypeDef[];
+  readonly wireMetadata?: unknown;
   readonly #tables: ReadonlyMap<number, TableDef>;
   readonly #tablesByName: ReadonlyMap<string, TableDef>;
   readonly #sequences: ReadonlyMap<number, SequenceDef>;
@@ -126,6 +140,7 @@ export class Catalog implements CatalogView {
 
   constructor(data: CatalogData) {
     for (const table of data.tables) for (const index of table.indexes) validateIndexPolicy(index);
+    this.wireMetadata = data.wireMetadata;
     this.version = data.version;
     this.counters = data.counters;
     this.tables = data.tables;
@@ -179,6 +194,7 @@ export class Catalog implements CatalogView {
 
   #data(): CatalogData {
     return {
+      wireMetadata: this.wireMetadata,
       version: this.version,
       counters: this.counters,
       tables: this.tables,
@@ -204,7 +220,12 @@ export class Catalog implements CatalogView {
     readonly logged: readonly LoggedChange[];
     readonly id: number | null;
   } {
-    const logged = this.#plan(change);
+    let expectedVersion = this.version;
+    const logged = this.#plan(change).map((operation) => {
+      const entry = { ...operation, expectedVersion, version };
+      expectedVersion = version;
+      return entry;
+    });
     const next = logged.reduce<Catalog>((catalog, entry) => catalog.apply(entry, version), this);
     const id = createdId(logged[0] ?? null);
     return { catalog: next, logged, id };
@@ -214,7 +235,7 @@ export class Catalog implements CatalogView {
     return this.#tablesByName.has(name) || this.views.some((view) => view.name === name);
   }
 
-  #plan(change: CatalogChange): LoggedChange[] {
+  #plan(change: CatalogChange): CatalogOperation[] {
     switch (change.kind) {
       case "createTable":
         return this.#planCreateTable(change.table);
@@ -345,7 +366,7 @@ export class Catalog implements CatalogView {
     return { id, name, tableId: table.id, columnIds, unique, kind, role };
   }
 
-  #planCreateTable(input: TableInput): LoggedChange[] {
+  #planCreateTable(input: TableInput): CatalogOperation[] {
     if (this.#nameTaken(input.name))
       throw new CatalogChangeError(`Relation ${input.name} already exists`);
     const counters = { ...this.counters };
@@ -532,6 +553,12 @@ export class Catalog implements CatalogView {
   // ── Application: logged change → next catalog (live and replay) ───────────────────────────
 
   apply(change: LoggedChange, version: number): Catalog {
+    if (
+      change.expectedVersion !== this.version ||
+      change.version !== version ||
+      version < this.version
+    )
+      throw new StoreCorruptionError("A logged catalog change has the wrong predecessor/version");
     const data = this.#data();
     const counters = { ...data.counters };
     const bump = (key: keyof CatalogCounters, used: number) => {
@@ -614,25 +641,179 @@ export class Catalog implements CatalogView {
         types = types.filter((type) => type.id !== change.typeId);
         break;
     }
-    return new Catalog({ version, counters, tables, sequences, views, types });
+    return new Catalog({
+      wireMetadata: this.wireMetadata,
+      version,
+      counters,
+      tables,
+      sequences,
+      views,
+      types,
+    });
   }
 
   // ── Stored form ────────────────────────────────────────────────────────────────────────────
 
   encode(): Uint8Array {
-    return encodeJson(this.#data());
+    return encodeCatalogStream(this.#data());
   }
 
   static decode(bytes: Uint8Array): Catalog {
+    return Catalog.fromStored(decodeCatalogStream(bytes));
+  }
+
+  /** Validation shared by native pages and the portable logical stream. */
+  static fromStored(data: CatalogStreamData, budget?: ByteBudget): Catalog {
+    // Temporary graph-validation IDs/names are distinct from the CatalogView's existing
+    // resident definitions. Admit before constructing the temporary sets and maps.
+    let entries =
+      data.tables.length + data.sequences.length + data.views.length + data.types.length;
+    for (const table of data.tables)
+      entries +=
+        table.columns.length +
+        table.indexes.length +
+        table.checks.length +
+        table.foreignKeys.length;
+    const scratch = 1024 + entries * 256;
+    if (budget && !budget.allocate(scratch)) throw new ParseBudgetError(scratch);
     try {
-      const data = decodeJson(bytes) as CatalogData;
-      for (const table of data.tables) validateStoredTable(table);
+      validateStoredCatalog(data);
       return new Catalog(data);
     } catch (error) {
-      if (error instanceof StoreCorruptionError) throw error;
+      if (error instanceof StoreCorruptionError || error instanceof UnsupportedCatalogError)
+        throw error;
       throw new StoreCorruptionError(`A stored catalog is malformed: ${String(error)}`);
+    } finally {
+      budget?.free(scratch);
     }
   }
+}
+
+/** Validate the complete stored graph, never a transient drop/recreate during ALTER replay. */
+function validateStoredCatalog(data: CatalogData): void {
+  const check = (ok: boolean, message: string) => {
+    if (!ok) throw new StoreCorruptionError(message);
+  };
+  const ids = (values: ReadonlyArray<{ readonly id: number }>, counter: number, name: string) => {
+    const seen = new Set<number>();
+    for (const value of values) {
+      check(
+        value.id > 0 && value.id < counter && !seen.has(value.id),
+        `Invalid/duplicate stored ${name} id`,
+      );
+      seen.add(value.id);
+    }
+    check(counter >= 1, `Invalid stored ${name} counter`);
+  };
+  const names = (values: ReadonlyArray<{ readonly name: string }>) => {
+    const seen = new Set<string>();
+    for (const value of values) {
+      check(!seen.has(value.name), "Duplicate stored catalog name");
+      seen.add(value.name);
+    }
+  };
+  ids(data.tables, data.counters.nextTableId, "table");
+  ids(
+    data.tables.flatMap((t) => t.columns),
+    data.counters.nextColumnId,
+    "column",
+  );
+  ids(
+    data.tables.flatMap((t) => t.indexes),
+    data.counters.nextIndexId,
+    "index",
+  );
+  ids(
+    data.tables.flatMap((t) => [...t.checks, ...t.foreignKeys]),
+    data.counters.nextConstraintId,
+    "constraint",
+  );
+  ids(data.sequences, data.counters.nextSequenceId, "sequence");
+  ids(data.views, data.counters.nextViewId, "view");
+  ids(data.types, data.counters.nextTypeId, "type");
+  names([...data.tables, ...data.views]);
+  names(data.sequences);
+  names(data.types);
+  const tables = new Map(data.tables.map((t) => [t.id, t]));
+  const sequences = new Set(data.sequences.map((s) => s.id));
+  for (const table of data.tables) {
+    validateStoredTable(table);
+    check(table.schemaVersion > 0, "Invalid stored schema version");
+    names(table.columns);
+    names(table.indexes);
+    names([...table.foreignKeys, ...table.checks]);
+    const columns = new Set(table.columns.map((c) => c.id));
+    for (const column of table.columns)
+      check(
+        column.identitySequence === null || sequences.has(column.identitySequence),
+        "Missing stored identity sequence",
+      );
+    for (const index of table.indexes)
+      check(
+        index.tableId === table.id &&
+          index.columnIds.length > 0 &&
+          index.columnIds.every((id) => columns.has(id)),
+        "Invalid stored index references",
+      );
+    check(
+      table.primaryKey === null ||
+        table.indexes.some((i) => i.id === table.primaryKey && i.unique && i.role === "primary"),
+      "Missing stored primary key",
+    );
+    for (const condition of table.checks)
+      check(
+        condition.columnIds.every((id) => columns.has(id)),
+        "Invalid stored check dependency",
+      );
+    for (const fk of table.foreignKeys) {
+      const parentTable = tables.get(fk.parentTableId);
+      const parent = parentTable?.indexes.find((i) => i.id === fk.parentIndexId);
+      check(
+        fk.columnIds.length > 0 && fk.columnIds.every((id) => columns.has(id)),
+        "Invalid stored foreign-key columns",
+      );
+      // Informational relationships survive the deliberate drop of their parent (shipped contract).
+      // An id outside the allocated namespace was never a valid parent, even informationally.
+      check(
+        fk.parentTableId < data.counters.nextTableId &&
+          fk.parentIndexId < data.counters.nextIndexId,
+        "Unknown stored foreign-key identity",
+      );
+      if (fk.enforced || parentTable !== undefined)
+        check(
+          parent !== undefined &&
+            parent.unique &&
+            parent.columnIds.length === fk.columnIds.length &&
+            parent.columnIds.every((id, position) => {
+              const p = parentTable?.columns.find((c) => c.id === id);
+              const c = table.columns.find((c) => c.id === fk.columnIds[position]);
+              return p !== undefined && c !== undefined && samePhysicalType(p.type, c.type);
+            }),
+          "Invalid stored foreign-key references",
+        );
+      const support = table.indexes.find((i) => i.id === fk.supportIndexId);
+      check(!fk.enforced || support !== undefined, "Missing stored foreign-key support index");
+      check(
+        fk.supportIndexId === null ||
+          (support !== undefined &&
+            support.columnIds.length >= fk.columnIds.length &&
+            fk.columnIds.every((id, position) => support.columnIds[position] === id)),
+        "Invalid stored foreign-key support columns",
+      );
+    }
+  }
+  for (const sequence of data.sequences) {
+    validateSequence(sequence);
+    check(
+      sequence.ownedBy === null ||
+        tables
+          .get(sequence.ownedBy.tableId)
+          ?.columns.some((c) => c.id === sequence.ownedBy?.columnId) === true,
+      "Invalid stored sequence owner",
+    );
+  }
+  for (const type of data.types)
+    check(new Set(type.labels).size === type.labels.length, "Duplicate stored enum label");
 }
 
 function createdId(change: LoggedChange | null): number | null {
@@ -662,26 +843,18 @@ function validateSequence(sequence: SequenceDef): void {
 }
 
 export function encodeLogged(change: LoggedChange, allocator?: BufferAllocator): Uint8Array {
-  return encodeJson(change, allocator);
+  return encodeCatalogChange(change, allocator);
 }
 
-function validateStoredType(type: PhysicalType, depth = 0): void {
-  if (depth > 8) throw new StoreCorruptionError("Stored array type nesting exceeds its cap");
-  requireTag(type.kind, DURABLE_CODECS.physical, "stored physical type", StoreCorruptionError);
-  if (type.kind === "array") validateStoredType(type.element, depth + 1);
-  if (type.kind === "int32")
-    requireTag(type.bits, DURABLE_CODECS.int32Bits, "stored integer width", StoreCorruptionError);
-  if (type.kind === "json")
-    requireTag(type.binary, DURABLE_CODECS.jsonBoolean, "stored JSON mode", StoreCorruptionError);
-  if (type.kind === "timestamp")
-    requireTag(
-      type.zoned,
-      DURABLE_CODECS.jsonBoolean,
-      "stored timestamp mode",
-      StoreCorruptionError,
-    );
+function positiveId(id: number): void {
+  if (!Number.isSafeInteger(id) || id <= 0)
+    throw new StoreCorruptionError("Invalid stored catalog id");
 }
 function validateStoredIndex(index: IndexDef): void {
+  positiveId(index.id);
+  positiveId(index.tableId);
+  if (!index.columnIds.length) throw new StoreCorruptionError("Empty stored index key");
+  index.columnIds.forEach(positiveId);
   if (index.keyLimit !== undefined)
     requireTag(
       index.keyLimit,
@@ -701,8 +874,18 @@ function validateStoredIndex(index: IndexDef): void {
   requireTag(index.role, DURABLE_CODECS.indexRole, "stored index role", StoreCorruptionError);
 }
 function validateStoredTable(table: TableDef): void {
+  positiveId(table.id);
+  positiveId(table.schemaVersion);
+  if (table.primaryKey !== null) positiveId(table.primaryKey);
+  for (const condition of table.checks) {
+    positiveId(condition.id);
+    condition.columnIds.forEach(positiveId);
+  }
   for (const column of table.columns) {
-    validateStoredType(column.type);
+    positiveId(column.id);
+    if (column.identitySequence !== null) positiveId(column.identitySequence);
+    validateCatalogType(column.type);
+    validateCatalogDeclared(column.declared, column.type);
     requireTag(
       column.nullable,
       DURABLE_CODECS.jsonBoolean,
@@ -746,13 +929,14 @@ function validateStoredTable(table: TableDef): void {
       );
     const missing = column.missing;
     if (missing !== null) {
+      validateCatalogMissing(missing, column.type);
       requireTag(
         missing.form,
         DURABLE_CODECS.vectorForm,
         "stored missing vector form",
         StoreCorruptionError,
       );
-      validateStoredType(missing.type);
+      validateCatalogType(missing.type);
       requireTag(
         missing.data.layout,
         DURABLE_CODECS.columnLayout,
@@ -784,6 +968,11 @@ function validateStoredTable(table: TableDef): void {
   }
   for (const index of table.indexes) validateStoredIndex(index);
   for (const foreignKey of table.foreignKeys) {
+    positiveId(foreignKey.id);
+    positiveId(foreignKey.parentTableId);
+    positiveId(foreignKey.parentIndexId);
+    if (foreignKey.supportIndexId !== null) positiveId(foreignKey.supportIndexId);
+    foreignKey.columnIds.forEach(positiveId);
     requireTag(
       foreignKey.enforced,
       DURABLE_CODECS.jsonBoolean,
@@ -801,18 +990,56 @@ function validateStoredTable(table: TableDef): void {
 
 export function decodeLogged(bytes: Uint8Array): LoggedChange {
   try {
-    const value = decodeJson(bytes) as LoggedChange;
+    const value = decodeCatalogChange(bytes);
     requireTag(
       value.op,
       DURABLE_CODECS.catalogOperation,
       "catalog operation",
       StoreCorruptionError,
     );
+    if (
+      !Number.isSafeInteger(value.expectedVersion) ||
+      value.expectedVersion < 0 ||
+      !Number.isSafeInteger(value.version) ||
+      value.version < 1 ||
+      value.version < value.expectedVersion
+    )
+      throw new StoreCorruptionError("Invalid logged catalog version precondition");
+    const fields = CATALOG_CHANGE_FIELDS[value.op];
+    for (const name of fields)
+      if (!Object.hasOwn(value, name))
+        throw new StoreCorruptionError(`Missing logged catalog field ${name}`);
+    for (const name of Object.keys(value))
+      if (
+        name !== "op" &&
+        name !== "expectedVersion" &&
+        name !== "version" &&
+        !(fields as readonly string[]).includes(name)
+      )
+        throw new StoreCorruptionError(`Unexpected logged catalog field ${name}`);
+    const record = value as unknown as Record<string, unknown>;
+    for (const name of ["tableId", "indexId", "sequenceId", "viewId", "typeId"] as const) {
+      const id = record[name];
+      if (name in record && !(typeof id === "number" && id > 0))
+        throw new StoreCorruptionError(`Invalid logged catalog id ${name}`);
+    }
     if (value.op === "createTable") validateStoredTable(value.table);
     if (value.op === "createIndex") validateStoredIndex(value.index);
+    if (value.op === "putSequence") {
+      positiveId(value.sequence.id);
+      validateSequence(value.sequence);
+    }
+    if (value.op === "createTable")
+      for (const sequence of value.sequences) {
+        positiveId(sequence.id);
+        validateSequence(sequence);
+      }
+    if (value.op === "createView") positiveId(value.view.id);
+    if (value.op === "createType") positiveId(value.type.id);
     return value;
   } catch (error) {
-    if (error instanceof StoreCorruptionError) throw error;
+    if (error instanceof StoreCorruptionError || error instanceof UnsupportedCatalogError)
+      throw error;
     throw new StoreCorruptionError(`A logged catalog change is malformed: ${String(error)}`);
   }
 }

@@ -111,7 +111,7 @@ export interface ManifestRoot {
   /** Global state below includes every transaction with LSN ≤ this. */
   readonly globalLsn: number;
   readonly catalogVersion: number;
-  /** The catalog: tables (columns with PhysicalType, schema versions), constraints, views. */
+  /** MCRT catalog tree: ordered MCPG fragments of the versioned MCAT logical records. */
   readonly catalog: BlobRef;
   /** Table ids below this that the catalog lacks were dropped; ids are never reused. */
   readonly nextTableId: number;

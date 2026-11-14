@@ -9,7 +9,7 @@ import { describe, expect, it } from "vitest";
 import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
 import type { Snapshot } from "../access/snapshot.js";
 import type { Statement } from "../access/modify.js";
-import { createReach } from "../../testing/reach.js";
+import { createReach, CATALOG_RECYCLE_REACH } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import type { WritePathImpl } from "./engine.js";
 import {
@@ -69,6 +69,7 @@ const RECYCLE_REACH = [
   "crash-after-recycle",
 ] as const;
 const reach = createReach("next-write-log-recycle", RECYCLE_REACH);
+const overlapReach = createReach("catalog-size-independent recycle overlap", CATALOG_RECYCLE_REACH);
 
 async function create(
   path: WritePathImpl,
@@ -89,11 +90,33 @@ describe("log recycling (generated)", () => {
       const random = mulberry32(seed);
       const int = (n: number) => Math.floor(random() * n);
       const bound = 800 + int(1600);
+      let recyclingPrepared = false;
+      let deferredHook: (() => Promise<void>) | null = null;
       const harness = new Harness("strict", "sim", 8 + int(16), undefined, {
         logRecycleBytes: bound,
         merges: { fanIn: 2 + int(3) },
+        afterDeltaPrepared: (kind) => {
+          recyclingPrepared = kind === "recycle";
+        },
       });
+      const open = harness.backend.open.bind(harness.backend);
+      harness.backend.open = async (lease) => {
+        const session = await open(lease),
+          publish = session.publish.bind(session);
+        session.publish = async (bytes) => {
+          const atRecycle = recyclingPrepared;
+          recyclingPrepared = false;
+          if (atRecycle && deferredHook !== null) {
+            const run = deferredHook;
+            deferredHook = null;
+            await run(); // append only: durability waits outside the held publication
+          }
+          return publish(bytes);
+        };
+        return session;
+      };
       reach.beginHistory();
+      overlapReach.beginHistory();
       let path = await harness.open();
       const hot = await create(path, "hot", [column("id", INT, false), column("v", INT)]);
       const cold = await create(path, "cold", [column("id", INT, false)]);
@@ -110,6 +133,24 @@ describe("log recycling (generated)", () => {
       const seen = (name: (typeof RECYCLE_REACH)[number], value: number) => {
         if (value > 0) reach.reach(name);
       };
+      // Catalog compression changes byte thresholds. Exercise overlap explicitly rather than
+      // depending on a particular catalog spelling to make two async operations collide.
+      await path.recycleLog(); // drain an automatically queued incarnation switch first
+      const prefixCount = 129 + (seed % 7);
+      const prefix = { repr: "safe" as const, values: new Float64Array(prefixCount) };
+      let prefixLsn = -1;
+      deferredHook = async () => {
+        prefixLsn = await path.sequences.next(sequenceId, prefixCount, prefix, 0);
+        overlapReach.reach("publish-held sequence reservation");
+      };
+      await path.recycleLog();
+      expect(deferredHook).toBeNull();
+      expect(path.maintenance.deferredFrames).toBeGreaterThan(0);
+      seen("deferred-frame", path.maintenance.deferredFrames);
+      overlapReach.reach("deferral observed");
+      await path.durable(prefixLsn);
+      for (const value of prefix.values) delivered.add(value);
+      overlapReach.reach("reserved values durable");
       for (let step = 0; step < 120; step++) {
         const roll = int(100);
         if (roll < 45) {
@@ -206,6 +247,7 @@ describe("log recycling (generated)", () => {
 
   it("reached every declared state", () => {
     reach.assertReached();
+    overlapReach.assertReached();
   });
 });
 

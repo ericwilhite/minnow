@@ -65,3 +65,9 @@ describe("declaredColumnType (DECISIONS.md C5)", () => {
     expect(() => type(t.a)).toThrow('type "mood" does not exist');
   });
 });
+
+it("keeps SQL BYTEA refused while native catalogs can describe byte columns", () => {
+  const t = columns("CREATE TABLE t (a BYTEA)");
+  expect(() => type(t.a)).toThrow(PlanningError);
+  expect(() => type(t.a)).toThrow(/does not exist/u);
+});

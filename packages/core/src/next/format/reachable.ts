@@ -34,6 +34,13 @@
  * a time, each released (its parse charge returned) when the walk moves past it. Data pages are
  * never read.
  */
+import { walkCatalogTree, type CatalogTreeReader } from "./catalog-tree.js";
+import {
+  decodeCatalogRoot,
+  decodeCatalogPage,
+  type CatalogRoot,
+  type CatalogPage,
+} from "./catalog-pages.js";
 import { sortedListedExtents } from "../storage/extent-list.js";
 import type {
   BlobRef,
@@ -68,7 +75,7 @@ export interface Held<T> {
 }
 
 /** Reads and decodes the metadata blobs the walk descends through (manifest-codec.ts). */
-export interface ManifestReader {
+export interface ManifestReader extends CatalogTreeReader {
   /** The page entries of a group directory's index blob (`TableRoot.groups`). */
   groupIndex(ref: BlobRef): Promise<Held<readonly GroupPageEntry[]>>;
   /** The `GroupRef`s of one directory page. */
@@ -79,6 +86,8 @@ export interface ManifestReader {
 
 export type ReachableKind =
   | "catalog"
+  | "catalog-index"
+  | "catalog-page"
   | "extent-list-page"
   | "table-statistics"
   | "group-directory"
@@ -105,6 +114,8 @@ export interface Reached {
 export interface ReachableOptions {
   /** Group roots read at once (default 32). */
   readonly concurrency?: number;
+  /** A table-only retirement walk must not read root-owned metadata. */
+  readonly skipCatalog?: boolean;
 }
 
 function* runsOf(
@@ -129,7 +140,18 @@ export async function* walkReachable(
   options: ReachableOptions = {},
 ): AsyncGenerator<Reached> {
   const concurrency = Math.max(1, options.concurrency ?? 32);
-  yield { ref: root.catalog, kind: "catalog", tableId: null };
+  if (!options.skipCatalog)
+    for await (const event of walkCatalogTree(root.catalog, reader))
+      yield {
+        ref: event.ref,
+        kind:
+          event.kind === "catalog-page"
+            ? "catalog-page"
+            : event.ref === root.catalog
+              ? "catalog"
+              : "catalog-index",
+        tableId: null,
+      };
   for (const page of root.extentList)
     yield { ref: page.blob, kind: "extent-list-page", tableId: null };
   for (const table of root.tables) {
@@ -281,6 +303,8 @@ export async function reachable(
 
 /** The decoders the walk uses (manifest-codec.ts by default; tests substitute their own). */
 export interface ManifestCodecs {
+  decodeCatalogRoot(bytes: Uint8Array, budget: ByteBudget): Parsed<CatalogRoot>;
+  decodeCatalogPage(bytes: Uint8Array, budget: ByteBudget): Parsed<CatalogPage>;
   decodeRoot(bytes: Uint8Array, budget: ByteBudget): Parsed<ManifestRoot>;
   decodeGroupIndex(bytes: Uint8Array, budget: ByteBudget): Parsed<readonly GroupPageEntry[]>;
   decodeGroupPage(bytes: Uint8Array, budget: ByteBudget): Parsed<readonly GroupRef[]>;
@@ -288,6 +312,8 @@ export interface ManifestCodecs {
 }
 
 export const MANIFEST_CODECS: ManifestCodecs = {
+  decodeCatalogRoot,
+  decodeCatalogPage,
   decodeRoot: decodeManifestRoot,
   decodeGroupIndex,
   decodeGroupPage,
@@ -338,6 +364,8 @@ export function reachableExtents(
       for await (const { ref } of walkReachable(
         manifest.value,
         {
+          catalogRoot: (blob) => decode(blob, (bytes, b) => codecs.decodeCatalogRoot(bytes, b)),
+          catalogPage: (blob) => decode(blob, (bytes, b) => codecs.decodeCatalogPage(bytes, b)),
           groupIndex: (blob) => decode(blob, (bytes, b) => codecs.decodeGroupIndex(bytes, b)),
           groupPage: (blob) => decode(blob, (bytes, b) => codecs.decodeGroupPage(bytes, b)),
           groupRoot: (blob) => decode(blob, (bytes, b) => codecs.decodeGroupRoot(bytes, b)),

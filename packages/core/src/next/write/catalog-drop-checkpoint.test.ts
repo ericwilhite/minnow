@@ -1,3 +1,5 @@
+import { catalogStorageParts, CatalogBuffers } from "./catalog-storage.js";
+import { decodeCatalogParts } from "./catalog-stream.js";
 /**
  * manifest.ts "Checkpoints and replay": the catalog at globalLsn and every table's indexes
  * agree. DROP cannot erase an earlier catalog's uncheckpointed CREATE INDEX obligation.
@@ -219,12 +221,14 @@ async function scenario(backend: Backend, plan: Plan) {
     autocommit(p, (s) => s.table(table).insert(batch(ints(values)), null));
   const validateRoots = async () => {
     for (const { root } of observations) {
-      const lease = await h.space.read([root.catalog], { budget: FREE });
+      const buffers = new CatalogBuffers(FREE);
       let catalog: Catalog;
       try {
-        catalog = Catalog.decode(need(lease.bytes[0]));
+        catalog = Catalog.fromStored(
+          await decodeCatalogParts(catalogStorageParts(root.catalog, h.space, FREE), buffers),
+        );
       } finally {
-        lease.release();
+        buffers.close();
       }
       const born = tables.filter((t) => t.lsn <= root.globalLsn);
       expect(catalog.tables.map((t) => t.id).sort((a, b) => a - b)).toEqual(
