@@ -700,7 +700,7 @@ export class StatementImpl implements Statement {
   readonly seq: number;
   readonly tx: TransactionImpl;
   readonly #rules: (tableId: number) => TableRules;
-  readonly #signal: AbortSignal | undefined;
+  #signal: AbortSignal | undefined;
   readonly #start: number;
   #state: "open" | "failed" | "ended" = "open";
   #writers: Map<string, TableWriterImpl> | null = null;
@@ -1013,7 +1013,11 @@ export class StatementImpl implements Statement {
     return false;
   }
 
-  end(): Promise<void> {
+  end(signal?: AbortSignal): Promise<void> {
+    this.#signal =
+      signal && this.#signal && signal !== this.#signal
+        ? AbortSignal.any([this.#signal, signal])
+        : (signal ?? this.#signal);
     const finish = (): MaybePromise<void> =>
       this.guard(() => {
         this.#releaseViews();

@@ -113,8 +113,9 @@ export interface Statement {
   /** After an accepted UPDATE/DELETE/upsert (including its INSERT arm). Native delete undo
    * independently invalidates FTS. No accepted rows means no effect. Rolls back with rows. */
   noteFtsMutation(tableId: number, kind: "update" | "delete" | "upsert"): void;
-  /** Runs deferred checks and foreign-key actions; then the statement is done. */
-  end(): Promise<void>;
+  /** Runs deferred checks/FK actions and FTS preparation. Both the statement signal and
+   * optional end signal cancel waits; cancellation keeps statement rollback available. */
+  end(signal?: AbortSignal): Promise<void>;
   /** Undoes everything the statement wrote, including its DDL. Idempotent. */
   rollback(): void;
 }

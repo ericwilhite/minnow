@@ -849,6 +849,43 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       throw new UnsupportedPlanError("a repeated relational operator id", { construct: "plan" });
     ids.add(rel.id);
     switch (rel.op) {
+      case "modify": {
+        if (!["insert", "update", "delete"].includes(rel.kind) || rel.returning !== null)
+          throw new UnsupportedPlanError("modify kind or RETURNING", { construct: "modify" });
+        const child = prepare(rel.input);
+        return (runtime, downstream, stops) => {
+          const statement = runtime.request.statement;
+          if (statement === null) throw new TypeError("modify requires a statement");
+          const writer = statement.table(rel.tableId, {
+            assigned: rel.assigned,
+            onRepeat: rel.onRepeat,
+          });
+          let pending: Promise<void> | null = null;
+          const sink: Operator = {
+            push(batch, transfer) {
+              runtime.signal.throwIfAborted();
+              const kind = rel.kind as "insert" | "update" | "delete";
+              const count = writer[kind](batch, null);
+              const record = (n: number) => {
+                runtime.counts[
+                  kind === "insert" ? "inserted" : kind === "update" ? "updated" : "deleted"
+                ] += n;
+                transfer?.release();
+              };
+              if (count instanceof Promise) {
+                pending = count.then(record);
+                return "blocked";
+              }
+              record(count);
+              return "ready";
+            },
+            ready: () => pending ?? Promise.resolve(),
+            finish: () => downstream.finish(),
+            abort: (reason) => downstream.abort(reason),
+          };
+          return child(runtime, sink, stops);
+        };
+      }
       case "indexRange": {
         if (options.keyOrder !== true)
           throw new UnsupportedPlanError(

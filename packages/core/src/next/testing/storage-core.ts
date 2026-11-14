@@ -117,6 +117,54 @@ export class StorageCore implements NextCore {
       if (lowered.change !== null) await this.change(lowered.change);
       return { kind: "ddl" };
     }
+    if (lowered.kind === "modify") {
+      const prepared = this.executor.prepare(lowered.plan);
+      const tx = await this.harness.path.begin();
+      const statement = tx.statement({
+        rules: (id) => {
+          const table = statement.catalog.table(id);
+          if (!table) throw new TypeError("missing table");
+          return compileTableRules(
+            table,
+            statement.catalog.version,
+            this.lowerer.lowerTableRules(table, statement.catalog),
+          );
+        },
+      });
+      const execution = prepared.execute({
+        snapshot: null,
+        statement,
+        parameters: params,
+        statementTime: 0n,
+        governor: this.harness.governor,
+        spill: this.spill,
+        queryId: ++this.#queryId,
+        reads: { open: (pages, chunk, options) => ChunkReader.open(pages, chunk, options) },
+        sequences: null,
+        sequenceSession: null,
+        returning: "atExecuted",
+      });
+      try {
+        for (;;) {
+          const frame = await execution.results.next();
+          if (frame === null) break;
+          frame.release();
+        }
+        const summary = await execution.executed;
+        const receipt = await tx.commit(null);
+        await receipt.durable;
+        await execution.delivered;
+        this.lastProfile = summary.profile;
+        return {
+          kind: lowered.plan.root.op === "modify" ? lowered.plan.root.kind : "modify",
+          rowCount: summary.rowCount,
+        };
+      } catch (error) {
+        execution.cancel(error);
+        tx.rollback();
+        throw error;
+      }
+    }
     if (lowered.kind !== "query")
       throw new UnsupportedPlanError(`the adapter's ${lowered.kind}`, { construct: lowered.kind });
     const prepared = this.executor.prepare(lowered.plan);

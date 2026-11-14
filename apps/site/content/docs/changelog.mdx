@@ -70,6 +70,12 @@ is declared; zero-row and rolled-back commands do not invalidate. A missing or s
 write renderer also invalidates acceleration rather than rejecting accepted rows.
 No supported 1.0 stored-format predecessor exists yet.
 
+The unexported rebuild now executes INSERT VALUES, INSERT SELECT, UPDATE and DELETE through
+its native statement writer for scan-based plans. RETURNING, ON CONFLICT and
+index-based modification inputs remain unfinished. Reads use the statement
+snapshot; statement errors roll back earlier rows. Unique and foreign-key checks use the
+existing write path. The shipped engine and stored formats are unchanged.
+
 The unexported rebuild casts integers, NUMERIC (keeping scale), float4/float8 (PostgreSQL's
 shortest spelling), boolean, date, time, timestamp, timestamptz (UTC), interval (including
 `infinity` / `-infinity`), uuid, JSON/JSONB and arrays to text with PostgreSQL's default output

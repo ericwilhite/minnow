@@ -7560,3 +7560,19 @@ export const FTS_CLAIM_CODEC_REACH = [
   "missing flag refused",
   "development predecessor refused",
 ] as const;
+
+export const GENERAL_MODIFY_REACH = [
+  "multi-row VALUES",
+  "expression update",
+  "INSERT SELECT snapshot",
+  "primary key update snapshot",
+  "failure rollback",
+  "predicate delete",
+] as const;
+
+export const MODIFY_SOURCES_REACH = [
+  "UPDATE FROM duplicate matches",
+  "DELETE USING duplicate matches",
+  "delete cascade",
+  "missing parent rollback",
+] as const;

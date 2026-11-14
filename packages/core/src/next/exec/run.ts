@@ -81,6 +81,7 @@ const HANDOFF = new Error("Producer retired at aggregation phase handoff");
 
 /** Per-execution only: never retained by an immutable prepared plan. */
 export class QueryRuntime {
+  readonly counts = { inserted: 0, updated: 0, deleted: 0 };
   #phaseCapable = false;
   #handoff = false;
   #scope: ResourcePhase | null = null;
@@ -1325,8 +1326,13 @@ export class QueryExecution implements Execution {
     readonly request: ExecuteRequest,
     program: Program,
   ) {
-    if (request.snapshot === null || hasStatement(request))
-      throw new TypeError("a query requires a read snapshot");
+    const modifying = plan.root.op === "modify";
+    if (modifying ? !hasStatement(request) : request.snapshot === null || hasStatement(request))
+      throw new TypeError(
+        modifying ? "modify requires a statement" : "a query requires a read snapshot",
+      );
+    const view = request.statement?.view ?? request.snapshot;
+    if (view === null) throw new TypeError("execution requires a view");
     const windowBytes = request.resultWindowBytes ?? RESULT_WINDOW_BYTES;
     if (!Number.isSafeInteger(windowBytes) || windowBytes <= 0)
       throw new TypeError("positive result window required");
@@ -1372,9 +1378,9 @@ export class QueryExecution implements Execution {
     try {
       if (request.signal?.aborted === true) this.cancel(request.signal.reason);
       this.#controller.signal.throwIfAborted();
-      if (request.snapshot.catalog.version !== plan.catalogVersion)
-        throw new PlanStaleError(plan.catalogVersion, request.snapshot.catalog.version);
-      this.#runtime = new QueryRuntime(plan, request, request.snapshot, this.#controller.signal);
+      if (view.catalog.version !== plan.catalogVersion)
+        throw new PlanStaleError(plan.catalogVersion, view.catalog.version);
+      this.#runtime = new QueryRuntime(plan, request, view, this.#controller.signal);
       if (program.atomic === true) {
         const deferred = new DeferredGrant(`query#${String(request.queryId)}/result`);
         this.#runtime.atomicResult(deferred, windowBytes);
@@ -1481,17 +1487,23 @@ export class QueryExecution implements Execution {
     }
     this.#settling = true;
     const complete = () => {
-      if (this.#controller.signal.aborted) {
+      if (this.request.statement === null && this.#controller.signal.aborted) {
         this.#settling = false;
         this.#fail(this.#controller.signal.reason);
         return;
       }
       const runtime = this.#runtime;
       if (runtime === null || this.#sink === null) throw new TypeError("execution runtime missing");
-      this.#sink.complete();
+      // A successful statement end is the DML completion point. Cancellation after it
+      // discards delivery, but must not report rollback of an already ended statement.
+      if (this.request.statement === null || !this.#controller.signal.aborted)
+        this.#sink.complete();
       this.#summary = {
-        rowCount: this.#sink.rowCount,
-        counts: { inserted: 0, updated: 0, deleted: 0 },
+        rowCount:
+          this.request.statement === null
+            ? this.#sink.rowCount
+            : runtime.counts.inserted + runtime.counts.updated + runtime.counts.deleted,
+        counts: { ...runtime.counts },
         requiresLsn: runtime.view.observedLsn,
         profile: runtime.summary(!this.#async),
       };
@@ -1499,7 +1511,14 @@ export class QueryExecution implements Execution {
       this.#resolve(this.#summary);
     };
     try {
-      const cleanup = this.#runtime?.close();
+      const close = () => this.#runtime?.close();
+      const cleanup =
+        this.request.statement === null
+          ? close()
+          : Promise.resolve(close()).then(() => {
+              this.#controller.signal.throwIfAborted();
+              return this.request.statement?.end(this.#controller.signal);
+            });
       if (cleanup instanceof Promise) {
         this.#async = true;
         cleanup
@@ -1528,6 +1547,7 @@ export class QueryExecution implements Execution {
         : raw;
     if (!this.#controller.signal.aborted) this.#controller.abort(error);
     this.#runtime?.abort(error);
+    this.request.statement?.rollback();
     this.#sink?.abort(error);
     if (this.#cancelled) this.results.cancel(error);
     else this.results.fail(error);
