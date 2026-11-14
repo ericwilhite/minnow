@@ -1,3 +1,4 @@
+import { closeSemanticResources, semanticRunFailure } from "./semantic-cleanup.js";
 import { MinnowDatabase } from "@minnowdb/core";
 import { MemoryBlockStore } from "@minnowdb/core/storage/memory";
 import { MinnowDatabaseClient } from "@minnowdb/core/client";
@@ -8,6 +9,7 @@ import {
   semanticFingerprint,
 } from "../src/testing/semantic-corpus.js";
 
+/** The same published engine on both sides: memory here, native worker storage over RPC there. */
 export async function runSemanticEquivalence(kind: "indexeddb" | "opfs") {
   const worker = new Worker(new URL("./published-worker.ts", import.meta.url), { type: "module" });
   const name = `semantics-${crypto.randomUUID()}`;
@@ -37,7 +39,9 @@ export async function runSemanticEquivalence(kind: "indexeddb" | "opfs") {
           client.query(testCase.sql, { ...options, memoize }),
         );
         if (semanticFingerprint(actual) !== semanticFingerprint(expected))
-          throw new Error(`Semantic worker drift: ${testCase.sql}`);
+          throw new Error(
+            `Semantic worker drift: ${testCase.sql}; memoize=${String(memoize)}; expected=${semanticFingerprint(expected)}; actual=${semanticFingerprint(actual)}`,
+          );
         compared += 1;
       }
     }
@@ -45,25 +49,26 @@ export async function runSemanticEquivalence(kind: "indexeddb" | "opfs") {
   } catch (error) {
     failures.push(error);
   } finally {
-    const closes = await Promise.allSettled([client.close(), database.close()]);
-    worker.terminate();
-    for (const result of closes) if (result.status === "rejected") failures.push(result.reason);
-    try {
-      if (kind === "opfs") await deleteOpfsDatabase({ name });
-      else
-        await new Promise<void>((resolve, reject) => {
-          const request = indexedDB.deleteDatabase(name);
-          request.onsuccess = () => resolve();
-          request.onerror = () =>
-            reject(request.error ?? new Error("Semantic database deletion failed"));
-          request.onblocked = () => reject(new Error("Semantic database deletion blocked"));
-        });
-    } catch (error) {
-      failures.push(error);
-    }
+    failures.push(
+      ...(await closeSemanticResources(
+        worker,
+        () => client.close(),
+        () => database.close(),
+        async () => {
+          if (kind === "opfs") await deleteOpfsDatabase({ name });
+          else
+            await new Promise<void>((resolve, reject) => {
+              const request = indexedDB.deleteDatabase(name);
+              request.onsuccess = () => resolve();
+              request.onerror = () =>
+                reject(request.error ?? new Error("Semantic database deletion failed"));
+              request.onblocked = () => reject(new Error("Semantic database deletion blocked"));
+            });
+        },
+      )),
+    );
   }
-  if (failures.length > 0)
-    throw new AggregateError(failures, "Semantic comparison or cleanup failed");
+  if (failures.length > 0) throw semanticRunFailure(failures);
   if (result === undefined) throw new Error("Semantic comparison result is missing");
   return result;
 }
