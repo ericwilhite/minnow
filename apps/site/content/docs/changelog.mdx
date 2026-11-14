@@ -81,7 +81,11 @@ validated before arbitration: a conflicting DO NOTHING row with a NOT NULL viola
 rejected, matching PostgreSQL (the shipped engine currently skips that check).
 Index inputs retain original row locators and suppress repeated probe matches. Reads use the statement
 snapshot; statement errors roll back earlier rows. Unique and foreign-key checks use the
-existing write path. Modification input uses a charged, bounded spill spool; read
+existing write path. CHECK constraints and stored generated columns now use the shared,
+charged row-rule program, retained through native FK actions. Generation runs inside the
+statement rule scope; an earlier row's NOT NULL or named CHECK failure precedes a later
+row's generated-expression error. Direct generated assignments remain refused; DEFAULT
+recomputes the value. Modification input uses a charged, bounded spill spool; read
 reservations retire before the writer starts, so a writer waiting for memory cannot pin
 its own producer. Single-table UPDATE and DELETE avoid statement-wide target sets;
 UPDATE FROM visits matching source rows in source order. The shipped engine and stored
@@ -167,8 +171,8 @@ main and OPFS gzip caps by 128 bytes each; client bundle and isolation limits ar
 The unexported rebuild adds charged, statement-owned CHECK and stored-generated-column
 kernels shared by ordinary writes and foreign-key actions. CHECK passes NULL and preserves
 row/constraint error order; generated recomputation keeps the old row intact for key checks.
-This internal module changes no published behavior or stored format; DML routing and triggers
-are integrated separately.
+This internal module changes no published behavior or stored format. DML routing now uses
+these kernels; trigger firing remains a separate integration.
 
 The unexported rebuild retains named enum identities, owned identity and schema counters,
 managed table/view flags, index directions, view outputs and stable expression dependencies in

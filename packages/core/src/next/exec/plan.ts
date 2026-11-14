@@ -869,8 +869,13 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         if (!["insert", "update", "delete", "upsert"].includes(rel.kind))
           throw new UnsupportedPlanError("modify kind or RETURNING", { construct: "modify" });
         const child = prepare(rel.input);
-        if (rel.returning !== null || rel.kind === "upsert") {
-          if (rel.kind !== "insert" && rel.kind !== "upsert" && !rel.oldRow)
+        if (rel.returning !== null || rel.kind === "upsert" || rel.usesRules) {
+          if (
+            rel.returning !== null &&
+            rel.kind !== "insert" &&
+            rel.kind !== "upsert" &&
+            !rel.oldRow
+          )
             throw new UnsupportedPlanError("RETURNING needs the original statement row");
           const shape = returningShape(rel);
           const exprs = rel.returning ?? [];
@@ -891,10 +896,12 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               },
               (operator) => operator.abort(undefined),
             );
-          const minimum =
+          const baseMinimum =
             compiler +
             modifySpoolBytes(rel.input.output.length) +
             modifySpoolBytes(rel.output.length);
+          const minimum = (runtime: QueryRuntime) =>
+            baseMinimum + (runtime.request.rowRules?.minimumBytes() ?? 0);
           compoundColumns.set(
             rel.id,
             Math.max(variableColumns(types(rel.input)), variableColumns(types(rel))),
@@ -903,7 +910,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             rel.id,
             2 * (variableColumns(types(rel)) + variableColumns(types(rel.input))),
           );
-          fixed(rel, minimum);
+          fixed(rel, (_cap, runtime) => minimum(runtime));
           return (runtime, _downstream, stops) => {
             if (rel.kind === "upsert") {
               const table = runtime.request.statement?.catalog.table(rel.tableId);
@@ -922,98 +929,127 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                   "ON CONFLICT DO UPDATE cannot reassign the conflict key",
                 );
             }
-            return then(runtime.admit(`modify#${String(rel.id)}`, minimum, true, rel), (grant) => {
-              if (!(grant instanceof ReservedGrant))
-                throw new TypeError("RETURNING needs atomic phase admission");
-              const release = grant.holdClose();
-              grant.onReclaimRequest(() => {
-                const idle = grant.held - grant.allocated - grant.loaned;
-                if (idle > 0) grant.release(idle);
-              });
-              const pool = new Pool(new Charge(grant), minimum);
-              const input = new ModifySpool(
-                types(rel.input),
-                grant,
-                runtime.request.spill,
-                runtime.request.queryId,
-                runtime.signal,
-                pool,
-                2 +
-                  (2 * variableColumns(types(rel))) /
-                    Math.max(1, variableColumns(types(rel.input))),
-              );
-              const returned = new ModifySpool(
-                types(rel),
-                grant,
-                runtime.request.spill,
-                runtime.request.queryId,
-                runtime.signal,
-                pool,
-                2,
-              );
-              const arena = new OutputArena(pool, MODIFY_ROWS);
-              const statement = runtime.request.statement;
-              const table = statement?.catalog.table(rel.tableId);
-              if (!statement || !table) throw new TypeError("Missing RETURNING statement/table");
-              const context: CompileContext = {
-                arena,
-                input: shape.types,
-                params: { slots: [] },
-                resolveCall,
-              };
-              const writer =
-                rel.kind === "upsert"
-                  ? new UpsertWriter(
-                      rel,
-                      statement,
-                      table,
-                      context,
-                      rel.returning === null ? _downstream : returned,
-                      pool,
-                      grant,
-                      runtime.request.reads,
-                      runtime.signal,
-                      runtime.counts,
-                    )
-                  : new ReturningWriter(
-                      rel,
-                      statement,
-                      table,
-                      context,
-                      returned,
-                      runtime.signal,
-                      runtime.counts,
-                    );
-              let retired: Promise<void> | null = null,
-                closed: Promise<void> | null = null;
-              const retireInput = () =>
-                (retired ??= (async () => {
-                  await writer.close();
-                  await input.close();
-                  arena.close();
-                })());
-              const close = () =>
-                (closed ??= (async () => {
-                  try {
-                    await retireInput();
-                    await returned.close();
-                  } finally {
-                    pool.close();
-                    release();
-                    grant.close();
-                    runtime.modification = null;
-                  }
-                })());
-              runtime.modification = {
-                spool: input,
-                writer,
-                ...(rel.returning === null ? {} : { returned }),
-                retireInput,
-                close,
-              };
-              runtime.onAbort((reason) => writer.abort(reason));
-              return child(runtime, input, stops);
-            });
+            return then(
+              runtime.admit(`modify#${String(rel.id)}`, minimum(runtime), true, rel),
+              (grant) => {
+                if (!(grant instanceof ReservedGrant))
+                  throw new TypeError("RETURNING needs atomic phase admission");
+                const release = grant.holdClose();
+                grant.onReclaimRequest(() => {
+                  const idle = grant.held - grant.allocated - grant.loaned;
+                  if (idle > 0) grant.release(idle);
+                });
+                const pool = new Pool(new Charge(grant), minimum(runtime));
+                const input = new ModifySpool(
+                  types(rel.input),
+                  grant,
+                  runtime.request.spill,
+                  runtime.request.queryId,
+                  runtime.signal,
+                  pool,
+                  2 +
+                    (2 * variableColumns(types(rel))) /
+                      Math.max(1, variableColumns(types(rel.input))) +
+                    (runtime.request.rowRules?.progressCopies() ?? 0) /
+                      Math.max(1, variableColumns(types(rel.input))),
+                );
+                const returned = new ModifySpool(
+                  types(rel),
+                  grant,
+                  runtime.request.spill,
+                  runtime.request.queryId,
+                  runtime.signal,
+                  pool,
+                  2,
+                );
+                const arena = new OutputArena(pool, MODIFY_ROWS);
+                const statement = runtime.request.statement;
+                const table = statement?.catalog.table(rel.tableId);
+                if (!statement || !table) throw new TypeError("Missing RETURNING statement/table");
+                const context: CompileContext = {
+                  arena,
+                  input: shape.types,
+                  params: { slots: [] },
+                  resolveCall,
+                };
+                let writer: UpsertWriter | ReturningWriter;
+                try {
+                  runtime.request.rowRules?.bind(pool, runtime.signal);
+                  writer =
+                    rel.kind === "upsert"
+                      ? new UpsertWriter(
+                          rel,
+                          statement,
+                          table,
+                          context,
+                          rel.returning === null ? _downstream : returned,
+                          pool,
+                          grant,
+                          runtime.request.reads,
+                          runtime.signal,
+                          runtime.counts,
+                          runtime.request.rowRules,
+                        )
+                      : new ReturningWriter(
+                          rel,
+                          statement,
+                          table,
+                          context,
+                          rel.returning === null ? _downstream : returned,
+                          runtime.signal,
+                          runtime.counts,
+                          runtime.request.rowRules,
+                          pool,
+                          grant,
+                          rel.uniqueTargets === true,
+                        );
+                } catch (error) {
+                  return (async () => {
+                    try {
+                      await input.close();
+                      await returned.close();
+                    } finally {
+                      arena.close();
+                      runtime.request.rowRules?.close();
+                      pool.close();
+                      release();
+                      grant.close();
+                    }
+                    throw error;
+                  })();
+                }
+                let retired: Promise<void> | null = null,
+                  closed: Promise<void> | null = null;
+                const retireInput = () =>
+                  (retired ??= (async () => {
+                    await writer.close();
+                    await input.close();
+                    arena.close();
+                  })());
+                const close = () =>
+                  (closed ??= (async () => {
+                    try {
+                      await retireInput();
+                      await returned.close();
+                    } finally {
+                      runtime.request.rowRules?.close();
+                      pool.close();
+                      release();
+                      grant.close();
+                      runtime.modification = null;
+                    }
+                  })());
+                runtime.modification = {
+                  spool: input,
+                  writer,
+                  ...(rel.returning === null ? {} : { returned }),
+                  retireInput,
+                  close,
+                };
+                runtime.onAbort((reason) => writer.abort(reason));
+                return child(runtime, input, stops);
+              },
+            );
           };
         }
         return (runtime, downstream, stops) => {
@@ -2935,7 +2971,44 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       });
     }
     for (const [id, columns] of compoundColumns)
-      if (active.has(id)) runtime.operatorParameterColumns(id, columns, compoundCopies.get(id));
+      if (active.has(id))
+        runtime.operatorParameterColumns(id, columns, compoundCopies.get(id) ?? 1);
+    const modificationSources = new Map<number, Set<number>>();
+    const modification = plan.root;
+    if (modification.op === "modify" && modification.deferGenerated && runtime.request.rowRules) {
+      const rules = runtime.request.rowRules;
+      for (let c = 0; c < modification.input.output.length; c++)
+        columnInputBytes(modification.input, c, {
+          parameter: () => 0,
+          source(source, column) {
+            const columns = joinKeySources.get(source) ?? new Set<number>();
+            columns.add(column);
+            joinKeySources.set(source, columns);
+            const modificationColumns = modificationSources.get(source) ?? new Set<number>();
+            modificationColumns.add(column);
+            modificationSources.set(source, modificationColumns);
+            return 0;
+          },
+        });
+      runtime.operatorParameterColumns(modification.id, 1, 2);
+      runtime.operatorColumnProgress(modification.id, (slots, largest) => {
+        const sizes = {
+          parameter: (slot: number) => slots[slot] ?? largest,
+          source: (source: number, column: number) =>
+            joinKeyColumnBytes.get(source)?.get(column) ?? null,
+        };
+        const input: number[] = [];
+        for (let c = 0; c < modification.input.output.length; c++) {
+          const bytes = columnInputBytes(modification.input, c, sizes);
+          if (bytes === null) return null;
+          input.push(bytes);
+        }
+        const output = rules.outputProgress(modification, input);
+        return output === null
+          ? null
+          : { row: input.reduce((a, b) => a + b, 0) + output + 65536, repeated: 0 };
+      });
+    }
     const jsonGroupSources = new Map<number, Set<number>>();
     const jsonGroupColumnBytes = new Map<number, Map<number, number>>();
     const resultSources = new Map<number, Set<number>>();
@@ -3818,6 +3891,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                   runtime.sourceView(),
                   {
                     ...source,
+                    ...(modificationSources.get(source.id)?.has(index)
+                      ? { singleValueBound: true, batchRows: 1 as const }
+                      : {}),
                     columns: [column],
                     types: [type],
                     stagingBytes: 0,

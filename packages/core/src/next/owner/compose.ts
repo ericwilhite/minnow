@@ -1,3 +1,4 @@
+import { StatementRules } from "../exec/statement-rules.js";
 /**
  * The composition root's engine: `OwnerEngine` and `EngineSession` (engine.ts) over the planner
  * port (planner.ts, B6), the executor (exec/executor.ts, B4) and the write path
@@ -707,7 +708,11 @@ class ComposedSession implements EngineSession {
     context: RunContext,
     target:
       | { readonly snapshot: Snapshot; readonly statement: null }
-      | { readonly snapshot: null; readonly statement: Statement },
+      | {
+          readonly snapshot: null;
+          readonly statement: Statement;
+          readonly rowRules?: StatementRules;
+        },
     returning: "atExecuted" | "atCommit",
   ): Execution {
     const prepared = this.#engine.prepare(plan);
@@ -979,17 +984,20 @@ class ComposedSession implements EngineSession {
   #modify(lowered: LoweredModify, params: readonly WireValue[], context: RunContext): Run {
     if (this.#state === "open" && this.#tx !== null) {
       const tx = this.#tx;
-      const statement = tx.statement({
-        rules: this.#rules(() => statement.catalog),
-        signal: context.signal,
-      });
+      if (lowered.plan.root.op !== "modify") throw new TypeError("Missing modification root");
+      const rowRules = new StatementRules(
+        tx.catalog,
+        lowered.plan.root.tableId,
+        this.#rules(() => tx.catalog),
+      );
+      const statement = tx.statement({ rules: (id) => rowRules.table(id), signal: context.signal });
       let execution: Execution;
       try {
         execution = this.#execute(
           lowered.plan,
           params,
           context,
-          { snapshot: null, statement },
+          { snapshot: null, statement, rowRules },
           "atExecuted",
         );
       } catch (error) {
@@ -1013,8 +1021,14 @@ class ComposedSession implements EngineSession {
     return this.#autocommit(
       lowered.columns,
       (tx, stream) => {
+        if (lowered.plan.root.op !== "modify") throw new TypeError("Missing modification root");
+        const rowRules = new StatementRules(
+          tx.catalog,
+          lowered.plan.root.tableId,
+          this.#rules(() => tx.catalog),
+        );
         const statement = tx.statement({
-          rules: this.#rules(() => statement.catalog),
+          rules: (id) => rowRules.table(id),
           signal: context.signal,
         });
         let execution: Execution;
@@ -1023,7 +1037,7 @@ class ComposedSession implements EngineSession {
             lowered.plan,
             params,
             context,
-            { snapshot: null, statement },
+            { snapshot: null, statement, rowRules },
             "atCommit",
           );
         } catch (error) {
@@ -1135,15 +1149,19 @@ class ComposedSession implements EngineSession {
         const plannedFollowUp = this.plan(lowered.followUp);
         const followUp = plannedFollowUp.lowered;
         if (followUp.kind !== "modify") throw new TypeError("A DDL follow-up must be a write");
-        const next = tx.statement({
-          rules: this.#rules(() => next.catalog),
-          signal: context.signal,
-        });
+        if (followUp.plan.root.op !== "modify")
+          throw new TypeError("Missing follow-up modification");
+        const rowRules = new StatementRules(
+          tx.catalog,
+          followUp.plan.root.tableId,
+          this.#rules(() => tx.catalog),
+        );
+        const next = tx.statement({ rules: (id) => rowRules.table(id), signal: context.signal });
         const execution = this.#execute(
           followUp.plan,
           boundParameters(plannedFollowUp, []),
           context,
-          { snapshot: null, statement: next },
+          { snapshot: null, statement: next, rowRules },
           "atExecuted",
         );
         execution.results.cancel();

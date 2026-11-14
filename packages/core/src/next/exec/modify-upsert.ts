@@ -2,6 +2,7 @@
 import type { TableDef } from "../access/catalog.js";
 import { CardinalityViolationError, ConflictKind, type Statement } from "../access/modify.js";
 import type { TableSnapshot } from "../access/snapshot.js";
+import type { StatementRules } from "./statement-rules.js";
 import type { Grant } from "../memory/governor.js";
 import type { PhysicalType } from "../types.js";
 import { locatorPosition, locatorSegment } from "../vector/locator.js";
@@ -10,7 +11,13 @@ import { ColumnStore } from "./column-store.js";
 import { ProjectOperator } from "./filter.js";
 import { selectedSegment } from "./late-fetch.js";
 import { compileExpr, type CompileContext } from "./kernels/compile.js";
-import { isValidSlot, flatOf, slotIndex, type Compiled } from "./kernels/vectors.js";
+import {
+  ExpressionMemoryError,
+  isValidSlot,
+  flatOf,
+  slotIndex,
+  type Compiled,
+} from "./kernels/vectors.js";
 import type { ModifyRel } from "./modify-returning.js";
 import { pushAndWait, type Operator, type Transfer } from "./pipeline.js";
 import type { ChunkReads } from "./scan.js";
@@ -56,6 +63,7 @@ export class UpsertWriter implements Operator {
   };
   readonly #locator: ReturnType<CompileContext["arena"]["flat"]>;
   readonly #old: ColumnStore;
+  readonly #assigned: ColumnStore;
   readonly #kernels: UpsertExpressions;
   #project: ProjectOperator | null;
   #table: TableSnapshot | null = null;
@@ -71,6 +79,7 @@ export class UpsertWriter implements Operator {
     readonly reads: ChunkReads,
     readonly signal: AbortSignal,
     readonly counts: { inserted: number; updated: number; deleted: number },
+    readonly scope: StatementRules | undefined,
   ) {
     context.arena.take(upsertMetadata(rel));
     this.#conflicts = {
@@ -82,6 +91,11 @@ export class UpsertWriter implements Operator {
     this.#locator = context.arena.flat({ kind: "locator", tableId: table.id });
     this.#old = new ColumnStore(
       table.columns.map((c) => c.type),
+      pool,
+      { chunkRows: 1, targetBytes: 65536 },
+    );
+    this.#assigned = new ColumnStore(
+      rel.onConflict?.assignments.map((a) => a.expr.type) ?? [],
       pool,
       { chunkRows: 1, targetBytes: 65536 },
     );
@@ -166,16 +180,34 @@ export class UpsertWriter implements Operator {
     for (let k = 0; k < (batch.selection?.count ?? batch.length); k++) {
       this.signal.throwIfAborted();
       const row = batch.selection?.rows[k] ?? k;
-      const proposed = batch.columns.map((column) => sortRowView(column, row));
+      let proposed: Vector[] = batch.columns.map((column) => sortRowView(column, row));
+      if (this.scope) {
+        const complete = await this.scope.prepare(
+          this.table.id,
+          { length: 1, selection: null, columns: proposed.slice(0, n) },
+          this.rel.deferGenerated === true,
+          this.pool,
+          this.grant,
+          this.signal,
+        );
+        proposed = [...complete, ...proposed.slice(n)];
+      } else if (this.rel.deferGenerated)
+        throw new TypeError("Generated upsert needs bound row rules");
       const input: Batch = { length: 1, selection: null, columns: proposed.slice(0, n) };
       await this.#insert.conflicts(input, conflict.arbiters, this.#conflicts);
       const kind = this.#conflicts.kinds[0];
       let affected: Vector[];
       if (kind === ConflictKind.none) {
+        this.pool.trimStep();
+        const idle = this.grant.held - this.grant.allocated - this.grant.loaned;
+        if (idle > 0) this.grant.release(idle);
         this.counts.inserted += await this.#insert.insert(input, null);
         affected = proposed;
       } else {
-        if (conflict.action === "nothing") continue;
+        if (conflict.action === "nothing") {
+          this.scope?.retire(this.table.id);
+          continue;
+        }
         if (kind === ConflictKind.statement || kind === ConflictKind.batch)
           throw new CardinalityViolationError(this.table.id, row);
         const locator = this.#conflicts.locators[0] ?? -1;
@@ -193,6 +225,7 @@ export class UpsertWriter implements Operator {
           const data = flatOf(condition).data;
           if (data.layout !== "bool") throw new TypeError("Conflict WHERE must be boolean");
           if (!isValidSlot(condition, 0) || data.values[slotIndex(condition, 0)] !== 1) {
+            this.scope?.retire(this.table.id);
             this.context.arena.retireVarlen();
             this.#old.reset(true);
             continue;
@@ -204,23 +237,57 @@ export class UpsertWriter implements Operator {
         if (locatorVector.data.layout !== "f64") throw new TypeError("Conflict locator layout");
         locatorVector.data.values[0] = locator;
         locatorVector.length = 1;
-        const assigned = values.slice(2 * n, 2 * n + this.#kernels.assignments.length);
-        this.counts.updated += await this.#update.update(
-          { length: 1, selection: null, columns: [locatorVector, ...assigned] },
-          null,
-        );
-        affected = [...current, ...proposed.slice(n)];
+        let assigned = values.slice(2 * n, 2 * n + this.#kernels.assignments.length);
+        if (this.rel.deferGenerated) {
+          this.#assigned.reset(true);
+          await this.pool.need(
+            2 * this.#assigned.appendNeed(assigned, 0) + 65536,
+            this.grant,
+            this.signal,
+          );
+          if (this.#assigned.append(assigned, null, 0, 1) !== 1)
+            throw new ExpressionMemoryError(this.#assigned.appendNeed(assigned, 0));
+          assigned = this.#assigned.vectors();
+        }
+        let next: Vector[] = [...current];
         for (const [j, assignment] of conflict.assignments.entries()) {
           const at = this.table.columns.findIndex((column) => column.id === assignment.column),
             value = assigned[j];
           if (at < 0 || !value) throw new TypeError("Missing conflict assignment");
-          affected[at] = value;
+          next[at] = value;
         }
+        if (this.scope)
+          next = [
+            ...(await this.scope.prepare(
+              this.table.id,
+              { length: 1, selection: null, columns: next },
+              this.rel.deferGenerated === true,
+              this.pool,
+              this.grant,
+              this.signal,
+            )),
+          ];
+        const writes = conflict.assignments.map((assignment) => {
+          const value =
+            next[this.table.columns.findIndex((column) => column.id === assignment.column)];
+          if (!value) throw new TypeError("Missing generated conflict assignment");
+          return value;
+        });
+        this.pool.trimStep();
+        const idle = this.grant.held - this.grant.allocated - this.grant.loaned;
+        if (idle > 0) this.grant.release(idle);
+        this.counts.updated += await this.#update.update(
+          { length: 1, selection: null, columns: [locatorVector, ...writes] },
+          null,
+        );
+        affected = [...next, ...proposed.slice(n)];
       }
       if (this.#project)
         await pushAndWait(this.#project, { length: 1, selection: null, columns: affected });
       this.context.arena.retireVarlen();
+      this.scope?.retire(this.table.id);
       this.#old.reset(true);
+      this.#assigned.reset(true);
     }
   }
   finish() {
@@ -232,6 +299,7 @@ export class UpsertWriter implements Operator {
   async close(): Promise<void> {
     await this.#pending.catch(() => undefined);
     this.#project = null;
+    this.#assigned.close();
     this.#old.close();
     this.#table = null;
   }

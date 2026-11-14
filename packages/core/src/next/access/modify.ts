@@ -192,6 +192,8 @@ export interface ConflictOutput {
  * order); they must not retain the batch.
  */
 export interface TableRules {
+  /** Optional shared complete-row validator: physical row order, NOT NULL then named CHECKs. */
+  validate?(batch: Batch, columnIds: readonly number[] | null): void;
   /**
    * CHECK constraints over the active rows: the first failing row (physical) and constraint id,
    * or null when all pass (NULL passes), ordered by physical row then PostgreSQL constraint

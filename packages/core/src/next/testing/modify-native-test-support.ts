@@ -1,6 +1,7 @@
 /** Native execution without the adapter's commit policy, for statement/delivery laws. */
 import type { StorageCore } from "./storage-core.js";
 import type { ParameterValue } from "../exec/executor.js";
+import { StatementRules } from "../exec/statement-rules.js";
 import { compileTableRules } from "../exec/rules.js";
 import { ChunkReader } from "../page/reader.js";
 export async function startModification(
@@ -13,20 +14,21 @@ export async function startModification(
   if (lowered.kind !== "modify") throw new TypeError("Expected modification");
   const prepared = core.executor.prepare(lowered.plan);
   const tx = await core.harness.path.begin();
-  const statement = tx.statement({
-    rules: (id) => {
-      const table = statement.catalog.table(id);
-      if (!table) throw new TypeError("Missing table");
-      return compileTableRules(
-        table,
-        statement.catalog.version,
-        core.lowerer.lowerTableRules(table, statement.catalog),
-      );
-    },
+  if (lowered.plan.root.op !== "modify") throw new TypeError("Missing modification root");
+  const rowRules = new StatementRules(tx.catalog, lowered.plan.root.tableId, (id) => {
+    const table = tx.catalog.table(id);
+    if (!table) throw new TypeError("Missing rule table");
+    return compileTableRules(
+      table,
+      tx.catalog.version,
+      core.lowerer.lowerTableRules(table, tx.catalog),
+    );
   });
+  const statement = tx.statement({ rules: (id) => rowRules.table(id) });
   try {
     const execution = prepared.execute({
       snapshot: null,
+      rowRules,
       statement,
       parameters,
       statementTime: 0n,

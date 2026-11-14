@@ -7678,3 +7678,31 @@ export const MODIFY_INDEX_REACH = [
   "stored segments",
   "memory segments",
 ] as const;
+
+export const MODIFY_ROW_RULES_REACH = [
+  "insert generated",
+  "update generated",
+  "generated DEFAULT",
+  "insert select generated",
+  "excluded generated",
+  "duplicate valid match",
+  "generated assignment refused",
+  "FK generated rekey",
+  "FK generated set null",
+  "CHECK rollback",
+] as const;
+
+export const ROOT_RULE_ORDER_REACH = [
+  "NOT NULL before generated error",
+  "CHECK before generated error",
+  "constraint identity",
+  "statement rollback",
+] as const;
+
+export const MODIFY_RULE_PRESSURE_REACH = [
+  "funded admission",
+  "wide generated insert",
+  "wide generated update",
+  "64 MiB",
+  "spill cleanup",
+] as const;

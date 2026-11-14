@@ -18,6 +18,8 @@ import {
 import { tableRuleProgram, ruleRetentionBytes, type RuleProgram } from "./rule-program.js";
 
 export interface BoundTableRules extends TableRules {
+  /** Caller fences all output borrows first; keep kernels/program alive for later FK actions. */
+  retireGenerated(): void;
   close(): void;
 }
 export interface RowRuleContext extends RowRuleOptions {
@@ -93,6 +95,9 @@ export function bindTableRules(
     : {
         check: rules.check.bind(rules),
         generate: rules.generate.bind(rules),
+        retireGenerated() {
+          return undefined;
+        },
         close() {
           return undefined;
         },
@@ -120,6 +125,7 @@ function total(expr: ScalarExpr): boolean {
 class Evaluator implements BoundTableRules {
   readonly #arena: OutputArena;
   readonly #one: Selection;
+  readonly #prefix: Selection;
   readonly #checks;
   readonly #generated;
   #closed = false;
@@ -141,6 +147,8 @@ class Evaluator implements BoundTableRules {
           program.generated.length * 64,
       );
       this.#one = { rows: new Uint16Array(1), count: 1 };
+      arena.take(2 * capacity);
+      this.#prefix = { rows: new Uint16Array(capacity), count: 0 };
       const context = {
         arena,
         params: { slots: [] },
@@ -210,6 +218,28 @@ class Evaluator implements BoundTableRules {
     } finally {
       for (const c of checks) c.value = null;
     }
+  }
+  validate(batch: Batch, changed: readonly number[] | null): void {
+    this.#validate(batch);
+    const prefix = this.#prefix;
+    prefix.count = 0;
+    let notNull: { row: number; column: number } | null = null;
+    for (let k = 0; k < (batch.selection?.count ?? batch.length); k++) {
+      const row = batch.selection?.rows[k] ?? k;
+      for (const [c, column] of this.program.table.columns.entries()) {
+        const value = batch.columns[c];
+        if (!column.nullable && value && !isValidSlot(value, row)) {
+          notNull = { row, column: column.id };
+          break;
+        }
+      }
+      if (notNull) break;
+      prefix.rows[prefix.count++] = row;
+    }
+    const failure = this.check(notNull ? { ...batch, selection: prefix } : batch, changed);
+    if (failure) throw new CheckViolationError(this.program.table.id, failure.checkId, failure.row);
+    if (notNull)
+      throw new NotNullViolationError(this.program.table.id, notNull.column, notNull.row);
   }
   generate(batch: Batch, changed: readonly number[]): void {
     this.#validate(batch);
@@ -295,6 +325,14 @@ class Evaluator implements BoundTableRules {
         throw error;
       }
     }
+  }
+  retireGenerated(): void {
+    if (this.#closed) return;
+    for (const g of this.#generated) {
+      g.store?.close();
+      g.store = null;
+    }
+    this.#arena.retireVarlen();
   }
   close(): void {
     if (this.#closed) return;

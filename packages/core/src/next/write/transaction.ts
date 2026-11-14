@@ -1311,6 +1311,19 @@ export class TableWriterImpl implements TableWriter {
     length: number,
     changed: readonly number[] | null,
   ): void {
+    if (
+      this.def.checks.length > 0 ||
+      this.def.columns.some((column) => column.generatedSql !== null)
+    ) {
+      const rules = this.statement.rules(this.tableId);
+      if (rules.validate) {
+        rules.validate(
+          { columns, length, selection: rows === null ? null : { rows, count: rows.length } },
+          changed,
+        );
+        return;
+      }
+    }
     this.def.columns.forEach((column, c) => {
       if (column.nullable && column.allowedValues === undefined) return;
       const vector = need(columns[c]);

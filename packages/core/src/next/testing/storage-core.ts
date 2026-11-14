@@ -15,6 +15,7 @@ import { UnsupportedPlanError } from "../exec/errors.js";
 import type { WireDictionary, WireFlat } from "../exec/result.js";
 import { bindParameter } from "../exec/parameters.js";
 import { ColumnStore } from "../exec/column-store.js";
+import { StatementRules } from "../exec/statement-rules.js";
 import { compileTableRules } from "../exec/rules.js";
 import type { LoweringContext } from "../lower/lowerer.js";
 import { createLowerer } from "../lower/create.js";
@@ -121,19 +122,20 @@ export class StorageCore implements NextCore {
     if (lowered.kind === "modify") {
       const prepared = this.executor.prepare(lowered.plan);
       const tx = await this.harness.path.begin();
-      const statement = tx.statement({
-        rules: (id) => {
-          const table = statement.catalog.table(id);
-          if (!table) throw new TypeError("missing table");
-          return compileTableRules(
-            table,
-            statement.catalog.version,
-            this.lowerer.lowerTableRules(table, statement.catalog),
-          );
-        },
+      if (lowered.plan.root.op !== "modify") throw new TypeError("Missing modification root");
+      const rowRules = new StatementRules(tx.catalog, lowered.plan.root.tableId, (id) => {
+        const table = tx.catalog.table(id);
+        if (!table) throw new TypeError("Missing rule table");
+        return compileTableRules(
+          table,
+          tx.catalog.version,
+          this.lowerer.lowerTableRules(table, tx.catalog),
+        );
       });
+      const statement = tx.statement({ rules: (id) => rowRules.table(id) });
       const execution = prepared.execute({
         snapshot: null,
+        rowRules,
         statement,
         parameters: params,
         statementTime: 0n,
@@ -154,7 +156,7 @@ export class StorageCore implements NextCore {
         await execution.delivered;
         this.lastProfile = summary.profile;
         return {
-          kind: lowered.plan.root.op === "modify" ? lowered.plan.root.kind : "modify",
+          kind: lowered.plan.root.kind,
           rowCount: summary.rowCount,
           ...(prepared.columns.length === 0
             ? {}

@@ -728,6 +728,13 @@ function modifyRows(rel: Extract<Rel, { op: "modify" }>, env: Environment): Row[
     stored.length = 0;
     return [];
   }
+  const generate = (row: Row): void => {
+    if (!rel.deferGenerated) return;
+    for (const column of table.columns) {
+      const rule = rules.generated.find((entry) => entry.columnId === column.id);
+      if (rule) row[table.columns.indexOf(column)] = evaluate(rule.expr, row, env);
+    }
+  };
   const input = run(rel.input, env);
   const returned: Row[] = [];
   const touched = new Set<number>();
@@ -789,6 +796,7 @@ function modifyRows(rel: Extract<Rel, { op: "modify" }>, env: Environment): Row[
             reads.push(value);
             next[table.columns.findIndex((column) => column.id === id)] = value;
           }
+          generate(next);
           validate(next);
           stored[locator] = [];
           if (conflict(next, []) !== -1) throw new ReferenceSqlError("duplicate key", "23505");
@@ -815,6 +823,7 @@ function modifyRows(rel: Extract<Rel, { op: "modify" }>, env: Environment): Row[
     if (rel.kind === "insert" || rel.kind === "upsert") {
       const proposed = passthrough === 0 ? row : row.slice(0, row.length - passthrough);
       const extra = passthrough === 0 ? [] : row.slice(row.length - passthrough);
+      generate(proposed);
       validate(proposed);
       if (rel.kind === "upsert" && rel.onConflict !== null) {
         const found = conflict(proposed, rel.onConflict.arbiters);

@@ -465,6 +465,9 @@ export type Rel =
       /** UPDATE/DELETE input carries the complete pre-statement row after assigned values,
        * before passthrough. It supplies RETURNING without fetching a locator after mutation. */
       readonly oldRow?: boolean;
+      /** Generated placeholders are filled by the statement-bound row-rule scope, before checks. */
+      readonly deferGenerated?: boolean;
+      readonly usesRules?: boolean;
       /**
        * UPDATE: the catalog column ids the statement assigns, in input order after the locator
        * (access/ `TableWriteOptions.assigned`). Empty for insert, upsert and delete.

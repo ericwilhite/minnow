@@ -115,6 +115,7 @@
  *   cardinalities back to lowering's statistics. `EXECUTOR_COSTS` are per-row CPU costs the cost
  *   model multiplies with cardinalities; the owner hands them to the lowerer.
  */
+import type { StatementRules } from "./statement-rules.js";
 import type { Snapshot } from "../access/snapshot.js";
 import type { Statement } from "../access/modify.js";
 import type { SequenceAccess } from "../access/write-path.js";
@@ -199,6 +200,9 @@ export interface PreparedPlan {
 }
 
 interface ExecuteBase {
+  /** Shared admitted CHECK/generated binding, also used by native FK actions. */
+  readonly rowRules?: StatementRules;
+
   /** Explicit relinquishing consumer only; ordinary result credits do not end view lifetimes. */
   readonly outputBuffers?: {
     take(bytes: number): ArrayBuffer | null;

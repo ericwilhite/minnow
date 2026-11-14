@@ -256,7 +256,8 @@ export class QueryRuntime {
     const spool =
       this.plan.root.op === "modify" &&
       this.plan.root.returning === null &&
-      this.plan.root.kind !== "upsert"
+      this.plan.root.kind !== "upsert" &&
+      !this.plan.root.usesRules
         ? modifySpoolBytes(this.plan.root.input.output.length)
         : 0;
     return (
@@ -1612,7 +1613,8 @@ export class QueryExecution implements Execution {
                   await this.#modifySpool?.close();
                   await modification?.retireInput?.();
                 })
-                .then(() => this.request.statement?.end(this.#controller.signal));
+                .then(() => this.request.statement?.end(this.#controller.signal))
+                .finally(() => this.request.rowRules?.close());
             });
       if (cleanup instanceof Promise) {
         this.#async = true;
