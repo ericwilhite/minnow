@@ -74,8 +74,10 @@ The unexported rebuild gives catalogs their own versioned binary grammar. Catalo
 stable field IDs and exact typed values. Native storage splits the logical stream across bounded,
 checksummed pages; the write-ahead log uses the same record definitions for catalog changes.
 Readers reject unknown required fields or versions with a typed error. Unknown optional display
-fields survive a read and rewrite. Field IDs and flag bytes are separate; reserved flags refuse.
-Catalog admission validates type, vector and reference consistency. Logged catalog changes name
+fields survive a read and rewrite. Reserved semantic fields refuse even when marked optional.
+Field IDs and flag bytes are separate; reserved flags refuse.
+Catalog admission validates type, vector and reference consistency. Live safe-integer payloads
+must be exact integers without negative zero; payload bytes under SQL NULL stay uninterpreted. Logged catalog changes name
 their expected predecessor version, checked before any effects from that transaction replay.
 Catalog pages participate in ordinary reachability and reclamation.
 These are unreleased development formats, not a change to the published 0.x formats or a public

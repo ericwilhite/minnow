@@ -283,6 +283,9 @@ export const CATALOG_RECORD_KINDS = {
   trigger: 20,
   fts: 21,
   section: 22,
+  ftsConfig: 26,
+  ftsCoverage: 27,
+  ftsState: 28,
 } as const;
 
 export const CATALOG_RECORD_SCHEMAS = {
@@ -409,6 +412,33 @@ export const CATALOG_RECORD_SCHEMAS = {
     "version:u",
   ],
   section: ["kind:u", "count:u"],
+} as const;
+
+/** Reserved semantic fields are unsupported even when their wire flag says optional.
+ * Never preserve these as opaque display extensions: their ids already have future semantics.
+ * FTS implementation removes each reservation only while installing its checked live schema.
+ */
+export const CATALOG_RESERVED_FIELDS = {
+  counters: [{ id: 8, name: "nextFtsId", type: "u" }],
+  change: [
+    { id: 15, name: "fts", type: "fts" },
+    { id: 16, name: "ftsId", type: "u" },
+  ],
+} as const;
+/** Allocated record families, not supported record decoders or an FTS readiness claim. */
+export const CATALOG_RESERVED_RECORD_SCHEMAS = {
+  fts: [
+    "id:u",
+    "tableId:u",
+    "columnId:u",
+    "tokenizerVersion:u",
+    "rendererVersion:u",
+    "scorerVersion:u",
+    "config:ftsConfig",
+  ],
+  ftsConfig: [],
+  ftsCoverage: [],
+  ftsState: [],
 } as const;
 
 /** Conditional fields of a resolved WAL operation; all listed fields are required. */

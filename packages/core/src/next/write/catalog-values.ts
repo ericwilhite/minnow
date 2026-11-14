@@ -143,6 +143,7 @@ function integerData(
   value: { repr: string; values?: unknown; limbs?: unknown },
   length: number,
   wide: boolean,
+  active: boolean,
 ): void {
   if (value.repr === "int128") {
     shape(value, ["repr", "limbs"]);
@@ -167,6 +168,12 @@ function integerData(
       (value.values as { length: number }).length === length,
       "Invalid stored integer vector length",
     );
+    // Only valid slots are values. In particular, NULL may retain NaN or any raw float word.
+    if (active && value.repr === "safe")
+      check(
+        (value.values as Float64Array).every((v) => Number.isSafeInteger(v) && !Object.is(v, -0)),
+        "Invalid stored safe integer value",
+      );
   }
 }
 export function validateCatalogMissing(vector: FlatVector, type: PhysicalType): void {
@@ -211,7 +218,7 @@ export function validateCatalogMissing(vector: FlatVector, type: PhysicalType): 
     }
     case "int64":
       shape(data, ["layout", "values"]);
-      integerData(data.values, n, false);
+      integerData(data.values, n, false, active);
       break;
     case "fixed16":
       shape(data, ["layout", "bytes"]);
@@ -235,7 +242,7 @@ export function validateCatalogMissing(vector: FlatVector, type: PhysicalType): 
       break;
     case "decimal":
       shape(data, ["layout", "coefficients", "scale", "scales", "specials"]);
-      integerData(data.coefficients, n, true);
+      integerData(data.coefficients, n, true, active);
       check(
         data.scale === null
           ? data.scales instanceof Uint16Array &&
@@ -264,7 +271,7 @@ export function validateCatalogMissing(vector: FlatVector, type: PhysicalType): 
           data.days.length === n,
         "Invalid stored interval shape",
       );
-      integerData(data.micros, n, false);
+      integerData(data.micros, n, false, active);
       break;
   }
 }

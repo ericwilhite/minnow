@@ -16,7 +16,9 @@ fields and versions are refused; exact typed values and optional display extensi
 rewrites. Reachability and reclamation include every catalog page. Fields use separate ID and flag
 bytes; reserved flags and inconsistent type, vector and reference shapes are refused. Logged
 catalog changes bind their expected predecessor and resulting version before row replay.
-Informational foreign keys may retain a dropped parent across checkpoint and reopen.
+Informational foreign keys may retain a dropped parent across checkpoint and reopen. Live
+safe-integer payloads reject nonfinite, fractional, unsafe and negative-zero values; NULL payloads
+stay uninterpreted. Reserved semantic FTS fields refuse even when marked optional.
 This changes unreleased
 rebuild bytes only (reader 3, manifest 4, commit body 2); no supported next/ writer has shipped.
 The published 0.x engine and its stored formats are unchanged; no migration is needed.

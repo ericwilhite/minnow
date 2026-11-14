@@ -169,7 +169,9 @@ charge callbacks and checks capacities, overlap, refusal, constructor failures a
 `durable-format.ts` assigns MCAT1 logical records, MCRT1 native indexes, MCPG1 data pages and
 MCHG1 WAL changes. Each field is an ID varuint, flags byte (bit 0 required), length varuint
 and payload. Field IDs span u53; every reserved flag bit refuses. Required fields use registered numeric IDs; unknown required fields,
-features and versions refuse. Optional display extensions remain opaque through rewrites.
+features and versions refuse. Reserved semantic fields also refuse when marked optional; FTS
+field/family allocations are registered before implementation. Optional display extensions remain
+opaque through rewrites.
 Records retain exact typed vectors, decimal coefficients, bigint sequence settings and UTF8
 identifier boundaries. An individual record is capped at 4 MiB. Catalogs stream one admitted
 record at a time across 256 KiB pages and 64-way indexes, including records crossing pages.
@@ -177,7 +179,9 @@ Read/abort/cancel paths return codec IO and temporary graph-validation charges. 
 claim new accounting for the existing CatalogView definition residency model.
 
 Native byte columns have an explicit BYTEA catalog descriptor; SQL BYTEA remains refused by the
-front end. Per-slot decimal payloads under SQL NULL stay uninterpreted; active scales/specials
+front end. Safe integer payloads must be exact within ±(2^53−1), without negative zero, for
+int64-family values, decimal coefficients and interval microseconds. Per-slot payloads under SQL
+NULL stay uninterpreted; active scales/specials
 retain their bounds. Catalog admission checks per-kind fields, declared/physical type agreement, exact missing-value
 shapes and FK support-key coherence. Enforced references require a live matching parent;
 informational references may retain the allocated identity of a dropped parent. MCHG changes

@@ -4,6 +4,7 @@
 import {
   CATALOG_RECORD_KINDS,
   CATALOG_RECORD_SCHEMAS,
+  CATALOG_RESERVED_FIELDS,
   CATALOG_NATIVE_GRAMMAR as grammar,
   DURABLE_CODECS,
 } from "../durable-format.js";
@@ -12,6 +13,8 @@ import { ByteReader, ByteWriter, utf8Length, type ByteSink } from "./bytes.js";
 import type { BufferAllocator } from "./commit-buffers.js";
 
 export type CatalogRecordKind = keyof typeof CATALOG_RECORD_SCHEMAS;
+const reservedFields: Partial<Record<CatalogRecordKind, ReadonlyArray<{ readonly id: number }>>> =
+  CATALOG_RESERVED_FIELDS;
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const opaque = Symbol("MCAT optional display fields");
 interface Extension {
@@ -404,6 +407,8 @@ function readRecord(input: ByteReader, kind: CatalogRecordKind, depth: number): 
     const payload = new ByteReader(body.raw(uint(body))),
       definition = definitions[id - 1];
     if (definition === undefined) {
+      if (reservedFields[kind]?.some((field) => field.id === id))
+        throw new UnsupportedCatalogError(`reserved field ${String(id)} in ${kind}`);
       if (required) throw new UnsupportedCatalogError(`field ${String(id)} in ${kind}`);
       extensions.push({ id, bytes: payload.bytes.slice() });
       continue;

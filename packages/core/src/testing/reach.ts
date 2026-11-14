@@ -5831,3 +5831,28 @@ export const CATALOG_NULL_DECIMAL_REACH = [
   "scale zero",
   "scale boundary",
 ] as const;
+
+export const CATALOG_SAFE_VALUES_REACH = [
+  "int64",
+  "time",
+  "timestamp",
+  "timestamptz",
+  "interval",
+  "decimal",
+  "exact live",
+  "NULL ignored",
+  "invalid live refused",
+  "NaN",
+  "infinity",
+  "negative zero",
+  "fraction",
+  "unsafe integer",
+] as const;
+export const CATALOG_RESERVATION_REACH = [
+  "counter 8",
+  "change 15",
+  "change 16",
+  "optional",
+  "required",
+  "display retained",
+] as const;
