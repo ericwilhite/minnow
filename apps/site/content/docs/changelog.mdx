@@ -10,6 +10,23 @@ compatibility policy and release process.
 
 ## Unreleased
 
+### Planned 1.0 cutover: full-text search
+
+The unexported 1.0 engine lowers MATCH/BM25 and evaluates them by scan. BM25 uses the whole
+visible base-table corpus before WHERE/LIMIT, with exact document-frequency unions for
+multiple columns and prefixes. Its raw-column spool spills under memory pressure; tokenizer
+workspace and score buffers are admitted before allocation.
+
+Document renderer version 2 deliberately uses PostgreSQL text forms for TIME and SQL arrays:
+fractional TIME zeros are dropped, and arrays use PostgreSQL quoting/escaping rather than the
+original JSON-array spelling. JSON follows `json::text` source-text preservation; JSONB follows
+canonical PostgreSQL JSONB text, including numeric display scale. These forms may change
+search terms compared with the 0.x tagged renderings. Ordinary scalar rendering and the
+version-1 tokenizer/scorer semantics are unchanged. The shipped 0.x engine stays on renderer
+version 1 with unchanged behavior. The 1.0 cutover requires a new database; its postings will
+be built from renderer-2 values. This stage adds no durable postings or public API and changes
+no shipped stored format.
+
 Full-text tokenization, plain-value document rendering and BM25 scoring now share an internal
 implementation between the shipped engine and the rebuild. Query behavior and stored formats
 are unchanged; no migration is needed. The row adapter avoids an extra iterator per search;

@@ -582,3 +582,17 @@ export const ORDERED_SET_CURRENT_REAL_AUTHORITY = {
   type: "double precision",
   authority: "C6/R21: REAL rounds on storage to float32; shipped REAL columns store JS doubles",
 } as const;
+
+/** Lead ruling 2026-11-13 (B7 stage2): representation loss must not refuse FTS.
+ * This is an explicit fixture authority, not a general result/error waiver. The renderer
+ * suite compares native text directly with PostgreSQL ::text and asserts both v1 and v2
+ * outcomes on each named difference. Tokenizer/scorer semantics are unchanged.
+ */
+export const FTS_RENDERING_AUTHORITY = {
+  ruling: "B7 FTS renderer canonicalization, lead 2026-11-13",
+  nativeRenderVersion: 2,
+  shippedRenderVersion: 1,
+  types: ["time", "array", "json", "jsonb"],
+  authority:
+    "PostgreSQL type output (::text), verified by fts-render-pglite.test.ts; canonical TIME fractions and array quoting, JSON source text and JSONB stored text",
+} as const;

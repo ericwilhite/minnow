@@ -102,6 +102,10 @@ export function columnInputBytes(
       const bytes = sizes.source(rel.id, column, coefficient);
       return bytes === null ? null : coefficient * bytes;
     }
+    case "fts":
+      return column < rel.input.output.length
+        ? columnInputBytes(rel.input, column, sizes, coefficient)
+        : 16 * coefficient;
     case "project": {
       const expr = rel.exprs[column];
       return expr ? expressionInputBytes(expr, rel.input, sizes, coefficient) : null;

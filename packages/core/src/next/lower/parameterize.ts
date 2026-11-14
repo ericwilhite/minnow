@@ -388,9 +388,17 @@ export function parameterize(text: string): ParameterizedText | null {
  * index lookup or range, either directly or through a widening integer cast.
  */
 export function liftedSlotsAreEquivalent(
-  plan: { readonly root: Rel; readonly initPlans: ReadonlyArray<{ readonly plan: Rel }> },
+  plan: {
+    readonly root: Rel;
+    readonly initPlans: ReadonlyArray<{ readonly plan: Rel }>;
+    readonly ftsParameters?: ReadonlyArray<{ readonly source: number; readonly slot: number }>;
+  },
   lifted: ReadonlySet<number>,
 ): boolean {
+  // Literal FTS queries validate during lowering; lifting one would postpone that error.
+  // Private text copies are real parameter dependencies even though only their destination
+  // slot appears in the expression tree. Keep literal FTS statements in their own family.
+  if (plan.ftsParameters?.some((mapping) => lifted.has(mapping.source))) return false;
   const widening = (expr: ScalarExpr): boolean =>
     expr.op === "cast" &&
     expr.input.type.kind === "int32" &&

@@ -2975,7 +2975,8 @@ not require a home cache directory.
 - Windows, set operations, recursive CTEs and GENERATE_SERIES, UPDATE … FROM, DELETE … USING and
   MERGE lower too. Numeric ordered sets lower with constant/parameter scalar fractions.
   Still refused (`UnsupportedPlanError`, stage "lower"): JSON aggregates, JSON constructors and paths, array / regex functions, batch UPDATE / DELETE (`batchWrite`), LATERAL the
-  decorrelator cannot remove, full-text search. `INVENTORY.md` has every construct's status.
+  decorrelator cannot remove. MATCH/BM25 now lower to the scan route described below.
+  `lower/INVENTORY.md` has every construct's status.
 - `testing/lowering-differential.test.ts` runs DDL, seed rows, queries (joins, subqueries,
   windows, set operations, recursion included), writes, RETURNING and failing writes through the
   current engine and through lowering + the IR reference interpreter (`testing/ir-reference.ts`),
@@ -3657,8 +3658,8 @@ floor changes.
 `full-text.ts` exposes the permitted representation-neutral `src/full-text` leaf: tokenizer v1,
 plain-value renderer v1, scorer v1, matching and exact corpus-stat helpers. The shipped adapter
 alone decodes legacy tagged values and retains its existing compilation cache. Native physical
-values will be adapted at the scan boundary; importing this leaf does not yet enable native SQL
-MATCH/BM25. Native execution must charge tokenizer workspace before calling these allocating
+values use the renderer-2 adapter at the scan boundary in stage 2 below; importing the leaf alone
+does not wire native SQL MATCH/BM25. Native execution must charge tokenizer workspace before calling these allocating
 helpers and must not adopt the shipped process cache. Dependency tests pin the leaf's complete
 neutral import closure; generated SQL comparisons use an independent token/stat/score model.
 
@@ -3678,3 +3679,29 @@ worst-case reservation. Failed vectorized expression batches in projections and 
 replay in row order, delivering complete earlier rows before the first data error. Target
 lists evaluate left to right; CASE/COALESCE keep their masks. Replay depends on volatile
 kernels staying refused. Other expanding expressions keep their dedicated admission paths.
+
+### Native FTS scan route (B7 stage 2)
+
+`lower/fts.ts` lowers MATCH to the R19 non-strict `fts_match` kernel. BM25 appends a native
+`fts` corpus operator before WHERE, GROUP BY and demand bounds. It accumulates integer N/T/df
+counts over visible input, with a per-document union across repeated columns and prefix terms,
+then scores retained columns through the shared scorer. A charged ordinal preserves input
+order through the external raw-column spool; there is no input replay or shipped executor.
+MATCH filter/projection jobs yield within documents and defer errors to scalar demand.
+
+A complete workspace bounds UTF-8 decoding, normalization/lowercase expansion, code-point
+iteration and 4096 bounded tokens. Source sizing and query length choose one shared workspace
+per arena (64 KiB plus 512 bytes per bounded source byte, capped at the legal cell length),
+not one reservation per column or row. Catalog missing values and numeric display scale also
+enter that bound; unconstrained NUMERIC uses the legal document ceiling until a tighter scale
+proof is available. The spool uses the existing charged sort/spill pool;
+cancellation fences document jobs, borrowed frames and spill I/O before releasing ownership.
+Each immutable literal/parameter query is parsed once per node. Cached terms own at most 32
+UTF-16 units each, including a truncated surrogate; they never pin a full decoded query or
+normalization source. Per-node query metadata is separately charged before construction.
+
+Native renderer 2 follows PG TIME/array/JSON/JSONB text laws (public FTS page / lead ruling
+2026-11-13); the shipped renderer remains 1. Tokenizer/scorer stay version 1. Tests compare
+real native SQL against shipped SQL for the common forms and pin the deliberate renderer-2
+changes against PGlite. No ready-index route, durable FTS grammars, background builds, snapshot
+FTS records or throughput claim is included in stage 2.

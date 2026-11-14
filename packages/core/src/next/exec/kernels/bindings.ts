@@ -29,7 +29,8 @@ export type CallKernel =
   | "temporalSub"
   | "calendarAdd"
   | "intervalExtract"
-  | "json";
+  | "json"
+  | "fts";
 
 export type Binding =
   | {
@@ -89,6 +90,7 @@ export const CASE_RESULT_KINDS: ReadonlySet<PhysicalKind> = new Set<PhysicalKind
 ]);
 
 export const FUNCTION_BINDINGS: Readonly<Record<string, Binding | PerOverload>> = {
+  fts_match: { kernel: "fts" },
   json_record: { kernel: "json" },
   json_record_value: { kernel: "json" },
   json_object: { kernel: "json" },

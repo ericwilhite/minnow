@@ -49,6 +49,16 @@ export class PlanBuilder {
   #nextWorkTable = 1;
   #nextSource = 1;
   readonly reads = new Set<number>();
+  readonly ftsQueries: ScalarExpr[] = [];
+  readonly ftsParameters = new Map<number, number>();
+  ftsParameter(source: number): number {
+    let slot = this.ftsParameters.get(source);
+    if (slot === undefined) {
+      slot = this.slot({ kind: "text" });
+      this.ftsParameters.set(source, slot);
+    }
+    return slot;
+  }
   readonly rowCounts = new Map<number, number>();
   /**
    * Whether a decision about the plan's shape read statistics (an index range costed against a

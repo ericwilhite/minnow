@@ -31,6 +31,7 @@
  *   parameter slots; `memoize` unless the subquery is volatile.
  * - An uncorrelated scalar subquery is an init plan (query.ts `installSubqueries`).
  */
+import { FullTextScope } from "./fts.js";
 import { seriesArgumentCount } from "../../engine/series-sources.js";
 import { constantRows } from "./constant-rows.js";
 import type { TableDef } from "../access/catalog.js";
@@ -397,7 +398,24 @@ export function lowerFrom(
   const attachments: Attachment[] = [];
 
   const rowMarkers = new Set<number>();
+  const fullText = new FullTextScope(
+    builder,
+    entries.length === 1 ? entries[0]?.read : undefined,
+    () =>
+      entries.flatMap((entry) =>
+        entry
+          .names()
+          .filter((name) => !name.startsWith(HIDDEN))
+          .map((name) => {
+            const found = entry.resolve(name);
+            if (!found) throw new PlanningError("FTS source column vanished", "XX000");
+            return typedOf(entry, found);
+          }),
+      ),
+    base.derived === undefined && base.union === undefined,
+  );
   const scope: Scope = {
+    fts: (expression, current) => fullText.lower(expression, current),
     rowField: (qualifier, ordinal) => {
       const entry = byQualifier(qualifier)[0];
       const found = entry?.field(ordinal);
@@ -817,6 +835,8 @@ export function lowerFrom(
           })),
         ),
     build: (where) => {
+      const fullTextWhere = fullText.used ? where : [];
+      if (fullText.used) where = [];
       const pool: Conjunct[] = [];
       const add = (typed: Typed) => {
         for (const part of conjunctsOf(typed))
@@ -905,11 +925,12 @@ export function lowerFrom(
       }
       const remaining = pool.filter((conjunct) => !conjunct.used);
       for (const conjunct of remaining) conjunct.used = true;
-      return filterUnit(
+      const result = filterUnit(
         acc,
         [...remaining.map((conjunct) => conjunct.typed), ...deferred],
         builder,
       );
+      return fullText.used ? fullText.finish(result, fullTextWhere) : result;
     },
   };
 }

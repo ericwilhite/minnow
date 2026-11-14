@@ -6018,3 +6018,73 @@ export const LISTED_REOPEN_CATALOG_REACH = [
   "audit",
   "no IO charge",
 ] as const;
+
+/** Native scan FTS: query grammar and snapshot-corpus statistics are separate axes. */
+export const FTS_SCAN_REACH = [
+  "whole corpus",
+  "NULL empty",
+  "prefix union",
+  "Unicode",
+  "duplicate terms and columns",
+  "parameters",
+  "schema and wildcard rebind",
+  "numeric display width",
+] as const;
+
+export const FTS_SCAN_PRESSURE_REACH = [
+  "competing grant",
+  "spill",
+  "df union",
+  "backpressure",
+  "exact scores",
+  "drained",
+] as const;
+
+export const FTS_RENDER_REACH = [
+  "versioned",
+  "TIME canonical",
+  "ARRAY canonical",
+  "JSON SQL text",
+  "JSONB SQL text",
+  "NULL elements and escaping",
+  "shipped unchanged",
+] as const;
+
+export const FTS_SQL_PRESSURE_REACH = [
+  "shipped exact",
+  "all credit occupied",
+  "native SQL spill",
+  "drained",
+] as const;
+
+export const FTS_JSON_REACH = [
+  "nested",
+  "siblings",
+  "CASE demand",
+  "owned parameters across cut",
+  "drained",
+] as const;
+
+export const FTS_CANCEL_REACH = [
+  "append suspended",
+  "source still charged",
+  "closed fenced",
+  "drained",
+] as const;
+
+export const FTS_WRITE_REACH = [
+  "UPDATE",
+  "DELETE",
+  "whole statement corpus",
+  "parameters and threshold",
+  "fresh inserted corpus",
+] as const;
+
+export const FTS_QUERY_REACH = [
+  "static query source",
+  "bounded terms",
+  "UTF16 truncation",
+  "charged metadata",
+  "constant parsed once",
+  "drained",
+] as const;

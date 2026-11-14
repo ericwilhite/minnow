@@ -1,3 +1,8 @@
+import { FtsExpressions } from "./fts-expressions.js";
+import { ftsExpression } from "../ir/fts-expression.js";
+import { FtsScanOperator, ftsScanMinimum } from "./fts-scan.js";
+import { FTS_WORKSPACE_BYTES, ftsWorkspaceBytes, ftsDeclaredBytes } from "./fts-value.js";
+import { queryTerms, queryText, configureFtsWorkspace, ftsRuntimeBytes } from "./kernels/fts.js";
 import {
   columnInputBytes,
   expressionInputBytes,
@@ -111,7 +116,7 @@ import { bindCall } from "./kernels/bindings.js";
 import { OutputArena, isValidSlot, slotOf } from "./kernels/vectors.js";
 import { ReservedGrant } from "./admission.js";
 import { LimitOperator } from "./limit.js";
-import { nullParameter, integerParameterBytes } from "./parameters.js";
+import { nullParameter, integerParameterBytes, validateParameterCount } from "./parameters.js";
 import { drive, isPromise, type BatchSource, type Operator } from "./pipeline.js";
 import type { QueryRuntime, Program, OperatorIdentity } from "./run.js";
 import { lateSortShape, type LateSortShape } from "./late-sort.js";
@@ -304,6 +309,7 @@ function instantiate<T>(
         });
       }
       const resources = new Resources(grant, capacity);
+      configureFtsWorkspace(resources.arena, ftsRuntimeBytes.get(runtime) ?? FTS_WORKSPACE_BYTES);
       runtime.dispose(() => resources.close());
       // Fixed buffers remain charged. Only unused holdings can be surrendered to another admission.
       grant.onReclaimRequest(() => {
@@ -639,6 +645,22 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   ) => admissions.push({ rel, minimum, owner, loanSlots });
   let nextPhysicalId = 0;
   const potentialHybridIds = new Set<number>();
+  const ftsWorkspaces = new Set<number>();
+  let ftsDeclared = 0;
+  interface FtsOwner {
+    readonly closed: Promise<void>;
+  }
+  const ftsOwners = new WeakMap<QueryRuntime, Set<FtsOwner>>();
+  const retainFts = (runtime: QueryRuntime, owner: FtsOwner) => {
+    let owners = ftsOwners.get(runtime);
+    if (!owners) {
+      owners = new Set();
+      ftsOwners.set(runtime, owners);
+    }
+    owners.add(owner);
+  };
+  const releaseFts = (runtime: QueryRuntime, owner: FtsOwner) =>
+    ftsOwners.get(runtime)?.delete(owner);
   const findIds = (rel: Rel): void => {
     if (
       !plan.volatile &&
@@ -646,6 +668,33 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       (rel.op === "aggregate" || rel.op === "distinct")
     )
       potentialHybridIds.add(rel.id);
+    if (plan.ftsQueries?.length || rel.op === "fts") {
+      let ownsFts = rel.op === "fts";
+      const inspect = (item: unknown): boolean => {
+        if (!item || typeof item !== "object" || ArrayBuffer.isView(item)) return false;
+        let found = false;
+        if ("op" in item && item.op === "call") {
+          const call = item as Extract<ScalarExpr, { op: "call" }>;
+          if (call.fn === "fts_match") {
+            found = true;
+            for (const arg of call.args.slice(1))
+              ftsDeclared = Math.max(ftsDeclared, ftsDeclaredBytes(arg.type));
+          }
+        }
+        for (const value of Object.values(item)) if (inspect(value)) found = true;
+        return found;
+      };
+      for (const [key, value] of Object.entries(rel))
+        if (!["input", "left", "right", "inputs", "base", "step"].includes(key) && inspect(value))
+          ownsFts = true;
+      if (rel.op === "fts")
+        for (const call of rel.calls)
+          for (const column of call.columns) {
+            const type = rel.input.output[column]?.type;
+            if (type) ftsDeclared = Math.max(ftsDeclared, ftsDeclaredBytes(type));
+          }
+      if (ownsFts) ftsWorkspaces.add(rel.id);
+    }
     nextPhysicalId = Math.max(nextPhysicalId, rel.id + 1);
     if (rel.op === "recursive") {
       findIds(rel.base);
@@ -1074,16 +1123,40 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                       : { rowsNeeded }
                     : { rowsNeeded: () => Math.min(rowsNeeded?.() ?? BATCH_ROWS, 1) }),
                 });
-                runtime.onAbort(() => scan.abort());
+                let borrowed: Promise<void> | undefined;
+                const abortScan = () => {
+                  if (borrowed) return;
+                  const owners = [...(ftsOwners.get(runtime) ?? [])];
+                  if (!owners.length) {
+                    scan.abort();
+                    return;
+                  }
+                  borrowed = Promise.resolve()
+                    .then(() => Promise.allSettled(owners.map((owner) => owner.closed)))
+                    .then(() => scan.abort());
+                };
+                runtime.onAbort(abortScan);
                 const source: BatchSource = {
                   next: () => (stops.some((stop) => stop()) ? (scan.abort(), null) : scan.next()),
-                  abort: () => scan.abort(),
+                  abort: abortScan,
                 };
                 runtime.pipeline();
                 const books = starBooks.get(runtime);
                 const outputSink = books?.shape.columns.has(rel.id)
                   ? starColumns((batch) => books.encode(rel.id, batch), downstream)
                   : downstream;
+                if (plan.ftsQueries?.length)
+                  return (async () => {
+                    try {
+                      await drive(source, counted(runtime, rel, outputSink), runtime.signal);
+                    } finally {
+                      await borrowed;
+                      scan.close();
+                    }
+                    const profile = runtime.profile(rel);
+                    profile.pagesRead = scan.stats.pagesRead;
+                    profile.pagesPruned = scan.stats.pagesPruned;
+                  })();
                 const result = drive(source, counted(runtime, rel, outputSink), runtime.signal);
                 return then(result, () => {
                   const profile = runtime.profile(rel);
@@ -1094,6 +1167,52 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               }),
           );
         };
+      }
+      case "fts": {
+        const child = prepare(rel.input),
+          input = types(rel.input);
+        const minimum = ftsScanMinimum(input, rel.calls.length);
+        fixed(rel, minimum);
+        return (runtime, downstream, stops) =>
+          instantiate(
+            runtime,
+            rel,
+            input,
+            minimum - FTS_WORKSPACE_BYTES + (ftsRuntimeBytes.get(runtime) ?? FTS_WORKSPACE_BYTES),
+            BATCH_ROWS,
+            (context, grant) =>
+              new FtsScanOperator(
+                input,
+                rel.calls,
+                context,
+                {
+                  grant,
+                  spill: runtime.request.spill,
+                  queryId: runtime.request.queryId,
+                  signal: runtime.signal,
+                },
+                counted(runtime, rel, downstream),
+              ),
+            (operator) => {
+              retainFts(runtime, operator);
+              runtime.onAbort((reason) => operator.abort(reason));
+              runtime.dispose(() => operator.closed);
+              return (async () => {
+                try {
+                  await child(runtime, operator, stops);
+                } catch (error) {
+                  operator.abort(error);
+                  await operator.closed;
+                  throw error;
+                } finally {
+                  releaseFts(runtime, operator);
+                }
+                const profile = runtime.profile(rel);
+                profile.spilledBytes = operator.profile.spilledBytes;
+                profile.spillPasses = operator.profile.mergePasses;
+              })();
+            },
+          );
       }
       case "filter":
       case "project":
@@ -1204,8 +1323,12 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                     counted(runtime, rel, downstream),
                   ),
                 (operator) => {
+                  if (ftsWorkspaces.has(rel.id)) retainFts(runtime, operator);
                   runtime.onAbort((reason) => operator.abort(reason));
-                  runtime.dispose(() => operator.closed);
+                  runtime.dispose(async () => {
+                    await operator.closed;
+                    releaseFts(runtime, operator);
+                  });
                   return (async () => {
                     try {
                       if (saved) await operator.resume();
@@ -1255,8 +1378,12 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                   counted(runtime, rel, downstream),
                 ),
               (operator) => {
+                if (ftsWorkspaces.has(rel.id)) retainFts(runtime, operator);
                 runtime.onAbort((reason) => operator.abort(reason));
-                runtime.dispose(() => operator.closed);
+                runtime.dispose(async () => {
+                  await operator.closed;
+                  releaseFts(runtime, operator);
+                });
                 return (async () => {
                   try {
                     await child(
@@ -1274,13 +1401,29 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               },
             );
         }
+        const hasFts =
+          rel.op !== "limit" &&
+          (Array.isArray(exprs) ? exprs.some(ftsExpression) : ftsExpression(exprs as ScalarExpr));
         const setup = (
           context: CompileContext,
           sink: Operator,
           runtime?: QueryRuntime,
           grant?: Grant,
+          stops: readonly Stop[] = [],
         ) =>
-          rel.op === "filter"
+          hasFts
+            ? new FtsExpressions(
+                exprs,
+                context,
+                sink,
+                runtime
+                  ? {
+                      signal: runtime.signal,
+                      stopped: () => stops.some((stop) => stop()),
+                    }
+                  : {},
+              )
+            : rel.op === "filter"
             ? new FilterOperator(exprs as ScalarExpr, context, sink)
             : rel.op === "project"
               ? (() => {
@@ -1354,23 +1497,40 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                     context.arena,
                     counted(runtime, rel, downstream),
                   )
-                : setup(context, counted(runtime, rel, downstream), runtime, grant),
+                : setup(context, counted(runtime, rel, downstream), runtime, grant, stops),
             (operator) => {
               runtime.onAbort((reason) => operator.abort(reason));
+              if (operator instanceof FtsExpressions) {
+                retainFts(runtime, operator);
+                runtime.dispose(() => operator.closed);
+              }
               const childStops =
                 operator instanceof LimitOperator ? [...stops, () => operator.done] : stops;
-              return childStops.some((stop) => stop())
-                ? operator.finish()
-                : child(
-                    runtime,
-                    operator,
-                    childStops,
-                    operator instanceof LimitOperator
-                      ? () => operator.inputNeeded(rowsNeeded?.() ?? Infinity)
-                      : rel.op === "filter"
-                        ? undefined
-                        : rowsNeeded,
-                  );
+              const run = () =>
+                childStops.some((stop) => stop())
+                  ? operator.finish()
+                  : child(
+                      runtime,
+                      operator,
+                      childStops,
+                      operator instanceof LimitOperator
+                        ? () => operator.inputNeeded(rowsNeeded?.() ?? Infinity)
+                        : rel.op === "filter"
+                          ? undefined
+                          : rowsNeeded,
+                    );
+              if (!(operator instanceof FtsExpressions)) return run();
+              return (async () => {
+                try {
+                  await run();
+                } catch (error) {
+                  operator.abort(error);
+                  await operator.closed;
+                  throw error;
+                } finally {
+                  releaseFts(runtime, operator);
+                }
+              })();
             },
           );
         };
@@ -3403,6 +3563,12 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         })();
       });
     if (sources.length === 0) {
+      if (ftsWorkspaces.size) {
+        const bytes = ftsRuntimeBytes.get(runtime) ?? ftsWorkspaceBytes(0);
+        ftsRuntimeBytes.set(runtime, bytes);
+        for (const entry of entries)
+          if (ftsWorkspaces.has(entry.rel.id)) entry.minimum += bytes - FTS_WORKSPACE_BYTES;
+      }
       if (!hasJson) return execute();
       const width = jsonConstants + 1;
       // Literal documents also bound result copies; no storage read contributes that size.
@@ -3432,6 +3598,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       for (;;) {
         let io = 0,
           progress = 0;
+        let ftsSourceBytes = ftsDeclared;
         bounds.clear();
         for (const source of sources) {
           const bound = yield* readValue(
@@ -3499,6 +3666,33 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               values.set(column, sourceValueBytes(cell));
             }
             boundedSourceRows.set(source.id, values);
+          }
+          if (ftsWorkspaces.size) {
+            // Old groups may synthesize a column's catalog missing-value constant.
+            // Its bytes are absent from page directories but present during rendering.
+            const table = runtime.view.catalog.table(source.tableId);
+            for (const column of source.columns) {
+              const value = table?.columns.find((def) => def.id === column)?.missing;
+              if (value?.data.layout === "varlen")
+                ftsSourceBytes = Math.max(ftsSourceBytes, value.data.bytes.length);
+            }
+            const row = yield* readValue(
+              boundSource(
+                runtime.sourceView(),
+                {
+                  ...source,
+                  singleValueBound: source.columns.length === 1,
+                  windowBytes: 0,
+                  stagingBytes: 0,
+                  rows: demand.get(source.id) ?? null,
+                },
+                runtime.request.governor,
+                runtime.signal,
+                1,
+                1,
+              ),
+            );
+            ftsSourceBytes = Math.max(ftsSourceBytes, row.valueBytes ?? row.progress / 4);
           }
           const keyColumns = joinKeySources.get(source.id);
           if (keyColumns)
@@ -3612,13 +3806,19 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           }
           runtime.resultCopySourceProgress(resultProgress);
         }
+        const ftsBytes = Math.max(
+          ftsRuntimeBytes.get(runtime) ?? 0,
+          ftsWorkspaceBytes(ftsSourceBytes),
+        );
+        if (ftsWorkspaces.size) ftsRuntimeBytes.set(runtime, ftsBytes);
         const jsonWidth = Math.max(jsonConstants, progress) + 1;
         if (hasJson) jsonWidths.set(runtime, jsonWidth);
         for (const [index, entry] of entries.entries())
           entry.minimum =
             (fixedMinimums[index] ?? 0) +
             (bounds.get(entry.rel.id)?.bytes ?? 0) +
-            (hasJson ? (jsonWorkspaces.get(entry.rel.id) ?? 0) * jsonWidth : 0);
+            (hasJson ? (jsonWorkspaces.get(entry.rel.id) ?? 0) * jsonWidth : 0) +
+            (ftsWorkspaces.has(entry.rel.id) ? ftsBytes - FTS_WORKSPACE_BYTES : 0);
         runtime.sourceBounds(bounds);
         runtime.readMinimum(
           io,
@@ -3773,5 +3973,59 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     };
     return runSliced(size(), new Slice(Infinity), () => undefined);
   };
+  if (plan.ftsQueries?.length) {
+    const queries = plan.ftsQueries;
+    const originalQuerySlot = (slot: number) =>
+      plan.ftsParameters?.find((mapping) => mapping.slot === slot)?.source ?? slot;
+    const validation: OperatorIdentity = { id: nextPhysicalId++, op: "fts" };
+    return Object.assign(
+      async (runtime: QueryRuntime, sink: ResultSink) => {
+        validateParameterCount(plan, runtime.request.parameters);
+        for (const query of queries)
+          if (
+            query.op === "param" &&
+            typeof runtime.request.parameters[originalQuerySlot(query.slot)] !== "string"
+          )
+            throw new TypeError("A full-text search query parameter must be a string");
+        let queryBytes = 0;
+        for (const query of queries)
+          queryBytes = Math.max(
+            queryBytes,
+            query.op === "param"
+              ? (runtime.request.parameters[originalQuerySlot(query.slot)] as string).length
+              : query.op === "literal" && query.value.data.layout === "varlen"
+                ? query.value.data.bytes.length
+                : 16384,
+          );
+        const workspace = ftsWorkspaceBytes(queryBytes);
+        ftsRuntimeBytes.set(runtime, workspace);
+        const grant = await runtime.admit(
+          `ftsQuery#${String(validation.id)}`,
+          workspace,
+          false,
+          validation,
+        );
+        if (!grant.allocate(workspace)) throw new Error("FTS query scratch was not admitted");
+        try {
+          const slice = new Slice(4);
+          const validate = function* (): SlicedJob<void> {
+            for (const query of queries) {
+              if (query.op === "param")
+                queryTerms(runtime.request.parameters[originalQuerySlot(query.slot)] as string);
+              else if (query.op === "literal") queryTerms(queryText(query.value));
+              else throw new TypeError("FTS queries must be literals or parameters");
+              if (slice.due()) yield;
+            }
+          };
+          await runSliced(validate(), slice, () => runtime.signal.throwIfAborted());
+        } finally {
+          grant.free(workspace);
+          grant.close();
+        }
+        await program(runtime, sink);
+      },
+      { atomic: true },
+    );
+  }
   return Object.assign(program, { atomic: true });
 }
