@@ -3,6 +3,33 @@ import { describe, expect, it } from "vitest";
 import rawProfile from "../postgres-feature-profile.json";
 import rawMatrix from "../sql-feature-matrix.json";
 import { featureBehaviorProbes } from "./sql-feature-probes.js";
+import { MinnowDatabase } from "../src/engine/database.js";
+import { MemoryBlockStore } from "../src/storage/index.js";
+
+it("pins omitted ON UPDATE as a product difference from PostgreSQL's NO ACTION", async () => {
+  const pg = new PGlite(),
+    minnow = new MinnowDatabase(new MemoryBlockStore());
+  try {
+    const setup = [
+      "CREATE TABLE p(name TEXT PRIMARY KEY)",
+      "CREATE TABLE c(id INTEGER PRIMARY KEY,parent TEXT REFERENCES p(name))",
+      "INSERT INTO p VALUES('old')",
+      "INSERT INTO c VALUES(1,'old')",
+    ];
+    for (const sql of setup) {
+      await pg.exec(sql);
+      await minnow.execute(sql);
+    }
+    const rekey = "UPDATE p SET name='new' WHERE name='old'";
+    await expect(pg.exec(rekey)).rejects.toMatchObject({ code: "23503" });
+    await minnow.execute(rekey);
+    expect((await minnow.query("SELECT parent FROM c")).rows).toEqual([{ parent: "new" }]);
+    expect((await pg.query("SELECT parent FROM c")).rows).toEqual([{ parent: "old" }]);
+  } finally {
+    await minnow.close();
+    await pg.close();
+  }
+});
 
 const expectedFeatureIds = [
   "aggregate.any-value",
@@ -92,7 +119,7 @@ describe("browser SQL feature behavior probes", () => {
   it("keeps the independently authored feature and step populations fixed", () => {
     expect(featureBehaviorProbes.map(({ featureId }) => featureId)).toEqual(expectedFeatureIds);
     expect(new Set(expectedFeatureIds).size).toBe(expectedFeatureIds.length);
-    expect(featureBehaviorProbes.reduce((total, probe) => total + probe.steps.length, 0)).toBe(162);
+    expect(featureBehaviorProbes.reduce((total, probe) => total + probe.steps.length, 0)).toBe(167);
     expect(
       featureBehaviorProbes
         .flatMap(({ steps }) => steps)

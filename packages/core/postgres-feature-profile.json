@@ -268,6 +268,11 @@
       "id": "window.frame-range-integer-fractional",
       "classification": "different",
       "reason": "PostgreSQL refuses a numeric RANGE offset over an integer key (0A000); the public Minnow executor accepts the fractional distance in double precision."
+    },
+    {
+      "id": "ddl.foreign-key-on-update",
+      "classification": "different",
+      "reason": "ON UPDATE CASCADE states the existing follow behavior. Without an ON UPDATE clause, Minnow still moves child references with their parent row; PostgreSQL defaults to NO ACTION and refuses a referenced parent-key change. This is a deliberate product contract."
     }
   ]
 }

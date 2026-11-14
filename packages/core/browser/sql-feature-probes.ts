@@ -1371,6 +1371,34 @@ export const featureBehaviorProbes: readonly FeatureBehaviorProbe[] = [
         sql: "SELECT name, score FROM keyed WHERE name = 'tmp'",
         expected: { columns: ["name", "score"], rows: [["final", 1]] },
       },
+      // Omission is the documented difference: keep this separate from explicit CASCADE.
+      {
+        kind: "execute",
+        sql: "CREATE TABLE implicit_child(id INTEGER PRIMARY KEY,parent TEXT REFERENCES keyed(name))",
+      },
+      {
+        kind: "mutation",
+        sql: "INSERT INTO keyed(name,score) VALUES('implicit-old',2)",
+        affectedRows: 1,
+        expected: emptyMutationResult,
+      },
+      {
+        kind: "mutation",
+        sql: "INSERT INTO implicit_child(id,parent) VALUES(2,'implicit-old')",
+        affectedRows: 1,
+        expected: emptyMutationResult,
+      },
+      {
+        kind: "mutation",
+        sql: "UPDATE keyed SET name='implicit-final' WHERE name='implicit-old'",
+        affectedRows: 1,
+        expected: emptyMutationResult,
+      },
+      {
+        kind: "query",
+        sql: "SELECT id,parent FROM implicit_child",
+        expected: { columns: ["id", "parent"], rows: [[2, "implicit-final"]] },
+      },
     ],
   },
   {

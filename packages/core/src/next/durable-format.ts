@@ -246,7 +246,8 @@ export const DURABLE_CODECS = {
   keyDescriptor: { inline: 0, overflow: 1 },
   indexKind: ["ordered", "equality"],
   indexRole: ["primary", "unique", "secondary", "foreignKey"],
-  foreignKeyAction: ["restrict", "cascade", "setNull"],
+  foreignKeyAction: ["restrict", "noAction", "cascade", "setNull", "setDefault"],
+  foreignKeyUpdateAction: ["restrict", "noAction", "cascade", "setNull", "setDefault", "follow"],
   vectorForm: ["flat"],
   vectorIntegerRepr: ["safe", "int64"],
   vectorDecimalRepr: ["safe", "int64", "int128", "wide"],
@@ -407,6 +408,7 @@ export const CATALOG_RECORD_SCHEMAS = {
     "supportIndexId:u?",
     "onDelete:s",
     "enforced:b",
+    "onUpdate:s",
   ],
   check: [
     "id:u",

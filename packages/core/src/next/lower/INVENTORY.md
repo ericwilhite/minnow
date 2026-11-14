@@ -777,3 +777,14 @@ enable a generic modify path or change the shipped engine.
 The resolved user-name prefix `RI_ConstraintTrigger_` is reserved for native system triggers
 (42939). PostgreSQL and the shipped engine accept it: this is an explicit 1.0 refusal so native
 durable RI IDs need not emulate PostgreSQL OIDs. Unquoted names fold before this check.
+
+### Exact foreign-key action descriptors (B6 / B5b)
+
+Native SQL preserves the five explicit PG actions for DELETE and UPDATE. Omitted ON UPDATE
+is stored as `follow`, the documented product row-identity behavior (unlike PG NO ACTION).
+Omitted SQL ON DELETE is stored as `noAction`; legacy schema inputs keep their declared
+blocking action. MCAT foreignKey10 field9 is required `onUpdate`, with centralized enum
+validation and ALTER/reopen retention. Parser provenance stays outside published compiled
+DTOs; the schema metadata inspector retains the effective actions. Repeated ON DELETE or
+ON UPDATE clauses refuse with42601. The shared row/command/RI consumer is B5b's execution
+unit; storing/lowering these modes alone does not enable their execution.

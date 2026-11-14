@@ -1552,9 +1552,17 @@ function planConstraintChanges(
     parentTable: string;
     parentColumns: readonly string[];
     onDelete: string;
+    onUpdate?: string;
   }): string =>
     `${key.columns.join(",")} -> ${key.parentTable}.` +
-    `${key.parentColumns.join(",")} ON DELETE ${key.onDelete}`;
+    `${key.parentColumns.join(",")} ON DELETE ${key.onDelete}` +
+    // Legacy DSL declarations omit ON UPDATE and keep row-identity follow. A native
+    // explicit action must not silently look identical to that managed declaration.
+    (key.onUpdate === undefined || key.onUpdate === "follow" ? "" : ` ON UPDATE ${key.onUpdate}`);
+  // The legacy schema DSL calls its blocking default RESTRICT. Preserve an existing
+  // SQL NO ACTION constraint rather than rewriting it just to change that alias.
+  const comparableKey = (key: Parameters<typeof describeKey>[0]): string =>
+    describeKey(key.onDelete === "no action" ? { ...key, onDelete: "restrict" } : key);
 
   const declaredList = declaredForeignKeys(definition);
   const existingKeys = new Map(record.foreignKeys.map((key) => [key.name, key]));
@@ -1571,7 +1579,7 @@ function planConstraintChanges(
         `FOREIGN KEY enforcement cannot change: ${definition.name}.${declared.columns.join(",")}`,
       );
     }
-    if (describeKey(existing) !== describeKey(declared)) {
+    if (comparableKey(existing) !== comparableKey(declared)) {
       if (!declared.enforced) {
         referencesChanged = true;
         continue;

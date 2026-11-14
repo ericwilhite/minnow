@@ -6543,6 +6543,7 @@ export const TRIGGER_PREFIX_REACH = [
 ] as const;
 
 export const TRIGGER_CATALOG_REACH = [
+  "introspection",
   "repeated binding",
   "single binding",
   "global name uniqueness",
@@ -6565,6 +6566,36 @@ export const TRIGGER_CATALOG_REACH = [
   "named body",
   "ordered bodies",
   "single body",
+] as const;
+
+export const CATALOG_FK_ACTION_REACH = [
+  "duplicate update refused",
+  "duplicate delete refused",
+  "introspection",
+  "delete omitted",
+  "delete noAction",
+  "delete restrict",
+  "delete cascade",
+  "delete setNull",
+  "delete setDefault",
+  "update omitted",
+  "update noAction",
+  "update restrict",
+  "update cascade",
+  "update setNull",
+  "update setDefault",
+  "self reference",
+  "external reference",
+  "named constraint",
+  "inline constraint",
+  "update clause first",
+  "delete clause first",
+  "checkpoint",
+  "WAL",
+  "plain column",
+  "quoted column",
+  "reopen",
+  "invalid mode refused",
 ] as const;
 
 export const TRIGGER_RESERVED_NAME_REACH = [

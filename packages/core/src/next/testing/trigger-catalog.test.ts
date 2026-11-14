@@ -1,6 +1,7 @@
 /** The shipped CREATE/DROP/schema-dependency contract, persisted through native MCAT/WAL. */
 import { column, schema, table as schemaTable } from "../../engine/schema.js";
 import { currentInput } from "../lower/ddl.js";
+import { inspectCatalog } from "../lower/catalog-schema.js";
 import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
 import { expect, it } from "vitest";
@@ -66,6 +67,11 @@ for (const seed of seedsFor("next-trigger-catalog", [0xb7c4, 0xb7c5]))
             if (!def) throw new Error("missing trigger");
             expect(def.event).toBe(event);
             expect(def.timing).toBe(timing);
+            expect(
+              inspectCatalog(native.harness.path.catalog).tables.find((t) => t.name === "src")
+                ?.triggers,
+            ).toEqual([{ id: String(def.id), name: def.name, event, timing }]);
+            reach.reach("introspection");
             expect(def.statements.map((b) => b.kind)).toEqual([
               "insert",
               ...(bodies > 1 ? ["update"] : []),

@@ -2160,7 +2160,7 @@
       "status": "supported",
       "setup": ["CREATE TABLE parents (id INTEGER PRIMARY KEY, label TEXT NOT NULL)"],
       "example": "CREATE TABLE children (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES parents(id) ON DELETE CASCADE)",
-      "notes": "Scalar and composite references target the parent's matching primary-key columns. Writes validate against their transaction; NULL references are satisfied. ON DELETE supports RESTRICT, CASCADE, and SET NULL atomically. Primary keys are immutable, so ON UPDATE has no action."
+      "notes": "Scalar and composite references target the parent's matching primary-key columns. Writes validate against their transaction; NULL references are satisfied. ON DELETE supports RESTRICT, CASCADE, and SET NULL atomically. Parent keys can change: references follow a rekey even when ON UPDATE is omitted, a documented difference from PostgreSQL (see ddl.foreign-key-on-update)."
     },
     {
       "id": "ddl.foreign-key-set-default",

@@ -178,6 +178,7 @@ export class MemoryCatalog {
         parentIndexId: found,
         supportIndexId: null,
         onDelete: key.onDelete,
+        onUpdate: key.onUpdate ?? "follow",
         enforced: key.enforced,
       };
     });

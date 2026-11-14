@@ -48,3 +48,18 @@ export function rememberAlwaysIdentity(value: object): void {
 export function alwaysIdentity(value: object | undefined): boolean {
   return value !== undefined && alwaysIdentities.has(value);
 }
+
+/** Exact native clauses; the published compiled DTO keeps its shipped three-action shape. */
+export type ReferentialSourceAction =
+  "restrict" | "cascade" | "set null" | "no action" | "set default";
+export interface ForeignKeyActionSource {
+  readonly onDelete: ReferentialSourceAction;
+  readonly onUpdate: ReferentialSourceAction | "follow";
+}
+const foreignKeys = new WeakMap<object, ForeignKeyActionSource>();
+export function rememberForeignKeyActions(key: object, actions: ForeignKeyActionSource): void {
+  foreignKeys.set(key, actions);
+}
+export function foreignKeyActions(key: object): ForeignKeyActionSource | undefined {
+  return foreignKeys.get(key);
+}

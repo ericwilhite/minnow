@@ -103,7 +103,14 @@ export function inspectCatalog(catalog: CatalogView): SchemaCatalog {
         name: table.name,
         managed: table.managed === true,
         columns: table.columns.map((def) => column(def, table.columns)),
-        triggers: [],
+        triggers: catalog.triggers
+          .filter((trigger) => trigger.tableId === table.id)
+          .map((trigger) => ({
+            id: String(trigger.id),
+            name: trigger.name,
+            event: trigger.event,
+            timing: trigger.timing,
+          })),
         ...(primary === undefined
           ? {}
           : {
@@ -132,7 +139,22 @@ export function inspectCatalog(catalog: CatalogView): SchemaCatalog {
               index?.columnIds.map(
                 (id) => parent?.columns.find((column) => column.id === id)?.name ?? "",
               ) ?? [],
-            onDelete: key.onDelete === "setNull" ? ("set null" as const) : key.onDelete,
+            onDelete:
+              key.onDelete === "setNull"
+                ? ("set null" as const)
+                : key.onDelete === "setDefault"
+                  ? ("set default" as const)
+                  : key.onDelete === "noAction"
+                    ? ("no action" as const)
+                    : key.onDelete,
+            onUpdate:
+              key.onUpdate === "setNull"
+                ? ("set null" as const)
+                : key.onUpdate === "setDefault"
+                  ? ("set default" as const)
+                  : key.onUpdate === "noAction"
+                    ? ("no action" as const)
+                    : key.onUpdate,
             enforced: key.enforced,
           };
         }),

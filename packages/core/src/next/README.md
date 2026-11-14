@@ -3801,3 +3801,12 @@ Required feature1 marks a stream containing declarations. Unknown semantic versi
 optional display extensions survive copies/replay. Definition fields8..15 and families27/28
 remain reserved rather than silently storing future semantics or native lease/coverage state.
 Snapshots will rebuild postings from rows; this stage only supplies the portable definition.
+
+### FK action provenance
+
+Native foreign-key records preserve exact explicit DELETE/UPDATE actions. An omitted
+ON UPDATE is stored as `follow`, distinct from explicit CASCADE and from PostgreSQL's
+NO ACTION default. The schema inspector exposes these modes and stored trigger identities.
+MCAT foreignKey10's required field9 carries onUpdate; these development bytes need the
+next pre-fence selector allocation before publication. Native RI execution/trigger firing
+remain the separate joint B6/B5b consumer described in the inventory.

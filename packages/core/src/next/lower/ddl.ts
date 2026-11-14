@@ -7,6 +7,7 @@
  */
 import type {
   CatalogChange,
+  ForeignKeyAction,
   CatalogView,
   InputExpressionDependencies,
   ColumnDef,
@@ -22,7 +23,7 @@ import {
   type PhysicalType,
   type SqlTypeDescriptor,
 } from "../types.js";
-import { alwaysIdentity } from "../../engine/catalog-ddl-sources.js";
+import { alwaysIdentity, foreignKeyActions } from "../../engine/catalog-ddl-sources.js";
 import type { ScalarExpr } from "../ir/ir.js";
 import type { NativeStatement } from "./statements.js";
 import { builtInCatalogType } from "./catalog-type-names.js";
@@ -143,7 +144,7 @@ function foreignKeyInput(
       name: key.name,
       parentTableId: "self",
       parentIndexId: same(primary) ? "primary" : { unique: unique?.name ?? "" },
-      onDelete: key.onDelete === "set null" ? "setNull" : key.onDelete,
+      ...referenceActions(key),
       enforced: key.enforced !== false,
       columns: positionsOf(key.columns ?? [key.column], columns, `foreign key ${key.name}`),
     };
@@ -175,9 +176,28 @@ function foreignKeyInput(
     name: key.name,
     parentTableId: parent.id,
     parentIndexId: parentIndex.id,
-    onDelete: key.onDelete === "set null" ? "setNull" : key.onDelete,
+    ...referenceActions(key),
     enforced: key.enforced !== false,
     columns: positionsOf(childNames, columns, `foreign key ${key.name}`),
+  };
+}
+
+/** Shared public DTO retains legacy aliases; native provenance preserves the exact clauses. */
+function referenceActions(key: ForeignKeyDefinition) {
+  const source = foreignKeyActions(key);
+  const normalize = (s: string): ForeignKeyAction => {
+    if (s === "set null") return "setNull";
+    if (s === "set default") return "setDefault";
+    if (s === "no action") return "noAction";
+    if (s === "restrict" || s === "cascade") return s;
+    throw new PlanningError("invalid foreign-key action provenance", "XX000");
+  };
+  return {
+    onDelete: normalize(source?.onDelete ?? key.onDelete),
+    onUpdate:
+      source?.onUpdate === undefined || source.onUpdate === "follow"
+        ? ("follow" as const)
+        : normalize(source.onUpdate),
   };
 }
 
@@ -450,6 +470,7 @@ export function currentInput(
         parentTableId: key.parentTableId,
         parentIndexId: key.parentIndexId,
         onDelete: key.onDelete,
+        onUpdate: key.onUpdate,
         enforced: key.enforced,
         columns: key.columnIds.map(position),
       })),

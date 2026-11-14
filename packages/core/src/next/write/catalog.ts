@@ -595,6 +595,7 @@ export class Catalog implements CatalogView {
               prior.parentTableId === key.parentTableId &&
               prior.parentIndexId === key.parentIndexId &&
               prior.onDelete === key.onDelete &&
+              prior.onUpdate === (key.onUpdate ?? "follow") &&
               prior.columnIds.length === key.columns.length &&
               prior.columnIds.every((id, i) => id === input.columns[key.columns[i] ?? -1]?.id),
           ),
@@ -829,6 +830,7 @@ export class Catalog implements CatalogView {
         parentIndexId: parentIndex.id,
         supportIndexId,
         onDelete: input_.onDelete,
+        onUpdate: input_.onUpdate ?? "follow",
         enforced: input_.enforced,
       });
     }
@@ -1460,6 +1462,12 @@ function validateStoredTable(table: TableDef): void {
       foreignKey.onDelete,
       DURABLE_CODECS.foreignKeyAction,
       "stored foreign-key action",
+      StoreCorruptionError,
+    );
+    requireTag(
+      foreignKey.onUpdate,
+      DURABLE_CODECS.foreignKeyUpdateAction,
+      "stored foreign-key update action",
       StoreCorruptionError,
     );
   }

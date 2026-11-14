@@ -72,6 +72,14 @@ const SETUP = ["CREATE TABLE a (id integer, v integer)", "CREATE TABLE b (id int
  * refusal of SQL PostgreSQL runs (0A000).
  */
 const CASES: ReadonlyArray<readonly [sql: string, message: string, source?: "published"]> = [
+  [
+    "CREATE TABLE dup_fk(n INT REFERENCES a(id) ON UPDATE CASCADE ON UPDATE NO ACTION)",
+    "Multiple ON UPDATE clauses are not allowed",
+  ],
+  [
+    "CREATE TABLE dup_fk(n INT REFERENCES a(id) ON DELETE CASCADE ON DELETE SET NULL)",
+    "Multiple ON DELETE clauses are not allowed",
+  ],
   ["SELECT '[]'::json -> 1.5", "-> array positions are integers"],
   ["SELECT '{}'::json ->> true", "->> keys are member names or array positions"],
   ["SELECT * FROM missing", "SELECT * requires known columns for: "],

@@ -23,12 +23,14 @@ export interface ColumnInfo {
   generated?: string;
 }
 
+type CatalogReference = Catalog["tables"][number]["foreignKeys"][number];
 export interface ForeignKeyInfo {
   name: string;
   columns: string[];
   parentTable: string;
   parentColumns: string[];
-  onDelete: "restrict" | "cascade" | "set null";
+  onDelete: CatalogReference["onDelete"];
+  onUpdate?: NonNullable<CatalogReference["onUpdate"]>;
   enforced: boolean;
 }
 
@@ -166,6 +168,7 @@ export function toCatalog(
               parentTable: key.parentTable,
               parentColumns: [...key.parentColumns],
               onDelete: key.onDelete,
+              ...(key.onUpdate === undefined ? {} : { onUpdate: key.onUpdate }),
               enforced: key.enforced,
             })),
             checks: rich.checks.map((check) => ({ name: check.name, sql: check.sql })),

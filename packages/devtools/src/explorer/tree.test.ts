@@ -94,6 +94,12 @@ describe("describeForeignKey", () => {
     expect(describeForeignKey({ ...ordersCustomer, onDelete: "restrict", enforced: false })).toBe(
       "customer_id → customers.customer_id · not enforced",
     );
+    expect(describeForeignKey({ ...ordersCustomer, onUpdate: "follow" })).toBe(
+      "customer_id → customers.customer_id · on delete cascade · follows rekeys (default)",
+    );
+    expect(
+      describeForeignKey({ ...ordersCustomer, onDelete: "no action", onUpdate: "set default" }),
+    ).toBe("customer_id → customers.customer_id · on delete no action · on update set default");
   });
 });
 
