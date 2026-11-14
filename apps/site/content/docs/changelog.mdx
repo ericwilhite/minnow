@@ -10,6 +10,13 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported rebuild casts integers, NUMERIC (keeping scale), float4/float8 (PostgreSQL's
+shortest spelling), boolean, date, time, timestamp, timestamptz (UTC), interval (including
+`infinity` / `-infinity`), uuid, JSON/JSONB and arrays to text with PostgreSQL's default output
+formats. `value::text` and `text || value` now work in the rebuild. Array text shares the full-text
+renderer's PostgreSQL quoting. The shipped engine, public API and stored formats are unchanged; no
+migration is needed.
+
 ### Planned 1.0 cutover: full-text search
 
 The unexported 1.0 engine lowers MATCH/BM25 and evaluates them by scan. BM25 uses the whole
@@ -285,8 +292,9 @@ finite INTERVAL values cast to unbounded TEXT in PostgreSQL's default output sty
 SQL TIMESTAMP literals retain all six fractional digits through lowering and optimization,
 including comparisons at microsecond boundaries; JavaScript Date inputs keep millisecond
 precision. The rebuild admits explicit TIMESTAMP/TIMESTAMPTZ precision 6 and refuses other
-precision modifiers instead of silently skipping their rounding. Timestamp row values keep their separate ISO representation. Bounded temporal text casts and
-infinite INTERVAL results remain explicitly unsupported. This changes the private rebuild
+precision modifiers instead of silently skipping their rounding. Timestamp row values keep their separate ISO representation. Bounded temporal text casts remain
+explicitly unsupported; infinite INTERVAL values now cast to `infinity` / `-infinity` (see the text-output
+cast entry above). This changes the private rebuild
 executor; the shipped SQL behavior, public API and stored formats are unchanged. No migration is
 needed.
 
