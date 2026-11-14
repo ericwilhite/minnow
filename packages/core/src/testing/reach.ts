@@ -6483,3 +6483,23 @@ export const ROW_RULES_FK_REACH = [
   "generated recomputed",
   "statement atomicity",
 ] as const;
+
+export const ROW_RULE_ORDER_REACH = [
+  "check",
+  "generated",
+  "null",
+  "names",
+  "success",
+  "single row",
+  "split batch",
+  "whole batch",
+  "reverse declaration",
+  "forward declaration",
+  "selection",
+  "dense",
+  "valid prefix",
+  "first row failure",
+  "plain name",
+  "quoted name",
+  "UTF8 names",
+] as const;

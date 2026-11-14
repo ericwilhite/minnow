@@ -715,7 +715,7 @@ engine. Their native typed refusals remain; no extra support is claimed here.
 
 `compileTableRules` retains validation-only immutable programs for the catalog cache. Its
 optional fourth `{charge,capacity,signal}` argument or `bindTableRules` supplies statement-owned
-CHECK/generated kernels. CHECK passes NULL, stops at the first physical row/catalog constraint,
+CHECK/generated kernels. CHECK passes NULL, stops at the first physical row/constraint-name order,
 and evaluates throwing expressions only when reached. Proven total comparisons use batched
 kernels. Generated values are charged, flattened into result-owned buffers, preserve inactive
 slots and include generated IDs when filtering dependent CHECKs. FK actions retain OLD wrappers
@@ -728,3 +728,9 @@ A live bound instance must not enter the evictable catalog RuleCache. Existing u
 expression overloads/casts still refuse at binding; defaults/clock/sequences stay caller-owned.
 Generated assignment legality remains in lowering (428C9); FK recomputation is not a user
 assignment. This module introduces no trigger firing or persisted-format change.
+
+Row-rule SQL data errors use the same precise-replay gate as projections. Successful generated
+batches remain vectorized; only a failing batch is re-evaluated by active row, generated column
+order, NOT NULL, then CHECK constraint-name order (UTF8, independent of locale). An earlier
+constraint can throw from generate() during replay; admission/cancellation/capability errors
+never select replay. Statement rollback and the write path remain the caller's responsibility.

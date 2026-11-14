@@ -18,7 +18,7 @@
  * ## Semantics
  * - `check` evaluates each CHECK over the active rows; FALSE fails and NULL passes (SQL). Checks
  *   that read none of `columnIds` (including regenerated IDs) may be skipped. The result is the first failing row in physical
- *   order, and for that row the first failing constraint in catalog order.
+ *   order, and for that row the first failing constraint in PostgreSQL constraint-name order.
  * - `generate` recomputes, in place, every stored generated column that depends on `columnIds`,
  *   in catalog order (a generated column cannot read another one, as in PostgreSQL).
  * - Both are synchronous kernels; execution buffers are charged before allocation at binding
@@ -119,6 +119,20 @@ function hasParam(expr: ScalarExpr): boolean {
   }
 }
 
+/** PostgreSQL strcmp on UTF8 identifiers: scalar order, independent of locale/UTF16. */
+function compareNames(a: string, b: string): number {
+  let i = 0,
+    j = 0;
+  while (i < a.length && j < b.length) {
+    const x = a.codePointAt(i) ?? 0,
+      y = b.codePointAt(j) ?? 0;
+    if (x !== y) return x - y;
+    i += x > 65535 ? 2 : 1;
+    j += y > 65535 ? 2 : 1;
+  }
+  return a.length - i - (b.length - j);
+}
+
 const NO_RULES_GENERATE = (): void => undefined;
 
 /**
@@ -158,17 +172,19 @@ export function compileTableRules(
 
   const byCheck = new Map(expressions.checks.map((entry) => [entry.checkId, entry.condition]));
   if (byCheck.size !== expressions.checks.length) fail("a check is given twice");
-  const checks: CompiledCheck[] = table.checks.map((def) => {
-    const condition = byCheck.get(def.id);
-    if (condition === undefined) return fail(`check ${String(def.id)} has no expression`);
-    if (condition.type.kind !== "bool") fail(`check ${String(def.id)} is not boolean`);
-    const reads = new Set<number>();
-    for (const index of validate(condition, `check ${String(def.id)}`)) {
-      const column = columns[index];
-      if (column !== undefined) reads.add(column.id);
-    }
-    return { def, reads, condition };
-  });
+  const checks: CompiledCheck[] = [...table.checks]
+    .sort((a, b) => compareNames(a.name, b.name))
+    .map((def) => {
+      const condition = byCheck.get(def.id);
+      if (condition === undefined) return fail(`check ${String(def.id)} has no expression`);
+      if (condition.type.kind !== "bool") fail(`check ${String(def.id)} is not boolean`);
+      const reads = new Set<number>();
+      for (const index of validate(condition, `check ${String(def.id)}`)) {
+        const column = columns[index];
+        if (column !== undefined) reads.add(column.id);
+      }
+      return { def, reads, condition };
+    });
   if (byCheck.size !== table.checks.length) fail("an expression names no check of the table");
 
   const generatedColumns = new Set(

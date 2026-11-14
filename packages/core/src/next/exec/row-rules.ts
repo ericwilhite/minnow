@@ -2,6 +2,8 @@
 import type { ScalarExpr } from "../ir/ir.js";
 import type { Vector } from "../vector/vector.js";
 import type { TableRules } from "../access/modify.js";
+import { CheckViolationError, NotNullViolationError } from "../access/modify.js";
+import { expressionDataError } from "./expression-errors.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import { BATCH_ROWS, type Batch, type Selection } from "../vector/vector.js";
 import { ColumnStore } from "./column-store.js";
@@ -211,6 +213,53 @@ class Evaluator implements BoundTableRules {
   }
   generate(batch: Batch, changed: readonly number[]): void {
     this.#validate(batch);
+    try {
+      this.#generate(batch, changed);
+    } catch (error) {
+      if (!expressionDataError(error)) throw error;
+      // The successful path stays columnar. A failing speculative batch has not been
+      // written. Replay rows first, then generated columns, NOT NULL and named CHECKs,
+      // exactly like relational projection replay (filter.ts). No SQL data was delivered.
+      this.#precise(batch, changed);
+      throw error; // deterministic kernels must reproduce a failure
+    }
+  }
+  #precise(batch: Batch, changed: readonly number[]): void {
+    const arena = this.#arena,
+      borrow = arena.borrowVarlen,
+      exact = arena.exactVarlenGrowth;
+    arena.retireVarlen();
+    arena.borrowVarlen = true;
+    arena.exactVarlenGrowth = true;
+    const columns = [...batch.columns],
+      one = { ...batch, columns, selection: this.#one };
+    try {
+      const count = batch.selection?.count ?? batch.length;
+      for (let k = 0; k < count; k++) {
+        this.options.signal?.throwIfAborted();
+        const row = batch.selection?.rows[k] ?? k;
+        this.#one.rows[0] = row;
+        for (const g of this.#generated) {
+          if (g.reads.size !== 0 && !changed.some((id) => g.reads.has(id))) continue;
+          columns[g.index] = g.kernel.evaluate(one, this.#one);
+        }
+        // All generated values precede constraint checking for this row. A NULL
+        // generated result is a 23502, not a later row's arithmetic exception.
+        for (const [i, col] of this.program.table.columns.entries()) {
+          const v = columns[i];
+          if (!col.nullable && v && !isValidSlot(v, row))
+            throw new NotNullViolationError(this.program.table.id, col.id, row);
+        }
+        const failure = this.check(one, changed);
+        if (failure) throw new CheckViolationError(this.program.table.id, failure.checkId, row);
+        arena.retireVarlen();
+      }
+    } finally {
+      arena.borrowVarlen = borrow;
+      arena.exactVarlenGrowth = exact;
+    }
+  }
+  #generate(batch: Batch, changed: readonly number[]): void {
     if ((batch.selection?.count ?? batch.length) === 0) return;
     for (const g of this.#generated) {
       if (g.reads.size !== 0 && !changed.some((id) => g.reads.has(id))) continue;
