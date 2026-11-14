@@ -5722,6 +5722,8 @@ export const EXPRESSION_FENCE_REACH = [
   "join key",
   "sort key",
   "cancelled suspension",
+  "helper close fence",
+  "no post-cancel rows",
   "cleanup zero",
 ] as const;
 
