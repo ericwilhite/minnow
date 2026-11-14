@@ -53,6 +53,7 @@
     "manifest-prefix-idb-run.ts",
     "audit-run.ts",
     "semantic-run.ts",
+    "semantic-cleanup.test.ts",
     "upgrade-run.ts",
     "upgrade-worker.ts",
     "oltp-latency-run.ts",

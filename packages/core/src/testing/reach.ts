@@ -6734,3 +6734,23 @@ export const TRIGGER_PREFIX_REACH = [
   "multiple bodies",
   "one body",
 ] as const;
+
+export const SEMANTIC_CLEANUP_REACH = [
+  "native drain pending",
+  "checkpoint before delete",
+  "terminate after deletion",
+  "client sync failure",
+  "client async failure",
+  "database close failure",
+  "delete failure",
+  "all failures retained",
+] as const;
+
+export const SEMANTIC_NATIVE_CLEANUP_REACH = [
+  "zero drain turns",
+  "multiple drain turns",
+  "close acknowledged before drain",
+  "checkpoint drained before delete",
+  "files deleted",
+  "worker terminated after deletion",
+] as const;
