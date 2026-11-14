@@ -81,6 +81,11 @@ export interface NativeCommandBoundary {
   rowReferentialEntries(command: CommandToken, row: RowImageRef): AsyncIterable<ReferentialEntry>;
   /** Non-ending command checkpoint BEFORE any AFTER event for this command. */
   verifyCommandUnique(command: CommandToken, signal: AbortSignal): Promise<void>;
+  /** Queue adapter: validate/resolve the root-owned scalar ID internally, then execute the
+   * immutable entry. Foreign/retired IDs refuse before effects. No entry/key buffers escape
+   * to the queue. Resolve I/O is fenced before
+   * callbacks; decoded entry metadata uses the root's prepaid ordinary frame workspace. */
+  executeReferentialId(id: number, hooks: NativeRowHooks, signal: AbortSignal): Promise<void>;
   /** Exactly one parent row/one FK event. Seal the complete child input before mutation;
    * release input/pin/producer progress before writer admission. No nested governor admission.
    * Follow uses captured identities; explicit actions use their distinct catalog mode.
