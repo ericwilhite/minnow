@@ -2896,6 +2896,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const retired: ExtentRef[] = [];
     // Directory chunks and the root this publication made: it owns them until a state holds them.
     let created: GroupDirectory | null = null;
+    // The directory this flush derives its next one from, held until it ends.
+    let pinned: GroupDirectory | null = null;
     let madeRoot: ManifestRoot | null = null;
     let unlock: (() => void) | null = null;
     const delta = new DeltaPublication(
@@ -2924,6 +2926,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
         def = { ...def, indexes };
       }
       const view = state.view;
+      // The next directory shares this one's chunks (`before.with`, after the awaits below). The
+      // flush holds its own reference on it meanwhile: a DROP TABLE publishes a state without the
+      // table, and the state it replaces may be the directory's last holder.
+      view.groups.retain();
+      pinned = view.groups;
       const newGroups: GroupRef[] = [];
       const published = new Map<
         Memtable,
@@ -3294,6 +3301,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (definitionCharge > 0) this.#chargeMetadata(-definitionCharge);
       delta.settle();
       created?.releaseCreation();
+      pinned?.release();
       if (madeRoot !== null) this.#releaseRoot(madeRoot);
       unlock?.();
       if (writing) this.#flushesWriting -= 1;
