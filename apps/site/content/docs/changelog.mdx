@@ -17,6 +17,11 @@ formats. `value::text` and `text || value` now work in the rebuild. Array text s
 renderer's PostgreSQL quoting. The shipped engine, public API and stored formats are unchanged; no
 migration is needed.
 
+The private trigger runner's current-prefix pin has a read phase, then a locator-only phase.
+It refuses data rereads after statement mutation begins, while later write batches retain
+locator resolution. Generated prefix tests cover publication, index maintenance, cancellation,
+and native row-account and reader-registration cleanup; this does not enable trigger firing.
+
 The private 1.0 catalog retains exact DELETE/UPDATE foreign-key actions and records omitted
 `ON UPDATE` as an explicit row-identity follow mode, preserving Minnow's documented difference
 from PostgreSQL. The native schema inspector exposes the effective actions and stored trigger

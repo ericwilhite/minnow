@@ -13,6 +13,12 @@
  * is O(1) to pin: nothing is copied. Everything reachable from it reads the same until
  * `release()`.
  *
+ * **Exception: Statement.readOwn() is a current-write-prefix phase pin, not an immutable
+ * data snapshot.** Fully consume and spool its input before any further statement mutation.
+ * Once mutation begins, do not reread the pin or its cached table/index/segment handles.
+ * It remains alive only to translate already-spooled locators through writer inputView, until
+ * writer borrows drain. A new body obtains a new phase pin; end/rollback invalidates all of them.
+ *
  * ## Visibility bound (`Snapshot.bound`)
  * Every in-memory change carries a sequence number `seq`; a change is visible iff
  * `seq ≤ bound` (`isVisible`). One comparison serves readers and the writer:

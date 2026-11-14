@@ -6838,3 +6838,18 @@ export const TRIGGER_WIRE_REACH = [
   "plain name",
   "UTF8 name",
 ] as const;
+
+export const TRIGGER_PREFIX_LIFECYCLE_REACH = [
+  "borrow ends before independent pin",
+  "publication with borrowed prefix",
+  "merge with prefix alive",
+  "flush only",
+  "cancel read",
+  "cancel write",
+  "committed bodies",
+  "multiple write batches",
+  "cached and fresh rereads refused",
+  "zero native retention and registrations",
+  "single row batches",
+  "several row batches",
+] as const;

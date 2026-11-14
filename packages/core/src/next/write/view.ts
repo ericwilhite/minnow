@@ -169,6 +169,7 @@ class GroupSegmentImpl implements GroupSegment {
   }
 
   get liveRowCount(): number {
+    this.view.snapshot.checkRead();
     if (this.#deleted === null) {
       const delta = groupDeletedCount(this.view.tableView, this.#groupId, this.view.snapshot.bound);
       // The durable bitmap is in the group's live count; delta positions are not in it.
@@ -178,7 +179,7 @@ class GroupSegmentImpl implements GroupSegment {
   }
 
   deletions(): MaybePromise<DeletionVector | null> {
-    this.view.snapshot.check();
+    this.view.snapshot.checkRead();
     const delta = groupDeletions(this.view.tableView, this.#groupId, this.view.snapshot.bound);
     const ref = this.directory.deletions(this.position);
     if (ref === null) return deletionVector(this.rowCount, null, delta);
@@ -199,7 +200,7 @@ class GroupSegmentImpl implements GroupSegment {
       ...(this.portableWork.signal === undefined ? {} : { signal: this.portableWork.signal }),
     });
     try {
-      this.view.snapshot.check();
+      this.view.snapshot.checkRead();
       return deletionVector(
         this.rowCount,
         decodeDeletionBitmap(need(lease.bytes[0]), this.rowCount),
@@ -218,7 +219,7 @@ class GroupSegmentImpl implements GroupSegment {
    * segment holds it, charged to the table snapshot's budget, until its snapshot is released.
    */
   root(): MaybePromise<GroupRoot> {
-    this.view.snapshot.check();
+    this.view.snapshot.checkRead();
     if (this.#root !== null) return this.#root;
     const got =
       this.#pending ??
@@ -258,7 +259,7 @@ class GroupSegmentImpl implements GroupSegment {
       ...(this.portableWork.signal === undefined ? {} : { signal: this.portableWork.signal }),
     });
     try {
-      this.view.snapshot.check();
+      this.view.snapshot.checkRead();
       const parsed = decodeGroupRoot(need(lease.bytes[0]), this.view.budget);
       let released = false;
       return {
@@ -288,6 +289,7 @@ class GroupSegmentImpl implements GroupSegment {
   }
 
   #requireRoot(): GroupRoot {
+    this.view.snapshot.checkRead();
     if (this.#root === null) throw new TypeError("Call root() before reading a group's chunks");
     return this.#root;
   }
@@ -374,7 +376,7 @@ class MemorySegmentImpl implements MemorySegment {
     return (this.#reads ??= new MemoryReads({
       rowCount: this.rowCount,
       column: (id) => this.view.column(id),
-      check: () => this.view.snapshot.check(),
+      check: () => this.view.snapshot.checkRead(),
       publishedRoot: () => need(this.memtable.published).group.root,
       retained: (chunk) => chunk === 0 && this.#retained !== null,
       ...(this.memtable.schemaVersion === this.view.schemaVersion
@@ -408,13 +410,14 @@ class MemorySegmentImpl implements MemorySegment {
   }
 
   get liveRowCount(): number {
+    this.view.snapshot.checkRead();
     return (
       this.rowCount - this.memtable.deletedUnder(this.view.snapshot.bound, this.rowCount).length
     );
   }
 
   deletions(): DeletionVector | null {
-    this.view.snapshot.check();
+    this.view.snapshot.checkRead();
     return deletionVector(
       this.rowCount,
       null,
@@ -423,10 +426,12 @@ class MemorySegmentImpl implements MemorySegment {
   }
 
   statistics(): ColumnStatistics | null {
+    this.view.snapshot.checkRead();
     return null;
   }
 
   pages(columnId: number): readonly PageSummary[] {
+    this.view.snapshot.checkRead();
     const c = this.#storedIndex(columnId);
     if (c < 0)
       return [
@@ -463,7 +468,7 @@ class MemorySegmentImpl implements MemorySegment {
   }
 
   portableChunk(columnId: number, chunk: number): MaybePromise<PortableChunk> {
-    this.view.snapshot.check();
+    this.view.snapshot.checkRead();
     const first = chunk * MEMORY_CHUNK_ROWS;
     const length = Math.min(MEMORY_CHUNK_ROWS, this.rowCount - first);
     if (!(Number.isInteger(chunk) && chunk >= 0 && length > 0))
@@ -484,7 +489,7 @@ class MemorySegmentImpl implements MemorySegment {
       return { kind: "resident", vector: stored.view(length), firstRow: first };
     }
     return settle(groupRootOf(published.groupRoot), (root) => {
-      this.view.snapshot.check();
+      this.view.snapshot.checkRead();
       const stored = root.columns.find((candidate) => candidate.columnId === columnId);
       if (stored === undefined) throw new RangeError("Published portable column missing");
       return { kind: "stored", chunk: stored, firstRow: 0 };
@@ -498,7 +503,7 @@ class MemorySegmentImpl implements MemorySegment {
     startRow = 0,
     step?: MemoryChunkStep,
   ): MaybePromise<ChunkResult> {
-    this.view.snapshot.check();
+    this.view.snapshot.checkRead();
     if (step !== undefined) return this.#bounded().chunk(columnId, chunk, out, startRow, step);
     const first = chunk * MEMORY_CHUNK_ROWS;
     const length = Math.min(MEMORY_CHUNK_ROWS, this.rowCount - first);
@@ -745,6 +750,7 @@ export class TableSnapshotImpl implements TableSnapshot {
 
   /** Built on first use (point reads and inserts never need them). */
   get segments(): readonly Segment[] {
+    this.snapshot.checkRead();
     if (this.#segments === null) {
       const segments: Segment[] = [];
       const groups = this.tableView.groups;
@@ -758,6 +764,7 @@ export class TableSnapshotImpl implements TableSnapshot {
   }
 
   get liveRowCount(): number {
+    this.snapshot.checkRead();
     let total = 0;
     const groups = this.tableView.groups;
     for (let position = 0; position < groups.count; position++)
@@ -774,7 +781,7 @@ export class TableSnapshotImpl implements TableSnapshot {
   }
 
   async *portableSegments(work: TaskWork = {}): AsyncGenerator<Segment> {
-    this.snapshot.check();
+    this.snapshot.checkRead();
     // One segment, deletion positions (<=65,536), root hold/iterator wrappers; not O(groups).
     const credit = 1024 * 1024;
     if (!this.budget.allocate(credit)) throw new ParseBudgetError(credit);
@@ -791,7 +798,7 @@ export class TableSnapshotImpl implements TableSnapshot {
     try {
       const groups = this.tableView.groups;
       for (let position = 0; position < groups.count; position++) {
-        this.snapshot.check();
+        this.snapshot.checkRead();
         active = new GroupSegmentImpl(position, groups, position, this, true, work);
         try {
           yield active;
@@ -801,7 +808,7 @@ export class TableSnapshotImpl implements TableSnapshot {
       }
       let index = groups.count;
       for (const memtable of this.tableView.memtables) {
-        this.snapshot.check();
+        this.snapshot.checkRead();
         active = new MemorySegmentImpl(index++, memtable, this);
         try {
           yield active;
@@ -889,6 +896,8 @@ export interface SnapshotParts {
   readonly statementView: boolean;
   /** Internal statement-owned prefix pins retire their owner's strong reference on release. */
   readonly onRelease?: () => void;
+  /** Optional phase fence for current-write-prefix pins, never used for locator liveness. */
+  readonly checkRead?: () => void;
 }
 
 export class SnapshotImpl implements Snapshot {
@@ -904,6 +913,7 @@ export class SnapshotImpl implements Snapshot {
   readonly #statementView: boolean;
   #released = false;
   #onRelease: (() => void) | undefined;
+  #checkRead: (() => void) | undefined;
   // Made on first use: most write-path views read one table through one index, or nothing.
   #indexes: Map<string, ViewIndex> | null = null;
   #tables: Map<number, TableSnapshotImpl> | null = null;
@@ -921,6 +931,7 @@ export class SnapshotImpl implements Snapshot {
     this.#reader = parts.shared.readers.open();
     this.#statementView = parts.statementView;
     this.#onRelease = parts.onRelease;
+    this.#checkRead = parts.checkRead;
   }
 
   get released(): boolean {
@@ -929,6 +940,11 @@ export class SnapshotImpl implements Snapshot {
 
   check(): void {
     if (this.#released) throw new SnapshotReleasedError();
+  }
+
+  checkRead(): void {
+    this.check();
+    this.#checkRead?.();
   }
 
   #def(tableId: number): { def: TableDef; view: TableView } {
@@ -940,6 +956,7 @@ export class SnapshotImpl implements Snapshot {
   }
 
   table(tableId: number, options: TableReadOptions): TableSnapshotImpl {
+    this.checkRead();
     const { def, view } = this.#def(tableId);
     const table = new TableSnapshotImpl(this, def, view, options.budget);
     (this.#handed ??= []).push(table);
@@ -961,6 +978,7 @@ export class SnapshotImpl implements Snapshot {
   }
 
   index(tableId: number, indexId: number): ViewIndex {
+    this.checkRead();
     const key = `${String(tableId)}:${String(indexId)}`;
     this.#indexes ??= new Map();
     let reader = this.#indexes.get(key);
@@ -1018,6 +1036,7 @@ export class SnapshotImpl implements Snapshot {
   releaseInternal(): void {
     if (this.#released) return;
     this.#released = true;
+    this.#checkRead = undefined; // A released caller pin must not retain its root statement.
     const notify = this.#onRelease;
     this.#onRelease = undefined;
     notify?.();
@@ -1132,6 +1151,7 @@ export class ViewIndex implements IndexReader {
     hash?: number,
     bloomHash?: number,
   ): Promise<void> | undefined {
+    this.table.snapshot.checkRead();
     if (hash === undefined || bloomHash === undefined) hashKey(bytes, start, end, this.#hashes);
     else {
       this.#hashes.first = hash;
@@ -1350,7 +1370,7 @@ export class ViewIndex implements IndexReader {
   }
 
   probe(keys: KeyBatch, out: ProbeOutput, resume?: ProbeResume): MaybePromise<ProbeResult> {
-    this.table.snapshot.check();
+    this.table.snapshot.checkRead();
     out.count = 0;
     const start = resume as Resume | undefined;
     return this.#probeFrom(keys, out, start?.key ?? 0, start?.skip ?? 0);
@@ -1411,13 +1431,14 @@ export class ViewIndex implements IndexReader {
   }
 
   planRange(range: KeyRange, direction: "asc" | "desc"): IndexRangePlan {
-    this.table.snapshot.check();
+    this.table.snapshot.checkRead();
     if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
     if (this.def.kind !== "ordered") throw new TypeError("An equality index serves lookups only");
     return planIndexRange(this, range, direction);
   }
 
   range(range: KeyRange, direction: "asc" | "desc"): IndexCursor {
+    this.table.snapshot.checkRead();
     if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
     if (this.def.kind !== "ordered") throw new TypeError("An equality index serves lookups only");
     return new StreamingRangeCursor(this, range, direction);
@@ -1427,6 +1448,7 @@ export class ViewIndex implements IndexReader {
   async collect(range: KeyRange): Promise<Array<{ key: Uint8Array; rowId: number }>> {
     if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
     const snapshot = this.table.snapshot;
+    snapshot.checkRead();
     const shared = snapshot.shared;
     const bound = snapshot.bound;
     const accept = (key: Uint8Array): -1 | 0 | 1 => {

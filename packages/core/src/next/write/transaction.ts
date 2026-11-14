@@ -755,10 +755,25 @@ export class StatementImpl implements Statement {
   #current: SnapshotImpl | null = null;
   #ownReads: Set<SnapshotImpl> | null = null;
   #ownOrigins: WeakSet<SnapshotImpl> | null = null;
+  #mutation = 0;
+
+  /** Data-phase fence; locator translation keeps the pin alive through every write batch. */
+  beginMutation(): void {
+    if (this.#ownReads !== null) this.#mutation++;
+  }
 
   readOwn(): SnapshotImpl {
     this.#checkOpen();
-    const view = this.#fresh(() => this.#ownReads?.delete(view));
+    const mutation = this.#mutation;
+    const view = this.#fresh(
+      () => this.#ownReads?.delete(view),
+      () => {
+        if (mutation !== this.#mutation)
+          throw new TransactionStateError(
+            "A current-prefix pin is locator-only after mutation begins",
+          );
+      },
+    );
     (this.#ownReads ??= new Set()).add(view);
     (this.#ownOrigins ??= new WeakSet()).add(view);
     return view;
@@ -790,7 +805,7 @@ export class StatementImpl implements Statement {
     return this.#current;
   }
 
-  #fresh(onRelease?: () => void): SnapshotImpl {
+  #fresh(onRelease?: () => void, checkRead?: () => void): SnapshotImpl {
     return new SnapshotImpl({
       state: this.tx.hooks.state(),
       bound: ALL,
@@ -800,6 +815,7 @@ export class StatementImpl implements Statement {
       label: `${this.tx.hooks.label()}/checks`,
       statementView: false,
       ...(onRelease === undefined ? {} : { onRelease }),
+      ...(checkRead === undefined ? {} : { checkRead }),
     });
   }
 
@@ -861,6 +877,7 @@ export class StatementImpl implements Statement {
 
   changeCatalog(change: CatalogChange): MaybePromise<{ readonly id: number | null }> {
     return this.guard(() => {
+      this.beginMutation();
       const before = this.tx.catalog;
       const { catalog, logged, id } = before.change(change, this.tx.hooks.nextCatalogVersion());
       const validate =
@@ -934,6 +951,7 @@ export class StatementImpl implements Statement {
     }
     return Promise.resolve(
       this.guard(async () => {
+        this.beginMutation();
         await this.#actions();
         await this.#verify();
       }),
@@ -1233,6 +1251,7 @@ export class TableWriterImpl implements TableWriter {
 
   insert(batch: Batch, written: Selection | null): MaybePromise<number> {
     return this.statement.guard(() => {
+      this.statement.beginMutation();
       this.#checkShape(
         batch.columns,
         0,
@@ -1782,6 +1801,7 @@ export class TableWriterImpl implements TableWriter {
 
   update(batch: Batch, written: Selection | null): MaybePromise<number> {
     return this.statement.guard(() => {
+      this.statement.beginMutation();
       this.#checkShape(batch.columns, 1, this.#assigned);
       const { rows, rowIds } = this.#targets(batch);
       if (written !== null) {
@@ -1872,6 +1892,7 @@ export class TableWriterImpl implements TableWriter {
 
   delete(batch: Batch, written: Selection | null): MaybePromise<number> {
     return this.statement.guard(() => {
+      this.statement.beginMutation();
       if (batch.columns.length !== 1)
         throw new TypeError("A delete batch holds the locator column only");
       const { rows, rowIds } = this.#targets(batch);

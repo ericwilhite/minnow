@@ -93,8 +93,10 @@ export interface Statement {
    * Separately pinned read of the current statement's own write prefix, for a trigger body.
    * Unlike view, includes this statement's writes. Consume/spool the complete body input
    * before performing its mutations: reads and mutations of a statement do not run concurrently.
-   * The caller releases after all read borrows drain; end/rollback also invalidates the pin.
-   * Keep it through the corresponding writer calls when supplying inputView for locators.
+   * This is a phase pin, an exception to Snapshot's immutable-read promise: its bound includes
+   * mutable own writes. After any mutation begins it MUST NOT be read again, even through a
+   * previously obtained table/index/segment; retain it only for inputView locator resolution.
+   * Caller releases after read/writer borrows drain; end/rollback also invalidates the pin.
    */
   readOwn(): Snapshot;
   /**
