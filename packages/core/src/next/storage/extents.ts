@@ -509,6 +509,10 @@ export interface PublishChange extends TaskWork {
   readonly writers: readonly ExtentWriter[];
   /** Extents the previous durable root reaches and the new one does not, each exactly once. */
   readonly retired: readonly ExtentRef[];
+  /** Complete generation replacement: use the immutable current-root disk inventory as
+   * retirement claims, never materialize it in the caller. Explicit retired must be empty.
+   * The ordinary before-minus-after proof still rejects any extent shared with the new root. */
+  readonly retireCurrentRoot?: boolean;
 }
 
 export interface SpaceStats {

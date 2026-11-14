@@ -8691,3 +8691,17 @@ export const SNAPSHOT_CATALOG_REFUSAL_REACH = [
   "unresolved reference",
   "unsupported field",
 ] as const;
+
+export const SNAPSHOT_RETIREMENT_REACH = [
+  "small old inventory",
+  "large old inventory",
+  "constant replacement workspace",
+] as const;
+
+export const SNAPSHOT_RETIRE_CURRENT_REACH = [
+  "sharing refused",
+  "mixed claims refused",
+  "cancel intact",
+  "pin survives replacement",
+  "exact retired inventory",
+] as const;

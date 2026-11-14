@@ -4276,3 +4276,8 @@ duplicate IDs/names, unsafe integers, allocation-counter floors and unresolved r
 are refused. Views, sequences, indexes/constraints and missing/backfill vectors require the
 stage4 MCAT adapter and receive a typed refusal here; trigger/managed/FTS fields cannot disappear
 through a permissive catalog constructor. This is an unreleased development interface.
+
+Complete snapshot replacement borrows the extent space's immutable, disk-backed current-root
+inventory as retirement claims. It does not collect old extents in a JavaScript Set or array.
+The ordinary exact retirement proof, two-generation delay and snapshot pins still apply;
+replacing a larger old database therefore needs no per-old-extent resident load allocation.

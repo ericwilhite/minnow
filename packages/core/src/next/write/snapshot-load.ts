@@ -27,14 +27,8 @@ import {
   snapshotU53,
   type SnapshotWork,
 } from "../format/snapshot.js";
-import { ExtentListKeeper, listedExtents } from "../storage/extent-list.js";
-import type {
-  BlobRef,
-  ByteBudget,
-  ExtentRef,
-  ExtentSpace,
-  ExtentWriter,
-} from "../storage/extents.js";
+import { ExtentListKeeper } from "../storage/extent-list.js";
+import type { BlobRef, ByteBudget, ExtentSpace, ExtentWriter } from "../storage/extents.js";
 import { decodeJson } from "./bytes.js";
 import { validateSnapshotCatalog } from "./snapshot-catalog-validate.js";
 import { Catalog } from "./catalog.js";
@@ -385,16 +379,6 @@ export async function loadSnapshot(
     const writtenCatalog = await writer.write([catalogBytes]),
       catalogRef = writtenCatalog.blobs[0];
     snapshotCheck(catalogRef !== undefined, "Missing native catalog");
-    const retired: ExtentRef[] = [],
-      seen = new Set<number>();
-    for await (const item of listedExtents(old?.extentList ?? [], target.space, budget, options)) {
-      const extent = "extent" in item ? item.extent : item;
-      if (!seen.has(extent.offset)) {
-        account.take(192);
-        seen.add(extent.offset);
-        retired.push(extent);
-      }
-    }
     list = new ExtentListKeeper([], { reader: target.space, budget, ...options });
     const prepared = await list.prepare(1, { added: writer.extents, released: [], writer });
     listPrepared = true;
@@ -417,7 +401,8 @@ export async function loadSnapshot(
     await snapshotPace(options);
     await target.space.publish(rootBytes, {
       writers: [writer],
-      retired,
+      retired: [],
+      retireCurrentRoot: true,
       list: prepared.list,
       budget,
       ...options,

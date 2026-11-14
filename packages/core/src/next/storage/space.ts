@@ -826,6 +826,10 @@ class Space implements ExtentSpace {
 
   async publish(root: Uint8Array, change: PublishChange): Promise<number> {
     this.accepting();
+    if (change.retireCurrentRoot === true && change.retired.length !== 0)
+      throw new TypeError(
+        "publish: retireCurrentRoot cannot be combined with explicit retirements",
+      );
     return this.#publishing.run(() =>
       this.#metadata.run(async () => {
         const budget = change.budget ?? this.#budget;
@@ -848,24 +852,32 @@ class Space implements ExtentSpace {
               undefined,
               true,
             );
-          claimed = await saveExtentInput(
-            this.journal,
-            (function* () {
-              for (const extent of change.retired) {
-                if (!Number.isSafeInteger(extent.length) || extent.length <= 0)
-                  throw new RangeError("publish: retirement is not an extent");
-                yield {
-                  offset: extent.offset,
-                  length: Math.ceil(extent.length / DATA_ALIGN) * DATA_ALIGN,
-                };
-              }
-            })(),
-            false,
-            Infinity,
-            change,
-            undefined,
-            true,
-          );
+          if (change.retireCurrentRoot === true) {
+            await this.#ensureInitialSnapshots(change);
+            await this.journal.workspace.run("spool", () =>
+              this.journal.retain(this.#currentSnapshot),
+            );
+            claimed = this.#currentSnapshot;
+          } else {
+            claimed = await saveExtentInput(
+              this.journal,
+              (function* () {
+                for (const extent of change.retired) {
+                  if (!Number.isSafeInteger(extent.length) || extent.length <= 0)
+                    throw new RangeError("publish: retirement is not an extent");
+                  yield {
+                    offset: extent.offset,
+                    length: Math.ceil(extent.length / DATA_ALIGN) * DATA_ALIGN,
+                  };
+                }
+              })(),
+              false,
+              Infinity,
+              change,
+              undefined,
+              true,
+            );
+          }
           await this.#ensureInitialSnapshots(change);
           return await this.#cache.withReadSlab((slab) =>
             this.mutate((guard) =>
