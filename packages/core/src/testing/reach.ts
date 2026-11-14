@@ -6876,3 +6876,38 @@ export const TRIGGER_QUEUE_READ_REACH = [
   "ordinary IDs",
   "zero ownership",
 ] as const;
+
+export const TRIGGER_BINDING_REACH = [
+  "unique repeated bindings",
+  "release before body",
+  "unrequested payload unread",
+  "exact native buffers",
+  "PG typed body value",
+  "zero ownership",
+  "flat",
+  "constant",
+  "dictionary",
+  "NULL",
+  "fragmented UTF8",
+  "decimal safe",
+  "decimal int64",
+  "decimal int128",
+  "decimal wide",
+  "wide int64",
+  "timestamp microseconds",
+] as const;
+
+export const TRIGGER_BINDING_LAYOUT_REACH = [
+  "SQL array",
+  "interval",
+  "UUID",
+  "decimal NaN",
+  "decimal Infinity",
+  "decimal -Infinity",
+  "exact admitted boundary",
+  "NULL payload ignored",
+  "live payload",
+  "flat",
+  "constant",
+  "dictionary",
+] as const;

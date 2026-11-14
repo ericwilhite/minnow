@@ -17,6 +17,11 @@ formats. `value::text` and `text || value` now work in the rebuild. Array text s
 renderer's PostgreSQL quoting. The shipped engine, public API and stored formats are unchanged; no
 migration is needed.
 
+The private trigger runtime adds typed OLD/NEW parameter scopes. Repeated references share
+one charged copy, wide values copy in cancellable fragments, and image borrows end before
+body execution. This is a runtime component; native SQL trigger firing remains disabled
+until the joint command, registry and body-runner integration is verified.
+
 The private rebuild adds a spillable AFTER-event queue with bounded metadata. Child events
 append behind the existing frame; pending IO and continuations drain before cleanup. This is
 runtime groundwork only: native trigger SQL stays disabled until the joint firing integration.

@@ -3863,3 +3863,14 @@ continuations, so a callback can append or run a nested producer without hold-an
 Close fences pending appends, reads and continuations before closing files or freeing scratch;
 cleanup attempts both epochs and surfaces close failures. This is a verified runtime component;
 SQL firing still needs the joint controller, typed body runner and native Statement.end hooks.
+
+TriggerBindingProgram compiles stable (OLD/NEW, column ID) dependencies once. Repeated textual
+parameters alias one owned typed scalar; no Date/Number/JS-row or public raw-parameter rebinding
+occurs. Projected image leases expose unrequested columns with an explicit unread marker,
+never SQL NULL. The body receives its scope only after the lease releases. NULL payloads stay
+uninterpreted, decimal tiers/scales and timestamp microseconds survive unchanged, and varlen
+copies use exact arrays with task-clock/cancellation checks per 64 KiB fragment. Binding
+metadata is prepaid ordinary workspace (maximum live body, not a sum across events); exact
+unique payload copies use the shared image progress envelope. Scope close clears native
+references before freeing charge. The native projected reader/body host and SQL integration
+remain separate: this component alone does not enable firing.

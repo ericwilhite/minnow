@@ -793,5 +793,7 @@ unit; storing/lowering these modes alone does not enable their execution.
 
 The scalar-reference AfterQueue now spills with bounded FIFO epoch metadata and releases read
 progress before callbacks. This component does not enable SQL trigger firing: the controller,
-typed OLD/NEW body input, native registry and B5b Statement.end/RI consumer still need their
-joint end-to-end verification. Accepted catalog/DDL behavior above is unchanged.
+native registry and B5b Statement.end/RI consumer still need their joint end-to-end verification.
+The typed binding component copies each unique OLD/NEW column once from a projected lease,
+releases it before body execution, and preserves native numeric/temporal values without raw
+parameter rebinding. The body query host and projected native reader remain pending. Accepted catalog/DDL behavior above is unchanged.

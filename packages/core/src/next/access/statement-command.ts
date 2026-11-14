@@ -1,4 +1,4 @@
-import type { Batch } from "../vector/vector.js";
+import type { Batch, Vector } from "../vector/vector.js";
 
 /** Native command/trigger boundary. Capability remains absent until its bounded registry and
  * executor hooks are installed; this contract does not enable trigger or RI scheduling.
@@ -70,12 +70,33 @@ export interface RowImageLease {
   readonly new: Batch | null;
   release(): void;
 }
+/** Unrequested is deliberately not SQL NULL and cannot be passed to a kernel as a Batch. */
+export const ROW_IMAGE_UNREAD = Symbol("row image column not requested");
+export interface RowBindingProjection {
+  readonly old: readonly number[];
+  readonly new: readonly number[];
+}
+/** Exactly one row, physical table-column order, with unrequested columns explicitly unread.
+ * The native helper charges/decodes only selected payloads. Stable IDs in the projection are
+ * validated against the image's table. Missing OLD/NEW sides are null, never synthetic rows.
+ * The borrow/release rules of RowImageLease apply unchanged. */
+export interface RowBindingLease {
+  readonly tableId: number;
+  readonly old: ReadonlyArray<Vector | typeof ROW_IMAGE_UNREAD> | null;
+  readonly new: ReadonlyArray<Vector | typeof ROW_IMAGE_UNREAD> | null;
+  release(): void;
+}
 export interface NativeCommandBoundary {
   /** One image helper slot in the shared root scope, independent of RI depth. Caller copies only
    * referenced bindings to prepaid workspace, then releases BEFORE any producer/admission wait.
    * Repeated bindings share the copied vector; no per-occurrence payload copies or JS row values.
    * See exec/row-image-layout.ts for the fixed minimum and exact-payload progress envelope. */
   readRowImages(images: RowImageRef, signal: AbortSignal): Promise<RowImageLease>;
+  readRowBindings(
+    images: RowImageRef,
+    projection: RowBindingProjection,
+    signal: AbortSignal,
+  ): Promise<RowBindingLease>;
   beginCommand(frameId: number, triggerBudget: number): CommandToken;
   /** Includes child c_ reference checks, not just parent a_ actions. Exposed after primary succeeds. */
   rowReferentialEntries(command: CommandToken, row: RowImageRef): AsyncIterable<ReferentialEntry>;
