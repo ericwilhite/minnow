@@ -60,6 +60,7 @@ export class ReturningWriter implements Operator {
       assigned: rel.assigned,
       onRepeat: rel.onRepeat,
       uniqueTargets,
+      ...(!uniqueTargets && rel.kind !== "insert" ? { requireTrackedTargets: true } : {}),
     });
     this.#project =
       rel.returning === null

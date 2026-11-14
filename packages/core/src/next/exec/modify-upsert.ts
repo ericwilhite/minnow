@@ -103,6 +103,7 @@ export class UpsertWriter implements Operator {
     this.#update = statement.table(table.id, {
       assigned: rel.onConflict?.assignments.map((a) => a.column) ?? [],
       onRepeat: "error",
+      requireTrackedTargets: true,
     });
     this.#kernels = new UpsertExpressions(rel, { ...context, input: upsertTypes(rel) });
     this.#project =

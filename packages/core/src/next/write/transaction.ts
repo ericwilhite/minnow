@@ -894,6 +894,8 @@ export class StatementImpl implements Statement {
 
   table(tableId: number, options: TableWriteOptions = {}): TableWriterImpl {
     if (this.#state !== "open") throw new TransactionStateError(`The statement is ${this.#state}`);
+    if (options.requireTrackedTargets === true && this.targets === undefined)
+      throw new TypeError("SQL modification requires admitted target tracking");
     if (options.inputView !== undefined) {
       const def = this.tx.catalog.table(tableId);
       if (def === undefined) throw new RangeError(`Table ${String(tableId)} does not exist`);

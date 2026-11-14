@@ -1634,7 +1634,9 @@ into hidden columns and removed from visible results. No runtime code generation
 The owner composition uses it by default; protocol tests over `StandinWritePath` explicitly keep
 their synthetic executor. Native INSERT VALUES/SELECT, UPDATE, DELETE, ON CONFLICT and RETURNING
 execute with statement snapshot input spools. Joined/index inputs retain locator identity;
-repeat tracking and returned rows use charged, spillable state. Complete-row validation includes
+repeat tracking and returned rows use charged, spillable state. SQL writers without a unique-target
+proof require the admitted tracker before writer lookup, including raw executor requests. The
+direct-native legacy target Set cannot be selected by SQL. Complete-row validation includes
 closed text sets as well as NOT NULL and CHECK, including precise generated-error replay.
 Closed-set failures retain their column identity and active physical row order. Shared row rules stay alive
 through native FK actions. Unsupported modification kinds and kernel overloads remain typed refusals.

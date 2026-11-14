@@ -7822,3 +7822,16 @@ export const MODIFY_UPSERT_RESOLUTION_REACH = [
   "completed read used",
   "bounded lookup count",
 ] as const;
+
+/** Raw native SQL execution must not opt into the legacy uncharged target Set. */
+export const MODIFY_TRACKING_CAPABILITY_REACH = [
+  "update",
+  "delete",
+  "upsert",
+  "RETURNING",
+  "plain",
+  "cached writer",
+  "fresh writer",
+  "raw caller refused",
+  "owned SQL tracked",
+] as const;

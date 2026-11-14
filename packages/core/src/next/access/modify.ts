@@ -138,6 +138,9 @@ export interface TableWriteOptions {
   /** Caller proves one visit per original target; omit repeat tracking for a scan/probe.
    * Never set for a join, MERGE or ON CONFLICT input. */
   readonly uniqueTargets?: boolean;
+  /** SQL streams without the unique-target proof require an admitted tracker. Refuse before
+   * writer lookup when it is missing; the direct-native legacy Set is not a SQL fallback. */
+  readonly requireTrackedTargets?: boolean;
 }
 
 export interface TableWriter {

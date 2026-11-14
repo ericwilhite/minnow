@@ -1088,6 +1088,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             assigned: rel.assigned,
             onRepeat: rel.onRepeat,
             uniqueTargets: rel.uniqueTargets === true,
+            ...(rel.kind !== "insert" && rel.uniqueTargets !== true
+              ? { requireTrackedTargets: true }
+              : {}),
           });
           let pending: Promise<void> | null = null;
           const sink: Operator = {

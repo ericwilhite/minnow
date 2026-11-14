@@ -93,7 +93,9 @@ reservations retire before the writer starts, so a writer waiting for memory can
 its own producer. Single-table UPDATE and DELETE avoid statement-wide target sets;
 UPDATE FROM visits matching source rows in source order. Joined modifications and upserts
 track repeated native row identities with a fixed charged bitmap cache and a spilled paged
-directory. Duplicate suppression follows row-rule evaluation. Single-row upsert writes
+directory. Joined/USING and conflict-update SQL writers require that admitted tracking
+capability before writer lookup; raw executor callers cannot fall back to an uncharged Set.
+Duplicate suppression follows row-rule evaluation. Single-row upsert writes
 coalesce contiguous undo ranges without crossing statement or catalog boundaries, keeping
 commit projection bounded. Prefix-pinned UPDATE/DELETE recheck pin lifetime after asynchronous
 repeat tracking, including the final target in a batch. A released pin cannot authorize a write.
