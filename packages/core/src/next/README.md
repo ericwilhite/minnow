@@ -191,7 +191,7 @@ version gaps from rolled-back DDL. DROP TABLE carries its MCHG definition too.
 
 The manifest names the catalog tree, not a JSON blob. Reachability checks child depth and
 summaries plus contiguous fragment offsets, and reclamation retires every old index/data page.
-The reader/manifest/commit-body development selectors are 4/5/3; older unpublished selectors
+The reader/manifest/commit-body development selectors are 5/6/4; older unpublished selectors
 refuse. The released 1.0 format has no supported predecessor yet. Trigger family20 remains
 reserved. FTS declarations persist without making an index ready. Snapshot catalog frame
 adapters are a separate integration step over the same portable MCAT stream.
