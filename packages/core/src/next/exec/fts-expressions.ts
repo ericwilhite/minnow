@@ -24,14 +24,18 @@ export class FtsExpressions implements Operator {
     exprs: readonly ScalarExpr[] | ScalarExpr,
     context: CompileContext,
     downstream: Operator,
-    readonly options: { signal?: AbortSignal; stopped?: () => boolean } = {},
+    readonly options: {
+      signal?: AbortSignal;
+      stopped?: () => boolean;
+      progress?: ProjectOperator["progress"];
+    } = {},
   ) {
     context.arena.take(512 + 2);
     this.#one = { rows: new Uint16Array(1), count: 1 };
     installFtsHost(context.arena, (node) => this.#nodes.push(node));
     try {
       this.#inner = Array.isArray(exprs)
-        ? new ProjectOperator(exprs, context, downstream)
+        ? new ProjectOperator(exprs, context, downstream, options.progress)
         : new FilterOperator(exprs as ScalarExpr, context, downstream);
     } finally {
       installFtsHost(context.arena, null);

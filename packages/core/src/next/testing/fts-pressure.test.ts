@@ -67,7 +67,15 @@ for (const seed of seedsFor("next-fts-sql-pressure", [0xb7fb, 0xb7fc]))
         const prepared = prepare(plan);
         return {
           ...prepared,
-          execute: (request) => prepared.execute({ ...request, governor: controlled }),
+          execute: (request) =>
+            prepared.execute({
+              ...request,
+              governor: controlled,
+              signal: AbortSignal.any([
+                ...(request.signal ? [request.signal] : []),
+                AbortSignal.timeout(45000),
+              ]),
+            }),
         };
       };
       const sql =
@@ -87,6 +95,27 @@ for (const seed of seedsFor("next-fts-sql-pressure", [0xb7fb, 0xb7fc]))
         ),
       ).toBeGreaterThan(0);
       reach.reach("native SQL spill");
+      // A MATCH wrapper must preserve the ordinary projection's pressure fallback.
+      // The tokenized document is small; only its reachable TEXT result is wide.
+      const payload = seed & 1 ? "x".repeat(710000) : "汉".repeat(230000);
+      for (const expression of [
+        "CASE WHEN MATCH(b) AGAINST 'alpha' THEN $1::text ELSE 'k'::text END",
+        "coalesce(CASE WHEN MATCH(b) AGAINST 'alpha' THEN nullif($1::text,'absent'::text) END,'k'::text)",
+      ]) {
+        const projection = `SELECT ${expression} k FROM docs WHERE id<2`;
+        const expectedProjection = await db.query(projection, {
+          params: [payload],
+          memoize: false,
+        });
+        // An unrelated previous execution's pinned holder must leave before the
+        // next execution admits its owned bindings; re-pin after atomic preflight.
+        blocker?.close();
+        blocker = undefined;
+        const projected = await core.execute(projection, [payload]);
+        if (!("batches" in projected)) throw Error("projection query");
+        expect(oracleRows(projected)).toEqual(expectedProjection.rows);
+      }
+      reach.reach("wide FTS projection");
     } finally {
       blocker?.close();
       await core.close();

@@ -6051,6 +6051,7 @@ export const FTS_RENDER_REACH = [
 ] as const;
 
 export const FTS_SQL_PRESSURE_REACH = [
+  "wide FTS projection",
   "shipped exact",
   "all credit occupied",
   "native SQL spill",

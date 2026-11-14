@@ -3688,6 +3688,9 @@ counts over visible input, with a per-document union across repeated columns and
 then scores retained columns through the shared scorer. A charged ordinal preserves input
 order through the external raw-column spool; there is no input replay or shipped executor.
 MATCH filter/projection jobs yield within documents and defer errors to scalar demand.
+The wrapper keeps the projection's grant-aware progress hook, including wide conditional
+TEXT results, and uses the actual star-route input layout. A MATCH job never replaces the
+ordinary projection's bounded, borrowing fallback under competing credit.
 
 A complete workspace bounds UTF-8 decoding, normalization/lowercase expansion, code-point
 iteration and 4096 bounded tokens. Source sizing and query length choose one shared workspace

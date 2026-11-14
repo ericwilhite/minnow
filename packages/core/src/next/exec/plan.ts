@@ -1410,42 +1410,45 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           runtime?: QueryRuntime,
           grant?: Grant,
           stops: readonly Stop[] = [],
-        ) =>
-          hasFts
+        ) => {
+          const progress =
+            runtime && grant
+              ? {
+                  signal: runtime.signal,
+                  available: () => runtime.projectionAvailable(grant),
+                }
+              : undefined;
+          let actualExprs = exprs;
+          if (rel.op === "project") {
+            const actual = runtime ? starRel(runtime, rel) : rel;
+            if (actual.op !== "project") throw new Error("Star project changed operator");
+            actualExprs =
+              actual === rel
+                ? exprs
+                : jsonDescendants.size
+                  ? actual.exprs.map((expr) => canonicalJsonText(expr, actual.input))
+                  : actual.exprs;
+            context = { ...context, input: types(actual.input) };
+          }
+          return hasFts
             ? new FtsExpressions(
-                exprs,
+                actualExprs,
                 context,
                 sink,
                 runtime
                   ? {
                       signal: runtime.signal,
                       stopped: () => stops.some((stop) => stop()),
+                      progress,
                     }
                   : {},
               )
             : rel.op === "filter"
-            ? new FilterOperator(exprs as ScalarExpr, context, sink)
-            : rel.op === "project"
-              ? (() => {
-                  const actual = runtime ? starRel(runtime, rel) : rel;
-                  if (actual.op !== "project") throw new Error("Star project changed operator");
-                  return new ProjectOperator(
-                    actual === rel
-                      ? (exprs as readonly ScalarExpr[])
-                      : jsonDescendants.size
-                        ? actual.exprs.map((expr) => canonicalJsonText(expr, actual.input))
-                        : actual.exprs,
-                    { ...context, input: types(actual.input) },
-                    sink,
-                    runtime && grant
-                      ? {
-                          signal: runtime.signal,
-                          available: () => runtime.projectionAvailable(grant),
-                        }
-                      : undefined,
-                  );
-                })()
-              : new LimitOperator(null, 0, context.arena, sink);
+              ? new FilterOperator(actualExprs as ScalarExpr, context, sink)
+              : rel.op === "project"
+                ? new ProjectOperator(actualExprs as readonly ScalarExpr[], context, sink, progress)
+                : new LimitOperator(null, 0, context.arena, sink);
+        };
         const minimum = measureCompilerBuffers(
           compilation,
           input,
