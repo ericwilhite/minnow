@@ -37,6 +37,7 @@ import {
 import { lowerBlock } from "./query.js";
 import { defaultValue, generatedValue, rowScope, ruleColumns, tableRowScope } from "./rules.js";
 import { nullLiteral } from "./literals.js";
+import { snapshotReturningParameters } from "./returning-input.js";
 
 type Insert = Extract<CompiledStatement, { kind: "insert" }>;
 type Update = Extract<CompiledStatement, { kind: "update" }>;
@@ -346,22 +347,25 @@ export function lowerInsert(statement: Insert, builder: PlanBuilder): LoweredWri
   const returning = returningList(statement, table, statement.alias, builder);
   const onConflict =
     statement.onConflict === undefined ? null : conflictClause(statement, table, targets, builder);
-  return {
-    rel: {
-      op: "modify",
-      id: builder.id(),
-      kind: onConflict === null ? "insert" : "upsert",
+  return snapshotReturningParameters(
+    {
+      rel: {
+        op: "modify",
+        id: builder.id(),
+        kind: onConflict === null ? "insert" : "upsert",
+        tableId: table.id,
+        input,
+        assigned: [],
+        onRepeat: "error",
+        onConflict,
+        returning: returning?.exprs ?? null,
+        output: outputColumns(returning?.columns ?? []),
+      },
+      columns: returning?.columns ?? [],
       tableId: table.id,
-      input,
-      assigned: [],
-      onRepeat: "error",
-      onConflict,
-      returning: returning?.exprs ?? null,
-      output: outputColumns(returning?.columns ?? []),
     },
-    columns: returning?.columns ?? [],
-    tableId: table.id,
-  };
+    builder,
+  );
 }
 
 function conflictClause(
@@ -526,6 +530,17 @@ function returningWithSources(
   const width = table.columns.length;
   const scope: Scope = {
     column: (reference) => {
+      // The shared parser normalizes plain target-qualified RETURNING lists to
+      // bare names. Resolve those against the affected target before join sources.
+      const own = reference.includes(".")
+        ? undefined
+        : table.columns.find((def) => def.name === reference);
+      if (own)
+        return {
+          expr: column(table.columns.indexOf(own), own),
+          nullable: own.nullable,
+          big: own.type.kind === "int64",
+        };
       const typed = target.scope.column(reference);
       if (typed?.expr.op !== "column") return typed;
       const index = typed.expr.index;
@@ -628,6 +643,14 @@ export function lowerUpdate(statement: Update, builder: PlanBuilder): LoweredWri
     builder,
   );
   const { returning, passthrough } = returningWithSources(statement, table, target, builder);
+  const oldRow =
+    returning === null
+      ? []
+      : table.columns.map((def) => {
+          const value = target.scope.column(`${statement.alias ?? table.name}.${def.name}`);
+          if (value === undefined) throw new PlanningError(`column ${def.name} vanished`, "XX000");
+          return value;
+        });
   const built = target.build();
   const locatorType = { kind: "locator" as const, tableId: table.id };
   const locator: OutputColumn = { name: "(locator)", type: locatorType, nullable: false };
@@ -649,12 +672,14 @@ export function lowerUpdate(statement: Update, builder: PlanBuilder): LoweredWri
       built.place({ op: "column", index: target.locator, type: locatorType }),
       ...assigned.map((entry) => built.place(entry.value.expr)),
       ...current.map((typed) => built.place(typed.expr)),
+      ...oldRow.map((typed) => built.place(typed.expr)),
       ...passthrough.map((typed) => built.place(typed.expr)),
     ],
     output: [
       locator,
       ...assigned.map((entry) => assignedOutput(entry.def)),
       ...current.map((typed, index) => extra(typed, index)),
+      ...oldRow.map(extra),
       ...passthrough.map(extra),
     ],
   };
@@ -669,35 +694,45 @@ export function lowerUpdate(statement: Update, builder: PlanBuilder): LoweredWri
             { op: "column", index: 0, type: locatorType },
             ...assigned.map((entry, index) => column(1 + index, entry.def)),
             ...dependents.map((entry) => entry.value.expr),
-            ...passthrough.map((typed, index) =>
+            ...oldRow.map((typed, index) =>
               column(1 + assigned.length + current.length + index, { type: typed.expr.type }),
+            ),
+            ...passthrough.map((typed, index) =>
+              column(1 + assigned.length + current.length + oldRow.length + index, {
+                type: typed.expr.type,
+              }),
             ),
           ],
           output: [
             locator,
             ...[...assigned, ...dependents].map((entry) => assignedOutput(entry.def)),
+            ...oldRow.map(extra),
             ...passthrough.map(extra),
           ],
         };
-  return {
-    rel: {
-      op: "modify",
-      id: builder.id(),
-      kind: "update",
+  return snapshotReturningParameters(
+    {
+      rel: {
+        op: "modify",
+        id: builder.id(),
+        kind: "update",
+        tableId: table.id,
+        input,
+        assigned: [...assigned, ...dependents].map((entry) => entry.def.id),
+        // A target row joined to several source rows is updated once, from the first (PostgreSQL).
+        onRepeat: statement.from === undefined ? "error" : "first",
+        uniqueTargets: statement.from === undefined,
+        onConflict: null,
+        returning: returning?.exprs ?? null,
+        ...(oldRow.length === 0 ? {} : { oldRow: true }),
+        ...(passthrough.length === 0 ? {} : { passthrough: passthrough.length }),
+        output: outputColumns(returning?.columns ?? []),
+      },
+      columns: returning?.columns ?? [],
       tableId: table.id,
-      input,
-      assigned: [...assigned, ...dependents].map((entry) => entry.def.id),
-      // A target row joined to several source rows is updated once, from the first (PostgreSQL).
-      onRepeat: statement.from === undefined ? "error" : "first",
-      uniqueTargets: statement.from === undefined,
-      onConflict: null,
-      returning: returning?.exprs ?? null,
-      ...(passthrough.length === 0 ? {} : { passthrough: passthrough.length }),
-      output: outputColumns(returning?.columns ?? []),
     },
-    columns: returning?.columns ?? [],
-    tableId: table.id,
-  };
+    builder,
+  );
 }
 
 export function lowerDelete(statement: Delete, builder: PlanBuilder): LoweredWrite {
@@ -705,6 +740,14 @@ export function lowerDelete(statement: Delete, builder: PlanBuilder): LoweredWri
   if (statement.truncate === true) return lowerTruncate(table, builder);
   const target = targetRows(table, statement.alias, statement.predicates, statement.from, builder);
   const { returning, passthrough } = returningWithSources(statement, table, target, builder);
+  const oldRow =
+    returning === null
+      ? []
+      : table.columns.map((def) => {
+          const value = target.scope.column(`${statement.alias ?? table.name}.${def.name}`);
+          if (value === undefined) throw new PlanningError(`column ${def.name} vanished`, "XX000");
+          return value;
+        });
   const built = target.build();
   const locatorType = { kind: "locator" as const, tableId: table.id };
   const input: Rel = {
@@ -713,10 +756,16 @@ export function lowerDelete(statement: Delete, builder: PlanBuilder): LoweredWri
     input: built.rel,
     exprs: [
       built.place({ op: "column", index: target.locator, type: locatorType }),
+      ...oldRow.map((typed) => built.place(typed.expr)),
       ...passthrough.map((typed) => built.place(typed.expr)),
     ],
     output: [
       { name: "(locator)", type: locatorType, nullable: false },
+      ...oldRow.map((typed, index) => ({
+        name: `(old ${String(index)})`,
+        type: typed.expr.type,
+        nullable: typed.nullable,
+      })),
       ...passthrough.map((typed, index) => ({
         name: `(passthrough ${String(index + 1)})`,
         type: typed.expr.type,
@@ -724,24 +773,28 @@ export function lowerDelete(statement: Delete, builder: PlanBuilder): LoweredWri
       })),
     ],
   };
-  return {
-    rel: {
-      op: "modify",
-      id: builder.id(),
-      kind: "delete",
+  return snapshotReturningParameters(
+    {
+      rel: {
+        op: "modify",
+        id: builder.id(),
+        kind: "delete",
+        tableId: table.id,
+        input,
+        assigned: [],
+        onRepeat: statement.from === undefined ? "error" : "first",
+        uniqueTargets: statement.from === undefined,
+        onConflict: null,
+        returning: returning?.exprs ?? null,
+        ...(oldRow.length === 0 ? {} : { oldRow: true }),
+        ...(passthrough.length === 0 ? {} : { passthrough: passthrough.length }),
+        output: outputColumns(returning?.columns ?? []),
+      },
+      columns: returning?.columns ?? [],
       tableId: table.id,
-      input,
-      assigned: [],
-      onRepeat: statement.from === undefined ? "error" : "first",
-      uniqueTargets: statement.from === undefined,
-      onConflict: null,
-      returning: returning?.exprs ?? null,
-      ...(passthrough.length === 0 ? {} : { passthrough: passthrough.length }),
-      output: outputColumns(returning?.columns ?? []),
     },
-    columns: returning?.columns ?? [],
-    tableId: table.id,
-  };
+    builder,
+  );
 }
 
 /**

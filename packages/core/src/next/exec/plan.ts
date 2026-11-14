@@ -1,3 +1,11 @@
+import {
+  ReturningWriter,
+  returningShape,
+  returningMetadata,
+  MODIFY_ROWS,
+} from "./modify-returning.js";
+import { ModifySpool, modifySpoolBytes } from "./modify-spool.js";
+import { Charge, Pool } from "./spill-pool.js";
 import { FtsPlan, configurePlanFtsArena } from "./fts-plan.js";
 import {
   columnInputBytes,
@@ -850,9 +858,109 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     ids.add(rel.id);
     switch (rel.op) {
       case "modify": {
-        if (!["insert", "update", "delete"].includes(rel.kind) || rel.returning !== null)
+        if (!["insert", "update", "delete"].includes(rel.kind))
           throw new UnsupportedPlanError("modify kind or RETURNING", { construct: "modify" });
         const child = prepare(rel.input);
+        if (rel.returning !== null) {
+          if (rel.kind !== "insert" && !rel.oldRow)
+            throw new UnsupportedPlanError("RETURNING needs the original statement row");
+          const shape = returningShape(rel);
+          const exprs = rel.returning;
+          const compiler =
+            returningMetadata(rel) +
+            measureCompilerBuffers(
+              compilation,
+              shape.types,
+              MODIFY_ROWS,
+              (context) => new ProjectOperator(exprs, context, DISCARD),
+              (operator) => operator.abort(undefined),
+            );
+          const minimum =
+            compiler +
+            modifySpoolBytes(rel.input.output.length) +
+            modifySpoolBytes(rel.output.length);
+          compoundColumns.set(
+            rel.id,
+            Math.max(variableColumns(types(rel.input)), variableColumns(types(rel))),
+          );
+          compoundCopies.set(
+            rel.id,
+            2 * (variableColumns(types(rel)) + variableColumns(types(rel.input))),
+          );
+          fixed(rel, minimum);
+          return (runtime, _downstream, stops) =>
+            then(runtime.admit(`modify#${String(rel.id)}`, minimum, true, rel), (grant) => {
+              if (!(grant instanceof ReservedGrant))
+                throw new TypeError("RETURNING needs atomic phase admission");
+              const release = grant.holdClose();
+              grant.onReclaimRequest(() => {
+                const idle = grant.held - grant.allocated - grant.loaned;
+                if (idle > 0) grant.release(idle);
+              });
+              const pool = new Pool(new Charge(grant), minimum);
+              const input = new ModifySpool(
+                types(rel.input),
+                grant,
+                runtime.request.spill,
+                runtime.request.queryId,
+                runtime.signal,
+                pool,
+                2 +
+                  (2 * variableColumns(types(rel))) /
+                    Math.max(1, variableColumns(types(rel.input))),
+              );
+              const returned = new ModifySpool(
+                types(rel),
+                grant,
+                runtime.request.spill,
+                runtime.request.queryId,
+                runtime.signal,
+                pool,
+                2,
+              );
+              const arena = new OutputArena(pool, MODIFY_ROWS);
+              const statement = runtime.request.statement;
+              const table = statement?.catalog.table(rel.tableId);
+              if (!statement || !table) throw new TypeError("Missing RETURNING statement/table");
+              const context: CompileContext = {
+                arena,
+                input: shape.types,
+                params: { slots: [] },
+                resolveCall,
+              };
+              const writer = new ReturningWriter(
+                rel,
+                statement,
+                table,
+                context,
+                returned,
+                runtime.signal,
+                runtime.counts,
+              );
+              let retired: Promise<void> | null = null,
+                closed: Promise<void> | null = null;
+              const retireInput = () =>
+                (retired ??= (async () => {
+                  await writer.close();
+                  await input.close();
+                  arena.close();
+                })());
+              const close = () =>
+                (closed ??= (async () => {
+                  try {
+                    await retireInput();
+                    await returned.close();
+                  } finally {
+                    pool.close();
+                    release();
+                    grant.close();
+                  }
+                })());
+              runtime.modification = { spool: input, writer, returned, retireInput, close };
+              runtime.onAbort((reason) => writer.abort(reason));
+              return child(runtime, input, stops);
+            });
+        }
         return (runtime, downstream, stops) => {
           const statement = runtime.request.statement;
           if (statement === null) throw new TypeError("modify requires a statement");
@@ -3736,7 +3844,15 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         // Judge the chosen native lanes, not dormant external helpers. Selection
         // happens once on the ordinary path; only a sizing retry repeats it.
         if (needsChoices) yield* readValue(chooseAggregates());
-        const overCap = runtime.minimumBytes(entries) > runtime.request.governor.capBytes;
+        const minimum = runtime.minimumBytes(entries);
+        // The native write owner is already admitted and may retain committed rows.
+        // Shrink optional read windows before queuing behind that persistent owner.
+        // A temporary competitor can still be awaited after all fitting alternatives.
+        const producerRoom =
+          plan.root.op === "modify"
+            ? Math.max(0, runtime.request.governor.capBytes - runtime.request.governor.usedBytes)
+            : runtime.request.governor.capBytes;
+        const overCap = minimum > Math.min(runtime.request.governor.capBytes, producerRoom);
         if (windows && overCap && [...bounds.values()].some((bound) => bound.windowBytes > 0)) {
           // Coalesced export windows are optional. All sizing holds have ended: retry the
           // ordinary bounded batch before treating the execution minimum as over-cap.

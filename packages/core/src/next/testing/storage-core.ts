@@ -142,25 +142,26 @@ export class StorageCore implements NextCore {
         reads: { open: (pages, chunk, options) => ChunkReader.open(pages, chunk, options) },
         sequences: null,
         sequenceSession: null,
-        returning: "atExecuted",
+        returning: "atCommit",
       });
       try {
-        for (;;) {
-          const frame = await execution.results.next();
-          if (frame === null) break;
-          frame.release();
-        }
         const summary = await execution.executed;
         const receipt = await tx.commit(null);
         await receipt.durable;
+        execution.acknowledgeCommit();
+        const batches = await this.collect(execution, prepared);
         await execution.delivered;
         this.lastProfile = summary.profile;
         return {
           kind: lowered.plan.root.op === "modify" ? lowered.plan.root.kind : "modify",
           rowCount: summary.rowCount,
+          ...(prepared.columns.length === 0
+            ? {}
+            : { returning: { columns: prepared.columns, batches } }),
         };
       } catch (error) {
         execution.cancel(error);
+        await Promise.allSettled([execution.executed, execution.delivered]);
         tx.rollback();
         throw error;
       }
@@ -169,41 +170,8 @@ export class StorageCore implements NextCore {
       throw new UnsupportedPlanError(`the adapter's ${lowered.kind}`, { construct: lowered.kind });
     const prepared = this.executor.prepare(lowered.plan);
     const run = this.start(prepared, params);
-    const batches: Batch[] = [];
-    // Stream dictionaries, applied in frame order as the owner client does (`StreamDictionaries`).
-    const dictionaries = new Map<number, WireFlat[]>();
     try {
-      for (;;) {
-        const frame = await run.execution.results.next();
-        if (frame === null) break;
-        try {
-          const payload = structuredClone(frame.payload);
-          for (const delta of payload.dictionaries) {
-            const parts = dictionaries.get(delta.id) ?? [];
-            if (delta.from !== parts.reduce((size, part) => size + part.length, 0))
-              throw new RangeError(`dictionary ${String(delta.id)} delta out of order`);
-            parts.push(delta.values);
-            dictionaries.set(delta.id, parts);
-          }
-          batches.push({
-            length: payload.rowCount,
-            selection: null,
-            columns: payload.columns.map((vector, index) => {
-              const flat =
-                vector.form === "dictionary"
-                  ? expandTextDictionary(vector, dictionaries.get(vector.dictionary) ?? [])
-                  : vector;
-              if (flat.form !== "flat")
-                throw new TypeError("the result sink must send flat or dictionary frames");
-              const type = prepared.columns[index]?.type;
-              if (type === undefined) throw new TypeError("missing result type");
-              return { ...flat, type };
-            }),
-          });
-        } finally {
-          frame.release();
-        }
-      }
+      const batches = await this.collect(run.execution, prepared);
       this.lastProfile = (await run.execution.executed).profile;
       await run.execution.delivered;
       return { kind: "rows", columns: prepared.columns, batches };
@@ -214,6 +182,43 @@ export class StorageCore implements NextCore {
     } finally {
       run.release();
     }
+  }
+  /** Apply wire dictionary deltas before releasing each result frame. */
+  private async collect(execution: Execution, prepared: PreparedPlan): Promise<Batch[]> {
+    const batches: Batch[] = [];
+    const dictionaries = new Map<number, WireFlat[]>();
+    for (;;) {
+      const frame = await execution.results.next();
+      if (frame === null) break;
+      try {
+        const payload = structuredClone(frame.payload);
+        for (const delta of payload.dictionaries) {
+          const parts = dictionaries.get(delta.id) ?? [];
+          if (delta.from !== parts.reduce((size, part) => size + part.length, 0))
+            throw new RangeError(`dictionary ${String(delta.id)} delta out of order`);
+          parts.push(delta.values);
+          dictionaries.set(delta.id, parts);
+        }
+        batches.push({
+          length: payload.rowCount,
+          selection: null,
+          columns: payload.columns.map((vector, index) => {
+            const flat =
+              vector.form === "dictionary"
+                ? expandTextDictionary(vector, dictionaries.get(vector.dictionary) ?? [])
+                : vector;
+            if (flat.form !== "flat")
+              throw new TypeError("the result sink must send flat or dictionary frames");
+            const type = prepared.columns[index]?.type;
+            if (type === undefined) throw new TypeError("missing result type");
+            return { ...flat, type };
+          }),
+        });
+      } finally {
+        frame.release();
+      }
+    }
+    return batches;
   }
   async insertVectors(table: TableDef, batch: Batch): Promise<number> {
     return this.write((statement) => statement.table(table.id).insert(batch, null));

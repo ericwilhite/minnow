@@ -813,15 +813,17 @@ function modifyRows(rel: Extract<Rel, { op: "modify" }>, env: Environment): Row[
   }
   for (const row of input) {
     if (rel.kind === "insert" || rel.kind === "upsert") {
-      validate(row);
+      const proposed = passthrough === 0 ? row : row.slice(0, row.length - passthrough);
+      const extra = passthrough === 0 ? [] : row.slice(row.length - passthrough);
+      validate(proposed);
       if (rel.kind === "upsert" && rel.onConflict !== null) {
-        const found = conflict(row, rel.onConflict.arbiters);
+        const found = conflict(proposed, rel.onConflict.arbiters);
         if (found !== -1) {
           if (rel.onConflict.action === "nothing") continue;
           if (touched.has(found))
             throw new ReferenceSqlError("affects a row a second time", "21000");
           const existing = stored[found] ?? [];
-          const both = [...existing, ...row];
+          const both = [...existing, ...proposed];
           if (rel.onConflict.where !== null && evaluate(rel.onConflict.where, both, env) !== true)
             continue;
           const next = [...existing];
@@ -834,13 +836,14 @@ function modifyRows(rel: Extract<Rel, { op: "modify" }>, env: Environment): Row[
           validate(next);
           stored[found] = next;
           touched.add(found);
-          returning(next);
+          returning(next, extra);
           continue;
         }
-      } else if (conflict(row, []) !== -1) throw new ReferenceSqlError("duplicate key", "23505");
-      stored.push(row);
+      } else if (conflict(proposed, []) !== -1)
+        throw new ReferenceSqlError("duplicate key", "23505");
+      stored.push(proposed);
       touched.add(stored.length - 1);
-      returning(row);
+      returning(proposed, extra);
     } else {
       const locator = Number(row[0]);
       const existing = stored[locator];

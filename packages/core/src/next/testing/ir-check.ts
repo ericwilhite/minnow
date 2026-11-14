@@ -446,7 +446,8 @@ function checkRel(rel: Rel, catalog: CatalogView): void {
       }));
       const input = rel.input.output;
       if (rel.kind === "insert" || rel.kind === "upsert") {
-        if (input.length !== row.length) fail(where, "insert input is not the table row");
+        if (input.length !== row.length + (rel.passthrough ?? 0))
+          fail(where, "insert input is not the table row and passthrough");
         for (const [index, column] of row.entries())
           if (!samePhysicalType(input[index]?.type ?? { kind: "text" }, column.type))
             fail(where, `insert column ${column.name} has another type`);

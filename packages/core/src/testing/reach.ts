@@ -7574,6 +7574,7 @@ export const GENERAL_MODIFY_REACH = [
 export const MODIFY_SOURCES_REACH = [
   "UPDATE FROM duplicate matches",
   "first distinct source wins",
+  "joined RETURNING",
   "DELETE USING duplicate matches",
   "delete cascade",
   "missing parent rollback",
@@ -7588,4 +7589,48 @@ export const MODIFY_PROGRESS_REACH = [
   "20000 updated",
   "20000 deleted",
   "bounded spill workspace",
+] as const;
+
+/** Returned row versions must survive phase retirement and commit-gated delivery. */
+export const MODIFY_RETURNING_REACH = [
+  "snapshotted parameters",
+  "inserted rows",
+  "new updated rows",
+  "old deleted rows",
+  "empty",
+  "insert select",
+] as const;
+
+/** RETURNING must not make statement execution depend on the reader or leak after cancellation. */
+export const MODIFY_RETURNING_LIFECYCLE_REACH = [
+  "gate insert",
+  "gate update",
+  "gate delete",
+  "atCommit hidden",
+  "atExecuted",
+  "cancel gate",
+  "delivery cleanup",
+] as const;
+
+/** Large returned values must spill without a second live loan or exceeding the governor. */
+export const MODIFY_RETURNING_PRESSURE_REACH = [
+  "funded before admission",
+  "64 MiB",
+  "wide input page",
+  "new rows",
+  "old rows",
+  "repeated output value",
+  "all credit returned",
+] as const;
+
+/** Publication keeps original values/indices; extra retained references require a prepaid budget. */
+export const MIXED_SOURCE_RECIPE_REACH = [
+  "multiple source segments",
+  "metadata paid",
+  "metadata denied no retain",
+  "locators preserved",
+  "publication retained",
+  "cancelled",
+  "exact original rows",
+  "all credit returned",
 ] as const;

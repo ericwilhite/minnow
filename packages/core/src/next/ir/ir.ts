@@ -451,7 +451,8 @@ export type Rel =
       readonly kind: "insert" | "update" | "delete" | "upsert" | "merge" | "truncate";
       readonly tableId: number;
       /**
-       * Rows to write (insert/upsert): every table column in catalog order, defaults and
+       * Rows to write (insert/upsert): every table column in catalog order, then any
+       * passthrough columns (including snapshotted RETURNING parameters). Defaults and
        * generated columns filled, each of exactly its column's type. Update: the row locator,
        * then one column per `assigned` column, in that order. Delete: the row locator. Merge: see
        * `merge`. For update, delete and merge, the last `passthrough` input columns follow (values
@@ -460,6 +461,9 @@ export type Rel =
       readonly input: Rel;
       /** Trailing input columns that only RETURNING reads (additive; absent is 0). */
       readonly passthrough?: number;
+      /** UPDATE/DELETE input carries the complete pre-statement row after assigned values,
+       * before passthrough. It supplies RETURNING without fetching a locator after mutation. */
+      readonly oldRow?: boolean;
       /**
        * UPDATE: the catalog column ids the statement assigns, in input order after the locator
        * (access/ `TableWriteOptions.assigned`). Empty for insert, upsert and delete.

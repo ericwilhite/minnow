@@ -18,8 +18,12 @@ it.each(seedsFor("next-modify-sources", [0xb5b3, 0xb5b4]))(
     const reach = createReach("modify sources", MODIFY_SOURCES_REACH);
     const all = async (sql: string) => {
       const result = await core.execute(sql);
-      await pg.exec(sql);
-      await shipped.run({ kind: "sql", sql });
+      const expected = await pg.query(sql);
+      const previous = await shipped.run({ kind: "sql", sql });
+      if ("returning" in result) {
+        expect(oracleRows(result.returning)).toEqual(expected.rows);
+        expect(oracleRows(result.returning)).toEqual(previous.rows);
+      }
       return result;
     };
     const compare = async (name: string) => {
@@ -48,7 +52,7 @@ it.each(seedsFor("next-modify-sources", [0xb5b3, 0xb5b4]))(
             `INSERT INTO source VALUES (1,1,${String(delta)}),(2,1,${String(delta + 100)}),(3,2,${String(delta)})`,
           );
           const updated = await all(
-            "UPDATE target SET v = target.v + source.delta FROM source WHERE target.id = source.link",
+            "UPDATE target SET v = target.v + source.delta FROM source WHERE target.id = source.link RETURNING target.id,target.v",
           );
           expect("rowCount" in updated ? updated.rowCount : null).toBe(2);
           const first = await core.execute("SELECT * FROM target ORDER BY id");
@@ -60,9 +64,10 @@ it.each(seedsFor("next-modify-sources", [0xb5b3, 0xb5b4]))(
           ]);
           reach.reach("UPDATE FROM duplicate matches");
           reach.reach("first distinct source wins");
+          reach.reach("joined RETURNING");
           await compare("target");
           const deleted = await all(
-            "DELETE FROM target USING source WHERE target.id = source.link",
+            "DELETE FROM target USING source WHERE target.id = source.link RETURNING target.id,target.v",
           );
           expect("rowCount" in deleted ? deleted.rowCount : null).toBe(2);
           reach.reach("DELETE USING duplicate matches");

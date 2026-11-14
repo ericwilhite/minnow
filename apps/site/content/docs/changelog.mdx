@@ -71,8 +71,10 @@ write renderer also invalidates acceleration rather than rejecting accepted rows
 No supported 1.0 stored-format predecessor exists yet.
 
 The unexported rebuild now executes INSERT VALUES, INSERT SELECT, UPDATE and DELETE through
-its native statement writer for scan-based plans. RETURNING, ON CONFLICT and
-index-based modification inputs remain unfinished. Reads use the statement
+its native statement writer for scan-based plans. RETURNING reports inserted rows,
+new UPDATE values and old DELETE values through charged spillable storage, and delivers
+rows only after the statement succeeds. ON CONFLICT and index-based modification inputs
+remain unfinished. Reads use the statement
 snapshot; statement errors roll back earlier rows. Unique and foreign-key checks use the
 existing write path. Modification input uses a charged, bounded spill spool; read
 reservations retire before the writer starts, so a writer waiting for memory cannot pin
