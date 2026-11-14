@@ -118,7 +118,15 @@ it.each(seedsFor("next-agg-admission-peak", [0xb793, 0xb794]))(
                 );
                 if (legacy) {
                   // Current main's admission: keep its per-operator/source/semantic
-                  // bounds intact; disable only this stack's aggregate recipes/packing.
+                  // bounds intact; disable this stack's aggregate/packing and result-row
+                  // recipes. A candidate-derived smaller result minimum is not the
+                  // frozen parent's peak when choosing the near-cap control.
+                  if (Object.hasOwn(QueryRuntime.prototype, "resultRowProgress"))
+                    mocks.push(
+                      vi
+                        .spyOn(QueryRuntime.prototype, "resultRowProgress")
+                        .mockImplementation(() => undefined),
+                    );
                   if (Object.hasOwn(QueryRuntime.prototype, "aggregateProgress"))
                     mocks.push(
                       vi

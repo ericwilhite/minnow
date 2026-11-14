@@ -5736,6 +5736,12 @@ export const BYTE_GROWTH_REACH = [
 ] as const;
 
 export const HASH_TRANSITION_REACH = [
+  "12 keys",
+  "16 keys",
+  "16 MiB",
+  "32 MiB",
+  "64 MiB",
+  "128 MiB",
   "mixed fixed/byte keys",
   "resident prefix",
   "saved float prefix",
@@ -5764,5 +5770,27 @@ export const HASH_PARENT_PEAK_REACH = [
   "unequal widths",
   "later batch",
   "parent peak",
+  "zero",
+] as const;
+
+export const HASH_RESULT_PROGRESS_REACH = [
+  "emitted aliases",
+  "small row tail",
+  "COUNT only",
+  "emitted key",
+  "variable aggregate",
+  "one-row scan",
+  "column",
+  "parameter",
+  "competitor",
+  "12 keys",
+  "16 keys",
+  "16 MiB",
+  "32 MiB",
+  "64 MiB",
+  "128 MiB",
+  "unreachable wide branch",
+  "fitting peak",
+  "PG exact",
   "zero",
 ] as const;

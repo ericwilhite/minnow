@@ -206,6 +206,29 @@ export class QueryRuntime {
   #resultProgressOverride: number | null = null;
   #resultOwnedMinimum = false;
   #resultCopies = 1;
+  #resultRowProgress: ((slots: readonly number[], largest: number) => number | null) | null = null;
+  /** Complete emitted row, already including logical aliases; unrelated input is not output. */
+  resultRowProgress(bound: (slots: readonly number[], largest: number) => number | null): void {
+    this.#resultRowProgress = bound;
+  }
+  #growthSlack = 0;
+  /** Smaller result minima return credit to shared admission. Keep speculative
+   * operator growth at its previous target instead of spending that saving on
+   * a larger failed projection/hash attempt. No credit is held here: other
+   * executions can use it. Protected complete steps are unchanged; optional
+   * allocation denial selects existing split/spill, never a typed refusal. */
+  projectionAvailable(grant: Grant): number {
+    return Math.max(0, grant.held - grant.allocated - grant.loaned) + this.#growthRoom();
+  }
+  #growthRoom(): number {
+    return Math.max(
+      0,
+      this.request.governor.capBytes -
+        this.request.governor.reserveBytes -
+        this.request.governor.usedBytes -
+        this.#growthSlack,
+    );
+  }
   #resultCopySourceProgress: number | null = null;
   resultCopySourceProgress(bytes: number): void {
     this.#resultCopySourceProgress = bytes;
@@ -220,7 +243,14 @@ export class QueryRuntime {
     // bounded empty-sink metadata, rather than an unused full consumer byte window.
     return this.#resultProgressOverride === 0 ? Math.min(this.#window, 4096) : this.#window;
   }
-  #resultStep(inputs: number, largestInput: number): number {
+  #resultStep(inputs: number, largestInput: number, slots: readonly number[] = []): number {
+    if (this.#resultProgressOverride === null) {
+      const row = this.#resultRowProgress?.(slots, largestInput);
+      if (row !== null && row !== undefined) return Math.max(MAX_BLOB_BYTES, row);
+    }
+    return this.#fallbackResultStep(inputs, largestInput);
+  }
+  #fallbackResultStep(inputs: number, largestInput: number): number {
     // Multiply the source/owned-value envelope, not the one-MiB blob floor.
     // Hundreds of tiny aliases need their actual frame minimum, not hundreds of blob loans.
     return this.#resultProgressOverride === null
@@ -349,6 +379,9 @@ export class QueryRuntime {
   sourceBounds(bounds: ReadonlyMap<number, ReadBound>): void {
     this.#readBounds = new Map(bounds);
     this.#nonRetainingReads = bounds.size === 1 && bounds.values().next().value?.retain === false;
+  }
+  sourceBatchRows(id: number): number | undefined {
+    return this.#readBounds.get(id)?.batchRows;
   }
   sourceWindow(id: number): number {
     return this.#readBounds.get(id)?.windowBytes ?? 0;
@@ -537,7 +570,7 @@ export class QueryRuntime {
         ? 0
         : Math.max(
             this.#resultWindow(),
-            this.#resultStep(inputs, largestInput) +
+            this.#resultStep(inputs, largestInput, slots) +
               (this.#resultOwnedMinimum ? resultFrameMetadataBytes(this.plan.columns.length) : 0),
           ))
     );
@@ -639,21 +672,34 @@ export class QueryRuntime {
     this.#operatorProgress = new Map(
       entries.filter(({ rel }) => canBorrow(rel)).map(({ rel }) => [rel.id, progress(rel)]),
     );
+    const emittedRow =
+      this.#resultProgressOverride === null
+        ? (this.#resultRowProgress?.(binding.slotBytes ?? [], binding.largestSlot) ?? null)
+        : null;
     const window =
       atomic && entries.length > 0
         ? Math.max(
             this.#resultWindow(),
             this.#resultOwnedMinimum
-              ? this.#resultStep(binding.logicalBytes ?? binding.bytes, binding.largestSlot) +
-                  resultFrameMetadataBytes(this.plan.columns.length)
-              : 0,
+              ? this.#resultStep(
+                  binding.logicalBytes ?? binding.bytes,
+                  binding.largestSlot,
+                  binding.slotBytes,
+                ) + resultFrameMetadataBytes(this.plan.columns.length)
+              : emittedRow === null
+                ? 0
+                : Math.max(MAX_BLOB_BYTES, emittedRow),
           )
         : 0;
     const resultProgress =
       atomic && entries.length > 0
         ? Math.max(
             0,
-            this.#resultStep(binding.logicalBytes ?? binding.bytes, binding.largestSlot) - window,
+            this.#resultStep(
+              binding.logicalBytes ?? binding.bytes,
+              binding.largestSlot,
+              binding.slotBytes,
+            ) - window,
           )
         : 0;
     const prefix = `query#${String(this.request.queryId)}`;
@@ -720,6 +766,16 @@ export class QueryRuntime {
         extra: add(`${key(entry)}/growth`, 0, true),
       };
     });
+    const resultSaving =
+      this.#resultProgressOverride === null
+        ? Math.max(
+            0,
+            this.#fallbackResultStep(binding.logicalBytes ?? binding.bytes, binding.largestSlot) -
+              window -
+              resultProgress,
+          )
+        : 0;
+    this.#growthSlack = resultSaving;
     const started = performance.now();
     const admitted = admitWorkingSet(this.request.governor, {
       label: `${prefix}/fixed-buffers`,
@@ -1186,16 +1242,41 @@ export class QueryRuntime {
     const allocate = grant.allocate.bind(grant),
       grow = grant.tryGrow.bind(grant),
       borrow = grant.borrow.bind(grant);
+    const optionalGrowth = account && this.#growthSlack > 0 && grant.label.endsWith("/growth");
     grant.allocate = (bytes) => {
+      if (
+        optionalGrowth &&
+        this.#growthSlack > 0 &&
+        bytes > Math.max(0, grant.held - grant.allocated) + this.#growthRoom()
+      )
+        return false;
       const ok = allocate(bytes);
       observe();
       return ok;
     };
     grant.tryGrow = (bytes) => {
+      if (optionalGrowth && this.#growthSlack > 0 && bytes > this.#growthRoom()) return false;
       const ok = grow(bytes);
       observe();
       return ok;
     };
+    if (optionalGrowth && grant.reclaimRoom !== undefined) {
+      const reclaim = grant.reclaimRoom.bind(grant);
+      grant.reclaimRoom = (bytes, signal) => {
+        const free = Math.max(0, grant.held - grant.allocated - grant.loaned);
+        const needed = Math.max(0, bytes - free);
+        if (
+          this.#growthSlack > 0 &&
+          needed > this.#growthRoom() &&
+          needed <=
+            this.request.governor.capBytes -
+              this.request.governor.reserveBytes -
+              this.request.governor.usedBytes
+        )
+          return Promise.resolve(false);
+        return reclaim(bytes, signal);
+      };
+    }
     grant.borrow = (bytes, signal) => {
       const start = performance.now();
       return borrow(bytes, signal).then((loan) => {

@@ -28,7 +28,7 @@ import { Slice, runSliced, type SlicedJob } from "./slices.js";
 /** Immutable pipeline recipes; every execution instantiates its own operators and kernels. */
 import type { MaybePromise } from "../access/key-index.js";
 import type { PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
-import { ResultSink } from "./result-sink.js";
+import { ResultSink, resultRowStepBytes } from "./result-sink.js";
 import { aggregateProgressLayout } from "./agg/parameter-copies.js";
 import { packAggregateInputs } from "./agg/input-layout.js";
 import { outputCopyLayout } from "./output-copies.js";
@@ -1063,7 +1063,11 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                           owner?.admitDictionary(dictionary) ?? false,
                         borrowOutputOnRefusal: true,
                       }),
-                  ...(rowsNeeded === undefined ? {} : { rowsNeeded }),
+                  ...(runtime.sourceBatchRows(rel.id) === undefined
+                    ? rowsNeeded === undefined
+                      ? {}
+                      : { rowsNeeded }
+                    : { rowsNeeded: () => Math.min(rowsNeeded?.() ?? BATCH_ROWS, 1) }),
                 });
                 runtime.onAbort(() => scan.abort());
                 const source: BatchSource = {
@@ -1288,14 +1292,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                     runtime && grant
                       ? {
                           signal: runtime.signal,
-                          available: () =>
-                            Math.max(0, grant.held - grant.allocated - grant.loaned) +
-                            Math.max(
-                              0,
-                              runtime.request.governor.capBytes -
-                                runtime.request.governor.reserveBytes -
-                                runtime.request.governor.usedBytes,
-                            ),
+                          available: () => runtime.projectionAvailable(grant),
                         }
                       : undefined,
                   );
@@ -2640,6 +2637,30 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       if (active.has(id)) runtime.operatorParameterColumns(id, columns, compoundCopies.get(id));
     const jsonGroupSources = new Map<number, Set<number>>();
     const jsonGroupColumnBytes = new Map<number, Map<number, number>>();
+    const resultSources = new Map<number, Set<number>>();
+    const resultColumnBytes = new Map<number, Map<number, number>>();
+    const resultWidth = (slots: readonly number[], largest: number, collect = false) => {
+      const widths: number[] = [];
+      for (let column = 0; column < plan.columns.length; column++) {
+        const width = columnInputBytes(plan.root, column, {
+          parameter: (slot) => slots[slot] ?? largest,
+          source(source, column) {
+            if (collect) {
+              const columns = resultSources.get(source) ?? new Set<number>();
+              columns.add(column);
+              resultSources.set(source, columns);
+              return 0;
+            }
+            return resultColumnBytes.get(source)?.get(column) ?? null;
+          },
+        });
+        if (width === null) return null;
+        widths.push(width);
+      }
+      return resultRowStepBytes(widths);
+    };
+    const knownResult = resultWidth([], 0, true) !== null;
+    runtime.resultRowProgress((slots, largest) => resultWidth(slots, largest));
     let semanticActive = active;
     const jsonGroups = [...jsonAggregateRecipes.values()].filter(
       (p) => p.loans > 1 && active.has(p.rel.id),
@@ -2997,6 +3018,10 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     findDemand(plan.root, null);
     const sources = [...readSources.values()].filter((source) => active.has(source.id));
     const bounds = new Map<number, ReadBound>();
+    // Publication-stable row facts survive producer retirement, without retaining input.
+    const boundedSourceRows = new Map<number, number>();
+    const aggregateLayout = (rel: Extract<Rel, { op: "aggregate" }>) =>
+      aggregateProgressLayout(rel, (source) => boundedSourceRows.get(source) ?? null);
     const chooseAggregates = () => runSliced(choose(), new Slice(Infinity), () => undefined);
     const choose = function* (): SlicedJob<void> {
       const selectedPercentiles = new Map<number, { bound: PercentileBound; minimum: number }>();
@@ -3187,8 +3212,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       then(needsChoices ? chooseAggregates() : undefined, () => {
         for (const [id, strategy] of aggregateChoices.get(runtime) ?? []) {
           const planner = aggregatePlanners.get(id);
-          if (planner)
-            runtime.aggregateProgress(id, strategy.kind, aggregateProgressLayout(planner.rel));
+          if (planner) runtime.aggregateProgress(id, strategy.kind, aggregateLayout(planner.rel));
         }
         if (
           ![...(aggregateChoices.get(runtime)?.values() ?? [])].some(
@@ -3276,11 +3300,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                 aggregateChoices.get(runtime)?.set(cut.rel, restore);
                 const planner = aggregatePlanners.get(cut.rel);
                 if (planner)
-                  runtime.aggregateProgress(
-                    cut.rel,
-                    restore.kind,
-                    aggregateProgressLayout(planner.rel),
-                  );
+                  runtime.aggregateProgress(cut.rel, restore.kind, aggregateLayout(planner.rel));
               }
               semanticActive = remaining;
               configureJson(next, cut);
@@ -3372,7 +3392,22 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     }
     const sizeSources = function* (): SlicedJob<void> {
       const fixedMinimums = entries.map((entry) => entry.minimum);
-      let windows = true;
+      let windows = true,
+        singleRows = false,
+        resultSizing = false;
+      const boundedScans = new Set<number>();
+      const collect = (rel: Rel): void => {
+        if (rel.op === "scan" && rel.filter === null) boundedScans.add(rel.id);
+        if (rel.op === "join") {
+          collect(rel.left);
+          collect(rel.right);
+        } else if (rel.op === "recursive") {
+          collect(rel.base);
+          collect(rel.step);
+        } else if ("inputs" in rel) for (const child of rel.inputs) collect(child);
+        else if ("input" in rel) collect(rel.input);
+      };
+      collect(plan.root);
       for (;;) {
         let io = 0,
           progress = 0;
@@ -3384,6 +3419,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
               {
                 ...source,
                 windowBytes: windows ? source.windowBytes : 0,
+                ...(singleRows && boundedScans.has(source.id) ? { batchRows: 1 as const } : {}),
                 ...(runtime.request.outputBuffers && source.windowBytes > 0
                   ? { retain: false }
                   : {}),
@@ -3401,6 +3437,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             ),
           );
           bounds.set(source.id, bound);
+          if (bound.batchRows === 1) boundedSourceRows.set(source.id, bound.progress / 4);
           const keyColumns = joinKeySources.get(source.id);
           if (keyColumns)
             for (const index of keyColumns) {
@@ -3457,6 +3494,33 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             columns.set(column, row.valueBytes ?? row.progress / 4);
             jsonGroupColumnBytes.set(source.id, columns);
           }
+          for (const column of resultSizing ? (resultSources.get(source.id) ?? []) : []) {
+            const name = source.columns[column],
+              type = source.types[column];
+            if (name === undefined || type === undefined) throw new Error("Missing result column");
+            const row = yield* readValue(
+              boundSource(
+                runtime.sourceView(),
+                {
+                  ...source,
+                  batchRows: 1,
+                  columns: [name],
+                  types: [type],
+                  stagingBytes: 0,
+                  windowBytes: 0,
+                  rows: demand.get(source.id) ?? null,
+                },
+                runtime.request.governor,
+                runtime.signal,
+                1,
+                1,
+                runtime.metadataCaches(source.retain !== false, sources),
+              ),
+            );
+            const columns = resultColumnBytes.get(source.id) ?? new Map<number, number>();
+            columns.set(column, Math.max(row.valueBytes ?? 0, row.progress / 4));
+            resultColumnBytes.set(source.id, columns);
+          }
           io = Math.max(io, bound.io);
           progress = Math.max(progress, bound.progress);
         }
@@ -3504,6 +3568,20 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         if (windows && overCap && [...bounds.values()].some((bound) => bound.windowBytes > 0)) {
           // Coalesced export windows are optional. All sizing holds have ended: retry the
           // ordinary bounded batch before treating the execution minimum as over-cap.
+          windows = false;
+          continue;
+        }
+        if (overCap && knownResult && !resultSizing && resultSources.size > 0) {
+          // Ordinary source-result copies keep the already proven read envelope.
+          // Only an over-cap minimum needs these additional per-emitted-column facts.
+          resultSizing = true;
+          continue;
+        }
+        if (overCap && !singleRows && sources.some((source) => boundedScans.has(source.id))) {
+          // No producer is open. Shrink the real read step before declaring its complete
+          // minimum irreducible: interval-wide multi-blob payloads need not coexist.
+          // Enforce the same bound in TableScan, not just in the sizing arithmetic.
+          singleRows = true;
           windows = false;
           continue;
         }

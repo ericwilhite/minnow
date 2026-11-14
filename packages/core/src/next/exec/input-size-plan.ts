@@ -1,5 +1,6 @@
 /** Per-value admission provenance. Unknown expanding expressions retain the legacy recipe.
  * Walks only plan metadata: no evaluation, caller-value reads or JSON/data allocation. */
+import { constantNull, constantBool } from "./expression-reach.js";
 import type { Rel, ScalarExpr } from "../ir/ir.js";
 export interface InputSizes {
   parameter(slot: number): number;
@@ -20,6 +21,7 @@ export function expressionInputBytes(
   sizes: InputSizes,
   coefficient = 1,
 ): number | null {
+  if (!variable(expr.type.kind)) return 16 * coefficient;
   switch (expr.op) {
     case "column":
       return columnInputBytes(input, expr.index, sizes, coefficient);
@@ -35,25 +37,41 @@ export function expressionInputBytes(
       );
     }
     case "cast":
-      return expressionInputBytes(expr.input, input, sizes, coefficient);
-    case "case":
-      return maximum([
-        ...expr.branches.map((branch) =>
-          expressionInputBytes(branch.then, input, sizes, coefficient),
-        ),
-        expr.otherwise ? expressionInputBytes(expr.otherwise, input, sizes, coefficient) : 0,
-      ]);
+      return expr.input.type.kind === expr.type.kind
+        ? expressionInputBytes(expr.input, input, sizes, coefficient)
+        : null;
+    case "case": {
+      const values: Array<number | null> = [];
+      let otherwise = true;
+      for (const branch of expr.branches) {
+        const condition = constantBool(branch.when);
+        if (condition === false || condition === null) continue;
+        values.push(expressionInputBytes(branch.then, input, sizes, coefficient));
+        if (condition === true) {
+          otherwise = false;
+          break;
+        }
+      }
+      if (otherwise && expr.otherwise)
+        values.push(expressionInputBytes(expr.otherwise, input, sizes, coefficient));
+      return maximum(values);
+    }
     case "call": {
       const first = expr.args[0];
       if (["upper", "lower"].includes(expr.fn))
         return first ? expressionInputBytes(first, input, sizes, 3 * coefficient) : 0;
       if (["nullif", "json_get", "json_get_text"].includes(expr.fn))
         return first ? expressionInputBytes(first, input, sizes, coefficient) : 0;
-      if (expr.fn === "coalesce")
-        return maximum(
-          expr.args.map((arg) => expressionInputBytes(arg, input, sizes, coefficient)),
-        );
-      if (expr.fn === "concat")
+      if (expr.fn === "coalesce") {
+        const values: Array<number | null> = [];
+        for (const arg of expr.args) {
+          const isNull = constantNull(arg);
+          if (isNull !== true) values.push(expressionInputBytes(arg, input, sizes, coefficient));
+          if (isNull === false) break;
+        }
+        return maximum(values);
+      }
+      if (["concat", "textcat"].includes(expr.fn))
         return sum(expr.args.map((arg) => expressionInputBytes(arg, input, sizes, coefficient)));
       return variable(expr.type.kind) ? null : 16 * coefficient;
     }
@@ -67,6 +85,8 @@ export function columnInputBytes(
   sizes: InputSizes,
   coefficient = 1,
 ): number | null {
+  const type = rel.output[column]?.type;
+  if (type && !variable(type.kind)) return 16 * coefficient;
   const saved = sizes.saved?.(rel.id, column);
   if (saved !== undefined) return coefficient * saved;
   switch (rel.op) {
@@ -106,11 +126,11 @@ export function columnInputBytes(
           : 16 * coefficient;
     case "aggregate": {
       const key = rel.groupBy[column];
-      return key !== undefined
-        ? columnInputBytes(rel.input, key, sizes, coefficient)
-        : variable(rel.output[column]?.type.kind ?? "")
-          ? null
-          : 16 * coefficient;
+      if (key !== undefined) return columnInputBytes(rel.input, key, sizes, coefficient);
+      const call = rel.aggregates[column - rel.groupBy.length];
+      return call && ["min", "max"].includes(call.fn) && call.args[0]
+        ? expressionInputBytes(call.args[0], rel.input, sizes, coefficient)
+        : null;
     }
     case "setOp":
       return maximum(

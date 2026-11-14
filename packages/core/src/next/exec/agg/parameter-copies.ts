@@ -2,6 +2,7 @@
  * Conditional widths are maxima over reachable outputs, not a union of parameter slots.
  * These are sizing facts only: no expression is evaluated and no caller buffer is read.
  */
+import { constantNull, constantBool } from "../expression-reach.js";
 import type { PhysicalType } from "../../types.js";
 import type { Rel, ScalarExpr } from "../../ir/ir.js";
 import { BATCH_TARGET_BYTES } from "../../vector/vector.js";
@@ -46,36 +47,18 @@ export const simpleAggregateType = (type: PhysicalType): boolean =>
 const zero: Width = { op: "bytes", bytes: 0 };
 const variable = (e: ScalarExpr) =>
   ["text", "bytes", "json", "array", "enum", "decimal"].includes(e.type.kind);
-function constantNull(e: ScalarExpr): boolean | null {
-  if (e.op === "cast") return constantNull(e.input);
-  if (e.op === "call" && e.fn === "coalesce") {
-    let unknown = false;
-    for (const arg of e.args) {
-      const value = constantNull(arg);
-      if (value === false) return false;
-      unknown ||= value === null;
-    }
-    return unknown ? null : true;
-  }
-  if (e.op === "call" && e.fn === "nullif" && e.args[0]) {
-    const first = constantNull(e.args[0]);
-    return first === true || (e.args[1] && constantNull(e.args[1]) === true) ? first : null;
-  }
-  if (e.op !== "literal") return null;
-  return e.value.validity !== null && ((e.value.validity[0] ?? 0) & 1) === 0;
-}
-function constantBool(e: ScalarExpr): boolean | null | undefined {
-  if (e.op !== "literal" || e.type.kind !== "bool") return undefined;
-  if (constantNull(e)) return null;
-  return e.value.data.layout === "bool" ? e.value.data.values[0] !== 0 : undefined;
-}
 export function aggregateProgressLayout(
   rel: Extract<Rel, { op: "aggregate" }>,
+  source?: (id: number, column: number) => number | null,
 ): AggregateProgressLayout {
   const column = (input: Rel, index: number): Width => {
     const c = input.output[index];
     if (!c || !["text", "bytes", "json", "array", "enum", "decimal"].includes(c.type.kind))
       return zero;
+    if (["scan", "keyLookup", "indexRange"].includes(input.op)) {
+      const bytes = simpleAggregateType(c.type) ? source?.(input.id, index) : null;
+      return bytes === null || bytes === undefined ? { op: "unknown" } : { op: "bytes", bytes };
+    }
     if (input.op === "project") {
       const e = input.exprs[index];
       return e ? expr(e, input.input) : zero;
