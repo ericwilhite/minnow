@@ -191,7 +191,7 @@ version gaps from rolled-back DDL. DROP TABLE carries its MCHG definition too.
 
 The manifest names the catalog tree, not a JSON blob. Reachability checks child depth and
 summaries plus contiguous fragment offsets, and reclamation retires every old index/data page.
-The reader/manifest/commit-body development selectors are 5/6/4; older unpublished selectors
+The reader/manifest/commit-body development selectors are 7/8/6; older unpublished selectors
 refuse. The released 1.0 format has no supported predecessor yet. Trigger family20 now carries dialect-versioned bodies and stable OLD/NEW/target dependencies
 (body30/binding31/column32). Definitions and CREATE/DROP lowering persist through WAL and
 checkpoint; trigger scheduling/body execution is the next integration unit. FTS declarations persist without making an index ready. Snapshot catalog frame
@@ -208,7 +208,7 @@ bodies and both recursive arms without executing them. Explicit stable enum-to-t
 refuse stored generation; implicit assignment follows PostgreSQL’s separate coercion rule. The codec validates ordered dependencies,
 references, ownership and cycles before exposing stored definitions. Semantic extension fields
 may be absent but, when present, carry the required wire flag; they are never display extensions.
-These additions and the trigger record family select reader6/manifest7/commitBody5 before any write. They change only
+The required effective-FK-action field selects reader7/manifest8/commitBody6 before any write. This changes only
 unreleased development formats; the first released1.0 writer starts the supported chain.
 
 `composeEngine().migrate()` is the owner-local schema bridge. It uses the existing schema planner

@@ -6144,9 +6144,9 @@ export const FTS_CODEC_REACH = [
 ] as const;
 
 export const FTS_SELECTOR_REACH = [
-  "reader6 barrier",
-  "manifest7 barrier",
-  "commit body5",
+  "reader7 barrier",
+  "manifest8 barrier",
+  "commit body6",
   "wide sequence preserved",
   "checksummed roundtrip",
 ] as const;
