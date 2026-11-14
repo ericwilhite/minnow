@@ -1,3 +1,5 @@
+import type { Batch } from "../vector/vector.js";
+
 /** Native command/trigger boundary. Capability remains absent until its bounded registry and
  * executor hooks are installed; this contract does not enable trigger or RI scheduling.
  * Queue packets contain scalar stable IDs only. The admitted root owns their paged registries,
@@ -59,7 +61,21 @@ export interface NativeRowHooks {
     budget: number,
   ): Promise<void>;
 }
+/** One root-funded borrow, exactly one physical row in each non-null image. Columns are in
+ * the owner's complete physical table-column order. Borrowers neither mutate nor retain vectors
+ * after release. Release is synchronous/idempotent; pending I/O finishes before lease delivery. */
+export interface RowImageLease {
+  readonly tableId: number;
+  readonly old: Batch | null;
+  readonly new: Batch | null;
+  release(): void;
+}
 export interface NativeCommandBoundary {
+  /** One image helper slot in the shared root scope, independent of RI depth. Caller copies only
+   * referenced bindings to prepaid workspace, then releases BEFORE any producer/admission wait.
+   * Repeated bindings share the copied vector; no per-occurrence payload copies or JS row values.
+   * See exec/row-image-layout.ts for the fixed minimum and exact-payload progress envelope. */
+  readRowImages(images: RowImageRef, signal: AbortSignal): Promise<RowImageLease>;
   beginCommand(frameId: number, triggerBudget: number): CommandToken;
   /** Includes child c_ reference checks, not just parent a_ actions. Exposed after primary succeeds. */
   rowReferentialEntries(command: CommandToken, row: RowImageRef): AsyncIterable<ReferentialEntry>;
