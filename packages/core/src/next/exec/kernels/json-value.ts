@@ -58,13 +58,37 @@ export function* jsonAscii(text: string, out: JsonOutput): SlicedJob<void> {
     if ((i & 1023) === 0 && out.slice.due()) yield;
   }
 }
+/** Caller funds coefficient spelling before entering; scale padding is streamed. */
+export function* decimalAscii(
+  coefficient: bigint,
+  scale: number,
+  out: JsonOutput,
+): SlicedJob<void> {
+  const digits = coefficient.toString(),
+    negative = coefficient < 0n,
+    start = negative ? 1 : 0,
+    integral = digits.length - start - scale;
+  if (negative) out.put(45);
+  if (integral <= 0) out.put(48);
+  for (let i = 0; i < Math.max(integral, 0); i++) {
+    out.put(start + i >= digits.length ? 48 : digits.charCodeAt(start + i));
+    if ((i & 1023) === 0 && out.slice.due()) yield;
+  }
+  if (scale > 0) {
+    out.put(46);
+    for (let i = 0; i < scale; i++) {
+      out.put(integral + i < 0 ? 48 : digits.charCodeAt(start + integral + i));
+      if ((i & 1023) === 0 && out.slice.due()) yield;
+    }
+  }
+}
 /** SQL keys are scalar output strings; JSON/arrays/records cannot be keys (22023). */
 export function* jsonValue(
   vector: Vector,
   row: number,
   out: JsonOutput,
   memory: JsonMemory,
-  slice: Slice,
+  _slice: Slice,
   key = false,
   rawKey = false,
 ): SlicedJob<void> {
@@ -133,26 +157,8 @@ export function* jsonValue(
           quote = true;
           break;
         }
-        const coefficient = coefficientAt(data, slot),
-          scale = scaleAt(data, slot),
-          digits = coefficient.toString();
-        const negative = coefficient < 0n,
-          start = negative ? 1 : 0,
-          integral = digits.length - start - scale;
         if (key && !rawKey) out.put(34);
-        if (negative) out.put(45);
-        if (integral <= 0) out.put(48);
-        for (let i = 0; i < Math.max(integral, 0); i++) {
-          out.put(start + i >= digits.length ? 48 : digits.charCodeAt(start + i));
-          if ((i & 1023) === 0 && slice.due()) yield;
-        }
-        if (scale > 0) {
-          out.put(46);
-          for (let i = 0; i < scale; i++) {
-            out.put(integral + i < 0 ? 48 : digits.charCodeAt(start + integral + i));
-            if ((i & 1023) === 0 && slice.due()) yield;
-          }
-        }
+        yield* decimalAscii(coefficientAt(data, slot), scaleAt(data, slot), out);
         if (key && !rawKey) out.put(34);
         return;
       }

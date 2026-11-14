@@ -503,3 +503,15 @@ as row data errors (22xxx). The producer is retired, the complete prefix is admi
 and delivered, then the error is raised. This does not defer memory admission
 (53200), cancellation, unsupported plans or storage faults. Aggregate array bounds
 are checked at finalization so a later transition error retains PostgreSQL's precedence.
+
+Output-function casts to TEXT share the existing resumable byte-expression workspace.
+Fixed scalar output has an intrinsic 48-byte per-row bound. NUMERIC streams scale
+padding; arrays stream dimensions, separators and quoted borrowed elements. Before
+decoding a NUMERIC array element, its normalized coefficient width funds the ASCII
+hex buffer, BigInt and decimal spelling (4096 + 16 times coefficient bytes), not an
+array of per-byte strings. Scratch returns before advancing to the next element.
+The legacy array visitors keep their caller-funded decode contract and validations.
+Completed native TEXT rows use their coupled measured delivery size plus independent
+alias copies; no JSON conversion multiplier is applied to those completed rows.
+Downstream operators keep their complete progress envelope. Pressure handoff, shared
+task-clock slices and cancellation retain the existing ownership protocol.

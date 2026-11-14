@@ -55,7 +55,11 @@ import {
   JSON_PHASE_FIXED,
   type JsonPhase,
 } from "./json-phase.js";
-import { jsonExpression, expandingJsonExpression } from "../ir/json-expression.js";
+import {
+  jsonExpression,
+  expandingJsonExpression,
+  nativeTextExpression,
+} from "../ir/json-expression.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import { samePhysicalType, type PhysicalType } from "../types.js";
 import { BATCH_ROWS, type Batch, type Selection, type Vector } from "../vector/vector.js";
@@ -1160,6 +1164,15 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             (operator) => operator.abort(undefined),
           );
           if (jsonDescendants.has(rel.id)) {
+            // The serialized native TEXT row already exists before delivery. Keep
+            // downstream progress intact; count only its actual mutable aliases here.
+            const nativeTextOutput =
+              rel.op === "project" &&
+              (exprs as readonly ScalarExpr[]).every((expr) => expr.type.kind !== "json") &&
+              (exprs as readonly ScalarExpr[]).some(nativeTextExpression);
+            const deliveryCopies = nativeTextOutput
+              ? checkpointDeliveryCopies(plan.root, rel)
+              : undefined;
             if (!phaseParents.has(rel.id))
               throw new UnsupportedPlanError(
                 "expanding JSON under a join/window retaining parent (checkpoint seam pending)",
@@ -1200,6 +1213,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
                     exprs,
                     context,
                     {
+                      nativeTextOutput,
+                      ...(deliveryCopies === undefined ? {} : { deliveryCopies }),
                       grant,
                       allocateResult: (bytes) => runtime.allocateResultOwned(bytes),
                       spill: runtime.request.spill,

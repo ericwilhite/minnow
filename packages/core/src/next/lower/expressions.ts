@@ -982,6 +982,31 @@ export function lowerExpression(
                 : "array_prepend";
           return callFunction(fn, [left, right], state);
         }
+        // text || anynonarray requires a text/unknown operand. An unknown next
+        // to JSONB/BYTEA selects that type's exact || overload, not textcat.
+        const textOperand = [left, right].some(
+          (v) => v.pending === undefined && v.expr.type.kind === "text",
+        );
+        const unknownOperand = left.pending !== undefined || right.pending !== undefined;
+        if (!textOperand) {
+          const binaryJson = (v: Typed) => v.expr.type.kind === "json" && v.expr.type.binary;
+          if (
+            (binaryJson(left) && (binaryJson(right) || right.pending !== undefined)) ||
+            (binaryJson(right) && left.pending !== undefined)
+          )
+            throw unsupported("function", "JSONB concatenation");
+          if (
+            (left.expr.type.kind === "bytes" &&
+              (right.expr.type.kind === "bytes" || right.pending !== undefined)) ||
+            (right.expr.type.kind === "bytes" && left.pending !== undefined)
+          )
+            throw unsupported("function", "BYTEA concatenation");
+          if (!unknownOperand)
+            throw new PlanningError(
+              "operator does not exist for non-text concatenation operands",
+              "42883",
+            );
+        }
         const text: PhysicalType = { kind: "text" };
         const asText = (value: Typed) =>
           coerce(

@@ -13,7 +13,7 @@ import {
   TIMESTAMP_POS_INFINITY,
   formatDate,
 } from "../../temporal.js";
-import { formatSqlTimestamp, formatSqlInterval, isInfiniteInterval } from "../../temporal-text.js";
+import { formatSqlTimestamp, formatSqlInterval } from "../../temporal-text.js";
 import { DatetimeOverflowError, UnsupportedPlanError } from "../errors.js";
 import {
   countIn,
@@ -82,8 +82,6 @@ class TemporalText implements Compiled {
           const months = data.months[slot] ?? 0,
             days = data.days[slot] ?? 0,
             micros = int64At(data.micros, slot);
-          if (isInfiniteInterval(months, days, micros))
-            throw new UnsupportedPlanError("infinite INTERVAL text", { construct: "cast" });
           text = formatSqlInterval(months, days, micros);
         } else throw new TypeError("Expected a temporal cast input");
         if (at + text.length > output.bytes.length)

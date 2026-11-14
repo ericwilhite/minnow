@@ -196,7 +196,7 @@ it.each(seedsFor("next-temporal-output-text", [0xb623, 0xb624]))(
   120_000,
 );
 
-it("keeps bounded temporal text casts and interval infinities explicitly refused", async () => {
+it("keeps bounded casts refused and prints native interval infinities", async () => {
   for (const type of TEMPORAL_TYPES) {
     const value: TemporalValue =
       type.kind === "date" ? 0 : type.kind === "interval" ? { months: 0, days: 0, micros: 0n } : 0n;
@@ -233,7 +233,7 @@ it("keeps bounded temporal text casts and interval infinities explicitly refused
     expect(
       (await pg.query<{ s: string }>(`SELECT ${pgTemporal(type, value)}::text AS s`)).rows,
     ).toEqual([{ s: text }]);
-    // The PG native tuple is observed only to reject unsupported values; no new writer encoding.
+    // PG interval_send pins the existing native sentinel tuple; no stored encoding changes.
     const hex = negative ? "80000000000000008000000080000000" : "7fffffffffffffff7fffffff7fffffff";
     expect(
       (await pg.query<{ v: string }>(`SELECT encode(interval_send(INTERVAL '${text}'),'hex') AS v`))
@@ -246,14 +246,7 @@ it("keeps bounded temporal text casts and interval infinities explicitly refused
         { op: "cast", input: col(0, type), type: TEXT },
         { arena, input: [type], params: { slots: [] } },
       );
-      expect(() => node.evaluate(batchOf([input]), null)).toThrow(
-        expect.objectContaining({
-          name: "UnsupportedPlanError",
-          sqlState: "0A000",
-          stage: "execute",
-          construct: "cast",
-        }),
-      );
+      expect(valueAt(node.evaluate(batchOf([input]), null), 0)).toBe(text);
     } finally {
       arena.close();
     }
