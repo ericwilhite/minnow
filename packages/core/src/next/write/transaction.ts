@@ -1957,6 +1957,7 @@ export class TableWriterImpl implements TableWriter {
         const seen = tracker?.testAndSet(this.tableId, rowId) ?? touched?.has(rowId) ?? false;
         if (seen instanceof Promise)
           return seen.then((value) => {
+            snapshot.check();
             keep(value);
             return visit(k + 1);
           });

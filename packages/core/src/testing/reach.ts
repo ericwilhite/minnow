@@ -7754,6 +7754,9 @@ export const MODIFY_DUPLICATE_RULES_REACH = [
 ] as const;
 /** Prefix pin expiry can occur while the bounded target tracker awaits its own spill I/O. */
 export const TRIGGER_PREFIX_TARGET_REACH = [
+  "one-row batch",
+  "suspended on final row",
+  "suspended before final row",
   "expired during wait",
   "UPDATE",
   "DELETE",

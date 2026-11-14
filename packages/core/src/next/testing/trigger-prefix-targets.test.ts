@@ -13,10 +13,11 @@ it.each(seedsFor("next-trigger-prefix-targets", [0xb5cc]))(
     const reach = createReach("prefix repeat wait", TRIGGER_PREFIX_TARGET_REACH);
     await fc.assert(
       fc.asyncProperty(
-        fc.integer({ min: 2, max: 8 }),
+        fc.integer({ min: 1, max: 8 }),
         fc.boolean(),
         fc.boolean(),
-        async (n, published, remove) => {
+        fc.boolean(),
+        async (n, published, remove, final) => {
           reach.beginHistory();
           const core = await new StorageCore(published ? 1 : undefined).open();
           try {
@@ -43,7 +44,7 @@ it.each(seedsFor("next-trigger-prefix-targets", [0xb5cc]))(
               rules,
               targets: {
                 testAndSet: () => {
-                  if (calls++ === 0) {
+                  if (calls++ === (final ? n - 1 : 0)) {
                     entered();
                     return gate.then(() => false);
                   }
@@ -75,12 +76,18 @@ it.each(seedsFor("next-trigger-prefix-targets", [0xb5cc]))(
                     null,
                   );
               if (calls === 0) await pending;
-              expect(calls, "admitted tracker participates before primary writes").toBe(1);
+              expect(calls, "admitted tracker participates before primary writes").toBe(
+                final ? n : 1,
+              );
               await started;
               pin.release();
               resume();
               await expect(pending).rejects.toThrow(/released/);
               reach.reach("expired during wait");
+              if (n === 1) reach.reach("one-row batch");
+              reach.reach(
+                final || n === 1 ? "suspended on final row" : "suspended before final row",
+              );
               reach.reach(remove ? "DELETE" : "UPDATE");
               reach.reach(published ? "published" : "resident");
             } finally {
@@ -105,8 +112,12 @@ it.each(seedsFor("next-trigger-prefix-targets", [0xb5cc]))(
         seed,
         numRuns: 6,
         examples: [
-          [2, false, false],
-          [3, true, true],
+          [1, false, false, true],
+          [1, true, true, false],
+          [2, false, false, true],
+          [3, true, true, true],
+          [2, false, true, false],
+          [3, true, false, false],
         ],
       },
     );
