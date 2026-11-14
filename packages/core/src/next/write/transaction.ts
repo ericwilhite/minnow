@@ -2237,16 +2237,20 @@ export class TableWriterImpl implements TableWriter {
           for (let k = 0; k < count; k++) copied.push(keys.key(k).slice());
         return copied;
       });
-      const decide = (k: number): MaybePromise<void> => {
+      const decide = (k: number, from = 0, resolved = false): MaybePromise<void> => {
         for (; k < rows.length; k++) {
           const row = rows[k] ?? 0;
           out.kinds[row] = ConflictKind.none;
-          for (let i = 0; i < indexes.length; i++) {
+          for (let i = from; i < indexes.length; i++) {
             const index = need(indexes[i]);
             if (this.#hasNullKey(index, batch.columns, row)) continue;
             const key = need(keyed[i]?.[k]);
-            const result = new ViewIndex(index, table).resolve(key, found);
-            if (result instanceof Promise) return result.then(() => decide(k));
+            if (!resolved) {
+              const result = new ViewIndex(index, table).resolve(key, found);
+              // Completion already filled `found`, even when optional cache admission failed.
+              if (result instanceof Promise) return result.then(() => decide(k, i, true));
+            }
+            resolved = false;
             if (found.length > 0) {
               const rowId = need(found[0]);
               out.kinds[row] = this.statement.inserted(this.tableId, rowId)
@@ -2272,6 +2276,7 @@ export class TableWriterImpl implements TableWriter {
               const text = String.fromCharCode(...need(keyed[i]?.[k]));
               if (!seen[i]?.has(text)) seen[i]?.set(text, row);
             }
+          from = 0;
         }
         return undefined;
       };

@@ -7810,3 +7810,15 @@ export const CLOSED_SET_REPLAY_REACH = [
   "single active row",
   "physical row and column",
 ] as const;
+
+/** Arbitration must consume completed asynchronous reads without relying on cache admission. */
+export const MODIFY_UPSERT_RESOLUTION_REACH = [
+  "fresh",
+  "primary",
+  "unique",
+  "targetless",
+  "published",
+  "resident",
+  "completed read used",
+  "bounded lookup count",
+] as const;
