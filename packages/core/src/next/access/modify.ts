@@ -165,15 +165,17 @@ export interface ConflictOutput {
 }
 
 /**
- * The executor's compiled rules for one table (one instance per table and catalog version; the
- * executor provides them through `compileTableRules`, ruling R1). All
+ * The executor's bound rules for one table/statement. Immutable programs may be cached per
+ * catalog identity/table; `bindTableRules` supplies execution-owned charged buffers. Close that
+ * binding only after the last writer borrow and statement.end() FK actions. All
  * methods are synchronous kernels over a batch of complete new rows (every column, catalog
  * order); they must not retain the batch.
  */
 export interface TableRules {
   /**
    * CHECK constraints over the active rows: the first failing row (physical) and constraint id,
-   * or null when all pass (NULL passes). `columnIds`, when given, are the columns the write
+   * or null when all pass (NULL passes), ordered by physical row then PostgreSQL constraint
+   * name. `columnIds`, when given, are the columns the write
    * changed: the rules may skip checks that read none of them.
    */
   check(
@@ -183,7 +185,12 @@ export interface TableRules {
   /**
    * Recomputes stored generated columns of rows the write path writes itself (foreign-key
    * actions changed `columnIds`), writing into the batch's own vectors (owned by the write path,
-   * which allocated them for this call).
+   * which allocated their writable wrappers for this call). Generated data may be replaced by
+   * binding-owned buffers, valid until that binding's next generate/close; writer copies finish
+   * before reuse. OLD and target wrappers must be distinct, even when their old data is shared).
+   * A SQL data error in speculative batch generation is replayed by row: generated columns,
+   * NOT NULL, then CHECKs in constraint-name order. An earlier constraint failure can therefore
+   * throw its typed constraint error from generate(), before a later row's expression error.
    */
   generate(batch: Batch, columnIds: readonly number[]): void;
 }

@@ -103,8 +103,9 @@ export const FRONT_END_STATES: ReadonlyArray<readonly [RegExp, string]> = [
   // An argument type no overload takes: "UPPER requires a string argument".
   [/^\S+ (requires an? [\w ]+ argument|takes [\w ]+ arguments)$/u, "42883"],
   [/^Unsupported CAST target: /u, "42704"],
-  [/^(?:GENERATED ALWAYS AS IDENTITY|IDENTITY sequence options) /u, "0A000"],
+  [/^IDENTITY sequence options /u, "0A000"],
   [/^IDENTITY requires ALWAYS or BY DEFAULT$/u, "42601"],
+  [/^Conflicting identity declarations for column /u, "42601"],
   [/column names must be unique/u, "42701"],
   [/must appear in GROUP BY/u, "42803"],
   [/^HAVING conditions must use aggregates, literals, or GROUP BY expressions$/u, "42803"],

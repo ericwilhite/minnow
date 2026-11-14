@@ -22,6 +22,7 @@ import {
   type PhysicalType,
   type SqlTypeDescriptor,
 } from "../types.js";
+import { alwaysIdentity } from "../../engine/catalog-ddl-sources.js";
 import type { ScalarExpr } from "../ir/ir.js";
 import type { NativeStatement } from "./statements.js";
 import { builtInCatalogType } from "./catalog-type-names.js";
@@ -211,6 +212,13 @@ export function tableInput(
       `${definition.name}.${front.name}`,
       catalog,
     );
+    if (
+      source === "sql" &&
+      front.defaultValue?.kind === "autoincrement" &&
+      type.kind !== "int32" &&
+      type.kind !== "int64"
+    )
+      throw new PlanningError("identity column type must be smallint, integer, or bigint", "22023");
     const namedType = type.kind === "enum" ? catalog.typeByName(type.name) : undefined;
     return {
       name: front.name,
@@ -227,6 +235,7 @@ export function tableInput(
       ...(source === "schema" && front.defaultValue?.kind === "autoincrement"
         ? { autoIncrement: true as const }
         : {}),
+      ...(alwaysIdentity(front.defaultValue) ? { identityAlways: true as const } : {}),
       ...(namedType === undefined ? {} : { typeId: namedType.id }),
       ...(front.enumValues === undefined ? {} : { allowedValues: front.enumValues }),
     };

@@ -181,6 +181,11 @@
   },
   {
     "file": "query.ts",
+    "message": "Conflicting identity declarations for column X",
+    "state": "42601"
+  },
+  {
+    "file": "query.ts",
     "message": "CREATE TABLE column names must be unique",
     "state": "42701"
   },
@@ -198,11 +203,6 @@
     "file": "query.ts",
     "message": "IDENTITY requires ALWAYS or BY DEFAULT",
     "state": "42601"
-  },
-  {
-    "file": "query.ts",
-    "message": "GENERATED ALWAYS AS IDENTITY is not supported",
-    "state": "0A000"
   },
   {
     "file": "query.ts",

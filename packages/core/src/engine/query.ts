@@ -4,6 +4,7 @@ import {
   copyIdentifierSource,
 } from "./identifier-sources.js";
 import {
+  rememberAlwaysIdentity,
   rememberCatalogDrop,
   builtInCatalogType,
   rememberCatalogDeclarations,
@@ -8847,28 +8848,47 @@ class Parser {
       let defaultValue: ColumnDefault | undefined =
         serial === true ? { kind: "autoincrement" } : undefined;
       let generatedValue: ColumnGenerated | undefined;
+      let identityDeclared = false,
+        explicitNull = false;
       for (;;) {
         if (this.#isKeyword("DEFAULT")) {
+          if (recordDeclaredTypes && identityDeclared)
+            throw new TypeError(`Conflicting identity declarations for column ${name}`);
           // PostgreSQL-compatible variable-free scalar expression, retained in the catalog.
           this.#keyword("DEFAULT");
           defaultValue = this.#columnDefault();
           continue;
         }
         if (this.#isKeyword("GENERATED")) {
-          if (this.#identityClause()) {
+          const identity = this.#identityClause();
+          if (identity) {
+            if (
+              recordDeclaredTypes &&
+              (defaultValue !== undefined || generatedValue !== undefined || explicitNull)
+            )
+              throw new TypeError(`Conflicting identity declarations for column ${name}`);
+            identityDeclared = true;
             // GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY: PostgreSQL's identity column, the
             // same auto-increment default a SERIAL column carries.
-            if (columnType.type !== "number" || columnType.integer !== true) {
+            if (
+              !recordDeclaredTypes &&
+              (columnType.type !== "number" || columnType.integer !== true)
+            ) {
               throw new TypeError(`Identity column ${name} must be an integer type`);
             }
             defaultValue = { kind: "autoincrement" };
+            if (recordDeclaredTypes && identity === "always") rememberAlwaysIdentity(defaultValue);
             nullable = false;
             continue;
           }
+          if (recordDeclaredTypes && identityDeclared)
+            throw new TypeError(`Conflicting identity declarations for column ${name}`);
           generatedValue = this.#generatedColumn();
           continue;
         }
         if (this.#isKeyword("AUTOINCREMENT")) {
+          if (recordDeclaredTypes && identityDeclared)
+            throw new TypeError(`Conflicting identity declarations for column ${name}`);
           // SQLite's spelling, after PRIMARY KEY.
           this.#keyword("AUTOINCREMENT");
           if (columnType.type !== "number" || columnType.integer !== true) {
@@ -8934,6 +8954,9 @@ class Parser {
         }
         if (this.#isKeyword("NULL")) {
           this.#keyword("NULL");
+          if (recordDeclaredTypes && identityDeclared)
+            throw new TypeError(`Conflicting identity declarations for column ${name}`);
+          explicitNull = true;
           nullable = true;
           continue;
         }
@@ -9173,7 +9196,7 @@ class Parser {
    * Consumes `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` and answers true; leaves the
    * tokens alone and answers false for the stored generated-column form.
    */
-  #identityClause(): boolean {
+  #identityClause(): false | "always" | "byDefault" {
     const start = this.#index;
     this.#keyword("GENERATED");
     let mode: "always" | "byDefault" | undefined;
@@ -9191,8 +9214,6 @@ class Parser {
         this.#keyword("IDENTITY");
         if (recordDeclaredTypes && mode === undefined)
           throw new TypeError("IDENTITY requires ALWAYS or BY DEFAULT");
-        if (recordDeclaredTypes && mode === "always")
-          throw new TypeError("GENERATED ALWAYS AS IDENTITY is not supported");
         // Sequence options in parentheses are accepted and ignored; the counter starts at 1.
         if (this.#punctuation("(")) {
           if (recordDeclaredTypes)
@@ -9206,7 +9227,7 @@ class Parser {
             if (token.kind === "punctuation" && token.text === ")") depth -= 1;
           }
         }
-        return true;
+        return mode ?? "byDefault";
       }
     }
     this.#index = start;
@@ -9778,7 +9799,11 @@ class Parser {
       assigned.add(target);
       assignments.push({
         column: target,
-        expression: rewriteUpsertExpression(this.#expression(), table, alias),
+        expression: rewriteUpsertExpression(
+          recordDeclaredTypes ? this.#updateAssignmentValue() : this.#expression(),
+          table,
+          alias,
+        ),
       });
       if (!this.#punctuation(",")) break;
     }
@@ -9950,7 +9975,9 @@ class Parser {
         for (;;) {
           const column = this.#identifier();
           this.#operator("=");
-          const expression = this.#expression();
+          const expression = recordDeclaredTypes
+            ? this.#updateAssignmentValue()
+            : this.#expression();
           if (hasAggregate(expression)) {
             throw new TypeError("Aggregate functions are not allowed in MERGE assignments");
           }
@@ -9980,7 +10007,7 @@ class Parser {
       this.#expectPunctuation("(");
       const values: Expression[] = [];
       for (;;) {
-        values.push(this.#expression());
+        values.push(recordDeclaredTypes ? this.#updateAssignmentValue() : this.#expression());
         if (!this.#punctuation(",")) break;
       }
       this.#expectPunctuation(")");

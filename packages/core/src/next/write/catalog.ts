@@ -487,6 +487,8 @@ export class Catalog implements CatalogView {
           throw new CatalogChangeError("ALTER column type requires a rewrite");
         if (prior.generatedSql !== column.generatedSql)
           throw new CatalogChangeError("Changing a generated expression requires a rewrite");
+        if (prior.identityAlways !== column.identityAlways)
+          throw new CatalogChangeError("ALTER cannot change identity generation mode");
         if (column.identitySequence !== prior.identitySequence && column.identitySequence !== null)
           throw new CatalogChangeError("ALTER cannot adopt another column's sequence");
         if (column.identity != null && prior.identitySequence !== null)
@@ -631,6 +633,7 @@ export class Catalog implements CatalogView {
         generatedSql: column.generatedSql,
         identitySequence,
         ...(column.autoIncrement === true ? { autoIncrement: true as const } : {}),
+        ...(column.identityAlways === true ? { identityAlways: true as const } : {}),
         missing: previous === undefined ? null : column.missing,
         ...(column.typeId === undefined ? {} : { typeId: column.typeId }),
         ...(column.allowedValues === undefined ? {} : { allowedValues: column.allowedValues }),

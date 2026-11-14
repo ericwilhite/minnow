@@ -10,25 +10,29 @@
  *   (`TableRuleExpressions`) and the owner passes those here.
  * - Expressions are positional over the table's columns in catalog order (`TableDef.columns`):
  *   `{ op: "column", index: i }` is column i, which is the layout of every batch the rules see.
- * - The owner caches the result per (table id, catalog version) and hands
- *   `(tableId) => TableRules` to `WriteTransaction.statement({ rules })`.
+ * - The owner caches only the immutable validated program per catalog identity/table id.
+ *   Each statement binds it with `bindTableRules` (row-rules.ts), or supplies the additive fourth
+ *   execution context here, and hands the bound hooks to `WriteTransaction.statement({ rules })`.
+ *   The binding, buffers and grant stay alive through statement.end(), including FK actions.
  *
  * ## Semantics
  * - `check` evaluates each CHECK over the active rows; FALSE fails and NULL passes (SQL). Checks
- *   that read none of `columnIds` are skipped. The result is the first failing row in physical
- *   order, and for that row the first failing constraint in catalog order.
+ *   that read none of `columnIds` (including regenerated IDs) may be skipped. The result is the first failing row in physical
+ *   order, and for that row the first failing constraint in PostgreSQL constraint-name order.
  * - `generate` recomputes, in place, every stored generated column that depends on `columnIds`,
  *   in catalog order (a generated column cannot read another one, as in PostgreSQL).
- * - Both are synchronous kernels with no allocation per row; their scratch is sized at compile
- *   time for one batch. Errors inside an expression (division by zero, overflow) are the kernels'
+ * - Both are synchronous kernels; execution buffers are charged before allocation at binding
+ *   time and growth. Programs retain no execution buffers. Errors inside an expression (division by zero, overflow) are the kernels'
  *   SQL errors (exec/errors.ts) and fail the statement.
  */
-import type { CheckDef, TableDef } from "../access/catalog.js";
+import type { TableDef } from "../access/catalog.js";
 import type { TableRules } from "../access/modify.js";
 import type { ScalarExpr } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
 import { samePhysicalType } from "../types.js";
 import type { Batch } from "../vector/vector.js";
+import { rememberRuleProgram, type CompiledCheck } from "./rule-program.js";
+import { bindTableRules, type BoundTableRules, type RowRuleContext } from "./row-rules.js";
 import { UnsupportedPlanError } from "./errors.js";
 
 /** The lowered forms of a table's rule expressions: defined once in ir/rules.ts (lowering builds them). */
@@ -115,10 +119,18 @@ function hasParam(expr: ScalarExpr): boolean {
   }
 }
 
-interface CompiledCheck {
-  readonly def: CheckDef;
-  /** Catalog column ids it reads. */
-  readonly reads: ReadonlySet<number>;
+/** PostgreSQL strcmp on UTF8 identifiers: scalar order, independent of locale/UTF16. */
+function compareNames(a: string, b: string): number {
+  let i = 0,
+    j = 0;
+  while (i < a.length && j < b.length) {
+    const x = a.codePointAt(i) ?? 0,
+      y = b.codePointAt(j) ?? 0;
+    if (x !== y) return x - y;
+    i += x > 65535 ? 2 : 1;
+    j += y > 65535 ? 2 : 1;
+  }
+  return a.length - i - (b.length - j);
 }
 
 const NO_RULES_GENERATE = (): void => undefined;
@@ -133,6 +145,18 @@ export function compileTableRules(
   table: TableDef,
   catalogVersion: number,
   expressions: TableRuleExpressions,
+): TableRules;
+export function compileTableRules(
+  table: TableDef,
+  catalogVersion: number,
+  expressions: TableRuleExpressions,
+  context: RowRuleContext,
+): BoundTableRules;
+export function compileTableRules(
+  table: TableDef,
+  catalogVersion: number,
+  expressions: TableRuleExpressions,
+  context?: RowRuleContext,
 ): TableRules {
   const fail = (message: string): never => {
     throw new RuleCompileError(table.id, `${message} (catalog version ${String(catalogVersion)})`);
@@ -148,17 +172,19 @@ export function compileTableRules(
 
   const byCheck = new Map(expressions.checks.map((entry) => [entry.checkId, entry.condition]));
   if (byCheck.size !== expressions.checks.length) fail("a check is given twice");
-  const checks: CompiledCheck[] = table.checks.map((def) => {
-    const condition = byCheck.get(def.id);
-    if (condition === undefined) return fail(`check ${String(def.id)} has no expression`);
-    if (condition.type.kind !== "bool") fail(`check ${String(def.id)} is not boolean`);
-    const reads = new Set<number>();
-    for (const index of validate(condition, `check ${String(def.id)}`)) {
-      const column = columns[index];
-      if (column !== undefined) reads.add(column.id);
-    }
-    return { def, reads };
-  });
+  const checks: CompiledCheck[] = [...table.checks]
+    .sort((a, b) => compareNames(a.name, b.name))
+    .map((def) => {
+      const condition = byCheck.get(def.id);
+      if (condition === undefined) return fail(`check ${String(def.id)} has no expression`);
+      if (condition.type.kind !== "bool") fail(`check ${String(def.id)} is not boolean`);
+      const reads = new Set<number>();
+      for (const index of validate(condition, `check ${String(def.id)}`)) {
+        const column = columns[index];
+        if (column !== undefined) reads.add(column.id);
+      }
+      return { def, reads, condition };
+    });
   if (byCheck.size !== table.checks.length) fail("an expression names no check of the table");
 
   const generatedColumns = new Set(
@@ -178,21 +204,49 @@ export function compileTableRules(
   for (const columnId of generatedColumns)
     if (!byColumn.has(columnId)) fail(`generated column ${String(columnId)} has no expression`);
 
-  if (checks.length === 0 && byColumn.size === 0)
-    return { check: () => null, generate: NO_RULES_GENERATE };
+  if (checks.length === 0 && byColumn.size === 0) {
+    const noRules: TableRules = { check: () => null, generate: NO_RULES_GENERATE };
+    return context ? bindTableRules(noRules, context.charge, context) : noRules;
+  }
 
-  // Expression kernels are Phase 2: the interface is fixed, evaluation is not implemented yet.
-  return {
+  const generated = columns.flatMap((column, index) => {
+    const expr = byColumn.get(column.id);
+    return expr === undefined
+      ? []
+      : [
+          {
+            columnId: column.id,
+            index,
+            expr,
+            reads: new Set([...columnsRead(expr, new Set())].map((i) => columns[i]?.id ?? -1)),
+          },
+        ];
+  });
+  const rules: TableRules = {
     check(_batch: Batch, columnIds: readonly number[] | null) {
-      const relevant =
-        columnIds === null
-          ? checks
-          : checks.filter((check) => columnIds.some((id) => check.reads.has(id)));
-      if (relevant.length === 0) return null;
-      throw new UnsupportedPlanError("CHECK evaluation (Phase 2)");
+      if (
+        checks.length === 0 ||
+        (generated.length === 0 &&
+          !checks.some(
+            (check) =>
+              check.reads.size === 0 ||
+              columnIds === null ||
+              columnIds.some((id) => check.reads.has(id)),
+          ))
+      )
+        return null;
+      throw new UnsupportedPlanError("row rules require an execution binding", {
+        construct: "rowRules",
+      });
     },
-    generate() {
-      throw new UnsupportedPlanError("generated columns (Phase 2)");
+    generate(_batch, columnIds) {
+      if (!generated.some((g) => g.reads.size === 0 || columnIds.some((id) => g.reads.has(id))))
+        return;
+      throw new UnsupportedPlanError("row rules require an execution binding", {
+        construct: "rowRules",
+      });
     },
   };
+  rememberRuleProgram(rules, { table, checks, generated });
+  return context ? bindTableRules(rules, context.charge, context) : rules;
 }

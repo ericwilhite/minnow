@@ -228,8 +228,8 @@ refused by typed preparation.
 
 1. **Owned sequences.** `TableInput` column `identity: { start, increment } | null`: the write
    path creates the owned sequence with the table and sets `identitySequence` and `ownedBy`.
-   SERIAL and BY DEFAULT IDENTITY lower to this path. ALWAYS and sequence options explicitly
-   refuse with 0A000. Schema counters also retain explicit-value advancement semantics.
+   SERIAL, BY DEFAULT and ALWAYS IDENTITY lower to this path. ALWAYS retains a durable
+   assignment-mode flag; non-DEFAULT user values refuse428C9. Sequence options refuse0A000. Schema counters also retain explicit-value advancement semantics.
 2. **Self-referencing foreign keys.** `TableInput.foreignKeys[].parentTableId` accepts `"self"`.
    SQL resolves its own PRIMARY/UNIQUE declaration before catalog IDs are assigned.
 3. **Enum types** in the catalog (`TypeDef { id, name, labels }`, `createType` / `dropType`).
@@ -706,7 +706,45 @@ new SQL CREATE/REPLACE always emits it. Column-alias projections can retain cons
 dependencies; this does not make a wildcard expand against the later catalog.
 
 Shipped-surface audit: GENERATED ALWAYS identity is accepted by the shipped engine as the
-same counter as BY DEFAULT (including explicit values); native parity is a required follow-up
-before freeze, alongside the shared row-rule/modify integration. CREATE SEQUENCE options
+same counter as BY DEFAULT (including explicit values). Native ALWAYS instead retains its
+PostgreSQL generation mode: explicit user values refuse428C9, DEFAULT/omission use the owned
+sequence. INSERT/SELECT, UPDATE/upsert, MERGE and batch inputs share that rule; the published
+counter alias remains unchanged. ALTER identity mode/options and OVERRIDING clauses still refuse. CREATE SEQUENCE options
 (negative increment/CYCLE included) and ALTER TYPE ADD VALUE are already refused by the shipped
 engine. Their native typed refusals remain; no extra support is claimed here.
+
+### Shared row-rule execution (B6 / B5b)
+
+`compileTableRules` retains validation-only immutable programs for the catalog cache. Its
+optional fourth `{charge,capacity,signal}` argument or `bindTableRules` supplies statement-owned
+CHECK/generated kernels. CHECK passes NULL, stops at the first physical row/constraint-name order,
+and evaluates throwing expressions only when reached. Proven total comparisons use batched
+kernels. Generated values are charged, flattened into result-owned buffers, preserve inactive
+slots and include generated IDs when filtering dependent CHECKs. FK actions retain OLD wrappers
+and use the same binding through statement.end(); CHECK errors roll the statement back.
+
+`tableRuleMinimumBytes` measures fixed buffers only; variable output/coefficient growth remains
+charged. Internal ExpressionMemoryError requires caller preflight/re-admission or cancellable
+waiting, never a below-cap SQL refusal. B5b owns that DML routing and general modify enablement.
+A live bound instance must not enter the evictable catalog RuleCache. Existing unsupported
+expression overloads/casts still refuse at binding; defaults/clock/sequences stay caller-owned.
+Generated assignment legality remains in lowering (428C9); FK recomputation is not a user
+assignment. This module introduces no trigger firing or persisted-format change.
+
+Row-rule SQL data errors use the same precise-replay gate as projections. Successful generated
+batches remain vectorized; only a failing batch is re-evaluated by active row, generated column
+order, NOT NULL, then CHECK constraint-name order (UTF8, independent of locale). An earlier
+constraint can throw from generate() during replay; admission/cancellation/capability errors
+never select replay. Statement rollback and the write path remain the caller's responsibility.
+
+### ALWAYS identity persistence
+
+MCAT column field15 `identityAlways` is semantic-required when present and must be true.
+It requires a non-null integer owned identity without a generated expression, explicit default
+or DSL advancement flag. Definition flags survive ALTER of unrelated columns, WAL/checkpoint
+and reopen. Unknown-required-field handling fences earlier unreleased readers; this additive
+record extension shares the unmerged stage2 development selector unit5/6/4. No released next/
+predecessor exists. Native-only DEFAULT assignment markers cover upsert and MERGE; conflicting
+identity/default/NULL declarations refuse42601. Existing generated-column assignment rules
+and SQL BY DEFAULT/SERIAL explicit-value behavior are unchanged. Runtime sequence execution
+remains the owner/executor's existing integration responsibility, not a generic DML enablement.

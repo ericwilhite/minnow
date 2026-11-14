@@ -22,20 +22,11 @@ import { compileExpr, selectTrue, type CompileContext } from "./kernels/compile.
 import type { Compiled } from "./kernels/vectors.js";
 import { projectionStep } from "./projection-step.js";
 import { ExpressionMemoryError, IDENTITY } from "./kernels/vectors.js";
-import { ExecutionError } from "./errors.js";
+import { expressionDataError as dataError } from "./expression-errors.js";
 import { Slice } from "./slices.js";
 import { afterYield, yieldTask, YIELD_INTERVAL_MS } from "./pipeline.js";
 import type { MaybePromise } from "../access/key-index.js";
 import type { Operator, PushResult, Transfer } from "./pipeline.js";
-
-/**
- * Only data errors select precise replay. Cancellation, admission, capability and internal
- * failures retain their original ownership/error path. Replay is safe because volatile
- * kernel bindings are refused; revisit this protocol BEFORE adding any volatile kernel.
- */
-function dataError(error: unknown): boolean {
-  return error instanceof ExecutionError && error.sqlState !== "57014";
-}
 
 /** The conjuncts of `predicate` (nested ANDs flattened), in order. */
 export function conjuncts(predicate: ScalarExpr): ScalarExpr[] {
