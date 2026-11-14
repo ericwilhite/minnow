@@ -1,3 +1,5 @@
+import { encodeFts, decodeFts, type FtsValues } from "../format/fts-codec.js";
+import { ftsSemantics } from "../fts-config.js";
 import {
   encodeCatalogStream,
   decodeCatalogStream,
@@ -379,6 +381,71 @@ function overflowAdapters(): Pick<
     runKeyPayload: { bytes: payload, decode: decode("payload") },
   };
 }
+function ftsAdapters(): Pick<
+  Record<Exclude<DurableFormatName, "indexedDb">, Adapter>,
+  keyof FtsValues
+> {
+  const values: FtsValues = {
+    ftsRoot: {
+      kind: "column",
+      ftsId: 1,
+      tableId: 1,
+      columnId: 1,
+      schemaVersion: 1,
+      generation: 1,
+      mutationEpoch: 0,
+      state: "ready",
+      owner: null,
+      leaseUntil: 0,
+      baseLsn: 0,
+      throughLsn: 0,
+      nextRowId: 1,
+      documentCount: 0,
+      tokenCount: 0n,
+      terms: null,
+      documents: null,
+      deltas: null,
+      ...ftsSemantics(),
+    },
+    ftsTerms: {
+      kind: "leaf",
+      entries: [{ term: "a", postings: { ref: blob, first: 1, last: 1, count: 1, tokens: 1n } }],
+    },
+    ftsPostings: { kind: "leaf", ids: Float64Array.of(1, 4), frequencies: Uint16Array.of(2, 3) },
+    ftsDocuments: {
+      kind: "leaf",
+      ids: Float64Array.of(1, 4),
+      lengths: Uint16Array.of(0, 3),
+      renderable: Uint8Array.of(0, 1),
+    },
+    ftsDelta: { kind: "leaf", ftsId: 1, generation: 1, mutationEpoch: 0, entries: [] },
+  };
+  const adapter = (kind: keyof FtsValues): Adapter => {
+    const account = budget(),
+      encoded = encodeFts(kind, values[kind], account);
+    const bytes = encoded.bytes.slice();
+    encoded.close();
+    expect(account.held).toBe(0);
+    return {
+      bytes,
+      decode(source) {
+        const parsed = decodeFts(kind, source, account);
+        try {
+          return parsed.value;
+        } finally {
+          account.free(parsed.charge);
+        }
+      },
+    };
+  };
+  return {
+    ftsRoot: adapter("ftsRoot"),
+    ftsTerms: adapter("ftsTerms"),
+    ftsPostings: adapter("ftsPostings"),
+    ftsDocuments: adapter("ftsDocuments"),
+    ftsDelta: adapter("ftsDelta"),
+  };
+}
 function adapters(): Record<Exclude<DurableFormatName, "indexedDb">, Adapter> {
   const header = { id: new Uint8Array(16), sourceLsn: 3 };
   const snapshot = new Uint8Array(64);
@@ -397,6 +464,7 @@ function adapters(): Record<Exclude<DurableFormatName, "indexedDb">, Adapter> {
   const portable = new Uint8Array(16);
   encodeSnapshotColumnHeader(integer.type, 2, portable);
   return {
+    ...ftsAdapters(),
     snapshotColumn: {
       bytes: portable,
       decode: (bytes) => decodeSnapshotColumnHeader(integer.type, bytes),

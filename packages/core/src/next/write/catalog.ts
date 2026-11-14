@@ -53,7 +53,9 @@ import {
   decodeCatalogChange,
   type CatalogStreamData,
 } from "./catalog-stream.js";
-import { UnsupportedCatalogError } from "./catalog-records.js";
+import { validateFtsDef, type FtsDef } from "../access/fts-def.js";
+import { DurableFormatError } from "../durable-format.js";
+import { retainCatalogExtensions, UnsupportedCatalogError } from "./catalog-records.js";
 
 export interface CatalogCounters {
   readonly nextTableId: number;
@@ -63,6 +65,7 @@ export interface CatalogCounters {
   readonly nextSequenceId: number;
   readonly nextViewId: number;
   readonly nextTypeId: number;
+  readonly nextFtsId: number;
 }
 
 const FIRST_COUNTERS: CatalogCounters = {
@@ -73,6 +76,7 @@ const FIRST_COUNTERS: CatalogCounters = {
   nextSequenceId: 1,
   nextViewId: 1,
   nextTypeId: 1,
+  nextFtsId: 1,
 };
 
 /** A change as the log carries it: every id resolved, nothing left to validate. */
@@ -91,7 +95,10 @@ export type CatalogOperation =
   | { readonly op: "createView"; readonly view: ViewDef }
   | { readonly op: "dropView"; readonly viewId: number }
   | { readonly op: "createType"; readonly type: TypeDef }
-  | { readonly op: "dropType"; readonly typeId: number };
+  | { readonly op: "dropType"; readonly typeId: number }
+  | { readonly op: "createFts"; readonly fts: FtsDef }
+  | { readonly op: "upsertFts"; readonly fts: FtsDef }
+  | { readonly op: "dropFts"; readonly ftsId: number };
 
 /** Every WAL operation binds its predecessor and its live-assigned resulting version. */
 export type LoggedChange = CatalogOperation & {
@@ -132,6 +139,7 @@ export class Catalog implements CatalogView {
   readonly sequences: readonly SequenceDef[];
   readonly views: readonly ViewDef[];
   readonly types: readonly TypeDef[];
+  readonly fts: readonly FtsDef[];
   readonly wireMetadata?: unknown;
   readonly #tables: ReadonlyMap<number, TableDef>;
   readonly #tablesByName: ReadonlyMap<string, TableDef>;
@@ -147,6 +155,7 @@ export class Catalog implements CatalogView {
     this.sequences = data.sequences;
     this.views = data.views;
     this.types = data.types;
+    this.fts = data.fts;
     this.#tables = new Map(data.tables.map((table) => [table.id, table]));
     this.#tablesByName = new Map(data.tables.map((table) => [table.name, table]));
     this.#sequences = new Map(data.sequences.map((sequence) => [sequence.id, sequence]));
@@ -161,6 +170,7 @@ export class Catalog implements CatalogView {
       sequences: [],
       views: [],
       types: [],
+      fts: [],
     });
   }
 
@@ -201,6 +211,7 @@ export class Catalog implements CatalogView {
       sequences: this.sequences,
       views: this.views,
       types: this.types,
+      fts: this.fts,
     };
   }
 
@@ -237,6 +248,14 @@ export class Catalog implements CatalogView {
 
   #plan(change: CatalogChange): CatalogOperation[] {
     switch (change.kind) {
+      case "createFts":
+        return [{ op: "createFts", fts: { ...change.fts, id: this.counters.nextFtsId } }];
+      case "upsertFts":
+        return [{ op: "upsertFts", fts: change.fts }];
+      case "dropFts":
+        if (!this.fts.some((def) => def.id === change.ftsId))
+          throw new CatalogChangeError("Unknown FTS definition");
+        return [{ op: "dropFts", ftsId: change.ftsId }];
       case "createTable":
         return this.#planCreateTable(change.table);
       case "alterTable":
@@ -561,11 +580,43 @@ export class Catalog implements CatalogView {
       throw new StoreCorruptionError("A logged catalog change has the wrong predecessor/version");
     const data = this.#data();
     const counters = { ...data.counters };
+    retainCatalogExtensions(data.counters, counters);
     const bump = (key: keyof CatalogCounters, used: number) => {
       counters[key] = Math.max(counters[key], used + 1);
     };
-    let { tables, sequences, views, types } = data;
+    let { tables, sequences, views, types, fts } = data;
     switch (change.op) {
+      case "createFts":
+      case "upsertFts": {
+        const def = change.fts;
+        validateFtsDef(def);
+        const old = fts.find((entry) => entry.id === def.id);
+        const column = this.table(def.tableId)?.columns.find((c) => c.id === def.columnId);
+        if (
+          !column ||
+          (old &&
+            (change.op === "createFts" ||
+              old.tableId !== def.tableId ||
+              old.columnId !== def.columnId)) ||
+          (!old && def.id < counters.nextFtsId) ||
+          fts.some(
+            (entry) =>
+              entry.id !== def.id &&
+              entry.tableId === def.tableId &&
+              entry.columnId === def.columnId,
+          )
+        )
+          throw new StoreCorruptionError("Invalid FTS identity or column binding");
+        if (def.id >= Number.MAX_SAFE_INTEGER) throw new StoreCorruptionError("FTS id exhausted");
+        bump("nextFtsId", def.id);
+        fts = [...fts.filter((entry) => entry.id !== def.id), def].sort((a, b) => a.id - b.id);
+        break;
+      }
+      case "dropFts":
+        if (!fts.some((entry) => entry.id === change.ftsId))
+          throw new StoreCorruptionError("Unknown FTS id");
+        fts = fts.filter((entry) => entry.id !== change.ftsId);
+        break;
       case "createTable": {
         const table = change.table;
         if (this.#tables.has(table.id))
@@ -581,6 +632,7 @@ export class Catalog implements CatalogView {
         break;
       }
       case "dropTable":
+        fts = fts.filter((def) => def.tableId !== change.tableId);
         tables = tables.filter((table) => table.id !== change.tableId);
         sequences = sequences.filter((sequence) => sequence.ownedBy?.tableId !== change.tableId);
         break;
@@ -649,6 +701,7 @@ export class Catalog implements CatalogView {
       sequences,
       views,
       types,
+      fts,
     });
   }
 
@@ -667,7 +720,11 @@ export class Catalog implements CatalogView {
     // Temporary graph-validation IDs/names are distinct from the CatalogView's existing
     // resident definitions. Admit before constructing the temporary sets and maps.
     let entries =
-      data.tables.length + data.sequences.length + data.views.length + data.types.length;
+      data.tables.length +
+      data.sequences.length +
+      data.views.length +
+      data.types.length +
+      data.fts.length;
     for (const table of data.tables)
       entries +=
         table.columns.length +
@@ -680,7 +737,11 @@ export class Catalog implements CatalogView {
       validateStoredCatalog(data);
       return new Catalog(data);
     } catch (error) {
-      if (error instanceof StoreCorruptionError || error instanceof UnsupportedCatalogError)
+      if (
+        error instanceof StoreCorruptionError ||
+        error instanceof UnsupportedCatalogError ||
+        error instanceof DurableFormatError
+      )
         throw error;
       throw new StoreCorruptionError(`A stored catalog is malformed: ${String(error)}`);
     } finally {
@@ -731,6 +792,23 @@ function validateStoredCatalog(data: CatalogData): void {
   ids(data.sequences, data.counters.nextSequenceId, "sequence");
   ids(data.views, data.counters.nextViewId, "view");
   ids(data.types, data.counters.nextTypeId, "type");
+  ids(data.fts, data.counters.nextFtsId, "FTS");
+  const bindings = new Set<string>();
+  let previousFtsId = 0;
+  for (const def of data.fts) {
+    validateFtsDef(def);
+    const key = `${String(def.tableId)}:${String(def.columnId)}`;
+    check(
+      def.id > previousFtsId &&
+        !bindings.has(key) &&
+        data.tables.some(
+          (table) => table.id === def.tableId && table.columns.some((c) => c.id === def.columnId),
+        ),
+      "Invalid stored FTS order or column binding",
+    );
+    previousFtsId = def.id;
+    bindings.add(key);
+  }
   names([...data.tables, ...data.views]);
   names(data.sequences);
   names(data.types);
@@ -829,6 +907,8 @@ function createdId(change: LoggedChange | null): number | null {
       return change.view.id;
     case "createType":
       return change.type.id;
+    case "createFts":
+      return change.fts.id;
     default:
       return null;
   }
@@ -1018,11 +1098,12 @@ export function decodeLogged(bytes: Uint8Array): LoggedChange {
       )
         throw new StoreCorruptionError(`Unexpected logged catalog field ${name}`);
     const record = value as unknown as Record<string, unknown>;
-    for (const name of ["tableId", "indexId", "sequenceId", "viewId", "typeId"] as const) {
+    for (const name of ["tableId", "indexId", "sequenceId", "viewId", "typeId", "ftsId"] as const) {
       const id = record[name];
       if (name in record && !(typeof id === "number" && id > 0))
         throw new StoreCorruptionError(`Invalid logged catalog id ${name}`);
     }
+    if (value.op === "createFts" || value.op === "upsertFts") validateFtsDef(value.fts);
     if (value.op === "createTable") validateStoredTable(value.table);
     if (value.op === "createIndex") validateStoredIndex(value.index);
     if (value.op === "putSequence") {
@@ -1038,7 +1119,11 @@ export function decodeLogged(bytes: Uint8Array): LoggedChange {
     if (value.op === "createType") positiveId(value.type.id);
     return value;
   } catch (error) {
-    if (error instanceof StoreCorruptionError || error instanceof UnsupportedCatalogError)
+    if (
+      error instanceof StoreCorruptionError ||
+      error instanceof UnsupportedCatalogError ||
+      error instanceof DurableFormatError
+    )
       throw error;
     throw new StoreCorruptionError(`A logged catalog change is malformed: ${String(error)}`);
   }

@@ -35,6 +35,7 @@ function catalogAt(version: number): CatalogView {
     tableByName: () => undefined,
     sequence: () => undefined,
     types: [],
+    fts: [],
     type: () => undefined,
     typeByName: () => undefined,
   };

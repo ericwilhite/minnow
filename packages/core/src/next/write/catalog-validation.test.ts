@@ -1,3 +1,4 @@
+import { ftsDef } from "../access/fts-def.js";
 /** MCAT must not expose a malformed identity/dependency graph as a CatalogView. */
 import fc from "fast-check";
 import { expect, it } from "vitest";
@@ -177,6 +178,9 @@ it.each(seedsFor("next-catalog-log-shape", [0xb760, 0xb761]))(
       { op: "dropView", viewId: 1 },
       { op: "createType", type: { id: 1, name: "typ", labels: ["a"] } },
       { op: "dropType", typeId: 1 },
+      { op: "createFts", fts: ftsDef(1, 1, 1) },
+      { op: "upsertFts", fts: ftsDef(1, 1, 1) },
+      { op: "dropFts", ftsId: 1 },
     ];
     const operations: LoggedChange[] = inputs.map((operation) => ({
       ...operation,
