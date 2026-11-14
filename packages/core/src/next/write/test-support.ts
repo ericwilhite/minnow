@@ -39,11 +39,77 @@ export const NO_RULES: TableRules = {
 
 export const rules = () => NO_RULES;
 
-const DECLARED: Record<string, SqlTypeDescriptor> = {
-  int32: { type: "number", integer: true, declaredTypeName: "INTEGER" },
-  int64: { type: "number", integer: true, declaredTypeName: "BIGINT" },
-  text: { type: "string", declaredTypeName: "TEXT" },
-};
+function declared(type: PhysicalType): SqlTypeDescriptor {
+  switch (type.kind) {
+    case "bool":
+      return { type: "boolean" };
+    case "int32":
+      return {
+        type: "number",
+        integer: true,
+        declaredTypeName: type.bits === 16 ? "SMALLINT" : "INTEGER",
+      };
+    case "int64":
+      return { type: "number", integer: true, declaredTypeName: "BIGINT" };
+    case "float32":
+      return { type: "number", declaredTypeName: "REAL" };
+    case "float64":
+      return { type: "number", declaredTypeName: "DOUBLE PRECISION" };
+    case "decimal":
+      return {
+        type: "string",
+        sqlDomain: {
+          kind: "numeric",
+          ...(type.precision === null ? {} : { precision: type.precision }),
+          ...(type.scale === null ? {} : { scale: type.scale }),
+        },
+      };
+    case "text":
+      return {
+        type: "string",
+        ...(type.maxLength === undefined
+          ? {}
+          : { declaredLength: { length: type.maxLength, fixed: type.fixed === true } }),
+      };
+    case "timestamp":
+      return { type: "datetime", ...(type.zoned ? {} : { withoutTimeZone: true }) };
+    case "json":
+      return { type: "string", sqlDomain: { kind: type.binary ? "jsonb" : "json" } };
+    case "enum":
+      return {
+        type: "string",
+        sqlDomain: { kind: "enum", name: type.name, values: [...type.labels] },
+      };
+    case "date":
+    case "time":
+    case "interval":
+    case "uuid":
+      return { type: "string", sqlDomain: { kind: type.kind } };
+    case "array": {
+      const element =
+        type.element.kind === "int32"
+          ? type.element.bits === 16
+            ? "smallint"
+            : "integer"
+          : type.element.kind === "int64"
+            ? "bigint"
+            : type.element.kind === "float32"
+              ? "real"
+              : type.element.kind === "float64"
+                ? "double precision"
+                : type.element.kind === "bool"
+                  ? "boolean"
+                  : type.element.kind === "timestamp"
+                    ? type.element.zoned
+                      ? "timestamptz"
+                      : "timestamp"
+                    : type.element.kind;
+      return { type: "string", sqlDomain: { kind: "array", element } };
+    }
+    default:
+      return { type: "string" };
+  }
+}
 
 export function column(
   name: string,
@@ -53,7 +119,7 @@ export function column(
   return {
     name,
     type,
-    declared: DECLARED[type.kind] ?? { type: "string" },
+    declared: declared(type),
     nullable,
     defaultSql: null,
     generatedSql: null,

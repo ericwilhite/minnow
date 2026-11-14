@@ -55,6 +55,7 @@ function field(spec: string) {
 }
 const typed = [
   [DURABLE_CODECS.catalogTypedArray.uint8, Uint8Array],
+  [DURABLE_CODECS.catalogTypedArray.uint16, Uint16Array],
   [DURABLE_CODECS.catalogTypedArray.int32, Int32Array],
   [DURABLE_CODECS.catalogTypedArray.uint32, Uint32Array],
   [DURABLE_CODECS.catalogTypedArray.float32, Float32Array],
@@ -286,7 +287,7 @@ function valueSize(spec: string, value: unknown, depth: number): number {
 function entries(
   kind: CatalogRecordKind,
   value: unknown,
-  visit: (tag: number, spec: string | null, value: unknown) => void,
+  visit: (id: number, flags: number, spec: string | null, value: unknown) => void,
 ): void {
   check(
     typeof value === "object" && value !== null && !Array.isArray(value),
@@ -308,21 +309,21 @@ function entries(
       check(f.optional, `Missing catalog field ${f.name}`);
       continue;
     }
-    visit(id * 2 + (f.optional ? 0 : 1), f.spec, v);
+    visit(id, f.optional ? 0 : DURABLE_CODECS.catalogFieldFlags.required, f.spec, v);
   }
   let last = definitions.length;
   for (const extension of record[opaque] ?? []) {
     check(extension.id > last, "Invalid optional catalog extension order");
     last = extension.id;
-    visit(extension.id * 2, null, extension.bytes);
+    visit(extension.id, 0, null, extension.bytes);
   }
 }
 function bodySize(kind: CatalogRecordKind, value: unknown, depth: number): number {
   check(depth <= 32, "Catalog nesting exceeds its cap");
   let size = 0;
-  entries(kind, value, (tag, spec, v) => {
+  entries(kind, value, (id, _flags, spec, v) => {
     const n = spec === null ? (v as Uint8Array).length : valueSize(spec, v, depth + 1);
-    size += width(tag) + width(n) + n;
+    size += width(id) + 1 + width(n) + n;
   });
   return size;
 }
@@ -340,9 +341,10 @@ function writeRecord(
   out.varuint(CATALOG_RECORD_KINDS[kind]);
   out.varuint(grammar.recordVersion);
   out.varuint(bodySize(kind, value, depth));
-  entries(kind, value, (tag, spec, v) => {
+  entries(kind, value, (id, flags, spec, v) => {
     const n = spec === null ? (v as Uint8Array).length : valueSize(spec, v, depth + 1);
-    out.varuint(tag);
+    out.varuint(id);
+    out.u8(flags);
     out.varuint(n);
     if (spec === null) out.raw(v as Uint8Array);
     else put(out, spec, v, allocator, depth + 1);
@@ -390,9 +392,13 @@ function readRecord(input: ByteReader, kind: CatalogRecordKind, depth: number): 
     extensions: Extension[] = [];
   let previous = 0;
   while (!body.done) {
-    const tag = uint(body),
-      id = Math.floor(tag / 2),
-      required = tag % 2 === 1;
+    const id = uint(body),
+      flags = body.u8();
+    check(
+      (flags & ~DURABLE_CODECS.catalogFieldFlags.knownMask) === 0,
+      "Reserved catalog field flags",
+    );
+    const required = (flags & DURABLE_CODECS.catalogFieldFlags.required) !== 0;
     check(id > previous, "Duplicate/out-of-order catalog field");
     previous = id;
     const payload = new ByteReader(body.raw(uint(body))),

@@ -532,7 +532,10 @@ function adapters(): Record<Exclude<DurableFormatName, "indexedDb">, Adapter> {
       decode: parsed(decodeCatalogPage),
     },
     catalog: { bytes: Catalog.empty().encode(), decode: (bytes) => Catalog.decode(bytes) },
-    catalogChange: { bytes: encodeLogged({ op: "dropTable", tableId: 1 }), decode: decodeLogged },
+    catalogChange: {
+      bytes: encodeLogged({ op: "dropTable", tableId: 1, expectedVersion: 0, version: 1 }),
+      decode: decodeLogged,
+    },
     ...overflowAdapters(),
     runBlock: runAdapter("runBlock"),
     runIndex: runAdapter("runIndex"),
@@ -786,6 +789,8 @@ for (const seed of seedsFor("next-durable-fields", [0xb223, 0xb224]))
         reach.reach("array boolean");
         const change = encodeCatalogChange({
           op: `future-${String(unknown)}`,
+          expectedVersion: 0,
+          version: 1,
           tableId: 1,
         } as unknown as Parameters<typeof encodeCatalogChange>[0]);
         await refused({ bytes: change, decode: decodeLogged }, change, "catalog operation");

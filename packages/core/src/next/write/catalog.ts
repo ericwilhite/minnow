@@ -1,3 +1,8 @@
+import {
+  validateCatalogType,
+  validateCatalogDeclared,
+  validateCatalogMissing,
+} from "./catalog-values.js";
 import type { ByteBudget } from "../storage/extents.js";
 import { ParseBudgetError } from "../format/manifest-codec.js";
 /**
@@ -71,7 +76,7 @@ const FIRST_COUNTERS: CatalogCounters = {
 };
 
 /** A change as the log carries it: every id resolved, nothing left to validate. */
-export type LoggedChange =
+export type CatalogOperation =
   | {
       readonly op: "createTable";
       readonly table: TableDef;
@@ -87,6 +92,12 @@ export type LoggedChange =
   | { readonly op: "dropView"; readonly viewId: number }
   | { readonly op: "createType"; readonly type: TypeDef }
   | { readonly op: "dropType"; readonly typeId: number };
+
+/** Every WAL operation binds its predecessor and its live-assigned resulting version. */
+export type LoggedChange = CatalogOperation & {
+  readonly expectedVersion: number;
+  readonly version: number;
+};
 
 type CatalogData = CatalogStreamData;
 
@@ -209,7 +220,12 @@ export class Catalog implements CatalogView {
     readonly logged: readonly LoggedChange[];
     readonly id: number | null;
   } {
-    const logged = this.#plan(change);
+    let expectedVersion = this.version;
+    const logged = this.#plan(change).map((operation) => {
+      const entry = { ...operation, expectedVersion, version };
+      expectedVersion = version;
+      return entry;
+    });
     const next = logged.reduce<Catalog>((catalog, entry) => catalog.apply(entry, version), this);
     const id = createdId(logged[0] ?? null);
     return { catalog: next, logged, id };
@@ -219,7 +235,7 @@ export class Catalog implements CatalogView {
     return this.#tablesByName.has(name) || this.views.some((view) => view.name === name);
   }
 
-  #plan(change: CatalogChange): LoggedChange[] {
+  #plan(change: CatalogChange): CatalogOperation[] {
     switch (change.kind) {
       case "createTable":
         return this.#planCreateTable(change.table);
@@ -350,7 +366,7 @@ export class Catalog implements CatalogView {
     return { id, name, tableId: table.id, columnIds, unique, kind, role };
   }
 
-  #planCreateTable(input: TableInput): LoggedChange[] {
+  #planCreateTable(input: TableInput): CatalogOperation[] {
     if (this.#nameTaken(input.name))
       throw new CatalogChangeError(`Relation ${input.name} already exists`);
     const counters = { ...this.counters };
@@ -537,6 +553,12 @@ export class Catalog implements CatalogView {
   // ── Application: logged change → next catalog (live and replay) ───────────────────────────
 
   apply(change: LoggedChange, version: number): Catalog {
+    if (
+      change.expectedVersion !== this.version ||
+      change.version !== version ||
+      version < this.version
+    )
+      throw new StoreCorruptionError("A logged catalog change has the wrong predecessor/version");
     const data = this.#data();
     const counters = { ...data.counters };
     const bump = (key: keyof CatalogCounters, used: number) => {
@@ -744,18 +766,39 @@ function validateStoredCatalog(data: CatalogData): void {
         "Invalid stored check dependency",
       );
     for (const fk of table.foreignKeys) {
-      const parent = tables.get(fk.parentTableId)?.indexes.find((i) => i.id === fk.parentIndexId);
+      const parentTable = tables.get(fk.parentTableId);
+      const parent = parentTable?.indexes.find((i) => i.id === fk.parentIndexId);
       check(
-        fk.columnIds.length > 0 &&
-          fk.columnIds.every((id) => columns.has(id)) &&
-          parent !== undefined &&
-          parent.unique &&
-          parent.columnIds.length === fk.columnIds.length,
-        "Invalid stored foreign-key references",
+        fk.columnIds.length > 0 && fk.columnIds.every((id) => columns.has(id)),
+        "Invalid stored foreign-key columns",
       );
+      // Informational relationships survive the deliberate drop of their parent (shipped contract).
+      // An id outside the allocated namespace was never a valid parent, even informationally.
       check(
-        fk.supportIndexId === null || table.indexes.some((i) => i.id === fk.supportIndexId),
-        "Missing stored foreign-key support index",
+        fk.parentTableId < data.counters.nextTableId &&
+          fk.parentIndexId < data.counters.nextIndexId,
+        "Unknown stored foreign-key identity",
+      );
+      if (fk.enforced || parentTable !== undefined)
+        check(
+          parent !== undefined &&
+            parent.unique &&
+            parent.columnIds.length === fk.columnIds.length &&
+            parent.columnIds.every((id, position) => {
+              const p = parentTable?.columns.find((c) => c.id === id);
+              const c = table.columns.find((c) => c.id === fk.columnIds[position]);
+              return p !== undefined && c !== undefined && samePhysicalType(p.type, c.type);
+            }),
+          "Invalid stored foreign-key references",
+        );
+      const support = table.indexes.find((i) => i.id === fk.supportIndexId);
+      check(!fk.enforced || support !== undefined, "Missing stored foreign-key support index");
+      check(
+        fk.supportIndexId === null ||
+          (support !== undefined &&
+            support.columnIds.length >= fk.columnIds.length &&
+            fk.columnIds.every((id, position) => support.columnIds[position] === id)),
+        "Invalid stored foreign-key support columns",
       );
     }
   }
@@ -803,22 +846,6 @@ export function encodeLogged(change: LoggedChange, allocator?: BufferAllocator):
   return encodeCatalogChange(change, allocator);
 }
 
-function validateStoredType(type: PhysicalType, depth = 0): void {
-  if (depth > 8) throw new StoreCorruptionError("Stored array type nesting exceeds its cap");
-  requireTag(type.kind, DURABLE_CODECS.physical, "stored physical type", StoreCorruptionError);
-  if (type.kind === "array") validateStoredType(type.element, depth + 1);
-  if (type.kind === "int32")
-    requireTag(type.bits, DURABLE_CODECS.int32Bits, "stored integer width", StoreCorruptionError);
-  if (type.kind === "json")
-    requireTag(type.binary, DURABLE_CODECS.jsonBoolean, "stored JSON mode", StoreCorruptionError);
-  if (type.kind === "timestamp")
-    requireTag(
-      type.zoned,
-      DURABLE_CODECS.jsonBoolean,
-      "stored timestamp mode",
-      StoreCorruptionError,
-    );
-}
 function positiveId(id: number): void {
   if (!Number.isSafeInteger(id) || id <= 0)
     throw new StoreCorruptionError("Invalid stored catalog id");
@@ -857,7 +884,8 @@ function validateStoredTable(table: TableDef): void {
   for (const column of table.columns) {
     positiveId(column.id);
     if (column.identitySequence !== null) positiveId(column.identitySequence);
-    validateStoredType(column.type);
+    validateCatalogType(column.type);
+    validateCatalogDeclared(column.declared, column.type);
     requireTag(
       column.nullable,
       DURABLE_CODECS.jsonBoolean,
@@ -901,13 +929,14 @@ function validateStoredTable(table: TableDef): void {
       );
     const missing = column.missing;
     if (missing !== null) {
+      validateCatalogMissing(missing, column.type);
       requireTag(
         missing.form,
         DURABLE_CODECS.vectorForm,
         "stored missing vector form",
         StoreCorruptionError,
       );
-      validateStoredType(missing.type);
+      validateCatalogType(missing.type);
       requireTag(
         missing.data.layout,
         DURABLE_CODECS.columnLayout,
@@ -968,12 +997,25 @@ export function decodeLogged(bytes: Uint8Array): LoggedChange {
       "catalog operation",
       StoreCorruptionError,
     );
+    if (
+      !Number.isSafeInteger(value.expectedVersion) ||
+      value.expectedVersion < 0 ||
+      !Number.isSafeInteger(value.version) ||
+      value.version < 1 ||
+      value.version < value.expectedVersion
+    )
+      throw new StoreCorruptionError("Invalid logged catalog version precondition");
     const fields = CATALOG_CHANGE_FIELDS[value.op];
     for (const name of fields)
       if (!Object.hasOwn(value, name))
         throw new StoreCorruptionError(`Missing logged catalog field ${name}`);
     for (const name of Object.keys(value))
-      if (name !== "op" && !(fields as readonly string[]).includes(name))
+      if (
+        name !== "op" &&
+        name !== "expectedVersion" &&
+        name !== "version" &&
+        !(fields as readonly string[]).includes(name)
+      )
         throw new StoreCorruptionError(`Unexpected logged catalog field ${name}`);
     const record = value as unknown as Record<string, unknown>;
     for (const name of ["tableId", "indexId", "sequenceId", "viewId", "typeId"] as const) {

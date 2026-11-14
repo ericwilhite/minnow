@@ -167,13 +167,21 @@ charge callbacks and checks capacities, overlap, refusal, constructor failures a
 ### Versioned catalog grammar
 
 `durable-format.ts` assigns MCAT1 logical records, MCRT1 native indexes, MCPG1 data pages and
-MCHG1 WAL changes. Required fields use registered numeric IDs; unknown required fields,
+MCHG1 WAL changes. Each field is an ID varuint, flags byte (bit 0 required), length varuint
+and payload. Field IDs span u53; every reserved flag bit refuses. Required fields use registered numeric IDs; unknown required fields,
 features and versions refuse. Optional display extensions remain opaque through rewrites.
 Records retain exact typed vectors, decimal coefficients, bigint sequence settings and UTF8
 identifier boundaries. An individual record is capped at 4 MiB. Catalogs stream one admitted
 record at a time across 256 KiB pages and 64-way indexes, including records crossing pages.
 Read/abort/cancel paths return codec IO and temporary graph-validation charges. This does not
 claim new accounting for the existing CatalogView definition residency model.
+
+Catalog admission checks per-kind fields, declared/physical type agreement, exact missing-value
+shapes and FK support-key coherence. Enforced references require a live matching parent;
+informational references may retain the allocated identity of a dropped parent. MCHG changes
+carry their expected predecessor and live-assigned resulting catalog version. Recovery checks
+the complete atomic catalog chain before applying any row, sequence or catalog effect, preserving
+version gaps from rolled-back DDL. DROP TABLE carries its MCHG definition too.
 
 The manifest names the catalog tree, not a JSON blob. Reachability checks child depth and
 summaries plus contiguous fragment offsets, and reclamation retires every old index/data page.

@@ -81,7 +81,8 @@ const inherited = (parent: string, decoder: string, fields: readonly FormatField
   }) as const satisfies Format;
 
 export const DURABLE_CODECS = {
-  catalogTypedArray: { uint8: 1, int32: 2, uint32: 3, float32: 4, float64: 5, int64: 6 },
+  catalogFieldFlags: { required: 1, knownMask: 1 },
+  catalogTypedArray: { uint8: 1, int32: 2, uint32: 3, float32: 4, float64: 5, int64: 6, uint16: 7 },
   catalogStorage: { typed: 0, expanded: 1 },
   checksum: {
     blob: "xxHash32",
@@ -339,7 +340,7 @@ export const CATALOG_RECORD_SCHEMAS = {
     "declaredTypeName:s~",
     "declaredLength:length~",
   ],
-  domain: ["kind:s", "precision:u~", "scale:n~", "element:s~", "name:s~", "values:[s]~"],
+  domain: ["kind:s", "precision:u~", "scale:n?~", "element:s~", "name:s~", "values:[s]~"],
   length: ["length:u", "fixed:b"],
   index: [
     "id:u",
@@ -381,16 +382,16 @@ export const CATALOG_RECORD_SCHEMAS = {
     "layout:s",
     "values:vectorValues~",
     "coefficients:integerValues~",
-    "scale:n~",
-    "scales:typed~",
-    "specials:typed~",
+    "scale:n?~",
+    "scales:typed?~",
+    "specials:typed?~",
     "offsets:typed~",
     "bytes:typed~",
     "months:typed~",
     "days:typed~",
     "micros:integerValues~",
   ],
-  integerValues: ["repr:s", "values:integerArray"],
+  integerValues: ["repr:s", "values:integerArray~", "limbs:typed~"],
   change: [
     "op:s",
     "table:table~",
@@ -404,6 +405,8 @@ export const CATALOG_RECORD_SCHEMAS = {
     "viewId:u~",
     "type:namedType~",
     "typeId:u~",
+    "expectedVersion:u",
+    "version:u",
   ],
   section: ["kind:u", "count:u"],
 } as const;

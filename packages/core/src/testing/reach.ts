@@ -5670,6 +5670,7 @@ export const CATALOG_RECORD_REACH = [
   "small field id",
   "wide field id",
   "maximum field id",
+  "reserved field flags refused",
 ] as const;
 
 export const CATALOG_PAGE_REACH = [
@@ -5772,4 +5773,51 @@ export const CATALOG_RECYCLE_REACH = [
   "publish-held sequence reservation",
   "deferral observed",
   "reserved values durable",
+] as const;
+
+export const CATALOG_REVIEW_REACH = [
+  "enum missing labels",
+  "enum empty labels",
+  "missing vector huge length",
+  "missing vector short data",
+  "declared mismatch",
+  "physical wrong conditional field",
+  "physical missing width",
+  "decimal missing precision",
+  "vector wrong layout",
+  "support wrong columns",
+  "missing support",
+  "parent key type",
+  "short validity",
+  "array missing element",
+] as const;
+
+export const CATALOG_INFORMATIONAL_REACH = ["sim", "memory", "checkpoint", "WAL only"] as const;
+export const CATALOG_WAL_VERSION_REACH = [
+  "sim",
+  "memory",
+  "live-assigned version gap preserved",
+  "bad predecessor refused",
+  "no earlier row effect applied",
+] as const;
+
+export const CATALOG_MISSING_REACH = [
+  "bool",
+  "i32",
+  "f32",
+  "f64",
+  "int64",
+  "fixed16",
+  "interval",
+  "decimal",
+  "varlen",
+  "safe",
+  "int128",
+  "wide",
+  "per-value scale",
+  "scale-only declaration",
+  "length",
+  "validity",
+  "type",
+  "conditional payload",
 ] as const;

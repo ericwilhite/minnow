@@ -13,7 +13,11 @@ compatibility policy and release process.
 The unexported rebuild replaces generic JSON catalog persistence with versioned binary catalog
 records, bounded native catalog pages and matching logged catalog changes. Unknown required
 fields and versions are refused; exact typed values and optional display extensions survive
-rewrites. Reachability and reclamation include every catalog page. This changes unreleased
+rewrites. Reachability and reclamation include every catalog page. Fields use separate ID and flag
+bytes; reserved flags and inconsistent type, vector and reference shapes are refused. Logged
+catalog changes bind their expected predecessor and resulting version before row replay.
+Informational foreign keys may retain a dropped parent across checkpoint and reopen.
+This changes unreleased
 rebuild bytes only (reader 3, manifest 4, commit body 2); no supported next/ writer has shipped.
 The published 0.x engine and its stored formats are unchanged; no migration is needed.
 

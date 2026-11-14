@@ -3,7 +3,7 @@ import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, CATALOG_GRAPH_REACH, CATALOG_LOG_SHAPE_REACH } from "../../testing/reach.js";
-import { Catalog, decodeLogged, type LoggedChange } from "./catalog.js";
+import { Catalog, decodeLogged, type LoggedChange, type CatalogOperation } from "./catalog.js";
 import { tableInput, column, INT } from "./test-support.js";
 import {
   encodeCatalogStream,
@@ -165,7 +165,7 @@ it.each(seedsFor("next-catalog-log-shape", [0xb760, 0xb761]))(
       cycle: false,
       ownedBy: null,
     };
-    const operations: LoggedChange[] = [
+    const inputs: CatalogOperation[] = [
       { op: "createTable", table, sequences: [] },
       { op: "dropTable", tableId: 1 },
       { op: "createIndex", index },
@@ -178,6 +178,11 @@ it.each(seedsFor("next-catalog-log-shape", [0xb760, 0xb761]))(
       { op: "createType", type: { id: 1, name: "typ", labels: ["a"] } },
       { op: "dropType", typeId: 1 },
     ];
+    const operations: LoggedChange[] = inputs.map((operation) => ({
+      ...operation,
+      expectedVersion: 0,
+      version: 1,
+    }));
     const reach = createReach("catalog log shape", CATALOG_LOG_SHAPE_REACH);
     fc.assert(
       fc.property(

@@ -471,7 +471,7 @@ export type BodyEffect =
       readonly schemaVersion: number;
       readonly definition: Uint8Array;
     }
-  | { readonly kind: "dropTable"; readonly tableId: number }
+  | { readonly kind: "dropTable"; readonly tableId: number; readonly definition: Uint8Array }
   /** Views, sequences, indexes: catalog state with no table schema change. */
   | { readonly kind: "catalog"; readonly definition: Uint8Array }
   /** A sequence block reservation: the sequence's new reserved-through value. */

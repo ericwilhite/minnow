@@ -1133,6 +1133,25 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const effects: Effect[] = body.effects.map((effect) => replayEffect(effect));
     if (body.request !== null) effects.push({ kind: "request" });
     const decisions = replayer.next(lsn, effects);
+    // Validate the entire atomic catalog chain before applying any row/sequence/catalog effect.
+    let predecessor = this.#catalog.version;
+    let firstCatalog = true;
+    for (let i = 0; i < body.effects.length; i++) {
+      const effect = need(body.effects[i]);
+      if (
+        decisions[i] &&
+        (effect.kind === "catalog" || effect.kind === "createTable" || effect.kind === "dropTable")
+      ) {
+        const change = need(decodeCatalogEffect(effect));
+        if (
+          change.expectedVersion !== predecessor ||
+          (firstCatalog && change.version <= predecessor)
+        )
+          throw new LogCorruptionError("A logged catalog change has the wrong predecessor");
+        predecessor = change.version;
+        firstCatalog = false;
+      }
+    }
     let published: Set<number> | null = null;
     for (let k = 0; k < body.effects.length; k++) {
       if (decisions[k] !== true) continue;
@@ -1180,12 +1199,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   async #replayCatalog(effect: BodyEffect, lsn: number): Promise<void> {
-    let change: LoggedChange;
-    if (effect.kind === "dropTable") change = { op: "dropTable", tableId: effect.tableId };
-    else if (effect.kind === "createTable" || effect.kind === "catalog")
-      change = decodeLogged(effect.definition);
-    else return;
-    const catalog = this.#catalog.apply(change, ++this.#version);
+    const change = decodeCatalogEffect(effect);
+    if (change === null) return;
+    const catalog = this.#catalog.apply(change, change.version);
+    this.#version = Math.max(this.#version, change.version);
     this.#catalog = catalog;
     this.#catalogHistory.push({ lsn, catalog });
     if (change.op === "createTable") {
@@ -5101,4 +5118,20 @@ class DeltaPublication {
 /** `openWritePath` (access/write-path.ts `OpenWritePath`). */
 export async function openWritePath(input: OpenWritePathInput): Promise<WritePath> {
   return WritePathImpl.open(input);
+}
+
+/** A WAL table effect and its MCHG definition must name the same operation and identity. */
+function decodeCatalogEffect(effect: BodyEffect): LoggedChange | null {
+  if (effect.kind !== "catalog" && effect.kind !== "createTable" && effect.kind !== "dropTable")
+    return null;
+  const change = decodeLogged(effect.definition);
+  if (
+    (effect.kind === "createTable" &&
+      (change.op !== "createTable" || change.table.id !== effect.tableId)) ||
+    (effect.kind === "dropTable" &&
+      (change.op !== "dropTable" || change.tableId !== effect.tableId)) ||
+    (effect.kind === "catalog" && (change.op === "createTable" || change.op === "dropTable"))
+  )
+    throw new LogCorruptionError("A catalog effect disagrees with its logged definition");
+  return change;
 }

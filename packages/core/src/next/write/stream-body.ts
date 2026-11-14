@@ -331,17 +331,19 @@ export async function streamBody(
     switch (effect.kind) {
       case "catalog": {
         const change = effect.change;
-        if (change.op === "dropTable") {
-          writer.u8(KIND.dropTable);
-          writer.varuint(change.tableId);
-        } else {
-          writer.u8(change.op === "createTable" ? KIND.createTable : KIND.catalog);
-          if (change.op === "createTable") writer.varuint(change.table.id);
-          const length = catalogChangeByteLength(change);
-          writer.varuint(length);
-          if (writer.intersects(length)) writeCatalogChange(writer, change);
-          else writer.skip(length);
-        }
+        writer.u8(
+          change.op === "dropTable"
+            ? KIND.dropTable
+            : change.op === "createTable"
+              ? KIND.createTable
+              : KIND.catalog,
+        );
+        if (change.op === "dropTable") writer.varuint(change.tableId);
+        if (change.op === "createTable") writer.varuint(change.table.id);
+        const length = catalogChangeByteLength(change);
+        writer.varuint(length);
+        if (writer.intersects(length)) writeCatalogChange(writer, change);
+        else writer.skip(length);
         break;
       }
       case "published":

@@ -11,7 +11,7 @@ import {
   decodeCatalogRecord,
   UnsupportedCatalogError,
 } from "./catalog-records.js";
-function append(source: Uint8Array, tag: number, payload: Uint8Array): Uint8Array {
+function append(source: Uint8Array, id: number, payload: Uint8Array, flags = 0): Uint8Array {
   const r = new ByteReader(source),
     kind = r.varuint(),
     version = r.varuint(),
@@ -19,7 +19,8 @@ function append(source: Uint8Array, tag: number, payload: Uint8Array): Uint8Arra
   r.end();
   const b = new ByteWriter();
   b.raw(body);
-  b.varuint(tag);
+  b.varuint(id);
+  b.u8(flags);
   b.blob(payload);
   const out = new ByteWriter();
   out.varuint(kind);
@@ -36,7 +37,7 @@ it.each(seedsFor("next-catalog-records", [0xb750, 0xb751]))(
         fc.string({ maxLength: 400 }),
         fc.bigInt({ min: -(2n ** 63n), max: 2n ** 63n - 1n }),
         fc.boolean(),
-        fc.integer({ min: 100, max: Math.floor(Number.MAX_SAFE_INTEGER / 2) }),
+        fc.integer({ min: 100, max: Number.MAX_SAFE_INTEGER }),
         async (name, start, cycle, fieldId) => {
           reach.beginHistory();
           const sequence = {
@@ -77,7 +78,7 @@ it.each(seedsFor("next-catalog-records", [0xb750, 0xb751]))(
             }
             expect(live).toBe(0);
             reach.reach("single charged output");
-            const optional = append(encoded.bytes, fieldId * 2, new Uint8Array([0xff, 0x00, 0x80]));
+            const optional = append(encoded.bytes, fieldId, new Uint8Array([0xff, 0x00, 0x80]));
             const restored = encodeCatalogRecord(
               "sequence",
               decodeCatalogRecord("sequence", optional),
@@ -88,14 +89,18 @@ it.each(seedsFor("next-catalog-records", [0xb750, 0xb751]))(
               restored.close();
             }
             reach.reach("unknown optional retained");
+            for (const flags of [2, 4, 8, 16, 32, 64, 128, 254])
+              expect(() =>
+                decodeCatalogRecord(
+                  "sequence",
+                  append(encoded.bytes, fieldId, new Uint8Array(), flags),
+                ),
+              ).toThrow(StoreCorruptionError);
+            reach.reach("reserved field flags refused");
             reach.reach(fieldId <= 65535 ? "small field id" : "wide field id");
-            if (fieldId === Math.floor(Number.MAX_SAFE_INTEGER / 2))
-              reach.reach("maximum field id");
+            if (fieldId === Number.MAX_SAFE_INTEGER) reach.reach("maximum field id");
             expect(() =>
-              decodeCatalogRecord(
-                "sequence",
-                append(encoded.bytes, fieldId * 2 + 1, new Uint8Array()),
-              ),
+              decodeCatalogRecord("sequence", append(encoded.bytes, fieldId, new Uint8Array(), 1)),
             ).toThrow(UnsupportedCatalogError);
             reach.reach("unknown required refused");
             expect(() =>
@@ -103,7 +108,7 @@ it.each(seedsFor("next-catalog-records", [0xb750, 0xb751]))(
             ).toThrow(StoreCorruptionError);
             reach.reach("truncated refused");
             expect(() =>
-              decodeCatalogRecord("sequence", append(encoded.bytes, 3, new Uint8Array([1]))),
+              decodeCatalogRecord("sequence", append(encoded.bytes, 1, new Uint8Array([1]), 1)),
             ).toThrow(StoreCorruptionError);
             reach.reach("duplicate/out-of-order refused");
           } finally {
@@ -116,7 +121,7 @@ it.each(seedsFor("next-catalog-records", [0xb750, 0xb751]))(
         numRuns: 24,
         examples: [
           ["\ufeffCase.汉", -9223372036854775808n, false, 100],
-          ["quoted.name", 9223372036854775807n, true, Math.floor(Number.MAX_SAFE_INTEGER / 2)],
+          ["quoted.name", 9223372036854775807n, true, Number.MAX_SAFE_INTEGER],
         ],
       },
     );
@@ -182,4 +187,24 @@ it("rejects noncanonical integers and unsupported record versions", () => {
   expect(() => encodeCatalogRecord("view", { id: 1, name: "\ud800", bodySql: "SELECT 1" })).toThrow(
     StoreCorruptionError,
   );
+});
+
+/** Hand-authored approved grammar, independent of the encoder's sizing/tag helpers. */
+it("matches the independent field-id/flags/length golden fixture", () => {
+  const golden = Uint8Array.of(14, 1, 14, 1, 1, 1, 7, 2, 1, 2, 1, 97, 3, 1, 2, 1, 81);
+  const view = { id: 7, name: "a", bodySql: "Q" };
+  expect(decodeCatalogRecord("view", golden)).toEqual(view);
+  // Exhaust the flags byte independently: this known required field admits exactly bit 0.
+  for (let flags = 0; flags <= 255; flags++) {
+    if (flags === 1) continue;
+    const invalid = golden.slice();
+    invalid[4] = flags;
+    expect(() => decodeCatalogRecord("view", invalid)).toThrow(StoreCorruptionError);
+  }
+  const encoded = encodeCatalogRecord("view", view);
+  try {
+    expect(encoded.bytes).toEqual(golden);
+  } finally {
+    encoded.close();
+  }
 });

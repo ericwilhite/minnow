@@ -6,7 +6,7 @@
  *   varuint effectCount; effects, each `u8 kind` then:
  *     1 createTable   varuint tableId, blob definition
  *     2 alterTable    varuint tableId, varuint schemaVersion, blob definition
- *     3 dropTable     varuint tableId
+ *     3 dropTable     varuint tableId, blob definition
  *     4 catalog       blob definition
  *     5 sequence      varuint sequenceId, bigint reservedThrough
  *     6 rows          varuint tableId, varuint schemaVersion,
@@ -62,6 +62,7 @@ export function encodeBody(body: CommitFrameBody, into?: ByteWriter): Uint8Array
         break;
       case "dropTable":
         writer.varuint(effect.tableId);
+        writer.blob(effect.definition);
         break;
       case "catalog":
         writer.blob(effect.definition);
@@ -152,7 +153,7 @@ function decodeEffect(reader: ByteReader): BodyEffect {
         definition: reader.blob().slice(),
       };
     case KIND.dropTable:
-      return { kind: "dropTable", tableId: reader.varuint() };
+      return { kind: "dropTable", tableId: reader.varuint(), definition: reader.blob().slice() };
     case KIND.catalog:
       return { kind: "catalog", definition: reader.blob().slice() };
     case KIND.sequence:
