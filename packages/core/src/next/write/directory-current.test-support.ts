@@ -313,11 +313,12 @@ export function currentDirectoryFixture(
         const legacy = decodeJson(raw(recipe.catalog)) as CatalogStreamData;
         const data = Catalog.fromStored({
           ...legacy,
-          // These archived JSON recipes predate FTS. Supply current logical declarations,
-          // never defaults in the ordinary stored decoder or an old-root upgrade path.
+          // These archived JSON recipes predate FTS and triggers. Supply current logical
+          // declarations, never defaults in the ordinary stored decoder or an old-root upgrade
+          // path.
           fts: [],
           triggers: [],
-          counters: { ...legacy.counters, nextFtsId: 1 },
+          counters: { ...legacy.counters, nextFtsId: 1, nextTriggerId: 1 },
         }).encode();
         const extents = recipe.extentList
           .flatMap((page) => decodeListPage(raw(page.blob), page))
