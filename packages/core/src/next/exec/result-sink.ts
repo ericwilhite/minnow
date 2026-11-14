@@ -56,7 +56,7 @@ export const resultFrameMetadataBytes = (columns: number): number =>
  * its initial 64 bytes while resizing. Producer buffers are charged elsewhere;
  * the ordinary frame window funds bounded small/multi-row attempts. */
 export function resultRowStepBytes(widths: readonly number[]): number {
-  return widths.reduce((n, width) => n + Math.max(64, width), 0) + 64 + 4096 + 256 * widths.length;
+  return widths.reduce((n, width) => n + Math.max(64, width), 0) + 64 + 4096 + 288 * widths.length;
 }
 
 export class ResultSink implements Operator {

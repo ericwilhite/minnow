@@ -99,7 +99,7 @@ shrink the funded step. Buffer allocation consumes that charge once; the next
 boundary releases any unused credit before asking for growth, and close releases
 it on cancellation. Other unused optional capacity remains reclaimable.
 
-Result progress follows the row actually delivered. Fixed aggregate results such as
+Aggregate result progress follows the row actually delivered. Fixed aggregate results such as
 COUNT do not inherit discarded TEXT inputs or unreturned grouping keys. Reachable
 CASE/COALESCE/NULLIF outputs retain their own width provenance; unknown expanding
 producers keep the complete fallback recipe. The sink's one-row retry uses exact
@@ -107,14 +107,20 @@ arenas (`targetBytes=0`), one field's initial-buffer overlap, and frame metadata
 counting each delivered alias once. A known complete row is ordinary result
 minimum credit, so copying it cannot grow while its own progress reservation sits
 unused. Explicit result-owned checkpoint envelopes
-continue to take precedence. Source result widths need an extra metadata pass only
+continue to take precedence. This refines the existing recipe only when tighter; plain or expanding expression
+delivery keeps its existing recipe. Source result widths need an extra metadata pass only
 when the ordinary complete minimum exceeds the cap.
 
 Before refusing that minimum, an unfiltered scan can retry its sizing and execution
 at one row per step. Directories, dictionary and encoded-page overlap stay charged;
 only large decoded payloads switch from an interval sum to a per-row maximum. The
 same row bound reaches TableScan and survives in the aggregate continuation's
-scalar width facts. No producer is opened during this decision. Reduced result
+scalar width facts. Only an actually over-cap chosen strategy selects this retry;
+dormant external helpers cannot inflate that decision. Value facts are measured
+per referenced column, excluding whole dictionary/codebook costs, and include
+the reader’s value-byte bound: a small progress
+floor alone does not bound a wide inline or dictionary cell. No producer is opened
+during this decision. Reduced result
 credit returns to shared admission without increasing this execution's speculative
 operator-growth target: allocation denial still selects the existing split/spill
 path. This growth policy holds no reservation, cannot block another execution,

@@ -7,6 +7,7 @@ import { createReach, HASH_RESULT_PROGRESS_REACH } from "../../testing/reach.js"
 import { Governor } from "../memory/governor.js";
 import { TableScan } from "../exec/table-scan.js";
 import { QueryRuntime } from "../exec/run.js";
+import * as reads from "../page/read-bounds.js";
 import { taskClock } from "../task.js";
 import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
@@ -20,6 +21,7 @@ const admit = Governor.prototype.admitGroup;
 const transfer = Governor.prototype.transferCredit;
 // eslint-disable-next-line @typescript-eslint/unbound-method -- original receiver supplied
 const next = TableScan.prototype.next;
+const boundSource = reads.boundSource;
 afterEach(() => vi.restoreAllMocks());
 it.each(seedsFor("hash-result-progress", [0xb7c3, 0xb7c4]))(
   "funds only emitted output and preserves fitting peaks seed%i",
@@ -95,6 +97,17 @@ it.each(seedsFor("hash-result-progress", [0xb7c3, 0xb7c4]))(
               try {
                 mocks.push(vi.spyOn(taskClock, "now").mockImplementation(() => ++tick));
                 taskClock.begin();
+                if (legacy)
+                  mocks.push(
+                    vi.spyOn(reads, "boundSource").mockImplementation((view, source, ...rest) => {
+                      // The frozen parent had no enforced one-row source recipe. Keep
+                      // its real full-step reader bound, not a cheaper candidate route
+                      // triggered by the parent's larger result reservation.
+                      const { batchRows: ignored, ...full } = source;
+                      void ignored;
+                      return boundSource(view, full, ...rest);
+                    }),
+                  );
                 if (legacy && Object.hasOwn(QueryRuntime.prototype, "resultRowProgress"))
                   mocks.push(
                     vi

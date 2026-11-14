@@ -5794,3 +5794,13 @@ export const HASH_RESULT_PROGRESS_REACH = [
   "PG exact",
   "zero",
 ] as const;
+
+export const HASH_SOURCE_VALUE_REACH = [
+  "progress floor insufficient",
+  "large values",
+  "UTF8",
+  "repeated rows",
+  "multiple columns",
+  "charged sizing",
+  "zero",
+] as const;

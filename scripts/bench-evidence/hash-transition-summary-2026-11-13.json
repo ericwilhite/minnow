@@ -270,10 +270,10 @@
     "higherQueryPeaks": 0,
     "higherUnpinnedTotalPeaks": 0,
     "maxQueryPeakDelta": 0,
-    "maxQueryPeakSaving": 11915280,
+    "maxQueryPeakSaving": 5613584,
     "rawHashes": {
       "compare-control.log": "dd098bd4815f753892e82946380cf1e869f3a68eeb1ccdab2a60b339d027d339",
-      "compare-candidate.log": "e42c44265f11e9f468d2a9db6d8de5167f1b8c8f6cda5625ba6da1507140363c",
+      "compare-candidate.log": "2372c6065beb19bb24445ee6cee87d75d783923db05aa4c722b6c55e76492b2c",
       "pg-audit.log": "7e8ac08f212dcb80e3b499cf1146979b958f185558a75cf323beecca414f34e0"
     },
     "termOrder": ["read", "result", "source", "projects", "aggregate", "helpers", "other"],
@@ -641,125 +641,125 @@
       {
         "case": ["column", "short", 1, 16, false, false],
         "oldMinimum": 19484807,
-        "initialTerms": [800000, 1048576, 4285823, 37124, 2651140, 1048576, 0],
-        "minimum": 9871239,
-        "largestPassMinimum": 9871239,
-        "peak": 9871240,
+        "initialTerms": [1600000, 1048576, 7485823, 37124, 2651140, 1048576, 0],
+        "minimum": 13871239,
+        "largestPassMinimum": 13871239,
+        "peak": 13871239,
         "irreducibleTerm": null,
         "PGexact": true
       },
       {
         "case": ["column", "short", 1, 16, true, false],
         "oldMinimum": 19484807,
-        "initialTerms": [800000, 1048576, 4285823, 37124, 2651140, 1048576, 0],
-        "minimum": 9871239,
-        "largestPassMinimum": 9871239,
-        "peak": 9871239,
+        "initialTerms": [1600000, 1048576, 7485823, 37124, 2651140, 1048576, 0],
+        "minimum": 13871239,
+        "largestPassMinimum": 13871239,
+        "peak": 13871239,
         "irreducibleTerm": null,
         "PGexact": true
       },
       {
         "case": ["column", "short", 2, 16, false, false],
         "oldMinimum": 19521931,
-        "initialTerms": [800000, 1048576, 4285823, 74248, 2651140, 1048576, 0],
-        "minimum": 9908363,
-        "largestPassMinimum": 9908363,
-        "peak": 9908365,
+        "initialTerms": [1600000, 1048576, 7485823, 74248, 2651140, 1048576, 0],
+        "minimum": 13908363,
+        "largestPassMinimum": 13908363,
+        "peak": 13908363,
         "irreducibleTerm": null,
         "PGexact": true
       },
       {
         "case": ["column", "short", 2, 16, true, false],
         "oldMinimum": 19521931,
-        "initialTerms": [800000, 1048576, 4285823, 74248, 2651140, 1048576, 0],
-        "minimum": 9908363,
-        "largestPassMinimum": 9908363,
-        "peak": 9908363,
+        "initialTerms": [1600000, 1048576, 7485823, 74248, 2651140, 1048576, 0],
+        "minimum": 13908363,
+        "largestPassMinimum": 13908363,
+        "peak": 13908363,
         "irreducibleTerm": null,
         "PGexact": true
       },
       {
         "case": ["column", "short", 4, 16, false, false],
         "oldMinimum": 19579795,
-        "initialTerms": [800000, 1048576, 4285823, 132112, 2651140, 1048576, 0],
-        "minimum": 9966227,
-        "largestPassMinimum": 9966227,
-        "peak": 9966231,
+        "initialTerms": [1600000, 1048576, 7485823, 132112, 2651140, 1048576, 0],
+        "minimum": 13966227,
+        "largestPassMinimum": 13966227,
+        "peak": 13966227,
         "irreducibleTerm": null,
         "PGexact": true
       },
       {
         "case": ["column", "short", 4, 16, true, false],
         "oldMinimum": 19579795,
-        "initialTerms": [800000, 1048576, 4285823, 132112, 2651140, 1048576, 0],
-        "minimum": 9966227,
-        "largestPassMinimum": 9966227,
-        "peak": 9966227,
+        "initialTerms": [1600000, 1048576, 7485823, 132112, 2651140, 1048576, 0],
+        "minimum": 13966227,
+        "largestPassMinimum": 13966227,
+        "peak": 13966227,
         "irreducibleTerm": null,
         "PGexact": true
       },
       {
         "case": ["column", "short", 8, 16, false, false],
         "oldMinimum": 19695523,
-        "initialTerms": [800000, 1048576, 4285823, 247840, 2651140, 1048576, 0],
-        "minimum": 10081955,
-        "largestPassMinimum": 10081955,
-        "peak": 10081963,
+        "initialTerms": [1600000, 1048576, 7485823, 247840, 2651140, 1048576, 0],
+        "minimum": 14081955,
+        "largestPassMinimum": 14081955,
+        "peak": 14081955,
         "irreducibleTerm": null,
         "PGexact": true
       },
       {
         "case": ["column", "short", 8, 16, true, false],
         "oldMinimum": 19695523,
-        "initialTerms": [800000, 1048576, 4285823, 247840, 2651140, 1048576, 0],
-        "minimum": 10081955,
-        "largestPassMinimum": 10081955,
-        "peak": 10081955,
+        "initialTerms": [1600000, 1048576, 7485823, 247840, 2651140, 1048576, 0],
+        "minimum": 14081955,
+        "largestPassMinimum": 14081955,
+        "peak": 14081955,
         "irreducibleTerm": null,
         "PGexact": true
       },
       {
         "case": ["column", "short", 12, 16, false, false],
         "oldMinimum": 19811251,
-        "initialTerms": [800000, 1048576, 4285823, 363568, 2651140, 1048576, 0],
-        "minimum": 10197683,
-        "largestPassMinimum": 10197683,
-        "peak": 10197695,
+        "initialTerms": [1600000, 1048576, 7485823, 363568, 2651140, 1048576, 0],
+        "minimum": 14197683,
+        "largestPassMinimum": 14197683,
+        "peak": 14197683,
         "irreducibleTerm": null,
         "PGexact": true
       },
       {
         "case": ["column", "short", 12, 16, true, false],
         "oldMinimum": 19811251,
-        "initialTerms": [800000, 1048576, 4285823, 363568, 2651140, 1048576, 0],
-        "minimum": 10197683,
-        "largestPassMinimum": 10197683,
-        "peak": 10197683,
+        "initialTerms": [1600000, 1048576, 7485823, 363568, 2651140, 1048576, 0],
+        "minimum": 14197683,
+        "largestPassMinimum": 14197683,
+        "peak": 14197683,
         "irreducibleTerm": null,
         "PGexact": true
       },
       {
         "case": ["column", "short", 16, 16, false, false],
         "oldMinimum": 19926979,
-        "initialTerms": [800000, 1048576, 4285823, 479296, 2651140, 1048576, 0],
-        "minimum": 10313411,
-        "largestPassMinimum": 10313411,
-        "peak": 10313427,
+        "initialTerms": [1600000, 1048576, 7485823, 479296, 2651140, 1048576, 0],
+        "minimum": 14313411,
+        "largestPassMinimum": 14313411,
+        "peak": 14313411,
         "irreducibleTerm": null,
         "PGexact": true
       },
       {
         "case": ["column", "short", 16, 16, true, false],
         "oldMinimum": 19926979,
-        "initialTerms": [800000, 1048576, 4285823, 479296, 2651140, 1048576, 0],
-        "minimum": 10313411,
-        "largestPassMinimum": 10313411,
-        "peak": 10313411,
+        "initialTerms": [1600000, 1048576, 7485823, 479296, 2651140, 1048576, 0],
+        "minimum": 14313411,
+        "largestPassMinimum": 14313411,
+        "peak": 14313411,
         "irreducibleTerm": null,
         "PGexact": true
       }
     ],
-    "reproduction": "node node_modules/vitest/vitest.mjs run packages/core/src/next/testing/executor-result-progress.test.ts packages/core/src/next/testing/executor-hash-transition.test.ts --maxWorkers=2",
+    "reproduction": "node node_modules/vitest/vitest.mjs run packages/core/src/next/testing/executor-result-progress.test.ts packages/core/src/next/testing/executor-hash-transition.test.ts packages/core/src/next/testing/executor-source-value-bound.test.ts --maxWorkers=2",
     "rawRoot": "/home/eric/.cache/b4-hash-review-2",
     "generators": {
       "keyTransition": {
@@ -812,6 +812,56 @@
         "rejected": true
       }
     ],
-    "verification": "Current focused5files39tests/core typecheck/changed-file lint green. Exact-tip full gate and fresh-process guards will be recorded in rawRoot before reporting. Earlier top-level CPU records are historical, not reused."
+    "verification": "Current8files45tests/core typecheck/changed lint GREEN. Superseded f8dd gate/CPU remain in rawRoot; final exact-tip gate and fresh guard will be recorded separately before reporting.",
+    "inlineFollowup": {
+      "authority": "ReadBound.valueBytes conservative cell bound; progress may remain65536 for64001-byte inline values.",
+      "selection": "Size chosen native lanes before retry; one selection on ordinary path. Refine result only for aggregate plans and only when tighter.",
+      "sources": "Single-value bounds per referenced column; no whole dictionary as one cell.",
+      "seeds": [47045, 47046],
+      "runs": 14,
+      "fixed": 4,
+      "random": 10,
+      "reach": [
+        "progress floor insufficient",
+        "large values",
+        "UTF8",
+        "repeated rows",
+        "multiple columns",
+        "charged sizing",
+        "zero"
+      ],
+      "proof": [
+        {
+          "name": "inline-RED-parent",
+          "exit": 1,
+          "rejected": true,
+          "seconds": 6.009964998927899,
+          "command": [
+            "node",
+            "node_modules/vitest/vitest.mjs",
+            "run",
+            "packages/core/src/next/testing/executor-source-value-bound.test.ts",
+            "--config",
+            "/home/eric/.cache/b4-hash-review-2/gate/vitest-star-two.mts",
+            "--maxWorkers=2"
+          ]
+        },
+        {
+          "name": "inline-mutant-progress-only",
+          "exit": 1,
+          "rejected": true,
+          "seconds": 6.111117382068187,
+          "command": [
+            "node",
+            "node_modules/vitest/vitest.mjs",
+            "run",
+            "packages/core/src/next/testing/executor-source-value-bound.test.ts",
+            "--config",
+            "/home/eric/.cache/b4-hash-review-2/gate/vitest-star-two.mts",
+            "--maxWorkers=2"
+          ]
+        }
+      ]
+    }
   }
 }

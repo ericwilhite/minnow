@@ -1,7 +1,13 @@
 /** Per-value admission provenance. Unknown expanding expressions retain the legacy recipe.
  * Walks only plan metadata: no evaluation, caller-value reads or JSON/data allocation. */
 import { constantNull, constantBool } from "./expression-reach.js";
+import type { ReadBound } from "../page/read-bounds.js";
 import type { Rel, ScalarExpr } from "../ir/ir.js";
+/** Progress may be only its floor for inline/dictionary pages. The separately
+ * reported logical value bound still covers every decoded cell. */
+export function sourceValueBytes(bound: Pick<ReadBound, "progress" | "valueBytes">): number {
+  return Math.max(bound.progress / 4, bound.valueBytes ?? 0);
+}
 export interface InputSizes {
   parameter(slot: number): number;
   source(id: number, column: number, coefficient: number): number | null;

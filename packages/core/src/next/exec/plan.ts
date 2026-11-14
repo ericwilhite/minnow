@@ -1,4 +1,9 @@
-import { columnInputBytes, expressionInputBytes, projectedInputBytes } from "./input-size-plan.js";
+import {
+  columnInputBytes,
+  expressionInputBytes,
+  projectedInputBytes,
+  sourceValueBytes,
+} from "./input-size-plan.js";
 import { KeyLayout } from "./join-keys.js";
 import { byteArrayGroupKey } from "./agg/json-array-key.js";
 import {
@@ -2659,8 +2664,11 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       }
       return resultRowStepBytes(widths);
     };
-    const knownResult = resultWidth([], 0, true) !== null;
-    runtime.resultRowProgress((slots, largest) => resultWidth(slots, largest));
+    // This recipe belongs to aggregate outputs/unreturned grouping keys. Keep plain
+    // source/expression delivery on its existing envelope, including expanding kernels.
+    const aggregateResult = aggregatePlanners.size + jsonAggregateRecipes.size > 0;
+    const knownResult = aggregateResult && resultWidth([], 0, true) !== null;
+    if (aggregateResult) runtime.resultRowProgress((slots, largest) => resultWidth(slots, largest));
     let semanticActive = active;
     const jsonGroups = [...jsonAggregateRecipes.values()].filter(
       (p) => p.loans > 1 && active.has(p.rel.id),
@@ -3019,9 +3027,18 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     const sources = [...readSources.values()].filter((source) => active.has(source.id));
     const bounds = new Map<number, ReadBound>();
     // Publication-stable row facts survive producer retirement, without retaining input.
-    const boundedSourceRows = new Map<number, number>();
+    const boundedSourceRows = new Map<number, Map<number, number>>();
+    let boundedColumns: Map<number, Set<number>> | null = null;
     const aggregateLayout = (rel: Extract<Rel, { op: "aggregate" }>) =>
-      aggregateProgressLayout(rel, (source) => boundedSourceRows.get(source) ?? null);
+      aggregateProgressLayout(
+        rel,
+        (source, column) => boundedSourceRows.get(source)?.get(column) ?? null,
+      );
+    const configureChoice = (id: number, strategy: AggregateStrategy) => {
+      const planner = aggregatePlanners.get(id);
+      if (planner) runtime.aggregateProgress(id, strategy.kind, aggregateLayout(planner.rel));
+    };
+    let choicesReady = false;
     const chooseAggregates = () => runSliced(choose(), new Slice(Infinity), () => undefined);
     const choose = function* (): SlicedJob<void> {
       const selectedPercentiles = new Map<number, { bound: PercentileBound; minimum: number }>();
@@ -3109,6 +3126,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           }
         }
         choices.set(entry.rel.id, strategy);
+        configureChoice(entry.rel.id, strategy);
         entry.minimum = strategy.minimum;
         entry.loanSlots = strategy.loans;
       }
@@ -3121,12 +3139,14 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           const planner = aggregatePlanners.get(entry.rel.id),
             prior = choices.get(entry.rel.id);
           const fallback = planner?.hybrid ?? planner?.external;
-          if (!planner || !fallback || prior?.kind === fallback.kind) continue;
+          if (!planner || !fallback || !prior || prior.kind === fallback.kind) continue;
           const saved = { minimum: entry.minimum, loanSlots: entry.loanSlots };
           entry.minimum = fallback.minimum;
           entry.loanSlots = fallback.loans;
+          configureChoice(entry.rel.id, fallback);
           const candidate = runtime.minimumBytes(entries);
           Object.assign(entry, saved);
+          configureChoice(entry.rel.id, prior);
           if (candidate < total) {
             best = entry;
             total = candidate;
@@ -3137,6 +3157,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         const external = planner?.hybrid ?? planner?.external;
         if (!external) throw new Error("Missing external fallback");
         choices.set(best.rel.id, external);
+        configureChoice(best.rel.id, external);
         best.minimum = external.minimum;
         best.loanSlots = external.loans;
       }
@@ -3193,7 +3214,10 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             entry.loanSlots = 0;
             return [prior];
           });
+          const priorStrategy = choices.get(shape.aggregate.id);
+          configureChoice(shape.aggregate.id, { kind: "hash", minimum: bound.aggregate, loans: 0 });
           if (runtime.minimumBytes(entries) > runtime.request.governor.capBytes) {
+            if (priorStrategy) configureChoice(shape.aggregate.id, priorStrategy);
             for (const prior of saved) {
               prior.entry.minimum = prior.minimum;
               prior.entry.loanSlots = prior.loanSlots;
@@ -3206,14 +3230,11 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           starChoices.set(runtime, { shape, identity, bound });
           break;
         }
+      choicesReady = true;
     };
     const needsChoices = aggregatePlanners.size + percentilePlanners.size > 0;
     const execute = () =>
-      then(needsChoices ? chooseAggregates() : undefined, () => {
-        for (const [id, strategy] of aggregateChoices.get(runtime) ?? []) {
-          const planner = aggregatePlanners.get(id);
-          if (planner) runtime.aggregateProgress(id, strategy.kind, aggregateLayout(planner.rel));
-        }
+      then(needsChoices && !choicesReady ? chooseAggregates() : undefined, () => {
         if (
           ![...(aggregateChoices.get(runtime)?.values() ?? [])].some(
             (choice) => choice.kind === "hybrid",
@@ -3437,7 +3458,48 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             ),
           );
           bounds.set(source.id, bound);
-          if (bound.batchRows === 1) boundedSourceRows.set(source.id, bound.progress / 4);
+          if (bound.batchRows === 1) {
+            if (boundedColumns === null) {
+              boundedColumns = new Map();
+              for (const planner of aggregatePlanners.values())
+                if (active.has(planner.rel.id))
+                  aggregateProgressLayout(planner.rel, (id, column) => {
+                    const columns = boundedColumns?.get(id) ?? new Set<number>();
+                    columns.add(column);
+                    boundedColumns?.set(id, columns);
+                    return null;
+                  });
+            }
+            const values = new Map<number, number>();
+            for (const column of boundedColumns.get(source.id) ?? []) {
+              const name = source.columns[column],
+                type = source.types[column];
+              if (name === undefined || type === undefined)
+                throw new Error("Missing aggregate source column");
+              const cell = yield* readValue(
+                boundSource(
+                  runtime.sourceView(),
+                  {
+                    ...source,
+                    columns: [name],
+                    types: [type],
+                    singleValueBound: true,
+                    batchRows: 1,
+                    stagingBytes: 0,
+                    windowBytes: 0,
+                    rows: demand.get(source.id) ?? null,
+                  },
+                  runtime.request.governor,
+                  runtime.signal,
+                  1,
+                  1,
+                  runtime.metadataCaches(source.retain !== false, sources),
+                ),
+              );
+              values.set(column, sourceValueBytes(cell));
+            }
+            boundedSourceRows.set(source.id, values);
+          }
           const keyColumns = joinKeySources.get(source.id);
           if (keyColumns)
             for (const index of keyColumns) {
@@ -3564,6 +3626,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
             ? Math.max(progress, 4 * jsonConstants) * jsonProgressColumns
             : progress,
         );
+        // Judge the chosen native lanes, not dormant external helpers. Selection
+        // happens once on the ordinary path; only a sizing retry repeats it.
+        if (needsChoices) yield* readValue(chooseAggregates());
         const overCap = runtime.minimumBytes(entries) > runtime.request.governor.capBytes;
         if (windows && overCap && [...bounds.values()].some((bound) => bound.windowBytes > 0)) {
           // Coalesced export windows are optional. All sizing holds have ended: retry the

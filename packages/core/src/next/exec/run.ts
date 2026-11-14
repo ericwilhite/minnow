@@ -243,12 +243,21 @@ export class QueryRuntime {
     // bounded empty-sink metadata, rather than an unused full consumer byte window.
     return this.#resultProgressOverride === 0 ? Math.min(this.#window, 4096) : this.#window;
   }
+  #tighterResultRow(inputs: number, largest: number, slots: readonly number[]): number | null {
+    if (this.#resultProgressOverride !== null) return null;
+    const row = this.#resultRowProgress?.(slots, largest) ?? null;
+    // Refine an existing complete recipe; a looser output estimate must not raise
+    // the minimum/peak of a fitting query. Opaque/expanding delivery stays unchanged.
+    return row !== null &&
+      Math.max(MAX_BLOB_BYTES, row) <= this.#fallbackResultStep(inputs, largest)
+      ? row
+      : null;
+  }
   #resultStep(inputs: number, largestInput: number, slots: readonly number[] = []): number {
-    if (this.#resultProgressOverride === null) {
-      const row = this.#resultRowProgress?.(slots, largestInput);
-      if (row !== null && row !== undefined) return Math.max(MAX_BLOB_BYTES, row);
-    }
-    return this.#fallbackResultStep(inputs, largestInput);
+    const row = this.#tighterResultRow(inputs, largestInput, slots);
+    return row === null
+      ? this.#fallbackResultStep(inputs, largestInput)
+      : Math.max(MAX_BLOB_BYTES, row);
   }
   #fallbackResultStep(inputs: number, largestInput: number): number {
     // Multiply the source/owned-value envelope, not the one-MiB blob floor.
@@ -672,10 +681,11 @@ export class QueryRuntime {
     this.#operatorProgress = new Map(
       entries.filter(({ rel }) => canBorrow(rel)).map(({ rel }) => [rel.id, progress(rel)]),
     );
-    const emittedRow =
-      this.#resultProgressOverride === null
-        ? (this.#resultRowProgress?.(binding.slotBytes ?? [], binding.largestSlot) ?? null)
-        : null;
+    const emittedRow = this.#tighterResultRow(
+      binding.logicalBytes ?? binding.bytes,
+      binding.largestSlot,
+      binding.slotBytes ?? [],
+    );
     const window =
       atomic && entries.length > 0
         ? Math.max(
