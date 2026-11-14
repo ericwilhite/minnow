@@ -3788,9 +3788,19 @@ export class WritePathImpl implements WritePath, EngineHooks {
       try {
         for (const { state, staging } of drops) {
           if (staging.entry === null) continue;
-          this.#pendingRetire.push(...staging.directory);
-          for (const memtable of staging.memtables)
-            this.#pendingRetire.push(...need(memtable.staged).extents);
+          // Publications that ran while this waited for the lock may already have left the entry
+          // out of the durable root and retired its extents: a root without the table retires
+          // everything the table's previous root reached, staged entries included. Retiring them
+          // again would release extents the extent list no longer names (ruling R25: an extent
+          // is released by one publication).
+          const listed = this.#root.tables
+            .find((table) => table.tableId === state.tableId)
+            ?.staged.some((entry) => entry.transaction === id);
+          if (listed === true) {
+            this.#pendingRetire.push(...staging.directory);
+            for (const memtable of staging.memtables)
+              this.#pendingRetire.push(...need(memtable.staged).extents);
+          }
           if (state.root !== null)
             state.root = {
               ...state.root,
