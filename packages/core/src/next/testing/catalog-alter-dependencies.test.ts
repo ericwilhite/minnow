@@ -30,17 +30,19 @@ for (const seed of seedsFor("next-catalog-alter-dependencies", [0xb7a0, 0xb7a1])
           fc.constantFrom("a", "Case", "a.b"),
           fc.boolean(),
           fc.boolean(),
-          async (prefix, suffix, name, reverse, checkpoint) => {
+          fc.boolean(),
+          async (prefix, suffix, name, reverse, checkpoint, others) => {
             reach.beginHistory();
             const core = await new StorageCore().open();
             try {
               const dead = Array.from({ length: prefix }, (_, i) => `u${String(i)}`),
                 a = quote(name);
-              const sql = `CREATE TABLE t(id INT PRIMARY KEY,${dead.map((n) => n + " INT").join(",")},${a} INT,c INT,${Array.from({ length: suffix }, (_, i) => `d${String(i)} INT,`).join("")}b INT GENERATED ALWAYS AS (${a}+1) STORED,CHECK(c>=0))`;
+              const sql = `CREATE TABLE t(id INT PRIMARY KEY,${dead.map((n) => n + " INT").join(",")},${a} INT,c INT,${Array.from({ length: suffix }, (_, i) => `d${String(i)} INT,`).join("")}b INT GENERATED ALWAYS AS (${a}+1) STORED${others ? ",CHECK(c>=0)" : ""})`;
               for (const cmd of [
                 sql,
-                `CREATE VIEW v AS SELECT ${a} FROM t`,
-                `CREATE INDEX ix ON t(c DESC)`,
+                ...(others
+                  ? [`CREATE VIEW v AS SELECT ${a} FROM t`, `CREATE INDEX ix ON t(c DESC)`]
+                  : []),
               ]) {
                 await pg.exec(cmd);
                 await core.execute(cmd);
@@ -57,17 +59,22 @@ for (const seed of seedsFor("next-catalog-alter-dependencies", [0xb7a0, 0xb7a1])
                 expect(
                   after?.columns.find((c) => c.name === "b")?.generatedDependencies?.columnIds,
                 ).toEqual([aid]);
-                expect(after?.checks[0]?.dependencies?.columnIds).toEqual([cid]);
-                expect(after?.indexes.find((i) => i.name === "ix")?.columnIds).toEqual([cid]);
-                expect(
-                  core.harness.path.catalog.views[0]?.dependencies?.find((d) => d.kind === "table")
-                    ?.columnIds,
-                ).toEqual([aid]);
+                if (others) {
+                  expect(after?.checks[0]?.dependencies?.columnIds).toEqual([cid]);
+                  expect(after?.indexes.find((i) => i.name === "ix")?.columnIds).toEqual([cid]);
+                  expect(
+                    core.harness.path.catalog.views[0]?.dependencies?.find(
+                      (d) => d.kind === "table",
+                    )?.columnIds,
+                  ).toEqual([aid]);
+                }
               }
               reach.reach("generated");
-              reach.reach("check");
-              reach.reach("view");
-              reach.reach("index");
+              if (others) {
+                reach.reach("check");
+                reach.reach("view");
+                reach.reach("index");
+              } else reach.reach("generated only");
               reach.reach(reverse ? "reverse drops" : "forward drops");
               if (prefix > 1) reach.reach("multiple drops");
               if (suffix === 0) reach.reach("short row");
@@ -93,8 +100,8 @@ for (const seed of seedsFor("next-catalog-alter-dependencies", [0xb7a0, 0xb7a1])
           seed,
           numRuns: 16,
           examples: [
-            [1, 0, "a", false, false],
-            [4, 3, "a.b", true, true],
+            [1, 0, "a", false, false, false],
+            [4, 3, "a.b", true, true, true],
           ],
         },
       );

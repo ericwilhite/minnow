@@ -6421,6 +6421,7 @@ export const CATALOG_FTS_ALTER_REACH = [
 
 export const ALTER_DEPENDENCIES_REACH = [
   "generated",
+  "generated only",
   "check",
   "view",
   "index",
