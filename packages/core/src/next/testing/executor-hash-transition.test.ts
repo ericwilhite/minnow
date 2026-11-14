@@ -29,7 +29,8 @@ it.each(seedsFor("executor-hash-transition", [0xb7bf, 0xb7c0]))(
           fc.boolean(),
           fc.boolean(),
           fc.boolean(),
-          async (width, count, mode, distinct, unicode, prefill) => {
+          fc.boolean(),
+          async (width, count, mode, distinct, unicode, prefill, mixed) => {
             reach.beginHistory();
             const value = unicode ? "汉".repeat(Math.floor(width / 3)) : "x".repeat(width);
             const args = Array.from({ length: distinct ? count : 1 }, (_, c) => value + String(c));
@@ -38,6 +39,10 @@ it.each(seedsFor("executor-hash-transition", [0xb7bf, 0xb7c0]))(
               (k, c) =>
                 `CASE WHEN i=${prefill ? "2049" : "1"} THEN $${String(distinct ? c + 1 : 1)}::text ${prefill ? "WHEN i=2050 THEN 'k' ELSE 'p'" : "ELSE 'k'"} END ${k}`,
             );
+            if (mixed) {
+              keys.unshift("j");
+              expressions.unshift("CASE WHEN i<=2048 OR i>=2051 THEN 0 ELSE 2147483647-i END j");
+            }
             const sql = `SELECT count(*) n,sum(v) s,avg(v) a FROM (SELECT ${expressions.join(",")},CASE WHEN i%3=0 THEN 1e16::float8 WHEN i%3=1 THEN 1::float8 ELSE -1e16::float8 END v FROM generate_series(1,${prefill ? "2052" : "3"})g(i))q GROUP BY ${keys.join(",")}`;
             const governor = new Governor(256 << 20);
             let competitor = await governor.admit({
@@ -123,6 +128,7 @@ it.each(seedsFor("executor-hash-transition", [0xb7bf, 0xb7c0]))(
                   canonical((await pg.query<Record<string, unknown>>(sql, args)).rows),
                 );
                 reach.reach("PG exact");
+                if (mixed) reach.reach("mixed fixed/byte keys");
                 if (prefill) {
                   reach.reach("resident prefix");
                   if (mode === 0) {
@@ -156,17 +162,19 @@ it.each(seedsFor("executor-hash-transition", [0xb7bf, 0xb7c0]))(
         ),
         {
           seed,
-          numRuns: 8,
+          numRuns: 18, // Ten fixed cases plus eight generated cases.
           endOnFailure: true,
           examples: [
-            [800000, 1, 0, false, false, false],
-            [800000, 1, 1, false, false, false],
-            [800000, 3, 2, true, false, false],
-            [800000, 1, 3, false, false, false],
-            [800000, 16, 0, false, false, false],
-            [800000, 8, 1, true, true, false],
-            [800000, 1, 0, false, false, true],
-            [600000, 3, 1, true, false, true],
+            [800000, 1, 0, false, false, false, false],
+            [800000, 1, 1, false, false, false, false],
+            [800000, 3, 2, true, false, false, false],
+            [800000, 1, 3, false, false, false, false],
+            [800000, 16, 0, false, false, false, false],
+            [800000, 8, 1, true, true, false, false],
+            [800000, 1, 0, false, false, true, false],
+            [600000, 3, 1, true, false, true, false],
+            [800000, 1, 0, false, false, true, true],
+            [600000, 3, 1, true, true, true, true],
           ],
         },
       );

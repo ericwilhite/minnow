@@ -116,7 +116,7 @@ it.each(seedsFor("hash-byte-transition", [0xb7bd, 0xb7be]))(
       ),
       {
         seed,
-        numRuns: 12,
+        numRuns: 17, // Five fixed cases plus twelve generated cases.
         endOnFailure: true,
         examples: [
           [800000, 1, false, false, false],

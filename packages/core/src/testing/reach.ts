@@ -5736,6 +5736,7 @@ export const BYTE_GROWTH_REACH = [
 ] as const;
 
 export const HASH_TRANSITION_REACH = [
+  "mixed fixed/byte keys",
   "resident prefix",
   "saved float prefix",
   "ordinary",
@@ -5747,5 +5748,21 @@ export const HASH_TRANSITION_REACH = [
   "repeated parameters",
   "compound keys",
   "UTF8",
+  "zero",
+] as const;
+
+export const HASH_PARENT_PEAK_REACH = [
+  "2 keys",
+  "3 keys",
+  "4 keys",
+  "8 keys",
+  "16 keys",
+  "dictionary",
+  "flat",
+  "selected",
+  "dense",
+  "unequal widths",
+  "later batch",
+  "parent peak",
   "zero",
 ] as const;
