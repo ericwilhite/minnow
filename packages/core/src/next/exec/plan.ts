@@ -1124,6 +1124,13 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       }
       case "keyLookup":
       case "indexRange": {
+        // A modify root has exactly one relational child: its statement-snapshot input.
+        // Its cursor/fetch step joins that producer's complete atomic reservation. Query
+        // roots keep the existing diagnostic gate; a LIMIT zero must not bypass it.
+        if (plan.root.op !== "modify" && options.keyOrder !== true)
+          throw new UnsupportedPlanError(`${rel.op} requires diagnostic opt-in outside DML`, {
+            construct: rel.op,
+          });
         if (
           options.keyOrder === true &&
           rel.op === "indexRange" &&

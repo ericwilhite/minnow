@@ -1593,8 +1593,11 @@ with at least seven of nine pairs favouring control is an accepted regression. O
 profiles are outside the component timing; query materialization remains in whole timing.
 The report includes CPU samples, full spreads, checkpointed partial rounds, profiles and the
 actual transformed JS needed to interpret line-level ticks. No baseline is an executor path.
-Unbounded, value-producing `indexRange` IR remains behind the internal `keyOrder:true`
-diagnostic opt-in. Ordinary SQL selects the admitted index recipe for a direct, complete
+Query-root `keyLookup` and `indexRange` IR remain behind the internal `keyOrder:true`
+diagnostic opt-in, including LIMIT zero. The general cursor/fetch recipe is available without
+that opt-in only inside a modification root's statement-snapshot input, whose producer
+atomically reserves the complete DML cursor/fetch minimum. This does not enable query-root
+index predicates. Ordinary SQL selects the admitted index recipe for a direct, complete
 primary-key ORDER BY with LIMIT or OFFSET, including OFFSET without LIMIT. The pinned
 catalog must certify the same unique key columns, byte collation and direction. Direct
 projections are supported; row-locking intent, filters, computed ordering, partial keys, mixed
@@ -3526,8 +3529,9 @@ coalesced window; it does not skip the gzip/large-value sizing proof or raise th
 `npx vite-node scripts/read-retention-bench.mts --compare=REV` runs five interleaved frozen-parent/
 candidate component rounds, checks physical frame bytes (including masks, padding and dictionary
 deltas), and guards warm repeated reads plus real persisted SQL scans and point selections.
-The current executor refuses the `keyLookup` operator; SQL point selection uses `id + 0` to
-exercise the supported scan path. The separate storage point-read guard is a direct single-blob
+The ordinary query executor refuses `keyLookup` without diagnostic opt-in; this query benchmark
+uses `id + 0` to exercise the supported scan path. DML's separately admitted input recipe is
+not a query-point-lookup path. The separate storage point-read guard is a direct single-blob
 cache hit. This benchmark does not claim indexed SQL point-lookup performance.
 
 `MINNOW_EXPORT_RETENTION_REFERENCE=REV` freezes the entire core at that Git revision on its

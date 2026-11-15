@@ -7901,3 +7901,21 @@ export const MODIFY_REFERENCE_GENERATED_REACH = [
   "NULL",
   "non-NULL",
 ] as const;
+
+export const MODIFY_INDEX_GATE_REACH = [
+  "update",
+  "delete",
+  "insert",
+  "upsert",
+  "keyLookup",
+  "indexRange",
+  "zero SELECT limit",
+  "positive SELECT limit",
+  "query unset refused",
+  "query false refused",
+  "query opt-in prepared",
+  "DML unset admitted",
+  "DML false admitted",
+  "PG and shipped rows",
+  "zero spill",
+] as const;
