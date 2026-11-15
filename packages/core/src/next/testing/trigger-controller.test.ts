@@ -4,7 +4,12 @@ import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
-import { createReach, TRIGGER_CONTROLLER_REACH } from "../../testing/reach.js";
+import {
+  createReach,
+  TRIGGER_CONTROLLER_REACH,
+  TRIGGER_PREPARATION_REACH,
+} from "../../testing/reach.js";
+import type { TriggerDef } from "../access/trigger-def.js";
 import type { CatalogView } from "../access/catalog.js";
 import {
   ROW_IMAGE_UNREAD,
@@ -28,12 +33,14 @@ import { yieldTask } from "../task.js";
 
 const quote = (s: string) => `"${s.replaceAll('"', '""')}"`;
 const names = ["Afirst", "zlast", "\ue000", "\u{10000}"];
-type Fault = "none" | "unique" | "body" | "pending close" | "depth";
+type Fault = "none" | "unique" | "body" | "pending close" | "depth" | "terminal not prepared";
 async function fixture(
   event: "delete" | "update",
   unicode: boolean,
   twoBodies: boolean,
   fault: Fault = "none",
+  omit: number | null = null,
+  terminalBefore = false,
 ) {
   const core = await new StorageCore(16).open();
   for (const sql of [
@@ -45,6 +52,7 @@ async function fixture(
     await core.execute(sql);
   const base = core.harness.path.catalog,
     programs: PreparedRowTrigger[] = [],
+    definitions: TriggerDef[] = [],
     specs: Array<{
       name: string;
       table: string;
@@ -73,11 +81,11 @@ async function fixture(
         double: false,
       },
     ];
-  if (fault === "depth")
+  if (fault === "depth" || fault === "terminal not prepared")
     specs.push({
       name: "deep",
       table: "audit",
-      timing: "after",
+      timing: terminalBefore ? "before" : "after",
       event: "insert",
       label: "deep",
       double: false,
@@ -89,9 +97,14 @@ async function fixture(
       declaration = core.lowerer.lower(sql, core.context());
     if (declaration.kind !== "ddl" || declaration.change?.kind !== "createTrigger")
       throw new Error("missing trigger definition");
-    const definition = { ...declaration.change.trigger, id: programs.length + 1 },
+    const definition = { ...declaration.change.trigger, id: definitions.length + 1 },
       owner = base.table(definition.tableId);
     if (!owner) throw new Error("missing owner");
+    definitions.push(definition);
+    // Native reach stops at spent budget. Its matching definition is retained in catalog,
+    // but its unreachable body must not be lowered/prepared merely to report depth.
+    if (omit === definition.id - 1 || (fault === "terminal not prepared" && spec.name === "deep"))
+      continue;
     const bodies = definition.statements.map((body) => {
       const lowered = core.lowerer.lower(body.sql, {
         ...core.context(),
@@ -118,7 +131,7 @@ async function fixture(
       views: base.views,
       types: base.types,
       fts: base.fts,
-      triggers: programs.map((p) => p.definition),
+      triggers: definitions,
       table: (id) => base.table(id),
       tableByName: (name) => base.tableByName(name),
       type: (id) => base.type(id),
@@ -238,12 +251,12 @@ async function fixture(
           );
           request.signal.throwIfAborted();
         }
-        trace.push(`${record.label}:${String(record.n)}`);
         if (record.target === log.id || record.target === audit.id) {
           const budget = budgets.get(request.command.id);
           if (budget === undefined) throw new Error("missing command budget");
           const image = { spoolId: record.target, row: record.n };
           await request.hooks.beforeRow(request.command, record.target, "insert", image, budget);
+          trace.push(`${record.label}:${String(record.n)}`);
           await request.hooks.afterRow(request.command, record.target, "insert", image, [], budget);
         }
       } else throw new Error("body verified before primary");
@@ -463,3 +476,72 @@ it("refuses foreign commands and a third matching derived trigger before effects
     }
   }
 }, 120_000);
+
+for (const seed of seedsFor("next-trigger-preparation", [0xb7dc, 0xb7dd]))
+  it(`refuses omitted live programs and detects unprepared terminal definitions seed ${String(seed)}`, async () => {
+    const reach = createReach("trigger preparation completeness", TRIGGER_PREPARATION_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 0, max: 5 }),
+        fc.boolean(),
+        fc.boolean(),
+        async (omit, update, terminalBefore) => {
+          reach.beginHistory();
+          const f = await fixture(update ? "update" : "delete", false, false, "none", omit);
+          try {
+            const execute = (async () => {
+              await f.row(1);
+              await f.runtime.finishRoot();
+            })();
+            await expect(execute, "unprepared matching trigger must refuse").rejects.toMatchObject({
+              code: "MINNOW_TRIGGER_STATE",
+              sqlState: "XX000",
+            });
+            await expect(execute).rejects.toThrow("matching trigger was not prepared");
+            reach.reach(
+              omit === 0 || omit === 3 ? "BEFORE omission refused" : "AFTER omission refused",
+            );
+            if (omit === 3 || omit === 4) reach.reach("RI route omission refused");
+            if (omit === 5) reach.reach("body route omission refused");
+            reach.reach(update ? "update route" : "delete route");
+          } finally {
+            await f.close();
+          }
+          const terminal = await fixture(
+            update ? "update" : "delete",
+            false,
+            false,
+            "terminal not prepared",
+            null,
+            terminalBefore,
+          );
+          try {
+            await expect(
+              terminal.row(1),
+              "unprepared terminal definition must still stop recursion",
+            ).rejects.toMatchObject({ code: "MINNOW_TRIGGER_DEPTH", sqlState: "54001" });
+            expect(terminal.trace).toEqual(terminalBefore ? ["pB:1"] : ["pB:1", "echo:1"]);
+            expect(terminal.maxFrames()).toBe(3);
+            reach.reach("terminal definition needs no compiled body");
+            reach.reach(terminalBefore ? "terminal BEFORE" : "terminal AFTER");
+          } finally {
+            await terminal.close();
+          }
+          reach.reach("zero queues copies and readers");
+        },
+      ),
+      {
+        seed,
+        numRuns: 10,
+        examples: [
+          [0, false, false],
+          [1, true, true],
+          [2, false, true],
+          [3, true, false],
+          [4, false, false],
+          [5, true, true],
+        ],
+      },
+    );
+    reach.assertReached();
+  }, 120_000);

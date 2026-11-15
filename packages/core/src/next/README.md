@@ -3926,3 +3926,10 @@ row-image and RI adapters, real prefix-pin lifetimes, nested frames and observed
 spills while competing grants hold spare credit. It does not exercise B5b's complete
 compiled source/registry/write driver. SQL firing stays disabled until that joint integration
 passes its end-to-end pressure, rollback, FK-action, cancellation and fault campaign.
+
+Prepared programs cover every matching trigger on nonnegative-budget routes. The controller
+checks actual catalog routes and refuses a missing program rather than skipping the trigger.
+A fixed eight-slot scalar route cache is paid by the root's frame metadata; cold scans use the
+shared task clock. At spent budget, matching definitions come directly from the catalog:
+BEFORE refuses depth immediately, and AFTER queues its ID to refuse at the ordered drain.
+An unreachable terminal body need not be compiled or have binding workspace reserved.

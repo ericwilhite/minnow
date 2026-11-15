@@ -6962,3 +6962,16 @@ export const TRIGGER_CONTROLLER_REACH = [
   "observed queue spill",
   "zero queues inputs pins and credit",
 ] as const;
+
+export const TRIGGER_PREPARATION_REACH = [
+  "terminal BEFORE",
+  "terminal AFTER",
+  "BEFORE omission refused",
+  "AFTER omission refused",
+  "RI route omission refused",
+  "body route omission refused",
+  "update route",
+  "delete route",
+  "terminal definition needs no compiled body",
+  "zero queues copies and readers",
+] as const;

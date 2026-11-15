@@ -31,7 +31,8 @@ export interface TriggerControllerOptions {
   readonly statement: Pick<Statement, "catalog" | "readOwn">;
   readonly native: NativeCommandBoundary;
   readonly body: Omit<TriggerBodyScope, "statement" | "native" | "hooks">;
-  /** Immutable preparation data in UTF8 trigger-name order (ties by stable ID). */
+  /** Immutable preparation data in UTF8 name order (ties by ID). Every matching live
+   * (budget >= 0) trigger is prepared. Spent-budget definitions need no body program. */
   readonly programs: readonly PreparedRowTrigger[];
   readonly io: SpillIo;
   readonly spill: SpillService;
@@ -54,8 +55,19 @@ interface Frame {
   completing: boolean;
   riDepth: number;
 }
+interface Route {
+  readonly table: number;
+  readonly event: WriteEvent;
+  readonly before: boolean;
+  readonly after: boolean;
+  readonly prepared: boolean;
+}
 const FRAME_BYTES = 4096,
-  ENTRY_BYTES = 128;
+  ENTRY_BYTES = 128,
+  ROUTE_SLOTS = 8; // Bounded scalar cache, covered by the root's FRAME_BYTES.
+function depth(): never {
+  throw new ExecutionError("Trigger cascade depth exceeded", "MINNOW_TRIGGER_DEPTH", "54001");
+}
 function invalid(message: string): never {
   throw new ExecutionError(
     `Invalid trigger controller ${message}`,
@@ -98,6 +110,8 @@ export class TriggerController implements NativeRowHooks {
   readonly #frames: Frame[] = [];
   readonly #pending = new Set<Promise<void>>();
   readonly #programs: readonly PreparedRowTrigger[];
+  readonly #routes: Route[] = [];
+  #routeCursor = 0;
   #root: Frame | null = null;
   #nextFrame = 1;
   #closed = false;
@@ -122,6 +136,8 @@ export class TriggerController implements NativeRowHooks {
       controller.#check();
       let previous: PreparedRowTrigger | undefined;
       for (const program of options.programs) {
+        const pause = pauseIfDue(controller.#scope.work);
+        if (pause) await pause;
         const def = program.definition;
         if (
           (previous !== undefined &&
@@ -240,6 +256,47 @@ export class TriggerController implements NativeRowHooks {
       invalid("foreign, retired or mismatched command");
     return frame;
   }
+  #prepared(def: TriggerDef): PreparedRowTrigger | undefined {
+    let lo = 0,
+      hi = this.#programs.length;
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2),
+        p = this.#programs[mid];
+      if (!p) invalid("sparse prepared programs");
+      const cmp = compareNames(p.definition.name, def.name) || p.definition.id - def.id;
+      if (cmp < 0) lo = mid + 1;
+      else hi = mid;
+    }
+    const found = this.#programs[lo];
+    return found?.definition === def ? found : undefined;
+  }
+  /** Guard the actual row route, independently of static reach/preparation. At spent budget
+   * only catalog matching is needed: its body is unreachable and must not be prepared. */
+  async #route(table: number, event: WriteEvent, budget: number): Promise<Route> {
+    const at = this.#routes.findIndex((r) => r.table === table && r.event === event),
+      cached = this.#routes[at];
+    if (cached && (budget < 0 || cached.prepared)) return cached;
+    let before = false,
+      after = false,
+      seen = 0;
+    for (const def of this.options.statement.catalog.triggers) {
+      if (def.tableId === table && def.event === event) {
+        before ||= def.timing === "before";
+        after ||= def.timing === "after";
+        if (budget >= 0 && !this.#prepared(def)) invalid("matching trigger was not prepared");
+      }
+      if (++seen % 128 === 0) {
+        const pause = pauseIfDue(this.#scope.work);
+        if (pause) await pause;
+      }
+    }
+    this.#check();
+    const route: Route = { table, event, before, after, prepared: budget >= 0 };
+    if (at >= 0) this.#routes[at] = route;
+    else if (this.#routes.length < ROUTE_SLOTS) this.#routes.push(route);
+    else this.#routes[this.#routeCursor++ % ROUTE_SLOTS] = route;
+    return route;
+  }
   async #retire(frame: Frame): Promise<void> {
     try {
       await frame.queue.close();
@@ -262,8 +319,16 @@ export class TriggerController implements NativeRowHooks {
     return this.#track(async () => {
       const frame = this.#frame(command, budget);
       if (frame.completing && frame.riDepth === 0) invalid("primary row after command completion");
+      const route = await this.#route(table, event, budget);
+      if (!route.before) return;
+      if (budget < 0) depth();
       // Preparation already sorted names; callbacks allocate no row-count-sized metadata.
+      let seen = 0;
       for (const program of this.#programs) {
+        if (++seen % 128 === 0) {
+          const pause = pauseIfDue(this.#scope.work);
+          if (pause) await pause;
+        }
         const def = program.definition;
         if (def.tableId !== table || def.event !== event || def.timing !== "before") continue;
         await this.#fire(program, images, budget);
@@ -290,10 +355,30 @@ export class TriggerController implements NativeRowHooks {
           if (frame.order.length >= this.options.rowEvents) invalid("row ordering capacity");
           frame.order.push(entry);
         };
-        for (const p of this.#programs) {
-          const def = p.definition;
+        const route = await this.#route(table, event, budget);
+        const addTrigger = (def: TriggerDef) => {
           if (def.tableId === table && def.event === event && def.timing === "after")
             add({ kind: "trigger", name: def.name, id: def.id });
+        };
+        if (route.after) {
+          let seen = 0;
+          if (budget < 0) {
+            for (const def of this.options.statement.catalog.triggers) {
+              addTrigger(def);
+              if (++seen % 128 === 0) {
+                const pause = pauseIfDue(this.#scope.work);
+                if (pause) await pause;
+              }
+            }
+          } else {
+            for (const p of this.#programs) {
+              addTrigger(p.definition);
+              if (++seen % 128 === 0) {
+                const pause = pauseIfDue(this.#scope.work);
+                if (pause) await pause;
+              }
+            }
+          }
         }
         for (const entry of ri) {
           if (
@@ -332,8 +417,7 @@ export class TriggerController implements NativeRowHooks {
   }
   async #fire(program: PreparedRowTrigger, images: RowImageRef, budget: number): Promise<void> {
     this.#check();
-    if (budget < 0)
-      throw new ExecutionError("Trigger cascade depth exceeded", "MINNOW_TRIGGER_DEPTH", "54001");
+    if (budget < 0) depth();
     for (const body of program.bodies) {
       const frame = await this.#newFrame(budget - 1);
       let failure: { reason: unknown } | null = null;
@@ -371,6 +455,7 @@ export class TriggerController implements NativeRowHooks {
         frame.riDepth--;
       }
     } else {
+      if (packet.budget < 0) depth();
       const program = this.#programs.find((p) => p.definition.id === packet.id);
       if (
         program?.definition.tableId !== packet.tableId ||
@@ -410,6 +495,7 @@ export class TriggerController implements NativeRowHooks {
     );
     return (this.#closing = (async () => {
       await Promise.allSettled([...this.#pending]);
+      this.#routes.length = 0; // Drop cache before retiring its root ordinary charge.
       const results = await Promise.allSettled(this.#frames.map((frame) => this.#retire(frame)));
       this.#root = null;
       const errors = results
