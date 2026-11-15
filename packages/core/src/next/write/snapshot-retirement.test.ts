@@ -16,6 +16,7 @@ import {
   snapshotCrc32,
 } from "../format/snapshot.js";
 import { Catalog } from "./catalog.js";
+import { encodeSnapshotCatalogHeader } from "./snapshot-catalog.js";
 import { loadSnapshot, type SnapshotLoadTarget } from "./snapshot-load.js";
 import { snapshotBlob } from "./snapshot-source.js";
 import { column, INT, tableInput } from "./test-support.js";
@@ -30,8 +31,11 @@ async function archive(rows: number): Promise<Uint8Array[]> {
           },
           1,
         ).catalog;
-  const bytes = catalog.encode(),
-    parts: Uint8Array[] = [],
+  const native = catalog.encode(),
+    bytes = new Uint8Array(24 + native.length);
+  encodeSnapshotCatalogHeader(native.length, 0, bytes.subarray(0, 24));
+  bytes.set(native, 24);
+  const parts: Uint8Array[] = [],
     budget = { allocate: () => true, free: () => undefined };
   const writer = await SnapshotStreamWriter.open(
     { id: new Uint8Array(16), sourceLsn: 0 },

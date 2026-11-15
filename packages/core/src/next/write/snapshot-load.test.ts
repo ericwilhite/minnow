@@ -12,6 +12,7 @@ import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import {
+  SNAPSHOT_SEQUENCE_LOAD_REACH,
   SNAPSHOT_SOURCE_STABILITY_REACH,
   createReach,
   SNAPSHOT_LOAD_REACH,
@@ -44,7 +45,13 @@ import { decodeCatalogStream, encodeCatalogStream } from "./catalog-stream.js";
 import { ftsDef } from "../access/fts-def.js";
 import { CATALOG_RECORD_KINDS } from "../durable-format.js";
 import { Catalog } from "./catalog.js";
+import {
+  snapshotCatalogParts,
+  encodeSnapshotCatalogHeader,
+  decodeSnapshotCatalogHeader,
+} from "./snapshot-catalog.js";
 import { exportPinnedSnapshot } from "./snapshot-export.js";
+import { exportSnapshot } from "./snapshot-capture.js";
 import { loadSnapshot, type SnapshotLoadTarget } from "./snapshot-load.js";
 import {
   Harness,
@@ -52,6 +59,7 @@ import {
   batch,
   column,
   INT,
+  BIG,
   ints,
   rowsOf,
   tableInput,
@@ -79,6 +87,20 @@ class Budget extends Governor implements ByteBudget {
     this.#used -= n;
     if (this.#used < 0) throw new Error("double free");
   }
+}
+/** Test-owned archive bytes. Production uses borrowed, charged catalog parts directly. */
+function portableCatalog(catalog: Catalog): Uint8Array {
+  const budget = new Budget(),
+    parts: Uint8Array[] = [];
+  for (const bytes of snapshotCatalogParts(catalog, [], budget)) parts.push(bytes.slice());
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const bytes of parts) {
+    out.set(bytes, at);
+    at += bytes.length;
+  }
+  expect(budget.used).toBe(0);
+  return out;
 }
 function input(
   chunks: readonly Uint8Array[],
@@ -171,7 +193,7 @@ async function fixture(values: ReadonlyArray<number | null>, large = false): Pro
       pin,
       new Uint8Array(16),
       (async function* () {
-        yield catalog.encode();
+        yield portableCatalog(catalog);
       })(),
       {
         write(bytesIn) {
@@ -700,7 +722,7 @@ for (const seed of seedsFor("next-snapshot-native-layouts", [0xb265, 0xb266]))
               pin,
               new Uint8Array(16),
               (async function* () {
-                yield catalog.encode();
+                yield portableCatalog(catalog);
               })(),
               {
                 write(bytes) {
@@ -866,6 +888,7 @@ async function corruptCatalog(
   chunks: readonly Uint8Array[],
   change: (value: Record<string, unknown>) => void,
   unsafeId = false,
+  portableChange?: (bytes: Uint8Array) => Uint8Array,
 ): Promise<Uint8Array[]> {
   const b = new Budget(),
     reader = await SnapshotStreamReader.open(
@@ -884,23 +907,38 @@ async function corruptCatalog(
     },
     b,
   );
-  let length = 0,
-    crc = 0;
+  const catalogParts: Uint8Array[] = [];
   try {
     for await (const frame of reader.frames()) {
       if (frame.kind === SnapshotKind.footer) continue;
       let bytes = frame.payload;
       if (frame.kind === SnapshotKind.catalogPart) {
-        const data = decodeCatalogStream(bytes);
+        catalogParts.push(bytes.slice());
+        continue;
+      }
+      if (frame.kind === SnapshotKind.catalogEnd) {
+        const whole = new Uint8Array(catalogParts.reduce((n, part) => n + part.length, 0));
+        let at = 0;
+        for (const part of catalogParts) {
+          whole.set(part, at);
+          at += part.length;
+        }
+        const header = decodeSnapshotCatalogHeader(whole.subarray(0, 24)),
+          data = decodeCatalogStream(whole.subarray(24, 24 + header.length));
         change(data as unknown as Record<string, unknown>);
-        bytes = encodeCatalogStream(data);
-        if (unsafeId) bytes = unsafeCatalogId(bytes);
-        length = bytes.length;
-        crc = snapshotCrc32(bytes);
-      } else if (frame.kind === SnapshotKind.catalogEnd) {
+        let native = encodeCatalogStream(data);
+        if (unsafeId) native = unsafeCatalogId(native);
+        let body: Uint8Array = new Uint8Array(whole.length - header.length + native.length);
+        encodeSnapshotCatalogHeader(native.length, header.count, body.subarray(0, 24));
+        body.set(native, 24);
+        body.set(whole.subarray(24 + header.length), 24 + native.length);
+        if (portableChange) body = portableChange(body);
+        await writer.frame(SnapshotKind.catalogPart, frame.objectId, 1, body);
         bytes = new Uint8Array(16);
-        snapshotNumbers([length, 0], bytes);
-        new DataView(bytes.buffer).setUint32(8, crc, true);
+        snapshotNumbers([body.length, 0], bytes);
+        new DataView(bytes.buffer).setUint32(8, snapshotCrc32(body), true);
+        await writer.frame(SnapshotKind.catalogEnd, frame.objectId, 2, bytes);
+        continue;
       }
       await writer.frame(frame.kind, frame.objectId, frame.partIndex, bytes);
     }
@@ -1208,7 +1246,7 @@ async function structuredArchive(type: PhysicalType, value: Uint8Array): Promise
   ).catalog;
   const chunks: Uint8Array[] = [],
     funding = new Budget(),
-    catalogBytes = catalog.encode();
+    catalogBytes = portableCatalog(catalog);
   const writer = await SnapshotStreamWriter.open(
     { id: new Uint8Array(16), sourceLsn: 0 },
     {
@@ -1478,7 +1516,7 @@ for (const layout of ["bytes", "json", "decimal", "padded decimal"] as const)
           pin,
           new Uint8Array(16),
           (async function* () {
-            yield catalog.encode();
+            yield portableCatalog(catalog);
           })(),
           {
             write(bytes) {
@@ -1531,7 +1569,7 @@ for (const seed of seedsFor("next-snapshot-load-root-credit", [0xb273, 0xb274]))
         const chunks: Uint8Array[] = [],
           b = new Budget(),
           numbers = new Uint8Array(24),
-          bytes = catalog.encode();
+          bytes = portableCatalog(catalog);
         const writer = await SnapshotStreamWriter.open(
           { id: new Uint8Array(16), sourceLsn: 0 },
           {
@@ -1637,7 +1675,7 @@ for (const seed of seedsFor("next-snapshot-json-semantics", [0xb275, 0xb276]))
               pin,
               new Uint8Array(16),
               (async function* () {
-                yield catalog.encode();
+                yield portableCatalog(catalog);
               })(),
               {
                 write(bytes) {
@@ -1817,6 +1855,155 @@ for (const seed of seedsFor("next-snapshot-source-stability", [0xb283, 0xb284]))
           }
         },
       ),
+      { seed, numRuns: 4 },
+    );
+    reach.assertReached();
+  }, 60000);
+
+for (const seed of seedsFor("next-snapshot-load-sequences", [0xb289, 0xb28a]))
+  it(`keeps owned sequence horizons at pin time across load and writes seed ${String(seed)}`, async () => {
+    const reach = createReach("snapshot sequence load", SNAPSHOT_SEQUENCE_LOAD_REACH);
+    await fc.assert(
+      fc.asyncProperty(fc.integer({ min: 10, max: 50 }), async (value) => {
+        reach.beginHistory();
+        for (const direction of [1n, -1n]) {
+          const source = new Harness("strict", "memory"),
+            path = await source.open(),
+            archive: Uint8Array[] = [];
+          let catalogBytes: Uint8Array;
+          try {
+            await autocommit(path, (st) =>
+              st.changeCatalog({
+                kind: "createTable",
+                table: tableInput(
+                  "identity",
+                  [
+                    {
+                      ...column("id", BIG, false),
+                      identity: { start: direction, increment: direction },
+                    },
+                  ],
+                  { primaryKey: null },
+                ),
+              }),
+            );
+            await autocommit(path, (st) =>
+              st.table(1).insert(batch(vectorOf(BIG, [direction, 2n * direction])), null),
+            );
+            await path.sequences.set(1, BigInt(value) * direction, false);
+            await path.recycleLog();
+            const funding = new Budget();
+            let writes = 0;
+            catalogBytes = path.catalog.encode();
+            await exportSnapshot(
+              path,
+              new Uint8Array(16),
+              {
+                async write(part) {
+                  archive.push(part.slice());
+                  if (++writes === 1) await path.sequences.set(1, 91n * direction, false);
+                },
+              },
+              funding,
+            );
+            expect(funding.used).toBe(0);
+          } finally {
+            await source.close();
+          }
+          for (const mutation of [
+            "horizon refusal",
+            "sequence counter floor",
+            "sequence owner reference",
+            "identity reference",
+            "sequence name uniqueness",
+          ] as const) {
+            const invalid = await corruptCatalog(
+              archive,
+              (data) => {
+                const counters = data.counters as Record<string, unknown>,
+                  sequences = data.sequences as Array<Record<string, unknown>>,
+                  tables = data.tables as Array<Record<string, unknown>>;
+                const sequence = sequences[0],
+                  firstTable = tables[0];
+                if (!sequence || !firstTable) throw new Error("fixture scope");
+                switch (mutation) {
+                  case "sequence counter floor":
+                    counters.nextSequenceId = 1;
+                    break;
+                  case "sequence owner reference":
+                    sequence.ownedBy = { tableId: 999, columnId: 1 };
+                    break;
+                  case "identity reference": {
+                    const columns = firstTable.columns as Array<Record<string, unknown>>;
+                    const first = columns[0];
+                    if (!first) throw new Error("fixture column");
+                    first.identitySequence = 999;
+                    break;
+                  }
+                  case "sequence name uniqueness":
+                    sequences.push({ ...sequence, id: 2, ownedBy: null });
+                    counters.nextSequenceId = 3;
+                    break;
+                }
+              },
+              false,
+              (bytes) => {
+                if (mutation === "horizon refusal")
+                  new DataView(bytes.buffer).setUint32(16, 0, true);
+                return bytes;
+              },
+            );
+            let opens = 0;
+            const refusing = new Budget();
+            await expect(
+              loadSnapshot(
+                input(invalid),
+                () => {
+                  opens++;
+                  return target(new Harness("strict", "memory"));
+                },
+                refusing,
+              ),
+            ).rejects.toMatchObject({ code: "MINNOW_SNAPSHOT_FORMAT" });
+            expect(opens).toBe(0);
+            expect(refusing.used).toBe(0);
+            reach.reach(mutation);
+          }
+          const h = new Harness("strict", "memory"),
+            funding = new Budget();
+          await loadSnapshot(input(archive), () => target(h), funding);
+          expect(funding.used).toBe(0);
+          const loaded = await h.open();
+          try {
+            expect(loaded.catalog.encode()).toEqual(catalogBytes);
+            const out = { repr: "int64" as const, values: new BigInt64Array(1) };
+            await loaded.sequences.next(1, 1, out, 0);
+            expect(out.values[0]).toBe(BigInt(value) * direction);
+            await autocommit(loaded, (st) =>
+              st.table(1).insert(batch(vectorOf(BIG, [3n * direction])), null),
+            );
+            await h.close();
+            const reopened = await h.open();
+            await reopened.sequences.next(1, 1, out, 0);
+            expect(out.values[0]).toBe((BigInt(value) + 1n) * direction);
+            const pin = reopened.pin();
+            try {
+              expect((await rowsOf(pin, 1)).map((row) => String(row[0]))).toEqual(
+                [1n * direction, 2n * direction, 3n * direction].map(String),
+              );
+            } finally {
+              pin.release();
+            }
+          } finally {
+            await h.close();
+          }
+          expect(h.governor.usedBytes).toBe(0);
+          expect(source.governor.usedBytes).toBe(0);
+          reach.reach(direction > 0n ? "ascending" : "descending");
+          for (const state of ["owned identity", "pin time", "continue writing", "reopen"] as const)
+            reach.reach(state);
+        }
+      }),
       { seed, numRuns: 4 },
     );
     reach.assertReached();

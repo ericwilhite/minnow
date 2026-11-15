@@ -219,7 +219,14 @@ export const DURABLE_EMISSIONS: Readonly<
   },
   "format/snapshot.ts:SnapshotStreamWriter.#emit:this.sink.write -> SnapshotSink.write": {
     count: 1,
-    kinds: ["snapshot", "snapshotFrame", "snapshotFooter", "snapshotColumn"],
+    kinds: [
+      "snapshot",
+      "snapshotFrame",
+      "snapshotFooter",
+      "snapshotColumn",
+      "snapshotCatalog",
+      "snapshotSequence",
+    ],
   },
   "format/manifest-codec.ts:writeGroupDirectory:writer.write -> ExtentWriter.write": {
     count: 2,

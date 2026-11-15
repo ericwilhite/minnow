@@ -853,6 +853,19 @@ export const DURABLE_FORMATS = {
     decoder: "decodeSnapshotFrame",
     state: "implemented",
   },
+  snapshotCatalog: {
+    magic: 0x54414350,
+    version: 1,
+    versionIn: "header",
+    fields: [magic(0x54414350), version(4, 2), zero(6, 2)],
+    decoder: "write/snapshot-catalog.ts:decodeSnapshotCatalog",
+    state: "implemented",
+  },
+  snapshotSequence: inherited(
+    "snapshotCatalog",
+    "write/snapshot-catalog.ts:decodeSnapshotSequence",
+    [zero(12, 4)],
+  ),
   snapshotColumn: {
     magic: 0x43504e4d,
     version: 1,

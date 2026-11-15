@@ -244,7 +244,7 @@ Named types accept at most 65,536 labels (the current two-byte native sort rank)
 most 63 UTF8 bytes. A wider type explicitly refuses rather than truncating a sort key.
 SQL's separate statement/token limits also apply.
 Type/generated rewrites, new row constraints during ALTER, and backfills the literal lowerer
-cannot represent remain explicit refusals. Trigger firing and portable catalog adapters are later approved stages; native FTS
+cannot represent remain explicit refusals. Portable catalog/sequence capture is implemented below; trigger/FTS snapshot reconstruction still refuses explicitly. Native FTS
 scan/definitions are integrated, while its durable postings publication remains separate. No released next/ format exists yet; this is not freeze readiness.
 
 ### Commit encoding under the cap
@@ -3741,7 +3741,7 @@ replaces the one-entry dictionary. This bounded dictionary keeps strings as byte
 large entries across1MiB frame boundaries. Column framing declares and verifies total encoded bytes.
 The exporter holds one1MiB payload window, small fixed scratch and one column reader; buffers
 for frames, pages and retained dictionary/metadata borrows remain charged separately.
-Catalog capture/sequence scope and native load/publication composition are subsequent stages.
+Portable catalog/sequence capture and native load/publication composition are described below.
 
 Stream writers validate the16-byte identity and safe-integer LSN before charging or cloning them.
 A failing source iterator's `return()` cannot replace the primary typed legacy/format/cancel refusal;
@@ -4266,20 +4266,31 @@ rejection is indeterminate: close/reopen and inspect the native root, never free
 reach. Old generations remain under the usual two-root/pin rules, and quota never truncates
 the old root/log to make room. Callers reopen the ordinary write path after publication.
 
-Stage3's internal catalog seam uses the common MCAT logical grammar and native
-`Catalog.fromStored` graph validation before target acquisition. Publication writes MCRT catalog
-pages through `writeCatalogStorage`, with the merged reader7/manifest8/body6 contract.
-Sequences, views, indexes/constraints, missing/backfill vectors, triggers, FTS and managed fields
-have explicit typed TODO refusals until stage4 supports their complete semantics.
-It is not a complete owner load command or a frozen portable format. No supported stored
-format changes, existing upgrade chain or public package API are introduced by this stage.
+Portable catalog1 uses a24-byte PCAT header: magic, u16 version1, u16 reserved0,
+u53 common MCAT length and u53 sequence-horizon count. The complete native MCAT stream
+follows. Each horizon has u53 sequence ID, u32 decimal byte length, u32 reserved0 and canonical
+ASCII decimal (`0` or an optional minus followed by nonzero-leading digits). Horizons match
+every sequence in catalog declaration order. Missing/duplicate/unknown IDs, noncanonical
+numbers, reserved bits, versions, lengths and trailing bytes refuse before target acquisition.
+The central registry covers both objects; no native catalog tags or stored versions change.
 
-Stage3 load validates its accepted catalog subset before target acquisition: unknown fields,
-duplicate IDs/names, unsafe integers, allocation-counter floors and unresolved references
-are refused. Views, sequences, indexes/constraints and missing/backfill vectors require the
-stage4 scope and receive a typed refusal here. Required MCAT features are checked, optional
-display extensions follow native preservation rules, and unsupported trigger/managed/FTS
-semantics cannot disappear through catalog construction. This is an unreleased development interface.
+`write/snapshot-capture.ts:exportSnapshot` captures the committed pin, immutable catalog and
+read-only sequence horizons synchronously before its first await. Output/cancel/error closes
+the catalog encoder and returns every capture charge. Later reservations, setval and owner
+checkpoints cannot change the archive's restart horizons. Loading writes those horizons into
+the new native root; unused reservations may be skipped, and ordinary sequence allocation
+continues after load/reopen. Definitions retain ownership, increment, bounds and CYCLE semantics.
+
+Catalog validation reuses the full native `Catalog.fromStored` checks before target acquisition:
+names/IDs, safe integer ranges, every counter floor, references, typed missing lanes and native
+expression metadata. Views and missing/backfill vectors are preserved through MCAT/MCHG and
+MCRT publication. This loader still has typed TODO refusals for indexes/FKs/CHECK, trigger/FTS,
+managed objects and closed text sets until their offline validation/reconstruction is wired.
+It never drops those declarations. Required MCAT features refuse; optional display extensions
+follow native preservation rules. The encoded catalog copies and full decoded graph are
+charged; encoded copies are dropped before target acquisition. The graph must fit the admitted
+working step, not an arbitrary1MiB catalog cap. Table rows remain streamed in bounded blocks.
+This is an unreleased internal interface, not a public owner command or frozen format.
 
 Complete snapshot replacement borrows the extent space's immutable, disk-backed current-root
 inventory as retirement claims. It does not collect old extents in a JavaScript Set or array.

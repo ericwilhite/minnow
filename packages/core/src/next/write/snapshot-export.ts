@@ -179,8 +179,8 @@ class Source {
 }
 
 /** Ownership of snapshot transfers to this call, including errors/cancel before the first byte.
- * catalog yields the matching portable catalog1 bytes, borrowed until advance; stage4 captures
- * its catalog/sequence scope at pin time. Output backpressure is sink.write settlement.
+ * catalog yields the matching portable catalog1 bytes, borrowed until advance. exportSnapshot
+ * captures catalog/sequence scope synchronously with its pin. Output backpressure is sink.write settlement.
  */
 export async function exportPinnedSnapshot(
   snapshot: Snapshot,

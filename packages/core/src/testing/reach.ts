@@ -60,6 +60,8 @@ export const DURABLE_REGISTRY_REACH = [
   "snapshotFrame",
   "snapshotFooter",
   "snapshotColumn",
+  "snapshotCatalog",
+  "snapshotSequence",
   "rootSlot",
   "epochSlot",
   "logHeader",
@@ -8789,4 +8791,34 @@ export const SNAPSHOT_SEQUENCE_CAPTURE_REACH = [
   "older horizon preserved",
   "released",
   "denied",
+] as const;
+
+export const SNAPSHOT_CATALOG_SCOPE_REACH = [
+  "bigint horizons",
+  "typed missing",
+  "logged typed lanes",
+  "strict horizon count",
+  "strict horizon id",
+  "canonical decimal",
+  "sequence reserved",
+  "catalog reserved",
+  "unknown version",
+  "trailing bytes",
+  "before first await",
+  "continued sequence",
+  "cancel release",
+] as const;
+
+export const SNAPSHOT_SEQUENCE_LOAD_REACH = [
+  "owned identity",
+  "ascending",
+  "descending",
+  "pin time",
+  "continue writing",
+  "reopen",
+  "horizon refusal",
+  "sequence counter floor",
+  "sequence owner reference",
+  "identity reference",
+  "sequence name uniqueness",
 ] as const;

@@ -24,7 +24,6 @@ import {
   encodeGroupPage,
   encodeManifestRoot,
   encodeTableStatistics,
-  parseCharge,
   ParseBudgetError,
   type GroupPageEntry,
 } from "../format/manifest-codec.js";
@@ -43,14 +42,13 @@ import {
   type ExtentSpace,
   type ExtentWriter,
 } from "../storage/extents.js";
-import { decodeCatalogStream } from "./catalog-stream.js";
+import { decodeSnapshotCatalog, type SnapshotHorizon } from "./snapshot-catalog.js";
 import { writeCatalogStorage } from "./catalog-storage.js";
 import { UnsupportedCatalogError } from "./catalog-records.js";
 import { SnapshotFormatError } from "../format/snapshot.js";
 import { StoreCorruptionError } from "../storage/contract.js";
 import { DurableFormatError } from "../durable-format.js";
-import { validateSnapshotCatalog } from "./snapshot-catalog-validate.js";
-import { Catalog } from "./catalog.js";
+import type { Catalog } from "./catalog.js";
 import { SnapshotScopeError } from "./snapshot-export.js";
 import { SnapshotNativeBuilder, snapshotBlockEnd } from "./snapshot-native.js";
 import {
@@ -74,14 +72,20 @@ export interface SnapshotLoadOptions extends SnapshotWork {
   readonly replace?: boolean;
 }
 
-function stage3Scope(catalog: Catalog): void {
-  if (catalog.sequences.length !== 0)
-    throw new SnapshotScopeError("Sequence capture requires portable catalog1 (stage4)");
+function snapshotScope(catalog: Catalog): void {
+  // TODO(B6/B2): CHECK evaluation and FTS postings reconstruction are not wired
+  // into this offline loader. Carry nothing partially; refuse before acquiring the target.
+  if (catalog.fts.length || catalog.triggers.length)
+    throw new SnapshotScopeError("TODO(B6): portable FTS/trigger reconstruction is unsupported");
+  if (catalog.views.some((view) => view.managed === true))
+    throw new SnapshotScopeError("TODO(B6): managed view snapshot scope is unsupported");
   for (const table of catalog.tables) {
-    if (table.indexes.length !== 0 || table.foreignKeys.length !== 0 || table.checks.length !== 0)
-      throw new SnapshotScopeError("Index/constraint snapshot reconstruction requires stage4");
-    if (table.columns.some((column) => column.missing !== null))
-      throw new SnapshotScopeError("Missing/backfill values require portable catalog1 (stage4)");
+    if (table.managed === true)
+      throw new SnapshotScopeError("TODO(B6): managed table snapshot scope is unsupported");
+    if (table.indexes.length || table.foreignKeys.length || table.checks.length)
+      throw new SnapshotScopeError("TODO(B2): portable index/constraint reconstruction");
+    if (table.columns.some((column) => column.allowedValues !== undefined))
+      throw new SnapshotScopeError("TODO(B6): portable closed-set validation");
   }
 }
 class NativeTable {
@@ -298,7 +302,8 @@ async function loadAttempt(
       tables: TableRoot[] = [];
     let catalogLength = 0,
       catalog: Catalog | undefined,
-      catalogBytes: Uint8Array | undefined,
+      catalogReady = false,
+      horizons: readonly SnapshotHorizon[] = [],
       tableIndex = 0,
       columnIndex = 0,
       old: ManifestRoot | null = null,
@@ -310,33 +315,35 @@ async function loadAttempt(
       const payload = frame.payload;
       if (frame.kind === SnapshotKind.catalogPart) {
         snapshotCheck(
-          catalogLength + payload.length <= 1024 * 1024,
-          "Portable catalog exceeds native catalog capacity",
+          Number.isSafeInteger(catalogLength + payload.length),
+          "Portable catalog length exceeds u53",
         );
         account.take(payload.length + 128);
         catalogParts.push(payload.slice());
         catalogLength += payload.length;
       } else if (frame.kind === SnapshotKind.catalogEnd) {
-        account.take(catalogLength + parseCharge(catalogLength) * 4);
-        catalogBytes = new Uint8Array(catalogLength);
+        account.take(catalogLength);
+        let catalogBytes: Uint8Array | undefined = new Uint8Array(catalogLength);
         let at = 0;
         for (const part of catalogParts) {
           catalogBytes.set(part, at);
           at += part.length;
         }
         try {
-          const data = decodeCatalogStream(catalogBytes);
-          validateSnapshotCatalog(data);
-          catalog = Catalog.fromStored(data, budget);
+          const decoded = decodeSnapshotCatalog(catalogBytes, account);
+          catalog = decoded.value.catalog;
+          horizons = decoded.value.horizons;
         } catch (error) {
           if (error instanceof UnsupportedCatalogError) throw new SnapshotScopeError(error.message);
           if (error instanceof StoreCorruptionError || error instanceof DurableFormatError)
             throw new SnapshotFormatError(error.message);
           throw error;
         }
-        stage3Scope(catalog);
-        catalogParts.length = 0;
-        account.free(catalogLength); // part copies consumed; slots remain funded
+        snapshotScope(catalog);
+        catalogReady = true;
+        catalogBytes = undefined;
+        account.free(catalogLength * 2 + catalogParts.length * 128);
+        catalogParts.length = 0; // only the decoded catalog/horizon graph survives target open
         // Prove the publication step fits before acquiring the owner. Its scratch is not
         // allocated until publication, so it need not overlap temporary extent-list encoding.
         account.take(4 * 1024 * 1024);
@@ -473,7 +480,7 @@ async function loadAttempt(
         writer !== undefined &&
         scratchWriter !== undefined &&
         catalog !== undefined &&
-        catalogBytes !== undefined &&
+        catalogReady &&
         table === undefined &&
         tableIndex === catalog.tables.length,
       "Incomplete native snapshot generation",
@@ -492,7 +499,7 @@ async function loadAttempt(
       catalogVersion: catalog.version,
       catalog: catalogRef,
       nextTableId: catalog.counters.nextTableId,
-      sequences: [],
+      sequences: horizons,
       tables,
       clients: [],
       extentList: prepared.list,

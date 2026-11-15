@@ -1,5 +1,11 @@
 import { encodeFtsJournal, decodeFtsJournal } from "../format/fts-journal.js";
 import { encodeFts, decodeFts, type FtsValues } from "../format/fts-codec.js";
+import {
+  encodeSnapshotCatalogHeader,
+  decodeSnapshotCatalog,
+  encodeSnapshotSequence,
+  decodeSnapshotSequence,
+} from "../write/snapshot-catalog.js";
 import { ftsSemantics } from "../fts-config.js";
 import {
   encodeCatalogStream,
@@ -487,9 +493,23 @@ function adapters(): Record<Exclude<DurableFormatName, "indexedDb">, Adapter> {
   );
   const journalBytes = journal.bytes.slice();
   journal.close();
+  const nativeCatalog = Catalog.empty().encode(),
+    portableCatalog = new Uint8Array(24 + nativeCatalog.length);
+  encodeSnapshotCatalogHeader(nativeCatalog.length, 0, portableCatalog.subarray(0, 24));
+  portableCatalog.set(nativeCatalog, 24);
+  const sequenceBudget = budget(),
+    encodedSequence = encodeSnapshotSequence(
+      { sequenceId: 1, reservedThrough: -2n },
+      sequenceBudget,
+    ),
+    sequence = encodedSequence.bytes.slice();
+  encodedSequence.close();
+  expect(sequenceBudget.held).toBe(0);
   return {
     ftsJournal: { bytes: journalBytes, decode: parsed(decodeFtsJournal) },
     ...ftsAdapters(),
+    snapshotCatalog: { bytes: portableCatalog, decode: parsed(decodeSnapshotCatalog) },
+    snapshotSequence: { bytes: sequence, decode: parsed(decodeSnapshotSequence) },
     snapshotColumn: {
       bytes: portable,
       decode: (bytes) => decodeSnapshotColumnHeader(integer.type, bytes),
