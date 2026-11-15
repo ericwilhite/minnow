@@ -5,6 +5,8 @@ import type { Rel } from "../ir/ir.js";
 export interface RuleReach {
   readonly tables: readonly number[];
   readonly triggers: boolean;
+  /** New action descriptors must not fall through to legacy follow/delete behavior. */
+  readonly unsupportedReferentialActions: boolean;
 }
 interface Work {
   tableId: number;
@@ -24,6 +26,7 @@ export function statementRuleReach(
     tables = new Set<number>();
   const seen = new Map<string, Set<number> | null>();
   let triggers = false;
+  let unsupportedReferentialActions = false;
   const enqueue = (
     id: number,
     event: TriggerEvent,
@@ -83,12 +86,16 @@ export function statementRuleReach(
         if (fk.parentTableId !== own.id) continue;
         if (state.event === "delete") {
           if (!fk.enforced) continue;
+          if (fk.onDelete === "setDefault") unsupportedReferentialActions = true;
           if (fk.onDelete === "cascade") enqueue(child.id, "delete", state.budget, null);
           else if (fk.onDelete === "setNull")
             enqueue(child.id, "update", state.budget, fk.columnIds);
         } else {
           const index = own.indexes.find((i) => i.id === fk.parentIndexId);
           if (assigned !== null && !index?.columnIds.some((id) => assigned.has(id))) continue;
+          // The existing executor implements enforced, omitted-update follow only.
+          // Explicit modes and informational follow need the bounded RI driver.
+          if (fk.onUpdate !== "follow" || !fk.enforced) unsupportedReferentialActions = true;
           // Conservative reach until the RI driver consumes exact action descriptors.
           // Informational follow references also need their child's row rules.
           const columns = [
@@ -99,5 +106,5 @@ export function statementRuleReach(
         }
       }
   }
-  return { tables: [...tables], triggers };
+  return { tables: [...tables], triggers, unsupportedReferentialActions };
 }

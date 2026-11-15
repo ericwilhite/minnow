@@ -3864,7 +3864,11 @@ ON UPDATE is stored as `follow`, distinct from explicit CASCADE and from Postgre
 NO ACTION default. The schema inspector exposes these modes and stored trigger identities.
 MCAT foreignKey10's required field9 carries onUpdate; these development bytes need the
 next pre-fence selector allocation before publication. Native RI execution/trigger firing
-remain the separate joint B6/B5b consumer described in the inventory.
+remain the separate joint B6/B5b consumer described in the inventory. Until that driver is
+installed, SQL refuses explicit ON UPDATE modes, ON DELETE SET DEFAULT and informational
+rekeys with 0A000, including raw executor requests. These descriptors cannot select legacy
+follow behavior or silently skip informational follow. Enforced omitted-update follow,
+non-key updates and DO NOTHING retain their existing execution paths.
 
 Current-prefix pins from Statement.readOwn are phase pins, not immutable data snapshots.
 Consume/spool every body input before mutation; once mutation begins, all data/index rereads

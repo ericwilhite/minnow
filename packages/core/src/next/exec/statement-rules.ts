@@ -18,6 +18,7 @@ import { ExpressionMemoryError } from "./kernels/vectors.js";
 export class StatementRules {
   readonly #tables: number[];
   readonly requiresTriggers: boolean;
+  readonly requiresReferentialRuntime: boolean;
   readonly #bound = new Map<number, BoundTableRules>();
   readonly #native = new Map<number, TableRules>();
   #targets: ModifyTargetSet | null = null;
@@ -40,6 +41,7 @@ export class StatementRules {
   ) {
     const reach = statementRuleReach(catalog, root, modify);
     this.requiresTriggers = reach.triggers;
+    this.requiresReferentialRuntime = reach.unsupportedReferentialActions;
     this.#tables = reach.tables.filter((id) => {
       const table = catalog.table(id);
       return (

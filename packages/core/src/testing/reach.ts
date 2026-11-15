@@ -7680,6 +7680,7 @@ export const MODIFY_INDEX_REACH = [
 ] as const;
 
 export const MODIFY_ROW_RULES_REACH = [
+  "omitted follow policy",
   "insert generated",
   "update generated",
   "generated DEFAULT",
@@ -7866,4 +7867,25 @@ export const MODIFY_UPSERT_POINT_REACH = [
   "NULL",
   "text",
   "one physical row",
+] as const;
+
+/** Action metadata cannot select a different old executor policy while its RI driver is absent. */
+export const MODIFY_FK_GUARDS_REACH = [
+  "update",
+  "upsert",
+  "delete",
+  "CASCADE",
+  "SET NULL",
+  "SET DEFAULT",
+  "RESTRICT",
+  "NO ACTION",
+  "informational",
+  "deleteDefault",
+  "follow",
+  "non-key update allowed",
+  "DO NOTHING allowed",
+  "raw guarded",
+  "owned guarded",
+  "RETURNING",
+  "plain",
 ] as const;

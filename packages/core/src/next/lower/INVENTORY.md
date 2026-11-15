@@ -869,3 +869,7 @@ read-only inspection tolerates unknown optional fields, retains no opaque payloa
 initialize a writable Catalog or encoder. Known semantic fields are required whenever present;
 requiredFeatures is centrally registered, sorted/unique and coherent with nonempty sections.
 Separate pre-fence root minimum-reader/minimum-writer admission belongs to B2, not this codec.
+
+SQL execution guards explicit ON UPDATE modes, ON DELETE SET DEFAULT and informational
+rekeys with0A000 until that bounded RI consumer is installed. Non-key updates, DO NOTHING
+and enforced omitted-update follow remain executable. The guard also covers raw executors.

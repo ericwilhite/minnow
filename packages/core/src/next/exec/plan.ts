@@ -361,6 +361,18 @@ function instantiate<T>(
   );
 }
 
+function requireModifyRuntime(runtime: QueryRuntime, rel: Extract<Rel, { op: "modify" }>): void {
+  const statement = runtime.request.statement;
+  if (!statement) return;
+  const rules = runtime.request.rowRules;
+  const reach =
+    rules === undefined ? statementRuleReach(statement.catalog, rel.tableId, rel) : null;
+  if (rules?.requiresTriggers ?? reach?.triggers ?? false)
+    throw new UnsupportedPlanError("trigger firing requires its admitted native runtime");
+  if (rules?.requiresReferentialRuntime ?? reach?.unsupportedReferentialActions ?? false)
+    throw new UnsupportedPlanError("referential action requires its admitted native runtime");
+}
+
 function counted(runtime: QueryRuntime, rel: OperatorIdentity, sink: Operator): Operator {
   const profile = runtime.profile(rel);
   return {
@@ -918,12 +930,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           );
           fixed(rel, (_cap, runtime) => minimum(runtime));
           return (runtime, _downstream, stops) => {
-            if (
-              runtime.request.statement &&
-              (runtime.request.rowRules?.requiresTriggers ??
-                statementRuleReach(runtime.request.statement.catalog, rel.tableId, rel).triggers)
-            )
-              throw new UnsupportedPlanError("trigger firing requires its admitted native runtime");
+            requireModifyRuntime(runtime, rel);
             if (rel.kind === "upsert") {
               const table = runtime.request.statement?.catalog.table(rel.tableId);
               const conflict = rel.onConflict;
@@ -1076,12 +1083,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
           };
         }
         return (runtime, downstream, stops) => {
-          if (
-            runtime.request.statement &&
-            (runtime.request.rowRules?.requiresTriggers ??
-              statementRuleReach(runtime.request.statement.catalog, rel.tableId, rel).triggers)
-          )
-            throw new UnsupportedPlanError("trigger firing requires its admitted native runtime");
+          requireModifyRuntime(runtime, rel);
           const statement = runtime.request.statement;
           if (statement === null) throw new TypeError("modify requires a statement");
           const writer = statement.table(rel.tableId, {

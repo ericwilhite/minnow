@@ -17,8 +17,8 @@ it.each(seedsFor("next-modify-row-rules", [0xb5c1, 0xb5c2]))(
     const reach = createReach("root row rules", MODIFY_ROW_RULES_REACH);
     const bag = (rows: readonly unknown[] | undefined) =>
       [...(rows ?? [])].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
-    const all = async (sql: string, params: readonly number[] = []) => {
-      const actual = await core.execute(sql, params),
+    const all = async (sql: string, params: readonly number[] = [], nativeSql = sql) => {
+      const actual = await core.execute(nativeSql, params),
         expected = await pg.query(sql, [...params]),
         old = await shipped.run({ kind: "sql", sql, params });
       if ("returning" in actual) {
@@ -79,11 +79,18 @@ it.each(seedsFor("next-modify-row-rules", [0xb5c1, 0xb5c2]))(
             await all("CREATE TABLE rule_parent(id INTEGER PRIMARY KEY)");
             await all(
               "CREATE TABLE rule_child(id INTEGER PRIMARY KEY,pid INTEGER REFERENCES rule_parent(id) ON UPDATE CASCADE ON DELETE SET NULL,g INTEGER GENERATED ALWAYS AS(COALESCE(pid,0)*2) STORED CHECK(g>=0))",
+              [],
+              // Product omission means identity-follow; PG uses explicit CASCADE for this control.
+              "CREATE TABLE rule_child(id INTEGER PRIMARY KEY,pid INTEGER REFERENCES rule_parent(id) ON DELETE SET NULL,g INTEGER GENERATED ALWAYS AS(COALESCE(pid,0)*2) STORED CHECK(g>=0))",
             );
             await all("INSERT INTO rule_parent VALUES(1)");
             await all("INSERT INTO rule_child(id,pid) VALUES(10,1)");
             await all(`UPDATE rule_parent SET id=id+${String(delta)} RETURNING id`);
             await all("SELECT * FROM rule_child ORDER BY id");
+            expect(
+              core.harness.path.catalog.tableByName("rule_child")?.foreignKeys[0]?.onUpdate,
+            ).toBe("follow");
+            reach.reach("omitted follow policy");
             reach.reach("FK generated rekey");
             await all("DELETE FROM rule_parent RETURNING id");
             await all("SELECT * FROM rule_child ORDER BY id");

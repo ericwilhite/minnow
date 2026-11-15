@@ -139,6 +139,9 @@ identities. Its catalog metadata type can describe the added action spellings an
 The shipped 0.x SQL input/runtime behavior stays unchanged. Duplicate action clauses
 are refused with PostgreSQL's syntax error in the native front end. Native action execution and
 trigger firing still require the joint execution integration; metadata alone does not enable them.
+Until that driver is installed, explicit native ON UPDATE modes, ON DELETE SET DEFAULT and
+informational rekeys refuse with 0A000 rather than falling through to a different action.
+Non-key updates, DO NOTHING and enforced omitted-update follow remain executable.
 The shared parser and schema-action comparison measure 1,179,776 raw / 353,876 gzip bytes
 for the main bundle, 1,592,207 / 460,862 with OPFS, and 1,588,242 / 458,212 for the
 IndexedDB worker. Raise their raw/gzip caps once by 512/256, 512/256 and 768/128 bytes;
