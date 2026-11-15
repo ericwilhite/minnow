@@ -7,12 +7,15 @@ import type {
   WriteEvent,
 } from "../access/statement-command.js";
 import type { MaybePromise } from "../access/key-index.js";
+import type { SnapshotImpl } from "../write/view.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import { SpillCorruptionError } from "../spill/contract.js";
 import type { RegistryDirectory } from "./registry-directory.js";
 
 const ACCEPTED = 5,
-  REFERENTIAL = 6;
+  REFERENTIAL = 6,
+  TARGET_NAMESPACE = 7,
+  TARGET_BITMAP = 8;
 const EVENTS = ["childInsert", "childUpdate", "parentDelete", "parentUpdate"] as const;
 const KINDS = [
   "checkReference",
@@ -80,6 +83,7 @@ export class RegistryCommands {
   #frames: Array<Frame | null> = [];
   #record: Uint8Array | null = null;
   #next = 0;
+  #nextTargets = 0;
   #pending: Promise<unknown> | null = null;
   #closed = false;
   #closing: Promise<void> | null = null;
@@ -164,6 +168,67 @@ export class RegistryCommands {
   /** Synchronous live capability check for primary continuations, before and after awaits. */
   budget(command: CommandToken): number {
     return this.#frame(command).budget;
+  }
+  /** SQL join/body repeat policy is command-local. RI inputs with proven unique captured
+   * targets do not use this tracker: separate actions may legally rewrite the same child.
+   * Caller validates the input's statement origin and supplies its original target identity;
+   * conflict versions resolve through lineage first, rather than using a rewritten physical ID.
+   * Both namespaces and 1024-row bitmaps use the shared paged directory, never a file/Set
+   * per command. The existing prepaid record is the only bitmap workspace. */
+  testAndSetTarget(
+    command: CommandToken,
+    tableId: number,
+    rowId: number,
+    input: SnapshotImpl,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const check = () => {
+      this.#frame(command);
+      signal.throwIfAborted();
+      input.check();
+    };
+    check();
+    positive(tableId);
+    if (!Number.isSafeInteger(rowId) || rowId < 0) invalid();
+    return this.#work(async () => {
+      const record = this.#record ?? invalid();
+      const present = await this.scope.directory.get(TARGET_NAMESPACE, tableId, record, command.id);
+      check();
+      const header = viewOf(record);
+      let namespace: number;
+      if (present) {
+        namespace = header.getFloat64(0, true);
+        if (
+          !Number.isSafeInteger(namespace) ||
+          namespace < 1 ||
+          header.getFloat64(8, true) !== tableId ||
+          header.getFloat64(16, true) !== command.id
+        )
+          corrupt();
+      } else {
+        positive(this.#nextTargets + 1);
+        namespace = ++this.#nextTargets;
+        record.fill(0);
+        header.setFloat64(0, namespace, true);
+        header.setFloat64(8, tableId, true);
+        header.setFloat64(16, command.id, true);
+        await this.scope.directory.put(TARGET_NAMESPACE, tableId, record, command.id);
+        check();
+      }
+      const block = Math.floor(rowId / 1024),
+        bit = rowId % 1024,
+        byte = Math.floor(bit / 8),
+        mask = 1 << (bit % 8);
+      await this.scope.directory.get(TARGET_BITMAP, block, record, namespace);
+      check();
+      const seen = ((record[byte] ?? 0) & mask) !== 0;
+      if (!seen) {
+        record[byte] = (record[byte] ?? 0) | mask;
+        await this.scope.directory.put(TARGET_BITMAP, block, record, namespace);
+        check();
+      }
+      return seen;
+    });
   }
   async #get(kind: number, id: number): Promise<DataView> {
     const record = this.#record;

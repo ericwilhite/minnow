@@ -4172,7 +4172,13 @@ separate integration responsibilities.
 immutable RI descriptors in the shared directory. Its fixed frame slots retain separate
 uniqueness and reference cursors. Every action checks its newly accepted child work, even
 when an earlier action already verified the same command token. Retired commands and RI
-IDs refuse; signed trigger budgets survive replay. Close fences pending verification callbacks
+IDs refuse; signed trigger budgets survive replay. Its command-local target tracker uses
+command/table namespace records and 1024-row bitmaps in that same shared directory, with the existing
+128-byte scratch record. Nested/reused commands have independent seen state; ancestors
+retain theirs. No file or resident Set is created per command. Every directory await rechecks
+the input locator pin and live command before target acceptance. RI inputs with a proven
+unique captured source bypass SQL repeat tracking so separate actions may rewrite a child.
+Close fences pending verification callbacks
 before returning metadata credit. This module stores work; native constraint verification,
 accepted-write capture and RI execution remain responsibilities of the native provider.
 

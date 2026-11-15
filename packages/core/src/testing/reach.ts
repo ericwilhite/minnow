@@ -8369,3 +8369,39 @@ export const COLUMN_RULE_BINDING_REACH = [
   "complete NOT NULL validator",
   "zero charge",
 ] as const;
+
+export const REGISTRY_COMMAND_TARGET_REACH = [
+  "three live commands",
+  "table isolation",
+  "command isolation",
+  "reused frame",
+  "ancestor survives child",
+  "cold bitmap revisit",
+  "neighbor bits and block boundary",
+  "wide native ID",
+  "zero native ID",
+  "one shared file",
+  "constant metadata",
+  "zero ownership",
+] as const;
+export const REGISTRY_COMMAND_TARGET_PIN_REACH = [
+  "boundary1",
+  "boundary2",
+  "boundary3",
+  "boundary4",
+  "one final target",
+  "no accepted mutation",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_COMMAND_TARGET_FENCE_REACH = [
+  "cancel",
+  "retire",
+  "close",
+  "cancel on final await",
+  "retire on final await",
+  "close on final await",
+  "close retains metadata through IO",
+  "no accepted mutation",
+  "zero ownership",
+] as const;
