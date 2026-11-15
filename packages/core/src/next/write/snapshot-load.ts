@@ -540,6 +540,9 @@ async function loadAttempt(
       sequences: horizons,
       tables,
       clients: [],
+      // Portable scope rejects FTS definitions: no old native acceleration/history
+      // may follow table IDs into the replacement generation. R25 retires its pages.
+      fts: { checkpoint: null, staged: null },
       extentList: prepared.list,
     };
     account.take(4 * 1024 * 1024);

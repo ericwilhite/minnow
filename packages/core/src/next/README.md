@@ -4256,6 +4256,12 @@ the guarded provider; the follow preparation/action scheduler is not enabled her
 
 ### Portable snapshot load
 
+The imported manifest uses canonical empty native FTS state (`checkpoint: null`, `staged: null`):
+portable scope refuses FTS definitions. Complete-generation retirement consumes the old R25
+inventory, including its FTS journal and payload extents, exactly once. Those bytes stay live
+while the previous root reaches them, then retire after the next publication. No old FTS state
+is carried into reused table IDs in the imported catalog.
+
 `write/snapshot-load.ts` implements the internal portable native loader. Its target factory must hold
 an exclusive, recovered and settled owner with no active writer/maintenance, and report logical
 emptiness and the actual last LSN. Replacement is explicit. Header and catalog checks precede

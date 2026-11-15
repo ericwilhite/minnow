@@ -8897,3 +8897,14 @@ export const SNAPSHOT_SEQUENCE_DROP_REACH = [
   "many emissions",
   "zero charges",
 ] as const;
+
+export const SNAPSHOT_FTS_RETIREMENT_REACH = [
+  "old FTS inventory exactly once",
+  "canonical empty FTS state",
+  "previous root FTS remains readable",
+  "old FTS physical retirement exactly once",
+  "ordinary reopen and continued write",
+  "one checkpoint",
+  "several checkpoints",
+  "zero charges",
+] as const;
