@@ -8087,6 +8087,41 @@ export const REGISTRY_SCALAR_REACH = [
   "zero ownership",
 ] as const;
 
+export const NATIVE_PRIMARY_IMAGE_WIDTH_REACH = [
+  "insert",
+  "update",
+  "NULL",
+  "non-NULL",
+  "empty",
+  "small",
+  "above fragment",
+  "constraint rollback",
+  "accepted row",
+  "writer prepared before lease",
+  "zero ownership",
+] as const;
+export const REGISTRY_IMAGE_SIZING_REACH = [
+  "insert",
+  "update",
+  "delete",
+  "NULL",
+  "non-NULL",
+  "empty",
+  "small",
+  "above fragment",
+  "no payload read",
+  "no admission",
+  "constant ownership",
+  "foreign root refused",
+  "continued full read",
+  "zero ownership",
+] as const;
+export const REGISTRY_IMAGE_SIZING_LIFETIME_REACH = [
+  "caller cancellation",
+  "close during IO",
+  "charge until IO drain",
+  "zero ownership",
+] as const;
 export const REGISTRY_IMAGES_REACH = [
   "INSERT images",
   "UPDATE images",

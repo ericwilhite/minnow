@@ -18,6 +18,7 @@ import type { RegistryFragments } from "./registry-fragments.js";
 import {
   loadRegistryScalar,
   registryScalarBytes,
+  registryScalarVarlenBytes,
   registryScalarStoreBytes,
   registryScalarWorkspaceBytes,
   storeRegistryScalar,
@@ -29,6 +30,11 @@ const IMAGE = 1,
 export interface ImageSource {
   readonly batch: Batch;
   readonly row: number;
+}
+export interface NativeImageShape {
+  readonly tableId: number;
+  readonly hasOld: boolean;
+  readonly hasNew: boolean;
 }
 export interface RegistryImageScope {
   readonly rootId: number;
@@ -265,13 +271,7 @@ export class RegistryImages {
       throw error;
     }
   }
-  #read(
-    ref: RowImageRef,
-    projection: RowBindingProjection | null,
-    signal: AbortSignal,
-  ): Promise<RowBindingLease> {
-    signal = AbortSignal.any([signal, this.scope.signal, this.#stop.signal]);
-    this.#check(signal);
+  #origin(ref: RowImageRef): void {
     if (
       ref.spoolId !== this.scope.rootId ||
       !Number.isSafeInteger(ref.row) ||
@@ -279,26 +279,75 @@ export class RegistryImages {
       ref.row > this.#nextImage
     )
       state();
+  }
+  async #info(ref: RowImageRef, signal: AbortSignal) {
+    const header = this.#header;
+    if (!header) state();
+    await this.#get(IMAGE, ref.row, header);
+    this.#check(signal);
+    const view = viewOf(header),
+      table = this.scope.catalog.table(view.getFloat64(16, true));
+    if (
+      table?.schemaVersion !== view.getFloat64(24, true) ||
+      table.columns.length !== view.getUint32(36, true) ||
+      view.getUint8(32) > 1 ||
+      view.getUint8(33) > 1
+    )
+      corrupt();
+    const oldHead = view.getFloat64(0, true),
+      nextHead = view.getFloat64(8, true),
+      hasOld = view.getUint8(32) === 1,
+      hasNext = view.getUint8(33) === 1;
+    if (
+      (!hasOld && !hasNext) ||
+      !Number.isSafeInteger(oldHead) ||
+      !Number.isSafeInteger(nextHead) ||
+      oldHead < 0 ||
+      nextHead < 0 ||
+      hasOld !== oldHead > 0 ||
+      hasNext !== nextHead > 0
+    )
+      corrupt();
+    return { table, oldHead, nextHead, hasOld, hasNext };
+  }
+  /** Fill caller-prepaid physical-column widths before writer progress preparation. Only
+   * directory records are read: no payload, decoded image lease, or independent admission.
+   * The caller keeps this scalar array through prepare, then borrows the actual image. */
+  describe(ref: RowImageRef, widths: number[], signal: AbortSignal): Promise<NativeImageShape> {
+    this.#check(signal);
+    this.#origin(ref);
     return this.#work(async () => {
-      const header = this.#header;
-      if (!header) state();
-      await this.#get(IMAGE, ref.row, header);
+      const { table, nextHead, hasOld, hasNext } = await this.#info(ref, signal);
+      if (widths.length !== table.columns.length) state();
+      widths.fill(0);
+      if (hasNext)
+        await this.#walk(
+          table,
+          nextHead,
+          null,
+          (position, scalar) => {
+            const column = table.columns[position];
+            if (!column) corrupt();
+            widths[position] = registryScalarVarlenBytes(scalar, column.type);
+            return Promise.resolve();
+          },
+          signal,
+        );
       this.#check(signal);
-      const view = viewOf(header),
-        table = this.scope.catalog.table(view.getFloat64(16, true));
-      if (
-        table?.schemaVersion !== view.getFloat64(24, true) ||
-        table.columns.length !== view.getUint32(36, true) ||
-        view.getUint8(32) > 1 ||
-        view.getUint8(33) > 1
-      )
-        corrupt();
+      return { tableId: table.id, hasOld, hasNew: hasNext };
+    });
+  }
+  #read(
+    ref: RowImageRef,
+    projection: RowBindingProjection | null,
+    signal: AbortSignal,
+  ): Promise<RowBindingLease> {
+    signal = AbortSignal.any([signal, this.scope.signal, this.#stop.signal]);
+    this.#check(signal);
+    this.#origin(ref);
+    return this.#work(async () => {
+      const { table, oldHead, nextHead, hasOld, hasNext } = await this.#info(ref, signal);
       if (projection) this.#validateProjection(table, projection);
-      const oldHead = view.getFloat64(0, true),
-        nextHead = view.getFloat64(8, true),
-        hasOld = view.getUint8(32) === 1,
-        hasNext = view.getUint8(33) === 1;
-      if (!hasOld && !hasNext) corrupt();
       let scalarBytes = 0,
         imageExtra = 0,
         workspace = 0;

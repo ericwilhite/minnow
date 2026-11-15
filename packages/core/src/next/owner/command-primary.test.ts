@@ -13,6 +13,7 @@ import {
   NATIVE_PRIMARY_CLOSE_FAULT_REACH,
   NATIVE_ACTION_UNIQUE_REACH,
   NATIVE_BOUNDARY_REFERENCE_REACH,
+  NATIVE_PRIMARY_IMAGE_WIDTH_REACH,
 } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { currentEngine } from "../../testing/differential-current.js";
@@ -297,22 +298,29 @@ async function fixture(
       before: number | null,
       key: number,
       n: number | null,
+      payload: string | null = "changed",
     ) {
       const old =
           before === null ? null : batch(ints([before + 1]), ints([before + 1]), texts(["seed"])),
-        next = event === "delete" ? null : batch(ints([key]), ints([n]), texts(["changed"]));
+        next = event === "delete" ? null : batch(ints([key]), ints([n]), texts([payload]));
       const ref = await images.append(
           id,
           old ? { batch: old, row: 0 } : null,
           next ? { batch: next, row: 0 } : null,
         ),
-        token = await primary.prepare(
-          command,
-          id,
-          event,
-          before === null ? null : firstNative + before,
-          [0, 0, next ? 7 : 0],
-        );
+        widths = [0, 0, 0];
+      // Preserve the parent's constant-width fixture as a replay control. Generated widths
+      // reject that old design through the real native byte-bound check, not a missing method.
+      const sizing: Partial<Pick<RegistryImages, "describe">> = images;
+      if (sizing.describe) await sizing.describe(ref, widths, signal);
+      else widths[2] = next ? 7 : 0;
+      const token = await primary.prepare(
+        command,
+        id,
+        event,
+        before === null ? null : firstNative + before,
+        widths,
+      );
       const lease = await execution.readRowImages(ref, signal);
       leases++;
       let newRowId: number | null;
@@ -398,6 +406,82 @@ async function fixture(
     },
   };
 }
+it.each(seedsFor("next-native-primary-image-width", [0xb60f, 0xb610]))(
+  "uses stored metadata to prepay variable native rows seed %i",
+  async (seed) => {
+    const reach = createReach("native metadata width preflight", NATIVE_PRIMARY_IMAGE_WIDTH_REACH),
+      pg = new PGlite();
+    try {
+      await fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 0, max: 100000 }),
+          fc.boolean(),
+          fc.boolean(),
+          fc.boolean(),
+          async (width, insert, nullable, reject) => {
+            reach.beginHistory();
+            const f = await fixture(1, false, false),
+              payload = nullable ? null : "雪".repeat(width),
+              n = reject ? -1 : 2;
+            try {
+              await pg.exec(
+                "DROP TABLE IF EXISTS t; CREATE TABLE t(id INT PRIMARY KEY,n INT NOT NULL,payload TEXT,CONSTRAINT positive CHECK(n>0)); INSERT INTO t VALUES(1,1,'seed')",
+              );
+              const expected = await result(() =>
+                pg.query(
+                  insert
+                    ? "INSERT INTO t VALUES(2,$1,$2)"
+                    : "UPDATE t SET n=$1,payload=$2 WHERE id=1",
+                  [n, payload],
+                ),
+              );
+              const actual = await result(async () => {
+                await f.write(
+                  insert ? "insert" : "update",
+                  insert ? null : 0,
+                  insert ? 2 : 1,
+                  n,
+                  payload,
+                );
+                await f.statement.end(f.signal);
+              });
+              expect(actual).toBe(expected);
+              await f.settle(actual);
+              expect(await f.rows()).toEqual(
+                (
+                  await pg.query<{ id: number; n: number; payload: string | null }>(
+                    "SELECT * FROM t ORDER BY id",
+                  )
+                ).rows.map((row) => [row.id, row.n, row.payload]),
+              );
+              reach.reach(insert ? "insert" : "update");
+              reach.reach(nullable ? "NULL" : "non-NULL");
+              reach.reach(width === 0 ? "empty" : width > 65536 ? "above fragment" : "small");
+              reach.reach(reject ? "constraint rollback" : "accepted row");
+              reach.reach("writer prepared before lease");
+            } finally {
+              await f.close();
+            }
+            reach.reach("zero ownership");
+          },
+        ),
+        {
+          seed,
+          numRuns: 12,
+          examples: [
+            [0, true, false, false],
+            [12, false, true, false],
+            [99999, false, false, true],
+            [100000, true, false, false],
+          ],
+        },
+      );
+      reach.assertReached();
+    } finally {
+      await pg.close();
+    }
+  },
+);
 it.each(seedsFor("next-native-primary", [0xb5ed]))(
   "applies native command images atomically without legacy deferred work seed %i",
   async (seed) => {

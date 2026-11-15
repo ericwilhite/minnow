@@ -177,7 +177,9 @@ prefix `RI_ConstraintTrigger_` for system triggers (SQLSTATE `42939`, `reserved_
 
 The private 1.0 write path adds separately owned current-statement read pins and validates
 body-writer locator origins, for trigger substatement integration. Released pins retire from
-the root's active ownership set; commit and rollback close remaining pins. No shipped behavior,
+the root's active ownership set; commit and rollback close remaining pins. The private image
+registry sizes variable NEW values from stored metadata before writer preparation, without
+decoding their payloads or retaining a value lease across that wait. No shipped behavior,
 public API or stored format changes.
 
 - The private 1.0 row-rule evaluator preserves PostgreSQL's first error across generated

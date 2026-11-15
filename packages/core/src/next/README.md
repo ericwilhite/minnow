@@ -4168,6 +4168,13 @@ turn on SQL firing. The caller supplies admitted scope/progress and immutable ta
 statement/command ownership, row rules, accepted-write hooks and deferred RI execution are
 separate integration responsibilities.
 
+`RegistryImages.describe` fills caller-prepaid NEW variable-width sizes from directory
+records, without reading scalar payloads or creating an image lease. The root can prepare
+writer growth from these exact sizes before borrowing OLD/NEW values. NULL and fixed-width
+cells need no variable payload credit. Metadata cancellation and close fence pending backing
+reads before returning the registry's fixed charge. Real native primary tests use this path;
+it does not supply the compiled body host or enable SQL firing.
+
 `owner/registry-commands.ts` records command/frame ownership, accepted native row IDs and
 immutable RI descriptors in the shared directory. Its fixed frame slots retain separate
 uniqueness and reference cursors. Every action checks its newly accepted child work, even

@@ -1,6 +1,6 @@
 /** Actual native registry image storage, projected into the independently owned B6 copier. */
 import fc from "fast-check";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import {
   createReach,
   REGISTRY_IMAGES_REACH,
@@ -8,6 +8,8 @@ import {
   REGISTRY_IMAGES_IO_REACH,
   REGISTRY_IMAGES_WIDE_REACH,
   REGISTRY_IMAGES_WORKSPACE_REACH,
+  REGISTRY_IMAGE_SIZING_REACH,
+  REGISTRY_IMAGE_SIZING_LIFETIME_REACH,
 } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { ROW_IMAGE_UNREAD, type RowImageRef } from "../access/statement-command.js";
@@ -32,6 +34,85 @@ function defined<T>(value: T | null | undefined): T {
   if (value === undefined || value === null) throw new Error("Missing native image test value");
   return value;
 }
+
+it.each(seedsFor("next-registry-image-sizing", [0xb60d, 0xb60e]))(
+  "prepares exact native writer widths without decoding payload seed %i",
+  async (seed) => {
+    const reach = createReach("native image writer sizing", REGISTRY_IMAGE_SIZING_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 0, max: 100000 }),
+        fc.constantFrom("insert", "update", "delete"),
+        fc.boolean(),
+        async (width, event, nullable) => {
+          reach.beginHistory();
+          let sizing = false;
+          const f = fixture(() => {
+              if (sizing) throw new Error("Writer sizing requested decoded payload credit");
+            }),
+            value = nullable ? null : "雪".repeat(width),
+            widths = [99, 99];
+          const read = vi.spyOn(RegistryFragments.prototype, "readInto");
+          try {
+            const ref = await f.images.append(
+              f.table.id,
+              event === "insert" ? null : f.input(1, "old"),
+              event === "delete" ? null : f.input(2, value),
+            );
+            const before = f.held,
+              progress = f.maxProgress;
+            sizing = true;
+            const shape = await f.images.describe(ref, widths, f.signal);
+            expect(shape).toEqual({
+              tableId: f.table.id,
+              hasOld: event !== "insert",
+              hasNew: event !== "delete",
+            });
+            expect(widths).toEqual([0, event === "delete" || nullable ? 0 : width * 3]);
+            expect(read).not.toHaveBeenCalled();
+            expect(f.held).toBe(before);
+            expect(f.maxProgress).toBe(progress);
+            // Reusing the caller's prepaid scalar slots must clear previous widths, including DELETE.
+            widths.fill(77);
+            await f.images.describe(ref, widths, f.signal);
+            expect(widths).toEqual([0, event === "delete" || nullable ? 0 : width * 3]);
+            await expect(
+              Promise.resolve().then(() =>
+                f.images.describe({ ...ref, spoolId: 99 }, widths, f.signal),
+              ),
+            ).rejects.toThrow();
+            sizing = false;
+            const lease = await f.images.readRowImages(ref, f.signal);
+            lease.release();
+            reach.reach(event);
+            reach.reach(nullable ? "NULL" : "non-NULL");
+            reach.reach(width === 0 ? "empty" : width > 65536 ? "above fragment" : "small");
+            reach.reach("no payload read");
+            reach.reach("no admission");
+            reach.reach("constant ownership");
+            reach.reach("foreign root refused");
+            reach.reach("continued full read");
+          } finally {
+            read.mockRestore();
+            await f.close();
+          }
+          reach.reach("zero ownership");
+        },
+      ),
+      {
+        seed,
+        numRuns: 12,
+        examples: [
+          [0, "insert", false],
+          [8, "update", true],
+          [99999, "update", false],
+          [12, "delete", false],
+        ],
+      },
+    );
+    reach.assertReached();
+  },
+);
 function fixture(
   prepare?: RegistryImageScope["prepare"],
   afterRead?: (ref: SpillPageRef) => Promise<void>,
@@ -149,6 +230,75 @@ function fixture(
     },
   };
 }
+
+it.each(seedsFor("next-registry-image-sizing-lifetime", [0xb611, 0xb612]))(
+  "fences cancelled metadata sizing before registry close seed %i",
+  async (seed) => {
+    const reach = createReach(
+      "native metadata sizing lifetime",
+      REGISTRY_IMAGE_SIZING_LIFETIME_REACH,
+    );
+    await fc.assert(
+      fc.asyncProperty(fc.boolean(), async (cancel) => {
+        reach.beginHistory();
+        let armed = false,
+          entered!: () => void,
+          release!: () => void;
+        const arrived = new Promise<void>((resolve) => {
+            entered = resolve;
+          }),
+          heldRead = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+        const f = fixture(undefined, async () => {
+          if (armed) {
+            armed = false;
+            entered();
+            await heldRead;
+          }
+        });
+        const stop = new AbortController(),
+          reason = new Error("cancel sizing IO"),
+          widths = [0, 0];
+        let first: RowImageRef | null = null;
+        try {
+          // Evict the first image's directory records so the test suspends actual backing IO.
+          for (let i = 0; i < 300; i++) {
+            const ref = await f.images.append(f.table.id, null, f.input(i, "payload"));
+            first ??= ref;
+          }
+          armed = true;
+          const pending = f.images.describe(defined(first), widths, stop.signal);
+          pending.catch(() => undefined);
+          await arrived;
+          let closed = false;
+          const before = f.held;
+          const closing = cancel
+            ? null
+            : f.images.close().then(() => {
+                closed = true;
+              });
+          if (cancel) stop.abort(reason);
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          expect(closed).toBe(false);
+          expect(f.held).toBe(before);
+          release();
+          if (cancel) await expect(pending).rejects.toBe(reason);
+          else await expect(pending).rejects.toThrow();
+          await closing;
+          reach.reach(cancel ? "caller cancellation" : "close during IO");
+          reach.reach("charge until IO drain");
+        } finally {
+          release();
+          await f.close();
+        }
+        reach.reach("zero ownership");
+      }),
+      { seed, numRuns: 4, examples: [[true], [false]] },
+    );
+    reach.assertReached();
+  },
+);
 
 it.each(seedsFor("next-registry-images", [0xb5df]))(
   "replays immutable projected row images under pressure seed %i",

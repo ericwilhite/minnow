@@ -179,6 +179,15 @@ export function registryScalarBytes(record: Uint8Array, type: PhysicalType): num
   return dataBytes(type, 1) + length;
 }
 
+/** Exact writer sizing from the scalar header. NULL and fixed-width cells need no
+ * variable payload credit; measuring never opens a fragment or decodes a value. */
+export function registryScalarVarlenBytes(record: Uint8Array, type: PhysicalType): number {
+  const bytes = registryScalarBytes(record, type);
+  return layoutOf(type) === "varlen" && viewOf(record).getUint8(16) === 1
+    ? bytes - dataBytes(type, 1)
+    : 0;
+}
+
 /** One decode step, released before the next column. Includes the encoded coefficient and
  * simultaneous arithmetic temporaries; the resulting BigInt is in registryScalarBytes. */
 export function registryScalarWorkspaceBytes(record: Uint8Array, type: PhysicalType): number {
