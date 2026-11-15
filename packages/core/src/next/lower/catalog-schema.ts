@@ -134,11 +134,13 @@ export function inspectCatalog(catalog: CatalogView): SchemaCatalog {
             columns: key.columnIds.map(
               (id) => table.columns.find((column) => column.id === id)?.name ?? "",
             ),
-            parentTable: parent?.name ?? `dropped:${String(key.parentTableId)}`,
+            parentTable: parent?.name ?? key.parentName ?? `dropped:${String(key.parentTableId)}`,
             parentColumns:
               index?.columnIds.map(
                 (id) => parent?.columns.find((column) => column.id === id)?.name ?? "",
-              ) ?? [],
+              ) ??
+              key.parentColumnNames ??
+              [],
             onDelete:
               key.onDelete === "setNull"
                 ? ("set null" as const)

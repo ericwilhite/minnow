@@ -754,11 +754,43 @@ export class Catalog implements CatalogView {
       const columnIds = input_.columns.map(
         (position) => at(position, `Foreign key ${input_.name}`).id,
       );
+      // A later unrelated child ALTER must preserve a retired informational binding,
+      // not look up the dropped name (which could now identify a different table).
+      const retired = previous?.foreignKeys.find((key) => key.id === input_.id);
+      if (
+        retired !== undefined &&
+        !input_.enforced &&
+        retired.parentTableId === input_.parentTableId &&
+        retired.parentIndexId === input_.parentIndexId &&
+        this.table(retired.parentTableId) === undefined
+      ) {
+        if (
+          columnIds.length !== retired.columnIds.length ||
+          columnIds.some((id, k) => {
+            const before = previous?.columns.find((c) => c.id === retired.columnIds[k]);
+            const after = columns.find((c) => c.id === id);
+            return !before || !after || !samePhysicalType(before.type, after.type);
+          })
+        )
+          throw new CatalogChangeError(
+            `Foreign key ${input_.name} changes a retired target's types`,
+          );
+        foreignKeys.push({
+          ...retired,
+          name: input_.name,
+          columnIds,
+          onDelete: input_.onDelete,
+          onUpdate: input_.onUpdate ?? "follow",
+        });
+        continue;
+      }
       let parentTableId: number;
+      let parentName: string;
       let parentIndex: IndexDef;
       let parentColumns: readonly ColumnDef[];
       if (input_.parentTableId === "self") {
         parentTableId = tableId;
+        parentName = input.name;
         const reference = input_.parentIndexId;
         const found =
           reference === "primary"
@@ -773,6 +805,7 @@ export class Catalog implements CatalogView {
       } else {
         const parent = this.#requireTable(input_.parentTableId);
         parentTableId = parent.id;
+        parentName = parent.name;
         const reference = input_.parentIndexId;
         const found =
           reference === "primary"
@@ -828,6 +861,16 @@ export class Catalog implements CatalogView {
         columnIds,
         parentTableId,
         parentIndexId: parentIndex.id,
+        ...(!input_.enforced
+          ? {
+              parentName,
+              parentColumnNames: parentIndex.columnIds.map((id) => {
+                const column = parentColumns.find((column) => column.id === id);
+                if (!column) throw new CatalogChangeError("Missing informational target column");
+                return column.name;
+              }),
+            }
+          : {}),
         supportIndexId,
         onDelete: input_.onDelete,
         onUpdate: input_.onUpdate ?? "follow",
@@ -952,12 +995,37 @@ export class Catalog implements CatalogView {
         sequences = [...sequences, ...change.sequences];
         break;
       }
-      case "dropTable":
+      case "dropTable": {
+        const retired = this.table(change.tableId);
+        if (!retired) throw new StoreCorruptionError("Unknown retired catalog table");
+        tables = tables.map((table) => {
+          if (!table.foreignKeys.some((key) => !key.enforced && key.parentTableId === retired.id))
+            return table;
+          return {
+            ...table,
+            foreignKeys: table.foreignKeys.map((key) => {
+              if (key.enforced || key.parentTableId !== retired.id) return key;
+              const index = retired.indexes.find((index) => index.id === key.parentIndexId);
+              if (!index) throw new StoreCorruptionError("Missing retired informational key");
+              return {
+                ...key,
+                parentName: retired.name,
+                parentColumnNames: index.columnIds.map((id) => {
+                  const column = retired.columns.find((column) => column.id === id);
+                  if (!column)
+                    throw new StoreCorruptionError("Missing retired informational column");
+                  return column.name;
+                }),
+              };
+            }),
+          };
+        });
         triggers = triggers.filter((t) => t.tableId !== change.tableId);
         fts = fts.filter((def) => def.tableId !== change.tableId);
         tables = tables.filter((table) => table.id !== change.tableId);
         sequences = sequences.filter((sequence) => sequence.ownedBy?.tableId !== change.tableId);
         break;
+      }
       case "createIndex":
         bump("nextIndexId", change.index.id);
         tables = tables.map((table) =>
@@ -1253,6 +1321,21 @@ function validateStoredCatalog(data: CatalogData): void {
               return p !== undefined && c !== undefined && samePhysicalType(p.type, c.type);
             }),
           "Invalid stored foreign-key references",
+        );
+      if (
+        fk.parentName !== undefined ||
+        fk.parentColumnNames !== undefined ||
+        parentTable === undefined
+      )
+        check(
+          !fk.enforced &&
+            typeof fk.parentName === "string" &&
+            fk.parentName.length > 0 &&
+            Array.isArray(fk.parentColumnNames) &&
+            fk.parentColumnNames.length === fk.columnIds.length &&
+            fk.parentColumnNames.every((name) => typeof name === "string" && name.length > 0) &&
+            new Set(fk.parentColumnNames).size === fk.parentColumnNames.length,
+          "Invalid stored informational target names",
         );
       const support = table.indexes.find((i) => i.id === fk.supportIndexId);
       check(!fk.enforced || support !== undefined, "Missing stored foreign-key support index");

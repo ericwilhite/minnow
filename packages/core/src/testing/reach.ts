@@ -7004,3 +7004,51 @@ export const CATALOG_CREATE_BACKFILL_REACH = [
   "continue writing",
   "zero resources",
 ] as const;
+
+export const CATALOG_INFORMATIONAL_NAMES_REACH = [
+  "dropped parent keeps names",
+  "native checkpoint",
+  "WAL replay",
+  "scalar",
+  "composite",
+  "plain",
+  "case dot UTF8",
+  "quote",
+  "remains informational",
+  "later child ALTER",
+  "replacement parent does not retarget",
+  "zero resources",
+] as const;
+
+export const CATALOG_FREEZE_TYPES_REACH = [
+  "int32",
+  "int64",
+  "float32",
+  "float64",
+  "decimal",
+  "text",
+  "bool",
+  "date",
+  "time",
+  "timestamp",
+  "json",
+  "uuid",
+  "interval",
+  "array",
+  "enum",
+  "checkpoint",
+  "WAL",
+  "continue DDL",
+  "zero resources",
+] as const;
+
+export const CATALOG_INFORMATIONAL_WIRE_REACH = [
+  "missing both",
+  "missing table",
+  "missing columns",
+  "wrong arity",
+  "empty label",
+  "required flags10 and11",
+  "scalar",
+  "composite",
+] as const;

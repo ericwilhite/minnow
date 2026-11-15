@@ -159,6 +159,10 @@ export interface ForeignKeyDef {
   readonly parentTableId: number;
   /** The parent's primary-key (or unique) index the reference names. */
   readonly parentIndexId: number;
+  /** Informational references survive a deliberate native parent drop. These fallback labels
+   * are refreshed before retirement; live bindings always use stable IDs, never these names. */
+  readonly parentName?: string;
+  readonly parentColumnNames?: readonly string[];
   /** The supporting index on `columnIds` (see "Rules"); null when `enforced` is false. */
   readonly supportIndexId: number | null;
   readonly onDelete: ForeignKeyAction;

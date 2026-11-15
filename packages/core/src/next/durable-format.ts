@@ -409,6 +409,8 @@ export const CATALOG_RECORD_SCHEMAS = {
     "onDelete:s",
     "enforced:b",
     "onUpdate:s",
+    "parentName:s~!",
+    "parentColumnNames:[s]~!",
   ],
   check: [
     "id:u",

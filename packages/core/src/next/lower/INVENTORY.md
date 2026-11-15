@@ -823,3 +823,17 @@ backfill boundary remains explicit: values requiring executor-only casts (for ex
 INTERVAL and JSONB) still refuse with 0A000; this unit does not evaluate runtime casts in lowering.
 `catalog-backfill-create.test.ts` compares shipped introspection and rows, with ordinary WAL
 and native checkpoint reopen, continued writes and zero retained governor bytes.
+
+### Catalog freeze audit: informational targets and descriptor reopen
+
+Informational native FKs retain fallback parent/column names in MCAT10 fields10/11,
+required-understanding when present. Live bindings remain stable IDs. Parent retirement
+freezes the current labels; unrelated child ALTER and name reuse preserve the retired identity.
+Missing or malformed retired descriptors are corruption. The shipped SQL parent-drop guard
+currently blocks informational references too; native catalog retirement is tested separately,
+using the shipped pre-drop descriptor as the label authority, with no SQL DROP parity claim.
+`catalog-informational-names` covers ordinary reopen and continued DDL; the wire generator
+checks paired fields/arity/names/flags. `catalog-freeze-types` fills ordinary WAL/checkpoint
+coverage for every supported physical/logical descriptor, independently checking widths,
+NUMERIC typmods, zones, JSON mode, array element type and enum label order before exact reopen.
+No extension-policy proposal is implemented here; existing framing and gates are retained.

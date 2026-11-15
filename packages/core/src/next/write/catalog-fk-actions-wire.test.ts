@@ -56,7 +56,7 @@ it("keeps every effective action in required foreign-key field9", () => {
         expect.objectContaining({ code: "MINNOW_STORE_CORRUPT" }),
       );
       expect(() =>
-        decodeCatalogRecord("foreignKey", wire([...fields, [10, Uint8Array.of(0)]])),
+        decodeCatalogRecord("foreignKey", wire([...fields, [12, Uint8Array.of(0)]])),
       ).toThrow(expect.objectContaining({ code: "MINNOW_CATALOG_UNSUPPORTED" }));
       cases++;
     }

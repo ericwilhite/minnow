@@ -10,6 +10,13 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The private 1.0 catalog keeps informational foreign-key target names after the native catalog
+retires a parent. Later unrelated child changes preserve the retired target identity, including
+when another table reuses its name. Two required-understanding fields extend the existing MCAT
+foreign-key record; existing field framing and development format selectors stay unchanged.
+This is private catalog metadata, not a change to the shipped SQL parent-drop policy or released
+0.x bytes. The final 1.0 extension and reader/writer policy remains under review.
+
 The private 1.0 schema-table lowering preserves API-supplied frozen backfills at creation,
 including fractional numbers and both timestamp kinds. Ordinary WAL and checkpoint reopen
 retain these values separately from insert defaults; generated columns cannot also declare a
