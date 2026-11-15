@@ -8788,7 +8788,7 @@ export const SNAPSHOT_SEQUENCE_CAPTURE_REACH = [
   "restored",
   "uninitialized",
   "read only",
-  "older horizon preserved",
+  "checkpoint history preserved",
   "released",
   "denied",
 ] as const;
@@ -8868,4 +8868,19 @@ export const SNAPSHOT_INDEX_LEASE_REACH = [
   "drop and retry",
   "four lease bound",
   "zero after close",
+] as const;
+
+export const SNAPSHOT_SEQUENCE_DURABILITY_REACH = [
+  "emitted ahead of durable",
+  "durable ahead of emitted",
+  "restored horizon",
+  "ascending",
+  "descending",
+  "single emitted value",
+  "multiple emitted values",
+  "pin before await",
+  "ordinary load nextval",
+  "ordinary reopen nextval",
+  "read only allocation",
+  "charges released",
 ] as const;

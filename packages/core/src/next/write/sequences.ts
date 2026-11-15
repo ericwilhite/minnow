@@ -118,10 +118,11 @@ export class Sequences implements SequenceAccess {
     return out;
   }
 
-  /** Readonly horizon capture, synchronously with a committed export pin BEFORE any await.
-   * Unlike checkpoint(), never prunes history or mutates live sequence allocation. */
+  /** Readonly current horizon capture, synchronously with an export pin BEFORE any await.
+   * Sequences are nontransactional: a value can already be emitted beyond a strict row pin's
+   * durable LSN. Unlike checkpoint(lsn), capture never filters or prunes reservation history.
+   * The latest reservation/restoration covers every emitted value; unused credit may skip. */
   capture(
-    lsn: number,
     definitions: readonly SequenceDef[],
     budget: ByteBudget,
   ): {
@@ -132,12 +133,12 @@ export class Sequences implements SequenceAccess {
     if (!budget.allocate(charge)) throw new SnapshotBudgetError(charge);
     try {
       const value = Object.freeze(
-        definitions.map((def) => {
-          let through = def.start;
-          for (const entry of this.#history.get(def.id) ?? [])
-            if (entry.lsn <= lsn) through = entry.through;
-          return Object.freeze({ sequenceId: def.id, reservedThrough: through });
-        }),
+        definitions.map((def) =>
+          Object.freeze({
+            sequenceId: def.id,
+            reservedThrough: this.#history.get(def.id)?.at(-1)?.through ?? def.start,
+          }),
+        ),
       );
       let released = false;
       return {

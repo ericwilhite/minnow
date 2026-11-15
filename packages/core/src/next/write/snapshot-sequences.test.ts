@@ -53,7 +53,6 @@ for (const seed of seedsFor("next-snapshot-sequences", [0xb285, 0xb286]))
                 expect(typeof sequences.next(1, count, out, 0)).toBe("number");
                 expect(out.values[0]).toBe(direction > 0n ? -1000n : 1000n);
               }
-              const bound = lsn;
               const expected = (at: number) =>
                 definitions.map((def) => ({
                   sequenceId: def.id,
@@ -68,18 +67,21 @@ for (const seed of seedsFor("next-snapshot-sequences", [0xb285, 0xb286]))
                   spillable: false,
                 });
               const before = history.length,
-                captured = sequences.capture(bound, definitions, grant);
+                captured = sequences.capture(definitions, grant);
               try {
                 expect(captured).not.toBeInstanceOf(Promise);
-                expect(captured.value).toEqual(expected(bound));
+                // R4/pg_dump: all already-emitted sequence state, independent of row MVCC.
+                expect(captured.value).toEqual(expected(Infinity));
                 expect(Object.isFrozen(captured.value)).toBe(true);
                 expect(history.length).toBe(before);
-                const older = sequences.capture(oldBound, definitions, grant);
-                try {
-                  expect(older.value).toEqual(expected(oldBound));
-                } finally {
-                  older.release();
-                }
+                const checkpoint = sequences.checkpoint(oldBound);
+                expect(checkpoint.sort((a, b) => a.sequenceId - b.sequenceId)).toEqual(
+                  expected(oldBound).filter((def) =>
+                    history.some(
+                      (entry) => entry.sequenceId === def.sequenceId && entry.lsn <= oldBound,
+                    ),
+                  ),
+                );
                 const frozen = captured.value.map((value) => ({ ...value }));
                 expect(typeof sequences.next(1, count, out, 0)).toBe("number");
                 sequences.checkpoint(lsn);
@@ -92,7 +94,7 @@ for (const seed of seedsFor("next-snapshot-sequences", [0xb285, 0xb286]))
                   "restored",
                   "uninitialized",
                   "read only",
-                  "older horizon preserved",
+                  "checkpoint history preserved",
                 ] as const)
                   reach.reach(state);
               } finally {
@@ -102,7 +104,7 @@ for (const seed of seedsFor("next-snapshot-sequences", [0xb285, 0xb286]))
               expect(grant.allocated).toBe(0);
               reach.reach("released");
               expect(grant.allocate(grant.held - 1)).toBe(true);
-              expect(() => sequences.capture(bound, definitions, grant)).toThrow(
+              expect(() => sequences.capture(definitions, grant)).toThrow(
                 expect.objectContaining({ code: "MINNOW_SNAPSHOT_BUDGET" }),
               );
               expect(grant.allocated).toBe(grant.held - 1);

@@ -19,8 +19,9 @@ export async function exportSnapshot(
   try {
     if (!(pin.catalog instanceof Catalog))
       throw new SnapshotScopeError("Portable export requires a native catalog");
-    // No await between pin and horizon capture. Later setval/reservations cannot change it.
-    captured = path.sequences.capture(pin.observedLsn, pin.catalog.sequences, budget);
+    // Row durability does not bound nontransactional sequence state. Cover already-emitted
+    // reservations too; no await here, so later setval/reservations cannot change the capture.
+    captured = path.sequences.capture(pin.catalog.sequences, budget);
     parts = snapshotCatalogParts(pin.catalog, captured.value, budget);
     const producer = parts;
     await exportPinnedSnapshot(

@@ -4282,6 +4282,8 @@ the catalog encoder and returns every capture charge. Later reservations, setval
 checkpoints cannot change the archive's restart horizons. Loading writes those horizons into
 the new native root; unused reservations may be skipped, and ordinary sequence allocation
 continues after load/reopen. Definitions retain ownership, increment, bounds and CYCLE semantics.
+Sequences are nontransactional: capture includes already-emitted reservations newer than a
+strict row pin's durable LSN. The row snapshot never filters sequence restart state.
 
 Catalog validation reuses the full native `Catalog.fromStored` checks before target acquisition:
 names/IDs, safe integer ranges, every counter floor, references, typed missing lanes and native
@@ -4351,9 +4353,12 @@ adversarial integrity/authentication guarantee. The source must still honor immu
 reads. This check also applies to owner-spooled input. Cancellation drains started reads and
 returns verification scratch before admission retries.
 
-`Sequences.capture(lsn, definitions, budget)` is the stage4 read-only restart-horizon primitive.
+`Sequences.capture(definitions, budget)` is the stage4 read-only restart-horizon primitive.
 It charges its immutable result before allocation and runs synchronously. Unlike checkpoint,
-it never prunes reservation history or logs a new reservation. Export must capture it in the
+it never filters or prunes reservation history or logs a new reservation. Export captures the
+latest logged/restored horizon of each pinned definition, including reservations beyond the
+row snapshot's durable LSN. Values already handed out must never be reused by a loaded copy.
+Export must capture it in the
 same synchronous call as its committed pin, before awaiting output or a catalog producer.
 An untouched sequence captures its configured start; restored and setval horizons retain their
 exact bigint values. The result stays charged until its idempotent `release()`.

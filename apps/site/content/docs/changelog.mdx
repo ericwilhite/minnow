@@ -235,7 +235,8 @@ Closed schema text sets retain text ordering; explicit schema counter values adv
 sequence. This changes unreleased rebuild bytes only; the published engine and its formats are
 unchanged. These catalog additions select development reader 5, manifest 6 and commit body 4.
 Portable snapshot catalog and sequence capture now reuse the native catalog grammar and preserve
-restart horizons at pin time. Portable load rebuilds native primary, unique, secondary and
+restart horizons at pin time, including sequence values emitted beyond a strict row snapshot's
+durable LSN. Portable load rebuilds native primary, unique, secondary and
 foreign-key indexes, checks their values before publication and keeps an existing target intact
 on pre-publication quota failure or cancellation. CHECK, trigger/FTS and managed snapshot scope
 still refuses explicitly;
