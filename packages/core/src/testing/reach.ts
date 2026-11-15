@@ -7013,9 +7013,20 @@ export const FTS_ADMISSION_CANCEL_REACH = [
   "actual admission wait",
   "abort while credit held",
   "abort on admission resume",
+  "same transaction usable",
   "no FTS preparation",
   "writer usable",
   "update",
   "delete",
   "upsert",
+] as const;
+
+/** Retiring a failed FTS forecast preserves allocated buffers plus the next simultaneous step. */
+export const FTS_CREDIT_RETIREMENT_REACH = [
+  "live buffer funded",
+  "all ordinary credit retained",
+  "overlap funded",
+  "owned bytes intact",
+  "idle credit returned",
+  "all accounts returned",
 ] as const;

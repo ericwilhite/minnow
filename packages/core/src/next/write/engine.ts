@@ -2328,8 +2328,27 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#check();
     signal?.throwIfAborted();
     if (this.#holder === null) throw new Error("FTS mutation without native writer");
-    this.#holder.ftsMutationPrepared = true;
-    return this.#prepareMinimum(this.#holder.catalog, signal);
+    const tx = this.#holder,
+      wasPrepared = tx.ftsMutationPrepared;
+    tx.ftsMutationPrepared = true;
+    const refused = (error: unknown): never => {
+      // A failed admission owns no future FTS step. Do not leave an unfunded minimum
+      // blocking ordinary work after statement rollback in this same transaction.
+      tx.ftsMutationPrepared = wasPrepared;
+      this.#credits.retireMetadataHeadroom(
+        Math.max(
+          this.#minimumMetadata,
+          this.#holder?.ftsMutationPrepared === true ? FTS_PUBLICATION_MINIMUM_BYTES : 0,
+        ),
+      );
+      throw error;
+    };
+    try {
+      const admission = this.#prepareMinimum(tx.catalog, signal);
+      return admission instanceof Promise ? admission.catch(refused) : admission;
+    } catch (error) {
+      return refused(error);
+    }
   }
 
   commit(tx: TransactionImpl, request: CommitRequest | null): Promise<CommitReceipt> {

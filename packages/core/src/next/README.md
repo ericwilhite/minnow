@@ -3937,3 +3937,9 @@ calculation. Cancellation rejects while competing credit is still held; it does 
 that holder to release first. Completion rechecks the signal so an abort racing with a granted
 minimum cannot report successful statement end. Rollback leaves rows and FTS state unchanged,
 and the writer remains usable. Commit's existing irreversible R9 boundary is unchanged.
+
+Failed FTS minimum admission restores the transaction's previous preparation state and retires
+unused provisional metadata headroom without another admission wait. Ordinary work after
+statement rollback can use its already-admitted minimum in the same transaction. Retirement
+keeps every allocated buffer, loan and the next step's overlap funded; earlier successful
+preparation remains protected.

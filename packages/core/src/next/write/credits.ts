@@ -89,6 +89,13 @@ export class WriteCredits {
     return releaseIdle(this.metadata, this.metadata.allocated + this.#metadataHeadroom);
   }
 
+  /** Cancelled provisional work can lower its forecast without attempting fresh admission.
+   * Existing allocations, loans and a newer/higher live minimum remain owned. */
+  retireMetadataHeadroom(bytes: number): number {
+    this.#metadataHeadroom = Math.min(this.#metadataHeadroom, bytes);
+    return this.reclaimMetadata();
+  }
+
   /** Fund a larger bounded step before it creates inputs or provisional publication state. */
   async growTo(grant: Grant, wanted: number, signal?: AbortSignal): Promise<void> {
     const stop =

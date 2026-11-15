@@ -124,10 +124,38 @@ for (const seed of seedsFor("next-fts-admission-cancel", [0xb861, 0xb862]))
                 }
                 expect(reason).toBe(abort);
                 path.prepareFtsMutation = nativePrepare;
-                release();
                 await Promise.allSettled([pending]);
                 s.rollback();
+                // Failed admission must not leave an UNFUNDED minimum in the same transaction.
+                // Reject an unexpected fresh-credit attempt immediately, never by timeout.
+                const nativeAdmit = h.governor.admitGroup.bind(h.governor);
+                let renewals = 0,
+                  continuationError: unknown;
+                h.governor.admitGroup = () => {
+                  renewals++;
+                  return Promise.reject(
+                    new Error("Unfunded cancelled FTS minimum requested credit"),
+                  );
+                };
+                try {
+                  const next = tx.statement({ rules });
+                  try {
+                    await next.table(1).insert(batch(texts(["continuation"])), null);
+                    await next.end();
+                  } catch (error) {
+                    continuationError = error;
+                  }
+                  expect(
+                    renewals,
+                    "ordinary work after rollback must not readmit the cancelled FTS minimum",
+                  ).toBe(0);
+                  expect(continuationError).toBeUndefined();
+                  reach.reach("same transaction usable");
+                } finally {
+                  h.governor.admitGroup = nativeAdmit;
+                }
                 tx.rollback();
+                release();
                 const pin = path.pin();
                 try {
                   expect(await rowsOf(pin, 1)).toEqual(values.map((v) => [v]));
