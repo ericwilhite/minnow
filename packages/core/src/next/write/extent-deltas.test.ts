@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 import type { PublishDelta } from "../access/write-path.js";
 import { reachableExtents } from "../format/reachable.js";
 import type { ExtentSpace } from "../storage/extents.js";
-import { createReach } from "../../testing/reach.js";
+import { createReach, FTS_ROOT_TRACKING_REACH } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { need } from "./bytes.js";
 import { ExtentSinkError, type WritePathImpl } from "./engine.js";
@@ -47,6 +47,7 @@ async function walk(space: ExtentSpace): Promise<Map<number, number>> {
 }
 
 const REACH = [
+  ...FTS_ROOT_TRACKING_REACH,
   "added",
   "released",
   "merge",
@@ -102,6 +103,21 @@ describe("extent deltas (ruling R25)", () => {
           for (let turns = random() < 0.5 ? int(12) : 0; turns > 0; turns--) await yieldTask();
         },
         afterDeltaPrepared: (kind) => {
+          if (kind === "fts" && pending !== null) {
+            const root = decodeManifestRoot(need(harness.space.root), FREE).value;
+            if (
+              root.tables.some((table) =>
+                table.staged.some((staged) =>
+                  pending?.delta.released.some(
+                    (extent) =>
+                      extent.offset === staged.groups.extent.offset &&
+                      extent.length === staged.groups.extent.length,
+                  ),
+                ),
+              )
+            )
+              reach.reach("FTS publication retires native staging");
+          }
           if (kind !== "merge") return;
           const roll = random();
           if (roll < 0.2) throw new Error("injected failure at encode");

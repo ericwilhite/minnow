@@ -7030,3 +7030,6 @@ export const FTS_CREDIT_RETIREMENT_REACH = [
   "idle credit returned",
   "all accounts returned",
 ] as const;
+
+/** FTS staging overlays must preserve native publication retirement bookkeeping (R25). */
+export const FTS_ROOT_TRACKING_REACH = ["FTS publication retires native staging"] as const;

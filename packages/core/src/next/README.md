@@ -3943,3 +3943,8 @@ unused provisional metadata headroom without another admission wait. Ordinary wo
 statement rollback can use its already-admitted minimum in the same transaction. Retirement
 keeps every allocated buffer, loan and the next step's overlap funded; earlier successful
 preparation remains protected.
+
+FTS preparation overlays keep the native root's provisional retirement and build-settlement
+bookkeeping through every root clone, including extent-list replacement. Adoption of the exact
+installed root drains deferred native staging retirement once (R25); a preparation publication
+must not leave that retirement queued for the next table publication.

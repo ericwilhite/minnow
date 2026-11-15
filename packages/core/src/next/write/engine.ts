@@ -2475,7 +2475,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         ))
           delta.retireFts(retired, event.ref.extent);
       }
-      root = { ...root, fts: { ...root.fts, staged: prepared } };
+      root = this.#carryRootTracking(root, { ...root, fts: { ...root.fts, staged: prepared } });
       const publicationWriter = writer;
       root = await this.#listed(root, (sequence) =>
         delta.prepare(sequence, publicationWriter, retired),
@@ -5101,12 +5101,19 @@ export class WritePathImpl implements WritePath, EngineHooks {
     root: ManifestRoot,
     prepare: (sequence: number) => Promise<ExtentList>,
   ): Promise<ManifestRoot> {
-    const listed: ManifestRoot = { ...root, extentList: await prepare(root.sequence) };
+    return this.#carryRootTracking(root, {
+      ...root,
+      extentList: await prepare(root.sequence),
+    });
+  }
+
+  /** Root overlays retain the provisional bookkeeping until the exact installed root adopts it. */
+  #carryRootTracking(root: ManifestRoot, next: ManifestRoot): ManifestRoot {
     const settles = this.#settles.get(root);
-    if (settles !== undefined) this.#settles.set(listed, settles);
+    if (settles !== undefined) this.#settles.set(next, settles);
     const drained = this.#drainedBy.get(root);
-    if (drained !== undefined) this.#drainedBy.set(listed, drained);
-    return listed;
+    if (drained !== undefined) this.#drainedBy.set(next, drained);
+    return next;
   }
 
   /** Every extent one table of the current root reaches (for a dropped table's retirement). */
