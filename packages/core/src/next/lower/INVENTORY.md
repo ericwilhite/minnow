@@ -801,3 +801,9 @@ parameter rebinding. The body query host and projected native reader remain pend
 The shipped recursion boundary allows two derived write levels (primary → audit → mirror).
 The runtime queue preserves signed budgets 1/0/-1 and supports up to three live frames,
 each with its prepaid minimum. RI preserves budget. This is packet/frame coverage, not native SQL trigger enablement.
+
+TriggerBodyRunner now owns a non-ending command's pin, copied bindings and sealed input reference.
+It preserves the complete modification descriptor, retires parameters before writes, fences
+input retirement before pin release, and propagates cancellation during cleanup. Its source
+host remains injected; the compiled B5b provider, named controller and native end/RI integration
+are still pending. This does not enable trigger SQL.

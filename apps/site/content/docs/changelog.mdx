@@ -19,7 +19,9 @@ migration is needed.
 
 The private trigger runtime adds typed OLD/NEW parameter scopes. Repeated references share
 one charged copy, wide values copy in cancellable fragments, and image borrows end before
-body execution. This is a runtime component; native SQL trigger firing remains disabled
+body execution. The non-ending body protocol seals input, retires copied parameters before
+writes, and fences input retirement before releasing its prefix pin, including cancellation
+during cleanup. These are runtime components; native SQL trigger firing remains disabled
 until the joint command, registry and body-runner integration is verified.
 
 The private rebuild adds a spillable AFTER-event queue with bounded metadata. It preserves

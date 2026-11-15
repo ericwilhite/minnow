@@ -6924,3 +6924,27 @@ export const TRIGGER_BUDGET_REACH = [
   "multiple root rows",
   "zero ownership",
 ] as const;
+
+export const TRIGGER_BODY_REACH = [
+  "prefix input sealed",
+  "complete modify metadata",
+  "binding copy retired before write",
+  "native rules and PG constraint",
+  "primary and cleanup errors retained",
+  "PG commit",
+  "multiple writer batches",
+  "PG root rollback",
+  "source failure",
+  "apply failure",
+  "cancel sealed input",
+  "cancel partial write",
+  "cancel image release",
+  "cancel binding retirement",
+  "cancel before source",
+  "pin survives input retirement",
+  "zero owned copies and readers",
+  "pending source cancellation fenced",
+  "pending retirement cancellation fenced",
+  "invalid programs refuse before effects",
+  "native generated NOT NULL matches PG",
+] as const;

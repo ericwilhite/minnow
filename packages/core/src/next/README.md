@@ -3862,7 +3862,7 @@ copies a bounded scalar window and drops native read buffers/progress loans befo
 continuations, so a callback can append or run a nested producer without hold-and-wait.
 Close fences pending appends, reads and continuations before closing files or freeing scratch;
 cleanup attempts both epochs and surfaces close failures. This is a verified runtime component;
-SQL firing still needs the joint controller, typed body runner and native Statement.end hooks.
+SQL firing still needs the joint controller, compiled body-source host and native Statement.end hooks.
 
 TriggerBindingProgram compiles stable (OLD/NEW, column ID) dependencies once. Repeated textual
 parameters alias one owned typed scalar; no Date/Number/JS-row or public raw-parameter rebinding
@@ -3883,3 +3883,22 @@ encodes `budget + 1` as a nonnegative scalar; scratch packets retain all three s
 count stays one, and copied parameters retire after input spooling, before nested writes. This
 keeps the maximum binding minimum independent of depth. The generated component suite checks
 the depth boundary against the shipped engine; native SQL firing remains disabled.
+
+TriggerBodyRunner controls one prepared body command through an injected TriggerBodyHost.
+The host receives the complete modification plan and frozen body metadata, including explicit
+assignment IDs. The runner preserves every other plan field when applying the body's repeat
+policy. A stale catalog version refuses before opening a pin or allocating a helper.
+
+Each call owns one fresh readOwn phase pin, typed binding scope and scalar input descriptor.
+The source host seals the complete input and retires execution-local operators and cached
+parameter-vector references before returning. Copied bindings then close before native writes
+or nested callbacks. The prefix pin survives all locator translations and input retirement;
+cleanup attempts every owned resource and preserves the primary error and cleanup failures.
+Cancellation is checked after awaited retirement as well as before effects. No body command
+calls statement end, rollback or commit. Its caller verifies command uniqueness, drains that
+command's nested AFTER frame, then verifies references; the root owns completion and rollback.
+
+The generated protocol suite uses real native writers, shared bound row rules and PGlite for
+commit/rollback, generated output, CHECK and generated NOT NULL failures. Its source host is a
+small native-vector fixture, not the compiled provider. B5b's admitted source/registry and B6's
+named-trigger controller remain a separate integration; native SQL firing is still disabled.
