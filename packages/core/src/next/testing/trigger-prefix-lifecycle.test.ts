@@ -30,7 +30,8 @@ for (const seed of seedsFor("next-trigger-prefix-lifecycle", [0xb7cc, 0xb7cd]))
           fc.integer({ min: 2, max: 3 }),
           fc.constantFrom("commit", "cancel read", "cancel write"),
           fc.boolean(),
-          async (count, size, bodies, finish, merge) => {
+          fc.integer({ min: 1, max: 3 }),
+          async (count, size, bodies, finish, merge, cancelAfter) => {
             reach.beginHistory();
             let releasePublish: () => void = () => undefined,
               entered: () => void = () => undefined;
@@ -105,7 +106,9 @@ for (const seed of seedsFor("next-trigger-prefix-lifecycle", [0xb7cc, 0xb7cd]))
                 for (let k = 0; k < out.count; k++) at[out.probes[k] ?? 0] = out.locators[k] ?? 0;
                 return at;
               };
-              let cancelled = false;
+              const cancelAt = Math.min(cancelAfter, Math.ceil(count / size) - 1);
+              let cancelled = false,
+                lastWriteBatches = 0;
               try {
                 for (let body = 0; body < bodies; body++) {
                   const pin = root.readOwn();
@@ -146,7 +149,8 @@ for (const seed of seedsFor("next-trigger-prefix-lifecycle", [0xb7cc, 0xb7cd]))
                     }
                   }
                   const writer = root.table(table.id, { assigned: [value], inputView: pin });
-                  let batches = 0;
+                  let batches = 0,
+                    maintained = false;
                   for (let from = 0; from < count; from += size) {
                     cancel.signal.throwIfAborted();
                     const end = Math.min(count, from + size);
@@ -158,6 +162,7 @@ for (const seed of seedsFor("next-trigger-prefix-lifecycle", [0xb7cc, 0xb7cd]))
                       null,
                     );
                     batches++;
+                    lastWriteBatches = batches;
                     if (from === 0) {
                       expect(() => pin.table(table.id, { budget: grant })).toThrow("locator-only");
                       expect(() => pin.index(table.id, primary)).toThrow("locator-only");
@@ -179,11 +184,30 @@ for (const seed of seedsFor("next-trigger-prefix-lifecycle", [0xb7cc, 0xb7cd]))
                         cachedCursor.close();
                       }
                       reach.reach("cached and fresh rereads refused");
-                      if (body === 0 && finish === "cancel write") {
-                        cancel.abort(reason);
-                        cancel.signal.throwIfAborted();
+                    }
+                    if (body === 0 && finish === "cancel write" && batches === cancelAt) {
+                      expect(batches).toBeLessThan(Math.ceil(count / size));
+                      expect(pin.released).toBe(false);
+                      expect(h.path.shared.readers.count).toBeGreaterThan(0);
+                      const retained = h.path.stats();
+                      expect(
+                        retained.memtableBytes +
+                          retained.frozenMemtableBytes +
+                          retained.borrowedChunkBytes,
+                      ).toBeGreaterThan(0);
+                      if (batches > 1) {
+                        expect(maintained, "maintenance completed before later cancellation").toBe(
+                          true,
+                        );
+                        reach.reach("cancel after several batches");
+                        reach.reach("maintenance before later cancellation");
                       }
-                      await h.path.runMaintenance(); // later writer batches still use the original locators
+                      cancel.abort(reason);
+                      cancel.signal.throwIfAborted();
+                    }
+                    if (from === 0) {
+                      await h.path.runMaintenance(); // later batches retain original locators
+                      maintained = true;
                     }
                   }
                   expect(batches).toBeGreaterThan(1);
@@ -202,6 +226,10 @@ for (const seed of seedsFor("next-trigger-prefix-lifecycle", [0xb7cc, 0xb7cd]))
                 if (error !== reason) throw error;
                 if (finish === "commit") throw error;
                 cancelled = true;
+                if (finish === "cancel write")
+                  expect(lastWriteBatches, "cancel at the generated writer boundary").toBe(
+                    cancelAt,
+                  );
                 reach.reach(finish);
               }
               if (cancelled) {
@@ -217,7 +245,8 @@ for (const seed of seedsFor("next-trigger-prefix-lifecycle", [0xb7cc, 0xb7cd]))
                 reach.reach("committed bodies");
               }
               tx = undefined;
-              for (const pin of pins) expect(pin.released).toBe(true);
+              for (const pin of pins)
+                expect(pin.released, "root completion retires every prefix pin").toBe(true);
               const final = h.path.pin();
               try {
                 expect(await rowsOf(final, table.id)).toEqual(
@@ -263,12 +292,15 @@ for (const seed of seedsFor("next-trigger-prefix-lifecycle", [0xb7cc, 0xb7cd]))
         ),
         {
           seed,
-          numRuns: 8,
+          // Keep the old four controls and four random runs; add two later-cancel controls.
+          numRuns: 10,
           examples: [
-            [8, 1, 2, "commit", false],
-            [10, 3, 3, "commit", true],
-            [9, 2, 2, "cancel read", true],
-            [12, 1, 2, "cancel write", false],
+            [8, 1, 2, "commit", false, 1],
+            [10, 3, 3, "commit", true, 1],
+            [9, 2, 2, "cancel read", true, 1],
+            [12, 1, 2, "cancel write", false, 1],
+            [12, 2, 3, "cancel write", true, 3],
+            [10, 3, 2, "cancel write", false, 2],
           ],
         },
       );

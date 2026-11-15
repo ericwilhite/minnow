@@ -149,6 +149,12 @@ export function isVisible(seq: number, bound: number): boolean {
   return seq <= bound;
 }
 
+/** A pinned immutable read view, with one phase-pin exception: Statement.readOwn().
+ * Fully consume/spool that view before a further statement mutation. After mutation begins,
+ * neither the pin nor cached table/index/segment/cursor handles may read data again. Keep it
+ * alive only for TableWriteOptions.inputView locator resolution until writer work drains;
+ * then release it. Statement end/rollback invalidates remaining phase pins. See the module
+ * contract for ordinary immutable read and statement views. */
 export interface Snapshot {
   /** The pinned root's sequence (diagnostics). */
   readonly rootSequence: number;

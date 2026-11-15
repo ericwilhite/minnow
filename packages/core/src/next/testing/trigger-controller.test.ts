@@ -8,11 +8,13 @@ import {
   createReach,
   TRIGGER_CONTROLLER_REACH,
   TRIGGER_PREPARATION_REACH,
+  TRIGGER_RI_UNIQUE_REACH,
 } from "../../testing/reach.js";
 import type { TriggerDef } from "../access/trigger-def.js";
 import type { CatalogView } from "../access/catalog.js";
 import {
   ROW_IMAGE_UNREAD,
+  type CommandToken,
   type NativeCommandBoundary,
   type ReferentialEntry,
   type WriteEvent,
@@ -22,6 +24,7 @@ import {
   triggerControllerMinimumBytes,
   type PreparedRowTrigger,
 } from "../exec/trigger-controller.js";
+import { ExecutionError } from "../exec/errors.js";
 import { TriggerBodyRunner, type TriggerBodyHost } from "../exec/trigger-body.js";
 import { Charge, Pool, SpillIo } from "../exec/spill-pool.js";
 import { PageWriter, SpillFiles } from "../exec/spill-pages.js";
@@ -33,7 +36,8 @@ import { yieldTask } from "../task.js";
 
 const quote = (s: string) => `"${s.replaceAll('"', '""')}"`;
 const names = ["Afirst", "zlast", "\ue000", "\u{10000}"];
-type Fault = "none" | "unique" | "body" | "pending close" | "depth" | "terminal not prepared";
+type Fault =
+  "none" | "unique" | "body" | "pending close" | "depth" | "terminal not prepared" | "RI unique";
 async function fixture(
   event: "delete" | "update",
   unicode: boolean,
@@ -41,11 +45,14 @@ async function fixture(
   fault: Fault = "none",
   omit: number | null = null,
   terminalBefore = false,
+  conflictAfter = 2,
 ) {
   const core = await new StorageCore(16).open();
   for (const sql of [
     "CREATE TABLE p(id INT PRIMARY KEY)",
-    "CREATE TABLE c(id INT PRIMARY KEY,pid INT REFERENCES p(id) ON DELETE CASCADE ON UPDATE CASCADE)",
+    fault === "RI unique"
+      ? "CREATE TABLE c(id INT PRIMARY KEY,pid INT DEFAULT 99 REFERENCES p(id) ON DELETE CASCADE ON UPDATE SET DEFAULT,grp INT NOT NULL,UNIQUE(pid,grp))"
+      : "CREATE TABLE c(id INT PRIMARY KEY,pid INT REFERENCES p(id) ON DELETE CASCADE ON UPDATE CASCADE)",
     "CREATE TABLE log(label TEXT,n INT)",
     "CREATE TABLE audit(label TEXT,n INT)",
   ])
@@ -161,12 +168,17 @@ async function fixture(
       signal.signal.throwIfAborted(),
     ),
     reason = new Error(`injected ${fault}`),
+    uniqueError = new ExecutionError("child unique conflict", "MINNOW_TEST_CHILD_UNIQUE", "23505"),
+    afterError = new ExecutionError("later AFTER body division", "MINNOW_TEST_AFTER", "22012"),
+    rootUniqueSteps: number[] = [],
+    riCommands: CommandToken[] = [],
     trace: string[] = [],
     checkpoints: string[] = [],
     budgets = new Map<number, number>(),
     inputs = new Map<number, { label: string; n: number; target: number }>(),
     entries = new Map<number, ReferentialEntry>();
-  let serial = 0,
+  let riWrites = 0,
+    serial = 0,
     nextInput = 0,
     maxFrames = 0,
     controller: TriggerController | null = null,
@@ -204,21 +216,31 @@ async function fixture(
     verifyCommandUnique: async (command) => {
       checkpoints.push(`unique:${String(command.id)}`);
       if (fault === "unique" && command.frameId === 1) throw reason;
+      if (command.frameId === 1) {
+        rootUniqueSteps.push(riWrites);
+        if (fault === "RI unique" && riWrites >= conflictAfter) throw uniqueError;
+      }
     },
     verifyCommandReferences: async (command) => {
       checkpoints.push(`refs:${String(command.id)}`);
     },
-    executeReferential: async () => {
-      throw new Error("queue must resolve by scalar ID");
+    executeReferential: async (entry, hooks, abort) => {
+      abort.throwIfAborted();
+      const command = { rootId: 9, id: entry.commandId, frameId: entry.frameId },
+        images = { spoolId: c.id, row: entry.images.row + 1000 };
+      riCommands.push(command);
+      await hooks.beforeRow(command, c.id, event, images, entry.triggerBudget);
+      riWrites++;
+      await hooks.afterRow(command, c.id, event, images, [], entry.triggerBudget);
+      // Same command token can gain new suspects after root/earlier action checkpoints.
+      // Check only newly introduced uniqueness; this does not drain outer AFTER events.
+      await native.verifyCommandUnique(command, abort);
     },
     executeReferentialId: async (id, hooks, abort) => {
       abort.throwIfAborted();
       const entry = entries.get(id);
       if (!entry) throw new Error("missing scalar RI entry");
-      const command = { rootId: 9, id: entry.commandId, frameId: entry.frameId },
-        images = { spoolId: c.id, row: entry.images.row + 1000 };
-      await hooks.beforeRow(command, c.id, event, images, entry.triggerBudget);
-      await hooks.afterRow(command, c.id, event, images, [], entry.triggerBudget);
+      await native.executeReferential(entry, hooks, abort);
     },
   };
   const host: TriggerBodyHost = {
@@ -239,6 +261,8 @@ async function fixture(
         if (!record) throw new Error("retired input");
         insideBody?.();
         if (fault === "body") throw reason;
+        if (fault === "RI unique" && record.label === "p1" && record.n === conflictAfter)
+          throw afterError;
         if (fault === "pending close") {
           await new Promise<void>((resolve) =>
             request.signal.addEventListener(
@@ -285,6 +309,11 @@ async function fixture(
   let closing: Promise<void> | null = null;
   return {
     runtime,
+    native,
+    signal: signal.signal,
+    entries,
+    rootUniqueSteps,
+    riCommands,
     trace,
     checkpoints,
     reason,
@@ -308,7 +337,7 @@ async function fixture(
         frameId: command.frameId,
         fkId: c.foreignKeys[0]?.id ?? 0,
         event: event === "delete" ? "parentDelete" : "parentUpdate",
-        kind: "cascade",
+        kind: fault === "RI unique" ? "setDefault" : "cascade",
         sortName: "RI_ConstraintTrigger_a_1",
         images,
         targets: null,
@@ -544,4 +573,97 @@ for (const seed of seedsFor("next-trigger-preparation", [0xb7dc, 0xb7dd]))
       },
     );
     reach.assertReached();
+  }, 120_000);
+
+for (const seed of seedsFor("next-trigger-ri-unique-contract", [0xb7de, 0xb7df]))
+  it(`checks each RI child write before later AFTER errors seed ${String(seed)}`, async () => {
+    const pg = new PGlite(),
+      reach = createReach("incremental RI child uniqueness", TRIGGER_RI_UNIQUE_REACH);
+    try {
+      await fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 1, max: 3 }),
+          fc.constantFrom("queue", "id", "entry"),
+          async (count, route) => {
+            reach.beginHistory();
+            await pg.exec(`DROP TABLE IF EXISTS c,p CASCADE;
+          CREATE TABLE p(id INT PRIMARY KEY);
+          CREATE TABLE c(id INT PRIMARY KEY,pid INT DEFAULT 99 REFERENCES p(id) ON UPDATE SET DEFAULT,grp INT NOT NULL,UNIQUE(pid,grp));
+          CREATE OR REPLACE FUNCTION later_after() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.id=${String(count)} THEN PERFORM 1/0; END IF; RETURN NEW; END $$;
+          CREATE TRIGGER "zlast" AFTER UPDATE ON p FOR EACH ROW EXECUTE FUNCTION later_after();
+          INSERT INTO p SELECT n FROM generate_series(1,${String(count)})n; INSERT INTO p VALUES(99);
+          INSERT INTO c VALUES ${Array.from({ length: count }, (_, i) => `(${String(1001 + i)},${String(i + 1)},${String(i === count - 1 ? 1 : i + 1)})`).join(",")};
+          ${count === 1 ? "INSERT INTO c VALUES(999,99,1);" : ""}`);
+            let state: unknown = null;
+            try {
+              await pg.exec("UPDATE p SET id=id+10 WHERE id<99");
+            } catch (error) {
+              if (typeof error === "object" && error !== null && "code" in error)
+                state = error.code;
+              else throw error;
+            }
+            expect(state, "PG child uniqueness precedes later named body error").toBe("23505");
+            const f = await fixture("update", false, false, "RI unique", null, false, count);
+            try {
+              const command = f.runtime.root;
+              for (let row = 1; row <= count; row++) await f.row(row);
+              const execute = async () => {
+                if (route === "queue") await f.runtime.finishRoot();
+                else {
+                  await f.native.verifyCommandUnique(command, f.signal); // root passes at step zero
+                  for (let row = 1; row <= count; row++) {
+                    const entry = f.entries.get(row);
+                    if (!entry) throw new Error("missing action");
+                    if (route === "id")
+                      await f.native.executeReferentialId(row, f.runtime, f.signal);
+                    else await f.native.executeReferential(entry, f.runtime, f.signal);
+                  }
+                }
+              };
+              await expect(
+                execute(),
+                "RI child checkpoint must beat the competing AFTER error",
+              ).rejects.toMatchObject({ sqlState: state });
+              expect(
+                f.rootUniqueSteps,
+                "root and every new action checkpoint share one token",
+              ).toEqual(Array.from({ length: count + 1 }, (_, i) => i));
+              expect(f.riCommands).toEqual(Array.from({ length: count }, () => command));
+              if (route !== "queue") {
+                expect(
+                  f.trace.some((s) => /^(p0|p1|cA):/.test(s)),
+                  "RI method never drains outer AFTER",
+                ).toBe(false);
+                reach.reach("no outer AFTER drain");
+              }
+              reach.reach(route);
+              reach.reach(count === 1 ? "first action conflict" : "successive actions one command");
+              if (count === 3) reach.reach("two earlier action checkpoints pass");
+              reach.reach("PG error priority");
+            } finally {
+              await f.close();
+            }
+            reach.reach("zero queues pins and credit");
+          },
+        ),
+        {
+          seed,
+          numRuns: 13,
+          examples: [
+            [2, "queue"],
+            [1, "queue"],
+            [3, "queue"],
+            [1, "id"],
+            [2, "id"],
+            [3, "id"],
+            [1, "entry"],
+            [2, "entry"],
+            [3, "entry"],
+          ],
+        },
+      );
+      reach.assertReached();
+    } finally {
+      await pg.close();
+    }
   }, 120_000);

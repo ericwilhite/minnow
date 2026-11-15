@@ -6840,6 +6840,8 @@ export const TRIGGER_WIRE_REACH = [
 ] as const;
 
 export const TRIGGER_PREFIX_LIFECYCLE_REACH = [
+  "cancel after several batches",
+  "maintenance before later cancellation",
   "borrow ends before independent pin",
   "publication with borrowed prefix",
   "merge with prefix alive",
@@ -6974,4 +6976,16 @@ export const TRIGGER_PREPARATION_REACH = [
   "delete route",
   "terminal definition needs no compiled body",
   "zero queues copies and readers",
+] as const;
+
+export const TRIGGER_RI_UNIQUE_REACH = [
+  "queue",
+  "id",
+  "entry",
+  "no outer AFTER drain",
+  "first action conflict",
+  "successive actions one command",
+  "two earlier action checkpoints pass",
+  "PG error priority",
+  "zero queues pins and credit",
 ] as const;

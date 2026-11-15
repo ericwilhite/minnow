@@ -108,12 +108,18 @@ export interface NativeCommandBoundary {
   /** Queue adapter: validate/resolve the root-owned scalar ID internally, then execute the
    * immutable entry. Foreign/retired IDs refuse before effects. No entry/key buffers escape
    * to the queue. Resolve I/O is fenced before
-   * callbacks; decoded entry metadata uses the root's prepaid ordinary frame workspace. */
+   * callbacks; decoded entry metadata uses the root's prepaid ordinary frame workspace.
+   * BEFORE resolving, verify all newly introduced child uniqueness for this action. An earlier
+   * root/action checkpoint does not cover later writes: successive actions may share a command
+   * token. Never drain outer AFTER events while performing this incremental checkpoint. */
   executeReferentialId(id: number, hooks: NativeRowHooks, signal: AbortSignal): Promise<void>;
   /** Exactly one parent row/one FK event. Seal the complete child input before mutation;
    * release input/pin/producer progress before writer admission. No nested governor admission.
    * Follow uses captured identities; explicit actions use their distinct catalog mode.
-   * RESTRICT is23001; NO ACTION/missing-parent23503. RI preserves trigger budget. */
+   * RESTRICT is23001; NO ACTION/missing-parent23503. RI preserves trigger budget.
+   * BEFORE resolving, incrementally verify this action's newly introduced child uniqueness,
+   * even if the shared command token passed a root or earlier action checkpoint. No outer
+   * AFTER drain: a child uniqueness error must precede a later named AFTER body's error. */
   executeReferential(
     entry: ReferentialEntry,
     hooks: NativeRowHooks,
