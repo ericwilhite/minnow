@@ -27,8 +27,8 @@ append behind the existing frame; pending IO and continuations drain before clea
 runtime groundwork only: native trigger SQL stays disabled until the joint firing integration.
 
 The private trigger runner's current-prefix pin has a read phase, then a locator-only phase.
-It refuses data rereads after statement mutation begins, while later write batches retain
-locator resolution. Generated prefix tests cover publication, index maintenance, cancellation,
+It refuses data rereads, including from pre-created index cursors, after statement mutation
+begins, while later write batches retain locator resolution. Generated prefix tests cover publication, index maintenance, cancellation,
 and native row-account and reader-registration cleanup; this does not enable trigger firing.
 
 The private 1.0 catalog retains exact DELETE/UPDATE foreign-key actions and records omitted

@@ -3845,7 +3845,7 @@ remain the separate joint B6/B5b consumer described in the inventory.
 
 Current-prefix pins from Statement.readOwn are phase pins, not immutable data snapshots.
 Consume/spool every body input before mutation; once mutation begins, all data/index rereads
-(including cached segment handles) are forbidden. Retain the pin only for inputView locator
+(including cached segment handles and pre-created index cursors) are forbidden. Retain the pin only for inputView locator
 translation through every write batch, then release it. A fresh body gets a fresh pin. Native
 entry points assert this with an O(1) statement mutation epoch; ordinary snapshots keep their
 immutable contract. Release clears the callback so a retained expired pin cannot retain its

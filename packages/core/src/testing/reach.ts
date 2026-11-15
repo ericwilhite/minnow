@@ -6849,6 +6849,7 @@ export const TRIGGER_PREFIX_LIFECYCLE_REACH = [
   "committed bodies",
   "multiple write batches",
   "cached and fresh rereads refused",
+  "cached cursor read refused",
   "zero native retention and registrations",
   "single row batches",
   "several row batches",

@@ -122,6 +122,7 @@ for (const seed of seedsFor("next-trigger-prefix-lifecycle", [0xb7cc, 0xb7cd]))
                   const source = pin.table(table.id, { budget: grant }),
                     segment = source.segments[0],
                     cachedIndex = pin.index(table.id, primary),
+                    cachedCursor = cachedIndex.range({ lower: null, upper: null }, "asc"),
                     at = await locate(pin);
                   if (!segment) throw new Error("missing source");
                   expect(h.path.shared.readers.count).toBeGreaterThan(0);
@@ -169,6 +170,14 @@ for (const seed of seedsFor("next-trigger-prefix-lifecycle", [0xb7cc, 0xb7cd]))
                           count: 0,
                         }),
                       ).toThrow("locator-only");
+                      try {
+                        await expect(
+                          Promise.resolve().then(() => cachedCursor.next(new Float64Array(1))),
+                        ).rejects.toThrow("locator-only");
+                        reach.reach("cached cursor read refused");
+                      } finally {
+                        cachedCursor.close();
+                      }
                       reach.reach("cached and fresh rereads refused");
                       if (body === 0 && finish === "cancel write") {
                         cancel.abort(reason);
