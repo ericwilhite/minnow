@@ -7083,3 +7083,24 @@ export const FTS_INLINE_CODEC_REACH = [
   "truncation refused",
   "trailing bytes refused",
 ] as const;
+
+/** Stage4 review: retirement at every awaited preparation edge must dominate its row claim. */
+export const FTS_AWAIT_STALE_REACH = [
+  "every IO boundary",
+  "final journal",
+  "publication",
+  "builder IO",
+  "same row claim",
+  "all touched bindings",
+  "exact reopen",
+] as const;
+export const FTS_COMMIT_WORK_REACH = [
+  "append ranges",
+  "1000 ranges",
+  "2000 ranges",
+  "linear commit reads",
+  "keyed skips payload",
+  "exact rows",
+  "bounded eligibility slice",
+  "eligibility abort on resume",
+] as const;

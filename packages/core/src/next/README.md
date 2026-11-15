@@ -3918,6 +3918,18 @@ Before global coverage advances, bounded journal pages checkpoint inline history
 Posting claims checkpoint at their own commit LSN first; later invalidations get separate
 checkpoints, never relabeling an earlier insert delta. Future indexed readers/builders must
 combine snapshot-visible pending cells and journal history before choosing acceleration.
+Insert eligibility is computed by a sliced pass per table, never by searching all undo for
+every inserted range. The commit route uses at most one bounded synchronous hint; unknown or
+expired work takes the shared-clock path, with cancellation checked on resume. Accepted
+append ranges use their chronological logical-row-ID high-water instead of scanning prior
+ranges for each document. No transaction-sized notification map is added.
+
+A capability is checked after the final awaited journal write, not just after payload writes.
+If it retired, invalidations dominate every touched binding. Native root publication and the
+outer admission/retry await are fenced again before sealing the protected row claim; a late
+retirement selects compact invalidation without losing accepted rows. Generation references
+remain protected and native retirement bookkeeping is preserved through that replacement.
+
 The SQL scan route and shipped engine behavior are unchanged. The new tag is part of the
 unmerged development manifest9/body7 unit; it changes no supported stored predecessor.
 

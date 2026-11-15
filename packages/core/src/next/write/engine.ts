@@ -1,14 +1,15 @@
 import { FtsMutations, type FtsMutationCommit } from "./fts-mutations.js";
-import { ftsMutationScan, isFtsKeyedUndo } from "./fts-undo.js";
+import { ftsMutationScan } from "./fts-undo.js";
 import { checkpointFtsMutations } from "./fts-mutation-checkpoint.js";
 import { ftsReplayCoverage } from "./fts-replay.js";
 import { FTS_PUBLICATION_MINIMUM_BYTES } from "./fts-minimum.js";
 import type { FtsWriteRenderer } from "../access/fts-write.js";
-import { compatibleFtsRenderer } from "./fts-renderer.js";
+import { compatibleFtsRenderer, stableFtsRenderer, type FtsClaimSeal } from "./fts-renderer.js";
 import {
   prepareFtsInserts,
   hasFtsWrites,
   hasFtsInserts,
+  hasFtsKeyedWrites,
   ftsPrepareMinimum,
   FTS_PREPARE_DESCRIPTOR_BYTES,
 } from "./fts-prepare.js";
@@ -2424,7 +2425,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   async #commitFts(tx: TransactionImpl, request: CommitRequest | null): Promise<CommitReceipt> {
     await this.#prepareMinimum(tx.catalog);
     let reservation: FtsMutationCommit | null = null;
-    const keyed = tx.undo.some(isFtsKeyedUndo);
+    const keyed = await hasFtsKeyedWrites(tx, { signal: this.#commitAbort.signal });
     const mutations = keyed
       ? await this.#metadataAsync(async () => this.#ensureFtsMutations())
       : null;
@@ -2437,10 +2438,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
       }
       const staging = this.#txStaging.get(tx);
       const names = staging === undefined ? null : await this.#restage(tx, staging);
-      if (hasFtsInserts(tx)) {
+      if (await hasFtsInserts(tx, { signal: this.#commitAbort.signal })) {
         const previous = this.#ftsPending;
         if (previous && previous.lsn > 0) await this.#appender.durable(previous.lsn);
-        await this.#metadataAsync(() => this.#stageFts(tx));
+        const seal = await this.#metadataAsync(() => this.#stageFts(tx));
+        // The outer retry/admission await is part of preparation too. Seal the claim only
+        // after it resumes, before dispatching to the row encoder.
+        if (!seal.invalidatesAll && !stableFtsRenderer(seal.renderer, seal.workspaceBytes))
+          await this.#metadataAsync(() => this.#stageFts(tx, false));
       }
       // Reference-free keyed effects require no manifest publication, even if a flush is
       // currently publishing. Stream them without a transaction-sized descriptor array.
@@ -2453,7 +2458,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     }
   }
 
-  async #stageFts(tx: TransactionImpl, allowPreparation = true): Promise<void> {
+  async #stageFts(tx: TransactionImpl, allowPreparation = true): Promise<FtsClaimSeal> {
     this.#check();
     if (this.#ftsMetadataBytes === 0) {
       this.#chargeMetadata(512);
@@ -2465,6 +2470,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       64 * 1024 +
       1024 * Math.ceil((tx.catalog.fts.length + tx.catalog.tables.length) / FTS_JOURNAL_ENTRIES);
     const renderer = compatibleFtsRenderer(this.#ftsRenderer);
+    const rendererWorkspace = renderer?.workspaceBytes ?? 0;
     const wanted = renderer ? ftsPrepareMinimum(renderer) : compact;
     // Optional accelerator work takes a complete existing/try-grown step; never waits while
     // borrowing source rows. If it cannot fit, fund only the compact invalidation path.
@@ -2480,6 +2486,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       (complete ? renderer.workspaceBytes : 0) + FTS_JOURNAL_ENTRIES * FTS_PREPARE_DESCRIPTOR_BYTES;
     let sealedBytes = 0;
     let retryCompact = false;
+    let invalidatesAll = !complete;
     let published = false;
     const scratch: ByteBudget = {
       allocate: (n) => {
@@ -2517,7 +2524,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         return write(parts);
       };
       const transaction = this.#root.sequence + 1;
-      const prepared = await prepareFtsInserts(
+      const preparation = await prepareFtsInserts(
         tx,
         transaction,
         scratch,
@@ -2525,16 +2532,18 @@ export class WritePathImpl implements WritePath, EngineHooks {
         complete ? renderer : null,
         this.#commitAbort.signal,
       );
+      invalidatesAll = preparation?.invalidatesAll ?? true;
       writer.write = write;
       // Rendering, token arrays and append frontiers have retired. Only sealed writer
       // descriptors remain owned through the distinct root-publication phase.
       this.#chargeMetadata(-(bytes - sealedBytes));
       ownedWorkspace = sealedBytes;
       this.#check();
-      if (prepared === null) {
+      if (preparation === null) {
         await writer.abort();
-        return;
+        return { renderer, workspaceBytes: rendererWorkspace, invalidatesAll: true };
       }
+      const prepared = preparation.ref;
       const retired: ExtentRef[] = [];
       let root = await this.#nextRoot(writer, retired, new Map(), delta);
       this.#check();
@@ -2570,8 +2579,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#adoptTableRoots(root);
       this.#ftsPending = pending;
       this.#ftsUnclaimed = false;
-      tx.ftsEffect = effect;
       this.#publishState();
+      // This is the claim-preparation seal: no await may separate this capability check
+      // from making the protected effect available to the row WAL encoder.
+      if (
+        complete &&
+        !preparation.invalidatesAll &&
+        !stableFtsRenderer(renderer, rendererWorkspace)
+      )
+        retryCompact = true;
+      else tx.ftsEffect = effect;
     } catch (error) {
       if (writer?.state === "open") await writer.abort().catch(() => undefined);
       if (
@@ -2590,7 +2607,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
       writer = null;
       if (ownedWorkspace) this.#chargeMetadata(-ownedWorkspace);
     }
-    if (retryCompact) await this.#stageFts(tx, false);
+    if (retryCompact) return this.#stageFts(tx, false);
+    return { renderer, workspaceBytes: rendererWorkspace, invalidatesAll };
   }
 
   #commitNow(
