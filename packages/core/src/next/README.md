@@ -3917,3 +3917,12 @@ Log coverage validation includes the FTS checkpoint; a missing WAL suffix is cor
 Real-owner COMMIT tests check in-flight, terminal, reopened and checkpointed retries before
 native preparation, including a retry while a later transaction owns uncommitted rows.
 The fixture feeds native row writers because B5b's SQL modify executor is a separate merge.
+
+A missing/stale composition renderer is an optional write capability, not a stored-format
+compatibility decision. Unsupported tokenizer/render/scorer/config or an invalid workspace
+selects atomic invalidation. Preparation rechecks across payload IO, including the final
+payload await; invalidation dominates any partial parts already prepared. A retained native
+writer uses the final transaction catalog's stable FTS IDs, not declarations cached when
+that writer was constructed. Required unsupported semantic versions in stored definitions
+or pages still refuse before mutation. Live build-generation CAS belongs to stage5; no
+ready accelerator is enabled by this write integration.

@@ -1,7 +1,7 @@
 import { ftsReplayCoverage } from "./fts-replay.js";
 import { FTS_PUBLICATION_MINIMUM_BYTES } from "./fts-minimum.js";
 import type { FtsWriteRenderer } from "../access/fts-write.js";
-import { requireFtsSemantics } from "../fts-config.js";
+import { compatibleFtsRenderer } from "./fts-renderer.js";
 import {
   prepareFtsInserts,
   hasFtsWrites,
@@ -453,10 +453,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   #ftsUnclaimed = false;
   #ftsMetadataBytes = 0;
   installFtsRenderer(renderer: FtsWriteRenderer): void {
-    requireFtsSemantics(renderer);
-    if (!Number.isSafeInteger(renderer.workspaceBytes) || renderer.workspaceBytes < 0)
-      throw new RangeError("Invalid FTS renderer workspace");
-    this.#ftsRenderer = renderer;
+    this.#ftsRenderer = compatibleFtsRenderer(renderer);
   }
 
   readonly durability: Durability;
@@ -2372,7 +2369,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       FTS_JOURNAL_ENTRIES * FTS_PREPARE_DESCRIPTOR_BYTES +
       64 * 1024 +
       1024 * Math.ceil((tx.catalog.fts.length + tx.catalog.tables.length) / FTS_JOURNAL_ENTRIES);
-    const renderer = this.#ftsRenderer;
+    const renderer = compatibleFtsRenderer(this.#ftsRenderer);
     const wanted = renderer ? ftsPrepareMinimum(renderer) : compact;
     // Optional accelerator work takes a complete existing/try-grown step; never waits while
     // borrowing source rows. If it cannot fit, fund only the compact invalidation path.

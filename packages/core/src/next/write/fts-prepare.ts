@@ -4,7 +4,7 @@
  * Nonresident/unsupported preparation invalidates the accelerator, never a legal row write.
  */
 import type { FtsWriteRenderer } from "../access/fts-write.js";
-import { requireFtsSemantics } from "../fts-config.js";
+import { compatibleFtsRenderer } from "./fts-renderer.js";
 import { tokenize } from "../full-text.js";
 import { writeFtsInsertDelta, FTS_APPEND_MINIMUM_BYTES } from "../format/fts-append.js";
 import {
@@ -53,7 +53,8 @@ export async function prepareFtsInserts(
   renderer: FtsWriteRenderer | null,
   signal?: AbortSignal,
 ): Promise<BlobRef | null> {
-  if (renderer) requireFtsSemantics(renderer);
+  renderer = compatibleFtsRenderer(renderer);
+  const rendererWorkspace = renderer?.workspaceBytes ?? 0;
   let previous: BlobRef | null = null,
     ordinal = 0;
   const entries: FtsJournalEntry[] = [];
@@ -149,6 +150,15 @@ export async function prepareFtsInserts(
           invalid = true;
           break;
         }
+        // A capability may retire across awaited preparation IO. Never mix semantic versions
+        // or use a newly enlarged workspace without its admission in this transaction.
+        if (
+          compatibleFtsRenderer(renderer) === null ||
+          renderer.workspaceBytes !== rendererWorkspace
+        ) {
+          invalid = true;
+          break;
+        }
         // No await/admission while rendering a borrowed row. All token/sort storage is prepaid.
         let rendered: string | undefined, tokens: string[];
         try {
@@ -189,6 +199,14 @@ export async function prepareFtsInserts(
       }
       if (invalid) break;
     }
+    // Also fence a change during the LAST payload/page await: invalidation dominates any
+    // already-prepared parts, and is claimed atomically by the same row body.
+    if (
+      touched &&
+      renderer !== null &&
+      (compatibleFtsRenderer(renderer) === null || renderer.workspaceBytes !== rendererWorkspace)
+    )
+      invalid = true;
     if (touched && invalid) await put({ ...identity, kind: "invalidate" });
   }
   await flush();

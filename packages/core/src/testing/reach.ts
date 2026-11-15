@@ -6963,3 +6963,30 @@ export const FTS_REPLAY_COVERAGE_REACH = [
   "complete WAL",
   "global independent",
 ] as const;
+
+/** A stale write adapter invalidates in the row commit, never refuses a legal row. */
+export const FTS_STALE_WRITER_REACH = [
+  "before install",
+  "before commit",
+  "during prepare",
+  "late declaration",
+  "tokenizer",
+  "renderer",
+  "scorer",
+  "config",
+  "workspace",
+  "partial parts dominated",
+  "same body",
+  "rows and history survive",
+] as const;
+
+/** Keyed undo and its invalidation are neither both published early nor separated at faults. */
+export const FTS_KEYED_FAULT_REACH = [
+  "update",
+  "delete",
+  "prepare",
+  "append",
+  "none",
+  "rows and invalidation agree",
+  "orphan retirement",
+] as const;

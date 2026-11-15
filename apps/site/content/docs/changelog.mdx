@@ -20,7 +20,8 @@ commit invalidates acceleration and searches continue by exact scan. This change
 native manifest/WAL bytes only; it does not change the shipped 0.x engine or require migration.
 Native accepted updates, deletes and notified upserts atomically record table-wide FTS
 invalidation with their rows. This history survives checkpoint/reopen even when no index
-is declared; zero-row and rolled-back commands do not invalidate.
+is declared; zero-row and rolled-back commands do not invalidate. A missing or stale native
+write renderer also invalidates acceleration rather than rejecting accepted rows.
 No supported 1.0 stored-format predecessor exists yet.
 
 The unexported rebuild casts integers, NUMERIC (keeping scale), float4/float8 (PostgreSQL's
