@@ -807,3 +807,8 @@ It preserves the complete modification descriptor, retires parameters before wri
 input retirement before pin release, and propagates cancellation during cleanup. Its source
 host remains injected; the compiled B5b provider, named controller and native end/RI integration
 are still pending. This does not enable trigger SQL.
+
+The private named TriggerController now merges user/RI row events and drains nested body
+frames through the prepared runtime/body capability. Static native reach must supply its
+live-frame and per-row ordering bounds. This is not a new lowering or SQL-execution capability:
+the native registry/source/write provider and joint end-to-end campaign remain required.

@@ -3902,3 +3902,27 @@ The generated protocol suite uses real native writers, shared bound row rules an
 commit/rollback, generated output, CHECK and generated NOT NULL failures. Its source host is a
 small native-vector fixture, not the compiled provider. B5b's admitted source/registry and B6's
 named-trigger controller remain a separate integration; native SQL firing is still disabled.
+
+### Named trigger controller component
+
+`TriggerController` accepts immutable prepared programs in UTF8 name order and an injected
+native command/body capability. It runs BEFORE bodies per row, then merges each accepted
+row's user AFTER names with native RI names. The queue is FIFO across the statement: RI
+child AFTER events append behind the parent events already queued. A user body's command
+gets a nested frame; its uniqueness checkpoint, AFTER drain and residual references finish
+before the next body statement. Root `finishRoot()` is a non-ending Statement.end hook,
+not a commit or a second native statement.
+
+Static reach supplies the maximum live frame count (at most three) and maximum user plus
+RI entries for one row. `triggerControllerMinimumBytes` reserves one fixed queue and one
+bounded ordering scratch per live frame. Body producers and the one image/binding helper
+are separate prepaid parts of the same root. Queue packets contain scalar IDs; native
+registries retain the image/action lifetime. The controller creates no per-row Map or file,
+and row-name sorting uses the shared task clock. Root cancellation/close drains pending
+callbacks and all queues before its caller releases the native root or its grants.
+
+The permanent PGlite differential exercises this component with injected scalar source,
+row-image and RI adapters, real prefix-pin lifetimes, nested frames and observed queue
+spills while competing grants hold spare credit. It does not exercise B5b's complete
+compiled source/registry/write driver. SQL firing stays disabled until that joint integration
+passes its end-to-end pressure, rollback, FK-action, cancellation and fault campaign.

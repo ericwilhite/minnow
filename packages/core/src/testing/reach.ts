@@ -6948,3 +6948,17 @@ export const TRIGGER_BODY_REACH = [
   "invalid programs refuse before effects",
   "native generated NOT NULL matches PG",
 ] as const;
+
+export const TRIGGER_CONTROLLER_REACH = [
+  "completed command refuses more primary rows",
+  "PG exact ordering",
+  "parent update and RI child",
+  "parent delete and RI child",
+  "nested body before next statement",
+  "three live frames",
+  "competing grants",
+  "UTF8 names across surrogate boundary",
+  "old parent queue before RI child AFTER",
+  "observed queue spill",
+  "zero queues inputs pins and credit",
+] as const;

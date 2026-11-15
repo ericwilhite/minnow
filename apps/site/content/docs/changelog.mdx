@@ -22,7 +22,9 @@ one charged copy, wide values copy in cancellable fragments, and image borrows e
 body execution. The non-ending body protocol seals input, retires copied parameters before
 writes, and fences input retirement before releasing its prefix pin, including cancellation
 during cleanup. These are runtime components; native SQL trigger firing remains disabled
-until the joint command, registry and body-runner integration is verified.
+until the joint command, registry and body-runner integration is verified. The injected
+named controller merges user and referential-action events, preserving statement FIFO and
+nested body-command drains; it does not enable native SQL firing by itself.
 
 The private rebuild adds a spillable AFTER-event queue with bounded metadata. It preserves
 the shipped limit of two derived writes, including terminal RI work with a spent
