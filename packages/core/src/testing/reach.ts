@@ -8977,3 +8977,30 @@ export const CANONICAL_REFUSAL_REACH = [
   "sparse at dense density",
   "writer HLL bytes",
 ] as const;
+
+export const NATIVE_PROFILE_REACH = [
+  "assigned vocabulary",
+  "unassigned nested vocabulary",
+  "unassigned reader",
+  "manifest mismatch",
+] as const;
+
+export const DURABLE_OCTET_REACH = [
+  "every unknown octet",
+  "page encodings",
+  "page value tags",
+  "metadata versions",
+  "outer selectors",
+  "other nested selectors",
+] as const;
+
+export const DURABLE_EMBEDDED_OCTET_REACH = [
+  "row-id kind",
+  "physical type",
+  "statistic",
+  "physical flags and widths",
+  "nested physical tag",
+  "directory page encoding",
+  "array decimal special",
+  "run encoding",
+] as const;

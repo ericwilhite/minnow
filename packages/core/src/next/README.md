@@ -446,7 +446,7 @@ Raw pages, columns and run parts inherit their directory, body or manifest versi
 Unknown versions, tags and reserved bits produce a typed `MINNOW_` refusal. An intact
 unsupported native header never means an empty store. Checksum-invalid slots still follow
 ordinary dual-slot recovery. Private scratch journals and spill encodings are listed separately;
-they are not recovery authorities. Snapshot entries are design reservations, with no loader yet.
+they are not recovery authorities. Portable snapshot1 has its own container and selectors.
 
 The 16-byte native root header now carries a minimum-reader version and the inner manifest
 format before its opaque payload. Both are checksummed. Acquisition checks both root slots
@@ -459,6 +459,23 @@ Its eleven formerly reserved high bits carry biased selectors: minimum-reader mi
 bits21..23 and manifest-format minus2 in bits24..31. Zero selects reader1/manifest2, so current
 bytes and charges stay unchanged. The first released1.0 writer starts the supported fixture
 and automatic-upgrade chain. The shipped0.x engine is unchanged.
+
+Compatibility belongs to the outer gates. A writer introducing a nested tag or encoding must
+raise minimum reader, and minimum writer when an older writer cannot fully rewrite it, before
+those bytes enter data or WAL. The separate minimum-writer selector remains a freeze dependency;
+the current header above carries only minimum reader. `NATIVE_READER_PROFILES` binds the native
+registry vocabulary to that reader selector, once at module initialization. It adds no stored
+field, and does no per-query/page/row work. A registry vocabulary extension without an assigned
+profile refuses before storage acquisition. The guard cannot detect a semantic reinterpretation
+of an unchanged tag; that still requires format review and supported-writer fixture evidence.
+
+Under supported outer gates, an unknown nested tag is corruption. Open fully validates what it
+eagerly reads (root, manifest, catalog and WAL tail), while data pages remain lazy. A consuming
+query, merge, staged checkpoint fold, export or index rebuild must refuse typed before using a
+bad value or publishing derived state. Failure preserves the old root/WAL; opening must not scan
+the entire database just to look for corrupt data pages. A quiet checkpoint and an index-run
+merge need not read unrelated column pages. Generated native corruption cases test the actual
+consuming paths, with all containing checksums valid and explicit root/WAL/reopen witnesses.
 
 Page aux is reserved-zero except where the active layout assigns a byte count, dictionary code,
 scale or exponent. Nondecimal directories cannot claim decimal specials. HLL dense registers

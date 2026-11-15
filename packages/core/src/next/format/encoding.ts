@@ -9,9 +9,7 @@ export class UnsupportedEncodingError extends ManifestCorruptionError {
     readonly version: number,
     readonly supported: readonly number[],
   ) {
-    super(
-      `${format} encoding ${String(version)} is unsupported${version > Math.max(...supported) ? " (newer than this build)" : " (unpublished development format)"}`,
-    );
+    super(`Unknown ${format} encoding ${String(version)}; expected ${supported.join(", ")}`);
     this.name = "UnsupportedEncodingError";
   }
 }
