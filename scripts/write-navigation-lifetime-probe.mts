@@ -50,6 +50,7 @@ async function one(s: NavigationLifetimeCase) {
     table: {
       snapshot: {
         check: () => undefined,
+        checkRead: () => undefined,
         watchCursor: () => () => undefined,
         bound: 1,
         shared: { space: h.space, governor: h.governor },
