@@ -11351,3 +11351,19 @@ export const BIGINT_REPOINT_REACH = [
   "published memory handle",
   "zero charge",
 ] as const;
+
+export const TRIGGER_ORDERING_HARNESS_REACH = [
+  "UPDATE",
+  "DELETE",
+  "empty root",
+  "row work",
+  "reverse creation",
+  "forward creation",
+  "two body commands",
+  "one body command",
+  "multiple BEFORE names",
+  "UTF8 names",
+  "spill sized parent queue",
+  "strict PG trace",
+  "adapter cleanup fenced",
+] as const;

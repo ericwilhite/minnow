@@ -4942,3 +4942,15 @@ Native command statements retain their memory policy across end and commit. Endi
 the command scope must not reintroduce a future background-merge estimate into the
 commit step while another admitted execution retains its workspace. The next live
 statement selects its own policy; actual merge acquisition still funds its full step.
+
+The reusable trigger ordering campaign lives in `testing/trigger-ordering.test-support.ts`.
+`orderingScript(history)` supplies inline native DDL, independently compiled PostgreSQL
+trigger functions, seeds, the root mutation and an ordered observation query. The same strict
+PGlite runner accepts a `TriggerOrderingFactory`: an adapter runs that history and fences
+cleanup before the next one starts. An unsupported native operation must reject, never become
+an empty trace or an accepted skip. The current factory uses the real controller with the
+explicitly synthetic source/row/RI fixture. Replacing that factory with B5b's verified native
+SQL setup/execution is still required before claiming end-to-end support or enabling firing.
+The generated histories vary row counts (including zero and spill-sized queues), before/after
+names, UTF8 boundaries, creation order, event and body-command count. Existing controller
+contract seeds and run counts stay intact in their separate suite.
