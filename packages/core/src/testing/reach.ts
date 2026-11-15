@@ -6146,8 +6146,8 @@ export const FTS_CODEC_REACH = [
 
 export const FTS_SELECTOR_REACH = [
   "reader7 barrier",
-  "manifest9 barrier",
-  "commit body7",
+  "manifest10 barrier",
+  "commit body8",
   "wide sequence preserved",
   "checksummed roundtrip",
 ] as const;
@@ -7086,6 +7086,8 @@ export const FTS_INLINE_CODEC_REACH = [
 
 /** Stage4 review: retirement at every awaited preparation edge must dominate its row claim. */
 export const FTS_AWAIT_STALE_REACH = [
+  "lock resume",
+  "admitted workspace",
   "every IO boundary",
   "final journal",
   "publication",
@@ -7103,4 +7105,32 @@ export const FTS_COMMIT_WORK_REACH = [
   "exact rows",
   "bounded eligibility slice",
   "eligibility abort on resume",
+] as const;
+
+export const FTS_PUBLICATION_SEAL_REACH = [
+  "late retirement invalidated",
+  "valid claim preserved",
+  "same row body",
+  "replayed disposition",
+  "checkpointed disposition",
+] as const;
+export const LOG_SEAL_REACH = [
+  "allocation retirement",
+  "synchronous fitting",
+  "queue drain",
+  "deferred recycle",
+  "multipart",
+  "one byte final body",
+  "atomic LSN seal",
+  "checked bytes",
+  "charges drained",
+] as const;
+export const FTS_CLAIM_CODEC_REACH = [
+  "valid flag",
+  "invalidated flag",
+  "wide identity",
+  "fixed final byte",
+  "reserved flags refused",
+  "missing flag refused",
+  "development predecessor refused",
 ] as const;

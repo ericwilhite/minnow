@@ -1,4 +1,5 @@
 import { ftsMutationScan } from "./fts-undo.js";
+import type { FtsClaimSeal } from "./fts-renderer.js";
 import { taskClock, yieldTask } from "../task.js";
 /**
  * Write transactions, statements and table writers (access/write-path.ts, access/modify.ts).
@@ -249,6 +250,7 @@ export class TransactionImpl implements WriteTransaction {
   }
   /** Prepared and protected by the engine before either commit codec is called. */
   ftsEffect: Extract<BodyEffect, { kind: "fts" }> | null = null;
+  ftsSeal: FtsClaimSeal | null = null;
   #ordinal = 0;
   #open: StatementImpl | null = null;
   #savepointMap: Map<number, number> | null = null;

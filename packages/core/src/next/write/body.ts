@@ -15,7 +15,7 @@
  *                     u8 hasDeletes; [varuint count, f64 rowId…, per row: varuint keys, blob key…]
  *     7 publishedRows varuint tableId, varuint schemaVersion, varuint transaction,
  *                     varuint rootSequence, varuint indexes, varuint indexId…
- *     8 fts           varuint stagedTransaction, varuint protectedRootSequence
+ *     8 fts           varuint stagedTransaction, varuint protectedRootSequence, u8 invalidated
  *     9 ftsMutation   varuint tableId, varuint schemaVersion (reference-free keyed history)
  */
 import { DURABLE_CODECS, DURABLE_FORMATS, requireTag } from "../durable-format.js";
@@ -106,6 +106,7 @@ export function encodeBody(body: CommitFrameBody, into?: ByteWriter): Uint8Array
       case "fts":
         writer.varuint(effect.transaction);
         writer.varuint(effect.rootSequence);
+        writer.u8(effect.invalidated ? 1 : 0);
         break;
       case "publishedRows":
         writer.varuint(effect.tableId);
@@ -203,7 +204,7 @@ function decodeEffect(reader: ByteReader): BodyEffect {
         rootSequence = reader.varuint();
       if (transaction < 1 || rootSequence !== transaction)
         throw new LogCorruptionError("Invalid FTS claim identity");
-      return { kind: "fts", transaction, rootSequence };
+      return { kind: "fts", transaction, rootSequence, invalidated: readFlag(reader) };
     }
     case KIND.publishedRows: {
       const tableId = reader.varuint();

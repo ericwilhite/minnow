@@ -104,10 +104,10 @@ export async function prepareFtsInserts(
   budget: ByteBudget,
   writer: ExtentWriter,
   renderer: FtsWriteRenderer | null,
+  rendererWorkspace: number,
   signal?: AbortSignal,
 ): Promise<FtsPreparation | null> {
   renderer = compatibleFtsRenderer(renderer);
-  const rendererWorkspace = renderer?.workspaceBytes ?? 0;
   let invalidatesAll = renderer === null;
   const chain: { ref: BlobRef | null } = { ref: null };
   let ordinal = 0;

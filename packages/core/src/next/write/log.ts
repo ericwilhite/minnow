@@ -49,6 +49,9 @@ export const IDLE_FLUSH_MS = 100;
 export const IDLE_ARM_MS = 45;
 export const RELAXED_DELAY_MS = 5;
 
+/** Patches only the final body's bytes, synchronously with its LSN assignment. No IO/admission. */
+export type AppendSeal = (lastBody: Uint8Array) => void;
+
 export interface LogPosition {
   readonly salt: number;
   /** Chain checksum at `end` (the next frame's seed). */
@@ -178,22 +181,26 @@ export class LogAppender {
    * above it) is refused with `LogExhaustedError` before anything changes (review B3-p2a-3 #5);
    * so is one too large for the log.
    */
-  append(body: Uint8Array): MaybePromise<number> {
+  append(body: Uint8Array, seal?: AppendSeal): MaybePromise<number> {
     this.#check();
     this.checkAppend?.();
-    if (this.#streaming !== null) return this.#streaming.then(() => this.append(body));
+    if (this.#streaming !== null) return this.#streaming.then(() => this.append(body, seal));
     const frameParts = Math.max(1, Math.ceil(body.length / MAX_FRAME_BODY_BYTES));
     const framed = body.length + frameParts * (40 + COMMIT_BUFFER_OVERHEAD);
     if (this.buffers !== undefined && framed > LOG_QUEUE_BYTES)
-      return this.appendStream(body.length, (out, offset) => {
-        out.set(body.subarray(offset, offset + out.length));
-      });
+      return this.appendStream(
+        body.length,
+        (out, offset) => {
+          out.set(body.subarray(offset, offset + out.length));
+        },
+        seal,
+      );
     if (
       this.buffers !== undefined &&
       this.#queuedCost + this.#inFlightBytes + this.#deferredBytes + framed > LOG_QUEUE_BYTES
     ) {
       const drain = this.#deferred !== null ? this.#recycled : this.flushEncoded();
-      return need(drain).then(() => this.append(body));
+      return need(drain).then(() => this.append(body, seal));
     }
     const parts = Math.max(1, Math.ceil(body.length / MAX_FRAME_BODY_BYTES));
     if (parts > MAX_FRAME_PARTS) throw new RangeError("A transaction is too large for the log");
@@ -203,19 +210,25 @@ export class LogAppender {
     if (this.#deferred !== null) {
       // A recycle is switching incarnations: keep the body (the caller may reuse its buffer).
       const copy = this.buffers?.create(body.length) ?? new Uint8Array(body.length);
-      copy.set(body);
-      this.#deferred.push({ body: copy, first });
+      try {
+        copy.set(body);
+        seal?.(copy);
+        this.#deferred.push({ body: copy, first });
+      } catch (error) {
+        this.buffers?.release(copy);
+        throw error;
+      }
       this.#deferredBytes += framed;
       this.#lastLsn = first + parts - 1;
       return this.#lastLsn;
     }
-    this.#encode(body, first, parts);
+    this.#encode(body, first, parts, seal);
     this.#schedule();
     return this.#lastLsn;
   }
 
   /** Encodes one transaction's frames at `first …` and queues them (all or nothing). */
-  #encode(body: Uint8Array, first: number, parts: number): void {
+  #encode(body: Uint8Array, first: number, parts: number, seal?: AppendSeal): void {
     // Frames are encoded first and committed together: a failure leaves the log unchanged.
     const frames: Uint8Array[] = [];
     let chain = this.#chain;
@@ -225,14 +238,23 @@ export class LogAppender {
           parts === 1
             ? body
             : body.subarray(part * MAX_FRAME_BODY_BYTES, (part + 1) * MAX_FRAME_BODY_BYTES);
-        const frame = encodeFrame(
-          { salt: this.#salt, lsn: first + part, partIndex: part, partCount: parts },
-          slice,
-          chain,
-          this.buffers?.create(frameLength(slice.length)),
-        );
-        chain = frame.chain;
-        frames.push(frame.bytes);
+        const output = this.buffers?.create(frameLength(slice.length));
+        try {
+          // Include allocation observers BEFORE the seal too. After it, only checksum,
+          // private queue updates and LSN assignment run: no external callback or await.
+          if (part === parts - 1) seal?.(slice);
+          const frame = encodeFrame(
+            { salt: this.#salt, lsn: first + part, partIndex: part, partCount: parts },
+            slice,
+            chain,
+            output,
+          );
+          chain = frame.chain;
+          frames.push(frame.bytes);
+        } catch (error) {
+          if (output) this.buffers?.release(output);
+          throw error;
+        }
       }
     } catch (error) {
       for (const frame of frames) this.buffers?.release(frame);
@@ -258,10 +280,11 @@ export class LogAppender {
   appendStream(
     length: number,
     fill: (body: Uint8Array, offset: number) => MaybePromise<void>,
+    seal?: AppendSeal,
   ): Promise<number> {
     this.#check();
     if (this.#streaming !== null)
-      return this.#streaming.then(() => this.appendStream(length, fill));
+      return this.#streaming.then(() => this.appendStream(length, fill, seal));
     const parts = Math.max(1, Math.ceil(length / MAX_FRAME_BODY_BYTES));
     if (parts > MAX_FRAME_PARTS) throw new RangeError("A transaction is too large for the log");
     const run = (async () => {
@@ -279,9 +302,16 @@ export class LogAppender {
           const bytes =
             this.buffers?.create(frameLength(bodyLength)) ??
             new Uint8Array(frameLength(bodyLength));
+          let queued = false;
           try {
             const body = bytes.subarray(FRAME_HEADER_BYTES, FRAME_HEADER_BYTES + bodyLength);
             await fill(body, offset);
+            // A sealed transaction linearizes with its LAST frame. All prior frames and
+            // every async encoder/drain are done. Queue the last frame instead of awaiting
+            // storage here: seal -> checksum -> queue -> LSN is one synchronous section.
+            // Its existing frame charge moves to the queue, with no copy or new credit.
+            const last = seal !== undefined && part === parts - 1;
+            if (last) seal(body);
             const frame = encodeFrame(
               { salt: this.#salt, lsn: first + part, partIndex: part, partCount: parts },
               body,
@@ -289,11 +319,16 @@ export class LogAppender {
               bytes,
             );
             // Resolution transfers responsibility for retained copies to storage; see #writeQueued.
-            await this.#session.appendLog(bytes);
+            if (last) {
+              this.#queued.push(bytes);
+              this.#queuedBytes += bytes.length;
+              this.#queuedCost += bytes.length + COMMIT_BUFFER_OVERHEAD;
+              queued = true;
+            } else await this.#session.appendLog(bytes);
             chain = frame.chain;
             end += bytes.length;
           } finally {
-            this.buffers?.release(bytes);
+            if (!queued) this.buffers?.release(bytes);
           }
           this.#check();
         }

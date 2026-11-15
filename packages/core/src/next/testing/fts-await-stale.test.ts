@@ -21,7 +21,7 @@ import {
 import { setupFts, ftsParts, lastFtsCommit } from "./fts-transaction.test-support.js";
 
 for (const tables of [1, 2])
-  for (const group of ["pages", "metadata"] as const)
+  for (const group of ["write", "journal", "append", "seal", "metadata"] as const)
     for (const seed of seedsFor("next-fts-await-stale", [0xb879, 0xb87a]))
       it(`fences ${group} preparation IO for ${String(tables)} tables seed ${String(seed)}`, async (context) => {
         let stopped = false,
@@ -30,13 +30,17 @@ for (const tables of [1, 2])
           stopped = true;
           retire?.();
         });
+        const checkActive = () => {
+          if (stopped) throw new Error("Retired FTS await history");
+        };
         const reach = createReach(
           "FTS awaited capability",
-          FTS_AWAIT_STALE_REACH.filter((state) =>
-            group === "pages"
-              ? state !== "publication" && state !== "builder IO"
-              : state !== "final journal",
-          ),
+          FTS_AWAIT_STALE_REACH.filter((state) => {
+            if (state === "final journal") return group === "journal";
+            if (state === "builder IO") return group === "append" || group === "seal";
+            if (state === "publication" || state === "lock resume") return group === "metadata";
+            return true;
+          }),
         );
         await fc.assert(
           fc.asyncProperty(
@@ -45,12 +49,13 @@ for (const tables of [1, 2])
             async (n, field) => {
               reach.beginHistory();
               const run = async (target: number | null): Promise<string[]> => {
-                if (stopped) throw new Error("Retired FTS await history");
+                checkActive();
                 const h = new Harness(),
                   restores: Array<() => void> = [],
                   events: string[] = [];
                 let armed = false,
-                  changed = false;
+                  changed = false,
+                  enlargedRender = false;
                 const restore = () => {
                   armed = false;
                   for (const undo of restores.splice(0)) undo();
@@ -86,7 +91,10 @@ for (const tables of [1, 2])
                     ...ftsSemantics(),
                     config: { version: 1 },
                     workspaceBytes: FTS_WORKSPACE_BYTES,
-                    render: ftsValue,
+                    render: (...args: Parameters<typeof ftsValue>) => {
+                      enlargedRender ||= adapter.workspaceBytes > FTS_WORKSPACE_BYTES;
+                      return ftsValue(...args);
+                    },
                   };
                   path.installFtsRenderer(adapter);
                   const tx = await path.begin(),
@@ -94,6 +102,7 @@ for (const tables of [1, 2])
                   const values = Array.from({ length: n }, (_, i) => `alpha beta ${String(i)}`);
                   for (const id of tableIds) await s.table(id).insert(batch(texts(values)), null);
                   await s.end();
+                  checkActive();
                   const edge = (kind: string) => {
                     if (!armed || stopped) return;
                     events.push(kind);
@@ -108,6 +117,9 @@ for (const tables of [1, 2])
                   };
                   const begin = h.space.beginWrite.bind(h.space);
                   h.space.beginWrite = (label) => {
+                    // The engine has resumed its publication-lock await, but must still
+                    // use the workspace admitted BEFORE waiting for that lock.
+                    if (label === "FTS preparation") edge("lock resume");
                     const out = begin(label);
                     if (label !== "FTS preparation") return out;
                     const write = out.write.bind(out),
@@ -174,6 +186,9 @@ for (const tables of [1, 2])
                   const receipt = await tx.commit(null);
                   restore();
                   await receipt.durable;
+                  expect(enlargedRender, "renderer must not run beyond admitted workspace").toBe(
+                    false,
+                  );
                   if (target !== null) {
                     expect(changed, "selected preparation boundary must be visited").toBe(true);
                     const entries = (await ftsParts(h)).entries;
@@ -212,11 +227,17 @@ for (const tables of [1, 2])
               // Independent histories, partitioned only for bounded CI bodies. Every seed,
               // generated input and IO position still runs; the groups share no live state.
               for (let i = 0; i < trace.length; i++) {
-                const isPage = trace[i] === "write" || trace[i] === "journal";
-                if (isPage !== (group === "pages")) continue;
+                const kind = trace[i];
+                const bucket =
+                  kind === "write" || kind === "journal" || kind === "append" || kind === "seal"
+                    ? kind
+                    : "metadata";
+                if (bucket !== group) continue;
                 const events = await run(i);
                 expect(events.slice(0, i + 1)).toEqual(trace.slice(0, i + 1));
                 reach.reach("every IO boundary");
+                if (trace[i] === "lock resume") reach.reach("lock resume");
+                if (field === "workspace") reach.reach("admitted workspace");
                 if (trace[i] === "journal" && i === trace.lastIndexOf("journal"))
                   reach.reach("final journal");
                 if (trace[i] === "publication") reach.reach("publication");
@@ -234,4 +255,4 @@ for (const tables of [1, 2])
           },
         );
         reach.assertReached();
-      }, 60_000);
+      }, 120_000);

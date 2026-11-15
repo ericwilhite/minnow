@@ -3855,8 +3855,7 @@ remain exact; NULL document presence is preserved. Term keys are copied through 
 UTF16 scratch lane, so a short slice cannot retain a large caller-owned source string.
 IO ownership uses the existing fenced
 FTS writer. Returned descriptors retain a transferred charge until their lease is released; release
-drops references before refund. The caller owns abort, staging and publication. Its caller is now the stage4 publication path below. Keyed mutation history is published by the path below. Request replay proofs and stale-writer
-integration are the following review pieces; SQL still uses the scan route.
+drops references before refund. The caller owns abort, staging and publication. Its caller is now the stage4 publication path below. Keyed mutation history is published by the path below. Replay/dedupe and stale-writer publication are covered by stage4 below; SQL still uses the scan route.
 
 ### Atomic FTS row publication (stage4)
 
@@ -3886,7 +3885,7 @@ compact invalidation; it never takes a second loan. Cancellation drains page IO 
 its buffers, the step, or the grant. Journal references are bounded before IO; the audit walks
 all prepared documents, terms and postings, with owned decoder leases.
 
-The new native manifest9 and commitBody7 selectors refuse older unpublished development bytes
+The new native manifest10 and commitBody8 selectors refuse older unpublished development bytes
 before mutation. MCAT dialect/minimum reader7 is unchanged: the independent manifest barrier
 already makes older builds refuse these native bytes before fencing. No supported1.0 predecessor
 exists; this is not an upgrade path for 0.x. The public/shipped engine remains unchanged.
@@ -3901,7 +3900,7 @@ before row append and retained with undo; rollback removes it and commit drops u
 refunding it. Repeated notifications do not allocate. Native delete undo remains the safety net.
 
 At statement completion the check/prefix views retire before prepaying the complete future
-journal phase. A reference-free `ftsMutation` effect (body7 tag9) commits keyed history in the
+journal phase. A reference-free `ftsMutation` effect (body8 tag9) commits keyed history in the
 same WAL body as accepted rows, even without an FTS declaration. It needs no new root while
 another native publication is held. Only posting/document payload references require protected
 staging before WAL. Keyed invalidation dominates insert-part construction for that table.
@@ -3926,12 +3925,23 @@ ranges for each document. No transaction-sized notification map is added.
 
 A capability is checked after the final awaited journal write, not just after payload writes.
 If it retired, invalidations dominate every touched binding. Native root publication and the
-outer admission/retry await are fenced again before sealing the protected row claim; a late
-retirement selects compact invalidation without losing accepted rows. Generation references
-remain protected and native retirement bookkeeping is preserved through that replacement.
+outer admission/retry await are fenced again before preparation returns. A final check in
+LogAppender's serialized section seals a canonical one-byte invalidation disposition in the
+LAST FTS effect, synchronously with checksum/queueing and LSN assignment. Streamed claims
+queue their final frame after all encoding/IO waits, transferring the existing frame charge;
+there is no await or new admission between that check and the LSN. Earlier retirement
+invalidates all touched bindings in the same row body; retirement after the LSN is later than
+this commit. Replay retains the disposition and checkpoint appends dominating invalidations
+before covering that WAL. Raw staged insert parts alone are never accelerator authority.
+
+Preparation receives the workspace baseline admitted before the publication-lock wait. It
+checks against that same baseline before each render call; growth cannot silently reset the
+baseline or allocate unfunded renderer scratch. Stale work selects invalidation before
+rendering. Fixed seal/claim state fits the already prepaid 512-byte FTS publication descriptor.
+Ordinary commits without an FTS seal keep their existing append path.
 
 The SQL scan route and shipped engine behavior are unchanged. The new tag is part of the
-unmerged development manifest9/body7 unit; it changes no supported stored predecessor.
+unmerged development manifest10/body8 unit; it changes no supported stored predecessor.
 
 FTS recovery reads the checked checkpoint head once and passes its actual covered LSN to
 `Replayer` independently of global/catalog/ledger and per-table row coverage. A conservative

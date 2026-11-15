@@ -8,11 +8,11 @@
  * checksummed slot is not an empty/torn slot. Reserved masks enumerate every permitted bit;
  * writers emit zero for the remainder, readers refuse it. Scratch/transport are not durable.
  */
-/** Shared reference-table envelope; the manifest also carries its logical format version9. */
+/** Shared reference-table envelope; the manifest also carries its logical format version10. */
 export const METADATA_ENVELOPE_VERSION = 1;
-/** Raise before publishing any incompatible nested durable codec. Never fence before checking. */
+/** Root reader capability; incompatible nested bytes advance this or the exact manifest barrier. */
 export const DURABLE_READER_VERSION = 7;
-export const MANIFEST_FORMAT_VERSION = 9;
+export const MANIFEST_FORMAT_VERSION = 10;
 export const ROOT_SLOT_HEADER_BYTES = 16;
 export const ROOT_SLOT_OVERHEAD = ROOT_SLOT_HEADER_BYTES + 4;
 
@@ -727,9 +727,9 @@ export const DURABLE_FORMATS = {
   ]),
   commitBody: {
     magic: null,
-    version: 7,
+    version: 8,
     versionIn: "header",
-    fields: [{ ...version(0), values: [7] }],
+    fields: [{ ...version(0), values: [8] }],
     decoder: "decodeBody",
     state: "implemented",
   },

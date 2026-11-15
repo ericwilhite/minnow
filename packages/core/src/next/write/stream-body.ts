@@ -439,6 +439,7 @@ export async function streamBody(
     writer.u8(KIND.fts);
     writer.varuint(tx.ftsEffect.transaction);
     writer.varuint(tx.ftsEffect.rootSequence);
+    writer.u8(tx.ftsEffect.invalidated ? 1 : 0);
   }
   return count;
 }

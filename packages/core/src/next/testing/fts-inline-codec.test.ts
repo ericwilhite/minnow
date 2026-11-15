@@ -1,4 +1,4 @@
-/** Body7 tag9 is a reference-free positive table/schema identity, not an optional claim. */
+/** Body8 tag9 is a reference-free positive table/schema identity, not an optional claim. */
 import fc from "fast-check";
 import { expect, it } from "vitest";
 import { createReach, FTS_INLINE_CODEC_REACH } from "../../testing/reach.js";

@@ -454,7 +454,8 @@ function tableStatistics(groupCount: number, totals: ReadonlyMap<number, Totals>
 
 export class WritePathImpl implements WritePath, EngineHooks {
   #ftsRenderer: FtsWriteRenderer | null = null;
-  #ftsPending: { transaction: number; ref: BlobRef; lsn: number } | null = null;
+  #ftsPending: { transaction: number; ref: BlobRef; lsn: number; invalidated: boolean } | null =
+    null;
   #ftsUnclaimed = false;
   #ftsMetadataBytes = 0;
   #ftsMutations: FtsMutations | null = null;
@@ -1232,7 +1233,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#ftsMetadataBytes = 512;
       }
       if (this.#ftsPending !== null) throw new LogCorruptionError("FTS staging claimed twice");
-      this.#ftsPending = { transaction: effect.transaction, ref, lsn };
+      this.#ftsPending = {
+        transaction: effect.transaction,
+        ref,
+        lsn,
+        invalidated: effect.invalidated,
+      };
     }
     if (
       body.effects.some(
@@ -2441,11 +2447,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (await hasFtsInserts(tx, { signal: this.#commitAbort.signal })) {
         const previous = this.#ftsPending;
         if (previous && previous.lsn > 0) await this.#appender.durable(previous.lsn);
-        const seal = await this.#metadataAsync(() => this.#stageFts(tx));
+        let seal = await this.#metadataAsync(() => this.#stageFts(tx));
         // The outer retry/admission await is part of preparation too. Seal the claim only
         // after it resumes, before dispatching to the row encoder.
-        if (!seal.invalidatesAll && !stableFtsRenderer(seal.renderer, seal.workspaceBytes))
-          await this.#metadataAsync(() => this.#stageFts(tx, false));
+        if (
+          !seal.invalidatesAll &&
+          (seal.renderer !== this.#ftsRenderer ||
+            !stableFtsRenderer(seal.renderer, seal.workspaceBytes))
+        )
+          seal = await this.#metadataAsync(() => this.#stageFts(tx, false));
+        tx.ftsSeal = seal;
       }
       // Reference-free keyed effects require no manifest publication, even if a flush is
       // currently publishing. Stream them without a transaction-sized descriptor array.
@@ -2453,6 +2464,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         ? this.#streamCommit(tx, request, (tableId) => names?.get(tableId) ?? null)
         : this.#commitNow(tx, request, (tableId) => names?.get(tableId) ?? null));
     } finally {
+      tx.ftsSeal = null;
       if (this.#ftsMutationCommit?.tx === tx) this.#ftsMutationCommit = null;
       if (reservation !== null) await mutations?.release(reservation);
     }
@@ -2530,6 +2542,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         scratch,
         writer,
         complete ? renderer : null,
+        rendererWorkspace,
         this.#commitAbort.signal,
       );
       invalidatesAll = preparation?.invalidatesAll ?? true;
@@ -2570,8 +2583,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#chargeMetadata(charge);
       this.#roots.set(root, { refs: 1, bytes: charge });
       madeRoot = root;
-      const pending = { transaction, ref: prepared, lsn: 0 };
-      const effect = { kind: "fts" as const, transaction, rootSequence: root.sequence };
+      const pending = { transaction, ref: prepared, lsn: 0, invalidated: false };
+      const effect = {
+        kind: "fts" as const,
+        transaction,
+        rootSequence: root.sequence,
+        invalidated: false,
+      };
       await delta.publish(this.#space, encoded, writer, retired);
       published = true;
       this.#root = root;
@@ -2651,7 +2669,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
         temporaries.length = 0;
         this.#commitBuffers.grant.free(workspace);
       }
-      const lsn = this.#appender.append(body);
+      const lsn = this.#appender.append(
+        body,
+        tx.ftsEffect === null ? undefined : (last) => this.#sealFtsClaim(tx, last),
+      );
       if (lsn instanceof Promise)
         return this.#trackCommit(
           lsn.then((value) => {
@@ -2761,17 +2782,21 @@ export class WritePathImpl implements WritePath, EngineHooks {
         return { wrote: false, lsn: tx.baseLsn, durable: Promise.resolve() };
       }
       this.#check();
-      const lsn = await this.#appender.appendStream(counter.length, async (body, offset) => {
-        this.#check();
-        await streamBody(
-          tx,
-          request,
-          staged,
-          new ByteWindow(body, offset, scratch),
-          () => this.#check(),
-          order,
-        );
-      });
+      const lsn = await this.#appender.appendStream(
+        counter.length,
+        async (body, offset) => {
+          this.#check();
+          await streamBody(
+            tx,
+            request,
+            staged,
+            new ByteWindow(body, offset, scratch),
+            () => this.#check(),
+            order,
+          );
+        },
+        tx.ftsEffect === null ? undefined : (last) => this.#sealFtsClaim(tx, last),
+      );
       this.#check();
       return this.#finishCommit(tx, request, lsn);
     } finally {
@@ -2782,6 +2807,24 @@ export class WritePathImpl implements WritePath, EngineHooks {
     }
   }
 
+  /** Called only by the serialized appender, after its last await and before assigning LSN. */
+  #sealFtsClaim(tx: TransactionImpl, last: Uint8Array): void {
+    this.#check();
+    const seal = tx.ftsSeal,
+      effect = tx.ftsEffect;
+    if (seal === null || effect === null || last.length === 0)
+      throw new Error("Missing FTS publication seal");
+    const invalidated =
+      effect.invalidated ||
+      (!seal.invalidatesAll &&
+        (seal.renderer !== this.#ftsRenderer ||
+          !stableFtsRenderer(seal.renderer, seal.workspaceBytes)));
+    // The registered FTS effect is the last effect and its boolean is the last body byte,
+    // even when a multipart boundary splits its identity. The patch never resizes the body.
+    last[last.length - 1] = invalidated ? 1 : 0;
+    if (invalidated) tx.ftsEffect = { ...effect, invalidated };
+  }
+
   #finishCommit(tx: TransactionImpl, request: CommitRequest | null, lsn: number): CommitReceipt {
     const inline = this.#ftsMutationCommit;
     if (inline?.tx === tx) this.#ftsMutations?.commit(inline.reservation, lsn);
@@ -2790,6 +2833,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (pending?.transaction !== tx.ftsEffect.transaction)
         throw new Error("FTS publication lost before commit");
       pending.lsn = lsn;
+      pending.invalidated = tx.ftsEffect.invalidated;
     }
     tx.restamp(lsn);
     // Claimed by the frame. A staged commit spans memtables, and a commit flushes whole: its
@@ -5019,6 +5063,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         writer,
         this.#space,
         this.#commitAbort.signal,
+        pending.invalidated,
       );
       const checkpoint = await writeFtsJournal(
         {

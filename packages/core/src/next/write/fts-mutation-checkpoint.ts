@@ -5,6 +5,7 @@ import {
   readFtsJournal,
   writeFtsJournal,
   FTS_JOURNAL_ENTRIES,
+  ftsPreparedEntries,
   type FtsJournalEntry,
 } from "../format/fts-journal.js";
 import { LogCorruptionError } from "../format/log-frame.js";
@@ -19,8 +20,9 @@ export async function checkpointFtsMutations(
   writer: ExtentWriter,
   reader: ExtentReader,
   signal?: AbortSignal,
+  invalidated = false,
 ): Promise<{ ref: BlobRef | null; lsn: number }> {
-  if (mutations === null || through <= after) return { ref: previous, lsn: 0 };
+  if (!invalidated && (mutations === null || through <= after)) return { ref: previous, lsn: 0 };
   const charge = FTS_JOURNAL_ENTRIES * 512 + 512;
   if (!budget.allocate(charge)) throw new ParseBudgetError(charge);
   let entries: FtsJournalEntry[] = [];
@@ -48,7 +50,24 @@ export async function checkpointFtsMutations(
       );
       entries.length = 0;
     };
-    for await (const e of mutations.pending(after, through, signal)) {
+    if (invalidated && previous !== null) {
+      // The WAL seal dominates every insert part. Materialize that disposition before
+      // checkpoint/global coverage can drop the WAL. No posting references are resurrected.
+      for await (const e of ftsPreparedEntries(previous, budget, reader, signal)) {
+        if (e.kind !== "insert") continue;
+        entries.push({
+          kind: "invalidate",
+          tableId: e.tableId,
+          schemaVersion: e.schemaVersion,
+          ftsId: e.ftsId,
+          columnId: e.columnId,
+          generation: e.generation,
+          mutationEpoch: e.mutationEpoch,
+        });
+        if (entries.length === FTS_JOURNAL_ENTRIES) await flush();
+      }
+    }
+    for await (const e of mutations?.pending(after, through, signal) ?? []) {
       // The commit LSN is a monotone epoch. It retains each table's exact invalidation
       // boundary even when several reference-free effects share one checkpoint page.
       entries.push({
