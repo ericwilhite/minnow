@@ -6989,3 +6989,18 @@ export const TRIGGER_RI_UNIQUE_REACH = [
   "PG error priority",
   "zero queues pins and credit",
 ] as const;
+
+export const CATALOG_CREATE_BACKFILL_REACH = [
+  "generated backfill refused before mutation",
+  "boolean",
+  "integer",
+  "float",
+  "text",
+  "enum",
+  "timestamp",
+  "timestamptz",
+  "WAL reopen",
+  "checkpoint reopen",
+  "continue writing",
+  "zero resources",
+] as const;

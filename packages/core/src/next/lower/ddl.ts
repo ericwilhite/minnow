@@ -14,6 +14,9 @@ import type {
   TableDef,
   TableInput,
 } from "../access/catalog.js";
+import { normalizedColumnBackfill } from "../../engine/catalog-mutations.js";
+import { floatLiteral, timestampLiteral } from "./literals.js";
+import { timestampFromDate } from "../temporal.js";
 import type { CompiledStatement, ForeignKeyDefinition } from "../../engine/query.js";
 import { compileCheckExpression, compileWithDeclaredTypes } from "../../engine/query.js";
 import type { ColumnDefault } from "../../storage/types.js";
@@ -248,7 +251,7 @@ export function tableInput(
       defaultSql: defaultSqlOf(front.defaultValue, front.name),
       generatedSql: front.generatedValue?.sql ?? null,
       identitySequence: null,
-      missing: null,
+      missing: missingValue(front, type, catalog),
       ...(front.defaultValue?.kind === "autoincrement"
         ? { identity: { start: 1n, increment: 1n } }
         : {}),
@@ -497,20 +500,41 @@ function rulesState(catalog: CatalogView): ExpressionState {
   };
 }
 
-/** The `missing` value of an added column: its constant default, when lowering knows it exactly. */
+/** Frozen API/ALTER backfill, never the current insert default. Runtime-only casts refuse. */
 export function missingValue(
   column: FrontEndColumn,
   type: PhysicalType,
   catalog: CatalogView,
 ): FlatVector | null {
   if (column.backfill === undefined) return null;
+  if (column.generatedValue !== undefined)
+    throw new PlanningError(
+      `A generated column cannot also have a backfill: ${column.name}`,
+      "42601",
+    );
+  // Validation uses resolved enum labels; the front end leaves a named type's labels empty.
+  // Domain normalizers return the old engine's tagged representation, which is never a
+  // native literal. Keep the source spelling for native coercion after validating it.
+  normalizedColumnBackfill(
+    type.kind === "enum" && column.sqlDomain?.kind === "enum"
+      ? { ...column, sqlDomain: { ...column.sqlDomain, values: [...type.labels] } }
+      : column,
+    column.backfill,
+  );
+  const value = column.backfill;
+  // API numbers are already Float64 values, not SQL NUMERIC spellings. Preserve their
+  // declared physical type without requiring a runtime cast of a fabricated SQL literal.
+  if (typeof value === "number" && (type.kind === "float64" || type.kind === "float32")) {
+    const literal = floatLiteral(value, type);
+    if (literal.op === "literal") return literal.value;
+  }
+  if (value instanceof Date && type.kind === "timestamp") {
+    const literal = timestampLiteral(timestampFromDate(value), type.zoned);
+    if (literal.op === "literal") return literal.value;
+  }
   const state = rulesState(catalog);
   const typed = coerce(
-    lowerExpression(
-      { kind: "literal", value: column.backfill },
-      { column: () => undefined },
-      state,
-    ),
+    lowerExpression({ kind: "literal", value }, { column: () => undefined }, state),
     type,
     "assignment",
     state.parameters,

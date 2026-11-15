@@ -812,3 +812,14 @@ The private named TriggerController now merges user/RI row events and drains nes
 frames through the prepared runtime/body capability. Static native reach must supply its
 live-frame and per-row ordering bounds. This is not a new lowering or SQL-execution capability:
 the native registry/source/write provider and joint end-to-end campaign remain required.
+
+### Catalog freeze audit: creation backfills
+
+`lowerSchemaTable` retains explicit `CreateTableInput.backfill` as a typed length-one
+`ColumnDef.missing` vector, including on CREATE. Native catalog planning keeps that vector;
+absence remains SQL NULL. API fractional numbers and Date inputs use their declared physical
+types. Generated-column/backfill combinations refuse before mutation. The constant-only
+backfill boundary remains explicit: values requiring executor-only casts (for example UUID,
+INTERVAL and JSONB) still refuse with 0A000; this unit does not evaluate runtime casts in lowering.
+`catalog-backfill-create.test.ts` compares shipped introspection and rows, with ordinary WAL
+and native checkpoint reopen, continued writes and zero retained governor bytes.

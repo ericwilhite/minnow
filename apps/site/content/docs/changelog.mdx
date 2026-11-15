@@ -10,6 +10,12 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The private 1.0 schema-table lowering preserves API-supplied frozen backfills at creation,
+including fractional numbers and both timestamp kinds. Ordinary WAL and checkpoint reopen
+retain these values separately from insert defaults; generated columns cannot also declare a
+backfill. This fixes private catalog metadata only, without changing released 0.x behavior,
+public APIs, catalog framing or format selectors.
+
 The unexported rebuild casts integers, NUMERIC (keeping scale), float4/float8 (PostgreSQL's
 shortest spelling), boolean, date, time, timestamp, timestamptz (UTC), interval (including
 `infinity` / `-infinity`), uuid, JSON/JSONB and arrays to text with PostgreSQL's default output
