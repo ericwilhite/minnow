@@ -3931,3 +3931,9 @@ FTS completion inspects only the current statement's undo interval. Earlier stat
 large explicit transaction are not revisited at each `end()`. A long current interval follows
 the shared task clock in chunks and checks the statement's abort signal on resume. Generated
 read-count and injected-clock probes enforce this bound without a host-timing threshold.
+
+The statement signal follows FTS metadata admission through the write hook and native minimum
+calculation. Cancellation rejects while competing credit is still held; it does not require
+that holder to release first. Completion rechecks the signal so an abort racing with a granted
+minimum cannot report successful statement end. Rollback leaves rows and FTS state unchanged,
+and the writer remains usable. Commit's existing irreversible R9 boundary is unchanged.

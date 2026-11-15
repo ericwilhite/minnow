@@ -7007,3 +7007,15 @@ export const FTS_STATEMENT_CLOCK_REACH = [
   "finish",
   "drained",
 ] as const;
+
+/** End-of-statement FTS admission observes its own signal before another holder releases credit. */
+export const FTS_ADMISSION_CANCEL_REACH = [
+  "actual admission wait",
+  "abort while credit held",
+  "abort on admission resume",
+  "no FTS preparation",
+  "writer usable",
+  "update",
+  "delete",
+  "upsert",
+] as const;

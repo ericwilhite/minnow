@@ -120,7 +120,7 @@ export interface EngineHooks {
   /** Ensures memtable memory for about `bytes` more before an insert (backpressure). */
   admit(bytes: number, growth?: () => number): MaybePromise<void>;
   /** End-of-statement admission after producer borrows and check views retire. */
-  prepareFtsMutation?(): MaybePromise<void>;
+  prepareFtsMutation?(signal?: AbortSignal): MaybePromise<void>;
   commit(tx: TransactionImpl, request: CommitRequest | null): Promise<CommitReceipt>;
   release(tx: TransactionImpl): void;
   label(): string;
@@ -995,7 +995,8 @@ export class StatementImpl implements Statement {
       this.guard(() => {
         this.#releaseViews();
         return settle(this.#needsFtsPreparation(this.#start), (keyed) =>
-          settle(keyed ? this.tx.hooks.prepareFtsMutation?.() : undefined, () => {
+          settle(keyed ? this.tx.hooks.prepareFtsMutation?.(this.#signal) : undefined, () => {
+            this.#signal?.throwIfAborted();
             this.#state = "ended";
             this.tx.ended(this);
           }),

@@ -2324,11 +2324,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   /** Accepted keyed writes reserve their whole future publication phase before command end.
    * Check/source views have retired; no borrowed vector or second loan crosses this wait. */
-  prepareFtsMutation(): MaybePromise<void> {
+  prepareFtsMutation(signal?: AbortSignal): MaybePromise<void> {
     this.#check();
+    signal?.throwIfAborted();
     if (this.#holder === null) throw new Error("FTS mutation without native writer");
     this.#holder.ftsMutationPrepared = true;
-    return this.#prepareMinimum();
+    return this.#prepareMinimum(this.#holder.catalog, signal);
   }
 
   commit(tx: TransactionImpl, request: CommitRequest | null): Promise<CommitReceipt> {
