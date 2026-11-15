@@ -9076,3 +9076,25 @@ export const NATIVE_HLL_REACH = [
   "reopenable",
   "charges released",
 ] as const;
+
+export const CORRUPT_MERGE_STRUCTURE_REACH = [
+  "short block",
+  "zero block count",
+  "offset table bounds",
+  "block byte cap",
+  "offset tiling",
+  "offset outside block",
+  "truncated key length",
+  "nonminimal key length",
+  "continued key length",
+  "key width cap",
+  "entry bounds",
+  "trailing block bytes",
+  "checksums valid",
+  "merge consumes damaged block",
+  "partial output discarded",
+  "typed corruption",
+  "root and WAL unchanged",
+  "reopenable",
+  "charges released",
+] as const;
