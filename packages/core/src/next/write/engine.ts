@@ -1450,7 +1450,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           directory.push(page.ref.extent);
           const held = await this.#metadata.groupPage(page.ref, this.#grant);
           try {
-            refs.push(...held.value);
+            for (const group of held.value) refs.push(group);
           } finally {
             held.release();
           }
@@ -3488,7 +3488,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           // Staged runs of an index dropped since staging do not fold: they are retired here.
           const indexIds = new Set(def.indexes.map((index) => index.id));
           for (const [indexId, list] of part.runs)
-            if (!indexIds.has(indexId)) retired.push(...list.map(runExtent));
+            if (!indexIds.has(indexId)) for (const run of list) retired.push(runExtent(run));
           newGroups.push(group);
           published.set(memtable, { group, root: await groupRootOf(part.groupRoot), runs });
           this.maintenance.stagedFolds += 1;
@@ -3637,11 +3637,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
         });
         runs.set(index.id, [...fresh.reverse(), ...(state.view.runs.get(index.id) ?? [])]);
       }
-      const nextRowId = Math.max(
-        state.nextRowId,
-        state.root?.nextRowId ?? 0,
-        ...newGroups.map((group) => group.lastRowId + 1),
-      );
+      let nextRowId = Math.max(state.nextRowId, state.root?.nextRowId ?? 0);
+      for (const group of newGroups) nextRowId = Math.max(nextRowId, group.lastRowId + 1);
       // Other transactions' staging stays listed; a folded one leaves with its directory.
       for (const id of foldedStagings) {
         const staging = state.stagings.get(id);
@@ -3650,7 +3647,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           staging.memtables.some((memtable) => memtable.rowCount > 0 && !set.includes(memtable))
         )
           throw new TypeError("A commit's staged rows must fold in one flush");
-        retired.push(...staging.directory);
+        for (const extent of staging.directory) retired.push(extent);
       }
       const tableRoot: TableRoot = {
         tableId: state.tableId,
@@ -4001,7 +3998,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
           );
         const parts = new Map<Memtable, StagedPart>();
         const residuals = new Map<Memtable, Map<number, KeyDelta>>();
-        for (const memtable of dropped) retired.push(...need(memtable.staged).extents);
+        for (const memtable of dropped)
+          for (const extent of need(memtable.staged).extents) retired.push(extent);
         // Tails a rollback truncated: deleted in the group's bitmap, gone from its runs.
         let rewrote = false;
         if (final)
@@ -4026,7 +4024,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         if (dropped.length === 0 && !rewrote && (adds.get(state)?.length ?? 0) === 0) continue;
         const memtables = [...kept, ...(adds.get(state) ?? [])];
         const partOf = (memtable: Memtable) => parts.get(memtable) ?? need(memtable.staged);
-        retired.push(...staging.directory);
+        for (const extent of staging.directory) retired.push(extent);
         let entry: TableRoot["staged"][number] | null = null;
         let directory: ExtentRef[] = [];
         if (memtables.length > 0) {
@@ -4050,7 +4048,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
           };
         }
         const base = state.root ?? emptyTableRoot(def, state.nextRowId, state.flushedThroughLsn);
-        const end = Math.max(0, ...memtables.map((memtable) => memtable.rowIdEnd));
+        let end = 0;
+        for (const memtable of memtables) end = Math.max(end, memtable.rowIdEnd);
         const others = base.staged.filter((staged) => staged.transaction !== id);
         const tableRoot: TableRoot = {
           ...base,
@@ -4266,7 +4265,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       }
       if (kept.length > 0) runs.set(indexId, kept);
     }
-    retired.push(...old);
+    for (const extent of old) retired.push(extent);
     const extents = [
       ...part.extents.filter((extent: ExtentRef) => !old.some((gone) => sameExtent(gone, extent))),
       ...writer.extents.slice(from),
@@ -4307,9 +4306,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
             .find((table) => table.tableId === state.tableId)
             ?.staged.some((entry) => entry.transaction === id);
           if (listed === true) {
-            this.#pendingRetire.push(...staging.directory);
+            for (const extent of staging.directory) this.#pendingRetire.push(extent);
             for (const memtable of staging.memtables)
-              this.#pendingRetire.push(...need(memtable.staged).extents);
+              for (const extent of need(memtable.staged).extents) this.#pendingRetire.push(extent);
           }
           if (state.root !== null)
             state.root = {
@@ -5201,9 +5200,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     if (this.#unclaimedWalks.length > 0) {
       const walks = [...this.#unclaimedWalks];
       const found: ExtentRef[] = [];
-      for (const stub of walks) found.push(...(await this.#tableExtents(stub)));
+      for (const stub of walks)
+        for (const extent of await this.#tableExtents(stub)) found.push(extent);
       this.#unclaimedWalks = this.#unclaimedWalks.filter((stub) => !walks.includes(stub));
-      this.#pendingRetire.push(...found);
+      for (const extent of found) this.#pendingRetire.push(extent);
     }
     const drained = [...this.#pendingRetire];
     if (drained.length > 0) retireOnce(retired, drained);
@@ -5678,7 +5678,7 @@ class DeltaPublication {
     this.#preparedList = prepared.list;
     // Retired by this publication like `released`: held under R8 (both durable roots and every
     // pin) before the space reuses them.
-    retired.push(...prepared.retire);
+    for (const extent of prepared.retire) retired.push(extent);
     if (this.sink !== null) {
       this.#sinkAsked = true;
       let result: ExtentDeltaResult | null;
@@ -5696,7 +5696,7 @@ class DeltaPublication {
           throw new ExtentSinkError(
             new RangeError("The root's extent list is the write path's own (ruling R25)"),
           );
-        retired.push(...result.retire);
+        for (const extent of result.retire) retired.push(extent);
       }
     }
     this.afterPrepared?.(this.kind, sequence);

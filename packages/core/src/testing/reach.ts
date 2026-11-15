@@ -8511,3 +8511,16 @@ export const NATIVE_BOUNDARY_IMAGE_CANCEL_REACH = [
   "released before boundary close",
   "zero ownership",
 ] as const;
+
+export const STAGED_FRAGMENT_MAXIMA_REACH = [
+  "stage",
+  "flush",
+  "one fragment",
+  "multiple fragments",
+  "over 64 fragments",
+  "rollback",
+  "fold committed rows",
+  "hidden staging",
+  "append after reopen",
+  "zero charge",
+] as const;
