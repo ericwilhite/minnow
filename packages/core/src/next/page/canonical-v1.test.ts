@@ -1,6 +1,6 @@
 /** PC3/PC4: current writer bytes stay valid; reserved fields/ranks refuse in the decode pass. */
 import fc from "fast-check";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import {
   createReach,
   CANONICAL_WRITER_REACH,
@@ -14,7 +14,7 @@ import { decodeRange, parsePage } from "./decode.js";
 import { encodeDirectory, parseDirectory } from "./directory.js";
 import { inflatePage } from "./gzip.js";
 import { PageEncoding } from "../format/manifest.js";
-import { DistinctSketch } from "./sketch.js";
+import { DistinctSketch, validateSketch } from "./sketch.js";
 import { dataAddress } from "./reader.js";
 import type { MemoryExtentSpace } from "./memory-extents.js";
 import {
@@ -424,6 +424,24 @@ for (const seed of seedsFor("next-canonical-refusal", [0xb2af, 0xb2b0]))
           const dense = new Uint8Array(1028);
           dense.set([10, 0, 0, 4]);
           dense.set(sketch.registers, 4);
+          // Validation must not allocate even a DataView or a typed subview. Build fixtures
+          // first; forbid constructors/copy helpers only during the synchronous body walk.
+          const allocation = () => {
+              throw new Error("HLL validation allocated");
+            },
+            subarray = vi.spyOn(Uint8Array.prototype, "subarray").mockImplementation(allocation),
+            slice = vi.spyOn(ArrayBuffer.prototype, "slice").mockImplementation(allocation);
+          vi.stubGlobal("DataView", new Proxy(DataView, { construct: allocation }));
+          vi.stubGlobal("Uint8Array", new Proxy(Uint8Array, { construct: allocation }));
+          try {
+            validateSketch(dense);
+            validateSketch(sparse);
+          } finally {
+            vi.unstubAllGlobals();
+            subarray.mockRestore();
+            slice.mockRestore();
+          }
+          reach.reach("allocation-free HLL validation");
           expect(equalBytes(DistinctSketch.parse(dense).registers, sketch.registers)).toBe(true);
           for (let invalid = 24; invalid < 256; invalid++) {
             const changed = dense.slice();

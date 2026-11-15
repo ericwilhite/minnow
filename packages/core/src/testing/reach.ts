@@ -8966,6 +8966,7 @@ export const CANONICAL_WRITER_REACH = [
 ] as const;
 
 export const CANONICAL_REFUSAL_REACH = [
+  "allocation-free HLL validation",
   "NULL scalar payload",
   "unused aux",
   "all-NULL aux",
@@ -9059,6 +9060,18 @@ export const STRUCTURED_EXPORT_REACH = [
   "typed query refusal",
   "typed export refusal",
   "no footer",
+  "root and WAL unchanged",
+  "reopenable",
+  "charges released",
+] as const;
+
+export const NATIVE_HLL_REACH = [
+  "dense rank",
+  "sparse duplicate",
+  "sparse order",
+  "real stored source",
+  "checksums valid",
+  "typed first-read refusal",
   "root and WAL unchanged",
   "reopenable",
   "charges released",

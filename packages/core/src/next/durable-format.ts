@@ -740,7 +740,7 @@ export const DURABLE_FORMATS = {
     decoder: "decodePointer",
     state: "implemented",
   },
-  sketch: inherited("pageDirectory", "DistinctSketch.parse", [
+  sketch: inherited("pageDirectory", "DistinctSketch.parse/validateSketch", [
     { name: "precision", offset: 0, width: 1, values: [10] },
     { name: "form", offset: 1, width: 1, values: [0, 1] },
   ]),

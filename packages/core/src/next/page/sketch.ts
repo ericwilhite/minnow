@@ -1,7 +1,8 @@
 /**
  * The distinct-count sketch of a column chunk: HyperLogLog with 2^10 one-byte registers
  * (standard error ≈ 3.3 %), mergeable by register maximum. Available for approximate planning and
- * cost estimates, never pruning or correctness; current execution does not read these bodies.
+ * cost estimates, never pruning or correctness. Directory reads validate the body without
+ * materializing registers; planning does not currently use its estimate.
  *
  * Values are hashed by SQL equality within one column: −0 = 0 and every NaN is one value for
  * floats, `1 mon` = `30 days` for intervals, and a decimal coefficient hashes the same whatever
@@ -11,7 +12,7 @@
  * Serialized form: u8 precision (10), u8 form (0 dense, 1 sparse), u16 entry count; dense is the
  * 1,024 registers, sparse is `count` × (u16 register, u8 value) for the non-zero registers.
  */
-import { requireHeader, DURABLE_CODECS, CONDITIONAL_FORMAT } from "../durable-format.js";
+import { requireTag, DURABLE_CODECS, CONDITIONAL_FORMAT } from "../durable-format.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { check, PageCorruptionError } from "./format.js";
 
@@ -109,35 +110,50 @@ export class DistinctSketch {
   }
 
   static parse(bytes: Uint8Array): DistinctSketch {
-    check(bytes.length >= 4 && bytes[0] === SKETCH_PRECISION, "Bad distinct sketch header");
-    requireHeader("sketch", bytes, PageCorruptionError);
-    const form = bytes[1] ?? 0;
-    const count = (bytes[2] ?? 0) | ((bytes[3] ?? 0) << 8);
+    const form = checkedForm(bytes);
     const sketch = new DistinctSketch();
-    if (form === 0) {
-      check(count === REGISTERS && bytes.length === 4 + REGISTERS, "Bad dense sketch");
-      // Validate while copying: no second pass or additional buffer.
-      for (let index = 0; index < REGISTERS; index++) {
-        const value = bytes[4 + index] ?? 0;
-        check(value <= CONDITIONAL_FORMAT.sketchMaximumRank, "Bad dense sketch rank");
-        sketch.registers[index] = value;
-      }
-    } else {
-      check(form === 1 && bytes.length === 4 + count * 3, "Bad sparse sketch");
-      let previous = -1;
-      for (let k = 0; k < count; k++) {
-        const at = 4 + k * 3;
-        const index = (bytes[at] ?? 0) | ((bytes[at + 1] ?? 0) << 8);
-        const value = bytes[at + 2] ?? 0;
-        check(
-          index < REGISTERS && value > 0 && value <= CONDITIONAL_FORMAT.sketchMaximumRank,
-          "Bad sketch entry",
-        );
-        check(index > previous, "Sparse sketch registers are not strictly increasing");
-        previous = index;
-        sketch.registers[index] = value;
-      }
-    }
+    readRegisters(bytes, form, sketch.registers);
     return sketch;
   }
+}
+
+function checkedForm(bytes: Uint8Array): number {
+  check(bytes.length >= 4 && bytes[0] === SKETCH_PRECISION, "Bad distinct sketch header");
+  const form = bytes[1] ?? 0;
+  requireTag(form, DURABLE_CODECS.sketchForm, "sketch form", PageCorruptionError);
+  return form;
+}
+/** Validate while copying, or validate only. One body walk; null allocates no registers. */
+function readRegisters(bytes: Uint8Array, form: number, registers: Uint8Array | null): void {
+  const count = (bytes[2] ?? 0) | ((bytes[3] ?? 0) << 8);
+  if (form === 0) {
+    check(count === REGISTERS && bytes.length === 4 + REGISTERS, "Bad dense sketch");
+    // Validate while copying: no second pass or additional buffer.
+    for (let index = 0; index < REGISTERS; index++) {
+      const value = bytes[4 + index] ?? 0;
+      check(value <= CONDITIONAL_FORMAT.sketchMaximumRank, "Bad dense sketch rank");
+      if (registers !== null) registers[index] = value;
+    }
+  } else {
+    check(form === 1 && bytes.length === 4 + count * 3, "Bad sparse sketch");
+    let previous = -1;
+    for (let k = 0; k < count; k++) {
+      const at = 4 + k * 3;
+      const index = (bytes[at] ?? 0) | ((bytes[at + 1] ?? 0) << 8);
+      const value = bytes[at + 2] ?? 0;
+      check(
+        index < REGISTERS && value > 0 && value <= CONDITIONAL_FORMAT.sketchMaximumRank,
+        "Bad sketch entry",
+      );
+      check(index > previous, "Sparse sketch registers are not strictly increasing");
+      previous = index;
+      if (registers !== null) registers[index] = value;
+    }
+  }
+}
+
+/** A directory must refuse a malformed hint even when planning does not use its estimate.
+ * No destination object/buffer, and the same checks as the materializing decoder. */
+export function validateSketch(bytes: Uint8Array): void {
+  readRegisters(bytes, checkedForm(bytes), null);
 }

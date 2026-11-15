@@ -482,7 +482,8 @@ scale or exponent. Nondecimal directories cannot claim decimal specials. HLL den
 are 0..23; sparse entries have ranks 1..23 and strictly increasing unique register IDs. These
 checks run during the existing parse/copy loop. Scalar payloads beneath NULLs remain don't-care;
 sparse versus dense HLL is a packing choice, so both valid forms are readable at any density.
-The current executor does not consume stored HLL bodies; callers must parse before using them.
+Directory reads validate HLL bodies without allocating registers. Planning does not currently
+use their estimates.
 
 Group deletion bitmaps inherit the enclosing group-page version. They store exactly
 `ceil(rowCount / 32)` little-endian u32 words, with unused high bits zero. Cache-hit and

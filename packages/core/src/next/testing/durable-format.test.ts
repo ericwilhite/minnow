@@ -102,7 +102,7 @@ import type { ManifestRoot, GroupRoot, BlobRef, PageEntry } from "../format/mani
 import { parsePage, parseDictionary } from "../page/decode.js";
 import { encodeDirectory, parseDirectory } from "../page/directory.js";
 import { decodePointer, encodePointer, LARGE_VALUE_BYTES } from "../page/large-value.js";
-import { DistinctSketch } from "../page/sketch.js";
+import { DistinctSketch, validateSketch } from "../page/sketch.js";
 import { encodeBody, decodeBody } from "../write/body.js";
 import { encodeColumn, decodeColumn } from "../write/columns.js";
 import { Catalog, decodeLogged, encodeLogged } from "../write/catalog.js";
@@ -628,6 +628,7 @@ function adapters(): Record<Exclude<DurableFormatName, "indexedDb">, Adapter> {
     sketch: {
       bytes: new DistinctSketch().serialize(),
       decode: (bytes) => DistinctSketch.parse(bytes),
+      also: [(bytes) => validateSketch(bytes)],
     },
     commitBody: { bytes: encodeBody({ request: null, effects: [] }), decode: decodeBody },
     column: {
