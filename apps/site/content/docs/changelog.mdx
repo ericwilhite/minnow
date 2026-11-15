@@ -10,6 +10,10 @@ compatibility policy and release process.
 
 ## Unreleased
 
+Private catalog capability validation now visits shared input objects once. External planning,
+replay and loading keep their inspection checks; internal construction avoids repeatedly walking
+the resident catalog on every DDL or replay step. This changes no stored bytes or released formats.
+
 The private 1.0 catalog requires understanding of every present semantic field, including
 conditional type, vector and WAL operands. Read-only catalog inspection may skip unknown
 optional fields; writable opens and replay refuse them. Catalog planning also refuses inspected
