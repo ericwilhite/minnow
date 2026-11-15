@@ -4307,3 +4307,12 @@ within its declared length, and enum bytes must name a declared label. Validatio
 private staging in bounded windows without constructing an array/JSON value graph. Array
 NUMERIC work is bounded by the supported precision; JSON nesting state grows only with depth
 and is charged, including resize overlap. Admission and cancellation follow the same replay path.
+
+Replay retries retain only the furthest consumed offset and a constant-size streaming digest,
+not source bytes. Before parsing a replay, a charged 64KiB window rechecks that entire prefix;
+normal pulling checks the same boundary again before advancing it. A changed length, short
+prefix read or digest mismatch refuses with `MINNOW_SNAPSHOT_SOURCE_CHANGED` and no publication.
+The digest has two 32-bit mixing lanes and detects accidental source changes; it is not an
+adversarial integrity/authentication guarantee. The source must still honor immutable exact
+reads. This check also applies to owner-spooled input. Cancellation drains started reads and
+returns verification scratch before admission retries.

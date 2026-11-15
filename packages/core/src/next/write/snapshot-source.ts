@@ -11,6 +11,80 @@ import type { ByteBudget } from "../storage/extents.js";
 import { snapshotInput } from "./snapshot-iterator.js";
 import { snapshotTake, snapshotPace } from "./snapshot-stage.js";
 
+/** Refusal of a replay that no longer names the original bytes, not a retryable IO error. */
+export class SnapshotSourceChangedError extends Error {
+  readonly code = "MINNOW_SNAPSHOT_SOURCE_CHANGED";
+  constructor() {
+    super("Snapshot source changed during load; retry with an immutable source");
+    this.name = "SnapshotSourceChangedError";
+  }
+}
+/** Two streaming 32-bit mixing lanes, independent of read partitioning. This is an
+ * accidental-change digest, not authentication. Do NOT use the archive CRC here: a valid
+ * frame plus its own CRC has a constant CRC residue even when its contents change. */
+class PrefixDigest {
+  a = 0x811c9dc5;
+  b = 0x9e3779b9;
+  add(bytes: Uint8Array): void {
+    for (const byte of bytes) {
+      this.a = Math.imul(this.a ^ byte, 0x01000193) >>> 0;
+      this.b = (Math.imul(this.b + byte, 0x85ebca6b) ^ (this.b >>> 13)) >>> 0;
+    }
+  }
+}
+/** Fixed bookkeeping survives admission retries, never source bytes. A replay verifies the
+ * furthest prefix BEFORE parsing it, then checks that boundary again as the parser consumes
+ * it. New bytes extend the checkpoint only after the old boundary has matched. */
+export class SnapshotSourcePrefix {
+  offset = 0;
+  #a = 0x811c9dc5;
+  #b = 0x9e3779b9;
+  constructor(readonly byteLength: number) {
+    if (!Number.isSafeInteger(byteLength) || byteLength < 0)
+      throw new SnapshotFormatError("Invalid snapshot source length");
+  }
+  check(digest: PrefixDigest): void {
+    if (digest.a !== this.#a || digest.b !== this.#b) throw new SnapshotSourceChangedError();
+  }
+  extend(offset: number, digest: PrefixDigest): void {
+    if (offset <= this.offset) return;
+    this.offset = offset;
+    this.#a = digest.a;
+    this.#b = digest.b;
+  }
+  async verify(
+    source: ReplayableSnapshotInput,
+    budget: ByteBudget,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (source.byteLength !== this.byteLength) throw new SnapshotSourceChangedError();
+    if (this.offset === 0) return;
+    const size = Math.min(65536, this.offset),
+      charge = size * 2 + 256;
+    snapshotTake(budget, charge);
+    try {
+      const scratch = new Uint8Array(size),
+        digest = new PrefixDigest();
+      const readSignal = signal ?? new AbortController().signal;
+      for (let offset = 0; offset < this.offset;) {
+        readSignal.throwIfAborted();
+        const into = scratch.subarray(0, Math.min(size, this.offset - offset));
+        try {
+          await source.readInto(offset, into, readSignal);
+        } catch {
+          readSignal.throwIfAborted();
+          throw new SnapshotSourceChangedError();
+        }
+        digest.add(into);
+        offset += into.length;
+        await snapshotPace({ signal: readSignal });
+      }
+      this.check(digest);
+    } finally {
+      budget.free(charge);
+    }
+  }
+}
 export interface ReplayableSnapshotInput {
   readonly byteLength: number;
   /** Exact, immutable read. Settle before releasing destination ownership, including on abort.
@@ -36,6 +110,7 @@ export function snapshotBlob(blob: Blob): ReplayableSnapshotInput {
 export class SnapshotReplay implements AsyncIterableIterator<Uint8Array> {
   readonly controller = new AbortController();
   #offset = 0;
+  readonly #digest = new PrefixDigest();
   #remaining = 64;
   #prefix = false;
   #held = 0;
@@ -46,6 +121,7 @@ export class SnapshotReplay implements AsyncIterableIterator<Uint8Array> {
     readonly source: ReplayableSnapshotInput,
     readonly budget: ByteBudget,
     readonly signal?: AbortSignal,
+    readonly prefix?: SnapshotSourcePrefix,
   ) {
     if (!Number.isSafeInteger(source.byteLength) || source.byteLength < 0)
       throw new SnapshotFormatError("Invalid snapshot source length");
@@ -77,14 +153,23 @@ export class SnapshotReplay implements AsyncIterableIterator<Uint8Array> {
       this.#remaining = 40;
       this.#prefix = true;
     }
-    const count = Math.min(65536, this.#remaining, this.source.byteLength - this.#offset);
+    const boundary =
+      this.prefix !== undefined && this.#offset < this.prefix.offset
+        ? this.prefix.offset - this.#offset
+        : 65536;
+    const count = Math.min(65536, boundary, this.#remaining, this.source.byteLength - this.#offset);
     // Destination and optional Blob/file adapter scratch coexist through read completion.
     snapshotTake(this.budget, count * 2 + 128);
     this.#held = count * 2 + 128;
     const bytes = new Uint8Array(count);
     await this.source.readInto(this.#offset, bytes, this.controller.signal);
     this.controller.signal.throwIfAborted();
+    this.#digest.add(bytes);
     this.#offset += count;
+    if (this.prefix !== undefined) {
+      if (this.#offset === this.prefix.offset) this.prefix.check(this.#digest);
+      this.prefix.extend(this.#offset, this.#digest);
+    }
     this.#remaining -= count;
     if (this.#prefix && count === 40) {
       this.#remaining = snapshotFrameBytes(decodeSnapshotFrameHeader(bytes).payloadBytes) - 40;

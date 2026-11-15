@@ -3,7 +3,11 @@
  * Publication rejection is indeterminate: close/reopen, never abort possibly published extents.
  */
 import { MemoryAdmissionError, type MemoryGovernor } from "../memory/governor.js";
-import { SnapshotReplay, type ReplayableSnapshotInput } from "./snapshot-source.js";
+import {
+  SnapshotReplay,
+  SnapshotSourcePrefix,
+  type ReplayableSnapshotInput,
+} from "./snapshot-source.js";
 import type { TableDef } from "../access/catalog.js";
 import { MAX_LSN } from "../access/snapshot.js";
 import {
@@ -203,6 +207,8 @@ export async function loadSnapshot(
   options: SnapshotLoadOptions = {},
 ): Promise<void> {
   let minimum = 1024;
+  // O(1) scalar retry bookkeeping, included in the existing 512B attempt control charge.
+  const prefix = new SnapshotSourcePrefix(input.byteLength);
   for (;;) {
     const [grant] = await governor.admitGroup({
       label: "portable snapshot load",
@@ -232,7 +238,8 @@ export async function loadSnapshot(
     try {
       if (!budget.allocate(512)) throw new SnapshotBudgetError(512);
       control = true;
-      replay = new SnapshotReplay(input, budget, options.signal);
+      await prefix.verify(input, budget, options.signal);
+      replay = new SnapshotReplay(input, budget, options.signal, prefix);
       await loadAttempt(replay, openTarget, budget, options);
       return;
     } catch (error) {

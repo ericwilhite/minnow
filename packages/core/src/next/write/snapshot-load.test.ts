@@ -1,12 +1,18 @@
 /** Atomic load law: old/absent or complete native root, never a portable prefix. */
 import { Governor, type Grant } from "../memory/governor.js";
-import { spoolSnapshotInput, type ReplayableSnapshotInput } from "./snapshot-source.js";
+import {
+  SnapshotReplay,
+  SnapshotSourcePrefix,
+  spoolSnapshotInput,
+  type ReplayableSnapshotInput,
+} from "./snapshot-source.js";
 import type { PhysicalType } from "../types.js";
 import { encodeSnapshotColumnHeader } from "./snapshot-column.js";
 import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import {
+  SNAPSHOT_SOURCE_STABILITY_REACH,
   createReach,
   SNAPSHOT_LOAD_REACH,
   SNAPSHOT_LOAD_FAULT_REACH,
@@ -943,6 +949,21 @@ for (const seed of seedsFor("next-snapshot-catalog-refusal", [0xb269, 0xb26a]))
                   tables.push({ ...table, id: salt + 10 });
                   (data.counters as Record<string, unknown>).nextTableId = salt + 11;
                   break;
+                case "nextColumnId floor":
+                  (data.counters as Record<string, unknown>).nextColumnId = 1;
+                  break;
+                case "nextTypeId floor":
+                  data.types = [{ id: 1, name: "counter_type", labels: ["v"] }];
+                  (data.counters as Record<string, unknown>).nextTypeId = 1;
+                  break;
+                case "nextIndexId floor":
+                case "nextConstraintId floor":
+                case "nextSequenceId floor":
+                case "nextViewId floor":
+                case "nextFtsId floor":
+                case "nextTriggerId floor":
+                  (data.counters as Record<string, unknown>)[mutation.split(" ")[0] ?? ""] = 0;
+                  break;
                 case "counter floor":
                   (data.counters as Record<string, unknown>).nextTableId = 1;
                   break;
@@ -1653,6 +1674,149 @@ for (const seed of seedsFor("next-snapshot-json-semantics", [0xb275, 0xb276]))
           expect(h.governor.usedBytes).toBe(0);
         }
       }),
+      { seed, numRuns: 4 },
+    );
+    reach.assertReached();
+  }, 60000);
+
+for (const seed of seedsFor("next-snapshot-source-stability", [0xb283, 0xb284]))
+  it(`refuses changed replay prefixes before publication seed ${String(seed)}`, async () => {
+    const reach = createReach("snapshot source stability", SNAPSHOT_SOURCE_STABILITY_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 1, max: 99 }),
+        fc.integer({ min: 16, max: 31 }),
+        async (value, bitByte) => {
+          reach.beginHistory();
+          const original = await fixture([value]);
+          // A fully valid replacement differs in UUID, including matching footer/CRCs.
+          const funding = new Budget(),
+            decoded = await SnapshotStreamReader.open(
+              (async function* () {
+                yield* original;
+              })(),
+              funding,
+            );
+          const id = decoded.header.id.slice();
+          id[bitByte - 16] = 1;
+          const replacement: Uint8Array[] = [];
+          const writer = await SnapshotStreamWriter.open(
+            { ...decoded.header, id },
+            {
+              write(bytes) {
+                replacement.push(bytes.slice());
+              },
+            },
+            funding,
+          );
+          for await (const frame of decoded.frames())
+            if (frame.kind !== SnapshotKind.footer)
+              await writer.frame(frame.kind, frame.objectId, frame.partIndex, frame.payload);
+          await writer.finish();
+          writer.close();
+          decoded.close();
+          expect(funding.used).toBe(0);
+          const first = original[0];
+          if (first === undefined) throw new Error("missing header");
+          // Consume the entire original (including its footer), then verify at a different
+          // read partitioning and reject a changed value/footer byte inside that prefix.
+          const whole = input(original),
+            prefixBudget = new Budget(),
+            prefix = new SnapshotSourcePrefix(whole.byteLength);
+          const pulling = new SnapshotReplay(whole, prefixBudget, undefined, prefix);
+          try {
+            for await (const part of pulling) {
+              expect(part.length).toBeGreaterThan(0);
+            }
+          } finally {
+            await pulling.close();
+          }
+          expect(prefix.offset).toBe(whole.byteLength);
+          await prefix.verify(whole, prefixBudget);
+          const at = 64 + Math.floor((value / 100) * (whole.byteLength - 64));
+          const changed: ReplayableSnapshotInput = {
+            byteLength: whole.byteLength,
+            async readInto(offset, into, signal) {
+              await whole.readInto(offset, into, signal);
+              if (offset <= at && at < offset + into.length)
+                into[at - offset] = (into[at - offset] ?? 0) ^ 1;
+            },
+          };
+          await expect(prefix.verify(changed, prefixBudget)).rejects.toMatchObject({
+            code: "MINNOW_SNAPSHOT_SOURCE_CHANGED",
+          });
+          expect(prefixBudget.used).toBe(0);
+          for (const mode of SNAPSHOT_SOURCE_STABILITY_REACH) {
+            const h = new Harness("strict", "memory"),
+              governor = new Governor(32 << 20);
+            const disk = new SimDisk(),
+              file = disk.open("snapshot-stability-spool", true),
+              scratch = new FileScratch(file, () => undefined);
+            const spool =
+              mode === "spool"
+                ? await spoolSnapshotInput(
+                    (async function* () {
+                      yield* original;
+                    })(),
+                    { scratch, offset: 4096, capacity: 8 << 20 },
+                    governor,
+                    { maxChunkBytes: 1 << 20 },
+                  )
+                : undefined;
+            let starts = 0,
+              opens = 0;
+            const source: ReplayableSnapshotInput = {
+              byteLength: original.reduce((n, part) => n + part.length, 0),
+              async readInto(offset, into, signal) {
+                if (offset === 0) starts++;
+                if (spool !== undefined && starts === 2 && offset === 0) {
+                  const changed = (first[bitByte] ?? 0) ^ 1;
+                  file.write(new Uint8Array([changed]), { at: 4096 + bitByte });
+                }
+                const changing = starts > 1 && mode !== "stable retry";
+                if (changing && mode === "truncated") throw new Error("source truncated");
+                await (
+                  spool ?? input(changing && mode === "valid archive" ? replacement : original)
+                ).readInto(offset, into, signal);
+                if (
+                  changing &&
+                  mode === "single bit" &&
+                  offset <= bitByte &&
+                  offset + into.length > bitByte
+                )
+                  into[bitByte - offset] = (into[bitByte - offset] ?? 0) ^ 1;
+              },
+            };
+            try {
+              const loading = loadSnapshot(
+                source,
+                () => {
+                  opens++;
+                  return target(h);
+                },
+                governor,
+              );
+              if (mode === "stable retry") {
+                await loading;
+                expect(await contents(h)).toEqual([[value, `value${String(value)}`]]);
+              } else {
+                await expect(loading).rejects.toMatchObject({
+                  code: "MINNOW_SNAPSHOT_SOURCE_CHANGED",
+                });
+                expect(opens).toBe(0);
+                expect(await contents(h)).toEqual([]);
+              }
+              expect(starts).toBeGreaterThan(1);
+              reach.reach(mode);
+            } finally {
+              await spool?.close();
+              file.close();
+            }
+            expect(governor.usedBytes).toBe(0);
+            expect(h.governor.usedBytes).toBe(0);
+          }
+        },
+      ),
       { seed, numRuns: 4 },
     );
     reach.assertReached();

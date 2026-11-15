@@ -8686,6 +8686,14 @@ export const SNAPSHOT_LOAD_OPEN_REACH = ["wait until discard", "wait until publi
 export const SNAPSHOT_CATALOG_REFUSAL_REACH = [
   "duplicate table name",
   "counter floor",
+  "nextColumnId floor",
+  "nextIndexId floor",
+  "nextConstraintId floor",
+  "nextSequenceId floor",
+  "nextViewId floor",
+  "nextTypeId floor",
+  "nextFtsId floor",
+  "nextTriggerId floor",
   "duplicate column id",
   "unsafe id",
   "unresolved reference",
@@ -8760,4 +8768,12 @@ export const SNAPSHOT_JSON_SEMANTICS_REACH = [
   "JSONB scale boundary",
   "JSONB precision boundary",
   "long zero exponent",
+] as const;
+
+export const SNAPSHOT_SOURCE_STABILITY_REACH = [
+  "valid archive",
+  "single bit",
+  "truncated",
+  "spool",
+  "stable retry",
 ] as const;
