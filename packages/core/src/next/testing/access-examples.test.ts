@@ -541,6 +541,7 @@ function recordingStatement(existing: ReadonlyMap<number, number>): {
     },
     table: () => writer,
     changeCatalog: () => ({ id: null }),
+    noteFtsMutation: () => undefined,
     end: async () => {
       calls.push("end");
     },

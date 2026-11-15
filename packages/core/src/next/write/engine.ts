@@ -1,8 +1,9 @@
+import { FTS_PUBLICATION_MINIMUM_BYTES } from "./fts-minimum.js";
 import type { FtsWriteRenderer } from "../access/fts-write.js";
 import { requireFtsSemantics } from "../fts-config.js";
 import {
   prepareFtsInserts,
-  hasFtsInserts,
+  hasFtsWrites,
   ftsPrepareMinimum,
   FTS_PREPARE_DESCRIPTOR_BYTES,
 } from "./fts-prepare.js";
@@ -1827,7 +1828,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
           if (!committed?.indexes.some((existing) => existing.id === index.id)) newBuilds++;
       }
     const metadata = this.#credits.prepareMetadata(
-      this.#minimumMetadata + newBuilds * PENDING_INDEX_BYTES,
+      Math.max(
+        this.#minimumMetadata,
+        this.#holder?.ftsMutationPrepared === true ? FTS_PUBLICATION_MINIMUM_BYTES : 0,
+      ) +
+        newBuilds * PENDING_INDEX_BYTES,
       signal,
     );
     if (metadata instanceof Promise) return this.#finishMinimumGrowth(metadata, signal);
@@ -2313,8 +2318,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
     return false;
   }
 
+  /** Accepted keyed writes reserve their whole future publication phase before command end.
+   * Check/source views have retired; no borrowed vector or second loan crosses this wait. */
+  prepareFtsMutation(): MaybePromise<void> {
+    this.#check();
+    if (this.#holder === null) throw new Error("FTS mutation without native writer");
+    this.#holder.ftsMutationPrepared = true;
+    return this.#prepareMinimum();
+  }
+
   commit(tx: TransactionImpl, request: CommitRequest | null): Promise<CommitReceipt> {
-    if (hasFtsInserts(tx)) return this.#trackCommit(this.#commitFts(tx, request), tx);
+    if (hasFtsWrites(tx)) return this.#trackCommit(this.#commitFts(tx, request), tx);
     const staging = this.#txStaging.get(tx);
     if (staging === undefined) return this.#commitNow(tx, request, () => null);
     // A large transaction: its staging is made exact first, then its frame names that root.
@@ -2350,7 +2364,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       FTS_JOURNAL_WORKSPACE_BYTES +
       FTS_JOURNAL_ENTRIES * FTS_PREPARE_DESCRIPTOR_BYTES +
       64 * 1024 +
-      1024 * Math.ceil(tx.catalog.fts.length / FTS_JOURNAL_ENTRIES);
+      1024 * Math.ceil((tx.catalog.fts.length + tx.catalog.tables.length) / FTS_JOURNAL_ENTRIES);
     const renderer = this.#ftsRenderer;
     const wanted = renderer ? ftsPrepareMinimum(renderer) : compact;
     // Optional accelerator work takes a complete existing/try-grown step; never waits while

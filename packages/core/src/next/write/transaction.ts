@@ -82,6 +82,8 @@ import { need, MemtableMemoryError } from "./bytes.js";
 
 /** Everything committed and pending (constraint checks see the whole transaction). */
 export const ALL = PENDING_BASE + MAX_STATEMENTS;
+/** Prepaid embedded notification slot; remains owned with row undo, not the statement. */
+const FTS_ROW_UNDO_BYTES = 32;
 
 /** What transactions need from the write path. */
 export interface EngineHooks {
@@ -116,6 +118,8 @@ export interface EngineHooks {
   addIndexDelta(tableId: number, indexId: number): Memtable;
   /** Ensures memtable memory for about `bytes` more before an insert (backpressure). */
   admit(bytes: number, growth?: () => number): MaybePromise<void>;
+  /** End-of-statement admission after producer borrows and check views retire. */
+  prepareFtsMutation?(): MaybePromise<void>;
   commit(tx: TransactionImpl, request: CommitRequest | null): Promise<CommitReceipt>;
   release(tx: TransactionImpl): void;
   label(): string;
@@ -125,6 +129,8 @@ export interface EngineHooks {
 export type Undo =
   | {
       readonly kind: "rows";
+      /** Present only on native, funded entries; mutation rolls back with this accepted range. */
+      ftsKeyed?: boolean;
       readonly statement: number;
       readonly tableId: number;
       readonly memtable: Memtable;
@@ -225,6 +231,20 @@ export class TransactionImpl implements WriteTransaction {
   state: WriteTransaction["state"] = "open";
   catalog: Catalog;
   readonly undo: Undo[] = [];
+  #ftsUndoBytes = 0;
+  /** Working minimum retained through publication; rollback may leave safe spare credit. */
+  ftsMutationPrepared = false;
+
+  /** Fund the embedded notification before native row append constructs its undo. */
+  reserveFtsRowUndo(): void {
+    if (!this.hooks.shared.budget.allocate(FTS_ROW_UNDO_BYTES))
+      throw new MemtableMemoryError(FTS_ROW_UNDO_BYTES);
+    this.#ftsUndoBytes += FTS_ROW_UNDO_BYTES;
+  }
+  releaseFtsRowUndo(): void {
+    this.#ftsUndoBytes -= FTS_ROW_UNDO_BYTES;
+    this.hooks.shared.budget.free(FTS_ROW_UNDO_BYTES);
+  }
   /** Prepared and protected by the engine before either commit codec is called. */
   ftsEffect: Extract<BodyEffect, { kind: "fts" }> | null = null;
   #ordinal = 0;
@@ -310,6 +330,7 @@ export class TransactionImpl implements WriteTransaction {
       const entry = this.undo.pop();
       if (entry === undefined) break;
       undoEntry(this, entry);
+      if (entry.kind === "rows" && entry.ftsKeyed !== undefined) this.releaseFtsRowUndo();
     }
   }
 
@@ -319,6 +340,11 @@ export class TransactionImpl implements WriteTransaction {
     this.state = "committing";
     try {
       const receipt = await this.hooks.commit(this, request);
+      // The engine consumed codecs, restamping and DDL iteration before releasing the slot.
+      // Drop undo objects before refunding their embedded notification slots.
+      this.undo.length = 0;
+      this.hooks.shared.budget.free(this.#ftsUndoBytes);
+      this.#ftsUndoBytes = 0;
       this.state = "committed";
       return receipt;
     } catch (error) {
@@ -689,6 +715,29 @@ export class StatementImpl implements Statement {
     }
     return false;
   }
+  /** Notification only: ordinary update/delete remain covered by their native undo. */
+  noteFtsMutation(tableId: number, kind: "update" | "delete" | "upsert"): void {
+    this.#checkOpen();
+    switch (kind) {
+      case "update":
+      case "delete":
+      case "upsert":
+        break;
+      default:
+        throw new TypeError("Unknown FTS mutation kind");
+    }
+    if (!this.catalog.table(tableId)) throw new RangeError("Unknown FTS mutation table");
+    for (let i = this.tx.undo.length - 1; i >= this.#start; i--) {
+      const e = this.tx.undo[i];
+      if (e?.kind === "rows" && e.tableId === tableId && e.count > 0) {
+        e.ftsKeyed = true;
+        return;
+      }
+      if ((e?.kind === "memDelete" || e?.kind === "groupDelete") && e.tableId === tableId) return;
+    }
+    // No accepted row in this statement (including DO NOTHING): no history or allocation.
+  }
+
   readonly suspects: Array<{ tableId: number; indexId: number; key: Uint8Array }> = [];
   readonly childChecks: FkCheck[] = [];
   /** Row ids this statement deleted, per table, while child checks were pending. */
@@ -919,11 +968,21 @@ export class StatementImpl implements Statement {
   }
 
   end(): Promise<void> {
-    const finish = () => {
-      this.#state = "ended";
-      this.#releaseViews();
-      this.tx.ended(this);
-    };
+    const finish = (): MaybePromise<void> =>
+      this.guard(() => {
+        this.#releaseViews();
+        const keyed = this.tx.undo.some(
+          (e) =>
+            e.statement === this.ordinal &&
+            (e.kind === "memDelete" ||
+              e.kind === "groupDelete" ||
+              (e.kind === "rows" && e.ftsKeyed === true)),
+        );
+        return settle(keyed ? this.tx.hooks.prepareFtsMutation?.() : undefined, () => {
+          this.#state = "ended";
+          this.tx.ended(this);
+        });
+      });
     if (
       this.suspects.length === 0 &&
       this.childChecks.length === 0 &&
@@ -932,8 +991,8 @@ export class StatementImpl implements Statement {
       // Nothing to re-verify: end now (no check view, no promise chain).
       if (this.#state !== "open")
         throw new TransactionStateError(`The statement is ${this.#state}`);
-      finish();
-      return RESOLVED;
+      const pending = finish();
+      return pending instanceof Promise ? pending : RESOLVED;
     }
     return Promise.resolve(
       this.guard(async () => {
@@ -1412,7 +1471,8 @@ export class TableWriterImpl implements TableWriter {
   /** Same capacity estimate; a contiguous varlen range uses its two end offsets. */
   #estimate(columns: readonly Vector[], plan: RowPlan): number {
     let bytes =
-      4096 * columns.length + plan.count * (16 * columns.length + 96 * this.def.indexes.length);
+      4096 * columns.length +
+      plan.count * (16 * columns.length + 96 * this.def.indexes.length + FTS_ROW_UNDO_BYTES);
     for (const vector of columns) bytes += 2 * this.#inputBytes(vector, plan);
     return bytes;
   }
@@ -1438,10 +1498,17 @@ export class TableWriterImpl implements TableWriter {
           });
         const take = Math.min(memtable.capacity, plan.count - done),
           before = memtable.rowCount;
-        memtable.append(columns, plan.rows, plan.from + done, take);
-        memtable.mark(seq);
+        tx.reserveFtsRowUndo();
+        try {
+          memtable.append(columns, plan.rows, plan.from + done, take);
+          memtable.mark(seq);
+        } catch (error) {
+          tx.releaseFtsRowUndo();
+          throw error;
+        }
         tx.undo.push({
           kind: "rows",
+          ftsKeyed: false,
           statement: this.statement.ordinal,
           tableId: this.tableId,
           memtable,

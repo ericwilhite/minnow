@@ -31,6 +31,14 @@ export function ftsPrepareMinimum(renderer: FtsWriteRenderer): number {
     512 * 1024
   );
 }
+export function isFtsKeyedUndo(e: TransactionImpl["undo"][number]): boolean {
+  return (
+    e.kind === "memDelete" || e.kind === "groupDelete" || (e.kind === "rows" && e.ftsKeyed === true)
+  );
+}
+export function hasFtsWrites(tx: TransactionImpl): boolean {
+  return tx.undo.some(isFtsKeyedUndo) || hasFtsInserts(tx);
+}
 export function hasFtsInserts(tx: TransactionImpl): boolean {
   if (tx.catalog.fts.length === 0) return false;
   return tx.undo.some(
@@ -63,9 +71,34 @@ export async function prepareFtsInserts(
     entries.push(e);
     if (entries.length === FTS_JOURNAL_ENTRIES) await flush();
   };
+  // One durable table-wide keyed history, even if there is no FtsDef yet. Iterate existing
+  // catalog/undo storage instead of allocating a transaction-sized notification set.
+  for (const table of tx.catalog.tables) {
+    let keyed = false;
+    for (let i = 0; i < tx.undo.length; i++) {
+      if ((i & 1023) === 0) await pauseIfDue(signal ? { signal } : undefined);
+      const e = tx.undo[i];
+      if (e && isFtsKeyedUndo(e) && "tableId" in e && e.tableId === table.id) {
+        keyed = true;
+        break;
+      }
+    }
+    if (keyed)
+      await put({
+        kind: "keyed",
+        tableId: table.id,
+        schemaVersion: table.schemaVersion,
+        ftsId: 0,
+        columnId: 0,
+        generation: 0,
+        mutationEpoch: 0,
+      });
+  }
   for (const def of tx.catalog.fts) {
     const table = tx.catalog.table(def.tableId);
     if (!table) continue;
+    if (tx.undo.some((e) => isFtsKeyedUndo(e) && "tableId" in e && e.tableId === table.id))
+      continue;
     const column = table.columns.findIndex((c) => c.id === def.columnId);
     const identity = {
       tableId: def.tableId,

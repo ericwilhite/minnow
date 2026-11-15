@@ -6907,3 +6907,29 @@ export const FTS_UTF8_BOM_REACH = [
   "exact bound",
   "over bound",
 ] as const;
+
+/** Native keyed undo must invalidate, independent of executor/DML notifications. */
+export const FTS_KEYED_PUBLICATION_REACH = [
+  "update",
+  "delete",
+  "memtable",
+  "durable group",
+  "one row and FTS commit",
+  "older snapshot",
+  "checkpoint and reopen",
+] as const;
+
+/** Accepted keyed/upsert markers and history are undo-owned, never declaration-dependent. */
+export const FTS_MUTATION_HISTORY_REACH = [
+  "accepted",
+  "no definition",
+  "definition",
+  "no publication",
+  "upsert",
+  "savepoint",
+  "statement",
+  "empty",
+  "delete",
+  "competing grant",
+  "reopen",
+] as const;

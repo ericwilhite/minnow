@@ -3855,8 +3855,8 @@ remain exact; NULL document presence is preserved. Term keys are copied through 
 UTF16 scratch lane, so a short slice cannot retain a large caller-owned source string.
 IO ownership uses the existing fenced
 FTS writer. Returned descriptors retain a transferred charge until their lease is released; release
-drops references before refund. The caller owns abort, staging and publication. Its caller is now the stage4 publication path below. Keyed mutation invalidation, request replay
-proofs and stale-writer integration are the following review pieces; SQL still uses the scan route.
+drops references before refund. The caller owns abort, staging and publication. Its caller is now the stage4 publication path below. Keyed mutation history is published by the path below. Request replay proofs and stale-writer
+integration are the following review pieces; SQL still uses the scan route.
 
 ### Atomic FTS row publication (stage4)
 
@@ -3890,3 +3890,21 @@ The new native manifest9 and commitBody7 selectors refuse older unpublished deve
 before mutation. MCAT dialect/minimum reader7 is unchanged: the independent manifest barrier
 already makes older builds refuse these native bytes before fencing. No supported1.0 predecessor
 exists; this is not an upgrade path for 0.x. The public/shipped engine remains unchanged.
+
+### Accepted keyed FTS mutation history (stage4)
+
+Native `memDelete`/`groupDelete` undo independently invalidates every binding on its table,
+including direct writers and referential actions. `Statement.noteFtsMutation` is the accepted
+DML seam: it marks an existing accepted row range for upsert (including the insert arm),
+update or delete. Zero accepted rows do nothing. An embedded notification slot is charged
+before row append and retained with undo; rollback removes it and commit drops undo before
+refunding it. Repeated notifications do not allocate. Native delete undo remains the safety net.
+
+At statement completion the check/prefix views retire before prepaying the complete future
+journal phase. A table-wide `keyed` journal event (`ftsId=0`) is protected before WAL and
+claimed with the accepted rows, even when the table has no FTS declaration. It checkpoints
+under the actual commit LSN before global coverage. One event covers every binding; keyed
+invalidation dominates insert-part construction in that transaction. The bounded journal
+retains mutation history for the later build/fold eligibility check; it is not portable MCAT.
+No extra development selector is needed because MFTJ1 already reserves the keyed event.
+The SQL scan route and shipped engine behavior are unchanged.

@@ -108,6 +108,9 @@ export interface Statement {
    * may take long; `rules` validates new CHECKs. Later statements see the new catalog.
    */
   changeCatalog(change: CatalogChange): MaybePromise<{ readonly id: number | null }>;
+  /** After an accepted UPDATE/DELETE/upsert (including its INSERT arm). Native delete undo
+   * independently invalidates FTS. No accepted rows means no effect. Rolls back with rows. */
+  noteFtsMutation(tableId: number, kind: "update" | "delete" | "upsert"): void;
   /** Runs deferred checks and foreign-key actions; then the statement is done. */
   end(): Promise<void>;
   /** Undoes everything the statement wrote, including its DDL. Idempotent. */
