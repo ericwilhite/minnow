@@ -524,7 +524,7 @@ export function missingValue(
   const value = column.backfill;
   // API numbers are already Float64 values, not SQL NUMERIC spellings. Preserve their
   // declared physical type without requiring a runtime cast of a fabricated SQL literal.
-  if (typeof value === "number" && (type.kind === "float64" || type.kind === "float32")) {
+  if (typeof value === "number" && type.kind === "float64") {
     const literal = floatLiteral(value, type);
     if (literal.op === "literal") return literal.value;
   }

@@ -10,6 +10,12 @@ compatibility policy and release process.
 
 ## Unreleased
 
+Initial private 1.0 schema migrations retain literal and generated frozen backfills. A generator
+runs once; repeating the same migration after WAL or checkpoint reopen remains a no-op. The
+API fractional-number shortcut applies only to Float64; SQL REAL defaults requiring a runtime
+cast keep their explicit `0A000` refusal instead of storing a rounded or overflowing value.
+Released 0.x behavior and stored formats are unchanged.
+
 The private 1.0 catalog keeps informational foreign-key target names after the native catalog
 retires a parent. Later unrelated child changes preserve the retired target identity, including
 when another table reuses its name. Two required-understanding fields extend the existing MCAT

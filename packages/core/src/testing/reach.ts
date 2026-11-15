@@ -7052,3 +7052,28 @@ export const CATALOG_INFORMATIONAL_WIRE_REACH = [
   "scalar",
   "composite",
 ] as const;
+
+export const CATALOG_MIGRATE_BACKFILL_REACH = [
+  "boolean",
+  "integer",
+  "float",
+  "text",
+  "enum",
+  "timestamp",
+  "timestamptz",
+  "generator exactly once",
+  "literal",
+  "checkpoint",
+  "WAL",
+  "idempotent after reopen",
+  "failure atomic",
+  "zero resources",
+] as const;
+
+export const CATALOG_REAL_BACKFILL_REACH = [
+  "ordinary",
+  "overflow",
+  "underflow",
+  "catalog unchanged",
+  "zero resources",
+] as const;

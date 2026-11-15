@@ -30,7 +30,15 @@ function create(def: AnyTable, catalog: CatalogView): CatalogChange {
       {
         name: def.name,
         managed: true,
-        columns: Object.entries(def.columns).map(([name, column]) => front(name, column)),
+        columns: Object.entries(def.columns).map(([name, column]) => {
+          const backfill = column.backfillValue;
+          return {
+            ...front(name, column),
+            ...(backfill === undefined
+              ? {}
+              : { backfill: typeof backfill === "function" ? backfill() : backfill }),
+          };
+        }),
         checks: def.checks,
         ...(def.primaryKey.length
           ? { compositePrimaryKey: def.primaryKey }

@@ -837,3 +837,9 @@ checks paired fields/arity/names/flags. `catalog-freeze-types` fills ordinary WA
 coverage for every supported physical/logical descriptor, independently checking widths,
 NUMERIC typmods, zones, JSON mode, array element type and enum label order before exact reopen.
 No extension-policy proposal is implemented here; existing framing and gates are retained.
+
+Initial managed-table creation forwards literal/generator backfills to the same typed
+`tableInput` path. Each generator runs once per create, and its value (never the function)
+survives WAL/native reopen. Identical migrations do not rerun it. REAL backfills requiring
+runtime casts remain 0A000: the primitive API Float64 shortcut is not a SQL REAL evaluator.
+The PGlite control includes ordinary fractions and both overflow/underflow (22003) boundaries.
