@@ -9098,3 +9098,20 @@ export const CORRUPT_MERGE_STRUCTURE_REACH = [
   "reopenable",
   "charges released",
 ] as const;
+
+export const STRUCTURED_BOUNDARIES_REACH = [
+  "JSONB surrogate and NUL boundaries",
+  "JSONB integer precision boundary",
+  "JSONB exponent boundary",
+  "JSONB scale boundary",
+  "JSON syntax boundaries",
+  "array boolean boundaries",
+  "array TIME lower and upper bounds",
+  "array SMALLINT lower and upper bounds",
+  "text code points and exact enum labels",
+  "fatal UTF-8 in JSON and array text",
+  "array NUMERIC scale and special boundaries",
+  "array NUMERIC signed precision boundary",
+  "array NUMERIC redundant sign extension",
+  "borrowed fragments and zero remaining charge",
+] as const;
