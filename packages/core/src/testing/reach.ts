@@ -8737,10 +8737,27 @@ export const SNAPSHOT_STRUCTURED_REACH = [
   "text utf8",
   "text length",
   "text bom length",
+  "jsonb nul",
+  "jsonb high surrogate",
+  "jsonb low surrogate",
+  "jsonb surrogate mismatch",
+  "jsonb exponent",
+  "jsonb scale",
+  "jsonb precision",
 ] as const;
 
 export const SNAPSHOT_LOAD_ROOT_REACH = [
   "oversized native root",
   "same governor handoff",
   "zero after reopen",
+] as const;
+
+export const SNAPSHOT_JSON_SEMANTICS_REACH = [
+  "plain JSON escapes",
+  "surrogate across window",
+  "surrogate pair across window",
+  "JSONB exponent boundary",
+  "JSONB scale boundary",
+  "JSONB precision boundary",
+  "long zero exponent",
 ] as const;

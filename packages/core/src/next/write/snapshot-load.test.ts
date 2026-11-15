@@ -3,6 +3,7 @@ import { Governor, type Grant } from "../memory/governor.js";
 import { spoolSnapshotInput, type ReplayableSnapshotInput } from "./snapshot-source.js";
 import type { PhysicalType } from "../types.js";
 import { encodeSnapshotColumnHeader } from "./snapshot-column.js";
+import { parseJsonb } from "../exec/semantic.js";
 import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
@@ -16,6 +17,7 @@ import {
   SNAPSHOT_ADMISSION_REACH,
   SNAPSHOT_STRUCTURED_REACH,
   SNAPSHOT_LOAD_ROOT_REACH,
+  SNAPSHOT_JSON_SEMANTICS_REACH,
 } from "../../testing/reach.js";
 import { decodeManifestRoot } from "../format/manifest-codec.js";
 import { listedRootExtents, reachableExtents } from "../format/reachable.js";
@@ -1356,6 +1358,21 @@ for (const seed of seedsFor("next-snapshot-structured", [0xb271, 0xb272]))
           type: { kind: "text", maxLength: 1 },
           value: new TextEncoder().encode("ab"),
         });
+        for (const [name, value] of [
+          ["jsonb nul", '"\\u0000"'],
+          ["jsonb high surrogate", '"\\uD800"'],
+          ["jsonb low surrogate", '"\\uDC00"'],
+          ["jsonb surrogate mismatch", '"\\uD800\\u0041"'],
+          ["jsonb exponent", "0e1073741824"],
+          ["jsonb scale", "0e-16384"],
+          ["jsonb precision", "1e131072"],
+        ] as const) {
+          cases.push({
+            name,
+            type: { kind: "json", binary: true },
+            value: new TextEncoder().encode(value),
+          });
+        }
         const h = new Harness("strict", "memory"),
           lsn = await oldTarget(h);
         try {
@@ -1549,6 +1566,95 @@ for (const seed of seedsFor("next-snapshot-load-root-credit", [0xb273, 0xb274]))
         reach.reach("zero after reopen");
       }),
       { seed, numRuns: 2 },
+    );
+    reach.assertReached();
+  }, 60000);
+
+for (const seed of seedsFor("next-snapshot-json-semantics", [0xb275, 0xb276]))
+  it(`keeps JSON spelling and accepts native JSONB boundaries seed ${String(seed)}`, async () => {
+    const reach = createReach("snapshot JSON semantics", SNAPSHOT_JSON_SEMANTICS_REACH);
+    await fc.assert(
+      fc.asyncProperty(fc.integer({ min: 0, max: 64 }), async (padding) => {
+        reach.beginHistory();
+        const cases = [
+          { name: "plain JSON escapes", binary: false, text: '"\\u0000\\uD800"' },
+          {
+            name: "surrogate across window",
+            binary: true,
+            text: '"' + "x".repeat(8188 + (padding % 3)) + '\\uD834\\uDD1E𝄞"',
+          },
+          {
+            name: "surrogate pair across window",
+            binary: true,
+            text: '"' + "x".repeat(8182 + (padding % 3)) + '\\uD834\\uDD1E"',
+          },
+          { name: "JSONB exponent boundary", binary: true, text: "0e1073741823" },
+          { name: "JSONB scale boundary", binary: true, text: "1e-16383" },
+          { name: "JSONB precision boundary", binary: true, text: "1e131071" },
+          {
+            name: "long zero exponent",
+            binary: true,
+            text: "0e+" + "0".repeat(8183 + (padding % 3)) + "1073741823",
+          },
+        ] as const;
+        for (const example of cases) {
+          if (example.binary) expect(() => parseJsonb(example.text)).not.toThrow();
+          else expect(() => JSON.parse(example.text) as unknown).not.toThrow();
+          const type: PhysicalType = { kind: "json", binary: example.binary },
+            archive = await structuredArchive(type, new TextEncoder().encode(example.text));
+          const h = new Harness("strict", "memory"),
+            funding = new Governor(16 << 20);
+          await loadSnapshot(input(archive), () => target(h), funding);
+          expect(funding.usedBytes).toBe(0);
+          const path = await h.open(),
+            pin = path.pin(),
+            exported: Uint8Array[] = [];
+          try {
+            const catalog = pin.catalog;
+            if (!(catalog instanceof Catalog)) throw new Error("catalog");
+            const b = new Budget();
+            await exportPinnedSnapshot(
+              pin,
+              new Uint8Array(16),
+              (async function* () {
+                yield catalog.encode();
+              })(),
+              {
+                write(bytes) {
+                  exported.push(bytes.slice());
+                },
+              },
+              b,
+            );
+            expect(b.used).toBe(0);
+            const body = async (chunks: Uint8Array[]) => {
+              const bytes: Uint8Array[] = [],
+                b = new Budget(),
+                reader = await SnapshotStreamReader.open(
+                  (async function* () {
+                    yield* chunks;
+                  })(),
+                  b,
+                );
+              try {
+                for await (const frame of reader.frames())
+                  if (frame.kind === SnapshotKind.columnPart) bytes.push(frame.payload.slice());
+              } finally {
+                reader.close();
+                expect(b.used).toBe(0);
+              }
+              return bytes;
+            };
+            expect(await body(exported)).toEqual(await body(archive));
+            reach.reach(example.name);
+          } finally {
+            pin.release();
+            await h.close();
+          }
+          expect(h.governor.usedBytes).toBe(0);
+        }
+      }),
+      { seed, numRuns: 4 },
     );
     reach.assertReached();
   }, 60000);

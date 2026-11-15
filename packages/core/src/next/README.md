@@ -4300,7 +4300,9 @@ it. The spool handle stays charged until `close()`, which releases only its own 
 
 Portable load validates structured value payloads before reconstructing a native group. Array
 version/type/dimensions, null bitmap padding, scalar ranges and internal element lengths must
-be valid, not merely checksummed. JSON must be complete UTF-8 JSON; text must be valid UTF-8
+be valid, not merely checksummed. JSON must be complete UTF-8 JSON. JSONB additionally
+checks native Unicode pairing/NUL and numeric exponent, display-scale and precision limits;
+plain JSON keeps its own escape/number grammar. Text must be valid UTF-8
 within its declared length, and enum bytes must name a declared label. Validation streams from
 private staging in bounded windows without constructing an array/JSON value graph. Array
 NUMERIC work is bounded by the supported precision; JSON nesting state grows only with depth

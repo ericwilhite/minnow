@@ -250,7 +250,7 @@ async function array(
 }
 
 /** Streaming JSON syntax recognizer: no parsed object/string/number value is retained. */
-async function json(cursor: Cursor, account: SnapshotAccount): Promise<void> {
+async function json(cursor: Cursor, account: SnapshotAccount, binary: boolean): Promise<void> {
   account.take(256);
   let stack = new Uint8Array(256),
     depth = 0;
@@ -278,9 +278,45 @@ async function json(cursor: Cursor, account: SnapshotAccount): Promise<void> {
   let key = false,
     escaped = false,
     unicode = 0,
+    unicodeValue = 0,
+    pendingHigh = false,
+    fractionDigits = 0,
+    significantDigits = 0,
+    nonzero = false,
+    exponent = 0,
+    exponentNegative = false,
     numberState = 0,
     literal = "",
     literalAt = 0;
+  // Native JSONB semantics (exec/semantic.ts parseJsonb; PG NUMERIC/Unicode limits).
+  // Keep only counters and one pending UTF-16 unit, never token text or parsed values.
+  const unit = (code: number) => {
+    if (!binary) return;
+    if (pendingHigh) {
+      snapshotCheck(code >= 0xdc00 && code <= 0xdfff, "Unpaired JSONB surrogate");
+      pendingHigh = false;
+    } else {
+      snapshotCheck(code !== 0 && (code < 0xdc00 || code > 0xdfff), "Invalid JSONB Unicode unit");
+      pendingHigh = code >= 0xd800 && code <= 0xdbff;
+    }
+  };
+  const mantissa = (c: string, fraction: boolean) => {
+    if (fraction) fractionDigits++;
+    if (c !== "0") nonzero = true;
+    if (nonzero) significantDigits++;
+  };
+  const exponentDigit = (c: string) => {
+    exponent = Math.min(1073741824, exponent * 10 + Number(c));
+  };
+  const finishNumber = () => {
+    if (!binary) return;
+    snapshotCheck(exponent <= 1073741823, "JSONB numeric exponent out of range");
+    const scale = fractionDigits - (exponentNegative ? -exponent : exponent);
+    snapshotCheck(
+      scale <= 16383 && (significantDigits === 0 || significantDigits - scale <= 131072),
+      "JSONB numeric value out of range",
+    );
+  };
   const digit = (c: string) => c >= "0" && c <= "9";
   const feed = (character: string) => {
     const c = character;
@@ -288,12 +324,16 @@ async function json(cursor: Cursor, account: SnapshotAccount): Promise<void> {
       if (parser.token === "string") {
         if (unicode > 0) {
           snapshotCheck(/^[0-9a-fA-F]$/.test(c), "Invalid JSON unicode escape");
-          unicode--;
+          unicodeValue = unicodeValue * 16 + Number.parseInt(c, 16);
+          if (--unicode === 0) unit(unicodeValue);
           return;
         }
         if (escaped) {
           snapshotCheck('"\\/bfnrtu'.includes(c), "Invalid JSON escape");
-          if (c === "u") unicode = 4;
+          if (c === "u") {
+            unicode = 4;
+            unicodeValue = 0;
+          } else snapshotCheck(!binary || !pendingHigh, "Unpaired JSONB surrogate");
           escaped = false;
           return;
         }
@@ -302,11 +342,13 @@ async function json(cursor: Cursor, account: SnapshotAccount): Promise<void> {
           return;
         }
         if (c === '"') {
+          snapshotCheck(!binary || !pendingHigh, "Unpaired JSONB surrogate");
           parser.token = "none";
           if (key) stack[depth - 1] = 2;
           return;
         }
         snapshotCheck(c.charCodeAt(0) >= 32, "Unescaped JSON control character");
+        unit(c.codePointAt(0) ?? 0);
         return;
       }
       if (parser.token === "literal") {
@@ -317,30 +359,37 @@ async function json(cursor: Cursor, account: SnapshotAccount): Promise<void> {
       if (parser.token === "number") {
         if (numberState === 0) {
           snapshotCheck(digit(c), "Truncated JSON number");
+          mantissa(c, false);
           numberState = c === "0" ? 1 : 2;
           return;
         }
         if (numberState === 3) {
           snapshotCheck(digit(c), "Truncated JSON fraction");
+          mantissa(c, true);
           numberState = 4;
           return;
         }
         if (numberState === 5) {
           if (c === "+" || c === "-") {
+            exponentNegative = c === "-";
             numberState = 6;
             return;
           }
           snapshotCheck(digit(c), "Truncated JSON exponent");
+          exponentDigit(c);
           numberState = 7;
           return;
         }
         if (numberState === 6) {
           snapshotCheck(digit(c), "Truncated JSON exponent");
+          exponentDigit(c);
           numberState = 7;
           return;
         }
         if (digit(c)) {
           snapshotCheck(numberState !== 1, "JSON leading zero");
+          if (numberState === 7) exponentDigit(c);
+          else mantissa(c, numberState === 4);
           return;
         }
         if (c === "." && (numberState === 1 || numberState === 2)) {
@@ -354,6 +403,7 @@ async function json(cursor: Cursor, account: SnapshotAccount): Promise<void> {
           numberState = 5;
           return;
         }
+        finishNumber();
         parser.token = "none"; // Validate the delimiter through the container grammar below.
       }
       if (c === " " || c === "\t" || c === "\n" || c === "\r") return;
@@ -361,6 +411,7 @@ async function json(cursor: Cursor, account: SnapshotAccount): Promise<void> {
       if (c === '"') {
         key = s === 0 || s === 1;
         if (!key) value();
+        pendingHigh = false;
         parser.token = "string";
         return;
       }
@@ -401,6 +452,12 @@ async function json(cursor: Cursor, account: SnapshotAccount): Promise<void> {
       }
       snapshotCheck(c === "-" || digit(c), "Invalid JSON token");
       parser.token = "number";
+      fractionDigits = 0;
+      significantDigits = 0;
+      nonzero = false;
+      exponent = 0;
+      exponentNegative = false;
+      if (c !== "-") mantissa(c, false);
       numberState = c === "-" ? 0 : c === "0" ? 1 : 2;
       return;
     }
@@ -424,6 +481,7 @@ async function json(cursor: Cursor, account: SnapshotAccount): Promise<void> {
       parser.token === "none" || (parser.token === "number" && [1, 2, 4, 7].includes(numberState)),
       "Truncated JSON token",
     );
+    if (parser.token === "number") finishNumber();
     snapshotCheck(parser.root && depth === 0, "Incomplete portable JSON");
   } finally {
     account.free(stack.length);
@@ -453,7 +511,7 @@ export async function validateSnapshotValue(
       bitmap = new Cursor(bitmapSource, offset, offset + length);
     await snapshotPace(column.work);
     if (type.kind === "array") await array(cursor, type.element, bitmap, account);
-    else if (type.kind === "json") await json(cursor, account);
+    else if (type.kind === "json") await json(cursor, account, type.binary);
     else await text(cursor, length, type, account);
   } finally {
     source?.close();
