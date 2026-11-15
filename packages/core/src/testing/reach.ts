@@ -50,6 +50,7 @@ export const DURABLE_LONG_KEY_REACH = [
   "partial native tree",
 ] as const;
 export const DURABLE_REGISTRY_REACH = [
+  "ftsJournal",
   "ftsRoot",
   "ftsTerms",
   "ftsPostings",
@@ -6145,8 +6146,8 @@ export const FTS_CODEC_REACH = [
 
 export const FTS_SELECTOR_REACH = [
   "reader7 barrier",
-  "manifest8 barrier",
-  "commit body6",
+  "manifest9 barrier",
+  "commit body7",
   "wide sequence preserved",
   "checksummed roundtrip",
 ] as const;
@@ -6849,4 +6850,60 @@ export const FTS_APPEND_REACH = [
   "charged workspace",
   "drained",
   "empty",
+] as const;
+
+export const FTS_ROW_PUBLICATION_REACH = [
+  "row and FTS body",
+  "protected before append",
+  "NULL",
+  "empty",
+  "rollback",
+  "savepoint",
+  "multiple statements",
+  "strict",
+  "relaxed",
+] as const;
+
+export const FTS_PUBLICATION_FAULT_REACH = [
+  "prepare fault",
+  "append fault",
+  "row and FTS commit",
+  "no uncommitted FTS",
+  "committed FTS survives",
+  "orphan retirement",
+] as const;
+
+export const FTS_PUBLICATION_CANCEL_REACH = [
+  "write 0",
+  "write 1",
+  "write 2",
+  "write 3",
+  "retained across close",
+  "drained",
+] as const;
+
+export const FTS_PUBLICATION_PRESSURE_REACH = [
+  "funded insert",
+  "pressure invalidation",
+  "rows preserved",
+  "NULL",
+  "text",
+] as const;
+
+export const FTS_STAGED_PUBLICATION_REACH = [
+  "rows actually staged",
+  "one publishedRows and FTS body",
+  "atomic missing-delta invalidation",
+  "replayed rows",
+  "checkpoint",
+] as const;
+
+export const FTS_UTF8_BOM_REACH = [
+  "leading",
+  "interior",
+  "none",
+  "empty",
+  "within bound",
+  "exact bound",
+  "over bound",
 ] as const;

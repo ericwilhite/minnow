@@ -1,3 +1,18 @@
+import type { FtsWriteRenderer } from "../access/fts-write.js";
+import { requireFtsSemantics } from "../fts-config.js";
+import {
+  prepareFtsInserts,
+  hasFtsInserts,
+  ftsPrepareMinimum,
+  FTS_PREPARE_DESCRIPTOR_BYTES,
+} from "./fts-prepare.js";
+import {
+  readFtsJournal,
+  writeFtsJournal,
+  walkFtsJournal,
+  FTS_JOURNAL_ENTRIES,
+  FTS_JOURNAL_WORKSPACE_BYTES,
+} from "../format/fts-journal.js";
 import { indexLimitViolation, indexMaximumKeyBytes } from "./index-limits.js";
 /**
  * The write path (access/write-path.ts): one engine per open database, in the owner.
@@ -431,6 +446,17 @@ function tableStatistics(groupCount: number, totals: ReadonlyMap<number, Totals>
 }
 
 export class WritePathImpl implements WritePath, EngineHooks {
+  #ftsRenderer: FtsWriteRenderer | null = null;
+  #ftsPending: { transaction: number; ref: BlobRef; lsn: number } | null = null;
+  #ftsUnclaimed = false;
+  #ftsMetadataBytes = 0;
+  installFtsRenderer(renderer: FtsWriteRenderer): void {
+    requireFtsSemantics(renderer);
+    if (!Number.isSafeInteger(renderer.workspaceBytes) || renderer.workspaceBytes < 0)
+      throw new RangeError("Invalid FTS renderer workspace");
+    this.#ftsRenderer = renderer;
+  }
+
   readonly durability: Durability;
   readonly ledger: RequestLedger;
   readonly sequences: Sequences;
@@ -799,6 +825,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         const salt = (crypto.getRandomValues(new Uint32Array(1))[0] ?? 1) >>> 0;
         root = {
           formatVersion: MANIFEST_FORMAT_VERSION,
+          fts: { checkpoint: null, staged: null },
           sequence: 1,
           epoch: session.epoch,
           log: { salt, firstLsn: 1, rootSequence: 1 },
@@ -1100,6 +1127,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       state.root = { ...table, staged: table.staged.filter((staged) => staged !== entry) };
       this.maintenance.stagingDropped += 1;
     }
+    this.#ftsUnclaimed = this.#root.fts.staged !== null && this.#ftsPending === null;
     if (session.logLength() > summary.validEnd) await session.truncateLog(summary.validEnd);
     const { header, nextSlot } = newestLogHeader(headers, root.log.salt);
     const position: LogPosition = {
@@ -1154,6 +1182,39 @@ export class WritePathImpl implements WritePath, EngineHooks {
         predecessor = change.version;
         firstCatalog = false;
       }
+    }
+    let ftsClaimed = false;
+    for (let i = 0; i < body.effects.length; i++) {
+      const effect = need(body.effects[i]);
+      if (effect.kind !== "fts" || decisions[i] !== true) continue;
+      if (ftsClaimed) throw new LogCorruptionError("Duplicate FTS claim in one commit");
+      ftsClaimed = true;
+      const ref = this.#root.fts.staged;
+      if (ref === null || this.#root.sequence < effect.rootSequence)
+        throw new LogCorruptionError("FTS claim lacks protected staging");
+      const held = await readFtsJournal(ref, this.#metadataBudget, this.#space, this.#signal);
+      try {
+        const page = held.value;
+        if (page.kind !== "prepared" || page.transaction !== effect.transaction)
+          throw new LogCorruptionError("FTS claim has wrong staged transaction");
+      } finally {
+        held.release();
+      }
+      // Validate the complete protected preparation before exposing any effect of this body.
+      for await (const event of walkFtsJournal(
+        ref,
+        false,
+        this.#metadataBudget,
+        this.#space,
+        this.#signal,
+      ))
+        void event;
+      if (this.#ftsMetadataBytes === 0) {
+        this.#chargeMetadata(512);
+        this.#ftsMetadataBytes = 512;
+      }
+      if (this.#ftsPending !== null) throw new LogCorruptionError("FTS staging claimed twice");
+      this.#ftsPending = { transaction: effect.transaction, ref, lsn };
     }
     let published: Set<number> | null = null;
     for (let k = 0; k < body.effects.length; k++) {
@@ -1506,6 +1567,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
   #currentPin: SpacePin | null = null;
 
   #publishState(): void {
+    if (this.#root.fts.staged === null) {
+      this.#ftsPending = null;
+      this.#ftsUnclaimed = false;
+    }
     const tables = new Map<number, TableView>();
     for (const [id, state] of this.#tables) tables.set(id, state.view);
     this.#state = { root: this.#root, tables };
@@ -1877,7 +1942,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
    */
   get residentMetadataBytes(): number {
     let total =
-      (this.#roots.get(this.#root)?.bytes ?? 0) + this.#pendingIndexes.size * PENDING_INDEX_BYTES;
+      (this.#roots.get(this.#root)?.bytes ?? 0) +
+      this.#pendingIndexes.size * PENDING_INDEX_BYTES +
+      this.#ftsMetadataBytes;
     for (const state of this.#tables.values())
       total += state.metadataBytes + state.view.groups.chargedBytes;
     // The resident parts of the index runs opened (fences, block refs, Bloom filters).
@@ -2196,6 +2263,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#txStaging.delete(tx);
       this.#dropStaging(staging);
     }
+    if (
+      tx.ftsEffect !== null &&
+      this.#ftsPending?.transaction === tx.ftsEffect.transaction &&
+      this.#ftsPending.lsn === 0
+    )
+      this.#ftsUnclaimed = true;
     this.#holder = null;
     this.#passSlot();
     // A frozen memtable may have waited for this writer's pending rows.
@@ -2241,6 +2314,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   commit(tx: TransactionImpl, request: CommitRequest | null): Promise<CommitReceipt> {
+    if (hasFtsInserts(tx)) return this.#trackCommit(this.#commitFts(tx, request), tx);
     const staging = this.#txStaging.get(tx);
     if (staging === undefined) return this.#commitNow(tx, request, () => null);
     // A large transaction: its staging is made exact first, then its frame names that root.
@@ -2252,6 +2326,158 @@ export class WritePathImpl implements WritePath, EngineHooks {
         throw error;
       },
     );
+  }
+
+  async #commitFts(tx: TransactionImpl, request: CommitRequest | null): Promise<CommitReceipt> {
+    await this.#prepareMinimum(tx.catalog);
+    const staging = this.#txStaging.get(tx);
+    const names = staging === undefined ? null : await this.#restage(tx, staging);
+    // A new staging root may replace the previous commit's preparation only after its WAL
+    // is durable and the new root checkpoints that claim. No guessed LSN or second append.
+    const previous = this.#ftsPending;
+    if (previous && previous.lsn > 0) await this.#appender.durable(previous.lsn);
+    await this.#metadataAsync(() => this.#stageFts(tx));
+    return this.#commitNow(tx, request, (tableId) => names?.get(tableId) ?? null);
+  }
+
+  async #stageFts(tx: TransactionImpl, allowPreparation = true): Promise<void> {
+    this.#check();
+    if (this.#ftsMetadataBytes === 0) {
+      this.#chargeMetadata(512);
+      this.#ftsMetadataBytes = 512;
+    }
+    const compact =
+      FTS_JOURNAL_WORKSPACE_BYTES +
+      FTS_JOURNAL_ENTRIES * FTS_PREPARE_DESCRIPTOR_BYTES +
+      64 * 1024 +
+      1024 * Math.ceil(tx.catalog.fts.length / FTS_JOURNAL_ENTRIES);
+    const renderer = this.#ftsRenderer;
+    const wanted = renderer ? ftsPrepareMinimum(renderer) : compact;
+    // Optional accelerator work takes a complete existing/try-grown step; never waits while
+    // borrowing source rows. If it cannot fit, fund only the compact invalidation path.
+    const available = this.#metadataGrant.held - this.#metadataGrant.allocated;
+    const complete =
+      allowPreparation &&
+      renderer !== null &&
+      (available >= wanted || this.#metadataGrant.tryGrow(wanted - available));
+    const bytes = complete ? wanted : compact;
+    this.#chargeMetadata(bytes);
+    let ownedWorkspace = bytes;
+    let used =
+      (complete ? renderer.workspaceBytes : 0) + FTS_JOURNAL_ENTRIES * FTS_PREPARE_DESCRIPTOR_BYTES;
+    let sealedBytes = 0;
+    let retryCompact = false;
+    let published = false;
+    const scratch: ByteBudget = {
+      allocate: (n) => {
+        if (used + n > bytes) throw new ParseBudgetError(n);
+        used += n;
+        return true;
+      },
+      free: (n) => {
+        used -= n;
+        if (used < 0) throw new Error("FTS workspace freed twice");
+      },
+    };
+    let unlock: (() => void) | null = null;
+    let writer: ExtentWriter | null = null,
+      madeRoot: ManifestRoot | null = null;
+    const delta = new DeltaPublication(
+      "fts",
+      this.#extentDeltas,
+      this.#lists,
+      this.#nextAttempt,
+      this.#afterDeltaPrepared,
+      this.#sinkFailed,
+      this.#pinBudget,
+    );
+    try {
+      unlock = await this.#lock();
+      this.#check();
+      writer = this.#space.beginWrite("FTS preparation");
+      const write = writer.write.bind(writer);
+      writer.write = async (parts) => {
+        // Prepay the returned extent/blob records and the writer's retained extent array,
+        // including geometric growth overlap, before storage constructs those records.
+        scratch.allocate(1024);
+        sealedBytes += 1024;
+        return write(parts);
+      };
+      const transaction = this.#root.sequence + 1;
+      const prepared = await prepareFtsInserts(
+        tx,
+        transaction,
+        scratch,
+        writer,
+        complete ? renderer : null,
+        this.#commitAbort.signal,
+      );
+      writer.write = write;
+      // Rendering, token arrays and append frontiers have retired. Only sealed writer
+      // descriptors remain owned through the distinct root-publication phase.
+      this.#chargeMetadata(-(bytes - sealedBytes));
+      ownedWorkspace = sealedBytes;
+      this.#check();
+      if (prepared === null) {
+        await writer.abort();
+        return;
+      }
+      const retired: ExtentRef[] = [];
+      let root = await this.#nextRoot(writer, retired, new Map(), delta);
+      this.#check();
+      // An earlier unclaimed preparation is not a committed delta. Retire only its own tree;
+      // checkpoint pages and claimed preparations remain reached from the committed chain.
+      if (root.fts.staged !== null) {
+        for await (const event of walkFtsJournal(
+          root.fts.staged,
+          false,
+          this.#metadataBudget,
+          this.#space,
+          this.#commitAbort.signal,
+        ))
+          delta.retireFts(retired, event.ref.extent);
+      }
+      root = { ...root, fts: { ...root.fts, staged: prepared } };
+      const publicationWriter = writer;
+      root = await this.#listed(root, (sequence) =>
+        delta.prepare(sequence, publicationWriter, retired),
+      );
+      this.#check();
+      const encoded = encodeManifestRoot(root),
+        charge = parseCharge(encoded.length);
+      this.#chargeMetadata(charge);
+      this.#roots.set(root, { refs: 1, bytes: charge });
+      madeRoot = root;
+      const pending = { transaction, ref: prepared, lsn: 0 };
+      const effect = { kind: "fts" as const, transaction, rootSequence: root.sequence };
+      await delta.publish(this.#space, encoded, writer, retired);
+      published = true;
+      this.#root = root;
+      this.#pruneCatalogs(root.globalLsn);
+      this.#adoptTableRoots(root);
+      this.#ftsPending = pending;
+      this.#ftsUnclaimed = false;
+      tx.ftsEffect = effect;
+      this.#publishState();
+    } catch (error) {
+      if (writer?.state === "open") await writer.abort().catch(() => undefined);
+      if (
+        complete &&
+        !published &&
+        error instanceof ParseBudgetError &&
+        this.#space.failed === null
+      )
+        retryCompact = true;
+      else throw error;
+    } finally {
+      delta.settle();
+      if (madeRoot) this.#releaseRoot(madeRoot);
+      unlock?.();
+      // eslint-disable-next-line no-useless-assignment -- drop sealed descriptor references before refund or retry
+      writer = null;
+      if (ownedWorkspace) this.#chargeMetadata(-ownedWorkspace);
+    }
+    if (retryCompact) await this.#stageFts(tx, false);
   }
 
   #commitNow(
@@ -2426,6 +2652,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   #finishCommit(tx: TransactionImpl, request: CommitRequest | null, lsn: number): CommitReceipt {
+    if (tx.ftsEffect !== null) {
+      const pending = this.#ftsPending;
+      if (pending?.transaction !== tx.ftsEffect.transaction)
+        throw new Error("FTS publication lost before commit");
+      pending.lsn = lsn;
+    }
     tx.restamp(lsn);
     // Claimed by the frame. A staged commit spans memtables, and a commit flushes whole: its
     // live tail (committed now) freezes, so the fold can run at once.
@@ -2702,6 +2934,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#unbindMetadataCaches();
       for (const cache of this.#metadataCaches) cache.clear();
       this.#lists.close();
+      this.#ftsPending = null;
+      this.#ftsRenderer = null;
+      this.#chargeMetadata(-this.#ftsMetadataBytes);
+      this.#ftsMetadataBytes = 0;
       this.#metadataGrant.close();
       this.#columns.close();
       this.#body.close();
@@ -2742,6 +2978,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#unbindMetadataCaches();
     for (const cache of this.#metadataCaches) cache.clear();
     this.#lists.close();
+    this.#ftsPending = null;
+    this.#ftsRenderer = null;
+    this.#chargeMetadata(-this.#ftsMetadataBytes);
+    this.#ftsMetadataBytes = 0;
     this.#metadataGrant.close();
     this.#columns.close();
     this.#body.close();
@@ -3190,7 +3430,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
           .filter((index): index is IndexRoot => index !== null),
         statistics,
       };
-      let root = await this.#nextRoot(writer, retired, new Map([[state.tableId, tableRoot]]));
+      let root = await this.#nextRoot(
+        writer,
+        retired,
+        new Map([[state.tableId, tableRoot]]),
+        delta,
+      );
       root = await this.#listed(root, (sequence) => delta.prepare(sequence, writer, retired));
       const rootBytes = encodeManifestRoot(root);
       // The resident state this publish adds (page index growth, the new root) is charged first.
@@ -3603,7 +3848,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         await writer.abort();
         return;
       }
-      let root = await this.#nextRoot(writer, retired, changed);
+      let root = await this.#nextRoot(writer, retired, changed, delta);
       this.#check();
       root = await this.#listed(root, (sequence) => delta.prepare(sequence, writer, retired));
       this.#check();
@@ -3937,7 +4182,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         return;
       }
       const released: ExtentRef[] = [];
-      let root = await this.#nextRoot(writer, released, new Map());
+      let root = await this.#nextRoot(writer, released, new Map(), delta);
       root = await this.#listed(root, (sequence) => delta.prepare(sequence, writer, released));
       const bytes = encodeManifestRoot(root);
       const charge = parseCharge(bytes.length);
@@ -4118,7 +4363,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const sequence = this.#root.sequence + 1;
       const incarnation = { salt, firstLsn: cut + 1, rootSequence: sequence };
       const retired: ExtentRef[] = [];
-      let root = await this.#nextRoot(writer, retired, quiet, incarnation);
+      let root = await this.#nextRoot(writer, retired, quiet, delta, incarnation);
       if (
         root.globalLsn !== cut ||
         root.tables.some((table) => table.flushedThroughLsn < cut) ||
@@ -4360,7 +4605,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
         secondaryIndexes: root.secondaryIndexes.map(withRuns),
       };
       const retired: ExtentRef[] = inputs.map(runExtent);
-      let next = await this.#nextRoot(writer, retired, new Map([[state.tableId, tableRoot]]));
+      let next = await this.#nextRoot(
+        writer,
+        retired,
+        new Map([[state.tableId, tableRoot]]),
+        delta,
+      );
       next = await this.#listed(next, (sequence) => delta.prepare(sequence, writer, retired));
       const rootBytes = encodeManifestRoot(next);
       const rootCharge = parseCharge(rootBytes.length);
@@ -4608,10 +4858,45 @@ export class WritePathImpl implements WritePath, EngineHooks {
     writer: ExtentWriter,
     retired: ExtentRef[],
     changed: ReadonlyMap<number, TableRoot>,
+    publication: DeltaPublication,
     /** A new log incarnation (a recycle's switching root). */
     incarnation: ManifestRoot["log"] | null = null,
   ): Promise<ManifestRoot> {
     const globalLsn = this.#rootLsn(changed);
+    let fts = this.#root.fts;
+    const pending = this.#ftsPending;
+    if (
+      pending !== null &&
+      pending.lsn > 0 &&
+      pending.lsn <= this.durableLsn &&
+      fts.staged !== null
+    ) {
+      const checkpoint = await writeFtsJournal(
+        {
+          kind: "checkpoint",
+          transaction: pending.transaction,
+          lsn: pending.lsn,
+          previous: fts.checkpoint,
+          staged: pending.ref,
+        },
+        this.#metadataBudget,
+        writer,
+        this.#commitAbort.signal,
+      );
+      fts = { checkpoint, staged: null };
+    } else if (this.#ftsUnclaimed && fts.staged !== null) {
+      for await (const event of walkFtsJournal(
+        fts.staged,
+        false,
+        this.#metadataBudget,
+        this.#space,
+        this.#commitAbort.signal,
+      ))
+        publication.retireFts(retired, event.ref.extent);
+      fts = { ...fts, staged: null };
+    }
+    if (pending !== null && pending.lsn > 0 && globalLsn >= pending.lsn && fts.staged !== null)
+      throw new Error("FTS coverage must be checkpointed before globalLsn");
     // Dropped staging the durable root still reaches (a rollback's), retired by this root.
     // Never twice: a dropped table's walk below also reaches staging its root still lists. They
     // leave the pending list only once this root is installed: a publication that fails after
@@ -4748,6 +5033,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     }));
     const next: ManifestRoot = {
       formatVersion: MANIFEST_FORMAT_VERSION,
+      fts,
       sequence: this.#root.sequence + 1,
       epoch: this.#session.epoch,
       log: incarnation ?? this.#root.log,
@@ -4969,6 +5255,8 @@ function replayEffect(effect: BodyEffect): Effect {
       return { kind: "dropTable", tableId: effect.tableId };
     case "catalog":
       return { kind: "catalog" };
+    case "fts":
+      return { kind: "fts" };
     case "sequence":
       return { kind: "sequence" };
     case "rows":
@@ -4998,7 +5286,7 @@ async function readBlob(space: Space, ref: BlobRef, budget: Grant): Promise<Uint
 }
 
 /** What a publication is (tests and diagnostics). */
-export type PublicationKind = "initial" | "flush" | "merge" | "recycle" | "idle" | "stage";
+export type PublicationKind = "initial" | "flush" | "merge" | "recycle" | "idle" | "stage" | "fts";
 
 /**
  * A memtable whose flush is due once its rows are committed: frozen, or staged (its flush folds
@@ -5031,6 +5319,14 @@ export class ExtentSinkError extends Error {
  * `ExtentSinkError`) without undoing the install, retrying, or skipping the publisher's cleanup.
  */
 class DeltaPublication {
+  #ftsRetireBytes = 0;
+  retireFts(retired: ExtentRef[], extent: ExtentRef): void {
+    if (retired.some((old) => sameExtent(old, extent))) return;
+    if (!this.budget.allocate(128)) throw new ParseBudgetError(128);
+    this.#ftsRetireBytes += 128;
+    retired.push({ offset: extent.offset, length: extent.length });
+  }
+
   #attempt: number | null = null;
   #sequence = 0;
   #durable = false;
@@ -5117,6 +5413,15 @@ class DeltaPublication {
 
   /** Commits (durable) or aborts the attempt, once. Never throws: a sink failure fails the path. */
   settle(): void {
+    try {
+      this.#settle();
+    } finally {
+      const charge = this.#ftsRetireBytes;
+      this.#ftsRetireBytes = 0;
+      if (charge) this.budget.free(charge);
+    }
+  }
+  #settle(): void {
     const attempt = this.#attempt;
     this.#attempt = null;
     if (attempt === null) return;

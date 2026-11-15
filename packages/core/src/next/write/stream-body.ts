@@ -324,6 +324,7 @@ export async function streamBody(
     count++;
     await pause(check);
   }
+  if (tx.ftsEffect) count++;
   writer.varuint(count);
   let orderOffset = 0;
   for await (const effect of effects(tx, staged, check)) {
@@ -421,6 +422,11 @@ export async function streamBody(
         break;
       }
     }
+  }
+  if (tx.ftsEffect) {
+    writer.u8(KIND.fts);
+    writer.varuint(tx.ftsEffect.transaction);
+    writer.varuint(tx.ftsEffect.rootSequence);
   }
   return count;
 }

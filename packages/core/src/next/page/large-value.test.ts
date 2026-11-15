@@ -583,6 +583,7 @@ describe("out-of-line values", () => {
     const catalog = await writeTestCatalog(writer);
     const manifest: ManifestRoot = {
       formatVersion: MANIFEST_FORMAT_VERSION,
+      fts: { checkpoint: null, staged: null },
       sequence: 1,
       epoch: 1,
       log: { salt: 1, firstLsn: 1, rootSequence: 1 },

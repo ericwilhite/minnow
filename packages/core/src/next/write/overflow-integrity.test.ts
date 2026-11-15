@@ -20,6 +20,7 @@ afterAll(() => reach.assertReached());
 function root(ref: RunRef, catalog: ManifestRoot["catalog"]): ManifestRoot {
   return {
     formatVersion: MANIFEST_FORMAT_VERSION,
+    fts: { checkpoint: null, staged: null },
     sequence: 1,
     epoch: 1,
     log: { salt: 1, firstLsn: 1, rootSequence: 1 },

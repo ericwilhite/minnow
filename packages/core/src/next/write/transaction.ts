@@ -225,6 +225,8 @@ export class TransactionImpl implements WriteTransaction {
   state: WriteTransaction["state"] = "open";
   catalog: Catalog;
   readonly undo: Undo[] = [];
+  /** Prepared and protected by the engine before either commit codec is called. */
+  ftsEffect: Extract<BodyEffect, { kind: "fts" }> | null = null;
   #ordinal = 0;
   #open: StatementImpl | null = null;
   #savepointMap: Map<number, number> | null = null;
@@ -461,6 +463,7 @@ export class TransactionImpl implements WriteTransaction {
     // Column bytes are final now: point the effects at views of the scratch buffer.
     for (let k = 0; k < spans.length; k += 3)
       need(columnLists[spans[k] ?? 0]).push(scratch.bytes.subarray(spans[k + 1], spans[k + 2]));
+    if (this.ftsEffect) effects.push(this.ftsEffect);
     return effects;
   }
 

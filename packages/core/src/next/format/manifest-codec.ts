@@ -1,6 +1,6 @@
 /**
  * Byte codecs of the manifest (ruling R15.3): the root, the paged group directory and the group
- * root. Shapes are format/manifest.ts: manifest version5; other blob grammars version1.
+ * root. Shapes are format/manifest.ts: manifest version9; other blob grammars version1.
  *
  * ## Common rules
  * - Every blob starts with a 4-byte magic and a version byte; integers are varints (bytes.ts).
@@ -1210,6 +1210,8 @@ export function encodeManifestRoot(root: ManifestRoot): Uint8Array {
     body.uint(page.first);
     body.uint(page.count);
   }
+  out.optionalBlob(root.fts.checkpoint);
+  out.optionalBlob(root.fts.staged);
   return out.finish(MAGIC.root, MAX_ROOT_BYTES, "A manifest root");
 }
 
@@ -1257,8 +1259,10 @@ export function decodeManifestRoot(bytes: Uint8Array, budget: ByteBudget): Parse
         );
         extentList.push({ blob, first, count });
       }
+      const fts = { checkpoint: refs.optionalBlob(), staged: refs.optionalBlob() };
       refs.end();
       return {
+        fts,
         formatVersion,
         sequence,
         epoch,

@@ -139,6 +139,7 @@ it("retains whole-store orphan refusal in ordinary audit and test-build open", a
     await session.publish(
       encodeManifestRoot({
         formatVersion: MANIFEST_FORMAT_VERSION,
+        fts: { checkpoint: null, staged: null },
         sequence: 1,
         epoch: seed.epoch,
         log: { salt: 1, firstLsn: 1, rootSequence: 1 },

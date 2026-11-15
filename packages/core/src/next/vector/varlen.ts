@@ -39,7 +39,8 @@ export function varlenMatchesString(data: VarlenData, slot: number, label: strin
 }
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder("utf-8", { fatal: true });
+// SQL TEXT has no transport BOM: U+FEFF is a stored character, including at offset zero.
+const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /**
  * The slice of a memory grant a builder needs (memory/governor.ts `Grant` satisfies it):

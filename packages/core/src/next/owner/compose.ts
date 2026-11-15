@@ -34,6 +34,8 @@
  * rule needs no wait, it polls the frames, releases the pin and returns them. Otherwise the
  * started execution continues as an ordinary `Run`: nothing is executed twice.
  */
+import { ftsValue, FTS_WORKSPACE_BYTES } from "../exec/fts-value.js";
+import { ftsSemantics } from "../fts-config.js";
 import type { CatalogView } from "../access/catalog.js";
 import type { AnyTable, SchemaDefinition, MigrationPlan } from "../../engine/schema.js";
 import { migrateCatalog, type MigrationOptions } from "./catalog-migration.js";
@@ -317,6 +319,11 @@ class ComposedEngine implements CatalogOwnerEngine {
   #sessionId = 0;
 
   constructor(options: ComposeOptions) {
+    options.writePath.installFtsRenderer?.({
+      ...ftsSemantics(),
+      workspaceBytes: FTS_WORKSPACE_BYTES,
+      render: ftsValue,
+    });
     this.#options = { ...options, executor: options.executor ?? createExecutor() };
     this.#now = options.now ?? Date.now;
     this.#statistics = options.statistics ?? { table: () => null };

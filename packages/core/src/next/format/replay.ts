@@ -92,6 +92,7 @@ export type Effect =
   | { readonly kind: "catalog" }
   | { readonly kind: "sequence" }
   | { readonly kind: "request" }
+  | { readonly kind: "fts" }
   | { readonly kind: "rows"; readonly tableId: number; readonly schemaVersion: number }
   | {
       readonly kind: "publishedRows";
@@ -173,6 +174,7 @@ export class Replayer {
     return effects.map((effect) => {
       switch (effect.kind) {
         case "catalog":
+        case "fts":
         case "sequence":
         case "request":
           return global;

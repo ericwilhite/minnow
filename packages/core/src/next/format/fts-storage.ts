@@ -113,6 +113,7 @@ export async function* walkFtsTree(
   budget: ByteBudget,
   reader: ExtentReader,
   signal?: AbortSignal,
+  initial?: { kind: Exclude<FtsFormatName, "ftsRoot">; bounds: Bounds },
 ): AsyncGenerator<FtsStorageEvent> {
   const work = signal ? { signal } : undefined;
   async function* node(
@@ -224,5 +225,6 @@ export async function* walkFtsTree(
   ): AsyncGenerator<FtsStorageEvent> {
     yield* node(kind, bounds.ref, { bounds, ...(identity ? { identity } : {}) });
   }
-  yield* node("ftsRoot", ref);
+  if (initial) yield* subtree(initial.kind, initial.bounds);
+  else yield* node("ftsRoot", ref);
 }

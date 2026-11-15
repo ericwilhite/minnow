@@ -45,6 +45,7 @@ const MAGIC = { root: 0x31524d4d, page: 0x3150474d, group: 0x3152474d };
 const ref: BlobRef = { extent: { offset: 0, length: 4096 }, offset: 0, length: 10, checksum: 0 };
 const root: ManifestRoot = {
   formatVersion: MANIFEST_FORMAT_VERSION,
+  fts: { checkpoint: null, staged: null },
   sequence: 1,
   epoch: 1,
   log: { salt: 1, firstLsn: 1, rootSequence: 1 },

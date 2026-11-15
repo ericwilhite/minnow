@@ -10,6 +10,16 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The private 1.0 text decoder preserves leading U+FEFF characters. Full-text document limits
+count these stored characters, even when the tokenizer treats them as whitespace.
+
+The private 1.0 write path protects prepared full-text insert parts before WAL publication and
+commits their claim with the accepted rows. Checkpoints retain the actual commit LSN before
+advancing global coverage. If preparation cannot fit or its source is unavailable, the same
+commit invalidates acceleration and searches continue by exact scan. This changes unreleased
+native manifest/WAL bytes only; it does not change the shipped 0.x engine or require migration.
+No supported 1.0 stored-format predecessor exists yet.
+
 The unexported rebuild casts integers, NUMERIC (keeping scale), float4/float8 (PostgreSQL's
 shortest spelling), boolean, date, time, timestamp, timestamptz (UTC), interval (including
 `infinity` / `-infinity`), uuid, JSON/JSONB and arrays to text with PostgreSQL's default output

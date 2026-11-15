@@ -97,6 +97,10 @@ export function encodeBody(body: CommitFrameBody, into?: ByteWriter): Uint8Array
         }
         break;
       }
+      case "fts":
+        writer.varuint(effect.transaction);
+        writer.varuint(effect.rootSequence);
+        break;
       case "publishedRows":
         writer.varuint(effect.tableId);
         writer.varuint(effect.schemaVersion);
@@ -180,6 +184,13 @@ function decodeEffect(reader: ByteReader): BodyEffect {
         deletes = { rowIds, keys };
       }
       return { kind: "rows", tableId, schemaVersion, inserts, deletes };
+    }
+    case KIND.fts: {
+      const transaction = reader.varuint(),
+        rootSequence = reader.varuint();
+      if (transaction < 1 || rootSequence !== transaction)
+        throw new LogCorruptionError("Invalid FTS claim identity");
+      return { kind: "fts", transaction, rootSequence };
     }
     case KIND.publishedRows: {
       const tableId = reader.varuint();

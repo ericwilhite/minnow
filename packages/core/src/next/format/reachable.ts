@@ -34,6 +34,7 @@
  * a time, each released (its parse charge returned) when the walk moves past it. Data pages are
  * never read.
  */
+import { walkFtsJournal } from "./fts-journal.js";
 import { walkCatalogTree, type CatalogTreeReader } from "./catalog-tree.js";
 import {
   decodeCatalogRoot,
@@ -76,6 +77,7 @@ export interface Held<T> {
 
 /** Reads and decodes the metadata blobs the walk descends through (manifest-codec.ts). */
 export interface ManifestReader extends CatalogTreeReader {
+  fts?(ref: BlobRef, checkpoint: boolean): AsyncIterable<{ ref: BlobRef; tableId: number | null }>;
   /** The page entries of a group directory's index blob (`TableRoot.groups`). */
   groupIndex(ref: BlobRef): Promise<Held<readonly GroupPageEntry[]>>;
   /** The `GroupRef`s of one directory page. */
@@ -85,6 +87,7 @@ export interface ManifestReader extends CatalogTreeReader {
 }
 
 export type ReachableKind =
+  | "fts"
   | "catalog"
   | "catalog-index"
   | "catalog-page"
@@ -140,6 +143,15 @@ export async function* walkReachable(
   options: ReachableOptions = {},
 ): AsyncGenerator<Reached> {
   const concurrency = Math.max(1, options.concurrency ?? 32);
+  if (!options.skipCatalog)
+    for (const [ref, checkpoint] of [
+      [root.fts.checkpoint, true],
+      [root.fts.staged, false],
+    ] as const) {
+      if (ref === null) continue;
+      valid(reader.fts !== undefined, "Missing native FTS reachability reader");
+      for await (const event of reader.fts(ref, checkpoint)) yield { ...event, kind: "fts" };
+    }
   if (!options.skipCatalog)
     for await (const event of walkCatalogTree(root.catalog, reader))
       yield {
@@ -364,6 +376,7 @@ export function reachableExtents(
       for await (const { ref } of walkReachable(
         manifest.value,
         {
+          fts: (ref, checkpoint) => walkFtsJournal(ref, checkpoint, budget, reader),
           catalogRoot: (blob) => decode(blob, (bytes, b) => codecs.decodeCatalogRoot(bytes, b)),
           catalogPage: (blob) => decode(blob, (bytes, b) => codecs.decodeCatalogPage(bytes, b)),
           groupIndex: (blob) => decode(blob, (bytes, b) => codecs.decodeGroupIndex(bytes, b)),
