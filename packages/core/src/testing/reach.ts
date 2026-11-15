@@ -9004,3 +9004,29 @@ export const DURABLE_EMBEDDED_OCTET_REACH = [
   "array decimal special",
   "run encoding",
 ] as const;
+
+export const CORRUPT_CHECKPOINT_REACH = [
+  "checkpoint consumes staged root",
+  "typed corruption",
+  "root and WAL unchanged",
+  "reopenable",
+  "charges released",
+] as const;
+
+export const CORRUPT_MERGE_REACH = [
+  "inline run",
+  "overflow run",
+  "merge consumes damaged block",
+  "partial output discarded",
+  "flag bit1",
+  "flag bit2",
+  "flag bit3",
+  "flag bit4",
+  "flag bit5",
+  "flag bit6",
+  "flag bit7",
+  "typed corruption",
+  "root and WAL unchanged",
+  "reopenable",
+  "charges released",
+] as const;

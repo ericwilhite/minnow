@@ -41,6 +41,8 @@
  *   runs readable. A crash before the publish leaves orphans the next open frees.
  */
 import type { ExtentRef, RunRef } from "../format/manifest.js";
+import { requireBits, RUN_CODEC } from "../durable-format.js";
+import { StoreCorruptionError } from "../storage/contract.js";
 import { OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
 import type { ByteBudget, SpaceReader } from "../access/space.js";
 import type { ExtentBuilder, ExtentWriter, ReadLease } from "../storage/extents.js";
@@ -49,7 +51,14 @@ import { taskClock, yieldTask } from "../exec/pipeline.js";
 import { charged, need } from "./bytes.js";
 import { RunRangeInput, rangeRunBytes } from "./range-input.js";
 import { runKeyBytes } from "./overflow-keys.js";
-import { RUN_BUFFER_OVERHEAD, RunEncoder, runRef, type RunReader } from "./runs.js";
+import {
+  BLOCK_BYTES,
+  MAX_KEY_BYTES,
+  RUN_BUFFER_OVERHEAD,
+  RunEncoder,
+  runRef,
+  type RunReader,
+} from "./runs.js";
 
 export { yieldTask, YIELD_INTERVAL_MS } from "../exec/pipeline.js";
 
@@ -256,39 +265,54 @@ class Cursor {
   }
 
   #nextBlock(): boolean {
-    for (;;) {
-      this.#block += 1;
-      const bytes = this.#blocks[this.#block];
-      if (bytes === undefined) return false;
-      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      const count = view.getUint16(0, true);
-      if (count === 0) continue;
-      this.bytes = bytes;
-      this.#view = view;
-      this.#count = count;
-      this.#entry = 0;
-      this.#decode();
-      return true;
-    }
+    this.#block += 1;
+    const bytes = this.#blocks[this.#block];
+    if (bytes === undefined) return false;
+    if (bytes.length < 2) throw new StoreCorruptionError("Run block is truncated");
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const count = view.getUint16(0, true);
+    if (count < 1 || 2 + 2 * count > bytes.length || bytes.length > BLOCK_BYTES + 2)
+      throw new StoreCorruptionError("Run block offsets are invalid");
+    this.#end = 2 + 2 * count;
+    this.bytes = bytes;
+    this.#view = view;
+    this.#count = count;
+    this.#entry = 0;
+    this.#decode();
+    return true;
   }
 
+  #end = 0;
   #decode(): void {
     const bytes = this.bytes;
     const view = need(this.#view);
     let at = view.getUint16(2 + this.#entry * 2, true);
-    let length = 0;
-    let scale = 1;
-    for (;;) {
-      const byte = bytes[at++] ?? 0;
-      length += (byte & 0x7f) * scale;
-      if (byte < 0x80) break;
-      scale *= 0x80;
+    // Same grammar as runs.ts validateBlock, checked while decoding instead of assuming a
+    // checksummed block is structurally valid. No second pass, temporary entry or allocation.
+    if (at !== this.#end || at >= bytes.length)
+      throw new StoreCorruptionError("Run block entries do not tile its bytes");
+    const first = bytes[at++] ?? 0;
+    let length = first;
+    if (first >= 128) {
+      if (at >= bytes.length) throw new StoreCorruptionError("Run key length is truncated");
+      const second = bytes[at++] ?? 0;
+      if (second === 0 || second >= 128)
+        throw new StoreCorruptionError("Run key length is not canonical");
+      length = (first & 127) + second * 128;
     }
+    const end = at + length + 7;
+    if (length > MAX_KEY_BYTES || end > bytes.length)
+      throw new StoreCorruptionError("Run block entry is truncated or too wide");
+    if (this.#entry === this.#count - 1 && end !== bytes.length)
+      throw new StoreCorruptionError("Run block has trailing bytes");
+    const flags = bytes[end - 1] ?? 0;
+    requireBits(flags, RUN_CODEC.flags, "run entry flags", StoreCorruptionError);
+    this.#end = end;
     this.keyStart = at;
     this.keyEnd = at + length;
     this.rowId =
       view.getUint32(at + length, true) + view.getUint16(at + length + 4, true) * 2 ** 32;
-    this.tombstone = ((bytes[at + length + 6] ?? 0) & 1) === 1;
+    this.tombstone = (flags & 1) === 1;
   }
 
   /** Moves to the next entry: true when one is ready, false when the batch is used up. */
