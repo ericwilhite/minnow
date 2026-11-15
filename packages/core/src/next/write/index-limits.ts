@@ -35,7 +35,7 @@ function termLimit(index: IndexDef) {
   return index.role === "primary" ? INDEXED_UTF16_UNITS : INDEX_TUPLE_TERM_UNITS;
 }
 /** No native allocations, pins or data reads: safe to use before range admission. */
-export function indexMaximumKeyBytes(index: IndexDef, table: TableDef): number {
+export function indexMaximumKeyBytes(index: IndexDef, table: Pick<TableDef, "columns">): number {
   if (!scalarIndexLimit(index))
     return Math.ceil((termLimit(index) * 3) / 5) + index.columnIds.length * 17 + 3;
   const type = need(table.columns.find((c) => c.id === index.columnIds[0])).type;
@@ -179,7 +179,7 @@ function stringUnits(
  * UTF-16 counting. Both passes use the same resolved flat/constant/dictionary slots. */
 export function indexLimitViolation(
   index: IndexDef,
-  table: TableDef,
+  table: Pick<TableDef, "columns">,
   columns: readonly Vector[],
   rows: Uint16Array | null,
   from: number,

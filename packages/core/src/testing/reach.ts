@@ -8176,3 +8176,44 @@ export const REGISTRY_IMAGES_WORKSPACE_REACH = [
   "positive coefficients",
   "zero ownership",
 ] as const;
+
+export const NATIVE_COMMAND_CHECK_REACH = [
+  "resident sources",
+  "published sources",
+  "unique 23505",
+  "primary 23505",
+  "missing parent 23503",
+  "valid reference",
+  "NULL reference skipped",
+  "NULL key skipped",
+  "valid command",
+  "obsolete version skipped",
+  "root prepaid cursor",
+  "image released before progress",
+  "projected unrelated payload",
+  "zero ownership",
+] as const;
+export const NATIVE_COMMAND_ACTION_CHECK_REACH = [
+  "root checkpoint already passed",
+  "earlier actions passed",
+  "new action uniqueness before later error",
+  "resident sources",
+  "published sources",
+  "zero ownership",
+] as const;
+export const NATIVE_COMMAND_CHECK_LIFETIME_REACH = [
+  "image gone before wait",
+  "close cancellation",
+  "caller cancellation",
+  "pending progress remains paid",
+  "no cursor after cancellation",
+  "zero ownership",
+] as const;
+export const NATIVE_COMMAND_CHECK_CONSTRUCTION_REACH = [
+  "digit scratch fault",
+  "key buffer fault",
+  "offset buffer fault",
+  "output buffer fault",
+  "private account restored",
+  "zero ownership",
+] as const;

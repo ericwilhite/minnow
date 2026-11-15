@@ -4167,3 +4167,12 @@ accepted-write capture and RI execution remain responsibilities of the native pr
 The registry lives in `owner/`: it composes native write access, spill storage and execution
 leases. Keeping it there preserves the dependency boundary; `write/` does not depend on the
 spill layer or trigger executor. The existing dependency-rule suite enforces that placement.
+
+`owner/command-checks.ts` verifies native command keys without ending the statement. It uses
+fresh scoped prefix pins and bounded, root-funded index cursors, stopping after two unique
+holders or one reference holder. Projected image leases end before cursor progress is funded.
+An already checked command token never covers a later action's accepted rows; obsolete deleted
+versions do not produce reference failures. A private fixed account also returns provisional
+key buffers when construction fails. Generated tests compare real native key checks against
+PGlite and shipped success/failure, including published sources and successive accepted writes.
+This checker is a provider component; it does not execute RI actions or install SQL firing.

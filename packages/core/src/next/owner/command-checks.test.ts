@@ -1,0 +1,606 @@
+/** Native bounded checks against PG and the shipped engine; no SQL trigger driver is installed. */
+import { PGlite } from "@electric-sql/pglite";
+import fc from "fast-check";
+import { expect, it, vi } from "vitest";
+import { yieldTask } from "../task.js";
+import { currentEngine } from "../../testing/differential-current.js";
+import {
+  createReach,
+  NATIVE_COMMAND_CHECK_REACH,
+  NATIVE_COMMAND_ACTION_CHECK_REACH,
+  NATIVE_COMMAND_CHECK_LIFETIME_REACH,
+  NATIVE_COMMAND_CHECK_CONSTRUCTION_REACH,
+} from "../../testing/reach.js";
+import { seedsFor } from "../../testing/seeds.js";
+import type { NativeCommandBoundary } from "../access/statement-command.js";
+import { MemorySpillService } from "../spill/memory-spill.js";
+import { NativeCommandChecks, commandCheckMinimumBytes } from "./command-checks.js";
+import { RegistryDirectory } from "./registry-directory.js";
+import { RegistryFragments } from "./registry-fragments.js";
+import { RegistryImages } from "./registry-images.js";
+import { RegistryCommands, type AcceptedCommandRow } from "./registry-commands.js";
+import { ViewIndex } from "../write/view.js";
+import { StatementImpl } from "../write/transaction.js";
+import {
+  autocommit,
+  batch,
+  column,
+  Harness,
+  INT,
+  ints,
+  TEXT,
+  texts,
+  tableInput,
+  rules,
+} from "../write/test-support.js";
+
+async function code(run: () => unknown): Promise<string | null> {
+  try {
+    await run();
+    return null;
+  } catch (error) {
+    if (typeof error !== "object" || error === null) throw error;
+    if ("sqlState" in error && typeof error.sqlState === "string") return error.sqlState;
+    if ("code" in error && typeof error.code === "string") return error.code;
+    throw error;
+  }
+}
+async function fixture(
+  published: boolean,
+  count: number,
+  beforeRange?: (signal: AbortSignal) => Promise<void>,
+) {
+  const h = new Harness("strict", "memory", 256),
+    path = await h.open();
+  let parent = 0,
+    child = 0;
+  await autocommit(path, async (s) => {
+    parent =
+      (
+        await s.changeCatalog({
+          kind: "createTable",
+          table: tableInput(
+            "p",
+            [column("id", INT, false), column("u", INT), column("payload", TEXT)],
+            { unique: [{ name: "p_u_key", columns: [1] }] },
+          ),
+        })
+      ).id ?? 0;
+    const def = s.catalog.table(parent);
+    if (!def?.primaryKey) throw new Error("Missing native parent index");
+    child =
+      (
+        await s.changeCatalog({
+          kind: "createTable",
+          table: tableInput(
+            "c",
+            [column("id", INT, false), column("pid", INT), column("payload", TEXT)],
+            {
+              foreignKeys: [
+                {
+                  name: "c_pid_fkey",
+                  columns: [1],
+                  parentTableId: parent,
+                  parentIndexId: def.primaryKey,
+                  onDelete: "noAction",
+                  enforced: true,
+                },
+              ],
+            },
+          ),
+        })
+      ).id ?? 0;
+  });
+  const ids = Array.from({ length: count }, (_, k) => k + 1);
+  for (let from = 0; from < count; from += 200) {
+    const part = ids.slice(from, from + 200);
+    await autocommit(path, (s) =>
+      s.table(parent).insert(batch(ints(part), ints(part), texts(part.map(() => "seed"))), null),
+    );
+  }
+  if (published) {
+    await path.recycleLog();
+    await path.quiesce();
+  }
+  const tx = await path.begin(),
+    statement = tx.statement({ rules });
+  if (!(statement instanceof StatementImpl)) throw new Error("Expected real native statement");
+  const grant = await h.governor.admit({
+    label: "prepaid native registry/check workspace",
+    minimumBytes: 2 * 1024 * 1024,
+    spillable: false,
+  });
+  const range = await h.governor.admit({
+    label: "prepaid native constraint cursor",
+    minimumBytes: 32 * 1024 * 1024,
+    spillable: false,
+  });
+  const stop = new AbortController(),
+    spill = new MemorySpillService();
+  const directory = new RegistryDirectory(grant, spill, 1, stop.signal),
+    fragments = new RegistryFragments(grant, spill, 1, stop.signal, () => undefined);
+  const images = new RegistryImages({
+    rootId: 17,
+    catalog: statement.catalog,
+    directory,
+    fragments,
+    charge: grant,
+    signal: stop.signal,
+    prepare: () => undefined,
+    checkpoint: () => undefined,
+  });
+  const commands = new RegistryCommands({
+    rootId: 17,
+    frames: 1,
+    rowEvents: 2,
+    directory,
+    charge: grant,
+    signal: stop.signal,
+    checkpoint: () => undefined,
+    referentialName: (id) => `RI_ConstraintTrigger_c_${String(id)}`,
+  });
+  const root = commands.beginCommand(1, 1);
+  let leases = 0,
+    maxRange = 0;
+  const projected: Pick<NativeCommandBoundary, "readRowBindings"> = {
+    readRowBindings: async (ref, projection, signal) => {
+      const lease = await images.readRowBindings(ref, projection, signal);
+      leases++;
+      return {
+        tableId: lease.tableId,
+        old: lease.old,
+        new: lease.new,
+        release: () => {
+          lease.release();
+          leases--;
+        },
+      };
+    },
+  };
+  const beforeCheckBytes = grant.allocated;
+  const checks = new NativeCommandChecks({
+    statement,
+    tables: [parent, child],
+    images: projected,
+    charge: grant,
+    signal: stop.signal,
+    prepareRange: async (plan, signal) => {
+      expect(leases).toBe(0);
+      await beforeRange?.(signal);
+      signal.throwIfAborted();
+      maxRange = Math.max(maxRange, plan.minimumBytes);
+      expect(plan.minimumBytes).toBeLessThanOrEqual(range.held);
+      return range;
+    },
+  });
+  expect(grant.allocated - beforeCheckBytes).toBe(
+    commandCheckMinimumBytes(statement.catalog, [parent, child]),
+  );
+  return {
+    h,
+    path,
+    tx,
+    statement,
+    parent,
+    child,
+    grant,
+    range,
+    stop,
+    images,
+    checks,
+    commands,
+    root,
+    get leases() {
+      return leases;
+    },
+    get maxRange() {
+      return maxRange;
+    },
+    async insert(tableId: number, id: number, value: number | null): Promise<AcceptedCommandRow> {
+      const input = batch(ints([id]), ints([value]), texts(["unrelated".repeat(10000)]));
+      const ref = await images.append(tableId, null, { batch: input, row: 0 });
+      await statement.table(tableId).insert(input, null);
+      const table = statement.current().internalTable(tableId),
+        mem = table.tableView.memtables.at(-1);
+      if (!mem) throw new Error("Missing accepted native row");
+      const accepted: AcceptedCommandRow = {
+        command: root,
+        tableId,
+        event: "insert",
+        images: ref,
+        oldRowId: null,
+        newRowId: mem.firstRowId + mem.rowCount - 1,
+      };
+      await commands.accept(accepted);
+      return accepted;
+    },
+    async close() {
+      await commands.close();
+      await checks.close();
+      await images.close();
+      await fragments.close();
+      await directory.close();
+      expect(grant.allocated).toBe(0);
+      expect(range.allocated).toBe(0);
+      grant.close();
+      range.close();
+      statement.rollback();
+      tx.rollback();
+      await h.close();
+      expect(h.governor.usedBytes).toBe(0);
+      expect(spill.bytesInUse).toBe(0);
+    },
+  };
+}
+
+it.each(seedsFor("next-native-command-checks", [0xb5e8]))(
+  "checks real native unique/FK keys with prepaid bounded cursors seed %i",
+  async (seed) => {
+    const reach = createReach("native command checks", NATIVE_COMMAND_CHECK_REACH),
+      pg = new PGlite(),
+      shipped = await currentEngine("memory");
+    try {
+      await fc.assert(
+        fc.asyncProperty(
+          fc.constantFrom(
+            "unique",
+            "primary",
+            "reference",
+            "reference valid",
+            "reference NULL",
+            "NULL",
+            "valid",
+            "obsolete",
+          ),
+          fc.boolean(),
+          fc.integer({ min: 2, max: 300 }),
+          async (kind, published, count) => {
+            reach.beginHistory();
+            const f = await fixture(published, count);
+            try {
+              for (const sql of [
+                "DROP TABLE IF EXISTS c",
+                "DROP TABLE IF EXISTS p",
+                "CREATE TABLE p(id INTEGER PRIMARY KEY,u INTEGER UNIQUE,payload TEXT)",
+                "CREATE TABLE c(id INTEGER PRIMARY KEY,pid INTEGER REFERENCES p(id),payload TEXT)",
+                `INSERT INTO p SELECT x,x,'seed' FROM generate_series(1,${String(count)}) x`,
+              ]) {
+                await pg.exec(sql);
+                if (!sql.startsWith("INSERT INTO")) await shipped.run({ kind: "sql", sql });
+              }
+              // The shipped source has no generate_series; exact same seed rows through VALUES.
+              await shipped.run({
+                kind: "sql",
+                sql: `INSERT INTO p VALUES ${Array.from({ length: count }, (_, i) => `(${String(i + 1)},${String(i + 1)},'seed')`).join(",")}`,
+              });
+              const child = kind.startsWith("reference") || kind === "obsolete",
+                table = child ? f.child : f.parent,
+                id = kind === "primary" ? 1 : count + 1,
+                value =
+                  kind === "unique"
+                    ? 1
+                    : kind === "reference valid"
+                      ? 1
+                      : kind === "reference NULL" || kind === "NULL"
+                        ? null
+                        : child
+                          ? count + 100
+                          : count + 1;
+              const row = await f.insert(table, id, value);
+              if (kind === "obsolete") {
+                await f.statement.table(table).applyDelete([row.newRowId ?? -1]);
+                reach.reach("obsolete version skipped");
+              }
+              const sql = `INSERT INTO ${child ? "c" : "p"} VALUES(${String(id)},${value === null ? "NULL" : String(value)},'candidate')`;
+              let expected: string | null = null,
+                shippedFailed = false;
+              if (kind !== "obsolete") {
+                expected = await code(() => pg.exec(sql));
+                try {
+                  await shipped.run({ kind: "sql", sql });
+                } catch {
+                  shippedFailed = true;
+                }
+              }
+              const legacy = vi.spyOn(ViewIndex.prototype, "countRange").mockImplementation(() => {
+                throw new Error("native check retained legacy matching IDs");
+              });
+              const admit = vi.spyOn(f.h.governor, "admit").mockImplementation(() => {
+                  throw new Error("native check independently admitted");
+                }),
+                group = vi.spyOn(f.h.governor, "admitGroup").mockImplementation(() => {
+                  throw new Error("native check independently admitted");
+                });
+              let observed: string | null;
+              try {
+                observed = await code(async () => {
+                  await f.commands.verify(
+                    f.root,
+                    "unique",
+                    (accepted, signal) => f.checks.verifyUnique(accepted, signal),
+                    f.stop.signal,
+                  );
+                  if (child) {
+                    const fk = f.statement.catalog.table(table)?.foreignKeys[0];
+                    if (!fk) throw new Error("Missing FK");
+                    await f.checks.verifyReference(row, fk.id, f.stop.signal);
+                  }
+                });
+              } finally {
+                admit.mockRestore();
+                group.mockRestore();
+                legacy.mockRestore();
+              }
+              expect(observed).toBe(expected);
+              if (kind !== "obsolete") expect(shippedFailed).toBe(expected !== null);
+              expect(f.leases).toBe(0);
+              expect(f.range.allocated).toBe(0);
+              reach.reach(published ? "published sources" : "resident sources");
+              reach.reach(
+                kind === "reference"
+                  ? "missing parent 23503"
+                  : kind === "unique"
+                    ? "unique 23505"
+                    : kind === "primary"
+                      ? "primary 23505"
+                      : kind === "reference valid"
+                        ? "valid reference"
+                        : kind === "reference NULL"
+                          ? "NULL reference skipped"
+                          : kind === "NULL"
+                            ? "NULL key skipped"
+                            : kind === "valid"
+                              ? "valid command"
+                              : "obsolete version skipped",
+              );
+              if (kind !== "NULL" && kind !== "obsolete") {
+                expect(f.maxRange).toBeGreaterThan(0);
+                reach.reach("root prepaid cursor");
+                reach.reach("image released before progress");
+                reach.reach("projected unrelated payload");
+              }
+            } finally {
+              await f.close();
+            }
+            reach.reach("zero ownership");
+          },
+        ),
+        {
+          seed,
+          numRuns: 12,
+          examples: [
+            ["unique", false, 3],
+            ["primary", true, 3],
+            ["reference", false, 3],
+            ["reference valid", true, 3],
+            ["reference NULL", false, 3],
+            ["NULL", true, 3],
+            ["valid", false, 3],
+            ["obsolete", true, 3],
+          ],
+        },
+      );
+      reach.assertReached();
+    } finally {
+      await pg.close();
+      await shipped.close();
+    }
+  },
+  120000,
+);
+
+it.each(seedsFor("next-native-command-action-checks", [0xb5e9]))(
+  "checks each real accepted action after the same token passed seed %i",
+  async (seed) => {
+    const pg = new PGlite(),
+      reach = createReach("native incremental action checks", NATIVE_COMMAND_ACTION_CHECK_REACH);
+    try {
+      await fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 0, max: 3 }),
+          fc.boolean(),
+          async (earlier, published) => {
+            reach.beginHistory();
+            const f = await fixture(published, 3);
+            try {
+              await pg.exec(
+                "DROP TABLE IF EXISTS p; CREATE TABLE p(id INTEGER PRIMARY KEY,u INTEGER UNIQUE,payload TEXT); INSERT INTO p VALUES(1,1,'seed'),(2,2,'seed'),(3,3,'seed')",
+              );
+              await f.commands.verify(
+                f.root,
+                "unique",
+                (row, signal) => f.checks.verifyUnique(row, signal),
+                f.stop.signal,
+              );
+              reach.reach("root checkpoint already passed");
+              const inserted = await f.insert(f.parent, 4, 4);
+              expect(inserted.newRowId).not.toBeNull();
+              for (let k = 0; k <= earlier; k++) {
+                if (k > 0) {
+                  await f.insert(f.parent, 4 + k, 4 + k);
+                  reach.reach("earlier actions passed");
+                }
+                await pg.exec(`INSERT INTO p VALUES(${String(4 + k)},${String(4 + k)},'action')`);
+                await f.commands.verify(
+                  f.root,
+                  "unique",
+                  (row, signal) => f.checks.verifyUnique(row, signal),
+                  f.stop.signal,
+                );
+              }
+              await f.insert(f.parent, 5 + earlier, 4);
+              const expected = await code(() =>
+                pg.exec(`INSERT INTO p VALUES(${String(5 + earlier)},4,'duplicate'); SELECT 1/0`),
+              );
+              let later = false;
+              const actual = await code(async () => {
+                await f.commands.verify(
+                  f.root,
+                  "unique",
+                  (row, signal) => f.checks.verifyUnique(row, signal),
+                  f.stop.signal,
+                );
+                later = true;
+                throw Object.assign(new Error("later AFTER body"), { sqlState: "22012" });
+              });
+              expect(expected).toBe("23505");
+              expect(actual).toBe(expected);
+              expect(later).toBe(false);
+              reach.reach("new action uniqueness before later error");
+              reach.reach(published ? "published sources" : "resident sources");
+            } finally {
+              await f.close();
+            }
+            reach.reach("zero ownership");
+          },
+        ),
+        {
+          seed,
+          numRuns: 8,
+          examples: [
+            [0, false],
+            [3, true],
+          ],
+        },
+      );
+      reach.assertReached();
+    } finally {
+      await pg.close();
+    }
+  },
+  120000,
+);
+
+it.each(seedsFor("next-native-command-check-lifetime", [0xb5ea]))(
+  "fences native check progress before refund on cancel seed %i",
+  async (seed) => {
+    const reach = createReach("native check lifetime", NATIVE_COMMAND_CHECK_LIFETIME_REACH);
+    await fc.assert(
+      fc.asyncProperty(fc.boolean(), async (close) => {
+        reach.beginHistory();
+        let entered!: () => void,
+          resume!: () => void,
+          observed: AbortSignal | null = null;
+        const ready = new Promise<void>((r) => {
+            entered = r;
+          }),
+          gate = new Promise<void>((r) => {
+            resume = r;
+          });
+        const f = await fixture(false, 2, async (signal) => {
+          observed = signal;
+          entered();
+          await gate;
+        });
+        let closing: Promise<void> | null = null;
+        try {
+          const row = await f.insert(f.parent, 3, 3);
+          const pending = f.checks.verifyUnique(row, f.stop.signal).then(
+            () => null,
+            (error: unknown) => error,
+          );
+          await ready;
+          expect(f.leases).toBe(0);
+          reach.reach("image gone before wait");
+          const paid = f.grant.allocated;
+          let done = false;
+          if (close)
+            closing = f.checks.close().then(() => {
+              done = true;
+            });
+          else f.stop.abort(new Error("caller cancelled"));
+          await yieldTask();
+          const stillPaid = f.grant.allocated === paid,
+            aborted = (observed as AbortSignal | null)?.aborted === true,
+            early = done;
+          resume();
+          const error = await pending;
+          await closing;
+          expect(error).toBeInstanceOf(Error);
+          expect(stillPaid).toBe(true);
+          expect(aborted).toBe(true);
+          expect(early).toBe(false);
+          expect(f.range.allocated).toBe(0);
+          reach.reach(close ? "close cancellation" : "caller cancellation");
+          reach.reach("pending progress remains paid");
+          reach.reach("no cursor after cancellation");
+        } finally {
+          resume();
+          await closing;
+          await f.close();
+        }
+        reach.reach("zero ownership");
+      }),
+      { seed, numRuns: 6, examples: [[false], [true]] },
+    );
+    reach.assertReached();
+  },
+  60000,
+);
+
+it.each(seedsFor("next-native-command-check-construction", [0xb5ec]))(
+  "returns private native check account after constructor faults seed %i",
+  async (seed) => {
+    const reach = createReach("native check construction", NATIVE_COMMAND_CHECK_CONSTRUCTION_REACH);
+    await fc.assert(
+      fc.asyncProperty(fc.integer({ min: 1, max: 4 }), async (nth) => {
+        reach.beginHistory();
+        const f = await fixture(false, 2),
+          before = f.grant.allocated,
+          failure = new Error("native check constructor fault");
+        const native = { Uint8Array, Int32Array, Float64Array };
+        let calls = 0;
+        const intercept = <T extends typeof Uint8Array | typeof Int32Array | typeof Float64Array>(
+          target: T,
+        ) =>
+          new Proxy(target, {
+            construct(constructor, args, newTarget) {
+              if (args[0] !== 0 && ++calls === nth) throw failure;
+              return Reflect.construct(constructor, args, newTarget) as
+                Uint8Array | Int32Array | Float64Array;
+            },
+          });
+        try {
+          vi.stubGlobal("Uint8Array", intercept(native.Uint8Array));
+          vi.stubGlobal("Int32Array", intercept(native.Int32Array));
+          vi.stubGlobal("Float64Array", intercept(native.Float64Array));
+          expect(
+            () =>
+              new NativeCommandChecks({
+                statement: f.statement,
+                tables: [f.parent, f.child],
+                images: f.images,
+                charge: f.grant,
+                signal: f.stop.signal,
+                prepareRange: async () => f.range,
+              }),
+          ).toThrow(failure);
+        } finally {
+          vi.stubGlobal("Uint8Array", native.Uint8Array);
+          vi.stubGlobal("Int32Array", native.Int32Array);
+          vi.stubGlobal("Float64Array", native.Float64Array);
+        }
+        try {
+          expect(calls).toBe(nth);
+          expect(f.grant.allocated).toBe(before);
+          reach.reach(
+            nth === 1
+              ? "digit scratch fault"
+              : nth === 2
+                ? "key buffer fault"
+                : nth === 3
+                  ? "offset buffer fault"
+                  : "output buffer fault",
+          );
+          reach.reach("private account restored");
+        } finally {
+          await f.close();
+        }
+        reach.reach("zero ownership");
+      }),
+      { seed, numRuns: 6, examples: [[1], [2], [3], [4]] },
+    );
+    reach.assertReached();
+  },
+  60000,
+);
