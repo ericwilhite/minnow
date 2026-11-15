@@ -13,7 +13,7 @@ import {
   type Vector,
   type VectorData,
 } from "../vector/vector.js";
-import { sourceSlot } from "./columns.js";
+import { sourceSlot } from "../write/columns.js";
 import type { RegistryFragments, RegistryPayload } from "./registry-fragments.js";
 
 const INLINE = 64;

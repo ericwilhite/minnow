@@ -4114,12 +4114,12 @@ firing remains guarded until the joint runtime is installed.
 
 ### Root registry scratch primitives (staging)
 
-`write/registry-directory.ts` stores fixed 128-byte records under a namespace, table ID and
+`owner/registry-directory.ts` stores fixed 128-byte records under a namespace, table ID and
 row ID. A 30 KiB charged cursor/cache serves all records through one spill file. IDs keep all
 53 safe integer bits. Dirty leaves and a copy-on-write radix path go to scratch; row count
 never grows a resident descriptor map. Callers provide their own prepaid record buffers.
 
-`write/registry-fragments.ts` stores variable image payloads in a second shared spill file.
+`owner/registry-fragments.ts` stores variable image payloads in a second shared spill file.
 Two 64 KiB charged buffers stream reverse-linked fragments, without an array of page refs or
 a whole-value encoding copy. Each fragment checks cancellation and the root task clock.
 Close fences pending create/read/write/fill/clock work before releasing either file or credit.
@@ -4132,7 +4132,7 @@ checks cover record eviction/overwrite, sparse table/row IDs, exact replay, corr
 constructor failures and cancellation fences. Native statement/provider and SQL differential
 coverage belong to the later integration, alongside the existing refusal guards.
 
-`write/registry-targets.ts` seals original child-identity ranges in the same descriptor file.
+`owner/registry-targets.ts` seals original child-identity ranges in the same descriptor file.
 Its 1 KiB charged cursor records table-local original-to-current native row versions and
 retains no row-ID map. A later update changes the canonical current version; deletion marks
 it retired. Replaying an earlier captured range resolves those identities rather than looking
@@ -4140,7 +4140,7 @@ up rewritten FK values. Empty ranges stay independently replayable. Callers must
 original `follow` matches before applying any follow action. This component neither finds FK
 matches nor schedules writes; those remain native-provider integration work.
 
-`write/registry-images.ts` and `registry-scalar.ts` capture immutable physical OLD/NEW
+`owner/registry-images.ts` and `registry-scalar.ts` capture immutable physical OLD/NEW
 vectors in that scratch layout. Full leases return one row; projected leases resolve stable
 column IDs and leave other columns explicitly `ROW_IMAGE_UNREAD`, never SQL NULL. The
 fixed image helper remains 30 KiB directory + 2 KiB image metadata + two 64 KiB buffers.
@@ -4156,10 +4156,14 @@ turn on SQL firing. The caller supplies admitted scope/progress and immutable ta
 statement/command ownership, row rules, accepted-write hooks and deferred RI execution are
 separate integration responsibilities.
 
-`write/registry-commands.ts` records command/frame ownership, accepted native row IDs and
+`owner/registry-commands.ts` records command/frame ownership, accepted native row IDs and
 immutable RI descriptors in the shared directory. Its fixed frame slots retain separate
 uniqueness and reference cursors. Every action checks its newly accepted child work, even
 when an earlier action already verified the same command token. Retired commands and RI
 IDs refuse; signed trigger budgets survive replay. Close fences pending verification callbacks
 before returning metadata credit. This module stores work; native constraint verification,
 accepted-write capture and RI execution remain responsibilities of the native provider.
+
+The registry lives in `owner/`: it composes native write access, spill storage and execution
+leases. Keeping it there preserves the dependency boundary; `write/` does not depend on the
+spill layer or trigger executor. The existing dependency-rule suite enforces that placement.

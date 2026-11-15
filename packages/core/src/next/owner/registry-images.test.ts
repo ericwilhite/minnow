@@ -18,8 +18,8 @@ import { MemorySpillService } from "../spill/memory-spill.js";
 import type { SpillService, SpillPageRef } from "../spill/contract.js";
 import { TaskClock, yieldTask } from "../task.js";
 import { bigintBytes } from "../memory/governor.js";
-import { Catalog } from "./catalog.js";
-import { column, tableInput, INT, TEXT } from "./test-support.js";
+import { Catalog } from "../write/catalog.js";
+import { column, tableInput, INT, TEXT } from "../write/test-support.js";
 import { RegistryDirectory, REGISTRY_DIRECTORY_BYTES } from "./registry-directory.js";
 import { RegistryFragments, REGISTRY_FRAGMENT_BYTES } from "./registry-fragments.js";
 import {
