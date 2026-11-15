@@ -181,7 +181,9 @@ nightly. The performance gate is deliberately kept off the merge path — it mea
 much as it measures the code, and a merge gate that fails on a noisy runner is one people learn to
 re-run rather than read. When a completed run crosses a ratio threshold, the gate starts a fresh
 process and fails only if that same workload and comparison engine cross it again. Setup errors,
-missing profiles, and incomplete runs still fail immediately.
+missing profiles, and incomplete runs still fail immediately. The SQL gate records the CPU model,
+Node/V8 versions and host load before timing. Threshold profiles group machines by OS, architecture
+and Node major version; CPU context is diagnostic and does not automatically select a looser threshold.
 `.github/workflows/browser-performance.yml` runs the [browser performance lane](#browser-performance-lane)
 nightly, also off the merge path, and uploads its JSON lines and summary as an artifact.
 
@@ -1177,8 +1179,11 @@ sample counts, synchronous execution, frame release and warm plan-cache reuse. I
 owner-share bound for prepared and parameterized text reads is enforced only with
 `MINNOW_PERF_LANE=1`; ordinary unit CI reports the values as an R6 test annotation. The nightly
 owner performance job runs this component benchmark with enforcement before the browser lane,
-and uploads its log alongside the browser results. The separate stub-server 10-microsecond check
-is unchanged.
+and uploads its log alongside the browser results. The hosted job does not qualify runner
+quietness; its absolute-target failures retain raw measurements for investigation. The separate
+stub-server 10-microsecond check is unchanged. Browser sample intervals are rounded to the nearest
+nanosecond before reporting microseconds, so an exact clock tick cannot cross a target through
+binary subtraction alone; the targets themselves are unchanged.
 
 An isolated scheduling experiment helps distinguish browser task queues from SQL and wire costs:
 
@@ -1364,6 +1369,8 @@ file residency at the start, not a promise it stays resident. `MINNOW_EXPORT_VAR
 nine cold/warm pairs with per-pass phases, GC pauses, read shapes, residency, and host pressure.
 The nightly workflow keeps the page diagnostic in `export-bench.json` and the cold comparison in
 `export-scan-bench.json`, under `browser-perf-results/`. Neither enforces a performance threshold.
+On Ubuntu 24.04, these diagnostics require `util-linux-extra` for `fincore`; the nightly workflow
+installs it explicitly before running the lane.
 
 `scripts/executor-export-bench.mts` isolates the production executor/result path against the
 historical adapter over the same memory-backed page cache, with per-batch reads for both and

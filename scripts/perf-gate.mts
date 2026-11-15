@@ -10,6 +10,7 @@
  * the gate catches regressions rather than host differences. Run with --update to add or rewrite
  * the current runtime's thresholds after an intentional change.
  */
+import { availableParallelism, cpus, loadavg } from "node:os";
 import { performanceMode, performanceIdDeclaration } from "./lib/performance-schema.mts";
 import { QuietWindow } from "./lib/quiet-window.mts";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -59,6 +60,19 @@ const update = process.argv.includes("--update");
 const mode = performanceMode(process.argv.slice(2));
 const idDeclaration = performanceIdDeclaration(mode);
 const profile = runtimePerformanceProfile();
+// Runtime profiles group CPU models together; retain the host context before any timed work.
+console.log(
+  "Performance host:",
+  JSON.stringify({
+    profile,
+    mode,
+    node: process.version,
+    v8: process.versions.v8,
+    cpu: cpus()[0]?.model ?? "unknown",
+    parallelism: availableParallelism(),
+    load: loadavg(),
+  }),
+);
 const baselineFile = existsSync(BASELINE_PATH)
   ? parsePerformanceBaseline(JSON.parse(readFileSync(BASELINE_PATH, "utf8")), ROWS)
   : undefined;

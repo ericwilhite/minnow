@@ -3,6 +3,7 @@
  * a protocol client with its connector (election, broker, lifecycle) and runs statements, so the
  * spec can drive several real tabs.
  */
+import { elapsedMicros } from "./clock.js";
 import { ProtocolClient, type ClientResult } from "../../dist/next/owner/client.js";
 import {
   OwnerConnector,
@@ -367,7 +368,7 @@ export async function brokerRoundTrips(
         );
       }
     });
-    if (i >= warmup) times.push((performance.now() - start) * 1000);
+    if (i >= warmup) times.push(elapsedMicros(start, performance.now()));
   }
   port.close();
   times.sort((a, b) => a - b);
@@ -398,7 +399,7 @@ export async function transferCrossover(sizes = [256, 1024, 4096, 16_384, 65_536
           transfer ? arrays.map((array) => array.buffer) : [],
         );
       });
-      if (i >= 100) times.push((performance.now() - start) * 1000);
+      if (i >= 100) times.push(elapsedMicros(start, performance.now()));
     }
     times.sort((a, b) => a - b);
     return quantile(times, 0.5);
@@ -441,7 +442,7 @@ export async function pointReads(count: number, warmup = 200, keys = 100) {
   for (let i = 0; i < warmup + count; i++) {
     const start = performance.now();
     await client.execute(prepared.id, [1 + (i % keys)], 0, version);
-    if (i >= warmup) times.push((performance.now() - start) * 1000);
+    if (i >= warmup) times.push(elapsedMicros(start, performance.now()));
   }
   times.sort((a, b) => a - b);
   return {
