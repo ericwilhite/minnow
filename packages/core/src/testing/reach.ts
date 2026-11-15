@@ -7889,3 +7889,15 @@ export const MODIFY_FK_GUARDS_REACH = [
   "RETURNING",
   "plain",
 ] as const;
+
+/** The independent IR reference must implement deferred generated rows after every assignment. */
+export const MODIFY_REFERENCE_GENERATED_REACH = [
+  "UPDATE",
+  "SQL upsert update",
+  "batch upsert update",
+  "upsert insert",
+  "stored and RETURNING",
+  "multiple generated columns",
+  "NULL",
+  "non-NULL",
+] as const;

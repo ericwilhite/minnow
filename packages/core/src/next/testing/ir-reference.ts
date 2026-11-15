@@ -847,6 +847,7 @@ function modifyRows(rel: Extract<Rel, { op: "modify" }>, env: Environment): Row[
             both[2 * table.columns.length + j] = value;
             next[table.columns.findIndex((column) => column.id === assignment.column)] = value;
           }
+          generate(next);
           validate(next);
           stored[found] = next;
           touched.add(found);
@@ -877,6 +878,7 @@ function modifyRows(rel: Extract<Rel, { op: "modify" }>, env: Environment): Row[
       const next = [...existing];
       for (const [k, id] of rel.assigned.entries())
         next[table.columns.findIndex((column) => column.id === id)] = row[k + 1] ?? null;
+      generate(next);
       validate(next);
       stored[locator] = [];
       if (conflict(next, []) !== -1) throw new ReferenceSqlError("duplicate key", "23505");

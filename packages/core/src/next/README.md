@@ -1638,6 +1638,8 @@ repeat tracking and returned rows use charged, spillable state. SQL writers with
 proof require the admitted tracker before writer lookup, including raw executor requests. The
 direct-native legacy target Set cannot be selected by SQL. Complete-row validation includes
 closed text sets as well as NOT NULL and CHECK, including precise generated-error replay.
+The independent IR reference also recomputes deferred generated columns after UPDATE and
+conflict assignments, including typed batch upserts, before validation and RETURNING.
 Closed-set failures retain their column identity and active physical row order. Shared row rules stay alive
 through native FK actions. Unsupported modification kinds and kernel overloads remain typed refusals.
 This factory does not turn those missing capabilities into current-engine fallbacks. The
