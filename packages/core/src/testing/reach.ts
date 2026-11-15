@@ -7255,3 +7255,9 @@ export const CATALOG_INSPECTION_NESTED_REACH = [
 ] as const;
 
 export const CATALOG_INSPECTION_ENTRY_REACH = ["native", "stand-in"] as const;
+
+export const CATALOG_WORK_REACH = [
+  "shared DAG linear",
+  "shared view operand",
+  "late inspection refuses",
+] as const;

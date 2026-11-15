@@ -65,6 +65,7 @@ import {
 import { validateFtsDef, type FtsDef } from "../access/fts-def.js";
 import { DurableFormatError } from "../durable-format.js";
 import {
+  requireWritableCatalog,
   requireWritableCatalogInput,
   UnsupportedCatalogError,
 } from "../access/catalog-capabilities.js";
@@ -131,6 +132,8 @@ export type LoggedChange = CatalogOperation & {
 };
 
 type CatalogData = CatalogStreamData;
+// Module-private capability: callers cannot select the trusted construction path.
+const INTERNAL_CATALOG = Symbol("internal catalog construction");
 
 function intRange(type: PhysicalType): { min: bigint; max: bigint } {
   if (type.kind === "int32")
@@ -170,8 +173,9 @@ export class Catalog implements CatalogView {
   readonly #sequences: ReadonlyMap<number, SequenceDef>;
   readonly #types: ReadonlyMap<number, TypeDef>;
 
-  constructor(data: CatalogData) {
-    requireWritableCatalogInput(data);
+  constructor(data: CatalogData, internal?: typeof INTERNAL_CATALOG) {
+    requireWritableCatalog(data);
+    if (internal !== INTERNAL_CATALOG) requireWritableCatalogInput(data);
     for (const table of data.tables) for (const index of table.indexes) validateIndexPolicy(index);
     this.version = data.version;
     this.counters = data.counters;
@@ -187,8 +191,12 @@ export class Catalog implements CatalogView {
     this.#types = new Map(data.types.map((type) => [type.id, type]));
   }
 
+  static #trusted(data: CatalogData): Catalog {
+    return new Catalog(data, INTERNAL_CATALOG);
+  }
+
   static empty(): Catalog {
-    return new Catalog({
+    return Catalog.#trusted({
       version: 0,
       counters: FIRST_COUNTERS,
       tables: [],
@@ -243,7 +251,7 @@ export class Catalog implements CatalogView {
 
   /** Same content at another version (a transaction's view after a rollback, for instance). */
   withVersion(version: number): Catalog {
-    return new Catalog({ ...this.#data(), version });
+    return Catalog.#trusted({ ...this.#data(), version });
   }
 
   // ── Validation: CatalogChange → logged changes ───────────────────────────────────────────
@@ -264,7 +272,7 @@ export class Catalog implements CatalogView {
       expectedVersion = version;
       return entry;
     });
-    const next = logged.reduce<Catalog>((catalog, entry) => catalog.apply(entry, version), this);
+    const next = logged.reduce<Catalog>((catalog, entry) => catalog.#apply(entry, version), this);
     try {
       validateStoredCatalog(next.#data());
       validateRelationalCatalog(next.#data());
@@ -910,6 +918,11 @@ export class Catalog implements CatalogView {
 
   apply(change: LoggedChange, version: number): Catalog {
     requireWritableCatalogInput(change);
+    return this.#apply(change, version);
+  }
+
+  #apply(change: LoggedChange, version: number): Catalog {
+    requireWritableCatalog(change);
     if (
       change.expectedVersion !== this.version ||
       change.version !== version ||
@@ -1093,7 +1106,7 @@ export class Catalog implements CatalogView {
         break;
     }
     validateTriggerCatalog({ tables, triggers, types, sequences });
-    return new Catalog({
+    return Catalog.#trusted({
       version,
       counters,
       tables,
@@ -1177,7 +1190,7 @@ export class Catalog implements CatalogView {
     try {
       validateStoredCatalog(data);
       validateRelationalCatalog(data);
-      return new Catalog(data);
+      return Catalog.#trusted(data);
     } catch (error) {
       if (
         error instanceof StoreCorruptionError ||
