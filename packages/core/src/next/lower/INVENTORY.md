@@ -812,3 +812,59 @@ The private named TriggerController now merges user/RI row events and drains nes
 frames through the prepared runtime/body capability. Static native reach must supply its
 live-frame and per-row ordering bounds. This is not a new lowering or SQL-execution capability:
 the native registry/source/write provider and joint end-to-end campaign remain required.
+
+### Catalog freeze audit: creation backfills
+
+`lowerSchemaTable` retains explicit `CreateTableInput.backfill` as a typed length-one
+`ColumnDef.missing` vector, including on CREATE. Native catalog planning keeps that vector;
+absence remains SQL NULL. API fractional numbers and Date inputs use their declared physical
+types. Generated-column/backfill combinations refuse before mutation. The constant-only
+backfill boundary remains explicit: values requiring executor-only casts (for example UUID,
+INTERVAL and JSONB) still refuse with 0A000; this unit does not evaluate runtime casts in lowering.
+`catalog-backfill-create.test.ts` compares shipped introspection and rows, with ordinary WAL
+and native checkpoint reopen, continued writes and zero retained governor bytes.
+
+### Catalog freeze audit: informational targets and descriptor reopen
+
+Informational native FKs retain fallback parent/column names in MCAT10 fields10/11,
+required-understanding when present. Live bindings remain stable IDs. Parent retirement
+freezes the current labels; unrelated child ALTER and name reuse preserve the retired identity.
+Missing or malformed retired descriptors are corruption. The shipped SQL parent-drop guard
+currently blocks informational references too; native catalog retirement is tested separately,
+using the shipped pre-drop descriptor as the label authority, with no SQL DROP parity claim.
+`catalog-informational-names` covers ordinary reopen and continued DDL; the wire generator
+checks paired fields/arity/names/flags. `catalog-freeze-types` fills ordinary WAL/checkpoint
+coverage for every supported physical/logical descriptor, independently checking widths,
+NUMERIC typmods, zones, JSON mode, array element type and enum label order before exact reopen.
+No extension-policy proposal is implemented here; existing framing and gates are retained.
+
+Initial managed-table creation forwards literal/generator backfills to the same typed
+`tableInput` path. Each generator runs once per create, and its value (never the function)
+survives WAL/native reopen. Identical migrations do not rerun it. REAL backfills requiring
+runtime casts remain 0A000: the primitive API Float64 shortcut is not a SQL REAL evaluator.
+The PGlite control includes ordinary fractions and both overflow/underflow (22003) boundaries.
+
+### Catalog default source identity
+
+MCAT column4 field16 `defaultSource` distinguishes an expression from literal boolean,
+number, string or JS Date (`datetime`). Its payload is already `defaultSql`; there is no second
+wide literal copy. Native SQL-only TableInputs may omit the source discriminator; source
+schema/API paths retain it. Canonical literal spellings and declaring types are validated;
+unknown source kinds, malformed literals or source metadata on absent/generated/identity
+SQL defaults are corruption. Signed-zero number defaults use a quoted cast input to retain
+FLOAT8's sign. Default replacement/removal and counter adoption clear old source metadata.
+`catalog-default-source`, `catalog-default-counter` and the independent field16/corruption
+suite compare shipped metadata and no-op migration behavior across ordinary WAL/checkpoint
+reopen, including NUMERIC numbers versus strings and literal-looking SQL expressions.
+Field framing and minimum reader/writer policy remain the separate pending proposal.
+
+Catalog source metadata uses captured Date intrinsics for caller-supplied defaults and frozen
+backfills. Column family4 field17 retains an integer API backfill's negative zero for
+introspection/migration; physical missing/row integer values remain SQL zero. The flag is
+required-understanding when present and valid only beside a non-NULL integer missing zero.
+
+MCAT/MCHG default decoding is writable and requires every field to be understood. Explicit
+read-only inspection tolerates unknown optional fields, retains no opaque payload, and cannot
+initialize a writable Catalog or encoder. Known semantic fields are required whenever present;
+requiredFeatures is centrally registered, sorted/unique and coherent with nonempty sections.
+Separate pre-fence root minimum-reader/minimum-writer admission belongs to B2, not this codec.

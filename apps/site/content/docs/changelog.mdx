@@ -10,6 +10,48 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The private 1.0 catalog requires understanding of every present semantic field, including
+conditional type, vector and WAL operands. Read-only catalog inspection may skip unknown
+optional fields; writable opens and replay refuse them. Catalog planning also refuses inspected
+operands before copying them, including nested records inside fresh mutation or replay wrappers.
+Unknown optional payloads are not
+retained for rewriting. Required features remain sorted, unique and checked against their
+catalog sections. This tightens unreleased MCAT admission without changing the field framing
+or released 0.x formats. Separate root reader/writer gate allocation remains with the format track.
+
+The private 1.0 catalog reads Date defaults and frozen backfills through captured Date
+intrinsics, so instance method overrides cannot replace the stored value. Integer backfill
+metadata also retains the API distinction between `-0` and `0` through WAL and checkpoint
+reopen; integer row values remain SQL zero. This adds a required-understanding MCAT column
+source flag to the unreleased format chain. Released 0.x behavior and formats are unchanged.
+
+The private 1.0 catalog retains whether a default came from a SQL expression or a literal,
+and the literal's original value type. Negative numbers, signed zero, Date values and NUMERIC
+number/string inputs survive introspection and reopen. Repeating an unchanged schema remains
+a no-op, including expression defaults such as `TRUE`. ALTER, default removal and counter
+adoption keep that metadata coherent. A small required-understanding discriminator uses the
+existing SQL spelling; large literals are not stored twice. This extends unreleased MCAT
+column records without changing field framing, released 0.x formats or behavior.
+
+Initial private 1.0 schema migrations retain literal and generated frozen backfills. A generator
+runs once; repeating the same migration after WAL or checkpoint reopen remains a no-op. The
+API fractional-number shortcut applies only to Float64; SQL REAL defaults requiring a runtime
+cast keep their explicit `0A000` refusal instead of storing a rounded or overflowing value.
+Released 0.x behavior and stored formats are unchanged.
+
+The private 1.0 catalog keeps informational foreign-key target names after the native catalog
+retires a parent. Later unrelated child changes preserve the retired target identity, including
+when another table reuses its name. Two required-understanding fields extend the existing MCAT
+foreign-key record; existing field framing and development format selectors stay unchanged.
+This is private catalog metadata, not a change to the shipped SQL parent-drop policy or released
+0.x bytes. The final 1.0 extension and reader/writer policy remains under review.
+
+The private 1.0 schema-table lowering preserves API-supplied frozen backfills at creation,
+including fractional numbers and both timestamp kinds. Ordinary WAL and checkpoint reopen
+retain these values separately from insert defaults; generated columns cannot also declare a
+backfill. This fixes private catalog metadata only, without changing released 0.x behavior,
+public APIs, catalog framing or format selectors.
+
 The unexported rebuild casts integers, NUMERIC (keeping scale), float4/float8 (PostgreSQL's
 shortest spelling), boolean, date, time, timestamp, timestamptz (UTC), interval (including
 `infinity` / `-infinity`), uuid, JSON/JSONB and arrays to text with PostgreSQL's default output
@@ -144,7 +186,7 @@ bytes to the core tarball; its packed cap rises once by 1,000 bytes.
 
 The unexported rebuild replaces generic JSON catalog persistence with versioned binary catalog
 records, bounded native catalog pages and matching logged catalog changes. Unknown required
-fields and versions are refused; exact typed values and optional display extensions survive
+fields and versions are refused; exact typed values survive
 rewrites. Reachability and reclamation include every catalog page. Fields use separate ID and flag
 bytes; reserved flags and inconsistent type, vector and reference shapes are refused. Logged
 catalog changes bind their expected predecessor and resulting version before row replay.

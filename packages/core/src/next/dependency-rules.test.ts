@@ -68,10 +68,11 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
     "owner",
   ],
 };
-// Representation-neutral shared FTS leaf: never an escape hatch into either executor.
-const FTS_LEAVES = new Set(
-  ["semantics.js", "limits.js"].map((name) => join(SRC, "full-text", name)),
-);
+// Representation-neutral leaves: captured Date intrinsics and shared FTS semantics only.
+const SHARED_LEAVES = new Set([
+  join(SRC, "date-value.js"),
+  ...["semantics.js", "limits.js"].map((name) => join(SRC, "full-text", name)),
+]);
 
 const BRIDGES = new Set(["lower", "owner", "testing"]);
 
@@ -129,12 +130,8 @@ describe("next/ dependency rules", () => {
     }
   });
 
-  it("shared FTS leaves have only neutral transitive dependencies", () => {
-    const allowed = new Set([
-      ...FTS_LEAVES,
-      join(SRC, "date-value.js"),
-      join(SRC, "block-format/unicode.js"),
-    ]);
+  it("shared Date and FTS leaves have only neutral transitive dependencies", () => {
+    const allowed = new Set([...SHARED_LEAVES, join(SRC, "block-format/unicode.js")]);
     for (const target of allowed) {
       const file = target.replace(/\.js$/, ".ts");
       for (const edge of importsOf(file))
@@ -146,7 +143,7 @@ describe("next/ dependency rules", () => {
     for (const file of sourceFiles(NEXT)) {
       if (BRIDGES.has(moduleOf(file)) || file.endsWith(".test.ts")) continue;
       for (const edge of importsOf(file).filter(
-        (candidate) => !inNext(candidate.target) && !FTS_LEAVES.has(candidate.target),
+        (candidate) => !inNext(candidate.target) && !SHARED_LEAVES.has(candidate.target),
       ))
         expect(edge.typeOnly, `${relative(SRC, file)} imports ${relative(SRC, edge.target)}`).toBe(
           true,

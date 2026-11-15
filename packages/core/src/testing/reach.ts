@@ -5737,7 +5737,8 @@ export const CATALOG_RECORD_REACH = [
   "record round trip",
   "single charged output",
   "exact bigint",
-  "unknown optional retained",
+  "unknown optional read only",
+  "unknown optional writer refused",
   "unknown required refused",
   "truncated refused",
   "duplicate/out-of-order refused",
@@ -5933,12 +5934,14 @@ export const CATALOG_SAFE_VALUES_REACH = [
 ] as const;
 
 export const CATALOG_RESERVATION_REACH = [
+  "reserved reader refused",
   "fts 8",
   "fts 9",
   "fts 10",
   "optional",
   "required",
-  "display retained",
+  "optional reader tolerated",
+  "optional writer refused",
 ] as const;
 
 export const BYTE_GROWTH_REACH = [
@@ -6171,7 +6174,8 @@ export const FTS_CATALOG_REACH = [
   "stale WAL",
   "invalid binding",
   "unknown semantics",
-  "display extensions",
+  "optional reader tolerated",
+  "optional writer refused",
   "drained",
 ] as const;
 export const FTS_STORAGE_REACH = [
@@ -6825,7 +6829,8 @@ export const TRIGGER_RESERVED_NAME_REACH = [
 export const TRIGGER_WIRE_REACH = [
   "reserved refused",
   "required refused",
-  "display retained",
+  "optional reader tolerated",
+  "optional writer refused",
   "dialect refused",
   "source refused",
   "insert",
@@ -6989,3 +6994,264 @@ export const TRIGGER_RI_UNIQUE_REACH = [
   "PG error priority",
   "zero queues pins and credit",
 ] as const;
+
+export const CATALOG_CREATE_BACKFILL_REACH = [
+  "integer signed zero",
+  "overridden Date methods",
+  "throwing Date methods",
+  "generated backfill refused before mutation",
+  "boolean",
+  "integer",
+  "float",
+  "text",
+  "enum",
+  "timestamp",
+  "timestamptz",
+  "WAL reopen",
+  "checkpoint reopen",
+  "continue writing",
+  "zero resources",
+] as const;
+
+export const CATALOG_INFORMATIONAL_NAMES_REACH = [
+  "dropped parent keeps names",
+  "native checkpoint",
+  "WAL replay",
+  "scalar",
+  "composite",
+  "plain",
+  "case dot UTF8",
+  "quote",
+  "remains informational",
+  "later child ALTER",
+  "replacement parent does not retarget",
+  "zero resources",
+] as const;
+
+export const CATALOG_FREEZE_TYPES_REACH = [
+  "int32",
+  "int64",
+  "float32",
+  "float64",
+  "decimal",
+  "text",
+  "bool",
+  "date",
+  "time",
+  "timestamp",
+  "json",
+  "uuid",
+  "interval",
+  "array",
+  "enum",
+  "checkpoint",
+  "WAL",
+  "continue DDL",
+  "zero resources",
+] as const;
+
+export const CATALOG_INFORMATIONAL_WIRE_REACH = [
+  "missing both",
+  "missing table",
+  "missing columns",
+  "wrong arity",
+  "empty label",
+  "required flags10 and11",
+  "scalar",
+  "composite",
+] as const;
+
+export const CATALOG_MIGRATE_BACKFILL_REACH = [
+  "integer signed zero",
+  "boolean",
+  "integer",
+  "float",
+  "text",
+  "enum",
+  "timestamp",
+  "timestamptz",
+  "generator exactly once",
+  "literal",
+  "checkpoint",
+  "WAL",
+  "idempotent after reopen",
+  "failure atomic",
+  "zero resources",
+] as const;
+
+export const CATALOG_REAL_BACKFILL_REACH = [
+  "ordinary",
+  "overflow",
+  "underflow",
+  "catalog unchanged",
+  "zero resources",
+] as const;
+
+export const CATALOG_DEFAULT_SOURCE_REACH = [
+  "integer signed zero",
+  "overridden Date methods",
+  "throwing Date methods",
+  "boolean",
+  "integer",
+  "float",
+  "text",
+  "enum",
+  "timestamp",
+  "timestamptz",
+  "numeric-number",
+  "numeric-string",
+  "expression spelling",
+  "literal JS type",
+  "checkpoint",
+  "WAL",
+  "idempotent",
+  "unrelated ALTER preserves source",
+  "ALTER source kind",
+  "default removal clears source",
+  "signed zero",
+  "empty text",
+  "zero resources",
+] as const;
+
+export const CATALOG_DEFAULT_COUNTER_REACH = [
+  "adopt counter",
+  "remove counter",
+  "float counter",
+  "integer counter",
+  "expression",
+  "literal",
+  "reopen idempotent",
+  "zero resources",
+] as const;
+export const CATALOG_DEFAULT_WIRE_REACH = [
+  "unknown tag",
+  "SQL absent",
+  "source type mismatch",
+  "nonfinite",
+  "invalid datetime",
+  "unclosed text",
+  "noncanonical boolean",
+  "generated default",
+  "noncanonical number",
+  "literal NULL",
+  "field16 required",
+] as const;
+
+export const CATALOG_BACKFILL_SIGN_REACH = [
+  "int32",
+  "int64",
+  "false sign",
+  "missing absent",
+  "missing NULL",
+  "nonzero value",
+  "noninteger type",
+  "required flag",
+  "downgrade refused",
+] as const;
+
+export const CATALOG_CAPABILITIES_REACH = [
+  "optional field",
+  "required field",
+  "unknown flags",
+  "duplicate field",
+  "out-of-order field",
+  "unknown feature",
+  "duplicate feature",
+  "out-of-order feature",
+  "feature disagreement",
+  "unknown family",
+  "record version",
+  "stream version",
+  "expression dialect",
+  "semantic downgrade",
+  "section order",
+  "optional reader tolerated",
+  "inspection cannot rewrite",
+  "metadata",
+  "nested counters",
+  "nested physical",
+  "fragment cleanup",
+] as const;
+
+export const CATALOG_SEMANTIC_CAPABILITIES_REACH = [
+  "integer width",
+  "decimal bounds",
+  "array/JSON mode",
+  "text bounds",
+  "timestamp mode",
+  "declared integer",
+  "declared domain",
+  "declared text/enum",
+  "vector payload",
+  "integer payload",
+  "index state",
+  "WAL operand",
+] as const;
+export const CATALOG_CAPABILITY_OPEN_REACH = [
+  "optional field",
+  "required field",
+  "unknown flags",
+  "duplicate field",
+  "out-of-order field",
+  "unknown feature",
+  "duplicate feature",
+  "out-of-order feature",
+  "feature disagreement",
+  "unknown family",
+  "record version",
+  "stream version",
+  "expression dialect",
+  "semantic downgrade",
+  "section order",
+  "both root slots unchanged",
+  "WAL header and tail unchanged",
+  "no native writer",
+  "retry unchanged",
+  "zero resources",
+  "metadata",
+  "nested counters",
+  "nested physical",
+] as const;
+
+export const CATALOG_CAPABILITY_WAL_REACH = [
+  "optional field",
+  "required field",
+  "unknown flags",
+  "duplicate field",
+  "out-of-order field",
+  "top-level change",
+  "nested view",
+  "inspection cannot replay",
+  "inspection cannot serialize",
+] as const;
+
+/** Inspection operands cannot pass through copying catalog planning/replay boundaries. */
+export const CATALOG_INSPECTION_INPUT_REACH = [
+  "createTable",
+  "alterTable",
+  "createIndex",
+  "createSequence",
+  "alterSequence",
+  "createView",
+  "replaceView",
+  "createType",
+  "createFts",
+  "upsertFts",
+  "createTrigger",
+  "fresh replay wrapper",
+  "source unchanged",
+  "own",
+  "inherited",
+  "hidden inherited",
+  "invalid root refuses",
+] as const;
+
+export const CATALOG_INSPECTION_NESTED_REACH = [
+  "physical",
+  "declared",
+  "ftsConfig",
+  "triggerBody",
+  "viewOutput",
+] as const;
+
+export const CATALOG_INSPECTION_ENTRY_REACH = ["native", "stand-in"] as const;

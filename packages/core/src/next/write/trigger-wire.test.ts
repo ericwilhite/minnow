@@ -52,7 +52,7 @@ for (const seed of seedsFor("next-trigger-wire", [0xb7c6, 0xb7c7]))
             timing = before ? "before" : "after";
           const type = wire(5, [
               [1, s("int32")],
-              [2, u(32), 0],
+              [2, u(32), 1],
             ]),
             target = wire(32, [
               [1, u(2)],
@@ -102,19 +102,22 @@ for (const seed of seedsFor("next-trigger-wire", [0xb7c6, 0xb7c7]))
             encoded.close();
           }
           const extended = wire(20, [...fields, [100, Uint8Array.of(0xff), required ? 1 : 0]]);
+          expect(() => decodeCatalogRecord("trigger", extended)).toThrow(
+            expect.objectContaining({ code: "MINNOW_CATALOG_UNSUPPORTED" }),
+          );
           if (required) {
-            expect(() => decodeCatalogRecord("trigger", extended)).toThrow(
+            expect(() => decodeCatalogRecord("trigger", extended, "read")).toThrow(
               expect.objectContaining({ code: "MINNOW_CATALOG_UNSUPPORTED" }),
             );
             reach.reach("required refused");
           } else {
-            const round = encodeCatalogRecord("trigger", decodeCatalogRecord("trigger", extended));
-            try {
-              expect(round.bytes).toEqual(extended);
-            } finally {
-              round.close();
-            }
-            reach.reach("display retained");
+            const inspected = decodeCatalogRecord("trigger", extended, "read");
+            expect(inspected).toMatchObject(decoded);
+            expect(() => encodeCatalogRecord("trigger", inspected)).toThrow(
+              expect.objectContaining({ code: "MINNOW_CATALOG_UNSUPPORTED" }),
+            );
+            reach.reach("optional reader tolerated");
+            reach.reach("optional writer refused");
           }
           expect(() => validateTriggerDef({ ...decoded, dialectVersion: 2 })).toThrow(
             expect.objectContaining({ code: "MINNOW_FORMAT_UNSUPPORTED" }),

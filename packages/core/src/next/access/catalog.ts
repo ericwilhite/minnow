@@ -32,6 +32,7 @@
  *   created; its `parentIndexId` is then `"primary"` or `{ unique: name }` of the same input.
  */
 import type { SqlTypeDescriptor, PhysicalType } from "../types.js";
+import type { CatalogDefaultSource } from "./catalog-default-source.js";
 import type { TriggerDef } from "./trigger-def.js";
 import type { FtsDef } from "./fts-def.js";
 import type { FlatVector } from "../vector/vector.js";
@@ -107,6 +108,9 @@ export interface ColumnDef {
   readonly nullable: boolean;
   /** Default expression (SQL text), or null. Applied by lowering, never by the write path. */
   readonly defaultSql: string | null;
+  /** Source API identity: SQL expression or the literal's primitive JS type. The existing
+   * SQL spelling carries its value without a second wide payload. Absent: native SQL only. */
+  readonly defaultSource?: CatalogDefaultSource;
   /** Stored generated column expression (SQL text), or null. */
   readonly generatedSql: string | null;
   /** The sequence behind SERIAL / IDENTITY / AUTOINCREMENT, or null. */
@@ -121,6 +125,8 @@ export interface ColumnDef {
    * when such rows read as SQL NULL.
    */
   readonly missing: FlatVector | null;
+  /** Preserve the API backfill's -0 spelling; integer missing vectors store SQL zero. */
+  readonly backfillNegativeZero?: true;
   /** A named enum identity; closed text sets use allowedValues instead. */
   readonly typeId?: number;
   readonly allowedValues?: readonly string[];
@@ -159,6 +165,10 @@ export interface ForeignKeyDef {
   readonly parentTableId: number;
   /** The parent's primary-key (or unique) index the reference names. */
   readonly parentIndexId: number;
+  /** Informational references survive a deliberate native parent drop. These fallback labels
+   * are refreshed before retirement; live bindings always use stable IDs, never these names. */
+  readonly parentName?: string;
+  readonly parentColumnNames?: readonly string[];
   /** The supporting index on `columnIds` (see "Rules"); null when `enforced` is false. */
   readonly supportIndexId: number | null;
   readonly onDelete: ForeignKeyAction;

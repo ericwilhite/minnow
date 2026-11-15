@@ -58,28 +58,34 @@ for (const seed of seedsFor("next-catalog-reservations", [0xb778, 0xb779]))
           const source = encodeCatalogRecord("fts", ftsDef(1, 1, 1));
           try {
             const altered = changeRecord(source.bytes, 8 + which, payload, required ? 1 : 0);
-            expect(() => decodeCatalogRecord("fts", altered)).toThrow(
-              expect.objectContaining({ code: "MINNOW_CATALOG_UNSUPPORTED" }),
-            );
+            for (const mode of ["read", "write"] as const)
+              expect(() => decodeCatalogRecord("fts", altered, mode)).toThrow(
+                expect.objectContaining({ code: "MINNOW_CATALOG_UNSUPPORTED" }),
+              );
+            reach.reach("reserved reader refused");
           } finally {
             source.close();
           }
           reach.reach(which === 0 ? "fts 8" : which === 1 ? "fts 9" : "fts 10");
           reach.reach(required ? "required" : "optional");
-          // An unreserved optional field remains display-only, byte-preserved by the codec.
-          const valid = encodeCatalogRecord("view", { id: 1, name: "v", bodySql: "SELECT 1" });
+          // Unallocated optional fields are tolerated by inspection, never rewritten.
+          const known = { id: 1, name: "v", bodySql: "SELECT 1" };
+          const valid = encodeCatalogRecord("view", known);
           try {
             const display = changeRecord(valid.bytes, 100, payload, 0);
-            const again = encodeCatalogRecord("view", decodeCatalogRecord("view", display));
-            try {
-              expect(again.bytes).toEqual(display);
-            } finally {
-              again.close();
-            }
+            const inspected = decodeCatalogRecord("view", display, "read");
+            expect(inspected).toMatchObject(known);
+            expect(() => decodeCatalogRecord("view", display)).toThrow(
+              expect.objectContaining({ code: "MINNOW_CATALOG_UNSUPPORTED" }),
+            );
+            expect(() => encodeCatalogRecord("view", inspected)).toThrow(
+              expect.objectContaining({ code: "MINNOW_CATALOG_UNSUPPORTED" }),
+            );
           } finally {
             valid.close();
           }
-          reach.reach("display retained");
+          reach.reach("optional reader tolerated");
+          reach.reach("optional writer refused");
         },
       ),
       {

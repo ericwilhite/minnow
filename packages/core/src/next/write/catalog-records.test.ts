@@ -79,16 +79,16 @@ it.each(seedsFor("next-catalog-records", [0xb750, 0xb751]))(
             expect(live).toBe(0);
             reach.reach("single charged output");
             const optional = append(encoded.bytes, fieldId, new Uint8Array([0xff, 0x00, 0x80]));
-            const restored = encodeCatalogRecord(
-              "sequence",
-              decodeCatalogRecord("sequence", optional),
+            const inspected = decodeCatalogRecord("sequence", optional, "read");
+            expect(inspected).toMatchObject(sequence);
+            reach.reach("unknown optional read only");
+            expect(() => encodeCatalogRecord("sequence", inspected)).toThrow(
+              UnsupportedCatalogError,
             );
-            try {
-              expect(restored.bytes).toEqual(optional);
-            } finally {
-              restored.close();
-            }
-            reach.reach("unknown optional retained");
+            expect(() => decodeCatalogRecord("sequence", optional)).toThrow(
+              UnsupportedCatalogError,
+            );
+            reach.reach("unknown optional writer refused");
             for (const flags of [2, 4, 8, 16, 32, 64, 128, 254])
               expect(() =>
                 decodeCatalogRecord(

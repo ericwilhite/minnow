@@ -1,10 +1,18 @@
 /** Shipped schema planner steps, translated to the same checked native changes as SQL DDL. */
 import { declaredForeignKeys, type AnyTable, type MigrationStep } from "../../engine/schema.js";
 type AnyColumn = AnyTable["columns"][string];
+import { defaultSourceOf } from "../access/catalog-default-source.js";
 import type { ColumnDefinition } from "../../engine/catalog-mutations.js";
 import type { CatalogChange, CatalogView, TableInput } from "../access/catalog.js";
 import type { Lowerer, LoweringContext } from "./lowerer.js";
-import { currentInput, defaultSqlOf, missingValue, tableInput, validateRules } from "./ddl.js";
+import {
+  backfillMetadata,
+  currentInput,
+  defaultSqlOf,
+  missingValue,
+  tableInput,
+  validateRules,
+} from "./ddl.js";
 import { declaredColumnType } from "./columns.js";
 import { PlanningError, unsupported } from "./errors.js";
 import { samePhysicalType } from "../types.js";
@@ -30,7 +38,15 @@ function create(def: AnyTable, catalog: CatalogView): CatalogChange {
       {
         name: def.name,
         managed: true,
-        columns: Object.entries(def.columns).map(([name, column]) => front(name, column)),
+        columns: Object.entries(def.columns).map(([name, column]) => {
+          const backfill = column.backfillValue;
+          return {
+            ...front(name, column),
+            ...(backfill === undefined
+              ? {}
+              : { backfill: typeof backfill === "function" ? backfill() : backfill }),
+          };
+        }),
         checks: def.checks,
         ...(def.primaryKey.length
           ? { compositePrimaryKey: def.primaryKey }
@@ -164,18 +180,21 @@ export function lowerMigrationStep(
       `${table.name}.${step.columnName}`,
       catalog,
     );
+    const defaultSource = defaultSourceOf(step.definition.defaultSpec);
     columns.push({
       name: step.columnName,
       type,
       declared,
       nullable: step.definition.isNullable,
       defaultSql: defaultSqlOf(step.definition.defaultSpec, step.columnName),
+      ...(defaultSource === undefined ? {} : { defaultSource }),
       generatedSql: null,
       identitySequence: null,
       missing:
         step.backfill === undefined
           ? null
           : missingValue({ ...widths, backfill: step.backfill }, type, catalog),
+      ...backfillMetadata(step.backfill, type),
       ...(step.definition.enumValues ? { allowedValues: step.definition.enumValues } : {}),
     });
   } else {
@@ -203,15 +222,21 @@ export function lowerMigrationStep(
         };
         break;
       }
-      case "alter-default":
+      case "alter-default": {
+        const { defaultSource: _source, ...rest } = column;
+        void _source;
+        const defaultSource = defaultSourceOf(step.defaultValue ?? undefined);
         columns[position] = {
-          ...column,
+          ...rest,
           defaultSql: defaultSqlOf(step.defaultValue ?? undefined, column.name),
+          ...(defaultSource === undefined ? {} : { defaultSource }),
         };
         break;
+      }
       case "set-auto-increment": {
-        const { autoIncrement: _auto, ...rest } = column;
+        const { autoIncrement: _auto, defaultSource: _source, ...rest } = column;
         void _auto;
+        void _source;
         columns[position] = {
           ...rest,
           identitySequence: step.enabled ? column.identitySequence : null,

@@ -3,6 +3,7 @@ import type { Catalog as SchemaCatalog, CatalogColumn } from "../../engine/catal
 import type { ColumnDefault } from "../../storage/types.js";
 import { compileDefaultExpression, compileWithDeclaredTypes } from "../../engine/query.js";
 import type { CatalogView, ColumnDef } from "../access/catalog.js";
+import { readDefaultLiteral } from "../access/catalog-default-source.js";
 import { int64At } from "../vector/int64.js";
 import { decodeUtf8 } from "../vector/varlen.js";
 import { formatDate, PG_EPOCH_UNIX_MICROS } from "../temporal.js";
@@ -12,6 +13,7 @@ import { int128At } from "../vector/int128.js";
 function backfill(column: ColumnDef): boolean | number | string | Date | undefined {
   const value = column.missing;
   if (!value || (value.validity !== null && ((value.validity[0] ?? 0) & 1) === 0)) return undefined;
+  if (column.backfillNegativeZero) return -0;
   const data = value.data;
   switch (data.layout) {
     case "bool":
@@ -52,6 +54,9 @@ function backfill(column: ColumnDef): boolean | number | string | Date | undefin
 function defaultOf(column: ColumnDef): ColumnDefault | undefined {
   if (column.identitySequence !== null) return { kind: "autoincrement" };
   if (column.defaultSql === null) return undefined;
+  if (column.defaultSource === "expression") return { kind: "expression", sql: column.defaultSql };
+  if (column.defaultSource !== undefined)
+    return { kind: "literal", value: readDefaultLiteral(column.defaultSource, column.defaultSql) };
   const expression = compileWithDeclaredTypes(() =>
     compileDefaultExpression(column.defaultSql ?? "NULL"),
   );
@@ -134,11 +139,13 @@ export function inspectCatalog(catalog: CatalogView): SchemaCatalog {
             columns: key.columnIds.map(
               (id) => table.columns.find((column) => column.id === id)?.name ?? "",
             ),
-            parentTable: parent?.name ?? `dropped:${String(key.parentTableId)}`,
+            parentTable: parent?.name ?? key.parentName ?? `dropped:${String(key.parentTableId)}`,
             parentColumns:
               index?.columnIds.map(
                 (id) => parent?.columns.find((column) => column.id === id)?.name ?? "",
-              ) ?? [],
+              ) ??
+              key.parentColumnNames ??
+              [],
             onDelete:
               key.onDelete === "setNull"
                 ? ("set null" as const)

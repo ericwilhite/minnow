@@ -1,3 +1,4 @@
+import { dateMilliseconds } from "../../date-value.js";
 /** Bounded columnar input for the SQL differential and Node baseline, outside execution timing. */
 import type { TableDef } from "../access/catalog.js";
 import { bindParameter } from "../exec/parameters.js";
@@ -99,7 +100,7 @@ export function inputBatch(
             type.kind === "timestamp"
               ? BigInt(
                   value instanceof Date
-                    ? value.getTime()
+                    ? dateMilliseconds(value)
                     : typeof value === "number"
                       ? value
                       : Date.parse(String(value)),

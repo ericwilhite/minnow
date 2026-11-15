@@ -14,9 +14,13 @@ import type {
   TableDef,
   TableInput,
 } from "../access/catalog.js";
+import { normalizedColumnBackfill } from "../../engine/catalog-mutations.js";
+import { floatLiteral, timestampLiteral } from "./literals.js";
+import { timestampFromDate } from "../temporal.js";
 import type { CompiledStatement, ForeignKeyDefinition } from "../../engine/query.js";
 import { compileCheckExpression, compileWithDeclaredTypes } from "../../engine/query.js";
-import type { ColumnDefault } from "../../storage/types.js";
+import { validateColumnDefault, type ColumnDefault } from "../../storage/types.js";
+import { defaultLiteralSql, defaultSourceOf } from "../access/catalog-default-source.js";
 import {
   ENUM_LABEL_LIMIT,
   ENUM_LABEL_BYTES,
@@ -60,19 +64,11 @@ export interface TableDefinition {
   }>;
 }
 
-function sqlConstant(value: boolean | number | string | Date): string {
-  if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
-  if (typeof value === "number")
-    return Number.isFinite(value) ? String(value) : `'${String(value)}'`;
-  const text = value instanceof Date ? value.toISOString() : value;
-  return `'${text.replaceAll("'", "''")}'`;
-}
-
 export function defaultSqlOf(value: ColumnDefault | undefined, _column: string): string | null {
   void _column;
   if (value === undefined) return null;
   if (value.kind === "autoincrement") return null; // The owned sequence is declared separately.
-  return value.kind === "literal" ? sqlConstant(value.value) : value.sql;
+  return value.kind === "literal" ? defaultLiteralSql(value.value) : value.sql;
 }
 
 /**
@@ -239,16 +235,31 @@ export function tableInput(
       type.kind !== "int64"
     )
       throw new PlanningError("identity column type must be smallint, integer, or bigint", "22023");
+    if (source === "schema" && front.defaultValue !== undefined)
+      validateColumnDefault(
+        {
+          ...front,
+          nullable: front.nullable === true,
+          isUniqueKey:
+            definition.uniqueKey === front.name ||
+            (definition.compositePrimaryKey?.length === 1 &&
+              definition.compositePrimaryKey[0] === front.name),
+        },
+        front.defaultValue,
+      );
     const namedType = type.kind === "enum" ? catalog.typeByName(type.name) : undefined;
+    const defaultSource = defaultSourceOf(front.defaultValue);
     return {
       name: front.name,
       type,
       declared,
       nullable: front.nullable === true,
       defaultSql: defaultSqlOf(front.defaultValue, front.name),
+      ...(defaultSource === undefined ? {} : { defaultSource }),
       generatedSql: front.generatedValue?.sql ?? null,
       identitySequence: null,
-      missing: null,
+      missing: missingValue(front, type, catalog),
+      ...backfillMetadata(front.backfill, type),
       ...(front.defaultValue?.kind === "autoincrement"
         ? { identity: { start: 1n, increment: 1n } }
         : {}),
@@ -497,20 +508,51 @@ function rulesState(catalog: CatalogView): ExpressionState {
   };
 }
 
-/** The `missing` value of an added column: its constant default, when lowering knows it exactly. */
+/** Source metadata cannot live in a SQL integer vector, whose zero has no sign. */
+export function backfillMetadata(
+  value: unknown,
+  type: PhysicalType,
+): { backfillNegativeZero?: true } {
+  return Object.is(value, -0) && (type.kind === "int32" || type.kind === "int64")
+    ? { backfillNegativeZero: true }
+    : {};
+}
+
+/** Frozen API/ALTER backfill, never the current insert default. Runtime-only casts refuse. */
 export function missingValue(
   column: FrontEndColumn,
   type: PhysicalType,
   catalog: CatalogView,
 ): FlatVector | null {
   if (column.backfill === undefined) return null;
+  if (column.generatedValue !== undefined)
+    throw new PlanningError(
+      `A generated column cannot also have a backfill: ${column.name}`,
+      "42601",
+    );
+  // Validation uses resolved enum labels; the front end leaves a named type's labels empty.
+  // Domain normalizers return the old engine's tagged representation, which is never a
+  // native literal. Keep the source spelling for native coercion after validating it.
+  normalizedColumnBackfill(
+    type.kind === "enum" && column.sqlDomain?.kind === "enum"
+      ? { ...column, sqlDomain: { ...column.sqlDomain, values: [...type.labels] } }
+      : column,
+    column.backfill,
+  );
+  const value = column.backfill;
+  // API numbers are already Float64 values, not SQL NUMERIC spellings. Preserve their
+  // declared physical type without requiring a runtime cast of a fabricated SQL literal.
+  if (typeof value === "number" && type.kind === "float64") {
+    const literal = floatLiteral(value, type);
+    if (literal.op === "literal") return literal.value;
+  }
+  if (value instanceof Date && type.kind === "timestamp") {
+    const literal = timestampLiteral(timestampFromDate(value), type.zoned);
+    if (literal.op === "literal") return literal.value;
+  }
   const state = rulesState(catalog);
   const typed = coerce(
-    lowerExpression(
-      { kind: "literal", value: column.backfill },
-      { column: () => undefined },
-      state,
-    ),
+    lowerExpression({ kind: "literal", value }, { column: () => undefined }, state),
     type,
     "assignment",
     state.parameters,
@@ -617,15 +659,18 @@ export function lowerDdl(statement: NativeStatement, catalog: CatalogView): DdlR
       const { type, declared } = declaredColumnType(front, `${table.name}.${front.name}`, catalog);
       const { columns, input } = currentInput(table);
       const namedType = type.kind === "enum" ? catalog.typeByName(type.name) : undefined;
+      const defaultSource = defaultSourceOf(front.defaultValue);
       const added = {
         name: front.name,
         type,
         declared,
         nullable: front.nullable === true,
         defaultSql: defaultSqlOf(front.defaultValue, front.name),
+        ...(defaultSource === undefined ? {} : { defaultSource }),
         generatedSql: null,
         identitySequence: null,
         missing: missingValue(front, type, catalog),
+        ...backfillMetadata(front.backfill, type),
         ...(namedType === undefined ? {} : { typeId: namedType.id }),
       };
       const next: TableInput = { ...input, columns: [...columns, added] };
