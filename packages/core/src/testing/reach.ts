@@ -8979,6 +8979,10 @@ export const CANONICAL_REFUSAL_REACH = [
 ] as const;
 
 export const NATIVE_PROFILE_REACH = [
+  "required catalog field",
+  "read-optional field",
+  "catalog wire type",
+  "required feature",
   "assigned vocabulary",
   "unassigned nested vocabulary",
   "unassigned reader",

@@ -1025,7 +1025,7 @@ export const NATIVE_READER_PROFILES: Readonly<
     }
   >
 > = Object.freeze({
-  7: Object.freeze({ manifest: 8, vocabulary: 2414547993 }),
+  7: Object.freeze({ manifest: 8, vocabulary: 2967629971 }),
 });
 
 function canonicalVocabulary(value: unknown): string {
@@ -1039,9 +1039,15 @@ function canonicalVocabulary(value: unknown): string {
 }
 
 /** FNV-1a is a source-vocabulary guard, NOT an on-disk checksum or an integrity boundary.
- * Catalog field layouts are deliberately absent: B6 assigns their separate reader/writer
- * requirements; an optional display field may need only a writer gate. Closed tags do not. */
-export function nativeVocabularyFingerprint(): number {
+ * Required catalog field IDs/codecs participate. Read-optional fields need only a writer gate;
+ * their source property names are not durable tags. B6 owns their capability classification. */
+export function nativeVocabularyFingerprint(
+  schemas: Readonly<Record<string, readonly string[]>> = CATALOG_RECORD_SCHEMAS,
+  features: ReadonlyArray<{
+    readonly id: number;
+    readonly section: number;
+  }> = CATALOG_REQUIRED_FEATURES,
+): number {
   const formats = Object.fromEntries(
     Object.entries(DURABLE_FORMATS)
       .filter(([name]) => name !== "indexedDb" && !name.startsWith("snapshot"))
@@ -1067,6 +1073,17 @@ export function nativeVocabularyFingerprint(): number {
     codecs,
     catalog: CATALOG_NATIVE_GRAMMAR,
     records: CATALOG_RECORD_KINDS,
+    features,
+    readerFields: Object.fromEntries(
+      Object.entries(schemas).map(([name, fields]) => [
+        name,
+        fields.flatMap((field, index) =>
+          field.includes("~") && !field.endsWith("!")
+            ? []
+            : [{ id: index + 1, codec: field.slice(field.indexOf(":") + 1) }],
+        ),
+      ]),
+    ),
     fts: FTS_NATIVE_GRAMMAR,
     reserved: RESERVED_MASKS,
     conditional: CONDITIONAL_FORMAT,

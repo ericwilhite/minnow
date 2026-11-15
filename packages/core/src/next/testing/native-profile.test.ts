@@ -4,6 +4,8 @@ import { expect, it } from "vitest";
 import { createReach, NATIVE_PROFILE_REACH } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import {
+  CATALOG_RECORD_SCHEMAS,
+  CATALOG_REQUIRED_FEATURES,
   DURABLE_READER_VERSION,
   MANIFEST_FORMAT_VERSION,
   NATIVE_READER_PROFILES,
@@ -14,7 +16,7 @@ import {
 // Independent ledger pin: changing the grammar's fingerprint on an existing profile must not
 // make a new nested tag look compatible. Before 1.0 these are development bytes; first frozen
 // fixtures will pin the agreed released profiles and all later entries are append-only.
-const known = { 7: { manifest: 8, vocabulary: 2414547993 } };
+const known = { 7: { manifest: 8, vocabulary: 2967629971 } };
 for (const seed of seedsFor("next-native-profile", [0xb2a1, 0xb2a2]))
   it(`refuses an unassigned native vocabulary before acquisition seed ${String(seed)}`, () => {
     const reach = createReach("outer native profile binding", NATIVE_PROFILE_REACH);
@@ -49,6 +51,44 @@ for (const seed of seedsFor("next-native-profile", [0xb2a1, 0xb2a2]))
             requireNativeReaderProfile(DURABLE_READER_VERSION, unsupported, vocabulary),
           ).toThrow(expect.objectContaining({ code: "MINNOW_FORMAT_UNSUPPORTED" }));
           reach.reach("manifest mismatch");
+          const required = {
+              ...CATALOG_RECORD_SCHEMAS,
+              table: [...CATALOG_RECORD_SCHEMAS.table, "future:u~!"],
+            },
+            optional = {
+              ...CATALOG_RECORD_SCHEMAS,
+              table: [...CATALOG_RECORD_SCHEMAS.table, "future:u~"],
+            },
+            changedWire = {
+              ...CATALOG_RECORD_SCHEMAS,
+              table: CATALOG_RECORD_SCHEMAS.table.map((field, at) => (at === 0 ? "id:s" : field)),
+            };
+          for (const changed of [
+            nativeVocabularyFingerprint(required),
+            nativeVocabularyFingerprint(changedWire),
+            nativeVocabularyFingerprint(CATALOG_RECORD_SCHEMAS, [
+              ...CATALOG_REQUIRED_FEATURES,
+              { id: unsupported, section: 3 },
+            ]),
+          ]) {
+            expect(changed).not.toBe(vocabulary);
+            expect(() =>
+              requireNativeReaderProfile(DURABLE_READER_VERSION, MANIFEST_FORMAT_VERSION, changed),
+            ).toThrow(expect.objectContaining({ code: "MINNOW_FORMAT_UNSUPPORTED" }));
+          }
+          expect(nativeVocabularyFingerprint(optional)).toBe(vocabulary);
+          expect(
+            nativeVocabularyFingerprint({
+              ...CATALOG_RECORD_SCHEMAS,
+              table: CATALOG_RECORD_SCHEMAS.table.map((field, at) =>
+                at === 0 ? "renamedId:u" : field,
+              ),
+            }),
+          ).toBe(vocabulary);
+          reach.reach("required catalog field");
+          reach.reach("read-optional field");
+          reach.reach("catalog wire type");
+          reach.reach("required feature");
         },
       ),
       { seed, numRuns: 32 },
