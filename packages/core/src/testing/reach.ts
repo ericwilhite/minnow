@@ -8063,6 +8063,60 @@ export const REGISTRY_FRAGMENT_CORRUPTION_REACH = [
   "zero ownership",
 ] as const;
 
+export const REGISTRY_SCALAR_REACH = [
+  "bool",
+  "i32",
+  "f32",
+  "f64",
+  "int64",
+  "fixed16",
+  "interval",
+  "varlen",
+  "decimal",
+  "decimal safe",
+  "decimal int64",
+  "decimal int128",
+  "decimal wide",
+  "flat",
+  "constant",
+  "dictionary",
+  "NULL",
+  "non-NULL",
+  "payload above scratch",
+  "wide coefficient above fragment",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_IMAGES_REACH = [
+  "INSERT images",
+  "UPDATE images",
+  "DELETE images",
+  "full physical row",
+  "projected stable IDs",
+  "unread is not NULL",
+  "large unrelated payload skipped",
+  "duplicate bindings alias",
+  "caller source retired",
+  "wide row replay",
+  "foreign root refused",
+  "two files independent of rows",
+  "fixed frozen minimum",
+  "zero ownership",
+] as const;
+export const REGISTRY_IMAGES_LIFETIME_REACH = [
+  "close waits lease",
+  "lease charge survives close",
+  "caller cancels prepare",
+  "close cancels prepare",
+  "zero ownership",
+] as const;
+export const REGISTRY_IMAGES_IO_REACH = [
+  "close cancels read",
+  "caller cancels read",
+  "charge survives payload IO",
+  "no read after cancel",
+  "zero ownership",
+] as const;
 export const REGISTRY_TARGET_REACH = [
   "parent swap captures",
   "updated once",
@@ -8090,5 +8144,13 @@ export const REGISTRY_IMAGES_WIDE_REACH = [
   "wide source retired",
   "projected wide payload skipped",
   "exact tier and scale",
+  "zero ownership",
+] as const;
+export const REGISTRY_IMAGES_WORKSPACE_REACH = [
+  "many wide columns",
+  "shared decode scratch",
+  "exact retained buffers",
+  "negative coefficients",
+  "positive coefficients",
   "zero ownership",
 ] as const;

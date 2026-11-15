@@ -4139,3 +4139,19 @@ it retired. Replaying an earlier captured range resolves those identities rather
 up rewritten FK values. Empty ranges stay independently replayable. Callers must capture all
 original `follow` matches before applying any follow action. This component neither finds FK
 matches nor schedules writes; those remain native-provider integration work.
+
+`write/registry-images.ts` and `registry-scalar.ts` capture immutable physical OLD/NEW
+vectors in that scratch layout. Full leases return one row; projected leases resolve stable
+column IDs and leave other columns explicitly `ROW_IMAGE_UNREAD`, never SQL NULL. The
+fixed image helper remains 30 KiB directory + 2 KiB image metadata + two 64 KiB buffers.
+Only requested payloads are decoded. Scalar tiers, NULLs, numeric scales/specials and exact
+int64/interval lanes survive capture and replay. Retained buffers are charged separately
+from one shared transient NUMERIC decoder workspace; column count does not multiply that
+workspace. Encode scratch is prepaid before capture. Release clears vector arrays before
+refunding them; close cancels progress waits and fences payload I/O and active leases.
+
+These image components use the frozen consumer ABI and pass through the real typed trigger
+binding copier in component tests. They still do not install a native statement provider or
+turn on SQL firing. The caller supplies admitted scope/progress and immutable table metadata;
+statement/command ownership, row rules, accepted-write hooks and deferred RI execution are
+separate integration responsibilities.
