@@ -4,9 +4,9 @@ import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, SNAPSHOT_RETIRE_CURRENT_REACH } from "../../testing/reach.js";
 import { Governor } from "../memory/governor.js";
-import { MemoryBackend } from "./memory-store.js";
-import { openExtentSpace } from "./space.js";
-import { jsonReachable, rootOf, bytesOf } from "./space-test-support.js";
+import { MemoryBackend } from "../storage/memory-store.js";
+import { openExtentSpace } from "../storage/space.js";
+import { jsonReachable, rootOf, bytesOf } from "../storage/space-test-support.js";
 for (const seed of seedsFor("next-retire-current-root", [0xb26d, 0xb26e]))
   it(`proves replacement claims without weakening R8 seed ${String(seed)}`, async () => {
     const reach = createReach("whole root retirement", SNAPSHOT_RETIRE_CURRENT_REACH);
