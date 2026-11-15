@@ -18,6 +18,14 @@ export function requireWritableCatalog(value: unknown): void {
  */
 export function requireWritableCatalogInput(value: unknown, depth = 0): void {
   requireWritableCatalog(value);
+  if (
+    depth === 0 &&
+    (typeof value !== "object" ||
+      value === null ||
+      Array.isArray(value) ||
+      ArrayBuffer.isView(value))
+  )
+    throw new StoreCorruptionError("Invalid catalog input record");
   if (typeof value !== "object" || value === null || ArrayBuffer.isView(value)) return;
   // The wire grammar caps nesting at32. Allow entry wrappers too, but reject cyclic/malformed
   // input without a graph-sized, uncharged visited set or an unbounded recursive walk.
@@ -27,9 +35,16 @@ export function requireWritableCatalogInput(value: unknown, depth = 0): void {
     // eslint-disable-next-line @typescript-eslint/prefer-for-of
     for (let i = 0; i < value.length; i++) requireWritableCatalogInput(value[i], depth + 1);
   } else {
-    const record = value as Record<string, unknown>;
-    for (const key of Object.getOwnPropertyNames(value))
-      requireWritableCatalogInput(record[key], depth + 1);
+    // DDL reads inherited properties too. A fresh wrapper can inherit an inspected operand
+    // without copying it, even non-enumerably. Check values as the planner resolves them.
+    let source: object | null = value;
+    for (let hops = 0; source !== null && source !== Object.prototype; hops++) {
+      if (hops > 64)
+        throw new StoreCorruptionError("Catalog input prototype nesting exceeds its cap");
+      for (const key of Object.getOwnPropertyNames(source))
+        requireWritableCatalogInput(Reflect.get(value, key), depth + 1);
+      source = Reflect.getPrototypeOf(source);
+    }
   }
 }
 export class UnsupportedCatalogError extends Error {

@@ -7240,6 +7240,10 @@ export const CATALOG_INSPECTION_INPUT_REACH = [
   "createTrigger",
   "fresh replay wrapper",
   "source unchanged",
+  "own",
+  "inherited",
+  "hidden inherited",
+  "invalid root refuses",
 ] as const;
 
 export const CATALOG_INSPECTION_NESTED_REACH = [

@@ -139,6 +139,15 @@ function inspect(
 function refuses(work: () => unknown): void {
   expect(work).toThrow(expect.objectContaining({ code }));
 }
+const layouts = ["own", "inherited", "hidden inherited"] as const;
+function wrapper<T extends object>(value: T, layout: (typeof layouts)[number]): T {
+  if (layout === "own") return value;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (layout === "hidden inherited")
+    for (const descriptor of Object.values(descriptors)) descriptor.enumerable = false;
+  const prototype = Object.create(null, descriptors) as object;
+  return Object.create(prototype) as T;
+}
 for (const seed of seedsFor("next-catalog-inspection-input", [0xb808, 0xb809]))
   it(`refuses inspection operands before every planning/replay copy seed ${String(seed)}`, () => {
     const reach = createReach("catalog inspection operands", CATALOG_INSPECTION_INPUT_REACH);
@@ -148,14 +157,15 @@ for (const seed of seedsFor("next-catalog-inspection-input", [0xb808, 0xb809]))
         fc.integer({ min: 1, max: 10000 }),
         fc.integer({ min: 100, max: Number.MAX_SAFE_INTEGER }),
         fc.uint8Array({ maxLength: 40 }),
-        (at, suffix, tag, payload) => {
+        fc.constantFrom(...layouts),
+        (at, suffix, tag, payload, layout) => {
           reach.beginHistory();
           const { base, entries } = inputs(suffix),
             entry = entries[at];
           if (!entry) throw new Error("missing change input");
           const before = base.encode(),
             version = base.version + 1,
-            control = base.change(entry.change, version),
+            control = base.change(wrapper(entry.change, layout), version),
             logged = control.logged.find((l) => entry.operand in l);
           if (!logged) throw new Error("missing logged operand");
           // The control proves validity independently of provenance; encode/reopen must still work.
@@ -167,13 +177,27 @@ for (const seed of seedsFor("next-catalog-inspection-input", [0xb808, 0xb809]))
           // fields in place, retaining the decoder's identity/provenance (not any opaque bytes).
           for (const name of Object.keys(inspected)) Reflect.deleteProperty(inspected, name);
           Object.assign(inspected, object(entry.change)[entry.operand]);
-          refuses(() => base.change({ ...entry.change, [entry.operand]: inspected }, version));
+          refuses(() =>
+            base.change(wrapper({ ...entry.change, [entry.operand]: inspected }, layout), version),
+          );
           reach.reach(entry.change.kind);
+          reach.reach(layout);
+          // Decorated arrays/functions are not record envelopes. They must not hide operands
+          // behind the walk's array-payload/primitive shortcuts before planning can copy them.
+          const command = { ...entry.change, [entry.operand]: inspected };
+          for (const invalid of [
+            Object.assign([], command),
+            Object.assign(() => undefined, command),
+          ])
+            expect(() => base.change(invalid, version)).toThrow(
+              expect.objectContaining({ code: "MINNOW_STORE_CORRUPT" }),
+            );
+          reach.reach("invalid root refuses");
           const replay: LoggedChange = {
             ...logged,
             [entry.operand]: inspect(entry.kind, wireValue, tag, payload),
           };
-          refuses(() => base.apply(replay, version));
+          refuses(() => base.apply(wrapper(replay, layout), version));
           reach.reach("fresh replay wrapper");
           expect(base.encode()).toEqual(before);
           reach.reach("source unchanged");
@@ -181,11 +205,19 @@ for (const seed of seedsFor("next-catalog-inspection-input", [0xb808, 0xb809]))
       ),
       {
         seed,
-        numRuns: 32,
-        examples: Array.from(
-          { length: 11 },
-          (_, at) => [at, at + 1, 100, Uint8Array.of(at)] as [number, number, number, Uint8Array],
-        ),
+        numRuns: 48,
+        examples: Array.from({ length: 11 }, (_, at) =>
+          layouts.map(
+            (layout) =>
+              [at, at + 1, 100, Uint8Array.of(at), layout] as [
+                number,
+                number,
+                number,
+                Uint8Array,
+                (typeof layouts)[number],
+              ],
+          ),
+        ).flat(),
       },
     );
     reach.assertReached();
@@ -268,17 +300,20 @@ it("refuses nested inspection before constructing or allocating a stored catalog
   if (!view) throw new Error("missing view");
   const input = { ...data, views: [inspect("view", view, 100, Uint8Array.of(1))] } as typeof data;
   let calls = 0;
-  refuses(() => new Catalog(input));
-  refuses(() =>
-    Catalog.fromStored(input, {
-      allocate() {
-        calls++;
-        return true;
-      },
-      free() {
-        calls++;
-      },
-    }),
-  );
-  expect(calls).toBe(0);
+  for (const layout of layouts) {
+    const carried = wrapper(input, layout);
+    refuses(() => new Catalog(carried));
+    refuses(() =>
+      Catalog.fromStored(carried, {
+        allocate() {
+          calls++;
+          return true;
+        },
+        free() {
+          calls++;
+        },
+      }),
+    );
+    expect(calls).toBe(0);
+  }
 });
