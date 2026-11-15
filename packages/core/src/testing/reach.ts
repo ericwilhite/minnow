@@ -8209,6 +8209,18 @@ export const NATIVE_COMMAND_CHECK_LIFETIME_REACH = [
   "no cursor after cancellation",
   "zero ownership",
 ] as const;
+export const PREPARED_ROW_CREDIT_REACH = [
+  "one prepared slot",
+  "owner close refuses live step",
+  "reclaim keeps floor",
+  "merge keeps floor",
+  "metadata transfer keeps floor",
+  "cancel before consumption",
+  "native allocations survive reservation release",
+  "idempotent retirement",
+  "idle floor returned",
+  "zero ownership",
+] as const;
 export const NATIVE_COMMAND_CHECK_CONSTRUCTION_REACH = [
   "digit scratch fault",
   "key buffer fault",

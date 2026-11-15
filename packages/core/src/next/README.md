@@ -4176,3 +4176,10 @@ versions do not produce reference failures. A private fixed account also returns
 key buffers when construction fails. Generated tests compare real native key checks against
 PGlite and shipped success/failure, including published sources and successive accepted writes.
 This checker is a provider component; it does not execute RI actions or install SQL firing.
+
+`write/credits.ts` also provides a prepared-row reservation for the forthcoming native
+primary adapter. The root funds writer growth first, then protects that already admitted
+headroom before borrowing an image. One paid 256-byte token keeps reclaim and metadata/merge
+transfers from consuming the next primary step. Releasing the token preserves charges for
+accepted native buffers; owner close requires the step to be retired. This facility has no
+DML caller yet and does not perform admission or change existing write scheduling.

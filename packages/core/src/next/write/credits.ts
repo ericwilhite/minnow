@@ -7,6 +7,15 @@ import { GrantClosedError } from "../memory/governor.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { releaseIdle } from "./budget.js";
 
+/** Fixed bookkeeping for the one prepared native row step. */
+export const WRITE_ROW_STEP_BYTES = 256;
+export interface PreparedWriteCredit {
+  /** Fails after consumption/owner cancellation; it never requests admission. */
+  check(): void;
+  /** Return only the reservation. Accepted native buffers keep their own charge. */
+  release(): void;
+}
+
 export interface WriteMinimum {
   readonly rows: number;
   readonly metadata: number;
@@ -24,6 +33,9 @@ export class WriteCredits {
   #closed = false;
   #mergeActive: Grant | null = null;
   #metadataHeadroom = 0;
+  #rowFloor = 0;
+  #rowStep = 0;
+  #nextRowStep = 0;
 
   private constructor(
     readonly governor: MemoryGovernor,
@@ -75,7 +87,41 @@ export class WriteCredits {
 
   /** Return idle estimates only; live buffers, public loans and the row working minimum stay. */
   reclaimRows(): number {
-    return releaseIdle(this.rows, this.minimum.rows);
+    return releaseIdle(this.rows, Math.max(this.minimum.rows, this.#rowFloor));
+  }
+
+  /** Protect already admitted writer progress BEFORE opening the root's image lease.
+   * No admission/loan here. One primary step at a time; producers have released their
+   * progress before the caller funds this headroom. Reclaim/metadata/merge transfers
+   * may use other idle rows, never this step's floor. Release before owner close. */
+  protectRows(bytes: number): PreparedWriteCredit {
+    this.#check();
+    if (
+      this.#rowStep !== 0 ||
+      !Number.isSafeInteger(bytes) ||
+      bytes < 0 ||
+      !Number.isSafeInteger(this.#nextRowStep + 1) ||
+      this.rows.held - this.rows.allocated - this.rows.loaned < bytes + WRITE_ROW_STEP_BYTES
+    )
+      throw new RangeError("Prepared row progress must already be admitted");
+    if (!this.rows.allocate(WRITE_ROW_STEP_BYTES))
+      throw new RangeError("Row progress metadata must be admitted");
+    const id = ++this.#nextRowStep;
+    this.#rowStep = id;
+    this.#rowFloor = this.rows.allocated + this.rows.loaned + bytes;
+    let released = false;
+    return {
+      check: () => {
+        this.#check();
+        if (released || this.#rowStep !== id) throw new GrantClosedError("prepared row progress");
+      },
+      release: () => {
+        if (released) return;
+        released = true;
+        this.#rowStep = this.#rowFloor = 0;
+        this.rows.free(WRITE_ROW_STEP_BYTES);
+      },
+    };
   }
 
   /** Keep the next metadata step prepaid in addition to actual native live allocations. */
@@ -106,7 +152,8 @@ export class WriteCredits {
       const missing = wanted - grant.held;
       if (missing <= 0) return;
       const idle =
-        this.rows.held - Math.max(this.minimum.rows, this.rows.allocated + this.rows.loaned);
+        this.rows.held -
+        Math.max(this.minimum.rows, this.rows.allocated + this.rows.loaned, this.#rowFloor);
       const moved = grant === this.rows ? 0 : Math.min(missing, Math.max(0, idle));
       if (moved > 0 && !this.governor.transferCredit(this.rows, grant, moved))
         throw new Error("Idle write credit was not transferred");
@@ -159,7 +206,8 @@ export class WriteCredits {
       // then return all remaining idle estimates globally. The active merge keeps its minimum.
       const idle = Math.max(
         0,
-        this.rows.held - Math.max(this.minimum.rows, this.rows.allocated + this.rows.loaned),
+        this.rows.held -
+          Math.max(this.minimum.rows, this.rows.allocated + this.rows.loaned, this.#rowFloor),
       );
       const returned = Math.min(bytes, idle);
       if (returned > 0) {
@@ -201,7 +249,7 @@ export class WriteCredits {
   /** Closing readers may inherit the existing row account, without re-admission/copying. */
   close({ keepRowsForReaders = false }: { readonly keepRowsForReaders?: boolean } = {}): void {
     if (this.#closed) return;
-    if (this.#mergeActive)
+    if (this.#mergeActive || this.#rowStep !== 0)
       throw new Error("Native write steps must settle before their accounts close");
     this.#closed = true;
     this.cancel(new GrantClosedError("write owner minimum"));
