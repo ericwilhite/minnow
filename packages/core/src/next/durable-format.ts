@@ -916,6 +916,15 @@ export const RESERVED_MASKS = {
   runEntry: 1,
 } as const;
 
+/** Conditional reserved fields cannot be unconditional header masks: aux is assigned by
+ * varlen/dictionary/scaled-float/uniform-scale layouts; decimal alone owns directory bit2. */
+export const CONDITIONAL_FORMAT = {
+  unusedPageAux: 0,
+  nondecimalDirectoryFlags: 3,
+  sketchMaximumRank: 33 - DURABLE_CODECS.sketchPrecision,
+  sparseSketchOrder: "strictly-increasing",
+} as const;
+
 export const PAGE_CODEC = {
   deltaRows: 128,
   scaledFloatMaxExponent: 15,
@@ -990,5 +999,6 @@ freeze(DURABLE_CODECS);
 freeze(PRIVATE_FORMATS);
 Object.freeze(RUN_CODEC);
 Object.freeze(RESERVED_MASKS);
+Object.freeze(CONDITIONAL_FORMAT);
 Object.freeze(PAGE_CODEC);
 Object.freeze(LARGE_CODEC);

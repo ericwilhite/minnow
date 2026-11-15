@@ -28,7 +28,7 @@
  * plain varlen pages only) lies between the previous page and its own: the page's pointers must
  * tile it (decode.ts `parsePage`), so no value aliases another or a page (review B2-p2b #1).
  */
-import { DURABLE_FORMATS, requireHeader } from "../durable-format.js";
+import { CONDITIONAL_FORMAT, DURABLE_FORMATS, requireHeader } from "../durable-format.js";
 import type { PageEntry, StatValue } from "../format/manifest.js";
 import { PageEncoding } from "../format/manifest.js";
 import { NUMERIC_MAX_SCALE } from "../types.js";
@@ -331,6 +331,10 @@ export function parseDirectory(bytes: Uint8Array, extentLength: number): ChunkDi
   check(tag >= ValueTag.bool && tag <= ValueTag.dec64, "Bad chunk tag");
   const flags = reader.u8();
   check((flags & ~7) === 0 && reader.u8() === 0, "Bad page directory flags");
+  check(
+    (flags & ~CONDITIONAL_FORMAT.nondecimalDirectoryFlags) === 0 || tag === ValueTag.dec64,
+    "Specials outside a decimal chunk",
+  );
   const rowCount = reader.u32();
   const pageCount = reader.u32();
   const stored = reader.u32();

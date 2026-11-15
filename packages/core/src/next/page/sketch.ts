@@ -1,7 +1,7 @@
 /**
  * The distinct-count sketch of a column chunk: HyperLogLog with 2^10 one-byte registers
- * (standard error ≈ 3.3 %), mergeable by register maximum. Approximate: it feeds planning and
- * the cost model, never pruning or correctness.
+ * (standard error ≈ 3.3 %), mergeable by register maximum. Available for approximate planning and
+ * cost estimates, never pruning or correctness; current execution does not read these bodies.
  *
  * Values are hashed by SQL equality within one column: −0 = 0 and every NaN is one value for
  * floats, `1 mon` = `30 days` for intervals, and a decimal coefficient hashes the same whatever
@@ -11,7 +11,7 @@
  * Serialized form: u8 precision (10), u8 form (0 dense, 1 sparse), u16 entry count; dense is the
  * 1,024 registers, sparse is `count` × (u16 register, u8 value) for the non-zero registers.
  */
-import { requireHeader, DURABLE_CODECS } from "../durable-format.js";
+import { requireHeader, DURABLE_CODECS, CONDITIONAL_FORMAT } from "../durable-format.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { check, PageCorruptionError } from "./format.js";
 
@@ -116,14 +116,25 @@ export class DistinctSketch {
     const sketch = new DistinctSketch();
     if (form === 0) {
       check(count === REGISTERS && bytes.length === 4 + REGISTERS, "Bad dense sketch");
-      sketch.registers.set(bytes.subarray(4));
+      // Validate while copying: no second pass or additional buffer.
+      for (let index = 0; index < REGISTERS; index++) {
+        const value = bytes[4 + index] ?? 0;
+        check(value <= CONDITIONAL_FORMAT.sketchMaximumRank, "Bad dense sketch rank");
+        sketch.registers[index] = value;
+      }
     } else {
       check(form === 1 && bytes.length === 4 + count * 3, "Bad sparse sketch");
+      let previous = -1;
       for (let k = 0; k < count; k++) {
         const at = 4 + k * 3;
         const index = (bytes[at] ?? 0) | ((bytes[at + 1] ?? 0) << 8);
         const value = bytes[at + 2] ?? 0;
-        check(index < REGISTERS && value > 0 && value <= 33 - SKETCH_PRECISION, "Bad sketch entry");
+        check(
+          index < REGISTERS && value > 0 && value <= CONDITIONAL_FORMAT.sketchMaximumRank,
+          "Bad sketch entry",
+        );
+        check(index > previous, "Sparse sketch registers are not strictly increasing");
+        previous = index;
         sketch.registers[index] = value;
       }
     }

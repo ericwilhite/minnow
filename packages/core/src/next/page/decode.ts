@@ -15,7 +15,7 @@
  * nulls (`RangeError` otherwise: the caller sizes and allocates from the directory statistics).
  * An int64-family target in the `safe` representation is allowed only for pages flagged safe.
  */
-import { requireHeader } from "../durable-format.js";
+import { requireHeader, CONDITIONAL_FORMAT } from "../durable-format.js";
 import type { PageEntry } from "../format/manifest.js";
 import { PageEncoding } from "../format/manifest.js";
 import type { FlatVector, Int64Values, Validity, VectorData } from "../vector/vector.js";
@@ -238,6 +238,16 @@ export function parsePage(
       ((kind === PageEncoding.constant || kind === PageEncoding.dictionary) && width === 0),
     "All-null page with a payload",
   );
+
+  // Aux is reserved-zero unless this exact layout assigns it a meaning. In particular an
+  // all-NULL header has no value/code/scale payload to describe. NULL scalar bytes stay free.
+  const usesAux =
+    !allNull &&
+    (kind === PageEncoding.dictionary ||
+      kind === PageEncoding.scaledFloat ||
+      uniformScale ||
+      (tag === ValueTag.varlen && (kind === PageEncoding.plain || kind === PageEncoding.constant)));
+  check(usesAux || (aux & ~CONDITIONAL_FORMAT.unusedPageAux) === 0, "Nonzero unused page aux");
 
   let at = PAGE_HEADER_BYTES;
   let validity: Uint32Array | null = null;

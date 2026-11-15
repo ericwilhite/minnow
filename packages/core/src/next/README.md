@@ -460,6 +460,13 @@ bits21..23 and manifest-format minus2 in bits24..31. Zero selects reader1/manife
 bytes and charges stay unchanged. The first released1.0 writer starts the supported fixture
 and automatic-upgrade chain. The shipped0.x engine is unchanged.
 
+Page aux is reserved-zero except where the active layout assigns a byte count, dictionary code,
+scale or exponent. Nondecimal directories cannot claim decimal specials. HLL dense registers
+are 0..23; sparse entries have ranks 1..23 and strictly increasing unique register IDs. These
+checks run during the existing parse/copy loop. Scalar payloads beneath NULLs remain don't-care;
+sparse versus dense HLL is a packing choice, so both valid forms are readable at any density.
+The current executor does not consume stored HLL bodies; callers must parse before using them.
+
 Group deletion bitmaps inherit the enclosing group-page version. They store exactly
 `ceil(rowCount / 32)` little-endian u32 words, with unused high bits zero. Cache-hit and
 async readers validate length and tail bits before creating their owned word copy; malformed
