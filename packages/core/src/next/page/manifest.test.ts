@@ -129,6 +129,7 @@ describe("manifest metadata end to end", () => {
     const empty: BlobRef = { extent: { offset: 0, length: 0 }, offset: 0, length: 0, checksum: 0 };
     const root: ManifestRoot = {
       formatVersion: MANIFEST_FORMAT_VERSION,
+      fts: { checkpoint: null, staged: null },
       sequence: 1,
       epoch: 1,
       log: { salt: 7, firstLsn: 1, rootSequence: 1 },
@@ -255,6 +256,7 @@ describe("manifest metadata end to end", () => {
     const found = await reachable(
       {
         formatVersion: MANIFEST_FORMAT_VERSION,
+        fts: { checkpoint: null, staged: null },
         sequence: 1,
         epoch: 1,
         log: { salt: 1, firstLsn: 1, rootSequence: 1 },

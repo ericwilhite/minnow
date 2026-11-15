@@ -464,6 +464,14 @@ export interface CommitFrameBody {
 }
 
 export type BodyEffect =
+  | { readonly kind: "ftsMutation"; readonly tableId: number; readonly schemaVersion: number }
+  | {
+      readonly kind: "fts";
+      readonly transaction: number;
+      readonly rootSequence: number;
+      /** Sealed synchronously with the commit LSN, after every preparation/encoding wait. */
+      readonly invalidated: boolean;
+    }
   | { readonly kind: "createTable"; readonly tableId: number; readonly definition: Uint8Array }
   | {
       readonly kind: "alterTable";

@@ -216,7 +216,8 @@ bodies and both recursive arms without executing them. Explicit stable enum-to-t
 refuse stored generation; implicit assignment follows PostgreSQL’s separate coercion rule. The codec validates ordered dependencies,
 references, ownership and cycles before exposing stored definitions. Semantic extension fields
 may be absent but, when present, carry the required wire flag; they are never display extensions.
-The required effective-FK-action field selects reader7/manifest8/commitBody6 before any write. This changes only
+The required effective-FK-action field first selected reader7/manifest8/commitBody6;
+FTS publication advances the native manifest/WAL selectors below, retaining reader7 for MCAT. This changes only
 unreleased development formats; the first released1.0 writer starts the supported chain.
 
 `composeEngine().migrate()` is the owner-local schema bridge. It uses the existing schema planner
@@ -3829,9 +3830,9 @@ Encoding measures before allocating one exact charged output. Parsing reserves a
 per-page object/typed-lane allowance before construction; returned decoded ownership remains
 charged until release. IO holds encoded buffers until write settlement and read leases through
 cancellation; consumers must drain or close borrowed tree iterators. The writer is provisional:
-its caller owns abort/publication. Stage3 does not attach native FTS roots to live manifests,
-maintain row-write deltas, prove cross-tree document unions, build indexes or select indexed
-queries. Those are later stages; SQL continues through the stage2 whole-corpus scan route.
+its caller owns abort/publication. Stage3 supplies these trees; the stage4 publication journal below protects insert parts in native
+roots. Background base building, cross-column distinct-ID unions and indexed selection remain
+later stages; SQL continues through the stage2 whole-corpus scan route.
 
 MCAT21 fields1..7 are id/tableId/columnId/tokenizerVersion/rendererVersion/scorerVersion/config.
 Config26 field1 version1 selects the whole fixed tokenizer1/renderer2/scorer1 configuration.
@@ -3942,3 +3943,142 @@ A fixed eight-slot scalar route cache is paid by the root's frame metadata; cold
 shared task clock. At spent budget, matching definitions come directly from the catalog:
 BEFORE refuses depth immediately, and AFTER queues its ID to refuse at the ordered drain.
 An unreachable terminal body need not be compiled or have binding workspace reserved.
+
+### FTS insert-delta page writer (stage4 primitive)
+
+`format/fts-append.ts` streams ordered accepted documents and `(term, rowId, tf)`
+postings into the registered native trees. It funds fixed leaf buffers, bounded fanout
+frontiers and term descriptors before construction. `FTS_APPEND_MINIMUM_BYTES` includes
+that workspace, codec scratch and one maximum encoded output; callers also fund their
+input read/sort window. No whole-delta map or native array sort is used. IDs and totals
+remain exact; NULL document presence is preserved. Term keys are copied through a bounded
+UTF16 scratch lane, so a short slice cannot retain a large caller-owned source string.
+IO ownership uses the existing fenced
+FTS writer. Returned descriptors retain a transferred charge until their lease is released; release
+drops references before refund. The caller owns abort, staging and publication. Its caller is now the stage4 publication path below. Keyed mutation history is published by the path below. Replay/dedupe and stale-writer publication are covered by stage4 below; SQL still uses the scan route.
+
+### Atomic FTS row publication (stage4)
+
+`write/fts-prepare.ts` visits final accepted native row undo ranges. It renders with the owner’s
+renderer2 adapter (no write-to-executor dependency), tokenizes with the shared tokenizer, and
+writes disjoint document/posting parts using a funded per-document sort (at most4096 tokens).
+There is no transaction-sized term map. Rolled-back ranges and deleted pending rows contribute
+no documents. Missing semantic capability, unavailable/staged input or preparation pressure emits
+an invalidation in the same commit rather than failing a legal row write. Large/spilled/staged
+commits may therefore lose acceleration while retaining exact scan results. No insert-throughput
+claim is made at this stage; later build/fold stages consolidate parts into the native delta trees.
+
+MFTJ1 (`ftsJournal`) has prepared pages of at most64 entries, linked by checked decreasing
+ordinals, and checkpoint pages linked by strictly decreasing actual commit LSNs. A native root’s
+`fts.staged` protects the preparation and every payload extent before WAL can name it. Both
+small and projected-stream commit codecs append one `fts` claim to the row body. The claim’s
+transaction identity is its staging root sequence; its commit LSN is the appender’s actual last
+frame LSN, including multipart commits and independent sequence frames. An aborted preparation
+has no visible claim. Unclaimed pages leave the next root and retire through the usual R25/two-root
+and pin rules. Root publication checkpoints each durable claim before globalLsn covers it.
+
+The complete mandatory FTS publication step shares the native metadata account; its peak is the
+maximum of the ordinary publication and FTS phases, rather than their sum. Renderer/tokenizer,
+append frontiers, returned descriptors, sealed extent records and growth overlap are prepaid as
+one optional step. A refused optional allocation unwinds its provisional writer before selecting
+compact invalidation; it never takes a second loan. Cancellation drains page IO before freeing
+its buffers, the step, or the grant. Journal references are bounded before IO; the audit walks
+all prepared documents, terms and postings, with owned decoder leases.
+
+The new native manifest10 and commitBody8 selectors refuse older unpublished development bytes
+before mutation. MCAT dialect/minimum reader7 is unchanged: the independent manifest barrier
+already makes older builds refuse these native bytes before fencing. No supported1.0 predecessor
+exists; this is not an upgrade path for 0.x. The public/shipped engine remains unchanged.
+
+### Accepted keyed FTS mutation history (stage4)
+
+Native `memDelete`/`groupDelete` undo independently invalidates every binding on its table,
+including direct writers and referential actions. `Statement.noteFtsMutation` is the accepted
+DML seam: it marks an existing accepted row range for upsert (including the insert arm),
+update or delete. Zero accepted rows do nothing. An embedded notification slot is charged
+before row append and retained with undo; rollback removes it and commit drops undo before
+refunding it. Repeated notifications do not allocate. Native delete undo remains the safety net.
+
+At statement completion the check/prefix views retire before prepaying the complete future
+journal phase. A reference-free `ftsMutation` effect (body8 tag9) commits keyed history in the
+same WAL body as accepted rows, even without an FTS declaration. It needs no new root while
+another native publication is held. Only posting/document payload references require protected
+staging before WAL. Keyed invalidation dominates insert-part construction for that table.
+
+`write/fts-mutations.ts` prepays bounded table records and shared commit cells before allocation.
+R9 fills the cell with the actual appender LSN, without allocation, IO or a per-table loop.
+Repeated keyed writes cannot restore append-only eligibility: the first accepted boundary
+remains authoritative until checkpoint. Decoder/encoder progress is sliced on the shared clock.
+Covered records reclaim only after active preparation and borrowed checkpoint readers drain.
+The native metadata account includes every retained record and commit cell through close.
+
+Before global coverage advances, bounded journal pages checkpoint inline history as table-wide
+`keyed` events (`ftsId=0`), with the actual invalidation LSN as their monotone mutation epoch.
+Posting claims checkpoint at their own commit LSN first; later invalidations get separate
+checkpoints, never relabeling an earlier insert delta. Future indexed readers/builders must
+combine snapshot-visible pending cells and journal history before choosing acceleration.
+Insert eligibility is computed by a sliced pass per table, never by searching all undo for
+every inserted range. The commit route uses at most one bounded synchronous hint; unknown or
+expired work takes the shared-clock path, with cancellation checked on resume. Accepted
+append ranges use their chronological logical-row-ID high-water instead of scanning prior
+ranges for each document. No transaction-sized notification map is added.
+
+A capability is checked after the final awaited journal write, not just after payload writes.
+If it retired, invalidations dominate every touched binding. Native root publication and the
+outer admission/retry await are fenced again before preparation returns. A final check in
+LogAppender's serialized section seals a canonical one-byte invalidation disposition in the
+LAST FTS effect, synchronously with checksum/queueing and LSN assignment. Streamed claims
+queue their final frame after all encoding/IO waits, transferring the existing frame charge;
+there is no await or new admission between that check and the LSN. Earlier retirement
+invalidates all touched bindings in the same row body; retirement after the LSN is later than
+this commit. Replay retains the disposition and checkpoint appends dominating invalidations
+before covering that WAL. Raw staged insert parts alone are never accelerator authority.
+
+Preparation receives the workspace baseline admitted before the publication-lock wait. It
+checks against that same baseline before each render call; growth cannot silently reset the
+baseline or allocate unfunded renderer scratch. Stale work selects invalidation before
+rendering. Fixed seal/claim state fits the already prepaid 512-byte FTS publication descriptor.
+Ordinary commits without an FTS seal keep their existing append path.
+
+The SQL scan route and shipped engine behavior are unchanged. The new tag is part of the
+unmerged development manifest10/body8 unit; it changes no supported stored predecessor.
+
+FTS recovery reads the checked checkpoint head once and passes its actual covered LSN to
+`Replayer` independently of global/catalog/ledger and per-table row coverage. A conservative
+global checkpoint can lag FTS coverage: rows still replay while the already-checkpointed FTS
+claim does not claim newer staging. A newer claim must still name its protected preparation.
+Log coverage validation includes the FTS checkpoint; a missing WAL suffix is corruption.
+Real-owner COMMIT tests check in-flight, terminal, reopened and checkpointed retries before
+native preparation, including a retry while a later transaction owns uncommitted rows.
+The fixture feeds native row writers because B5b's SQL modify executor is a separate merge.
+
+A missing/stale composition renderer is an optional write capability, not a stored-format
+compatibility decision. Unsupported tokenizer/render/scorer/config or an invalid workspace
+selects atomic invalidation. Preparation rechecks across payload IO, including the final
+payload await; invalidation dominates any partial parts already prepared. A retained native
+writer uses the final transaction catalog's stable FTS IDs, not declarations cached when
+that writer was constructed. Required unsupported semantic versions in stored definitions
+or pages still refuse before mutation. Live build-generation CAS belongs to stage5; no
+ready accelerator is enabled by this write integration.
+
+FTS completion inspects only the current statement's undo interval. Earlier statements in a
+large explicit transaction are not revisited at each `end()`. A long current interval follows
+the shared task clock in chunks and checks the statement's abort signal on resume. Generated
+read-count and injected-clock probes enforce this bound without a host-timing threshold.
+
+The statement signal follows FTS metadata admission through the write hook and native minimum
+calculation. Cancellation rejects while competing credit is still held; it does not require
+that holder to release first. Completion rechecks the signal so an abort racing with a granted
+minimum cannot report successful statement end. Rollback leaves rows and FTS state unchanged,
+and the writer remains usable. Commit's existing irreversible R9 boundary is unchanged.
+
+Failed FTS minimum admission restores the transaction's previous preparation state and retires
+unused provisional metadata headroom without another admission wait. Ordinary work after
+statement rollback can use its already-admitted minimum in the same transaction. Retirement
+keeps every allocated buffer, loan and the next step's overlap funded; earlier successful
+preparation remains protected.
+
+FTS preparation overlays keep the native root's provisional retirement and build-settlement
+bookkeeping through every root clone, including extent-list replacement. Adoption of the exact
+installed root drains deferred native staging retirement once (R25); a preparation publication
+must not leave that retirement queued for the next table publication.

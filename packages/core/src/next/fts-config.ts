@@ -22,6 +22,16 @@ export function ftsSemantics(): FtsSemantics {
     config: { version: FTS_CONFIG_VERSION },
   };
 }
+/** Optional write accelerators may decline a stale capability without refusing legal rows.
+ * Required stored semantic versions still use requireFtsSemantics and refuse before mutation. */
+export function supportsFtsSemantics(value: FtsSemantics): boolean {
+  return (
+    value.tokenizerVersion === FTS_TOKENIZER_VERSION &&
+    value.rendererVersion === FTS_RENDER_VERSION &&
+    value.scorerVersion === FTS_SCORER_VERSION &&
+    value.config.version === FTS_CONFIG_VERSION
+  );
+}
 /** Callers first validate structural integer fields; valid future versions are unsupported. */
 export function requireFtsSemantics(value: FtsSemantics): void {
   const check = (actual: number, expected: number, label: string) => {

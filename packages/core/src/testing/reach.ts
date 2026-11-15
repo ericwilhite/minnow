@@ -50,6 +50,7 @@ export const DURABLE_LONG_KEY_REACH = [
   "partial native tree",
 ] as const;
 export const DURABLE_REGISTRY_REACH = [
+  "ftsJournal",
   "ftsRoot",
   "ftsTerms",
   "ftsPostings",
@@ -6148,8 +6149,8 @@ export const FTS_CODEC_REACH = [
 
 export const FTS_SELECTOR_REACH = [
   "reader7 barrier",
-  "manifest8 barrier",
-  "commit body6",
+  "manifest10 barrier",
+  "commit body8",
   "wide sequence preserved",
   "checksummed roundtrip",
 ] as const;
@@ -7260,4 +7261,302 @@ export const CATALOG_WORK_REACH = [
   "shared DAG linear",
   "shared view operand",
   "late inspection refuses",
+] as const;
+
+export const FTS_APPEND_REACH = [
+  "exact documents",
+  "exact postings",
+  "wide IDs",
+  "raw UTF16",
+  "NULL documents",
+  "empty renderable",
+  "charged workspace",
+  "drained",
+  "empty",
+] as const;
+
+export const FTS_ROW_PUBLICATION_REACH = [
+  "row and FTS body",
+  "protected before append",
+  "NULL",
+  "empty",
+  "rollback",
+  "savepoint",
+  "multiple statements",
+  "strict",
+  "relaxed",
+] as const;
+
+export const FTS_PUBLICATION_FAULT_REACH = [
+  "prepare fault",
+  "append fault",
+  "row and FTS commit",
+  "no uncommitted FTS",
+  "committed FTS survives",
+  "orphan retirement",
+] as const;
+
+export const FTS_PUBLICATION_CANCEL_REACH = [
+  "write 0",
+  "write 1",
+  "write 2",
+  "write 3",
+  "retained across close",
+  "drained",
+] as const;
+
+export const FTS_PUBLICATION_PRESSURE_REACH = [
+  "funded insert",
+  "pressure invalidation",
+  "rows preserved",
+  "NULL",
+  "text",
+] as const;
+
+export const FTS_STAGED_PUBLICATION_REACH = [
+  "rows actually staged",
+  "one publishedRows and FTS body",
+  "atomic missing-delta invalidation",
+  "replayed rows",
+  "checkpoint",
+] as const;
+
+export const FTS_UTF8_BOM_REACH = [
+  "leading",
+  "interior",
+  "none",
+  "empty",
+  "within bound",
+  "exact bound",
+  "over bound",
+] as const;
+
+/** Native keyed undo must invalidate, independent of executor/DML notifications. */
+export const FTS_KEYED_PUBLICATION_REACH = [
+  "update",
+  "delete",
+  "memtable",
+  "durable group",
+  "one row and FTS commit",
+  "older snapshot",
+  "checkpoint and reopen",
+] as const;
+
+/** Accepted keyed/upsert markers and history are undo-owned, never declaration-dependent. */
+export const FTS_MUTATION_HISTORY_REACH = [
+  "accepted",
+  "no definition",
+  "definition",
+  "no publication",
+  "upsert",
+  "savepoint",
+  "statement",
+  "empty",
+  "delete",
+  "competing grant",
+  "reopen",
+] as const;
+
+/** FTS has independent actual-LSN coverage; replay and conservative global roots apply once. */
+export const FTS_INDEPENDENT_REPLAY_REACH = [
+  "global trails FTS",
+  "rows once",
+  "each claim once",
+  "actual LSNs",
+  "repeated reopen",
+  "recycle",
+] as const;
+
+/** Native FTS work must occur after the real owner ledger's exactly-once admission. */
+export const FTS_OWNER_DEDUPE_REACH = [
+  "in flight",
+  "terminal retry",
+  "replayed ledger",
+  "rows once",
+  "parts once",
+  "checkpointed ledger",
+  "later transaction untouched",
+] as const;
+
+/** Native FTS checkpoint authority cannot be replaced by row/global coverage. */
+export const FTS_REPLAY_COVERAGE_REACH = [
+  "FTS covered rows replay",
+  "new claim",
+  "missing WAL refused",
+  "complete WAL",
+  "global independent",
+] as const;
+
+/** A stale write adapter invalidates in the row commit, never refuses a legal row. */
+export const FTS_STALE_WRITER_REACH = [
+  "before install",
+  "before commit",
+  "during prepare",
+  "late declaration",
+  "tokenizer",
+  "renderer",
+  "scorer",
+  "config",
+  "workspace",
+  "partial parts dominated",
+  "same body",
+  "rows and history survive",
+] as const;
+
+/** Keyed undo and its invalidation are neither both published early nor separated at faults. */
+export const FTS_KEYED_FAULT_REACH = [
+  "update",
+  "delete",
+  "prepare",
+  "append",
+  "none",
+  "rows and invalidation agree",
+  "orphan retirement",
+] as const;
+
+/** Statement FTS completion is bounded by current undo, independent of prior statement count. */
+export const FTS_STATEMENT_BOUND_REACH = [
+  "ordinary insert",
+  "accepted notice",
+  "prior history excluded",
+  "current statement checked",
+  "commit",
+] as const;
+
+/** Shared task-clock slices and abort-on-resume in the current statement's FTS undo scan. */
+export const FTS_STATEMENT_CLOCK_REACH = [
+  "bounded slice",
+  "abort on resume",
+  "finish",
+  "drained",
+] as const;
+
+/** End-of-statement FTS admission observes its own signal before another holder releases credit. */
+export const FTS_ADMISSION_CANCEL_REACH = [
+  "actual admission wait",
+  "abort while credit held",
+  "abort on admission resume",
+  "same transaction usable",
+  "no FTS preparation",
+  "writer usable",
+  "update",
+  "delete",
+  "upsert",
+] as const;
+
+/** Retiring a failed FTS forecast preserves allocated buffers plus the next simultaneous step. */
+export const FTS_CREDIT_RETIREMENT_REACH = [
+  "live buffer funded",
+  "all ordinary credit retained",
+  "overlap funded",
+  "owned bytes intact",
+  "idle credit returned",
+  "all accounts returned",
+] as const;
+
+/** FTS staging overlays must preserve native publication retirement bookkeeping (R25). */
+export const FTS_ROOT_TRACKING_REACH = ["FTS publication retires native staging"] as const;
+
+export const FTS_INLINE_MUTATION_REACH = [
+  "wide commit LSN",
+  "cancelled record rebound",
+  "stable checkpoint prefix",
+  "bounded journal pages",
+  "journal growth boundary",
+  "denied before entries",
+  "cancel after k",
+  "constant-time R9",
+  "same table idempotent",
+  "borrowed checkpoint fenced",
+  "checkpoint reclaims",
+  "funded resize",
+] as const;
+
+export const FTS_INLINE_PUBLICATION_REACH = [
+  "32MiB cap",
+  "128MiB cap",
+  "update",
+  "delete",
+  "upsert",
+  "definition",
+  "no definition",
+  "competing grant",
+  "no second root publish",
+  "older snapshot",
+  "actual-LSN checkpoint",
+  "exact reopen",
+] as const;
+
+export const FTS_INLINE_MIXED_REACH = [
+  "independent coverage",
+  "same-body append and keyed",
+  "uncheckpointed reopen",
+  "separate actual LSNs",
+  "NULL append",
+  "exact rows",
+  "checkpoint replay",
+  "all charges returned",
+] as const;
+
+export const FTS_INLINE_CODEC_REACH = [
+  "registered tag",
+  "wide identifiers",
+  "zero table refused",
+  "zero schema refused",
+  "truncation refused",
+  "trailing bytes refused",
+] as const;
+
+/** Stage4 review: retirement at every awaited preparation edge must dominate its row claim. */
+export const FTS_AWAIT_STALE_REACH = [
+  "lock resume",
+  "admitted workspace",
+  "every IO boundary",
+  "final journal",
+  "publication",
+  "builder IO",
+  "same row claim",
+  "all touched bindings",
+  "exact reopen",
+] as const;
+
+export const FTS_COMMIT_WORK_REACH = [
+  "append ranges",
+  "1000 ranges",
+  "2000 ranges",
+  "linear commit reads",
+  "keyed skips payload",
+  "exact rows",
+  "bounded eligibility slice",
+  "eligibility abort on resume",
+] as const;
+
+export const FTS_PUBLICATION_SEAL_REACH = [
+  "late retirement invalidated",
+  "valid claim preserved",
+  "same row body",
+  "replayed disposition",
+  "checkpointed disposition",
+] as const;
+
+export const LOG_SEAL_REACH = [
+  "allocation retirement",
+  "synchronous fitting",
+  "queue drain",
+  "deferred recycle",
+  "multipart",
+  "one byte final body",
+  "atomic LSN seal",
+  "checked bytes",
+  "charges drained",
+] as const;
+
+export const FTS_CLAIM_CODEC_REACH = [
+  "valid flag",
+  "invalidated flag",
+  "wide identity",
+  "fixed final byte",
+  "reserved flags refused",
+  "missing flag refused",
+  "development predecessor refused",
 ] as const;

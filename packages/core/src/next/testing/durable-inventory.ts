@@ -148,6 +148,7 @@ export function discoverDurableSources(): {
           "format/key-pointer.ts",
           "format/catalog-pages.ts",
           "format/fts.ts",
+          "format/fts-journal.ts",
         ].includes(relative(NEXT, path)) &&
         ts.isTypeReferenceNode(node) &&
         (["BlobRef", "ChunkData", "KeyChunk", "RunKeyStorage"].includes(node.typeName.getText()) ||
@@ -186,6 +187,10 @@ const LOG = ["logFrame", "commitBody", "column", "catalogChange", "arrayValue"];
 export const DURABLE_EMISSIONS: Readonly<
   Record<string, { count: number; kinds: readonly string[] }>
 > = {
+  "format/fts-journal.ts:writeFtsJournal:writer.write -> ExtentWriter.write": {
+    count: 1,
+    kinds: ["ftsJournal"],
+  },
   "format/fts-storage.ts:writeFtsNode:writer.write -> ExtentWriter.write": {
     count: 1,
     kinds: ["ftsRoot", "ftsTerms", "ftsPostings", "ftsDocuments", "ftsDelta"],
@@ -321,8 +326,12 @@ export const DURABLE_EMISSIONS: Readonly<
 };
 /** Durable references declared by the schema, independently of its encoders and registry. */
 export const DURABLE_REFERENCES: Readonly<Record<string, readonly string[]>> = {
+  "FtsJournalLink.previous": ["ftsJournal"],
+  "FtsCheckpointPage.staged": ["ftsJournal"],
   "FtsIdRef.ref": ["ftsRoot", "ftsPostings", "ftsDocuments", "ftsDelta"],
   "FtsTermRef.ref": ["ftsTerms"],
+  "ManifestRoot.fts.checkpoint": ["ftsJournal"],
+  "ManifestRoot.fts.staged": ["ftsJournal"],
   "ManifestRoot.catalog": ["catalogRoot"],
   "CatalogChild.ref": ["catalogRoot", "catalogPage"],
   "TableRoot.groups": ["groupIndex", "groupPage"],

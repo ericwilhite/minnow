@@ -218,6 +218,8 @@ export interface BeginOptions {
 }
 
 export interface WritePath {
+  /** Owner installs renderer2; missing capability makes writes invalidate, never reinterpret cells. */
+  installFtsRenderer?(renderer: import("./fts-write.js").FtsWriteRenderer): void;
   readonly durability: Durability;
   readonly appliedLsn: number;
   readonly durableLsn: number;

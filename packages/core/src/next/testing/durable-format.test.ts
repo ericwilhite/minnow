@@ -1,3 +1,4 @@
+import { encodeFtsJournal, decodeFtsJournal } from "../format/fts-journal.js";
 import { encodeFts, decodeFts, type FtsValues } from "../format/fts-codec.js";
 import { ftsSemantics } from "../fts-config.js";
 import {
@@ -119,6 +120,7 @@ const blob: BlobRef = {
 };
 const manifest: ManifestRoot = {
   formatVersion: MANIFEST_FORMAT_VERSION,
+  fts: { checkpoint: null, staged: null },
   sequence: 1,
   epoch: 1,
   log: { salt: 7, firstLsn: 1, rootSequence: 1 },
@@ -463,7 +465,30 @@ function adapters(): Record<Exclude<DurableFormatName, "indexedDb">, Adapter> {
   );
   const portable = new Uint8Array(16);
   encodeSnapshotColumnHeader(integer.type, 2, portable);
+  const journal = encodeFtsJournal(
+    {
+      kind: "prepared",
+      transaction: 1,
+      ordinal: 1,
+      previous: null,
+      entries: [
+        {
+          kind: "invalidate",
+          tableId: 1,
+          schemaVersion: 1,
+          ftsId: 1,
+          columnId: 1,
+          generation: 1,
+          mutationEpoch: 0,
+        },
+      ],
+    },
+    budget(),
+  );
+  const journalBytes = journal.bytes.slice();
+  journal.close();
   return {
+    ftsJournal: { bytes: journalBytes, decode: parsed(decodeFtsJournal) },
     ...ftsAdapters(),
     snapshotColumn: {
       bytes: portable,
@@ -1219,7 +1244,7 @@ for (const seed of seedsFor("next-durable-before-fence", [0xb22f, 0xb230]))
               const header = new DataView(bytes.buffer);
               if (field === "minimum reader")
                 header.setUint8(10, (header.getUint8(10) & 31) | ((future - 1) << 5));
-              else header.setUint8(11, future - 1); // manifest version future+1, biased by2.
+              else header.setUint8(11, MANIFEST_FORMAT_VERSION + future - 2); // Independently newer manifest, biased by2.
               checksum(bytes);
               const shim = new MemoryOpfs();
               // Good older slot must not conceal a future current/previous slot.

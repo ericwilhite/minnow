@@ -379,6 +379,9 @@ class RecordingStatement implements Statement {
     };
     return { tableId, insert, update: refuse, delete: refuse, conflicts: refuse };
   }
+  noteFtsMutation(): void {
+    // This recording double has no durable index state.
+  }
   changeCatalog(): never {
     throw new Error("not in this example");
   }

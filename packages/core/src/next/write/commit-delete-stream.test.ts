@@ -5,7 +5,7 @@ import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, WRITE_DELETE_STREAM_STATES } from "../../testing/reach.js";
 import { Governor } from "../memory/governor.js";
-import { encodeBody } from "./body.js";
+import { decodeBody, encodeBody } from "./body.js";
 import { ByteWriter } from "./bytes.js";
 import { ByteWindow } from "./window.js";
 import { streamBody } from "./stream-body.js";
@@ -140,10 +140,15 @@ for (const seed of seedsFor("next-write-delete-stream", [0xde1]))
               request: null,
               effects: tx.effects(new ByteWriter()),
             });
+            // The canonical encoder includes the same reference-free FTS invalidation.
             capture = new Uint8Array(expected.length);
             const receipt = await tx.commit(null);
             await receipt.durable;
             expect(at).toBe(expected.length);
+            const logged = decodeBody(capture.subarray(0, at));
+            expect(logged.effects.filter((effect) => effect.kind === "ftsMutation")).toHaveLength(
+              1,
+            );
             expect(Buffer.compare(capture, expected), "canonical sorted deletion body").toBe(0);
             expect(loans).toBeGreaterThan(0);
             reach.reach("charged order loan");

@@ -130,6 +130,8 @@ export interface ManifestRoot {
    * the full walk (reachable.ts) is the audit's cross-check.
    */
   readonly extentList: ExtentList;
+  /** Native FTS publication journal, independent of row checkpoints and portable MCAT. */
+  readonly fts: { readonly checkpoint: BlobRef | null; readonly staged: BlobRef | null };
 }
 
 export interface TableRoot {

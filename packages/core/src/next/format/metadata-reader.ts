@@ -14,6 +14,7 @@
  *
  * It satisfies reachable.ts `ManifestReader` (bind a budget with `manifestReader`).
  */
+import { walkFtsJournal } from "./fts-journal.js";
 import {
   decodeCatalogRoot,
   decodeCatalogPage,
@@ -62,6 +63,9 @@ type Decoder<T> = (bytes: Uint8Array, budget: ByteBudget) => Parsed<T>;
 
 export class MetadataReader {
   readonly #space: ExtentReader;
+  fts(ref: BlobRef, checkpoint: boolean, budget: ByteBudget) {
+    return walkFtsJournal(ref, checkpoint, budget, this.#space);
+  }
   readonly #caches: MetadataCaches;
 
   constructor(space: ExtentReader, caches: MetadataCaches = {}) {
@@ -157,6 +161,7 @@ function held<T>(value: T, release: () => void): Held<T> {
 /** A `ManifestReader` (reachable.ts) over `reader`, charging `budget`. */
 export function manifestReader(reader: MetadataReader, budget: ByteBudget): ManifestReader {
   return {
+    fts: (ref, checkpoint) => reader.fts(ref, checkpoint, budget),
     catalogRoot: async (ref) => reader.catalogRoot(ref, budget),
     catalogPage: async (ref) => reader.catalogPage(ref, budget),
     groupIndex: async (ref) => reader.groupIndex(ref, budget),

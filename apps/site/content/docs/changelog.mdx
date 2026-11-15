@@ -56,6 +56,20 @@ retain these values separately from insert defaults; generated columns cannot al
 backfill. This fixes private catalog metadata only, without changing released 0.x behavior,
 public APIs, catalog framing or format selectors.
 
+The private 1.0 text decoder preserves leading U+FEFF characters. Full-text document limits
+count these stored characters, even when the tokenizer treats them as whitespace.
+
+The private 1.0 write path protects prepared full-text insert parts before WAL publication and
+commits their claim with the accepted rows. Checkpoints retain the actual commit LSN before
+advancing global coverage. If preparation cannot fit or its source is unavailable, the same
+commit invalidates acceleration and searches continue by exact scan. This changes unreleased
+native manifest/WAL bytes only; it does not change the shipped 0.x engine or require migration.
+Native accepted updates, deletes and notified upserts atomically record table-wide FTS
+invalidation with their rows. This history survives checkpoint/reopen even when no index
+is declared; zero-row and rolled-back commands do not invalidate. A missing or stale native
+write renderer also invalidates acceleration rather than rejecting accepted rows.
+No supported 1.0 stored-format predecessor exists yet.
+
 The unexported rebuild casts integers, NUMERIC (keeping scale), float4/float8 (PostgreSQL's
 shortest spelling), boolean, date, time, timestamp, timestamptz (UTC), interval (including
 `infinity` / `-infinity`), uuid, JSON/JSONB and arrays to text with PostgreSQL's default output

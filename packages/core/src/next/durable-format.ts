@@ -8,11 +8,11 @@
  * checksummed slot is not an empty/torn slot. Reserved masks enumerate every permitted bit;
  * writers emit zero for the remainder, readers refuse it. Scratch/transport are not durable.
  */
-/** Shared reference-table envelope; the manifest also carries its logical format version8. */
+/** Shared reference-table envelope; the manifest also carries its logical format version10. */
 export const METADATA_ENVELOPE_VERSION = 1;
-/** Raise before publishing any incompatible nested durable codec. Never fence before checking. */
+/** Root reader capability; incompatible nested bytes advance this or the exact manifest barrier. */
 export const DURABLE_READER_VERSION = 7;
-export const MANIFEST_FORMAT_VERSION = 8;
+export const MANIFEST_FORMAT_VERSION = 10;
 export const ROOT_SLOT_HEADER_BYTES = 16;
 export const ROOT_SLOT_OVERHEAD = ROOT_SLOT_HEADER_BYTES + 4;
 
@@ -147,6 +147,8 @@ export const DURABLE_CODECS = {
     sequence: 5,
     rows: 6,
     publishedRows: 7,
+    fts: 8,
+    ftsMutation: 9,
   },
   column: {
     bool: 1,
@@ -571,6 +573,16 @@ export const CATALOG_CHANGE_FIELDS = {
 } as const;
 
 export const DURABLE_FORMATS = {
+  ftsJournal: {
+    ...envelope(0x4a54464d, "readFtsJournal"), // MFTJ
+    fields: [
+      magic(0x4a54464d),
+      version(4),
+      zero(5, 1),
+      { name: "node kind", offset: 6, width: 1, values: [0, 1] },
+      zero(7, 1),
+    ],
+  },
   ftsRoot: {
     ...envelope(0x5254464d, "decodeFts"), // MFTR
     fields: [
@@ -726,9 +738,9 @@ export const DURABLE_FORMATS = {
   ]),
   commitBody: {
     magic: null,
-    version: 6,
+    version: 8,
     versionIn: "header",
-    fields: [{ ...version(0), values: [6] }],
+    fields: [{ ...version(0), values: [8] }],
     decoder: "decodeBody",
     state: "implemented",
   },

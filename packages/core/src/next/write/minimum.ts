@@ -1,4 +1,5 @@
 /** Bounds one publication from its actual schema, directories and pending inputs (governor rule 3). */
+import { FTS_PUBLICATION_MINIMUM_BYTES } from "./fts-minimum.js";
 import type { MaybePromise } from "../access/key-index.js";
 import type { RunRef } from "../format/manifest.js";
 import { parseCharge } from "../format/manifest-codec.js";
@@ -82,14 +83,20 @@ export function writeStepMinimum(
       yield;
     }
     return {
-      metadata:
+      metadata: Math.max(
+        catalog.fts.length > 0 ||
+          state.root.fts.checkpoint !== null ||
+          state.root.fts.staged !== null
+          ? FTS_PUBLICATION_MINIMUM_BYTES
+          : 0,
         RUN_ENCODER_MINIMUM +
-        (keyBytes > 2048 ? 8 * keyBytes : 0) +
-        4096 +
-        directory +
-        runMetadata +
-        2 * parseCharge(largest) +
-        5 * (raw + 512),
+          (keyBytes > 2048 ? 8 * keyBytes : 0) +
+          4096 +
+          directory +
+          runMetadata +
+          2 * parseCharge(largest) +
+          5 * (raw + 512),
+      ),
       merge: merging
         ? MERGE_FIXED_BYTES +
           Math.max(runs, fanIn) * mergeBytes +

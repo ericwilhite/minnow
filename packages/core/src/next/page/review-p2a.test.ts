@@ -45,6 +45,7 @@ const MAGIC = { root: 0x31524d4d, page: 0x3150474d, group: 0x3152474d };
 const ref: BlobRef = { extent: { offset: 0, length: 4096 }, offset: 0, length: 10, checksum: 0 };
 const root: ManifestRoot = {
   formatVersion: MANIFEST_FORMAT_VERSION,
+  fts: { checkpoint: null, staged: null },
   sequence: 1,
   epoch: 1,
   log: { salt: 1, firstLsn: 1, rootSequence: 1 },
@@ -326,7 +327,9 @@ describe("review B2-p2a #3, #4: strings and ledger keys decode as written", () =
         out.f64(1);
       }
       out.f64(0); // recorded at
-      out.uint(0); // no extent list pages (format 2, ruling R25)
+      out.uint(0); // no extent list pages (ruling R25)
+      out.u8(0); // no FTS checkpoint (manifest 9)
+      out.u8(0); // no staged FTS preparation
       return out.finish();
     };
     expect(decodeManifestRoot(keysAt(["__proto__", "a"]), UNLIMITED).value.clients).toHaveLength(1);
