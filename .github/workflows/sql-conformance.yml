@@ -42,6 +42,11 @@ jobs:
     name: Full browser conformance (${{ matrix.browser }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 360
+    # The browser step builds packages/core first, which outgrew Node's default ~2 GiB heap on
+    # the macOS WebKit runners (Full SQL conformance run 43711521591: heap OOM, exit 134).
+    # Same setting as ci.yml and release.yml.
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
     strategy:
       fail-fast: false
       matrix:
