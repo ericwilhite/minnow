@@ -1343,13 +1343,51 @@ export class TableWriterImpl implements TableWriter {
         return;
       }
     }
+    try {
+      this.#validateColumns(columns, rows, length);
+    } catch (error) {
+      if (!(error instanceof NotNullViolationError || error instanceof ClosedSetViolationError))
+        throw error;
+      // The common path remains columnar. Replay a column violation in row order, then
+      // check the complete valid prefix before reporting it. CHECK already guarantees
+      // row/name order (including expression errors). Generated errors replay in TableRules.
+      // Borrow selected rows directly; no row list, payload copy or admission on failure.
+      const count = rows?.length ?? length;
+      for (let k = 0; k < count; k++) {
+        try {
+          this.#validateColumns(columns, rows, length, k, 1);
+        } catch (precise) {
+          if (!(
+            precise instanceof NotNullViolationError || precise instanceof ClosedSetViolationError
+          ))
+            throw precise;
+          this.#checkConstraints(
+            columns,
+            rows === null ? null : rows.subarray(0, k),
+            rows === null ? k : length,
+            changed,
+          );
+          throw precise;
+        }
+      }
+      throw error; // deterministic physical input must reproduce the violation
+    }
+    this.#checkConstraints(columns, rows, length, changed);
+  }
+
+  #validateColumns(
+    columns: readonly Vector[],
+    rows: Uint16Array | null,
+    length: number,
+    from = 0,
+    count = rows?.length ?? length,
+  ): void {
     this.def.columns.forEach((column, c) => {
       if (column.nullable && column.allowedValues === undefined) return;
       const vector = need(columns[c]);
       if (vector.form === "flat" && vector.validity === null && column.allowedValues === undefined)
         return;
-      const count = rows?.length ?? length;
-      for (let k = 0; k < count; k++) {
+      for (let k = from; k < from + count; k++) {
         const row = rows === null ? k : (rows[k] ?? 0);
         if (isNullAt(vector, row)) {
           if (!column.nullable) throw new NotNullViolationError(this.tableId, column.id, row);
@@ -1366,11 +1404,16 @@ export class TableWriterImpl implements TableWriter {
         }
       }
     });
+  }
+
+  #checkConstraints(
+    columns: readonly Vector[],
+    rows: Uint16Array | null,
+    length: number,
+    changed: readonly number[] | null,
+  ): void {
     if (this.def.checks.length === 0) return;
-    const selection: Selection | null =
-      rows === null || rows.length === length
-        ? null
-        : { rows: Uint16Array.from(rows), count: rows.length };
+    const selection: Selection | null = rows === null ? null : { rows, count: rows.length };
     const failure = this.statement
       .rules(this.tableId)
       .check({ length, columns, selection }, changed);

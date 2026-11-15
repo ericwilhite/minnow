@@ -6687,6 +6687,28 @@ export const ROW_RULES_FK_REACH = [
   "statement atomicity",
 ] as const;
 
+export const NATIVE_CONSTRAINT_ORDER_REACH = [
+  "check-null",
+  "null-check",
+  "error-null",
+  "columns",
+  "success",
+  "width1",
+  "width2",
+  "width8",
+  "complete validator",
+  "native fallback",
+  "vectorized success",
+  "selection",
+  "dense",
+  "valid prefix",
+  "first row",
+  "reverse CHECK declarations",
+  "forward CHECK declarations",
+  "ASCII names",
+  "UTF8 names",
+] as const;
+
 export const ROW_RULE_ORDER_REACH = [
   "check",
   "generated",

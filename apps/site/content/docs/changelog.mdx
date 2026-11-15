@@ -177,6 +177,10 @@ public API or stored format changes.
   expressions, NOT NULL and CHECKs when batch evaluation fails. CHECKs use constraint-name
   order. Successful generated batches retain vectorized evaluation; shipped 0.x behavior and
   stored formats are unchanged.
+  Native column validation also preserves row order when a caller supplies CHECK kernels
+  without a complete-row validator: an earlier row's CHECK precedes a later row's NULL,
+  and an earlier row's NULL precedes a later row's failure in another column. Batch width
+  and inactive rows do not change the reported constraint or column.
 
 The unexported rebuild retains `GENERATED ALWAYS AS IDENTITY` in its catalog and applies
 PostgreSQL's assignment rules: omitted values and DEFAULT use the owned sequence; explicit
