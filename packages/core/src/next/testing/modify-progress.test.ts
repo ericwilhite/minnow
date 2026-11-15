@@ -3,6 +3,7 @@ import fc from "fast-check";
 import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, MODIFY_PROGRESS_REACH } from "../../testing/reach.js";
+import { WriteCredits } from "../write/credits.js";
 import { Governor, type Grant } from "../memory/governor.js";
 import { TableWriterImpl, StatementImpl } from "../write/transaction.js";
 import { watchGrants } from "../write/test-support.js";
@@ -27,7 +28,27 @@ it.each(seedsFor("next-modify-progress", [0xb5ba]))(
           return grant;
         };
         await core.open();
-        let checking = false;
+        let checking = false,
+          verifying = false;
+        let protocolFailure: Error | undefined;
+        const verifyStop = new AbortController();
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- Invoked with the same native owner.
+        const originalMetadata = WriteCredits.prototype.prepareMetadata;
+        const metadata = vi
+          .spyOn(WriteCredits.prototype, "prepareMetadata")
+          .mockImplementation(function (this: WriteCredits, bytes, signal) {
+            if (verifying && core.harness.path.stats().levelZeroRuns === 0) {
+              if (grants.some((g) => g.label.startsWith("merge t") && g.held > 0)) {
+                protocolFailure = new Error(
+                  "Completed merge retained working credit across future metadata admission",
+                );
+                verifyStop.abort(protocolFailure);
+                throw protocolFailure;
+              }
+              reach.reach("finished merge credit retired");
+            }
+            return originalMetadata.call(this, bytes, signal);
+          });
         // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound with call in the spy.
         const originalUpdate = TableWriterImpl.prototype.update;
         // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound with call in the spy.
@@ -88,7 +109,19 @@ it.each(seedsFor("next-modify-progress", [0xb5ba]))(
           reach.reach("single UPDATE no target set");
           reach.reach("20000 updated");
           checking = false;
-          const rows = await core.execute("SELECT COUNT(*) AS n FROM t WHERE v <> id");
+          verifying = true;
+          let rows;
+          try {
+            rows = await core.execute(
+              "SELECT COUNT(*) AS n FROM t WHERE v <> id",
+              [],
+              verifyStop.signal,
+            );
+          } catch (error) {
+            throw protocolFailure ?? error;
+          } finally {
+            verifying = false;
+          }
           if (rows.kind !== "rows" || !("batches" in rows)) throw new Error("rows");
           expect(oracleRows(rows)).toEqual([{ n: 20000 }]);
           checking = true;
@@ -103,12 +136,19 @@ it.each(seedsFor("next-modify-progress", [0xb5ba]))(
           reach.reach("64 MiB");
           reach.reach("bounded spill workspace");
         } finally {
+          metadata.mockRestore();
           update.mockRestore();
           remove.mockRestore();
           end.mockRestore();
           await core.close();
         }
         expect(core.harness.governor.usedBytes).toBe(0);
+        expect(
+          core.harness.path.maintenance.lastMergeFailure,
+          "healthy completed merges must finalize without ownership errors",
+        ).toBeNull();
+        expect(core.harness.path.maintenance.merges).toBeGreaterThan(0);
+        reach.reach("healthy merge completion");
       }),
       { seed, numRuns: 2 },
     );

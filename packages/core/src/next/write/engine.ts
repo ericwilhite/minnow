@@ -4723,6 +4723,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     let output: Awaited<ReturnType<typeof mergeRuns>> | null = null;
     let unlock: (() => void) | null = null;
     let madeRoot: ManifestRoot | null = null;
+    let mergeCreditReleased = false;
     const delta = new DeltaPublication(
       "merge",
       this.#extentDeltas,
@@ -4812,6 +4813,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#dropRunReaders(inputs);
       });
       output.release(); // the published root now owns and accounts its boundary keys
+      // The merge is complete. Retire its working credit before a future metadata/
+      // merge forecast can wait behind a query that needs this very credit.
+      this.#credits.releaseMerge(grant);
+      mergeCreditReleased = true;
       await this.#prepareMinimum();
       const counters = this.maintenance;
       counters.merges += 1;
@@ -4834,7 +4839,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (madeRoot !== null) this.#releaseRoot(madeRoot);
       unlock?.();
       output?.release();
-      this.#credits.releaseMerge(grant);
+      if (!mergeCreditReleased) this.#credits.releaseMerge(grant);
     }
   }
 

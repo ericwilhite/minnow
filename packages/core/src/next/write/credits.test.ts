@@ -1,10 +1,15 @@
 /** Native write steps keep their minimum while another admitted execution retains its credit. */
 import fc from "fast-check";
 import { expect, it } from "vitest";
-import { Governor } from "../memory/governor.js";
+import { Governor, type Grant } from "../memory/governor.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { WriteCredits } from "./credits.js";
-import { createReach, WRITE_CREDIT_STATES } from "../../testing/reach.js";
+import {
+  createReach,
+  WRITE_CREDIT_STATES,
+  WRITE_MERGE_RETIREMENT_REACH,
+} from "../../testing/reach.js";
+import { yieldTask } from "../task.js";
 const reach = createReach("native write minimum", WRITE_CREDIT_STATES);
 
 const KiB = 1024;
@@ -14,6 +19,70 @@ const minimum = {
   commits: 64 * KiB,
   merge: 64 * KiB,
 };
+
+for (const seed of seedsFor("next-write-merge-retirement", [0xb617, 0xb618]))
+  it(`retires oversized completed merge credit before queued readers ${String(seed)}`, async () => {
+    const seen = createReach("native merge retirement", WRITE_MERGE_RETIREMENT_REACH);
+    await fc.assert(
+      fc.asyncProperty(fc.integer({ min: 1, max: 128 }), async (units) => {
+        seen.beginHistory();
+        const governor = new Governor(4 * 1024 * KiB),
+          credits = await WriteCredits.open(governor, minimum);
+        const extra = units * 4 * KiB,
+          stop = new AbortController();
+        let reader: Grant | undefined, pending: Promise<Grant> | undefined;
+        try {
+          const active = await credits.acquireMerge("completed merge", minimum.merge + extra);
+          const bytes = active.held;
+          expect(active.allocate(bytes)).toBe(true);
+          const working = new Uint8Array(bytes).fill(7);
+          const free = governor.capBytes - governor.reserveBytes - governor.usedBytes;
+          let admitted = false;
+          pending = governor.admit({
+            label: "waiting complete reader",
+            minimumBytes: free + extra / 2,
+            spillable: false,
+            signal: stop.signal,
+          });
+          void pending.then(
+            (g) => {
+              reader = g;
+              admitted = true;
+            },
+            () => undefined,
+          );
+          await yieldTask();
+          expect(admitted).toBe(false);
+          expect(working[0]).toBe(7);
+          seen.reach("queued reader");
+          active.free(bytes);
+          credits.releaseMerge(active);
+          expect(credits.merge.held, "finished merge may retain only the native base minimum").toBe(
+            minimum.merge,
+          );
+          reader = await pending;
+          expect(reader.allocate(reader.held)).toBe(true);
+          const retained = new Uint8Array(reader.allocated).fill(9);
+          seen.reach("dynamic working credit retired");
+          await credits.prepareMetadata(minimum.metadata + extra / 4);
+          expect(retained[0]).toBe(9);
+          seen.reach("metadata while reader retained");
+        } finally {
+          stop.abort(new Error("merge retirement history ended"));
+          await Promise.allSettled(pending ? [pending] : []);
+          if (reader) {
+            reader.free(reader.allocated);
+            reader.close();
+          }
+          credits.close();
+        }
+        expect(governor.usedBytes).toBe(0);
+        seen.reach("all credit returned");
+      }),
+      { seed, numRuns: 12 },
+    );
+    seen.assertReached();
+  });
 for (const seed of seedsFor("next-write-native-credit", [0xb3c1]))
   it(`funds native steps and returns each holding once (seed ${String(seed)})`, async () => {
     await fc.assert(

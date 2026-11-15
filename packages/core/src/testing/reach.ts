@@ -7638,7 +7638,16 @@ export const MODIFY_SOURCES_REACH = [
 ] as const;
 
 /** Native modification phases must retire producer credit before a writer can wait. */
+export const WRITE_MERGE_RETIREMENT_REACH = [
+  "queued reader",
+  "dynamic working credit retired",
+  "metadata while reader retained",
+  "all credit returned",
+] as const;
+
 export const MODIFY_PROGRESS_REACH = [
+  "finished merge credit retired",
+  "healthy merge completion",
   "64 MiB",
   "single UPDATE no target set",
   "single DELETE no target set",

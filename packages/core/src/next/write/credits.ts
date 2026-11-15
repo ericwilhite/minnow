@@ -189,6 +189,9 @@ export class WriteCredits {
       throw new Error("Native merge credit was not returned");
     this.#mergeActive = null;
     grant.close();
+    // A completed step cannot keep an oversized future forecast while another
+    // complete execution waits. The next merge prepares its full step anew.
+    releaseIdle(this.merge, this.minimum.merge);
   }
 
   cancel(reason: unknown): void {

@@ -72,6 +72,9 @@ The private SQL modification executor now notifies this history for accepted UPD
 DELETE USING and both ON CONFLICT write arms. Coalesced inserts retain one funded undo
 entry and preserve any accepted upsert marker; statement and savepoint rollback remove
 their FTS effects together with the rows. Both statement and end signals cancel FTS admission.
+Completed native index merges return their working credit before reserving the next
+maintenance step, so reads under a small memory cap can follow keyed modifications
+without a circular admission wait.
 No supported 1.0 stored-format predecessor exists yet.
 
 The unexported rebuild now executes INSERT VALUES, INSERT SELECT, UPDATE and DELETE through
