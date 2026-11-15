@@ -84,6 +84,7 @@ export const DURABLE_CODECS = {
   ftsNode: { leaf: 0, branch: 1 },
   ftsState: { building: 0, ready: 1, invalid: 2 },
   catalogFieldFlags: { required: 1, knownMask: 1 },
+  catalogDefaultSource: ["expression", "boolean", "number", "string", "datetime"],
   catalogTypedArray: { uint8: 1, int32: 2, uint32: 3, float32: 4, float64: 5, int64: 6, uint16: 7 },
   catalogStorage: { typed: 0, expanded: 1 },
   checksum: {
@@ -361,6 +362,7 @@ export const CATALOG_RECORD_SCHEMAS = {
     "generatedDependencies:expressionDependencies~!",
     "autoIncrement:b~!",
     "identityAlways:b~!",
+    "defaultSource:s~!",
   ],
   physical: [
     "kind:s",

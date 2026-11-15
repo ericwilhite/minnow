@@ -3,6 +3,7 @@ import type { Catalog as SchemaCatalog, CatalogColumn } from "../../engine/catal
 import type { ColumnDefault } from "../../storage/types.js";
 import { compileDefaultExpression, compileWithDeclaredTypes } from "../../engine/query.js";
 import type { CatalogView, ColumnDef } from "../access/catalog.js";
+import { readDefaultLiteral } from "../access/catalog-default-source.js";
 import { int64At } from "../vector/int64.js";
 import { decodeUtf8 } from "../vector/varlen.js";
 import { formatDate, PG_EPOCH_UNIX_MICROS } from "../temporal.js";
@@ -52,6 +53,9 @@ function backfill(column: ColumnDef): boolean | number | string | Date | undefin
 function defaultOf(column: ColumnDef): ColumnDefault | undefined {
   if (column.identitySequence !== null) return { kind: "autoincrement" };
   if (column.defaultSql === null) return undefined;
+  if (column.defaultSource === "expression") return { kind: "expression", sql: column.defaultSql };
+  if (column.defaultSource !== undefined)
+    return { kind: "literal", value: readDefaultLiteral(column.defaultSource, column.defaultSql) };
   const expression = compileWithDeclaredTypes(() =>
     compileDefaultExpression(column.defaultSql ?? "NULL"),
   );

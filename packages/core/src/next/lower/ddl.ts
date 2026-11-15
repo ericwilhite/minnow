@@ -19,7 +19,8 @@ import { floatLiteral, timestampLiteral } from "./literals.js";
 import { timestampFromDate } from "../temporal.js";
 import type { CompiledStatement, ForeignKeyDefinition } from "../../engine/query.js";
 import { compileCheckExpression, compileWithDeclaredTypes } from "../../engine/query.js";
-import type { ColumnDefault } from "../../storage/types.js";
+import { validateColumnDefault, type ColumnDefault } from "../../storage/types.js";
+import { defaultLiteralSql, defaultSourceOf } from "../access/catalog-default-source.js";
 import {
   ENUM_LABEL_LIMIT,
   ENUM_LABEL_BYTES,
@@ -63,19 +64,11 @@ export interface TableDefinition {
   }>;
 }
 
-function sqlConstant(value: boolean | number | string | Date): string {
-  if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
-  if (typeof value === "number")
-    return Number.isFinite(value) ? String(value) : `'${String(value)}'`;
-  const text = value instanceof Date ? value.toISOString() : value;
-  return `'${text.replaceAll("'", "''")}'`;
-}
-
 export function defaultSqlOf(value: ColumnDefault | undefined, _column: string): string | null {
   void _column;
   if (value === undefined) return null;
   if (value.kind === "autoincrement") return null; // The owned sequence is declared separately.
-  return value.kind === "literal" ? sqlConstant(value.value) : value.sql;
+  return value.kind === "literal" ? defaultLiteralSql(value.value) : value.sql;
 }
 
 /**
@@ -242,13 +235,27 @@ export function tableInput(
       type.kind !== "int64"
     )
       throw new PlanningError("identity column type must be smallint, integer, or bigint", "22023");
+    if (source === "schema" && front.defaultValue !== undefined)
+      validateColumnDefault(
+        {
+          ...front,
+          nullable: front.nullable === true,
+          isUniqueKey:
+            definition.uniqueKey === front.name ||
+            (definition.compositePrimaryKey?.length === 1 &&
+              definition.compositePrimaryKey[0] === front.name),
+        },
+        front.defaultValue,
+      );
     const namedType = type.kind === "enum" ? catalog.typeByName(type.name) : undefined;
+    const defaultSource = defaultSourceOf(front.defaultValue);
     return {
       name: front.name,
       type,
       declared,
       nullable: front.nullable === true,
       defaultSql: defaultSqlOf(front.defaultValue, front.name),
+      ...(defaultSource === undefined ? {} : { defaultSource }),
       generatedSql: front.generatedValue?.sql ?? null,
       identitySequence: null,
       missing: missingValue(front, type, catalog),
@@ -641,12 +648,14 @@ export function lowerDdl(statement: NativeStatement, catalog: CatalogView): DdlR
       const { type, declared } = declaredColumnType(front, `${table.name}.${front.name}`, catalog);
       const { columns, input } = currentInput(table);
       const namedType = type.kind === "enum" ? catalog.typeByName(type.name) : undefined;
+      const defaultSource = defaultSourceOf(front.defaultValue);
       const added = {
         name: front.name,
         type,
         declared,
         nullable: front.nullable === true,
         defaultSql: defaultSqlOf(front.defaultValue, front.name),
+        ...(defaultSource === undefined ? {} : { defaultSource }),
         generatedSql: null,
         identitySequence: null,
         missing: missingValue(front, type, catalog),

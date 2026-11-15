@@ -10,6 +10,14 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The private 1.0 catalog retains whether a default came from a SQL expression or a literal,
+and the literal's original value type. Negative numbers, signed zero, Date values and NUMERIC
+number/string inputs survive introspection and reopen. Repeating an unchanged schema remains
+a no-op, including expression defaults such as `TRUE`. ALTER, default removal and counter
+adoption keep that metadata coherent. A small required-understanding discriminator uses the
+existing SQL spelling; large literals are not stored twice. This extends unreleased MCAT
+column records without changing field framing, released 0.x formats or behavior.
+
 Initial private 1.0 schema migrations retain literal and generated frozen backfills. A generator
 runs once; repeating the same migration after WAL or checkpoint reopen remains a no-op. The
 API fractional-number shortcut applies only to Float64; SQL REAL defaults requiring a runtime

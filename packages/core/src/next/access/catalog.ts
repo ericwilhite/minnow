@@ -32,6 +32,7 @@
  *   created; its `parentIndexId` is then `"primary"` or `{ unique: name }` of the same input.
  */
 import type { SqlTypeDescriptor, PhysicalType } from "../types.js";
+import type { CatalogDefaultSource } from "./catalog-default-source.js";
 import type { TriggerDef } from "./trigger-def.js";
 import type { FtsDef } from "./fts-def.js";
 import type { FlatVector } from "../vector/vector.js";
@@ -107,6 +108,9 @@ export interface ColumnDef {
   readonly nullable: boolean;
   /** Default expression (SQL text), or null. Applied by lowering, never by the write path. */
   readonly defaultSql: string | null;
+  /** Source API identity: SQL expression or the literal's primitive JS type. The existing
+   * SQL spelling carries its value without a second wide payload. Absent: native SQL only. */
+  readonly defaultSource?: CatalogDefaultSource;
   /** Stored generated column expression (SQL text), or null. */
   readonly generatedSql: string | null;
   /** The sequence behind SERIAL / IDENTITY / AUTOINCREMENT, or null. */

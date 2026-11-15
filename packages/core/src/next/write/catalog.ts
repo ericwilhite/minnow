@@ -680,6 +680,7 @@ export class Catalog implements CatalogView {
         // A primary key's columns are NOT NULL (PostgreSQL).
         nullable: column.nullable && !primary.has(position),
         defaultSql: column.defaultSql,
+        ...(column.defaultSource === undefined ? {} : { defaultSource: column.defaultSource }),
         generatedSql: column.generatedSql,
         identitySequence,
         ...(column.autoIncrement === true ? { autoIncrement: true as const } : {}),

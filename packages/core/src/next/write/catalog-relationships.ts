@@ -1,4 +1,5 @@
 /** Semantic admission for the relational catalog extensions, after wire/physical shape checks. */
+import { readDefaultLiteral } from "../access/catalog-default-source.js";
 import type { ExpressionDependencies, ViewDef } from "../access/catalog.js";
 import type { CatalogStreamData } from "./catalog-stream.js";
 import { CATALOG_NATIVE_GRAMMAR, DURABLE_CODECS, requireTag } from "../durable-format.js";
@@ -52,6 +53,33 @@ export function validateRelationalCatalog(data: CatalogStreamData): void {
     const columns = columnMaps.get(table.id);
     check(columns !== undefined, "Missing table columns");
     for (const column of table.columns) {
+      if (column.defaultSource !== undefined) {
+        requireTag(
+          column.defaultSource,
+          DURABLE_CODECS.catalogDefaultSource,
+          "default source",
+          StoreCorruptionError,
+        );
+        const sql = column.defaultSql;
+        check(
+          sql !== null && column.identitySequence === null && column.generatedSql === null,
+          "Default source without an ordinary default",
+        );
+        if (column.defaultSource !== "expression") {
+          check(
+            column.defaultSource === "number"
+              ? column.declared.type === "number" || column.declared.sqlDomain?.kind === "numeric"
+              : column.declared.type === column.defaultSource,
+            "Default source differs from declared type",
+          );
+          try {
+            readDefaultLiteral(column.defaultSource, sql);
+          } catch (error) {
+            if (!(error instanceof TypeError || error instanceof RangeError)) throw error;
+            throw new StoreCorruptionError("Invalid stored literal default source");
+          }
+        }
+      }
       if (column.identitySequence !== null) {
         const sequence = sequences.get(column.identitySequence);
         check(

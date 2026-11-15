@@ -7077,3 +7077,50 @@ export const CATALOG_REAL_BACKFILL_REACH = [
   "catalog unchanged",
   "zero resources",
 ] as const;
+
+export const CATALOG_DEFAULT_SOURCE_REACH = [
+  "boolean",
+  "integer",
+  "float",
+  "text",
+  "enum",
+  "timestamp",
+  "timestamptz",
+  "numeric-number",
+  "numeric-string",
+  "expression spelling",
+  "literal JS type",
+  "checkpoint",
+  "WAL",
+  "idempotent",
+  "unrelated ALTER preserves source",
+  "ALTER source kind",
+  "default removal clears source",
+  "signed zero",
+  "empty text",
+  "zero resources",
+] as const;
+
+export const CATALOG_DEFAULT_COUNTER_REACH = [
+  "adopt counter",
+  "remove counter",
+  "float counter",
+  "integer counter",
+  "expression",
+  "literal",
+  "reopen idempotent",
+  "zero resources",
+] as const;
+export const CATALOG_DEFAULT_WIRE_REACH = [
+  "unknown tag",
+  "SQL absent",
+  "source type mismatch",
+  "nonfinite",
+  "invalid datetime",
+  "unclosed text",
+  "noncanonical boolean",
+  "generated default",
+  "noncanonical number",
+  "literal NULL",
+  "field16 required",
+] as const;
