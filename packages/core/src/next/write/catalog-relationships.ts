@@ -1,4 +1,5 @@
 /** Semantic admission for the relational catalog extensions, after wire/physical shape checks. */
+import { int64At } from "../vector/int64.js";
 import { readDefaultLiteral } from "../access/catalog-default-source.js";
 import type { ExpressionDependencies, ViewDef } from "../access/catalog.js";
 import type { CatalogStreamData } from "./catalog-stream.js";
@@ -53,6 +54,24 @@ export function validateRelationalCatalog(data: CatalogStreamData): void {
     const columns = columnMaps.get(table.id);
     check(columns !== undefined, "Missing table columns");
     for (const column of table.columns) {
+      if (column.backfillNegativeZero !== undefined) {
+        const missing = column.missing;
+        requireTag(
+          column.backfillNegativeZero,
+          DURABLE_CODECS.presentFlag,
+          "integer backfill signed-zero source",
+          StoreCorruptionError,
+        );
+        check(
+          (column.type.kind === "int32" || column.type.kind === "int64") &&
+            missing !== null &&
+            missing.length === 1 &&
+            (missing.validity === null || ((missing.validity[0] ?? 0) & 1) !== 0) &&
+            ((missing.data.layout === "i32" && missing.data.values[0] === 0) ||
+              (missing.data.layout === "int64" && int64At(missing.data.values, 0) === 0n)),
+          "Invalid integer backfill signed-zero source",
+        );
+      }
       if (column.defaultSource !== undefined) {
         requireTag(
           column.defaultSource,

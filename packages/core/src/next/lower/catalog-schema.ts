@@ -13,6 +13,7 @@ import { int128At } from "../vector/int128.js";
 function backfill(column: ColumnDef): boolean | number | string | Date | undefined {
   const value = column.missing;
   if (!value || (value.validity !== null && ((value.validity[0] ?? 0) & 1) === 0)) return undefined;
+  if (column.backfillNegativeZero) return -0;
   const data = value.data;
   switch (data.layout) {
     case "bool":

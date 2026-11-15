@@ -48,7 +48,7 @@ for (const seed of seedsFor("next-catalog-migrate-backfill", [0xb7ea, 0xb7eb]))
     await fc.assert(
       fc.asyncProperty(
         fc.constantFrom(...kinds),
-        fc.integer({ min: -1000, max: 1000 }),
+        fc.oneof(fc.integer({ min: -1000, max: 1000 }), fc.constant(-0)),
         fc.boolean(),
         fc.boolean(),
         async (kind, n, generated, checkpoint) => {
@@ -66,10 +66,12 @@ for (const seed of seedsFor("next-catalog-migrate-backfill", [0xb7ea, 0xb7eb]))
             await migrate();
             const expected = (await old.introspect()).tables[0]?.columns[1]?.backfill;
             expect(expected).toBeDefined();
-            const check = () =>
-              expect(
-                inspectCatalog(core.harness.path.catalog).tables[0]?.columns[1]?.backfill,
-              ).toEqual(expected);
+            const check = () => {
+              const actual = inspectCatalog(core.harness.path.catalog).tables[0]?.columns[1]
+                ?.backfill;
+              expect(actual).toEqual(expected);
+              if (kind === "integer") expect(Object.is(actual, -0)).toBe(Object.is(n, -0));
+            };
             check();
             expect(nativeCalls).toBe(generated ? 1 : 0);
             expect(shippedCalls).toBe(generated ? 1 : 0);
@@ -83,6 +85,7 @@ for (const seed of seedsFor("next-catalog-migrate-backfill", [0xb7ea, 0xb7eb]))
             expect(shippedCalls).toBe(generated ? 1 : 0);
             expect(core.harness.path.catalog.tableByName("initial")?.managed).toBe(true);
             reach.reach(kind);
+            if (kind === "integer" && Object.is(n, -0)) reach.reach("integer signed zero");
             reach.reach(generated ? "generator exactly once" : "literal");
             reach.reach(checkpoint ? "checkpoint" : "WAL");
             reach.reach("idempotent after reopen");
@@ -113,10 +116,14 @@ for (const seed of seedsFor("next-catalog-migrate-backfill", [0xb7ea, 0xb7eb]))
       {
         seed,
         numRuns: 32,
-        examples: kinds.flatMap((kind) => [
-          [kind, -7, false, false] as [(typeof kinds)[number], number, boolean, boolean],
-          [kind, 8, true, true] as [(typeof kinds)[number], number, boolean, boolean],
-        ]),
+        examples: [
+          ["integer", -0, false, false],
+          ["integer", -0, true, true],
+          ...kinds.flatMap((kind) => [
+            [kind, -7, false, false] as [(typeof kinds)[number], number, boolean, boolean],
+            [kind, 8, true, true] as [(typeof kinds)[number], number, boolean, boolean],
+          ]),
+        ],
       },
     );
     reach.assertReached();

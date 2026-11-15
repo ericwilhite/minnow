@@ -1,5 +1,7 @@
 /** Shipped ColumnDefault keeps the API source kind and JS value type, not just SQL spelling. */
 import fc from "fast-check";
+import { dateIsoString } from "../../date-value.js";
+import { catalogDate, dateOverrides } from "./catalog-date.test-support.js";
 import { expect, it } from "vitest";
 import { column, schema, table } from "../../engine/schema.js";
 import { MinnowDatabase } from "../../engine/database.js";
@@ -21,10 +23,15 @@ const kinds = [
   "numeric-number",
   "numeric-string",
 ] as const;
-function definition(kind: (typeof kinds)[number], n: number, expression: boolean) {
+function definition(
+  kind: (typeof kinds)[number],
+  n: number,
+  expression: boolean,
+  override: (typeof dateOverrides)[number],
+) {
   const text = kind === "text" && n === 0 ? "" : `汉'${String(n)}`,
     stringSql = `'${text.replaceAll("'", "''")}'`,
-    date = new Date(Date.UTC(2000, 1, 29, 12, 34, 56, 123) + n);
+    date = catalogDate(Date.UTC(2001, 1, 3, 4, 5, 6, 123) + n, override);
   const value =
     kind === "boolean"
       ? expression
@@ -58,12 +65,12 @@ function definition(kind: (typeof kinds)[number], n: number, expression: boolean
                     : column.numeric().default(`${String(n)}.250`)
                   : kind === "timestamp"
                     ? expression
-                      ? column.timestamp().defaultSql(`CAST('${date.toISOString()}' AS TIMESTAMP)`)
+                      ? column.timestamp().defaultSql(`CAST('${dateIsoString(date)}' AS TIMESTAMP)`)
                       : column.timestamp().default(date)
                     : expression
                       ? column
                           .datetime()
-                          .defaultSql(`CAST('${date.toISOString()}' AS TIMESTAMP WITH TIME ZONE)`)
+                          .defaultSql(`CAST('${dateIsoString(date)}' AS TIMESTAMP WITH TIME ZONE)`)
                       : column.datetime().default(date);
   return schema([table("defaults", { id: column.integer().unique(), value })]);
 }
@@ -73,14 +80,15 @@ for (const seed of seedsFor("next-catalog-default-source", [0xb7ec, 0xb7ed]))
     await fc.assert(
       fc.asyncProperty(
         fc.constantFrom(...kinds),
-        fc.integer({ min: -1000, max: 1000 }),
+        fc.oneof(fc.integer({ min: -1000, max: 1000 }), fc.constant(-0)),
         fc.boolean(),
         fc.boolean(),
-        async (kind, n, expression, checkpoint) => {
+        fc.constantFrom(...dateOverrides),
+        async (kind, n, expression, checkpoint, override) => {
           reach.beginHistory();
           const core = await new StorageCore().open(),
             old = new MinnowDatabase(new MemoryBlockStore()),
-            def = definition(kind, n, expression);
+            def = definition(kind, n, expression, override);
           const migrate = (next = def) =>
             migrateCatalog(core.harness.path, core.lowerer, core.harness.governor, next);
           try {
@@ -97,7 +105,7 @@ for (const seed of seedsFor("next-catalog-default-source", [0xb7ec, 0xb7ed]))
             await core.reopen();
             check();
             expect((await migrate()).steps).toEqual([]);
-            const alternate = definition(kind, n, !expression);
+            const alternate = definition(kind, n, !expression, override);
             await old.migrate(alternate);
             await migrate(alternate);
             expected = (await old.introspect()).tables[0]?.columns[1]?.defaultValue;
@@ -127,6 +135,11 @@ for (const seed of seedsFor("next-catalog-default-source", [0xb7ec, 0xb7ed]))
             check();
             reach.reach(kind);
             if (kind === "float" && n === 0) reach.reach("signed zero");
+            if (kind === "integer" && Object.is(n, -0)) reach.reach("integer signed zero");
+            if ((kind === "timestamp" || kind === "timestamptz") && override !== "none")
+              reach.reach(
+                override === "throw" ? "throwing Date methods" : "overridden Date methods",
+              );
             if (kind === "text" && n === 0) reach.reach("empty text");
             reach.reach(expression ? "expression spelling" : "literal JS type");
             reach.reach(checkpoint ? "checkpoint" : "WAL");
@@ -145,13 +158,30 @@ for (const seed of seedsFor("next-catalog-default-source", [0xb7ec, 0xb7ed]))
         numRuns: 36,
         examples: [
           ...kinds.flatMap((kind) => [
-            [kind, -7, false, false] as [(typeof kinds)[number], number, boolean, boolean],
-            [kind, 8, true, true] as [(typeof kinds)[number], number, boolean, boolean],
+            [kind, -7, false, false, "none"] as [
+              (typeof kinds)[number],
+              number,
+              boolean,
+              boolean,
+              (typeof dateOverrides)[number],
+            ],
+            [kind, 8, true, true, "none"] as [
+              (typeof kinds)[number],
+              number,
+              boolean,
+              boolean,
+              (typeof dateOverrides)[number],
+            ],
           ]),
-          ["float", 0, false, true],
-          ["float", 0, true, false],
-          ["text", 0, false, false],
-          ["text", 0, true, true],
+          ["float", 0, false, true, "none"],
+          ["float", 0, true, false, "none"],
+          ["text", 0, false, false, "none"],
+          ["text", 0, true, true, "none"],
+          ["integer", -0, false, true, "none"],
+          ["timestamp", 0, false, false, "epoch"],
+          ["timestamptz", 0, false, true, "epoch"],
+          ["timestamp", 1, false, true, "throw"],
+          ["timestamptz", -1, false, false, "throw"],
         ],
       },
     );

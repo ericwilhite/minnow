@@ -259,6 +259,7 @@ export function tableInput(
       generatedSql: front.generatedValue?.sql ?? null,
       identitySequence: null,
       missing: missingValue(front, type, catalog),
+      ...backfillMetadata(front.backfill, type),
       ...(front.defaultValue?.kind === "autoincrement"
         ? { identity: { start: 1n, increment: 1n } }
         : {}),
@@ -507,6 +508,16 @@ function rulesState(catalog: CatalogView): ExpressionState {
   };
 }
 
+/** Source metadata cannot live in a SQL integer vector, whose zero has no sign. */
+export function backfillMetadata(
+  value: unknown,
+  type: PhysicalType,
+): { backfillNegativeZero?: true } {
+  return Object.is(value, -0) && (type.kind === "int32" || type.kind === "int64")
+    ? { backfillNegativeZero: true }
+    : {};
+}
+
 /** Frozen API/ALTER backfill, never the current insert default. Runtime-only casts refuse. */
 export function missingValue(
   column: FrontEndColumn,
@@ -659,6 +670,7 @@ export function lowerDdl(statement: NativeStatement, catalog: CatalogView): DdlR
         generatedSql: null,
         identitySequence: null,
         missing: missingValue(front, type, catalog),
+        ...backfillMetadata(front.backfill, type),
         ...(namedType === undefined ? {} : { typeId: namedType.id }),
       };
       const next: TableInput = { ...input, columns: [...columns, added] };

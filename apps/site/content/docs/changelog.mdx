@@ -10,6 +10,12 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The private 1.0 catalog reads Date defaults and frozen backfills through captured Date
+intrinsics, so instance method overrides cannot replace the stored value. Integer backfill
+metadata also retains the API distinction between `-0` and `0` through WAL and checkpoint
+reopen; integer row values remain SQL zero. This adds a required-understanding MCAT column
+source flag to the unreleased format chain. Released 0.x behavior and formats are unchanged.
+
 The private 1.0 catalog retains whether a default came from a SQL expression or a literal,
 and the literal's original value type. Negative numbers, signed zero, Date values and NUMERIC
 number/string inputs survive introspection and reopen. Repeating an unchanged schema remains

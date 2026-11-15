@@ -686,6 +686,9 @@ export class Catalog implements CatalogView {
         ...(column.autoIncrement === true ? { autoIncrement: true as const } : {}),
         ...(column.identityAlways === true ? { identityAlways: true as const } : {}),
         missing: column.missing,
+        ...(column.backfillNegativeZero === undefined
+          ? {}
+          : { backfillNegativeZero: column.backfillNegativeZero }),
         ...(column.typeId === undefined ? {} : { typeId: column.typeId }),
         ...(column.allowedValues === undefined ? {} : { allowedValues: column.allowedValues }),
       };

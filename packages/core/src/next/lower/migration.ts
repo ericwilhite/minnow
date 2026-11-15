@@ -5,7 +5,14 @@ import { defaultSourceOf } from "../access/catalog-default-source.js";
 import type { ColumnDefinition } from "../../engine/catalog-mutations.js";
 import type { CatalogChange, CatalogView, TableInput } from "../access/catalog.js";
 import type { Lowerer, LoweringContext } from "./lowerer.js";
-import { currentInput, defaultSqlOf, missingValue, tableInput, validateRules } from "./ddl.js";
+import {
+  backfillMetadata,
+  currentInput,
+  defaultSqlOf,
+  missingValue,
+  tableInput,
+  validateRules,
+} from "./ddl.js";
 import { declaredColumnType } from "./columns.js";
 import { PlanningError, unsupported } from "./errors.js";
 import { samePhysicalType } from "../types.js";
@@ -187,6 +194,7 @@ export function lowerMigrationStep(
         step.backfill === undefined
           ? null
           : missingValue({ ...widths, backfill: step.backfill }, type, catalog),
+      ...backfillMetadata(step.backfill, type),
       ...(step.definition.enumValues ? { allowedValues: step.definition.enumValues } : {}),
     });
   } else {

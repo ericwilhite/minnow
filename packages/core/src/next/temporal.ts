@@ -13,6 +13,7 @@
  * Years are astronomical in ISO text (0000 is 1 BC, −0001 is 2 BC) and PostgreSQL-style ("BC")
  * in DATE text. Calendar is proleptic Gregorian, as in PostgreSQL.
  */
+import { dateMilliseconds } from "../date-value.js";
 import { INT32_MAX, INT32_MIN, INT64_MAX, INT64_MIN } from "./types.js";
 
 /** Days from 1970-01-01 to 2000-01-01. */
@@ -175,7 +176,7 @@ export function parseTimestamp(text: string): bigint | null {
 
 /** A JS Date (ms since 1970) → stored µs. Exact to the millisecond. */
 export function timestampFromDate(date: Date): bigint {
-  const millis = date.getTime();
+  const millis = dateMilliseconds(date);
   if (!Number.isFinite(millis)) throw new RangeError("Invalid Date");
   return BigInt(millis) * 1000n - PG_EPOCH_UNIX_MICROS;
 }

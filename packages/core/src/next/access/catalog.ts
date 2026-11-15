@@ -125,6 +125,8 @@ export interface ColumnDef {
    * when such rows read as SQL NULL.
    */
   readonly missing: FlatVector | null;
+  /** Preserve the API backfill's -0 spelling; integer missing vectors store SQL zero. */
+  readonly backfillNegativeZero?: true;
   /** A named enum identity; closed text sets use allowedValues instead. */
   readonly typeId?: number;
   readonly allowedValues?: readonly string[];

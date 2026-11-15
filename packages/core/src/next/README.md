@@ -362,7 +362,8 @@ its memory-store results exclude payload fetch, SQL, owner transport and real di
 
 ## Dependency rules
 
-`dependency-rules.test.ts` enforces these.
+`dependency-rules.test.ts` enforces these. The representation-neutral `src/date-value.ts`
+leaf supplies captured Date intrinsics to both engines; it cannot import either executor.
 
 - Nothing outside `next/` imports `next/` until cut-over.
 - Inside `next/`, each module imports only the layers below it:

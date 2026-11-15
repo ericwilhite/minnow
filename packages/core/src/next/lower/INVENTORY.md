@@ -857,3 +857,8 @@ FLOAT8's sign. Default replacement/removal and counter adoption clear old source
 suite compare shipped metadata and no-op migration behavior across ordinary WAL/checkpoint
 reopen, including NUMERIC numbers versus strings and literal-looking SQL expressions.
 Field framing and minimum reader/writer policy remain the separate pending proposal.
+
+Catalog source metadata uses captured Date intrinsics for caller-supplied defaults and frozen
+backfills. Column family4 field17 retains an integer API backfill's negative zero for
+introspection/migration; physical missing/row integer values remain SQL zero. The flag is
+required-understanding when present and valid only beside a non-NULL integer missing zero.

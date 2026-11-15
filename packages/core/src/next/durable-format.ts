@@ -363,6 +363,7 @@ export const CATALOG_RECORD_SCHEMAS = {
     "autoIncrement:b~!",
     "identityAlways:b~!",
     "defaultSource:s~!",
+    "backfillNegativeZero:b~!",
   ],
   physical: [
     "kind:s",

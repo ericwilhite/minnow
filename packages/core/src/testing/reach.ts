@@ -6991,6 +6991,9 @@ export const TRIGGER_RI_UNIQUE_REACH = [
 ] as const;
 
 export const CATALOG_CREATE_BACKFILL_REACH = [
+  "integer signed zero",
+  "overridden Date methods",
+  "throwing Date methods",
   "generated backfill refused before mutation",
   "boolean",
   "integer",
@@ -7054,6 +7057,7 @@ export const CATALOG_INFORMATIONAL_WIRE_REACH = [
 ] as const;
 
 export const CATALOG_MIGRATE_BACKFILL_REACH = [
+  "integer signed zero",
   "boolean",
   "integer",
   "float",
@@ -7079,6 +7083,9 @@ export const CATALOG_REAL_BACKFILL_REACH = [
 ] as const;
 
 export const CATALOG_DEFAULT_SOURCE_REACH = [
+  "integer signed zero",
+  "overridden Date methods",
+  "throwing Date methods",
   "boolean",
   "integer",
   "float",
@@ -7123,4 +7130,16 @@ export const CATALOG_DEFAULT_WIRE_REACH = [
   "noncanonical number",
   "literal NULL",
   "field16 required",
+] as const;
+
+export const CATALOG_BACKFILL_SIGN_REACH = [
+  "int32",
+  "int64",
+  "false sign",
+  "missing absent",
+  "missing NULL",
+  "nonzero value",
+  "noninteger type",
+  "required flag",
+  "downgrade refused",
 ] as const;

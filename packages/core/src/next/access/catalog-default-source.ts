@@ -1,6 +1,7 @@
 /** Lossless source identity for the schema API's literal-versus-SQL defaults.
  * The existing defaultSql is the payload; this discriminator never duplicates wide text.
  */
+import { dateIsoString, dateMilliseconds } from "../../date-value.js";
 import type { ColumnDefault } from "../../storage/types.js";
 import type { DURABLE_CODECS } from "../durable-format.js";
 export type CatalogDefaultSource = (typeof DURABLE_CODECS.catalogDefaultSource)[number];
@@ -22,9 +23,9 @@ export function defaultLiteralSql(value: boolean | number | string | Date): stri
     // text casts into the column's type instead; FLOAT8 retains the original signed zero.
     return Object.is(value, -0) ? "'-0'" : String(value);
   }
-  if (value instanceof Date && !Number.isFinite(value.getTime()))
+  if (value instanceof Date && !Number.isFinite(dateMilliseconds(value)))
     throw new TypeError("Default literal must be a valid Date");
-  const text = value instanceof Date ? value.toISOString() : value;
+  const text = value instanceof Date ? dateIsoString(value) : value;
   return `'${text.replaceAll("'", "''")}'`;
 }
 function quoted(sql: string): string {
@@ -49,7 +50,8 @@ export function readDefaultLiteral(
       return quoted(sql);
     case "datetime": {
       const value = new Date(quoted(sql));
-      if (Number.isFinite(value.getTime()) && defaultLiteralSql(value) === sql) return value;
+      if (Number.isFinite(dateMilliseconds(value)) && defaultLiteralSql(value) === sql)
+        return value;
       break;
     }
   }

@@ -2,6 +2,8 @@
  * Authority: storage/types.ts TableColumnRecord.backfill and the shipped public introspector.
  */
 import fc from "fast-check";
+import { dateMilliseconds } from "../../date-value.js";
+import { catalogDate, dateOverrides } from "./catalog-date.test-support.js";
 import { expect, it } from "vitest";
 import { MinnowDatabase, type CreateTableInput } from "../../engine/database.js";
 import { MemoryBlockStore } from "../../storage/index.js";
@@ -12,7 +14,11 @@ import { StorageCore } from "./storage-core.js";
 import { oracleRows } from "./differential-adapter.js";
 
 const kinds = ["boolean", "integer", "float", "text", "enum", "timestamp", "timestamptz"] as const;
-function definition(kind: (typeof kinds)[number], n: number): CreateTableInput {
+function definition(
+  kind: (typeof kinds)[number],
+  n: number,
+  override: (typeof dateOverrides)[number],
+): CreateTableInput {
   const base = { name: "value", nullable: false };
   const column =
     kind === "boolean"
@@ -31,7 +37,7 @@ function definition(kind: (typeof kinds)[number], n: number): CreateTableInput {
             : {
                 ...base,
                 type: "datetime" as const,
-                backfill: new Date(Date.UTC(2000, 1, 29, 12, 34, 56, 123) + n),
+                backfill: catalogDate(Date.UTC(2001, 1, 3, 4, 5, 6, 123) + n, override),
                 ...(kind === "timestamp" ? { withoutTimeZone: true as const } : {}),
               };
   return {
@@ -51,11 +57,12 @@ for (const seed of seedsFor("next-catalog-create-backfill", [0xb7e2, 0xb7e3]))
     await fc.assert(
       fc.asyncProperty(
         fc.constantFrom(...kinds),
-        fc.integer({ min: -1000, max: 1000 }),
+        fc.oneof(fc.integer({ min: -1000, max: 1000 }), fc.constant(-0)),
         fc.boolean(),
-        async (kind, n, checkpoint) => {
+        fc.constantFrom(...dateOverrides),
+        async (kind, n, checkpoint, override) => {
           reach.beginHistory();
-          const input = definition(kind, n),
+          const input = definition(kind, n, override),
             core = await new StorageCore(4).open(),
             old = new MinnowDatabase(new MemoryBlockStore());
           try {
@@ -66,9 +73,20 @@ for (const seed of seedsFor("next-catalog-create-backfill", [0xb7e2, 0xb7e3]))
             const check = () => {
               const actual = inspectCatalog(core.harness.path.catalog).tables[0]?.columns[1];
               expect(actual?.backfill).toEqual(expected?.backfill);
-              // Native defaults are normalized SQL; the old API literal/expression tag is
-              // not its storage format. Assert preservation independently of that tag.
-              expect(actual?.defaultValue).toBeDefined();
+              if (expected?.backfill instanceof Date) {
+                expect(actual?.backfill).toBeInstanceOf(Date);
+                expect(dateMilliseconds(actual?.backfill as Date)).toBe(
+                  dateMilliseconds(expected.backfill),
+                );
+              }
+              if (kind === "integer") {
+                expect(Object.is(actual?.backfill, -0)).toBe(Object.is(n, -0));
+                expect(actual?.defaultValue?.kind).toBe("literal");
+                if (actual?.defaultValue?.kind === "literal")
+                  expect(Object.is(actual.defaultValue.value, -0)).toBe(Object.is(n, -0));
+              }
+              // Source identity and its Date/number value survive independently of SQL row storage.
+              expect(actual?.defaultValue).toEqual(expected?.defaultValue);
               expect(core.harness.path.catalog.encode()).toEqual(catalogBytes);
               expect(core.harness.path.catalog.tables[0]?.columns[1]?.missing).not.toBeNull();
               expect(core.harness.path.catalog.tables[0]?.columns[0]?.missing).toBeNull();
@@ -89,6 +107,11 @@ for (const seed of seedsFor("next-catalog-create-backfill", [0xb7e2, 0xb7e3]))
             expect(core.harness.path.catalog.encode()).toEqual(catalogBytes);
             reach.reach("generated backfill refused before mutation");
             reach.reach(kind);
+            if (kind === "integer" && Object.is(n, -0)) reach.reach("integer signed zero");
+            if ((kind === "timestamp" || kind === "timestamptz") && override !== "none")
+              reach.reach(
+                override === "throw" ? "throwing Date methods" : "overridden Date methods",
+              );
             const value = input.columns[1]?.backfill;
             if (value === undefined) throw new Error("missing generated input");
             await old.insertBatch("frozen", [{ id: 1, value }]);
@@ -119,10 +142,28 @@ for (const seed of seedsFor("next-catalog-create-backfill", [0xb7e2, 0xb7e3]))
       {
         seed,
         numRuns: 24,
-        examples: kinds.flatMap((kind) => [
-          [kind, -7, false] as [(typeof kinds)[number], number, boolean],
-          [kind, 8, true] as [(typeof kinds)[number], number, boolean],
-        ]),
+        examples: [
+          ["timestamp", 0, false, "epoch"],
+          ...kinds.flatMap((kind) => [
+            [kind, -7, false, "none"] as [
+              (typeof kinds)[number],
+              number,
+              boolean,
+              (typeof dateOverrides)[number],
+            ],
+            [kind, 8, true, "none"] as [
+              (typeof kinds)[number],
+              number,
+              boolean,
+              (typeof dateOverrides)[number],
+            ],
+          ]),
+          ["integer", -0, false, "none"],
+          ["integer", -0, true, "none"],
+          ["timestamptz", 0, true, "epoch"],
+          ["timestamp", 1, true, "throw"],
+          ["timestamptz", -1, false, "throw"],
+        ],
       },
     );
     reach.assertReached();
