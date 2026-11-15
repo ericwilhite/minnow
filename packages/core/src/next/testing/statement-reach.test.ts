@@ -24,6 +24,7 @@ it.each(seedsFor("next-statement-rule-reach", [0xb5cd]))(
             "CREATE TABLE c(id INTEGER PRIMARY KEY,pid INTEGER REFERENCES p(id) ON DELETE SET NULL)",
             "CREATE TABLE sink(v INTEGER CHECK(v>=0))",
             "CREATE TABLE info_sink(v INTEGER CHECK(v>=0))",
+            "CREATE TABLE tail(v INTEGER CHECK(v>=0))",
             "CREATE TABLE gp(id INTEGER PRIMARY KEY,base INTEGER,k INTEGER GENERATED ALWAYS AS(base+1) STORED UNIQUE)",
             "CREATE TABLE gc(pid INTEGER REFERENCES gp(k))",
             "CREATE TABLE driver(id INTEGER PRIMARY KEY,v INTEGER)",
@@ -32,7 +33,7 @@ it.each(seedsFor("next-statement-rule-reach", [0xb5cd]))(
             "INSERT INTO c VALUES(1,1)",
             "CREATE TRIGGER tc AFTER UPDATE ON c BEGIN UPDATE side SET pid=NEW.pid,v=COALESCE(NEW.pid,0) WHERE id=NEW.id;END",
             "CREATE TRIGGER ts AFTER UPDATE ON side BEGIN INSERT INTO sink(v) VALUES(NEW.v);END",
-            "CREATE TRIGGER back AFTER INSERT ON sink BEGIN UPDATE side SET v=NEW.v WHERE id=1;END",
+            "CREATE TRIGGER back AFTER INSERT ON sink BEGIN INSERT INTO tail(v) VALUES(NEW.v);UPDATE side SET v=NEW.v WHERE id=1;END",
             "CREATE TRIGGER tg AFTER UPDATE ON gc BEGIN INSERT INTO sink(v) VALUES(NEW.pid);END",
             "CREATE TRIGGER drive AFTER UPDATE ON driver BEGIN UPDATE gp SET base=NEW.v WHERE id=NEW.id;END",
           ])
@@ -69,11 +70,19 @@ it.each(seedsFor("next-statement-rule-reach", [0xb5cd]))(
           const names = (ids: readonly number[]) =>
             ids.map((id) => withInfo.table(id)?.name).sort();
           const update = root(`UPDATE p SET id=id+${String(delta)}`);
-          expect(names(statementRuleReach(withInfo, parent.id, update, 0).tables)).toEqual([
+          expect(names(statementRuleReach(withInfo, parent.id, update, -1).tables)).toEqual([
             "c",
             "info",
             "p",
             "side",
+          ]);
+          expect(names(statementRuleReach(withInfo, parent.id, update, 0).tables)).toEqual([
+            "c",
+            "info",
+            "info_sink",
+            "p",
+            "side",
+            "sink",
           ]);
           expect(names(statementRuleReach(withInfo, parent.id, update, 1).tables)).toEqual([
             "c",
@@ -82,11 +91,13 @@ it.each(seedsFor("next-statement-rule-reach", [0xb5cd]))(
             "p",
             "side",
             "sink",
+            "tail",
           ]);
           expect(statementRuleReach(catalog, parent.id, update, 0).triggers).toBe(true);
           reach.reach("FK preserves budget");
           reach.reach("budget diamond");
-          reach.reach("budget zero refuses");
+          reach.reach("budget zero fires");
+          reach.reach("negative budget writes without firing");
           reach.reach("informational update only");
           const lookedUp: number[] = [];
           const scope = new StatementRules(
@@ -100,7 +111,7 @@ it.each(seedsFor("next-statement-rule-reach", [0xb5cd]))(
           );
           expect(scope.requiresTriggers).toBe(true);
           expect(scope.minimumBytes()).toBeGreaterThan(0);
-          expect(names(lookedUp)).toEqual(["info_sink", "side", "sink"]);
+          expect(names(lookedUp)).toEqual(["info_sink", "side", "sink", "tail"]);
           reach.reach("rule minimum includes body targets");
           await scope.close();
           const harmless = root("UPDATE p SET v=v+1");
@@ -112,19 +123,21 @@ it.each(seedsFor("next-statement-rule-reach", [0xb5cd]))(
           reach.reach("insert stops FK edge");
           expect(
             names(statementRuleReach(withInfo, parent.id, root("DELETE FROM p")).tables),
-          ).toEqual(["c", "side"]);
+          ).toEqual(["c", "side", "sink"]);
           reach.reach("delete event differs");
           const generated = root(`UPDATE gp SET base=base+${String(delta)}`);
           expect(names(statementRuleReach(catalog, generated.tableId, generated).tables)).toEqual([
             "gc",
             "gp",
+            "side",
             "sink",
+            "tail",
           ]);
           expect(statementRuleReach(catalog, generated.tableId, generated).triggers).toBe(true);
           const bodyGenerated = root(`UPDATE driver SET v=v+${String(delta)}`);
           expect(
             names(statementRuleReach(catalog, bodyGenerated.tableId, bodyGenerated).tables),
-          ).toEqual(["driver", "gc", "gp"]);
+          ).toEqual(["driver", "gc", "gp", "sink"]);
           reach.reach("generated key propagation");
           for (const sql of [
             `UPDATE p SET id=id+${String(delta)}${returning ? " RETURNING id" : ""}`,

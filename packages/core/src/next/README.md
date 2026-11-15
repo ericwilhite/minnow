@@ -4091,3 +4091,9 @@ FTS preparation overlays keep the native root's provisional retirement and build
 bookkeeping through every root clone, including extent-list replacement. Adoption of the exact
 installed root drains deferred native staging retirement once (R25); a preparation publication
 must not leave that retirement queued for the next table publication.
+
+Native statement rule admission follows the shipped trigger budget: root1 and body0 may
+fire, and their body at -1 may write but cannot fire another matching user trigger.
+Referential actions preserve that signed budget. The static walk includes rules for both
+body levels and distinguishes the same table reached with different budgets; SQL trigger
+firing remains guarded until the joint runtime is installed.

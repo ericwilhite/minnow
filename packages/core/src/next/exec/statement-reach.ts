@@ -18,8 +18,8 @@ export function statementRuleReach(
   modify?: Extract<Rel, { op: "modify" }>,
   budget = 1,
 ): RuleReach {
-  if (!Number.isInteger(budget) || budget < 0)
-    throw new RangeError("Nonnegative trigger budget required");
+  if (!Number.isInteger(budget) || budget < -1)
+    throw new RangeError("Trigger budget must be an integer at least -1");
   const pending: Work[] = [],
     tables = new Set<number>();
   const seen = new Map<string, Set<number> | null>();
@@ -67,8 +67,8 @@ export function statementRuleReach(
     for (const trigger of catalog.triggers) {
       if (trigger.tableId !== own.id || trigger.event !== state.event) continue;
       triggers = true;
-      // A matching trigger at budget0 must be refused by the controller, never silently skipped.
-      if (state.budget === 0) continue;
+      // Shipped recursion fires at 1 and 0; a body may write at -1, but cannot fire again.
+      if (state.budget < 0) continue;
       for (const body of trigger.statements)
         enqueue(
           body.targetTableId,
@@ -89,8 +89,8 @@ export function statementRuleReach(
         } else {
           const index = own.indexes.find((i) => i.id === fk.parentIndexId);
           if (assigned !== null && !index?.columnIds.some((id) => assigned.has(id))) continue;
-          // Existing metadata's update mode is follow, including informational references.
-          // B6's additive descriptor will select exact explicit actions at this boundary.
+          // Conservative reach until the RI driver consumes exact action descriptors.
+          // Informational follow references also need their child's row rules.
           const columns = [
             ...fk.columnIds,
             ...child.columns.filter((c) => c.generatedSql !== null).map((c) => c.id),
