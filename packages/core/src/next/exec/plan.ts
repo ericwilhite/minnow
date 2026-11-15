@@ -3005,8 +3005,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       });
     }
     for (const [id, columns] of compoundColumns)
-      if (active.has(id))
-        runtime.operatorParameterColumns(id, columns, compoundCopies.get(id) ?? 1);
+      if (active.has(id)) runtime.operatorParameterColumns(id, columns, compoundCopies.get(id));
     const modificationSources = new Map<number, Set<number>>();
     const modification = plan.root;
     if (modification.op === "modify" && modification.deferGenerated && runtime.request.rowRules) {
