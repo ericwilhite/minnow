@@ -3908,3 +3908,12 @@ invalidation dominates insert-part construction in that transaction. The bounded
 retains mutation history for the later build/fold eligibility check; it is not portable MCAT.
 No extra development selector is needed because MFTJ1 already reserves the keyed event.
 The SQL scan route and shipped engine behavior are unchanged.
+
+FTS recovery reads the checked checkpoint head once and passes its actual covered LSN to
+`Replayer` independently of global/catalog/ledger and per-table row coverage. A conservative
+global checkpoint can lag FTS coverage: rows still replay while the already-checkpointed FTS
+claim does not claim newer staging. A newer claim must still name its protected preparation.
+Log coverage validation includes the FTS checkpoint; a missing WAL suffix is corruption.
+Real-owner COMMIT tests check in-flight, terminal, reopened and checkpointed retries before
+native preparation, including a retry while a later transaction owns uncommitted rows.
+The fixture feeds native row writers because B5b's SQL modify executor is a separate merge.

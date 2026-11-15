@@ -6933,3 +6933,33 @@ export const FTS_MUTATION_HISTORY_REACH = [
   "competing grant",
   "reopen",
 ] as const;
+
+/** FTS has independent actual-LSN coverage; replay and conservative global roots apply once. */
+export const FTS_INDEPENDENT_REPLAY_REACH = [
+  "global trails FTS",
+  "rows once",
+  "each claim once",
+  "actual LSNs",
+  "repeated reopen",
+  "recycle",
+] as const;
+
+/** Native FTS work must occur after the real owner ledger's exactly-once admission. */
+export const FTS_OWNER_DEDUPE_REACH = [
+  "in flight",
+  "terminal retry",
+  "replayed ledger",
+  "rows once",
+  "parts once",
+  "checkpointed ledger",
+  "later transaction untouched",
+] as const;
+
+/** Native FTS checkpoint authority cannot be replaced by row/global coverage. */
+export const FTS_REPLAY_COVERAGE_REACH = [
+  "FTS covered rows replay",
+  "new claim",
+  "missing WAL refused",
+  "complete WAL",
+  "global independent",
+] as const;

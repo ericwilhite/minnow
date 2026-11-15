@@ -1,3 +1,4 @@
+import { ftsReplayCoverage } from "./fts-replay.js";
 import { FTS_PUBLICATION_MINIMUM_BYTES } from "./fts-minimum.js";
 import type { FtsWriteRenderer } from "../access/fts-write.js";
 import { requireFtsSemantics } from "../fts-config.js";
@@ -1062,6 +1063,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const session = this.#session;
     const checkpoint = {
       rootSequence: root.sequence,
+      ftsThroughLsn: await ftsReplayCoverage(
+        root.fts.checkpoint,
+        this.#metadataBudget,
+        this.#space,
+        this.#signal,
+      ),
       globalLsn: root.globalLsn,
       nextTableId: root.nextTableId,
       tables: new Map(

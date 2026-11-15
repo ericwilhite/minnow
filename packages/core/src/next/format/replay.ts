@@ -51,6 +51,8 @@
  *    the old log's last LSN, in the root that switches salt (format/manifest.ts).
  *
  * ## Rules for the transaction at LSN L (applied when its last part is read)
+ * - FTS claims apply iff L > both globalLsn and the native FTS checkpoint LSN.
+ *   A checkpoint can lead global coverage; replaying rows never claims that FTS delta twice.
  * - Global effects apply iff L > globalLsn, in order:
  *   - createTable(id): id ≥ nextTableId; the table starts with flushedThroughLsn = L − 1, version 1.
  *   - alterTable(id, v): the table exists and v = version + 1.
@@ -80,6 +82,8 @@ export interface ReplayCheckpoint {
   /** The durable root's sequence (for `publishedRows`). */
   readonly rootSequence?: number;
   readonly globalLsn: number;
+  /** Complete native FTS checkpoint, which may lead global catalog/ledger coverage. */
+  readonly ftsThroughLsn?: number;
   readonly nextTableId: number;
   readonly tables: ReadonlyMap<number, TableCheckpoint>;
 }
@@ -108,6 +112,7 @@ export type Effect =
 
 export class Replayer {
   readonly #globalLsn: number;
+  readonly #ftsThroughLsn: number;
   readonly #rootSequence: number;
   readonly #tables: Map<number, TableCheckpoint>;
   readonly #unclaimed = new Map<number, Map<number, StagedTransaction>>();
@@ -116,6 +121,7 @@ export class Replayer {
 
   constructor(checkpoint: ReplayCheckpoint) {
     this.#globalLsn = checkpoint.globalLsn;
+    this.#ftsThroughLsn = checkpoint.ftsThroughLsn ?? 0;
     this.#rootSequence = checkpoint.rootSequence ?? 0;
     this.#nextTableId = checkpoint.nextTableId;
     this.#tables = new Map(checkpoint.tables);
@@ -144,7 +150,7 @@ export class Replayer {
 
   /** The coverage rule; call with the scan's `lastLsn` before replaying. */
   static checkCoverage(checkpoint: ReplayCheckpoint, lastLsn: number): void {
-    let needed = checkpoint.globalLsn;
+    let needed = Math.max(checkpoint.globalLsn, checkpoint.ftsThroughLsn ?? 0);
     for (const table of checkpoint.tables.values())
       needed = Math.max(needed, table.flushedThroughLsn);
     if (lastLsn < needed)
@@ -173,8 +179,9 @@ export class Replayer {
     const global = lsn > this.#globalLsn;
     return effects.map((effect) => {
       switch (effect.kind) {
-        case "catalog":
         case "fts":
+          return global && lsn > this.#ftsThroughLsn;
+        case "catalog":
         case "sequence":
         case "request":
           return global;
