@@ -67,6 +67,23 @@ export async function ftsParts(h: Harness) {
       held.release();
     }
   }
+  const latest = await maybeLastFtsCommit(h);
+  const inline = latest?.body.effects.filter((effect) => effect.kind === "ftsMutation") ?? [];
+  if (latest && inline.length > 0 && (lsn === null || latest.lastLsn > lsn)) {
+    const entries: FtsJournalEntry[] = inline.map((effect) => ({
+      kind: "keyed",
+      tableId: effect.tableId,
+      schemaVersion: effect.schemaVersion,
+      ftsId: 0,
+      columnId: 0,
+      generation: 0,
+      mutationEpoch: latest.lastLsn,
+    }));
+    if (ref && latest.body.effects.some((effect) => effect.kind === "fts"))
+      for await (const e of ftsPreparedEntries(ref, b, h.space)) entries.push(structuredClone(e));
+    expect(b.held).toBe(0);
+    return { entries, lsn: latest.lastLsn };
+  }
   if (!ref) throw new Error("Missing native FTS preparation");
   const entries: FtsJournalEntry[] = [];
   for await (const e of ftsPreparedEntries(ref, b, h.space)) entries.push(structuredClone(e));
@@ -74,7 +91,7 @@ export async function ftsParts(h: Harness) {
   return { entries, lsn };
 }
 
-export async function lastFtsCommit(h: Harness) {
+async function maybeLastFtsCommit(h: Harness) {
   const session = sessions.get(h);
   if (!session) throw new Error("Missing FTS fixture session");
   const scan = scanLog(
@@ -83,7 +100,7 @@ export async function lastFtsCommit(h: Harness) {
     h.path.state().root.log,
   );
   const last = scan.frames.at(-1);
-  if (!last) throw new Error("Missing commit frame");
+  if (!last) return null;
   const start = last.lsn - last.partIndex,
     frames = scan.frames.filter((f) => f.lsn - f.partIndex === start);
   const bytes = new Uint8Array(frames.reduce((n, f) => n + f.body.length, 0));
@@ -93,4 +110,10 @@ export async function lastFtsCommit(h: Harness) {
     at += f.body.length;
   }
   return { body: decodeBody(bytes), firstLsn: start, lastLsn: last.lsn, parts: frames.length };
+}
+
+export async function lastFtsCommit(h: Harness) {
+  const result = await maybeLastFtsCommit(h);
+  if (!result) throw new Error("Missing commit frame");
+  return result;
 }

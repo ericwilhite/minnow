@@ -147,6 +147,7 @@ export const DURABLE_CODECS = {
     rows: 6,
     publishedRows: 7,
     fts: 8,
+    ftsMutation: 9,
   },
   column: {
     bool: 1,

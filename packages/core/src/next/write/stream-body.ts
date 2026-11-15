@@ -1,3 +1,4 @@
+import { ftsMutationScan } from "./fts-undo.js";
 /** Registered commit bytes projected a frame at a time without materialized columns. */
 import { DURABLE_CODECS, DURABLE_FORMATS } from "../durable-format.js";
 import { catalogChangeByteLength, writeCatalogChange } from "./catalog-stream.js";
@@ -324,6 +325,10 @@ export async function streamBody(
     count++;
     await pause(check);
   }
+  for (const mutation of ftsMutationScan(tx)) {
+    if (mutation !== null) count++;
+    await pause(check);
+  }
   if (tx.ftsEffect) count++;
   writer.varuint(count);
   let orderOffset = 0;
@@ -422,6 +427,13 @@ export async function streamBody(
         break;
       }
     }
+  }
+  for (const mutation of ftsMutationScan(tx)) {
+    await pause(check);
+    if (mutation === null) continue;
+    writer.u8(KIND.ftsMutation);
+    writer.varuint(mutation.tableId);
+    writer.varuint(mutation.schemaVersion);
   }
   if (tx.ftsEffect) {
     writer.u8(KIND.fts);

@@ -82,15 +82,16 @@ for (const seed of seedsFor("next-fts-mutation-history", [0xb851, 0xb852]))
                 const mutated = mode === "upsert" || mode === "delete";
                 expect(receipt.wrote).toBe(mutated);
                 if (mutated) {
+                  const logged = await lastFtsCommit(h);
                   expect(
-                    path.state().root.fts.staged ?? path.state().root.fts.checkpoint,
-                    "accepted keyed history must have a protected journal",
-                  ).not.toBeNull();
+                    logged.body.effects.some((effect) => effect.kind === "ftsMutation"),
+                    "reference-free keyed history is protected by its atomic WAL body",
+                  ).toBe(true);
                   expect((await ftsParts(h)).entries).toMatchObject([
                     { kind: "keyed", tableId: 1, ftsId: 0 },
                   ]);
                   expect(
-                    (await lastFtsCommit(h)).body.effects.filter((e) => e.kind === "fts"),
+                    (await lastFtsCommit(h)).body.effects.filter((e) => e.kind === "ftsMutation"),
                   ).toHaveLength(1);
                   reach.reach("accepted");
                   if (!hasDefinition) reach.reach("no definition");

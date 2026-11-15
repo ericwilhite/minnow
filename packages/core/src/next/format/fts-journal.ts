@@ -28,6 +28,8 @@ export interface FtsInsertPart {
   readonly documents: FtsDocumentRef;
   readonly terms: FtsTermRef | null;
 }
+/** For table-wide keyed entries mutationEpoch is the first accepted commit LSN in
+ * this checkpoint interval. It preserves the snapshot boundary when entries share a page. */
 export interface FtsInvalidation {
   readonly kind: "invalidate" | "keyed";
   readonly tableId: number;

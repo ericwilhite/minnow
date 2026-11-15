@@ -97,6 +97,7 @@ export type Effect =
   | { readonly kind: "sequence" }
   | { readonly kind: "request" }
   | { readonly kind: "fts" }
+  | { readonly kind: "ftsMutation"; readonly tableId: number; readonly schemaVersion: number }
   | { readonly kind: "rows"; readonly tableId: number; readonly schemaVersion: number }
   | {
       readonly kind: "publishedRows";
@@ -179,6 +180,14 @@ export class Replayer {
     const global = lsn > this.#globalLsn;
     return effects.map((effect) => {
       switch (effect.kind) {
+        case "ftsMutation": {
+          if (!global || lsn <= this.#ftsThroughLsn) return false;
+          const table = this.#tables.get(effect.tableId);
+          if (!table) return this.#absentTable(effect.tableId, global);
+          if (effect.schemaVersion > table.schemaVersion)
+            throw new LogCorruptionError("FTS mutation has future schema");
+          return true;
+        }
         case "fts":
           return global && lsn > this.#ftsThroughLsn;
         case "catalog":

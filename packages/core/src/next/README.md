@@ -3901,13 +3901,25 @@ before row append and retained with undo; rollback removes it and commit drops u
 refunding it. Repeated notifications do not allocate. Native delete undo remains the safety net.
 
 At statement completion the check/prefix views retire before prepaying the complete future
-journal phase. A table-wide `keyed` journal event (`ftsId=0`) is protected before WAL and
-claimed with the accepted rows, even when the table has no FTS declaration. It checkpoints
-under the actual commit LSN before global coverage. One event covers every binding; keyed
-invalidation dominates insert-part construction in that transaction. The bounded journal
-retains mutation history for the later build/fold eligibility check; it is not portable MCAT.
-No extra development selector is needed because MFTJ1 already reserves the keyed event.
-The SQL scan route and shipped engine behavior are unchanged.
+journal phase. A reference-free `ftsMutation` effect (body7 tag9) commits keyed history in the
+same WAL body as accepted rows, even without an FTS declaration. It needs no new root while
+another native publication is held. Only posting/document payload references require protected
+staging before WAL. Keyed invalidation dominates insert-part construction for that table.
+
+`write/fts-mutations.ts` prepays bounded table records and shared commit cells before allocation.
+R9 fills the cell with the actual appender LSN, without allocation, IO or a per-table loop.
+Repeated keyed writes cannot restore append-only eligibility: the first accepted boundary
+remains authoritative until checkpoint. Decoder/encoder progress is sliced on the shared clock.
+Covered records reclaim only after active preparation and borrowed checkpoint readers drain.
+The native metadata account includes every retained record and commit cell through close.
+
+Before global coverage advances, bounded journal pages checkpoint inline history as table-wide
+`keyed` events (`ftsId=0`), with the actual invalidation LSN as their monotone mutation epoch.
+Posting claims checkpoint at their own commit LSN first; later invalidations get separate
+checkpoints, never relabeling an earlier insert delta. Future indexed readers/builders must
+combine snapshot-visible pending cells and journal history before choosing acceleration.
+The SQL scan route and shipped engine behavior are unchanged. The new tag is part of the
+unmerged development manifest9/body7 unit; it changes no supported stored predecessor.
 
 FTS recovery reads the checked checkpoint head once and passes its actual covered LSN to
 `Replayer` independently of global/catalog/ledger and per-table row coverage. A conservative

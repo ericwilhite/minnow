@@ -140,19 +140,16 @@ for (const seed of seedsFor("next-write-delete-stream", [0xde1]))
               request: null,
               effects: tx.effects(new ByteWriter()),
             });
-            // One FTS claim accompanies the native deletes. Its tag, two safe-integer
-            // varints and possible effect-count growth fit within 32 additional bytes.
-            capture = new Uint8Array(expected.length + 32);
+            // The canonical encoder includes the same reference-free FTS invalidation.
+            capture = new Uint8Array(expected.length);
             const receipt = await tx.commit(null);
             await receipt.durable;
-            expect(at).toBeGreaterThan(expected.length);
+            expect(at).toBe(expected.length);
             const logged = decodeBody(capture.subarray(0, at));
-            expect(logged.effects.filter((effect) => effect.kind === "fts")).toHaveLength(1);
-            const rowBody = encodeBody({
-              ...logged,
-              effects: logged.effects.filter((effect) => effect.kind !== "fts"),
-            });
-            expect(Buffer.compare(rowBody, expected), "canonical sorted deletion body").toBe(0);
+            expect(logged.effects.filter((effect) => effect.kind === "ftsMutation")).toHaveLength(
+              1,
+            );
+            expect(Buffer.compare(capture, expected), "canonical sorted deletion body").toBe(0);
             expect(loans).toBeGreaterThan(0);
             reach.reach("charged order loan");
             capture = null;

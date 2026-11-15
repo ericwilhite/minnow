@@ -11,23 +11,51 @@ import {
   locators,
   rules,
   rowsOf,
+  watchGrants,
 } from "../write/test-support.js";
 import { setupFts, ftsParts } from "./fts-transaction.test-support.js";
 for (const seed of seedsFor("next-fts-keyed-faults", [0xb85b, 0xb85c]))
-  it(`keeps keyed rows and FTS invalidation atomic across publication faults ${String(seed)}`, async () => {
+  it(`keeps keyed rows and FTS invalidation atomic across publication faults ${String(seed)}`, async (context) => {
+    let retired = false,
+      retire: (() => void) | undefined;
+    context.onTestFinished(() => {
+      retired = true;
+      retire?.();
+    });
     const reach = createReach("FTS keyed faults", FTS_KEYED_FAULT_REACH);
     await fc.assert(
       fc.asyncProperty(fc.integer({ min: 1, max: 3 }), async (n) => {
         reach.beginHistory();
         for (const kind of ["update", "delete"] as const)
           for (const fault of ["prepare", "append", "none"] as const) {
+            if (retired) throw new Error("Retired keyed FTS fault history");
             let armed = false;
-            const h = new Harness("strict", "sim", undefined, undefined, {
-              afterDeltaPrepared(kind) {
-                if (armed && fault === "prepare" && kind === "fts")
+            const h = new Harness("strict", "sim");
+            const restores: Array<() => void> = [];
+            watchGrants(h.governor, (grant) => {
+              if (retired || grant.label !== "write path metadata") return;
+              const allocate = grant.allocate.bind(grant);
+              grant.allocate = (bytes) => {
+                if (
+                  armed &&
+                  fault === "prepare" &&
+                  (new Error().stack ?? "").includes("fts-mutations")
+                )
                   throw new Error("FTS keyed preparation fault");
-              },
+                return allocate(bytes);
+              };
+              restores.push(() => {
+                grant.allocate = allocate;
+              });
             });
+            const restore = () => {
+              armed = false;
+              for (const undo of restores.splice(0)) undo();
+            };
+            retire = () => {
+              restore();
+              void h.close().catch(() => undefined);
+            };
             const open = h.backend.open.bind(h.backend);
             h.backend.open = async (...args) => {
               const session = await open(...args),
@@ -82,8 +110,9 @@ for (const seed of seedsFor("next-fts-keyed-faults", [0xb85b, 0xb85c]))
               reach.reach("rows and invalidation agree");
               reach.reach("orphan retirement");
             } finally {
-              armed = false;
+              restore();
               await h.close();
+              retire = undefined;
             }
           }
       }),

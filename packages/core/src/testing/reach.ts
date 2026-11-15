@@ -7033,3 +7033,53 @@ export const FTS_CREDIT_RETIREMENT_REACH = [
 
 /** FTS staging overlays must preserve native publication retirement bookkeeping (R25). */
 export const FTS_ROOT_TRACKING_REACH = ["FTS publication retires native staging"] as const;
+
+export const FTS_INLINE_MUTATION_REACH = [
+  "wide commit LSN",
+  "cancelled record rebound",
+  "stable checkpoint prefix",
+  "bounded journal pages",
+  "journal growth boundary",
+  "denied before entries",
+  "cancel after k",
+  "constant-time R9",
+  "same table idempotent",
+  "borrowed checkpoint fenced",
+  "checkpoint reclaims",
+  "funded resize",
+] as const;
+
+export const FTS_INLINE_PUBLICATION_REACH = [
+  "32MiB cap",
+  "128MiB cap",
+  "update",
+  "delete",
+  "upsert",
+  "definition",
+  "no definition",
+  "competing grant",
+  "no second root publish",
+  "older snapshot",
+  "actual-LSN checkpoint",
+  "exact reopen",
+] as const;
+
+export const FTS_INLINE_MIXED_REACH = [
+  "independent coverage",
+  "same-body append and keyed",
+  "uncheckpointed reopen",
+  "separate actual LSNs",
+  "NULL append",
+  "exact rows",
+  "checkpoint replay",
+  "all charges returned",
+] as const;
+
+export const FTS_INLINE_CODEC_REACH = [
+  "registered tag",
+  "wide identifiers",
+  "zero table refused",
+  "zero schema refused",
+  "truncation refused",
+  "trailing bytes refused",
+] as const;

@@ -1,3 +1,4 @@
+import { ftsMutationScan } from "./fts-undo.js";
 import { taskClock, yieldTask } from "../task.js";
 /**
  * Write transactions, statements and table writers (access/write-path.ts, access/modify.ts).
@@ -490,6 +491,7 @@ export class TransactionImpl implements WriteTransaction {
     // Column bytes are final now: point the effects at views of the scratch buffer.
     for (let k = 0; k < spans.length; k += 3)
       need(columnLists[spans[k] ?? 0]).push(scratch.bytes.subarray(spans[k + 1], spans[k + 2]));
+    for (const mutation of ftsMutationScan(this)) if (mutation !== null) effects.push(mutation);
     if (this.ftsEffect) effects.push(this.ftsEffect);
     return effects;
   }

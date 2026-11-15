@@ -1,3 +1,5 @@
+import { decodeManifestRoot } from "../format/manifest-codec.js";
+import { ftsDef } from "../access/fts-def.js";
 /**
  * Generated histories of large transactions against a model (format/replay.ts "Large
  * transactions"; access/write-path.ts "Commit"; access/snapshot.ts visibility). Small memtables
@@ -13,7 +15,7 @@ import { describe, expect, it } from "vitest";
 import { UniqueViolationError } from "../access/modify.js";
 import type { Snapshot } from "../access/snapshot.js";
 import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
-import { createReach } from "../../testing/reach.js";
+import { createReach, FTS_ROOT_TRACKING_REACH } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { need } from "./bytes.js";
 import type { WritePathImpl } from "./engine.js";
@@ -42,6 +44,7 @@ const bodyOf = (id: number) => `${String(id)}:${largeId(id) ? LARGE_BODY : "smal
 const FREE = { allocate: () => true, free: () => undefined };
 
 const REACH = [
+  ...FTS_ROOT_TRACKING_REACH,
   "staged",
   "folded",
   "truncated-tail",
@@ -135,8 +138,11 @@ async function check(path: WritePathImpl, t: number, model: Map<number, number>,
 
 describe("staged large transactions, generated", () => {
   const SEEDS = seedsFor("next-write-staged", [901, 902, 903, 904]);
-  for (const seed of SEEDS)
-    it(`histories of large transactions equal the model (seed ${String(seed)})`, async () => {
+  for (const { seed, withFts } of SEEDS.flatMap((seed) => [
+    { seed, withFts: false },
+    { seed, withFts: true },
+  ]))
+    it(`histories of large transactions equal the model (seed ${String(seed)}, FTS ${String(withFts)})`, async (context) => {
       expect(new TextEncoder().encode(LARGE_BODY).byteLength).toBeGreaterThan(LARGE_VALUE_BYTES);
       const random = mulberry32(seed);
       const int = (n: number) => Math.floor(random() * n);
@@ -145,13 +151,49 @@ describe("staged large transactions, generated", () => {
       // The held generation's flushes never publish: a crashed process writes nothing more.
       let generation = 0;
       let held = -1;
+      let retiresStaging = false;
+      let ftsFlushGate: Promise<void> | null = null,
+        releaseFtsFlush: (() => void) | undefined;
+      context.onTestFinished(() => releaseFtsFlush?.());
       const harness = new Harness("strict", "sim", 6, undefined, {
+        afterDeltaPrepared: (kind) => {
+          if (kind === "fts" && retiresStaging)
+            reach.reach("FTS publication retires native staging");
+        },
         // Merges off: a crashed process must publish nothing more, and merges run on their own.
         merges: { mode: "off" },
+        ...(withFts ? { idleGarbageBytes: Number.MAX_SAFE_INTEGER } : {}),
         beforeFlushPublish: async () => {
+          if (ftsFlushGate !== null) await ftsFlushGate;
           if (held === generation) await new Promise<never>(() => undefined);
         },
       });
+      if (withFts)
+        harness.extentDeltas = {
+          prepare: (_attempt, delta) => {
+            if (harness.space.root === null) {
+              retiresStaging = false;
+              return null;
+            }
+            const root = decodeManifestRoot(harness.space.root, FREE).value;
+            retiresStaging = root.tables.some((table) =>
+              table.staged.some((staged) =>
+                delta.released.some(
+                  (extent) =>
+                    extent.offset === staged.groups.extent.offset &&
+                    extent.length === staged.groups.extent.length,
+                ),
+              ),
+            );
+            return null;
+          },
+          commit: () => {
+            retiresStaging = false;
+          },
+          abort: () => {
+            retiresStaging = false;
+          },
+        };
       reach.beginHistory();
       let path = await harness.open();
       let t = 0;
@@ -168,6 +210,12 @@ describe("staged large transactions, generated", () => {
             })
           ).id ?? 0;
       });
+      if (withFts)
+        await autocommit(path, async (statement) => {
+          const { id: _id, ...fts } = ftsDef(1, t, need(path.catalog.table(t)?.columns[2]).id);
+          void _id;
+          await statement.changeCatalog({ kind: "createFts", fts });
+        });
       const crash = () => {
         held = generation;
         generation += 1;
@@ -309,6 +357,36 @@ describe("staged large transactions, generated", () => {
         }
       }
       await path.quiesce();
+      if (withFts) {
+        ftsFlushGate = new Promise<void>((resolve) => {
+          releaseFtsFlush = resolve;
+        });
+        try {
+          const discarded = await path.begin(),
+            statement = discarded.statement({ rules });
+          for (let call = 0; call < 4; call++) {
+            const ids = Array.from({ length: 7 }, () => next++);
+            await statement
+              .table(t)
+              .insert(batch(ints(ids), ints(ids), texts(ids.map(bodyOf))), null);
+          }
+          await statement.end();
+          await path.admit(0);
+          expect(
+            path.state().root.tables.find((table) => table.tableId === t)?.staged.length,
+          ).toBeGreaterThan(0);
+          discarded.rollback();
+          const id = next++;
+          await autocommit(path, (statement) =>
+            statement.table(t).insert(batch(ints([id]), ints([id]), texts([bodyOf(id)])), null),
+          );
+          model.set(id, id);
+        } finally {
+          releaseFtsFlush?.();
+          ftsFlushGate = null;
+        }
+        await path.quiesce();
+      }
       // An open drops staging no frame claimed at its first publication: make one.
       await path.recycleLog();
       observe();

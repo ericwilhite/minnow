@@ -51,7 +51,7 @@ for (const seed of seedsFor("next-fts-keyed-publication", [0xb84f, 0xb850]))
                 "accepted native keyed undo must invalidate every FTS binding",
               ).toBe(true);
               const logged = await lastFtsCommit(h);
-              expect(logged.body.effects.filter((e) => e.kind === "fts")).toHaveLength(1);
+              expect(logged.body.effects.filter((e) => e.kind === "ftsMutation")).toHaveLength(1);
               expect(logged.body.effects.some((e) => e.kind === "rows" && e.deletes !== null)).toBe(
                 true,
               );
