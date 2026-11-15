@@ -2,6 +2,9 @@
  * The target factory owns a settled/exclusive owner (no active WritePath or background writers).
  * Publication rejection is indeterminate: close/reopen, never abort possibly published extents.
  */
+import { indexKeyKind } from "../keys/key-encoding.js";
+import { MemtableMemoryError } from "./bytes.js";
+import { SnapshotIndexes } from "./snapshot-index.js";
 import { MemoryAdmissionError, type MemoryGovernor } from "../memory/governor.js";
 import {
   SnapshotReplay,
@@ -82,8 +85,28 @@ function snapshotScope(catalog: Catalog): void {
   for (const table of catalog.tables) {
     if (table.managed === true)
       throw new SnapshotScopeError("TODO(B6): managed table snapshot scope is unsupported");
-    if (table.indexes.length || table.foreignKeys.length || table.checks.length)
-      throw new SnapshotScopeError("TODO(B2): portable index/constraint reconstruction");
+    for (const index of table.indexes) {
+      snapshotCheck(
+        index.role !== "primary" || (index.unique && table.primaryKey === index.id),
+        "Orphan/nonunique imported PRIMARY definition",
+      );
+      let equality = false;
+      for (const id of index.columnIds) {
+        const column = table.columns.find((column) => column.id === id);
+        snapshotCheck(column !== undefined, "Unresolved imported index column");
+        try {
+          if (indexKeyKind(column.type) === "equality") equality = true;
+        } catch {
+          throw new SnapshotScopeError("Unindexable portable index type");
+        }
+      }
+      snapshotCheck(
+        !equality || index.kind === "equality",
+        "Ordered enum index cannot preserve its semantics",
+      );
+    }
+    if (table.checks.length)
+      throw new SnapshotScopeError("TODO(B6): offline CHECK evaluation is not wired");
     if (table.columns.some((column) => column.allowedValues !== undefined))
       throw new SnapshotScopeError("TODO(B6): portable closed-set validation");
   }
@@ -250,6 +273,7 @@ export async function loadSnapshot(
       if (
         !(
           error instanceof SnapshotBudgetError ||
+          error instanceof MemtableMemoryError ||
           error instanceof ParseBudgetError ||
           error instanceof ReadDeniedError
         ) ||
@@ -287,6 +311,7 @@ async function loadAttempt(
     writer: ExtentWriter | undefined,
     scratchWriter: ExtentWriter | undefined,
     native: SnapshotNativeBuilder | undefined,
+    indexes: SnapshotIndexes | undefined,
     table: NativeTable | undefined,
     list: ExtentListKeeper | undefined;
   let listPrepared = false,
@@ -373,6 +398,14 @@ async function loadAttempt(
         writer = target.space.beginWrite("snapshot native generation", { budget });
         scratchWriter = target.space.beginWrite("snapshot verified portable staging", { budget });
         native = new SnapshotNativeBuilder(writer, target.space, budget, account);
+        indexes = new SnapshotIndexes(
+          catalog,
+          target.space,
+          writer,
+          scratchWriter,
+          budget,
+          options,
+        );
       } else if (frame.kind === SnapshotKind.tableBegin) {
         snapshotCheck(
           catalog !== undefined && writer !== undefined && table === undefined,
@@ -429,6 +462,8 @@ async function loadAttempt(
         await current.finish(target.space, record);
         current = undefined;
         if (columnIndex === table.def.columns.length) {
+          snapshotCheck(indexes !== undefined, "Missing native index builder");
+          await indexes.append(table.def.id, staged, table.rows + 1);
           for (let from = 0; from < blockRows;) {
             const to = snapshotBlockEnd(staged, from, blockRows);
             const group = await native.group(staged, from, to, table.rows + 1, table.groups + 1);
@@ -469,7 +504,8 @@ async function loadAttempt(
           }
         snapshotCheck(table.rows === expected, "Native/portable table counts disagree");
         account.take(2048 + table.def.columns.length * 64);
-        tables.push(await table.finish(lsn));
+        snapshotCheck(indexes !== undefined, "Missing native indexes");
+        tables.push({ ...(await table.finish(lsn)), ...(await indexes.finishTable(table.def.id)) });
         table.close();
         table = undefined;
       }
@@ -485,6 +521,8 @@ async function loadAttempt(
         tableIndex === catalog.tables.length,
       "Incomplete native snapshot generation",
     );
+    snapshotCheck(indexes !== undefined, "Missing native index validation");
+    await indexes.validate();
     await scratchWriter.abort();
     const catalogRef = await writeCatalogStorage(writer, catalog, budget, options.signal);
     list = new ExtentListKeeper([], { reader: target.space, budget, ...options });
@@ -533,6 +571,7 @@ async function loadAttempt(
     throw error;
   } finally {
     reader?.close();
+    indexes?.close();
     native?.close();
     table?.close();
     for (const column of staged) column.close();

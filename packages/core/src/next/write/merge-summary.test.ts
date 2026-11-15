@@ -524,6 +524,8 @@ it("the production merge uses the publication account and releases it at root ad
       input.outputBudget === input.grant || !(input.outputBudget instanceof MetadataBudget);
     observed++;
     const out = await original(input);
+    if (!("allocated" in input.grant) || typeof input.grant.allocated !== "number")
+      throw new TypeError("Native maintenance must use its actual governor grant");
     retainedWorkingBytes += input.grant.allocated;
     return out;
   });

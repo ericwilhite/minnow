@@ -4254,7 +4254,9 @@ original follow-input preparation and reference checks. Completing one phase can
 suppress another phase or later writes on the same token. This is bookkeeping for
 the guarded provider; the follow preparation/action scheduler is not enabled here.
 
-`write/snapshot-load.ts` adds the internal stage3 native loader. Its target factory must hold
+### Portable snapshot load
+
+`write/snapshot-load.ts` implements the internal portable native loader. Its target factory must hold
 an exclusive, recovered and settled owner with no active writer/maintenance, and report logical
 emptiness and the actual last LSN. Replacement is explicit. Header and catalog checks precede
 target acquisition. Verified portable bytes are staged in writer-owned extents, reconstructed
@@ -4284,13 +4286,34 @@ continues after load/reopen. Definitions retain ownership, increment, bounds and
 Catalog validation reuses the full native `Catalog.fromStored` checks before target acquisition:
 names/IDs, safe integer ranges, every counter floor, references, typed missing lanes and native
 expression metadata. Views and missing/backfill vectors are preserved through MCAT/MCHG and
-MCRT publication. This loader still has typed TODO refusals for indexes/FKs/CHECK, trigger/FTS,
+MCRT publication. This loader still has typed TODO refusals for CHECK, trigger/FTS,
 managed objects and closed text sets until their offline validation/reconstruction is wired.
 It never drops those declarations. Required MCAT features refuse; optional display extensions
 follow native preservation rules. The encoded catalog copies and full decoded graph are
 charged; encoded copies are dropped before target acquisition. The graph must fit the admitted
 working step, not an arbitrary1MiB catalog cap. Table rows remain streamed in bounded blocks.
 This is an unreleased internal interface, not a public owner command or frozen format.
+
+`write/snapshot-index.ts` reconstructs primary, unique, secondary and FK-supporting runs from
+validated logical rows. It decodes only the current index's columns into reusable scalar
+buffers, bounds its sorted delta at256KiB and keeps at most four charged staging-part leases.
+A denied scalar read drops reconstructible leases before retry; mandatory failures unwind the
+whole admitted load. Native semantic key limits and long-key encoding2 apply. Invalid nonunique
+index definitions remain invalid with empty physical runs, preserving ordinary scan fallback.
+
+Online merges page one continuation piece per sorted input through `mergeSortedRuns`; they
+reuse the ordinary merge encoder and funded output-boundary ownership. No complete input
+index or unbounded probe-result list is retained. Final native RunRef descriptors remain charged
+and subject to the existing manifest capacity. Completed intermediate extents are discarded.
+UNIQUE/PRIMARY keys are checked in full byte order across all output pieces. Enforced FKs use
+private sorted scratch runs and a bounded merge join against each rebuilt parent unique index.
+NULL references skip; explicit FK action modes remain in the catalog. Scratch checks use the
+parent's key policy, including when the child's smaller supporting index was invalidated.
+All FK scratch is aborted before the final native extent inventory and single root publication.
+A checksum-valid constraint violation, cancellation or quota failure cannot publish a partial
+result or replace the old root. Import copies values and never fires defaults, generated rules,
+triggers or sequence allocation. CHECK/trigger/FTS/managed/closed-set refusals remain release
+scope blockers; this implementation makes no native import throughput or size claim.
 
 Complete snapshot replacement borrows the extent space's immutable, disk-backed current-root
 inventory as retirement claims. It does not collect old extents in a JavaScript Set or array.

@@ -13,6 +13,7 @@ import {
   catalogStream,
   catalogStreamByteLength,
   decodeCatalogStream,
+  type CatalogStreamData,
 } from "./catalog-stream.js";
 import { snapshotCheck, snapshotTake } from "./snapshot-stage.js";
 import { SnapshotScopeError } from "./snapshot-export.js";
@@ -114,7 +115,7 @@ export function decodeSnapshotSequence(
 }
 /** Borrowed parts remain charged until next()/return(). Caller closes the generator on error. */
 export function* snapshotCatalogParts(
-  catalog: Catalog,
+  catalog: CatalogStreamData,
   horizons: readonly SnapshotHorizon[],
   budget: ByteBudget,
 ): Generator<Uint8Array, void> {

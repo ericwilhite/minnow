@@ -41,7 +41,7 @@
  *   runs readable. A crash before the publish leaves orphans the next open frees.
  */
 import type { ExtentRef, RunRef } from "../format/manifest.js";
-import { OBJECT_OVERHEAD_BYTES, type Grant } from "../memory/governor.js";
+import { OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
 import type { ByteBudget, SpaceReader } from "../access/space.js";
 import type { ExtentBuilder, ExtentWriter, ReadLease } from "../storage/extents.js";
 import { compareBytes } from "../vector/varlen.js";
@@ -156,19 +156,19 @@ class OwnedCursor implements MergeHead {
   readonly #bytes: number;
   #closed = false;
   constructor(
-    reader: RunReader,
+    ref: RunRef,
     readonly order: number,
     space: SpaceReader,
-    readonly budget: Grant,
+    readonly budget: ByteBudget,
     signal: AbortSignal,
   ) {
-    this.#bytes = rangeRunBytes(reader.ref, 1);
+    this.#bytes = rangeRunBytes(ref, 1);
     charged(budget, this.#bytes);
     try {
       this.#input = new RunRangeInput(
         space,
         budget,
-        reader.ref,
+        ref,
         { lower: null, upper: null },
         1,
         Infinity,
@@ -235,7 +235,7 @@ class Cursor {
     reader: RunReader,
     readonly order: number,
     readonly space: SpaceReader,
-    readonly budget: Grant,
+    readonly budget: ByteBudget,
   ) {
     this.#refs = reader.blockRefs();
   }
@@ -367,7 +367,7 @@ export interface MergeInput {
   readonly space: SpaceReader;
   readonly writer: ExtentWriter;
   /** The merge's own grant: leases and staging (`MERGE_FIXED_BYTES` + inputs). */
-  readonly grant: Grant;
+  readonly grant: ByteBudget;
   /** Publication ownership, growing with piece count. The owner must unwind/retry on pressure
    * before waiting; live keys never wait inside the fixed working account. */
   readonly outputBudget: ByteBudget;
@@ -396,13 +396,112 @@ export interface MergeOutput {
   readonly slices: number;
 }
 
-/** Runs one merge (see "A merge"); the caller publishes its runs or aborts the writer. */
+/** The same encoder/heap owns every output; ordinary resident-reader callers keep their path. */
 export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
-  const { space, writer, grant, policy, outputBudget } = input;
-  // The estimate: the inputs' extents (the output is no larger, short of block repacking).
   let estimate = 0;
   for (const reader of input.readers) estimate += runExtent(reader.ref).length;
   const overflow = input.readers.some((reader) => (reader.ref.encoding ?? 1) === 2);
+  return mergeHeads(input, input.readers.length, estimate, overflow, (k, signal) => {
+    const reader = need(input.readers[k]);
+    return overflow
+      ? new OwnedCursor(reader.ref, k, input.space, input.grant, signal)
+      : new Cursor(reader, k, input.space, input.grant);
+  });
+}
+export interface SortedMergeInput extends Omit<MergeInput, "readers"> {
+  /** Each list is ONE sorted run, continuation pieces in order; borrowed until settlement. */
+  readonly runs: ReadonlyArray<readonly RunRef[]>;
+}
+/** Bounded directory/block work: one current piece per logical input, never resident indexes. */
+class PieceCursor implements MergeHead {
+  #next = 0;
+  #current: OwnedCursor | null = null;
+  constructor(
+    readonly pieces: readonly RunRef[],
+    readonly order: number,
+    readonly space: SpaceReader,
+    readonly budget: ByteBudget,
+    readonly signal: AbortSignal,
+  ) {}
+  async load(): Promise<boolean> {
+    for (;;) {
+      this.signal.throwIfAborted();
+      if (this.#current !== null) {
+        if (await this.#current.load()) {
+          this.signal.throwIfAborted();
+          return true;
+        }
+        this.#current.release();
+        this.#current = null;
+      }
+      const ref = this.pieces[this.#next++];
+      if (ref === undefined) return false;
+      this.#current = new OwnedCursor(ref, this.order, this.space, this.budget, this.signal);
+    }
+  }
+  advance(): boolean {
+    return false;
+  }
+  get bytes(): Uint8Array {
+    return need(this.#current).bytes;
+  }
+  get keyStart(): number {
+    return need(this.#current).keyStart;
+  }
+  get keyEnd(): number {
+    return need(this.#current).keyEnd;
+  }
+  get rowId(): number {
+    return need(this.#current).rowId;
+  }
+  get tombstone(): boolean {
+    return need(this.#current).tombstone;
+  }
+  release(): void {
+    this.#current?.release();
+    this.#current = null;
+  }
+}
+export async function mergeSortedRuns(input: SortedMergeInput): Promise<MergeOutput> {
+  const control = 1024 + input.runs.length * 256;
+  charged(input.grant, control);
+  try {
+    let estimate = 0,
+      overflow = false;
+    for (const pieces of input.runs)
+      for (const [i, ref] of pieces.entries()) {
+        if ((i === 0 && ref.continues === true) || (i > 0 && ref.continues !== true))
+          throw new TypeError("Sorted merge input must be one continuation run");
+        estimate += runExtent(ref).length;
+        overflow ||= (ref.encoding ?? 1) === 2;
+      }
+    const output = await mergeHeads(
+      input,
+      input.runs.length,
+      estimate,
+      overflow,
+      (k, signal) => new PieceCursor(need(input.runs[k]), k, input.space, input.grant, signal),
+    );
+    try {
+      input.signal?.throwIfAborted();
+      if (input.stopped()) throw new MergeAbortedError();
+      return output;
+    } catch (error) {
+      output.release();
+      throw error;
+    }
+  } finally {
+    input.grant.free(control);
+  }
+}
+async function mergeHeads(
+  input: Omit<MergeInput, "readers">,
+  count: number,
+  estimate: number,
+  overflow: boolean,
+  make: (k: number, signal: AbortSignal) => MergeHead,
+): Promise<MergeOutput> {
+  const { writer, grant, policy, outputBudget } = input;
   const signal = input.signal ?? new AbortController().signal;
   const cursors: MergeHead[] = [];
   const heap = new Heap();
@@ -484,12 +583,9 @@ export async function mergeRuns(input: MergeInput): Promise<MergeOutput> {
     }
   };
   try {
-    for (let k = 0; k < input.readers.length; k++) {
+    for (let k = 0; k < count; k++) {
       signal.throwIfAborted();
-      const reader = need(input.readers[k]);
-      const cursor = overflow
-        ? new OwnedCursor(reader, k, space, grant, signal)
-        : new Cursor(reader, k, space, grant);
+      const cursor = make(k, signal);
       cursors.push(cursor);
       if (await cursor.load()) heap.push(cursor);
     }

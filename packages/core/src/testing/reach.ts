@@ -8822,3 +8822,50 @@ export const SNAPSHOT_SEQUENCE_LOAD_REACH = [
   "identity reference",
   "sequence name uniqueness",
 ] as const;
+
+export const SNAPSHOT_INDEX_REACH = [
+  "inline keys",
+  "overflow keys",
+  "multi block merge",
+  "native probes",
+  "continue reopen",
+  "null FK",
+  "FK modes",
+  "unique refusal",
+  "FK refusal",
+] as const;
+
+export const SNAPSHOT_SORTED_MERGE_REACH = [
+  "one piece",
+  "many pieces",
+  "ordered complete output",
+  "blocked cancel",
+  "no resident blooms",
+  "fixed working bound",
+] as const;
+
+export const SNAPSHOT_INDEX_FAILURE_REACH = [
+  "partial native output",
+  "quota",
+  "cancel",
+  "old root and rows",
+] as const;
+
+export const SNAPSHOT_INDEX_SCOPE_REACH = [
+  "invalid unique",
+  "orphan primary",
+  "scalar composite policy",
+] as const;
+export const SNAPSHOT_LONG_FK_REACH = [
+  "long parent scalar",
+  "invalid support retained",
+  "FK actions retained",
+  "continued FK enforcement",
+] as const;
+
+export const SNAPSHOT_INDEX_LEASE_REACH = [
+  "real grant pressure",
+  "drop and retry",
+  "four lease bound",
+  "zero after close",
+] as const;

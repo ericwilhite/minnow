@@ -1,5 +1,5 @@
 /** Atomic load law: old/absent or complete native root, never a portable prefix. */
-import { Governor, type Grant } from "../memory/governor.js";
+import { Governor } from "../memory/governor.js";
 import {
   SnapshotReplay,
   SnapshotSourcePrefix,
@@ -26,11 +26,9 @@ import {
   SNAPSHOT_JSON_SEMANTICS_REACH,
 } from "../../testing/reach.js";
 import { decodeManifestRoot } from "../format/manifest-codec.js";
-import { listedRootExtents, reachableExtents } from "../format/reachable.js";
 import { FileScratch } from "../storage/file-store.js";
 import { SimDisk } from "../storage/sim-disk.js";
-import { openExtentSpace } from "../storage/space.js";
-import type { ByteBudget, ExtentSpace } from "../storage/extents.js";
+import type { ByteBudget } from "../storage/extents.js";
 import {
   SnapshotKind,
   SnapshotStreamReader,
@@ -52,6 +50,7 @@ import {
 } from "./snapshot-catalog.js";
 import { exportPinnedSnapshot } from "./snapshot-export.js";
 import { exportSnapshot } from "./snapshot-capture.js";
+import { snapshotTestTarget as target } from "./snapshot-test-support.js";
 import { loadSnapshot, type SnapshotLoadTarget } from "./snapshot-load.js";
 import {
   Harness,
@@ -206,56 +205,6 @@ async function fixture(values: ReadonlyArray<number | null>, large = false): Pro
     return bytes;
   } finally {
     await h.close();
-  }
-}
-async function target(
-  h: Harness,
-  currentLsn = 0,
-  empty = true,
-  observe?: (space: ExtentSpace) => void,
-  prepaid?: Grant,
-): Promise<SnapshotLoadTarget> {
-  const lease = await h.backend.acquire(),
-    session = await h.backend.open(lease),
-    startup =
-      prepaid ??
-      (await h.governor.admit({
-        label: "load startup",
-        minimumBytes: 8 << 20,
-        spillable: true,
-      }));
-  try {
-    const space = await openExtentSpace(session, {
-      reachable: listedRootExtents(),
-      walk: reachableExtents(),
-      verifyAtOpen: true,
-      budget: startup,
-      registerCache: (cache) => h.governor.registerCache(cache),
-    });
-    observe?.(space);
-    return {
-      space,
-      epoch: session.epoch,
-      currentLsn,
-      empty,
-      async close() {
-        try {
-          await space.close();
-        } finally {
-          if (prepaid === undefined) startup.close();
-          try {
-            await session.close();
-          } finally {
-            await lease.release();
-          }
-        }
-      },
-    };
-  } catch (error) {
-    if (prepaid === undefined) startup.close();
-    await session.close();
-    await lease.release();
-    throw error;
   }
 }
 async function contents(h: Harness): Promise<unknown[][]> {
