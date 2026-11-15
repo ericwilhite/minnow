@@ -15,11 +15,14 @@ const WIDTH = 10,
 const TYPES = Array.from({ length: WIDTH }, () => ({ kind: "float64" }) as const);
 const EVENTS = ["insert", "update", "delete"] as const;
 const KINDS = ["trigger", "referential"] as const;
-/** Additive ordinary workspace in the root's admitted scope, per live frame (root +one body).
+/** Additive ordinary workspace in the root's admitted scope, per live frame (root +two nested bodies).
  * Two tape directories/staging blocks, one encoder, one released-read window and packet views.
  * No nested governor admission and no event-count multiplier. Shared spill I/O is reused.
  */
 export const TRIGGER_AFTER_QUEUE_BYTES = 256 * 1024;
+/** Shipped budgets 1 and 0 both fire; a terminal budget -1 write cannot fire again.
+ * Root plus two nested body commands, with RI preserving the current frame/budget. */
+export const TRIGGER_MAX_FRAMES = 3;
 const FIXED = 8192;
 export interface TriggerAfterEvent {
   readonly kind: "trigger" | "referential";
@@ -169,7 +172,8 @@ export class TriggerAfterQueue {
         event,
         e.images.spoolId,
         e.images.row,
-        e.budget,
+        // Nonnegative packet scalar; preserve the spent -1 budget for terminal RI work.
+        e.budget + 1,
         e.id,
       ];
     if (
@@ -234,8 +238,9 @@ export class TriggerAfterQueue {
     const numbers = Array.from({ length: WIDTH }, (_, c) => window[c * ROWS + row] ?? NaN);
     if (numbers.some((n) => !Number.isSafeInteger(n) || n < 0))
       throw new SpillCorruptionError("Invalid AFTER scalar");
-    const [kind, rootId, id, frameId, tableId, event, spoolId, at, budget, target] = numbers,
-      writeEvent = EVENTS[event ?? -1];
+    const [kind, rootId, id, frameId, tableId, event, spoolId, at, encodedBudget, target] = numbers,
+      writeEvent = EVENTS[event ?? -1],
+      budget = encodedBudget === undefined ? undefined : encodedBudget - 1;
     if (
       (kind !== 0 && kind !== 1) ||
       rootId !== this.origin.rootId ||

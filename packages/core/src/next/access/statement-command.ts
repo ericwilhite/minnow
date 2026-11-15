@@ -3,7 +3,10 @@ import type { Batch, Vector } from "../vector/vector.js";
 /** Native command/trigger boundary. Capability remains absent until its bounded registry and
  * executor hooks are installed; this contract does not enable trigger or RI scheduling.
  * Queue packets contain scalar stable IDs only. The admitted root owns their paged registries,
- * image/target spools and pins, and validates root origin plus command/frame liveness on use. */
+ * image/target spools and pins, and validates root origin plus command/frame liveness on use.
+ * Shipped trigger budgets are signed: root 1 and body 0 both fire; their target -1 may be
+ * written, but a further matching trigger errors. RI preserves budget, including -1.
+ * There are at most three live command frames; image-helper count is still one. */
 
 export type WriteEvent = "insert" | "update" | "delete";
 export interface CommandToken {

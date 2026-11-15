@@ -22,8 +22,9 @@ one charged copy, wide values copy in cancellable fragments, and image borrows e
 body execution. This is a runtime component; native SQL trigger firing remains disabled
 until the joint command, registry and body-runner integration is verified.
 
-The private rebuild adds a spillable AFTER-event queue with bounded metadata. Child events
-append behind the existing frame; pending IO and continuations drain before cleanup. This is
+The private rebuild adds a spillable AFTER-event queue with bounded metadata. It preserves
+the shipped limit of two derived writes, including terminal RI work with a spent
+trigger budget. Child events append behind the existing frame; pending IO and continuations drain before cleanup. This is
 runtime groundwork only: native trigger SQL stays disabled until the joint firing integration.
 
 The private trigger runner's current-prefix pin has a read phase, then a locator-only phase.

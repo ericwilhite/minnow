@@ -3856,8 +3856,8 @@ The trigger runtime's AfterQueue is a bounded FIFO over native scratch pages. Ea
 has at most two tape epochs: drain the old epoch completely, then switch to events appended by
 its RI callbacks. Packets carry scalar command/frame, image and trigger/RI IDs only. The root
 registry owns row images and referential keys; the queue owns no per-event Map or file.
-TRIGGER_AFTER_QUEUE_BYTES prepays 256 KiB of ordinary workspace per live frame (root plus one
-body frame). Repeated/spilled events do not increase that minimum. RecursiveTape.eachCopied
+TRIGGER_AFTER_QUEUE_BYTES prepays 256 KiB of ordinary workspace per live frame (root plus two nested
+body frames). Repeated/spilled events do not increase that minimum. RecursiveTape.eachCopied
 copies a bounded scalar window and drops native read buffers/progress loans before invoking
 continuations, so a callback can append or run a nested producer without hold-and-wait.
 Close fences pending appends, reads and continuations before closing files or freeing scratch;
@@ -3874,3 +3874,12 @@ metadata is prepaid ordinary workspace (maximum live body, not a sum across even
 unique payload copies use the shared image progress envelope. Scope close clears native
 references before freeing charge. The native projected reader/body host and SQL integration
 remain separate: this component alone does not enable firing.
+
+The shipped recursion contract permits primary → audit → mirror, and rejects a further matching
+trigger with statement rollback. Root budget 1 and body budget 0 both fire; target -1 may be written,
+while RI preserves that signed budget. `TRIGGER_MAX_FRAMES` is 3, an upper bound; callers
+prepay only the reachable live frames. The queue
+encodes `budget + 1` as a nonnegative scalar; scratch packets retain all three states. Image-helper
+count stays one, and copied parameters retire after input spooling, before nested writes. This
+keeps the maximum binding minimum independent of depth. The generated component suite checks
+the depth boundary against the shipped engine; native SQL firing remains disabled.

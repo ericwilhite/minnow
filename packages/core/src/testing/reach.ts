@@ -6912,3 +6912,15 @@ export const TRIGGER_BINDING_LAYOUT_REACH = [
   "constant",
   "dictionary",
 ] as const;
+export const TRIGGER_BUDGET_REACH = [
+  "root budget",
+  "body zero budget",
+  "terminal negative RI budget",
+  "two derived writes succeed",
+  "third trigger rejected and rolled back",
+  "competing credit",
+  "BEFORE chain",
+  "AFTER chain",
+  "multiple root rows",
+  "zero ownership",
+] as const;

@@ -797,3 +797,7 @@ native registry and B5b Statement.end/RI consumer still need their joint end-to-
 The typed binding component copies each unique OLD/NEW column once from a projected lease,
 releases it before body execution, and preserves native numeric/temporal values without raw
 parameter rebinding. The body query host and projected native reader remain pending. Accepted catalog/DDL behavior above is unchanged.
+
+The shipped recursion boundary allows two derived write levels (primary → audit → mirror).
+The runtime queue preserves signed budgets 1/0/-1 and supports up to three live frames,
+each with its prepaid minimum. RI preserves budget. This is packet/frame coverage, not native SQL trigger enablement.
