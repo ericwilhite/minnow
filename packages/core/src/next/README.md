@@ -3842,3 +3842,94 @@ NO ACTION default. The schema inspector exposes these modes and stored trigger i
 MCAT foreignKey10's required field9 carries onUpdate; these development bytes need the
 next pre-fence selector allocation before publication. Native RI execution/trigger firing
 remain the separate joint B6/B5b consumer described in the inventory.
+
+Current-prefix pins from Statement.readOwn are phase pins, not immutable data snapshots.
+Consume/spool every body input before mutation; once mutation begins, all data/index rereads
+(including cached segment handles and pre-created index cursors) are forbidden. Retain the pin only for inputView locator
+translation through every write batch, then release it. A fresh body gets a fresh pin. Native
+entry points assert this with an O(1) statement mutation epoch; ordinary snapshots keep their
+immutable contract. Release clears the callback so a retained expired pin cannot retain its
+statement. Prefix lifecycle histories assert borrowed chunks, memtables, reader registrations
+and the native row account drain to zero.
+
+The trigger runtime's AfterQueue is a bounded FIFO over native scratch pages. Each active frame
+has at most two tape epochs: drain the old epoch completely, then switch to events appended by
+its RI callbacks. Packets carry scalar command/frame, image and trigger/RI IDs only. The root
+registry owns row images and referential keys; the queue owns no per-event Map or file.
+TRIGGER_AFTER_QUEUE_BYTES prepays 256 KiB of ordinary workspace per live frame (root plus two nested
+body frames). Repeated/spilled events do not increase that minimum. RecursiveTape.eachCopied
+copies a bounded scalar window and drops native read buffers/progress loans before invoking
+continuations, so a callback can append or run a nested producer without hold-and-wait.
+Close fences pending appends, reads and continuations before closing files or freeing scratch;
+cleanup attempts both epochs and surfaces close failures. This is a verified runtime component;
+SQL firing still needs the joint controller, compiled body-source host and native Statement.end hooks.
+
+TriggerBindingProgram compiles stable (OLD/NEW, column ID) dependencies once. Repeated textual
+parameters alias one owned typed scalar; no Date/Number/JS-row or public raw-parameter rebinding
+occurs. Projected image leases expose unrequested columns with an explicit unread marker,
+never SQL NULL. The body receives its scope only after the lease releases. NULL payloads stay
+uninterpreted, decimal tiers/scales and timestamp microseconds survive unchanged, and varlen
+copies use exact arrays with task-clock/cancellation checks per 64 KiB fragment. Binding
+metadata is prepaid ordinary workspace (maximum live body, not a sum across events); exact
+unique payload copies use the shared image progress envelope. Scope close clears native
+references before freeing charge. The native projected reader/body host and SQL integration
+remain separate: this component alone does not enable firing.
+
+The shipped recursion contract permits primary → audit → mirror, and rejects a further matching
+trigger with statement rollback. Root budget 1 and body budget 0 both fire; target -1 may be written,
+while RI preserves that signed budget. `TRIGGER_MAX_FRAMES` is 3, an upper bound; callers
+prepay only the reachable live frames. The queue
+encodes `budget + 1` as a nonnegative scalar; scratch packets retain all three states. Image-helper
+count stays one, and copied parameters retire after input spooling, before nested writes. This
+keeps the maximum binding minimum independent of depth. The generated component suite checks
+the depth boundary against the shipped engine; native SQL firing remains disabled.
+
+TriggerBodyRunner controls one prepared body command through an injected TriggerBodyHost.
+The host receives the complete modification plan and frozen body metadata, including explicit
+assignment IDs. The runner preserves every other plan field when applying the body's repeat
+policy. A stale catalog version refuses before opening a pin or allocating a helper.
+
+Each call owns one fresh readOwn phase pin, typed binding scope and scalar input descriptor.
+The source host seals the complete input and retires execution-local operators and cached
+parameter-vector references before returning. Copied bindings then close before native writes
+or nested callbacks. The prefix pin survives all locator translations and input retirement;
+cleanup attempts every owned resource and preserves the primary error and cleanup failures.
+Cancellation is checked after awaited retirement as well as before effects. No body command
+calls statement end, rollback or commit. Its caller verifies command uniqueness, drains that
+command's nested AFTER frame, then verifies references; the root owns completion and rollback.
+
+The generated protocol suite uses real native writers, shared bound row rules and PGlite for
+commit/rollback, generated output, CHECK and generated NOT NULL failures. Its source host is a
+small native-vector fixture, not the compiled provider. B5b's admitted source/registry and B6's
+named-trigger controller remain a separate integration; native SQL firing is still disabled.
+
+### Named trigger controller component
+
+`TriggerController` accepts immutable prepared programs in UTF8 name order and an injected
+native command/body capability. It runs BEFORE bodies per row, then merges each accepted
+row's user AFTER names with native RI names. The queue is FIFO across the statement: RI
+child AFTER events append behind the parent events already queued. A user body's command
+gets a nested frame; its uniqueness checkpoint, AFTER drain and residual references finish
+before the next body statement. Root `finishRoot()` is a non-ending Statement.end hook,
+not a commit or a second native statement.
+
+Static reach supplies the maximum live frame count (at most three) and maximum user plus
+RI entries for one row. `triggerControllerMinimumBytes` reserves one fixed queue and one
+bounded ordering scratch per live frame. Body producers and the one image/binding helper
+are separate prepaid parts of the same root. Queue packets contain scalar IDs; native
+registries retain the image/action lifetime. The controller creates no per-row Map or file,
+and row-name sorting uses the shared task clock. Root cancellation/close drains pending
+callbacks and all queues before its caller releases the native root or its grants.
+
+The permanent PGlite differential exercises this component with injected scalar source,
+row-image and RI adapters, real prefix-pin lifetimes, nested frames and observed queue
+spills while competing grants hold spare credit. It does not exercise B5b's complete
+compiled source/registry/write driver. SQL firing stays disabled until that joint integration
+passes its end-to-end pressure, rollback, FK-action, cancellation and fault campaign.
+
+Prepared programs cover every matching trigger on nonnegative-budget routes. The controller
+checks actual catalog routes and refuses a missing program rather than skipping the trigger.
+A fixed eight-slot scalar route cache is paid by the root's frame metadata; cold scans use the
+shared task clock. At spent budget, matching definitions come directly from the catalog:
+BEFORE refuses depth immediately, and AFTER queues its ID to refuse at the ordered drain.
+An unreachable terminal body need not be compiled or have binding workspace reserved.

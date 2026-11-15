@@ -240,7 +240,7 @@ export class StreamingRangeCursor implements IndexCursor {
     return this.#consume(count, null);
   }
   #consume(limit: number, out: Float64Array | null): MaybePromise<number> {
-    this.index.table.snapshot.check();
+    this.index.table.snapshot.checkRead();
     this.admitted?.signal.throwIfAborted();
     if (this.#closed || limit === 0) return 0;
     if (this.#busy) throw new TypeError("Only one outstanding index cursor call is allowed");
@@ -350,7 +350,7 @@ export class StreamingRangeCursor implements IndexCursor {
     if (this.#grant === null) yield* this.#open();
     let count = 0;
     while (!this.#stopped() && this.#size > 0 && count < limit) {
-      this.index.table.snapshot.check();
+      this.index.table.snapshot.checkRead();
       if (taskClock.due()) yield yieldTask();
       if (this.#stopped()) break;
       if (out === null) {

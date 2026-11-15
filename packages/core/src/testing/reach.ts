@@ -6838,3 +6838,154 @@ export const TRIGGER_WIRE_REACH = [
   "plain name",
   "UTF8 name",
 ] as const;
+
+export const TRIGGER_PREFIX_LIFECYCLE_REACH = [
+  "cancel after several batches",
+  "maintenance before later cancellation",
+  "borrow ends before independent pin",
+  "publication with borrowed prefix",
+  "merge with prefix alive",
+  "flush only",
+  "cancel read",
+  "cancel write",
+  "committed bodies",
+  "multiple write batches",
+  "cached and fresh rereads refused",
+  "cached cursor read refused",
+  "zero native retention and registrations",
+  "single row batches",
+  "several row batches",
+] as const;
+
+export const TRIGGER_AFTER_QUEUE_REACH = [
+  "spilled pages",
+  "append during drain",
+  "cancel continuation",
+  "FIFO order",
+  "wide IDs exact",
+  "empty",
+  "one row",
+  "multiple blocks or rows",
+  "fixed metadata and ordinary credit",
+  "zero ownership",
+] as const;
+
+export const TRIGGER_QUEUE_READ_REACH = [
+  "actual competing-credit loan",
+  "progress returned before continuation",
+  "directory carry",
+  "one page",
+  "wide scalar IDs",
+  "ordinary IDs",
+  "zero ownership",
+] as const;
+
+export const TRIGGER_BINDING_REACH = [
+  "unique repeated bindings",
+  "release before body",
+  "unrequested payload unread",
+  "exact native buffers",
+  "PG typed body value",
+  "zero ownership",
+  "flat",
+  "constant",
+  "dictionary",
+  "NULL",
+  "fragmented UTF8",
+  "decimal safe",
+  "decimal int64",
+  "decimal int128",
+  "decimal wide",
+  "wide int64",
+  "timestamp microseconds",
+] as const;
+
+export const TRIGGER_BINDING_LAYOUT_REACH = [
+  "SQL array",
+  "interval",
+  "UUID",
+  "decimal NaN",
+  "decimal Infinity",
+  "decimal -Infinity",
+  "exact admitted boundary",
+  "NULL payload ignored",
+  "live payload",
+  "flat",
+  "constant",
+  "dictionary",
+] as const;
+export const TRIGGER_BUDGET_REACH = [
+  "root budget",
+  "body zero budget",
+  "terminal negative RI budget",
+  "two derived writes succeed",
+  "third trigger rejected and rolled back",
+  "competing credit",
+  "BEFORE chain",
+  "AFTER chain",
+  "multiple root rows",
+  "zero ownership",
+] as const;
+
+export const TRIGGER_BODY_REACH = [
+  "prefix input sealed",
+  "complete modify metadata",
+  "binding copy retired before write",
+  "native rules and PG constraint",
+  "primary and cleanup errors retained",
+  "PG commit",
+  "multiple writer batches",
+  "PG root rollback",
+  "source failure",
+  "apply failure",
+  "cancel sealed input",
+  "cancel partial write",
+  "cancel image release",
+  "cancel binding retirement",
+  "cancel before source",
+  "pin survives input retirement",
+  "zero owned copies and readers",
+  "pending source cancellation fenced",
+  "pending retirement cancellation fenced",
+  "invalid programs refuse before effects",
+  "native generated NOT NULL matches PG",
+] as const;
+
+export const TRIGGER_CONTROLLER_REACH = [
+  "completed command refuses more primary rows",
+  "PG exact ordering",
+  "parent update and RI child",
+  "parent delete and RI child",
+  "nested body before next statement",
+  "three live frames",
+  "competing grants",
+  "UTF8 names across surrogate boundary",
+  "old parent queue before RI child AFTER",
+  "observed queue spill",
+  "zero queues inputs pins and credit",
+] as const;
+
+export const TRIGGER_PREPARATION_REACH = [
+  "terminal BEFORE",
+  "terminal AFTER",
+  "BEFORE omission refused",
+  "AFTER omission refused",
+  "RI route omission refused",
+  "body route omission refused",
+  "update route",
+  "delete route",
+  "terminal definition needs no compiled body",
+  "zero queues copies and readers",
+] as const;
+
+export const TRIGGER_RI_UNIQUE_REACH = [
+  "queue",
+  "id",
+  "entry",
+  "no outer AFTER drain",
+  "first action conflict",
+  "successive actions one command",
+  "two earlier action checkpoints pass",
+  "PG error priority",
+  "zero queues pins and credit",
+] as const;

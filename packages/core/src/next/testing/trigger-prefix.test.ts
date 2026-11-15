@@ -168,6 +168,9 @@ for (const seed of seedsFor("next-trigger-prefix", [0xb7c2, 0xb7c3]))
               } finally {
                 keys.close();
               }
+              expect(core.harness.path.shared.readers.count).toBe(0);
+              expect(core.harness.path.shared.readers.heldPins).toBe(0);
+              expect(core.harness.path.stats().borrowedChunkBytes).toBe(0);
               expect(grant.allocated).toBe(0);
               grant.close();
               grant = undefined;
@@ -180,6 +183,13 @@ for (const seed of seedsFor("next-trigger-prefix", [0xb7c2, 0xb7c3]))
               tx?.rollback();
               grant?.close();
               await core.close();
+              expect(core.harness.path.shared.readers.count).toBe(0);
+              expect(core.harness.path.stats()).toMatchObject({
+                memtableBytes: 0,
+                frozenMemtableBytes: 0,
+                borrowedChunkBytes: 0,
+              });
+              expect(core.harness.path.shared.budget).toMatchObject({ allocated: 0, loaned: 0 });
               await pg.exec("ROLLBACK;DROP TABLE IF EXISTS t");
             }
           },

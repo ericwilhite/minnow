@@ -194,7 +194,9 @@ for (const seed of seedsFor("next-overflow-summary-ranges", [0xb50b]))
                     snapshot: {
                       bound: Infinity,
                       shared: { governor: h.governor, space: h.space },
+                      // An immutable synthetic view has no current-prefix mutation epoch.
                       check: () => undefined,
+                      checkRead: () => undefined,
                       watchCursor() {
                         return () => undefined;
                       },

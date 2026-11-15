@@ -13,6 +13,12 @@
  * is O(1) to pin: nothing is copied. Everything reachable from it reads the same until
  * `release()`.
  *
+ * **Exception: Statement.readOwn() is a current-write-prefix phase pin, not an immutable
+ * data snapshot.** Fully consume and spool its input before any further statement mutation.
+ * Once mutation begins, do not reread the pin or its cached table/index/segment handles.
+ * It remains alive only to translate already-spooled locators through writer inputView, until
+ * writer borrows drain. A new body obtains a new phase pin; end/rollback invalidates all of them.
+ *
  * ## Visibility bound (`Snapshot.bound`)
  * Every in-memory change carries a sequence number `seq`; a change is visible iff
  * `seq ≤ bound` (`isVisible`). One comparison serves readers and the writer:
@@ -143,6 +149,12 @@ export function isVisible(seq: number, bound: number): boolean {
   return seq <= bound;
 }
 
+/** A pinned immutable read view, with one phase-pin exception: Statement.readOwn().
+ * Fully consume/spool that view before a further statement mutation. After mutation begins,
+ * neither the pin nor cached table/index/segment/cursor handles may read data again. Keep it
+ * alive only for TableWriteOptions.inputView locator resolution until writer work drains;
+ * then release it. Statement end/rollback invalidates remaining phase pins. See the module
+ * contract for ordinary immutable read and statement views. */
 export interface Snapshot {
   /** The pinned root's sequence (diagnostics). */
   readonly rootSequence: number;
