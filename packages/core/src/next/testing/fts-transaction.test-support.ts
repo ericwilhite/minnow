@@ -25,7 +25,9 @@ export function ftsBudget() {
     },
   };
 }
-export async function setupFts(h: Harness, render = true) {
+/** Open/capture the real store session with the stage4 renderer; SQL/DML fixtures may
+ * create their own table/key shapes before declaring an FTS definition. */
+export async function openFtsHarness(h: Harness, render = true) {
   const open = h.backend.open.bind(h.backend);
   h.backend.open = async (...args) => {
     const session = await open(...args);
@@ -39,6 +41,10 @@ export async function setupFts(h: Harness, render = true) {
       workspaceBytes: FTS_WORKSPACE_BYTES,
       render: ftsValue,
     });
+  return path;
+}
+export async function setupFts(h: Harness, render = true) {
+  const path = await openFtsHarness(h, render);
   await autocommit(path, async (s) => {
     await s.changeCatalog({
       kind: "createTable",

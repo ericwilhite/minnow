@@ -2103,7 +2103,9 @@ export class TableWriterImpl implements TableWriter {
       const removed = this.#deleteRows(table, rowIds, old);
       const added = this.insertRows(columns, all);
       this.#parentChecksForChange(old, columns, rowIds.length);
-      return all_(removed, added);
+      return settle(all_(removed, added), () => {
+        if (rowIds.length > 0) this.statement.noteFtsMutation(this.tableId, "update");
+      });
     });
   }
 
@@ -2141,7 +2143,9 @@ export class TableWriterImpl implements TableWriter {
                   next: null,
                 });
         }
-      return removed;
+      return settle(removed, () => {
+        if (rowIds.length > 0) this.statement.noteFtsMutation(this.tableId, "delete");
+      });
     });
   }
 

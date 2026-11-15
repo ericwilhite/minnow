@@ -207,7 +207,9 @@ export class UpsertWriter implements Operator {
         this.pool.trimStep();
         const idle = this.grant.held - this.grant.allocated - this.grant.loaned;
         if (idle > 0) this.grant.release(idle);
-        this.counts.inserted += await this.#insert.insert(input, null);
+        const inserted = await this.#insert.insert(input, null);
+        if (inserted > 0) this.statement.noteFtsMutation(this.table.id, "upsert");
+        this.counts.inserted += inserted;
         affected = proposed;
       } else {
         if (conflict.action === "nothing") {
@@ -282,10 +284,12 @@ export class UpsertWriter implements Operator {
         this.pool.trimStep();
         const idle = this.grant.held - this.grant.allocated - this.grant.loaned;
         if (idle > 0) this.grant.release(idle);
-        this.counts.updated += await this.#update.update(
+        const updated = await this.#update.update(
           { length: 1, selection: null, columns: [locatorVector, ...writes] },
           null,
         );
+        if (updated > 0) this.statement.noteFtsMutation(this.table.id, "upsert");
+        this.counts.updated += updated;
         affected = [...next, ...proposed.slice(n)];
       }
       if (this.#project)

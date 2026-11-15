@@ -140,6 +140,7 @@ it.each(["before", "after"])("handles cancellation %s statement completion", asy
         catalog: real.catalog,
         table: real.table.bind(real),
         changeCatalog: real.changeCatalog.bind(real),
+        noteFtsMutation: real.noteFtsMutation.bind(real),
         rollback: real.rollback.bind(real),
         end: async (signal?: AbortSignal) => {
           entered();

@@ -68,6 +68,10 @@ Native accepted updates, deletes and notified upserts atomically record table-wi
 invalidation with their rows. This history survives checkpoint/reopen even when no index
 is declared; zero-row and rolled-back commands do not invalidate. A missing or stale native
 write renderer also invalidates acceleration rather than rejecting accepted rows.
+The private SQL modification executor now notifies this history for accepted UPDATE FROM,
+DELETE USING and both ON CONFLICT write arms. Coalesced inserts retain one funded undo
+entry and preserve any accepted upsert marker; statement and savepoint rollback remove
+their FTS effects together with the rows. Both statement and end signals cancel FTS admission.
 No supported 1.0 stored-format predecessor exists yet.
 
 The unexported rebuild now executes INSERT VALUES, INSERT SELECT, UPDATE and DELETE through

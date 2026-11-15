@@ -7364,6 +7364,39 @@ export const FTS_KEYED_PUBLICATION_REACH = [
   "checkpoint and reopen",
 ] as const;
 
+/** Actual SQL DML shares atomic row/FTS undo, WAL and reopen boundaries. */
+export const MODIFY_FTS_REACH = [
+  "insert",
+  "updateFrom",
+  "deleteUsing",
+  "upsertInsert",
+  "upsertUpdate",
+  "nothing",
+  "whereFalse",
+  "commit",
+  "rollback",
+  "savepoint",
+  "failure",
+  "definition",
+  "no definition",
+  "coalesced insert",
+  "late statement error",
+  "survivor after rollback",
+  "same WAL body",
+  "undo accounting",
+  "reopen",
+  "PG and shipped",
+] as const;
+
+export const MODIFY_FTS_COALESCING_REACH = [
+  "commit flag",
+  "rollback flag",
+  "first flag",
+  "later flag",
+  "ordinary append after flag",
+  "one funded entry",
+] as const;
+
 /** Accepted keyed/upsert markers and history are undo-owned, never declaration-dependent. */
 export const FTS_MUTATION_HISTORY_REACH = [
   "accepted",
@@ -7455,6 +7488,8 @@ export const FTS_STATEMENT_CLOCK_REACH = [
 
 /** End-of-statement FTS admission observes its own signal before another holder releases credit. */
 export const FTS_ADMISSION_CANCEL_REACH = [
+  "options",
+  "end",
   "actual admission wait",
   "abort while credit held",
   "abort on admission resume",
