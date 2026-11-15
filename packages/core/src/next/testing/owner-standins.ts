@@ -1033,6 +1033,8 @@ export class StandinExecutor implements Executor {
   readonly channels = new Set<ResultChannel>();
   /** Called on every `acknowledgeCommit()` (completion 2), for ordering assertions. */
   onAcknowledge: (() => void) | null = null;
+  /** Observe immutable rule programs without borrowing a native statement evaluator. */
+  onExecute: ((request: ExecuteRequest) => void) | null = null;
 
   /** Frame bytes still charged across every execution (B4's accounting). */
   get outstandingBytes(): number {
@@ -1075,6 +1077,7 @@ export class StandinExecutor implements Executor {
       usesSequences: planUsesSequences(plan),
       bind: (values, grant) => bindParameters(plan, values, grant),
       execute: (request) => {
+        this.onExecute?.(request);
         if (request.parameters.length !== plan.placeholderCount)
           throw new ExecutionError(
             `Expected ${String(plan.placeholderCount)} parameters`,
