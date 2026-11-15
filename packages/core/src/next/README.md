@@ -4111,3 +4111,23 @@ fire, and their body at -1 may write but cannot fire another matching user trigg
 Referential actions preserve that signed budget. The static walk includes rules for both
 body levels and distinguishes the same table reached with different budgets; SQL trigger
 firing remains guarded until the joint runtime is installed.
+
+### Root registry scratch primitives (staging)
+
+`write/registry-directory.ts` stores fixed 128-byte records under a namespace, table ID and
+row ID. A 30 KiB charged cursor/cache serves all records through one spill file. IDs keep all
+53 safe integer bits. Dirty leaves and a copy-on-write radix path go to scratch; row count
+never grows a resident descriptor map. Callers provide their own prepaid record buffers.
+
+`write/registry-fragments.ts` stores variable image payloads in a second shared spill file.
+Two 64 KiB charged buffers stream reverse-linked fragments, without an array of page refs or
+a whole-value encoding copy. Each fragment checks cancellation and the root task clock.
+Close fences pending create/read/write/fill/clock work before releasing either file or credit.
+Spill allocation failure, checksum failure and malformed links fail the operation and release
+all owned scratch at close.
+
+These are internal building blocks. They do not install `NativeCommandBoundary`, change
+`Statement.end`, execute referential actions or enable SQL triggers. Generated component
+checks cover record eviction/overwrite, sparse table/row IDs, exact replay, corruption,
+constructor failures and cancellation fences. Native statement/provider and SQL differential
+coverage belong to the later integration, alongside the existing refusal guards.

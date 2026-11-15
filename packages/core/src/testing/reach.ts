@@ -7985,3 +7985,80 @@ export const MODIFY_INDEX_GATE_REACH = [
   "PG and shipped rows",
   "zero spill",
 ] as const;
+
+/** Root scalar registries have a fixed charged directory independent of row/event count. */
+export const REGISTRY_DIRECTORY_REACH = [
+  "evicted records",
+  "overwritten records",
+  "separate namespaces",
+  "wide IDs",
+  "max safe ID",
+  "missing record",
+  "fixed metadata",
+  "one spill file",
+  "descriptor count above cap",
+  "zero ownership",
+] as const;
+export const REGISTRY_DIRECTORY_IO_REACH = [
+  "create",
+  "append",
+  "read",
+  "external cancellation",
+  "close cancellation",
+  "charge survives I/O",
+  "zero ownership",
+] as const;
+export const REGISTRY_DIRECTORY_FAULT_REACH = [
+  "create",
+  "append",
+  "read",
+  "checksum",
+  "structure",
+  "close failure",
+  "failure poisons further work",
+  "zero ownership",
+] as const;
+export const REGISTRY_DIRECTORY_ALLOCATION_REACH = [
+  "first allocation",
+  "partial construction",
+  "denied before allocation",
+  "zero ownership",
+] as const;
+export const REGISTRY_DIRECTORY_OWNER_REACH = [
+  "same row different tables",
+  "wide table ID",
+  "max safe table ID",
+  "over-cap descriptors spill",
+  "zero ownership",
+] as const;
+export const REGISTRY_FRAGMENT_REACH = [
+  "empty",
+  "exact fragment",
+  "ragged fragment",
+  "payload larger than scratch",
+  "bounded copy and I/O",
+  "task clock per fragment",
+  "one file across payloads",
+  "replay without ref list",
+  "zero ownership",
+] as const;
+export const REGISTRY_FRAGMENT_IO_REACH = [
+  "create",
+  "append",
+  "read",
+  "fill",
+  "clock",
+  "external cancellation",
+  "close cancellation",
+  "zero ownership",
+] as const;
+export const REGISTRY_FRAGMENT_CORRUPTION_REACH = [
+  "checksum",
+  "header",
+  "cycle",
+  "truncated",
+  "oversized",
+  "fractional",
+  "bounded reads",
+  "zero ownership",
+] as const;
