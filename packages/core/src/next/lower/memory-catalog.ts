@@ -18,6 +18,7 @@ import type {
   ViewDef,
   TypeDef,
 } from "../access/catalog.js";
+import { requireWritableCatalogInput } from "../access/catalog-capabilities.js";
 import { CatalogChangeError } from "../access/catalog.js";
 import { resolveDependencies, tableUsesObject } from "../access/catalog-dependencies.js";
 import { ownedSequenceName } from "../access/catalog-names.js";
@@ -206,6 +207,7 @@ export class MemoryCatalog {
 
   /** Applies one change; returns the id of what it created (or null). */
   apply(change: CatalogChange): { readonly id: number | null } {
+    requireWritableCatalogInput(change);
     const view = this.#view;
     let tables = view.tables;
     let sequences = view.sequences;

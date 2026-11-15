@@ -172,7 +172,8 @@ and payload. Field IDs span u53; every reserved flag bit refuses. Required field
 features and versions refuse. Reserved future semantic fields also refuse when marked optional.
 FTS definitions use family21/config26; physical state never becomes opaque catalog data. Every known catalog field is semantic and requires understanding when present. Unknown optional
 fields are tolerated only by explicit read-only inspection, without retaining opaque payloads.
-Inspection results cannot initialize a writable Catalog, replay changes, or feed an encoder.
+Inspection results cannot initialize a writable Catalog, plan mutations, replay changes, or feed
+an encoder, including nested inspection records inside freshly constructed operands.
 Writable native/portable decode defaults to full understanding; requiredFeatures is sorted/unique
 and coherent with nonempty sections. Separate pre-fence root reader/writer gate allocation is
 owned by B2; an older writer must refuse any database it cannot fully rewrite.

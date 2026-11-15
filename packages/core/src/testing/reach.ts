@@ -7224,3 +7224,30 @@ export const CATALOG_CAPABILITY_WAL_REACH = [
   "inspection cannot replay",
   "inspection cannot serialize",
 ] as const;
+
+/** Inspection operands cannot pass through copying catalog planning/replay boundaries. */
+export const CATALOG_INSPECTION_INPUT_REACH = [
+  "createTable",
+  "alterTable",
+  "createIndex",
+  "createSequence",
+  "alterSequence",
+  "createView",
+  "replaceView",
+  "createType",
+  "createFts",
+  "upsertFts",
+  "createTrigger",
+  "fresh replay wrapper",
+  "source unchanged",
+] as const;
+
+export const CATALOG_INSPECTION_NESTED_REACH = [
+  "physical",
+  "declared",
+  "ftsConfig",
+  "triggerBody",
+  "viewOutput",
+] as const;
+
+export const CATALOG_INSPECTION_ENTRY_REACH = ["native", "stand-in"] as const;

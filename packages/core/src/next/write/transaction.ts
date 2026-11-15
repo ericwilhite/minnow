@@ -13,6 +13,7 @@
  * and foreign keys are checked at `Statement.end()`: during the statement a key that collides with
  * a live row is only a suspect, re-verified at the end against everything the statement wrote.
  */
+import { requireWritableCatalogInput } from "../access/catalog-capabilities.js";
 import { indexLimitViolation } from "./index-limits.js";
 import { scanIndexHolders } from "./index-scan.js";
 import { SMALL_COMMIT_BYTES, type BufferAllocator } from "./commit-buffers.js";
@@ -877,6 +878,7 @@ export class StatementImpl implements Statement {
 
   changeCatalog(change: CatalogChange): MaybePromise<{ readonly id: number | null }> {
     return this.guard(() => {
+      requireWritableCatalogInput(change);
       this.beginMutation();
       const before = this.tx.catalog;
       const { catalog, logged, id } = before.change(change, this.tx.hooks.nextCatalogVersion());

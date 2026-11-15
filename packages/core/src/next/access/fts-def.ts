@@ -31,7 +31,8 @@ function positive(value: unknown, label: string): asserts value is number {
 }
 
 /** Shape/range corruption is distinct from a valid, unsupported semantic version.
- * Unknown optional display fields live in MCAT's opaque extension storage, not these objects.
+ * Unknown optional fields may only be skipped during read-only catalog inspection;
+ * their bytes are never retained for rewriting.
  */
 export function validateFtsDef(value: unknown): asserts value is FtsDef {
   record(value, "FTS definition");

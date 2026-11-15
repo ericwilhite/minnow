@@ -64,7 +64,10 @@ import {
 } from "../access/trigger-def.js";
 import { validateFtsDef, type FtsDef } from "../access/fts-def.js";
 import { DurableFormatError } from "../durable-format.js";
-import { requireWritableCatalog, UnsupportedCatalogError } from "./catalog-records.js";
+import {
+  requireWritableCatalogInput,
+  UnsupportedCatalogError,
+} from "../access/catalog-capabilities.js";
 import { validateRelationalCatalog } from "./catalog-relationships.js";
 import { utf8Length } from "../vector/varlen.js";
 
@@ -168,7 +171,7 @@ export class Catalog implements CatalogView {
   readonly #types: ReadonlyMap<number, TypeDef>;
 
   constructor(data: CatalogData) {
-    requireWritableCatalog(data);
+    requireWritableCatalogInput(data);
     for (const table of data.tables) for (const index of table.indexes) validateIndexPolicy(index);
     this.version = data.version;
     this.counters = data.counters;
@@ -254,6 +257,7 @@ export class Catalog implements CatalogView {
     readonly logged: readonly LoggedChange[];
     readonly id: number | null;
   } {
+    requireWritableCatalogInput(change);
     let expectedVersion = this.version;
     const logged = this.#plan(change).map((operation) => {
       const entry = { ...operation, expectedVersion, version };
@@ -905,7 +909,7 @@ export class Catalog implements CatalogView {
   // ── Application: logged change → next catalog (live and replay) ───────────────────────────
 
   apply(change: LoggedChange, version: number): Catalog {
-    requireWritableCatalog(change);
+    requireWritableCatalogInput(change);
     if (
       change.expectedVersion !== this.version ||
       change.version !== version ||
@@ -1113,7 +1117,7 @@ export class Catalog implements CatalogView {
 
   /** Validation shared by native pages and the portable logical stream. */
   static fromStored(data: CatalogStreamData, budget?: ByteBudget): Catalog {
-    requireWritableCatalog(data);
+    requireWritableCatalogInput(data);
     // Temporary graph-validation IDs/names are distinct from the CatalogView's existing
     // resident definitions. Admit before constructing the temporary sets and maps.
     let entries =

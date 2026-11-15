@@ -12,7 +12,9 @@ compatibility policy and release process.
 
 The private 1.0 catalog requires understanding of every present semantic field, including
 conditional type, vector and WAL operands. Read-only catalog inspection may skip unknown
-optional fields; writable opens and replay refuse them. Unknown optional payloads are not
+optional fields; writable opens and replay refuse them. Catalog planning also refuses inspected
+operands before copying them, including nested records inside fresh mutation or replay wrappers.
+Unknown optional payloads are not
 retained for rewriting. Required features remain sorted, unique and checked against their
 catalog sections. This tightens unreleased MCAT admission without changing the field framing
 or released 0.x formats. Separate root reader/writer gate allocation remains with the format track.

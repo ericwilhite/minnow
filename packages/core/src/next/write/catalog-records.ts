@@ -12,6 +12,17 @@ import { StoreCorruptionError } from "../storage/contract.js";
 import { ByteReader, ByteWriter, utf8Length, type ByteSink } from "./bytes.js";
 import type { BufferAllocator } from "./commit-buffers.js";
 
+import {
+  catalogInspection,
+  requireWritableCatalog,
+  UnsupportedCatalogError,
+} from "../access/catalog-capabilities.js";
+export {
+  catalogInspection,
+  requireWritableCatalog,
+  UnsupportedCatalogError,
+} from "../access/catalog-capabilities.js";
+
 export type CatalogRecordKind = keyof typeof CATALOG_RECORD_SCHEMAS;
 const reservedFields: Partial<Record<CatalogRecordKind, ReadonlyArray<{ readonly id: number }>>> =
   CATALOG_RESERVED_FIELDS;
@@ -20,23 +31,6 @@ const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
  * every field, independently of the root's pre-fence minimum-writer capability gate. */
 export type CatalogDecodeMode = "read" | "write";
 type RecordValue = Record<string, unknown>;
-// Capability provenance only: retain no unknown payload bytes or extension descriptors.
-const inspections = new WeakSet();
-export function catalogInspection<T extends object>(value: T): T {
-  inspections.add(value);
-  return value;
-}
-export function requireWritableCatalog(value: unknown): void {
-  if (typeof value === "object" && value !== null && inspections.has(value))
-    throw new UnsupportedCatalogError("read-only catalog inspection cannot be rewritten");
-}
-export class UnsupportedCatalogError extends Error {
-  readonly code = "MINNOW_CATALOG_UNSUPPORTED";
-  constructor(readonly feature: string) {
-    super(`Unsupported required catalog feature: ${feature}`);
-    this.name = "UnsupportedCatalogError";
-  }
-}
 function check(ok: boolean, message: string): asserts ok {
   if (!ok) throw new StoreCorruptionError(message);
 }
