@@ -10,6 +10,13 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The private 1.0 catalog requires understanding of every present semantic field, including
+conditional type, vector and WAL operands. Read-only catalog inspection may skip unknown
+optional fields; writable opens and replay refuse them. Unknown optional payloads are not
+retained for rewriting. Required features remain sorted, unique and checked against their
+catalog sections. This tightens unreleased MCAT admission without changing the field framing
+or released 0.x formats. Separate root reader/writer gate allocation remains with the format track.
+
 The private 1.0 catalog reads Date defaults and frozen backfills through captured Date
 intrinsics, so instance method overrides cannot replace the stored value. Integer backfill
 metadata also retains the API distinction between `-0` and `0` through WAL and checkpoint

@@ -16,12 +16,20 @@ export type CatalogRecordKind = keyof typeof CATALOG_RECORD_SCHEMAS;
 const reservedFields: Partial<Record<CatalogRecordKind, ReadonlyArray<{ readonly id: number }>>> =
   CATALOG_RESERVED_FIELDS;
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-const opaque = Symbol("MCAT optional display fields");
-interface Extension {
-  id: number;
-  bytes: Uint8Array;
+/** Read-only inspection may skip unknown optional fields. Writable decoding must understand
+ * every field, independently of the root's pre-fence minimum-writer capability gate. */
+export type CatalogDecodeMode = "read" | "write";
+type RecordValue = Record<string, unknown>;
+// Capability provenance only: retain no unknown payload bytes or extension descriptors.
+const inspections = new WeakSet();
+export function catalogInspection<T extends object>(value: T): T {
+  inspections.add(value);
+  return value;
 }
-type RecordValue = Record<string, unknown> & { [opaque]?: Extension[] };
+export function requireWritableCatalog(value: unknown): void {
+  if (typeof value === "object" && value !== null && inspections.has(value))
+    throw new UnsupportedCatalogError("read-only catalog inspection cannot be rewritten");
+}
 export class UnsupportedCatalogError extends Error {
   readonly code = "MINNOW_CATALOG_UNSUPPORTED";
   constructor(readonly feature: string) {
@@ -182,18 +190,18 @@ function put(
   check(Object.hasOwn(CATALOG_RECORD_SCHEMAS, spec), "Unknown catalog schema");
   writeRecord(out, spec as CatalogRecordKind, value, allocator, depth + 1);
 }
-function get(input: ByteReader, spec: string, depth: number): unknown {
+function get(input: ByteReader, spec: string, depth: number, mode: CatalogDecodeMode): unknown {
   check(depth <= 32, "Catalog nesting exceeds its cap");
   if (spec.endsWith("?")) {
     const flag = input.u8();
     check(flag <= 1, "Invalid catalog null flag");
-    return flag === 0 ? null : get(input, spec.slice(0, -1), depth + 1);
+    return flag === 0 ? null : get(input, spec.slice(0, -1), depth + 1, mode);
   }
   if (spec.startsWith("[")) {
     const count = uint(input);
     check(count <= input.bytes.length - input.offset, "Catalog array count exceeds bytes");
     const result: unknown[] = [];
-    for (let i = 0; i < count; i++) result.push(get(input, spec.slice(1, -1), depth + 1));
+    for (let i = 0; i < count; i++) result.push(get(input, spec.slice(1, -1), depth + 1, mode));
     return result;
   }
   switch (spec) {
@@ -216,7 +224,7 @@ function get(input: ByteReader, spec: string, depth: number): unknown {
       return b === 1;
     }
     case "i": {
-      const s = get(input, "s", depth + 1);
+      const s = get(input, "s", depth + 1, mode);
       check(
         typeof s === "string" && /^(?:0|-[1-9]\d*|[1-9]\d*)$/u.test(s),
         "Noncanonical catalog bigint",
@@ -231,11 +239,11 @@ function get(input: ByteReader, spec: string, depth: number): unknown {
       check(tag === storage.typed || tag === storage.expanded, "Unknown catalog vector storage");
       return tag === storage.typed
         ? getTyped(input)
-        : get(input, spec === "vectorValues" ? "integerValues" : "[i]", depth + 1);
+        : get(input, spec === "vectorValues" ? "integerValues" : "[i]", depth + 1, mode);
     }
   }
   check(Object.hasOwn(CATALOG_RECORD_SCHEMAS, spec), "Unknown catalog schema");
-  return readRecord(input, spec as CatalogRecordKind, depth + 1);
+  return readRecord(input, spec as CatalogRecordKind, depth + 1, mode);
 }
 function width(value: number): number {
   check(Number.isSafeInteger(value) && value >= 0, "Invalid catalog size");
@@ -299,12 +307,13 @@ function valueSize(spec: string, value: unknown, depth: number): number {
 function entries(
   kind: CatalogRecordKind,
   value: unknown,
-  visit: (id: number, flags: number, spec: string | null, value: unknown) => void,
+  visit: (id: number, flags: number, spec: string, value: unknown) => void,
 ): void {
   check(
     typeof value === "object" && value !== null && !Array.isArray(value),
     "Invalid catalog record",
   );
+  requireWritableCatalog(value);
   const record = value as RecordValue,
     definitions = shape(kind);
   for (const key of Object.keys(record))
@@ -323,18 +332,12 @@ function entries(
     }
     visit(id, f.required ? DURABLE_CODECS.catalogFieldFlags.required : 0, f.spec, v);
   }
-  let last = definitions.length;
-  for (const extension of record[opaque] ?? []) {
-    check(extension.id > last, "Invalid optional catalog extension order");
-    last = extension.id;
-    visit(extension.id, 0, null, extension.bytes);
-  }
 }
 function bodySize(kind: CatalogRecordKind, value: unknown, depth: number): number {
   check(depth <= 32, "Catalog nesting exceeds its cap");
   let size = 0;
   entries(kind, value, (id, _flags, spec, v) => {
-    const n = spec === null ? (v as Uint8Array).length : valueSize(spec, v, depth + 1);
+    const n = valueSize(spec, v, depth + 1);
     size += width(id) + 1 + width(n) + n;
   });
   return size;
@@ -350,16 +353,16 @@ function writeRecord(
   allocator: BufferAllocator | undefined,
   depth: number,
 ): void {
+  const size = bodySize(kind, value, depth);
   out.varuint(CATALOG_RECORD_KINDS[kind]);
   out.varuint(grammar.recordVersion);
-  out.varuint(bodySize(kind, value, depth));
+  out.varuint(size);
   entries(kind, value, (id, flags, spec, v) => {
-    const n = spec === null ? (v as Uint8Array).length : valueSize(spec, v, depth + 1);
+    const n = valueSize(spec, v, depth + 1);
     out.varuint(id);
     out.u8(flags);
     out.varuint(n);
-    if (spec === null) out.raw(v as Uint8Array);
-    else put(out, spec, v, allocator, depth + 1);
+    put(out, spec, v, allocator, depth + 1);
   });
 }
 /** The shared writer reserves eight bytes per varuint; an exact-size owner reserves its actual width. */
@@ -393,15 +396,19 @@ export function encodeCatalogRecord(
     throw error;
   }
 }
-function readRecord(input: ByteReader, kind: CatalogRecordKind, depth: number): RecordValue {
+function readRecord(
+  input: ByteReader,
+  kind: CatalogRecordKind,
+  depth: number,
+  mode: CatalogDecodeMode,
+): RecordValue {
   const id = uint(input),
     version = uint(input);
   if (id !== CATALOG_RECORD_KINDS[kind] || version !== grammar.recordVersion)
     throw new UnsupportedCatalogError(`record ${String(id)} version ${String(version)}`);
   const body = new ByteReader(input.raw(uint(input))),
     definitions = shape(kind),
-    result: RecordValue = {},
-    extensions: Extension[] = [];
+    result: RecordValue = {};
   let previous = 0;
   while (!body.done) {
     const id = uint(body),
@@ -418,39 +425,39 @@ function readRecord(input: ByteReader, kind: CatalogRecordKind, depth: number): 
     if (definition === undefined) {
       if (reservedFields[kind]?.some((field) => field.id === id))
         throw new UnsupportedCatalogError(`reserved field ${String(id)} in ${kind}`);
-      if (required) throw new UnsupportedCatalogError(`field ${String(id)} in ${kind}`);
-      extensions.push({ id, bytes: payload.bytes.slice() });
+      if (required || mode !== "read")
+        throw new UnsupportedCatalogError(`field ${String(id)} in ${kind}`);
       continue;
     }
     const f = field(definition);
     check(required === f.required, "Invalid catalog field requirement flag");
-    result[f.name] = get(payload, f.spec, depth + 1);
+    result[f.name] = get(payload, f.spec, depth + 1, mode);
     payload.end();
   }
   for (const definition of definitions) {
     const f = field(definition);
     check(f.optional || Object.hasOwn(result, f.name), `Missing catalog field ${f.name}`);
   }
-  if (extensions.length) result[opaque] = extensions;
-  return result;
+  return mode === "read" ? catalogInspection(result) : result;
 }
-export function decodeCatalogRecord(kind: CatalogRecordKind, source: Uint8Array): unknown {
+export function decodeCatalogRecord(
+  kind: CatalogRecordKind,
+  source: Uint8Array,
+  mode: CatalogDecodeMode = "write",
+): unknown {
   const reader = new ByteReader(source),
-    value = readRecord(reader, kind, 0);
+    value = readRecord(reader, kind, 0, mode);
   reader.end();
   return value;
 }
 
-/** Preserve only opaque display fields when rebuilding a known record by identity. */
-export function retainCatalogExtensions(source: unknown, target: object): void {
-  if (typeof source === "object" && source !== null && opaque in source) {
-    const extensions = (source as RecordValue)[opaque];
-    if (extensions !== undefined) (target as RecordValue)[opaque] = extensions;
-  }
-}
 /** Consume one record from a larger logical stream, without copying its enclosing bytes. */
-export function readCatalogRecord(kind: CatalogRecordKind, input: ByteReader): unknown {
-  return readRecord(input, kind, 0);
+export function readCatalogRecord(
+  kind: CatalogRecordKind,
+  input: ByteReader,
+  mode: CatalogDecodeMode = "write",
+): unknown {
+  return readRecord(input, kind, 0, mode);
 }
 
 /** A schema walk measures the wire before the caller admits its output allocation. */

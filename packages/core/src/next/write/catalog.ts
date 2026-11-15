@@ -64,7 +64,7 @@ import {
 } from "../access/trigger-def.js";
 import { validateFtsDef, type FtsDef } from "../access/fts-def.js";
 import { DurableFormatError } from "../durable-format.js";
-import { retainCatalogExtensions, UnsupportedCatalogError } from "./catalog-records.js";
+import { requireWritableCatalog, UnsupportedCatalogError } from "./catalog-records.js";
 import { validateRelationalCatalog } from "./catalog-relationships.js";
 import { utf8Length } from "../vector/varlen.js";
 
@@ -162,15 +162,14 @@ export class Catalog implements CatalogView {
   readonly types: readonly TypeDef[];
   readonly fts: readonly FtsDef[];
   readonly triggers: readonly TriggerDef[];
-  readonly wireMetadata?: unknown;
   readonly #tables: ReadonlyMap<number, TableDef>;
   readonly #tablesByName: ReadonlyMap<string, TableDef>;
   readonly #sequences: ReadonlyMap<number, SequenceDef>;
   readonly #types: ReadonlyMap<number, TypeDef>;
 
   constructor(data: CatalogData) {
+    requireWritableCatalog(data);
     for (const table of data.tables) for (const index of table.indexes) validateIndexPolicy(index);
-    this.wireMetadata = data.wireMetadata;
     this.version = data.version;
     this.counters = data.counters;
     this.tables = data.tables;
@@ -228,7 +227,6 @@ export class Catalog implements CatalogView {
 
   #data(): CatalogData {
     return {
-      wireMetadata: this.wireMetadata,
       version: this.version,
       counters: this.counters,
       tables: this.tables,
@@ -907,6 +905,7 @@ export class Catalog implements CatalogView {
   // ── Application: logged change → next catalog (live and replay) ───────────────────────────
 
   apply(change: LoggedChange, version: number): Catalog {
+    requireWritableCatalog(change);
     if (
       change.expectedVersion !== this.version ||
       change.version !== version ||
@@ -915,7 +914,6 @@ export class Catalog implements CatalogView {
       throw new StoreCorruptionError("A logged catalog change has the wrong predecessor/version");
     const data = this.#data();
     const counters = { ...data.counters };
-    retainCatalogExtensions(data.counters, counters);
     const bump = (key: keyof CatalogCounters, used: number) => {
       counters[key] = Math.max(counters[key], used + 1);
     };
@@ -1092,7 +1090,6 @@ export class Catalog implements CatalogView {
     }
     validateTriggerCatalog({ tables, triggers, types, sequences });
     return new Catalog({
-      wireMetadata: this.wireMetadata,
       version,
       counters,
       tables,
@@ -1116,6 +1113,7 @@ export class Catalog implements CatalogView {
 
   /** Validation shared by native pages and the portable logical stream. */
   static fromStored(data: CatalogStreamData, budget?: ByteBudget): Catalog {
+    requireWritableCatalog(data);
     // Temporary graph-validation IDs/names are distinct from the CatalogView's existing
     // resident definitions. Admit before constructing the temporary sets and maps.
     let entries =

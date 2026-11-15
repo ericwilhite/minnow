@@ -170,8 +170,12 @@ charge callbacks and checks capacities, overlap, refusal, constructor failures a
 MCHG1 WAL changes. Each field is an ID varuint, flags byte (bit 0 required), length varuint
 and payload. Field IDs span u53; every reserved flag bit refuses. Required fields use registered numeric IDs; unknown required fields,
 features and versions refuse. Reserved future semantic fields also refuse when marked optional.
-FTS definitions use family21/config26; physical state never becomes opaque catalog data. Optional display extensions remain
-opaque through rewrites.
+FTS definitions use family21/config26; physical state never becomes opaque catalog data. Every known catalog field is semantic and requires understanding when present. Unknown optional
+fields are tolerated only by explicit read-only inspection, without retaining opaque payloads.
+Inspection results cannot initialize a writable Catalog, replay changes, or feed an encoder.
+Writable native/portable decode defaults to full understanding; requiredFeatures is sorted/unique
+and coherent with nonempty sections. Separate pre-fence root reader/writer gate allocation is
+owned by B2; an older writer must refuse any database it cannot fully rewrite.
 Records retain exact typed vectors, decimal coefficients, bigint sequence settings and UTF8
 identifier boundaries. An individual record is capped at 4 MiB. Catalogs stream one admitted
 record at a time across 256 KiB pages and 64-way indexes, including records crossing pages.

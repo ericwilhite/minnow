@@ -4,8 +4,7 @@
 import { pauseIfDue, type TaskWork } from "../task.js";
 import {
   CATALOG_NATIVE_GRAMMAR as grammar,
-  CATALOG_FTS_FEATURE,
-  CATALOG_TRIGGER_FEATURE,
+  CATALOG_REQUIRED_FEATURES,
   CATALOG_RECORD_KINDS as kinds,
 } from "../durable-format.js";
 import type { TriggerDef } from "../access/trigger-def.js";
@@ -19,7 +18,9 @@ import {
   encodeCatalogRecord,
   decodeCatalogRecord,
   readCatalogRecord,
-  retainCatalogExtensions,
+  type CatalogDecodeMode,
+  catalogInspection,
+  requireWritableCatalog,
   UnsupportedCatalogError,
   type CatalogRecordKind,
   catalogRecordSize,
@@ -34,7 +35,7 @@ export interface CatalogStreamData {
   readonly types: readonly TypeDef[];
   readonly fts: readonly FtsDef[];
   readonly triggers: readonly TriggerDef[];
-  /** Unknown display fields from the metadata record; never consulted for semantics. */
+  /** Decoded known metadata for inspection, never opaque data for rewrite. */
   readonly wireMetadata?: unknown;
 }
 interface Metadata {
@@ -86,17 +87,16 @@ function readHeader(input: ByteReader, magic: number): void {
     throw new UnsupportedCatalogError(`expression dialect ${String(dialect)}`);
 }
 function metadata(data: CatalogStreamData): Metadata {
-  const result = {
+  requireWritableCatalog(data);
+  const content = sections.map(([kind, key]) => ({ kind: kinds[kind], count: data[key].length }));
+  return {
     version: data.version,
     counters: data.counters,
-    requiredFeatures: [
-      ...(data.fts.length ? [CATALOG_FTS_FEATURE] : []),
-      ...(data.triggers.length ? [CATALOG_TRIGGER_FEATURE] : []),
-    ],
-    sections: sections.map(([kind, key]) => ({ kind: kinds[kind], count: data[key].length })),
+    requiredFeatures: CATALOG_REQUIRED_FEATURES.filter((feature) =>
+      content.some((s) => s.kind === feature.section && s.count > 0),
+    ).map((feature) => feature.id),
+    sections: content,
   };
-  retainCatalogExtensions(data.wireMetadata, result);
-  return result;
 }
 function* ownedRecord(
   kind: CatalogRecordKind,
@@ -119,6 +119,7 @@ export function* catalogStream(
   data: CatalogStreamData,
   allocator?: BufferAllocator,
 ): Generator<Uint8Array> {
+  requireWritableCatalog(data);
   const first = header(grammar.streamMagic, allocator);
   try {
     yield first.bytes;
@@ -169,17 +170,14 @@ function checkMetadata(value: unknown): Metadata {
   }
   if (
     meta.requiredFeatures.some(
-      (feature) => feature !== CATALOG_FTS_FEATURE && feature !== CATALOG_TRIGGER_FEATURE,
+      (feature) => !CATALOG_REQUIRED_FEATURES.some((known) => known.id === feature),
     )
   )
     throw new UnsupportedCatalogError(`features ${meta.requiredFeatures.join(",")}`);
   check(meta.sections.length === sections.length, "Catalog section set is incomplete");
   for (const [i, [kind]] of sections.entries())
     check(meta.sections[i]?.kind === kinds[kind], "Duplicate/out-of-order catalog section");
-  for (const [kind, feature] of [
-    [kinds.fts, CATALOG_FTS_FEATURE],
-    [kinds.trigger, CATALOG_TRIGGER_FEATURE],
-  ] as const) {
+  for (const { section: kind, id: feature } of CATALOG_REQUIRED_FEATURES) {
     const present = (meta.sections.find((s) => s.kind === kind)?.count ?? 0) > 0;
     check(
       meta.requiredFeatures.includes(feature) === present,
@@ -188,10 +186,13 @@ function checkMetadata(value: unknown): Metadata {
   }
   return meta;
 }
-export function decodeCatalogStream(bytes: Uint8Array): CatalogStreamData {
+export function decodeCatalogStream(
+  bytes: Uint8Array,
+  mode: CatalogDecodeMode = "write",
+): CatalogStreamData {
   const input = new ByteReader(bytes);
   readHeader(input, grammar.streamMagic);
-  const meta = checkMetadata(readCatalogRecord("catalog", input));
+  const meta = checkMetadata(readCatalogRecord("catalog", input, mode));
   const groups: Record<string, unknown[]> = {
     tables: [],
     sequences: [],
@@ -208,13 +209,13 @@ export function decodeCatalogStream(bytes: Uint8Array): CatalogStreamData {
     );
     for (let j = 0; j < count; j++) {
       const at = input.offset,
-        value = readCatalogRecord(kind, input);
+        value = readCatalogRecord(kind, input, mode);
       check(input.offset - at <= CATALOG_RECORD_BYTES, "Catalog record exceeds its4MiB limit");
       groups[key]?.push(value);
     }
   }
   input.end();
-  return {
+  const data = {
     version: meta.version,
     counters: meta.counters,
     tables: groups.tables as TableDef[],
@@ -225,6 +226,7 @@ export function decodeCatalogStream(bytes: Uint8Array): CatalogStreamData {
     triggers: groups.triggers as TriggerDef[],
     wireMetadata: meta,
   };
+  return mode === "read" ? catalogInspection(data) : data;
 }
 /** Same MCHG wire in the bounded multipart commit path, with no record-sized allocation. */
 export function catalogChangeByteLength(change: LoggedChange): number {
@@ -254,10 +256,13 @@ export function encodeCatalogChange(change: LoggedChange, allocator?: BufferAllo
     first.close();
   }
 }
-export function decodeCatalogChange(bytes: Uint8Array): LoggedChange {
+export function decodeCatalogChange(
+  bytes: Uint8Array,
+  mode: CatalogDecodeMode = "write",
+): LoggedChange {
   const input = new ByteReader(bytes);
   readHeader(input, grammar.changeMagic);
-  const result = readCatalogRecord("change", input) as LoggedChange;
+  const result = readCatalogRecord("change", input, mode) as LoggedChange;
   input.end();
   return result;
 }
@@ -268,6 +273,7 @@ export async function decodeCatalogParts(
   parts: AsyncIterable<Uint8Array>,
   allocator: BufferAllocator,
   work?: TaskWork,
+  mode: CatalogDecodeMode = "write",
 ): Promise<CatalogStreamData> {
   const iterator = parts[Symbol.asyncIterator]();
   let current: Uint8Array | undefined,
@@ -333,7 +339,7 @@ export async function decodeCatalogParts(
     try {
       bytes.set(prefix);
       await copy(bytes, prefix.length, length);
-      return decodeCatalogRecord(kind, bytes);
+      return decodeCatalogRecord(kind, bytes, mode);
     } finally {
       allocator.release(bytes);
     }
@@ -365,7 +371,7 @@ export async function decodeCatalogParts(
     }
     check(!current || at === current.length, "Catalog has trailing bytes");
     check(!(await nextPart()), "Catalog has trailing pages");
-    return {
+    const data = {
       version: meta.version,
       counters: meta.counters,
       tables: groups.tables as TableDef[],
@@ -376,6 +382,7 @@ export async function decodeCatalogParts(
       triggers: groups.triggers as TriggerDef[],
       wireMetadata: meta,
     };
+    return mode === "read" ? catalogInspection(data) : data;
   } finally {
     current = undefined;
     await iterator.return?.();

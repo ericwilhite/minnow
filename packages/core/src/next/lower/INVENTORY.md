@@ -862,3 +862,9 @@ Catalog source metadata uses captured Date intrinsics for caller-supplied defaul
 backfills. Column family4 field17 retains an integer API backfill's negative zero for
 introspection/migration; physical missing/row integer values remain SQL zero. The flag is
 required-understanding when present and valid only beside a non-NULL integer missing zero.
+
+MCAT/MCHG default decoding is writable and requires every field to be understood. Explicit
+read-only inspection tolerates unknown optional fields, retains no opaque payload, and cannot
+initialize a writable Catalog or encoder. Known semantic fields are required whenever present;
+requiredFeatures is centrally registered, sorted/unique and coherent with nonempty sections.
+Separate pre-fence root minimum-reader/minimum-writer admission belongs to B2, not this codec.
