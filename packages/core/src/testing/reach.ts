@@ -5934,12 +5934,14 @@ export const CATALOG_SAFE_VALUES_REACH = [
 ] as const;
 
 export const CATALOG_RESERVATION_REACH = [
+  "reserved reader refused",
   "fts 8",
   "fts 9",
   "fts 10",
   "optional",
   "required",
-  "display retained",
+  "optional reader tolerated",
+  "optional writer refused",
 ] as const;
 
 export const BYTE_GROWTH_REACH = [
@@ -6172,7 +6174,8 @@ export const FTS_CATALOG_REACH = [
   "stale WAL",
   "invalid binding",
   "unknown semantics",
-  "display extensions",
+  "optional reader tolerated",
+  "optional writer refused",
   "drained",
 ] as const;
 export const FTS_STORAGE_REACH = [
@@ -6826,7 +6829,8 @@ export const TRIGGER_RESERVED_NAME_REACH = [
 export const TRIGGER_WIRE_REACH = [
   "reserved refused",
   "required refused",
-  "display retained",
+  "optional reader tolerated",
+  "optional writer refused",
   "dialect refused",
   "source refused",
   "insert",

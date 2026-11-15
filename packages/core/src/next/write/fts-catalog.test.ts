@@ -149,19 +149,24 @@ for (const seed of seedsFor("next-fts-catalog", [0xb81b, 0xb81c]))
             ],
             [100, Uint8Array.of(9), 0],
           ]);
-          const opaque = decodeCatalogRecord("fts", extended) as FtsDef;
+          // Lead's extension policy: inspection may read, but cannot rewrite future fields.
+          const inspected = decodeCatalogRecord("fts", extended, "read") as FtsDef;
+          expect(inspected).toMatchObject(def);
+          expect(() => decodeCatalogRecord("fts", extended)).toThrow(
+            expect.objectContaining({ code: "MINNOW_CATALOG_UNSUPPORTED" }),
+          );
+          expect(() => encodeCatalogRecord("fts", inspected)).toThrow(
+            expect.objectContaining({ code: "MINNOW_CATALOG_UNSUPPORTED" }),
+          );
+          reach.reach("optional reader tolerated");
+          reach.reach("optional writer refused");
+          // Keep the original supported-definition upsert/reopen control.
           const updated = catalog.change(
-            { kind: "upsertFts", fts: opaque },
+            { kind: "upsertFts", fts: def },
             catalog.version + 1,
           ).catalog;
           const loaded = Catalog.decode(updated.withVersion(updated.version + 1).encode());
-          const encoded = encodeCatalogRecord("fts", loaded.fts[0]);
-          try {
-            expect(encoded.bytes).toEqual(extended);
-          } finally {
-            encoded.close();
-          }
-          reach.reach("display extensions");
+          expect(loaded.fts[0]).toEqual(def);
           reach.reach("portable definitions");
           const drop = catalog.change(
             { kind: "dropFts", ftsId: def.id },

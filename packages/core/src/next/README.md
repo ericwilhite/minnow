@@ -3835,7 +3835,7 @@ Counter field8 is nextFtsId; MCHG fields15/16 carry a definition/ID for create/u
 Definitions are ordered by stable ID, unique per live column, and removed with their table;
 dropped IDs are never reused. WAL keeps the existing expected/resulting version preconditions.
 Required feature1 marks a stream containing declarations. Unknown semantic versions refuse;
-optional display extensions survive copies/replay. Definition fields8..15 and families27/28
+unknown optional fields are read-tolerated only and cannot be rewritten by an older build. Definition fields8..15 and families27/28
 remain reserved rather than silently storing future semantics or native lease/coverage state.
 Snapshots will rebuild postings from rows; this stage only supplies the portable definition.
 

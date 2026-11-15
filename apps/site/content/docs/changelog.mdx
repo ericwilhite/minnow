@@ -184,7 +184,7 @@ bytes to the core tarball; its packed cap rises once by 1,000 bytes.
 
 The unexported rebuild replaces generic JSON catalog persistence with versioned binary catalog
 records, bounded native catalog pages and matching logged catalog changes. Unknown required
-fields and versions are refused; exact typed values and optional display extensions survive
+fields and versions are refused; exact typed values survive
 rewrites. Reachability and reclamation include every catalog page. Fields use separate ID and flag
 bytes; reserved flags and inconsistent type, vector and reference shapes are refused. Logged
 catalog changes bind their expected predecessor and resulting version before row replay.
