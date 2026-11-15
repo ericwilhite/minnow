@@ -9030,3 +9030,32 @@ export const CORRUPT_MERGE_REACH = [
   "reopenable",
   "charges released",
 ] as const;
+
+export const STRUCTURED_PARTS_REACH = [
+  "all array scalar kinds",
+  "array NULL bitmap",
+  "JSON",
+  "JSONB",
+  "internal corruption",
+  "funding before producer",
+  "cancellation releases producer",
+  "borrowed parts copied before advance",
+  "charges released",
+  "large bounded bitmap",
+] as const;
+
+export const STRUCTURED_EXPORT_REACH = [
+  "version",
+  "element tag",
+  "dimensions",
+  "flags",
+  "element length",
+  "decimal special",
+  "real stored source",
+  "typed query refusal",
+  "typed export refusal",
+  "no footer",
+  "root and WAL unchanged",
+  "reopenable",
+  "charges released",
+] as const;
