@@ -4155,3 +4155,11 @@ binding copier in component tests. They still do not install a native statement 
 turn on SQL firing. The caller supplies admitted scope/progress and immutable table metadata;
 statement/command ownership, row rules, accepted-write hooks and deferred RI execution are
 separate integration responsibilities.
+
+`write/registry-commands.ts` records command/frame ownership, accepted native row IDs and
+immutable RI descriptors in the shared directory. Its fixed frame slots retain separate
+uniqueness and reference cursors. Every action checks its newly accepted child work, even
+when an earlier action already verified the same command token. Retired commands and RI
+IDs refuse; signed trigger budgets survive replay. Close fences pending verification callbacks
+before returning metadata credit. This module stores work; native constraint verification,
+accepted-write capture and RI execution remain responsibilities of the native provider.

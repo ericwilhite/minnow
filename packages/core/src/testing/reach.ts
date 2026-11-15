@@ -8146,6 +8146,28 @@ export const REGISTRY_IMAGES_WIDE_REACH = [
   "exact tier and scale",
   "zero ownership",
 ] as const;
+export const REGISTRY_COMMAND_REACH = [
+  "root budget 1",
+  "body budget 0",
+  "terminal budget -1",
+  "three live frames",
+  "retired command refused",
+  "incremental action uniqueness",
+  "separate reference cursor",
+  "immutable RI replay",
+  "retired RI refused",
+  "wide row IDs",
+  "spilled accepted rows",
+  "fixed metadata",
+  "zero ownership",
+] as const;
+export const REGISTRY_COMMAND_IO_REACH = [
+  "caller cancellation",
+  "close cancellation",
+  "verification IO fenced",
+  "metadata remains paid",
+  "zero ownership",
+] as const;
 export const REGISTRY_IMAGES_WORKSPACE_REACH = [
   "many wide columns",
   "shared decode scratch",
