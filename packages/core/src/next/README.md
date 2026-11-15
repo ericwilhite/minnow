@@ -4131,3 +4131,11 @@ These are internal building blocks. They do not install `NativeCommandBoundary`,
 checks cover record eviction/overwrite, sparse table/row IDs, exact replay, corruption,
 constructor failures and cancellation fences. Native statement/provider and SQL differential
 coverage belong to the later integration, alongside the existing refusal guards.
+
+`write/registry-targets.ts` seals original child-identity ranges in the same descriptor file.
+Its 1 KiB charged cursor records table-local original-to-current native row versions and
+retains no row-ID map. A later update changes the canonical current version; deletion marks
+it retired. Replaying an earlier captured range resolves those identities rather than looking
+up rewritten FK values. Empty ranges stay independently replayable. Callers must capture all
+original `follow` matches before applying any follow action. This component neither finds FK
+matches nor schedules writes; those remain native-provider integration work.

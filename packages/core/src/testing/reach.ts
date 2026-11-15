@@ -8062,3 +8062,33 @@ export const REGISTRY_FRAGMENT_CORRUPTION_REACH = [
   "bounded reads",
   "zero ownership",
 ] as const;
+
+export const REGISTRY_TARGET_REACH = [
+  "parent swap captures",
+  "updated once",
+  "multiple physical versions",
+  "deleted target skipped",
+  "same row different tables",
+  "wide IDs",
+  "empty range replay",
+  "foreign root refused",
+  "one file across ranges",
+  "over-cap targets",
+  "fixed metadata",
+  "zero ownership",
+] as const;
+export const REGISTRY_TARGET_IO_REACH = [
+  "caller cancellation",
+  "close cancellation",
+  "input return fenced",
+  "pending input remains charged",
+  "zero ownership",
+] as const;
+export const REGISTRY_IMAGES_WIDE_REACH = [
+  "capture scratch prepaid",
+  "signed wide coefficient",
+  "wide source retired",
+  "projected wide payload skipped",
+  "exact tier and scale",
+  "zero ownership",
+] as const;
