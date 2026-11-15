@@ -161,6 +161,10 @@ export class RegistryCommands {
     };
     return command;
   }
+  /** Synchronous live capability check for primary continuations, before and after awaits. */
+  budget(command: CommandToken): number {
+    return this.#frame(command).budget;
+  }
   async #get(kind: number, id: number): Promise<DataView> {
     const record = this.#record;
     if (!record) invalid();

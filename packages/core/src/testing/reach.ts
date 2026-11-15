@@ -8229,3 +8229,88 @@ export const NATIVE_COMMAND_CHECK_CONSTRUCTION_REACH = [
   "private account restored",
   "zero ownership",
 ] as const;
+export const NATIVE_PRIMARY_REACH = [
+  "insert",
+  "update",
+  "delete",
+  "key swap",
+  "PG immediate swap refused",
+  "product swap deferred PG control",
+  "resident sources",
+  "published sources",
+  "no admission with image lease",
+  "no legacy deferred queues",
+  "whole statement rollback",
+  "NOT NULL",
+  "CHECK",
+  "command uniqueness",
+  "later callback failure",
+  "root end once",
+  "zero ownership",
+] as const;
+export const NATIVE_PRIMARY_OWNERSHIP_REACH = [
+  "insert",
+  "update",
+  "delete",
+  "conflicts",
+  "DDL",
+  "prepared end",
+  "foreign command",
+  "retired command",
+  "forged preparation",
+  "no unchecked mutation",
+  "zero ownership",
+] as const;
+export const NATIVE_PRIMARY_LIFETIME_REACH = [
+  "close waits native reservation",
+  "retirement during reservation",
+  "no mutation after await",
+  "prepared credit retired",
+  "zero ownership",
+] as const;
+export const NATIVE_PRIMARY_ADMISSION_REACH = [
+  "native growth queued",
+  "competing credit retained",
+  "operation cancellation",
+  "cancel completes at admission boundary",
+  "same transaction continues",
+  "zero ownership",
+] as const;
+export const NATIVE_PRIMARY_OWNER_CLOSE_REACH = [
+  "resident source",
+  "published source",
+  "pending callback fenced",
+  "rollback waits callback",
+  "prefix pin retired by rollback",
+  "native primary charge retained",
+  "zero ownership",
+] as const;
+export const COMMAND_MAINTENANCE_WAIT_REACH = [
+  "one native operation factory",
+  "one completion observer",
+  "cancelled listeners removed",
+  "later command attaches",
+  "one active waiter",
+  "owner failure preserved",
+  "owner completion preserved",
+  "settled listener removed",
+] as const;
+
+export const NATIVE_PRIMARY_END_FENCE_REACH = [
+  "resident source",
+  "published source",
+  "end callback fenced",
+  "cancelled end cannot succeed",
+  "rollback after fence",
+  "charge retained until callback",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PRIMARY_CLOSE_FAULT_REACH = [
+  "async callback fault",
+  "immediate callback fault",
+  "native rollback despite fault",
+  "metadata refunded after fence",
+  "original callback fault retained",
+  "zero ownership",
+] as const;

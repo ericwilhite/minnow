@@ -4181,5 +4181,20 @@ This checker is a provider component; it does not execute RI actions or install 
 primary adapter. The root funds writer growth first, then protects that already admitted
 headroom before borrowing an image. One paid 256-byte token keeps reclaim and metadata/merge
 transfers from consuming the next primary step. Releasing the token preserves charges for
-accepted native buffers; owner close requires the step to be retired. This facility has no
-DML caller yet and does not perform admission or change existing write scheduling.
+accepted native buffers; owner close requires the step to be retired.
+
+`write/primary-command.ts` is the private native consumer of that reservation. A root installs
+it before any statement writes, prepares progress with no borrowed image, then applies one
+complete physical OLD/NEW row. It returns the new native identity and leaves command
+uniqueness, references and RI sequencing to the root registry. Retained legacy writers cannot
+bypass the installed capability or enqueue legacy deferred work. Complete-row validation uses
+the shared bound rules; the root remains responsible for BEFORE and generated evaluation.
+Statement end invokes the supplied root checkpoint, and native owner close fences that work
+before rollback and account release, including callback failures. Command cancellation releases
+its wait on independently owned committed maintenance; staging remains fenced to completion.
+A weak completion cache prevents cancelled waits from retaining command reaction lists.
+
+This is a staged internal API, with synthetic final controller callbacks in its native tests.
+Its initial preflight refuses auto-increment and wide/variable indexed domains before writes.
+No SQL path installs it yet. The full native trigger/RI provider and compiled body-input host
+remain separate integration work; the existing SQL refusal guards remain in force.

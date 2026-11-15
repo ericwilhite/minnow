@@ -130,6 +130,9 @@ it.each(seedsFor("next-registry-commands", [0xb5e5]))(
             ).toThrow("native command work");
             expect(() => f.commands.beginCommand(4, -1)).toThrow("native command work");
             for (const command of [root, body, terminal]) {
+              expect(f.commands.budget(command)).toBe(
+                command === root ? 1 : command === body ? 0 : -1,
+              );
               const item = await add(command, "update");
               if (command === root) expected.push(item.images.row);
               for (const fkId of [9, 10])

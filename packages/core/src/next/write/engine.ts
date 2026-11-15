@@ -127,7 +127,8 @@ import { Replayer, type Effect } from "../format/replay.js";
 import { walkReachable } from "../format/reachable.js";
 import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
 import { OBJECT_OVERHEAD_BYTES, type Grant, type Loan } from "../memory/governor.js";
-import { WriteCredits } from "./credits.js";
+import { CommandMaintenance, waitCommandMaintenance } from "./command-wait.js";
+import { WriteCredits, WRITE_ROW_STEP_BYTES, type PreparedWriteCredit } from "./credits.js";
 import { RunSink } from "./run-output.js";
 import { writeStepMinimum, type WriteStepMinimum } from "./minimum.js";
 import { MetadataBudget, releaseIdle } from "./budget.js";
@@ -516,6 +517,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     take: () => void;
   }> = [];
   #flushes: Promise<void> = Promise.resolve();
+  readonly #commandLogMaintenance = new CommandMaintenance();
   #flushScheduled = false;
   readonly #runReaders = new Map<string, RunReader | Promise<RunReader>>();
   /** The same readers by `RunRef` identity (the hot path: no key string per probe). */
@@ -1834,21 +1836,26 @@ export class WritePathImpl implements WritePath, EngineHooks {
   };
 
   /** Retry only after an operation has aborted its provisional writer and released its lock. */
-  #metadataRetry<T>(work: () => MaybePromise<T>): MaybePromise<T> {
-    return this.#metadataBudget.retry(work, () => {
-      this.#signal?.throwIfAborted();
-      // The initial load precedes construction of the appender in recovery. The path is not
-      // exposed to close yet; open's abort signal is still checked at every suspension.
-      if (this.#recovering) {
-        if (this.#failure !== null) throw this.#failure;
-        return;
-      }
-      this.#check();
-    });
+  #metadataRetry<T>(work: () => MaybePromise<T>, signal?: AbortSignal): MaybePromise<T> {
+    return this.#metadataBudget.retry(
+      work,
+      () => {
+        signal?.throwIfAborted();
+        this.#signal?.throwIfAborted();
+        // The initial load precedes construction of the appender in recovery. The path is not
+        // exposed to close yet; open's abort signal is still checked at every suspension.
+        if (this.#recovering) {
+          if (this.#failure !== null) throw this.#failure;
+          return;
+        }
+        this.#check();
+      },
+      signal ? (wanted) => this.#credits.growTo(this.#metadataGrant, wanted, signal) : undefined,
+    );
   }
 
-  async #metadataAsync<T>(work: () => Promise<T>): Promise<T> {
-    return await this.#metadataRetry(work);
+  async #metadataAsync<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    return await this.#metadataRetry(work, signal);
   }
 
   readonly #minimumRuns = new Set<Promise<void>>();
@@ -2057,20 +2064,54 @@ export class WritePathImpl implements WritePath, EngineHooks {
       : this.#admitRows(bytes, growth);
   }
 
+  /** Root has retired producer/image borrows before this cancellable native prepayment.
+   * The returned reservation survives reclaim while the root decodes its one row. */
+  async reserveCommandRows(
+    bytes: number,
+    growth: () => number,
+    signal: AbortSignal,
+  ): Promise<PreparedWriteCredit> {
+    signal.throwIfAborted();
+    await this.#prepareMinimum(undefined, signal);
+    try {
+      try {
+        await this.#admitRows(bytes + WRITE_ROW_STEP_BYTES, growth, signal);
+      } catch (error) {
+        if (!(error instanceof MemtableMemoryError)) throw error;
+        // Relief has already staged releasable native rows. A competing root may still own
+        // ordinary capacity; wait in FIFO order with this command's cancellation signal.
+        await this.#credits.growTo(
+          this.#grant,
+          this.#grant.allocated + this.#grant.loaned + bytes + WRITE_ROW_STEP_BYTES + growth(),
+          signal,
+        );
+      }
+      this.#check();
+      signal.throwIfAborted();
+      return this.#credits.protectRows(bytes + growth());
+    } catch (error) {
+      this.#credits.reclaimRows();
+      throw error;
+    }
+  }
+
   #admitAfterMinimum(prepared: Promise<void>, bytes: number, growth?: () => number): Promise<void> {
     return prepared.then(() => this.#admitRows(bytes, growth));
   }
 
-  #admitRows(bytes: number, growth?: () => number): MaybePromise<void> {
+  #admitRows(bytes: number, growth?: () => number, signal?: AbortSignal): MaybePromise<void> {
+    signal?.throwIfAborted();
     this.#check();
     // A large transaction's full memtables are staged first: its rows never stay resident whole.
     const stage = this.#stageCandidates();
     if (stage !== null)
-      return this.#stage(stage).then(() =>
-        this.#headroom(bytes + (growth?.() ?? 0)) ? undefined : this.#relieve(bytes, growth),
+      return this.#stage(stage, signal).then(() =>
+        this.#headroom(bytes + (growth?.() ?? 0))
+          ? undefined
+          : this.#relieve(bytes, growth, signal),
       );
     if (this.#headroom(bytes + (growth?.() ?? 0))) return;
-    return this.#relieve(bytes, growth);
+    return this.#relieve(bytes, growth, signal);
   }
 
   #headroom(bytes: number): boolean {
@@ -2081,8 +2122,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     return reclaimed >= bytes || this.#grant.tryGrow(bytes - reclaimed);
   }
 
-  async #relieve(bytes: number, growth?: () => number): Promise<void> {
+  async #relieve(bytes: number, growth?: () => number, signal?: AbortSignal): Promise<void> {
     for (let attempt = 0; attempt < 8; attempt++) {
+      signal?.throwIfAborted();
       const live = [...this.#tables.values()]
         .map((state) => state.view.memtables[state.view.memtables.length - 1])
         .filter(
@@ -2099,10 +2141,18 @@ export class WritePathImpl implements WritePath, EngineHooks {
       // transaction rows. Freezing is representation-only; row/delta undo still names it,
       // and staging remaps those records before releasing their native buffers.
       const stage = this.#stageCandidates();
-      if (stage !== null) await this.#stage(stage);
+      if (stage !== null) await this.#stage(stage, signal);
+      signal?.throwIfAborted();
       this.#scheduleFlush();
-      await this.#appender.flush();
-      await this.#flushes;
+      if (signal) {
+        // These operations own only committed data/log work. They remain owned by the
+        // write path when this command cancels; no command buffer/undo is abandoned.
+        await this.#commandLogMaintenance.wait(() => this.#appender.flush(), signal);
+        await waitCommandMaintenance(this.#flushes, signal);
+      } else {
+        await this.#appender.flush();
+        await this.#flushes;
+      }
       this.#check();
       if (this.#headroom(bytes + (growth?.() ?? 0))) return;
     }
@@ -3083,6 +3133,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#closed = true;
     this.#credits.cancel(new WritePathClosedError());
     this.#commitAbort.abort(new WritePathClosedError());
+    let commandFailure: { reason: unknown } | null = null;
+    try {
+      await this.#holder?.closeNativeCommands();
+    } catch (reason) {
+      // The adapter fences its work and retires its own metadata before rejecting.
+      // Native rollback/accounts still close even when a controller cleanup reports an error.
+      commandFailure = { reason };
+    }
     this.#signal?.removeEventListener("abort", this.#abortCommit);
     if (this.#idleTimer !== null) clearTimeout(this.#idleTimer);
     this.#idleTimer = null;
@@ -3142,6 +3200,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#grant.close();
       });
     }
+    if (commandFailure) throw commandFailure.reason;
   }
 
   /** A refused open has no caller-owned readers: release native owners before their grants.
@@ -3821,15 +3880,25 @@ export class WritePathImpl implements WritePath, EngineHooks {
     return run;
   }
 
-  #stage(candidates: ReadonlyMap<TableState, readonly Memtable[]>): Promise<void> {
-    return this.#trackStaging(this.#metadataAsync(() => this.#stageNow(candidates)));
+  #stage(
+    candidates: ReadonlyMap<TableState, readonly Memtable[]>,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    return this.#trackStaging(
+      this.#metadataAsync(() => this.#stageNow(candidates, signal), signal),
+    );
   }
 
-  async #stageNow(candidates: ReadonlyMap<TableState, readonly Memtable[]>): Promise<void> {
+  async #stageNow(
+    candidates: ReadonlyMap<TableState, readonly Memtable[]>,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    signal?.throwIfAborted();
     const tx = need(this.#holder);
     const unlock = await this.#lock();
     try {
       this.#check();
+      signal?.throwIfAborted();
       await this.#publishStaging(tx, candidates, false);
       this.#check();
     } finally {
