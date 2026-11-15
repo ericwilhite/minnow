@@ -10,8 +10,9 @@ import { seedsFor } from "../../testing/seeds.js";
 import type { PhysicalType } from "../types.js";
 import type { ColumnChunk, PageEntry } from "../format/manifest.js";
 import { encodeArrayValue } from "../vector/array-value.js";
-import { decodeRange, parsePage } from "./decode.js";
+import { decodeRange, parsePage, type PageView } from "./decode.js";
 import { encodeDirectory, parseDirectory } from "./directory.js";
+import { chunkTagOf, PageFlag, ValueTag } from "./format.js";
 import { inflatePage } from "./gzip.js";
 import { PageEncoding } from "../format/manifest.js";
 import { DistinctSketch, validateSketch } from "./sketch.js";
@@ -30,7 +31,7 @@ import {
 
 const utf8 = new TextEncoder();
 interface Column {
-  name: (typeof CANONICAL_WRITER_REACH)[number];
+  name: string;
   type: PhysicalType;
   values: TestValue[];
   vector?: VectorOptions;
@@ -192,6 +193,158 @@ function corpus(count: number, salt: number): Column[] {
     },
   ];
 }
+
+/** These fixtures deliberately force each current codec. This is a coverage witness,
+ * not a promise that future writers must keep the same packing policy. A policy change
+ * must replace the lost representation with another genuine stored-page witness. */
+function expectedLayout(
+  column: Column,
+  entry: PageEntry,
+  dictionaries: boolean,
+): [number, number, number, number] {
+  const values = column.values.slice(entry.firstRow, entry.firstRow + entry.rowCount),
+    valid = values.filter((value) => value !== null);
+  const tag = chunkTagOf(column.type);
+  if (valid.length === 0) return [PageEncoding.constant, tag, PageFlag.allNull, 0];
+  let flags = valid.length === values.length ? 0 : PageFlag.validity;
+  const rangeWidth = (range: bigint) => (range < 256n ? 1 : range < 65536n ? 2 : 4);
+  const integers = () => valid.map((value) => BigInt(value as number | bigint));
+  const differenceWidth = (numbers: bigint[]) =>
+    rangeWidth(
+      numbers.reduce((a, b) => (a > b ? a : b)) - numbers.reduce((a, b) => (a < b ? a : b)),
+    );
+  const dictionary =
+    dictionaries &&
+    (["text", "text constant", "enum", "UUID dictionary"].includes(column.name) ||
+      (column.name === "UUID" && valid.length < values.length));
+  if (dictionary)
+    return [PageEncoding.dictionary, tag, flags, column.name === "text constant" ? 0 : 1];
+  switch (column.name) {
+    case "bool":
+      return [PageEncoding.bitmap, tag, flags, 0];
+    case "i32 plain":
+      return [PageEncoding.plain, tag, flags, 4];
+    case "i32 FOR":
+      return [PageEncoding.frameOfReference, tag, flags, 1];
+    case "i32 constant":
+      return [PageEncoding.constant, tag, flags, 4];
+    case "i64 safe":
+    case "time":
+    case "timestamp":
+    case "timestamptz":
+      flags |= PageFlag.safe;
+      return [
+        PageEncoding.frameOfReference,
+        tag,
+        flags | (valid.length === values.length ? PageFlag.delta : 0),
+        valid.length === values.length ? 0 : differenceWidth(integers()),
+      ];
+    case "i64 words":
+    case "date":
+      return [
+        PageEncoding.frameOfReference,
+        tag,
+        flags | (valid.length === values.length ? PageFlag.delta : 0),
+        valid.length === values.length ? 0 : differenceWidth(integers()),
+      ];
+    case "f32":
+      return [PageEncoding.plain, tag, flags, 4];
+    case "f64 special":
+      return [PageEncoding.plain, tag, flags, 8];
+    case "f64 scaled":
+    case "f64 patched":
+      return [PageEncoding.scaledFloat, tag, flags, 1];
+    case "decimal i128":
+      return [PageEncoding.plain, ValueTag.dec128, flags, 16];
+    case "decimal mixed":
+      return [
+        PageEncoding.frameOfReference,
+        ValueTag.dec64,
+        flags | PageFlag.safe | PageFlag.scales | PageFlag.specials,
+        1,
+      ];
+    case "decimal safe":
+    case "decimal i64":
+    case "decimal uniform": {
+      const delta = valid.length === values.length;
+      if (column.name !== "decimal i64") flags |= PageFlag.safe;
+      if (column.name === "decimal uniform") flags |= PageFlag.uniformScale;
+      return [
+        PageEncoding.frameOfReference,
+        ValueTag.dec64,
+        flags | (delta ? PageFlag.delta : 0),
+        delta
+          ? 0
+          : differenceWidth(valid.map((value) => (value as { coefficient: bigint }).coefficient)),
+      ];
+    }
+    case "interval safe":
+      return [PageEncoding.plain, tag, flags | PageFlag.safe, 16];
+    case "interval wide":
+    case "UUID":
+    case "UUID dictionary":
+      return [PageEncoding.plain, tag, flags, 16];
+    case "text constant":
+      return [PageEncoding.constant, tag, flags, 0];
+    case "large value":
+      return [PageEncoding.plain, tag, flags | PageFlag.large, 2];
+    default: {
+      if (tag !== ValueTag.varlen) throw new Error("Missing corpus layout expectation");
+      const bytes = valid.reduce<number>((sum, value) => sum + (value as Uint8Array).length, 0);
+      return [PageEncoding.plain, tag, flags, bytes < 65536 ? 2 : 4];
+    }
+  }
+}
+function observeLayout(page: PageView, reach: ReturnType<typeof createReach>): void {
+  const { kind, tag, flags, width } = page;
+  // Reach comes only from the observed bytes, never the column's name or intended encoder.
+  if ((flags & PageFlag.allNull) !== 0) reach.reach("stored all-NULL constant");
+  if ((flags & PageFlag.validity) !== 0) reach.reach("stored validity bitmap");
+  if ((flags & PageFlag.safe) !== 0) reach.reach("stored safe integer lane");
+  if ((flags & PageFlag.delta) !== 0 && width === 0) reach.reach("stored zero-width delta");
+  if ((flags & PageFlag.scales) !== 0 && (flags & PageFlag.specials) !== 0)
+    reach.reach("stored mixed scales and specials");
+  if ((flags & PageFlag.uniformScale) !== 0) reach.reach("stored uniform scale");
+  if ((flags & PageFlag.large) !== 0 && width === 2) reach.reach("stored out-of-line pointers");
+  if (kind === PageEncoding.bitmap && tag === ValueTag.bool && width === 0)
+    reach.reach("stored bool bitmap");
+  if (kind === PageEncoding.plain) {
+    if (tag === ValueTag.i32 && width === 4) reach.reach("stored plain i32");
+    if (tag === ValueTag.f32 && width === 4) reach.reach("stored plain f32");
+    if (tag === ValueTag.f64 && width === 8) reach.reach("stored plain f64");
+    if (tag === ValueTag.dec128 && width === 16) reach.reach("stored plain decimal128");
+    if (tag === ValueTag.fixed16 && width === 16) reach.reach("stored plain fixed16");
+    if (tag === ValueTag.interval && width === 16) {
+      reach.reach((flags & PageFlag.safe) !== 0 ? "stored safe interval" : "stored wide interval");
+    }
+    if (tag === ValueTag.varlen && width === 2) reach.reach("stored varlen offsets16");
+    if (tag === ValueTag.varlen && width === 4) reach.reach("stored varlen offsets32");
+  }
+  if (kind === PageEncoding.frameOfReference && (flags & PageFlag.delta) === 0) {
+    if (tag === ValueTag.i32 && width === 1) reach.reach("stored FOR i32");
+    if (tag === ValueTag.i64 && (flags & PageFlag.safe) === 0 && width === 1)
+      reach.reach("stored wide FOR i64");
+    if (tag === ValueTag.i64 && (flags & PageFlag.safe) !== 0 && width > 0)
+      reach.reach("stored safe FOR i64");
+    if (tag === ValueTag.dec64 && (flags & PageFlag.safe) === 0 && width === 1)
+      reach.reach("stored wide FOR decimal64");
+  }
+  if (kind === PageEncoding.constant && (flags & PageFlag.allNull) === 0) {
+    if (tag === ValueTag.i32 && width === 4) reach.reach("stored constant i32");
+    if (tag === ValueTag.varlen && width === 0) reach.reach("stored constant varlen");
+  }
+  if (kind === PageEncoding.dictionary) {
+    if (tag === ValueTag.varlen && width === 0) reach.reach("stored constant dictionary code");
+    if (tag === ValueTag.varlen && width === 1) reach.reach("stored varlen dictionary codes");
+    if (tag === ValueTag.fixed16 && width === 1) reach.reach("stored fixed16 dictionary codes");
+  }
+  if (kind === PageEncoding.scaledFloat && tag === ValueTag.f64 && width === 1) {
+    if (page.patches?.length === 0) reach.reach("stored scaled float without patches");
+    if (page.patches?.length === 1 && page.patches[0] === 1)
+      reach.reach("stored scaled float with raw patch");
+  }
+}
+
 const equalBytes = (a: Uint8Array, b: Uint8Array) =>
   Buffer.from(a.buffer, a.byteOffset, a.byteLength).equals(
     Buffer.from(b.buffer, b.byteOffset, b.byteLength),
@@ -243,7 +396,6 @@ for (const seed of seedsFor("next-canonical-writer", [0xb2ad, 0xb2ae]))
                     `${column.name} row${String(row)}`,
                   ).toBe(true);
                 decoded.push({ ...column, values });
-                reach.reach(column.name);
               }
               expect(
                 equalBytes(original.space.bytes, stored),
@@ -252,11 +404,22 @@ for (const seed of seedsFor("next-canonical-writer", [0xb2ad, 0xb2ae]))
               const rewritten = await writeGroup(decoded, options);
               for (let at = 0; at < columns.length; at++) {
                 const a = original.group.columns[at],
-                  b = rewritten.group.columns[at];
-                if (a === undefined || b === undefined) throw new Error("Missing rewritten column");
+                  b = rewritten.group.columns[at],
+                  column = columns[at];
+                if (a === undefined || b === undefined || column === undefined)
+                  throw new Error("Missing rewritten column");
                 const ar = await openChunk(original.space, a),
                   br = await openChunk(rewritten.space, b);
                 try {
+                  // The configured raw budget fits each corpus column into one data page.
+                  expect(ar.directory.pages.length).toBe(1);
+                  expect(ar.directory.tag).toBe(chunkTagOf(column.type));
+                  expect(ar.directory.scale).toBe(
+                    column.type.kind === "decimal" ? column.type.scale : 0,
+                  );
+                  expect(ar.directory.hasSpecials).toBe(
+                    column.name === "decimal mixed" && nulls !== "all",
+                  );
                   expect(br.directory.pages.length).toBe(ar.directory.pages.length);
                   expect(br.directory.tag).toBe(ar.directory.tag);
                   expect(br.directory.scale).toBe(ar.directory.scale);
@@ -266,24 +429,63 @@ for (const seed of seedsFor("next-canonical-writer", [0xb2ad, 0xb2ae]))
                       bp = br.directory.pages[page];
                     if (ap === undefined || bp === undefined)
                       throw new Error("Missing round-trip page");
+                    const bytes = await raw(original.space, a, ap),
+                      view = parsePage(bytes, ap, ar.directory.tag, ar.directory.scale),
+                      expected = expectedLayout(column, ap, !gzip),
+                      compressed = gzip && column.name === "gzip source" && nulls !== "all";
+                    expect(ap.firstRow).toBe(0);
+                    expect(ap.rowCount).toBe(count);
+                    expect(ap.nullCount).toBe(
+                      column.values.filter((value) => value === null).length,
+                    );
                     expect(
-                      equalBytes(
-                        await raw(original.space, a, ap),
-                        await raw(rewritten.space, b, bp),
-                      ),
+                      Array.from(bytes.subarray(0, 4)),
+                      column.name + " actual kind/tag/flags/width",
+                    ).toEqual(expected);
+                    expect(ap.encoding).toBe(expected[0] | (compressed ? PageEncoding.gzip : 0));
+                    expect(bp.encoding).toBe(ap.encoding);
+                    if (
+                      nulls !== "all" &&
+                      column.type.kind === "float64" &&
+                      ["f64 scaled", "f64 patched"].includes(column.name)
+                    )
+                      expect(view.patches?.length).toBe(column.name === "f64 patched" ? 1 : 0);
+                    observeLayout(view, reach);
+                    if (compressed) reach.reach("stored gzip page");
+                    expect(
+                      equalBytes(bytes, await raw(rewritten.space, b, bp)),
                       "decoded page bytes round-trip exactly",
                     ).toBe(true);
                   }
                   const ad = ar.directory.dictionary,
                     bd = br.directory.dictionary;
                   expect(bd === null).toBe(ad === null);
-                  if (ad !== null && bd !== null)
-                    expect(
-                      equalBytes(
-                        await raw(original.space, a, ad),
-                        await raw(rewritten.space, b, bd),
-                      ),
-                    ).toBe(true);
+                  const dictionaryExpected =
+                    nulls !== "all" &&
+                    !gzip &&
+                    (["text", "text constant", "enum", "UUID dictionary"].includes(column.name) ||
+                      (column.name === "UUID" && nulls === "sparse"));
+                  expect(ad !== null).toBe(dictionaryExpected);
+                  if (ad !== null && bd !== null) {
+                    const bytes = await raw(original.space, a, ad),
+                      view = parsePage(bytes, ad, ar.directory.tag, ar.directory.scale),
+                      fixed = ar.directory.tag === ValueTag.fixed16;
+                    expect(ad.encoding).toBe(PageEncoding.plain);
+                    expect(bd.encoding).toBe(ad.encoding);
+                    expect(Array.from(bytes.subarray(0, 4))).toEqual([
+                      PageEncoding.plain,
+                      ar.directory.tag,
+                      0,
+                      fixed ? 16 : 4,
+                    ]);
+                    observeLayout(view, reach);
+                    reach.reach(
+                      fixed
+                        ? "stored dictionary fixed16 payload"
+                        : "stored dictionary offsets32 payload",
+                    );
+                    expect(equalBytes(bytes, await raw(rewritten.space, b, bd))).toBe(true);
+                  }
                   if (ar.directory.sketch !== null) {
                     const sketch = DistinctSketch.parse(ar.directory.sketch);
                     expect(equalBytes(sketch.serialize(), ar.directory.sketch)).toBe(true);
