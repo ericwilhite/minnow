@@ -1,3 +1,4 @@
+import { taskClock, yieldTask } from "../task.js";
 /**
  * Write transactions, statements and table writers (access/write-path.ts, access/modify.ts).
  *
@@ -694,6 +695,7 @@ export class StatementImpl implements Statement {
   readonly seq: number;
   readonly tx: TransactionImpl;
   readonly #rules: (tableId: number) => TableRules;
+  readonly #signal: AbortSignal | undefined;
   readonly #start: number;
   #state: "open" | "failed" | "ended" = "open";
   #writers: Map<string, TableWriterImpl> | null = null;
@@ -749,6 +751,7 @@ export class StatementImpl implements Statement {
     this.ordinal = ordinal;
     this.seq = pendingSeq(ordinal);
     this.#rules = options.rules;
+    this.#signal = options.signal;
     this.#start = tx.undo.length;
     this.#startCatalog = tx.catalog;
   }
@@ -967,21 +970,36 @@ export class StatementImpl implements Statement {
     return work();
   }
 
+  /** Statement ranges are disjoint: revisiting all older undo makes N statements quadratic.
+   * Large current statements still share the worker clock and recheck cancellation on resume. */
+  #needsFtsPreparation(from: number): MaybePromise<boolean> {
+    this.#checkOpen();
+    this.#signal?.throwIfAborted();
+    for (let i = from; i < this.tx.undo.length; i++) {
+      const e = this.tx.undo[i];
+      if (
+        e &&
+        (e.kind === "memDelete" ||
+          e.kind === "groupDelete" ||
+          (e.kind === "rows" && e.ftsKeyed === true))
+      )
+        return true;
+      if ((i & 1023) === 1023 && taskClock.due())
+        return yieldTask().then(() => this.#needsFtsPreparation(i + 1));
+    }
+    return false;
+  }
+
   end(): Promise<void> {
     const finish = (): MaybePromise<void> =>
       this.guard(() => {
         this.#releaseViews();
-        const keyed = this.tx.undo.some(
-          (e) =>
-            e.statement === this.ordinal &&
-            (e.kind === "memDelete" ||
-              e.kind === "groupDelete" ||
-              (e.kind === "rows" && e.ftsKeyed === true)),
+        return settle(this.#needsFtsPreparation(this.#start), (keyed) =>
+          settle(keyed ? this.tx.hooks.prepareFtsMutation?.() : undefined, () => {
+            this.#state = "ended";
+            this.tx.ended(this);
+          }),
         );
-        return settle(keyed ? this.tx.hooks.prepareFtsMutation?.() : undefined, () => {
-          this.#state = "ended";
-          this.tx.ended(this);
-        });
       });
     if (
       this.suspects.length === 0 &&

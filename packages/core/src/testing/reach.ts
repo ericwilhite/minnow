@@ -6990,3 +6990,20 @@ export const FTS_KEYED_FAULT_REACH = [
   "rows and invalidation agree",
   "orphan retirement",
 ] as const;
+
+/** Statement FTS completion is bounded by current undo, independent of prior statement count. */
+export const FTS_STATEMENT_BOUND_REACH = [
+  "ordinary insert",
+  "accepted notice",
+  "prior history excluded",
+  "current statement checked",
+  "commit",
+] as const;
+
+/** Shared task-clock slices and abort-on-resume in the current statement's FTS undo scan. */
+export const FTS_STATEMENT_CLOCK_REACH = [
+  "bounded slice",
+  "abort on resume",
+  "finish",
+  "drained",
+] as const;

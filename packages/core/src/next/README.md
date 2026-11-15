@@ -3926,3 +3926,8 @@ writer uses the final transaction catalog's stable FTS IDs, not declarations cac
 that writer was constructed. Required unsupported semantic versions in stored definitions
 or pages still refuse before mutation. Live build-generation CAS belongs to stage5; no
 ready accelerator is enabled by this write integration.
+
+FTS completion inspects only the current statement's undo interval. Earlier statements in a
+large explicit transaction are not revisited at each `end()`. A long current interval follows
+the shared task clock in chunks and checks the statement's abort signal on resume. Generated
+read-count and injected-clock probes enforce this bound without a host-timing threshold.
