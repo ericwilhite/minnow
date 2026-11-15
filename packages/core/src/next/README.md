@@ -4216,3 +4216,13 @@ This is a staged internal API, with synthetic final controller callbacks in its 
 Its initial preflight refuses auto-increment and wide/variable indexed domains before writes.
 No SQL path installs it yet. The full native trigger/RI provider and compiled body-input host
 remain separate integration work; the existing SQL refusal guards remain in force.
+
+`owner/command-execution.ts` assembles the native command boundary over those image,
+command and constraint components. Direct RI entries are compared with the canonical
+registry record; each completed action verifies newly accepted child uniqueness before
+retiring its scalar ID. No token-level cache or outer AFTER drain is used. Complete
+reference checks retire command slots for reuse. Callback slots are fixed by the prepared
+frame bound, cancellation listeners retire after each operation, and close fences callbacks
+and undelivered image leases before returning component credit. The root supplies a real
+child-capture/action executor and closes shared scratch/pins afterward. This assembly still
+has no compiled trigger-body host or generic SQL enablement; refusal guards remain.

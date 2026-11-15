@@ -11,6 +11,8 @@ import {
   NATIVE_PRIMARY_OWNER_CLOSE_REACH,
   NATIVE_PRIMARY_END_FENCE_REACH,
   NATIVE_PRIMARY_CLOSE_FAULT_REACH,
+  NATIVE_ACTION_UNIQUE_REACH,
+  NATIVE_BOUNDARY_REFERENCE_REACH,
 } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { currentEngine } from "../../testing/differential-current.js";
@@ -19,6 +21,8 @@ import type { BoundTableRules } from "../exec/row-rules.js";
 import { createLowerer } from "../lower/create.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { NativeCommandChecks } from "./command-checks.js";
+import { NativeCommandExecution, type NativeCommandExecutionScope } from "./command-execution.js";
+import { DivisionByZeroError } from "../exec/errors.js";
 import { RegistryCommands } from "./registry-commands.js";
 import { RegistryDirectory } from "./registry-directory.js";
 import { RegistryFragments } from "./registry-fragments.js";
@@ -59,11 +63,25 @@ async function fixture(
   after: boolean,
   closeGate?: () => Promise<void>,
   finishGate?: () => Promise<void>,
+  actionCount = 0,
+  reference = false,
 ) {
   const h = new Harness("strict", "memory", 256),
     path = await h.open();
-  let id = 0;
+  let id = 0,
+    parent = 0,
+    parentIndex = 0;
   await autocommit(path, async (s) => {
+    if (reference) {
+      parent =
+        (
+          await s.changeCatalog({
+            kind: "createTable",
+            table: tableInput("p", [column("id", INT, false)]),
+          })
+        ).id ?? 0;
+      parentIndex = s.catalog.table(parent)?.primaryKey ?? 0;
+    }
     id =
       (
         await s.changeCatalog({
@@ -71,12 +89,27 @@ async function fixture(
           table: tableInput(
             "t",
             [column("id", INT, false), column("n", INT, false), column("payload", TEXT)],
-            { checks: [{ name: "positive", columns: [1], conditionSql: "n>0" }] },
+            {
+              checks: [{ name: "positive", columns: [1], conditionSql: "n>0" }],
+              foreignKeys: reference
+                ? [
+                    {
+                      name: "t_n_fkey",
+                      columns: [1],
+                      parentTableId: parent,
+                      parentIndexId: parentIndex,
+                      onDelete: "noAction",
+                      enforced: true,
+                    },
+                  ]
+                : [],
+            },
           ),
         })
       ).id ?? 0;
   });
   const seed = Array.from({ length: count }, (_, i) => i + 1);
+  if (reference) await autocommit(path, (s) => s.table(parent).insert(batch(ints(seed)), null));
   await autocommit(path, (s) =>
     s.table(id).insert(batch(ints(seed), ints(seed), texts(seed.map(() => "seed"))), null),
   );
@@ -114,7 +147,8 @@ async function fixture(
   const def = statement.catalog.table(id);
   if (!def) throw new Error("Missing native table");
   const lowerer = createLowerer(),
-    signal = new AbortController().signal;
+    stopping = new AbortController(),
+    signal = stopping.signal;
   bound = compileTableRules(
     def,
     statement.catalog.version,
@@ -137,13 +171,14 @@ async function fixture(
   const commands = new RegistryCommands({
       rootId: 61,
       frames: 1,
-      rowEvents: 0,
+      rowEvents: actionCount,
       directory,
       charge: root,
       signal,
       checkpoint: () => undefined,
-      referentialName: () => {
-        throw new Error("No FK in primary fixture");
+      referentialName: (fk, event) => {
+        if (actionCount === 0) throw new Error("No FK in primary fixture");
+        return `RI_ConstraintTrigger_a_${String(fk)}_${event}`;
       },
     }),
     command = commands.beginCommand(1, 1);
@@ -152,7 +187,7 @@ async function fixture(
     closed = false;
   const checks = new NativeCommandChecks({
     statement,
-    tables: [id],
+    tables: reference ? [id, parent] : [id],
     images,
     charge: root,
     signal,
@@ -161,6 +196,21 @@ async function fixture(
       stop.throwIfAborted();
       expect(plan.minimumBytes).toBeLessThanOrEqual(range.held);
       return range;
+    },
+  });
+  let referentialWork: NativeCommandExecutionScope["runReferential"] | null = null;
+  const execution = new NativeCommandExecution({
+    frames: 1,
+    catalog: statement.catalog,
+    commands,
+    images,
+    checks,
+    charge: root,
+    signal,
+    abortRoot: (reason) => stopping.abort(reason),
+    runReferential: async (entry, hooks, stop) => {
+      if (!referentialWork) throw new Error("No FK action in primary fixture");
+      await referentialWork(entry, hooks, stop);
     },
   });
   const retained = statement.table(id),
@@ -176,10 +226,9 @@ async function fixture(
         await finishGate();
         return;
       }
-      await commands.verify(command, "unique", (row, s) => checks.verifyUnique(row, s), stop);
+      await execution.verifyCommandUnique(command, stop);
       if (after) throw Object.assign(new Error("later AFTER callback"), { sqlState: "22P02" });
-      await commands.verify(command, "references", async () => undefined, stop);
-      commands.retireCommand(command);
+      await execution.verifyCommandReferences(command, stop);
     },
     closeRoot: async () => {
       await closeGate?.();
@@ -209,6 +258,7 @@ async function fixture(
     disposed = true;
     await primary.close();
     expect(closed).toBe(true);
+    await execution.close();
     await commands.close();
     await checks.close();
     await images.close();
@@ -229,6 +279,10 @@ async function fixture(
     statement,
     id,
     primary,
+    execution,
+    setReferentialWork(work: NativeCommandExecutionScope["runReferential"]) {
+      referentialWork = work;
+    },
     signal,
     root,
     command,
@@ -259,7 +313,7 @@ async function fixture(
           before === null ? null : firstNative + before,
           [0, 0, next ? 7 : 0],
         );
-      const lease = await images.readRowImages(ref, signal);
+      const lease = await execution.readRowImages(ref, signal);
       leases++;
       let newRowId: number | null;
       try {
@@ -277,6 +331,7 @@ async function fixture(
         newRowId,
       };
       await commands.accept(accepted);
+      return accepted;
     },
     async settle(error: string | null) {
       await dispose();
@@ -981,4 +1036,190 @@ it.each(seedsFor("next-native-primary-close-fault", [0xb5f4]))(
     reach.assertReached();
   },
   60000,
+);
+
+it.each(seedsFor("next-native-action-unique", [0xb602]))(
+  "checks newly accepted native child work before each action resolves seed %i",
+  async (seed) => {
+    const reach = createReach("native action uniqueness", NATIVE_ACTION_UNIQUE_REACH),
+      pg = new PGlite();
+    try {
+      await fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 1, max: 3 }),
+          fc.boolean(),
+          fc.constantFrom("entry", "id"),
+          async (actions, published, route) => {
+            reach.beginHistory();
+            const count = actions + 1,
+              f = await fixture(count, published, false, undefined, undefined, actions);
+            const key = (i: number) => (i === actions - 1 ? (actions === 1 ? count + 1 : 0) : -i);
+            const hooks = {
+              beforeRow: async () => {
+                throw new Error("Unexpected outer BEFORE drain");
+              },
+              afterRow: async () => {
+                throw new Error("Unexpected outer AFTER drain");
+              },
+            };
+            let after = 0,
+              called = 0;
+            try {
+              await pg.exec(
+                "DROP TABLE IF EXISTS t; CREATE TABLE t(id INTEGER PRIMARY KEY,n INTEGER NOT NULL,payload TEXT)",
+              );
+              await pg.exec(
+                `INSERT INTO t VALUES ${Array.from({ length: count }, (_, i) => `(${String(i + 1)},${String(i + 1)},'seed')`).join(",")}`,
+              );
+              await pg.exec("BEGIN");
+              const expected = await result(async () => {
+                await pg.exec(
+                  `UPDATE t SET id=${String(count + 1)},n=${String(count + 1)},payload='changed' WHERE id=${String(count)}`,
+                );
+                for (let i = 0; i < actions; i++)
+                  await pg.exec(
+                    `UPDATE t SET id=${String(key(i))},payload='changed' WHERE id=${String(i + 1)}`,
+                  );
+                await pg.exec("SELECT 100/0");
+              });
+              await pg.exec("ROLLBACK");
+              expect(expected).toBe("23505");
+              const parent = await f.write("update", count - 1, count + 1, count + 1),
+                ids: number[] = [];
+              for (let i = 0; i < actions; i++)
+                ids.push(
+                  await f.commands.addReferential(f.command, parent.images, {
+                    fkId: i + 1,
+                    event: "parentUpdate",
+                    kind: "setDefault",
+                    targets: null,
+                  }),
+                );
+              // The callback performs real native child writes. Descriptor discovery/FK lookup
+              // is deliberately synthetic here; this is not a SQL FK scheduling claim.
+              f.setReferentialWork(async (entry, _hooks, stop) => {
+                stop.throwIfAborted();
+                called++;
+                const i = entry.fkId - 1;
+                await f.write("update", i, key(i), i + 1);
+              });
+              const actual = await result(async () => {
+                await f.execution.verifyCommandUnique(f.command, f.signal);
+                for (const id of ids) {
+                  if (route === "id") await f.execution.executeReferentialId(id, hooks, f.signal);
+                  else
+                    await f.execution.executeReferential(
+                      await f.commands.resolveReferential(id),
+                      hooks,
+                      f.signal,
+                    );
+                }
+                after++;
+                throw new DivisionByZeroError();
+              });
+              expect(actual).toBe(expected);
+              expect(called).toBe(actions);
+              expect(after).toBe(0);
+              await f.settle(actual);
+              expect(await f.rows()).toEqual(
+                Array.from({ length: count }, (_, i) => [i + 1, i + 1, "seed"]),
+              );
+              reach.reach(route);
+              reach.reach(published ? "published" : "resident");
+              reach.reach(
+                actions === 1 ? "one action" : actions === 2 ? "two actions" : "three actions",
+              );
+              reach.reach("shared command token");
+              reach.reach("native23505 before later22012");
+              reach.reach("atomic rollback");
+            } finally {
+              await f.close();
+            }
+            reach.reach("zero ownership");
+          },
+        ),
+        {
+          seed,
+          numRuns: 8,
+          examples: [
+            [1, false, "entry"],
+            [2, true, "id"],
+            [3, false, "id"],
+            [3, true, "entry"],
+          ],
+        },
+      );
+      reach.assertReached();
+    } finally {
+      await pg.close();
+    }
+  },
+  120000,
+);
+
+it.each(seedsFor("next-native-boundary-reference", [0xb606]))(
+  "verifies native command child references before retiring the command seed %i",
+  async (seed) => {
+    const reach = createReach("native boundary references", NATIVE_BOUNDARY_REFERENCE_REACH),
+      pg = new PGlite();
+    try {
+      await fc.assert(
+        fc.asyncProperty(
+          fc.boolean(),
+          fc.boolean(),
+          fc.integer({ min: 2, max: 6 }),
+          async (published, missing, count) => {
+            reach.beginHistory();
+            const f = await fixture(count, published, false, undefined, undefined, 0, true);
+            try {
+              await pg.exec(
+                "DROP TABLE IF EXISTS t; DROP TABLE IF EXISTS p; CREATE TABLE p(id INTEGER PRIMARY KEY); CREATE TABLE t(id INTEGER PRIMARY KEY,n INTEGER NOT NULL REFERENCES p(id),payload TEXT)",
+              );
+              await pg.exec(
+                `INSERT INTO p VALUES ${Array.from({ length: count }, (_, i) => `(${String(i + 1)})`).join(",")}`,
+              );
+              await pg.exec(
+                `INSERT INTO t VALUES ${Array.from({ length: count }, (_, i) => `(${String(i + 1)},${String(i + 1)},'seed')`).join(",")}`,
+              );
+              const parent = missing ? count + 100 : count;
+              const expected = await result(() =>
+                pg.exec(`INSERT INTO t VALUES(${String(count + 1)},${String(parent)},'changed')`),
+              );
+              const actual = await result(async () => {
+                await f.write("insert", null, count + 1, parent);
+                await f.statement.end(f.signal);
+              });
+              expect(actual).toBe(expected);
+              expect(actual).toBe(missing ? "23503" : null);
+              await f.settle(actual);
+              const rows = (
+                await pg.query<{ id: number; n: number; payload: string }>(
+                  "SELECT * FROM t ORDER BY id",
+                )
+              ).rows;
+              expect(await f.rows()).toEqual(rows.map((row) => [row.id, row.n, row.payload]));
+              reach.reach(published ? "published" : "resident");
+              reach.reach(missing ? "native missing parent23503" : "native parent exists");
+              reach.reach("command end checkpoint");
+            } finally {
+              await f.close();
+            }
+            reach.reach("zero ownership");
+          },
+        ),
+        {
+          seed,
+          numRuns: 8,
+          examples: [
+            [false, true, 2],
+            [true, false, 6],
+          ],
+        },
+      );
+      reach.assertReached();
+    } finally {
+      await pg.close();
+    }
+  },
+  120000,
 );

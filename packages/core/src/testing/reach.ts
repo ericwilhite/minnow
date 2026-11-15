@@ -8405,3 +8405,74 @@ export const REGISTRY_COMMAND_TARGET_FENCE_REACH = [
   "no accepted mutation",
   "zero ownership",
 ] as const;
+
+export const NATIVE_ACTION_UNIQUE_REACH = [
+  "entry",
+  "id",
+  "resident",
+  "published",
+  "one action",
+  "two actions",
+  "three actions",
+  "shared command token",
+  "native23505 before later22012",
+  "atomic rollback",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BOUNDARY_REACH = [
+  "id",
+  "entry",
+  "forged",
+  "retired",
+  "foreign",
+  "invalid before effects",
+  "retired action refused",
+  "command retired and reused",
+  "budget-1",
+  "budget0",
+  "budget1",
+  "zero ownership",
+] as const;
+export const NATIVE_BOUNDARY_FENCE_REACH = [
+  "image",
+  "check",
+  "action",
+  "caller cancels root",
+  "undelivered lease released",
+  "reentrant close shares fence",
+  "IO fence before credit return",
+  "zero ownership",
+] as const;
+export const NATIVE_BOUNDARY_LISTENER_REACH = [
+  "external signal",
+  "root signal",
+  "no settled listener history",
+  "constant metadata",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BOUNDARY_REFERENCE_REACH = [
+  "published",
+  "resident",
+  "native missing parent23503",
+  "native parent exists",
+  "command end checkpoint",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BOUNDARY_NESTING_REACH = [
+  "one live frame",
+  "two live frames",
+  "three live frames",
+  "RI preserves budget-1",
+  "outer action drain refused before child effects",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BOUNDARY_IMAGE_CANCEL_REACH = [
+  "projected lease",
+  "full lease",
+  "released before boundary close",
+  "zero ownership",
+] as const;
