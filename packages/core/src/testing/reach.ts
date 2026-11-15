@@ -8314,3 +8314,58 @@ export const NATIVE_PRIMARY_CLOSE_FAULT_REACH = [
   "original callback fault retained",
   "zero ownership",
 ] as const;
+export const MODIFY_SOURCE_ERROR_ORDER_REACH = [
+  "insert",
+  "nothing",
+  "upsert",
+  "update",
+  "check",
+  "null",
+  "none",
+  "RETURNING",
+  "no RETURNING",
+  "multiple input pages",
+  "short prefix",
+  "atomic rollback",
+  "zero spill",
+] as const;
+export const MODIFY_RETURNING_ERROR_ORDER_REACH = [
+  "CHECK binding",
+  "NOT NULL without CHECK",
+  "insert",
+  "upsert",
+  "update",
+  "same batch",
+  "across batches",
+  "PG row order",
+  "shipped batch-order difference",
+  "atomic rollback",
+] as const;
+
+export const MODIFY_SOURCE_FAULT_ORDER_REACH = [
+  "57014",
+  "0A000",
+  "XX000",
+  "53200",
+  "no writer continuation",
+  "zero spill",
+] as const;
+
+export const MODIFY_WINDOW_ERROR_ORDER_REACH = [
+  "earlier CHECK",
+  "window argument error",
+  "atomic rollback",
+  "zero spill",
+] as const;
+export const MODIFY_RETURNING_SCOPE_REACH = [
+  "bound native error order",
+  "raw missing capability refusal",
+  "zero spill",
+] as const;
+export const COLUMN_RULE_BINDING_REACH = [
+  "CHECK refusal",
+  "generated refusal",
+  "minimum covers binding",
+  "complete NOT NULL validator",
+  "zero charge",
+] as const;

@@ -1641,6 +1641,18 @@ repeat tracking and returned rows use charged, spillable state. SQL writers with
 proof require the admitted tracker before writer lookup, including raw executor requests. The
 direct-native legacy target Set cannot be selected by SQL. Complete-row validation includes
 closed text sets as well as NOT NULL and CHECK, including precise generated-error replay.
+A terminal source SQL value error stays after its sealed candidate prefix: earlier rows run
+through their row rules and RETURNING before that error is raised. A failed batch preparation
+replays complete candidates in order, so a later row's CHECK cannot hide an earlier RETURNING
+error. NEW+RETURNING also binds this shared validator for column restrictions on tables
+without CHECK/generated expressions; raw executor callers must supply the admitted scope.
+The explicit column-only binding refuses tables whose lowered expression rules are needed.
+Cancellation, admission, unsupported plans and storage faults fail immediately; they
+never trigger candidate replay. Uniqueness and FK checks keep their statement-end boundary.
+The generated comparison uses PostgreSQL for error priority. Shipped nullable arithmetic,
+DO NOTHING proposal skipping and batch validation can choose a different error; its existing
+outcome and rollback are observed separately. Volatile kernels remain refused; this change
+does not make eager materialization safe for volatile side effects or enable a trigger host.
 The independent IR reference also recomputes deferred generated columns after UPDATE and
 conflict assignments, including typed batch upserts, before validation and RETURNING.
 Closed-set failures retain their column identity and active physical row order. Shared row rules stay alive

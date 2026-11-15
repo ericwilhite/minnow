@@ -7,7 +7,13 @@ import type { TableRules } from "../access/modify.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import { BATCH_ROWS, type Batch, type Vector } from "../vector/vector.js";
 import { UnsupportedPlanError } from "./errors.js";
-import { bindTableRules, tableRuleMinimumBytes, type BoundTableRules } from "./row-rules.js";
+import {
+  bindColumnRules,
+  columnRuleMinimumBytes,
+  bindTableRules,
+  tableRuleMinimumBytes,
+  type BoundTableRules,
+} from "./row-rules.js";
 import type { Pool } from "./spill-pool.js";
 import type { Rel } from "../ir/ir.js";
 import { expressionInputBytes, projectedInputBytes } from "./input-size-plan.js";
@@ -45,7 +51,14 @@ export class StatementRules {
     this.#tables = reach.tables.filter((id) => {
       const table = catalog.table(id);
       return (
-        table && (table.checks.length > 0 || table.columns.some((c) => c.generatedSql !== null))
+        table &&
+        (table.checks.length > 0 ||
+          table.columns.some((c) => c.generatedSql !== null) ||
+          (id === root &&
+            modify !== undefined &&
+            modify.kind !== "delete" &&
+            modify.returning !== null &&
+            table.columns.some((c) => !c.nullable || c.allowedValues !== undefined)))
       );
     });
   }
@@ -57,7 +70,16 @@ export class StatementRules {
         ? 0
         : 4096 +
           this.#tables.length * 1024 +
-          this.#tables.reduce((n, id) => n + tableRuleMinimumBytes(this.lookup(id), BATCH_ROWS), 0))
+          this.#tables.reduce((n, id) => {
+            const table = this.catalog.table(id);
+            if (!table) throw new TypeError("Missing row-rule table");
+            return (
+              n +
+              (table.checks.length === 0 && table.columns.every((c) => c.generatedSql === null)
+                ? columnRuleMinimumBytes(table, BATCH_ROWS)
+                : tableRuleMinimumBytes(this.lookup(id), BATCH_ROWS))
+            );
+          }, 0))
     );
   }
   progressCopies(): number {
@@ -120,7 +142,12 @@ export class StatementRules {
     try {
       this.#targets = new ModifyTargetSet(counted, spill, queryId, signal);
       for (const id of this.#tables) {
-        const bound = bindTableRules(this.lookup(id), counted, { capacity: BATCH_ROWS, signal });
+        const table = this.catalog.table(id);
+        if (!table) throw new TypeError("Missing row-rule table");
+        const bound =
+          table.checks.length === 0 && table.columns.every((c) => c.generatedSql === null)
+            ? bindColumnRules(table, counted, { capacity: BATCH_ROWS, signal })
+            : bindTableRules(this.lookup(id), counted, { capacity: BATCH_ROWS, signal });
         this.#bound.set(id, bound);
         this.#native.set(id, {
           check: bound.check.bind(bound),

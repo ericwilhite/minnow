@@ -1,4 +1,5 @@
 /** Execution-owned row-rule kernels. Cached programs never retain mutable buffers or grants. */
+import type { TableDef } from "../access/catalog.js";
 import type { ScalarExpr } from "../ir/ir.js";
 import type { Vector } from "../vector/vector.js";
 import type { TableRules } from "../access/modify.js";
@@ -44,7 +45,26 @@ function capacityOf(options: RowRuleOptions): number {
  * Data-dependent varlen/coefficient growth is separate and charged at evaluation time. */
 export function tableRuleMinimumBytes(rules: TableRules, capacity = BATCH_ROWS): number {
   const program = tableRuleProgram(rules);
-  if (!program) return 0;
+  return program ? programMinimumBytes(program, capacity) : 0;
+}
+/** Column restrictions use the same complete-row evaluator even without expression IR.
+ * Preserve the cached NO_RULES fast path unless a caller explicitly requests this binding. */
+function columnProgram(table: TableDef): RuleProgram {
+  if (table.checks.length || table.columns.some((column) => column.generatedSql !== null))
+    throw new TypeError("Column-only rules cannot replace lowered CHECK/generated rules");
+  return { table, checks: [], generated: [] };
+}
+export function columnRuleMinimumBytes(table: TableDef, capacity = BATCH_ROWS): number {
+  return programMinimumBytes(columnProgram(table), capacity);
+}
+export function bindColumnRules(
+  table: TableDef,
+  charge: ByteCharge,
+  options: RowRuleOptions = {},
+): BoundTableRules {
+  return new Evaluator(columnProgram(table), charge, options);
+}
+function programMinimumBytes(program: RuleProgram, capacity: number): number {
   capacityOf({ capacity });
   const probe = (rows: number) => {
     let used = 0,

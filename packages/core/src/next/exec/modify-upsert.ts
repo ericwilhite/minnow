@@ -19,7 +19,7 @@ import {
   slotIndex,
   type Compiled,
 } from "./kernels/vectors.js";
-import type { ModifyRel } from "./modify-returning.js";
+import { requireReturningRules, type ModifyRel } from "./modify-returning.js";
 import { pushAndWait, type Operator, type Transfer } from "./pipeline.js";
 import type { ChunkReads } from "./scan.js";
 import { sortRowView, SORT_ROW_VIEW_BYTES } from "./sort-row.js";
@@ -106,6 +106,7 @@ export class UpsertWriter implements Operator {
       onRepeat: "error",
       requireTrackedTargets: true,
     });
+    requireReturningRules(rel, table, scope);
     this.#kernels = new UpsertExpressions(rel, { ...context, input: upsertTypes(rel) });
     this.#project =
       rel.returning === null

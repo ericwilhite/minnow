@@ -14,6 +14,7 @@ import {
   ParameterBindError,
   PlanStaleError,
   QueryCancelledError,
+  rowValueError,
 } from "./errors.js";
 import { WindowError } from "./window-frames.js";
 import type {
@@ -88,6 +89,8 @@ export class QueryRuntime {
     spool: ModifySpool;
     writer: Operator;
     returned?: ModifySpool;
+    /** Source's terminal SQL value error follows the fully sealed successful prefix. */
+    terminalError?: ExecutionError;
     retireInput?(): Promise<void>;
     close?(): Promise<void>;
   } | null = null;
@@ -1554,13 +1557,42 @@ export class QueryExecution implements Execution {
         work
           .then(
             () => this.#finish(),
-            (error: unknown) => this.#fail(error),
+            (error: unknown) => this.#sourceFailed(error),
           )
           .catch((error: unknown) => this.#fail(error));
       } else this.#finish();
     } catch (error) {
-      this.#fail(error);
+      this.#sourceFailed(error);
     }
+  }
+
+  #sourceFailed(error: unknown): void {
+    if (error instanceof WindowError)
+      error = new ExecutionError(error.message, "MINNOW_WINDOW_ERROR", error.code, {
+        cause: error,
+      });
+    const modification = this.#runtime?.modification;
+    if (
+      !this.request.statement ||
+      !modification ||
+      !rowValueError(error) ||
+      this.#controller.signal.aborted
+    ) {
+      this.#fail(error);
+      return;
+    }
+    // Source kernels already delivered only rows before their failing row. Seal that prefix
+    // before producer retirement, then replay it through row constraints and RETURNING first.
+    // Cancellation, admission, unsupported plans and storage faults never select this path.
+    modification.terminalError = error;
+    this.#async = true;
+    modification.spool
+      .finish()
+      .then(
+        () => this.#finish(),
+        (reason: unknown) => this.#fail(reason),
+      )
+      .catch((reason: unknown) => this.#fail(reason));
   }
 
   #finish(): void {
@@ -1613,6 +1645,11 @@ export class QueryExecution implements Execution {
                 .then(async () => {
                   await this.#modifySpool?.close();
                   await modification?.retireInput?.();
+                  if (modification?.terminalError) {
+                    const error = modification.terminalError;
+                    delete modification.terminalError;
+                    throw error;
+                  }
                 })
                 .then(() => this.request.statement?.end(this.#controller.signal))
                 .finally(() => this.request.rowRules?.close());

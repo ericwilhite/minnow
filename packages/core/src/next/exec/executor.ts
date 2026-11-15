@@ -200,7 +200,8 @@ export interface PreparedPlan {
 }
 
 interface ExecuteBase {
-  /** Shared admitted CHECK/generated binding, also used by native FK actions. */
+  /** Shared admitted row rules, also used by native FK actions. Required for NEW RETURNING
+   * with column restrictions, so failed batch preparation can replay in complete-row order. */
   readonly rowRules?: StatementRules;
 
   /** Explicit relinquishing consumer only; ordinary result credits do not end view lifetimes. */

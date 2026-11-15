@@ -1,6 +1,12 @@
 /** Mutation-phase kernels: complete scoped row rules, then RETURNING only for accepted writes. */
 import type { TableDef } from "../access/catalog.js";
 import type { Statement } from "../access/modify.js";
+import {
+  CheckViolationError,
+  ClosedSetViolationError,
+  NotNullViolationError,
+} from "../access/modify.js";
+import { rowValueError, UnsupportedPlanError } from "./errors.js";
 import type { Rel } from "../ir/ir.js";
 import type { PhysicalType } from "../types.js";
 import type { Batch, Selection, Vector } from "../vector/vector.js";
@@ -14,6 +20,21 @@ import type { Grant } from "../memory/governor.js";
 
 export type ModifyRel = Extract<Rel, { op: "modify" }>;
 export const MODIFY_ROWS = 256;
+/** Check after the writer capability preflight, before any candidate can be accepted. */
+export function requireReturningRules(
+  rel: ModifyRel,
+  table: TableDef,
+  scope: StatementRules | undefined,
+): void {
+  if (
+    rel.kind !== "delete" &&
+    rel.returning !== null &&
+    !scope &&
+    table.columns.some((column) => !column.nullable || column.allowedValues !== undefined)
+  )
+    throw new UnsupportedPlanError("RETURNING row validation requires its admitted scope");
+}
+
 export function returningShape(rel: ModifyRel): {
   start: number;
   width: number;
@@ -62,6 +83,7 @@ export class ReturningWriter implements Operator {
       uniqueTargets,
       ...(!uniqueTargets && rel.kind !== "insert" ? { requireTrackedTargets: true } : {}),
     });
+    requireReturningRules(rel, table, scope);
     this.#project =
       rel.returning === null
         ? null
@@ -88,8 +110,20 @@ export class ReturningWriter implements Operator {
           prepared = await this.#prepare({ ...batch, selection: this.#part });
           break;
         } catch (error) {
-          if (!(error instanceof ExpressionMemoryError) || count === 1) throw error;
-          count = Math.max(1, Math.floor(count / 2));
+          if (count === 1) throw error;
+          if (
+            rowValueError(error) ||
+            error instanceof CheckViolationError ||
+            error instanceof ClosedSetViolationError ||
+            error instanceof NotNullViolationError
+          ) {
+            // Failed preparation wrote nothing. Replay complete candidates in row order so
+            // an earlier RETURNING error is not hidden by a later candidate's row rule.
+            this.scope?.retire(this.table.id);
+            count = 1;
+          } else if (error instanceof ExpressionMemoryError)
+            count = Math.max(1, Math.floor(count / 2));
+          else throw error;
         }
       }
       const kind = this.rel.kind as "insert" | "update" | "delete";
