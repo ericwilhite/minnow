@@ -76,7 +76,9 @@ new UPDATE values and old DELETE values through charged spillable storage, and d
 rows only after the statement succeeds. ON CONFLICT supports primary and unique arbiters,
 permuted composite targets, DO NOTHING (including a bare target), and DO UPDATE with
 EXCLUDED and WHERE. An asynchronous arbiter lookup consumes its completed result once, so progress does not
-depend on retaining the read in a cache. Oversized conflict proposals fail the same index-key
+depend on retaining the read in a cache. OLD-row conflict fetches decode only the selected
+physical row, including when its memory segment publishes between capture and fetch.
+Oversized conflict proposals fail the same index-key
 limit as plain INSERT before arbitration encodes or copies the key; private key conversion
 uses bounded call arity. A repeated affected target rolls back the statement; assignments to
 arbiter or primary-key columns are refused as in the shipped engine. Proposed rows are

@@ -10,6 +10,7 @@ import type { Batch, Vector } from "../vector/vector.js";
 import { ColumnStore } from "./column-store.js";
 import { ProjectOperator } from "./filter.js";
 import { selectedSegment } from "./late-fetch.js";
+import { PointMemorySegment } from "./point-segment.js";
 import { compileExpr, type CompileContext } from "./kernels/compile.js";
 import {
   ExpressionMemoryError,
@@ -128,7 +129,11 @@ export class UpsertWriter implements Operator {
     if (!source || locatorPosition(locator) >= source.rowCount)
       throw new RangeError("Conflict locator is outside statement snapshot");
     this.#old.reset(true);
-    const segment = selectedSegment(source, 0, new Uint16Array([locatorPosition(locator)]));
+    const position = locatorPosition(locator);
+    const segment =
+      source.kind === "memory"
+        ? new PointMemorySegment(source, position)
+        : selectedSegment(source, 0, new Uint16Array([position]));
     const scan = new TableScan({
       table: {
         tableId: original.tableId,

@@ -87,7 +87,8 @@ export class StorageCore implements NextCore {
     return this.executor.prepare(lowered.plan);
   }
   /** Caller consumes results concurrently with execution and releases this pin after executed. */
-  start(prepared: PreparedPlan, params: readonly ParameterValue[] = []) {
+  start(prepared: PreparedPlan, params: readonly ParameterValue[] = [], signal?: AbortSignal) {
+    signal?.throwIfAborted();
     const snapshot = this.harness.path.pin();
     let execution: Execution;
     try {
@@ -96,6 +97,7 @@ export class StorageCore implements NextCore {
         statement: null,
         parameters: params,
         statementTime: 0n,
+        ...(signal === undefined ? {} : { signal }),
         governor: this.harness.governor,
         spill: this.spill,
         queryId: ++this.#queryId,
@@ -110,7 +112,12 @@ export class StorageCore implements NextCore {
     }
     return { execution, release: () => snapshot.release() };
   }
-  async execute(sql: string, params: readonly ParameterValue[] = []): Promise<NextStatementResult> {
+  async execute(
+    sql: string,
+    params: readonly ParameterValue[] = [],
+    signal?: AbortSignal,
+  ): Promise<NextStatementResult> {
+    signal?.throwIfAborted();
     this.lastProfile = null;
     const lowered = this.lowerer.lower(sql, this.context());
     if (lowered.kind === "ddl") {
@@ -147,6 +154,7 @@ export class StorageCore implements NextCore {
         statement,
         parameters: params,
         statementTime: 0n,
+        ...(signal === undefined ? {} : { signal }),
         governor: this.harness.governor,
         spill: this.spill,
         queryId: ++this.#queryId,
@@ -180,7 +188,7 @@ export class StorageCore implements NextCore {
     if (lowered.kind !== "query")
       throw new UnsupportedPlanError(`the adapter's ${lowered.kind}`, { construct: lowered.kind });
     const prepared = this.executor.prepare(lowered.plan);
-    const run = this.start(prepared, params);
+    const run = this.start(prepared, params, signal);
     try {
       const batches = await this.collect(run.execution, prepared);
       this.lastProfile = (await run.execution.executed).profile;

@@ -7718,6 +7718,7 @@ export const MODIFY_TARGET_SET_REACH = [
 ] as const;
 /** Large shared-scope inputs and native repeat policy; b5c7 includes20k target witness. */
 export const MODIFY_LARGE_TARGETS_REACH = [
+  "120s per history",
   "coalesced row undo",
   "joined first match",
   "large upsert",
@@ -7851,4 +7852,18 @@ export const MODIFY_UPSERT_KEY_LIMIT_REACH = [
   "plain identity",
   "shipped cap PG difference",
   "bounded arity",
+] as const;
+
+/** Point arbitration fetches bound physical decode before and after publication. */
+export const MODIFY_UPSERT_POINT_REACH = [
+  "first physical chunk",
+  "later physical chunk",
+  "resident",
+  "publication after capture",
+  "first",
+  "middle",
+  "last",
+  "NULL",
+  "text",
+  "one physical row",
 ] as const;

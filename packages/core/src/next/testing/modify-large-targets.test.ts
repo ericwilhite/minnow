@@ -15,6 +15,8 @@ it.each(seedsFor("next-modify-large-targets", [0xb5c7]))(
     const reach = createReach("large modify targets", MODIFY_LARGE_TARGETS_REACH);
     const scenario = async (n: number, reference: boolean) => {
       if (!reference) reach.beginHistory();
+      const started = performance.now();
+      const deadline = AbortSignal.timeout(120000);
       const core = new StorageCore(256),
         governor = new Governor(64 * 1024 * 1024);
       Object.defineProperty(core.harness, "governor", { value: governor });
@@ -56,7 +58,7 @@ it.each(seedsFor("next-modify-large-targets", [0xb5c7]))(
       const bag = (rows: readonly unknown[] | undefined) =>
         [...(rows ?? [])].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
       const all = async (sql: string) => {
-        const a = await core.execute(sql);
+        const a = await core.execute(sql, [], deadline);
         if ("returning" in a) {
           const rows = oracleRows(a.returning).sort((x, y) => Number(x.id) - Number(y.id));
           expect(rows).toEqual(
@@ -104,7 +106,7 @@ it.each(seedsFor("next-modify-large-targets", [0xb5c7]))(
           "DELETE FROM big_target USING big_source WHERE big_target.id=big_source.tid RETURNING big_target.id,big_target.v",
         );
         if (!reference) reach.reach("joined delete");
-        const empty = await core.execute("SELECT * FROM big_target");
+        const empty = await core.execute("SELECT * FROM big_target", [], deadline);
         if (empty.kind !== "rows" || !("batches" in empty)) throw new Error("rows");
         expect(oracleRows(empty)).toEqual([]);
         expect(touched).not.toHaveBeenCalled();
@@ -120,15 +122,22 @@ it.each(seedsFor("next-modify-large-targets", [0xb5c7]))(
         await old?.close();
       }
       expect(governor.usedBytes).toBe(0);
+      expect(
+        performance.now() - started,
+        "one large history must complete within120s",
+      ).toBeLessThan(120000);
+      if (!reference) reach.reach("120s per history");
     };
     await fc.assert(
       fc.asyncProperty(fc.integer({ min: 8193, max: 22000 }), async (n) => {
         await scenario(4 + (n % 37), true);
         await scenario(n, false);
       }),
-      { seed, numRuns: 2, examples: [[20000]] },
+      { seed, numRuns: 2, examples: [[20000]], endOnFailure: true },
     );
     reach.assertReached();
   },
-  120000,
+  // Complete histories retain their individual 120s cancellation/cleanup bound.
+  // The outer allowance also includes their seeding and PostgreSQL/shipped comparisons.
+  600000,
 );

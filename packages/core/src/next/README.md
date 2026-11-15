@@ -1644,6 +1644,10 @@ This factory does not turn those missing capabilities into current-engine fallba
 lowerer emits joins and windows for the factory; SQL catalogue tests exercise them through
 real storage and result delivery.
 
+Upsert OLD fetches size and decode exactly the conflicting physical row. A memory segment
+that publishes between locator capture and fetch keeps the same row/chunk coordinates and
+uses the reader's prepaid bounded output; it does not decode a sparse mask's whole chunk.
+
 The whole execution minimum includes scan resident pages, a serialized read step, downstream
 fixed buffers, private per-breaker progress, input parameters and one result frame. Nothing is
 partially admitted while waiting for the remainder. Read leases are charged within that minimum;
