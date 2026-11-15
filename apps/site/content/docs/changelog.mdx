@@ -236,7 +236,8 @@ sequence. This changes unreleased rebuild bytes only; the published engine and i
 unchanged. These catalog additions select development reader 5, manifest 6 and commit body 4.
 Portable snapshot catalog and sequence capture now reuse the native catalog grammar and preserve
 restart horizons at pin time, including sequence values emitted beyond a strict row snapshot's
-durable LSN. Portable load rebuilds native primary, unique, secondary and
+durable LSN. A pending strict-mode DROP retains its emitted horizon until the DROP is durable,
+so an export pinned to the earlier catalog cannot reuse a sequence value. Portable load rebuilds native primary, unique, secondary and
 foreign-key indexes, checks their values before publication and keeps an existing target intact
 on pre-publication quota failure or cancellation. CHECK, trigger/FTS and managed snapshot scope
 still refuses explicitly;
@@ -327,7 +328,8 @@ checksummed minimum-reader and manifest-format barrier, checked before owner epo
 or OPFS file creation. An older reader therefore cannot fence a newer writer before refusing.
 This changes unreleased rebuild bytes only; the shipped0.x engine and its stored formats are
 unchanged. No supported next/ format has shipped; its upgrade chain starts at released1.0.
-Portable snapshot export/load is still a design, not an available API.
+Portable snapshot export/load is implemented privately for validation; no public snapshot API is
+available yet.
 
 The rebuild's 0.x refusal also covers partial OPFS trees, including a surviving
 `wal-acknowledgements` file. Unknown directory contents are refused before native file creation.

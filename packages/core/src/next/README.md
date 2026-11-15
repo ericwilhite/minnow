@@ -4284,6 +4284,9 @@ the new native root; unused reservations may be skipped, and ordinary sequence a
 continues after load/reopen. Definitions retain ownership, increment, bounds and CYCLE semantics.
 Sequences are nontransactional: capture includes already-emitted reservations newer than a
 strict row pin's durable LSN. The row snapshot never filters sequence restart state.
+A strict DROP retains its reservation history until the DROP is durable, because a pin may
+still contain the old definition. New allocations already use the current catalog and refuse
+that dropped sequence. Once durable, its retained state is reclaimed.
 
 Catalog validation reuses the full native `Catalog.fromStored` checks before target acquisition:
 names/IDs, safe integer ranges, every counter floor, references, typed missing lanes and native

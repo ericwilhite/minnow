@@ -8884,3 +8884,16 @@ export const SNAPSHOT_SEQUENCE_DURABILITY_REACH = [
   "read only allocation",
   "charges released",
 ] as const;
+
+export const SNAPSHOT_SEQUENCE_DROP_REACH = [
+  "pending DROP in strict pin",
+  "capture before await",
+  "ordinary load advances past emitted",
+  "ordinary reopen advances",
+  "reclaimed after durability",
+  "ascending",
+  "descending",
+  "one emission",
+  "many emissions",
+  "zero charges",
+] as const;
