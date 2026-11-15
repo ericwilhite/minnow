@@ -69,7 +69,7 @@ import { groupRootOf, type Memtable } from "./memtable.js";
 import type { KeyDelta } from "./key-hash.js";
 import type { RunEntry, RunReader } from "./runs.js";
 import { groupDeletions, type Shared, type TableView, type WriteState } from "./state.js";
-import { need } from "./bytes.js";
+import { need, byteString } from "./bytes.js";
 
 const settle = <T, R>(
   value: MaybePromise<T>,
@@ -1505,7 +1505,7 @@ export class ViewIndex implements IndexReader {
     // Candidate keys from every layer, then resolve each key once.
     const keys = new Map<string, Uint8Array>();
     const add = (key: Uint8Array) => {
-      if (inKeyRange(range, key)) keys.set(String.fromCharCode(...key), key.slice());
+      if (inKeyRange(range, key)) keys.set(byteString(key), key.slice());
     };
     for (const memtable of this.table.tableView.memtables) {
       for (const run of memtable.staged?.runs.get(this.def.id) ?? []) {

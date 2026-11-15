@@ -82,7 +82,7 @@ import {
   otherIndexLayersEndBefore,
   type TableSnapshotImpl,
 } from "./view.js";
-import { need, MemtableMemoryError } from "./bytes.js";
+import { need, MemtableMemoryError, byteString } from "./bytes.js";
 
 /** Everything committed and pending (constraint checks see the whole transaction). */
 export const ALL = PENDING_BASE + MAX_STATEMENTS;
@@ -2228,6 +2228,11 @@ export class TableWriterImpl implements TableWriter {
             });
       const rows = activeRows(batch);
       this.#validate(batch.columns, rows, batch.length, null);
+      // Reject before encoding/copying arbiter keys, just as the insertion path does.
+      for (const index of indexes) {
+        const failure = indexLimitViolation(index, this.def, batch.columns, rows, 0, rows.length);
+        if (failure) throw failure;
+      }
       const current = this.statement.current();
       const table = current.internalTable(this.tableId);
       const view = this.statement.view.internalTable(this.tableId);
@@ -2262,7 +2267,7 @@ export class TableWriterImpl implements TableWriter {
               out.indexIds[row] = index.id;
               break;
             }
-            const text = String.fromCharCode(...key);
+            const text = byteString(key);
             const earlier = seen[i]?.get(text);
             if (earlier !== undefined) {
               out.kinds[row] = ConflictKind.batch;
@@ -2275,7 +2280,7 @@ export class TableWriterImpl implements TableWriter {
             for (let i = 0; i < indexes.length; i++) {
               const index = need(indexes[i]);
               if (this.#hasNullKey(index, batch.columns, row)) continue;
-              const text = String.fromCharCode(...need(keyed[i]?.[k]));
+              const text = byteString(need(keyed[i]?.[k]));
               if (!seen[i]?.has(text)) seen[i]?.set(text, row);
             }
           from = 0;

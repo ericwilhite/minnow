@@ -7835,3 +7835,19 @@ export const MODIFY_TRACKING_CAPABILITY_REACH = [
   "raw caller refused",
   "owned SQL tracked",
 ] as const;
+
+/** Oversized proposals fail with the index-path identity before arbitration encoding/copies. */
+export const MODIFY_UPSERT_KEY_LIMIT_REACH = [
+  "range keys",
+  "nothing",
+  "targetless",
+  "update",
+  "prefix rollback",
+  "empty proposal",
+  "ASCII",
+  "UTF8",
+  "before key encoding",
+  "plain identity",
+  "shipped cap PG difference",
+  "bounded arity",
+] as const;

@@ -1,9 +1,17 @@
 /** PostgreSQL INSERT ON CONFLICT: arbiters observe earlier proposals, including EXCLUDED and WHERE. */
 import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
-import { createReach, MODIFY_UPSERT_REACH } from "../../testing/reach.js";
+import {
+  createReach,
+  MODIFY_UPSERT_REACH,
+  MODIFY_UPSERT_KEY_LIMIT_REACH,
+} from "../../testing/reach.js";
+import * as keyEncoding from "../keys/key-encoding.js";
+import { flatOf, slotIndex } from "../exec/kernels/vectors.js";
+import { IndexKeyLimitError } from "../write/index-limits.js";
+import { ViewIndex } from "../write/view.js";
 import { currentEngine } from "../../testing/differential-current.js";
 import { checkPlan } from "./ir-check.js";
 import { StorageCore } from "./storage-core.js";
@@ -203,3 +211,134 @@ it.each(seedsFor("next-modify-upsert", [0xb5bd, 0xb5be]))(
   },
   60000,
 );
+
+for (const seed of seedsFor("next-upsert-key-limits", [0xb5d2]))
+  it(`checks oversized proposals before encoding their arbiter keys seed ${String(seed)}`, async () => {
+    const reach = createReach("upsert key limits", MODIFY_UPSERT_KEY_LIMIT_REACH),
+      pg = new PGlite(),
+      old = await currentEngine("memory");
+    try {
+      await fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 130000, max: 180000 }),
+          fc.constantFrom("x", "é", "😀"),
+          fc.boolean(),
+          fc.constantFrom("nothing", "targetless", "update"),
+          async (size, glyph, prefix, action) => {
+            reach.beginHistory();
+            const core = await new StorageCore().open();
+            try {
+              const ddl =
+                "CREATE TABLE wide_ups(id INTEGER PRIMARY KEY,note TEXT UNIQUE,v INTEGER)";
+              await core.execute(ddl);
+              await pg.exec("DROP TABLE IF EXISTS wide_ups");
+              await pg.exec(ddl);
+              await old.run({ kind: "sql", sql: "DROP TABLE IF EXISTS wide_ups" });
+              await old.run({ kind: "sql", sql: ddl });
+              const table = core.harness.path.catalog.tableByName("wide_ups"),
+                note = table?.columns.find((c) => c.name === "note"),
+                index = table?.indexes.find(
+                  (i) => i.role === "unique" && i.columnIds.includes(note?.id ?? -1),
+                );
+              if (!index) throw new Error("note index");
+              // Keep the exact UTF16 width oversized while making PG btree compression predictable.
+              const value = glyph + "x".repeat(size - glyph.length),
+                expected = {
+                  code: "MINNOW_INDEX_KEY_TOO_LONG",
+                  indexId: index.id,
+                  units: value.length,
+                  maximum: 16384,
+                };
+              const original = keyEncoding.encodeKeyBatch;
+              const encoding = vi
+                .spyOn(keyEncoding, "encodeKeyBatch")
+                .mockImplementation((...args) => {
+                  for (const column of args[1]) {
+                    const data = flatOf(column.vector).data,
+                      at = slotIndex(column.vector, 0);
+                    if (
+                      data.layout === "varlen" &&
+                      (data.offsets[at + 1] ?? 0) - (data.offsets[at] ?? 0) > 65536
+                    )
+                      throw new Error(
+                        "oversized arbiter reached key encoding before its limit check",
+                      );
+                  }
+                  return original(...args);
+                });
+              const plain = "INSERT INTO wide_ups VALUES(99,$1,7)",
+                sql = `INSERT INTO wide_ups VALUES ${prefix ? "(1,'prefix',2)," : ""}(2,$1,3) ON CONFLICT ${action === "targetless" ? "" : "(note)"} ${action === "update" ? "DO UPDATE SET v=EXCLUDED.v" : "DO NOTHING"} RETURNING id`;
+              try {
+                await expect(core.execute(plain, [value])).rejects.toBeInstanceOf(
+                  IndexKeyLimitError,
+                );
+                await expect(core.execute(plain, [value])).rejects.toMatchObject(expected);
+                await expect(core.execute(sql, [value])).rejects.toMatchObject(expected);
+              } finally {
+                encoding.mockRestore();
+              }
+              await expect(old.run({ kind: "sql", sql, params: [value] })).rejects.toThrow();
+              // PG accepts these compressible keys; Minnow's documented index-path cap is stricter.
+              expect((await pg.query(sql, [value])).rows).toHaveLength(prefix ? 2 : 1);
+              const empty = await core.execute("SELECT * FROM wide_ups");
+              if (empty.kind !== "rows" || !("batches" in empty)) throw new Error("rows");
+              expect(oracleRows(empty)).toEqual([]);
+              reach.reach(action);
+              reach.reach(prefix ? "prefix rollback" : "empty proposal");
+              reach.reach(glyph === "x" ? "ASCII" : "UTF8");
+              reach.reach("before key encoding");
+              reach.reach("plain identity");
+              reach.reach("shipped cap PG difference");
+              // Legal keys must also use bounded call arity on engines with smaller argument limits.
+              const fromCharCode = String.fromCharCode;
+              const arity = vi.spyOn(String, "fromCharCode").mockImplementation((...units) => {
+                expect(
+                  units.length,
+                  "byte-key conversion uses bounded call arity",
+                ).toBeLessThanOrEqual(512);
+                return Reflect.apply(fromCharCode, String, units);
+              });
+              try {
+                await core.execute(
+                  "INSERT INTO wide_ups VALUES(3,$1,9) ON CONFLICT(note) DO NOTHING",
+                  [glyph.repeat(1024)],
+                );
+                const pin = core.harness.path.pin();
+                try {
+                  const entries = await new ViewIndex(
+                    index,
+                    pin.internalTable(index.tableId),
+                  ).collect({ lower: null, upper: null });
+                  expect(entries).toHaveLength(1);
+                  expect(entries[0]?.key.length).toBeGreaterThan(512);
+                  reach.reach("range keys");
+                } finally {
+                  pin.release();
+                }
+              } finally {
+                arity.mockRestore();
+              }
+              reach.reach("bounded arity");
+              expect(core.spill.bytesInUse).toBe(0);
+            } finally {
+              await core.close();
+            }
+            expect(core.harness.governor.usedBytes).toBe(0);
+          },
+        ),
+        {
+          seed,
+          numRuns: 12,
+          examples: [
+            [150000, "x", false, "nothing"],
+            [130000, "é", true, "targetless"],
+            [150000, "😀", true, "update"],
+          ],
+        },
+      );
+      reach.assertReached();
+    } finally {
+      await pg.close();
+      await old.close();
+    }
+  }, 120000);
