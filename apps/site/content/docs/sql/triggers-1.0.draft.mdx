@@ -1,0 +1,124 @@
+---
+title: Row triggers in 1.0 (draft)
+description: Trigger bodies, foreign-key action order, and changes from the 0.x engine.
+draft: true
+---
+
+> **Unpublished 1.0 draft.** Native trigger firing is not enabled yet. Keep this page out of
+> the documentation collection and navigation until the joint native execution tests pass.
+> This page describes the intended 1.0 contract; it does not change the shipped 0.x engine.
+
+## Writing a trigger
+
+Triggers run for each affected row, inside the statement that caused them. `OLD` reads the
+previous row on UPDATE or DELETE; `NEW` reads the proposed or accepted row on INSERT or
+UPDATE. A failed trigger rolls back the whole originating statement, including its earlier
+rows, trigger writes, and foreign-key actions.
+
+Minnow uses inline bodies rather than PostgreSQL's `EXECUTE FUNCTION` syntax:
+
+```sql
+CREATE TABLE audit (order_id INTEGER, old_status TEXT, new_status TEXT);
+
+CREATE TRIGGER record_change AFTER UPDATE ON orders
+FOR EACH ROW
+BEGIN
+  INSERT INTO audit (order_id, old_status, new_status)
+  VALUES (OLD.order_id, OLD.status, NEW.status);
+END
+```
+
+`DROP TRIGGER record_change` removes the trigger. Trigger names are global within a database.
+Bodies contain ordered INSERT, UPDATE, or DELETE statements. INSERT bodies use VALUES into
+keyless tables; UPDATE and DELETE bodies target keyed tables. User parameters, ON CONFLICT,
+and RETURNING in a body are refused. Views cannot own triggers or be body targets.
+
+Later statements in a body see earlier writes and their completed trigger effects. A body
+statement finishes its own AFTER work before the next body statement starts. Separate body
+statements may update the same row; duplicate targets within one body command are refused.
+
+## Row and foreign-key action order
+
+The 1.0 engine follows PostgreSQL's trigger-name ordering:
+
+1. Run the row's BEFORE triggers in name order.
+2. Compute stored generated columns, check the row, and apply its primary mutation.
+3. After the command's primary writes pass uniqueness checks, process its queued AFTER work.
+   Referential actions and user AFTER triggers share this name order.
+4. A referential action runs the affected children's own BEFORE triggers, row rules and writes.
+   It checks any new child uniqueness conflicts before returning. Child AFTER events append
+   behind the events already waiting in the containing statement's queue.
+
+Names compare by UTF8 identifier order, not creation order or the user's locale. Unquoted
+names fold to lowercase; quoted names keep their spelling. For example, `"A_log"` sorts
+before an internal `RI_ConstraintTrigger_*` action, while `z_log` sorts after it.
+
+A child's AFTER trigger can therefore run after remaining parent AFTER triggers. It does not
+jump ahead just because the child write happened during a cascade. User body statements have
+their own nested AFTER work, which completes before their containing trigger continues.
+
+A uniqueness conflict created by an RI action is an error at that action, even when the
+parent command and earlier RI actions already passed their uniqueness checks. A later
+AFTER body's error cannot replace it.
+
+## Change from 0.x: BEFORE runs before cascading children
+
+The 0.x engine can cascade-delete children before a parent's BEFORE DELETE body runs.
+That ordering changes in 1.0. Consider:
+
+```sql
+CREATE TABLE parents (id INTEGER PRIMARY KEY);
+CREATE TABLE children (
+  id INTEGER PRIMARY KEY,
+  parent_id INTEGER REFERENCES parents(id) ON DELETE CASCADE,
+  value INTEGER CHECK (value > 0)
+);
+INSERT INTO parents VALUES (1);
+INSERT INTO children VALUES (10, 1, 5);
+
+CREATE TRIGGER validate_children BEFORE DELETE ON parents
+BEGIN
+  UPDATE children SET value = -1 WHERE parent_id = OLD.id;
+END
+
+DELETE FROM parents WHERE id = 1;
+```
+
+In 0.x the delete can succeed: the child was already removed before the body looked for it.
+In 1.0 the BEFORE body still finds the child. Its CHECK fails with `23514`, and the whole
+delete rolls back. Parent 1 and child 10 remain, with the child's original value 5.
+UPDATE actions and rekeys use the same ordering model. Review triggers that relied on children
+already having disappeared or moved before a parent BEFORE trigger.
+
+## Reserved system names
+
+The exact resolved-name prefix `RI_ConstraintTrigger_` is reserved for referential actions.
+Creating a user trigger with that prefix fails with `42939` (`reserved_name`).
+
+The shipped 0.x engine accepts those names. Rename quoted names such as
+`"RI_ConstraintTrigger_audit"` before cutover. An unquoted `RI_ConstraintTrigger_audit` folds
+to `ri_constrainttrigger_audit`, which does not have the reserved resolved-name prefix.
+Names outside that prefix follow PostgreSQL's ordering exactly.
+
+## ON UPDATE still defaults to rekey-follow
+
+When ON UPDATE is omitted, a declared reference follows its parent's rekey. This is Minnow's
+existing product contract and remains a documented difference from PostgreSQL, whose default
+is NO ACTION. The catalog records the effective `follow` action explicitly.
+
+An explicit ON UPDATE clause keeps its specified action: CASCADE, RESTRICT, NO ACTION,
+SET NULL, or SET DEFAULT. An omitted clause is not rewritten to NO ACTION or treated as an
+explicit CASCADE. Informational NOT ENFORCED references still follow rekeys; they do not
+require the parent row to exist or take ON DELETE actions.
+
+## One further trigger level
+
+A trigger's write may fire one further level of triggers. For example, an accounts trigger
+may write an audit row, and an audit trigger may write a mirror row. That chain is allowed,
+matching the shipped engine.
+
+If the mirror write would fire another trigger, the statement fails with
+`Trigger cascade depth exceeded` (`54001` in the 1.0 runtime). The entire original statement
+rolls back, including its account, audit, and mirror writes. The engine does not silently
+skip a trigger beyond the supported level. Referential actions preserve this allowance;
+they do not consume an extra user-trigger level by themselves.
