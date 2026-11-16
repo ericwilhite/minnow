@@ -262,11 +262,11 @@ export const DURABLE_EMISSIONS: Readonly<
     count: 1,
     kinds: ["indexedDb"],
   },
-  'storage/indexeddb.ts:IdbSession.publish:tx.store("roots").put -> IdbStoreLike.put': {
+  'storage/indexeddb.ts:IdbSession.#publish:tx.store("roots").put -> IdbStoreLike.put': {
     count: 1,
     kinds: ["rootSlot"],
   },
-  "storage/indexeddb.ts:IdbSession.publish:roots.put -> IdbStoreLike.put": {
+  "storage/indexeddb.ts:IdbSession.#publish:roots.put -> IdbStoreLike.put": {
     count: 1,
     kinds: ["rootSlot"],
   },
