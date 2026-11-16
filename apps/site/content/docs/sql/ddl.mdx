@@ -23,20 +23,6 @@ may declare several scalar or composite `UNIQUE` constraints, inline or table-le
 enforced independently. A table with one inline `UNIQUE` column and no primary key uses that
 column as its row identity.
 
-In the 1.0 engine, `UNIQUE` and `PRIMARY KEY` check the completed statement. `NOT NULL`
-and `CHECK` run as rows are written. If an insert reuses an existing primary key and a later
-row violates `NOT NULL`, Minnow 1.0 reports the null error (`23502`). PostgreSQL
-reports the duplicate key first (`23505`), as does Minnow 0.x. A later `CHECK` failure also
-takes precedence in Minnow 1.0. Either error rolls back the whole statement.
-
-This timing also lets one statement swap unique keys when the finished rows have no
-duplicates. Some multi-row key updates that PostgreSQL rejects therefore succeed in
-Minnow 1.0. Uniqueness still has to hold before the statement succeeds; it is not
-postponed until `COMMIT`. PostgreSQL's
-[CREATE TABLE notes](https://www.postgresql.org/docs/current/sql-createtable.html#SQL-CREATETABLE-COMPATIBILITY)
-describe the difference between its default per-row checks and the SQL standard's
-statement-end checks.
-
 ```sql
 CREATE TABLE order_items (
   order_id INTEGER,
