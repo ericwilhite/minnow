@@ -10,8 +10,13 @@ import {
   NATIVE_COMMAND_ACTION_CHECK_REACH,
   NATIVE_COMMAND_CHECK_LIFETIME_REACH,
   NATIVE_COMMAND_CHECK_CONSTRUCTION_REACH,
+  NATIVE_CHILD_CAPTURE_REACH,
 } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
+import type { RowTargetRange } from "../access/statement-command.js";
+import { RegistryTargets } from "./registry-targets.js";
+import { readRows } from "../write/rows.js";
+import { KeyBatch, encodeKeyBatch } from "../keys/key-encoding.js";
 import type { NativeCommandBoundary } from "../access/statement-command.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { NativeCommandChecks, commandCheckMinimumBytes } from "./command-checks.js";
@@ -32,6 +37,7 @@ import {
   texts,
   tableInput,
   rules,
+  locators,
 } from "../write/test-support.js";
 
 async function code(run: () => unknown): Promise<string | null> {
@@ -49,6 +55,7 @@ async function fixture(
   published: boolean,
   count: number,
   beforeRange?: (signal: AbortSignal) => Promise<void>,
+  childCount = 0,
 ) {
   const h = new Harness("strict", "memory", 256),
     path = await h.open();
@@ -96,6 +103,21 @@ async function fixture(
     const part = ids.slice(from, from + 200);
     await autocommit(path, (s) =>
       s.table(parent).insert(batch(ints(part), ints(part), texts(part.map(() => "seed"))), null),
+    );
+  }
+  for (let from = 0; from < childCount; from += 200) {
+    const positions = Array.from({ length: Math.min(200, childCount - from) }, (_, i) => from + i);
+    await autocommit(path, (statement) =>
+      statement
+        .table(child)
+        .insert(
+          batch(
+            ints(positions.map((i) => i + 1)),
+            ints(positions.map((i) => (i % 5 === 0 ? null : (i % Math.min(count, 2)) + 1))),
+            texts(positions.map(() => "child")),
+          ),
+          null,
+        ),
     );
   }
   if (published) {
@@ -157,6 +179,13 @@ async function fixture(
       };
     },
   };
+  const targets = new RegistryTargets({
+    rootId: 17,
+    directory,
+    charge: grant,
+    signal: stop.signal,
+    checkpoint: () => undefined,
+  });
   const beforeCheckBytes = grant.allocated;
   const checks = new NativeCommandChecks({
     statement,
@@ -189,6 +218,7 @@ async function fixture(
     images,
     checks,
     commands,
+    targets,
     root,
     get leases() {
       return leases;
@@ -217,6 +247,7 @@ async function fixture(
     async close() {
       await commands.close();
       await checks.close();
+      await targets.close();
       await images.close();
       await fragments.close();
       await directory.close();
@@ -476,7 +507,7 @@ it.each(seedsFor("next-native-command-check-lifetime", [0xb5ea]))(
   async (seed) => {
     const reach = createReach("native check lifetime", NATIVE_COMMAND_CHECK_LIFETIME_REACH);
     await fc.assert(
-      fc.asyncProperty(fc.boolean(), async (close) => {
+      fc.asyncProperty(fc.boolean(), fc.boolean(), async (close, capture) => {
         reach.beginHistory();
         let entered!: () => void,
           resume!: () => void,
@@ -495,7 +526,23 @@ it.each(seedsFor("next-native-command-check-lifetime", [0xb5ea]))(
         let closing: Promise<void> | null = null;
         try {
           const row = await f.insert(f.parent, 3, 3);
-          const pending = f.checks.verifyUnique(row, f.stop.signal).then(
+          const images = await f.images.append(
+            f.parent,
+            { batch: batch(ints([1]), ints([1]), texts(["seed"])), row: 0 },
+            { batch: batch(ints([4]), ints([1]), texts(["next"])), row: 0 },
+          );
+          const fk = f.statement.catalog.table(f.child)?.foreignKeys[0];
+          if (!fk) throw new Error("Missing capture FK");
+          const work = capture
+            ? f.checks.captureChildren(
+                { tableId: f.parent, images },
+                f.child,
+                fk.id,
+                f.targets,
+                f.stop.signal,
+              )
+            : f.checks.verifyUnique(row, f.stop.signal);
+          const pending = work.then(
             () => null,
             (error: unknown) => error,
           );
@@ -518,10 +565,11 @@ it.each(seedsFor("next-native-command-check-lifetime", [0xb5ea]))(
           await closing;
           expect(error).toBeInstanceOf(Error);
           expect(stillPaid).toBe(true);
-          expect(aborted).toBe(true);
+          expect(aborted, "native preparation receives cancellation").toBe(true);
           expect(early).toBe(false);
           expect(f.range.allocated).toBe(0);
           reach.reach(close ? "close cancellation" : "caller cancellation");
+          if (capture) reach.reach(close ? "capture close" : "capture cancellation");
           reach.reach("pending progress remains paid");
           reach.reach("no cursor after cancellation");
         } finally {
@@ -531,7 +579,16 @@ it.each(seedsFor("next-native-command-check-lifetime", [0xb5ea]))(
         }
         reach.reach("zero ownership");
       }),
-      { seed, numRuns: 6, examples: [[false], [true]] },
+      {
+        seed,
+        numRuns: 6,
+        examples: [
+          [false, false],
+          [true, false],
+          [false, true],
+          [true, true],
+        ],
+      },
     );
     reach.assertReached();
   },
@@ -604,3 +661,167 @@ it.each(seedsFor("next-native-command-check-construction", [0xb5ec]))(
   },
   60000,
 );
+
+for (const seed of seedsFor("next-native-child-capture", [0xb61d, 0xb61e]))
+  it(`seals complete original RI child identities through a paid cursor ${String(seed)}`, async () => {
+    const reach = createReach("native RI child capture", NATIVE_CHILD_CAPTURE_REACH),
+      pg = new PGlite();
+    await pg.waitReady;
+    try {
+      await fc.assert(
+        fc.asyncProperty(
+          fc.oneof(
+            { weight: 3, arbitrary: fc.integer({ min: 0, max: 128 }) },
+            { weight: 1, arbitrary: fc.integer({ min: 1025, max: 2300 }) },
+          ),
+          fc.constantFrom(1, 2, 3),
+          fc.boolean(),
+          fc.boolean(),
+          async (count, key, published, prefix) => {
+            reach.beginHistory();
+            const f = await fixture(published, 3, undefined, count);
+            let restoreHolders: (() => void) | undefined;
+            try {
+              await pg.exec(
+                "DROP TABLE IF EXISTS c;DROP TABLE IF EXISTS p;CREATE TABLE p(id INT PRIMARY KEY);INSERT INTO p VALUES(1),(2),(3);CREATE TABLE c(id INT PRIMARY KEY,pid INT REFERENCES p(id))",
+              );
+              if (count)
+                await pg.exec(
+                  `INSERT INTO c VALUES ${Array.from({ length: count }, (_, i) => `(${String(i + 1)},${i % 5 === 0 ? "NULL" : String((i % 2) + 1)})`).join(",")}`,
+                );
+              if (prefix && count > 1) {
+                const pid = f.statement.catalog.table(f.child)?.columns[1]?.id;
+                if (!pid) throw new Error("Missing reference column");
+                await f.statement
+                  .table(f.child, { assigned: [pid], uniqueTargets: true })
+                  .update(batch(locators([1], f.child), ints([1])), null);
+                await pg.exec("UPDATE c SET pid=1 WHERE id=2");
+                reach.reach("current prefix");
+              }
+              // NEW deliberately has another key. Capture uses immutable OLD before a
+              // parent continuation; an updated key must not change the input identity set.
+              const images = await f.images.append(
+                f.parent,
+                {
+                  batch: batch(ints([key]), ints([key]), texts(["unrelated".repeat(10000)])),
+                  row: 0,
+                },
+                { batch: batch(ints([key === 1 ? 2 : 1]), ints([key]), texts(["next"])), row: 0 },
+              );
+              const child = f.statement.catalog.table(f.child),
+                fk = child?.foreignKeys[0];
+              if (!child || !fk) throw new Error("Missing native child FK");
+              // A large-result trap prevents RED shrinking to an empty old-API lookup.
+              // eslint-disable-next-line @typescript-eslint/unbound-method
+              const holders = ViewIndex.prototype.holders;
+              const trap = vi.spyOn(ViewIndex.prototype, "holders").mockImplementation(function (
+                this: ViewIndex,
+                ...args
+              ) {
+                if (count > 1024 && key !== 3)
+                  throw new Error("native child capture must use a bounded cursor");
+                return holders.call(this, ...args);
+              });
+              restoreHolders = () => trap.mockRestore();
+              const before = f.grant.allocated;
+              type Capture = (
+                parent: { tableId: number; images: typeof images },
+                child: number,
+                fk: number,
+                targets: RegistryTargets,
+                signal: AbortSignal,
+              ) => Promise<RowTargetRange>;
+              const capability = f.checks as unknown as { captureChildren?: Capture };
+              let range: RowTargetRange;
+              if (capability.captureChildren)
+                range = await capability.captureChildren(
+                  { tableId: f.parent, images },
+                  f.child,
+                  fk.id,
+                  f.targets,
+                  f.stop.signal,
+                );
+              else {
+                // Parent replay of the existing legacy RI design, rather than a
+                // missing-method/setup failure: holders materializes the full target set.
+                const pin = f.statement.readOwn(),
+                  keys = new KeyBatch(f.grant, 4096, 4096);
+                try {
+                  encodeKeyBatch(
+                    "equality",
+                    [{ vector: ints([key]), direction: "asc", nulls: "first" }],
+                    { length: 1, selection: null },
+                    keys,
+                  );
+                  const support = child.indexes.find((index) => index.id === fk.supportIndexId);
+                  if (!support) throw new Error("Missing support index");
+                  const rows = await new ViewIndex(
+                    { ...support, unique: false },
+                    pin.internalTable(f.child),
+                  ).holders(keys.key(0), false);
+                  range = await f.targets.capture(async function* () {
+                    for (const rowId of rows) yield { tableId: f.child, rowId };
+                  });
+                } finally {
+                  keys.close();
+                  pin.release();
+                }
+              }
+              expect(f.grant.allocated, "row count does not grow resident capture metadata").toBe(
+                before,
+              );
+              expect(f.range.allocated, "native cursor/page reservations end before replay").toBe(
+                0,
+              );
+              const actual: number[] = [],
+                pin = f.statement.readOwn();
+              try {
+                for await (const row of f.targets.rows(range, f.stop.signal)) {
+                  expect(row.tableId).toBe(f.child);
+                  const columns = await readRows(pin.internalTable(f.child), [row.rowId]),
+                    first = columns[0];
+                  if (first?.data.layout !== "i32") throw new Error("Expected integer key");
+                  actual.push(first.data.values[0] ?? -1);
+                }
+              } finally {
+                pin.release();
+              }
+              const expected = (
+                await pg.query<{ id: number }>("SELECT id FROM c WHERE pid=$1 ORDER BY id", [key])
+              ).rows.map((row) => row.id);
+              expect(
+                actual.sort((a, b) => a - b),
+                "complete OLD-key child target set matches PostgreSQL",
+              ).toEqual(expected);
+              expect(range.count).toBe(expected.length);
+              reach.reach(published ? "published" : "resident");
+              reach.reach(key === 3 || count === 0 ? "empty" : "matching OLD");
+              if (expected.length > 2) reach.reach("multiple cursor fills");
+              if (count > 1024) reach.reach("spilled target directory");
+              reach.reach("NEW differs");
+              reach.reach("fixed metadata");
+              reach.reach("released cursor");
+            } finally {
+              restoreHolders?.();
+              await f.close();
+            }
+            reach.reach("zero ownership");
+          },
+        ),
+        {
+          seed,
+          numRuns: 12,
+          examples: [
+            [0, 1, false, false],
+            [40, 1, false, true],
+            [45, 2, true, true],
+            [2200, 1, true, false],
+            [200, 3, false, false],
+          ],
+        },
+      );
+      reach.assertReached();
+    } finally {
+      await pg.close();
+    }
+  }, 120000);

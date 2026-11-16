@@ -8245,6 +8245,8 @@ export const NATIVE_COMMAND_CHECK_LIFETIME_REACH = [
   "pending progress remains paid",
   "no cursor after cancellation",
   "zero ownership",
+  "capture close",
+  "capture cancellation",
 ] as const;
 export const PREPARED_ROW_CREDIT_REACH = [
   "one prepared slot",
@@ -8566,5 +8568,20 @@ export const NATIVE_PRIMARY_FTS_REACH = [
   "resident",
   "undo and WAL",
   "reopen",
+  "zero ownership",
+] as const;
+
+/** RI inputs seal full OLD-key child identities with fixed metadata and one native cursor. */
+export const NATIVE_CHILD_CAPTURE_REACH = [
+  "current prefix",
+  "published",
+  "resident",
+  "empty",
+  "matching OLD",
+  "multiple cursor fills",
+  "spilled target directory",
+  "NEW differs",
+  "fixed metadata",
+  "released cursor",
   "zero ownership",
 ] as const;

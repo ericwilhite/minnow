@@ -3,12 +3,17 @@
 import type { CatalogView, ColumnDef, IndexDef, TableDef } from "../access/catalog.js";
 import type { IndexCursor, IndexRangePlan } from "../access/key-index.js";
 import { ForeignKeyViolationError, UniqueViolationError } from "../access/modify.js";
-import { ROW_IMAGE_UNREAD, type NativeCommandBoundary } from "../access/statement-command.js";
+import {
+  ROW_IMAGE_UNREAD,
+  type NativeCommandBoundary,
+  type RowTargetRange,
+} from "../access/statement-command.js";
 import { encodeKeyBatch, KeyBatch, type KeyColumn } from "../keys/key-encoding.js";
 import { MinimumBudget } from "../memory/working-set.js";
 import type { Grant } from "../memory/governor.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import type { Vector } from "../vector/vector.js";
+import type { RegistryTargets } from "./registry-targets.js";
 import type { AcceptedCommandRow } from "./registry-commands.js";
 import { isNullAt } from "../write/columns.js";
 import { indexLimitViolation, indexMaximumKeyBytes } from "../write/index-limits.js";
@@ -57,7 +62,7 @@ export class NativeCommandChecks {
   #vectors: Vector[] = [];
   #parts: KeyColumn[] = [];
   #out: Float64Array | null = null;
-  #pending: Promise<void> | null = null;
+  #pending: Promise<unknown> | null = null;
   #closing: Promise<void> | null = null;
   #closed = false;
   readonly #metadata: number;
@@ -94,7 +99,7 @@ export class NativeCommandChecks {
     this.scope.signal.throwIfAborted();
     if (this.#closed) invalid();
   }
-  #work(signal: AbortSignal, run: (signal: AbortSignal) => Promise<void>): Promise<void> {
+  #work<T>(signal: AbortSignal, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
     this.#check(signal);
     if (this.#pending) invalid();
     const combined = AbortSignal.any([signal, this.scope.signal, this.#stop.signal]);
@@ -127,21 +132,27 @@ export class NativeCommandChecks {
   /** Encode only requested columns, then release the projected image before cursor funding.
    * Equality keys are copied into one prepaid KeyBatch, never a key per accepted row. */
   async #key(
-    row: AcceptedCommandRow,
+    row: Pick<AcceptedCommandRow, "tableId" | "images">,
     index: IndexDef,
     ids: readonly number[],
     signal: AbortSignal,
+    side: "old" | "new" = "new",
   ): Promise<Uint8Array | null> {
     const keys = this.#keys ?? invalid(),
       table = tableOf(this.scope.statement.catalog, row.tableId),
-      image = await this.scope.images.readRowBindings(row.images, { old: [], new: ids }, signal);
+      image = await this.scope.images.readRowBindings(
+        row.images,
+        { old: side === "old" ? ids : [], new: side === "new" ? ids : [] },
+        signal,
+      );
     try {
       this.#check(signal);
-      if (image.tableId !== table.id || image.new?.length !== table.columns.length) invalid();
+      const values = image[side];
+      if (image.tableId !== table.id || values?.length !== table.columns.length) invalid();
       for (const id of ids) {
         const position = table.columns.findIndex((column) => column.id === id),
           column = table.columns[position],
-          vector = image.new[position];
+          vector = values[position];
         if (!column || !vector || vector === ROW_IMAGE_UNREAD || vector.length !== 1) invalid();
         if (isNullAt(vector, 0)) return null;
         this.#columns.push(column);
@@ -204,6 +215,85 @@ export class NativeCommandChecks {
         view.release();
       }
     }
+  }
+
+  /** Seal one OLD parent key's complete child identity set through the native bounded
+   * support-index cursor. Caller captures ALL follow inputs before any RI write;
+   * DELETE/explicit actions call this at their ordered RI event against a fresh prefix.
+   * No payload/image/producer lease survives cursor preparation or the returned range.
+   * The root must preflight a valid leading support index for this implementation; the
+   * separately guarded informational/invalid-index scan route is not supplied here. */
+  captureChildren(
+    parent: Pick<AcceptedCommandRow, "tableId" | "images">,
+    childId: number,
+    foreignKeyId: number,
+    targets: RegistryTargets,
+    signal: AbortSignal,
+  ): Promise<RowTargetRange> {
+    return this.#work(signal, async (stop) => {
+      const child = tableOf(this.scope.statement.catalog, childId),
+        fk = child.foreignKeys.find((candidate) => candidate.id === foreignKeyId),
+        def = tableOf(this.scope.statement.catalog, parent.tableId);
+      if (
+        !this.scope.tables.includes(childId) ||
+        !this.scope.tables.includes(parent.tableId) ||
+        fk?.parentTableId !== parent.tableId
+      )
+        invalid();
+      const index = def.indexes.find((candidate) => candidate.id === fk.parentIndexId),
+        support = child.indexes.find((candidate) => candidate.id === fk.supportIndexId);
+      if (
+        !index ||
+        !support ||
+        support.invalid === true ||
+        !fk.columnIds.every((id, position) => support.columnIds[position] === id)
+      )
+        invalid();
+      const key = await this.#key(parent, index, index.columnIds, stop, "old"),
+        scope = this.scope,
+        out = this.#out ?? invalid();
+      return targets.capture(async function* (captureSignal) {
+        const combined = AbortSignal.any([stop, captureSignal]);
+        combined.throwIfAborted();
+        if (!key) return;
+        const pin = scope.statement.readOwn();
+        let cursor: IndexCursor | null = null,
+          pending: Promise<number> | null = null;
+        try {
+          const table = pin.internalTable(childId),
+            reader = new ViewIndex({ ...support, unique: false }, table),
+            plan = reader.planProbe(key),
+            budget = await scope.prepareRange(plan, combined);
+          combined.throwIfAborted();
+          pin.checkRead();
+          if (budget.loaned !== 0 || budget.held - budget.allocated < plan.minimumBytes) invalid();
+          cursor = plan.open({ budget, signal: combined });
+          for (;;) {
+            const next = cursor.next(out);
+            pending = next instanceof Promise ? next : null;
+            const count = await next;
+            combined.throwIfAborted();
+            pin.checkRead();
+            if (count === 0) break;
+            for (let i = 0; i < count; i++) {
+              combined.throwIfAborted();
+              pin.checkRead();
+              yield { tableId: childId, rowId: table.rowId(out[i] ?? invalid()) };
+              // A continuation may have yielded/cancelled on the LAST result too.
+              combined.throwIfAborted();
+              pin.checkRead();
+            }
+          }
+        } finally {
+          cursor?.close();
+          try {
+            await pending?.catch(() => undefined);
+          } finally {
+            pin.release();
+          }
+        }
+      });
+    });
   }
 
   verifyUnique(row: AcceptedCommandRow, signal: AbortSignal): Promise<void> {

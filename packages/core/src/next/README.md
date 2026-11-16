@@ -4237,3 +4237,11 @@ frame bound, cancellation listeners retire after each operation, and close fence
 and undelivered image leases before returning component credit. The root supplies a real
 child-capture/action executor and closes shared scratch/pins afterward. This assembly still
 has no compiled trigger-body host or generic SQL enablement; refusal guards remain.
+
+`NativeCommandChecks.captureChildren` seals an OLD parent key's complete child identity
+range through the prepaid native support-index cursor and shared spilled directory. It
+uses projected key bindings, closes its phase pin/cursor before returning, and retains no
+per-child array. Root integration must capture every original follow range before RI
+writes and complete OLD/NEW input images before child mutations. The informational and
+invalid-index scan route, child action writer and compiled body provider remain guarded
+integration work; this helper alone does not enable FK/trigger scheduling.
