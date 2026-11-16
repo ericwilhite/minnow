@@ -1334,14 +1334,18 @@ for (const seed of seedsFor("next-durable-before-fence", [0xb22f, 0xb230]))
 
               const factory = new IDBFactory();
               const raw = await openIndexedDb(factory, "future");
-              const witness = new Uint8Array([7, 13, 23]).buffer;
+              const witness = new Uint8Array([7, 13, 23]).buffer,
+                futureSlot = slot === "root-0" ? "slot-0" : "slot-1",
+                supportedSlot = slot === "root-0" ? "slot-1" : "slot-0",
+                supportedBytes = encodeRootSlot(8, new Uint8Array([9]));
               await raw.transaction(
                 ["meta", "roots", "log", "data"],
                 "readwrite",
                 "strict",
                 (tx) => {
                   tx.store("meta").put("epoch", 7);
-                  tx.store("roots").put("slot-0", bytes.slice().buffer);
+                  tx.store("roots").put(futureSlot, bytes.slice().buffer);
+                  tx.store("roots").put(supportedSlot, supportedBytes.slice().buffer);
                   for (const name of ["log", "data", "meta"]) tx.store(name).put(0, witness);
                 },
               );
@@ -1385,8 +1389,11 @@ for (const seed of seedsFor("next-durable-before-fence", [0xb22f, 0xb230]))
                   "relaxed",
                   (tx) => {
                     tx.store("meta").get("epoch", (value) => expect(value).toBe(7));
-                    tx.store("roots").get("slot-0", (value) =>
+                    tx.store("roots").get(futureSlot, (value) =>
                       expect(new Uint8Array(value as ArrayBuffer)).toEqual(bytes),
+                    );
+                    tx.store("roots").get(supportedSlot, (value) =>
+                      expect(new Uint8Array(value as ArrayBuffer)).toEqual(supportedBytes),
                     );
                     for (const name of ["log", "data", "meta"])
                       tx.store(name).get(0, (value) => expect(value).toEqual(witness));
