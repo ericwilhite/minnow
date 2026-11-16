@@ -56,7 +56,10 @@
  * - **Groups.** A table's groups cover disjoint row-id ranges, in insertion (row-id) order. Row ids
  *   are never reused and never rewritten by maintenance; a merge keeps each row's id.
  * - **Checkpoints and replay** (replay.ts): global state (catalog, sequences, ledger) is as of
- *   `globalLsn`; each table's rows are as of its `flushedThroughLsn`. A root may switch to a new
+ *   `globalLsn`; each table's rows are as of its `flushedThroughLsn`. Table replay schema
+ *   versions agree with that catalog. An ALTER holds the catalog checkpoint until all earlier-
+ *   schema positional WAL rows are covered by their table checkpoint; group columns keep stable
+ *   IDs independently of this replay version. A root may switch to a new
  *   log salt only when `globalLsn` and every table's `flushedThroughLsn` reach the old log's last
  *   LSN; the new incarnation records the switching root's sequence (`log.rootSequence`).
  *   `tables` agrees with the catalog at `globalLsn`: every table it has (one dropped later stays,

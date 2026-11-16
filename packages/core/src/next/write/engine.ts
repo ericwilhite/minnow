@@ -957,6 +957,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const built: GroupDirectory[] = [];
     try {
       for (const table of root.tables) {
+        if (this.#catalog.table(table.tableId)?.schemaVersion !== table.schemaVersion)
+          throw new ManifestCorruptionError(
+            "Table replay schema disagrees with checkpoint catalog",
+          );
         let groups = GroupDirectory.EMPTY;
         let pages: readonly GroupPageEntry[] = [];
         let metadataBytes = 0;
@@ -5057,6 +5061,54 @@ export class WritePathImpl implements WritePath, EngineHooks {
     let before: number;
     do {
       before = globalLsn;
+      // Row frames carry positional columns, not a historical schema descriptor. An
+      // ALTER cannot enter the checkpoint catalog while any earlier-schema frame
+      // still needs replay. A flush may lift this barrier with its proposed coverage.
+      for (const state of this.#tables.values()) {
+        const current = this.#catalog.table(state.tableId);
+        if (
+          current !== undefined &&
+          (current.schemaVersion === 1 ||
+            current.schemaVersion === this.#baseCatalog.table(state.tableId)?.schemaVersion)
+        )
+          continue; // No uncheckpointed ALTER: do not walk catalog history for ordinary tables.
+        const covered = changed.get(state.tableId)?.flushedThroughLsn ?? state.flushedThroughLsn;
+        let previous = this.#baseCatalog.table(state.tableId)?.schemaVersion;
+        for (const entry of this.#catalogHistory) {
+          if (entry.lsn > globalLsn) break;
+          const version = entry.catalog.table(state.tableId)?.schemaVersion;
+          const altered = previous !== undefined && version !== undefined && version > previous;
+          previous = version;
+          if (!altered) continue;
+          const pendingRows = state.view.memtables.some(
+            (memtable) =>
+              memtable.schemaVersion < version && maxSeq(memtable, memtable.rowCount) > covered,
+          );
+          const pendingDeletes = (positions: ReadonlyMap<number, number>) => {
+            for (const seq of positions.values())
+              if (seq > covered && seq <= entry.lsn) return true;
+            return false;
+          };
+          let deleted = false;
+          if (!pendingRows) {
+            for (const positions of state.view.groupDeletes.byGroup.values())
+              if (pendingDeletes(positions)) {
+                deleted = true;
+                break;
+              }
+            if (!deleted)
+              for (const source of state.view.groupSources.values())
+                if (pendingDeletes(source.deletions)) {
+                  deleted = true;
+                  break;
+                }
+          }
+          if (pendingRows || deleted) {
+            globalLsn = entry.lsn - 1;
+            break;
+          }
+        }
+      }
       for (const pending of this.#pendingIndexes.values()) {
         if (pending.droppedAt !== null && globalLsn >= pending.droppedAt) continue;
         const state = this.#tables.get(pending.tableId);
@@ -5112,11 +5164,28 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   /**
-   * Freezes the committed live memtable of each table whose index build holds the root's LSN back,
+   * Freezes committed live tails whose old schema or index build holds the root's LSN back,
    * so its flush (which settles the build) can run; true when it froze any.
    */
   #freezeBuilds(): boolean {
     let froze = false;
+    // An ALTER barrier, like an index build, must not strand another table's flush.
+    // Only committed old-schema tails are eligible; pending writes keep their owner.
+    for (const state of this.#tables.values()) {
+      const last = state.view.memtables[state.view.memtables.length - 1];
+      const def = this.#catalog.table(state.tableId);
+      if (
+        last?.state === "live" &&
+        def !== undefined &&
+        last.schemaVersion < def.schemaVersion &&
+        last.visibleRows(MAX_LSN) === last.rowCount
+      ) {
+        last.state = "frozen";
+        last.measure();
+        this.#setView(state, { ...state.view });
+        froze = true;
+      }
+    }
     for (const pending of this.#pendingIndexes.values()) {
       const state = this.#tables.get(pending.tableId);
       const last = state?.view.memtables[state.view.memtables.length - 1];
@@ -5459,12 +5528,13 @@ function withCatalogIndexes(root: TableRoot, def: TableDef, addBuilt = false): T
   // Unchanged only if every index root is the same one (review B3-p2b-4 D2: a drop and a create
   // of the same count is a change).
   if (
+    root.schemaVersion === def.schemaVersion &&
     keyIndex === root.keyIndex &&
     secondaryIndexes.length === root.secondaryIndexes.length &&
     secondaryIndexes.every((index, k) => index === root.secondaryIndexes[k])
   )
     return root;
-  return { ...root, keyIndex, secondaryIndexes };
+  return { ...root, schemaVersion: def.schemaVersion, keyIndex, secondaryIndexes };
 }
 
 /**

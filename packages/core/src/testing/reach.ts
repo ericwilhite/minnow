@@ -9351,3 +9351,30 @@ export const R6_RELEASE_REACH = [
   "0.x unchanged",
   "1.x gated",
 ] as const;
+
+/** Catalog and row checkpoints must retain positional WAL schemas across ALTER. */
+export const DDL_ROW_SCHEMA_REACH = [
+  "position 0",
+  "position 1",
+  "position 2",
+  "position 3",
+  "FTS publication",
+  "plain publication",
+  "stored rows",
+  "resident rows",
+  "empty root before rows",
+  "no initial empty root",
+  "reopen after publication",
+  "new schema write",
+  "second ALTER",
+  "checkpoint and maintenance",
+] as const;
+
+/** Rejected replay schemas cannot consume ownership or prevent repaired reopen. */
+export const DDL_SCHEMA_CORRUPTION_REACH = [
+  "past schema",
+  "future schema",
+  "typed refusal",
+  "charge returned",
+  "repair retry",
+] as const;

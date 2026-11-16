@@ -18,6 +18,14 @@ compatibility policy and release process.
   major 1+ without the record. No scheduled job fails just to report missing acceptance.
   Targets and the database format are unchanged.
 
+The private 1.0 write path keeps catalog and row checkpoints compatible across ALTER TABLE.
+Dropping, adding or renaming a column cannot let an unrelated publication discard the schema
+needed by older positional WAL rows. Pending rows are flushed before their schema leaves the
+checkpoint; published table replay versions follow that catalog. Reopen refuses incompatible
+checkpoint versions instead of reading values under the wrong column names. This fixes both
+FTS-triggered reopen failures and native maintenance column misassociation. Released 0.x
+behavior and formats are unchanged; this does not repair already-damaged development stores.
+
 The shipped engine’s fast path for SUM and AVG over floating-point columns adds values directly,
 recovering overhead introduced by the 0.19.3 integer-exactness checks. SQL integer aggregates
 still reject inexact intermediate results; floating-point accumulation order is unchanged.
