@@ -126,6 +126,7 @@ export const DURABLE_FIELD_REACH = [
 
 export const DURABLE_STARTUP_REACH = [
   "minimum reader",
+  "minimum writer",
   "manifest format",
   "root-0",
   "root-1",
@@ -6158,8 +6159,9 @@ export const FTS_CODEC_REACH = [
 ] as const;
 
 export const FTS_SELECTOR_REACH = [
-  "reader7 barrier",
-  "manifest10 barrier",
+  "reader9 barrier",
+  "writer9 barrier",
+  "manifest12 barrier",
   "commit body8",
   "wide sequence preserved",
   "checksummed roundtrip",
@@ -8993,6 +8995,7 @@ export const NATIVE_PROFILE_REACH = [
   "unassigned nested vocabulary",
   "unassigned reader",
   "manifest mismatch",
+  "assigned selector in preserved population",
 ] as const;
 
 export const DURABLE_OCTET_REACH = [
@@ -9222,4 +9225,107 @@ export const RETIREMENT_FAST_FALLBACK_REACH = [
   "no grant growth",
   "foreign error preserved",
   "original root intact",
+] as const;
+
+export const ROOT_DUAL_GATE_REACH = [
+  "short capability header corrupt",
+  "u32 reader and writer",
+  "high sequence independent",
+  "borrowed manifest only",
+] as const;
+
+export const ROOT_NATIVE_DUAL_GATE_REACH = [
+  "minimum reader",
+  "minimum writer",
+  "root-0",
+  "root-1",
+  "partial tree",
+  "complete tree",
+  "OPFS unchanged",
+  "IDB unchanged",
+  "concurrent refusals",
+  "live lock untouched",
+  "zero writes",
+] as const;
+
+export const NATIVE_WRITER_PROFILE_REACH = [
+  "assigned rewrite vocabulary",
+  "unassigned writer",
+  "unassigned rewrite vocabulary",
+  "read optional field requires writer gate",
+  "all record kinds",
+  "assigned selector in preserved population",
+] as const;
+
+export const ROOT_WRITE_GATE_REACH = [
+  "durable reader gate before append",
+  "durable writer gate before append",
+  "FTS claims after gate",
+  "zero charges",
+] as const;
+
+export const ROOT_GATE_RACE_REACH = [
+  "IDB",
+  "OPFS",
+  "reader",
+  "writer",
+  "publication first",
+  "probe-steal interval",
+  "steal first",
+  "refused live owner survives",
+  "live owner still writes",
+  "stolen queued publication refuses",
+] as const;
+
+export const ROOT_PUBLICATION_ORDER_REACH = [
+  "batched earlier write and root atomic",
+  "unbatched earlier write precedes root",
+  "same extent overwrite after root",
+] as const;
+
+export const ROOT_GATE_LIVENESS_REACH = [
+  "IDB",
+  "OPFS",
+  "gate granted",
+  "future gate granted",
+  "before owner steal",
+  "after owner steal",
+  "immediate notification",
+  "delayed notification",
+  "publisher completes while opener suspended",
+  "same epoch higher generation",
+  "stale opener no writes",
+  "live owner still writes",
+  "compatible takeover preserved",
+  "before native fence",
+] as const;
+
+export const ROOT_FENCE_BOUNDARY_REACH = [
+  "IDB",
+  "OPFS",
+  "before owner grant",
+  "after owner grant",
+  "fresh takeover while obsolete opener frozen",
+  "durable identity before lease exposure",
+  "cancelled waiter never steals later",
+  "root and WAL preserved at cut",
+] as const;
+
+export const OWNER_IDENTITY_REACH = [
+  "single-word epoch",
+  "multi-word epoch",
+  "both checksums and zero reserved",
+  "all identity fields affect authority",
+  "same epoch recovery",
+  "takeover advances epoch",
+  "hint ties use higher epoch",
+] as const;
+
+export const NATIVE_FIXTURE_REACH = [
+  "one-byte chunks",
+  "split chunks",
+  "ordinary native open and exact bytes",
+  "target-local epoch advances",
+  "source unchanged",
+  "occupied target refused unchanged",
 ] as const;

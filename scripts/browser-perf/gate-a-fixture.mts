@@ -64,6 +64,7 @@ export function fixtureSourceHash(): string {
       "packages/core/src/next/storage",
       "packages/core/src/next/hash",
       "packages/core/src/next/types.ts",
+      "packages/core/src/next/durable-format.ts",
       "packages/core/src/next/vector",
       "scripts/browser-perf/page/wide-data.ts",
       "scripts/browser-perf/page/wide-vectors.ts",

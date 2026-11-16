@@ -15,6 +15,7 @@ import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { OwnershipLostError, StoreCorruptionError } from "./contract.js";
 import { ByteStore, IDB_RECORD_BYTES } from "./idb-bytes.js";
 import { openIndexedDb, type IdbDatabaseLike, type IdbTransactionLike } from "./idb-like.js";
+import { encodeEpochSlot } from "./opfs.js";
 import { createIndexedDbBackend } from "./indexeddb.js";
 import { SimDisk, SimLocks } from "./sim-disk.js";
 import { simIndexedDb } from "./sim-idb.js";
@@ -40,7 +41,10 @@ function forge(
   records: ReadonlyArray<readonly [number, number]>,
   entries: ReadonlyArray<readonly [number, unknown]>,
 ): Promise<void> {
-  return db.transaction([space, `${space}-index`], "readwrite", "strict", (tx) => {
+  return db.transaction(["meta", space, `${space}-index`], "readwrite", "strict", (tx) => {
+    tx.store("meta").get("epoch", (value) => {
+      if (value === undefined) tx.store("meta").put("epoch", encodeEpochSlot(1).buffer);
+    });
     for (const [offset, length] of records)
       tx.store(space).put(offset, { offset, bytes: filled(length, 7).buffer });
     for (const [key, entry] of entries) tx.store(`${space}-index`).put(key, entry);

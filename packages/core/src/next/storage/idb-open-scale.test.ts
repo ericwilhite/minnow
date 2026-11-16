@@ -3,6 +3,7 @@ import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { expect, it } from "vitest";
 import { openIndexedDb, type IdbDatabaseLike, type IdbStoreLike } from "./idb-like.js";
 import { createIndexedDbBackend } from "./indexeddb.js";
+import { encodeEpochSlot } from "./opfs.js";
 import { SimLocks } from "./sim-disk.js";
 
 (globalThis as { IDBKeyRange?: unknown }).IDBKeyRange ??= IDBKeyRange;
@@ -12,6 +13,10 @@ it.each([0, 1, 129, 8193, 32769])(
   async (records) => {
     const factory = new IDBFactory();
     const raw = await openIndexedDb(factory, "scale");
+    // A real stored image always has its durable ownership fence before byte records.
+    await raw.transaction(["meta"], "readwrite", "strict", (tx) =>
+      tx.store("meta").put("epoch", encodeEpochSlot(1).buffer),
+    );
     await raw.transaction(
       ["data", "data-index", "log", "log-index"],
       "readwrite",
@@ -59,10 +64,16 @@ it.each([0, 1, 129, 8193, 32769])(
     );
     raw.close();
     const requests: string[] = [];
-    const roots: string[] = [];
+    const roots: Array<{ mode: "readonly" | "readwrite"; method: string; key: unknown }> = [];
     const values: unknown[] = [];
-    const observe = (name: string, method: string, then: (value: unknown) => void) => {
-      if (name === "roots") roots.push(`${name}.${method}`);
+    const observe = (
+      name: string,
+      mode: "readonly" | "readwrite",
+      method: string,
+      then: (value: unknown) => void,
+      key?: unknown,
+    ) => {
+      if (name === "roots") roots.push({ mode, method, key });
       else if (name !== "meta") requests.push(`${name}.${method}`);
       return (value: unknown) => {
         if (name !== "meta" && name !== "roots" && value !== undefined) {
@@ -72,16 +83,24 @@ it.each([0, 1, 129, 8193, 32769])(
         then(value);
       };
     };
-    const wrap = (name: string, store: IdbStoreLike): IdbStoreLike => ({
+    const wrap = (
+      name: string,
+      store: IdbStoreLike,
+      mode: "readonly" | "readwrite",
+    ): IdbStoreLike => ({
       ...store,
-      get: (key, then) => store.get(key, observe(name, "get", then)),
-      last: (range, then) => store.last(range, observe(name, "last", then)),
+      get: (key, then) => store.get(key, observe(name, mode, "get", then, key)),
+      last: (range, then) => store.last(range, observe(name, mode, "last", then)),
       getAll: (range, then, count) =>
-        store.getAll(range, (found) => observe(name, "getAll", () => then(found))(found), count),
+        store.getAll(
+          range,
+          (found) => observe(name, mode, "getAll", () => then(found))(found),
+          count,
+        ),
       getAllKeys: (range, then, count) =>
         store.getAllKeys(
           range,
-          (found) => observe(name, "getAllKeys", () => then(found))(found),
+          (found) => observe(name, mode, "getAllKeys", () => then(found))(found),
           count,
         ),
     });
@@ -95,7 +114,7 @@ it.each([0, 1, 129, 8193, 32769])(
           transaction: (stores, mode, durability, body) =>
             db.transaction(stores, mode, durability, (tx) =>
               body({
-                store: (name) => wrap(name, tx.store(name)),
+                store: (name) => wrap(name, tx.store(name), mode),
                 abort: (error) => tx.abort(error),
               }),
             ),
@@ -108,8 +127,15 @@ it.each([0, 1, 129, 8193, 32769])(
       expect(await session.dataLength()).toBe(Math.max(0, (records - 1) * 4096 + 8));
       expect(session.logLength()).toBe(Math.max(0, (records - 1) * 4096 + 8));
       // Count point requests too: a loop of get()/last() must fail just like bulk enumeration.
-      // Fixed pre-fence version checks are independent of data/log record count.
-      expect(roots).toEqual(["roots.get", "roots.get"]);
+      // The storage contract requires both slots before lock/steal, then again inside the
+      // owned fence to reject stale probes before epoch writes. These four exact header
+      // requests are fixed, independent of the TWO data/log boundary lookups below.
+      expect(roots).toEqual([
+        { mode: "readonly", method: "get", key: "slot-0" },
+        { mode: "readonly", method: "get", key: "slot-1" },
+        { mode: "readwrite", method: "get", key: "slot-0" },
+        { mode: "readwrite", method: "get", key: "slot-1" },
+      ]);
       expect(requests.length).toBeLessThanOrEqual(2);
       expect(values.length).toBeLessThanOrEqual(2);
       for (const value of values)

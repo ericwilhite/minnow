@@ -35,6 +35,8 @@ import {
   type IdbTransactionLike,
 } from "./idb-like.js";
 import { createIndexedDbBackend } from "./indexeddb.js";
+import { identityOwnerName } from "./owner-identity.js";
+import { DURABLE_READER_VERSION, DURABLE_WRITER_VERSION } from "../durable-format.js";
 import { SimDisk, SimLocks } from "./sim-disk.js";
 import { simIndexedDb } from "./sim-idb.js";
 
@@ -132,11 +134,21 @@ describe("a release whose wait runs out aborts, settles, closes, then unlocks (f
     await tick();
     // The next owner is already waiting for the lock while the release runs.
     let liveAtGrant = -1;
-    const granted = locks.request("minnow:timeout", {}).then((held) => {
-      events.push("granted");
-      liveAtGrant = live;
-      return held;
-    });
+    const granted = locks
+      .request(
+        identityOwnerName("timeout", {
+          epoch: lease.epoch,
+          generation: 1,
+          reader: DURABLE_READER_VERSION,
+          writer: DURABLE_WRITER_VERSION,
+        }),
+        {},
+      )
+      .then((held) => {
+        events.push("granted");
+        liveAtGrant = live;
+        return held;
+      });
     const report = await lease.release();
     const next = await granted;
     keepAlive = false;
@@ -208,15 +220,20 @@ describe("a release whose wait runs out aborts, settles, closes, then unlocks (f
   });
 
   it("a release within the window reports what drained and aborts nothing", async () => {
+    const { state, database } = faultyConnection();
     const backend = createIndexedDbBackend({
-      database: () => simIndexedDb(new SimDisk()),
+      database: () => database,
       locks: new SimLocks(),
       name: "drained",
     });
     const lease = await backend.acquire();
     const session = await backend.open(lease);
+    const started = new Promise<void>((resolve) => {
+      state.onStart = resolve;
+    });
     const publishing = session.publish(new Uint8Array([1]));
-    await Promise.resolve();
+    // The law concerns issued transactions, not a particular microtask count before issuance.
+    await started;
     const [, report] = await Promise.all([publishing, lease.release()]);
     expect(report).toEqual({ drained: 1, aborted: 0 });
   });
@@ -343,11 +360,16 @@ function faultyConnection() {
     aborts: 0,
     closes: 0,
     finishers: [] as Array<() => void>,
+    onStart: null as (() => void) | null,
   };
   const database: IdbDatabaseLike = {
     transaction(stores, mode, durability, body) {
       const plan = state.plans.shift();
-      if (plan === undefined) return inner.transaction(stores, mode, durability, body);
+      if (plan === undefined) {
+        const run = inner.transaction(stores, mode, durability, body);
+        state.onStart?.();
+        return run;
+      }
       return new Promise<void>((resolve, reject) => {
         state.finishers.push(resolve);
         body({
@@ -357,6 +379,7 @@ function faultyConnection() {
             if (plan === "honour") reject(reason);
           },
         });
+        state.onStart?.();
       });
     },
     close: () => {
@@ -383,7 +406,15 @@ describe("a release gives up on aborted transactions that never end (review B1-p
     const publishing = session.publish(new Uint8Array([1]));
     await tick();
     // The next owner is already waiting for the lock.
-    const granted = locks.request("minnow:unsettled", {});
+    const granted = locks.request(
+      identityOwnerName("unsettled", {
+        epoch: lease.epoch,
+        generation: 1,
+        reader: DURABLE_READER_VERSION,
+        writer: DURABLE_WRITER_VERSION,
+      }),
+      {},
+    );
     const released = lease.release();
 
     const release = await outcomeWithin(released, 2_000);
@@ -476,16 +507,22 @@ describe("a release gives up on aborted transactions that never end (review B1-p
     const lease = await backend.acquire();
     const session = await backend.open(lease);
     state.plans.push("honour", "withhold");
-    const outcomes = [
-      session.publish(new Uint8Array([1])),
-      scratchOf(backend, lease).write(0, new Uint8Array(8)),
-    ].map((run) =>
-      run.then(
-        () => "settled",
-        (error: unknown) => error,
-      ),
-    );
-    await tick();
+    const firstStarted = new Promise<void>((resolve) => {
+      state.onStart = resolve;
+    });
+    const publishing = session.publish(new Uint8Array([1])).catch((error: unknown) => error);
+    await firstStarted;
+    const secondStarted = new Promise<void>((resolve) => {
+      state.onStart = resolve;
+    });
+    const spilling = scratchOf(backend, lease)
+      .write(0, new Uint8Array(8))
+      .catch((error: unknown) => error);
+    await secondStarted;
+    state.onStart = null;
+    // Both native transactions are active concurrently; bind the fault plans to actual starts.
+    expect(state.finishers).toHaveLength(2);
+    const outcomes = [publishing, spilling];
     const release = await outcomeWithin(lease.release(), 2_000);
     expect(release).not.toBe("pending");
     const error = (release as { error?: unknown }).error;

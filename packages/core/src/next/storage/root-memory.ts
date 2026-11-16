@@ -3,7 +3,12 @@
  * Oversized roots need ordinary caller credit before allocating; no admission is awaited.
  * Native publication borrows the frame itself, never encoding/copying it a second time.
  */
-import { DURABLE_FORMATS, ROOT_SLOT_HEADER_BYTES, ROOT_SLOT_OVERHEAD } from "../durable-format.js";
+import {
+  DURABLE_FORMATS,
+  ROOT_SLOT_PAYLOAD_OFFSET,
+  ROOT_SLOT_CAPABILITY_BYTES,
+  ROOT_SLOT_OVERHEAD,
+} from "../durable-format.js";
 import { writeRootVersion } from "./root-slot.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { pauseIfDue, type TaskWork } from "../task.js";
@@ -160,7 +165,7 @@ export class RootFrame {
     readonly small: boolean,
   ) {
     this.#slot = new Uint8Array(length + ROOT_HEADER);
-    this.#bytes = this.#slot.subarray(ROOT_SLOT_HEADER_BYTES, ROOT_SLOT_HEADER_BYTES + length);
+    this.#bytes = this.#slot.subarray(ROOT_SLOT_PAYLOAD_OFFSET, ROOT_SLOT_PAYLOAD_OFFSET + length);
   }
   get bytes(): Uint8Array {
     if (this.#refs === 0) throw new TypeError("Released root frame");
@@ -181,7 +186,7 @@ export class RootFrame {
     view.setUint32(0, DURABLE_FORMATS.rootSlot.magic, true);
     view.setUint32(4, sequence >>> 0, true);
     view.setUint32(8, Math.floor(sequence / 2 ** 32), true);
-    view.setUint32(12, this.bytes.length, true);
+    view.setUint32(12, ROOT_SLOT_CAPABILITY_BYTES + this.bytes.length, true);
     writeRootVersion(view);
     view.setUint32(this.#slot.length - 4, xxHash32(this.#slot, 0, 0, this.#slot.length - 4), true);
     prepared.set(this.bytes, { token: session.rootWriterToken ?? session, slot, frame: this });

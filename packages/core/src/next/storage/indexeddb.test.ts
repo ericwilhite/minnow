@@ -370,12 +370,18 @@ describe("release drains the connection, then closes it (the WebKit wedge mitiga
     const inner = simIndexedDb(new SimDisk());
     const events: string[] = [];
     let connections = 0;
+    let publishingNow = false;
+    let started!: () => void;
+    const nativePublication = new Promise<void>((resolve) => {
+      started = resolve;
+    });
     const backend = createIndexedDbBackend({
       database: () => {
         connections += 1;
         return {
           transaction: async (stores, mode, durability, body) => {
             await inner.transaction(stores, mode, durability, body);
+            if (publishingNow && mode === "readwrite" && stores.includes("roots")) started();
             // A transaction that settles a moment later, as a real one in flight would.
             await new Promise<void>((resolve) => {
               setTimeout(resolve, 20);
@@ -392,11 +398,10 @@ describe("release drains the connection, then closes it (the WebKit wedge mitiga
     });
     const lease = await backend.acquire();
     const session = await backend.open(lease);
+    publishingNow = true;
     const publishing = session.publish(new Uint8Array([1]));
-    // One task later the publish's transaction is in flight (it settles 20 ms after committing).
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, 0);
-    });
+    // Wait for the actual strict publication transaction, after identity verification.
+    await nativePublication;
     events.length = 0;
     const [, report] = await Promise.all([publishing, lease.release()]);
     expect(report).toEqual({ drained: 1, aborted: 0 });

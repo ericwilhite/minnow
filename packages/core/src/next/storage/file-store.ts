@@ -5,12 +5,14 @@
  * - `root-0`, `root-1`: the two root slots (root-slot.ts), written alternately.
  *
  * OPFS gives it `FileSystemSyncAccessHandle`s; tests give it sim-disk.ts handles. All work is
- * synchronous on open handles: each async method runs its whole body before its first await
- * point, so the ownership check (`guard`) and the effect happen in one step.
+ * synchronous on open handles: the ownership check (`guard`) and each file effect happen in
+ * one step. Native root publication first awaits its coordination gate, then checks ownership
+ * again before flushing or writing.
  *
  * Publication order (guarantee 1): flush the data file; write the inactive root slot; flush it.
  * A torn slot fails its checksum and the other slot, the previous root, stays current.
  */
+import type { PublicationGate } from "./fence.js";
 import { ROOT_SLOT_OVERHEAD } from "../durable-format.js";
 import { chooseRoot, encodeRootSlot } from "./root-slot.js";
 import { preparedRoot } from "./root-memory.js";
@@ -77,7 +79,12 @@ export class FileStoreSession implements StoreSession {
   #closed = false;
 
   /** `guard` throws `OwnershipLostError` once the lease is lost; it runs before every effect. */
-  constructor(files: FileSet, epoch: number, guard: () => void) {
+  constructor(
+    files: FileSet,
+    epoch: number,
+    guard: () => void,
+    readonly publication?: PublicationGate,
+  ) {
     this.#files = files;
     this.epoch = epoch;
     this.#guard = guard;
@@ -128,6 +135,14 @@ export class FileStoreSession implements StoreSession {
   }
 
   async publish(root: Uint8Array): Promise<void> {
+    if (this.publication !== undefined)
+      return this.publication(() => {
+        this.#publish(root);
+      });
+    this.#publish(root);
+  }
+
+  #publish(root: Uint8Array): void {
     const files = this.#owned();
     const prepared = preparedRoot(this, root);
     const chosen = prepared === undefined ? this.#chooseRoot() : null;

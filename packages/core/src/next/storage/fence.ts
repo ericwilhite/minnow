@@ -9,6 +9,8 @@ import { OwnerUnresponsiveError, OwnershipLostError, isBusyError } from "./contr
 
 /** The slice of the Web Locks API ownership needs (`navigator.locks` adapts to it). */
 export interface LockManagerLike {
+  /** Snapshot of held names, for native OPFS platforms that deny Blob reads of held files. */
+  query?(): Promise<readonly string[]>;
   /**
    * Resolves when `name` is held. With `steal`, takes it from the current holder, whose `lost`
    * signal aborts (the platform's AbortError on its request). `signal` cancels a wait.
@@ -38,7 +40,7 @@ type Outcome<T> =
   | { readonly kind: "deadline" };
 
 /** Settles with the open's outcome, or `deadline` after `ms` (the open keeps running). */
-function withDeadline<T>(attempt: Promise<T>, ms: number): Promise<Outcome<T>> {
+export function withDeadline<T>(attempt: Promise<T>, ms: number): Promise<Outcome<T>> {
   return new Promise((resolve) => {
     const timer = setTimeout(
       () => {
@@ -59,17 +61,49 @@ function withDeadline<T>(attempt: Promise<T>, ms: number): Promise<Outcome<T>> {
   });
 }
 
-/**
- * Takes the lock, then opens the backend fence until it stops failing busy (`isBusyError`),
- * backing off from 1 ms to 100 ms, all within `timeoutMs`.
- *
- * - `openFence` may be synchronous or return a promise (`createSyncAccessHandle` does; so does an
- *   IndexedDB epoch bump). The deadline applies while it is pending and is checked again after it
- *   opens: past it, acquisition fails with `OwnerUnresponsiveError`, and the fence (opened late,
- *   or opened after the deadline by a slow synchronous call) is closed at once.
- * - If the lock is stolen while the fence opens, the opened fence is closed and acquisition fails
- *   with `OwnershipLostError`: a newer owner is acquiring.
- * - Every failure releases the lock; a non-busy error is rethrown.
+export type PublicationGate = (publish: () => void | Promise<void>) => Promise<void>;
+
+export async function requestUntil(
+  locks: LockManagerLike,
+  name: string,
+  deadline: number,
+  timeoutMs: number,
+  steal = false,
+  signal?: AbortSignal,
+): Promise<HeldLock> {
+  if (signal?.aborted === true || Date.now() > deadline)
+    throw new OwnerUnresponsiveError(timeoutMs);
+  const waiting = new AbortController();
+  const cancel = () => waiting.abort();
+  signal?.addEventListener("abort", cancel, { once: true });
+  const timer = setTimeout(
+    () => {
+      waiting.abort();
+    },
+    Math.max(0, deadline - Date.now()),
+  );
+  try {
+    const lock = await locks.request(name, {
+      ...(steal ? { steal: true } : {}),
+      signal: waiting.signal,
+    });
+    if (waiting.signal.aborted || Date.now() > deadline) {
+      lock.release();
+      throw new OwnerUnresponsiveError(timeoutMs);
+    }
+    return lock;
+  } catch (error) {
+    if (waiting.signal.aborted) throw new OwnerUnresponsiveError(timeoutMs);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", cancel);
+  }
+}
+
+/** Generic lock + asynchronous native-handle acquisition for memory, simulator and owner
+ * host election. Native storage compatibility uses native-fence.ts's durable identities.
+ * Retries busy opens within one deadline; closes every late/opened-after-loss resource.
  */
 export async function acquireFenced<T>(
   locks: LockManagerLike,
@@ -80,22 +114,7 @@ export async function acquireFenced<T>(
 ): Promise<{ readonly lock: HeldLock; readonly fence: T }> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_ACQUIRE_TIMEOUT_MS;
   const deadline = Date.now() + timeoutMs;
-  const waiting = new AbortController();
-  const timer = setTimeout(() => {
-    waiting.abort();
-  }, timeoutMs);
-  let lock: HeldLock;
-  try {
-    lock = await locks.request(name, {
-      ...(options.steal === true ? { steal: true } : {}),
-      signal: waiting.signal,
-    });
-  } catch (error) {
-    if (waiting.signal.aborted) throw new OwnerUnresponsiveError(timeoutMs);
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
+  const lock = await requestUntil(locks, name, deadline, timeoutMs, options.steal === true);
   let delay = FIRST_RETRY_MS;
   for (;;) {
     if (lock.lost.aborted) {

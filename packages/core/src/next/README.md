@@ -178,8 +178,8 @@ External input checks expand each distinct object once, with temporary identity 
 to the input graph. Cycles refuse. Internally planned/replayed results use shallow construction
 checks rather than re-walking the entire resident catalog; public replay still checks its operands.
 Writable native/portable decode defaults to full understanding; requiredFeatures is sorted/unique
-and coherent with nonempty sections. Separate pre-fence root reader/writer gate allocation is
-owned by B2; an older writer must refuse any database it cannot fully rewrite.
+and coherent with nonempty sections. Separate pre-fence root reader/writer gates enforce read
+and rewrite capabilities; an older writer refuses any database it cannot fully rewrite.
 Records retain exact typed vectors, decimal coefficients, bigint sequence settings and UTF8
 identifier boundaries. An individual record is capped at 4 MiB. Catalogs stream one admitted
 record at a time across 256 KiB pages and 64-way indexes, including records crossing pages.
@@ -199,7 +199,7 @@ version gaps from rolled-back DDL. DROP TABLE carries its MCHG definition too.
 
 The manifest names the catalog tree, not a JSON blob. Reachability checks child depth and
 summaries plus contiguous fragment offsets, and reclamation retires every old index/data page.
-The reader/manifest/commit-body development selectors are 7/8/6; older unpublished selectors
+The native reader/writer/manifest/commit-body development selectors are 8/8/11/8; older unpublished selectors
 refuse. The released 1.0 format has no supported predecessor yet. Trigger family20 now carries dialect-versioned bodies and stable OLD/NEW/target dependencies
 (body30/binding31/column32). Definitions and CREATE/DROP lowering persist through WAL and
 checkpoint; trigger scheduling/body execution is the next integration unit. Writes whose event
@@ -448,26 +448,56 @@ unsupported native header never means an empty store. Checksum-invalid slots sti
 ordinary dual-slot recovery. Private scratch journals and spill encodings are listed separately;
 they are not recovery authorities. Portable snapshot1 has its own container and selectors.
 
-The 16-byte native root header now carries a minimum-reader version and the inner manifest
-format before its opaque payload. Both are checksummed. Acquisition checks both root slots
-before creating OPFS files or advancing an owner epoch; IndexedDB checks in the strict fence
-transaction before enqueueing any write. Unsupported root barriers use
-`DurableFormatError` (`MINNOW_FORMAT_UNSUPPORTED`). Publishers, including prepaid root frames,
-emit the registry values. Every future incompatible nested codec must raise this outer barrier
-before writing incompatible data or log bytes, so an older reader cannot advance the newer owner's epoch before refusing.
-Its eleven formerly reserved high bits carry biased selectors: minimum-reader minus1 in
-bits21..23 and manifest-format minus2 in bits24..31. Zero selects reader1/manifest2, so current
-bytes and charges stay unchanged. The first released1.0 writer starts the supported fixture
-and automatic-upgrade chain. The shipped0.x engine is unchanged.
+The native root keeps its 16-byte MNRT framing prefix and adds two checksummed u32 fields:
+minimum reader at byte16 and minimum writer at byte20. The manifest begins at byte24. The
+sequence-high word's bits21..23 select tag7; its upper byte carries manifest12-minus2.
+The current capability baseline is reader9/writer9, manifest12, with commitBody8 unchanged.
+Root frames fund the extra8 bytes before allocation. Earlier unpublished development roots
+are refused; no supported next/ predecessor has shipped.
 
-Compatibility belongs to the outer gates. A writer introducing a nested tag or encoding must
-raise minimum reader, and minimum writer when an older writer cannot fully rewrite it, before
-those bytes enter data or WAL. The separate minimum-writer selector remains a freeze dependency;
-the current header above carries only minimum reader. `NATIVE_READER_PROFILES` binds the native
-registry vocabulary to that reader selector, once at module initialization. It adds no stored
-field, and does no per-query/page/row work. A registry vocabulary extension without an assigned
-profile refuses before storage acquisition. The guard cannot detect a semantic reinterpretation
-of an unchanged tag; that still requires format review and supported-writer fixture evidence.
+Both native backends validate the root and native fence capabilities before a takeover.
+The durable fence is a40-byte MNE2 record containing epoch, generation, minimum reader and
+minimum writer, with prefix and full checksums. Acquisition advances both counters; recovery
+of a stranded publication gate advances only the generation. Both counters are positive safe
+integers and never wrap. OPFS keeps two512-byte slots in `epoch`; IndexedDB keeps a tight
+ArrayBuffer under the existing `meta["epoch"]` key (schema2).
+
+Native owner locks are `minnow-owner:<nameLength>:<name>:<epoch>:<generation>:<reader>:<writer>`;
+gate locks prepend `minnow-gate:` to that exact owner name. A stealing opener captures an
+identity, takes its gate without stealing it, rechecks compatibility, and targets only that
+identity's owner lock. The native fence compares the full expected identity before changing it.
+A frozen or revoked opener never retargets a newer identity using an old compatibility proof.
+Compatible live-owner takeover remains supported.
+
+Publication waits at most1000ms for the current identity's gate on the publisher's own clock.
+If an opener freezes while holding it, the healthy owner claims the next generation's gate
+and owner lock, conditionally persists that identity, then publishes there. It switches its
+loss listener before the native compare-and-swap; loss of the obsolete lock cannot abort the
+new authority, even when notifications arrive late. A failed compare-and-swap loses authority.
+The frozen gate can remain held indefinitely without blocking current publication or openers.
+Publication is serialized per owner lease. Ordinary queued openers do not hold the current
+owner's gate while waiting. OPFS uses read-only native snapshots; where held files deny those,
+a snapshot of held identity lock names is only an acquisition hint, still checked by native CAS.
+
+IndexedDB reserves each publication's commit-chain position and captures earlier queued writes
+BEFORE gate waiting. Later writes cannot pass the publication or join its earlier batch.
+Its strict root transaction compares the complete identity atomically with publication; ordinary
+transactions still compare epoch. OPFS validates both slots under exclusive handles before
+creating missing files, then records its fence before creating other files. Gate/preflight work
+shares the acquisition deadline, including cleanup of a late IndexedDB connection.
+Unsupported gates use `DurableFormatError` (`MINNOW_FORMAT_UNSUPPORTED`). Readable but
+unrewritable stores refuse too; there is no physical read-only owner fallback. Stale native
+identity attempts use `OwnershipLostError` and cannot mutate current root, WAL or metadata.
+
+Every native publisher, including prepaid root frames, emits both selectors. Compatibility
+belongs to those outer gates: incompatible nested tags must raise minimum reader, and any field
+an older writer cannot fully rewrite must raise minimum writer BEFORE its data or WAL bytes.
+`NATIVE_READER_PROFILES` covers required-understanding grammar; `NATIVE_WRITER_PROFILES` also
+covers read-optional catalog fields. Both guards run at module initialization before acquisition.
+The ledger cannot detect a semantic reinterpretation of an unchanged tag; format review and
+supported-writer upgrade fixtures remain required. After the first released1.0 baseline, adding
+a writer profile also requires automatic open/load upgrade and a durable barrier before the new
+feature is enabled. Merely changing a constant is unfinished. The shipped0.x engine is unchanged.
 
 Under supported outer gates, an unknown nested tag is corruption. Open fully validates what it
 eagerly reads (root, manifest, catalog and WAL tail), while data pages remain lazy. A consuming
@@ -2678,6 +2708,11 @@ timing; cached files are never opened for writing by a rerun. Seed and aggregate
 appear in every pass and the final report. Preparation publishes a completed image atomically;
 an incomplete or changed cache cannot supply an acceptance result. No supported stored format
 changes here.
+The private installer accepts only an empty disposable target and initializes its native fence
+before copying the four cached payload files. Epochs are target-local, never imported from the
+source. It refuses an occupied directory unchanged. The durable-format registry participates in
+the fixture fingerprint, so profile changes invalidate the cache. Setup is outside measurements;
+this adapter is not an application snapshot loader.
 
 The command requires Linux cache-control tools, installed dependencies and Chromium. It records
 load1 at startup, after fixture preparation, each second while the runner is active, and before/
@@ -3906,8 +3941,8 @@ Snapshots will rebuild postings from rows; this stage only supplies the portable
 Native foreign-key records preserve exact explicit DELETE/UPDATE actions. An omitted
 ON UPDATE is stored as `follow`, distinct from explicit CASCADE and from PostgreSQL's
 NO ACTION default. The schema inspector exposes these modes and stored trigger identities.
-MCAT foreignKey10's required field9 carries onUpdate; these development bytes need the
-next pre-fence selector allocation before publication. Native RI execution/trigger firing
+MCAT foreignKey10's required field9 carries onUpdate; the outer reader9/writer9/manifest12
+gates cover these development bytes before publication. Native RI execution/trigger firing
 remain the separate joint B6/B5b consumer described in the inventory. Until that driver is
 installed, SQL refuses explicit ON UPDATE modes, ON DELETE SET DEFAULT and informational
 rekeys with 0A000, including raw executor requests. These descriptors cannot select legacy
@@ -4046,7 +4081,7 @@ compact invalidation; it never takes a second loan. Cancellation drains page IO 
 its buffers, the step, or the grant. Journal references are bounded before IO; the audit walks
 all prepared documents, terms and postings, with owned decoder leases.
 
-The new native manifest10 and commitBody8 selectors refuse older unpublished development bytes
+The B7 native manifest10 (now11 with dual root gates) and commitBody8 selectors refuse older unpublished development bytes
 before mutation. MCAT dialect/minimum reader7 is unchanged: the independent manifest barrier
 already makes older builds refuse these native bytes before fencing. No supported1.0 predecessor
 exists; this is not an upgrade path for 0.x. The public/shipped engine remains unchanged.
@@ -4102,7 +4137,7 @@ rendering. Fixed seal/claim state fits the already prepaid 512-byte FTS publicat
 Ordinary commits without an FTS seal keep their existing append path.
 
 The SQL scan route and shipped engine behavior are unchanged. The new tag is part of the
-unmerged development manifest10/body8 unit; it changes no supported stored predecessor.
+development FTS unit (now manifest12/body8 with generation-fenced dual gates); it changes no supported stored predecessor.
 
 FTS recovery reads the checked checkpoint head once and passes its actual covered LSN to
 `Replayer` independently of global/catalog/ledger and per-table row coverage. A conservative

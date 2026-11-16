@@ -262,11 +262,11 @@ export const DURABLE_EMISSIONS: Readonly<
     count: 1,
     kinds: ["indexedDb"],
   },
-  'storage/indexeddb.ts:IdbSession.publish:tx.store("roots").put -> IdbStoreLike.put': {
+  'storage/indexeddb.ts:IdbSession.#publish:tx.store("roots").put -> IdbStoreLike.put': {
     count: 1,
     kinds: ["rootSlot"],
   },
-  "storage/indexeddb.ts:IdbSession.publish:roots.put -> IdbStoreLike.put": {
+  "storage/indexeddb.ts:IdbSession.#publish:roots.put -> IdbStoreLike.put": {
     count: 1,
     kinds: ["rootSlot"],
   },
@@ -290,7 +290,10 @@ export const DURABLE_EMISSIONS: Readonly<
     count: 1,
     kinds: [],
   },
-  "storage/indexeddb.ts:ready:meta.put -> IdbStoreLike.put": { count: 1, kinds: ["indexedDb"] },
+  'storage/indexeddb.ts:ready:tx.store("meta").put -> IdbStoreLike.put': {
+    count: 1,
+    kinds: ["epochSlot"],
+  },
   "storage/opfs.ts:QuotaMappedFile.write:this.#handle.write -> SyncFile.write": {
     count: 1,
     kinds: [],
@@ -299,7 +302,7 @@ export const DURABLE_EMISSIONS: Readonly<
     count: 1,
     kinds: [],
   },
-  "storage/opfs.ts:nextEpoch:file.write -> SyncFile.write": { count: 1, kinds: ["epochSlot"] },
+  "storage/opfs.ts:writeIdentity:file.write -> SyncFile.write": { count: 1, kinds: ["epochSlot"] },
   "storage/sim-idb.ts:SimDatabase.#commit:this.#file.write -> SyncFile.write": {
     count: 1,
     kinds: [],

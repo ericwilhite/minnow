@@ -8,7 +8,7 @@
  * - `log`, `data`, `root-0`, `root-1` (file-store.ts);
  * - `space-meta` and `space-meta-index`: owner-private reconstructible extent-space metadata;
  * - `spill` and `spill-meta`: scratch payload and allocator pages; `spill` is the scratch file the spill service uses (`StorageBackend.scratch`);
- * - `epoch`: the epoch counter, two checksummed slots (`nextEpoch`). Each acquisition writes the
+ * - `epoch`: the epoch counter, two checksummed identity slots (`writeIdentity`). Each acquisition writes the
  *   next value into the other slot and flushes it before the lease exists, so epochs increase
  *   across acquisitions and crashes (`OwnerLease.epoch`); the flush costs one platform flush per
  *   acquisition, never per commit.
@@ -18,7 +18,7 @@
  * `createSyncAccessHandle` is async, costs 0.2–12 ms, and waits behind a busy page on WebKit.
  *
  * ## Acquisition (`storage/fence.ts` `acquireFenced`)
- * 1. The Web Lock `minnow:<db>` (`navigator.locks`, adapted to `LockManagerLike`).
+ * 1. The identity-specific Web Lock (`owner-identity.ts`) (`navigator.locks`, adapted to `LockManagerLike`).
  * 2. Every file's sync handle, opened in a fixed order with bounded retry: the lock frees
  *    2 ms–2 s before a dead owner's handles. Read-only root/log/epoch snapshots reject
  *    unsupported headers before file creation; the root minimum-reader barrier is rechecked
@@ -41,12 +41,17 @@
  * these handles. Clients never open these files: any
  * other opener would block the owner.
  */
-import { ROOT_SLOT_OVERHEAD, DURABLE_FORMATS, requireHeader } from "../durable-format.js";
+import {
+  ROOT_SLOT_OVERHEAD,
+  DURABLE_READER_VERSION,
+  DURABLE_WRITER_VERSION,
+} from "../durable-format.js";
 import { decodeRootSlot } from "./root-slot.js";
 import { validLogHeaderEnvelope } from "./durable-header.js";
-import { xxHash32 } from "../hash/xxhash32.js";
 import {
   OwnershipLostError,
+  OwnerUnresponsiveError,
+  isBusyError,
   StoreCorruptionError,
   StoreQuotaError,
   type AcquireOptions,
@@ -57,7 +62,23 @@ import {
   type StorageObserver,
   type SyncFile,
 } from "./contract.js";
-import { acquireFenced, type HeldLock, type LockManagerLike } from "./fence.js";
+import {
+  DEFAULT_ACQUIRE_TIMEOUT_MS,
+  type HeldLock,
+  type LockManagerLike,
+  type PublicationGate,
+} from "./fence.js";
+import { acquireNative, NativeAuthority } from "./native-fence.js";
+import {
+  EMPTY_IDENTITY,
+  OWNER_IDENTITY_BYTES,
+  decodeOwnerIdentity,
+  encodeOwnerIdentity,
+  requireIdentity,
+  sameIdentity,
+  identityFromNames,
+  type OwnerIdentity,
+} from "./owner-identity.js";
 import { refuseLegacyOpfs } from "./legacy-data.js";
 import { FileScratch, FileStoreSession, type FileSet } from "./file-store.js";
 
@@ -78,7 +99,7 @@ export interface OpfsDirectoryLike {
 export interface OpfsBackendOptions {
   /** The database's own directory (under `navigator.storage.getDirectory()`). */
   readonly directory: OpfsDirectoryLike;
-  /** The database name; the lock is `minnow:<name>`. */
+  /** The logical database name; native owner/gate lock names include its durable identity. */
   readonly name: string;
   readonly locks: LockManagerLike;
   /** Told about every sync call the sessions make (test instrumentation). */
@@ -219,7 +240,8 @@ class ObservedFile implements SyncFile {
 interface OpenFiles {
   readonly files: FileSet;
   readonly scratch: SyncFile;
-  readonly epoch: number;
+  readonly identity: OwnerIdentity;
+  readonly epochFile: SyncFile;
   readonly handles: readonly SyncFile[];
 }
 
@@ -228,13 +250,24 @@ class OpfsLease implements OwnerLease {
   readonly files: FileSet;
   readonly scratchFile: SyncFile;
   readonly #handles: readonly SyncFile[];
-  readonly #lock: HeldLock;
+  readonly #lock: NativeAuthority;
+  readonly publication: PublicationGate;
   readonly #lost = new AbortController();
 
-  constructor(lock: HeldLock, opened: OpenFiles, observe: StorageObserver | null) {
+  constructor(lock: NativeAuthority, opened: OpenFiles, observe: StorageObserver | null) {
     this.#lock = lock;
     this.#handles = opened.handles;
-    this.epoch = opened.epoch;
+    this.epoch = opened.identity.epoch;
+    this.publication = lock.publication(
+      async (expected, next) => {
+        this.guard();
+        writeIdentity(opened.epochFile, expected, next, false);
+      },
+      async (expected) => {
+        this.guard();
+        requireIdentity(readIdentity(opened.epochFile, false).identity, expected);
+      },
+    );
     const lost = () => this.#lost.signal.aborted;
     const wrap = (file: SyncFile, name: string): SyncFile => {
       const mapped = new QuotaMappedFile(file, lost);
@@ -295,34 +328,20 @@ function closeAll(handles: readonly SyncFile[]): void {
 }
 
 /**
- * The epoch counter (review B1-p2b finding 2): two checksummed slots in the `epoch` file, one per
- * 512-byte sector so a torn write damages only the slot being written, chosen like root slots
- * (the valid slot with the higher value wins; the next write goes to the other). Acquisition
- * writes value + 1 into the other slot and flushes before the lease exists, so no epoch handed to a
- * live owner can repeat after a crash; an interrupted acquisition leaves the old value, which no
- * live owner holds. Slot: magic u32 "MNEP" | value u32 lo | value u32 hi | xxHash32 of the 12.
+ * The native owner fence: two checksummed MNE2 records, one per512-byte sector.
+ * Both identities are validated before selection. The higher generation wins; acquisition
+ * advances epoch and generation, bounded publication recovery advances generation only.
+ * owner-identity.ts defines the exact40-byte record, reserved bits and capability floors.
  */
 export const EPOCH_SLOT_BYTES = 512;
-const EPOCH_MAGIC = DURABLE_FORMATS.epochSlot.magic; // "MNEP"
-
+/** Test/fixture convenience: production passes the full identity. */
 export function encodeEpochSlot(value: number): Uint8Array {
-  const bytes = new Uint8Array(16);
-  const view = new DataView(bytes.buffer);
-  view.setUint32(0, EPOCH_MAGIC, true);
-  view.setUint32(4, value >>> 0, true);
-  view.setUint32(8, Math.floor(value / 2 ** 32), true);
-  view.setUint32(12, xxHash32(bytes, 0, 0, 12), true);
-  return bytes;
-}
-
-/** Empty/torn slots return null; intact unsupported identities/reserved bits refuse. */
-function decodeEpochSlot(bytes: Uint8Array): number | null {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  if (bytes.length < 16) return null;
-  if (view.getUint32(12, true) !== xxHash32(bytes, 0, 0, 12)) return null;
-  requireHeader("epochSlot", bytes, StoreCorruptionError);
-  const value = view.getUint32(4, true) + view.getUint32(8, true) * 2 ** 32;
-  return Number.isSafeInteger(value) && value >= 1 ? value : null;
+  return encodeOwnerIdentity({
+    epoch: value,
+    generation: value,
+    reader: DURABLE_READER_VERSION,
+    writer: DURABLE_WRITER_VERSION,
+  });
 }
 
 function readAll(file: SyncFile, at: number, length: number): Uint8Array {
@@ -344,27 +363,75 @@ function readAll(file: SyncFile, at: number, length: number): Uint8Array {
  * goes to the other. Otherwise it is `StoreCorruptionError`, never a silent restart at 1. A counter
  * that cannot increase within safe integers is refused.
  */
-function nextEpoch(file: SyncFile, unused: boolean): number {
+function chooseIdentity(
+  slots: ReadonlyArray<OwnerIdentity | null>,
+  unused: boolean,
+): { identity: OwnerIdentity; slot: number } {
+  const [first, second] = slots;
+  if (first == null && second == null) {
+    if (!unused) throw new StoreCorruptionError("The epoch file holds no valid identity");
+    return { identity: EMPTY_IDENTITY, slot: 0 };
+  }
+  if (first != null && second != null) {
+    if (first.generation === second.generation && !sameIdentity(first, second))
+      throw new StoreCorruptionError("Conflicting native fence identities");
+    const older = first.generation < second.generation ? first : second,
+      newer = older === first ? second : first;
+    if (older.epoch > newer.epoch) throw new StoreCorruptionError("Native fence epoch regressed");
+  }
+  return first != null && (second == null || first.generation >= second.generation)
+    ? { identity: first, slot: 1 }
+    : { identity: second ?? EMPTY_IDENTITY, slot: 0 };
+}
+function readIdentity(file: SyncFile, unused: boolean): { identity: OwnerIdentity; slot: number } {
   const size = file.getSize();
-  const slots = [0, 1].map((slot) =>
-    decodeEpochSlot(
-      readAll(
-        file,
-        slot * EPOCH_SLOT_BYTES,
-        Math.min(16, Math.max(0, size - slot * EPOCH_SLOT_BYTES)),
+  return chooseIdentity(
+    [0, 1].map((slot) =>
+      decodeOwnerIdentity(
+        readAll(
+          file,
+          slot * EPOCH_SLOT_BYTES,
+          Math.min(OWNER_IDENTITY_BYTES, Math.max(0, size - slot * EPOCH_SLOT_BYTES)),
+        ),
       ),
     ),
+    unused,
   );
-  const [first, second] = slots as [number | null, number | null];
-  if (first === null && second === null && size > 0 && !unused)
-    throw new StoreCorruptionError("The epoch file holds no valid epoch");
-  const current = Math.max(first ?? 0, second ?? 0);
-  const next = current + 1;
-  if (!Number.isSafeInteger(next)) throw new StoreCorruptionError("The epoch counter is exhausted");
-  const slot = first !== null && first === current ? 1 : 0;
-  file.write(encodeEpochSlot(next), { at: slot * EPOCH_SLOT_BYTES });
+}
+function writeIdentity(
+  file: SyncFile,
+  expected: OwnerIdentity,
+  next: OwnerIdentity,
+  unused: boolean,
+): void {
+  const current = readIdentity(file, unused);
+  requireIdentity(current.identity, expected);
+  file.write(encodeOwnerIdentity(next), { at: current.slot * EPOCH_SLOT_BYTES });
   file.flush();
-  return next;
+}
+
+/** Only an unused store may recover a torn first fence as virtual identity zero. */
+async function existingUnused(directory: OpfsDirectoryLike): Promise<boolean> {
+  for (const name of ["log", "data", "root-0", "root-1"]) {
+    let handle: OpfsFileHandleLike;
+    try {
+      handle = await directory.getFileHandle(name, { create: false });
+    } catch (error) {
+      if (errorName(error) === "NotFoundError") continue;
+      throw error;
+    }
+    if (handle.getFile !== undefined) {
+      if ((await handle.getFile()).size !== 0) return false;
+    } else {
+      const file = await handle.createSyncAccessHandle();
+      try {
+        if (file.getSize() !== 0) return false;
+      } finally {
+        closeAll([file]);
+      }
+    }
+  }
+  return true;
 }
 
 /** Native Blob snapshots read only bounded root/header bytes before missing files are created.
@@ -389,9 +456,11 @@ async function checkExistingFormats(directory: OpfsDirectoryLike): Promise<void>
       for (const slot of [0, 1]) {
         const start = slot * EPOCH_SLOT_BYTES;
         const bytes = new Uint8Array(
-          await file.slice(start, start + (name === "epoch" ? 16 : 512)).arrayBuffer(),
+          await file
+            .slice(start, start + (name === "epoch" ? OWNER_IDENTITY_BYTES : 512))
+            .arrayBuffer(),
         );
-        if (name === "epoch") decodeEpochSlot(bytes);
+        if (name === "epoch") decodeOwnerIdentity(bytes);
         else validLogHeaderEnvelope(bytes);
       }
   }
@@ -401,9 +470,14 @@ async function checkExistingFormats(directory: OpfsDirectoryLike): Promise<void>
  * Opens every file's handle in order and advances the epoch; on any failure closes every handle it
  * opened, then throws (quota failures as `StoreQuotaError`), so a retry finds the files free.
  */
-async function openFiles(directory: OpfsDirectoryLike, location: string): Promise<OpenFiles> {
+async function openFiles(
+  directory: OpfsDirectoryLike,
+  location: string,
+  expected: OwnerIdentity,
+  next: OwnerIdentity,
+  beforeMutation: () => void,
+): Promise<OpenFiles> {
   await refuseLegacyOpfs(directory, location, OPFS_FILE_NAMES);
-  await checkExistingFormats(directory);
   const handles: SyncFile[] = [];
   try {
     const existing = new Map<string, SyncFile>();
@@ -431,12 +505,31 @@ async function openFiles(directory: OpfsDirectoryLike, location: string): Promis
           const bytes = readAll(
             handle,
             start,
-            Math.min(name === "epoch" ? 16 : 512, Math.max(0, handle.getSize() - start)),
+            Math.min(
+              name === "epoch" ? OWNER_IDENTITY_BYTES : 512,
+              Math.max(0, handle.getSize() - start),
+            ),
           );
-          if (name === "epoch") decodeEpochSlot(bytes);
+          if (name === "epoch") decodeOwnerIdentity(bytes);
           else validLogHeaderEnvelope(bytes);
         }
     }
+    const unused = ["log", "data", "root-0", "root-1"].every(
+      (name) => (existing.get(name)?.getSize() ?? 0) === 0,
+    );
+    let epochFile = existing.get("epoch");
+    beforeMutation();
+    if (epochFile === undefined) {
+      if (!unused) throw new StoreCorruptionError("A used store has no native fence");
+      requireIdentity(EMPTY_IDENTITY, expected);
+      const file = await directory.getFileHandle("epoch", { create: true });
+      epochFile = await file.createSyncAccessHandle();
+      handles.push(epochFile);
+      existing.set("epoch", epochFile);
+    }
+    // The durable identity is recorded before any other file is created or changed.
+    beforeMutation();
+    writeIdentity(new QuotaMappedFile(epochFile, () => false), expected, next, unused);
     const ordered: SyncFile[] = [];
     for (const name of OPFS_FILE_NAMES) {
       let handle = existing.get(name);
@@ -447,7 +540,7 @@ async function openFiles(directory: OpfsDirectoryLike, location: string): Promis
       }
       ordered.push(handle);
     }
-    const [log, data, root0, root1, scratch, epochFile, metadata, metadataIndex, spillMetadata] =
+    const [log, data, root0, root1, scratch, , metadata, metadataIndex, spillMetadata] =
       ordered as [
         SyncFile,
         SyncFile,
@@ -459,12 +552,11 @@ async function openFiles(directory: OpfsDirectoryLike, location: string): Promis
         SyncFile,
         SyncFile,
       ];
-    const unused = [log, data, root0, root1].every((file) => file.getSize() === 0);
-    const epoch = nextEpoch(new QuotaMappedFile(epochFile, () => false), unused);
     return {
       files: { log, data, roots: [root0, root1], metadata, metadataIndex, spillMetadata },
       scratch,
-      epoch,
+      identity: next,
+      epochFile: new QuotaMappedFile(epochFile, () => false),
       handles,
     };
   } catch (error) {
@@ -484,25 +576,102 @@ export function createOpfsBackend(options: OpfsBackendOptions): StorageBackend {
   return {
     fence: "handle",
     async acquire(acquire: AcquireOptions = {}): Promise<OwnerLease> {
-      const { lock, fence } = await acquireFenced(
+      const inspect = async (): Promise<OwnerIdentity> => {
+        await refuseLegacyOpfs(options.directory, options.name, OPFS_FILE_NAMES);
+        try {
+          await checkExistingFormats(options.directory);
+          let handle: OpfsFileHandleLike;
+          try {
+            handle = await options.directory.getFileHandle("epoch", { create: false });
+          } catch (error) {
+            if (errorName(error) === "NotFoundError") return EMPTY_IDENTITY;
+            throw error;
+          }
+          if (handle.getFile !== undefined) {
+            const blob = await handle.getFile();
+            const slots = await Promise.all(
+              [0, 1].map(async (slot) =>
+                decodeOwnerIdentity(
+                  new Uint8Array(
+                    await blob
+                      .slice(
+                        slot * EPOCH_SLOT_BYTES,
+                        slot * EPOCH_SLOT_BYTES + OWNER_IDENTITY_BYTES,
+                      )
+                      .arrayBuffer(),
+                  ),
+                ),
+              ),
+            );
+            return chooseIdentity(slots, await existingUnused(options.directory)).identity;
+          }
+          const file = await handle.createSyncAccessHandle();
+          try {
+            return readIdentity(file, await existingUnused(options.directory)).identity;
+          } finally {
+            closeAll([file]);
+          }
+        } catch (error) {
+          if (!isBusyError(error)) throw error;
+          // Some engines deny even read-only Blob snapshots while a SAH is held. A names
+          // snapshot supplies only the immutable target hint; owned handles still do the CAS.
+          const hinted = identityFromNames(options.name, (await options.locks.query?.()) ?? []);
+          if (hinted === undefined)
+            throw new OwnerUnresponsiveError(acquire.timeoutMs ?? DEFAULT_ACQUIRE_TIMEOUT_MS);
+          return hinted;
+        }
+      };
+      const { authority, opened } = await acquireNative(
         options.locks,
-        `minnow:${options.name}`,
-        () => openFiles(options.directory, options.name),
-        (opened) => {
-          closeAll(opened.handles);
+        options.name,
+        inspect,
+        async (expected, next, deadline) => {
+          const beforeMutation = () => {
+            if (Date.now() > deadline)
+              throw new OwnerUnresponsiveError(acquire.timeoutMs ?? DEFAULT_ACQUIRE_TIMEOUT_MS);
+          };
+          let delay = 1;
+          for (;;) {
+            requireIdentity(await inspect(), expected);
+            beforeMutation();
+            try {
+              return await openFiles(
+                options.directory,
+                options.name,
+                expected,
+                next,
+                beforeMutation,
+              );
+            } catch (error) {
+              if (!isBusyError(error)) throw error;
+              // A busy open can outlive the pre-fence snapshot while a healthy owner recovers.
+              requireIdentity(await inspect(), expected);
+              beforeMutation();
+              await new Promise<void>((resolve) => {
+                setTimeout(resolve, delay);
+              });
+              delay = Math.min(delay * 2, 100);
+            }
+          }
         },
+        (files) => closeAll(files.handles),
         acquire,
       );
-      const lease = new OpfsLease(lock, fence, options.observe ?? null);
+      const lease = new OpfsLease(authority, opened, options.observe ?? null);
       leases.add(lease);
       return lease;
     },
     async open(lease: OwnerLease): Promise<StoreSession> {
       const owned = own(lease);
       owned.guard();
-      return new FileStoreSession(owned.files, owned.epoch, () => {
-        owned.guard();
-      });
+      return new FileStoreSession(
+        owned.files,
+        owned.epoch,
+        () => {
+          owned.guard();
+        },
+        owned.publication,
+      );
     },
     scratch(lease: OwnerLease): ScratchSpace {
       const owned = own(lease);
@@ -519,6 +688,7 @@ export function createOpfsBackend(options: OpfsBackendOptions): StorageBackend {
 
 /** The slice of `navigator.locks` the adapter uses. */
 export interface WebLocksLike {
+  query?(): Promise<{ held?: ReadonlyArray<{ name?: string }> }>;
   request(
     name: string,
     options: { steal?: boolean; signal?: AbortSignal },
@@ -534,6 +704,14 @@ export interface WebLocksLike {
  */
 export function webLocks(locks: WebLocksLike): LockManagerLike {
   return {
+    ...(locks.query === undefined
+      ? {}
+      : {
+          query: async () =>
+            (await locks.query?.())?.held?.flatMap(({ name }) =>
+              name === undefined ? [] : [name],
+            ) ?? [],
+        }),
     request(name, { steal, signal }) {
       return new Promise<HeldLock>((resolve, reject) => {
         const lost = new AbortController();

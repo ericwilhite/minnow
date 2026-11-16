@@ -49,6 +49,15 @@ it.each([17, 8193])(
   "opens %i physical records without bulk enumeration and continues writing",
   async (count) => {
     const factory = new IDBFactory();
+    // A real native image has an ownership fence before its first payload record.
+    // Keep initialization outside the lazy-open request counters below.
+    const bootstrap = createIndexedDbBackend({
+      name: "lazy",
+      locks: new SimLocks(),
+      database: () => openIndexedDb(factory, "lazy"),
+    });
+    const initial = await bootstrap.acquire();
+    await initial.release();
     const db = await openIndexedDb(factory, "lazy");
     await db.transaction(
       ["data", "data-index", "log", "log-index"],
