@@ -169,6 +169,7 @@ export class NativePrimaryAdapter {
           () => {
             this.scope.commandBudget(token.command);
           },
+          token.command.id,
         );
       } finally {
         this.#prepared = null;

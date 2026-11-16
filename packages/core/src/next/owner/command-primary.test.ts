@@ -15,6 +15,7 @@ import {
   NATIVE_BOUNDARY_REFERENCE_REACH,
   NATIVE_PRIMARY_IMAGE_WIDTH_REACH,
   NATIVE_PRIMARY_FTS_REACH,
+  NATIVE_COMMAND_UNDO_REACH,
 } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { currentEngine } from "../../testing/differential-current.js";
@@ -32,6 +33,7 @@ import { RegistryImages } from "./registry-images.js";
 import type { AcceptedCommandRow } from "./registry-commands.js";
 import { WritePathImpl } from "../write/engine.js";
 import { yieldTask } from "../task.js";
+import type { CommandToken } from "../access/statement-command.js";
 import { ftsDef } from "../access/fts-def.js";
 import { ftsMutationScan } from "../write/fts-undo.js";
 import {
@@ -75,6 +77,7 @@ async function fixture(
   actionCount = 0,
   reference = false,
   fts = false,
+  frames = 1,
 ) {
   const h = new Harness("strict", "memory", 256),
     path = fts ? await openFtsHarness(h) : await h.open();
@@ -188,7 +191,7 @@ async function fixture(
     });
   const commands = new RegistryCommands({
       rootId: 61,
-      frames: 1,
+      frames,
       rowEvents: actionCount,
       directory,
       charge: root,
@@ -218,7 +221,7 @@ async function fixture(
   });
   let referentialWork: NativeCommandExecutionScope["runReferential"] | null = null;
   const execution = new NativeCommandExecution({
-    frames: 1,
+    frames,
     catalog: statement.catalog,
     commands,
     images,
@@ -316,6 +319,7 @@ async function fixture(
       key: number,
       n: number | null,
       payload: string | null = "changed",
+      owner: CommandToken = command,
     ) {
       const old =
           before === null ? null : batch(ints([before + 1]), ints([before + 1]), texts(["seed"])),
@@ -332,7 +336,7 @@ async function fixture(
       if (sizing.describe) await sizing.describe(ref, widths, signal);
       else widths[2] = next ? 7 : 0;
       const token = await primary.prepare(
-        command,
+        owner,
         id,
         event,
         before === null ? null : firstNative + before,
@@ -348,7 +352,7 @@ async function fixture(
         leases--;
       }
       const accepted: AcceptedCommandRow = {
-        command,
+        command: owner,
         tableId: id,
         event,
         images: ref,
@@ -1470,4 +1474,103 @@ for (const seed of seedsFor("next-native-primary-fts", [0xb61b, 0xb61c]))
       await shipped.close();
       await pg.close();
     }
+  }, 120000);
+
+for (const seed of seedsFor("next-native-command-undo", [0xb61f, 0xb620]))
+  it(`fences funded native append ranges by command identity ${String(seed)}`, async () => {
+    const reach = createReach("native command undo", NATIVE_COMMAND_UNDO_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 2, max: 6 }),
+        fc.integer({ min: 1, max: 3 }),
+        fc.constantFrom("commit", "rollback", "savepoint"),
+        async (rounds, rows, mode) => {
+          reach.beginHistory();
+          const f = await fixture(1, false, false, undefined, undefined, 0, false, false, 3),
+            runs: Array<{ command: number; count: number }> = [],
+            expected: Array<readonly unknown[]> = [[1, 1, "seed"]];
+          let reservations = 0,
+            key = 100;
+          const reserve = f.tx.reserveFtsRowUndo.bind(f.tx),
+            release = f.tx.releaseFtsRowUndo.bind(f.tx),
+            r = vi.spyOn(f.tx, "reserveFtsRowUndo").mockImplementation(() => {
+              reserve();
+              reservations++;
+            }),
+            d = vi.spyOn(f.tx, "releaseFtsRowUndo").mockImplementation(() => {
+              release();
+              reservations--;
+            });
+          const append = async (owner: CommandToken, n: number) => {
+            for (let i = 0; i < n; i++) {
+              await f.write("insert", null, key, 2, "command", owner);
+              expected.push([key++, 2, "command"]);
+              const last = runs.at(-1);
+              if (last?.command === owner.id) last.count++;
+              else runs.push({ command: owner.id, count: 1 });
+              const actual = f.tx.undo.filter((e) => e.kind === "rows");
+              expect(
+                actual.map((e) => e.count),
+                "one append undo range belongs to one native command",
+              ).toEqual(runs.map((run) => run.count));
+              expect(reservations, "one FTS reservation per retained command range").toBe(
+                actual.length,
+              );
+              expect(actual.every((e) => e.ftsKeyed === false)).toBe(true);
+            }
+          };
+          const finish = async (owner: CommandToken) => {
+            await f.execution.verifyCommandUnique(owner, f.signal);
+            await f.execution.verifyCommandReferences(owner, f.signal);
+          };
+          try {
+            for (let round = 0; round < rounds; round++) {
+              await append(f.command, 1);
+              const body = f.commands.beginCommand(2, 0);
+              await append(body, rows);
+              const nested = f.commands.beginCommand(3, -1);
+              await append(nested, rows);
+              await finish(nested);
+              await append(body, rows);
+              await finish(body);
+              const again = f.commands.beginCommand(2, 0);
+              await append(again, rows);
+              await finish(again);
+              await append(f.command, 1);
+            }
+            await f.statement.end(f.signal);
+            await f.settle(mode === "rollback" ? "requested rollback" : null, mode === "savepoint");
+            expect(await f.rows()).toEqual(mode === "commit" ? expected : [[1, 1, "seed"]]);
+            // Commit drops undo and refunds its aggregate slot budget directly;
+            // rollback visits releaseFtsRowUndo per entry. The live-range assertions
+            // above establish the aggregate's cardinality; owner close checks its ledger.
+            if (mode !== "commit")
+              expect(reservations, "rollback retires every command slot").toBe(0);
+            expect(f.tx.undo).toHaveLength(0);
+            reach.reach(mode);
+            reach.reach("root/body/nested");
+            reach.reach("reused frame slots");
+            reach.reach("returned parent command");
+            reach.reach("sequential bodies reuse frame");
+            reach.reach("ordinary insert flags");
+            if (rows > 1) reach.reach("coalesced same-command rows");
+          } finally {
+            r.mockRestore();
+            d.mockRestore();
+            await f.close();
+          }
+          reach.reach("zero ownership");
+        },
+      ),
+      {
+        seed,
+        numRuns: 12,
+        examples: [
+          [2, 2, "commit"],
+          [3, 3, "rollback"],
+          [4, 1, "savepoint"],
+        ],
+      },
+    );
+    reach.assertReached();
   }, 120000);

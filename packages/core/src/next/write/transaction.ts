@@ -1339,6 +1339,7 @@ export class TableWriterImpl implements TableWriter {
   // a row effect per input for the bounded commit encoder's repeated passes.
   #lastRowsUndo = -1;
   #lastRowsCatalog = -1;
+  #lastRowsCommand = 0;
   /** Indexes of other tables' foreign keys that reference this table's keys. */
   readonly #referenced: ReadonlySet<number>;
 
@@ -1416,9 +1417,12 @@ export class TableWriterImpl implements TableWriter {
     changed: readonly number[] | null,
     signal: AbortSignal,
     checkCommand: () => void,
+    commandId: number,
   ): Promise<number | null> {
     this.statement.checkCommandPrimary(commands);
     checkCommand();
+    if (!Number.isSafeInteger(commandId) || commandId < 1)
+      throw new TypeError("Invalid native row command identity");
     this.statement.beginMutation();
     const ids = this.def.columns.map((column) => column.id);
     if ((event !== "insert") !== (old !== null) || (event !== "delete") !== (next !== null))
@@ -1466,9 +1470,15 @@ export class TableWriterImpl implements TableWriter {
     }
     let inserted: number | null = null;
     if (next)
-      await this.#insertRows(next.columns, { rows: null, from: 0, count: 1 }, true, (rowId) => {
-        inserted = rowId;
-      });
+      await this.#insertRows(
+        next.columns,
+        { rows: null, from: 0, count: 1 },
+        true,
+        (rowId) => {
+          inserted = rowId;
+        },
+        commandId,
+      );
     signal.throwIfAborted();
     if (event !== "insert") this.statement.noteFtsMutation(this.tableId, event);
     return inserted;
@@ -1782,6 +1792,7 @@ export class TableWriterImpl implements TableWriter {
     plan: RowPlan,
     command = false,
     inserted?: (rowId: number) => void,
+    commandId = 0,
   ): MaybePromise<void> {
     const tx = this.statement.tx,
       seq = this.statement.seq;
@@ -1810,7 +1821,8 @@ export class TableWriterImpl implements TableWriter {
           previous.statement === this.statement.ordinal &&
           previous.memtable === memtable &&
           previous.before + previous.count === before &&
-          this.#lastRowsCatalog === this.statement.catalog.version;
+          this.#lastRowsCatalog === this.statement.catalog.version &&
+          this.#lastRowsCommand === commandId;
         // FTS reserves one embedded flag per retained entry, not per append. An
         // extension keeps its funded flag (including true) and needs no new slot.
         if (!coalesce) tx.reserveFtsRowUndo();
@@ -1826,6 +1838,7 @@ export class TableWriterImpl implements TableWriter {
         } else {
           this.#lastRowsUndo = tx.undo.length;
           this.#lastRowsCatalog = this.statement.catalog.version;
+          this.#lastRowsCommand = commandId;
           tx.undo.push({
             kind: "rows",
             ftsKeyed: false,

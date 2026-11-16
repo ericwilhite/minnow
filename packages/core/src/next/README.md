@@ -4221,6 +4221,9 @@ its wait on independently owned committed maintenance; staging remains fenced to
 A weak completion cache prevents cancelled waits from retaining command reaction lists.
 
 This is a staged internal API, with synthetic final controller callbacks in its native tests.
+Native append undo ranges coalesce only within one command identity, including when body
+frames are reused. Each retained range keeps one funded FTS flag; registry checkpoints
+remain independent of undo-array positions.
 Accepted native-primary UPDATE/DELETE calls preserve the same FTS mutation notifications,
 funded row undo and atomic WAL history as legacy writers. Ordinary INSERT keeps insert deltas;
 rollback and savepoints retire this history with the rows.

@@ -8585,3 +8585,17 @@ export const NATIVE_CHILD_CAPTURE_REACH = [
   "released cursor",
   "zero ownership",
 ] as const;
+
+/** Native row ranges coalesce inside one command, retaining exactly one funded FTS flag. */
+export const NATIVE_COMMAND_UNDO_REACH = [
+  "commit",
+  "rollback",
+  "savepoint",
+  "root/body/nested",
+  "reused frame slots",
+  "returned parent command",
+  "ordinary insert flags",
+  "coalesced same-command rows",
+  "zero ownership",
+  "sequential bodies reuse frame",
+] as const;
