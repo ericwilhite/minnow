@@ -4221,6 +4221,9 @@ its wait on independently owned committed maintenance; staging remains fenced to
 A weak completion cache prevents cancelled waits from retaining command reaction lists.
 
 This is a staged internal API, with synthetic final controller callbacks in its native tests.
+Accepted native-primary UPDATE/DELETE calls preserve the same FTS mutation notifications,
+funded row undo and atomic WAL history as legacy writers. Ordinary INSERT keeps insert deltas;
+rollback and savepoints retire this history with the rows.
 Its initial preflight refuses auto-increment and wide/variable indexed domains before writes.
 No SQL path installs it yet. The full native trigger/RI provider and compiled body-input host
 remain separate integration work; the existing SQL refusal guards remain in force.

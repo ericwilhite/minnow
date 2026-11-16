@@ -1470,6 +1470,7 @@ export class TableWriterImpl implements TableWriter {
         inserted = rowId;
       });
     signal.throwIfAborted();
+    if (event !== "insert") this.statement.noteFtsMutation(this.tableId, event);
     return inserted;
   }
 

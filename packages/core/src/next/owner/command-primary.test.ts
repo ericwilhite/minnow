@@ -14,6 +14,7 @@ import {
   NATIVE_ACTION_UNIQUE_REACH,
   NATIVE_BOUNDARY_REFERENCE_REACH,
   NATIVE_PRIMARY_IMAGE_WIDTH_REACH,
+  NATIVE_PRIMARY_FTS_REACH,
 } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { currentEngine } from "../../testing/differential-current.js";
@@ -31,6 +32,13 @@ import { RegistryImages } from "./registry-images.js";
 import type { AcceptedCommandRow } from "./registry-commands.js";
 import { WritePathImpl } from "../write/engine.js";
 import { yieldTask } from "../task.js";
+import { ftsDef } from "../access/fts-def.js";
+import { ftsMutationScan } from "../write/fts-undo.js";
+import {
+  openFtsHarness,
+  ftsParts,
+  lastFtsCommit,
+} from "../testing/fts-transaction.test-support.js";
 import { NATIVE_PRIMARY_BYTES } from "../write/primary-command.js";
 import { StatementImpl } from "../write/transaction.js";
 import {
@@ -66,9 +74,10 @@ async function fixture(
   finishGate?: () => Promise<void>,
   actionCount = 0,
   reference = false,
+  fts = false,
 ) {
   const h = new Harness("strict", "memory", 256),
-    path = await h.open();
+    path = fts ? await openFtsHarness(h) : await h.open();
   let id = 0,
     parent = 0,
     parentIndex = 0;
@@ -108,6 +117,13 @@ async function fixture(
           ),
         })
       ).id ?? 0;
+    if (fts) {
+      const columnId = s.catalog.table(id)?.columns[2]?.id;
+      if (!columnId) throw new Error("Missing FTS payload column");
+      const { id: ignored, ...definition } = ftsDef(1, id, columnId);
+      void ignored;
+      await s.changeCatalog({ kind: "createFts", fts: definition });
+    }
   });
   const seed = Array.from({ length: count }, (_, i) => i + 1);
   if (reference) await autocommit(path, (s) => s.table(parent).insert(batch(ints(seed)), null));
@@ -136,7 +152,8 @@ async function fixture(
       minimumBytes: 32 * 1024 * 1024,
       spillable: false,
     });
-  const tx = await path.begin();
+  const tx = await path.begin(),
+    startPoint = tx.savepoint();
   let bound: BoundTableRules | null = null;
   const statement = tx.statement({
     rules: (table) => {
@@ -341,8 +358,9 @@ async function fixture(
       await commands.accept(accepted);
       return accepted;
     },
-    async settle(error: string | null) {
+    async settle(error: string | null, savepoint = false) {
       await dispose();
+      if (savepoint) tx.rollbackTo(startPoint);
       if (error) {
         statement.rollback();
         tx.rollback();
@@ -1307,3 +1325,149 @@ it.each(seedsFor("next-native-boundary-reference", [0xb606]))(
   },
   120000,
 );
+
+for (const seed of seedsFor("next-native-primary-fts", [0xb61b, 0xb61c]))
+  it(`preserves FTS history through accepted native command primaries ${String(seed)}`, async () => {
+    const reach = createReach("native primary FTS", NATIVE_PRIMARY_FTS_REACH),
+      pg = new PGlite(),
+      shipped = await currentEngine("memory");
+    await pg.waitReady;
+    const reference = async (sql: string) => {
+      await pg.exec(sql);
+      await shipped.run({ kind: "sql", sql });
+    };
+    try {
+      await fc.assert(
+        fc.asyncProperty(
+          fc.constantFrom("insert", "update", "delete"),
+          fc.constantFrom("commit", "rollback", "savepoint"),
+          fc.integer({ min: 1, max: 9 }),
+          fc.boolean(),
+          async (event, mode, count, published) => {
+            reach.beginHistory();
+            const f = await fixture(count, published, false, undefined, undefined, 0, false, true);
+            const notes: string[] = [];
+            const nativeNote = f.statement.noteFtsMutation.bind(f.statement);
+            const spy = vi
+              .spyOn(f.statement, "noteFtsMutation")
+              .mockImplementation((table, kind) => {
+                expect(table).toBe(f.id);
+                notes.push(kind);
+                nativeNote(table, kind);
+              });
+            try {
+              await reference("DROP TABLE IF EXISTS t");
+              await reference(
+                "CREATE TABLE t(id INT PRIMARY KEY,n INT NOT NULL,payload TEXT,CONSTRAINT positive CHECK(n>0))",
+              );
+              await reference(
+                `INSERT INTO t VALUES ${Array.from({ length: count }, (_, i) => `(${String(i + 1)},${String(i + 1)},'seed')`).join(",")}`,
+              );
+              await reference("BEGIN");
+              await reference("SAVEPOINT s");
+              const before = structuredClone(f.path.state().root.fts);
+              const last = f.tx.baseLsn;
+              const key = event === "insert" ? count + 1 : 1;
+              await f.write(event, event === "insert" ? null : 0, key, count + 100, "after");
+              expect(notes, "accepted primary notifies shared FTS history").toEqual(
+                event === "insert" ? [] : [event],
+              );
+              expect(
+                [...ftsMutationScan(f.tx)].filter((e) => e !== null).map((e) => e.tableId),
+                "native primary mutation participates in ordinary undo scan",
+              ).toEqual(event === "insert" ? [] : [f.id]);
+              await reference(
+                event === "delete"
+                  ? "DELETE FROM t WHERE id=1"
+                  : event === "update"
+                    ? `UPDATE t SET n=${String(count + 100)},payload='after' WHERE id=1`
+                    : `INSERT INTO t VALUES(${String(key)},${String(count + 100)},'after')`,
+              );
+              await f.statement.end(f.signal);
+              await f.settle(
+                mode === "rollback" ? "requested rollback" : null,
+                mode === "savepoint",
+              );
+              if (mode === "rollback") await reference("ROLLBACK");
+              else {
+                if (mode === "savepoint") await reference("ROLLBACK TO SAVEPOINT s");
+                await reference("COMMIT");
+              }
+              if (mode === "commit") {
+                const logged = await lastFtsCommit(f.h);
+                expect(logged.lastLsn).toBeGreaterThan(last);
+                expect(
+                  logged.body.effects.filter((e) => e.kind === "ftsMutation" && e.tableId === f.id),
+                ).toHaveLength(event === "insert" ? 0 : 1);
+                if (event !== "insert")
+                  expect(
+                    (await ftsParts(f.h)).entries.some(
+                      (e) => e.kind === "keyed" && e.tableId === f.id,
+                    ),
+                  ).toBe(true);
+              } else {
+                const pin = f.path.pin();
+                try {
+                  expect(pin.observedLsn).toBe(last);
+                } finally {
+                  pin.release();
+                }
+                expect(f.path.state().root.fts).toEqual(before);
+              }
+              const compare = async () => {
+                const pin = f.h.path.pin();
+                try {
+                  const rows = (await rowsOf(pin, f.id)).sort(
+                      (a, b) => Number(a[0]) - Number(b[0]),
+                    ),
+                    sql = "SELECT * FROM t ORDER BY id";
+                  const expected = (await pg.query<{ id: number; n: number; payload: string }>(sql))
+                    .rows;
+                  expect(rows).toEqual(expected.map((row) => [row.id, row.n, row.payload]));
+                  expect((await shipped.run({ kind: "sql", sql })).rows).toEqual(expected);
+                } finally {
+                  pin.release();
+                }
+              };
+              await compare();
+              await f.path.recycleLog();
+              await f.h.reopen();
+              await compare();
+              reach.reach(event);
+              reach.reach(mode);
+              reach.reach(published ? "published" : "resident");
+              reach.reach("undo and WAL");
+              reach.reach("reopen");
+            } finally {
+              spy.mockRestore();
+              await Promise.allSettled([
+                pg.exec("ROLLBACK"),
+                shipped.run({ kind: "sql", sql: "ROLLBACK" }),
+              ]);
+              await f.close();
+            }
+            reach.reach("zero ownership");
+          },
+        ),
+        {
+          seed,
+          numRuns: 20,
+          examples: [
+            ["insert", "commit", 1, false],
+            ["update", "commit", 3, true],
+            ["delete", "commit", 4, false],
+            ["insert", "rollback", 5, true],
+            ["update", "rollback", 6, false],
+            ["delete", "rollback", 7, true],
+            ["insert", "savepoint", 3, false],
+            ["update", "savepoint", 4, true],
+            ["delete", "savepoint", 5, false],
+          ],
+        },
+      );
+      reach.assertReached();
+    } finally {
+      await shipped.close();
+      await pg.close();
+    }
+  }, 120000);

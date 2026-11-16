@@ -8553,3 +8553,18 @@ export const MODIFY_FTS_PATHS_REACH = [
   "stored",
   "reopen",
 ] as const;
+
+/** The staged native primary capability must preserve ordinary FTS undo/WAL semantics. */
+export const NATIVE_PRIMARY_FTS_REACH = [
+  "insert",
+  "update",
+  "delete",
+  "commit",
+  "rollback",
+  "savepoint",
+  "published",
+  "resident",
+  "undo and WAL",
+  "reopen",
+  "zero ownership",
+] as const;
