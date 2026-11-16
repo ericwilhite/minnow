@@ -14,6 +14,7 @@ import {
 } from "./contract.js";
 import {
   MAX_BLOB_BYTES,
+  ReadDeniedError,
   SpaceFailedError,
   type WriteOptions,
   type BlobRef,
@@ -45,6 +46,17 @@ import { MAX_SLAB } from "./slabs.js";
 import { RootMemory, type RootFrame } from "./root-memory.js";
 import { decodeRootSlot } from "./root-slot.js";
 import { MetadataMutex } from "./metadata-mutex.js";
+import {
+  prepareRetirementInventory,
+  RETIREMENT_PREPARATION_BYTES,
+  type RetirementPreparationContext,
+} from "./retirement-prepare.js";
+import { borrowRetirementInventory } from "./retirement-inventory.js";
+import type {
+  RetirementInput,
+  RetirementOptions,
+  RetirementInventory,
+} from "./retirement-contract.js";
 import { captureAudit, clearCapture, flattenCapture, type AuditCapture } from "./audit-capture.js";
 import { MetadataJournal, MetadataWorkspace } from "./metadata-journal.js";
 import {
@@ -347,6 +359,11 @@ class Space implements ExtentSpace {
   readonly #metadata = new MetadataMutex();
   readonly #auditing = new Mutex();
   readonly #audits = new Set<Promise<void>>();
+  readonly #retirementPreparing = new Set<{
+    readonly stop: AbortController;
+    readonly run: Promise<RetirementInventory>;
+  }>();
+  readonly #retirementInventories = new Set<RetirementInventory>();
   readonly #tickets: RetirementTickets;
   #currentSnapshot: number;
   #previousSnapshot: number;
@@ -822,87 +839,221 @@ class Space implements ExtentSpace {
     while (this.#background.size > 0) await Promise.all([...this.#background]);
   }
 
+  /** No input/observer wait owns the metadata workspace: captureAudit yields it cooperatively. */
+  async prepareRetirements(
+    input: RetirementInput,
+    options: RetirementOptions,
+  ): Promise<RetirementInventory> {
+    this.accepting();
+    options.signal?.throwIfAborted();
+    const budget = options.budget;
+    if (!budget.allocate(RETIREMENT_PREPARATION_BYTES))
+      throw new ReadDeniedError(RETIREMENT_PREPARATION_BYTES);
+    let record:
+      { readonly stop: AbortController; readonly run: Promise<RetirementInventory> } | undefined;
+    try {
+      this.accepting();
+      options.signal?.throwIfAborted();
+      const stop = new AbortController(),
+        signal =
+          options.signal === undefined
+            ? stop.signal
+            : AbortSignal.any([stop.signal, options.signal]);
+      // Register the preparation before user budget/source callbacks can reenter close().
+      const run = Promise.resolve()
+        .then(() =>
+          prepareRetirementInventory(this.#retirementContext(), input, {
+            ...options,
+            signal,
+          }),
+        )
+        .then(async (inventory) => {
+          try {
+            signal.throwIfAborted();
+            this.accepting();
+          } catch (error) {
+            await inventory.release();
+            throw error;
+          }
+          this.#retirementInventories.add(inventory);
+          return inventory;
+        });
+      record = { stop, run };
+      this.#retirementPreparing.add(record);
+      return await run;
+    } catch (error) {
+      if (this.journal.failed) this.fail(error);
+      throw error;
+    } finally {
+      if (record !== undefined) this.#retirementPreparing.delete(record);
+      budget.free(RETIREMENT_PREPARATION_BYTES);
+    }
+  }
+  /** Context methods capture only the space, never caller inputs or source iterators. */
+  #retirementContext(): RetirementPreparationContext {
+    return {
+      owner: this,
+      journal: this.journal,
+      mutex: this.#metadata,
+      check: () => this.usable(),
+      withSlab: (work) => this.#cache.withReadSlab((slab) => work({ slab })),
+      read: (handle, position, target, work) =>
+        this.#metadata.run(() =>
+          this.journal.workspace.run("spool", async () => {
+            work.signal?.throwIfAborted();
+            this.usable();
+            const cursor = await this.journal.cursor(handle, 1, true, position);
+            try {
+              const page = await cursor.next(work);
+              work.signal?.throwIfAborted();
+              this.usable();
+              if (page !== null) target.set(page);
+              return { position: cursor.position, bytes: page?.length ?? 0 };
+            } finally {
+              await cursor.close();
+            }
+          }),
+        ),
+      dispose: (handle) => this.#metadata.run(() => disposeSnapshot(this.journal, handle)),
+      finished: (inventory) => {
+        this.#retirementInventories.delete(inventory);
+      },
+    };
+  }
+
   // ── Publication ──────────────────────────────────────────────────────────────────────────────
 
   async publish(root: Uint8Array, change: PublishChange): Promise<number> {
     this.accepting();
-    if (change.retireCurrentRoot === true && change.retired.length !== 0)
+    if (
+      change.retireCurrentRoot === true &&
+      (change.retired.length !== 0 || change.retiredInventory !== undefined)
+    )
       throw new TypeError(
         "publish: retireCurrentRoot cannot be combined with explicit retirements",
       );
-    return this.#publishing.run(() =>
-      this.#metadata.run(async () => {
-        const budget = change.budget ?? this.#budget;
-        // Codec/callback admission is preparation, outside the final barrier and slab scope.
-        const lease = listLease(root, this.#reachable, budget, change.list);
-        let frame: RootFrame | null = null;
-        let raw = 0,
-          claimed = 0,
-          failed = false;
-        try {
-          frame = await this.roots.copy(root, budget, change);
-          const ownedRoot = frame;
-          if (lease === null)
-            raw = await saveExtentInput(
-              this.journal,
-              rootInput(root, this.#reachable, this, budget, change),
-              this.#reachable.ordered === true,
-              this.#fileLength,
-              change,
-              undefined,
-              true,
-            );
-          if (change.retireCurrentRoot === true) {
+    const borrowed =
+      change.retiredInventory === undefined
+        ? null
+        : borrowRetirementInventory(change.retiredInventory, this, change.budget ?? this.#budget);
+    try {
+      return await this.#publishing.run(() =>
+        this.#metadata.run(async () => {
+          const budget = change.budget ?? this.#budget;
+          // Codec/callback admission is preparation, outside the final barrier and slab scope.
+          const lease = listLease(root, this.#reachable, budget, change.list);
+          let frame: RootFrame | null = null;
+          let raw = 0,
+            claimed = 0,
+            arrayClaims = 0,
+            orderedArrayClaims = 0,
+            combinedClaims = 0,
+            failed = false;
+          try {
+            frame = await this.roots.copy(root, budget, change);
+            const ownedRoot = frame;
+            if (lease === null)
+              raw = await saveExtentInput(
+                this.journal,
+                rootInput(root, this.#reachable, this, budget, change),
+                this.#reachable.ordered === true,
+                this.#fileLength,
+                change,
+                undefined,
+                true,
+              );
+            if (change.retireCurrentRoot === true) {
+              await this.#ensureInitialSnapshots(change);
+              await this.journal.workspace.run("spool", () =>
+                this.journal.retain(this.#currentSnapshot),
+              );
+              claimed = this.#currentSnapshot;
+            } else if (borrowed !== null) {
+              await this.journal.workspace.run("spool", () => this.journal.retain(borrowed.handle));
+              claimed = borrowed.handle;
+              if (change.retired.length > 0) {
+                arrayClaims = await saveExtentInput(
+                  this.journal,
+                  change.retired,
+                  false,
+                  Infinity,
+                  change,
+                  undefined,
+                  true,
+                );
+                await this.#cache.withReadSlab(async (slab) => {
+                  const io = { slab };
+                  orderedArrayClaims = await pairPhase(this.journal, io, "merge", (slots) =>
+                    sortExtents(this.journal, arrayClaims, "refuse", change, slots),
+                  );
+                  combinedClaims = await pairPhase(this.journal, io, "merge", (slots) =>
+                    mergeExtents(
+                      this.journal,
+                      claimed,
+                      orderedArrayClaims,
+                      "union",
+                      change,
+                      "refuse",
+                      slots,
+                    ),
+                  );
+                  await disposeSnapshot(this.journal, claimed);
+                  claimed = combinedClaims;
+                  combinedClaims = 0;
+                });
+              }
+            } else {
+              claimed = await saveExtentInput(
+                this.journal,
+                (function* () {
+                  for (const extent of change.retired) {
+                    if (!Number.isSafeInteger(extent.length) || extent.length <= 0)
+                      throw new RangeError("publish: retirement is not an extent");
+                    yield {
+                      offset: extent.offset,
+                      length: Math.ceil(extent.length / DATA_ALIGN) * DATA_ALIGN,
+                    };
+                  }
+                })(),
+                false,
+                Infinity,
+                change,
+                undefined,
+                true,
+              );
+            }
             await this.#ensureInitialSnapshots(change);
-            await this.journal.workspace.run("spool", () =>
-              this.journal.retain(this.#currentSnapshot),
+            return await this.#cache.withReadSlab((slab) =>
+              this.mutate((guard) =>
+                this.#publishNow(
+                  ownedRoot,
+                  change,
+                  lease?.list ?? null,
+                  raw,
+                  claimed,
+                  { slab },
+                  guard,
+                ),
+              ),
             );
-            claimed = this.#currentSnapshot;
-          } else {
-            claimed = await saveExtentInput(
+          } catch (error) {
+            failed = true;
+            if (this.journal.failed) this.fail(error);
+            throw error;
+          } finally {
+            if (frame !== null && frame !== this.#rootFrame) frame.release();
+            lease?.release();
+            await discardPrepared(
               this.journal,
-              (function* () {
-                for (const extent of change.retired) {
-                  if (!Number.isSafeInteger(extent.length) || extent.length <= 0)
-                    throw new RangeError("publish: retirement is not an extent");
-                  yield {
-                    offset: extent.offset,
-                    length: Math.ceil(extent.length / DATA_ALIGN) * DATA_ALIGN,
-                  };
-                }
-              })(),
-              false,
-              Infinity,
-              change,
-              undefined,
-              true,
+              [raw, claimed, arrayClaims, orderedArrayClaims, combinedClaims],
+              failed,
             );
           }
-          await this.#ensureInitialSnapshots(change);
-          return await this.#cache.withReadSlab((slab) =>
-            this.mutate((guard) =>
-              this.#publishNow(
-                ownedRoot,
-                change,
-                lease?.list ?? null,
-                raw,
-                claimed,
-                { slab },
-                guard,
-              ),
-            ),
-          );
-        } catch (error) {
-          failed = true;
-          if (this.journal.failed) this.fail(error);
-          throw error;
-        } finally {
-          if (frame !== null && frame !== this.#rootFrame) frame.release();
-          lease?.release();
-          await discardPrepared(this.journal, [raw, claimed], failed);
-        }
-      }),
-    );
+        }),
+      );
+    } finally {
+      borrowed?.release();
+    }
   }
 
   async #publishNow(
@@ -1362,6 +1513,11 @@ class Space implements ExtentSpace {
     return (this.#closePromise = this.#closeNow());
   }
   async #closeNow(): Promise<void> {
+    for (const preparation of this.#retirementPreparing)
+      preparation.stop.abort(new StoreClosedError());
+    // Stop descriptor readers now; each inventory independently fences accepted publications.
+    for (const inventory of this.#retirementInventories)
+      void inventory.release().catch((error: unknown) => this.fail(error));
     await this.#publishing.run(async () => undefined);
     // Await busy operations outside the barrier: a queued seal/abort needs it to finish.
     for (const writer of this.writers) {
@@ -1375,6 +1531,10 @@ class Space implements ExtentSpace {
     await this.settled();
     await this.#mutations.run(async () => undefined);
     for (const audit of this.#audits) await audit.catch(() => undefined);
+    for (const preparation of this.#retirementPreparing)
+      await preparation.run.catch(() => undefined);
+    for (const inventory of this.#retirementInventories)
+      await inventory.release().catch((error: unknown) => this.fail(error));
     await this.#metadata.run(async () => undefined);
     await this.#cache.settled();
     this.#closed = true;

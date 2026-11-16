@@ -1,3 +1,4 @@
+import type { RetirementInventory } from "../storage/retirement-contract.js";
 import { FtsMutations, type FtsMutationCommit } from "./fts-mutations.js";
 import { ftsMutationScan } from "./fts-undo.js";
 import { checkpointFtsMutations } from "./fts-mutation-checkpoint.js";
@@ -124,7 +125,7 @@ import {
   type TableStatistics,
 } from "../format/manifest.js";
 import { Replayer, type Effect } from "../format/replay.js";
-import { walkReachable } from "../format/reachable.js";
+import { walkReachable, type ManifestReader } from "../format/reachable.js";
 import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
 import { OBJECT_OVERHEAD_BYTES, type Grant, type Loan } from "../memory/governor.js";
 import { CommandMaintenance, waitCommandMaintenance } from "./command-wait.js";
@@ -882,7 +883,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         } catch (error) {
           failed = error;
         } finally {
-          delta.settle();
+          await delta.settle();
         }
         // A sink that failed to settle is the open's failure, as it is the write path's later.
         if (sink.failure !== null) throw sink.failure;
@@ -2612,20 +2613,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#check();
       // An earlier unclaimed preparation is not a committed delta. Retire only its own tree;
       // checkpoint pages and claimed preparations remain reached from the committed chain.
-      if (root.fts.staged !== null) {
-        for await (const event of walkFtsJournal(
-          root.fts.staged,
-          false,
-          this.#metadataBudget,
-          this.#space,
-          this.#commitAbort.signal,
-        ))
-          delta.retireFts(retired, event.ref.extent);
-      }
+      if (root.fts.staged !== null) delta.retireFts(root.fts.staged);
       root = this.#carryRootTracking(root, { ...root, fts: { ...root.fts, staged: prepared } });
       const publicationWriter = writer;
-      root = await this.#listed(root, (sequence) =>
-        delta.prepare(sequence, publicationWriter, retired),
+      root = await this.#listed(
+        root,
+        (sequence) => delta.prepare(sequence, publicationWriter, retired),
+        delta,
       );
       this.#check();
       const encoded = encodeManifestRoot(root),
@@ -2668,7 +2662,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         retryCompact = true;
       else throw error;
     } finally {
-      delta.settle();
+      await delta.settle();
       if (madeRoot) this.#releaseRoot(madeRoot);
       unlock?.();
       // eslint-disable-next-line no-useless-assignment -- drop sealed descriptor references before refund or retry
@@ -3687,7 +3681,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
         new Map([[state.tableId, tableRoot]]),
         delta,
       );
-      root = await this.#listed(root, (sequence) => delta.prepare(sequence, writer, retired));
+      root = await this.#listed(
+        root,
+        (sequence) => delta.prepare(sequence, writer, retired),
+        delta,
+      );
       const rootBytes = encodeManifestRoot(root);
       // The resident state this publish adds (page index growth, the new root) is charged first.
       // The pending publication owns both charges across the await (review B3-p2a-3 #3): they
@@ -3795,7 +3793,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     } finally {
       for (const output of outputs) output.release();
       if (definitionCharge > 0) this.#chargeMetadata(-definitionCharge);
-      delta.settle();
+      await delta.settle();
       created?.releaseCreation();
       pinned?.release();
       if (madeRoot !== null) this.#releaseRoot(madeRoot);
@@ -4113,7 +4111,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
       }
       let root = await this.#nextRoot(writer, retired, changed, delta);
       this.#check();
-      root = await this.#listed(root, (sequence) => delta.prepare(sequence, writer, retired));
+      root = await this.#listed(
+        root,
+        (sequence) => delta.prepare(sequence, writer, retired),
+        delta,
+      );
       this.#check();
       const bytes = encodeManifestRoot(root);
       const charge = parseCharge(bytes.length);
@@ -4138,7 +4140,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (writer.state === "open") await writer.abort().catch(() => undefined);
       throw error;
     } finally {
-      delta.settle();
+      await delta.settle();
       if (madeRoot !== null) this.#releaseRoot(madeRoot);
       for (const output of outputs) output.release();
       if (!installed) {
@@ -4446,7 +4448,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
       }
       const released: ExtentRef[] = [];
       let root = await this.#nextRoot(writer, released, new Map(), delta);
-      root = await this.#listed(root, (sequence) => delta.prepare(sequence, writer, released));
+      root = await this.#listed(
+        root,
+        (sequence) => delta.prepare(sequence, writer, released),
+        delta,
+      );
       const bytes = encodeManifestRoot(root);
       const charge = parseCharge(bytes.length);
       this.#chargeMetadata(charge);
@@ -4462,7 +4468,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (writer.state === "open") await writer.abort().catch(() => undefined);
       throw error;
     } finally {
-      delta.settle();
+      await delta.settle();
       if (madeRoot !== null) this.#releaseRoot(madeRoot);
       unlock();
     }
@@ -4634,7 +4640,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
       )
         throw new RangeError("A log recycle's root does not cover the log it would reset");
       const recycling = writer;
-      root = await this.#listed(root, (sequence) => delta.prepare(sequence, recycling, retired));
+      root = await this.#listed(
+        root,
+        (sequence) => delta.prepare(sequence, recycling, retired),
+        delta,
+      );
       const rootBytes = encodeManifestRoot(root);
       const rootCharge = parseCharge(rootBytes.length);
       this.#chargeMetadata(rootCharge);
@@ -4665,7 +4675,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (!switched) this.#appender.abandonRecycle();
       else if (this.#appender.recycling)
         this.#appender.failRecycle(new Error("The log reset after a recycle's publish failed"));
-      delta.settle();
+      await delta.settle();
       if (madeRoot !== null) this.#releaseRoot(madeRoot);
       unlock?.();
       this.#maintenanceHolds = false;
@@ -4875,7 +4885,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
         new Map([[state.tableId, tableRoot]]),
         delta,
       );
-      next = await this.#listed(next, (sequence) => delta.prepare(sequence, writer, retired));
+      next = await this.#listed(
+        next,
+        (sequence) => delta.prepare(sequence, writer, retired),
+        delta,
+      );
       const rootBytes = encodeManifestRoot(next);
       const rootCharge = parseCharge(rootBytes.length);
       this.#chargeMetadata(rootCharge);
@@ -4917,7 +4931,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       throw error;
     } finally {
       this.#merging = false;
-      delta.settle();
+      await delta.settle();
       if (madeRoot !== null) this.#releaseRoot(madeRoot);
       unlock?.();
       output?.release();
@@ -5167,14 +5181,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       fts = { checkpoint, staged: null };
       ftsThrough = pending.lsn;
     } else if (this.#ftsUnclaimed && fts.staged !== null) {
-      for await (const event of walkFtsJournal(
-        fts.staged,
-        false,
-        this.#metadataBudget,
-        this.#space,
-        this.#commitAbort.signal,
-      ))
-        publication.retireFts(retired, event.ref.extent);
+      publication.retireFts(fts.staged);
       fts = { ...fts, staged: null };
     }
     const inlineThrough = Math.min(this.#ftsMutations?.appliedLsn ?? 0, this.durableLsn);
@@ -5374,7 +5381,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
   async #listed(
     root: ManifestRoot,
     prepare: (sequence: number) => Promise<ExtentList>,
+    publication: DeltaPublication,
   ): Promise<ManifestRoot> {
+    await publication.prepareFtsRetirements(
+      this.#space,
+      root,
+      manifestReader(this.#metadata, this.#metadataBudget),
+      this.#metadataBudget,
+      this.#commitAbort.signal,
+    );
     return this.#carryRootTracking(root, {
       ...root,
       extentList: await prepare(root.sequence),
@@ -5642,12 +5657,52 @@ export class ExtentSinkError extends Error {
  * `ExtentSinkError`) without undoing the install, retrying, or skipping the publisher's cleanup.
  */
 class DeltaPublication {
-  #ftsRetireBytes = 0;
-  retireFts(retired: ExtentRef[], extent: ExtentRef): void {
-    if (retired.some((old) => sameExtent(old, extent))) return;
-    if (!this.budget.allocate(128)) throw new ParseBudgetError(128);
-    this.#ftsRetireBytes += 128;
-    retired.push({ offset: extent.offset, length: extent.length });
+  #retirementInventory: RetirementInventory | undefined;
+  // At most the old unclaimed root and the root replaced by preparation in one publication.
+  // Pages stream later, once the NEW root's complete retained references are fixed.
+  #ftsRetireHeads: BlobRef[] | undefined;
+  #ftsInventory: RetirementInventory | undefined;
+  retireFts(ref: BlobRef): void {
+    if ((this.#ftsRetireHeads?.length ?? 0) >= 2)
+      throw new Error("Too many FTS heads in one publication");
+    if (this.#ftsRetireHeads === undefined) {
+      if (!this.budget.allocate(512)) throw new ParseBudgetError(512);
+      this.#ftsRetireHeads = [];
+    }
+    this.#ftsRetireHeads.push({
+      extent: { offset: ref.extent.offset, length: ref.extent.length },
+      offset: ref.offset,
+      length: ref.length,
+      checksum: ref.checksum,
+    });
+  }
+
+  async prepareFtsRetirements(
+    space: Space,
+    root: ManifestRoot,
+    reader: ManifestReader,
+    budget: ByteBudget,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (this.#ftsRetireHeads === undefined) return;
+    if (this.#ftsInventory !== undefined) throw new Error("FTS retirement prepared twice");
+    const heads = this.#ftsRetireHeads;
+    async function* candidates() {
+      for (const head of heads)
+        for await (const event of walkFtsJournal(head, false, budget, space, signal))
+          yield event.ref;
+    }
+    async function* retained() {
+      for await (const event of walkReachable(root, reader, { concurrency: 1 })) {
+        signal.throwIfAborted();
+        yield "checksum" in event.ref ? event.ref : event.ref.extent;
+      }
+    }
+    this.#ftsInventory = await space.prepareRetirements(candidates(), {
+      budget,
+      retained: retained(),
+      signal,
+    });
   }
 
   #attempt: number | null = null;
@@ -5674,7 +5729,16 @@ class DeltaPublication {
    * added to `retired`) and returns it for the root; then tells the sink, if any, the attempt's
    * whole delta (the list pages included, so `added`/`released` stay exact for a full walk).
    */
-  async prepare(sequence: number, writer: ExtentWriter, retired: ExtentRef[]): Promise<ExtentList> {
+  async prepare(
+    sequence: number,
+    writer: ExtentWriter,
+    retired: ExtentRef[],
+    inventory?: RetirementInventory,
+  ): Promise<ExtentList> {
+    if (inventory !== undefined && this.#ftsInventory !== undefined)
+      throw new Error("Publication supplied two retirement inventories");
+    inventory ??= this.#ftsInventory;
+    this.#retirementInventory = inventory;
     const attempt = this.nextAttempt();
     this.#attempt = attempt;
     this.#sequence = sequence;
@@ -5683,6 +5747,7 @@ class DeltaPublication {
       prepared = await this.lists.prepare(attempt, {
         added: writer.extents,
         released: retired,
+        ...(inventory === undefined ? {} : { releasedInventory: inventory }),
         writer,
       });
     } catch (error) {
@@ -5700,6 +5765,7 @@ class DeltaPublication {
         result = await this.sink.prepare(attempt, {
           added: writer.extents,
           released: retired,
+          ...(inventory === undefined ? {} : { releasedInventory: inventory }),
           writer,
         });
       } catch (error) {
@@ -5728,6 +5794,9 @@ class DeltaPublication {
     await space.publish(root, {
       writers: [writer],
       retired,
+      ...(this.#retirementInventory === undefined
+        ? {}
+        : { retiredInventory: this.#retirementInventory }),
       list: this.#preparedList,
       budget: this.budget,
     });
@@ -5735,13 +5804,23 @@ class DeltaPublication {
   }
 
   /** Commits (durable) or aborts the attempt, once. Never throws: a sink failure fails the path. */
-  settle(): void {
+  async settle(): Promise<void> {
     try {
       this.#settle();
     } finally {
-      const charge = this.#ftsRetireBytes;
-      this.#ftsRetireBytes = 0;
-      if (charge) this.budget.free(charge);
+      this.#retirementInventory = undefined;
+      const inventory = this.#ftsInventory;
+      this.#ftsInventory = undefined;
+      try {
+        await inventory?.release();
+      } catch (error) {
+        this.fail(new ExtentSinkError(error));
+      } finally {
+        const charged = this.#ftsRetireHeads !== undefined;
+        if (this.#ftsRetireHeads) this.#ftsRetireHeads.length = 0;
+        this.#ftsRetireHeads = undefined;
+        if (charged) this.budget.free(512);
+      }
     }
   }
   #settle(): void {

@@ -9141,3 +9141,82 @@ export const SNAPSHOT_FTS_CUT_REACH = [
   "ordinary reopen",
   "zero charges",
 ] as const;
+
+/** B7 arbitrary disk-backed release inventories retain R25/R8 under fixed complete credit. */
+export const BOUNDED_RETIREMENT_REACH = [
+  "large fixed-cap inventory",
+  "reverse source",
+  "multiple replay windows",
+  "previous-root protection",
+  "pin protection after both roots drain",
+  "exactly-once physical release",
+] as const;
+/** Every accepted native retirement read, producer and publication keeps its ownership fence. */
+export const BOUNDED_RETIREMENT_FENCE_REACH = [
+  "packed alias subtraction",
+  "exact duplicate union",
+  "space-close read fence",
+  "release read fence",
+  "producer settlement fence",
+  "accepted publication fence",
+] as const;
+/** Refusing admission cannot create a native retirement allocation or consume caller input. */
+export const BOUNDED_RETIREMENT_ADMISSION_REACH = [
+  "preparation before source",
+  "cursor before native read",
+  "publication before queue",
+] as const;
+
+/** Bounded array thresholds and same-space nested capture retain the exact release set. */
+export const BOUNDED_RETIREMENT_ARRAY_REACH = [
+  "array-4095",
+  "array-4096",
+  "array-4097",
+  "array-8193",
+  "mixed-source reentry",
+  "bounded resident I/O saving",
+] as const;
+/** Recovery may use either durable slot, but never the discarded private descriptor file. */
+export const BOUNDED_RETIREMENT_CRASH_REACH = [
+  "durable exact root",
+  "retry then both roots drain",
+  "handle every publication step",
+  "epoch every publication step",
+] as const;
+/** Every scalar/fixed-window boundary and reentrant charge may abandon an unfinished capture. */
+export const BOUNDED_RETIREMENT_FAULT_REACH = [
+  "empty source failure",
+  "first item failure",
+  "before window failure",
+  "at window failure",
+  "after window failure",
+  "multiple window failure",
+  "close at preparation charge",
+  "close at owner charge",
+  "release at cursor charge",
+] as const;
+
+export const FTS_RETIREMENT_PRESSURE_REACH = [
+  "owned through publication",
+  "released after settlement",
+  "shared source refs",
+  "unique source refs",
+  "large preparation",
+  "fixed native credit",
+  "disk dedupe",
+  "no fresh admission",
+  "reopen exact rows",
+  "zero charges",
+] as const;
+
+export const RETIREMENT_FAST_FALLBACK_REACH = [
+  "throwing refusal",
+  "boolean refusal",
+  "at threshold",
+  "below threshold",
+  "disk fits192KiB",
+  "exact survivor",
+  "no grant growth",
+  "foreign error preserved",
+  "original root intact",
+] as const;

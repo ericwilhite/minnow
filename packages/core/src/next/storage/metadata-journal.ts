@@ -438,13 +438,27 @@ export class MetadataJournal {
       throw error;
     }
   }
-  async cursor(handle: number, slot: number, borrowed = false): Promise<ChainCursor> {
+  async cursor(
+    handle: number,
+    slot: number,
+    borrowed = false,
+    position?: ChainPosition,
+  ): Promise<ChainCursor> {
     if (slot === 0) throw new RangeError("Frame zero belongs to the journal");
     const frame = this.workspace.claim(slot);
     try {
       const descriptor = await this.describe(handle);
+      const cursor = new ChainCursor(
+        this,
+        slot,
+        this.workspace.epoch,
+        descriptor,
+        handle,
+        !borrowed,
+        position,
+      );
       if (!borrowed) await this.retain(handle);
-      return new ChainCursor(this, slot, this.workspace.epoch, descriptor, handle, !borrowed);
+      return cursor;
     } catch (error) {
       this.workspace.returnFrame(frame);
       throw error;
@@ -555,6 +569,12 @@ export class ChainWriter {
   }
 }
 
+/** Scalar boundary between immutable chain pages. No frame or view escapes a phase. */
+export interface ChainPosition {
+  readonly next: number;
+  readonly remaining: number;
+  readonly pages: number;
+}
 /** Borrowed page slices stay valid only until the next next() call, never past the phase. */
 export class ChainCursor {
   #next: number;
@@ -568,9 +588,27 @@ export class ChainCursor {
     readonly descriptor: ChainDescriptor,
     readonly handle: number,
     readonly retained = true,
+    position?: ChainPosition,
   ) {
-    this.#next = descriptor.first;
-    this.#remaining = descriptor.length;
+    if (
+      position !== undefined &&
+      (!safe(position.next) ||
+        position.next > journal.pages ||
+        !safe(position.pages) ||
+        position.pages > Math.ceil(descriptor.length / METADATA_PAYLOAD_BYTES) ||
+        !safe(position.remaining) ||
+        position.remaining !==
+          Math.max(0, descriptor.length - position.pages * METADATA_PAYLOAD_BYTES) ||
+        (position.remaining === 0) !== (position.next === 0) ||
+        (position.pages === 0 && position.next !== descriptor.first))
+    )
+      throw new StoreCorruptionError("Invalid owner-private chain position");
+    this.#next = position?.next ?? descriptor.first;
+    this.#remaining = position?.remaining ?? descriptor.length;
+    this.#pages = position?.pages ?? 0;
+  }
+  get position(): ChainPosition {
+    return { next: this.#next, remaining: this.#remaining, pages: this.#pages };
   }
   get frame(): Uint8Array {
     if (this.journal.workspace.epoch !== this.epoch)

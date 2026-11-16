@@ -441,3 +441,6 @@ export async function sortExtents(
     await pairs?.close();
   }
 }
+
+/** Shared by fixed-window inventory readers; same coordinate law as native pair streams. */
+export { coordinates as validateExtentPair };
