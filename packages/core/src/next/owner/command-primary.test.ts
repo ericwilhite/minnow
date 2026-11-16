@@ -36,11 +36,7 @@ import { yieldTask } from "../task.js";
 import type { CommandToken } from "../access/statement-command.js";
 import { ftsDef } from "../access/fts-def.js";
 import { ftsMutationScan } from "../write/fts-undo.js";
-import {
-  openFtsHarness,
-  ftsParts,
-  lastFtsCommit,
-} from "../testing/fts-transaction.test-support.js";
+import { openFtsHarness, ftsParts, lastFtsCommit } from "./fts-transaction.test-support.js";
 import { NATIVE_PRIMARY_BYTES } from "../write/primary-command.js";
 import { StatementImpl } from "../write/transaction.js";
 import {
