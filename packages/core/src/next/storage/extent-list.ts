@@ -464,48 +464,65 @@ export class ExtentListKeeper {
       (delta.releasedInventory?.count ?? 0) === 0
     )
       return { list: pages, retire: [], charge: 0, retireCharge: 0 };
-    // Above the bounded array fast path, releases are streamed from the native inventory.
+    // Large sources and refused resident reservations stream from the native inventory.
     let ownedInventory: RetirementInventory | undefined;
     let cursor: RetirementCursor | undefined;
     let charge = 0;
     let retained = 0;
     try {
       let inventory = delta.releasedInventory;
-      if (
+      const resultCapacity =
+        2 * pages.length + Math.ceil(delta.added.length / this.#pageExtents) + 1;
+      const common =
+        32 * delta.added.length +
+        256 * this.#pageExtents +
+        1024 +
+        512 * resultCapacity +
+        128 * pages.length;
+      const residentRequired = common + 32 * delta.released.length;
+      let spool =
         delta.released.length > RESIDENT_RELEASE_LIMIT ||
-        (inventory !== undefined && delta.released.length > 0)
-      ) {
+        (inventory !== undefined && delta.released.length > 0);
+      let refusal: ReadDeniedError | undefined;
+      // The small array is only an optional optimization. Refuse neither the legal
+      // delta nor its cheaper disk route just because this larger reservation fails.
+      if (!spool && inventory === undefined && delta.released.length > 0) {
+        let admitted: boolean;
+        try {
+          admitted = this.#budget.allocate(residentRequired);
+        } catch (error) {
+          if (!(error instanceof ReadDeniedError)) throw error;
+          refusal = error;
+          admitted = false;
+        }
+        if (admitted) charge = residentRequired;
+        else spool = true;
+      }
+      if (spool) {
         const service = this.#reader as ExtentReader & {
           prepareRetirements?: (
             input: RetirementInput,
             options: RetirementOptions,
           ) => Promise<RetirementInventory>;
         };
-        if (service.prepareRetirements === undefined)
+        if (service.prepareRetirements === undefined) {
+          if (delta.released.length <= RESIDENT_RELEASE_LIMIT && inventory === undefined)
+            throw refusal ?? new ReadDeniedError(residentRequired);
           throw new TypeError(
             "Large extent deltas require the native retirement inventory service",
           );
+        }
         ownedInventory = await service.prepareRetirements(
           combinedReleases(delta, this.#budget, this.#work),
-          {
-            ...this.#work,
-            budget: this.#budget,
-            duplicates: "refuse",
-          },
+          { ...this.#work, budget: this.#budget, duplicates: "refuse" },
         );
         inventory = ownedInventory;
       }
-      const residentLength = inventory === undefined ? delta.released.length : 0;
-      const resultCapacity =
-        2 * pages.length + Math.ceil(delta.added.length / this.#pageExtents) + 1;
-      const required =
-        32 * (delta.added.length + residentLength) +
-        256 * this.#pageExtents +
-        1024 +
-        512 * resultCapacity +
-        128 * pages.length;
-      reserve(this.#budget, required);
-      charge = required;
+      if (charge === 0) {
+        const required = common + (inventory === undefined ? 32 * delta.released.length : 0);
+        reserve(this.#budget, required);
+        charge = required;
+      }
       const copy = async (input: readonly ExtentRef[]) => {
         const result: ExtentRef[] = [];
         for (let start = 0; start < input.length; start += 128) {

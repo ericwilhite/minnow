@@ -4440,3 +4440,8 @@ keeps no payload-sized array and performs no per-extent linear deduplication sca
 The inventory stays owned through list preparation, publication and sink settlement;
 accepted reads drain before its charge is released. This is preparation cleanup support;
 the native index build controller remains separate.
+
+Resident release lists of at most 4,096 entries are an optional optimization. The
+keeper first attempts their complete reservation; a boolean or typed memory refusal
+selects the same disk inventory used for larger sources. Other errors propagate.
+The disk route admits its smaller working window before copying or consuming entries.

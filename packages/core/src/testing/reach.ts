@@ -9208,3 +9208,15 @@ export const FTS_RETIREMENT_PRESSURE_REACH = [
   "reopen exact rows",
   "zero charges",
 ] as const;
+
+export const RETIREMENT_FAST_FALLBACK_REACH = [
+  "throwing refusal",
+  "boolean refusal",
+  "at threshold",
+  "below threshold",
+  "disk fits192KiB",
+  "exact survivor",
+  "no grant growth",
+  "foreign error preserved",
+  "original root intact",
+] as const;
