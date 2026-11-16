@@ -49,9 +49,11 @@
  * include `meta`, so they run in call order.
  *
  * ## Epoch record
- * Missing means a new store (epoch 1). A record that is not a safe positive integer, or one that
- * cannot be incremented, refuses ownership with `StoreCorruptionError`: two owners must never
- * share an epoch.
+ * The tight40-byte MNE2 ArrayBuffer at meta["epoch"] contains epoch, monotonic generation
+ * and pre-authority reader/writer floors. Acquisition compares the entire expected identity
+ * atomically, then advances both counters. Bounded publication recovery advances generation
+ * without changing the owner's epoch. Ordinary I/O checks epoch; publication checks full identity.
+ * Missing identifies a fresh store; malformed/exhausted records refuse, never reset.
  */
 import { ROOT_SLOT_OVERHEAD } from "../durable-format.js";
 import { validLogHeaderEnvelope } from "./durable-header.js";
@@ -76,17 +78,18 @@ import {
   type StoreSession,
   type WriteDataOptions,
 } from "./contract.js";
+import { type PublicationGate, type LockManagerLike } from "./fence.js";
+import { acquireNative, NativeAuthority } from "./native-fence.js";
 import {
-  acquireFenced,
-  publicationGate,
-  type PublicationGate,
-  type HeldLock,
-  type LockManagerLike,
-} from "./fence.js";
+  encodeOwnerIdentity,
+  storedIdentity,
+  requireIdentity,
+  type OwnerIdentity,
+} from "./owner-identity.js";
 import { ByteStore, inOrder } from "./idb-bytes.js";
 import type { CacheMemory, EvictableCacheLike } from "./extents.js";
 import { IdbMetadataCache, type MetadataCacheBacking } from "./idb-metadata-cache.js";
-import type { IdbDatabaseLike, IdbTransactionLike } from "./idb-like.js";
+import { IDB_STORES, type IdbDatabaseLike, type IdbTransactionLike } from "./idb-like.js";
 import { chooseRoot, decodeRootSlot, encodeRootSlot } from "./root-slot.js";
 import { preparedRoot } from "./root-memory.js";
 
@@ -97,7 +100,7 @@ export interface IndexedDbBackendOptions {
    * chain and is closed when its last acquisition releases).
    */
   readonly database: () => Promise<IdbDatabaseLike> | IdbDatabaseLike;
-  /** The database name; the lock is `minnow:<name>`. */
+  /** The logical database name; native owner/gate lock names include its durable identity. */
   readonly name: string;
   readonly locks: LockManagerLike;
   /** Queue relaxed writes into batches (the default); false commits each alone (benchmarks). */
@@ -417,7 +420,7 @@ class TrackedConnection implements IdbDatabaseLike {
 class IdbLease implements OwnerLease {
   readonly epoch: number;
   readonly database: TrackedConnection;
-  readonly #lock: HeldLock;
+  readonly #lock: NativeAuthority;
   readonly #lost = new AbortController();
 
   readonly #closeConnection: () => Promise<ReleaseReport>;
@@ -442,7 +445,7 @@ class IdbLease implements OwnerLease {
   }
 
   constructor(
-    lock: HeldLock,
+    lock: NativeAuthority,
     database: TrackedConnection,
     epoch: number,
     closeConnection: () => Promise<ReleaseReport>,
@@ -492,15 +495,28 @@ class IdbLease implements OwnerLease {
       durability,
       (tx) => {
         tx.store("meta").get("epoch", (stored) => {
-          if (stored !== this.epoch) {
+          if (storedIdentity(stored).epoch !== this.epoch) {
             this.lose();
             tx.abort(new OwnershipLostError(this.epoch));
             return;
           }
+          if (stores.includes("roots"))
+            requireIdentity(storedIdentity(stored), this.#lock.identity);
           body(tx);
         });
       },
       nativeSettled,
+    );
+  }
+
+  publication(): PublicationGate {
+    return this.#lock.publication(
+      async (expected, next) => {
+        await replaceIdentity(this.database, expected, next);
+      },
+      // The strict root transaction performs the full identity comparison atomically with
+      // publication. A separate readonly transaction would add I/O without fencing the write.
+      async () => undefined,
     );
   }
 
@@ -525,7 +541,7 @@ class IdbLease implements OwnerLease {
       "relaxed",
       (tx) => {
         tx.store("meta").get("epoch", (stored) => {
-          if (stored !== this.epoch) {
+          if (storedIdentity(stored).epoch !== this.epoch) {
             this.lose();
             tx.abort(new OwnershipLostError(this.epoch));
             return;
@@ -1448,6 +1464,40 @@ class IdbScratch implements ScratchSpace {
   }
 }
 
+/** All eagerly read outer gates are checked in the same native transaction as a fence CAS. */
+function validateNativeHeaders(
+  tx: IdbTransactionLike,
+  checked: () => void = () => undefined,
+): void {
+  for (const slot of [0, 1]) {
+    tx.store("roots").get(`slot-${String(slot)}`, (value) => {
+      decodeRootSlot(slotBytes(value), true);
+      checked();
+    });
+    tx.store("meta").get(`header-${String(slot)}`, (value) => {
+      validLogHeaderEnvelope(slotBytes(value));
+      checked();
+    });
+  }
+}
+async function replaceIdentity(
+  db: TrackedConnection,
+  expected: OwnerIdentity,
+  next: OwnerIdentity,
+): Promise<void> {
+  await db.transaction(["meta", "roots"], "readwrite", "strict", (tx) => {
+    let checked = 0;
+    const ready = () => {
+      if (++checked === 5) tx.store("meta").put("epoch", encodeOwnerIdentity(next).buffer);
+    };
+    validateNativeHeaders(tx, ready);
+    tx.store("meta").get("epoch", (value) => {
+      requireIdentity(storedIdentity(value), expected);
+      ready();
+    });
+  });
+}
+
 /** The IndexedDB `StorageBackend` (epoch fence, spill store). */
 export function createIndexedDbBackend(options: IndexedDbBackendOptions): StorageBackend {
   const leases = new WeakSet<IdbLease>();
@@ -1462,106 +1512,63 @@ export function createIndexedDbBackend(options: IndexedDbBackendOptions): Storag
   return {
     fence: "epoch",
     async acquire(acquire: AcquireOptions = {}): Promise<OwnerLease> {
-      let prefetched: TrackedConnection | null = null,
+      let connection: TrackedConnection | undefined,
+        accepted = false,
         abandoned = false;
-      const closePrefetched = async () => {
-        const pending = prefetched;
-        prefetched = null;
-        // A timed-out readonly probe may still have a queued/active transaction.
-        // Abort only this tracker's work; preserve the original refusal/deadline error.
-        if (pending !== null) await pending.drainAndClose(0, settleMs).catch(() => undefined);
+      const inspect = async (): Promise<OwnerIdentity> => {
+        if (connection === undefined) {
+          const opened = new TrackedConnection(
+            await options.database(),
+            serialize,
+            options.observe ?? null,
+          );
+          if (abandoned) {
+            opened.close();
+            throw new StoreClosedError();
+          }
+          connection = opened;
+        }
+        let identity: OwnerIdentity | undefined;
+        await connection.transaction(IDB_STORES, "readonly", "relaxed", (tx) => {
+          validateNativeHeaders(tx);
+          tx.store("meta").get("epoch", (value) => {
+            identity = storedIdentity(value);
+            if (value === undefined)
+              for (const name of IDB_STORES)
+                tx.store(name).last({}, (last) => {
+                  if (last !== undefined)
+                    throw new StoreCorruptionError("A used store has no native fence");
+                });
+          });
+        });
+        if (identity === undefined)
+          throw new StoreCorruptionError("Native fence read did not complete");
+        return identity;
       };
       try {
-        const { lock, fence } = await acquireFenced(
+        const { authority, opened } = await acquireNative(
           options.locks,
-          `minnow:${options.name}`,
-          async () => {
-            // Every acquisition its own connection: releasing an obsolete lease closes only its own.
-            const db =
-              prefetched ??
-              new TrackedConnection(await options.database(), serialize, options.observe ?? null);
-            prefetched = null;
-            let epoch = 0;
-            // The fence: one strict transaction moves the durable epoch past every older owner's.
-            await db
-              .transaction(["meta", "roots"], "readwrite", "strict", (tx) => {
-                const meta = tx.store("meta");
-                let checked = 0;
-                const ready = () => {
-                  if (++checked === 5) meta.put("epoch", epoch);
-                };
-                for (const slot of [0, 1]) {
-                  tx.store("roots").get(`slot-${String(slot)}`, (value) => {
-                    decodeRootSlot(slotBytes(value), true);
-                    ready();
-                  });
-                  meta.get(`header-${String(slot)}`, (value) => {
-                    validLogHeaderEnvelope(slotBytes(value));
-                    ready();
-                  });
-                }
-                meta.get("epoch", (stored) => {
-                  // Missing: a new store. Anything else must be a counter that can still increase
-                  // (review B1-p2c finding 1): a malformed or exhausted one would let two owners share
-                  // an epoch, so ownership is refused instead.
-                  if (stored === undefined) epoch = 1;
-                  else if (
-                    typeof stored !== "number" ||
-                    !Number.isSafeInteger(stored) ||
-                    stored < 1
-                  ) {
-                    tx.abort(new StoreCorruptionError("The epoch record is malformed"));
-                    return;
-                  } else if (!Number.isSafeInteger(stored + 1)) {
-                    tx.abort(new StoreCorruptionError("The epoch counter is exhausted"));
-                    return;
-                  } else epoch = stored + 1;
-                  ready();
-                });
-              })
-              .catch((error: unknown) => {
-                db.close();
-                throw error;
-              });
-            return { db, epoch };
+          options.name,
+          inspect,
+          async (expected, next) => {
+            const db = connection;
+            if (db === undefined) throw new StoreClosedError();
+            await replaceIdentity(db, expected, next);
+            return db;
           },
-          (fence) => {
-            fence.db.close();
-          },
+          (db) => db.close(),
           acquire,
-          async () => {
-            const db = new TrackedConnection(
-              await options.database(),
-              serialize,
-              options.observe ?? null,
-            );
-            if (abandoned) {
-              db.close();
-              return;
-            }
-            prefetched = db;
-            await db.transaction(["meta", "roots"], "readonly", "relaxed", (tx) => {
-              for (const slot of [0, 1]) {
-                tx.store("roots").get(`slot-${String(slot)}`, (value) => {
-                  decodeRootSlot(slotBytes(value), true);
-                });
-                tx.store("meta").get(`header-${String(slot)}`, (value) => {
-                  validLogHeaderEnvelope(slotBytes(value));
-                });
-              }
-            });
-            // Timeout/failure cleanup owns prefetched even if this read settles late.
-          },
         );
-        const connection = fence.db;
-        const lease = new IdbLease(lock, connection, fence.epoch, () =>
-          connection.drainAndClose(drainMs, settleMs),
+        const lease = new IdbLease(authority, opened, authority.identity.epoch, () =>
+          opened.drainAndClose(drainMs, settleMs),
         );
         leases.add(lease);
+        accepted = true;
         return lease;
       } finally {
         abandoned = true;
-        await closePrefetched();
+        if (!accepted && connection !== undefined)
+          await connection.drainAndClose(0, settleMs).catch(() => undefined);
       }
     },
     async open(lease: OwnerLease): Promise<StoreSession> {
@@ -1584,7 +1591,7 @@ export function createIndexedDbBackend(options: IndexedDbBackendOptions): Storag
         options.batching ?? true,
         memory,
         options.registerCache ?? null,
-        publicationGate(options.locks, `minnow:${options.name}`, owned.signal),
+        owned.publication(),
       );
     },
     scratch(lease: OwnerLease): ScratchSpace {

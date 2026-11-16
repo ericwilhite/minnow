@@ -9198,3 +9198,41 @@ export const ROOT_PUBLICATION_ORDER_REACH = [
   "unbatched earlier write precedes root",
   "same extent overwrite after root",
 ] as const;
+
+export const ROOT_GATE_LIVENESS_REACH = [
+  "IDB",
+  "OPFS",
+  "gate granted",
+  "future gate granted",
+  "before owner steal",
+  "after owner steal",
+  "immediate notification",
+  "delayed notification",
+  "publisher completes while opener suspended",
+  "same epoch higher generation",
+  "stale opener no writes",
+  "live owner still writes",
+  "compatible takeover preserved",
+  "before native fence",
+] as const;
+
+export const ROOT_FENCE_BOUNDARY_REACH = [
+  "IDB",
+  "OPFS",
+  "before owner grant",
+  "after owner grant",
+  "fresh takeover while obsolete opener frozen",
+  "durable identity before lease exposure",
+  "cancelled waiter never steals later",
+  "root and WAL preserved at cut",
+] as const;
+
+export const OWNER_IDENTITY_REACH = [
+  "single-word epoch",
+  "multi-word epoch",
+  "both checksums and zero reserved",
+  "all identity fields affect authority",
+  "same epoch recovery",
+  "takeover advances epoch",
+  "hint ties use higher epoch",
+] as const;

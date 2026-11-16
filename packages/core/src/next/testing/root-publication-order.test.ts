@@ -9,6 +9,8 @@ import { createReach, ROOT_PUBLICATION_ORDER_REACH } from "../../testing/reach.j
 import { seedsFor } from "../../testing/seeds.js";
 import { createIndexedDbBackend } from "../storage/indexeddb.js";
 import { openIndexedDb, type ByteRecord } from "../storage/idb-like.js";
+import { identityGateName } from "../storage/owner-identity.js";
+import { DURABLE_READER_VERSION, DURABLE_WRITER_VERSION } from "../durable-format.js";
 import { SimLocks } from "../storage/sim-disk.js";
 
 for (const seed of seedsFor("root-publication-order", [0xb2cb, 0xb2cc]))
@@ -67,7 +69,15 @@ for (const seed of seedsFor("root-publication-order", [0xb2cb, 0xb2cc]))
             });
             const owner = await backend.acquire(),
               session = await backend.open(owner);
-            const gate = await locks.request("minnow-gate:minnow:publication-order", {});
+            const gate = await locks.request(
+              identityGateName("publication-order", {
+                epoch: 1,
+                generation: 1,
+                reader: DURABLE_READER_VERSION,
+                writer: DURABLE_WRITER_VERSION,
+              }),
+              {},
+            );
             try {
               await session.writeData(0, Uint8Array.of(first));
               const publishing = session.publish(Uint8Array.of(3));

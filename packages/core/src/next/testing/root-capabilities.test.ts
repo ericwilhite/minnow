@@ -1,4 +1,9 @@
 /** The compatibility probe must precede even stealing a live newer owner's Web Lock. */
+import {
+  DURABLE_READER_VERSION,
+  DURABLE_WRITER_VERSION,
+  MANIFEST_FORMAT_VERSION,
+} from "../durable-format.js";
 import fc from "fast-check";
 import { expect, it } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
@@ -13,17 +18,26 @@ import { createOpfsBackend, encodeEpochSlot } from "../storage/opfs.js";
 import { createIndexedDbBackend } from "../storage/indexeddb.js";
 import type { IdbDatabaseLike, IdbStoreLike } from "../storage/idb-like.js";
 import { openIndexedDb } from "../storage/idb-like.js";
+import { identityOwnerName } from "../storage/owner-identity.js";
 import { SimLocks } from "../storage/sim-disk.js";
 import { encodeRootSlot } from "../storage/root-slot.js";
 import { Harness, autocommit, batch, texts } from "../write/test-support.js";
 import { setupFts, lastFtsCommit } from "./fts-transaction.test-support.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 
+const ownerName = identityOwnerName("future", {
+  epoch: 7,
+  generation: 7,
+  reader: DURABLE_READER_VERSION,
+  writer: DURABLE_WRITER_VERSION,
+});
+const futureCapability = fc.integer({ min: DURABLE_READER_VERSION + 1, max: 0xffffffff });
+
 for (const seed of seedsFor("next-root-dual-native", [0xb2c3, 0xb2c4]))
   it(`refuses future read or rewrite gates without fencing a live owner seed ${String(seed)}`, async () => {
     const reach = createReach("dual native pre-authority gates", ROOT_NATIVE_DUAL_GATE_REACH);
     await fc.assert(
-      fc.asyncProperty(fc.integer({ min: 9, max: 0xffffffff }), async (future) => {
+      fc.asyncProperty(futureCapability, async (future) => {
         reach.beginHistory();
         for (const field of ["minimum reader", "minimum writer"] as const)
           for (const slot of ["root-0", "root-1"] as const)
@@ -37,11 +51,11 @@ for (const seed of seedsFor("next-root-dual-native", [0xb2c3, 0xb2c4]))
               view.setUint32(bytes.length - 4, xxHash32(bytes, 0, 0, bytes.length - 4), true);
               const other = encodeRootSlot(6, new Uint8Array(32).fill(11)); // valid current cannot conceal future previous
               const locks = new SimLocks(),
-                holder = await locks.request("minnow:future", {});
+                holder = await locks.request(ownerName, {});
               let lockCalls = 0;
               const observedLocks = {
                 request: (...args: Parameters<SimLocks["request"]>) => {
-                  if (args[0] === "minnow:future") lockCalls++;
+                  if (args[0].startsWith("minnow-owner:")) lockCalls++;
                   return locks.request(...args);
                 },
               };
@@ -98,14 +112,14 @@ for (const seed of seedsFor("next-root-dual-native", [0xb2c3, 0xb2c4]))
                 "readwrite",
                 "strict",
                 (tx) => {
-                  tx.store("meta").put("epoch", 7);
+                  tx.store("meta").put("epoch", encodeEpochSlot(7).buffer);
                   tx.store("roots").put(futureSlot, bytes.slice().buffer);
                   tx.store("roots").put(supportedSlot, other.slice().buffer);
                   for (const name of ["meta", "log", "data"]) tx.store(name).put(0, witness);
                 },
               );
               const idbLocks = new SimLocks(),
-                idbHolder = await idbLocks.request("minnow:future", {});
+                idbHolder = await idbLocks.request(ownerName, {});
               let idbLockCalls = 0,
                 idbWrites = 0,
                 opened = 0,
@@ -114,7 +128,7 @@ for (const seed of seedsFor("next-root-dual-native", [0xb2c3, 0xb2c4]))
                 name: "future",
                 locks: {
                   request: (...args) => {
-                    if (args[0] === "minnow:future") idbLockCalls++;
+                    if (args[0].startsWith("minnow-owner:")) idbLockCalls++;
                     return idbLocks.request(...args);
                   },
                 },
@@ -171,7 +185,9 @@ for (const seed of seedsFor("next-root-dual-native", [0xb2c3, 0xb2c4]))
                   "readonly",
                   "relaxed",
                   (tx) => {
-                    tx.store("meta").get("epoch", (value) => expect(value).toBe(7));
+                    tx.store("meta").get("epoch", (value) =>
+                      expect(value).toEqual(encodeEpochSlot(7).buffer),
+                    );
                     tx.store("roots").get(futureSlot, (value) =>
                       expect(new Uint8Array(value as ArrayBuffer)).toEqual(bytes),
                     );
@@ -258,9 +274,9 @@ for (const seed of seedsFor("next-root-gate-before-wal", [0xb2c7, 0xb2c8]))
               const frame = await session.readRootSlot(slot);
               if (frame === null) continue;
               const header = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
-              expect(header.getUint32(16, true)).toBe(8);
-              expect(header.getUint32(20, true)).toBe(8);
-              expect(header.getUint8(11)).toBe(9);
+              expect(header.getUint32(16, true)).toBe(DURABLE_READER_VERSION);
+              expect(header.getUint32(20, true)).toBe(DURABLE_WRITER_VERSION);
+              expect(header.getUint8(11)).toBe(MANIFEST_FORMAT_VERSION - 2);
               roots++;
             }
             expect(roots).toBeGreaterThan(0);

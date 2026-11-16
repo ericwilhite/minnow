@@ -4,89 +4,35 @@
 import "fake-indexeddb/auto";
 import fc from "fast-check";
 import { afterAll, expect, it } from "vitest";
-import { IDBFactory } from "fake-indexeddb";
-import { MemoryOpfs } from "../../testing/opfs-shim.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, ROOT_GATE_RACE_REACH } from "../../testing/reach.js";
-import { createOpfsBackend } from "../storage/opfs.js";
-import { createIndexedDbBackend } from "../storage/indexeddb.js";
-import { IDB_STORES, openIndexedDb } from "../storage/idb-like.js";
 import { SimLocks } from "../storage/sim-disk.js";
-import { acquireFenced, publicationGate, type LockManagerLike } from "../storage/fence.js";
+import { acquireNative, NativeAuthority } from "../storage/native-fence.js";
 import type { StorageBackend, StoreSession } from "../storage/contract.js";
 import { RootMemory } from "../storage/root-memory.js";
 import { countingBudget, countingMemory } from "../storage/space-test-support.js";
-import { DurableFormatError } from "../durable-format.js";
+import {
+  DURABLE_READER_VERSION,
+  DURABLE_WRITER_VERSION,
+  DurableFormatError,
+} from "../durable-format.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 
-const ownerName = "minnow:gate-race";
-const gateName = `minnow-gate:${ownerName}`;
-const deferred = () => {
-  let resolve!: () => void;
-  const promise = new Promise<void>((done) => {
-    resolve = done;
-  });
-  return { promise, resolve };
+import {
+  identityOwnerName,
+  identityGateName,
+  requireIdentity,
+  type OwnerIdentity,
+} from "../storage/owner-identity.js";
+const initial = {
+  epoch: 1,
+  generation: 1,
+  reader: DURABLE_READER_VERSION,
+  writer: DURABLE_WRITER_VERSION,
 };
-
-async function fixture(kind: "IDB" | "OPFS", locks: LockManagerLike) {
-  if (kind === "OPFS") {
-    const shim = new MemoryOpfs();
-    return {
-      backend: () =>
-        createOpfsBackend({
-          name: "gate-race",
-          locks,
-          // Native Chromium/Firefox permit Blob snapshots while a SAH is held. The strict
-          // cross-browser shim refuses them, so model that independently probed native API here.
-          directory: {
-            keys: () => shim.root.keys(),
-            getFileHandle: async (name, options) => {
-              const handle = await shim.root.getFileHandle(name, options);
-              return {
-                createSyncAccessHandle: () => handle.createSyncAccessHandle(),
-                getFile: async () =>
-                  new Blob([new Uint8Array(shim.readFileBytes(name) ?? []).buffer]),
-              };
-            },
-          },
-        }),
-      image: async () => {
-        const entries: Array<readonly [string, Uint8Array | undefined]> = [];
-        for await (const name of shim.root.keys()) entries.push([name, shim.readFileBytes(name)]);
-        return entries.sort(([a], [b]) => a.localeCompare(b));
-      },
-    };
-  }
-  const factory = new IDBFactory();
-  return {
-    backend: () =>
-      createIndexedDbBackend({
-        name: "gate-race",
-        locks,
-        database: () => openIndexedDb(factory, "gate-race"),
-      }),
-    image: async () => {
-      const db = await openIndexedDb(factory, "gate-race");
-      const image: Record<string, unknown> = {};
-      try {
-        await db.transaction(IDB_STORES, "readonly", "relaxed", (tx) => {
-          for (const name of IDB_STORES) {
-            tx.store(name).getAllKeys({}, (keys) => {
-              image[`${name}:keys`] = keys;
-            });
-            tx.store(name).getAll({}, (values) => {
-              image[`${name}:values`] = values;
-            });
-          }
-        });
-        return image;
-      } finally {
-        db.close();
-      }
-    },
-  };
-}
+const ownerName = identityOwnerName("gate-race", initial);
+const gateName = identityGateName("gate-race", initial);
+import { deferred, fixture } from "./root-gate.test-support.js";
 
 async function futurePublication(
   session: StoreSession,
@@ -120,13 +66,15 @@ async function futurePublication(
   }
 }
 
+const futureCapability = fc.integer({ min: DURABLE_READER_VERSION + 1, max: 0xffffffff });
+
 const reach = createReach("root publication versus steal", ROOT_GATE_RACE_REACH);
 afterAll(() => reach.assertReached());
 for (const kind of ["IDB", "OPFS"] as const)
   for (const seed of seedsFor("root-publication-steal", [0xb2c9, 0xb2ca]))
     it(`${kind}: serializes publication versus steal without aborting a refused opener's live owner seed ${String(seed)}`, async () => {
       await fc.assert(
-        fc.asyncProperty(fc.integer({ min: 9, max: 0xffffffff }), async (future) => {
+        fc.asyncProperty(futureCapability, async (future) => {
           reach.beginHistory();
           for (const field of ["reader", "writer"] as const)
             for (const order of [
@@ -250,7 +198,7 @@ for (const kind of ["IDB", "OPFS"] as const) {
       waiting = true;
       queued = backend.acquire({ timeoutMs: 2000 }).catch((error: unknown) => error);
       await requested.promise;
-      await futurePublication(session, "writer", 9);
+      await futurePublication(session, "writer", DURABLE_WRITER_VERSION + 1);
       const before = await source.image();
       expect(owner.signal.aborted).toBe(false);
       await session.close();
@@ -277,7 +225,7 @@ for (const kind of ["IDB", "OPFS"] as const) {
       });
       expect(owner.signal.aborted).toBe(false);
       held.release();
-      await futurePublication(session, "writer", 9);
+      await futurePublication(session, "writer", DURABLE_WRITER_VERSION + 1);
       expect(owner.signal.aborted).toBe(false);
       await expect(backend.acquire({ steal: true })).rejects.toMatchObject({
         code: "MINNOW_FORMAT_UNSUPPORTED",
@@ -298,11 +246,23 @@ it("keeps publication excluded through fencing even if the old worker receives l
     finishFence = deferred();
   let writes = 0;
   let publication: Promise<unknown> | undefined;
-  const publish = publicationGate(locks, ownerName, delayedLoss.signal);
-  const acquiring = acquireFenced(
+  let identity: OwnerIdentity = initial;
+  const authority = new NativeAuthority(locks, "gate-race", identity, {
+    lost: delayedLoss.signal,
+    release: () => old.release(),
+  });
+  const publish = authority.publication(
+    async (expected, next) => {
+      requireIdentity(identity, expected);
+      identity = next;
+    },
+    async (expected) => requireIdentity(identity, expected),
+  );
+  const acquiring = acquireNative(
     locks,
-    ownerName,
-    async () => {
+    "gate-race",
+    async () => identity,
+    async (expected, next) => {
       // The underlying lock is stolen but the old worker has not handled the loss message.
       expect(old.lost.aborted).toBe(true);
       publication = publish(() => {
@@ -311,12 +271,13 @@ it("keeps publication excluded through fencing even if the old worker receives l
       fencing.resolve();
       await finishFence.promise;
       // Model the actual epoch/handle fence, then delivery of the old worker's loss notification.
+      requireIdentity(identity, expected);
+      identity = next;
       delayedLoss.abort();
       return 1;
     },
     () => undefined,
     { steal: true },
-    async () => undefined,
   );
   await fencing.promise;
   await Promise.resolve();
@@ -329,7 +290,7 @@ it("keeps publication excluded through fencing even if the old worker receives l
     expect(await publication).toMatchObject({ code: "MINNOW_OWNERSHIP_LOST" });
     expect(writes).toBe(0);
   } finally {
-    acquired.lock.release();
+    acquired.authority.release();
     old.release();
   }
 });

@@ -35,6 +35,8 @@ import {
   type IdbTransactionLike,
 } from "./idb-like.js";
 import { createIndexedDbBackend } from "./indexeddb.js";
+import { identityOwnerName } from "./owner-identity.js";
+import { DURABLE_READER_VERSION, DURABLE_WRITER_VERSION } from "../durable-format.js";
 import { SimDisk, SimLocks } from "./sim-disk.js";
 import { simIndexedDb } from "./sim-idb.js";
 
@@ -132,11 +134,21 @@ describe("a release whose wait runs out aborts, settles, closes, then unlocks (f
     await tick();
     // The next owner is already waiting for the lock while the release runs.
     let liveAtGrant = -1;
-    const granted = locks.request("minnow:timeout", {}).then((held) => {
-      events.push("granted");
-      liveAtGrant = live;
-      return held;
-    });
+    const granted = locks
+      .request(
+        identityOwnerName("timeout", {
+          epoch: lease.epoch,
+          generation: 1,
+          reader: DURABLE_READER_VERSION,
+          writer: DURABLE_WRITER_VERSION,
+        }),
+        {},
+      )
+      .then((held) => {
+        events.push("granted");
+        liveAtGrant = live;
+        return held;
+      });
     const report = await lease.release();
     const next = await granted;
     keepAlive = false;
@@ -394,7 +406,15 @@ describe("a release gives up on aborted transactions that never end (review B1-p
     const publishing = session.publish(new Uint8Array([1]));
     await tick();
     // The next owner is already waiting for the lock.
-    const granted = locks.request("minnow:unsettled", {});
+    const granted = locks.request(
+      identityOwnerName("unsettled", {
+        epoch: lease.epoch,
+        generation: 1,
+        reader: DURABLE_READER_VERSION,
+        writer: DURABLE_WRITER_VERSION,
+      }),
+      {},
+    );
     const released = lease.release();
 
     const release = await outcomeWithin(released, 2_000);

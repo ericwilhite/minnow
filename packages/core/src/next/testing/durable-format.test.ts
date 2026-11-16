@@ -213,14 +213,22 @@ const parsed =
   };
 const checksum = (bytes: Uint8Array, end = bytes.length - 4, seed = 0) =>
   new DataView(bytes.buffer, bytes.byteOffset).setUint32(end, xxHash32(bytes, seed, 0, end), true);
+function unsupportedEpoch(bytes: Uint8Array): boolean {
+  return (
+    new DataView(bytes.buffer, bytes.byteOffset).getUint32(0, true) !==
+      DURABLE_FORMATS.epochSlot.magic ||
+    (new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true) & 0xffe00000) !== 0 ||
+    (new DataView(bytes.buffer, bytes.byteOffset).getUint32(20, true) & 0xffe00000) !== 0 ||
+    new DataView(bytes.buffer, bytes.byteOffset).getUint32(24, true) !== DURABLE_READER_VERSION ||
+    new DataView(bytes.buffer, bytes.byteOffset).getUint32(28, true) !== DURABLE_WRITER_VERSION ||
+    new DataView(bytes.buffer, bytes.byteOffset).getUint32(32, true) !== 0
+  );
+}
 async function epoch(bytes: Uint8Array) {
   const shim = new MemoryOpfs();
   shim.writeFileBytes("epoch", bytes);
   // Unknown identities must be refused before even creating another native file.
-  const unsupported =
-    new DataView(bytes.buffer, bytes.byteOffset).getUint32(0, true) !==
-      DURABLE_FORMATS.epochSlot.magic ||
-    (new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true) & 0xffe00000) !== 0;
+  const unsupported = unsupportedEpoch(bytes);
   if (unsupported)
     shim.setWriteFault(() => {
       throw new Error("mutation before format refusal");
@@ -229,6 +237,39 @@ async function epoch(bytes: Uint8Array) {
     name: "registry",
     directory: shim.root,
     locks: new SimLocks(),
+  });
+  const lease = await backend.acquire();
+  await lease.release();
+  return 1;
+}
+async function epochIdb(bytes: Uint8Array) {
+  const factory = new IDBFactory(),
+    raw = await openIndexedDb(factory, "epoch-registry");
+  await raw.transaction(["meta"], "readwrite", "strict", (tx) =>
+    tx.store("meta").put("epoch", bytes.slice().buffer),
+  );
+  const backend = createIndexedDbBackend({
+    name: "epoch-registry",
+    locks: new SimLocks(),
+    database: () => ({
+      close: () => raw.close(),
+      transaction: (stores, mode, durability, body) =>
+        raw.transaction(stores, mode, durability, (tx) =>
+          body({
+            abort: (error) => tx.abort(error),
+            store: (name) => {
+              const store = tx.store(name);
+              return {
+                ...store,
+                put: (key, value) => {
+                  if (unsupportedEpoch(bytes)) throw new Error("mutation before format refusal");
+                  store.put(key, value);
+                },
+              };
+            },
+          }),
+        ),
+    }),
   });
   const lease = await backend.acquire();
   await lease.release();
@@ -539,7 +580,15 @@ function adapters(): Record<Exclude<DurableFormatName, "indexedDb">, Adapter> {
       decode: (bytes) => decodeRootSlot(bytes),
       repair: checksum,
     },
-    epochSlot: { bytes: encodeEpochSlot(1), decode: epoch, repair: checksum },
+    epochSlot: {
+      bytes: encodeEpochSlot(1),
+      decode: epoch,
+      also: [epochIdb],
+      repair: (bytes) => {
+        checksum(bytes, 12);
+        checksum(bytes);
+      },
+    },
     logHeader: {
       bytes: encodeLogHeader({
         salt: 7,
@@ -1051,7 +1100,7 @@ for (const seed of seedsFor("next-durable-native-open", [0xb229, 0xb22a]))
           const factory = new IDBFactory();
           const raw = await openIndexedDb(factory, "future");
           await raw.transaction(["meta", "roots"], "readwrite", "strict", (tx) => {
-            tx.store("meta").put("epoch", 7);
+            tx.store("meta").put("epoch", encodeEpochSlot(7).buffer);
             tx.store(name === "rootSlot" ? "roots" : "meta").put(
               name === "rootSlot" ? "slot-0" : "header-0",
               bytes.slice().buffer,
@@ -1075,7 +1124,9 @@ for (const seed of seedsFor("next-durable-native-open", [0xb229, 0xb22a]))
           const verify = await openIndexedDb(factory, "future");
           try {
             await verify.transaction(["meta", "roots"], "readonly", "relaxed", (tx) => {
-              tx.store("meta").get("epoch", (value) => expect(value).toBe(7));
+              tx.store("meta").get("epoch", (value) =>
+                expect(value).toEqual(encodeEpochSlot(7).buffer),
+              );
               tx.store(name === "rootSlot" ? "roots" : "meta").get(
                 name === "rootSlot" ? "slot-0" : "header-0",
                 (value) => expect(new Uint8Array(value as ArrayBuffer)).toEqual(bytes),
@@ -1343,7 +1394,7 @@ for (const seed of seedsFor("next-durable-before-fence", [0xb22f, 0xb230]))
                 "readwrite",
                 "strict",
                 (tx) => {
-                  tx.store("meta").put("epoch", 7);
+                  tx.store("meta").put("epoch", encodeEpochSlot(7).buffer);
                   tx.store("roots").put(futureSlot, bytes.slice().buffer);
                   tx.store("roots").put(supportedSlot, supportedBytes.slice().buffer);
                   for (const name of ["log", "data", "meta"]) tx.store(name).put(0, witness);
@@ -1388,7 +1439,9 @@ for (const seed of seedsFor("next-durable-before-fence", [0xb22f, 0xb230]))
                   "readonly",
                   "relaxed",
                   (tx) => {
-                    tx.store("meta").get("epoch", (value) => expect(value).toBe(7));
+                    tx.store("meta").get("epoch", (value) =>
+                      expect(value).toEqual(encodeEpochSlot(7).buffer),
+                    );
                     tx.store("roots").get(futureSlot, (value) =>
                       expect(new Uint8Array(value as ArrayBuffer)).toEqual(bytes),
                     );

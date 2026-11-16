@@ -1,4 +1,9 @@
 /** MNRT2: independent read/rewrite requirements precede every ownership mutation. */
+import {
+  DURABLE_READER_VERSION,
+  DURABLE_WRITER_VERSION,
+  MANIFEST_FORMAT_VERSION,
+} from "../durable-format.js";
 import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
@@ -19,10 +24,10 @@ for (const seed of seedsFor("next-root-dual-codec", [0xb2c1, 0xb2c2]))
             bytes = encodeRootSlot(sequence, root),
             view = new DataView(bytes.buffer);
           expect(view.getUint8(10) >>> 5).toBe(7);
-          expect(view.getUint8(11)).toBe(9); // manifest11-minus2; recognizable old-reader refusal
+          expect(view.getUint8(11)).toBe(MANIFEST_FORMAT_VERSION - 2); // manifest-minus2; recognizable old-reader refusal
           expect(view.getUint32(12, true)).toBe(root.length + 8);
-          expect(view.getUint32(16, true)).toBe(8);
-          expect(view.getUint32(20, true)).toBe(8);
+          expect(view.getUint32(16, true)).toBe(DURABLE_READER_VERSION);
+          expect(view.getUint32(20, true)).toBe(DURABLE_WRITER_VERSION);
           expect(decodeRootSlot(bytes)).toEqual({ sequence, root });
           expect(decodeRootSlot(bytes, true)?.root.buffer).toBe(bytes.buffer);
           for (let length = 0; length < 8; length++) {

@@ -3,6 +3,7 @@ import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { expect, it } from "vitest";
 import { openIndexedDb, type IdbDatabaseLike, type IdbStoreLike } from "./idb-like.js";
 import { createIndexedDbBackend } from "./indexeddb.js";
+import { encodeEpochSlot } from "./opfs.js";
 import { SimLocks } from "./sim-disk.js";
 
 (globalThis as { IDBKeyRange?: unknown }).IDBKeyRange ??= IDBKeyRange;
@@ -12,6 +13,10 @@ it.each([0, 1, 129, 8193, 32769])(
   async (records) => {
     const factory = new IDBFactory();
     const raw = await openIndexedDb(factory, "scale");
+    // A real stored image always has its durable ownership fence before byte records.
+    await raw.transaction(["meta"], "readwrite", "strict", (tx) =>
+      tx.store("meta").put("epoch", encodeEpochSlot(1).buffer),
+    );
     await raw.transaction(
       ["data", "data-index", "log", "log-index"],
       "readwrite",

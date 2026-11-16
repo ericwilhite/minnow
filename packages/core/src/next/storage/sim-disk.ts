@@ -304,6 +304,10 @@ interface LockState {
 export class SimLocks implements LockManagerLike {
   readonly #locks = new Map<string, LockState>();
 
+  async query(): Promise<readonly string[]> {
+    return [...this.#locks].filter(([, state]) => state.holder !== null).map(([name]) => name);
+  }
+
   #state(name: string): LockState {
     let state = this.#locks.get(name);
     if (state === undefined) {

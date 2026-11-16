@@ -16,14 +16,14 @@
  * The native vocabulary/profile guard below catches an unassigned vocabulary extension.
  * The independent native writer ledger also guards read-optional fields before acquisition.
  */
-/** Shared reference-table envelope; the manifest also carries its logical format version11. */
+/** Shared reference-table envelope; the manifest also carries its logical format version12. */
 export const METADATA_ENVELOPE_VERSION = 1;
 /** Root reader capability; incompatible nested bytes advance this or the exact manifest barrier. */
-export const DURABLE_READER_VERSION = 8;
-export const MANIFEST_FORMAT_VERSION = 11;
+export const DURABLE_READER_VERSION = 9;
+export const MANIFEST_FORMAT_VERSION = 12;
 export const ROOT_SLOT_HEADER_BYTES = 16;
 /** Profile8 escape: two independently checked u32 capability selectors precede the manifest. */
-export const DURABLE_WRITER_VERSION = 8;
+export const DURABLE_WRITER_VERSION = 9;
 export const ROOT_SLOT_CAPABILITY_BYTES = 8;
 export const ROOT_SLOT_EXTENSION_TAG = 7;
 export const ROOT_SLOT_PAYLOAD_OFFSET = ROOT_SLOT_HEADER_BYTES + ROOT_SLOT_CAPABILITY_BYTES;
@@ -45,7 +45,7 @@ export interface FormatField {
   /** Permitted bits; every other bit is reserved-zero. */
   readonly mask?: number;
 }
-/** Header selectors can name an outer envelope (manifest envelope1) plus its logical version11. */
+/** Header selectors can name an outer envelope (manifest envelope1) plus its logical version12. */
 interface Format {
   readonly magic: number | null;
   readonly version: number;
@@ -668,7 +668,7 @@ export const DURABLE_FORMATS = {
         values: Array.from({ length: 32 }, (_, i) => (ROOT_SLOT_EXTENSION_TAG << 5) + i),
       },
       { name: "manifest format", offset: 11, width: 1, values: [MANIFEST_FORMAT_VERSION - 2] },
-      // No earlier profile belongs to manifest11; this first baseline has no released predecessor.
+      // No earlier profile belongs to manifest12; this first baseline has no released predecessor.
       { name: "minimum reader", offset: 16, width: 4, values: [DURABLE_READER_VERSION] },
       { name: "minimum writer", offset: 20, width: 4, values: [DURABLE_WRITER_VERSION] },
     ],
@@ -676,14 +676,18 @@ export const DURABLE_FORMATS = {
     state: "implemented",
   },
   epochSlot: {
-    magic: 0x50454e4d,
-    version: 1,
+    magic: 0x32454e4d,
+    version: 2,
     versionIn: "magic",
     fields: [
-      magic(0x50454e4d),
+      magic(0x32454e4d),
       { name: "epoch high reserved", offset: 8, width: 4, mask: 0x1fffff },
+      { name: "generation high reserved", offset: 20, width: 4, mask: 0x1fffff },
+      { name: "minimum reader", offset: 24, width: 4, values: [DURABLE_READER_VERSION] },
+      { name: "minimum writer", offset: 28, width: 4, values: [DURABLE_WRITER_VERSION] },
+      zero(32, 4),
     ],
-    decoder: "decodeEpochSlot",
+    decoder: "decodeOwnerIdentity",
     state: "implemented",
   },
   logHeader: {
@@ -1036,12 +1040,14 @@ export const NATIVE_READER_PROFILES: Readonly<
 > = Object.freeze({
   7: Object.freeze({ manifest: 10, vocabulary: 3713904595 }),
   8: Object.freeze({ manifest: 11, vocabulary: 1164132746 }),
+  9: Object.freeze({ manifest: 12, vocabulary: 131312130 }),
 });
 
 /** Required rewrite capability includes even fields that are optional for reading.
  * New fields/features must assign a new writer profile before any native owner can start. */
 export const NATIVE_WRITER_PROFILES: typeof NATIVE_READER_PROFILES = Object.freeze({
   8: Object.freeze({ manifest: 11, vocabulary: 1164132746 }),
+  9: Object.freeze({ manifest: 12, vocabulary: 131312130 }),
 });
 
 function canonicalVocabulary(value: unknown): string {
@@ -1075,14 +1081,13 @@ export function nativeVocabularyFingerprint(
           version: format.version,
           versionIn: format.versionIn,
           parent: "parent" in format ? format.parent : null,
-          fields:
-            name === "rootSlot"
-              ? format.fields.map((field) =>
-                  field.name === "minimum reader" || field.name === "minimum writer"
-                    ? { name: field.name, offset: field.offset, width: field.width }
-                    : field,
-                )
-              : format.fields,
+          // Outer capability selector VALUES identify the profile, not nested vocabulary.
+          // Keep their byte locations in the binding (MNRT and MNE2), without self-reference.
+          fields: format.fields.map((field) =>
+            field.name === "minimum reader" || field.name === "minimum writer"
+              ? { name: field.name, offset: field.offset, width: field.width }
+              : field,
+          ),
         },
       ]),
   );

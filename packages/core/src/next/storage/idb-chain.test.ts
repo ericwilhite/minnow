@@ -259,6 +259,19 @@ describe("one chain per connection object, across acquisitions and backends (rev
       };
       const pick = <T>(items: readonly T[]): T | undefined =>
         items[Math.floor(random() * items.length)];
+      // Begin with an actual live owner, rather than relying on a fixed number of task
+      // turns for an asynchronous acquisition to finish before the generated loop ends.
+      const initialBackend = backends[0];
+      if (initialBackend === undefined) throw new Error("backend");
+      const initial = await initialBackend.acquire();
+      holders.push({ lease: initial, session: await initialBackend.open(initial) });
+      owners.add(0);
+      const otherBackend = backends[1];
+      if (otherBackend === undefined) throw new Error("backend");
+      const other = await otherBackend.acquire({ steal: true });
+      holders.push({ lease: other, session: await otherBackend.open(other) });
+      owners.add(1);
+      reach.reach("both-backends-owned");
       for (let step = 0; step < 40; step++) {
         const roll = random();
         if (acquiring === 0 && (roll < 0.2 || holders.length === 0)) {

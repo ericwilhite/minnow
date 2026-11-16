@@ -5,7 +5,8 @@
  * ## Ownership comes first (`StorageBackend.acquire`)
  * Exactly one owner may mutate a database. Acquisition is separate from opening and has two
  * layers, both owned by the backend (the fence is pluggable):
- * 1. **Web Lock** `minnow:<db>` (FIFO; `steal` takes it from a live holder).
+ * 1. **Web Lock** (FIFO; `steal` takes it from a live holder). Native names include the
+ *    durable owner identity; memory/simulator names remain logical. See native-fence.ts.
  * 2. **Backend fence**:
  *    - `handle` (OPFS): opening the store's files with sync access handles. While one owner holds
  *      them no other context can open, write, remove or move them, even after stealing the lock.
@@ -16,7 +17,7 @@
  *      record; every readwrite transaction reads it first and aborts if it moved.
  * Before advancing the durable epoch or creating missing native files, acquisition validates both
  * checksummed root-slot reader/writer/manifest barriers (root-slot.ts). A non-mutating preflight
- * precedes even the Web Lock request; readable-but-unrewritable stores refuse too. There is no
+ * precedes even a side-effecting Web Lock steal; readable-but-unrewritable stores refuse too. There is no
  * read-only owner fallback. Opaque manifest replay still follows ownership. OPFS rechecks existing
  * exclusive handles before creating missing files; IDB checks before enqueueing its epoch put.
  * If the fence is still held when `timeoutMs` passes, acquisition fails with

@@ -450,32 +450,44 @@ they are not recovery authorities. Portable snapshot1 has its own container and 
 
 The native root keeps its 16-byte MNRT framing prefix and adds two checksummed u32 fields:
 minimum reader at byte16 and minimum writer at byte20. The manifest begins at byte24. The
-sequence-high word's upper three bits select escape8; its upper byte carries manifest11-minus2.
-The current capability baseline is reader8/writer8, manifest11, with commitBody8 unchanged.
+sequence-high word's bits21..23 select tag7; its upper byte carries manifest12-minus2.
+The current capability baseline is reader9/writer9, manifest12, with commitBody8 unchanged.
 Root frames fund the extra8 bytes before allocation. Earlier unpublished development roots
 are refused; no supported next/ predecessor has shipped.
 
-Both native backends probe both root slots before requesting the owner Web Lock. A stealing
-opener holds the separate, non-stealing `minnow-gate:minnow:<name>` lock from before that probe
-through the ownership steal and backend fencing. Delayed lock-loss notification in the old
-worker cannot let a publisher run before the new handle/epoch fence. Every native root publication holds the same exclusive gate through
-its durable write: a requirement cannot change between the probe and the steal. Publication
-winning the gate makes an incompatible opener refuse while the live owner keeps its lock;
-acquisition winning it makes the old publisher lose authority before it can publish. Ordinary
-queued openers never hold the gate while waiting for ownership, so a live owner's publication
-can finish. A queued publisher cancels on owner loss and checks authority after getting the gate.
-The gate uses a distinct namespace from owner locks, including for arbitrary database names.
-IndexedDB reserves each publication's commit-chain position and captures its earlier queued writes
-BEFORE waiting for this gate. Later writes cannot pass the publication or join its earlier batch.
-Release accounting describes issued native transactions; tests observe their actual start,
-including when gate waiting delays issuance.
-OPFS rechecks existing owned handles before creating missing files or advancing the epoch.
-IndexedDB rechecks both roots in its strict fence transaction before enqueueing the epoch write.
-Gate waiting and preflight share the acquisition deadline; a late IndexedDB connection closes
-without requesting the owner lock. Unsupported gates use
-`DurableFormatError` (`MINNOW_FORMAT_UNSUPPORTED`). A database that is readable but requires a
-newer writer also refuses: SQL read-only transactions still use a writable owner, and no safe
-physical read-only owner path is provided. Stale probes never authorize native writes.
+Both native backends validate the root and native fence capabilities before a takeover.
+The durable fence is a40-byte MNE2 record containing epoch, generation, minimum reader and
+minimum writer, with prefix and full checksums. Acquisition advances both counters; recovery
+of a stranded publication gate advances only the generation. Both counters are positive safe
+integers and never wrap. OPFS keeps two512-byte slots in `epoch`; IndexedDB keeps a tight
+ArrayBuffer under the existing `meta["epoch"]` key (schema2).
+
+Native owner locks are `minnow-owner:<nameLength>:<name>:<epoch>:<generation>:<reader>:<writer>`;
+gate locks prepend `minnow-gate:` to that exact owner name. A stealing opener captures an
+identity, takes its gate without stealing it, rechecks compatibility, and targets only that
+identity's owner lock. The native fence compares the full expected identity before changing it.
+A frozen or revoked opener never retargets a newer identity using an old compatibility proof.
+Compatible live-owner takeover remains supported.
+
+Publication waits at most1000ms for the current identity's gate on the publisher's own clock.
+If an opener freezes while holding it, the healthy owner claims the next generation's gate
+and owner lock, conditionally persists that identity, then publishes there. It switches its
+loss listener before the native compare-and-swap; loss of the obsolete lock cannot abort the
+new authority, even when notifications arrive late. A failed compare-and-swap loses authority.
+The frozen gate can remain held indefinitely without blocking current publication or openers.
+Publication is serialized per owner lease. Ordinary queued openers do not hold the current
+owner's gate while waiting. OPFS uses read-only native snapshots; where held files deny those,
+a snapshot of held identity lock names is only an acquisition hint, still checked by native CAS.
+
+IndexedDB reserves each publication's commit-chain position and captures earlier queued writes
+BEFORE gate waiting. Later writes cannot pass the publication or join its earlier batch.
+Its strict root transaction compares the complete identity atomically with publication; ordinary
+transactions still compare epoch. OPFS validates both slots under exclusive handles before
+creating missing files, then records its fence before creating other files. Gate/preflight work
+shares the acquisition deadline, including cleanup of a late IndexedDB connection.
+Unsupported gates use `DurableFormatError` (`MINNOW_FORMAT_UNSUPPORTED`). Readable but
+unrewritable stores refuse too; there is no physical read-only owner fallback. Stale native
+identity attempts use `OwnershipLostError` and cannot mutate current root, WAL or metadata.
 
 Every native publisher, including prepaid root frames, emits both selectors. Compatibility
 belongs to those outer gates: incompatible nested tags must raise minimum reader, and any field
@@ -3924,7 +3936,7 @@ Snapshots will rebuild postings from rows; this stage only supplies the portable
 Native foreign-key records preserve exact explicit DELETE/UPDATE actions. An omitted
 ON UPDATE is stored as `follow`, distinct from explicit CASCADE and from PostgreSQL's
 NO ACTION default. The schema inspector exposes these modes and stored trigger identities.
-MCAT foreignKey10's required field9 carries onUpdate; the outer reader8/writer8/manifest11
+MCAT foreignKey10's required field9 carries onUpdate; the outer reader9/writer9/manifest12
 gates cover these development bytes before publication. Native RI execution/trigger firing
 remain the separate joint B6/B5b consumer described in the inventory. Until that driver is
 installed, SQL refuses explicit ON UPDATE modes, ON DELETE SET DEFAULT and informational
@@ -4120,7 +4132,7 @@ rendering. Fixed seal/claim state fits the already prepaid 512-byte FTS publicat
 Ordinary commits without an FTS seal keep their existing append path.
 
 The SQL scan route and shipped engine behavior are unchanged. The new tag is part of the
-development FTS unit (now manifest11/body8 with dual gates); it changes no supported stored predecessor.
+development FTS unit (now manifest12/body8 with generation-fenced dual gates); it changes no supported stored predecessor.
 
 FTS recovery reads the checked checkpoint head once and passes its actual covered LSN to
 `Replayer` independently of global/catalog/ledger and per-table row coverage. A conservative

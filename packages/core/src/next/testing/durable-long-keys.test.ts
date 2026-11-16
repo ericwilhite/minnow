@@ -19,6 +19,7 @@ import {
   DURABLE_READER_VERSION,
   MANIFEST_FORMAT_VERSION,
   NATIVE_READER_PROFILES,
+  ROOT_SLOT_EXTENSION_TAG,
   nativeVocabularyFingerprint,
 } from "../durable-format.js";
 import { decodeManifestRoot } from "../format/manifest-codec.js";
@@ -200,7 +201,7 @@ for (const seed of seedsFor("next-durable-older-long-key-reader", [0xb532]))
         expect(DURABLE_READER_VERSION).toBeGreaterThan(1);
         expect(MANIFEST_FORMAT_VERSION).toBeGreaterThan(2);
         const bytes = encodeRootSlot(2, Uint8Array.of(1, 2, 3));
-        expect((bytes[10] ?? 0) >>> 5).toBe(DURABLE_READER_VERSION - 1);
+        expect((bytes[10] ?? 0) >>> 5).toBe(ROOT_SLOT_EXTENSION_TAG);
         expect(bytes[11]).toBe(MANIFEST_FORMAT_VERSION - 2);
         expect(() => older.decodeRootSlot(bytes)).toThrow(
           expect.objectContaining({
@@ -242,7 +243,7 @@ for (const seed of seedsFor("next-durable-older-long-key-reader", [0xb532]))
         const idbSlot = second ? "slot-1" : "slot-0";
         await raw.transaction(["roots", "meta"], "readwrite", "strict", (tx) => {
           tx.store("roots").put(idbSlot, bytes.slice().buffer);
-          tx.store("meta").put("epoch", 1);
+          tx.store("meta").put("epoch", encodeEpochSlot(1).buffer);
         });
         let idbWrites = 0;
         const backend = older.createIndexedDbBackend({
@@ -286,7 +287,9 @@ for (const seed of seedsFor("next-durable-older-long-key-reader", [0xb532]))
         try {
           await inspect.transaction(["roots", "meta"], "readonly", "relaxed", (tx) => {
             tx.store("roots").get(idbSlot, (value) => expect(value).toEqual(bytes.slice().buffer));
-            tx.store("meta").get("epoch", (value) => expect(value).toBe(1));
+            tx.store("meta").get("epoch", (value) =>
+              expect(value).toEqual(encodeEpochSlot(1).buffer),
+            );
           });
         } finally {
           inspect.close();
