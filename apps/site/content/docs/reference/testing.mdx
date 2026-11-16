@@ -2029,6 +2029,13 @@ metadata faults, cancellation, native root copies and snapshot charges have sepa
 These are managed-buffer bounds; opaque native IndexedDB memory still needs Gate D browser
 measurement.
 
+The rebuild's portable-load histories replace targets holding real FTS checkpoint journals,
+committed staged preparations, document pages, terms and postings. They interrupt every
+physical publication step, reopen to either intact old rows and FTS payloads or a complete
+replacement with empty native FTS state, then retry. Old FTS extents must retire exactly once
+and all governor charges must return. These tests use the simulated honest-flush disk;
+they do not replace browser power-loss or quota testing.
+
 The owner-ready campaign accepts `MINNOW_OWNER_REOPEN_SAMPLES=6` for six wall and six
 separate CPU samples per dataset/backend. It retains each sample and its before/after host
 load and CPU-pressure snapshot, including slow observations. Private metadata read bytes are

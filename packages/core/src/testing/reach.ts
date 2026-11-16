@@ -9122,3 +9122,19 @@ export const SNAPSHOT_VALIDATOR_LEASE_REACH = [
   "parser funded before producer entry",
   "cancel after lease acquisition",
 ] as const;
+
+export const SNAPSHOT_FTS_CUT_REACH = [
+  "checkpoint target",
+  "checkpoint and staged target",
+  "document and term payloads",
+  "every physical publication step",
+  "one power loss per cut",
+  "old target recovered",
+  "complete replacement recovered",
+  "old history and payload intact",
+  "canonical empty replacement",
+  "retry after interruption",
+  "old FTS retirement exactly once",
+  "ordinary reopen",
+  "zero charges",
+] as const;

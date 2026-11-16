@@ -4287,6 +4287,10 @@ inventory, including its FTS journal and payload extents, exactly once. Those by
 while the previous root reaches them, then retire after the next publication. No old FTS state
 is carried into reused table IDs in the imported catalog.
 
+Generated native histories cut every physical replacement-publication step with checkpoint
+and committed staged FTS state present. They reopen before retry, prove old payload bytes or
+complete canonical replacement, then drain both roots and check exact-once release and zero charges.
+
 `write/snapshot-load.ts` implements the internal portable native loader. Its target factory must hold
 an exclusive, recovered and settled owner with no active writer/maintenance, and report logical
 emptiness and the actual last LSN. Replacement is explicit. Header and catalog checks precede
