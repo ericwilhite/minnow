@@ -27,6 +27,7 @@ const KINDS = [
   "noAction",
 ] as const;
 const WRITES = ["insert", "update", "delete"] as const;
+const CHECKPOINTS: readonly string[] = ["unique", "references", "followTargets"];
 let nextReferentialId = 0;
 function invalid(): never {
   throw new TypeError("Invalid, foreign or retired native command work");
@@ -61,10 +62,12 @@ interface Frame {
   tail: number;
   unique: number;
   references: number;
+  followTargets: number;
   checking: Promise<void> | null;
   count: number;
   uniqueCount: number;
   referencesCount: number;
+  followTargetsCount: number;
 }
 export interface RegistryCommandScope {
   readonly rootId: number;
@@ -158,10 +161,12 @@ export class RegistryCommands {
       tail: 0,
       unique: 0,
       references: 0,
+      followTargets: 0,
       checking: null,
       count: 0,
       uniqueCount: 0,
       referencesCount: 0,
+      followTargetsCount: 0,
     };
     return command;
   }
@@ -308,15 +313,20 @@ export class RegistryCommands {
    * Only the successful prefix advances. No AFTER callback or root end is invoked here. */
   verify(
     command: CommandToken,
-    kind: "unique" | "references",
+    kind: "unique" | "references" | "followTargets",
     check: (row: AcceptedCommandRow, signal: AbortSignal) => Promise<void>,
     signal: AbortSignal,
   ): Promise<void> {
     const frame = this.#frame(command);
     this.#check(signal);
-    if (frame.checking) invalid();
+    if (frame.checking || !CHECKPOINTS.includes(kind)) invalid();
     const stop = frame.tail,
-      countKey = kind === "unique" ? "uniqueCount" : "referencesCount",
+      countKey =
+        kind === "unique"
+          ? "uniqueCount"
+          : kind === "references"
+            ? "referencesCount"
+            : "followTargetsCount",
       remaining = frame.count - frame[countKey],
       combined = AbortSignal.any([signal, this.scope.signal, this.#stop.signal]);
     const run = async () => {

@@ -5,6 +5,7 @@ import {
   createReach,
   REGISTRY_COMMAND_REACH,
   REGISTRY_COMMAND_IO_REACH,
+  REGISTRY_THREE_CHECKPOINT_REACH,
 } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import type { CommandToken, ReferentialEntry, WriteEvent } from "../access/statement-command.js";
@@ -333,3 +334,86 @@ it.each(seedsFor("next-registry-command-io", [0xb5e6]))(
   },
   60000,
 );
+
+for (const seed of seedsFor("next-registry-three-checkpoints", [0xb621, 0xb622]))
+  it(`keeps unique, follow input and reference watermarks independent ${String(seed)}`, async () => {
+    const reach = createReach("three native checkpoints", REGISTRY_THREE_CHECKPOINT_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 2, max: 5 }),
+        fc.integer({ min: 1, max: 48 }),
+        fc.shuffledSubarray(["unique", "followTargets", "references"] as const, {
+          minLength: 3,
+          maxLength: 3,
+        }),
+        fc.boolean(),
+        async (rounds, count, order, wide) => {
+          reach.beginHistory();
+          const base = wide ? 2 ** 52 : 1,
+            f = fixture(base),
+            command = f.commands.beginCommand(base + 1, 1);
+          const expected: number[] = [],
+            seen: { unique: number[]; followTargets: number[]; references: number[] } = {
+              unique: [],
+              followTargets: [],
+              references: [],
+            };
+          let id = base;
+          try {
+            for (let round = 0; round < rounds; round++) {
+              for (let i = 0; i < count; i++) {
+                const item = row(command, id++);
+                await f.commands.accept(item);
+                expected.push(item.images.row);
+              }
+              for (const kind of order) {
+                await f.commands.verify(
+                  command,
+                  kind,
+                  async (item) => {
+                    seen[kind].push(item.images.row);
+                  },
+                  f.root.signal,
+                );
+                expect(seen[kind], `${kind} sees every newly accepted row independently`).toEqual(
+                  expected,
+                );
+                await f.commands.verify(
+                  command,
+                  kind,
+                  async () => {
+                    throw new Error("checkpoint revisited its completed prefix");
+                  },
+                  f.root.signal,
+                );
+              }
+              expect(f.held).toBe(f.limit);
+            }
+            f.commands.retireCommand(command);
+            for (const kind of order) reach.reach(kind);
+            reach.reach(
+              order.indexOf("followTargets") < order.indexOf("references")
+                ? "follow before references"
+                : "references before follow",
+            );
+            reach.reach(wide ? "wide IDs" : "small IDs");
+            reach.reach("incremental prefixes");
+            reach.reach("no completed-prefix replay");
+          } finally {
+            await f.close();
+          }
+          reach.reach("fixed metadata");
+          reach.reach("zero ownership");
+        },
+      ),
+      {
+        seed,
+        numRuns: 12,
+        examples: [
+          [3, 4, ["unique", "followTargets", "references"], false],
+          [4, 3, ["references", "followTargets", "unique"], true],
+        ],
+      },
+    );
+    reach.assertReached();
+  }, 60000);

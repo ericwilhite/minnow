@@ -8599,3 +8599,18 @@ export const NATIVE_COMMAND_UNDO_REACH = [
   "zero ownership",
   "sequential bodies reuse frame",
 ] as const;
+
+/** Follow preparation cannot advance or borrow native uniqueness/reference check positions. */
+export const REGISTRY_THREE_CHECKPOINT_REACH = [
+  "unique",
+  "followTargets",
+  "references",
+  "follow before references",
+  "references before follow",
+  "wide IDs",
+  "small IDs",
+  "incremental prefixes",
+  "no completed-prefix replay",
+  "fixed metadata",
+  "zero ownership",
+] as const;

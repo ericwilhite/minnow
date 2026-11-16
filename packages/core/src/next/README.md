@@ -4248,3 +4248,8 @@ per-child array. Root integration must capture every original follow range befor
 writes and complete OLD/NEW input images before child mutations. The informational and
 invalid-index scan route, child action writer and compiled body provider remain guarded
 integration work; this helper alone does not enable FK/trigger scheduling.
+
+Native command records keep independent accepted-row checkpoints for uniqueness,
+original follow-input preparation and reference checks. Completing one phase cannot
+suppress another phase or later writes on the same token. This is bookkeeping for
+the guarded provider; the follow preparation/action scheduler is not enabled here.
