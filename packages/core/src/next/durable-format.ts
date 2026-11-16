@@ -45,7 +45,7 @@ export interface FormatField {
   /** Permitted bits; every other bit is reserved-zero. */
   readonly mask?: number;
 }
-/** Header selectors can name an outer envelope (manifest envelope1) plus its logical version8. */
+/** Header selectors can name an outer envelope (manifest envelope1) plus its logical version11. */
 interface Format {
   readonly magic: number | null;
   readonly version: number;

@@ -178,8 +178,8 @@ External input checks expand each distinct object once, with temporary identity 
 to the input graph. Cycles refuse. Internally planned/replayed results use shallow construction
 checks rather than re-walking the entire resident catalog; public replay still checks its operands.
 Writable native/portable decode defaults to full understanding; requiredFeatures is sorted/unique
-and coherent with nonempty sections. Separate pre-fence root reader/writer gate allocation is
-owned by B2; an older writer must refuse any database it cannot fully rewrite.
+and coherent with nonempty sections. Separate pre-fence root reader/writer gates enforce read
+and rewrite capabilities; an older writer refuses any database it cannot fully rewrite.
 Records retain exact typed vectors, decimal coefficients, bigint sequence settings and UTF8
 identifier boundaries. An individual record is capped at 4 MiB. Catalogs stream one admitted
 record at a time across 256 KiB pages and 64-way indexes, including records crossing pages.
@@ -3911,8 +3911,8 @@ Snapshots will rebuild postings from rows; this stage only supplies the portable
 Native foreign-key records preserve exact explicit DELETE/UPDATE actions. An omitted
 ON UPDATE is stored as `follow`, distinct from explicit CASCADE and from PostgreSQL's
 NO ACTION default. The schema inspector exposes these modes and stored trigger identities.
-MCAT foreignKey10's required field9 carries onUpdate; these development bytes need the
-next pre-fence selector allocation before publication. Native RI execution/trigger firing
+MCAT foreignKey10's required field9 carries onUpdate; the outer reader8/writer8/manifest11
+gates cover these development bytes before publication. Native RI execution/trigger firing
 remain the separate joint B6/B5b consumer described in the inventory. Until that driver is
 installed, SQL refuses explicit ON UPDATE modes, ON DELETE SET DEFAULT and informational
 rekeys with 0A000, including raw executor requests. These descriptors cannot select legacy
