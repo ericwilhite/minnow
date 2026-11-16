@@ -208,8 +208,9 @@ export interface TableSnapshot {
    * Never materializes segments or pins metadata for the whole table. Missing means unsupported. */
   portableSegments?(work?: TaskWork): AsyncIterable<Segment>;
   /** Optional admission retry. Existing owner-charged storage may stay resident through
-   * publication. It never changes visibility, and close releases the retention. */
-  prepareRead?(): TableReadRecipe | null;
+   * publication. It never changes visibility, and close releases the retention.
+   * Multiple small native tails require a prepaid budget for recipe metadata. */
+  prepareRead?(options?: { readonly budget: ByteBudget }): TableReadRecipe | null;
 }
 
 export type Segment = GroupSegment | MemorySegment;

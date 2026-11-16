@@ -14,6 +14,7 @@ import { describe, expect, it } from "vitest";
 import type { CatalogView, TableDef } from "../access/catalog.js";
 import type { StatementOptions, TableRules } from "../access/modify.js";
 import { EXECUTOR_COSTS } from "../exec/executor.js";
+import type { StatementRules } from "../exec/statement-rules.js";
 import { createLowerer } from "../lower/create.js";
 import { MemoryCatalog } from "../lower/memory-catalog.js";
 import { ProtocolClient } from "../owner/client.js";
@@ -94,13 +95,23 @@ function spied(planCacheSize?: number) {
   h.writePath.onStatement = (options, catalog) => {
     statements.push({ options, catalog });
   };
-  /** The rules the write path would get for the last statement's table named `name`. */
+  const programs = new WeakMap<StatementOptions, StatementRules>();
+  h.executor.onExecute = (request) => {
+    const last = statements.at(-1);
+    if (last && request.rowRules) programs.set(last.options, request.rowRules);
+  };
+  /** Inspect cached immutable programs; native evaluators require a live admitted scope. */
   const rulesOfLast = (name: string): { rules: TableRules; table: TableDef; version: number } => {
     const last = statements.at(-1);
     if (last === undefined) throw new Error("no statement");
     const table = last.catalog.tableByName(name);
     if (table === undefined) throw new Error(`no table ${name}`);
-    return { rules: last.options.rules(table.id), table, version: last.catalog.version };
+    const scope = programs.get(last.options);
+    return {
+      rules: scope ? scope.lookup(table.id) : last.options.rules(table.id),
+      table,
+      version: last.catalog.version,
+    };
   };
   return { ...h, compiled, rulesOfLast };
 }

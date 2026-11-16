@@ -37,6 +37,7 @@ import {
 import { lowerBlock } from "./query.js";
 import { defaultValue, generatedValue, rowScope, ruleColumns, tableRowScope } from "./rules.js";
 import { nullLiteral } from "./literals.js";
+import { snapshotReturningParameters } from "./returning-input.js";
 
 type Insert = Extract<CompiledStatement, { kind: "insert" }>;
 type Update = Extract<CompiledStatement, { kind: "update" }>;
@@ -158,7 +159,7 @@ function completeRows(
   const output: OutputColumn[] = table.columns.map((def) => ({
     name: def.name,
     type: def.type,
-    nullable: def.nullable,
+    nullable: def.nullable || def.generatedSql !== null,
   }));
   const first: Rel = {
     op: "project",
@@ -167,14 +168,7 @@ function completeRows(
     exprs: base.map((value) => value.expr),
     output,
   };
-  if (!table.columns.some((def) => def.generatedSql !== null)) return first;
-  const scope = tableRowScope(table);
-  const exprs = table.columns.map((def, position) =>
-    def.generatedSql === null
-      ? column(position, def)
-      : generatedValue(def, scope, builder.state).expr,
-  );
-  return { op: "project", id: builder.id(), input: first, exprs, output };
+  return first;
 }
 
 function arbitersFor(table: TableDef, columns: readonly string[]): IndexDef[] {
@@ -227,28 +221,15 @@ function conflictAssignments(
   qualifiers: readonly string[],
   builder: PlanBuilder,
 ): Array<{ readonly column: number; readonly expr: ScalarExpr }> {
-  const width = table.columns.length;
-  const order = new Map(assigned.map((entry, index) => [entry.def.id, index]));
-  const dependents = dependentGenerated(
-    table,
-    new Set(order.keys()),
-    (def) => ({
-      expr: column(2 * width + (order.get(def.id) ?? 0), def),
-      nullable: true,
-      big: def.type.kind === "int64",
-    }),
-    (position, def) => ({
-      expr: column(position, def),
-      nullable: def.nullable,
-      big: def.type.kind === "int64",
-    }),
-    qualifiers,
-    builder,
-  );
-  return [...assigned, ...dependents].map(({ def, value }) => ({
-    column: def.id,
-    expr: value.expr,
-  }));
+  // Generated expressions run with CHECK/NOT NULL in the statement's bound scope.
+  void qualifiers;
+  void builder;
+  return [
+    ...assigned,
+    ...table.columns
+      .filter((def) => def.generatedSql !== null)
+      .map((def) => ({ def, value: { expr: nullLiteral(def.type), nullable: true, big: false } })),
+  ].map(({ def, value }) => ({ column: def.id, expr: value.expr }));
 }
 
 function generatedAssignmentError(def: ColumnDef): PlanningError {
@@ -346,22 +327,29 @@ export function lowerInsert(statement: Insert, builder: PlanBuilder): LoweredWri
   const returning = returningList(statement, table, statement.alias, builder);
   const onConflict =
     statement.onConflict === undefined ? null : conflictClause(statement, table, targets, builder);
-  return {
-    rel: {
-      op: "modify",
-      id: builder.id(),
-      kind: onConflict === null ? "insert" : "upsert",
+  return snapshotReturningParameters(
+    {
+      rel: {
+        op: "modify",
+        id: builder.id(),
+        kind: onConflict === null ? "insert" : "upsert",
+        tableId: table.id,
+        usesRules: builder.catalog.tables.some(
+          (t) => t.checks.length > 0 || t.columns.some((c) => c.generatedSql !== null),
+        ),
+        deferGenerated: table.columns.some((def) => def.generatedSql !== null),
+        input,
+        assigned: [],
+        onRepeat: "error",
+        onConflict,
+        returning: returning?.exprs ?? null,
+        output: outputColumns(returning?.columns ?? []),
+      },
+      columns: returning?.columns ?? [],
       tableId: table.id,
-      input,
-      assigned: [],
-      onRepeat: "error",
-      onConflict,
-      returning: returning?.exprs ?? null,
-      output: outputColumns(returning?.columns ?? []),
     },
-    columns: returning?.columns ?? [],
-    tableId: table.id,
-  };
+    builder,
+  );
 }
 
 function conflictClause(
@@ -526,6 +514,17 @@ function returningWithSources(
   const width = table.columns.length;
   const scope: Scope = {
     column: (reference) => {
+      // The shared parser normalizes plain target-qualified RETURNING lists to
+      // bare names. Resolve those against the affected target before join sources.
+      const own = reference.includes(".")
+        ? undefined
+        : table.columns.find((def) => def.name === reference);
+      if (own)
+        return {
+          expr: column(table.columns.indexOf(own), own),
+          nullable: own.nullable,
+          big: own.type.kind === "int64",
+        };
       const typed = target.scope.column(reference);
       if (typed?.expr.op !== "column") return typed;
       const index = typed.expr.index;
@@ -584,7 +583,6 @@ function returningWithSources(
 
 export function lowerUpdate(statement: Update, builder: PlanBuilder): LoweredWrite {
   const table = targetTable(statement.table, builder);
-  const qualifiers = [table.name, ...(statement.alias === undefined ? [] : [statement.alias])];
   const target = targetRows(table, statement.alias, statement.predicates, statement.from, builder);
   const scope = target.scope;
   const assigned: Array<{ def: ColumnDef; value: Typed }> = [];
@@ -608,26 +606,19 @@ export function lowerUpdate(statement: Update, builder: PlanBuilder): LoweredWri
         );
     assigned.push({ def, value });
   }
-  // Generated columns read the assigned values as columns of a first projection
-  // [locator, assigned…, current target values…, RETURNING passthrough…] (review B6-p2a finding 3).
-  const order = new Map(assigned.map((entry, index) => [entry.def.id, index]));
   const current: Typed[] = [];
-  const dependents = dependentGenerated(
-    table,
-    new Set(order.keys()),
-    (def) => ({ expr: column(1 + (order.get(def.id) ?? 0), def), nullable: true, big: false }),
-    (_position, def) => {
-      const resolved =
-        scope.column(`${qualifiers[qualifiers.length - 1] ?? table.name}.${def.name}`) ??
-        scope.column(def.name);
-      if (resolved === undefined) throw new PlanningError(`column ${def.name} vanished`, "XX000");
-      current.push(resolved);
-      return { ...resolved, expr: column(1 + assigned.length + current.length - 1, def) };
-    },
-    qualifiers,
-    builder,
-  );
+  const dependents = table.columns
+    .filter((def) => def.generatedSql !== null)
+    .map((def) => ({ def, value: { expr: nullLiteral(def.type), nullable: true, big: false } }));
   const { returning, passthrough } = returningWithSources(statement, table, target, builder);
+  const oldRow =
+    returning === null && dependents.length === 0 && table.checks.length === 0
+      ? []
+      : table.columns.map((def) => {
+          const value = target.scope.column(`${statement.alias ?? table.name}.${def.name}`);
+          if (value === undefined) throw new PlanningError(`column ${def.name} vanished`, "XX000");
+          return value;
+        });
   const built = target.build();
   const locatorType = { kind: "locator" as const, tableId: table.id };
   const locator: OutputColumn = { name: "(locator)", type: locatorType, nullable: false };
@@ -649,12 +640,14 @@ export function lowerUpdate(statement: Update, builder: PlanBuilder): LoweredWri
       built.place({ op: "column", index: target.locator, type: locatorType }),
       ...assigned.map((entry) => built.place(entry.value.expr)),
       ...current.map((typed) => built.place(typed.expr)),
+      ...oldRow.map((typed) => built.place(typed.expr)),
       ...passthrough.map((typed) => built.place(typed.expr)),
     ],
     output: [
       locator,
       ...assigned.map((entry) => assignedOutput(entry.def)),
       ...current.map((typed, index) => extra(typed, index)),
+      ...oldRow.map(extra),
       ...passthrough.map(extra),
     ],
   };
@@ -669,34 +662,49 @@ export function lowerUpdate(statement: Update, builder: PlanBuilder): LoweredWri
             { op: "column", index: 0, type: locatorType },
             ...assigned.map((entry, index) => column(1 + index, entry.def)),
             ...dependents.map((entry) => entry.value.expr),
-            ...passthrough.map((typed, index) =>
+            ...oldRow.map((typed, index) =>
               column(1 + assigned.length + current.length + index, { type: typed.expr.type }),
+            ),
+            ...passthrough.map((typed, index) =>
+              column(1 + assigned.length + current.length + oldRow.length + index, {
+                type: typed.expr.type,
+              }),
             ),
           ],
           output: [
             locator,
             ...[...assigned, ...dependents].map((entry) => assignedOutput(entry.def)),
+            ...oldRow.map(extra),
             ...passthrough.map(extra),
           ],
         };
-  return {
-    rel: {
-      op: "modify",
-      id: builder.id(),
-      kind: "update",
+  return snapshotReturningParameters(
+    {
+      rel: {
+        op: "modify",
+        id: builder.id(),
+        kind: "update",
+        tableId: table.id,
+        usesRules: builder.catalog.tables.some(
+          (t) => t.checks.length > 0 || t.columns.some((c) => c.generatedSql !== null),
+        ),
+        deferGenerated: table.columns.some((def) => def.generatedSql !== null),
+        input,
+        assigned: [...assigned, ...dependents].map((entry) => entry.def.id),
+        // A target row joined to several source rows is updated once, from the first (PostgreSQL).
+        onRepeat: statement.from === undefined ? "error" : "first",
+        uniqueTargets: statement.from === undefined,
+        onConflict: null,
+        returning: returning?.exprs ?? null,
+        ...(oldRow.length === 0 ? {} : { oldRow: true }),
+        ...(passthrough.length === 0 ? {} : { passthrough: passthrough.length }),
+        output: outputColumns(returning?.columns ?? []),
+      },
+      columns: returning?.columns ?? [],
       tableId: table.id,
-      input,
-      assigned: [...assigned, ...dependents].map((entry) => entry.def.id),
-      // A target row joined to several source rows is updated once, from the first (PostgreSQL).
-      onRepeat: statement.from === undefined ? "error" : "first",
-      onConflict: null,
-      returning: returning?.exprs ?? null,
-      ...(passthrough.length === 0 ? {} : { passthrough: passthrough.length }),
-      output: outputColumns(returning?.columns ?? []),
     },
-    columns: returning?.columns ?? [],
-    tableId: table.id,
-  };
+    builder,
+  );
 }
 
 export function lowerDelete(statement: Delete, builder: PlanBuilder): LoweredWrite {
@@ -704,6 +712,14 @@ export function lowerDelete(statement: Delete, builder: PlanBuilder): LoweredWri
   if (statement.truncate === true) return lowerTruncate(table, builder);
   const target = targetRows(table, statement.alias, statement.predicates, statement.from, builder);
   const { returning, passthrough } = returningWithSources(statement, table, target, builder);
+  const oldRow =
+    returning === null
+      ? []
+      : table.columns.map((def) => {
+          const value = target.scope.column(`${statement.alias ?? table.name}.${def.name}`);
+          if (value === undefined) throw new PlanningError(`column ${def.name} vanished`, "XX000");
+          return value;
+        });
   const built = target.build();
   const locatorType = { kind: "locator" as const, tableId: table.id };
   const input: Rel = {
@@ -712,10 +728,16 @@ export function lowerDelete(statement: Delete, builder: PlanBuilder): LoweredWri
     input: built.rel,
     exprs: [
       built.place({ op: "column", index: target.locator, type: locatorType }),
+      ...oldRow.map((typed) => built.place(typed.expr)),
       ...passthrough.map((typed) => built.place(typed.expr)),
     ],
     output: [
       { name: "(locator)", type: locatorType, nullable: false },
+      ...oldRow.map((typed, index) => ({
+        name: `(old ${String(index)})`,
+        type: typed.expr.type,
+        nullable: typed.nullable,
+      })),
       ...passthrough.map((typed, index) => ({
         name: `(passthrough ${String(index + 1)})`,
         type: typed.expr.type,
@@ -723,23 +745,32 @@ export function lowerDelete(statement: Delete, builder: PlanBuilder): LoweredWri
       })),
     ],
   };
-  return {
-    rel: {
-      op: "modify",
-      id: builder.id(),
-      kind: "delete",
+  return snapshotReturningParameters(
+    {
+      rel: {
+        op: "modify",
+        id: builder.id(),
+        kind: "delete",
+        tableId: table.id,
+        usesRules: builder.catalog.tables.some(
+          (t) => t.checks.length > 0 || t.columns.some((c) => c.generatedSql !== null),
+        ),
+        deferGenerated: table.columns.some((def) => def.generatedSql !== null),
+        input,
+        assigned: [],
+        onRepeat: statement.from === undefined ? "error" : "first",
+        uniqueTargets: statement.from === undefined,
+        onConflict: null,
+        returning: returning?.exprs ?? null,
+        ...(oldRow.length === 0 ? {} : { oldRow: true }),
+        ...(passthrough.length === 0 ? {} : { passthrough: passthrough.length }),
+        output: outputColumns(returning?.columns ?? []),
+      },
+      columns: returning?.columns ?? [],
       tableId: table.id,
-      input,
-      assigned: [],
-      onRepeat: statement.from === undefined ? "error" : "first",
-      onConflict: null,
-      returning: returning?.exprs ?? null,
-      ...(passthrough.length === 0 ? {} : { passthrough: passthrough.length }),
-      output: outputColumns(returning?.columns ?? []),
     },
-    columns: returning?.columns ?? [],
-    tableId: table.id,
-  };
+    builder,
+  );
 }
 
 /**
@@ -967,6 +998,10 @@ export function lowerMerge(statement: Merge, builder: PlanBuilder): LoweredWrite
       id: builder.id(),
       kind: "merge",
       tableId: table.id,
+      usesRules: builder.catalog.tables.some(
+        (t) => t.checks.length > 0 || t.columns.some((c) => c.generatedSql !== null),
+      ),
+      deferGenerated: table.columns.some((def) => def.generatedSql !== null),
       input,
       assigned: [],
       onRepeat: "error",
@@ -1079,6 +1114,10 @@ export function lowerBatchWrite(
       id: builder.id(),
       kind: onConflict === null ? "insert" : "upsert",
       tableId: table.id,
+      usesRules: builder.catalog.tables.some(
+        (t) => t.checks.length > 0 || t.columns.some((c) => c.generatedSql !== null),
+      ),
+      deferGenerated: table.columns.some((def) => def.generatedSql !== null),
       input,
       assigned: [],
       onRepeat: "error",

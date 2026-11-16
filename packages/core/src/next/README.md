@@ -202,7 +202,11 @@ summaries plus contiguous fragment offsets, and reclamation retires every old in
 The reader/manifest/commit-body development selectors are 7/8/6; older unpublished selectors
 refuse. The released 1.0 format has no supported predecessor yet. Trigger family20 now carries dialect-versioned bodies and stable OLD/NEW/target dependencies
 (body30/binding31/column32). Definitions and CREATE/DROP lowering persist through WAL and
-checkpoint; trigger scheduling/body execution is the next integration unit. FTS declarations persist without making an index ready. Snapshot catalog frame
+checkpoint; trigger scheduling/body execution is the next integration unit. Writes whose event
+can reach a stored trigger refuse before mutation until that runtime is installed. Rule admission
+walks stable trigger target IDs and referential edges with event, assigned columns and remaining
+body budget; informational update-follow edges and generated keys are included. Unrelated writes
+keep their existing execution path. FTS declarations persist without making an index ready. Snapshot catalog frame
 adapters are a separate integration step over the same portable MCAT stream.
 
 ### Relational catalog and managed migration
@@ -230,10 +234,10 @@ column, and DSL counters advance past explicit safe integer values. SQL SERIAL a
 IDENTITY use PostgreSQL sequence semantics instead. Restart uses the existing durable reservation
 horizon; unused reserved values may be skipped after recovery.
 
-Limits: general `modify` IR execution is still outside this catalog stage. SQL/DSL definition
-and query differentials use PGlite; native TableWriter/persistence tests do not claim SQL DML
-execution. ALWAYS identity retains its generation mode and rejects explicit assignments; identity options
-still refuse with 0A000 instead of losing the clause.
+The catalog-stage SQL/DSL definition and query differentials use PGlite; its native
+TableWriter/persistence tests are separate from the generated SQL DML execution suites.
+ALWAYS identity is retained and enforces DEFAULT versus explicit assignment. Unsupported
+identity options refuse with 0A000 instead of losing the clause.
 Named enums that shadow an underlying built-in `pg_type` name require SQL namespaces and
 explicitly refuse; quoted aliases such as `"integer"` retain their separate enum identity.
 Named types accept at most 65,536 labels (the current two-byte native sort rank), each at
@@ -1589,8 +1593,12 @@ with at least seven of nine pairs favouring control is an accepted regression. O
 profiles are outside the component timing; query materialization remains in whole timing.
 The report includes CPU samples, full spreads, checkpointed partial rounds, profiles and the
 actual transformed JS needed to interpret line-level ticks. No baseline is an executor path.
-Unbounded, value-producing `indexRange` IR remains behind the internal `keyOrder:true`
-diagnostic opt-in. Ordinary SQL selects the admitted index recipe for a direct, complete
+Query-root `keyLookup` and `indexRange` IR remain behind the internal `keyOrder:true`
+diagnostic opt-in, including LIMIT zero. The general cursor/fetch recipe is available without
+that opt-in on the modification input's single-source path through unary operators. Its
+producer atomically reserves the complete DML cursor/fetch minimum. Cursors beneath join
+or set-operation branches retain the diagnostic gate: a MODIFY ancestor alone does not
+prove the branch minimum. This does not enable query-root index predicates. Ordinary SQL selects the admitted index recipe for a direct, complete
 primary-key ORDER BY with LIMIT or OFFSET, including OFFSET without LIMIT. The pinned
 catalog must certify the same unique key columns, byte collation and direction. Direct
 projections are supported; row-locking intent, filters, computed ordering, partial keys, mixed
@@ -1628,12 +1636,35 @@ must keep that grant alive for the bound vectors' lifetime. Computed join/sort/w
 into hidden columns and removed from visible results. No runtime code generation is used.
 
 The owner composition uses it by default; protocol tests over `StandinWritePath` explicitly keep
-their synthetic executor. DML, keyed nested-loop joins, index lookup, bounded or locator-producing
-index ranges, fetch, init plans, apply, UNION/INTERSECT and
-recursion are still typed prepare-time refusals, as are unsupported existing kernel overloads.
+their synthetic executor. Native INSERT VALUES/SELECT, UPDATE, DELETE, ON CONFLICT and RETURNING
+execute with statement snapshot input spools. Joined/index inputs retain locator identity;
+repeat tracking and returned rows use charged, spillable state. SQL writers without a unique-target
+proof require the admitted tracker before writer lookup, including raw executor requests. The
+direct-native legacy target Set cannot be selected by SQL. Complete-row validation includes
+closed text sets as well as NOT NULL and CHECK, including precise generated-error replay.
+A terminal source SQL value error stays after its sealed candidate prefix: earlier rows run
+through their row rules and RETURNING before that error is raised. A failed batch preparation
+replays complete candidates in order, so a later row's CHECK cannot hide an earlier RETURNING
+error. NEW+RETURNING also binds this shared validator for column restrictions on tables
+without CHECK/generated expressions; raw executor callers must supply the admitted scope.
+The explicit column-only binding refuses tables whose lowered expression rules are needed.
+Cancellation, admission, unsupported plans and storage faults fail immediately; they
+never trigger candidate replay. Uniqueness and FK checks keep their statement-end boundary.
+The generated comparison uses PostgreSQL for error priority. Shipped nullable arithmetic,
+DO NOTHING proposal skipping and batch validation can choose a different error; its existing
+outcome and rollback are observed separately. Volatile kernels remain refused; this change
+does not make eager materialization safe for volatile side effects or enable a trigger host.
+The independent IR reference also recomputes deferred generated columns after UPDATE and
+conflict assignments, including typed batch upserts, before validation and RETURNING.
+Closed-set failures retain their column identity and active physical row order. Shared row rules stay alive
+through native FK actions. Unsupported modification kinds and kernel overloads remain typed refusals.
 This factory does not turn those missing capabilities into current-engine fallbacks. The
 lowerer emits joins and windows for the factory; SQL catalogue tests exercise them through
 real storage and result delivery.
+
+Upsert OLD fetches size and decode exactly the conflicting physical row. A memory segment
+that publishes between locator capture and fetch keeps the same row/chunk coordinates and
+uses the reader's prepaid bounded output; it does not decode a sparse mask's whole chunk.
 
 The whole execution minimum includes scan resident pages, a serialized read step, downstream
 fixed buffers, private per-breaker progress, input parameters and one result frame. Nothing is
@@ -1681,7 +1712,7 @@ rule adapts only direct integer AVG outputs according to C11; it grants no float
 over the real write path and flushed MemoryBackend storage. Ingestion is outside query timing;
 this is not the browser Gate B lane.
 
-The full interface contract includes the following (DML remains unimplemented by the factory):
+The full interface contract includes the following:
 
 - `executor.prepare(plan)` compiles a plan once; execute accepts raw values and binds after
   admission. Explicit `bind(values, grant)` also requires an admitted execution budget;
@@ -3511,8 +3542,9 @@ coalesced window; it does not skip the gzip/large-value sizing proof or raise th
 `npx vite-node scripts/read-retention-bench.mts --compare=REV` runs five interleaved frozen-parent/
 candidate component rounds, checks physical frame bytes (including masks, padding and dictionary
 deltas), and guards warm repeated reads plus real persisted SQL scans and point selections.
-The current executor refuses the `keyLookup` operator; SQL point selection uses `id + 0` to
-exercise the supported scan path. The separate storage point-read guard is a direct single-blob
+The ordinary query executor refuses `keyLookup` without diagnostic opt-in; this query benchmark
+uses `id + 0` to exercise the supported scan path. DML's separately admitted input recipe is
+not a query-point-lookup path. The separate storage point-read guard is a direct single-blob
 cache hit. This benchmark does not claim indexed SQL point-lookup performance.
 
 `MINNOW_EXPORT_RETENTION_REFERENCE=REV` freezes the entire core at that Git revision on its
@@ -3851,7 +3883,11 @@ ON UPDATE is stored as `follow`, distinct from explicit CASCADE and from Postgre
 NO ACTION default. The schema inspector exposes these modes and stored trigger identities.
 MCAT foreignKey10's required field9 carries onUpdate; these development bytes need the
 next pre-fence selector allocation before publication. Native RI execution/trigger firing
-remain the separate joint B6/B5b consumer described in the inventory.
+remain the separate joint B6/B5b consumer described in the inventory. Until that driver is
+installed, SQL refuses explicit ON UPDATE modes, ON DELETE SET DEFAULT and informational
+rekeys with 0A000, including raw executor requests. These descriptors cannot select legacy
+follow behavior or silently skip informational follow. Enforced omitted-update follow,
+non-key updates and DO NOTHING retain their existing execution paths.
 
 Current-prefix pins from Statement.readOwn are phase pins, not immutable data snapshots.
 Consume/spool every body input before mutation; once mutation begins, all data/index rereads
@@ -4082,3 +4118,138 @@ FTS preparation overlays keep the native root's provisional retirement and build
 bookkeeping through every root clone, including extent-list replacement. Adoption of the exact
 installed root drains deferred native staging retirement once (R25); a preparation publication
 must not leave that retirement queued for the next table publication.
+
+Native statement rule admission follows the shipped trigger budget: root1 and body0 may
+fire, and their body at -1 may write but cannot fire another matching user trigger.
+Referential actions preserve that signed budget. The static walk includes rules for both
+body levels and distinguishes the same table reached with different budgets; SQL trigger
+firing remains guarded until the joint runtime is installed.
+
+### Root registry scratch primitives (staging)
+
+`owner/registry-directory.ts` stores fixed 128-byte records under a namespace, table ID and
+row ID. A 30 KiB charged cursor/cache serves all records through one spill file. IDs keep all
+53 safe integer bits. Dirty leaves and a copy-on-write radix path go to scratch; row count
+never grows a resident descriptor map. Callers provide their own prepaid record buffers.
+
+`owner/registry-fragments.ts` stores variable image payloads in a second shared spill file.
+Two 64 KiB charged buffers stream reverse-linked fragments, without an array of page refs or
+a whole-value encoding copy. Each fragment checks cancellation and the root task clock.
+Close fences pending create/read/write/fill/clock work before releasing either file or credit.
+Spill allocation failure, checksum failure and malformed links fail the operation and release
+all owned scratch at close.
+
+These are internal building blocks. They do not install `NativeCommandBoundary`, change
+`Statement.end`, execute referential actions or enable SQL triggers. Generated component
+checks cover record eviction/overwrite, sparse table/row IDs, exact replay, corruption,
+constructor failures and cancellation fences. Native statement/provider and SQL differential
+coverage belong to the later integration, alongside the existing refusal guards.
+
+`owner/registry-targets.ts` seals original child-identity ranges in the same descriptor file.
+Its 1 KiB charged cursor records table-local original-to-current native row versions and
+retains no row-ID map. A later update changes the canonical current version; deletion marks
+it retired. Replaying an earlier captured range resolves those identities rather than looking
+up rewritten FK values. Empty ranges stay independently replayable. Callers must capture all
+original `follow` matches before applying any follow action. This component neither finds FK
+matches nor schedules writes; those remain native-provider integration work.
+
+`owner/registry-images.ts` and `registry-scalar.ts` capture immutable physical OLD/NEW
+vectors in that scratch layout. Full leases return one row; projected leases resolve stable
+column IDs and leave other columns explicitly `ROW_IMAGE_UNREAD`, never SQL NULL. The
+fixed image helper remains 30 KiB directory + 2 KiB image metadata + two 64 KiB buffers.
+Only requested payloads are decoded. Scalar tiers, NULLs, numeric scales/specials and exact
+int64/interval lanes survive capture and replay. Retained buffers are charged separately
+from one shared transient NUMERIC decoder workspace; column count does not multiply that
+workspace. Encode scratch is prepaid before capture. Release clears vector arrays before
+refunding them; close cancels progress waits and fences payload I/O and active leases.
+
+These image components use the frozen consumer ABI and pass through the real typed trigger
+binding copier in component tests. They still do not install a native statement provider or
+turn on SQL firing. The caller supplies admitted scope/progress and immutable table metadata;
+statement/command ownership, row rules, accepted-write hooks and deferred RI execution are
+separate integration responsibilities.
+
+`RegistryImages.describe` fills caller-prepaid NEW variable-width sizes from directory
+records, without reading scalar payloads or creating an image lease. The root can prepare
+writer growth from these exact sizes before borrowing OLD/NEW values. NULL and fixed-width
+cells need no variable payload credit. Metadata cancellation and close fence pending backing
+reads before returning the registry's fixed charge. Real native primary tests use this path;
+it does not supply the compiled body host or enable SQL firing.
+
+`owner/registry-commands.ts` records command/frame ownership, accepted native row IDs and
+immutable RI descriptors in the shared directory. Its fixed frame slots retain separate
+uniqueness and reference cursors. Every action checks its newly accepted child work, even
+when an earlier action already verified the same command token. Retired commands and RI
+IDs refuse; signed trigger budgets survive replay. Its command-local target tracker uses
+command/table namespace records and 1024-row bitmaps in that same shared directory, with the existing
+128-byte scratch record. Nested/reused commands have independent seen state; ancestors
+retain theirs. No file or resident Set is created per command. Every directory await rechecks
+the input locator pin and live command before target acceptance. RI inputs with a proven
+unique captured source bypass SQL repeat tracking so separate actions may rewrite a child.
+Close fences pending verification callbacks
+before returning metadata credit. This module stores work; native constraint verification,
+accepted-write capture and RI execution remain responsibilities of the native provider.
+
+The registry lives in `owner/`: it composes native write access, spill storage and execution
+leases. Keeping it there preserves the dependency boundary; `write/` does not depend on the
+spill layer or trigger executor. The existing dependency-rule suite enforces that placement.
+
+`owner/command-checks.ts` verifies native command keys without ending the statement. It uses
+fresh scoped prefix pins and bounded, root-funded index cursors, stopping after two unique
+holders or one reference holder. Projected image leases end before cursor progress is funded.
+An already checked command token never covers a later action's accepted rows; obsolete deleted
+versions do not produce reference failures. A private fixed account also returns provisional
+key buffers when construction fails. Generated tests compare real native key checks against
+PGlite and shipped success/failure, including published sources and successive accepted writes.
+This checker is a provider component; it does not execute RI actions or install SQL firing.
+
+`write/credits.ts` also provides a prepared-row reservation for the forthcoming native
+primary adapter. The root funds writer growth first, then protects that already admitted
+headroom before borrowing an image. One paid 256-byte token keeps reclaim and metadata/merge
+transfers from consuming the next primary step. Releasing the token preserves charges for
+accepted native buffers; owner close requires the step to be retired.
+
+`write/primary-command.ts` is the private native consumer of that reservation. A root installs
+it before any statement writes, prepares progress with no borrowed image, then applies one
+complete physical OLD/NEW row. It returns the new native identity and leaves command
+uniqueness, references and RI sequencing to the root registry. Retained legacy writers cannot
+bypass the installed capability or enqueue legacy deferred work. Complete-row validation uses
+the shared bound rules; the root remains responsible for BEFORE and generated evaluation.
+Statement end invokes the supplied root checkpoint, and native owner close fences that work
+before rollback and account release, including callback failures. Command cancellation releases
+its wait on independently owned committed maintenance; staging remains fenced to completion.
+A weak completion cache prevents cancelled waits from retaining command reaction lists.
+
+This is a staged internal API, with synthetic final controller callbacks in its native tests.
+Native append undo ranges coalesce only within one command identity, including when body
+frames are reused. Each retained range keeps one funded FTS flag; registry checkpoints
+remain independent of undo-array positions.
+Accepted native-primary UPDATE/DELETE calls preserve the same FTS mutation notifications,
+funded row undo and atomic WAL history as legacy writers. Ordinary INSERT keeps insert deltas;
+rollback and savepoints retire this history with the rows.
+Its initial preflight refuses auto-increment and wide/variable indexed domains before writes.
+No SQL path installs it yet. The full native trigger/RI provider and compiled body-input host
+remain separate integration work; the existing SQL refusal guards remain in force.
+
+`owner/command-execution.ts` assembles the native command boundary over those image,
+command and constraint components. Direct RI entries are compared with the canonical
+registry record; each completed action verifies newly accepted child uniqueness before
+retiring its scalar ID. No token-level cache or outer AFTER drain is used. Complete
+reference checks retire command slots for reuse. Callback slots are fixed by the prepared
+frame bound, cancellation listeners retire after each operation, and close fences callbacks
+and undelivered image leases before returning component credit. The root supplies a real
+child-capture/action executor and closes shared scratch/pins afterward. This assembly still
+has no compiled trigger-body host or generic SQL enablement; refusal guards remain.
+
+`NativeCommandChecks.captureChildren` seals an OLD parent key's complete child identity
+range through the prepaid native support-index cursor and shared spilled directory. It
+uses projected key bindings, closes its phase pin/cursor before returning, and retains no
+per-child array. Root integration must capture every original follow range before RI
+writes and complete OLD/NEW input images before child mutations. The informational and
+invalid-index scan route, child action writer and compiled body provider remain guarded
+integration work; this helper alone does not enable FK/trigger scheduling.
+
+Native command records keep independent accepted-row checkpoints for uniqueness,
+original follow-input preparation and reference checks. Completing one phase cannot
+suppress another phase or later writes on the same token. This is bookkeeping for
+the guarded provider; the follow preparation/action scheduler is not enabled here.

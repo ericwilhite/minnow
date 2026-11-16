@@ -341,6 +341,27 @@ export class JoinTable {
     return true;
   }
 
+  /** DML chooses the earliest source row. Reverse each completed LIFO chain in place;
+   * no row-sized scratch or new retained state, and every link is bounded sliced work. */
+  *oldestFirst(slice: Slice): SlicedJob<void> {
+    if (this.next === null) return;
+    const heads = this.kind === "direct" ? this.#heads : this.#slots;
+    const stride = this.kind === "direct" ? 1 : this.#stride;
+    for (let slot = 0; slot < heads.length; slot += stride) {
+      let row = heads[slot] ?? 0,
+        previous = 0;
+      while (row !== 0) {
+        const next = this.next[row - 1] ?? 0;
+        this.next[row - 1] = previous;
+        previous = row;
+        row = next;
+        if (slice.due()) yield;
+      }
+      heads[slot] = previous;
+      if (slice.due()) yield;
+    }
+  }
+
   #linkDuplicate(row: number, head: number): boolean {
     if (this.next === null) {
       if (!this.#allocate(this.rows * 4)) return false;

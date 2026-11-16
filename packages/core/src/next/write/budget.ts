@@ -65,12 +65,16 @@ export class MetadataBudget implements ByteBudget {
    * it does not repeatedly encode/abort while a reader still owns that memory. The budget takes
    * no loan. Publication owners place their retry outside their provisional writer and lock.
    */
-  retry<T>(work: () => MaybePromise<T>, check: () => void): MaybePromise<T> {
+  retry<T>(
+    work: () => MaybePromise<T>,
+    check: () => void,
+    grow?: (wanted: number) => Promise<void>,
+  ): MaybePromise<T> {
     const refused = (error: unknown): MaybePromise<T> => {
       if (!(error instanceof MetadataPressure)) throw error;
-      return this.#wait(error.wanted, check).then(() => {
+      return this.#wait(error.wanted, check, grow).then(() => {
         check();
-        return this.retry(work, check);
+        return this.retry(work, check, grow);
       });
     };
     try {
@@ -81,10 +85,15 @@ export class MetadataBudget implements ByteBudget {
     }
   }
 
-  async #wait(wanted: number, check: () => void): Promise<void> {
-    if (this.grow !== undefined) {
+  async #wait(
+    wanted: number,
+    check: () => void,
+    override?: (wanted: number) => Promise<void>,
+  ): Promise<void> {
+    const grow = override ?? this.grow;
+    if (grow !== undefined) {
       check();
-      await this.grow(wanted);
+      await grow(wanted);
       check();
       return;
     }

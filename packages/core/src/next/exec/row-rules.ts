@@ -1,8 +1,14 @@
 /** Execution-owned row-rule kernels. Cached programs never retain mutable buffers or grants. */
+import type { TableDef } from "../access/catalog.js";
 import type { ScalarExpr } from "../ir/ir.js";
 import type { Vector } from "../vector/vector.js";
 import type { TableRules } from "../access/modify.js";
-import { CheckViolationError, NotNullViolationError } from "../access/modify.js";
+import {
+  CheckViolationError,
+  ClosedSetViolationError,
+  NotNullViolationError,
+} from "../access/modify.js";
+import { varlenMatchesString } from "../vector/varlen.js";
 import { expressionDataError } from "./expression-errors.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import { BATCH_ROWS, type Batch, type Selection } from "../vector/vector.js";
@@ -18,6 +24,8 @@ import {
 import { tableRuleProgram, ruleRetentionBytes, type RuleProgram } from "./rule-program.js";
 
 export interface BoundTableRules extends TableRules {
+  /** Caller fences all output borrows first; keep kernels/program alive for later FK actions. */
+  retireGenerated(): void;
   close(): void;
 }
 export interface RowRuleContext extends RowRuleOptions {
@@ -37,7 +45,26 @@ function capacityOf(options: RowRuleOptions): number {
  * Data-dependent varlen/coefficient growth is separate and charged at evaluation time. */
 export function tableRuleMinimumBytes(rules: TableRules, capacity = BATCH_ROWS): number {
   const program = tableRuleProgram(rules);
-  if (!program) return 0;
+  return program ? programMinimumBytes(program, capacity) : 0;
+}
+/** Column restrictions use the same complete-row evaluator even without expression IR.
+ * Preserve the cached NO_RULES fast path unless a caller explicitly requests this binding. */
+function columnProgram(table: TableDef): RuleProgram {
+  if (table.checks.length || table.columns.some((column) => column.generatedSql !== null))
+    throw new TypeError("Column-only rules cannot replace lowered CHECK/generated rules");
+  return { table, checks: [], generated: [] };
+}
+export function columnRuleMinimumBytes(table: TableDef, capacity = BATCH_ROWS): number {
+  return programMinimumBytes(columnProgram(table), capacity);
+}
+export function bindColumnRules(
+  table: TableDef,
+  charge: ByteCharge,
+  options: RowRuleOptions = {},
+): BoundTableRules {
+  return new Evaluator(columnProgram(table), charge, options);
+}
+function programMinimumBytes(program: RuleProgram, capacity: number): number {
   capacityOf({ capacity });
   const probe = (rows: number) => {
     let used = 0,
@@ -93,6 +120,9 @@ export function bindTableRules(
     : {
         check: rules.check.bind(rules),
         generate: rules.generate.bind(rules),
+        retireGenerated() {
+          return undefined;
+        },
         close() {
           return undefined;
         },
@@ -120,6 +150,7 @@ function total(expr: ScalarExpr): boolean {
 class Evaluator implements BoundTableRules {
   readonly #arena: OutputArena;
   readonly #one: Selection;
+  readonly #prefix: Selection;
   readonly #checks;
   readonly #generated;
   #closed = false;
@@ -141,6 +172,8 @@ class Evaluator implements BoundTableRules {
           program.generated.length * 64,
       );
       this.#one = { rows: new Uint16Array(1), count: 1 };
+      arena.take(2 * capacity);
+      this.#prefix = { rows: new Uint16Array(capacity), count: 0 };
       const context = {
         arena,
         params: { slots: [] },
@@ -211,6 +244,47 @@ class Evaluator implements BoundTableRules {
       for (const c of checks) c.value = null;
     }
   }
+  validate(batch: Batch, changed: readonly number[] | null): void {
+    this.#validate(batch);
+    const prefix = this.#prefix;
+    prefix.count = 0;
+    let columnFailure: NotNullViolationError | ClosedSetViolationError | null = null;
+    for (let k = 0; k < (batch.selection?.count ?? batch.length); k++) {
+      const row = batch.selection?.rows[k] ?? k;
+      columnFailure = this.#columnFailure(batch, row);
+      if (columnFailure) break;
+      prefix.rows[prefix.count++] = row;
+    }
+    const failure = this.check(columnFailure ? { ...batch, selection: prefix } : batch, changed);
+    if (failure) throw new CheckViolationError(this.program.table.id, failure.checkId, failure.row);
+    if (columnFailure) throw columnFailure;
+  }
+  #columnFailure(
+    batch: Batch,
+    row: number,
+  ): NotNullViolationError | ClosedSetViolationError | null {
+    for (const [c, column] of this.program.table.columns.entries()) {
+      const value = batch.columns[c];
+      if (!value) throw new TypeError("Missing complete-row column");
+      if (!isValidSlot(value, row)) {
+        if (!column.nullable)
+          return new NotNullViolationError(this.program.table.id, column.id, row);
+        continue;
+      }
+      if (column.allowedValues !== undefined) {
+        const data = flatOf(value).data;
+        if (data.layout !== "varlen")
+          throw new TypeError("A closed text set received a non-text vector");
+        if (
+          !column.allowedValues.some((label) =>
+            varlenMatchesString(data, slotIndex(value, row), label),
+          )
+        )
+          return new ClosedSetViolationError(this.program.table.id, column.id, row);
+      }
+    }
+    return null;
+  }
   generate(batch: Batch, changed: readonly number[]): void {
     this.#validate(batch);
     try {
@@ -245,13 +319,7 @@ class Evaluator implements BoundTableRules {
         }
         // All generated values precede constraint checking for this row. A NULL
         // generated result is a 23502, not a later row's arithmetic exception.
-        for (const [i, col] of this.program.table.columns.entries()) {
-          const v = columns[i];
-          if (!col.nullable && v && !isValidSlot(v, row))
-            throw new NotNullViolationError(this.program.table.id, col.id, row);
-        }
-        const failure = this.check(one, changed);
-        if (failure) throw new CheckViolationError(this.program.table.id, failure.checkId, row);
+        this.validate(one, changed);
         arena.retireVarlen();
       }
     } finally {
@@ -295,6 +363,14 @@ class Evaluator implements BoundTableRules {
         throw error;
       }
     }
+  }
+  retireGenerated(): void {
+    if (this.#closed) return;
+    for (const g of this.#generated) {
+      g.store?.close();
+      g.store = null;
+    }
+    this.#arena.retireVarlen();
   }
   close(): void {
     if (this.#closed) return;

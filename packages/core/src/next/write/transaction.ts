@@ -17,7 +17,7 @@ import { taskClock, yieldTask } from "../task.js";
  * a live row is only a suspect, re-verified at the end against everything the statement wrote.
  */
 import { requireWritableCatalogInput } from "../access/catalog-capabilities.js";
-import { indexLimitViolation } from "./index-limits.js";
+import { indexLimitViolation, indexMaximumKeyBytes } from "./index-limits.js";
 import { scanIndexHolders } from "./index-scan.js";
 import { SMALL_COMMIT_BYTES, type BufferAllocator } from "./commit-buffers.js";
 import {
@@ -58,7 +58,8 @@ import {
 } from "../access/write-path.js";
 import type { BodyEffect } from "../format/log-frame.js";
 import { encodeKeyBatch, KeyBatch, type KeyColumn } from "../keys/key-encoding.js";
-import { samePhysicalType } from "../types.js";
+import { layoutOf, samePhysicalType } from "../types.js";
+import type { WriteEvent } from "../access/statement-command.js";
 import { int64At } from "../vector/int64.js";
 import { compareBytes, varlenMatchesString } from "../vector/varlen.js";
 import {
@@ -82,7 +83,9 @@ import {
   otherIndexLayersEndBefore,
   type TableSnapshotImpl,
 } from "./view.js";
-import { need, MemtableMemoryError } from "./bytes.js";
+import { need, MemtableMemoryError, byteString } from "./bytes.js";
+import type { PreparedWriteCredit } from "./credits.js";
+import { NativePrimaryAdapter, type NativePrimaryScope } from "./primary-command.js";
 
 /** Everything committed and pending (constraint checks see the whole transaction). */
 export const ALL = PENDING_BASE + MAX_STATEMENTS;
@@ -124,6 +127,12 @@ export interface EngineHooks {
   admit(bytes: number, growth?: () => number): MaybePromise<void>;
   /** End-of-statement admission after producer borrows and check views retire. */
   prepareFtsMutation?(signal?: AbortSignal): MaybePromise<void>;
+  /** Command primary prepayment, before the root borrows a decoded image. */
+  reserveCommandRows?(
+    bytes: number,
+    growth: () => number,
+    signal: AbortSignal,
+  ): Promise<PreparedWriteCredit>;
   commit(tx: TransactionImpl, request: CommitRequest | null): Promise<CommitReceipt>;
   release(tx: TransactionImpl): void;
   label(): string;
@@ -285,6 +294,11 @@ export class TransactionImpl implements WriteTransaction {
   /** @internal */
   ended(statement: StatementImpl): void {
     if (this.#open === statement) this.#open = null;
+  }
+
+  /** Owner close fences command callbacks before synchronous native rollback. */
+  closeNativeCommands(): Promise<void> {
+    return this.#open?.closeNativeCommands() ?? RESOLVED;
   }
 
   savepoint(): Savepoint {
@@ -700,19 +714,33 @@ export class StatementImpl implements Statement {
   readonly seq: number;
   readonly tx: TransactionImpl;
   readonly #rules: (tableId: number) => TableRules;
-  readonly #signal: AbortSignal | undefined;
+  #signal: AbortSignal | undefined;
   readonly #start: number;
   #state: "open" | "failed" | "ended" = "open";
   #writers: Map<string, TableWriterImpl> | null = null;
   #plain: TableWriterImpl | null = null;
+  #commandMode = false;
+  #commands: NativePrimaryAdapter | null = null;
   /** Row ids this statement updated or deleted, per table (row-affected-twice). */
   #touchedMap: Map<number, Set<number>> | null = null;
+  readonly targets: StatementOptions["targets"];
 
   get touched(): Map<number, Set<number>> {
     return (this.#touchedMap ??= new Map());
   }
   /** Whether this statement inserted row `rowId` of `tableId` (ON CONFLICT `statement`). */
   inserted(tableId: number, rowId: number): boolean {
+    // Native IDs only advance. A row below the statement-visible high-water mark
+    // cannot have been inserted by this statement. Do not rescan its entire growing
+    // undo stream for every existing-row upsert; inspect only immutable view facts.
+    const start = this.view.internalTable(tableId);
+    const groups = start.tableView.groups;
+    let before = groups.count === 0 ? -1 : groups.get(groups.count - 1).lastRowId;
+    for (const memtable of start.tableView.memtables) {
+      const count = memtable.visibleRows(this.view.bound);
+      if (count > 0) before = Math.max(before, memtable.firstRowId + count - 1);
+    }
+    if (rowId <= before) return false;
     const undo = this.tx.undo;
     for (let k = this.#start; k < undo.length; k++) {
       const entry = undo[k];
@@ -757,6 +785,7 @@ export class StatementImpl implements Statement {
     this.seq = pendingSeq(ordinal);
     this.#rules = options.rules;
     this.#signal = options.signal;
+    this.targets = options.targets;
     this.#start = tx.undo.length;
     this.#startCatalog = tx.catalog;
   }
@@ -789,6 +818,34 @@ export class StatementImpl implements Statement {
 
   rules(tableId: number): TableRules {
     return this.#rules(tableId);
+  }
+
+  /** Internal composition capability; no SQL caller installs it until its whole route is ready. */
+  openNativeCommands(scope: Omit<NativePrimaryScope, "statement">): NativePrimaryAdapter {
+    this.#checkOpen();
+    if (this.#commandMode || this.tx.undo.length !== this.#start)
+      throw new TransactionStateError("Native command scope must precede statement writes");
+    const commands = new NativePrimaryAdapter({ ...scope, statement: this });
+    this.#commands = commands;
+    this.#commandMode = true;
+    return commands;
+  }
+
+  /** Existing/retained legacy writers must not bypass command ownership after installation. */
+  checkLegacyWrite(): void {
+    this.#checkOpen();
+    if (this.#commandMode)
+      throw new TransactionStateError("Native command writes require their primary capability");
+  }
+
+  checkCommandPrimary(commands: NativePrimaryAdapter): void {
+    this.#checkOpen();
+    if (this.#commands !== commands)
+      throw new TransactionStateError("Foreign native command primary capability");
+  }
+
+  closeNativeCommands(): Promise<void> {
+    return this.#commands?.close() ?? RESOLVED;
   }
 
   /** Runs `work`; any error fails the statement (its only valid call is then `rollback`). */
@@ -881,6 +938,8 @@ export class StatementImpl implements Statement {
 
   table(tableId: number, options: TableWriteOptions = {}): TableWriterImpl {
     if (this.#state !== "open") throw new TransactionStateError(`The statement is ${this.#state}`);
+    if (options.requireTrackedTargets === true && this.targets === undefined)
+      throw new TypeError("SQL modification requires admitted target tracking");
     if (options.inputView !== undefined) {
       const def = this.tx.catalog.table(tableId);
       if (def === undefined) throw new RangeError(`Table ${String(tableId)} does not exist`);
@@ -888,7 +947,10 @@ export class StatementImpl implements Statement {
       return new TableWriterImpl(this, def, options);
     }
     // The common case (no options, the same table again) skips the keyed lookup.
-    const plain = options.assigned === undefined && options.onRepeat === undefined;
+    const plain =
+      options.assigned === undefined &&
+      options.onRepeat === undefined &&
+      options.uniqueTargets !== true;
     if (plain && this.#plain?.tableId === tableId) return this.#plain;
     if (plain && this.#plain === null && this.#writers === null) {
       // The first writer of a statement needs no map.
@@ -900,9 +962,9 @@ export class StatementImpl implements Statement {
     if (this.#writers === null) {
       this.#writers = new Map();
       if (this.#plain !== null)
-        this.#writers.set(`${String(this.#plain.tableId)}::error`, this.#plain);
+        this.#writers.set(`${String(this.#plain.tableId)}::error:false`, this.#plain);
     }
-    const key = `${String(tableId)}:${(options.assigned ?? []).join(",")}:${options.onRepeat ?? "error"}`;
+    const key = `${String(tableId)}:${(options.assigned ?? []).join(",")}:${options.onRepeat ?? "error"}:${String(options.uniqueTargets === true)}`;
     let writer = this.#writers.get(key);
     if (writer === undefined) {
       const def = this.tx.catalog.table(tableId);
@@ -938,6 +1000,7 @@ export class StatementImpl implements Statement {
   changeCatalog(change: CatalogChange): MaybePromise<{ readonly id: number | null }> {
     return this.guard(() => {
       requireWritableCatalogInput(change);
+      this.checkLegacyWrite();
       this.beginMutation();
       const before = this.tx.catalog;
       const { catalog, logged, id } = before.change(change, this.tx.hooks.nextCatalogVersion());
@@ -1013,7 +1076,11 @@ export class StatementImpl implements Statement {
     return false;
   }
 
-  end(): Promise<void> {
+  end(signal?: AbortSignal): Promise<void> {
+    this.#signal =
+      signal && this.#signal && signal !== this.#signal
+        ? AbortSignal.any([this.#signal, signal])
+        : (signal ?? this.#signal);
     const finish = (): MaybePromise<void> =>
       this.guard(() => {
         this.#releaseViews();
@@ -1025,6 +1092,19 @@ export class StatementImpl implements Statement {
           }),
         );
       });
+    if (this.#commands !== null) {
+      const commands = this.#commands;
+      return Promise.resolve(
+        this.guard(async () => {
+          this.beginMutation();
+          await commands.finishRoot(this.#signal);
+          if (this.suspects.length || this.childChecks.length || this.parentChecks.length)
+            throw new TransactionStateError(
+              "Legacy deferred work escaped native command ownership",
+            );
+        }),
+      ).then(finish);
+    }
     if (
       this.suspects.length === 0 &&
       this.childChecks.length === 0 &&
@@ -1236,6 +1316,7 @@ export class StatementImpl implements Statement {
 
   rollback(): void {
     if (this.#state === "ended") return;
+    this.#commands?.checkRollbackReady();
     this.tx.undoTo(this.#start);
     this.#state = "ended";
     this.#releaseViews();
@@ -1253,6 +1334,12 @@ export class TableWriterImpl implements TableWriter {
   readonly #assigned: readonly number[];
   readonly #onRepeat: "error" | "first";
   readonly #inputView: SnapshotImpl | null;
+  readonly #uniqueTargets: boolean;
+  // One scalar cursor per existing writer: repeated one-row upserts must not leave
+  // a row effect per input for the bounded commit encoder's repeated passes.
+  #lastRowsUndo = -1;
+  #lastRowsCatalog = -1;
+  #lastRowsCommand = 0;
   /** Indexes of other tables' foreign keys that reference this table's keys. */
   readonly #referenced: ReadonlySet<number>;
 
@@ -1267,6 +1354,7 @@ export class TableWriterImpl implements TableWriter {
     this.#inputView =
       options.inputView === undefined ? null : statement.writerView(options.inputView);
     this.#onRepeat = options.onRepeat ?? "error";
+    this.#uniqueTargets = options.uniqueTargets === true;
     this.#referenced = referencedIndexes(statement.catalog, def.id);
   }
 
@@ -1274,6 +1362,126 @@ export class TableWriterImpl implements TableWriter {
     const index = this.def.columns.findIndex((column) => column.id === columnId);
     if (index < 0) throw new RangeError(`Table ${this.def.name} has no column ${String(columnId)}`);
     return index;
+  }
+
+  /** Pure conservative one-row sizing. No native/image input is retained across admission. */
+  commandPrimarySizing(
+    commands: NativePrimaryAdapter,
+    event: WriteEvent,
+    widths: readonly number[],
+  ): { readonly bytes: number; readonly growth: () => number } {
+    this.statement.checkCommandPrimary(commands);
+    const bytes =
+      65536 * (this.def.columns.length + this.def.indexes.length) +
+      (event === "delete" ? 0 : 2 * widths.reduce((n, width) => n + width, 0));
+    return {
+      bytes,
+      growth: () => {
+        const live = this.statement.tx.hooks.state().tables.get(this.tableId)?.memtables.at(-1);
+        if (live?.state !== "live") return 0;
+        let growth = 0;
+        if (event !== "delete")
+          for (const [c, width] of widths.entries()) {
+            const chunk = live.chunks[c]?.at(-1),
+              arena = chunk?.arena;
+            if (!chunk || !arena) continue;
+            const wanted = (chunk.offsets?.[chunk.length] ?? 0) + width;
+            if (wanted <= arena.length) continue;
+            let size = arena.length * 2;
+            while (size < wanted) size *= 2;
+            growth += size;
+          }
+        for (const index of this.def.indexes) {
+          if (index.invalid === true) continue;
+          const delta = live.deltas.get(index.id);
+          // At most an old tombstone plus a new put; cover every delta backing-array resize
+          // and ordered-node split, including the old/new overlap, before the primary call.
+          growth +=
+            2 * (delta?.bytes ?? 0) +
+            (delta?.appendKeyBytes(2 * indexMaximumKeyBytes(index, this.def)) ?? 0);
+        }
+        return growth;
+      },
+    };
+  }
+
+  /** Full physical images supplied by the root. No legacy row read/copy/deferred queues.
+   * Root already ran BEFORE and generation; complete-row constraints still run here. */
+  async commandPrimary(
+    commands: NativePrimaryAdapter,
+    event: WriteEvent,
+    oldRowId: number | null,
+    old: Batch | null,
+    next: Batch | null,
+    widths: readonly number[],
+    changed: readonly number[] | null,
+    signal: AbortSignal,
+    checkCommand: () => void,
+    commandId: number,
+  ): Promise<number | null> {
+    this.statement.checkCommandPrimary(commands);
+    checkCommand();
+    if (!Number.isSafeInteger(commandId) || commandId < 1)
+      throw new TypeError("Invalid native row command identity");
+    this.statement.beginMutation();
+    const ids = this.def.columns.map((column) => column.id);
+    if ((event !== "insert") !== (old !== null) || (event !== "delete") !== (next !== null))
+      throw new TypeError("Native primary image sides do not match the write");
+    for (const input of [old, next]) {
+      if (!input) continue;
+      if (input.length !== 1 || input.selection !== null)
+        throw new TypeError("Native primary requires one complete physical row");
+      this.#checkShape(input.columns, 0, ids);
+    }
+    if (next) {
+      for (const [c, vector] of next.columns.entries())
+        if (
+          layoutOf(vector.type) === "varlen" &&
+          this.#inputBytes(vector, { rows: null, from: 0, count: 1 }) > (widths[c] ?? -1)
+        )
+          throw new TypeError("Native row exceeded its prepared byte bound");
+      this.#validate(next.columns, null, 1, changed);
+      for (const index of this.def.indexes) {
+        if (index.invalid === true) continue;
+        const failure = indexLimitViolation(index, this.def, next.columns, null, 0, 1);
+        if (failure) throw failure;
+      }
+    }
+    signal.throwIfAborted();
+    if (oldRowId !== null) {
+      const pin = this.statement.readOwn();
+      try {
+        const table = pin.internalTable(this.tableId),
+          locator = table.locator(oldRowId),
+          segment = table.segments[Math.floor(locator / 65536)],
+          position = locator % 65536;
+        if (
+          !segment ||
+          position >= segment.rowCount ||
+          (await segment.deletions())?.isDeleted(position) === true
+        )
+          throw new TransactionStateError("Native primary target changed before continuation");
+        signal.throwIfAborted();
+        checkCommand();
+        await this.#deleteRows(table, [oldRowId], need(old).columns);
+      } finally {
+        pin.release();
+      }
+    }
+    let inserted: number | null = null;
+    if (next)
+      await this.#insertRows(
+        next.columns,
+        { rows: null, from: 0, count: 1 },
+        true,
+        (rowId) => {
+          inserted = rowId;
+        },
+        commandId,
+      );
+    signal.throwIfAborted();
+    if (event !== "insert") this.statement.noteFtsMutation(this.tableId, event);
+    return inserted;
   }
 
   #checkShape(columns: readonly Vector[], offset: number, columnIds: readonly number[]): void {
@@ -1302,13 +1510,64 @@ export class TableWriterImpl implements TableWriter {
     length: number,
     changed: readonly number[] | null,
   ): void {
+    if (
+      this.def.checks.length > 0 ||
+      this.def.columns.some((column) => column.generatedSql !== null)
+    ) {
+      const rules = this.statement.rules(this.tableId);
+      if (rules.validate) {
+        rules.validate(
+          { columns, length, selection: rows === null ? null : { rows, count: rows.length } },
+          changed,
+        );
+        return;
+      }
+    }
+    try {
+      this.#validateColumns(columns, rows, length);
+    } catch (error) {
+      if (!(error instanceof NotNullViolationError || error instanceof ClosedSetViolationError))
+        throw error;
+      // The common path remains columnar. Replay a column violation in row order, then
+      // check the complete valid prefix before reporting it. CHECK already guarantees
+      // row/name order (including expression errors). Generated errors replay in TableRules.
+      // Borrow selected rows directly; no row list, payload copy or admission on failure.
+      const count = rows?.length ?? length;
+      for (let k = 0; k < count; k++) {
+        try {
+          this.#validateColumns(columns, rows, length, k, 1);
+        } catch (precise) {
+          if (!(
+            precise instanceof NotNullViolationError || precise instanceof ClosedSetViolationError
+          ))
+            throw precise;
+          this.#checkConstraints(
+            columns,
+            rows === null ? null : rows.subarray(0, k),
+            rows === null ? k : length,
+            changed,
+          );
+          throw precise;
+        }
+      }
+      throw error; // deterministic physical input must reproduce the violation
+    }
+    this.#checkConstraints(columns, rows, length, changed);
+  }
+
+  #validateColumns(
+    columns: readonly Vector[],
+    rows: Uint16Array | null,
+    length: number,
+    from = 0,
+    count = rows?.length ?? length,
+  ): void {
     this.def.columns.forEach((column, c) => {
       if (column.nullable && column.allowedValues === undefined) return;
       const vector = need(columns[c]);
       if (vector.form === "flat" && vector.validity === null && column.allowedValues === undefined)
         return;
-      const count = rows?.length ?? length;
-      for (let k = 0; k < count; k++) {
+      for (let k = from; k < from + count; k++) {
         const row = rows === null ? k : (rows[k] ?? 0);
         if (isNullAt(vector, row)) {
           if (!column.nullable) throw new NotNullViolationError(this.tableId, column.id, row);
@@ -1325,11 +1584,16 @@ export class TableWriterImpl implements TableWriter {
         }
       }
     });
+  }
+
+  #checkConstraints(
+    columns: readonly Vector[],
+    rows: Uint16Array | null,
+    length: number,
+    changed: readonly number[] | null,
+  ): void {
     if (this.def.checks.length === 0) return;
-    const selection: Selection | null =
-      rows === null || rows.length === length
-        ? null
-        : { rows: Uint16Array.from(rows), count: rows.length };
+    const selection: Selection | null = rows === null ? null : { rows, count: rows.length };
     const failure = this.statement
       .rules(this.tableId)
       .check({ length, columns, selection }, changed);
@@ -1338,6 +1602,7 @@ export class TableWriterImpl implements TableWriter {
 
   insert(batch: Batch, written: Selection | null): MaybePromise<number> {
     return this.statement.guard(() => {
+      this.statement.checkLegacyWrite();
       this.statement.beginMutation();
       this.#checkShape(
         batch.columns,
@@ -1372,6 +1637,7 @@ export class TableWriterImpl implements TableWriter {
     rows: Uint16Array | null,
     count = rows?.length ?? 0,
   ): MaybePromise<void> {
+    this.statement.checkLegacyWrite();
     const advances: Array<MaybePromise<void>> = [];
     for (const [position, column] of this.def.columns.entries())
       if (column.autoIncrement === true && column.identitySequence !== null) {
@@ -1521,10 +1787,16 @@ export class TableWriterImpl implements TableWriter {
     return bytes;
   }
 
-  #insertRows(columns: readonly Vector[], plan: RowPlan): MaybePromise<void> {
+  #insertRows(
+    columns: readonly Vector[],
+    plan: RowPlan,
+    command = false,
+    inserted?: (rowId: number) => void,
+    commandId = 0,
+  ): MaybePromise<void> {
     const tx = this.statement.tx,
       seq = this.statement.seq;
-    const rowIds: number[] | null = this.def.foreignKeys.length > 0 ? [] : null;
+    const rowIds: number[] | null = !command && this.def.foreignKeys.length > 0 ? [] : null;
     let done = 0;
     const next = (): MaybePromise<void> => {
       while (done < plan.count) {
@@ -1542,24 +1814,43 @@ export class TableWriterImpl implements TableWriter {
           });
         const take = Math.min(memtable.capacity, plan.count - done),
           before = memtable.rowCount;
-        tx.reserveFtsRowUndo();
+        const previous = tx.undo[this.#lastRowsUndo];
+        const coalesce =
+          previous?.kind === "rows" &&
+          previous.ftsKeyed !== undefined &&
+          previous.statement === this.statement.ordinal &&
+          previous.memtable === memtable &&
+          previous.before + previous.count === before &&
+          this.#lastRowsCatalog === this.statement.catalog.version &&
+          this.#lastRowsCommand === commandId;
+        // FTS reserves one embedded flag per retained entry, not per append. An
+        // extension keeps its funded flag (including true) and needs no new slot.
+        if (!coalesce) tx.reserveFtsRowUndo();
         try {
           memtable.append(columns, plan.rows, plan.from + done, take);
           memtable.mark(seq);
         } catch (error) {
-          tx.releaseFtsRowUndo();
+          if (!coalesce) tx.releaseFtsRowUndo();
           throw error;
         }
-        tx.undo.push({
-          kind: "rows",
-          ftsKeyed: false,
-          statement: this.statement.ordinal,
-          tableId: this.tableId,
-          memtable,
-          before,
-          count: take,
-        });
+        if (coalesce) {
+          tx.undo[this.#lastRowsUndo] = { ...previous, count: previous.count + take };
+        } else {
+          this.#lastRowsUndo = tx.undo.length;
+          this.#lastRowsCatalog = this.statement.catalog.version;
+          this.#lastRowsCommand = commandId;
+          tx.undo.push({
+            kind: "rows",
+            ftsKeyed: false,
+            statement: this.statement.ordinal,
+            tableId: this.tableId,
+            memtable,
+            before,
+            count: take,
+          });
+        }
         const firstRowId = memtable.firstRowId + before;
+        inserted?.(firstRowId);
         if (rowIds !== null) for (let k = 0; k < take; k++) rowIds.push(firstRowId + k);
         const put = this.#putValidKeys(
           this.def.indexes,
@@ -1569,6 +1860,7 @@ export class TableWriterImpl implements TableWriter {
           memtable,
           plan.from + done,
           take,
+          command,
         );
         done += take;
         if (put instanceof Promise) return put.then(next);
@@ -1673,6 +1965,7 @@ export class TableWriterImpl implements TableWriter {
     memtable: Memtable,
     from: number,
     count: number,
+    command = false,
   ): MaybePromise<void> {
     const tx = this.statement.tx;
     const seq = this.statement.seq;
@@ -1730,6 +2023,7 @@ export class TableWriterImpl implements TableWriter {
       }
       const added = delta.entryCount - first;
       if (added === 0) continue;
+      if (command) continue; // Accepted image registry owns deferred command uniqueness.
       if (!index.unique) continue;
       const check =
         added === 1
@@ -1858,7 +2152,7 @@ export class TableWriterImpl implements TableWriter {
   }
 
   /** Row ids of the active rows' locators (column 0), applying the row-affected-twice rule. */
-  #targets(batch: Batch): { rows: Uint16Array; rowIds: number[] } {
+  #targets(batch: Batch): MaybePromise<{ rows: Uint16Array; rowIds: number[] }> {
     const locators = batch.columns[0];
     if (
       locators?.form !== "flat" ||
@@ -1869,43 +2163,66 @@ export class TableWriterImpl implements TableWriter {
     const snapshot = this.#inputView ?? this.statement.view;
     snapshot.check();
     const view = snapshot.internalTable(this.tableId);
-    let touched = this.statement.touched.get(this.tableId);
-    if (touched === undefined) {
+    const locatorValues = locators.data.values;
+    const tracker = this.#uniqueTargets ? undefined : this.statement.targets;
+    let touched =
+      this.#uniqueTargets || tracker ? undefined : this.statement.touched.get(this.tableId);
+    if (!this.#uniqueTargets && !tracker && touched === undefined) {
       touched = new Set();
       this.statement.touched.set(this.tableId, touched);
     }
     const kept: number[] = [];
     const rowIds: number[] = [];
-    for (const row of activeRows(batch)) {
-      if (
-        locators.validity !== null &&
-        ((locators.validity[row >>> 5] ?? 0) & (1 << (row & 31))) === 0
-      )
-        throw new TypeError("An update or delete target has a null locator");
-      const rowId = view.rowId(locators.data.values[row] ?? 0);
-      if (touched.has(rowId)) {
-        if (this.#onRepeat === "error") throw new CardinalityViolationError(this.tableId, row);
-        continue;
+    const active = activeRows(batch);
+    const visit = (from: number): MaybePromise<void> => {
+      for (let k = from; k < active.length; k++) {
+        const row = need(active[k]);
+        if (
+          locators.validity !== null &&
+          ((locators.validity[row >>> 5] ?? 0) & (1 << (row & 31))) === 0
+        )
+          throw new TypeError("An update or delete target has a null locator");
+        snapshot.check();
+        const rowId = view.rowId(locatorValues[row] ?? 0);
+        const keep = (seen: boolean) => {
+          if (seen) {
+            if (this.#onRepeat === "error") throw new CardinalityViolationError(this.tableId, row);
+            return;
+          }
+          touched?.add(rowId);
+          kept.push(row);
+          rowIds.push(rowId);
+        };
+        const seen = tracker?.testAndSet(this.tableId, rowId) ?? touched?.has(rowId) ?? false;
+        if (seen instanceof Promise)
+          return seen.then((value) => {
+            snapshot.check();
+            keep(value);
+            return visit(k + 1);
+          });
+        keep(seen);
       }
-      touched.add(rowId);
-      kept.push(row);
-      rowIds.push(rowId);
-    }
-    return { rows: Uint16Array.from(kept), rowIds };
+    };
+    return settle(visit(0), () => ({ rows: Uint16Array.from(kept), rowIds }));
   }
 
   update(batch: Batch, written: Selection | null): MaybePromise<number> {
     return this.statement.guard(() => {
+      this.statement.checkLegacyWrite();
       this.statement.beginMutation();
       this.#checkShape(batch.columns, 1, this.#assigned);
-      const { rows, rowIds } = this.#targets(batch);
-      if (written !== null) {
-        written.rows.set(rows);
-        written.count = rows.length;
-      }
-      if (rowIds.length === 0) return 0;
-      const sources = this.#assigned.map((_, k) => ({ vector: need(batch.columns[k + 1]), rows }));
-      return settle(this.#update(rowIds, this.#assigned, sources, false), () => rowIds.length);
+      return settle(this.#targets(batch), ({ rows, rowIds }) => {
+        if (written !== null) {
+          written.rows.set(rows);
+          written.count = rows.length;
+        }
+        if (rowIds.length === 0) return 0;
+        const sources = this.#assigned.map((_, k) => ({
+          vector: need(batch.columns[k + 1]),
+          rows,
+        }));
+        return settle(this.#update(rowIds, this.#assigned, sources, false), () => rowIds.length);
+      });
     });
   }
 
@@ -1920,6 +2237,7 @@ export class TableWriterImpl implements TableWriter {
     values: ReadonlyArray<{ readonly vector: Vector; readonly row: number }>,
     generate: boolean,
   ): Promise<void> {
+    this.statement.checkLegacyWrite();
     for (let from = 0; from < rowIds.length; from += MEMORY_CHUNK_ROWS) {
       const ids = rowIds.slice(from, from + MEMORY_CHUNK_ROWS);
       const rows = new Uint16Array(ids.length);
@@ -1934,6 +2252,7 @@ export class TableWriterImpl implements TableWriter {
 
   /** A delete a foreign-key action writes (ON DELETE CASCADE). */
   async applyDelete(rowIds: readonly number[]): Promise<void> {
+    this.statement.checkLegacyWrite();
     for (let from = 0; from < rowIds.length; from += MEMORY_CHUNK_ROWS) {
       const ids = rowIds.slice(from, from + MEMORY_CHUNK_ROWS);
       const done = this.#delete(ids);
@@ -1981,22 +2300,26 @@ export class TableWriterImpl implements TableWriter {
       const removed = this.#deleteRows(table, rowIds, old);
       const added = this.insertRows(columns, all);
       this.#parentChecksForChange(old, columns, rowIds.length);
-      return all_(removed, added);
+      return settle(all_(removed, added), () => {
+        if (rowIds.length > 0) this.statement.noteFtsMutation(this.tableId, "update");
+      });
     });
   }
 
   delete(batch: Batch, written: Selection | null): MaybePromise<number> {
     return this.statement.guard(() => {
+      this.statement.checkLegacyWrite();
       this.statement.beginMutation();
       if (batch.columns.length !== 1)
         throw new TypeError("A delete batch holds the locator column only");
-      const { rows, rowIds } = this.#targets(batch);
-      if (written !== null) {
-        written.rows.set(rows);
-        written.count = rows.length;
-      }
-      if (rowIds.length === 0) return 0;
-      return settle(this.#delete(rowIds), () => rowIds.length);
+      return settle(this.#targets(batch), ({ rows, rowIds }) => {
+        if (written !== null) {
+          written.rows.set(rows);
+          written.count = rows.length;
+        }
+        if (rowIds.length === 0) return 0;
+        return settle(this.#delete(rowIds), () => rowIds.length);
+      });
     });
   }
 
@@ -2018,7 +2341,9 @@ export class TableWriterImpl implements TableWriter {
                   next: null,
                 });
         }
-      return removed;
+      return settle(removed, () => {
+        if (rowIds.length > 0) this.statement.noteFtsMutation(this.tableId, "delete");
+      });
     });
   }
 
@@ -2132,6 +2457,7 @@ export class TableWriterImpl implements TableWriter {
 
   conflicts(batch: Batch, arbiters: readonly number[], out: ConflictOutput): MaybePromise<void> {
     return this.statement.guard(() => {
+      this.statement.checkLegacyWrite();
       this.#checkShape(
         batch.columns,
         0,
@@ -2147,6 +2473,12 @@ export class TableWriterImpl implements TableWriter {
               return index;
             });
       const rows = activeRows(batch);
+      this.#validate(batch.columns, rows, batch.length, null);
+      // Reject before encoding/copying arbiter keys, just as the insertion path does.
+      for (const index of indexes) {
+        const failure = indexLimitViolation(index, this.def, batch.columns, rows, 0, rows.length);
+        if (failure) throw failure;
+      }
       const current = this.statement.current();
       const table = current.internalTable(this.tableId);
       const view = this.statement.view.internalTable(this.tableId);
@@ -2158,16 +2490,20 @@ export class TableWriterImpl implements TableWriter {
           for (let k = 0; k < count; k++) copied.push(keys.key(k).slice());
         return copied;
       });
-      const decide = (k: number): MaybePromise<void> => {
+      const decide = (k: number, from = 0, resolved = false): MaybePromise<void> => {
         for (; k < rows.length; k++) {
           const row = rows[k] ?? 0;
           out.kinds[row] = ConflictKind.none;
-          for (let i = 0; i < indexes.length; i++) {
+          for (let i = from; i < indexes.length; i++) {
             const index = need(indexes[i]);
             if (this.#hasNullKey(index, batch.columns, row)) continue;
             const key = need(keyed[i]?.[k]);
-            const result = new ViewIndex(index, table).resolve(key, found);
-            if (result instanceof Promise) return result.then(() => decide(k));
+            if (!resolved) {
+              const result = new ViewIndex(index, table).resolve(key, found);
+              // Completion already filled `found`, even when optional cache admission failed.
+              if (result instanceof Promise) return result.then(() => decide(k, i, true));
+            }
+            resolved = false;
             if (found.length > 0) {
               const rowId = need(found[0]);
               out.kinds[row] = this.statement.inserted(this.tableId, rowId)
@@ -2177,7 +2513,7 @@ export class TableWriterImpl implements TableWriter {
               out.indexIds[row] = index.id;
               break;
             }
-            const text = String.fromCharCode(...key);
+            const text = byteString(key);
             const earlier = seen[i]?.get(text);
             if (earlier !== undefined) {
               out.kinds[row] = ConflictKind.batch;
@@ -2190,9 +2526,10 @@ export class TableWriterImpl implements TableWriter {
             for (let i = 0; i < indexes.length; i++) {
               const index = need(indexes[i]);
               if (this.#hasNullKey(index, batch.columns, row)) continue;
-              const text = String.fromCharCode(...need(keyed[i]?.[k]));
+              const text = byteString(need(keyed[i]?.[k]));
               if (!seen[i]?.has(text)) seen[i]?.set(text, row);
             }
+          from = 0;
         }
         return undefined;
       };

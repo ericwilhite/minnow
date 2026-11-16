@@ -7,8 +7,8 @@ import { Governor } from "../memory/governor.js";
 import { OutputArena } from "./kernels/vectors.js";
 import { IndexOrderSource } from "./key-order.js";
 import { createExecutor } from "./create.js";
-import { UnsupportedPlanError } from "../errors.js";
 import type { PhysicalPlan } from "../ir/ir.js";
+import { UnsupportedPlanError } from "../errors.js";
 
 it.each(seedsFor("next-key-order-prefix", [0xe103, 0xe104]))(
   "bounds cursor reads and closes once (seed %i)",
@@ -252,9 +252,9 @@ it.each(seedsFor("next-key-order-held-floor", [0xe105, 0xe106]))(
 );
 
 it.each(seedsFor("next-key-order-refusal", [0xe107, 0xe108]))(
-  "refuses unimplemented range fields even below LIMIT zero (seed %i)",
+  "gates native query range fields even below LIMIT zero (seed %i)",
   (seed) => {
-    const reach = createReach("index range refusal", ["lower", "upper", "locator"]);
+    const reach = createReach("index range fields", ["lower", "upper", "locator"]);
     fc.assert(
       fc.property(fc.integer({ min: 1, max: 7 }), fc.boolean(), (mask, inclusive) => {
         reach.beginHistory();
@@ -290,6 +290,7 @@ it.each(seedsFor("next-key-order-refusal", [0xe107, 0xe108]))(
           volatile: false,
         };
         expect(() => createExecutor().prepare(plan)).toThrow(UnsupportedPlanError);
+        expect(() => createExecutor({ keyOrder: true }).prepare(plan)).not.toThrow();
         if (mask & 1) reach.reach("lower");
         if (mask & 2) reach.reach("upper");
         if (mask & 4) reach.reach("locator");

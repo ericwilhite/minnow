@@ -16,7 +16,7 @@ export function createExecutor(options: CompileOptions = {}): Executor {
       return Object.freeze({
         plan,
         columns: plan.columns,
-        kind: "query" as const,
+        kind: plan.root.op === "modify" ? ("modify" as const) : ("query" as const),
         usesSequences: false,
         bind: (values: readonly ParameterValue[], grant: Grant) =>
           bindParameters(plan, values, grant),

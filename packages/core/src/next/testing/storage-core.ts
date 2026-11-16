@@ -15,7 +15,9 @@ import { UnsupportedPlanError } from "../exec/errors.js";
 import type { WireDictionary, WireFlat } from "../exec/result.js";
 import { bindParameter } from "../exec/parameters.js";
 import { ColumnStore } from "../exec/column-store.js";
+import { StatementRules } from "../exec/statement-rules.js";
 import { compileTableRules } from "../exec/rules.js";
+import type { LoweringContext } from "../lower/lowerer.js";
 import { createLowerer } from "../lower/create.js";
 import { ChunkReader } from "../page/reader.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
@@ -38,7 +40,7 @@ export class StorageCore implements NextCore {
     await this.harness.open();
     return this;
   }
-  context() {
+  context(): LoweringContext {
     return {
       catalog: this.harness.path.catalog,
       statistics: { table: () => null },
@@ -85,7 +87,8 @@ export class StorageCore implements NextCore {
     return this.executor.prepare(lowered.plan);
   }
   /** Caller consumes results concurrently with execution and releases this pin after executed. */
-  start(prepared: PreparedPlan, params: readonly ParameterValue[] = []) {
+  start(prepared: PreparedPlan, params: readonly ParameterValue[] = [], signal?: AbortSignal) {
+    signal?.throwIfAborted();
     const snapshot = this.harness.path.pin();
     let execution: Execution;
     try {
@@ -94,6 +97,7 @@ export class StorageCore implements NextCore {
         statement: null,
         parameters: params,
         statementTime: 0n,
+        ...(signal === undefined ? {} : { signal }),
         governor: this.harness.governor,
         spill: this.spill,
         queryId: ++this.#queryId,
@@ -108,7 +112,12 @@ export class StorageCore implements NextCore {
     }
     return { execution, release: () => snapshot.release() };
   }
-  async execute(sql: string, params: readonly ParameterValue[] = []): Promise<NextStatementResult> {
+  async execute(
+    sql: string,
+    params: readonly ParameterValue[] = [],
+    signal?: AbortSignal,
+  ): Promise<NextStatementResult> {
+    signal?.throwIfAborted();
     this.lastProfile = null;
     const lowered = this.lowerer.lower(sql, this.context());
     if (lowered.kind === "ddl") {
@@ -117,45 +126,71 @@ export class StorageCore implements NextCore {
       if (lowered.change !== null) await this.change(lowered.change);
       return { kind: "ddl" };
     }
+    if (lowered.kind === "modify") {
+      const prepared = this.executor.prepare(lowered.plan);
+      const tx = await this.harness.path.begin();
+      if (lowered.plan.root.op !== "modify") throw new TypeError("Missing modification root");
+      const rowRules = new StatementRules(
+        tx.catalog,
+        lowered.plan.root.tableId,
+        (id) => {
+          const table = tx.catalog.table(id);
+          if (!table) throw new TypeError("Missing rule table");
+          return compileTableRules(
+            table,
+            tx.catalog.version,
+            this.lowerer.lowerTableRules(table, tx.catalog),
+          );
+        },
+        lowered.plan.root,
+      );
+      const statement = tx.statement({
+        rules: (id) => rowRules.table(id),
+        targets: rowRules.targets,
+      });
+      const execution = prepared.execute({
+        snapshot: null,
+        rowRules,
+        statement,
+        parameters: params,
+        statementTime: 0n,
+        ...(signal === undefined ? {} : { signal }),
+        governor: this.harness.governor,
+        spill: this.spill,
+        queryId: ++this.#queryId,
+        reads: { open: (pages, chunk, options) => ChunkReader.open(pages, chunk, options) },
+        sequences: null,
+        sequenceSession: null,
+        returning: "atCommit",
+      });
+      try {
+        const summary = await execution.executed;
+        const receipt = await tx.commit(null);
+        await receipt.durable;
+        execution.acknowledgeCommit();
+        const batches = await this.collect(execution, prepared);
+        await execution.delivered;
+        this.lastProfile = summary.profile;
+        return {
+          kind: lowered.plan.root.kind,
+          rowCount: summary.rowCount,
+          ...(prepared.columns.length === 0
+            ? {}
+            : { returning: { columns: prepared.columns, batches } }),
+        };
+      } catch (error) {
+        execution.cancel(error);
+        await Promise.allSettled([execution.executed, execution.delivered]);
+        tx.rollback();
+        throw error;
+      }
+    }
     if (lowered.kind !== "query")
       throw new UnsupportedPlanError(`the adapter's ${lowered.kind}`, { construct: lowered.kind });
     const prepared = this.executor.prepare(lowered.plan);
-    const run = this.start(prepared, params);
-    const batches: Batch[] = [];
-    // Stream dictionaries, applied in frame order as the owner client does (`StreamDictionaries`).
-    const dictionaries = new Map<number, WireFlat[]>();
+    const run = this.start(prepared, params, signal);
     try {
-      for (;;) {
-        const frame = await run.execution.results.next();
-        if (frame === null) break;
-        try {
-          const payload = structuredClone(frame.payload);
-          for (const delta of payload.dictionaries) {
-            const parts = dictionaries.get(delta.id) ?? [];
-            if (delta.from !== parts.reduce((size, part) => size + part.length, 0))
-              throw new RangeError(`dictionary ${String(delta.id)} delta out of order`);
-            parts.push(delta.values);
-            dictionaries.set(delta.id, parts);
-          }
-          batches.push({
-            length: payload.rowCount,
-            selection: null,
-            columns: payload.columns.map((vector, index) => {
-              const flat =
-                vector.form === "dictionary"
-                  ? expandTextDictionary(vector, dictionaries.get(vector.dictionary) ?? [])
-                  : vector;
-              if (flat.form !== "flat")
-                throw new TypeError("the result sink must send flat or dictionary frames");
-              const type = prepared.columns[index]?.type;
-              if (type === undefined) throw new TypeError("missing result type");
-              return { ...flat, type };
-            }),
-          });
-        } finally {
-          frame.release();
-        }
-      }
+      const batches = await this.collect(run.execution, prepared);
       this.lastProfile = (await run.execution.executed).profile;
       await run.execution.delivered;
       return { kind: "rows", columns: prepared.columns, batches };
@@ -166,6 +201,43 @@ export class StorageCore implements NextCore {
     } finally {
       run.release();
     }
+  }
+  /** Apply wire dictionary deltas before releasing each result frame. */
+  private async collect(execution: Execution, prepared: PreparedPlan): Promise<Batch[]> {
+    const batches: Batch[] = [];
+    const dictionaries = new Map<number, WireFlat[]>();
+    for (;;) {
+      const frame = await execution.results.next();
+      if (frame === null) break;
+      try {
+        const payload = structuredClone(frame.payload);
+        for (const delta of payload.dictionaries) {
+          const parts = dictionaries.get(delta.id) ?? [];
+          if (delta.from !== parts.reduce((size, part) => size + part.length, 0))
+            throw new RangeError(`dictionary ${String(delta.id)} delta out of order`);
+          parts.push(delta.values);
+          dictionaries.set(delta.id, parts);
+        }
+        batches.push({
+          length: payload.rowCount,
+          selection: null,
+          columns: payload.columns.map((vector, index) => {
+            const flat =
+              vector.form === "dictionary"
+                ? expandTextDictionary(vector, dictionaries.get(vector.dictionary) ?? [])
+                : vector;
+            if (flat.form !== "flat")
+              throw new TypeError("the result sink must send flat or dictionary frames");
+            const type = prepared.columns[index]?.type;
+            if (type === undefined) throw new TypeError("missing result type");
+            return { ...flat, type };
+          }),
+        });
+      } finally {
+        frame.release();
+      }
+    }
+    return batches;
   }
   async insertVectors(table: TableDef, batch: Batch): Promise<number> {
     return this.write((statement) => statement.table(table.id).insert(batch, null));

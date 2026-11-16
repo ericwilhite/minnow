@@ -7435,6 +7435,8 @@ export const FTS_STATEMENT_CLOCK_REACH = [
 
 /** End-of-statement FTS admission observes its own signal before another holder releases credit. */
 export const FTS_ADMISSION_CANCEL_REACH = [
+  "options",
+  "end",
   "actual admission wait",
   "abort while credit held",
   "abort on admission resume",
@@ -7564,3 +7566,1095 @@ export const FTS_CLAIM_CODEC_REACH = [
 ] as const;
 
 export const OWNER_CLOCK_REACH = ["clock tick exact", "over target remains over"] as const;
+
+export const NATIVE_CONSTRAINT_ORDER_REACH = [
+  "check-null",
+  "null-check",
+  "error-null",
+  "columns",
+  "success",
+  "width1",
+  "width2",
+  "width8",
+  "complete validator",
+  "native fallback",
+  "vectorized success",
+  "selection",
+  "dense",
+  "valid prefix",
+  "first row",
+  "reverse CHECK declarations",
+  "forward CHECK declarations",
+  "ASCII names",
+  "UTF8 names",
+] as const;
+
+/** Actual SQL DML shares atomic row/FTS undo, WAL and reopen boundaries. */
+export const MODIFY_FTS_REACH = [
+  "insert",
+  "updateFrom",
+  "deleteUsing",
+  "upsertInsert",
+  "upsertUpdate",
+  "nothing",
+  "whereFalse",
+  "commit",
+  "rollback",
+  "savepoint",
+  "failure",
+  "definition",
+  "no definition",
+  "coalesced insert",
+  "late statement error",
+  "survivor after rollback",
+  "same WAL body",
+  "undo accounting",
+  "reopen",
+  "PG and shipped",
+] as const;
+
+export const MODIFY_FTS_COALESCING_REACH = [
+  "commit flag",
+  "rollback flag",
+  "first flag",
+  "later flag",
+  "ordinary append after flag",
+  "one funded entry",
+] as const;
+
+export const GENERAL_MODIFY_REACH = [
+  "multi-row VALUES",
+  "empty producer",
+  "expression update",
+  "INSERT SELECT snapshot",
+  "primary key update snapshot",
+  "failure rollback",
+  "predicate delete",
+] as const;
+
+export const MODIFY_SOURCES_REACH = [
+  "UPDATE FROM duplicate matches",
+  "first distinct source wins",
+  "joined RETURNING",
+  "DELETE USING duplicate matches",
+  "delete cascade",
+  "missing parent rollback",
+] as const;
+
+/** Native modification phases must retire producer credit before a writer can wait. */
+export const WRITE_MERGE_RETIREMENT_REACH = [
+  "queued reader",
+  "dynamic working credit retired",
+  "metadata while reader retained",
+  "all credit returned",
+] as const;
+
+export const MODIFY_PROGRESS_REACH = [
+  "finished merge credit retired",
+  "healthy merge completion",
+  "64 MiB",
+  "single UPDATE no target set",
+  "single DELETE no target set",
+  "read grants retired",
+  "20000 updated",
+  "20000 deleted",
+  "bounded spill workspace",
+] as const;
+
+/** Returned row versions must survive phase retirement and commit-gated delivery. */
+export const MODIFY_RETURNING_REACH = [
+  "snapshotted parameters",
+  "inserted rows",
+  "new updated rows",
+  "old deleted rows",
+  "empty",
+  "insert select",
+] as const;
+
+/** RETURNING must not make statement execution depend on the reader or leak after cancellation. */
+export const MODIFY_RETURNING_LIFECYCLE_REACH = [
+  "gate insert",
+  "gate update",
+  "gate delete",
+  "atCommit hidden",
+  "atExecuted",
+  "cancel gate",
+  "delivery cleanup",
+] as const;
+
+/** Large returned values must spill without a second live loan or exceeding the governor. */
+export const MODIFY_RETURNING_PRESSURE_REACH = [
+  "funded before admission",
+  "64 MiB",
+  "wide input page",
+  "new rows",
+  "old rows",
+  "repeated output value",
+  "all credit returned",
+] as const;
+
+/** Publication keeps original values/indices; extra retained references require a prepaid budget. */
+export const MIXED_SOURCE_RECIPE_REACH = [
+  "multiple source segments",
+  "metadata paid",
+  "metadata denied no retain",
+  "locators preserved",
+  "publication retained",
+  "cancelled",
+  "exact original rows",
+  "all credit returned",
+] as const;
+
+export const MODIFY_UPSERT_REACH = [
+  "without RETURNING",
+  "proposed NOT NULL before conflict",
+  "composite primary target",
+  "repeated unique target",
+  "FK valid update",
+  "FK rollback",
+  "primary target",
+  "unique target",
+  "target permutation",
+  "target order",
+  "EXCLUDED",
+  "WHERE true",
+  "WHERE false",
+  "targetless nothing",
+  "targeted nothing",
+  "multi-row proposals",
+  "insert select",
+  "null unique tuples",
+  "repeated existing",
+  "repeated inserted",
+  "non-arbiter unique rollback",
+  "arbiter assignment refused",
+] as const;
+
+export const MODIFY_INDEX_REACH = [
+  "keyLookup",
+  "indexRange",
+  "duplicate keys",
+  "text key",
+  "composite key",
+  "inclusive bound",
+  "exclusive bound",
+  "nonunique range",
+  "parameter bounds",
+  "rekey snapshot",
+  "key delete",
+  "range delete",
+  "absent target",
+  "null key",
+  "stored segments",
+  "memory segments",
+] as const;
+
+export const MODIFY_ROW_RULES_REACH = [
+  "omitted follow policy",
+  "insert generated",
+  "update generated",
+  "generated DEFAULT",
+  "insert select generated",
+  "excluded generated",
+  "duplicate valid match",
+  "generated assignment refused",
+  "FK generated rekey",
+  "FK generated set null",
+  "CHECK rollback",
+] as const;
+
+export const ROOT_RULE_ORDER_REACH = [
+  "NOT NULL before generated error",
+  "CHECK before generated error",
+  "constraint identity",
+  "statement rollback",
+] as const;
+
+export const MODIFY_RULE_PRESSURE_REACH = [
+  "funded admission",
+  "wide generated insert",
+  "wide generated update",
+  "64 MiB",
+  "spill cleanup",
+] as const;
+
+/** Repeat-tracker cache eviction and identity domains; generated b5c6 histories. */
+export const MODIFY_TARGET_SET_REACH = [
+  "evicted leaf",
+  "repeated target",
+  "separate tables",
+  "wide row identity",
+  "fixed charged envelope",
+  "complete cleanup",
+] as const;
+
+/** Large shared-scope inputs and native repeat policy; b5c7 includes20k target witness. */
+export const MODIFY_LARGE_TARGETS_REACH = [
+  "120s per history",
+  "coalesced row undo",
+  "joined first match",
+  "large upsert",
+  "joined delete",
+  "no native repeat Set",
+  "64 MiB",
+  "complete cleanup",
+] as const;
+
+/** Create/write/read borrows survive cancellation until the backend returns. */
+export const MODIFY_TARGET_CANCEL_REACH = [
+  "create",
+  "append",
+  "read",
+  "borrow fenced",
+  "idempotent cleanup",
+] as const;
+
+/** Single-row write coalescing must retain catalog boundaries, rollback and recovery. */
+export const WRITE_ROW_UNDO_REACH = [
+  "visible row shortcut",
+  "new row classified",
+  "coalesced append",
+  "catalog boundary",
+  "frozen memtable",
+  "commit",
+  "statement rollback",
+  "transaction rollback",
+  "reopen",
+] as const;
+
+/** Moving repeat suppression ahead of generated evaluation loses required errors. */
+export const MODIFY_DUPLICATE_RULES_REACH = [
+  "ignored generated error",
+  "statement rollback",
+  "duplicate source values",
+] as const;
+
+/** Prefix pin expiry can occur while the bounded target tracker awaits its own spill I/O. */
+export const TRIGGER_PREFIX_TARGET_REACH = [
+  "one-row batch",
+  "suspended on final row",
+  "suspended before final row",
+  "expired during wait",
+  "UPDATE",
+  "DELETE",
+  "published",
+  "resident",
+  "no primary effect",
+] as const;
+
+/** Immutable trigger targets and FK edges must enter native rule/admission reach. */
+export const STATEMENT_RULE_REACH = [
+  "rule minimum includes body targets",
+  "raw executor guarded",
+  "informational update only",
+  "generated key propagation",
+  "FK preserves budget",
+  "budget diamond",
+  "budget zero fires",
+  "negative budget writes without firing",
+  "unrelated update",
+  "insert stops FK edge",
+  "delete event differs",
+  "RETURNING guarded",
+  "plain guarded",
+  "guard before mutation",
+] as const;
+
+/** Closed text sets cannot disappear when complete-row CHECK/generated validation is installed. */
+export const MODIFY_CLOSED_SET_REACH = [
+  "INSERT",
+  "UPDATE",
+  "upsert insert",
+  "upsert proposed",
+  "upsert assignment",
+  "CHECK",
+  "no CHECK",
+  "generated",
+  "no generated",
+  "first invalid row",
+  "column identity",
+  "rollback",
+  "NULL and UTF8 allowed",
+] as const;
+
+/** Closed-set checks share normal and exceptional generated-row validation. */
+export const CLOSED_SET_REPLAY_REACH = [
+  "flat",
+  "dictionary",
+  "constant",
+  "selection",
+  "all rows",
+  "before later generated error",
+  "single active row",
+  "physical row and column",
+] as const;
+
+/** Arbitration must consume completed asynchronous reads without relying on cache admission. */
+export const MODIFY_UPSERT_RESOLUTION_REACH = [
+  "fresh",
+  "primary",
+  "unique",
+  "targetless",
+  "published",
+  "resident",
+  "completed read used",
+  "bounded lookup count",
+] as const;
+
+/** Raw native SQL execution must not opt into the legacy uncharged target Set. */
+export const MODIFY_TRACKING_CAPABILITY_REACH = [
+  "update",
+  "delete",
+  "upsert",
+  "RETURNING",
+  "plain",
+  "cached writer",
+  "fresh writer",
+  "raw caller refused",
+  "owned SQL tracked",
+] as const;
+
+/** Oversized proposals fail with the index-path identity before arbitration encoding/copies. */
+export const MODIFY_UPSERT_KEY_LIMIT_REACH = [
+  "range keys",
+  "nothing",
+  "targetless",
+  "update",
+  "prefix rollback",
+  "empty proposal",
+  "ASCII",
+  "UTF8",
+  "before key encoding",
+  "plain identity",
+  "shipped cap PG difference",
+  "bounded arity",
+] as const;
+
+/** Point arbitration fetches bound physical decode before and after publication. */
+export const MODIFY_UPSERT_POINT_REACH = [
+  "first physical chunk",
+  "later physical chunk",
+  "resident",
+  "publication after capture",
+  "first",
+  "middle",
+  "last",
+  "NULL",
+  "text",
+  "one physical row",
+] as const;
+
+/** Action metadata cannot select a different old executor policy while its RI driver is absent. */
+export const MODIFY_FK_GUARDS_REACH = [
+  "update",
+  "upsert",
+  "delete",
+  "CASCADE",
+  "SET NULL",
+  "SET DEFAULT",
+  "RESTRICT",
+  "NO ACTION",
+  "informational",
+  "deleteDefault",
+  "follow",
+  "non-key update allowed",
+  "DO NOTHING allowed",
+  "raw guarded",
+  "owned guarded",
+  "RETURNING",
+  "plain",
+] as const;
+
+/** The independent IR reference must implement deferred generated rows after every assignment. */
+export const MODIFY_REFERENCE_GENERATED_REACH = [
+  "UPDATE",
+  "SQL upsert update",
+  "batch upsert update",
+  "upsert insert",
+  "stored and RETURNING",
+  "multiple generated columns",
+  "NULL",
+  "non-NULL",
+] as const;
+
+export const MODIFY_INDEX_GATE_REACH = [
+  "update",
+  "delete",
+  "insert",
+  "upsert",
+  "keyLookup",
+  "indexRange",
+  "zero SELECT limit",
+  "positive SELECT limit",
+  "query unset refused",
+  "query false refused",
+  "query opt-in prepared",
+  "DML unset admitted",
+  "DML false admitted",
+  "PG and shipped rows",
+  "zero spill",
+  "nested join refused",
+  "nested set refused",
+] as const;
+
+/** Root scalar registries have a fixed charged directory independent of row/event count. */
+export const REGISTRY_DIRECTORY_REACH = [
+  "evicted records",
+  "overwritten records",
+  "separate namespaces",
+  "wide IDs",
+  "max safe ID",
+  "missing record",
+  "fixed metadata",
+  "one spill file",
+  "descriptor count above cap",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_DIRECTORY_IO_REACH = [
+  "create",
+  "append",
+  "read",
+  "external cancellation",
+  "close cancellation",
+  "charge survives I/O",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_DIRECTORY_FAULT_REACH = [
+  "create",
+  "append",
+  "read",
+  "checksum",
+  "structure",
+  "close failure",
+  "failure poisons further work",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_DIRECTORY_ALLOCATION_REACH = [
+  "first allocation",
+  "partial construction",
+  "denied before allocation",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_DIRECTORY_OWNER_REACH = [
+  "same row different tables",
+  "wide table ID",
+  "max safe table ID",
+  "over-cap descriptors spill",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_FRAGMENT_REACH = [
+  "empty",
+  "exact fragment",
+  "ragged fragment",
+  "payload larger than scratch",
+  "bounded copy and I/O",
+  "task clock per fragment",
+  "one file across payloads",
+  "replay without ref list",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_FRAGMENT_IO_REACH = [
+  "create",
+  "append",
+  "read",
+  "fill",
+  "clock",
+  "external cancellation",
+  "close cancellation",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_FRAGMENT_CORRUPTION_REACH = [
+  "checksum",
+  "header",
+  "cycle",
+  "truncated",
+  "oversized",
+  "fractional",
+  "bounded reads",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_SCALAR_REACH = [
+  "bool",
+  "i32",
+  "f32",
+  "f64",
+  "int64",
+  "fixed16",
+  "interval",
+  "varlen",
+  "decimal",
+  "decimal safe",
+  "decimal int64",
+  "decimal int128",
+  "decimal wide",
+  "flat",
+  "constant",
+  "dictionary",
+  "NULL",
+  "non-NULL",
+  "payload above scratch",
+  "wide coefficient above fragment",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PRIMARY_IMAGE_WIDTH_REACH = [
+  "insert",
+  "update",
+  "NULL",
+  "non-NULL",
+  "empty",
+  "small",
+  "above fragment",
+  "constraint rollback",
+  "accepted row",
+  "writer prepared before lease",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_IMAGE_SIZING_REACH = [
+  "insert",
+  "update",
+  "delete",
+  "NULL",
+  "non-NULL",
+  "empty",
+  "small",
+  "above fragment",
+  "no payload read",
+  "no admission",
+  "constant ownership",
+  "foreign root refused",
+  "continued full read",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_IMAGE_SIZING_LIFETIME_REACH = [
+  "caller cancellation",
+  "close during IO",
+  "charge until IO drain",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_IMAGES_REACH = [
+  "INSERT images",
+  "UPDATE images",
+  "DELETE images",
+  "full physical row",
+  "projected stable IDs",
+  "unread is not NULL",
+  "large unrelated payload skipped",
+  "duplicate bindings alias",
+  "caller source retired",
+  "wide row replay",
+  "foreign root refused",
+  "two files independent of rows",
+  "fixed frozen minimum",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_IMAGES_LIFETIME_REACH = [
+  "close waits lease",
+  "lease charge survives close",
+  "caller cancels prepare",
+  "close cancels prepare",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_IMAGES_IO_REACH = [
+  "close cancels read",
+  "caller cancels read",
+  "charge survives payload IO",
+  "no read after cancel",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_TARGET_REACH = [
+  "parent swap captures",
+  "updated once",
+  "multiple physical versions",
+  "deleted target skipped",
+  "same row different tables",
+  "wide IDs",
+  "empty range replay",
+  "foreign root refused",
+  "one file across ranges",
+  "over-cap targets",
+  "fixed metadata",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_TARGET_IO_REACH = [
+  "caller cancellation",
+  "close cancellation",
+  "input return fenced",
+  "pending input remains charged",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_IMAGES_WIDE_REACH = [
+  "capture scratch prepaid",
+  "signed wide coefficient",
+  "wide source retired",
+  "projected wide payload skipped",
+  "exact tier and scale",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_COMMAND_REACH = [
+  "root budget 1",
+  "body budget 0",
+  "terminal budget -1",
+  "three live frames",
+  "retired command refused",
+  "incremental action uniqueness",
+  "separate reference cursor",
+  "immutable RI replay",
+  "retired RI refused",
+  "wide row IDs",
+  "spilled accepted rows",
+  "fixed metadata",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_COMMAND_IO_REACH = [
+  "caller cancellation",
+  "close cancellation",
+  "verification IO fenced",
+  "metadata remains paid",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_IMAGES_WORKSPACE_REACH = [
+  "many wide columns",
+  "shared decode scratch",
+  "exact retained buffers",
+  "negative coefficients",
+  "positive coefficients",
+  "zero ownership",
+] as const;
+
+export const NATIVE_COMMAND_CHECK_REACH = [
+  "resident sources",
+  "published sources",
+  "unique 23505",
+  "primary 23505",
+  "missing parent 23503",
+  "valid reference",
+  "NULL reference skipped",
+  "NULL key skipped",
+  "valid command",
+  "obsolete version skipped",
+  "root prepaid cursor",
+  "image released before progress",
+  "projected unrelated payload",
+  "zero ownership",
+] as const;
+
+export const NATIVE_COMMAND_ACTION_CHECK_REACH = [
+  "root checkpoint already passed",
+  "earlier actions passed",
+  "new action uniqueness before later error",
+  "resident sources",
+  "published sources",
+  "zero ownership",
+] as const;
+
+export const NATIVE_COMMAND_CHECK_LIFETIME_REACH = [
+  "image gone before wait",
+  "close cancellation",
+  "caller cancellation",
+  "pending progress remains paid",
+  "no cursor after cancellation",
+  "zero ownership",
+  "capture close",
+  "capture cancellation",
+] as const;
+
+export const PREPARED_ROW_CREDIT_REACH = [
+  "one prepared slot",
+  "owner close refuses live step",
+  "reclaim keeps floor",
+  "merge keeps floor",
+  "metadata transfer keeps floor",
+  "cancel before consumption",
+  "native allocations survive reservation release",
+  "idempotent retirement",
+  "idle floor returned",
+  "zero ownership",
+] as const;
+
+export const NATIVE_COMMAND_CHECK_CONSTRUCTION_REACH = [
+  "digit scratch fault",
+  "key buffer fault",
+  "offset buffer fault",
+  "output buffer fault",
+  "private account restored",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PRIMARY_REACH = [
+  "insert",
+  "update",
+  "delete",
+  "key swap",
+  "PG immediate swap refused",
+  "product swap deferred PG control",
+  "resident sources",
+  "published sources",
+  "no admission with image lease",
+  "no legacy deferred queues",
+  "whole statement rollback",
+  "NOT NULL",
+  "CHECK",
+  "command uniqueness",
+  "later callback failure",
+  "root end once",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PRIMARY_OWNERSHIP_REACH = [
+  "insert",
+  "update",
+  "delete",
+  "conflicts",
+  "DDL",
+  "prepared end",
+  "foreign command",
+  "retired command",
+  "forged preparation",
+  "no unchecked mutation",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PRIMARY_LIFETIME_REACH = [
+  "close waits native reservation",
+  "retirement during reservation",
+  "no mutation after await",
+  "prepared credit retired",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PRIMARY_ADMISSION_REACH = [
+  "native growth queued",
+  "competing credit retained",
+  "operation cancellation",
+  "cancel completes at admission boundary",
+  "same transaction continues",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PRIMARY_OWNER_CLOSE_REACH = [
+  "resident source",
+  "published source",
+  "pending callback fenced",
+  "rollback waits callback",
+  "prefix pin retired by rollback",
+  "native primary charge retained",
+  "zero ownership",
+] as const;
+
+export const COMMAND_MAINTENANCE_WAIT_REACH = [
+  "one native operation factory",
+  "one completion observer",
+  "cancelled listeners removed",
+  "later command attaches",
+  "one active waiter",
+  "owner failure preserved",
+  "owner completion preserved",
+  "settled listener removed",
+] as const;
+
+export const NATIVE_PRIMARY_END_FENCE_REACH = [
+  "resident source",
+  "published source",
+  "end callback fenced",
+  "cancelled end cannot succeed",
+  "rollback after fence",
+  "charge retained until callback",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PRIMARY_CLOSE_FAULT_REACH = [
+  "async callback fault",
+  "immediate callback fault",
+  "native rollback despite fault",
+  "metadata refunded after fence",
+  "original callback fault retained",
+  "zero ownership",
+] as const;
+
+export const MODIFY_SOURCE_ERROR_ORDER_REACH = [
+  "insert",
+  "nothing",
+  "upsert",
+  "update",
+  "check",
+  "null",
+  "none",
+  "RETURNING",
+  "no RETURNING",
+  "multiple input pages",
+  "short prefix",
+  "atomic rollback",
+  "zero spill",
+] as const;
+
+export const MODIFY_RETURNING_ERROR_ORDER_REACH = [
+  "CHECK binding",
+  "NOT NULL without CHECK",
+  "insert",
+  "upsert",
+  "update",
+  "same batch",
+  "across batches",
+  "PG row order",
+  "shipped batch-order difference",
+  "atomic rollback",
+] as const;
+
+export const MODIFY_SOURCE_FAULT_ORDER_REACH = [
+  "57014",
+  "0A000",
+  "XX000",
+  "53200",
+  "no writer continuation",
+  "zero spill",
+] as const;
+
+export const MODIFY_WINDOW_ERROR_ORDER_REACH = [
+  "earlier CHECK",
+  "window argument error",
+  "atomic rollback",
+  "zero spill",
+] as const;
+
+export const MODIFY_RETURNING_SCOPE_REACH = [
+  "bound native error order",
+  "raw missing capability refusal",
+  "zero spill",
+] as const;
+
+export const COLUMN_RULE_BINDING_REACH = [
+  "CHECK refusal",
+  "generated refusal",
+  "minimum covers binding",
+  "complete NOT NULL validator",
+  "zero charge",
+] as const;
+
+export const REGISTRY_COMMAND_TARGET_REACH = [
+  "three live commands",
+  "table isolation",
+  "command isolation",
+  "reused frame",
+  "ancestor survives child",
+  "cold bitmap revisit",
+  "neighbor bits and block boundary",
+  "wide native ID",
+  "zero native ID",
+  "one shared file",
+  "constant metadata",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_COMMAND_TARGET_PIN_REACH = [
+  "boundary1",
+  "boundary2",
+  "boundary3",
+  "boundary4",
+  "one final target",
+  "no accepted mutation",
+  "zero ownership",
+] as const;
+
+export const REGISTRY_COMMAND_TARGET_FENCE_REACH = [
+  "cancel",
+  "retire",
+  "close",
+  "cancel on final await",
+  "retire on final await",
+  "close on final await",
+  "close retains metadata through IO",
+  "no accepted mutation",
+  "zero ownership",
+] as const;
+
+export const NATIVE_ACTION_UNIQUE_REACH = [
+  "entry",
+  "id",
+  "resident",
+  "published",
+  "one action",
+  "two actions",
+  "three actions",
+  "shared command token",
+  "native23505 before later22012",
+  "atomic rollback",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BOUNDARY_REACH = [
+  "id",
+  "entry",
+  "forged",
+  "retired",
+  "foreign",
+  "invalid before effects",
+  "retired action refused",
+  "command retired and reused",
+  "budget-1",
+  "budget0",
+  "budget1",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BOUNDARY_FENCE_REACH = [
+  "image",
+  "check",
+  "action",
+  "caller cancels root",
+  "undelivered lease released",
+  "reentrant close shares fence",
+  "IO fence before credit return",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BOUNDARY_LISTENER_REACH = [
+  "external signal",
+  "root signal",
+  "no settled listener history",
+  "constant metadata",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BOUNDARY_REFERENCE_REACH = [
+  "published",
+  "resident",
+  "native missing parent23503",
+  "native parent exists",
+  "command end checkpoint",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BOUNDARY_NESTING_REACH = [
+  "one live frame",
+  "two live frames",
+  "three live frames",
+  "RI preserves budget-1",
+  "outer action drain refused before child effects",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BOUNDARY_IMAGE_CANCEL_REACH = [
+  "projected lease",
+  "full lease",
+  "released before boundary close",
+  "zero ownership",
+] as const;
+
+export const STAGED_FRAGMENT_MAXIMA_REACH = [
+  "stage",
+  "flush",
+  "one fragment",
+  "multiple fragments",
+  "over 64 fragments",
+  "rollback",
+  "fold committed rows",
+  "hidden staging",
+  "append after reopen",
+  "zero charge",
+] as const;
+
+/** Internal RI writers and actual selected index/empty SQL DML retain FTS undo/WAL atomicity. */
+export const MODIFY_FTS_PATHS_REACH = [
+  "ri update",
+  "ri delete",
+  "keyLookup update",
+  "keyLookup delete",
+  "indexRange update",
+  "indexRange delete",
+  "zero update",
+  "zero delete",
+  "ri commit",
+  "ri rollback",
+  "ri savepoint",
+  "keyLookup commit",
+  "keyLookup rollback",
+  "keyLookup savepoint",
+  "indexRange commit",
+  "indexRange rollback",
+  "indexRange savepoint",
+  "commit",
+  "rollback",
+  "savepoint",
+  "resident",
+  "stored",
+  "reopen",
+] as const;
+
+/** The staged native primary capability must preserve ordinary FTS undo/WAL semantics. */
+export const NATIVE_PRIMARY_FTS_REACH = [
+  "insert",
+  "update",
+  "delete",
+  "commit",
+  "rollback",
+  "savepoint",
+  "published",
+  "resident",
+  "undo and WAL",
+  "reopen",
+  "zero ownership",
+] as const;
+
+/** RI inputs seal full OLD-key child identities with fixed metadata and one native cursor. */
+export const NATIVE_CHILD_CAPTURE_REACH = [
+  "current prefix",
+  "published",
+  "resident",
+  "empty",
+  "matching OLD",
+  "multiple cursor fills",
+  "spilled target directory",
+  "NEW differs",
+  "fixed metadata",
+  "released cursor",
+  "zero ownership",
+] as const;
+
+/** Native row ranges coalesce inside one command, retaining exactly one funded FTS flag. */
+export const NATIVE_COMMAND_UNDO_REACH = [
+  "commit",
+  "rollback",
+  "savepoint",
+  "root/body/nested",
+  "reused frame slots",
+  "returned parent command",
+  "ordinary insert flags",
+  "coalesced same-command rows",
+  "zero ownership",
+  "sequential bodies reuse frame",
+] as const;
+
+/** Follow preparation cannot advance or borrow native uniqueness/reference check positions. */
+export const REGISTRY_THREE_CHECKPOINT_REACH = [
+  "unique",
+  "followTargets",
+  "references",
+  "follow before references",
+  "references before follow",
+  "wide IDs",
+  "small IDs",
+  "incremental prefixes",
+  "no completed-prefix replay",
+  "fixed metadata",
+  "zero ownership",
+] as const;

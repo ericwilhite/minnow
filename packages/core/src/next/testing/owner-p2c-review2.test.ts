@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import type { CatalogView } from "../access/catalog.js";
 import type { StatementOptions, TableRules } from "../access/modify.js";
 import { EXECUTOR_COSTS } from "../exec/executor.js";
+import type { StatementRules } from "../exec/statement-rules.js";
 import { createLowerer } from "../lower/create.js";
 import { MemoryCatalog } from "../lower/memory-catalog.js";
 import { Governor, OBJECT_OVERHEAD_BYTES, bigintBytes } from "../memory/governor.js";
@@ -113,18 +114,24 @@ describe("finding 1 (review): sizing walks the expressions, BigInts included", (
   });
 });
 
-/** The harness with every write statement's options recorded, to call `rules` as B3 will. */
+/** Observe cached immutable programs, independently of the native admitted evaluators. */
 function withRules() {
   const h = harness();
   const statements: Array<{ options: StatementOptions; catalog: CatalogView }> = [];
   h.writePath.onStatement = (options, catalog) => {
     statements.push({ options, catalog });
   };
+  const programs = new WeakMap<StatementOptions, StatementRules>();
+  h.executor.onExecute = (request) => {
+    const last = statements.at(-1);
+    if (last && request.rowRules) programs.set(last.options, request.rowRules);
+  };
   const compileLast = (name: string) => {
     const last = statements.at(-1);
     const table = last?.catalog.tableByName(name);
     if (last === undefined || table === undefined) throw new Error("no statement");
-    return last.options.rules(table.id);
+    const scope = programs.get(last.options);
+    return scope ? scope.lookup(table.id) : last.options.rules(table.id);
   };
   return { ...h, compileLast };
 }

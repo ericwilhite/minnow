@@ -335,7 +335,8 @@ describe("DML", () => {
     const root = lowered.plan.root;
     if (root.op !== "modify") throw new Error("Expected modify");
     expect([root.kind, root.onConflict]).toEqual(["insert", null]);
-    expect(chain(root)).toEqual(["modify", "project", "project", "values"]);
+    expect(chain(root)).toEqual(["modify", "project", "values"]);
+    expect(root.deferGenerated).toBe(true);
     const orders = catalog.view.tableByName("orders");
     expect(root.input.output.map((column) => column.name)).toEqual(
       orders?.columns.map((column) => column.name),
@@ -411,7 +412,7 @@ describe("DML", () => {
     const orders = catalog.view.tableByName("orders");
     const id = (name: string) => orders?.columns.find((column) => column.name === name)?.id;
     expect(root.kind).toBe("update");
-    // Assigned columns in statement order, then the generated total that reads qty, computed in
+    // Assigned columns in statement order, then generated placeholders filled in the bound row-rule scope, placed in
     // a second projection from the materialized qty (review finding 3).
     expect(root.assigned).toEqual([id("qty"), id("note"), id("total")]);
     expect(chain(root)).toEqual(["modify", "project", "project", "keyLookup"]);

@@ -168,6 +168,8 @@ export interface VectorPredicate {
 export type HashJoinKind = Exclude<JoinKind, "cross">;
 
 export interface HashJoinSpec {
+  /** Modification joins visit duplicate build keys in source order. */
+  readonly oldestFirst?: boolean;
   readonly kind: HashJoinKind;
   readonly probeTypes: readonly PhysicalType[];
   readonly buildTypes: readonly PhysicalType[];
@@ -990,6 +992,7 @@ class Level {
     );
     if (table === null) return false;
     this.table = table;
+    if (shared.spec.oldestFirst) yield* table.oldestFirst(slice);
     if (shared.kind === "mark") shared.resetKeys();
     shared.profile.table = table.kind;
     if (shared.kind === "right" || shared.kind === "full") {

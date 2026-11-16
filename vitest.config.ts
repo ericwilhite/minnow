@@ -4,6 +4,7 @@ import { configDefaults, defineConfig } from "vitest/config";
 import DurationSequencer from "./scripts/test-shards.ts";
 
 const maintenanceWorkload = "packages/core/src/engine/maintenance-under-load.test.ts";
+const modifyPressureWorkload = "packages/core/src/next/testing/modify-large-targets.test.ts";
 const reachUnions = "packages/**/*.reach.test.ts";
 
 /**
@@ -55,7 +56,12 @@ export default defineConfig({
             "scripts/**/*.test.ts",
             "apps/site/{lib,bench,components}/**/*.test.ts",
           ],
-          exclude: [...configDefaults.exclude, maintenanceWorkload, reachUnions],
+          exclude: [
+            ...configDefaults.exclude,
+            maintenanceWorkload,
+            modifyPressureWorkload,
+            reachUnions,
+          ],
           // `npm run test:packed`: every segment the engine can pack is packed.
           setupFiles:
             process.env.MINNOW_FORCE_PACKING === "1" ? ["scripts/forced-packing.setup.ts"] : [],
@@ -78,11 +84,23 @@ export default defineConfig({
       {
         extends: true,
         test: {
+          name: "modify-pressure",
+          include: [modifyPressureWorkload],
+          // Complete histories retain their own 120s cancellation/cleanup deadline. As with
+          // maintenance, isolate this bounded-cap campaign from unrelated database suites;
+          // its rows, seeds, differential checks and memory cap stay unchanged.
+          fileParallelism: false,
+          sequence: { groupOrder: 3 },
+        },
+      },
+      {
+        extends: true,
+        test: {
           name: "reach",
           // Each asserts the union of what a split campaign's files reached, so it runs after
           // them; scripts/test-shards.ts keeps it in their run part.
           include: [reachUnions],
-          sequence: { groupOrder: 3 },
+          sequence: { groupOrder: 4 },
         },
       },
     ],

@@ -147,6 +147,13 @@ class SelectedMemory implements MemorySegment {
   }
 }
 
+/** Borrowed physical-position view; the caller prepays descriptors and position buffers. */
+export function selectedSegment(source: Segment, index: number, rows: Uint16Array): Segment {
+  return source.kind === "group"
+    ? new SelectedGroup(source, index, rows)
+    : new SelectedMemory(source, index, rows);
+}
+
 /** Inner sorts return their buffers/loans; the execution owns the reusable outer account. */
 export function scopedGrant(grant: Grant, minimum: number): Grant {
   let closed = false;

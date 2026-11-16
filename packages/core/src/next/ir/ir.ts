@@ -436,7 +436,8 @@ export type Rel =
    *   Assignments are evaluated in list order, each once per row, and assignment `j` may also
    *   read column `2n + i` for `i < j`: the value assignment `i` produced. Lowering recomputes a
    *   stored generated column from those values, so a volatile assigned expression is evaluated
-   *   once (review B6-p2a finding 3).
+   *   once (review B6-p2a finding 3). Snapshotted parameter/passthrough values follow
+   *   all assignment slots at `2n + assignments.length`.
    * - `returning`: the affected table row (new values for insert, update and upsert; old values
    *   for delete), then the input's passthrough columns (`passthrough`, below).
    * - `merge` actions: see `MergeAction`.
@@ -451,7 +452,8 @@ export type Rel =
       readonly kind: "insert" | "update" | "delete" | "upsert" | "merge" | "truncate";
       readonly tableId: number;
       /**
-       * Rows to write (insert/upsert): every table column in catalog order, defaults and
+       * Rows to write (insert/upsert): every table column in catalog order, then any
+       * passthrough columns (including snapshotted RETURNING parameters). Defaults and
        * generated columns filled, each of exactly its column's type. Update: the row locator,
        * then one column per `assigned` column, in that order. Delete: the row locator. Merge: see
        * `merge`. For update, delete and merge, the last `passthrough` input columns follow (values
@@ -460,6 +462,12 @@ export type Rel =
       readonly input: Rel;
       /** Trailing input columns that only RETURNING reads (additive; absent is 0). */
       readonly passthrough?: number;
+      /** UPDATE/DELETE input carries the complete pre-statement row after assigned values,
+       * before passthrough. It supplies RETURNING without fetching a locator after mutation. */
+      readonly oldRow?: boolean;
+      /** Generated placeholders are filled by the statement-bound row-rule scope, before checks. */
+      readonly deferGenerated?: boolean;
+      readonly usesRules?: boolean;
       /**
        * UPDATE: the catalog column ids the statement assigns, in input order after the locator
        * (access/ `TableWriteOptions.assigned`). Empty for insert, upsert and delete.
@@ -472,6 +480,8 @@ export type Rel =
        * (access/ `TableWriteOptions.onRepeat`.)
        */
       readonly onRepeat: "error" | "first";
+      /** Lowering proves a single-table scan/probe emits each original target at most once. */
+      readonly uniqueTargets?: boolean;
       readonly onConflict: {
         /**
          * The unique indexes a proposed row conflicts on, tried in order (access/

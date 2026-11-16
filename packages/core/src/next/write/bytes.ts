@@ -15,6 +15,14 @@ export function need<T>(value: T | null | undefined): T {
   return value;
 }
 
+/** Exact private byte token (not UTF8 decoding), with bounded argument arity on every engine. */
+export function byteString(bytes: Uint8Array): string {
+  let text = "";
+  for (let from = 0; from < bytes.length; from += 512)
+    text += Reflect.apply(String.fromCharCode, String, bytes.subarray(from, from + 512)) as string;
+  return text;
+}
+
 /** Memory a structure charges before it allocates (a governor grant, or a memtable's counter). */
 export interface Charge {
   allocate(bytes: number): boolean;

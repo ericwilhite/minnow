@@ -79,7 +79,52 @@ Native accepted updates, deletes and notified upserts atomically record table-wi
 invalidation with their rows. This history survives checkpoint/reopen even when no index
 is declared; zero-row and rolled-back commands do not invalidate. A missing or stale native
 write renderer also invalidates acceleration rather than rejecting accepted rows.
+The private SQL modification executor now notifies this history for accepted UPDATE FROM,
+DELETE USING and both ON CONFLICT write arms. Coalesced inserts retain one funded undo
+entry and preserve any accepted upsert marker; statement and savepoint rollback remove
+their FTS effects together with the rows. Both statement and end signals cancel FTS admission.
+Completed native index merges return their working credit before reserving the next
+maintenance step, so reads under a small memory cap can follow keyed modifications
+without a circular admission wait.
 No supported 1.0 stored-format predecessor exists yet.
+
+The unexported rebuild now executes INSERT VALUES, INSERT SELECT, UPDATE and DELETE through
+its native statement writer for scans, index lookups and bounded index ranges. RETURNING reports inserted rows,
+new UPDATE values and old DELETE values through charged spillable storage, and delivers
+rows only after the statement succeeds. ON CONFLICT supports primary and unique arbiters,
+permuted composite targets, DO NOTHING (including a bare target), and DO UPDATE with
+EXCLUDED and WHERE. An asynchronous arbiter lookup consumes its completed result once, so progress does not
+depend on retaining the read in a cache. OLD-row conflict fetches decode only the selected
+physical row, including when its memory segment publishes between capture and fetch.
+Oversized conflict proposals fail the same index-key
+limit as plain INSERT before arbitration encodes or copies the key; private key conversion
+uses bounded call arity. A repeated affected target rolls back the statement; assignments to
+arbiter or primary-key columns are refused as in the shipped engine. Proposed rows are
+validated before arbitration: a conflicting DO NOTHING row with a NOT NULL violation is
+rejected, matching PostgreSQL (the shipped engine currently skips that check).
+Single-source index inputs retain original row locators and suppress repeated probe matches.
+Cursors beneath join or set-operation inputs retain the internal diagnostic opt-in until
+their complete admission is proved. Reads use the statement
+snapshot; statement errors roll back earlier rows. Unique and foreign-key checks use the
+existing write path. CHECK constraints and stored generated columns now use the shared,
+charged row-rule program, retained through native FK actions. Set operations retain their
+operator-specific progress-copy allowance when no DML override applies. Generation runs inside the
+statement rule scope; an earlier row's NOT NULL or named CHECK failure precedes a later
+row's generated-expression error. Closed text sets remain enforced alongside CHECK and
+generated columns, including conflict proposals and assignments; violations retain their
+column identity and the first invalid row. Direct generated assignments remain refused; DEFAULT
+recomputes the value. Modification input uses a charged, bounded spill spool; read
+reservations retire before the writer starts, so a writer waiting for memory cannot pin
+its own producer. Single-table UPDATE and DELETE avoid statement-wide target sets;
+UPDATE FROM visits matching source rows in source order. Joined modifications and upserts
+track repeated native row identities with a fixed charged bitmap cache and a spilled paged
+directory. Joined/USING and conflict-update SQL writers require that admitted tracking
+capability before writer lookup; raw executor callers cannot fall back to an uncharged Set.
+Duplicate suppression follows row-rule evaluation. Single-row upsert writes
+coalesce contiguous undo ranges without crossing statement or catalog boundaries, keeping
+commit projection bounded. Prefix-pinned UPDATE/DELETE recheck pin lifetime after asynchronous
+repeat tracking, including the final target in a batch. A released pin cannot authorize a write.
+The shipped engine and stored formats are unchanged.
 
 The unexported rebuild casts integers, NUMERIC (keeping scale), float4/float8 (PostgreSQL's
 shortest spelling), boolean, date, time, timestamp, timestamptz (UTC), interval (including
@@ -115,6 +160,9 @@ identities. Its catalog metadata type can describe the added action spellings an
 The shipped 0.x SQL input/runtime behavior stays unchanged. Duplicate action clauses
 are refused with PostgreSQL's syntax error in the native front end. Native action execution and
 trigger firing still require the joint execution integration; metadata alone does not enable them.
+Until that driver is installed, explicit native ON UPDATE modes, ON DELETE SET DEFAULT and
+informational rekeys refuse with 0A000 rather than falling through to a different action.
+Non-key updates, DO NOTHING and enforced omitted-update follow remain executable.
 The shared parser and schema-action comparison measure 1,179,776 raw / 353,876 gzip bytes
 for the main bundle, 1,592,207 / 460,862 with OPFS, and 1,588,242 / 458,212 for the
 IndexedDB worker. Raise their raw/gzip caps once by 512/256, 512/256 and 768/128 bytes;
@@ -142,13 +190,19 @@ prefix `RI_ConstraintTrigger_` for system triggers (SQLSTATE `42939`, `reserved_
 
 The private 1.0 write path adds separately owned current-statement read pins and validates
 body-writer locator origins, for trigger substatement integration. Released pins retire from
-the root's active ownership set; commit and rollback close remaining pins. No shipped behavior,
+the root's active ownership set; commit and rollback close remaining pins. The private image
+registry sizes variable NEW values from stored metadata before writer preparation, without
+decoding their payloads or retaining a value lease across that wait. No shipped behavior,
 public API or stored format changes.
 
 - The private 1.0 row-rule evaluator preserves PostgreSQL's first error across generated
   expressions, NOT NULL and CHECKs when batch evaluation fails. CHECKs use constraint-name
   order. Successful generated batches retain vectorized evaluation; shipped 0.x behavior and
   stored formats are unchanged.
+  Native column validation also preserves row order when a caller supplies CHECK kernels
+  without a complete-row validator: an earlier row's CHECK precedes a later row's NULL,
+  and an earlier row's NULL precedes a later row's failure in another column. Batch width
+  and inactive rows do not change the reported constraint or column.
 
 The unexported rebuild retains `GENERATED ALWAYS AS IDENTITY` in its catalog and applies
 PostgreSQL's assignment rules: omitted values and DEFAULT use the owned sequence; explicit
@@ -159,10 +213,12 @@ query front end grows slightly: each engine entry's raw size cap rises once by 5
 main and OPFS gzip caps by 128 bytes each; client bundle and isolation limits are unchanged.
 
 The unexported rebuild adds charged, statement-owned CHECK and stored-generated-column
-kernels shared by ordinary writes and foreign-key actions. CHECK passes NULL and preserves
-row/constraint error order; generated recomputation keeps the old row intact for key checks.
-This internal module changes no published behavior or stored format; DML routing and triggers
-are integrated separately.
+kernels shared by ordinary writes and foreign-key actions. CHECK passes NULL. Generated
+expressions, NOT NULL and CHECK validation preserve row and constraint-name error order;
+this ordering claim does not cover unique or foreign-key checks. Generated recomputation
+keeps the old row intact for key checks.
+This internal module changes no published behavior or stored format. DML routing now uses
+these kernels; trigger firing remains a separate integration.
 
 The unexported rebuild retains named enum identities, owned identity and schema counters,
 managed table/view flags, index directions, view outputs and stable expression dependencies in

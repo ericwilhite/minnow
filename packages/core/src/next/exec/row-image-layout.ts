@@ -1,5 +1,5 @@
 /** Image-registry ABI budget. The native provider must fit this fragmented, scalar layout;
- * implementation/firing remains absent until installed by the admitted root. */
+ * SQL firing remains absent until the admitted root installs its native provider. */
 import type { PhysicalType } from "../types.js";
 import { dataBytes } from "../vector/vector.js";
 import { SORT_ROW_VIEW_BYTES } from "./sort-row.js";

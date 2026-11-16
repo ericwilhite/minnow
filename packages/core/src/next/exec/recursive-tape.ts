@@ -142,8 +142,9 @@ export class RecursiveTape {
   each(
     types: readonly PhysicalType[],
     visit: (columns: readonly Vector[], rows: number) => Promise<boolean>,
+    beforeLeaf?: (bytes: number) => Promise<void>,
   ): Promise<void> {
-    return this.#each(types, visit, null);
+    return this.#each(types, visit, null, beforeLeaf);
   }
   /** Copy into caller-prepaid ordinary scratch, then retire read buffers/loans BEFORE
    * continuation. Trigger AFTER queues append during continuation; no read loan may span it. */
@@ -158,6 +159,7 @@ export class RecursiveTape {
     types: readonly PhysicalType[],
     visit: (columns: readonly Vector[], rows: number) => Promise<boolean>,
     copy: ((columns: readonly Vector[], rows: number) => void) | null,
+    beforeLeaf?: (bytes: number) => Promise<void>,
   ): Promise<void> {
     this.#reading = true;
     let top = 0;
@@ -176,6 +178,7 @@ export class RecursiveTape {
         this.#stack[top] = null;
         if (frame == null) throw new SpillCorruptionError("Missing recursive directory frame");
         if (frame.level === 0) {
+          await beforeLeaf?.(frame.ref.length);
           let data: { page: { bytes: Uint8Array; charged: number }; decoded: DecodedPage } | null =
             await this.#read(frame.ref, types);
           if (copy === null) {

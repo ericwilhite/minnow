@@ -69,7 +69,7 @@ import { groupRootOf, type Memtable } from "./memtable.js";
 import type { KeyDelta } from "./key-hash.js";
 import type { RunEntry, RunReader } from "./runs.js";
 import { groupDeletions, type Shared, type TableView, type WriteState } from "./state.js";
-import { need } from "./bytes.js";
+import { need, byteString } from "./bytes.js";
 
 const settle = <T, R>(
   value: MaybePromise<T>,
@@ -695,57 +695,90 @@ export class TableSnapshotImpl implements TableSnapshot {
     this.#columnIndex = columnIndex(def);
   }
 
-  /** Admission fallback only: retain at most one native memory chunk. Other sources keep
-   * their existing publication-stable recipe. Query close and snapshot close both release it. */
-  prepareRead(): TableReadRecipe | null {
+  /** Admission fallback: retain one existing chunk per native tail. No-options callers
+   * keep the single-segment contract; multiple tails require prepaid metadata.
+   * Query close and snapshot close both release retention. */
+  prepareRead(options?: { readonly budget: ByteBudget }): TableReadRecipe | null {
     const segments = this.segments;
-    const segment = segments.length === 1 ? segments[0] : undefined;
-    if (!(segment instanceof MemorySegmentImpl)) return null;
-    const published = segment.memtable.published;
-    if (published !== null) {
-      // The stable source is stored already. Use the ordinary validated-root/group
-      // reader and its actual page recipe, not the memory re-point worst case.
-      const reader = new GroupRead(published.group.root, this.snapshot.pages, this.budget);
-      const group: GroupSegment = {
-        kind: "group",
-        index: segment.index,
-        rowCount: segment.rowCount,
-        staged: false,
-        get liveRowCount() {
-          return segment.liveRowCount;
+    let memory = 0;
+    for (const segment of segments)
+      if (segment instanceof MemorySegmentImpl && segment.rowCount > 0) memory++;
+    if (memory === 0 || (segments.length !== 1 && options === undefined)) return null;
+    // A source may contain stored groups and several small native tails. Retain
+    // only each tail's existing single chunk, all still charged to the write owner.
+    // The query prepays every retained-column reference, replacement and close token.
+    const bytes = options ? 8192 + memory * (1024 + this.columns.length * 16) : 0;
+    if (bytes > 0 && !options?.budget.allocate(bytes)) return null;
+    const closes: Array<() => void> = [];
+    const replacements = new Map<number, GroupSegment>();
+    let live = true;
+    const close = () => {
+      if (!live) return;
+      live = false;
+      for (const end of closes) end();
+      closes.length = 0;
+      replacements.clear();
+      if (bytes > 0) options?.budget.free(bytes);
+    };
+    try {
+      for (const segment of segments) {
+        if (!(segment instanceof MemorySegmentImpl) || segment.rowCount === 0) continue;
+        const published = segment.memtable.published;
+        if (published === null) {
+          const end = segment.retainResident();
+          if (end === null) {
+            close();
+            return null;
+          }
+          closes.push(end);
+          continue;
+        }
+        const reader = new GroupRead(published.group.root, this.snapshot.pages, this.budget);
+        replacements.set(segment.index, {
+          kind: "group",
+          index: segment.index,
+          rowCount: segment.rowCount,
+          staged: false,
+          get liveRowCount() {
+            return segment.liveRowCount;
+          },
+          group: published.group,
+          deletions: () => segment.deletions(),
+          root: () => reader.root(),
+          releaseRoot: () => reader.release(),
+          chunk: (id) => reader.chunk(id),
+          statistics: (id) => reader.chunk(id)?.statistics ?? null,
+          pages: (id) => reader.summaries(id),
+        });
+        closes.push(() => reader.release());
+      }
+      if (replacements.size === 0) return { table: this, close };
+      const liveRows = () => this.liveRowCount;
+      const facade = new Proxy<readonly Segment[]>([], {
+        has: (_target, key) => Reflect.has(segments, key),
+        get: (_target, key, receiver): unknown => {
+          if (typeof key !== "string" || !/^\d+$/u.test(key))
+            return Reflect.get(segments, key, receiver);
+          const index = Number(key);
+          return replacements.get(index) ?? segments[index];
         },
-        group: published.group,
-        deletions: () => segment.deletions(),
-        root: () => reader.root(),
-        releaseRoot: () => reader.release(),
-        chunk: (id) => reader.chunk(id),
-        statistics: (id) =>
-          reader.chunk(id)?.statistics ?? missingStatistics(this.column(id), segment.rowCount),
-        pages: (id) =>
-          reader.chunk(id) === null
-            ? [
-                {
-                  firstRow: 0,
-                  rowCount: segment.rowCount,
-                  ...missingStatistics(this.column(id), segment.rowCount),
-                },
-              ]
-            : reader.summaries(id),
-      };
-      const table: TableSnapshot = {
-        tableId: this.tableId,
-        schemaVersion: this.schemaVersion,
-        columns: this.columns,
-        get liveRowCount() {
-          return group.liveRowCount;
+      });
+      return {
+        table: {
+          tableId: this.tableId,
+          schemaVersion: this.schemaVersion,
+          columns: this.columns,
+          get liveRowCount() {
+            return liveRows();
+          },
+          segments: facade,
         },
-        segments: [group],
+        close,
       };
-      return { table, close: () => reader.release() };
+    } catch (error) {
+      close();
+      throw error;
     }
-    const close = segment.retainResident();
-    if (close === null) return null;
-    return { table: this, close };
   }
 
   /** Built on first use (point reads and inserts never need them). */
@@ -1430,6 +1463,12 @@ export class ViewIndex implements IndexReader {
     return rows;
   }
 
+  planProbe(key: Uint8Array): IndexRangePlan {
+    this.table.snapshot.check();
+    if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
+    return planIndexRange(this, prefixRange(key), "asc");
+  }
+
   planRange(range: KeyRange, direction: "asc" | "desc"): IndexRangePlan {
     this.table.snapshot.checkRead();
     if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
@@ -1466,7 +1505,7 @@ export class ViewIndex implements IndexReader {
     // Candidate keys from every layer, then resolve each key once.
     const keys = new Map<string, Uint8Array>();
     const add = (key: Uint8Array) => {
-      if (inKeyRange(range, key)) keys.set(String.fromCharCode(...key), key.slice());
+      if (inKeyRange(range, key)) keys.set(byteString(key), key.slice());
     };
     for (const memtable of this.table.tableView.memtables) {
       for (const run of memtable.staged?.runs.get(this.def.id) ?? []) {

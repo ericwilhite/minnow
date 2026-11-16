@@ -78,6 +78,9 @@ export interface StatementOptions {
    * statement writes, including rows written by foreign-key actions.
    */
   readonly rules: (tableId: number) => TableRules;
+  /** Admitted, bounded repeat tracking. Returns true if this native row ID was already seen.
+   * Shared by every writer of the statement; the owner fences borrows before closing it. */
+  readonly targets?: { testAndSet(tableId: number, rowId: number): MaybePromise<boolean> };
   /** Cancels waits inside the statement (backpressure, index reads). */
   readonly signal?: AbortSignal;
 }
@@ -113,8 +116,9 @@ export interface Statement {
   /** After an accepted UPDATE/DELETE/upsert (including its INSERT arm). Native delete undo
    * independently invalidates FTS. No accepted rows means no effect. Rolls back with rows. */
   noteFtsMutation(tableId: number, kind: "update" | "delete" | "upsert"): void;
-  /** Runs deferred checks and foreign-key actions; then the statement is done. */
-  end(): Promise<void>;
+  /** Runs deferred checks/FK actions and FTS preparation. Both the statement signal and
+   * optional end signal cancel waits; cancellation keeps statement rollback available. */
+  end(signal?: AbortSignal): Promise<void>;
   /** Undoes everything the statement wrote, including its DDL. Idempotent. */
   rollback(): void;
 }
@@ -131,6 +135,12 @@ export interface TableWriteOptions {
    * skips the repeat (UPDATE … FROM, DELETE … USING). Default `"error"`.
    */
   readonly onRepeat?: "error" | "first";
+  /** Caller proves one visit per original target; omit repeat tracking for a scan/probe.
+   * Never set for a join, MERGE or ON CONFLICT input. */
+  readonly uniqueTargets?: boolean;
+  /** SQL streams without the unique-target proof require an admitted tracker. Refuse before
+   * writer lookup when it is missing; the direct-native legacy Set is not a SQL fallback. */
+  readonly requireTrackedTargets?: boolean;
 }
 
 export interface TableWriter {
@@ -188,6 +198,8 @@ export interface ConflictOutput {
  * order); they must not retain the batch.
  */
 export interface TableRules {
+  /** Optional complete-row validator: physical rows, column NOT NULL/closed sets, named CHECKs. */
+  validate?(batch: Batch, columnIds: readonly number[] | null): void;
   /**
    * CHECK constraints over the active rows: the first failing row (physical) and constraint id,
    * or null when all pass (NULL passes), ordered by physical row then PostgreSQL constraint
@@ -205,7 +217,7 @@ export interface TableRules {
    * binding-owned buffers, valid until that binding's next generate/close; writer copies finish
    * before reuse. OLD and target wrappers must be distinct, even when their old data is shared).
    * A SQL data error in speculative batch generation is replayed by row: generated columns,
-   * NOT NULL, then CHECKs in constraint-name order. An earlier constraint failure can therefore
+   * NOT NULL/closed sets, then CHECKs in constraint-name order. An earlier failure can therefore
    * throw its typed constraint error from generate(), before a later row's expression error.
    */
   generate(batch: Batch, columnIds: readonly number[]): void;
