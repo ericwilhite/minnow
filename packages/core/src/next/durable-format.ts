@@ -4,7 +4,7 @@
  * released 1.0 writer, incompatible changes require a registered ordinary-open/load upgrade.
  *
  * A codec without its own version inherits the named parent's version. Epoch slots select
- * their layout by exact magic. Root slots carry a pre-fence reader/manifest barrier. An unknown,
+ * their layout by exact magic. Root slots carry a pre-fence reader/writer/manifest barrier. An unknown,
  * checksummed slot is not an empty/torn slot. Reserved masks enumerate every permitted bit;
  * writers emit zero for the remainder, readers refuse it. Scratch/transport are not durable.
  *
@@ -14,15 +14,20 @@
  * unknown nested tag is corruption: refuse before consuming it or publishing derived state.
  * Open validates everything it eagerly reads; it never scans all data pages just to open.
  * The native vocabulary/profile guard below catches an unassigned vocabulary extension.
- * The separate minimum-writer slot allocation remains a pre-freeze dependency (B2/B6 seam).
+ * The independent native writer ledger also guards read-optional fields before acquisition.
  */
-/** Shared reference-table envelope; the manifest also carries its logical format version10. */
+/** Shared reference-table envelope; the manifest also carries its logical format version11. */
 export const METADATA_ENVELOPE_VERSION = 1;
 /** Root reader capability; incompatible nested bytes advance this or the exact manifest barrier. */
-export const DURABLE_READER_VERSION = 7;
-export const MANIFEST_FORMAT_VERSION = 10;
+export const DURABLE_READER_VERSION = 8;
+export const MANIFEST_FORMAT_VERSION = 11;
 export const ROOT_SLOT_HEADER_BYTES = 16;
-export const ROOT_SLOT_OVERHEAD = ROOT_SLOT_HEADER_BYTES + 4;
+/** Profile8 escape: two independently checked u32 capability selectors precede the manifest. */
+export const DURABLE_WRITER_VERSION = 8;
+export const ROOT_SLOT_CAPABILITY_BYTES = 8;
+export const ROOT_SLOT_EXTENSION_TAG = 7;
+export const ROOT_SLOT_PAYLOAD_OFFSET = ROOT_SLOT_HEADER_BYTES + ROOT_SLOT_CAPABILITY_BYTES;
+export const ROOT_SLOT_OVERHEAD = ROOT_SLOT_PAYLOAD_OFFSET + 4;
 
 export class DurableFormatError extends Error {
   readonly code = "MINNOW_FORMAT_UNSUPPORTED";
@@ -651,19 +656,21 @@ export const DURABLE_FORMATS = {
   },
   rootSlot: {
     magic: 0x54524e4d,
-    version: 1,
+    version: 2,
     versionIn: "header",
     fields: [
       magic(0x54524e4d),
-      // The u53 sequence leaves11 high bits: minimum-reader-minus1 in bits21..23,
-      // manifest-format-minus2 in bits24..31. Initial writer bytes remain unchanged.
+      // Preserve the recognizable16-byte checksummed frame. Old reader7 refuses escape8.
       {
-        name: "minimum reader",
+        name: "capability envelope",
         offset: 10,
         width: 1,
-        values: Array.from({ length: 32 * DURABLE_READER_VERSION }, (_, i) => i),
+        values: Array.from({ length: 32 }, (_, i) => (ROOT_SLOT_EXTENSION_TAG << 5) + i),
       },
       { name: "manifest format", offset: 11, width: 1, values: [MANIFEST_FORMAT_VERSION - 2] },
+      // No earlier profile belongs to manifest11; this first baseline has no released predecessor.
+      { name: "minimum reader", offset: 16, width: 4, values: [DURABLE_READER_VERSION] },
+      { name: "minimum writer", offset: 20, width: 4, values: [DURABLE_WRITER_VERSION] },
     ],
     decoder: "decodeRootSlot",
     state: "implemented",
@@ -1028,6 +1035,13 @@ export const NATIVE_READER_PROFILES: Readonly<
   >
 > = Object.freeze({
   7: Object.freeze({ manifest: 10, vocabulary: 3713904595 }),
+  8: Object.freeze({ manifest: 11, vocabulary: 1164132746 }),
+});
+
+/** Required rewrite capability includes even fields that are optional for reading.
+ * New fields/features must assign a new writer profile before any native owner can start. */
+export const NATIVE_WRITER_PROFILES: typeof NATIVE_READER_PROFILES = Object.freeze({
+  8: Object.freeze({ manifest: 11, vocabulary: 1164132746 }),
 });
 
 function canonicalVocabulary(value: unknown): string {
@@ -1049,6 +1063,7 @@ export function nativeVocabularyFingerprint(
     readonly id: number;
     readonly section: number;
   }> = CATALOG_REQUIRED_FEATURES,
+  mode: "read" | "write" = "read",
 ): number {
   const formats = Object.fromEntries(
     Object.entries(DURABLE_FORMATS)
@@ -1060,7 +1075,14 @@ export function nativeVocabularyFingerprint(
           version: format.version,
           versionIn: format.versionIn,
           parent: "parent" in format ? format.parent : null,
-          fields: format.fields,
+          fields:
+            name === "rootSlot"
+              ? format.fields.map((field) =>
+                  field.name === "minimum reader" || field.name === "minimum writer"
+                    ? { name: field.name, offset: field.offset, width: field.width }
+                    : field,
+                )
+              : format.fields,
         },
       ]),
   );
@@ -1080,7 +1102,7 @@ export function nativeVocabularyFingerprint(
       Object.entries(schemas).map(([name, fields]) => [
         name,
         fields.flatMap((field, index) =>
-          field.includes("~") && !field.endsWith("!")
+          mode === "read" && field.includes("~") && !field.endsWith("!")
             ? []
             : [{ id: index + 1, codec: field.slice(field.indexOf(":") + 1) }],
         ),
@@ -1120,4 +1142,21 @@ requireNativeReaderProfile(
   DURABLE_READER_VERSION,
   MANIFEST_FORMAT_VERSION,
   nativeVocabularyFingerprint(),
+);
+
+export function requireNativeWriterProfile(
+  writer: number,
+  manifest: number,
+  vocabulary: number,
+): void {
+  const profile = NATIVE_WRITER_PROFILES[writer];
+  if (profile?.manifest !== manifest || profile.vocabulary !== vocabulary)
+    throw new DurableFormatError(
+      `Native rewrite vocabulary ${String(vocabulary)} requires an assigned outer writer profile (writer ${String(writer)}, manifest ${String(manifest)})`,
+    );
+}
+requireNativeWriterProfile(
+  DURABLE_WRITER_VERSION,
+  MANIFEST_FORMAT_VERSION,
+  nativeVocabularyFingerprint(CATALOG_RECORD_SCHEMAS, CATALOG_REQUIRED_FEATURES, "write"),
 );

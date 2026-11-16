@@ -126,6 +126,7 @@ export const DURABLE_FIELD_REACH = [
 
 export const DURABLE_STARTUP_REACH = [
   "minimum reader",
+  "minimum writer",
   "manifest format",
   "root-0",
   "root-1",
@@ -6155,8 +6156,9 @@ export const FTS_CODEC_REACH = [
 ] as const;
 
 export const FTS_SELECTOR_REACH = [
-  "reader7 barrier",
-  "manifest10 barrier",
+  "reader8 barrier",
+  "writer8 barrier",
+  "manifest11 barrier",
   "commit body8",
   "wide sequence preserved",
   "checksummed roundtrip",
@@ -9139,5 +9141,41 @@ export const SNAPSHOT_FTS_CUT_REACH = [
   "retry after interruption",
   "old FTS retirement exactly once",
   "ordinary reopen",
+  "zero charges",
+] as const;
+
+export const ROOT_DUAL_GATE_REACH = [
+  "short capability header corrupt",
+  "u32 reader and writer",
+  "high sequence independent",
+  "borrowed manifest only",
+] as const;
+
+export const ROOT_NATIVE_DUAL_GATE_REACH = [
+  "minimum reader",
+  "minimum writer",
+  "root-0",
+  "root-1",
+  "partial tree",
+  "complete tree",
+  "OPFS unchanged",
+  "IDB unchanged",
+  "concurrent refusals",
+  "live lock untouched",
+  "zero writes",
+] as const;
+
+export const NATIVE_WRITER_PROFILE_REACH = [
+  "assigned rewrite vocabulary",
+  "unassigned writer",
+  "unassigned rewrite vocabulary",
+  "read optional field requires writer gate",
+  "all record kinds",
+] as const;
+
+export const ROOT_WRITE_GATE_REACH = [
+  "durable reader gate before append",
+  "durable writer gate before append",
+  "FTS claims after gate",
   "zero charges",
 ] as const;

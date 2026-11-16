@@ -2029,6 +2029,13 @@ metadata faults, cancellation, native root copies and snapshot charges have sepa
 These are managed-buffer bounds; opaque native IndexedDB memory still needs Gate D browser
 measurement.
 
+Native compatibility histories vary minimum reader and minimum writer independently in both
+root slots. Concurrent openers must refuse an unsupported requirement before stealing the live
+owner's lock, writing an epoch or creating missing files. They compare every OPFS file and the
+IndexedDB root, log, data and epoch records afterward. Stale preflight snapshots still require
+an owned recheck. These tests use the native adapters over their test shims, not two browser
+binaries from different released versions. The first supported format chain starts at1.0.
+
 The rebuild's portable-load histories replace targets holding real FTS checkpoint journals,
 committed staged preparations, document pages, terms and postings. They interrupt every
 physical publication step, reopen to either intact old rows and FTS payloads or a complete

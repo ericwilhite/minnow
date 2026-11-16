@@ -15,8 +15,9 @@
  *    - `epoch` (IndexedDB, which has no exclusive handle): acquisition increments a durable epoch
  *      record; every readwrite transaction reads it first and aborts if it moved.
  * Before advancing the durable epoch or creating missing native files, acquisition validates both
- * checksummed root-slot reader/manifest barriers (root-slot.ts). Unsupported requirements refuse
- * without a native write; opaque manifest replay still follows ownership. OPFS rechecks existing
+ * checksummed root-slot reader/writer/manifest barriers (root-slot.ts). A non-mutating preflight
+ * precedes even the Web Lock request; readable-but-unrewritable stores refuse too. There is no
+ * read-only owner fallback. Opaque manifest replay still follows ownership. OPFS rechecks existing
  * exclusive handles before creating missing files; IDB checks before enqueueing its epoch put.
  * If the fence is still held when `timeoutMs` passes, acquisition fails with
  * `OwnerUnresponsiveError` (a frozen or hung owner: the caller reports it and retries later).

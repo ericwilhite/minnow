@@ -58,6 +58,7 @@ import { MemoryOpfs } from "../../testing/opfs-shim.js";
 import {
   DURABLE_FORMATS,
   DURABLE_READER_VERSION,
+  DURABLE_WRITER_VERSION,
   MANIFEST_FORMAT_VERSION,
   type DurableFormatName,
   type FormatField,
@@ -832,7 +833,9 @@ for (const seed of seedsFor("next-durable-aliases", [0xb227, 0xb228]))
 it("has a real adapter for every implemented byte decoder including portable snapshot1", () => {
   const all = adapters();
   expect(DURABLE_READER_VERSION).toBeGreaterThanOrEqual(1);
-  expect(DURABLE_READER_VERSION).toBeLessThanOrEqual(8);
+  expect(DURABLE_READER_VERSION).toBeLessThanOrEqual(0xffffffff);
+  expect(DURABLE_WRITER_VERSION).toBeGreaterThanOrEqual(1);
+  expect(DURABLE_WRITER_VERSION).toBeLessThanOrEqual(0xffffffff);
   expect(MANIFEST_FORMAT_VERSION).toBeGreaterThanOrEqual(2);
   expect(MANIFEST_FORMAT_VERSION).toBeLessThanOrEqual(257);
   const discovered = discoverDurableSources();
@@ -1246,13 +1249,17 @@ for (const seed of seedsFor("next-durable-header-read", [0xb22d, 0xb22e]))
   });
 
 // First supported1.0 root envelope: newer inner codecs must refuse BEFORE fencing.
+const futureRootCapability = fc.integer({
+  min: Math.max(DURABLE_READER_VERSION, DURABLE_WRITER_VERSION) + 1,
+  max: 136,
+});
 for (const seed of seedsFor("next-durable-before-fence", [0xb22f, 0xb230]))
   it(`refuses a newer root before all native mutations seed ${String(seed)}`, async () => {
     const reach = createReach("durable startup", DURABLE_STARTUP_REACH);
     await fc.assert(
-      fc.asyncProperty(fc.integer({ min: DURABLE_READER_VERSION + 1, max: 8 }), async (future) => {
+      fc.asyncProperty(futureRootCapability, async (future) => {
         reach.beginHistory();
-        for (const field of ["minimum reader", "manifest format"] as const)
+        for (const field of ["minimum reader", "minimum writer", "manifest format"] as const)
           for (const slot of ["root-0", "root-1"] as const)
             for (const [complete, stale] of [
               [false, false],
@@ -1266,8 +1273,8 @@ for (const seed of seedsFor("next-durable-before-fence", [0xb22f, 0xb230]))
               reach.reach(complete ? "complete tree" : "partial tree");
               const bytes = encodeRootSlot(9, encodeManifestRoot(manifest));
               const header = new DataView(bytes.buffer);
-              if (field === "minimum reader")
-                header.setUint8(10, (header.getUint8(10) & 31) | ((future - 1) << 5));
+              if (field === "minimum reader") header.setUint32(16, future, true);
+              else if (field === "minimum writer") header.setUint32(20, future, true);
               else header.setUint8(11, MANIFEST_FORMAT_VERSION + future - 2); // Independently newer manifest, biased by2.
               checksum(bytes);
               const shim = new MemoryOpfs();

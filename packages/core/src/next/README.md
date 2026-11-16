@@ -199,7 +199,7 @@ version gaps from rolled-back DDL. DROP TABLE carries its MCHG definition too.
 
 The manifest names the catalog tree, not a JSON blob. Reachability checks child depth and
 summaries plus contiguous fragment offsets, and reclamation retires every old index/data page.
-The reader/manifest/commit-body development selectors are 7/8/6; older unpublished selectors
+The native reader/writer/manifest/commit-body development selectors are 8/8/11/8; older unpublished selectors
 refuse. The released 1.0 format has no supported predecessor yet. Trigger family20 now carries dialect-versioned bodies and stable OLD/NEW/target dependencies
 (body30/binding31/column32). Definitions and CREATE/DROP lowering persist through WAL and
 checkpoint; trigger scheduling/body execution is the next integration unit. Writes whose event
@@ -448,26 +448,31 @@ unsupported native header never means an empty store. Checksum-invalid slots sti
 ordinary dual-slot recovery. Private scratch journals and spill encodings are listed separately;
 they are not recovery authorities. Portable snapshot1 has its own container and selectors.
 
-The 16-byte native root header now carries a minimum-reader version and the inner manifest
-format before its opaque payload. Both are checksummed. Acquisition checks both root slots
-before creating OPFS files or advancing an owner epoch; IndexedDB checks in the strict fence
-transaction before enqueueing any write. Unsupported root barriers use
-`DurableFormatError` (`MINNOW_FORMAT_UNSUPPORTED`). Publishers, including prepaid root frames,
-emit the registry values. Every future incompatible nested codec must raise this outer barrier
-before writing incompatible data or log bytes, so an older reader cannot advance the newer owner's epoch before refusing.
-Its eleven formerly reserved high bits carry biased selectors: minimum-reader minus1 in
-bits21..23 and manifest-format minus2 in bits24..31. Zero selects reader1/manifest2, so current
-bytes and charges stay unchanged. The first released1.0 writer starts the supported fixture
-and automatic-upgrade chain. The shipped0.x engine is unchanged.
+The native root keeps its 16-byte MNRT framing prefix and adds two checksummed u32 fields:
+minimum reader at byte16 and minimum writer at byte20. The manifest begins at byte24. The
+sequence-high word's upper three bits select escape8; its upper byte carries manifest11-minus2.
+The current capability baseline is reader8/writer8, manifest11, with commitBody8 unchanged.
+Root frames fund the extra8 bytes before allocation. Earlier unpublished development roots
+are refused; no supported next/ predecessor has shipped.
 
-Compatibility belongs to the outer gates. A writer introducing a nested tag or encoding must
-raise minimum reader, and minimum writer when an older writer cannot fully rewrite it, before
-those bytes enter data or WAL. The separate minimum-writer selector remains a freeze dependency;
-the current header above carries only minimum reader. `NATIVE_READER_PROFILES` binds the native
-registry vocabulary to that reader selector, once at module initialization. It adds no stored
-field, and does no per-query/page/row work. A registry vocabulary extension without an assigned
-profile refuses before storage acquisition. The guard cannot detect a semantic reinterpretation
-of an unchanged tag; that still requires format review and supported-writer fixture evidence.
+Both native backends probe both root slots before requesting a Web Lock, so a stable unsupported
+requirement refuses before a steal can disrupt the live owner. OPFS rechecks existing owned
+handles before creating missing files or advancing the epoch. IndexedDB rechecks both roots in
+its strict fence transaction before enqueueing the epoch write. Preflight shares the acquisition
+deadline; a late IndexedDB connection closes without requesting a lock. Unsupported gates use
+`DurableFormatError` (`MINNOW_FORMAT_UNSUPPORTED`). A database that is readable but requires a
+newer writer also refuses: SQL read-only transactions still use a writable owner, and no safe
+physical read-only owner path is provided. Stale probes never authorize native writes.
+
+Every native publisher, including prepaid root frames, emits both selectors. Compatibility
+belongs to those outer gates: incompatible nested tags must raise minimum reader, and any field
+an older writer cannot fully rewrite must raise minimum writer BEFORE its data or WAL bytes.
+`NATIVE_READER_PROFILES` covers required-understanding grammar; `NATIVE_WRITER_PROFILES` also
+covers read-optional catalog fields. Both guards run at module initialization before acquisition.
+The ledger cannot detect a semantic reinterpretation of an unchanged tag; format review and
+supported-writer upgrade fixtures remain required. After the first released1.0 baseline, adding
+a writer profile also requires automatic open/load upgrade and a durable barrier before the new
+feature is enabled. Merely changing a constant is unfinished. The shipped0.x engine is unchanged.
 
 Under supported outer gates, an unknown nested tag is corruption. Open fully validates what it
 eagerly reads (root, manifest, catalog and WAL tail), while data pages remain lazy. A consuming
@@ -4046,7 +4051,7 @@ compact invalidation; it never takes a second loan. Cancellation drains page IO 
 its buffers, the step, or the grant. Journal references are bounded before IO; the audit walks
 all prepared documents, terms and postings, with owned decoder leases.
 
-The new native manifest10 and commitBody8 selectors refuse older unpublished development bytes
+The B7 native manifest10 (now11 with dual root gates) and commitBody8 selectors refuse older unpublished development bytes
 before mutation. MCAT dialect/minimum reader7 is unchanged: the independent manifest barrier
 already makes older builds refuse these native bytes before fencing. No supported1.0 predecessor
 exists; this is not an upgrade path for 0.x. The public/shipped engine remains unchanged.
@@ -4102,7 +4107,7 @@ rendering. Fixed seal/claim state fits the already prepaid 512-byte FTS publicat
 Ordinary commits without an FTS seal keep their existing append path.
 
 The SQL scan route and shipped engine behavior are unchanged. The new tag is part of the
-unmerged development manifest10/body8 unit; it changes no supported stored predecessor.
+development FTS unit (now manifest11/body8 with dual gates); it changes no supported stored predecessor.
 
 FTS recovery reads the checked checkpoint head once and passes its actual covered LSN to
 `Replayer` independently of global/catalog/ledger and per-table row coverage. A conservative

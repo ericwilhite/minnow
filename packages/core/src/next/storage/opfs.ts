@@ -492,6 +492,10 @@ export function createOpfsBackend(options: OpfsBackendOptions): StorageBackend {
           closeAll(opened.handles);
         },
         acquire,
+        async () => {
+          await refuseLegacyOpfs(options.directory, options.name, OPFS_FILE_NAMES);
+          await checkExistingFormats(options.directory);
+        },
       );
       const lease = new OpfsLease(lock, fence, options.observe ?? null);
       leases.add(lease);

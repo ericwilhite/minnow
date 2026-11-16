@@ -60,6 +60,8 @@ function withDeadline<T>(attempt: Promise<T>, ms: number): Promise<Outcome<T>> {
 }
 
 /**
+ * Runs optional non-mutating compatibility preflight before requesting the Web Lock (including
+ * a steal). The same deadline covers preflight; its owner cleans up late resources.
  * Takes the lock, then opens the backend fence until it stops failing busy (`isBusyError`),
  * backing off from 1 ms to 100 ms, all within `timeoutMs`.
  *
@@ -77,13 +79,25 @@ export async function acquireFenced<T>(
   openFence: () => T | Promise<T>,
   closeFence: (fence: T) => void,
   options: { steal?: boolean; timeoutMs?: number } = {},
+  preflight?: () => Promise<void>,
 ): Promise<{ readonly lock: HeldLock; readonly fence: T }> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_ACQUIRE_TIMEOUT_MS;
   const deadline = Date.now() + timeoutMs;
+  // Compatibility is checked before even a lock steal can abort a newer live owner.
+  // The backend also checks under ownership; this non-mutating probe can become stale.
+  if (preflight !== undefined) {
+    const outcome = await withDeadline(Promise.resolve().then(preflight), deadline - Date.now());
+    if (outcome.kind === "failed") throw outcome.error;
+    if (outcome.kind === "deadline" || Date.now() > deadline)
+      throw new OwnerUnresponsiveError(timeoutMs);
+  }
   const waiting = new AbortController();
-  const timer = setTimeout(() => {
-    waiting.abort();
-  }, timeoutMs);
+  const timer = setTimeout(
+    () => {
+      waiting.abort();
+    },
+    Math.max(0, deadline - Date.now()),
+  );
   let lock: HeldLock;
   try {
     lock = await locks.request(name, {
