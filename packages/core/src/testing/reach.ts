@@ -9469,3 +9469,30 @@ export const REPLAY_MAPPING_MEMORY_REACH = [
   "row ownership outlives cache",
   "zero retained",
 ] as const;
+
+/** Deferred original follow targets bind by immutable action ID, not a resident rowset map. */
+export const REGISTRY_FOLLOWING_REACH = [
+  "published",
+  "resident",
+  "original key swap targets",
+  "no recapture",
+  "immutable queued descriptor",
+  "incremental same-token work",
+  "independent FK reference failure",
+  "fixed metadata",
+  "zero ownership",
+] as const;
+
+/** Follow input cancellation must fence native IO before its prepaid metadata retires. */
+export const REGISTRY_FOLLOWING_LIFETIME_REACH = [
+  "unprepared",
+  "retired",
+  "corrupt",
+  "cancel",
+  "close",
+  "published",
+  "resident",
+  "paid pending capture",
+  "no retained image lease",
+  "zero ownership",
+] as const;

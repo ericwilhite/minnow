@@ -11,9 +11,12 @@ import {
   NATIVE_COMMAND_CHECK_LIFETIME_REACH,
   NATIVE_COMMAND_CHECK_CONSTRUCTION_REACH,
   NATIVE_CHILD_CAPTURE_REACH,
+  REGISTRY_FOLLOWING_REACH,
+  REGISTRY_FOLLOWING_LIFETIME_REACH,
 } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import type { RowTargetRange } from "../access/statement-command.js";
+import { RegistryFollowing, REGISTRY_FOLLOWING_BYTES } from "./registry-following.js";
 import { RegistryTargets } from "./registry-targets.js";
 import { readRows } from "../write/rows.js";
 import { KeyBatch, encodeKeyBatch } from "../keys/key-encoding.js";
@@ -50,6 +53,12 @@ async function code(run: () => unknown): Promise<string | null> {
     if ("code" in error && typeof error.code === "string") return error.code;
     throw error;
   }
+}
+async function failure(run: () => Promise<unknown>): Promise<unknown> {
+  return await run().then(
+    () => null,
+    (error: unknown) => error,
+  );
 }
 async function fixture(
   published: boolean,
@@ -219,6 +228,7 @@ async function fixture(
     checks,
     commands,
     targets,
+    directory,
     root,
     get leases() {
       return leases;
@@ -825,3 +835,396 @@ for (const seed of seedsFor("next-native-child-capture", [0xb61d, 0xb61e]))
       await pg.close();
     }
   }, 120000);
+
+for (const seed of seedsFor("next-registry-following", [0xb623, 0xb624]))
+  it(`binds original follow ranges without changing queued entries ${String(seed)}`, async () => {
+    const reach = createReach("native follow bindings", REGISTRY_FOLLOWING_REACH),
+      pg = new PGlite();
+    await pg.waitReady;
+    try {
+      await fc.assert(
+        fc.asyncProperty(
+          fc.integer({ min: 6, max: 36 }),
+          fc.boolean(),
+          fc.boolean(),
+          async (count, published, late) => {
+            reach.beginHistory();
+            const f = await fixture(published, 3, undefined, count);
+            const before = f.grant.allocated;
+            const bindings = new RegistryFollowing({
+              rootId: 17,
+              catalog: f.statement.catalog,
+              commands: f.commands,
+              directory: f.directory,
+              targets: f.targets,
+              checks: f.checks,
+              charge: f.grant,
+              signal: f.stop.signal,
+            });
+            const capture = vi.spyOn(f.checks, "captureChildren");
+            try {
+              expect(f.grant.allocated - before).toBe(REGISTRY_FOLLOWING_BYTES);
+              await pg.exec(
+                "DROP TABLE IF EXISTS c;DROP TABLE IF EXISTS p;CREATE TABLE p(id INT PRIMARY KEY);INSERT INTO p VALUES(1),(2),(3);CREATE TABLE c(id INT PRIMARY KEY,pid INT REFERENCES p(id))",
+              );
+              await pg.exec(
+                `INSERT INTO c VALUES ${Array.from({ length: count }, (_, i) => `(${String(i + 1)},${i % 5 === 0 ? "NULL" : String((i % 2) + 1)})`).join(",")}`,
+              );
+              const parent = f.statement.catalog.table(f.parent),
+                child = f.statement.catalog.table(f.child),
+                fk = child?.foreignKeys[0];
+              const pk = parent?.columns[0]?.id,
+                pid = child?.columns[1]?.id;
+              if (!parent || !child || !fk || !pk || !pid)
+                throw new Error("Missing native follow shape");
+              // Product omission follows original parent identities across a key swap.
+              // PG below is an independent reference for child membership/existence,
+              // not a claim PG permits a non-deferrable primary-key swap.
+              await f.statement
+                .table(f.parent, { assigned: [pk], uniqueTargets: true })
+                .update(batch(locators([0, 1], f.parent), ints([2, 1])), null);
+              const appended = f.tx.undo
+                .filter((e) => e.kind === "rows" && e.tableId === f.parent)
+                .at(-1);
+              if (appended?.kind !== "rows" || appended.count !== 2)
+                throw new Error("Missing accepted parent rows");
+              const actions: number[] = [],
+                refs: AcceptedCommandRow[] = [];
+              for (let i = 0; i < 2; i++) {
+                const images = await f.images.append(
+                  f.parent,
+                  { batch: batch(ints([i + 1]), ints([i + 1]), texts(["seed"])), row: 0 },
+                  { batch: batch(ints([2 - i]), ints([i + 1]), texts(["seed"])), row: 0 },
+                );
+                const row: AcceptedCommandRow = {
+                  command: f.root,
+                  tableId: f.parent,
+                  event: "update",
+                  images,
+                  oldRowId: i,
+                  newRowId: appended.memtable.firstRowId + appended.before + i,
+                };
+                await f.commands.accept(row);
+                refs.push(row);
+                actions.push(
+                  await f.commands.addReferential(f.root, images, {
+                    fkId: fk.id,
+                    event: "parentUpdate",
+                    kind: "follow",
+                    targets: null,
+                  }),
+                );
+              }
+              await f.commands.verify(
+                f.root,
+                "unique",
+                (row, stop) => f.checks.verifyUnique(row, stop),
+                f.stop.signal,
+              );
+              await bindings.prepare(f.root, f.stop.signal);
+              expect(capture).toHaveBeenCalledTimes(2);
+              const first = actions[0],
+                second = actions[1];
+              if (!first || !second) throw new Error("Missing follow event IDs");
+              const firstRange = await bindings.require(first, f.stop.signal),
+                secondRange = await bindings.require(second, f.stop.signal);
+              const ids = async (range: RowTargetRange) => {
+                const out: number[] = [],
+                  pin = f.statement.readOwn();
+                try {
+                  for await (const row of f.targets.rows(range, f.stop.signal)) {
+                    const vectors = await readRows(pin.internalTable(f.child), [row.rowId]),
+                      id = vectors[0];
+                    if (id?.data.layout !== "i32") throw new Error("Expected native child key");
+                    out.push(id.data.values[0] ?? -1);
+                  }
+                } finally {
+                  pin.release();
+                }
+                return out.sort((a, b) => a - b);
+              };
+              const expected = (
+                await pg.query<{ id: number }>("SELECT id FROM c WHERE pid=2 ORDER BY id")
+              ).rows.map((row) => row.id);
+              for await (const row of f.targets.rows(firstRange, f.stop.signal)) {
+                const pin = f.statement.readOwn();
+                try {
+                  const locator = pin.internalTable(f.child).locator(row.rowId);
+                  await f.statement
+                    .table(f.child, { assigned: [pid], inputView: pin, uniqueTargets: true })
+                    .update(batch(locators([locator], f.child), ints([2])), null);
+                  const entry = f.tx.undo
+                    .filter((e) => e.kind === "rows" && e.tableId === f.child)
+                    .at(-1);
+                  if (entry?.kind !== "rows") throw new Error("Missing native child version");
+                  await f.targets.note(
+                    f.child,
+                    row.rowId,
+                    entry.memtable.firstRowId + entry.before + entry.count - 1,
+                  );
+                } finally {
+                  pin.release();
+                }
+              }
+              await pg.exec("UPDATE c SET pid=2 WHERE pid=1");
+              const fresh = (
+                await pg.query<{ id: number }>("SELECT id FROM c WHERE pid=2 ORDER BY id")
+              ).rows.map((row) => row.id);
+              expect(fresh.length).toBeGreaterThan(expected.length);
+              await bindings.prepare(f.root, f.stop.signal);
+              expect(
+                capture,
+                "completed original rows are never recaptured after an RI rewrite",
+              ).toHaveBeenCalledTimes(2);
+              expect(
+                await ids(await bindings.require(second, f.stop.signal)),
+                "second original range excludes already rewritten first children",
+              ).toEqual(expected);
+              expect(
+                await f.commands.resolveReferential(second),
+                "queued descriptor remains immutable",
+              ).toMatchObject({ targets: null });
+              expect(secondRange).toEqual(await bindings.require(second, f.stop.signal));
+              if (late) {
+                await f.statement
+                  .table(f.parent, { assigned: [pk], uniqueTargets: true })
+                  .update(batch(locators([2], f.parent), ints([4])), null);
+                const entry = f.tx.undo
+                  .filter((e) => e.kind === "rows" && e.tableId === f.parent)
+                  .at(-1);
+                if (entry?.kind !== "rows") throw new Error("Missing later parent version");
+                const images = await f.images.append(
+                  f.parent,
+                  { batch: batch(ints([3]), ints([3]), texts(["seed"])), row: 0 },
+                  { batch: batch(ints([4]), ints([3]), texts(["seed"])), row: 0 },
+                );
+                await f.commands.accept({
+                  command: f.root,
+                  tableId: f.parent,
+                  event: "update",
+                  images,
+                  oldRowId: 2,
+                  newRowId: entry.memtable.firstRowId + entry.before + entry.count - 1,
+                });
+                const id = await f.commands.addReferential(f.root, images, {
+                  fkId: fk.id,
+                  event: "parentUpdate",
+                  kind: "follow",
+                  targets: null,
+                });
+                await f.commands.verify(
+                  f.root,
+                  "unique",
+                  (row, stop) => f.checks.verifyUnique(row, stop),
+                  f.stop.signal,
+                );
+                await bindings.prepare(f.root, f.stop.signal);
+                expect(
+                  capture,
+                  "new work on the same token gets its own capture",
+                ).toHaveBeenCalledTimes(3);
+                expect((await bindings.require(id, f.stop.signal)).count).toBe(0);
+                reach.reach("incremental same-token work");
+              }
+              const invalid = await f.insert(f.child, count + 100, 999);
+              await bindings.prepare(f.root, f.stop.signal);
+              await expect(
+                pg.exec(`INSERT INTO c VALUES(${String(count + 100)},999)`),
+              ).rejects.toMatchObject({ code: "23503" });
+              expect(
+                await code(() =>
+                  f.commands.verify(
+                    f.root,
+                    "references",
+                    async (row, stop) => {
+                      if (row.images.row === invalid.images.row)
+                        await f.checks.verifyReference(row, fk.id, stop);
+                    },
+                    f.stop.signal,
+                  ),
+                ),
+                "follow preparation never consumes reference checks",
+              ).toBe("23503");
+              reach.reach(published ? "published" : "resident");
+              reach.reach("original key swap targets");
+              reach.reach("no recapture");
+              reach.reach("immutable queued descriptor");
+              reach.reach("independent FK reference failure");
+            } finally {
+              capture.mockRestore();
+              await bindings.close();
+              expect(f.grant.allocated).toBe(before);
+              await f.close();
+            }
+            reach.reach("fixed metadata");
+            reach.reach("zero ownership");
+          },
+        ),
+        {
+          seed,
+          numRuns: 12,
+          examples: [
+            [6, false, true],
+            [8, true, false],
+          ],
+        },
+      );
+      reach.assertReached();
+    } finally {
+      await pg.close();
+    }
+  }, 120000);
+
+for (const seed of seedsFor("next-registry-following-lifetime", [0xb625]))
+  it(`fences original follow input lifetime ${String(seed)}`, async () => {
+    const reach = createReach("native follow lifetime", REGISTRY_FOLLOWING_LIFETIME_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.constantFrom("unprepared", "retired", "corrupt", "cancel", "close"),
+        fc.boolean(),
+        async (kind, published) => {
+          reach.beginHistory();
+          const suspended = kind === "cancel" || kind === "close";
+          let resume: () => void = () => undefined;
+          const gate = new Promise<void>((resolve) => {
+            resume = resolve;
+          });
+          let entered: () => void = () => undefined;
+          const ready = new Promise<void>((resolve) => {
+            entered = resolve;
+          });
+          let observed: AbortSignal | null = null;
+          const f = await fixture(
+            published,
+            2,
+            suspended
+              ? async (signal) => {
+                  observed = signal;
+                  entered();
+                  await gate;
+                }
+              : undefined,
+            6,
+          );
+          const before = f.grant.allocated,
+            bindings = new RegistryFollowing({
+              rootId: 17,
+              catalog: f.statement.catalog,
+              commands: f.commands,
+              directory: f.directory,
+              targets: f.targets,
+              checks: f.checks,
+              charge: f.grant,
+              signal: f.stop.signal,
+            });
+          let closing: Promise<void> | undefined;
+          try {
+            const parent = f.statement.catalog.table(f.parent),
+              fk = f.statement.catalog.table(f.child)?.foreignKeys[0],
+              pk = parent?.columns[0]?.id;
+            if (!pk || !fk) throw new Error("Missing native follow lifetime shape");
+            await f.statement
+              .table(f.parent, { assigned: [pk], uniqueTargets: true })
+              .update(batch(locators([0], f.parent), ints([4])), null);
+            const undo = f.tx.undo
+              .filter((entry) => entry.kind === "rows" && entry.tableId === f.parent)
+              .at(-1);
+            if (undo?.kind !== "rows") throw new Error("Missing native follow update");
+            const images = await f.images.append(
+              f.parent,
+              { batch: batch(ints([1]), ints([1]), texts(["seed"])), row: 0 },
+              { batch: batch(ints([4]), ints([1]), texts(["seed"])), row: 0 },
+            );
+            await f.commands.accept({
+              command: f.root,
+              tableId: f.parent,
+              event: "update",
+              images,
+              oldRowId: 0,
+              newRowId: undo.memtable.firstRowId + undo.before,
+            });
+            const id = await f.commands.addReferential(f.root, images, {
+              fkId: fk.id,
+              event: "parentUpdate",
+              kind: "follow",
+              targets: null,
+            });
+            if (kind === "unprepared") {
+              expect(
+                await failure(() => bindings.require(id, f.stop.signal)),
+                "a queued ID is not yet a sealed input",
+              ).toBeInstanceOf(TypeError);
+            } else if (suspended) {
+              const pending = bindings.prepare(f.root, f.stop.signal).then(
+                () => null,
+                (error: unknown) => error,
+              );
+              await ready;
+              expect(f.leases).toBe(0);
+              let closed = false;
+              if (kind === "close")
+                closing = bindings.close().then(() => {
+                  closed = true;
+                });
+              else f.stop.abort(new Error("native follow cancelled"));
+              await yieldTask();
+              const paid = f.grant.allocated === before + REGISTRY_FOLLOWING_BYTES,
+                cancelled = (observed as AbortSignal | null)?.aborted === true,
+                early = closed;
+              resume();
+              const error = await pending;
+              await closing;
+              expect(error, "pending capture cannot complete after cancellation").toBeInstanceOf(
+                Error,
+              );
+              expect(cancelled, "capture receives the follow scope cancellation").toBe(true);
+              expect(paid, "metadata remains paid while the capture is suspended").toBe(true);
+              expect(early, "close fences pending native preparation").toBe(false);
+              expect(f.range.allocated).toBe(0);
+              reach.reach("paid pending capture");
+              reach.reach("no retained image lease");
+            } else {
+              await bindings.prepare(f.root, f.stop.signal);
+              if (kind === "retired") {
+                await f.commands.retireReferential(id);
+                expect(
+                  await failure(() => bindings.require(id, f.stop.signal)),
+                  "retired RI IDs cannot reuse sealed ranges",
+                ).toBeInstanceOf(TypeError);
+              } else {
+                const record = new Uint8Array(128);
+                expect(await f.directory.get(9, id, record)).toBe(true);
+                new DataView(record.buffer).setFloat64(16, f.root.id + 1, true);
+                await f.directory.put(9, id, record);
+                expect(
+                  await failure(() => bindings.require(id, f.stop.signal)),
+                  "binding origin is authenticated",
+                ).toMatchObject({ name: "SpillCorruptionError" });
+              }
+            }
+            reach.reach(kind);
+            reach.reach(published ? "published" : "resident");
+          } finally {
+            resume();
+            await closing;
+            await bindings.close();
+            expect(f.grant.allocated).toBe(before);
+            await f.close();
+          }
+          reach.reach("zero ownership");
+        },
+      ),
+      {
+        seed,
+        numRuns: 10,
+        examples: [
+          ["unprepared", false],
+          ["retired", true],
+          ["corrupt", false],
+          ["cancel", true],
+          ["close", false],
+        ],
+      },
+    );
+    reach.assertReached();
+  }, 60000);
