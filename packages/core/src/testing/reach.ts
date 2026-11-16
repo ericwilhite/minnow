@@ -3594,6 +3594,9 @@ export const DATE_PART_SQL_REACH = [
 
 /** Coverage-sized SQL histories retain every original phase/pressure state. */
 export const AGG_HANDOFF_SQL_REACH = [
+  "headroom released at scan open",
+  "growth boundary pressure",
+  "followers start at first handoff",
   "several executions",
   "scalar",
   "grouped",

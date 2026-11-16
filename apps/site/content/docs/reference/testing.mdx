@@ -978,6 +978,23 @@ versions, and requires the in-memory replay's exact rows in its exact order; one
 both paths through a real small budget. `delta-scan.test.ts` runs its SQLite-checked mutation
 script through both paths as well.
 
+`executor-agg-handoff.test.ts` forces its first aggregate's variable-state growth to
+contend with a pinned native holder. It pins at the actual hash-growth boundary,
+after reader/sizing credit can retire, and starts the other executions at the
+first handoff before its restore resumes. A fitting query is allowed to finish
+without a handoff; this campaign deliberately establishes pressure before requiring one.
+The resident follower still must finish without requesting a restore phase.
+
+The generator keeps its scalar, skewed and many-group shapes, two or three
+executions, parameter sizes, filters, resident followers and both cancellation
+points. An additional schedule releases an 8 MiB sizing reservation when the scan
+opens. Both that schedule and the original schedule must reach the same pressure,
+restoration, PostgreSQL-result and zero-credit checks. All original examples,
+seeds, six generated histories per seed, 8,192 source rows, memory caps and deadlines
+remain. Fast-check includes examples in its run budget, so the budget increases from
+14 to 17 to add three examples while preserving all six generated histories. The growth observer is restored and checked alongside the existing
+suspension/restore observers, including abandoned histories.
+
 `event-loop-stalls.test.ts` runs a 1 ms watchdog through the workloads that once held every
 other query for hundreds of milliseconds or minutes — a fold of reordered wide upserts, live
 aggregates patched after large commits, scans over upsert-heavy tables, secondary-index builds
