@@ -6156,9 +6156,9 @@ export const FTS_CODEC_REACH = [
 ] as const;
 
 export const FTS_SELECTOR_REACH = [
-  "reader8 barrier",
-  "writer8 barrier",
-  "manifest11 barrier",
+  "reader9 barrier",
+  "writer9 barrier",
+  "manifest12 barrier",
   "commit body8",
   "wide sequence preserved",
   "checksummed roundtrip",
@@ -8992,6 +8992,7 @@ export const NATIVE_PROFILE_REACH = [
   "unassigned nested vocabulary",
   "unassigned reader",
   "manifest mismatch",
+  "assigned selector in preserved population",
 ] as const;
 
 export const DURABLE_OCTET_REACH = [
@@ -9171,6 +9172,7 @@ export const NATIVE_WRITER_PROFILE_REACH = [
   "unassigned rewrite vocabulary",
   "read optional field requires writer gate",
   "all record kinds",
+  "assigned selector in preserved population",
 ] as const;
 
 export const ROOT_WRITE_GATE_REACH = [

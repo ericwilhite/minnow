@@ -26,6 +26,7 @@ import {
 const known = {
   7: { manifest: 10, vocabulary: 3713904595 },
   8: { manifest: 11, vocabulary: 1164132746 },
+  9: { manifest: 12, vocabulary: 131312130 },
 };
 for (const seed of seedsFor("next-native-profile", [0xb2a1, 0xb2a2]))
   it(`refuses an unassigned native vocabulary before acquisition seed ${String(seed)}`, () => {
@@ -40,7 +41,9 @@ for (const seed of seedsFor("next-native-profile", [0xb2a1, 0xb2a2]))
           expect(Object.isFrozen(NATIVE_READER_PROFILES)).toBe(true);
           expect(Object.isFrozen(NATIVE_READER_PROFILES[DURABLE_READER_VERSION])).toBe(true);
           const vocabulary = nativeVocabularyFingerprint();
-          expect(vocabulary).toBe(known[8].vocabulary);
+          expect(DURABLE_READER_VERSION).toBe(9);
+          expect(MANIFEST_FORMAT_VERSION).toBe(12);
+          expect(vocabulary).toBe(known[9].vocabulary);
           expect(() =>
             requireNativeReaderProfile(DURABLE_READER_VERSION, MANIFEST_FORMAT_VERSION, vocabulary),
           ).not.toThrow();
@@ -53,13 +56,22 @@ for (const seed of seedsFor("next-native-profile", [0xb2a1, 0xb2a2]))
             ),
           ).toThrow(expect.objectContaining({ code: "MINNOW_FORMAT_UNSUPPORTED" }));
           reach.reach("unassigned nested vocabulary");
-          expect(() =>
-            requireNativeReaderProfile(unsupported, MANIFEST_FORMAT_VERSION, vocabulary),
-          ).toThrow(expect.objectContaining({ code: "MINNOW_FORMAT_UNSUPPORTED" }));
-          reach.reach("unassigned reader");
-          // Keep the original generated population; the current known manifest11 is not
+          // Preserve9..255:9 is now assigned, so assert its acceptance rather than removing it
+          // from the generator. Every history also exercises genuinely unassigned selectors.
+          for (const selector of [unsupported, 7, 8, 10, 255]) {
+            const check = () =>
+              requireNativeReaderProfile(selector, MANIFEST_FORMAT_VERSION, vocabulary);
+            if (selector === 9) {
+              expect(check).not.toThrow();
+              reach.reach("assigned selector in preserved population");
+            } else {
+              expect(check).toThrow(expect.objectContaining({ code: "MINNOW_FORMAT_UNSUPPORTED" }));
+              reach.reach("unassigned reader");
+            }
+          }
+          // Keep the original generated population; the current known manifest12 is not
           // an unsupported selector. Also witness both superseded development layouts.
-          for (const manifest of [unsupported, 8, 9, 10, 255]) {
+          for (const manifest of [unsupported, 8, 9, 10, 11, 255]) {
             if (manifest === MANIFEST_FORMAT_VERSION) continue;
             expect(() =>
               requireNativeReaderProfile(DURABLE_READER_VERSION, manifest, vocabulary),
@@ -106,7 +118,14 @@ for (const seed of seedsFor("next-native-profile", [0xb2a1, 0xb2a2]))
           reach.reach("required feature");
         },
       ),
-      { seed, numRuns: 32 },
+      {
+        seed,
+        numRuns: 32,
+        examples: [
+          [0, 9],
+          [31, 255],
+        ],
+      },
     );
     reach.assertReached();
   });
@@ -120,7 +139,11 @@ for (const seed of seedsFor("next-native-writer-profile", [0xb2c5, 0xb2c6]))
         fc.integer({ min: 9, max: 255 }),
         (bit, future) => {
           reach.beginHistory();
-          const knownWriter = { 8: { manifest: 11, vocabulary: 1164132746 } };
+          const knownWriter = {
+            8: { manifest: 11, vocabulary: 1164132746 },
+            9: { manifest: 12, vocabulary: 131312130 },
+          };
+          expect(DURABLE_WRITER_VERSION).toBe(9);
           expect(NATIVE_WRITER_PROFILES).toEqual(knownWriter);
           const current = nativeVocabularyFingerprint(
             CATALOG_RECORD_SCHEMAS,
@@ -129,9 +152,15 @@ for (const seed of seedsFor("next-native-writer-profile", [0xb2c5, 0xb2c6]))
           );
           requireNativeWriterProfile(DURABLE_WRITER_VERSION, MANIFEST_FORMAT_VERSION, current);
           reach.reach("assigned rewrite vocabulary");
-          expect(() =>
-            requireNativeWriterProfile(future, MANIFEST_FORMAT_VERSION, current),
-          ).toThrow(expect.objectContaining({ code: "MINNOW_FORMAT_UNSUPPORTED" }));
+          for (const selector of [future, 8, 10, 255]) {
+            const check = () =>
+              requireNativeWriterProfile(selector, MANIFEST_FORMAT_VERSION, current);
+            if (selector === 9) {
+              expect(check).not.toThrow();
+              reach.reach("assigned selector in preserved population");
+            } else
+              expect(check).toThrow(expect.objectContaining({ code: "MINNOW_FORMAT_UNSUPPORTED" }));
+          }
           expect(() =>
             requireNativeWriterProfile(
               DURABLE_WRITER_VERSION,
@@ -165,7 +194,14 @@ for (const seed of seedsFor("next-native-writer-profile", [0xb2c5, 0xb2c6]))
           reach.reach("all record kinds");
         },
       ),
-      { seed, numRuns: 32 },
+      {
+        seed,
+        numRuns: 32,
+        examples: [
+          [0, 9],
+          [31, 255],
+        ],
+      },
     );
     reach.assertReached();
   });

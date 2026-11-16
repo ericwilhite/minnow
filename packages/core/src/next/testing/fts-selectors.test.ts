@@ -1,4 +1,4 @@
-/** Independent golden selectors: MCAT reader7, native reader8/writer8, manifest11/commitBody8.
+/** Independent golden selectors: MCAT reader7, native reader9/writer9, manifest12/commitBody8.
  * These are development bytes, not a supported predecessor or an indexed-query claim.
  */
 import fc from "fast-check";
@@ -28,14 +28,14 @@ for (const seed of seedsFor("next-fts-selectors", [0xb817, 0xb818]))
           };
           if (seed & 1) checkBody();
           const encoded = encodeRootSlot(sequence, payload);
-          expect((encoded[10] ?? 0) >>> 5, "profile8 escape ABI").toBe(7);
+          expect((encoded[10] ?? 0) >>> 5, "u32 capability escape ABI").toBe(7);
           const view = new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength);
-          expect(view.getUint32(16, true), "reader8 ABI").toBe(8);
-          reach.reach("reader8 barrier");
-          expect(view.getUint32(20, true), "writer8 ABI").toBe(8);
-          reach.reach("writer8 barrier");
-          expect(encoded[11], "manifest11 ABI").toBe(9);
-          reach.reach("manifest11 barrier");
+          expect(view.getUint32(16, true), "reader9 ABI").toBe(9);
+          reach.reach("reader9 barrier");
+          expect(view.getUint32(20, true), "writer9 ABI").toBe(9);
+          reach.reach("writer9 barrier");
+          expect(encoded[11], "manifest12 ABI").toBe(10);
+          reach.reach("manifest12 barrier");
           const decoded = decodeRootSlot(encoded);
           expect(decoded?.sequence).toBe(sequence);
           expect(decoded?.root).toEqual(payload);
