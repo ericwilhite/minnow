@@ -54,6 +54,11 @@ import {
   type EngineOutcome,
   type Verdict,
 } from "./lib/browser-perf-baseline.mts";
+import {
+  browserWorkload,
+  calibrationProvenance,
+  requireMeasuredCalibration,
+} from "./lib/browser-perf-workload.mts";
 import { LANE_DIR_ENV, PROC_AVAILABLE, laneDirectory } from "./lib/browser-perf-host.mts";
 import {
   compareResults,
@@ -311,6 +316,7 @@ function judge(records: readonly CellRecord[], profile: string): Judged[] {
     const referenceOutcome = outcome(reference);
     const observation: CellObservation = {
       cell,
+      workload: browserWorkload(cell),
       reference: ref.engine,
       minnow: {
         ...minnowOutcome,
@@ -365,7 +371,9 @@ function summaryTables(
       `\n${group === "point" ? "Point suite (unit: ms per operation)" : `${group} (unit: ms per query)`} — reference ${reference}, profile ${profile}`,
     );
     const rows = entries.map((j) => {
-      const base = baseline?.profiles[profile]?.cells[j.minnow.cell];
+      const recorded = baseline?.profiles[profile]?.cells[j.minnow.cell];
+      // Calibration may measure changed SQL; never display its obsolete threshold beside it.
+      const base = recorded?.workload === j.observation.workload ? recorded : undefined;
       const ratio =
         j.minnow.ok &&
         j.reference?.ok === true &&
@@ -484,6 +492,15 @@ async function main(): Promise<number> {
     if ((record as LaneRecord).type === "load") loads.push(record as LoadRecord);
   };
   let profile = "";
+  const selected = [
+    ...(pointSelected ? POINT_CELLS.filter(includePoint).map((c) => `point/${c}`) : []),
+    ...datasets.flatMap((d) =>
+      analyticsCells(d)
+        .filter(includeAnalytics)
+        .map((c) => c.id),
+    ),
+  ];
+  if (update) for (const cell of selected) calibrationProvenance(cell, process.env);
   const started = Date.now();
   const first = await withBrowser(async (browser) => {
     profile = browserPerfProfile(browser.browserVersion);
@@ -515,6 +532,13 @@ async function main(): Promise<number> {
       throw new Error(
         `No browser baseline for ${profile}; run npm run benchmark:browser -- --update on that runtime`,
       );
+    }
+    if (!update) {
+      for (const cell of selected) {
+        const entry = baseline?.profiles[profile]?.cells[cell];
+        if (entry !== undefined && entry.workload !== browserWorkload(cell))
+          throw new Error(`${cell}: changed workload — recalibrate`);
+      }
     }
     return runSuites(browser, "initial", capture);
   });
@@ -552,21 +576,6 @@ async function main(): Promise<number> {
 
   if (update) {
     const calibrated: Record<string, CellBaseline> = {};
-    for (const j of judged) calibrated[j.observation.cell] = calibrate(j.observation);
-    const previous = baseline?.profiles[profile];
-    const provisional = flag("final")
-      ? false
-      : flag("provisional")
-        ? true
-        : (previous?.provisional ?? true);
-    const host = `${String(os.cpus().length)} threads, ${String(Math.round(os.totalmem() / 2 ** 30))} GiB`;
-    writeFileSync(
-      BASELINE_PATH,
-      `${JSON.stringify(updatedBaseline(baseline, profile, calibrated, { provisional, recorded: `${new Date().toISOString().slice(0, 10)} on ${host}`, ...(previous?.note === undefined ? {} : { note: previous.note }) }), null, 2)}\n`,
-    );
-    log(
-      `\nBaseline profile ${profile} updated for ${String(Object.keys(calibrated).length)} cell(s)${provisional ? " (provisional)" : ""}.`,
-    );
     // Calibration records what a cell does; it must never record a broken store or a wrong
     // answer as normal.
     const reopenFailures = judged.filter((j) => j.minnow.reopen?.ok === false);
@@ -581,6 +590,28 @@ async function main(): Promise<number> {
       );
       return 1;
     }
+    for (const j of judged) {
+      requireMeasuredCalibration(j.observation);
+      const calibration = calibrationProvenance(j.observation.cell, process.env);
+      calibrated[j.observation.cell] = {
+        ...calibrate(j.observation),
+        ...(calibration === undefined ? {} : { calibration }),
+      };
+    }
+    const previous = baseline?.profiles[profile];
+    const provisional = flag("final")
+      ? false
+      : flag("provisional")
+        ? true
+        : (previous?.provisional ?? true);
+    const host = `${String(os.cpus().length)} threads, ${String(Math.round(os.totalmem() / 2 ** 30))} GiB`;
+    writeFileSync(
+      BASELINE_PATH,
+      `${JSON.stringify(updatedBaseline(baseline, profile, calibrated, { provisional, recorded: `${new Date().toISOString().slice(0, 10)} on ${host}`, ...(previous?.note === undefined ? {} : { note: previous.note }) }), null, 2)}\n`,
+    );
+    log(
+      `\nBaseline profile ${profile} updated for ${String(Object.keys(calibrated).length)} cell(s)${provisional ? " (provisional)" : ""}.`,
+    );
     return 0;
   }
 

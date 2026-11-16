@@ -189,6 +189,7 @@ describe("browser lane datasets", () => {
   });
 });
 
+const workload = "a".repeat(64);
 describe("browser lane baseline", () => {
   const observation = (
     minnowMs: number,
@@ -196,6 +197,7 @@ describe("browser lane baseline", () => {
     extra: Partial<CellObservation["minnow"]> = {},
   ): CellObservation => ({
     cell: "W1M/q",
+    workload,
     reference: "duckdb",
     minnow: { ok: true, timing: timing(minnowMs), check: "match", ...extra },
     referenceOutcome: { ok: true, timing: timing(referenceMs) },
@@ -216,6 +218,7 @@ describe("browser lane baseline", () => {
     expect(cell.threshold).toBeGreaterThanOrEqual(6);
     expect(cell.threshold).toBeLessThanOrEqual(12);
     expect(calibrate({ ...observation(1, 1), minnow: { ok: false, failure: "budget" } })).toEqual({
+      workload,
       reference: "duckdb",
       status: "fails",
       failure: "budget",
@@ -225,6 +228,7 @@ describe("browser lane baseline", () => {
 
   it("flags only a ratio whose whole sampled range is past the threshold", () => {
     const baseline = {
+      workload,
       reference: "duckdb" as const,
       status: "completes" as const,
       ratio: 4,
@@ -237,8 +241,9 @@ describe("browser lane baseline", () => {
   });
 
   it("treats status changes, reopen failures and wrong results differently", () => {
-    const completes = { reference: "duckdb" as const, status: "completes" as const };
+    const completes = { workload, reference: "duckdb" as const, status: "completes" as const };
     const fails = {
+      workload,
       reference: "duckdb" as const,
       status: "fails" as const,
       failure: "budget" as const,
@@ -280,20 +285,22 @@ describe("browser lane baseline", () => {
 
   it("merges one profile's cells and keeps targets and other profiles", () => {
     const parsed = parseBrowserPerfBaseline({
-      schemaVersion: 1,
+      schemaVersion: 2,
       targets: { "W1M/q": { gate: "B", ratio: 1 } },
       profiles: {
         other: {
           provisional: false,
           recorded: "x",
-          cells: { "W1M/q": { reference: "duckdb", status: "completes", ratio: 2, threshold: 3 } },
+          cells: {
+            "W1M/q": { workload, reference: "duckdb", status: "completes", ratio: 2, threshold: 3 },
+          },
         },
       },
     });
     const next = updatedBaseline(
       parsed,
       "mine",
-      { "W1M/q": { reference: "duckdb", status: "fails", failure: "budget" } },
+      { "W1M/q": { workload, reference: "duckdb", status: "fails", failure: "budget" } },
       { provisional: true, recorded: "y" },
     );
     expect(next.targets).toEqual(parsed.targets);
@@ -301,7 +308,7 @@ describe("browser lane baseline", () => {
     expect(next.profiles.mine?.cells["W1M/q"]?.status).toBe("fails");
     expect(() =>
       parseBrowserPerfBaseline({
-        schemaVersion: 1,
+        schemaVersion: 2,
         profiles: { p: { cells: { c: { status: "maybe" } } } },
       }),
     ).toThrow();

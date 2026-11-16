@@ -7564,3 +7564,14 @@ export const FTS_CLAIM_CODEC_REACH = [
 ] as const;
 
 export const OWNER_CLOCK_REACH = ["clock tick exact", "over target remains over"] as const;
+
+/** Baseline ratios are meaningful only for the recorded SQL and dataset scale. */
+export const BROWSER_WORKLOAD_REACH = ["SQL changed", "dataset changed", "scale changed"] as const;
+
+/** Shared hosts observe R6; acceptance needs independently qualified host evidence. */
+export const R6_OBSERVATION_REACH = [
+  "over-target observation",
+  "unqualified acceptance refused",
+  "qualified target judging",
+  "invariants always enforced",
+] as const;

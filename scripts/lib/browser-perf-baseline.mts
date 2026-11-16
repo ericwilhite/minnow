@@ -8,6 +8,7 @@
  * Unlike the Node gate it also records what a cell *does*. Many analytics cells fail at default
  * options today, so each cell carries an expected status: `completes`, or `fails` with its failure
  * class. The lane flags:
+ *   - changed SQL/dataset/scale (fatal before ratios; explicit recalibration required);
  *   - a database that will not reopen after a failed Minnow cell (always fatal, never retried);
  *   - a Minnow result that disagrees with the reference engine (always fatal);
  *   - a cell that used to complete and now fails (confirmed by a re-run);
@@ -22,6 +23,9 @@ import type { FailureClass, ResultCheck, TimingSummary } from "./browser-perf-re
 import { isMismatch } from "./browser-perf-results.mts";
 
 export interface CellBaseline {
+  /** SHA-256 of the exact SQL, dataset identity, scale and execution options. */
+  readonly workload: string;
+  readonly calibration?: { readonly authority: string; readonly run: string };
   readonly reference: EngineId;
   readonly status: "completes" | "fails";
   /** The failure class a known-failing cell fails with. */
@@ -55,7 +59,7 @@ export interface BaselineProfile {
 }
 
 export interface BrowserPerfBaseline {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly targets: Record<string, CellTarget>;
   readonly profiles: Record<string, BaselineProfile>;
 }
@@ -75,7 +79,7 @@ const positive = (value: unknown, label: string): number => {
 /** Parses the checked-in file field by field rather than trusting a type assertion. */
 export function parseBrowserPerfBaseline(value: unknown): BrowserPerfBaseline {
   const root = object(value, "Browser performance baseline");
-  if (root.schemaVersion !== 1) throw new Error("Unsupported browser performance baseline schema");
+  if (root.schemaVersion !== 2) throw new Error("Unsupported browser performance baseline schema");
   const targets: Record<string, CellTarget> = {};
   for (const [cell, raw] of Object.entries(object(root.targets ?? {}, "targets"))) {
     const target = object(raw, `target ${cell}`);
@@ -106,7 +110,27 @@ export function parseBrowserPerfBaseline(value: unknown): BrowserPerfBaseline {
       ) {
         throw new Error(`${name}/${cell} has no valid reference engine`);
       }
+      if (typeof entry.workload !== "string" || !/^[a-f0-9]{64}$/.test(entry.workload))
+        throw new Error(
+          `${name}/${cell}: changed workload — recalibrate (missing or invalid identity)`,
+        );
+      const calibration =
+        entry.calibration === undefined ? undefined : object(entry.calibration, "calibration");
+      if (
+        calibration !== undefined &&
+        (typeof calibration.authority !== "string" || typeof calibration.run !== "string")
+      )
+        throw new Error(`${name}/${cell}: invalid calibration provenance`);
       cells[cell] = {
+        workload: entry.workload,
+        ...(calibration === undefined
+          ? {}
+          : {
+              calibration: {
+                authority: calibration.authority as string,
+                run: calibration.run as string,
+              },
+            }),
         reference: entry.reference,
         status: entry.status,
         ...(typeof entry.failure === "string" ? { failure: entry.failure as FailureClass } : {}),
@@ -125,7 +149,7 @@ export function parseBrowserPerfBaseline(value: unknown): BrowserPerfBaseline {
       cells,
     };
   }
-  return { schemaVersion: 1, targets, profiles };
+  return { schemaVersion: 2, targets, profiles };
 }
 
 /**
@@ -155,6 +179,7 @@ export interface EngineOutcome {
 }
 
 export interface CellObservation {
+  readonly workload: string;
   readonly cell: string;
   readonly reference: EngineId;
   readonly minnow: EngineOutcome & {
@@ -173,6 +198,7 @@ export type VerdictKind =
   | "newly-failing"
   | "ratio-regression"
   | "uncalibrated"
+  | "changed-workload"
   | "newly-completing"
   | "failure-changed"
   | "reference-failed";
@@ -224,18 +250,20 @@ const significant = (value: number): number => Number(value.toPrecision(3));
 
 /** The baseline entry this observation would record. */
 export function calibrate(observation: CellObservation): CellBaseline {
-  const { minnow, referenceOutcome, reference } = observation;
-  if (!minnow.ok) return { reference, status: "fails", failure: minnow.failure ?? "error" };
+  const { minnow, referenceOutcome, reference, workload } = observation;
+  if (!minnow.ok)
+    return { reference, workload, status: "fails", failure: minnow.failure ?? "error" };
   if (
     referenceOutcome?.ok !== true ||
     minnow.timing === undefined ||
     referenceOutcome.timing === undefined
   ) {
-    return { reference, status: "completes" };
+    return { reference, workload, status: "completes" };
   }
   const onceOnly = minnow.onceOnly === true || referenceOutcome.onceOnly === true;
   return {
     reference,
+    workload,
     status: "completes",
     ratio: significant(ratioRange(minnow.timing, referenceOutcome.timing).typical),
     threshold: significant(thresholdFor(minnow.timing, referenceOutcome.timing, onceOnly)),
@@ -270,6 +298,14 @@ export function evaluate(
     add(
       "uncalibrated",
       "no baseline entry for this cell on this profile; record one with --update",
+      true,
+    );
+    return verdicts;
+  }
+  if (baseline.workload !== observation.workload || baseline.reference !== observation.reference) {
+    add(
+      "changed-workload",
+      "changed workload — recalibrate; the recorded SQL/dataset/scale differs",
       true,
     );
     return verdicts;
@@ -328,7 +364,7 @@ export function updatedBaseline(
     Object.entries(merged).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
   );
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     targets: baseline?.targets ?? {},
     profiles: { ...baseline?.profiles, [profile]: { ...meta, cells: sorted } },
   };

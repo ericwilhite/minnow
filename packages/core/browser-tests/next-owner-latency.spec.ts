@@ -1,4 +1,5 @@
 import { expect, type Page } from "@playwright/test";
+import { r6Policy, validateLatencySample } from "../src/next/testing/r6-policy.js";
 import { test } from "./fixtures.js";
 
 /**
@@ -37,12 +38,15 @@ const TARGET_LOADED_P95_US = 5_000;
  * made reads 5.7× a bare round trip. Deterministic, unlike timings on a shared host.
  */
 const MAX_LOCK_CALLS_PER_SAMPLE = 8;
-/** A quiet perf host (the browser perf lane): enforce R6's absolute targets too. */
-const ENFORCE_TARGETS = process.env.MINNOW_PERF_LANE === "1";
+const POLICY = r6Policy(process.env);
 
 test.describe.configure({ timeout: 120_000 });
 
-test("cross-tab warm point reads meet R6", async ({ page, context, browserName }, info) => {
+test("cross-tab warm point reads report R6 and enforce invariants", async ({
+  page,
+  context,
+  browserName,
+}, info) => {
   const name = `latency-${String(Date.now())}`;
   const owner = page;
   await owner.goto("/packages/core/browser/next-owner/blank.html");
@@ -70,6 +74,8 @@ test("cross-tab warm point reads meet R6", async ({ page, context, browserName }
   const crossover = await call(reader, "transferCrossover");
   const result = {
     browser: browserName,
+    acceptance: POLICY.status,
+    targets: { p50Us: TARGET_P50_US[browserName], loadedP95Us: TARGET_LOADED_P95_US },
     timers,
     baseline,
     uncontended,
@@ -83,15 +89,31 @@ test("cross-tab warm point reads meet R6", async ({ page, context, browserName }
     body: JSON.stringify(result, null, 2),
     contentType: "application/json",
   });
+  validateLatencySample(baseline, 3_000);
+  validateLatencySample(uncontended, 3_000);
+  validateLatencySample(loaded, 1_000);
+  for (const value of [
+    timers.stepUs,
+    ratio,
+    lockCalls,
+    loaded.p99,
+    loaded.max,
+    uncontended.p99,
+    uncontended.max,
+    ...crossover.flatMap((r) => [r.transfer, r.clone]),
+  ]) {
+    expect(Number.isFinite(value)).toBe(true);
+    expect(value).toBeGreaterThanOrEqual(0);
+  }
   expect(timers.isolated).toBe(true);
   expect(locksAfter.owner).not.toBeNull();
   expect(lockCalls).toBeLessThanOrEqual(MAX_LOCK_CALLS_PER_SAMPLE);
-  if (ENFORCE_TARGETS) {
+  if (POLICY.enforce) {
     expect(uncontended.p50).toBeLessThanOrEqual(TARGET_P50_US[browserName]);
     expect(loaded.p95).toBeLessThanOrEqual(TARGET_LOADED_P95_US);
   } else
     info.annotations.push({
       type: "R6",
-      description: `targets reported, not enforced (MINNOW_PERF_LANE unset): p50 ${uncontended.p50.toFixed(0)} µs vs ${String(TARGET_P50_US[browserName])} (${ratio.toFixed(1)}× a bare round trip); loaded p95 ${loaded.p95.toFixed(0)} µs vs ${String(TARGET_LOADED_P95_US)}`,
+      description: `${POLICY.status}; targets reported, not judged: p50 ${uncontended.p50.toFixed(0)} µs vs ${String(TARGET_P50_US[browserName])} (${ratio.toFixed(1)}× a bare round trip); loaded p95 ${loaded.p95.toFixed(0)} µs vs ${String(TARGET_LOADED_P95_US)}`,
     });
 });

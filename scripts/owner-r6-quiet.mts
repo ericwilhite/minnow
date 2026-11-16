@@ -69,6 +69,10 @@ async function command(
   }
 }
 try {
+  if (!process.env.MINNOW_R6_QUIET_RUNNER_ID?.trim())
+    throw new Error(
+      "R6 NOT ACCEPTED: no qualified quiet runner configured (release-blocking 1.0 item)",
+    );
   if (process.platform === "win32")
     throw new Error("R6 requires an OS load average; Windows does not supply one");
   sample();
@@ -88,6 +92,18 @@ try {
     await new Promise((resolve) => setTimeout(resolve, 5000));
   }
   host.samples.length = 0;
+  // Component absolute targets also belong to this audited host, never the shared observer.
+  const components = await command(
+    "owner-components",
+    [
+      resolve("node_modules/vitest/vitest.mjs"),
+      "run",
+      "packages/core/src/next/testing/owner-point-read.bench.test.ts",
+      "--maxWorkers=2",
+    ],
+    { MINNOW_PERF_LANE: "1", MINNOW_R6_MODE: "accept", MINNOW_R6_QUALIFIED: "1" },
+  );
+  if (components.code !== 0) throw new Error("R6 component acceptance failed; retain raw evidence");
   const records = [];
   let passed = true;
   for (const browser of ["chromium", "firefox", "webkit"]) {
@@ -110,6 +126,8 @@ try {
         ],
         {
           MINNOW_PERF_LANE: "1",
+          MINNOW_R6_MODE: "accept",
+          MINNOW_R6_QUALIFIED: "1",
           MINNOW_OWNER_SCHEDULING_BENCH: "1",
           PLAYWRIGHT_JSON_OUTPUT_FILE: join(out, name + ".json"),
           ...(browser === "webkit" && process.env.MINNOW_R6_WEBKIT_BROWSERS_PATH
@@ -218,6 +236,7 @@ try {
     revision: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
     node: process.version,
     cpus: availableParallelism(),
+    qualifiedRunner: process.env.MINNOW_R6_QUIET_RUNNER_ID,
     status: passed ? "pass" : "targets-missed",
     quantum: "candidate only; decide from quiet latency and fixed-work completion times",
     records,

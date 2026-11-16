@@ -1163,11 +1163,11 @@ The unexported rebuild core's owner protocol has a separate, cross-origin isolat
 Run one engine at a time, with no other benchmark or build in flight:
 
 ```bash
-MINNOW_PERF_LANE=1 npm run test:browser:next-owner -- next-owner-latency.spec.ts --project=chromium --repeat-each=5 --workers=1
+MINNOW_R6_MODE=observe npm run test:browser:next-owner -- next-owner-latency.spec.ts --project=chromium --repeat-each=5 --workers=1
 ```
 
-Repeat for `firefox` and `webkit`, recording host load alongside the results. This lane enforces
-warm cross-tab point-read p50 targets of 250, 400 and 600 microseconds respectively, and a loaded
+Repeat for `firefox` and `webkit`, recording host load alongside the results. Shared Ubuntu
+runners are an observation lane: they report, but do not judge, warm cross-tab point-read p50 targets of 250, 400 and 600 microseconds respectively, and a loaded
 p95 target of 5 milliseconds. The fixture uses real lowering and the owner protocol, with a
 synthetic executor and write path; it does not establish the real executor's lookup cost.
 Warm prepared reads bypass plan-cache lookup. The report also includes bare broker round trips,
@@ -1175,15 +1175,19 @@ lock-call counts and a clone/transfer probe. The probe sends buffers to the brok
 without echoing those buffers, so it measures one payload direction.
 
 The Node component split in `owner-point-read.bench.test.ts` always checks finite measurements,
-sample counts, synchronous execution, frame release and warm plan-cache reuse. Its 50-microsecond
-owner-share bound for prepared and parameterized text reads is enforced only with
-`MINNOW_PERF_LANE=1`; ordinary unit CI reports the values as an R6 test annotation. The nightly
-owner performance job runs this component benchmark with enforcement before the browser lane,
-and uploads its log alongside the browser results. The hosted job does not qualify runner
-quietness; its absolute-target failures retain raw measurements for investigation. The separate
-stub-server 10-microsecond check is unchanged. Browser sample intervals are rounded to the nearest
-nanosecond before reporting microseconds, so an exact clock tick cannot cross a target through
-binary subtraction alone; the targets themselves are unchanged.
+sample counts, synchronous execution, frame release and warm plan-cache reuse. The nightly owner
+observation job runs it with `MINNOW_R6_MODE=observe`, then runs the browser observations. It
+reports the server-alone 10-microsecond and owner-share 50-microsecond targets without judging
+them. Browser correctness, finite-value, sample-count, isolation and lock invariants still fail
+the job. Raw metrics and the unchanged absolute targets are uploaded together.
+
+**R6 is NOT ACCEPTED.** A qualified quiet runner is not configured yet; this is a release-blocking
+1.0 item. The workflow has a separate, explicitly failing acceptance job. A green observation
+job never grants acceptance. Absolute targets are judged only after independent host and CPU-load
+qualification, never qualification by the latency result or selection of a lucky run. Keep all
+histories. A missing, busy or unqualified runner refuses acceptance. Browser sample intervals are
+rounded to the nearest nanosecond before reporting microseconds, so an exact clock tick cannot
+cross a target through binary subtraction alone; the targets themselves are unchanged.
 
 An isolated scheduling experiment helps distinguish browser task queues from SQL and wire costs:
 
@@ -1203,15 +1207,15 @@ before choosing a scheduling change.
 
 ### Quiet-host R6 gate and CPU components
 
-Run all engines with one command when the host is idle:
+Once a quiet runner is independently qualified and configured, run all engines with one command:
 
 ```bash
-npm run benchmark:owner:r6 -- --out /path/to/fresh-output
+MINNOW_R6_QUIET_RUNNER_ID=<approved-runner-id> npm run benchmark:owner:r6 -- --out /path/to/fresh-output
 ```
 
-The command checks `load1 <= 1` before starting, builds the core, waits up to ten minutes for
-build load to decay, then runs Chromium, Firefox and WebKit sequentially. Each engine runs the
-latency lane five times with `MINNOW_PERF_LANE=1`, then the five-round fixed-work sweep over
+The command refuses an absent configured runner ID and checks `load1 <= 1` before starting, builds the core, waits up to ten minutes for
+build load to decay, judges the Node component targets, then runs Chromium, Firefox and WebKit sequentially. Each engine runs the
+latency lane five times with qualified absolute judging, then the five-round fixed-work sweep over
 4, 1 and 0.5 ms quanta (including the original fixture's 4 ms control). It samples host load every
 second and at command boundaries. Any measured load above 1, invalid load evidence or incomplete
 run produces `refused.json` and raw logs, **never `report.json`**. It waits for its own children;
@@ -1671,9 +1675,18 @@ file carries the design targets for the 1.0 reset (Gates A–D and the point tar
 prints each cell's progress toward its target and never fails on one. `--update` rewrites the
 current profile's cells it ran and keeps every other profile and the targets. A profile marked
 `provisional` was calibrated on a noisy or unrepresentative host; recalibrate it on the machine
-that runs the lane, and treat that update as a code change. The CI profile starts empty, so the
-nightly run fails as uncalibrated until the workflow is run once with its `update` input and the
-uploaded baseline file is committed.
+that runs the lane, and treat that update as a code change. A new CI profile starts empty, so its
+nightly run fails as uncalibrated until the hosted workflow is run with `recalibrate=all` and the
+uploaded baseline file is committed. Use `recalibrate=S_q7` for the approved NUMERIC ROUND
+correction from `4e7b6a0c`; its new measurements must come from the hosted runner. That cell's
+calibration records the authority and workflow run URL.
+
+Every browser baseline entry has a SHA-256 workload identity over the exact SQL (including
+reference dialects), dataset ID and scale, generator version and memory cap. Point cells include
+the executed SQL family, table definitions and row counts. A changed identity fails closed with
+“changed workload — recalibrate”, before loading data; it never receives a ratio verdict. The
+old S_q7 entries retain the identity of their original FLOAT query until hosted calibration;
+no local numbers or guessed thresholds replace them.
 
 ## Refresh the download-size comparison
 

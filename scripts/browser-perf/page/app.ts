@@ -5,6 +5,14 @@
  * Playwright. Timings are taken here with `performance.now()`; memory and CPU are read by the
  * driver from `/proc` around each call, because the page cannot see its own process.
  */
+import {
+  POINT_TABLES,
+  INSERT_SQL,
+  READ_SQL,
+  LITERAL_READ_SQL,
+  UPDATE_SQL,
+  type PointTable,
+} from "../point-sql.ts";
 import * as duckdb from "@duckdb/duckdb-wasm";
 import { MinnowDatabaseClient } from "@minnowdb/core/client";
 import { deleteOpfsDatabase } from "@minnowdb/core/storage/opfs";
@@ -692,19 +700,6 @@ export function pointUuid(id: number): string {
   return `${a}-${b.slice(0, 4)}-4${b.slice(4, 7)}-${c.slice(0, 4)}-${c.slice(4)}${d}`;
 }
 
-const POINT_TABLES = {
-  pt_int: {
-    minnow:
-      "id BIGINT PRIMARY KEY, a INTEGER NOT NULL, b DOUBLE PRECISION NOT NULL, c TEXT NOT NULL",
-    sqlite: "id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b REAL NOT NULL, c TEXT NOT NULL",
-  },
-  pt_uuid: {
-    minnow: "id TEXT PRIMARY KEY, a INTEGER NOT NULL, b DOUBLE PRECISION NOT NULL, c TEXT NOT NULL",
-    sqlite: "id TEXT PRIMARY KEY, a INTEGER NOT NULL, b REAL NOT NULL, c TEXT NOT NULL",
-  },
-} as const;
-type PointTable = keyof typeof POINT_TABLES;
-
 const pointKey = (table: PointTable, id: number): string | number =>
   table === "pt_uuid" ? pointUuid(id) : id;
 const pointRow = (table: PointTable, id: number): Array<string | number> => [
@@ -748,10 +743,6 @@ async function pointLoad(input: { table: PointTable; rows: number }): Promise<Lo
   }
   return { ...timings, totalMs: performance.now() - started, rows: { [input.table]: input.rows } };
 }
-
-const INSERT_SQL = (table: PointTable): string =>
-  `INSERT INTO ${table} (id, a, b, c) VALUES (?, ?, ?, ?)`;
-const READ_SQL = (table: PointTable): string => `SELECT id, a, b, c FROM ${table} WHERE id = ?`;
 
 /** Sequential single-row INSERTs, each its own commit: `batches` × `perBatch`. */
 async function pointInsertSequential(input: {
@@ -838,7 +829,7 @@ async function pointRead(input: {
     const value = pointKey(input.table, key);
     if (input.literal !== true) return target.read(READ_SQL(input.table), [value]);
     const inline = typeof value === "number" ? String(value) : `'${value}'`;
-    return target.read(`SELECT id, a, b, c FROM ${input.table} WHERE id = ${inline}`, []);
+    return target.read(LITERAL_READ_SQL(input.table, inline), []);
   };
   // One untimed read first, so the batch timings measure warm reads.
   await readOne(keys[0] ?? 1);
@@ -879,7 +870,7 @@ async function pointUpdates(input: {
   const keys = keySequence(input.seed, input.count, input.rows);
   const started = performance.now();
   for (const key of keys) {
-    await target.write(`UPDATE ${input.table} SET a = a + 1, c = ? WHERE id = ?`, [
+    await target.write(UPDATE_SQL(input.table), [
       `updated-${String(key)}`,
       pointKey(input.table, key),
     ]);

@@ -2,21 +2,22 @@
  * The point-read path's owner-side cost (ruling R6), measured in Node.
  *
  * - **Server alone** (a stub engine whose point read costs nothing): what the protocol server adds
- *   (envelope check, admission, the session queue, `runNow`, settle, the reply). Gated at 10 µs.
+ *   (envelope check, admission, the session queue, `runNow`, settle, the reply). Target 10 µs; judged only on a qualified quiet host.
  * - **The full composition** over real lowering and the stand-in executor and write path, split per
  *   read into lowering, execution (the executor and what it calls), the write path (snapshot pins),
  *   and the rest: the server plus the composition (plan-cache hit, statistics check, admission,
  *   frames to the wire). The owner's share (the rest plus lowering) is gated at 50 µs only with
- *   `MINNOW_PERF_LANE=1`; ordinary CI annotates that measurement. Warm
+ *   the qualified quiet-host wrapper; shared CI only observes that measurement. Warm
  *   prepared and parameterized reads must not lower at all. Execution is reported, not gated: the
  *   stand-in scans the table for its key lookup; its cost is not the real executor's. Whole-read
- *   cross-tab R6 targets are enforced separately in the browser perf lane.
+ *   cross-tab R6 targets are judged separately on a qualified quiet runner.
  * - **Literal statements** (`WHERE id = 7`, a new text per key) share an auto-parameterized
  *   template: warm reads must neither lower nor prepare again, even past 512 distinct texts.
  *
  * Every read must take the synchronous path. Structural and cache invariants always apply;
  * the composition timing bound belongs to the perf lane, not shared CI runners. The timing wrappers add well under a µs per call.
  */
+import { r6Policy } from "./r6-policy.js";
 import { describe, expect, it } from "vitest";
 import type { ChunkReads } from "../exec/scan.js";
 import { Governor } from "../memory/governor.js";
@@ -29,6 +30,8 @@ import type { EngineSession, OwnerEngine, PlannedStatement, SyncRun } from "../o
 import { RequestLedger } from "../format/ledger.js";
 import { PROTOCOL_VERSION } from "../owner/protocol.js";
 import { OwnerServer, type ServerPort } from "../owner/server.js";
+
+const POLICY = r6Policy(process.env);
 
 const ROWS = 1_000;
 const READS = 20_000;
@@ -274,7 +277,10 @@ describe("point read (R6)", () => {
     console.log(
       `server alone (stub engine): p50 ${quantile(times, 0.5).toFixed(2)} µs, p99 ${quantile(times, 0.99).toFixed(2)} µs`,
     );
-    expect(quantile(times, 0.5)).toBeLessThan(10);
+    expect(times).toHaveLength((READS * 3) / 4);
+    expect(times.every((n) => Number.isFinite(n) && n >= 0)).toBe(true);
+    if (POLICY.enforce) expect(quantile(times, 0.5)).toBeLessThan(10);
+    else console.log(`${POLICY.status}; server-alone 10 µs bound reported, not judged`);
   }, 60_000);
 
   it("splits the composition's point read into lowering, execution, the write path and the owner's share", async ({
@@ -446,12 +452,12 @@ describe("point read (R6)", () => {
     expect(textReads.synchronous).toBe(READS / 2);
     // CI always checks the split and cache invariants; absolute time needs a perf host.
     close();
-    if (process.env.MINNOW_PERF_LANE === "1") {
+    if (POLICY.enforce) {
       expect(preparedReads.owner).toBeLessThan(50);
       expect(textReads.owner).toBeLessThan(50);
     } else
       await annotate(
-        `R6 composition owner's share: prepared ${preparedReads.owner.toFixed(2)} µs, parameterized text ${textReads.owner.toFixed(2)} µs; 50 µs bound reported, not enforced (MINNOW_PERF_LANE unset or not 1)`,
+        `R6 composition owner's share: prepared ${preparedReads.owner.toFixed(2)} µs, parameterized text ${textReads.owner.toFixed(2)} µs; 50 µs bound reported, not judged; ${POLICY.status}`,
         "R6",
       );
   }, 120_000);
