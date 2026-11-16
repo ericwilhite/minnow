@@ -7,6 +7,14 @@
  * their layout by exact magic. Root slots carry a pre-fence reader/manifest barrier. An unknown,
  * checksummed slot is not an empty/torn slot. Reserved masks enumerate every permitted bit;
  * writers emit zero for the remainder, readers refuse it. Scratch/transport are not durable.
+ *
+ * PC2: compatibility belongs to the outer gates, not lazy nested decoders. A writer adding a
+ * nested tag/encoding must raise minimum reader, and minimum writer if an older writer cannot
+ * fully rewrite it, durably BEFORE feature bytes enter WAL/data. Under supported gates an
+ * unknown nested tag is corruption: refuse before consuming it or publishing derived state.
+ * Open validates everything it eagerly reads; it never scans all data pages just to open.
+ * The native vocabulary/profile guard below catches an unassigned vocabulary extension.
+ * The separate minimum-writer slot allocation remains a pre-freeze dependency (B2/B6 seam).
  */
 /** Shared reference-table envelope; the manifest also carries its logical format version10. */
 export const METADATA_ENVELOPE_VERSION = 1;
@@ -732,7 +740,7 @@ export const DURABLE_FORMATS = {
     decoder: "decodePointer",
     state: "implemented",
   },
-  sketch: inherited("pageDirectory", "DistinctSketch.parse", [
+  sketch: inherited("pageDirectory", "DistinctSketch.parse/validateSketch", [
     { name: "precision", offset: 0, width: 1, values: [10] },
     { name: "form", offset: 1, width: 1, values: [0, 1] },
   ]),
@@ -853,6 +861,19 @@ export const DURABLE_FORMATS = {
     decoder: "decodeSnapshotFrame",
     state: "implemented",
   },
+  snapshotCatalog: {
+    magic: 0x54414350,
+    version: 1,
+    versionIn: "header",
+    fields: [magic(0x54414350), version(4, 2), zero(6, 2)],
+    decoder: "write/snapshot-catalog.ts:decodeSnapshotCatalog",
+    state: "implemented",
+  },
+  snapshotSequence: inherited(
+    "snapshotCatalog",
+    "write/snapshot-catalog.ts:decodeSnapshotSequence",
+    [zero(12, 4)],
+  ),
   snapshotColumn: {
     magic: 0x43504e4d,
     version: 1,
@@ -901,6 +922,15 @@ export const RESERVED_MASKS = {
   alignmentPadding: 0,
   scaledFloatPatchReserved: 0,
   runEntry: 1,
+} as const;
+
+/** Conditional reserved fields cannot be unconditional header masks: aux is assigned by
+ * varlen/dictionary/scaled-float/uniform-scale layouts; decimal alone owns directory bit2. */
+export const CONDITIONAL_FORMAT = {
+  unusedPageAux: 0,
+  nondecimalDirectoryFlags: 3,
+  sketchMaximumRank: 33 - DURABLE_CODECS.sketchPrecision,
+  sparseSketchOrder: "strictly-increasing",
 } as const;
 
 export const PAGE_CODEC = {
@@ -977,5 +1007,117 @@ freeze(DURABLE_CODECS);
 freeze(PRIVATE_FORMATS);
 Object.freeze(RUN_CODEC);
 Object.freeze(RESERVED_MASKS);
+Object.freeze(CONDITIONAL_FORMAT);
 Object.freeze(PAGE_CODEC);
 Object.freeze(LARGE_CODEC);
+
+/** An immutable build-time compatibility ledger, not another stored field. Portable snapshot
+ * selectors have their own container/codecSet and do not change the native root profile.
+ * When extending the native vocabulary, add a NEW reader profile: never rewrite an entry
+ * belonging to a released writer. The independent generated test pins the known ledger too.
+ * Profile7 is the initial UNRELEASED binding, aligned to main13c28d1b manifest10/body8;
+ * older development bindings are not supported predecessors (AGENTS.md).
+ */
+export const NATIVE_READER_PROFILES: Readonly<
+  Record<
+    number,
+    {
+      readonly manifest: number;
+      readonly vocabulary: number;
+    }
+  >
+> = Object.freeze({
+  7: Object.freeze({ manifest: 10, vocabulary: 3713904595 }),
+});
+
+function canonicalVocabulary(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalVocabulary).join(",")}]`;
+  if (typeof value === "object" && value !== null)
+    return `{${Object.entries(value)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([key, child]) => `${JSON.stringify(key)}:${canonicalVocabulary(child)}`)
+      .join(",")}}`;
+  return value === undefined ? "null" : JSON.stringify(value);
+}
+
+/** FNV-1a is a source-vocabulary guard, NOT an on-disk checksum or an integrity boundary.
+ * Required catalog field IDs/codecs participate. Read-optional fields need only a writer gate;
+ * their source property names are not durable tags. B6 owns their capability classification. */
+export function nativeVocabularyFingerprint(
+  schemas: Readonly<Record<string, readonly string[]>> = CATALOG_RECORD_SCHEMAS,
+  features: ReadonlyArray<{
+    readonly id: number;
+    readonly section: number;
+  }> = CATALOG_REQUIRED_FEATURES,
+): number {
+  const formats = Object.fromEntries(
+    Object.entries(DURABLE_FORMATS)
+      .filter(([name]) => name !== "indexedDb" && !name.startsWith("snapshot"))
+      .map(([name, format]) => [
+        name,
+        {
+          magic: format.magic,
+          version: format.version,
+          versionIn: format.versionIn,
+          parent: "parent" in format ? format.parent : null,
+          fields: format.fields,
+        },
+      ]),
+  );
+  const codecs = Object.fromEntries(
+    Object.entries(DURABLE_CODECS).filter(
+      ([name]) => !["snapshot", "snapshotValue", "legacySnapshotPrefix", "checksum"].includes(name),
+    ),
+  );
+  const text = canonicalVocabulary({
+    envelope: METADATA_ENVELOPE_VERSION,
+    formats,
+    codecs,
+    catalog: CATALOG_NATIVE_GRAMMAR,
+    records: CATALOG_RECORD_KINDS,
+    features,
+    readerFields: Object.fromEntries(
+      Object.entries(schemas).map(([name, fields]) => [
+        name,
+        fields.flatMap((field, index) =>
+          field.includes("~") && !field.endsWith("!")
+            ? []
+            : [{ id: index + 1, codec: field.slice(field.indexOf(":") + 1) }],
+        ),
+      ]),
+    ),
+    fts: FTS_NATIVE_GRAMMAR,
+    reserved: RESERVED_MASKS,
+    conditional: CONDITIONAL_FORMAT,
+    page: PAGE_CODEC,
+    large: LARGE_CODEC,
+    run: RUN_CODEC,
+    checksum: {
+      blob: DURABLE_CODECS.checksum.blob,
+      seed: DURABLE_CODECS.checksum.blobSeed,
+      slot: DURABLE_CODECS.checksum.nativeSlot,
+    },
+  });
+  let hash = 0x811c9dc5;
+  for (let at = 0; at < text.length; at++) hash = Math.imul(hash ^ text.charCodeAt(at), 0x01000193);
+  return hash >>> 0;
+}
+
+/** Called once at module initialization, before any native storage acquisition. No per-query,
+ * page or row work. Parameters also let the generated law model an unassigned extension. */
+export function requireNativeReaderProfile(
+  reader: number,
+  manifest: number,
+  vocabulary: number,
+): void {
+  const profile = NATIVE_READER_PROFILES[reader];
+  if (profile?.manifest !== manifest || profile.vocabulary !== vocabulary)
+    throw new DurableFormatError(
+      `Native vocabulary ${String(vocabulary)} requires an assigned outer reader profile (reader ${String(reader)}, manifest ${String(manifest)})`,
+    );
+}
+requireNativeReaderProfile(
+  DURABLE_READER_VERSION,
+  MANIFEST_FORMAT_VERSION,
+  nativeVocabularyFingerprint(),
+);

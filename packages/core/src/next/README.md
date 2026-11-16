@@ -244,7 +244,7 @@ Named types accept at most 65,536 labels (the current two-byte native sort rank)
 most 63 UTF8 bytes. A wider type explicitly refuses rather than truncating a sort key.
 SQL's separate statement/token limits also apply.
 Type/generated rewrites, new row constraints during ALTER, and backfills the literal lowerer
-cannot represent remain explicit refusals. Trigger firing and portable catalog adapters are later approved stages; native FTS
+cannot represent remain explicit refusals. Portable catalog/sequence capture is implemented below; trigger/FTS snapshot reconstruction still refuses explicitly. Native FTS
 scan/definitions are integrated, while its durable postings publication remains separate. No released next/ format exists yet; this is not freeze readiness.
 
 ### Commit encoding under the cap
@@ -446,7 +446,7 @@ Raw pages, columns and run parts inherit their directory, body or manifest versi
 Unknown versions, tags and reserved bits produce a typed `MINNOW_` refusal. An intact
 unsupported native header never means an empty store. Checksum-invalid slots still follow
 ordinary dual-slot recovery. Private scratch journals and spill encodings are listed separately;
-they are not recovery authorities. Snapshot entries are design reservations, with no loader yet.
+they are not recovery authorities. Portable snapshot1 has its own container and selectors.
 
 The 16-byte native root header now carries a minimum-reader version and the inner manifest
 format before its opaque payload. Both are checksummed. Acquisition checks both root slots
@@ -459,6 +459,31 @@ Its eleven formerly reserved high bits carry biased selectors: minimum-reader mi
 bits21..23 and manifest-format minus2 in bits24..31. Zero selects reader1/manifest2, so current
 bytes and charges stay unchanged. The first released1.0 writer starts the supported fixture
 and automatic-upgrade chain. The shipped0.x engine is unchanged.
+
+Compatibility belongs to the outer gates. A writer introducing a nested tag or encoding must
+raise minimum reader, and minimum writer when an older writer cannot fully rewrite it, before
+those bytes enter data or WAL. The separate minimum-writer selector remains a freeze dependency;
+the current header above carries only minimum reader. `NATIVE_READER_PROFILES` binds the native
+registry vocabulary to that reader selector, once at module initialization. It adds no stored
+field, and does no per-query/page/row work. A registry vocabulary extension without an assigned
+profile refuses before storage acquisition. The guard cannot detect a semantic reinterpretation
+of an unchanged tag; that still requires format review and supported-writer fixture evidence.
+
+Under supported outer gates, an unknown nested tag is corruption. Open fully validates what it
+eagerly reads (root, manifest, catalog and WAL tail), while data pages remain lazy. A consuming
+query, merge, staged checkpoint fold, export or index rebuild must refuse typed before using a
+bad value or publishing derived state. Failure preserves the old root/WAL; opening must not scan
+the entire database just to look for corrupt data pages. A quiet checkpoint and an index-run
+merge need not read unrelated column pages. Generated native corruption cases test the actual
+consuming paths, with all containing checksums valid and explicit root/WAL/reopen witnesses.
+
+Page aux is reserved-zero except where the active layout assigns a byte count, dictionary code,
+scale or exponent. Nondecimal directories cannot claim decimal specials. HLL dense registers
+are 0..23; sparse entries have ranks 1..23 and strictly increasing unique register IDs. These
+checks run during the existing parse/copy loop. Scalar payloads beneath NULLs remain don't-care;
+sparse versus dense HLL is a packing choice, so both valid forms are readable at any density.
+Directory reads validate HLL bodies without allocating registers. Planning does not currently
+use their estimates.
 
 Group deletion bitmaps inherit the enclosing group-page version. They store exactly
 `ceil(rowCount / 32)` little-endian u32 words, with unused high bits zero. Cache-hit and
@@ -3741,7 +3766,7 @@ replaces the one-entry dictionary. This bounded dictionary keeps strings as byte
 large entries across1MiB frame boundaries. Column framing declares and verifies total encoded bytes.
 The exporter holds one1MiB payload window, small fixed scratch and one column reader; buffers
 for frames, pages and retained dictionary/metadata borrows remain charged separately.
-Catalog capture/sequence scope and native load/publication composition are subsequent stages.
+Portable catalog/sequence capture and native load/publication composition are described below.
 
 Stream writers validate the16-byte identity and safe-integer LSN before charging or cloning them.
 A failing source iterator's `return()` cannot replace the primary typed legacy/format/cancel refusal;
@@ -4253,3 +4278,127 @@ Native command records keep independent accepted-row checkpoints for uniqueness,
 original follow-input preparation and reference checks. Completing one phase cannot
 suppress another phase or later writes on the same token. This is bookkeeping for
 the guarded provider; the follow preparation/action scheduler is not enabled here.
+
+### Portable snapshot load
+
+The imported manifest uses canonical empty native FTS state (`checkpoint: null`, `staged: null`):
+portable scope refuses FTS definitions. Complete-generation retirement consumes the old R25
+inventory, including its FTS journal and payload extents, exactly once. Those bytes stay live
+while the previous root reaches them, then retire after the next publication. No old FTS state
+is carried into reused table IDs in the imported catalog.
+
+Generated native histories cut every physical replacement-publication step with checkpoint
+and committed staged FTS state present. They reopen before retry, prove old payload bytes or
+complete canonical replacement, then drain both roots and check exact-once release and zero charges.
+
+`write/snapshot-load.ts` implements the internal portable native loader. Its target factory must hold
+an exclusive, recovered and settled owner with no active writer/maintenance, and report logical
+emptiness and the actual last LSN. Replacement is explicit. Header and catalog checks precede
+target acquisition. Verified portable bytes are staged in writer-owned extents, reconstructed
+as native chunks with common row boundaries, then discarded. Frames, row coordinates, parts,
+metadata descriptors and codecs are charged before allocation. A complete native root with a
+fresh log incarnation is published once, only after footer, CRCs, counts and physical EOF.
+An interrupted pre-publication load discards staging; retry starts from byte0. Publication
+rejection is indeterminate: close/reopen and inspect the native root, never free data it may
+reach. Old generations remain under the usual two-root/pin rules, and quota never truncates
+the old root/log to make room. Callers reopen the ordinary write path after publication.
+
+Portable catalog1 uses a24-byte PCAT header: magic, u16 version1, u16 reserved0,
+u53 common MCAT length and u53 sequence-horizon count. The complete native MCAT stream
+follows. Each horizon has u53 sequence ID, u32 decimal byte length, u32 reserved0 and canonical
+ASCII decimal (`0` or an optional minus followed by nonzero-leading digits). Horizons match
+every sequence in catalog declaration order. Missing/duplicate/unknown IDs, noncanonical
+numbers, reserved bits, versions, lengths and trailing bytes refuse before target acquisition.
+The central registry covers both objects; no native catalog tags or stored versions change.
+
+`write/snapshot-capture.ts:exportSnapshot` captures the committed pin, immutable catalog and
+read-only sequence horizons synchronously before its first await. Output/cancel/error closes
+the catalog encoder and returns every capture charge. Later reservations, setval and owner
+checkpoints cannot change the archive's restart horizons. Loading writes those horizons into
+the new native root; unused reservations may be skipped, and ordinary sequence allocation
+continues after load/reopen. Definitions retain ownership, increment, bounds and CYCLE semantics.
+Sequences are nontransactional: capture includes already-emitted reservations newer than a
+strict row pin's durable LSN. The row snapshot never filters sequence restart state.
+A strict DROP retains its reservation history until the DROP is durable, because a pin may
+still contain the old definition. New allocations already use the current catalog and refuse
+that dropped sequence. Once durable, its retained state is reclaimed.
+
+Catalog validation reuses the full native `Catalog.fromStored` checks before target acquisition:
+names/IDs, safe integer ranges, every counter floor, references, typed missing lanes and native
+expression metadata. Views and missing/backfill vectors are preserved through MCAT/MCHG and
+MCRT publication. This loader still has typed TODO refusals for CHECK, trigger/FTS,
+managed objects and closed text sets until their offline validation/reconstruction is wired.
+It never drops those declarations. Required MCAT features refuse; optional display extensions
+follow native preservation rules. The encoded catalog copies and full decoded graph are
+charged; encoded copies are dropped before target acquisition. The graph must fit the admitted
+working step, not an arbitrary1MiB catalog cap. Table rows remain streamed in bounded blocks.
+This is an unreleased internal interface, not a public owner command or frozen format.
+
+`write/snapshot-index.ts` reconstructs primary, unique, secondary and FK-supporting runs from
+validated logical rows. It decodes only the current index's columns into reusable scalar
+buffers, bounds its sorted delta at256KiB and keeps at most four charged staging-part leases.
+A denied scalar read drops reconstructible leases before retry; mandatory failures unwind the
+whole admitted load. Native semantic key limits and long-key encoding2 apply. Invalid nonunique
+index definitions remain invalid with empty physical runs, preserving ordinary scan fallback.
+
+Online merges page one continuation piece per sorted input through `mergeSortedRuns`; they
+reuse the ordinary merge encoder and funded output-boundary ownership. No complete input
+index or unbounded probe-result list is retained. Final native RunRef descriptors remain charged
+and subject to the existing manifest capacity. Completed intermediate extents are discarded.
+UNIQUE/PRIMARY keys are checked in full byte order across all output pieces. Enforced FKs use
+private sorted scratch runs and a bounded merge join against each rebuilt parent unique index.
+NULL references skip; explicit FK action modes remain in the catalog. Scratch checks use the
+parent's key policy, including when the child's smaller supporting index was invalidated.
+All FK scratch is aborted before the final native extent inventory and single root publication.
+A checksum-valid constraint violation, cancellation or quota failure cannot publish a partial
+result or replace the old root. Import copies values and never fires defaults, generated rules,
+triggers or sequence allocation. CHECK/trigger/FTS/managed/closed-set refusals remain release
+scope blockers; this implementation makes no native import throughput or size claim.
+
+Complete snapshot replacement borrows the extent space's immutable, disk-backed current-root
+inventory as retirement claims. It does not collect old extents in a JavaScript Set or array.
+The ordinary exact retirement proof, two-generation delay and snapshot pins still apply;
+replacing a larger old database therefore needs no per-old-extent resident load allocation.
+
+The internal loader accepts an immutable `ReplayableSnapshotInput` (exact offset reads) and the
+owner's real governor. It admits a complete working step before retaining input. A mandatory
+allocation shortfall discards the unpublished attempt and releases its input, staging and owner
+before a cancellable admission wait, then replays from offset zero. Only a required step above
+the cap is `53200`; optional writer buffers still fall back to existing bounded slabs. The target
+factory uses prepaid owner resources and must not wait for admission while inputs are retained.
+An opener queued during a discarded attempt may see the old generation before retry completes.
+It never sees a partial new generation. One-shot sources spool at the owner edge through
+`spoolSnapshotInput` into an exclusive scratch reservation, then follow the same loader path.
+The owner declares the maximum borrowed chunk capacity; the copy step is admitted before pulling
+it. The spool handle stays charged until `close()`, which releases only its own scratch range.
+
+Portable load validates structured value payloads before reconstructing a native group. Array
+version/type/dimensions, null bitmap padding, scalar ranges and internal element lengths must
+be valid, not merely checksummed. JSON must be complete UTF-8 JSON. JSONB additionally
+checks native Unicode pairing/NUL and numeric exponent, display-scale and precision limits;
+plain JSON keeps its own escape/number grammar. Text must be valid UTF-8
+within its declared length, and enum bytes must name a declared label. Validation streams from
+private staging in bounded windows without constructing an array/JSON value graph. Array
+NUMERIC work is bounded by the supported precision; JSON nesting state grows only with depth
+and is charged, including resize overlap. Admission and cancellation follow the same replay path.
+
+Replay retries retain only the furthest consumed offset and a constant-size streaming digest,
+not source bytes. Before parsing a replay, a charged 64KiB window rechecks that entire prefix;
+normal pulling checks the same boundary again before advancing it. A changed length, short
+prefix read or digest mismatch refuses with `MINNOW_SNAPSHOT_SOURCE_CHANGED` and no publication.
+The digest has two 32-bit mixing lanes and detects accidental source changes; it is not an
+adversarial integrity/authentication guarantee. The source must still honor immutable exact
+reads. This check also applies to owner-spooled input. Cancellation drains started reads and
+returns verification scratch before admission retries.
+
+`Sequences.capture(definitions, budget)` is the stage4 read-only restart-horizon primitive.
+It charges its immutable result before allocation and runs synchronously. Unlike checkpoint,
+it never filters or prunes reservation history or logs a new reservation. Export captures the
+latest logged/restored horizon of each pinned definition, including reservations beyond the
+row snapshot's durable LSN. Values already handed out must never be reused by a loaded copy.
+Export must capture it in the
+same synchronous call as its committed pin, before awaiting output or a catalog producer.
+An untouched sequence captures its configured start; restored and setval horizons retain their
+exact bigint values. The result stays charged until its idempotent `release()`.
+Catalog lanes and logged changes use the common binary MCAT/MCHG codecs; stage4 does not add
+a parallel tagged-JSON grammar.

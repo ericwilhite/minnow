@@ -2029,6 +2029,13 @@ metadata faults, cancellation, native root copies and snapshot charges have sepa
 These are managed-buffer bounds; opaque native IndexedDB memory still needs Gate D browser
 measurement.
 
+The rebuild's portable-load histories replace targets holding real FTS checkpoint journals,
+committed staged preparations, document pages, terms and postings. They interrupt every
+physical publication step, reopen to either intact old rows and FTS payloads or a complete
+replacement with empty native FTS state, then retry. Old FTS extents must retire exactly once
+and all governor charges must return. These tests use the simulated honest-flush disk;
+they do not replace browser power-loss or quota testing.
+
 The owner-ready campaign accepts `MINNOW_OWNER_REOPEN_SAMPLES=6` for six wall and six
 separate CPU samples per dataset/backend. It retains each sample and its before/after host
 load and CPU-pressure snapshot, including slow observations. Private metadata read bytes are
@@ -2378,13 +2385,19 @@ Byte slicing is restricted to key-bearing input. A large unindexed payload keeps
 admission and publication boundaries; the bounded memory-read campaign checks its original
 logical prefixes without changing its fixture or expectations.
 
-The long-key registry integration requires reader version 2 in the outer root-slot header
-and manifest version 3. It registers inline/overflow runs, pointer and chunk descriptors,
+The long-key registry integration first introduced reader version 2 in the outer root-slot
+header and manifest version 3; later native features advance those selectors together with
+the closed vocabulary registry. It registers inline/overflow runs, pointer and chunk descriptors,
 the checksummed key directory, raw payload references and the extended-block bit. The
 independent persistence inventory includes these references. `durable-long-keys.test.ts`
 checks WAL-only nonunique invalidation at 13,107 UTF-16 units and an independently bundled
-reader with capability 1: OPFS and IndexedDB must refuse before native writes. The strict
-catalog-operation registry admits `invalidateIndex` while still rejecting unknown operations.
+reader with capability 1: OPFS and IndexedDB must refuse before native writes. That synthetic
+build has a profile for its own codec vocabulary, accepts its own root header, and uses the
+same manifest version as the current build, isolating reader-capability refusal. A separate
+incoherent bundle must fail module initialization; production profile validation stays strict.
+Both native root slots and unchanged IDB root/epoch bytes are checked. This is a gate test,
+not a historical predecessor or upgrade fixture. The strict catalog-operation registry admits
+`invalidateIndex` while still rejecting unknown operations.
 
 Archived development directory roots are refused by the outer durable-format gate with
 `MINNOW_FORMAT_UNSUPPORTED`, before the inner manifest decoder runs. The directory-refusal

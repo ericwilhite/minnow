@@ -2927,7 +2927,21 @@ export class WritePathImpl implements WritePath, EngineHooks {
             );
         }
         {
-          if (change.op === "dropSequence") this.sequences.drop(change.sequenceId);
+          if (change.op === "dropSequence") {
+            // A strict pin can still contain the old definition until this DROP is durable.
+            // Its nontransactional capture must retain the already-emitted horizon meanwhile.
+            const sequenceId = change.sequenceId;
+            const wait = this.durability === "strict" ? this.#appender.durable(lsn) : null;
+            if (wait === null) this.sequences.drop(sequenceId);
+            else
+              void wait.then(
+                () => {
+                  if (this.#catalog.sequence(sequenceId) === undefined)
+                    this.sequences.drop(sequenceId);
+                },
+                () => undefined,
+              );
+          }
           if (
             change.op === "createIndex" &&
             this.#catalog

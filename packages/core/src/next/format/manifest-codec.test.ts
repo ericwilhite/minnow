@@ -759,7 +759,7 @@ describe("manifest codec rules", () => {
     expect(budget.held).toBe(0);
   });
 
-  it("refuses a root written by a newer format", () => {
+  it("refuses an unknown inner manifest version without guessing its writer", () => {
     const owner = big;
     const root: ManifestRoot = {
       formatVersion: MANIFEST_FORMAT_VERSION + 1,
@@ -776,14 +776,30 @@ describe("manifest codec rules", () => {
       clients: [],
       extentList: [],
     };
-    expect(() => decodeManifestRoot(encodeManifestRoot(root), tracked())).toThrow(/newer/);
+    const budget = tracked();
+    expect(() => decodeManifestRoot(encodeManifestRoot(root), budget)).toThrow(
+      expect.objectContaining({
+        code: "MINNOW_UNSUPPORTED_ENCODING",
+        format: "manifest",
+        version: MANIFEST_FORMAT_VERSION + 1,
+        supported: [MANIFEST_FORMAT_VERSION],
+      }),
+    );
+    expect(budget.held).toBe(0);
   });
 
   it("refuses the frozen unpublished R25 development root without upgrading", () => {
     const budget = tracked();
     expect(() =>
       decodeManifestRoot(Uint8Array.from(Buffer.from(frozenR25.rootHex, "hex")), budget),
-    ).toThrow(/unpublished development/);
+    ).toThrow(
+      expect.objectContaining({
+        code: "MINNOW_UNSUPPORTED_ENCODING",
+        format: "manifest",
+        version: 2,
+        supported: [MANIFEST_FORMAT_VERSION],
+      }),
+    );
     expect(budget.held).toBe(0);
   });
 
@@ -805,7 +821,12 @@ describe("manifest codec rules", () => {
     };
     const budget = tracked();
     expect(() => decodeManifestRoot(encodeManifestRoot(root), budget)).toThrow(
-      /unpublished development/,
+      expect.objectContaining({
+        code: "MINNOW_UNSUPPORTED_ENCODING",
+        format: "manifest",
+        version: 1,
+        supported: [MANIFEST_FORMAT_VERSION],
+      }),
     );
     expect(budget.held).toBe(0);
   });

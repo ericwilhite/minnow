@@ -37,6 +37,9 @@ export const DIRECTORY_REFUSAL_REACH = [
   "packed-4099",
 ] as const;
 export const DURABLE_LONG_KEY_REACH = [
+  "coherent older profile loaded",
+  "older own floor accepted",
+  "same manifest reader refusal",
   "WAL-only invalidation",
   "replayed invalidation",
   "memory",
@@ -60,6 +63,8 @@ export const DURABLE_REGISTRY_REACH = [
   "snapshotFrame",
   "snapshotFooter",
   "snapshotColumn",
+  "snapshotCatalog",
+  "snapshotSequence",
   "rootSlot",
   "epochSlot",
   "logHeader",
@@ -8657,4 +8662,482 @@ export const REGISTRY_THREE_CHECKPOINT_REACH = [
   "no completed-prefix replay",
   "fixed metadata",
   "zero ownership",
+] as const;
+
+export const SNAPSHOT_LOAD_REACH = [
+  "interrupted prefix",
+  "old target intact",
+  "retry complete",
+  "native reopen",
+  "continued writes",
+  "quota safe",
+] as const;
+
+export const SNAPSHOT_LOAD_FAULT_REACH = [
+  "quota",
+  "before publication",
+  "after publication",
+  "cancel",
+] as const;
+
+export const SNAPSHOT_NATIVE_LAYOUT_REACH = [
+  "sparse nulls",
+  "all valid",
+  "all scalar and byte layouts",
+] as const;
+
+export const SNAPSHOT_LOAD_OPEN_REACH = ["wait until discard", "wait until publication"] as const;
+
+export const SNAPSHOT_CATALOG_REFUSAL_REACH = [
+  "duplicate table name",
+  "counter floor",
+  "nextColumnId floor",
+  "nextIndexId floor",
+  "nextConstraintId floor",
+  "nextSequenceId floor",
+  "nextViewId floor",
+  "nextTypeId floor",
+  "nextFtsId floor",
+  "nextTriggerId floor",
+  "duplicate column id",
+  "unsafe id",
+  "unresolved reference",
+  "unsupported field",
+  "unsupported trigger",
+  "unsupported fts",
+] as const;
+
+export const SNAPSHOT_RETIREMENT_REACH = [
+  "small old inventory",
+  "large old inventory",
+  "constant replacement workspace",
+] as const;
+
+export const SNAPSHOT_RETIRE_CURRENT_REACH = [
+  "sharing refused",
+  "mixed claims refused",
+  "cancel intact",
+  "pin survives replacement",
+  "exact retired inventory",
+] as const;
+
+export const SNAPSHOT_ADMISSION_REACH = [
+  "unwind before wait",
+  "cancel queued",
+  "release and replay",
+  "only above cap refused",
+  "one shot via spool",
+] as const;
+
+export const SNAPSHOT_STRUCTURED_REACH = [
+  "array version",
+  "array element tag",
+  "array dimensions",
+  "array flags",
+  "array dimension length",
+  "array lower bound",
+  "array element length",
+  "array truncated element",
+  "array null tail",
+  "array boolean",
+  "array decimal special",
+  "array decimal scale",
+  "array decimal overflow",
+  "array unsupported element",
+  "json grammar",
+  "json utf8",
+  "enum label",
+  "text utf8",
+  "text length",
+  "text bom length",
+  "jsonb nul",
+  "jsonb high surrogate",
+  "jsonb low surrogate",
+  "jsonb surrogate mismatch",
+  "jsonb exponent",
+  "jsonb scale",
+  "jsonb precision",
+] as const;
+
+export const SNAPSHOT_LOAD_ROOT_REACH = [
+  "oversized native root",
+  "same governor handoff",
+  "zero after reopen",
+] as const;
+
+export const SNAPSHOT_JSON_SEMANTICS_REACH = [
+  "plain JSON escapes",
+  "surrogate across window",
+  "surrogate pair across window",
+  "JSONB exponent boundary",
+  "JSONB scale boundary",
+  "JSONB precision boundary",
+  "long zero exponent",
+] as const;
+
+export const SNAPSHOT_SOURCE_STABILITY_REACH = [
+  "valid archive",
+  "single bit",
+  "truncated",
+  "spool",
+  "stable retry",
+] as const;
+
+export const SNAPSHOT_SEQUENCE_CAPTURE_REACH = [
+  "ascending",
+  "descending",
+  "cycling",
+  "setval",
+  "restored",
+  "uninitialized",
+  "read only",
+  "checkpoint history preserved",
+  "released",
+  "denied",
+] as const;
+
+export const SNAPSHOT_CATALOG_SCOPE_REACH = [
+  "bigint horizons",
+  "typed missing",
+  "logged typed lanes",
+  "strict horizon count",
+  "strict horizon id",
+  "canonical decimal",
+  "sequence reserved",
+  "catalog reserved",
+  "unknown version",
+  "trailing bytes",
+  "before first await",
+  "continued sequence",
+  "cancel release",
+] as const;
+
+export const SNAPSHOT_SEQUENCE_LOAD_REACH = [
+  "owned identity",
+  "ascending",
+  "descending",
+  "pin time",
+  "continue writing",
+  "reopen",
+  "horizon refusal",
+  "sequence counter floor",
+  "sequence owner reference",
+  "identity reference",
+  "sequence name uniqueness",
+] as const;
+
+export const SNAPSHOT_INDEX_REACH = [
+  "inline keys",
+  "overflow keys",
+  "multi block merge",
+  "native probes",
+  "continue reopen",
+  "null FK",
+  "FK modes",
+  "unique refusal",
+  "FK refusal",
+] as const;
+
+export const SNAPSHOT_SORTED_MERGE_REACH = [
+  "one piece",
+  "many pieces",
+  "ordered complete output",
+  "blocked cancel",
+  "no resident blooms",
+  "fixed working bound",
+] as const;
+
+export const SNAPSHOT_INDEX_FAILURE_REACH = [
+  "partial native output",
+  "quota",
+  "cancel",
+  "old root and rows",
+] as const;
+
+export const SNAPSHOT_INDEX_SCOPE_REACH = [
+  "invalid unique",
+  "orphan primary",
+  "scalar composite policy",
+] as const;
+export const SNAPSHOT_LONG_FK_REACH = [
+  "long parent scalar",
+  "invalid support retained",
+  "FK actions retained",
+  "continued FK enforcement",
+] as const;
+
+export const SNAPSHOT_INDEX_LEASE_REACH = [
+  "real grant pressure",
+  "drop and retry",
+  "four lease bound",
+  "zero after close",
+] as const;
+
+export const SNAPSHOT_SEQUENCE_DURABILITY_REACH = [
+  "emitted ahead of durable",
+  "durable ahead of emitted",
+  "restored horizon",
+  "ascending",
+  "descending",
+  "single emitted value",
+  "multiple emitted values",
+  "pin before await",
+  "ordinary load nextval",
+  "ordinary reopen nextval",
+  "read only allocation",
+  "charges released",
+] as const;
+
+export const SNAPSHOT_SEQUENCE_DROP_REACH = [
+  "pending DROP in strict pin",
+  "capture before await",
+  "ordinary load advances past emitted",
+  "ordinary reopen advances",
+  "reclaimed after durability",
+  "ascending",
+  "descending",
+  "one emission",
+  "many emissions",
+  "zero charges",
+] as const;
+
+export const SNAPSHOT_FTS_RETIREMENT_REACH = [
+  "old FTS inventory exactly once",
+  "canonical empty FTS state",
+  "previous root FTS remains readable",
+  "old FTS physical retirement exactly once",
+  "ordinary reopen and continued write",
+  "one checkpoint",
+  "several checkpoints",
+  "zero charges",
+] as const;
+
+export const PAGE_CORRUPTION_REACH = [
+  "plain",
+  "constant",
+  "bitmap",
+  "for",
+  "dictionary",
+  "scaled",
+  "gzip",
+  "encoding",
+  "value tag",
+  "reserved",
+  "unused aux",
+  "directory flags",
+  "all valid",
+  "sparse NULLs",
+  "checksum-valid refusal",
+  "root and WAL unchanged",
+  "reopenable",
+  "charges released",
+] as const;
+
+export const CANONICAL_WRITER_REACH = [
+  "stored all-NULL constant",
+  "stored validity bitmap",
+  "stored safe integer lane",
+  "stored zero-width delta",
+  "stored mixed scales and specials",
+  "stored uniform scale",
+  "stored out-of-line pointers",
+  "stored bool bitmap",
+  "stored plain i32",
+  "stored plain f32",
+  "stored plain f64",
+  "stored plain decimal128",
+  "stored plain fixed16",
+  "stored safe interval",
+  "stored wide interval",
+  "stored varlen offsets16",
+  "stored varlen offsets32",
+  "stored FOR i32",
+  "stored wide FOR i64",
+  "stored safe FOR i64",
+  "stored wide FOR decimal64",
+  "stored constant i32",
+  "stored constant varlen",
+  "stored constant dictionary code",
+  "stored varlen dictionary codes",
+  "stored fixed16 dictionary codes",
+  "stored scaled float without patches",
+  "stored scaled float with raw patch",
+  "stored gzip page",
+  "stored dictionary fixed16 payload",
+  "stored dictionary offsets32 payload",
+] as const;
+
+export const CANONICAL_REFUSAL_REACH = [
+  "allocation-free HLL validation",
+  "NULL scalar payload",
+  "unused aux",
+  "all-NULL aux",
+  "nondecimal specials",
+  "duplicate sparse",
+  "unordered sparse",
+  "dense ranks",
+  "dense at sparse density",
+  "sparse at dense density",
+  "writer HLL bytes",
+] as const;
+
+export const NATIVE_PROFILE_REACH = [
+  "required catalog field",
+  "read-optional field",
+  "catalog wire type",
+  "required feature",
+  "assigned vocabulary",
+  "unassigned nested vocabulary",
+  "unassigned reader",
+  "manifest mismatch",
+] as const;
+
+export const DURABLE_OCTET_REACH = [
+  "every unknown octet",
+  "page encodings",
+  "page value tags",
+  "metadata versions",
+  "outer selectors",
+  "other nested selectors",
+] as const;
+
+export const DURABLE_EMBEDDED_OCTET_REACH = [
+  "row-id kind",
+  "physical type",
+  "statistic",
+  "physical flags and widths",
+  "nested physical tag",
+  "directory page encoding",
+  "array decimal special",
+  "run encoding",
+] as const;
+
+export const CORRUPT_CHECKPOINT_REACH = [
+  "checkpoint consumes staged root",
+  "typed corruption",
+  "root and WAL unchanged",
+  "reopenable",
+  "charges released",
+] as const;
+
+export const CORRUPT_MERGE_REACH = [
+  "inline run",
+  "overflow run",
+  "merge consumes damaged block",
+  "partial output discarded",
+  "flag bit1",
+  "flag bit2",
+  "flag bit3",
+  "flag bit4",
+  "flag bit5",
+  "flag bit6",
+  "flag bit7",
+  "typed corruption",
+  "root and WAL unchanged",
+  "reopenable",
+  "charges released",
+] as const;
+
+export const STRUCTURED_PARTS_REACH = [
+  "all array scalar kinds",
+  "array NULL bitmap",
+  "JSON",
+  "JSONB",
+  "internal corruption",
+  "funding before producer",
+  "cancellation releases producer",
+  "borrowed parts copied before advance",
+  "charges released",
+  "large bounded bitmap",
+] as const;
+
+export const STRUCTURED_EXPORT_REACH = [
+  "version",
+  "element tag",
+  "dimensions",
+  "flags",
+  "element length",
+  "decimal special",
+  "real stored source",
+  "typed query refusal",
+  "typed export refusal",
+  "no footer",
+  "root and WAL unchanged",
+  "reopenable",
+  "charges released",
+] as const;
+
+export const NATIVE_HLL_REACH = [
+  "dense rank",
+  "sparse duplicate",
+  "sparse order",
+  "real stored source",
+  "checksums valid",
+  "typed first-read refusal",
+  "root and WAL unchanged",
+  "reopenable",
+  "charges released",
+] as const;
+
+export const CORRUPT_MERGE_STRUCTURE_REACH = [
+  "short block",
+  "zero block count",
+  "offset table bounds",
+  "block byte cap",
+  "offset tiling",
+  "offset outside block",
+  "truncated key length",
+  "nonminimal key length",
+  "continued key length",
+  "key width cap",
+  "entry bounds",
+  "trailing block bytes",
+  "checksums valid",
+  "merge consumes damaged block",
+  "partial output discarded",
+  "typed corruption",
+  "root and WAL unchanged",
+  "reopenable",
+  "charges released",
+] as const;
+
+export const STRUCTURED_BOUNDARIES_REACH = [
+  "JSONB surrogate and NUL boundaries",
+  "JSONB integer precision boundary",
+  "JSONB exponent boundary",
+  "JSONB scale boundary",
+  "JSON syntax boundaries",
+  "array boolean boundaries",
+  "array TIME lower and upper bounds",
+  "array SMALLINT lower and upper bounds",
+  "text code points and exact enum labels",
+  "fatal UTF-8 in JSON and array text",
+  "array NUMERIC scale and special boundaries",
+  "array NUMERIC signed precision boundary",
+  "array NUMERIC redundant sign extension",
+  "borrowed fragments and zero remaining charge",
+] as const;
+
+export const SNAPSHOT_VALIDATOR_LEASE_REACH = [
+  "fragmented accepted values",
+  "fragmented refused values",
+  "leases returned before grant close",
+  "parser funded before producer entry",
+  "cancel after lease acquisition",
+] as const;
+
+export const SNAPSHOT_FTS_CUT_REACH = [
+  "checkpoint target",
+  "checkpoint and staged target",
+  "document and term payloads",
+  "every physical publication step",
+  "one power loss per cut",
+  "old target recovered",
+  "complete replacement recovered",
+  "old history and payload intact",
+  "canonical empty replacement",
+  "retry after interruption",
+  "old FTS retirement exactly once",
+  "ordinary reopen",
+  "zero charges",
 ] as const;

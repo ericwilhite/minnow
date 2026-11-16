@@ -1,5 +1,11 @@
 import { encodeFtsJournal, decodeFtsJournal } from "../format/fts-journal.js";
 import { encodeFts, decodeFts, type FtsValues } from "../format/fts-codec.js";
+import {
+  encodeSnapshotCatalogHeader,
+  decodeSnapshotCatalog,
+  encodeSnapshotSequence,
+  decodeSnapshotSequence,
+} from "../write/snapshot-catalog.js";
 import { ftsSemantics } from "../fts-config.js";
 import {
   encodeCatalogStream,
@@ -44,6 +50,8 @@ import {
   DURABLE_CATALOG_REACH,
   DURABLE_READ_REACH,
   DURABLE_STARTUP_REACH,
+  DURABLE_OCTET_REACH,
+  DURABLE_EMBEDDED_OCTET_REACH,
 } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { MemoryOpfs } from "../../testing/opfs-shim.js";
@@ -54,11 +62,12 @@ import {
   type DurableFormatName,
   type FormatField,
 } from "../durable-format.js";
+import { readRunEncoding } from "../format/encoding.js";
 import { ByteWriter as MetadataWriter } from "../format/bytes.js";
 import { readKeyPointer, writeKeyPointer } from "../format/key-pointer.js";
 import { readRunKey, writeRunKey } from "../format/run-key.js";
 import { OverflowKeys, overflowKeyBytes } from "../write/overflow-keys.js";
-import { ByteReader as MetadataReader } from "../format/bytes.js";
+import { ByteReader as MetadataReader, ManifestCorruptionError } from "../format/bytes.js";
 import { decodeDeletionBitmap } from "../format/deletion-bitmap.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { decodeRootSlot, encodeRootSlot } from "../storage/root-slot.js";
@@ -93,7 +102,7 @@ import type { ManifestRoot, GroupRoot, BlobRef, PageEntry } from "../format/mani
 import { parsePage, parseDictionary } from "../page/decode.js";
 import { encodeDirectory, parseDirectory } from "../page/directory.js";
 import { decodePointer, encodePointer, LARGE_VALUE_BYTES } from "../page/large-value.js";
-import { DistinctSketch } from "../page/sketch.js";
+import { DistinctSketch, validateSketch } from "../page/sketch.js";
 import { encodeBody, decodeBody } from "../write/body.js";
 import { encodeColumn, decodeColumn } from "../write/columns.js";
 import { Catalog, decodeLogged, encodeLogged } from "../write/catalog.js";
@@ -487,9 +496,23 @@ function adapters(): Record<Exclude<DurableFormatName, "indexedDb">, Adapter> {
   );
   const journalBytes = journal.bytes.slice();
   journal.close();
+  const nativeCatalog = Catalog.empty().encode(),
+    portableCatalog = new Uint8Array(24 + nativeCatalog.length);
+  encodeSnapshotCatalogHeader(nativeCatalog.length, 0, portableCatalog.subarray(0, 24));
+  portableCatalog.set(nativeCatalog, 24);
+  const sequenceBudget = budget(),
+    encodedSequence = encodeSnapshotSequence(
+      { sequenceId: 1, reservedThrough: -2n },
+      sequenceBudget,
+    ),
+    sequence = encodedSequence.bytes.slice();
+  encodedSequence.close();
+  expect(sequenceBudget.held).toBe(0);
   return {
     ftsJournal: { bytes: journalBytes, decode: parsed(decodeFtsJournal) },
     ...ftsAdapters(),
+    snapshotCatalog: { bytes: portableCatalog, decode: parsed(decodeSnapshotCatalog) },
+    snapshotSequence: { bytes: sequence, decode: parsed(decodeSnapshotSequence) },
     snapshotColumn: {
       bytes: portable,
       decode: (bytes) => decodeSnapshotColumnHeader(integer.type, bytes),
@@ -605,6 +628,7 @@ function adapters(): Record<Exclude<DurableFormatName, "indexedDb">, Adapter> {
     sketch: {
       bytes: new DistinctSketch().serialize(),
       decode: (bytes) => DistinctSketch.parse(bytes),
+      also: [(bytes) => validateSketch(bytes)],
     },
     commitBody: { bytes: encodeBody({ request: null, effects: [] }), decode: decodeBody },
     column: {
@@ -1372,3 +1396,227 @@ for (const seed of seedsFor("next-durable-before-fence", [0xb22f, 0xb230]))
     );
     reach.assertReached();
   });
+
+/** The old generator sampled u8 values. A shuffled exhaustive domain catches holes between
+ * those samples without replacing or shrinking the original seeded populations. */
+for (const seed of seedsFor("next-durable-octets", [0xb2a3, 0xb2a4]))
+  it(`refuses every unknown octet of each registered selector seed ${String(seed)}`, async () => {
+    const reach = createReach("exhaustive durable octets", DURABLE_OCTET_REACH);
+    const all = adapters();
+    await fc.assert(
+      fc.asyncProperty(
+        fc.shuffledSubarray(
+          Array.from({ length: 256 }, (_, value) => value),
+          {
+            minLength: 256,
+            maxLength: 256,
+          },
+        ),
+        async (values) => {
+          reach.beginHistory();
+          let checked = 0;
+          for (const [name, adapter] of Object.entries(all))
+            for (const field of DURABLE_FORMATS[name as keyof typeof all]
+              .fields as readonly FormatField[]) {
+              if (field.width !== 1 || field.values === undefined) continue;
+              for (const value of values) {
+                if (field.values.includes(value)) continue;
+                const bytes = adapter.bytes.slice();
+                bytes[field.offset] = value;
+                adapter.repair?.(bytes);
+                await refused(adapter, bytes, `${name}.${field.name}:${String(value)}`);
+                checked++;
+              }
+              if (name === "page" && field.name === "encoding") reach.reach("page encodings");
+              else if (name === "page" && field.name === "value tag")
+                reach.reach("page value tags");
+              else if (["manifest", "groupRoot", "groupPage", "groupIndex"].includes(name))
+                reach.reach("metadata versions");
+              else if (name === "rootSlot") reach.reach("outer selectors");
+              else reach.reach("other nested selectors");
+            }
+          expect(checked).toBeGreaterThan(7000);
+          reach.reach("every unknown octet");
+        },
+      ),
+      { seed, numRuns: 2 },
+    );
+    reach.assertReached();
+  }, 180_000);
+
+function groupPrefix(bytes: Uint8Array) {
+  const reader = new MetadataReader(bytes);
+  reader.u32();
+  reader.u8();
+  const count = reader.count(2);
+  for (let at = 0; at < count; at++) {
+    reader.uint();
+    reader.uint();
+  }
+  reader.uint();
+  const rowIds = reader.at;
+  expect(reader.u8()).toBe(0);
+  expect(reader.count(1)).toBe(1);
+  return { rowIds, type: reader.at };
+}
+function groupStatistic(bytes: Uint8Array): number {
+  const reader = new MetadataReader(bytes);
+  const prefix = groupPrefix(bytes);
+  reader.at = prefix.type;
+  const tag = reader.u8();
+  if (tag === 2) expect(reader.u8()).toBe(32);
+  else expect(tag).toBe(1);
+  expect(reader.count(1)).toBe(1);
+  reader.uint();
+  reader.uint(); // columnId,typeIndex
+  for (let field = 0; field < 6; field++) reader.uint(); // data, then directory Data
+  reader.u32();
+  reader.uint(); // directory checksum,nullCount
+  return reader.at;
+}
+for (const seed of seedsFor("next-durable-embedded-octets", [0xb2ab, 0xb2ac]))
+  it(`refuses every unknown embedded tag under the supported outer grammar seed ${String(seed)}`, async () => {
+    const reach = createReach("embedded durable octets", DURABLE_EMBEDDED_OCTET_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.shuffledSubarray(
+          Array.from({ length: 256 }, (_, n) => n),
+          { minLength: 256, maxLength: 256 },
+        ),
+        fc.integer({ min: 0, max: 8 }),
+        async (values, depth) => {
+          reach.beginHistory();
+          const column = root.columns[0];
+          if (column === undefined) throw new Error("Missing root column fixture");
+          const unknownBounds = { nullCount: 0, min: null, max: null, dictionarySize: null };
+          // No payload follows these tags: a bogus unknown-as-default decoder must not be
+          // rejected accidentally by an unrelated leftover payload or EOF check.
+          const bytes = encodeGroupRoot({
+              ...root,
+              columns: [{ ...column, type: { kind: "bool" }, statistics: unknownBounds }],
+            }),
+            prefix = groupPrefix(bytes),
+            statistic = groupStatistic(bytes);
+          const view: Adapter = {
+            bytes,
+            decode: parsed(decodeGroupRoot),
+            also: [parsed(tryDecodeGroupRootView)],
+          };
+          await view.decode(bytes, budget());
+          for (const decode of view.also ?? []) await decode(bytes, budget());
+          const mutations: Array<{
+            offset: number;
+            known: readonly number[];
+            label: "row-id kind" | "physical type" | "statistic";
+          }> = [
+            { offset: prefix.rowIds, known: [0, 1], label: "row-id kind" },
+            {
+              offset: prefix.type,
+              known: Array.from({ length: 16 }, (_, i) => i + 1),
+              label: "physical type",
+            },
+            { offset: statistic, known: [0, 1, 2, 3, 4, 5], label: "statistic" },
+          ];
+          for (const mutation of mutations) {
+            for (const value of values)
+              if (!mutation.known.includes(value)) {
+                const changed = bytes.slice();
+                changed[mutation.offset] = value;
+                await refused(view, changed, mutation.label);
+              }
+            reach.reach(mutation.label);
+          }
+          for (const type of [
+            { kind: "json", binary: true },
+            { kind: "timestamp", zoned: true },
+            { kind: "decimal", precision: null, scale: 0 },
+            { kind: "int32", bits: 32 },
+          ] as const) {
+            const encoded = encodeGroupRoot({
+                ...root,
+                columns: [{ ...column, type, statistics: unknownBounds }],
+              }),
+              start = groupPrefix(encoded).type + (type.kind === "decimal" ? 2 : 1);
+            const adapter = {
+              bytes: encoded,
+              decode: parsed(decodeGroupRoot),
+              also: [parsed(tryDecodeGroupRootView)],
+            };
+            await adapter.decode(encoded, budget());
+            const known = type.kind === "int32" ? [16, 32] : [0, 1];
+            for (const value of values)
+              if (!known.includes(value)) {
+                const changed = encoded.slice();
+                changed[start] = value;
+                await refused(adapter, changed, "physical conditional discriminator");
+              }
+          }
+          reach.reach("physical flags and widths");
+          let type: GroupRoot["columns"][number]["type"] = { kind: "bool" };
+          for (let at = 0; at < depth; at++) type = { kind: "array", element: type };
+          const nested = encodeGroupRoot({
+              ...root,
+              columns: [{ ...column, type, statistics: unknownBounds }],
+            }),
+            leaf = groupPrefix(nested).type + depth;
+          for (const value of values)
+            if (value === 0 || value > 16) {
+              const changed = nested.slice();
+              changed[leaf] = value;
+              await refused(
+                {
+                  bytes: nested,
+                  decode: parsed(decodeGroupRoot),
+                  also: [parsed(tryDecodeGroupRootView)],
+                },
+                changed,
+                "nested physical tag",
+              );
+            }
+          reach.reach("nested physical tag");
+          const dir = encodeDirectory(directory);
+          parseDirectory(dir, 4096);
+          // No dictionary: first page record starts20; encoding is its byte24.
+          for (const value of values)
+            if (![1, 2, 3, 4, 5, 6, 129, 130, 131, 132, 133, 134].includes(value)) {
+              const changed = dir.slice();
+              changed[44] = value;
+              await refused(
+                { bytes: dir, decode: (bytes) => parseDirectory(bytes, 4096) },
+                changed,
+                "directory page encoding",
+              );
+            }
+          reach.reach("directory page encoding");
+          const decimal = { kind: "decimal", precision: null, scale: null } as const,
+            array = encodeArrayValue(decimal, {
+              dimensions: [1],
+              lowerBounds: [1],
+              elements: [{ coefficient: 0n, scale: 0, special: "NaN" }],
+            });
+          for (const value of values) {
+            if (value > 3) {
+              const changed = array.slice();
+              changed[12] = value;
+              await refused(
+                { bytes: array, decode: (bytes) => decodeArrayValue(decimal, bytes) },
+                changed,
+                "array decimal special",
+              );
+            }
+            if (value !== 1 && value !== 2) {
+              expect(() => readRunEncoding(value)).toThrow(
+                expect.objectContaining({ code: "MINNOW_UNSUPPORTED_ENCODING" }),
+              );
+              expect(() => readRunEncoding(value)).toThrow(ManifestCorruptionError);
+              expect(() => readRunEncoding(value)).toThrow(/^Unknown run encoding/u);
+            }
+          }
+          reach.reach("array decimal special");
+          reach.reach("run encoding");
+        },
+      ),
+      { seed, numRuns: 2 },
+    );
+    reach.assertReached();
+  }, 180_000);

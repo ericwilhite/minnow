@@ -15,6 +15,8 @@ import {
   type SnapshotWork,
 } from "../format/snapshot.js";
 import { ChunkReader } from "../page/reader.js";
+import { PageCorruptionError } from "../page/format.js";
+import { StructuredValueCorruptionError, validateStructuredParts } from "./structured-value.js";
 import type { ByteBudget } from "../storage/extents.js";
 import { layoutOf, type PhysicalType } from "../types.js";
 import { pauseIfDue, sortInSlices } from "../task.js";
@@ -179,8 +181,8 @@ class Source {
 }
 
 /** Ownership of snapshot transfers to this call, including errors/cancel before the first byte.
- * catalog yields the matching portable catalog1 bytes, borrowed until advance; stage4 captures
- * its catalog/sequence scope at pin time. Output backpressure is sink.write settlement.
+ * catalog yields the matching portable catalog1 bytes, borrowed until advance. exportSnapshot
+ * captures catalog/sequence scope synchronously with its pin. Output backpressure is sink.write settlement.
  */
 export async function exportPinnedSnapshot(
   snapshot: Snapshot,
@@ -336,14 +338,37 @@ export async function exportPinnedSnapshot(
                     record[0] = DURABLE_CODECS.snapshotValue.define;
                     new DataView(record.buffer).setUint32(1, length, true);
                     await append(record.subarray(0, 5));
-                    let copied = 0;
-                    for await (const bytes of source.parts(position)) {
-                      await pace(work);
-                      copied += bytes.length;
-                      await append(bytes);
+                    if (column.type.kind === "bytes") {
+                      let copied = 0;
+                      for await (const bytes of source.parts(position)) {
+                        await pace(work);
+                        copied += bytes.length;
+                        await append(bytes);
+                      }
+                      if (copied !== length)
+                        throw new PageCorruptionError("Pinned value changed its byte length");
+                    } else {
+                      // Native page checks validate the byte layout, not structured varlen bodies.
+                      // Validate while forwarding each borrowed part; an invalid value must never
+                      // produce a complete portable snapshot, even with valid native checksums.
+                      try {
+                        await validateStructuredParts(
+                          column.type,
+                          () => source.parts(position),
+                          length,
+                          {
+                            take: (bytes) => take(budget, bytes),
+                            free: (bytes) => budget.free(bytes),
+                            pace: () => pace(work),
+                          },
+                          append,
+                        );
+                      } catch (error) {
+                        if (error instanceof StructuredValueCorruptionError)
+                          throw new PageCorruptionError(error.message);
+                        throw error;
+                      }
                     }
-                    if (copied !== length)
-                      throw new SnapshotFormatError("Pinned value changed its byte length");
                     record.fill(0, 0, 5);
                     record[0] = DURABLE_CODECS.snapshotValue.reference;
                     await append(record.subarray(0, 5));

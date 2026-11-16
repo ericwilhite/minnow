@@ -13,6 +13,8 @@
  *   consuming anything; a cycling one wraps to its start of range (PostgreSQL: min for ascending,
  *   max for descending).
  */
+import type { ByteBudget } from "../storage/extents.js";
+import { SnapshotBudgetError } from "../format/snapshot.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { SequenceExhaustedError, type SequenceAccess } from "../access/write-path.js";
 import type { SequenceDef } from "../access/catalog.js";
@@ -114,6 +116,43 @@ export class Sequences implements SequenceAccess {
       if (keepFrom > 0) list.splice(0, keepFrom);
     }
     return out;
+  }
+
+  /** Readonly current horizon capture, synchronously with an export pin BEFORE any await.
+   * Sequences are nontransactional: a value can already be emitted beyond a strict row pin's
+   * durable LSN. Unlike checkpoint(lsn), capture never filters or prunes reservation history.
+   * The latest reservation/restoration covers every emitted value; unused credit may skip. */
+  capture(
+    definitions: readonly SequenceDef[],
+    budget: ByteBudget,
+  ): {
+    readonly value: ReadonlyArray<{ sequenceId: number; reservedThrough: bigint }>;
+    release(): void;
+  } {
+    const charge = 512 + definitions.length * 128;
+    if (!budget.allocate(charge)) throw new SnapshotBudgetError(charge);
+    try {
+      const value = Object.freeze(
+        definitions.map((def) =>
+          Object.freeze({
+            sequenceId: def.id,
+            reservedThrough: this.#history.get(def.id)?.at(-1)?.through ?? def.start,
+          }),
+        ),
+      );
+      let released = false;
+      return {
+        value,
+        release() {
+          if (released) return;
+          released = true;
+          budget.free(charge);
+        },
+      };
+    } catch (error) {
+      budget.free(charge);
+      throw error;
+    }
   }
 
   /** Forgets a dropped sequence. */

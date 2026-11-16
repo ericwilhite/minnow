@@ -70,6 +70,19 @@ format change must preserve ordinary automatic open/load with frozen older-write
 continued writes and reopen, interruption/retry, corruption refusal, concurrent openers and
 older-writer refusal. Unreleased rebuild formats are not supported predecessors.
 
+The planned 1.0 format handles compatibility at its outer reader and writer gates. A new nested
+tag or encoding requires a higher reader capability, and a higher writer capability when older
+writers cannot safely rewrite it. These gates must be published before the new feature reaches
+data or the write-ahead log. An unknown nested tag under supported gates is corruption. It is
+refused when read, before its value is used or published into derived data. Open validates its
+root, manifest, catalog and log reads without scanning every stored data page. The private format
+is still being finalized; this changes no published 0.x format or API.
+
+The private page reader also refuses nonzero unused aux fields, nondecimal directory special
+flags, and invalid or unordered distinct-sketch registers. Current writers already emit the
+accepted form. NULL payload bytes stay uninterpreted, and sparse versus dense sketches remain
+a packing choice rather than a compatibility distinction.
+
 The unexported rebuild gives catalogs their own versioned binary grammar. Catalog records keep
 stable field IDs and exact typed values. Native storage splits the logical stream across bounded,
 checksummed pages; the write-ahead log uses the same record definitions for catalog changes.
