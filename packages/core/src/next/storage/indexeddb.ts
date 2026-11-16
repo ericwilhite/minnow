@@ -76,7 +76,13 @@ import {
   type StoreSession,
   type WriteDataOptions,
 } from "./contract.js";
-import { acquireFenced, type HeldLock, type LockManagerLike } from "./fence.js";
+import {
+  acquireFenced,
+  publicationGate,
+  type PublicationGate,
+  type HeldLock,
+  type LockManagerLike,
+} from "./fence.js";
 import { ByteStore, inOrder } from "./idb-bytes.js";
 import type { CacheMemory, EvictableCacheLike } from "./extents.js";
 import { IdbMetadataCache, type MetadataCacheBacking } from "./idb-metadata-cache.js";
@@ -627,6 +633,7 @@ class IdbSession implements StoreSession {
     batching: boolean,
     memory: CacheMemory | null,
     readonly registerMetadataCache: ((cache: EvictableCacheLike) => CacheMemory) | null,
+    readonly publication: PublicationGate,
   ) {
     this.#lease = lease;
     this.epoch = lease.epoch;
@@ -851,6 +858,10 @@ class IdbSession implements StoreSession {
 
   /** Guarantee 1: every queued write, then the root, in one strict transaction. */
   async publish(root: Uint8Array): Promise<void> {
+    return this.publication(() => this.#publish(root));
+  }
+
+  async #publish(root: Uint8Array): Promise<void> {
     this.#mutable();
     this.#lease.guard();
     const prepared = preparedRoot(this, root);
@@ -1566,6 +1577,7 @@ export function createIndexedDbBackend(options: IndexedDbBackendOptions): Storag
         options.batching ?? true,
         memory,
         options.registerCache ?? null,
+        publicationGate(options.locks, `minnow:${options.name}`, owned.signal),
       );
     },
     scratch(lease: OwnerLease): ScratchSpace {

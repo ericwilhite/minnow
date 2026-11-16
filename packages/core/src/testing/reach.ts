@@ -9179,3 +9179,16 @@ export const ROOT_WRITE_GATE_REACH = [
   "FTS claims after gate",
   "zero charges",
 ] as const;
+
+export const ROOT_GATE_RACE_REACH = [
+  "IDB",
+  "OPFS",
+  "reader",
+  "writer",
+  "publication first",
+  "probe-steal interval",
+  "steal first",
+  "refused live owner survives",
+  "live owner still writes",
+  "stolen queued publication refuses",
+] as const;

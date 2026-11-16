@@ -41,7 +41,7 @@ for (const seed of seedsFor("next-root-dual-native", [0xb2c3, 0xb2c4]))
               let lockCalls = 0;
               const observedLocks = {
                 request: (...args: Parameters<SimLocks["request"]>) => {
-                  lockCalls++;
+                  if (args[0] === "minnow:future") lockCalls++;
                   return locks.request(...args);
                 },
               };
@@ -114,7 +114,7 @@ for (const seed of seedsFor("next-root-dual-native", [0xb2c3, 0xb2c4]))
                 name: "future",
                 locks: {
                   request: (...args) => {
-                    idbLockCalls++;
+                    if (args[0] === "minnow:future") idbLockCalls++;
                     return idbLocks.request(...args);
                   },
                 },
@@ -200,6 +200,7 @@ for (const seed of seedsFor("next-root-dual-native", [0xb2c3, 0xb2c4]))
 it("closes an IDB preflight connection arriving after the acquisition deadline", async () => {
   const factory = new IDBFactory(),
     raw = await openIndexedDb(factory, "late-probe");
+  const coordination = new SimLocks();
   let deliver!: (db: IdbDatabaseLike) => void,
     notify!: () => void,
     locks = 0,
@@ -214,9 +215,10 @@ it("closes an IDB preflight connection arriving after the acquisition deadline",
     name: "late-probe",
     database: () => connection,
     locks: {
-      request() {
+      request(name, options) {
+        if (name.startsWith("minnow-gate:")) return coordination.request(name, options);
         locks++;
-        return Promise.reject(new Error("must not acquire lock"));
+        return Promise.reject(new Error("must not acquire owner lock"));
       },
     },
   });
@@ -296,8 +298,9 @@ for (const seed of seedsFor("next-root-gate-before-wal", [0xb2c7, 0xb2c8]))
     reach.assertReached();
   });
 
-it("aborts a stalled readonly preflight before closing without taking a lock", async () => {
+it("aborts a stalled readonly preflight before closing without taking the owner lock", async () => {
   const events: string[] = [];
+  const coordination = new SimLocks();
   let locks = 0;
   const unexpected = () => {
     throw new Error("unexpected preflight operation");
@@ -334,9 +337,10 @@ it("aborts a stalled readonly preflight before closing without taking a lock", a
     database: () => database,
     releaseSettleMs: 50,
     locks: {
-      request() {
+      request(name, options) {
+        if (name.startsWith("minnow-gate:")) return coordination.request(name, options);
         locks++;
-        return Promise.reject(new Error("must not acquire lock"));
+        return Promise.reject(new Error("must not acquire owner lock"));
       },
     },
   });

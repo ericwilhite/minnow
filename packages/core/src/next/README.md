@@ -455,11 +455,20 @@ The current capability baseline is reader8/writer8, manifest11, with commitBody8
 Root frames fund the extra8 bytes before allocation. Earlier unpublished development roots
 are refused; no supported next/ predecessor has shipped.
 
-Both native backends probe both root slots before requesting a Web Lock, so a stable unsupported
-requirement refuses before a steal can disrupt the live owner. OPFS rechecks existing owned
-handles before creating missing files or advancing the epoch. IndexedDB rechecks both roots in
-its strict fence transaction before enqueueing the epoch write. Preflight shares the acquisition
-deadline; a late IndexedDB connection closes without requesting a lock. Unsupported gates use
+Both native backends probe both root slots before requesting the owner Web Lock. A stealing
+opener holds the separate, non-stealing `minnow-gate:minnow:<name>` lock from before that probe
+through the ownership steal and backend fencing. Delayed lock-loss notification in the old
+worker cannot let a publisher run before the new handle/epoch fence. Every native root publication holds the same exclusive gate through
+its durable write: a requirement cannot change between the probe and the steal. Publication
+winning the gate makes an incompatible opener refuse while the live owner keeps its lock;
+acquisition winning it makes the old publisher lose authority before it can publish. Ordinary
+queued openers never hold the gate while waiting for ownership, so a live owner's publication
+can finish. A queued publisher cancels on owner loss and checks authority after getting the gate.
+The gate uses a distinct namespace from owner locks, including for arbitrary database names.
+OPFS rechecks existing owned handles before creating missing files or advancing the epoch.
+IndexedDB rechecks both roots in its strict fence transaction before enqueueing the epoch write.
+Gate waiting and preflight share the acquisition deadline; a late IndexedDB connection closes
+without requesting the owner lock. Unsupported gates use
 `DurableFormatError` (`MINNOW_FORMAT_UNSUPPORTED`). A database that is readable but requires a
 newer writer also refuses: SQL read-only transactions still use a writable owner, and no safe
 physical read-only owner path is provided. Stale probes never authorize native writes.

@@ -57,7 +57,7 @@ import {
   type StorageObserver,
   type SyncFile,
 } from "./contract.js";
-import { acquireFenced, type HeldLock, type LockManagerLike } from "./fence.js";
+import { acquireFenced, publicationGate, type HeldLock, type LockManagerLike } from "./fence.js";
 import { refuseLegacyOpfs } from "./legacy-data.js";
 import { FileScratch, FileStoreSession, type FileSet } from "./file-store.js";
 
@@ -504,9 +504,14 @@ export function createOpfsBackend(options: OpfsBackendOptions): StorageBackend {
     async open(lease: OwnerLease): Promise<StoreSession> {
       const owned = own(lease);
       owned.guard();
-      return new FileStoreSession(owned.files, owned.epoch, () => {
-        owned.guard();
-      });
+      return new FileStoreSession(
+        owned.files,
+        owned.epoch,
+        () => {
+          owned.guard();
+        },
+        publicationGate(options.locks, `minnow:${options.name}`, owned.signal),
+      );
     },
     scratch(lease: OwnerLease): ScratchSpace {
       const owned = own(lease);
