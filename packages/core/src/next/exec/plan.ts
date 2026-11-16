@@ -870,6 +870,17 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
     terminalInput.exprs.every((expr, k) => expr.op === "column" && expr.index === k)
   )
     terminalInput = terminalInput.input;
+  // Only the single source path of a modification input has the reviewed cursor
+  // recipe. Crossing a join/set branch requires a separate complete-minimum proof.
+  let modifyIndexInput: number | null = null;
+  if (plan.root.op === "modify") {
+    let input = plan.root.input;
+    for (;;) {
+      if (input.op === "keyLookup" || input.op === "indexRange") modifyIndexInput = input.id;
+      if (!("input" in input)) break;
+      input = input.input;
+    }
+  }
   const prepare = (rel: Rel): Recipe => {
     if (rel.op === "sort" && !rel.withTies && windowSuppliesOrder(rel.input, rel.keys))
       rel = { ...rel, op: "limit" };
@@ -1124,13 +1135,16 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       }
       case "keyLookup":
       case "indexRange": {
-        // A modify root has exactly one relational child: its statement-snapshot input.
-        // Its cursor/fetch step joins that producer's complete atomic reservation. Query
-        // roots keep the existing diagnostic gate; a LIMIT zero must not bypass it.
-        if (plan.root.op !== "modify" && options.keyOrder !== true)
-          throw new UnsupportedPlanError(`${rel.op} requires diagnostic opt-in outside DML`, {
-            construct: rel.op,
-          });
+        // A cursor on the direct single-source modify input path joins the admitted
+        // producer. Query roots and cursors under branching inputs remain diagnostic;
+        // neither a MODIFY ancestor nor LIMIT zero grants an unreviewed minimum.
+        if (modifyIndexInput !== rel.id && options.keyOrder !== true)
+          throw new UnsupportedPlanError(
+            `${rel.op} requires diagnostic opt-in outside admitted modification input`,
+            {
+              construct: rel.op,
+            },
+          );
         if (
           options.keyOrder === true &&
           rel.op === "indexRange" &&

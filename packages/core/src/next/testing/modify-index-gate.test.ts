@@ -103,6 +103,59 @@ for (const seed of seedsFor("next-modify-index-gate", [0xb609, 0xb60a]))
               expect(refused, "SELECT index cursor must remain diagnostic-only").toBe(true);
               expect(() => executor.prepare(lowered.plan)).not.toThrow();
             }
+            // Branching input needs its own simultaneous-source admission proof. A
+            // MODIFY ancestor alone cannot authorize the cursor under a join/set input.
+            const empty: Rel = {
+              id: 1000001,
+              op: "values",
+              output: lowered.plan.root.input.output,
+              rows: [],
+            };
+            const joined: Rel = {
+              id: 1000002,
+              op: "join",
+              kind: "semi",
+              algorithm: "nestedLoop",
+              left: lowered.plan.root.input,
+              right: empty,
+              output: empty.output,
+              leftKeys: [],
+              rightKeys: [],
+              nullSafe: [],
+              residual: null,
+              publishes: [],
+            };
+            const except: Rel = {
+              id: 1000003,
+              op: "setOp",
+              kind: "except",
+              all: false,
+              inputs: [lowered.plan.root.input, empty],
+              output: empty.output,
+            };
+            for (const branch of [
+              joined,
+              { ...joined, left: empty, right: lowered.plan.root.input },
+              ...(form === "insert" || form === "upsert" ? [except] : []),
+            ]) {
+              const nested: PhysicalPlan = {
+                ...lowered.plan,
+                root: { ...lowered.plan.root, input: branch },
+              };
+              for (const keyOrder of [undefined, false]) {
+                let refused = false;
+                try {
+                  createExecutor(keyOrder === undefined ? {} : { keyOrder }).prepare(nested);
+                } catch (error) {
+                  expect(error).toBeInstanceOf(UnsupportedPlanError);
+                  expect((error as UnsupportedPlanError).construct).toBe(route);
+                  refused = true;
+                }
+                expect(refused, "nested branch index must remain diagnostic-only").toBe(true);
+              }
+              expect(() => createExecutor({ keyOrder: true }).prepare(nested)).not.toThrow();
+              reach.reach(branch.op === "join" ? "nested join refused" : "nested set refused");
+            }
             expect(() => createExecutor({ keyOrder: true }).prepare(select)).not.toThrow();
             const actual = await core.execute(sql),
               expected = await pg.query(sql),

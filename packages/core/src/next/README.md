@@ -1595,9 +1595,10 @@ The report includes CPU samples, full spreads, checkpointed partial rounds, prof
 actual transformed JS needed to interpret line-level ticks. No baseline is an executor path.
 Query-root `keyLookup` and `indexRange` IR remain behind the internal `keyOrder:true`
 diagnostic opt-in, including LIMIT zero. The general cursor/fetch recipe is available without
-that opt-in only inside a modification root's statement-snapshot input, whose producer
-atomically reserves the complete DML cursor/fetch minimum. This does not enable query-root
-index predicates. Ordinary SQL selects the admitted index recipe for a direct, complete
+that opt-in on the modification input's single-source path through unary operators. Its
+producer atomically reserves the complete DML cursor/fetch minimum. Cursors beneath join
+or set-operation branches retain the diagnostic gate: a MODIFY ancestor alone does not
+prove the branch minimum. This does not enable query-root index predicates. Ordinary SQL selects the admitted index recipe for a direct, complete
 primary-key ORDER BY with LIMIT or OFFSET, including OFFSET without LIMIT. The pinned
 catalog must certify the same unique key columns, byte collation and direction. Direct
 projections are supported; row-locking intent, filters, computed ordering, partial keys, mixed

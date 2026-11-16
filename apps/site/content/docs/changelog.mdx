@@ -91,7 +91,9 @@ uses bounded call arity. A repeated affected target rolls back the statement; as
 arbiter or primary-key columns are refused as in the shipped engine. Proposed rows are
 validated before arbitration: a conflicting DO NOTHING row with a NOT NULL violation is
 rejected, matching PostgreSQL (the shipped engine currently skips that check).
-Index inputs retain original row locators and suppress repeated probe matches. Reads use the statement
+Single-source index inputs retain original row locators and suppress repeated probe matches.
+Cursors beneath join or set-operation inputs retain the internal diagnostic opt-in until
+their complete admission is proved. Reads use the statement
 snapshot; statement errors roll back earlier rows. Unique and foreign-key checks use the
 existing write path. CHECK constraints and stored generated columns now use the shared,
 charged row-rule program, retained through native FK actions. Set operations retain their

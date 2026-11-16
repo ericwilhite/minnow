@@ -7984,6 +7984,8 @@ export const MODIFY_INDEX_GATE_REACH = [
   "DML false admitted",
   "PG and shipped rows",
   "zero spill",
+  "nested join refused",
+  "nested set refused",
 ] as const;
 
 /** Root scalar registries have a fixed charged directory independent of row/event count. */
