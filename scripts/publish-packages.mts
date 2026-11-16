@@ -3,7 +3,8 @@
  *
  * The version in the manifest is the release. There is nothing else to remember: bump a package
  * with `npm run version:set`, push it, and once CI is green this publishes exactly the packages
- * whose version npm does not already have, then tags each one. Re-running publishes nothing,
+ * whose version npm does not already have, then tags each one. Major 1+ additionally requires
+ * committed qualified R6 acceptance evidence, checked before registry access. Re-running publishes nothing,
  * because the registry is the record of what has shipped — so a rerun after a failure is safe,
  * and a push that changes no version is a no-op.
  *
@@ -15,6 +16,7 @@
  * Run locally it publishes with whatever `npm whoami` says, which is how a package is created in
  * the first place — a trusted publisher can only be configured for a package that exists.
  */
+import { assertR6ReleaseReady } from "./lib/r6-acceptance.mts";
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -108,7 +110,12 @@ function provenanceAvailable(): boolean {
 }
 
 const provenance = provenanceAvailable();
-const pending = publishable().filter((entry) => !alreadyPublished(entry));
+const candidates = publishable();
+assertR6ReleaseReady(
+  candidates.map((entry) => entry.version),
+  repoRoot,
+);
+const pending = candidates.filter((entry) => !alreadyPublished(entry));
 
 if (pending.length === 0) {
   console.log("Every package's version is already on npm. Nothing to publish.");

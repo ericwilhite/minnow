@@ -1,8 +1,9 @@
 /** One command, sequential engines; no process termination, retries or contaminated summaries. */
 import { spawn, execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { availableParallelism, loadavg, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { acceptanceFromQuietRun } from "./lib/r6-acceptance.mts";
 import { QuietHost } from "./owner-r6-policy.js";
 
 const args = process.argv.slice(2);
@@ -12,12 +13,8 @@ const out = args[1] === undefined ? mkdtempSync(join(tmpdir(), "minnow-r6-")) : 
 mkdirSync(out, { recursive: true });
 // A fresh output directory prevents stale accepted results surviving a refused invocation.
 const accepted = join(out, "report.json");
-try {
-  readFileSync(accepted);
+if (existsSync(accepted) || existsSync(join(out, "acceptance.json")))
   throw new Error("Choose a fresh output directory");
-} catch (error) {
-  if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-}
 const host = new QuietHost();
 function sample() {
   host.observe(loadavg());
@@ -231,7 +228,7 @@ try {
       }),
     };
   });
-  save("report.json", {
+  const report = {
     schemaVersion: 1,
     revision: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
     node: process.version,
@@ -241,7 +238,12 @@ try {
     quantum: "candidate only; decide from quiet latency and fixed-work completion times",
     records,
     summary,
-  });
+  };
+  const acceptance = passed
+    ? acceptanceFromQuietRun(report, host.samples, process.platform)
+    : undefined;
+  save("report.json", report);
+  if (acceptance !== undefined) save("acceptance.json", acceptance);
   console.log(`Quiet-host report: ${accepted}`);
   process.exitCode = passed ? 0 : 1;
 } catch (error) {

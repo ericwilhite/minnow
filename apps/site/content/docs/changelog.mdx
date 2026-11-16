@@ -13,8 +13,10 @@ compatibility policy and release process.
 - The browser performance gate now binds every baseline to its SQL and dataset scale and refuses
   changed workloads before comparison. The S_q7 NUMERIC ROUND correction (`4e7b6a0c`) requires
   explicit hosted recalibration. Shared-runner R6 results are observations; absolute acceptance
-  remains a release-blocking 1.0 item until a qualified quiet runner is configured. Targets and
-  the database format are unchanged.
+  remains a release-blocking 1.0 item until a valid quiet-host acceptance record is committed.
+  The qualified job is skipped without `R6_QUIET_RUNNER`; `version:check` and the publisher refuse
+  major 1+ without the record. No scheduled job fails just to report missing acceptance.
+  Targets and the database format are unchanged.
 
 The shipped engine’s fast path for SUM and AVG over floating-point columns adds values directly,
 recovering overhead introduced by the 0.19.3 integer-exactness checks. SQL integer aggregates

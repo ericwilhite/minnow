@@ -1181,9 +1181,21 @@ reports the server-alone 10-microsecond and owner-share 50-microsecond targets w
 them. Browser correctness, finite-value, sample-count, isolation and lock invariants still fail
 the job. Raw metrics and the unchanged absolute targets are uploaded together.
 
-**R6 is NOT ACCEPTED.** A qualified quiet runner is not configured yet; this is a release-blocking
-1.0 item. The workflow has a separate, explicitly failing acceptance job. A green observation
-job never grants acceptance. Absolute targets are judged only after independent host and CPU-load
+**R6 is NOT ACCEPTED until a passing quiet-host record is committed.** The scheduled
+acceptance job runs only when the repository variable `R6_QUIET_RUNNER` names a qualified quiet
+runner. Without that configuration it is skipped; it never fails just to report missing acceptance.
+The observation job still enforces all its invariants and can pass independently. A green
+observation or a skipped acceptance job never grants acceptance.
+
+`npm run version:check` refuses any published package on major 1 or later, including prereleases,
+unless `packages/core/r6-acceptance.json` is valid and its exact bytes are in Git HEAD.
+An untracked, staged-only or edited record cannot unblock a release. The publisher makes the
+same check before consulting npm. The record names the qualified runner, UTC date, measured
+commit, host-load qualification, all three browsers and their p50 and loaded p95 values. It records
+the worst of the five run-level quantiles for each browser; all must meet the unchanged targets.
+The 0.x release line does not require this future acceptance record.
+
+Absolute targets are judged only after independent host and CPU-load
 qualification, never qualification by the latency result or selection of a lucky run. Keep all
 histories. A missing, busy or unqualified runner refuses acceptance. Browser sample intervals are
 rounded to the nearest nanosecond before reporting microseconds, so an exact clock tick cannot
@@ -1219,7 +1231,10 @@ latency lane five times with qualified absolute judging, then the five-round fix
 4, 1 and 0.5 ms quanta (including the original fixture's 4 ms control). It samples host load every
 second and at command boundaries. Any measured load above 1, invalid load evidence or incomplete
 run produces `refused.json` and raw logs, **never `report.json`**. It waits for its own children;
-it does not kill processes. A complete quiet run writes `report.json`; unmet targets return exit
+it does not kill processes. A complete quiet run writes `report.json`; a passing run also writes
+`acceptance.json`. The qualified job uploads both and the raw evidence as `r6-acceptance`.
+Review that evidence, copy `acceptance.json` to `packages/core/r6-acceptance.json` and commit it;
+do not hand-write passing numbers. Re-run `npm run version:check`. Unmet targets return exit
 1, refusal returns exit 2. The gate requires OS load averages (Linux/macOS).
 
 Temporary output uses `os.tmpdir()`; set `TMPDIR` to your scratch directory on a constrained host.

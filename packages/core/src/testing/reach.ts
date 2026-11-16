@@ -7575,3 +7575,14 @@ export const R6_OBSERVATION_REACH = [
   "qualified target judging",
   "invariants always enforced",
 ] as const;
+
+/** A version label, fabricated status or missing browser cannot bypass R6 acceptance. */
+export const R6_RELEASE_REACH = [
+  "valid record",
+  "over target refused",
+  "unqualified refused",
+  "incomplete browsers refused",
+  "per-run overshoot refused",
+  "0.x unchanged",
+  "1.x gated",
+] as const;

@@ -51,7 +51,7 @@ for (const seed of seedsFor("r6-observation", [47142, 47143]))
     reach.assertReached();
   });
 
-it("keeps scheduled observations separate from the explicitly blocked acceptance job", async () => {
+it("keeps scheduled observations separate from the conditionally scheduled acceptance job", async () => {
   const { readFileSync } = await import("node:fs");
   const workflow = readFileSync(
     new URL("../.github/workflows/browser-performance.yml", import.meta.url),
@@ -60,7 +60,9 @@ it("keeps scheduled observations separate from the explicitly blocked acceptance
   const owner = workflow.split("\n  owner:\n")[1]?.split("\n  owner-acceptance:\n");
   expect(owner?.[0]?.match(/MINNOW_R6_MODE: "observe"/g)).toHaveLength(2);
   expect(owner?.[0]).not.toContain("MINNOW_PERF_LANE");
-  expect(owner?.[1]).toContain("R6 NOT ACCEPTED");
-  expect(owner?.[1]).toContain("exit 1");
+  expect(owner?.[1]).toContain("if: vars.R6_QUIET_RUNNER != ''");
+  expect(owner?.[1]).toContain("runs-on: ${{ vars.R6_QUIET_RUNNER }}");
+  expect(owner?.[1]).toContain("benchmark:owner:r6");
+  expect(owner?.[1]).not.toContain("exit 1");
   expect(owner?.[1]).not.toContain("continue-on-error");
 });

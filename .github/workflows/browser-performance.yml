@@ -9,7 +9,8 @@
 #
 # Shared ubuntu workers observe R6 and enforce structural invariants, not absolute latency.
 # R6 acceptance remains NOT ACCEPTED (release-blocking for 1.0) until a qualified quiet runner
-# is configured. The separate acceptance job fails explicitly; observation cannot turn it green.
+# is configured and its record committed. Without a runner the acceptance job is skipped;
+# version:check enforces the 1.0 release gate. Observations cannot grant acceptance.
 name: Browser performance
 
 on:
@@ -199,14 +200,29 @@ jobs:
           retention-days: 90
 
   owner-acceptance:
-    name: R6 absolute acceptance — NOT ACCEPTED
-    runs-on: ubuntu-latest
-    # No qualified runner is configured yet. Never treat an observation pass as acceptance.
+    name: R6 acceptance (qualified quiet runner)
+    if: vars.R6_QUIET_RUNNER != ''
+    runs-on: ${{ vars.R6_QUIET_RUNNER }}
+    timeout-minutes: 120
     steps:
-      - name: Refuse unqualified acceptance (1.0 release blocker)
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: bash scripts/ci-install.sh
+      - name: Install the browsers
+        run: npx playwright install --with-deps chromium firefox webkit
+      - name: Judge absolute R6 targets on the qualified host
         shell: bash
-        run: |
-          echo '## R6 NOT ACCEPTED' >> "$GITHUB_STEP_SUMMARY"
-          echo 'Release-blocking 1.0 item: no qualified quiet runner is configured. Shared-host observations are not acceptance.' >> "$GITHUB_STEP_SUMMARY"
-          echo '::error::R6 NOT ACCEPTED: configure a qualified quiet runner; targets are unchanged.'
-          exit 1
+        env:
+          MINNOW_R6_QUIET_RUNNER_ID: ${{ runner.name }}
+          R6_OUTPUT: ${{ runner.temp }}/minnow-r6-${{ github.run_id }}-${{ github.run_attempt }}
+        run: npm run benchmark:owner:r6 -- --out "$R6_OUTPUT"
+      - name: Upload qualified acceptance evidence for review
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: r6-acceptance
+          path: ${{ runner.temp }}/minnow-r6-${{ github.run_id }}-${{ github.run_attempt }}/
+          retention-days: 90

@@ -224,6 +224,17 @@ npm run version:set -- major                  # every package to the next major,
 Add the release and its migration/storage notes to `apps/site/content/docs/changelog.mdx`. The
 version check fails until every current published package version appears there.
 
+For major 1 and later, including prereleases, `npm run version:check` also requires a committed
+`packages/core/r6-acceptance.json` from a passing qualified quiet-host run. It validates the
+runner, date, measured commit, host-load evidence and all three browsers against the unchanged
+R6 targets. Missing, invalid, untracked, staged-only or edited evidence refuses the release.
+The publisher repeats this check before consulting npm. The 0.x line is unaffected.
+
+Configure `R6_QUIET_RUNNER` to schedule the qualified job, review its `r6-acceptance` artifact,
+then copy and commit its generated `acceptance.json`. Without a configured runner that job is
+skipped, and ordinary scheduled observations remain useful; neither is R6 acceptance. See the
+[quiet-host procedure](/docs/reference/testing#quiet-host-r6-gate-and-cpu-components).
+
 Run the full local gate and open a pull request on a release branch:
 
 ```bash

@@ -5,6 +5,9 @@
 # already have, then tags each one. A push that changes no version publishes nothing, and rerunning
 # a failed job is safe, because the registry is what decides — not this workflow's history.
 #
+# CI version:check and the publisher refuse major 1+ without a valid committed R6 quiet-host
+# acceptance record. A skipped nightly acceptance job never bypasses this release gate.
+#
 # It waits for CI rather than repeating the merge gate, then adds the exhaustive SQL, long
 # deterministic-simulator, and full real-browser profiles. `workflow_run` fires when CI finishes,
 # and no red or skipped gate can reach the registry.

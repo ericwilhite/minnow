@@ -24,6 +24,7 @@
  * `BLOCK_FORMAT_VERSION`, which moves on its own schedule and is what the fixtures in
  * packages/core/format-fixtures/ are keyed to.
  */
+import { assertR6ReleaseReady } from "./lib/r6-acceptance.mts";
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -162,6 +163,12 @@ function check(): number {
       continue;
     }
     versions.set(entry.manifest.name ?? entry.relativePath, version ?? "");
+  }
+
+  try {
+    assertR6ReleaseReady([...versions.values()], repoRoot);
+  } catch (error) {
+    problems.push(error instanceof Error ? error.message : String(error));
   }
 
   const majors = new Set([...versions.values()].map((version) => parseVersion(version)?.major));
