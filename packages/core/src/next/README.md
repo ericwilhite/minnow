@@ -4429,3 +4429,14 @@ returns descriptor credit. Space close applies the same fences. Data becomes reu
 once only after neither root slot nor an old pin reaches it. Crash recovery uses the durable root
 lists, never this reconstructible private file. No durable grammar, format version, public API or
 shipped-engine behavior changes here; the native FTS builder is not wired to this seam yet.
+
+### FTS preparation retirement
+
+Replacing an unclaimed FTS preparation records at most two owned head references in a
+fixed 512-byte control charge. Once the new root is fixed, publication streams the old
+journal/tree walk into the existing disk retirement inventory. Its sort/difference
+removes duplicates and subtracts the complete new root's retained references. Collection
+keeps no payload-sized array and performs no per-extent linear deduplication scan.
+The inventory stays owned through list preparation, publication and sink settlement;
+accepted reads drain before its charge is released. This is preparation cleanup support;
+the native index build controller remains separate.

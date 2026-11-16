@@ -9195,3 +9195,16 @@ export const BOUNDED_RETIREMENT_FAULT_REACH = [
   "close at owner charge",
   "release at cursor charge",
 ] as const;
+
+export const FTS_RETIREMENT_PRESSURE_REACH = [
+  "owned through publication",
+  "released after settlement",
+  "shared source refs",
+  "unique source refs",
+  "large preparation",
+  "fixed native credit",
+  "disk dedupe",
+  "no fresh admission",
+  "reopen exact rows",
+  "zero charges",
+] as const;
