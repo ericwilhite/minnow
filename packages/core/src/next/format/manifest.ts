@@ -57,9 +57,10 @@
  *   are never reused and never rewritten by maintenance; a merge keeps each row's id.
  * - **Checkpoints and replay** (replay.ts): global state (catalog, sequences, ledger) is as of
  *   `globalLsn`; each table's rows are as of its `flushedThroughLsn`. Table replay schema
- *   versions agree with that catalog. An ALTER holds the catalog checkpoint until all earlier-
- *   schema positional WAL rows are covered by their table checkpoint; group columns keep stable
- *   IDs independently of this replay version. A root may switch to a new
+ *   versions agree with that catalog. ROW WAL names its physical columns and tombstone indexes
+ *   by stable IDs, so an older row frame can replay under a newer checkpoint catalog. Added
+ *   columns retain their lazy missing values; dropped column bytes are ignored. Immutable group
+ *   columns also keep stable IDs independently of the catalog replay version. A root may switch to a new
  *   log salt only when `globalLsn` and every table's `flushedThroughLsn` reach the old log's last
  *   LSN; the new incarnation records the switching root's sequence (`log.rootSequence`).
  *   `tables` agrees with the catalog at `globalLsn`: every table it has (one dropped later stays,
@@ -139,7 +140,7 @@ export interface ManifestRoot {
 
 export interface TableRoot {
   readonly tableId: number;
-  /** The schema version its groups were written under (replay checks frames against it). */
+  /** The catalog schema at the global checkpoint; groups/ROW effects retain physical IDs. */
   readonly schemaVersion: number;
   /** The next row id this table allocates (row ids start at 1): past every row id it holds. */
   readonly nextRowId: number;

@@ -166,6 +166,8 @@ export type Undo =
       readonly position: number;
       readonly rowId: number;
       readonly keys: readonly Uint8Array[];
+      readonly schemaVersion: number;
+      readonly indexIds: readonly number[];
     }
   | {
       readonly kind: "groupDelete";
@@ -176,6 +178,8 @@ export type Undo =
       readonly position: number;
       readonly rowId: number;
       readonly keys: readonly Uint8Array[];
+      readonly schemaVersion: number;
+      readonly indexIds: readonly number[];
     }
   | {
       readonly kind: "freeze";
@@ -401,7 +405,15 @@ export class TransactionImpl implements WriteTransaction {
     const inserts: Array<{ memtable: Memtable; from: number; to: number }> = [];
     // A staged table's rows are one `publishedRows` effect, at its first staged memtable.
     const published = new Set<number>();
-    let deletes: Map<number, Array<{ rowId: number; keys: readonly Uint8Array[] }>> | null = null;
+    let deletes: Map<
+      number,
+      Array<{
+        rowId: number;
+        keys: readonly Uint8Array[];
+        schemaVersion: number;
+        indexIds: readonly number[];
+      }>
+    > | null = null;
     const emitRows = () => {
       for (const range of inserts) {
         const memtable = range.memtable;
@@ -439,7 +451,12 @@ export class TransactionImpl implements WriteTransaction {
             kind: "rows",
             tableId: memtable.tableId,
             schemaVersion: memtable.schemaVersion,
-            inserts: { firstRowId: memtable.firstRowId + from, rowCount: count, columns },
+            inserts: {
+              firstRowId: memtable.firstRowId + from,
+              rowCount: count,
+              columns,
+              columnIds: memtable.columns.map((column) => column.id),
+            },
             deletes: null,
           });
           from = end;
@@ -447,10 +464,7 @@ export class TransactionImpl implements WriteTransaction {
       }
       if (deletes !== null)
         for (const [tableId, list] of deletes) {
-          let schemaVersion: number | undefined;
-          for (const range of inserts)
-            if (range.memtable.tableId === tableId) schemaVersion = range.memtable.schemaVersion;
-          schemaVersion ??= need(this.tableVersion(tableId));
+          const { schemaVersion, indexIds } = need(list[0]);
           list.sort((x, y) => x.rowId - y.rowId);
           const rowIds =
             allocator === undefined
@@ -465,6 +479,7 @@ export class TransactionImpl implements WriteTransaction {
             inserts: null,
             deletes: {
               rowIds,
+              indexIds,
               keys: list.map((item) => item.keys),
             },
           });
@@ -493,7 +508,12 @@ export class TransactionImpl implements WriteTransaction {
             list = [];
             deletes.set(entry.tableId, list);
           }
-          list.push({ rowId: entry.rowId, keys: entry.keys });
+          list.push({
+            rowId: entry.rowId,
+            keys: entry.keys,
+            schemaVersion: entry.schemaVersion,
+            indexIds: entry.indexIds,
+          });
           break;
         }
         case "catalog":
@@ -2420,6 +2440,7 @@ export class TableWriterImpl implements TableWriter {
           });
       }
     }
+    const indexIds = this.def.indexes.map((index) => index.id);
     rowIds.forEach((rowId, k) => {
       const locator = table.locator(rowId);
       const segment = table.segments[Math.floor(locator / 65_536)];
@@ -2436,6 +2457,8 @@ export class TableWriterImpl implements TableWriter {
           position,
           rowId,
           keys,
+          schemaVersion: this.def.schemaVersion,
+          indexIds,
         });
       } else if (segment?.kind === "group") {
         const deletes = table.tableView.groupDeletes;
@@ -2449,6 +2472,8 @@ export class TableWriterImpl implements TableWriter {
           position,
           rowId,
           keys,
+          schemaVersion: this.def.schemaVersion,
+          indexIds,
         });
       }
     });

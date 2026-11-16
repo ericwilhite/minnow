@@ -8,6 +8,7 @@ import { ftsDef } from "../access/fts-def.js";
 import { ftsSemantics } from "../fts-config.js";
 import { ftsValue, FTS_WORKSPACE_BYTES } from "../exec/fts-value.js";
 import { oracleRows } from "./differential-adapter.js";
+import { batch, locators } from "../write/test-support.js";
 import { StorageCore } from "./storage-core.js";
 
 for (const op of ["drop", "add", "rename"] as const)
@@ -29,8 +30,9 @@ for (const op of ["drop", "add", "rename"] as const)
             stored: fc.boolean(),
             missing: fc.boolean(),
             rootFirst: fc.boolean(),
+            deleted: fc.boolean(),
           }),
-          async ({ position, width, fts, stored, missing, rootFirst }) => {
+          async ({ position, width, fts, stored, missing, rootFirst, deleted }) => {
             reach.beginHistory();
             reach.reach(
               (["position 0", "position 1", "position 2", "position 3", "position 4"] as const)[
@@ -59,6 +61,13 @@ for (const op of ["drop", "add", "rename"] as const)
               if (rootFirst) await core.harness.path.recycleLog();
               await core.writeBatch("insertBatch", "docs", rows);
               if (stored) await core.harness.path.recycleLog();
+              if (deleted) {
+                const id = core.harness.path.catalog.tableByName("docs")?.id;
+                if (id === undefined) throw new Error("missing delete table");
+                await core.write((s) => s.table(id).delete(batch(locators([0], id)), null));
+                rows.shift();
+              }
+              reach.reach(deleted ? "delete before ALTER" : "insert only");
               const name = names[position] ?? "extra";
               if (op === "drop") {
                 await core.execute(`ALTER TABLE docs DROP COLUMN ${name}`);
@@ -176,13 +185,22 @@ for (const op of ["drop", "add", "rename"] as const)
                 stored: false,
                 missing: true,
                 rootFirst: false,
+                deleted: false,
               },
             ],
             ...positions.flatMap((position) =>
               [false, true].flatMap((fts) =>
                 [false, true].flatMap((stored) =>
                   [false, true].map((missing) => [
-                    { position, width: 4, fts, stored, missing, rootFirst: !stored },
+                    {
+                      position,
+                      width: 4,
+                      fts,
+                      stored,
+                      missing,
+                      rootFirst: !stored,
+                      deleted: !missing,
+                    },
                   ]),
                 ),
               ),

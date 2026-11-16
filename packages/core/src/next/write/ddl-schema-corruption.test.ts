@@ -1,4 +1,4 @@
-/** A mismatched development checkpoint must refuse before positional row replay. */
+/** A mismatched development checkpoint must refuse before reconstructing row state. */
 import fc from "fast-check";
 import { expect, it } from "vitest";
 import { createReach, DDL_SCHEMA_CORRUPTION_REACH } from "../../testing/reach.js";

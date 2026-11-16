@@ -9360,6 +9360,8 @@ export const DDL_ROW_SCHEMA_REACH = [
   "position 3",
   "FTS publication",
   "plain publication",
+  "delete before ALTER",
+  "insert only",
   "stored rows",
   "resident rows",
   "empty root before rows",
@@ -9377,4 +9379,36 @@ export const DDL_SCHEMA_CORRUPTION_REACH = [
   "typed refusal",
   "charge returned",
   "repair retry",
+] as const;
+
+export const DDL_ATOMIC_SCHEMA_REACH = [
+  "drop",
+  "add",
+  "rename",
+  "replace",
+  "FTS",
+  "plain",
+  "atomic reopened",
+] as const;
+
+export const DDL_INDEX_SCHEMA_REACH = [
+  "drop",
+  "add",
+  "rename",
+  "first",
+  "middle",
+  "last",
+  "shared DDL LSN",
+  "publication advances",
+  "exact reopen",
+] as const;
+
+export const ROW_IDENTITIES_REACH = [
+  "stable columns",
+  "stable tombstone indexes",
+  "older identified rows",
+  "positional mismatch refused",
+  "invalid version refused",
+  "malformed IDs refused",
+  "unknown flag refused",
 ] as const;

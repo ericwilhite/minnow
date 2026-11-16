@@ -505,12 +505,14 @@ export type BodyEffect =
  */
 export interface TableChange {
   readonly tableId: number;
-  /** The table's schema version the columns were encoded under; replay refuses a mismatch. */
+  /** The physical schema at the write; stable-ID effects may replay under a newer catalog. */
   readonly schemaVersion: number;
   readonly inserts: {
     readonly firstRowId: number;
     readonly rowCount: number;
-    /** One encoded column per table column, in catalog order (spill-page column encoding). */
+    /** Stable physical column IDs. Native writers always supply them; absent is strict positional. */
+    readonly columnIds?: readonly number[];
+    /** One encoded column per physical column ID (spill-page column encoding). */
     readonly columns: readonly Uint8Array[];
   } | null;
   /**
@@ -519,6 +521,8 @@ export interface TableChange {
    * rows are derived from the inserted columns, so they are not repeated.
    */
   readonly deletes: {
+    /** Stable index IDs shared by each row's key list, including indexes later dropped. */
+    readonly indexIds?: readonly number[];
     readonly rowIds: Float64Array;
     readonly keys: ReadonlyArray<readonly Uint8Array[]>;
   } | null;

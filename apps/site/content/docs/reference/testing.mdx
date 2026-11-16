@@ -1941,9 +1941,14 @@ The DDL row-schema campaign runs DROP, ADD and RENAME at each column position ov
 and published rows. Unrelated ordinary and FTS writes publish roots; each history reopens at
 publication, after later writes, after another ALTER, and after checkpoint/maintenance. It
 compares every value by its current column identity, including frozen ADD missing values.
-The catalog cannot advance past ALTER until older positional WAL frames are covered by the
-table checkpoint. A compatible table replay version advances with the catalog. Removing either
-rule must fail the generated campaign; incompatible durable versions refuse before row replay.
+Row WAL names physical columns and tombstone indexes by stable IDs. A newer catalog checkpoint
+must preserve surviving values from older row frames without positional decoding or expanding
+missing values into every row. Generated histories cover DROP, ADD and RENAME at each position,
+DELETE marks, atomic CREATE/rows/ALTER (including replacing all old columns), and an ALTER
+sharing an LSN with another table's index
+build. They check exact rows after ordinary and FTS publications, writes, checkpoints, maintenance
+and reopen. Malformed identities and incompatible root/catalog replay versions refuse with typed
+errors; repaired roots can retry without leaked admission.
 
 Dropping an index does not erase a build still needed by an older catalog checkpoint. The
 write path retains that obligation until a published root carries the build or covers its

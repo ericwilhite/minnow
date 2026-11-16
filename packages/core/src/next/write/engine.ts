@@ -141,6 +141,7 @@ import type { StatValue } from "../types.js";
 import { layoutOf } from "../types.js";
 import type { Vector } from "../vector/vector.js";
 import { compareBytes } from "../vector/varlen.js";
+import { missingVector } from "./missing-value.js";
 import { decodeBody, encodeBody } from "./body.js";
 import {
   COMMIT_MINIMUM_BYTES,
@@ -1378,14 +1379,37 @@ export class WritePathImpl implements WritePath, EngineHooks {
       throw new LogCorruptionError(`Rows for table ${String(effect.tableId)}, which replay lacks`);
     const inserts = effect.inserts;
     if (inserts !== null) {
-      const columns = def.columns.map((column, c) => {
-        const bytes = inserts.columns[c];
-        if (bytes === undefined) throw new LogCorruptionError("A logged insert lacks a column");
-        return decodeColumn(bytes, column.type);
+      const ids = inserts.columnIds ?? def.columns.map((column) => column.id);
+      const catalogColumns = new Map(def.columns.map((column) => [column.id, column]));
+      const physical = ids.flatMap((id, c) => {
+        const column = catalogColumns.get(id);
+        return column === undefined ? [] : [{ column, bytes: need(inserts.columns[c]) }];
       });
+      if (effect.schemaVersion === def.schemaVersion && physical.length !== def.columns.length)
+        throw new LogCorruptionError("A logged insert lacks a catalog column");
+      const physicalDef: TableDef = {
+        ...def,
+        schemaVersion: effect.schemaVersion,
+        columns: physical.map(({ column }) => column),
+      };
+      const columns = physical.map(({ column, bytes }) => {
+        const vector = decodeColumn(bytes, column.type);
+        if (vector.length !== inserts.rowCount)
+          throw new LogCorruptionError("A logged insert column has the wrong row count");
+        return vector;
+      });
+      // Indexes use the current catalog's operands, without materializing an added
+      // missing value per row. Physical memtable storage remains the old ID subset.
+      const byId = new Map(physical.map(({ column }, c) => [column.id, need(columns[c])]));
+      const indexed =
+        def.indexes.length === 0
+          ? []
+          : def.columns.map(
+              (column) => byId.get(column.id) ?? missingVector(column, inserts.rowCount),
+            );
       let done = 0;
       while (done < inserts.rowCount) {
-        let { memtable } = this.liveMemtable(effect.tableId, inserts.rowCount - done);
+        let { memtable } = this.liveMemtable(effect.tableId, inserts.rowCount - done, physicalDef);
         const logged = inserts.firstRowId + done;
         // Staging moves the root's next row id past its rows; after a rollback the ids it used
         // (never committed) may be used again by rows logged but not flushed. An empty memtable
@@ -1395,10 +1419,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
           logged < memtable.firstRowId &&
           logged >= this.#rowFloor(state, memtable)
         )
-          memtable = this.#liveAt(state, logged);
+          memtable = this.#liveAt(state, logged, physicalDef);
         // Row ids a rolled-back staging used and the next rows skipped: a forward gap.
         if (memtable.firstRowId + memtable.rowCount < logged)
-          memtable = this.#liveAt(state, logged);
+          memtable = this.#liveAt(state, logged, physicalDef);
         const next = memtable.firstRowId + memtable.rowCount;
         if (next !== inserts.firstRowId + done)
           throw new LogCorruptionError(
@@ -1410,19 +1434,20 @@ export class WritePathImpl implements WritePath, EngineHooks {
         memtable.mark(lsn);
         const rowIds = Array.from({ length: take }, (_, k) => memtable.firstRowId + before + k);
         const rows = Uint16Array.from({ length: take }, (_, k) => done + k);
-        this.#putEntries(def, def.indexes, memtable, columns, rows, rowIds, lsn);
+        this.#putEntries(def, def.indexes, memtable, indexed, rows, rowIds, lsn);
         done += take;
       }
     }
     const deletes = effect.deletes;
     if (deletes !== null) {
       const live = this.liveMemtable(effect.tableId, 0).memtable;
+      const ids = deletes.indexIds ?? def.indexes.map((index) => index.id);
       deletes.rowIds.forEach((rowId, k) => {
         const keys = deletes.keys[k] ?? [];
-        def.indexes.forEach((index, i) => {
+        ids.forEach((indexId, i) => {
           const key = keys[i];
           if (key === undefined || key.length === 0) return;
-          live.deltas.get(index.id)?.add(key, 0, key.length, rowId, lsn, true);
+          live.deltas.get(indexId)?.add(key, 0, key.length, rowId, lsn, true);
         });
         this.#markDeleted(state, rowId, lsn);
       });
@@ -1680,12 +1705,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
   liveMemtable(
     tableId: number,
     rows = 1,
+    definition?: TableDef,
   ): { memtable: Memtable; created: boolean; frozen: Memtable | null } {
     const state = this.#tables.get(tableId);
     if (state === undefined) throw new RangeError(`Table ${String(tableId)} has no state`);
     const memtables = state.view.memtables;
     const last = memtables[memtables.length - 1];
-    const def = this.#def(tableId);
+    const def = definition ?? this.#def(tableId);
     if (last?.state === "live" && last.schemaVersion === def.schemaVersion) {
       if (rows === 0) return { memtable: last, created: false, frozen: null };
       const pending = last.visibleRows(MAX_LSN) < last.rowCount;
@@ -1727,7 +1753,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   /** A live memtable starting at `firstRowId` (replay past a gap): the current one ends first. */
-  #liveAt(state: TableState, firstRowId: number): Memtable {
+  #liveAt(state: TableState, firstRowId: number, definition?: TableDef): Memtable {
     const memtables = [...state.view.memtables];
     const last = memtables[memtables.length - 1];
     if (last?.state === "live") {
@@ -1738,7 +1764,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         last.measure();
       }
     }
-    const def = this.#def(state.tableId);
+    const def = definition ?? this.#def(state.tableId);
     const memtable = new Memtable(
       state.tableId,
       firstRowId,
@@ -5061,54 +5087,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
     let before: number;
     do {
       before = globalLsn;
-      // Row frames carry positional columns, not a historical schema descriptor. An
-      // ALTER cannot enter the checkpoint catalog while any earlier-schema frame
-      // still needs replay. A flush may lift this barrier with its proposed coverage.
-      for (const state of this.#tables.values()) {
-        const current = this.#catalog.table(state.tableId);
-        if (
-          current !== undefined &&
-          (current.schemaVersion === 1 ||
-            current.schemaVersion === this.#baseCatalog.table(state.tableId)?.schemaVersion)
-        )
-          continue; // No uncheckpointed ALTER: do not walk catalog history for ordinary tables.
-        const covered = changed.get(state.tableId)?.flushedThroughLsn ?? state.flushedThroughLsn;
-        let previous = this.#baseCatalog.table(state.tableId)?.schemaVersion;
-        for (const entry of this.#catalogHistory) {
-          if (entry.lsn > globalLsn) break;
-          const version = entry.catalog.table(state.tableId)?.schemaVersion;
-          const altered = previous !== undefined && version !== undefined && version > previous;
-          previous = version;
-          if (!altered) continue;
-          const pendingRows = state.view.memtables.some(
-            (memtable) =>
-              memtable.schemaVersion < version && maxSeq(memtable, memtable.rowCount) > covered,
-          );
-          const pendingDeletes = (positions: ReadonlyMap<number, number>) => {
-            for (const seq of positions.values())
-              if (seq > covered && seq <= entry.lsn) return true;
-            return false;
-          };
-          let deleted = false;
-          if (!pendingRows) {
-            for (const positions of state.view.groupDeletes.byGroup.values())
-              if (pendingDeletes(positions)) {
-                deleted = true;
-                break;
-              }
-            if (!deleted)
-              for (const source of state.view.groupSources.values())
-                if (pendingDeletes(source.deletions)) {
-                  deleted = true;
-                  break;
-                }
-          }
-          if (pendingRows || deleted) {
-            globalLsn = entry.lsn - 1;
-            break;
-          }
-        }
-      }
       for (const pending of this.#pendingIndexes.values()) {
         if (pending.droppedAt !== null && globalLsn >= pending.droppedAt) continue;
         const state = this.#tables.get(pending.tableId);
@@ -5164,28 +5142,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   /**
-   * Freezes committed live tails whose old schema or index build holds the root's LSN back,
+   * Freezes the committed live memtable of each table whose index build holds the root's LSN back,
    * so its flush (which settles the build) can run; true when it froze any.
    */
   #freezeBuilds(): boolean {
     let froze = false;
-    // An ALTER barrier, like an index build, must not strand another table's flush.
-    // Only committed old-schema tails are eligible; pending writes keep their owner.
-    for (const state of this.#tables.values()) {
-      const last = state.view.memtables[state.view.memtables.length - 1];
-      const def = this.#catalog.table(state.tableId);
-      if (
-        last?.state === "live" &&
-        def !== undefined &&
-        last.schemaVersion < def.schemaVersion &&
-        last.visibleRows(MAX_LSN) === last.rowCount
-      ) {
-        last.state = "frozen";
-        last.measure();
-        this.#setView(state, { ...state.view });
-        froze = true;
-      }
-    }
     for (const pending of this.#pendingIndexes.values()) {
       const state = this.#tables.get(pending.tableId);
       const last = state?.view.memtables[state.view.memtables.length - 1];
@@ -5668,7 +5629,14 @@ function replayEffect(effect: BodyEffect): Effect {
     case "sequence":
       return { kind: "sequence" };
     case "rows":
-      return { kind: "rows", tableId: effect.tableId, schemaVersion: effect.schemaVersion };
+      return {
+        kind: "rows",
+        tableId: effect.tableId,
+        schemaVersion: effect.schemaVersion,
+        stableIds:
+          (effect.inserts === null || effect.inserts.columnIds !== undefined) &&
+          (effect.deletes === null || effect.deletes.indexIds !== undefined),
+      };
     case "publishedRows":
       return effect;
   }

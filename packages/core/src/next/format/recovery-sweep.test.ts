@@ -88,7 +88,7 @@ interface Staged {
 interface TableState {
   version: number;
   flushed: number;
-  /** LSN of the last schema change, for writer obligation 1. */
+  /** Last schema change: this synthetic positional model uses the strict variant of obligation 1. */
   alteredAt: number;
   durable: string[];
   memory: string[];

@@ -19,10 +19,12 @@ compatibility policy and release process.
   Targets and the database format are unchanged.
 
 The private 1.0 write path keeps catalog and row checkpoints compatible across ALTER TABLE.
-Dropping, adding or renaming a column cannot let an unrelated publication discard the schema
-needed by older positional WAL rows. Pending rows are flushed before their schema leaves the
-checkpoint; published table replay versions follow that catalog. Reopen refuses incompatible
-checkpoint versions instead of reading values under the wrong column names. This fixes both
+Row WAL now records stable column and index IDs, so dropping, adding or renaming a column
+preserves surviving values when the catalog checkpoint advances before the rows. Added columns
+keep their frozen missing values without copying them into every replayed row. Published table
+replay versions follow the checkpoint catalog, and incompatible checkpoint versions are refused.
+The unreleased native grammar advances to reader 8, manifest 11 and commit body 9; the 1.0
+format chain still starts with its first released writer. This fixes both
 FTS-triggered reopen failures and native maintenance column misassociation. Released 0.x
 behavior and formats are unchanged; this does not repair already-damaged development stores.
 
