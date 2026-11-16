@@ -14,8 +14,13 @@ import { createOpfsBackend, encodeEpochSlot } from "../storage/opfs.js";
 import { createIndexedDbBackend } from "../storage/indexeddb.js";
 import { IDBFactory } from "fake-indexeddb";
 import { openIndexedDb } from "../storage/idb-like.js";
-import { encodeRootSlot } from "../storage/root-slot.js";
-import { DURABLE_READER_VERSION, MANIFEST_FORMAT_VERSION } from "../durable-format.js";
+import { decodeRootSlot, encodeRootSlot } from "../storage/root-slot.js";
+import {
+  DURABLE_READER_VERSION,
+  MANIFEST_FORMAT_VERSION,
+  NATIVE_READER_PROFILES,
+  nativeVocabularyFingerprint,
+} from "../durable-format.js";
 import { decodeManifestRoot } from "../format/manifest-codec.js";
 import {
   Harness,
@@ -35,14 +40,26 @@ let dir = "",
   older: {
     createOpfsBackend: typeof createOpfsBackend;
     createIndexedDbBackend: typeof createIndexedDbBackend;
+    encodeRootSlot: typeof encodeRootSlot;
+    decodeRootSlot: typeof decodeRootSlot;
+    NATIVE_READER_PROFILES: typeof NATIVE_READER_PROFILES;
+    nativeVocabularyFingerprint: typeof nativeVocabularyFingerprint;
+    DURABLE_READER_VERSION: number;
+    MANIFEST_FORMAT_VERSION: number;
   };
 // A codec-compatible capability-1 build isolates the minimum-reader gate from the
-// manifest-version gate. It is not a supported predecessor fixture or an upgrade test.
-beforeAll(async () => {
-  dir = await mkdtemp(join(tmpdir(), "minnow-reader1-"));
+// manifest-version gate. Like a real build, it needs a profile for its OWN vocabulary:
+// changing only the selector makes the module internally inconsistent. The synthetic
+// entry is local to this bundled fixture; production's immutable ledger and initializer
+// stay strict. This is not a historical predecessor fixture or an upgrade test.
+async function readerBuild(coherent: boolean): Promise<typeof older> {
   const result = await build({
     stdin: {
-      contents: `export { createOpfsBackend } from "./storage/opfs.js"; export { createIndexedDbBackend } from "./storage/indexeddb.js";`,
+      contents: `export { createOpfsBackend } from "./storage/opfs.js";
+        export { createIndexedDbBackend } from "./storage/indexeddb.js";
+        export { encodeRootSlot, decodeRootSlot } from "./storage/root-slot.js";
+        export { DURABLE_READER_VERSION, MANIFEST_FORMAT_VERSION, NATIVE_READER_PROFILES,
+          nativeVocabularyFingerprint } from "./durable-format.js";`,
       resolveDir: join(import.meta.dirname, ".."),
     },
     bundle: true,
@@ -53,20 +70,37 @@ beforeAll(async () => {
       {
         name: "older-reader-capability",
         setup(api) {
-          api.onLoad({ filter: /durable-format\.ts$/ }, async ({ path }) => ({
-            contents: (await readFile(path, "utf8")).replace(
-              /export const DURABLE_READER_VERSION = \d+;/,
-              "export const DURABLE_READER_VERSION = 1;",
-            ),
-            loader: "ts",
-          }));
+          api.onLoad({ filter: /durable-format\.ts$/ }, async ({ path }) => {
+            const source = await readFile(path, "utf8"),
+              selector = /export const DURABLE_READER_VERSION = \d+;/,
+              ledger = /(export const NATIVE_READER_PROFILES:[\s\S]*?= Object\.freeze\(\{)/;
+            expect(source).toMatch(selector);
+            expect(source).toMatch(ledger);
+            const selected = source.replace(selector, "export const DURABLE_READER_VERSION = 1;");
+            return {
+              contents: coherent
+                ? selected.replace(
+                    ledger,
+                    "$1\n  1: Object.freeze({ manifest: MANIFEST_FORMAT_VERSION, vocabulary: nativeVocabularyFingerprint() }),",
+                  )
+                : selected,
+              loader: "ts",
+            };
+          });
         },
       },
     ],
   });
-  const file = join(dir, "reader1.mjs");
+  const file = join(dir, coherent ? "reader1.mjs" : "unassigned-reader1.mjs");
   await writeFile(file, need(result.outputFiles[0]).contents);
-  older = (await import(pathToFileURL(file).href)) as typeof older;
+  return (await import(pathToFileURL(file).href)) as typeof older;
+}
+beforeAll(async () => {
+  dir = await mkdtemp(join(tmpdir(), "minnow-reader1-"));
+  older = await readerBuild(true);
+});
+it("keeps the module-initialization guard for an incoherent synthetic build", async () => {
+  await expect(readerBuild(false)).rejects.toMatchObject({ code: "MINNOW_FORMAT_UNSUPPORTED" });
 });
 afterAll(async () => {
   if (dir) await rm(dir, { recursive: true, force: true });
@@ -150,11 +184,31 @@ for (const seed of seedsFor("next-durable-older-long-key-reader", [0xb532]))
     await fc.assert(
       fc.asyncProperty(fc.boolean(), fc.boolean(), async (second, complete) => {
         reach.beginHistory();
+        expect(older.DURABLE_READER_VERSION).toBe(1);
+        expect(older.MANIFEST_FORMAT_VERSION).toBe(MANIFEST_FORMAT_VERSION);
+        expect(older.NATIVE_READER_PROFILES[1]).toEqual({
+          manifest: MANIFEST_FORMAT_VERSION,
+          vocabulary: older.nativeVocabularyFingerprint(),
+        });
+        reach.reach("coherent older profile loaded");
+        const supported = older.encodeRootSlot(2, Uint8Array.of(1, 2, 3));
+        expect(older.decodeRootSlot(supported)).toEqual({
+          sequence: 2,
+          root: Uint8Array.of(1, 2, 3),
+        });
+        reach.reach("older own floor accepted");
         expect(DURABLE_READER_VERSION).toBeGreaterThan(1);
         expect(MANIFEST_FORMAT_VERSION).toBeGreaterThan(2);
         const bytes = encodeRootSlot(2, Uint8Array.of(1, 2, 3));
         expect((bytes[10] ?? 0) >>> 5).toBe(DURABLE_READER_VERSION - 1);
         expect(bytes[11]).toBe(MANIFEST_FORMAT_VERSION - 2);
+        expect(() => older.decodeRootSlot(bytes)).toThrow(
+          expect.objectContaining({
+            code: "MINNOW_FORMAT_UNSUPPORTED",
+          }),
+        );
+        expect(() => older.decodeRootSlot(bytes)).toThrow("rootSlot minimum reader");
+        reach.reach("same manifest reader refusal");
         const shim = new MemoryOpfs(),
           slot = second ? "root-1" : "root-0";
         shim.writeFileBytes(slot, bytes);
@@ -185,8 +239,9 @@ for (const seed of seedsFor("next-durable-older-long-key-reader", [0xb532]))
         reach.reach("older OPFS zero writes");
         const factory = new IDBFactory(),
           raw = await openIndexedDb(factory, "older");
+        const idbSlot = second ? "slot-1" : "slot-0";
         await raw.transaction(["roots", "meta"], "readwrite", "strict", (tx) => {
-          tx.store("roots").put("slot-0", bytes.slice().buffer);
+          tx.store("roots").put(idbSlot, bytes.slice().buffer);
           tx.store("meta").put("epoch", 1);
         });
         let idbWrites = 0;
@@ -227,6 +282,15 @@ for (const seed of seedsFor("next-durable-older-long-key-reader", [0xb532]))
         });
         expect(idbWrites).toBe(0);
         raw.close();
+        const inspect = await openIndexedDb(factory, "older");
+        try {
+          await inspect.transaction(["roots", "meta"], "readonly", "relaxed", (tx) => {
+            tx.store("roots").get(idbSlot, (value) => expect(value).toEqual(bytes.slice().buffer));
+            tx.store("meta").get("epoch", (value) => expect(value).toBe(1));
+          });
+        } finally {
+          inspect.close();
+        }
         reach.reach("older IDB zero writes");
         reach.reach(second ? "second root slot" : "first root slot");
         reach.reach(complete ? "complete native tree" : "partial native tree");

@@ -37,6 +37,9 @@ export const DIRECTORY_REFUSAL_REACH = [
   "packed-4099",
 ] as const;
 export const DURABLE_LONG_KEY_REACH = [
+  "coherent older profile loaded",
+  "older own floor accepted",
+  "same manifest reader refusal",
   "WAL-only invalidation",
   "replayed invalidation",
   "memory",
