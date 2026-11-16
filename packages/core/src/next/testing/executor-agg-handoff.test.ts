@@ -6,6 +6,7 @@ import fc from "fast-check";
 import { afterEach, expect, it, vi } from "vitest";
 import { RestoredAggregateOperator } from "../exec/agg/restored.js";
 import { QueryRuntime } from "../exec/run.js";
+import { HashWorkspace } from "../exec/agg/hash-workspace.js";
 import { AGG_HANDOFF_SQL_REACH, createReach } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { ScratchSpillService } from "../spill/scratch-spill.js";
@@ -26,6 +27,8 @@ import { byteSliceEquals } from "./byte-equality.test.fixture.js";
 const suspendProducer = QueryRuntime.prototype.suspendProducer;
 // eslint-disable-next-line @typescript-eslint/unbound-method -- called with the original receiver.
 const finishRestore = RestoredAggregateOperator.prototype.finish;
+// eslint-disable-next-line @typescript-eslint/unbound-method -- called with the original receiver.
+const prepareHash = HashWorkspace.prototype.prepare;
 const observers = new Set<() => void>();
 const activeHistories = new Set<() => void>();
 const campaigns = new Set<AbortController>();
@@ -50,6 +53,8 @@ afterEach(() => {
   expect(QueryRuntime.prototype.suspendProducer).toBe(suspendProducer);
   // eslint-disable-next-line @typescript-eslint/unbound-method -- identity assertion, never invoked unbound.
   expect(RestoredAggregateOperator.prototype.finish).toBe(finishRestore);
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- identity assertion, never invoked unbound.
+  expect(HashWorkspace.prototype.prepare).toBe(prepareHash);
 });
 
 /** Liveness guard: productive FIFO phases may take more than 30 seconds in total. */
@@ -280,7 +285,8 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
           fc.constantFrom("none", "wait", "restore"),
           fc.boolean(),
           fc.boolean(),
-          async (count, size, shape, cancellation, filtered, residentFollower) => {
+          fc.boolean(),
+          async (count, size, shape, cancellation, filtered, residentFollower, lateHeadroom) => {
             campaign.signal.throwIfAborted();
             const cancel = cancellation === "wait";
             const grouped = shape !== "scalar";
@@ -299,7 +305,21 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
               snapshot = core.harness.path.pin(),
               executions: Execution[] = [],
               jobs: Array<Promise<unknown>> = [];
+            // A sizing/read owner can retire after the scan's first open. Releasing this
+            // real reservation models that schedule without depending on host speed.
+            const retiring = await governor.admit({
+              label: "retiring sizing holder",
+              minimumBytes: lateHeadroom ? 8 << 20 : 0,
+              spillable: true,
+            });
+            expect(retiring.allocate(retiring.held)).toBe(true);
+            let sizingRetired = false;
+            const retireSizing = () => {
+              sizingRetired = true;
+              retiring.close();
+            };
             const stop = () => {
+              retireSizing();
               pinned.close();
               for (const execution of executions)
                 execution.cancel(new Error("Handoff history ended"));
@@ -367,6 +387,32 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
                 }
               });
             const closeRetirement = ownObserver(retirement);
+            // Opening a reader can precede retirement of sizing/other producer credit.
+            // Pin at an actual optional growth request, after those bytes were released,
+            // so this history forces pressure regardless of batch/task timing.
+            const growth = vi
+              .spyOn(HashWorkspace.prototype, "prepare")
+              .mockImplementation(function (this: HashWorkspace, peak, signal) {
+                if (!pressured && peak > this.admitted) {
+                  expect(sizingRetired).toBe(true);
+                  pressured = true;
+                  const room = Math.max(
+                    0,
+                    governor.capBytes - governor.reserveBytes - governor.usedBytes,
+                  );
+                  if (room > 0) {
+                    expect(pinned.allocate(room)).toBe(true);
+                    observed.pinned = true;
+                    reach.reach("temporary pinned holder");
+                  }
+                  expect(governor.usedBytes).toBeGreaterThanOrEqual(
+                    governor.capBytes - governor.reserveBytes,
+                  );
+                  reach.reach("growth boundary pressure");
+                }
+                return prepareHash.call(this, peak, signal);
+              });
+            const closeGrowth = ownObserver(growth);
             // Start cancellation only after the sealed restore graph has actually opened.
             const restoration = vi
               .spyOn(RestoredAggregateOperator.prototype, "finish")
@@ -407,6 +453,13 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
               const available =
                 governor.capBytes - governor.usedBytes + (options.idleCredit?.held ?? 0);
               const before = governor.usedBytes;
+              // No follower may return credit before the first pressure cut is sealed.
+              if (
+                phaseRequests === 0 &&
+                options.idleCredit &&
+                options.grants.some((part) => part.minimumBytes > 0)
+              )
+                expect(executions).toHaveLength(1);
               const result = native(options);
               if (options.idleCredit && options.grants.some((part) => part.minimumBytes > 0)) {
                 phaseRequests++;
@@ -420,7 +473,7 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
                   // pool. No reclaimable producer remains, so this is a real FIFO wait.
                   expect(wanted).toBeGreaterThan(available);
                   expect(governor.usedBytes).toBe(before);
-                  for (let i = 1; i < count; i++) start(i);
+                  startFollowers();
                   queueMicrotask(() => {
                     cancelled = 0;
                     executions[0]?.cancel(new Error("cancel pending aggregate phase"));
@@ -429,7 +482,16 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
                     reach.reach("holder releases");
                     followersReady();
                   });
-                } else releaseHolder();
+                } else {
+                  if (phaseRequests === 1) {
+                    // Followers cannot finish and return credit before the first
+                    // pressure cut. They start before this restore resumes, so the
+                    // executions still overlap through the real admission/restore.
+                    startFollowers();
+                    followersReady();
+                  }
+                  releaseHolder();
+                }
                 return result.then((parts) => {
                   expect(snapshot.released).toBe(false);
                   advance();
@@ -457,16 +519,9 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
                 returning: "atExecuted",
                 reads: {
                   open: (pages, chunk, options) => {
-                    if (!pressured && chosen === prepared) {
-                      pressured = true;
-                      const room = Math.max(
-                        0,
-                        governor.capBytes - governor.reserveBytes - governor.usedBytes,
-                      );
-                      if (room > 0 && pinned.allocate(room)) {
-                        observed.pinned = true;
-                        reach.reach("temporary pinned holder");
-                      }
+                    if (chosen === prepared && !sizingRetired) {
+                      retireSizing();
+                      if (lateHeadroom) reach.reach("headroom released at scan open");
                     }
                     // Opening the admitted scan is after parameter copying, before any handoff.
                     caller[0] = "caller changed after binding";
@@ -489,23 +544,25 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
                 return error;
               });
             };
+            const startFollowers = () => {
+              for (let i = 1; i < count; i++) start(i);
+              reach.reach("followers start at first handoff");
+            };
             try {
-              if (cancel) {
-                start(0);
-                const first = jobs[0];
-                if (!first) throw new Error("Missing first phase execution");
-                await deadline(
-                  Promise.race([
-                    followers,
-                    first.then((error) => {
-                      throw error instanceof Error
-                        ? error
-                        : new Error("Query finished without reaching its queued phase");
-                    }),
-                  ]),
-                  activity,
-                );
-              } else for (let i = 0; i < count; i++) start(i);
+              start(0);
+              const first = jobs[0];
+              if (!first) throw new Error("Missing first phase execution");
+              await deadline(
+                Promise.race([
+                  followers,
+                  first.then((error) => {
+                    throw error instanceof Error
+                      ? error
+                      : new Error("Query finished without reaching its forced pressure phase");
+                  }),
+                ]),
+                activity,
+              );
               const results = await deadline(Promise.all(jobs), activity);
               for (let i = 0; i < results.length; i++) {
                 if (i === cancelled)
@@ -552,6 +609,7 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
             } finally {
               closeRetirement();
               closeRestoration();
+              closeGrowth();
               stop();
               activeHistories.delete(stop);
               await Promise.allSettled(jobs);
@@ -572,16 +630,21 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
         ),
         {
           seed,
-          numRuns: 14,
+          // fast-check counts examples inside numRuns. Preserve the original six
+          // random histories alongside eight original and three added examples.
+          numRuns: 17,
           examples: [
-            [2, 0, "scalar", "none", false, false],
-            [2, 512, "scalar", "none", false, false],
-            [2, 2048, "skew", "none", true, false],
-            [2, 512, "many", "none", false, false],
-            [3, 32, "scalar", "wait", true, false],
-            [2, 1024, "skew", "restore", false, false],
-            [2, 0, "scalar", "none", false, true],
-            [3, 512, "many", "none", true, true],
+            [2, 6120, "skew", "none", false, true, false],
+            [2, 6120, "skew", "none", false, true, true],
+            [2, 0, "skew", "none", false, false, true],
+            [2, 0, "scalar", "none", false, false, false],
+            [2, 512, "scalar", "none", false, false, false],
+            [2, 2048, "skew", "none", true, false, false],
+            [2, 512, "many", "none", false, false, false],
+            [3, 32, "scalar", "wait", true, false, false],
+            [2, 1024, "skew", "restore", false, false, false],
+            [2, 0, "scalar", "none", false, true, false],
+            [3, 512, "many", "none", true, true, false],
           ],
         },
       );
@@ -604,12 +667,15 @@ for (const seed of seedsFor("next-aggregation-abandoned-observers", [0xb4f7, 0xb
     expect(QueryRuntime.prototype.suspendProducer).toBe(suspendProducer);
     // eslint-disable-next-line @typescript-eslint/unbound-method -- identity assertion, never invoked unbound.
     expect(RestoredAggregateOperator.prototype.finish).toBe(finishRestore);
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- identity assertion, never invoked unbound.
+    expect(HashWorkspace.prototype.prepare).toBe(prepareHash);
     fc.assert(
       fc.property(fc.boolean(), fc.boolean(), (suspend, restore) => {
         if (suspend)
           vi.spyOn(QueryRuntime.prototype, "suspendProducer").mockResolvedValue(undefined);
         if (restore)
           vi.spyOn(RestoredAggregateOperator.prototype, "finish").mockResolvedValue(undefined);
+        vi.spyOn(HashWorkspace.prototype, "prepare").mockReturnValue(false);
       }),
       {
         seed,
