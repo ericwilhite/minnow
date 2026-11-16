@@ -30,6 +30,8 @@ import { RegistryCommands } from "./registry-commands.js";
 import { RegistryDirectory } from "./registry-directory.js";
 import { RegistryFragments } from "./registry-fragments.js";
 import { RegistryImages } from "./registry-images.js";
+import { RegistryFollowing } from "./registry-following.js";
+import { RegistryTargets } from "./registry-targets.js";
 import type { AcceptedCommandRow } from "./registry-commands.js";
 import { WritePathImpl } from "../write/engine.js";
 import { yieldTask } from "../task.js";
@@ -216,12 +218,30 @@ async function fixture(
     },
   });
   let referentialWork: NativeCommandExecutionScope["runReferential"] | null = null;
+  const targets = new RegistryTargets({
+      rootId: 61,
+      directory,
+      charge: root,
+      signal,
+      checkpoint: () => undefined,
+    }),
+    following = new RegistryFollowing({
+      rootId: 61,
+      catalog: statement.catalog,
+      commands,
+      directory,
+      targets,
+      checks,
+      charge: root,
+      signal,
+    });
   const execution = new NativeCommandExecution({
     frames,
     catalog: statement.catalog,
     commands,
     images,
     checks,
+    following,
     charge: root,
     signal,
     abortRoot: (reason) => stopping.abort(reason),
@@ -279,15 +299,21 @@ async function fixture(
     await commands.close();
     await checks.close();
     await images.close();
+    await targets.close();
     await fragments.close();
     await directory.close();
     bound?.close();
     bound = null;
+    const unretired = root.allocated;
+    // Preserve the boundary's ownership assertion while still fencing/refunding a broken
+    // implementation. A later harness-close error must not hide the original leak.
+    await following.close();
     expect(root.allocated).toBe(0);
     expect(range.allocated).toBe(0);
     root.close();
     range.close();
     expect(spill.bytesInUse).toBe(0);
+    expect(unretired, "native command close retires follow metadata").toBe(0);
   };
   return {
     h,

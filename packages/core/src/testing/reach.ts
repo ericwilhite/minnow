@@ -8527,6 +8527,7 @@ export const NATIVE_BOUNDARY_REACH = [
 ] as const;
 
 export const NATIVE_BOUNDARY_FENCE_REACH = [
+  "follow",
   "image",
   "check",
   "action",
@@ -8537,6 +8538,19 @@ export const NATIVE_BOUNDARY_FENCE_REACH = [
   "zero ownership",
 ] as const;
 
+/** Original follow capture follows each successful incremental unique checkpoint. */
+export const NATIVE_BOUNDARY_FOLLOW_REACH = [
+  "root preparation",
+  "uniqueness before capture",
+  "same token later rows",
+  "successful action preparation",
+  "failed uniqueness skips capture",
+  "multiple actions",
+  "budget-1",
+  "budget0",
+  "budget1",
+  "zero ownership",
+] as const;
 export const NATIVE_BOUNDARY_LISTENER_REACH = [
   "external signal",
   "root signal",

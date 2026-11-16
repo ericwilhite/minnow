@@ -16,6 +16,7 @@ import type { ByteCharge } from "../vector/varlen.js";
 import type { NativeCommandChecks } from "./command-checks.js";
 import type { RegistryImages } from "./registry-images.js";
 import type { RegistryCommands } from "./registry-commands.js";
+import type { RegistryFollowing } from "./registry-following.js";
 
 function invalid(): never {
   throw new TypeError("Invalid native command execution");
@@ -30,6 +31,9 @@ export interface NativeCommandExecutionScope {
   readonly commands: RegistryCommands;
   readonly images: Pick<RegistryImages, "readRowImages" | "readRowBindings" | "close">;
   readonly checks: Pick<NativeCommandChecks, "verifyUnique" | "verifyReference" | "close">;
+  /** Capture original follow identities after uniqueness, before named AFTER work. New
+   * accepted rows on an existing token need a fresh checkpoint; completed ranges never re-probe. */
+  readonly following: Pick<RegistryFollowing, "prepare" | "close">;
   readonly charge: ByteCharge;
   readonly signal: AbortSignal;
   /** Synchronous root-owned AbortController.abort, never a recursive close/rollback.
@@ -191,8 +195,10 @@ export class NativeCommandExecution implements NativeCommandBoundary {
   }
   verifyCommandUnique(command: CommandToken, signal: AbortSignal): Promise<void> {
     return this.#run(signal, async (stop) => {
-      const { commands, checks } = this.scope;
+      const { commands, checks, following } = this.scope;
       await commands.verify(command, "unique", (row, s) => checks.verifyUnique(row, s), stop);
+      this.#check(stop);
+      await following.prepare(command, stop);
     });
   }
   verifyCommandReferences(command: CommandToken, signal: AbortSignal): Promise<void> {
@@ -272,6 +278,7 @@ export class NativeCommandExecution implements NativeCommandBoundary {
       }
       await Promise.allSettled(this.#jobs.filter((job) => job !== null));
       for (const close of [
+        () => scope.following.close(),
         () => scope.images.close(),
         () => scope.checks.close(),
         () => scope.commands.close(),
