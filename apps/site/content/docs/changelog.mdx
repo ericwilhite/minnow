@@ -10,6 +10,17 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The shipped engine’s fast path for SUM and AVG over floating-point columns adds values directly,
+recovering overhead introduced by the 0.19.3 integer-exactness checks. SQL integer aggregates
+still reject inexact intermediate results; floating-point accumulation order is unchanged.
+No stored-format or migration change is required.
+
+The nightly browser performance workflow explicitly installs the file-residency diagnostic
+used by its export measurements. Owner latency samples use nanosecond-rounded intervals to
+avoid rejecting exact browser-clock ticks because of binary subtraction artifacts. Performance
+targets and baseline ratios are unchanged. The SQL gate also records CPU, runtime and host-load
+context before its timed work so cross-runner flags can be investigated.
+
 Private catalog capability validation now visits shared input objects once. External planning,
 replay and loading keep their inspection checks; internal construction avoids repeatedly walking
 the resident catalog on every DDL or replay step. This changes no stored bytes or released formats.

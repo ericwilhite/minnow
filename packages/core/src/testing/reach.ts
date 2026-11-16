@@ -891,6 +891,7 @@ export const INTEGER_ARITHMETIC_EXACTNESS_STATES = [
   "integer text safe",
   "integer text refusal",
   "fractional text refusal",
+  "filtered raw aggregate",
 ] as const;
 
 /** DOUBLE aggregates retain float arithmetic regardless of whole-valued contributions. */
@@ -903,6 +904,7 @@ export const DOUBLE_AGGREGATE_STATES = [
   "dictionary",
   "window",
   "unknown inputs",
+  "filtered raw aggregate",
 ] as const;
 
 /**
@@ -7560,3 +7562,5 @@ export const FTS_CLAIM_CODEC_REACH = [
   "missing flag refused",
   "development predecessor refused",
 ] as const;
+
+export const OWNER_CLOCK_REACH = ["clock tick exact", "over target remains over"] as const;

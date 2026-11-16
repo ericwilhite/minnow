@@ -8,8 +8,9 @@
 # failed cell, or when Minnow's answer differs from the competitor's.
 #
 # The owner lane (job `owner`) is the next core's cross-tab point-read latency in Chromium, Firefox
-# and WebKit: ruling R22.3 judges R6's absolute targets here (MINNOW_PERF_LANE=1), not on loaded
-# shared hosts, where the lane records them without enforcing.
+# and WebKit: ruling R22.3 judges R6's absolute targets here (MINNOW_PERF_LANE=1). This hosted
+# job does not qualify host quietness; preserve the raw measurements when interpreting a failure.
+# Developer runs without that flag record latency without enforcing the absolute targets.
 name: Browser performance
 
 on:
@@ -47,6 +48,13 @@ jobs:
           node-version: 24
           cache: npm
       - run: bash scripts/ci-install.sh
+      - name: Install file-cache diagnostics
+        # Ubuntu 24.04 splits fincore from util-linux; both export diagnostics require it.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y util-linux-extra
+          fincore --version
+          dd --version
       - name: Install Chromium
         run: npx playwright install --with-deps chromium
       - name: Run the lane
@@ -77,8 +85,8 @@ jobs:
         # The analytics harness's aggregation shapes (agg_highcard_int, agg_3dims_20aggs,
         # agg_count_distinct, agg_count_distinct_dictionary, agg_numeric_sum) through the rebuild core's aggregate operator in
         # real Chromium: prebuilt batches, operator cost only, wall time min and median of five.
-        # Recorded nightly so layout changes (row layout, partitioning) are measured on a quiet
-        # host; nothing judges it.
+        # Recorded nightly so layout changes (row layout, partitioning) use the same scheduled
+        # runner; nothing judges it or qualifies host quietness.
         if: always()
         shell: bash
         run: |

@@ -5484,11 +5484,10 @@ class GroupAccumulator {
         if (!isValid(column.validity, slot)) continue;
         counts[column.index] = (counts[column.index] ?? 0) + 1;
         if (column.sums) {
-          state.sums[column.index] = checkedSum(
-            state.sums[column.index] ?? 0,
-            column.values[slot] ?? 0,
-            column.integerArgument,
-          );
+          // Only SQL integer arguments need the checked helper in this hot loop.
+          state.sums[column.index] = column.integerArgument
+            ? checkedSum(state.sums[column.index] ?? 0, column.values[slot] ?? 0, true)
+            : (state.sums[column.index] ?? 0) + (column.values[slot] ?? 0);
         }
       }
       // Only COUNT(DISTINCT) plans pay for this loop: an empty for-of per row cost every grouped

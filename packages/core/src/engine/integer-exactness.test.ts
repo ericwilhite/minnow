@@ -91,6 +91,8 @@ describe("integer exactness", () => {
               "SELECT SUM(a) AS v FROM t GROUP BY g, b",
               "SELECT SUM(a) AS v FROM t GROUP BY g",
               "SELECT AVG(a) AS v FROM t",
+              "SELECT SUM(a) AS v FROM t WHERE g >= 0",
+              "SELECT AVG(a) AS v FROM t WHERE g >= 0",
               "SELECT SUM(a) OVER (ORDER BY g) AS v FROM t",
               "SELECT AVG(a) OVER (ORDER BY g) AS v FROM t",
               "SELECT SUM(a) OVER (ORDER BY g ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS v FROM t",
@@ -101,10 +103,14 @@ describe("integer exactness", () => {
                     { a, b: 0, g: 0, label: "x" },
                     { a: b, b: 0, g: 0, label: "x" },
                   ];
+              // A mixed selection prevents an all-matching chunk from bypassing raw accumulation.
+              const inputRows = sql.includes("WHERE")
+                ? [...rows, { a: 42, b: 0, g: -1, label: "x" }]
+                : rows;
               for (const execute of [executeQuery, executeRowQuery]) {
                 const plan = compileQuery(sql);
                 annotatePlanIntegerDivision(plan, () => true);
-                const run = () => execute(plan, new Map([["t", rows]]));
+                const run = () => execute(plan, new Map([["t", inputRows]]));
                 if (!safe) expect(run, sql).toThrow(RangeError);
                 else {
                   const result = run();
@@ -114,6 +120,7 @@ describe("integer exactness", () => {
                 }
               }
               if (sql.includes("label")) reach.reach("dictionary aggregate");
+              if (sql.includes("WHERE")) reach.reach("filtered raw aggregate");
             }
 
             for (const [operator, x, y] of [
@@ -165,6 +172,8 @@ describe("integer exactness", () => {
             for (const sql of [
               "SELECT SUM(d) AS v FROM t",
               "SELECT AVG(d) AS v FROM t",
+              "SELECT SUM(d) AS v FROM t WHERE k >= 0",
+              "SELECT AVG(d) AS v FROM t WHERE k >= 0",
               "SELECT SUM(DISTINCT d) AS v FROM t",
               "SELECT SUM(d) AS v FROM t GROUP BY g",
               "SELECT SUM(d) AS v FROM t GROUP BY k",
@@ -175,6 +184,9 @@ describe("integer exactness", () => {
               "SELECT AVG(d) OVER (ORDER BY id) AS v FROM t",
               "SELECT SUM(d) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS v FROM t",
             ]) {
+              const inputRows = sql.includes("WHERE")
+                ? [...rows, { d: 41.25, id: 3, g: "a", k: -1 }]
+                : rows;
               const contributions = sql.includes("DISTINCT")
                 ? [...new Set(values)]
                 : sql.includes("1 PRECEDING")
@@ -185,15 +197,19 @@ describe("integer exactness", () => {
               for (const execute of [executeQuery, executeRowQuery]) {
                 const plan = compileQuery(sql);
                 annotatePlanIntegerDivision(plan, () => new Set());
-                expect(execute(plan, new Map([["t", rows]])).rows.at(-1)?.v, sql).toBe(expected);
-                // No catalog means the column has no integer declaration, even if every value is whole.
-                expect(execute(compileQuery(sql), new Map([["t", rows]])).rows.at(-1)?.v, sql).toBe(
+                expect(execute(plan, new Map([["t", inputRows]])).rows.at(-1)?.v, sql).toBe(
                   expected,
                 );
+                // No catalog means the column has no integer declaration, even if every value is whole.
+                expect(
+                  execute(compileQuery(sql), new Map([["t", inputRows]])).rows.at(-1)?.v,
+                  sql,
+                ).toBe(expected);
               }
               if (sql.includes("GROUP BY g") || sql.includes("CASE"))
                 doubleReach.reach("dictionary");
               if (sql.includes("OVER")) doubleReach.reach("window");
+              if (sql.includes("WHERE")) doubleReach.reach("filtered raw aggregate");
             }
             doubleReach.reach("unknown inputs");
           },
