@@ -1,3 +1,4 @@
+import type { RetirementInventory } from "../storage/retirement-contract.js";
 import { FtsMutations, type FtsMutationCommit } from "./fts-mutations.js";
 import { ftsMutationScan } from "./fts-undo.js";
 import { checkpointFtsMutations } from "./fts-mutation-checkpoint.js";
@@ -5642,6 +5643,7 @@ export class ExtentSinkError extends Error {
  * `ExtentSinkError`) without undoing the install, retrying, or skipping the publisher's cleanup.
  */
 class DeltaPublication {
+  #retirementInventory: RetirementInventory | undefined;
   #ftsRetireBytes = 0;
   retireFts(retired: ExtentRef[], extent: ExtentRef): void {
     if (retired.some((old) => sameExtent(old, extent))) return;
@@ -5674,7 +5676,13 @@ class DeltaPublication {
    * added to `retired`) and returns it for the root; then tells the sink, if any, the attempt's
    * whole delta (the list pages included, so `added`/`released` stay exact for a full walk).
    */
-  async prepare(sequence: number, writer: ExtentWriter, retired: ExtentRef[]): Promise<ExtentList> {
+  async prepare(
+    sequence: number,
+    writer: ExtentWriter,
+    retired: ExtentRef[],
+    inventory?: RetirementInventory,
+  ): Promise<ExtentList> {
+    this.#retirementInventory = inventory;
     const attempt = this.nextAttempt();
     this.#attempt = attempt;
     this.#sequence = sequence;
@@ -5683,6 +5691,7 @@ class DeltaPublication {
       prepared = await this.lists.prepare(attempt, {
         added: writer.extents,
         released: retired,
+        ...(inventory === undefined ? {} : { releasedInventory: inventory }),
         writer,
       });
     } catch (error) {
@@ -5700,6 +5709,7 @@ class DeltaPublication {
         result = await this.sink.prepare(attempt, {
           added: writer.extents,
           released: retired,
+          ...(inventory === undefined ? {} : { releasedInventory: inventory }),
           writer,
         });
       } catch (error) {
@@ -5728,6 +5738,9 @@ class DeltaPublication {
     await space.publish(root, {
       writers: [writer],
       retired,
+      ...(this.#retirementInventory === undefined
+        ? {}
+        : { retiredInventory: this.#retirementInventory }),
       list: this.#preparedList,
       budget: this.budget,
     });
@@ -5739,6 +5752,7 @@ class DeltaPublication {
     try {
       this.#settle();
     } finally {
+      this.#retirementInventory = undefined;
       const charge = this.#ftsRetireBytes;
       this.#ftsRetireBytes = 0;
       if (charge) this.budget.free(charge);

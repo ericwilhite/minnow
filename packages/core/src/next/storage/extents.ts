@@ -181,6 +181,11 @@
  * assumes a file.
  */
 import type { TaskWork } from "../task.js";
+import type {
+  RetirementInput,
+  RetirementOptions,
+  RetirementInventory,
+} from "./retirement-contract.js";
 import type { ExtentList } from "./extent-list.js";
 import type { StoreSession } from "./contract.js";
 import type { RootPin } from "./reclaim.js";
@@ -509,6 +514,8 @@ export interface PublishChange extends TaskWork {
   readonly writers: readonly ExtentWriter[];
   /** Extents the previous durable root reaches and the new one does not, each exactly once. */
   readonly retired: readonly ExtentRef[];
+  /** Same-space immutable inventory, unioned with the bounded array (duplicates refuse). */
+  readonly retiredInventory?: RetirementInventory;
   /** Complete generation replacement: use the immutable current-root disk inventory as
    * retirement claims, never materialize it in the caller. Explicit retired must be empty.
    * The ordinary before-minus-after proof still rejects any extent shared with the new root. */
@@ -571,6 +578,13 @@ export interface ExtentSpace extends ExtentReader {
    * builders asks the budget for its own staging buffer (see "Memory").
    */
   beginWrite(label: string, options?: WriteOptions): ExtentWriter;
+  /** Prepare a bounded, replayable owner-private set. Pages require NEW-root retained witnesses
+   * to subtract packed/shared aliases. Caller owns source pins and releases the inventory only
+   * after keeper/observers/publication settle. No new persistent format or recovery authority. */
+  prepareRetirements(
+    input: RetirementInput,
+    options: RetirementOptions,
+  ): Promise<RetirementInventory>;
   /** Atomically and durably makes `root` current; returns its generation. See "Publish". */
   publish(root: Uint8Array, change: PublishChange): Promise<number>;
   /**

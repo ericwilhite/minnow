@@ -365,8 +365,17 @@ for (const field of ["added", "released"] as const)
         return Reflect.get(target, key, receiver) as unknown;
       },
     });
-    const space = new MemoryExtentSpace();
     const charged = countingBudget(8 << 20);
+    // Large releases use the native immutable inventory, not a resident-only page fixture.
+    // Keep the same input/read bound/abort identity while exercising production preparation.
+    const backend = new MemoryBackend();
+    const lease = await backend.acquire();
+    const session = await backend.open(lease);
+    const space = await openExtentSpace(session, {
+      reachable: () => [],
+      budget: charged,
+      registerCache: () => countingMemory(Infinity),
+    });
     const controller = new AbortController();
     const reason = new Error("cancel during input copy");
     const keeper = new ExtentListKeeper([], {
@@ -382,16 +391,21 @@ for (const field of ["added", "released"] as const)
         controller.abort(reason);
       },
     });
+    const writer = space.beginWrite("copy cancel");
     try {
       await expect(
         keeper.prepare(1, {
           added: field === "added" ? input : [],
           released: field === "released" ? input : [],
-          writer: space.beginWrite("copy cancel"),
+          writer,
         }),
       ).rejects.toBe(reason);
       expect(charged.used).toBe(0);
     } finally {
       keeper.close();
+      await writer.abort();
+      await space.close();
+      await session.close();
+      await lease.release();
     }
   });

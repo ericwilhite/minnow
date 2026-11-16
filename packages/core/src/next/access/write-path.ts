@@ -401,6 +401,8 @@ export interface PublishDelta {
    * older pins (two-generation reclaim, R8): not reusable yet.
    */
   readonly released: readonly ExtentRef[];
+  /** Additional exact releases, read through fixed windows; caller retains until settlement. */
+  readonly releasedInventory?: import("../storage/retirement-contract.js").RetirementInventory;
   /** The attempt's writer, still open. */
   readonly writer: SpaceWriter;
 }

@@ -24,6 +24,12 @@
  * the durable root's list at open, never from earlier callbacks (a sink that failed mid-publication
  * is rebuilt by reopening).
  */
+import type {
+  RetirementCursor,
+  RetirementInventory,
+  RetirementInput,
+  RetirementOptions,
+} from "./retirement-contract.js";
 import { DURABLE_FORMATS, requireHeader } from "../durable-format.js";
 import { pauseIfDue, sortInSlices, type TaskWork } from "../task.js";
 import { StoreCorruptionError } from "./contract.js";
@@ -267,6 +273,8 @@ export async function extentsOf(
 export interface ExtentListDelta {
   readonly added: readonly ExtentRef[];
   readonly released: readonly ExtentRef[];
+  /** Additional immutable releases; caller owns it through every observer and publication. */
+  readonly releasedInventory?: RetirementInventory;
   /** The publication's writer, still open: the new pages are written into it. */
   readonly writer: ExtentWriter;
 }
@@ -280,12 +288,57 @@ export interface PreparedList {
 }
 
 export interface ExtentListKeeperOptions extends TaskWork {
-  /** Reads the pages a delta touches (the extent space). */
+  /** Reads the pages a delta touches. Unbounded release arrays require the native
+   * ExtentSpace.prepareRetirements service; alternate readers support the bounded array path. */
   readonly reader: ExtentReader;
   /** Admits keeper scratch, read leases and retained prepared/committed list metadata. */
   readonly budget: ByteBudget;
   /** Extents per page at most (tests use small pages); default `LIST_PAGE_EXTENTS`. */
   readonly pageExtents?: number;
+}
+
+/** Small deltas avoid scratch I/O. Larger arrays use the same disk inventory as streamed input. */
+const RESIDENT_RELEASE_LIMIT = 4096;
+
+class ResidentReleases implements RetirementCursor {
+  offset = 0;
+  length = 0;
+  #at = 0;
+  constructor(private values: readonly ExtentRef[]) {}
+  next(): boolean {
+    const value = this.values[this.#at++];
+    if (value === undefined) return false;
+    this.offset = value.offset;
+    this.length = value.length;
+    return true;
+  }
+  async close(): Promise<void> {
+    this.values = [];
+  }
+}
+
+/** No page/frame borrow survives the yielded descriptor. captureAudit releases its workspace
+ * while awaiting this source, including when the source cursor belongs to this same space. */
+async function* combinedReleases(
+  delta: ExtentListDelta,
+  budget: ByteBudget,
+  work: TaskWork,
+): AsyncGenerator<ExtentRef> {
+  const cursor = delta.releasedInventory?.cursor({
+    budget,
+    ...(work.signal === undefined ? {} : { signal: work.signal }),
+  });
+  try {
+    if (cursor !== undefined)
+      while (await cursor.next(work)) yield { offset: cursor.offset, length: cursor.length };
+    for (const extent of delta.released) {
+      const pending = pauseIfDue(work);
+      if (pending !== undefined) await pending;
+      yield extent;
+    }
+  } finally {
+    await cursor?.close();
+  }
 }
 
 const byOffset = (a: ExtentRef, b: ExtentRef) => a.offset - b.offset;
@@ -405,22 +458,54 @@ export class ExtentListKeeper {
     const firstPause = pauseIfDue(this.#work);
     if (firstPause !== undefined) await firstPause;
     const pages = this.#committed;
-    if (delta.added.length === 0 && delta.released.length === 0)
+    if (
+      delta.added.length === 0 &&
+      delta.released.length === 0 &&
+      (delta.releasedInventory?.count ?? 0) === 0
+    )
       return { list: pages, retire: [], charge: 0, retireCharge: 0 };
-    // Input copies + sort workspace; two pages' objects/slots and one encoded output; retained
-    // result pages plus retirement set/maps. Reserve every component before allocating it.
-    const resultCapacity = 2 * pages.length + Math.ceil(delta.added.length / this.#pageExtents) + 1;
-    const charge =
-      32 * (delta.added.length + delta.released.length) +
-      256 * this.#pageExtents +
-      1024 +
-      512 * resultCapacity +
-      128 * pages.length;
-    reserve(this.#budget, charge);
+    // Above the bounded array fast path, releases are streamed from the native inventory.
+    let ownedInventory: RetirementInventory | undefined;
+    let cursor: RetirementCursor | undefined;
+    let charge = 0;
     let retained = 0;
     try {
-      // The reservation above includes both copies. Check the shared deadline while reading
-      // caller-owned inputs too: a later sliced sort cannot bound this preceding work.
+      let inventory = delta.releasedInventory;
+      if (
+        delta.released.length > RESIDENT_RELEASE_LIMIT ||
+        (inventory !== undefined && delta.released.length > 0)
+      ) {
+        const service = this.#reader as ExtentReader & {
+          prepareRetirements?: (
+            input: RetirementInput,
+            options: RetirementOptions,
+          ) => Promise<RetirementInventory>;
+        };
+        if (service.prepareRetirements === undefined)
+          throw new TypeError(
+            "Large extent deltas require the native retirement inventory service",
+          );
+        ownedInventory = await service.prepareRetirements(
+          combinedReleases(delta, this.#budget, this.#work),
+          {
+            ...this.#work,
+            budget: this.#budget,
+            duplicates: "refuse",
+          },
+        );
+        inventory = ownedInventory;
+      }
+      const residentLength = inventory === undefined ? delta.released.length : 0;
+      const resultCapacity =
+        2 * pages.length + Math.ceil(delta.added.length / this.#pageExtents) + 1;
+      const required =
+        32 * (delta.added.length + residentLength) +
+        256 * this.#pageExtents +
+        1024 +
+        512 * resultCapacity +
+        128 * pages.length;
+      reserve(this.#budget, required);
+      charge = required;
       const copy = async (input: readonly ExtentRef[]) => {
         const result: ExtentRef[] = [];
         for (let start = 0; start < input.length; start += 128) {
@@ -438,14 +523,22 @@ export class ExtentListKeeper {
         return result;
       };
       const added = await copy(delta.added);
-      const released = await copy(delta.released);
       await sortInSlices(added, byOffset, this.#work);
-      await sortInSlices(released, byOffset, this.#work);
+      if (inventory === undefined) {
+        const released = await copy(delta.released);
+        await sortInSlices(released, byOffset, this.#work);
+        cursor = new ResidentReleases(released);
+      } else
+        cursor = inventory.cursor({
+          budget: this.#budget,
+          ...(this.#work.signal === undefined ? {} : { signal: this.#work.signal }),
+        });
+      let hasRelease = await cursor.next(this.#work);
       const out: ExtentListPage[] = [];
       let buffer: ExtentRef[] = [];
       let previousEnd = -1;
       let ai = 0;
-      let ri = 0;
+
       const flush = async () => {
         const first = buffer[0];
         if (first === undefined) return;
@@ -464,7 +557,7 @@ export class ExtentListKeeper {
             `Extent list: duplicate or overlapping addition at ${String(extent.offset)}`,
           );
         previousEnd = extent.offset + extent.length;
-        buffer.push(extent);
+        buffer.push({ offset: extent.offset, length: extent.length });
         if (buffer.length === this.#pageExtents) return flush();
         return undefined;
       };
@@ -474,28 +567,17 @@ export class ExtentListKeeper {
         const page = pages[index];
         const next = pages[index + 1];
         const end = next?.first ?? Infinity;
-        const addStart = ai;
-        const releaseStart = ri;
-        while ((added[ai]?.offset ?? Infinity) < end) {
-          if (ai % 128 === 0) {
-            const pending = pauseIfDue(this.#work);
-            if (pending !== undefined) await pending;
-          }
-          ai++;
-        }
-        while ((released[ri]?.offset ?? Infinity) < end) {
-          if (ri % 128 === 0) {
-            const pending = pauseIfDue(this.#work);
-            if (pending !== undefined) await pending;
-          }
-          ri++;
-        }
         const mergeNeighbour =
           page !== undefined &&
           buffer.length > 0 &&
           buffer.length < this.#pageExtents / 2 &&
           buffer.length + page.count <= this.#pageExtents;
-        if (page !== undefined && ai === addStart && ri === releaseStart && !mergeNeighbour) {
+        if (
+          page !== undefined &&
+          (added[ai]?.offset ?? Infinity) >= end &&
+          (!hasRelease || cursor.offset >= end) &&
+          !mergeNeighbour
+        ) {
           await flush();
           out.push(page);
           continue;
@@ -505,41 +587,38 @@ export class ExtentListKeeper {
             ? null
             : await readPages([page], this.#reader, this.#budget, this.#work);
         try {
-          let a = addStart;
-          let r = releaseStart;
           let processed = 0;
           for (const extent of held?.pages[0] ?? []) {
             if (processed++ % 128 === 0) {
               const pending = pauseIfDue(this.#work);
               if (pending !== undefined) await pending;
             }
-            const removal = released[r];
-            if (r < ri && removal !== undefined && removal.offset < extent.offset)
+            if (hasRelease && cursor.offset < extent.offset)
               throw new StoreCorruptionError(
-                `Extent list: the publication releases extents the list does not name (first at ${String(removal.offset)})`,
+                `Extent list: the publication releases extents the list does not name (first at ${String(cursor.offset)})`,
               );
             let keep = true;
-            if (r < ri && removal?.offset === extent.offset) {
-              if (removal.length !== extent.length)
+            if (hasRelease && cursor.offset === extent.offset) {
+              if (cursor.length !== extent.length)
                 throw new StoreCorruptionError(
-                  `Extent list: the publication releases ${String(extent.offset)} as ${String(removal.length)} bytes, the list has ${String(extent.length)}`,
+                  `Extent list: the publication releases ${String(extent.offset)} as ${String(cursor.length)} bytes, the list has ${String(extent.length)}`,
                 );
               keep = false;
-              r++;
+              hasRelease = await cursor.next(this.#work);
             }
-            while (a < ai && (added[a]?.offset ?? Infinity) < extent.offset) {
-              if (a % 128 === 0) {
+            while ((added[ai]?.offset ?? Infinity) < extent.offset) {
+              if (ai % 128 === 0) {
                 const pending = pauseIfDue(this.#work);
                 if (pending !== undefined) await pending;
               }
-              const addition = added[a++];
+              const addition = added[ai++];
               if (addition !== undefined) {
                 const pending = append(addition);
                 if (pending !== undefined) await pending;
               }
             }
             if (keep) {
-              if (a < ai && added[a]?.offset === extent.offset)
+              if (added[ai]?.offset === extent.offset)
                 throw new StoreCorruptionError(
                   `Extent list: the publication adds the extent at ${String(extent.offset)}, which the list already names`,
                 );
@@ -547,16 +626,16 @@ export class ExtentListKeeper {
               if (pending !== undefined) await pending;
             }
           }
-          if (r !== ri)
+          if (hasRelease && cursor.offset < end)
             throw new StoreCorruptionError(
               "Extent list: the publication releases extents the list does not name",
             );
-          while (a < ai) {
-            if (a % 128 === 0) {
+          while ((added[ai]?.offset ?? Infinity) < end) {
+            if (ai % 128 === 0) {
               const pending = pauseIfDue(this.#work);
               if (pending !== undefined) await pending;
             }
-            const addition = added[a++];
+            const addition = added[ai++];
             if (addition !== undefined) {
               const pending = append(addition);
               if (pending !== undefined) await pending;
@@ -568,7 +647,7 @@ export class ExtentListKeeper {
         const nextTouched =
           next !== undefined &&
           ((added[ai]?.offset ?? Infinity) < (pages[index + 2]?.first ?? Infinity) ||
-            (released[ri]?.offset ?? Infinity) < (pages[index + 2]?.first ?? Infinity));
+            (hasRelease ? cursor.offset : Infinity) < (pages[index + 2]?.first ?? Infinity));
         if (
           next === undefined ||
           nextTouched ||
@@ -583,10 +662,22 @@ export class ExtentListKeeper {
       if (pending !== undefined) await pending;
       const listCharge = 128 + out.length * PAGE_MEMORY_BYTES;
       const retireCharge = 64 + retire.length * 16;
+      await cursor.close();
+      cursor = undefined;
+      await ownedInventory?.release();
+      ownedInventory = undefined;
       retained = listCharge + retireCharge;
       return { list: out, retire, charge: listCharge, retireCharge };
     } finally {
-      this.#budget.free(charge - retained);
+      try {
+        await cursor?.close();
+      } finally {
+        try {
+          await ownedInventory?.release();
+        } finally {
+          this.#budget.free(charge - retained);
+        }
+      }
     }
   }
 }

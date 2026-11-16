@@ -4402,3 +4402,30 @@ An untouched sequence captures its configured start; restored and setval horizon
 exact bigint values. The result stays charged until its idempotent `release()`.
 Catalog lanes and logged changes use the common binary MCAT/MCHG codecs; stage4 does not add
 a parallel tagged-JSON grammar.
+
+### Bounded retirement inventories (R25/R8)
+
+`ExtentSpace.prepareRetirements(source, { budget, retained?, duplicates? })` captures arbitrary
+retired extent/page streams into the same owner-private disk inventory used by complete snapshot
+replacement. Capture yields the metadata workspace while a producer waits; sorting and optional
+new-root alias subtraction use the existing bounded native merge. Page candidates require the new
+root's retained-reference witness (possibly empty). Whole extents may be supplied directly.
+The inventory is preparation, never permission to free data: publication still verifies its exact
+claims against both immutable root inventories and the supplied sealed writers.
+
+`PublishChange.retiredInventory`, `PublishDelta.releasedInventory` and the extent-list keeper carry
+this capability alongside ordinary release arrays. Arrays are a bounded fast path up to4096
+entries, saving the measured inventory I/O for small deltas; larger arrays automatically spool.
+Alternate extent readers must supply the native retirement service for that large-array path.
+The keeper consumes sorted scalar releases in one pass, without a per-retired-extent copy. Its
+existing root-list/output-page descriptor bounds still apply. List-page retirements merge with
+the inventory claims before the unchanged exact R25 publication check.
+
+Preparation precharges4096B plus the4096B returned owner. Each independent replay cursor charges
+65504B for one fixed window and control state. A queued publication charges256B for its borrow
+before queuing. Cursor frames never escape a metadata phase; caller source pins remain separately
+owned. Release stops new uses, drains started producer/reader I/O and accepted publications, then
+returns descriptor credit. Space close applies the same fences. Data becomes reusable exactly
+once only after neither root slot nor an old pin reaches it. Crash recovery uses the durable root
+lists, never this reconstructible private file. No durable grammar, format version, public API or
+shipped-engine behavior changes here; the native FTS builder is not wired to this seam yet.
