@@ -9572,3 +9572,34 @@ export const NATIVE_PREFIX_IMAGES_LIFETIME_REACH = [
   "source loan repaid",
   "zero ownership",
 ] as const;
+
+/** Complete native RI payload inputs remain replayable through mutations and handle retirement. */
+export const NATIVE_CHILD_INPUT_REACH = [
+  "shared files",
+  "empty",
+  "nonempty",
+  "many inputs",
+  "resident",
+  "published",
+  "fragmented payload",
+  "small payload",
+  "complete before continuation",
+  "replay after mutation",
+  "retired handle",
+  "images survive retirement",
+  "foreign handle",
+  "fixed metadata",
+  "zero ownership",
+] as const;
+export const NATIVE_CHILD_INPUT_FENCE_REACH = [
+  "IO fault",
+  "between rows",
+  "payload IO",
+  "phase change",
+  "caller cancellation",
+  "external close",
+  "pending metadata",
+  "no partial handle",
+  "source retired",
+  "zero ownership",
+] as const;
