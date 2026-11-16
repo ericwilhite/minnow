@@ -202,8 +202,10 @@ query front end grows slightly: each engine entry's raw size cap rises once by 5
 main and OPFS gzip caps by 128 bytes each; client bundle and isolation limits are unchanged.
 
 The unexported rebuild adds charged, statement-owned CHECK and stored-generated-column
-kernels shared by ordinary writes and foreign-key actions. CHECK passes NULL and preserves
-row/constraint error order; generated recomputation keeps the old row intact for key checks.
+kernels shared by ordinary writes and foreign-key actions. CHECK passes NULL. Generated
+expressions, NOT NULL and CHECK validation preserve row and constraint-name error order;
+this ordering claim does not cover unique or foreign-key checks. Generated recomputation
+keeps the old row intact for key checks.
 This internal module changes no published behavior or stored format. DML routing now uses
 these kernels; trigger firing remains a separate integration.
 

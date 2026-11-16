@@ -8526,3 +8526,30 @@ export const STAGED_FRAGMENT_MAXIMA_REACH = [
   "append after reopen",
   "zero charge",
 ] as const;
+
+/** Internal RI writers and actual selected index/empty SQL DML retain FTS undo/WAL atomicity. */
+export const MODIFY_FTS_PATHS_REACH = [
+  "ri update",
+  "ri delete",
+  "keyLookup update",
+  "keyLookup delete",
+  "indexRange update",
+  "indexRange delete",
+  "zero update",
+  "zero delete",
+  "ri commit",
+  "ri rollback",
+  "ri savepoint",
+  "keyLookup commit",
+  "keyLookup rollback",
+  "keyLookup savepoint",
+  "indexRange commit",
+  "indexRange rollback",
+  "indexRange savepoint",
+  "commit",
+  "rollback",
+  "savepoint",
+  "resident",
+  "stored",
+  "reopen",
+] as const;

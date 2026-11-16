@@ -6,13 +6,20 @@ import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
 import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
-import { createReach, MODIFY_FTS_REACH, MODIFY_FTS_COALESCING_REACH } from "../../testing/reach.js";
+import {
+  createReach,
+  MODIFY_FTS_REACH,
+  MODIFY_FTS_COALESCING_REACH,
+  MODIFY_FTS_PATHS_REACH,
+} from "../../testing/reach.js";
 import { currentEngine } from "../../testing/differential-current.js";
 import { ftsDef } from "../access/fts-def.js";
 import { StatementRules } from "../exec/statement-rules.js";
 import { compileTableRules } from "../exec/rules.js";
 import { ChunkReader } from "../page/reader.js";
 import { walkFtsTree } from "../format/fts-storage.js";
+import type { Rel } from "../ir/ir.js";
+import { ftsMutationScan } from "../write/fts-undo.js";
 import { StatementImpl, TransactionImpl } from "../write/transaction.js";
 import { StorageCore } from "./storage-core.js";
 import { oracleRows } from "./differential-adapter.js";
@@ -28,9 +35,22 @@ import { Harness, batch, texts, rules } from "../write/test-support.js";
 
 let queryId = 1_000_000;
 /** Real compiled MODIFY in a caller-controlled transaction; no alternate writer/model. */
-async function run(core: StorageCore, tx: TransactionImpl, sql: string) {
+function usesIndex(rel: Rel, route: "keyLookup" | "indexRange"): boolean {
+  if (rel.op === route) return true;
+  if ("input" in rel && usesIndex(rel.input, route)) return true;
+  if ("left" in rel && (usesIndex(rel.left, route) || usesIndex(rel.right, route))) return true;
+  return "inputs" in rel && rel.inputs.some((input) => usesIndex(input, route));
+}
+async function run(
+  core: StorageCore,
+  tx: TransactionImpl,
+  sql: string,
+  route?: "keyLookup" | "indexRange",
+) {
   const lowered = core.lowerer.lower(sql, { ...core.context(), catalog: tx.catalog });
   if (lowered.kind !== "modify" || lowered.plan.root.op !== "modify") throw new Error("modify");
+  if (route)
+    expect(usesIndex(lowered.plan.root.input, route), "actual compiled DML index input").toBe(true);
   const rowRules = new StatementRules(
     tx.catalog,
     lowered.plan.root.tableId,
@@ -434,3 +454,224 @@ for (const seed of seedsFor("next-modify-fts-coalescing", [0xb615, 0xb616]))
     );
     reach.assertReached();
   }, 60_000);
+
+// These histories use the same real compiled executor as the main campaign. In RI
+// cases the root targets parents; only the internal child writer can notify docs.
+for (const seed of seedsFor("next-modify-fts-paths", [0xb619, 0xb61a]))
+  it(`journals internal RI, selected index and empty DML paths ${String(seed)}`, async () => {
+    const reach = createReach("FTS native writer paths", MODIFY_FTS_PATHS_REACH),
+      pg = new PGlite(),
+      shipped = await currentEngine("memory");
+    await pg.waitReady;
+    try {
+      await fc.assert(
+        fc.asyncProperty(
+          fc.constantFrom("ri", "keyLookup", "indexRange", "zero"),
+          fc.constantFrom("update", "delete"),
+          fc.constantFrom("commit", "rollback", "savepoint"),
+          fc.integer({ min: 3, max: 9 }),
+          fc.boolean(),
+          async (path, event, mode, n, stored) => {
+            reach.beginHistory();
+            const core = new StorageCore(stored ? 2 : 16);
+            let tx: TransactionImpl | undefined;
+            const notes: string[] = [];
+            let docsId = 0;
+            // eslint-disable-next-line @typescript-eslint/unbound-method
+            const nativeNote = StatementImpl.prototype.noteFtsMutation;
+            const spy = vi
+              .spyOn(StatementImpl.prototype, "noteFtsMutation")
+              .mockImplementation(function (this: StatementImpl, id, kind) {
+                if (id === docsId) notes.push(kind);
+                nativeNote.call(this, id, kind);
+              });
+            const reference = async (sql: string) => {
+              await pg.exec(sql);
+              await shipped.run({ kind: "sql", sql });
+            };
+            const all = async (sql: string) => {
+              await core.execute(sql);
+              await reference(sql);
+            };
+            try {
+              await openFtsHarness(core.harness);
+              const context = core.context.bind(core);
+              core.context = () => ({
+                ...context(),
+                statistics: { table: () => ({ rowCount: 1000000, column: () => null }) },
+              });
+              await reference("DROP TABLE IF EXISTS docs");
+              await reference("DROP TABLE IF EXISTS parents");
+              await all("CREATE TABLE parents(id INT PRIMARY KEY,v INT)");
+              const schema =
+                "CREATE TABLE docs(id INT PRIMARY KEY,body TEXT,n INT REFERENCES parents(id) ON DELETE CASCADE)";
+              await core.execute(schema);
+              await shipped.run({ kind: "sql", sql: schema });
+              // Omitted ON UPDATE follows original parent identities in the product;
+              // explicit PG CASCADE is the independent reference for these disjoint keys.
+              await pg.exec(
+                schema.replace("ON DELETE CASCADE", "ON DELETE CASCADE ON UPDATE CASCADE"),
+              );
+              await all("CREATE INDEX docs_n ON docs(n)");
+              const table = core.harness.path.catalog.tableByName("docs");
+              if (!table?.columns[1]) throw new Error("docs definition");
+              docsId = table.id;
+              const { id: _id, ...fts } = ftsDef(1, docsId, table.columns[1].id);
+              void _id;
+              await core.change({ kind: "createFts", fts });
+              await all(
+                `INSERT INTO parents VALUES ${Array.from({ length: n }, (_, i) => `(${String(i + 1)},0)`).join(",")}`,
+              );
+              await all(
+                `INSERT INTO docs VALUES ${Array.from({ length: n }, (_, i) => `(${String(i + 1)},'alpha ${String(i)}',${String(i + 1)})`).join(",")}`,
+              );
+              if (stored) await core.harness.path.quiesce();
+              const before = structuredClone(core.harness.path.state().root.fts),
+                last = await lastFtsCommit(core.harness);
+              tx = await begin(core);
+              const accounting = funded(tx),
+                point = tx.savepoint();
+              try {
+                await reference("BEGIN");
+                await reference("SAVEPOINT start_here");
+                const target = path === "ri" ? "parents" : "docs";
+                const predicate =
+                  path === "zero"
+                    ? `id=${String(n + 999)}`
+                    : path === "indexRange"
+                      ? "n>=1 AND n<3"
+                      : "id IN(1,2,1)";
+                const sql =
+                  event === "delete"
+                    ? `DELETE FROM ${target} WHERE ${predicate}`
+                    : `UPDATE ${target} SET ${path === "ri" ? "id=id+100" : "body='changed'"} WHERE ${predicate}`;
+                const currentTx = tx;
+                const parentId = tx.catalog.tableByName("parents")?.id;
+                if (!parentId) throw new Error("parents definition");
+                const history = () => [...ftsMutationScan(currentTx)].filter((e) => e !== null);
+                expect(history()).toEqual([]);
+                notes.length = 0;
+                const undoLength = tx.undo.length;
+                await run(
+                  core,
+                  tx,
+                  sql,
+                  path === "keyLookup" || path === "indexRange" ? path : undefined,
+                );
+                await reference(sql);
+                accounting.check();
+                if (path === "zero") {
+                  expect(notes, "empty target must not notify").toEqual([]);
+                  expect(history(), "empty target preserves mutation history").toEqual([]);
+                  expect(tx.undo).toHaveLength(undoLength);
+                  reach.reach(`zero ${event}`);
+                } else {
+                  expect(
+                    notes.length,
+                    "accepted child writer notifies before completion",
+                  ).toBeGreaterThan(0);
+                  expect(notes.every((kind) => kind === event)).toBe(true);
+                  expect(history().map((e) => e.tableId)).toEqual(
+                    path === "ri" ? [parentId, docsId] : [docsId],
+                  );
+                  reach.reach(`${path} ${event}`);
+                }
+                if (mode === "rollback") {
+                  tx.rollback();
+                  await reference("ROLLBACK");
+                } else {
+                  if (mode === "savepoint") {
+                    tx.rollbackTo(point);
+                    await reference("ROLLBACK TO SAVEPOINT start_here");
+                    expect(history()).toEqual([]);
+                    accounting.check();
+                  }
+                  const receipt = await tx.commit(null);
+                  await receipt.durable;
+                  await reference("COMMIT");
+                  const keyed = mode === "commit" && path !== "zero";
+                  const logged = await lastFtsCommit(core.harness);
+                  if (keyed) {
+                    expect(logged.lastLsn).toBe(receipt.lsn);
+                    expect(
+                      logged.body.effects.filter(
+                        (e) => e.kind === "ftsMutation" && e.tableId === docsId,
+                      ),
+                    ).toHaveLength(1);
+                    expect(
+                      (await ftsParts(core.harness)).entries.some(
+                        (e) => e.kind === "keyed" && e.tableId === docsId,
+                      ),
+                    ).toBe(true);
+                  } else {
+                    expect(receipt.wrote).toBe(false);
+                    expect(logged.lastLsn).toBe(last.lastLsn);
+                  }
+                }
+                if (mode !== "commit" || path === "zero")
+                  expect(core.harness.path.state().root.fts).toEqual(before);
+                reach.reach(mode);
+                if (path !== "zero") reach.reach(`${path} ${mode}`);
+              } finally {
+                accounting.close();
+              }
+              const compare = async () => {
+                for (const name of ["parents", "docs"]) {
+                  const sql = `SELECT * FROM ${name} ORDER BY id`,
+                    actual = await core.execute(sql);
+                  if (!("batches" in actual)) throw new Error("rows");
+                  expect(oracleRows(actual)).toEqual((await pg.query(sql)).rows);
+                  expect(oracleRows(actual)).toEqual(
+                    (await shipped.run({ kind: "sql", sql })).rows,
+                  );
+                }
+              };
+              await compare();
+              await core.harness.path.recycleLog();
+              await core.reopen();
+              await compare();
+              reach.reach(stored ? "stored" : "resident");
+              reach.reach("reopen");
+            } finally {
+              spy.mockRestore();
+              await Promise.allSettled([
+                pg.exec("ROLLBACK"),
+                shipped.run({ kind: "sql", sql: "ROLLBACK" }),
+              ]);
+              tx?.rollback();
+              await core.close();
+              expect(core.harness.governor.usedBytes).toBe(0);
+              expect(core.spill.bytesInUse).toBe(0);
+            }
+          },
+        ),
+        {
+          seed,
+          numRuns: 20,
+          examples: [
+            ["ri", "delete", "commit", 5, true],
+            ["ri", "update", "commit", 4, false],
+            ["ri", "delete", "rollback", 4, false],
+            ["ri", "update", "rollback", 5, true],
+            ["ri", "update", "savepoint", 3, true],
+            ["keyLookup", "update", "commit", 3, true],
+            ["keyLookup", "delete", "commit", 4, false],
+            ["keyLookup", "update", "rollback", 5, false],
+            ["keyLookup", "delete", "rollback", 6, true],
+            ["keyLookup", "update", "savepoint", 4, true],
+            ["indexRange", "update", "commit", 3, false],
+            ["indexRange", "delete", "commit", 4, true],
+            ["indexRange", "update", "rollback", 5, true],
+            ["indexRange", "delete", "rollback", 6, false],
+            ["indexRange", "delete", "savepoint", 4, false],
+            ["zero", "update", "commit", 3, true],
+            ["zero", "delete", "commit", 4, false],
+          ],
+        },
+      );
+      reach.assertReached();
+    } finally {
+      await shipped.close();
+      await pg.close();
+    }
+  }, 120_000);
