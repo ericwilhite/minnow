@@ -9236,3 +9236,12 @@ export const OWNER_IDENTITY_REACH = [
   "takeover advances epoch",
   "hint ties use higher epoch",
 ] as const;
+
+export const NATIVE_FIXTURE_REACH = [
+  "one-byte chunks",
+  "split chunks",
+  "ordinary native open and exact bytes",
+  "target-local epoch advances",
+  "source unchanged",
+  "occupied target refused unchanged",
+] as const;

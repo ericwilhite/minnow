@@ -37,6 +37,7 @@ import {
   survivors,
   type ExportGroup,
 } from "../../../scripts/browser-perf/page/export-stream.js";
+import { installFileStoreFixture } from "../../../scripts/browser-perf/page/opfs-fixture.js";
 import { fixtureReviver } from "../../../scripts/browser-perf/page/fixture-json.js";
 import { wideSpec } from "../../../scripts/browser-perf/page/wide-data.js";
 import { typeOf, vectorOf } from "../../../scripts/browser-perf/page/wide-vectors.js";
@@ -247,34 +248,13 @@ async function installFixture(dir: string, base: string): Promise<BuildResult> {
     files: Array<{ name: string; bytes: number }>;
   };
   const folder = await directory(dir);
-  for (const name of ["data", "log", "root-0", "root-1"]) {
-    const expected = manifest.files.find((f) => f.name === name);
-    if (!expected) throw new Error("Missing fixture file");
-    const source = await fetch(base + name);
-    if (!source.ok || !source.body) throw new Error("Fixture fetch failed");
-    const handle = await folder.getFileHandle(name, { create: true }),
-      out = await handle.createSyncAccessHandle();
-    let at = 0;
-    try {
-      out.truncate(0);
-      const reader = source.body.getReader();
-      for (;;) {
-        const part = await reader.read();
-        if (part.done) break;
-        let offset = 0;
-        while (offset < part.value.length) {
-          const written = out.write(part.value.subarray(offset), { at });
-          if (written <= 0) throw new Error("Short fixture write");
-          at += written;
-          offset += written;
-        }
-      }
-      if (at !== expected.bytes) throw new Error("Fixture length mismatch");
-      out.flush();
-    } finally {
-      out.close();
-    }
-  }
+  await installFileStoreFixture({
+    directory: folder,
+    name: `next-export:${dir}`,
+    locks,
+    files: manifest.files,
+    read: (name) => fetch(base + name),
+  });
   const descriptors = await fetch(base + "groups.json");
   if (!descriptors.ok) throw new Error("Missing fixture descriptors");
   const groups = JSON.parse(await descriptors.text(), fixtureReviver) as ExportGroup[];

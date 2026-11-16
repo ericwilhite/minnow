@@ -2708,6 +2708,11 @@ timing; cached files are never opened for writing by a rerun. Seed and aggregate
 appear in every pass and the final report. Preparation publishes a completed image atomically;
 an incomplete or changed cache cannot supply an acceptance result. No supported stored format
 changes here.
+The private installer accepts only an empty disposable target and initializes its native fence
+before copying the four cached payload files. Epochs are target-local, never imported from the
+source. It refuses an occupied directory unchanged. The durable-format registry participates in
+the fixture fingerprint, so profile changes invalidate the cache. Setup is outside measurements;
+this adapter is not an application snapshot loader.
 
 The command requires Linux cache-control tools, installed dependencies and Chromium. It records
 load1 at startup, after fixture preparation, each second while the runner is active, and before/
