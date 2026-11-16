@@ -9114,3 +9114,11 @@ export const STRUCTURED_BOUNDARIES_REACH = [
   "array NUMERIC redundant sign extension",
   "borrowed fragments and zero remaining charge",
 ] as const;
+
+export const SNAPSHOT_VALIDATOR_LEASE_REACH = [
+  "fragmented accepted values",
+  "fragmented refused values",
+  "leases returned before grant close",
+  "parser funded before producer entry",
+  "cancel after lease acquisition",
+] as const;
