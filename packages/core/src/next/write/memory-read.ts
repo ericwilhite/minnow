@@ -65,6 +65,9 @@ export const MEMORY_READ_RESIDENT_BYTES = METADATA + 3 * MAX_BLOB_BYTES + 2 * PA
 // Conservative parse-alignment copies of a page AND dictionary, predicate scratch, scalar
 // decode/object/BigInt temporaries. The alignment allowance is charged before reader.load.
 const WORK = 2 * MAX_BLOB_BYTES + 512 * 1024;
+/** Base sizing workspace before a bounded reader can obtain its publication-stable
+ * row progress loan. Callers also prepay request/column descriptors and scan buffers. */
+export const MEMORY_READ_HINT_BYTES = WORK;
 // The reader charges these separately: one scaled-float page lane and its predicate scratch.
 const DECODER_SCRATCH = 65536 * 8 + predicateScratchBytes(4096);
 

@@ -9536,3 +9536,39 @@ export const MODIFY_UNIQUE_TIMING_REACH = [
   "atomic rollback",
   "success",
 ] as const;
+
+/** Full native OLD payload capture stays inside source/image ownership. */
+export const NATIVE_PREFIX_IMAGES_REACH = [
+  "single-row native sizing",
+  "source progress loan",
+  "fragmented payload",
+  "small payload",
+  "published",
+  "resident",
+  "NULLs",
+  "non-null",
+  "wide decoder tier",
+  "native decoder tier",
+  "full physical order",
+  "no legacy copies",
+  "source retired before replay",
+  "zero ownership",
+] as const;
+
+/** Payload capture fences native source/preparation work before retiring root scratch. */
+export const NATIVE_PREFIX_IMAGES_LIFETIME_REACH = [
+  "reentrant capture",
+  "reentrant close shares fence",
+  "prepare",
+  "payload",
+  "phase",
+  "fault",
+  "synchronous close",
+  "external close",
+  "caller cancellation",
+  "published",
+  "resident",
+  "paid pending work",
+  "source loan repaid",
+  "zero ownership",
+] as const;
