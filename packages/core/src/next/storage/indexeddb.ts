@@ -563,6 +563,8 @@ interface Barrier {
   readonly spaces: readonly ByteStore[];
   readonly extra: readonly string[];
   readonly write: QueuedWrite;
+  /** Wait only after this barrier has captured its preceding writes and commit-chain place. */
+  readonly publication?: PublicationGate;
 }
 
 /** The log's last record while it is under `LOG_COALESCE_BYTES`, with its bytes. */
@@ -747,21 +749,24 @@ class IdbSession implements StoreSession {
       if (this.#failure !== null) throw this.#failure;
       if (all.length === 0) return;
       try {
-        await transact(
-          this.#lease,
-          spaces,
-          barrier?.durability ?? "relaxed",
-          (tx) => {
-            inOrder(
-              all.length,
-              (index, done) => {
-                all[index]?.(tx, done);
-              },
-              () => undefined,
-            );
-          },
-          extra,
-        );
+        const commit = () =>
+          transact(
+            this.#lease,
+            spaces,
+            barrier?.durability ?? "relaxed",
+            (tx) => {
+              inOrder(
+                all.length,
+                (index, done) => {
+                  all[index]?.(tx, done);
+                },
+                () => undefined,
+              );
+            },
+            extra,
+          );
+        if (barrier?.publication === undefined) await commit();
+        else await barrier.publication(commit);
       } catch (error) {
         this.#failure ??= error instanceof Error ? error : new Error(String(error));
         throw this.#failure;
@@ -858,7 +863,7 @@ class IdbSession implements StoreSession {
 
   /** Guarantee 1: every queued write, then the root, in one strict transaction. */
   async publish(root: Uint8Array): Promise<void> {
-    return this.publication(() => this.#publish(root));
+    return this.#publish(root);
   }
 
   async #publish(root: Uint8Array): Promise<void> {
@@ -870,6 +875,7 @@ class IdbSession implements StoreSession {
         durability: "strict",
         spaces: [],
         extra: ["roots"],
+        publication: this.publication,
         write: (tx, next) => {
           tx.store("roots").put(`slot-${String(prepared.slot)}`, prepared.frame.slotBytes.buffer);
           next();
@@ -882,6 +888,7 @@ class IdbSession implements StoreSession {
       durability: "strict",
       spaces: [],
       extra: ["roots"],
+      publication: this.publication,
       write: (tx, next) => {
         const roots = tx.store("roots");
         roots.get("slot-0", (first) => {

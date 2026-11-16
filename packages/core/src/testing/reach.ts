@@ -9192,3 +9192,9 @@ export const ROOT_GATE_RACE_REACH = [
   "live owner still writes",
   "stolen queued publication refuses",
 ] as const;
+
+export const ROOT_PUBLICATION_ORDER_REACH = [
+  "batched earlier write and root atomic",
+  "unbatched earlier write precedes root",
+  "same extent overwrite after root",
+] as const;

@@ -465,6 +465,10 @@ acquisition winning it makes the old publisher lose authority before it can publ
 queued openers never hold the gate while waiting for ownership, so a live owner's publication
 can finish. A queued publisher cancels on owner loss and checks authority after getting the gate.
 The gate uses a distinct namespace from owner locks, including for arbitrary database names.
+IndexedDB reserves each publication's commit-chain position and captures its earlier queued writes
+BEFORE waiting for this gate. Later writes cannot pass the publication or join its earlier batch.
+Release accounting describes issued native transactions; tests observe their actual start,
+including when gate waiting delays issuance.
 OPFS rechecks existing owned handles before creating missing files or advancing the epoch.
 IndexedDB rechecks both roots in its strict fence transaction before enqueueing the epoch write.
 Gate waiting and preflight share the acquisition deadline; a late IndexedDB connection closes
