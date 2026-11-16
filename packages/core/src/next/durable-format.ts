@@ -1015,6 +1015,8 @@ Object.freeze(LARGE_CODEC);
  * selectors have their own container/codecSet and do not change the native root profile.
  * When extending the native vocabulary, add a NEW reader profile: never rewrite an entry
  * belonging to a released writer. The independent generated test pins the known ledger too.
+ * Profile7 is the initial UNRELEASED binding, aligned to main13c28d1b manifest10/body8;
+ * older development bindings are not supported predecessors (AGENTS.md).
  */
 export const NATIVE_READER_PROFILES: Readonly<
   Record<
@@ -1025,7 +1027,7 @@ export const NATIVE_READER_PROFILES: Readonly<
     }
   >
 > = Object.freeze({
-  7: Object.freeze({ manifest: 8, vocabulary: 2967629971 }),
+  7: Object.freeze({ manifest: 10, vocabulary: 3713904595 }),
 });
 
 function canonicalVocabulary(value: unknown): string {

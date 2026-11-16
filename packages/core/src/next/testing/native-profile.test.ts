@@ -16,7 +16,7 @@ import {
 // Independent ledger pin: changing the grammar's fingerprint on an existing profile must not
 // make a new nested tag look compatible. Before 1.0 these are development bytes; first frozen
 // fixtures will pin the agreed released profiles and all later entries are append-only.
-const known = { 7: { manifest: 8, vocabulary: 2967629971 } };
+const known = { 7: { manifest: 10, vocabulary: 3713904595 } };
 for (const seed of seedsFor("next-native-profile", [0xb2a1, 0xb2a2]))
   it(`refuses an unassigned native vocabulary before acquisition seed ${String(seed)}`, () => {
     const reach = createReach("outer native profile binding", NATIVE_PROFILE_REACH);
@@ -47,9 +47,14 @@ for (const seed of seedsFor("next-native-profile", [0xb2a1, 0xb2a2]))
             requireNativeReaderProfile(unsupported, MANIFEST_FORMAT_VERSION, vocabulary),
           ).toThrow(expect.objectContaining({ code: "MINNOW_FORMAT_UNSUPPORTED" }));
           reach.reach("unassigned reader");
-          expect(() =>
-            requireNativeReaderProfile(DURABLE_READER_VERSION, unsupported, vocabulary),
-          ).toThrow(expect.objectContaining({ code: "MINNOW_FORMAT_UNSUPPORTED" }));
+          // Keep the original generated population; main's known manifest10 is not
+          // an unsupported selector. Also witness both superseded development layouts.
+          for (const manifest of [unsupported, 8, 9, 255]) {
+            if (manifest === MANIFEST_FORMAT_VERSION) continue;
+            expect(() =>
+              requireNativeReaderProfile(DURABLE_READER_VERSION, manifest, vocabulary),
+            ).toThrow(expect.objectContaining({ code: "MINNOW_FORMAT_UNSUPPORTED" }));
+          }
           reach.reach("manifest mismatch");
           const required = {
               ...CATALOG_RECORD_SCHEMAS,
