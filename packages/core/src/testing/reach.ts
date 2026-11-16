@@ -9223,3 +9223,34 @@ export const RETIREMENT_FAST_FALLBACK_REACH = [
   "foreign error preserved",
   "original root intact",
 ] as const;
+
+export const SQL_REGEX_MATCH_MODES_REACH = [
+  "astral input",
+  "newline input",
+  "start anchor",
+  "end anchor",
+  "captured substring",
+  "boolean match",
+  "boolean rejection",
+  "zero-width match",
+] as const;
+
+export const SQL_REGEX_WORK_REACH = [
+  "nested repetition",
+  "ambiguous alternation",
+  "repeated wildcards",
+  "nullable end match",
+  "anchored empty cycles",
+] as const;
+
+export const SQL_REGEX_FLAGS_REACH = [
+  "newline mode",
+  "case-sensitive mode",
+  "case-insensitive mode",
+] as const;
+
+export const SQL_REGEX_ACCEPTANCE_REACH = [
+  "long literal match",
+  "long literal alternative",
+  "failed-start cache rollover",
+] as const;

@@ -995,6 +995,18 @@ remain. Fast-check includes examples in its run budget, so the budget increases 
 14 to 17 to add three examples while preserving all six generated histories. The growth observer is restored and checked alongside the existing
 suspension/restore observers, including abandoned histories.
 
+`sql-regex.test.ts` checks the original four pathological patterns over 1,000 `a`
+characters and a trailing `!` using instruction counts. PostgreSQL supplies each expected
+result: the original `(a*)*$` can match empty at the end, while an additional `^(a*)*$`
+case must fail. These fixtures' complete state-position spaces fit the memo ceiling;
+boolean matching charges duplicate arrivals too and must stay within `(2 × compiled states + 1) × (input length + 1)`
+steps. An observer fails immediately if a backtracking implementation crosses that bound;
+the test's 20-second timeout is unchanged. Additional work guards retain successful 4,096-character
+literals and searches crossing the failed-state cache boundary. A separate check spends all 8,388,608 permitted
+steps and requires the next one to throw. The PostgreSQL corpus checks substring captures
+and boolean results together, including empty matches, anchors, newlines, and astral text.
+This checks algorithmic work, rather than a wall-time guarantee on a loaded host.
+
 `event-loop-stalls.test.ts` runs a 1 ms watchdog through the workloads that once held every
 other query for hundreds of milliseconds or minutes — a fold of reordered wide upserts, live
 aggregates patched after large commits, scans over upsert-heavy tables, secondary-index builds

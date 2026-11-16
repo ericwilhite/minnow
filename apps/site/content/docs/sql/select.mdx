@@ -98,7 +98,9 @@ safe integer range. `QUOTE_LITERAL` renders public domain values and declared nu
 `%n$` conversions. An explicit position sets the cursor for the next unnumbered conversion.
 Malformed directives and missing arguments throw; width and alignment directives are unsupported.
 
-Regex matching selects the leftmost, longest match. It supports grouping, alternation, character
+Regex substring and replacement select the leftmost, longest match. Boolean regex checks use
+bounded state sets to test whether a match exists, without retaining capture paths. Both support
+grouping, alternation, character
 classes and ASCII POSIX classes, anchors, and greedy repetition. Pattern backreferences,
 lookaround, inline flags, and non-greedy quantifiers throw; replacement backreferences still work.
 The [SQL limits](/docs/sql) bound pattern size, compilation, matching, and replacement output.

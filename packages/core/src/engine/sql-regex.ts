@@ -43,11 +43,16 @@ const classes: Readonly<Record<string, string>> = {
 export class SqlRegex {
   readonly #instructions: Instruction[] = [{ kind: "match" }];
   readonly #start: number;
-  readonly #groups: number;
+  readonly #slots: number;
   readonly #global: boolean;
 
   get retainedSize(): number {
     return this.#instructions.length * 96;
+  }
+
+  /** Every interpreter arrival spends from the fixed per-operation SQL work ceiling. */
+  spend(work: { remaining: number }): void {
+    if (--work.remaining < 0) throw new RangeError("SQL pattern match exceeds its work limit");
   }
 
   constructor(pattern: string, flags: string) {
@@ -191,7 +196,7 @@ export class SqlRegex {
     };
     const root = alternative(0);
     if (cursor !== pattern.length) fail("unmatched closing parenthesis");
-    this.#groups = groups;
+    this.#slots = 2 * (groups + 1);
     const emit = (instruction: Instruction): number => {
       if (this.#instructions.length >= 65_536)
         throw new RangeError("Regular expression state limit exceeded");
@@ -206,23 +211,15 @@ export class SqlRegex {
           slot: node.group * 2,
           next: compile(node.child, emit({ kind: "save", slot: node.group * 2 + 1, next })),
         });
-      if (node.kind === "sequence") {
-        let start = next;
-        for (let index = node.children.length - 1; index >= 0; index -= 1)
-          start = compile(required(node.children[index]), start);
-        return start;
-      }
-      if (node.kind === "alternative") {
-        let start = compile(required(node.children[node.children.length - 1]), next);
-        for (let index = node.children.length - 2; index >= 0; index -= 1) {
-          start = emit({
-            kind: "split",
-            first: compile(required(node.children[index]), next),
-            second: start,
-          });
-        }
-        return start;
-      }
+      if (node.kind === "sequence")
+        return node.children.reduceRight((start, child) => compile(child, start), next);
+      if (node.kind === "alternative")
+        return node.children.reduceRight((second, child, index) => {
+          const first = compile(child, next);
+          return index === node.children.length - 1
+            ? first
+            : emit({ kind: "split", first, second });
+        }, next);
       let start = next;
       if (node.max === Infinity) {
         const loop = { kind: "split" as const, first: -1, second: next };
@@ -238,52 +235,73 @@ export class SqlRegex {
     this.#start = compile(root, 0);
   }
 
-  #search(input: string, from: number, budget: { remaining: number }): RegExpExecArray | null {
+  #search(input: string, from: number, capture: false, work?: { remaining: number }): boolean;
+  #search(
+    input: string,
+    from: number,
+    capture?: true,
+    work?: { remaining: number },
+  ): RegExpExecArray | null;
+  #search(
+    input: string,
+    from: number,
+    capture = true,
+    work = { remaining: MAX_SQL_PATTERN_MATCH_STEPS },
+  ): RegExpExecArray | null | boolean {
     if (input.length > MAX_SQL_SCALAR_RESULT_CHARACTERS)
       throw new RangeError("Regular expression input exceeds scalar size limit");
-    const spend = (): void => {
-      if (--budget.remaining < 0) throw new RangeError("SQL pattern match exceeds its work limit");
-    };
+    // Captures cannot affect the supported language (backreferences/lookaround are refused).
+    // Completed-start failures can therefore be shared across starts in boolean mode. Keep
+    // current cycle guards when old memo entries are evicted at the existing state ceiling.
+    const visited = new Map<string | number, number>();
     for (let start = from; start <= input.length;) {
-      const stack = [
+      if (capture) visited.clear();
+      const stack: Array<{ pc: number; position: number; captures: number[] | null }> = [
         {
           pc: this.#start,
           position: start,
-          captures: new Array<number>(2 * (this.#groups + 1)).fill(-1),
+          captures: capture ? new Array<number>(this.#slots) : null,
         },
       ];
-      let best: { position: number; captures: number[] } | undefined;
+      let best: number[] | undefined;
       // Repeated empty groups may loop forever. Memoize VM configurations, including captures,
       // so captures remain correct while zero-width cycles terminate deterministically.
-      const visited = new Set<string>();
       while (stack.length > 0) {
         const state = required(stack.pop());
         let { pc, position } = state;
         const captures = state.captures;
         for (;;) {
-          spend();
-          const key = `${String(pc)}:${String(position)}:${captures.join(",")}`;
+          this.spend(work); // Charge duplicate arrivals too, before deduplication.
+          // PCs fit 16 bits; bounded UTF-16 positions keep the packed numeric key exact.
+          const key =
+            captures === null
+              ? position * 65_536 + pc
+              : `${String(pc)}:${String(position)}:${captures.join(",")}`;
           if (visited.has(key)) break;
           if (visited.size >= 65_536)
+            for (const [previous, owner] of visited) if (owner < start) visited.delete(previous);
+          if (visited.size >= 65_536)
             throw new RangeError("Regular expression match state limit exceeded");
-          visited.add(key);
+          visited.set(key, start);
           const instruction = required(this.#instructions[pc]);
           if (instruction.kind === "match") {
-            if (
-              best === undefined ||
-              position > best.position ||
-              (position === best.position && preferredCaptures(captures, best.captures))
-            )
-              best = { position, captures };
+            if (captures === null) return true;
+            captures[0] = start;
+            captures[1] = position;
+            if (best === undefined || preferredCaptures(captures, best)) best = captures;
             break;
           }
           if (instruction.kind === "split") {
             if (stack.length >= 65_536)
               throw new RangeError("Regular expression branch limit exceeded");
-            stack.push({ pc: instruction.second, position, captures: [...captures] });
+            stack.push({
+              pc: instruction.second,
+              position,
+              captures: captures === null ? null : [...captures],
+            });
             pc = instruction.first;
           } else if (instruction.kind === "save") {
-            captures[instruction.slot] = position;
+            if (captures !== null) captures[instruction.slot] = position;
             pc = instruction.next;
           } else if (instruction.kind === "assert") {
             if (!instruction.accepts(input, position)) break;
@@ -299,10 +317,10 @@ export class SqlRegex {
         }
       }
       if (best !== undefined) {
-        const result: Array<string | undefined> = [input.slice(start, best.position)];
-        for (let group = 1; group <= this.#groups; group += 1) {
-          const begin = best.captures[group * 2] ?? -1;
-          const end = best.captures[group * 2 + 1] ?? -1;
+        const result: Array<string | undefined> = [];
+        for (let group = 0; group < best.length; group += 2) {
+          const begin = best[group] ?? -1;
+          const end = best[group + 1] ?? -1;
           result.push(begin < 0 || end < 0 ? undefined : input.slice(begin, end));
         }
         // Native RegExp also returns undefined for an unmatched optional capture; lib.d.ts
@@ -312,18 +330,18 @@ export class SqlRegex {
       if (start === input.length) break;
       start += String.fromCodePoint(required(input.codePointAt(start))).length;
     }
-    return null;
+    return capture ? null : false;
   }
 
   exec(input: string): RegExpExecArray | null {
-    return this.#search(input, 0, { remaining: MAX_SQL_PATTERN_MATCH_STEPS });
+    return this.#search(input, 0);
   }
   test(input: string): boolean {
-    return this.exec(input) !== null;
+    return this.#search(input, 0, false);
   }
 
   [Symbol.replace](input: string, replacement: string): string {
-    const budget = { remaining: MAX_SQL_PATTERN_MATCH_STEPS };
+    const work = { remaining: MAX_SQL_PATTERN_MATCH_STEPS };
     const parts: string[] = [];
     let cursor = 0;
     let from = 0;
@@ -335,7 +353,7 @@ export class SqlRegex {
       parts.push(part);
     };
     for (;;) {
-      const match = this.#search(input, from, budget);
+      const match = this.#search(input, from, true, work);
       if (match === null) break;
       append(input.slice(cursor, match.index));
       append(
@@ -357,13 +375,11 @@ export class SqlRegex {
 }
 
 function preferredCaptures(left: readonly number[], right: readonly number[]): boolean {
-  for (let index = 2; index < left.length; index += 2) {
-    const begin = left[index] ?? -1;
+  for (let index = 0; index < left.length; index += 1) {
+    const value = left[index] ?? -1;
     const other = right[index] ?? -1;
-    if (begin !== other) return begin >= 0 && (other < 0 || begin < other);
-    const end = left[index + 1] ?? -1;
-    const otherEnd = right[index + 1] ?? -1;
-    if (end !== otherEnd) return end > otherEnd;
+    if (value !== other)
+      return index % 2 === 0 ? value >= 0 && (other < 0 || value < other) : value > other;
   }
   return false;
 }
