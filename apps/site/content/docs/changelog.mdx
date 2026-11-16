@@ -125,8 +125,14 @@ Single-source index inputs retain original row locators and suppress repeated pr
 Cursors beneath join or set-operation inputs retain the internal diagnostic opt-in until
 their complete admission is proved. Reads use the statement
 snapshot; statement errors roll back earlier rows. Unique and foreign-key checks use the
-existing write path. CHECK constraints and stored generated columns now use the shared,
-charged row-rule program, retained through native FK actions. Set operations retain their
+existing write path. Uniqueness is checked at statement end: a later NOT NULL or CHECK
+failure wins over an earlier duplicate key, unlike PostgreSQL. For example, an existing
+primary key followed by a null in a NOT NULL column reports the null error; the shipped
+0.x engine reports the duplicate primary key first.
+Some multi-row key updates that PostgreSQL rejects succeed when their finished keys are
+unique. Either kind of failure still rolls back the whole statement. CHECK constraints and
+stored generated columns now use the shared, charged row-rule program, retained through native
+FK actions. Set operations retain their
 operator-specific progress-copy allowance when no DML override applies. Generation runs inside the
 statement rule scope; an earlier row's NOT NULL or named CHECK failure precedes a later
 row's generated-expression error. Closed text sets remain enforced alongside CHECK and

@@ -9510,3 +9510,29 @@ export const REGISTRY_FOLLOWING_LIFETIME_REACH = [
   "no retained image lease",
   "zero ownership",
 ] as const;
+
+/** 1.0 deliberately reports later row rules before statement-end UNIQUE/PK errors. */
+export const MODIFY_UNIQUE_TIMING_REACH = [
+  "spooled input",
+  "direct input",
+  "PK",
+  "UNIQUE",
+  "NOT NULL",
+  "CHECK",
+  "VALUES",
+  "SELECT",
+  "same page",
+  "across pages",
+  "published",
+  "resident",
+  "RETURNING",
+  "no RETURNING",
+  "native row-level first",
+  "PG unique first",
+  "shipped primary unique-first",
+  "shipped secondary row-first",
+  "unique-only rejected",
+  "row-only rejected",
+  "atomic rollback",
+  "success",
+] as const;
