@@ -1447,9 +1447,13 @@
         "S1/S_q7": {
           "reference": "duckdb",
           "status": "completes",
-          "ratio": 5.14,
-          "threshold": 9.56,
-          "workload": "5dec4ecac3cf661e391d321e0799cd1b7ac4ea9b65ec377f86d0f0b0f6a1ff48"
+          "ratio": 19.3,
+          "threshold": 29,
+          "workload": "778ae7135face38780006bfb8dbe7259aa88d60957c24b7c85b0b2c845fb0122",
+          "calibration": {
+            "authority": "4e7b6a0c: PostgreSQL-valid NUMERIC ROUND workload correction",
+            "run": "https://github.com/ericwilhite/minnow/actions/runs/43795802769"
+          }
         },
         "S1/S_q8": {
           "reference": "duckdb",
