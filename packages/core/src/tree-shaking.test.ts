@@ -106,7 +106,10 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 450.125 * 1024;
 const INDEXEDDB_WORKER_RAW_BUDGET = 1551.25 * 1024;
 // Native trigger-name folding: 1,587,617 raw / 457,994 gzip bytes (+100 / +28).
 // The old gzip cap is exceeded by 10 bytes. Raise once by 128; raw and isolation caps stay.
-const INDEXEDDB_WORKER_GZIP_BUDGET = 447.5 * 1024;
+// Bounded boolean regex (3dc95943): 1,588,261 raw / 458,253 gzip bytes with the
+// official Node 24.22.2 compressor, matching CI 44044406507 (13 bytes over the old cap).
+// Raise once by the existing 128-byte budget step; raw, sibling and isolation caps stay.
+const INDEXEDDB_WORKER_GZIP_BUDGET = 447.625 * 1024;
 // What a page that hosts the engine in a worker ships on the main thread: the client, the schema
 // DSL and error classes, the Kysely dialect and live queries, and the React hooks, with `kysely`
 // and `react` left to the application. 105.9 KiB raw / 31.6 KiB gzip.
