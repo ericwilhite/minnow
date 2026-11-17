@@ -11410,3 +11410,25 @@ export const NATIVE_TRIGGER_BODIES_REACH = [
   "DELETE body",
   "zero native ownership",
 ] as const;
+
+export const NATIVE_TRIGGER_ERRORS_REACH = [
+  "before-input",
+  "after-input",
+  "before-generated",
+  "after-generated",
+  "check-before-next-row",
+  "root-unique",
+  "body-unique",
+  "ri-unique",
+  "ri-check",
+  "child-before",
+  "parent-before-child-after",
+  "early-parent-after",
+  "before-restrict",
+  "published source",
+  "resident source",
+  "reverse creation",
+  "forward creation",
+  "exact statement undo",
+  "zero native ownership",
+] as const;

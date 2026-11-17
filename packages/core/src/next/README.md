@@ -5007,3 +5007,12 @@ shipped product cap: native and shipped reject and undo the whole statement, whi
 function succeeds. The test states that difference explicitly, rather than treating PG's
 successful deeper execution as native parity. This is still component qualification;
 owner SQL dispatch, production admission and firing enablement remain separate.
+
+The concrete competing-error campaign checks PGlite's first SQLSTATE in thirteen qualified
+shapes: input/BEFORE/AFTER, generated and CHECK evaluation, later-row errors, root/body
+uniqueness, RI uniqueness/CHECK/BEFORE, and named parent versus child AFTER work. Each
+failure must undo every actual source, child, guard, nested log and unique-target row before
+an empty transaction commit. The generator varies source width in rows, publication and
+trigger creation order. This checks those error paths, rather than claiming all error
+precedence is identical to PostgreSQL: native statement-end uniqueness remains the approved
+product rule. SQL failed-session policy and owner dispatch are still outside this fixture.
