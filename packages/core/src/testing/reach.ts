@@ -9254,3 +9254,13 @@ export const SQL_REGEX_ACCEPTANCE_REACH = [
   "long literal alternative",
   "failed-start cache rollover",
 ] as const;
+
+export const PROTOTYPE_RUN_LIFETIME_REACH = [
+  "already cancelled",
+  "cancelled in flight",
+  "query error",
+  "deferred cleanup",
+  "microtask gap",
+  "task gap",
+  "next observer intact",
+] as const;

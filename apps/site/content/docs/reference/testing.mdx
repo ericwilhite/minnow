@@ -1019,6 +1019,13 @@ the assertion while still rejecting a scheduler that only yields to microtasks. 
 check uses the OPFS simulator; it does not establish browser latency or bound uncounted
 computation. `scripts/stall-survey.mts` measures real elapsed stalls.
 
+The unexported executor's aggregate step-peak properties also count physical pipeline
+operations instead of aborting valid wide-key histories after 30 seconds. They retain their
+180-second test deadline, generated dimensions, examples, and run counts. They propagate the
+test runner's cancellation signal and await asynchronous cleanup before restoring prototype
+observers. A generated lifetime check covers cancellation, query failure, and deferred cleanup
+across microtask and task boundaries.
+
 `checkpoint-slicing.test.ts` pins that a multi-slice OPFS checkpoint gives the event loop turns
 between its slot writes, publishes exactly the bytes a one-step checkpoint would, and survives
 power loss or a refused write at every one of its file operations, with the refused checkpoint
