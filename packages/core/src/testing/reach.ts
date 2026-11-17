@@ -9988,3 +9988,13 @@ export const NATIVE_RI_SCHEMA_IDENTITY_REACH = [
   "ordinary reopen",
   "zero ownership",
 ] as const;
+
+export const NATIVE_SELF_FOLLOW_REACH = [
+  "swap",
+  "rotation",
+  "published",
+  "resident",
+  "one follow per original target",
+  "shipped data",
+  "zero ownership",
+] as const;

@@ -183,6 +183,15 @@ export class NativeReferentialMutations {
           check();
           const row = await scope.inputs.row(input, i, signal);
           check();
+          if (entry.kind === "follow") {
+            const repeated = await scope.following.testAndSetFollowTarget(
+              entry.id,
+              row.originalId,
+              signal,
+            );
+            check();
+            if (repeated) continue;
+          }
           const event = entry.kind === "cascade" && parent.event === "delete" ? "delete" : "update";
           let images = row.images;
           if (event === "update") {

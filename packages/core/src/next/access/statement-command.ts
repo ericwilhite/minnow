@@ -111,13 +111,19 @@ export interface NativeCommandBoundary {
    * callbacks; decoded entry metadata uses the root's prepaid ordinary frame workspace.
    * BEFORE resolving, verify all newly introduced child uniqueness for this action. An earlier
    * root/action checkpoint does not cover later writes: successive actions may share a command
-   * token. Never drain outer AFTER events while performing this incremental checkpoint. */
+   * token. Omitted-update follow completes/checks its captured command/FK group instead,
+   * preserving key swaps; later descriptors for that completed group are no-ops. Its check
+   * still precedes all subsequent outer AFTER/RI work. Never drain outer AFTER here. */
   executeReferentialId(id: number, hooks: NativeRowHooks, signal: AbortSignal): Promise<void>;
   /** Exactly one parent row/one FK event. Seal the complete child input before mutation;
    * release input/pin/producer progress before writer admission. No nested governor admission.
-   * Follow uses captured identities; explicit actions use their distinct catalog mode.
+   * Follow uses captured identities, applies the complete command/FK group at its first
+   * continuation, and checks child uniqueness before resolving that group. Each original
+   * child is followed at most once per command/FK, including self-referential rewrites.
+   * Later descriptors for that completed group do not repeat it. Explicit actions use their
+   * distinct catalog mode and retain per-action uniqueness checkpoints.
    * RESTRICT is23001; NO ACTION/missing-parent23503. RI preserves trigger budget.
-   * BEFORE resolving, incrementally verify this action's newly introduced child uniqueness,
+   * BEFORE resolving explicit actions, incrementally verify their new child uniqueness,
    * even if the shared command token passed a root or earlier action checkpoint. No outer
    * AFTER drain: a child uniqueness error must precede a later named AFTER body's error. */
   executeReferential(

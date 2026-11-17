@@ -4331,7 +4331,9 @@ Explicit actions check newly accepted child uniqueness before each action resolv
 ON UPDATE follow applies the complete captured command/FK group and checks its child uniqueness
 before returning to user AFTER work or another RI action. This preserves unique child swaps and
 rotations; a nonunique completed group reports23505 with the child constraint identity. Group
-links share the root spill directory, with charged catalog-sized headers per live frame.
+links share the root spill directory, with charged catalog-sized headers per live frame. A shared paged
+bitmap records each original child once per command/FK, so self-referential follow
+cannot recapture its own rewritten versions.
 SET DEFAULT
 also checks remaining references to the old parent key; NO ACTION allows an equivalent live
 replacement parent, while RESTRICT reports23001. Informational references follow by bounded

@@ -25,7 +25,9 @@ export function registryFollowingBytes(catalog: CatalogView, frames = 3): number
   return bytes;
 }
 const FOLLOWING = 9,
-  FOLLOW_INPUT = 14;
+  FOLLOW_INPUT = 14,
+  FOLLOW_TARGET_NAMESPACE = 15,
+  FOLLOW_TARGET_BITMAP = 16;
 export interface RegistryFollowingScope {
   readonly rootId: number;
   readonly frames?: number;
@@ -56,6 +58,7 @@ export class RegistryFollowing {
   #closing: Promise<void> | null = null;
   #failure: { reason: unknown } | null = null;
   #closed = false;
+  #nextVisited = 0;
   readonly #bytes: number;
   #keys: Float64Array | null = null;
   #groups: Array<{ command: CommandToken | null; heads: Float64Array }> = [];
@@ -356,6 +359,65 @@ export class RegistryFollowing {
       const input = view.getFloat64(48, true);
       if (!Number.isSafeInteger(input) || input < 1) corrupt();
       return { rootId: this.scope.rootId, id: input };
+    });
+  }
+  /** A follow edge rewrites an original child at most once in its containing command.
+   * Later RI rows may name newer physical versions of the same origin. The shared paged
+   * bitmap prevents re-follow cycles without retaining a Set or a file per action. */
+  testAndSetFollowTarget(id: number, originalId: number, signal: AbortSignal): Promise<boolean> {
+    return this.#work(signal, async (stop) => {
+      if (!Number.isSafeInteger(originalId) || originalId < 0) invalid();
+      const entry = await this.scope.commands.resolveReferential(id);
+      this.#foreignKey(entry);
+      const record = this.#record ?? invalid(),
+        found = await this.scope.directory.get(
+          FOLLOW_TARGET_NAMESPACE,
+          entry.fkId,
+          record,
+          entry.commandId,
+        );
+      this.#check(stop);
+      let namespace: number;
+      const view = viewOf(record);
+      if (found) {
+        namespace = view.getFloat64(0, true);
+        if (
+          !Number.isSafeInteger(namespace) ||
+          namespace < 1 ||
+          view.getFloat64(8, true) !== entry.fkId ||
+          view.getFloat64(16, true) !== entry.commandId ||
+          view.getFloat64(24, true) !== this.scope.rootId
+        )
+          corrupt();
+      } else {
+        if (!Number.isSafeInteger(this.#nextVisited + 1)) invalid();
+        namespace = ++this.#nextVisited;
+        record.fill(0);
+        view.setFloat64(0, namespace, true);
+        view.setFloat64(8, entry.fkId, true);
+        view.setFloat64(16, entry.commandId, true);
+        view.setFloat64(24, this.scope.rootId, true);
+        await this.scope.directory.put(
+          FOLLOW_TARGET_NAMESPACE,
+          entry.fkId,
+          record,
+          entry.commandId,
+        );
+        this.#check(stop);
+      }
+      const block = Math.floor(originalId / 1024),
+        bit = originalId % 1024,
+        byte = Math.floor(bit / 8),
+        mask = 1 << (bit % 8);
+      await this.scope.directory.get(FOLLOW_TARGET_BITMAP, block, record, namespace);
+      this.#check(stop);
+      const seen = ((record[byte] ?? 0) & mask) !== 0;
+      if (!seen) {
+        record[byte] = (record[byte] ?? 0) | mask;
+        await this.scope.directory.put(FOLLOW_TARGET_BITMAP, block, record, namespace);
+        this.#check(stop);
+      }
+      return seen;
     });
   }
   completeGroup(id: number, signal: AbortSignal): Promise<void> {

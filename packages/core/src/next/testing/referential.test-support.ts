@@ -472,6 +472,7 @@ export async function referentialFixture(
         pin.release();
       }
     },
+    targets,
     async capture(tableName: string, indexes: readonly number[]) {
       const table = catalog.tableByName(tableName);
       if (!table) throw new Error("missing native table");
