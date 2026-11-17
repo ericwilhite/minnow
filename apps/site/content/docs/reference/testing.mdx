@@ -1024,7 +1024,10 @@ operations instead of aborting valid wide-key histories after 30 seconds. They r
 180-second test deadline, generated dimensions, examples, and run counts. They propagate the
 test runner's cancellation signal and await asynchronous cleanup before restoring prototype
 observers. A generated lifetime check covers cancellation, query failure, and deferred cleanup
-across microtask and task boundaries.
+across microtask and task boundaries. The pool properties compare every held lease's bytes
+with an independent fixture after every step using a native exact comparison. The console
+snippet checks reuse unchanged parsed declarations and the previous TypeScript program;
+changed snippet text still receives full syntactic and semantic diagnostics.
 
 `checkpoint-slicing.test.ts` pins that a multi-slice OPFS checkpoint gives the event loop turns
 between its slot writes, publishes exactly the bytes a one-step checkpoint would, and survives

@@ -99,6 +99,8 @@ export default tseslint.config(
       "packages/core/src/storage/contract-boundaries.test.ts",
       // The same, for the rebuild core's module layers (next/README.md).
       "packages/core/src/next/dependency-rules.test.ts",
+      // Exact native byte oracle in a Node-only pool test; no production module imports it.
+      "packages/core/src/next/storage/one-pass-pool.test.ts",
       // Node-only source inventory; no browser or production module imports this fixture.
       "packages/core/src/next/testing/durable-inventory.ts",
       // Independently bundles an older-capability reader; owns its os.tmpdir fixture.

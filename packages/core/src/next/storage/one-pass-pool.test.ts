@@ -13,6 +13,7 @@
  * evictions and refusals, and checks every held lease's bytes and every charge after each step.
  * A reader's use of it (its dictionary is never pooled) is in page/export-path.test.ts.
  */
+import { Buffer } from "node:buffer";
 import { afterAll, describe, expect, it } from "vitest";
 import { createReach } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
@@ -29,6 +30,8 @@ function defined<T>(value: T | undefined): T {
   return value;
 }
 const data = new Uint8Array(BLOBS * 65_536).map((_, index) => (index * 31 + 7) % 251);
+// The oracle keeps an independent immutable source even if a bad adapter aliases its input.
+const expectedData = data.slice();
 /** Blob k: `lengths[k]` bytes at the start of a 64 KiB stretch (so blobs never share a slab). */
 const lengths = Array.from({ length: BLOBS }, (_, k) => 8 * (100 + ((k * 977) % 7000)));
 const refs: BlobRef[] = lengths.map((length, k) => ({
@@ -279,7 +282,14 @@ describe.each(SEEDS)("the one-pass buffer pool under random use (seed %i)", (see
         // Every held lease still has its own verified bytes: nothing it holds was reused.
         for (const { lease, refs: input } of held)
           lease.bytes.forEach((bytes, k) => {
-            expect(xxHash32(bytes), where(step)).toBe(defined(input[k]).checksum);
+            const ref = defined(input[k]);
+            const start = ref.extent.offset + ref.offset;
+            // Compare every held byte on every step. Native comparison avoids repeatedly
+            // instrumenting a JS hash loop under coverage and also detects hash collisions.
+            expect(
+              Buffer.compare(bytes, expectedData.subarray(start, start + ref.length)),
+              where(step),
+            ).toBe(0);
           });
         // The leases pay for what they hold; the cache for the fixed slabs and idle buffers.
         expect(budget.used, where(step)).toBe(held.reduce((sum, { charged }) => sum + charged, 0));
