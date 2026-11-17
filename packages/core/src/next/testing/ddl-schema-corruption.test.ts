@@ -5,9 +5,9 @@ import { createReach, DDL_SCHEMA_CORRUPTION_REACH } from "../../testing/reach.js
 import { seedsFor } from "../../testing/seeds.js";
 import { decodeManifestRoot, encodeManifestRoot } from "../format/manifest-codec.js";
 import type { ManifestRoot } from "../format/manifest.js";
-import { StorageCore } from "../testing/storage-core.js";
-import { oracleRows } from "../testing/differential-adapter.js";
-import { need, UNCHARGED } from "./bytes.js";
+import { StorageCore } from "./storage-core.js";
+import { oracleRows } from "./differential-adapter.js";
+import { need, UNCHARGED } from "../write/bytes.js";
 
 for (const seed of seedsFor("ddl-schema-corruption", [47393, 47394]))
   it(`refuses a mismatched replay version and permits repaired retry seed ${String(seed)}`, async () => {
