@@ -25,6 +25,7 @@ import { MemorySpillService } from "../spill/memory-spill.js";
 import { createLowerer } from "../lower/create.js";
 import { StandinExecutor, StandinWritePath, withTestStatements } from "./owner-standins.js";
 import { ProtocolClient } from "../owner/client.js";
+import { PlanCache } from "../owner/plan-cache.js";
 import { composeEngine } from "../owner/compose.js";
 import type { EngineSession, OwnerEngine, PlannedStatement, SyncRun } from "../owner/engine.js";
 import { RequestLedger } from "../format/ledger.js";
@@ -193,13 +194,14 @@ function stubEngine(): OwnerEngine {
     close: () => undefined,
   } as unknown as EngineSession;
   return {
-    // This isolated point-read baseline deliberately has no retained preparation cache.
-    createPreparedCache: () => ({
-      get: () => undefined,
-      set: () => false,
-      delete: () => undefined,
-      close: () => undefined,
-    }),
+    // The benchmark sends one PREPARE then handle-only reads. Retain that one real,
+    // charged entry; an always-refused cache measures missing-handle errors instead.
+    createPreparedCache: () =>
+      new PlanCache<{ readonly text: string; readonly planned: PlannedStatement }>(
+        new Governor(4 << 20),
+        1,
+        64 << 10,
+      ),
     createReturnPool: () => {
       throw new Error("Point benchmark stub has no streaming output pool");
     },
