@@ -9329,3 +9329,25 @@ export const NATIVE_FIXTURE_REACH = [
   "source unchanged",
   "occupied target refused unchanged",
 ] as const;
+
+/** Baseline ratios are meaningful only for the recorded SQL and dataset scale. */
+export const BROWSER_WORKLOAD_REACH = ["SQL changed", "dataset changed", "scale changed"] as const;
+
+/** Shared hosts observe R6; acceptance needs independently qualified host evidence. */
+export const R6_OBSERVATION_REACH = [
+  "over-target observation",
+  "unqualified acceptance refused",
+  "qualified target judging",
+  "invariants always enforced",
+] as const;
+
+/** A version label, fabricated status or missing browser cannot bypass R6 acceptance. */
+export const R6_RELEASE_REACH = [
+  "valid record",
+  "over target refused",
+  "unqualified refused",
+  "incomplete browsers refused",
+  "per-run overshoot refused",
+  "0.x unchanged",
+  "1.x gated",
+] as const;

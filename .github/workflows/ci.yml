@@ -299,8 +299,8 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
       # The rebuild owner's specs run once per engine, under their own cross-origin-isolated
-      # server. R6 latency targets are reported here and enforced only in the
-      # browser performance lane.
+      # server. R6 latency targets are reported here; absolute acceptance requires a qualified
+      # quiet runner. The nightly shared runner observes, never grants acceptance.
       - name: Test rebuild owner in ${{ matrix.browser }}
         id: next-owner
         if: matrix.site

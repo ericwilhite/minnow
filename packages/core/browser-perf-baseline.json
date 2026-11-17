@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "targets": {
     "point/load_keyed_1m_strict": {
       "gate": "point",
@@ -13,22 +13,22 @@
     "point/insert_concurrent_strict_8": {
       "gate": "point",
       "ratio": 0.667,
-      "note": "\u22651.5\u00d7 SQLite throughput; p95 \u22641.1\u00d7"
+      "note": "≥1.5× SQLite throughput; p95 ≤1.1×"
     },
     "point/insert_concurrent_strict_32": {
       "gate": "point",
       "ratio": 0.667,
-      "note": "\u22651.5\u00d7 SQLite throughput; p95 \u22641.1\u00d7"
+      "note": "≥1.5× SQLite throughput; p95 ≤1.1×"
     },
     "point/insert_concurrent_strict_64": {
       "gate": "point",
       "ratio": 0.667,
-      "note": "\u22651.5\u00d7 SQLite throughput; p95 \u22641.1\u00d7"
+      "note": "≥1.5× SQLite throughput; p95 ≤1.1×"
     },
     "point/insert_prepared_relaxed": {
       "gate": "point",
       "ratio": 0.8,
-      "note": "\u22651.25\u00d7 SQLite relaxed throughput; \u226420 \u00b5s owner CPU per insert"
+      "note": "≥1.25× SQLite relaxed throughput; ≤20 µs owner CPU per insert"
     },
     "point/pk_read_warm_int": {
       "gate": "point",
@@ -82,7 +82,7 @@
       "gate": "B",
       "ratio": 1,
       "completes": true,
-      "note": "streams \u2265190k rows/s with RSS \u2264 baseline + 256 MB"
+      "note": "streams ≥190k rows/s with RSS ≤ baseline + 256 MB"
     },
     "W1M/agg_3dims_20aggs": {
       "gate": "B",
@@ -193,7 +193,7 @@
       "gate": "B",
       "ratio": 1,
       "completes": true,
-      "note": "\u226420 ms cold"
+      "note": "≤20 ms cold"
     },
     "W1M/sort_topn": {
       "gate": "B",
@@ -208,7 +208,7 @@
     "W1M/spill_group_1m@64MiB": {
       "gate": "A",
       "completes": true,
-      "note": "completes under the cap in \u22643\u00d7 its unbounded time; DuckDB-Wasm cannot spill"
+      "note": "completes under the cap in ≤3× its unbounded time; DuckDB-Wasm cannot spill"
     },
     "W1M/spill_group_1m@256MiB": {
       "gate": "A",
@@ -218,7 +218,7 @@
     "W1M/spill_sort_wide_text@64MiB": {
       "gate": "A",
       "completes": true,
-      "note": "completes under the cap in \u22643\u00d7 its unbounded time; DuckDB-Wasm cannot spill"
+      "note": "completes under the cap in ≤3× its unbounded time; DuckDB-Wasm cannot spill"
     },
     "W1M/spill_sort_wide_text@256MiB": {
       "gate": "A",
@@ -228,7 +228,7 @@
     "W1M/spill_hash_join_text@64MiB": {
       "gate": "A",
       "completes": true,
-      "note": "completes under the cap in \u22643\u00d7 its unbounded time; DuckDB-Wasm cannot spill"
+      "note": "completes under the cap in ≤3× its unbounded time; DuckDB-Wasm cannot spill"
     },
     "W1M/spill_hash_join_text@256MiB": {
       "gate": "A",
@@ -609,7 +609,7 @@
     "W5M/spill_group_1m@64MiB": {
       "gate": "A",
       "completes": true,
-      "note": "completes under the cap in \u22643\u00d7 its unbounded time; DuckDB-Wasm cannot spill"
+      "note": "completes under the cap in ≤3× its unbounded time; DuckDB-Wasm cannot spill"
     },
     "W5M/spill_group_1m@256MiB": {
       "gate": "A",
@@ -619,7 +619,7 @@
     "W5M/spill_sort_wide_text@64MiB": {
       "gate": "A",
       "completes": true,
-      "note": "completes under the cap in \u22643\u00d7 its unbounded time; DuckDB-Wasm cannot spill"
+      "note": "completes under the cap in ≤3× its unbounded time; DuckDB-Wasm cannot spill"
     },
     "W5M/spill_sort_wide_text@256MiB": {
       "gate": "A",
@@ -629,7 +629,7 @@
     "W5M/spill_hash_join_text@64MiB": {
       "gate": "A",
       "completes": true,
-      "note": "completes under the cap in \u22643\u00d7 its unbounded time; DuckDB-Wasm cannot spill"
+      "note": "completes under the cap in ≤3× its unbounded time; DuckDB-Wasm cannot spill"
     },
     "W5M/spill_hash_join_text@256MiB": {
       "gate": "A",
@@ -727,539 +727,632 @@
           "reference": "duckdb",
           "status": "completes",
           "ratio": 8.34,
-          "threshold": 13.9
+          "threshold": 13.9,
+          "workload": "02e6a0b35321b873d7567279df3c361ceb4c289197ae11095dc23e6064dfe53c"
         },
         "S1/S_fact_fact": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 3.22,
-          "threshold": 4.83
+          "threshold": 4.83,
+          "workload": "b19310efbfc680182840806ac021e32bb0781a64bda9ebf042ef01f4b55edc99"
         },
         "S1/S_m2m": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 4.61,
-          "threshold": 6.92
+          "threshold": 6.92,
+          "workload": "95dd7ac7971d7584ac6d22ae3c9bb1dc8a1071479d7199a6af2dae0ae5bbb9ad"
         },
         "S1/S_q10": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 5.41,
-          "threshold": 8.99
+          "threshold": 8.99,
+          "workload": "8b64b9e52e6f4882bf8a83b9935211aa988f71cc0f731a5d0f2e09fe3616639c"
         },
         "S1/S_q11": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.19,
-          "threshold": 3.62
+          "threshold": 3.62,
+          "workload": "77561a083de3e8bdfef5d331f648a97cb5c3c5adb1fee51061db697ad6a6e78e"
         },
         "S1/S_q14": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 3.11,
-          "threshold": 4.66
+          "threshold": 4.66,
+          "workload": "cab7faddb06862423c94ae668f5d60be23143801fef86f7d7b9d772c1b3de7a0"
         },
         "S1/S_q15": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 12.7,
-          "threshold": 19.1
+          "threshold": 19.1,
+          "workload": "b32742bd5ddc82c076880be6199677511a8927fcdf36964b40a8898bd9f06c92"
         },
         "S1/S_q2": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 7.21,
-          "threshold": 12.5
+          "threshold": 12.5,
+          "workload": "727a6780a8cea52dc32417697d4126af901520fafa48509c48f6585b7be35833"
         },
         "S1/S_q3": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.13,
-          "threshold": 6.39
+          "threshold": 6.39,
+          "workload": "002f3d50193175664a77c5c0da2e97de8d4e35cf7215757c6b96203ee000e394"
         },
         "S1/S_q4": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 9.71,
-          "threshold": 24.4
+          "threshold": 24.4,
+          "workload": "fd6f1bcc01aace268177731e263c19d8e808c1fab70d4a2d3353604a95bf73d4"
         },
         "S1/S_q5": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 4.17,
-          "threshold": 6.26
+          "threshold": 6.26,
+          "workload": "2b95874ed82d1ac27836c15f1523179ec73cf60528e2ee304062c8f686da5b16"
         },
         "S1/S_q6": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 7.11,
-          "threshold": 14.2
+          "threshold": 14.2,
+          "workload": "94b2c1beb47f26c9ad81e7cfb4c0cea246f98091d0e06a1ef39e408e5de1017a"
         },
         "S1/S_q7": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 5.32,
-          "threshold": 7.97
+          "threshold": 7.97,
+          "workload": "5dec4ecac3cf661e391d321e0799cd1b7ac4ea9b65ec377f86d0f0b0f6a1ff48"
         },
         "S1/S_q8": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 10.1,
-          "threshold": 18.4
+          "threshold": 18.4,
+          "workload": "78de0dcdd789d4b9d255d2c53fc8e0aa8e7d170afcb8772e00e5adb1c8f50998"
         },
         "S1/S_q9": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 8.38,
-          "threshold": 12.6
+          "threshold": 12.6,
+          "workload": "c630bf61964f94c02fc5f78d1554e489887c976ecd0cfdacd55aa79940d8b64b"
         },
         "S1/S_semi": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 8.51,
-          "threshold": 18.5
+          "threshold": 18.5,
+          "workload": "eeff611727bed594090f7217f994863a23eb4580c2b11391f7c2454f7b02cb4b"
         },
         "W1M/agg_3dims_20aggs": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 21.8,
-          "threshold": 42.5
+          "threshold": 42.5,
+          "workload": "45b4219c325afb187685216140e0baac7f10f2f52bba7af6ce84326a975fd0fe"
         },
         "W1M/agg_count_distinct": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 8.18,
-          "threshold": 17.7
+          "threshold": 17.7,
+          "workload": "42f01a7e2ac816aa9801b62faf9b476438142147b188245f306cdb751f76d771"
         },
         "W1M/agg_count_distinct_grouped": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 6.91,
-          "threshold": 11.7
+          "threshold": 11.7,
+          "workload": "e2dd03c21502a21e027de71dcb9adcacfbc07bc66225ec71d8ac35438809bc59"
         },
         "W1M/agg_highcard_int": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "spill-limit"
+          "failure": "spill-limit",
+          "workload": "49c09b1ee55471282b62369005011707d843885f60571f69662a30b75eb697a6"
         },
         "W1M/agg_highcard_text": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "spill-limit"
+          "failure": "spill-limit",
+          "workload": "07d71caf520b7966445fcb5f9b7b87dc800cc76c76cfded14eb0bf58569601ff"
         },
         "W1M/agg_numeric_grouped": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 692,
-          "threshold": 1040
+          "threshold": 1040,
+          "workload": "b1f2cc2ab939482e44df66bd84b7f7995cc22ff5683d89f2a8e86e8afa486b00"
         },
         "W1M/agg_numeric_sum": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 1370,
-          "threshold": 2270
+          "threshold": 2270,
+          "workload": "0834b2c23d7d4f27b93ada534e0415ebb67bd4780ae49d009fda2401e09570a8"
         },
         "W1M/join_anti_not_exists": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.68,
-          "threshold": 8.03
+          "threshold": 8.03,
+          "workload": "0b93ee848bdb74052c35d37677c1bc6e9d2d3ed60eadf1655392d058ee0d4139"
         },
         "W1M/join_fact_fact_int": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 0.954,
-          "threshold": 2.52
+          "threshold": 2.52,
+          "workload": "dc9c5604cdd224665919e19be10c9dd640b229c9dc8e5ad6ef39e7633358ccb4"
         },
         "W1M/join_fact_fact_text": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "88a8b1b9a9010c01d3a62d8ae09a6690b360534683c999a892e235b7186f25e5"
         },
         "W1M/join_semi_exists": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.87,
-          "threshold": 5.22
+          "threshold": 5.22,
+          "workload": "b4f6dcd9df723c29f32fa2feb03bbcb114dbf1e5da69164d8c8147933f03497a"
         },
         "W1M/join_star_3dims": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 1.66,
-          "threshold": 2.75
+          "threshold": 2.75,
+          "workload": "6dde52a87514f6f81eb05523dd2ad9ec6fc0740f5885c48813e62e1494d2c64e"
         },
         "W1M/scan_export_all": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "0d81f6ae7496838386d4620259cee254349f172a2555d0356d92f025e1a3e157"
         },
         "W1M/scan_first_page": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 107,
-          "threshold": 222
+          "threshold": 222,
+          "workload": "b10dff41faabed0586f9c320e557a5206fd8ffd8850921ac26e9e35d30bd5ce7"
         },
         "W1M/scan_first_page_ordered": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 16.4,
-          "threshold": 27.7
+          "threshold": 27.7,
+          "workload": "56132c4da6a7911d7b005fb039a1afcf781f9f54a250bd8eef8a220dcbf908c9"
         },
         "W1M/scan_proj3_agg": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.32,
-          "threshold": 6.95
+          "threshold": 6.95,
+          "workload": "b07bcd43ba7f4e0384d0e003d3010c962e24ce8903389c5a27c0a49564000bc4"
         },
         "W1M/scan_selective_30col": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 110,
-          "threshold": 172
+          "threshold": 172,
+          "workload": "66ea0f5f21341d645e8e61e7f95352147c3e3ded0879c25af84ad16c542b24e7"
         },
         "W1M/sort_deep_offset": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 0.57,
-          "threshold": 1.07
+          "threshold": 1.07,
+          "workload": "29d8f38f03c399c44bacf5b596736faec31a7d38a1acdd9cf876728a96803541"
         },
         "W1M/sort_deep_offset_pk": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 0.00187,
-          "threshold": 0.00562
+          "threshold": 0.00562,
+          "workload": "f927efee5c5b16a6289bf077f887181d3f82557f6672112e58e5a6c210842122"
         },
         "W1M/sort_full_numeric": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 3.49,
-          "threshold": 5.43
+          "threshold": 5.43,
+          "workload": "6f6e5fb86bd5aefc768601bacc01754fcc7f277ac4eac83eb4184558751b194c"
         },
         "W1M/sort_full_text": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "timeout"
+          "failure": "timeout",
+          "workload": "321912a9053d5c7aa90880e3fdce86b43d495771af65d4b410b8904103e05480"
         },
         "W1M/sort_topn": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 7.13,
-          "threshold": 10.7
+          "threshold": 10.7,
+          "workload": "d9733704320fea34ac225ef35105808e1e38b23fc98d58f5c104b5d646059c70"
         },
         "W1M/sort_topn_wide": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "9bcefc6cb29a552c60c3960112a7ddf2f9af9d36804ba9344d75aa2d1a8bf667"
         },
         "W1M/spill_group_1m@256MiB": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 16.8,
-          "threshold": 50.4
+          "threshold": 50.4,
+          "workload": "7c40181973ec13b7a5288bc2698503d523b67d4efd196e155532a3392bdc0d7b"
         },
         "W1M/spill_group_1m@64MiB": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "spill-limit"
+          "failure": "spill-limit",
+          "workload": "d87d99b492210b7db60cf696b5da8625b01883e6aaeb796da67928b7061b1a18"
         },
         "W1M/spill_hash_join_text@256MiB": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 8.32,
-          "threshold": 15.6
+          "threshold": 15.6,
+          "workload": "08bdf9196aeec4e91fbaafad80572916264cc671e0311320ecd38cf24c535115"
         },
         "W1M/spill_hash_join_text@64MiB": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "cafccbb10b09a34b3e94b36836e3e22d9d1807b2cc26dfcc0d19b825bebde652"
         },
         "W1M/spill_sort_wide_text@256MiB": {
           "reference": "duckdb",
-          "status": "completes"
+          "status": "completes",
+          "workload": "5e9c7430cabc11de51fdfb5530511294c5ce83b5b569e6e113a6968f08b88b5e"
         },
         "W1M/spill_sort_wide_text@64MiB": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "timeout"
+          "failure": "timeout",
+          "workload": "70a57913eb4ab8b81752b65590bee43615a728232f260f390c1ca1901d74197f"
         },
         "W1M/win_lag_lead": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "35648c277ab4ba0a3ec4ba76968ac91111baed9b1083d2a195a654518030734e"
         },
         "W1M/win_median_pct": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 10.1,
-          "threshold": 17.7
+          "threshold": 17.7,
+          "workload": "784ed49bfac01b660dd935f983f0585e9d882f0dec9195ec02f81ea3eff4b935"
         },
         "W1M/win_moving_avg": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "42aab2d5bb01382f84bb63590dad8177da50c946da5250066f1a5644697072fe"
         },
         "W1M/win_rank": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "12ded6ffa11355e17436734028f9ff925ebda44f600cd030bb47c68e782addf2"
         },
         "W1M/win_running_sum": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "de8abb2ba2a173f5acaf4222068c227b2bb255d656e62e81995e89e8f6585a42"
         },
         "W1M/win_topk_row_number": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "6b2a3aa778449c87c0dc41bb694e09af101dadf66d13f54dd571ce0ce60d660e"
         },
         "W500/agg_3dims_20aggs": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 27,
-          "threshold": 46.8
+          "threshold": 46.8,
+          "workload": "09aa9fab3ae48cdd2798ebd511f0e7f4c0ad85b52b49a6326eab6449c3f8716d"
         },
         "W500/agg_count_distinct": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.32,
-          "threshold": 4.12
+          "threshold": 4.12,
+          "workload": "59b82e9f692c3136c4b13cf8b8fac6fb5dcd65c881a7a466672f99816dce02ef"
         },
         "W500/agg_count_distinct_grouped": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 3.16,
-          "threshold": 6.27
+          "threshold": 6.27,
+          "workload": "601cc64ea128ed2c834b2007b1a3489b0a48ab260eab5dfdbb96683d602c3ba8"
         },
         "W500/agg_highcard_int": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 25.2,
-          "threshold": 75.5
+          "threshold": 75.5,
+          "workload": "d8f055aa1937f962f1d1891fe6cfd173cbc70aad4dd404c43e858eeb06567d81"
         },
         "W500/agg_highcard_text": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 21.4,
-          "threshold": 44.9
+          "threshold": 44.9,
+          "workload": "cdf6544ae1a3433a495a10630c30adf8669670152ff7a6e5f68c6c8bd7fe25f6"
         },
         "W500/agg_numeric_grouped": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 581,
-          "threshold": 871
+          "threshold": 871,
+          "workload": "891916d7248a89072735d9138afc0e96cd084cc29b475712fefd2a4b85863c49"
         },
         "W500/agg_numeric_sum": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 1260,
-          "threshold": 1890
+          "threshold": 1890,
+          "workload": "2374979094acf1898a25908ffc4736ac492dbd84e312e1c64a5295b54f3e21de"
         },
         "W500/join_anti_not_exists": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 5.35,
-          "threshold": 11.2
+          "threshold": 11.2,
+          "workload": "67d9fb5fc42dc0e93ea1a919699d3cdc01f4b9bbfa9f0d689f8b81b4ce8cbbbe"
         },
         "W500/join_fact_fact_int": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 1.48,
-          "threshold": 4.45
+          "threshold": 4.45,
+          "workload": "6f3543d94ee18eeb9cd4b5300b7b230cf30acf9cec66354a58b57d8d40907584"
         },
         "W500/join_fact_fact_text": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 3.28,
-          "threshold": 5.1
+          "threshold": 5.1,
+          "workload": "afe74f33219dd7b63d89bcfbef11059e38d80df441af4cfb3b236b562efbc862"
         },
         "W500/join_semi_exists": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 3.72,
-          "threshold": 7.98
+          "threshold": 7.98,
+          "workload": "53cbecc13cd5cf854b848ad66ff13fa1bc51e6e0ec96086c2ca6b906ebc07074"
         },
         "W500/join_star_3dims": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 3.86,
-          "threshold": 11.1
+          "threshold": 11.1,
+          "workload": "ae3b3cc2886df323547d088017d3ad358ff4cf1f636847953186bc8ed3e0f573"
         },
         "W500/scan_export_all": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "d617e878c1c0f34e06d2c5979cb5529838f222bf666580aa60ed18bbbcf15da3"
         },
         "W500/scan_first_page": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "a5c1cf104c1bdf9ad6399adeb9f437adccdcc74e4dbffcda0977b0d28a5ebbeb"
         },
         "W500/scan_first_page_ordered": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "63a47d5146e1bec09ea59d79ffbefd0a3fe7d0c29b3085f6c9350a8ffbb81d75"
         },
         "W500/scan_proj3_agg": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 1.69,
-          "threshold": 5.06
+          "threshold": 5.06,
+          "workload": "39a53f05b2aedbf38c306696eac02feed17c23a3941388a0ec668dd2196dbb25"
         },
         "W500/scan_selective_30col": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 143,
-          "threshold": 215
+          "threshold": 215,
+          "workload": "c232881792d66513af063ea7e074a861f2640527732ef3d5d1f8540d1b93d532"
         },
         "W500/sort_deep_offset": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 0.755,
-          "threshold": 1.2
+          "threshold": 1.2,
+          "workload": "fa495e9e49bf1452520fff35a215604a705343f496b7315ad603ce8b39fb1836"
         },
         "W500/sort_deep_offset_pk": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 0.0156,
-          "threshold": 0.0468
+          "threshold": 0.0468,
+          "workload": "f9cb32f8586a76922b690d080334ec5381d04b1ae561a82a5ebf966df04784df"
         },
         "W500/sort_full_numeric": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 5.81,
-          "threshold": 11
+          "threshold": 11,
+          "workload": "971fa555bec0a28d1cc243cae32e9fce020a11f98ed3161118946ffddfc47529"
         },
         "W500/sort_full_text": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 7.45,
-          "threshold": 14.6
+          "threshold": 14.6,
+          "workload": "ffc59a1a04fad00a19d81c4fff92270d5a4f48bd28b72ca868dbe4e1e8d1a060"
         },
         "W500/sort_topn": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 0.146,
-          "threshold": 0.438
+          "threshold": 0.438,
+          "workload": "a0432f58cbf708c0f04c48653664ee8e6a0926cd849df39f0a50936bbde0b3b8"
         },
         "W500/sort_topn_wide": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "4d04f91c5365b572574af405e9173e81eb0d0ab688ebbb1fef72577ebe868d44"
         },
         "W500/win_lag_lead": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 10.2,
-          "threshold": 19.1
+          "threshold": 19.1,
+          "workload": "7dec8ae561f17297ec54c68a25c2013c5b4e16afb6b6f08ccb9d34cf91f0daed"
         },
         "W500/win_median_pct": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 12.4,
-          "threshold": 22.8
+          "threshold": 22.8,
+          "workload": "ef27b5c9a5df1ced074873e5970c9a2aa521b81fc1f2a22cc2f86108ccc75b3b"
         },
         "W500/win_moving_avg": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 5.96,
-          "threshold": 9.76
+          "threshold": 9.76,
+          "workload": "a1b14cf18e5e28a710c2b297c86512d4e07dc37ecce6f6d42df86098caad3d69"
         },
         "W500/win_rank": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 9.46,
-          "threshold": 16.9
+          "threshold": 16.9,
+          "workload": "5f096705caa55ca85e8fb754725053028ee45e6084bf351910f18b2798d19600"
         },
         "W500/win_running_sum": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 3.98,
-          "threshold": 11.7
+          "threshold": 11.7,
+          "workload": "566236ee22a21d2f3c2fc77efdded1a15d2074d0e073ad1d0e3e2a7b64abc7b6"
         },
         "W500/win_topk_row_number": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 5.83,
-          "threshold": 8.74
+          "threshold": 8.74,
+          "workload": "4effe4d1fe119c619479d771f14530487091bc570b4669c3e5e7cb61256b0109"
         },
         "point/insert_concurrent_strict_32": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 31.9,
-          "threshold": 70.4
+          "threshold": 70.4,
+          "workload": "01cd6756fc897e054955e8366838d21c9e217cf46e785e59aedd695e1bcdbd5a"
         },
         "point/insert_concurrent_strict_64": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 31,
-          "threshold": 59.3
+          "threshold": 59.3,
+          "workload": "0c6108131cd8c4f72afff440256783a578a0c5764744e17990635ac0369d4784"
         },
         "point/insert_concurrent_strict_8": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 26,
-          "threshold": 78
+          "threshold": 78,
+          "workload": "98773aa864be9844c9655950da3b4953656a8c4bfa5d29fd37bbb6c1b508c057"
         },
         "point/insert_prepared_relaxed": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 14.4,
-          "threshold": 40.4
+          "threshold": 40.4,
+          "workload": "22181fad2803a47c8cd00018dc7af59563dab2fbfa4d44a82be3e04c124d913e"
         },
         "point/insert_single_strict": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 5,
-          "threshold": 13.4
+          "threshold": 13.4,
+          "workload": "bc1cbb5c79e68689402affbfaa09f68a948dae15433b1294bac29ec929d7fd08"
         },
         "point/load_keyed_1m_strict": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 0.554,
-          "threshold": 1.66
+          "threshold": 1.66,
+          "workload": "cceed6318a5b0782569f400f93227fd646cbd09576c7e2f11fd9499d7326a423"
         },
         "point/pk_read_after_2k_writes": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 214,
-          "threshold": 405
+          "threshold": 405,
+          "workload": "02866e0c8d6a93a5f7d9c78b7c8a4a9ab684d62c991efd3575770ec2ebc0a658"
         },
         "point/pk_read_cold_1m": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 166,
-          "threshold": 497
+          "threshold": 497,
+          "workload": "ff3b4a78c57bf22e26e19a3ca41509aed081e67cade7c9ebf41cc73259622ff4"
         },
         "point/pk_read_compacted": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 143,
-          "threshold": 428
+          "threshold": 428,
+          "workload": "d2bc219f75d75b14b17ac11765819b78c617a1e375d714480321877fa083bdf7"
         },
         "point/pk_read_cross_tab": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 499,
-          "threshold": 1500
+          "threshold": 1500,
+          "workload": "a8e84673a3311ef68d6a7fff95a7c2d4339a4dd6904ee0be9120674364da4375"
         },
         "point/pk_read_warm_int": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 312,
-          "threshold": 936
+          "threshold": 936,
+          "workload": "0450156bae3dedae2110112b6e70229e79b3ca39011df9cafffd1751eab8188c"
         },
         "point/pk_read_warm_int_literal": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 173,
-          "threshold": 520
+          "threshold": 520,
+          "workload": "87824bfb20e2e93cab9d102780a9d183dbea5f5d2667e8e8558e9fc5827192a5"
         },
         "point/pk_read_warm_uuid": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 4.07,
-          "threshold": 12.2
+          "threshold": 12.2,
+          "workload": "03f2d0f7c07e3d0c0406c89d9b6f420b70adfe75977e8f84c2b2e45531b7fe94"
         }
       }
     },
@@ -1271,539 +1364,636 @@
           "reference": "duckdb",
           "status": "completes",
           "ratio": 6.86,
-          "threshold": 10.3
+          "threshold": 10.3,
+          "workload": "02e6a0b35321b873d7567279df3c361ceb4c289197ae11095dc23e6064dfe53c"
         },
         "S1/S_fact_fact": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.76,
-          "threshold": 4.41
+          "threshold": 4.41,
+          "workload": "b19310efbfc680182840806ac021e32bb0781a64bda9ebf042ef01f4b55edc99"
         },
         "S1/S_m2m": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 4.85,
-          "threshold": 7.28
+          "threshold": 7.28,
+          "workload": "95dd7ac7971d7584ac6d22ae3c9bb1dc8a1071479d7199a6af2dae0ae5bbb9ad"
         },
         "S1/S_q10": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 4.77,
-          "threshold": 7.71
+          "threshold": 7.71,
+          "workload": "8b64b9e52e6f4882bf8a83b9935211aa988f71cc0f731a5d0f2e09fe3616639c"
         },
         "S1/S_q11": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.42,
-          "threshold": 4.01
+          "threshold": 4.01,
+          "workload": "77561a083de3e8bdfef5d331f648a97cb5c3c5adb1fee51061db697ad6a6e78e"
         },
         "S1/S_q14": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.79,
-          "threshold": 4.18
+          "threshold": 4.18,
+          "workload": "cab7faddb06862423c94ae668f5d60be23143801fef86f7d7b9d772c1b3de7a0"
         },
         "S1/S_q15": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 11,
-          "threshold": 18
+          "threshold": 18,
+          "workload": "b32742bd5ddc82c076880be6199677511a8927fcdf36964b40a8898bd9f06c92"
         },
         "S1/S_q2": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 5.86,
-          "threshold": 10.1
+          "threshold": 10.1,
+          "workload": "727a6780a8cea52dc32417697d4126af901520fafa48509c48f6585b7be35833"
         },
         "S1/S_q3": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.4,
-          "threshold": 5.78
+          "threshold": 5.78,
+          "workload": "002f3d50193175664a77c5c0da2e97de8d4e35cf7215757c6b96203ee000e394"
         },
         "S1/S_q4": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 8.18,
-          "threshold": 20.9
+          "threshold": 20.9,
+          "workload": "fd6f1bcc01aace268177731e263c19d8e808c1fab70d4a2d3353604a95bf73d4"
         },
         "S1/S_q5": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 3.78,
-          "threshold": 6.02
+          "threshold": 6.02,
+          "workload": "2b95874ed82d1ac27836c15f1523179ec73cf60528e2ee304062c8f686da5b16"
         },
         "S1/S_q6": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 7.33,
-          "threshold": 17
+          "threshold": 17,
+          "workload": "94b2c1beb47f26c9ad81e7cfb4c0cea246f98091d0e06a1ef39e408e5de1017a"
         },
         "S1/S_q7": {
           "reference": "duckdb",
           "status": "completes",
-          "ratio": 5.14,
-          "threshold": 9.56
+          "ratio": 19.3,
+          "threshold": 29,
+          "workload": "778ae7135face38780006bfb8dbe7259aa88d60957c24b7c85b0b2c845fb0122",
+          "calibration": {
+            "authority": "4e7b6a0c: PostgreSQL-valid NUMERIC ROUND workload correction",
+            "run": "https://github.com/ericwilhite/minnow/actions/runs/43795802769"
+          }
         },
         "S1/S_q8": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 10.9,
-          "threshold": 20.1
+          "threshold": 20.1,
+          "workload": "78de0dcdd789d4b9d255d2c53fc8e0aa8e7d170afcb8772e00e5adb1c8f50998"
         },
         "S1/S_q9": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 8.3,
-          "threshold": 12.9
+          "threshold": 12.9,
+          "workload": "c630bf61964f94c02fc5f78d1554e489887c976ecd0cfdacd55aa79940d8b64b"
         },
         "S1/S_semi": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 5.47,
-          "threshold": 11
+          "threshold": 11,
+          "workload": "eeff611727bed594090f7217f994863a23eb4580c2b11391f7c2454f7b02cb4b"
         },
         "W1M/agg_3dims_20aggs": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 22.4,
-          "threshold": 33.6
+          "threshold": 33.6,
+          "workload": "45b4219c325afb187685216140e0baac7f10f2f52bba7af6ce84326a975fd0fe"
         },
         "W1M/agg_count_distinct": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 9.67,
-          "threshold": 17.1
+          "threshold": 17.1,
+          "workload": "42f01a7e2ac816aa9801b62faf9b476438142147b188245f306cdb751f76d771"
         },
         "W1M/agg_count_distinct_grouped": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 6.43,
-          "threshold": 9.65
+          "threshold": 9.65,
+          "workload": "e2dd03c21502a21e027de71dcb9adcacfbc07bc66225ec71d8ac35438809bc59"
         },
         "W1M/agg_highcard_int": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "spill-limit"
+          "failure": "spill-limit",
+          "workload": "49c09b1ee55471282b62369005011707d843885f60571f69662a30b75eb697a6"
         },
         "W1M/agg_highcard_text": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "spill-limit"
+          "failure": "spill-limit",
+          "workload": "07d71caf520b7966445fcb5f9b7b87dc800cc76c76cfded14eb0bf58569601ff"
         },
         "W1M/agg_numeric_grouped": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 694,
-          "threshold": 1040
+          "threshold": 1040,
+          "workload": "b1f2cc2ab939482e44df66bd84b7f7995cc22ff5683d89f2a8e86e8afa486b00"
         },
         "W1M/agg_numeric_sum": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 1520,
-          "threshold": 2280
+          "threshold": 2280,
+          "workload": "0834b2c23d7d4f27b93ada534e0415ebb67bd4780ae49d009fda2401e09570a8"
         },
         "W1M/join_anti_not_exists": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 3.12,
-          "threshold": 4.67
+          "threshold": 4.67,
+          "workload": "0b93ee848bdb74052c35d37677c1bc6e9d2d3ed60eadf1655392d058ee0d4139"
         },
         "W1M/join_fact_fact_int": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 1.42,
-          "threshold": 2.24
+          "threshold": 2.24,
+          "workload": "dc9c5604cdd224665919e19be10c9dd640b229c9dc8e5ad6ef39e7633358ccb4"
         },
         "W1M/join_fact_fact_text": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "88a8b1b9a9010c01d3a62d8ae09a6690b360534683c999a892e235b7186f25e5"
         },
         "W1M/join_semi_exists": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.88,
-          "threshold": 4.32
+          "threshold": 4.32,
+          "workload": "b4f6dcd9df723c29f32fa2feb03bbcb114dbf1e5da69164d8c8147933f03497a"
         },
         "W1M/join_star_3dims": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.6,
-          "threshold": 3.9
+          "threshold": 3.9,
+          "workload": "6dde52a87514f6f81eb05523dd2ad9ec6fc0740f5885c48813e62e1494d2c64e"
         },
         "W1M/scan_export_all": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "0d81f6ae7496838386d4620259cee254349f172a2555d0356d92f025e1a3e157"
         },
         "W1M/scan_first_page": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 81.5,
-          "threshold": 128
+          "threshold": 128,
+          "workload": "b10dff41faabed0586f9c320e557a5206fd8ffd8850921ac26e9e35d30bd5ce7"
         },
         "W1M/scan_first_page_ordered": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 12.4,
-          "threshold": 18.7
+          "threshold": 18.7,
+          "workload": "56132c4da6a7911d7b005fb039a1afcf781f9f54a250bd8eef8a220dcbf908c9"
         },
         "W1M/scan_proj3_agg": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.76,
-          "threshold": 8.28
+          "threshold": 8.28,
+          "workload": "b07bcd43ba7f4e0384d0e003d3010c962e24ce8903389c5a27c0a49564000bc4"
         },
         "W1M/scan_selective_30col": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 127,
-          "threshold": 191
+          "threshold": 191,
+          "workload": "66ea0f5f21341d645e8e61e7f95352147c3e3ded0879c25af84ad16c542b24e7"
         },
         "W1M/sort_deep_offset": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 0.473,
-          "threshold": 0.709
+          "threshold": 0.709,
+          "workload": "29d8f38f03c399c44bacf5b596736faec31a7d38a1acdd9cf876728a96803541"
         },
         "W1M/sort_deep_offset_pk": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 0.00267,
-          "threshold": 0.00714
+          "threshold": 0.00714,
+          "workload": "f927efee5c5b16a6289bf077f887181d3f82557f6672112e58e5a6c210842122"
         },
         "W1M/sort_full_numeric": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 3.97,
-          "threshold": 5.96
+          "threshold": 5.96,
+          "workload": "6f6e5fb86bd5aefc768601bacc01754fcc7f277ac4eac83eb4184558751b194c"
         },
         "W1M/sort_full_text": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "timeout"
+          "failure": "timeout",
+          "workload": "321912a9053d5c7aa90880e3fdce86b43d495771af65d4b410b8904103e05480"
         },
         "W1M/sort_topn": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 14.5,
-          "threshold": 21.8
+          "threshold": 21.8,
+          "workload": "d9733704320fea34ac225ef35105808e1e38b23fc98d58f5c104b5d646059c70"
         },
         "W1M/sort_topn_wide": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "9bcefc6cb29a552c60c3960112a7ddf2f9af9d36804ba9344d75aa2d1a8bf667"
         },
         "W1M/spill_group_1m@256MiB": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 21.3,
-          "threshold": 32.9
+          "threshold": 32.9,
+          "workload": "7c40181973ec13b7a5288bc2698503d523b67d4efd196e155532a3392bdc0d7b"
         },
         "W1M/spill_group_1m@64MiB": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "spill-limit"
+          "failure": "spill-limit",
+          "workload": "d87d99b492210b7db60cf696b5da8625b01883e6aaeb796da67928b7061b1a18"
         },
         "W1M/spill_hash_join_text@256MiB": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 8.23,
-          "threshold": 12.3
+          "threshold": 12.3,
+          "workload": "08bdf9196aeec4e91fbaafad80572916264cc671e0311320ecd38cf24c535115"
         },
         "W1M/spill_hash_join_text@64MiB": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "cafccbb10b09a34b3e94b36836e3e22d9d1807b2cc26dfcc0d19b825bebde652"
         },
         "W1M/spill_sort_wide_text@256MiB": {
           "reference": "duckdb",
-          "status": "completes"
+          "status": "completes",
+          "workload": "5e9c7430cabc11de51fdfb5530511294c5ce83b5b569e6e113a6968f08b88b5e"
         },
         "W1M/spill_sort_wide_text@64MiB": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "timeout"
+          "failure": "timeout",
+          "workload": "70a57913eb4ab8b81752b65590bee43615a728232f260f390c1ca1901d74197f"
         },
         "W1M/win_lag_lead": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "35648c277ab4ba0a3ec4ba76968ac91111baed9b1083d2a195a654518030734e"
         },
         "W1M/win_median_pct": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 9.64,
-          "threshold": 14.5
+          "threshold": 14.5,
+          "workload": "784ed49bfac01b660dd935f983f0585e9d882f0dec9195ec02f81ea3eff4b935"
         },
         "W1M/win_moving_avg": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "42aab2d5bb01382f84bb63590dad8177da50c946da5250066f1a5644697072fe"
         },
         "W1M/win_rank": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "12ded6ffa11355e17436734028f9ff925ebda44f600cd030bb47c68e782addf2"
         },
         "W1M/win_running_sum": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "de8abb2ba2a173f5acaf4222068c227b2bb255d656e62e81995e89e8f6585a42"
         },
         "W1M/win_topk_row_number": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "6b2a3aa778449c87c0dc41bb694e09af101dadf66d13f54dd571ce0ce60d660e"
         },
         "W500/agg_3dims_20aggs": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 15.6,
-          "threshold": 23.4
+          "threshold": 23.4,
+          "workload": "09aa9fab3ae48cdd2798ebd511f0e7f4c0ad85b52b49a6326eab6449c3f8716d"
         },
         "W500/agg_count_distinct": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 1.43,
-          "threshold": 2.14
+          "threshold": 2.14,
+          "workload": "59b82e9f692c3136c4b13cf8b8fac6fb5dcd65c881a7a466672f99816dce02ef"
         },
         "W500/agg_count_distinct_grouped": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 1.63,
-          "threshold": 2.47
+          "threshold": 2.47,
+          "workload": "601cc64ea128ed2c834b2007b1a3489b0a48ab260eab5dfdbb96683d602c3ba8"
         },
         "W500/agg_highcard_int": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 10.7,
-          "threshold": 32.2
+          "threshold": 32.2,
+          "workload": "d8f055aa1937f962f1d1891fe6cfd173cbc70aad4dd404c43e858eeb06567d81"
         },
         "W500/agg_highcard_text": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 12.5,
-          "threshold": 26.6
+          "threshold": 26.6,
+          "workload": "cdf6544ae1a3433a495a10630c30adf8669670152ff7a6e5f68c6c8bd7fe25f6"
         },
         "W500/agg_numeric_grouped": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 373,
-          "threshold": 560
+          "threshold": 560,
+          "workload": "891916d7248a89072735d9138afc0e96cd084cc29b475712fefd2a4b85863c49"
         },
         "W500/agg_numeric_sum": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 614,
-          "threshold": 1230
+          "threshold": 1230,
+          "workload": "2374979094acf1898a25908ffc4736ac492dbd84e312e1c64a5295b54f3e21de"
         },
         "W500/join_anti_not_exists": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 1.96,
-          "threshold": 5.37
+          "threshold": 5.37,
+          "workload": "67d9fb5fc42dc0e93ea1a919699d3cdc01f4b9bbfa9f0d689f8b81b4ce8cbbbe"
         },
         "W500/join_fact_fact_int": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 0.577,
-          "threshold": 1.73
+          "threshold": 1.73,
+          "workload": "6f3543d94ee18eeb9cd4b5300b7b230cf30acf9cec66354a58b57d8d40907584"
         },
         "W500/join_fact_fact_text": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.55,
-          "threshold": 3.83
+          "threshold": 3.83,
+          "workload": "afe74f33219dd7b63d89bcfbef11059e38d80df441af4cfb3b236b562efbc862"
         },
         "W500/join_semi_exists": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 1.89,
-          "threshold": 4.84
+          "threshold": 4.84,
+          "workload": "53cbecc13cd5cf854b848ad66ff13fa1bc51e6e0ec96086c2ca6b906ebc07074"
         },
         "W500/join_star_3dims": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.09,
-          "threshold": 6.28
+          "threshold": 6.28,
+          "workload": "ae3b3cc2886df323547d088017d3ad358ff4cf1f636847953186bc8ed3e0f573"
         },
         "W500/scan_export_all": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "d617e878c1c0f34e06d2c5979cb5529838f222bf666580aa60ed18bbbcf15da3"
         },
         "W500/scan_first_page": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "a5c1cf104c1bdf9ad6399adeb9f437adccdcc74e4dbffcda0977b0d28a5ebbeb"
         },
         "W500/scan_first_page_ordered": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "63a47d5146e1bec09ea59d79ffbefd0a3fe7d0c29b3085f6c9350a8ffbb81d75"
         },
         "W500/scan_proj3_agg": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 1.86,
-          "threshold": 5.59
+          "threshold": 5.59,
+          "workload": "39a53f05b2aedbf38c306696eac02feed17c23a3941388a0ec668dd2196dbb25"
         },
         "W500/scan_selective_30col": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 74.7,
-          "threshold": 118
+          "threshold": 118,
+          "workload": "c232881792d66513af063ea7e074a861f2640527732ef3d5d1f8540d1b93d532"
         },
         "W500/sort_deep_offset": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 0.459,
-          "threshold": 0.865
+          "threshold": 0.865,
+          "workload": "fa495e9e49bf1452520fff35a215604a705343f496b7315ad603ce8b39fb1836"
         },
         "W500/sort_deep_offset_pk": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 0.0086,
-          "threshold": 0.0258
+          "threshold": 0.0258,
+          "workload": "f9cb32f8586a76922b690d080334ec5381d04b1ae561a82a5ebf966df04784df"
         },
         "W500/sort_full_numeric": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.87,
-          "threshold": 4.98
+          "threshold": 4.98,
+          "workload": "971fa555bec0a28d1cc243cae32e9fce020a11f98ed3161118946ffddfc47529"
         },
         "W500/sort_full_text": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 5.04,
-          "threshold": 10.1
+          "threshold": 10.1,
+          "workload": "ffc59a1a04fad00a19d81c4fff92270d5a4f48bd28b72ca868dbe4e1e8d1a060"
         },
         "W500/sort_topn": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 0.145,
-          "threshold": 0.436
+          "threshold": 0.436,
+          "workload": "a0432f58cbf708c0f04c48653664ee8e6a0926cd849df39f0a50936bbde0b3b8"
         },
         "W500/sort_topn_wide": {
           "reference": "duckdb",
           "status": "fails",
-          "failure": "budget"
+          "failure": "budget",
+          "workload": "4d04f91c5365b572574af405e9173e81eb0d0ab688ebbb1fef72577ebe868d44"
         },
         "W500/win_lag_lead": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 4.15,
-          "threshold": 6.22
+          "threshold": 6.22,
+          "workload": "7dec8ae561f17297ec54c68a25c2013c5b4e16afb6b6f08ccb9d34cf91f0daed"
         },
         "W500/win_median_pct": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 7.57,
-          "threshold": 11.3
+          "threshold": 11.3,
+          "workload": "ef27b5c9a5df1ced074873e5970c9a2aa521b81fc1f2a22cc2f86108ccc75b3b"
         },
         "W500/win_moving_avg": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 3.91,
-          "threshold": 6.78
+          "threshold": 6.78,
+          "workload": "a1b14cf18e5e28a710c2b297c86512d4e07dc37ecce6f6d42df86098caad3d69"
         },
         "W500/win_rank": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 4.07,
-          "threshold": 6.17
+          "threshold": 6.17,
+          "workload": "5f096705caa55ca85e8fb754725053028ee45e6084bf351910f18b2798d19600"
         },
         "W500/win_running_sum": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.35,
-          "threshold": 4.36
+          "threshold": 4.36,
+          "workload": "566236ee22a21d2f3c2fc77efdded1a15d2074d0e073ad1d0e3e2a7b64abc7b6"
         },
         "W500/win_topk_row_number": {
           "reference": "duckdb",
           "status": "completes",
           "ratio": 2.53,
-          "threshold": 3.82
+          "threshold": 3.82,
+          "workload": "4effe4d1fe119c619479d771f14530487091bc570b4669c3e5e7cb61256b0109"
         },
         "point/insert_concurrent_strict_32": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 47.9,
-          "threshold": 144
+          "threshold": 144,
+          "workload": "01cd6756fc897e054955e8366838d21c9e217cf46e785e59aedd695e1bcdbd5a"
         },
         "point/insert_concurrent_strict_64": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 62.6,
-          "threshold": 188
+          "threshold": 188,
+          "workload": "0c6108131cd8c4f72afff440256783a578a0c5764744e17990635ac0369d4784"
         },
         "point/insert_concurrent_strict_8": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 46.4,
-          "threshold": 139
+          "threshold": 139,
+          "workload": "98773aa864be9844c9655950da3b4953656a8c4bfa5d29fd37bbb6c1b508c057"
         },
         "point/insert_prepared_relaxed": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 19.4,
-          "threshold": 58.3
+          "threshold": 58.3,
+          "workload": "22181fad2803a47c8cd00018dc7af59563dab2fbfa4d44a82be3e04c124d913e"
         },
         "point/insert_single_strict": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 9.24,
-          "threshold": 27.7
+          "threshold": 27.7,
+          "workload": "bc1cbb5c79e68689402affbfaa09f68a948dae15433b1294bac29ec929d7fd08"
         },
         "point/load_keyed_1m_strict": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 0.572,
-          "threshold": 1.72
+          "threshold": 1.72,
+          "workload": "cceed6318a5b0782569f400f93227fd646cbd09576c7e2f11fd9499d7326a423"
         },
         "point/pk_read_after_2k_writes": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 268,
-          "threshold": 412
+          "threshold": 412,
+          "workload": "02866e0c8d6a93a5f7d9c78b7c8a4a9ab684d62c991efd3575770ec2ebc0a658"
         },
         "point/pk_read_cold_1m": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 111,
-          "threshold": 233
+          "threshold": 233,
+          "workload": "ff3b4a78c57bf22e26e19a3ca41509aed081e67cade7c9ebf41cc73259622ff4"
         },
         "point/pk_read_compacted": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 126,
-          "threshold": 379
+          "threshold": 379,
+          "workload": "d2bc219f75d75b14b17ac11765819b78c617a1e375d714480321877fa083bdf7"
         },
         "point/pk_read_cross_tab": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 715,
-          "threshold": 1460
+          "threshold": 1460,
+          "workload": "a8e84673a3311ef68d6a7fff95a7c2d4339a4dd6904ee0be9120674364da4375"
         },
         "point/pk_read_warm_int": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 493,
-          "threshold": 1030
+          "threshold": 1030,
+          "workload": "0450156bae3dedae2110112b6e70229e79b3ca39011df9cafffd1751eab8188c"
         },
         "point/pk_read_warm_int_literal": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 312,
-          "threshold": 936
+          "threshold": 936,
+          "workload": "87824bfb20e2e93cab9d102780a9d183dbea5f5d2667e8e8558e9fc5827192a5"
         },
         "point/pk_read_warm_uuid": {
           "reference": "sqlite",
           "status": "completes",
           "ratio": 3.32,
-          "threshold": 9.95
+          "threshold": 9.95,
+          "workload": "03f2d0f7c07e3d0c0406c89d9b6f420b70adfe75977e8f84c2b2e45531b7fe94"
         }
       }
     }

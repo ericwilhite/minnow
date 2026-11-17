@@ -7,10 +7,10 @@
 # code. Unlike the Node gate it also fails at once when a Minnow store will not reopen after a
 # failed cell, or when Minnow's answer differs from the competitor's.
 #
-# The owner lane (job `owner`) is the next core's cross-tab point-read latency in Chromium, Firefox
-# and WebKit: ruling R22.3 judges R6's absolute targets here (MINNOW_PERF_LANE=1). This hosted
-# job does not qualify host quietness; preserve the raw measurements when interpreting a failure.
-# Developer runs without that flag record latency without enforcing the absolute targets.
+# Shared ubuntu workers observe R6 and enforce structural invariants, not absolute latency.
+# R6 acceptance remains NOT ACCEPTED (release-blocking for 1.0) until a qualified quiet runner
+# is configured and its record committed. Without a runner the acceptance job is skipped;
+# version:check enforces the 1.0 release gate. Observations cannot grant acceptance.
 name: Browser performance
 
 on:
@@ -24,10 +24,11 @@ on:
         default: default
         type: choice
         options: [default, large, all]
-      update:
-        description: "Recalibrate this runner's baseline profile and upload the file (no judging)"
-        default: false
-        type: boolean
+      recalibrate:
+        description: "Hosted calibration only: S_q7 cites the 4e7b6a0c NUMERIC ROUND correction"
+        default: none
+        type: choice
+        options: [none, S_q7, all]
 
 permissions:
   contents: read
@@ -68,7 +69,7 @@ jobs:
           npm run benchmark:browser --
           --scale=${{ inputs.scale || 'default' }}
           --out=browser-perf-results
-          ${{ inputs.update && '--update' || '' }}
+          ${{ inputs.recalibrate == 'S_q7' && '--update --suite=analytics --only=S_q7' || inputs.recalibrate == 'all' && '--update' || '' }}
           2>&1 | tee browser-perf.txt
       - name: Storage microbench (rebuild core, recorded, not judged)
         # The rebuild core's storage in real Chromium on the runner's disk, OPFS and IndexedDB:
@@ -159,7 +160,7 @@ jobs:
           retention-days: 90
 
   owner:
-    name: Owner latency lane (R6)
+    name: Owner latency observation (R6; not acceptance)
     runs-on: ubuntu-latest
     # The latency spec takes about two minutes per engine on a quiet runner; installs dominate.
     timeout-minutes: 45
@@ -175,14 +176,14 @@ jobs:
       - name: Run the owner component split (R6)
         shell: bash
         env:
-          MINNOW_PERF_LANE: "1"
+          MINNOW_R6_MODE: "observe"
         run: |
           npx tsc -b packages/core
           npx vitest run packages/core/src/next/testing/owner-point-read.bench.test.ts --maxWorkers=2 2>&1 | tee owner-components.txt
       - name: Run the owner latency lane
         shell: bash
         env:
-          MINNOW_PERF_LANE: "1"
+          MINNOW_R6_MODE: "observe"
         run: >-
           npm run test:browser:next-owner --
           packages/core/browser-tests/next-owner-latency.spec.ts
@@ -196,4 +197,32 @@ jobs:
             owner-lane.txt
             owner-components.txt
             playwright-report/
+          retention-days: 90
+
+  owner-acceptance:
+    name: R6 acceptance (qualified quiet runner)
+    if: vars.R6_QUIET_RUNNER != ''
+    runs-on: ${{ vars.R6_QUIET_RUNNER }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: bash scripts/ci-install.sh
+      - name: Install the browsers
+        run: npx playwright install --with-deps chromium firefox webkit
+      - name: Judge absolute R6 targets on the qualified host
+        shell: bash
+        env:
+          MINNOW_R6_QUIET_RUNNER_ID: ${{ runner.name }}
+          R6_OUTPUT: ${{ runner.temp }}/minnow-r6-${{ github.run_id }}-${{ github.run_attempt }}
+        run: npm run benchmark:owner:r6 -- --out "$R6_OUTPUT"
+      - name: Upload qualified acceptance evidence for review
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: r6-acceptance
+          path: ${{ runner.temp }}/minnow-r6-${{ github.run_id }}-${{ github.run_attempt }}/
           retention-days: 90

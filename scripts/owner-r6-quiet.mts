@@ -1,8 +1,9 @@
 /** One command, sequential engines; no process termination, retries or contaminated summaries. */
 import { spawn, execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { availableParallelism, loadavg, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { acceptanceFromQuietRun } from "./lib/r6-acceptance.mts";
 import { QuietHost } from "./owner-r6-policy.js";
 
 const args = process.argv.slice(2);
@@ -12,12 +13,8 @@ const out = args[1] === undefined ? mkdtempSync(join(tmpdir(), "minnow-r6-")) : 
 mkdirSync(out, { recursive: true });
 // A fresh output directory prevents stale accepted results surviving a refused invocation.
 const accepted = join(out, "report.json");
-try {
-  readFileSync(accepted);
+if (existsSync(accepted) || existsSync(join(out, "acceptance.json")))
   throw new Error("Choose a fresh output directory");
-} catch (error) {
-  if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-}
 const host = new QuietHost();
 function sample() {
   host.observe(loadavg());
@@ -69,6 +66,10 @@ async function command(
   }
 }
 try {
+  if (!process.env.MINNOW_R6_QUIET_RUNNER_ID?.trim())
+    throw new Error(
+      "R6 NOT ACCEPTED: no qualified quiet runner configured (release-blocking 1.0 item)",
+    );
   if (process.platform === "win32")
     throw new Error("R6 requires an OS load average; Windows does not supply one");
   sample();
@@ -88,6 +89,18 @@ try {
     await new Promise((resolve) => setTimeout(resolve, 5000));
   }
   host.samples.length = 0;
+  // Component absolute targets also belong to this audited host, never the shared observer.
+  const components = await command(
+    "owner-components",
+    [
+      resolve("node_modules/vitest/vitest.mjs"),
+      "run",
+      "packages/core/src/next/testing/owner-point-read.bench.test.ts",
+      "--maxWorkers=2",
+    ],
+    { MINNOW_PERF_LANE: "1", MINNOW_R6_MODE: "accept", MINNOW_R6_QUALIFIED: "1" },
+  );
+  if (components.code !== 0) throw new Error("R6 component acceptance failed; retain raw evidence");
   const records = [];
   let passed = true;
   for (const browser of ["chromium", "firefox", "webkit"]) {
@@ -110,6 +123,8 @@ try {
         ],
         {
           MINNOW_PERF_LANE: "1",
+          MINNOW_R6_MODE: "accept",
+          MINNOW_R6_QUALIFIED: "1",
           MINNOW_OWNER_SCHEDULING_BENCH: "1",
           PLAYWRIGHT_JSON_OUTPUT_FILE: join(out, name + ".json"),
           ...(browser === "webkit" && process.env.MINNOW_R6_WEBKIT_BROWSERS_PATH
@@ -213,16 +228,22 @@ try {
       }),
     };
   });
-  save("report.json", {
+  const report = {
     schemaVersion: 1,
     revision: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
     node: process.version,
     cpus: availableParallelism(),
+    qualifiedRunner: process.env.MINNOW_R6_QUIET_RUNNER_ID,
     status: passed ? "pass" : "targets-missed",
     quantum: "candidate only; decide from quiet latency and fixed-work completion times",
     records,
     summary,
-  });
+  };
+  const acceptance = passed
+    ? acceptanceFromQuietRun(report, host.samples, process.platform)
+    : undefined;
+  save("report.json", report);
+  if (acceptance !== undefined) save("acceptance.json", acceptance);
   console.log(`Quiet-host report: ${accepted}`);
   process.exitCode = passed ? 0 : 1;
 } catch (error) {
