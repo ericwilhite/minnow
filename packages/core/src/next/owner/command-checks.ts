@@ -45,7 +45,7 @@ function shape(catalog: CatalogView, tables: readonly number[]) {
   }
   let capacity = 4096;
   while (capacity < keyBytes) capacity *= 2;
-  return { columns, capacity, metadata: 2048 + 2 * capacity + 256 * columns + 8 * tables.length };
+  return { columns, capacity, metadata: 2176 + 2 * capacity + 256 * columns + 24 * tables.length };
 }
 export function commandCheckMinimumBytes(catalog: CatalogView, tables: readonly number[]): number {
   const sizes = shape(catalog, tables);
@@ -77,6 +77,8 @@ export class NativeCommandChecks {
   #out: Float64Array | null = null;
   #previous: Uint8Array | null = null;
   #one: Uint16Array | null = null;
+  #tableIds: Float64Array | null = null;
+  #transactionFrom: Float64Array | null = null;
   #pending: Promise<unknown> | null = null;
   #closing: Promise<void> | null = null;
   #closed = false;
@@ -97,6 +99,31 @@ export class NativeCommandChecks {
       this.#out = new Float64Array(2);
       this.#previous = new Uint8Array(sizes.capacity);
       this.#one = new Uint16Array(1);
+      this.#tableIds = Float64Array.from(scope.tables).sort();
+      this.#transactionFrom = new Float64Array(scope.tables.length);
+      const view = scope.statement.view;
+      for (const [i, id] of this.#tableIds.entries()) {
+        const table = view.internalTable(id),
+          groups = table.tableView.groups;
+        let last = groups.count === 0 ? -1 : groups.get(groups.count - 1).lastRowId;
+        for (const memory of table.tableView.memtables) {
+          const count = memory.visibleRows(view.bound);
+          if (count) last = Math.max(last, memory.firstRowId + count - 1);
+        }
+        this.#transactionFrom[i] = last + 1;
+      }
+      // Native physical IDs only advance. Existing transaction row undo identifies the
+      // first version written before this statement; later versions start above its tail.
+      // One catalog-sized pair of arrays replaces any per-row transaction-origin set.
+      for (const entry of scope.statement.tx.undo)
+        if (entry.kind === "rows") {
+          const at = this.#tableIndex(entry.tableId);
+          if (at >= 0)
+            this.#transactionFrom[at] = Math.min(
+              this.#transactionFrom[at] ?? Infinity,
+              entry.memtable.firstRowId + entry.before,
+            );
+        }
     } catch (error) {
       this.#keys?.close();
       this.#keys = null;
@@ -481,6 +508,39 @@ export class NativeCommandChecks {
       return false;
     });
   }
+  #tableIndex(tableId: number): number {
+    const ids = this.#tableIds ?? invalid();
+    let lo = 0,
+      hi = ids.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if ((ids[mid] ?? Infinity) < tableId) lo = mid + 1;
+      else hi = mid;
+    }
+    return ids[lo] === tableId ? lo : -1;
+  }
+  /** PostgreSQL may omit unchanged FK checks for committed OLD tuples. A tuple version
+   * written in this transaction still requires its non-null reference check, even when
+   * the key bytes match (including a previous statement's insert/update). */
+  referenceMustCheck(row: AcceptedCommandRow, fkId: number, signal: AbortSignal): Promise<boolean> {
+    this.#check(signal);
+    if (row.event === "delete") return Promise.resolve(false);
+    const table = tableOf(this.scope.statement.catalog, row.tableId),
+      fk = table.foreignKeys.find((fk) => fk.id === fkId) ?? invalid();
+    if (!fk.enforced) return Promise.resolve(false);
+    if (row.event === "update") {
+      const index = this.#tableIndex(row.tableId),
+        threshold = this.#transactionFrom?.[index];
+      if (index < 0 || threshold === undefined || row.oldRowId === null) invalid();
+      if (row.oldRowId >= threshold)
+        return this.#work(signal, async (stop) => {
+          const parent = tableOf(this.scope.statement.catalog, fk.parentTableId),
+            index = parent.indexes.find((index) => index.id === fk.parentIndexId) ?? invalid();
+          return (await this.#key(row, index, fk.columnIds, stop, "new")) !== null;
+        });
+    }
+    return this.referenceNeedsCheck(row, fkId, signal);
+  }
   /** NO ACTION checks the final prefix: an equivalent replacement parent can satisfy
    * the OLD key. RESTRICT must not use this exemption. No image survives range funding. */
   oldParentKeyExists(
@@ -555,6 +615,7 @@ export class NativeCommandChecks {
       this.#out = null;
       this.#previous = null;
       this.#one = null;
+      this.#tableIds = this.#transactionFrom = null;
       this.#columns.length = this.#vectors.length = this.#parts.length = 0;
       const account = this.#account ?? invalid();
       account.free(this.#metadata);

@@ -292,7 +292,7 @@ export class NativeRows {
     };
     if (row.event !== "delete")
       for (const fk of table.foreignKeys) {
-        if (fk.enforced && (await scope.checks.referenceNeedsCheck(row, fk.id, signal)))
+        if (fk.enforced && (await scope.checks.referenceMustCheck(row, fk.id, signal)))
           await add(
             fk.id,
             row.event === "insert" ? "childInsert" : "childUpdate",

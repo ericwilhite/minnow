@@ -1,4 +1,5 @@
 /** Actual native registry/writer/action/controller assembly. No SQL firing is enabled. */
+import type { WriteTransaction } from "../access/write-path.js";
 import { expect } from "vitest";
 import { TriggerBodyRunner } from "../exec/trigger-body.js";
 import { ExecutionError } from "../exec/errors.js";
@@ -37,6 +38,7 @@ export async function referentialFixture(
   published = false,
   failAfter: number | null = null,
   capBytes = 256 * 1024 * 1024,
+  options: { frameCount?: number; prior?: (tx: WriteTransaction) => Promise<void> } = {},
 ) {
   const core = new StorageCore(256);
   Object.defineProperty(core.harness, "governor", { value: new Governor(capBytes) });
@@ -48,7 +50,7 @@ export async function referentialFixture(
       `CREATE TRIGGER "Z_after" AFTER UPDATE ON p BEGIN INSERT INTO error_sink VALUES(CASE WHEN OLD.id=${String(failAfter)} THEN 1/0 ELSE NULL END); END`,
     );
   }
-  const frames = failAfter === null ? 1 : 2;
+  const frames = options.frameCount ?? (failAfter === null ? 1 : 2);
   const path = core.harness.path,
     governor = core.harness.governor;
   if (published) {
@@ -83,6 +85,7 @@ export async function referentialFixture(
       signal.throwIfAborted();
     }
   }
+  await options.prior?.(tx);
   const catalog = tx.catalog,
     tables = catalog.tables.map((table) => {
       const expr = core.lowerer.lowerTableRules(table, catalog),

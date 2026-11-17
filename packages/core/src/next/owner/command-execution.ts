@@ -30,7 +30,10 @@ export interface NativeCommandExecutionScope {
   readonly catalog: CatalogView;
   readonly commands: RegistryCommands;
   readonly images: Pick<RegistryImages, "readRowImages" | "readRowBindings" | "close">;
-  readonly checks: Pick<NativeCommandChecks, "verifyUnique" | "verifyReference" | "close">;
+  readonly checks: Pick<
+    NativeCommandChecks,
+    "verifyUnique" | "verifyReference" | "referenceMustCheck" | "close"
+  >;
   /** Capture original follow identities after uniqueness, before named AFTER work. New
    * accepted rows on an existing token need a fresh checkpoint; completed ranges never re-probe. */
   readonly following: Pick<RegistryFollowing, "prepare" | "close">;
@@ -211,7 +214,8 @@ export class NativeCommandExecution implements NativeCommandBoundary {
           const table = this.scope.catalog.table(row.tableId) ?? invalid();
           for (const fk of table.foreignKeys) {
             this.#check(s);
-            if (fk.enforced) await checks.verifyReference(row, fk.id, s);
+            if (fk.enforced && (await checks.referenceMustCheck(row, fk.id, s)))
+              await checks.verifyReference(row, fk.id, s);
           }
         },
         stop,

@@ -9800,3 +9800,14 @@ export const NATIVE_ROW_BORROW_REACH = [
   "generated values",
   "zero ownership",
 ] as const;
+
+export const NATIVE_REFERENCE_CHECKPOINT_REACH = [
+  "rekey",
+  "delete",
+  "current transaction insert",
+  "current transaction update",
+  "committed version",
+  "published",
+  "resident",
+  "zero ownership",
+] as const;

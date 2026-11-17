@@ -130,6 +130,7 @@ async function fixture(frames = 3) {
       },
     },
     checks: {
+      referenceMustCheck: async () => true,
       verifyUnique: async () => {
         unique++;
         await checking?.();
