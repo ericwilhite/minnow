@@ -4533,6 +4533,14 @@ sweep and ready. Startup uses actual charged allocations, without the harness's 
 installs the same composition into the existing owner host/election/lifecycle runtime. Worker
 and store barrels remain held for cutover. No test engine or old BlockStore cast is used.
 
+`owner/client-connect.ts` assembles the thin client from one `ProtocolClient`, the existing
+owner connector and the canonical database-client facade. Settings are captured before
+asynchronous election. Closing waits for this client's started owners to stop, including
+startup that reenters close before returning its handle. It does not stop another context's
+owner. Backend, worker, broker and platform selection remain explicit internal inputs;
+the client bundle includes neither native storage nor execution. Generated MessageChannel
+tests use real native owner boot, continued writes after restart and blocked startup cleanup.
+
 The cap is explicit until B4b supplies the reviewed public default/minimum. The base native
 write-owner minimum does not fit a 16 MiB cap; boot surfaces its typed 53200 refusal and releases
 the fence. Generated ordinary open/reopen tests cover memory and native IndexedDB at fitting

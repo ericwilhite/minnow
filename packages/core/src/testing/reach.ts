@@ -9642,3 +9642,13 @@ export const PUBLIC_CURSOR_CONCURRENCY_REACH = [
   "two calls",
   "many calls",
 ] as const;
+
+export const PUBLIC_CONNECT_REACH = [
+  "queued SQL and captured settings",
+  "native owner restart and recovery",
+  "native owner retained",
+  "exact continued native writes",
+  "all started owners and locks drained",
+] as const;
+
+export const PUBLIC_CONNECT_CLOSE_REACH = ["blocked", "reentrant"] as const;
