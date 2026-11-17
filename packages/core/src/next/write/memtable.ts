@@ -289,7 +289,7 @@ export class Memtable {
   #holdBorrowed(chunk: number, stored: ColumnChunk[]): void {
     const held = this.#lent.get(chunk);
     if (held === undefined) this.#lent.set(chunk, stored);
-    else held.push(...stored);
+    else for (const column of stored) held.push(column);
   }
 
   /** Bytes of released chunks still borrowed by readers. */

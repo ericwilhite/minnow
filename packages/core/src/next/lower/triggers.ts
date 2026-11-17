@@ -82,7 +82,7 @@ export function createTriggerChange(
       if (parsed.defaultValues !== true && !parsed.columns.length)
         implicitArity = target.columns.length;
       const targets = names.map(use);
-      insertColumnIds.push(...targets.map((c) => c.id));
+      for (const target of targets) insertColumnIds.push(target.id);
       if (new Set(insertColumnIds).size !== insertColumnIds.length)
         throw new PlanningError("column specified more than once", "42701");
       for (const row of parsed.rows) {

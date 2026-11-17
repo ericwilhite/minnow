@@ -162,7 +162,7 @@ export function trackReleases(session: StoreSession): Array<{ offset: number; le
   const ranges: Array<{ offset: number; length: number }> = [],
     release = session.releaseData.bind(session);
   session.releaseData = async (input) => {
-    ranges.push(...input.map((r) => ({ ...r })));
+    for (const range of input.map((r) => ({ ...r }))) ranges.push(range);
     await release(input);
   };
   return ranges;

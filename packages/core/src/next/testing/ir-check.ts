@@ -471,7 +471,7 @@ function checkRel(rel: Rel, catalog: CatalogView): void {
         // assignment slots and must already be available to WHERE/SET.
         const start = reads.length;
         reads.length += rel.onConflict.assignments.length;
-        reads.push(...input.slice(row.length));
+        for (const column of input.slice(row.length)) reads.push(column);
         if (rel.onConflict.where !== null) checkExpr(rel.onConflict.where, reads, where);
         for (const [j, assignment] of rel.onConflict.assignments.entries()) {
           checkExpr(assignment.expr, reads, where);

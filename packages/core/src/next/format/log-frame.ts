@@ -362,7 +362,10 @@ export function scanLog(
     const accepted = state.accept(body.subarray(state.offset, state.offset + length));
     if (accepted === null) break;
     open.push(accepted.frame);
-    if (accepted.completes) frames.push(...open.splice(0));
+    if (accepted.completes) {
+      for (const frame of open) frames.push(frame);
+      open.length = 0;
+    }
   }
   return { ...state.finish(), frames };
 }

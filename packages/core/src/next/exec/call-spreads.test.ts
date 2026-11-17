@@ -12,6 +12,7 @@ import { expressionInputBytes } from "./input-size-plan.js";
 import { prepareParameters } from "./parameters.js";
 import { jsonGroupWorkspaceMultiplier } from "./agg/json-group-keys.js";
 import { aggregateLaneBytes, type AggregateProgressLayout } from "./agg/parameter-copies.js";
+import { FUNCTIONS } from "../ir/functions.js";
 
 const text: PhysicalType = { kind: "text" };
 const empty: Rel = { op: "values", id: 1, output: [], rows: [] };
@@ -109,18 +110,41 @@ for (const seed of seedsFor("next-exec-call-lists", [47409, 47410]))
     reach.assertReached();
   });
 
-it("keeps only proven bounded call spreads in executor production sources", () => {
-  // FTS terms are capped at 32 UTF-16 units. The adapters forward fixed method tuples.
+const next = join(import.meta.dirname, "..");
+const layers = [
+  ".",
+  ...readdirSync(next, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name),
+];
+it.each(layers)("keeps only proven bounded call spreads in rebuild layer %s", (layer) => {
+  // The finite overload registry cannot grow this exception without a new bound or a loop.
+  for (const overloads of Object.values(FUNCTIONS))
+    expect(overloads.length).toBeLessThanOrEqual(32);
+  // FTS strings <=128 units, metadata read scopes <=6 frames, one-page append returns
+  // one blob, chaos fixtures seal <=12/8 pages, crash fixture inserts exactly8 IDs.
+  // The remaining adapters forward fixed method tuples, not caller-sized lists.
   const bounded = new Map([
-    ["kernels/fts.ts", new Set(["String.fromCharCode"])],
-    ["late-fetch.ts", new Set(["this.source.chunk", "this.source.readHint"])],
+    ["exec/kernels/fts.ts", new Set(["String.fromCharCode"])],
+    ["exec/late-fetch.ts", new Set(["this.source.chunk", "this.source.readHint"])],
+    ["format/fts-append.ts", new Set(["String.fromCharCode"])],
+    ["format/fts-codec.ts", new Set(["String.fromCharCode"])],
+    ["lower/coerce.ts", new Set(["Math.max"])],
+    ["storage/metadata-journal.ts", new Set(["this.#frames.push"])],
+    ["storage/extents.examples.ts", new Set(["pending.push"])],
+    ["spill/chaos-workload.ts", new Set(["written.push"])],
+    ["write/crash-sweep.test-support.ts", new Set(["kept.push"])],
+    ["write/engine.ts", new Set(["write"])],
+    ["owner/fts-transaction.test-support.ts", new Set(["open"])],
+    ["write/directory-publication-compat.test-support.ts", new Set(["begin"])],
+    ["testing/json-group-generated-lifetime.test.fixture.ts", new Set(["decode"])],
   ]);
   const unbounded: string[] = [];
-  function walk(directory: string) {
+  function walk(directory: string, descend = true) {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
       if (entry.isDirectory()) {
-        walk(path);
+        if (descend) walk(path);
         continue;
       }
       if (!path.endsWith(".ts") || /\.(test|bench)\.ts$/.test(path)) continue;
@@ -135,7 +159,7 @@ it("keeps only proven bounded call spreads in executor production sources", () =
           (ts.isCallExpression(node) || ts.isNewExpression(node)) &&
           node.arguments?.some(ts.isSpreadElement)
         ) {
-          const name = relative(import.meta.dirname, path).replaceAll("\\", "/");
+          const name = relative(next, path).replaceAll("\\", "/");
           if (!bounded.get(name)?.has(node.expression.getText(source)))
             unbounded.push(
               `${name}:${String(source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1)}`,
@@ -146,6 +170,7 @@ it("keeps only proven bounded call spreads in executor production sources", () =
       visit(source);
     }
   }
-  walk(import.meta.dirname);
+  // Root files are checked once; separate layer bodies keep coverage work bounded.
+  walk(join(next, layer), layer !== ".");
   expect(unbounded).toEqual([]);
 });

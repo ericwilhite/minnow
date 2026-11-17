@@ -1041,10 +1041,10 @@ export class ProtocolClient {
         const last = message.frames.at(-1);
         if (pending.cursor !== null) {
           if (!(pending.cursor instanceof ExportQueue))
-            pending.cursor.frames.push(...message.frames);
+            for (const frame of message.frames) pending.cursor.frames.push(frame);
           if (message.frames.length > 0) pending.handedOut = true;
         } else {
-          pending.frames.push(...message.frames);
+          for (const frame of message.frames) pending.frames.push(frame);
           // Buffered: released on receipt, riding on the next request when one follows soon.
           if (last !== undefined) {
             let bytes = 0;

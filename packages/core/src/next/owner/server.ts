@@ -1180,7 +1180,7 @@ class Connection {
         transfer,
         "result" in request && request.result.recycle === true,
       );
-      stream.posted.push(...pending);
+      for (const frame of pending) stream.posted.push(frame);
       stream.lastActivityMs = this.#server.now();
       pending = [];
       this.#sweepIfNeeded();
@@ -1289,7 +1289,7 @@ class Connection {
     }
     const transfer: ArrayBuffer[] = [];
     for (const frame of frames) for (const buffer of frame.transfer) transfer.push(buffer);
-    stream.posted.push(...frames);
+    for (const frame of frames) stream.posted.push(frame);
     if (stream.posted.length === 0) this.#streams.delete(request.seq);
     // A finished stream with frames outstanding stays watched (live) or swept (not live).
     this.#sweepIfNeeded();

@@ -184,7 +184,8 @@ export class SimDisk {
 
   flushFile(state: FileState): void {
     this.step(state, null);
-    if (this.#options.flush === "lying") state.queued.push(...state.pending);
+    if (this.#options.flush === "lying")
+      for (const operation of state.pending) state.queued.push(operation);
     else state.durable = state.current;
     state.pending = [];
   }
