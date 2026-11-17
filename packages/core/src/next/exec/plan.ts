@@ -1,3 +1,4 @@
+import { NativeTargetGuard } from "./native-target-guard.js";
 import { statementRuleReach } from "./statement-reach.js";
 import { cursorMinimum, runIndexAccess, indexExpressions, indexMetadata } from "./index-access.js";
 import {
@@ -628,6 +629,15 @@ export interface CompileOptions {
   readonly windowScalarArguments?: boolean;
 }
 export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): Program {
+  return compileRecipe(plan, options, false);
+}
+/** Private native body/root producer: retain the complete MODIFY descriptor for source
+ * admission, but construct no writer, rules, RETURNING or statement-end continuation. */
+export function compileModificationInput(plan: PhysicalPlan): Program {
+  if (plan.root.op !== "modify") throw new TypeError("Expected complete modification input");
+  return compileRecipe(plan, {}, true);
+}
+function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: boolean): Program {
   if (options.aggregateInputPacking !== false)
     plan = { ...plan, root: packAggregateInputs(plan.root) };
   const windowBounds =
@@ -893,6 +903,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         if (!["insert", "update", "delete", "upsert"].includes(rel.kind))
           throw new UnsupportedPlanError("modify kind or RETURNING", { construct: "modify" });
         const child = prepare(rel.input);
+        if (inputOnly && rel === plan.root) return child;
         if (
           rel.returning !== null ||
           rel.kind === "upsert" ||
@@ -1455,8 +1466,34 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
       case "filter":
       case "project":
       case "limit": {
-        const child = prepare(rel.input),
+        const originalChild = prepare(rel.input),
           input = types(rel.input);
+        const targetColumn =
+          inputOnly &&
+          rel.op === "project" &&
+          plan.root.op === "modify" &&
+          plan.root.kind === "update" &&
+          plan.root.onRepeat === "error" &&
+          plan.root.input.id === rel.id &&
+          !plan.root.uniqueTargets
+            ? rel.exprs[0]
+            : null;
+        if (targetColumn && targetColumn.op !== "column")
+          throw new UnsupportedPlanError("native body target locator projection");
+        const child: Recipe = (runtime, downstream, stops, rowsNeeded) => {
+          const target = runtime.nativeInputTargets;
+          if (!targetColumn || !target)
+            return originalChild(runtime, downstream, stops, rowsNeeded);
+          const guard = new NativeTargetGuard(
+            target,
+            targetColumn.index,
+            downstream,
+            runtime.signal,
+          );
+          runtime.onAbort((reason) => guard.abort(reason));
+          runtime.dispose(() => guard.close());
+          return originalChild(runtime, guard, stops, rowsNeeded);
+        };
         const exprs =
           rel.op === "project"
             ? jsonDescendants.size
@@ -2921,7 +2958,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
   const fallback =
     lateSortIds.size === 0 && domainPlans === 0
       ? null
-      : compilePlan(plan, { ...options, lateSort: false, domainCountSum: false });
+      : compileRecipe(plan, { ...options, lateSort: false, domainCountSum: false }, inputOnly);
   const resultLayout = outputCopyLayout(plan.root);
   const resultCopies = hasInputSizedJson ? 1 : (resultLayout?.variableCopies ?? 1);
   const genericProgram: Program = (runtime, sink) => {
@@ -3678,7 +3715,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         };
         phases.set(runtime, state);
         const guarded: Operator = {
-          reclassifiesTransfers: sink.reclassifiesTransfers,
+          reclassifiesTransfers: sink.reclassifiesTransfers === true,
           push: (batch, transfer) => sink.push(batch, transfer),
           ready: () => sink.ready(),
           finish: () => sink.finish(),

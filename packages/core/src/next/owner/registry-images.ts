@@ -1,6 +1,6 @@
 /** Root-owned immutable OLD/NEW images. Directory records and fragmented scalar payloads
  * outlive queue packets; only one projected, charged image lease may be live at a time. */
-import type { CatalogView, TableDef } from "../access/catalog.js";
+import type { ColumnDef } from "../access/catalog.js";
 import type { MaybePromise } from "../access/key-index.js";
 import {
   ROW_IMAGE_UNREAD,
@@ -28,6 +28,10 @@ export const REGISTRY_IMAGE_BYTES = 2048;
 const IMAGE = 1,
   SCALAR = 2;
 const IMAGE_SIDES = ["old", "new"] as const;
+export interface ImageCaptureContext {
+  readonly charge: ByteCharge;
+  prepare(bytes: number, signal: AbortSignal): MaybePromise<void>;
+}
 export interface ImageSource {
   readonly batch: Batch;
   readonly row: number;
@@ -46,9 +50,15 @@ export interface NativeImageShape {
   readonly hasOld: boolean;
   readonly hasNew: boolean;
 }
+/** Scratch input schemas use the same typed scalar format without entering the catalog. */
+export interface RegistryImageTable {
+  readonly id: number;
+  readonly schemaVersion: number;
+  readonly columns: ReadonlyArray<Pick<ColumnDef, "id" | "type">>;
+}
 export interface RegistryImageScope {
   readonly rootId: number;
-  readonly catalog: CatalogView;
+  readonly catalog: { table(id: number): RegistryImageTable | undefined };
   readonly directory: RegistryDirectory;
   readonly fragments: RegistryFragments;
   readonly charge: ByteCharge;
@@ -133,6 +143,7 @@ export class RegistryImages {
     tableId: number,
     old: ImageSource | null,
     next: ImageSource | null,
+    capture?: ImageCaptureContext,
   ): Promise<RowImageRef> {
     return this.#work(async () => {
       const table = this.scope.catalog.table(tableId),
@@ -161,7 +172,7 @@ export class RegistryImages {
           }
         }
       if (captureBytes > 0) {
-        await this.scope.prepare(captureBytes, this.#signal ?? state());
+        await (capture ?? this.scope).prepare(captureBytes, this.#signal ?? state());
         this.#check();
       }
       const heads = [0, 0];
@@ -196,7 +207,7 @@ export class RegistryImages {
             vector,
             source.row,
             this.scope.fragments,
-            this.scope.charge,
+            capture?.charge ?? this.scope.charge,
           );
           this.#check();
           await this.scope.directory.put(SCALAR, id, scalar);
@@ -318,6 +329,69 @@ export class RegistryImages {
       return { spoolId: this.scope.rootId, row: id };
     });
   }
+  /** Project complete immutable OLD/NEW rows from typed registry input columns.
+   * Only scalar descriptors are copied; large payload fragments remain root-owned.
+   * Synthetic input schemas can never become accepted images without this real-table projection. */
+  compose(
+    tableId: number,
+    old: readonly RegistryImageLink[] | null,
+    next: readonly RegistryImageLink[] | null,
+    signal: AbortSignal,
+  ): Promise<RowImageRef> {
+    this.#check(signal);
+    return this.#work(async () => {
+      const table = this.scope.catalog.table(tableId);
+      if (!table || (!old && !next)) state();
+      const heads = [0, 0],
+        scalar = this.#scalar ?? state();
+      for (const [side, links] of [old, next].entries()) {
+        if (!links) continue;
+        if (links.length !== table.columns.length) state();
+        let previous = 0;
+        for (const [position, column] of table.columns.entries()) {
+          this.#check(signal);
+          const link = links[position];
+          if (!link) state();
+          this.#origin(link.image);
+          if (!IMAGE_SIDES.includes(link.side)) state();
+          const source = await this.#info(link.image, signal),
+            sourceColumn = source.table.columns.find((c) => c.id === link.columnId);
+          if (!sourceColumn || !samePhysicalType(sourceColumn.type, column.type)) state();
+          await this.#copyLink(link, signal);
+          this.#check(signal);
+          const id = (this.#nextScalar = nextId(this.#nextScalar)),
+            view = viewOf(scalar);
+          view.setFloat64(0, 0, true);
+          view.setFloat64(8, column.id, true);
+          await this.scope.directory.put(SCALAR, id, scalar);
+          this.#check(signal);
+          if (previous) {
+            await this.#get(SCALAR, previous, scalar);
+            viewOf(scalar).setFloat64(0, id, true);
+            await this.scope.directory.put(SCALAR, previous, scalar);
+            this.#check(signal);
+          } else heads[side] = id;
+          previous = id;
+          await this.scope.checkpoint();
+          this.#check(signal);
+        }
+      }
+      const id = (this.#nextImage = nextId(this.#nextImage)),
+        header = this.#header ?? state(),
+        view = viewOf(header);
+      header.fill(0);
+      view.setFloat64(0, heads[0] ?? 0, true);
+      view.setFloat64(8, heads[1] ?? 0, true);
+      view.setFloat64(16, table.id, true);
+      view.setFloat64(24, table.schemaVersion, true);
+      view.setUint8(32, old ? 1 : 0);
+      view.setUint8(33, next ? 1 : 0);
+      view.setUint32(36, table.columns.length, true);
+      await this.scope.directory.put(IMAGE, id, header);
+      this.#check(signal);
+      return { spoolId: this.scope.rootId, row: id };
+    });
+  }
   /** Copy a selected source descriptor through the prepaid buffers, validating the
    * complete source chain. No scalar payload is decoded/copied or leased. */
   async #copyLink(link: RegistryImageLink, signal: AbortSignal): Promise<void> {
@@ -341,12 +415,12 @@ export class RegistryImages {
     if (!found || cursor !== 0) corrupt();
     scalar.set(header);
   }
-  #validateProjection(table: TableDef, projection: RowBindingProjection): void {
+  #validateProjection(table: RegistryImageTable, projection: RowBindingProjection): void {
     for (const side of [projection.old, projection.new])
       for (const id of side) if (!table.columns.some((column) => column.id === id)) state();
   }
   async #walk(
-    table: TableDef,
+    table: RegistryImageTable,
     head: number,
     selected: readonly number[] | null,
     visit: (position: number, scalar: Uint8Array) => Promise<void>,

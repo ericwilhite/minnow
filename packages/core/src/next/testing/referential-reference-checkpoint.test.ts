@@ -40,7 +40,7 @@ for (const seed of seedsFor("next-native-reference-checkpoint", [0xb669, 0xb66a]
                 "INSERT INTO p VALUES(1)",
                 ...(priorKind !== 1 ? [`INSERT INTO c VALUES(1,1,${String(n)})`] : []),
               ],
-              f = await referentialFixture(setup, published, null, 256 << 20, {
+              f = await referentialFixture(setup, published, null, 256 << 20, null, {
                 frameCount: 2,
                 ...(fresh
                   ? {

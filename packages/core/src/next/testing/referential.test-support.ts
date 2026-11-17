@@ -1,5 +1,9 @@
 /** Actual native registry/writer/action/controller assembly. No SQL firing is enabled. */
 import type { WriteTransaction } from "../access/write-path.js";
+import { NativeBodyHost } from "../owner/body-host.js";
+import { NativeBodyPrograms, nativeBodyProgramMinimumBytes } from "../owner/body-programs.js";
+import type { BoundParameters } from "../exec/executor.js";
+import type { NativeRowHooks } from "../access/statement-command.js";
 import { expect } from "vitest";
 import { TriggerBodyRunner } from "../exec/trigger-body.js";
 import { ExecutionError } from "../exec/errors.js";
@@ -38,6 +42,7 @@ export async function referentialFixture(
   published = false,
   failAfter: number | null = null,
   capBytes = 256 * 1024 * 1024,
+  nativeRootSql: string | null = null,
   options: { frameCount?: number; prior?: (tx: WriteTransaction) => Promise<void> } = {},
 ) {
   const core = new StorageCore(256);
@@ -50,7 +55,7 @@ export async function referentialFixture(
       `CREATE TRIGGER "Z_after" AFTER UPDATE ON p BEGIN INSERT INTO error_sink VALUES(CASE WHEN OLD.id=${String(failAfter)} THEN 1/0 ELSE NULL END); END`,
     );
   }
-  const frames = options.frameCount ?? (failAfter === null ? 1 : 2);
+  const frames = options.frameCount ?? (nativeRootSql === null ? (failAfter === null ? 1 : 2) : 3);
   const path = core.harness.path,
     governor = core.harness.governor;
   if (published) {
@@ -101,6 +106,46 @@ export async function referentialFixture(
       },
     });
   if (!(statement instanceof StatementImpl)) throw new Error("missing native statement");
+  const preparedTriggers = catalog.triggers.map((definition) => {
+    const owner = catalog.table(definition.tableId);
+    if (!owner) throw new Error("Missing fixture trigger owner");
+    return {
+      definition,
+      bodies: definition.statements.map((body) => {
+        const lowered = core.lowerer.lower(body.sql, {
+          ...core.context(),
+          parameterTypes: body.bindings.map((binding) => binding.type),
+        });
+        if (lowered.kind !== "modify") throw new Error("Missing fixture body modify");
+        return new TriggerBodyRunner(owner, body, lowered.plan);
+      }),
+    };
+  });
+  preparedTriggers.sort((a, b) => {
+    const left = new TextEncoder().encode(a.definition.name),
+      right = new TextEncoder().encode(b.definition.name);
+    for (let i = 0; i < Math.min(left.length, right.length); i++)
+      if (left[i] !== right[i]) return (left[i] ?? 0) - (right[i] ?? 0);
+    return left.length - right.length || a.definition.id - b.definition.id;
+  });
+  const rootLowered =
+    nativeRootSql === null ? null : core.lowerer.lower(nativeRootSql, core.context());
+  if (rootLowered && rootLowered.kind !== "modify") throw new Error("Missing native root modify");
+  const rootPlan = rootLowered?.kind === "modify" ? rootLowered.plan : null;
+  const nativePlans = rootPlan
+    ? [
+        { body: null, plan: rootPlan },
+        ...preparedTriggers.flatMap((trigger) =>
+          trigger.bodies.map((body) => ({ body: body.body, plan: body.plan })),
+        ),
+      ]
+    : null;
+  if (nativePlans) {
+    releaseIdle(source);
+    await ensure(charge, nativeBodyProgramMinimumBytes(nativePlans), signal);
+  }
+  const bodyPrograms = nativePlans ? new NativeBodyPrograms(catalog, nativePlans, charge) : null;
+  let bodyHost: NativeBodyHost | null = null;
   const checkpoint = async () => {
       signal.throwIfAborted();
     },
@@ -109,7 +154,7 @@ export async function referentialFixture(
     fragments = new RegistryFragments(charge, spill, 1, signal, checkpoint),
     images = new RegistryImages({
       rootId: 39,
-      catalog,
+      catalog: bodyPrograms ?? catalog,
       directory,
       fragments,
       charge,
@@ -231,7 +276,9 @@ export async function referentialFixture(
         }
       },
       closeRoot: async () => {
+        if (bodyHost) stop.abort(new Error("Native root closing"));
         await controller.close();
+        await bodyHost?.close();
         await execution.close();
       },
     }),
@@ -288,24 +335,45 @@ export async function referentialFixture(
     io = new SpillIo(pool, files, pages, { grant: charge, queryId: 2, signal }, () =>
       signal.throwIfAborted(),
     );
+  if (bodyPrograms)
+    bodyHost = new NativeBodyHost({
+      rootId: 39,
+      frames,
+      programs: bodyPrograms,
+      statement,
+      commands,
+      images,
+      directory,
+      prefix,
+      rows,
+      targets,
+      charge,
+      signal,
+      abortRoot: (reason) => stop.abort(reason),
+      checkpoint,
+      releaseIdleStep,
+      query: {
+        governor,
+        source,
+        metadata: charge,
+        signal,
+        prepare: (bytes, stop) => ensure(source, bytes, stop),
+        prepareMetadata: (bytes, stop) => ensure(charge, bytes, stop),
+      },
+      execution: {
+        spill,
+        queryId: 2,
+        statementTime: 0n,
+        reads,
+        sequences: null,
+        sequenceSession: null,
+        returning: "atExecuted",
+      },
+    });
   const controller = await TriggerController.create({
     statement,
     native: execution,
-    programs: catalog.triggers.map((definition) => {
-      const owner = catalog.table(definition.tableId);
-      if (!owner) throw new Error("Missing fixture trigger owner");
-      return {
-        definition,
-        bodies: definition.statements.map((body) => {
-          const lowered = core.lowerer.lower(body.sql, {
-            ...core.context(),
-            parameterTypes: body.bindings.map((binding) => binding.type),
-          });
-          if (lowered.kind !== "modify") throw new Error("Missing fixture body modify");
-          return new TriggerBodyRunner(owner, body, lowered.plan);
-        }),
-      };
-    }),
+    programs: preparedTriggers,
     io,
     spill,
     frameCount: frames,
@@ -313,7 +381,7 @@ export async function referentialFixture(
     body: {
       charge: pool,
       work: { signal },
-      host: {
+      host: bodyHost ?? {
         // Deliberately an error-order adapter, not the compiled body provider. Every
         // native RI write/check above is real; user bodies are still disabled in SQL.
         spoolBodyInput: async (request) => {
@@ -332,6 +400,7 @@ export async function referentialFixture(
   const retire = () =>
     (retiring ??= (async () => {
       await statement.closeNativeCommands();
+      await bodyPrograms?.close();
       actions.close();
       rows.close();
       restrictions.close();
@@ -372,6 +441,36 @@ export async function referentialFixture(
     source,
     actions,
     defaults,
+    bodyHost,
+    rootPlan,
+    async nativeRoot(
+      parameters: BoundParameters = { slots: [] },
+      hooks: NativeRowHooks = controller,
+    ) {
+      if (!bodyHost || !rootPlan) throw new Error("Missing native compiled root");
+      const pin = statement.readOwn();
+      let input: Awaited<ReturnType<typeof bodyHost.spoolRootInput>> | null = null;
+      try {
+        input = await bodyHost.spoolRootInput({
+          command: controller.root,
+          plan: rootPlan,
+          inputView: pin,
+          parameters,
+          signal,
+        });
+        await bodyHost.applyRootInput({
+          command: controller.root,
+          plan: rootPlan,
+          inputView: pin,
+          input,
+          hooks,
+          signal,
+        });
+      } finally {
+        if (input) await bodyHost.releaseBodyInput(controller.root, input);
+        pin.release();
+      }
+    },
     async capture(tableName: string, indexes: readonly number[]) {
       const table = catalog.tableByName(tableName);
       if (!table) throw new Error("missing native table");

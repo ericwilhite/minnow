@@ -4288,8 +4288,8 @@ Accepted native-primary UPDATE/DELETE calls preserve the same FTS mutation notif
 funded row undo and atomic WAL history as legacy writers. Ordinary INSERT keeps insert deltas;
 rollback and savepoints retire this history with the rows.
 Its initial preflight refuses auto-increment and wide/variable indexed domains before writes.
-No SQL path installs it yet. The full native trigger/RI provider and compiled body-input host
-remain separate integration work; the existing SQL refusal guards remain in force.
+No SQL path installs it yet. A compiled body-input host now consumes this continuation;
+production admission and SQL dispatch remain separate integration work.
 
 `owner/command-execution.ts` assembles the native command boundary over those image,
 command and constraint components. Direct RI entries are compared with the canonical
@@ -4298,8 +4298,8 @@ retiring its scalar ID. No token-level cache or outer AFTER drain is used. Compl
 reference checks retire command slots for reuse. Callback slots are fixed by the prepared
 frame bound, cancellation listeners retire after each operation, and close fences callbacks
 and undelivered image leases before returning component credit. The root supplies a real
-child-capture/action executor and closes shared scratch/pins afterward. This assembly still
-has no compiled trigger-body host or generic SQL enablement; refusal guards remain.
+child-capture/action executor and closes shared scratch/pins afterward. The compiled body host
+uses this boundary, while generic SQL enablement remains guarded.
 
 `NativeCommandChecks.captureChildren` seals an OLD parent key's complete child identity
 range through the prepaid native support-index cursor and shared spilled directory. It
@@ -4338,9 +4338,10 @@ generated PGlite action/rollback/key-order and small-cap tests. The later user-A
 adapter in the per-action uniqueness test is synthetic, not a compiled-body proof. Native
 primary preflight still refuses auto-increment and wide/variable indexed domains. Native
 sequence defaults retain their kernel refusal; RI assignments to generated FK columns also
-refuse rather than silently recomputing away the assignment. The compiled COMPLETE-MODIFY body host,
-production root admission/setup and joint trigger ordering verification remain unfinished;
-SQL firing and advanced-RI refusal guards remain in place. No stored format changes.
+refuse rather than silently recomputing away the assignment. The compiled COMPLETE-MODIFY body host
+is exercised with actual native RI and user-body ordering; production root admission/setup and
+SQL enablement remain unfinished. SQL firing and advanced-RI refusal guards remain in place.
+No stored format changes.
 
 The source ordinary minimum includes the fixed native decoder/IO workspace; fixed buffers
 must not be mistaken for a variable value that exceeds the shared reserve. The in-memory
@@ -4514,3 +4515,16 @@ Resident release lists of at most 4,096 entries are an optional optimization. Th
 keeper first attempts their complete reservation; a boolean or typed memory refusal
 selects the same disk inventory used for larger sources. Other errors propagate.
 The disk route admits its smaller working window before copying or consuming entries.
+
+`owner/body-host.ts` seals complete MODIFY inputs through `NativeInputProgram`, using native
+scalar parameters and root-backed query grants. Scratch input schemas stay outside the catalog
+and WAL; scalar descriptor links build complete OLD/NEW rows without copying payload fragments.
+A fixed set of live slots uses command identity, not the monotonically increasing frame ID.
+Each input's catalog/schema version is fixed, and native command mode refuses intervening DDL.
+Statement input and OLD capture finish before writes. Body parameter copies and execution-local
+operators retire before apply; cancellation also fences an accepted asynchronous sink before
+retiring its batch, arenas or credit. Command-local paged target bitmaps preserve first-match
+root joins without a resident target-ID collection. Volatile producers, FTS prefix reads,
+RETURNING and upsert remain outside this private host's supported preparation boundary.
+Body INSERT remains keyless and VALUES-only; body UPDATE/DELETE remain keyed and refuse FROM/USING,
+as enforced by the shared trigger lowering contract. No existing SQL guard is removed.

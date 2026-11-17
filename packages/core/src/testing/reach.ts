@@ -9811,3 +9811,140 @@ export const NATIVE_REFERENCE_CHECKPOINT_REACH = [
   "resident",
   "zero ownership",
 ] as const;
+
+export const NATIVE_PARAMETER_REACH = [
+  "clock",
+  "no clock",
+  "NULL",
+  "int64 exact",
+  "timestamp exact",
+  "numeric exact",
+  "payload",
+  "fixed",
+  "FTS alias",
+  "zero ownership",
+] as const;
+
+export const PREPAID_QUERY_REACH = [
+  "resident metadata",
+  "no recipe",
+  "many parts",
+  "few parts",
+  "loan",
+  "idle transfer",
+  "no hold and wait",
+  "zero ownership",
+] as const;
+
+export const NATIVE_INPUT_REACH = [
+  "resident",
+  "published",
+  "index input",
+  "scan input",
+  "VALUES input",
+  "terminal error prefix",
+  "successful prefix",
+  "parameters retired before apply",
+  "no writes",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BODY_HOST_REACH = [
+  "INSERT",
+  "UPDATE",
+  "DELETE",
+  "published",
+  "resident",
+  "zero rows",
+  "rowset",
+  "later body prefix",
+  "rollback",
+  "success",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BODY_RI_REACH = [
+  "CASCADE",
+  "SET NULL",
+  "SET DEFAULT",
+  "RESTRICT",
+  "NO ACTION",
+  "rekey",
+  "delete",
+  "published",
+  "resident",
+  "rowset",
+  "empty",
+  "rollback",
+  "named continuations",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BODY_ERROR_REACH = [
+  "earlier CHECK",
+  "terminal expression",
+  "published",
+  "resident",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BODY_PRESSURE_REACH = [
+  "published",
+  "resident",
+  "wide unused payload",
+  "small rows",
+  "64MiB competing credit",
+  "bounded files",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BODY_LIFETIME_REACH = [
+  "root close",
+  "caller cancel",
+  "published",
+  "resident",
+  "pending producer fence",
+  "parameter lifetime",
+  "rollback",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BODY_JOIN_REACH = [
+  "DELETE USING",
+  "UPDATE FROM",
+  "published",
+  "resident",
+  "duplicate targets",
+  "distinct source values",
+  "accepted images only",
+  "zero ownership",
+  "duplicate expression error",
+] as const;
+
+export const NATIVE_PARAMETER_VALIDATION_REACH = [
+  "count",
+  "clock slot",
+  "FTS slot",
+  "shape",
+  "type",
+  "int64 bound",
+  "int32 bound",
+] as const;
+
+export const NATIVE_INPUT_RETENTION_REACH = [
+  "empty literal",
+  "small literal",
+  "large literal",
+  "shared aliases",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BODY_REFERENCE_REACH = [
+  "rekey",
+  "delete",
+  "earlier transaction INSERT",
+  "committed child",
+  "published",
+  "resident",
+  "zero ownership",
+] as const;

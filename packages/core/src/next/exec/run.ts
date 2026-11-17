@@ -1,3 +1,5 @@
+import type { NativeInputTargets } from "./native-target-guard.js";
+import type { NativeParameterBinding } from "./native-parameters.js";
 import { ModifySpool, modifySpoolBytes } from "./modify-spool.js";
 import type { Operator } from "./pipeline.js";
 /** One query's admissions, resources and the executed/delivered lifecycle. */
@@ -71,7 +73,12 @@ export type OperatorIdentity = Pick<Rel, "id" | "op"> & {
   /** Private helper grants retain unique labels, but statistics belong to an IR operator. */
   readonly profileAs?: Pick<Rel, "id" | "op">;
 };
-export type Program = ((runtime: QueryRuntime, sink: ResultSink) => MaybePromise<void>) & {
+/** A native input sink shares the producer protocol without client result encoding. */
+export interface ProgramSink extends Operator {
+  suspendBudget(): Promise<void>;
+  resumeBudget(): void;
+}
+export type Program = ((runtime: QueryRuntime, sink: ProgramSink) => MaybePromise<void>) & {
   readonly atomic?: boolean;
 };
 
@@ -84,6 +91,7 @@ const HANDOFF = new Error("Producer retired at aggregation phase handoff");
 
 /** Per-execution only: never retained by an immutable prepared plan. */
 export class QueryRuntime {
+  nativeInputTargets: NativeInputTargets | null = null;
   /** Input is materialized before native writes; only this bounded spool survives producer retirement. */
   modification: {
     spool: ModifySpool;
@@ -669,7 +677,7 @@ export class QueryRuntime {
         loanSlot,
       })),
     ]);
-    if (!needsParameterSizing(this.plan, this.request.parameters))
+    if (this.nativeParameters || !needsParameterSizing(this.plan, this.request.parameters))
       return this.#sizeAndReserve(entries);
     const label = `query#${String(this.request.queryId)}/parameter-sizing`;
     const admitted = admitWorkingSet(this.request.governor, {
@@ -692,13 +700,15 @@ export class QueryRuntime {
   #sizeAndReserve(entries: readonly Reservation[], scratch?: Grant): MaybePromise<void> {
     let binding: MaybePromise<ParameterBinding>;
     try {
-      binding = prepareParameters(
-        this.plan,
-        this.request.parameters,
-        this.signal,
-        this.request.governor.capBytes,
-        scratch,
-      );
+      binding =
+        this.nativeParameters ??
+        prepareParameters(
+          this.plan,
+          this.request.parameters,
+          this.signal,
+          this.request.governor.capBytes,
+          scratch,
+        );
     } catch (error) {
       scratch?.close();
       throw error;
@@ -964,7 +974,10 @@ export class QueryRuntime {
     readonly request: ExecuteRequest,
     readonly view: Snapshot,
     readonly signal: AbortSignal,
+    readonly nativeParameters: NativeParameterBinding | null = null,
   ) {
+    if (nativeParameters && !nativeParameters.matches(plan))
+      throw new TypeError("Native parameter binding belongs to another plan");
     // No owned parameter buffers exist until reserve() admits inputs and operators atomically.
     if (plan.clockSlot !== null && plan.parameters[plan.clockSlot]?.kind !== "timestamp")
       throw new TypeError("invalid statement clock slot");
@@ -979,7 +992,10 @@ export class QueryRuntime {
   } {
     const prior = this.#bounds.get(rel.id);
     if (prior !== undefined) return prior;
-    if (this.request.parameters.length !== this.plan.placeholderCount)
+    if (
+      (this.nativeParameters?.placeholderCount ?? this.request.parameters.length) !==
+      this.plan.placeholderCount
+    )
       throw new ParameterBindError(
         `Expected ${String(this.plan.placeholderCount)} parameters, received ${String(this.request.parameters.length)}`,
         null,
@@ -1010,6 +1026,7 @@ export class QueryRuntime {
 
   /** Reservation pruning needs integer bounds before materializing any vectors. */
   boundParameter(slot: number): number | bigint | null {
+    if (this.nativeParameters) return this.nativeParameters.boundParameter(slot);
     const type = this.plan.parameters[slot];
     const value = this.request.parameters[slot];
     if (value === null) return null;
@@ -1149,7 +1166,7 @@ export class QueryRuntime {
 
   /** Called only after the old graph unwound and parameter copies were checkpointed.
    * Neither this operation nor resource scopes release the owner-held snapshot pin. */
-  async suspendProducer(sink: ResultSink, idleCredit: Grant): Promise<void> {
+  async suspendProducer(sink: ProgramSink, idleCredit: Grant): Promise<void> {
     if (!this.#handoff || this.#scope !== null || this.#atomicResult === null)
       throw new Error("Producer graph must retire before phase admission");
     await sink.suspendBudget();
@@ -1206,6 +1223,7 @@ export class QueryRuntime {
     if (this.#closed) return;
     this.#closed = true;
     this.#bounds.clear();
+    this.nativeInputTargets = null;
     this.params.slots = [];
     if (this.#sourceRecipes.size === 0) return this.#releaseResources();
     const closeSources = () => {
