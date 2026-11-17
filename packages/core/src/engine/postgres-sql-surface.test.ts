@@ -7,7 +7,7 @@
  * `run` executes through both executors and asserts they agree, so no feature can be correct in
  * one and wrong in the other.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
 import { MAX_TRANSACTION_SAVEPOINTS, MinnowDatabase, type DatabaseRow } from "./database.js";
 import { bindPlanParameters, compileQuery, executeQuery, executeRowQuery } from "./query.js";
@@ -670,18 +670,38 @@ describe("statement transactions", () => {
   });
 
   it("rolls back a transaction left open, rather than holding the scope forever", async () => {
-    const database = new MinnowDatabase(new MemoryBlockStore(), { transactionIdleTimeoutMs: 5 });
-    await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
-    await database.execute("BEGIN");
-    await database.execute("INSERT INTO t (id, n) VALUES (1, 10)");
-    // Nothing touches it for longer than the idle bound: the scope ends itself.
-    await new Promise((resolve) => setTimeout(resolve, 40));
-    await expect(database.query("SELECT COUNT(*) AS n FROM t")).rejects.toThrow(/expired/);
-    await database.execute("ROLLBACK");
-    expect((await database.query("SELECT COUNT(*) AS n FROM t")).rows).toEqual([{ n: 0 }]);
-    // And the next BEGIN is allowed, because the abandoned one is no longer open.
-    await database.execute("BEGIN");
-    await database.execute("ROLLBACK");
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    let time = Date.parse("2026-01-01T00:00:00Z");
+    const store = new MemoryBlockStore();
+    const database = new MinnowDatabase(store, {
+      transactionIdleTimeoutMs: 5,
+      now: () => new Date(time),
+      autoCompact: false,
+    });
+    try {
+      await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
+      await database.execute("BEGIN");
+      await database.execute("INSERT INTO t (id, n) VALUES (1, 10)");
+      // Just below the bound it remains usable; that statement resets idle activity.
+      time += 4;
+      await vi.advanceTimersByTimeAsync(4);
+      expect((await database.query("SELECT COUNT(*) AS n FROM t")).rows).toEqual([{ n: 1 }]);
+      // At the idle bound, expiry must roll back before another statement can run.
+      time += 5;
+      await vi.advanceTimersByTimeAsync(5);
+      await expect(database.query("SELECT COUNT(*) AS n FROM t")).rejects.toThrow(/expired/);
+      await database.execute("ROLLBACK");
+      expect((await database.query("SELECT COUNT(*) AS n FROM t")).rows).toEqual([{ n: 0 }]);
+      // And the next BEGIN is allowed, because the abandoned one is no longer open.
+      await database.execute("BEGIN");
+      await database.execute("ROLLBACK");
+    } finally {
+      try {
+        await database.close();
+      } finally {
+        vi.useRealTimers();
+      }
+    }
   });
 
   it("rolls back an open transaction and releases resident state when the database closes", async () => {
@@ -707,24 +727,71 @@ describe("statement transactions", () => {
   });
 
   it("stays open while its statements are slow, however long they take", async () => {
-    /** A store whose reads are slow, so one statement outlives several idle sweeps. */
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    let time = Date.parse("2026-01-01T00:00:00Z");
+    /** Holds a real statement inside its read until the test releases it. */
     class SlowStore extends MemoryBlockStore {
+      beforeRead: (() => Promise<void>) | null = null;
       override async getBlocks(ids: readonly string[]): ReturnType<MemoryBlockStore["getBlocks"]> {
-        await new Promise((resolve) => setTimeout(resolve, 12));
+        const wait = this.beforeRead;
+        this.beforeRead = null;
+        if (wait) await wait();
         return super.getBlocks(ids);
       }
     }
-    const database = new MinnowDatabase(new SlowStore(), { transactionIdleTimeoutMs: 5 });
-    await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
-    await database.execute("INSERT INTO t (id, n) VALUES (1, 1)");
-    await database.execute("BEGIN");
-    // Every statement here runs longer than the whole idle bound. Idle means nothing running,
-    // not time passing, so the scope has to survive all of them.
-    for (let index = 0; index < 5; index += 1) {
-      await database.execute(`UPDATE t SET n = ${String(index)} WHERE id = 1`);
+    const store = new SlowStore();
+    const database = new MinnowDatabase(store, {
+      transactionIdleTimeoutMs: 5,
+      now: () => new Date(time),
+      bufferPoolBytes: 0,
+      autoCompact: false,
+    });
+    let release: () => void = () => undefined;
+    let running: Promise<unknown> | undefined;
+    try {
+      await database.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
+      await database.execute("INSERT INTO t (id, n) VALUES (1, 1)");
+      await database.execute("BEGIN");
+      // Every statement here runs longer than the whole idle bound. Idle means nothing running,
+      // not time passing, so the scope has to survive all of them.
+      for (let index = 0; index < 5; index += 1) {
+        let enter!: () => void;
+        const entered = new Promise<void>((resolve) => {
+          enter = resolve;
+        });
+        const held = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        store.beforeRead = () => {
+          enter();
+          return held;
+        };
+        running = database.execute(`UPDATE t SET n = ${String(index)} WHERE id = 1`);
+        // Also observe a premature failure/completion, so a missing gate never hangs the body.
+        await Promise.race([
+          entered,
+          running.then(() => {
+            throw new Error("Statement missed its read gate");
+          }),
+        ]);
+        time += 100;
+        await vi.advanceTimersByTimeAsync(100); // Twenty production idle sweeps while busy.
+        release();
+        await running;
+        time += 4;
+        await vi.advanceTimersByTimeAsync(4); // A genuine but not-yet-expired idle gap.
+      }
+      await expect(database.execute("COMMIT")).resolves.toMatchObject({ action: "commit" });
+      expect((await database.query("SELECT n FROM t")).rows).toEqual([{ n: 4 }]);
+    } finally {
+      release();
+      try {
+        await running?.catch(() => undefined);
+        await database.close();
+      } finally {
+        vi.useRealTimers();
+      }
     }
-    await expect(database.execute("COMMIT")).resolves.toMatchObject({ action: "commit" });
-    expect((await database.query("SELECT n FROM t")).rows).toEqual([{ n: 4 }]);
   });
 
   it("refuses what it cannot take back, and the spellings it has no meaning for", async () => {
