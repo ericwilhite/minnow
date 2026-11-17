@@ -3,7 +3,7 @@ import { expect } from "vitest";
 import { TriggerBodyRunner } from "../exec/trigger-body.js";
 import { ExecutionError } from "../exec/errors.js";
 import { valueAt } from "../exec/kernels/test-support.js";
-import { StorageCore } from "../testing/storage-core.js";
+import { StorageCore } from "./storage-core.js";
 import { StatementImpl } from "../write/transaction.js";
 import { releaseIdle } from "../write/budget.js";
 
@@ -17,20 +17,20 @@ import { ChunkReader } from "../page/reader.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { Governor, type Grant } from "../memory/governor.js";
 import type { Batch } from "../vector/vector.js";
-import { RegistryDirectory } from "./registry-directory.js";
-import { RegistryFragments } from "./registry-fragments.js";
-import { RegistryImages } from "./registry-images.js";
-import { RegistryCommands } from "./registry-commands.js";
-import { RegistryTargets } from "./registry-targets.js";
-import { RegistryFollowing } from "./registry-following.js";
-import { NativePrefixImages, nativePrefixSourceBytes } from "./prefix-images.js";
-import { NativeChildInputs } from "./child-inputs.js";
-import { NativeCommandChecks } from "./command-checks.js";
-import { NativeRows } from "./native-rows.js";
-import { NativeDefaults } from "./native-defaults.js";
-import { NativeReferentialChecks } from "./referential-checks.js";
-import { NativeReferentialMutations } from "./referential-mutations.js";
-import { NativeCommandExecution } from "./command-execution.js";
+import { RegistryDirectory } from "../owner/registry-directory.js";
+import { RegistryFragments } from "../owner/registry-fragments.js";
+import { RegistryImages } from "../owner/registry-images.js";
+import { RegistryCommands } from "../owner/registry-commands.js";
+import { RegistryTargets } from "../owner/registry-targets.js";
+import { RegistryFollowing } from "../owner/registry-following.js";
+import { NativePrefixImages, nativePrefixSourceBytes } from "../owner/prefix-images.js";
+import { NativeChildInputs } from "../owner/child-inputs.js";
+import { NativeCommandChecks } from "../owner/command-checks.js";
+import { NativeRows } from "../owner/native-rows.js";
+import { NativeDefaults } from "../owner/native-defaults.js";
+import { NativeReferentialChecks } from "../owner/referential-checks.js";
+import { NativeReferentialMutations } from "../owner/referential-mutations.js";
+import { NativeCommandExecution } from "../owner/command-execution.js";
 
 export async function referentialFixture(
   setup: readonly string[],
