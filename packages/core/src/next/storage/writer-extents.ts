@@ -1,6 +1,6 @@
 import { writerViewSource } from "./writer-view.js";
 /** Bounded immutable delta inputs; native histories spill instead of materializing arrays. */
-import type { TaskWork } from "../task.js";
+import { pauseIfDue, type TaskWork } from "../task.js";
 import { ReadDeniedError, type ByteBudget, type ExtentRef, type ExtentWriter } from "./extents.js";
 import type { RetirementInput, RetirementInventory } from "./retirement-contract.js";
 import { WriterInventoryRequiredError } from "./writer-inventory.js";
@@ -16,6 +16,14 @@ export async function captureWriterExtents(
   since?: number,
 ): Promise<CapturedWriterExtents> {
   work.signal?.throwIfAborted();
+  const source = since === undefined ? undefined : writerViewSource(writer.extents);
+  if (since !== undefined && source?.captureSmall !== undefined) {
+    const pending = pauseIfDue(work);
+    if (pending !== undefined) await pending;
+    const input = source.captureSmall(since, budget, work);
+    if (input !== undefined)
+      return { added: [], addedInventory: input, release: () => input.release() };
+  }
   let resident: readonly ExtentRef[] | undefined;
   if (since === undefined || writer.snapshotExtents === undefined) {
     try {

@@ -2,11 +2,14 @@
  * Length is a scalar. Synchronous element materialization is available only in the resident
  * window; no proxy trap performs I/O or allocates a history-sized vector.
  */
-import type { ExtentRef, ExtentWriter } from "./extents.js";
+import type { TaskWork } from "../task.js";
+import type { RetirementInventory } from "./retirement-contract.js";
+import type { ByteBudget, ExtentRef, ExtentWriter } from "./extents.js";
 const NATIVE_VIEW = Symbol("native sealed extent view");
 export interface WriterViewSource {
   readonly writer: ExtentWriter;
   resident(): readonly ExtentRef[];
+  captureSmall?(since: number, budget: ByteBudget, work: TaskWork): RetirementInventory | undefined;
 }
 export function writerViewSource(value: readonly ExtentRef[]): WriterViewSource | undefined {
   return (value as readonly ExtentRef[] & { readonly [NATIVE_VIEW]?: WriterViewSource })[
@@ -17,8 +20,13 @@ export function createWriterExtentView(
   writer: ExtentWriter,
   resident: () => readonly ExtentRef[],
   count: () => number,
+  captureSmall?: WriterViewSource["captureSmall"],
 ): readonly ExtentRef[] {
-  const source: WriterViewSource = { writer, resident };
+  const source: WriterViewSource = {
+    writer,
+    resident,
+    ...(captureSmall === undefined ? {} : { captureSmall }),
+  };
   const view = new Proxy<ExtentRef[]>([], {
     get(_target, key) {
       if (key === NATIVE_VIEW) return source;

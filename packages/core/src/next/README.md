@@ -4509,3 +4509,30 @@ full/ordinal snapshots. `testing/writer-ownership-pressure.test.ts` covers real 
 with 65/4,097 extents, publication/abort under competing grants, and plain-row/FTS producers,
 exact committed/reopened rows and zero ownership. These are memory/correctness proofs, not
 throughput or browser RSS claims. No durable grammar, released API or supported predecessor changes.
+
+Incremental writer captures keep one prepaid chunk-handle/ordinal seek hint. Successive
+part cuts reread at most one old ownership chunk plus newly sealed chunks; they do not
+rescan the full sealed history. Older cuts fall back to a full walk. The hint retains no
+reader, page, array or additional loan and is installed only after successful capture.
+`storage/writer-incremental.test.ts` bounds total metadata reads over generated repeated
+cuts, checks exact full/backward snapshots and returns all fixed-window credit.
+`scripts/next-writer-insert-bench.mts` compares compiled runtimes with interleaved CPU
+pairs for ordinary narrow/wide inserts through durable quiescence, using prebuilt columns.
+
+Ownership flushes retain the same 64-record resident window and pack scratch records
+into the existing compact journal-page format. A proved strictly ordered captured stream
+needs no second sort; arbitrary physical order still uses the shared sort. Small immutable
+retirement cursors allocate only their record-count-sized buffer under the unchanged
+maximum prepaid allowance. Cancellation before flush attachment drains its partial chain
+and preserves the resident ownership for retry. These are private workspace changes.
+
+Current-tail ordinal cuts use a bounded resident input to the same inventory cursors:
+copy at most 64 packed extent pairs under the existing 4 KiB owner allowance, with
+no journal I/O. The independent copy survives writer abort and creator-grant closure.
+It is not retirement authority; publication still needs the ordinary retained-reference
+witness. Cross-window cuts use the journal. A due task clock discards the speculative
+copy and refunds its ordinary prepayment before falling back; ownership transfers to
+the non-evictable account only after a successful copy. Native close fences resident
+inputs and their accepted reads before clearing payloads and refunding credit once.
+`testing/writer-resident.test.ts` covers these pressure and lifetime histories, and
+`storage/writer-resident.test.ts` rejects a small view over an oversized backing buffer.

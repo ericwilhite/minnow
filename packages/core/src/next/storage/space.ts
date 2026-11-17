@@ -1,3 +1,4 @@
+import { makeResidentWriterInput } from "./writer-resident.js";
 import { createWriterExtentView } from "./writer-view.js";
 import {
   WriterInventory,
@@ -616,6 +617,55 @@ class Space implements ExtentSpace {
         throw error;
       });
   }
+  /** Bounded input snapshot, not a retirement authority; no journal until the tail is insufficient. */
+  captureResidentWriter(
+    writer: Writer,
+    since: number,
+    budget: ByteBudget,
+    work: TaskWork,
+  ): RetirementInventory | undefined {
+    writer.usable();
+    if (!writer.inventory.canCopyTail(since)) return undefined;
+    // A clock-due copy is speculative. Keep its prepayment in the originating
+    // grant until it succeeds, so falling back cannot consume that grant twice.
+    const funding = this.roots.leaseBudget(budget);
+    if (!funding.allocate(RETIREMENT_OWNER_BYTES)) {
+      funding.close();
+      return undefined;
+    }
+    let copied: { bytes: Uint8Array; count: number } | undefined,
+      transferred = false;
+    try {
+      writer.usable();
+      work.signal?.throwIfAborted();
+      copied = writer.inventory.copyTail(since, work);
+      if (copied === undefined) {
+        funding.close();
+        return undefined;
+      }
+      writer.usable();
+      work.signal?.throwIfAborted();
+      funding.transfer();
+      transferred = true;
+      writer.usable();
+      work.signal?.throwIfAborted();
+      const inventory = makeResidentWriterInput(
+        copied.bytes,
+        copied.count,
+        descriptorOwnerBudget(funding),
+        this.#retirementInventories,
+      );
+      this.#retirementInventories.add(inventory);
+      return inventory;
+    } catch (error) {
+      // Drop the speculative payload before refunding its owner allowance.
+      // eslint-disable-next-line no-useless-assignment -- ownership ends before refund
+      copied = undefined;
+      funding.close();
+      if (!transferred && error instanceof ReadDeniedError) return undefined;
+      throw error;
+    }
+  }
   async snapshotWriter(
     writer: Writer,
     options: { budget: ByteBudget; since?: number } & TaskWork,
@@ -1008,7 +1058,11 @@ class Space implements ExtentSpace {
               const page = await cursor.next(work);
               work.signal?.throwIfAborted();
               this.usable();
-              if (page !== null) target.set(page);
+              if (page !== null) {
+                if (page.length > target.byteLength)
+                  throw new StoreCorruptionError("Retirement page exceeds its record bound");
+                target.set(page);
+              }
               return { position: cursor.position, bytes: page?.length ?? 0 };
             } finally {
               await cursor.close();
@@ -1744,6 +1798,7 @@ class Writer implements ExtentWriter {
       this,
       () => this.inventory.resident,
       () => this.inventory.count,
+      (since, budget, work) => this.space.captureResidentWriter(this, since, budget, work),
     );
   }
 

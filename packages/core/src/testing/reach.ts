@@ -9502,3 +9502,59 @@ export const WRITER_FOREIGN_OWNER_REACH = [
   "snapshot survives creator",
   "zero both governors",
 ] as const;
+
+export const WRITER_INCREMENTAL_REACH = [
+  "linear capture IO",
+  "partial chunk and new chunks",
+  "bounded resident ownership",
+  "older cut falls back exactly",
+  "full snapshot remains exact",
+  "all ownership returned",
+] as const;
+
+export const WRITER_FLUSH_CANCEL_REACH = [
+  "compact pages only",
+  "cancel after scratch writes",
+  "resident ownership survives cancel",
+  "retry exact ownership",
+  "all cancellation credit returned",
+] as const;
+
+export const WRITER_SMALL_CURSOR_REACH = [
+  "count bounded window",
+  "maximum window",
+  "empty no read",
+  "all cursor credit returned",
+] as const;
+
+export const WRITER_RESIDENT_REACH = [
+  "payload cleared before one refund",
+  "resident zero journal writes",
+  "crossing cut uses disk fallback",
+  "resident suffix after earlier spill",
+  "ordinal holes preserved",
+  "input is not retirement authority",
+  "creator closes after ownership transfer",
+  "exact sealed receipts",
+  "release fences accepted response",
+  "all ownership returned",
+] as const;
+
+export const WRITER_RESIDENT_BACKING_REACH = [
+  "small view with oversized backing refused",
+  "no owner credit leak",
+] as const;
+
+export const WRITER_RESIDENT_DEFER_REACH = [
+  "copy deferred to sliced disk route",
+  "single admitted owner transferred once",
+  "exact suffix after clock deferral",
+  "all bytes released",
+] as const;
+
+export const WRITER_MIXED_CUT_REACH = [
+  "many resident-only increasing cuts",
+  "next crossing cut has bounded old overlap",
+  "exact crossing suffix",
+  "all mixed-cut credit returned",
+] as const;

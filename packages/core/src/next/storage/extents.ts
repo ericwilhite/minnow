@@ -447,6 +447,8 @@ export interface ExtentWriter {
   /** Immutable offset-ordered live ownership, optionally restricted to seals after since.
    * Caller pays before allocation and owns the inventory through every observer/publication.
    * It pins descriptors only; source data ownership/pins must remain valid independently.
+   * Successive increasing cuts walk new seals plus a bounded overlap per cut; seeking an older
+   * cut may restart. The seek state must not grow with the sealed history.
    */
   snapshotExtents?(
     options: { readonly budget: ByteBudget; readonly since?: number } & TaskWork,
