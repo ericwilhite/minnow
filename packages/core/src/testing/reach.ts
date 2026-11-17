@@ -11375,3 +11375,19 @@ export const NATIVE_TRIGGER_ORDERING_REACH = [
   "exact parent and child rows",
   "exact nested body rows",
 ] as const;
+
+export const NATIVE_TRIGGER_SAVEPOINT_REACH = [
+  "pre-savepoint trigger and RI effects",
+  "successful body effects rolled back",
+  "whole statement rollback includes RI and nested bodies",
+  "late child AFTER failure",
+  "late parent AFTER failure",
+  "exact pre-savepoint restoration",
+  "continued triggering transaction",
+  "published source",
+  "resident source",
+  "two parent rows",
+  "more parent rows",
+  "exact committed rows",
+  "zero native ownership",
+] as const;

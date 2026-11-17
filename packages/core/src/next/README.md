@@ -4948,9 +4948,9 @@ The reusable trigger ordering campaign lives in `testing/trigger-ordering.test-s
 trigger functions, seeds, the root mutation and an ordered observation query. The same strict
 PGlite runner accepts a `TriggerOrderingFactory`: an adapter runs that history and fences
 cleanup before the next one starts. An unsupported native operation must reject, never become
-an empty trace or an accepted skip. The current factory uses the real controller with the
-explicitly synthetic source/row/RI fixture. Replacing that factory with B5b's verified native
-SQL setup/execution is still required before claiming end-to-end support or enabling firing.
+an empty trace or an accepted skip. The original campaign uses the real controller with an explicitly synthetic source/row/RI
+fixture. The separate native factory described below now qualifies B5b's concrete command
+provider. Production owner admission and SQL dispatch still need their own enablement evidence.
 The generated histories vary row counts (including zero and spill-sized queues), before/after
 names, UTF8 boundaries, creation order, event and body-command count. Existing controller
 contract seeds and run counts stay intact in their separate suite.
@@ -4975,3 +4975,25 @@ case groups, assigning each history by row parity. A ledger audit checks equal g
 inputs, exactly one completed native execution per history, and the combined declared Reach.
 The twelve-run configuration and all large histories stay unchanged; split bodies reduce
 coverage instrumentation's longest test without changing its deadline.
+
+### Native trigger statement rollback and enclosing savepoints
+
+`owner/trigger-statement.ts` runs one already-funded native command graph. It drains graph
+callbacks and IO before undoing a failed statement; it neither admits a separate pool nor
+commits the transaction. Caller-owned rule bindings and grants stay live through that drain.
+A close failure after successful statement end needs the caller's enclosing transaction or
+savepoint recovery; an ended statement cannot be undone by `Statement.rollback()`.
+
+The native savepoint campaign uses the real writer across several triggering statements,
+with independently pinned read-own observations and PGlite comparison. It checks failures
+in parent and RI-child AFTER bodies after nested effects, exact statement undo before
+rollback-to, successful body effects undone by rollback-to, continued triggering writes,
+and exact committed parent/child/log/audit/trace rows. Both generated seeds replay the same
+eight runs and two examples in bounded location/parity groups; an exactly-once ledger and declared
+Reach audit the split. Its fixed test funding is not production admission.
+
+Inline bodies remain INSERT/UPDATE/DELETE only. CREATE TRIGGER rejects in-body SAVEPOINT or
+ROLLBACK with a typed planning error before changing the catalog or executing a body. The
+PostgreSQL comparison checks its own trigger-function execution refusal and statement undo;
+the different grammars do not imply identical refusal stages or diagnostics. Enclosing
+savepoints belong to the caller transaction. SQL firing remains guarded in this consumer stage.
