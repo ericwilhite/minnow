@@ -9255,6 +9255,30 @@ export const SQL_REGEX_ACCEPTANCE_REACH = [
   "failed-start cache rollover",
 ] as const;
 
+export const SQL_REGEX_GENERATED_REACH = [
+  "nullable",
+  "nested",
+  "alternative",
+  "optional",
+  "sequence",
+  "~",
+  "~*",
+  "!~",
+  "!~*",
+  "start anchor",
+  "end anchor",
+  "Unicode",
+  "astral input",
+  "newline input",
+  "boolean true",
+  "boolean false",
+  "captures compared",
+  "PostgreSQL captures compared",
+  "unmatched capture",
+  "empty match",
+  "typed limit distinct from result",
+] as const;
+
 export const PROTOTYPE_RUN_LIFETIME_REACH = [
   "already cancelled",
   "cancelled in flight",
