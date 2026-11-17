@@ -9441,3 +9441,31 @@ export const DDL_STAGED_ALTER_REACH = [
   "native reads",
   "exact post-fold reopen",
 ] as const;
+
+export const REPLAY_MAPPING_WORK_REACH = [
+  "one table",
+  "multiple tables",
+  "wide",
+  "narrow",
+  "two physical versions",
+  "unchanged schema",
+  "unrelated DDL",
+  "no unrelated DDL",
+  "mapping reuse bound",
+  "charged then released",
+  "exact replay values",
+  "zero retained",
+] as const;
+
+export const REPLAY_MAPPING_MEMORY_REACH = [
+  "wide IDs",
+  "small IDs",
+  "stable identity reuse",
+  "permuted layout reuse",
+  "same version identity refusal",
+  "independent memtable ownership",
+  "pressure discards inactive cache",
+  "catalog invalidation",
+  "row ownership outlives cache",
+  "zero retained",
+] as const;

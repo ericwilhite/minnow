@@ -46,6 +46,7 @@ import {
   type StagedPart,
 } from "./memtable.js";
 import type { KeyDelta, DeltaVisitor } from "./key-hash.js";
+import { ReplayColumnMappings } from "./replay-columns.js";
 
 /**
  * `openWritePath`'s input plus internal tuning for tests (never a public dial): smaller memtables
@@ -506,6 +507,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #catalogHistory: Array<{ lsn: number; catalog: Catalog }> = [];
   #version: number;
   readonly #tables = new Map<number, TableState>();
+  #replayColumns: ReplayColumnMappings | null = null;
   #state!: WriteState;
   #root: ManifestRoot;
   #failure: Error | null = null;
@@ -629,6 +631,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
     /** Stagings a rollback dropped; staged commits replayed at open. */
     stagingRollbacks: 0,
     publishedReplays: 0,
+    /** Recovery identity work; physical mappings exclude decoded per-effect vectors. */
+    replayMappingBuilds: 0,
+    replayMappingHits: 0,
+    replayMappingBytes: 0,
+    replayMappingPeakBytes: 0,
+    replayMappingEvictions: 0,
     /** Delta entries staged memtables kept resident (tombstones of older rows). */
     stagedResidualEntries: 0,
     /** Flushes held because their table is newer than the root an index build holds back. */
@@ -1112,25 +1120,40 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#nextStagingId = Math.max(this.#nextStagingId, staged.transaction + 1);
     const headers = await session.readLogHeaders();
     let parts: Uint8Array[] = [];
-    const summary: LogScanSummary = await scanLogIncremental(
-      { length: session.logLength(), read: (offset, length) => session.readLog(offset, length) },
-      headers,
-      root.log,
-      {
-        part: (frame) => {
-          parts.push(frame.body.slice());
-        },
-        commit: async (_transaction, lastLsn) => {
-          const bytes = parts.length === 1 ? need(parts[0]) : concat(parts);
-          parts = [];
-          await this.#replay(replayer, lastLsn, decodeBody(bytes));
-        },
-        abandon: () => {
-          parts = [];
-        },
-      },
-      this.#grant,
+    const mappings = await this.#metadataRetry(
+      () => new ReplayColumnMappings(this.#metadataBudget),
     );
+    this.#replayColumns = mappings;
+    let summary: LogScanSummary;
+    try {
+      summary = await scanLogIncremental(
+        { length: session.logLength(), read: (offset, length) => session.readLog(offset, length) },
+        headers,
+        root.log,
+        {
+          part: (frame) => {
+            parts.push(frame.body.slice());
+          },
+          commit: async (_transaction, lastLsn) => {
+            const bytes = parts.length === 1 ? need(parts[0]) : concat(parts);
+            parts = [];
+            await this.#replay(replayer, lastLsn, decodeBody(bytes));
+          },
+          abandon: () => {
+            parts = [];
+          },
+        },
+        this.#grant,
+      );
+    } finally {
+      this.maintenance.replayMappingBuilds = mappings.builds;
+      this.maintenance.replayMappingHits = mappings.hits;
+      this.maintenance.replayMappingPeakBytes = mappings.peakBytes;
+      this.maintenance.replayMappingEvictions = mappings.evictions;
+      mappings.close();
+      this.#replayColumns = null;
+      this.maintenance.replayMappingBytes = mappings.bytes;
+    }
     Replayer.checkCoverage(checkpoint, summary.lastLsn);
     // Staging no frame claimed: its transaction never committed. The first root leaves it out
     // and retires its rows and runs together.
@@ -1320,6 +1343,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const change = decodeCatalogEffect(effect);
     if (change === null) return;
     const catalog = this.#catalog.apply(change, change.version);
+    this.#replayColumns?.synchronize(catalog);
     this.#version = Math.max(this.#version, change.version);
     this.#catalog = catalog;
     this.#catalogHistory.push({ lsn, catalog });
@@ -1379,34 +1403,31 @@ export class WritePathImpl implements WritePath, EngineHooks {
       throw new LogCorruptionError(`Rows for table ${String(effect.tableId)}, which replay lacks`);
     const inserts = effect.inserts;
     if (inserts !== null) {
-      const ids = inserts.columnIds ?? def.columns.map((column) => column.id);
-      const catalogColumns = new Map(def.columns.map((column) => [column.id, column]));
-      const physical = ids.flatMap((id, c) => {
-        const column = catalogColumns.get(id);
-        return column === undefined ? [] : [{ column, bytes: need(inserts.columns[c]) }];
-      });
-      if (effect.schemaVersion === def.schemaVersion && physical.length !== def.columns.length)
-        throw new LogCorruptionError("A logged insert lacks a catalog column");
-      const physicalDef: TableDef = {
-        ...def,
-        schemaVersion: effect.schemaVersion,
-        columns: physical.map(({ column }) => column),
-      };
-      const columns = physical.map(({ column, bytes }) => {
-        const vector = decodeColumn(bytes, column.type);
+      const pending = this.#metadataRetry(() =>
+        need(this.#replayColumns).get(def, effect.schemaVersion, inserts.columnIds),
+      );
+      const mapping = pending instanceof Promise ? await pending : pending;
+      const physicalDef = mapping.definition;
+      const columns = physicalDef.columns.map((column, c) => {
+        const vector = decodeColumn(
+          need(inserts.columns[need(mapping.sourcePositions[c])]),
+          column.type,
+        );
         if (vector.length !== inserts.rowCount)
           throw new LogCorruptionError("A logged insert column has the wrong row count");
         return vector;
       });
       // Indexes use the current catalog's operands, without materializing an added
       // missing value per row. Physical memtable storage remains the old ID subset.
-      const byId = new Map(physical.map(({ column }, c) => [column.id, need(columns[c])]));
       const indexed =
         def.indexes.length === 0
           ? []
-          : def.columns.map(
-              (column) => byId.get(column.id) ?? missingVector(column, inserts.rowCount),
-            );
+          : def.columns.map((column, c) => {
+              const position = need(mapping.indexPositions[c]);
+              return position < 0
+                ? missingVector(column, inserts.rowCount)
+                : need(columns[position]);
+            });
       let done = 0;
       while (done < inserts.rowCount) {
         let { memtable } = this.liveMemtable(effect.tableId, inserts.rowCount - done, physicalDef);
@@ -1736,6 +1757,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#grant,
       this.#memtableRows,
       this.#arenaPool,
+      definition !== undefined && def.columns !== this.#def(tableId).columns,
     );
     this.#setView(state, { ...state.view, memtables: [...memtables, memtable] });
     if (frozen !== null && !this.#recovering) this.#scheduleFlush();
@@ -1774,6 +1796,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#grant,
       this.#memtableRows,
       this.#arenaPool,
+      definition !== undefined && def.columns !== this.#def(state.tableId).columns,
     );
     this.#setView(state, { ...state.view, memtables: [...memtables, memtable] });
     return memtable;

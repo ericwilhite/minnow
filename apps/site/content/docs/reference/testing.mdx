@@ -1945,6 +1945,15 @@ folding must preserve the same values. Published-memory membership comes from va
 metadata, read lazily; open still does not walk group roots. Every controlled fold gate is
 released and drained, including on failure.
 
+A separate replay-work generator interleaves many one-row commits over wide tables and one or
+two physical schemas. Mapping builds are bounded by the distinct table/schema pairs; unrelated
+DDL must not rebuild them. Identity metadata is charged before allocation, invalidated when its
+table descriptor changes, and released when replay ends, including failed replay. Under pressure
+inactive mappings are discarded before retrying the ordinary cancellable metadata policy.
+Descriptor arrays retained by memtables have independent row-owner charges until their final
+reader fence. Generated ownership cases force eviction, ID permutations and high column IDs,
+then assert that cache retirement cannot release a still-retained memtable's charge.
+
 The DDL row-schema campaign runs DROP, ADD and RENAME at each column position over resident
 and published rows. Unrelated ordinary and FTS writes publish roots; each history reopens at
 publication, after later writes, after another ALTER, and after checkpoint/maintenance. It

@@ -42,7 +42,11 @@ for (const timing of ["before", "after"] as const)
             Object.assign(core.harness, {
               tuning: {
                 merges: { mode: "off" },
-                beforeFlushPublish: () => gate.wait,
+                beforeFlushPublish: async () => {
+                  const owner = core.harness.path;
+                  await gate.wait;
+                  if (owner.closed) throw new Error("test cut cancels the parked fold");
+                },
               },
             });
             await core.open();
@@ -129,6 +133,9 @@ for (const timing of ["before", "after"] as const)
               gate = foldGate();
               await core.reopen();
               install();
+              expect(
+                core.harness.path.state().root.tables.find((t) => t.tableId === 1)?.staged.length,
+              ).toBeGreaterThan(0);
               expect(core.harness.path.maintenance.publishedReplays).toBeGreaterThan(0);
               const result = await core.execute(`SELECT ${names.join(",")} FROM docs`);
               if (!("batches" in result)) throw new Error("missing rows");
