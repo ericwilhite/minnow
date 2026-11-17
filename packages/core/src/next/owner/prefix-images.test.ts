@@ -38,6 +38,15 @@ for (const seed of seedsFor("next-native-prefix-images", [0xb62b, 0xb62c]))
               hints = vi.spyOn(MemoryReads.prototype, "hint"),
               added = vi.spyOn(f.stop.signal, "addEventListener"),
               removed = vi.spyOn(f.stop.signal, "removeEventListener");
+            let preparations = 0;
+            const readerBase = f.statement.tx.hooks.shared.readers.count;
+            f.setPrepare(() => {
+              preparations++;
+              expect(f.statement.tx.hooks.shared.readers.count).toBe(readerBase);
+              expect(f.source.allocated).toBe(0);
+              expect(f.source.loaned).toBe(0);
+              return Promise.resolve();
+            });
             // eslint-disable-next-line @typescript-eslint/unbound-method -- Invoked with its original TableScan receiver via call.
             const original = TableScan.prototype.next;
             const decode = vi.spyOn(TableScan.prototype, "next").mockImplementation(async function (
@@ -140,8 +149,15 @@ for (const seed of seedsFor("next-native-prefix-images", [0xb62b, 0xb62c]))
               ).toBe(true);
               if (hints.mock.calls.length > 0) reach.reach("single-row native sizing");
               if (width === 80000 && !published) {
-                expect(borrow, "wide source uses protected progress").toHaveBeenCalled();
-                reach.reach("source progress loan");
+                expect(
+                  preparations,
+                  "wide source obtains complete ordinary progress",
+                ).toBeGreaterThan(f.ids.length);
+                expect(
+                  borrow,
+                  "ordinary progress does not consume the shared reserve",
+                ).not.toHaveBeenCalled();
+                reach.reach("source progress admission");
               }
               reach.reach(width >= 24000 ? "fragmented payload" : "small payload");
               reach.reach(published ? "published" : "resident");

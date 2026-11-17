@@ -150,6 +150,7 @@ export async function prefixFixture(
       signal.throwIfAborted();
       expect(source.allocated).toBe(0);
       expect(source.loaned).toBe(0);
+      if (minimum > source.held) expect(await source.makeRoom?.(minimum, signal)).toBe(true);
       expect(minimum).toBeLessThanOrEqual(source.held);
       return source;
     },

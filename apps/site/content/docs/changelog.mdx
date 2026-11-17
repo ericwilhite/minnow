@@ -38,6 +38,9 @@ the root statement. Its query workspace is funded by the root, and cancellation 
 inputs before releasing credit. A low-level root assembler connects the native graph and fences
 its producer and complete end continuation; commit stays with its caller. SQL firing remains
 guarded while owner admission and dispatch are integrated. Fixed decoder workspace is admitted before native source reads.
+Wide native OLD-row reads now close their decoder and pin and return unused producer credit
+before funding a larger ordinary read step. They no longer mistake that step for a value-sized
+reserve loan. Cancellation waits for readmission cleanup.
 No released API, stored-format or migration change is required.
 
 The shipped engine’s fast path for SUM and AVG over floating-point columns adds values directly,

@@ -13,7 +13,7 @@ import { selectedSegment } from "../exec/late-fetch.js";
 import { TableScan, memoryScanBufferBytes } from "../exec/table-scan.js";
 import { OutputArena } from "../exec/kernels/vectors.js";
 import type { ChunkReads } from "../exec/scan.js";
-import type { Grant, Loan } from "../memory/governor.js";
+import type { Grant } from "../memory/governor.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import { BATCH_ROWS, type FlatVector, type Vector, type ConstantVector } from "../vector/vector.js";
 import { setInt128 } from "../vector/int128.js";
@@ -34,7 +34,8 @@ export interface NativePrefixImageScope {
   readonly charge: ByteCharge;
   readonly signal: AbortSignal;
   /** Root-owned source step; no source/image borrow exists when this is called. Root
-   * reclaims/transfers idle base credit after sealing the rowset, BEFORE writer growth. */
+   * reclaims/transfers idle base credit after sealing the rowset, BEFORE writer growth.
+   * Wider reads repeat this call only after decoder/pin teardown and unused-credit return. */
   prepareSource(table: TableDef, minimum: number, signal: AbortSignal): Promise<Grant>;
   /** Synchronous root AbortController operation, never a recursive close/rollback. */
   abortRoot(reason: unknown): void;
@@ -47,8 +48,8 @@ export function nativePrefixImageBytes(columns: number): number {
   if (!Number.isSafeInteger(bytes)) invalid();
   return bytes;
 }
-/** Fixed native decode/IO belongs to ordinary admission. Only a row's variable
- * payload may use the shared reserve after the publication-stable hint. */
+/** Fixed native decode/IO starts in ordinary admission. Wider row steps are funded
+ * at a fresh boundary after publication-stable hints or persisted decode sizing. */
 const MEMORY_STEP_BYTES =
   MEMORY_READ_HINT_BYTES +
   MEMORY_READ_RESIDENT_BYTES +
@@ -66,6 +67,15 @@ export function nativePrefixSourceBytes(table: TableDef): number {
 }
 function invalid(): never {
   throw new TypeError("Invalid or retired native prefix image source");
+}
+function sourceBoundary(budget: Grant): void {
+  if (budget.allocated !== 0 || budget.loaned !== 0) invalid();
+}
+/** Internal retry only. All decoder/input ownership ends before the larger admission. */
+class PrefixStep extends Error {
+  constructor(readonly bytes: number) {
+    super("Retry native source at a fresh boundary");
+  }
 }
 /** A true one-row memory source. A sparse deletion mask would make MemorySegmentScan
  * size/decode preceding rows in the chunk, even though its consumer needs only one. */
@@ -266,113 +276,132 @@ export class NativePrefixImages {
       this.#check(stop);
       return this.scope.statement.guard(async () => {
         const table = this.scope.statement.catalog.table(tableId) ?? invalid(),
-          minimum = nativePrefixSourceBytes(table),
-          budget = await this.scope.prepareSource(table, minimum, stop);
-        this.#check(stop);
-        if (budget.loaned !== 0 || budget.held - budget.allocated < minimum) invalid();
-        const pin = this.scope.statement.readOwn();
-        let arena: OutputArena | null = null;
-        let loan: Loan | null = null;
-        try {
-          const source = pin.internalTable(tableId),
-            locator = source.locator(rowId),
-            segment = source.segments[Math.floor(locator / 65536)],
-            position = locator % 65536;
-          if (
-            !segment ||
-            position >= segment.rowCount ||
-            (await segment.deletions())?.isDeleted(position) === true
-          )
-            invalid();
+          baseMinimum = nativePrefixSourceBytes(table);
+        let minimum = baseMinimum;
+        for (;;) {
+          const budget = await this.scope.prepareSource(table, minimum, stop);
           this.#check(stop);
-          pin.checkRead();
-          const positions = this.#positions ?? invalid();
-          positions[0] = position;
-          this.#ids.length = 0;
-          for (const column of table.columns) this.#ids.push(column.id);
-          if (segment.kind === "memory") {
-            // B3's publication-stable hint sizes the WHOLE native read, not just output
-            // buffers. Its transient sizing workspace is in minimum. No payload borrow
-            // survives the hint, so obtaining the shared progress lane cannot self-wait.
-            const hint = await segment.readHint(
-              {
-                columns: this.#ids,
-                chunk: Math.floor(position / MEMORY_CHUNK_ROWS),
-                startRow: position % MEMORY_CHUNK_ROWS,
-                maxRows: 1,
-                targetBytes: 1,
-              },
-              { budget, pages: pin.pages, signal: stop },
-            );
-            this.#check(stop);
-            pin.checkRead();
-            const complete = Math.max(
-              minimum,
-              minimum -
-                MEMORY_STEP_BYTES +
-                hint.residentBytes +
-                hint.scratchBytes +
-                hint.ioBytes +
-                hint.outputBytes,
-            );
-            if (!Number.isSafeInteger(complete)) invalid();
-            const shortfall = complete - (budget.held - budget.allocated);
-            if (shortfall > 0) loan = await budget.borrow(shortfall, stop);
-            this.#check(stop);
-            pin.checkRead();
-          }
-          arena = new OutputArena(budget, 1);
-          const scan = new TableScan({
-            table: {
-              tableId,
-              schemaVersion: source.schemaVersion,
-              columns: source.columns,
-              segments: [
-                segment.kind === "memory"
-                  ? pointMemory(segment, position)
-                  : selectedSegment(segment, 0, positions),
-              ],
-              liveRowCount: 1,
-            },
-            columns: this.#ids,
-            filter: null,
-            emitLocator: false,
-            pages: pin.pages,
-            reads: this.scope.reads,
-            budget,
-            context: { arena, params: { slots: [] }, input: [] },
-            boundedMemory: true,
-            rowsNeeded: () => 1,
-            loans: { borrow: (bytes) => budget.borrow(bytes, stop) },
-          });
-          this.#scan = scan;
-          const item = await scan.next();
-          this.#check(stop);
-          pin.checkRead();
-          if (!item || (item.batch.selection?.count ?? item.batch.length) !== 1) invalid();
+          sourceBoundary(budget);
+          if (budget.held < minimum) invalid();
+          const pin = this.scope.statement.readOwn();
+          let arena: OutputArena | null = null;
+          let nextMinimum: number;
           try {
-            const row = item.batch.selection?.rows[0] ?? 0;
-            await this.#normalize(item.batch, row, stop, pin);
-            pin.checkRead();
-            const image = await this.scope.images.append(
-              tableId,
-              { batch: { ...item.batch, columns: this.#columns }, row },
-              null,
-            );
+            const source = pin.internalTable(tableId),
+              locator = source.locator(rowId),
+              segment = source.segments[Math.floor(locator / 65536)],
+              position = locator % 65536;
+            if (
+              !segment ||
+              position >= segment.rowCount ||
+              (await segment.deletions())?.isDeleted(position) === true
+            )
+              invalid();
             this.#check(stop);
             pin.checkRead();
-            if (image.spoolId !== this.scope.rootId) invalid();
-            return image;
+            const positions = this.#positions ?? invalid();
+            positions[0] = position;
+            this.#ids.length = 0;
+            for (const column of table.columns) this.#ids.push(column.id);
+            if (segment.kind === "memory") {
+              // The hint's transient sizing workspace retires before the complete read.
+              // A larger step retries from a fresh source boundary, never a reserve loan
+              // or an admission while keeping decoder/input allocations.
+              const hint = await segment.readHint(
+                {
+                  columns: this.#ids,
+                  chunk: Math.floor(position / MEMORY_CHUNK_ROWS),
+                  startRow: position % MEMORY_CHUNK_ROWS,
+                  maxRows: 1,
+                  targetBytes: 1,
+                },
+                { budget, pages: pin.pages, signal: stop },
+              );
+              this.#check(stop);
+              pin.checkRead();
+              const complete = Math.max(
+                minimum,
+                baseMinimum -
+                  MEMORY_STEP_BYTES +
+                  hint.residentBytes +
+                  hint.scratchBytes +
+                  hint.ioBytes +
+                  hint.outputBytes,
+              );
+              if (!Number.isSafeInteger(complete)) invalid();
+              if (complete > budget.held - budget.allocated) throw new PrefixStep(complete);
+              this.#check(stop);
+              pin.checkRead();
+            }
+            arena = new OutputArena(budget, 1);
+            const scan = new TableScan({
+              table: {
+                tableId,
+                schemaVersion: source.schemaVersion,
+                columns: source.columns,
+                segments: [
+                  segment.kind === "memory"
+                    ? pointMemory(segment, position)
+                    : selectedSegment(segment, 0, positions),
+                ],
+                liveRowCount: 1,
+              },
+              columns: this.#ids,
+              filter: null,
+              emitLocator: false,
+              pages: pin.pages,
+              reads: this.scope.reads,
+              budget,
+              context: { arena, params: { slots: [] }, input: [] },
+              boundedMemory: true,
+              rowsNeeded: () => 1,
+              loans: {
+                borrow: async (bytes) => {
+                  // A persisted column reveals its exact one-row decode growth here.
+                  // Unwind the group before funding that complete ordinary working set.
+                  const complete = budget.allocated + bytes;
+                  if (!Number.isSafeInteger(complete)) invalid();
+                  throw new PrefixStep(complete);
+                },
+              },
+            });
+            this.#scan = scan;
+            const item = await scan.next();
+            this.#check(stop);
+            pin.checkRead();
+            if (!item || (item.batch.selection?.count ?? item.batch.length) !== 1) invalid();
+            try {
+              const row = item.batch.selection?.rows[0] ?? 0;
+              await this.#normalize(item.batch, row, stop, pin);
+              pin.checkRead();
+              const image = await this.scope.images.append(
+                tableId,
+                { batch: { ...item.batch, columns: this.#columns }, row },
+                null,
+              );
+              this.#check(stop);
+              pin.checkRead();
+              if (image.spoolId !== this.scope.rootId) invalid();
+              return image;
+            } finally {
+              item.transfer?.release();
+            }
+          } catch (error) {
+            if (!(error instanceof PrefixStep)) throw error;
+            if (error.bytes <= minimum) invalid();
+            nextMinimum = error.bytes;
           } finally {
-            item.transfer?.release();
+            this.#scan?.abort();
+            this.#scan = null;
+            this.#columns.length = this.#ids.length = 0;
+            arena?.close();
+            pin.release();
           }
-        } finally {
-          this.#scan?.abort();
-          this.#scan = null;
-          this.#columns.length = this.#ids.length = 0;
-          arena?.close();
-          pin.release();
-          loan?.repay();
+          this.#check(stop);
+          sourceBoundary(budget);
+          budget.release(budget.held);
+          minimum = nextMinimum;
+          await this.scope.checkpoint();
         }
       });
     });

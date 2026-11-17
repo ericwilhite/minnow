@@ -4350,8 +4350,12 @@ is exercised with actual native RI and user-body ordering; owner admission/dispa
 SQL enablement remain unfinished. SQL firing and advanced-RI refusal guards remain in place.
 No stored format changes.
 
-The source ordinary minimum includes the fixed native decoder/IO workspace; fixed buffers
-must not be mistaken for a variable value that exceeds the shared reserve. The in-memory
+The source ordinary minimum includes the fixed native decoder/IO workspace. A wider point
+read first closes its decoder, arena and pin, returns unused producer credit, then funds the
+larger complete ordinary step and retries. Memory hints use the original fixed baseline;
+persisted decoders report exact one-row growth. A valid row is not rejected just because that
+working step exceeds the shared reserve. Cancellation fences the pending readmission before
+returning metadata charge. The in-memory
 spill test service looks up append-ordered offsets by binary search, so registry page count
 does not introduce a linear scan for every read. Its stored pages remain a test double for
 external scratch storage; the governor assertions cover native resident accounts.

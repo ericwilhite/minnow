@@ -9540,7 +9540,7 @@ export const MODIFY_UNIQUE_TIMING_REACH = [
 /** Full native OLD payload capture stays inside source/image ownership. */
 export const NATIVE_PREFIX_IMAGES_REACH = [
   "single-row native sizing",
-  "source progress loan",
+  "source progress admission",
   "fragmented payload",
   "small payload",
   "published",
@@ -10094,5 +10094,25 @@ export const NATIVE_FOLLOW_VISITED_REACH = [
   "fixed charged metadata",
   "one shared file",
   "spilled replay",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PREFIX_WIDE_STEP_REACH = [
+  "memory source",
+  "stored source",
+  "64MiB",
+  "128MiB",
+  "complete ordinary retry",
+  "pin and decoder retired",
+  "no reserve loan",
+  "exact payload",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PREFIX_WIDE_LIFETIME_REACH = [
+  "cancel",
+  "close",
+  "no producer pin or credit",
+  "metadata fenced through admission",
   "zero ownership",
 ] as const;
