@@ -5,6 +5,7 @@ import type { Operator } from "./pipeline.js";
 /** One query's admissions, resources and the executed/delivered lifecycle. */
 import type { MaybePromise } from "../access/key-index.js";
 import { SnapshotReleasedError } from "../access/snapshot.js";
+import { sizingSettled } from "../page/read-bounds.js";
 import { QueryRoots, type RootColumns } from "../page/query-roots.js";
 import { readTable } from "./read-table.js";
 import type { ByteBudget } from "../access/space.js";
@@ -1388,6 +1389,12 @@ function hasStatement(request: ExecuteRequest): boolean {
   return request.statement !== null;
 }
 
+// Synchronous cached executions never touch these maps or allocate fence state. Async
+// launch/program promises already exist; weak keys cannot retain retired executions.
+const launches = new WeakMap<QueryExecution, Promise<void>>();
+const producers = new WeakMap<QueryExecution, Promise<void>>();
+const retirements = new WeakMap<QueryExecution, Promise<void>>();
+
 export class QueryExecution implements Execution {
   readonly results: ResultChannel;
   readonly delivered: Promise<void>;
@@ -1487,17 +1494,39 @@ export class QueryExecution implements Execution {
       const grant = request.governor.tryAdmit(options);
       if (grant === null) {
         this.#async = true;
-        request.governor
+        const launch = request.governor
           .admit({ ...options, signal: this.#controller.signal })
           .then(
             (g) => this.#start(g, program),
             (error: unknown) => this.#fail(error),
           )
           .catch((error: unknown) => this.#fail(error));
+        launches.set(this, launch);
       } else this.#start(grant, program);
     } catch (error) {
       this.#fail(error);
     }
+  }
+
+  /** Resource retirement is independent of all existing outcome/delivery completions. */
+  settled(): Promise<void> {
+    let fence = retirements.get(this);
+    if (fence === undefined) {
+      fence = this.#retire();
+      retirements.set(this, fence);
+    }
+    return fence;
+  }
+
+  async #retire(): Promise<void> {
+    await launches.get(this)?.catch(() => undefined);
+    // A queued launch can install its program after settled() was first requested.
+    await producers.get(this)?.catch(() => undefined);
+    await this.executed.catch(() => undefined);
+    await this.delivered.catch(() => undefined);
+    await sizingSettled(this.#controller.signal);
+    launches.delete(this);
+    producers.delete(this);
   }
 
   get state(): ExecutionState {
@@ -1572,6 +1601,7 @@ export class QueryExecution implements Execution {
       const work = program(runtime, this.#sink);
       if (work instanceof Promise) {
         this.#async = true;
+        producers.set(this, work);
         work
           .then(
             () => this.#finish(),

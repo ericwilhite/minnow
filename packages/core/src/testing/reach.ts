@@ -17,6 +17,20 @@
  * (`packages/db/tests/oracle-reach.ts`). Like ./seeds.ts, this module is excluded from the
  * published tarball.
  */
+export const EXECUTION_RETIREMENT_REACH = [
+  "task-yield cancellation",
+  "IO cancellation",
+  "launch then program",
+  "immediate program",
+  "queued admission aborted",
+  "cancel",
+  "dispose",
+  "delivery remains prompt",
+  "IO abort prompt",
+  "sizing drained before retirement",
+  "zero charges",
+] as const;
+
 /** Ordered hot-key traversal stays linear relative to the legacy input scan. */
 export const HOT_KEY_SORT_WORK_STATES = [
   "exact ordered rows",

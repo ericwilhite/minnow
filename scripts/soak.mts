@@ -35,6 +35,7 @@ const SUITES: Suite[] = [
     file: "packages/core/src/engine/sql-mutation-conformance.test.ts",
   },
   { name: "differential", file: "packages/core/src/engine/differential.test.ts" },
+  { name: "next-execution-retirement", file: "packages/core/src/next/exec/retirement.test.ts" },
   { name: "deterministic-simulator", file: "packages/core/src/testing/simulator.test.ts" },
   {
     name: "interaction-simulator",

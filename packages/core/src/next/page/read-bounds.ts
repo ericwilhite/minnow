@@ -62,9 +62,17 @@ interface Snapshot {
     >;
   }>;
 }
-function run<T>(job: ReadJob<T>): MaybePromise<T> {
-  const step = job.next();
-  return step.done ? step.value : step.value.then(() => run(job));
+function run<T>(
+  job: ReadJob<T>,
+  step: IteratorResult<Promise<void>, T> = job.next(),
+): MaybePromise<T> {
+  return step.done
+    ? step.value
+    : step.value.then(
+        () => run(job),
+        // A rejected task yield must unwind the generator's owned sizing grant/readers.
+        (error: unknown) => run(job, job.throw(error)),
+      );
 }
 
 export interface ReadSource {
@@ -126,6 +134,22 @@ class SizingBudget implements ByteBudget {
 
 const NO_ALLOCATION: ByteBudget = { allocate: () => false, free: () => undefined };
 
+// A driver may stop awaiting a cancelled sizing job before its borrowed IO unwinds.
+// No registry entry or wrapper is allocated for a synchronous sizing result.
+const sizingJobs = new WeakMap<AbortSignal, Set<Promise<unknown>>>();
+
+/** Resource fence for the native execution's signal, separate from outcome completion. */
+export function sizingSettled(signal: AbortSignal): Promise<void> | undefined {
+  if (!sizingJobs.has(signal)) return undefined;
+  return (async () => {
+    for (;;) {
+      const jobs = sizingJobs.get(signal);
+      if (jobs === undefined || jobs.size === 0) return;
+      await Promise.allSettled(jobs);
+    }
+  })();
+}
+
 /**
  * Only metadata is read for ordinary inline pages. Large-value header pages are inspected to
  * find their exact logical lengths; out-of-line payloads are not read. Each sizing attempt is
@@ -162,7 +186,18 @@ export function boundSource(
   prefixRows = BATCH_ROWS,
   caches?: QueryRoots,
 ): MaybePromise<ReadBound> {
-  return run(size());
+  const result = run(size());
+  if (result instanceof Promise) {
+    let jobs = sizingJobs.get(signal);
+    if (jobs === undefined) sizingJobs.set(signal, (jobs = new Set()));
+    jobs.add(result);
+    const complete = () => {
+      jobs.delete(result);
+      if (jobs.size === 0) sizingJobs.delete(signal);
+    };
+    void result.then(complete, complete);
+  }
+  return result;
   function* size(): ReadJob<ReadBound> {
     const table = yield* readValue(view.table(source.tableId, { budget: NO_ALLOCATION }));
     const certificate = new Int32DomainCertificate(

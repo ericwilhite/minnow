@@ -4,6 +4,7 @@
     "new ground; when it finds a break, the seed goes here and the deterministic suite replays it",
     "forever after. Never remove one: a seed listed here is a bug that used to exist, and the",
     "entry is what stops it coming back. Keys match the suite names passed to seedsFor().",
+    "Native execution retirement seeds 8850/8851 force cancel/dispose during source sizing and deferred launch: delivered alone does not fence the sizing grant.",
     "Interaction seeds 24301, 61935, and 608135839 exposed native OPFS checkpoint recovery failures;",
     "their storage reductions are in checkpoint-interruption.test.ts and opfs-checkpoint.spec.ts.",
     "Seed 3084996986 preserves the long WebKit plan that exposed excessive trace capture cost.",
@@ -24,6 +25,7 @@
     "Next-write extent-delta seed 701 failed about one run in fifty with an ExtentSinkError (a publication released extents the extent list does not name): a rolled-back staging's deferred retirement ran after a dropped table's walk had already released it. The seed replays the random history; the lock-queue ordering is forced in extent-release-ordering.test.ts. Seed 704 reproduced a flush retaining a group chunk that a concurrent DROP TABLE had released (CI coverage shard 4/7); the ordering is forced in group-chunk-retain-ordering.test.ts."
   ],
   "suites": {
+    "next-execution-retirement": [8850, 8851],
     "sql-conformance": [12648430],
     "sql-mutation-conformance": [],
     "differential": [],
