@@ -466,10 +466,11 @@ export class NativeBodyHost implements TriggerBodyHost {
   applyBodyInput(request: Parameters<TriggerBodyHost["applyBodyInput"]>[0]): Promise<void> {
     return this.#apply(request);
   }
-  applyRootInput(
+  async applyRootInput(
     request: Omit<Parameters<TriggerBodyHost["applyBodyInput"]>[0], "body">,
-  ): Promise<void> {
-    return this.#apply({ ...request, body: null });
+  ): Promise<number> {
+    await this.#apply({ ...request, body: null });
+    return this.#frame(request.command).count;
   }
   #apply(request: Request & { input: TriggerBodyInput; hooks: NativeRowHooks }): Promise<void> {
     const frame = this.#frame(request.command);

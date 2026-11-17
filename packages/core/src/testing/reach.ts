@@ -9998,3 +9998,51 @@ export const NATIVE_SELF_FOLLOW_REACH = [
   "shipped data",
   "zero ownership",
 ] as const;
+
+export const NATIVE_BODY_FOLLOW_GROUP_REACH = [
+  "swap",
+  "rotation",
+  "published",
+  "resident",
+  "23505 before user22012",
+  "parent and child AFTER see complete group",
+  "explicit CASCADE PG boundary",
+  "zero ownership",
+] as const;
+
+export const NATIVE_COMMAND_ROOT_REACH = [
+  "INSERT",
+  "UPDATE",
+  "DELETE",
+  "published",
+  "resident",
+  "zero matches",
+  "rollback",
+  "commit",
+  "atomic row/BEFORE error",
+  "zero ownership",
+] as const;
+
+export const NATIVE_COMMAND_ROOT_LIFETIME_REACH = [
+  "complete end tail",
+  "sealed source continuation",
+  "published",
+  "resident",
+  "zero ownership",
+] as const;
+export const NATIVE_COMMAND_ROOT_FOREIGN_REACH = [
+  "foreign primary refused",
+  "original graph usable",
+  "published",
+  "resident",
+  "zero ownership",
+] as const;
+
+export const NATIVE_COMMAND_ROOT_PRESSURE_REACH = [
+  "published",
+  "resident",
+  "64MiB competing credit",
+  "wide unrelated payload",
+  "bounded files",
+  "zero ownership",
+] as const;

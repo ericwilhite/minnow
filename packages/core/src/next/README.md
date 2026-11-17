@@ -4346,7 +4346,7 @@ adapter in the per-action uniqueness test is synthetic, not a compiled-body proo
 primary preflight still refuses auto-increment and wide/variable indexed domains. Native
 sequence defaults retain their kernel refusal; RI assignments to generated FK columns also
 refuse rather than silently recomputing away the assignment. The compiled COMPLETE-MODIFY body host
-is exercised with actual native RI and user-body ordering; production root admission/setup and
+is exercised with actual native RI and user-body ordering; owner admission/dispatch and
 SQL enablement remain unfinished. SQL firing and advanced-RI refusal guards remain in place.
 No stored format changes.
 
@@ -4535,3 +4535,19 @@ root joins without a resident target-ID collection. Volatile producers, FTS pref
 RETURNING and upsert remain outside this private host's supported preparation boundary.
 Body INSERT remains keyless and VALUES-only; body UPDATE/DELETE remain keyed and refuse FROM/USING,
 as enforced by the shared trigger lowering contract. No existing SQL guard is removed.
+
+### Native command graph assembly
+
+`owner/command-root.ts` installs the real primary, registry, RI executor, compiled body host
+and B6 controller in one already admitted root scope. `run(typedParameters)` seals input and
+returns the affected-row count; `end()` is its sole statement-ending entrypoint. The caller
+commits separately. `close()` cancels and fences the root producer and the complete end tail
+before retiring graph resources. Failed setup cannot close a different installed primary.
+Caller-owned rule bindings, preparation and grants remain caller-owned.
+
+`nativeCommandRootSetupBytes` measures this assembler's setup bound. It excludes caller
+preparation/bindings and complete source, image, binding and writer progress. The funding ports
+must supply that complete admitted work; this helper is not an execution minimum. Owner admission
+and SQL dispatch still keep their guards. Generated PG traces/errors, an actual compiled follow
+observer, foreign-scope/cancellation fences and competing-credit64MiB roots exercise the assembler.
+The initial SUM observer probe hit the existing initPlan refusal; no initPlan capability was added.
