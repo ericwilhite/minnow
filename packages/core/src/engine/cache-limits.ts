@@ -24,6 +24,6 @@ export const MAX_SQL_STRUCTURED_VALUE_DEPTH = 128;
 
 /** SQL patterns compile outside the execution memory budget and may be retained in small caches. */
 export const MAX_SQL_PATTERN_CHARACTERS = 16 * 1024;
-/** Deterministic CPU ceiling for one non-trivial LIKE or SIMILAR TO match. */
+/** Pattern matching step limit. */
 export const MAX_SQL_PATTERN_MATCH_STEPS = 8 * 1024 * 1024;
 export const MAX_SQL_NUMERIC_DIGITS = 100_000;

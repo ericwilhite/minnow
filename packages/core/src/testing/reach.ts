@@ -9481,3 +9481,68 @@ export const REPLAY_MAPPING_MEMORY_REACH = [
   "row ownership outlives cache",
   "zero retained",
 ] as const;
+
+export const SQL_REGEX_MATCH_MODES_REACH = [
+  "astral input",
+  "newline input",
+  "start anchor",
+  "end anchor",
+  "captured substring",
+  "boolean match",
+  "boolean rejection",
+  "zero-width match",
+] as const;
+
+export const SQL_REGEX_WORK_REACH = [
+  "nested repetition",
+  "ambiguous alternation",
+  "repeated wildcards",
+  "nullable end match",
+  "anchored empty cycles",
+] as const;
+
+export const SQL_REGEX_FLAGS_REACH = [
+  "newline mode",
+  "case-sensitive mode",
+  "case-insensitive mode",
+] as const;
+
+export const SQL_REGEX_ACCEPTANCE_REACH = [
+  "long literal match",
+  "long literal alternative",
+  "failed-start cache rollover",
+] as const;
+
+export const SQL_REGEX_GENERATED_REACH = [
+  "nullable",
+  "nested",
+  "alternative",
+  "optional",
+  "sequence",
+  "~",
+  "~*",
+  "!~",
+  "!~*",
+  "start anchor",
+  "end anchor",
+  "Unicode",
+  "astral input",
+  "newline input",
+  "boolean true",
+  "boolean false",
+  "captures compared",
+  "PostgreSQL captures compared",
+  "unmatched capture",
+  "empty match",
+  "typed limit distinct from result",
+] as const;
+
+export const PROTOTYPE_RUN_LIFETIME_REACH = [
+  "already cancelled",
+  "cancelled in flight",
+  "query error",
+  "deferred cleanup",
+  "microtask gap",
+  "task gap",
+  "next observer intact",
+] as const;

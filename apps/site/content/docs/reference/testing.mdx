@@ -995,12 +995,40 @@ remain. Fast-check includes examples in its run budget, so the budget increases 
 14 to 17 to add three examples while preserving all six generated histories. The growth observer is restored and checked alongside the existing
 suspension/restore observers, including abandoned histories.
 
-`event-loop-stalls.test.ts` runs a 1 ms watchdog through the workloads that once held every
-other query for hundreds of milliseconds or minutes — a fold of reordered wide upserts, live
-aggregates patched after large commits, scans over upsert-heavy tables, secondary-index builds
-and their first lookups, a full-text index build, and a 600,000-row write and upsert on OPFS —
-and fails if any stretch the watchdog
-cannot run exceeds 250 ms (750 ms in CI). Each case fails against the code before 0.13.0.
+`sql-regex.test.ts` checks the original four pathological patterns over 1,000 `a`
+characters and a trailing `!` using instruction counts. PostgreSQL supplies each expected
+result: the original `(a*)*$` can match empty at the end, while an additional `^(a*)*$`
+case must fail. These fixtures' complete state-position spaces fit the memo ceiling;
+boolean matching charges duplicate arrivals too and must stay within `(2 × compiled states + 1) × (input length + 1)`
+steps. An observer fails immediately if a backtracking implementation crosses that bound;
+the test's 20-second timeout is unchanged. Additional work guards retain successful 4,096-character
+literals and searches crossing the failed-state cache boundary. A separate check spends all 8,388,608 permitted
+steps and requires the next one to throw. The PostgreSQL corpus checks substring captures
+and boolean results together, including empty matches, anchors, newlines, and astral text.
+This checks algorithmic work, rather than a wall-time guarantee on a loaded host.
+
+`event-loop-stalls.test.ts` runs a 1 ms watchdog through reordered wide upserts, live
+aggregate updates, scans over upsert-heavy tables, secondary-index builds and their first
+lookups, a full-text index build, and key-forward maintenance. These checks retain their
+250 ms limit (750 ms in CI). The 600,000-row OPFS write and upsert instead counts work
+between real `MessageChannel` tasks: one unit per 1,024 source-field or descriptor reads,
+per generator step, or per 64 KiB of synchronous storage transfers. It retains a bound of
+250 units (750 in CI), drives the existing slice clock with those units, and checks that
+all three counters and real task boundaries were exercised. This removes host pauses from
+the assertion while still rejecting a scheduler that only yields to microtasks. The counted
+check uses the OPFS simulator; it does not establish browser latency or bound uncounted
+computation. `scripts/stall-survey.mts` measures real elapsed stalls.
+
+The unexported executor's aggregate step-peak properties also count physical pipeline
+operations instead of aborting valid wide-key histories after 30 seconds. They retain their
+180-second test deadline, generated dimensions, examples, and run counts. They propagate the
+test runner's cancellation signal and await asynchronous cleanup before restoring prototype
+observers. A generated lifetime check covers cancellation, query failure, and deferred cleanup
+across microtask and task boundaries. The pool properties compare every held lease's bytes
+with an independent fixture after every step using a native exact comparison. The console
+snippet checks reuse unchanged parsed declarations and the previous TypeScript program;
+changed snippet text still receives full syntactic and semantic diagnostics.
+
 `checkpoint-slicing.test.ts` pins that a multi-slice OPFS checkpoint gives the event loop turns
 between its slot writes, publishes exactly the bytes a one-step checkpoint would, and survives
 power loss or a refused write at every one of its file operations, with the refused checkpoint

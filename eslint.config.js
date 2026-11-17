@@ -101,6 +101,8 @@ export default tseslint.config(
       "packages/core/src/next/dependency-rules.test.ts",
       // Reads executor sources to reject variable-size native argument lists. Test only.
       "packages/core/src/next/exec/call-spreads.test.ts",
+      // Exact native byte oracle in a Node-only pool test; no production module imports it.
+      "packages/core/src/next/storage/one-pass-pool.test.ts",
       // Node-only source inventory; no browser or production module imports this fixture.
       "packages/core/src/next/testing/durable-inventory.ts",
       // Independently bundles an older-capability reader; owns its os.tmpdir fixture.

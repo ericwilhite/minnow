@@ -3,7 +3,8 @@
  * for hundreds of milliseconds or minutes: a fold of upserts written in an unrelated order,
  * live aggregates patched after large commits, scans over tables carrying many upserts,
  * secondary-index builds and their first lookups, full-text index builds, and single writes of
- * hundreds of thousands of rows. A watchdog timer records the longest interval it could not run; the
+ * hundreds of thousands of rows. A watchdog timer records the longest interval it could not run in five cases; the OPFS
+ * large-write case counts work between real tasks to avoid host-load noise. The
  * bound is loose enough for a loaded machine and tight enough that a task working through its
  * whole input without yielding fails here. `scripts/stall-survey.mts` measures the real numbers.
  */
@@ -12,6 +13,7 @@ import { MemoryBlockStore } from "../storage/index.js";
 import { OpfsBlockStore } from "../storage/opfs/index.js";
 import { MemoryOpfs } from "../testing/opfs-shim.js";
 import { MinnowDatabase } from "./database.js";
+import { EventLoopWork } from "./event-loop-work.test-support.js";
 import { heavyTestTimeout } from "./storage-test-helpers.js";
 
 vi.setConfig({ testTimeout: heavyTestTimeout(120_000) });
@@ -188,35 +190,50 @@ describe("background work never holds the event loop", () => {
   });
 
   it("writes and upserts 600,000 rows on OPFS in short slices", async () => {
-    const store = await OpfsBlockStore.open({ name: "large-write", root: new MemoryOpfs().root });
+    const shim = new MemoryOpfs();
+    const work = new EventLoopWork();
+    shim.setTransferLimit((_path, _operation, bytes) => {
+      work.transfer(bytes);
+      return undefined;
+    });
+    const store = await OpfsBlockStore.open({ name: "large-write", root: shim.root });
     const database = new MinnowDatabase(store, { autoCompact: false });
-    await database.createTable({
-      name: "t",
-      uniqueKey: "id",
-      columns: [
-        { name: "id", type: "number" },
-        { name: "label", type: "string" },
-      ],
-    });
-    const batch = (version: number) =>
-      Array.from({ length: 600_000 }, (_, id) => ({
-        id,
-        label: `l-${String(id)}-${String(version)}`,
-      }));
-    const inserted = batch(0);
-    const upserted = batch(1);
-    const stall = await longestStall(async () => {
-      await database.insertBatch("t", inserted);
-      await database.upsertBatch("t", upserted);
-    });
-    expect(stall).toBeLessThan(STALL_BOUND_MS);
-    for (const id of [0, 123_456, 599_999]) {
-      expect(
-        (await database.query("SELECT label FROM t WHERE id = ?", { params: [id] })).rows,
-      ).toEqual([{ label: `l-${String(id)}-1` }]);
+    try {
+      await database.createTable({
+        name: "t",
+        uniqueKey: "id",
+        columns: [
+          { name: "id", type: "number" },
+          { name: "label", type: "string" },
+        ],
+      });
+      const batch = (version: number) =>
+        Array.from({ length: 600_000 }, (_, id) => ({
+          id,
+          label: `l-${String(id)}-${String(version)}`,
+        }));
+      const inserted = work.rows(batch(0));
+      const upserted = work.rows(batch(1));
+      const measured = await work.measure(async () => {
+        await database.insertBatch("t", inserted);
+        await database.upsertBatch("t", upserted);
+      });
+      // Keep the original 250/750 bound, now in counted work units rather than host milliseconds.
+      expect(measured.largest).toBeLessThan(STALL_BOUND_MS);
+      expect(measured.fields).toBeGreaterThanOrEqual(1_200_000);
+      expect(measured.steps).toBeGreaterThan(0);
+      expect(measured.bytes).toBeGreaterThan(0);
+      expect(measured.turns).toBeGreaterThan(1);
+      for (const id of [0, 123_456, 599_999]) {
+        expect(
+          (await database.query("SELECT label FROM t WHERE id = ?", { params: [id] })).rows,
+        ).toEqual([{ label: `l-${String(id)}-1` }]);
+      }
+    } finally {
+      shim.setTransferLimit(null);
+      await database.close();
+      store.close();
     }
-    await database.close();
-    store.close();
   });
 
   it("builds a full-text index in short slices", async () => {

@@ -60,6 +60,11 @@ const declarations = new Map(
 );
 declarations.set("/playground.d.ts", playgroundDeclarations(retailSchema));
 
+// Keep the editor's immutable declaration trees between edits. Every diagnosis still checks
+// all declarations (no skipLibCheck); only unchanged parsing and program structure are reused.
+const parsedSources = new Map<string, ts.SourceFile>();
+let previousProgram: ts.Program | undefined;
+
 function diagnose(code: string): string[] {
   const entry = "/snippet.ts";
   const sources = new Map(declarations);
@@ -75,11 +80,14 @@ function diagnose(code: string): string[] {
   const host: ts.CompilerHost = {
     fileExists: (name) => read(name) !== undefined,
     readFile: read,
-    getSourceFile: (name, languageVersion) => {
+    getSourceFile: (name, languageVersion, _onError, shouldCreateNewSourceFile) => {
       const source = read(name);
-      return source === undefined
-        ? undefined
-        : ts.createSourceFile(name, source, languageVersion, true);
+      if (source === undefined) return undefined;
+      const previous = parsedSources.get(name);
+      if (shouldCreateNewSourceFile !== true && previous?.text === source) return previous;
+      const parsed = ts.createSourceFile(name, source, languageVersion, true);
+      parsedSources.set(name, parsed);
+      return parsed;
     },
     getDefaultLibFileName: (compilerOptions) =>
       path.join(libDir, ts.getDefaultLibFileName(compilerOptions)),
@@ -90,7 +98,8 @@ function diagnose(code: string): string[] {
     getNewLine: () => "\n",
   };
 
-  const program = ts.createProgram([entry, "/playground.d.ts"], options, host);
+  const program = ts.createProgram([entry, "/playground.d.ts"], options, host, previousProgram);
+  previousProgram = program;
   return [...program.getSemanticDiagnostics(), ...program.getSyntacticDiagnostics()].map(
     (diagnostic) => {
       const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, " ");

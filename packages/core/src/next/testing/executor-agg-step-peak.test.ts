@@ -18,6 +18,7 @@ import { Pool } from "../exec/spill-pool.js";
 import { oracleRows } from "./differential-adapter.js";
 import type { NextStatementResult } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
+import { PrototypeRuns } from "./prototype-runs.test-support.js";
 // eslint-disable-next-line @typescript-eslint/unbound-method -- original receiver supplied
 const reserve = QueryRuntime.prototype.reserve;
 // eslint-disable-next-line @typescript-eslint/unbound-method -- original receiver supplied
@@ -38,86 +39,62 @@ function resultRows(result: NextStatementResult) {
   if (!("batches" in result)) throw new Error("missing aggregate rows");
   return oracleRows(result);
 }
-afterEach(() => vi.restoreAllMocks());
-it.each(seedsFor("next-agg-step-peak", [0xb795, 0xb796]))(
+const runs = new PrototypeRuns();
+afterEach(async () => {
+  await runs.settled();
+  vi.restoreAllMocks();
+});
+it.for(seedsFor("next-agg-step-peak", [0xb795, 0xb796]))(
   "shares restore peak seed%i",
-  async (seed) => {
-    const core = await new StorageCore().open(),
-      pg = new PGlite();
-    const reach = createReach("aggregate physical step peak", AGG_STEP_PEAK_REACH);
-    try {
-      await pg.waitReady;
-      await fc.assert(
-        fc.asyncProperty(
-          fc.integer({ min: 1, max: 16 }),
-          fc.integer({ min: 900000, max: 1100000 }),
-          fc.integer({ min: 6, max: 12 }),
-          fc.boolean(),
-          fc.boolean(),
-          fc.boolean(),
-          fc.boolean(),
-          async (keys, bytes, rows, unicode, cancel, distinct, prefix) => {
-            reach.beginHistory();
-            const governor = new Governor(256 << 20);
-            let blocker = await governor.admit({
-              label: "pinned competing holder",
-              minimumBytes: 0,
-              spillable: true,
-            });
-            const abort = new AbortController(),
-              mocks: Array<{ mockRestore(): void }> = [];
-            let occupied = false,
-              restored = false,
-              shared = false;
-            const observed = { liveKey: false, savedPrefix: false };
-            const timer = setTimeout(
-              () => abort.abort(new Error("aggregate step progress deadline")),
-              30000,
-            );
-            try {
-              mocks.push(
-                vi.spyOn(QueryRuntime.prototype, "reserve").mockImplementation(async function (
-                  this: QueryRuntime,
-                  ...args
-                ) {
-                  await reserve.apply(this, args);
-                  if (this.request.governor === governor && !occupied && !(prefix && !distinct)) {
-                    expect(
-                      blocker.allocate(
-                        governor.capBytes - governor.reserveBytes - governor.usedBytes,
-                      ),
-                    ).toBe(true);
-                    occupied = true;
-                  }
-                }),
-              );
-              const pin = { next: false };
-              mocks.push(
-                vi.spyOn(HybridAggregateOperator.prototype, "push").mockImplementation(function (
-                  this: HybridAggregateOperator,
-                  ...args
-                ) {
-                  const result = hybridPush.apply(this, args);
-                  if (prefix && !distinct && !occupied) {
-                    pin.next = true;
-                    return "blocked";
-                  }
-                  return result;
-                }),
-              );
-              mocks.push(
-                vi
-                  .spyOn(HybridAggregateOperator.prototype, "ready")
-                  .mockImplementation(async function (this: HybridAggregateOperator) {
-                    await hybridReady.call(this);
-                    if (pin.next) {
-                      pin.next = false;
-                      expect(
-                        blocker.allocate(
-                          governor.capBytes - governor.reserveBytes - governor.usedBytes,
-                        ),
-                      ).toBe(true);
-                      await blocker.reclaimRoom?.(1, abort.signal);
+  { timeout: 180000 },
+  async (seed, { signal: testSignal }) =>
+    runs.run(async () => {
+      const core = await new StorageCore().open(),
+        pg = new PGlite();
+      const reach = createReach("aggregate physical step peak", AGG_STEP_PEAK_REACH);
+      try {
+        await pg.waitReady;
+        await fc.assert(
+          fc.asyncProperty(
+            fc.integer({ min: 1, max: 16 }),
+            fc.integer({ min: 900000, max: 1100000 }),
+            fc.integer({ min: 6, max: 12 }),
+            fc.boolean(),
+            fc.boolean(),
+            fc.boolean(),
+            fc.boolean(),
+            async (keys, bytes, rows, unicode, cancel, distinct, prefix) => {
+              testSignal.throwIfAborted();
+              reach.beginHistory();
+              const governor = new Governor(256 << 20);
+              let blocker = await governor.admit({
+                label: "pinned competing holder",
+                minimumBytes: 0,
+                spillable: true,
+              });
+              const abort = new AbortController(),
+                mocks: Array<{ mockRestore(): void }> = [];
+              let occupied = false,
+                restored = false,
+                shared = false;
+              const observed = { liveKey: false, savedPrefix: false };
+              const signal = AbortSignal.any([abort.signal, testSignal]);
+              // Bound physical pipeline progress, not elapsed time spent comparing wide keys.
+              // Coverage and host scheduling must not turn valid work into query cancellation.
+              let steps = 0;
+              const progress = () => {
+                if (++steps === 30_001)
+                  abort.abort(new Error("aggregate exceeded 30,000 physical pipeline steps"));
+              };
+              try {
+                mocks.push(
+                  vi.spyOn(QueryRuntime.prototype, "reserve").mockImplementation(async function (
+                    this: QueryRuntime,
+                    ...args
+                  ) {
+                    await reserve.apply(this, args);
+                    progress();
+                    if (this.request.governor === governor && !occupied && !(prefix && !distinct)) {
                       expect(
                         blocker.allocate(
                           governor.capBytes - governor.reserveBytes - governor.usedBytes,
@@ -126,157 +103,201 @@ it.each(seedsFor("next-agg-step-peak", [0xb795, 0xb796]))(
                       occupied = true;
                     }
                   }),
-              );
-              mocks.push(
-                vi.spyOn(GroupCheckpoint.prototype, "save").mockImplementation(function (
-                  this: GroupCheckpoint,
-                  ...args
-                ) {
-                  expect(this.keyCount).toBe((distinct ? keys : 1) + 1);
-                  if (args[1] > 0) observed.savedPrefix = true;
-                  return save.apply(this, args);
-                }),
-              );
-              mocks.push(
-                vi.spyOn(QueryRuntime.prototype, "restorePhase").mockImplementation(async function (
-                  this: QueryRuntime,
-                  ...args
-                ) {
-                  if (this.request.governor !== governor) return restore.apply(this, args);
-                  restored = true;
-                  blocker.close(); // finite competing holder: release for whole phase admission
-                  await restore.apply(this, args);
-                  blocker = await governor.admit({
-                    label: "repinned competing holder",
-                    minimumBytes: 0,
-                    spillable: true,
-                  });
-                  expect(
-                    blocker.allocate(
-                      governor.capBytes - governor.reserveBytes - governor.usedBytes,
-                    ),
-                  ).toBe(true);
-                  reach.reach("repinned after admission");
-                }),
-              );
-              mocks.push(
-                vi.spyOn(Governor.prototype, "admitGroup").mockImplementation(function (
-                  this: Governor,
-                  options,
-                ) {
-                  if (
-                    this === governor &&
-                    options.grants.some((p) => p.label.endsWith("/step-peak"))
-                  ) {
-                    shared = true;
-                    expect(
-                      options.grants
-                        .filter(
-                          (p) => p.label.includes("/aggregate#") && p.label.endsWith("/progress"),
-                        )
-                        .every((p) => p.minimumBytes === 0),
-                    ).toBe(true);
-                  }
-                  return admit.call(this, options);
-                }),
-              );
-              mocks.push(
-                vi.spyOn(SortOperator.prototype, "push").mockImplementation(function (
-                  this: SortOperator,
-                  ...args
-                ) {
-                  if (
-                    restored &&
-                    this.spec.types.at(-1)?.kind === "bytes" &&
-                    this.spec.types.length > 4
-                  ) {
-                    expect(this.profile.mode).toBe("compare");
-                    reach.reach("raw restore pages");
-                  }
-                  return sortPush.apply(this, args);
-                }),
-              );
-              mocks.push(
-                vi.spyOn(Pool.prototype, "trimStep").mockImplementation(function (this: Pool) {
-                  trim.call(this);
-                  if (restored && this.used > 1 << 20) {
-                    observed.liveKey = true;
-                    if (cancel) queueMicrotask(() => abort.abort());
-                  }
-                }),
-              );
-              const prepare = core.executor.prepare.bind(core.executor);
-              mocks.push(
-                vi.spyOn(core.executor, "prepare").mockImplementation((plan) => {
-                  const p = prepare(plan);
-                  return {
-                    ...p,
-                    execute: (r) => p.execute({ ...r, governor, signal: abort.signal }),
-                  };
-                }),
-              );
-              const fields = Array.from(
-                  { length: keys },
-                  (_, i) => `$${String(distinct ? i + 1 : 1)}::text k${String(i)}`,
-                ),
-                group = Array.from({ length: keys }, (_, i) => `k${String(i)}`);
-              const sql = `SELECT i,count(*) n,sum(i) s,avg(i)::float8 a,min(i) lo,max(i) hi FROM (SELECT ${fields.join(",")},i FROM generate_series(1,${String(rows)})g(i))q GROUP BY ${group.join(",")},i ORDER BY i`;
-              const value = unicode ? "汉".repeat(Math.floor(bytes / 3)) : "x".repeat(bytes);
-              const args = distinct
-                ? Array.from({ length: keys }, (_, i) => value + String(i))
-                : [value];
-              if (cancel) {
-                await expect(core.execute(sql, args)).rejects.toMatchObject({ sqlState: "57014" });
-                reach.reach("cancel live key");
-              } else {
-                expect(resultRows(await core.execute(sql, args))).toEqual(
-                  (await pg.query(sql, args)).rows,
                 );
-                reach.reach("PG exact");
+                const pin = { next: false };
+                mocks.push(
+                  vi.spyOn(HybridAggregateOperator.prototype, "push").mockImplementation(function (
+                    this: HybridAggregateOperator,
+                    ...args
+                  ) {
+                    progress();
+                    const result = hybridPush.apply(this, args);
+                    if (prefix && !distinct && !occupied) {
+                      pin.next = true;
+                      return "blocked";
+                    }
+                    return result;
+                  }),
+                );
+                mocks.push(
+                  vi
+                    .spyOn(HybridAggregateOperator.prototype, "ready")
+                    .mockImplementation(async function (this: HybridAggregateOperator) {
+                      progress();
+                      await hybridReady.call(this);
+                      if (pin.next) {
+                        pin.next = false;
+                        expect(
+                          blocker.allocate(
+                            governor.capBytes - governor.reserveBytes - governor.usedBytes,
+                          ),
+                        ).toBe(true);
+                        await blocker.reclaimRoom?.(1, signal);
+                        expect(
+                          blocker.allocate(
+                            governor.capBytes - governor.reserveBytes - governor.usedBytes,
+                          ),
+                        ).toBe(true);
+                        occupied = true;
+                      }
+                    }),
+                );
+                mocks.push(
+                  vi.spyOn(GroupCheckpoint.prototype, "save").mockImplementation(function (
+                    this: GroupCheckpoint,
+                    ...args
+                  ) {
+                    progress();
+                    expect(this.keyCount).toBe((distinct ? keys : 1) + 1);
+                    if (args[1] > 0) observed.savedPrefix = true;
+                    return save.apply(this, args);
+                  }),
+                );
+                mocks.push(
+                  vi
+                    .spyOn(QueryRuntime.prototype, "restorePhase")
+                    .mockImplementation(async function (this: QueryRuntime, ...args) {
+                      if (this.request.governor !== governor) return restore.apply(this, args);
+                      progress();
+                      restored = true;
+                      blocker.close(); // finite competing holder: release for whole phase admission
+                      await restore.apply(this, args);
+                      blocker = await governor.admit({
+                        label: "repinned competing holder",
+                        minimumBytes: 0,
+                        spillable: true,
+                      });
+                      expect(
+                        blocker.allocate(
+                          governor.capBytes - governor.reserveBytes - governor.usedBytes,
+                        ),
+                      ).toBe(true);
+                      reach.reach("repinned after admission");
+                    }),
+                );
+                mocks.push(
+                  vi.spyOn(Governor.prototype, "admitGroup").mockImplementation(function (
+                    this: Governor,
+                    options,
+                  ) {
+                    if (
+                      this === governor &&
+                      options.grants.some((p) => p.label.endsWith("/step-peak"))
+                    ) {
+                      shared = true;
+                      expect(
+                        options.grants
+                          .filter(
+                            (p) => p.label.includes("/aggregate#") && p.label.endsWith("/progress"),
+                          )
+                          .every((p) => p.minimumBytes === 0),
+                      ).toBe(true);
+                    }
+                    return admit.call(this, options);
+                  }),
+                );
+                mocks.push(
+                  vi.spyOn(SortOperator.prototype, "push").mockImplementation(function (
+                    this: SortOperator,
+                    ...args
+                  ) {
+                    progress();
+                    if (
+                      restored &&
+                      this.spec.types.at(-1)?.kind === "bytes" &&
+                      this.spec.types.length > 4
+                    ) {
+                      expect(this.profile.mode).toBe("compare");
+                      reach.reach("raw restore pages");
+                    }
+                    return sortPush.apply(this, args);
+                  }),
+                );
+                mocks.push(
+                  vi.spyOn(Pool.prototype, "trimStep").mockImplementation(function (this: Pool) {
+                    progress();
+                    trim.call(this);
+                    if (restored && this.used > 1 << 20) {
+                      observed.liveKey = true;
+                      if (cancel) queueMicrotask(() => abort.abort());
+                    }
+                  }),
+                );
+                const prepare = core.executor.prepare.bind(core.executor);
+                mocks.push(
+                  vi.spyOn(core.executor, "prepare").mockImplementation((plan) => {
+                    const p = prepare(plan);
+                    return {
+                      ...p,
+                      execute: (r) => p.execute({ ...r, governor, signal }),
+                    };
+                  }),
+                );
+                const fields = Array.from(
+                    { length: keys },
+                    (_, i) => `$${String(distinct ? i + 1 : 1)}::text k${String(i)}`,
+                  ),
+                  group = Array.from({ length: keys }, (_, i) => `k${String(i)}`);
+                const sql = `SELECT i,count(*) n,sum(i) s,avg(i)::float8 a,min(i) lo,max(i) hi FROM (SELECT ${fields.join(",")},i FROM generate_series(1,${String(rows)})g(i))q GROUP BY ${group.join(",")},i ORDER BY i`;
+                const value = unicode ? "汉".repeat(Math.floor(bytes / 3)) : "x".repeat(bytes);
+                const args = distinct
+                  ? Array.from({ length: keys }, (_, i) => value + String(i))
+                  : [value];
+                if (cancel) {
+                  await expect(core.execute(sql, args)).rejects.toMatchObject({
+                    sqlState: "57014",
+                  });
+                  reach.reach("cancel live key");
+                } else {
+                  expect(resultRows(await core.execute(sql, args))).toEqual(
+                    (await pg.query(sql, args)).rows,
+                  );
+                  reach.reach("PG exact");
+                }
+                testSignal.throwIfAborted();
+                expect(steps).toBeGreaterThan(0);
+                expect(steps).toBeLessThanOrEqual(30_000);
+                expect(occupied).toBe(true);
+                if (prefix && !distinct) expect(observed.savedPrefix).toBe(true);
+                if (observed.savedPrefix) reach.reach("saved prefix");
+                expect(restored).toBe(true);
+                expect(shared).toBe(true);
+                if (observed.liveKey) reach.reach("trim live key");
+                reach.reach(distinct ? "distinct keys" : "repeated keys");
+                reach.reach("restore");
+                reach.reach("shared peak");
+                reach.reach(unicode ? "UTF8" : "ASCII");
+                if (keys === 1) reach.reach("one logical wide key");
+                if (keys === 16) reach.reach("sixteen logical keys");
+              } finally {
+                for (const mock of mocks.reverse()) mock.mockRestore();
+                blocker.close();
+                expect(governor.usedBytes).toBe(0);
+                expect(core.spill.bytesInUse).toBe(0);
+                reach.reach("zero");
               }
-              expect(occupied).toBe(true);
-              if (prefix && !distinct) expect(observed.savedPrefix).toBe(true);
-              if (observed.savedPrefix) reach.reach("saved prefix");
-              expect(restored).toBe(true);
-              expect(shared).toBe(true);
-              if (observed.liveKey) reach.reach("trim live key");
-              reach.reach(distinct ? "distinct keys" : "repeated keys");
-              reach.reach("restore");
-              reach.reach("shared peak");
-              reach.reach(unicode ? "UTF8" : "ASCII");
-              if (keys === 1) reach.reach("one logical wide key");
-              if (keys === 16) reach.reach("sixteen logical keys");
-            } finally {
-              clearTimeout(timer);
-              for (const mock of mocks.reverse()) mock.mockRestore();
-              blocker.close();
-              expect(governor.usedBytes).toBe(0);
-              expect(core.spill.bytesInUse).toBe(0);
-              reach.reach("zero");
-            }
+            },
+          ),
+          {
+            seed,
+            numRuns: 16,
+            examples: [
+              [1, 1100000, 6, false, false, false, false],
+              [16, 1100000, 8, true, false, false, true],
+              [16, 1100000, 8, false, true, false, true],
+              [8, 1100000, 6, false, false, true, false],
+              [16, 900000, 6, true, false, true, false],
+              [12, 1100000, 6, false, true, true, false],
+            ],
           },
-        ),
-        {
-          seed,
-          numRuns: 16,
-          examples: [
-            [1, 1100000, 6, false, false, false, false],
-            [16, 1100000, 8, true, false, false, true],
-            [16, 1100000, 8, false, true, false, true],
-            [8, 1100000, 6, false, false, true, false],
-            [16, 900000, 6, true, false, true, false],
-            [12, 1100000, 6, false, true, true, false],
-          ],
-        },
-      );
-      reach.assertReached();
-    } finally {
-      vi.restoreAllMocks();
-      await core.close();
-      await pg.close();
-    }
-  },
-  180000,
+        );
+        reach.assertReached();
+      } finally {
+        vi.restoreAllMocks();
+        await core.close();
+        await pg.close();
+      }
+    }),
 );
 
 it.each(seedsFor("next-agg-packed-bindings", [0xb797, 0xb798]))(

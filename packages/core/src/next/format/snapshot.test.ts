@@ -241,6 +241,10 @@ it("keeps a pending sink charged through close and releases a reader closed whil
   const budget = new Budget();
   let unblock!: () => void,
     block = false;
+  let enterSink!: () => void;
+  const sinkEntered = new Promise<void>((resolve) => {
+    enterSink = resolve;
+  });
   const writer = await SnapshotStreamWriter.open(
     { id: new Uint8Array(16), sourceLsn: 0 },
     {
@@ -248,6 +252,7 @@ it("keeps a pending sink charged through close and releases a reader closed whil
         block
           ? new Promise<void>((resolve) => {
               unblock = resolve;
+              enterSink();
             })
           : undefined,
     },
@@ -255,7 +260,8 @@ it("keeps a pending sink charged through close and releases a reader closed whil
   );
   block = true;
   const pending = writer.frame(SnapshotKind.catalogBegin, 1, 0, new Uint8Array());
-  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  // Pacing may yield before I/O: wait for the borrowed write itself, not one timer turn.
+  await Promise.race([sinkEntered, pending]);
   writer.close();
   expect(budget.used).toBeGreaterThan(1024);
   unblock();
