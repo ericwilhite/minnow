@@ -1112,9 +1112,10 @@ class Connection {
             frames: result.frames,
           });
       },
-      (error) => {
+      (error, version) => {
         initial = false;
-        this.post({ t: "error", seq: request.seq, error: toWireError(error) });
+        // The runtime already admitted and prepared this bounded diagnostic and its clone.
+        this.post({ t: "error", seq: request.seq, error, liveVersion: version });
       },
       () => {
         this.#live.delete(request.seq);

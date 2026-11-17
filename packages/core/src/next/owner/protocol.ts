@@ -649,6 +649,8 @@ export interface Failure {
   readonly t: "error";
   readonly seq: number;
   readonly error: WireError;
+  /** Live errors use the same bounded ACK window; returning credit accepts no newer data. */
+  readonly liveVersion?: number;
 }
 
 /**

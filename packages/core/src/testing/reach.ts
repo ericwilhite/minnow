@@ -10661,6 +10661,23 @@ export const LIVE_PUBLICATION_REACH = [
   "zero charges",
 ] as const;
 
+export const LIVE_ERROR_REACH = [
+  "error baseline evictable",
+  "diagnostic admission retirement",
+  "one unacknowledged error",
+  "error burst coalesced",
+  "error memory bounded",
+  "same-row ready recovery",
+  "error ACK preserves accepted rekeys",
+  "error callback rejection isolated",
+  "error refresh reset",
+  "error reconnect reset",
+  "error owner-change reset",
+  "query error",
+  "admission error",
+  "zero charges",
+] as const;
+
 export const LIVE_RUNTIME_REACH = [
   "async delivery rejection",
   "sync delivery rejection",

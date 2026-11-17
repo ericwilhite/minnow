@@ -29,8 +29,13 @@
     "B8 rejected-delivery seeds8826/8827 preserve a decoder rejection before snapshot installation: resource credit may return, but the last accepted result/rekey watermark must not advance."
   ],
   "suites": {
-    "next-execution-retirement": [8850, 8851],
-    "sql-conformance": [12648430],
+    "next-execution-retirement": [
+      8850,
+      8851
+    ],
+    "sql-conformance": [
+      12648430
+    ],
     "sql-mutation-conformance": [],
     "differential": [],
     "concurrency-simulation": [],
@@ -38,20 +43,67 @@
     "compaction-soak": [],
     "compaction-soak-snapshots": [],
     "partitioned-compaction-soak": [],
-    "auto-compaction-soak": [26172526, 756656541, 1271068371],
-    "interaction-simulator": [
-      24301, 61935, 608135839, 3084996986, 2654435792, 608135840, 3084996987, 1349451771,
-      2654435807, 2779118408, 2779075658, 16053, 2779093776, 720016, 740013, 740037, 750001, 89
+    "auto-compaction-soak": [
+      26172526,
+      756656541,
+      1271068371
     ],
-    "interaction-simulator-rekeying": [800002, 800011, 800017, 800024, 800027, 800037, 800040],
-    "interaction-simulator-schema": [4, 2, 9, 109, 116, 144, 145, 159, 500, 503, 3, 5, 6],
+    "interaction-simulator": [
+      24301,
+      61935,
+      608135839,
+      3084996986,
+      2654435792,
+      608135840,
+      3084996987,
+      1349451771,
+      2654435807,
+      2779118408,
+      2779075658,
+      16053,
+      2779093776,
+      720016,
+      740013,
+      740037,
+      750001,
+      89
+    ],
+    "interaction-simulator-rekeying": [
+      800002,
+      800011,
+      800017,
+      800024,
+      800027,
+      800037,
+      800040
+    ],
+    "interaction-simulator-schema": [
+      4,
+      2,
+      9,
+      109,
+      116,
+      144,
+      145,
+      159,
+      500,
+      503,
+      3,
+      5,
+      6
+    ],
     "block-format-properties": [],
     "index-oracle": [],
     "live-oracle": [],
     "compaction-interleave": [],
     "fts-oracle": [],
-    "live-differential": [213708905],
-    "next-write-extent-deltas": [701, 704],
+    "live-differential": [
+      213708905
+    ],
+    "next-write-extent-deltas": [
+      701,
+      704
+    ],
     "live-correctness": [],
     "key-forwards": [],
     "json-values": [],
@@ -62,17 +114,48 @@
     "temp-owner-lifecycle": [],
     "differential-harness": [],
     "next-live-publication": [],
-    "next-live-commit-oracle": [8804, 8805],
+    "next-live-commit-oracle": [
+      8804,
+      8805
+    ],
     "next-live-runtime": [],
-    "next-live-rekey-history": [8806, 8807],
+    "next-live-rekey-history": [
+      8806,
+      8807
+    ],
     "next-live-late-registration": [],
-    "next-live-missed-notification": [8810, 8811],
-    "next-live-row-values": [8840, 8841],
-    "next-live-cleanup-fence": [8812, 8813],
+    "next-live-missed-notification": [
+      8810,
+      8811
+    ],
+    "next-live-row-values": [
+      8840,
+      8841
+    ],
+    "next-live-cleanup-fence": [
+      8812,
+      8813
+    ],
     "next-live-pressure": [],
-    "next-live-rejected-delivery": [8826, 8827],
-    "next-live-observer-reentry": [8860, 8861],
-    "next-live-dispatch": [8862, 8863],
-    "next-live-effect-integration": [8864, 8865]
+    "next-live-rejected-delivery": [
+      8826,
+      8827
+    ],
+    "next-live-observer-reentry": [
+      8860,
+      8861
+    ],
+    "next-live-dispatch": [
+      8862,
+      8863
+    ],
+    "next-live-effect-integration": [
+      8864,
+      8865
+    ],
+    "next-live-errors": [
+      8828,
+      8829
+    ]
   }
 }

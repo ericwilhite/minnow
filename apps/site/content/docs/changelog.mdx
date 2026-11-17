@@ -47,7 +47,10 @@ Only committed changes invalidate queries; rollback and savepoint rollback disca
 Disposal drains native admission, execution and sizing cleanup through a separate resource fence;
 commit, durability and result-outcome boundaries are unchanged. Decoder errors preserve the
 last accepted result and rekey watermark, so later updates can recover without losing notices.
-Slow subscribers keep one pending update and coalesce later commits. The owner bounds retained
+Slow subscribers keep one unacknowledged result or error and coalesce later commits.
+Recovery clears an error even when the successful query returns the previous rows. Live error
+diagnostics omit stacks and bound copied details; oversized or refused diagnostics report
+SQLSTATE `53200` while preserving the last good rows. The owner bounds retained
 results and rekey history through memory accounting. Table-qualified rekey notices come from
 accepted UPDATEs while the owner can cover the subscriber's gap. If that history is evicted,
 the owner changes, the catalog changes, or a snapshot replaces the database, delivery explicitly

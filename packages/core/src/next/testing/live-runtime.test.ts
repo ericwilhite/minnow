@@ -2,83 +2,13 @@ import { LiveRuntime } from "../live/runtime.js";
 import { afterAll, describe, expect, it } from "vitest";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { createReach, LIVE_RUNTIME_REACH } from "../../testing/reach.js";
-import { createLowerer } from "../lower/create.js";
-import { chunkReads } from "../exec/scan.js";
-import { composeEngine } from "../owner/compose.js";
-import { ProtocolClient, type ClientLiveHandle } from "../owner/client.js";
-import { OwnerServer } from "../owner/server.js";
-import { MemorySpillService } from "../spill/memory-spill.js";
-import { Governor } from "../memory/governor.js";
+import type { ClientLiveHandle } from "../owner/client.js";
 import { decodeColumn } from "../write/columns.js";
-import { Harness, autocommit, batch, texts } from "../write/test-support.js";
+import { autocommit, batch, texts } from "../write/test-support.js";
+import { setup, until } from "./live-runtime.test-support.js";
 
 const reach = createReach("next-live-runtime", LIVE_RUNTIME_REACH);
 afterAll(() => reach.assertReached());
-async function until(check: () => boolean): Promise<void> {
-  const deadline = Date.now() + 10000;
-  while (!check()) {
-    if (Date.now() > deadline) throw new Error("Live result did not settle");
-    await new Promise((resolve) => setTimeout(resolve, 2));
-  }
-}
-async function setup(cap?: number) {
-  const h = new Harness("strict", "memory");
-  if (cap !== undefined) Object.defineProperty(h, "governor", { value: new Governor(cap) });
-  await h.open();
-  const spill = new MemorySpillService();
-  let engine = composeEngine({
-    planner: createLowerer(),
-    writePath: h.path,
-    governor: h.governor,
-    spill,
-    reads: chunkReads,
-  });
-  let server = new OwnerServer(engine, { ownerId: "live-1", epoch: 1, build: "test" });
-  const client = new ProtocolClient();
-  const ports: MessagePort[] = [];
-  async function connect(reconnect = false) {
-    const { port1, port2 } = new MessageChannel();
-    ports.push(port1, port2);
-    server.accept(port1);
-    if (reconnect) await client.reconnect(port2);
-    else await client.connect(port2);
-  }
-  await connect();
-  return {
-    h,
-    client,
-    get engine() {
-      return engine;
-    },
-    reconnect: () => connect(true),
-    async changeOwner() {
-      const stop = server.quiesce("closing");
-      await stop.drained;
-      stop.finish();
-      await engine.close();
-      await h.close();
-      await h.open();
-      engine = composeEngine({
-        planner: createLowerer(),
-        writePath: h.path,
-        governor: h.governor,
-        spill,
-        reads: chunkReads,
-      });
-      server = new OwnerServer(engine, { ownerId: "live-2", epoch: 2, build: "test" });
-      await connect(true);
-    },
-    async close() {
-      client.close();
-      const stop = server.quiesce("closing");
-      await stop.drained;
-      stop.finish();
-      for (const port of ports) port.close();
-      await engine.close();
-      await h.close();
-    },
-  };
-}
 
 describe("native live-query runtime and MessageChannel transport", () => {
   it("releases failed delivery credit and permits the same result on refresh", async () => {

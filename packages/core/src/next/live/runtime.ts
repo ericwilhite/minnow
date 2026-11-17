@@ -7,7 +7,9 @@ import { MemoryAdmissionError, stringBytes, type MemoryGovernor } from "../memor
 import type { EngineSession, OwnerEngine, PlannedStatement } from "../owner/engine.js";
 import type { FramePayload } from "../owner/frame.js";
 import type { WireColumnMeta, WireValue } from "../owner/protocol.js";
-import { LIVE_UNACKED_DROP_MS } from "./constants.js";
+import type { WireError } from "../owner/errors.js";
+import { prepareLiveError } from "./errors.js";
+import { LIVE_UNACKED_DROP_MS, LIVE_ERROR_SCRATCH_BYTES } from "./constants.js";
 
 export interface LiveDelivery {
   readonly version: number;
@@ -26,7 +28,7 @@ interface Entry {
   readonly sql: string;
   readonly params: readonly WireValue[];
   readonly deliver: (result: LiveDelivery) => void;
-  readonly error: (error: unknown) => void;
+  readonly error: (error: WireError, version: number) => void;
   readonly ended: () => void;
   readonly metadata: number;
   readonly abort: AbortController;
@@ -38,6 +40,8 @@ interface Entry {
   closed: boolean;
   running: boolean;
   waiting: number | null;
+  waitingResult: boolean;
+  errored: boolean;
   sentAt: number;
   acknowledgedLsn: number | null;
   retained: LiveDelivery | null;
@@ -45,7 +49,8 @@ interface Entry {
   stage: LiveDelivery | null;
   stageBytes: number;
   cloneBytes: number;
-  failure: unknown;
+  failure: WireError | null;
+  failureBytes: number;
   failed: boolean;
   session: EngineSession | null;
   plan: PlannedStatement | null;
@@ -115,13 +120,15 @@ export class LiveRuntime {
     this.#cache = governor.registerCache({
       get evictableBytes() {
         let bytes = 0;
-        for (const entry of entries) if (entry.waiting === null) bytes += entry.bytes;
+        for (const entry of entries)
+          if (entry.waiting === null || !entry.waitingResult) bytes += entry.bytes;
         return bytes;
       },
       evict: (wanted) => {
         let freed = 0;
         for (const entry of this.#entries) {
-          if (entry.waiting !== null) continue;
+          // An error delivery owns copy credit, not the last accepted data baseline.
+          if (entry.waiting !== null && entry.waitingResult) continue;
           freed += entry.bytes;
           this.#releaseBaseline(entry);
           if (freed >= wanted) break;
@@ -198,7 +205,8 @@ export class LiveRuntime {
     ended: Entry["ended"],
   ): LiveHandle {
     if (this.#closed) throw new Error("Live runtime is closed");
-    const metadata = 2048 + stringBytes(sql) + valueBytes(params);
+    // Entry state and the bounded cohort/launcher continuations coexist with diagnostic scratch.
+    const metadata = 2560 + LIVE_ERROR_SCRATCH_BYTES + stringBytes(sql) + valueBytes(params);
     this.#charge(metadata);
     let entry: Entry;
     try {
@@ -218,6 +226,8 @@ export class LiveRuntime {
         closed: false,
         running: false,
         waiting: null,
+        waitingResult: false,
+        errored: false,
         sentAt: 0,
         acknowledgedLsn: null,
         retained: null,
@@ -225,7 +235,8 @@ export class LiveRuntime {
         stage: null,
         stageBytes: 0,
         cloneBytes: 0,
-        failure: undefined,
+        failure: null,
+        failureBytes: 0,
         failed: false,
         session: null,
         plan: null,
@@ -238,13 +249,19 @@ export class LiveRuntime {
     this.#schedule();
     return {
       ack: (version, accepted = true) => {
-        if (entry.waiting === version) {
-          if (accepted) entry.acknowledgedLsn = entry.retained?.lsn ?? entry.acknowledgedLsn;
+        if (!entry.closed && entry.waiting === version) {
+          const result = entry.waitingResult;
+          // Returning error credit is not accepting any newer data or rekey watermark.
+          if (result && accepted) {
+            entry.acknowledgedLsn = entry.retained?.lsn ?? entry.acknowledgedLsn;
+            entry.errored = false;
+          }
           entry.waiting = null;
+          entry.waitingResult = false;
           const cloneBytes = entry.cloneBytes;
           entry.cloneBytes = 0;
           // Failed decode is not a seen snapshot. Never suppress its retry against this wire image.
-          if (!accepted) this.#releaseBaseline(entry);
+          if (result && !accepted) this.#releaseBaseline(entry);
           this.#free(cloneBytes);
           this.#schedule();
         }
@@ -276,7 +293,8 @@ export class LiveRuntime {
     if (![...this.#entries].some((entry) => entry.dirty && entry.waiting === null)) return;
     this.#timer = setTimeout(() => {
       this.#timer = null;
-      const work = this.#sweep();
+      // Publish the resource fence before synchronous planning/admission can retire the owner.
+      const work = Promise.resolve().then(() => this.#sweep());
       this.#work = work;
       void work.finally(() => {
         if (this.#work === work) this.#work = null;
@@ -311,7 +329,71 @@ export class LiveRuntime {
     this.#free(entry.dependencyBytes);
     entry.dependencyBytes = bytes;
   }
+  #prepareFailure(entry: Entry, error: unknown): void {
+    if (entry.closed) return;
+    if (entry.waiting !== null) {
+      entry.dirty = true;
+      return;
+    }
+    // Admission can reenter close(). Keep the prepaid scratch alive until preparation returns.
+    const running = entry.running;
+    entry.running = true;
+    const previous = entry.failureBytes;
+    entry.failure = null;
+    entry.failureBytes = 0;
+    entry.failed = false;
+    let bytes = 0;
+    try {
+      this.#free(previous);
+      const prepared = prepareLiveError(error, (wanted) => {
+        if (entry.closed) return false;
+        try {
+          this.#charge(wanted);
+          bytes = wanted;
+          return true;
+        } catch {
+          return false;
+        }
+      });
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- diagnostic admission can close the entry reentrantly.
+      if (entry.closed) this.#free(bytes);
+      else {
+        entry.failure = prepared;
+        entry.failureBytes = bytes;
+        entry.failed = true;
+      }
+    } finally {
+      entry.running = running;
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- admission callbacks may have closed this entry.
+      if (entry.closed && !entry.running) this.#retire(entry);
+    }
+  }
+  #emitFailure(entry: Entry): void {
+    if (entry.closed || entry.waiting !== null || entry.failure === null) return;
+    const error = entry.failure;
+    entry.failure = null;
+    entry.failed = false;
+    entry.cloneBytes = entry.failureBytes;
+    entry.failureBytes = 0;
+    const version = ++this.#version;
+    entry.waiting = version;
+    entry.waitingResult = false;
+    entry.errored = true;
+    entry.sentAt = Date.now();
+    try {
+      entry.error(error, version);
+    } catch {
+      // A direct consumer can ACK or close reentrantly, then throw.
+      if (entry.waiting === version) {
+        entry.waiting = null;
+        const bytes = entry.cloneBytes;
+        entry.cloneBytes = 0;
+        this.#free(bytes);
+      }
+    }
+  }
   async #sweep(): Promise<void> {
+    if (this.#closed) return;
     this.#sweeping = true;
     // Per-entry metadata prepays this bounded cohort and eight worker continuations.
     const cohort = [...this.#entries].filter((entry) => entry.dirty && entry.waiting === null);
@@ -323,6 +405,7 @@ export class LiveRuntime {
     try {
       const durable = this.engine.durable(lsn);
       if (durable !== null) await durable;
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- close can run during durability/admission.
       if (this.#closed) return;
       // No await between these pins: every session captures the same committed state.
       for (const entry of cohort) {
@@ -336,8 +419,7 @@ export class LiveRuntime {
           if (entry.plan.kind !== "query") throw new TypeError("Live queries require SELECT");
           this.#dependencies(entry, entry.plan);
         } catch (error) {
-          entry.failure = error;
-          entry.failed = true;
+          this.#prepareFailure(entry, error);
         }
       }
       let next = 0;
@@ -354,18 +436,13 @@ export class LiveRuntime {
         if (entry.closed) continue;
         entry.running = false;
         if (entry.failed) {
-          entry.failed = false;
-          try {
-            entry.error(entry.failure);
-          } catch {
-            /* Consumer isolation. */
-          }
-          entry.failure = undefined;
+          this.#emitFailure(entry);
           continue;
         }
         const result = entry.stage;
         if (result === null) continue;
         if (
+          !entry.errored &&
           entry.retained !== null &&
           equal(entry.retained.columns, result.columns) &&
           equal(entry.retained.frames, result.frames) &&
@@ -385,11 +462,8 @@ export class LiveRuntime {
           this.#free(entry.stageBytes);
           entry.stageBytes = 0;
           entry.stage = null;
-          try {
-            entry.error(error);
-          } catch {
-            /* Consumer isolation. */
-          }
+          this.#prepareFailure(entry, error);
+          this.#emitFailure(entry);
           continue;
         }
         this.#releaseBaseline(entry);
@@ -398,30 +472,26 @@ export class LiveRuntime {
         entry.stage = null;
         entry.stageBytes = 0;
         entry.waiting = result.version;
+        entry.waitingResult = true;
         entry.sentAt = Date.now();
         try {
           entry.deliver(result);
         } catch (error) {
           entry.waiting = null;
+          entry.waitingResult = false;
           const cloneBytes = entry.cloneBytes;
           entry.cloneBytes = 0;
           this.#releaseBaseline(entry);
           this.#free(cloneBytes);
-          try {
-            entry.error(error);
-          } catch {
-            /* Consumer isolation. */
-          }
+          this.#prepareFailure(entry, error);
+          this.#emitFailure(entry);
         }
       }
     } catch (error) {
       for (const entry of cohort)
         if (!entry.closed) {
-          try {
-            entry.error(error);
-          } catch {
-            /* Consumer isolation. */
-          }
+          this.#prepareFailure(entry, error);
+          this.#emitFailure(entry);
         }
     } finally {
       for (const entry of cohort) {
@@ -447,8 +517,7 @@ export class LiveRuntime {
     try {
       await entry.ready;
     } catch (error) {
-      entry.failure = error;
-      entry.failed = true;
+      this.#prepareFailure(entry, error);
       return;
     }
     let run;
@@ -460,8 +529,7 @@ export class LiveRuntime {
         frameRows: null,
       });
     } catch (error) {
-      entry.failure = error;
-      entry.failed = true;
+      this.#prepareFailure(entry, error);
       return;
     }
     // Observe the rejection while draining the stream; it may fail before next().
@@ -516,12 +584,11 @@ export class LiveRuntime {
       };
       entry.stageBytes = bytes;
     } catch (error) {
-      run.results.cancel(error);
+      this.#prepareFailure(entry, error);
+      run.results.cancel();
       await run.done.catch(() => undefined);
       await run.cleaned?.catch(() => undefined);
       this.#free(bytes);
-      entry.failure = error;
-      entry.failed = true;
     }
   }
   #releaseBaseline(entry: Entry): void {
@@ -533,6 +600,10 @@ export class LiveRuntime {
   #retire(entry: Entry): void {
     if (entry.retired) return;
     entry.retired = true;
+    entry.failure = null;
+    const failureBytes = entry.failureBytes;
+    entry.failureBytes = 0;
+    this.#free(failureBytes);
     this.#releaseBaseline(entry);
     this.#free(entry.cloneBytes);
     entry.cloneBytes = 0;

@@ -24,7 +24,12 @@ site changelog's unreleased section.
   active decoder and one coalesced replacement across reconnects. B6 must cancel stale decoder
   jobs on `onLoading`, check their generation/job token before publishing, and keep their
   allocations charged until those jobs drain. A timeout ends the owner handle after 60 seconds;
-  the client re-subscribes. Native callbacks and error hooks are isolated.
+  the client re-subscribes. Native callbacks and error hooks are isolated. `onError` may also return a promise: resolve
+  after installing the error snapshot, keep its payload charged until replacement/disposal,
+  and isolate downstream listener failures. Error and
+  result deliveries share the same active job and replacement slot. Error acknowledgements
+  release credit without accepting data or advancing the rekey watermark. The next successful
+  read delivers ready even when its rows equal the last good rows.
 - `NativeLiveState` supplies stable loading/ready/error snapshot cells and charged listeners.
   Loading and error keep the last good rows. B6 supplies the row payload's account, refresh
   promise sharing and adapter lifecycle. `LiveRows` supplies unique-key validation, stable row
@@ -56,12 +61,22 @@ or a stored-format change.
 
 The owner charges subscription/parameter/dependency/cohort metadata, native frame capacities,
 retained baselines, previous-row payloads held by diffs, clone credit until acknowledgement,
-and history copies. Live retained
+history copies, bounded diagnostic scratch and error-copy overlap. Live retained
 state uses at most one quarter of ordinary owner capacity. A slow subscriber owns one delivery
-and one dirty watermark. Acknowledged baselines are evictable even during their next execution;
+(result or error) and one dirty watermark. Acknowledged baselines remain evictable during
+an error delivery and their next execution;
 no pin remains between sweeps. Dispose cancels admission/execution and owner close drains it. Internal `Run.cleaned`
 forwards `Execution.settled()`, including deferred launch, program, delivery and sizing-job
-cleanup. `Run.done` alone is the producer/outcome boundary and does not guarantee retirement.
+cleanup. The cohort launcher installs its work fence before synchronous planning/admission,
+so reentrant close cannot resolve with diagnostic scratch still held. `Run.done` alone is the producer/outcome boundary and does not guarantee retirement.
+
+Live diagnostics prepay 16 KiB of bounded sizing/fallback scratch per subscription. Before
+copying diagnostic properties, the owner sizes them and admits three-copy overlap credit.
+Diagnostics are limited to 64 KiB, 32 graph nodes, 64 fields and depth eight (including eight
+cause links). They preserve bounded cloneable own data, codes and SQLSTATE, but omit stacks
+and do not invoke custom diagnostic getters. Oversized, unsupported or refused diagnostics
+become an explicit `MemoryAdmissionError` with SQLSTATE `53200`; the previous good rows remain.
+This bounds failing-query notifications as well as successful updates.
 
 Result retention adopts ordinary fixed allocations through the governor's existing cache
 transfer contract. Progress-backed and mixed growth allocations cannot be adopted. Refusal

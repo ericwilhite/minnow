@@ -142,24 +142,34 @@ export interface ClientLiveOptions {
     generation: number,
     delivery: { readonly reset: boolean; readonly keyChanges: readonly RekeyEffect[] },
   ): void | Promise<void>;
-  onError(error: Error): void;
+  onError(error: Error): void | Promise<void>;
   onLoading?(): void;
 }
 export interface ClientLiveHandle {
   refresh(): void;
   close(): void;
 }
-interface QueuedLiveDelivery {
-  readonly result: ClientResult;
-  readonly version: number;
-  readonly token: number;
-  readonly delivery: { readonly reset: boolean; readonly keyChanges: readonly RekeyEffect[] };
-}
+type QueuedLiveDelivery =
+  | {
+      readonly kind: "result";
+      readonly result: ClientResult;
+      readonly version: number;
+      readonly token: number;
+      readonly delivery: { readonly reset: boolean; readonly keyChanges: readonly RekeyEffect[] };
+    }
+  | {
+      readonly kind: "error";
+      readonly error: Error;
+      readonly version: number | null;
+      readonly token: number;
+    };
+
 interface ClientLiveState {
   readonly sql: string;
   readonly params: readonly WireValue[];
   readonly options: ClientLiveOptions;
   delivering: boolean;
+  initialErrorHandled: boolean;
   queued: QueuedLiveDelivery | null;
   seq: number;
   generation: number;
@@ -631,6 +641,7 @@ export class ProtocolClient {
       params: structuredClone(params),
       options,
       delivering: false,
+      initialErrorHandled: false,
       queued: null,
       seq: -1,
       generation: this.#generation,
@@ -674,12 +685,14 @@ export class ProtocolClient {
       /* Consumer isolation. */
     }
     const token = ++state.token;
+    state.initialErrorHandled = false;
     state.generation = this.#generation;
     const request = this.#request({ t: "subscribe", text: state.sql, params: state.params });
     state.seq = request.seq;
     this.#liveBySeq.set(state.seq, state);
     void request.promise.catch((error: unknown) => {
-      if (!state.closed && state.token === token) this.#liveError(state, error);
+      if (!state.closed && state.token === token && !state.initialErrorHandled)
+        this.#liveError(state, error);
     });
   }
   #restartLives(): void {
@@ -688,12 +701,13 @@ export class ProtocolClient {
       this.#startLive(state);
     }
   }
-  #liveError(state: ClientLiveState, error: unknown): void {
-    try {
-      state.options.onError(error instanceof Error ? error : new Error(String(error)));
-    } catch {
-      /* Consumer isolation. */
-    }
+  #liveError(state: ClientLiveState, error: unknown, version: number | null = null): void {
+    this.#queueLive(state, {
+      kind: "error",
+      error: error instanceof Error ? error : new Error(String(error)),
+      version,
+      token: state.token,
+    });
   }
   #deliverLive(
     state: ClientLiveState,
@@ -701,35 +715,50 @@ export class ProtocolClient {
     version: number,
     delivery: { readonly reset: boolean; readonly keyChanges: readonly RekeyEffect[] },
   ): void {
-    const token = state.token,
-      generation = this.#generation;
+    this.#queueLive(state, { kind: "result", result, version, delivery, token: state.token });
+  }
+  #queueLive(state: ClientLiveState, job: QueuedLiveDelivery): void {
+    if (state.closed || job.token !== state.token) return;
     if (state.delivering) {
-      state.queued = { result, version, delivery, token };
+      state.queued = job;
       return;
     }
+    const generation = this.#generation;
     state.delivering = true;
     let accepted = false;
     void Promise.resolve()
       .then(() => {
-        if (state.closed || token !== state.token) return;
-        return state.options.onResult(result, version, generation, delivery);
+        if (state.closed || job.token !== state.token) return;
+        if (job.kind === "error") return state.options.onError(job.error);
+        return state.options.onResult(job.result, job.version, generation, job.delivery);
       })
       .then(
         () => {
-          accepted = true;
+          accepted = job.kind === "result";
         },
         (error: unknown) => {
-          if (!state.closed && state.token === token) this.#liveError(state, error);
+          // A failed error listener is isolated; it must not recursively enqueue another error.
+          if (job.kind === "result" && !state.closed && state.token === job.token)
+            this.#liveError(state, error);
         },
       )
       .finally(() => {
         state.delivering = false;
-        if (!state.closed && token === state.token && generation === this.#generation)
-          this.#port?.postMessage({ t: "liveAck", target: state.seq, version, accepted });
+        if (
+          job.version !== null &&
+          !state.closed &&
+          job.token === state.token &&
+          generation === this.#generation
+        )
+          this.#port?.postMessage({
+            t: "liveAck",
+            target: state.seq,
+            version: job.version,
+            accepted,
+          });
         const queued = state.queued;
         state.queued = null;
-        if (!state.closed && queued?.token === state.token)
-          this.#deliverLive(state, queued.result, queued.version, queued.delivery);
+        if (!state.closed && queued?.token === state.token) this.#queueLive(state, queued);
       });
   }
 
@@ -1312,7 +1341,7 @@ export class ProtocolClient {
             { reset: message.reset ?? false, keyChanges: message.keyChanges ?? [] },
           );
         } catch (error) {
-          this.#liveError(state, error);
+          this.#liveError(state, error, message.version);
         }
         return;
       }
@@ -1451,6 +1480,17 @@ export class ProtocolClient {
       case "value":
       case "error": {
         const live = this.#liveBySeq.get(message.seq);
+        if (message.t === "error" && live !== undefined && message.liveVersion !== undefined) {
+          if (live.generation !== this.#generation) return;
+          const error = fromWireError(message.error, ownerErrorRegistry);
+          const pending = this.#pending.get(message.seq);
+          if (pending !== undefined) {
+            live.initialErrorHandled = true;
+            this.#fail(pending, error);
+          }
+          this.#liveError(live, error, message.liveVersion);
+          return;
+        }
         if (message.t === "error" && live !== undefined && !this.#pending.has(message.seq)) {
           this.#liveError(live, fromWireError(message.error, ownerErrorRegistry));
           return;
