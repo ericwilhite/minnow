@@ -313,6 +313,7 @@ describe("review B2-p2a #3, #4: strings and ledger keys decode as written", () =
       out.uint(0);
       out.uint(4096);
       for (const n of [MANIFEST_FORMAT_VERSION, 1, 1]) out.uint(n); // format version, sequence, epoch
+      for (const word of [1, 0, 0, 0]) out.u32(word); // manifest14: independent u128LE identity=1
       out.u32(1); // log salt
       for (const n of [1, 1, 1, 1, 0, 0, 10]) out.uint(n); // log, lsn, catalog version, catalog
       out.u32(0);
@@ -333,7 +334,9 @@ describe("review B2-p2a #3, #4: strings and ledger keys decode as written", () =
       out.u8(0); // no staged FTS preparation
       return out.finish();
     };
-    expect(decodeManifestRoot(keysAt(["__proto__", "a"]), UNLIMITED).value.clients).toHaveLength(1);
+    const valid = decodeManifestRoot(keysAt(["__proto__", "a"]), UNLIMITED).value;
+    expect(valid.databaseId).toBe(1n);
+    expect(valid.clients).toHaveLength(1);
     expect(() => decodeManifestRoot(keysAt(["__proto__", "__proto__"]), UNLIMITED)).toThrow(
       ManifestCorruptionError,
     );

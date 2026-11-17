@@ -1,4 +1,4 @@
-/** Independent golden selectors: Stable-ID ROW reader10/writer10, manifest13/commitBody9.
+/** Independent golden selectors: restore identity reader11/writer11, manifest14/commitBody9.
  * These are development bytes, not a supported predecessor or an indexed-query claim.
  */
 import fc from "fast-check";
@@ -30,12 +30,12 @@ for (const seed of seedsFor("next-fts-selectors", [0xb817, 0xb818]))
           const encoded = encodeRootSlot(sequence, payload);
           expect((encoded[10] ?? 0) >>> 5, "u32 capability escape ABI").toBe(7);
           const view = new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength);
-          expect(view.getUint32(16, true), "reader10 ABI").toBe(10);
-          reach.reach("reader10 barrier");
-          expect(view.getUint32(20, true), "writer10 ABI").toBe(10);
-          reach.reach("writer10 barrier");
-          expect(encoded[11], "manifest13 ABI").toBe(11);
-          reach.reach("manifest13 barrier");
+          expect(view.getUint32(16, true), "reader11 ABI").toBe(11);
+          reach.reach("reader11 barrier");
+          expect(view.getUint32(20, true), "writer11 ABI").toBe(11);
+          reach.reach("writer11 barrier");
+          expect(encoded[11], "manifest14 ABI").toBe(12);
+          reach.reach("manifest14 barrier");
           const decoded = decodeRootSlot(encoded);
           expect(decoded?.sequence).toBe(sequence);
           expect(decoded?.root).toEqual(payload);
