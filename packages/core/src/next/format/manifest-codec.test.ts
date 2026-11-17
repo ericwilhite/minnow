@@ -405,6 +405,7 @@ afterAll(() => {
 const manifestRoot: fc.Arbitrary<ManifestRoot> = extents.chain((pool) =>
   fc.record({
     formatVersion: fc.constant(MANIFEST_FORMAT_VERSION),
+    databaseId: fc.constant(1n),
     fts: fc.constant({ checkpoint: null, staged: null }),
     sequence: lsn,
     epoch: lsn,
@@ -685,6 +686,7 @@ describe("manifest codec rules", () => {
     expect(encodeGroupPage(groups.slice(0, GROUPS_PER_PAGE)).length).toBeLessThan(1 << 20);
     const huge: ManifestRoot = {
       formatVersion: MANIFEST_FORMAT_VERSION,
+      databaseId: 1n,
       fts: { checkpoint: null, staged: null },
       sequence: 1,
       epoch: 1,
@@ -763,6 +765,7 @@ describe("manifest codec rules", () => {
     const owner = big;
     const root: ManifestRoot = {
       formatVersion: MANIFEST_FORMAT_VERSION + 1,
+      databaseId: 1n,
       fts: { checkpoint: null, staged: null },
       sequence: 1,
       epoch: 1,
@@ -806,6 +809,7 @@ describe("manifest codec rules", () => {
   it("refuses a root of format 1, written before extent lists (ruling R25)", () => {
     const root: ManifestRoot = {
       formatVersion: 1,
+      databaseId: 1n,
       fts: { checkpoint: null, staged: null },
       sequence: 1,
       epoch: 1,
@@ -835,6 +839,7 @@ describe("manifest codec rules", () => {
     const page = (first: number, count: number) => ({ blob: ref(big), first, count });
     const rootWith = (extentList: ManifestRoot["extentList"]): ManifestRoot => ({
       formatVersion: MANIFEST_FORMAT_VERSION,
+      databaseId: 1n,
       fts: { checkpoint: null, staged: null },
       sequence: 1,
       epoch: 1,

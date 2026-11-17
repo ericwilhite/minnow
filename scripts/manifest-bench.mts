@@ -128,6 +128,7 @@ function manifestRoot(tables: number): ManifestRoot {
   }));
   return {
     formatVersion: MANIFEST_FORMAT_VERSION,
+    databaseId: 1n,
     fts: { checkpoint: null, staged: null },
     sequence: 99,
     epoch: 3,

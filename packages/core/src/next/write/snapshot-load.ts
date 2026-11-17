@@ -3,6 +3,7 @@ import { captureWriterExtents, type CapturedWriterExtents } from "../storage/wri
  * The target factory owns a settled/exclusive owner (no active WritePath or background writers).
  * Publication rejection is indeterminate: close/reopen, never abort possibly published extents.
  */
+import { freshDatabaseIdentity, nextDatabaseIdentity } from "../format/database-identity.js";
 import { indexKeyKind } from "../keys/key-encoding.js";
 import { MemtableMemoryError } from "./bytes.js";
 import { SnapshotIndexes } from "./snapshot-index.js";
@@ -539,6 +540,8 @@ async function loadAttempt(
     listPrepared = true;
     const root: ManifestRoot = {
       formatVersion: MANIFEST_FORMAT_VERSION,
+      databaseId:
+        old === null ? freshDatabaseIdentity(budget) : nextDatabaseIdentity(old.databaseId),
       sequence,
       epoch: target.epoch,
       log: { salt: ((old?.log.salt ?? 0) + 1) >>> 0, firstLsn: lsn + 1, rootSequence: sequence },

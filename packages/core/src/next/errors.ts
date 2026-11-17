@@ -103,3 +103,12 @@ export class UnsupportedPlanError extends Error {
     this.construct = options.construct ?? null;
   }
 }
+
+/** A valid durable identity has no successor; replacement must not wrap it. */
+export class DatabaseIdentityExhaustedError extends Error {
+  readonly code = "MINNOW_DATABASE_ID_EXHAUSTED";
+  constructor() {
+    super("Database restore identity is exhausted; create a fresh database");
+    this.name = "DatabaseIdentityExhaustedError";
+  }
+}

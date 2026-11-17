@@ -104,6 +104,7 @@ export async function buildListedReopenSpace(
       });
       root = {
         formatVersion: MANIFEST_FORMAT_VERSION,
+        databaseId: 1n,
         fts: { checkpoint: null, staged: null },
         sequence,
         epoch: opened.epoch,

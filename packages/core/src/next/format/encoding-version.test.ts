@@ -25,6 +25,7 @@ for (const seed of seedsFor("next-encoding-versions", [0xb502]))
           };
           const root: ManifestRoot = {
             formatVersion: version,
+            databaseId: 1n,
             fts: { checkpoint: null, staged: null },
             sequence: 1,
             epoch: 1,

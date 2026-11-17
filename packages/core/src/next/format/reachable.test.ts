@@ -183,6 +183,7 @@ function fixture(): Fixture {
   // Only the fields the walk reads are meaningful here.
   const root = {
     formatVersion: MANIFEST_FORMAT_VERSION,
+    databaseId: 1n,
     fts: { checkpoint: null, staged: null },
     sequence: 3,
     epoch: 1,

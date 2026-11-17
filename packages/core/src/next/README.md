@@ -4771,3 +4771,20 @@ Canonical storage checks refuse extra fields in IndexedDB byte-index records, re
 LSN bits and padding within the acknowledged region, and invalid extent-list bounds. Invalid
 post-ack WAL bytes remain unreplayable tail. Private metadata and scratch journals still reset
 on open and validate on use; they are not supported durable formats.
+
+### Durable database identity (development manifest 14)
+
+The native manifest carries a required nonzero 128-bit little-endian databaseId after its epoch.
+Native creation seeds it under a charged temporary allocation. Normal checkpoints, merges,
+sequence publications and WAL recycling carry it unchanged. Portable replacement advances the
+target identity, including when the same archive is imported repeatedly. Identity exhaustion
+refuses before publication. The source identity and source/target request outcomes are excluded.
+
+This scalar inherits the manifest's gate and is registered as databaseIdentity. The development
+allocation above reader 10/writer 10/manifest 13 is reader 11/writer 11/manifest 14; WAL body 9 and the
+portable format 1 bytes stay unchanged. No released next/ predecessor exists yet.
+
+The owner must bind sessions and retries to this identity before looking up the request ledger.
+An old database session must receive MINNOW_DATABASE_REPLACED and reopen after replacement;
+reporting an old write as still committed would be misleading because restore removed its effect.
+Owner/public transport wiring is the next stage; this section describes the native foundation.

@@ -53,6 +53,7 @@ export const DURABLE_LONG_KEY_REACH = [
   "partial native tree",
 ] as const;
 export const DURABLE_REGISTRY_REACH = [
+  "databaseIdentity",
   "ftsJournal",
   "ftsRoot",
   "ftsTerms",
@@ -10689,4 +10690,28 @@ export const IDB_ENTRY_ALLOCATION_REACH = [
   "serial page boundary",
   "no key arrays",
   "extra field refused on read",
+] as const;
+
+export const DATABASE_IDENTITY_REACH = [
+  "small",
+  "wide",
+  "successor",
+  "exhaustion",
+  "zero refused",
+  "truncation refused",
+  "funded native seed",
+  "denied seed",
+] as const;
+
+export const DATABASE_IDENTITY_NATIVE_REACH = [
+  "empty database",
+  "empty table",
+  "populated",
+  "OPFS",
+  "IndexedDB",
+  "ordinary publication",
+  "ordinary reopen",
+  "replacement",
+  "same archive again",
+  "replaced reopen",
 ] as const;

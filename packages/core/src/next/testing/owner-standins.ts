@@ -315,6 +315,7 @@ export interface StandinWritePathOptions {
 }
 
 export class StandinWritePath implements WritePath {
+  readonly databaseId = 1n;
   readonly durability: "strict" | "relaxed";
   /**
    * Called with each statement's options as it opens (tests): the stand-in enforces no rules, so a

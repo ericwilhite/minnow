@@ -95,6 +95,7 @@ export function prepareOwnerExport(
   if (!definition) throw new Error("Missing fixture catalog");
   let pins = 0;
   const writePath: WritePath = {
+    databaseId: 1n, // Immutable read-only fixture; no restore/write path.
     durability: "strict",
     appliedLsn: 0,
     durableLsn: 0,

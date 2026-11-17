@@ -1,3 +1,4 @@
+import { readDatabaseIdentity } from "../format/database-identity.js";
 import { encodeFtsJournal, decodeFtsJournal } from "../format/fts-journal.js";
 import { encodeFts, decodeFts, type FtsValues } from "../format/fts-codec.js";
 import {
@@ -131,6 +132,7 @@ const blob: BlobRef = {
 };
 const manifest: ManifestRoot = {
   formatVersion: MANIFEST_FORMAT_VERSION,
+  databaseId: 1n,
   fts: { checkpoint: null, staged: null },
   sequence: 1,
   epoch: 1,
@@ -648,6 +650,14 @@ function adapters(): Record<Exclude<DurableFormatName, "indexedDb">, Adapter> {
       ],
     },
     manifest: { bytes: encodeManifestRoot(manifest), decode: parsed(decodeManifestRoot) },
+    databaseIdentity: {
+      bytes: new Uint8Array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+      decode: (bytes) => {
+        const reader = new MetadataReader(bytes);
+        readDatabaseIdentity(reader);
+        reader.end();
+      },
+    },
     groupRoot: {
       bytes: encodeGroupRoot(root),
       decode: parsed(decodeGroupRoot),

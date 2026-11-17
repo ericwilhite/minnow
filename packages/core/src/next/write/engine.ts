@@ -5,6 +5,7 @@ import {
   capturedWriterReferences,
   type CapturedWriterExtents,
 } from "../storage/writer-extents.js";
+import { freshDatabaseIdentity } from "../format/database-identity.js";
 import type { RetirementInventory } from "../storage/retirement-contract.js";
 import { FtsMutations, type FtsMutationCommit } from "./fts-mutations.js";
 import { ftsMutationScan } from "./fts-undo.js";
@@ -858,6 +859,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         const salt = (crypto.getRandomValues(new Uint32Array(1))[0] ?? 1) >>> 0;
         root = {
           formatVersion: MANIFEST_FORMAT_VERSION,
+          databaseId: freshDatabaseIdentity(metadataBudget),
           fts: { checkpoint: null, staged: null },
           sequence: 1,
           epoch: session.epoch,
@@ -3198,6 +3200,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
       for (const memtable of state.view.memtables)
         if (awaitsFlush(memtable)) total += memtable.bytes;
     return total;
+  }
+
+  get databaseId(): bigint {
+    return this.#root.databaseId;
   }
 
   close(): Promise<void> {
@@ -5568,6 +5574,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     }));
     const next: ManifestRoot = {
       formatVersion: MANIFEST_FORMAT_VERSION,
+      databaseId: this.#root.databaseId,
       fts,
       sequence: this.#root.sequence + 1,
       epoch: this.#session.epoch,
