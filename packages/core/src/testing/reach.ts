@@ -10661,6 +10661,42 @@ export const LIVE_PUBLICATION_REACH = [
   "zero charges",
 ] as const;
 
+export const LIVE_RUNTIME_REACH = [
+  "async delivery rejection",
+  "sync delivery rejection",
+  "rejected delivery rekey continuity",
+  "rejected delivery final value",
+  "result cleanup fence",
+  "catalog identity reset",
+  "missed middle notification",
+  "late registration",
+  "rekey covered",
+  "rekey reset",
+  "rekey owner reset",
+  "row identity reuse",
+  "small cap",
+  "subscribe",
+  "unsubscribe",
+  "window",
+  "commit",
+  "rollback",
+  "reconnect",
+  "owner change",
+  "refresh",
+  "unaffected table",
+  "zero charges",
+] as const;
+
+export const LIVE_ROW_VALUE_REACH = [
+  "retained previous rows",
+  "composite notices",
+  "Date keys",
+  "Date value changes",
+  "captured input",
+  "invalid key refused",
+  "zero charges",
+] as const;
+
 export const LIVE_OBSERVER_REENTRY_REACH = [
   "subscribe",
   "unsubscribe",

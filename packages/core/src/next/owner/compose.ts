@@ -1,3 +1,4 @@
+import { LiveRuntime } from "../live/runtime.js";
 import { StatementRules } from "../exec/statement-rules.js";
 /**
  * The composition root's engine: `OwnerEngine` and `EngineSession` (engine.ts) over the planner
@@ -506,6 +507,14 @@ class ComposedEngine implements CatalogOwnerEngine {
     return lowered.kind === "query" || lowered.kind === "modify" ? lowered.reads : [];
   }
 
+  #live: LiveRuntime | null = null;
+  get live(): LiveRuntime {
+    const feed = this.#options.writePath.changes;
+    if (feed === undefined)
+      throw new TypeError("Native publication feed required for live queries");
+    return (this.#live ??= new LiveRuntime(this, this.#options.governor, feed));
+  }
+
   onCommit(listener: (tables: readonly number[]) => void): () => void {
     const feed = this.#options.writePath.changes;
     if (feed !== undefined)
@@ -557,6 +566,7 @@ class ComposedEngine implements CatalogOwnerEngine {
   }
 
   async close(): Promise<void> {
+    await this.#live?.close();
     try {
       await this.#options.writePath.close();
     } finally {
@@ -657,6 +667,10 @@ class ComposedSession implements EngineSession {
     this.#engine = engine;
     this.#sequenceAccess = guardedSequences(engine.writePath.sequences, () => this.#modes.readOnly);
     this.ledgerSession = { sessionId, generation };
+  }
+
+  get snapshotLsn(): number | undefined {
+    return this.#readPin?.observedLsn;
   }
 
   get transaction(): TransactionState {
@@ -881,6 +895,9 @@ class ComposedSession implements EngineSession {
     return {
       results: run.results,
       done,
+      get cleaned() {
+        return run.cleaned;
+      },
       commits: run.commits,
       // Read live: the composition sets it as the run crosses the commit boundary.
       get reachedCommit() {
@@ -964,6 +981,9 @@ class ComposedSession implements EngineSession {
       );
       return {
         results: execution.results,
+        get cleaned() {
+          return execution.settled?.() ?? execution.delivered;
+        },
         done: this.#abortOnFailure(done),
         reachedCommit: false,
         commits: false,
@@ -998,6 +1018,9 @@ class ComposedSession implements EngineSession {
       .finally(releasePin);
     return {
       results: execution.results,
+      get cleaned() {
+        return execution.settled?.() ?? execution.delivered;
+      },
       done: inReadOnly ? this.#abortOnFailure(done) : done,
       reachedCommit: false,
       commits: false,

@@ -34,7 +34,10 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
   exec: [".", "hash", "vector", "keys", "ir", "memory", "spill", "access", "page"],
   write: [".", "hash", "vector", "keys", "storage", "format", "memory", "access", "page"],
   lower: [".", "ir", "vector", "access"],
+  // B8 is an owner-adjacent consumer; owner references here are contracts only.
+  live: ["access", "memory", "storage", "owner"],
   owner: [
+    "live",
     ".",
     "access",
     "keys",
@@ -51,6 +54,7 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
     "lower",
   ],
   testing: [
+    "live",
     ".",
     "access",
     "keys",
@@ -123,6 +127,8 @@ describe("next/ dependency rules", () => {
       for (const edge of importsOf(file).filter((candidate) => inNext(candidate.target))) {
         const target = moduleOf(edge.target);
         if (target === module) continue;
+        if (module === "live" && target === "owner")
+          expect(edge.typeOnly, "live may depend only on owner contracts").toBe(true);
         // R23.5 owns the worker scheduler here; this is the sole write -> exec exception.
         if (module === "write" && edge.target === join(NEXT, "exec/pipeline.js")) continue;
         expect(allowed, `${relative(SRC, file)} imports next/${target}`).toContain(target);

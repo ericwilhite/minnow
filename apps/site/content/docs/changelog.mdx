@@ -42,6 +42,20 @@ probe recovers missed notifications. Optional owner-session key history is bound
 missing continuity requires an explicit reset. This does not change stored formats, commit
 codecs, ledger outcomes, or released 0.x behavior.
 
+The private 1.0 rebuild adds native commit summaries and an internal live-query runtime.
+Only committed changes invalidate queries; rollback and savepoint rollback discard their effects.
+Disposal drains native admission, execution and sizing cleanup through a separate resource fence;
+commit, durability and result-outcome boundaries are unchanged. Decoder errors preserve the
+last accepted result and rekey watermark, so later updates can recover without losing notices.
+Slow subscribers keep one pending update and coalesce later commits. The owner bounds retained
+results and rekey history through memory accounting. Table-qualified rekey notices come from
+accepted UPDATEs while the owner can cover the subscriber's gap. If that history is evicted,
+the owner changes, the catalog changes, or a snapshot replaces the database, delivery explicitly
+resets the result
+instead of inventing rekey notices. Consumers must accept full snapshots on reset.
+These paths remain unpublished until the 1.0 cutover. Released 0.x APIs and behavior are unchanged;
+there is no stored-format change or migration in this work.
+
 - The browser performance gate now binds every baseline to its SQL and dataset scale and refuses
   changed workloads before comparison. The S_q7 NUMERIC ROUND correction (`4e7b6a0c`) requires
   explicit hosted recalibration. Shared-runner R6 results are observations; absolute acceptance

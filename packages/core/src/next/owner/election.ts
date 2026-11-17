@@ -119,7 +119,7 @@ export const HANDSHAKE_TIMEOUT_MS = 5_000;
 /** Idle time after which a client releases its liveness lock. */
 export const LIVENESS_IDLE_RELEASE_MS = 1_000;
 /** A live subscription whose update is unacknowledged this long is dropped (`liveEnded`). */
-export const LIVE_UNACKED_DROP_MS = 60_000;
+export { LIVE_UNACKED_DROP_MS } from "../live/constants.js";
 
 /** Lock and channel names. `db` is the database name the app opened. */
 export const ownerLockName = (db: string): string => `minnow:${db}`;

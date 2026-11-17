@@ -28,14 +28,22 @@ interface Suite {
 /** Every suite whose corpus is generated from a seed. A suite with a fixed corpus gains nothing here. */
 const SUITES: Suite[] = [
   {
-    name: "next-live-effect-integration",
-    file: "packages/core/src/next/write/changes-integration.test.ts",
-  },
-  { name: "next-live-dispatch", file: "packages/core/src/next/write/changes-deferred.test.ts" },
-  {
     name: "next-live-observer-reentry",
     file: "packages/core/src/next/write/changes-reentrancy.test.ts",
   },
+  { name: "next-live-dispatch", file: "packages/core/src/next/write/changes-deferred.test.ts" },
+  {
+    name: "next-live-effect-integration",
+    file: "packages/core/src/next/write/changes-integration.test.ts",
+  },
+  { name: "next-live-publication", file: "packages/core/src/next/write/changes.test.ts" },
+  {
+    name: "next-live-commit-oracle",
+    file: "packages/core/src/next/testing/live-commit-oracle.test.ts",
+  },
+  // One file varies all live runtime histories through MINNOW_SEED.
+  { name: "next-live-runtime", file: "packages/core/src/next/testing/live-runtime.test.ts" },
+  { name: "next-live-row-values", file: "packages/core/src/next/live/rows.test.ts" },
   { name: "differential-harness", file: "packages/core/src/testing/differential-harness.test.ts" },
   { name: "block-format-properties", file: "packages/core/src/block-format/properties.test.ts" },
   { name: "sql-conformance", file: "packages/core/src/engine/sql-conformance.test.ts" },

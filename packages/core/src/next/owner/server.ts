@@ -1,3 +1,4 @@
+import type { LiveHandle } from "../live/runtime.js";
 /**
  * The owner's protocol server: connections, request admission and outcomes, per-session ordering,
  * the idle-transaction timeout, result streaming with release windows, cancellation, liveness and
@@ -332,6 +333,7 @@ class Connection {
   /** Requests waiting behind their session, by seq: a cancel marks them. */
   readonly #queued = new Map<number, { cancelled: boolean; close: boolean }>();
   readonly #streams = new Map<number, Stream>();
+  readonly #live = new Map<number, LiveHandle>();
   #aliveTimer: ReturnType<typeof setInterval> | null = null;
   #lastPostAt = 0;
   #sweepTimer: ReturnType<typeof setInterval> | null = null;
@@ -425,6 +427,7 @@ class Connection {
         this.#watchIfNeeded();
         return;
       case "liveAck":
+        this.#live.get(message.target)?.ack(message.version, message.accepted !== false);
         return;
       case "ping":
         this.post({ t: "alive" });
@@ -1043,17 +1046,12 @@ class Connection {
               },
             )
             .finally(finish);
-        case "subscribe":
+        case "subscribe": {
           engine.ledger.settle(this.clientId, request.seq);
-          this.post({
-            t: "error",
-            seq: request.seq,
-            error: toWireError(
-              new TypeError("Live subscriptions are not served by this owner yet"),
-            ),
-          });
+          this.#subscribeLive(request);
           finish();
           return;
+        }
       }
     } catch (error) {
       this.#finishLedger(request, planned, before, session, null, true, error);
@@ -1068,6 +1066,66 @@ class Connection {
     goAsync();
     running.run = run;
     return this.#stream(request, planned, run, session, before, running).finally(finish);
+  }
+
+  /** Live handles outlive the initial request slot; replay always registers a fresh read. */
+  #subscribeLive(request: Extract<Request, { t: "subscribe" }>): void {
+    this.#live.get(request.seq)?.close();
+    this.#live.delete(request.seq);
+    const runtime = this.#server.engine.live;
+    if (runtime === undefined) throw new TypeError("Native live runtime is unavailable");
+    let initial = true;
+    const handle = runtime.subscribe(
+      request.text,
+      request.params,
+      (result) => {
+        if (initial) {
+          initial = false;
+          this.post({
+            t: "done",
+            seq: request.seq,
+            columns: result.columns,
+            frames: result.frames,
+            liveVersion: result.version,
+            liveReset: result.reset,
+            keyChanges: result.rekeys,
+            summary: {
+              command: "SELECT",
+              rowCount: result.frames.reduce((n, frame) => n + frame.rowCount, 0),
+              counts: null,
+              lsn: result.lsn,
+              replayed: false,
+              closedEarly: false,
+              transaction: "idle",
+              catalogVersion: this.#server.engine.catalogVersion,
+            },
+          });
+        } else
+          this.post({
+            t: "live",
+            seq: request.seq,
+            version: result.version,
+            lsn: result.lsn,
+            reset: result.reset,
+            keyChanges: result.rekeys,
+            columns: result.columns,
+            frames: result.frames,
+          });
+      },
+      (error) => {
+        initial = false;
+        this.post({ t: "error", seq: request.seq, error: toWireError(error) });
+      },
+      () => {
+        this.#live.delete(request.seq);
+        this.#watchIfNeeded();
+        this.#updateAlive();
+        this.post({ t: "liveEnded", seq: request.seq, reason: "unacknowledged" });
+      },
+    );
+    this.#live.set(request.seq, handle);
+    this.#watchIfNeeded();
+    this.#updateAlive();
   }
 
   #beginRun(session: EngineSession, readOnly: boolean, signal: AbortSignal): Run {
@@ -1432,6 +1490,15 @@ class Connection {
   // ---- signals ----
 
   #cancel(target: number, close: boolean): void {
+    const live = this.#live.get(target);
+    if (live !== undefined) {
+      live.close();
+      this.#live.delete(target);
+      this.#watchIfNeeded();
+      this.#updateAlive();
+      this.post({ t: "liveEnded", seq: target, reason: "unknown" });
+      return;
+    }
     const queued = this.#queued.get(target);
     if (queued !== undefined) {
       queued.cancelled = true;
@@ -1478,6 +1545,7 @@ class Connection {
 
   /** Whether this client's liveness matters now: live requests, live frames, open transactions. */
   #livenessNeeded(): boolean {
+    if (this.#livenessHeld && this.#live.size > 0) return true;
     for (const running of this.#running.values()) if (running.live) return true;
     // Frames posted to a live client hold the executor's charge: keep watching until released.
     for (const stream of this.#streams.values())
@@ -1528,11 +1596,15 @@ class Connection {
 
   #updateAlive(): void {
     const interval = this.#server.options.aliveIntervalMs ?? ALIVE_INTERVAL_MS;
-    if (this.#running.size > 0 && this.#aliveTimer === null && this.#state === "open") {
+    if (
+      (this.#running.size > 0 || this.#live.size > 0) &&
+      this.#aliveTimer === null &&
+      this.#state === "open"
+    ) {
       this.#aliveTimer = setInterval(() => {
         this.post({ t: "alive" });
       }, interval);
-    } else if (this.#running.size === 0 && this.#aliveTimer !== null) {
+    } else if (this.#running.size === 0 && this.#live.size === 0 && this.#aliveTimer !== null) {
       clearInterval(this.#aliveTimer);
       this.#aliveTimer = null;
     }
@@ -1582,6 +1654,8 @@ class Connection {
   end(reason: "bye" | "reconnected" | "livenessLost" | "stepDown", keepPort = false): void {
     if (this.#state === "closed") return;
     this.#state = "closed";
+    for (const handle of this.#live.values()) handle.close();
+    this.#live.clear();
     this.#returns?.close();
     this.#returns = null;
     void reason;
