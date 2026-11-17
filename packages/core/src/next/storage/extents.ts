@@ -244,6 +244,9 @@ export interface WrittenExtent {
 
 /** A grant's suballocator (`memory/governor.ts` `Grant.allocate`/`free`). Never waits. */
 export interface ByteBudget {
+  /** Optional nonwaiting reservation for a preferred workspace size. False leaves no charge;
+   * implementations must not throw a retry/admission request for ordinary pressure here. */
+  tryAllocate?(bytes: number): boolean;
   /** An allocation-policy wrapper may identify the native grant holding its ordinary credit.
    * allocate/free must affect that same grant; retained transfers never use its loan bytes. */
   ordinarySource?(): ByteBudget;
@@ -434,8 +437,22 @@ export type WriterState = "open" | "publishing" | "published" | "aborted" | "ind
 export interface ExtentWriter {
   readonly label: string;
   readonly state: WriterState;
-  /** Sealed extents, in seal order. */
+  /** Borrowed array-shaped view. Length is scalar; native consumers recognize its asynchronous
+   * inventory capability. Synchronous element access/materialization requires a bounded resident
+   * window; use snapshotExtents for larger histories. Invalidated by write/ownership transfer.
+   */
   readonly extents: readonly ExtentRef[];
+  /** Monotone seal cut, including discarded slots. Native consumers never materialize its history. */
+  readonly extentOrdinal?: number;
+  /** Immutable offset-ordered live ownership, optionally restricted to seals after since.
+   * Caller pays before allocation and owns the inventory through every observer/publication.
+   * It pins descriptors only; source data ownership/pins must remain valid independently.
+   * Successive increasing cuts walk new seals plus a bounded overlap per cut; seeking an older
+   * cut may restart. The seek state must not grow with the sealed history.
+   */
+  snapshotExtents?(
+    options: { readonly budget: ByteBudget; readonly since?: number } & TaskWork,
+  ): Promise<import("./retirement-contract.js").RetirementInventory>;
   /** Bytes reserved by open builders plus bytes of sealed extents. */
   readonly bytes: number;
   /**
@@ -497,6 +514,13 @@ export interface ExtentBuilder {
 
 /** Options of `beginWrite` (an additive change after the Phase 1 freeze). */
 export interface WriteOptions {
+  /** Prepaid ordinary funding for the writer's bounded ownership descriptors. Their charge
+   * moves into native non-evictable memory and returns at publication/abort, independently of
+   * builder buffers. Defaults to the space's structural budget, not the buffer-only budget.
+   * A foreign governor cannot transfer into this space: it refunds that attempt and uses
+   * already-admitted native structural credit instead, without cross-governor reclassification.
+   */
+  readonly ownershipBudget?: ByteBudget;
   /**
    * Charged for each builder's own staging buffer (up to 256 KiB, no more than the builder's
    * capacity), returned at its seal or abort. A builder the budget refuses uses the shared slab.

@@ -1,3 +1,4 @@
+import { WRITER_OWNERSHIP_STEP_BYTES } from "../storage/writer-inventory.js";
 /** Bounds one publication from its actual schema, directories and pending inputs (governor rule 3). */
 import { FTS_PUBLICATION_MINIMUM_BYTES } from "./fts-minimum.js";
 import type { MaybePromise } from "../access/key-index.js";
@@ -89,7 +90,8 @@ export function writeStepMinimum(
           state.root.fts.staged !== null
           ? FTS_PUBLICATION_MINIMUM_BYTES
           : 0,
-        RUN_ENCODER_MINIMUM +
+        WRITER_OWNERSHIP_STEP_BYTES +
+          RUN_ENCODER_MINIMUM +
           (keyBytes > 2048 ? 8 * keyBytes : 0) +
           4096 +
           directory +

@@ -1,3 +1,9 @@
+import { StagedExtents, EMPTY_STAGED_EXTENTS } from "./staged-extents.js";
+import {
+  captureWriterExtents,
+  capturedWriterReferences,
+  type CapturedWriterExtents,
+} from "../storage/writer-extents.js";
 import type { RetirementInventory } from "../storage/retirement-contract.js";
 import { FtsMutations, type FtsMutationCommit } from "./fts-mutations.js";
 import { ftsMutationScan } from "./fts-undo.js";
@@ -283,6 +289,8 @@ interface Staging {
   readonly id: number;
   /** Staged memtables in row-id order (a rollback may leave some empty or out of the view). */
   memtables: Memtable[];
+  /** Descriptor ownership outlives rollback removing a memtable/data pin. */
+  sources: StagedExtents[];
   /** The entry as the table's root has it (null until a root first lists it). */
   entry: TableRoot["staged"][number] | null;
   /** The entry's directory blobs (index and pages): retired when it is rewritten or folded. */
@@ -1574,7 +1582,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         groupRoot,
         runs,
         pin,
-        extents: [],
+        extents: EMPTY_STAGED_EXTENTS,
       };
       memtable.published = { group: ref, groupRoot, runs: new Map(), pin };
       memtable.state = "staged";
@@ -1587,6 +1595,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     state.stagings.set(effect.transaction, {
       id: effect.transaction,
       memtables: staged,
+      sources: staged.map((memtable) => need(memtable.staged).extents),
       entry,
       directory,
       rootSequence: this.#root.sequence,
@@ -2024,6 +2033,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (pending.tableId === tableId) this.#forgetIndex(indexId);
     const state = this.#tables.get(tableId);
     this.#tables.delete(tableId);
+    if (state !== undefined) {
+      for (const staging of state.stagings.values())
+        for (const source of staging.sources) source.release();
+      state.stagings.clear();
+    }
     this.#summaries.delete(tableId);
     this.#publishState();
     // Older readers may still read its memtables (ruling 5): their memory goes when they close,
@@ -2630,7 +2644,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     try {
       unlock = await this.#lock();
       this.#check();
-      writer = this.#space.beginWrite("FTS preparation");
+      writer = this.#space.beginWrite("FTS preparation", { ownershipBudget: this.#metadataBudget });
       const write = writer.write.bind(writer);
       writer.write = async (parts) => {
         // Prepay the returned extent/blob records and the writer's retained extent array,
@@ -3230,6 +3244,20 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#unbindMetadataCaches();
       for (const cache of this.#metadataCaches) cache.clear();
       this.#lists.close();
+      for (const source of this.#pendingStagedSources) {
+        source.queued = false;
+        source.release();
+      }
+      this.#pendingStagedSources = [];
+      for (const state of this.#tables.values()) {
+        for (const staging of state.stagings.values())
+          for (const source of staging.sources) source.release();
+        state.stagings.clear();
+      }
+      for (const state of this.#tables.values())
+        for (const memtable of state.view.memtables) memtable.staged?.extents.close();
+      for (const memtable of this.#published) memtable.staged?.extents.close();
+      await Promise.allSettled(this.#stagingRuns);
       this.#ftsPending = null;
       await this.#ftsMutations?.close();
       this.#ftsMutations = null;
@@ -3432,7 +3460,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
       return;
     let def: TableDef = current;
     let definitionCharge = 0;
-    const writer = this.#space.beginWrite(`flush t${String(state.tableId)}`);
+    const writer = this.#space.beginWrite(`flush t${String(state.tableId)}`, {
+      ownershipBudget: this.#metadataBudget,
+    });
     const outputs: RunSummary[] = [];
     const retired: ExtentRef[] = [];
     // Directory chunks and the root this publication made: it owns them until a state holds them.
@@ -3809,7 +3839,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
       state.flushedThroughLsn = through;
       state.nextGroupId = nextGroupId;
       state.nextRowId = nextRowId;
-      for (const id of foldedStagings) state.stagings.delete(id);
+      for (const id of foldedStagings) {
+        for (const source of state.stagings.get(id)?.sources ?? []) source.release();
+        state.stagings.delete(id);
+      }
       // Rebuilt from the view as it is now: memtables, deletions and sources added during the
       // flush stay (the flush only removes what it published).
       const current = state.view;
@@ -3866,6 +3899,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   #unclaimedWalks: TableRoot[] = [];
   /** Extents of dropped staging the durable root still reaches: retired by the next root. */
   #pendingRetire: ExtentRef[] = [];
+  #pendingStagedSources: StagedExtents[] = [];
   /** Rollbacks' staging drops, each under the publish lock (close and quiesce wait for them). */
   #stagingDrops: Promise<void> = Promise.resolve();
 
@@ -4015,7 +4049,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       for (const state of this.#tables.values()) if (state.stagings.has(id)) tables.add(state);
     if (tables.size === 0) return;
     id ??= this.#nextStagingId++;
-    const writer = this.#space.beginWrite("stage");
+    const writer = this.#space.beginWrite("stage", { ownershipBudget: this.#metadataBudget });
     const write = writer.write.bind(writer);
     writer.write = async (...args) => {
       this.#check();
@@ -4050,6 +4084,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         const staging: Staging = state.stagings.get(id) ?? {
           id,
           memtables: [],
+          sources: [],
           entry: null,
           directory: [],
           rootSequence: 0,
@@ -4062,8 +4097,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
           );
         const parts = new Map<Memtable, StagedPart>();
         const residuals = new Map<Memtable, Map<number, KeyDelta>>();
-        for (const memtable of dropped)
-          for (const extent of need(memtable.staged).extents) retired.push(extent);
+        await delta.retireStagedSources(
+          dropped.map((memtable) => need(memtable.staged).extents),
+          this.#commitAbort.signal,
+        );
         // Tails a rollback truncated: deleted in the group's bitmap, gone from its runs.
         let rewrote = false;
         if (final)
@@ -4072,7 +4109,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
             if (part.group.liveRowCount === memtable.rowCount) continue;
             parts.set(
               memtable,
-              await this.#truncateStaged(writer, memtable, part, retired, outputs),
+              await this.#truncateStaged(writer, memtable, part, retired, outputs, owned),
             );
             this.#check();
             rewrote = true;
@@ -4122,10 +4159,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
         };
         changed.set(state.tableId, tableRoot);
         const stagingId = id;
+        const sources = memtables.map((memtable) => partOf(memtable).extents);
         installs.push(() => {
+          for (const source of sources) source.retain();
+          for (const source of staging.sources) source.release();
           // #adoptTableRoots installed the reconciled durable entry, not this draft.
           state.nextRowId = Math.max(state.nextRowId, end);
           for (const [memtable, part] of parts) {
+            if (memtable.staged !== null && memtable.staged.pin !== part.pin)
+              memtable.staged.pin.release();
             memtable.staged = part;
             memtable.published = {
               group: part.group,
@@ -4150,6 +4192,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
             state.stagings.set(stagingId, {
               ...staging,
               memtables,
+              sources,
               entry,
               directory,
               rootSequence: 0, // set below
@@ -4202,6 +4245,61 @@ export class WritePathImpl implements WritePath, EngineHooks {
     }
   }
 
+  #trackStagedExtentCleanup(pending: Promise<void>): void {
+    this.#stagingRuns.add(pending);
+    void pending.then(
+      () => this.#stagingRuns.delete(pending),
+      (error: unknown) => {
+        this.#stagingRuns.delete(pending);
+        this.#sinkFailed(new ExtentSinkError(error));
+      },
+    );
+  }
+  #ownStagedExtents(
+    captured: CapturedWriterExtents,
+    base: SpacePin,
+  ): { extents: StagedExtents; pin: SpacePin } {
+    const extents = new StagedExtents(captured, (pending) =>
+      this.#trackStagedExtentCleanup(pending),
+    );
+    return {
+      extents,
+      pin: {
+        generation: base.generation,
+        label: base.label,
+        get released() {
+          return base.released;
+        },
+        release() {
+          if (base.released) return;
+          base.release();
+          extents.release();
+        },
+      },
+    };
+  }
+  #queueStagedExtents(source: StagedExtents): void {
+    if (source.empty || source.queued) return;
+    source.retain();
+    source.queued = true;
+    this.#pendingStagedSources.push(source);
+  }
+  async #stagePendingRetirements(delta: DeltaPublication): Promise<void> {
+    if (this.#pendingStagedSources.length === 0) return;
+    const selected = this.#pendingStagedSources.slice();
+    await delta.retireStagedSources(selected, this.#commitAbort.signal, () => {
+      for (let i = 0; i < selected.length; i++)
+        if (this.#pendingStagedSources[i] !== selected[i])
+          throw new Error("Changed staged retirement prefix");
+      this.#pendingStagedSources = this.#pendingStagedSources.slice(selected.length);
+      for (const source of selected) {
+        source.queued = false;
+        source.release();
+      }
+      selected.length = 0;
+    });
+  }
+
   /**
    * Writes one frozen memtable of pending rows as a staged group and runs of its own puts; the
    * other delta entries go to residual deltas (same order, so undo can be remapped). Its pin and
@@ -4220,7 +4318,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     residual: Map<number, KeyDelta>;
     remaps: Map<KeyDelta, { delta: KeyDelta; entries: Int32Array }>;
   }> {
-    const from = writer.extents.length;
+    const from = writer.extentOrdinal ?? writer.extents.length;
     this.#stageFault?.("group", index);
     const groupRoot = await this.#writeGroup(writer, memtable);
     this.#check();
@@ -4275,15 +4373,30 @@ export class WritePathImpl implements WritePath, EngineHooks {
       root: rootBlob,
       deletions: null,
     };
-    const pin = this.#space.pin(`staged t${String(memtable.tableId)}`, this.#pinBudget);
-    owned.pins.push(pin);
+    const captured = await captureWriterExtents(
+      writer,
+      this.#metadataBudget,
+      { signal: this.#commitAbort.signal },
+      from,
+    );
+    let retained: { extents: StagedExtents; pin: SpacePin };
+    try {
+      retained = this.#ownStagedExtents(
+        captured,
+        this.#space.pin(`staged t${String(memtable.tableId)}`, this.#pinBudget),
+      );
+    } catch (error) {
+      await captured.release();
+      throw error;
+    }
+    owned.pins.push(retained.pin);
     const part: StagedPart = {
       stagingId,
       group,
       groupRoot,
       runs,
-      pin,
-      extents: writer.extents.slice(from),
+      pin: retained.pin,
+      extents: retained.extents,
     };
     return { part, residual, remaps };
   }
@@ -4295,8 +4408,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     part: StagedPart,
     retired: ExtentRef[],
     outputs: RunSummary[],
+    owned: Provisional,
   ): Promise<StagedPart> {
-    const from = writer.extents.length;
+    const from = writer.extentOrdinal ?? writer.extents.length;
     const live = memtable.rowCount;
     const tail = Array.from({ length: memtable.storedRows - live }, (_, k) => live + k);
     const deletions = await this.#writeBitmap(writer, memtable.storedRows, null, tail);
@@ -4334,15 +4448,52 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (kept.length > 0) runs.set(indexId, kept);
     }
     for (const extent of old) retired.push(extent);
-    const extents = [
-      ...part.extents.filter((extent: ExtentRef) => !old.some((gone) => sameExtent(gone, extent))),
-      ...writer.extents.slice(from),
-    ];
+    const fresh = await captureWriterExtents(
+      writer,
+      this.#metadataBudget,
+      { signal: this.#commitAbort.signal },
+      from,
+    );
+    let combined: RetirementInventory;
+    try {
+      const source = async function* (budget: ByteBudget, signal: AbortSignal) {
+        yield* part.extents.references(budget, { signal });
+        yield* capturedWriterReferences(fresh, budget, { signal });
+      };
+      combined = await this.#space.prepareRetirements(
+        source(this.#metadataBudget, this.#commitAbort.signal),
+        {
+          budget: this.#metadataBudget,
+          retained: old,
+          retainedOwner: true,
+          signal: this.#commitAbort.signal,
+        },
+      );
+    } finally {
+      await fresh.release();
+    }
+    const captured: CapturedWriterExtents = {
+      added: [],
+      addedInventory: combined,
+      release: () => combined.release(),
+    };
+    let retained: { extents: StagedExtents; pin: SpacePin };
+    try {
+      retained = this.#ownStagedExtents(
+        captured,
+        this.#space.pin(`restaged t${String(memtable.tableId)}`, this.#pinBudget),
+      );
+    } catch (error) {
+      await captured.release();
+      throw error;
+    }
+    owned.pins.push(retained.pin);
     return {
       ...part,
       group: { ...part.group, deletions, liveRowCount: live },
       runs,
-      extents,
+      pin: retained.pin,
+      extents: retained.extents,
     };
   }
 
@@ -4360,34 +4511,41 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.maintenance.stagingRollbacks += 1;
     // The durable root still lists them: the next root leaves them out and retires their extents
     // (under the lock, so no publication in flight adopts the old entry back).
-    this.#stagingDrops = this.#stagingDrops.then(async () => {
-      const unlock = await this.#lock();
-      try {
-        for (const { state, staging } of drops) {
-          if (staging.entry === null) continue;
-          // Publications that ran while this waited for the lock may already have left the entry
-          // out of the durable root and retired its extents: a root without the table retires
-          // everything the table's previous root reached, staged entries included. Retiring them
-          // again would release extents the extent list no longer names (ruling R25: an extent
-          // is released by one publication).
-          const listed = this.#root.tables
-            .find((table) => table.tableId === state.tableId)
-            ?.staged.some((entry) => entry.transaction === id);
-          if (listed === true) {
-            for (const extent of staging.directory) this.#pendingRetire.push(extent);
-            for (const memtable of staging.memtables)
-              for (const extent of need(memtable.staged).extents) this.#pendingRetire.push(extent);
+    this.#stagingDrops = this.#stagingDrops.then(
+      async () => {
+        let unlock: (() => void) | undefined;
+        try {
+          unlock = await this.#lock();
+          for (const { state, staging } of drops) {
+            if (staging.entry === null) continue;
+            // Publications that ran while this waited for the lock may already have left the entry
+            // out of the durable root and retired its extents: a root without the table retires
+            // everything the table's previous root reached, staged entries included. Retiring them
+            // again would release extents the extent list no longer names (ruling R25: an extent
+            // is released by one publication).
+            const listed = this.#root.tables
+              .find((table) => table.tableId === state.tableId)
+              ?.staged.some((entry) => entry.transaction === id);
+            if (listed === true) {
+              for (const extent of staging.directory) this.#pendingRetire.push(extent);
+              for (const source of staging.sources) this.#queueStagedExtents(source);
+            }
+            if (state.root !== null)
+              state.root = {
+                ...state.root,
+                staged: state.root.staged.filter((staged) => staged.transaction !== id),
+              };
           }
-          if (state.root !== null)
-            state.root = {
-              ...state.root,
-              staged: state.root.staged.filter((staged) => staged.transaction !== id),
-            };
+        } finally {
+          unlock?.();
+          for (const { staging } of drops) for (const source of staging.sources) source.release();
         }
-      } finally {
-        unlock();
-      }
-    });
+      },
+      (error: unknown) => {
+        for (const { staging } of drops) for (const source of staging.sources) source.release();
+        throw error;
+      },
+    );
   }
 
   /**
@@ -4491,7 +4649,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#sinkFailed,
       this.#pinBudget,
     );
-    const writer = this.#space.beginWrite("idle publish");
+    const writer = this.#space.beginWrite("idle publish", {
+      ownershipBudget: this.#metadataBudget,
+    });
     try {
       // The lock may have waited: closed, or garbage reclaimed by a publish meanwhile.
       if (this.closed || !this.#garbageOverBound()) {
@@ -4679,7 +4839,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
             flushedThroughLsn: cut,
           });
       }
-      writer = this.#space.beginWrite("log recycle");
+      writer = this.#space.beginWrite("log recycle", { ownershipBudget: this.#metadataBudget });
       const salt = (crypto.getRandomValues(new Uint32Array(1))[0] ?? 1) >>> 0 || 1;
       const sequence = this.#root.sequence + 1;
       const incarnation = { salt, firstLsn: cut + 1, rootSequence: sequence };
@@ -4854,6 +5014,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     let writer: ExtentWriter;
     try {
       writer = this.#space.beginWrite(`merge t${String(state.tableId)} i${String(indexId)}`, {
+        ownershipBudget: this.#metadataBudget,
         budget: grant,
       });
     } catch (error) {
@@ -5191,6 +5352,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     /** A new log incarnation (a recycle's switching root). */
     incarnation: ManifestRoot["log"] | null = null,
   ): Promise<ManifestRoot> {
+    await this.#stagePendingRetirements(publication);
     const globalLsn = this.#rootLsn(changed);
     let fts = this.#root.fts;
     let ftsThrough = this.#ftsCoveredLsn;
@@ -5718,6 +5880,37 @@ export class ExtentSinkError extends Error {
  * `ExtentSinkError`) without undoing the install, retrying, or skipping the publisher's cleanup.
  */
 class DeltaPublication {
+  #stagedSources: StagedExtents[] = [];
+  #stagedCommitted: (() => void) | undefined;
+  #retirementSpace: Space | undefined;
+  #filteredFromInventory: RetirementInventory | undefined;
+  #residentStaged:
+    { retired: ExtentRef[]; start: number; count: number; bytes: number } | undefined;
+  async retireStagedSources(
+    sources: readonly StagedExtents[],
+    signal: AbortSignal,
+    committed?: () => void,
+  ): Promise<void> {
+    for (let i = 0; i < sources.length; i++) {
+      if ((i & 127) === 0) {
+        signal.throwIfAborted();
+        if (taskClock.due()) await yieldTask();
+        signal.throwIfAborted();
+      }
+      const source = sources[i];
+      if (source === undefined || source.empty) continue;
+      source.retain();
+      this.#stagedSources.push(source);
+    }
+    if (committed !== undefined) {
+      if (this.#stagedCommitted !== undefined)
+        throw new Error("Staged retirement prefix supplied twice");
+      this.#stagedCommitted = committed;
+    }
+  }
+
+  #keeperAdditions: CapturedWriterExtents | undefined;
+  #sinkAdditions: CapturedWriterExtents | undefined;
   #retirementInventory: RetirementInventory | undefined;
   // At most the old unclaimed root and the root replaced by preparation in one publication.
   // Pages stream later, once the NEW root's complete retained references are fixed.
@@ -5745,13 +5938,16 @@ class DeltaPublication {
     budget: ByteBudget,
     signal: AbortSignal,
   ): Promise<void> {
-    if (this.#ftsRetireHeads === undefined) return;
+    if (this.#ftsRetireHeads === undefined && this.#stagedSources.length === 0) return;
     if (this.#ftsInventory !== undefined) throw new Error("FTS retirement prepared twice");
-    const heads = this.#ftsRetireHeads;
+    this.#retirementSpace = space;
+    const heads = this.#ftsRetireHeads ?? [],
+      staged = this.#stagedSources;
     async function* candidates() {
       for (const head of heads)
         for await (const event of walkFtsJournal(head, false, budget, space, signal))
           yield event.ref;
+      for (const part of staged) yield* part.references(budget, { signal });
     }
     async function* retained() {
       for await (const event of walkReachable(root, reader, { concurrency: 1 })) {
@@ -5798,15 +5994,71 @@ class DeltaPublication {
   ): Promise<ExtentList> {
     if (inventory !== undefined && this.#ftsInventory !== undefined)
       throw new Error("Publication supplied two retirement inventories");
-    inventory ??= this.#ftsInventory;
+    // Preserve the existing small-array observer contract with a charged bounded fast path.
+    // Larger ownership is always streamed; no extent-sized materialization is permitted.
+    if (
+      inventory === undefined &&
+      this.#ftsRetireHeads === undefined &&
+      this.#ftsInventory !== undefined &&
+      this.#ftsInventory.count <= 64
+    ) {
+      const bytes = 256 + 256 * this.#ftsInventory.count;
+      if (!this.budget.allocate(bytes)) throw new ParseBudgetError(bytes);
+      const resident = { retired, start: retired.length, count: 0, bytes };
+      this.#residentStaged = resident;
+      const cursor = this.#ftsInventory.cursor({ budget: this.budget });
+      try {
+        while (await cursor.next()) {
+          const offset = cursor.offset,
+            length = cursor.length;
+          if (retired.some((extent) => extent.offset === offset && extent.length === length))
+            continue;
+          retired.push({ offset, length });
+          resident.count++;
+        }
+      } finally {
+        await cursor.close();
+      }
+    }
+    if (
+      inventory === undefined &&
+      this.#residentStaged === undefined &&
+      this.#ftsInventory !== undefined &&
+      this.#stagedSources.length > 0 &&
+      retired.length > 0 &&
+      this.#retirementSpace !== undefined
+    ) {
+      const oldInventory = this.#ftsInventory,
+        budget = this.budget;
+      const source = async function* () {
+        const cursor = oldInventory.cursor({ budget });
+        try {
+          while (await cursor.next()) yield { offset: cursor.offset, length: cursor.length };
+        } finally {
+          await cursor.close();
+        }
+      };
+      const filtered = await this.#retirementSpace.prepareRetirements(source(), {
+        budget,
+        retained: retired,
+      });
+      this.#ftsInventory = filtered;
+      this.#filteredFromInventory = oldInventory;
+    }
+    if (this.#residentStaged === undefined) inventory ??= this.#ftsInventory;
     this.#retirementInventory = inventory;
     const attempt = this.nextAttempt();
     this.#attempt = attempt;
     this.#sequence = sequence;
     let prepared: ExtentDeltaResult;
+    const additions = await captureWriterExtents(writer, this.budget);
+    this.#keeperAdditions = additions;
     try {
       prepared = await this.lists.prepare(attempt, {
-        added: writer.extents,
+        added: additions.added,
+        ...(additions.addedInventory === undefined
+          ? {}
+          : { addedInventory: additions.addedInventory }),
         released: retired,
         ...(inventory === undefined ? {} : { releasedInventory: inventory }),
         writer,
@@ -5823,8 +6075,13 @@ class DeltaPublication {
       this.#sinkAsked = true;
       let result: ExtentDeltaResult | null;
       try {
+        const additions = await captureWriterExtents(writer, this.budget);
+        this.#sinkAdditions = additions;
         result = await this.sink.prepare(attempt, {
-          added: writer.extents,
+          added: additions.added,
+          ...(additions.addedInventory === undefined
+            ? {}
+            : { addedInventory: additions.addedInventory }),
           released: retired,
           ...(inventory === undefined ? {} : { releasedInventory: inventory }),
           writer,
@@ -5870,10 +6127,39 @@ class DeltaPublication {
       this.#settle();
     } finally {
       this.#retirementInventory = undefined;
-      const inventory = this.#ftsInventory;
-      this.#ftsInventory = undefined;
+      const resident = this.#residentStaged;
+      this.#residentStaged = undefined;
+      if (resident !== undefined) {
+        resident.retired.splice(resident.start, resident.count);
+        this.budget.free(resident.bytes);
+      }
+      const committed = this.#stagedCommitted;
+      this.#stagedCommitted = undefined;
       try {
-        await inventory?.release();
+        if (this.#durable) committed?.();
+      } catch (error) {
+        this.fail(new ExtentSinkError(error));
+      }
+      while (this.#stagedSources.length > 0) this.#stagedSources.pop()?.release();
+      this.#retirementSpace = undefined;
+      const keeperAdditions = this.#keeperAdditions,
+        sinkAdditions = this.#sinkAdditions;
+      this.#keeperAdditions = this.#sinkAdditions = undefined;
+      for (const additions of [keeperAdditions, sinkAdditions])
+        try {
+          await additions?.release();
+        } catch (error) {
+          this.fail(new ExtentSinkError(error));
+        }
+      const inventory = this.#ftsInventory,
+        previous = this.#filteredFromInventory;
+      this.#ftsInventory = this.#filteredFromInventory = undefined;
+      try {
+        try {
+          await inventory?.release();
+        } finally {
+          await previous?.release();
+        }
       } catch (error) {
         this.fail(new ExtentSinkError(error));
       } finally {

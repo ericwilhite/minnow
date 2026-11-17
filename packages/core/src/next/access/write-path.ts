@@ -395,6 +395,8 @@ export interface OpenWritePathInput {
 export interface PublishDelta {
   /** Extents the new root reaches and the previous one does not: every extent `writer` sealed. */
   readonly added: readonly ExtentRef[];
+  /** Additional immutable additions, caller-owned through publication and observers. */
+  readonly addedInventory?: import("../storage/retirement-contract.js").RetirementInventory;
   /**
    * Extents the previous root reaches and the new one does not: exactly the publish's `retired`.
    * They leave the new root's list at once, but stay protected by the previous root's list and

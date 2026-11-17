@@ -1,3 +1,10 @@
+import { makeResidentWriterInput } from "./writer-resident.js";
+import { createWriterExtentView } from "./writer-view.js";
+import {
+  WriterInventory,
+  WRITER_INVENTORY_WINDOW,
+  writerInventoryBytes,
+} from "./writer-inventory.js";
 /** Extent allocation and ownership over StoreSession. R8 state is a disk queue of immutable
  * before/after snapshots; the capped free-run arena never treats its unknown complement as
  * ownership. Every ownership removal/transition is serialized through one mutation barrier.
@@ -51,7 +58,11 @@ import {
   RETIREMENT_PREPARATION_BYTES,
   type RetirementPreparationContext,
 } from "./retirement-prepare.js";
-import { borrowRetirementInventory } from "./retirement-inventory.js";
+import {
+  borrowRetirementInventory,
+  makeRetirementInventory,
+  RETIREMENT_OWNER_BYTES,
+} from "./retirement-inventory.js";
 import type {
   RetirementInput,
   RetirementOptions,
@@ -562,10 +573,140 @@ class Space implements ExtentSpace {
 
   beginWrite(label: string, options: WriteOptions = {}): ExtentWriter {
     this.accepting();
-    const writer = new Writer(this, label, options.budget ?? null);
+    let capacity = WRITER_INVENTORY_WINDOW;
+    let funding: { close(): void };
+    for (;;) {
+      try {
+        funding = this.roots.descriptorLease(
+          options.ownershipBudget ?? this.#budget,
+          writerInventoryBytes(capacity),
+          capacity > 1,
+          true,
+          this.#budget,
+        );
+        break;
+      } catch (error) {
+        if (!(error instanceof ReadDeniedError) || capacity === 1) throw error;
+        capacity = Math.max(1, Math.floor(capacity / 2));
+      }
+    }
+    let writer: Writer;
+    try {
+      this.accepting();
+      writer = new Writer(
+        this,
+        label,
+        options.budget ?? null,
+        new WriterInventory(this.journal, capacity, funding),
+      );
+    } catch (error) {
+      funding.close();
+      throw error;
+    }
     this.writers.add(writer);
     this.reserved();
     return writer;
+  }
+
+  /** Metadata turn always precedes data ownership barriers. No fresh admission here. */
+  metadataTurn<T>(work: (io: MetadataWork) => Promise<T>): Promise<T> {
+    return this.#metadata
+      .run(() => this.#cache.withReadSlab((slab) => work({ slab })))
+      .catch((error: unknown) => {
+        if (this.journal.failed || error instanceof StoreCorruptionError) this.fail(error);
+        throw error;
+      });
+  }
+  /** Bounded input snapshot, not a retirement authority; no journal until the tail is insufficient. */
+  captureResidentWriter(
+    writer: Writer,
+    since: number,
+    budget: ByteBudget,
+    work: TaskWork,
+  ): RetirementInventory | undefined {
+    writer.usable();
+    if (!writer.inventory.canCopyTail(since)) return undefined;
+    // A clock-due copy is speculative. Keep its prepayment in the originating
+    // grant until it succeeds, so falling back cannot consume that grant twice.
+    const funding = this.roots.leaseBudget(budget);
+    if (!funding.allocate(RETIREMENT_OWNER_BYTES)) {
+      funding.close();
+      return undefined;
+    }
+    let copied: { bytes: Uint8Array; count: number } | undefined,
+      transferred = false;
+    try {
+      writer.usable();
+      work.signal?.throwIfAborted();
+      copied = writer.inventory.copyTail(since, work);
+      if (copied === undefined) {
+        funding.close();
+        return undefined;
+      }
+      writer.usable();
+      work.signal?.throwIfAborted();
+      funding.transfer();
+      transferred = true;
+      writer.usable();
+      work.signal?.throwIfAborted();
+      const inventory = makeResidentWriterInput(
+        copied.bytes,
+        copied.count,
+        descriptorOwnerBudget(funding),
+        this.#retirementInventories,
+      );
+      this.#retirementInventories.add(inventory);
+      return inventory;
+    } catch (error) {
+      // Drop the speculative payload before refunding its owner allowance.
+      // eslint-disable-next-line no-useless-assignment -- ownership ends before refund
+      copied = undefined;
+      funding.close();
+      if (!transferred && error instanceof ReadDeniedError) return undefined;
+      throw error;
+    }
+  }
+  async snapshotWriter(
+    writer: Writer,
+    options: { budget: ByteBudget; since?: number } & TaskWork,
+  ): Promise<RetirementInventory> {
+    options.signal?.throwIfAborted();
+    const funding = this.roots.descriptorLease(
+      options.budget,
+      RETIREMENT_OWNER_BYTES,
+      false,
+      options.since === undefined,
+      this.#budget,
+    );
+    let captured = 0,
+      transferred = false;
+    try {
+      return await this.metadataTurn(async (io) => {
+        this.accepting();
+        options.signal?.throwIfAborted();
+        const result = await writer.inventory.captureInside(io, options.since ?? 0, options);
+        captured = result.handle;
+        options.signal?.throwIfAborted();
+        this.accepting();
+        const inventory = makeRetirementInventory(
+          this.#retirementContext(),
+          captured,
+          result.count,
+          descriptorOwnerBudget(funding),
+        );
+        this.#retirementInventories.add(inventory);
+        captured = 0;
+        transferred = true;
+        return inventory;
+      });
+    } finally {
+      try {
+        if (captured !== 0) await this.#metadata.run(() => disposeSnapshot(this.journal, captured));
+      } finally {
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- async metadata callback transfers only on success
+        if (!transferred) funding.close();
+      }
+    }
   }
 
   /** Throws unless writes and publishes are allowed. */
@@ -849,6 +990,9 @@ class Space implements ExtentSpace {
     const budget = options.budget;
     if (!budget.allocate(RETIREMENT_PREPARATION_BYTES))
       throw new ReadDeniedError(RETIREMENT_PREPARATION_BYTES);
+    const ownerFunding =
+      options.retainedOwner === true ? this.roots.leaseBudget(budget) : undefined;
+    let retained = false;
     let record:
       { readonly stop: AbortController; readonly run: Promise<RetirementInventory> } | undefined;
     try {
@@ -864,6 +1008,7 @@ class Space implements ExtentSpace {
         .then(() =>
           prepareRetirementInventory(this.#retirementContext(), input, {
             ...options,
+            ...(ownerFunding === undefined ? {} : { ownerBudget: ownerFunding }),
             signal,
           }),
         )
@@ -871,11 +1016,15 @@ class Space implements ExtentSpace {
           try {
             signal.throwIfAborted();
             this.accepting();
+            ownerFunding?.transfer();
+            signal.throwIfAborted();
+            this.accepting();
           } catch (error) {
             await inventory.release();
             throw error;
           }
           this.#retirementInventories.add(inventory);
+          retained = true;
           return inventory;
         });
       record = { stop, run };
@@ -886,6 +1035,8 @@ class Space implements ExtentSpace {
       throw error;
     } finally {
       if (record !== undefined) this.#retirementPreparing.delete(record);
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- async preparation callback transfers only on success
+      if (!retained) ownerFunding?.close();
       budget.free(RETIREMENT_PREPARATION_BYTES);
     }
   }
@@ -907,7 +1058,11 @@ class Space implements ExtentSpace {
               const page = await cursor.next(work);
               work.signal?.throwIfAborted();
               this.usable();
-              if (page !== null) target.set(page);
+              if (page !== null) {
+                if (page.length > target.byteLength)
+                  throw new StoreCorruptionError("Retirement page exceeds its record bound");
+                target.set(page);
+              }
               return { position: cursor.position, bytes: page?.length ?? 0 };
             } finally {
               await cursor.close();
@@ -919,6 +1074,67 @@ class Space implements ExtentSpace {
         this.#retirementInventories.delete(inventory);
       },
     };
+  }
+
+  /** Existing metadata sort/union proves ownership; no caller-sized descriptor vector. */
+  async #writerOwnership(
+    writers: Iterable<ExtentWriter>,
+    io: MetadataWork,
+    work: TaskWork | undefined,
+    includeBuilders: boolean,
+  ): Promise<number> {
+    const capture: AuditCapture = { head: 0, tail: 0 };
+    let part = 0,
+      raw = 0,
+      result = 0;
+    const enqueue = (handle: number) =>
+      this.journal.workspace.run("spool", async () => {
+        if (handle === 0) return;
+        part = handle;
+        if (capture.tail !== 0) await this.journal.link(capture.tail, part);
+        else capture.head = part;
+        capture.tail = part;
+        part = 0;
+      });
+    try {
+      for (const writer of writers) {
+        if (!(writer instanceof Writer) || writer.space !== this)
+          throw new TypeError("Foreign native ownership source");
+        await enqueue((await writer.inventory.captureInside(io, 0, work)).handle);
+        if (includeBuilders && writer.builders.size > 0)
+          await enqueue(
+            await saveExtentInput(
+              this.journal,
+              (function* () {
+                for (const builder of writer.builders) yield* builder.ownedRanges();
+              })(),
+              false,
+              Infinity,
+              work,
+              io,
+              true,
+            ),
+          );
+      }
+      if (capture.head !== 0 && capture.head === capture.tail) {
+        // The one native writer's capture is already ordered unless builders were queued too.
+        result = capture.head;
+        capture.head = capture.tail = 0;
+      } else {
+        raw = await flattenCapture(this.journal, capture, io, work);
+        result = await pairPhase(this.journal, io, "merge", (slots) =>
+          sortExtents(this.journal, raw, "refuse", work, slots),
+        );
+      }
+      const handle = result;
+      result = 0;
+      return handle;
+    } finally {
+      if (part !== 0) await disposeSnapshot(this.journal, part);
+      if (raw !== 0) await disposeSnapshot(this.journal, raw);
+      if (result !== 0) await disposeSnapshot(this.journal, result);
+      await clearCapture(this.journal, capture);
+    }
   }
 
   // ── Publication ──────────────────────────────────────────────────────────────────────────────
@@ -1108,24 +1324,9 @@ class Space implements ExtentSpace {
           });
         throw error;
       }
-      ownerRaw = await saveExtentInput(
-        this.journal,
-        (function* () {
-          for (const candidate of change.writers) {
-            if (!(candidate instanceof Writer))
-              throw new TypeError("publish writer changed during call");
-            yield* candidate.extents;
-          }
-        })(),
-        false,
-        Infinity,
-        change,
-        io,
-        true,
-      );
-      owners = await pairPhase(this.journal, io, "merge", (slots) =>
-        sortExtents(this.journal, ownerRaw, "refuse", change, slots),
-      );
+      ownerRaw = await this.#writerOwnership(change.writers, io, change, false);
+      owners = ownerRaw;
+      ownerRaw = 0;
       // Retirement authority is ONLY the two immutable root lists. No free-map complement,
       // allocator allocation test or mutable unpublished-writer observation authorizes it.
       const validated = await validatePublication(
@@ -1164,8 +1365,10 @@ class Space implements ExtentSpace {
       const generation = this.#ledger.advance();
       for (const candidate of change.writers)
         if (candidate instanceof Writer) {
+          candidate.publishedBytes = candidate.inventory.bytes;
           candidate.state = "published";
           this.writers.delete(candidate);
+          await candidate.inventory.closeInside();
         }
       installed = true;
       await disposeSnapshot(this.journal, oldPrevious);
@@ -1327,23 +1530,9 @@ class Space implements ExtentSpace {
       );
       await this.#metadata.run(async () => {
         if (!this.#sameEpoch(epoch)) return;
-        const liveWriters = this.writers;
-        writerRaw = await saveExtentInput(
-          this.journal,
-          (function* () {
-            for (const writer of liveWriters) {
-              yield* writer.extents;
-              for (const builder of writer.builders) yield* builder.ownedRanges();
-            }
-          })(),
-          false,
-          Infinity,
-          undefined,
-          undefined,
-          true,
-        );
         await this.#cache.withReadSlab(async (slab) => {
           const io = { slab };
+          writerRaw = await this.#writerOwnership(this.writers, io, undefined, true);
           const sorting = (handle: number, duplicates: "exact" | "refuse") =>
             pairPhase(this.journal, io, "merge", (slots) =>
               sortExtents(this.journal, handle, duplicates, undefined, slots),
@@ -1509,8 +1698,15 @@ class Space implements ExtentSpace {
 
   close(): Promise<void> {
     if (this.#closePromise !== null) return this.#closePromise;
+    let resolve!: () => void, reject!: (error: unknown) => void;
+    const closing = new Promise<void>((yes, no) => {
+      resolve = yes;
+      reject = no;
+    });
+    this.#closePromise = closing;
     this.#closing = true;
-    return (this.#closePromise = this.#closeNow());
+    void this.#closeNow().then(resolve, reject);
+    return closing;
   }
   async #closeNow(): Promise<void> {
     for (const preparation of this.#retirementPreparing)
@@ -1535,7 +1731,13 @@ class Space implements ExtentSpace {
       await preparation.run.catch(() => undefined);
     for (const inventory of this.#retirementInventories)
       await inventory.release().catch((error: unknown) => this.fail(error));
-    await this.#metadata.run(async () => undefined);
+    await this.#metadata.run(async () => {
+      for (const writer of this.writers) {
+        for (const builder of writer.builders) builder.releaseBuffer();
+        await writer.inventory.closeInside().catch((error: unknown) => this.fail(error));
+      }
+      this.writers.clear();
+    });
     await this.#cache.settled();
     this.#closed = true;
     this.staged = null;
@@ -1563,8 +1765,11 @@ class Writer implements ExtentWriter {
   readonly space: Space;
   readonly label: string;
   state: WriterState = "open";
+  /** Scalar diagnostic survives publication; the ownership records do not. */
+  publishedBytes = 0;
   readonly builders = new Set<Builder>();
-  readonly #extents: ExtentRef[] = [];
+  readonly #seals = new Mutex();
+  readonly #extentView: readonly ExtentRef[];
   /** Calls in flight (appends, whole seals): abort waits for them. */
   busy = 0;
   readonly #idle: Array<() => void> = [];
@@ -1580,21 +1785,54 @@ class Writer implements ExtentWriter {
   /** Charged for each builder's own staging buffer; null: builders share the space's slab. */
   readonly budget: ByteBudget | null;
 
-  constructor(space: Space, label: string, budget: ByteBudget | null) {
+  constructor(
+    space: Space,
+    label: string,
+    budget: ByteBudget | null,
+    readonly inventory: WriterInventory,
+  ) {
     this.space = space;
     this.label = label;
     this.budget = budget;
+    this.#extentView = createWriterExtentView(
+      this,
+      () => this.inventory.resident,
+      () => this.inventory.count,
+      (since, budget, work) => this.space.captureResidentWriter(this, since, budget, work),
+    );
   }
 
   get extents(): readonly ExtentRef[] {
-    return this.#extents;
+    return this.#extentView;
   }
 
   get bytes(): number {
     let bytes = 0;
     for (const builder of this.builders) bytes += builder.capacity;
-    for (const extent of this.#extents) bytes += this.space.map.sizeOf(extent.length);
+    bytes += this.state === "published" ? this.publishedBytes : this.inventory.bytes;
     return bytes;
+  }
+
+  get extentOrdinal(): number {
+    return this.inventory.ordinal;
+  }
+  snapshotExtents(
+    options: { budget: ByteBudget; since?: number } & TaskWork,
+  ): Promise<RetirementInventory> {
+    this.usable();
+    return this.track(() => this.space.snapshotWriter(this, options));
+  }
+  sealTurn<T>(work: () => Promise<T>): Promise<T> {
+    return this.track(() =>
+      this.#seals.run(async () => {
+        if (this.inventory.needsFlush)
+          await this.space.metadataTurn(() => this.inventory.flushInside());
+        if (this.abortRequested)
+          throw new TypeError(`Writer ${this.label} was aborted during the seal`);
+        this.usable();
+        return work();
+      }),
+    );
   }
 
   usable(): void {
@@ -1629,7 +1867,7 @@ class Writer implements ExtentWriter {
 
   sealed(builder: Builder, extent: ExtentRef | null): void {
     this.builders.delete(builder);
-    if (extent !== null) this.#extents.push(extent);
+    if (extent !== null) this.inventory.append(extent, this.space.map.sizeOf(extent.length));
   }
 
   async write(parts: readonly Uint8Array[]): Promise<WrittenExtent> {
@@ -1644,50 +1882,86 @@ class Writer implements ExtentWriter {
 
   async discard(extent: ExtentRef): Promise<void> {
     this.usable();
-    await this.space.mutate(async (guard) => {
-      // Accepted before close; recheck ownership, without treating close's drain as new work.
-      if (this.state !== "open") throw new TypeError(`Writer ${this.label} cannot discard now`);
-      this.space.usable();
-      const index = this.#extents.findIndex(
-        (candidate) => candidate.offset === extent.offset && candidate.length === extent.length,
-      );
-      if (index < 0) throw new RangeError(`Writer ${this.label} did not seal that extent`);
-      this.#extents.splice(index, 1);
-      await this.space.freeGuarded(
-        [{ offset: extent.offset, length: this.space.map.sizeOf(extent.length) }],
-        guard,
-      );
-    });
+    await this.track(() =>
+      this.#seals.run(() =>
+        this.space.metadataTurn(async () => {
+          const location = await this.inventory.findInside(extent);
+          if (location === undefined)
+            throw new RangeError(`Writer ${this.label} did not seal that extent`);
+          await this.space.mutate(async (guard) => {
+            if (this.state !== "open")
+              throw new TypeError(`Writer ${this.label} cannot discard now`);
+            this.space.usable();
+            await this.inventory.clearInside(location, this.space.map.sizeOf(extent.length));
+            await this.space.freeGuarded(
+              [{ offset: extent.offset, length: this.space.map.sizeOf(extent.length) }],
+              guard,
+            );
+          });
+        }),
+      ),
+    );
   }
-  async abort(): Promise<void> {
-    if (this.state === "aborted") return Promise.resolve();
+  abort(): Promise<void> {
     if (this.#abortPromise !== null) return this.#abortPromise;
+    if (this.state === "aborted") return Promise.resolve();
     if (this.state !== "open")
       return Promise.reject(new TypeError(`Writer ${this.label} is ${this.state}`));
     this.space.cleanupAllowed();
-    // Do not remove ownership or mark aborted until the queued transition owns the barrier.
-    return (this.#abortPromise = this.#abortNow());
-  }
-  *#abortRanges(): IterableIterator<DataRange> {
-    for (const builder of this.builders) {
-      if (this.space.staged?.builder === builder) this.space.staged = null;
-      yield* builder.abandon();
-    }
-    for (const extent of this.#extents)
-      yield { offset: extent.offset, length: this.space.map.sizeOf(extent.length) };
+    let resolve!: () => void, reject!: (error: unknown) => void;
+    const closing = new Promise<void>((yes, no) => {
+      resolve = yes;
+      reject = no;
+    });
+    this.#abortPromise = closing;
+    void this.#abortNow().then(resolve, reject);
+    return closing;
   }
   async #abortNow(): Promise<void> {
     while (this.busy > 0) await new Promise<void>((resolve) => this.#idle.push(resolve));
-    await this.space.writeLock.run(() =>
-      this.space.mutate(async (guard) => {
-        if (this.state !== "open") throw new TypeError(`Writer ${this.label} is ${this.state}`);
-        this.state = "aborted";
-        await this.space.freeGuarded(this.#abortRanges(), guard);
-        this.builders.clear();
-        this.#extents.length = 0;
-        this.space.writers.delete(this);
-      }),
-    );
+    await this.space.metadataTurn(async (io) => {
+      let handle = 0;
+      try {
+        handle = (await this.inventory.captureInside(io)).handle;
+        await this.space.writeLock.run(() =>
+          this.space.mutate(async (guard) => {
+            if (this.state !== "open") throw new TypeError(`Writer ${this.label} is ${this.state}`);
+            this.state = "aborted";
+            for (const builder of this.builders) {
+              if (this.space.staged?.builder === builder) this.space.staged = null;
+              await this.space.freeGuarded(builder.abandon(), guard);
+            }
+            await pairPhase(this.space.journal, io, "merge", async (slots) => {
+              const pairs = await openPairs(this.space.journal, handle, slots.left, true);
+              let batch: DataRange[] = [];
+              try {
+                for (;;) {
+                  const pending = pairs.next();
+                  if (!(typeof pending === "boolean" ? pending : await pending)) break;
+                  batch.push({ offset: pairs.offset, length: this.space.map.sizeOf(pairs.length) });
+                  if (batch.length === this.inventory.capacity) {
+                    await this.space.freeGuarded(batch, guard);
+                    batch = [];
+                  }
+                }
+                if (batch.length > 0) await this.space.freeGuarded(batch, guard);
+              } finally {
+                await pairs.close();
+              }
+            });
+            this.builders.clear();
+            this.space.writers.delete(this);
+          }),
+        );
+      } finally {
+        try {
+          if (handle !== 0) await disposeSnapshot(this.space.journal, handle);
+        } finally {
+          for (const builder of this.builders) builder.releaseBuffer();
+          await this.inventory.closeInside();
+        }
+      }
+    });
   }
 }
 
@@ -1798,7 +2072,7 @@ class Builder implements ExtentBuilder {
     if (this.#appending) throw new TypeError("seal during an append");
     this.#state = "sealed";
     const space = this.writer.space;
-    return this.writer.track(() =>
+    return this.writer.sealTurn(() =>
       space.writeLock.run(() =>
         space.mutate(async (guard) => {
           if (this.#length === 0) {
@@ -1848,4 +2122,17 @@ class Builder implements ExtentBuilder {
       ),
     );
   }
+}
+
+function descriptorOwnerBudget(funding: { close(): void }): ByteBudget {
+  let live = true;
+  return {
+    allocate: () => false,
+    free: (bytes) => {
+      if (!live || bytes !== RETIREMENT_OWNER_BYTES)
+        throw new RangeError("Invalid inventory descriptor refund");
+      live = false;
+      funding.close();
+    },
+  };
 }

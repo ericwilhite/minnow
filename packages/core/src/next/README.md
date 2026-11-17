@@ -4480,3 +4480,59 @@ Resident release lists of at most 4,096 entries are an optional optimization. Th
 keeper first attempts their complete reservation; a boolean or typed memory refusal
 selects the same disk inventory used for larger sources. Other errors propagate.
 The disk route admits its smaller working window before copying or consuming entries.
+
+### Bounded native writer ownership
+
+Native `ExtentWriter` owns a charged window of at most 64 sealed extents. Larger histories
+spill through the existing `MetadataJournal` chunk queue, pair sort and retirement-inventory
+cursors. Seal ordinals remain monotone across discard and address reuse; a per-part capture
+selects ordinals without copying earlier parts. No private inventory is a durable root reference.
+
+`writer.extents.length` is scalar. Synchronous element access/materialization is a borrowed
+small-window view; after spill use `snapshotExtents({ budget, since?, signal? })`. The returned
+immutable source belongs to the caller until `release()` settles, independently of later seals,
+publication or abort. Publication observers consume `addedInventory`/`releasedInventory` when
+present, keeping both sources alive through settlement. Small released-array observers retain a
+separately charged bounded fast path. Native publication and audit use the same disk sources.
+
+The existing root bank's spare allowance funds transient descriptor controls without reducing
+its five-small-frame reserve. Additional owners take ordinary preflight credit before allocation,
+then move that credit into non-evictable ownership when their lifetime can exceed their creating
+grant. A portable loader can use a different governor from its target: a refused foreign
+transfer refunds the caller and uses the target's already-admitted structural credit instead.
+No credit moves between governors. Staged descriptors have a separate owner from their data pin: rollback can release a row
+memtable before the publication that retires its extents. Close and abort fence accepted I/O, drop
+resident windows, then refund exactly once. The existing FTS 4 MiB publication floor is unchanged.
+
+`storage/writer-inventory.test.ts` covers 63/64/65/32,769 sealed records, holes, address reuse and
+full/ordinal snapshots. `testing/writer-ownership-pressure.test.ts` covers real native writers
+with 65/4,097 extents, publication/abort under competing grants, and plain-row/FTS producers,
+exact committed/reopened rows and zero ownership. These are memory/correctness proofs, not
+throughput or browser RSS claims. No durable grammar, released API or supported predecessor changes.
+
+Incremental writer captures keep one prepaid chunk-handle/ordinal seek hint. Successive
+part cuts reread at most one old ownership chunk plus newly sealed chunks; they do not
+rescan the full sealed history. Older cuts fall back to a full walk. The hint retains no
+reader, page, array or additional loan and is installed only after successful capture.
+`storage/writer-incremental.test.ts` bounds total metadata reads over generated repeated
+cuts, checks exact full/backward snapshots and returns all fixed-window credit.
+`scripts/next-writer-insert-bench.mts` compares compiled runtimes with interleaved CPU
+pairs for ordinary narrow/wide inserts through durable quiescence, using prebuilt columns.
+
+Ownership flushes retain the same 64-record resident window and pack scratch records
+into the existing compact journal-page format. A proved strictly ordered captured stream
+needs no second sort; arbitrary physical order still uses the shared sort. Small immutable
+retirement cursors allocate only their record-count-sized buffer under the unchanged
+maximum prepaid allowance. Cancellation before flush attachment drains its partial chain
+and preserves the resident ownership for retry. These are private workspace changes.
+
+Current-tail ordinal cuts use a bounded resident input to the same inventory cursors:
+copy at most 64 packed extent pairs under the existing 4 KiB owner allowance, with
+no journal I/O. The independent copy survives writer abort and creator-grant closure.
+It is not retirement authority; publication still needs the ordinary retained-reference
+witness. Cross-window cuts use the journal. A due task clock discards the speculative
+copy and refunds its ordinary prepayment before falling back; ownership transfers to
+the non-evictable account only after a successful copy. Native close fences resident
+inputs and their accepted reads before clearing payloads and refunding credit once.
+`testing/writer-resident.test.ts` covers these pressure and lifetime histories, and
+`storage/writer-resident.test.ts` rejects a small view over an oversized backing buffer.

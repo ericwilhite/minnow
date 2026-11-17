@@ -62,7 +62,8 @@ export async function prepareRetirementInventory(
 ): Promise<RetirementInventory> {
   options.signal?.throwIfAborted();
   context.check();
-  if (!options.budget.allocate(RETIREMENT_OWNER_BYTES))
+  const ownerBudget = options.ownerBudget ?? options.budget;
+  if (!ownerBudget.allocate(RETIREMENT_OWNER_BYTES))
     throw new ReadDeniedError(RETIREMENT_OWNER_BYTES);
   let candidates: AuditCapture | null = null,
     kept: AuditCapture | null = null;
@@ -156,7 +157,7 @@ export async function prepareRetirementInventory(
     try {
       options.signal?.throwIfAborted();
       context.check();
-      return makeRetirementInventory(context, result, count, options.budget);
+      return makeRetirementInventory(context, result, count, ownerBudget);
     } catch (error) {
       reason ??= error instanceof Error ? error : new Error(String(error));
     }
@@ -166,7 +167,7 @@ export async function prepareRetirementInventory(
   } catch {
     /* preserve the original preparation/cancellation failure */
   } finally {
-    options.budget.free(RETIREMENT_OWNER_BYTES);
+    ownerBudget.free(RETIREMENT_OWNER_BYTES);
   }
   throw reason ?? new Error("Retirement preparation failed");
 }

@@ -52,7 +52,9 @@ class Cursor implements RetirementCursor {
     signal?: AbortSignal,
   ) {
     // The factory charges BEFORE constructing this cursor, its controller or window.
-    this.#window = new Uint8Array(METADATA_PAYLOAD_BYTES);
+    // The prepaid allowance remains the maximum. Small immutable inventories
+    // cannot fill a page: avoid allocating a full frame for every staged part.
+    this.#window = new Uint8Array(Math.min(METADATA_PAYLOAD_BYTES, inventory.count * 16));
     this.#view = new DataView(this.#window.buffer);
     this.#signal = AbortSignal.any(
       signal === undefined

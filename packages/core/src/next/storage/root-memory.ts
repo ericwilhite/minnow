@@ -24,6 +24,10 @@ export const ROOT_BANK_BYTES = 128 * 1024;
 export const SMALL_ROOT_BYTES = 18 * 1024;
 const FRAME_OVERHEAD = 512;
 const ROOT_HEADER = ROOT_SLOT_OVERHEAD;
+/** The existing bank can also fund bounded transient ownership descriptors, while preserving
+ * its full five-small-frame worst case and the original owner/control allowance. */
+export const ROOT_DESCRIPTOR_BANK_BYTES =
+  ROOT_BANK_BYTES - 8192 - 5 * (SMALL_ROOT_BYTES + ROOT_HEADER + FRAME_OVERHEAD);
 interface PreparedRoot {
   readonly token: object;
   readonly frame: RootFrame;
@@ -38,6 +42,7 @@ export function preparedRoot(session: StoreSession, bytes: Uint8Array): Prepared
 export class RootMemory {
   readonly evictableBytes = 0;
   #small = 0;
+  #descriptorBank = 0;
   #extra = 0;
   #closed = false;
   private constructor(readonly memory: CacheMemory) {}
@@ -62,13 +67,15 @@ export class RootMemory {
    * the root bank's fixed allowance. No later allocation is allowed through the lease.
    */
   leaseBudget(source: ByteBudget): ByteBudget & { transfer(): void; close(): void } {
+    let origin: ByteBudget | null = source;
     let bytes = 0,
       moved = false,
       closed = false;
     const budget = {
       allocate: (n: number): boolean => {
         if (closed || moved) throw new TypeError("Root descriptor lease cannot grow");
-        if (!source.allocate(n)) return false;
+        if (origin === null) throw new TypeError("Retired descriptor admission");
+        if (!origin.allocate(n)) return false;
         bytes += n;
         return true;
       },
@@ -76,28 +83,101 @@ export class RootMemory {
         if (n > bytes) throw new RangeError("Root descriptor lease freed too much");
         bytes -= n;
         if (moved) this.refund(n, false);
-        else source.free(n);
+        else {
+          if (origin === null) throw new TypeError("Retired descriptor admission");
+          origin.free(n);
+        }
       },
       transfer: (): void => {
         if (closed || moved || this.#closed) throw new TypeError("Root descriptor lease is closed");
+        const admitted = origin;
+        if (admitted === null) throw new TypeError("Retired descriptor admission");
         if (bytes !== 0) {
           const accepted =
             this.memory.takeFrom === undefined
               ? this.memory.charge(bytes)
-              : this.memory.takeFrom(source.ordinarySource?.() ?? source, bytes);
+              : this.memory.takeFrom(admitted.ordinarySource?.() ?? admitted, bytes);
           if (!accepted) throw new ReadDeniedError(bytes);
-          if (this.memory.takeFrom === undefined) source.free(bytes);
+          if (this.memory.takeFrom === undefined) admitted.free(bytes);
           this.#extra += bytes;
         }
+        origin = null; // the retained owner must not keep the creating grant/write path alive
         moved = true;
       },
       close: (): void => {
         if (closed) return;
-        budget.free(bytes);
         closed = true;
+        try {
+          budget.free(bytes);
+        } finally {
+          origin = null;
+        }
       },
     };
     return budget;
+  }
+
+  /** Native descriptor owners outlive the admission that created them. Move ordinary credit
+   * atomically into the existing non-evictable account, before allocating their fixed window.
+   */
+  descriptorLease(
+    source: ByteBudget,
+    bytes: number,
+    preferred = false,
+    bank = false,
+    fallback?: ByteBudget,
+  ): { close(): void } {
+    if (this.#closed) throw new TypeError("Root descriptor memory is closed");
+    if (
+      bank &&
+      this.#descriptorBank + bytes <= ROOT_DESCRIPTOR_BANK_BYTES &&
+      this.#small + bytes <= ROOT_BANK_BYTES - 8192
+    ) {
+      this.#descriptorBank += bytes;
+      this.#small += bytes;
+      let live = true;
+      return {
+        close: () => {
+          if (!live) return;
+          live = false;
+          this.#descriptorBank -= bytes;
+          this.refund(bytes, true);
+        },
+      };
+    }
+    const accepted =
+      preferred && source.tryAllocate !== undefined
+        ? source.tryAllocate(bytes)
+        : source.allocate(bytes);
+    if (!accepted) throw new ReadDeniedError(bytes);
+    let moved: boolean;
+    try {
+      moved =
+        this.memory.takeFrom === undefined
+          ? this.memory.charge(bytes)
+          : this.memory.takeFrom(source.ordinarySource?.() ?? source, bytes);
+    } catch (error) {
+      source.free(bytes);
+      throw error;
+    }
+    if (!moved) {
+      source.free(bytes);
+      // A portable loader may have a different governor from its target. The target's
+      // structural step is already admitted; never move credit between governors.
+      if (fallback !== undefined && fallback !== source)
+        return this.descriptorLease(fallback, bytes, preferred);
+      throw new ReadDeniedError(bytes);
+    }
+    if (this.memory.takeFrom === undefined) source.free(bytes);
+    this.#extra += bytes;
+    let live = true;
+    return {
+      close: () => {
+        if (!live) return;
+        live = false;
+        this.refund(bytes, false);
+      },
+    };
   }
 
   async copy(bytes: Uint8Array, budget: ByteBudget, work?: TaskWork): Promise<RootFrame> {
@@ -147,7 +227,7 @@ export class RootMemory {
   close(): void {
     if (this.#closed) return;
     // All frame owners (including captured audits) must release before closing the bank.
-    if (this.#small !== 0 || this.#extra !== 0)
+    if (this.#small !== 0 || this.#extra !== 0 || this.#descriptorBank !== 0)
       throw new TypeError("Root frames still owned at close");
     this.#closed = true;
     this.memory.release(ROOT_BANK_BYTES);
