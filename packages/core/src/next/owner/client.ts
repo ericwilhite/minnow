@@ -1,3 +1,8 @@
+import {
+  SnapshotClient,
+  type SnapshotExportOptions,
+  type SnapshotImportOptions,
+} from "./snapshot-api.js";
 /**
  * The protocol client: one client's side of protocol.ts over a MessagePort — the handshake,
  * sequencing and the outstanding window (sequence.ts), resendability, frame releases, stream
@@ -108,6 +113,8 @@ export interface ExportStream {
 }
 
 export interface ClientResult {
+  /** Structured-clone administration reply; absent for SQL results. */
+  readonly value?: unknown;
   readonly columns: readonly WireColumnMeta[];
   readonly frames: readonly FramePayload[];
   readonly summary: StatementSummary;
@@ -678,6 +685,50 @@ export class ProtocolClient {
     this.#lostCauses.delete(session);
   }
 
+  #snapshotClient: SnapshotClient | undefined;
+  #snapshots(): SnapshotClient {
+    return (this.#snapshotClient ??= new SnapshotClient(
+      async (op, args, signal) => {
+        signal?.throwIfAborted();
+        const { seq, promise } = this.#request({ t: "admin", op, args });
+        const abort = () => this.cancel(seq);
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) abort();
+        try {
+          return (await promise).value;
+        } catch (error) {
+          if (signal?.aborted && error instanceof CancelledError) throw signal.reason;
+          throw error;
+        } finally {
+          signal?.removeEventListener("abort", abort);
+        }
+      },
+      () => {
+        this.#cursors++;
+        this.onActivity?.();
+        return () => {
+          this.#cursors--;
+          this.onActivity?.();
+        };
+      },
+    ));
+  }
+  exportSnapshot(options?: SnapshotExportOptions): Promise<Uint8Array> {
+    return this.#snapshots().exportSnapshot(options);
+  }
+  exportSnapshotStream(options?: SnapshotExportOptions): AsyncGenerator<Uint8Array, void, void> {
+    return this.#snapshots().exportSnapshotStream(options);
+  }
+  importSnapshot(bytes: Uint8Array, options?: SnapshotImportOptions): Promise<void> {
+    return this.#snapshots().importSnapshot(bytes, options);
+  }
+  importSnapshotStream(
+    source: AsyncIterable<Uint8Array>,
+    options?: SnapshotImportOptions,
+  ): Promise<void> {
+    return this.#snapshots().importSnapshotStream(source, options);
+  }
+
   /** Sends a request and returns its seq with its promise (for cancellation and retries in tests). */
   send(body: Body): { readonly seq: number; readonly promise: Promise<ClientResult> } {
     return this.#request(body);
@@ -1169,6 +1220,12 @@ export class ProtocolClient {
         welcome?.resolve(message);
         return;
       }
+      case "connectionReset":
+        this.giveUp("snapshot import ended this connection; reconnect before continuing");
+        this.#port?.close();
+        this.#port = null;
+        this.onStepDown?.("closing");
+        return;
       case "databaseReplaced":
         this.#markDatabaseReplaced();
         return;

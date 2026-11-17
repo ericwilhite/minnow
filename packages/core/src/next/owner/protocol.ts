@@ -1,3 +1,4 @@
+import type { SnapshotOp } from "./snapshot-api.js";
 /**
  * The owner/client wire protocol: every message that crosses the MessagePort between a client
  * (any tab or worker) and the database's one owner worker.
@@ -217,7 +218,7 @@ export type TransactionState = "idle" | "open" | "failed" | "timedOut";
 export const DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
 
 /** Bumped by every change to a message in this file or in frame.ts. */
-export const PROTOCOL_VERSION = 9;
+export const PROTOCOL_VERSION = 10;
 
 /** The owner sends `alive` at least this often while a client has requests in flight. */
 export const ALIVE_INTERVAL_MS = 1_000;
@@ -429,6 +430,7 @@ export interface AdminRequest extends RequestHeader {
  * is fixed by its client method in api.ts. Snapshot export streams through `rows` frames of bytes.
  */
 export type AdminOp =
+  | SnapshotOp
   | "catalog"
   | "storageStats"
   | "memoryStats"
@@ -720,7 +722,8 @@ export type OwnerMessage =
   | SessionAborted
   | StepDown
   | Diagnostic
-  | DatabaseReplaced;
+  | DatabaseReplaced
+  | { readonly t: "connectionReset" };
 
 /** Whether `message` is the last message about its seq. */
 export function isTerminal(message: OwnerMessage): boolean {

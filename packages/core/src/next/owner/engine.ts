@@ -1,3 +1,4 @@
+import type { OwnerSnapshotOperations } from "./snapshot-connection.js";
 /**
  * The owner worker's inside: the boundary between the protocol server (this track) and the
  * engine composed from the other tracks. The server owns connections, request admission and
@@ -213,6 +214,7 @@ export interface PreparedCache {
 export interface OwnerEngine {
   /** Bounded, evictable, governor-charged owner handle cache. Fallback SQL permits re-planning. */
   createPreparedCache(): PreparedCache;
+  readonly snapshots?: OwnerSnapshotOperations | undefined;
   /** Durable database incarnation; owner changes alone do not change it. */
   readonly databaseId: bigint;
   /** A connection-owned, governor-charged cache, closed when that connection ends. */

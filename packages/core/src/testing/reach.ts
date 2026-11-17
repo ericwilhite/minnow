@@ -10733,3 +10733,81 @@ export const OWNER_DATABASE_IDENTITY_QUEUE_REACH = [
   "no stale replay",
   "no queued write",
 ] as const;
+
+export const SNAPSHOT_OWNER_API_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "resident source",
+  "stored source",
+  "stream API",
+  "array API",
+  "rows and catalog",
+  "fresh incarnation same client ID",
+  "sequence high water",
+  "old client refused",
+  "write and reopen",
+] as const;
+
+export const SNAPSHOT_OWNER_FAILURE_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "stalled input cancelled",
+  "unbounded return ignored",
+  "quota refused",
+  "corruption refused",
+  "scope refused",
+  "old target and source intact",
+  "retry completes",
+] as const;
+
+export const SNAPSHOT_TRANSPORT_REACH = [
+  "single chunk",
+  "split native write",
+  "all",
+  "break",
+  "cancel",
+  "reconnect",
+  "owner change",
+  "precharged transfer copies",
+  "borrowed source never transferred",
+  "held output stays valid",
+] as const;
+
+export const SNAPSHOT_OWNER_INFLIGHT_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "writer slot blocked",
+  "durable commit blocked",
+  "no input before drain",
+  "suspended export cancelled",
+  "committed reply lost",
+  "committed reply received",
+  "no stale retry",
+  "new session writes",
+] as const;
+
+export const SNAPSHOT_SOURCE_CONTROL_REACH = [
+  "close holds control",
+  "concurrent closes wait",
+  "closed source refuses reads",
+  "release failure",
+  "release success",
+] as const;
+
+export const SNAPSHOT_OWNER_CLEANUP_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "sweep after reclaim failure",
+  "host notified",
+  "complete target reopens",
+  "source intact",
+] as const;
+
+export const SNAPSHOT_INSTALL_REACH = [
+  "same version",
+  "old cache funded",
+  "old cache released",
+  "text",
+  "int32",
+  "int64",
+] as const;

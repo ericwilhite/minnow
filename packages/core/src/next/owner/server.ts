@@ -1,3 +1,9 @@
+import {
+  SnapshotConnection,
+  SnapshotHandleError,
+  isSnapshotOp,
+  type OwnerSnapshotOperations,
+} from "./snapshot-connection.js";
 /**
  * The owner's protocol server: connections, request admission and outcomes, per-session ordering,
  * the idle-transaction timeout, result streaming with release windows, cancellation, liveness and
@@ -86,6 +92,10 @@ export interface ServerPort {
 }
 
 export interface OwnerServerOptions {
+  /** Unrecoverable native replacement: the host releases this owner and its lease. */
+  readonly onFatal?: (error: unknown) => void;
+  /** Native portable archive operations, owned by this worker composition. */
+  readonly snapshots?: OwnerSnapshotOperations;
   /** Random per owner worker. */
   readonly ownerId: string;
   /** The storage fence epoch held. */
@@ -184,6 +194,7 @@ export class OwnerServer {
   /** Completion of each executing request, by `clientId:seq`, for `inFlight` admissions. */
   readonly #inFlight = new Map<string, Promise<void>>();
   #steppingDown: StepDown["reason"] | null = null;
+  #restorer: Connection | null = null;
   synchronous = 0;
   asynchronous = 0;
 
@@ -242,6 +253,60 @@ export class OwnerServer {
       beginTask();
       connection.receive(event.data);
     };
+  }
+
+  /** Owns the import exclusion interval, including upload and native recovery. */
+  async reserveReplacement(
+    connection: Connection,
+    seq: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (this.#restorer !== null)
+      throw new SnapshotHandleError("Another snapshot replacement is active");
+    this.#restorer = connection;
+    const current = `${connection.clientId}:${String(seq)}`;
+    await Promise.all(
+      [...this.#connections].map((other) =>
+        other.drainForReplacement(other === connection ? seq : null),
+      ),
+    );
+    await Promise.all(
+      [...this.#inFlight].filter(([key]) => key !== current).map(([, done]) => done),
+    );
+    // Session queue finalizers follow their run's completion.
+    await Promise.resolve();
+    signal.throwIfAborted();
+  }
+
+  replacementAllows(connection: Connection, request: Request): boolean {
+    return (
+      this.#restorer === null ||
+      (this.#restorer === connection &&
+        request.t === "admin" &&
+        (request.op === "snapshotImportWrite" ||
+          request.op === "snapshotImportFinish" ||
+          request.op === "snapshotImportAbort"))
+    );
+  }
+
+  finishReplacement(connection: Connection): void {
+    if (this.#restorer !== connection) return;
+    this.#restorer = null;
+    // Connection generations and request sequences belong to this database incarnation.
+    if (connection.databaseId !== this.#engine.databaseId) this.#generations.clear();
+    for (const old of [...this.#connections]) {
+      old.post(
+        old.databaseId === this.#engine.databaseId
+          ? { t: "connectionReset" }
+          : { t: "databaseReplaced" },
+      );
+      old.end("reconnected");
+    }
+    const operations = this.#options.snapshots ?? this.#engine.snapshots;
+    if (operations?.fatal === true) {
+      this.stepDown("closing");
+      this.#options.onFatal?.(operations.fatalError);
+    }
   }
 
   /** Newest generation seen per client, kept a retry window after its last hello. */
@@ -319,6 +384,10 @@ export class OwnerServer {
 
 class Connection {
   #databaseId = 0n;
+  #drainingForRestore = false;
+  #snapshots: SnapshotConnection | undefined;
+  #snapshotClosing: Promise<void> | undefined;
+  #snapshotActivityMs = 0;
   #returns: ReturnPool | null = null;
   readonly #server: OwnerServer;
   readonly #port: ServerPort;
@@ -350,6 +419,112 @@ class Connection {
 
   get sessionCount(): number {
     return this.#sessions.size;
+  }
+
+  get databaseId(): bigint {
+    return this.#databaseId;
+  }
+
+  /** Drain old work without closing the import command's port. Pending commit I/O settles;
+   * result production is discarded as on disconnect, so credits cannot hold up replacement. */
+  async drainForReplacement(except: number | null): Promise<void> {
+    this.#drainingForRestore = true;
+    for (const queued of this.#queued.values()) queued.cancelled = true;
+    for (const [seq, running] of this.#running) {
+      if (seq === except) continue;
+      running.lost = new SessionLostError(
+        "transaction",
+        seq,
+        running.run?.reachedCommit === true ? "unknown" : "none",
+      );
+      if (running.run?.reachedCommit !== true) running.abort.abort(running.lost);
+    }
+    for (const [seq, stream] of this.#streams) {
+      for (const frame of stream.posted.splice(0)) frame.release();
+      if (this.#running.get(seq)?.run?.reachedCommit !== true)
+        stream.results.cancel(new SessionLostError("result", seq));
+    }
+    this.#prepared.clear();
+    for (const slot of this.#sessions.values()) {
+      this.#endGeneration(slot);
+      if (!slot.busy) this.#closeSession(slot);
+    }
+    this.#returns?.close();
+    this.#returns = null;
+    if (except === null && this.#snapshots !== undefined) {
+      const snapshots = this.#snapshots;
+      this.#snapshots = undefined;
+      await snapshots.close();
+    }
+  }
+
+  /** Snapshot transport has generation-scoped handles, not replayable ledger outcomes.
+   * In particular, upload commands must never touch a closed/replaced write-path ledger. */
+  async #snapshotRequest(request: Extract<Request, { t: "admin" }>): Promise<void> {
+    if (!isSnapshotOp(request.op)) throw new ProtocolError("Not a snapshot command");
+    if (this.#running.has(request.seq)) return;
+    if (request.retry || request.generation !== this.generation) {
+      this.post({
+        t: "error",
+        seq: request.seq,
+        error: toWireError(
+          new SnapshotHandleError("Snapshot connection changed; start a new transfer"),
+        ),
+      });
+      return;
+    }
+    const abort = new AbortController();
+    const running: Running = {
+      abort,
+      session: null,
+      live: request.live || this.#livenessHeld,
+      closeEarly: false,
+      cancelled: false,
+      lost: null,
+      run: null,
+    };
+    this.#running.set(request.seq, running);
+    const key = `${this.clientId}:${String(request.seq)}`;
+    let settle!: () => void;
+    this.#server.inFlight.set(
+      key,
+      new Promise<void>((resolve) => {
+        settle = resolve;
+      }),
+    );
+    this.#server.asynchronous++;
+    this.#updateAlive();
+    let reserved = false;
+    try {
+      if (request.op === "snapshotImportOpen") {
+        if (this.#snapshots?.active === true)
+          throw new SnapshotHandleError("Close this connection's active snapshot first");
+        reserved = true;
+        await this.#server.reserveReplacement(this, request.seq, abort.signal);
+      }
+      const value = await this.#snapshotCommand(request.op, request.args, abort.signal);
+      const transfer =
+        request.op === "snapshotExportRead" && value instanceof Uint8Array
+          ? [value.buffer as ArrayBuffer]
+          : [];
+      this.post({ t: "value", seq: request.seq, value }, transfer, true);
+    } catch (error) {
+      this.post({ t: "error", seq: request.seq, error: toWireError(error) });
+    } finally {
+      this.#running.delete(request.seq);
+      this.#server.inFlight.delete(key);
+      settle();
+      this.#updateAlive();
+      this.#checkDrained();
+      if (
+        ((reserved ||
+          request.op === "snapshotImportFinish" ||
+          request.op === "snapshotImportAbort") &&
+          this.#snapshots?.active !== true) ||
+        (this.#server.options.snapshots ?? this.#server.engine.snapshots)?.fatal === true
+      )
+        this.#server.finishReplacement(this);
+    }
   }
 
   get outstandingFrames(): number {
@@ -632,6 +807,7 @@ class Connection {
     slot.timer.end();
     if (slot.pending === 0 && slot.retireSequence !== null) this.#closeSession(slot);
     this.#watchIfNeeded();
+    if (this.#drainingForRestore && slot.pending === 0) this.#closeSession(slot);
   }
 
   // ---- requests ----
@@ -644,6 +820,18 @@ class Connection {
 
   #request(request: Request): void {
     if (this.#refuseReplaced(request)) return;
+    if (!this.#server.replacementAllows(this, request)) {
+      this.post({
+        t: "error",
+        seq: request.seq,
+        error: toWireError(new SnapshotHandleError("Database replacement is in progress")),
+      });
+      return;
+    }
+    if (request.t === "admin" && isSnapshotOp(request.op)) {
+      void this.#snapshotRequest(request);
+      return;
+    }
     const session = "session" in request ? (request.session ?? null) : null;
     if (session !== null && (!Number.isSafeInteger(session) || session < 0)) {
       this.post({
@@ -718,6 +906,14 @@ class Connection {
   #serveOne(request: Request, slot: SessionSlot | null): void | Promise<void> {
     // A queued request may have arrived before replacement. Check again at execution.
     if (this.#refuseReplaced(request)) return;
+    if (!this.#server.replacementAllows(this, request)) {
+      this.post({
+        t: "error",
+        seq: request.seq,
+        error: toWireError(new SnapshotHandleError("Database replacement is in progress")),
+      });
+      return;
+    }
     const server = this.#server;
     const engine = server.engine;
     // Plan first (synchronous, cached): the scope depends on what the statement is.
@@ -1245,7 +1441,7 @@ class Connection {
     let pending: ResultFrame[] = [];
     const flush = () => {
       if (pending.length === 0) return;
-      if (this.#state === "closed") {
+      if (this.#state === "closed" || this.#drainingForRestore) {
         // Nobody will release them: free them now.
         for (const frame of pending) frame.release();
         pending = [];
@@ -1283,7 +1479,7 @@ class Connection {
           this.#server.aliveIfOverdue();
         }
         if (frame === null) break;
-        if (this.#state === "closed") {
+        if (this.#state === "closed" || this.#drainingForRestore) {
           frame.release();
           continue;
         }
@@ -1302,6 +1498,8 @@ class Connection {
         pending.push(frame);
       }
       const outcome = await run.done;
+      if (this.#drainingForRestore && !(run.reachedCommit && columnsMeta.length === 0))
+        throw running.lost ?? new SessionLostError("result", request.seq);
       stream.finished = true;
       this.#finishLedger(request, planned, before, session, outcome, false, null, run);
       this.#terminalDone(
@@ -1505,10 +1703,32 @@ class Connection {
     }
   }
 
+  async #snapshotCommand(
+    op: import("./snapshot-api.js").SnapshotOp,
+    args: ReadonlyArray<import("./protocol.js").WireValue>,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    const operations = this.#server.options.snapshots ?? this.#server.engine.snapshots;
+    if (operations === undefined)
+      throw new SnapshotHandleError("Portable snapshots are unavailable on this owner");
+    if (this.#snapshotClosing !== undefined)
+      throw new SnapshotHandleError("Previous snapshot cleanup is still pending");
+    this.#snapshots ??= new SnapshotConnection(operations);
+    this.#snapshotActivityMs = this.#server.now();
+    try {
+      return await this.#snapshots.command(op, args, signal);
+    } finally {
+      this.#snapshotActivityMs = this.#server.now();
+      this.#watchIfNeeded();
+      this.#sweepIfNeeded();
+    }
+  }
+
   // ---- liveness, heartbeats, abandoned streams ----
 
   /** Whether this client's liveness matters now: live requests, live frames, open transactions. */
   #livenessNeeded(): boolean {
+    if (this.#livenessHeld && this.#snapshots?.active === true) return true;
     for (const running of this.#running.values()) if (running.live) return true;
     // Frames posted to a live client hold the executor's charge: keep watching until released.
     for (const stream of this.#streams.values())
@@ -1571,9 +1791,9 @@ class Connection {
 
   #sweepIfNeeded(): void {
     const limit = this.#server.options.abandonedStreamMs ?? ABANDONED_STREAM_MS;
-    const hasNonLive = [...this.#streams.values()].some(
-      (stream) => !stream.live && stream.posted.length > 0,
-    );
+    const hasNonLive =
+      (this.#snapshots?.active === true && !this.#livenessHeld) ||
+      [...this.#streams.values()].some((stream) => !stream.live && stream.posted.length > 0);
     if (hasNonLive && this.#sweepTimer === null) {
       this.#sweepTimer = setInterval(
         () => {
@@ -1589,6 +1809,20 @@ class Connection {
 
   #sweep(limit: number): void {
     const now = this.#server.now();
+    if (
+      this.#snapshots?.active === true &&
+      !this.#livenessHeld &&
+      now - this.#snapshotActivityMs >= limit
+    ) {
+      const abandoned = this.#snapshots;
+      this.#snapshots = undefined;
+      this.#snapshotClosing = abandoned.close().finally(() => {
+        this.#snapshotClosing = undefined;
+        this.#server.finishReplacement(this);
+        this.#checkDrained();
+      });
+      void this.#snapshotClosing.catch(() => undefined);
+    }
     for (const [seq, stream] of this.#streams) {
       if (stream.live || stream.posted.length === 0 || now - stream.lastActivityMs < limit)
         continue;
@@ -1613,6 +1847,16 @@ class Connection {
   end(reason: "bye" | "reconnected" | "livenessLost" | "stepDown", keepPort = false): void {
     if (this.#state === "closed") return;
     this.#state = "closed";
+    if (this.#snapshots !== undefined) {
+      const snapshots = this.#snapshots;
+      this.#snapshots = undefined;
+      this.#snapshotClosing = snapshots.close().finally(() => {
+        this.#snapshotClosing = undefined;
+        this.#server.finishReplacement(this);
+        this.#checkDrained();
+      });
+      void this.#snapshotClosing.catch(() => undefined);
+    }
     this.#returns?.close();
     this.#returns = null;
     void reason;
@@ -1662,7 +1906,12 @@ class Connection {
   }
 
   get isDrained(): boolean {
-    return this.#state === "closed" && this.#running.size === 0 && this.#sessions.size === 0;
+    return (
+      this.#state === "closed" &&
+      this.#running.size === 0 &&
+      this.#sessions.size === 0 &&
+      this.#snapshotClosing === undefined
+    );
   }
 
   #checkDrained(): void {

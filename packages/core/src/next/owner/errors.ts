@@ -1,3 +1,11 @@
+import {
+  SnapshotHandleError,
+  SnapshotScopeError,
+  SnapshotFormatError,
+  SnapshotBudgetError,
+  LegacySnapshotError,
+  SnapshotSourceChangedError,
+} from "../snapshot-errors.js";
 /**
  * Errors of the owner/client boundary, and how any error crosses the port.
  *
@@ -264,6 +272,12 @@ export class RecordedFailureError extends Error {
 /** The classes above, keyed by name, for `fromWireError`. */
 export const ownerErrorRegistry: ErrorRegistry = new Map<string, new (...args: never[]) => Error>([
   ["DatabaseReplacedError", DatabaseReplacedError],
+  ["SnapshotSourceChangedError", SnapshotSourceChangedError],
+  ["SnapshotHandleError", SnapshotHandleError],
+  ["SnapshotScopeError", SnapshotScopeError],
+  ["SnapshotFormatError", SnapshotFormatError],
+  ["SnapshotBudgetError", SnapshotBudgetError],
+  ["LegacySnapshotError", LegacySnapshotError],
   ["OwnerUnresponsiveError", OwnerUnresponsiveError],
   ["SessionLostError", SessionLostError],
   ["CommittedWithoutResultError", CommittedWithoutResultError],

@@ -89,7 +89,7 @@ export interface DefaultSessionView {
 
 /** Whether `request` (its header aside) is resendable. See the module comment. */
 export function isResendable(
-  request: { readonly t: Request["t"]; readonly session?: number },
+  request: { readonly t: Request["t"]; readonly session?: number; readonly op?: string },
   defaultSession: DefaultSessionView,
 ): boolean {
   switch (request.t) {
@@ -101,8 +101,11 @@ export function isResendable(
           defaultSession.unresolvedControl === 0)
       );
     case "subscribe":
-    case "admin":
       return true;
+    case "admin":
+      // Portable handles and a replacement finish belong to one connection generation.
+      // A lost reply must never replay an import or bind a stream to a different snapshot.
+      return request.op?.startsWith("snapshot") !== true;
     case "begin":
     case "commit":
     case "rollback":

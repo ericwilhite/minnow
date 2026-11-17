@@ -1,3 +1,4 @@
+import type { OwnerSnapshotOperations } from "./snapshot-connection.js";
 import { StatementRules } from "../exec/statement-rules.js";
 /**
  * The composition root's engine: `OwnerEngine` and `EngineSession` (engine.ts) over the planner
@@ -109,6 +110,9 @@ import type {
 import type { TransactionState, WireColumnMeta, WireValue } from "./protocol.js";
 
 export interface ComposeOptions {
+  readonly snapshots?: OwnerSnapshotOperations;
+  /** Native composition closes sessions/spaces only after the path and all caches. */
+  readonly closeStorage?: () => Promise<void>;
   /** Lowering (lower/create.ts `createLowerer()`), or a test double of its shape. */
   readonly planner: StatementPlanner;
   /**
@@ -294,6 +298,8 @@ function countsOf(
 
 /** Owner-local schema entry point; the transport client remains a separate composition. */
 export interface CatalogOwnerEngine extends OwnerEngine {
+  /** Exclusive replacement only: no session or execution may survive this swap. */
+  installWritePath(path: WritePath): void;
   migrate(
     definition: SchemaDefinition<readonly AnyTable[]>,
     options?: MigrationOptions,
@@ -307,14 +313,17 @@ class ComposedEngine implements CatalogOwnerEngine {
   createReturnPool(capBytes: number): ReturnPool {
     return new ReturnPool(this.#options.governor, capBytes);
   }
-  readonly #options: ComposeOptions & { readonly executor: Executor };
+  readonly #options: Omit<ComposeOptions, "writePath"> & {
+    writePath: WritePath;
+    readonly executor: Executor;
+  };
   readonly #now: () => number;
   readonly #plans: PlanCache<CachedPlan>;
   readonly #sessionPlans = new Set<PlanCache<PlannedStatement>>();
-  readonly #statistics: PlanningStatistics;
+  #statistics: PlanningStatistics;
   /** Compiled table rules for the committed catalog (rule-cache.ts). */
   readonly #rules: RuleCache;
-  readonly #prepared = new WeakMap<PhysicalPlan, PreparedPlan>();
+  #prepared = new WeakMap<PhysicalPlan, PreparedPlan>();
   readonly #commitListeners = new Set<(tables: readonly number[]) => void>();
   #queryId = 0;
   #sessionId = 0;
@@ -330,6 +339,25 @@ class ComposedEngine implements CatalogOwnerEngine {
     this.#statistics = options.statistics ?? { table: () => null };
     this.#rules = new RuleCache(options.governor);
     this.#plans = new PlanCache(options.governor, options.planCacheSize, options.planCacheBytes);
+  }
+
+  get snapshots(): OwnerSnapshotOperations | undefined {
+    return this.#options.snapshots;
+  }
+
+  installWritePath(path: WritePath): void {
+    this.#plans.clear();
+    this.#rules.clear();
+    for (const cache of this.#sessionPlans) cache.close();
+    this.#sessionPlans.clear();
+    this.#prepared = new WeakMap();
+    this.#statistics = { table: () => null };
+    this.#options.writePath = path;
+    path.installFtsRenderer?.({
+      ...ftsSemantics(),
+      workspaceBytes: FTS_WORKSPACE_BYTES,
+      render: ftsValue,
+    });
   }
 
   /**
@@ -554,6 +582,7 @@ class ComposedEngine implements CatalogOwnerEngine {
       this.#plans.close();
       for (const cache of this.#sessionPlans) cache.close();
       this.#sessionPlans.clear();
+      await this.#options.closeStorage?.();
     }
   }
 }

@@ -77,7 +77,7 @@ export interface SnapshotLoadOptions extends SnapshotWork {
   readonly replace?: boolean;
 }
 
-function snapshotScope(catalog: Catalog): void {
+export function validateSnapshotScope(catalog: Catalog): void {
   // TODO(B6/B2): CHECK evaluation and FTS postings reconstruction are not wired
   // into this offline loader. Carry nothing partially; refuse before acquiring the target.
   if (catalog.fts.length || catalog.triggers.length)
@@ -367,7 +367,7 @@ async function loadAttempt(
             throw new SnapshotFormatError(error.message);
           throw error;
         }
-        snapshotScope(catalog);
+        validateSnapshotScope(catalog);
         catalogReady = true;
         catalogBytes = undefined;
         account.free(catalogLength * 2 + catalogParts.length * 128);

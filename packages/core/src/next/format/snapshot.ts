@@ -1,3 +1,9 @@
+import {
+  SnapshotFormatError,
+  SnapshotBudgetError,
+  LegacySnapshotError,
+} from "../snapshot-errors.js";
+export { SnapshotFormatError, SnapshotBudgetError, LegacySnapshotError };
 /** Portable snapshot1 outer grammar. Payload views borrow their frame until the next read step.
  * CRC32/ISO-HDLC is integrity, not authentication. No native address or storage call appears here.
  */
@@ -11,29 +17,7 @@ export const SNAPSHOT_PAYLOAD_BYTES = 1 << 20;
 export const SNAPSHOT_CONTROL_BYTES = 1024;
 export const SnapshotKind = DURABLE_CODECS.snapshot;
 export type SnapshotKind = (typeof SnapshotKind)[keyof typeof SnapshotKind];
-export class SnapshotFormatError extends Error {
-  readonly code = "MINNOW_SNAPSHOT_FORMAT";
-  constructor(message: string) {
-    super(message);
-    this.name = "SnapshotFormatError";
-  }
-}
-export class SnapshotBudgetError extends Error {
-  readonly code = "MINNOW_SNAPSHOT_BUDGET";
-  constructor(readonly bytes: number) {
-    super(`Snapshot needs ${String(bytes)} charged bytes`);
-    this.name = "SnapshotBudgetError";
-  }
-}
-export class LegacySnapshotError extends Error {
-  readonly code = "MINNOW_LEGACY_DATA";
-  constructor() {
-    super(
-      "This snapshot was written by Minnow 0.x; Minnow 1.0 does not load it. The archive and target are unchanged. Use Minnow 0.x to read it or start fresh.",
-    );
-    this.name = "LegacySnapshotError";
-  }
-}
+
 function check(value: boolean, message: string): asserts value {
   if (!value) throw new SnapshotFormatError(message);
 }

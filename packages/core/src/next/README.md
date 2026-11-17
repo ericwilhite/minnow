@@ -4784,13 +4784,43 @@ This scalar inherits the manifest's gate and is registered as databaseIdentity. 
 allocation above reader 10/writer 10/manifest 13 is reader 11/writer 11/manifest 14; WAL body 9 and the
 portable format 1 bytes stay unchanged. No released next/ predecessor exists yet.
 
-The owner must bind sessions and retries to this identity before looking up the request ledger.
-An old database session must receive MINNOW_DATABASE_REPLACED and reopen after replacement;
-reporting an old write as still committed would be misleading because restore removed its effect.
-Owner/public transport wiring is the next stage; this section describes the native foundation.
-
 The owner protocol binds each client to the durable database incarnation at its first
 handshake. A replacement refuses that client, including lost-reply retries and queued
 requests, with `DatabaseReplacedError` (`MINNOW_DATABASE_REPLACED`). Close it and open a
 new client. This check precedes ledger replay, planning and connection supersession;
 ordinary ownership changes preserve the incarnation and normal retry behaviour.
+
+### Portable snapshots through the owner (unexported)
+
+`ProtocolClient` and the `MinnowClient` contract now provide `exportSnapshot()`,
+`exportSnapshotStream()`, `importSnapshot()` and `importSnapshotStream()`, with the
+existing `signal` and `onProgress` option shapes. This does not change the published
+0.x package entry point. The staged 1.0 snapshot guide is in the cutover register.
+
+`openNativeOwnerEngine()` composes the native backend under the host's existing lease.
+The protocol server uses its snapshot operations automatically. Export pins one committed
+view and captures sequence high-water synchronously. Streaming transfers at most one
+acknowledged 1 MiB dedicated chunk at a time; cached and borrowed page buffers never transfer.
+The byte-array convenience method collects the whole archive on the client; use streaming
+for large databases.
+
+Import replaces the target. The owner excludes new work, drains commits already in progress,
+cancels other work and exports, closes transactions, and spools one-shot input to exclusive
+scratch. The replayable native loader validates and builds an unpublished generation, then
+publishes only after the footer and checksums. Scratch, frames and native metadata stay
+charged. It recovers the physical root slots before answering, including after cancellation,
+quota or an indeterminate publication error. A recovered new incarnation proves publication;
+late cancellation can therefore finish successfully. Failed unpublished imports preserve the
+old data. Unrecoverable native recovery steps the owner down and releases its lease.
+
+Successful replacement ends every old connection with `MINNOW_DATABASE_REPLACED`; open a
+new client, including after the importing client succeeds. Failed imports reset connections
+and transactions; the connector reconnects to the unchanged incarnation. Transfer handles
+never survive reconnects: restart the transfer from the original archive. Ordinary owner
+changes still preserve the database identity and exactly-once write retries.
+
+The native catalog/index/sequence scope is preserved and indexes are rebuilt with uniqueness
+and foreign-key validation. Trigger, FTS, managed, CHECK, closed-set and unindexable scopes
+still refuse with `MINNOW_SNAPSHOT_SCOPE` and TODO markers; they are never dropped silently.
+Native sequence capture is tested through `SequenceAccess`: the current default real executor
+does not implement sequence function calls, independently of snapshot transport.

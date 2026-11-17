@@ -1,3 +1,5 @@
+import { SnapshotSourceChangedError } from "../snapshot-errors.js";
+export { SnapshotSourceChangedError };
 /** One load path: immutable exact-offset reads. One-shot producers spool at the owner edge. */
 import {
   decodeSnapshotFrameHeader,
@@ -12,13 +14,7 @@ import { snapshotInput } from "./snapshot-iterator.js";
 import { snapshotTake, snapshotPace } from "./snapshot-stage.js";
 
 /** Refusal of a replay that no longer names the original bytes, not a retryable IO error. */
-export class SnapshotSourceChangedError extends Error {
-  readonly code = "MINNOW_SNAPSHOT_SOURCE_CHANGED";
-  constructor() {
-    super("Snapshot source changed during load; retry with an immutable source");
-    this.name = "SnapshotSourceChangedError";
-  }
-}
+
 /** Two streaming 32-bit mixing lanes, independent of read partitioning. This is an
  * accidental-change digest, not authentication. Do NOT use the archive CRC here: a valid
  * frame plus its own CRC has a constant CRC residue even when its contents change. */
@@ -236,12 +232,21 @@ export async function spoolSnapshotInput(
   let length = 0,
     written = 0,
     closed = false;
-  const release = async () => {
-    if (closed) return;
+  let closing: Promise<void> | undefined;
+  // Repeated close waits for the same started reclamation. Its fixed control credit
+  // belongs to this source until native cleanup settles (governor rule 8).
+  const release = (): Promise<void> => {
+    if (closing !== undefined) return closing;
     closed = true;
-    sourceGrant.close();
-    if (written > 0)
-      await scratch.release([{ offset, length: Math.ceil(written / DATA_ALIGN) * DATA_ALIGN }]);
+    closing = (async () => {
+      try {
+        if (written > 0)
+          await scratch.release([{ offset, length: Math.ceil(written / DATA_ALIGN) * DATA_ALIGN }]);
+      } finally {
+        sourceGrant.close();
+      }
+    })();
+    return closing;
   };
   try {
     if (!grant.allocate(bytes)) throw new TypeError("Lost snapshot spool admission");

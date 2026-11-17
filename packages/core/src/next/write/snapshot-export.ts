@@ -1,3 +1,5 @@
+import { SnapshotScopeError } from "../snapshot-errors.js";
+export { SnapshotScopeError };
 /** Pinned logical export. No source writes, native addresses, whole-table or whole-value copy. */
 import { snapshotInput } from "./snapshot-iterator.js";
 import { DURABLE_CODECS } from "../durable-format.js";
@@ -30,13 +32,6 @@ import {
   snapshotValueWidth,
 } from "./snapshot-column.js";
 
-export class SnapshotScopeError extends Error {
-  readonly code = "MINNOW_SNAPSHOT_SCOPE";
-  constructor(message: string) {
-    super(message);
-    this.name = "SnapshotScopeError";
-  }
-}
 function take(budget: ByteBudget, bytes: number): void {
   if (!budget.allocate(bytes)) throw new SnapshotBudgetError(bytes);
 }

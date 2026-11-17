@@ -248,6 +248,9 @@ export async function startOwnerHost<F>(
   const epoch = factory.epochOf?.(fence) ?? 1;
   const idle = init.settings.transactionIdleTimeoutMs;
   const server = new OwnerServer(engine, {
+    onFatal: () => {
+      void stop("closing", true);
+    },
     ownerId,
     epoch,
     build: init.build,
