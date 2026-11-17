@@ -40,6 +40,7 @@ export function clientCursor<TRow = Row>(
   });
   const abort = () => client.cancel(raw.seq);
   let ended = false,
+    pulling = false,
     closing: Promise<void> | null = null;
   const end = () => {
     if (ended) return;
@@ -74,6 +75,9 @@ export function clientCursor<TRow = Row>(
     },
     async next() {
       if (ended) return { done: true, value: undefined };
+      // A misuse error must not retire the valid read already waiting for a frame.
+      if (pulling) throw new TypeError("Only one cursor next() may be pending");
+      pulling = true;
       try {
         const frame = await raw.frames.next();
         if (frame.done) {
@@ -93,6 +97,8 @@ export function clientCursor<TRow = Row>(
       } catch (error) {
         end();
         throw cancelledReason(error, options.signal);
+      } finally {
+        pulling = false;
       }
     },
     async return() {

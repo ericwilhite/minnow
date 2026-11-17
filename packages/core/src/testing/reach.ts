@@ -9635,3 +9635,10 @@ export const PUBLIC_WORKER_BOOT_REACH = [
 ] as const;
 
 export const PUBLIC_WORKER_LIFETIME_REACH = ["before-init", "during-resolve", "malformed"] as const;
+
+export const PUBLIC_CURSOR_CONCURRENCY_REACH = [
+  "abort all reads settle",
+  "close all reads settle",
+  "two calls",
+  "many calls",
+] as const;

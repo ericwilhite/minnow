@@ -178,7 +178,8 @@ export interface CursorOptions extends CallOptions {
 /**
  * Rows streamed one frame at a time, with backpressure: the owner sends a frame only when the
  * consumer's window has room for it. Holds a snapshot pin until it ends; `return()` (a `break` in
- * `for await`) or `close()` releases it.
+ * `for await`) or `close()` releases it. Only one next() may be pending; overlap rejects
+ * without retiring the active read.
  */
 export interface Cursor<TRow = Row> extends AsyncIterableIterator<Result<TRow>> {
   readonly columns: Promise<readonly ResultColumn[]>;
