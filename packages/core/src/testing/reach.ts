@@ -9424,3 +9424,20 @@ export const DDL_PUBLICATION_SCHEMA_REACH = [
   "version aligned",
   "exact reopen",
 ] as const;
+
+export const DDL_STAGED_ALTER_REACH = [
+  "varlen",
+  "fixed",
+  "frozen default",
+  "NULL missing",
+  "first",
+  "middle",
+  "last",
+  "FTS checkpoint",
+  "plain staging checkpoint",
+  "staging observed",
+  "new catalog with unfolded claim",
+  "exact pre-fold reopen",
+  "native reads",
+  "exact post-fold reopen",
+] as const;

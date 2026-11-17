@@ -1526,7 +1526,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const memtable = new Memtable(
         def.id,
         ref.firstRowId,
-        def.schemaVersion,
+        effect.schemaVersion,
         def.columns,
         def.indexes.map((index) => index.id),
         this.#grant,

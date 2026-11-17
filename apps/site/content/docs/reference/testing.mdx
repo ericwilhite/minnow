@@ -1937,6 +1937,14 @@ protected-reader minimum campaign checks merge progress while real reader bytes 
 
 ### Rebuild-core catalog checkpoints
 
+The staged-ALTER campaign places ADD both before and after staging, checkpoints the newer
+catalog while the older claim remains unfolded, and reopens before allowing the fold. Fixed
+and varlen columns, NULL and frozen defaults, each native column position, and plain/FTS
+publications are generated. Bounded SQL reads, native/portable reads, and a second reopen after
+folding must preserve the same values. Published-memory membership comes from validated group
+metadata, read lazily; open still does not walk group roots. Every controlled fold gate is
+released and drained, including on failure.
+
 The DDL row-schema campaign runs DROP, ADD and RENAME at each column position over resident
 and published rows. Unrelated ordinary and FTS writes publish roots; each history reopens at
 publication, after later writes, after another ALTER, and after checkpoint/maintenance. It

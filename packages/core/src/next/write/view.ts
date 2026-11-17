@@ -378,6 +378,9 @@ class MemorySegmentImpl implements MemorySegment {
       column: (id) => this.view.column(id),
       check: () => this.view.snapshot.checkRead(),
       publishedRoot: () => need(this.memtable.published).group.root,
+      // Staged replay must remain lazy at open. The group's validated ID list, not
+      // the current catalog used to construct its wrapper, owns physical membership.
+      publishedMissing: (id) => missingScalar(need(this.view.column(id))),
       retained: (chunk) => chunk === 0 && this.#retained !== null,
       ...(this.memtable.schemaVersion === this.view.schemaVersion
         ? {}
@@ -491,7 +494,12 @@ class MemorySegmentImpl implements MemorySegment {
     return settle(groupRootOf(published.groupRoot), (root) => {
       this.view.snapshot.checkRead();
       const stored = root.columns.find((candidate) => candidate.columnId === columnId);
-      if (stored === undefined) throw new RangeError("Published portable column missing");
+      if (stored === undefined)
+        return {
+          kind: "resident",
+          vector: missingVector(need(this.view.column(columnId)), length),
+          firstRow: first,
+        };
       return { kind: "stored", chunk: stored, firstRow: 0 };
     });
   }
@@ -551,9 +559,16 @@ class MemorySegmentImpl implements MemorySegment {
     length: number,
     out: ChunkOutput,
   ): MaybePromise<ChunkResult> {
+    this.view.snapshot.checkRead();
     const stored = root.columns.find((candidate) => candidate.columnId === columnId);
     if (stored === undefined)
-      throw new RangeError(`The published group lacks column ${String(columnId)}`);
+      return {
+        vector: missingVector(need(this.view.column(columnId)), length),
+        firstRow: 0,
+        rowCount: length,
+        complete: true,
+        reason: null,
+      };
     const shared = this.view.snapshot.shared;
     const from = first + startRow;
     const to = first + length;
