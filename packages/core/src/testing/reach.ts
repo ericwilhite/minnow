@@ -9576,3 +9576,13 @@ export const PUBLIC_RESULT_CHANNEL_REACH = [
   "wide int8 stays exact",
   "numeric display scale",
 ] as const;
+
+export const PUBLIC_TRANSPORT_REACH = [
+  "prepared parameter types",
+  "structured admin reply",
+  "ordinary cursor metadata and completion",
+  "views live after close",
+  "immutable dictionary prefix",
+  "unsent close and cancellation",
+  "early return terminal fence",
+] as const;

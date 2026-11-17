@@ -46,6 +46,7 @@
  * the liveness lock (`liveness { held: true }`) before anything else is sent on it.
  */
 import { SessionLostError } from "../errors.js";
+import type { PhysicalType } from "../types.js";
 import { decodeUtf8 } from "../vector/varlen.js";
 import {
   ClientClosedError,
@@ -109,6 +110,12 @@ export interface ClientResult {
   readonly columns: readonly WireColumnMeta[];
   readonly frames: readonly FramePayload[];
   readonly summary: StatementSummary;
+  /** Already-applied dictionaries; ordinary result buffers are never relinquished. */
+  readonly dictionaries: StreamDictionaries;
+  /** PREPARE's input types (not returned for ordinary statements). */
+  readonly parameters?: readonly PhysicalType[];
+  /** Structured administrative reply, including null/false/zero. */
+  readonly value?: unknown;
   /** Decoded rows (test helper: bool, int32, int64, float64, text and dictionary text). */
   rows(): unknown[][];
 }
@@ -162,28 +169,44 @@ interface Pending {
   readonly reject: (error: Error) => void;
 }
 
-/** Frames waiting for a cursor consumer. */
+/** Frames waiting for a cursor consumer. Metadata can arrive before a result ends. */
 class CursorQueue {
   readonly frames: FramePayload[] = [];
   done: StatementSummary | null = null;
   error: Error | null = null;
   wake: (() => void) | null = null;
-}
-
-class ExportQueue extends CursorQueue {
-  readonly handles = new WeakMap<FramePayload, ExportFrame>();
+  stopped = false;
+  dictionaries = new StreamDictionaries();
   readonly columns: Promise<readonly WireColumnMeta[]>;
   resolveColumns: (columns: readonly WireColumnMeta[]) => void = () => undefined;
   rejectColumns: (error: Error) => void = () => undefined;
-  stopped = false;
   constructor() {
-    super();
     this.columns = new Promise((resolve, reject) => {
       this.resolveColumns = resolve;
       this.rejectColumns = reject;
     });
     this.columns.catch(() => undefined);
   }
+}
+
+class ExportQueue extends CursorQueue {
+  readonly handles = new WeakMap<FramePayload, ExportFrame>();
+}
+
+export interface PreparedInfo {
+  readonly id: number;
+  readonly columns: readonly WireColumnMeta[];
+  readonly parameters: readonly PhysicalType[];
+  readonly catalogVersion: number;
+}
+export interface OrdinaryCursor {
+  readonly seq: number;
+  readonly columns: Promise<readonly WireColumnMeta[]>;
+  readonly done: Promise<StatementSummary>;
+  readonly frames: AsyncIterableIterator<FramePayload>;
+  /** Stable immutable entry prefix for a Result retained after this cursor closes. */
+  snapshotDictionaries(): StreamDictionaries;
+  close(): void;
 }
 
 const randomClientId = (): string => {
@@ -228,11 +251,14 @@ function makeResult(
   frames: readonly FramePayload[],
   summary: StatementSummary,
   dictionaries: StreamDictionaries,
+  extra?: Pick<Partial<ClientResult>, "parameters" | "value">,
 ): ClientResult {
   return {
     columns,
     frames,
     summary,
+    dictionaries,
+    ...extra,
     rows: () => {
       const rows: unknown[][] = [];
       for (const frame of frames)
@@ -440,6 +466,7 @@ export class ProtocolClient {
       }
       pending.frames.length = 0;
       pending.dictionaries = new StreamDictionaries();
+      if (pending.cursor !== null) pending.cursor.dictionaries = pending.dictionaries;
       pending.columns = null;
       this.#send(pending, pending.sent);
     }
@@ -555,12 +582,29 @@ export class ProtocolClient {
     }).promise;
   }
 
-  async prepare(
-    sql: string,
-  ): Promise<{ readonly id: number; readonly columns: readonly WireColumnMeta[] }> {
+  prepare(sql: string): Promise<PreparedInfo> {
+    return this.prepareTask(sql).promise;
+  }
+
+  /** Same opaque request, with its sequence available for terminal-aware cancellation. */
+  prepareTask(sql: string): { readonly seq: number; readonly promise: Promise<PreparedInfo> } {
     const id = ++this.#prepared;
-    const result = await this.#request({ t: "prepare", id, text: sql }).promise;
-    return { id, columns: result.columns };
+    const task = this.#request({ t: "prepare", id, text: sql });
+    return {
+      seq: task.seq,
+      promise: task.promise.then((result) => ({
+        id,
+        columns: result.columns,
+        parameters: result.parameters ?? [],
+        catalogVersion: result.summary.catalogVersion,
+      })),
+    };
+  }
+
+  /** Releases a connection-scoped prepared handle. It cannot survive a reconnect. */
+  unprepare(id: number): void {
+    this.#preparedKinds.delete(id);
+    if (!this.#closed) this.#port?.postMessage({ t: "unprepare", id });
   }
 
   execute(
@@ -601,8 +645,12 @@ export class ProtocolClient {
   cursor(
     sql: string,
     params: readonly WireValue[] = [],
-    options: { readonly windowBytes?: number; readonly session?: number } = {},
-  ): { readonly seq: number; readonly frames: AsyncIterableIterator<FramePayload>; close(): void } {
+    options: {
+      readonly windowBytes?: number;
+      readonly session?: number;
+      readonly frameRows?: number;
+    } = {},
+  ): OrdinaryCursor {
     const queue = new CursorQueue();
     const { seq, promise } = this.#request(
       {
@@ -614,13 +662,22 @@ export class ProtocolClient {
         params,
         result: {
           windowBytes: options.windowBytes ?? DEFAULT_RESULT_WINDOW_BYTES,
-          frameRows: null,
+          frameRows: options.frameRows ?? null,
           wantRows: true,
         },
       },
       queue,
     );
-    promise.catch(() => undefined);
+    const done = promise.then((result) => result.summary);
+    done.catch(() => undefined);
+    const stop = () => {
+      if (queue.stopped) return;
+      queue.stopped = true;
+      queue.frames.length = 0;
+      this.cancel(seq, true);
+      queue.dictionaries = new StreamDictionaries();
+      queue.wake?.();
+    };
     const window = options.windowBytes ?? DEFAULT_RESULT_WINDOW_BYTES;
     const release = (frame: FramePayload) => {
       this.#queueRelease(seq, frame.sequence, payloadBytes(frame), window);
@@ -631,6 +688,7 @@ export class ProtocolClient {
       },
       next: async (): Promise<IteratorResult<FramePayload>> => {
         for (;;) {
+          if (queue.stopped) return { value: undefined, done: true };
           const frame = queue.frames.shift();
           if (frame !== undefined) {
             release(frame);
@@ -643,17 +701,48 @@ export class ProtocolClient {
           });
         }
       },
+      return: async () => {
+        stop();
+        await done.catch(() => undefined);
+        return { value: undefined, done: true };
+      },
     };
     return {
       seq,
       frames,
-      close: () => {
-        this.cancel(seq, true);
-      },
+      columns: queue.columns,
+      done,
+      snapshotDictionaries: () => queue.dictionaries.snapshot(),
+      close: stop,
     };
   }
 
   cancel(seq: number, close = false): void {
+    if (seq < 0) return; // Refused before a sequence was allocated.
+    const pending = this.#pending.get(seq);
+    if (pending !== undefined && !pending.sent) {
+      if (!close) this.#fail(pending, new CancelledError());
+      else {
+        this.#settle(seq);
+        const summary: StatementSummary = {
+          ...emptySummary(),
+          closedEarly: true,
+          transaction:
+            pending.session === 0
+              ? this.#session0.transaction
+              : pending.session === null
+                ? "idle"
+                : (this.#sessions.get(pending.session) ?? "idle"),
+        };
+        if (pending.cursor) {
+          pending.cursor.done = summary;
+          pending.cursor.resolveColumns([]);
+          pending.cursor.wake?.();
+        }
+        pending.resolve(makeResult([], [], summary, pending.dictionaries));
+      }
+      return;
+    }
     this.#port?.postMessage({ t: "cancel", target: seq, close });
   }
 
@@ -860,6 +949,7 @@ export class ProtocolClient {
     if (this.#pending.size === 0) this.#lastHeardAt = this.#now();
     this.#pending.set(seq, pending);
     if (cursor !== null) {
+      cursor.dictionaries = pending.dictionaries;
       this.#cursors++;
       const closeCursor = () => {
         this.#cursors--;
@@ -951,7 +1041,7 @@ export class ProtocolClient {
   ): { readonly seq: number; readonly promise: Promise<ClientResult> } {
     if (cursor !== null) {
       cursor.error = error;
-      if (cursor instanceof ExportQueue) cursor.rejectColumns(error);
+      cursor.rejectColumns(error);
       cursor.wake?.();
     }
     return { seq: -1, promise: Promise.reject(error) };
@@ -974,8 +1064,8 @@ export class ProtocolClient {
           window,
           pending.sentOn === this.#generation,
         );
-        pending.cursor.rejectColumns(error);
       }
+      pending.cursor.rejectColumns(error);
       pending.cursor.error = error;
       pending.cursor.wake?.();
     }
@@ -1038,9 +1128,14 @@ export class ProtocolClient {
           this.#fail(pending, error instanceof Error ? error : new Error(String(error)));
           return;
         }
+        if (pending.cursor !== null && (pending.columns !== null || message.t === "done")) {
+          pending.cursor.resolveColumns(pending.columns ?? []);
+          // Metadata has escaped too: a reconnect cannot silently change this cursor's schema.
+          pending.handedOut = true;
+        }
         const last = message.frames.at(-1);
         if (pending.cursor !== null) {
-          if (!(pending.cursor instanceof ExportQueue))
+          if (!(pending.cursor instanceof ExportQueue) && !pending.cursor.stopped)
             for (const frame of message.frames) pending.cursor.frames.push(frame);
           if (message.frames.length > 0) pending.handedOut = true;
         } else {
@@ -1102,6 +1197,7 @@ export class ProtocolClient {
               catalogVersion: message.catalogVersion,
             },
             pending.dictionaries,
+            { parameters: message.parameters },
           ),
         );
         return;
@@ -1115,7 +1211,9 @@ export class ProtocolClient {
           return;
         }
         this.#settle(message.seq);
-        pending.resolve(makeResult([], [], emptySummary(), pending.dictionaries));
+        pending.resolve(
+          makeResult([], [], emptySummary(), pending.dictionaries, { value: message.value }),
+        );
         return;
       }
       case "sessionAborted":

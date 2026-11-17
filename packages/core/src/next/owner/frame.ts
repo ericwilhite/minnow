@@ -93,6 +93,15 @@ export class StreamDictionaries {
     dictionary.size += delta.values.length;
   }
 
+  /** Immutable prefix ownership for an ordinary Result; data buffers stay shared, never copied. */
+  snapshot(): StreamDictionaries {
+    const result = new StreamDictionaries();
+    result.#nextSequence = this.#nextSequence;
+    for (const [id, dictionary] of this.#dictionaries)
+      result.#dictionaries.set(id, { size: dictionary.size, parts: dictionary.parts.slice() });
+    return result;
+  }
+
   /** Entries of dictionary `id` so far. */
   size(id: number): number {
     return this.#dictionaries.get(id)?.size ?? 0;

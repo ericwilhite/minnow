@@ -4492,3 +4492,11 @@ prefix. Constants expand only for column access. NULL payloads are never interpr
 JavaScript arrays have zero-based nested dimensions; the original SQL bounds remain available
 in the array column's encoded bytes. Caller-retained views live with the Result and must not
 be passed to the explicit recycling export API. There is no package entry-point switch here.
+
+The internal protocol client now preserves the PREPARE parameter types and structured admin
+reply values that the owner already sends. Ordinary cursors expose column metadata, terminal
+completion and immutable dictionary prefixes for the canonical Result decoder. Closing or
+returning a cursor releases the owner's stream without detaching consumer-held ordinary
+views. An unsent cancellation settles locally, so a later connection cannot run it. Explicit
+recycling exports retain their separate return-buffer contract. These are internal transport
+bindings; the public entry points and default engine have not switched.
