@@ -9948,3 +9948,43 @@ export const NATIVE_BODY_REFERENCE_REACH = [
   "resident",
   "zero ownership",
 ] as const;
+
+export const NATIVE_FOLLOW_GROUP_REACH = [
+  "explicit CASCADE PG",
+  "omitted follow shipped",
+  "swap",
+  "rotation",
+  "nonunique completed group",
+  "unique completed group",
+  "child constraint identity",
+  "failure before later AFTER",
+  "published",
+  "resident",
+  "zero ownership",
+  "whole group OLD before writes",
+] as const;
+
+export const NATIVE_FOLLOW_GROUP_PRESSURE_REACH = [
+  "published",
+  "resident",
+  "rotation",
+  "64MiB competing credit",
+  "bounded files",
+  "fixed charged metadata",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_SCHEMA_IDENTITY_REACH = [
+  "drop earlier position",
+  "drop later position",
+  "published",
+  "resident",
+  "rekey",
+  "delete",
+  "rollback",
+  "commit",
+  "stable index identities",
+  "add after RI",
+  "ordinary reopen",
+  "zero ownership",
+] as const;

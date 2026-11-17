@@ -1,4 +1,5 @@
-/** One concrete named RI action. Full OLD inputs are sealed before any mutation;
+/** One concrete named RI continuation (a complete original-target group for follow).
+ * Full OLD inputs are sealed before any mutation;
  * child BEFORE runs inline, while child AFTER appends through the caller's hooks. */
 import type { StatementImpl } from "../write/transaction.js";
 import type { CatalogView } from "../access/catalog.js";
@@ -70,7 +71,25 @@ export class NativeReferentialMutations {
     return this.#scope;
   }
   async run(entry: ReferentialEntry, hooks: NativeRowHooks, signal: AbortSignal): Promise<void> {
-    await this.scope.statement.guard(() => this.runAction(entry, hooks, signal));
+    await this.scope.statement.guard(async () => {
+      if (entry.kind !== "follow") {
+        await this.runAction(entry, hooks, signal);
+        return;
+      }
+      for await (const member of this.scope.following.group(entry.id, signal)) {
+        const child = this.scope.catalog.tables.find((table) =>
+          table.foreignKeys.some((fk) => fk.id === member.fkId),
+        );
+        if (!child) throw new TypeError("Missing follow child");
+        const targets = await this.scope.following.require(member.id, signal),
+          input = await this.scope.inputs.seal(child.id, targets, signal);
+        await this.scope.following.bindChildInput(member.id, input, signal);
+        this.scope.releaseIdleStep();
+      }
+      for await (const member of this.scope.following.group(entry.id, signal))
+        await this.runAction(member, hooks, signal);
+      await this.scope.following.completeGroup(entry.id, signal);
+    });
   }
   private async runAction(
     entry: ReferentialEntry,
@@ -149,11 +168,15 @@ export class NativeReferentialMutations {
           ? await scope.following.require(entry.id, signal)
           : await scope.checks.captureChildren(parent, child.id, fk.id, scope.targets, signal);
       check();
-      const input = await scope.inputs.seal(child.id, targets, signal);
+      const input =
+        entry.kind === "follow"
+          ? await scope.following.childInput(entry.id, signal)
+          : await scope.inputs.seal(child.id, targets, signal);
       check();
       try {
         const shape = await scope.inputs.describe(input, signal);
         check();
+        if (shape.tableId !== child.id) throw new TypeError("Foreign RI child input");
         scope.releaseIdleStep();
         for (let i = 0; i < shape.count; i++) {
           await scope.checkpoint();

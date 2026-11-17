@@ -11,16 +11,28 @@ import { SpillCorruptionError } from "../spill/contract.js";
 import type { RegistryCommands } from "./registry-commands.js";
 import type { RegistryDirectory } from "./registry-directory.js";
 import type { RegistryTargets } from "./registry-targets.js";
+import type { NativeChildInputRef } from "./child-inputs.js";
 import type { NativeCommandChecks } from "./command-checks.js";
 
 export const REGISTRY_FOLLOWING_BYTES = 1024;
-const FOLLOWING = 9;
+export function registryFollowingBytes(catalog: CatalogView, frames = 3): number {
+  if (!Number.isInteger(frames) || frames < 1 || frames > 3) invalid();
+  let keys = 0;
+  for (const table of catalog.tables)
+    for (const fk of table.foreignKeys) if (fk.onUpdate === "follow") keys++;
+  const bytes = REGISTRY_FOLLOWING_BYTES + 256 + 8 * keys + frames * (256 + 8 * keys);
+  if (!Number.isSafeInteger(bytes)) invalid();
+  return bytes;
+}
+const FOLLOWING = 9,
+  FOLLOW_INPUT = 14;
 export interface RegistryFollowingScope {
   readonly rootId: number;
+  readonly frames?: number;
   readonly catalog: CatalogView;
   readonly commands: Pick<
     RegistryCommands,
-    "verify" | "rowReferentialEntries" | "resolveReferential"
+    "verify" | "rowReferentialEntries" | "resolveReferential" | "active"
   >;
   readonly directory: RegistryDirectory;
   readonly targets: RegistryTargets;
@@ -44,16 +56,30 @@ export class RegistryFollowing {
   #closing: Promise<void> | null = null;
   #failure: { reason: unknown } | null = null;
   #closed = false;
+  readonly #bytes: number;
+  #keys: Float64Array | null = null;
+  #groups: Array<{ command: CommandToken | null; heads: Float64Array }> = [];
   constructor(scope: RegistryFollowingScope) {
     scope.signal.throwIfAborted();
     if (!Number.isSafeInteger(scope.rootId) || scope.rootId < 1) invalid();
-    if (!scope.charge.allocate(REGISTRY_FOLLOWING_BYTES))
+    this.#bytes = registryFollowingBytes(scope.catalog, scope.frames);
+    if (!scope.charge.allocate(this.#bytes))
       throw new RangeError("Follow metadata must be admitted");
     this.#scope = scope;
     try {
       this.#record = new Uint8Array(128);
+      let keys = 0;
+      for (const table of scope.catalog.tables)
+        for (const fk of table.foreignKeys) if (fk.onUpdate === "follow") keys++;
+      this.#keys = new Float64Array(keys);
+      let at = 0;
+      for (const table of scope.catalog.tables)
+        for (const fk of table.foreignKeys) if (fk.onUpdate === "follow") this.#keys[at++] = fk.id;
+      this.#keys.sort();
+      for (let n = 0; n < (scope.frames ?? 3); n++)
+        this.#groups.push({ command: null, heads: new Float64Array(keys) });
     } catch (error) {
-      scope.charge.free(REGISTRY_FOLLOWING_BYTES);
+      scope.charge.free(this.#bytes);
       this.#scope = null;
       throw error;
     }
@@ -128,6 +154,39 @@ export class RegistryFollowing {
       corrupt();
     return { spoolId: this.scope.rootId, from, count };
   }
+  #groupSlot(command: CommandToken) {
+    let slot = this.#groups.find((slot) => slot.command?.id === command.id);
+    if (!slot) {
+      slot = this.#groups.find(
+        (slot) => !slot.command || !this.scope.commands.active(slot.command),
+      );
+      if (!slot) invalid();
+      slot.command = command;
+      slot.heads.fill(0);
+    }
+    return slot;
+  }
+  #keyIndex(fkId: number) {
+    const keys = this.#keys ?? invalid();
+    let lo = 0,
+      hi = keys.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if ((keys[mid] ?? Infinity) < fkId) lo = mid + 1;
+      else hi = mid;
+    }
+    if (keys[lo] !== fkId) invalid();
+    return lo;
+  }
+  async #packet(id: number, signal: AbortSignal) {
+    const record = this.#record ?? invalid();
+    if (!(await this.scope.directory.get(FOLLOWING, id, record))) invalid();
+    this.#check(signal);
+    const view = viewOf(record);
+    if (view.getFloat64(0, true) !== this.scope.rootId || view.getFloat64(8, true) !== id)
+      corrupt();
+    return view;
+  }
   /** After newly accepted primary rows pass uniqueness and before their AFTER drain.
    * Every new follow range is sealed before any RI writer runs. Subsequent checkpoints
    * visit NEW accepted rows only; re-probing an old key after follow writes is wrong. */
@@ -165,7 +224,11 @@ export class RegistryFollowing {
               range.count < 0
             )
               invalid();
-            const record = this.#record ?? invalid(),
+            const slot = this.#groupSlot(command),
+              key = this.#keyIndex(fk.id),
+              saved = slot.heads[key] ?? 0,
+              leader = saved === 0 ? entry.id : saved,
+              record = this.#record ?? invalid(),
               view = viewOf(record);
             record.fill(0);
             view.setFloat64(0, this.scope.rootId, true);
@@ -180,8 +243,28 @@ export class RegistryFollowing {
             view.setFloat64(72, child.id, true);
             view.setFloat64(80, child.schemaVersion, true);
             view.setInt8(88, entry.triggerBudget);
+            view.setFloat64(104, leader, true);
+            if (leader === entry.id) view.setFloat64(112, entry.id, true);
             await this.scope.directory.put(FOLLOWING, entry.id, record);
             this.#check(inner);
+            if (leader === entry.id) slot.heads[key] = entry.id;
+            else {
+              const first = await this.#packet(leader, inner),
+                tail = first.getFloat64(112, true);
+              if (
+                first.getFloat64(16, true) !== command.id ||
+                first.getFloat64(32, true) !== fk.id ||
+                first.getUint8(120) !== 0
+              )
+                corrupt();
+              const last = await this.#packet(tail, inner);
+              last.setFloat64(96, entry.id, true);
+              await this.scope.directory.put(FOLLOWING, tail, record);
+              const head = await this.#packet(leader, inner);
+              head.setFloat64(112, entry.id, true);
+              await this.scope.directory.put(FOLLOWING, leader, record);
+              this.#check(inner);
+            }
           }
         },
         stop,
@@ -197,14 +280,117 @@ export class RegistryFollowing {
       return (await this.#read(entry, stop)) ?? invalid();
     });
   }
+  /** One omitted-update follow group is a statement-end uniqueness unit. Packets and
+   * captured original targets spill in shared storage; no per-row resident list exists. */
+  async *group(id: number, signal: AbortSignal): AsyncIterable<ReferentialEntry> {
+    const start = await this.#work(signal, async (stop) => {
+      const entry = await this.scope.commands.resolveReferential(id);
+      this.#foreignKey(entry);
+      if (!(await this.#read(entry, stop))) invalid();
+      const own = await this.#packet(id, stop),
+        leader = own.getFloat64(104, true),
+        head = await this.#packet(leader, stop);
+      if (head.getUint8(120) === 1) return null;
+      if (head.getUint8(120) !== 0 || head.getFloat64(104, true) !== leader) corrupt();
+      return { leader, tail: head.getFloat64(112, true), command: entry.commandId, fk: entry.fkId };
+    });
+    if (!start) return;
+    let cursor = start.leader;
+    for (;;) {
+      const item = await this.#work(signal, async (stop) => {
+        const entry = await this.scope.commands.resolveReferential(cursor);
+        if (entry.commandId !== start.command || entry.fkId !== start.fk) corrupt();
+        this.#foreignKey(entry);
+        const view = await this.#packet(cursor, stop);
+        if (view.getFloat64(104, true) !== start.leader) corrupt();
+        return { entry, next: view.getFloat64(96, true) };
+      });
+      yield item.entry;
+      if (cursor === start.tail) break;
+      if (!Number.isSafeInteger(item.next) || item.next <= cursor) corrupt();
+      cursor = item.next;
+    }
+  }
+  /** Scalar input handles use the shared directory; whole-group OLD payloads never form
+   * a resident list or one file per parent. All seals precede the first group mutation. */
+  bindChildInput(id: number, input: NativeChildInputRef, signal: AbortSignal): Promise<void> {
+    return this.#work(signal, async (stop) => {
+      const entry = await this.scope.commands.resolveReferential(id),
+        { child } = this.#foreignKey(entry);
+      if (!(await this.#read(entry, stop))) invalid();
+      if (input.rootId !== this.scope.rootId || !Number.isSafeInteger(input.id) || input.id < 1)
+        invalid();
+      const record = this.#record ?? invalid();
+      if (await this.scope.directory.get(FOLLOW_INPUT, id, record)) invalid();
+      this.#check(stop);
+      record.fill(0);
+      const view = viewOf(record);
+      view.setFloat64(0, this.scope.rootId, true);
+      view.setFloat64(8, id, true);
+      view.setFloat64(16, entry.commandId, true);
+      view.setFloat64(24, entry.fkId, true);
+      view.setFloat64(32, child.id, true);
+      view.setFloat64(40, child.schemaVersion, true);
+      view.setFloat64(48, input.id, true);
+      await this.scope.directory.put(FOLLOW_INPUT, id, record);
+      this.#check(stop);
+    });
+  }
+  childInput(id: number, signal: AbortSignal): Promise<NativeChildInputRef> {
+    return this.#work(signal, async (stop) => {
+      const entry = await this.scope.commands.resolveReferential(id),
+        { child } = this.#foreignKey(entry),
+        record = this.#record ?? invalid();
+      if (!(await this.scope.directory.get(FOLLOW_INPUT, id, record))) invalid();
+      this.#check(stop);
+      const view = viewOf(record);
+      if (
+        view.getFloat64(0, true) !== this.scope.rootId ||
+        view.getFloat64(8, true) !== id ||
+        view.getFloat64(16, true) !== entry.commandId ||
+        view.getFloat64(24, true) !== entry.fkId ||
+        view.getFloat64(32, true) !== child.id ||
+        view.getFloat64(40, true) !== child.schemaVersion
+      )
+        corrupt();
+      const input = view.getFloat64(48, true);
+      if (!Number.isSafeInteger(input) || input < 1) corrupt();
+      return { rootId: this.scope.rootId, id: input };
+    });
+  }
+  completeGroup(id: number, signal: AbortSignal): Promise<void> {
+    return this.#work(signal, async (stop) => {
+      const entry = await this.scope.commands.resolveReferential(id);
+      this.#foreignKey(entry);
+      if (!(await this.#read(entry, stop))) invalid();
+      const own = await this.#packet(id, stop),
+        leader = own.getFloat64(104, true),
+        head = await this.#packet(leader, stop);
+      if (
+        head.getFloat64(104, true) !== leader ||
+        head.getFloat64(16, true) !== entry.commandId ||
+        head.getFloat64(32, true) !== entry.fkId ||
+        head.getUint8(120) > 1
+      )
+        corrupt();
+      head.setUint8(120, 1);
+      await this.scope.directory.put(FOLLOWING, leader, this.#record ?? invalid());
+      const slot = this.#groups.find((slot) => slot.command?.id === entry.commandId),
+        key = this.#keyIndex(entry.fkId);
+      if (slot?.heads[key] === leader) slot.heads[key] = 0;
+      this.#check(stop);
+    });
+  }
   close(): Promise<void> {
     return (this.#closing ??= (async () => {
       this.#closed = true;
       this.#stop.abort(new Error("Native follow inputs closed"));
       await this.#pending?.catch(() => undefined);
       this.#record = null;
+      this.#keys = null;
+      this.#groups = [];
       this.#failure = null;
-      this.scope.charge.free(REGISTRY_FOLLOWING_BYTES);
+      this.scope.charge.free(this.#bytes);
       this.#scope = null;
     })());
   }

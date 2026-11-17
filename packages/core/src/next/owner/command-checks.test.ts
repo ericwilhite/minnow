@@ -19,7 +19,7 @@ import {
 } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import type { RowTargetRange } from "../access/statement-command.js";
-import { RegistryFollowing, REGISTRY_FOLLOWING_BYTES } from "./registry-following.js";
+import { RegistryFollowing, registryFollowingBytes } from "./registry-following.js";
 import { RegistryTargets } from "./registry-targets.js";
 import { readRows } from "../write/rows.js";
 import { KeyBatch, encodeKeyBatch } from "../keys/key-encoding.js";
@@ -884,7 +884,7 @@ for (const seed of seedsFor("next-registry-following", [0xb623, 0xb624]))
             });
             const capture = vi.spyOn(f.checks, "captureChildren");
             try {
-              expect(f.grant.allocated - before).toBe(REGISTRY_FOLLOWING_BYTES);
+              expect(f.grant.allocated - before).toBe(registryFollowingBytes(f.statement.catalog));
               await pg.exec(
                 "DROP TABLE IF EXISTS c;DROP TABLE IF EXISTS p;CREATE TABLE p(id INT PRIMARY KEY);INSERT INTO p VALUES(1),(2),(3);CREATE TABLE c(id INT PRIMARY KEY,pid INT REFERENCES p(id))",
               );
@@ -1189,7 +1189,8 @@ for (const seed of seedsFor("next-registry-following-lifetime", [0xb625]))
                 });
               else f.stop.abort(new Error("native follow cancelled"));
               await yieldTask();
-              const paid = f.grant.allocated === before + REGISTRY_FOLLOWING_BYTES,
+              const paid =
+                  f.grant.allocated === before + registryFollowingBytes(f.statement.catalog),
                 cancelled = (observed as AbortSignal | null)?.aborted === true,
                 early = closed;
               resume();

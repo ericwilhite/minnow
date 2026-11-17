@@ -127,6 +127,16 @@ export class RegistryCommands {
     if (frame?.command.frameId !== command.frameId) invalid();
     return frame;
   }
+  /** Bounded lifetime query for companion frame-owned metadata; never revives a token. */
+  active(command: CommandToken): boolean {
+    this.#check();
+    return (
+      command.rootId === this.scope.rootId &&
+      this.#frames.some(
+        (frame) => frame?.command.id === command.id && frame.command.frameId === command.frameId,
+      )
+    );
+  }
   #work<T>(run: () => Promise<T>): Promise<T> {
     this.#check();
     if (this.#pending) invalid();

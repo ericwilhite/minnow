@@ -201,6 +201,7 @@ export async function referentialFixture(
     }),
     following = new RegistryFollowing({
       rootId: 39,
+      frames,
       catalog,
       commands,
       directory,

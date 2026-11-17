@@ -4327,7 +4327,12 @@ AFTER uses. A bounded per-frame descriptor list covers one row, not the affected
 SET NULL, lowered SET DEFAULT, RESTRICT/NO ACTION and original-identity rekey-follow.
 Every action seals complete child OLD inputs before mutation, then runs child BEFORE and
 appends child AFTER through the containing controller. It never drains outer AFTER work.
-The boundary checks newly accepted child uniqueness before each action resolves. SET DEFAULT
+Explicit actions check newly accepted child uniqueness before each action resolves. Omitted
+ON UPDATE follow applies the complete captured command/FK group and checks its child uniqueness
+before returning to user AFTER work or another RI action. This preserves unique child swaps and
+rotations; a nonunique completed group reports23505 with the child constraint identity. Group
+links share the root spill directory, with charged catalog-sized headers per live frame.
+SET DEFAULT
 also checks remaining references to the old parent key; NO ACTION allows an equivalent live
 replacement parent, while RESTRICT reports23001. Informational references follow by bounded
 scan and skip delete/existence actions. Linked NEW scalar descriptors share parent/unchanged
