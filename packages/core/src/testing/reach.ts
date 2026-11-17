@@ -11455,3 +11455,27 @@ export const NATIVE_TRIGGER_FOLLOW_REACH = [
   "exact original-target rows",
   "zero native ownership",
 ] as const;
+
+export const NATIVE_TRIGGER_CANCEL_REACH = [
+  "first",
+  "middle",
+  "last",
+  "checkpoint error",
+  "AbortSignal cancellation",
+  "published",
+  "resident",
+  "empty commit after statement undo",
+  "exact parent RI and nested rows",
+  "prefix registrations retired",
+  "zero native ownership",
+] as const;
+
+export const PIPELINE_ABORT_WAIT_REACH = [
+  "already aborted",
+  "abort during wait",
+  "producer rejects",
+  "producer resolves",
+  "pending producer",
+  "settled producer",
+  "original cancellation reason",
+] as const;

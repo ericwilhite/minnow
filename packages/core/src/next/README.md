@@ -5027,3 +5027,15 @@ publication and nested bodies. A ledger splits the same twelve runs and six exam
 per seed between self/external cases and proves exactly-once execution. Native phase/FIFO
 laws remain covered by the provider's follow-group campaigns. Observation reads return
 retired command credit first; the test caller is still not a production funding recipe.
+
+The native cancellation campaign injects an AbortSignal or a checkpoint failure at the
+first, middle and final measured checkpoint of the real root/RI/nested-body graph.
+After its fences drain, no failed-statement effects may commit; parent, child, log,
+audit and trace rows must be unchanged. Prefix reader registrations, retained chunks,
+write-path state, grants and spill ownership must retire. Cleanup aggregates may retain
+the original failure as their cause; the comparison does not require Error identity.
+The shared pipeline observes even an already-cancelled wait's producer promise, so a
+later producer rejection cannot escape as an unhandled rejection. This does not wait
+for the producer before reporting cancellation; native source and image cleanup still
+fence outstanding borrows separately. Owner cancel-versus-commit and lost-reply policy
+remain separate qualification work; this does not enable SQL firing.

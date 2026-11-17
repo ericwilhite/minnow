@@ -131,7 +131,12 @@ function abortReason(signal: AbortSignal): Error {
  */
 export function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (signal === undefined) return promise;
-  if (signal.aborted) return Promise.reject(abortReason(signal));
+  if (signal.aborted) {
+    // The producer was started before this call. Its eventual rejection still needs
+    // an observer, even though cancellation wins without waiting for its completion.
+    void promise.catch(() => undefined);
+    return Promise.reject(abortReason(signal));
+  }
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => {
       reject(abortReason(signal));
