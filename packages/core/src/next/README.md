@@ -4305,14 +4305,48 @@ has no compiled trigger-body host or generic SQL enablement; refusal guards rema
 range through the prepaid native support-index cursor and shared spilled directory. It
 uses projected key bindings, closes its phase pin/cursor before returning, and retains no
 per-child array. Root integration must capture every original follow range before RI
-writes and complete OLD/NEW input images before child mutations. The informational and
-invalid-index scan route, child action writer and compiled body provider remain guarded
-integration work; this helper alone does not enable FK/trigger scheduling.
+writes and complete OLD/NEW input images before child mutations. Informational references
+without support indexes use a projected native scan and the same bounded target directory;
+unrelated payloads are not decoded. Invalid enforced support indexes still refuse. This
+helper alone does not enable FK/trigger scheduling.
 
 Native command records keep independent accepted-row checkpoints for uniqueness,
 original follow-input preparation and reference checks. Completing one phase cannot
 suppress another phase or later writes on the same token. This is bookkeeping for
-the guarded provider; the follow preparation/action scheduler is not enabled here.
+the guarded provider; no SQL path installs its follow preparation/action executor yet.
+
+### Concrete native RI continuations
+
+`owner/native-rows.ts` runs one admitted BEFORE → generated rules → native primary
+continuation and registers actual child-reference and parent-action entries from accepted
+images. Generated calculations stay in the shared row-rule scope. Source/image loans and
+unused source credit retire before writer growth; immutable OLD/NEW refs survive queued
+AFTER uses. A bounded per-frame descriptor list covers one row, not the affected rowset.
+
+`owner/referential-mutations.ts` supplies the concrete registry action callback: CASCADE,
+SET NULL, lowered SET DEFAULT, RESTRICT/NO ACTION and original-identity rekey-follow.
+Every action seals complete child OLD inputs before mutation, then runs child BEFORE and
+appends child AFTER through the containing controller. It never drains outer AFTER work.
+The boundary checks newly accepted child uniqueness before each action resolves. SET DEFAULT
+also checks remaining references to the old parent key; NO ACTION allows an equivalent live
+replacement parent, while RESTRICT reports23001. Informational references follow by bounded
+scan and skip delete/existence actions. Linked NEW scalar descriptors share parent/unchanged
+payload fragments without changing canonical OLD or materializing unrelated values.
+
+These internal components are composed with the actual native writer and B6 controller in
+generated PGlite action/rollback/key-order and small-cap tests. The later user-AFTER error
+adapter in the per-action uniqueness test is synthetic, not a compiled-body proof. Native
+primary preflight still refuses auto-increment and wide/variable indexed domains. Native
+sequence defaults retain their kernel refusal; RI assignments to generated FK columns also
+refuse rather than silently recomputing away the assignment. The compiled COMPLETE-MODIFY body host,
+production root admission/setup and joint trigger ordering verification remain unfinished;
+SQL firing and advanced-RI refusal guards remain in place. No stored format changes.
+
+The source ordinary minimum includes the fixed native decoder/IO workspace; fixed buffers
+must not be mistaken for a variable value that exceeds the shared reserve. The in-memory
+spill test service looks up append-ordered offsets by binary search, so registry page count
+does not introduce a linear scan for every read. Its stored pages remain a test double for
+external scratch storage; the governor assertions cover native resident accounts.
 
 ### Portable snapshot load
 

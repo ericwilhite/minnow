@@ -265,6 +265,20 @@ export class ForeignKeyViolationError extends ConstraintError {
   }
 }
 
+/** 23001. Explicit RESTRICT refuses a referenced parent at its ordered RI event. */
+export class RestrictViolationError extends ConstraintError {
+  readonly code = "MINNOW_RESTRICT_VIOLATION";
+  readonly sqlState = "23001";
+  constructor(
+    tableId: number,
+    readonly foreignKeyId: number,
+    readonly key: Uint8Array,
+  ) {
+    super(`Foreign key ${String(foreignKeyId)} restricts the parent change`, tableId);
+    this.name = "RestrictViolationError";
+  }
+}
+
 /** 23502. `row` is the physical batch row, or −1 for a row a foreign-key action wrote. */
 export class NotNullViolationError extends ConstraintError {
   readonly code = "MINNOW_NOT_NULL_VIOLATION";

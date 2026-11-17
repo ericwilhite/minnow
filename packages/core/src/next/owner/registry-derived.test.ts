@@ -4,8 +4,8 @@ import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, REGISTRY_DERIVED_REACH } from "../../testing/reach.js";
 import { prefixFixture } from "./prefix-images.test-support.js";
-import { ints, texts } from "../write/test-support.js";
-import { valueAt } from "../exec/kernels/test-support.js";
+import { batch, ints, texts } from "../write/test-support.js";
+import { valueAt, decimal, decimals } from "../exec/kernels/test-support.js";
 
 function required<T>(value: T | undefined): T {
   if (value === undefined) throw new Error("Missing native image column");
@@ -21,9 +21,10 @@ for (const seed of seedsFor("next-registry-derived", [0xb631, 0xb632]))
         fc.boolean(),
         fc.boolean(),
         fc.constantFrom(0, 24000, 80000),
-        async (published, nullable, reverse, width) => {
+        fc.boolean(),
+        async (published, nullable, reverse, width, alias) => {
           reach.beginHistory();
-          const f = await prefixFixture(2, width, published, false);
+          const f = await prefixFixture(2, width, published, false, true);
           try {
             const id = f.ids[1],
               table = f.statement.catalog.table(f.tableId);
@@ -32,12 +33,27 @@ for (const seed of seedsFor("next-registry-derived", [0xb631, 0xb632]))
               key = table.columns[0],
               payload = table.columns[2];
             if (!key || !payload) throw new Error("Missing physical columns");
+            const sourceTable = f.statement.catalog.table(f.extraId),
+              sourceKey = sourceTable?.columns[0];
+            if (!sourceTable || !sourceKey) throw new Error("Missing linked table");
+            const sourceInput = (id: number) => ({
+                batch: batch(ints([id]), decimals(decimal(38, 0), [[1n, 0]]), texts(["source"])),
+                row: 0,
+              }),
+              parent = await f.images.append(sourceTable.id, sourceInput(76), sourceInput(77));
             const read = vi.spyOn(f.fragments, "readInto"),
               append = vi.spyOn(f.fragments, "append"),
               paid = f.root.allocated;
             let updated;
             try {
-              const changes = [{ columnId: key.id, value: ints([77]) }];
+              const changes = [
+                {
+                  columnId: key.id,
+                  value: alias
+                    ? { image: parent, side: "new" as const, columnId: sourceKey.id }
+                    : ints([77]),
+                },
+              ];
               updated = await f.images.derive(old, "old", changes, f.stop.signal);
               expect(read, "derivation reads scalar descriptors only").not.toHaveBeenCalled();
               expect(
@@ -80,6 +96,22 @@ for (const seed of seedsFor("next-registry-derived", [0xb631, 0xb632]))
                 image.release();
               }
             }
+            const inserted = await f.images.append(sourceTable.id, null, sourceInput(90)),
+              finalized = await f.images.derive(
+                inserted,
+                "new",
+                [{ columnId: sourceKey.id, value: ints([99]) }],
+                f.stop.signal,
+              ),
+              insertImage = await f.images.readRowImages(finalized, f.stop.signal);
+            try {
+              expect(insertImage.old).toBeNull();
+              expect(valueAt(required(insertImage.new?.columns[0]), 0)).toBe(99);
+            } finally {
+              insertImage.release();
+            }
+            reach.reach("insert NEW");
+            reach.reach(alias ? "linked parent scalar" : "owned scalar");
             reach.reach(published ? "published" : "resident");
             reach.reach(nullable ? "NULL replacement" : "value replacement");
             reach.reach(reverse ? "reverse replacements" : "ordered replacements");
@@ -97,9 +129,9 @@ for (const seed of seedsFor("next-registry-derived", [0xb631, 0xb632]))
         seed,
         numRuns: 12,
         examples: [
-          [false, false, false, 0],
-          [true, true, true, 80000],
-          [false, true, false, 24000],
+          [false, false, false, 0, false],
+          [true, true, true, 80000, true],
+          [false, true, false, 24000, true],
         ],
       },
     );

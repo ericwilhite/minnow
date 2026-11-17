@@ -111,6 +111,7 @@ it.each(seedsFor("next-registry-commands", [0xb5e5]))(
           const add = async (command: CommandToken, event: WriteEvent) => {
             const item = row(command, id++, event);
             await f.commands.accept(item);
+            expect(await f.commands.accepted(command, item.images)).toEqual(item);
             return item;
           };
           const finish = async (command: CommandToken) => {

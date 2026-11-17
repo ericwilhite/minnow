@@ -309,6 +309,12 @@ export class RegistryCommands {
       next: view.getFloat64(32, true),
     };
   }
+  /** Canonical accepted metadata; no mutable record or key buffer escapes. */
+  accepted(command: CommandToken, images: RowImageRef): Promise<AcceptedCommandRow> {
+    this.#frame(command);
+    if (images.spoolId !== this.scope.rootId) invalid();
+    return this.#work(async () => (await this.#row(command, images.row)).row);
+  }
   /** Called for every action, including a second action under a previously verified token.
    * Only the successful prefix advances. No AFTER callback or root end is invoked here. */
   verify(

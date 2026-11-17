@@ -32,6 +32,15 @@ export interface ImageSource {
   readonly batch: Batch;
   readonly row: number;
 }
+export interface RegistryImageLink {
+  readonly image: RowImageRef;
+  readonly side: "old" | "new";
+  readonly columnId: number;
+}
+export interface RegistryImagePatch {
+  readonly columnId: number;
+  readonly value: Vector | RegistryImageLink | null;
+}
 export interface NativeImageShape {
   readonly tableId: number;
   readonly hasOld: boolean;
@@ -217,7 +226,7 @@ export class RegistryImages {
   derive(
     ref: RowImageRef,
     source: "old" | "new",
-    changes: ReadonlyArray<{ readonly columnId: number; readonly value: Vector | null }>,
+    changes: readonly RegistryImagePatch[],
     signal: AbortSignal,
   ): Promise<RowImageRef> {
     this.#check(signal);
@@ -226,17 +235,24 @@ export class RegistryImages {
       const { table, oldHead, nextHead } = await this.#info(ref, signal),
         header = this.#header ?? state(),
         scalar = this.#scalar ?? state();
-      if (!oldHead || !IMAGE_SIDES.includes(source)) state();
+      if (!IMAGE_SIDES.includes(source)) state();
       let cursor = source === "old" ? oldHead : nextHead,
         capture = 0;
       if (!cursor) state();
       for (const [i, change] of changes.entries()) {
         const column = table.columns.find((candidate) => candidate.id === change.columnId);
         if (!column || changes.some((other, k) => k < i && other.columnId === column.id)) state();
-        if (change.value) {
+        if (change.value && "form" in change.value) {
           if (change.value.length !== 1 || !samePhysicalType(column.type, change.value.type))
             state();
           capture = Math.max(capture, registryScalarStoreBytes(change.value, 0));
+        } else if (change.value) {
+          this.#origin(change.value.image);
+          if (!IMAGE_SIDES.includes(change.value.side)) state();
+          const link = change.value,
+            linked = await this.#info(link.image, signal),
+            sourceColumn = linked.table.columns.find((candidate) => candidate.id === link.columnId);
+          if (!sourceColumn || !samePhysicalType(sourceColumn.type, column.type)) state();
         }
       }
       if (capture > 0) {
@@ -255,7 +271,9 @@ export class RegistryImages {
           change = changes.find((entry) => entry.columnId === column.id);
         if (view.getFloat64(8, true) !== column.id) corrupt();
         if (change) {
-          if (change.value) {
+          if (change.value && !("form" in change.value)) {
+            await this.#copyLink(change.value, signal);
+          } else if (change.value) {
             await storeRegistryScalar(
               scalar,
               change.value,
@@ -272,6 +290,7 @@ export class RegistryImages {
         }
         const id = (this.#nextScalar = nextId(this.#nextScalar));
         view.setFloat64(0, 0, true);
+        view.setFloat64(8, column.id, true);
         await this.scope.directory.put(SCALAR, id, scalar);
         this.#check(signal);
         if (previous) {
@@ -291,13 +310,36 @@ export class RegistryImages {
       view.setFloat64(8, first, true);
       view.setFloat64(16, table.id, true);
       view.setFloat64(24, table.schemaVersion, true);
-      view.setUint8(32, 1);
+      view.setUint8(32, oldHead > 0 ? 1 : 0);
       view.setUint8(33, 1);
       view.setUint32(36, table.columns.length, true);
       await this.scope.directory.put(IMAGE, id, header);
       this.#check(signal);
       return { spoolId: this.scope.rootId, row: id };
     });
+  }
+  /** Copy a selected source descriptor through the prepaid buffers, validating the
+   * complete source chain. No scalar payload is decoded/copied or leased. */
+  async #copyLink(link: RegistryImageLink, signal: AbortSignal): Promise<void> {
+    const { table, oldHead, nextHead } = await this.#info(link.image, signal),
+      scalar = this.#scalar ?? state(),
+      header = this.#header ?? state();
+    let cursor = link.side === "old" ? oldHead : nextHead,
+      found = false;
+    if (!cursor) state();
+    for (const column of table.columns) {
+      await this.#get(SCALAR, cursor, scalar);
+      this.#check(signal);
+      const view = viewOf(scalar);
+      if (view.getFloat64(8, true) !== column.id) corrupt();
+      cursor = view.getFloat64(0, true);
+      if (column.id === link.columnId) {
+        header.set(scalar);
+        found = true;
+      }
+    }
+    if (!found || cursor !== 0) corrupt();
+    scalar.set(header);
   }
   #validateProjection(table: TableDef, projection: RowBindingProjection): void {
     for (const side of [projection.old, projection.new])

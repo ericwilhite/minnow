@@ -29,6 +29,12 @@ format chain still starts with its first released writer. This fixes both
 FTS-triggered reopen failures and native maintenance column misassociation. Released 0.x
 behavior and formats are unchanged; this does not repair already-damaged development stores.
 
+The unexported rebuild now has concrete native foreign-key action components, including
+complete child-row spooling, shared row rules, original-identity rekey-follow and per-action
+child uniqueness checks. They remain behind the current SQL guards while the compiled trigger
+body host and production root integration are completed. Fixed decoder workspace is admitted
+before native source reads. No released API, stored-format or migration change is required.
+
 The shipped engine’s fast path for SUM and AVG over floating-point columns adds values directly,
 recovering overhead introduced by the 0.19.3 integer-exactness checks. SQL integer aggregates
 still reject inexact intermediate results; floating-point accumulation order is unchanged.

@@ -20,7 +20,9 @@ import { setInt128 } from "../vector/int128.js";
 import type { PhysicalType } from "../types.js";
 import { sourceSlot } from "../write/columns.js";
 import type { StatementImpl } from "../write/transaction.js";
-import { MEMORY_READ_HINT_BYTES } from "../write/memory-read.js";
+import { MAX_READ_BYTES } from "../access/space.js";
+import { scratchBytes as predicateScratchBytes } from "../page/select.js";
+import { MEMORY_READ_HINT_BYTES, MEMORY_READ_RESIDENT_BYTES } from "../write/memory-read.js";
 import type { RegistryImages } from "./registry-images.js";
 
 export interface NativePrefixImageScope {
@@ -45,9 +47,17 @@ export function nativePrefixImageBytes(columns: number): number {
   if (!Number.isSafeInteger(bytes)) invalid();
   return bytes;
 }
+/** Fixed native decode/IO belongs to ordinary admission. Only a row's variable
+ * payload may use the shared reserve after the publication-stable hint. */
+const MEMORY_STEP_BYTES =
+  MEMORY_READ_HINT_BYTES +
+  MEMORY_READ_RESIDENT_BYTES +
+  MAX_READ_BYTES +
+  65536 * 8 +
+  predicateScratchBytes(4096);
 export function nativePrefixSourceBytes(table: TableDef): number {
   return (
-    MEMORY_READ_HINT_BYTES +
+    MEMORY_STEP_BYTES +
     memoryScanBufferBytes(table.columns.map((column) => column.type)) +
     6 * BATCH_ROWS * Uint16Array.BYTES_PER_ELEMENT +
     2048 * table.columns.length +
@@ -299,7 +309,7 @@ export class NativePrefixImages {
             const complete = Math.max(
               minimum,
               minimum -
-                MEMORY_READ_HINT_BYTES +
+                MEMORY_STEP_BYTES +
                 hint.residentBytes +
                 hint.scratchBytes +
                 hint.ioBytes +

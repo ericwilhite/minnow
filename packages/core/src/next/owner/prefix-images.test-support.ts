@@ -1,4 +1,5 @@
 /** Real native source/image fixture shared by payload and complete-input tests. */
+import { Governor } from "../memory/governor.js";
 import { expect } from "vitest";
 import { ChunkReader } from "../page/reader.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
@@ -31,11 +32,15 @@ export async function prefixFixture(
   width: number,
   published: boolean,
   nullable: boolean,
+  extraTable = false,
+  capBytes = 256 * 1024 * 1024,
 ) {
-  const h = new Harness("strict", "memory", 256),
-    path = await h.open(),
+  const h = new Harness("strict", "memory", 256);
+  Object.defineProperty(h, "governor", { value: new Governor(capBytes) });
+  const path = await h.open(),
     type = decimal(38, 0);
-  let tableId = 0;
+  let tableId = 0,
+    extraId = 0;
   await autocommit(path, async (s) => {
     tableId =
       (
@@ -49,6 +54,20 @@ export async function prefixFixture(
         })
       ).id ?? 0;
   });
+  if (extraTable)
+    await autocommit(path, async (statement) => {
+      extraId =
+        (
+          await statement.changeCatalog({
+            kind: "createTable",
+            table: tableInput("source", [
+              column("id", INT, false),
+              column("n", type),
+              column("payload", TEXT),
+            ]),
+          })
+        ).id ?? 0;
+    });
   const coefficients = Array.from({ length: rows }, (_, i) =>
     i % 3 === 0 ? BigInt(i + 1) : i % 3 === 1 ? 2n ** 56n + BigInt(i) : 10n ** 30n + BigInt(i),
   );
@@ -156,6 +175,7 @@ export async function prefixFixture(
     source,
     ids,
     tableId,
+    extraId,
     coefficients,
     payloads,
     fragments,

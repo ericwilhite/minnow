@@ -9606,6 +9606,9 @@ export const NATIVE_CHILD_INPUT_FENCE_REACH = [
 
 /** RI image proposals preserve canonical OLD and share unchanged fragmented payloads. */
 export const REGISTRY_DERIVED_REACH = [
+  "insert NEW",
+  "linked parent scalar",
+  "owned scalar",
   "published",
   "resident",
   "NULL replacement",
@@ -9617,5 +9620,183 @@ export const REGISTRY_DERIVED_REACH = [
   "no payload copy",
   "canonical OLD",
   "successive derivations",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PARENT_KEY_REACH = [
+  "removed parent",
+  "retained parent",
+  "resident",
+  "published",
+  "primary",
+  "secondary",
+  "changed",
+  "unchanged",
+  "parent present",
+  "parent absent",
+  "NULL OLD",
+  "NULL NEW",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_RESTRICTION_REACH = [
+  "resident",
+  "published",
+  "restrict",
+  "noAction",
+  "empty children",
+  "referenced",
+  "replacement parent",
+  "no replacement",
+  "end failure",
+  "end success",
+  "zero ownership",
+] as const;
+
+export const NATIVE_INFORMATIONAL_CAPTURE_REACH = [
+  "resident",
+  "published",
+  "empty",
+  "matching",
+  "large unrelated payload",
+  "small payload",
+  "projected memory source",
+  "fixed metadata",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_MUTATION_REACH = [
+  "plain",
+  "notNull",
+  "check",
+  "generated",
+  "CASCADE",
+  "SET NULL",
+  "SET DEFAULT",
+  "RESTRICT",
+  "NO ACTION",
+  "rekey",
+  "delete",
+  "published",
+  "resident",
+  "children",
+  "empty",
+  "valid",
+  "same",
+  "missing",
+  "commit",
+  "rollback",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_FOLLOW_REACH = [
+  "informational scan",
+  "indexed follow",
+  "published",
+  "resident",
+  "swapped identities",
+  "generated child",
+  "zero ownership",
+] as const;
+export const NATIVE_RI_INCREMENTAL_UNIQUE_REACH = [
+  "published",
+  "resident",
+  "actions 1",
+  "actions 2",
+  "actions 3",
+  "child unique before later error",
+  "old reference before later error",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_COMPOSITE_REACH = [
+  "CASCADE",
+  "SET NULL",
+  "SET DEFAULT",
+  "reversed key",
+  "declared key",
+  "rekey",
+  "delete",
+  "published",
+  "resident",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_PRESSURE_REACH = [
+  "rekey",
+  "delete",
+  "published",
+  "resident",
+  "64MiB",
+  "competing credit",
+  "many child segments",
+  "bounded files",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PREFIX_FIXED_STEP_REACH = [
+  "published",
+  "resident",
+  "payload",
+  "empty payload",
+  "64MiB competing credit",
+  "zero ownership",
+] as const;
+
+export const MEMORY_SPILL_OFFSET_REACH = [
+  "between pages",
+  "empty",
+  "many pages",
+  "few pages",
+  "absent",
+  "present",
+  "exact offset",
+] as const;
+
+export const MEMORY_SPILL_NATIVE_OFFSET_REACH = [
+  "checksum",
+  "payload",
+  "many pages",
+  "few pages",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_LIFETIME_REACH = [
+  "published",
+  "resident",
+  "close fence",
+  "caller cancel",
+  "complete child input",
+  "no borrow across continuation",
+  "rollback",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_GENERATED_KEY_REACH = [
+  "published",
+  "resident",
+  "delete cascade allowed",
+  "assignment refused",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_REPLACEMENT_REACH = [
+  "CASCADE",
+  "SET NULL",
+  "SET DEFAULT",
+  "rekey",
+  "delete",
+  "published",
+  "resident",
+  "replacement parent",
+  "zero ownership",
+] as const;
+
+export const NATIVE_ROW_BORROW_REACH = [
+  "BEFORE placeholders",
+  "published",
+  "resident",
+  "frozen leases",
+  "generated values",
   "zero ownership",
 ] as const;

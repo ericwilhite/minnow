@@ -31,6 +31,21 @@ export class MemorySpillService implements SpillService {
   }
 }
 
+/** Exact lookup in append order. Registry scratch files contain many tiny pages;
+ * metadata probes must grow logarithmically with page count, without a second directory. */
+export function findSpillOffset(offsets: readonly number[], offset: number): number {
+  let low = 0,
+    high = offsets.length - 1;
+  while (low <= high) {
+    const middle = low + Math.floor((high - low) / 2),
+      value = offsets[middle];
+    if (value === offset) return middle;
+    if (value !== undefined && value < offset) low = middle + 1;
+    else high = middle - 1;
+  }
+  return -1;
+}
+
 export class MemorySpillFile implements SpillFile {
   readonly queryId: number;
   readonly #onClose: () => void;
@@ -59,7 +74,7 @@ export class MemorySpillFile implements SpillFile {
 
   async read(ref: SpillPageRef): Promise<Uint8Array> {
     if (this.#closed) throw new TypeError("Spill file is closed");
-    const index = this.#offsets.indexOf(ref.offset);
+    const index = findSpillOffset(this.#offsets, ref.offset);
     const page = this.#pages[index];
     if (page?.length !== ref.length || xxHash32(page) !== ref.checksum)
       throw new SpillCorruptionError(`Spill page at ${String(ref.offset)} failed verification`);
@@ -73,7 +88,7 @@ export class MemorySpillFile implements SpillFile {
 
   /** Test seam: flips one byte of a stored page. */
   corrupt(ref: SpillPageRef, byte: number): void {
-    const page = this.#pages[this.#offsets.indexOf(ref.offset)];
+    const page = this.#pages[findSpillOffset(this.#offsets, ref.offset)];
     if (page !== undefined) page[byte] = (page[byte] ?? 0) ^ 0xff;
   }
 

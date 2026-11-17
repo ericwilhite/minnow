@@ -2,7 +2,11 @@
  * Root funds the shared cursor step; image leases end before its progress callback. */
 import type { CatalogView, ColumnDef, IndexDef, TableDef } from "../access/catalog.js";
 import type { IndexCursor, IndexRangePlan } from "../access/key-index.js";
-import { ForeignKeyViolationError, UniqueViolationError } from "../access/modify.js";
+import {
+  ForeignKeyViolationError,
+  UniqueViolationError,
+  RestrictViolationError,
+} from "../access/modify.js";
 import {
   ROW_IMAGE_UNREAD,
   type NativeCommandBoundary,
@@ -12,12 +16,16 @@ import { encodeKeyBatch, KeyBatch, type KeyColumn } from "../keys/key-encoding.j
 import { MinimumBudget } from "../memory/working-set.js";
 import type { Grant } from "../memory/governor.js";
 import type { ByteCharge } from "../vector/varlen.js";
-import type { Vector } from "../vector/vector.js";
+import { BATCH_ROWS, type Vector } from "../vector/vector.js";
 import type { RegistryTargets } from "./registry-targets.js";
 import type { AcceptedCommandRow } from "./registry-commands.js";
 import { isNullAt } from "../write/columns.js";
 import { indexLimitViolation, indexMaximumKeyBytes } from "../write/index-limits.js";
 import type { StatementImpl } from "../write/transaction.js";
+import type { ChunkReads } from "../exec/scan.js";
+import { TableScan, memoryScanBufferBytes } from "../exec/table-scan.js";
+import { OutputArena } from "../exec/kernels/vectors.js";
+import { MEMORY_READ_HINT_BYTES, MEMORY_READ_RESIDENT_BYTES } from "../write/memory-read.js";
 import { ViewIndex } from "../write/view.js";
 
 function invalid(): never {
@@ -52,6 +60,11 @@ export interface NativeCommandCheckScope {
   /** Root-owned shared range step. No image borrow exists here. No nested self-admission;
    * root obtains/retains its prepaid cursor grant and releases idle producer credit as needed. */
   prepareRange(plan: IndexRangePlan, signal: AbortSignal): Promise<Grant>;
+  /** Shared root source step for informational references without a support index. */
+  readonly scan?: {
+    readonly reads: ChunkReads;
+    prepare(table: TableDef, minimum: number, signal: AbortSignal): Promise<Grant>;
+  };
 }
 export class NativeCommandChecks {
   readonly #stop = new AbortController();
@@ -62,6 +75,8 @@ export class NativeCommandChecks {
   #vectors: Vector[] = [];
   #parts: KeyColumn[] = [];
   #out: Float64Array | null = null;
+  #previous: Uint8Array | null = null;
+  #one: Uint16Array | null = null;
   #pending: Promise<unknown> | null = null;
   #closing: Promise<void> | null = null;
   #closed = false;
@@ -80,6 +95,8 @@ export class NativeCommandChecks {
     try {
       this.#keys = new KeyBatch(account, sizes.capacity, sizes.capacity);
       this.#out = new Float64Array(2);
+      this.#previous = new Uint8Array(sizes.capacity);
+      this.#one = new Uint16Array(1);
     } catch (error) {
       this.#keys?.close();
       this.#keys = null;
@@ -221,8 +238,8 @@ export class NativeCommandChecks {
    * support-index cursor. Caller captures ALL follow inputs before any RI write;
    * DELETE/explicit actions call this at their ordered RI event against a fresh prefix.
    * No payload/image/producer lease survives cursor preparation or the returned range.
-   * The root must preflight a valid leading support index for this implementation; the
-   * separately guarded informational/invalid-index scan route is not supplied here. */
+   * Enforced references require a valid leading support index. Informational references
+   * without one use the root-funded projected scan; unrelated payloads are not decoded. */
   captureChildren(
     parent: Pick<AcceptedCommandRow, "tableId" | "images">,
     childId: number,
@@ -242,8 +259,12 @@ export class NativeCommandChecks {
         invalid();
       const index = def.indexes.find((candidate) => candidate.id === fk.parentIndexId),
         support = child.indexes.find((candidate) => candidate.id === fk.supportIndexId);
+      if (!index) invalid();
+      if (!support && !fk.enforced) {
+        const key = await this.#key(parent, index, index.columnIds, stop, "old");
+        return this.#captureScan(child, fk.columnIds, key, targets, stop);
+      }
       if (
-        !index ||
         !support ||
         support.invalid === true ||
         !fk.columnIds.every((id, position) => support.columnIds[position] === id)
@@ -296,6 +317,209 @@ export class NativeCommandChecks {
     });
   }
 
+  /** Only FK columns are decoded; unrelated child payloads are never materialized.
+   * This source runs before any RI writer, and yields into the fixed target directory,
+   * not a callback/body/admission consumer. All source loans/pins end before return. */
+  async #captureScan(
+    child: TableDef,
+    ids: readonly number[],
+    key: Uint8Array | null,
+    targets: RegistryTargets,
+    signal: AbortSignal,
+  ): Promise<RowTargetRange> {
+    const scope = this.scope,
+      source = scope.scan ?? invalid(),
+      previous = this.#previous ?? invalid(),
+      one = this.#one ?? invalid(),
+      keys = this.#keys ?? invalid();
+    if (key && key.length > previous.length) invalid();
+    if (key) previous.set(key);
+    const length = key?.length ?? 0;
+    return targets.capture(async function* (stop) {
+      if (!key) return;
+      signal.throwIfAborted();
+      stop.throwIfAborted();
+      const types = ids.map(
+          (id) => child.columns.find((column) => column.id === id)?.type ?? invalid(),
+        ),
+        minimum =
+          MEMORY_READ_HINT_BYTES +
+          MEMORY_READ_RESIDENT_BYTES +
+          memoryScanBufferBytes(types) +
+          131072 +
+          32768 * ids.length,
+        budget = await source.prepare(child, minimum, signal);
+      signal.throwIfAborted();
+      stop.throwIfAborted();
+      if (budget.loaned !== 0 || budget.held - budget.allocated < minimum) invalid();
+      const pin = scope.statement.readOwn();
+      let scan: TableScan | null = null,
+        arena: OutputArena | null = null;
+      const abort = () => scan?.abort();
+      signal.addEventListener("abort", abort, { once: true });
+      stop.addEventListener("abort", abort, { once: true });
+      try {
+        const table = pin.internalTable(child.id);
+        arena = new OutputArena(budget, BATCH_ROWS);
+        scan = new TableScan({
+          table,
+          columns: ids,
+          filter: null,
+          emitLocator: true,
+          pages: pin.pages,
+          reads: source.reads,
+          budget,
+          context: { arena, params: { slots: [] }, input: types },
+          boundedMemory: true,
+          loans: { borrow: (bytes) => budget.borrow(bytes, signal) },
+        });
+        for (;;) {
+          const item = await scan.next();
+          signal.throwIfAborted();
+          stop.throwIfAborted();
+          pin.checkRead();
+          if (!item) break;
+          try {
+            const batch = item.batch,
+              locator = batch.columns[ids.length];
+            if (locator?.form !== "flat" || locator.data.layout !== "f64") invalid();
+            const parts: KeyColumn[] = [];
+            for (let c = 0; c < ids.length; c++)
+              parts.push({
+                vector: batch.columns[c] ?? invalid(),
+                direction: "asc",
+                nulls: "first",
+              });
+            for (let k = 0; k < (batch.selection?.count ?? batch.length); k++) {
+              const row = batch.selection?.rows[k] ?? k;
+              if (parts.some((part) => isNullAt(part.vector, row))) continue;
+              one[0] = row;
+              const encoded = encodeKeyBatch(
+                "equality",
+                parts,
+                { length: batch.length, selection: { rows: one, count: 1 } },
+                keys,
+              );
+              if (!encoded.done || encoded.encoded !== 1) invalid();
+              const candidate = keys.key(0);
+              if (candidate.length !== length) continue;
+              let equal = true;
+              for (let i = 0; i < length; i++)
+                if (candidate[i] !== previous[i]) {
+                  equal = false;
+                  break;
+                }
+              if (equal) {
+                yield {
+                  tableId: child.id,
+                  rowId: table.rowId(locator.data.values[row] ?? invalid()),
+                };
+                signal.throwIfAborted();
+                stop.throwIfAborted();
+                pin.checkRead();
+              }
+            }
+          } finally {
+            item.transfer?.release();
+          }
+        }
+      } finally {
+        signal.removeEventListener("abort", abort);
+        stop.removeEventListener("abort", abort);
+        scan?.abort();
+        arena?.close();
+        pin.release();
+      }
+    });
+  }
+
+  /** Unchanged and NULL OLD keys have no RI action. Save equality bytes in prepaid
+   * scratch before encoding NEW; the shared KeyBatch is overwritten on each encode. */
+  parentKeyChanged(
+    row: Pick<AcceptedCommandRow, "tableId" | "images">,
+    indexId: number,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    return this.#work(signal, async (stop) => {
+      const table = tableOf(this.scope.statement.catalog, row.tableId),
+        index = table.indexes.find((index) => index.id === indexId) ?? invalid(),
+        old = await this.#key(row, index, index.columnIds, stop, "old"),
+        previous = this.#previous ?? invalid();
+      if (!old) return false;
+      if (old.length > previous.length) invalid();
+      previous.set(old);
+      const length = old.length,
+        next = await this.#key(row, index, index.columnIds, stop, "new");
+      if (next?.length !== length) return true;
+      for (let i = 0; i < length; i++) if (previous[i] !== next[i]) return true;
+      return false;
+    });
+  }
+  /** A NULL NEW reference has no child check. Unlike parent actions, NULL OLD to
+   * non-NULL NEW is a change and must not be silently skipped. */
+  referenceNeedsCheck(
+    row: AcceptedCommandRow,
+    fkId: number,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    return this.#work(signal, async (stop) => {
+      if (row.event === "delete") return false;
+      const table = tableOf(this.scope.statement.catalog, row.tableId),
+        fk = table.foreignKeys.find((fk) => fk.id === fkId) ?? invalid(),
+        parent = tableOf(this.scope.statement.catalog, fk.parentTableId),
+        index = parent.indexes.find((index) => index.id === fk.parentIndexId) ?? invalid(),
+        next = await this.#key(row, index, fk.columnIds, stop, "new"),
+        previous = this.#previous ?? invalid();
+      if (!next) return false;
+      if (row.event === "insert") return true;
+      if (next.length > previous.length) invalid();
+      previous.set(next);
+      const length = next.length,
+        old = await this.#key(row, index, fk.columnIds, stop, "old");
+      if (old?.length !== length) return true;
+      for (let i = 0; i < length; i++) if (previous[i] !== old[i]) return true;
+      return false;
+    });
+  }
+  /** NO ACTION checks the final prefix: an equivalent replacement parent can satisfy
+   * the OLD key. RESTRICT must not use this exemption. No image survives range funding. */
+  oldParentKeyExists(
+    row: Pick<AcceptedCommandRow, "tableId" | "images">,
+    indexId: number,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    return this.#work(signal, async (stop) => {
+      const table = tableOf(this.scope.statement.catalog, row.tableId),
+        index = table.indexes.find((index) => index.id === indexId) ?? invalid(),
+        key = await this.#key(row, index, index.columnIds, stop, "old");
+      return key !== null && (await this.#matches(table.id, index, key, 1, stop)) !== 0;
+    });
+  }
+  /** Ordered parent constraint action. A complete fresh child capture established
+   * referenced; no callback or mutation runs between that capture and this check. */
+  verifyParentRestriction(
+    row: Pick<AcceptedCommandRow, "tableId" | "images">,
+    foreignKeyId: number,
+    referenced: boolean,
+    restrict: boolean,
+    signal: AbortSignal,
+  ): Promise<void> {
+    return this.#work(signal, async (stop) => {
+      if (!referenced) return;
+      const table = tableOf(this.scope.statement.catalog, row.tableId);
+      let indexId: number | null = null;
+      for (const child of this.scope.statement.catalog.tables)
+        for (const fk of child.foreignKeys)
+          if (fk.id === foreignKeyId && fk.parentTableId === table.id && fk.enforced)
+            indexId = fk.parentIndexId;
+      const index = table.indexes.find((candidate) => candidate.id === indexId) ?? invalid(),
+        key = await this.#key(row, index, index.columnIds, stop, "old");
+      if (!key) return;
+      if (!restrict && (await this.#matches(table.id, index, key, 1, stop)) !== 0) return;
+      if (restrict) throw new RestrictViolationError(table.id, foreignKeyId, key.slice());
+      throw new ForeignKeyViolationError(table.id, foreignKeyId, "referenced", key.slice());
+    });
+  }
   verifyUnique(row: AcceptedCommandRow, signal: AbortSignal): Promise<void> {
     return this.#work(signal, async (stop) => {
       if (!(await this.#live(row, stop))) return;
@@ -329,6 +553,8 @@ export class NativeCommandChecks {
       this.#keys?.close();
       this.#keys = null;
       this.#out = null;
+      this.#previous = null;
+      this.#one = null;
       this.#columns.length = this.#vectors.length = this.#parts.length = 0;
       const account = this.#account ?? invalid();
       account.free(this.#metadata);

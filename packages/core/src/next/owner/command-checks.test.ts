@@ -7,6 +7,9 @@ import { currentEngine } from "../../testing/differential-current.js";
 import {
   createReach,
   NATIVE_COMMAND_CHECK_REACH,
+  NATIVE_PARENT_KEY_REACH,
+  NATIVE_RI_RESTRICTION_REACH,
+  NATIVE_INFORMATIONAL_CAPTURE_REACH,
   NATIVE_COMMAND_ACTION_CHECK_REACH,
   NATIVE_COMMAND_CHECK_LIFETIME_REACH,
   NATIVE_COMMAND_CHECK_CONSTRUCTION_REACH,
@@ -22,11 +25,15 @@ import { readRows } from "../write/rows.js";
 import { KeyBatch, encodeKeyBatch } from "../keys/key-encoding.js";
 import type { NativeCommandBoundary } from "../access/statement-command.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
+import { NativeCommandExecution } from "./command-execution.js";
+import { NativeReferentialChecks } from "./referential-checks.js";
 import { NativeCommandChecks, commandCheckMinimumBytes } from "./command-checks.js";
 import { RegistryDirectory } from "./registry-directory.js";
 import { RegistryFragments } from "./registry-fragments.js";
 import { RegistryImages } from "./registry-images.js";
 import { RegistryCommands, type AcceptedCommandRow } from "./registry-commands.js";
+import { ChunkReader } from "../page/reader.js";
+import { MemoryReads } from "../write/memory-read.js";
 import { ViewIndex } from "../write/view.js";
 import { StatementImpl } from "../write/transaction.js";
 import {
@@ -41,6 +48,7 @@ import {
   tableInput,
   rules,
   locators,
+  rowsOf,
 } from "../write/test-support.js";
 
 async function code(run: () => unknown): Promise<string | null> {
@@ -65,6 +73,9 @@ async function fixture(
   count: number,
   beforeRange?: (signal: AbortSignal) => Promise<void>,
   childCount = 0,
+  deleteMode: "noAction" | "restrict" = "noAction",
+  enforced = true,
+  payloadWidth = 0,
 ) {
   const h = new Harness("strict", "memory", 256),
     path = await h.open();
@@ -98,8 +109,8 @@ async function fixture(
                   columns: [1],
                   parentTableId: parent,
                   parentIndexId: def.primaryKey,
-                  onDelete: "noAction",
-                  enforced: true,
+                  onDelete: deleteMode,
+                  enforced,
                 },
               ],
             },
@@ -123,7 +134,7 @@ async function fixture(
           batch(
             ints(positions.map((i) => i + 1)),
             ints(positions.map((i) => (i % 5 === 0 ? null : (i % Math.min(count, 2)) + 1))),
-            texts(positions.map(() => "child")),
+            texts(positions.map(() => "child" + "雪".repeat(payloadWidth))),
           ),
           null,
         ),
@@ -202,6 +213,15 @@ async function fixture(
     images: projected,
     charge: grant,
     signal: stop.signal,
+    scan: {
+      reads: { open: (pages, chunk, options) => ChunkReader.open(pages, chunk, options) },
+      prepare: async (_table, minimum, signal) => {
+        signal.throwIfAborted();
+        expect(leases).toBe(0);
+        expect(range.held - range.allocated).toBeGreaterThanOrEqual(minimum);
+        return range;
+      },
+    },
     prepareRange: async (plan, signal) => {
       expect(leases).toBe(0);
       await beforeRange?.(signal);
@@ -255,6 +275,7 @@ async function fixture(
       return accepted;
     },
     async close() {
+      await statement.closeNativeCommands();
       await commands.close();
       await checks.close();
       await targets.close();
@@ -1228,3 +1249,392 @@ for (const seed of seedsFor("next-registry-following-lifetime", [0xb625]))
     );
     reach.assertReached();
   }, 60000);
+
+for (const seed of seedsFor("next-native-parent-key-probes", [0xb633, 0xb634]))
+  it(`checks RI OLD/NEW equality and final parent availability ${String(seed)}`, async () => {
+    const reach = createReach("native RI parent keys", NATIVE_PARENT_KEY_REACH),
+      pg = new PGlite();
+    try {
+      await pg.exec(
+        "CREATE TABLE p(id INT PRIMARY KEY,u INT UNIQUE); INSERT INTO p SELECT i,i FROM generate_series(1,5) i",
+      );
+      await fc.assert(
+        fc.asyncProperty(
+          fc.option(fc.integer({ min: 0, max: 7 }), { nil: null }),
+          fc.option(fc.integer({ min: 0, max: 7 }), { nil: null }),
+          fc.boolean(),
+          fc.boolean(),
+          fc.boolean(),
+          async (before, after, secondary, published, remove) => {
+            reach.beginHistory();
+            const f = await fixture(published, 5);
+            try {
+              const table = f.statement.catalog.table(f.parent);
+              if (!table) throw new Error("Missing parent");
+              const index = secondary
+                ? table.indexes.find((index) => index.unique && index.id !== table.primaryKey)
+                : table.indexes.find((index) => index.id === table.primaryKey);
+              if (!index) throw new Error("Missing parent index");
+              const old = batch(ints([before ?? 0]), ints([before]), texts(["old"])),
+                next = batch(ints([after ?? 0]), ints([after]), texts(["new"])),
+                images = await f.images.append(
+                  f.parent,
+                  { batch: old, row: 0 },
+                  { batch: next, row: 0 },
+                ),
+                row = { tableId: f.parent, images },
+                oldKey = secondary ? before : (before ?? 0),
+                newKey = secondary ? after : (after ?? 0),
+                expected = (
+                  await pg.query<{ changed: boolean }>(
+                    "SELECT $1::int IS NOT NULL AND $1::int IS DISTINCT FROM $2::int AS changed",
+                    [oldKey, newKey],
+                  )
+                ).rows[0]?.changed;
+              expect(
+                await f.checks.parentKeyChanged(row, index.id, f.stop.signal),
+                "RI action selection uses saved OLD bytes",
+              ).toBe(expected);
+              await pg.exec("TRUNCATE p; INSERT INTO p SELECT i,i FROM generate_series(1,5) i");
+              if (remove && oldKey !== null && oldKey >= 1 && oldKey <= 5) {
+                const pin = f.statement.readOwn();
+                try {
+                  await f.statement
+                    .table(f.parent, { inputView: pin, uniqueTargets: true })
+                    .delete(batch(locators([oldKey - 1], f.parent)), null);
+                } finally {
+                  pin.release();
+                }
+                await pg.query("DELETE FROM p WHERE id=$1", [oldKey]);
+                reach.reach("removed parent");
+              } else reach.reach("retained parent");
+              const exists = (
+                await pg.query<{ found: boolean }>(
+                  `SELECT EXISTS(SELECT FROM p WHERE ${secondary ? "u" : "id"}=$1) AS found`,
+                  [oldKey],
+                )
+              ).rows[0]?.found;
+              expect(
+                await f.checks.oldParentKeyExists(row, index.id, f.stop.signal),
+                "NO ACTION resolves the final parent prefix",
+              ).toBe(exists);
+              expect(f.leases).toBe(0);
+              reach.reach(published ? "published" : "resident");
+              reach.reach(secondary ? "secondary" : "primary");
+              reach.reach(expected ? "changed" : "unchanged");
+              reach.reach(exists ? "parent present" : "parent absent");
+              if (secondary && before === null) reach.reach("NULL OLD");
+              if (secondary && before !== null && after === null) reach.reach("NULL NEW");
+            } finally {
+              await f.close();
+            }
+            reach.reach("zero ownership");
+          },
+        ),
+        {
+          seed,
+          numRuns: 12,
+          examples: [
+            [1, 1, false, false, true],
+            [1, 2, true, true, false],
+            [null, 1, true, false, false],
+            [1, null, true, true, true],
+            [0, 6, false, true, false],
+          ],
+        },
+      );
+      reach.assertReached();
+    } finally {
+      await pg.close();
+    }
+  }, 120000);
+
+for (const seed of seedsFor("next-native-ri-restriction", [0xb635, 0xb636]))
+  it(`executes registry RI restrictions at native statement end ${String(seed)}`, async () => {
+    const reach = createReach("native RI restrictions", NATIVE_RI_RESTRICTION_REACH),
+      pg = new PGlite();
+    try {
+      await fc.assert(
+        fc.asyncProperty(
+          fc.constantFrom("noAction" as const, "restrict" as const),
+          fc.integer({ min: 0, max: 9 }),
+          fc.constantFrom(1, 2),
+          fc.boolean(),
+          fc.boolean(),
+          async (mode, count, key, published, replacement) => {
+            reach.beginHistory();
+            const f = await fixture(published, 2, undefined, count, mode);
+            try {
+              await pg.exec(
+                `DROP TABLE IF EXISTS c,p; CREATE TABLE p(id INT PRIMARY KEY,u INT,payload TEXT); CREATE TABLE c(id INT PRIMARY KEY,pid INT REFERENCES p ON DELETE ${mode === "restrict" ? "RESTRICT" : "NO ACTION"},payload TEXT); INSERT INTO p VALUES(1,1,'seed'),(2,2,'seed')`,
+              );
+              for (let i = 0; i < count; i++)
+                await pg.query("INSERT INTO c VALUES($1,$2,'child')", [
+                  i + 1,
+                  i % 5 === 0 ? null : (i % 2) + 1,
+                ]);
+              const reference = await code(() =>
+                  pg.query(
+                    replacement
+                      ? "WITH d AS (DELETE FROM p WHERE id=$1 RETURNING *) INSERT INTO p SELECT * FROM d"
+                      : "DELETE FROM p WHERE id=$1",
+                    [key],
+                  ),
+                ),
+                following = new RegistryFollowing({
+                  rootId: 17,
+                  catalog: f.statement.catalog,
+                  commands: f.commands,
+                  directory: f.directory,
+                  targets: f.targets,
+                  checks: f.checks,
+                  charge: f.grant,
+                  signal: f.stop.signal,
+                }),
+                actions = new NativeReferentialChecks({
+                  catalog: f.statement.catalog,
+                  commands: f.commands,
+                  targets: f.targets,
+                  checks: f.checks,
+                  signal: f.stop.signal,
+                  charge: f.grant,
+                }),
+                hooks = {
+                  beforeRow: async () => {
+                    throw new Error("Constraint action fired BEFORE");
+                  },
+                  afterRow: async () => {
+                    throw new Error("Constraint action drained AFTER");
+                  },
+                },
+                execution = new NativeCommandExecution({
+                  frames: 1,
+                  catalog: f.statement.catalog,
+                  commands: f.commands,
+                  images: f.images,
+                  checks: f.checks,
+                  following,
+                  charge: f.grant,
+                  signal: f.stop.signal,
+                  abortRoot: (reason) => f.stop.abort(reason),
+                  runReferential: (entry, _hooks, signal) => actions.run(entry, signal),
+                }),
+                primary = f.statement.openNativeCommands({
+                  tables: [f.parent],
+                  charge: f.grant,
+                  signal: f.stop.signal,
+                  commandBudget: (token) => f.commands.budget(token),
+                  closeRoot: async () => {
+                    try {
+                      await execution.close();
+                    } finally {
+                      actions.close();
+                    }
+                  },
+                  finishRoot: async (signal) => {
+                    await execution.verifyCommandUnique(f.root, signal);
+                    for await (const entry of execution.rowReferentialEntries(f.root, oldRef))
+                      await execution.executeReferentialId(entry.id, hooks, signal);
+                    await execution.verifyCommandReferences(f.root, signal);
+                  },
+                }),
+                oldInput = batch(ints([key]), ints([key]), texts(["seed"])),
+                oldRef = await f.images.append(f.parent, { batch: oldInput, row: 0 }, null),
+                pin = f.statement.readOwn();
+              let oldId: number;
+              try {
+                oldId = pin.internalTable(f.parent).rowId(key - 1);
+              } finally {
+                pin.release();
+              }
+              const observed = await code(async () => {
+                const prepared = await primary.prepare(
+                    f.root,
+                    f.parent,
+                    "delete",
+                    oldId,
+                    [0, 0, 0],
+                  ),
+                  lease = await f.images.readRowImages(oldRef, f.stop.signal);
+                try {
+                  await primary.apply(prepared, lease.old, null);
+                } finally {
+                  lease.release();
+                }
+                await f.commands.accept({
+                  command: f.root,
+                  tableId: f.parent,
+                  event: "delete",
+                  images: oldRef,
+                  oldRowId: oldId,
+                  newRowId: null,
+                });
+                const fk = f.statement.catalog.table(f.child)?.foreignKeys[0];
+                if (!fk) throw new Error("Missing native FK");
+                await f.commands.addReferential(f.root, oldRef, {
+                  fkId: fk.id,
+                  event: "parentDelete",
+                  kind: mode,
+                  targets: null,
+                });
+                if (replacement) {
+                  const ref = await f.images.append(f.parent, null, { batch: oldInput, row: 0 }),
+                    token = await primary.prepare(f.root, f.parent, "insert", null, [0, 0, 4]),
+                    image = await f.images.readRowImages(ref, f.stop.signal);
+                  let id: number | null;
+                  try {
+                    id = await primary.apply(token, null, image.new);
+                  } finally {
+                    image.release();
+                  }
+                  await f.commands.accept({
+                    command: f.root,
+                    tableId: f.parent,
+                    event: "insert",
+                    images: ref,
+                    oldRowId: null,
+                    newRowId: id,
+                  });
+                }
+                await f.statement.end();
+                await f.tx.commit(null);
+              });
+              expect(observed, "native end reports PG's precise RI action code").toBe(reference);
+              await f.statement.closeNativeCommands();
+              if (observed !== null) f.tx.rollback();
+              const snapshot = f.path.pin();
+              try {
+                const actual = (await rowsOf(snapshot, f.parent)).map((row) => row[0]).sort(),
+                  expected = (
+                    await pg.query<{ id: number }>("SELECT id FROM p ORDER BY id")
+                  ).rows.map((row) => row.id);
+                expect(actual, "RI failure rolls back all native primary changes").toEqual(
+                  expected,
+                );
+              } finally {
+                snapshot.release();
+              }
+              reach.reach(published ? "published" : "resident");
+              reach.reach(mode);
+              let referenced = false;
+              for (let i = 0; i < count; i++)
+                if (i % 5 !== 0 && (i % 2) + 1 === key) referenced = true;
+              reach.reach(referenced ? "referenced" : "empty children");
+              reach.reach(replacement ? "replacement parent" : "no replacement");
+              reach.reach(observed ? "end failure" : "end success");
+            } finally {
+              await f.close();
+            }
+            reach.reach("zero ownership");
+          },
+        ),
+        {
+          seed,
+          numRuns: 12,
+          examples: [
+            ["restrict", 4, 1, false, true],
+            ["noAction", 4, 1, true, true],
+            ["noAction", 4, 1, false, false],
+            ["restrict", 0, 2, true, false],
+          ],
+        },
+      );
+      reach.assertReached();
+    } finally {
+      await pg.close();
+    }
+  }, 120000);
+
+for (const seed of seedsFor("next-native-informational-capture", [0xb637, 0xb638]))
+  it(`captures informational follow identities by bounded projected scan ${String(seed)}`, async () => {
+    const reach = createReach("native informational follow", NATIVE_INFORMATIONAL_CAPTURE_REACH),
+      pg = new PGlite();
+    try {
+      await fc.assert(
+        fc.asyncProperty(
+          fc.boolean(),
+          fc.integer({ min: 0, max: 40 }),
+          fc.constantFrom(0, 24000),
+          async (published, count, width) => {
+            reach.beginHistory();
+            const f = await fixture(published, 2, undefined, count, "noAction", false, width),
+              hints = vi.spyOn(MemoryReads.prototype, "hint");
+            try {
+              await pg.exec("DROP TABLE IF EXISTS c; CREATE TABLE c(id INT,pid INT)");
+              for (let i = 0; i < count; i++)
+                await pg.query("INSERT INTO c VALUES($1,$2)", [
+                  i + 1,
+                  i % 5 === 0 ? null : (i % 2) + 1,
+                ]);
+              const child = f.statement.catalog.table(f.child),
+                fk = child?.foreignKeys[0];
+              if (!child || !fk) throw new Error("Missing informational child");
+              expect(fk.enforced).toBe(false);
+              expect(fk.supportIndexId).toBeNull();
+              const input = batch(ints([1]), ints([1]), texts(["seed"])),
+                images = await f.images.append(f.parent, { batch: input, row: 0 }, null),
+                paid = f.grant.allocated,
+                range = await f.checks.captureChildren(
+                  { tableId: f.parent, images },
+                  f.child,
+                  fk.id,
+                  f.targets,
+                  f.stop.signal,
+                ),
+                pin = f.statement.readOwn(),
+                actual: number[] = [];
+              try {
+                const table = pin.internalTable(f.child),
+                  ids = Array.from({ length: count }, (_, i) => table.rowId(i));
+                for await (const row of f.targets.rows(range, f.stop.signal))
+                  actual.push(ids.indexOf(row.rowId) + 1);
+              } finally {
+                pin.release();
+              }
+              expect(actual.sort((a, b) => a - b)).toEqual(
+                (
+                  await pg.query<{ id: number }>("SELECT id FROM c WHERE pid=1 ORDER BY id")
+                ).rows.map((row) => row.id),
+              );
+              expect(f.grant.allocated, "informational scanning retains fixed root metadata").toBe(
+                paid,
+              );
+              expect(f.range.allocated).toBe(0);
+              expect(f.range.loaned).toBe(0);
+              if (hints.mock.calls.length) {
+                expect(
+                  hints.mock.calls.every(
+                    ([request]) =>
+                      request.columns.length === 1 && request.columns[0] === fk.columnIds[0],
+                  ),
+                  "informational scan decodes FK columns only",
+                ).toBe(true);
+                reach.reach("projected memory source");
+              }
+              reach.reach(published ? "published" : "resident");
+              reach.reach(actual.length ? "matching" : "empty");
+              reach.reach(width ? "large unrelated payload" : "small payload");
+              reach.reach("fixed metadata");
+            } finally {
+              hints.mockRestore();
+              await f.close();
+            }
+            reach.reach("zero ownership");
+          },
+        ),
+        {
+          seed,
+          numRuns: 8,
+          examples: [
+            [false, 40, 24000],
+            [true, 40, 24000],
+            [true, 0, 0],
+            [false, 3, 0],
+          ],
+        },
+      );
+      reach.assertReached();
+    } finally {
+      await pg.close();
+    }
+  }, 120000);
