@@ -3782,7 +3782,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#root = root;
       this.#pruneCatalogs(root.globalLsn);
       this.#adoptTableRoots(root);
-      state.root = tableRoot;
       state.pages = pages;
       state.flushedThroughLsn = through;
       state.nextGroupId = nextGroupId;
@@ -4101,7 +4100,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         changed.set(state.tableId, tableRoot);
         const stagingId = id;
         installs.push(() => {
-          state.root = tableRoot;
+          // #adoptTableRoots installed the reconciled durable entry, not this draft.
           state.nextRowId = Math.max(state.nextRowId, end);
           for (const [memtable, part] of parts) {
             memtable.staged = part;
@@ -4685,10 +4684,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#root = root;
       this.#pruneCatalogs(root.globalLsn);
       this.#adoptTableRoots(root);
-      for (const [tableId, table] of quiet) {
-        const state = this.#tables.get(tableId);
-        if (state !== undefined) state.root = table;
-      }
       this.#publishState();
       // The root covering the old log is durable: only now may the log go.
       await this.#session.resetLog();
@@ -4929,7 +4924,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#root = next;
       this.#pruneCatalogs(next.globalLsn);
       this.#adoptTableRoots(next);
-      state.root = tableRoot;
       const viewRuns = new Map(state.view.runs);
       viewRuns.set(indexId, runs);
       this.#setView(state, { ...state.view, runs: viewRuns });
@@ -5296,7 +5290,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const state = this.#tables.get(def.id);
       const replaced = changed.get(def.id);
       if (replaced !== undefined) {
-        tables.push(replaced);
+        // Merge/staging roots may copy a previous replay version even though this
+        // publication advances the catalog. Physical group IDs stay independent.
+        tables.push(
+          replaced.schemaVersion === def.schemaVersion
+            ? replaced
+            : { ...replaced, schemaVersion: def.schemaVersion },
+        );
         continue;
       }
       const settles = settled.get(def.id);

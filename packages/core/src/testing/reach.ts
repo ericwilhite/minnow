@@ -9412,3 +9412,15 @@ export const ROW_IDENTITIES_REACH = [
   "malformed IDs refused",
   "unknown flag refused",
 ] as const;
+
+export const DDL_PUBLICATION_SCHEMA_REACH = [
+  "drop",
+  "add",
+  "rename",
+  "first",
+  "middle",
+  "last",
+  "route observed",
+  "version aligned",
+  "exact reopen",
+] as const;

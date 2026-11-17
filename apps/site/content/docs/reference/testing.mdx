@@ -1948,7 +1948,9 @@ DELETE marks, atomic CREATE/rows/ALTER (including replacing all old columns), an
 sharing an LSN with another table's index
 build. They check exact rows after ordinary and FTS publications, writes, checkpoints, maintenance
 and reopen. Malformed identities and incompatible root/catalog replay versions refuse with typed
-errors; repaired roots can retry without leaked admission.
+errors; repaired roots can retry without leaked admission. A separate generated campaign forces
+merge and staging publications immediately after ALTER, before a later row flush could hide a
+stale copied replay version.
 
 Dropping an index does not erase a build still needed by an older catalog checkpoint. The
 write path retains that obligation until a published root carries the build or covers its
