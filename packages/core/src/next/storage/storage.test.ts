@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   OwnerUnresponsiveError as SharedOwnerUnresponsiveError,
   RequestExpiredError,
@@ -90,25 +90,44 @@ describe("fence acquisition", () => {
   });
 
   it("fails, closes the fence and releases the lock when the open itself overruns (review probe)", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
     const locks = new SimLocks();
-    let closed = 0;
+    let opened = 0,
+      closed = 0;
     const start = Date.now();
-    await expect(
-      acquireFenced(
-        locks,
-        "db",
-        () => {
-          while (Date.now() - start < 20) {
-            // A synchronous open that blocks past the deadline.
-          }
-          return "handle";
-        },
-        () => (closed += 1),
-        { timeoutMs: 1 },
-      ),
-    ).rejects.toThrow(OwnerUnresponsiveError);
-    expect(closed).toBe(1);
-    expect(await lockIsFree(locks)).toBe(true);
+    try {
+      await expect(
+        acquireFenced(
+          locks,
+          "db",
+          () => {
+            opened += 1;
+            // Freeze time until the lock is held and this synchronous open runs.
+            // Moving the clock alone does not fire the deadline timer: the
+            // post-open check must notice the overrun and close this exact fence.
+            vi.setSystemTime(start + 20);
+            return "handle";
+          },
+          (fence) => {
+            expect(fence).toBe("handle");
+            closed += 1;
+          },
+          { timeoutMs: 1 },
+        ),
+      ).rejects.toThrow(OwnerUnresponsiveError);
+      expect(opened).toBe(1);
+      expect(closed).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+      // Inspect before awaiting a second lock, so a leaked lock fails rather
+      // than hanging or racing the wall-time fallback used by the other cases.
+      expect(await locks.query()).toEqual([]);
+      const next = await locks.request("db", {});
+      next.release();
+    } finally {
+      locks.reset();
+      vi.useRealTimers();
+    }
   });
 
   it("rethrows a non-busy failure (sync or async) and releases the lock", async () => {
