@@ -4522,4 +4522,21 @@ cached handle; the internal facade always supplies fallback SQL.
 CRUD input conversion preserves the native write-request shape, cloned inputs and typed validity.
 Native `ComposedSession.write` remains an explicit stub pending B5b's input/admission wiring;
 these convenience calls are not yet enabled. SQL execution is tested against the real native
-write path/executor. B8's live runtime binding and production boot are separate follow-ups.
+write path/executor. B8's live runtime binding remains separate; native boot is described below.
+
+### Internal native boot
+
+`owner/native-boot.ts` composes an actual backend lease/session, extent space, native write-path
+recovery, governor, shared spill service, lowerer and real executor. Recovery precedes scratch
+sweep and ready. Startup uses actual charged allocations, without the harness's 8 MiB reserve.
+`owner/database.ts` supplies a local no-broker database over this owner; `native-worker.ts`
+installs the same composition into the existing owner host/election/lifecycle runtime. Worker
+and store barrels remain held for cutover. No test engine or old BlockStore cast is used.
+
+The cap is explicit until B4b supplies the reviewed public default/minimum. The base native
+write-owner minimum does not fit a 16 MiB cap; boot surfaces its typed 53200 refusal and releases
+the fence. Generated ordinary open/reopen tests cover memory and native IndexedDB at fitting
+32/64 MiB caps, continued writes, exact values and zero native charges after close. Memory alone
+uses MemorySpillService, as the native spill contract allows; durable backends use charged
+ScratchSpillService. This Node evidence is not a new supported Node product or real-browser
+qualification. Snapshot replacement, public DTO/CRUD wiring and B8's live binding remain separate.

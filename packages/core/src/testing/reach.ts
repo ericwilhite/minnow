@@ -9617,3 +9617,21 @@ export const PUBLIC_CLIENT_BINDING_REACH = [
   "no-effect reason and unknown effect",
   "cursor metadata abort reason",
 ] as const;
+
+export const PUBLIC_BOOT_REACH = [
+  "native fixed-minimum refusal releases fence",
+  "native IDB scratch service",
+  "memory backend spill exception",
+  "recovery and continued writes",
+  "exact native rows",
+  "all native charges closed",
+] as const;
+
+export const PUBLIC_WORKER_BOOT_REACH = [
+  "worker native SQL and exact decode",
+  "worker isolated transaction",
+  "worker cursor close retains views",
+  "worker complete native teardown",
+] as const;
+
+export const PUBLIC_WORKER_LIFETIME_REACH = ["before-init", "during-resolve", "malformed"] as const;
