@@ -4804,9 +4804,9 @@ acknowledged 1 MiB dedicated chunk at a time; cached and borrowed page buffers n
 The byte-array convenience method collects the whole archive on the client; use streaming
 for large databases.
 
-Import replaces the target. The owner excludes new work, drains commits already in progress,
-cancels other work and exports, closes transactions, and spools one-shot input to exclusive
-scratch. The replayable native loader validates and builds an unpublished generation, then
+Import replaces the target. The owner excludes new work, drains commits already in progress
+and cleanup still owned by disconnected clients, cancels other work and exports, closes
+transactions, and spools one-shot input to exclusive scratch. The replayable native loader validates and builds an unpublished generation, then
 publishes only after the footer and checksums. Scratch, frames and native metadata stay
 charged. It recovers the physical root slots before answering, including after cancellation,
 quota or an indeterminate publication error. A recovered new incarnation proves publication;

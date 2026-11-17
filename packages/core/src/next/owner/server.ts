@@ -273,6 +273,9 @@ export class OwnerServer {
     await Promise.all(
       [...this.#inFlight].filter(([key]) => key !== current).map(([, done]) => done),
     );
+    // Disconnected clients can still own started native cleanup after their request
+    // has settled. Never close/reuse the native path or scratch beneath that work.
+    await Promise.all([...this.#draining].map((other) => other.drained()));
     // Session queue finalizers follow their run's completion.
     await Promise.resolve();
     signal.throwIfAborted();
@@ -456,6 +459,8 @@ class Connection {
       this.#snapshots = undefined;
       await snapshots.close();
     }
+    // Abandonment may already have moved a live connection's handle into cleanup.
+    if (except === null) await this.#snapshotClosing;
   }
 
   /** Snapshot transport has generation-scoped handles, not replayable ledger outcomes.

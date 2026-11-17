@@ -10811,3 +10811,16 @@ export const SNAPSHOT_INSTALL_REACH = [
   "int32",
   "int64",
 ] as const;
+
+export const SNAPSHOT_OWNER_DRAIN_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "disconnect",
+  "reconnect",
+  "cancel",
+  "abandon",
+  "started cleanup charged",
+  "import waits for cleanup",
+  "release unblocks import",
+  "fresh session writes",
+] as const;
