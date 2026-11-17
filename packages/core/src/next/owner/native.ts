@@ -85,26 +85,17 @@ export async function openNativeOwnerEngine(
   const operations: OwnerSnapshotOperations = {
     governor,
     fatal: false,
-    async export(sink, signal) {
-      const grant = await governor.admit({
-        label: "portable export",
-        minimumBytes: 8 << 20,
-        spillable: true,
-        signal,
-      });
+    exportMinimumBytes: 8 << 20,
+    async export(sink, signal, grant) {
+      if (path === undefined) throw new SnapshotScopeError("Native owner is not open");
+      validateSnapshotScope(path.catalog);
+      // Identity bytes belong to the existing complete export grant.
+      if (!grant.allocate(80)) throw new SnapshotScopeError("Lost export identity admission");
       try {
-        if (path === undefined) throw new SnapshotScopeError("Native owner is not open");
-        validateSnapshotScope(path.catalog);
-        // Identity bytes belong to the existing complete export grant.
-        if (!grant.allocate(80)) throw new SnapshotScopeError("Lost export identity admission");
-        try {
-          const id = crypto.getRandomValues(new Uint8Array(16));
-          await exportSnapshot(path, id, sink, grant, { signal });
-        } finally {
-          grant.free(80);
-        }
+        const id = crypto.getRandomValues(new Uint8Array(16));
+        await exportSnapshot(path, id, sink, grant, { signal });
       } finally {
-        grant.close();
+        grant.free(80);
       }
     },
     async import(source, signal) {

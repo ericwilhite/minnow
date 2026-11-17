@@ -35,12 +35,14 @@ for (const seed of seedsFor("next-snapshot-transport", [0xb2e7, 0xb2e8]))
           });
           let transfers = 0;
           let transport: Grant | undefined;
-          const admit = h.governor.admit.bind(h.governor);
-          const admission = vi.spyOn(h.governor, "admit").mockImplementation(async (options) => {
-            const grant = await admit(options);
-            if (options.label === "snapshot transport") transport = grant;
-            return grant;
-          });
+          const admit = h.governor.admitGroup.bind(h.governor);
+          const admission = vi
+            .spyOn(h.governor, "admitGroup")
+            .mockImplementation(async (options) => {
+              const grants = await admit(options);
+              transport = grants.find((grant) => grant.label === "snapshot transport");
+              return grants;
+            });
           // Explicitly invoked with .call(this) below, preserving the native receiver.
           // eslint-disable-next-line @typescript-eslint/unbound-method
           const slice = Uint8Array.prototype.slice;
@@ -58,19 +60,15 @@ for (const seed of seedsFor("next-snapshot-transport", [0xb2e7, 0xb2e8]))
 
           const operations = {
             governor: h.governor,
-            async export(sink: SnapshotSink, signal: AbortSignal) {
-              const grant = await h.governor.admit({
-                label: "transport source",
-                minimumBytes: length + 64,
-                spillable: false,
-                signal,
-              });
+            exportMinimumBytes: length + 64,
+            async export(sink: SnapshotSink, signal: AbortSignal, grant: Grant) {
+              signal.throwIfAborted();
               try {
                 expect(grant.allocate(length + 64)).toBe(true);
                 borrowed = Uint8Array.from({ length }, (_, n) => (n * 31 + length) & 255);
                 await sink.write(borrowed);
               } finally {
-                grant.close();
+                grant.free(length + 64);
                 signalClose();
               }
             },

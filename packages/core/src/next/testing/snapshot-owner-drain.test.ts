@@ -43,7 +43,7 @@ for (const seed of seedsFor("next-snapshot-owner-drain", [0xb2f1, 0xb2f2]))
               let cleanupDone = false,
                 importStarted = false,
                 inputs = 0;
-              operations.export = async (sink, signal) => {
+              operations.export = async (sink, signal, work) => {
                 const grant = await target.current.governor.admit({
                   label: "started export cleanup witness",
                   minimumBytes: 1024,
@@ -51,7 +51,7 @@ for (const seed of seedsFor("next-snapshot-owner-drain", [0xb2f1, 0xb2f2]))
                 });
                 expect(grant.allocate(1024)).toBe(true);
                 try {
-                  await nativeExport(sink, signal);
+                  await nativeExport(sink, signal, work);
                 } finally {
                   entered();
                   await waiting;

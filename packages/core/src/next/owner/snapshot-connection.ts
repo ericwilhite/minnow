@@ -14,7 +14,10 @@ export interface OwnerSnapshotOperations {
   /** Recovery failed: the server must step down rather than serve a stale path. */
   fatal?: boolean;
   fatalError?: unknown;
-  export(sink: SnapshotSink, signal: AbortSignal): Promise<void>;
+  /** Complete work minimum, admitted atomically with transport (zero for a pure sink).
+   * The supplied work grant belongs to SnapshotConnection; export never admits again. */
+  readonly exportMinimumBytes: number;
+  export(sink: SnapshotSink, signal: AbortSignal, work: Grant): Promise<void>;
   /** Spool this one-shot producer, then use the replayable core loader with replace:true.
    * Settle/exclude ordinary writers and reopen ordinary recovery before resolving/rejecting.
    */
@@ -143,21 +146,38 @@ export class SnapshotConnection {
 
   async #open(kind: Flow["kind"], signal: AbortSignal): Promise<string> {
     // Fund the incoming clone or dedicated outgoing buffer BEFORE allowing any chunk message.
-    const grant = await this.operations.governor.admit({
+    const transport = {
       label: "snapshot transport",
       minimumBytes: SNAPSHOT_TRANSFER_BYTES + 1024,
       spillable: false,
-      signal,
-    });
+    };
+    const minimum = kind === "export" ? this.operations.exportMinimumBytes : undefined;
+    const [grant, work] =
+      minimum === undefined
+        ? [await this.operations.governor.admit({ ...transport, signal })]
+        : await this.operations.governor.admitGroup({
+            label: "portable snapshot export",
+            grants: [
+              transport,
+              { label: "portable export", minimumBytes: minimum, spillable: true },
+            ],
+            signal,
+          });
+    if (grant === undefined) throw new Error("Missing snapshot transport admission");
     const abort = new AbortController(),
       id = crypto.randomUUID();
     const workSignal = AbortSignal.any([abort.signal, signal, this.#lifetime.signal]);
     if (!grant.allocate(SNAPSHOT_TRANSFER_BYTES + 1024)) {
       grant.close();
+      work?.close();
       throw new SnapshotScopeError("Snapshot transport lost its admission");
     }
     let flow: Flow;
     if (kind === "export") {
+      if (work === undefined) {
+        grant.close();
+        throw new SnapshotScopeError("Missing complete snapshot export admission");
+      }
       let available = deferred<Uint8Array | null>(),
         consumed = deferred<undefined>();
       let handedOut = false;
@@ -180,6 +200,7 @@ export class SnapshotConnection {
               },
             },
             workSignal,
+            work,
           ),
         )
         .then(() => {
@@ -213,6 +234,7 @@ export class SnapshotConnection {
         .finally(() => {
           workSignal.removeEventListener("abort", aborted);
           grant.close();
+          work.close();
         })
         .catch(() => undefined);
     } else {

@@ -10824,3 +10824,19 @@ export const SNAPSHOT_OWNER_DRAIN_REACH = [
   "release unblocks import",
   "fresh session writes",
 ] as const;
+
+export const SNAPSHOT_TRANSPORT_ADMISSION_REACH = [
+  "above cap refused",
+  "wait retains nothing",
+  "cancel pending admission",
+  "release starts funded export",
+  "native work precharged",
+  "all credit returned",
+] as const;
+
+export const SNAPSHOT_NATIVE_ADMISSION_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "native complete group",
+  "no nested admission",
+] as const;
