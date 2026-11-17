@@ -10680,3 +10680,13 @@ export const STORAGE_CANONICAL_REACH = [
   "safe aligned end",
   "physical end",
 ] as const;
+
+export const IDB_ENTRY_ALLOCATION_REACH = [
+  "parallel read",
+  "serial read",
+  "one record",
+  "multiple records",
+  "serial page boundary",
+  "no key arrays",
+  "extra field refused on read",
+] as const;
