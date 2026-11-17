@@ -10046,3 +10046,53 @@ export const NATIVE_COMMAND_ROOT_PRESSURE_REACH = [
   "bounded files",
   "zero ownership",
 ] as const;
+
+export const NATIVE_COMMAND_REACH = [
+  "frames1",
+  "frames2",
+  "frames3",
+  "published",
+  "resident",
+  "zero rows",
+  "terminal catalog error",
+  "unreachable volatile body excluded",
+  "UTF8 order",
+  "shipped data/error",
+  "zero ownership",
+] as const;
+export const NATIVE_COMMAND_FK_REACH = [
+  "follow",
+  "cascade",
+  "setNull",
+  "setDefault",
+  "restrict",
+  "noAction",
+  "DELETE",
+  "UPDATE",
+  "body generated parent key",
+  "informational follow",
+  "non-key update pruned",
+  "charged fixed metadata",
+  "zero ownership",
+] as const;
+
+export const NATIVE_COMMAND_REACH_LIFETIME = [
+  "pause retains prepaid metadata",
+  "cancel",
+  "complete",
+  "zero ownership",
+] as const;
+
+export const NATIVE_FOLLOW_VISITED_REACH = [
+  "wide IDs",
+  "low and high coexist",
+  "low IDs",
+  "dense bits",
+  "sparse blocks",
+  "command isolation",
+  "FK isolation",
+  "fixed charged metadata",
+  "one shared file",
+  "spilled replay",
+  "zero ownership",
+] as const;

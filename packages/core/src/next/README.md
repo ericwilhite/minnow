@@ -4356,6 +4356,14 @@ spill test service looks up append-ordered offsets by binary search, so registry
 does not introduce a linear scan for every read. Its stored pages remain a test double for
 external scratch storage; the governor assertions cover native resident accounts.
 
+`owner/command-reach.ts` prepares only reachable live trigger definitions and actual FK
+mutation routes in a charged catalog-sized matrix. It tracks root/body budgets1/0/-1,
+keeps RI in its containing frame, includes generated rekeys and informational follow,
+and counts one row's queue scratch. Terminal matching triggers remain runtime errors;
+their unreachable bodies are not compiled. Its preparation charge retires after pending
+task work unwinds. This is owner-admission groundwork, not SQL enablement or a complete
+root working-set minimum.
+
 ### Portable snapshot load
 
 The imported manifest uses canonical empty native FTS state (`checkpoint: null`, `staged: null`):

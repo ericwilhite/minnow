@@ -18,6 +18,7 @@ import {
   type NativeCommandRootScope,
 } from "../owner/command-root.js";
 import { nativePrefixSourceBytes } from "../owner/prefix-images.js";
+import { NativeCommandReach, nativeCommandReachBytes } from "../owner/command-reach.js";
 import { StorageCore } from "./storage-core.js";
 let identity = 100000;
 function compareNames(left: string, right: string) {
@@ -37,6 +38,7 @@ export async function commandRootFixture(
   sql: string,
   published = false,
   cap = 64 << 20,
+  reachableOnly = false,
 ) {
   const core = new StorageCore(256);
   Object.defineProperty(core.harness, "governor", { value: new Governor(cap) });
@@ -52,11 +54,25 @@ export async function commandRootFixture(
     signal = stop.signal,
     lowered = core.lowerer.lower(sql, { ...core.context(), catalog });
   if (lowered.kind !== "modify") throw new Error("root modify");
-  const definitions = catalog.tables.map((table) => {
-      const expr = core.lowerer.lowerTableRules(table, catalog);
-      return { table, expr, program: compileTableRules(table, catalog.version, expr) };
-    }),
-    triggers = catalog.triggers.map((definition) => {
+  if (lowered.plan.root.op !== "modify") throw new Error("root descriptor");
+  const reachGrant = reachableOnly
+      ? await core.harness.governor.admit({
+          label: "root static reach",
+          minimumBytes: nativeCommandReachBytes(catalog),
+          spillable: false,
+          signal,
+        })
+      : null,
+    nativeReach = reachGrant
+      ? await NativeCommandReach.prepare(catalog, lowered.plan.root, reachGrant, { signal })
+      : null;
+  const definitions = catalog.tables
+      .filter((table) => !nativeReach || nativeReach.tables.includes(table.id))
+      .map((table) => {
+        const expr = core.lowerer.lowerTableRules(table, catalog);
+        return { table, expr, program: compileTableRules(table, catalog.version, expr) };
+      }),
+    triggers = (nativeReach?.triggers ?? catalog.triggers).map((definition) => {
       const owner = catalog.table(definition.tableId);
       if (!owner) throw new Error("trigger owner");
       return {
@@ -79,8 +95,8 @@ export async function commandRootFixture(
   const preparation: NativeRootPreparation = {
       rootId: ++identity,
       catalog,
-      frames: 3,
-      rowEvents: 16,
+      frames: nativeReach?.frames ?? 3,
+      rowEvents: nativeReach?.rowEvents ?? 16,
       root: lowered.plan,
       triggers,
       tableIds: definitions.map((d) => d.table.id),
@@ -179,6 +195,11 @@ export async function commandRootFixture(
       statement.rollback();
       tx.rollback();
       for (const binding of tables) binding.rules.close();
+      nativeReach?.close();
+      if (reachGrant) {
+        expect(reachGrant.allocated).toBe(0);
+        reachGrant.close();
+      }
       expect(metadata.allocated).toBe(0);
       expect(source.allocated).toBe(0);
       expect(source.loaned).toBe(0);
@@ -197,6 +218,7 @@ export async function commandRootFixture(
     stop,
     spill,
     setupBytes,
+    nativeReach,
     retire,
     async commit() {
       await root.end();
