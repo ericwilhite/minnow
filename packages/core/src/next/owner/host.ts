@@ -1,3 +1,4 @@
+import { validateStoreName } from "../storage/store-name.js";
 /**
  * The owner runtime: what runs inside the owner worker (a dedicated worker a page started, or a
  * dedicated worker hosting in place). It takes the fence, opens the engine, serves clients and
@@ -149,6 +150,7 @@ export async function startOwnerHost<F>(
   factory: OwnerEngineFactory<F>,
   deps: OwnerHostDeps,
 ): Promise<OwnerHost> {
+  validateStoreName(init.database);
   const database = init.database;
   const protocol =
     typeof init.settings.protocol === "number" ? init.settings.protocol : PROTOCOL_VERSION;

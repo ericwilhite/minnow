@@ -123,6 +123,12 @@ const corrupt = (what: string) => new StoreCorruptionError(`IndexedDB byte space
 
 function isEntry(value: unknown): value is IndexEntry {
   if (typeof value !== "object" || value === null) return false;
+  if (
+    Reflect.ownKeys(value).length !== 2 ||
+    !Object.hasOwn(value, "offset") ||
+    !Object.hasOwn(value, "length")
+  )
+    return false;
   const { offset, length } = value as Record<string, unknown>;
   return (
     typeof offset === "number" &&

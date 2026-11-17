@@ -52,6 +52,9 @@ interface Format {
   readonly parent?: string;
   readonly versionIn: "header" | "magic" | "parent" | "platform";
   readonly fields: readonly FormatField[];
+  /** Canonical refusals on already assigned lanes; no new accepted vocabulary. */
+  readonly canonicalFields?: readonly FormatField[];
+  readonly paddingZero?: number;
   readonly decoder: string;
   readonly state: "implemented" | "design";
 }
@@ -706,6 +709,8 @@ export const DURABLE_FORMATS = {
   logFrame: {
     ...inherited("logHeader", "scanLog/scanLogIncremental"),
     magic: 0x464c4e4d,
+    canonicalFields: [{ name: "LSN high reserved", offset: 12, width: 4, mask: 0x1fffff }],
+    paddingZero: 0,
     fields: [
       magic(0x464c4e4d),
       { name: "kind", offset: 20, width: 1, values: [1] },
@@ -986,6 +991,21 @@ export function requireBits(
 ): void {
   if ((value & ~mask) !== 0) throw new ErrorType(`Nonzero reserved bits in ${what}`);
 }
+/** Refusal-only constraints on existing lanes: no new accepted native vocabulary/profile.
+ * Dynamic padding runs from28+bodyLength through the final checksum (exclusive).
+ */
+export const STORAGE_CANONICAL = Object.freeze({
+  logFrameLsnHigh: DURABLE_FORMATS.logFrame.canonicalFields[0],
+  logFramePadding: DURABLE_FORMATS.logFrame.paddingZero,
+});
+const CANONICAL_LOG_FRAME_FIELDS: readonly FormatField[] = Object.freeze([
+  ...DURABLE_FORMATS.logFrame.fields,
+  ...DURABLE_FORMATS.logFrame.canonicalFields,
+]);
+/** The prebuilt full registry view, including refusal-only constraints. */
+export function durableFields(format: DurableFormatName): readonly FormatField[] {
+  return format === "logFrame" ? CANONICAL_LOG_FRAME_FIELDS : DURABLE_FORMATS[format].fields;
+}
 /** Caller has already verified a checksummed slot before distinguishing it from a torn slot. */
 export function requireHeader(
   format: DurableFormatName,
@@ -993,7 +1013,8 @@ export function requireHeader(
   ErrorType: FormatErrorType = DurableFormatError,
 ): void {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  for (const field of DURABLE_FORMATS[format].fields as readonly FormatField[]) {
+  const fields = durableFields(format);
+  for (const field of fields) {
     if (field.offset + field.width > bytes.length)
       throw new ErrorType(`Truncated ${format} ${field.name}`);
     const value =

@@ -1,3 +1,4 @@
+import { validateStoreName, encodeStoreName } from "./store-name.js";
 /**
  * Which backend a database gets (the ownership track calls this in the owner worker).
  *
@@ -108,9 +109,11 @@ async function child(
 export async function chooseBackend(
   name: string,
   platform: StoragePlatform = globalThis,
-  locks: LockManagerLike = webLocks(platform.navigator?.locks as Parameters<typeof webLocks>[0]),
+  locks?: LockManagerLike,
   accounting: Pick<IndexedDbBackendOptions, "memory" | "registerCache"> = {},
 ): Promise<ChosenBackend> {
+  validateStoreName(name);
+  locks ??= webLocks(platform.navigator?.locks as Parameters<typeof webLocks>[0]);
   // 1. The OPFS probe: only a recognized refusal (or no API) means "no OPFS".
   let root: DirectoryHandleLike | null = null;
   let opfsRefused: string | null = "unsupported";
@@ -145,7 +148,7 @@ export async function chooseBackend(
     )
       throw new StoreConflictError(`${INDEXEDDB_PREFIX}${name}`);
     const namespace = await root.getDirectoryHandle(OPFS_NAMESPACE, { create: true });
-    const directory = await namespace.getDirectoryHandle(encodeURIComponent(name), {
+    const directory = await namespace.getDirectoryHandle(encodeStoreName(name), {
       create: true,
     });
     return {

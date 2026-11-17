@@ -10644,3 +10644,39 @@ export const NATIVE_WRITE_GROWTH_REACH = [
   "net new credit completes",
   "zero final charge",
 ] as const;
+
+
+export const STORE_NAME_REACH = [
+  "empty",
+  "high surrogate",
+  "low surrogate",
+  "too long",
+  "UTF-8 bound",
+  "valid boundary",
+] as const;
+export const STORAGE_CANONICAL_REACH = [
+  "closed IDB fields",
+  "LSN high bits",
+  "LSN bit 21",
+  "LSN bit 22",
+  "LSN bit 23",
+  "LSN bit 24",
+  "LSN bit 25",
+  "LSN bit 26",
+  "LSN bit 27",
+  "LSN bit 28",
+  "LSN bit 29",
+  "LSN bit 30",
+  "LSN bit 31",
+
+  "padding",
+  "padding first",
+  "padding last",
+  "padding interior",
+  "frame byte identity",
+  "valid",
+  "alignment",
+  "aligned overlap",
+  "safe aligned end",
+  "physical end",
+] as const;

@@ -4762,3 +4762,12 @@ must supply that complete admitted work; this helper is not an execution minimum
 and SQL dispatch still keep their guards. Generated PG traces/errors, an actual compiled follow
 observer, foreign-scope/cancellation fences and competing-credit64MiB roots exercise the assembler.
 The initial SUM observer probe hit the existing initPlan refusal; no initPlan capability was added.
+
+Store names in the first native format are non-empty, well-formed Unicode, at most 80 UTF-8
+bytes, and never normalized. `OwnerConnector`, owner startup and backend selection refuse an
+invalid name with `InvalidStoreNameError` (`MINNOW_INVALID_STORE_NAME`) before platform access.
+Native OPFS uses percent encoding; dot-only components are escaped as `%2E`/`%2E%2E`.
+Canonical storage checks refuse extra fields in IndexedDB byte-index records, reserved MNLF
+LSN bits and padding within the acknowledged region, and invalid extent-list bounds. Invalid
+post-ack WAL bytes remain unreplayable tail. Private metadata and scratch journals still reset
+on open and validate on use; they are not supported durable formats.

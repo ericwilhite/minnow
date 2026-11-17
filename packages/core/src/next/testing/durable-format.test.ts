@@ -57,6 +57,7 @@ import { seedsFor } from "../../testing/seeds.js";
 import { MemoryOpfs } from "../../testing/opfs-shim.js";
 import {
   DURABLE_FORMATS,
+  durableFields,
   DURABLE_READER_VERSION,
   DURABLE_WRITER_VERSION,
   MANIFEST_FORMAT_VERSION,
@@ -499,6 +500,16 @@ function ftsAdapters(): Pick<
     ftsDelta: adapter("ftsDelta"),
   };
 }
+function ackFrame(bytes: Uint8Array): Uint8Array {
+  return encodeLogHeader({
+    salt: 7,
+    generation: 1,
+    ackEnd: bytes.length,
+    ackChain: new DataView(bytes.buffer, bytes.byteOffset).getUint32(bytes.length - 4, true),
+    ackLsn: 1,
+    rootSequence: manifest.log.rootSequence,
+  });
+}
 function adapters(): Record<Exclude<DurableFormatName, "indexedDb">, Adapter> {
   const header = { id: new Uint8Array(16), sourceLsn: 3 };
   const snapshot = new Uint8Array(64);
@@ -607,7 +618,7 @@ function adapters(): Record<Exclude<DurableFormatName, "indexedDb">, Adapter> {
         encodeBody({ request: null, effects: [] }),
         7,
       ).bytes,
-      decode: (bytes) => scanLog(bytes, [null, null], manifest.log),
+      decode: (bytes) => scanLog(bytes, [ackFrame(bytes), null], manifest.log),
       repair: (bytes) => checksum(bytes, bytes.length - 4, 7),
       also: [
         async (bytes, b) => {
@@ -618,7 +629,7 @@ function adapters(): Record<Exclude<DurableFormatName, "indexedDb">, Adapter> {
                 length: bytes.length,
                 read: (offset, length) => Promise.resolve(bytes.subarray(offset, offset + length)),
               },
-              [null, null],
+              [ackFrame(bytes), null],
               manifest.log,
               {
                 part: () => {
@@ -759,7 +770,7 @@ for (const seed of seedsFor("next-durable-registry", [0xb221, 0xb222]))
             for (const decode of adapter.also ?? []) await decode(adapter.bytes, b);
             expect(b.held, name).toBe(0);
             reach.reach(name);
-            for (const field of DURABLE_FORMATS[name].fields as readonly FormatField[]) {
+            for (const field of durableFields(name)) {
               const original = new DataView(adapter.bytes.buffer, adapter.bytes.byteOffset);
               const old =
                 field.width === 1
@@ -822,7 +833,7 @@ for (const seed of seedsFor("next-durable-registry", [0xb221, 0xb222]))
       { seed, numRuns: 12 },
     );
     reach.assertReached();
-  });
+  }, 60_000);
 
 for (const seed of seedsFor("next-durable-aliases", [0xb227, 0xb228]))
   it(`sweeps lazy roots and dictionary parsing independently seed ${String(seed)}`, async () => {
@@ -1063,7 +1074,7 @@ for (const seed of seedsFor("next-durable-native-open", [0xb229, 0xb22a]))
           reach.reach(name);
           const adapter = all[name];
           const mutations: Uint8Array[] = [];
-          for (const field of DURABLE_FORMATS[name].fields as readonly FormatField[]) {
+          for (const field of durableFields(name)) {
             const original = new DataView(adapter.bytes.buffer, adapter.bytes.byteOffset);
             const old =
               field.width === 1
@@ -1164,7 +1175,7 @@ for (const seed of seedsFor("next-durable-native-open", [0xb229, 0xb22a]))
       { seed, numRuns: 12 },
     );
     reach.assertReached();
-  });
+  }, 60_000);
 
 for (const seed of seedsFor("next-durable-catalog", [0xb22b, 0xb22c]))
   it(`refuses unknown catalog and scalar tags before publishing a catalog seed ${String(seed)}`, async () => {

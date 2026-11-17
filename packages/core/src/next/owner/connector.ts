@@ -1,3 +1,4 @@
+import { validateStoreName } from "../storage/store-name.js";
 /**
  * The client side of election (election.ts): keeps one `ProtocolClient` connected to the
  * database's owner, electing this context when there is none.
@@ -230,6 +231,7 @@ export class OwnerConnector {
   };
 
   constructor(options: ConnectorOptions) {
+    validateStoreName(options.database);
     this.#options = options;
     this.#announcements =
       options.announcements === false ? null : openChannel(skewChannelName(options.database));

@@ -293,7 +293,7 @@ export type ClientStatus =
   | "closed";
 
 export interface ClientOptions {
-  /** The database name: one owner per name per origin. */
+  /** Database name: nonempty well-formed Unicode, <=80 UTF-8 bytes, never normalized. */
   readonly database: string;
   /**
    * In a page: starts this page's owner worker when it wins the election
