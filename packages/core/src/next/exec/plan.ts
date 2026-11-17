@@ -3146,11 +3146,8 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         !jsonGroups.some((p) => p.rel.id === id)
       )
         return 0;
-      const fallback = Math.max(
-        largest,
-        jsonConstants,
-        ...[...bounds.values()].map((b) => b.progress / 4),
-      );
+      let fallback = Math.max(largest, jsonConstants);
+      for (const bound of bounds.values()) fallback = Math.max(fallback, bound.progress / 4);
       const sizes = {
         parameter: (slot: number) => slots[slot] ?? largest,
         source: (source: number, column: number) =>
@@ -3311,7 +3308,9 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         const copies = new Map<number, number>();
         for (const column of planner.rel.groupBy) copies.set(column, (copies.get(column) ?? 0) + 1);
         // Ordinary row copies and semantic key operands have independent bounds.
-        const multiplicity = json ? 1 : Math.max(1, ...copies.values());
+        let multiplicity = 1;
+        if (!json)
+          for (const count of copies.values()) multiplicity = Math.max(multiplicity, count);
         // JSON literals are measured exactly: the stored inline ceiling is not a
         // lower bound on a one-byte key. Source/parameter/checkpoint bytes enter
         // through their own measured bounds. Wide representative restoration also
@@ -3325,10 +3324,7 @@ export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): P
         // repeated key position duplicates that whole prefix; extra inline/literal
         // and parameter output is added separately by the runtime.
         inputMultiplicity = Math.max(inputMultiplicity, multiplicity);
-        sourceMultiplicity = Math.max(
-          sourceMultiplicity,
-          json ? 1 : Math.max(1, ...copies.values()),
-        );
+        sourceMultiplicity = Math.max(sourceMultiplicity, multiplicity);
       }
       if (hasAggregateProgress)
         runtime.progressEnvelope(inline, inputMultiplicity, sourceMultiplicity);

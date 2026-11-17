@@ -17,8 +17,14 @@ const sum = (values: ReadonlyArray<number | null>): number | null =>
   values.some((value) => value === null)
     ? null
     : values.reduce<number>((n, value) => n + (value ?? 0), 0);
-const maximum = (values: ReadonlyArray<number | null>): number | null =>
-  values.some((value) => value === null) ? null : Math.max(0, ...(values as number[]));
+function maximum(values: ReadonlyArray<number | null>): number | null {
+  let largest = 0;
+  for (const value of values) {
+    if (value === null) return null;
+    largest = Math.max(largest, value);
+  }
+  return largest;
+}
 const variable = (kind: string) =>
   ["text", "bytes", "json", "array", "decimal", "enum"].includes(kind);
 export function expressionInputBytes(

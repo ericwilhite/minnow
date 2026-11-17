@@ -181,7 +181,7 @@ export function packAggregateInputs(root: Rel): Rel {
       }
       restore.push(at);
     }
-    output.push(...r.output.slice(r.groupBy.length));
+    for (const column of r.output.slice(r.groupBy.length)) output.push(column);
     const physical: Aggregate = {
       ...r,
       input,

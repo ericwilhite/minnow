@@ -9457,6 +9457,18 @@ export const REPLAY_MAPPING_WORK_REACH = [
   "zero retained",
 ] as const;
 
+export const EXEC_CALL_LIST_REACH = [
+  "empty",
+  "ordinary",
+  "above native argument limit",
+  "nullable maximum",
+  "parameter maximum and sum",
+  "structural key maximum",
+  "aggregate lane maximum",
+] as const;
+
+export const NEXT_CALL_LIST_REACH = ["empty", "ordinary", "large", "exact list"] as const;
+
 export const REPLAY_MAPPING_MEMORY_REACH = [
   "wide IDs",
   "small IDs",

@@ -484,7 +484,7 @@ export function asBool(typed: Typed, state: ExpressionState): Typed {
 }
 
 /** The collation of compared operands: an explicit COLLATE on either side, else the default. */
-function collationOf(...values: readonly Collated[]): Collation {
+function collationOf(values: readonly Collated[]): Collation {
   for (const value of values) if (value.collation !== undefined) return value.collation;
   return null;
 }
@@ -543,7 +543,7 @@ export function lowerCondition(
         cmp,
         left: a.expr,
         right: b.expr,
-        collation: collationOf(l, r),
+        collation: collationOf([l, r]),
         type: BOOL,
       },
       nullable: a.nullable || b.nullable,
@@ -611,7 +611,7 @@ export function lowerCondition(
           negated: operator === "NOT IN",
           arg: first.expr,
           list: rest.map((item) => item.expr),
-          collation: collationOf(arg, ...items),
+          collation: collationOf([arg, ...items]),
           type: BOOL,
         },
         nullable: first.nullable || rest.some((item) => item.nullable),
@@ -644,7 +644,7 @@ export function lowerCondition(
           arg: arg.expr,
           pattern: pattern.expr,
           escape: escape ?? null,
-          collation: collationOf(arg, pattern),
+          collation: collationOf([arg, pattern]),
           type: BOOL,
         },
         nullable: arg.nullable || pattern.nullable,

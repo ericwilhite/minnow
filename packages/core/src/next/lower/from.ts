@@ -797,9 +797,10 @@ export function lowerFrom(
           ),
         );
       if (join.on !== undefined)
-        conditions.push(
-          ...conjunctsOf(asBool(lowerExpression(join.on, scope, builder.state), builder.state)),
-        );
+        for (const condition of conjunctsOf(
+          asBool(lowerExpression(join.on, scope, builder.state), builder.state),
+        ))
+          conditions.push(condition);
     }
     joinConditions.set(entry.source, conditions);
   }

@@ -340,7 +340,7 @@ export class CollectSink implements Operator {
       for (let i = 1; i < batch.selection.count; i++)
         if ((batch.selection.rows[i] ?? 0) <= (batch.selection.rows[i - 1] ?? 0))
           throw new Error("selection not ascending");
-    this.rows.push(...rowsOf(batch));
+    for (const row of rowsOf(batch)) this.rows.push(row);
     this.pushes++;
     if (this.blockEvery > 0 && this.pushes % this.blockEvery === 0) {
       this.#pending = new Promise((resolve) => setTimeout(resolve, 0)).then(() => {

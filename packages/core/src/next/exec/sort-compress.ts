@@ -217,7 +217,7 @@ export class SortKeyCompression {
       if (ranked) {
         const field = yield* this.#field(ranked, n, slice);
         if (field) fields.push(field);
-      } else fields.push(...original);
+      } else for (const field of original) fields.push(field);
       from += length;
     }
     const bits = fields.reduce((sum, field) => sum + field.bits, 0),

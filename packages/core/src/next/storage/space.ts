@@ -1782,7 +1782,7 @@ class Builder implements ExtentBuilder {
     } finally {
       this.#appending = false;
     }
-    this.#pending.push(...blobs);
+    for (const blob of blobs) this.#pending.push(blob);
     return blobs;
   }
 

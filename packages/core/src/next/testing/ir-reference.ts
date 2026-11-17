@@ -1326,7 +1326,7 @@ function recursiveRows(rel: Extract<Rel, { op: "recursive" }>, env: Environment)
     const workTables = new Map(env.workTables ?? []);
     workTables.set(rel.workTable, work);
     work = fresh(run(rel.step, { ...env, workTables }));
-    result.push(...work);
+    for (const row of work) result.push(row);
   }
   return result;
 }

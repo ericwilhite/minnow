@@ -1945,6 +1945,14 @@ folding must preserve the same values. Published-memory membership comes from va
 metadata, read lazily; open still does not walk group roots. Every controlled fold gate is
 released and drained, including on failure.
 
+The executor list-cardinality campaign varies parameter, expression and aggregate lists from
+empty inputs through more than 131,072 elements. Sizing uses loops rather than JavaScript call
+argument spreads, so long lists keep the same maxima and sums without a native stack error.
+A source check covers every rebuild layer, including support files. It permits argument spreads
+only for documented small bounds or fixed-tuple adapters. Separate layer bodies bound its work
+under coverage. Generated lowering, flush-queue and release-inventory cases also exercise lists
+above the native argument limit, preserving collation bindings, order and copied range metadata.
+
 A separate replay-work generator interleaves many one-row commits over wide tables and one or
 two physical schemas. Mapping builds are bounded by the distinct table/schema pairs; unrelated
 DDL must not rebuild them. Identity metadata is charged before allocation, invalidated when its

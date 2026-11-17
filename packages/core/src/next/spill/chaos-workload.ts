@@ -332,10 +332,9 @@ export async function runChaos(
   const [header] = await session.readLogHeaders();
   const headerGeneration = generationOf(header);
   const resetting = inFlight.some((intent) => intent.step === "reset");
-  const truncateTo = Math.min(
-    Number.POSITIVE_INFINITY,
-    ...inFlight.map((intent) => intent.truncateTo ?? Number.POSITIVE_INFINITY),
-  );
+  let truncateTo = Number.POSITIVE_INFINITY;
+  for (const intent of inFlight)
+    truncateTo = Math.min(truncateTo, intent.truncateTo ?? Number.POSITIVE_INFINITY);
   let generation: number;
   let verified = 0;
   if (headerGeneration === known.generation) {
