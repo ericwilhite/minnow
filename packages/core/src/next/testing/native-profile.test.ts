@@ -143,7 +143,7 @@ for (const seed of seedsFor("next-native-writer-profile", [0xb2c5, 0xb2c6]))
           const knownWriter = {
             8: { manifest: 11, vocabulary: 1164132746 },
             9: { manifest: 12, vocabulary: 131312130 },
-  10: { manifest: 13, vocabulary: 3997453788 },
+            10: { manifest: 13, vocabulary: 3997453788 },
           };
           expect(DURABLE_WRITER_VERSION).toBe(10);
           expect(NATIVE_WRITER_PROFILES).toEqual(knownWriter);

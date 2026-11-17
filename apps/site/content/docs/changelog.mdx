@@ -24,7 +24,7 @@ preserves surviving values when the catalog checkpoint advances before the rows.
 keep their frozen missing values without copying them into every replayed row. Every publication
 route, including staging and native maintenance, takes its table replay version from the checkpoint
 catalog. Incompatible checkpoint versions are refused.
-The unreleased native grammar advances to reader 8, manifest 11 and commit body 9; the 1.0
+The unreleased native grammar advances to reader 10, writer 10, manifest 13 and commit body 9; the 1.0
 format chain still starts with its first released writer. This fixes both
 FTS-triggered reopen failures and native maintenance column misassociation. Released 0.x
 behavior and formats are unchanged; this does not repair already-damaged development stores.
