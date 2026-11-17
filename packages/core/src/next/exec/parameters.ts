@@ -217,7 +217,8 @@ export function prepareParameters(
   }
   const slice = new Slice(YIELD_INTERVAL_MS);
   function* size(): SlicedJob<ParameterBinding> {
-    let bytes = 0;
+    let bytes = 0,
+      largestSlot = 0;
     const sizes: number[] = [];
     for (let slot = 0; slot < plan.parameters.length; slot++) {
       const type = plan.parameters[slot];
@@ -238,13 +239,14 @@ export function prepareParameters(
         throw new MemoryAdmissionError("parameters", bytes + length, capacity);
       const slotBytes = yield* sizeOf(type, value, slice, scratch);
       sizes.push(slotBytes);
+      largestSlot = Math.max(largestSlot, slotBytes);
       bytes += slotBytes;
       if (bytes > capacity) throw new MemoryAdmissionError("parameters", bytes, capacity);
       if (!Number.isSafeInteger(bytes)) throw new MemoryAdmissionError("parameters", bytes, 0);
     }
     return {
       bytes,
-      largestSlot: Math.max(0, ...sizes),
+      largestSlot,
       slotBytes: sizes,
       bind(charge, statementTime = 0n) {
         const pool = prepaid(charge, bytes);

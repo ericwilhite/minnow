@@ -544,7 +544,8 @@ export class ColumnStore {
     const sources = vectors.map(resolve);
     // Optional dense tail: the store's last columns, row k of this call at `dense.from + k`.
     const tail = dense?.vectors.length ?? 0;
-    if (tail > 0 && dense !== undefined) sources.push(...dense.vectors.map(resolve));
+    if (tail > 0 && dense !== undefined)
+      for (const vector of dense.vectors) sources.push(resolve(vector));
     const split = sources.length - tail;
     const denseFrom = dense?.from ?? 0;
     const rowsOf = (c: number, n: number, done: number): Rows =>

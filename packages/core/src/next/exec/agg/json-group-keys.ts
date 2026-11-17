@@ -11,10 +11,13 @@ export function jsonGroupWorkspaceMultiplier(
   types: readonly PhysicalType[],
   groupBy: readonly number[],
 ): number {
-  return Math.max(
-    1,
-    ...groupBy.map((i) => (types[i]?.kind === "json" ? 13 : types[i]?.kind === "array" ? 17 : 1)),
-  );
+  let maximum = 1;
+  for (const i of groupBy)
+    maximum = Math.max(
+      maximum,
+      types[i]?.kind === "json" ? 13 : types[i]?.kind === "array" ? 17 : 1,
+    );
+  return maximum;
 }
 export class JsonGroupKeys {
   readonly decodedKeys: readonly SortColumn[];

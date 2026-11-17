@@ -188,13 +188,12 @@ export function aggregateLaneBytes(
   const fixed = layout.simple && !layout.calls.some((call) => call.variable);
   const step = (row: readonly Width[]) =>
     rowStep(row, slots, fixed ? BATCH_TARGET_BYTES : Infinity);
-  const full = () =>
-    Math.max(
-      MAX_BLOB_BYTES,
-      step(layout.input) ?? baseline,
-      ...layout.calls.map((call) => step([...layout.keys, call.width]) ?? baseline),
-      step(layout.keys) ?? baseline,
-    );
+  const full = () => {
+    let maximum = Math.max(MAX_BLOB_BYTES, step(layout.input) ?? baseline);
+    for (const call of layout.calls)
+      maximum = Math.max(maximum, step([...layout.keys, call.width]) ?? baseline);
+    return Math.max(maximum, step(layout.keys) ?? baseline);
+  };
   // The wrapper owns fixed compiler/native buffers; all borrows go through named helpers.
   if (slot === undefined || (kind === "hybrid" && slot === 0)) return 0;
   if (slot === 1) {

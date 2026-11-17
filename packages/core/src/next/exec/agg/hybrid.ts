@@ -177,7 +177,7 @@ export class HybridAggregateOperator implements Operator {
       this.#directory.attach(this.#io, this.#ioPool);
       this.#output = shared.resume.output;
       this.#level = shared.resume.level;
-      this.#stack.push(...shared.resume.pending);
+      for (const pending of shared.resume.pending) this.#stack.push(pending);
       Object.assign(this.profile, shared.resume.profile);
       this.#restore = this.#resume(shared.resume);
     }
