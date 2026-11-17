@@ -3,52 +3,21 @@ title: Storage adapters
 description: The shared storage interface, and choosing between IndexedDB, OPFS, and memory.
 ---
 
-A database is an engine plus a store. The engine decides what to write; the store decides where it
-goes. Minnow includes three adapters, all using the same `BlockStore` interface, so swapping one
-for another changes nothing else about your code.
+A database is an engine plus a backend. IndexedDB uses browser transactions; OPFS uses worker
+file IO with explicit durability flushes; memory keeps the backing bytes in JavaScript memory
+and does not survive process loss. Both durable backends preserve the same database semantics.
+Their IO costs and relative speed depend on the browser and workload; use the live benchmarks.
 
-| Adapter                                          | Import                             | Survives a reload | Use it for                                         |
-| ------------------------------------------------ | ---------------------------------- | ----------------- | -------------------------------------------------- |
-| [`IndexedDbBlockStore`](/docs/storage/indexeddb) | `@minnowdb/core/storage/indexeddb` | Yes               | Applications.                                      |
-| [`OpfsBlockStore`](/docs/storage/opfs)           | `@minnowdb/core/storage/opfs`      | Yes               | Applications, where OPFS exists (worker required). |
-| [`MemoryBlockStore`](/docs/storage/memory)       | `@minnowdb/core/storage/memory`    | No                | Tests, scratch work, throwaway analysis.           |
+Origin persistence reduces automatic quota eviction when granted. It does not protect against
+explicit deletion, device loss or application mistakes. Keep an independent copy when the local
+database is not reproducible.
 
-The two durable adapters hold the same block format, and a [snapshot](/docs/storage/snapshots)
-moves a database between them. OPFS uses synchronous file access in a worker, while IndexedDB
-uses browser transactions. Their relative speed depends on the workload and browser; use the
-[benchmarks page](/benchmarks) to measure both. Where OPFS is unavailable — notably
-Safari private browsing — use IndexedDB, which remains the default.
+## What a backend holds
 
-Both durable adapters default to strict per-commit flushing. Browser quota eviction is a separate
-origin-level decision: call `ensureOriginPersistence("required")` before opening a store when the
-application cannot safely recreate its local data, and keep an export or remote copy when the user
-must not be the only person capable of deleting it.
-
-## What a store holds
-
-Not rows. The engine hands the store immutable, compressed, self-describing **blocks** — one
-column's values for one row group — plus the records that say which blocks are live:
-
-- **Blocks** — the data, keyed by an immutable id.
-- **Manifest summaries and membership provenance** — one bounded summary per version plus the
-  ordered add/remove interval for each block. Publishing the next summary and its membership
-  changes is what makes a commit visible; no commit clones the complete live block-ID set.
-- **Segments** — which blocks belong to which table, and which row ids they cover.
-- **Transactions** — the commit each segment belongs to, which is how visibility resolves.
-- **Catalog** — tables, columns, counters, unique-key membership, full-text index state.
-- **Leases, temp pages, and job records** — reader pins, query spill, and the cursors that let
-  compaction and collection resume.
-
-Because published blocks are immutable and membership at a version is resolved from durable
-intervals, a reader can hold a version open while writers keep committing. Fixed pinned-history
-ceilings eventually backpressure new writes rather than reclaiming bytes a live reader still
-needs. That is the whole concurrency story — a property of the layout, not of locks.
-
-Cold history walks are cursor-paged. Manifest membership, retired provenance, segments,
-transactions, leases, temporary owners, and maintenance jobs all expose bounded pages rather than
-an API that materializes the database's retained history. The engine's public
-`listVisibleSegmentPage()` adds a stable version and table identity to its cursor, so concurrent
-writes cannot turn later pages into a mixed-version scan.
+The 1.0 engine stores versioned roots, a write-ahead log and immutable native data extents.
+Catalog and data-page grammars are centrally registered. A reader pins a committed view;
+reclamation cannot free bytes that view still needs. Backend packaging and IO differ between
+IndexedDB and OPFS. Portable snapshots carry logical data and catalog state, not native addresses.
 
 ## Writing your own
 

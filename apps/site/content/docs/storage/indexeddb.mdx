@@ -63,86 +63,10 @@ await store.getLogicalStorageBytes();
 
 ## What it creates
 
-One IndexedDB database with eleven object stores: `blocks`, `manifests`, `segments`,
-`transactions`, `transactionJournal`, `catalog`, `leases`, `temp`, `gc`, `statistics`, and
-`snapshotHeaders`. Block payloads are stored as `Uint8Array` values keyed by block id. Manifest
-membership is interval provenance beside each block, so snapshot export can cursor the captured
-version without constructing a descriptor array; integrity checks cross-check that provenance
-against the payload store. They also report, as `orphan-manifest`, a readable manifest summary
-newer than the `manifest/current` pointer: every publication writes its summary and moves the
-pointer in one transaction, so such a record means the pointer went backwards and readers are
-answering from an older version than the one that committed last.
-
-A transaction record in `transactions` holds the record's fields plus three counts: journaled
-blocks, journaled segments, and journal chunks. The block and segment ids themselves live in
-`transactionJournal` as chunks keyed `[transactionId, chunkIndex]`, each holding at most 1,024 ids
-in journal order, and every chunk but the last is full. Staging reads only the last chunk and
-writes only the ids it adds, so a transaction can journal as many artifacts as the global staging
-ceilings allow without each step growing with the journal. Reads reassemble the contract's
-`pendingBlockIds` and `pendingSegmentIds` from the chunks and refuse a record whose counts, chunk
-count, or chunk contents disagree. Commit, abort, and savepoint rollback still validate the whole
-journal; a record's chunks are deleted with the record.
-
-A resumable snapshot import keeps one scalar identity/progress marker in `catalog` until the final
-transaction publishes the manifest pointer and deletes the live marker atomically. Its header
-contains only per-kind counts and byte totals. Canonical metadata is carried as one semantic item
-per frame in `snapshotHeaders`; block frames carry one raw block. Metadata frames are at most
-4 MiB, one append accepts at most 64 frames and 16 MiB of metadata, and block payloads retain the
-normal block-size ceiling — no browser must clone database-sized metadata as one IndexedDB value.
-While the marker exists, ordinary catalog writes through the adapter abort; final publication also
-rechecks both the marker identity and the still-empty current-manifest pointer before it publishes
-anything.
-
-An application can inspect that state with `inspectInterruptedImport()`. Retrying the same snapshot
-continues it; `abortInterruptedImport(identity)` atomically verifies the marker and clears the
-still-unpublished target, including staged payloads, metadata frames, and any unrelated low-level
-writes made while the marker blocked normal engine use. A mismatched identity or a database that
-has since published refuses the abort without deleting anything.
-
-Once an import owner's bounded lease expires, a different snapshot may claim the still-empty
-target. That takeover first clears every staged block, table, segment, transaction, provenance
-record, metadata frame, and resource ledger in the same transaction that installs the new marker.
-If any part of that transaction fails, the old import remains intact and resumable.
-
-The importer writes blocks, tables, segments, transactions, UNIQUE generations, and posting
-generations in bounded frame batches and keeps durable cursors in the marker. Finish validates the
-staged stores with sequential cursors and then publishes the manifest summary, current pointer,
-catalog epoch, and completed replay identity atomically. An exact retry after a lost final response
-compares every payload byte and finishes as a no-op; a later commit removes the bounded completed
-identity record.
-
-Only one live snapshot export is admitted. Its backup lease is indexed by expiry and protects the
-captured manifest; an expired session is reclaimed before another begins. This bounds both durable
-pins and the adapter's descriptor cache even when a caller abandons an iterator.
-
-Each manifest is a fixed-size summary. Block membership is stored once as ordered interval
-provenance — the version that added the block and, when retired, the version that removed it.
-Publishing therefore writes work proportional to the changed blocks, never a periodic copy of all
-live block ids. Version membership checks are point reads, snapshot and maintenance scans are
-cursor-paged, and deleting an old manifest summary does not erase the provenance GC needs to finish
-reclaiming its retired blocks.
-
-Cleanup removes the oldest pruned summaries in bounded transactions, so closing between pages
-leaves a valid predecessor chain. Earlier releases could leave an unfinished deletion range;
-its durable cleanup marker identifies that exact range for integrity checks and resumption.
-An unrelated gap remains a corruption finding.
-
-UNIQUE membership uses immutable lexical generations plus at most 16 ordered commit tails. Every
-base or tail part is capped at 2,048 tokens and a conservative 2 MiB retained-size model. The
-seventeenth tail is folded by a bounded k-way merge into a new generation; the old generation and
-tails disappear in the same commit. Builds require globally strict lexical input, append the same
-bounded parts under an expiring owner, and publish by switching the namespace generation pointer
-in the same catalog transaction.
-
-Point and bulk probes bound each cursor to its selected base or tail source, seek only the
-predecessor parts for their requested tokens, and retain one
-decoded part at a time. Small and bulk-loaded tables can still use the optional complete
-membership cache; it drops itself at `uniqueKeyCacheBytes`, after which persistent probes remain
-authoritative. The limit also works in a worker store descriptor:
-
-```ts
-{ store: { kind: "indexeddb", name: "shop", uniqueKeyCacheBytes: 4 * 1024 * 1024 } }
-```
+The 1.0 IndexedDB backend stores native metadata and extent payloads through browser transactions.
+Roots and WAL use the registered 1.0 format chain. Reads pin the version they use; publication and
+reclamation preserve that pin. The former 0.x object-store, manifest-summary and FTS-chunk layout
+is not the 1.0 contract.
 
 ## Hard growth ceilings
 
@@ -207,38 +131,9 @@ also use bounded read batches, so each retained block does not require a separat
 
 ## Multiple tabs
 
-Several tabs may open the same database at once. Engine snapshots keep reads consistent while
-other connections publish. Physical IndexedDB operations can queue behind overlapping read/write
-transactions, including collection. Every writer — scopes, batch and SQL writes, `BEGIN`
-transactions, DDL, and maintenance publications — takes its turn through the Web Lock
-`minnowdb-write:minnowdb-live:indexeddb:<name>` before reading the state it depends on, so tabs
-never conflict with each other; see [writer turns](/docs/engine/transactions#conflicts). Storage
-compare-and-swap remains the correctness boundary for a writer that does not take a turn. A tab
-that stops inside its turn holds the others until it finishes or the browser releases its lock;
-the wait is reported after ten seconds and never bypassed, and closing a waiting engine or
-client cancels its wait at once.
-
-When a newer build requests an IndexedDB schema version, every Minnow connection steps aside on
-the browser's `versionchange` event, so it cannot strand the open. It first finishes what it
-already accepted: the worker host writes its buffered writers' rows, for up to three seconds.
-Then it closes. From then on that connection fails every call with `StorageConnectionClosedError`
-whose `reason` is `"superseded"` (a connection the application closed itself reports `"closed"`).
-It extends `ConnectionLostError`: the connection cannot be reused. A worker client reloads the
-page by default, which loads the newer build; see
-[when a newer build opens the database](/docs/engine/workers#when-a-newer-build-opens-the-database).
-A call the connection had already handed to IndexedDB is not affected. IndexedDB finishes the
-transactions it accepted before the connection closes, so that call still settles on its own
-result, or on the unresponsive deadline below if its transaction never answers.
-
-The newer build's open waits while older connections finish, up to ten seconds. If a connection
-still blocks it then (a frozen tab, or one that is not Minnow's), `open()` rejects with
-`IndexedDbSchemaUpgradeBlockedError`, a `StorageUpgradeBlockedError`. The error carries the
-database name and old/requested versions; close or reload the older tab and retry. A request that
-already reported this error is marked abandoned, so it cannot wake later and silently upgrade or
-rebuild the database after its caller has moved on.
-
-Transaction completion is observed before requests are submitted. An abort remains observable
-even if quota or request-failure processing resumes after the abort event.
+Native writer ownership serializes mutation across tabs. Readers use pinned committed views.
+Unsupported readers or writers refuse before mutation; storage ownership is not permission to
+rewrite data that the build cannot understand.
 
 ## A connection that stops answering
 
@@ -280,47 +175,7 @@ alongside writes, or another tab's writes — can still queue, so the bound abov
 
 ## Schema compatibility and recovery
 
-The current IndexedDB schema is 8. Schema 1 kept each transaction's journal ids on the record
-itself; opening a schema-1 database moves them into `transactionJournal` chunks and rewrites the
-records with their counts. Schema 3 changes no stored record: it admits compaction jobs whose
-merge plan is recomputed from its sources rather than stored cell by cell, which a schema-2 build
-cannot read. Schema 4 rewrites nothing either: one commit may store an indexed column's changes as
-several part records, with a small directory of their term ranges, so a commit's index changes
-have no size limit and a lookup reads only the parts its terms fall in. A schema-3 build cannot
-read those parts. Schema 5 rewrites nothing either: the catalog may hold the engine's internal
-key-forwards table, which records where each row whose primary key changed now lives. A schema-4
-build (core 0.14.1 and older) would read that table as an ordinary one and miss the forwards, so
-it must not open the database. Schema 7 rewrites nothing either. It admits two kinds of
-compaction job that a schema-5 build (core 0.15.0) refuses as corruption: a fold across
-`ALTER TABLE` — a source written before a column was added, whose rows the fold fills with the
-column's default, or an update left holding only its key after `DROP COLUMN` — and a delta
-merge, which merges a run of level-zero updates and deletes into a few segments that take the
-run's place. Schema 6 was never released: core 0.16.0 moves a schema-5 database straight to
-schema 7. Schema 8 rewrites nothing either: a column's catalog record may say it was declared
-`TIMESTAMP` (without time zone), so its SQL text has no zone, and a segment may be packed — a
-small commit's columns stored as one block, which the segment record names with `packedBlockId`
-— in staging calls of up to 1,024 blocks. A schema-7 build (core 0.16.0) refuses the first as
-corruption and would count a packed segment's blocks wrongly. Columns an older build wrote stay
-`TIMESTAMPTZ`, whatever their DDL said. Opening a schema-2 to schema-7 database only raises the
-version, and the older build then refuses it. There are no pre-contract schemas or compatibility
-branches. Every schema change adds one ordered migration for every integer version between the database and the
-current build. All of those migrations run inside the browser's single `versionchange`
-transaction: either the complete chain and its data changes commit, or the old database remains
-byte-for-byte logical state. A database laid out in every stable schema is opened, migrated, and
-checked in CI, and the migration registry refuses to load if a schema bump omitted or reordered a
-step.
-
-A build older than the database throws `StorageFormatVersionError` and leaves every store, index,
-and record untouched; it never downgrades or recreates the database. Malformed current-schema
-metadata is `StorageCorruptionError`, also without automatic deletion. So is damage inside a
-stored block: a payload or envelope checksum that fails when the engine decodes the block —
-packed or unpacked, on every store — rejects the read with `StorageCorruptionError` naming
-`blocks/<id>`, with the decoder's error as its `cause`, and the integrity check reports the same
-block as `invalid-block`. Use snapshots or remote
-synchronization for recovery from genuine corruption or browser storage loss; no local adapter can
-reconstruct the only copy of bytes that are gone.
-
-One caveat worth knowing: a browser may throttle or suspend a background tab's IndexedDB activity.
-A long compaction in a hidden tab can simply stop making progress until it is foregrounded, which
-is why [maintenance](/docs/storage/maintenance) is stepped and resumable rather than one long
-operation.
+Opening 0.x IndexedDB data in 1.0 is refused with `MINNOW_LEGACY_DATA` without mutation. No legacy
+schema converter runs at this boundary. The first released 1.0 native writer starts the new
+supported chain. Later supported upgrades must preserve data through ordinary open/load and be
+retryable across interruption; unsupported future versions refuse before mutation.

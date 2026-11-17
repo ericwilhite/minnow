@@ -29,9 +29,9 @@ workers, transactions, and API details.
 The optional [Kysely dialect](https://minnowdb.com/docs/adapters/kysely/) connects Kysely's
 PostgreSQL compiler to the engine and derives its `DB` types from the same schema declaration.
 
-Minnow is 0.x: breaking changes land in minor releases, so pin exact versions and upgrade
-`@minnowdb` packages together. See
-[Versioning](https://minnowdb.com/docs/reference/versioning/).
+Minnow 1.x follows semantic versioning for its public API. Use mutually compatible `@minnowdb`
+packages. The 1.0 engine refuses 0.x stored databases without mutation; start with a new database
+name. See [Versioning](https://minnowdb.com/docs/reference/versioning/).
 
 ## License
 

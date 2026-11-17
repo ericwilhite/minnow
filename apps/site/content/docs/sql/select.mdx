@@ -167,11 +167,10 @@ function call takes the function's name as written (`COUNT(*)` is `count`, `ARRA
 `expression`, numbered like any repeated name (`expression`, `expression_2`), where PostgreSQL
 would say `?column?`.
 
-`ROUND(value, digits)` takes `NUMERIC` in PostgreSQL. Cast a plain-number expression
-explicitly, as in `ROUND(SUM(total)::NUMERIC, 2)`, for SQL that also runs there. Minnow's
-current engine additionally accepts a plain number with a digit count; PostgreSQL refuses
-that overload with `42883`. This legacy overload is planned for removal when the rebuilt
-engine becomes the default; use the explicit cast now. The numeric form returns exact decimal text.
+`ROUND(value, digits)` requires NUMERIC input and an integer digit count. Cast approximate input
+explicitly, for example `ROUND(SUM(total)::NUMERIC, 2)`. Minnow 1.0 and PostgreSQL refuse
+ROUND(float8,int4) with 42883. The old 0.x overload is not part of 1.0; numeric rounding returns
+exact decimal text with PostgreSQL's rounding and scale rules.
 
 ## Joins
 
@@ -305,10 +304,10 @@ SELECT c.customer_id,
 FROM customers c
 ```
 
-The current engine returns compact JSON strings. Whitespace and numeric spelling can differ
-from PostgreSQL's JSON text; the rebuild preserves PostgreSQL's spelling. Add `ORDER BY` inside
-an aggregate when array order matters: without it, PostgreSQL may visit a group's rows in a
-different order.
+JSON and JSONB preserve PostgreSQL's distinct output text, including whitespace, numeric
+spelling, escaping and key behavior. JSON keeps duplicate object fields; JSONB canonicalizes keys
+and keeps the last duplicate. Add `ORDER BY` inside an aggregate when array element or duplicate
+key winner order matters. SQL NULL and the JSON document `null` remain distinct.
 
 The same rule applies through `JSON_QUERY`. Ordinary text that happens to contain JSON remains a
 JSON string; cast it to `JSON`/`JSONB` or pass it through a JSON constructor when it should embed
@@ -322,11 +321,11 @@ untyped document literal to `JSON` so PostgreSQL can resolve the operator overlo
 SELECT '{"sku": "A-1", "dims": {"w": 30, "h": 40}}'::json -> 'dims' ->> 'w' AS width
 ```
 
-`->` returns a JSON value, so steps chain and a selected string keeps its quotes; `->>` returns
-text, with strings unquoted and a selected JSON null as SQL `NULL`. A key of the wrong kind for
-the document's shape — a member name against an array, a position against an object or scalar —
-selects `NULL`. The operators accept stored `JSON`/`JSONB` values and ordinary JSON text alike,
-but unlike `JSON_VALUE`'s quiet `NULL`, a document that is not JSON at all is an error.
+JSON extraction accepts typed `JSON` and `JSONB` operands with their PostgreSQL-specific
+semantics. Cast an otherwise ambiguous document literal explicitly, for example
+`'{"a":1}'::json ->> 'a'`. Plain TEXT is not silently promoted into a JSON operator overload.
+A missing member or incompatible selector yields SQL NULL where PostgreSQL does; malformed
+JSON is an error. JSONB scalar-as-one-element-array behavior is distinct from JSON.
 
 `STRING_AGG(value, delimiter ORDER BY expression)` skips NULL values, supports `DISTINCT`, and
 spills under the same query-memory bound as other grouped aggregates.
@@ -435,14 +434,9 @@ WITH RECURSIVE months(month) AS (
 SELECT month FROM months
 ```
 
-A CTE can name its own output columns, as `months(month)` does above; a recursive one takes those
-names before its step runs, which is how the step reads `month` back. `DATE '2025-01-01'` is a
-zoneless calendar date returned as `YYYY-MM-DD`; `TIMESTAMP '2025-01-01 09:30:00'` is an instant
-read as UTC, the way every datetime in a Minnow database is stored. `INTERVAL '1 month'` added to
-or subtracted from either does calendar arithmetic, so 31 January plus a month is the end of
-February. `DATE ± INTERVAL` always returns a timestamp, including whole-day and zero intervals.
-`EXTRACT` reads fractional seconds from timestamps and reads the stored fields of `TIME` and
-`INTERVAL` without converting them to dates.
+`EXTRACT` returns PostgreSQL's exact NUMERIC result; `date_part(text, value)` returns
+DOUBLE PRECISION. Both read the corresponding date/timestamp/interval fields, and timestamp
+fractional seconds retain microseconds.
 
 Dates and timestamps do PostgreSQL's arithmetic: `date - date` is a whole number of days, an
 integer that divides as one, `date + 7` and `date - 7` shift a `DATE` by days, and

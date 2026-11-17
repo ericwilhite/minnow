@@ -10,16 +10,12 @@ npm install @minnowdb/core
 [minnowdb.com](https://minnowdb.com) has the full documentation, a live SQL and TypeScript console,
 and benchmarks that run in your browser.
 
-> **Experimental API.** Minnow is in 0.x, so minor releases can include API and SQL breaking
-> changes. Within the 0.x line, stored data is stable: block format 2, snapshot formats 1 to 3, IndexedDB schema 8, and
-> OPFS layout 13 are versioned separately and locked — an incompatible future writer must use a new
-> format number. The planned 1.0 rebuild starts a fresh stored-format chain and refuses 0.x
-> databases without changing them. There is no 0.x-to-1.0 converter; use a fresh database name.
-> Automatic-upgrade guarantees for that chain start with its first released 1.0 writer.
-> Pin exact package versions. See
-> [Versioning](https://minnowdb.com/docs/reference/versioning/), the
-> [v1 support policy](https://minnowdb.com/docs/reference/support/), and the
-> [Changelog](https://minnowdb.com/docs/changelog/).
+**Minnow 1.x.** The 1.x public API follows semantic versioning. Minnow 1.0 starts a new
+stored-format chain. It refuses 0.x databases with `MINNOW_LEGACY_DATA` without changing them;
+there is no 0.x-to-1.0 converter. Use a fresh database name or explicitly delete the old database.
+Automatic upgrades within the new chain start with the first released 1.0 format. Unreleased
+rebuild formats are not supported predecessors. See [Versioning](https://minnowdb.com/docs/reference/versioning/)
+and the [v1 support policy](https://minnowdb.com/docs/reference/support/).
 
 ## Why Minnow
 
@@ -40,9 +36,9 @@ and benchmarks that run in your browser.
   read anything, so concurrent writes land in a serial order without an application-side queue
   or retry loop. Callbacks run once; a tab that stops inside its turn is reported, never
   bypassed.
-- **Deploys without stuck tabs.** When a release changes the stored format, tabs still on the
-  previous release finish what they accepted, step aside, and reload themselves; the new tab
-  upgrades the database in well under a second. Prefer to ask first? Opt into a reload prompt.
+- **Versioned storage.** Supported upgrades in the 1.x format chain preserve data through
+  ordinary open/load. The 1.0 boundary starts a fresh chain and refuses 0.x data unchanged;
+  it is not an automatic upgrade from 0.x.
 - **Plain JavaScript.** The engine with its larger durable adapter is about 450 KiB gzipped, with
   no Wasm download, compile step, special headers, or server process.
 - **Direct SQL or Kysely.** Run PostgreSQL-style SQL through the engine API or use Kysely through

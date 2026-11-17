@@ -4,8 +4,7 @@ description: Release notes, migration steps, and storage compatibility for every
 ---
 
 Release notes are listed newest first. Each entry names the packages published from that release
-commit; an omitted package did not change. Minnow is still in 0.x, so read an entry's migration
-notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
+commit; an omitted package did not change. Read an entry's migration notes before changing a pinned version. The [versioning guide](/docs/reference/versioning) explains the
 compatibility policy and release process.
 
 ## Unreleased
@@ -553,6 +552,39 @@ Timestamp source and precision-admission metadata adds 326 minified raw bytes pe
 Current raw/gzip sizes are 1,172,985/351,332 bytes for the main entry, 1,585,395/458,305 with OPFS,
 and 1,581,428/455,871 for the IndexedDB worker. Only the IndexedDB raw cap moves up once by
 512 bytes; the other bundle caps stay unchanged. The packed-size adjustment is recorded above.
+
+## 1.0.0 — Cutover draft (not released)
+
+This entry is prepared for the 1.0 release step; it does not announce publication.
+
+**Migration and stored formats:** 1.0 starts a new stored-format chain. There is no upgrade or
+converter from 0.x. Opening a 0.x database or loading a 0.x snapshot refuses with
+`MINNOW_LEGACY_DATA` without changing its bytes or creating an empty replacement. Read old data
+with a compatible 0.x build. Use a fresh database name, or explicitly delete old data you no
+longer need. Automatic upgrades and released-writer fixtures in the new chain start with the
+first released 1.0 format; development rebuild bytes are not supported predecessors.
+
+Native roots have separate minimum-reader and minimum-writer capabilities, checked before
+mutation authority. Versioned catalog records and row WAL preserve stable column/index identities
+across ALTER, checkpoint and replay. Portable snapshots use a separate framed format with catalog
+records, sequence horizons and an integrity footer; native extent addresses are not portable.
+Public snapshot wiring and complete catalog scope must pass their remaining release gates.
+
+SQL uses typed native values: timestamp literals preserve microseconds; JSON and JSONB preserve
+their PostgreSQL-specific text; `ROUND(float8, int4)` is refused with `42883` (cast to NUMERIC).
+Full-text renderer 2 uses PostgreSQL's canonical TIME and array text. The native FTS grammar and
+transactional deltas are separate from 0.x search state; old postings are not reused.
+
+`UNIQUE` and `PRIMARY KEY` check the completed statement, before success rather than COMMIT.
+A later NOT NULL or CHECK error can precede an earlier duplicate; final-state key swaps can
+succeed where PostgreSQL's default per-row uniqueness check refuses. With omitted ON UPDATE,
+references follow their original parent row and child uniqueness is checked after the complete
+captured follow group. Explicit actions retain per-action checks. Trigger/RI end-to-end
+qualification remains a release gate; the detailed 1.0 ordering change is in the trigger draft.
+
+The shared-runner R6 lane records observations and enforces invariants. Absolute acceptance still
+requires a qualified quiet runner and a committed acceptance record. `version:check` refuses
+package versions at or above 1.0.0 without that record; no acceptance is claimed here.
 
 ## 0.20.0 — November 7, 2026
 

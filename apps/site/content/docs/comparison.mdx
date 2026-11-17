@@ -18,21 +18,9 @@ complete server dialect, or direct file analysis matters more.
 
 ## Why choose Minnow
 
-- **One database for application work and analysis.** Primary and secondary indexes handle
-  selective reads and writes. Columnar storage keeps scans, joins, and aggregates efficient as
-  data grows.
-- **PostgreSQL-style SQL without a PostgreSQL server.** Use familiar syntax directly or through
-  Kysely. The [compatibility page](/docs/sql/feature-matrix) lists exact matches, differences,
-  extensions, and exclusions.
-- **Small, browser-native delivery.** Minnow is plain JavaScript with no Wasm compile step,
-  `SharedArrayBuffer`, or cross-origin isolation requirement.
-- **Durable multi-tab storage.** IndexedDB and OPFS adapters publish atomic commits and give each
-  reader a stable snapshot.
-- **Control over memory and threading.** Run the engine in a worker, set an execution budget, and
-  spill large sorts and grouped results to storage.
-- **Native Kysely types.** `@minnowdb/kysely` derives its full database type from the same schema
-  declaration Minnow migrates, including defaults, exact numeric and calendar-date boundaries,
-  and driver-specific aggregate and built-in function results without redundant output generics.
+- **Control over memory and threading.** Run the engine in a worker and choose a finite
+  modeled memory cap. Spillable execution and cancellable admission keep transient pressure
+  bounded; an irreducible over-cap step returns SQLSTATE 53200.
 
 Minnow does not provide a server, replication, multi-device sync, or compatibility with another
 database's file format.
@@ -145,16 +133,9 @@ adapter ships with the project.
 
 ## Minnow's limits
 
-- Minnow is in 0.x, so minor releases can include API and SQL breaking changes. Block format 2,
-  snapshot formats 1 to 3, IndexedDB schema 8, and native OPFS layout 13 are separately versioned
-  and locked. Supported storage upgrades run automatically on open, including IndexedDB schemas
-  1–7 to 8 and OPFS layouts 6–12 to 13; see the [OPFS guide](/docs/storage/opfs#what-it-creates).
-- Its SQL dialect is an embedded PostgreSQL subset, not the PostgreSQL server.
-- `UPDATE` and `DELETE` require row identity: a primary key or one inline unique column.
-- Secondary indexes support scalar and composite left-prefix equality, `IN`, range filtering, and
-  selected ordered or covering reads. They do not provide PostgreSQL's full access-method system.
-- The engine runs in browsers, not Node.js.
-- There is no replication, server process, or multi-device sync.
+- Minnow 1.x follows its public API compatibility contract. Stored formats have separate
+  versions. The 1.0 engine refuses 0.x databases unchanged; there is no 0.x-to-1.0 converter.
+  Supported automatic upgrades begin with the first released 1.0 format.
 
 Try Minnow in the [live SQL and TypeScript console](/#console). The
 [benchmarks](/benchmarks) run Minnow, SQLite Wasm, and PGlite on your machine and verify every

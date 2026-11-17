@@ -23,6 +23,20 @@ may declare several scalar or composite `UNIQUE` constraints, inline or table-le
 enforced independently. A table with one inline `UNIQUE` column and no primary key uses that
 column as its row identity.
 
+In the 1.0 engine, `UNIQUE` and `PRIMARY KEY` check the completed statement. `NOT NULL`
+and `CHECK` run as rows are written. If an insert reuses an existing primary key and a later
+row violates `NOT NULL`, Minnow 1.0 reports the null error (`23502`). PostgreSQL
+reports the duplicate key first (`23505`), as does Minnow 0.x. A later `CHECK` failure also
+takes precedence in Minnow 1.0. Either error rolls back the whole statement.
+
+This timing also lets one statement swap unique keys when the finished rows have no
+duplicates. Some multi-row key updates that PostgreSQL rejects therefore succeed in
+Minnow 1.0. Uniqueness still has to hold before the statement succeeds; it is not
+postponed until `COMMIT`. PostgreSQL's
+[CREATE TABLE notes](https://www.postgresql.org/docs/current/sql-createtable.html#SQL-CREATETABLE-COMPATIBILITY)
+describe the difference between its default per-row checks and the SQL standard's
+statement-end checks.
+
 ```sql
 CREATE TABLE order_items (
   order_id INTEGER,
@@ -38,13 +52,10 @@ A primary key can change: `UPDATE ... SET` on a key column rekeys the row, and e
 it follows. See [Offline sync and rekeying](/docs/engine/rekeying). Composite identity uses an
 internal scalar locator, so it does not add tuple comparison work to ordinary scans.
 
-A `SERIAL`, `BIGSERIAL`, or `SMALLSERIAL` column, a column declared `GENERATED { ALWAYS | BY
-DEFAULT } AS IDENTITY`, and SQLite's `INTEGER PRIMARY KEY AUTOINCREMENT` all read as the table's
-auto-increment key, the same thing the schema DSL's `column.integer().autoIncrement()` declares:
-omitted values count up from 1, an explicit value is accepted without advancing the counter (as
-a PostgreSQL sequence behaves), and identity sequence options in parentheses are accepted and
-ignored. The counter belongs to the
-row identity, so the column must be the primary key.
+Identity metadata records ALWAYS or BY DEFAULT and the sequence's explicit options.
+GENERATED ALWAYS rejects an ordinary explicit assignment unless the admitted override form is
+used. Options are validated and stored, never accepted and silently ignored. The native sequence
+ledger retains continuation state through durable reopen.
 
 ```sql
 CREATE TABLE events (id SERIAL PRIMARY KEY, kind TEXT NOT NULL, at TIMESTAMP DEFAULT NOW())
@@ -119,10 +130,16 @@ because it says what happens anyway; `ON UPDATE RESTRICT`, `NO ACTION`, `SET NUL
 `SET DEFAULT` are rejected. Unlike PostgreSQL, a reference with no `ON UPDATE` clause follows too,
 instead of refusing the key change.
 
-At the 1.0 cutover, omitting `ON UPDATE` still follows the parent row. Explicit clauses
-retain their specified action instead: `CASCADE`, `RESTRICT`, `NO ACTION`, `SET NULL`, or
-`SET DEFAULT`. The rebuild catalog distinguishes the implicit follow action from explicit
-`CASCADE`, so a future format change cannot silently replace this product default.
+Omitting `ON UPDATE` follows the parent row. The durable catalog records that implicit action
+as `follow`, separately from explicit `CASCADE` and the other actions, so a future change cannot
+silently replace this product contract.
+
+When `ON UPDATE` is omitted, Minnow follows each child's original parent row. It checks child
+uniqueness after the complete captured follow group, so swapping or rotating parent keys also
+works when the child reference is unique. A nonunique completed group fails with SQLSTATE
+`23505` and identifies the child constraint before user `AFTER` work or a later referential action
+can observe the changes. Explicit `ON UPDATE CASCADE`, `SET NULL` and `SET DEFAULT` retain
+per-action uniqueness checks.
 
 `NOT ENFORCED` keeps the relationship without requiring the parent row to exist, for a table that
 holds only part of its parent's rows. Such a reference takes no `ON DELETE` action but still
@@ -231,8 +248,10 @@ Those restrictions affect speed only, never the accepted SQL or its result.
 
 ## Column types
 
-Blocks retain four compact physical kinds—number, string, boolean, and datetime—but SQL domains
-add validation and semantics without widening hot scan vectors:
+The 1.0 engine uses typed native vectors for SQL integer widths, exact numerics, floats, dates,
+timestamps, intervals, arrays, JSON and the other admitted domains. SQL types and result
+metadata determine arithmetic, validation and decoding; they are not four physical kinds with
+decorative SQL labels.
 
 | SQL domain         | Spellings                                               | JavaScript result                          |
 | ------------------ | ------------------------------------------------------- | ------------------------------------------ |
@@ -251,64 +270,26 @@ add validation and semantics without widening hot scan vectors:
 | array              | `INTEGER[]`, `TEXT[]`, and other core arrays            | JSON `string`                              |
 | enum               | a name declared by `CREATE TYPE … AS ENUM`              | member `string`                            |
 
-`TIMESTAMP` and `TIMESTAMPTZ` values, including timestamp literals, keep millisecond precision
-in the current engine. Fractional digits beyond the first three are discarded before
-comparisons, arithmetic, or text output. For example,
-`TIMESTAMP '2000-02-29 12:34:56.123400'::text` returns `2000-02-29 12:34:56.123`;
-PostgreSQL returns `2000-02-29 12:34:56.1234`.
+SQL `TIMESTAMP` and `TIMESTAMPTZ` values retain microsecond precision. For example,
+`TIMESTAMP '2000-02-29 12:34:56.123400'::text` returns `2000-02-29 12:34:56.1234`.
+Comparisons and subtraction distinguish microsecond boundaries. A JavaScript `Date` can carry
+milliseconds only; use SQL text when every stored fractional digit must cross that boundary.
 
-Both datetime kinds store the same UTC instant, compare and sort alike, do the same arithmetic,
-and come back to JavaScript as a `Date`. They differ only in text, which follows PostgreSQL in a
-UTC session — through `CAST(x AS TEXT)` or `x::text`, `||`, `CONCAT`, `FORMAT`, `TO_CHAR`, and the
-JSON constructors. A `TIMESTAMPTZ` column is an instant, so `CAST(placed_at AS TEXT)` is
-`2025-03-14 09:30:00+00`, with fractional seconds only when they are nonzero
-(`2025-03-14 09:30:00.25+00`), and `TO_JSON(placed_at)` is `"2025-03-14T09:30:00+00:00"`. A
-`TIMESTAMP` column, a `TIMESTAMP '…'` literal, a cast to `TIMESTAMP`, `MAKE_TIMESTAMP`,
-`LOCALTIMESTAMP`, and a date plus an interval are timestamps without time zone, and their text
-carries no zone: `2025-03-14 09:30:00`, and `"2025-03-14T09:30:00"` in JSON. Views, CTEs, derived
-tables, and `CREATE TABLE … AS` keep each column's kind; mixing the two in `CASE`, `COALESCE`, or a
-`UNION` gives `TIMESTAMPTZ`, as PostgreSQL does. A precision such as `TIMESTAMP(3)` is accepted and
-ignored; it does not change millisecond precision. Every text form reads back as the same instant. Text
-written into either kind is read as an instant, so a `TIMESTAMP` column stores
-`'2025-03-14 09:30:00+02'` as `07:30` UTC, where PostgreSQL would drop the offset and keep
-`09:30`. A datetime column written by core 0.16.0 or earlier is `TIMESTAMPTZ`, whatever its DDL
-said, and stays so after the [automatic upgrade](/docs/reference/versioning); `listTables()` and
-`introspect()` report a `TIMESTAMP` column with `withoutTimeZone: true`, which the low-level
-`createTable` API accepts on a `datetime` column too. An interval renders as `1 year 2 mons 3 days 04:05:06.5`,
-`-00:00:01`, or `-3 days +04:00:00`, and a time of day as `09:30:00.5`. A datetime returned to
-JavaScript is still a `Date`, not text.
+`TIMESTAMP WITHOUT TIME ZONE` represents calendar fields without a zone; SQL timestamp
+literals ignore a written zone as PostgreSQL does. `TIMESTAMPTZ` represents an instant and renders
+in the fixed UTC session. They are distinct SQL types, not just display aliases. Explicit
+precision 6 is supported; other precision modifiers are refused with typed `0A000` until their
+rounding and column constraints are implemented. They are never silently ignored.
 
-Widths in `VARCHAR(80)` are accepted and ignored — they document intent, and nothing truncates.
-So are `CREATE TEMP`, `TEMPORARY`, and `UNLOGGED TABLE`: every table lives in the one database
-with one durability. A column constraint may be named (`n INTEGER CONSTRAINT n_positive CHECK
-(n > 0)`), as a table constraint may.
-An integer write or cast must be inside JavaScript's exact safe-integer range,
-−9,007,199,254,740,991 through 9,007,199,254,740,991. Minnow rejects a value outside that range
-instead of rounding an ID or quantity before it reaches disk. SQL declarations set this guard
-automatically; the low-level `createTable` API can request the same domain with `integer: true` on
-a number column. An integer _constant_ beyond that range is not an error: it stays exact, like
-PostgreSQL's `int8` and `NUMERIC` typing of large constants, and writing one to an integer column
-is rejected rather than rounded.
+SQL `SMALLINT`, `INTEGER` and `BIGINT` enforce their PostgreSQL integer widths; exact SQL
+values are not restricted to JavaScript's safe-integer range. A JavaScript number cannot carry an
+arbitrary 64-bit integer losslessly. Use the documented 1.0 exact input/result representation when
+crossing that boundary; do not round identifiers into Float64.
 
-Non-constant integer addition, subtraction, and multiplication throw `RangeError` if the
-result leaves the safe range; they never return a rounded integer. Unary minus, `ABS`,
-remainder, and integer division preserve safe integer inputs. `DIV` and `WIDTH_BUCKET`
-refuse a whole-number result outside the safe range with `RangeError`. `SUM` and `AVG` retain their
-number result contract: an integer-typed argument throws `RangeError` as soon as a
-partial sum leaves the safe range, even if later cancellation or division would bring it back.
-This also applies to grouped, DISTINCT, live, and window aggregates, including running sums.
-`DOUBLE PRECISION` arguments retain approximate floating-point accumulation even when every
-value happens to be a whole number. A numeric input of unknown SQL type uses
-floating-point accumulation. A bound JavaScript number follows literal typing: a safe whole
-number is integer, while a fractional or unsafe whole number is floating point. Use an explicit
-`CAST(value AS DOUBLE PRECISION)` to request floating-point aggregation regardless of value.
-Integer intermediates in UPDATE, ON CONFLICT, MERGE, and trigger assignments have the same
-range checks, even when a later operation would return to the safe range. Sequence expressions
-(`NEXTVAL` and `CURRVAL`) and SQL defaults use these checks too. Untyped text operands in
-integer arithmetic follow the integer CAST rules before conversion: out-of-range or fractional
-integer text is refused.
-Use `CAST(value AS NUMERIC)` before arithmetic or aggregation for exact decimal strings and
-larger results. Constant arithmetic beyond the safe range returns an exact decimal string.
+Arithmetic and aggregates follow their resolved PostgreSQL SQL types. Overflow is checked in
+the resolved integer type; SUM/AVG use their declared aggregate result type rather than a blanket
+JavaScript-number contract. `NUMERIC` remains exact. `DOUBLE PRECISION` is approximate even when
+its values happen to be whole numbers.
 
 Integer division is PostgreSQL's. When both operands of `/` are integers — integer columns,
 integer constants, `COUNT`, an integer `CAST`, a `date - date` difference, or integer arithmetic
@@ -338,24 +319,16 @@ never fewer fractional digits than either operand, rounded half away from zero. 
 minor unit when that simpler boundary fits; use `DOUBLE PRECISION` only when approximation is
 intended.
 
-Decimal constants in SQL are exact too, because PostgreSQL types every decimal constant
-`NUMERIC`: arithmetic among constants folds in exact decimal space, so `SELECT 0.1 + 0.2`
-is `0.3` and `1.000000000000000000000000 / 3` keeps twenty-four true digits, the quotient
-scale following the written scales. A result that reads back identically from a JavaScript
-number is returned as an ordinary number — the same cast PostgreSQL applies when a numeric
-constant meets a float column — so `price * 1.1` still computes and returns binary floats. A
-result the number boundary would visibly round is returned as an exact decimal string
-instead. That exactness also holds beside a float
-column: a constant Float64 cannot represent keeps exact semantics in arithmetic and
-comparisons where PostgreSQL would cast it to the float and round — a deliberate difference
-recorded in the feature profile.
+Mixed exact and approximate operands follow their resolved PostgreSQL overload and coercions.
+An exact literal can be rounded when it is coerced to an approximate type. Cast operands to
+NUMERIC when exact decimal arithmetic is required; do not rely on a 0.x exception that preserved
+some constants beside floating columns.
 
-A column with a declared scale renders at exactly that scale, matching PostgreSQL: `1.5` in a
-`NUMERIC(10, 2)` column reads back as `'1.50'`, and so do aggregates, window aggregates, and
-`COALESCE` over it, plus `CAST(… AS NUMERIC(p, s))` results. Two shapes render canonically
-instead (trailing fractional zeros stripped), where PostgreSQL would keep each value's own
-scale: a bare `NUMERIC` column with no declared scale, and derived arithmetic such as
-`price * 2`, whose result type carries no scale.
+Exact NUMERIC values retain PostgreSQL display scale through stored values, casts and supported
+arithmetic. A declared NUMERIC(p,s) enforces its precision and scale; an unconstrained NUMERIC
+still keeps the value's scale rather than automatically stripping fractional zeros. Division and
+AVG use their resolved PostgreSQL result scale. Decode exact values without rounding them through
+JavaScript Number unless approximation is an explicit application choice.
 
 `JSON` validates a document and preserves object key order; `JSONB` canonicalizes object keys.
 Numbers read from JSON text retain every decimal digit in storage, extraction, constructors,

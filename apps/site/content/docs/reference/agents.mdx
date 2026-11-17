@@ -69,9 +69,9 @@ machines: https://minnowdb.com/llms.txt
 - `db.query(sql, { params })` runs `SELECT` and returns `{ rows, columns, columnDomains }`.
   `columnDomains` is positionally aligned with `columns`; use it to generically parse declared or
   aliased JSON/JSONB text. It throws on a statement that writes, rather than writing.
-- `db.queryCursor(sql, { params, batchRows, signal })` pulls bounded result pages. Single-table,
-  unordered scans stream directly; blocking sorts, groups, joins, and derived sources page the
-  ordinary completed result. The worker transfers one columnar page per pull.
+- Query cursors are pull-driven and apply backpressure. Native blocking operators use admitted
+  workspace and spill instead of requiring the complete ordinary JavaScript result first. Close
+  or cancel a cursor you stop consuming so it releases buffers, pins and temporary work.
 - `db.execute(sql, params, options?)` runs any statement. Check `result.kind` to see what happened
   (`rows`, `insert`, `update`, `delete`, `merge`, `transaction`, `set`, `create-table`, `add-column`,
   `create-type`, `create-sequence`, `drop-column`, `drop-table`, `create-index`, `drop-index`,
@@ -84,11 +84,23 @@ machines: https://minnowdb.com/llms.txt
   statement is parsed and planned once and only re-bound per call. Minnow recognizes some inlined
   literals (comparison operands, IN-list items) and shares their plan, but every other inlined
   value still makes a new statement that is parsed and planned from scratch.
-- Treat Minnow's fixed SQL safety limits as input validation, not tuning: one statement is capped
-  at 1,048,576 characters, 16,384 tokens, 4,096 parameter positions, and 128 syntax levels. Pattern,
-  JSON/array, numeric, scalar-result, and full-text inputs have their own documented ceilings in
-  https://minnowdb.com/docs/sql/. Keep the 64 MiB execution budget unless the application has a
-  measured reason to change it; `null` explicitly opts into unbounded execution memory.
+- Treat fixed SQL input limits as validation, not tuning. Use a finite governor cap. Transient
+  credit pressure waits cancellably or spills; only an irreducible over-cap step returns `53200`.
+  A JSON result needs its serialized bytes plus one delivery copy (2×). Do not use an unbounded
+  budget option or inherit 0.x defaults unless the released 1.0 API explicitly documents it.
+- In Minnow 1.0, UNIQUE and PRIMARY KEY check the completed statement. A later
+  NOT NULL or CHECK failure can be reported before an earlier duplicate key;
+  PostgreSQL reports the duplicate first. Minnow 0.x does so in the primary-key
+  example. Some multi-row key updates that PostgreSQL rejects succeed in Minnow
+  when the final keys are unique.
+  Any constraint failure rolls back the whole statement. Uniqueness must hold
+  before the statement succeeds; it is not postponed until COMMIT.
+- When `ON UPDATE` is omitted, Minnow follows each child's original parent row. It checks child
+  uniqueness after the complete captured follow group, so swapping or rotating parent keys also
+  works when the child reference is unique. A nonunique completed group fails with SQLSTATE
+  `23505` and identifies the child constraint before user `AFTER` work or a later referential action
+  can observe the changes. Explicit `ON UPDATE CASCADE`, `SET NULL` and `SET DEFAULT` retain
+  per-action uniqueness checks.
 - `UPDATE` and `DELETE` require scalar or composite row identity: a `PRIMARY KEY`, or the
   single inline `UNIQUE` form. A table without one can only be appended to.
 - A primary key can change. For a record created offline under a temporary key, run
@@ -258,9 +270,9 @@ machines: https://minnowdb.com/llms.txt
   Logical domains such as exact NUMERIC and enum use indexes for equality, but scan/sort for ranges.
 - SQL transactions support `SAVEPOINT name`, `ROLLBACK TO SAVEPOINT name`, and
   `RELEASE SAVEPOINT name`. A second `BEGIN` is rejected; use a savepoint for nested work.
-- For two-argument `ROUND`, cast a plain-number input to `NUMERIC`: `ROUND(value::NUMERIC, digits)`.
-  PostgreSQL refuses `ROUND(float8, int4)` with `42883`; Minnow's legacy overload is planned for
-  removal when the rebuilt engine becomes the default.
+- For two-argument ROUND, cast approximate input to NUMERIC: `ROUND(value::NUMERIC, digits)`.
+  PostgreSQL and Minnow 1.0 refuse `ROUND(float8,int4)` with `42883`. The 0.x overload was a
+  legacy extension; do not generate it for 1.0.
 - `db.explain(sql)` returns the optimized plan as text.
 - Check https://minnowdb.com/sql-feature-matrix.json before using an unfamiliar SQL form, and
   https://minnowdb.com/postgres-feature-profile.json before assuming PostgreSQL behavior. They
@@ -290,17 +302,12 @@ machines: https://minnowdb.com/llms.txt
   only under ANY/ALL. Numeric RANGE offsets need one numeric ordering expression. A positive offset must remain
   finite and nonzero when converted to a double, even over a NUMERIC key.
   FULL JOIN supports grouping, DISTINCT, wildcards, and compound ON in its sole-join form.
-- A datetime cast or concatenated to text is PostgreSQL's text in UTC: `2026-01-02 03:04:05+00`
-  for a `TIMESTAMPTZ` column (`column.datetime()`, and every datetime column core 0.16.0 or
-  earlier wrote), and no `+00` for a `TIMESTAMP` column (`column.timestamp()`), literal, or cast;
-  `"2026-01-02T03:04:05+00:00"` against `"2026-01-02T03:04:05"` in JSON. Both kinds hold the same
-  UTC instant and compare alike. Timestamp literals and values in the current engine keep
-  millisecond precision: fractional digits beyond the first three are discarded before
-  comparisons, arithmetic, or text output. For example,
-  `TIMESTAMP '2000-02-29 12:34:56.123400'::text` returns `2000-02-29 12:34:56.123`,
-  while PostgreSQL returns `2000-02-29 12:34:56.1234`.
-  INTERVAL values read and render as `1 day 02:00:00`. Query
-  results return datetimes as `Date` objects; use those rather than parsing SQL text.
+- SQL timestamps retain microseconds. `TIMESTAMP '2000-02-29 12:34:56.123400'::text` returns
+  `2000-02-29 12:34:56.1234`; SQL comparisons and subtraction keep those digits. TIMESTAMP
+  without time zone keeps calendar fields and ignores a written zone in SQL literals;
+  TIMESTAMPTZ renders the instant in UTC. Only precision 6 is admitted; other precision modifiers
+  refuse with `0A000`. A JavaScript Date can carry milliseconds only, so use SQL text for exact
+  fractional output. The final 1.0 result descriptors define other JavaScript representations.
 - Transaction modes use PostgreSQL's admission rules: a changed isolation level requires
   no earlier query and no savepoint; the same requested level is always allowed.
   `[NOT] DEFERRABLE` requires no earlier query and no savepoint even when unchanged.
@@ -329,16 +336,12 @@ machines: https://minnowdb.com/llms.txt
   `ON DELETE SET DEFAULT`. Every rejected form is an `unsupported` row of the feature matrix
   with its exact error; check each supported entry's note before assuming every PostgreSQL
   variant.
-- Within the 0.x line, supported stored-format upgrades run automatically through ordinary open/load, including
-  IndexedDB schemas 1–7 to 8 and OPFS layouts 6–12 to 13. Do not add a required export/import
-  step. Every format change needs frozen
-  older-writer fixtures and data-preservation, continued-write/reopen, interruption/power-loss,
-  corruption-refusal, concurrent-open and older-writer-barrier tests. Close older connections
-  if they block an upgrade; quota/I/O failures must report an error and remain retryable.
-- The planned 1.0 rebuild starts a fresh format chain. It refuses 0.x databases unchanged with
-  `MINNOW_LEGACY_DATA`; use a new database name or explicitly delete the old database.
-  There is no 0.x-to-1.0 converter. Automatic-upgrade and frozen-fixture obligations for the
-  new chain start at its first released 1.0 format, not its unreleased development formats.
+- Minnow 1.0 refuses 0.x databases with `MINNOW_LEGACY_DATA` before mutation; it never creates
+  an empty replacement over old data. There is no 0.x-to-1.0 converter. Use a fresh name, or
+  explicitly delete old data you no longer need. Automatic upgrades and frozen-writer fixtures
+  in the new chain start with its first released 1.0 format, not development rebuild artifacts.
+  Later supported format changes must preserve data through ordinary open/load with retry and
+  older-writer refusal.
 - OPFS coordination exhaustion and queue overload throw `OpfsCoordinationError` from
   `@minnowdb/core`; `instanceof` survives worker RPC. Retry boot/migrate with bounded backoff;
   never delete a database merely because migration rejected. Established live queries retain

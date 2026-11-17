@@ -7,38 +7,17 @@ A browser tab does not get to use all the memory it likes. Two separate mechanis
 inside a bound you choose: a per-execution budget with spilling, and a byte-bounded cache of
 decoded blocks.
 
-## The execution budget
+## The memory governor
 
-Every statement has a 64 MiB modeled execution budget by default. Override it for one statement:
+The 1.0 engine uses a shared finite memory governor for modeled engine allocations. It admits
+work before allocation, including progress workspace. Operators spill or wait cancellably under
+transient pressure; fitting work must not fail merely because another query temporarily holds
+credit. An irreducible step that exceeds the whole cap fails with SQLSTATE `53200`.
 
-```ts
-await db.query(sql, { executionMemoryBudgetBytes: 32 * 1024 * 1024 });
-```
-
-The budget covers the modeled vectors, row-index arrays, grouping and result payloads, and
-ordering buffers — the parts the engine allocates and can therefore account for. It does not cover
-JavaScript container overhead, the lifetime of the result you are handed, or the browser's own
-allocator overhead.
-
-When an operator would exceed the budget, it **spills** to storage and continues. A sort, a hash
-join, or a grouping over more data than fits writes runs to temporary pages and merges them. The
-query gets slower; it does not fail.
-
-If a statement cannot proceed even with spilling, it throws `QueryMemoryBudgetError` rather than
-letting the tab die.
-
-The `Streamed mutation replay` label identifies the state needed to apply updates, deletes,
-and upserts during a scan: a bitmap with one bit per historical scan row, and about eight bytes
-per row an update or upsert changed. Repeated replacements discard superseded patches, and
-temporary data is released between scan windows. A query keeps those patches only while they fit
-a quarter of its budget. Past that, it replays them one range of rows at a time as the scan
-reaches each range, so a large unmerged delta makes a query slower, never a failed one, and the
-table is queued for [compaction](/docs/storage/maintenance#deletes-and-updates-before-compaction).
-Only the bitmap must always fit: one bit per row, 64 MiB for half a billion rows.
-
-```ts
-import { QueryMemoryBudgetError } from "@minnowdb/core";
-```
+JSON construction and aggregation use one charged result-owned working value plus one delivery
+buffer: the single-value boundary is twice the serialized bytes. Other operators document their
+own irreducible workspace. Storage quota is separate. The modeled cap does not measure the
+browser's complete JavaScript heap, caller-owned inputs or values the caller retains after delivery.
 
 ## Measuring what a query used
 
@@ -77,72 +56,22 @@ statement checks the signal once before it starts running, so an already-aborted
 never mutates anything, and a mutation that has begun publishes completely or fails. Losing its worker reply can leave
 the outcome unknown; see [worker deadlines and cancellation](/docs/engine/workers).
 
-## The buffer pool
+## Cache and pinned residency
 
-Separately from execution, decoded blocks are cached so a warm scan does not re-read and
-re-decompress storage:
-
-```ts
-const db = new MinnowDatabase(store, { bufferPoolBytes: 64 * 1024 * 1024 });
-db.bufferPoolStats(); // what is resident right now
-```
-
-It holds decoded blocks, ready-to-read column batches, recorded value ranges, and reusable
-subquery results. Every entry belongs to an exact block or table version, so the cache cannot serve
-old data as new. Replaced entries simply stop matching and age out of the size-limited cache.
-
-The modeled pool charge includes each artifact's payload, its key at two bytes per character,
-and fixed entry overhead. Long SQL and plan identities therefore consume the same budget as the
-results they identify. This is a residency model, not a measurement of the JavaScript heap.
-Queries that read volatile functions or the clock, including through nested views, do not reuse
-result memos.
-
-Derived results, including window output, build their column vectors directly from result rows
-without retaining an intermediate value array for every column. Window execution also omits
-peer buffers when all functions sharing an ordering can operate by row position alone.
-Keyed reads use the pool's block vectors directly; they add no separate row cache or index.
-Eligible keyed UPDATEs load the selected row through the bounded point reader, then
-evaluate assignments through the ordinary query kernel. This path retains the usual predicate,
-visibility and type checks.
-
-`0` disables it, which is the right setting for a one-shot import that will never re-read what it
-writes.
+Cached pages and other retained engine artifacts participate in native memory accounting.
+A reader's pinned version remains valid until it releases it. Eviction and spill must respect
+borrowers; releasing an owner's handle does not permit uncharging bytes a reader still retains.
+Cache residency is a modeled engine cost, not the browser's complete heap size.
 
 ## Spill cleanup
 
-Spilled pages are owned by a lease that is renewed while the query runs, so a tab that disappears
-mid-query leaves pages that a later session can identify as abandoned and reclaim:
+Spill and checkpoint files belong to executing work and are released on finish, cancellation or
+error. Recovery can sweep abandoned temporary work. These files are not committed database
+snapshots and do not carry a supported stored-format upgrade promise.
 
-```ts
-await db.cleanupQuerySpill();
-```
+## Choosing a cap
 
-Worth calling at startup in a long-lived application. It is bounded work and safe to run
-concurrently with queries.
-
-## Choosing numbers
-
-The defaults — a 64 MiB buffer pool and a separate 64 MiB per-statement execution budget — suit an
-application working over tens of megabytes of data. Lower either on a constrained device or when
-many databases are open at once. Set the database-wide default with
-`new MinnowDatabase(store, { executionMemoryBudgetBytes })`; pass `null` there only when an
-application deliberately accepts unbounded execution memory. The same database default applies
-to mutation selection, triggers, subqueries, and read-your-writes scopes, not only public SELECTs.
-
-Window execution reserves result, sort, peer, and aggregate buffers against the query budget.
-Database window passes yield to allow cancellation. These working buffers currently require
-resident memory; they do not spill. Result memos use bounded dependency-table generations and a
-structural schema identity, so unrelated-table writes preserve warm results. Missing commit
-history invalidates the memo rather than guessing.
-
-The rebuild's internal index reader exposes `planRange(range, direction)` for query-wide
-admission. Planning holds no new native buffers or leases. Its `minimumBytes` covers merge
-heads, key copies, run navigation and bounded I/O, including a memtable publishing before
-opening. Range bounds must remain immutable for the plan and cursor's lifetime.
-
-A caller must include that minimum in its atomic query admission, then call
-`plan.open({ budget, signal })` with a dedicated grant. A plan opens once. The cursor does
-not admit more memory, grow the grant or borrow shared progress credit. Closing it cancels
-pending work and releases its scratch after that work settles; the caller then closes the
-grant. This access-layer API is available now; executor integration and the SQL planner
-route will follow separately. Stored bytes are unchanged.
+Choose a finite cap for the workload and device, allowing for concurrent engines and the
+browser's other memory use. The governor accounts for engine-managed work and progress; it does
+not bound the entire JavaScript heap or a memory backend's stored database. Use observed native
+peak statistics and the documented 1.0 options. Do not disable accounting to hide admission errors.

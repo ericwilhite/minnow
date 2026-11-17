@@ -369,9 +369,10 @@ await database.query("SELECT name FROM active_customers");
 await database.execute("INSERT INTO active_customers (name) VALUES ($1)", ["Ada"]); // rejected
 ```
 
-Because nothing is stored under a view, replacing one is always safe: change the `sql` and the next
-`migrate()` redefines it in place. Removing the declaration drops the view — within a schema, the
-declaration is the source of truth.
+A view binds its output schema and source dependencies when it is created. Wildcard bindings
+are frozen: adding a base-table column does not silently append it to an existing view. A
+replacement must preserve the compatible existing output prefix and dependencies; it is not
+unconditionally safe. Managed view removal/replacement applies only to schema-owned objects.
 
 That authority stops at the views the schema created. A view made with `CREATE VIEW`, or one
 written before Minnow recorded ownership, belongs to no schema and no migration removes it —

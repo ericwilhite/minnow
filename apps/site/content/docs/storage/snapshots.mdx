@@ -66,43 +66,14 @@ prefix and let a different snapshot take over; a failed takeover leaves the old 
 That is also what the devtools' **Download database** button does; see
 [the devtools](/docs/devtools#downloading-the-database).
 
-## Loading and resuming
+## Loading and retrying
 
-Create an empty target store and import through its database:
+The 1.0 loader validates the container, catalog, typed values and required capabilities before
+publishing a replacement root. A failure, cancellation or pre-publication interruption leaves
+the previous committed database intact. Initial native loading is retryable from the start;
+do not promise resumable offset/session import unless the released API implements it.
 
-```ts
-const store = await IndexedDbBlockStore.open({ name: "seeded" });
-const restored = new MinnowDatabase(store);
-
-await restored.importSnapshotStream(response.body!, {
-  signal,
-  onProgress: ({ writtenBytes, totalBytes }) => {
-    setProgress(writtenBytes / totalBytes);
-  },
-});
-```
-
-The target must be empty. Import never merges histories. Before accepting the first frame, the
-adapter durably claims the snapshot identity and owner. It stages bounded, contiguous frame
-batches and publishes the manifest pointer only after the verified footer arrives. A crash,
-quota refusal, or lost response cannot publish a prefix.
-
-Retry the exact same file to continue an interrupted import. A repeated sequence is accepted only
-when every persisted byte matches; changed bytes, a different identity, an expired owner, or a
-store that has since published are refused. Ordinary catalog writes are refused while an import
-owns the empty target.
-
-To abandon an interrupted import deliberately:
-
-```ts
-const interrupted = await restored.inspectInterruptedImport();
-if (interrupted !== null) {
-  await restored.abortInterruptedImport(interrupted.identity);
-}
-```
-
-Cancellation is an identity-checked removal of the unpublished session and every staged byte. It
-does not delete a database that has already been published.
+A 0.x snapshot container is refused without mutation. It is not a 0.x-to-1.0 migration path.
 
 ## What it carries
 
@@ -129,85 +100,18 @@ generation exceeds its fuse, export omits the whole generation and marks its cat
 invalid; it never emits a partial ready accelerator. These indexes are pruning accelerators that
 scans re-verify, so either case costs a rebuild, never a wrong answer.
 
-## The framed container
+## The 1.0 framed container
 
-A snapshot is a bounded frame stream, not one database-sized metadata object. Format 2 is format
-1 with one addition: it may carry the engine's internal key-forwards table, which records where
-each [rekeyed](/docs/engine/rekeying) row now lives. The engine creates that table on the first
-rekey — even one that fails — and keeps it, so from then on every snapshot of that database is
-format 2. Format 3 is format 1 with a column declared `TIMESTAMP` (without time zone): it carries
-that kind, so the restored column renders its text without a zone. A snapshot is written at the
-lowest format its tables need, so one without either record is format 1, byte for byte, and older
-builds still import it. Core 0.14.1 and older refuse format 2, and core 0.16.0 and older refuse
-format 3.
-All integers in envelopes are little-endian.
-
-The file starts with a 20-byte prefix:
-
-| Offset | Width | Field                                |
-| -----: | ----: | ------------------------------------ |
-|      0 |     8 | ASCII magic `MINSNAP1`               |
-|      8 |     4 | snapshot format version (`1` or `2`) |
-|     12 |     4 | canonical header byte length         |
-|     16 |     4 | CRC-32 of the header bytes           |
-
-The header is at most 64 KiB of canonical UTF-8 JSON. It contains only the database version,
-creation time, and exact frame/item/byte totals for six ordered families:
-`catalog-page`, `segment-page`, `transaction-page`, `unique-page`, `posting-page`, and `block`.
-It never contains row keys, posting lists, block descriptors, or another database-sized array.
-
-Each body frame has a fixed 40-byte envelope followed by its optional block ID and payload:
-
-| Offset | Width | Field                         |
-| -----: | ----: | ----------------------------- |
-|      0 |     4 | frame marker                  |
-|      4 |     4 | frame-kind ordinal            |
-|      8 |     8 | global sequence               |
-|     16 |     4 | item count                    |
-|     20 |     4 | block-ID byte length, or zero |
-|     24 |     8 | payload byte length           |
-|     32 |     4 | CRC-32 of the exact payload   |
-|     36 |     4 | reserved zero                 |
-
-Metadata frames use Minnow's canonical binary wire encoding and hold exactly one semantic item,
-up to 4 MiB. A block frame holds exactly one ID and one complete block-format-2 value. Metadata batches
-are capped at 64 frames and 16 MiB; a block is acknowledged alone when needed. Lengths, item
-counts, sequence, family order, canonical strings and timestamps, cross-record references,
-counters, and checksums are validated before publication.
-
-A fixed 40-byte footer records the total frame count, item count, stored payload bytes, and a
-rolling CRC over every frame envelope, key, and payload. The decoder also rejects a missing
-footer, trailing bytes, a family/header-total mismatch, and integer totals outside JavaScript's
-exact safe range. Every embedded block independently checks its envelope, stored payload, and
-logical payload, so corruption is localized before a query can observe it.
-
-CRC-32 detects accidental corruption; it does not authenticate hostile input. Sign or
-authenticate snapshots received across a trust boundary.
+The 1.0 portable format has its own registered header, version, typed object frames and terminal
+integrity footer. Native references never appear in portable data. Catalog frames use the
+versioned MCAT record grammar and explicit sequence horizons. The reader checks ordering,
+lengths, checksums, required codecs, complete object/table totals and EOF before publication.
+Truncation, duplicates, trailing bytes and unsupported versions are typed refusals. Old 0.x
+snapshot formats 1–3 are not predecessors of this container.
 
 ## Exporting safely
 
-Export begin atomically captures one version and creates a backup lease, persisted by the durable
-adapters. Metadata is emitted in bounded pages; block membership is walked by cursor, and payload
-bytes are read and verified one block at a time. A concurrent commit lands wholly before or after
-the captured version. Garbage collection cannot reclaim the pinned version until export closes or
-its bounded lease expires.
-
-At most one export and one unpublished import session may exist in a store. Pull-driven export
-creates no unbounded producer queue, and stopping the iterator releases its session in `finally`.
-`exportSnapshot()` deliberately collects that stream into one `Uint8Array` and therefore has a
-4,294,967,295-byte ceiling; `exportSnapshotStream()` does not have a whole-file size ceiling.
-
-Full-text and secondary-index generations are included only when their exact coverage can be
-proved and one exact merged generation fits the adapter's ordered-read fuse. Both durable
-adapters cap that merge at 64 MiB; OPFS also caps it at 65,536 retained row IDs. Otherwise the
-restored catalog marks the accelerator for rebuild. That can make its first query slower, but
-cannot change the answer. UNIQUE membership is authoritative rather than optional: IndexedDB
-exports it in deterministic lexical chunks through the fixed 36 MiB merge bound and restore
-re-enables duplicate enforcement before publication.
-
-Snapshot formats 1 and 2 and their embedded block-format-2 bytes are frozen by fixtures and opened
-on every test run. A future incompatible writer uses a new format number; it does not reinterpret
-these bytes. The compatibility check compares compressed blocks by their canonical uncompressed
-payload because native gzip encoders may emit different valid stored streams. A snapshot is still
-only as durable as the media and origin that holds it, so keep independent copies for
-data that must survive loss of that origin or device.
+Export holds one committed pin for the archive's lifetime, including catalog and sequence
+horizons. Release the source on completion, cancellation or error. Loading needs temporary space
+beside the target's old reachable versions and index-build work; quota failure must not publish
+partial data. Keep a verified independent archive when local data is not reproducible.

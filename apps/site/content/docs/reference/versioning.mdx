@@ -26,32 +26,14 @@ is the sibling release this package was built against — when an adapter starts
 the engine added in 0.6.8, its next release says `>=0.6.8` and npm resolves an engine that has
 it. Below the major, a fix to the console does not drag the engine's version along with it.
 
-## What 0.x means
+## What 1.x means
 
-Minnow is in 0.x, and the usual 0.x rule applies: **breaking changes can land in a minor
-release.** Pin exact versions in an application, and read the [changelog](/docs/changelog) before
-upgrading. The smaller API used between Minnow's own packages remains compatible inside the shared
-major; that is what lets an older adapter accept a newer engine.
-
-A change is breaking when it is one of these:
-
-- **The API.** An export removed or renamed, a signature narrowed, or a default changed.
-- **SQL.** A form that used to run and no longer does, or one that runs and now answers
-  differently. Additions to the [feature matrix](/docs/sql/feature-matrix) are not breaking.
-- **Stored data.** A database written by the old version that the new one cannot open. Within the 0.x line, the locked
-  byte contracts below narrow this category: a release cannot reinterpret or drop an existing
-  block-format-2, snapshot-format-1/2, IndexedDB-schema-1/2/3/4, or OPFS-layout-6/7/8/9 reader or
-  automatic converter.
-
-From 1.0 onwards these move the major version — every package's, together — and minor releases
-stay additive.
-
-Every published subpath participates in that rule, including low-level extension, testing, worker,
-and JSON metadata entry points. `scripts/api-contract.policy.json` assigns each one an audience;
-the label explains its intended caller and does not weaken its compatibility guarantee.
-`npm run api:check` fails on an unclassified subpath, a declaration change, or a change from
-type-only to runtime reachability. See the [v1 support policy](/docs/reference/support) for the full
-contract and release-candidate checklist.
+The 1.x public API follows semantic versioning: compatible additions may ship in a minor release;
+removing or breaking a documented public contract requires a new major version. Stored-format
+versions are separate from package versions. The first released 1.0 writer starts the supported
+format chain; supported later writers preserve automatic upgrades through ordinary open/load.
+The 0.x release history remains available in the changelog, but 0.x is not an upgrade predecessor
+of 1.0.
 
 ## Release notes
 
@@ -62,167 +44,38 @@ recorded there.
 
 ## The 1.0 storage reset
 
-The planned 1.0 rebuild starts fresh. Its ordinary open refuses databases written by Minnow
-0.x with `MINNOW_LEGACY_DATA`, without changing them or opening an empty replacement. Use a
-fresh database name, or explicitly delete the old database. There is no 0.x-to-1.0 converter.
-The first released 1.0 format begins the new supported upgrade chain. Every later supported
-format change must preserve ordinary automatic open/load with frozen older-writer fixtures,
-continued writes and reopen, interruption/retry, corruption refusal, concurrent openers and
-older-writer refusal. Unreleased rebuild formats are not supported predecessors.
+Minnow 1.0 starts a new stored-format chain. Opening a 0.x database fails with
+`MINNOW_LEGACY_DATA` before creating a replacement or changing the old database. There is no
+0.x-to-1.0 converter. Use a new name, or explicitly delete data you no longer need. Read an
+old database with its compatible 0.x build.
 
-The planned 1.0 format handles compatibility at its outer reader and writer gates. A new nested
-tag or encoding requires a higher reader capability, and a higher writer capability when older
-writers cannot safely rewrite it. These gates must be published before the new feature reaches
-data or the write-ahead log. An unknown nested tag under supported gates is corruption. It is
-refused when read, before its value is used or published into derived data. Open validates its
-root, manifest, catalog and log reads without scanning every stored data page. The private format
-is still being finalized; this changes no published 0.x format or API.
+Automatic-upgrade and frozen-fixture obligations in the new chain begin with the first released
+1.0 format. Unreleased rebuild formats are not supported predecessors. Later supported format
+changes must preserve data through ordinary open/load, continued writes and reopen, including
+interruption/retry, corruption refusal, concurrent openers and older-writer refusal.
 
-The private page reader also refuses nonzero unused aux fields, nondecimal directory special
-flags, and invalid or unordered distinct-sketch registers. Current writers already emit the
-accepted form. NULL payload bytes stay uninterpreted, and sparse versus dense sketches remain
-a packing choice rather than a compatibility distinction.
+Catalog records use append-only central field IDs and length-delimited fields. Unknown required
+fields and unsupported versions refuse. Explicit read-only inspection may skip unknown optional
+fields without retaining their bytes; inspection records cannot become mutation or replay inputs,
+including through nested aliases or planner copies. A writer must understand everything it would
+rewrite. Separate minimum-reader and minimum-writer gates enforce that rule before mutation
+authority. Every present semantic field requires understanding.
 
-The unexported rebuild gives catalogs their own versioned binary grammar. Catalog records keep
-stable field IDs and exact typed values. Native storage splits the logical stream across bounded,
-checksummed pages; the write-ahead log uses the same record definitions for catalog changes.
-Readers reject unknown required fields or versions with a typed error. Read-only inspection may
-skip unknown optional fields, without retaining their bytes. Inspected records cannot enter catalog
-planning, mutation or replay, including through fresh wrappers around them. Writable opens require
-understanding every field before taking mutation authority. Reserved semantic fields refuse even
-when marked optional.
-Field IDs and flag bytes are separate; reserved flags refuse.
-Catalog admission validates type, vector and reference consistency. Live safe-integer payloads
-must be exact integers without negative zero; payload bytes under SQL NULL stay uninterpreted. Logged catalog changes name
-their expected predecessor version, checked before any effects from that transaction replay.
-Catalog pages participate in ordinary reachability and reclamation.
-These are unreleased development formats, not a change to the published 0.x formats or a public
-snapshot API. Triggers and full-text search remain required work before the 1.0 format freeze.
+Row WAL uses stable column and index identities across `ALTER TABLE`. A dropped column does not
+shift surviving values during replay. Older staged groups retain their physical membership, and
+added columns read their frozen missing values across checkpoint, maintenance and reopen.
 
-The remaining byte contracts on this page describe the existing 0.x engine.
+## Stored formats have their own versions
 
-## The block format has its own version
+The first released 1.0 native and portable formats start a new compatibility chain. Native roots,
+WAL records, catalog records and data pages have registered versioned grammars; portable snapshots
+use their own framed grammar. Spill and scratch files are temporary and are not committed snapshots.
+Unsupported readers or writers refuse before mutation. Do not interpret development selector numbers
+as released compatibility promises.
 
-The version on the package describes the code. The stored bytes carry a separate
-`BLOCK_FORMAT_VERSION`, and a snapshot file carries `SNAPSHOT_FORMAT_VERSION`. They move on their
-own schedule — most package releases do not touch them.
-
-Block format 2 is the first locked envelope: a 44-byte header followed by canonical metadata and
-the stored payload. Permanent raw vectors freeze every Minnow-owned byte for all four physical
-types. A future writer uses a new format number and retains the format-2 reader rather than
-changing those bytes in place.
-
-A packed block holds a small segment's column blocks in one stored payload. It is a container,
-not a new block format: a 24-byte header and a directory of 12-byte entries, then complete
-format-2 blocks, one per column. The container has its own version, 1, and a frozen vector of its
-bytes. Snapshots never carry it: an export writes each member as an ordinary format-2 block
-frame, so packing never changes a snapshot's format, and an older build imports it whenever it
-could before.
-
-Snapshot format 1 is locked with block format 2 embedded inside it. Its fixture freezes the file
-framing, canonical header, payload order, and logical block bytes. Native `CompressionStream`
-implementations may produce different valid gzip streams, so compressed payload sizes and their
-derived stored-byte checksums are compared after decompression. An incompatible snapshot writer
-must use a new snapshot format number and keep the format-1 reader.
-
-Snapshot format 2 uses format 1's file framing and frames unchanged. It is written only when the
-database holds the engine's internal key-forwards table, which records where each row whose
-primary key changed now lives. A snapshot without that table is still format 1, byte for byte, so
-older builds can import it. Core 0.14.1 and older refuse a format-2 snapshot, because they would
-restore the forwards table as an ordinary one and lose the forwards.
-
-Snapshot format 3 also uses format 1's framing unchanged. It is written only when a table has a
-column declared `TIMESTAMP` (without time zone). Core 0.16.0 and older refuse a format-3
-snapshot, because they would refuse that column as corrupt or restore it as `TIMESTAMPTZ`. A
-snapshot without such a column is still format 1 or 2. The current build imports all three
-formats, and refuses a snapshot whose format is too old for a record it holds: a format-1
-snapshot with a key-forwards table, or a format-1 or format-2 snapshot with a `TIMESTAMP`
-column.
-
-IndexedDB schema 1 was its first locked native layout; schema 2 (core 0.10.0) moved each
-transaction's artifact journal into chunked records and migrates a schema-1 database in place on
-open. Schema 3 (core 0.13.0) changes no stored record: it admits compaction jobs with replayed
-merge plans, so a schema-2 build, which cannot read them, refuses the database. Schema 4 (core
-0.14.0) rewrites nothing either: it lets one commit store an indexed column's changes as several
-part records, so a commit's index changes have no size limit, and a schema-3 build refuses the
-database. Schema 5 rewrites nothing as well: the catalog may hold the engine's internal
-key-forwards table, which a schema-4 build (core 0.14.1 and older) would read as an ordinary
-table, so that build refuses the database. Schema 7 (core 0.16.0) rewrites nothing either: it
-admits compaction jobs that fold a table across `ALTER TABLE` — a source written before a column
-was added, whose rows the fold fills with the column's default, or an update left holding only
-its key after `DROP COLUMN` — and delta merges, compaction jobs that merge a run of level-zero
-updates and deletes into a few segments that take the run's place. A schema-5 build (core
-0.15.0) refuses either job as corruption, so that build refuses the database. Schema 6 was
-never released: core 0.16.0 moves a schema-5 database straight to schema 7. Schema 8 rewrites
-nothing either: a column's catalog record may say it was declared `TIMESTAMP` (without time
-zone), which a schema-7 build (core 0.16.0) refuses as corruption, and it admits packed segments
-and staging calls of up to 1,024 blocks, which that build would count wrongly, so it refuses the
-database. Columns written before schema 8 stay `TIMESTAMPTZ`. No pre-contract
-schema readers or recreation policy ship. Every future integer schema
-version must add one ordered migration to the explicit registry and a frozen fixture for the
-version it supersedes. The browser runs the complete chain
-inside one `versionchange` transaction, so either every schema and data step commits or the old
-database remains intact. An older application build refuses a newer database without mutation.
-
-OPFS native layout 13 is the current contract. Like layouts 8 (core 0.13.0), 9 (core 0.14.0),
-10 (core 0.15.0), and 12 (core 0.16.0), it keeps layout 7's bytes — the checkpoint, WAL, and
-extents still carry encoding version 7. Layout 8 admits compaction jobs with replayed merge plans, which a layout-7
-build cannot read. Layout 9 admits a WAL entry whose payload spans several frames, for a commit
-too large for one, and checkpointed index changes of any size, which a layout-8 build cannot
-read. Layout 10 admits the engine's internal key-forwards table, which a layout-9 build (core
-0.14.1 and older) would read as an ordinary table. Layout 12 admits compaction jobs that fold a
-table across `ALTER TABLE ADD` or `DROP COLUMN`, and delta merges; a layout-10 build refuses
-either as corruption. Layout 11 was never released: core 0.16.0 moves a layout-10 database
-straight to layout 12. Layout 13 admits a column declared `TIMESTAMP` (without time zone), which
-a layout-12 build (core 0.16.0) would render as `TIMESTAMPTZ`, and packed segments in staging
-frames of up to 1,024 blocks, which it would count wrongly. The format marker is the barrier,
-and upgrading a layout-7 to 12 database rewrites only that marker. Layout 7's fixture freezes the format
-marker, checkpoint, WAL tail, extent payloads, and a separate checksummed acknowledgement file. That file records
-which WAL boundary completed a strict flush, so recovery can distinguish an unwritten suffix
-from damage to an acknowledged write. Missing or corrupt acknowledgement bytes stop recovery.
-
-**Supported upgrades are automatic, including during 0.x.** Opening a layout-6 database with
-the current build validates its native data and converts it under exclusive ownership; a layout-7
-to 12 database only has its marker rewritten. All of them end at layout 13. An IndexedDB database
-at schema 1 to 7 is also upgraded to schema 8 when it is opened; only the step from schema 1
-rewrites records. Every datetime column an older build wrote stays `TIMESTAMPTZ` after the
-upgrade, whatever its DDL said. No export/import or separate migration call is needed. Block
-format 2 is unchanged. Frozen older
-immutable posting envelopes remain readable. Older application builds refuse the upgraded
-database.
-
-Conversion prepares and validates a temporary copy before replacing native control files. It
-needs temporary quota for that copy. The new format marker is flushed before current-format
-checkpoints replace the old ones; both checkpoint mirrors and the acknowledgement file are
-durable before the old WAL is reset. A checksummed ready record resumes interrupted publication,
-and a durable completion receipt prevents a stale conversion record from rolling back later
-writes. Cleanup follows current-layout recovery and full integrity validation.
-
-A missing payload, corrupt legacy checkpoint, or ambiguous incomplete legacy WAL stops the
-upgrade with an error. Layout 6 never recorded strict acknowledgement boundaries, so conversion
-cannot reconstruct lost historical acknowledgement evidence or silently excuse damaged bytes.
-If an older connection still owns the database, close it and retry opening. Quota or I/O failures
-also report an error; opening again retries or resumes the conversion.
-
-Every future supported format change must retain a reader or an automatic, crash-resumable
-conversion through the ordinary open/load API. Manual export/import is not its upgrade path.
-Tests must open every supported frozen older fixture, preserve its data, continue writing and
-reopen, and exercise interruption, power loss, concurrent openers and older-writer refusal.
-Unknown versions are refused without guessing their shape or deleting their data.
-
-There is deliberately no data migration for unsupported pre-v1 prototypes. They were removed
-before the schema-1 IndexedDB contract was frozen. OPFS always rejects an unknown layout marker;
-to keep experimental OPFS data, use the build that can still open it to export a supported framed
-snapshot before upgrading.
-
-Every released block/snapshot pair keeps a frozen database in
-`packages/core/format-fixtures/`, opened and queried on every test run. Native OPFS layouts keep a
-separate frozen file tree in the same directory. The native test enumerates every layout fixture,
-requires one for the current writer, and reopens and continues writing each supported older tree.
-Every fixture records the exact `@minnowdb/core` package version that wrote it, so the suite proves
-which released writer the compatibility case represents and rejects impossible future provenance.
-A change that would make either kind unreadable fails in CI rather than in an application. See
-[Testing](/docs/reference/testing) for how that suite works.
+Block format 2, snapshot formats 1–3, IndexedDB schemas 1–8 and OPFS layouts 6–13 describe the
+historical 0.x chain. Those converters remain part of 0.x; 1.0 does not run them or reuse their
+bytes as a new database. Read old data using a compatible 0.x build.
 
 ## How a release is cut
 

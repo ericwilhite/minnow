@@ -53,6 +53,13 @@ The batch API and Kysely do the same thing: `db.update("orders", -1, { order_id:
 
 ## What the engine does
 
+When `ON UPDATE` is omitted, Minnow follows each child's original parent row. It checks child
+uniqueness after the complete captured follow group, so swapping or rotating parent keys also
+works when the child reference is unique. A nonunique completed group fails with SQLSTATE
+`23505` and identifies the child constraint before user `AFTER` work or a later referential action
+can observe the changes. Explicit `ON UPDATE CASCADE`, `SET NULL` and `SET DEFAULT` retain
+per-action uniqueness checks.
+
 For that one `UPDATE`, in order:
 
 1. **Takes the writer turn.** The rekey is one write scope, like any other write. No other write,

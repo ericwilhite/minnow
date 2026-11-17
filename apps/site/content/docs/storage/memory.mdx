@@ -35,9 +35,7 @@ portable artifact.
 
 ## What it costs
 
-Everything lives in JavaScript memory: block payloads stay compressed, but they stay resident.
-Budget roughly what the same data would occupy in a durable store, plus the catalog.
-
-Nothing survives a reload, and nothing is shared between tabs — two tabs each get their own
-database. Where a durable adapter's cross-tab behaviour needs testing, that has to be a
-browser test against the real store.
+The memory backend keeps the backing database bytes in JavaScript memory and does not survive
+process loss. Those storage bytes are separate from the engine's modeled execution/cache budget.
+The governor is not a measurement or limit of the browser's complete JavaScript heap. Use memory
+for disposable data and tests; use a durable backend for data that must survive a reload.
