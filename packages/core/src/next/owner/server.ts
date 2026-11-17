@@ -316,7 +316,7 @@ class Connection {
   #livenessLock = "";
   #state: "handshake" | "open" | "closed" = "handshake";
   readonly #sessions = new Map<number, SessionSlot>();
-  readonly #prepared = new Map<number, { readonly text: string; planned: PlannedStatement }>();
+  readonly #prepared: ReturnType<OwnerEngine["createPreparedCache"]>;
   readonly #running = new Map<number, Running>();
   /** Requests waiting behind their session, by seq: a cancel marks them. */
   readonly #queued = new Map<number, { cancelled: boolean; close: boolean }>();
@@ -333,6 +333,7 @@ class Connection {
   constructor(server: OwnerServer, port: ServerPort) {
     this.#server = server;
     this.#port = port;
+    this.#prepared = server.engine.createPreparedCache();
   }
 
   get outstandingFrames(): number {
@@ -414,7 +415,7 @@ class Connection {
         this.post({ t: "alive" });
         return;
       case "unprepare":
-        this.#prepared.delete(message.id);
+        this.#prepared.delete(String(message.id));
         return;
       case "bye":
         this.end("bye");
@@ -597,7 +598,7 @@ class Connection {
   // ---- requests ----
 
   #request(request: Request): void {
-    const session = "session" in request ? request.session : null;
+    const session = "session" in request ? (request.session ?? null) : null;
     if (session !== null && (!Number.isSafeInteger(session) || session < 0)) {
       this.post({
         t: "error",
@@ -607,7 +608,11 @@ class Connection {
       return;
     }
     const slot = this.#slot(session ?? 0);
-    if (request.t === "prepare" || request.t === "subscribe" || request.t === "admin") {
+    if (
+      (request.t === "prepare" && session === null) ||
+      request.t === "subscribe" ||
+      request.t === "admin"
+    ) {
       // Session-free requests do not wait behind a session.
       void this.#serveOne(request, null);
       return;
@@ -659,6 +664,19 @@ class Connection {
     if (request.t === "statement" && session !== null) {
       try {
         planned = this.#planStatement(session, request.text, request.prepared);
+        if (
+          request.scopedTransaction === true &&
+          (planned.control === "begin" ||
+            planned.control === "commit" ||
+            planned.control === "rollback")
+        )
+          throw new TypeError(
+            "A callback transaction owns its BEGIN, COMMIT and ROLLBACK boundary",
+          );
+        if (request.queryOnly === true && planned.kind !== "query")
+          throw new TypeError(
+            "query() and cursor() accept SELECT statements; use execute() for other statements",
+          );
       } catch (error) {
         planError = error;
       }
@@ -715,9 +733,13 @@ class Connection {
     prepared: number | null,
   ): PlannedStatement {
     if (prepared !== null) {
-      const entry = this.#prepared.get(prepared);
-      if (entry === undefined)
+      const entry = this.#prepared.get(String(prepared));
+      if (entry === undefined) {
+        if (text !== null) return session.plan(text);
         throw new ProtocolError(`Prepared statement ${String(prepared)} does not exist`);
+      }
+      if (text !== null && text !== entry.text)
+        throw new ProtocolError("Prepared fallback SQL does not match its handle");
       // Re-planned against the session's catalog when it differs (the planned entry stays the
       // shared one, so a transaction's private plan never outlives it).
       return entry.planned.catalogVersion === session.catalogVersion
@@ -971,7 +993,7 @@ class Connection {
           );
           break;
         case "prepare":
-          this.#prepare(request);
+          this.#prepare(request, session);
           finish();
           return;
         case "admin":
@@ -1030,17 +1052,20 @@ class Connection {
     };
   }
 
-  #prepare(request: Extract<Request, { t: "prepare" }>): void {
+  #prepare(request: Extract<Request, { t: "prepare" }>, session: EngineSession | null): void {
     const engine = this.#server.engine;
     engine.ledger.settle(this.clientId, request.seq);
     let planned: PlannedStatement;
     try {
-      planned = engine.plan(request.text);
+      planned = session === null ? engine.plan(request.text) : session.plan(request.text);
     } catch (error) {
       this.post({ t: "error", seq: request.seq, error: toWireError(error) });
       return;
     }
-    this.#prepared.set(request.id, { text: request.text, planned });
+    // A private catalog's plan stays in its native session cache; retaining it in a connection
+    // cache would outlive transaction end and could collide with a later catalog version.
+    if (session === null || session.transaction === "idle")
+      this.#prepared.set(String(request.id), { text: request.text, planned });
     this.post({
       t: "prepared",
       seq: request.seq,
@@ -1543,7 +1568,7 @@ class Connection {
         );
     }
     this.#streams.clear();
-    this.#prepared.clear();
+    this.#prepared.close();
     // The ledger ends every session's generation now, busy or not: a retry arriving before a busy
     // session's task finishes must already find it ended (format/ledger.ts `endSession`; a late
     // completion is ignored). Only the engine session waits for its task.

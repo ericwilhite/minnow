@@ -94,6 +94,12 @@ export function isResendable(
 ): boolean {
   switch (request.t) {
     case "prepare":
+      return (
+        request.session === undefined ||
+        (request.session === 0 &&
+          defaultSession.transaction === "idle" &&
+          defaultSession.unresolvedControl === 0)
+      );
     case "subscribe":
     case "admin":
       return true;

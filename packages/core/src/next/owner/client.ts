@@ -587,9 +587,17 @@ export class ProtocolClient {
   }
 
   /** Same opaque request, with its sequence available for terminal-aware cancellation. */
-  prepareTask(sql: string): { readonly seq: number; readonly promise: Promise<PreparedInfo> } {
+  prepareTask(
+    sql: string,
+    session?: number,
+  ): { readonly seq: number; readonly promise: Promise<PreparedInfo> } {
     const id = ++this.#prepared;
-    const task = this.#request({ t: "prepare", id, text: sql });
+    const task = this.#request({
+      t: "prepare",
+      id,
+      text: sql,
+      ...(session === undefined ? {} : { session }),
+    });
     return {
       seq: task.seq,
       promise: task.promise.then((result) => ({
@@ -649,6 +657,8 @@ export class ProtocolClient {
       readonly windowBytes?: number;
       readonly session?: number;
       readonly frameRows?: number;
+      readonly queryOnly?: boolean;
+      readonly prepared?: number;
     } = {},
   ): OrdinaryCursor {
     const queue = new CursorQueue();
@@ -657,7 +667,8 @@ export class ProtocolClient {
         t: "statement",
         session: options.session ?? 0,
         text: sql,
-        prepared: null,
+        prepared: options.prepared ?? null,
+        ...(options.queryOnly === undefined ? {} : { queryOnly: options.queryOnly }),
         knownColumnsVersion: -1,
         params,
         result: {
@@ -905,7 +916,7 @@ export class ProtocolClient {
       this.onActivity?.();
       return refused;
     }
-    const session = "session" in body ? body.session : null;
+    const session = "session" in body ? (body.session ?? null) : null;
     const kind = this.#kindOf(body);
     const control = kind !== null && kind !== "other";
     // Never sent, so nothing took effect: on the new owner it would run outside the lost

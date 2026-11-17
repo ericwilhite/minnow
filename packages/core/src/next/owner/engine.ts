@@ -204,7 +204,15 @@ export interface EngineSession {
   close(): void;
 }
 
+export interface PreparedCache {
+  get(id: string): { readonly text: string; readonly planned: PlannedStatement } | undefined;
+  set(id: string, value: { readonly text: string; readonly planned: PlannedStatement }): boolean;
+  delete(id: string): void;
+  close(): void;
+}
 export interface OwnerEngine {
+  /** Bounded, evictable, governor-charged owner handle cache. Fallback SQL permits re-planning. */
+  createPreparedCache(): PreparedCache;
   /** A connection-owned, governor-charged cache, closed when that connection ends. */
   createReturnPool(capBytes: number): ReturnPool;
   readonly durability: Durability;

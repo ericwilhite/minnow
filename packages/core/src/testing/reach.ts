@@ -9586,3 +9586,34 @@ export const PUBLIC_TRANSPORT_REACH = [
   "unsent close and cancellation",
   "early return terminal fence",
 ] as const;
+
+export const PUBLIC_FACADE_REACH = [
+  "owner query-only guard",
+  "transaction isolation and scope fence",
+  "callback rollback",
+  "savepoint recovery",
+  "private preparation and owned transaction boundary",
+  "prepared catalog invalidation",
+  "charged bounded prepared cache",
+  "uncached prepared fallback",
+  "cursor return retains Result and drains pin",
+] as const;
+
+export const PUBLIC_FACADE_OUTCOME_REACH = [
+  "abort before commit is no effect",
+  "commit wins over abort",
+  "lost reply ledger replay",
+  "lost RETURNING stays committed without result",
+  "cursor abort preserves prefix and terminal reason",
+] as const;
+
+export const PUBLIC_CLIENT_BINDING_REACH = [
+  "int32 input",
+  "float64 input",
+  "int64 input",
+  "empty input",
+  "validity word boundary",
+  "terminal success beats abort",
+  "no-effect reason and unknown effect",
+  "cursor metadata abort reason",
+] as const;

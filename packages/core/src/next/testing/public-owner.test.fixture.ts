@@ -5,10 +5,11 @@ import { OwnerServer } from "../owner/server.js";
 import { ChunkReader } from "../page/reader.js";
 import { StorageCore } from "./storage-core.js";
 
-export async function publicOwner() {
+export async function publicOwner(options: { planCacheBytes?: number } = {}) {
   const core = await new StorageCore().open();
   const engine = composeEngine({
     planner: core.lowerer,
+    ...(options.planCacheBytes === undefined ? {} : { planCacheBytes: options.planCacheBytes }),
     writePath: core.harness.path,
     governor: core.harness.governor,
     spill: core.spill,

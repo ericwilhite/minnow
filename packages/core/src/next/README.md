@@ -4500,3 +4500,26 @@ returning a cursor releases the owner's stream without detaching consumer-held o
 views. An unsent cancellation settles locally, so a later connection cannot run it. Explicit
 recycling exports retain their separate return-buffer contract. These are internal transport
 bindings; the public entry points and default engine have not switched.
+
+### Internal SQL facade
+
+`owner/database-client.ts` binds SQL calls, opaque preparation, ordinary cursors and callback
+transactions to ProtocolClient. `query` and `cursor` accept SELECT plans; `execute` accepts any
+statement. The owner checks these rules after lowering. Callback transactions own their
+BEGIN/COMMIT/ROLLBACK boundary; savepoints remain available. Their native sessions isolate
+uncommitted writes from the default session, and their handles cannot outlive the callback.
+Cancellation waits for the native terminal reply: an acknowledged commit wins over abort,
+a proved no-effect cancellation returns the caller's reason, and unknown effects stay unknown.
+
+Connection prepared handles use a bounded governor-charged cache, rather than holding a plan
+outside its original cache's charge. Executions include the original SQL as an exact fallback
+for eviction or reconnection, under the same protocol sequence and ledger identity. Private-DDL
+preparation runs in its session and does not retain the private plan beyond that session cache.
+The unreleased protocol profile is 7 for these optional owner-side call guards/session binding;
+this changes no stored bytes or published package entry. Raw id-only execution requires a live
+cached handle; the internal facade always supplies fallback SQL.
+
+CRUD input conversion preserves the native write-request shape, cloned inputs and typed validity.
+Native `ComposedSession.write` remains an explicit stub pending B5b's input/admission wiring;
+these convenience calls are not yet enabled. SQL execution is tested against the real native
+write path/executor. B8's live runtime binding and production boot are separate follow-ups.

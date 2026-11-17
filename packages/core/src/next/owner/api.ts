@@ -188,16 +188,22 @@ export interface Cursor<TRow = Row> extends AsyncIterableIterator<Result<TRow>> 
 /** SQL execution. A transaction and the client both implement it. */
 export interface SqlExecutor {
   /**
-   * Runs one statement. Any statement: SELECT, DML (with RETURNING), DDL, and on the client's
-   * default session also `BEGIN`/`COMMIT`/`ROLLBACK` (as one PostgreSQL connection would).
+   * Runs a SELECT. The owner checks the planned statement kind before execution.
+   * Use execute for DML, DDL and transaction-control SQL.
    */
   query<TRow = Row>(
     sql: string,
     params?: readonly Param[],
     options?: CallOptions,
   ): Promise<Result<TRow>>;
+  /** Runs any one statement, including DML/DDL and default-session transaction control. */
+  execute<TRow = Row>(
+    sql: string,
+    params?: readonly Param[],
+    options?: CallOptions,
+  ): Promise<Result<TRow>>;
   cursor<TRow = Row>(sql: string, params?: readonly Param[], options?: CursorOptions): Cursor<TRow>;
-  /** Plans once on the owner; executions send an id and parameters only. */
+  /** Opaque preparation. The bounded owner cache may re-plan after eviction or reconnection. */
   prepare(sql: string, options?: CallOptions): Promise<PreparedStatement>;
   insert(table: string, rows: WriteInput, options?: InsertOptions): Promise<Result>;
   upsert(table: string, rows: WriteInput, options?: WriteOptions): Promise<Result>;
@@ -212,6 +218,7 @@ export interface PreparedStatement {
   readonly columns: readonly ResultColumn[];
   readonly parameters: readonly PhysicalType[];
   query<TRow = Row>(params?: readonly Param[], options?: CallOptions): Promise<Result<TRow>>;
+  execute<TRow = Row>(params?: readonly Param[], options?: CallOptions): Promise<Result<TRow>>;
   cursor<TRow = Row>(params?: readonly Param[], options?: CursorOptions): Cursor<TRow>;
   /** Frees the plan on the owner. Idempotent. */
   close(): void;

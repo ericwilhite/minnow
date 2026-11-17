@@ -193,6 +193,13 @@ function stubEngine(): OwnerEngine {
     close: () => undefined,
   } as unknown as EngineSession;
   return {
+    // This isolated point-read baseline deliberately has no retained preparation cache.
+    createPreparedCache: () => ({
+      get: () => undefined,
+      set: () => false,
+      delete: () => undefined,
+      close: () => undefined,
+    }),
     createReturnPool: () => {
       throw new Error("Point benchmark stub has no streaming output pool");
     },
