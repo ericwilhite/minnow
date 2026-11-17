@@ -10,6 +10,11 @@ compatibility policy and release process.
 
 ## Unreleased
 
+Boolean SQL regex operators (`~`, `~*`, `!~`, `!~*`) accept more inputs within the same
+work and memory limits. Matching `"a".repeat(1000) + "!"` with `~`, `(a+)+$` previously threw `RangeError`
+and now returns false; `(a*)*$` previously threw `RangeError` and now returns true, matching
+PostgreSQL's empty match at the end. No migration or stored-format change is required.
+
 The shipped engine’s fast path for SUM and AVG over floating-point columns adds values directly,
 recovering overhead introduced by the 0.19.3 integer-exactness checks. SQL integer aggregates
 still reject inexact intermediate results; floating-point accumulation order is unchanged.
