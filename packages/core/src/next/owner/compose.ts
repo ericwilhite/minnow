@@ -507,12 +507,27 @@ class ComposedEngine implements CatalogOwnerEngine {
   }
 
   onCommit(listener: (tables: readonly number[]) => void): () => void {
+    const feed = this.#options.writePath.changes;
+    if (feed !== undefined)
+      return feed.observe((event) =>
+        listener(
+          event.catalog || event.unknown || event.replacement
+            ? []
+            : event.tables.slice(0, event.tableCount),
+        ),
+      );
     this.#commitListeners.add(listener);
     return () => this.#commitListeners.delete(listener);
   }
 
   committed(tables: readonly number[]): void {
-    for (const listener of this.#commitListeners) listener(tables);
+    for (const listener of this.#commitListeners) {
+      try {
+        listener(tables);
+      } catch {
+        /* Observers do not own commit outcomes. */
+      }
+    }
   }
 
   admin(op: string): Promise<unknown> {

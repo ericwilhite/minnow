@@ -1,3 +1,4 @@
+import type { ChangeFeed } from "./changes.js";
 /**
  * The write path as the owner composes it: transactions, group commit, durability and delivery,
  * sequences, backpressure, memory, startup (owner: write path, track B3; consumers: the ownership
@@ -218,6 +219,8 @@ export interface BeginOptions {
 }
 
 export interface WritePath {
+  /** Native committed effects; optional only for legacy test doubles. */
+  readonly changes?: ChangeFeed;
   /** Owner installs renderer2; missing capability makes writes invalidate, never reinterpret cells. */
   installFtsRenderer?(renderer: import("./fts-write.js").FtsWriteRenderer): void;
   readonly durability: Durability;

@@ -231,7 +231,7 @@ export interface OwnerEngine {
   openSession(clientId: string, generation: number, sessionId?: string): EngineSession;
   /** Tables a statement's result depends on: subscriptions re-run after commits touching them. */
   readSet(statement: PlannedStatement): readonly number[];
-  /** Calls `listener` after each commit with the ids of the tables it changed. */
+  /** Calls `listener` after native publication. An empty list means globally dirty (catalog/unknown/reset). */
   onCommit(listener: (tables: readonly number[]) => void): () => void;
   /** Admin calls (protocol.ts `AdminOp`), each with its structured-clone value. */
   admin(op: string, args: readonly WireValue[], context: RunContext): Promise<unknown>;

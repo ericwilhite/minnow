@@ -10651,3 +10651,12 @@ export const NATIVE_WRITE_GROWTH_REACH = [
   "net new credit completes",
   "zero final charge",
 ] as const;
+
+export const LIVE_PUBLICATION_REACH = [
+  "catalog publication",
+  "savepoint rollback",
+  "transaction rollback",
+  "explicit commit",
+  "observer isolation",
+  "zero charges",
+] as const;

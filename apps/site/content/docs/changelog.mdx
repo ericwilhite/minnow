@@ -35,6 +35,12 @@ spills larger histories through the existing native metadata inventory. Publicat
 snapshot loading and abort consume immutable cursors instead of copying a whole write's
 extent list into memory. Descriptor ownership drains before its memory is released.
 No stored-format change or migration is required; released 0.x behavior is unchanged.
+The private 1.0 native writer now reports committed changes from surviving transaction undo.
+Rollback and savepoint rollback discard their effects. Summaries include the real LSN and
+separate catalog, snapshot-replacement and unknown-effect markers. A monotone publication
+probe recovers missed notifications. Optional owner-session key history is bounded and charged;
+missing continuity requires an explicit reset. This does not change stored formats, commit
+codecs, ledger outcomes, or released 0.x behavior.
 
 - The browser performance gate now binds every baseline to its SQL and dataset scale and refuses
   changed workloads before comparison. The S_q7 NUMERIC ROUND correction (`4e7b6a0c`) requires
