@@ -98,7 +98,7 @@ export async function buildListedReopenSpace(
             ];
       const sequence: number = (root?.sequence ?? 0) + 1;
       const prepared = await keeper.prepare(sequence, {
-        added: [...writer.extents],
+        added: writer.extents,
         released: retired,
         writer,
       });

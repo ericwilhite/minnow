@@ -9469,3 +9469,36 @@ export const REPLAY_MAPPING_MEMORY_REACH = [
   "row ownership outlives cache",
   "zero retained",
 ] as const;
+
+export const WRITER_INVENTORY_REACH = [
+  "fixed record window",
+  "bounded hidden record arrays",
+  "discard and exact reuse",
+  "exact full and ordinal snapshots",
+  "all ownership credit returned",
+] as const;
+
+export const WRITER_INVENTORY_STORAGE_REACH = ["resident ownership", "spilled ownership"] as const;
+
+export const WRITER_OWNERSHIP_PRESSURE_REACH = [
+  "bounded synchronous view",
+  "exact immutable source",
+  "published source drained",
+  "aborted source drained",
+  "all-credit competitor",
+  "zero ownership",
+] as const;
+
+export const WRITER_OWNED_PRODUCERS_REACH = [
+  "large single producer",
+  "competing publication credit",
+  "exact committed and reopened rows",
+  "zero ownership",
+] as const;
+
+export const WRITER_FOREIGN_OWNER_REACH = [
+  "two live owners beyond bank",
+  "creator grant closes before target",
+  "snapshot survives creator",
+  "zero both governors",
+] as const;

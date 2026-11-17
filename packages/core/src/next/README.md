@@ -4480,3 +4480,32 @@ Resident release lists of at most 4,096 entries are an optional optimization. Th
 keeper first attempts their complete reservation; a boolean or typed memory refusal
 selects the same disk inventory used for larger sources. Other errors propagate.
 The disk route admits its smaller working window before copying or consuming entries.
+
+### Bounded native writer ownership
+
+Native `ExtentWriter` owns a charged window of at most 64 sealed extents. Larger histories
+spill through the existing `MetadataJournal` chunk queue, pair sort and retirement-inventory
+cursors. Seal ordinals remain monotone across discard and address reuse; a per-part capture
+selects ordinals without copying earlier parts. No private inventory is a durable root reference.
+
+`writer.extents.length` is scalar. Synchronous element access/materialization is a borrowed
+small-window view; after spill use `snapshotExtents({ budget, since?, signal? })`. The returned
+immutable source belongs to the caller until `release()` settles, independently of later seals,
+publication or abort. Publication observers consume `addedInventory`/`releasedInventory` when
+present, keeping both sources alive through settlement. Small released-array observers retain a
+separately charged bounded fast path. Native publication and audit use the same disk sources.
+
+The existing root bank's spare allowance funds transient descriptor controls without reducing
+its five-small-frame reserve. Additional owners take ordinary preflight credit before allocation,
+then move that credit into non-evictable ownership when their lifetime can exceed their creating
+grant. A portable loader can use a different governor from its target: a refused foreign
+transfer refunds the caller and uses the target's already-admitted structural credit instead.
+No credit moves between governors. Staged descriptors have a separate owner from their data pin: rollback can release a row
+memtable before the publication that retires its extents. Close and abort fence accepted I/O, drop
+resident windows, then refund exactly once. The existing FTS 4 MiB publication floor is unchanged.
+
+`storage/writer-inventory.test.ts` covers 63/64/65/32,769 sealed records, holes, address reuse and
+full/ordinal snapshots. `testing/writer-ownership-pressure.test.ts` covers real native writers
+with 65/4,097 extents, publication/abort under competing grants, and plain-row/FTS producers,
+exact committed/reopened rows and zero ownership. These are memory/correctness proofs, not
+throughput or browser RSS claims. No durable grammar, released API or supported predecessor changes.

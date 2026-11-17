@@ -1,3 +1,4 @@
+import type { StagedExtents } from "./staged-extents.js";
 /**
  * A memtable: one table's rows in memory, at most 65,536 of them (one locator segment), in row-id
  * order, plus the key-index delta of every index and the deletions of its own rows.
@@ -30,7 +31,6 @@
  */
 import type { ColumnDef } from "../access/catalog.js";
 import type { SpacePin } from "../access/space.js";
-import type { ExtentRef } from "../storage/extents.js";
 import type { GroupRef, GroupRoot, RunRef } from "../format/manifest.js";
 import type { Vector } from "../vector/vector.js";
 import { ColumnChunk, MEMORY_CHUNK_ROWS } from "./columns.js";
@@ -181,7 +181,7 @@ export interface StagedPart {
   /** Held while the staged group can be read through this memtable. */
   readonly pin: SpacePin;
   /** Every extent written for it (group, runs, tail bitmap): retired if the staging is dropped. */
-  readonly extents: readonly ExtentRef[];
+  readonly extents: StagedExtents;
 }
 
 export interface Published {

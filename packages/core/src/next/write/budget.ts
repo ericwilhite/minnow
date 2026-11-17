@@ -52,6 +52,16 @@ export class MetadataBudget implements ByteBudget {
     readonly grow?: (wanted: number) => Promise<void>,
   ) {}
 
+  ordinarySource(): ByteBudget {
+    return this.grant;
+  }
+
+  tryAllocate(bytes: number): boolean {
+    if (bytes > this.capBytes) return false;
+    if (this.grant.allocate(bytes)) return true;
+    return this.reclaimWriter() > 0 && this.grant.allocate(bytes);
+  }
+
   allocate(bytes: number): boolean {
     if (bytes > this.capBytes) throw new MetadataAllocationTooLargeError(bytes, this.capBytes);
     if (this.grant.allocate(bytes)) return true;

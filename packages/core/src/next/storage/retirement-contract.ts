@@ -4,6 +4,11 @@ import type { BlobRef, ExtentRef, ByteBudget } from "./extents.js";
 export type RetirementInput = Iterable<ExtentRef | BlobRef> | AsyncIterable<ExtentRef | BlobRef>;
 export interface RetirementOptions extends TaskWork {
   readonly budget: ByteBudget;
+  /** Native retained owners can outlive the creating admission; move only their fixed
+   * descriptor allowance into non-evictable memory before exposing the result. */
+  readonly retainedOwner?: boolean;
+  /** Internal factory funding; working cursors still use budget. */
+  readonly ownerBudget?: ByteBudget;
   /** Page candidates deduplicate exactly; strict callers may instead reject repeated extents. */
   readonly duplicates?: "exact" | "refuse";
   /** References in the NEW root, excluding old roots/pins (R8 already protects those).

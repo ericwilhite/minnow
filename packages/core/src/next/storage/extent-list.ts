@@ -1,3 +1,5 @@
+import { writerViewSource } from "./writer-view.js";
+import { WriterInventoryRequiredError } from "./writer-inventory.js";
 /**
  * Ruling R25: each published root references a paged, offset-sorted list of the exact extents it
  * reaches, so startup rebuilds free space from the current and previous roots' lists (two reads
@@ -272,6 +274,8 @@ export async function extentsOf(
 /** One publication attempt's change to the set of extents its root reaches (`PublishDelta`). */
 export interface ExtentListDelta {
   readonly added: readonly ExtentRef[];
+  /** Additional exact additions, immutable and caller-owned through settlement. */
+  readonly addedInventory?: RetirementInventory;
   readonly released: readonly ExtentRef[];
   /** Additional immutable releases; caller owns it through every observer and publication. */
   readonly releasedInventory?: RetirementInventory;
@@ -455,11 +459,33 @@ export class ExtentListKeeper {
     charge: number;
     retireCharge: number;
   }> {
+    const native = writerViewSource(delta.added);
+    if (native !== undefined) {
+      let resident: readonly ExtentRef[] | undefined;
+      try {
+        resident = native.resident();
+      } catch (error) {
+        if (!(error instanceof WriterInventoryRequiredError)) throw error;
+      }
+      if (resident !== undefined) return this.#apply({ ...delta, added: resident });
+      if (native.writer.snapshotExtents === undefined)
+        throw new TypeError("Native writer inventory source missing");
+      const inventory = await native.writer.snapshotExtents({
+        ...this.#work,
+        budget: this.#budget,
+      });
+      try {
+        return await this.#apply({ ...delta, added: [], addedInventory: inventory });
+      } finally {
+        await inventory.release();
+      }
+    }
     const firstPause = pauseIfDue(this.#work);
     if (firstPause !== undefined) await firstPause;
     const pages = this.#committed;
     if (
       delta.added.length === 0 &&
+      (delta.addedInventory?.count ?? 0) === 0 &&
       delta.released.length === 0 &&
       (delta.releasedInventory?.count ?? 0) === 0
     )
@@ -467,12 +493,15 @@ export class ExtentListKeeper {
     // Large sources and refused resident reservations stream from the native inventory.
     let ownedInventory: RetirementInventory | undefined;
     let cursor: RetirementCursor | undefined;
+    let additions: RetirementCursor | undefined;
     let charge = 0;
     let retained = 0;
     try {
       let inventory = delta.releasedInventory;
-      const resultCapacity =
-        2 * pages.length + Math.ceil(delta.added.length / this.#pageExtents) + 1;
+      if (delta.addedInventory !== undefined && delta.added.length !== 0)
+        throw new TypeError("An addition inventory must replace the resident addition vector");
+      const additionCount = delta.addedInventory?.count ?? delta.added.length;
+      const resultCapacity = 2 * pages.length + Math.ceil(additionCount / this.#pageExtents) + 1;
       const common =
         32 * delta.added.length +
         256 * this.#pageExtents +
@@ -539,8 +568,17 @@ export class ExtentListKeeper {
         if (pending !== undefined) await pending;
         return result;
       };
-      const added = await copy(delta.added);
-      await sortInSlices(added, byOffset, this.#work);
+      if (delta.addedInventory === undefined) {
+        const added = await copy(delta.added);
+        await sortInSlices(added, byOffset, this.#work);
+        additions = new ResidentReleases(added);
+      } else
+        additions = delta.addedInventory.cursor({
+          budget: this.#budget,
+          ...(this.#work.signal === undefined ? {} : { signal: this.#work.signal }),
+        });
+      const firstAddition = additions.next(this.#work);
+      let hasAddition = typeof firstAddition === "boolean" ? firstAddition : await firstAddition;
       if (inventory === undefined) {
         const released = await copy(delta.released);
         await sortInSlices(released, byOffset, this.#work);
@@ -591,7 +629,7 @@ export class ExtentListKeeper {
           buffer.length + page.count <= this.#pageExtents;
         if (
           page !== undefined &&
-          (added[ai]?.offset ?? Infinity) >= end &&
+          (hasAddition ? additions.offset : Infinity) >= end &&
           (!hasRelease || cursor.offset >= end) &&
           !mergeNeighbour
         ) {
@@ -623,19 +661,19 @@ export class ExtentListKeeper {
               keep = false;
               hasRelease = await cursor.next(this.#work);
             }
-            while ((added[ai]?.offset ?? Infinity) < extent.offset) {
+            while ((hasAddition ? additions.offset : Infinity) < extent.offset) {
               if (ai % 128 === 0) {
                 const pending = pauseIfDue(this.#work);
                 if (pending !== undefined) await pending;
               }
-              const addition = added[ai++];
-              if (addition !== undefined) {
-                const pending = append(addition);
-                if (pending !== undefined) await pending;
-              }
+              ai++;
+              const pending = append({ offset: additions.offset, length: additions.length });
+              if (pending !== undefined) await pending;
+              const advanced = additions.next(this.#work);
+              hasAddition = typeof advanced === "boolean" ? advanced : await advanced;
             }
             if (keep) {
-              if (added[ai]?.offset === extent.offset)
+              if (hasAddition && additions.offset === extent.offset)
                 throw new StoreCorruptionError(
                   `Extent list: the publication adds the extent at ${String(extent.offset)}, which the list already names`,
                 );
@@ -647,23 +685,23 @@ export class ExtentListKeeper {
             throw new StoreCorruptionError(
               "Extent list: the publication releases extents the list does not name",
             );
-          while ((added[ai]?.offset ?? Infinity) < end) {
+          while ((hasAddition ? additions.offset : Infinity) < end) {
             if (ai % 128 === 0) {
               const pending = pauseIfDue(this.#work);
               if (pending !== undefined) await pending;
             }
-            const addition = added[ai++];
-            if (addition !== undefined) {
-              const pending = append(addition);
-              if (pending !== undefined) await pending;
-            }
+            ai++;
+            const pending = append({ offset: additions.offset, length: additions.length });
+            if (pending !== undefined) await pending;
+            const advanced = additions.next(this.#work);
+            hasAddition = typeof advanced === "boolean" ? advanced : await advanced;
           }
         } finally {
           held?.release();
         }
         const nextTouched =
           next !== undefined &&
-          ((added[ai]?.offset ?? Infinity) < (pages[index + 2]?.first ?? Infinity) ||
+          ((hasAddition ? additions.offset : Infinity) < (pages[index + 2]?.first ?? Infinity) ||
             (hasRelease ? cursor.offset : Infinity) < (pages[index + 2]?.first ?? Infinity));
         if (
           next === undefined ||
@@ -687,6 +725,7 @@ export class ExtentListKeeper {
       return { list: out, retire, charge: listCharge, retireCharge };
     } finally {
       try {
+        await additions?.close();
         await cursor?.close();
       } finally {
         try {

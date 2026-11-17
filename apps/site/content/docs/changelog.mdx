@@ -10,6 +10,12 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The private 1.0 storage writer keeps sealed-extent ownership in a charged fixed window and
+spills larger histories through the existing native metadata inventory. Publication, staging,
+snapshot loading and abort consume immutable cursors instead of copying a whole write's
+extent list into memory. Descriptor ownership drains before its memory is released.
+No stored-format change or migration is required; released 0.x behavior is unchanged.
+
 - The browser performance gate now binds every baseline to its SQL and dataset scale and refuses
   changed workloads before comparison. The S_q7 NUMERIC ROUND correction (`4e7b6a0c`) requires
   explicit hosted recalibration. Shared-runner R6 results are observations; absolute acceptance

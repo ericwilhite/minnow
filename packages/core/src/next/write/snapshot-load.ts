@@ -1,3 +1,4 @@
+import { captureWriterExtents, type CapturedWriterExtents } from "../storage/writer-extents.js";
 /** Portable input -> private native generation -> ONE durable publication, after footer AND EOF.
  * The target factory owns a settled/exclusive owner (no active WritePath or background writers).
  * Publication rejection is indeterminate: close/reopen, never abort possibly published extents.
@@ -313,7 +314,8 @@ async function loadAttempt(
     native: SnapshotNativeBuilder | undefined,
     indexes: SnapshotIndexes | undefined,
     table: NativeTable | undefined,
-    list: ExtentListKeeper | undefined;
+    list: ExtentListKeeper | undefined,
+    additions: CapturedWriterExtents | undefined;
   let listPrepared = false,
     oldCharge = 0;
   let failed = false;
@@ -395,8 +397,14 @@ async function loadAttempt(
         );
         lsn = target.currentLsn + 1;
         sequence = (old?.sequence ?? 0) + 1;
-        writer = target.space.beginWrite("snapshot native generation", { budget });
-        scratchWriter = target.space.beginWrite("snapshot verified portable staging", { budget });
+        writer = target.space.beginWrite("snapshot native generation", {
+          budget,
+          ownershipBudget: budget,
+        });
+        scratchWriter = target.space.beginWrite("snapshot verified portable staging", {
+          budget,
+          ownershipBudget: budget,
+        });
         native = new SnapshotNativeBuilder(writer, target.space, budget, account);
         indexes = new SnapshotIndexes(
           catalog,
@@ -526,7 +534,8 @@ async function loadAttempt(
     await scratchWriter.abort();
     const catalogRef = await writeCatalogStorage(writer, catalog, budget, options.signal);
     list = new ExtentListKeeper([], { reader: target.space, budget, ...options });
-    const prepared = await list.prepare(1, { added: writer.extents, released: [], writer });
+    additions = await captureWriterExtents(writer, budget, options);
+    const prepared = await list.prepare(1, { ...additions, released: [], writer });
     listPrepared = true;
     const root: ManifestRoot = {
       formatVersion: MANIFEST_FORMAT_VERSION,
@@ -573,16 +582,25 @@ async function loadAttempt(
     if (scratchWriter?.state === "open") await scratchWriter.abort().catch(() => undefined);
     throw error;
   } finally {
-    reader?.close();
-    indexes?.close();
-    native?.close();
-    table?.close();
-    for (const column of staged) column.close();
-    if (listPrepared) list?.abort(1);
-    list?.close();
-    account.close();
-    if (oldCharge !== 0) budget.free(oldCharge);
-    await closeLoadTarget(target, failed);
+    try {
+      reader?.close();
+      indexes?.close();
+      native?.close();
+      table?.close();
+      for (const column of staged) column.close();
+      if (listPrepared) list?.abort(1);
+      list?.close();
+    } finally {
+      try {
+        await additions?.release().catch((error: unknown) => {
+          if (!failed) throw error;
+        });
+      } finally {
+        account.close();
+        if (oldCharge !== 0) budget.free(oldCharge);
+        await closeLoadTarget(target, failed);
+      }
+    }
   }
 }
 
