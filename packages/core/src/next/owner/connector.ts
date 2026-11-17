@@ -246,6 +246,9 @@ export class OwnerConnector {
     this.#client = options.client;
     // The lock `#updateLiveness` holds is the one the owner must watch.
     this.#client.livenessLock = clientLockName(options.database, options.client.clientId);
+    this.#client.onDatabaseReplaced = () => {
+      this.close();
+    };
     this.#client.onStepDown = (reason) => {
       this.#ownerLeft(reason);
     };

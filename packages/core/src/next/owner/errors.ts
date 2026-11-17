@@ -12,7 +12,12 @@
  * - Errors from the SQL front end, the executor and storage cross the same way; the client's
  *   registry includes their classes (composition, Phase 2).
  */
-import { OwnerUnresponsiveError, RequestExpiredError, SessionLostError } from "../errors.js";
+import {
+  OwnerUnresponsiveError,
+  RequestExpiredError,
+  SessionLostError,
+  DatabaseReplacedError,
+} from "../errors.js";
 import {
   rehydrateError,
   serializeError,
@@ -21,7 +26,7 @@ import {
 } from "../../worker-protocol/index.js";
 
 /** Defined once for every track (next/errors.ts); re-exported for the client API. */
-export { OwnerUnresponsiveError, RequestExpiredError, SessionLostError };
+export { OwnerUnresponsiveError, RequestExpiredError, SessionLostError, DatabaseReplacedError };
 
 export type WireError = SerializedError;
 
@@ -258,6 +263,7 @@ export class RecordedFailureError extends Error {
 
 /** The classes above, keyed by name, for `fromWireError`. */
 export const ownerErrorRegistry: ErrorRegistry = new Map<string, new (...args: never[]) => Error>([
+  ["DatabaseReplacedError", DatabaseReplacedError],
   ["OwnerUnresponsiveError", OwnerUnresponsiveError],
   ["SessionLostError", SessionLostError],
   ["CommittedWithoutResultError", CommittedWithoutResultError],

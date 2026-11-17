@@ -40,6 +40,7 @@ describe("handshake", () => {
     old.onmessage?.({
       data: {
         t: "hello",
+        databaseId: null,
         protocol: PROTOCOL_VERSION + 1,
         build: "x",
         clientId: "a".repeat(32),

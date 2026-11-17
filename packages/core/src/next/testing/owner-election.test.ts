@@ -981,7 +981,7 @@ describe("review of increment 2 (B5-p2b-review-1)", () => {
           if (message.t === "hello")
             queueMicrotask(() =>
               port.onmessage?.({
-                data: { t: "welcome", ownerId: "o", protocol: PROTOCOL_VERSION },
+                data: { t: "welcome", databaseId: 1n, ownerId: "o", protocol: PROTOCOL_VERSION },
               }),
             );
         },

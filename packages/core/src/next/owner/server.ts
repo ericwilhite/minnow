@@ -33,7 +33,7 @@
  * posted frame is released, every stream cancelled, every session rolled back and ended in the
  * ledger (`endSession`).
  */
-import { RequestExpiredError, SessionLostError } from "../errors.js";
+import { RequestExpiredError, SessionLostError, DatabaseReplacedError } from "../errors.js";
 import { LIVENESS_IDLE_RELEASE_MS } from "./election.js";
 import { beginTask } from "../exec/pipeline.js";
 import { QueryCancelledError } from "../exec/errors.js";
@@ -318,6 +318,7 @@ export class OwnerServer {
 }
 
 class Connection {
+  #databaseId = 0n;
   #returns: ReturnPool | null = null;
   readonly #server: OwnerServer;
   readonly #port: ServerPort;
@@ -485,6 +486,26 @@ class Connection {
       this.#protocolFailure(hello, new ProtocolError("generation must be a positive integer"));
       return;
     }
+    if (
+      hello.databaseId !== null &&
+      (typeof hello.databaseId !== "bigint" ||
+        hello.databaseId <= 0n ||
+        hello.databaseId >> 128n !== 0n)
+    ) {
+      this.#protocolFailure(hello, new ProtocolError("Invalid database identity"));
+      return;
+    }
+    if (hello.databaseId !== null && hello.databaseId !== server.engine.databaseId) {
+      this.post({
+        t: "refused",
+        reason: "databaseReplaced",
+        ownerProtocol: protocol,
+        ownerBuild: server.options.build,
+      });
+      this.end("reconnected");
+      return;
+    }
+    this.#databaseId = server.engine.databaseId;
     if (!server.claimGeneration(hello.clientId, hello.generation)) {
       // A newer connection of this client exists (or existed): this one is stale.
       this.post({
@@ -503,6 +524,7 @@ class Connection {
     server.supersede(this.clientId, this.generation, this);
     this.post({
       t: "welcome",
+      databaseId: this.#databaseId,
       protocol,
       build: server.options.build,
       ownerId: server.options.ownerId,
@@ -614,7 +636,14 @@ class Connection {
 
   // ---- requests ----
 
+  #refuseReplaced(request: Request): boolean {
+    if (this.#databaseId === this.#server.engine.databaseId) return false;
+    this.post({ t: "error", seq: request.seq, error: toWireError(new DatabaseReplacedError()) });
+    return true;
+  }
+
   #request(request: Request): void {
+    if (this.#refuseReplaced(request)) return;
     const session = "session" in request ? (request.session ?? null) : null;
     if (session !== null && (!Number.isSafeInteger(session) || session < 0)) {
       this.post({
@@ -687,6 +716,8 @@ class Connection {
 
   /** Admits and serves one request; returns a promise only if it continues asynchronously. */
   #serveOne(request: Request, slot: SessionSlot | null): void | Promise<void> {
+    // A queued request may have arrived before replacement. Check again at execution.
+    if (this.#refuseReplaced(request)) return;
     const server = this.#server;
     const engine = server.engine;
     // Plan first (synchronous, cached): the scope depends on what the statement is.

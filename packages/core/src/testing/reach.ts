@@ -10715,3 +10715,21 @@ export const DATABASE_IDENTITY_NATIVE_REACH = [
   "same archive again",
   "replaced reopen",
 ] as const;
+
+export const OWNER_DATABASE_IDENTITY_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "lost committed reply",
+  "committed receipt delivered",
+  "SDK retry refused",
+  "sticky old session",
+  "stale hello before supersede",
+  "new session writes",
+] as const;
+
+export const OWNER_DATABASE_IDENTITY_QUEUE_REACH = [
+  "queued before replacement",
+  "arrived after replacement",
+  "no stale replay",
+  "no queued write",
+] as const;

@@ -217,7 +217,7 @@ export type TransactionState = "idle" | "open" | "failed" | "timedOut";
 export const DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
 
 /** Bumped by every change to a message in this file or in frame.ts. */
-export const PROTOCOL_VERSION = 8;
+export const PROTOCOL_VERSION = 9;
 
 /** The owner sends `alive` at least this often while a client has requests in flight. */
 export const ALIVE_INTERVAL_MS = 1_000;
@@ -272,6 +272,8 @@ export type WireValue =
 
 export interface Hello {
   readonly t: "hello";
+  /** Null only for a fresh client. Reconnects must name the originally opened database. */
+  readonly databaseId: bigint | null;
   readonly protocol: number;
   /** The app build (bundle hash or version string); diagnostic only, never compared. */
   readonly build: string;
@@ -523,6 +525,7 @@ export interface OwnerLimits {
 
 export interface Welcome {
   readonly t: "welcome";
+  readonly databaseId: bigint;
   readonly protocol: number;
   readonly build: string;
   /** Random per owner worker; changes on every election. */
@@ -548,7 +551,8 @@ export interface Refused {
    * - `staleGeneration`: this client already connected with this generation or a newer one; the
    *   hello belongs to an ended connection.
    */
-  readonly reason: "version" | "steppingDown" | "superseded" | "staleGeneration";
+  readonly reason:
+    "version" | "steppingDown" | "superseded" | "staleGeneration" | "databaseReplaced";
   readonly ownerProtocol: number;
   readonly ownerBuild: string;
 }
@@ -703,8 +707,20 @@ export interface Diagnostic {
 
 export type Reply = Rows | Done | Prepared | Value | Failure;
 
+export interface DatabaseReplaced {
+  readonly t: "databaseReplaced";
+}
 export type OwnerMessage =
-  Welcome | Refused | Reply | Live | LiveEnded | Alive | SessionAborted | StepDown | Diagnostic;
+  | Welcome
+  | Refused
+  | Reply
+  | Live
+  | LiveEnded
+  | Alive
+  | SessionAborted
+  | StepDown
+  | Diagnostic
+  | DatabaseReplaced;
 
 /** Whether `message` is the last message about its seq. */
 export function isTerminal(message: OwnerMessage): boolean {

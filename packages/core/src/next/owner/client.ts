@@ -45,7 +45,7 @@
  * owner died or did not answer within `HANDSHAKE_TIMEOUT_MS`. A welcomed connection re-announces
  * the liveness lock (`liveness { held: true }`) before anything else is sent on it.
  */
-import { SessionLostError } from "../errors.js";
+import { SessionLostError, DatabaseReplacedError } from "../errors.js";
 import type { PhysicalType } from "../types.js";
 import { decodeUtf8 } from "../vector/varlen.js";
 import {
@@ -68,6 +68,7 @@ import {
   RELEASE_DELAY_MS,
   LEASE_RELEASE_FAILURE_CONTEXT,
   PROTOCOL_VERSION,
+  ProtocolError,
   type OwnerMessage,
   type PreparedStatementKind,
   type Request,
@@ -313,10 +314,14 @@ export class ProtocolClient {
   readonly #releases = new Map<number, { through: number; bytes: number }>();
   #releaseTimer: ReturnType<typeof setTimeout> | null = null;
   #closed = false;
+  #databaseId: bigint | null = null;
+  #replaced: DatabaseReplacedError | null = null;
   onSessionAborted: ((session: number) => void) | null = null;
   /** Called whenever requests in flight or pins change (the connector's liveness and watcher). */
   onActivity: (() => void) | null = null;
   onStepDown: ((reason: StepDown["reason"]) => void) | null = null;
+  /** Stops reconnecting: replacement requires a fresh client, never transparent replay. */
+  onDatabaseReplaced: ((error: DatabaseReplacedError) => void) | null = null;
   onOwnerError: ((event: { kind: string; context: string; error: Error }) => void) | null = null;
 
   constructor(options: ProtocolClientOptions = {}) {
@@ -507,6 +512,10 @@ export class ProtocolClient {
   }
 
   #open(port: MessagePort, signal?: AbortSignal): Promise<Welcome> {
+    if (this.#replaced !== null) {
+      port.close();
+      return Promise.reject(this.#replaced);
+    }
     // Releases name the old connection's streams, which ended with it.
     this.#takeReleases();
     this.#port?.close();
@@ -541,6 +550,7 @@ export class ProtocolClient {
       }
       port.postMessage({
         t: "hello",
+        databaseId: this.#databaseId,
         protocol: this.protocol,
         build: this.#build,
         clientId: this.clientId,
@@ -929,6 +939,7 @@ export class ProtocolClient {
     body: Body,
     cursor: CursorQueue | null = null,
   ): { readonly seq: number; readonly promise: Promise<ClientResult> } {
+    if (this.#replaced !== null) return this.#refuse(this.#replaced, cursor);
     if (this.#closed) return this.#refuse(new ClientClosedError(), cursor);
     if (this.#unreachable !== null) {
       // Gave up on reaching an owner: never sent, so nothing takes effect. Still activity: the
@@ -1109,11 +1120,45 @@ export class ProtocolClient {
 
   // ---- incoming ----
 
+  #markDatabaseReplaced(): DatabaseReplacedError {
+    if (this.#replaced !== null) return this.#replaced;
+    const error = new DatabaseReplacedError();
+    this.#replaced = error;
+    this.#welcome?.reject(error);
+    this.#welcome = null;
+    for (const pending of [...this.#pending.values()]) this.#fail(pending, error);
+    this.#takeReleases();
+    const port = this.#port;
+    this.#port = null;
+    try {
+      port?.postMessage({ t: "bye" });
+    } finally {
+      port?.close();
+    }
+    this.onDatabaseReplaced?.(error);
+    this.onActivity?.();
+    return error;
+  }
+
   #receive(message: OwnerMessage): void {
     this.#lastHeardAt = this.#now();
     this.#lastMessageAt = this.#lastHeardAt;
     switch (message.t) {
       case "welcome": {
+        if (
+          typeof message.databaseId !== "bigint" ||
+          message.databaseId <= 0n ||
+          message.databaseId >> 128n !== 0n
+        ) {
+          this.#welcome?.reject(new ProtocolError("Invalid owner database identity"));
+          this.#welcome = null;
+          return;
+        }
+        if (this.#databaseId !== null && this.#databaseId !== message.databaseId) {
+          this.#markDatabaseReplaced();
+          return;
+        }
+        this.#databaseId = message.databaseId;
         this.#ownerId = message.ownerId;
         this.#ownerLockHolder = message.lockHolder;
         this.#ownerEpoch = message.epoch;
@@ -1124,7 +1169,14 @@ export class ProtocolClient {
         welcome?.resolve(message);
         return;
       }
+      case "databaseReplaced":
+        this.#markDatabaseReplaced();
+        return;
       case "refused":
+        if (message.reason === "databaseReplaced") {
+          this.#markDatabaseReplaced();
+          return;
+        }
         this.#welcome?.reject(new ConnectionRefusedError(message.reason, message.ownerProtocol));
         this.#welcome = null;
         return;
@@ -1249,7 +1301,9 @@ export class ProtocolClient {
         const pending = this.#pending.get(message.seq);
         if (pending === undefined) return;
         if (message.t === "error") {
-          this.#fail(pending, fromWireError(message.error, ownerErrorRegistry));
+          const error = fromWireError(message.error, ownerErrorRegistry);
+          if (error instanceof DatabaseReplacedError) this.#markDatabaseReplaced();
+          else this.#fail(pending, error);
           return;
         }
         this.#settle(message.seq);

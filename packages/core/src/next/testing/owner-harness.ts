@@ -121,6 +121,7 @@ export function raw(server: OwnerServer, clientId = "0".repeat(31) + "1", genera
   };
   deliver({
     t: "hello",
+    databaseId: null,
     protocol: PROTOCOL_VERSION,
     build: "test",
     clientId,

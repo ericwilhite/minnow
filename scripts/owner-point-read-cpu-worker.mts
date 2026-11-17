@@ -67,6 +67,7 @@ const deliver = (data: unknown) => {
 };
 deliver({
   t: "hello",
+  databaseId: null,
   protocol: PROTOCOL_VERSION,
   build: "b",
   clientId: "e".repeat(32),

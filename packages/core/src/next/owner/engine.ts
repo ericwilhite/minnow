@@ -213,6 +213,8 @@ export interface PreparedCache {
 export interface OwnerEngine {
   /** Bounded, evictable, governor-charged owner handle cache. Fallback SQL permits re-planning. */
   createPreparedCache(): PreparedCache;
+  /** Durable database incarnation; owner changes alone do not change it. */
+  readonly databaseId: bigint;
   /** A connection-owned, governor-charged cache, closed when that connection ends. */
   createReturnPool(capBytes: number): ReturnPool;
   readonly durability: Durability;

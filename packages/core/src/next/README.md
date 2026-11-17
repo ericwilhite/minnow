@@ -4788,3 +4788,9 @@ The owner must bind sessions and retries to this identity before looking up the 
 An old database session must receive MINNOW_DATABASE_REPLACED and reopen after replacement;
 reporting an old write as still committed would be misleading because restore removed its effect.
 Owner/public transport wiring is the next stage; this section describes the native foundation.
+
+The owner protocol binds each client to the durable database incarnation at its first
+handshake. A replacement refuses that client, including lost-reply retries and queued
+requests, with `DatabaseReplacedError` (`MINNOW_DATABASE_REPLACED`). Close it and open a
+new client. This check precedes ledger replay, planning and connection supersession;
+ordinary ownership changes preserve the incarnation and normal retry behaviour.

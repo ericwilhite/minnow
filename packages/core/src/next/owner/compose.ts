@@ -358,6 +358,10 @@ class ComposedEngine implements CatalogOwnerEngine {
     return this.#rules;
   }
 
+  get databaseId(): bigint {
+    return this.#options.writePath.databaseId;
+  }
+
   get durability() {
     return this.#options.writePath.durability;
   }

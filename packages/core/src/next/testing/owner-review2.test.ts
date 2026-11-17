@@ -36,7 +36,9 @@ function fakeOwner() {
       sent.push(message);
       if (message.t === "hello")
         queueMicrotask(() =>
-          port.onmessage?.({ data: { t: "welcome", ownerId: "o", protocol: PROTOCOL_VERSION } }),
+          port.onmessage?.({
+            data: { t: "welcome", databaseId: 1n, ownerId: "o", protocol: PROTOCOL_VERSION },
+          }),
         );
     },
   };
@@ -528,10 +530,20 @@ describe("checked sound by the review (kept as regression tests)", () => {
     expect(await pending).toBe("OwnerUnreachableError");
     const second = new MessageChannel();
     second.port2.onmessage = () => {
-      second.port2.postMessage({ t: "welcome", ownerId: "new", protocol: PROTOCOL_VERSION });
+      second.port2.postMessage({
+        t: "welcome",
+        databaseId: 1n,
+        ownerId: "new",
+        protocol: PROTOCOL_VERSION,
+      });
     };
     const connecting = client.connect(second.port1);
-    first.port2.postMessage({ t: "welcome", ownerId: "old", protocol: PROTOCOL_VERSION });
+    first.port2.postMessage({
+      t: "welcome",
+      databaseId: 1n,
+      ownerId: "old",
+      protocol: PROTOCOL_VERSION,
+    });
     expect((await connecting).ownerId).toBe("new");
     client.close();
     first.port2.close();
