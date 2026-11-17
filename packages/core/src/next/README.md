@@ -4954,3 +4954,24 @@ SQL setup/execution is still required before claiming end-to-end support or enab
 The generated histories vary row counts (including zero and spill-sized queues), before/after
 names, UTF8 boundaries, creation order, event and body-command count. Existing controller
 contract seeds and run counts stay intact in their separate suite.
+
+### Concrete native trigger ordering consumer (qualification, not SQL enablement)
+
+`testing/native-trigger-ordering.test.ts` supplies the reusable campaign with the real
+`NativeCommandRoot`/compiled body host, accepted primary writes and native RI executor.
+Both PostgreSQL and native bodies record their strict sequence with actual SQL updates to
+one untriggered text accumulator, before the existing log/audit inserts. This preserves
+nested body frames and exact ordering without requiring unsupported volatile sequence defaults.
+The original sequence-backed/controller-only campaign stays separate, with its seeds and
+counts unchanged. Native histories additionally vary resident/published source state.
+
+The consumer checks accepted root count and reads actual stored trace data after native
+statement completion/commit. Fixture close fences the graph, grants, rules and spill files.
+The fixture is an already-funded component caller; its spare workspace is not a production
+admission recipe. SQL dispatch/firing guards and unsupported provider forms remain unchanged.
+
+The native campaign replays the identical seed/arbitraries/four examples in two bounded
+case groups, assigning each history by row parity. A ledger audit checks equal generated
+inputs, exactly one completed native execution per history, and the combined declared Reach.
+The twelve-run configuration and all large histories stay unchanged; split bodies reduce
+coverage instrumentation's longest test without changing its deadline.

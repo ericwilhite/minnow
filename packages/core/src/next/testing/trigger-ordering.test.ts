@@ -3,10 +3,8 @@ import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, TRIGGER_ORDERING_HARNESS_REACH } from "../../testing/reach.js";
-import {
-  controllerOrderingFactory,
-  orderingDifferential,
-} from "./trigger-ordering.test-support.js";
+import { orderingDifferential } from "./trigger-ordering.test-support.js";
+import { controllerOrderingFactory } from "./trigger-ordering-controller.test-support.js";
 
 const prefixes = fc.array(fc.constantFrom("A", "Z", "a", "z", "\ue000", "\u{10000}"), {
   minLength: 2,

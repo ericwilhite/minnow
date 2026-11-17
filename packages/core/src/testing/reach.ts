@@ -11367,3 +11367,11 @@ export const TRIGGER_ORDERING_HARNESS_REACH = [
   "strict PG trace",
   "adapter cleanup fenced",
 ] as const;
+
+export const NATIVE_TRIGGER_ORDERING_REACH = [
+  ...TRIGGER_ORDERING_HARNESS_REACH,
+  "resident source",
+  "published source",
+  "exact parent and child rows",
+  "exact nested body rows",
+] as const;
