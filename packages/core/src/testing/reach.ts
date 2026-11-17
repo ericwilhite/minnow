@@ -11391,3 +11391,22 @@ export const NATIVE_TRIGGER_SAVEPOINT_REACH = [
   "exact committed rows",
   "zero native ownership",
 ] as const;
+
+export const NATIVE_TRIGGER_BODIES_REACH = [
+  "insert",
+  "update",
+  "delete",
+  "BEFORE",
+  "AFTER",
+  "published source",
+  "resident source",
+  "root trigger only",
+  "one further trigger level succeeds",
+  "third matching level refuses and undoes all effects",
+  "PG exact supported body results",
+  "OLD and NEW bindings",
+  "multi-value INSERT and NULL binding",
+  "noncommuting ordered UPDATE bodies",
+  "DELETE body",
+  "zero native ownership",
+] as const;

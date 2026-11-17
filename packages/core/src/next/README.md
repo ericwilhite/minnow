@@ -4997,3 +4997,13 @@ ROLLBACK with a typed planning error before changing the catalog or executing a 
 PostgreSQL comparison checks its own trigger-function execution refusal and statement undo;
 the different grammars do not imply identical refusal stages or diagnostics. Enclosing
 savepoints belong to the caller transaction. SQL firing remains guarded in this consumer stage.
+
+The concrete body campaign compares native and shipped INSERT/UPDATE/DELETE bodies with
+independently compiled PostgreSQL functions. It checks OLD/NEW expressions, ordered
+noncommuting UPDATE commands, DELETE, multi-value INSERT, NULL bindings and exact stored
+rows under BEFORE/AFTER firing from resident or published sources. The supported root and
+one-further-trigger levels match PG's data. A third matching trigger level follows Minnow's
+shipped product cap: native and shipped reject and undo the whole statement, while the PG
+function succeeds. The test states that difference explicitly, rather than treating PG's
+successful deeper execution as native parity. This is still component qualification;
+owner SQL dispatch, production admission and firing enablement remain separate.
