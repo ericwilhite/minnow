@@ -144,6 +144,9 @@ export async function nativeTriggerSession(
     rollbackTo: (save: ReturnType<typeof f.tx.savepoint>) => f.tx.rollbackTo(save),
     release: (save: ReturnType<typeof f.tx.savepoint>) => f.tx.release(save),
     async committedQuery(sql: string) {
+      // The command graph has retired. Do not hold its idle reservation while this
+      // independent observation requests a complete read plan under the same cap.
+      f.scope.funding.releaseIdleStep();
       const result = await f.core.execute(sql);
       if (!("batches" in result)) throw new TypeError("Native committed observation must SELECT");
       return oracleRows(result);

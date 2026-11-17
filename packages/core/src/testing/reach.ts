@@ -11432,3 +11432,26 @@ export const NATIVE_TRIGGER_ERRORS_REACH = [
   "exact statement undo",
   "zero native ownership",
 ] as const;
+
+export const NATIVE_TRIGGER_FOLLOW_REACH = [
+  "shift",
+  "swap",
+  "rotate",
+  "self reference",
+  "external child",
+  "informational orphan unchanged",
+  "enforced reference",
+  "published",
+  "resident",
+  "raw PG cascade counterpart",
+  "PG captured-identity reference",
+  "nested tally body",
+  "no further body",
+  "NULL payload",
+  "empty payload",
+  "UTF8 payload",
+  "NULL reference unchanged",
+  "unchanged roots still fire",
+  "exact original-target rows",
+  "zero native ownership",
+] as const;

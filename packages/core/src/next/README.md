@@ -5016,3 +5016,14 @@ an empty transaction commit. The generator varies source width in rows, publicat
 trigger creation order. This checks those error paths, rather than claiming all error
 precedence is identical to PostgreSQL: native statement-end uniqueness remains the approved
 product rule. SQL failed-session policy and owner dispatch are still outside this fixture.
+
+The original-target follow campaign compares exact native stored rows, OLD/NEW log
+multisets and nested-body totals against real PostgreSQL execution. Disjoint enforced
+rekeys use explicit PG CASCADE. Swaps, rotations and informational references use a PG
+reference with stable logical target identities and an explicit relational follow UPDATE;
+this models Minnow's documented extension, not PostgreSQL's omitted ON UPDATE default.
+Its generated histories vary self/external references, orphans, NULLs, unchanged roots,
+publication and nested bodies. A ledger splits the same twelve runs and six examples
+per seed between self/external cases and proves exactly-once execution. Native phase/FIFO
+laws remain covered by the provider's follow-group campaigns. Observation reads return
+retired command credit first; the test caller is still not a production funding recipe.
