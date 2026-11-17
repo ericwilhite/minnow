@@ -4480,3 +4480,15 @@ Resident release lists of at most 4,096 entries are an optional optimization. Th
 keeper first attempts their complete reservation; a boolean or typed memory refusal
 selects the same disk inventory used for larger sources. Other errors propagate.
 The disk route admits its smaller working window before copying or consuming entries.
+
+## Internal public-API preparation
+
+`owner/result.ts` implements the canonical lazy `Result` contract in `owner/api.ts`, behind
+internal imports only. Scalar decoding follows DECISIONS D1/D2 and C1–C6: int8 is bigint unless
+lowering marks a checked-number result, timestamps are ISO strings with six fractional digits,
+and exact NUMERIC retains its display scale. `columnChunks()` aliases flat received buffers;
+`column()` concatenates only when requested. Dictionary views retain codes and a stable entry
+prefix. Constants expand only for column access. NULL payloads are never interpreted.
+JavaScript arrays have zero-based nested dimensions; the original SQL bounds remain available
+in the array column's encoded bytes. Caller-retained views live with the Result and must not
+be passed to the explicit recycling export API. There is no package entry-point switch here.

@@ -9546,3 +9546,33 @@ export const PROTOTYPE_RUN_LIFETIME_REACH = [
   "task gap",
   "next observer intact",
 ] as const;
+
+/** Canonical Result decoding changes representation without changing values or frame ownership. */
+export const PUBLIC_RESULT_REACH = [
+  "exact int64",
+  "three decimal tiers",
+  "ISO microseconds",
+  "NULL garbage ignored",
+  "dictionary deltas",
+  "constant expansion",
+  "multi-frame concatenation",
+  "zero-copy flat view",
+] as const;
+
+export const PUBLIC_RESULT_PG_REACH = [
+  "executor frames",
+  "PG exact numeric",
+  "D1 timestamp",
+  "D2 bigint",
+  "float32 boundary",
+  "SQL array",
+  "NULL result",
+  "typed column metadata",
+] as const;
+
+export const PUBLIC_RESULT_CHANNEL_REACH = [
+  "MessageChannel native execution",
+  "safe int8 stays bigint",
+  "wide int8 stays exact",
+  "numeric display scale",
+] as const;
