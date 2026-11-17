@@ -515,3 +515,18 @@ Completed native TEXT rows use their coupled measured delivery size plus indepen
 alias copies; no JSON conversion multiplier is applied to those completed rows.
 Downstream operators keep their complete progress envelope. Pressure handoff, shared
 task-clock slices and cancellation retain the existing ownership protocol.
+
+## Native result retention
+
+A private result frame may offer `adopt(take)` before release. A cache receiver uses its
+registered `takeFrom` handle, moving existing ordinary allocated/held credit without a
+free-and-reacquire gap. The frame still returns stream credit normally; its old cleanup must
+not refund the adopted payload. Refusal leaves both owners unchanged, and a frame adopts once.
+Result metadata includes both adoption closures in the complete delivery envelope.
+
+Deferred native result accounts forward this operation to their installed reservation. A
+reservation can transfer a wholly fixed ordinary allocation; progress-backed or mixed growth
+allocations are refused. The receiving live runtime keeps retained state bounded, accounts
+clone credit until acknowledgement, and treats refusal as a retained-result memory error.
+The owner may evict acknowledged baselines while another execution runs. Frame retention does
+not bypass whole-execution admission, cancellation, or IO fences.

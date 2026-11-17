@@ -36,6 +36,22 @@ export class ReservedGrant implements Grant {
   ) {
     this.#credit = minimum;
   }
+  /** A terminal result frame may move its ordinary fixed allocation to a retention cache.
+   * Progress and mixed accounts remain nontransferable; a refusal changes no ownership. */
+  adopt(take: (source: Grant, bytes: number) => boolean, bytes: number): boolean {
+    if (
+      this.#closed ||
+      bytes > this.#used ||
+      this.extra.allocated !== 0 ||
+      (this.progress?.budget.allocated ?? 0) !== 0 ||
+      this.#loan !== null
+    )
+      return false;
+    if (!take(this.fixed, bytes)) return false;
+    this.#used -= bytes;
+    this.#credit -= bytes;
+    return true;
+  }
   get label(): string {
     return this.extra.label;
   }

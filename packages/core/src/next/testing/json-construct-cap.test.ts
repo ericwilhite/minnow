@@ -119,9 +119,9 @@ it.each(seedsFor("next-json-construction-cap", [0xb6d8, 0xb6d9]))(
               await run(anchor);
               const overhead = binary ? 9 : 10;
               const output = anchor + overhead;
-              // Three frame headers plus two per output column coexist with
-              // the transferred payload; they are not another serialized copy.
-              expect(lastResultMinimum).toBe(2 * (output + 4096) + 5 * OBJECT_OVERHEAD_BYTES);
+              // Three frame headers, two objects for this output column and the two
+              // adoption closures coexist with the payload, not another serialized copy.
+              expect(lastResultMinimum).toBe(2 * (output + 4096) + 7 * OBJECT_OVERHEAD_BYTES);
               expect(lastResultMinimum).toBeGreaterThan(window);
               if (large) {
                 expect(lastResultMinimum).toBeGreaterThan(1 << 20);

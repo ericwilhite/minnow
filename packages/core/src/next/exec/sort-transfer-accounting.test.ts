@@ -88,7 +88,9 @@ for (const seed of seedsFor("next-sort-transfer-accounting", [0x6a11, 0x7b23]))
           published = false;
           const before = source.allocated + result.allocated;
           const heldBefore = source.held;
-          const metadata = OBJECT_OVERHEAD_BYTES * (3 + 2 * width);
+          // Three frame wrappers, two objects per column, and the sink/channel
+          // adoption closures coexist with the transferred native payload.
+          const metadata = OBJECT_OVERHEAD_BYTES * (3 + 2 * width + 2);
           const copyBitmaps = mode === "refuse" ? width * 256 : 0;
           if (!token) throw Error("missing transfer");
           liveAtPublication =

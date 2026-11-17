@@ -222,7 +222,9 @@ for (const seed of seedsFor("next-sort-transfer-failures", [0x8a11, 0x9b24]))
                 const frame = channel.poll();
                 if (!frame) throw Error("missing frame");
                 frames.push(frame);
-                const metadata = OBJECT_OVERHEAD_BYTES * (3 + 2 * width);
+                // Three frame wrappers, two objects per column, and the sink/channel
+                // adoption closures coexist with the transferred native payload.
+                const metadata = OBJECT_OVERHEAD_BYTES * (3 + 2 * width + 2);
                 const deltaBytes = frameTransferList({
                   rowCount: 0,
                   columns: [],

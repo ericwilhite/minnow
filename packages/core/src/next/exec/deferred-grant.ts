@@ -1,3 +1,4 @@
+import { ReservedGrant } from "./admission.js";
 /** The result sink has no buffers before the plan's atomic whole-minimum admission. */
 import { GrantClosedError, type Grant, type Loan } from "../memory/governor.js";
 
@@ -29,6 +30,14 @@ export class DeferredGrant implements Grant {
     this.#target = null;
     this.#onClose = null;
     return target;
+  }
+  /** Retention moves ordinary allocation from the installed account without exposing a stale
+   * target across a phase handoff. The synchronous callback must publish ownership atomically. */
+  adopt(take: (source: Grant, bytes: number) => boolean, bytes: number): boolean {
+    if (this.#closed || this.#target === null) return false;
+    return this.#target instanceof ReservedGrant
+      ? this.#target.adopt(take, bytes)
+      : take(this.#target, bytes);
   }
   get held(): number {
     return this.#target?.held ?? 0;
