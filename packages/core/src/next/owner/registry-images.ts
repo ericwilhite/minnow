@@ -27,6 +27,7 @@ import {
 export const REGISTRY_IMAGE_BYTES = 2048;
 const IMAGE = 1,
   SCALAR = 2;
+const IMAGE_SIDES = ["old", "new"] as const;
 export interface ImageSource {
   readonly batch: Batch;
   readonly row: number;
@@ -206,6 +207,95 @@ export class RegistryImages {
       view.setUint32(36, table.columns.length, true);
       await this.scope.directory.put(IMAGE, id, header);
       this.#check();
+      return { spoolId: this.scope.rootId, row: id };
+    });
+  }
+  /** Derive immutable UPDATE images by copying scalar descriptors, never OLD payloads.
+   * Changes are root-owned values (not an image lease), or explicit SQL NULL. The
+   * unchanged fragmented payloads remain shared until root close. A second derivation
+   * can replace generated placeholders after BEFORE without changing canonical OLD. */
+  derive(
+    ref: RowImageRef,
+    source: "old" | "new",
+    changes: ReadonlyArray<{ readonly columnId: number; readonly value: Vector | null }>,
+    signal: AbortSignal,
+  ): Promise<RowImageRef> {
+    this.#check(signal);
+    this.#origin(ref);
+    return this.#work(async () => {
+      const { table, oldHead, nextHead } = await this.#info(ref, signal),
+        header = this.#header ?? state(),
+        scalar = this.#scalar ?? state();
+      if (!oldHead || !IMAGE_SIDES.includes(source)) state();
+      let cursor = source === "old" ? oldHead : nextHead,
+        capture = 0;
+      if (!cursor) state();
+      for (const [i, change] of changes.entries()) {
+        const column = table.columns.find((candidate) => candidate.id === change.columnId);
+        if (!column || changes.some((other, k) => k < i && other.columnId === column.id)) state();
+        if (change.value) {
+          if (change.value.length !== 1 || !samePhysicalType(column.type, change.value.type))
+            state();
+          capture = Math.max(capture, registryScalarStoreBytes(change.value, 0));
+        }
+      }
+      if (capture > 0) {
+        await this.scope.prepare(capture, signal);
+        this.#check(signal);
+      }
+      let first = 0,
+        previous = 0;
+      for (const column of table.columns) {
+        await this.scope.checkpoint();
+        this.#check(signal);
+        await this.#get(SCALAR, cursor, scalar);
+        this.#check(signal);
+        const view = viewOf(scalar),
+          next = view.getFloat64(0, true),
+          change = changes.find((entry) => entry.columnId === column.id);
+        if (view.getFloat64(8, true) !== column.id) corrupt();
+        if (change) {
+          if (change.value) {
+            await storeRegistryScalar(
+              scalar,
+              change.value,
+              0,
+              this.scope.fragments,
+              this.scope.charge,
+            );
+            this.#check(signal);
+          } else {
+            const layout = view.getUint8(23);
+            scalar.fill(0, 16);
+            view.setUint8(23, layout);
+          }
+        }
+        const id = (this.#nextScalar = nextId(this.#nextScalar));
+        view.setFloat64(0, 0, true);
+        await this.scope.directory.put(SCALAR, id, scalar);
+        this.#check(signal);
+        if (previous) {
+          await this.#get(SCALAR, previous, scalar);
+          viewOf(scalar).setFloat64(0, id, true);
+          await this.scope.directory.put(SCALAR, previous, scalar);
+          this.#check(signal);
+        } else first = id;
+        previous = id;
+        cursor = next;
+      }
+      if (cursor !== 0) corrupt();
+      const id = (this.#nextImage = nextId(this.#nextImage)),
+        view = viewOf(header);
+      header.fill(0);
+      view.setFloat64(0, oldHead, true);
+      view.setFloat64(8, first, true);
+      view.setFloat64(16, table.id, true);
+      view.setFloat64(24, table.schemaVersion, true);
+      view.setUint8(32, 1);
+      view.setUint8(33, 1);
+      view.setUint32(36, table.columns.length, true);
+      await this.scope.directory.put(IMAGE, id, header);
+      this.#check(signal);
       return { spoolId: this.scope.rootId, row: id };
     });
   }

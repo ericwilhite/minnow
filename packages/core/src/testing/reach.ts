@@ -9603,3 +9603,19 @@ export const NATIVE_CHILD_INPUT_FENCE_REACH = [
   "source retired",
   "zero ownership",
 ] as const;
+
+/** RI image proposals preserve canonical OLD and share unchanged fragmented payloads. */
+export const REGISTRY_DERIVED_REACH = [
+  "published",
+  "resident",
+  "NULL replacement",
+  "value replacement",
+  "reverse replacements",
+  "ordered replacements",
+  "large shared payload",
+  "small shared payload",
+  "no payload copy",
+  "canonical OLD",
+  "successive derivations",
+  "zero ownership",
+] as const;
