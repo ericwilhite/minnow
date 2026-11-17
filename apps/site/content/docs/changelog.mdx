@@ -18,6 +18,17 @@ compatibility policy and release process.
   major 1+ without the record. No scheduled job fails just to report missing acceptance.
   Targets and the database format are unchanged.
 
+The private 1.0 write path keeps catalog and row checkpoints compatible across ALTER TABLE.
+Row WAL now records stable column and index IDs, so dropping, adding or renaming a column
+preserves surviving values when the catalog checkpoint advances before the rows. Added columns
+keep their frozen missing values without copying them into every replayed row. Every publication
+route, including staging and native maintenance, takes its table replay version from the checkpoint
+catalog. Incompatible checkpoint versions are refused.
+The unreleased native grammar advances to reader 10, writer 10, manifest 13 and commit body 9; the 1.0
+format chain still starts with its first released writer. This fixes both
+FTS-triggered reopen failures and native maintenance column misassociation. Released 0.x
+behavior and formats are unchanged; this does not repair already-damaged development stores.
+
 The shipped engine’s fast path for SUM and AVG over floating-point columns adds values directly,
 recovering overhead introduced by the 0.19.3 integer-exactness checks. SQL integer aggregates
 still reject inexact intermediate results; floating-point accumulation order is unchanged.

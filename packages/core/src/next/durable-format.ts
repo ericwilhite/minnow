@@ -16,14 +16,14 @@
  * The native vocabulary/profile guard below catches an unassigned vocabulary extension.
  * The independent native writer ledger also guards read-optional fields before acquisition.
  */
-/** Shared reference-table envelope; the manifest also carries its logical format version12. */
+/** Shared reference-table envelope; the manifest also carries its logical format version13. */
 export const METADATA_ENVELOPE_VERSION = 1;
 /** Root reader capability; incompatible nested bytes advance this or the exact manifest barrier. */
-export const DURABLE_READER_VERSION = 9;
-export const MANIFEST_FORMAT_VERSION = 12;
+export const DURABLE_READER_VERSION = 10;
+export const MANIFEST_FORMAT_VERSION = 13;
 export const ROOT_SLOT_HEADER_BYTES = 16;
 /** Profile8 escape: two independently checked u32 capability selectors precede the manifest. */
-export const DURABLE_WRITER_VERSION = 9;
+export const DURABLE_WRITER_VERSION = 10;
 export const ROOT_SLOT_CAPABILITY_BYTES = 8;
 export const ROOT_SLOT_EXTENSION_TAG = 7;
 export const ROOT_SLOT_PAYLOAD_OFFSET = ROOT_SLOT_HEADER_BYTES + ROOT_SLOT_CAPABILITY_BYTES;
@@ -45,7 +45,7 @@ export interface FormatField {
   /** Permitted bits; every other bit is reserved-zero. */
   readonly mask?: number;
 }
-/** Header selectors can name an outer envelope (manifest envelope1) plus its logical version12. */
+/** Header selectors can name an outer envelope (manifest envelope1) plus its logical version13. */
 interface Format {
   readonly magic: number | null;
   readonly version: number;
@@ -668,7 +668,7 @@ export const DURABLE_FORMATS = {
         values: Array.from({ length: 32 }, (_, i) => (ROOT_SLOT_EXTENSION_TAG << 5) + i),
       },
       { name: "manifest format", offset: 11, width: 1, values: [MANIFEST_FORMAT_VERSION - 2] },
-      // No earlier profile belongs to manifest12; this first baseline has no released predecessor.
+      // No earlier profile belongs to manifest13; this first baseline has no released predecessor.
       { name: "minimum reader", offset: 16, width: 4, values: [DURABLE_READER_VERSION] },
       { name: "minimum writer", offset: 20, width: 4, values: [DURABLE_WRITER_VERSION] },
     ],
@@ -757,9 +757,9 @@ export const DURABLE_FORMATS = {
   ]),
   commitBody: {
     magic: null,
-    version: 8,
+    version: 9,
     versionIn: "header",
-    fields: [{ ...version(0), values: [8] }],
+    fields: [{ ...version(0), values: [9] }],
     decoder: "decodeBody",
     state: "implemented",
   },
@@ -1027,6 +1027,7 @@ Object.freeze(LARGE_CODEC);
  * When extending the native vocabulary, add a NEW reader profile: never rewrite an entry
  * belonging to a released writer. The independent generated test pins the known ledger too.
  * Profile7 is the initial UNRELEASED binding, aligned to main13c28d1b manifest10/body8;
+ * profile10 records stable column/index identities in ROW body9 under manifest13.
  * older development bindings are not supported predecessors (AGENTS.md).
  */
 export const NATIVE_READER_PROFILES: Readonly<
@@ -1041,6 +1042,7 @@ export const NATIVE_READER_PROFILES: Readonly<
   7: Object.freeze({ manifest: 10, vocabulary: 3713904595 }),
   8: Object.freeze({ manifest: 11, vocabulary: 1164132746 }),
   9: Object.freeze({ manifest: 12, vocabulary: 131312130 }),
+  10: Object.freeze({ manifest: 13, vocabulary: 3997453788 }),
 });
 
 /** Required rewrite capability includes even fields that are optional for reading.
@@ -1048,6 +1050,7 @@ export const NATIVE_READER_PROFILES: Readonly<
 export const NATIVE_WRITER_PROFILES: typeof NATIVE_READER_PROFILES = Object.freeze({
   8: Object.freeze({ manifest: 11, vocabulary: 1164132746 }),
   9: Object.freeze({ manifest: 12, vocabulary: 131312130 }),
+  10: Object.freeze({ manifest: 13, vocabulary: 3997453788 }),
 });
 
 function canonicalVocabulary(value: unknown): string {

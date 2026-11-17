@@ -41,11 +41,12 @@
  * entry in the same publish.
  *
  * ## Writer obligations
- * 1. **A checkpoint covers the rows before the schema it records.** A root whose `globalLsn` covers
- *    a schema change (ALTER) of table T at LSN A must have `T.flushedThroughLsn ≥ A`: before
- *    publishing such a root, flush T (its memtable rows were converted when the ALTER applied).
- *    So replay never meets a row of T encoded under a schema older than the root's; replay checks
- *    schema versions and reports a violation as corruption.
+ * 1. **Physical operands retain identity.** Native ROW effects name column and tombstone-index
+ *    IDs. Their physical schema can precede the checkpoint catalog: replay maps surviving IDs
+ *    and lazily supplies added columns' frozen missing values. Immutable staged group columns
+ *    already name stable IDs. A future/zero schema is corruption. Positional codec controls
+ *    (including the synthetic crash-sweep model) require an exact replay-schema match; a writer
+ *    of those controls must cover older positional rows before checkpointing an ALTER.
  * 2. **Table ids are never reused.** An id below `nextTableId` that the catalog lacks was dropped.
  * 3. **Recycle the log only when covered:** `globalLsn` and every table's `flushedThroughLsn` reach
  *    the old log's last LSN, in the root that switches salt (format/manifest.ts).
@@ -58,7 +59,8 @@
  *   - alterTable(id, v): the table exists and v = version + 1.
  *   - dropTable(id): the table exists; rows replayed for it are discarded.
  * - A row change of table T under version v applies iff T exists at that point of replay,
- *   L > T.flushedThroughLsn, and v is T's version at that point (else corruption). If T is absent
+ *   L > T.flushedThroughLsn, and 1 ≤ v ≤ T's version at that point. An older v requires stable
+ *   operand IDs (staged groups already have them); positional effects require equality. If T is absent
  *   with id < nextTableId it was dropped: the change is skipped when L ≤ globalLsn (rows before
  *   the drop) and is corruption when L > globalLsn. An unknown id is corruption.
  * - **Coverage:** the log must reach every checkpoint the root claims: the last valid LSN must be
@@ -98,7 +100,12 @@ export type Effect =
   | { readonly kind: "request" }
   | { readonly kind: "fts" }
   | { readonly kind: "ftsMutation"; readonly tableId: number; readonly schemaVersion: number }
-  | { readonly kind: "rows"; readonly tableId: number; readonly schemaVersion: number }
+  | {
+      readonly kind: "rows";
+      readonly tableId: number;
+      readonly schemaVersion: number;
+      readonly stableIds?: boolean;
+    }
   | {
       readonly kind: "publishedRows";
       readonly tableId: number;
@@ -222,7 +229,7 @@ export class Replayer {
           // The same dropped/unknown-table rule as ordinary rows.
           if (table === undefined) return this.#absentTable(effect.tableId, global);
           if (lsn <= table.flushedThroughLsn) return false;
-          if (effect.schemaVersion !== table.schemaVersion)
+          if (effect.schemaVersion < 1 || effect.schemaVersion > table.schemaVersion)
             throw new LogCorruptionError(
               `Published rows for table ${String(effect.tableId)} under the wrong schema`,
             );
@@ -246,7 +253,11 @@ export class Replayer {
           const table = this.#tables.get(effect.tableId);
           if (table === undefined) return this.#absentTable(effect.tableId, global);
           if (lsn <= table.flushedThroughLsn) return false;
-          if (effect.schemaVersion !== table.schemaVersion)
+          if (
+            effect.schemaVersion < 1 ||
+            effect.schemaVersion > table.schemaVersion ||
+            (effect.schemaVersion !== table.schemaVersion && effect.stableIds !== true)
+          )
             throw new LogCorruptionError(
               `Rows for table ${String(effect.tableId)} were written under schema ${String(effect.schemaVersion)}, not ${String(table.schemaVersion)}`,
             );

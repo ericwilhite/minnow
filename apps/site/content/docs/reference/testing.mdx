@@ -1937,6 +1937,38 @@ protected-reader minimum campaign checks merge progress while real reader bytes 
 
 ### Rebuild-core catalog checkpoints
 
+The staged-ALTER campaign places ADD both before and after staging, checkpoints the newer
+catalog while the older claim remains unfolded, and reopens before allowing the fold. Fixed
+and varlen columns, NULL and frozen defaults, each native column position, and plain/FTS
+publications are generated. Bounded SQL reads, native/portable reads, and a second reopen after
+folding must preserve the same values. Published-memory membership comes from validated group
+metadata, read lazily; open still does not walk group roots. Every controlled fold gate is
+released and drained, including on failure.
+
+A separate replay-work generator interleaves many one-row commits over wide tables and one or
+two physical schemas. Mapping builds are bounded by the distinct table/schema pairs; unrelated
+DDL must not rebuild them. Identity metadata is charged before allocation, invalidated when its
+table descriptor changes, and released when replay ends, including failed replay. Under pressure
+inactive mappings are discarded before retrying the ordinary cancellable metadata policy.
+Descriptor arrays retained by memtables have independent row-owner charges until their final
+reader fence. Generated ownership cases force eviction, ID permutations and high column IDs,
+then assert that cache retirement cannot release a still-retained memtable's charge.
+
+The DDL row-schema campaign runs DROP, ADD and RENAME at each column position over resident
+and published rows. Unrelated ordinary and FTS writes publish roots; each history reopens at
+publication, after later writes, after another ALTER, and after checkpoint/maintenance. It
+compares every value by its current column identity, including frozen ADD missing values.
+Row WAL names physical columns and tombstone indexes by stable IDs. A newer catalog checkpoint
+must preserve surviving values from older row frames without positional decoding or expanding
+missing values into every row. Generated histories cover DROP, ADD and RENAME at each position,
+DELETE marks, atomic CREATE/rows/ALTER (including replacing all old columns), and an ALTER
+sharing an LSN with another table's index
+build. They check exact rows after ordinary and FTS publications, writes, checkpoints, maintenance
+and reopen. Malformed identities and incompatible root/catalog replay versions refuse with typed
+errors; repaired roots can retry without leaked admission. A separate generated campaign forces
+merge and staging publications immediately after ALTER, before a later row flush could hide a
+stale copied replay version.
+
 Dropping an index does not erase a build still needed by an older catalog checkpoint. The
 write path retains that obligation until a published root carries the build or covers its
 DROP. A flush whose selected catalog still requires the old index writes its backfill runs;

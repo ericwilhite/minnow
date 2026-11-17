@@ -35,7 +35,7 @@ import type { GroupRef, GroupRoot, RunRef } from "../format/manifest.js";
 import type { Vector } from "../vector/vector.js";
 import { ColumnChunk, MEMORY_CHUNK_ROWS } from "./columns.js";
 import { KeyDelta } from "./key-hash.js";
-import { UNCHARGED, type Charge } from "./bytes.js";
+import { charged, UNCHARGED, type Charge } from "./bytes.js";
 import { need } from "./bytes.js";
 
 export const MEMTABLE_ROWS = 65_536;
@@ -210,6 +210,7 @@ export class Memtable {
   /** Rows the staged group stores (≥ `rowCount`: a rollback truncates the marks only). */
   storedRows = 0;
   readonly #counter: Counter;
+  #ownedColumnBytes = 0;
   /** Readers borrowing each chunk index (memory segments: one chunk at a time each). */
   readonly #borrows = new Map<number, number>();
   /** Chunks released while borrowed: charged until their last borrow ends. */
@@ -226,10 +227,17 @@ export class Memtable {
     /** Rows before the memtable is full (tests shrink it: `EngineInput.tuning`). */
     readonly limit = MEMTABLE_ROWS,
     readonly pool?: ArenaPool,
+    /** Recovery memoization can retire before this memtable or its readers do. */
+    copyColumns = false,
   ) {
-    this.columns = columns;
-    this.chunks = columns.map(() => []);
     this.#counter = new Counter(charge, pool);
+    if (copyColumns) {
+      const bytes = 64 + columns.length * 8;
+      charged(this.#counter, bytes);
+      this.#ownedColumnBytes = bytes;
+      this.columns = [...columns];
+    } else this.columns = columns;
+    this.chunks = this.columns.map(() => []);
     this.deltas = new Map(indexIds.map((id) => [id, new KeyDelta(this.#counter)]));
   }
 
@@ -488,6 +496,10 @@ export class Memtable {
     this.chunks = this.columns.map(() => []);
     this.deltas.clear();
     this.deltasDropped = true;
+    if (this.#ownedColumnBytes > 0) {
+      this.#counter.free(this.#ownedColumnBytes);
+      this.#ownedColumnBytes = 0;
+    }
   }
 
   deltasDropped = false;

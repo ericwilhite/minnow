@@ -45,6 +45,8 @@ export interface MemoryReadSource {
   resident(columnId: number, chunk: number): FlatVector | null;
   /** Schema-only column: the same catalog-owned scalar in every old row, even after publication. */
   missing?(columnId: number): FlatVector | null;
+  /** A recovered staged group's physical membership is known only after its root is read. */
+  publishedMissing?(columnId: number): FlatVector;
   publishedRoot(): BlobRef;
   /** Explicit source recipe, independently owned by the query, keeps this chunk resident. */
   retained?(chunk: number): boolean;
@@ -198,7 +200,7 @@ export class MemoryReads {
     columnId: number,
     context: MemoryReadContext,
     check: () => void,
-    use: (reader: ChunkReader) => Generator<Promise<unknown>, T, unknown>,
+    use: (reader: ChunkReader | { missing: FlatVector }) => Generator<Promise<unknown>, T, unknown>,
   ): Generator<Promise<unknown>, T, unknown> {
     // Do not call a cold LazyGroupRoot.get(): its callback uses the writer's pages and budget.
     const root = yield* wait(
@@ -207,8 +209,11 @@ export class MemoryReads {
     try {
       check();
       const stored = root.value.columns.find((c) => c.columnId === columnId);
-      if (stored === undefined)
+      if (stored === undefined) {
+        const missing = this.source.publishedMissing?.(columnId);
+        if (missing !== undefined) return yield* use({ missing });
         throw new RangeError("The published memory group lacks this column");
+      }
       const reader = yield* wait(
         ChunkReader.open(context.pages, stored, { budget: context.budget, signal: context.signal }),
       );
@@ -235,6 +240,14 @@ export class MemoryReads {
     if (resident) return 0;
     const from = request.chunk * MEMORY_CHUNK_ROWS + request.startRow;
     return yield* this.#withReader(columnId, context, check, function* (reader) {
+      if ("missing" in reader) {
+        const bytes = memoryValueBytes(reader.missing, 0);
+        for (let row = 0; row < rows; row++) {
+          yield* pause(check);
+          each(row, bytes);
+        }
+        return 0;
+      }
       let gzip = 0;
       const dictionary = reader.directory.dictionary;
       if (dictionary !== null && (dictionary.encoding & PageEncoding.gzip) !== 0)
@@ -331,6 +344,7 @@ export class MemoryReads {
             gzip,
             yield* this.#withReader(id, context, check, function* (reader) {
               yield* pause(check);
+              if ("missing" in reader) return 0;
               const [a, b] = reader.pagesInRange(
                 request.chunk * MEMORY_CHUNK_ROWS + request.startRow,
                 request.chunk * MEMORY_CHUNK_ROWS + request.startRow + rows,
@@ -474,6 +488,15 @@ export class MemoryReads {
       if (published) {
         if (retained) throw new Error("Retained source recipe lost its resident storage");
         yield* this.#withReader(columnId, context, check, function* (reader) {
+          if ("missing" in reader) {
+            for (; written < hint.rowCount; written++) {
+              yield* pause(check);
+              if (!accept(reader.missing, 0)) break;
+              copyMemoryRow(reader.missing, 0, out.flat, written);
+              out.codes[written] = written;
+            }
+            return;
+          }
           const scalar = scalarOutput(type);
           const mask = new Uint8Array(1),
             selected = new Uint32Array(MEMORY_CHUNK_ROWS / 32);

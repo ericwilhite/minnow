@@ -11,8 +11,12 @@
  *     5 sequence      varuint sequenceId, bigint reservedThrough
  *     6 rows          varuint tableId, varuint schemaVersion,
  *                     u8 hasInserts; [varuint firstRowId, varuint rowCount, varuint columns,
+ *                                     u8 hasColumnIds, [varuint ids, varuint columnId…],
  *                                     blob column…]   (columns.ts frame column codec)
- *                     u8 hasDeletes; [varuint count, f64 rowId…, per row: varuint keys, blob key…]
+ *                     u8 hasDeletes; [u8 hasIndexIds, [varuint ids, varuint indexId…],
+ *                                     varuint count, f64 rowId…, per row: varuint keys, blob key…]
+ *   Native ROW effects always carry IDs. Absent IDs are strict positional codec controls,
+ *   not a compatible predecessor encoding. Body9 is gated by reader8/manifest11.
  *     7 publishedRows varuint tableId, varuint schemaVersion, varuint transaction,
  *                     varuint rootSequence, varuint indexes, varuint indexId…
  *     8 fts           varuint stagedTransaction, varuint protectedRootSequence, u8 invalidated
@@ -83,12 +87,14 @@ export function encodeBody(body: CommitFrameBody, into?: ByteWriter): Uint8Array
           writer.varuint(inserts.firstRowId);
           writer.varuint(inserts.rowCount);
           writer.varuint(inserts.columns.length);
+          writeIds(writer, inserts.columnIds);
           for (const column of inserts.columns) writer.blob(column);
         }
         const deletes = effect.deletes;
         if (deletes === null) writer.u8(0);
         else {
           writer.u8(1);
+          writeIds(writer, deletes.indexIds);
           writer.varuint(deletes.rowIds.length);
           for (const rowId of deletes.rowIds) writer.f64(rowId);
           for (let k = 0; k < deletes.rowIds.length; k++) {
@@ -177,18 +183,29 @@ function decodeEffect(reader: ByteReader): BodyEffect {
         const firstRowId = reader.varuint();
         const rowCount = reader.varuint();
         const columnCount = reader.varuint();
+        const columnIds = readIds(reader);
+        if (columnIds !== undefined && columnIds.length !== columnCount)
+          throw new LogCorruptionError("Logged column IDs differ from column count");
         const columns = Array.from({ length: columnCount }, () => reader.blob().slice());
-        inserts = { firstRowId, rowCount, columns };
+        inserts = {
+          firstRowId,
+          rowCount,
+          columns,
+          ...(columnIds === undefined ? {} : { columnIds }),
+        };
       }
       let deletes: Extract<BodyEffect, { kind: "rows" }>["deletes"] = null;
       if (readFlag(reader)) {
+        const indexIds = readIds(reader);
         const n = reader.varuint();
         const rowIds = reader.f64Array(n);
         const keys = Array.from({ length: n }, () => {
           const keyCount = reader.varuint();
+          if (indexIds !== undefined && keyCount !== indexIds.length)
+            throw new LogCorruptionError("Logged keys differ from index ID count");
           return Array.from({ length: keyCount }, () => reader.blob().slice());
         });
-        deletes = { rowIds, keys };
+        deletes = { rowIds, keys, ...(indexIds === undefined ? {} : { indexIds }) };
       }
       return { kind: "rows", tableId, schemaVersion, inserts, deletes };
     }
@@ -218,4 +235,20 @@ function decodeEffect(reader: ByteReader): BodyEffect {
     default:
       throw new LogCorruptionError(`Unknown commit effect kind ${String(kind)}`);
   }
+}
+
+/** A presence flag preserves strict positional codec controls; native effects always name IDs. */
+function writeIds(writer: ByteWriter, ids: readonly number[] | undefined): void {
+  writer.u8(ids === undefined ? 0 : 1);
+  if (ids !== undefined) {
+    writer.varuint(ids.length);
+    for (const id of ids) writer.varuint(id);
+  }
+}
+function readIds(reader: ByteReader): readonly number[] | undefined {
+  if (!readFlag(reader)) return undefined;
+  const ids = Array.from({ length: reader.varuint() }, () => reader.varuint());
+  if (ids.some((id) => id < 1) || new Set(ids).size !== ids.length)
+    throw new LogCorruptionError("Logged identities must be positive and unique");
+  return ids;
 }

@@ -72,6 +72,7 @@ type Effect =
       kind: "deletes";
       tableId: number;
       schemaVersion: number;
+      indexIds: readonly number[];
       start: number;
       end: number;
       count: number;
@@ -151,18 +152,16 @@ async function* effects(
       }
       if (seen) continue;
       let count = 0;
-      let version: number | undefined;
       for (let k = start; k < end; k++) {
         if ((k & 1023) === 0) await pause(check);
         const next = need(undo[k]);
         if (isDelete(next) && next.tableId === entry.tableId) count++;
-        if (next.kind === "rows" && next.tableId === entry.tableId)
-          version = next.memtable.schemaVersion;
       }
       yield {
         kind: "deletes",
         tableId: entry.tableId,
-        schemaVersion: version ?? need(tx.tableVersion(entry.tableId)),
+        schemaVersion: entry.schemaVersion,
+        indexIds: entry.indexIds,
         start,
         end,
         count,
@@ -376,6 +375,9 @@ export async function streamBody(
         writer.varuint(memtable.firstRowId + from);
         writer.varuint(count);
         writer.varuint(memtable.chunks.length);
+        writer.u8(1);
+        writer.varuint(memtable.columns.length);
+        for (const column of memtable.columns) writer.varuint(column.id);
         for (const stored of memtable.chunks) {
           await pause(check);
           const vector = need(stored[Math.floor(from / MEMORY_CHUNK_ROWS)]).view();
@@ -394,6 +396,9 @@ export async function streamBody(
         writer.varuint(effect.schemaVersion);
         writer.u8(0);
         writer.u8(1);
+        writer.u8(1);
+        writer.varuint(effect.indexIds.length);
+        for (const id of effect.indexIds) writer.varuint(id);
         writer.varuint(effect.count);
         const ordered = async function* (): AsyncGenerator<Delete> {
           if (order !== undefined) {

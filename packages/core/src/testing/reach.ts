@@ -6159,10 +6159,10 @@ export const FTS_CODEC_REACH = [
 ] as const;
 
 export const FTS_SELECTOR_REACH = [
-  "reader9 barrier",
-  "writer9 barrier",
-  "manifest12 barrier",
-  "commit body8",
+  "reader10 barrier",
+  "writer10 barrier",
+  "manifest13 barrier",
+  "commit body9",
   "wide sequence preserved",
   "checksummed roundtrip",
 ] as const;
@@ -9350,4 +9350,122 @@ export const R6_RELEASE_REACH = [
   "per-run overshoot refused",
   "0.x unchanged",
   "1.x gated",
+] as const;
+
+/** Catalog and row checkpoints must retain positional WAL schemas across ALTER. */
+export const DDL_ROW_SCHEMA_REACH = [
+  "position 0",
+  "position 1",
+  "position 2",
+  "position 3",
+  "FTS publication",
+  "plain publication",
+  "delete before ALTER",
+  "insert only",
+  "stored rows",
+  "resident rows",
+  "empty root before rows",
+  "no initial empty root",
+  "reopen after publication",
+  "new schema write",
+  "second ALTER",
+  "checkpoint and maintenance",
+] as const;
+
+/** Rejected replay schemas cannot consume ownership or prevent repaired reopen. */
+export const DDL_SCHEMA_CORRUPTION_REACH = [
+  "past schema",
+  "future schema",
+  "typed refusal",
+  "charge returned",
+  "repair retry",
+] as const;
+
+export const DDL_ATOMIC_SCHEMA_REACH = [
+  "drop",
+  "add",
+  "rename",
+  "replace",
+  "FTS",
+  "plain",
+  "atomic reopened",
+] as const;
+
+export const DDL_INDEX_SCHEMA_REACH = [
+  "drop",
+  "add",
+  "rename",
+  "first",
+  "middle",
+  "last",
+  "shared DDL LSN",
+  "publication advances",
+  "exact reopen",
+] as const;
+
+export const ROW_IDENTITIES_REACH = [
+  "stable columns",
+  "stable tombstone indexes",
+  "older identified rows",
+  "positional mismatch refused",
+  "invalid version refused",
+  "malformed IDs refused",
+  "unknown flag refused",
+] as const;
+
+export const DDL_PUBLICATION_SCHEMA_REACH = [
+  "drop",
+  "add",
+  "rename",
+  "first",
+  "middle",
+  "last",
+  "route observed",
+  "version aligned",
+  "exact reopen",
+] as const;
+
+export const DDL_STAGED_ALTER_REACH = [
+  "varlen",
+  "fixed",
+  "frozen default",
+  "NULL missing",
+  "first",
+  "middle",
+  "last",
+  "FTS checkpoint",
+  "plain staging checkpoint",
+  "staging observed",
+  "new catalog with unfolded claim",
+  "exact pre-fold reopen",
+  "native reads",
+  "exact post-fold reopen",
+] as const;
+
+export const REPLAY_MAPPING_WORK_REACH = [
+  "one table",
+  "multiple tables",
+  "wide",
+  "narrow",
+  "two physical versions",
+  "unchanged schema",
+  "unrelated DDL",
+  "no unrelated DDL",
+  "mapping reuse bound",
+  "charged then released",
+  "exact replay values",
+  "zero retained",
+] as const;
+
+export const REPLAY_MAPPING_MEMORY_REACH = [
+  "wide IDs",
+  "small IDs",
+  "stable identity reuse",
+  "permuted layout reuse",
+  "same version identity refusal",
+  "independent memtable ownership",
+  "pressure discards inactive cache",
+  "catalog invalidation",
+  "row ownership outlives cache",
+  "zero retained",
 ] as const;

@@ -46,6 +46,7 @@ import {
   type StagedPart,
 } from "./memtable.js";
 import type { KeyDelta, DeltaVisitor } from "./key-hash.js";
+import { ReplayColumnMappings } from "./replay-columns.js";
 
 /**
  * `openWritePath`'s input plus internal tuning for tests (never a public dial): smaller memtables
@@ -141,6 +142,7 @@ import type { StatValue } from "../types.js";
 import { layoutOf } from "../types.js";
 import type { Vector } from "../vector/vector.js";
 import { compareBytes } from "../vector/varlen.js";
+import { missingVector } from "./missing-value.js";
 import { decodeBody, encodeBody } from "./body.js";
 import {
   COMMIT_MINIMUM_BYTES,
@@ -505,6 +507,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #catalogHistory: Array<{ lsn: number; catalog: Catalog }> = [];
   #version: number;
   readonly #tables = new Map<number, TableState>();
+  #replayColumns: ReplayColumnMappings | null = null;
   #state!: WriteState;
   #root: ManifestRoot;
   #failure: Error | null = null;
@@ -628,6 +631,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
     /** Stagings a rollback dropped; staged commits replayed at open. */
     stagingRollbacks: 0,
     publishedReplays: 0,
+    /** Recovery identity work; physical mappings exclude decoded per-effect vectors. */
+    replayMappingBuilds: 0,
+    replayMappingHits: 0,
+    replayMappingBytes: 0,
+    replayMappingPeakBytes: 0,
+    replayMappingEvictions: 0,
     /** Delta entries staged memtables kept resident (tombstones of older rows). */
     stagedResidualEntries: 0,
     /** Flushes held because their table is newer than the root an index build holds back. */
@@ -957,6 +966,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const built: GroupDirectory[] = [];
     try {
       for (const table of root.tables) {
+        if (this.#catalog.table(table.tableId)?.schemaVersion !== table.schemaVersion)
+          throw new ManifestCorruptionError(
+            "Table replay schema disagrees with checkpoint catalog",
+          );
         let groups = GroupDirectory.EMPTY;
         let pages: readonly GroupPageEntry[] = [];
         let metadataBytes = 0;
@@ -1107,25 +1120,40 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#nextStagingId = Math.max(this.#nextStagingId, staged.transaction + 1);
     const headers = await session.readLogHeaders();
     let parts: Uint8Array[] = [];
-    const summary: LogScanSummary = await scanLogIncremental(
-      { length: session.logLength(), read: (offset, length) => session.readLog(offset, length) },
-      headers,
-      root.log,
-      {
-        part: (frame) => {
-          parts.push(frame.body.slice());
-        },
-        commit: async (_transaction, lastLsn) => {
-          const bytes = parts.length === 1 ? need(parts[0]) : concat(parts);
-          parts = [];
-          await this.#replay(replayer, lastLsn, decodeBody(bytes));
-        },
-        abandon: () => {
-          parts = [];
-        },
-      },
-      this.#grant,
+    const mappings = await this.#metadataRetry(
+      () => new ReplayColumnMappings(this.#metadataBudget),
     );
+    this.#replayColumns = mappings;
+    let summary: LogScanSummary;
+    try {
+      summary = await scanLogIncremental(
+        { length: session.logLength(), read: (offset, length) => session.readLog(offset, length) },
+        headers,
+        root.log,
+        {
+          part: (frame) => {
+            parts.push(frame.body.slice());
+          },
+          commit: async (_transaction, lastLsn) => {
+            const bytes = parts.length === 1 ? need(parts[0]) : concat(parts);
+            parts = [];
+            await this.#replay(replayer, lastLsn, decodeBody(bytes));
+          },
+          abandon: () => {
+            parts = [];
+          },
+        },
+        this.#grant,
+      );
+    } finally {
+      this.maintenance.replayMappingBuilds = mappings.builds;
+      this.maintenance.replayMappingHits = mappings.hits;
+      this.maintenance.replayMappingPeakBytes = mappings.peakBytes;
+      this.maintenance.replayMappingEvictions = mappings.evictions;
+      mappings.close();
+      this.#replayColumns = null;
+      this.maintenance.replayMappingBytes = mappings.bytes;
+    }
     Replayer.checkCoverage(checkpoint, summary.lastLsn);
     // Staging no frame claimed: its transaction never committed. The first root leaves it out
     // and retires its rows and runs together.
@@ -1315,6 +1343,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const change = decodeCatalogEffect(effect);
     if (change === null) return;
     const catalog = this.#catalog.apply(change, change.version);
+    this.#replayColumns?.synchronize(catalog);
     this.#version = Math.max(this.#version, change.version);
     this.#catalog = catalog;
     this.#catalogHistory.push({ lsn, catalog });
@@ -1374,14 +1403,34 @@ export class WritePathImpl implements WritePath, EngineHooks {
       throw new LogCorruptionError(`Rows for table ${String(effect.tableId)}, which replay lacks`);
     const inserts = effect.inserts;
     if (inserts !== null) {
-      const columns = def.columns.map((column, c) => {
-        const bytes = inserts.columns[c];
-        if (bytes === undefined) throw new LogCorruptionError("A logged insert lacks a column");
-        return decodeColumn(bytes, column.type);
+      const pending = this.#metadataRetry(() =>
+        need(this.#replayColumns).get(def, effect.schemaVersion, inserts.columnIds),
+      );
+      const mapping = pending instanceof Promise ? await pending : pending;
+      const physicalDef = mapping.definition;
+      const columns = physicalDef.columns.map((column, c) => {
+        const vector = decodeColumn(
+          need(inserts.columns[need(mapping.sourcePositions[c])]),
+          column.type,
+        );
+        if (vector.length !== inserts.rowCount)
+          throw new LogCorruptionError("A logged insert column has the wrong row count");
+        return vector;
       });
+      // Indexes use the current catalog's operands, without materializing an added
+      // missing value per row. Physical memtable storage remains the old ID subset.
+      const indexed =
+        def.indexes.length === 0
+          ? []
+          : def.columns.map((column, c) => {
+              const position = need(mapping.indexPositions[c]);
+              return position < 0
+                ? missingVector(column, inserts.rowCount)
+                : need(columns[position]);
+            });
       let done = 0;
       while (done < inserts.rowCount) {
-        let { memtable } = this.liveMemtable(effect.tableId, inserts.rowCount - done);
+        let { memtable } = this.liveMemtable(effect.tableId, inserts.rowCount - done, physicalDef);
         const logged = inserts.firstRowId + done;
         // Staging moves the root's next row id past its rows; after a rollback the ids it used
         // (never committed) may be used again by rows logged but not flushed. An empty memtable
@@ -1391,10 +1440,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
           logged < memtable.firstRowId &&
           logged >= this.#rowFloor(state, memtable)
         )
-          memtable = this.#liveAt(state, logged);
+          memtable = this.#liveAt(state, logged, physicalDef);
         // Row ids a rolled-back staging used and the next rows skipped: a forward gap.
         if (memtable.firstRowId + memtable.rowCount < logged)
-          memtable = this.#liveAt(state, logged);
+          memtable = this.#liveAt(state, logged, physicalDef);
         const next = memtable.firstRowId + memtable.rowCount;
         if (next !== inserts.firstRowId + done)
           throw new LogCorruptionError(
@@ -1406,19 +1455,20 @@ export class WritePathImpl implements WritePath, EngineHooks {
         memtable.mark(lsn);
         const rowIds = Array.from({ length: take }, (_, k) => memtable.firstRowId + before + k);
         const rows = Uint16Array.from({ length: take }, (_, k) => done + k);
-        this.#putEntries(def, def.indexes, memtable, columns, rows, rowIds, lsn);
+        this.#putEntries(def, def.indexes, memtable, indexed, rows, rowIds, lsn);
         done += take;
       }
     }
     const deletes = effect.deletes;
     if (deletes !== null) {
       const live = this.liveMemtable(effect.tableId, 0).memtable;
+      const ids = deletes.indexIds ?? def.indexes.map((index) => index.id);
       deletes.rowIds.forEach((rowId, k) => {
         const keys = deletes.keys[k] ?? [];
-        def.indexes.forEach((index, i) => {
+        ids.forEach((indexId, i) => {
           const key = keys[i];
           if (key === undefined || key.length === 0) return;
-          live.deltas.get(index.id)?.add(key, 0, key.length, rowId, lsn, true);
+          live.deltas.get(indexId)?.add(key, 0, key.length, rowId, lsn, true);
         });
         this.#markDeleted(state, rowId, lsn);
       });
@@ -1497,7 +1547,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const memtable = new Memtable(
         def.id,
         ref.firstRowId,
-        def.schemaVersion,
+        effect.schemaVersion,
         def.columns,
         def.indexes.map((index) => index.id),
         this.#grant,
@@ -1676,12 +1726,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
   liveMemtable(
     tableId: number,
     rows = 1,
+    definition?: TableDef,
   ): { memtable: Memtable; created: boolean; frozen: Memtable | null } {
     const state = this.#tables.get(tableId);
     if (state === undefined) throw new RangeError(`Table ${String(tableId)} has no state`);
     const memtables = state.view.memtables;
     const last = memtables[memtables.length - 1];
-    const def = this.#def(tableId);
+    const def = definition ?? this.#def(tableId);
     if (last?.state === "live" && last.schemaVersion === def.schemaVersion) {
       if (rows === 0) return { memtable: last, created: false, frozen: null };
       const pending = last.visibleRows(MAX_LSN) < last.rowCount;
@@ -1706,6 +1757,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#grant,
       this.#memtableRows,
       this.#arenaPool,
+      definition !== undefined && def.columns !== this.#def(tableId).columns,
     );
     this.#setView(state, { ...state.view, memtables: [...memtables, memtable] });
     if (frozen !== null && !this.#recovering) this.#scheduleFlush();
@@ -1723,7 +1775,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   /** A live memtable starting at `firstRowId` (replay past a gap): the current one ends first. */
-  #liveAt(state: TableState, firstRowId: number): Memtable {
+  #liveAt(state: TableState, firstRowId: number, definition?: TableDef): Memtable {
     const memtables = [...state.view.memtables];
     const last = memtables[memtables.length - 1];
     if (last?.state === "live") {
@@ -1734,7 +1786,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         last.measure();
       }
     }
-    const def = this.#def(state.tableId);
+    const def = definition ?? this.#def(state.tableId);
     const memtable = new Memtable(
       state.tableId,
       firstRowId,
@@ -1744,6 +1796,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#grant,
       this.#memtableRows,
       this.#arenaPool,
+      definition !== undefined && def.columns !== this.#def(state.tableId).columns,
     );
     this.#setView(state, { ...state.view, memtables: [...memtables, memtable] });
     return memtable;
@@ -3752,7 +3805,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#root = root;
       this.#pruneCatalogs(root.globalLsn);
       this.#adoptTableRoots(root);
-      state.root = tableRoot;
       state.pages = pages;
       state.flushedThroughLsn = through;
       state.nextGroupId = nextGroupId;
@@ -4071,7 +4123,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         changed.set(state.tableId, tableRoot);
         const stagingId = id;
         installs.push(() => {
-          state.root = tableRoot;
+          // #adoptTableRoots installed the reconciled durable entry, not this draft.
           state.nextRowId = Math.max(state.nextRowId, end);
           for (const [memtable, part] of parts) {
             memtable.staged = part;
@@ -4655,10 +4707,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#root = root;
       this.#pruneCatalogs(root.globalLsn);
       this.#adoptTableRoots(root);
-      for (const [tableId, table] of quiet) {
-        const state = this.#tables.get(tableId);
-        if (state !== undefined) state.root = table;
-      }
       this.#publishState();
       // The root covering the old log is durable: only now may the log go.
       await this.#session.resetLog();
@@ -4899,7 +4947,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#root = next;
       this.#pruneCatalogs(next.globalLsn);
       this.#adoptTableRoots(next);
-      state.root = tableRoot;
       const viewRuns = new Map(state.view.runs);
       viewRuns.set(indexId, runs);
       this.#setView(state, { ...state.view, runs: viewRuns });
@@ -5266,7 +5313,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const state = this.#tables.get(def.id);
       const replaced = changed.get(def.id);
       if (replaced !== undefined) {
-        tables.push(replaced);
+        // Merge/staging roots may copy a previous replay version even though this
+        // publication advances the catalog. Physical group IDs stay independent.
+        tables.push(
+          replaced.schemaVersion === def.schemaVersion
+            ? replaced
+            : { ...replaced, schemaVersion: def.schemaVersion },
+        );
         continue;
       }
       const settles = settled.get(def.id);
@@ -5459,12 +5512,13 @@ function withCatalogIndexes(root: TableRoot, def: TableDef, addBuilt = false): T
   // Unchanged only if every index root is the same one (review B3-p2b-4 D2: a drop and a create
   // of the same count is a change).
   if (
+    root.schemaVersion === def.schemaVersion &&
     keyIndex === root.keyIndex &&
     secondaryIndexes.length === root.secondaryIndexes.length &&
     secondaryIndexes.every((index, k) => index === root.secondaryIndexes[k])
   )
     return root;
-  return { ...root, keyIndex, secondaryIndexes };
+  return { ...root, schemaVersion: def.schemaVersion, keyIndex, secondaryIndexes };
 }
 
 /**
@@ -5598,7 +5652,14 @@ function replayEffect(effect: BodyEffect): Effect {
     case "sequence":
       return { kind: "sequence" };
     case "rows":
-      return { kind: "rows", tableId: effect.tableId, schemaVersion: effect.schemaVersion };
+      return {
+        kind: "rows",
+        tableId: effect.tableId,
+        schemaVersion: effect.schemaVersion,
+        stableIds:
+          (effect.inserts === null || effect.inserts.columnIds !== undefined) &&
+          (effect.deletes === null || effect.deletes.indexIds !== undefined),
+      };
     case "publishedRows":
       return effect;
   }
