@@ -1061,81 +1061,104 @@ for (const seed of seedsFor("next-durable-native-open", [0xb229, 0xb22a]))
         const all = adapters();
         for (const name of ["rootSlot", "logHeader"] as const) {
           reach.reach(name);
-          const adapter = all[name],
-            bytes = adapter.bytes.slice();
-          const view = new DataView(bytes.buffer);
-          if (name === "rootSlot")
-            view.setUint32(0, (DURABLE_FORMATS.rootSlot.magic ^ unknown) >>> 0, true);
-          else view.setUint32(4, unknown, true);
-          adapter.repair?.(bytes);
-          const shim = new MemoryOpfs();
-          const file = name === "rootSlot" ? "root-0" : "log";
-          shim.writeFileBytes(file, bytes);
-          let writes = 0;
-          shim.setWriteFault(() => {
-            writes++;
-            throw new Error("native mutation before format refusal");
-          });
-          const backend = createOpfsBackend({
-            name: "future",
-            directory: shim.root,
-            locks: new SimLocks(),
-          });
-          let failure: unknown;
-          try {
-            const lease = await backend.acquire();
-            await lease.release();
-          } catch (error) {
-            failure = error;
+          const adapter = all[name];
+          const mutations: Uint8Array[] = [];
+          for (const field of DURABLE_FORMATS[name].fields as readonly FormatField[]) {
+            const original = new DataView(adapter.bytes.buffer, adapter.bytes.byteOffset);
+            const old =
+              field.width === 1
+                ? original.getUint8(field.offset)
+                : field.width === 2
+                  ? original.getUint16(field.offset, true)
+                  : original.getUint32(field.offset, true);
+            const values: number[] = [];
+            if (field.values !== undefined) {
+              let value = unknown;
+              while (field.values.includes(value)) value++;
+              values.push(value);
+            } else {
+              for (let bit = 0; bit < field.width * 8; bit++)
+                if (((field.mask ?? 0) & (1 << bit)) === 0) values.push((old | (1 << bit)) >>> 0);
+            }
+            for (const value of values) {
+              const bytes = adapter.bytes.slice();
+              fieldValue(new DataView(bytes.buffer), field, value);
+              adapter.repair?.(bytes);
+              mutations.push(bytes);
+            }
           }
-          expect(failure).toBeInstanceOf(Error);
-          expect(typeof (failure as { code?: unknown }).code).toBe("string");
-          expect((failure as { code?: unknown }).code).toMatch(/^MINNOW_/u);
-          expect(writes).toBe(0);
-          const names: string[] = [];
-          for await (const name of shim.root.keys()) names.push(name);
-          expect(names).toEqual([file]);
-          expect(shim.readFileBytes(file)).toEqual(bytes);
-          reach.reach("OPFS");
-          const factory = new IDBFactory();
-          const raw = await openIndexedDb(factory, "future");
-          await raw.transaction(["meta", "roots"], "readwrite", "strict", (tx) => {
-            tx.store("meta").put("epoch", encodeEpochSlot(7).buffer);
-            tx.store(name === "rootSlot" ? "roots" : "meta").put(
-              name === "rootSlot" ? "slot-0" : "header-0",
-              bytes.slice().buffer,
-            );
-          });
-          const idb = createIndexedDbBackend({
-            name: "future",
-            database: () => raw,
-            locks: new SimLocks(),
-          });
-          let idbFailure: unknown;
-          try {
-            const lease = await idb.acquire();
-            await lease.release();
-          } catch (error) {
-            idbFailure = error;
-          }
-          expect(idbFailure).toBeInstanceOf(Error);
-          expect(typeof (idbFailure as { code?: unknown }).code).toBe("string");
-          expect((idbFailure as { code?: unknown }).code).toMatch(/^MINNOW_/u);
-          const verify = await openIndexedDb(factory, "future");
-          try {
-            await verify.transaction(["meta", "roots"], "readonly", "relaxed", (tx) => {
-              tx.store("meta").get("epoch", (value) =>
-                expect(value).toEqual(encodeEpochSlot(7).buffer),
-              );
-              tx.store(name === "rootSlot" ? "roots" : "meta").get(
+          reach.reach("all registered native fields");
+          if (name === "logHeader") reach.reach("reserved u53 bits");
+          for (const bytes of mutations) {
+            const shim = new MemoryOpfs();
+            const file = name === "rootSlot" ? "root-0" : "log";
+            shim.writeFileBytes(file, bytes);
+            let writes = 0;
+            shim.setWriteFault(() => {
+              writes++;
+              throw new Error("native mutation before format refusal");
+            });
+            const backend = createOpfsBackend({
+              name: "future",
+              directory: shim.root,
+              locks: new SimLocks(),
+            });
+            let failure: unknown;
+            try {
+              const lease = await backend.acquire();
+              await lease.release();
+            } catch (error) {
+              failure = error;
+            }
+            expect(failure).toBeInstanceOf(Error);
+            expect(typeof (failure as { code?: unknown }).code).toBe("string");
+            expect((failure as { code?: unknown }).code).toMatch(/^MINNOW_/u);
+            expect(writes).toBe(0);
+            const names: string[] = [];
+            for await (const name of shim.root.keys()) names.push(name);
+            expect(names).toEqual([file]);
+            expect(shim.readFileBytes(file)).toEqual(bytes);
+            reach.reach("OPFS");
+            const factory = new IDBFactory();
+            const raw = await openIndexedDb(factory, "future");
+            await raw.transaction(["meta", "roots"], "readwrite", "strict", (tx) => {
+              tx.store("meta").put("epoch", encodeEpochSlot(7).buffer);
+              tx.store(name === "rootSlot" ? "roots" : "meta").put(
                 name === "rootSlot" ? "slot-0" : "header-0",
-                (value) => expect(new Uint8Array(value as ArrayBuffer)).toEqual(bytes),
+                bytes.slice().buffer,
               );
             });
-          } finally {
-            verify.close();
+            const idb = createIndexedDbBackend({
+              name: "future",
+              database: () => raw,
+              locks: new SimLocks(),
+            });
+            let idbFailure: unknown;
+            try {
+              const lease = await idb.acquire();
+              await lease.release();
+            } catch (error) {
+              idbFailure = error;
+            }
+            expect(idbFailure).toBeInstanceOf(Error);
+            expect(typeof (idbFailure as { code?: unknown }).code).toBe("string");
+            expect((idbFailure as { code?: unknown }).code).toMatch(/^MINNOW_/u);
+            const verify = await openIndexedDb(factory, "future");
+            try {
+              await verify.transaction(["meta", "roots"], "readonly", "relaxed", (tx) => {
+                tx.store("meta").get("epoch", (value) =>
+                  expect(value).toEqual(encodeEpochSlot(7).buffer),
+                );
+                tx.store(name === "rootSlot" ? "roots" : "meta").get(
+                  name === "rootSlot" ? "slot-0" : "header-0",
+                  (value) => expect(new Uint8Array(value as ArrayBuffer)).toEqual(bytes),
+                );
+              });
+            } finally {
+              verify.close();
+            }
+            reach.reach("IDB");
           }
-          reach.reach("IDB");
         }
       }),
       { seed, numRuns: 12 },

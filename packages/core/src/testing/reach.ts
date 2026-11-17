@@ -139,7 +139,14 @@ export const DURABLE_STARTUP_REACH = [
   "zero writes",
 ] as const;
 export const DURABLE_ALIAS_REACH = ["logical manifest", "lazy root", "dictionary"] as const;
-export const DURABLE_NATIVE_REACH = ["rootSlot", "logHeader", "OPFS", "IDB"] as const;
+export const DURABLE_NATIVE_REACH = [
+  "rootSlot",
+  "logHeader",
+  "OPFS",
+  "IDB",
+  "all registered native fields",
+  "reserved u53 bits",
+] as const;
 export const DURABLE_CATALOG_REACH = [
   "physical",
   "index kind",
