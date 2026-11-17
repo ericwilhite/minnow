@@ -38,6 +38,7 @@ import {
   nativeReferentialMinimumBytes,
 } from "./referential-mutations.js";
 import { NativeCommandExecution, nativeCommandExecutionBytes } from "./command-execution.js";
+import { NativeFollowUnique, nativeFollowUniqueBytes } from "./follow-unique.js";
 import { nativeInputProgramBytes } from "./native-input.js";
 import { NativeBodyPrograms, type NativeBodyPlan } from "./body-programs.js";
 import { NativeBodyHost, nativeBodyHostBytes, type NativeBodyHostScope } from "./body-host.js";
@@ -128,6 +129,7 @@ export function nativeCommandRootSetupBytes(scope: NativeRootPreparation): numbe
     nativeRowMinimumBytes(columns, scope.frames, scope.rowEvents) +
     nativeReferentialMinimumBytes(catalog, scope.frames) +
     nativeCommandExecutionBytes(scope.frames) +
+    nativeFollowUniqueBytes(scope.frames) +
     programBytes +
     nativeBodyHostBytes(columns, scope.frames) +
     poolBytes(scope);
@@ -413,6 +415,21 @@ export class NativeCommandRoot {
         }),
         (v) => v.close(),
       ),
+      followUnique = this.#own(
+        new NativeFollowUnique({
+          rootId: scope.rootId,
+          frames: scope.frames,
+          catalog,
+          directory,
+          following,
+          targets,
+          checks,
+          charge,
+          signal,
+          checkpoint: () => this.#checkpoint(),
+        }),
+        (v) => v.close(),
+      ),
       execution = this.#own(
         new NativeCommandExecution({
           catalog,
@@ -420,6 +437,7 @@ export class NativeCommandRoot {
           images,
           checks,
           following,
+          followUnique,
           frames: scope.frames,
           charge,
           signal,

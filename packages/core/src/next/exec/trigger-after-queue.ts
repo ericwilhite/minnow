@@ -14,7 +14,7 @@ const WIDTH = 10,
   ROWS = 64;
 const TYPES = Array.from({ length: WIDTH }, () => ({ kind: "float64" }) as const);
 const EVENTS = ["insert", "update", "delete"] as const;
-const KINDS = ["trigger", "referential"] as const;
+const KINDS = ["trigger", "referential", "deferredTrigger"] as const;
 /** Additive ordinary workspace in the root's admitted scope, per live frame (root +two nested bodies).
  * Two tape directories/staging blocks, one encoder, one released-read window and packet views.
  * No nested governor admission and no event-count multiplier. Shared spill I/O is reused.
@@ -25,13 +25,14 @@ export const TRIGGER_AFTER_QUEUE_BYTES = 256 * 1024;
 export const TRIGGER_MAX_FRAMES = 3;
 const FIXED = 8192;
 export interface TriggerAfterEvent {
-  readonly kind: "trigger" | "referential";
+  readonly kind: "trigger" | "referential" | "deferredTrigger";
   readonly command: CommandToken;
   readonly tableId: number;
   readonly event: WriteEvent;
   readonly images: RowImageRef;
   readonly budget: number;
-  /** Trigger catalog ID or native referential-registry ID. */
+  /** Trigger catalog ID or native referential-registry ID. deferredTrigger retains its
+   * original signed budget/images while routing through the containing follow command. */
   readonly id: number;
 }
 class Epoch {
@@ -242,7 +243,7 @@ export class TriggerAfterQueue {
       writeEvent = EVENTS[event ?? -1],
       budget = encodedBudget === undefined ? undefined : encodedBudget - 1;
     if (
-      (kind !== 0 && kind !== 1) ||
+      (kind !== 0 && kind !== 1 && kind !== 2) ||
       rootId !== this.origin.rootId ||
       frameId !== this.origin.frameId ||
       !id ||
@@ -256,7 +257,7 @@ export class TriggerAfterQueue {
     )
       throw new SpillCorruptionError("Invalid AFTER event origin or kind");
     return {
-      kind: kind === 0 ? "trigger" : "referential",
+      kind: kind === 0 ? "trigger" : kind === 1 ? "referential" : "deferredTrigger",
       command: { rootId, id, frameId },
       tableId,
       event: writeEvent,

@@ -123,29 +123,38 @@ export class PrepaidQueryGovernor implements MemoryGovernor {
     const signal = options.signal ? AbortSignal.any([this.#signal, options.signal]) : this.#signal;
     const work = (async () => {
       this.#check(signal);
-      if (this.scope.source.held - this.scope.source.allocated < total) {
-        // Source recipes or phase metadata can be retained, but a live producer cannot
-        // request another working set while keeping its admitted minimum.
-        if (this.#held !== 0) throw new TypeError("Native producer must retire before admission");
-        await this.scope.prepare(total, signal);
+      // Headers belong to the SAME complete producer step. Protect them before
+      // allocating its source share; late per-share allocation could refuse while
+      // its own unused source credit occupied the remaining room.
+      const headerBytes = size(options.grants.length * SHARE_BYTES);
+      if (!this.scope.metadata.allocate(headerBytes)) {
+        if (this.#held !== 0 || this.scope.source.allocated !== 0 || this.scope.source.loaned !== 0)
+          throw new TypeError("Native producer metadata must be prepaid");
+        if (this.scope.source.held) this.scope.source.release(this.scope.source.held);
+        await this.scope.prepareMetadata(headerBytes, signal);
         this.#check(signal);
+        if (!this.scope.metadata.allocate(headerBytes))
+          throw new Error("Native root did not protect query headers");
       }
-      if (!this.scope.source.allocate(total))
-        throw new Error("Native root did not protect the complete query minimum");
-      let remaining = total;
+      let headers = headerBytes,
+        remaining = 0;
       const shares: PrepaidShare[] = [];
       try {
+        this.#check(signal);
+        if (this.scope.source.held - this.scope.source.allocated < total) {
+          // Source recipes or phase metadata can be retained, but a live producer cannot
+          // request another working set while keeping its admitted minimum.
+          if (this.#held !== 0) throw new TypeError("Native producer must retire before admission");
+          await this.scope.prepare(total, signal);
+          this.#check(signal);
+        }
+        if (!this.scope.source.allocate(total))
+          throw new Error("Native root did not protect the complete query minimum");
+        remaining = total;
         for (const part of options.grants) {
           this.#check(signal);
-          if (!this.scope.metadata.allocate(SHARE_BYTES))
-            throw new RangeError("Native query share metadata must be admitted");
-          let share: PrepaidShare;
-          try {
-            share = new PrepaidShare(this, part.label, part.spillable, part.minimumBytes, true);
-          } catch (e) {
-            this.scope.metadata.free(SHARE_BYTES);
-            throw e;
-          }
+          const share = new PrepaidShare(this, part.label, part.spillable, part.minimumBytes, true);
+          headers -= SHARE_BYTES;
           share.next = this.#first;
           if (this.#first) this.#first.previous = share;
           this.#first = share;
@@ -159,6 +168,7 @@ export class PrepaidQueryGovernor implements MemoryGovernor {
         throw error;
       } finally {
         if (remaining) this.scope.source.free(remaining);
+        if (headers) this.scope.metadata.free(headers);
       }
     })();
     const pending = work.finally(() => {

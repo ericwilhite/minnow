@@ -36,6 +36,7 @@ import { NativeDefaults } from "../owner/native-defaults.js";
 import { NativeReferentialChecks } from "../owner/referential-checks.js";
 import { NativeReferentialMutations } from "../owner/referential-mutations.js";
 import { NativeCommandExecution } from "../owner/command-execution.js";
+import { NativeFollowUnique } from "../owner/follow-unique.js";
 
 export async function referentialFixture(
   setup: readonly string[],
@@ -318,12 +319,25 @@ export async function referentialFixture(
       checkpoint,
       releaseIdleStep,
     }),
+    followUnique = new NativeFollowUnique({
+      rootId: 39,
+      frames,
+      catalog,
+      directory,
+      following,
+      targets,
+      checks,
+      charge,
+      signal,
+      checkpoint,
+    }),
     execution = new NativeCommandExecution({
       catalog,
       commands,
       images,
       checks,
       following,
+      followUnique,
       frames,
       charge,
       signal,

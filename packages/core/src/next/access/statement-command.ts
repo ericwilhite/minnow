@@ -44,6 +44,9 @@ export interface ReferentialEntry {
   readonly triggerBudget: number;
 }
 export interface NativeRowHooks {
+  /** Implicit-follow exception: nested USER AFTER bodies append to the containing group
+   * queue until its complete uniqueness checkpoint. RI/reference work stays immediate. */
+  followGroup?(command: CommandToken, phase: "begin" | "end", budget: number): void;
   /** Generated NEW values are placeholders here. One row continues to rules/primary before
    * the next row's BEFORE runs; a later BEFORE error must not mask an earlier row's CHECK. */
   beforeRow(
@@ -54,7 +57,8 @@ export interface NativeRowHooks {
     budget: number,
   ): Promise<void>;
   /** Accepted OLD/NEW only. Append AFTER packets; never drain them synchronously for RI.
-   * Body commands drain their nested frame; RI children append to the containing outer frame. */
+   * Body commands drain their nested frame, except user AFTER bodies inside implicit follow;
+   * those wait on the containing group queue. RI children append to their containing frame. */
   afterRow(
     command: CommandToken,
     tableId: number,
@@ -103,7 +107,8 @@ export interface NativeCommandBoundary {
   beginCommand(frameId: number, triggerBudget: number): CommandToken;
   /** Includes child c_ reference checks, not just parent a_ actions. Exposed after primary succeeds. */
   rowReferentialEntries(command: CommandToken, row: RowImageRef): AsyncIterable<ReferentialEntry>;
-  /** Non-ending command checkpoint BEFORE any AFTER event for this command. */
+  /** Non-ending command checkpoint before AFTER. Checks on original children of an active
+   * implicit-follow group are retained for its complete checkpoint; RI stays immediate. */
   verifyCommandUnique(command: CommandToken, signal: AbortSignal): Promise<void>;
   /** Queue adapter: validate/resolve the root-owned scalar ID internally, then execute the
    * immutable entry. Foreign/retired IDs refuse before effects. No entry/key buffers escape
@@ -113,7 +118,9 @@ export interface NativeCommandBoundary {
    * root/action checkpoint does not cover later writes: successive actions may share a command
    * token. Omitted-update follow completes/checks its captured command/FK group instead,
    * preserving key swaps; later descriptors for that completed group are no-ops. Its check
-   * still precedes all subsequent outer AFTER/RI work. Never drain outer AFTER here. */
+   * still precedes subsequent user AFTER work, including deferred nested bodies. Nested RI
+   * remains immediate, but uniqueness of captured follow children belongs to that group.
+   * Never drain outer AFTER here. */
   executeReferentialId(id: number, hooks: NativeRowHooks, signal: AbortSignal): Promise<void>;
   /** Exactly one parent row/one FK event. Seal the complete child input before mutation;
    * release input/pin/producer progress before writer admission. No nested governor admission.
@@ -121,10 +128,12 @@ export interface NativeCommandBoundary {
    * continuation, and checks child uniqueness before resolving that group. Each original
    * child is followed at most once per command/FK, including self-referential rewrites.
    * Later descriptors for that completed group do not repeat it. Explicit actions use their
-   * distinct catalog mode and retain per-action uniqueness checkpoints.
+   * distinct catalog mode and retain per-action uniqueness checkpoints, except an original
+   * child in an enclosing active implicit-follow group is checked at that group's checkpoint.
    * RESTRICT is23001; NO ACTION/missing-parent23503. RI preserves trigger budget.
    * BEFORE resolving explicit actions, incrementally verify their new child uniqueness,
-   * even if the shared command token passed a root or earlier action checkpoint. No outer
+   * even if the shared command token passed a root or earlier action checkpoint (the enclosing
+   * follow-child exception above still applies). No outer
    * AFTER drain: a child uniqueness error must precede a later named AFTER body's error. */
   executeReferential(
     entry: ReferentialEntry,

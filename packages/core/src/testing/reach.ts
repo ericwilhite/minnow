@@ -10116,3 +10116,50 @@ export const NATIVE_PREFIX_WIDE_LIFETIME_REACH = [
   "metadata fenced through admission",
   "zero ownership",
 ] as const;
+
+export const FOLLOW_NESTED_AFTER_REACH = [
+  "swap",
+  "rotation",
+  "first position",
+  "middle position",
+  "last position",
+  "published",
+  "resident",
+  "group23505 before nested22012",
+  "immutable nested images FIFO",
+  "mid-swap RI uniqueness waits",
+  "nested follow membership overlap",
+  "nested explicit RI",
+  "nested RI visible to next body",
+  "deferred nested versions checked",
+  "explicit PG action unchanged",
+  "zero native charge",
+] as const;
+
+export const FOLLOW_NESTED_PRESSURE_REACH = [
+  "published",
+  "resident",
+  "64MiB competing credit",
+  "wide unchanged payload",
+  "bounded active files",
+  "deferred FIFO exact",
+  "zero native charge",
+] as const;
+export const FOLLOW_NESTED_BOUNDARY_REACH = [
+  "published",
+  "resident",
+  "nonmember immediate uniqueness",
+  "spent budget preserved",
+  "depth after completed group",
+  "atomic rollback",
+  "zero native charge",
+] as const;
+
+export const FOLLOW_UNIQUE_ALLOCATION_REACH = [
+  "frames1",
+  "frames2",
+  "frames3",
+  "denied before buffers",
+  "granted and released once",
+  "zero native charge",
+] as const;

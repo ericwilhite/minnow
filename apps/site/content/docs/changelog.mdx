@@ -32,7 +32,12 @@ behavior and formats are unchanged; this does not repair already-damaged develop
 The unexported rebuild now has concrete native foreign-key action components, including
 complete child-row spooling, shared row rules and original-identity rekey-follow. Omitted-update
 follow checks uniqueness after its complete original-target group, preserving swaps and rotations;
-explicit actions check child uniqueness before each action returns. A private compiled body host
+explicit actions normally check child uniqueness before each action returns. While an implicit
+follow group runs, nested user AFTER bodies wait for its completed uniqueness checkpoint.
+Nested RI actions and FK checks stay immediate; uniqueness of original follow children,
+including versions written by nested commands, is checked with the group. Unrelated rows
+keep their usual checks. Deferred bodies retain their original trigger budget and row images.
+A private compiled body host
 seals complete modification inputs, uses typed OLD/NEW parameters and runs bodies without ending
 the root statement. Its query workspace is funded by the root, and cancellation drains borrowed
 inputs before releasing credit. A low-level root assembler connects the native graph and fences

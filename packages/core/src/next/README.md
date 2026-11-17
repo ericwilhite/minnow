@@ -4327,13 +4327,21 @@ AFTER uses. A bounded per-frame descriptor list covers one row, not the affected
 SET NULL, lowered SET DEFAULT, RESTRICT/NO ACTION and original-identity rekey-follow.
 Every action seals complete child OLD inputs before mutation, then runs child BEFORE and
 appends child AFTER through the containing controller. It never drains outer AFTER work.
-Explicit actions check newly accepted child uniqueness before each action resolves. Omitted
+Explicit actions normally check newly accepted child uniqueness before each action resolves. Omitted
 ON UPDATE follow applies the complete captured command/FK group and checks its child uniqueness
-before returning to user AFTER work or another RI action. This preserves unique child swaps and
+before returning to user AFTER work or another outer RI action. This preserves unique child swaps and
 rotations; a nonunique completed group reports23505 with the child constraint identity. Group
 links share the root spill directory, with charged catalog-sized headers per live frame. A shared paged
 bitmap records each original child once per command/FK, so self-referential follow
 cannot recapture its own rewritten versions.
+While a follow group runs, nested user AFTER bodies append to its containing queue and wait
+for its uniqueness checkpoint. BEFORE bodies, nested RI actions and FK checks remain immediate.
+Uniqueness checks on the group's original children, including versions written by nested
+commands or RI, belong to that group checkpoint; unrelated rows keep their normal checks.
+Original trigger budgets and OLD/NEW images survive deferral. Both original membership and
+deferred accepted versions spill through the shared directory with fixed charged metadata.
+Producer-share headers are prepaid before source reservation, so the producer's own credit
+cannot block their admission.
 SET DEFAULT
 also checks remaining references to the old parent key; NO ACTION allows an equivalent live
 replacement parent, while RESTRICT reports23001. Informational references follow by bounded
