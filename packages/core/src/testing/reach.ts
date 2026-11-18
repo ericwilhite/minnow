@@ -10660,3 +10660,12 @@ export const LIVE_PUBLICATION_REACH = [
   "observer isolation",
   "zero charges",
 ] as const;
+
+export const LIVE_OBSERVER_REENTRY_REACH = [
+  "subscribe",
+  "unsubscribe",
+  "replace",
+  "eligible frontier",
+  "bounded replacement chain",
+  "zero charges",
+] as const;

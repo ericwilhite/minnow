@@ -56,6 +56,7 @@
     "unicode-properties": [],
     "record-json-properties": [],
     "temp-owner-lifecycle": [],
-    "differential-harness": []
+    "differential-harness": [],
+    "next-live-observer-reentry": [8860, 8861]
   }
 }

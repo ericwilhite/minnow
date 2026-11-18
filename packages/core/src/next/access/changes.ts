@@ -40,9 +40,15 @@ export const CHANGE_FEED_BYTES = 8192;
 export const CHANGE_LISTENER_BYTES = 1024;
 export const CHANGE_TABLE_LIMIT = 64;
 
+interface ObserverCell {
+  readonly epoch: number;
+  readonly listener: (change: CommittedChange) => void;
+}
+
 /** Single-writer preparation and allocation-free publication. Not a persistent log. */
 export class ChangeFeed {
-  readonly #listeners = new Set<(change: CommittedChange) => void>();
+  readonly #listeners = new Set<ObserverCell>();
+  #observerEpoch = 0;
   readonly #tables: number[] = [];
   readonly #event = {
     lsn: 0,
@@ -91,10 +97,13 @@ export class ChangeFeed {
   }
   observe(listener: (change: CommittedChange) => void): () => void {
     if (this.#closed) throw new Error("Publication feed is closed");
+    if (this.#observerEpoch === Number.MAX_SAFE_INTEGER)
+      throw new RangeError("Live observer registration epoch exhausted");
     // Each registration owns an independent cell even when callbacks are identical.
+    // Its existing reservation includes the epoch, Set membership and unsubscribe closure.
     if (!this.budget.allocate(CHANGE_LISTENER_BYTES))
       throw new MemoryAdmissionError("live observer", CHANGE_LISTENER_BYTES, 0);
-    const cell = (event: CommittedChange) => listener(event);
+    const cell: ObserverCell = { epoch: ++this.#observerEpoch, listener };
     this.#listeners.add(cell);
     return () => {
       if (this.#listeners.delete(cell)) this.budget.free(CHANGE_LISTENER_BYTES);
@@ -225,9 +234,13 @@ export class ChangeFeed {
   }
   /** Called after native installation; a listener cannot change the commit's outcome. */
   notify(): void {
+    // An epoch frontier needs no listener-sized dispatch array. New registrations append
+    // beyond it, even when a callback removes itself or other eligible registrations.
+    const through = this.#observerEpoch;
     for (const listener of this.#listeners) {
+      if (listener.epoch > through) break;
       try {
-        listener(this.#event);
+        listener.listener(this.#event);
       } catch {
         /* Observer errors belong to its consumer. */
       }
