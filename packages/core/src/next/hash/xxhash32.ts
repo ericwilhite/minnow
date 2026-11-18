@@ -100,11 +100,18 @@ function hashGeneral(bytes: Uint8Array, seed: number, start: number, end: number
       const view = new DataView(bytes.buffer, bytes.byteOffset + start, length);
       const stripes = length - 16;
       let at = 0;
+      // Keep the bulk stripe rounds explicit. Mixed native-header training can make V8
+      // spend its inlining budget on the short byte path and leave round() calls here.
+      // scripts/fts-checksum-component.mts reproduces that cliff after real native setup.
       for (; at <= stripes; at += 16) {
-        v1 = round(v1, view.getInt32(at, true));
-        v2 = round(v2, view.getInt32(at + 4, true));
-        v3 = round(v3, view.getInt32(at + 8, true));
-        v4 = round(v4, view.getInt32(at + 12, true));
+        v1 = (v1 + Math.imul(view.getInt32(at, true), PRIME2)) | 0;
+        v1 = Math.imul((v1 << 13) | (v1 >>> 19), PRIME1);
+        v2 = (v2 + Math.imul(view.getInt32(at + 4, true), PRIME2)) | 0;
+        v2 = Math.imul((v2 << 13) | (v2 >>> 19), PRIME1);
+        v3 = (v3 + Math.imul(view.getInt32(at + 8, true), PRIME2)) | 0;
+        v3 = Math.imul((v3 << 13) | (v3 >>> 19), PRIME1);
+        v4 = (v4 + Math.imul(view.getInt32(at + 12, true), PRIME2)) | 0;
+        v4 = Math.imul((v4 << 13) | (v4 >>> 19), PRIME1);
       }
       index = start + at;
     } else

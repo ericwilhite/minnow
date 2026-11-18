@@ -250,6 +250,7 @@ export const openExtentSpace: OpenExtentSpace = async (session, options) => {
     await backing.reset();
     const journal = new MetadataJournal(backing, workspace);
     const reader = {
+      dataLength,
       read: (refs: readonly BlobRef[], read: ReadOptions) => cache.read(refs, read),
       peek: (ref: BlobRef, peek?: PeekOptions) => cache.peek(ref, peek),
     };
@@ -531,6 +532,9 @@ class Space implements ExtentSpace {
     return this.#map;
   }
 
+  get dataLength(): number {
+    return this.#fileLength;
+  }
   get stats(): SpaceStats {
     let writerBytes = 0;
     for (const writer of this.writers) writerBytes += writer.bytes;

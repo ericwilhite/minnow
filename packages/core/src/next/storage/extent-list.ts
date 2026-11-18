@@ -8,7 +8,7 @@ import { WriterInventoryRequiredError } from "./writer-inventory.js";
  * ## The list
  * - **Pages.** A list is an ordered array of pages (`ExtentListPage`), each a blob in the data
  *   space holding a run of extents in strictly increasing offset order; every extent of a page is
- *   below the next page's `first`. A page holds at most `LIST_PAGE_EXTENTS` extents (64 KiB).
+ *   below the next page's `first`. A page holds at most `LIST_PAGE_EXTENTS` extents (65536B entries +16B header).
  * - **What it names.** Every extent the root reaches except the extents the list's own pages live
  *   in: the root names those directly (its list field), so a reader yields them from the field.
  * - **Page bytes.** `MXL1` (u32 LE), version 1 (u16), reserved (u16), count (u32), reserved (u32),
@@ -34,7 +34,7 @@ import type {
 } from "./retirement-contract.js";
 import { DURABLE_FORMATS, requireHeader } from "../durable-format.js";
 import { pauseIfDue, sortInSlices, type TaskWork } from "../task.js";
-import { StoreCorruptionError } from "./contract.js";
+import { DATA_ALIGN, StoreCorruptionError } from "./contract.js";
 import {
   MAX_READ_BYTES,
   ReadDeniedError,
@@ -45,7 +45,7 @@ import {
   type ExtentWriter,
 } from "./extents.js";
 
-/** Extents per list page at most (16 bytes each: 64 KiB of entries). */
+/** Extents per list page at most (65536 bytes of entries plus the16-byte header). */
 export const LIST_PAGE_EXTENTS = 4096;
 
 const MAGIC = DURABLE_FORMATS.extentList.magic; // "MXL1"
@@ -79,7 +79,36 @@ export function encodeListPage(extents: readonly ExtentRef[]): Uint8Array {
 }
 
 /** The extents of `page` (verified bytes `bytes`), checked against the root's entry for it. */
-export function decodeListPage(bytes: Uint8Array, page: ExtentListPage): ExtentRef[] {
+/** One-pass scalar bounds, shared by object and slab decoders. Returns aligned end. */
+export function extentListEnd(
+  offset: number,
+  length: number,
+  previousEnd: number,
+  dataLength: number,
+): number {
+  const end = offset + length,
+    alignedEnd = offset + Math.ceil(length / DATA_ALIGN) * DATA_ALIGN;
+  if (
+    !Number.isSafeInteger(dataLength) ||
+    dataLength < 0 ||
+    !Number.isSafeInteger(offset) ||
+    offset < 0 ||
+    offset % DATA_ALIGN !== 0 ||
+    !Number.isSafeInteger(length) ||
+    length <= 0 ||
+    !Number.isSafeInteger(end) ||
+    !Number.isSafeInteger(alignedEnd) ||
+    end > dataLength ||
+    offset < previousEnd
+  )
+    throw new StoreCorruptionError("Extent list: invalid, overlapping or descending extent");
+  return alignedEnd;
+}
+export function decodeListPage(
+  bytes: Uint8Array,
+  page: ExtentListPage,
+  dataLength = Number.MAX_SAFE_INTEGER,
+): ExtentRef[] {
   const fail = (why: string): never => {
     throw new StoreCorruptionError(`Extent list page at ${String(page.first)}: ${why}`);
   };
@@ -99,13 +128,11 @@ export function decodeListPage(bytes: Uint8Array, page: ExtentListPage): ExtentR
   for (let index = 0; index < count; index++) {
     const offset = view.getFloat64(HEADER + index * ENTRY, true);
     const length = view.getFloat64(HEADER + index * ENTRY + 8, true);
-    if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 || length < 1)
-      fail(`names an invalid extent (${String(offset)}, ${String(length)})`);
-    if (offset < previousEnd) fail("is not in increasing offset order");
+    const alignedEnd = extentListEnd(offset, length, previousEnd, dataLength);
     if (index === 0 && offset !== page.first)
       fail(`starts at ${String(offset)}, the root says ${String(page.first)}`);
     extents.push({ offset, length });
-    previousEnd = offset + length;
+    previousEnd = alignedEnd;
   }
   return extents;
 }
@@ -169,7 +196,7 @@ async function readPages(
       const bytes = lease.bytes[index];
       if (page === undefined || bytes === undefined)
         throw new StoreCorruptionError("An extent list page is missing");
-      decoded.push(decodeListPage(bytes, page));
+      decoded.push(decodeListPage(bytes, page, reader.dataLength));
     }
     const held = lease;
     let released = false;

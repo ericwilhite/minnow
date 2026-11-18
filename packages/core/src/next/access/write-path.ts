@@ -221,6 +221,8 @@ export interface BeginOptions {
 export interface WritePath {
   /** Native committed effects; optional only for legacy test doubles. */
   readonly changes?: ChangeFeed;
+  /** Durable database incarnation. Ordinary owner changes/checkpoints preserve it. */
+  readonly databaseId: bigint;
   /** Owner installs renderer2; missing capability makes writes invalidate, never reinterpret cells. */
   installFtsRenderer?(renderer: import("./fts-write.js").FtsWriteRenderer): void;
   readonly durability: Durability;

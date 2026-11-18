@@ -6,7 +6,7 @@ import { seedsFor } from "../../testing/seeds.js";
 import { createReach, PUBLIC_TRANSPORT_REACH } from "../../testing/reach.js";
 import { ProtocolClient } from "../owner/client.js";
 import { StreamDictionaries, type FramePayload } from "../owner/frame.js";
-import { PROTOCOL_VERSION, type StatementSummary } from "../owner/protocol.js";
+import { PROTOCOL_VERSION, type StatementSummary, type Welcome } from "../owner/protocol.js";
 import { decodeResult } from "../owner/result.js";
 import { publicOwner } from "./public-owner.test.fixture.js";
 
@@ -150,11 +150,20 @@ for (const seed of seedsFor("next-public-transport", [0xb736, 0xb737]))
               if (event.data.t === "hello")
                 channel.port2.postMessage({
                   t: "welcome",
+                  databaseId: 1n,
+                  build: "public-transport-fixture",
+                  durability: "strict",
+                  limits: {
+                    maxOutstanding: 64,
+                    retryWindowMs: 60_000,
+                    frameBytes: 1024 * 1024,
+                    aliveIntervalMs: 1000,
+                  },
                   ownerId: "unsent",
                   lockHolder: "unsent",
                   protocol: PROTOCOL_VERSION,
                   epoch: 1,
-                });
+                } satisfies Welcome);
               if (event.data.t === "ping") channel.port2.postMessage({ t: "alive" });
             };
             try {

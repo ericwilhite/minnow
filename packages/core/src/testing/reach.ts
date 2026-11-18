@@ -67,6 +67,7 @@ export const DURABLE_LONG_KEY_REACH = [
   "partial native tree",
 ] as const;
 export const DURABLE_REGISTRY_REACH = [
+  "databaseIdentity",
   "ftsJournal",
   "ftsRoot",
   "ftsTerms",
@@ -153,7 +154,14 @@ export const DURABLE_STARTUP_REACH = [
   "zero writes",
 ] as const;
 export const DURABLE_ALIAS_REACH = ["logical manifest", "lazy root", "dictionary"] as const;
-export const DURABLE_NATIVE_REACH = ["rootSlot", "logHeader", "OPFS", "IDB"] as const;
+export const DURABLE_NATIVE_REACH = [
+  "rootSlot",
+  "logHeader",
+  "OPFS",
+  "IDB",
+  "all registered native fields",
+  "reserved u53 bits",
+] as const;
 export const DURABLE_CATALOG_REACH = [
   "physical",
   "index kind",
@@ -6173,9 +6181,9 @@ export const FTS_CODEC_REACH = [
 ] as const;
 
 export const FTS_SELECTOR_REACH = [
-  "reader10 barrier",
-  "writer10 barrier",
-  "manifest13 barrier",
+  "reader11 barrier",
+  "writer11 barrier",
+  "manifest14 barrier",
   "commit body9",
   "wide sequence preserved",
   "checksummed roundtrip",
@@ -9148,6 +9156,8 @@ export const SNAPSHOT_VALIDATOR_LEASE_REACH = [
 ] as const;
 
 export const SNAPSHOT_FTS_CUT_REACH = [
+  "one native preparation per configuration",
+  "shared fixture fingerprint verified",
   "checkpoint target",
   "checkpoint and staged target",
   "document and term payloads",
@@ -10831,4 +10841,245 @@ export const LIVE_BINARY_VALUE_REACH = [
   "offset view",
   "private copy",
   "zero charges",
+] as const;
+
+export const STORE_NAME_REACH = [
+  "empty",
+  "high surrogate",
+  "low surrogate",
+  "too long",
+  "UTF-8 bound",
+  "valid boundary",
+] as const;
+
+export const STORAGE_CANONICAL_REACH = [
+  "closed IDB fields",
+  "LSN high bits",
+  "LSN bit 21",
+  "LSN bit 22",
+  "LSN bit 23",
+  "LSN bit 24",
+  "LSN bit 25",
+  "LSN bit 26",
+  "LSN bit 27",
+  "LSN bit 28",
+  "LSN bit 29",
+  "LSN bit 30",
+  "LSN bit 31",
+
+  "padding",
+  "padding first",
+  "padding last",
+  "padding interior",
+  "frame byte identity",
+  "valid",
+  "alignment",
+  "aligned overlap",
+  "safe aligned end",
+  "physical end",
+] as const;
+
+export const IDB_ENTRY_ALLOCATION_REACH = [
+  "parallel read",
+  "serial read",
+  "one record",
+  "multiple records",
+  "serial page boundary",
+  "no key arrays",
+  "extra field refused on read",
+] as const;
+
+export const DATABASE_IDENTITY_REACH = [
+  "small",
+  "wide",
+  "successor",
+  "exhaustion",
+  "zero refused",
+  "truncation refused",
+  "funded native seed",
+  "denied seed",
+] as const;
+
+export const DATABASE_IDENTITY_NATIVE_REACH = [
+  "empty database",
+  "empty table",
+  "populated",
+  "OPFS",
+  "IndexedDB",
+  "ordinary publication",
+  "ordinary reopen",
+  "replacement",
+  "same archive again",
+  "replaced reopen",
+] as const;
+
+export const OWNER_DATABASE_IDENTITY_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "lost committed reply",
+  "committed receipt delivered",
+  "SDK retry refused",
+  "sticky old session",
+  "stale hello before supersede",
+  "new session writes",
+] as const;
+
+export const OWNER_DATABASE_IDENTITY_QUEUE_REACH = [
+  "queued before replacement",
+  "arrived after replacement",
+  "no stale replay",
+  "no queued write",
+] as const;
+
+export const SNAPSHOT_OWNER_API_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "resident source",
+  "stored source",
+  "stream API",
+  "array API",
+  "rows and catalog",
+  "fresh incarnation same client ID",
+  "sequence high water",
+  "old client refused",
+  "write and reopen",
+] as const;
+
+export const SNAPSHOT_OWNER_FAILURE_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "stalled input cancelled",
+  "unbounded return ignored",
+  "quota refused",
+  "corruption refused",
+  "scope refused",
+  "old target and source intact",
+  "retry completes",
+] as const;
+
+export const SNAPSHOT_TRANSPORT_REACH = [
+  "single chunk",
+  "split native write",
+  "all",
+  "break",
+  "cancel",
+  "reconnect",
+  "owner change",
+  "precharged transfer copies",
+  "borrowed source never transferred",
+  "held output stays valid",
+] as const;
+
+export const SNAPSHOT_OWNER_INFLIGHT_REACH = [
+  "contract-only prepared cache closed",
+  "concrete prepared cache closed",
+  "OPFS",
+  "IndexedDB",
+  "writer slot blocked",
+  "durable commit blocked",
+  "no input before drain",
+  "suspended export cancelled",
+  "committed reply lost",
+  "committed reply received",
+  "no stale retry",
+  "new session writes",
+] as const;
+
+export const SNAPSHOT_SOURCE_CONTROL_REACH = [
+  "close holds control",
+  "concurrent closes wait",
+  "closed source refuses reads",
+  "release failure",
+  "release success",
+] as const;
+
+export const SNAPSHOT_OWNER_CLEANUP_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "sweep after reclaim failure",
+  "host notified",
+  "complete target reopens",
+  "source intact",
+] as const;
+
+export const SNAPSHOT_INSTALL_REACH = [
+  "same version",
+  "old cache funded",
+  "old cache released",
+  "text",
+  "int32",
+  "int64",
+] as const;
+
+export const SNAPSHOT_OWNER_DRAIN_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "disconnect",
+  "reconnect",
+  "cancel",
+  "abandon",
+  "started cleanup charged",
+  "import waits for cleanup",
+  "release unblocks import",
+  "fresh session writes",
+] as const;
+
+export const SNAPSHOT_TRANSPORT_ADMISSION_REACH = [
+  "at whole cap admitted",
+  "below whole cap admitted",
+  "above cap refused",
+  "wait retains nothing",
+  "cancel pending admission",
+  "release starts funded export",
+  "native work precharged",
+  "all credit returned",
+] as const;
+
+export const SNAPSHOT_NATIVE_ADMISSION_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "native complete group",
+  "native import complete group",
+  "no nested admission",
+] as const;
+
+export const SNAPSHOT_IMPORT_ADMISSION_REACH = [
+  "combined oversize refuses",
+  "wait holds nothing",
+  "cancel wait",
+  "release starts import",
+  "whole cap admits",
+  "all credit returned",
+] as const;
+
+export const SNAPSHOT_RETAINED_ADMISSION_REACH = [
+  "source",
+  "control",
+  "spool",
+  "typed combined refusal",
+  "zero final charges",
+] as const;
+
+export const CLOSED_DISK_FIXTURE_REACH = [
+  "live handles refused",
+  "pending writes",
+  "lying queued writes",
+  "honest durable bytes",
+  "epoch carried",
+  "isolated append",
+  "isolated overwrite",
+  "isolated truncate",
+  "same seeded power loss",
+  "consumed random stream refused",
+] as const;
+
+export const CLOSED_DISK_FINGERPRINT_REACH = [
+  "current",
+  "durable",
+  "pending bytes",
+  "queued bytes",
+  "pending offset",
+  "queued offset",
+  "pending truncate",
+  "queued truncate",
 ] as const;

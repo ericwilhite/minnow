@@ -4,7 +4,12 @@
 import { pauseIfDue, type TaskWork } from "../task.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { DATA_ALIGN, StoreCorruptionError } from "./contract.js";
-import { LIST_PAGE_EXTENTS, type ExtentList, type ExtentListPage } from "./extent-list.js";
+import {
+  extentListEnd,
+  LIST_PAGE_EXTENTS,
+  type ExtentList,
+  type ExtentListPage,
+} from "./extent-list.js";
 import type { PageCache } from "./page-cache.js";
 
 const HEADER = 16,
@@ -100,20 +105,7 @@ export class NativeExtentList {
     const at = HEADER + this.#entry++ * ENTRY;
     const offset = view.getFloat64(at, true),
       length = view.getFloat64(at + 8, true);
-    const end = offset + length,
-      alignedEnd = offset + Math.ceil(length / DATA_ALIGN) * DATA_ALIGN;
-    if (
-      !Number.isSafeInteger(offset) ||
-      offset < 0 ||
-      offset % DATA_ALIGN !== 0 ||
-      !Number.isSafeInteger(length) ||
-      length <= 0 ||
-      !Number.isSafeInteger(end) ||
-      !Number.isSafeInteger(alignedEnd) ||
-      end > this.dataLength ||
-      offset < this.#lastEnd
-    )
-      return fail("invalid, overlapping or descending extent");
+    const alignedEnd = extentListEnd(offset, length, this.#lastEnd, this.dataLength);
     const page = this.list[this.#index - 1];
     if (page === undefined || (this.#entry === 1 && offset !== page.first))
       return fail("first offset disagrees with root");

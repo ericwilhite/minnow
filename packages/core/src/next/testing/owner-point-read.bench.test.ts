@@ -202,6 +202,7 @@ function stubEngine(): OwnerEngine {
         1,
         64 << 10,
       ),
+    databaseId: 1n,
     createReturnPool: () => {
       throw new Error("Point benchmark stub has no streaming output pool");
     },
@@ -232,6 +233,7 @@ function ownerSideMicros(
   };
   deliver({
     t: "hello",
+    databaseId: null,
     protocol: PROTOCOL_VERSION,
     build: "b",
     clientId: "f".repeat(32),
@@ -312,6 +314,7 @@ describe("point read (R6)", () => {
     };
     deliver({
       t: "hello",
+      databaseId: null,
       protocol: PROTOCOL_VERSION,
       build: "b",
       clientId: "e".repeat(32),

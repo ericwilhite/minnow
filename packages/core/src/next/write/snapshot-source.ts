@@ -1,3 +1,5 @@
+import { SnapshotSourceChangedError } from "../snapshot-errors.js";
+export { SnapshotSourceChangedError };
 /** One load path: immutable exact-offset reads. One-shot producers spool at the owner edge. */
 import {
   decodeSnapshotFrameHeader,
@@ -5,20 +7,14 @@ import {
   SnapshotFormatError,
   type SnapshotWork,
 } from "../format/snapshot.js";
-import type { MemoryGovernor } from "../memory/governor.js";
+import type { MemoryGovernor, Grant, NativeGrantGroupOptions } from "../memory/governor.js";
 import { DATA_ALIGN, type ScratchSpace } from "../storage/contract.js";
 import type { ByteBudget } from "../storage/extents.js";
 import { snapshotInput } from "./snapshot-iterator.js";
 import { snapshotTake, snapshotPace } from "./snapshot-stage.js";
 
 /** Refusal of a replay that no longer names the original bytes, not a retryable IO error. */
-export class SnapshotSourceChangedError extends Error {
-  readonly code = "MINNOW_SNAPSHOT_SOURCE_CHANGED";
-  constructor() {
-    super("Snapshot source changed during load; retry with an immutable source");
-    this.name = "SnapshotSourceChangedError";
-  }
-}
+
 /** Two streaming 32-bit mixing lanes, independent of read partitioning. This is an
  * accidental-change digest, not authentication. Do NOT use the archive CRC here: a valid
  * frame plus its own CRC has a constant CRC residue even when its contents change. */
@@ -87,6 +83,9 @@ export class SnapshotSourcePrefix {
 }
 export interface ReplayableSnapshotInput {
   readonly byteLength: number;
+  /** Irreducible source credit in this exact governor, retained across load attempts.
+   * Excludes caller control (SnapshotLoadOptions.retainedBytes), never evictable cache. */
+  retainedBytes?(governor: MemoryGovernor): number;
   /** Exact, immutable read. Settle before releasing destination ownership, including on abort.
    * At most destination.length additional scratch; the caller funds both before calling. */
   readInto(offset: number, destination: Uint8Array, signal: AbortSignal): Promise<void>;
@@ -197,6 +196,13 @@ export interface SnapshotSpoolRegion {
   readonly offset: number;
   readonly capacity: number;
 }
+/** Same named parts for owner-level atomic admission and standalone spooling. */
+export function snapshotSpoolGrants(maxChunkBytes: number): NativeGrantGroupOptions["grants"] {
+  return [
+    { label: "snapshot spool copy", minimumBytes: maxChunkBytes + 65536 + 1024, spillable: false },
+    { label: "snapshot spool source", minimumBytes: 1024, spillable: false },
+  ];
+}
 /** Owner edge only. It never truncates shared scratch or adds another core loader path.
  * The owner bounds producer chunks; their borrowed capacity is included in the complete step.
  * close() relinquishes the source after all core attempts/reads have settled. */
@@ -204,7 +210,11 @@ export async function spoolSnapshotInput(
   input: AsyncIterable<Uint8Array>,
   region: SnapshotSpoolRegion,
   governor: MemoryGovernor,
-  options: SnapshotWork & { readonly maxChunkBytes: number },
+  options: SnapshotWork & {
+    readonly maxChunkBytes: number;
+    /** Already admitted with incoming transport. Never admit while retaining that transport. */
+    readonly funding?: readonly Grant[];
+  },
 ): Promise<ReplayableSnapshotInput & { close(): Promise<void> }> {
   const { scratch, offset, capacity } = region,
     { maxChunkBytes, signal } = options;
@@ -221,27 +231,35 @@ export async function spoolSnapshotInput(
   )
     throw new TypeError("Invalid snapshot spool reservation");
   const bytes = maxChunkBytes + 65536 + 1024;
-  const [grant, sourceGrant] = await governor.admitGroup({
-    label: "snapshot spool",
-    includesProgress: true,
-    grants: [
-      { label: "snapshot spool copy", minimumBytes: bytes, spillable: false },
-      { label: "snapshot spool source", minimumBytes: 1024, spillable: false },
-    ],
-    ...(signal === undefined ? {} : { signal }),
-  });
+  const [grant, sourceGrant] =
+    options.funding ??
+    (await governor.admitGroup({
+      label: "snapshot spool",
+      includesProgress: true,
+      grants: snapshotSpoolGrants(maxChunkBytes),
+      ...(signal === undefined ? {} : { signal }),
+    }));
   if (grant === undefined || sourceGrant === undefined)
     throw new TypeError("Missing snapshot spool grant");
   if (!sourceGrant.allocate(1024)) throw new TypeError("Lost snapshot spool source admission");
   let length = 0,
     written = 0,
     closed = false;
-  const release = async () => {
-    if (closed) return;
+  let closing: Promise<void> | undefined;
+  // Repeated close waits for the same started reclamation. Its fixed control credit
+  // belongs to this source until native cleanup settles (governor rule 8).
+  const release = (): Promise<void> => {
+    if (closing !== undefined) return closing;
     closed = true;
-    sourceGrant.close();
-    if (written > 0)
-      await scratch.release([{ offset, length: Math.ceil(written / DATA_ALIGN) * DATA_ALIGN }]);
+    closing = (async () => {
+      try {
+        if (written > 0)
+          await scratch.release([{ offset, length: Math.ceil(written / DATA_ALIGN) * DATA_ALIGN }]);
+      } finally {
+        sourceGrant.close();
+      }
+    })();
+    return closing;
   };
   try {
     if (!grant.allocate(bytes)) throw new TypeError("Lost snapshot spool admission");
@@ -278,6 +296,7 @@ export async function spoolSnapshotInput(
     signal?.throwIfAborted();
     return {
       byteLength: length,
+      retainedBytes: (owner) => (owner === governor ? sourceGrant.held : 0),
       async readInto(at, destination, readSignal) {
         readSignal.throwIfAborted();
         if (closed) throw new TypeError("Snapshot spool released");

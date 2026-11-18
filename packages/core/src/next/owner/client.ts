@@ -1,4 +1,9 @@
 import type { RekeyEffect } from "../access/changes.js";
+import {
+  SnapshotClient,
+  type SnapshotExportOptions,
+  type SnapshotImportOptions,
+} from "./snapshot-api.js";
 /**
  * The protocol client: one client's side of protocol.ts over a MessagePort — the handshake,
  * sequencing and the outstanding window (sequence.ts), resendability, frame releases, stream
@@ -46,7 +51,7 @@ import type { RekeyEffect } from "../access/changes.js";
  * owner died or did not answer within `HANDSHAKE_TIMEOUT_MS`. A welcomed connection re-announces
  * the liveness lock (`liveness { held: true }`) before anything else is sent on it.
  */
-import { SessionLostError } from "../errors.js";
+import { SessionLostError, DatabaseReplacedError } from "../errors.js";
 import type { PhysicalType } from "../types.js";
 import { decodeUtf8 } from "../vector/varlen.js";
 import {
@@ -69,6 +74,7 @@ import {
   RELEASE_DELAY_MS,
   LEASE_RELEASE_FAILURE_CONTEXT,
   PROTOCOL_VERSION,
+  ProtocolError,
   type OwnerMessage,
   type PreparedStatementKind,
   type Request,
@@ -364,10 +370,14 @@ export class ProtocolClient {
   readonly #releases = new Map<number, { through: number; bytes: number }>();
   #releaseTimer: ReturnType<typeof setTimeout> | null = null;
   #closed = false;
+  #databaseId: bigint | null = null;
+  #replaced: DatabaseReplacedError | null = null;
   onSessionAborted: ((session: number) => void) | null = null;
   /** Called whenever requests in flight or pins change (the connector's liveness and watcher). */
   onActivity: (() => void) | null = null;
   onStepDown: ((reason: StepDown["reason"]) => void) | null = null;
+  /** Stops reconnecting: replacement requires a fresh client, never transparent replay. */
+  onDatabaseReplaced: ((error: DatabaseReplacedError) => void) | null = null;
   onOwnerError: ((event: { kind: string; context: string; error: Error }) => void) | null = null;
 
   constructor(options: ProtocolClientOptions = {}) {
@@ -563,6 +573,10 @@ export class ProtocolClient {
   }
 
   #open(port: MessagePort, signal?: AbortSignal): Promise<Welcome> {
+    if (this.#replaced !== null) {
+      port.close();
+      return Promise.reject(this.#replaced);
+    }
     // Releases name the old connection's streams, which ended with it.
     this.#takeReleases();
     this.#port?.close();
@@ -597,6 +611,7 @@ export class ProtocolClient {
       }
       port.postMessage({
         t: "hello",
+        databaseId: this.#databaseId,
         protocol: this.protocol,
         build: this.#build,
         clientId: this.clientId,
@@ -875,6 +890,50 @@ export class ProtocolClient {
     this.#lostCauses.delete(session);
   }
 
+  #snapshotClient: SnapshotClient | undefined;
+  #snapshots(): SnapshotClient {
+    return (this.#snapshotClient ??= new SnapshotClient(
+      async (op, args, signal) => {
+        signal?.throwIfAborted();
+        const { seq, promise } = this.#request({ t: "admin", op, args });
+        const abort = () => this.cancel(seq);
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) abort();
+        try {
+          return (await promise).value;
+        } catch (error) {
+          if (signal?.aborted && error instanceof CancelledError) throw signal.reason;
+          throw error;
+        } finally {
+          signal?.removeEventListener("abort", abort);
+        }
+      },
+      () => {
+        this.#cursors++;
+        this.onActivity?.();
+        return () => {
+          this.#cursors--;
+          this.onActivity?.();
+        };
+      },
+    ));
+  }
+  exportSnapshot(options?: SnapshotExportOptions): Promise<Uint8Array> {
+    return this.#snapshots().exportSnapshot(options);
+  }
+  exportSnapshotStream(options?: SnapshotExportOptions): AsyncGenerator<Uint8Array, void, void> {
+    return this.#snapshots().exportSnapshotStream(options);
+  }
+  importSnapshot(bytes: Uint8Array, options?: SnapshotImportOptions): Promise<void> {
+    return this.#snapshots().importSnapshot(bytes, options);
+  }
+  importSnapshotStream(
+    source: AsyncIterable<Uint8Array>,
+    options?: SnapshotImportOptions,
+  ): Promise<void> {
+    return this.#snapshots().importSnapshotStream(source, options);
+  }
+
   /** Sends a request and returns its seq with its promise (for cancellation and retries in tests). */
   send(body: Body): { readonly seq: number; readonly promise: Promise<ClientResult> } {
     return this.#request(body);
@@ -1136,6 +1195,7 @@ export class ProtocolClient {
     body: Body,
     cursor: CursorQueue | null = null,
   ): { readonly seq: number; readonly promise: Promise<ClientResult> } {
+    if (this.#replaced !== null) return this.#refuse(this.#replaced, cursor);
     if (this.#closed) return this.#refuse(new ClientClosedError(), cursor);
     if (this.#unreachable !== null) {
       // Gave up on reaching an owner: never sent, so nothing takes effect. Still activity: the
@@ -1316,11 +1376,45 @@ export class ProtocolClient {
 
   // ---- incoming ----
 
+  #markDatabaseReplaced(): DatabaseReplacedError {
+    if (this.#replaced !== null) return this.#replaced;
+    const error = new DatabaseReplacedError();
+    this.#replaced = error;
+    this.#welcome?.reject(error);
+    this.#welcome = null;
+    for (const pending of [...this.#pending.values()]) this.#fail(pending, error);
+    this.#takeReleases();
+    const port = this.#port;
+    this.#port = null;
+    try {
+      port?.postMessage({ t: "bye" });
+    } finally {
+      port?.close();
+    }
+    this.onDatabaseReplaced?.(error);
+    this.onActivity?.();
+    return error;
+  }
+
   #receive(message: OwnerMessage): void {
     this.#lastHeardAt = this.#now();
     this.#lastMessageAt = this.#lastHeardAt;
     switch (message.t) {
       case "welcome": {
+        if (
+          typeof message.databaseId !== "bigint" ||
+          message.databaseId <= 0n ||
+          message.databaseId >> 128n !== 0n
+        ) {
+          this.#welcome?.reject(new ProtocolError("Invalid owner database identity"));
+          this.#welcome = null;
+          return;
+        }
+        if (this.#databaseId !== null && this.#databaseId !== message.databaseId) {
+          this.#markDatabaseReplaced();
+          return;
+        }
+        this.#databaseId = message.databaseId;
         this.#ownerId = message.ownerId;
         this.#ownerLockHolder = message.lockHolder;
         this.#ownerEpoch = message.epoch;
@@ -1331,7 +1425,20 @@ export class ProtocolClient {
         welcome?.resolve(message);
         return;
       }
+      case "connectionReset":
+        this.giveUp("snapshot import ended this connection; reconnect before continuing");
+        this.#port?.close();
+        this.#port = null;
+        this.onStepDown?.("closing");
+        return;
+      case "databaseReplaced":
+        this.#markDatabaseReplaced();
+        return;
       case "refused":
+        if (message.reason === "databaseReplaced") {
+          this.#markDatabaseReplaced();
+          return;
+        }
         this.#welcome?.reject(new ConnectionRefusedError(message.reason, message.ownerProtocol));
         this.#welcome = null;
         return;
@@ -1511,7 +1618,9 @@ export class ProtocolClient {
         const pending = this.#pending.get(message.seq);
         if (pending === undefined) return;
         if (message.t === "error") {
-          this.#fail(pending, fromWireError(message.error, ownerErrorRegistry));
+          const error = fromWireError(message.error, ownerErrorRegistry);
+          if (error instanceof DatabaseReplacedError) this.#markDatabaseReplaced();
+          else this.#fail(pending, error);
           return;
         }
         this.#settle(message.seq);

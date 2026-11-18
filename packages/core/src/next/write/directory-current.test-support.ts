@@ -25,6 +25,7 @@ import type { ManifestRoot } from "../format/manifest.js";
 export const DIRECTORY_RECIPES = {
   "packed-0": {
     formatVersion: MANIFEST_FORMAT_VERSION,
+    databaseId: 1n,
     fts: { checkpoint: null, staged: null },
     sequence: 2,
     epoch: 1,
@@ -88,6 +89,7 @@ export const DIRECTORY_RECIPES = {
   },
   "packed-4095": {
     formatVersion: MANIFEST_FORMAT_VERSION,
+    databaseId: 1n,
     fts: { checkpoint: null, staged: null },
     sequence: 3,
     epoch: 1,
@@ -185,6 +187,7 @@ export const DIRECTORY_RECIPES = {
   },
   "packed-4099": {
     formatVersion: MANIFEST_FORMAT_VERSION,
+    databaseId: 1n,
     fts: { checkpoint: null, staged: null },
     sequence: 3,
     epoch: 1,

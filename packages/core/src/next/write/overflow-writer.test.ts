@@ -218,6 +218,7 @@ function encode(
       if (!blob) throw new Error("missing fixture blob");
       const rootBytes = encodeManifestRoot({
         formatVersion: MANIFEST_FORMAT_VERSION,
+        databaseId: 1n,
         fts: { checkpoint: null, staged: null },
         sequence: 1,
         epoch: 1,

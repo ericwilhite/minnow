@@ -401,6 +401,8 @@ export interface PeekOptions {
 }
 
 export interface ExtentReader {
+  /** Physical byte bound when known; no admission or I/O is performed to obtain it. */
+  readonly dataLength?: number;
   /**
    * Verified bytes for `refs` (any order; duplicates share one array): cache hits, then the
    * misses in coalesced slabs. At most `MAX_READ_BYTES` in total (`RangeError` otherwise).

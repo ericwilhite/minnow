@@ -35,6 +35,7 @@
  * - A frozen owner fails reads with `OwnerUnresponsiveError` after `unresponsiveAfterMs`, and
  *   writes in flight with `OutcomeUnknownError { reason: "unresponsive" }`: they may still commit.
  */
+import type { SnapshotApi } from "./snapshot-api.js";
 import type { PhysicalType } from "../types.js";
 import type { Int128Values, Int64Values, WideCoefficients } from "../vector/vector.js";
 import type { Broker } from "./election.js";
@@ -293,7 +294,7 @@ export type ClientStatus =
   | "closed";
 
 export interface ClientOptions {
-  /** The database name: one owner per name per origin. */
+  /** Database name: nonempty well-formed Unicode, <=80 UTF-8 bytes, never normalized. */
   readonly database: string;
   /**
    * In a page: starts this page's owner worker when it wins the election
@@ -332,7 +333,7 @@ export interface ClientOptions {
   }) => void;
 }
 
-export interface MinnowClient extends SqlExecutor {
+export interface MinnowClient extends SqlExecutor, SnapshotApi {
   readonly status: ClientStatus;
   /** Resolves when connected to an owner (electing this page if needed). */
   ready(): Promise<void>;

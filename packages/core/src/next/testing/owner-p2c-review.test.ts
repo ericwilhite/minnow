@@ -238,7 +238,9 @@ describe("finding 4: close() discards pending releases", () => {
         sent.push({ ...message, afterClose: closed });
         if (message.t === "hello")
           queueMicrotask(() =>
-            port.onmessage?.({ data: { t: "welcome", ownerId: "o", protocol: PROTOCOL_VERSION } }),
+            port.onmessage?.({
+              data: { t: "welcome", databaseId: 1n, ownerId: "o", protocol: PROTOCOL_VERSION },
+            }),
           );
       },
     };

@@ -213,6 +213,7 @@ export function boundSource(
     const sizingPages: SpaceReader =
       retention.retain === false
         ? {
+            ...(view.pages.dataLength === undefined ? {} : { dataLength: view.pages.dataLength }),
             peek: (ref, options) => view.pages.peek(ref, { ...options, once: true }),
             read: (refs, options) => view.pages.read(refs, { ...options, ...retention }),
           }
@@ -442,6 +443,9 @@ export function boundSource(
               // No directory/inflate admission is needed by the sizing pass. Exact-sized
               // encoded reads keep this attempt's complete reservation a hard limit.
               const pages: SpaceReader = {
+                ...(view.pages.dataLength === undefined
+                  ? {}
+                  : { dataLength: view.pages.dataLength }),
                 peek: () => null,
                 read: (refs, options) =>
                   view.pages.read(refs, {

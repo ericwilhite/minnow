@@ -23,7 +23,9 @@ function fakePort(onSend: (message: Record<string, unknown>) => void = () => und
     postMessage(message: Record<string, unknown>) {
       onSend(message);
       if (message.t === "hello")
-        queueMicrotask(() => port.onmessage?.({ data: { t: "welcome", ownerId: "o" } }));
+        queueMicrotask(() =>
+          port.onmessage?.({ data: { t: "welcome", databaseId: 1n, ownerId: "o" } }),
+        );
       if (message.t === "prepare")
         queueMicrotask(() =>
           port.onmessage?.({

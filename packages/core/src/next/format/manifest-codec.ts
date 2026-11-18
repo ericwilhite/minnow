@@ -1,6 +1,6 @@
 /**
  * Byte codecs of the manifest (ruling R15.3): the root, the paged group directory and the group
- * root. Shapes are format/manifest.ts: manifest version9; other blob grammars version1.
+ * root. Shapes are format/manifest.ts: the current manifest version; other blob grammars version1.
  *
  * ## Common rules
  * - Every blob starts with a 4-byte magic and a version byte; integers are varints (bytes.ts).
@@ -36,6 +36,7 @@
  * bigints are minimal; ledger counts are in key order (`<` on UTF-16 code units). A blob over
  * its cap is refused before it is charged.
  */
+import { readDatabaseIdentity, writeDatabaseIdentity } from "./database-identity.js";
 import {
   DURABLE_CODECS,
   DURABLE_FORMATS,
@@ -1188,6 +1189,7 @@ export function encodeManifestRoot(root: ManifestRoot): Uint8Array {
   body.uint(root.formatVersion);
   body.uint(root.sequence);
   body.uint(root.epoch);
+  writeDatabaseIdentity(body, root.databaseId);
   body.u32(root.log.salt);
   body.uint(root.log.firstLsn);
   body.uint(root.log.rootSequence);
@@ -1225,6 +1227,7 @@ export function decodeManifestRoot(bytes: Uint8Array, budget: ByteBudget): Parse
       requireEncoding("manifest", formatVersion, [MANIFEST_FORMAT_VERSION]);
       const sequence = reader.uint();
       const epoch = reader.uint();
+      const databaseId = readDatabaseIdentity(reader);
       const log = { salt: reader.u32(), firstLsn: reader.uint(), rootSequence: reader.uint() };
       const globalLsn = reader.uint();
       const catalogVersion = reader.uint();
@@ -1266,6 +1269,7 @@ export function decodeManifestRoot(bytes: Uint8Array, budget: ByteBudget): Parse
         formatVersion,
         sequence,
         epoch,
+        databaseId,
         log,
         globalLsn,
         catalogVersion,

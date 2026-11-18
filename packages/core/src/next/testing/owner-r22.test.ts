@@ -24,6 +24,7 @@ function recordingPort(server: ReturnType<typeof harness>["server"]) {
   };
   deliver({
     t: "hello",
+    databaseId: null,
     protocol: PROTOCOL_VERSION,
     build: "t",
     clientId: "a".repeat(32),
@@ -61,7 +62,9 @@ function fakeOwner() {
       sent.push(message);
       if (message.t === "hello")
         queueMicrotask(() =>
-          port.onmessage?.({ data: { t: "welcome", ownerId: "o", protocol: PROTOCOL_VERSION } }),
+          port.onmessage?.({
+            data: { t: "welcome", databaseId: 1n, ownerId: "o", protocol: PROTOCOL_VERSION },
+          }),
         );
     },
   };

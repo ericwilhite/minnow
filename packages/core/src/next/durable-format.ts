@@ -16,18 +16,27 @@
  * The native vocabulary/profile guard below catches an unassigned vocabulary extension.
  * The independent native writer ledger also guards read-optional fields before acquisition.
  */
-/** Shared reference-table envelope; the manifest also carries its logical format version13. */
+/** Shared reference-table envelope; the manifest also carries its logical format version14. */
 export const METADATA_ENVELOPE_VERSION = 1;
 /** Root reader capability; incompatible nested bytes advance this or the exact manifest barrier. */
-export const DURABLE_READER_VERSION = 10;
-export const MANIFEST_FORMAT_VERSION = 13;
+export const DURABLE_READER_VERSION = 11;
+export const MANIFEST_FORMAT_VERSION = 14;
 export const ROOT_SLOT_HEADER_BYTES = 16;
 /** Profile8 escape: two independently checked u32 capability selectors precede the manifest. */
-export const DURABLE_WRITER_VERSION = 10;
+export const DURABLE_WRITER_VERSION = 11;
 export const ROOT_SLOT_CAPABILITY_BYTES = 8;
 export const ROOT_SLOT_EXTENSION_TAG = 7;
 export const ROOT_SLOT_PAYLOAD_OFFSET = ROOT_SLOT_HEADER_BYTES + ROOT_SLOT_CAPABILITY_BYTES;
 export const ROOT_SLOT_OVERHEAD = ROOT_SLOT_PAYLOAD_OFFSET + 4;
+
+/** Required manifest scalar; inherits the manifest gate, with no nested discriminator. */
+export const DATABASE_IDENTITY_CODEC = Object.freeze({
+  bytes: 16,
+  wordBits: 32,
+  words: 4,
+  nonzero: true,
+  endian: "little",
+} as const);
 
 export class DurableFormatError extends Error {
   readonly code = "MINNOW_FORMAT_UNSUPPORTED";
@@ -52,6 +61,9 @@ interface Format {
   readonly parent?: string;
   readonly versionIn: "header" | "magic" | "parent" | "platform";
   readonly fields: readonly FormatField[];
+  /** Canonical refusals on already assigned lanes; no new accepted vocabulary. */
+  readonly canonicalFields?: readonly FormatField[];
+  readonly paddingZero?: number;
   readonly decoder: string;
   readonly state: "implemented" | "design";
 }
@@ -706,6 +718,8 @@ export const DURABLE_FORMATS = {
   logFrame: {
     ...inherited("logHeader", "scanLog/scanLogIncremental"),
     magic: 0x464c4e4d,
+    canonicalFields: [{ name: "LSN high reserved", offset: 12, width: 4, mask: 0x1fffff }],
+    paddingZero: 0,
     fields: [
       magic(0x464c4e4d),
       { name: "kind", offset: 20, width: 1, values: [1] },
@@ -714,6 +728,7 @@ export const DURABLE_FORMATS = {
     ],
   },
   manifest: { ...envelope(0x31524d4d, "decodeManifestRoot"), version: MANIFEST_FORMAT_VERSION },
+  databaseIdentity: inherited("manifest", "readDatabaseIdentity"),
   groupRoot: envelope(0x3152474d, "decodeGroupRoot/tryDecodeGroupRootView"),
   groupPage: envelope(0x3150474d, "decodeGroupPage"),
   deletionBitmap: inherited("groupPage", "decodeDeletionBitmap"),
@@ -986,6 +1001,21 @@ export function requireBits(
 ): void {
   if ((value & ~mask) !== 0) throw new ErrorType(`Nonzero reserved bits in ${what}`);
 }
+/** Refusal-only constraints on existing lanes: no new accepted native vocabulary/profile.
+ * Dynamic padding runs from28+bodyLength through the final checksum (exclusive).
+ */
+export const STORAGE_CANONICAL = Object.freeze({
+  logFrameLsnHigh: DURABLE_FORMATS.logFrame.canonicalFields[0],
+  logFramePadding: DURABLE_FORMATS.logFrame.paddingZero,
+});
+const CANONICAL_LOG_FRAME_FIELDS: readonly FormatField[] = Object.freeze([
+  ...DURABLE_FORMATS.logFrame.fields,
+  ...DURABLE_FORMATS.logFrame.canonicalFields,
+]);
+/** The prebuilt full registry view, including refusal-only constraints. */
+export function durableFields(format: DurableFormatName): readonly FormatField[] {
+  return format === "logFrame" ? CANONICAL_LOG_FRAME_FIELDS : DURABLE_FORMATS[format].fields;
+}
 /** Caller has already verified a checksummed slot before distinguishing it from a torn slot. */
 export function requireHeader(
   format: DurableFormatName,
@@ -993,7 +1023,8 @@ export function requireHeader(
   ErrorType: FormatErrorType = DurableFormatError,
 ): void {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  for (const field of DURABLE_FORMATS[format].fields as readonly FormatField[]) {
+  const fields = durableFields(format);
+  for (const field of fields) {
     if (field.offset + field.width > bytes.length)
       throw new ErrorType(`Truncated ${format} ${field.name}`);
     const value =
@@ -1043,6 +1074,7 @@ export const NATIVE_READER_PROFILES: Readonly<
   8: Object.freeze({ manifest: 11, vocabulary: 1164132746 }),
   9: Object.freeze({ manifest: 12, vocabulary: 131312130 }),
   10: Object.freeze({ manifest: 13, vocabulary: 3997453788 }),
+  11: Object.freeze({ manifest: 14, vocabulary: 3266998012 }),
 });
 
 /** Required rewrite capability includes even fields that are optional for reading.
@@ -1051,6 +1083,7 @@ export const NATIVE_WRITER_PROFILES: typeof NATIVE_READER_PROFILES = Object.free
   8: Object.freeze({ manifest: 11, vocabulary: 1164132746 }),
   9: Object.freeze({ manifest: 12, vocabulary: 131312130 }),
   10: Object.freeze({ manifest: 13, vocabulary: 3997453788 }),
+  11: Object.freeze({ manifest: 14, vocabulary: 3266998012 }),
 });
 
 function canonicalVocabulary(value: unknown): string {
@@ -1117,6 +1150,7 @@ export function nativeVocabularyFingerprint(
       ]),
     ),
     fts: FTS_NATIVE_GRAMMAR,
+    databaseIdentity: DATABASE_IDENTITY_CODEC,
     reserved: RESERVED_MASKS,
     conditional: CONDITIONAL_FORMAT,
     page: PAGE_CODEC,

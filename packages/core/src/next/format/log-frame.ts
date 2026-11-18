@@ -39,7 +39,12 @@
  *   in-order write-back loss may drop a suffix of groups, never reorder or invent one.
  */
 import { validLogHeaderEnvelope } from "../storage/durable-header.js";
-import { DURABLE_CODECS, DURABLE_FORMATS, requireHeader } from "../durable-format.js";
+import {
+  DURABLE_CODECS,
+  DURABLE_FORMATS,
+  requireHeader,
+  STORAGE_CANONICAL,
+} from "../durable-format.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 
 export const FRAME_MAGIC = DURABLE_FORMATS.logFrame.magic; // "MNLF"
@@ -289,11 +294,17 @@ class LogScanState {
     const frameLsn = getU53(view, 8);
     const partIndex = view.getUint16(22, true);
     const partCount = view.getUint16(24, true);
-    requireHeader("logFrame", bytes, LogCorruptionError);
+    try {
+      requireHeader("logFrame", bytes, LogCorruptionError);
+      const bodyEnd = FRAME_HEADER_BYTES + view.getUint32(16, true);
+      for (let at = bodyEnd; at < length - 4; at++)
+        if (bytes[at] !== STORAGE_CANONICAL.logFramePadding)
+          throw new LogCorruptionError("Nonzero log frame padding");
+    } catch (error) {
+      if (this.header !== null && this.offset < this.header.ackEnd) throw error;
+      return null; // Unsupported/corrupt post-ack bytes are unreplayable tail, never a value.
+    }
     if (frameLsn !== this.#lsn + 1) return null;
-    const bodyEnd = FRAME_HEADER_BYTES + view.getUint32(16, true);
-    for (let at = bodyEnd; at < length - 4; at++)
-      if (bytes[at] !== 0) throw new LogCorruptionError("Nonzero log frame padding");
     if (partCount < 1 || partIndex >= partCount) return null;
     const continues =
       partIndex === 0

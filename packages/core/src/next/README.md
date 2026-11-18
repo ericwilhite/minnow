@@ -4762,3 +4762,77 @@ must supply that complete admitted work; this helper is not an execution minimum
 and SQL dispatch still keep their guards. Generated PG traces/errors, an actual compiled follow
 observer, foreign-scope/cancellation fences and competing-credit64MiB roots exercise the assembler.
 The initial SUM observer probe hit the existing initPlan refusal; no initPlan capability was added.
+
+Store names in the first native format are non-empty, well-formed Unicode, at most 80 UTF-8
+bytes, and never normalized. `OwnerConnector`, owner startup and backend selection refuse an
+invalid name with `InvalidStoreNameError` (`MINNOW_INVALID_STORE_NAME`) before platform access.
+Native OPFS uses percent encoding; dot-only components are escaped as `%2E`/`%2E%2E`.
+Canonical storage checks refuse extra fields in IndexedDB byte-index records, reserved MNLF
+LSN bits and padding within the acknowledged region, and invalid extent-list bounds. Invalid
+post-ack WAL bytes remain unreplayable tail. Private metadata and scratch journals still reset
+on open and validate on use; they are not supported durable formats.
+
+### Durable database identity (development manifest 14)
+
+The native manifest carries a required nonzero 128-bit little-endian databaseId after its epoch.
+Native creation seeds it under a charged temporary allocation. Normal checkpoints, merges,
+sequence publications and WAL recycling carry it unchanged. Portable replacement advances the
+target identity, including when the same archive is imported repeatedly. Identity exhaustion
+refuses before publication. The source identity and source/target request outcomes are excluded.
+
+This scalar inherits the manifest's gate and is registered as databaseIdentity. The development
+allocation above reader 10/writer 10/manifest 13 is reader 11/writer 11/manifest 14; WAL body 9 and the
+portable format 1 bytes stay unchanged. No released next/ predecessor exists yet.
+
+The owner protocol binds each client to the durable database incarnation at its first
+handshake. A replacement refuses that client, including lost-reply retries and queued
+requests, with `DatabaseReplacedError` (`MINNOW_DATABASE_REPLACED`). Close it and open a
+new client. This check precedes ledger replay, planning and connection supersession;
+ordinary ownership changes preserve the incarnation and normal retry behaviour.
+
+### Portable snapshots through the owner (unexported)
+
+`ProtocolClient` and the `MinnowClient` contract now provide `exportSnapshot()`,
+`exportSnapshotStream()`, `importSnapshot()` and `importSnapshotStream()`, with the
+existing `signal` and `onProgress` option shapes. This does not change the published
+0.x package entry point. The staged 1.0 snapshot guide is in the cutover register.
+
+`openNativeOwnerEngine()` composes the native backend under the host's existing lease.
+The protocol server uses its snapshot operations automatically. Export pins one committed
+view and captures sequence high-water synchronously. Streaming transfers at most one
+acknowledged 1 MiB dedicated chunk at a time; cached and borrowed page buffers never transfer.
+Native export work and transport are admitted as one complete minimum. A queued export holds
+neither grant; this includes private progress, so only a minimum above the whole cap refuses
+with `MINNOW_MEMORY_ADMISSION`.
+The byte-array convenience method collects the whole archive on the client; use streaming
+for large databases.
+
+Import replaces the target. The owner excludes new work, drains commits already in progress
+and cleanup still owned by disconnected clients, cancels other work and exports, closes
+transactions, and spools one-shot input to exclusive scratch. The replayable native loader validates and builds an unpublished generation, then
+publishes only after the footer and checksums. Scratch, frames and native metadata stay
+charged. It recovers the physical root slots before answering, including after cancellation,
+quota or an indeterminate publication error. A recovered new incarnation proves publication;
+late cancellation can therefore finish successfully. Failed unpublished imports preserve the
+old data. Unrecoverable native recovery steps the owner down and releases its lease.
+
+Successful replacement ends every old connection with `MINNOW_DATABASE_REPLACED`; open a
+new client, including after the importing client succeeds. Failed imports reset connections
+and transactions; the connector reconnects to the unchanged incarnation. Transfer handles
+never survive reconnects: restart the transfer from the original archive. Ordinary owner
+changes still preserve the database identity and exactly-once write retries.
+
+The native catalog/index/sequence scope is preserved and indexes are rebuilt with uniqueness
+and foreign-key validation. Trigger, FTS, managed, CHECK, closed-set and unindexable scopes
+still refuse with `MINNOW_SNAPSHOT_SCOPE` and TODO markers; they are never dropped silently.
+Native sequence capture is tested through `SequenceAccess`: the current default real executor
+does not implement sequence function calls, independently of snapshot transport.
+
+Snapshot imports admit incoming transport and scratch-spool memory together. A queued import
+retains no partial transport grant. Replay admission includes the source handle and owner
+control memory that must survive retries; a combined minimum above the whole cap refuses
+with `MINNOW_MEMORY_ADMISSION`, rather than waiting for its own retained memory.
+
+Native store-name validation and encoding live in the shared, pure `store-name.ts` module.
+The thin connector validates the same 80-byte Unicode name domain without importing a storage
+backend. This preserves the client bundle boundary and changes no valid name or stored byte.

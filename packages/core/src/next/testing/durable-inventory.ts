@@ -215,7 +215,7 @@ export const DURABLE_EMISSIONS: Readonly<
   },
   "write/snapshot-load.ts:loadAttempt:target.space.publish -> ExtentSpace.publish": {
     count: 1,
-    kinds: ["manifest"],
+    kinds: ["manifest", "databaseIdentity"],
   },
   "format/snapshot.ts:SnapshotStreamWriter.#emit:this.sink.write -> SnapshotSink.write": {
     count: 1,
@@ -313,7 +313,7 @@ export const DURABLE_EMISSIONS: Readonly<
   },
   "storage/space.ts:Space.#publishNow:this.#session.publish -> StoreSession.publish": {
     count: 1,
-    kinds: ["manifest"],
+    kinds: ["manifest", "databaseIdentity"],
   },
   "storage/space.ts:Writer.write:builder.append -> ExtentBuilder.append": { count: 1, kinds: [] },
   "write/catalog-storage.ts:node:writer.write -> ExtentWriter.write": {
@@ -353,7 +353,7 @@ export const DURABLE_EMISSIONS: Readonly<
   },
   "write/engine.ts:DeltaPublication.publish:space.publish -> ExtentSpace.publish": {
     count: 1,
-    kinds: ["manifest"],
+    kinds: ["manifest", "databaseIdentity"],
   },
 };
 /** Durable references declared by the schema, independently of its encoders and registry. */

@@ -108,6 +108,8 @@ export type ChunkData = Omit<BlobRef, "checksum">;
 
 export interface ManifestRoot {
   readonly formatVersion: number;
+  /** Stable across ordinary publications; changes on EVERY replacement. Never from the archive. */
+  readonly databaseId: bigint;
   /** Strictly increasing per publish. */
   readonly sequence: number;
   /** Epoch of the owner that published it (diagnostic; fencing is the store's). */

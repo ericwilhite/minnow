@@ -149,6 +149,7 @@ function peer(
     if (message.t === "hello")
       ports.port1.postMessage({
         t: "welcome",
+        databaseId: 1n,
         protocol: PROTOCOL_VERSION,
         ownerId: "fixture",
         epoch: 1,

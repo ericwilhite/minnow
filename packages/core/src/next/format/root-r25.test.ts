@@ -83,6 +83,7 @@ async function seed(store: StorageBackend, corrupt = false, old = false) {
     await session.writeData(16384, catalogIndex);
     const root: ManifestRoot = {
       formatVersion: MANIFEST_FORMAT_VERSION,
+      databaseId: 1n,
       fts: { checkpoint: null, staged: null },
       sequence: 1,
       epoch: lease.epoch,
