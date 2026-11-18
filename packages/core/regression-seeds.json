@@ -77,6 +77,7 @@
     "next-live-errors": [8828, 8829],
     "next-live-lifecycle": [8830, 8831],
     "next-live-close": [8832, 8833],
-    "next-live-admission-close": [8866, 8867]
+    "next-live-admission-close": [8866, 8867],
+    "next-live-row-backing": [8870, 8871]
   }
 }

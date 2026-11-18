@@ -10794,3 +10794,15 @@ export const LIVE_ADMISSION_CLOSE_REACH = [
   "runtime",
   "zero charges",
 ] as const;
+
+export const LIVE_BACKING_REACH = [
+  "bytes",
+  "words",
+  "data",
+  "buffer",
+  "refused before clone",
+  "whole backing charged",
+  "previous row charged",
+  "old diff released",
+  "zero charges",
+] as const;

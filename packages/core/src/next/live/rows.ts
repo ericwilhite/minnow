@@ -92,7 +92,9 @@ function bytesOf(value: unknown): number {
   if (typeof value === "string") return stringBytes(value);
   if (typeof value === "bigint") return bigintBytes(value);
   if (value === null || typeof value !== "object") return 16;
-  if (ArrayBuffer.isView(value)) return 128 + value.byteLength;
+  if (value instanceof ArrayBuffer) return 128 + value.byteLength;
+  // structuredClone retains the whole backing store, even for a one-byte view.
+  if (ArrayBuffer.isView(value)) return 128 + value.buffer.byteLength;
   let bytes = 128;
   for (const key of Object.keys(value))
     bytes += stringBytes(key) + bytesOf(Reflect.get(value, key));
