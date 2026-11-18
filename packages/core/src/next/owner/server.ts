@@ -447,7 +447,9 @@ class Connection {
       if (this.#running.get(seq)?.run?.reachedCommit !== true)
         stream.results.cancel(new SessionLostError("result", seq));
     }
-    this.#prepared.clear();
+    // Every old connection ends after restore, even if it fails. Retire the cache through
+    // its public contract now; concrete cache-only methods cannot be required of an owner.
+    this.#prepared.close();
     for (const slot of this.#sessions.values()) {
       this.#endGeneration(slot);
       if (!slot.busy) this.#closeSession(slot);

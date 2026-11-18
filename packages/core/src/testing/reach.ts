@@ -10776,6 +10776,8 @@ export const SNAPSHOT_TRANSPORT_REACH = [
 ] as const;
 
 export const SNAPSHOT_OWNER_INFLIGHT_REACH = [
+  "contract-only prepared cache closed",
+  "concrete prepared cache closed",
   "OPFS",
   "IndexedDB",
   "writer slot blocked",

@@ -113,8 +113,6 @@ export interface ExportStream {
 }
 
 export interface ClientResult {
-  /** Structured-clone administration reply; absent for SQL results. */
-  readonly value?: unknown;
   readonly columns: readonly WireColumnMeta[];
   readonly frames: readonly FramePayload[];
   readonly summary: StatementSummary;
