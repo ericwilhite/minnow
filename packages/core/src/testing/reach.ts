@@ -2909,6 +2909,7 @@ export const WRITE_PRIVATE_MINIMUM_STATES = [
   "complete current snapshot",
   "durable reopen",
   "all credit returned",
+  "declared metadata window after reclaim",
 ] as const;
 
 /** An admitted writer funds one bounded step without taking another execution's minimum. */
@@ -10636,11 +10637,18 @@ export const NATIVE_WRITE_PRESSURE_REACH = [
   "one funded root list through reopen",
   "idle row credit reclaimed",
   "competing reader owns real bytes",
-  "admission after provisional unwind",
+  "admission after provisional settlement",
   "six 1 MiB native commits",
   "exact durable rows",
   "32 MiB peak",
   "zero final charge",
+] as const;
+
+export const NATIVE_WRITE_SETTLEMENT_REACH = [
+  "published settled",
+  "aborted settled",
+  "unsettled rejected",
+  "owned bytes rejected",
 ] as const;
 
 export const NATIVE_WRITE_OPTIONAL_REACH = [

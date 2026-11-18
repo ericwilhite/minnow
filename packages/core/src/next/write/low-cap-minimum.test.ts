@@ -20,9 +20,14 @@ import {
 
 const MiB = 1048576;
 const reach = createReach("prepaid write progress", WRITE_PRIVATE_MINIMUM_STATES);
-for (const backend of ["memory", "indexeddb"] as const)
+for (const [backend, reclaimed] of [
+  ["memory", false],
+  ["indexeddb", false],
+  ["memory", true],
+  ["indexeddb", true],
+] as const)
   for (const seed of seedsFor("next-write-private-minimum", [0xb3f1]))
-    it(`makes merge progress inside prepaid credit over ${backend} (seed ${String(seed)})`, async () => {
+    it(`makes merge progress inside prepaid credit over ${backend}${reclaimed ? " after forecast reclamation" : ""} (seed ${String(seed)})`, async () => {
       await fc.assert(
         fc.asyncProperty(
           fc.record({
@@ -57,6 +62,7 @@ for (const backend of ["memory", "indexeddb"] as const)
               buffer: Uint8Array | undefined,
               blocked = 0;
             const blockedAt: string[] = [];
+            let reclaimMetadata: (() => unknown) | undefined;
             const release = () => {
               if (!holder) return;
               expect(buffer?.[0]).toBe(7);
@@ -93,12 +99,17 @@ for (const backend of ["memory", "indexeddb"] as const)
             };
             const watchMetadata = (grant: Grant) => {
               if (grant.label === "write path metadata") {
+                const register = grant.onReclaimRequest.bind(grant);
+                grant.onReclaimRequest = (callback) => {
+                  reclaimMetadata = () => callback(Number.MAX_SAFE_INTEGER);
+                  register(callback);
+                };
                 const grow = grant.tryGrow.bind(grant);
                 grant.tryGrow = (bytes) => {
                   const ok = grow(bytes);
                   if (!ok && holder) {
                     blocked++;
-                    blockedAt.push("denied metadata growth");
+                    blockedAt.push(`denied metadata growth (${new Error().stack ?? "no stack"})`);
                     release();
                   }
                   return ok;
@@ -134,6 +145,12 @@ for (const backend of ["memory", "indexeddb"] as const)
               }
               expect(path.maintenance.flushes).toBeGreaterThanOrEqual(s.fanIn);
               reach.reach("merge debt prepared");
+              if (reclaimed) {
+                if (!reclaimMetadata)
+                  throw new Error("Native metadata reclaim hook was not installed");
+                await reclaimMetadata();
+                reach.reach("declared metadata window after reclaim");
+              }
               const free = governor.capBytes - governor.reserveBytes - governor.usedBytes;
               expect(free).toBeGreaterThan(0);
               holder = await governor.admit({
@@ -181,7 +198,15 @@ for (const backend of ["memory", "indexeddb"] as const)
             reach.reach("all credit returned");
           },
         ),
-        { seed, numRuns: 40 },
+        {
+          seed,
+          // Explicit examples consume iterations; keep every original 40 seeded draw.
+          numRuns: 42,
+          examples: [
+            [{ cap: 64, rows: 11, fanIn: 3, cycles: 8 }],
+            [{ cap: 32, rows: 4, fanIn: 2, cycles: 5 }],
+          ],
+        },
       );
     }, 120000);
 
