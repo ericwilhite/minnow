@@ -28,6 +28,11 @@ interface Suite {
 /** Every suite whose corpus is generated from a seed. A suite with a fixed corpus gains nothing here. */
 const SUITES: Suite[] = [
   {
+    name: "next-live-effect-integration",
+    file: "packages/core/src/next/write/changes-integration.test.ts",
+  },
+  { name: "next-live-dispatch", file: "packages/core/src/next/write/changes-deferred.test.ts" },
+  {
     name: "next-live-observer-reentry",
     file: "packages/core/src/next/write/changes-reentrancy.test.ts",
   },

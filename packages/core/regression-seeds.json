@@ -57,6 +57,8 @@
     "record-json-properties": [],
     "temp-owner-lifecycle": [],
     "differential-harness": [],
-    "next-live-observer-reentry": [8860, 8861]
+    "next-live-observer-reentry": [8860, 8861],
+    "next-live-dispatch": [8862, 8863],
+    "next-live-effect-integration": [8864, 8865]
   }
 }

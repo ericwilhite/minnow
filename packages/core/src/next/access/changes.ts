@@ -36,7 +36,8 @@ export interface CommittedChange {
   readonly unknown: boolean;
 }
 
-export const CHANGE_FEED_BYTES = 8192;
+// Includes two extra fixed frontiers/events and the single deferred dispatch task.
+export const CHANGE_FEED_BYTES = 12288;
 export const CHANGE_LISTENER_BYTES = 1024;
 export const CHANGE_TABLE_LIMIT = 64;
 
@@ -58,6 +59,55 @@ export class ChangeFeed {
     catalog: false,
     replacement: false,
     unknown: false,
+  };
+  readonly #queuedTables: number[] = [];
+  readonly #dispatchTables: number[] = [];
+  readonly #queued = {
+    lsn: 0,
+    previousLsn: 0,
+    tables: this.#queuedTables,
+    tableCount: 0,
+    catalog: false,
+    replacement: false,
+    unknown: false,
+  };
+  readonly #dispatch = {
+    lsn: 0,
+    previousLsn: 0,
+    tables: this.#dispatchTables,
+    tableCount: 0,
+    catalog: false,
+    replacement: false,
+    unknown: false,
+  };
+  #queuedPublication = false;
+  #dispatching = false;
+  #timer: ReturnType<typeof setTimeout> | null = null;
+  readonly #deliver = () => {
+    this.#timer = null;
+    if (this.#closed || !this.#queuedPublication) return;
+    this.#copy(this.#queued, this.#dispatch);
+    this.#queuedPublication = false;
+    this.#dispatching = true;
+    // New registrations cannot join this borrowed event, including replacement callbacks.
+    const through = this.#observerEpoch;
+    try {
+      for (const cell of this.#listeners) {
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- a preceding observer can close the feed reentrantly.
+        if (cell.epoch > through || this.#closed) break;
+        try {
+          cell.listener(this.#dispatch);
+        } catch {
+          /* Consumer-owned error. */
+        }
+      }
+    } finally {
+      this.#dispatching = false;
+      // A reentrant close leaves this borrowed dispatch storage funded until callout returns.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- consumer callout can close the feed.
+      if (this.#closed) this.budget.free(CHANGE_FEED_BYTES);
+      else this.#schedule();
+    }
   };
   readonly #history: Array<RekeyEffect | null> = Array.from(
     { length: REKEY_HISTORY_LIMIT },
@@ -88,7 +138,11 @@ export class ChangeFeed {
     this.#event.previousLsn = lsn;
     this.#floor = lsn;
     // Preallocate array capacity before publication, including its maximum backing storage.
-    for (let i = 0; i < CHANGE_TABLE_LIMIT; i++) this.#tables.push(0);
+    for (let i = 0; i < CHANGE_TABLE_LIMIT; i++) {
+      this.#tables.push(0);
+      this.#queuedTables.push(0);
+      this.#dispatchTables.push(0);
+    }
     this.#event.tableCount = 0;
   }
   /** Compare with the last consumed LSN. A mismatch without its event means globally dirty. */
@@ -232,19 +286,59 @@ export class ChangeFeed {
     this.#pending[this.#pendingCount++] = effect;
     this.#pendingBytes += effect.bytes;
   }
-  /** Called after native installation; a listener cannot change the commit's outcome. */
+  #copy(
+    from: CommittedChange,
+    into: {
+      lsn: number;
+      previousLsn: number;
+      tables: number[];
+      tableCount: number;
+      catalog: boolean;
+      replacement: boolean;
+      unknown: boolean;
+    },
+  ): void {
+    into.lsn = from.lsn;
+    into.previousLsn = from.previousLsn;
+    into.tableCount = from.tableCount;
+    into.catalog = from.catalog;
+    into.replacement = from.replacement;
+    into.unknown = from.unknown;
+    for (let i = 0; i < from.tableCount; i++) into.tables[i] = from.tables[i] ?? 0;
+  }
+  #schedule(): void {
+    if (this.#closed || !this.#queuedPublication || this.#timer !== null || this.#dispatching)
+      return;
+    // A scheduling failure cannot cross the outcome boundary. probe() still recovers it.
+    try {
+      this.#timer = setTimeout(this.#deliver, 0);
+    } catch {
+      /* Poll recovers the hint. */
+    }
+  }
+  /** After bookkeeping and writer release. One funded task coalesces any publication burst. */
   notify(): void {
-    // An epoch frontier needs no listener-sized dispatch array. New registrations append
-    // beyond it, even when a callback removes itself or other eligible registrations.
-    const through = this.#observerEpoch;
-    for (const listener of this.#listeners) {
-      if (listener.epoch > through) break;
-      try {
-        listener.listener(this.#event);
-      } catch {
-        /* Observer errors belong to its consumer. */
+    if (this.#closed) return;
+    if (!this.#queuedPublication) this.#copy(this.#event, this.#queued);
+    else {
+      const into = this.#queued,
+        from = this.#event;
+      into.lsn = from.lsn;
+      into.catalog ||= from.catalog;
+      into.replacement ||= from.replacement;
+      into.unknown ||= from.unknown;
+      for (let i = 0; i < from.tableCount; i++) {
+        const id = from.tables[i] ?? 0;
+        let found = false;
+        for (let j = 0; j < into.tableCount; j++) if (into.tables[j] === id) found = true;
+        if (!found) {
+          if (into.tableCount === CHANGE_TABLE_LIMIT) into.unknown = true;
+          else into.tables[into.tableCount++] = id;
+        }
       }
     }
+    this.#queuedPublication = true;
+    this.#schedule();
   }
   /** Offline replacement owners call after their single root publication has succeeded. */
   replace(lsn: number): void {
@@ -262,9 +356,13 @@ export class ChangeFeed {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    if (this.#timer !== null) clearTimeout(this.#timer);
+    this.#timer = null;
+    this.#queuedPublication = false;
     this.#dropPending();
     this.#dropHistory();
-    this.budget.free(CHANGE_FEED_BYTES + CHANGE_LISTENER_BYTES * this.#listeners.size);
+    this.budget.free(CHANGE_LISTENER_BYTES * this.#listeners.size);
+    if (!this.#dispatching) this.budget.free(CHANGE_FEED_BYTES);
     this.#listeners.clear();
     this.#event.tableCount = 0;
   }

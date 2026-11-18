@@ -10669,3 +10669,21 @@ export const LIVE_OBSERVER_REENTRY_REACH = [
   "bounded replacement chain",
   "zero charges",
 ] as const;
+
+export const LIVE_DISPATCH_REACH = [
+  "writer released",
+  "response available",
+  "bounded coalescing",
+  "uncommitted excluded",
+  "borrow stable during callout",
+  "zero charges",
+] as const;
+
+export const LIVE_EFFECT_INTEGRATION_REACH = [
+  "RI",
+  "trigger body",
+  "partial statement",
+  "migration",
+  "snapshot load",
+  "zero charges",
+] as const;

@@ -13,6 +13,7 @@ import {
 } from "./test-support.js";
 
 import { createReach, LIVE_PUBLICATION_REACH } from "../../testing/reach.js";
+const turn = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 const reach = createReach("next-live-publication", LIVE_PUBLICATION_REACH);
 afterAll(() => reach.assertReached());
 
@@ -42,6 +43,7 @@ describe("native committed changes", () => {
             if (table.id === null) throw new Error("Table ID missing");
             ids.push(table.id);
           });
+          await turn();
           expect(events.at(-1)?.catalog).toBe(true);
           reach.reach("catalog publication");
         }
@@ -67,6 +69,7 @@ describe("native committed changes", () => {
           } else {
             const receipt = await tx.commit(null);
             await receipt.durable;
+            await turn();
             expect(events).toHaveLength(count + 1);
             expect(events.at(-1)).toEqual({ lsn: receipt.lsn, tables: [kept], catalog: false });
             expect(feed.probe()).toBe(receipt.lsn);
@@ -83,7 +86,7 @@ describe("native committed changes", () => {
       reach.reach("zero charges");
     });
   }
-  it("bounds summaries, catches missed notifications and marks replacement distinctly", () => {
+  it("bounds summaries, catches missed notifications and marks replacement distinctly", async () => {
     let bytes = 0;
     const feed = ChangeFeed.create(
       {
@@ -113,7 +116,9 @@ describe("native committed changes", () => {
       lineage.push([e.previousLsn, e.lsn]);
     });
     feed.notify();
+    await turn();
     feed.replace(11);
+    await turn();
     expect(replacement).toBe(true);
     expect(lineage).toEqual([
       [0, 10],

@@ -3027,7 +3027,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
       }
     }
     this.#changes?.install(tx, lsn);
-    this.#changes?.notify();
     this.#afterAppend();
     this.#lastCommitAt = performance.now();
     const receipt = new Receipt(lsn, this.#appender);
@@ -3044,6 +3043,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       else record();
     }
     this.release(tx);
+    this.#changes?.notify();
     return receipt;
   }
 
