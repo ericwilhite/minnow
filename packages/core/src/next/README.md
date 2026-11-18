@@ -4762,3 +4762,23 @@ must supply that complete admitted work; this helper is not an execution minimum
 and SQL dispatch still keep their guards. Generated PG traces/errors, an actual compiled follow
 observer, foreign-scope/cancellation fences and competing-credit64MiB roots exercise the assembler.
 The initial SUM observer probe hit the existing initPlan refusal; no initPlan capability was added.
+
+### Native write-owner funding boundary
+
+`StatementImpl.prepareNativeStep(rootBytes, signal, { includesProgress? })` stabilizes
+native storage before the caller funds its next complete root step. The invalidatable
+boundary reports protected row credit, metadata/publication headroom, commit buffers,
+active/permanent merge credit and non-evictable extent storage once. It returns idle
+forecasts and stages eligible rows first. Temporary reader/result pressure waits with
+cancellation; an intrinsic compound minimum above the selected capacity fails with 53200.
+Ordinary funding preserves the governor reserve. Only an already-proven complete private
+progress step may use the existing whole-cap mode.
+
+Keep no image, producer borrow or progress loan across preparation or fresh admission.
+Include retained preparation/rules/parameters and all simultaneous next-step maxima in
+`rootBytes`; exclude the native floor already reported by the boundary. Protect rule and
+image workspace separately. Combine `invalidated` with cancellation only while funding,
+check before admission and allocation, and retire provisional funding before retrying a
+changed boundary. Never replay SQL. Release the boundary before execution/statement end;
+use the command's cancellation signal for execution. This internal API does not enable SQL
+triggers or change the released API or stored format.

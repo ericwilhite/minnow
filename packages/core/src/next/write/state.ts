@@ -105,15 +105,19 @@ export class ReaderRegistry {
   /** Re-point holds (a pin and retained deltas), each waiting for every reader older than `before`. */
   readonly #pins: Array<{ readonly before: number; readonly release: () => void }> = [];
 
+  constructor(readonly changed?: () => void) {}
+
   open(): number {
     const id = this.#next++;
     this.#live.add(id);
+    this.changed?.();
     return id;
   }
 
   close(id: number): void {
     if (!this.#live.delete(id)) return;
     this.#drain();
+    this.changed?.();
   }
 
   get count(): number {

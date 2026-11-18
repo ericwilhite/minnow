@@ -36,6 +36,52 @@ export class WriteCredits {
   #rowFloor = 0;
   #rowStep = 0;
   #nextRowStep = 0;
+  #changed: ((growth?: boolean) => void) | null = null;
+
+  /** One write-owner controller, not a listener or account per row. */
+  onNativeStepChange(changed: ((growth?: boolean) => void) | null): void {
+    this.#changed = changed;
+  }
+
+  /** Potential next safe step. Its metadata headroom must be funded before publication
+   * as a boundary; a provisional publication can temporarily make it exceed holdings.
+   * The active merge and its remaining prepaid credit form ONE working minimum. */
+  protectedBytes(
+    mergeMinimum = this.minimum.merge,
+    metadataHeadroom = this.#metadataHeadroom,
+  ): number {
+    const active = this.#mergeActive?.held ?? 0;
+    return (
+      Math.max(this.minimum.rows, this.rows.allocated + this.rows.loaned, this.#rowFloor) +
+      this.metadata.allocated +
+      Math.max(this.metadata.loaned, metadataHeadroom) +
+      this.commits.held +
+      Math.max(this.minimum.merge, mergeMinimum, active + this.merge.allocated + this.merge.loaned)
+    );
+  }
+
+  get hasLoans(): boolean {
+    return !!(
+      this.rows.loaned ||
+      this.metadata.loaned ||
+      this.commits.loaned ||
+      this.merge.loaned ||
+      this.#mergeActive?.loaned
+    );
+  }
+  get hasActiveMerge(): boolean {
+    return this.#mergeActive !== null;
+  }
+
+  /** Return high-water estimates without using a live primary or merge's progress. */
+  reclaimNativeStep(mergeMinimum = this.minimum.merge): void {
+    this.reclaimRows();
+    this.reclaimMetadata();
+    releaseIdle(
+      this.merge,
+      Math.max(0, Math.max(this.minimum.merge, mergeMinimum) - (this.#mergeActive?.held ?? 0)),
+    );
+  }
 
   private constructor(
     readonly governor: MemoryGovernor,
@@ -87,7 +133,9 @@ export class WriteCredits {
 
   /** Return idle estimates only; live buffers, public loans and the row working minimum stay. */
   reclaimRows(): number {
-    return releaseIdle(this.rows, Math.max(this.minimum.rows, this.#rowFloor));
+    const released = releaseIdle(this.rows, Math.max(this.minimum.rows, this.#rowFloor));
+    if (released) this.#changed?.();
+    return released;
   }
 
   /** Protect already admitted writer progress BEFORE opening the root's image lease.
@@ -109,6 +157,7 @@ export class WriteCredits {
     const id = ++this.#nextRowStep;
     this.#rowStep = id;
     this.#rowFloor = this.rows.allocated + this.rows.loaned + bytes;
+    this.#changed?.();
     let released = false;
     return {
       check: () => {
@@ -120,19 +169,34 @@ export class WriteCredits {
         released = true;
         this.#rowStep = this.#rowFloor = 0;
         this.rows.free(WRITE_ROW_STEP_BYTES);
+        this.#changed?.();
       },
     };
   }
 
   /** Keep the next metadata step prepaid in addition to actual native live allocations. */
-  prepareMetadata(bytes: number, signal?: AbortSignal): MaybePromise<void> {
+  prepareMetadata(
+    bytes: number,
+    signal?: AbortSignal,
+    includesProgress = false,
+  ): MaybePromise<void> {
+    const changed = this.#metadataHeadroom !== bytes;
     this.#metadataHeadroom = bytes;
+    if (changed) this.#changed?.();
     const wanted = this.metadata.allocated + bytes;
-    return this.metadata.held >= wanted ? undefined : this.growTo(this.metadata, wanted, signal);
+    return this.metadata.held >= wanted
+      ? undefined
+      : this.growTo(this.metadata, wanted, signal, includesProgress);
+  }
+
+  get metadataReady(): boolean {
+    return this.metadata.held >= this.metadata.allocated + this.#metadataHeadroom;
   }
 
   reclaimMetadata(): number {
-    return releaseIdle(this.metadata, this.metadata.allocated + this.#metadataHeadroom);
+    const released = releaseIdle(this.metadata, this.metadata.allocated + this.#metadataHeadroom);
+    if (released) this.#changed?.();
+    return released;
   }
 
   /** Cancelled provisional work can lower its forecast without attempting fresh admission.
@@ -143,7 +207,12 @@ export class WriteCredits {
   }
 
   /** Fund a larger bounded step before it creates inputs or provisional publication state. */
-  async growTo(grant: Grant, wanted: number, signal?: AbortSignal): Promise<void> {
+  async growTo(
+    grant: Grant,
+    wanted: number,
+    signal?: AbortSignal,
+    includesProgress = false,
+  ): Promise<void> {
     const stop =
       signal === undefined ? this.#stop.signal : AbortSignal.any([signal, this.#stop.signal]);
     for (;;) {
@@ -151,13 +220,21 @@ export class WriteCredits {
       stop.throwIfAborted();
       const missing = wanted - grant.held;
       if (missing <= 0) return;
+      // A root waiting on fresh admission must unwind before native growth queues
+      // behind it. Credit transfers below remain within this one write owner.
+      this.#changed?.();
       const idle =
         this.rows.held -
         Math.max(this.minimum.rows, this.rows.allocated + this.rows.loaned, this.#rowFloor);
       const moved = grant === this.rows ? 0 : Math.min(missing, Math.max(0, idle));
       if (moved > 0 && !this.governor.transferCredit(this.rows, grant, moved))
         throw new Error("Idle write credit was not transferred");
-      if (grant.held >= wanted || grant.tryGrow(wanted - grant.held)) return;
+      if (grant.held >= wanted) return;
+      if (grant.tryGrow(wanted - grant.held)) {
+        this.#changed?.(true);
+        return;
+      }
+      this.#changed?.(true);
       // Admission asks spillable holders to reclaim. Surrender our target's idle
       // credit first and request the whole remaining deficit: otherwise that request
       // can be funded by reclaiming this same account, transferred back, and repeated
@@ -169,10 +246,14 @@ export class WriteCredits {
       if (deficit <= 0) continue;
       const [credit] = await this.governor.admitGroup({
         label: `grow ${grant.label}`,
+        includesProgress,
         grants: [
           {
             label: "write growth credit",
-            minimumBytes: Math.min(deficit, this.governor.capBytes - this.governor.reserveBytes),
+            minimumBytes: Math.min(
+              deficit,
+              this.governor.capBytes - (includesProgress ? 0 : this.governor.reserveBytes),
+            ),
             spillable: false,
           },
         ],
@@ -226,6 +307,7 @@ export class WriteCredits {
         throw new Error("Prepaid merge credit did not fund the step");
       this.#mergeActive = grant;
       this.reclaimRows();
+      this.#changed?.();
       return grant;
     } catch (error) {
       const idle = grant.held - grant.allocated - grant.loaned;
@@ -246,6 +328,7 @@ export class WriteCredits {
     // A completed step cannot keep an oversized future forecast while another
     // complete execution waits. The next merge prepares its full step anew.
     releaseIdle(this.merge, this.minimum.merge);
+    this.#changed?.();
   }
 
   cancel(reason: unknown): void {
@@ -258,6 +341,7 @@ export class WriteCredits {
     if (this.#mergeActive || this.#rowStep !== 0)
       throw new Error("Native write steps must settle before their accounts close");
     this.#closed = true;
+    this.#changed = null;
     this.cancel(new GrantClosedError("write owner minimum"));
     this.signal?.removeEventListener("abort", this.#abort);
     for (const grant of [this.metadata, this.commits, this.merge]) grant.close();

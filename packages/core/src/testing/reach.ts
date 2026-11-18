@@ -10637,3 +10637,46 @@ export const NATIVE_WRITE_GROWTH_REACH = [
   "net new credit completes",
   "zero final charge",
 ] as const;
+
+export const NATIVE_WRITE_STEP_REACH = [
+  "statement requires witness retirement",
+  "true compound size refusal",
+  "temporary pressure waits",
+  "native metadata invalidates funding",
+  "cancellable wait",
+  "owner close cancels funding",
+  "image cannot consume rule workspace",
+  "whole-cap private progress",
+  "ordinary capacity",
+  "32 MiB",
+  "64 MiB",
+  "all ownership retired",
+  "native footprint equals protected holdings",
+  "private native metadata progresses",
+  "ordinary native metadata waits",
+] as const;
+
+export const NATIVE_WRITE_STEP_BORROW_REACH = [
+  "foreign native chunk waits",
+  "cancel with borrower still live",
+  "borrow release sufficient before snapshot close",
+  "32 MiB",
+  "64 MiB",
+  "all ownership retired",
+  "own locator pin is not foreign pressure",
+  "foreign query pin before owner",
+  "foreign query pin after owner",
+] as const;
+
+export const NATIVE_WRITE_STEP_CREDIT_REACH = [
+  "control charged before retention",
+  "primary floor survives reclaim",
+  "metadata and commit buffers once",
+  "active merge once",
+  "future merge forecast reclaimed",
+  "stale witness rejected before allocation",
+  "fresh boundary after invalidation",
+  "zero ownership",
+  "decrease invalidates for reclaim",
+  "handoff changes restabilized",
+] as const;

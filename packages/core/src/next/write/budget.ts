@@ -51,6 +51,7 @@ export class MetadataBudget implements ByteBudget {
     readonly reclaimWriter: () => number,
     readonly capBytes: number,
     readonly grow?: (wanted: number) => Promise<void>,
+    readonly changed?: () => void,
   ) {}
 
   ordinarySource(): ByteBudget {
@@ -65,8 +66,14 @@ export class MetadataBudget implements ByteBudget {
 
   allocate(bytes: number): boolean {
     if (bytes > this.capBytes) throw new MetadataAllocationTooLargeError(bytes, this.capBytes);
-    if (this.grant.allocate(bytes)) return true;
-    if (this.reclaimWriter() > 0 && this.grant.allocate(bytes)) return true;
+    if (this.grant.allocate(bytes)) {
+      if (bytes) this.changed?.();
+      return true;
+    }
+    if (this.reclaimWriter() > 0 && this.grant.allocate(bytes)) {
+      if (bytes) this.changed?.();
+      return true;
+    }
     throw new MetadataPressure(bytes, this.grant.allocated + bytes);
   }
 
@@ -118,5 +125,6 @@ export class MetadataBudget implements ByteBudget {
 
   free(bytes: number): void {
     this.grant.free(bytes);
+    if (bytes) this.changed?.();
   }
 }

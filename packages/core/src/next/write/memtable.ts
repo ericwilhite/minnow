@@ -229,6 +229,7 @@ export class Memtable {
     readonly pool?: ArenaPool,
     /** Recovery memoization can retire before this memtable or its readers do. */
     copyColumns = false,
+    readonly pressureChanged?: () => void,
   ) {
     this.#counter = new Counter(charge, pool);
     if (copyColumns) {
@@ -282,6 +283,7 @@ export class Memtable {
     if (lent !== undefined) {
       for (const stored of lent) this.#releaseChunk(stored);
       this.#lent.delete(chunk);
+      this.pressureChanged?.();
     }
   }
 
