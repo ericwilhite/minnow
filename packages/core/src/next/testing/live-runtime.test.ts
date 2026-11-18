@@ -5,7 +5,7 @@ import { createReach, LIVE_RUNTIME_REACH } from "../../testing/reach.js";
 import type { ClientLiveHandle } from "../owner/client.js";
 import { decodeColumn } from "../write/columns.js";
 import { autocommit, batch, texts } from "../write/test-support.js";
-import { setup, until } from "./live-runtime.test-support.js";
+import { setup, until, publicationTurn } from "./live-runtime.test-support.js";
 
 const reach = createReach("next-live-runtime", LIVE_RUNTIME_REACH);
 afterAll(() => reach.assertReached());
@@ -298,6 +298,7 @@ describe("native live-query runtime and MessageChannel transport", () => {
               ? `UPDATE rejected SET id = ${String(next)}`
               : "INSERT INTO rejected VALUES (-1)",
           );
+          await publicationTurn();
           await until(idle);
           const expected = Number((await active.client.query(sql)).rows()[0]?.[0]);
           expect(
@@ -713,6 +714,7 @@ describe("native live-query runtime and MessageChannel transport", () => {
           `INSERT INTO missed VALUES ${Array.from({ length: added }, () => "(1)").join(",")}`,
         );
         await active.client.query("INSERT INTO other VALUES (1)");
+        await publicationTurn();
         await until(
           () =>
             runtime.stats.running === 0 && runtime.stats.dirty === 0 && runtime.stats.waiting === 0,

@@ -10817,3 +10817,18 @@ export const LIVE_IDENTITY_REACH = [
   "new identity insert",
   "zero charges",
 ] as const;
+
+export const LIVE_BINARY_VALUE_REACH = [
+  "buffer",
+  "bytes",
+  "words",
+  "data",
+  "equal",
+  "different",
+  "grow",
+  "shrink",
+  "updated patch",
+  "offset view",
+  "private copy",
+  "zero charges",
+] as const;

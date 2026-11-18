@@ -112,22 +112,23 @@ SQL LIMIT/OFFSET executes natively and `LiveRows.maxRows` rejects oversized deco
 Trigger/RI writers enter the same surviving undo stream. Full trigger firing qualification
 remains with the tracks enabling it; the FTS test here qualifies the native scan/fallback path.
 
-Run the focused evidence with:
+Run every live test, including transport, lifecycle and the main runtime/pressure campaign:
 
 ```sh
 npx vitest run packages/core/src/next/live \
-  packages/core/src/next/testing/live-runtime.test.ts \
-  packages/core/src/next/testing/live-runtime-errors.test.ts \
-  packages/core/src/next/testing/live-runtime-lifecycle.test.ts \
-  packages/core/src/next/testing/live-runtime-close.test.ts \
-  packages/core/src/next/testing/live-runtime-admission.test.ts \
-  packages/core/src/next/write/changes.test.ts \
-  packages/core/src/next/write/changes-reentrancy.test.ts \
-  packages/core/src/next/write/changes-deferred.test.ts \
-  packages/core/src/next/write/changes-integration.test.ts \
-  packages/core/src/next/testing/live-commit-oracle.test.ts \
-  packages/core/src/next/exec/result-retain.test.ts --maxWorkers=2
+  packages/core/src/next/testing/live-*.test.ts \
+  packages/core/src/next/write/changes*.test.ts \
+  packages/core/src/next/exec/result-retain.test.ts \
+  packages/core/src/next/exec/retirement.test.ts \
+  packages/core/src/testing/seeds.test.ts --maxWorkers=2
 ```
+
+Discover all `live/` and `testing/live-*.test.ts` files when assembling a programmatic command;
+never substitute a cached selection. The main runtime file owns the rejected-delivery and
+missed-notification reach as well as the pressure histories. Publication idle checks cross the
+deferred notification task first, retaining their original assertions and deadlines.
+Binary decoded values compare visible byte lengths and contents for raw ArrayBuffers, typed
+views and DataViews. Equal bytes preserve the snapshot; changed or resized bytes emit updates.
 
 Every generated history uses `seedsFor`; replay with `MINNOW_SEED`. Declared campaign reach lives
 in `testing/reach.ts`. The parent-API commit oracle fails on the parent, and mutants reject a

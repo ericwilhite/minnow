@@ -74,11 +74,22 @@ export function sameLiveValue(left: unknown, right: unknown): boolean {
     );
   if (left === null || right === null || typeof left !== "object" || typeof right !== "object")
     return false;
-  if (ArrayBuffer.isView(left) && ArrayBuffer.isView(right)) {
-    const a = new Uint8Array(left.buffer, left.byteOffset, left.byteLength);
-    const b = new Uint8Array(right.buffer, right.byteOffset, right.byteLength);
-    return a.length === b.length && a.every((value, i) => value === b[i]);
+  const leftBytes = left instanceof ArrayBuffer || ArrayBuffer.isView(left) ? left : null;
+  const rightBytes = right instanceof ArrayBuffer || ArrayBuffer.isView(right) ? right : null;
+  if (leftBytes !== null || rightBytes !== null) {
+    if (leftBytes === null || rightBytes === null) return false;
+    if (leftBytes.byteLength !== rightBytes.byteLength) return false;
+    const a =
+      leftBytes instanceof ArrayBuffer
+        ? new Uint8Array(leftBytes)
+        : new Uint8Array(leftBytes.buffer, leftBytes.byteOffset, leftBytes.byteLength);
+    const b =
+      rightBytes instanceof ArrayBuffer
+        ? new Uint8Array(rightBytes)
+        : new Uint8Array(rightBytes.buffer, rightBytes.byteOffset, rightBytes.byteLength);
+    return a.every((value, i) => value === b[i]);
   }
+
   const a = Object.keys(left),
     b = Object.keys(right);
   return (
