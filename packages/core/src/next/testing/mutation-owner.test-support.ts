@@ -54,11 +54,11 @@ export async function mutationOwner(
   const client = new ProtocolClient({ ...options, now: () => now });
   let annotateError: ((error: unknown) => void) | null = null;
   const openSession = engine.openSession.bind(engine);
-  engine.openSession = (...input) => {
-    const session = openSession(...input),
+  engine.openSession = (clientId, generation, sessionId) => {
+    const session = openSession(clientId, generation, sessionId),
       run = session.run.bind(session);
-    session.run = (...input) => {
-      const result = run(...input);
+    session.run = (statement, params, context) => {
+      const result = run(statement, params, context);
       if (!annotateError) return result;
       const poll = result.results.poll.bind(result.results),
         next = result.results.next.bind(result.results);
