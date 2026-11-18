@@ -30,6 +30,12 @@ including when releasing part of its reserved space fails. Idle maintenance can 
 those statistics without a reservation error. Released 0.x behavior is unchanged;
 no stored-format change or migration is required.
 
+The private 1.0 devtools binding reads canonical results, detached catalog descriptions and
+logical explain plans. Duplicate labels keep their column positions; exact integers, NUMERIC
+and microsecond timestamps retain their canonical values. Metadata stays charged until receipt.
+The released 0.x panel and public package entries are unchanged. Live devtools queries remain
+explicitly unbound. No stored-format change or migration is required.
+
 The shared parser now records each SELECT output's original label for the private 1.0
 engine, which follows PostgreSQL for duplicate labels (`SELECT 1 AS x, 2 AS x` returns two
 columns named `x`). The released 0.x engine keeps its numbered names (`x`, `x_2`) and its

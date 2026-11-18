@@ -4748,7 +4748,7 @@ Connection prepared handles use a bounded governor-charged cache, rather than ho
 outside its original cache's charge. Executions include the original SQL as an exact fallback
 for eviction or reconnection, under the same protocol sequence and ledger identity. Private-DDL
 preparation runs in its session and does not retain the private plan beyond that session cache.
-The unreleased protocol profile is 8 for these optional owner-side call guards/session binding;
+The unreleased protocol profile is 9 (inspection ops plus optional owner-side call guards/session binding);
 this changes no stored bytes or published package entry. Raw id-only execution requires a live
 cached handle; the internal facade always supplies fallback SQL.
 
