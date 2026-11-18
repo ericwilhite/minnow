@@ -5624,6 +5624,23 @@ export class WritePathImpl implements WritePath, EngineHooks {
     if (this.#rootSelectionBoundary !== null)
       await this.#rootSelectionBoundary("before", publication.kind);
     const globalLsn = this.#rootLsn(changed);
+    // Capture quiet-build coverage in the same synchronous observation as the catalog cut.
+    // Later rows may arrive during the awaits below: their index deltas stay in memtables/WAL
+    // after this cut, but cannot revoke its already-promised empty index/checkpoint. Rechecking
+    // live quietness later admitted a catalog index without its root (seed703).
+    const settled = new Map<number, number>();
+    for (const pending of this.#pendingIndexes.values()) {
+      const state = this.#tables.get(pending.tableId);
+      if (
+        state !== undefined &&
+        (pending.droppedAt === null || pending.droppedAt > globalLsn) &&
+        !changed.has(pending.tableId) &&
+        state.flushedThroughLsn < pending.lsn &&
+        pending.lsn <= globalLsn &&
+        quietTable(state)
+      )
+        settled.set(pending.tableId, Math.max(settled.get(pending.tableId) ?? 0, pending.lsn));
+    }
     if (this.#rootSelectionBoundary !== null)
       await this.#rootSelectionBoundary("after", publication.kind);
     let fts = this.#root.fts;
@@ -5709,22 +5726,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
     }
     const drained = [...this.#pendingRetire];
     if (drained.length > 0) retireOnce(retired, drained);
-    // A quiet table's index build has no entries: this root settles it (an empty index root and a
-    // checkpoint past the build), so the build stops holding the root's LSN back. Without this an
-    // index on a table that gets no rows held every later root (and log recycling) back for good.
-    const settled = new Map<number, number>();
-    for (const pending of this.#pendingIndexes.values()) {
-      const state = this.#tables.get(pending.tableId);
-      if (
-        state !== undefined &&
-        (pending.droppedAt === null || pending.droppedAt > globalLsn) &&
-        !changed.has(pending.tableId) &&
-        state.flushedThroughLsn < pending.lsn &&
-        pending.lsn <= globalLsn &&
-        quietTable(state)
-      )
-        settled.set(pending.tableId, Math.max(settled.get(pending.tableId) ?? 0, pending.lsn));
-    }
     const catalog = this.#catalogAt(globalLsn);
     for (const tableId of changed.keys())
       if (this.#catalog.table(tableId) !== undefined && catalog.table(tableId) === undefined)
@@ -5928,8 +5929,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
 /** `root` without the indexes `def` (the publication's catalog) no longer has. */
 /**
  * `root` with exactly the index roots `def` (the publishing root's catalog) has: dropped ones
- * leave. With `addBuilt`, an index the root lacks is added with no runs; only for a table with no
- * unpublished data (`quietTable`), whose index build therefore has no entries.
+ * leave. With `addBuilt`, an index the root lacks is added with no runs; only for a table quiet
+ * at the selected cut. Later rows retain their index deltas above that build checkpoint.
  */
 function withCatalogIndexes(root: TableRoot, def: TableDef, addBuilt = false): TableRoot {
   const ids = new Set(def.indexes.map((index) => index.id));
