@@ -25,6 +25,11 @@ no stored-format change or migration is required.
 The writer may finish a prepaid publication before waiting for the next phase's memory;
 published state keeps its owning charge, and provisional work must be fully settled first.
 
+After recovery finishes, the private writer returns its unused WAL scan reservation
+before accepting queries. Reopened databases keep their row workspace and live buffers
+funded without blocking a query behind completed recovery work. Released 0.x behavior is
+unchanged; no stored-format change or migration is required.
+
 The private 1.0 storage writer keeps space statistics exact while aborting a write,
 including when releasing part of its reserved space fails. Idle maintenance can read
 those statistics without a reservation error. Released 0.x behavior is unchanged;

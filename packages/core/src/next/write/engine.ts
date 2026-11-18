@@ -994,6 +994,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
       await engine.#recover();
       await engine.#validateRunLimits();
       engine.#recovering = false;
+      // scanLogIncremental has returned its buffer. Its open-only reservation
+      // cannot remain ahead of an independently admitted query after readiness.
+      credits.retireRowsMinimum(MINIMUM_BYTES - RECOVERY_SCAN_BYTES);
       if (input.deferInitialMaintenance !== true) engine.startInitialMaintenance();
       return engine;
     } catch (error) {

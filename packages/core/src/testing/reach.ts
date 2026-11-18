@@ -11351,3 +11351,28 @@ export const BIGINT_REPOINT_REACH = [
   "published memory handle",
   "zero charge",
 ] as const;
+
+export const WRITE_RECOVERY_CREDIT_REACH = [
+  "scan buffer owned through suspension",
+  "completed scan returned",
+  "small live rows",
+  "live rows above working floor",
+  "prepared row preserved",
+  "no prepared row",
+  "idle scan forecast returned",
+  "retirement idempotent",
+  "competing reader progresses",
+  "zero final charge",
+] as const;
+
+export const NATIVE_RECOVERY_CREDIT_REACH = [
+  "recovery read and working buffers coexist",
+  "recovery competitor owns real bytes",
+  "scan forecast retired before ready",
+  "query admitted without completed scan credit",
+  "32 MiB",
+  "64 MiB",
+  "exact reopened rows",
+  "continued native writes",
+  "zero final charge",
+] as const;

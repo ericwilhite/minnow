@@ -33,6 +33,7 @@ export class WriteCredits {
   #closed = false;
   #mergeActive: Grant | null = null;
   #metadataHeadroom = 0;
+  #rowMinimum: number;
   #rowFloor = 0;
   #rowStep = 0;
   #nextRowStep = 0;
@@ -96,6 +97,7 @@ export class WriteCredits {
     this.metadata = metadata;
     this.commits = commits;
     this.merge = merge;
+    this.#rowMinimum = minimum.rows;
     this.#abort = () => this.cancel(signal?.reason);
     signal?.addEventListener("abort", this.#abort, { once: true });
     if (signal?.aborted) this.#abort();
@@ -133,9 +135,17 @@ export class WriteCredits {
 
   /** Return idle estimates only; live buffers, public loans and the row working minimum stay. */
   reclaimRows(): number {
-    const released = releaseIdle(this.rows, Math.max(this.minimum.rows, this.#rowFloor));
+    const released = releaseIdle(this.rows, Math.max(this.#rowMinimum, this.#rowFloor));
     if (released) this.#changed?.();
     return released;
+  }
+
+  /** Retire completed recovery credit, preserving actual/loan/prepared ownership. */
+  retireRowsMinimum(bytes: number): number {
+    if (!Number.isSafeInteger(bytes) || bytes < 0)
+      throw new RangeError("Row working minimum must be a nonnegative safe integer");
+    this.#rowMinimum = Math.min(this.#rowMinimum, bytes);
+    return this.reclaimRows();
   }
 
   /** Protect already admitted writer progress BEFORE opening the root's image lease.
@@ -225,7 +235,7 @@ export class WriteCredits {
       this.#changed?.();
       const idle =
         this.rows.held -
-        Math.max(this.minimum.rows, this.rows.allocated + this.rows.loaned, this.#rowFloor);
+        Math.max(this.#rowMinimum, this.rows.allocated + this.rows.loaned, this.#rowFloor);
       const moved = grant === this.rows ? 0 : Math.min(missing, Math.max(0, idle));
       if (moved > 0 && !this.governor.transferCredit(this.rows, grant, moved))
         throw new Error("Idle write credit was not transferred");
@@ -294,7 +304,7 @@ export class WriteCredits {
       const idle = Math.max(
         0,
         this.rows.held -
-          Math.max(this.minimum.rows, this.rows.allocated + this.rows.loaned, this.#rowFloor),
+          Math.max(this.#rowMinimum, this.rows.allocated + this.rows.loaned, this.#rowFloor),
       );
       const returned = Math.min(bytes, idle);
       if (returned > 0) {

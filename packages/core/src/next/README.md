@@ -146,6 +146,14 @@ with real competing buffers, exact durable rows, and a zero final charge.
 keeps all 40 original generated scenarios per seed, and checks exact current/reopened rows over memory
 and IndexedDB. Its explicit examples include the coverage regression and its reduction.
 
+The initial row minimum also funds the WAL recovery scanner. After recovery and run
+validation have drained, the owner retires that scan-only forecast before announcing
+readiness. The four-MiB row working minimum, real allocations, outstanding loans and any
+prepared row step stay protected. Completed recovery must not retain unused credit ahead
+of a query's independently admitted minimum. `write/recovery-credit.test.ts` and
+`testing/native-recovery-credit.test.ts` generate in-flight reads with real competing
+buffers, prepared rows, exact reopen/continued writes and zero final charge.
+
 Extent-list preparation and `GroupWriter` page buffers use that metadata budget too:
 reclaimed idle row credit is never mistaken for prepaid publication workspace. Only the
 keeper's internal metadata-pressure request can reach the outer retry; genuine external
