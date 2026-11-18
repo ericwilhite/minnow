@@ -10826,6 +10826,8 @@ export const SNAPSHOT_OWNER_DRAIN_REACH = [
 ] as const;
 
 export const SNAPSHOT_TRANSPORT_ADMISSION_REACH = [
+  "at whole cap admitted",
+  "below whole cap admitted",
   "above cap refused",
   "wait retains nothing",
   "cancel pending admission",

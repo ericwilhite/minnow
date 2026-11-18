@@ -157,6 +157,7 @@ export class SnapshotConnection {
         ? [await this.operations.governor.admit({ ...transport, signal })]
         : await this.operations.governor.admitGroup({
             label: "portable snapshot export",
+            includesProgress: true,
             grants: [
               transport,
               { label: "portable export", minimumBytes: minimum, spillable: true },

@@ -4802,7 +4802,8 @@ The protocol server uses its snapshot operations automatically. Export pins one 
 view and captures sequence high-water synchronously. Streaming transfers at most one
 acknowledged 1 MiB dedicated chunk at a time; cached and borrowed page buffers never transfer.
 Native export work and transport are admitted as one complete minimum. A queued export holds
-neither grant; a minimum above normal capacity refuses with `MINNOW_MEMORY_ADMISSION`.
+neither grant; this includes private progress, so only a minimum above the whole cap refuses
+with `MINNOW_MEMORY_ADMISSION`.
 The byte-array convenience method collects the whole archive on the client; use streaming
 for large databases.
 

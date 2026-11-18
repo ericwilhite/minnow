@@ -27,6 +27,7 @@ for (const seed of seedsFor("next-snapshot-native-admission", [0xb2f5, 0xb2f6]))
               expect(
                 group.mock.calls.some(
                   ([options]) =>
+                    options.includesProgress === true &&
                     options.grants.some(
                       (g) => g.label === "portable export" && g.minimumBytes === 8 << 20,
                     ) &&

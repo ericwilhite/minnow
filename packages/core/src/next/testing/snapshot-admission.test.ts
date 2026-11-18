@@ -11,13 +11,21 @@ for (const seed of seedsFor("next-snapshot-transport-admission", [0xb2f3, 0xb2f4
     const reach = createReach("snapshot complete admission", SNAPSHOT_TRANSPORT_ADMISSION_REACH);
     await fc.assert(
       fc.asyncProperty(
-        fc.constantFrom("oversize", "release", "cancel"),
+        fc.constantFrom("exact", "below", "oversize", "release", "cancel"),
         fc.integer({ min: 1, max: 1024 }),
         async (mode, extra) => {
           reach.beginHistory();
-          const governor = new Governor((mode === "oversize" ? 10 : 32) << 20),
-            workBytes = (8 << 20) + extra,
+          const workBytes = (8 << 20) + extra,
             total = workBytes + (1 << 20) + 1024,
+            cap =
+              mode === "oversize"
+                ? total - extra
+                : mode === "exact"
+                  ? total
+                  : mode === "below"
+                    ? total + extra
+                    : 32 << 20,
+            governor = new Governor(cap),
             controller = new AbortController();
           let calls = 0,
             blocker: Grant | undefined;
@@ -52,14 +60,29 @@ for (const seed of seedsFor("next-snapshot-transport-admission", [0xb2f3, 0xb2f4
           const connection = new SnapshotConnection(operations);
           try {
             if (mode === "oversize") {
-              expect(total).toBeGreaterThan(governor.capBytes - governor.reserveBytes);
+              expect(total).toBeGreaterThan(governor.capBytes);
               await expect(
                 connection.command("snapshotExportOpen", [], controller.signal),
-              ).rejects.toMatchObject({ code: "MINNOW_MEMORY_ADMISSION", bytes: total });
+              ).rejects.toMatchObject({
+                code: "MINNOW_MEMORY_ADMISSION",
+                bytes: total,
+                capacity: cap,
+              });
               expect(calls).toBe(0);
               reach.reach("above cap refused");
+            } else if (mode === "exact" || mode === "below") {
+              expect(total).toBeGreaterThan(governor.capBytes - governor.reserveBytes);
+              expect(total).toBeLessThanOrEqual(governor.capBytes);
+              const id = await connection.command("snapshotExportOpen", [], controller.signal);
+              expect(
+                await connection.command("snapshotExportRead", [id as string], controller.signal),
+              ).toEqual(new Uint8Array([7, 9]));
+              expect(
+                await connection.command("snapshotExportRead", [id as string], controller.signal),
+              ).toBeNull();
+              reach.reach(mode === "exact" ? "at whole cap admitted" : "below whole cap admitted");
             } else {
-              const held = governor.capBytes - governor.reserveBytes - total + extra;
+              const held = governor.capBytes - total + extra;
               blocker = await governor.admit({
                 label: "other operation",
                 minimumBytes: held,
@@ -114,6 +137,8 @@ for (const seed of seedsFor("next-snapshot-transport-admission", [0xb2f3, 0xb2f4
         seed,
         numRuns: 9,
         examples: [
+          ["exact", 1],
+          ["below", 1024],
           ["oversize", 1],
           ["release", 1024],
           ["cancel", 1],
