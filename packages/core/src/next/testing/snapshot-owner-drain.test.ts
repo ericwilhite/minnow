@@ -59,9 +59,9 @@ for (const seed of seedsFor("next-snapshot-owner-drain", [0xb2f1, 0xb2f2]))
                   grant.close();
                 }
               };
-              operations.import = async (input, signal) => {
+              operations.import = async (input, signal, funding) => {
                 importStarted = true;
-                await nativeImport(input, signal);
+                await nativeImport(input, signal, funding);
               };
               let now = Date.now();
               if (mode === "abandon") {

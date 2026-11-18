@@ -37,11 +37,26 @@ for (const seed of seedsFor("next-snapshot-native-admission", [0xb2f5, 0xb2f6]))
               expect(
                 admit.mock.calls.filter(([options]) => options.label === "portable export"),
               ).toHaveLength(0);
+              await client.importSnapshot(archive);
+              expect(
+                group.mock.calls.some(
+                  ([options]) =>
+                    options.label === "portable snapshot import" &&
+                    options.includesProgress === true &&
+                    options.grants.reduce((n, g) => n + g.minimumBytes, 0) === 2165760,
+                ),
+              ).toBe(true);
+              expect(
+                group.mock.calls.filter(([options]) => options.label === "snapshot spool"),
+              ).toHaveLength(0);
+              reach.reach("native import complete group");
             } finally {
               admit.mockRestore();
               group.mockRestore();
             }
-            expect((await client.query("SELECT v FROM t")).rows()).toEqual([[value]]);
+            expect((await (await owner.current.connect()).query("SELECT v FROM t")).rows()).toEqual(
+              [[value]],
+            );
             reach.reach(kind);
             reach.reach("native complete group");
             reach.reach("no nested admission");

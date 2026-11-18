@@ -31,6 +31,7 @@ for (const seed of seedsFor("next-snapshot-transport-admission", [0xb2f3, 0xb2f4
             blocker: Grant | undefined;
           const operations: OwnerSnapshotOperations & { exportMinimumBytes: number } = {
             governor,
+            importGrants: [],
             exportMinimumBytes: workBytes,
             async export(sink, signal, budget?: Grant) {
               calls++;

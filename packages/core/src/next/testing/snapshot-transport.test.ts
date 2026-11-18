@@ -60,6 +60,7 @@ for (const seed of seedsFor("next-snapshot-transport", [0xb2e7, 0xb2e8]))
 
           const operations = {
             governor: h.governor,
+            importGrants: [],
             exportMinimumBytes: length + 64,
             async export(sink: SnapshotSink, signal: AbortSignal, grant: Grant) {
               signal.throwIfAborted();

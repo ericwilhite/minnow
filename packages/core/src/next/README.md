@@ -4827,3 +4827,8 @@ and foreign-key validation. Trigger, FTS, managed, CHECK, closed-set and unindex
 still refuse with `MINNOW_SNAPSHOT_SCOPE` and TODO markers; they are never dropped silently.
 Native sequence capture is tested through `SequenceAccess`: the current default real executor
 does not implement sequence function calls, independently of snapshot transport.
+
+Snapshot imports admit incoming transport and scratch-spool memory together. A queued import
+retains no partial transport grant. Replay admission includes the source handle and owner
+control memory that must survive retries; a combined minimum above the whole cap refuses
+with `MINNOW_MEMORY_ADMISSION`, rather than waiting for its own retained memory.

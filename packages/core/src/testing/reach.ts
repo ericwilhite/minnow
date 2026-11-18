@@ -10840,5 +10840,23 @@ export const SNAPSHOT_NATIVE_ADMISSION_REACH = [
   "OPFS",
   "IndexedDB",
   "native complete group",
+  "native import complete group",
   "no nested admission",
+] as const;
+
+export const SNAPSHOT_IMPORT_ADMISSION_REACH = [
+  "combined oversize refuses",
+  "wait holds nothing",
+  "cancel wait",
+  "release starts import",
+  "whole cap admits",
+  "all credit returned",
+] as const;
+
+export const SNAPSHOT_RETAINED_ADMISSION_REACH = [
+  "source",
+  "control",
+  "spool",
+  "typed combined refusal",
+  "zero final charges",
 ] as const;

@@ -11,8 +11,9 @@ import { SCRATCH_CONTROL_BYTES } from "../spill/scratch-ranges.js";
 import { WritePathImpl, type EngineInput } from "../write/engine.js";
 import { exportSnapshot } from "../write/snapshot-capture.js";
 import { loadSnapshot, validateSnapshotScope } from "../write/snapshot-load.js";
-import { spoolSnapshotInput } from "../write/snapshot-source.js";
+import { snapshotSpoolGrants, spoolSnapshotInput } from "../write/snapshot-source.js";
 import { SnapshotScopeError } from "../snapshot-errors.js";
+import { FIXED_CACHE_BYTES } from "../storage/page-cache.js";
 import { ChunkReader } from "../page/reader.js";
 import { composeEngine, type CatalogOwnerEngine } from "./compose.js";
 import type { StatementPlanner } from "./planner.js";
@@ -86,6 +87,7 @@ export async function openNativeOwnerEngine(
     governor,
     fatal: false,
     exportMinimumBytes: 8 << 20,
+    importGrants: snapshotSpoolGrants(SNAPSHOT_TRANSFER_BYTES),
     async export(sink, signal, grant) {
       if (path === undefined) throw new SnapshotScopeError("Native owner is not open");
       validateSnapshotScope(path.catalog);
@@ -98,7 +100,7 @@ export async function openNativeOwnerEngine(
         grant.free(80);
       }
     },
-    async import(source, signal) {
+    async import(source, signal, funding) {
       if (path === undefined || space === undefined || spill === undefined)
         throw new SnapshotScopeError("Native owner is not open");
       // Server has drained all sessions, pins and output pools. Close maintenance too.
@@ -119,7 +121,7 @@ export async function openNativeOwnerEngine(
             capacity: Math.floor(Number.MAX_SAFE_INTEGER / DATA_ALIGN) * DATA_ALIGN,
           },
           governor,
-          { signal, maxChunkBytes: SNAPSHOT_TRANSFER_BYTES },
+          { signal, maxChunkBytes: SNAPSHOT_TRANSFER_BYTES, funding: funding.work },
         );
         await loadSnapshot(
           archive,
@@ -135,7 +137,16 @@ export async function openNativeOwnerEngine(
             };
           },
           governor,
-          { signal, replace: true },
+          {
+            signal,
+            replace: true,
+            retainedBytes: () =>
+              funding.transport.held +
+              spillCredit.held +
+              (startup?.held ?? 0) +
+              (space?.stats.retainedBytes ?? 0) +
+              FIXED_CACHE_BYTES,
+          },
         );
       } catch (error) {
         failure = { error };

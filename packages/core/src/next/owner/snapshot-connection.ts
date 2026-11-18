@@ -3,12 +3,16 @@ export { SnapshotHandleError };
 /** Connection-scoped, bounded portable archive transport. Native storage is supplied by the
  * owner composition, never by the page. Handles cannot cross reconnects.
  */
-import type { MemoryGovernor, Grant } from "../memory/governor.js";
+import type { MemoryGovernor, Grant, NativeGrantGroupOptions } from "../memory/governor.js";
 import type { SnapshotSink } from "../format/snapshot.js";
 import { SnapshotScopeError } from "../snapshot-errors.js";
 import { SNAPSHOT_TRANSFER_BYTES, type SnapshotOp } from "./snapshot-api.js";
 import type { WireValue } from "./protocol.js";
 
+export interface SnapshotImportFunding {
+  readonly transport: Grant;
+  readonly work: readonly Grant[];
+}
 export interface OwnerSnapshotOperations {
   readonly governor: MemoryGovernor;
   /** Recovery failed: the server must step down rather than serve a stale path. */
@@ -21,7 +25,12 @@ export interface OwnerSnapshotOperations {
   /** Spool this one-shot producer, then use the replayable core loader with replace:true.
    * Settle/exclude ordinary writers and reopen ordinary recovery before resolving/rejecting.
    */
-  import(source: AsyncIterable<Uint8Array>, signal: AbortSignal): Promise<void>;
+  readonly importGrants: NativeGrantGroupOptions["grants"];
+  import(
+    source: AsyncIterable<Uint8Array>,
+    signal: AbortSignal,
+    funding: SnapshotImportFunding,
+  ): Promise<void>;
 }
 
 function deferred<T>() {
@@ -151,26 +160,31 @@ export class SnapshotConnection {
       minimumBytes: SNAPSHOT_TRANSFER_BYTES + 1024,
       spillable: false,
     };
-    const minimum = kind === "export" ? this.operations.exportMinimumBytes : undefined;
-    const [grant, work] =
-      minimum === undefined
-        ? [await this.operations.governor.admit({ ...transport, signal })]
-        : await this.operations.governor.admitGroup({
-            label: "portable snapshot export",
-            includesProgress: true,
-            grants: [
-              transport,
-              { label: "portable export", minimumBytes: minimum, spillable: true },
-            ],
-            signal,
-          });
+    const grants = await this.operations.governor.admitGroup({
+      label: `portable snapshot ${kind}`,
+      includesProgress: true,
+      grants: [
+        transport,
+        ...(kind === "export"
+          ? [
+              {
+                label: "portable export",
+                minimumBytes: this.operations.exportMinimumBytes,
+                spillable: true,
+              },
+            ]
+          : this.operations.importGrants),
+      ],
+      signal,
+    });
+    const [grant, work] = grants;
     if (grant === undefined) throw new Error("Missing snapshot transport admission");
     const abort = new AbortController(),
       id = crypto.randomUUID();
     const workSignal = AbortSignal.any([abort.signal, signal, this.#lifetime.signal]);
     if (!grant.allocate(SNAPSHOT_TRANSFER_BYTES + 1024)) {
       grant.close();
-      work?.close();
+      for (const part of grants.slice(1)) part.close();
       throw new SnapshotScopeError("Snapshot transport lost its admission");
     }
     let flow: Flow;
@@ -276,7 +290,10 @@ export class SnapshotConnection {
         },
       };
       const done = Promise.resolve().then(() =>
-        this.operations.import({ [Symbol.asyncIterator]: () => iterator }, workSignal),
+        this.operations.import({ [Symbol.asyncIterator]: () => iterator }, workSignal, {
+          transport: grant,
+          work: grants.slice(1),
+        }),
       );
       void done.catch((reason: unknown) => {
         flow.failure = { reason };
@@ -287,7 +304,7 @@ export class SnapshotConnection {
       void done
         .finally(() => {
           workSignal.removeEventListener("abort", aborted);
-          grant.close();
+          for (const part of grants) part.close();
         })
         .catch(() => undefined);
       flow = {

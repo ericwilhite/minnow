@@ -75,6 +75,9 @@ export interface SnapshotLoadTarget {
 }
 export interface SnapshotLoadOptions extends SnapshotWork {
   readonly replace?: boolean;
+  /** Caller-owned irreducible credit in this governor, outside the attempt. Excludes the
+   * source's retainedBytes. Read again after unwind: transport may have released payload. */
+  readonly retainedBytes?: () => number;
 }
 
 export function validateSnapshotScope(catalog: Catalog): void {
@@ -238,7 +241,20 @@ export async function loadSnapshot(
   let minimum = 1024;
   // O(1) scalar retry bookkeeping, included in the existing 512B attempt control charge.
   const prefix = new SnapshotSourcePrefix(input.byteLength);
+  const retainedBytes = () => {
+    const bytes = (input.retainedBytes?.(governor) ?? 0) + (options.retainedBytes?.() ?? 0);
+    if (!Number.isSafeInteger(bytes) || bytes < 0)
+      throw new TypeError("Invalid retained snapshot credit");
+    return bytes;
+  };
   for (;;) {
+    const retained = retainedBytes();
+    if (minimum + retained > governor.capBytes)
+      throw new MemoryAdmissionError(
+        "portable snapshot load",
+        minimum + retained,
+        governor.capBytes,
+      );
     const [grant] = await governor.admitGroup({
       label: "portable snapshot load",
       includesProgress: true,
@@ -283,11 +299,19 @@ export async function loadSnapshot(
       )
         throw error;
       const required = shortfall.required;
-      if (required > governor.capBytes)
-        throw new MemoryAdmissionError("portable snapshot load", required, governor.capBytes);
+      const retained = retainedBytes();
+      if (required + retained > governor.capBytes)
+        throw new MemoryAdmissionError(
+          "portable snapshot load",
+          required + retained,
+          governor.capBytes,
+        );
       // Round only inside the cap: rounding must not turn a fitting step into a 53200.
       const availableAfterUnwind = governor.capBytes - governor.usedBytes + grant.held;
-      minimum = Math.max(required, Math.min(availableAfterUnwind, minimum * 2));
+      minimum = Math.max(
+        required,
+        Math.min(governor.capBytes - retained, availableAfterUnwind, minimum * 2),
+      );
     } finally {
       try {
         await replay?.close();

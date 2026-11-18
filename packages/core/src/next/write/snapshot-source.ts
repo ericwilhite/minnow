@@ -7,7 +7,7 @@ import {
   SnapshotFormatError,
   type SnapshotWork,
 } from "../format/snapshot.js";
-import type { MemoryGovernor } from "../memory/governor.js";
+import type { MemoryGovernor, Grant, NativeGrantGroupOptions } from "../memory/governor.js";
 import { DATA_ALIGN, type ScratchSpace } from "../storage/contract.js";
 import type { ByteBudget } from "../storage/extents.js";
 import { snapshotInput } from "./snapshot-iterator.js";
@@ -83,6 +83,9 @@ export class SnapshotSourcePrefix {
 }
 export interface ReplayableSnapshotInput {
   readonly byteLength: number;
+  /** Irreducible source credit in this exact governor, retained across load attempts.
+   * Excludes caller control (SnapshotLoadOptions.retainedBytes), never evictable cache. */
+  retainedBytes?(governor: MemoryGovernor): number;
   /** Exact, immutable read. Settle before releasing destination ownership, including on abort.
    * At most destination.length additional scratch; the caller funds both before calling. */
   readInto(offset: number, destination: Uint8Array, signal: AbortSignal): Promise<void>;
@@ -193,6 +196,13 @@ export interface SnapshotSpoolRegion {
   readonly offset: number;
   readonly capacity: number;
 }
+/** Same named parts for owner-level atomic admission and standalone spooling. */
+export function snapshotSpoolGrants(maxChunkBytes: number): NativeGrantGroupOptions["grants"] {
+  return [
+    { label: "snapshot spool copy", minimumBytes: maxChunkBytes + 65536 + 1024, spillable: false },
+    { label: "snapshot spool source", minimumBytes: 1024, spillable: false },
+  ];
+}
 /** Owner edge only. It never truncates shared scratch or adds another core loader path.
  * The owner bounds producer chunks; their borrowed capacity is included in the complete step.
  * close() relinquishes the source after all core attempts/reads have settled. */
@@ -200,7 +210,11 @@ export async function spoolSnapshotInput(
   input: AsyncIterable<Uint8Array>,
   region: SnapshotSpoolRegion,
   governor: MemoryGovernor,
-  options: SnapshotWork & { readonly maxChunkBytes: number },
+  options: SnapshotWork & {
+    readonly maxChunkBytes: number;
+    /** Already admitted with incoming transport. Never admit while retaining that transport. */
+    readonly funding?: readonly Grant[];
+  },
 ): Promise<ReplayableSnapshotInput & { close(): Promise<void> }> {
   const { scratch, offset, capacity } = region,
     { maxChunkBytes, signal } = options;
@@ -217,15 +231,14 @@ export async function spoolSnapshotInput(
   )
     throw new TypeError("Invalid snapshot spool reservation");
   const bytes = maxChunkBytes + 65536 + 1024;
-  const [grant, sourceGrant] = await governor.admitGroup({
-    label: "snapshot spool",
-    includesProgress: true,
-    grants: [
-      { label: "snapshot spool copy", minimumBytes: bytes, spillable: false },
-      { label: "snapshot spool source", minimumBytes: 1024, spillable: false },
-    ],
-    ...(signal === undefined ? {} : { signal }),
-  });
+  const [grant, sourceGrant] =
+    options.funding ??
+    (await governor.admitGroup({
+      label: "snapshot spool",
+      includesProgress: true,
+      grants: snapshotSpoolGrants(maxChunkBytes),
+      ...(signal === undefined ? {} : { signal }),
+    }));
   if (grant === undefined || sourceGrant === undefined)
     throw new TypeError("Missing snapshot spool grant");
   if (!sourceGrant.allocate(1024)) throw new TypeError("Lost snapshot spool source admission");
@@ -283,6 +296,7 @@ export async function spoolSnapshotInput(
     signal?.throwIfAborted();
     return {
       byteLength: length,
+      retainedBytes: (owner) => (owner === governor ? sourceGrant.held : 0),
       async readInto(at, destination, readSignal) {
         readSignal.throwIfAborted();
         if (closed) throw new TypeError("Snapshot spool released");
