@@ -10585,3 +10585,55 @@ export const FOLLOW_NESTED_RECOVERY_REACH = [
   "published",
   "zero native charge",
 ] as const;
+
+export const WRITER_ABORT_STATS_REACH = [
+  "stats observed mid-abort",
+  "metadata await observed",
+  "release batch boundary",
+  "idle publish observed mid-abort",
+  "fragmented builder",
+  "spilled sealed inventory",
+  "failed ranges remain owned",
+  "partial release failure",
+  "successful abort audit",
+  "capture refuses aborting writer",
+  "zero final charge",
+] as const;
+
+export const NATIVE_WRITE_PRESSURE_REACH = [
+  "one funded root list through reopen",
+  "idle row credit reclaimed",
+  "competing reader owns real bytes",
+  "admission after provisional unwind",
+  "six 1 MiB native commits",
+  "exact durable rows",
+  "32 MiB peak",
+  "zero final charge",
+] as const;
+
+export const NATIVE_WRITE_OPTIONAL_REACH = [
+  "preferred size declined",
+  "cheaper path exact",
+  "no grant growth",
+  "zero final charge",
+] as const;
+
+export const NATIVE_ROOT_LIST_FUNDING_REACH = [
+  "pending funding preserved",
+  "standalone keeper stays funded",
+  "different identity refused",
+  "one root reservation",
+  "root survives keeper close",
+  "zero final charge",
+] as const;
+
+export const NATIVE_WRITE_GROWTH_REACH = [
+  "real competing buffers",
+  "complete deficit after surrender",
+  "task runs while growth waits",
+  "rows",
+  "metadata",
+  "cancellation without competitor release",
+  "net new credit completes",
+  "zero final charge",
+] as const;

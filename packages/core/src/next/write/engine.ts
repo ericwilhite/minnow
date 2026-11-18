@@ -1,3 +1,4 @@
+import { idleGarbageOverBound } from "./idle-garbage.js";
 import { StagedExtents, EMPTY_STAGED_EXTENTS } from "./staged-extents.js";
 import {
   captureWriterExtents,
@@ -139,7 +140,7 @@ import { CommandMaintenance, waitCommandMaintenance } from "./command-wait.js";
 import { WriteCredits, WRITE_ROW_STEP_BYTES, type PreparedWriteCredit } from "./credits.js";
 import { RunSink } from "./run-output.js";
 import { writeStepMinimum, type WriteStepMinimum } from "./minimum.js";
-import { MetadataBudget, releaseIdle } from "./budget.js";
+import { MetadataBudget, MetadataPressure, releaseIdle } from "./budget.js";
 import { GroupWriter } from "../page/writer.js";
 import type { StoreSession } from "../storage/contract.js";
 import { ExtentListKeeper, type ExtentList } from "../storage/extent-list.js";
@@ -839,7 +840,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       let catalog: Catalog;
       let lists: ExtentListKeeper;
       if (space.root === null) {
-        lists = new ExtentListKeeper([], { reader: space, budget: grant });
+        lists = new ExtentListKeeper([], { reader: space, budget: metadataBudget });
         catalog = Catalog.empty();
         const { writer, catalogRef } = await metadataBudget.retry(
           async () => {
@@ -919,7 +920,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         rootCharge = parsed.charge;
         root = parsed.value;
         // Built from the durable root's list, never from earlier callbacks (ruling R25).
-        lists = new ExtentListKeeper(root.extentList, { reader: space, budget: grant });
+        lists = new ExtentListKeeper(root.extentList, { reader: space, budget: metadataBudget });
         catalog = await metadataBudget.retry(
           async () => {
             const buffers = new CatalogBuffers(metadataBudget);
@@ -4587,8 +4588,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   #garbageOverBound(): boolean {
-    const stats = this.#space.stats;
-    return stats.waitingBytes > Math.max(this.#idleGarbageBytes, 0.05 * stats.dataBytes);
+    return idleGarbageOverBound(this.#space, this.#idleGarbageBytes);
   }
 
   /**
@@ -5165,7 +5165,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
       // A catalog-only ALTER never rewrites an older immutable memtable's physical schema.
       columns: memtable.columns.map((column) => ({ columnId: column.id, type: column.type })),
       writer,
-      charge: this.#grant,
+      // Page working buffers are metadata work, not a reclaimable row estimate.
+      // Their owner aborts the provisional writer before #metadataAsync can wait.
+      charge: this.#metadataBudget,
     });
     const chunks = Math.ceil(memtable.rowCount / MEMORY_CHUNK_ROWS);
     for (let chunk = 0; chunk < chunks; chunk++) {
@@ -6064,6 +6066,9 @@ class DeltaPublication {
         writer,
       });
     } catch (error) {
+      // Only our keeper's internal admission request may retry, outside the provisional
+      // writer and publication lock. A real external sink failure remains fatal below.
+      if (error instanceof MetadataPressure) throw error;
       throw new ExtentSinkError(error); // settle() aborts the attempt
     }
     this.#listPrepared = true;
@@ -6175,14 +6180,20 @@ class DeltaPublication {
     this.#attempt = null;
     if (attempt === null) return;
     const listPrepared = this.#listPrepared;
+    const preparedList = this.#preparedList;
     const sinkAsked = this.#sinkAsked;
     this.#listPrepared = false;
     this.#preparedList = null;
     this.#sinkAsked = false;
     try {
       if (listPrepared) {
-        if (this.#durable) this.lists.commit(attempt, this.#sequence);
-        else this.lists.abort(attempt);
+        if (this.#durable) {
+          this.lists.commit(attempt, this.#sequence);
+          if (preparedList === null) throw new TypeError("Installed root has no prepared list");
+          // Every native publisher funds its root before publish; that root owns this
+          // same array. Reopen already borrows it. Keep one reservation after install.
+          this.lists.borrowCommittedList(preparedList);
+        } else this.lists.abort(attempt);
       }
     } catch (error) {
       this.fail(new ExtentSinkError(error));

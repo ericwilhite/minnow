@@ -10,6 +10,11 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The private 1.0 storage writer keeps space statistics exact while aborting a write,
+including when releasing part of its reserved space fails. Idle maintenance can read
+those statistics without a reservation error. Released 0.x behavior is unchanged;
+no stored-format change or migration is required.
+
 The shared parser now records each SELECT output's original label for the private 1.0
 engine, which follows PostgreSQL for duplicate labels (`SELECT 1 AS x, 2 AS x` returns two
 columns named `x`). The released 0.x engine keeps its numbered names (`x`, `x_2`) and its
@@ -17,6 +22,13 @@ results are unchanged. The main bundle measures 1,179,975 raw / 353,974 gzip byt
 1,592,412 / 460,959; raise their raw/gzip caps once by 512/128. The combined worker/client cap
 rises by 256 (573,743 measured) and the packed core cap by 250 (1,028,540 measured).
 No stored-format change or migration is required.
+
+The private 1.0 writer waits for temporary memory pressure while preparing retirement
+metadata or column-group pages, instead of refusing a fitting write after idle row credit
+was reclaimed. Optional dictionaries and resident retirement lists keep their smaller
+fallbacks. Committed extent metadata keeps one owning charge through publication and reopen.
+Native credit growth returns unused credit before waiting for more, keeping cancellation responsive.
+No stored-format change or migration is required; released 0.x behavior is unchanged.
 
 The private 1.0 storage writer keeps sealed-extent ownership in a charged fixed window and
 spills larger histories through the existing native metadata inventory. Publication, staging,

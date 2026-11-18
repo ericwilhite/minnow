@@ -47,6 +47,8 @@ const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
  * allocation out of the grant's held bytes, growing a spillable grant for any shortfall.
  */
 export interface ByteCharge {
+  /** Optional encoding optimizations may decline without requesting async admission. */
+  tryAllocate?(bytes: number): boolean;
   allocate(bytes: number): boolean;
   free(bytes: number): void;
 }

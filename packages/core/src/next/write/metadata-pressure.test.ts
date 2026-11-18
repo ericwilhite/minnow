@@ -199,6 +199,7 @@ it("rejects only an individual metadata allocation beyond the entire cap with a 
     expect(() => budget.allocate(g.capBytes + 1)).toThrow(
       expect.objectContaining({
         code: "MINNOW_METADATA_ALLOCATION_TOO_LARGE",
+        sqlState: "53200",
         bytes: g.capBytes + 1,
         cap: g.capBytes,
       }),

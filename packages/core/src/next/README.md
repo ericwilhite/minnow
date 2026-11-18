@@ -131,6 +131,26 @@ larger than the entire cap gets the typed `MetadataAllocationTooLargeError` size
 Reclaim preserves both allocated bytes and outstanding loans; it never frees a reader's live buffers.
 `write/metadata-pressure.test.ts` generates reader-held memory through flush, staging, merges
 and durable reopen on memory and simulated IndexedDB.
+Extent-list preparation and `GroupWriter` page buffers use that metadata budget too:
+reclaimed idle row credit is never mistaken for prepaid publication workspace. Only the
+keeper's internal metadata-pressure request can reach the outer retry; genuine external
+extent-sink errors remain fatal. Optional resident release lists and page dictionaries use
+nonwaiting admission and fall back to the smaller disk/plain route instead of demanding
+more credit. After durable installation, the keeper borrows its exact committed list from
+the already funded root, as on reopen; it releases the separate keeper reservation without
+releasing the root's ownership. Standalone keepers retain their own list charge.
+`testing/native-write-pressure.test.ts` covers six direct native 1 MiB TEXT
+inserts at 32 MiB, generated microtask interleavings, competing reader buffers, provisional
+writer unwind before admission, exact rows, one root charge before/after reopen and zero
+final charge. `testing/native-root-list-funding.test.ts` pins the identity and pending-state
+handoff guards and the standalone keeper lifetime. Its optional-workspace
+companion pins both cheaper fallbacks under fully occupied ordinary credit.
+Growth surrenders the target account's reclaimable estimates before admitting its full
+remaining deficit. Asking for the old deficit lets admission reclaim that same account,
+hand its credit back, and repeat without net growth or a task turn. Live buffers, loans,
+the prepared-row floor and metadata headroom stay owned. `write/credit-growth.test.ts`
+generates row/metadata growth, real competing buffers, completion/cancellation, one
+complete-deficit admission and zero final charge under 32 MiB.
 Oversized insert calls admit at most 2,048 rows at once, so an entire call's conservative
 estimate does not need to fit beside other working grants. Eligible pending chunks stage
 between pieces of the same call; uniqueness, foreign keys and rollback still span the whole
@@ -4544,6 +4564,15 @@ selects the same disk inventory used for larger sources. Other errors propagate.
 The disk route admits its smaller working window before copying or consuming entries.
 
 ### Bounded native writer ownership
+
+Abort detaches each builder before consuming its reservation. Its remaining disk bytes move
+into one scalar writer owner, then into `releasingBytes` for each platform release. A failed
+release returns those bytes to the failed writer; successfully freed ranges are not counted
+again. Stats and the idle-publication predicate remain exact through every await. Inventory
+captures reject an aborting writer; audit waits for its mutation barrier and reports the typed
+space failure instead of enumerating an unsuccessful abort's consumed records.
+`testing/writer-abort-stats.test.ts` observes those boundaries, including spilled inventories,
+fragmented reservations and partial release failures. This changes no stored format.
 
 Native `ExtentWriter` owns a charged window of at most 64 sealed extents. Larger histories
 spill through the existing `MetadataJournal` chunk queue, pair sort and retirement-inventory
