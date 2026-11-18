@@ -98,7 +98,11 @@ safe integer range. `QUOTE_LITERAL` renders public domain values and declared nu
 `%n$` conversions. An explicit position sets the cursor for the next unnumbered conversion.
 Malformed directives and missing arguments throw; width and alignment directives are unsupported.
 
-Regex substring and replacement select the leftmost, longest match. Boolean regex checks use
+Regex substring and replacement select the leftmost, longest match. Captures follow PostgreSQL's
+ARE ordering: earlier greedy parts take priority, and a repeated group reports its final
+iteration. For alternatives matching the same whole text, the first applicable alternative
+supplies the captures. A group that did not participate is NULL in substring output and empty in replacement
+backreferences. Boolean regex checks use
 bounded state sets to test whether a match exists, without retaining capture paths. Both support
 grouping, alternation, character
 classes and ASCII POSIX classes, anchors, and greedy repetition. Pattern backreferences,

@@ -68,7 +68,7 @@ function boundedTest(expression: SqlRegex, input: string, bound: number, label: 
 
 it("bounds pathological failing matches, including nested repetition and ambiguous alternation", async () => {
   const input = "a".repeat(1000) + "!";
-  // Pattern-cache accounting retains 96 bytes per compiled instruction.
+  // Count actual VM states; cached capture-dissection metadata is separately charged.
   // The fixture's complete state-position space fits the existing memo ceiling: no eviction.
   // Each state has at most two outgoing edges plus one new search start per input position.
   const reach = createReach("SQL regex bounded matches", SQL_REGEX_WORK_REACH);
@@ -90,8 +90,8 @@ it("bounds pathological failing matches, including nested repetition and ambiguo
         pattern,
       ])
     ).rows[0]?.matched;
-    const bound = (2 * (expression.retainedSize / 96) + 1) * (input.length + 1);
-    expect((expression.retainedSize / 96) * (input.length + 1)).toBeLessThanOrEqual(65_536);
+    const bound = (2 * expression.instructionCount + 1) * (input.length + 1);
+    expect(expression.instructionCount * (input.length + 1)).toBeLessThanOrEqual(65_536);
     expect(boundedTest(expression, input, bound, pattern)).toBe(expected);
     reach.reach(state);
   }
@@ -116,11 +116,22 @@ it("keeps long literal successes and failed-start cache rollover within linear w
       ])
     ).rows[0]?.matched;
     expect(expected).toBe(true);
-    const bound = 2 * (input.length + expression.retainedSize / 96 + 1);
+    const bound = 2 * (input.length + expression.instructionCount + 1);
     expect(boundedTest(expression, input, bound, state)).toBe(expected);
     reach.reach(state);
   }
   reach.assertReached();
+});
+
+it("keeps capture-free prefixes and fixed-width repeated captures within their VM bound", async () => {
+  for (const pattern of ["a*(a*)", "(a)*", "((a+)*)"]) {
+    const input = "a".repeat(1000),
+      expression = new SqlRegex(pattern, "");
+    expect(expression.exec(input)?.slice(1)).toEqual(
+      (await postgres.query<{ g: string[] }>("SELECT regexp_match($1, $2) g", [input, pattern]))
+        .rows[0]?.g,
+    );
+  }
 });
 
 it("retains the complete fixed pattern work ceiling", () => {
@@ -186,6 +197,9 @@ it("matches PostgreSQL across the fixed ambiguous-pattern regression corpus", as
     "^(a|b)+$",
     "[^b]*",
     "(a*)(b*)(a*)",
+    "(a(b)?)*",
+    "((a|b)*)*",
+    "(a|(a))",
     "",
     ".",
     "^$",
@@ -238,12 +252,43 @@ it("matches PostgreSQL across the fixed ambiguous-pattern regression corpus", as
 const regexHistory = fc.record({
   atom: fc.constantFrom("a", "b", "é", "😀", "Ω"),
   other: fc.constantFrom("a", "b", "é", "😀", "Ω"),
-  shape: fc.constantFrom("nullable", "nested", "alternative", "optional", "sequence"),
+  shape: fc.constantFrom(
+    "nullable",
+    "nested",
+    "alternative",
+    "optional",
+    "sequence",
+    "noncapturing",
+    "last optional",
+    "star optional",
+    "alternative captures",
+    "bounded",
+    "nullable positive",
+  ),
+  replacement: fc.constantFrom(
+    "\\1",
+    "\\2",
+    "\\&",
+    "\\\\1",
+    "\\\\&",
+    "\\q",
+    "\\0",
+    "$$",
+    "\\1-\\2-\\&",
+  ),
+  global: fc.boolean(),
   start: fc.boolean(),
   end: fc.boolean(),
   operator: fc.constantFrom("~", "~*", "!~", "!~*"),
   repetitions: fc.integer({ min: 1, max: 3 }),
-  inputMode: fc.constantFrom("random", "witness", "uppercase", "surrounded", "newline"),
+  inputMode: fc.constantFrom(
+    "random",
+    "witness",
+    "uppercase",
+    "surrounded",
+    "newline",
+    "last absent",
+  ),
   input: fc.array(fc.constantFrom("a", "b", "A", "B", "é", "É", "😀", "Ω", "ω", "\n", "!"), {
     maxLength: 8,
   }),
@@ -273,7 +318,7 @@ const generatedReach = createReach("SQL regex generated differential", SQL_REGEX
   minimum: 2,
 });
 it.each(seedsFor("sql-regex-generated", [48101, 48102]))(
-  "preserves generated boolean and capture results against the parent and PostgreSQL, seed %s",
+  "preserves boolean results and matches PostgreSQL capture and replacement semantics, seed %s",
   async (seed) => {
     await fc.assert(
       fc.asyncProperty(regexHistory, async (history) => {
@@ -288,19 +333,33 @@ it.each(seedsFor("sql-regex-generated", [48101, 48102]))(
                 ? `(${atom}|${atom}${atom})(${other}?)`
                 : shape === "optional"
                   ? `(${atom})?(${other}*)`
-                  : `(${atom}*)(${other}?)`;
+                  : shape === "noncapturing"
+                    ? `(?:${atom}*)(${atom}*)`
+                    : shape === "last optional"
+                      ? `(${atom}(${other})?)+`
+                      : shape === "star optional"
+                        ? `(${atom}(${other})?)*`
+                        : shape === "alternative captures"
+                          ? `(${atom}|(${atom}))`
+                          : shape === "bounded"
+                            ? `((${atom}*){1,${String(repetitions + 1)}})`
+                            : shape === "nullable positive"
+                              ? `((${atom}*)+)`
+                              : `(${atom}*)(${other}?)`;
         const pattern = `${start ? "^" : ""}${body}${end ? "$" : ""}`;
         const witness = atom.repeat(repetitions) + (shape === "optional" ? other : "");
         const input =
-          inputMode === "random"
-            ? history.input.join("")
-            : inputMode === "uppercase"
-              ? witness.toUpperCase()
-              : inputMode === "surrounded"
-                ? `!${witness}!`
-                : inputMode === "newline"
-                  ? `\n${witness}\n`
-                  : witness;
+          inputMode === "last absent"
+            ? atom + other + atom
+            : inputMode === "random"
+              ? history.input.join("")
+              : inputMode === "uppercase"
+                ? witness.toUpperCase()
+                : inputMode === "surrounded"
+                  ? `!${witness}!`
+                  : inputMode === "newline"
+                    ? `\n${witness}\n`
+                    : witness;
         const flags = operator.endsWith("*") ? "i" : "";
         const negate = operator.startsWith("!");
         const parent = new ParentSqlRegex(pattern, flags);
@@ -311,7 +370,10 @@ it.each(seedsFor("sql-regex-generated", [48101, 48102]))(
         const oldCaptures = regexOutcome(() => captures(parent.exec(input)));
         const newCaptures = regexOutcome(() => captures(current.exec(input)));
         expect(newBoolean, label).toEqual(oldBoolean);
-        expect(newCaptures, label).toEqual(oldCaptures);
+        if (oldCaptures.kind === "result" && newCaptures.kind === "result")
+          expect(newCaptures.value?.values[0] ?? null, label).toEqual(
+            oldCaptures.value?.values[0] ?? null,
+          );
         // This short grammar must finish in both interpreters. Equal limit errors are not
         // evidence of equal results, and PostgreSQL does not share Minnow's resource ceilings.
         expect(newBoolean.kind, label).toBe("result");
@@ -330,17 +392,29 @@ it.each(seedsFor("sql-regex-generated", [48101, 48102]))(
         expect(newBoolean, label).toEqual({ kind: "result", value: pg?.matched });
         if (newCaptures.kind === "result") {
           expect(newCaptures.value?.values[0] ?? null, label).toEqual(pg?.whole);
-          // The parent has a known POSIX last-iteration difference for nested quantified
-          // captures (pinned below). Conservatively cross-check PG subcaptures only when no
-          // capturing group is quantified; ALL forms still compare every capture to parent.
-          if (shape === "alternative" || shape === "sequence") {
-            expect(
-              newCaptures.value?.values.slice(1).map((value) => value ?? null) ?? null,
-              label,
-            ).toEqual(pg?.groups);
-            generatedReach.reach("PostgreSQL captures compared");
-          }
+          expect(
+            newCaptures.value?.values.slice(1).map((value) => value ?? null) ?? null,
+            label,
+          ).toEqual(pg?.groups);
+          generatedReach.reach("PostgreSQL captures compared");
         }
+        const sql =
+          "SELECT SUBSTRING($1::text FROM $2::text) AS sub, REGEXP_REPLACE($1::text, $2::text, $3::text, $4::text) AS replaced";
+        const parameters = [
+          input,
+          pattern,
+          history.replacement,
+          flags + (history.global ? "g" : ""),
+        ];
+        const literalSql = sql.replace(
+          /\$(\d)/g,
+          (_, n: string) => "'" + (parameters[Number(n) - 1] ?? "").replaceAll("'", "''") + "'",
+        );
+        expect((await db.query(literalSql.replaceAll("::text", ""))).rows, label).toEqual(
+          (await postgres.query(sql, parameters)).rows,
+        );
+        generatedReach.reach(history.global ? "global replacement" : "first replacement");
+        if (history.replacement.startsWith("\\\\")) generatedReach.reach("escaped backslash");
         generatedReach.reach(shape);
         generatedReach.reach(operator);
         if (start) generatedReach.reach("start anchor");
@@ -366,33 +440,29 @@ it.each(seedsFor("sql-regex-generated", [48101, 48102]))(
       for (const outcome of [
         regexOutcome(() => expression.test(oversized)),
         regexOutcome(() => expression.exec(oversized)),
-      ])
+      ]) {
         expect(outcome).toEqual({
           kind: "limit",
           message: "Regular expression input exceeds scalar size limit",
         });
+        generatedReach.beginHistory();
+        generatedReach.reach("typed limit distinct from result");
+      }
     }
-    generatedReach.beginHistory();
-    generatedReach.reach("typed limit distinct from result");
   },
 );
 it("reaches the generated regex dimensions", () => generatedReach.assertReached());
 
-it("preserves the known PostgreSQL difference in nested quantified capture groups", async () => {
-  const pattern = "((a+)+)";
-  const input = "aa";
-  // Existing shipped behavior, not a PostgreSQL conformance assertion. The 1.0 compatibility
-  // decision is tracked in minnow-plan/OPEN-ISSUES.md: POSIX last-iteration semantics.
-  for (const expression of [new ParentSqlRegex(pattern, ""), new SqlRegex(pattern, "")])
-    expect(captures(expression.exec(input))).toEqual({
-      index: 0,
-      input,
-      values: ["aa", "aa", "aa"],
-    });
+it("fixes the shipped nested-repeat capture difference against PostgreSQL", async () => {
+  const pattern = "((a+)+)",
+    input = "aa";
+  expect(captures(new ParentSqlRegex(pattern, "").exec(input))?.values).toEqual(["aa", "aa", "aa"]);
+  expect(captures(new SqlRegex(pattern, "").exec(input))?.values).toEqual(["aa", "aa", "a"]);
   expect(
     (await postgres.query("SELECT regexp_match($1, $2) AS groups", [input, pattern])).rows,
   ).toEqual([{ groups: ["aa", "a"] }]);
 });
+
 it.each([
   "SELECT REGEXP_REPLACE('a' || CHR(10) || 'b', '[^b]+', '_', 'n') AS v",
   "SELECT REGEXP_REPLACE('a' || CHR(10) || 'b', '^b$', '_', 'n') AS v",

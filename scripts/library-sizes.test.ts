@@ -53,9 +53,11 @@ describe("compressed download budgets", () => {
     // Native display-label provenance: 573,743 combined gzip bytes (+75 versus a249070e).
     // The client is byte-identical; only shared engine/query.js grows (186 raw bytes).
     // Raise once by 256 bytes; the audit finds no native/test input or new module.
+    // PostgreSQL ARE capture dissection (calibration build): 575,256 combined gzip bytes.
+    // Raise once by 1.5 KiB; client/private-input isolation budgets stay unchanged.
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
-    ).toBeLessThanOrEqual(560.5 * 1024);
+    ).toBeLessThanOrEqual(562 * 1024);
   });
 });

@@ -9564,6 +9564,15 @@ export const SQL_REGEX_GENERATED_REACH = [
   "unmatched capture",
   "empty match",
   "typed limit distinct from result",
+  "noncapturing",
+  "last optional",
+  "star optional",
+  "alternative captures",
+  "bounded",
+  "nullable positive",
+  "global replacement",
+  "first replacement",
+  "escaped backslash",
 ] as const;
 
 export const PROTOTYPE_RUN_LIFETIME_REACH = [

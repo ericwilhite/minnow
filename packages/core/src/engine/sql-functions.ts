@@ -722,11 +722,11 @@ function regexFlags(name: string, value: unknown): string {
 
 /** PostgreSQL replacement text: \1 back-references and \& become JavaScript's $1 and $&. */
 function replacementText(value: string): string {
-  return value
-    .replace(/\$/g, "$$$$")
-    .replace(/\\(\d)/g, "$$$1")
-    .replace(/\\&/g, "$$&")
-    .replace(/\\\\/g, "\\");
+  // Only fixed, one/two-character tokens: one linear pass, with no per-character array.
+  // Consumed escaped backslashes cannot become backreferences in a later replacement pass.
+  return value.replace(/\\([1-9&\\])|\$/gu, (_match, token: string | undefined) =>
+    token === undefined ? "$$" : token === "\\" ? "\\" : "$" + token,
+  );
 }
 
 /** AGE(later, earlier): the calendar difference PostgreSQL reports, in months, days, and time. */

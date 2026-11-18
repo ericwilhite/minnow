@@ -12,6 +12,24 @@ compatibility policy and release process.
 
 The unexported 1.0 rebuild reserves wide sort merge workspace independently of source batch size, including encoded keys and the `WITH TIES` boundary row when a competing query forces a smaller source recipe.
 
+Regex substring and replacement now follow PostgreSQL's ARE capture ordering. Earlier greedy
+parts take priority over later captures; positive repetitions report the final atom after a
+greedy prefix, and an optional group absent from that atom does not reuse an earlier capture.
+When alternatives match the same whole text, the first applicable alternative supplies the
+captures; `REGEXP_REPLACE('a', '(a|(a))', '\2')` now returns the empty string.
+This fixes released 0.x results: `REGEXP_REPLACE('aa', '((a+)+)', '\2')` returns `a`,
+and `SUBSTRING('aaa' FROM 'a*(a*)')` returns the empty string. Review code that depended on
+those former capture values. Replacement text also preserves escaped backslashes before a
+digit or ampersand, and keeps `\0` literal instead of changing it to `$0`. Review replacements
+that depended on those former spellings. The supported pattern syntax and bounded work limits are unchanged;
+no stored-format change or migration is required.
+The capture-fix calibration build measured 1,184,226 raw / 355,431 gzip bytes
+for the main bundle,
+1,596,663 / 462,405 with OPFS, and 1,592,698 / 459,825 for the IndexedDB worker.
+Raise their raw caps once by 4 / 4 / 4.25 KiB and gzip caps by 1.5 KiB each;
+client and private-input isolation limits stay unchanged. The combined worker/client measures
+575,256 gzip bytes (cap +1.5 KiB); the core tarball measures 1,030,251 bytes (cap +1,750).
+
 The private 1.0 writer preserves exact BIGINT values when updating or deleting persisted
 rows, including primary and unique keys and RETURNING results. Cached memory readers keep
 the caller's full-width integer buffers after publication. Values across the signed 64-bit

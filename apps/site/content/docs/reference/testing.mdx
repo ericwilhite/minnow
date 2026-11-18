@@ -1005,7 +1005,11 @@ the test's 20-second timeout is unchanged. Additional work guards retain success
 literals and searches crossing the failed-state cache boundary. A separate check spends all 8,388,608 permitted
 steps and requires the next one to throw. The PostgreSQL corpus checks substring captures
 and boolean results together, including empty matches, anchors, newlines, and astral text.
-This checks algorithmic work, rather than a wall-time guarantee on a loaded host.
+The generated differential also compares every capture and shipped substring/replacement output
+with PGlite for nested, nullable, bounded, optional and non-capturing repetitions, alternation,
+Unicode, and replacement escapes. The frozen parent remains a boolean/whole-match control,
+not the authority for capture ordering. This checks algorithmic work, rather than a wall-time
+guarantee on a loaded host.
 
 `event-loop-stalls.test.ts` runs a 1 ms watchdog through reordered wide upserts, live
 aggregate updates, scans over upsert-heavy tables, secondary-index builds and their first

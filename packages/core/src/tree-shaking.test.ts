@@ -62,8 +62,10 @@ const SQL_ENGINE_MODULES =
 // Raise raw once by 512 and gzip by 256; client/private-input isolation stays unchanged.
 // Native display-label provenance (PostgreSQL duplicate labels): 1,179,975 raw / 353,974 gzip.
 // Raise raw once by 512 and gzip by 128; private-input isolation stays unchanged.
-const COMPLETE_ENTRY_RAW_BUDGET = 1152.75 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 345.75 * 1024;
+// PostgreSQL ARE capture dissection (calibration build): 1,184,226 raw / 355,431 gzip bytes.
+// Raise raw once by 4 KiB and gzip by 1.5 KiB; private-input/isolation limits stay.
+const COMPLETE_ENTRY_RAW_BUDGET = 1156.75 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 347.25 * 1024;
 // The engine with the larger durable adapter, OPFS.
 // JSON_TABLE metadata: 1,585,069 raw / 458,168 gzip bytes; counterfactual
 // 1,584,618 / 458,049 (+451 / +119). Raw cap +512 once, gzip cap unchanged.
@@ -85,8 +87,10 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 345.75 * 1024;
 // Raise raw once by 512 and gzip by 256; no next/ or test input is reachable.
 // Native display-label provenance (PostgreSQL duplicate labels): 1,592,412 raw / 460,959 gzip.
 // Raise raw once by 512 and gzip by 128; no next/ or test input is reachable.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1555.5 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 450.25 * 1024;
+// PostgreSQL ARE capture dissection (calibration build): 1,596,663 raw / 462,405 gzip bytes.
+// Raise raw once by 4 KiB and gzip by 1.5 KiB; no private rebuild/test input ships.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1559.5 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 451.75 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does.
 // JSON_TABLE metadata: 1,581,102 raw / 455,735 gzip bytes; counterfactual
@@ -107,13 +111,16 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 450.25 * 1024;
 // gzip, standalone client and all isolation assertions stay unchanged.
 // Exact native FK provenance / schema-action comparison: 1,588,242 raw / 458,212 gzip.
 // Raise raw once by 768 and gzip by 128; standalone client and isolation caps stay.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1551.25 * 1024;
+// PostgreSQL ARE capture dissection (calibration build): 1,592,698 raw / 459,825 gzip bytes.
+// Raise raw once by 4.25 KiB; the standalone client and isolation limits stay.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1555.5 * 1024;
 // Native trigger-name folding: 1,587,617 raw / 457,994 gzip bytes (+100 / +28).
 // The old gzip cap is exceeded by 10 bytes. Raise once by 128; raw and isolation caps stay.
 // Bounded boolean regex (3dc95943): 1,588,261 raw / 458,253 gzip bytes with the
 // official Node 24.22.2 compressor, matching CI 44044406507 (13 bytes over the old cap).
 // Raise once by the existing 128-byte budget step; raw, sibling and isolation caps stay.
-const INDEXEDDB_WORKER_GZIP_BUDGET = 447.625 * 1024;
+// ARE capture dissection: raise gzip once by 1.5 KiB (459,825 bytes measured).
+const INDEXEDDB_WORKER_GZIP_BUDGET = 449.125 * 1024;
 // What a page that hosts the engine in a worker ships on the main thread: the client, the schema
 // DSL and error classes, the Kysely dialect and live queries, and the React hooks, with `kysely`
 // and `react` left to the application. 105.9 KiB raw / 31.6 KiB gzip.

@@ -4,19 +4,12 @@ import {
   MAX_SQL_SCALAR_RESULT_CHARACTERS,
 } from "./cache-limits.js";
 
-type Node =
-  | { kind: "character"; matches: (value: string) => boolean }
-  | { kind: "assert"; accepts: (input: string, position: number) => boolean }
-  | { kind: "sequence"; children: Node[] }
-  | { kind: "alternative"; children: Node[] }
-  | { kind: "group"; child: Node; group: number }
-  | { kind: "repeat"; child: Node; min: number; max: number };
-type Instruction =
-  | { kind: "character"; matches: (value: string) => boolean; next: number }
-  | { kind: "assert"; accepts: (input: string, position: number) => boolean; next: number }
-  | { kind: "save"; slot: number; next: number }
-  | { kind: "split"; first: number; second: number }
-  | { kind: "match" };
+import {
+  captureSpans,
+  type RegexNode as Node,
+  type RegexInstruction as Instruction,
+  type RegexNodeRange,
+} from "./sql-regex-captures.js";
 
 function required<T>(value: T | undefined): T {
   if (value === undefined) throw new Error("Invalid SQL regular expression program");
@@ -45,9 +38,15 @@ export class SqlRegex {
   readonly #start: number;
   readonly #slots: number;
   readonly #global: boolean;
+  readonly #captureRoot: Node | null;
+  readonly #ranges: Map<Node, RegexNodeRange> | null;
+  /** Actual VM states, distinct from cached AST/dissection metadata. */
+  get instructionCount(): number {
+    return this.#instructions.length;
+  }
 
   get retainedSize(): number {
-    return this.#instructions.length * 96;
+    return this.#instructions.length * 96 + (this.#ranges?.size ?? 0) * 256;
   }
 
   /** Every interpreter arrival spends from the fixed per-operation SQL work ceiling. */
@@ -197,39 +196,98 @@ export class SqlRegex {
     const root = alternative(0);
     if (cursor !== pattern.length) fail("unmatched closing parenthesis");
     this.#slots = 2 * (groups + 1);
+    this.#captureRoot = groups ? root : null;
+    this.#ranges = groups ? new Map() : null;
     const emit = (instruction: Instruction): number => {
       if (this.#instructions.length >= 65_536)
         throw new RangeError("Regular expression state limit exceeded");
       this.#instructions.push(instruction);
       return this.#instructions.length - 1;
     };
+    const descriptions = new Map<Node, { captures: boolean; width: number | null }>();
+    const describe = (node: Node): { captures: boolean; width: number | null } => {
+      const old = descriptions.get(node);
+      if (old) return old;
+      const descendants =
+        node.kind === "group" || node.kind === "repeat"
+          ? [node.child]
+          : node.kind === "sequence" || node.kind === "alternative"
+            ? node.children
+            : [];
+      const values = descendants.map(describe),
+        widths = values.map((value) => value.width);
+      const width =
+        node.kind === "character"
+          ? 1
+          : node.kind === "assert"
+            ? 0
+            : node.kind === "group"
+              ? (widths[0] ?? null)
+              : node.kind === "sequence"
+                ? widths.every((w) => w !== null)
+                  ? widths.reduce<number>((n, w) => n + w, 0)
+                  : null
+                : node.kind === "alternative"
+                  ? widths.every((w) => w === widths[0])
+                    ? (widths[0] ?? null)
+                    : null
+                  : widths[0] === 0
+                    ? 0
+                    : node.min === node.max && widths[0] !== null && widths[0] !== undefined
+                      ? widths[0] * node.min
+                      : null;
+      const value = {
+        captures: node.kind === "group" || values.some((value) => value.captures),
+        width: width !== null && Number.isSafeInteger(width) ? width : null,
+      };
+      descriptions.set(node, value);
+      return value;
+    };
     const compile = (node: Node, next: number): number => {
-      if (node.kind === "character" || node.kind === "assert") return emit({ ...node, next });
-      if (node.kind === "group")
-        return emit({
-          kind: "save",
-          slot: node.group * 2,
-          next: compile(node.child, emit({ kind: "save", slot: node.group * 2 + 1, next })),
-        });
-      if (node.kind === "sequence")
-        return node.children.reduceRight((start, child) => compile(child, start), next);
-      if (node.kind === "alternative")
-        return node.children.reduceRight((second, child, index) => {
-          const first = compile(child, next);
-          return index === node.children.length - 1
-            ? first
-            : emit({ kind: "split", first, second });
-        }, next);
-      let start = next;
-      if (node.max === Infinity) {
-        const loop = { kind: "split" as const, first: -1, second: next };
-        start = emit(loop);
-        loop.first = compile(node.child, start);
-      } else {
-        for (let index = node.min; index < node.max; index += 1)
-          start = emit({ kind: "split", first: compile(node.child, start), second: start });
-      }
-      for (let index = 0; index < node.min; index += 1) start = compile(node.child, start);
+      const children: Array<{ start: number; stop: number }> = [];
+      let prefix: { start: number; stop: number } | null = null;
+      const build = (): number => {
+        if (node.kind === "character" || node.kind === "assert") return emit({ ...node, next });
+        if (node.kind === "group")
+          return emit({
+            kind: "save",
+            slot: node.group * 2,
+            next: compile(node.child, emit({ kind: "save", slot: node.group * 2 + 1, next })),
+          });
+        if (node.kind === "sequence") {
+          let start = next;
+          for (let i = node.children.length - 1; i >= 0; i--) {
+            const stop = start;
+            start = compile(required(node.children[i]), stop);
+            if (this.#ranges) children[i] = { start, stop };
+          }
+          return start;
+        }
+        if (node.kind === "alternative")
+          return node.children.reduceRight((second, child, index) => {
+            const first = compile(child, next);
+            return index === node.children.length - 1
+              ? first
+              : emit({ kind: "split", first, second });
+          }, next);
+        let start = next;
+        if (node.max === Infinity) {
+          const loop = { kind: "split" as const, first: -1, second: next };
+          start = emit(loop);
+          loop.first = compile(node.child, start);
+        } else {
+          for (let index = node.min; index < node.max; index += 1)
+            start = emit({ kind: "split", first: compile(node.child, start), second: start });
+        }
+        for (let index = 0; index < node.min; index += 1) {
+          if (this.#ranges) prefix = { start, stop: next };
+          start = compile(node.child, start);
+        }
+        return start;
+      };
+      const start = build();
+      if (this.#ranges)
+        this.#ranges.set(node, { start, stop: next, children, prefix, ...describe(node) });
       return start;
     };
     this.#start = compile(root, 0);
@@ -260,12 +318,12 @@ export class SqlRegex {
         {
           pc: this.#start,
           position: start,
-          captures: capture ? new Array<number>(this.#slots) : null,
+          captures: capture ? new Array<number>(2) : null,
         },
       ];
       let best: number[] | undefined;
-      // Repeated empty groups may loop forever. Memoize VM configurations, including captures,
-      // so captures remain correct while zero-width cycles terminate deterministically.
+      // Select only the whole span here. Subcaptures cannot affect this language and
+      // are dissected afterwards; repeated empty paths must still terminate.
       while (stack.length > 0) {
         const state = required(stack.pop());
         let { pc, position } = state;
@@ -301,7 +359,7 @@ export class SqlRegex {
             });
             pc = instruction.first;
           } else if (instruction.kind === "save") {
-            if (captures !== null) captures[instruction.slot] = position;
+            if (captures !== null && instruction.slot < 2) captures[instruction.slot] = position;
             pc = instruction.next;
           } else if (instruction.kind === "assert") {
             if (!instruction.accepts(input, position)) break;
@@ -333,8 +391,29 @@ export class SqlRegex {
     return capture ? null : false;
   }
 
+  #match(input: string, from: number, work: { remaining: number }): RegExpExecArray | null {
+    const whole = this.#search(input, from, true, work);
+    if (whole === null || this.#captureRoot === null || this.#ranges === null) return whole;
+    const spans = captureSpans(
+      this.#captureRoot,
+      this.#ranges,
+      this.#instructions,
+      input,
+      whole.index,
+      whole.index + whole[0].length,
+      this.#slots,
+      () => this.spend(work),
+    );
+    const values: Array<string | undefined> = [whole[0]];
+    for (let i = 2; i < spans.length; i += 2) {
+      const begin = spans[i] ?? -1,
+        end = spans[i + 1] ?? -1;
+      values.push(begin < 0 || end < 0 ? undefined : input.slice(begin, end));
+    }
+    return Object.assign(values, { index: whole.index, input }) as RegExpExecArray;
+  }
   exec(input: string): RegExpExecArray | null {
-    return this.#search(input, 0);
+    return this.#match(input, 0, { remaining: MAX_SQL_PATTERN_MATCH_STEPS });
   }
   test(input: string): boolean {
     return this.#search(input, 0, false);
@@ -353,7 +432,7 @@ export class SqlRegex {
       parts.push(part);
     };
     for (;;) {
-      const match = this.#search(input, from, true, work);
+      const match = this.#match(input, from, work);
       if (match === null) break;
       append(input.slice(cursor, match.index));
       append(
