@@ -4836,3 +4836,10 @@ with `MINNOW_MEMORY_ADMISSION`, rather than waiting for its own retained memory.
 Native store-name validation and encoding live in the shared, pure `store-name.ts` module.
 The thin connector validates the same 80-byte Unicode name domain without importing a storage
 backend. This preserves the client bundle boundary and changes no valid name or stored byte.
+
+A flush rechecks that its assembled checkpoint contains the table before preparing its R25
+extent list. Ordinary catalog commits can advance a durable DROP while root preparation
+awaits, even though the flush holds the publication lock. A checkpoint which omits the table
+abandons the provisional writer and releases all fresh output. An older coherent checkpoint
+which still contains the table may publish; WAL replay carries the later DROP. Older read
+pins retain their values in both histories. This changes no stored bytes or format selector.

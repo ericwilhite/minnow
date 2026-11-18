@@ -11083,3 +11083,23 @@ export const CLOSED_DISK_FINGERPRINT_REACH = [
   "pending truncate",
   "queued truncate",
 ] as const;
+
+/** R25: a delayed flush must match its selected catalog before it contributes ownership. */
+export const ROOT_SELECTION_DROP_REACH = [
+  "sim",
+  "memory",
+  "indexeddb",
+  "opfs",
+  "drop before selection",
+  "drop after selection",
+  "all valid",
+  "NULL payload",
+  "sealed output exists",
+  "missing target abandoned",
+  "coherent older root kept",
+  "older pin values",
+  "no orphan writer",
+  "exact native inventory",
+  "reopen and keep writing",
+  "zero final charge",
+] as const;
