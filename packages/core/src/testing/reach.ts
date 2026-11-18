@@ -9718,3 +9718,19 @@ export const PUBLIC_STORE_ENTRY_REACH = [
   "captured lifecycle policy",
   "worker lease and charge cleanup",
 ] as const;
+
+/** Companion adapters use the exact canonical facade, not the legacy Result/Date boundary. */
+export const NATIVE_KYSELY_REACH = [
+  "exact int8",
+  "nullable text",
+  "NUMERIC scale",
+  "timestamp microseconds",
+  "bounded stream",
+  "early cursor close",
+  "isolated callback",
+  "rollback",
+  "savepoint recovery",
+  "catalog SQL widths",
+  "explicit decoding",
+  "live unbound",
+] as const;

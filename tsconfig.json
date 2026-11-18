@@ -18,6 +18,9 @@
     },
     {
       "path": "packages/devtools/demo"
+    },
+    {
+      "path": "packages/kysely/next"
     }
   ]
 }
