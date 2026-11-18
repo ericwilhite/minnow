@@ -9734,3 +9734,15 @@ export const NATIVE_KYSELY_REACH = [
   "explicit decoding",
   "live unbound",
 ] as const;
+
+export const NATIVE_EXPORT_REACH = [
+  "BIGINT decimal tokens",
+  "NUMERIC and temporal text",
+  "escaped CSV",
+  "NULL and arrays",
+  "bytea hex",
+  "multiple frames",
+  "empty header",
+  "duplicate columns",
+  "cancel closes cursor",
+] as const;

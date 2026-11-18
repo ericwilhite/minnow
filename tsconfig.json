@@ -24,6 +24,9 @@
     },
     {
       "path": "packages/react/next"
+    },
+    {
+      "path": "packages/export/next"
     }
   ]
 }
