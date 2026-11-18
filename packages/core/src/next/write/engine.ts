@@ -5,6 +5,7 @@ import {
   capturedWriterReferences,
   type CapturedWriterExtents,
 } from "../storage/writer-extents.js";
+import { ChangeFeed } from "../access/changes.js";
 import type { RetirementInventory } from "../storage/retirement-contract.js";
 import { FtsMutations, type FtsMutationCommit } from "./fts-mutations.js";
 import { ftsMutationScan } from "./fts-undo.js";
@@ -2524,7 +2525,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
     }
   }
 
+  #changes: ChangeFeed | null = null;
+  get liveRekeys(): boolean {
+    return this.#changes !== null;
+  }
+  /** Lazily funded before registration; the native writer is the only publication authority. */
+  get changes(): ChangeFeed {
+    return (this.#changes ??= ChangeFeed.create(this.#metadataBudget, this.appliedLsn));
+  }
+
   commit(tx: TransactionImpl, request: CommitRequest | null): Promise<CommitReceipt> {
+    this.#changes?.prepare(tx, tx.undo);
     if (hasFtsWrites(tx)) return this.#trackCommit(this.#commitFts(tx, request), tx);
     const staging = this.#txStaging.get(tx);
     if (staging === undefined) return this.#commitNow(tx, request, () => null);
@@ -3015,6 +3026,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         }
       }
     }
+    this.#changes?.install(tx, lsn);
     this.#afterAppend();
     this.#lastCommitAt = performance.now();
     const receipt = new Receipt(lsn, this.#appender);
@@ -3031,6 +3043,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       else record();
     }
     this.release(tx);
+    this.#changes?.notify();
     return receipt;
   }
 
@@ -3260,6 +3273,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
       for (const memtable of this.#published) memtable.staged?.extents.close();
       await Promise.allSettled(this.#stagingRuns);
       this.#ftsPending = null;
+      this.#changes?.close();
+      this.#changes = null;
       await this.#ftsMutations?.close();
       this.#ftsMutations = null;
       this.#ftsRenderer = null;

@@ -1,4 +1,5 @@
 import { captureWriterExtents, type CapturedWriterExtents } from "../storage/writer-extents.js";
+import type { ChangeFeed } from "../access/changes.js";
 /** Portable input -> private native generation -> ONE durable publication, after footer AND EOF.
  * The target factory owns a settled/exclusive owner (no active WritePath or background writers).
  * Publication rejection is indeterminate: close/reopen, never abort possibly published extents.
@@ -63,6 +64,8 @@ import {
 } from "./snapshot-stage.js";
 
 export interface SnapshotLoadTarget {
+  /** Owner-lifetime feed, if observers survive the exclusive offline replacement. */
+  readonly changes?: ChangeFeed;
   readonly space: ExtentSpace;
   readonly epoch: number;
   /** Settled old incarnation's last LSN, INCLUDING committed log-only state. */
@@ -565,6 +568,7 @@ async function loadAttempt(
       budget,
       ...options,
     });
+    target.changes?.replace(lsn);
     list.commit(1, sequence);
     listPrepared = false;
   } catch (error) {

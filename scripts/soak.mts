@@ -27,6 +27,36 @@ interface Suite {
 
 /** Every suite whose corpus is generated from a seed. A suite with a fixed corpus gains nothing here. */
 const SUITES: Suite[] = [
+  { name: "next-live-row-binary", file: "packages/core/src/next/live/rows-binary.test.ts" },
+  { name: "next-live-row-identity", file: "packages/core/src/next/live/rows-identity.test.ts" },
+  { name: "next-live-row-backing", file: "packages/core/src/next/live/rows-backing.test.ts" },
+  {
+    name: "next-live-admission-close",
+    file: "packages/core/src/next/testing/live-runtime-admission.test.ts",
+  },
+  {
+    name: "next-live-observer-reentry",
+    file: "packages/core/src/next/write/changes-reentrancy.test.ts",
+  },
+  { name: "next-live-dispatch", file: "packages/core/src/next/write/changes-deferred.test.ts" },
+  {
+    name: "next-live-effect-integration",
+    file: "packages/core/src/next/testing/changes-integration.test.ts",
+  },
+  { name: "next-live-publication", file: "packages/core/src/next/write/changes.test.ts" },
+  {
+    name: "next-live-commit-oracle",
+    file: "packages/core/src/next/testing/live-commit-oracle.test.ts",
+  },
+  // Each file varies its live history campaigns through MINNOW_SEED.
+  { name: "next-live-runtime", file: "packages/core/src/next/testing/live-runtime.test.ts" },
+  { name: "next-live-errors", file: "packages/core/src/next/testing/live-runtime-errors.test.ts" },
+  {
+    name: "next-live-lifecycle",
+    file: "packages/core/src/next/testing/live-runtime-lifecycle.test.ts",
+  },
+  { name: "next-live-close", file: "packages/core/src/next/testing/live-runtime-close.test.ts" },
+  { name: "next-live-row-values", file: "packages/core/src/next/live/rows.test.ts" },
   { name: "differential-harness", file: "packages/core/src/testing/differential-harness.test.ts" },
   { name: "block-format-properties", file: "packages/core/src/block-format/properties.test.ts" },
   { name: "sql-conformance", file: "packages/core/src/engine/sql-conformance.test.ts" },
@@ -35,6 +65,7 @@ const SUITES: Suite[] = [
     file: "packages/core/src/engine/sql-mutation-conformance.test.ts",
   },
   { name: "differential", file: "packages/core/src/engine/differential.test.ts" },
+  { name: "next-execution-retirement", file: "packages/core/src/next/exec/retirement.test.ts" },
   { name: "deterministic-simulator", file: "packages/core/src/testing/simulator.test.ts" },
   {
     name: "interaction-simulator",

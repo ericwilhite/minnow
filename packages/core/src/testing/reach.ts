@@ -17,6 +17,20 @@
  * (`packages/db/tests/oracle-reach.ts`). Like ./seeds.ts, this module is excluded from the
  * published tarball.
  */
+export const EXECUTION_RETIREMENT_REACH = [
+  "task-yield cancellation",
+  "IO cancellation",
+  "launch then program",
+  "immediate program",
+  "queued admission aborted",
+  "cancel",
+  "dispose",
+  "delivery remains prompt",
+  "IO abort prompt",
+  "sizing drained before retirement",
+  "zero charges",
+] as const;
+
 /** Ordered hot-key traversal stays linear relative to the legacy input scan. */
 export const HOT_KEY_SORT_WORK_STATES = [
   "exact ordered rows",
@@ -10636,4 +10650,185 @@ export const NATIVE_WRITE_GROWTH_REACH = [
   "cancellation without competitor release",
   "net new credit completes",
   "zero final charge",
+] as const;
+
+export const LIVE_PUBLICATION_REACH = [
+  "catalog publication",
+  "savepoint rollback",
+  "transaction rollback",
+  "explicit commit",
+  "observer isolation",
+  "zero charges",
+] as const;
+
+export const LIVE_CLOSE_REACH = [
+  "native captures released",
+  "active decoder and replacement",
+  "handle captures released",
+  "client replacement released",
+  "no delivery after disposal",
+  "zero charges",
+] as const;
+
+export const LIVE_LIFECYCLE_REACH = [
+  "full parameter backing preflight",
+  "parameter copy funded before allocation",
+  "parameter bytes captured privately",
+  "shared parameters refused",
+  "loading closes subscription",
+  "loading refresh supersedes registration",
+  "loading refresh transition",
+  "loading reconnect transition",
+  "loading owner-change transition",
+  "one current client registration",
+  "peer retirement during registration",
+  "registration admission retirement",
+  "parameter-copy retirement",
+  "owner retirement",
+  "runtime retirement",
+  "dependency admission retirement",
+  "no retired dependency links",
+  "planning proof unknown",
+  "dependency proof admission refused",
+  "new dependency invalidation",
+  "unknown proof widens globally",
+  "recovered proof excludes unaffected tables",
+  "scratch oracle after commits",
+  "zero charges",
+] as const;
+
+export const LIVE_ERROR_REACH = [
+  "error baseline evictable",
+  "diagnostic admission retirement",
+  "one unacknowledged error",
+  "error burst coalesced",
+  "error memory bounded",
+  "same-row ready recovery",
+  "error ACK preserves accepted rekeys",
+  "error callback rejection isolated",
+  "error refresh reset",
+  "error reconnect reset",
+  "error owner-change reset",
+  "query error",
+  "admission error",
+  "zero charges",
+] as const;
+
+export const LIVE_RUNTIME_REACH = [
+  "async delivery rejection",
+  "sync delivery rejection",
+  "rejected delivery rekey continuity",
+  "rejected delivery final value",
+  "result cleanup fence",
+  "catalog identity reset",
+  "missed middle notification",
+  "late registration",
+  "rekey covered",
+  "rekey reset",
+  "rekey owner reset",
+  "row identity reuse",
+  "small cap",
+  "subscribe",
+  "unsubscribe",
+  "window",
+  "commit",
+  "rollback",
+  "reconnect",
+  "owner change",
+  "refresh",
+  "unaffected table",
+  "zero charges",
+] as const;
+
+export const LIVE_ROW_VALUE_REACH = [
+  "retained previous rows",
+  "composite notices",
+  "Date keys",
+  "Date value changes",
+  "captured input",
+  "invalid key refused",
+  "zero charges",
+] as const;
+
+export const LIVE_OBSERVER_REENTRY_REACH = [
+  "subscribe",
+  "unsubscribe",
+  "replace",
+  "eligible frontier",
+  "bounded replacement chain",
+  "zero charges",
+] as const;
+
+export const LIVE_DISPATCH_REACH = [
+  "writer released",
+  "response available",
+  "bounded coalescing",
+  "uncommitted excluded",
+  "borrow stable during callout",
+  "zero charges",
+] as const;
+
+export const LIVE_EFFECT_INTEGRATION_REACH = [
+  "RI",
+  "trigger body",
+  "partial statement",
+  "migration",
+  "snapshot load",
+  "zero charges",
+] as const;
+
+export const LIVE_ADMISSION_CLOSE_REACH = [
+  "cohort durability",
+  "begin",
+  "next frame",
+  "next end",
+  "frame durability",
+  "adoption",
+  "done",
+  "cleaned",
+  "dependencies",
+  "history",
+  "copy",
+  "deliver",
+  "handle",
+  "runtime",
+  "zero charges",
+] as const;
+
+export const LIVE_BACKING_REACH = [
+  "bytes",
+  "words",
+  "data",
+  "buffer",
+  "refused before clone",
+  "whole backing charged",
+  "previous row charged",
+  "old diff released",
+  "zero charges",
+] as const;
+
+export const LIVE_IDENTITY_REACH = [
+  "reuse source",
+  "reuse destination",
+  "retire chain",
+  "swap",
+  "unrelated",
+  "new identity hop",
+  "new identity insert",
+  "zero charges",
+] as const;
+
+export const LIVE_BINARY_VALUE_REACH = [
+  "buffer",
+  "bytes",
+  "words",
+  "data",
+  "equal",
+  "different",
+  "grow",
+  "shrink",
+  "updated patch",
+  "offset view",
+  "private copy",
+  "zero charges",
 ] as const;

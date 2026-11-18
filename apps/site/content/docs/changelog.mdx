@@ -35,6 +35,34 @@ spills larger histories through the existing native metadata inventory. Publicat
 snapshot loading and abort consume immutable cursors instead of copying a whole write's
 extent list into memory. Descriptor ownership drains before its memory is released.
 No stored-format change or migration is required; released 0.x behavior is unchanged.
+The private 1.0 native writer now reports committed changes from surviving transaction undo.
+Rollback and savepoint rollback discard their effects. Summaries include the real LSN and
+separate catalog, snapshot-replacement and unknown-effect markers. A monotone publication
+probe recovers missed notifications. Optional owner-session key history is bounded and charged;
+missing continuity requires an explicit reset. This does not change stored formats, commit
+codecs, ledger outcomes, or released 0.x behavior.
+
+The private 1.0 rebuild adds native commit summaries and an internal live-query runtime.
+Only committed changes invalidate queries; rollback and savepoint rollback discard their effects.
+Failed replanning widens invalidation until a complete dependency proof is restored. Refresh and
+reconnect honor teardown or another refresh requested from a loading callback, and owner
+retirement cannot publish a late subscription. Parameter capture charges complete byte-buffer
+capacity before making its private copy. Disposal drops private captures and queued replacements
+while active consumer callbacks finish.
+Disposal drains native admission, execution and sizing cleanup through a separate resource fence;
+commit, durability and result-outcome boundaries are unchanged. Decoder errors preserve the
+last accepted result and rekey watermark, so later updates can recover without losing notices.
+Slow subscribers keep one unacknowledged result or error and coalesce later commits.
+Recovery clears an error even when the successful query returns the previous rows. Live error
+diagnostics omit stacks and bound copied details; oversized or refused diagnostics report
+SQLSTATE `53200` while preserving the last good rows. The owner bounds retained
+results and rekey history through memory accounting. Table-qualified rekey notices come from
+accepted UPDATEs while the owner can cover the subscriber's gap. If that history is evicted,
+the owner changes, the catalog changes, or a snapshot replaces the database, delivery explicitly
+resets the result
+instead of inventing rekey notices. Consumers must accept full snapshots on reset.
+These paths remain unpublished until the 1.0 cutover. Released 0.x APIs and behavior are unchanged;
+there is no stored-format change or migration in this work.
 
 - The browser performance gate now binds every baseline to its SQL and dataset scale and refuses
   changed workloads before comparison. The S_q7 NUMERIC ROUND correction (`4e7b6a0c`) requires

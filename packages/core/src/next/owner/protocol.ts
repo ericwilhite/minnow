@@ -1,3 +1,4 @@
+import type { RekeyEffect } from "../access/changes.js";
 /**
  * The owner/client wire protocol: every message that crosses the MessagePort between a client
  * (any tab or worker) and the database's one owner worker.
@@ -485,6 +486,8 @@ export interface LiveAck {
   readonly t: "liveAck";
   readonly target: number;
   readonly version: number;
+  /** False returns delivery credit while retaining the last successfully installed watermark. */
+  readonly accepted?: boolean;
 }
 
 export interface Unprepare {
@@ -601,6 +604,10 @@ export interface Rows {
 }
 
 export interface Done {
+  /** Initial live result acknowledgement token; the request slot itself is settled. */
+  readonly liveVersion?: number;
+  readonly liveReset?: boolean;
+  readonly keyChanges?: readonly RekeyEffect[];
   readonly t: "done";
   readonly seq: number;
   readonly columns: readonly WireColumnMeta[] | null;
@@ -642,6 +649,8 @@ export interface Failure {
   readonly t: "error";
   readonly seq: number;
   readonly error: WireError;
+  /** Live errors use the same bounded ACK window; returning credit accepts no newer data. */
+  readonly liveVersion?: number;
 }
 
 /**
@@ -650,6 +659,10 @@ export interface Failure {
  * `LIVE_UNACKED_DROP_MS` (election.ts) with `liveEnded`; a client that wakes later resubscribes.
  */
 export interface Live {
+  readonly reset?: boolean;
+  readonly keyChanges?: readonly RekeyEffect[];
+  /** Snapshot LSN, distinct from the per-subscription acknowledgement token. */
+  readonly lsn?: number;
   readonly t: "live";
   readonly seq: number;
   readonly version: number;

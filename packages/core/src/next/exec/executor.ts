@@ -106,6 +106,11 @@
  * - SQL errors are `ExecutionError`s with PostgreSQL's SQLSTATE (exec/errors.ts); access/ and
  *   storage errors (constraint violations, corruption) pass through unchanged.
  *
+ * Native `settled()` is a separate resource fence for owner retirement. It also drains
+ * deferred launch/program and sizing work after cancellation. It does not delay or change
+ * executed/delivered outcomes; cancellation still reaches admission and IO immediately.
+ * The fence is allocated only when requested.
+ *
  * ## Statistics and the cost model
  * - Planning reads statistics from directories and sketches through lowering; the executor never
  *   plans. Data-dependent choices are made at run time from exact facts: page pruning and the
@@ -253,6 +258,9 @@ export interface Execution {
   acknowledgeCommit(): void;
   /** Completion 3. */
   readonly delivered: Promise<void>;
+  /** Lazy native resource fence: drains deferred launch and program work (including sizing)
+   * in addition to the existing completions. Optional on injected test executors. */
+  settled?(): Promise<void>;
   /** Cancels (see "Cancellation"). Idempotent; a no-op once `delivered` settled. */
   cancel(reason?: unknown): void;
 }

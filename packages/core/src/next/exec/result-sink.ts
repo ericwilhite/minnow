@@ -1,3 +1,4 @@
+import { DeferredGrant } from "./deferred-grant.js";
 /** Owned, compact result frames. Borrowed input is copied; authorized dedicated input stays charged through frame credit. */
 import type { MaybePromise } from "../access/key-index.js";
 import { OBJECT_OVERHEAD_BYTES, bigintBytes, type Grant, type Loan } from "../memory/governor.js";
@@ -49,14 +50,20 @@ export interface ResultSinkOptions {
 
 /** Frame wrappers coexist with a source's already charged result-owned buffers. */
 export const resultFrameMetadataBytes = (columns: number): number =>
-  OBJECT_OVERHEAD_BYTES * (3 + 2 * columns);
+  OBJECT_OVERHEAD_BYTES * (5 + 2 * columns);
 
 /** A failed multi-row attempt returns its buffers before retrying at one row.
  * #make(1) uses targetBytes=0, so each field's arena is exact, overlapping only
  * its initial 64 bytes while resizing. Producer buffers are charged elsewhere;
  * the ordinary frame window funds bounded small/multi-row attempts. */
 export function resultRowStepBytes(widths: readonly number[]): number {
-  return widths.reduce((n, width) => n + Math.max(64, width), 0) + 64 + 4096 + 288 * widths.length;
+  return (
+    widths.reduce((n, width) => n + Math.max(64, width), 0) +
+    64 +
+    4096 +
+    2 * OBJECT_OVERHEAD_BYTES +
+    288 * widths.length
+  );
 }
 
 export class ResultSink implements Operator {
@@ -380,6 +387,25 @@ export class ResultSink implements Operator {
           dictionaries: frame.dictionaries,
         },
         requiresLsn: this.requiresLsn,
+        adopt: (take) => {
+          if (frame.freed || frame.loan !== null) return null;
+          const bytes =
+            frame.store.retainedBytes +
+            frame.extraBytes +
+            (frame.metadata ? this.#metadataBytes : 0);
+          if (
+            !(this.grant instanceof DeferredGrant
+              ? this.grant.adopt(take, bytes)
+              : take(this.grant, bytes))
+          )
+            return null;
+          // Cache now owns the ordinary allocation and its spare capacities. Freeing the frame
+          // still retires wrappers/credit, but must not refund the adopted payload a second time.
+          frame.store.retainedBytes = 0;
+          frame.extraBytes = 0;
+          frame.metadata = false;
+          return bytes;
+        },
         free: () => this.#free(frame),
       });
     } catch (error) {

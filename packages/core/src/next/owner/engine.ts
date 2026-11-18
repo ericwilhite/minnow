@@ -1,3 +1,4 @@
+import type { LiveRuntime } from "../live/runtime.js";
 /**
  * The owner worker's inside: the boundary between the protocol server (this track) and the
  * engine composed from the other tracks. The server owns connections, request admission and
@@ -116,6 +117,9 @@ export interface Run {
   readonly results: ResultStream;
   /** Owner-facing: the terminal `done` may be sent (see "Completions"). */
   readonly done: Promise<RunOutcome>;
+  /** After all frames return, fences result-grant/borrowed-IO cleanup. Live teardown awaits
+   * this separately from the ledger's producer/outcome boundary. Absent on control/test runs. */
+  readonly cleaned?: Promise<void> | undefined;
   /** Whether the composition has called the write path's `commit()` for this run (read it after `done` settles). */
   readonly reachedCommit: boolean;
   /**
@@ -135,6 +139,8 @@ export interface SyncRun {
 
 /** One session: its transaction, its pins, its sequence state. One per connection session id. */
 export interface EngineSession {
+  /** LSN of the pinned live/read-only snapshot, if one is open. */
+  readonly snapshotLsn?: number | undefined;
   /** The ledger key of this session's `statement` outcomes (outcomes.ts). */
   readonly ledgerSession: LedgerSession;
   readonly transaction: TransactionState;
@@ -213,6 +219,9 @@ export interface PreparedCache {
 export interface OwnerEngine {
   /** Bounded, evictable, governor-charged owner handle cache. Fallback SQL permits re-planning. */
   createPreparedCache(): PreparedCache;
+
+  /** Native live runtime; absent only on older test engines. */
+  readonly live?: LiveRuntime;
   /** A connection-owned, governor-charged cache, closed when that connection ends. */
   createReturnPool(capBytes: number): ReturnPool;
   readonly durability: Durability;
@@ -231,7 +240,7 @@ export interface OwnerEngine {
   openSession(clientId: string, generation: number, sessionId?: string): EngineSession;
   /** Tables a statement's result depends on: subscriptions re-run after commits touching them. */
   readSet(statement: PlannedStatement): readonly number[];
-  /** Calls `listener` after each commit with the ids of the tables it changed. */
+  /** Calls `listener` after native publication. An empty list means globally dirty (catalog/unknown/reset). */
   onCommit(listener: (tables: readonly number[]) => void): () => void;
   /** Admin calls (protocol.ts `AdminOp`), each with its structured-clone value. */
   admin(op: string, args: readonly WireValue[], context: RunContext): Promise<unknown>;

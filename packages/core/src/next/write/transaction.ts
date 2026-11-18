@@ -1,3 +1,5 @@
+import { captureRekey, LIVE_REKEY_TRANSACTION_BYTES } from "./live-rekeys.js";
+import type { RekeyEffect } from "../access/changes.js";
 import { ftsMutationScan } from "./fts-undo.js";
 import type { FtsClaimSeal } from "./fts-renderer.js";
 import { taskClock, yieldTask } from "../task.js";
@@ -94,6 +96,7 @@ const FTS_ROW_UNDO_BYTES = 32;
 
 /** What transactions need from the write path. */
 export interface EngineHooks {
+  readonly liveRekeys?: boolean;
   readonly shared: Shared;
   /** The one key batch writers encode into (one writer at a time; consumed before reuse). */
   readonly keys: KeyBatch;
@@ -160,6 +163,7 @@ export type Undo =
     }
   | {
       readonly kind: "memDelete";
+      liveRekey?: RekeyEffect | "reset" | null;
       readonly statement: number;
       readonly tableId: number;
       readonly memtable: Memtable;
@@ -171,6 +175,7 @@ export type Undo =
     }
   | {
       readonly kind: "groupDelete";
+      liveRekey?: RekeyEffect | "reset" | null;
       readonly statement: number;
       readonly tableId: number;
       readonly deletes: GroupDeletes;
@@ -249,6 +254,7 @@ export class TransactionImpl implements WriteTransaction {
   catalog: Catalog;
   readonly undo: Undo[] = [];
   #ftsUndoBytes = 0;
+  liveRekeyBytes = 0;
   /** Working minimum retained through publication; rollback may leave safe spare credit. */
   ftsMutationPrepared = false;
 
@@ -352,6 +358,14 @@ export class TransactionImpl implements WriteTransaction {
     while (this.undo.length > length) {
       const entry = this.undo.pop();
       if (entry === undefined) break;
+      if (
+        (entry.kind === "memDelete" || entry.kind === "groupDelete") &&
+        entry.liveRekey &&
+        entry.liveRekey !== "reset"
+      ) {
+        this.hooks.shared.budget.free(entry.liveRekey.bytes);
+        this.liveRekeyBytes -= entry.liveRekey.bytes;
+      }
       undoEntry(this, entry);
       if (entry.kind === "rows" && entry.ftsKeyed !== undefined) this.releaseFtsRowUndo();
     }
@@ -366,6 +380,8 @@ export class TransactionImpl implements WriteTransaction {
       // The engine consumed codecs, restamping and DDL iteration before releasing the slot.
       // Drop undo objects before refunding their embedded notification slots.
       this.undo.length = 0;
+      this.hooks.shared.budget.free(this.liveRekeyBytes);
+      this.liveRekeyBytes = 0;
       this.hooks.shared.budget.free(this.#ftsUndoBytes);
       this.#ftsUndoBytes = 0;
       this.state = "committed";
@@ -1468,6 +1484,7 @@ export class TableWriterImpl implements TableWriter {
       }
     }
     signal.throwIfAborted();
+    const liveStart = this.statement.tx.undo.length;
     if (oldRowId !== null) {
       const pin = this.statement.readOwn();
       try {
@@ -1500,8 +1517,78 @@ export class TableWriterImpl implements TableWriter {
         commandId,
       );
     signal.throwIfAborted();
+    if (event === "update" && old && next && oldRowId !== null)
+      this.#captureLiveRekeys(old.columns, next.columns, [oldRowId], liveStart, [
+        need<number>(inserted),
+      ]);
+    if (event === "delete" && old && oldRowId !== null)
+      this.#captureLiveRekeys(
+        old.columns,
+        old.columns,
+        [oldRowId],
+        liveStart,
+        [oldRowId],
+        "delete",
+      );
     if (event !== "insert") this.statement.noteFtsMutation(this.tableId, event);
     return inserted;
+  }
+
+  #captureLiveRekeys(
+    old: readonly Vector[],
+    next: readonly Vector[],
+    rowIds: readonly number[],
+    start: number,
+    nextRowIds: readonly number[] | null,
+    kind: "update" | "delete" = "update",
+  ): void {
+    const tx = this.statement.tx;
+    if (!tx.hooks.liveRekeys) return;
+    const budget = {
+      allocate: (bytes: number) => {
+        if (tx.liveRekeyBytes + bytes > LIVE_REKEY_TRANSACTION_BYTES) return false;
+        if (!tx.hooks.shared.budget.allocate(bytes)) return false;
+        tx.liveRekeyBytes += bytes;
+        return true;
+      },
+      free: (bytes: number) => {
+        tx.liveRekeyBytes -= bytes;
+        tx.hooks.shared.budget.free(bytes);
+      },
+    };
+    for (let row = 0; row < rowIds.length; row++) {
+      const effect =
+        nextRowIds === null
+          ? "reset"
+          : captureRekey(
+              this.def,
+              old,
+              next,
+              row,
+              need(rowIds[row]),
+              need(nextRowIds[row]),
+              this.#keys,
+              budget,
+              kind,
+            );
+      if (effect === null) continue;
+      let entry: Undo | undefined;
+      for (let i = start; i < tx.undo.length; i++) {
+        const candidate = tx.undo[i];
+        if (
+          candidate &&
+          (candidate.kind === "memDelete" || candidate.kind === "groupDelete") &&
+          candidate.tableId === this.tableId &&
+          candidate.rowId === rowIds[row]
+        ) {
+          entry = candidate;
+          break;
+        }
+      }
+      if (entry && (entry.kind === "memDelete" || entry.kind === "groupDelete"))
+        entry.liveRekey = effect;
+      else if (effect !== "reset") budget.free(effect.bytes);
+    }
   }
 
   #checkShape(columns: readonly Vector[], offset: number, columnIds: readonly number[]): void {
@@ -1656,6 +1743,7 @@ export class TableWriterImpl implements TableWriter {
     columns: readonly Vector[],
     rows: Uint16Array | null,
     count = rows?.length ?? 0,
+    inserted?: (rowId: number, count: number) => void,
   ): MaybePromise<void> {
     this.statement.checkLegacyWrite();
     const advances: Array<MaybePromise<void>> = [];
@@ -1685,7 +1773,7 @@ export class TableWriterImpl implements TableWriter {
       }
     return settle(all(advances), () =>
       settle(this.#prepareKeyLimits(this.def.indexes, columns, rows, 0, count), () =>
-        this.#insertPreparedRows(columns, rows, count),
+        this.#insertPreparedRows(columns, rows, count, inserted),
       ),
     );
   }
@@ -1694,6 +1782,7 @@ export class TableWriterImpl implements TableWriter {
     columns: readonly Vector[],
     rows: Uint16Array | null,
     count: number,
+    inserted?: (rowId: number, count: number) => void,
   ): MaybePromise<void> {
     if (count <= MEMORY_CHUNK_ROWS) {
       const plan: RowPlan = { rows, from: 0, count },
@@ -1701,7 +1790,7 @@ export class TableWriterImpl implements TableWriter {
       if (bytes <= BATCH_TARGET_BYTES || count <= 1 || !this.#wideKeys(columns, plan))
         return settle(
           this.statement.tx.hooks.admit(bytes, () => this.#growth(columns, plan)),
-          () => this.#insertRows(columns, plan),
+          () => this.#insertRows(columns, plan, false, inserted),
         );
     }
     // Keep ordinary batches unchanged. Wide borrowed input is admitted and staged in byte
@@ -1723,7 +1812,7 @@ export class TableWriterImpl implements TableWriter {
           offset += plan.count;
           const pending = settle(
             this.statement.tx.hooks.admit(bytes, () => this.#growth(columns, plan)),
-            () => this.statement.guard(() => this.#insertRows(columns, plan)),
+            () => this.statement.guard(() => this.#insertRows(columns, plan, false, inserted)),
           );
           if (pending instanceof Promise) return pending.then(next);
         }
@@ -1811,7 +1900,7 @@ export class TableWriterImpl implements TableWriter {
     columns: readonly Vector[],
     plan: RowPlan,
     command = false,
-    inserted?: (rowId: number) => void,
+    inserted?: (rowId: number, count: number) => void,
     commandId = 0,
   ): MaybePromise<void> {
     const tx = this.statement.tx,
@@ -1870,7 +1959,7 @@ export class TableWriterImpl implements TableWriter {
           });
         }
         const firstRowId = memtable.firstRowId + before;
-        inserted?.(firstRowId);
+        inserted?.(firstRowId, take);
         if (rowIds !== null) for (let k = 0; k < take; k++) rowIds.push(firstRowId + k);
         const put = this.#putValidKeys(
           this.def.indexes,
@@ -2317,12 +2406,48 @@ export class TableWriterImpl implements TableWriter {
           .rules(this.tableId)
           .generate({ length: rowIds.length, columns, selection: null }, columnIds);
       this.#validate(columns, all, rowIds.length, columnIds);
-      const removed = this.#deleteRows(table, rowIds, old);
-      const added = this.insertRows(columns, all);
-      this.#parentChecksForChange(old, columns, rowIds.length);
-      return settle(all_(removed, added), () => {
-        if (rowIds.length > 0) this.statement.noteFtsMutation(this.tableId, "update");
-      });
+      const tx = this.statement.tx;
+      const liveStart = tx.undo.length;
+      const scratchBytes = tx.hooks.liveRekeys ? 64 + 16 * rowIds.length : 0;
+      let funded = false;
+      if (scratchBytes > 0) {
+        try {
+          funded = tx.hooks.shared.budget.allocate(scratchBytes);
+        } catch {
+          /* Optional capture falls back to reset. */
+        }
+      }
+      const nextRowIds: number[] | null = funded ? [] : null;
+      const retire = () => {
+        if (funded) {
+          funded = false;
+          tx.hooks.shared.budget.free(scratchBytes);
+        }
+      };
+      try {
+        const removed = this.#deleteRows(table, rowIds, old);
+        const added = this.insertRows(
+          columns,
+          all,
+          all.length,
+          nextRowIds === null
+            ? undefined
+            : (first, count) => {
+                for (let i = 0; i < count; i++) nextRowIds.push(first + i);
+              },
+        );
+        this.#parentChecksForChange(old, columns, rowIds.length);
+        const work = settle(all_(removed, added), () => {
+          this.#captureLiveRekeys(old, columns, rowIds, liveStart, nextRowIds);
+          if (rowIds.length > 0) this.statement.noteFtsMutation(this.tableId, "update");
+        });
+        if (work instanceof Promise) return work.finally(retire);
+        retire();
+        return work;
+      } catch (error) {
+        retire();
+        throw error;
+      }
     });
   }
 
@@ -2348,6 +2473,7 @@ export class TableWriterImpl implements TableWriter {
     const current = this.statement.current();
     const table = current.internalTable(this.tableId);
     return settle(readRows(table, rowIds), (old) => {
+      const liveStart = this.statement.tx.undo.length;
       const removed = this.#deleteRows(table, rowIds, old);
       for (const index of this.def.indexes)
         if (this.#referenced.has(index.id)) {
@@ -2362,6 +2488,7 @@ export class TableWriterImpl implements TableWriter {
                 });
         }
       return settle(removed, () => {
+        this.#captureLiveRekeys(old, old, rowIds, liveStart, rowIds, "delete");
         if (rowIds.length > 0) this.statement.noteFtsMutation(this.tableId, "delete");
       });
     });

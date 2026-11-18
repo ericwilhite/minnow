@@ -72,7 +72,7 @@
 import { frameTransferList, flats } from "./frame-buffers.js";
 export { frameTransferList, FrameBufferError } from "./frame-buffers.js";
 import type { OutputColumn } from "../ir/ir.js";
-import { bigintBytes } from "../memory/governor.js";
+import { bigintBytes, type Grant } from "../memory/governor.js";
 import { BATCH_TARGET_BYTES, type Validity, type VectorData } from "../vector/vector.js";
 import { QueryCancelledError } from "./errors.js";
 import type { PushResult } from "./pipeline.js";
@@ -129,6 +129,8 @@ export interface FramePayload {
 }
 
 export interface ResultFrame {
+  /** Internal retention: atomically adopt ordinary credit before release. Null leaves ownership unchanged. */
+  adopt?(take: (source: Grant, bytes: number) => boolean): number | null;
   readonly payload: FramePayload;
   /** The payload's ArrayBuffers, for `postMessage`'s transfer list. */
   readonly transfer: readonly ArrayBuffer[];
@@ -155,6 +157,7 @@ export type UnnumberedPayload = Omit<FramePayload, "sequence">;
 
 /** What the result sink offers: a sealed payload and how to free its bytes. */
 export interface FrameOffer {
+  readonly adopt?: (take: (source: Grant, bytes: number) => boolean) => number | null;
   readonly payload: UnnumberedPayload;
   readonly requiresLsn: number;
   /** Frees the frame's bytes from the result grant (called once, on release). */
@@ -328,6 +331,7 @@ export class ResultChannel implements ResultStream {
 
   #frame(offer: FrameOffer): ResultFrame {
     let released = false;
+    let adopted = false;
     const payload: FramePayload = { ...offer.payload, sequence: this.#sequence++ };
     const byteLength = frameByteLength(payload);
     return {
@@ -335,6 +339,12 @@ export class ResultChannel implements ResultStream {
       transfer: frameTransferList(payload),
       byteLength,
       requiresLsn: offer.requiresLsn,
+      adopt: (take) => {
+        if (released || adopted || offer.adopt === undefined) return null;
+        const bytes = offer.adopt(take);
+        if (bytes !== null) adopted = true;
+        return bytes;
+      },
       release: () => {
         if (released) return;
         released = true;

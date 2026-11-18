@@ -910,7 +910,8 @@ export class OwnerConnector {
    * one asks who holds the host lock. See "Losing the owner" for the outcomes and the backoff.
    */
   #updateSilence(): void {
-    const needs = this.#status === "connected" && this.#client.pendingCount > 0;
+    const needs =
+      this.#status === "connected" && (this.#client.pendingCount > 0 || this.#client.liveCount > 0);
     if (!needs) {
       if (this.#silenceTimer !== null) clearTimeout(this.#silenceTimer);
       this.#silenceTimer = null;
@@ -942,7 +943,10 @@ export class OwnerConnector {
 
   async #checkSilence(): Promise<void> {
     this.#silenceTimer = null;
-    if (this.#status !== "connected" || this.#client.pendingCount === 0) {
+    if (
+      this.#status !== "connected" ||
+      (this.#client.pendingCount === 0 && this.#client.liveCount === 0)
+    ) {
       this.#silence.probeAt = null;
       return;
     }
@@ -1017,7 +1021,8 @@ export class OwnerConnector {
    * owner died: another context's, or this page's own worker.
    */
   #updateWatch(): void {
-    const needs = this.#status === "connected" && this.#client.pendingCount > 0;
+    const needs =
+      this.#status === "connected" && (this.#client.pendingCount > 0 || this.#client.liveCount > 0);
     if (needs) {
       if (this.#watchIdle !== null) clearTimeout(this.#watchIdle);
       this.#watchIdle = null;
@@ -1046,7 +1051,7 @@ export class OwnerConnector {
     if (this.#watch === null || this.#watchIdle !== null) return;
     this.#watchIdle = setTimeout(() => {
       this.#watchIdle = null;
-      if (this.#client.pendingCount > 0) return;
+      if (this.#client.pendingCount > 0 || this.#client.liveCount > 0) return;
       this.#watch?.stop();
       this.#watch = null;
     }, LIVENESS_IDLE_RELEASE_MS);
@@ -1054,7 +1059,8 @@ export class OwnerConnector {
 
   #updateLiveness(): void {
     const state = this.#liveness;
-    const busy = this.#client.pendingCount > 0 || this.#client.hasPins;
+    const busy =
+      this.#client.pendingCount > 0 || this.#client.liveCount > 0 || this.#client.hasPins;
     if (busy) {
       if (state.idleTimer !== null) clearTimeout(state.idleTimer);
       state.idleTimer = null;
@@ -1082,7 +1088,12 @@ export class OwnerConnector {
     if (state.lock !== null && state.idleTimer === null)
       state.idleTimer = setTimeout(() => {
         state.idleTimer = null;
-        if (this.#client.pendingCount === 0 && !this.#client.hasPins) this.#releaseLiveness();
+        if (
+          this.#client.pendingCount === 0 &&
+          this.#client.liveCount === 0 &&
+          !this.#client.hasPins
+        )
+          this.#releaseLiveness();
       }, LIVENESS_IDLE_RELEASE_MS);
   }
 

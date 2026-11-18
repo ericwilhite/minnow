@@ -4,6 +4,7 @@
     "new ground; when it finds a break, the seed goes here and the deterministic suite replays it",
     "forever after. Never remove one: a seed listed here is a bug that used to exist, and the",
     "entry is what stops it coming back. Keys match the suite names passed to seedsFor().",
+    "Native execution retirement seeds 8850/8851 force cancel/dispose during source sizing and deferred launch: delivered alone does not fence the sizing grant.",
     "Interaction seeds 24301, 61935, and 608135839 exposed native OPFS checkpoint recovery failures;",
     "their storage reductions are in checkpoint-interruption.test.ts and opfs-checkpoint.spec.ts.",
     "Seed 3084996986 preserves the long WebKit plan that exposed excessive trace capture cost.",
@@ -21,9 +22,14 @@
     "Once ADD and DROP COLUMN reached tables that hold rows (--constraints true --schema-changes true --full-text true --burst-commits 300): memory seed 109 (--length 1500 --connections 6 --tables 3 --key-space 48) exposed an index selection reading a stale row from a folded base after ADD COLUMN, reduced in simulator-regressions.test.ts; memory seeds 116, 144 and 159 exposed compactTable failing on a fold planned before an ALTER TABLE, and OPFS seeds 500 to 517 (--length 800 --connections 4 --tables 3 --key-space 32) exposed recovery refusing a database whose table changed after a fold, both reduced in schema-change-compaction.test.ts; memory seed 145 then exposed that abandoning such a fold left its transaction active, which refused DROP COLUMN until the lease expired, reduced there too. Before the fold fix, every such seed failed with 'Full-row compaction source is missing columns'.",
     "Once full-text plans fold their append-only tables and every maintenance checks integrity: IndexedDB seeds 2 to 6 (--length 300 --connections 3 --tables 3 --key-space 24 --constraints true --schema-changes true --full-text true --burst-commits 300) exposed a fold invalidating an append-only table's full-text index and leaving its postings, which checkIntegrity reported as 'postings table of contents has no catalog owner'; every IndexedDB seed with an inline UNIQUE column, the suite's own defaults among them, exposed checkIntegrity reporting that column's index before its first build. Both are reduced in fts-fold.test.ts.",
     "Live-differential seed 213708905 exposed integer arithmetic returning JavaScript's negative zero (-4 % 4) on fresh execution while the patched grouped live result held 0; reduced in negative-zero.test.ts.",
-    "Next-write extent-delta seed 701 failed about one run in fifty with an ExtentSinkError (a publication released extents the extent list does not name): a rolled-back staging's deferred retirement ran after a dropped table's walk had already released it. The seed replays the random history; the lock-queue ordering is forced in extent-release-ordering.test.ts. Seed 704 reproduced a flush retaining a group chunk that a concurrent DROP TABLE had released (CI coverage shard 4/7); the ordering is forced in group-chunk-retain-ordering.test.ts."
+    "Next-write extent-delta seed 701 failed about one run in fifty with an ExtentSinkError (a publication released extents the extent list does not name): a rolled-back staging's deferred retirement ran after a dropped table's walk had already released it. The seed replays the random history; the lock-queue ordering is forced in extent-release-ordering.test.ts. Seed 704 reproduced a flush retaining a group chunk that a concurrent DROP TABLE had released (CI coverage shard 4/7); the ordering is forced in group-chunk-retain-ordering.test.ts.",
+    "B8 seeds 8804/8805 preserve missing explicit-commit invalidation; 8810/8811 preserve a dropped middle notification followed by an unrelated commit; 8840/8841 preserve explicit adapter Date comparison by instant. Reductions are the native live commit/runtime/row-value oracles.",
+    "B8 rekey-history seeds 8806/8807 preserve the catalog identity boundary: an old table rekey pending during DROP/CREATE of its SQL name must reset without stale notices.",
+    "B8 cleanup-fence seeds 8812/8813 force asynchronous result cleanup after producer completion; owner close must wait before releasing its lifetime.",
+    "B8 rejected-delivery seeds8826/8827 preserve a decoder rejection before snapshot installation: resource credit may return, but the last accepted result/rekey watermark must not advance."
   ],
   "suites": {
+    "next-execution-retirement": [8850, 8851],
     "sql-conformance": [12648430],
     "sql-mutation-conformance": [],
     "differential": [],
@@ -54,6 +60,26 @@
     "unicode-properties": [],
     "record-json-properties": [],
     "temp-owner-lifecycle": [],
-    "differential-harness": []
+    "differential-harness": [],
+    "next-live-publication": [],
+    "next-live-commit-oracle": [8804, 8805],
+    "next-live-runtime": [],
+    "next-live-rekey-history": [8806, 8807],
+    "next-live-late-registration": [],
+    "next-live-missed-notification": [8810, 8811],
+    "next-live-row-values": [8840, 8841],
+    "next-live-cleanup-fence": [8812, 8813],
+    "next-live-pressure": [],
+    "next-live-rejected-delivery": [8826, 8827],
+    "next-live-observer-reentry": [8860, 8861],
+    "next-live-dispatch": [8862, 8863],
+    "next-live-effect-integration": [8864, 8865],
+    "next-live-errors": [8828, 8829],
+    "next-live-lifecycle": [8830, 8831],
+    "next-live-close": [8832, 8833],
+    "next-live-admission-close": [8866, 8867],
+    "next-live-row-backing": [8870, 8871],
+    "next-live-row-identity": [8868, 8869],
+    "next-live-row-binary": [8872, 8873]
   }
 }
