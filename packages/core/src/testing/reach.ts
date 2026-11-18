@@ -10806,3 +10806,14 @@ export const LIVE_BACKING_REACH = [
   "old diff released",
   "zero charges",
 ] as const;
+
+export const LIVE_IDENTITY_REACH = [
+  "reuse source",
+  "reuse destination",
+  "retire chain",
+  "swap",
+  "unrelated",
+  "new identity hop",
+  "new identity insert",
+  "zero charges",
+] as const;

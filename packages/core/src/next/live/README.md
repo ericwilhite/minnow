@@ -11,6 +11,9 @@ site changelog's unreleased section.
   or dependency admission invalidates the old proof: later commits retry conservatively until
   a fresh proof succeeds, then unaffected tables are excluded again. A cohort pins
   synchronously, executes at most eight queries concurrently, then delivers in one turn.
+  Native observer dispatch runs in one deferred task after receipt/ledger bookkeeping and
+  writer release. Two funded fixed frontiers coalesce installed effects and isolate a borrowed
+  event from reentrant publication; a registration epoch excludes callback-created replacements.
 - `ProtocolClient.subscribeLive()` returns synchronous `refresh()` and `close()` handles.
   Refresh registers a fresh read and explicitly resets the result. It captures parameters
   privately, admitting complete backing-buffer capacity before cloning a byte view. The private
@@ -41,7 +44,9 @@ site changelog's unreleased section.
   promise sharing and adapter lifecycle. `LiveRows` supplies unique-key validation, stable row
   identity, window result-bound enforcement, keyed changes, and reset/retained-position patches.
   Its budget belongs to the receiving decoded store. Snapshots retained by application code
-  after replacement belong to that application, not an owner delivery queue.
+  after replacement belong to that application, not an owner delivery queue. Reconciliation
+  charges complete cloned ArrayBuffer backing capacity, including previous rows held by diffs.
+  A narrow view over a large buffer therefore needs admission for the backing capacity.
 
 ## Rekey continuity
 
@@ -60,7 +65,9 @@ only scalar notices pair keyed result rows, as in the shipped contract.
 Covered gaps deliver exact ordered notices. Catalog publication resets identity proofs because
 table names and primary-key definitions may change. Uncovered gaps, owner changes and snapshot
 replacement deliver an explicit full reset with no stale notices. Never infer a rekey by
-pairing an unrelated delete and insert. These guarantees do not require durable rekey history
+pairing an unrelated delete and insert. Each previous identity is matched once; moved or retired
+keys cannot reuse that previous row when a new row acquires the key, and an old destination's
+delete remains visible when another row rekeys into its value. These guarantees do not require durable rekey history
 or a stored-format change.
 
 ## Memory and limits
@@ -77,7 +84,9 @@ and reconnect preserve the captured parameters. Active consumer jobs retain thei
 charges until they drain. Dispose cancels admission/execution and owner close drains it. Internal `Run.cleaned`
 forwards `Execution.settled()`, including deferred launch, program, delivery and sizing-job
 cleanup. The cohort launcher installs its work fence before synchronous planning/admission,
-so reentrant close cannot resolve with diagnostic scratch still held. `Run.done` alone is the producer/outcome boundary and does not guarantee retirement.
+so reentrant close cannot resolve with diagnostic scratch still held. Retirement stays fenced
+through result-copy admission and delivery too: a reentrant disposal returns newly acquired
+copy credit without installing or delivering the staged result. `Run.done` alone is the producer/outcome boundary and does not guarantee retirement.
 
 Live diagnostics prepay 16 KiB of bounded sizing/fallback scratch per subscription. Before
 copying diagnostic properties, the owner sizes them and admits three-copy overlap credit.
@@ -111,7 +120,11 @@ npx vitest run packages/core/src/next/live \
   packages/core/src/next/testing/live-runtime-errors.test.ts \
   packages/core/src/next/testing/live-runtime-lifecycle.test.ts \
   packages/core/src/next/testing/live-runtime-close.test.ts \
+  packages/core/src/next/testing/live-runtime-admission.test.ts \
   packages/core/src/next/write/changes.test.ts \
+  packages/core/src/next/write/changes-reentrancy.test.ts \
+  packages/core/src/next/write/changes-deferred.test.ts \
+  packages/core/src/next/write/changes-integration.test.ts \
   packages/core/src/next/testing/live-commit-oracle.test.ts \
   packages/core/src/next/exec/result-retain.test.ts --maxWorkers=2
 ```

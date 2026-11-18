@@ -151,6 +151,7 @@ export class LiveRows<R extends object> {
       const retained = new Int32Array(input.length).fill(-1);
       const changedRows: Array<{ index: number; row: R }> = [];
       const movedKeys = new Map<string, string>();
+      const retiredOrigins = new Set<string>();
       if (!reset && this.options.table !== undefined) {
         for (const change of keyChanges)
           if (
@@ -168,7 +169,10 @@ export class LiveRows<R extends object> {
                 movedKeys.delete(old);
                 break;
               }
-            movedKeys.set(origin, to);
+            if (change.kind === "delete") {
+              movedKeys.delete(origin);
+              retiredOrigins.add(origin);
+            } else movedKeys.set(origin, to);
           }
       }
       // Native row-ID links distinguish a continuing UPDATE chain from a deleted key that
@@ -179,6 +183,7 @@ export class LiveRows<R extends object> {
         keyChanges.some((change) => change.fromRowId !== undefined)
       ) {
         movedKeys.clear();
+        retiredOrigins.clear();
         const identities = new Map<number, string | null>();
         const owned = new Set<string>();
         for (const change of keyChanges) {
@@ -198,7 +203,10 @@ export class LiveRows<R extends object> {
           }
           identities.delete(change.fromRowId);
           if (change.kind === "delete") {
-            if (origin !== null) movedKeys.delete(origin);
+            if (origin !== null) {
+              movedKeys.delete(origin);
+              retiredOrigins.add(origin);
+            }
           } else {
             identities.set(change.toRowId, origin);
             if (origin !== null) movedKeys.set(origin, token(change.to));
@@ -207,13 +215,20 @@ export class LiveRows<R extends object> {
       }
       const origins = new Map<string, string>();
       for (const [from, to] of movedKeys) origins.set(to, from);
+      // Match each previous identity once. A reused value is not its moved/deleted origin.
+      const matched = new Set<string>();
       for (let at = 0; at < input.length; at++) {
         const value = input[at];
         if (value === undefined) throw new TypeError("Sparse live result");
         const id = token(value[this.key]);
         if (index.has(id)) throw new TypeError("Duplicate live result key");
         const origin = origins.get(id);
-        const old = reset ? undefined : this.#index.get(origin ?? id);
+        const previousId = origin ?? (movedKeys.has(id) || retiredOrigins.has(id) ? undefined : id);
+        const old =
+          reset || previousId === undefined || matched.has(previousId)
+            ? undefined
+            : this.#index.get(previousId);
+        if (old !== undefined && previousId !== undefined) matched.add(previousId);
         const same = old !== undefined && sameLiveValue(old.row, value);
         const row = same ? old.row : Object.freeze(structuredClone(value));
         rows.push(row);
@@ -247,7 +262,7 @@ export class LiveRows<R extends object> {
       const deletions: Array<RowChange<R>> = [];
       if (!reset)
         for (const [id, old] of this.#index) {
-          if (!index.has(id) && !index.has(movedKeys.get(id) ?? id))
+          if (!matched.has(id))
             deletions.push({
               type: "delete",
               key: old.row[this.key] as LiveKey,
